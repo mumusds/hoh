@@ -13,7 +13,7 @@
   ],
   "cwd": "fresh temp Git repo outside the checkout",
   "exit_code": 1,
-  "recorded_at": "2026-11-03T21:59:01.574867+00:00",
+  "recorded_at": "2026-11-03T22:22:44.660728+00:00",
   "mode": "live",
   "notes": "logged in, model unavailable to the account: the MODEL_UNAVAILABLE surface",
   "stopped": "exited",

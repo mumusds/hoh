@@ -22,7 +22,8 @@ INLINE_LONG={'--eval','--print','--command'}
 # Short options whose value is the rest of the cluster or the next argument (M0R3-04: `bash -o errexit -c`,
 # `python3 -W ignore -c`); long options that take a separate value; options after which the rest is not ours.
 OPERAND_LETTERS={'shell':'oO','python':'WX','node':'rC','perl':'IMmx','ruby':'IrCx'}
-OPERAND_LONG={'node':{'--require','--import','--loader','--experimental-loader','--conditions','--input-type','--env-file','--title'}}
+OPERAND_LONG={'node':{'--require','--import','--loader','--experimental-loader','--conditions','--input-type','--env-file','--title'},
+              'shell':{'--rcfile','--init-file'},'python':{'--check-hash-based-pycs'}}
 END_LETTERS={'python':'m'}
 KIND_VALUE=re.compile(r'(?<![A-Za-z0-9_])kind\s*=\s*([A-Za-z_](?:[A-Za-z0-9_\-]|\.(?=[A-Za-z0-9_]))*)')
 
@@ -31,9 +32,17 @@ def unwrap_env(args:list[str])->list[str]|None:
     while args and Path(args[0]).name=='env':
         i=1
         while i<len(args) and args[i].startswith('-'):  # includes `-`, the short form of --ignore-environment
-            if args[i]=='--':i+=1;break
-            if args[i] in ('-S','--split-string') or args[i].startswith(('--split-string=','-S')):return None
-            i+=2 if args[i] in ENV_OPTIONS_WITH_ARG else 1
+            a=args[i];i+=1
+            if a=='--':break
+            if a.startswith('--'):
+                if a.split('=',1)[0]=='--split-string':return None
+                if a in ENV_OPTIONS_WITH_ARG:i+=1
+                continue
+            for j,ch in enumerate(a[1:],1):  # a short-option cluster such as -iS or -iu NAME (M0R4-08)
+                if ch=='S':return None
+                if ch in 'uC':
+                    if j==len(a)-1:i+=1
+                    break
         while i<len(args) and '=' in args[i] and not args[i].startswith('-'):i+=1
         args=args[i:]
     return args

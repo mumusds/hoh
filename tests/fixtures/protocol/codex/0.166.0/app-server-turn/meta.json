@@ -8,10 +8,10 @@
   ],
   "cwd": "fresh temp Git repo outside the checkout",
   "exit_code": 0,
-  "recorded_at": "2026-11-03T21:59:27.095441+00:00",
+  "recorded_at": "2026-11-03T22:23:09.974293+00:00",
   "mode": "live",
   "notes": "thread/start then one turn/start until turn/completed",
-  "thread_id": "01a1a36c-80f1-7df2-9ba7-ce3e733a83fe",
+  "thread_id": "01a1a382-3756-72a1-954e-667ab93c9033",
   "stopped": "exited",
   "valid": true,
   "problems": []

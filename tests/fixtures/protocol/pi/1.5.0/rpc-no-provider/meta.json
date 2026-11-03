@@ -11,7 +11,7 @@
   ],
   "cwd": "fresh temp Git repo outside the checkout",
   "exit_code": 0,
-  "recorded_at": "2026-11-03T22:01:38.811936+00:00",
+  "recorded_at": "2026-11-03T22:23:45.005037+00:00",
   "mode": "live",
   "notes": "empty PI_CODING_AGENT_DIR, no provider key variables, PI_OFFLINE=1: get_state then prompt",
   "env_overrides": [
