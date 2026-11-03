@@ -1,0 +1,19 @@
+[package]
+name = "hoh-app"
+description = "HoH composition root: CLI, TUI, HTTP API and host process (binary `hoh`)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "hoh"
+path = "src/main.rs"
+
+[dependencies]
+hoh-core = { path = "../hoh-core" }
+hoh-agents = { path = "../hoh-agents" }
+
+[lints]
+workspace = true

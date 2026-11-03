@@ -80,7 +80,8 @@ VERIFY
   fi
   if ! command -v rustup >/dev/null; then
     fetch https://sh.rustup.rs "$DEV/downloads/rustup-init.sh"
-    sh "$DEV/downloads/rustup-init.sh" -y --profile minimal --default-toolchain stable
+    # PATH comes from .hoh-dev/env.sh; do not edit the user's shell profile.
+    sh "$DEV/downloads/rustup-init.sh" -y --no-modify-path --profile minimal --default-toolchain stable
   fi
   if [[ ! -f "$DEV/rust-version.lock" ]]; then
     rustup toolchain install stable --profile minimal --component rustfmt --component clippy

@@ -1,0 +1,7 @@
+{
+  "packages": [
+    "npm:pi-smart-compact@10.7.3",
+    "npm:pi-hermes-memory@0.10.0",
+    "npm:@juicesharp/rpiv-todo@2.15.0"
+  ]
+}

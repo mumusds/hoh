@@ -24,3 +24,13 @@ jobs:
       # Validation, baseline/CR verification, generated-view drift and all bundle tests.
       - run: bash scripts/check.sh --bundle
       # No native model credentials; these are NOT product/live acceptance tests.
+  product:
+    # Rust workspace checks (M0-T02). The toolchain is pinned by rust-toolchain.toml.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - run: rustup toolchain install  # installs the channel and components from rust-toolchain.toml
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked

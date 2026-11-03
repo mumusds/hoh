@@ -1,0 +1,11 @@
+[package]
+name = "hoh-core"
+description = "HoH domain model: specifications, workflow state, scheduling, verification and persistence ports."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
