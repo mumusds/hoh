@@ -12,17 +12,17 @@ from common import ROOT, Terminated, atomic_json, execute, flag_supported, insta
 # so a delegated or already-running top-level session cannot start another commander.
 PARENT_ENV='HOH_BOOTSTRAP_PARENT'
 TOP_LEVEL_ROLES={'commander','developer'}
-# Identity/IPC variables a parent agent session sets for its own children (observed for Claude Code 2.1,
-# documented for Codex). A delegated agent must start as an independent session, so these are removed;
-# provider/auth configuration (ANTHROPIC_*, CLAUDE_CODE_USE_BEDROCK, ...) is kept.
-PARENT_SESSION_VARS=frozenset({'CLAUDECODE','CLAUDE_PID','CLAUDE_EFFORT','CLAUDE_CODE_SESSION_ID','CLAUDE_CODE_CHILD_SESSION',
+# Session identity, IPC and per-session state that a parent agent session injects into its children
+# (observed for Claude Code 2.1.317, documented for Codex). A delegated agent must start as an
+# independent session, so only these are removed. User feature flags and provider/auth configuration
+# (ANTHROPIC_*, CLAUDE_CODE_USE_BEDROCK, CLAUDE_CODE_EXPERIMENTAL_*, ...) are kept.
+PARENT_SESSION_VARS=frozenset({'AI_AGENT','CLAUDECODE','CLAUDE_PID','CLAUDE_EFFORT','CLAUDE_CODE_SESSION_ID','CLAUDE_CODE_CHILD_SESSION',
     'CLAUDE_CODE_MESSAGING_SOCKET','CLAUDE_CODE_MESSAGING_TOKEN','CLAUDE_CODE_SESSION_ATTENDED','CLAUDE_CODE_ENTRYPOINT',
-    'CLAUDE_CODE_EXECPATH','CLAUDE_CODE_HIDE_CWD','CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN','CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS',
-    'CODEX_SANDBOX','CODEX_SANDBOX_NETWORK_DISABLED'})
+    'CLAUDE_CODE_EXECPATH','CODEX_SANDBOX','CODEX_SANDBOX_NETWORK_DISABLED'})
 
-def child_env(attempt_id:str)->dict[str,str]:
+def child_env(attempt_id:str|None=None)->dict[str,str]:
     env={k:v for k,v in os.environ.items() if k not in PARENT_SESSION_VARS}
-    env[PARENT_ENV]=attempt_id
+    if attempt_id:env[PARENT_ENV]=attempt_id
     return env
 
 REQUIRED={
@@ -32,7 +32,7 @@ REQUIRED={
 }
 def help_text(agent:str,cwd:Path)->str:
     cmd=[agent,'exec','--help'] if agent=='codex' else [agent,'--help']
-    r=subprocess.run(cmd,cwd=cwd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=20,check=False)
+    r=subprocess.run(cmd,cwd=cwd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=20,check=False,env=child_env())
     if r.returncode:raise RuntimeError(f'{agent} help failed ({r.returncode})')
     return r.stdout.decode('utf-8',errors='replace')
 
@@ -97,7 +97,7 @@ def inspect_output(agent:str,path:Path)->dict:
 
 def cli_version(agent:str,cwd:Path)->str:
     try:
-        r=subprocess.run([agent,'--version'],cwd=cwd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=20,check=False)
+        r=subprocess.run([agent,'--version'],cwd=cwd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=20,check=False,env=child_env())
         text=r.stdout.decode('utf-8','replace').strip().splitlines()
         return text[0][:160] if r.returncode==0 and text else 'unknown'
     except (OSError,subprocess.TimeoutExpired):return 'unknown'
@@ -160,7 +160,7 @@ def main(argv=None)->int:
     (out/'prompt.md').write_bytes(data)
     (out/'native-help.txt').write_text(help_output,encoding='utf-8')
     version=cli_version(a.agent,a.cwd)
-    record={'schema_version':'1.1','record_type':'bootstrap_native_attempt','attempt_id':attempt_id,'candidate_id':os.getenv('HOH_CANDIDATE_ID'),'check_id':os.getenv('HOH_CHECK_ID'),'parent_attempt':os.getenv(PARENT_ENV),'agent':a.agent,'cli_version':version,'role':a.role,'argv':cmd,'cwd':str(a.cwd.resolve()),'started_at':utcnow(),'prompt_sha256':sha256(out/'prompt.md'),'model_requested':model,'top_level_bootstrap':a.top_level,'status':'RUNNING','product_accepted':False}
+    record={'schema_version':'1.1','record_type':'bootstrap_native_attempt','attempt_id':attempt_id,'candidate_id':os.getenv('HOH_CANDIDATE_ID'),'check_id':os.getenv('HOH_CHECK_ID'),'parent_attempt':os.getenv(PARENT_ENV),'agent':a.agent,'cli_version':version,'role':a.role,'argv':cmd,'cwd':str(a.cwd.resolve()),'started_at':utcnow(),'prompt_sha256':sha256(out/'prompt.md'),'model_requested':model,'top_level_bootstrap':a.top_level,'env_removed':sorted(PARENT_SESSION_VARS&os.environ.keys()),'status':'RUNNING','product_accepted':False}
     atomic_json(out/'attempt.json',record)
     print(f'Native {a.agent} invocation; logs: {out}',file=sys.stderr,flush=True)
     previous=install_termination_handlers()

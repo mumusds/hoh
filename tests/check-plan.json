@@ -3,19 +3,155 @@
   "plan_id": "hoh-product",
   "description": "Frozen into every candidate as its test plan. Entries that point at scripts/product/not-implemented.sh fail with exit 3 until the task named in their argv replaces them with the real command.",
   "checks": {
-    "build": {"mode": "product", "argv": ["bash", "scripts/product/build.sh"], "timeout_seconds": 3600},
-    "static": {"mode": "product", "argv": ["bash", "scripts/product/static.sh"], "timeout_seconds": 1800},
-    "unit": {"mode": "product", "argv": ["cargo", "test", "--workspace", "--locked", "--lib"], "timeout_seconds": 3600},
-    "integration": {"mode": "product", "argv": ["cargo", "test", "--workspace", "--locked", "--tests"], "timeout_seconds": 3600},
-    "recovery": {"mode": "product", "argv": ["bash", "scripts/product/not-implemented.sh", "recovery", "M2-T05"], "timeout_seconds": 7200},
-    "adapter-live": {"mode": "live", "argv": ["bash", "scripts/product/not-implemented.sh", "adapter-live", "M1-T03"], "timeout_seconds": 7200, "artifacts": ["live-sessions.json"]},
-    "plugin-live": {"mode": "live", "argv": ["bash", "scripts/product/not-implemented.sh", "plugin-live", "M5-T03"], "timeout_seconds": 7200, "artifacts": ["live-sessions.json"]},
-    "tui-pty": {"mode": "product", "argv": ["bash", "scripts/product/not-implemented.sh", "tui-pty", "M1-T08"], "timeout_seconds": 3600},
-    "web-e2e": {"mode": "product", "argv": ["bash", "scripts/product/not-implemented.sh", "web-e2e", "M6-T02"], "timeout_seconds": 3600},
-    "deployment": {"mode": "product", "argv": ["bash", "scripts/product/not-implemented.sh", "deployment", "V01-T02"], "timeout_seconds": 3600},
-    "soak": {"mode": "live", "argv": ["bash", "scripts/product/not-implemented.sh", "soak", "M7-T03"], "timeout_seconds": 345600, "artifacts": ["live-sessions.json", "timeline.jsonl"]},
-    "independent-qa": {"mode": "live", "argv": ["bash", "scripts/product/not-implemented.sh", "independent-qa", "V01-T01"], "timeout_seconds": 14400, "artifacts": ["live-sessions.json"]},
-    "independent-review": {"mode": "live", "argv": ["bash", "scripts/product/not-implemented.sh", "independent-review", "V01-T01"], "timeout_seconds": 14400, "artifacts": ["live-sessions.json"]},
-    "traceability": {"mode": "product", "argv": ["bash", "scripts/product/not-implemented.sh", "traceability", "M3-T02"], "timeout_seconds": 1800}
+    "build": {
+      "mode": "product",
+      "argv": [
+        "bash",
+        "scripts/product/build.sh"
+      ],
+      "timeout_seconds": 3600
+    },
+    "static": {
+      "mode": "product",
+      "argv": [
+        "bash",
+        "scripts/product/static.sh"
+      ],
+      "timeout_seconds": 1800
+    },
+    "unit": {
+      "mode": "product",
+      "argv": [
+        "bash",
+        "scripts/product/cargo-tests.sh",
+        "unit"
+      ],
+      "timeout_seconds": 3600
+    },
+    "integration": {
+      "mode": "product",
+      "argv": [
+        "bash",
+        "scripts/product/cargo-tests.sh",
+        "integration"
+      ],
+      "timeout_seconds": 3600
+    },
+    "recovery": {
+      "mode": "product",
+      "argv": [
+        "bash",
+        "scripts/product/not-implemented.sh",
+        "recovery",
+        "M2-T05"
+      ],
+      "timeout_seconds": 7200
+    },
+    "adapter-live": {
+      "mode": "live",
+      "argv": [
+        "bash",
+        "scripts/product/not-implemented.sh",
+        "adapter-live",
+        "M1-T03"
+      ],
+      "timeout_seconds": 7200,
+      "artifacts": [
+        "live-sessions.json"
+      ]
+    },
+    "plugin-live": {
+      "mode": "live",
+      "argv": [
+        "bash",
+        "scripts/product/not-implemented.sh",
+        "plugin-live",
+        "M5-T03"
+      ],
+      "timeout_seconds": 7200,
+      "artifacts": [
+        "live-sessions.json"
+      ]
+    },
+    "tui-pty": {
+      "mode": "product",
+      "argv": [
+        "bash",
+        "scripts/product/not-implemented.sh",
+        "tui-pty",
+        "M1-T08"
+      ],
+      "timeout_seconds": 3600
+    },
+    "web-e2e": {
+      "mode": "product",
+      "argv": [
+        "bash",
+        "scripts/product/not-implemented.sh",
+        "web-e2e",
+        "M6-T02"
+      ],
+      "timeout_seconds": 3600
+    },
+    "deployment": {
+      "mode": "product",
+      "argv": [
+        "bash",
+        "scripts/product/not-implemented.sh",
+        "deployment",
+        "V01-T02"
+      ],
+      "timeout_seconds": 3600
+    },
+    "soak": {
+      "mode": "live",
+      "argv": [
+        "bash",
+        "scripts/product/not-implemented.sh",
+        "soak",
+        "M7-T03"
+      ],
+      "timeout_seconds": 345600,
+      "artifacts": [
+        "live-sessions.json",
+        "timeline.jsonl"
+      ]
+    },
+    "independent-qa": {
+      "mode": "live",
+      "argv": [
+        "bash",
+        "scripts/product/not-implemented.sh",
+        "independent-qa",
+        "M2-T10"
+      ],
+      "timeout_seconds": 14400,
+      "artifacts": [
+        "live-sessions.json"
+      ]
+    },
+    "independent-review": {
+      "mode": "live",
+      "argv": [
+        "bash",
+        "scripts/product/not-implemented.sh",
+        "independent-review",
+        "M2-T10"
+      ],
+      "timeout_seconds": 14400,
+      "artifacts": [
+        "live-sessions.json"
+      ]
+    },
+    "traceability": {
+      "mode": "product",
+      "argv": [
+        "bash",
+        "scripts/product/not-implemented.sh",
+        "traceability",
+        "M2-T10"
+      ],
+      "timeout_seconds": 1800
+    }
   }
 }

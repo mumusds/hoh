@@ -1,0 +1,2 @@
+{"id": "s2", "type": "get_state"}
+{"id": "p2", "type": "prompt", "message": "Repeat the exact token you replied with in the previous turn, and nothing else."}

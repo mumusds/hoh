@@ -1,0 +1,18 @@
+{
+  "agent": "pi",
+  "cli_version": "1.5.0",
+  "case": "rpc-prompt",
+  "argv": [
+    "pi",
+    "--mode",
+    "rpc",
+    "--session-dir",
+    "<temp>/pi-sessions"
+  ],
+  "cwd": "fresh temp Git repo outside the checkout",
+  "exit_code": 0,
+  "recorded_at": "2026-11-03T17:39:26.596148+00:00",
+  "mode": "live",
+  "valid": true,
+  "notes": "get_state then one prompt until agent_settled"
+}

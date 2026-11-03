@@ -10,11 +10,12 @@
     "--verbose",
     "--dangerously-skip-permissions",
     "--resume",
-    "37511cf5-39bd-480c-9e3f-130e000802d1"
+    "<session_id of success>"
   ],
-  "cwd": "<temp git repo>",
+  "cwd": "fresh temp Git repo outside the checkout",
   "exit_code": 0,
-  "recorded_at": "2026-11-03T17:20:14.623862+00:00",
+  "recorded_at": "2026-11-03T17:37:26.566945+00:00",
   "mode": "live",
-  "notes": "second turn of the success session via --resume"
+  "valid": true,
+  "notes": "second turn via --resume"
 }

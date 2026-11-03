@@ -7,6 +7,6 @@ if [[ -f web/package.json ]]; then
   npm ci --prefix web
   npm run build --prefix web
 else
-  # M6-T03 must turn a missing web/ into a failure once the Web GUI is in scope.
+  # M6-T02 (Web GUI) must turn a missing web/ into a failure once the Web GUI is in scope.
   echo 'build: web/ not present yet (Web GUI arrives in M6); Rust workspace built.' >&2
 fi

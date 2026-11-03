@@ -45,12 +45,25 @@
    "kind": "setup",
    "owner_role": "researcher",
    "writer": false,
-   "title": "采集真实协议样例与认证状态：Codex App Server/exec、Claude stream-json、Pi RPC（不得打印token）",
+   "title": "采集真实协议样例：Claude stream-json 与 Pi RPC（含取消/恢复）；Codex 离线 schema 与未认证样例（不得打印token）",
    "depends_on": [
     "M0-T01"
    ],
    "requirements": [],
-   "done_when": "每个CLI保存版本、--help hash、成功/失败/取消样例fixture；无认证者记录BLOCKED_AUTH而非伪造样例。"
+   "done_when": "每个可用CLI的成功/失败/取消样例均经 record.py 校验为 valid；compat-manifest 记录版本、二进制与help哈希；无认证部分拆为独立任务并记录BLOCKED_AUTH。"
+  },
+  {
+   "id": "M0-T05",
+   "milestone": "M0",
+   "kind": "setup",
+   "owner_role": "researcher",
+   "writer": false,
+   "title": "采集 Codex 已认证真实样例：exec turn、App Server turn/start、steer 与 interrupt（需要 codex login）",
+   "depends_on": [
+    "M0-T01"
+   ],
+   "requirements": [],
+   "done_when": "tests/fixtures/protocol/record.py 录制的 Codex 已认证用例全部 valid，compat-manifest 中 codex auth 为 AUTHENTICATED；未登录前保持 blocked。"
   },
   {
    "id": "M1-T01",
@@ -231,7 +244,7 @@
    "kind": "implement",
    "owner_role": "developer",
    "writer": true,
-   "title": "冻结候选、证据有效性、QA/Review barrier与结果投影",
+   "title": "冻结候选、证据有效性、QA/Review barrier与结果投影；提供 v0.1 所需的 independent-qa / independent-review / traceability 检查脚本（经 run_check 运行原生独立会话并产出 live-sessions.json）",
    "depends_on": [
     "M2-T03",
     "M2-T05",
@@ -242,7 +255,7 @@
     "REQ-053",
     "REQ-054"
    ],
-   "done_when": "REQ-052/053/054全部AC通过；FAILED/UNKNOWN永不投影为PASS。"
+   "done_when": "REQ-052/053/054全部AC通过；FAILED/UNKNOWN永不投影为PASS。 tests/check-plan.json 中这三项检查不再指向 not-implemented.sh。"
   },
   {
    "id": "V01-T01",
@@ -892,7 +905,8 @@
    "title": "全量真实验收：全部检查、独立QA/Review、release_gate --profile v1",
    "depends_on": [
     "M7-T02",
-    "M7-T03"
+    "M7-T03",
+    "M0-T05"
    ],
    "requirements": [
     "REQ-001",

@@ -27,12 +27,14 @@ if [[ "$(id -u)" == 0 ]]; then
   exit 78
 fi
 DEV="$ROOT/.hoh-dev"; mkdir -p "$DEV" "$DEV/downloads" "$DEV/runtime" "$DEV/tooling" "$DEV/attempts"
-export PATH="$DEV/tooling/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+export PATH="$DEV/tooling/bin:$HOME/.local/bin:${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
 if [[ -d "$DEV/runtime/node/bin" ]]; then export PATH="$DEV/runtime/node/bin:$PATH"; fi
 # env.sh is regenerated only from paths; never write credentials here.
 python3 - "$ROOT" <<'ENV'
 import pathlib,sys,shlex
-r=pathlib.Path(sys.argv[1]);d=r/'.hoh-dev';paths=[d/'venv/bin',d/'runtime/node/bin',d/'tooling/bin',pathlib.Path.home()/'.local/bin',pathlib.Path.home()/'.cargo/bin']
+import os
+r=pathlib.Path(sys.argv[1]);d=r/'.hoh-dev';cargo=pathlib.Path(os.environ.get('CARGO_HOME') or pathlib.Path.home()/'.cargo')
+paths=[d/'venv/bin',d/'runtime/node/bin',d/'tooling/bin',pathlib.Path.home()/'.local/bin',cargo/'bin']
 env=shlex.quote(str(r/'.env'))
 (d/'env.sh').write_text('# Source this in each new development shell. No secrets are written here.\nexport HOH_PROJECT_ROOT='+shlex.quote(str(r))+'\nexport PATH='+shlex.quote(':'.join(map(str,paths)))+':"$PATH"\n'
   '# Optional user overrides (see .env.example); .env is gitignored.\nif [ -f '+env+' ]; then set -a; . '+env+'; set +a; fi\n',encoding='utf-8')

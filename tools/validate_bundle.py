@@ -14,6 +14,21 @@ from gen_spec_views import stale as stale_views
 DEGRADABLE={'REQ-048','REQ-049','REQ-050'}
 TASK_KINDS={'setup','spec','implement','verify','release'}
 TRIVIAL_COMMANDS={'true',':','echo','printf','exit','yes'}
+SHELLS={'bash','sh','dash','zsh','ksh'}
+INTERPRETERS={'python','python3','node','perl','ruby'}
+
+def plan_command_problem(argv:list[str])->str|None:
+    """Checks must run committed, reviewable commands: no always-succeeding builtins, no inline code."""
+    args=list(argv)
+    while args and Path(args[0]).name=='env':  # env [-i] [VAR=value ...] command
+        args=[a for a in args[1:] if not a.startswith('-')]
+        while args and '=' in args[0]:args=args[1:]
+    if not args:return 'empty command'
+    name=Path(args[0]).name
+    if name in TRIVIAL_COMMANDS:return f'always-succeeding command {args[0]!r}'
+    if (name in SHELLS or name.rstrip('0123456789.') in INTERPRETERS) and any(a in ('-c','-e','--eval') for a in args[1:]):
+        return f'inline code via {args[0]} {"/".join(a for a in args[1:] if a in ("-c","-e","--eval"))}; commit a script instead'
+    return None
 
 # The kit owns these paths. Product sources (crates/, web/, tests/ fixtures …) have their own linters,
 # so their JSON/TOML/Markdown is never parsed or link-checked here.
@@ -110,6 +125,7 @@ def validate(root:Path)->dict:
     for path in ['context-handoff.json','hcp-message.json','command.json']:
         try:Draft202012Validator(proto).validate(load_json(root/'examples'/path))
         except Exception as e:errors.append(f'example {path}: {e}')
+    check((root/'tests/check-plan.json').is_file() or not (root/'Cargo.toml').is_file(),'tests/check-plan.json is required once the Cargo workspace exists')
     for rel in ['examples/check-plan.json','tests/check-plan.json']:
         if not (root/rel).is_file():continue
         try:
@@ -117,7 +133,8 @@ def validate(root:Path)->dict:
             check(set(plan['checks'])==set(policy['checks']),f'{rel}: must declare exactly the release-policy checks')
             for cid,entry in plan['checks'].items():
                 rule=policy['checks'].get(cid,{})
-                check(Path(entry['argv'][0]).name not in TRIVIAL_COMMANDS,f'{rel}: {cid} uses an always-succeeding command {entry["argv"][0]!r}')
+                problem=plan_command_problem(entry['argv'])
+                check(problem is None,f'{rel}: {cid} uses {problem}')
                 check(entry['mode']==rule.get('mode'),f'{rel}: {cid} mode {entry["mode"]} but policy needs {rule.get("mode")}')
                 if entry['mode']=='live':check(policy['artifacts']['live_sessions'] in entry.get('artifacts',[]),f'{rel}: live check {cid} must declare {policy["artifacts"]["live_sessions"]}')
             check(policy['artifacts']['soak_timeline'] in plan['checks'].get('soak',{}).get('artifacts',[]),f'{rel}: soak must declare {policy["artifacts"]["soak_timeline"]}')

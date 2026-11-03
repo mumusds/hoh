@@ -39,10 +39,11 @@ def main(argv=None):
         old=lock['plugins'].get(item['id'],{})
         entry={'package':item['package'],'source':item['source'],'compatibility':'NOT_TESTED'}
         try:
-            version=old.get('version') or run(['npm','view',item['package'],'version'],60)
+            version=item.get('version') or old.get('version') or run(['npm','view',item['package'],'version'],60)
             if not version or '\n' in version:raise RuntimeError('invalid npm version result')
-            integrity=old.get('integrity') or run(['npm','view',f'{item["package"]}@{version}','dist.integrity'],60)
+            integrity=run(['npm','view',f'{item["package"]}@{version}','dist.integrity'],60)
             if not integrity.startswith('sha512-'):raise RuntimeError('npm registry returned no sha512 integrity')
+            if item.get('integrity') and integrity!=item['integrity']:raise RuntimeError(f'registry integrity {integrity} differs from the pinned {item["integrity"]}')
             entry.update(version=version,integrity=integrity,state='RESOLVED')
             lock['plugins'][item['id']]=entry;atomic_json(lock_path,lock)
             run(['pi','install','--local',*approve,f'npm:{item["package"]}@{version}'],600)

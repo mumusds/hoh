@@ -8,7 +8,9 @@
       "source": "https://github.com/alpertarhan/pi-smart-compact",
       "purpose": "context-continuity",
       "install_by_default": true,
-      "configuration_policy": "Resolve installed-version settings; disable optional cross-session memory if Hermes owns it. Do not invent keys."
+      "configuration_policy": "Resolve installed-version settings; disable optional cross-session memory if Hermes owns it. Do not invent keys.",
+      "version": "10.7.3",
+      "integrity": "sha512-dm0OQ53mCIfV/Ri0fvOhhT3goLRd1Yaa6g/0wUpji+J62xHkB/1XtiXlXpgl1D+fmur6rYNyuJflbpXpykG+tA=="
     },
     {
       "id": "hermes-memory",
@@ -16,7 +18,9 @@
       "source": "https://github.com/chandra447/pi-hermes-memory",
       "purpose": "long-term-memory",
       "install_by_default": true,
-      "configuration_policy": "Project-scoped facts; policy-only does not replace hard context; verify concurrency and compact hooks."
+      "configuration_policy": "Project-scoped facts; policy-only does not replace hard context; verify concurrency and compact hooks.",
+      "version": "0.10.0",
+      "integrity": "sha512-H0q2jTsyBcp0Q85eZFABke2gFId646pHkkgp2YqSMCumyTWxndsTtmdX1e97OW5nh+mu/SMRYLnxNlO9zLfutw=="
     },
     {
       "id": "todo",
@@ -24,7 +28,9 @@
       "source": "https://github.com/juicesharp/rpiv-mono",
       "purpose": "pi-local-tasks",
       "install_by_default": true,
-      "configuration_policy": "Do not install whole rpiv workflow; no global-state authority."
+      "configuration_policy": "Do not install whole rpiv workflow; no global-state authority.",
+      "version": "2.15.0",
+      "integrity": "sha512-8WfYssdgQgSWzFNsRzdw5Z6ZJIjO2ecM/YqEzYpR/ore+Hh5aNmafGVy94uFbIofAv2wGGitx5e3J/ucRrViXQ=="
     }
   ]
 }

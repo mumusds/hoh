@@ -10,9 +10,18 @@
     "--verbose",
     "--dangerously-skip-permissions"
   ],
-  "cwd": "<temp git repo>",
+  "cwd": "fresh temp Git repo outside the checkout",
   "exit_code": 0,
-  "recorded_at": "2026-11-03T17:20:30.063740+00:00",
+  "recorded_at": "2026-11-03T17:37:37.828699+00:00",
   "mode": "live",
-  "notes": "SIGINT to the process group ~12 s after start, while the tool runs"
+  "valid": true,
+  "notes": "SIGINT to the process group 4 s after a foreground Bash tool_use frame, before its tool_result",
+  "sigint_after_frame_index": 4,
+  "recorder_state": "SIGINT sent during foreground tool",
+  "frames_after_sigint": [
+    "system:task_notification",
+    "user",
+    "user",
+    "result:error_during_execution"
+  ]
 }

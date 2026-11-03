@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-11-03T17:20:01.011826+00:00",
+  "checked_at": "2026-11-03T17:37:47.230486+00:00",
   "command": [
     "codex",
     "login",
@@ -7,6 +7,5 @@
   ],
   "exit_code": 1,
   "output": "Not logged in",
-  "state": "BLOCKED_AUTH",
-  "live_samples": "NOT_RUN (no login)"
+  "state": "BLOCKED_AUTH"
 }

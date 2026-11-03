@@ -46,9 +46,12 @@ class BundleContracts(unittest.TestCase):
         import validate_bundle
         with tempfile.TemporaryDirectory() as d:
             root=Path(d)/'kit';shutil.copytree(ROOT,root,ignore=shutil.ignore_patterns('.git','.hoh-dev','__pycache__','target','npm'))
-            plan=load_json(root/'tests/check-plan.json');plan['checks']['recovery']['argv']=['true']
-            (root/'tests/check-plan.json').write_text(json.dumps(plan))
-            r=validate_bundle.validate(root);self.assertTrue(any('always-succeeding' in e for e in r['errors']),r['errors'])
+            for argv,message in [(['true'],'always-succeeding'),(['env','X=1','true'],'always-succeeding'),(['bash','-c','exit 0'],'inline code'),
+                                 (['python3','-c','pass'],'inline code'),(['sh','-c',':'],'inline code')]:
+                plan=load_json(ROOT/'tests/check-plan.json');plan['checks']['recovery']['argv']=argv
+                (root/'tests/check-plan.json').write_text(json.dumps(plan))
+                r=validate_bundle.validate(root)
+                with self.subTest(argv=argv):self.assertTrue(any(message in e for e in r['errors']),r['errors'])
     def test_original_skills_available(self):
         skills=load_json(ROOT/'resources/skills/registry.json')['skills'];self.assertEqual(len(skills),12)
         for s in skills:self.assertTrue((ROOT/s['entry']).is_file())

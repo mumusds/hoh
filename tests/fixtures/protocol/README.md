@@ -1,21 +1,32 @@
 # Native protocol fixtures (M0-T04)
 
-Recorded on the development VM on 2026-11-03 against the CLI versions in `compat-manifest.json`.
-They are replay inputs for adapter tests (REQ-024/025/026/027). Never edit them by hand; re-record
-when a CLI version changes and keep the old directory until the compat suite has been rerun.
+Replay inputs for adapter tests (REQ-024/025/026/027), recorded on the development VM against the
+versions and binaries pinned in `compat-manifest.json`. Never edit them by hand. Re-record with
 
-Each case directory holds `meta.json` (exact argv, exit code, timestamp), raw `stdout.jsonl`,
-`stderr.log` and, when a protocol is driven over stdin, `stdin.jsonl`. Claude was run with the
-parent Claude Code session variables removed from the environment (see `tools/agent_task.py`).
+    python3 tests/fixtures/protocol/record.py [--agents claude,codex,pi]
 
-| Agent | Case | Status | Observation that adapters must honor |
+which runs every case in a fresh temporary Git repository outside this checkout, strips the parent
+agent-session variables (`tools/agent_task.py` `PARENT_SESSION_VARS`), stores the exact stdin, raw
+stdout/stderr and `meta.json`, refuses cases that do not show what they claim (`valid`), and rewrites
+the manifest. Keep the previous version directory until the compat suite has been rerun.
+
+Provenance limits: the operator's user-level agent configuration (plugins, hooks, account, rate-limit
+state) applies to live runs and appears in the raw frames (local paths, plugin inventory, rate-limit
+and overage metadata). No credentials are present. Fixtures stay byte-exact because adapter tests
+compare raw bytes; the repository is private.
+
+| Agent | Case | Status | What adapters must honor |
 |---|---|---|---|
-| claude 2.1.317 | `success` | live | `system:init` carries `session_id` and `model`; a `rate_limit_event` frame appears before `result` and must be kept as an unknown/auxiliary event |
+| claude 2.1.317 | `success` | live | `system:init` carries `session_id` and `model`; an undocumented `rate_limit_event` frame precedes `result` and must be kept as an unknown/auxiliary event |
 | claude 2.1.317 | `resume` | live | `--resume <session_id>` continues the same session id |
 | claude 2.1.317 | `max-turns-error` | live | `result` subtype `error_max_turns`, exit code 1 |
-| claude 2.1.317 | `sigint-cancel` | live | SIGINT during a tool run ends with **exit code 0 and no `result` frame**; success must never be inferred from the exit code |
-| pi 1.5.0 | `rpc-no-provider` | live (no provider) | `get_state` works without a model; `prompt` returns `success:false` "No API key found" → REJECTED / BLOCKED_AUTH, no `agent_settled` to wait for |
-| codex 0.166.0 | `app-server-schema/` | offline | App Server JSON Schema from `codex app-server generate-json-schema`; live samples NOT_RUN because Codex is not logged in (BLOCKED_AUTH) |
+| claude 2.1.317 | `sigint-cancel` | live | SIGINT while a foreground tool runs yields `result` subtype `error_during_execution`, `is_error: true`, **exit code 0** — success must come from the result frame, never from the exit code |
+| pi 1.5.0 | `rpc-prompt` | live | `prompt` response `disposition: "started"`; `agent_start` … `agent_end` → `agent_settled` |
+| pi 1.5.0 | `rpc-resume` | live | a new process with the same `--session-dir` and `--session-id` reports the same `sessionId` and remembers the previous turn |
+| pi 1.5.0 | `rpc-abort` | live | `abort` during streaming ends the assistant message with `stopReason: "aborted"` and still emits `agent_settled` |
+| codex 0.166.0 | `exec-unauthenticated` | live, no login | `thread.started`, `turn.started`, repeated `error` frames, exit code 1 |
+| codex 0.166.0 | `app-server-handshake-unauthenticated` | live, no login | `initialize` and `thread/start` succeed without login (`thread/started` notification); failures surface only once a turn runs |
+| codex 0.166.0 | `app-server-schema/` | offline | JSON Schema from `codex app-server generate-json-schema` (tree hash in the manifest) |
 
-Missing live samples (Codex exec/App Server turns, Pi turns with a provider) are external blockers,
-not gaps to be filled with invented frames.
+Codex authenticated turns (exec and App Server `turn/start`, steer, interrupt) are NOT_RUN until
+`codex login` is done (task M0-T05). They are an external blocker, not a gap to fill with invented frames.

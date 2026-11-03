@@ -17,7 +17,7 @@ if '--help' in args:
 if '--version' in args:print('MOCK_AGENT_VERSION');sys.exit(0)
 data=sys.stdin.buffer.read()
 if os.environ.get('FAKE_TRACE'):
- open(os.environ['FAKE_TRACE'],'w').write(json.dumps({'argv':args,'stdin':data.decode(),'env':sorted(k for k in os.environ if k.startswith(('CLAUDE','CODEX','HOH_','ANTHROPIC')))}))
+ open(os.environ['FAKE_TRACE'],'w').write(json.dumps({'argv':args,'stdin':data.decode(),'env':sorted(k for k in os.environ if k.startswith(('CLAUDE','CODEX','HOH_','ANTHROPIC','AI_')))}))
 mode=os.getenv('FAKE_MODE','ok')
 print('mock diagnostic',file=sys.stderr)
 if mode=='exit-error':sys.exit(7)
@@ -72,11 +72,14 @@ class NativeBridge(unittest.TestCase):
         self.assertEqual(p.returncode,2);self.assertIn('already inside bootstrap session',p.stderr)
     def test_parent_session_variables_not_inherited(self):
         parent={'CLAUDECODE':'1','CLAUDE_CODE_SESSION_ID':'parent','CLAUDE_CODE_MESSAGING_TOKEN':'secret','CLAUDE_CODE_MESSAGING_SOCKET':'/tmp/s',
-                'CLAUDE_CODE_ENTRYPOINT':'cli','CODEX_SANDBOX':'seatbelt','CLAUDE_CODE_USE_BEDROCK':'1','ANTHROPIC_MODEL':'m'}
-        self.env=self.env|parent;p,_=self.bridge(agent='claude');self.assertEqual(p.returncode,0,p.stderr)
+                'CLAUDE_CODE_ENTRYPOINT':'cli','CODEX_SANDBOX':'seatbelt','AI_AGENT':'claude-code_x','CLAUDE_CODE_USE_BEDROCK':'1','ANTHROPIC_MODEL':'m',
+                'CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS':'1'}
+        self.env=self.env|parent;p,out=self.bridge(agent='claude');self.assertEqual(p.returncode,0,p.stderr)
         seen=set(load_json(self.root/'trace.json')['env'])
-        self.assertFalse(seen&{'CLAUDECODE','CLAUDE_CODE_SESSION_ID','CLAUDE_CODE_MESSAGING_TOKEN','CLAUDE_CODE_MESSAGING_SOCKET','CLAUDE_CODE_ENTRYPOINT','CODEX_SANDBOX'})
-        self.assertTrue({'CLAUDE_CODE_USE_BEDROCK','ANTHROPIC_MODEL','HOH_BOOTSTRAP_PARENT'}<=seen)  # provider config and our marker stay
+        removed={'CLAUDECODE','CLAUDE_CODE_SESSION_ID','CLAUDE_CODE_MESSAGING_TOKEN','CLAUDE_CODE_MESSAGING_SOCKET','CLAUDE_CODE_ENTRYPOINT','CODEX_SANDBOX'}
+        self.assertFalse(seen&(removed|{'AI_AGENT'}))
+        self.assertTrue({'CLAUDE_CODE_USE_BEDROCK','ANTHROPIC_MODEL','CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS','HOH_BOOTSTRAP_PARENT'}<=seen)  # config and our marker stay
+        self.assertTrue(removed|{'AI_AGENT'}<=set(load_json(out/'attempt.json')['env_removed']))
     def test_child_sees_parent_marker(self):
         p,out=self.bridge();self.assertEqual(p.returncode,0,p.stderr)
         self.assertEqual(load_json(out/'attempt.json')['cli_version'],'MOCK_AGENT_VERSION')
