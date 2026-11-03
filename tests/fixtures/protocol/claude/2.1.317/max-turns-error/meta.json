@@ -14,7 +14,7 @@
   ],
   "cwd": "fresh temp Git repo outside the checkout",
   "exit_code": 1,
-  "recorded_at": "2026-11-03T22:45:50.704255+00:00",
+  "recorded_at": "2026-11-03T23:03:16.291909+00:00",
   "mode": "live",
   "notes": "tool use needs a second turn",
   "stopped": "exited",

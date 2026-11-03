@@ -91,6 +91,14 @@ def alive(pid: int) -> bool:
     return proc_state(pid) not in (None, 'Z')
 
 
+def start_time(pid: int) -> int | None:
+    """Start time in clock ticks since boot (/proc/<pid>/stat field 22), None when the process is gone."""
+    try:
+        return int(Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[19])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
 def carrying(token: str) -> list[int]:
     """Live processes whose environment holds this Proc's token: the child and every descendant that kept the
     inherited environment, wherever it was re-parented and whatever session or group it moved to (M0R5-02/06).
@@ -106,11 +114,41 @@ def carrying(token: str) -> list[int]:
     return found
 
 
+def unverifiable(since: int) -> list[int]:
+    """Our own live processes started at or after `since` whose environment we may not read (e.g. made non-dumpable):
+    they could be descendants, so a case cannot be shown clean while they run (M0R6-02). They are not killed,
+    because they could equally be unrelated."""
+    found = []
+    for environ in Path('/proc').glob('[0-9]*/environ'):
+        try:
+            pid = int(environ.parent.name)
+            if environ.parent.stat().st_uid != os.getuid():
+                continue
+            environ.read_bytes()
+        except PermissionError:
+            started = start_time(pid)
+            if started is not None and started >= since and alive(pid):
+                found.append(pid)
+        except (OSError, ValueError):
+            continue
+    return found
+
+
 class Stopped(str):
     """How a child ended (exited, SIGTERM, ...), with the command lines of descendants that outlived it: `lingered`
-    ended by themselves within the grace period, `descendants` had to be killed."""
+    ended by themselves within the grace period, `descendants` had to be killed, `unverifiable` might be ours but
+    their environment cannot be read."""
     descendants: list[str] = []
     lingered: list[str] = []
+    unverifiable: list[str] = []
+
+
+def child_setup() -> None:
+    """Runs in the child before exec: default dispositions and an empty mask for the signals the recorder uses, also
+    when the recorder itself was started with SIGINT ignored (a background job) — Claude's cancel needs SIGINT."""
+    for sig in SIGNALS:
+        signal.signal(sig, signal.SIG_DFL)
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, SIGNALS)
 
 
 def cmdline(pid: int) -> str:
@@ -134,6 +172,7 @@ class Proc:
         self.close_requested = False
         self.descendants: list[str] = []  # command lines of descendants killed by stop()
         self.lingered: list[str] = []  # descendants that outlived the child but ended on their own
+        self.hidden: list[str] = []  # processes that may be descendants but whose environment is unreadable
         self.sel = selectors.DefaultSelector()
         # Signals stay blocked until the child is fully registered, so an interrupt is handled only once stop_all()
         # can find it (M0R5-01); the child unblocks them before exec.
@@ -141,8 +180,9 @@ class Proc:
         try:
             self.p = subprocess.Popen(argv, cwd=cwd, env=(env or ENV) | {TOKEN_VAR: self.token}, stdin=subprocess.PIPE,
                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
-                                      preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_UNBLOCK, SIGNALS))
+                                      preexec_fn=child_setup)
             LIVE.add(self)
+            self.started = start_time(self.p.pid) or 0
             os.set_blocking(self.p.stdin.fileno(), False)
             self.sel.register(self.p.stdout, selectors.EVENT_READ)
             self.sel.register(self.p.stderr, selectors.EVENT_READ)
@@ -264,51 +304,89 @@ class Proc:
         """Give descendants that outlived the child up to `grace` s to end by themselves (Claude can leave the last
         `sleep` of a cancelled tool for a moment); they are recorded, and only those still running get killed."""
         deadline = time.monotonic() + grace
-        seen = {pid: cmdline(pid) for pid in carrying(self.token) if pid != self.p.pid}
-        while seen and time.monotonic() < deadline:
-            running = set(carrying(self.token))
-            for pid in [pid for pid in seen if pid not in running]:
-                self.lingered.append(seen.pop(pid))
-            if seen:
-                time.sleep(0.05)
+        running: dict[int, str] = {}
+        while True:  # rescan each round: descendants born during the grace period count too (M0R6-03)
+            now_running = {pid for pid in carrying(self.token) if pid != self.p.pid}
+            for pid in now_running:
+                running.setdefault(pid, cmdline(pid))
+            for pid in [pid for pid in running if pid not in now_running]:
+                self.lingered.append(running.pop(pid))
+            if not running or time.monotonic() >= deadline:
+                return
+            time.sleep(0.05)
 
     def stop(self, grace: float = 20, term_grace: float = 10, kill_grace: float = 5, descendant_grace: float = 5) -> Stopped:
         """Finish writing stdin, close it and wait `grace` s for exit; then SIGTERM the group, then SIGKILL it, each
-        bounded. Afterwards, on every path, processes still carrying the token (descendants that left the group,
-        with or without its pipes) are killed: `+descendants-killed`. Pipes still open even then are closed
-        (`+abandoned`). Returns how it ended."""
+        bounded. Afterwards, on every path, processes still carrying the token are given `descendant_grace` s to end
+        by themselves (`lingered`) and then killed (`+descendants-killed`); possible descendants whose environment is
+        unreadable make it `+descendants-unverifiable`. Pipes still open even then are closed (`+abandoned`).
+        If an exception (SIGINT, SIGTERM) interrupts this, the child is terminated before it propagates and stays
+        registered until then (M0R6-01)."""
         self.close_requested = True
-        how = 'exited'
         try:
-            self.flush()
-            finished = False
-            for sig, wait in ((None, grace), (signal.SIGTERM, term_grace), (signal.SIGKILL, kill_grace)):
-                if sig is not None:
-                    how = sig.name
-                    self.close_stdin()
-                    self.signal(sig)
-                if self.drain(wait):
-                    finished = True
-                    break
-            if finished:
-                self.outlived(descendant_grace)
-            if self.kill_descendants(kill_grace):
-                how += '+descendants-killed'
-            if not finished and not self.drain(kill_grace):
-                for key in list(self.sel.get_map().values()):
-                    self.sel.unregister(key.fileobj)
-                    key.fileobj.close()
-                how += '+abandoned'
-                try:
-                    self.p.wait(timeout=kill_grace)
-                except subprocess.TimeoutExpired:
-                    pass
-            result = Stopped(how)
-            result.descendants, result.lingered = list(self.descendants), list(self.lingered)
-            return result
-        finally:
+            result = self.stop_gracefully(grace, term_grace, kill_grace, descendant_grace)
+        except BaseException:
+            self.terminate()
+            raise
+        LIVE.discard(self)
+        return result
+
+    def stop_gracefully(self, grace: float, term_grace: float, kill_grace: float, descendant_grace: float) -> Stopped:
+        how = 'exited'
+        self.flush()
+        finished = False
+        for sig, wait in ((None, grace), (signal.SIGTERM, term_grace), (signal.SIGKILL, kill_grace)):
+            if sig is not None:
+                how = sig.name
+                self.close_stdin()
+                self.signal(sig)
+            if self.drain(wait):
+                finished = True
+                break
+        if finished:
+            self.outlived(descendant_grace)
+        if self.kill_descendants(kill_grace):
+            how += '+descendants-killed'
+        if not finished and not self.drain(kill_grace):
+            self.close_pipes()
+            how += '+abandoned'
+            try:
+                self.p.wait(timeout=kill_grace)
+            except subprocess.TimeoutExpired:
+                pass
+        self.close_stdin()
+        self.hidden = [f'{pid} {cmdline(pid)}' for pid in unverifiable(self.started)]
+        if self.hidden:
+            how += '+descendants-unverifiable'
+            print('warning: processes that may be descendants could not be checked (environment unreadable): ' + '; '.join(self.hidden), file=sys.stderr)
+        result = Stopped(how)
+        result.descendants, result.lingered, result.unverifiable = list(self.descendants), list(self.lingered), list(self.hidden)
+        return result
+
+    def close_pipes(self) -> None:
+        for key in list(self.sel.get_map().values()):
+            self.sel.unregister(key.fileobj)
+            key.fileobj.close()
+
+    def terminate(self) -> None:
+        """Kill the child, its group and its descendants now, with SIGINT/SIGTERM/SIGHUP blocked so a second signal
+        cannot interrupt the cleanup; bounded (about 10 s). Unregisters the Proc when done."""
+        blocked = signal.pthread_sigmask(signal.SIG_BLOCK, SIGNALS)
+        try:
             self.close_stdin()
+            self.signal(signal.SIGTERM)
+            if not self.drain(2):
+                self.signal(signal.SIGKILL)
+                self.drain(3)
+            self.kill_descendants(3)
+            self.close_pipes()
+            try:
+                self.p.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+        finally:
             LIVE.discard(self)
+            signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
 
     @property
     def returncode(self) -> int | None:
@@ -316,11 +394,11 @@ class Proc:
 
 
 def stop_all() -> None:
-    """Stop every child still running, e.g. after SIGINT/SIGTERM interrupted a case (M0R4-01). A failure to stop one
-    is reported and does not prevent stopping the others (M0R5-01)."""
+    """Terminate every child still registered, e.g. after SIGINT/SIGTERM interrupted a case (M0R4-01). A failure to
+    terminate one is reported and does not prevent terminating the others (M0R5-01)."""
     for p in list(LIVE):
         try:
-            p.stop(grace=0, term_grace=5, kill_grace=5, descendant_grace=0)
+            p.terminate()
         except Exception as exc:  # keep going: the remaining children and the caller's cleanup still matter
             LIVE.discard(p)
             print(f'warning: could not stop child {getattr(getattr(p, "p", None), "pid", "?")}: {type(exc).__name__}: {exc}', file=sys.stderr)
@@ -638,9 +716,11 @@ class Recording:
             meta['descendants_killed'] = stop.descendants
         if getattr(stop, 'lingered', None):
             meta['descendants_lingered'] = stop.lingered  # outlived the CLI briefly, ended on their own
+        if getattr(stop, 'unverifiable', None):
+            meta['descendants_unverifiable'] = stop.unverifiable
         fs = frames(stdout)
         problems = VALIDATORS[(self.agent, case)](fs, rc, meta, sent_messages(stdin), self.ctx)
-        if stop is not None and any(word in stop for word in ('SIGKILL', 'descendants', 'abandoned')):
+        if stop is not None and any(word in stop for word in ('SIGKILL', 'descendants-killed', 'descendants-unverifiable', 'abandoned')):
             problems.append(f'process cleanup: {stop}')  # a child that had to be killed or left descendants (M0R4-07, M0R5-02)
         meta |= {'valid': not problems, 'problems': problems}
         (d / 'meta.json').write_text(json.dumps(meta, ensure_ascii=False, indent=2) + '\n')
@@ -997,11 +1077,15 @@ AGENTS = {'claude': claude, 'codex': codex, 'pi': pi}
 
 def record(agent: str, root: Path = HERE) -> Path:
     """Record one agent into staging and publish it; raises RecordingFailed and leaves the published fixtures alone otherwise."""
-    version = INSTALLED_VERSION[agent]()
-    before = binaries(agent)
-    started = now()
-    rec = Recording(agent, version, root)
     previous = install_termination_handlers()  # SIGTERM/SIGHUP raise Terminated so children are stopped (M0R4-01)
+    try:
+        version = INSTALLED_VERSION[agent]()
+        before = binaries(agent)
+        started = now()
+        rec = Recording(agent, version, root)
+    except BaseException:
+        restore_handlers(previous)
+        raise
     try:
         AGENTS[agent](rec)
         if INSTALLED_VERSION[agent]() != version or binaries(agent) != before:
@@ -1072,20 +1156,24 @@ def main() -> int:
     if unknown:
         ap.error('unknown agents: ' + ', '.join(sorted(unknown)))
     failures = []
+    previous = install_termination_handlers()  # the whole run, including between agents (M0R6-04)
     try:
         for name in AGENTS:
             if name in selected:
                 try:
                     print(f'recorded {name}: {record(name, HERE)}')
                 except (KeyboardInterrupt, Terminated) as exc:
-                    print(f'interrupted while recording {name} ({type(exc).__name__}); its published fixtures are unchanged', file=sys.stderr)
-                    return 130
+                    print(f'interrupted while recording {name} ({type(exc).__name__} {exc}); its published fixtures are unchanged', file=sys.stderr)
+                    return 128 + signal.Signals[str(exc)] if isinstance(exc, Terminated) else 130
                 except RecordingFailed as exc:
                     failures.append(str(exc))
                     print(f'NOT recorded: {exc}', file=sys.stderr)
     finally:
-        write_manifest(HERE)  # also after an interrupt: agents published earlier in this run must be listed (M0R5-03)
-        print('wrote compat-manifest.json')
+        try:
+            write_manifest(HERE)  # also after an interrupt: agents published earlier in this run must be listed (M0R5-03)
+            print('wrote compat-manifest.json')
+        finally:
+            restore_handlers(previous)
     return 1 if failures else 0
 
 

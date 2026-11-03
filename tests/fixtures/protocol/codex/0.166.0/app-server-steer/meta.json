@@ -8,7 +8,7 @@
   ],
   "cwd": "fresh temp Git repo outside the checkout",
   "exit_code": 0,
-  "recorded_at": "2026-11-03T22:47:42.417705+00:00",
+  "recorded_at": "2026-11-03T23:05:14.910966+00:00",
   "mode": "live",
   "notes": "turn/steer with a stale expectedTurnId (must be rejected) and with the active turn id",
   "stopped": "exited",
