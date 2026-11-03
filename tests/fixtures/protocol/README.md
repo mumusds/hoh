@@ -15,7 +15,10 @@ every case is valid and the binary did not change meanwhile; otherwise the publi
 they were, the staging directory moves to `.hoh-dev/protocol-failed/` and the recorder exits 1 (also
 when an agent is not logged in). `provenance.json` holds the binary and help hashes and the auth state
 measured while recording; the manifest is rebuilt from those files and never re-measures binaries.
-Children are stopped with bounded escalation (close stdin, SIGTERM, SIGKILL of the process group).
+Children are stopped with bounded escalation (close stdin, SIGTERM, SIGKILL of the process group); the
+recorder is the child subreaper, so descendants that left the group are killed too, and a case whose
+process needed SIGKILL or left descendants is invalid. SIGINT/SIGTERM stop every child before the
+temporary directories are removed. Publishing swaps the directories atomically (`renameat2`).
 Keep the previous version directory until the compat suite has been rerun.
 
 Provenance limits: the operator's user-level agent configuration (plugins, hooks, account, rate-limit

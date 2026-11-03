@@ -63,12 +63,17 @@ class BundleContracts(unittest.TestCase):
                              (['bash','-O','extglob','-c','true'],'inline code'),(['python3','-W','ignore','-c','pass'],'inline code'),
                              (['python3','-X','dev','-c','pass'],'inline code'),(['python3','-Wignore','-c','pass'],'inline code'),
                              (['node','--eval=0'],'inline code'),(['node','--print=1'],'inline code'),(['node','-r','x','-e','0'],'inline code'),
-                             (['node','--require','x','--eval','0'],'inline code')]:
+                             (['node','--require','x','--eval','0'],'inline code'),
+                             # M0R4-08: long options with operands and env short-option clusters.
+                             (['bash','--rcfile','/dev/null','-c','exit 0'],'inline code'),(['bash','--init-file','x','-c','true'],'inline code'),
+                             (['python3','--check-hash-based-pycs','always','-c','pass'],'inline code'),(['env','-iS',"bash -c 'exit 0'"],'split-string'),
+                             (['env','-iu','X','true'],'always-succeeding'),(['env','-iC','/tmp','true'],'always-succeeding')]:
             with self.subTest(argv=argv):self.assertIn(message,problem(argv) or '')
         # Committed scripts stay allowed, also behind options whose values contain the inline letters.
         for argv in [['bash','scripts/product/check.sh','unit'],['bash','-o','pipefail','scripts/x.sh','-c'],['env','-','PATH=/usr/bin','bash','scripts/x.sh'],
                      ['python3','-W','default::DeprecationWarning','tools/x.py'],['python3','-Wdefault::DeprecationWarning','tools/x.py','-c'],
-                     ['python3','-m','unittest','discover'],['node','-r','./setup.js','scripts/x.mjs'],['node','--input-type=module','scripts/x.mjs']]:
+                     ['python3','-m','unittest','discover'],['node','-r','./setup.js','scripts/x.mjs'],['node','--input-type=module','scripts/x.mjs'],
+                     ['bash','--rcfile','/dev/null','scripts/x.sh'],['python3','--check-hash-based-pycs','never','tools/x.py'],['env','-iu','X','bash','scripts/x.sh']]:
             with self.subTest(argv=argv):self.assertIsNone(problem(argv))
     def test_compat_manifest_schema_matches_ac_027_01(self):
         # CR3R-04: the schema forbade the field names AC-027-01 required.

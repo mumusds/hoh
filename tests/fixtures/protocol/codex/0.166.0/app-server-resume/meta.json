@@ -8,10 +8,10 @@
   ],
   "cwd": "fresh temp Git repo outside the checkout",
   "exit_code": 0,
-  "recorded_at": "2026-11-03T21:59:34.524771+00:00",
+  "recorded_at": "2026-11-03T22:23:17.166425+00:00",
   "mode": "live",
   "notes": "new app-server process: thread/resume of app-server-turn, then a turn that must recall the token",
-  "resumed_thread_id": "01a1a36c-80f1-7df2-9ba7-ce3e733a83fe",
+  "resumed_thread_id": "01a1a382-3756-72a1-954e-667ab93c9033",
   "stopped": "exited",
   "valid": true,
   "problems": []

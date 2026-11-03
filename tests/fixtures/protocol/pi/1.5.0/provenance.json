@@ -1,8 +1,8 @@
 {
   "cli_version": "1.5.0",
   "auth": "AUTHENTICATED (live turn recorded)",
-  "recording_started_at": "2026-11-03T22:01:30.450124+00:00",
-  "recorded_at": "2026-11-03T22:01:53.111279+00:00",
+  "recording_started_at": "2026-11-03T22:23:36.639556+00:00",
+  "recorded_at": "2026-11-03T22:23:55.622907+00:00",
   "help_argv": [
     "pi",
     "--help"

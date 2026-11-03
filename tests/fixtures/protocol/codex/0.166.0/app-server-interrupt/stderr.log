@@ -1,1 +1,1 @@
-[2m2026-11-03T21:59:43.498910Z[0m [31mERROR[0m [2mcodex_core::tools::router[0m[2m:[0m [3merror[0m[2m=[0mtool call cancelled
+[2m2026-11-03T22:23:25.817587Z[0m [31mERROR[0m [2mcodex_core::session[0m[2m:[0m failed to record rollout items: thread 01a1a382-711a-7660-8404-1e528e816422 not found

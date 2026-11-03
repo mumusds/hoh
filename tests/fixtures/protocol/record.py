@@ -18,7 +18,7 @@ failed re-recording never leaves older successes looking current (M0R3-01, M0R3-
 Child processes are stopped with bounded escalation: close stdin, SIGTERM, SIGKILL, reap (M0R3-03).
 """
 from __future__ import annotations
-import argparse, hashlib, json, os, selectors, shutil, signal, subprocess, sys, tempfile, time
+import argparse, ctypes, errno, hashlib, json, os, selectors, shutil, signal, subprocess, sys, tempfile, time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -26,6 +26,7 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[2]
 sys.path.insert(0, str(REPO / 'tools'))
 from agent_task import PARENT_SESSION_VARS  # noqa: E402  (single source of the stripped variable list)
+from common import Terminated, install_termination_handlers, restore_handlers  # noqa: E402
 
 ENV = {k: v for k, v in os.environ.items() if k not in PARENT_SESSION_VARS}
 TOKEN = 'HOH_SAMPLE_OK'
@@ -72,32 +73,101 @@ def frames(raw: bytes) -> list[dict]:
 
 # --- processes ------------------------------------------------------------------------------------------
 
+LIBC = ctypes.CDLL(None, use_errno=True)
+LIVE: set['Proc'] = set()  # children not yet stopped, so an interrupted recording can stop them (M0R4-01)
+
+
+def enable_subreaper() -> bool:
+    """Make this process the Linux child subreaper: descendants that leave a child's process group (setsid) are
+    re-parented here instead of to init when their parent exits, so they can still be found and killed (M0R4-07)."""
+    return LIBC.prctl(36, 1, 0, 0, 0) == 0  # PR_SET_CHILD_SUBREAPER
+
+
+def reap_orphans() -> int:
+    """Kill and reap every process re-parented to us that is not one of our live children; returns how many."""
+    live = {p.p.pid for p in LIVE}
+    killed = 0
+    for stat in Path('/proc').glob('[0-9]*/stat'):
+        try:
+            pid, ppid = int(stat.parent.name), int(stat.read_text().rsplit(')', 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+        if ppid == os.getpid() and pid not in live:
+            try:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+                killed += 1
+            except (ProcessLookupError, ChildProcessError):
+                pass
+    return killed
+
+
 class Proc:
-    """A child in its own process group whose stdout and stderr are drained together, so neither pipe fills up."""
+    """A child in its own process group. stdin is written without blocking and stdout/stderr are drained in the same
+    loop, so no pipe can stall the recorder and every wait is bounded (M0R3-03, M0R4-06)."""
 
     def __init__(self, argv: list[str], cwd: Path, env: dict | None = None):
         self.p = subprocess.Popen(argv, cwd=cwd, env=env or ENV, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, start_new_session=True)
+        LIVE.add(self)
         self.out = b''
         self.err = b''
         self.sent = b''
+        self.pending = bytearray()
+        self.close_requested = False
+        os.set_blocking(self.p.stdin.fileno(), False)
         self.sel = selectors.DefaultSelector()
         self.sel.register(self.p.stdout, selectors.EVENT_READ)
         self.sel.register(self.p.stderr, selectors.EVENT_READ)
 
+    def reading(self) -> bool:
+        return any(k.fileobj is not self.p.stdin for k in self.sel.get_map().values())
+
+    def close_stdin(self) -> None:
+        self.pending.clear()
+        if not self.p.stdin.closed:
+            if self.p.stdin in [k.fileobj for k in self.sel.get_map().values()]:
+                self.sel.unregister(self.p.stdin)
+            try:
+                self.p.stdin.close()
+            except OSError:
+                pass
+
+    def flush(self) -> None:
+        """Write as much pending input as the pipe takes now; close stdin once everything requested is written."""
+        while self.pending and not self.p.stdin.closed:
+            try:
+                n = os.write(self.p.stdin.fileno(), self.pending[:65536])
+            except BlockingIOError:
+                break
+            except (BrokenPipeError, OSError):  # the CLI stopped reading; what it printed is still collected
+                self.close_stdin()
+                return
+            del self.pending[:n]
+        if self.p.stdin.closed:
+            return
+        waiting = self.p.stdin in [k.fileobj for k in self.sel.get_map().values()]
+        if self.pending and not waiting:
+            self.sel.register(self.p.stdin, selectors.EVENT_WRITE)
+        elif not self.pending and waiting:
+            self.sel.unregister(self.p.stdin)
+        if not self.pending and self.close_requested:
+            self.close_stdin()
+
     def write(self, data: bytes) -> None:
         self.sent += data
-        try:
-            self.p.stdin.write(data)
-            self.p.stdin.flush()
-        except BrokenPipeError:  # the CLI stopped reading; what it printed is still collected
-            pass
+        if not self.p.stdin.closed and not self.close_requested:
+            self.pending += data
+            self.flush()
 
     def pump(self, timeout: float) -> bool:
-        """Read what arrives within `timeout`; False once both streams are closed."""
-        if not self.sel.get_map():
+        """Write pending input and read what arrives within `timeout`; False once stdout and stderr are closed."""
+        if not self.reading():
             return False
         for key, _ in self.sel.select(timeout):
+            if key.fileobj is self.p.stdin:
+                self.flush()
+                continue
             chunk = os.read(key.fd, 65536)
             if not chunk:
                 self.sel.unregister(key.fileobj)
@@ -106,7 +176,7 @@ class Proc:
                 self.out += chunk
             else:
                 self.err += chunk
-        return bool(self.sel.get_map())
+        return self.reading()
 
     def frames(self) -> list[dict]:
         return frames(self.out)
@@ -126,40 +196,61 @@ class Proc:
         except ProcessLookupError:
             pass
 
+    def drain(self, wait: float) -> bool:
+        """Pump until stdout/stderr close and the child exits, at most `wait` seconds; True if it exited."""
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline:
+            if self.pump(min(0.5, max(0.0, deadline - time.monotonic()))):
+                continue
+            try:
+                self.p.wait(timeout=max(0.0, deadline - time.monotonic()))
+                return True
+            except subprocess.TimeoutExpired:
+                return False
+        return False
+
     def stop(self, grace: float = 20, term_grace: float = 10, kill_grace: float = 5) -> str:
-        """Close stdin and wait `grace` s for exit; then SIGTERM the group, then SIGKILL it, each bounded.
-        Returns how it ended: exited, SIGTERM, SIGKILL, or SIGKILL+abandoned when a descendant outside the
-        group still held a pipe open (those pipes are closed so the recorder never hangs)."""
-        try:
-            self.p.stdin.close()
-        except OSError:
-            pass
+        """Finish writing stdin, close it and wait `grace` s for exit; then SIGTERM the group, then SIGKILL it, each
+        bounded. Descendants that left the group and still hold a pipe are killed when we are their subreaper
+        (`+orphans-killed`); if pipes stay open even then they are closed (`+abandoned`). Returns how it ended."""
+        self.close_requested = True
+        self.flush()
         how = 'exited'
-        for sig, wait in ((None, grace), (signal.SIGTERM, term_grace), (signal.SIGKILL, kill_grace)):
-            if sig is not None:
-                how = sig.name
-                self.signal(sig)
-            deadline = time.monotonic() + wait
-            while time.monotonic() < deadline:
-                if self.pump(min(0.5, max(0.0, deadline - time.monotonic()))):
-                    continue
-                try:
-                    self.p.wait(timeout=max(0.0, deadline - time.monotonic()))
-                    return how
-                except subprocess.TimeoutExpired:
-                    break
-        for key in list(self.sel.get_map().values()):
-            self.sel.unregister(key.fileobj)
-            key.fileobj.close()
         try:
-            self.p.wait(timeout=kill_grace)
-        except subprocess.TimeoutExpired:
-            pass
-        return how + '+abandoned'
+            for sig, wait in ((None, grace), (signal.SIGTERM, term_grace), (signal.SIGKILL, kill_grace)):
+                if sig is not None:
+                    how = sig.name
+                    self.close_stdin()
+                    self.signal(sig)
+                if self.drain(wait):
+                    break
+            else:
+                if reap_orphans():
+                    how += '+orphans-killed'
+                if not self.drain(kill_grace):
+                    for key in list(self.sel.get_map().values()):
+                        self.sel.unregister(key.fileobj)
+                        key.fileobj.close()
+                    how += '+abandoned'
+                    try:
+                        self.p.wait(timeout=kill_grace)
+                    except subprocess.TimeoutExpired:
+                        pass
+            return how
+        finally:
+            self.close_stdin()
+            LIVE.discard(self)
 
     @property
     def returncode(self) -> int | None:
         return self.p.returncode
+
+
+def stop_all() -> None:
+    """Stop every child still running, e.g. after SIGINT/SIGTERM interrupted a case (M0R4-01)."""
+    for p in list(LIVE):
+        p.stop(grace=0, term_grace=5, kill_grace=5)
+    reap_orphans()
 
 
 def run(argv: list[str], stdin: bytes, cwd: Path, timeout: float = 300, env: dict | None = None) -> tuple[bytes, bytes, int | None, str]:
@@ -243,14 +334,21 @@ def v_codex_exec(fs, rc, meta, sent, ctx):
     return out
 
 
-def v_codex_exec_failed(needle: str):
+def v_codex_exec_failed(needle):
+    """turn.failed whose message names the claimed cause: a fixed text, or a value taken from meta (M0R4-04)."""
     def check(fs, rc, meta, sent, ctx):
         out: list[str] = []
+        want = needle(meta) if callable(needle) else needle
         expect(out, rc not in (0, None), f'exit code {rc}, expected non-zero')
         expect(out, bool(typed(fs, 'turn.failed')) and not typed(fs, 'turn.completed'), 'no turn.failed, or a turn.completed')
-        expect(out, needle.lower() in failed_message(fs).lower(), f'turn.failed message lacks {needle!r}: {failed_message(fs)[:200]!r}')
+        expect(out, bool(want) and want.lower() in failed_message(fs).lower(), f'turn.failed message lacks {want!r}: {failed_message(fs)[:200]!r}')
         return out
     return check
+
+
+def requested_model(meta: dict) -> str | None:
+    argv = meta.get('argv', [])
+    return next((argv[i + 1] for i, a in enumerate(argv[:-1]) if a in ('--model', '-m')), None)
 
 
 def requests(sent: list[dict], method: str) -> list[dict]:
@@ -317,7 +415,9 @@ def v_app_interrupt(fs, rc, meta, sent, ctx):
 
 def v_app_steer(fs, rc, meta, sent, ctx):
     out: list[str] = []
-    expect(out, 'error' in reply(fs, sent, 'turn/steer', 0), 'stale expectedTurnId was not rejected')
+    stale = reply(fs, sent, 'turn/steer', 0).get('error') or {}
+    expect(out, stale.get('code') == -32600 and 'expected active turn id' in str(stale.get('message')),
+           f'stale expectedTurnId was not rejected as a stale turn: {stale}')
     expect(out, 'result' in reply(fs, sent, 'turn/steer', 1), 'steer with the active turn id was not accepted')
     one_turn(fs, sent, out, 'completed')
     expect(out, 'STEERED' in agent_messages(fs), 'the agent did not follow the steer (no agentMessage containing STEERED)')
@@ -338,11 +438,17 @@ def pi_text(message: dict) -> str:
 
 
 def pi_turn_ok(fs, out: list[str], prompt_id: str) -> None:
+    """Judged by the final answer: Pi retries failed requests itself (auto_retry_*), so an earlier error message is
+    fine when a retry succeeded afterwards (M0R4-05); an exhausted retry or a final error/abort is not."""
     expect(out, pi_response(fs, prompt_id).get('success') is True, f'prompt {prompt_id} was not accepted')
     msgs = pi_assistant(fs)
-    expect(out, bool(msgs) and all(m.get('stopReason') not in ('error', 'aborted') for m in msgs),
-           'assistant stop reasons ' + ', '.join(str(m.get('stopReason')) for m in msgs))
-    expect(out, any(TOKEN in pi_text(m) for m in msgs), f'no assistant message containing {TOKEN}')
+    final = msgs[-1] if msgs else {}
+    expect(out, final.get('stopReason') not in (None, 'error', 'aborted'), 'assistant stop reasons ' + ', '.join(str(m.get('stopReason')) for m in msgs))
+    expect(out, TOKEN in pi_text(final), f'final assistant message lacks {TOKEN}')
+    retries = typed(fs, 'auto_retry_end')
+    expect(out, all(r.get('success') is not False for r in retries), 'a native retry was exhausted')
+    if any(m.get('stopReason') == 'error' for m in msgs[:-1]):
+        expect(out, any(r.get('success') is True for r in retries), 'an assistant error was not followed by a successful retry')
     settled = typed(fs, 'agent_settled')
     expect(out, len(settled) == 1 and settled[0].get('aborted') is False, f'agent_settled frames {settled}')
     expect(out, not typed(fs, 'error') and not typed(fs, 'agent_error'), 'error frames present')
@@ -375,13 +481,15 @@ def v_pi_abort(fs, rc, meta, sent, ctx):
 def v_pi_no_provider(fs, rc, meta, sent, ctx):
     out: list[str] = []
     expect(out, pi_response(fs, 's1').get('success') is True, 'get_state failed')
-    expect(out, pi_response(fs, 'p1').get('success') is False, 'prompt without a provider was accepted')
+    p1 = pi_response(fs, 'p1')
+    expect(out, p1.get('success') is False and 'api key' in str(p1.get('error', '')).lower(), f'prompt without a provider did not fail for a missing API key: {p1}')
     return out
 
 
 def v_pi_invalid_model(fs, rc, meta, sent, ctx):
     out: list[str] = []
-    expect(out, pi_response(fs, 'm1').get('success') is False, 'set_model with an unknown model was accepted')
+    m1 = pi_response(fs, 'm1')
+    expect(out, m1.get('success') is False and 'model not found' in str(m1.get('error', '')).lower(), f'set_model with an unknown model did not fail as not found: {m1}')
     return out
 
 
@@ -389,7 +497,7 @@ VALIDATORS = {
     ('claude', 'success'): v_claude_success, ('claude', 'resume'): v_claude_resume,
     ('claude', 'max-turns-error'): v_claude_max_turns, ('claude', 'sigint-cancel'): v_claude_sigint,
     ('codex', 'exec'): v_codex_exec, ('codex', 'exec-unauthenticated'): v_codex_exec_failed('401'),
-    ('codex', 'exec-turn-failed'): v_codex_exec_failed('model'),
+    ('codex', 'exec-turn-failed'): v_codex_exec_failed(requested_model),
     ('codex', 'app-server-handshake'): v_app_handshake, ('codex', 'app-server-handshake-unauthenticated'): v_app_handshake,
     ('codex', 'app-server-turn'): v_app_turn, ('codex', 'app-server-resume'): v_app_resume,
     ('codex', 'app-server-interrupt'): v_app_interrupt, ('codex', 'app-server-steer'): v_app_steer,
@@ -406,6 +514,13 @@ def sent_messages(stdin: bytes) -> list[dict]:
 
 class RecordingFailed(Exception):
     pass
+
+
+def exchange(a: Path, b: Path) -> None:
+    """Atomically swap two directories (Linux renameat2 RENAME_EXCHANGE), so the published path never vanishes."""
+    if LIBC.renameat2(-100, os.fsencode(a), -100, os.fsencode(b), 2) != 0:  # AT_FDCWD, RENAME_EXCHANGE
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err), str(a))
 
 
 def recover(agent_dir: Path) -> None:
@@ -447,6 +562,8 @@ class Recording:
             meta['stopped'] = stop
         fs = frames(stdout)
         problems = VALIDATORS[(self.agent, case)](fs, rc, meta, sent_messages(stdin), self.ctx)
+        if stop is not None and any(word in stop for word in ('SIGKILL', 'orphans', 'abandoned')):
+            problems.append(f'process cleanup: {stop}')  # a child that had to be killed or left descendants (M0R4-07)
         meta |= {'valid': not problems, 'problems': problems}
         (d / 'meta.json').write_text(json.dumps(meta, ensure_ascii=False, indent=2) + '\n')
         if problems:
@@ -461,21 +578,25 @@ class Recording:
         if self.problems:
             raise RecordingFailed('; '.join(f'{k}: {", ".join(v)}' for k, v in self.problems.items()))
         (self.dir / 'provenance.json').write_text(json.dumps(provenance, ensure_ascii=False, indent=2) + '\n')
-        old = None
-        if self.final.exists():
+        if not self.final.exists():
+            self.dir.rename(self.final)
+            return
+        try:
+            exchange(self.dir, self.final)  # staging now holds the old version (M0R4-02)
+        except OSError as exc:
+            if exc.errno not in (errno.EINVAL, errno.ENOSYS, errno.EXDEV):
+                raise
+            # No RENAME_EXCHANGE here: two renames; recover() restores the old version if we die in between.
             old = self.parent / f'.replaced-{self.version}-{os.getpid()}'
             self.final.rename(old)
-        try:
             self.dir.rename(self.final)
-        except BaseException:
-            if old is not None and not self.final.exists():
-                old.rename(self.final)
-            raise
-        if old is not None:
             shutil.rmtree(old)
+            return
+        shutil.rmtree(self.dir)
 
     def abandon(self) -> Path:
-        if not self.dir.exists():  # already published
+        if not self.dir.exists() or (self.dir / 'provenance.json').exists():  # already published
+            shutil.rmtree(self.dir, ignore_errors=True)
             return self.final
         self.failed_root.mkdir(parents=True, exist_ok=True)
         dest = self.failed_root / f'{self.agent}-{self.version}-{datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")}'
@@ -793,6 +914,8 @@ def record(agent: str, root: Path = HERE) -> Path:
     before = binaries(agent)
     started = now()
     rec = Recording(agent, version, root)
+    enable_subreaper()
+    previous = install_termination_handlers()  # SIGTERM/SIGHUP raise Terminated so children are stopped (M0R4-01)
     try:
         AGENTS[agent](rec)
         if INSTALLED_VERSION[agent]() != version or binaries(agent) != before:
@@ -803,12 +926,15 @@ def record(agent: str, root: Path = HERE) -> Path:
                      'help_argv': argv, 'help_sha256': sha256(help_bytes), **before})
         return rec.final
     except BaseException as exc:
+        stop_all()
         where = rec.abandon()
-        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+        if isinstance(exc, (KeyboardInterrupt, SystemExit, Terminated)):
             raise
         detail = str(exc) if isinstance(exc, RecordingFailed) else f'{type(exc).__name__}: {exc}'
         raise RecordingFailed(f'{agent} {version}: {detail}; published fixtures unchanged; staging kept at {where}') from exc
     finally:
+        stop_all()  # children first, then their directories
+        restore_handlers(previous)
         while TEMP_DIRS:
             shutil.rmtree(TEMP_DIRS.pop(), ignore_errors=True)
 
@@ -818,7 +944,13 @@ def write_manifest(root: Path = HERE) -> None:
     directory was recorded, or for older directories without one, the provenance the previous manifest recorded.
     Nothing is re-measured here, so an entry never pairs old fixtures with a newer binary (M0R3-02)."""
     path = root / 'compat-manifest.json'
-    previous = json.loads(path.read_text()).get('agents', {}) if path.exists() else {}
+    try:
+        previous = json.loads(path.read_text()).get('agents', {}) if path.exists() else {}
+    except ValueError:  # truncated by an interrupted write before writes became atomic (M0R4-03)
+        print(f'warning: {path} is not valid JSON; rebuilding it from provenance.json files only', file=sys.stderr)
+        previous = {}
+    for agent_dir in (p for p in root.iterdir() if p.is_dir() and not p.name.startswith(('_', '.'))):
+        recover(agent_dir)  # an interrupted publish must not hide its version (M0R4-02)
     agents: dict[str, dict] = {}
     for agent_dir in sorted(p for p in root.iterdir() if p.is_dir() and not p.name.startswith(('_', '.'))):
         name = agent_dir.name
@@ -839,7 +971,9 @@ def write_manifest(root: Path = HERE) -> None:
             agents.setdefault(name, {})[version_dir.name] = entry
     manifest = {'schema_version': '1.3', 'recorded_at': now(), 'recorder': 'tests/fixtures/protocol/record.py',
                 'hash_algorithms': {'tree_sha256': tree_sha256.__doc__, 'files': 'sha256 of the raw file bytes'}, 'agents': agents}
-    path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + '\n')
+    tmp = path.with_name(f'.{path.name}.{os.getpid()}.tmp')
+    tmp.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + '\n')
+    os.replace(tmp, path)
 
 
 def main() -> int:
@@ -854,6 +988,9 @@ def main() -> int:
         if name in selected:
             try:
                 print(f'recorded {name}: {record(name)}')
+            except (KeyboardInterrupt, Terminated) as exc:
+                print(f'interrupted while recording {name} ({type(exc).__name__}); its published fixtures are unchanged', file=sys.stderr)
+                return 130
             except RecordingFailed as exc:
                 failures.append(str(exc))
                 print(f'NOT recorded: {exc}', file=sys.stderr)
