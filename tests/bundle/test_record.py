@@ -7,6 +7,10 @@ from helpers import ROOT
 spec=importlib.util.spec_from_file_location('record',ROOT/'tests/fixtures/protocol/record.py')
 record=importlib.util.module_from_spec(spec);spec.loader.exec_module(record)
 FIXTURES=ROOT/'tests/fixtures/protocol'
+# Children run in transient systemd user scopes (cgroups). Outside CI a machine without a user manager skips the
+# process tests; in CI (where the workflow starts one) they must run, so a missing manager fails them instead.
+SCOPES=record.scopes_available()
+needs_scopes=unittest.skipUnless(SCOPES is None or os.environ.get('CI'),f'systemd user scopes unavailable: {SCOPES}')
 
 def load_case(agent:str,version:str,case:str):
     d=FIXTURES/agent/version/case
@@ -145,6 +149,29 @@ if mode=='hidden':
     time.sleep(0.3);sys.exit(0)
 if mode=='dispositions':
     print(json.dumps({s:str(signal.getsignal(getattr(signal,s))) for s in ('SIGINT','SIGTERM','SIGHUP')}));sys.exit(0)
+if mode=='spawner':
+    if os.fork()==0:
+        os.setsid();fd=os.open(os.devnull,os.O_RDWR)
+        for n in (0,1,2):os.dup2(fd,n)
+        end=time.time()+10
+        while time.time()<end:  # keeps forking new descendants, also while it is being killed
+            if os.fork()==0:open(os.path.join(sys.argv[2],str(os.getpid())),'w').close();time.sleep(30);os._exit(0)
+            time.sleep(0.02)
+        os._exit(0)
+    time.sleep(0.3);sys.exit(0)
+if mode=='relay-fast':
+    if os.fork()==0:
+        os.setsid();fd=os.open(os.devnull,os.O_RDWR)
+        for n in (0,1,2):os.dup2(fd,n)
+        if os.fork()==0:time.sleep(0.8);os._exit(0)  # B takes over at once
+        os._exit(0)
+    sys.exit(0)
+if mode=='version-probe':
+    if os.fork()==0:
+        os.setsid();fd=os.open(os.devnull,os.O_RDWR)
+        for n in (0,1,2):os.dup2(fd,n)
+        open(sys.argv[2],'w').write(str(os.getpid()));time.sleep(30);os._exit(0)
+    print('9.9.9');sys.stdout.flush();sys.exit(0) if len(sys.argv)<4 else time.sleep(30)
 if mode=='escape-quiet':
     if os.fork()==0:
         os.setsid();fd=os.open(os.devnull,os.O_RDWR)
@@ -156,6 +183,7 @@ if mode=='chatty':
 time.sleep(60)
 """
 
+@needs_scopes
 class BoundedStop(unittest.TestCase):
     """M0R3-03: stopping a child never waits without bound."""
     def setUp(self):
@@ -199,15 +227,36 @@ class BoundedStop(unittest.TestCase):
         # M0R6-03: a tree that hands over to a new descendant and ends within the grace period is not killed.
         p=self.proc('relay');how=p.stop(grace=5,descendant_grace=5)
         self.assertEqual(how,'exited');self.assertEqual(how.descendants,[]);self.assertGreaterEqual(len(how.lingered),2)
-    def test_unreadable_descendant_invalidates_case(self):
-        # M0R6-02: a descendant whose environment cannot be read cannot be shown to be gone, so the case is invalid.
+    def test_nondumpable_descendant_killed(self):
+        # M0R6-02: membership of the child's cgroup does not depend on reading /proc/<pid>/environ.
         p=self.proc('hidden');how=p.stop(grace=5,descendant_grace=1)
-        self.assertIn('descendants-unverifiable',how)
+        self.assertEqual(how,'exited+descendants-killed');self.assertFalse(self.escaped_alive())
         t=tempfile.TemporaryDirectory();self.addCleanup(t.cleanup)
         rec=record.Recording('pi','1.5.0',Path(t.name),Path(t.name)/'failed');d=FIXTURES/'pi/1.5.0/rpc-invalid-model'
         rec.save('rpc-invalid-model',['pi'],(d/'stdin.txt').read_bytes(),(d/'stdout.jsonl').read_bytes(),b'',0,'x',stop=how)
         self.assertTrue(any('process cleanup' in p for p in rec.problems['rpc-invalid-model']))
-        self.assertTrue(json.loads((rec.dir/'rpc-invalid-model/meta.json').read_text())['descendants_unverifiable'])
+    def test_descendants_forked_during_the_kill_are_killed(self):
+        # M0R7-01: a tree that keeps forking cannot outrun the cleanup (cgroup.kill is atomic for the whole cgroup).
+        spawned=self.dir/'spawned';spawned.mkdir()
+        p=record.Proc([sys.executable,str(self.script),'spawner',str(spawned)],self.dir,dict(os.environ))
+        how=p.stop(grace=5,descendant_grace=0.5);time.sleep(0.2)
+        pids=[int(x.name) for x in spawned.iterdir()];self.assertGreater(len(pids),3)
+        self.assertEqual(how,'exited+descendants-killed');self.assertEqual([x for x in pids if record.alive(x)],[])
+        self.assertFalse(record.populated(p.cgroup));self.assertNotIn(p,record.LIVE)
+    def test_fast_handover_within_grace_is_not_killed(self):
+        # M0R7-03: a descendant that hands over to a new one at once still counts as one tree ending on its own.
+        p=self.proc('relay-fast');how=p.stop(grace=5,descendant_grace=3)
+        self.assertEqual(how,'exited');self.assertEqual(how.descendants,[])
+    def test_terminate_survives_cleanup_errors(self):
+        # M0R7-02: an error inside terminate() must not skip the kill, the wait or the confirmation.
+        p=self.proc('ignore-term');time.sleep(0.3)
+        with patch.object(p,'drain',side_effect=OSError(5,'Input/output error')):p.terminate()
+        self.assertIsNotNone(p.p.returncode);self.assertFalse(record.populated(p.cgroup));self.assertNotIn(p,record.LIVE)
+    def test_unconfirmed_child_stays_registered(self):
+        p=self.proc('ignore-term');time.sleep(0.3)
+        with patch.object(p,'kill_tree'),patch.object(p,'signal'),patch.object(record,'CONFIRM_SECONDS',0.5):
+            with self.assertRaises(RuntimeError):p.terminate()
+        self.assertIn(p,record.LIVE);p.terminate();self.assertNotIn(p,record.LIVE)
     def test_child_gets_default_signal_dispositions(self):
         # A recorder started with SIGINT ignored (background job) must not pass that on: Claude's cancel needs SIGINT.
         old=signal.signal(signal.SIGINT,signal.SIG_IGN);self.addCleanup(signal.signal,signal.SIGINT,old)
@@ -223,10 +272,10 @@ class BoundedStop(unittest.TestCase):
         p=record.Proc([sys.executable,str(self.script),'close-then-read',str(self.dir/'n')],self.dir,dict(os.environ))
         p.write(b'z'*(3<<20));how=p.stop(grace=10)
         self.assertEqual((how,(self.dir/'n').read_text()),('exited',str(3<<20)))
-    def test_stop_all_survives_a_failing_stop(self):
+    def test_stop_all_survives_a_failing_terminate(self):
         a=self.proc('sleep');b=self.proc('sleep')
-        with patch.object(a,'stop',side_effect=RuntimeError('boom')):record.stop_all()
-        self.assertIsNotNone(b.p.poll());a.signal(signal.SIGKILL);a.p.wait()
+        with patch.object(a,'terminate',side_effect=RuntimeError('boom')):record.stop_all()
+        self.assertIsNotNone(b.p.poll());self.assertIn(a,record.LIVE);a.terminate()
     def test_unclean_stop_invalidates_case(self):
         t=tempfile.TemporaryDirectory();self.addCleanup(t.cleanup)
         rec=record.Recording('pi','1.5.0',Path(t.name),Path(t.name)/'failed');d=FIXTURES/'pi/1.5.0/rpc-invalid-model'
@@ -259,6 +308,7 @@ def sandbox(d:Path)->Path:
     shutil.copy(FIXTURES/'record.py',repo/'tests/fixtures/protocol/record.py');(repo/'tools').symlink_to(ROOT/'tools')
     return repo
 
+@needs_scopes
 class Interrupted(unittest.TestCase):
     """M0R4-01: SIGINT or SIGTERM to the recorder stops every child before its directories are removed."""
     def interrupt(self,sig):
@@ -326,6 +376,29 @@ sys.exit(record.main())
         entry=json.loads((root/'compat-manifest.json').read_text())['agents']['claude']['2.1.317']
         published=root/'claude/2.1.317/max-turns-error/stdout.jsonl'
         self.assertEqual(entry['cases']['max-turns-error']['files']['stdout.jsonl'],record.sha256(published.read_bytes()))
+    def test_sigterm_during_version_probe_kills_its_descendants(self):
+        # M0R7-04: version/help/schema/auth probes run in scopes too, so an interrupt kills their whole tree.
+        t=tempfile.TemporaryDirectory();self.addCleanup(t.cleanup);d=Path(t.name);repo=sandbox(d);root=repo/'tests/fixtures/protocol'
+        pidfile=d/'probe.pid';script=d/'child.py';script.write_text(SLEEPER)
+        driver=d/'driver.py';driver.write_text(DRIVER_PREAMBLE+'''
+probe=[sys.executable,sys.argv[3],'version-probe',sys.argv[4],'block']
+record.INSTALLED_VERSION['pi']=lambda:record.first_line(probe)
+sys.argv=['record.py','--agents','pi'];sys.exit(record.main())
+''')
+        p=subprocess.Popen([sys.executable,str(driver),str(repo),str(root),str(script),str(pidfile)],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        self.addCleanup(lambda:p.poll() is None and p.kill())
+        deadline=time.monotonic()+30
+        while not pidfile.exists() and time.monotonic()<deadline:time.sleep(0.05)
+        time.sleep(0.3);pid=int(pidfile.read_text());p.send_signal(signal.SIGTERM);out,err=p.communicate(timeout=60)
+        still=record.alive(pid)
+        if still:os.kill(pid,signal.SIGKILL)
+        self.assertEqual(p.returncode,128+signal.SIGTERM,err.decode()[-2000:]);self.assertFalse(still)
+    def test_version_probe_leaves_nothing_behind(self):
+        t=tempfile.TemporaryDirectory();self.addCleanup(t.cleanup);d=Path(t.name);script=d/'child.py';script.write_text(SLEEPER)
+        self.assertEqual(record.first_line([sys.executable,str(script),'version-probe',str(d/'probe.pid')]),'9.9.9')
+        pid=int((d/'probe.pid').read_text());still=record.alive(pid)
+        if still:os.kill(pid,signal.SIGKILL)
+        self.assertFalse(still)
     def test_signal_while_constructing_a_child(self):
         # M0R5-01: SIGTERM arriving inside Proc() is handled only once the child is registered, so it is still stopped.
         t=tempfile.TemporaryDirectory();self.addCleanup(t.cleanup);d=Path(t.name);repo=sandbox(d);root=repo/'tests/fixtures/protocol';info=d/'child.json'
@@ -365,6 +438,7 @@ sys.exit(record.main())
         published=root/'claude/2.1.317/max-turns-error/stdout.jsonl'
         self.assertEqual(entry['cases']['max-turns-error']['files']['stdout.jsonl'],record.sha256(published.read_bytes()))
 
+@needs_scopes
 class StagedPublication(unittest.TestCase):
     """M0R3-02: a version directory is replaced only by a complete, valid recording."""
     def setUp(self):
@@ -418,6 +492,16 @@ class StagedPublication(unittest.TestCase):
         entry=json.loads((self.root/'compat-manifest.json').read_text())['agents']['pi']['1.5.0']
         self.assertEqual((entry['entry_sha256'],entry['help_sha256'],entry['auth']),('A',record.sha256(b'help'),'AUTHENTICATED (live turn recorded)'))
         self.assertEqual(list(entry['cases']),['rpc-invalid-model'])
+    def test_record_keeps_directories_of_a_child_it_could_not_stop(self):
+        # M0R7-02: a cwd is removed only once nothing registered can still be using it.
+        made={}
+        def body(rec):
+            made['cwd']=record.workdir();made['p']=record.Proc(['sleep','30'],made['cwd']);raise RuntimeError('case failed')
+        with patch.dict(record.AGENTS,{'pi':body}),patch.dict(record.INSTALLED_VERSION,{'pi':lambda:'1.5.0'}),patch.object(record,'binaries',lambda name:{}),\
+             patch.object(record,'REPO',self.root.parent),patch.object(record.Proc,'terminate',side_effect=RuntimeError('cannot confirm')):
+            with self.assertRaises(record.RecordingFailed):record.record('pi',self.root)
+        self.assertTrue(made['cwd'].exists());self.assertIn(made['p'],record.LIVE)
+        made['p'].terminate();shutil.rmtree(made['cwd']);record.TEMP_DIRS.clear()
     def test_record_removes_its_temporary_directories(self):
         made=[]
         def body(rec):made.append(record.workdir());made.append(record.tempdir('hoh-codex-home-'));rec.fail('auth','BLOCKED_AUTH')

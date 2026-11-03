@@ -15,17 +15,18 @@ every case is valid and the binary did not change meanwhile; otherwise the publi
 they were, the staging directory moves to `.hoh-dev/protocol-failed/` and the recorder exits 1 (also
 when an agent is not logged in). `provenance.json` holds the binary and help hashes and the auth state
 measured while recording; the manifest is rebuilt from those files and never re-measures binaries.
-Children are stopped with bounded escalation (close stdin, SIGTERM, SIGKILL of the process group). Each
-child's environment carries a token (`HOH_RECORDER_PROC`), so its descendants are found wherever they
-went (other session or group, re-parented, stdio closed): those that end on their own within 5 s after
-the CLI exited are recorded in `meta.json` `descendants_lingered`; those still running are killed and
-the case is invalid, as is one whose process needed SIGKILL. Our own processes started after the child
-whose environment cannot be read (made non-dumpable) might be descendants: they are reported, not killed,
-and the case is invalid. A descendant that exec'd with a cleared environment cannot be found this way.
+Every child, including version/help/schema/auth probes, runs in its own transient systemd user scope
+(`systemd-run --user --scope`, i.e. its own cgroup v2), so the recorder needs a systemd user manager
+(`loginctl enable-linger`) and refuses to run without one (exit 69). The kernel keeps every descendant
+in that cgroup whatever it does (fork, setsid, closed stdio, non-dumpable), `cgroup.kill` kills all of
+them at once and `cgroup.events` reports when none is left. Children are stopped with bounded
+escalation: close stdin, SIGTERM to the process group, then kill the scope. Descendants still in the
+scope after the CLI exited get 5 s to end by themselves (`meta.json` `descendants_lingered`); the rest
+are killed and the case is invalid (`descendants_killed`), as is one whose process needed SIGKILL.
 Children get default SIGINT/SIGTERM/SIGHUP dispositions even when the recorder runs with SIGINT ignored.
-SIGINT/SIGTERM/SIGHUP at any point of a run (also while a child is being stopped or between agents) stop
-every child before the temporary directories are removed, and the manifest is still rebuilt. Publishing
-swaps the directories atomically (`renameat2`).
+SIGINT/SIGTERM/SIGHUP at any point of a run stop every child before the temporary directories are
+removed (directories of a child that could not be confirmed gone are kept), and the manifest is still
+rebuilt. Publishing swaps the directories atomically (`renameat2`).
 Keep the previous version directory until the compat suite has been rerun.
 
 Provenance limits: the operator's user-level agent configuration (plugins, hooks, account, rate-limit
@@ -38,7 +39,7 @@ compare raw bytes; the repository is private.
 | claude 2.1.317 | `success` | live | `system:init` carries `session_id` and `model`; an undocumented `rate_limit_event` frame precedes `result` and must be kept as an unknown/auxiliary event |
 | claude 2.1.317 | `resume` | live | `--resume <session_id>` continues the same session id |
 | claude 2.1.317 | `max-turns-error` | live | `result` subtype `error_max_turns`, exit code 1 |
-| claude 2.1.317 | `sigint-cancel` | live | SIGINT while a foreground tool runs yields `result` subtype `error_during_execution`, `is_error: true`, **exit code 0** — success must come from the result frame, never from the exit code. The CLI may exit before the cancelled tool's last child ends (`sleep 2` outlived it in 2 of 5 runs during M0-T06), so the adapter must reap the attempt's whole process tree |
+| claude 2.1.317 | `sigint-cancel` | live | SIGINT while a foreground tool runs yields `result` subtype `error_during_execution`, `is_error: true`, **exit code 0** — success must come from the result frame, never from the exit code. The CLI may exit before the cancelled tool's last child ends (`sleep 2` outlived it in several M0-T06 runs; `meta.json` `descendants_lingered`), so the adapter must reap the attempt's whole process tree |
 | pi 1.5.0 | `rpc-prompt` | live | `prompt` response `disposition: "started"`; `agent_start` … `agent_end` → `agent_settled` |
 | pi 1.5.0 | `rpc-resume` | live | a new process with the same `--session-dir` and `--session-id` reports the same `sessionId` and remembers the previous turn |
 | pi 1.5.0 | `rpc-abort` | live | `abort` during streaming ends the assistant message with `stopReason: "aborted"` and still emits `agent_settled` |

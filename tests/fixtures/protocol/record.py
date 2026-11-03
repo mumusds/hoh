@@ -42,7 +42,8 @@ def sha256(data: bytes) -> str:
 
 
 def first_line(argv: list[str]) -> str:
-    out = subprocess.run(argv, capture_output=True, text=True, env=ENV, timeout=60).stdout.strip().splitlines()
+    """First stdout line of a probe; it runs in its own scope like the agents, so nothing it starts survives (M0R7-04)."""
+    out = run(argv, b'', Path(tempfile.gettempdir()), timeout=60, descendant_grace=1)[0].decode('utf-8', 'replace').strip().splitlines()
     return out[0] if out else 'unknown'
 
 
@@ -54,7 +55,8 @@ def tempdir(prefix: str) -> Path:
 
 def workdir() -> Path:
     d = tempdir('hoh-protocol-')
-    subprocess.run(['git', 'init', '-q', str(d)], check=True)
+    if run(['git', 'init', '-q', str(d)], b'', d, timeout=60)[2] != 0:
+        raise RuntimeError(f'git init failed in {d}')
     return d
 
 
@@ -74,9 +76,10 @@ def frames(raw: bytes) -> list[dict]:
 # --- processes ------------------------------------------------------------------------------------------
 
 LIBC = ctypes.CDLL(None, use_errno=True)
-LIVE: set['Proc'] = set()  # children not yet stopped, so an interrupted recording can stop them (M0R4-01)
-TOKEN_VAR = 'HOH_RECORDER_PROC'
+LIVE: set['Proc'] = set()  # children not confirmed gone, so an interrupted recording can still stop them (M0R4-01)
 SIGNALS = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
+SCOPE = ['systemd-run', '--user', '--scope', '--quiet', '--collect']
+CONFIRM_SECONDS = 5.0  # how long terminate() waits for the kernel to report a cgroup empty
 
 
 def proc_state(pid: int) -> str | None:
@@ -91,66 +94,6 @@ def alive(pid: int) -> bool:
     return proc_state(pid) not in (None, 'Z')
 
 
-def start_time(pid: int) -> int | None:
-    """Start time in clock ticks since boot (/proc/<pid>/stat field 22), None when the process is gone."""
-    try:
-        return int(Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[19])
-    except (OSError, IndexError, ValueError):
-        return None
-
-
-def carrying(token: str) -> list[int]:
-    """Live processes whose environment holds this Proc's token: the child and every descendant that kept the
-    inherited environment, wherever it was re-parented and whatever session or group it moved to (M0R5-02/06).
-    A descendant that exec'd with a cleared environment cannot be found this way."""
-    needle = f'{TOKEN_VAR}={token}'.encode()
-    found = []
-    for environ in Path('/proc').glob('[0-9]*/environ'):
-        try:
-            if needle in environ.read_bytes().split(b'\0') and alive(int(environ.parent.name)):
-                found.append(int(environ.parent.name))
-        except (OSError, ValueError):
-            continue
-    return found
-
-
-def unverifiable(since: int) -> list[int]:
-    """Our own live processes started at or after `since` whose environment we may not read (e.g. made non-dumpable):
-    they could be descendants, so a case cannot be shown clean while they run (M0R6-02). They are not killed,
-    because they could equally be unrelated."""
-    found = []
-    for environ in Path('/proc').glob('[0-9]*/environ'):
-        try:
-            pid = int(environ.parent.name)
-            if environ.parent.stat().st_uid != os.getuid():
-                continue
-            environ.read_bytes()
-        except PermissionError:
-            started = start_time(pid)
-            if started is not None and started >= since and alive(pid):
-                found.append(pid)
-        except (OSError, ValueError):
-            continue
-    return found
-
-
-class Stopped(str):
-    """How a child ended (exited, SIGTERM, ...), with the command lines of descendants that outlived it: `lingered`
-    ended by themselves within the grace period, `descendants` had to be killed, `unverifiable` might be ours but
-    their environment cannot be read."""
-    descendants: list[str] = []
-    lingered: list[str] = []
-    unverifiable: list[str] = []
-
-
-def child_setup() -> None:
-    """Runs in the child before exec: default dispositions and an empty mask for the signals the recorder uses, also
-    when the recorder itself was started with SIGINT ignored (a background job) — Claude's cancel needs SIGINT."""
-    for sig in SIGNALS:
-        signal.signal(sig, signal.SIG_DFL)
-    signal.pthread_sigmask(signal.SIG_UNBLOCK, SIGNALS)
-
-
 def cmdline(pid: int) -> str:
     try:
         return Path(f'/proc/{pid}/cmdline').read_bytes().replace(b'\0', b' ').decode('utf-8', 'replace').strip()[:300]
@@ -158,13 +101,80 @@ def cmdline(pid: int) -> str:
         return f'pid {pid}'
 
 
+_SCOPE_BASE: list = []
+
+
+def scopes_available() -> str | None:
+    """None when this machine can run children in transient systemd user scopes, otherwise why not. Every child runs
+    in its own scope, i.e. its own cgroup: the kernel keeps all of its descendants there whatever they do (fork,
+    setsid, closed stdio, non-dumpable), `cgroup.kill` kills all of them at once and `cgroup.events` says when none is
+    left, so no /proc scanning race exists (M0R7-01/03, replacing the subreaper and environment-token designs)."""
+    if not _SCOPE_BASE:
+        try:
+            r = subprocess.run(SCOPE + ['--', 'cat', '/proc/self/cgroup'], capture_output=True, text=True, timeout=30, env=ENV)
+            path = r.stdout.strip().rsplit(':', 1)[-1]
+            ok = r.returncode == 0 and path.endswith('.scope') and Path('/sys/fs/cgroup' + path).parent.is_dir()
+            _SCOPE_BASE.append(Path('/sys/fs/cgroup' + path).parent if ok else
+                               (r.stderr.strip() or f'systemd-run exited {r.returncode}')[:300])
+        except (OSError, subprocess.SubprocessError) as exc:
+            _SCOPE_BASE.append(f'{type(exc).__name__}: {exc}')
+    return None if isinstance(_SCOPE_BASE[0], Path) else _SCOPE_BASE[0]
+
+
+def require_scopes() -> Path:
+    reason = scopes_available()
+    if reason is not None:
+        raise RuntimeError(f'cannot confine agent processes: systemd user scopes are unavailable ({reason}); the recorder needs '
+                           'a systemd user manager (loginctl enable-linger) and cgroup v2')
+    return _SCOPE_BASE[0]
+
+
+GONE = (errno.ENOENT, errno.ENODEV)  # a cgroup systemd removed, or is removing, after it became empty
+
+
+def populated(cgroup: Path) -> bool:
+    """Whether any process is left in the cgroup; a removed (collected) cgroup is empty."""
+    try:
+        return 'populated 1' in (cgroup / 'cgroup.events').read_text().splitlines()
+    except OSError as exc:
+        if exc.errno in GONE:
+            return False
+        raise
+
+
+def members(cgroup: Path) -> list[int]:
+    try:
+        return [int(x) for x in (cgroup / 'cgroup.procs').read_text().split()]
+    except OSError as exc:
+        if exc.errno in GONE:
+            return []
+        raise
+
+
+class Stopped(str):
+    """How a child ended (exited, SIGTERM, ...), with the command lines of descendants that outlived it: `lingered`
+    ended by themselves within the grace period, `descendants` were still running and had to be killed."""
+    descendants: list[str] = []
+    lingered: list[str] = []
+
+
+def child_setup() -> None:
+    """Runs in the child before exec: default dispositions and an empty mask for the signals the recorder uses, also
+    when the recorder itself was started with SIGINT ignored (a background job): Claude's cancel needs SIGINT."""
+    for sig in SIGNALS:
+        signal.signal(sig, signal.SIG_DFL)
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, SIGNALS)
+
+
 class Proc:
-    """A child in its own process group. stdin is written without blocking and stdout/stderr are drained in the same
-    loop, so no pipe can stall the recorder and every wait is bounded (M0R3-03, M0R4-06). Its environment carries a
-    unique token so its descendants can be found and killed when it stops."""
+    """A child in its own process group and its own transient systemd user scope (cgroup). stdin is written without
+    blocking and stdout/stderr are drained in the same loop, so no pipe can stall the recorder and every wait is
+    bounded (M0R3-03, M0R4-06); the scope contains every descendant, so stopping it leaves nothing behind."""
 
     def __init__(self, argv: list[str], cwd: Path, env: dict | None = None):
-        self.token = os.urandom(8).hex()
+        base = require_scopes()
+        self.unit = f'hoh-recorder-{os.getpid()}-{os.urandom(6).hex()}'
+        self.cgroup = base / f'{self.unit}.scope'
         self.out = b''
         self.err = b''
         self.sent = b''
@@ -172,20 +182,25 @@ class Proc:
         self.close_requested = False
         self.descendants: list[str] = []  # command lines of descendants killed by stop()
         self.lingered: list[str] = []  # descendants that outlived the child but ended on their own
-        self.hidden: list[str] = []  # processes that may be descendants but whose environment is unreadable
         self.sel = selectors.DefaultSelector()
-        # Signals stay blocked until the child is fully registered, so an interrupt is handled only once stop_all()
-        # can find it (M0R5-01); the child unblocks them before exec.
+        # Signals stay blocked until the child is registered and inside its scope, so an interrupt is handled only
+        # once stop_all() can find and kill it (M0R5-01); the child resets them before exec.
         blocked = signal.pthread_sigmask(signal.SIG_BLOCK, SIGNALS)
         try:
-            self.p = subprocess.Popen(argv, cwd=cwd, env=(env or ENV) | {TOKEN_VAR: self.token}, stdin=subprocess.PIPE,
-                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
-                                      preexec_fn=child_setup)
+            # systemd-run --scope moves itself into the new scope and then execs argv in place (same pid).
+            self.p = subprocess.Popen(SCOPE + [f'--unit={self.unit}', '--', *argv], cwd=cwd, env=env or ENV,
+                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                      start_new_session=True, preexec_fn=child_setup)
             LIVE.add(self)
-            self.started = start_time(self.p.pid) or 0
             os.set_blocking(self.p.stdin.fileno(), False)
             self.sel.register(self.p.stdout, selectors.EVENT_READ)
             self.sel.register(self.p.stderr, selectors.EVENT_READ)
+            deadline = time.monotonic() + 30
+            while self.p.poll() is None and self.p.pid not in members(self.cgroup) and time.monotonic() < deadline:
+                time.sleep(0.005)
+            if self.p.poll() is None and self.p.pid not in members(self.cgroup):
+                self.terminate()
+                raise RuntimeError(f'{argv[0]} did not enter its scope {self.unit} within 30 s')
         finally:
             signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
 
@@ -271,6 +286,14 @@ class Proc:
         except ProcessLookupError:
             pass
 
+    def kill_tree(self) -> None:
+        """SIGKILL every process in the scope at once, the child included; the kernel admits no new member meanwhile."""
+        try:
+            (self.cgroup / 'cgroup.kill').write_text('1')
+        except OSError as exc:
+            if exc.errno not in GONE:  # otherwise already empty and collected
+                raise
+
     def drain(self, wait: float) -> bool:
         """Write and read until stdin is done, stdout/stderr close and the child exits, at most `wait` s."""
         deadline = time.monotonic() + wait
@@ -285,43 +308,20 @@ class Proc:
                 return False
         return False
 
-    def kill_descendants(self, wait: float) -> int:
-        """SIGKILL every process still carrying our token and wait until they are gone; returns how many there were."""
-        pids = carrying(self.token)
-        for pid in pids:
-            self.descendants.append(cmdline(pid))
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+    def settle(self, wait: float) -> bool:
+        """Wait until the scope is empty, at most `wait` s; True when it is."""
         deadline = time.monotonic() + wait
-        while carrying(self.token) and time.monotonic() < deadline:
-            self.p.poll()  # reaps the child itself if it was among them
-            time.sleep(0.05)
-        return len(pids)
-
-    def outlived(self, grace: float) -> None:
-        """Give descendants that outlived the child up to `grace` s to end by themselves (Claude can leave the last
-        `sleep` of a cancelled tool for a moment); they are recorded, and only those still running get killed."""
-        deadline = time.monotonic() + grace
-        running: dict[int, str] = {}
-        while True:  # rescan each round: descendants born during the grace period count too (M0R6-03)
-            now_running = {pid for pid in carrying(self.token) if pid != self.p.pid}
-            for pid in now_running:
-                running.setdefault(pid, cmdline(pid))
-            for pid in [pid for pid in running if pid not in now_running]:
-                self.lingered.append(running.pop(pid))
-            if not running or time.monotonic() >= deadline:
-                return
-            time.sleep(0.05)
+        while populated(self.cgroup):
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.02)
+        return True
 
     def stop(self, grace: float = 20, term_grace: float = 10, kill_grace: float = 5, descendant_grace: float = 5) -> Stopped:
-        """Finish writing stdin, close it and wait `grace` s for exit; then SIGTERM the group, then SIGKILL it, each
-        bounded. Afterwards, on every path, processes still carrying the token are given `descendant_grace` s to end
-        by themselves (`lingered`) and then killed (`+descendants-killed`); possible descendants whose environment is
-        unreadable make it `+descendants-unverifiable`. Pipes still open even then are closed (`+abandoned`).
-        If an exception (SIGINT, SIGTERM) interrupts this, the child is terminated before it propagates and stays
-        registered until then (M0R6-01)."""
+        """Finish writing stdin, close it and wait `grace` s for exit; then SIGTERM the group, then kill the scope, each
+        bounded. Afterwards descendants still in the scope get `descendant_grace` s to end by themselves (`lingered`);
+        the rest are killed with the scope (`+descendants-killed`). If an exception (SIGINT, SIGTERM) interrupts this,
+        terminate() runs before it propagates, and the child stays registered until confirmed gone (M0R6-01)."""
         self.close_requested = True
         try:
             result = self.stop_gracefully(grace, term_grace, kill_grace, descendant_grace)
@@ -335,57 +335,75 @@ class Proc:
         how = 'exited'
         self.flush()
         finished = False
-        for sig, wait in ((None, grace), (signal.SIGTERM, term_grace), (signal.SIGKILL, kill_grace)):
-            if sig is not None:
-                how = sig.name
+        seen: dict[int, str] = {}
+        killed: list[int] = []
+        for stage, wait in (('', grace), ('SIGTERM', term_grace), ('SIGKILL', kill_grace)):
+            if stage:
+                how = stage
                 self.close_stdin()
-                self.signal(sig)
+                if stage == 'SIGTERM':
+                    self.signal(signal.SIGTERM)
+                else:
+                    killed = [pid for pid in members(self.cgroup) if pid != self.p.pid]
+                    seen.update((pid, cmdline(pid)) for pid in killed)
+                    self.kill_tree()
             if self.drain(wait):
                 finished = True
                 break
-        if finished:
-            self.outlived(descendant_grace)
-        if self.kill_descendants(kill_grace):
+        deadline = time.monotonic() + (descendant_grace if finished else 0)
+        while populated(self.cgroup) and time.monotonic() < deadline:  # the kernel's flag: no scan race (M0R7-03)
+            for pid in members(self.cgroup):
+                seen.setdefault(pid, cmdline(pid))
+            time.sleep(0.05)
+        left = members(self.cgroup)
+        for pid in left:
+            seen.setdefault(pid, cmdline(pid))
+        if populated(self.cgroup):
+            self.kill_tree()
+            if not self.settle(kill_grace):
+                raise RuntimeError(f'scope {self.unit} still has processes after cgroup.kill: {members(self.cgroup)}')
+        left = [pid for pid in dict.fromkeys(killed + left) if pid != self.p.pid]
+        if left:
             how += '+descendants-killed'
+        self.descendants = [seen[pid] for pid in left]
+        self.lingered = [cmd for pid, cmd in seen.items() if pid not in left and pid != self.p.pid]
         if not finished and not self.drain(kill_grace):
             self.close_pipes()
             how += '+abandoned'
-            try:
-                self.p.wait(timeout=kill_grace)
-            except subprocess.TimeoutExpired:
-                pass
         self.close_stdin()
-        self.hidden = [f'{pid} {cmdline(pid)}' for pid in unverifiable(self.started)]
-        if self.hidden:
-            how += '+descendants-unverifiable'
-            print('warning: processes that may be descendants could not be checked (environment unreadable): ' + '; '.join(self.hidden), file=sys.stderr)
         result = Stopped(how)
-        result.descendants, result.lingered, result.unverifiable = list(self.descendants), list(self.lingered), list(self.hidden)
+        result.descendants, result.lingered = list(self.descendants), list(self.lingered)
         return result
 
     def close_pipes(self) -> None:
         for key in list(self.sel.get_map().values()):
             self.sel.unregister(key.fileobj)
-            key.fileobj.close()
+            try:
+                key.fileobj.close()
+            except OSError:
+                pass
 
     def terminate(self) -> None:
-        """Kill the child, its group and its descendants now, with SIGINT/SIGTERM/SIGHUP blocked so a second signal
-        cannot interrupt the cleanup; bounded (about 10 s). Unregisters the Proc when done."""
+        """Kill the whole scope now, with SIGINT/SIGTERM/SIGHUP blocked so a second signal cannot cut the cleanup short.
+        Every step runs even if an earlier one fails (M0R7-02); the Proc is unregistered only once the kernel reports
+        the scope empty and the child is reaped, otherwise RuntimeError is raised and it stays registered."""
         blocked = signal.pthread_sigmask(signal.SIG_BLOCK, SIGNALS)
+        errors = []
         try:
-            self.close_stdin()
-            self.signal(signal.SIGTERM)
-            if not self.drain(2):
-                self.signal(signal.SIGKILL)
-                self.drain(3)
-            self.kill_descendants(3)
-            self.close_pipes()
+            for step in (self.close_stdin, self.kill_tree, lambda: self.signal(signal.SIGKILL),
+                         lambda: self.drain(1), lambda: self.settle(CONFIRM_SECONDS), self.close_pipes):
+                try:
+                    step()
+                except Exception as exc:
+                    errors.append(f'{type(exc).__name__}: {exc}')
             try:
-                self.p.wait(timeout=2)
+                self.p.wait(timeout=CONFIRM_SECONDS)
             except subprocess.TimeoutExpired:
                 pass
-        finally:
+            if self.p.returncode is None or populated(self.cgroup):
+                raise RuntimeError(f'could not confirm that scope {self.unit} is empty: members {members(self.cgroup)}; ' + '; '.join(errors))
             LIVE.discard(self)
+        finally:
             signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
 
     @property
@@ -395,19 +413,19 @@ class Proc:
 
 def stop_all() -> None:
     """Terminate every child still registered, e.g. after SIGINT/SIGTERM interrupted a case (M0R4-01). A failure to
-    terminate one is reported and does not prevent terminating the others (M0R5-01)."""
+    terminate one is reported and does not prevent terminating the others (M0R5-01); it stays registered."""
     for p in list(LIVE):
         try:
             p.terminate()
         except Exception as exc:  # keep going: the remaining children and the caller's cleanup still matter
-            LIVE.discard(p)
             print(f'warning: could not stop child {getattr(getattr(p, "p", None), "pid", "?")}: {type(exc).__name__}: {exc}', file=sys.stderr)
 
 
-def run(argv: list[str], stdin: bytes, cwd: Path, timeout: float = 300, env: dict | None = None) -> tuple[bytes, bytes, int | None, str]:
+def run(argv: list[str], stdin: bytes, cwd: Path, timeout: float = 300, env: dict | None = None,
+        descendant_grace: float = 5) -> tuple[bytes, bytes, int | None, str]:
     p = Proc(argv, cwd, env)
     p.write(stdin)
-    how = p.stop(grace=timeout)
+    how = p.stop(grace=timeout, descendant_grace=descendant_grace)
     return p.out, p.err, p.returncode, how
 
 
@@ -716,11 +734,9 @@ class Recording:
             meta['descendants_killed'] = stop.descendants
         if getattr(stop, 'lingered', None):
             meta['descendants_lingered'] = stop.lingered  # outlived the CLI briefly, ended on their own
-        if getattr(stop, 'unverifiable', None):
-            meta['descendants_unverifiable'] = stop.unverifiable
         fs = frames(stdout)
         problems = VALIDATORS[(self.agent, case)](fs, rc, meta, sent_messages(stdin), self.ctx)
-        if stop is not None and any(word in stop for word in ('SIGKILL', 'descendants-killed', 'descendants-unverifiable', 'abandoned')):
+        if stop is not None and any(word in stop for word in ('SIGKILL', 'descendants-killed', 'abandoned')):
             problems.append(f'process cleanup: {stop}')  # a child that had to be killed or left descendants (M0R4-07, M0R5-02)
         meta |= {'valid': not problems, 'problems': problems}
         (d / 'meta.json').write_text(json.dumps(meta, ensure_ascii=False, indent=2) + '\n')
@@ -772,7 +788,7 @@ class Recording:
 
 
 def help_file(rec: Recording, name: str, argv: list[str]) -> bytes:
-    data = subprocess.run(argv, capture_output=True, env=ENV, timeout=60).stdout
+    data = run(argv, b'', rec.dir, timeout=60, descendant_grace=1)[0]
     (rec.dir / name).write_bytes(data)
     return data
 
@@ -845,11 +861,14 @@ def claude_cancel(rec: Recording, base: list[str]) -> None:
 
 
 def codex(rec: Recording) -> None:
-    subprocess.run(['codex', 'app-server', 'generate-json-schema', '--out', str(rec.dir / 'app-server-schema')], check=True,
-                   capture_output=True, env=ENV, timeout=120)
+    out, err, rc, _ = run(['codex', 'app-server', 'generate-json-schema', '--out', str(rec.dir / 'app-server-schema')], b'', rec.dir,
+                          timeout=120, descendant_grace=1)
+    if rc != 0:
+        raise RuntimeError(f'codex app-server generate-json-schema exited {rc}: {err.decode("utf-8", "replace")[-500:]}')
     help_file(rec, 'help-exec.txt', ['codex', 'exec', '--help'])
     help_file(rec, 'help-app-server.txt', ['codex', 'app-server', '--help'])
-    status = subprocess.run(['codex', 'login', 'status'], capture_output=True, text=True, env=ENV, timeout=60)
+    out, err, rc, _ = run(['codex', 'login', 'status'], b'', rec.dir, timeout=60, descendant_grace=1)
+    status = subprocess.CompletedProcess(['codex', 'login', 'status'], rc, out.decode('utf-8', 'replace'), err.decode('utf-8', 'replace'))
     authed = status.returncode == 0
     rec.auth = 'AUTHENTICATED' if authed else 'BLOCKED_AUTH'
     (rec.dir / 'auth-status.json').write_text(json.dumps({'checked_at': now(), 'command': ['codex', 'login', 'status'], 'exit_code': status.returncode,
@@ -1107,6 +1126,10 @@ def record(agent: str, root: Path = HERE) -> Path:
             stop_all()  # children first, then their directories
         finally:
             restore_handlers(previous)
+            if LIVE:  # a child we could not confirm gone may still use them (M0R7-02)
+                print('warning: keeping temporary directories of children that could not be stopped: '
+                      + ', '.join(map(str, TEMP_DIRS)), file=sys.stderr)
+                TEMP_DIRS.clear()
             while TEMP_DIRS:
                 shutil.rmtree(TEMP_DIRS.pop(), ignore_errors=True)
 
@@ -1155,6 +1178,11 @@ def main() -> int:
     unknown = set(selected) - set(AGENTS)
     if unknown:
         ap.error('unknown agents: ' + ', '.join(sorted(unknown)))
+    try:
+        require_scopes()
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 69
     failures = []
     previous = install_termination_handlers()  # the whole run, including between agents (M0R6-04)
     try:
