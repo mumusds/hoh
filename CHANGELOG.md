@@ -1,5 +1,15 @@
 # 变更记录
 
+## 基线 HOH-BASELINE-1.1 revision 3 — 2026-11-03（CR-002）
+
+项目所有者确认 CR-001 批准人、v0.1 范围（18 项需求）和 M1/M2 全部暂定选择（字段更名为 `decisions`）。复审后修正四处设计缺陷：
+- 调度改为有界等待，防止饥饿（REQ-038）；
+- 配置了费用上限但价格未知时 fail-closed（REQ-042）；
+- SQLite 在启动时做 WAL 自检，不再只靠文件系统名单（REQ-062）；
+- 按 Pi 1.5.0 官方文档剥离 CR（REQ-026）。
+
+验收数从 161 增至 164。详见 `docs/cr/CR-002-confirm-m1-m2-decisions.md`。
+
 ## 开发启动包 1.1.0 — 2026-11-03（CR-001，基线 HOH-BASELINE-1.1）
 
 项目所有者批准的决定：Pi 插件真实集成改为 degradable（COMPLETED_DEGRADED）；新增 v0.1 中间版本（INTERIM_RELEASED）；自举期 M0–M2 改为主开发会话 + 独立 Review 会话。详见 `docs/cr/CR-001-kit-hardening.md`。

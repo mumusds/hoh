@@ -30,7 +30,7 @@ def functional_spec(req:list,scen:dict)->str:
             out.append(f'- **{ac["id"]}**（{ac["test_id"]} · 检查 `{s["check_id"]}`）Given {ac["given"]}；When {ac["when"]}；Then {ac["then"]}')
             if s.get('pass_criteria'):out.append('  - 判定：'+'；'.join(s['pass_criteria']))
         out.append('')
-        if r.get('open_questions'):out.append('**待定（已按更严格可验证行为暂定）**\n\n'+''.join(f'- {q}\n' for q in r['open_questions']))
+        if r.get('decisions'):out.append('**已确认的设计选择**（项目所有者 2026-11-03 确认，CR-002；“初值”指可经 CR 调整的基线值）\n\n'+''.join(f'- {q}\n' for q in r['decisions']))
     return '\n'.join(out).rstrip()+'\n'
 
 def traceability(req:list,scen:dict,tasks:list)->str:

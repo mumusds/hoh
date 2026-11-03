@@ -52,7 +52,7 @@ Rust模块化单体；Codex Commander + Claude CTO/Developer + Pi QA/Research；
 
 ## 机器可读交付
 
-`contracts/`含70项需求（M1/M2 的27项已细化为 detailed，其余为 outline，在各自里程碑开始前细化）、161条验收与同数测试场景（每条指定产出证据的检查）、47个任务、10个JSON Schema（含检查计划、live会话、soak时间线、原生attempt）、OpenAPI和可执行SQL；`resources/`含6个角色Prompt、12个原创工程Skill、16个文档模板；`tools/`与`scripts/`负责环境、自测、单次Agent调用、任务台账、候选冻结、按检查计划执行、证据门禁、基线/CR与生成视图。它们是开发辅助，不是Rust产品的替代实现。
+`contracts/`含70项需求（M1/M2 的27项已细化为 detailed，其余为 outline，在各自里程碑开始前细化）、164条验收与同数测试场景（每条指定产出证据的检查）、47个任务、10个JSON Schema（含检查计划、live会话、soak时间线、原生attempt）、OpenAPI和可执行SQL；`resources/`含6个角色Prompt、12个原创工程Skill、16个文档模板；`tools/`与`scripts/`负责环境、自测、单次Agent调用、任务台账、候选冻结、按检查计划执行、证据门禁、基线/CR与生成视图。它们是开发辅助，不是Rust产品的替代实现。
 
 ## 检查启动包
 

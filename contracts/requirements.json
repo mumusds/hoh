@@ -63,7 +63,7 @@
      "test_id": "TEST-001-03"
     }
    ],
-   "open_questions": [
+   "decisions": [
     "无 TTY 时 bare `hoh` 返回64而非静默退出或降级为 -p，属从严选择。",
     "输入历史存储位置文档未定，选择项目 `.hoh/` 下持久化；是否跨项目共享未定。",
     "PTY 测试等待 Workspace 出现的10 s 是测试超时初值，不是启动性能指标；启动时延阈值文档未给出。"
@@ -132,7 +132,7 @@
      "test_id": "TEST-002-03"
     }
    ],
-   "open_questions": [
+   "decisions": [
     "`-p` 是否接受 stdin 作为提示来源文档未定；选择从严：从不读取 stdin。",
     "缺关键决策的 blocked_reason 命名 NEED_DECISION 为初值。",
     "`--resume` 指向不存在或 COMPLETED 的 run 退出码64为初值（COMPLETED 不得重开同 run）。",
@@ -198,7 +198,7 @@
      "test_id": "TEST-003-03"
     }
    ],
-   "open_questions": [
+   "decisions": [
     "`init` 与无 `-p` 的位置参数作为用法错误64，文档未逐一列出，按最小命令面从严。",
     "`hoh attach` 无 id 时：恰1个可附着 run 允许直接附着，0个返回64，为初值选择。",
     "`--output json|stream-json` 与 bare `hoh`（TUI）同用是否报64未定，选择报64。"
@@ -277,11 +277,11 @@
      "test_id": "TEST-004-04"
     }
    ],
-   "open_questions": [
+   "decisions": [
     "0/3/64/78/130 与 docs/22-tooling.md 工具语义一致；1/4/5/6/69/143 及 BLOCKED 统一为3是本规格提出的初值；124/127 不用于产品（截止→INCOMPLETE=4，缺原生 CLI→BLOCKED=3）。",
-    "stream-json 终态事件 kind=`run.result` 与 json 结果字段集为初值，需补入 contracts 并做 schema 版本化。",
+    "stream-json 终态事件 kind=`run.result` 与 json 结果字段集为确认值；M1-T06 实现时把 run.result 与 json 结果对象写入 protocol.schema.json（随该任务的 CR 重锁）。",
     "U+2028/U+2029 强制转义为从严选择（JSON 标准允许原样输出）。",
-    "docs/12 用 CAPABILITY_UNSUPPORTED、docs/14 用 BLOCKED_CAPABILITY：选择后者作 blocked_reason，前者作错误码，命名需统一。"
+    "命名已统一（CR-001）：BLOCKED_CAPABILITY 为 Run/Task 阻塞原因，CAPABILITY_UNSUPPORTED 为错误码（API 422），见 docs/12、docs/14。"
    ]
   },
   {
@@ -361,7 +361,7 @@
      "test_id": "TEST-005-05"
     }
    ],
-   "open_questions": [
+   "decisions": [
     "detach返回时限文档未定，取初值10 s（本地冷启动host、FakeAgent）。",
     "detach的JSON对象沿用/v1/commands 202字段并增加run_id，为本选择；具体退出码数值由REQ-004统一，此处只断言0/非0。",
     "RUN_NOT_FOUND错误码名为初值。",
@@ -429,7 +429,7 @@
      "test_id": "TEST-006-03"
     }
    ],
-   "open_questions": [
+   "decisions": [
     "verified 的唯一来源选为显式 `hoh doctor --live`（产生模型费用，是选项而非子命令），沿用 preflight --live 思路；文档未定义产品 doctor 的 live 方式。",
     "退出码0只表示无确定阻断项，unknown/not_verified 不致非0；是否应更严格（如 unknown 也返回3）待确认。",
     "探测超时20 s 沿用 tools/preflight.py 初值；protocol 新增 degraded 值表示仅 exec 降级可用。"
@@ -765,7 +765,7 @@
      "test_id": "TEST-018-05"
     }
    ],
-   "open_questions": [
+   "decisions": [
     "example 只有 agent 与 reviewer.independent_session 两个键。选择在 [team.<role>] 下增加可选键 model（字符串，可空）、fallback（Agent 名有序数组）、prompt（覆盖文件路径），需与 example 同步更新。",
     "文档没有给出配置校验错误码。选择 HTTP 400 + code=INVALID_TEAM_CONFIG（初值），版本冲突沿用 409。",
     "[team.*] 下出现未知键时，选择拒绝并指出键路径，不静默忽略。",
@@ -848,8 +848,8 @@
      "test_id": "TEST-019-05"
     }
    ],
-   "open_questions": [
-    "SQL 只有 runs.role_epoch 一列。选择按 (run_id, role) 维护 epoch（需要迁移扩展），这样 Commander 交接不会连带隔离 Developer 的在途结果，避免原任务重做。",
+   "decisions": [
+    "role_epoch 按 (run_id, role) 维护（SQL role_bindings 表，CR-001），Commander 交接不会连带隔离 Developer 的在途结果，避免原任务重做。",
     "新绑定 Agent 在生效时探测失败：选择保留旧绑定与旧 epoch，记录交接失败事件，而不是让该职位进入空缺。",
     "文档没有定义 Commander 的安全点。选择：当前 Commander turn 结束，或者没有在途 turn；不主动中断在途 turn。"
    ]
@@ -930,7 +930,7 @@
      "test_id": "TEST-020-05"
     }
    ],
-   "open_questions": [
+   "decisions": [
     "文档没有列出各内置职位的 required_capabilities。初值：所有职位需要 structured_events，或可用 TaskResult 结构化桥替代；developer/qa 需要经 probe 实测的命令执行能力；commander/reviewer 需要 resume。",
     "默认配置不含任何隐式 fallback，未配置 fallback 即直接 BLOCKED。",
     "文档没有说明 429/503 是否触发 fallback。选择不触发，按重试与预算规则等待；只有永久错误（缺认证/能力不支持/未安装/无模型）才评估 fallback。",
@@ -1015,7 +1015,7 @@
      "test_id": "TEST-021-05"
     }
    ],
-   "open_questions": [
+   "decisions": [
     "2 秒/10 秒的语义：选择尾随去抖（同键静默 2 秒后触发），加上自首事件起最长 10 秒。",
     "紧急事件集合：选择只有 IntegrityViolation 类（例如验证中候选被改、DB integrity 失败）绕过去抖；critical issue 属于重要事件，仍走去抖。",
     "同键已有未处理触发器时，新事件并入该触发器，不并发第二个触发器。",
@@ -1102,7 +1102,7 @@
      "test_id": "TEST-022-05"
     }
    ],
-   "open_questions": [
+   "decisions": [
     "文档没有给出投递上限或期限。初值 max_delivery_attempts=5（测试中配置为 3），超过后进入 DEAD_LETTER，不删除。",
     "乱序时 expected_revision 不匹配：选择直接 rejected 并写收据；发送方重算后用新的 message_id 和 expected_revision 重发，旧 message_id 不复活。",
     "拒绝原因码 stale_epoch/spec_mismatch/candidate_mismatch 为初值。"
@@ -1201,7 +1201,7 @@
      "test_id": "TEST-024-04"
     }
    ],
-   "open_questions": [
+   "decisions": [
     "App Server 的 YOLO 通过 thread/start 的 approvalPolicy=never、sandbox=danger-full-access 表达，依据本机 codex 0.166 generate-json-schema；docs/13 只描述 exec flag。",
     "native cancel grace 10 s 与 TERM grace 5 s 为初值，三个适配器共用。",
     "降级 exec 的 resume 用 `codex exec resume <id>`（本机 help 存在），是否计为 resume 能力由兼容套件确认。"
@@ -1276,7 +1276,7 @@
      "test_id": "TEST-025-04"
     }
    ],
-   "open_questions": [
+   "decisions": [
     "原生取消选 SIGINT；`--input-format stream-json` 下是否有协议级 interrupt 需以版本样例确认后再启用。",
     "成功判定同时要求 result success、is_error=false 与退出码0，属从严选择。",
     "PROTOCOL_INCOMPLETE 命名为初值；`--include-partial-messages` 默认关闭，仅在需要实时增量时开启。"
@@ -1297,7 +1297,7 @@
    "summary": "Pi 适配器以 `pi --mode rpc` 和持久会话目录运行，严格按 LF 字节分帧，先订阅后发送，按 prompt disposition 与 agent_settled（或状态核验）判定完成，并能在重启后恢复同一会话。",
    "behavior": [
     "必须以 argv `pi --mode rpc` 加持久 `--session-dir`（位于 `.hoh/` 下按 session 固定）与 session id 启动，禁止 `--no-session`；路径写入 sessions.native_path。",
-    "stdout 必须按 0x0A 字节分帧后再解码 UTF-8，不使用会把 U+2028/U+2029 当换行的读取器；单帧上限1 MiB（初值）。",
+    "stdout 必须按 0x0A 字节分帧并剥离 LF 前可选的 CR，再解码 UTF-8；不使用会把 U+2028/U+2029 当换行的读取器；单帧上限1 MiB（初值）。",
     "必须先启动 stdout/stderr 持续读取任务再写入任何命令，stdout 与 stderr 并行 drain，避免管道阻塞。",
     "每条 prompt 命令必须带唯一 correlation id 并据此关联 response；response 成功只表示接受，不是完成。",
     "disposition=handled 必须立即结束该次交付（未启动模型 run，不等 settled）；started/queued 必须等 agent_settled 才判定静止；agent_end 后的重试/压缩不算完成。",
@@ -1349,10 +1349,10 @@
      "test_id": "TEST-026-04"
     }
    ],
-   "open_questions": [
-    "本机未安装 Pi：中止命令、状态查询、agent_settled、disposition 与扩展 UI 请求的帧名依据 docs/13 与 S07/S09 摘要，须在 M0 录制真实样例确认。",
-    "是否剥离 LF 前的 CR 文档未定；选择只按 0x0A 分帧，CR 由 JSON 解析作为空白处理。",
-    "session id 参数名以安装版本 help 为准；UI 请求 cancel 回应测试阈值≤1 s 为初值。"
+   "decisions": [
+    "帧名已对照本机 Pi 1.5.0 自带文档（docs/rpc.md、rpc-commands.md、rpc-extension-ui.md）核实：命令以 `id` 关联 response；prompt 的 disposition 为 started/queued/handled；事件 agent_start/agent_end/agent_settled；中止命令 `abort`；状态查询 `get_state`（isStreaming、isCompacting、pendingMessageCount）；对话类 extension_ui_request（select/confirm/input/editor）须以同 id 的 extension_ui_response 回 `cancelled: true`，notify/setStatus/setWidget/setTitle/set_editor_text 不需回应；会话参数 `--session-dir`/`--session-id`。M0-T04 仍须录制真实样例。",
+    "已修正（CR-002，依据 Pi 1.5.0 docs/rpc.md）：只按 0x0A 分帧，并剥离 LF 前可选的 CR 以接受 CRLF。",
+    "会话参数为 `--session-id <id>`（Pi 1.5.0 help）；UI 请求 cancel 回应测试阈值≤1 s 为确认值。"
    ]
   },
   {
@@ -1427,7 +1427,7 @@
      "test_id": "TEST-027-04"
     }
    ],
-   "open_questions": [
+   "decisions": [
     "COMPAT_UNVERIFIED、PROTOCOL_FRAME_TOO_LARGE 命名与读块64 KiB 为初值；帧上限1 MiB 为 docs/13 初值。",
     "兼容套件是否必须含 live smoke（产生费用）未定；选择离线探测+fixture 为必需，live smoke 由 adapter-live 检查单独记录。",
     "Claude/Pi 无原生 schema 命令，schema_sha256 记 null，以 help hash 与 fixture 为准。"
@@ -1671,9 +1671,9 @@
      "test_id": "TEST-035-05"
     }
    ],
-   "open_questions": [
-    "本REQ引入的拒绝原因码（DEPENDENCY_NOT_ACCEPTED、STALE_*、BUDGET_NOT_RESERVABLE、ROLE_CAPABILITY_MISSING、ILLEGAL_TRANSITION、EVIDENCE_GATE_UNMET、COMMANDER_UNAVAILABLE）为初值，需进入protocol schema枚举。",
-    "decisions表无reason列；本选择迁移增加reason_code列，而非只写在event中。",
+   "decisions": [
+    "拒绝原因码（DEPENDENCY_NOT_ACCEPTED、STALE_*、BUDGET_NOT_RESERVABLE、ROLE_CAPABILITY_MISSING、ILLEGAL_TRANSITION、EVIDENCE_GATE_UNMET、COMMANDER_UNAVAILABLE）为确认值；M1-T01 实现领域类型时集中写入 protocol.schema.json 枚举（随该任务 CR 重锁）。",
+    "decisions 表已含 reason_code 列（CR-001 SQL），原因码不只写在 event 中。",
     "「已授权低风险动作」文档未枚举；本选择仅含常规QA/Review派发、已调度重试、pause/cancel与状态持久化。"
    ]
   },
@@ -1745,10 +1745,10 @@
      "test_id": "TEST-036-04"
     }
    ],
-   "open_questions": [
+   "decisions": [
     "VERIFYING→RUNNING（候选失败后修复/下一增量）文档未显式列出，按工程循环选择为合法。",
     "INCOMPLETE是否终态未定；本选择终态仅COMPLETED/CANCELLED/FAILED，INCOMPLETE/BLOCKED/WAITING_EXTERNAL/PAUSED可经ResumeRun回到resume_state。",
-    "attempts缺config_revision列，需迁移扩展；SESSION_NOT_INDEPENDENT错误码为初值。",
+    "attempts 已含 config_revision 列（CR-001 SQL）；SESSION_NOT_INDEPENDENT 为确认的错误码。",
     "故障注入点只在test feature编译，生产二进制不得包含注入路径。"
    ]
   },
@@ -1823,10 +1823,10 @@
      "test_id": "TEST-037-04"
     }
    ],
-   "open_questions": [
+   "decisions": [
     "barrier开放期间Developer是否可在写目录做不相关增量文档未定；本选择允许不相关写Task，但源自当前candidate Issue的修复须待barrier关闭后派发。",
     "reader_slots=2取自config示例，作为初值。",
-    "leases主键为(project_id,kind)，多读槽需不同kind（如reader-1、reader-2）或迁移改主键；本选择使用编号kind。"
+    "多读槽使用编号 kind（reader-1、reader-2…）；SQL leases.kind 约束已相应放宽（CR-002）。"
    ]
   },
   {
@@ -1849,6 +1849,7 @@
     "排序必须先分层：关键回归/数据完整性(0)→解阻(1)→普通(2)；层内按score=(4*user_value+3*unblock_value+3*risk_reduction+2*information_gain+age_bonus)/max(cost_estimate,1)降序。",
     "平局必须依次按created_seq升序、task_id字典序打破；结果与输入顺序及哈希迭代顺序无关。",
     "各输入分值必须在0..5；cost缺估计用中位桶；age_bonus截断在0..10。",
+    "eligible但未被选的调度轮数达到max_wait_rounds（初值20）的Task进入层0与层1之间的老化子层，子层内按首次eligible序号FIFO；层0为空时等待轮数有上界（防饥饿）。",
     "权重与参数必须写入Run配置快照；活跃Run中不得修改，变更只对新Run生效。",
     "1000个活跃Task及其依赖必须可确定性调度，不在每次选择时全表反序列化历史。"
    ],
@@ -1901,11 +1902,18 @@
      "when": "提交修改R权重为(1,1,1,1)的配置变更。",
      "then": "返回409；R配置快照仍为(4,3,3,2)；后续调度score仍按原权重计算。",
      "test_id": "TEST-038-05"
+    },
+    {
+     "id": "AC-038-06",
+     "given": "层0为空；层2中H(user_value=0,cost=5,score=0)最早eligible；每轮补入一个新的L(user_value=3,cost=2,score=6)；max_wait_rounds=20，age_bonus上限10。",
+     "when": "连续运行25个调度轮，每轮选1个Task。",
+     "then": "前20轮选中L；第21轮选中H（已进入老化子层）；全部轮次中任一eligible Task连续未被选的轮数≤20。",
+     "test_id": "TEST-038-06"
     }
    ],
-   "open_questions": [
+   "decisions": [
     "age_bonus增长单位未定；本选择为每个调度轮eligible但未被选+1（不依赖墙钟），上限10。",
-    "上限10时老化只能追平≤10/max(cost,1)的分差，如user_value=0、cost=5的Task面对持续新到的score=6任务仍会饥饿；若要求严格无饥饿需CR。",
+    "已修正（CR-002）：age_bonus 上限 10 只能追平有限分差，无法防饥饿。新增 max_wait_rounds（初值 20）：eligible 但未被选的轮数达到上限的 Task 进入位于层0与层1之间的老化子层，子层内按首次 eligible 的序号 FIFO；层0为空时任何 eligible Task 的等待轮数有上界。",
     "cost_estimate桶未定；初值为整数1..5，缺估计取中位桶3。",
     "分层赋值规则未定；本选择：critical/high回归或数据完整性Issue→0，被阻塞Task依赖→1，其余→2。",
     "超出0..5的分值选择拒绝而非截断；SCORE_OUT_OF_RANGE、DAG_CYCLE、DAG_MISSING_DEPENDENCY为初值错误码。"
@@ -1979,7 +1987,7 @@
      "test_id": "TEST-039-04"
     }
    ],
-   "open_questions": [
+   "decisions": [
     "文档只写了“默认分配”，没说某类用不完的份额是否可以挪给其他类。选择以份额为硬上限，不挪用，便于复现和判定。",
     "估算 tokenizer 的误差容限未定。选择所有预算判定都以估算值为准，并标 estimated。"
    ]
@@ -2086,9 +2094,9 @@
      "test_id": "TEST-041-05"
     }
    ],
-   "open_questions": [
+   "decisions": [
     "租约TTL与续约周期未定：初值TTL=120 s、每30 s续约。",
-    "attempts缺pid、pgid、boot_id、starttime列，需迁移扩展；STALE_LEASE_EPOCH为初值错误码。",
+    "attempts 已含 pid、boot_id、process_start_id 列（CR-001 SQL）；进程组 id 等于 pid（独立 session 启动）；STALE_LEASE_EPOCH 为确认错误码。",
     "host崩溃的≤30 s检测依赖systemd RestartSec或下一次客户端启动；以RestartSec=5 s（初值）测量。"
    ]
   },
@@ -2113,7 +2121,7 @@
     "鉴权缺失必须直接BLOCKED（BLOCKED_AUTH），CLI能力不兼容直接BLOCKED（BLOCKED_CAPABILITY）；不进入指数退避。",
     "同一问题本地修复≤3次、协议格式纠正≤2次（max_local_repairs/max_protocol_repairs）；超限即升级决策，不再派发同类修复。",
     "预算（max_iterations=100、max_duration_hours=120、可选token/费用上限）必须派发前预留并持久累计；耗尽或deadline_at到达即停止新派发，Run=INCOMPLETE并列出剩余项。",
-    "价格未知时cost必须为null并标unknown；费用上限检查结果为unknown而非通过；不以估算冒充账单。",
+    "价格未知时cost必须为null并标unknown；不以估算冒充账单。配置了费用上限而所用模型价格未知时，该上限无法执行，派发前即BLOCKED（BUDGET_UNENFORCEABLE）。",
     "wall deadline与inactivity watchdog必须分别计时；无输出但工具进程仍运行不判为死机。"
    ],
    "failure_modes": [
@@ -2167,13 +2175,20 @@
      "when": "Runtime评估第4次本地修复与第3次协议纠正。",
      "then": "两者均不派发；各产生1条need_decision升级事件；重启后计数仍为3与2；相关Task≠ACCEPTED。",
      "test_id": "TEST-042-05"
+    },
+    {
+     "id": "AC-042-06",
+     "given": "Run Rc配置费用上限max_usd=5，所用模型不在价格表中；Run Rd未配置费用上限，其余相同。",
+     "when": "两个Run各尝试派发第一个Attempt。",
+     "then": "Rc在派发前进入BLOCKED、原因BUDGET_UNENFORCEABLE、attempts=0；Rd正常派发，cost_usd=null且cost_status=unknown。",
+     "test_id": "TEST-042-06"
     }
    ],
-   "open_questions": [
+   "decisions": [
     "退避base=2 s、cap=300 s、瞬时重试上限8次均为初值。",
-    "价格未知时费用上限的处理选择为：不判通过、显示unknown、继续受其他预算约束；是否应改为BLOCKED待定。",
-    "docs/14用BLOCKED_AUTH/BLOCKED_CAPABILITY，docs/12用CAPABILITY_UNSUPPORTED；本选择前者为Run阻塞原因，后者为错误码；runs需增加blocked_reason列。",
-    "tasks/attempts缺attempt_count、next_retry_at列（仅outbox有），且无预算账本表，需迁移扩展。"
+    "已修正（CR-002）：价格未知时 cost 为 null 并显示 unknown；若用户配置了费用上限而所用模型价格未知，该上限无法执行，派发前即 BLOCKED（BUDGET_UNENFORCEABLE），不在无法核算时继续花费；未配置费用上限时照常受其他预算约束。",
+    "命名已统一（CR-001）：BLOCKED_AUTH/BLOCKED_CAPABILITY 为阻塞原因，CAPABILITY_UNSUPPORTED 为错误码；runs 已含 blocked_reason 列。",
+    "tasks 已含 attempt_count、next_retry_at；预算账本为 budgets 表（CR-001 SQL）。"
    ]
   },
   {
@@ -2253,7 +2268,7 @@
      "test_id": "TEST-043-05"
     }
    ],
-   "open_questions": [
+   "decisions": [
     "native interrupt grace 10 s、SIGTERM grace 5 s及17 s总上限为初值；docs只要求短grace与有界SIGKILL。",
     "安全点未精确定义；本选择为当前Attempt到达SETTLED/FAILED/CANCELLED，Pause不设超时也不中断。",
     "以setsid脱离进程组的后代不受pgid信号覆盖；本选择额外按/proc父子链终止该Attempt后代，需实现时确认可行。"
@@ -2518,7 +2533,7 @@
      "test_id": "TEST-052-04"
     }
    ],
-   "open_questions": [
+   "decisions": [
     "产品中对相同内容重复冻结：选择返回已有 candidate_id，不新增行。自举工具 tools/candidate.py 则拒绝覆盖已存在的清单文件。",
     "符号链接和子模块：选择拒绝冻结，直到实现显式身份规则并有测试。",
     "evidence.outcome 枚举里没有 INSUFFICIENT。选择存为 outcome=INVALID，并附原因码 INSUFFICIENT。"
@@ -2605,7 +2620,7 @@
      "test_id": "TEST-053-05"
     }
    ],
-   "open_questions": [
+   "decisions": [
     "UNKNOWN 之后对同一 candidate 重测通过：选择投影为 FLAKY（不满足 strict），要变为 PASS 需走 REQ-055 的 flaky 处置或产生新 candidate。",
     "QA 能否在初始上下文看到自测报告：选择允许，但只作为排在 AC 之后的 diagnostic 引用。"
    ]
@@ -2691,7 +2706,7 @@
      "test_id": "TEST-054-05"
     }
    ],
-   "open_questions": [
+   "decisions": [
     "Reviewer 是否必须与 QA 也不同会话：tools/release_gate.py 要求 developer/QA/reviewer 三者不同，选择让三者与 Commander 全部互不相同。",
     "independent-report 的 finding 没有定位字段：选择用 summary 和 evidence 引用承载代码/行为定位；fingerprint 由 Runtime 计算，与 candidate 无关（初值：sha256(severity+规范化 summary+定位)），以便跨候选追踪。",
     "文档只要求“Review 完成”：选择 Review status=FAIL 即不满足候选 ACCEPTED（更严格）；PASS 报告中可以带 low/medium 建议。"
@@ -2879,6 +2894,7 @@
     "writer队列必须有界；满时对调用方背压，最长等待busy_timeout后返回可重试错误；关键事件不得静默丢弃。",
     "消费方必须在同一事务写receipts(consumer,message_id)与状态迁移；重复投递返回首次result_json，不重复改状态。",
     "DB所在文件系统为nfs/nfs4/cifs/smb3/fuse.sshfs/9p等网络或共享文件系统时必须拒绝打开，返回DB_ON_NETWORK_FS且不创建DB文件。",
+    "名单外的文件系统（含virtiofs）在host启动时必须做WAL自检（临时库启用WAL、写入、checkpoint、-shm映射与加锁）；失败即返回DB_WAL_UNSUPPORTED拒绝启动，不创建正式DB文件。",
     "SQLITE_BUSY超过busy_timeout时写命令返回503、retryable=true并保持上次已提交状态；读请求与UI不被该写等待阻塞。",
     "UI、Agent适配器与Web处理器不得直接执行INSERT/UPDATE/DELETE，只能经Persistence模块类型接口。"
    ],
@@ -2934,12 +2950,19 @@
      "when": "运行静态检查，扫描SQL写语句与rusqlite写API调用位置。",
      "then": "INSERT/UPDATE/DELETE/REPLACE及写调用只出现在Persistence模块白名单路径；白名单外命中数=0；web目录无SQLite依赖。",
      "test_id": "TEST-062-05"
+    },
+    {
+     "id": "AC-062-06",
+     "given": "三个目录：ext4上的/p4；注入WAL自检故障（-shm映射失败）的/p6；注入checkpoint失败的/p7。",
+     "when": "分别在各目录启动host。",
+     "then": "/p4自检通过并正常接受写命令；/p6、/p7 host退出码≠0、stderr含DB_WAL_UNSUPPORTED，且.hoh下无正式*.db/-wal/-shm文件。",
+     "test_id": "TEST-062-06"
     }
    ],
-   "open_questions": [
+   "decisions": [
     "busy_timeout取初值5000 ms：单writer下仅与备份/checkpoint/外部诊断连接争用。",
     "synchronous选FULL（初值）以覆盖VM硬重启后已ACK事务不丢；若性能目标不达需CR改NORMAL并记录风险。",
-    "网络/共享文件系统名单为初值；virtiofs是否拒绝未定，本选择暂不拒绝。",
+    "已修正（CR-002）：已知网络/共享文件系统直接拒绝；其余文件系统（含 virtiofs）在 host 启动时做 WAL 自检（临时库启用 WAL、写入、checkpoint、-shm 映射与加锁），失败即以 DB_WAL_UNSUPPORTED 拒绝启动——以实测代替名单猜测。",
     "DB_ON_NETWORK_FS、DB_BUSY错误码名为初值；GET≤500 ms借用事件可见p95目标作为阈值。"
    ]
   },

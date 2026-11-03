@@ -41,11 +41,11 @@
 |REQ-035|双层编排|M2|required|v1, v0.1|detailed|AC-035-01（TEST-035-01·unit）<br>AC-035-02（TEST-035-02·integration）<br>AC-035-03（TEST-035-03·integration）<br>AC-035-04（TEST-035-04·unit）<br>AC-035-05（TEST-035-05·integration）|M2-T02, V01-T01, V01-T02, M2-T11, M7-T04|
 |REQ-036|持久生命周期|M2|required|v1, v0.1|detailed|AC-036-01（TEST-036-01·unit）<br>AC-036-02（TEST-036-02·recovery）<br>AC-036-03（TEST-036-03·integration）<br>AC-036-04（TEST-036-04·integration）|M2-T01, M2-T02, V01-T01, V01-T02, M2-T11, M7-T04|
 |REQ-037|单写者与并行验证|M2|required|v1, v0.1|detailed|AC-037-01（TEST-037-01·integration）<br>AC-037-02（TEST-037-02·integration）<br>AC-037-03（TEST-037-03·integration）<br>AC-037-04（TEST-037-04·integration）|M2-T03, V01-T01, V01-T02, M2-T11, M7-T04|
-|REQ-038|任务DAG调度|M2|required|v1, v0.1|detailed|AC-038-01（TEST-038-01·unit）<br>AC-038-02（TEST-038-02·unit）<br>AC-038-03（TEST-038-03·integration）<br>AC-038-04（TEST-038-04·unit）<br>AC-038-05（TEST-038-05·integration）|M2-T03, V01-T01, V01-T02, M2-T11, M7-T04|
+|REQ-038|任务DAG调度|M2|required|v1, v0.1|detailed|AC-038-01（TEST-038-01·unit）<br>AC-038-02（TEST-038-02·unit）<br>AC-038-03（TEST-038-03·integration）<br>AC-038-04（TEST-038-04·unit）<br>AC-038-05（TEST-038-05·integration）<br>AC-038-06（TEST-038-06·unit）|M2-T03, V01-T01, V01-T02, M2-T11, M7-T04|
 |REQ-039|上下文渐进披露|M2|required|v1|detailed|AC-039-01（TEST-039-01·unit）<br>AC-039-02（TEST-039-02·unit）<br>AC-039-03（TEST-039-03·integration）<br>AC-039-04（TEST-039-04·integration）|M2-T09, M2-T11, M7-T04|
 |REQ-040|停滞与诊断|M3|required|v1|outline|AC-040-01（TEST-040-01·unit）|M3-T01, M3-T04, M3-T05, M7-T04|
 |REQ-041|恢复与幂等|M2|required|v1, v0.1|detailed|AC-041-01（TEST-041-01·recovery）<br>AC-041-02（TEST-041-02·recovery）<br>AC-041-03（TEST-041-03·recovery）<br>AC-041-04（TEST-041-04·integration）<br>AC-041-05（TEST-041-05·recovery）|M2-T05, V01-T01, V01-T02, M2-T11, M7-T04|
-|REQ-042|预算与等待|M2|required|v1, v0.1|detailed|AC-042-01（TEST-042-01·unit）<br>AC-042-02（TEST-042-02·recovery）<br>AC-042-03（TEST-042-03·integration）<br>AC-042-04（TEST-042-04·integration）<br>AC-042-05（TEST-042-05·unit）|M2-T05, V01-T01, V01-T02, M2-T11, M7-T04|
+|REQ-042|预算与等待|M2|required|v1, v0.1|detailed|AC-042-01（TEST-042-01·unit）<br>AC-042-02（TEST-042-02·recovery）<br>AC-042-03（TEST-042-03·integration）<br>AC-042-04（TEST-042-04·integration）<br>AC-042-05（TEST-042-05·unit）<br>AC-042-06（TEST-042-06·integration）|M2-T05, V01-T01, V01-T02, M2-T11, M7-T04|
 |REQ-043|暂停取消分离|M2|required|v1, v0.1|detailed|AC-043-01（TEST-043-01·integration）<br>AC-043-02（TEST-043-02·integration）<br>AC-043-03（TEST-043-03·tui-pty）<br>AC-043-04（TEST-043-04·integration）<br>AC-043-05（TEST-043-05·unit）|M2-T06, V01-T01, V01-T02, M2-T11, M7-T04|
 |REQ-044|可恢复版本|M5|required|v1|outline|AC-044-01（TEST-044-01·recovery）|M5-T01, M5-T02, M5-T04, M7-T04|
 |REQ-045|四层Prompt版本|M3|required|v1|outline|AC-045-01（TEST-045-01·unit）|M3-T01, M3-T03, M3-T05, M7-T04|
@@ -65,7 +65,7 @@
 |REQ-059|事件重连|M6|required|v1|outline|AC-059-01（TEST-059-01·web-e2e）|M6-T01, M6-T02, M6-T04, M7-T04|
 |REQ-060|多客户端操作|M6|required|v1|outline|AC-060-01（TEST-060-01·web-e2e）|M6-T01, M6-T02, M6-T04, M7-T04|
 |REQ-061|无障碍和远程体验|M6|required|v1|outline|AC-061-01（TEST-061-01·web-e2e）|M6-T01, M6-T02, M6-T04, M7-T04|
-|REQ-062|持久化一致性|M2|required|v1, v0.1|detailed|AC-062-01（TEST-062-01·integration）<br>AC-062-02（TEST-062-02·integration）<br>AC-062-03（TEST-062-03·integration）<br>AC-062-04（TEST-062-04·integration）<br>AC-062-05（TEST-062-05·static）|M2-T01, V01-T01, V01-T02, M2-T11, M7-T04|
+|REQ-062|持久化一致性|M2|required|v1, v0.1|detailed|AC-062-01（TEST-062-01·integration）<br>AC-062-02（TEST-062-02·integration）<br>AC-062-03（TEST-062-03·integration）<br>AC-062-04（TEST-062-04·integration）<br>AC-062-05（TEST-062-05·static）<br>AC-062-06（TEST-062-06·integration）|M2-T01, V01-T01, V01-T02, M2-T11, M7-T04|
 |REQ-063|备份与迁移|M5|required|v1|outline|AC-063-01（TEST-063-01·recovery）|M5-T01, M5-T02, M5-T04, M7-T04|
 |REQ-064|可观测性与容量|M4|required|v1|outline|AC-064-01（TEST-064-01·integration）|M4-T01, M4-T03, M4-T04, M7-T04|
 |REQ-065|Git集成与交付|M6|required|v1|outline|AC-065-01（TEST-065-01·integration）|M6-T01, M6-T03, M6-T04, M7-T04|
@@ -75,4 +75,4 @@
 |REQ-069|交付真实性|M7|required|v1|outline|AC-069-01（TEST-069-01·traceability）|M7-T01, M7-T02, M7-T04|
 |REQ-070|长期维护与升级|M7|required|v1|outline|AC-070-01（TEST-070-01·deployment）|M7-T01, M7-T02, M7-T04|
 
-合计：70 项需求（27 项 detailed），161 条验收。v0.1 范围：18 项需求。
+合计：70 项需求（27 项 detailed），164 条验收。v0.1 范围：18 项需求。

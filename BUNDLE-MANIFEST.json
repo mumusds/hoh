@@ -4,7 +4,7 @@
   "kind": "design_and_ai_development_kit",
   "product_implemented": false,
   "baseline": "HOH-BASELINE-1.1",
-  "baseline_revision": 2,
+  "baseline_revision": 3,
   "entries": [
     {
       "path": ".agents/skills/hoh-bootstrap/SKILL.md",
@@ -48,8 +48,8 @@
     },
     {
       "path": "CHANGELOG.md",
-      "bytes": 2881,
-      "sha256": "b11f9a31d029f5188a289c36c01974aedfb482ea26dfed45e62d1c333292c109"
+      "bytes": 3470,
+      "sha256": "55ef961afb75490c6a8fc2127e7648650178e4ebfbbef268dc7d8efaab973f0b"
     },
     {
       "path": "CLAUDE.md",
@@ -84,7 +84,7 @@
     {
       "path": "README.md",
       "bytes": 6117,
-      "sha256": "0df98ce5ae98d5cb2787b996c27cba28e0747a25ea8f31661ac76af56f4c7ab9"
+      "sha256": "575e4ae15ffc830a2ede7755e1accf999e6a994fce05c0f0e3b77fca09380449"
     },
     {
       "path": "RESUME_PROMPT.md",
@@ -118,13 +118,13 @@
     },
     {
       "path": "contracts/acceptance-scenarios.json",
-      "bytes": 110174,
-      "sha256": "2b889876f9e15934706b1f0a96a85f190cfc92896f1130bf1e9b3ca5358ca6f8"
+      "bytes": 111887,
+      "sha256": "602f988556eeda86d0706cad71113fd1a9c748594c2b7d43192cca3766b6b7ab"
     },
     {
       "path": "contracts/baseline-lock.json",
-      "bytes": 2798,
-      "sha256": "5fd8647091758bbd1286d5ed8c5040b1c05738d61617ddec6458a5852cb57530"
+      "bytes": 2975,
+      "sha256": "2106a1ee2d6966a445f56bf4174ae248596090b2589a3fa3a353d50f1bed5f0b"
     },
     {
       "path": "contracts/candidate.schema.json",
@@ -183,8 +183,8 @@
     },
     {
       "path": "contracts/requirements.json",
-      "bytes": 174605,
-      "sha256": "f12844c087b95dcbe32bfef0ac821afaebb4ad4ea8e4bec872593f75735e15de"
+      "bytes": 177369,
+      "sha256": "b277beda5245e4f6d6c465b7e86c5a83b7f8bb54a5a66650a186ba22b7939ff9"
     },
     {
       "path": "contracts/soak-event.schema.json",
@@ -193,8 +193,8 @@
     },
     {
       "path": "contracts/sql/001_initial.sql",
-      "bytes": 13713,
-      "sha256": "547dbcc09fe5d79624165e564b829df309be878715d1e63b433e8440f7be6006"
+      "bytes": 13728,
+      "sha256": "6416aa327597671a5180a96fbf4a126f99ed8c25ddbc19d51aba1e150d95d91a"
     },
     {
       "path": "docs/00-product-definition.md",
@@ -208,8 +208,8 @@
     },
     {
       "path": "docs/02-functional-spec.md",
-      "bytes": 183360,
-      "sha256": "57af2559588a2df979e3a279a1be30701101e9ea695abc355d62e93a9e9a5ab6"
+      "bytes": 188464,
+      "sha256": "f774bb63427fb59d95e01fe2812b4e365910c4298ad2cbdd592feabb8dbaf0cd"
     },
     {
       "path": "docs/03-ux.md",
@@ -233,13 +233,13 @@
     },
     {
       "path": "docs/07-algorithms.md",
-      "bytes": 4931,
-      "sha256": "50812065d2ae33e6fb620ec47697b86510ed64b98dc2e3434af20e97fcf209bf"
+      "bytes": 5272,
+      "sha256": "c51b0424237f3a89f1ec878c7c7a31e6d7ead7bb79e2e078379ba700f0f8187a"
     },
     {
       "path": "docs/08-development-plan.md",
-      "bytes": 5196,
-      "sha256": "59b8cee6e09b50b222d738f231fc7cc876534b52f9336479b93353c173bd217e"
+      "bytes": 5240,
+      "sha256": "3f3ed424aa015b2e0a1de83aad79cef206233922fc740e8a308b39944691f639"
     },
     {
       "path": "docs/09-testing.md",
@@ -288,8 +288,8 @@
     },
     {
       "path": "docs/18-traceability.md",
-      "bytes": 12897,
-      "sha256": "972fc958f9836580c3efbe5a59ea81638aa05995b473835110b148a7e3d2d21f"
+      "bytes": 13019,
+      "sha256": "07402c21eb4d457b3145393d8e4206b33fc2557ab5265d3554cc28caefd4369c"
     },
     {
       "path": "docs/19-ai-development.md",
@@ -367,6 +367,11 @@
       "sha256": "22bc5370a6d03b11441cd6a0dc2b9a141e4fc5d406b2889375247a4257ced50b"
     },
     {
+      "path": "docs/cr/CR-002-confirm-m1-m2-decisions.md",
+      "bytes": 2585,
+      "sha256": "0c6e1e0f55292f565dbe54410feac648391610688eb6cc8dd50a280f0b5d8316"
+    },
+    {
       "path": "examples/README.md",
       "bytes": 499,
       "sha256": "22b635acd422e187b5d3a206255e5adc0bd9323f79fb41ee0cbefb7ddebfac66"
@@ -409,7 +414,7 @@
     {
       "path": "reports/bundle-validation.json",
       "bytes": 409,
-      "sha256": "e5510bcec981ac63b826cdf5ad96717d6adc4e9f47f5e523c833edd32134f355"
+      "sha256": "c042052f2ac386eef5c05968b8108a35f0e7f9468979835df102e0911d32fb31"
     },
     {
       "path": "reports/environment-preflight.json",
@@ -513,8 +518,8 @@
     },
     {
       "path": "reports/tests-bundle.json",
-      "bytes": 580,
-      "sha256": "d226a6a60257d67f706a7cf2f06d47df84de51c2441f72bb43d40b0cc1de5726"
+      "bytes": 581,
+      "sha256": "1df7ea1faf3ae2e91bbfa43dcf35ce97cc19d8bafb6c88db056bc13198a3c4fb"
     },
     {
       "path": "requirements-dev.txt",
@@ -753,13 +758,13 @@
     },
     {
       "path": "tests/bundle/test_reference.py",
-      "bytes": 3011,
-      "sha256": "7097ee0dd3fba134686e119b2e047be018f839d707925aa67b0c0b256a56ebd2"
+      "bytes": 3782,
+      "sha256": "5bed8c05a3c9b39c892d206c6310192106814703ec5418bf0e4116fda6839aac"
     },
     {
       "path": "tests/bundle/test_sql.py",
-      "bytes": 6768,
-      "sha256": "eacf2c469323abe972648ee68e48fec147eeec209ce89c23f0dbe18e72a7ee0d"
+      "bytes": 7361,
+      "sha256": "c2920806b551c6320508366fea7fab55d607038aa23651780ebf3b494e86c427"
     },
     {
       "path": "tests/bundle/test_tools.py",
@@ -793,8 +798,8 @@
     },
     {
       "path": "tools/gen_spec_views.py",
-      "bytes": 4541,
-      "sha256": "6402f463ba515824da223f588fde1e83b6bf888d538d737533e16e00a2dd558c"
+      "bytes": 4601,
+      "sha256": "39a318406797eceb1e39b4f52b050b5fe33137251f6f9f0dda3e49840af4437d"
     },
     {
       "path": "tools/install_pi_plugins.py",
@@ -808,8 +813,8 @@
     },
     {
       "path": "tools/reference_model.py",
-      "bytes": 2616,
-      "sha256": "5992b1830f1552b126ecfffdb9e3cca5760a8375c7ed85cc5ba2d3c1b272cfc5"
+      "bytes": 3032,
+      "sha256": "5034f27c320dc49082d1d2be589ba67b2add0091b0182fddf40521265c99acac"
     },
     {
       "path": "tools/release_gate.py",

@@ -43,6 +43,11 @@ class SQLContract(unittest.TestCase):
         self.c.execute("INSERT INTO attempts(attempt_id,task_id,state,role_epoch,host_epoch,config_revision) VALUES('a','t','PREPARED',1,1,0)")
         self.c.execute("INSERT INTO leases VALUES('p','writer','a',1,'later')")
         with self.assertRaises(sqlite3.IntegrityError):self.c.execute("INSERT INTO leases VALUES('p','writer','a',2,'later')")
+    def test_lease_kinds(self):
+        self.c.execute("INSERT INTO tasks(task_id,run_id,spec_id,state,role,created_seq) VALUES('t2','r','s','READY','qa',2)")
+        self.c.execute("INSERT INTO attempts(attempt_id,task_id,state,role_epoch,host_epoch,config_revision) VALUES('a2','t2','PREPARED',1,1,0)")
+        self.c.execute("INSERT INTO leases VALUES('p','reader-1','a2',1,'later')");self.c.execute("INSERT INTO leases VALUES('p','reader-2','a2',1,'later')")
+        with self.assertRaises(sqlite3.IntegrityError):self.c.execute("INSERT INTO leases VALUES('p','reader-x','a2',1,'later')")
     def test_sqlite_online_backup(self):
         self.c.commit();other=sqlite3.connect(':memory:');self.addCleanup(other.close);self.c.backup(other)
         self.assertEqual(other.execute('SELECT run_id FROM runs').fetchone()[0],'r')

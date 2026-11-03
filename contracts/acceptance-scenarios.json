@@ -2276,6 +2276,28 @@
    ]
   },
   {
+   "id": "TEST-038-06",
+   "requirement_id": "REQ-038",
+   "acceptance_id": "AC-038-06",
+   "check_id": "unit",
+   "fixture": "确定性调度器单元测试，FakeClock，固定created_seq",
+   "steps": [
+    "构造就绪集与每轮补入的L",
+    "运行25轮并记录每轮选择与各Task等待轮数"
+   ],
+   "pass_criteria": [
+    "第1–20轮选择均为L",
+    "第21轮选择为H",
+    "最大连续等待轮数≤20",
+    "H在第21轮的子层标记=aged"
+   ],
+   "observables": [
+    "每轮选择序列",
+    "各Task等待轮数",
+    "子层归属"
+   ]
+  },
+  {
    "id": "TEST-039-01",
    "requirement_id": "REQ-039",
    "acceptance_id": "AC-039-01",
@@ -2614,6 +2636,27 @@
     "计数快照",
     "events导出",
     "测试报告原文"
+   ]
+  },
+  {
+   "id": "TEST-042-06",
+   "requirement_id": "REQ-042",
+   "acceptance_id": "AC-042-06",
+   "check_id": "integration",
+   "fixture": "FakeAgent不报告价格；价格表缺该模型",
+   "steps": [
+    "启动Rc并观察派发",
+    "启动Rd并完成一轮"
+   ],
+   "pass_criteria": [
+    "Rc：state=BLOCKED、blocked_reason=BUDGET_UNENFORCEABLE、attempts行数=0",
+    "Rd：attempts行数≥1、cost_usd=null、cost_status=unknown",
+    "两者state≠COMPLETED"
+   ],
+   "observables": [
+    "runs行",
+    "attempts行",
+    "最终JSON结果"
    ]
   },
   {
@@ -3461,6 +3504,27 @@
     "扫描stdout与命中列表",
     "白名单文件hash",
     "candidate身份"
+   ]
+  },
+  {
+   "id": "TEST-062-06",
+   "requirement_id": "REQ-062",
+   "acceptance_id": "AC-062-06",
+   "check_id": "integration",
+   "fixture": "可注入故障的WAL自检测试替身（仅test feature编译）",
+   "steps": [
+    "在/p4启动host并提交一条命令",
+    "在/p6、/p7启动host"
+   ],
+   "pass_criteria": [
+    "/p4：命令返回202且可查到",
+    "/p6、/p7：退出码≠0且stderr含DB_WAL_UNSUPPORTED",
+    "/p6、/p7的.hoh下正式DB文件数=0"
+   ],
+   "observables": [
+    "退出码",
+    "stderr",
+    ".hoh目录清单"
    ]
   },
   {

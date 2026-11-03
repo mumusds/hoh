@@ -14,6 +14,9 @@ class Task:
     age: float=0
     cost: float=1
     seq: int=0
+    waited: int=0         # scheduling rounds eligible but not selected
+    eligible_since: int=0 # sequence number of the first round it became eligible
+MAX_WAIT_ROUNDS=20  # REQ-038 (CR-002): bounded waiting via an aged FIFO sub-layer between layers 0 and 1
 
 def topo(tasks: Iterable[Task]) -> list[str]:
     items=list(tasks);m={t.id:t for t in items}
@@ -31,13 +34,14 @@ def topo(tasks: Iterable[Task]) -> list[str]:
     if len(result)!=len(items):raise ValueError('cycle')
     return result
 
-def choose(tasks: Iterable[Task],accepted:set[str],leased:set[str],budget:float) -> str|None:
+def choose(tasks: Iterable[Task],accepted:set[str],leased:set[str],budget:float,max_wait_rounds:int=MAX_WAIT_ROUNDS) -> str|None:
     items=list(tasks);topo(items)
     eligible=[t for t in items if t.id not in accepted|leased and set(t.deps)<=accepted and max(t.cost,1)<=budget]
     def key(t:Task):
         if t.cost<0 or not 0<=t.severity<=2:raise ValueError('bad task parameters')
+        if t.severity>0 and t.waited>=max_wait_rounds:return 0.5,0,t.eligible_since,t.seq,t.id  # aged FIFO sub-layer
         score=(4*t.value+3*t.unblock+3*t.risk+2*t.information+min(max(t.age,0),10))/max(t.cost,1)
-        return t.severity,-score,t.seq,t.id
+        return t.severity,-score,0,t.seq,t.id
     return min(eligible,key=key).id if eligible else None
 
 def decision_current(expected_revision:int,current_revision:int,epoch:int,current_epoch:int)->bool:

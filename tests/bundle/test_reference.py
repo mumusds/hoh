@@ -17,6 +17,19 @@ class Scheduling(unittest.TestCase):
     def test_hard_severity(self):self.assertEqual(choose([Task('a',severity=0,value=0),Task('b',severity=2,value=100)],set(),set(),5),'a')
     def test_stable_tie(self):self.assertEqual(choose([Task('b'),Task('a')],set(),set(),5),'a')
     def test_aging_priority(self):self.assertEqual(choose([Task('a'),Task('b',age=10)],set(),set(),5),'b')
+    def test_bounded_wait_prevents_starvation(self):
+        # AC-038-06: a score-0 task facing a fresh score-6 task every round is chosen at round 21.
+        from dataclasses import replace
+        h=Task('h',value=0,cost=5,seq=0);picked=[]
+        for rnd in range(1,26):
+            new=Task(f'l{rnd}',value=3,cost=2,seq=rnd)
+            choice=choose([h,new],set(),set(),10)
+            picked.append(choice)
+            if choice=='h':break
+            h=replace(h,waited=h.waited+1,age=min(h.age+1,10))
+        self.assertEqual(picked[:20],[f'l{i}' for i in range(1,21)]);self.assertEqual(picked[20],'h')
+    def test_critical_layer_still_first(self):
+        self.assertEqual(choose([Task('aged',waited=50),Task('crit',severity=0,value=0)],set(),set(),5),'crit')
     def test_bad_cost(self):
         with self.assertRaises(ValueError):choose([Task('a',cost=-1)],set(),set(),5)
     def test_current_decision(self):self.assertTrue(decision_current(2,2,3,3))

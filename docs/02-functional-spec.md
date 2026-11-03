@@ -38,7 +38,7 @@ M1 · P0 · 发布类 required · 目标 v1, v0.1 · 成熟度 detailed，参考
 - **AC-001-03**（TEST-001-03 · 检查 `integration`）Given 与上一 AC 相同的 fixture 项目，测试进程无控制终端；When 分别执行 `hoh </dev/null >out 2>err` 与在 PTY 中执行 `hoh >out`（仅 stdout 被重定向）；Then 两者退出码均为64；out 为0字节；err 含 `-p` 提示；DB 行数不变；未启动新 host 进程
   - 判定：两次退出码均=64；out 文件大小=0；err 含字符串 `-p`；out 与 PTY 输出均不含 `ESC[?1049h`；DB 各表行数与基线相等，无新 host 进程
 
-**待定（已按更严格可验证行为暂定）**
+**已确认的设计选择**（项目所有者 2026-11-03 确认，CR-002；“初值”指可经 CR 调整的基线值）
 
 - 无 TTY 时 bare `hoh` 返回64而非静默退出或降级为 -p，属从严选择。
 - 输入历史存储位置文档未定，选择项目 `.hoh/` 下持久化；是否跨项目共享未定。
@@ -77,7 +77,7 @@ M1 · P0 · 发布类 required · 目标 v1, v0.1 · 成熟度 detailed，参考
 - **AC-002-03**（TEST-002-03 · 检查 `integration`）Given fixture 项目含 run C=COMPLETED（revision=5）与 run K=BLOCKED（NEED_DECISION）；FakeAgent 在收到答复后以 INCOMPLETE 结束；When 依次执行 `hoh -p`、`hoh -p ''`、`hoh -p '  '`、`hoh -p x --resume NOPE`、`hoh -p x --resume <C>`、`hoh -p '采用方案A' --resume <K>`；Then 前5项退出码64、stdout 0字节、runs 行数不变且 C 仍 COMPLETED/revision=5；第6项不新建 run，commands 新增1行 SendInput(run_id=K)，退出码=4
   - 判定：前5条退出码均=64，stdout 大小=0，stderr 非空；前5条后 runs 行数不变，run C state=COMPLETED 且 revision=5；第6条后 runs 行数不变，commands 新增恰1行 kind=SendInput 且 run_id=K；第6条退出码=4，run K 终态=INCOMPLETE
 
-**待定（已按更严格可验证行为暂定）**
+**已确认的设计选择**（项目所有者 2026-11-03 确认，CR-002；“初值”指可经 CR 调整的基线值）
 
 - `-p` 是否接受 stdin 作为提示来源文档未定；选择从严：从不读取 stdin。
 - 缺关键决策的 blocked_reason 命名 NEED_DECISION 为初值。
@@ -116,7 +116,7 @@ M1 · P0 · 发布类 required · 目标 v1, v0.1 · 成熟度 detailed，参考
 - **AC-003-03**（TEST-003-03 · 检查 `integration`）Given fixture 项目含2个可附着 run（RUNNING、PAUSED），测试进程无 TTY；When 执行 `hoh attach </dev/null >out 2>err`；Then 退出码64；out 0字节；err 同时含两个 run_id；两 run 的 state/revision 不变；host 无新增客户端订阅
   - 判定：退出码=64；out 大小=0，err 含两个完整 run_id；两 run state 与 revision 不变；host 订阅计数与执行前相等
 
-**待定（已按更严格可验证行为暂定）**
+**已确认的设计选择**（项目所有者 2026-11-03 确认，CR-002；“初值”指可经 CR 调整的基线值）
 
 - `init` 与无 `-p` 的位置参数作为用法错误64，文档未逐一列出，按最小命令面从严。
 - `hoh attach` 无 id 时：恰1个可附着 run 允许直接附着，0个返回64，为初值选择。
@@ -159,12 +159,12 @@ M1 · P0 · 发布类 required · 目标 v1, v0.1 · 成熟度 detailed，参考
 - **AC-004-04**（TEST-004-04 · 检查 `integration`）Given fake 原生 CLI 回放 Codex `codexErrorInfo=unauthorized` 失败样例；另一 FakeAgent 脚本使 run 持续 RUNNING；When 执行 `hoh -p 'x' --output json`；对第二个 run 的前台客户端 `hoh -p 'y' --output stream-json` 发送 SIGINT；Then 第一条退出码3，state=BLOCKED、blocked_reason=BLOCKED_AUTH；第二条退出码130，stderr 含 run_id 与 `hoh attach`，host 中该 run 仍为 RUNNING 且无 CancelRun
   - 判定：第一条退出码=3，blocked_reason=BLOCKED_AUTH，state≠COMPLETED；第二条退出码=130，stderr 含 run_id 与 `hoh attach`；SIGINT 后5 s 内该 run state=RUNNING，commands 中无 kind=CancelRun；stderr 不含 `panicked at`
 
-**待定（已按更严格可验证行为暂定）**
+**已确认的设计选择**（项目所有者 2026-11-03 确认，CR-002；“初值”指可经 CR 调整的基线值）
 
 - 0/3/64/78/130 与 docs/22-tooling.md 工具语义一致；1/4/5/6/69/143 及 BLOCKED 统一为3是本规格提出的初值；124/127 不用于产品（截止→INCOMPLETE=4，缺原生 CLI→BLOCKED=3）。
-- stream-json 终态事件 kind=`run.result` 与 json 结果字段集为初值，需补入 contracts 并做 schema 版本化。
+- stream-json 终态事件 kind=`run.result` 与 json 结果字段集为确认值；M1-T06 实现时把 run.result 与 json 结果对象写入 protocol.schema.json（随该任务的 CR 重锁）。
 - U+2028/U+2029 强制转义为从严选择（JSON 标准允许原样输出）。
-- docs/12 用 CAPABILITY_UNSUPPORTED、docs/14 用 BLOCKED_CAPABILITY：选择后者作 blocked_reason，前者作错误码，命名需统一。
+- 命名已统一（CR-001）：BLOCKED_CAPABILITY 为 Run/Task 阻塞原因，CAPABILITY_UNSUPPORTED 为错误码（API 422），见 docs/12、docs/14。
 
 ## REQ-005 · 脱离与附着
 
@@ -203,7 +203,7 @@ hoh -p --detach 在命令持久接受后输出run_id并退出，独立host继续
 - **AC-005-05**（TEST-005-05 · 检查 `integration`）Given 测试构建故障注入使StartRun事务COMMIT返回错误。；When 执行 hoh -p --detach --output json '目标'。；Then 退出码非0；stdout为空；stderr含诊断code；runs表无新行；不存在该命令启动的Agent进程。
   - 判定：退出码≠0；stdout字节数=0；stderr包含错误code；runs与attempts行数不变，FakeAgent进程数=0
 
-**待定（已按更严格可验证行为暂定）**
+**已确认的设计选择**（项目所有者 2026-11-03 确认，CR-002；“初值”指可经 CR 调整的基线值）
 
 - detach返回时限文档未定，取初值10 s（本地冷启动host、FakeAgent）。
 - detach的JSON对象沿用/v1/commands 202字段并增加run_id，为本选择；具体退出码数值由REQ-004统一，此处只断言0/非0。
@@ -244,7 +244,7 @@ M1 · P0 · 发布类 required · 目标 v1 · 成熟度 detailed，参考：`do
 - **AC-006-03**（TEST-006-03 · 检查 `adapter-live`）Given 目标 VM 实装的 codex 与 claude（及 bootstrap 安装的 pi，若有）已原生登录；记录各自 `--version` 原文；When 执行 `hoh doctor --output json`，再执行显式 `hoh doctor --live --output json`；Then 第一次 version 与原生 `--version` 一致、无 verified、所有子进程 argv 属于探测白名单；第二次完成最小原生调用的 agent 为 verified 并附 attempt 记录，未登录者为 missing 且退出码3
   - 判定：默认模式各项 version 与原生输出相等；默认模式 auth_check∈{not_verified,missing,unknown}；默认模式子进程 argv 均属 {--version、--help、子命令 --help、schema 生成、原生状态命令}；live 模式 verified 项各有 mode=live 的 attempt 记录与原生会话 id；live 模式任一 agent 未登录时其项=missing 且退出码=3
 
-**待定（已按更严格可验证行为暂定）**
+**已确认的设计选择**（项目所有者 2026-11-03 确认，CR-002；“初值”指可经 CR 调整的基线值）
 
 - verified 的唯一来源选为显式 `hoh doctor --live`（产生模型费用，是选项而非子命令），沿用 preflight --live 思路；文档未定义产品 doctor 的 live 方式。
 - 退出码0只表示无确定阻断项，unknown/not_verified 不致非0；是否应更严格（如 unknown 也返回3）待确认。
@@ -408,7 +408,7 @@ M2 · P0 · 发布类 required · 目标 v1 · 成熟度 detailed，参考：`co
 - **AC-018-05**（TEST-018-05 · 检查 `integration`）Given 项目配置新增 [team.security_reviewer] agent=codex，并引用一个职责 Prompt 覆盖文件；When 加载配置后派发一个 role=security_reviewer 的 FakeAgent 任务；Then GetSnapshot 的团队列表含 security_reviewer 且 role_epoch=1；该 attempt 记录 prompt 来源为该覆盖文件及其 sha256；其 session 与 reviewer 会话不同
   - 判定：团队列表含 security_reviewer，role_epoch=1；attempt 的 prompt 来源路径与 sha256 等于覆盖文件；session_id(security_reviewer)≠session_id(reviewer)
 
-**待定（已按更严格可验证行为暂定）**
+**已确认的设计选择**（项目所有者 2026-11-03 确认，CR-002；“初值”指可经 CR 调整的基线值）
 
 - example 只有 agent 与 reviewer.independent_session 两个键。选择在 [team.<role>] 下增加可选键 model（字符串，可空）、fallback（Agent 名有序数组）、prompt（覆盖文件路径），需与 example 同步更新。
 - 文档没有给出配置校验错误码。选择 HTTP 400 + code=INVALID_TEAM_CONFIG（初值），版本冲突沿用 409。
@@ -452,9 +452,9 @@ M2 · P0 · 发布类 required · 目标 v1 · 成熟度 detailed，参考：`do
 - **AC-019-05**（TEST-019-05 · 检查 `recovery`）Given FakeAgent 团队，在交接事务提交后、Pi 会话启动前注入 kill -9 host；When 重启 host 并完成 reconcile；此后旧 Codex 进程继续输出 3 条 epoch=1 消息；Then 从重启到 reconcile 完成 ≤30 秒；commander 仍为 pi 且 role_epoch=2；role=commander、agent=pi 的新 session 恰好 1 个；3 条旧消息全部被拒绝，没有重复派发
   - 判定：reconcile 完成时间 - 重启时间 ≤30s；commander role_epoch=2，agent=pi；新 commander session 数=1；旧 epoch 拒绝数=3，dispatch outbox 无重复 message_id
 
-**待定（已按更严格可验证行为暂定）**
+**已确认的设计选择**（项目所有者 2026-11-03 确认，CR-002；“初值”指可经 CR 调整的基线值）
 
-- SQL 只有 runs.role_epoch 一列。选择按 (run_id, role) 维护 epoch（需要迁移扩展），这样 Commander 交接不会连带隔离 Developer 的在途结果，避免原任务重做。
+- role_epoch 按 (run_id, role) 维护（SQL role_bindings 表，CR-001），Commander 交接不会连带隔离 Developer 的在途结果，避免原任务重做。
 - 新绑定 Agent 在生效时探测失败：选择保留旧绑定与旧 epoch，记录交接失败事件，而不是让该职位进入空缺。
 - 文档没有定义 Commander 的安全点。选择：当前 Commander turn 结束，或者没有在途 turn；不主动中断在途 turn。
 
@@ -495,7 +495,7 @@ M2 · P0 · 发布类 required · 目标 v1 · 成熟度 detailed，参考：`do
 - **AC-020-05**（TEST-020-05 · 检查 `unit`）Given FakeClock t=0；developer 首选 claude 返回 503 且 Retry-After=30；另一 run 中 claude 返回认证失败；developer.fallback=[codex]；When 分别派发 developer 任务；Then 503 场景：WAITING_EXTERNAL，next_retry_at=t+30s，不启用 codex；认证失败场景：next_retry_at 为空、不做指数重试，按 fallback 启用 codex
   - 判定：503：状态=WAITING_EXTERNAL，next_retry_at-t=30s，fallback 选中次数=0；auth：next_retry_at=null，选中 codex，原因含 BLOCKED_AUTH
 
-**待定（已按更严格可验证行为暂定）**
+**已确认的设计选择**（项目所有者 2026-11-03 确认，CR-002；“初值”指可经 CR 调整的基线值）
 
 - 文档没有列出各内置职位的 required_capabilities。初值：所有职位需要 structured_events，或可用 TaskResult 结构化桥替代；developer/qa 需要经 probe 实测的命令执行能力；commander/reviewer 需要 resume。
 - 默认配置不含任何隐式 fallback，未配置 fallback 即直接 BLOCKED。
@@ -541,7 +541,7 @@ Commander 只被重要事件或策略规定的轮次边界唤醒；同类事件�
 - **AC-021-05**（TEST-021-05 · 检查 `integration`）Given writer_slots=1、reader_slots=2 全部被 FakeAgent 长任务占用；reserve_supervisor_slot=true；FakeClock；When t=0 注入 1 条 critical issue；处理完后让 FakeCommander 不可用，再注入 need_decision 和 candidate_ready；Then critical issue 在 t=2.0s 唤醒 Commander，不排在读写槽之后；Commander 不可用后 run=BLOCKED 且原因含 need_decision，candidate_ready 仍产生 QA/Review dispatch；GetEvents 能读到每个触发器的去重键、event_seqs 和延迟毫秒数
   - 判定：唤醒时刻=2.0s；run.state=BLOCKED，原因含 need_decision；qa 与 reviewer 的 dispatch 各 1 条；events 中触发器记录含 dedup 键、event_seqs 与非负的延迟毫秒字段
 
-**待定（已按更严格可验证行为暂定）**
+**已确认的设计选择**（项目所有者 2026-11-03 确认，CR-002；“初值”指可经 CR 调整的基线值）
 
 - 2 秒/10 秒的语义：选择尾随去抖（同键静默 2 秒后触发），加上自首事件起最长 10 秒。
 - 紧急事件集合：选择只有 IntegrityViolation 类（例如验证中候选被改、DB integrity 失败）绕过去抖；critical issue 属于重要事件，仍走去抖。
@@ -588,7 +588,7 @@ HCP 消息与状态迁移在同一事务中持久化，并按消费者与 messag
 - **AC-022-05**（TEST-022-05 · 检查 `integration`）Given 当前 spec_sha256=S2、candidate=C2、qa role_epoch=2；When 分别投递 4 条 QA 消息：role_epoch=1；spec_sha256=S1；candidate_id=C1；以及一条 acceptance_ids=[] 的 handoff；Then 前 3 条得到 kind=rejected，原因分别为 stale_epoch/spec_mismatch/candidate_mismatch；第 4 条 schema 校验失败；task 与 acceptance_results 都不变；4 条拒绝都写入事件
   - 判定：4 条消息的处理结果都不是 applied；tasks.revision 前后相等；acceptance_results 行数前后相等；拒绝事件数=4
 
-**待定（已按更严格可验证行为暂定）**
+**已确认的设计选择**（项目所有者 2026-11-03 确认，CR-002；“初值”指可经 CR 调整的基线值）
 
 - 文档没有给出投递上限或期限。初值 max_delivery_attempts=5（测试中配置为 3），超过后进入 DEAD_LETTER，不删除。
 - 乱序时 expected_revision 不匹配：选择直接 rejected 并写收据；发送方重算后用新的 message_id 和 expected_revision 重发，旧 message_id 不复活。
@@ -642,7 +642,7 @@ Codex 适配器以 `codex app-server`（stdio JSON-RPC）完成握手、thread�
 - **AC-024-04**（TEST-024-04 · 检查 `adapter-live`）Given VM 实装 codex（记录 version、binary sha256、help 与 schema hash），已原生登录，临时 Git 仓库；When live smoke：第1轮要求只回复 `HOH_NATIVE_SMOKE_OK` 且不用工具；第2轮要求执行 `sleep 120` 后立即 cancel；Then 第1轮 turn.status=completed、attempt=SETTLED、agent 消息含该 token；第2轮 turn.status=interrupted、attempt=CANCELLED，进程组在 grace 上限内无残留；未登录时检查结果为 BLOCKED 而非 PASS
   - 判定：第1轮 turn.status=completed，attempt=SETTLED，消息含 `HOH_NATIVE_SMOKE_OK`；第2轮 turn.status=interrupted，attempt=CANCELLED；cancel 后≤16 s 内进程组无存活进程与僵尸；evidence.mode=live 并记录实际版本、threadId、turnId 与 resolved model；鉴权失败时检查 outcome=BLOCKED，不得为 PASS
 
-**待定（已按更严格可验证行为暂定）**
+**已确认的设计选择**（项目所有者 2026-11-03 确认，CR-002；“初值”指可经 CR 调整的基线值）
 
 - App Server 的 YOLO 通过 thread/start 的 approvalPolicy=never、sandbox=danger-full-access 表达，依据本机 codex 0.166 generate-json-schema；docs/13 只描述 exec flag。
 - native cancel grace 10 s 与 TERM grace 5 s 为初值，三个适配器共用。
@@ -684,7 +684,7 @@ Claude 适配器以 `claude -p --output-format stream-json --verbose` 非交互�
 - **AC-025-04**（TEST-025-04 · 检查 `adapter-live`）Given VM 实装 claude（记录 version、path、sha256、help hash），已原生登录，非 root 用户，临时 Git 仓库；When 第1轮只回复 `HOH_NATIVE_SMOKE_OK`；第2轮用 `--resume` 要求复述上轮 token；第3轮要求运行 `sleep 120` 后 cancel；Then 第1轮 result subtype=success、attempt=SETTLED；第2轮 session_id 与第1轮相同且回复含 token；第3轮 attempt=CANCELLED，进程组≤16 s 内全部 reap；未登录时检查结果为 BLOCKED 而非 PASS
   - 判定：第1轮 result.subtype=success、is_error=false，attempt=SETTLED；第2轮 init session_id=第1轮 session_id，result 文本含 token；第3轮 attempt=CANCELLED，cancel 后≤16 s 进程组进程数=0；evidence.mode=live 并记录版本、session_id、resolved model；鉴权失败时检查 outcome=BLOCKED，不得为 PASS
 
-**待定（已按更严格可验证行为暂定）**
+**已确认的设计选择**（项目所有者 2026-11-03 确认，CR-002；“初值”指可经 CR 调整的基线值）
 
 - 原生取消选 SIGINT；`--input-format stream-json` 下是否有协议级 interrupt 需以版本样例确认后再启用。
 - 成功判定同时要求 result success、is_error=false 与退出码0，属从严选择。
@@ -699,7 +699,7 @@ Pi 适配器以 `pi --mode rpc` 和持久会话目录运行，严格按 LF 字�
 **必须行为**
 
 - 必须以 argv `pi --mode rpc` 加持久 `--session-dir`（位于 `.hoh/` 下按 session 固定）与 session id 启动，禁止 `--no-session`；路径写入 sessions.native_path。
-- stdout 必须按 0x0A 字节分帧后再解码 UTF-8，不使用会把 U+2028/U+2029 当换行的读取器；单帧上限1 MiB（初值）。
+- stdout 必须按 0x0A 字节分帧并剥离 LF 前可选的 CR，再解码 UTF-8；不使用会把 U+2028/U+2029 当换行的读取器；单帧上限1 MiB（初值）。
 - 必须先启动 stdout/stderr 持续读取任务再写入任何命令，stdout 与 stderr 并行 drain，避免管道阻塞。
 - 每条 prompt 命令必须带唯一 correlation id 并据此关联 response；response 成功只表示接受，不是完成。
 - disposition=handled 必须立即结束该次交付（未启动模型 run，不等 settled）；started/queued 必须等 agent_settled 才判定静止；agent_end 后的重试/压缩不算完成。
@@ -727,11 +727,11 @@ Pi 适配器以 `pi --mode rpc` 和持久会话目录运行，严格按 LF 字�
 - **AC-026-04**（TEST-026-04 · 检查 `adapter-live`）Given VM 上按 bootstrap 安装的 Pi（记录 version、path、sha256、help hash 与 Node 版本），已原生配置 provider，临时 Git 仓库；未安装时本 AC 记 NOT_RUN；When RPC 发 prompt 只回复 `HOH_NATIVE_SMOKE_OK`；结束后终止进程并以同会话重启，要求复述上轮 token；再发长任务后 cancel；Then 第1轮终态由 agent_settled（或状态核验）判定且回复含 token；重启后会话 id 相同且回复含 token；cancel 后 attempt=CANCELLED、进程组全部 reap；缺认证时检查结果为 BLOCKED 而非 PASS
   - 判定：第1轮 response 被接受，终态依据为 agent_settled 或状态核验，回复含 token；第2轮会话 id 与第1轮相同，回复含 token；cancel 后≤16 s 进程组进程数=0，attempt=CANCELLED；argv 不含 `--no-session`；evidence.mode=live；鉴权失败时 outcome=BLOCKED；未安装时 outcome=NOT_RUN，均不得为 PASS
 
-**待定（已按更严格可验证行为暂定）**
+**已确认的设计选择**（项目所有者 2026-11-03 确认，CR-002；“初值”指可经 CR 调整的基线值）
 
-- 本机未安装 Pi：中止命令、状态查询、agent_settled、disposition 与扩展 UI 请求的帧名依据 docs/13 与 S07/S09 摘要，须在 M0 录制真实样例确认。
-- 是否剥离 LF 前的 CR 文档未定；选择只按 0x0A 分帧，CR 由 JSON 解析作为空白处理。
-- session id 参数名以安装版本 help 为准；UI 请求 cancel 回应测试阈值≤1 s 为初值。
+- 帧名已对照本机 Pi 1.5.0 自带文档（docs/rpc.md、rpc-commands.md、rpc-extension-ui.md）核实：命令以 `id` 关联 response；prompt 的 disposition 为 started/queued/handled；事件 agent_start/agent_end/agent_settled；中止命令 `abort`；状态查询 `get_state`（isStreaming、isCompacting、pendingMessageCount）；对话类 extension_ui_request（select/confirm/input/editor）须以同 id 的 extension_ui_response 回 `cancelled: true`，notify/setStatus/setWidget/setTitle/set_editor_text 不需回应；会话参数 `--session-dir`/`--session-id`。M0-T04 仍须录制真实样例。
+- 已修正（CR-002，依据 Pi 1.5.0 docs/rpc.md）：只按 0x0A 分帧，并剥离 LF 前可选的 CR 以接受 CRLF。
+- 会话参数为 `--session-id <id>`（Pi 1.5.0 help）；UI 请求 cancel 回应测试阈值≤1 s 为确认值。
 
 ## REQ-027 · 协议版本与能力
 
@@ -770,7 +770,7 @@ M1 · P0 · 发布类 required · 目标 v1, v0.1 · 成熟度 detailed，参考
 - **AC-027-04**（TEST-027-04 · 检查 `integration`）Given compat manifest 已登记 fake codex A 的 hash 且兼容套件 PASS；一个使用 A 的 RUNNING attempt 持有写租约；When 将 PATH 中 codex 替换为 hash 不同的 B 后请求新 attempt；请求运行兼容套件；待写租约释放后运行套件并重试；Then 新 attempt 被拒（COMPAT_UNVERIFIED）而原 attempt 继续至 SETTLED；写租约活跃时套件请求被拒；套件 PASS 后 manifest 新增 B 记录且新 attempt 成功启动；PASS 前 doctor 显示 protocol=unknown
   - 判定：替换后首个新 attempt 被拒，错误码=COMPAT_UNVERIFIED，无子进程启动；原 attempt 最终 state=SETTLED，其进程仍为 A；doctor codex 项 protocol=unknown；租约活跃时套件请求被拒绝；套件 PASS 后 manifest 含 B 的 binary_sha256，重试 attempt 成功启动
 
-**待定（已按更严格可验证行为暂定）**
+**已确认的设计选择**（项目所有者 2026-11-03 确认，CR-002；“初值”指可经 CR 调整的基线值）
 
 - COMPAT_UNVERIFIED、PROTOCOL_FRAME_TOO_LARGE 命名与读块64 KiB 为初值；帧上限1 MiB 为 docs/13 初值。
 - 兼容套件是否必须含 live smoke（产生费用）未定；选择离线探测+fixture 为必需，live smoke 由 adapter-live 检查单独记录。
@@ -890,10 +890,10 @@ Commander只提交带role_epoch与expected_revision的决策提议，Runtime确�
 - **AC-035-05**（TEST-035-05 · 检查 `integration`）Given FakeCommander设为不可用（启动即失败）；Run R RUNNING，C1已冻结；同时存在一个critical issue需决策。；When Runtime处理candidate_ready与该critical issue事件。；Then QA与Review仍被派发；Run进入BLOCKED且原因=COMMANDER_UNAVAILABLE；sender为Commander的APPLIED decision新增0行。
   - 判定：outbox含qa与reviewer的C1 dispatch各1行；runs.state=BLOCKED且阻塞原因=COMMANDER_UNAVAILABLE；新增APPLIED decision中Commander来源行数=0
 
-**待定（已按更严格可验证行为暂定）**
+**已确认的设计选择**（项目所有者 2026-11-03 确认，CR-002；“初值”指可经 CR 调整的基线值）
 
-- 本REQ引入的拒绝原因码（DEPENDENCY_NOT_ACCEPTED、STALE_*、BUDGET_NOT_RESERVABLE、ROLE_CAPABILITY_MISSING、ILLEGAL_TRANSITION、EVIDENCE_GATE_UNMET、COMMANDER_UNAVAILABLE）为初值，需进入protocol schema枚举。
-- decisions表无reason列；本选择迁移增加reason_code列，而非只写在event中。
+- 拒绝原因码（DEPENDENCY_NOT_ACCEPTED、STALE_*、BUDGET_NOT_RESERVABLE、ROLE_CAPABILITY_MISSING、ILLEGAL_TRANSITION、EVIDENCE_GATE_UNMET、COMMANDER_UNAVAILABLE）为确认值；M1-T01 实现领域类型时集中写入 protocol.schema.json 枚举（随该任务 CR 重锁）。
+- decisions 表已含 reason_code 列（CR-001 SQL），原因码不只写在 event 中。
 - 「已授权低风险动作」文档未枚举；本选择仅含常规QA/Review派发、已调度重试、pause/cancel与状态持久化。
 
 ## REQ-036 · 持久生命周期
@@ -931,11 +931,11 @@ Run/Iteration/Task/Attempt/Session以独立全局ID持久化，按单源迁移�
 - **AC-036-04**（TEST-036-04 · 检查 `integration`）Given host运行，1个SSE客户端与1个TUI投影已订阅；故障注入使下一次COMMIT返回SQLITE_FULL。；When 提交PauseRun命令；随后关闭注入，以新idempotency_key再提交一次。；Then 首次返回非202错误且retryable=true；5 s内订阅者收到该迁移事件0条，Run state/revision不变；第二次返回202，订阅者恰收到1条。
   - 判定：首次HTTP状态≠202且错误体retryable=true；首次后5 s内两个订阅者收到PAUSE_REQUESTED相关事件数=0；runs.state与revision与提交前相同；第二次HTTP 202，每个订阅者恰收到1条对应事件
 
-**待定（已按更严格可验证行为暂定）**
+**已确认的设计选择**（项目所有者 2026-11-03 确认，CR-002；“初值”指可经 CR 调整的基线值）
 
 - VERIFYING→RUNNING（候选失败后修复/下一增量）文档未显式列出，按工程循环选择为合法。
 - INCOMPLETE是否终态未定；本选择终态仅COMPLETED/CANCELLED/FAILED，INCOMPLETE/BLOCKED/WAITING_EXTERNAL/PAUSED可经ResumeRun回到resume_state。
-- attempts缺config_revision列，需迁移扩展；SESSION_NOT_INDEPENDENT错误码为初值。
+- attempts 已含 config_revision 列（CR-001 SQL）；SESSION_NOT_INDEPENDENT 为确认的错误码。
 - 故障注入点只在test feature编译，生产二进制不得包含注入路径。
 
 ## REQ-037 · 单写者与并行验证
@@ -973,11 +973,11 @@ M2 · P0 · 发布类 required · 目标 v1, v0.1 · 成熟度 detailed，参考
 - **AC-037-04**（TEST-037-04 · 检查 `integration`）Given C1的barrier未关闭（QA运行中）；FakeAgent QA发出「请Developer修改当前candidate后我继续」请求。；When Runtime处理该请求；barrier关闭后派发修复，FakeAgent Developer产出C2。；Then 请求被拒并新增1个candidate_id=C1的Issue；barrier关闭前该Issue的修复Task未派发；C2产生后其acceptance_results为0行，直到C2的QA与Review完成。
   - 判定：请求结果为rejected，issues新增1行且candidate_id=C1；wait-for图无QA→Developer边；修复Task的dispatch事件seq大于C1 barrier关闭事件seq；C2冻结时acceptance_results中C2行数=0
 
-**待定（已按更严格可验证行为暂定）**
+**已确认的设计选择**（项目所有者 2026-11-03 确认，CR-002；“初值”指可经 CR 调整的基线值）
 
 - barrier开放期间Developer是否可在写目录做不相关增量文档未定；本选择允许不相关写Task，但源自当前candidate Issue的修复须待barrier关闭后派发。
 - reader_slots=2取自config示例，作为初值。
-- leases主键为(project_id,kind)，多读槽需不同kind（如reader-1、reader-2）或迁移改主键；本选择使用编号kind。
+- 多读槽使用编号 kind（reader-1、reader-2…）；SQL leases.kind 约束已相应放宽（CR-002）。
 
 ## REQ-038 · 任务DAG调度
 
@@ -992,6 +992,7 @@ M2 · P0 · 发布类 required · 目标 v1, v0.1 · 成熟度 detailed，参考
 - 排序必须先分层：关键回归/数据完整性(0)→解阻(1)→普通(2)；层内按score=(4*user_value+3*unblock_value+3*risk_reduction+2*information_gain+age_bonus)/max(cost_estimate,1)降序。
 - 平局必须依次按created_seq升序、task_id字典序打破；结果与输入顺序及哈希迭代顺序无关。
 - 各输入分值必须在0..5；cost缺估计用中位桶；age_bonus截断在0..10。
+- eligible但未被选的调度轮数达到max_wait_rounds（初值20）的Task进入层0与层1之间的老化子层，子层内按首次eligible序号FIFO；层0为空时等待轮数有上界（防饥饿）。
 - 权重与参数必须写入Run配置快照；活跃Run中不得修改，变更只对新Run生效。
 - 1000个活跃Task及其依赖必须可确定性调度，不在每次选择时全表反序列化历史。
 
@@ -1015,11 +1016,13 @@ M2 · P0 · 发布类 required · 目标 v1, v0.1 · 成熟度 detailed，参考
   - 判定：前4轮选中L，第5轮选中H；第5轮H的age_bonus=4且score=6；全部轮次age_bonus最大值≤10
 - **AC-038-05**（TEST-038-05 · 检查 `integration`）Given Run R处于RUNNING，配置快照记录调度权重(4,3,3,2)。；When 提交修改R权重为(1,1,1,1)的配置变更。；Then 返回409；R配置快照仍为(4,3,3,2)；后续调度score仍按原权重计算。
   - 判定：HTTP状态=409；配置快照权重=(4,3,3,2)；该次调度的score与原权重手算值一致
+- **AC-038-06**（TEST-038-06 · 检查 `unit`）Given 层0为空；层2中H(user_value=0,cost=5,score=0)最早eligible；每轮补入一个新的L(user_value=3,cost=2,score=6)；max_wait_rounds=20，age_bonus上限10。；When 连续运行25个调度轮，每轮选1个Task。；Then 前20轮选中L；第21轮选中H（已进入老化子层）；全部轮次中任一eligible Task连续未被选的轮数≤20。
+  - 判定：第1–20轮选择均为L；第21轮选择为H；最大连续等待轮数≤20；H在第21轮的子层标记=aged
 
-**待定（已按更严格可验证行为暂定）**
+**已确认的设计选择**（项目所有者 2026-11-03 确认，CR-002；“初值”指可经 CR 调整的基线值）
 
 - age_bonus增长单位未定；本选择为每个调度轮eligible但未被选+1（不依赖墙钟），上限10。
-- 上限10时老化只能追平≤10/max(cost,1)的分差，如user_value=0、cost=5的Task面对持续新到的score=6任务仍会饥饿；若要求严格无饥饿需CR。
+- 已修正（CR-002）：age_bonus 上限 10 只能追平有限分差，无法防饥饿。新增 max_wait_rounds（初值 20）：eligible 但未被选的轮数达到上限的 Task 进入位于层0与层1之间的老化子层，子层内按首次 eligible 的序号 FIFO；层0为空时任何 eligible Task 的等待轮数有上界。
 - cost_estimate桶未定；初值为整数1..5，缺估计取中位桶3。
 - 分层赋值规则未定；本选择：critical/high回归或数据完整性Issue→0，被阻塞Task依赖→1，其余→2。
 - 超出0..5的分值选择拒绝而非截断；SCORE_OUT_OF_RANGE、DAG_CYCLE、DAG_MISSING_DEPENDENCY为初值错误码。
@@ -1059,7 +1062,7 @@ M2 · P0 · 发布类 required · 目标 v1 · 成熟度 detailed，参考：`do
 - **AC-039-04**（TEST-039-04 · 检查 `integration`）Given attempt A 已完成，记录了 prompt sha256、资源包版本、输入引用列表和截断策略；When 用 A 记录的输入引用和同一资源包版本重新装箱；Then 新 Prompt 的 sha256 等于 A 记录的值；上述四个字段都非空
   - 判定：sha256(重装) == attempts(A).prompt_sha256；4 个字段都不为空
 
-**待定（已按更严格可验证行为暂定）**
+**已确认的设计选择**（项目所有者 2026-11-03 确认，CR-002；“初值”指可经 CR 调整的基线值）
 
 - 文档只写了“默认分配”，没说某类用不完的份额是否可以挪给其他类。选择以份额为硬上限，不挪用，便于复现和判定。
 - 估算 tokenizer 的误差容限未定。选择所有预算判定都以估算值为准，并标 estimated。
@@ -1113,10 +1116,10 @@ host在kill -9、断网或VM重启后按固定顺序reconcile：取锁与完整�
 - **AC-041-05**（TEST-041-05 · 检查 `recovery`）Given FakeRemote（本地fake forge）支持按run marker查询PR；effect E(创建PR)为STARTED且远端已有带该marker的PR；effect E2为STARTED而FakeRemote查询返回不可用。；When 重启host执行reconcile。；Then E置OBSERVED或COMMITTED且external_ref=已有PR；E2置UNKNOWN、所属Attempt=UNKNOWN_EFFECT并产生诊断事件；FakeRemote创建调用数=0。
   - 判定：E.state∈{OBSERVED,COMMITTED}且external_ref=预置PR标识；E2.state=UNKNOWN，其Attempt.state=UNKNOWN_EFFECT；存在含E2 effect_key的诊断事件；FakeRemote创建调用次数=0
 
-**待定（已按更严格可验证行为暂定）**
+**已确认的设计选择**（项目所有者 2026-11-03 确认，CR-002；“初值”指可经 CR 调整的基线值）
 
 - 租约TTL与续约周期未定：初值TTL=120 s、每30 s续约。
-- attempts缺pid、pgid、boot_id、starttime列，需迁移扩展；STALE_LEASE_EPOCH为初值错误码。
+- attempts 已含 pid、boot_id、process_start_id 列（CR-001 SQL）；进程组 id 等于 pid（独立 session 启动）；STALE_LEASE_EPOCH 为确认错误码。
 - host崩溃的≤30 s检测依赖systemd RestartSec或下一次客户端启动；以RestartSec=5 s（初值）测量。
 
 ## REQ-042 · 预算与等待
@@ -1133,7 +1136,7 @@ M2 · P0 · 发布类 required · 目标 v1, v0.1 · 成熟度 detailed，参考
 - 鉴权缺失必须直接BLOCKED（BLOCKED_AUTH），CLI能力不兼容直接BLOCKED（BLOCKED_CAPABILITY）；不进入指数退避。
 - 同一问题本地修复≤3次、协议格式纠正≤2次（max_local_repairs/max_protocol_repairs）；超限即升级决策，不再派发同类修复。
 - 预算（max_iterations=100、max_duration_hours=120、可选token/费用上限）必须派发前预留并持久累计；耗尽或deadline_at到达即停止新派发，Run=INCOMPLETE并列出剩余项。
-- 价格未知时cost必须为null并标unknown；费用上限检查结果为unknown而非通过；不以估算冒充账单。
+- 价格未知时cost必须为null并标unknown；不以估算冒充账单。配置了费用上限而所用模型价格未知时，该上限无法执行，派发前即BLOCKED（BUDGET_UNENFORCEABLE）。
 - wall deadline与inactivity watchdog必须分别计时；无输出但工具进程仍运行不判为死机。
 
 **失败与边界**
@@ -1156,13 +1159,15 @@ M2 · P0 · 发布类 required · 目标 v1, v0.1 · 成熟度 detailed，参考
   - 判定：Ra迭代数=2，之后outbox无新dispatch；Ra最终JSON含state=INCOMPLETE、非空剩余REQ列表、cost_usd=null、cost_status=unknown；Rb.state=INCOMPLETE；Ra与Rb的state≠COMPLETED
 - **AC-042-05**（TEST-042-05 · 检查 `unit`）Given 同一issue fingerprint F的本地修复已失败3次；某Attempt的协议格式纠正已发生2次；之后host重启一次。；When Runtime评估第4次本地修复与第3次协议纠正。；Then 两者均不派发；各产生1条need_decision升级事件；重启后计数仍为3与2；相关Task≠ACCEPTED。
   - 判定：重载后计数=3与2；两次请求dispatch数=0；need_decision事件数=2；相关Task.state≠ACCEPTED
+- **AC-042-06**（TEST-042-06 · 检查 `integration`）Given Run Rc配置费用上限max_usd=5，所用模型不在价格表中；Run Rd未配置费用上限，其余相同。；When 两个Run各尝试派发第一个Attempt。；Then Rc在派发前进入BLOCKED、原因BUDGET_UNENFORCEABLE、attempts=0；Rd正常派发，cost_usd=null且cost_status=unknown。
+  - 判定：Rc：state=BLOCKED、blocked_reason=BUDGET_UNENFORCEABLE、attempts行数=0；Rd：attempts行数≥1、cost_usd=null、cost_status=unknown；两者state≠COMPLETED
 
-**待定（已按更严格可验证行为暂定）**
+**已确认的设计选择**（项目所有者 2026-11-03 确认，CR-002；“初值”指可经 CR 调整的基线值）
 
 - 退避base=2 s、cap=300 s、瞬时重试上限8次均为初值。
-- 价格未知时费用上限的处理选择为：不判通过、显示unknown、继续受其他预算约束；是否应改为BLOCKED待定。
-- docs/14用BLOCKED_AUTH/BLOCKED_CAPABILITY，docs/12用CAPABILITY_UNSUPPORTED；本选择前者为Run阻塞原因，后者为错误码；runs需增加blocked_reason列。
-- tasks/attempts缺attempt_count、next_retry_at列（仅outbox有），且无预算账本表，需迁移扩展。
+- 已修正（CR-002）：价格未知时 cost 为 null 并显示 unknown；若用户配置了费用上限而所用模型价格未知，该上限无法执行，派发前即 BLOCKED（BUDGET_UNENFORCEABLE），不在无法核算时继续花费；未配置费用上限时照常受其他预算约束。
+- 命名已统一（CR-001）：BLOCKED_AUTH/BLOCKED_CAPABILITY 为阻塞原因，CAPABILITY_UNSUPPORTED 为错误码；runs 已含 blocked_reason 列。
+- tasks 已含 attempt_count、next_retry_at；预算账本为 budgets 表（CR-001 SQL）。
 
 ## REQ-043 · 暂停取消分离
 
@@ -1202,7 +1207,7 @@ pause持久后立即阻止新派发并在安全点进入PAUSED；cancel经优先
 - **AC-043-05**（TEST-043-05 · 检查 `unit`）Given 测试ProcessControl fake在SIGKILL后仍报告进程存活30 s。；When 提交CancelRun并推进FakeClock 30 s，然后fake报告退出。；Then 前30 s Run保持CANCEL_REQUESTED且投影显示CANCELLING，无CANCELLED事件；fake报告退出后才写CANCELLED。
   - 判定：0–30 s所有采样runs.state=CANCEL_REQUESTED且投影标签=CANCELLING；退出报告前CANCELLED事件数=0；退出报告后恰1条CANCELLED事件
 
-**待定（已按更严格可验证行为暂定）**
+**已确认的设计选择**（项目所有者 2026-11-03 确认，CR-002；“初值”指可经 CR 调整的基线值）
 
 - native interrupt grace 10 s、SIGTERM grace 5 s及17 s总上限为初值；docs只要求短grace与有界SIGKILL。
 - 安全点未精确定义；本选择为当前Attempt到达SETTLED/FAILED/CANCELLED，Pause不设超时也不中断。
@@ -1333,7 +1338,7 @@ candidate 从干净的已提交工作树冻结，绑定 commit/tree/spec/environ
 - **AC-052-04**（TEST-052-04 · 检查 `unit`）Given 当前 candidate C、spec S，以及一条完整有效的 PASS 证据 e0；When 分别篡改 e0 的 11 个方面：candidate_id、git_tree、spec_sha256、environment_sha256、test_plan_sha256、observations=[]、producer attempt 不存在、finished_at<started_at、source_unchanged=false、stdout sha256 不符、missing_artifacts 非空；Then e0 判为 valid；11 个变体全部判为 not valid：observations=[] 的原因为 INSUFFICIENT，其余为 INVALID
   - 判定：valid(e0)=true；11/11 变体 valid=false；原因码与期望表逐项一致
 
-**待定（已按更严格可验证行为暂定）**
+**已确认的设计选择**（项目所有者 2026-11-03 确认，CR-002；“初值”指可经 CR 调整的基线值）
 
 - 产品中对相同内容重复冻结：选择返回已有 candidate_id，不新增行。自举工具 tools/candidate.py 则拒绝覆盖已存在的清单文件。
 - 符号链接和子模块：选择拒绝冻结，直到实现显式身份规则并有测试。
@@ -1377,7 +1382,7 @@ QA 在独立会话中，以 spec/AC 和冻结候选为起点逐条验收；开�
 - **AC-053-05**（TEST-053-05 · 检查 `adapter-live`）Given 真实 Developer 会话与真实 QA 会话（不同原生会话；默认绑定 Claude/Pi，v0.1 可为两个 Claude 会话）；植入缺陷的小仓库，其中 AC-B 的确定性测试必然失败；When 以 hoh 真实运行一次 candidate→QA 循环；Then QA 的 native session id 与 Developer 不同，二者都记录在 sessions 表；QA 报告绑定 C，其 native_attempt 记录中包含报告的 session_id；不论 QA 是否执行该测试，AC-B 的投影都不是 PASS，candidate 不是 ACCEPTED
   - 判定：session_id(qa)≠session_id(developer)，native_id 不同；QA 报告 candidate_id=C，且 native_attempt.session_ids 包含报告 session_id；AC-B 投影∈{FAIL,UNKNOWN,NOT_RUN,INVALID}；candidate 状态≠ACCEPTED
 
-**待定（已按更严格可验证行为暂定）**
+**已确认的设计选择**（项目所有者 2026-11-03 确认，CR-002；“初值”指可经 CR 调整的基线值）
 
 - UNKNOWN 之后对同一 candidate 重测通过：选择投影为 FLAKY（不满足 strict），要变为 PASS 需走 REQ-055 的 flaky 处置或产生新 candidate。
 - QA 能否在初始上下文看到自测报告：选择允许，但只作为排在 AC 之后的 diagnostic 引用。
@@ -1420,7 +1425,7 @@ Reviewer 在独立会话中审查与 QA 相同的冻结候选，报告绑定 can
 - **AC-054-05**（TEST-054-05 · 检查 `unit`）Given 候选汇合函数的输入维度：QA∈{PASS,FAIL,UNKNOWN,NOT_RUN}、Review∈{PASS,FAIL,UNKNOWN,NOT_RUN}、确定性检查∈{全部有效 PASS,有一项 FAIL,空列表}、AC 覆盖∈{全覆盖,缺 1 项}；When 穷举全部 4×4×3×2=96 种组合并调用汇合函数；Then 只有 (PASS,PASS,全部有效 PASS,全覆盖) 这 1 种组合返回 ACCEPTED，其余 95 种都不返回 ACCEPTED；检查列表为空时不视为通过
   - 判定：ACCEPTED 计数=1；含 UNKNOWN 的组合全部非 ACCEPTED；Review=PASS 且检查 FAIL 的组合全部非 ACCEPTED；检查为空列表的组合全部非 ACCEPTED
 
-**待定（已按更严格可验证行为暂定）**
+**已确认的设计选择**（项目所有者 2026-11-03 确认，CR-002；“初值”指可经 CR 调整的基线值）
 
 - Reviewer 是否必须与 QA 也不同会话：tools/release_gate.py 要求 developer/QA/reviewer 三者不同，选择让三者与 Commander 全部互不相同。
 - independent-report 的 finding 没有定位字段：选择用 summary 和 evidence 引用承载代码/行为定位；fingerprint 由 Runtime 计算，与 candidate 无关（初值：sha256(severity+规范化 summary+定位)），以便跨候选追踪。
@@ -1517,6 +1522,7 @@ M2 · P0 · 发布类 required · 目标 v1, v0.1 · 成熟度 detailed，参考
 - writer队列必须有界；满时对调用方背压，最长等待busy_timeout后返回可重试错误；关键事件不得静默丢弃。
 - 消费方必须在同一事务写receipts(consumer,message_id)与状态迁移；重复投递返回首次result_json，不重复改状态。
 - DB所在文件系统为nfs/nfs4/cifs/smb3/fuse.sshfs/9p等网络或共享文件系统时必须拒绝打开，返回DB_ON_NETWORK_FS且不创建DB文件。
+- 名单外的文件系统（含virtiofs）在host启动时必须做WAL自检（临时库启用WAL、写入、checkpoint、-shm映射与加锁）；失败即返回DB_WAL_UNSUPPORTED拒绝启动，不创建正式DB文件。
 - SQLITE_BUSY超过busy_timeout时写命令返回503、retryable=true并保持上次已提交状态；读请求与UI不被该写等待阻塞。
 - UI、Agent适配器与Web处理器不得直接执行INSERT/UPDATE/DELETE，只能经Persistence模块类型接口。
 
@@ -1541,12 +1547,14 @@ M2 · P0 · 发布类 required · 目标 v1, v0.1 · 成熟度 detailed，参考
   - 判定：p1、p2、p3结果=DB_ON_NETWORK_FS，p4、p5结果=通过；host退出码≠0且stderr含DB_ON_NETWORK_FS；/p1/.hoh下匹配*.db、*-wal、*-shm的文件数=0
 - **AC-062-05**（TEST-062-05 · 检查 `static`）Given HoH源码仓库（hoh-core/hoh-agents/hoh-app/web）。；When 运行静态检查，扫描SQL写语句与rusqlite写API调用位置。；Then INSERT/UPDATE/DELETE/REPLACE及写调用只出现在Persistence模块白名单路径；白名单外命中数=0；web目录无SQLite依赖。
   - 判定：白名单外SQL写语句及写API命中数=0；web依赖中无sqlite相关包；扫描文件数>0（防空扫描）
+- **AC-062-06**（TEST-062-06 · 检查 `integration`）Given 三个目录：ext4上的/p4；注入WAL自检故障（-shm映射失败）的/p6；注入checkpoint失败的/p7。；When 分别在各目录启动host。；Then /p4自检通过并正常接受写命令；/p6、/p7 host退出码≠0、stderr含DB_WAL_UNSUPPORTED，且.hoh下无正式*.db/-wal/-shm文件。
+  - 判定：/p4：命令返回202且可查到；/p6、/p7：退出码≠0且stderr含DB_WAL_UNSUPPORTED；/p6、/p7的.hoh下正式DB文件数=0
 
-**待定（已按更严格可验证行为暂定）**
+**已确认的设计选择**（项目所有者 2026-11-03 确认，CR-002；“初值”指可经 CR 调整的基线值）
 
 - busy_timeout取初值5000 ms：单writer下仅与备份/checkpoint/外部诊断连接争用。
 - synchronous选FULL（初值）以覆盖VM硬重启后已ACK事务不丢；若性能目标不达需CR改NORMAL并记录风险。
-- 网络/共享文件系统名单为初值；virtiofs是否拒绝未定，本选择暂不拒绝。
+- 已修正（CR-002）：已知网络/共享文件系统直接拒绝；其余文件系统（含 virtiofs）在 host 启动时做 WAL 自检（临时库启用 WAL、写入、checkpoint、-shm 映射与加锁），失败即以 DB_WAL_UNSUPPORTED 拒绝启动——以实测代替名单猜测。
 - DB_ON_NETWORK_FS、DB_BUSY错误码名为初值；GET≤500 ms借用事件可见p95目标作为阈值。
 
 ## REQ-063 · 备份与迁移

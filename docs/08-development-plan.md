@@ -37,7 +37,7 @@ M0 → M1-T01/T02/T03/T06/T08 → M2-T01…T06、T10 → V01-T01（独立QA+Revi
 M1/M2 的 27 项需求已是 detailed。M3–M7 的需求是 outline，各里程碑第一个任务（Mx-T01，kind=spec）负责：
 
 1. 每项写 2–5 条可判定 AC（Given/When/Then 具体到命令、状态、阈值，至少一条失败路径），以及 behavior、failure_modes、测试场景（check_id、步骤、判定、需保存的观测）。
-2. 不删范围、不降门槛；文档没写到的地方按更严格、可验证的行为选择，并记入 open_questions。
+2. 不删范围、不降门槛；文档没写到的地方按更严格、可验证的行为选择，并记入该需求的 decisions，在 CR 中请项目所有者确认。
 3. 运行 `tools/gen_spec_views.py`；写 CR 记录（状态 APPROVED 需要用户批准或预先授权的规则）；执行 `tools/baseline.py relock --cr`；`scripts/check.sh --bundle` 必须通过。
 
 ## 每个任务的执行契约
