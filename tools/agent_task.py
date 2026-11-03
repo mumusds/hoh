@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse, fcntl, json, os, re, shutil, subprocess, sys, uuid
 from pathlib import Path
 from common import ROOT, Terminated, atomic_json, execute, flag_supported, install_termination_handlers, load_json, restore_handlers, running_as_root, sha256, utcnow
+from install_pi_plugins import verify_installed
 
 # Set in every native child. A nested bridge call with --top-level is refused,
 # so a delegated or already-running top-level session cannot start another commander.
@@ -189,6 +190,13 @@ def main(argv=None)->int:
         print('Native agents run with bypass/YOLO flags; use the VM non-root development user, not root.',file=sys.stderr);return 78
     try:help_output=help_text(a.agent,a.cwd);cmd=command_for(a.agent,out/'sessions',model,help_output)
     except (RuntimeError,ValueError,subprocess.TimeoutExpired) as exc:print(str(exc),file=sys.stderr);return 78
+    env=child_env(attempt_id);pi_packages=None
+    if a.agent=='pi':
+        # Pi installs missing configured packages at startup unless offline; load only verified installations (M0R3-05).
+        pi_packages=verify_installed(a.cwd.resolve())
+        if pi_packages['problems']:
+            print('Refusing to start Pi with unverified project packages (run tools/install_pi_plugins.py): '+'; '.join(pi_packages['problems']),file=sys.stderr);return 78
+        env['PI_OFFLINE']='1'
     if a.agent=='codex':
         git=subprocess.run(['git','rev-parse','--show-toplevel'],cwd=a.cwd,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         if git.returncode:
@@ -200,11 +208,12 @@ def main(argv=None)->int:
     (out/'native-help.txt').write_text(help_output,encoding='utf-8')
     version=cli_version(a.agent,a.cwd)
     record={'schema_version':'1.1','record_type':'bootstrap_native_attempt','attempt_id':attempt_id,'candidate_id':os.getenv('HOH_CANDIDATE_ID'),'check_id':os.getenv('HOH_CHECK_ID'),'parent_attempt':os.getenv(PARENT_ENV),'agent':a.agent,'cli_version':version,'role':a.role,'argv':cmd,'cwd':str(a.cwd.resolve()),'started_at':utcnow(),'prompt_sha256':sha256(out/'prompt.md'),'model_requested':model,'top_level_bootstrap':a.top_level,'env_removed':sorted(PARENT_SESSION_VARS&os.environ.keys()),'status':'RUNNING','product_accepted':False}
+    if pi_packages is not None:record.update(env_set={'PI_OFFLINE':'1'},pi_packages=pi_packages)
     atomic_json(out/'attempt.json',record)
     print(f'Native {a.agent} invocation; logs: {out}',file=sys.stderr,flush=True)
     previous=install_termination_handlers()
     try:
-        rc,timed,dur=execute(cmd,a.cwd.resolve(),out/'stdout.jsonl',out/'stderr.log',a.timeout,data,env=child_env(attempt_id))
+        rc,timed,dur=execute(cmd,a.cwd.resolve(),out/'stdout.jsonl',out/'stderr.log',a.timeout,data,env=env)
         observed=inspect_output(a.agent,out/'stdout.jsonl');final_text=observed.pop('_final_text')
         ok=rc==0 and observed['terminal_observed'] and not observed['native_error_observed'] and observed['malformed_records']==0
         record.update(observed,exit_code=rc,timed_out=timed,duration_seconds=dur,finished_at=utcnow(),status='NATIVE_TURN_COMPLETED' if ok else 'NATIVE_FAILED',stdout_sha256=sha256(out/'stdout.jsonl'),stderr_sha256=sha256(out/'stderr.log'))

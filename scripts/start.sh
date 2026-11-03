@@ -24,7 +24,13 @@ case "$AGENT" in
  claude) CMD=(claude --dangerously-skip-permissions);;
  pi) CMD=(pi);;
 esac
-if [[ "$DRY" == 1 ]]; then printf 'DRY RUN: '; printf '%q ' "${CMD[@]}" '[HOH_TOP_LEVEL_BOOTSTRAP] <LAUNCH_PROMPT.md content>'; printf '\n'; exit 0; fi
+ENVS=()
+if [[ "$AGENT" == pi ]]; then
+ # Pi installs missing configured packages at startup unless offline; load only verified installations (M0R3-05).
+ python3 tools/install_pi_plugins.py --verify >/dev/null || { echo 'Refusing to start Pi with unverified project packages; run tools/install_pi_plugins.py' >&2; exit 78; }
+ ENVS=(PI_OFFLINE=1)
+fi
+if [[ "$DRY" == 1 ]]; then printf 'DRY RUN: '; printf '%q ' "${ENVS[@]}" "${CMD[@]}" '[HOH_TOP_LEVEL_BOOTSTRAP] <LAUNCH_PROMPT.md content>'; printf '\n'; exit 0; fi
 command -v "$AGENT" >/dev/null || { echo "Run bootstrap first: missing $AGENT" >&2; exit 127; }
 if [[ "$(id -u)" == 0 ]]; then echo 'Use a non-root VM development user; native agents run with bypass flags.' >&2; exit 78; fi
 has_flag() { grep -Eq -- "(^|[^[:alnum:]_-])$1([^[:alnum:]_-]|\$)" <<<"$HELP"; }
@@ -34,4 +40,4 @@ if [[ "$AGENT" == pi ]]; then
 else
  FLAG="${CMD[1]}"; has_flag "$FLAG" || { echo "Installed $AGENT does not support $FLAG" >&2; exit 78; }
 fi
-HOH_BOOTSTRAP_PARENT="interactive-$(date -u +%Y%m%dT%H%M%SZ)-$$" exec "${CMD[@]}" "$(printf '[HOH_TOP_LEVEL_BOOTSTRAP]\n%s' "$(cat LAUNCH_PROMPT.md)")"
+HOH_BOOTSTRAP_PARENT="interactive-$(date -u +%Y%m%dT%H%M%SZ)-$$" exec env "${ENVS[@]}" "${CMD[@]}" "$(printf '[HOH_TOP_LEVEL_BOOTSTRAP]\n%s' "$(cat LAUNCH_PROMPT.md)")"
