@@ -20,6 +20,8 @@ builtin→global→project→run，每层保留来源和diff。用户编辑复�
 
 ## 三插件策略
 
+发布类（CR-001）：三个插件的真实集成（REQ-048/049/050）为 degradable。上游不可用、不兼容或无法安装时，HoH 继续工作，并以带诊断证据与上游引用的 DEGRADED 交付，发布状态为 `COMPLETED_DEGRADED`。自动解析/安装/诊断与显式降级本身（REQ-051）仍是 required。不能静默省略，也不能伪称兼容。
+
 pi-smart-compact选alpertarhan Pi Continuity [S14]：上下文清理/verified compaction；可选长期记忆后端避免与Hermes重复。配置键以安装版本实际schema为准，不能照抄不确定key。
 
 pi-hermes-memory [S15]：项目/跨会话经验；policy-only召回可能漏，硬规格永远在HoH事实层。经验有source、project、confidence、validity条件，召回命中不得直接把Issue关闭。
@@ -30,7 +32,7 @@ pi-hermes-memory [S15]：项目/跨会话经验；policy-only召回可能漏，�
 
 版本/来源/依赖锁定，单插件→两插件→三插件逐级；压缩前Hermes flush与Compact hook顺序、重入保护、模型调用次数、会话恢复、并发DB维护都需测。RPC不能调用完整Pi custom TUI [S09]。HoH自己的TUI提供设置表单，实际改动通过经过核实的插件配置adapter。
 
-安装失败可让不依赖插件的任务继续，但状态必须degraded且最终完整门禁阻塞；不强制用户手工安装，不偷偷把插件删出v1。升级在维护窗口，原组合锁定到run。
+安装失败可让不依赖插件的任务继续，但状态必须为 DEGRADED，且出现在发布报告中（`COMPLETED_DEGRADED`，不是 `COMPLETED`）；不强制用户手工安装，不偷偷把插件删出v1。升级在维护窗口，原组合锁定到run。
 
 ## Skill注册最小字段
 

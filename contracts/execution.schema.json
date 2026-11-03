@@ -3,7 +3,7 @@
   "additionalProperties": false,
   "properties": {
     "schema_version": {
-      "const": "1.0"
+      "const": "1.1"
     },
     "record_type": {
       "const": "command_execution"
@@ -20,8 +20,7 @@
     },
     "candidate_id": {
       "type": "string",
-      "minLength": 1,
-      "maxLength": 160
+      "pattern": "^CAND-[a-f0-9]{64}$"
     },
     "spec_sha256": {
       "type": "string",
@@ -43,7 +42,10 @@
       }
     },
     "cwd": {
-      "type": "string"
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)",
+      "description": "Working directory relative to the candidate checkout root; must equal the check plan entry."
     },
     "started_at": {
       "type": "string",
@@ -73,7 +75,8 @@
       "properties": {
         "path": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "pattern": "^(?!/)"
         },
         "sha256": {
           "type": "string",
@@ -91,7 +94,8 @@
       "properties": {
         "path": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "pattern": "^(?!/)"
         },
         "sha256": {
           "type": "string",
@@ -109,7 +113,8 @@
       "properties": {
         "path": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "pattern": "^(?!/)"
         },
         "sha256": {
           "type": "string",
@@ -127,6 +132,67 @@
     "test_plan_sha256": {
       "type": "string",
       "pattern": "^[a-f0-9]{64}$"
+    },
+    "artifacts": {
+      "type": "array",
+      "description": "Declared check-plan artifacts found after the command exited.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "path",
+          "sha256"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^(?!/)"
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          }
+        }
+      }
+    },
+    "missing_artifacts": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "producer_attempt_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160,
+      "description": "Runtime attempt that produced this execution; the bootstrap tool uses its own record_id."
+    },
+    "runner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tool",
+        "euid"
+      ],
+      "properties": {
+        "tool": {
+          "type": "string",
+          "minLength": 1
+        },
+        "euid": {
+          "type": "integer"
+        },
+        "boot_id": {
+          "type": "string"
+        }
+      }
     }
   },
   "required": [
@@ -149,8 +215,12 @@
     "candidate_manifest",
     "source_unchanged",
     "environment_sha256",
-    "test_plan_sha256"
+    "test_plan_sha256",
+    "artifacts",
+    "missing_artifacts",
+    "producer_attempt_id",
+    "runner"
   ],
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:hoh:execution:1.0"
+  "$id": "urn:hoh:execution:1.1"
 }

@@ -10,6 +10,8 @@ Git：新任务feature branch；小范围commit绑定REQ/工作包；无关格�
 
 文档与用户输出中文优先，代码/API/枚举用稳定英文；错误有machine code、可读信息、上下文与恢复动作。状态、结果和时间线不能由LLM随意文本推断。
 
-提交前：bundle validator；cargo fmt --check；cargo clippy --workspace --all-targets -- -D warnings；cargo test --workspace --locked；Web类型/单测/build；相关PTY/E2E；有需要时真实Agent/插件测试。未运行准确标注。
+受锁契约（CONTRACT、需求、场景、policy、schema、docs/10、门禁工具）只能随APPROVED的CR修改并执行 `tools/baseline.py relock`；`docs/02`与`docs/18`由 `tools/gen_spec_views.py` 生成，勿手改。
+
+提交前：`scripts/check.sh --bundle`；cargo fmt --check；cargo clippy --workspace --all-targets -- -D warnings；cargo test --workspace --locked；Web类型/单测/build；相关PTY/E2E；有需要时真实Agent/插件测试。未运行准确标注。
 
 Review检查：范围/REQ覆盖、状态机、并发、外部效果、取消、资源释放、证据、未知状态、UX错误流程、兼容性、性能、可维护性。不以代码行数或“写了很多文档”验收。

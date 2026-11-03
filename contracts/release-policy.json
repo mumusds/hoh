@@ -1,26 +1,93 @@
 {
-  "schema_version": "1.0",
-  "baseline_id": "HOH-BASELINE-1.0",
-  "required_checks": [
-    "build",
-    "static",
-    "unit",
-    "integration",
-    "adapter-live",
-    "tui-pty",
-    "web-e2e",
-    "plugin-live",
-    "recovery",
-    "deployment",
-    "soak",
-    "independent-qa",
-    "independent-review",
-    "traceability"
-  ],
-  "required_modes": {
-    "adapter-live": "live",
-    "plugin-live": "live",
-    "soak": "live"
+  "schema_version": "1.1",
+  "baseline_id": "HOH-BASELINE-1.1",
+  "checks": {
+    "build": {
+      "mode": "product"
+    },
+    "static": {
+      "mode": "product"
+    },
+    "unit": {
+      "mode": "product"
+    },
+    "integration": {
+      "mode": "product"
+    },
+    "adapter-live": {
+      "mode": "live"
+    },
+    "tui-pty": {
+      "mode": "product"
+    },
+    "web-e2e": {
+      "mode": "product"
+    },
+    "plugin-live": {
+      "mode": "live",
+      "degradable": true
+    },
+    "recovery": {
+      "mode": "product"
+    },
+    "deployment": {
+      "mode": "product"
+    },
+    "soak": {
+      "mode": "live"
+    },
+    "independent-qa": {
+      "mode": "live"
+    },
+    "independent-review": {
+      "mode": "live"
+    },
+    "traceability": {
+      "mode": "product"
+    }
+  },
+  "profiles": {
+    "v1": {
+      "description": "Complete v1 release: every requirement whose release_targets contains v1.",
+      "release_status_on_pass": "COMPLETED",
+      "release_status_on_degraded_pass": "COMPLETED_DEGRADED",
+      "required_checks": [
+        "build",
+        "static",
+        "unit",
+        "integration",
+        "adapter-live",
+        "tui-pty",
+        "web-e2e",
+        "plugin-live",
+        "recovery",
+        "deployment",
+        "soak",
+        "independent-qa",
+        "independent-review",
+        "traceability"
+      ],
+      "requires_soak": true
+    },
+    "v0.1": {
+      "description": "Interim usable release: requirements whose release_targets contains v0.1 (CLI/TUI shell, Claude adapter, durable runtime, frozen candidate with independent QA/review). Never reported as COMPLETED.",
+      "release_status_on_pass": "INTERIM_RELEASED",
+      "release_status_on_degraded_pass": "INTERIM_RELEASED",
+      "required_checks": [
+        "build",
+        "static",
+        "unit",
+        "integration",
+        "adapter-live",
+        "tui-pty",
+        "recovery",
+        "deployment",
+        "independent-qa",
+        "independent-review",
+        "traceability"
+      ],
+      "requires_soak": false
+    }
   },
   "minimum_soak_seconds": 259200,
   "minimum_live_iterations": 20,
@@ -28,12 +95,13 @@
     "critical",
     "high"
   ],
-  "required_sources": [
-    "implementation",
-    "test_execution",
-    "qa",
-    "reviewer"
+  "artifacts": {
+    "live_sessions": "live-sessions.json",
+    "soak_timeline": "timeline.jsonl"
+  },
+  "accepted_attempt_statuses": [
+    "NATIVE_TURN_COMPLETED",
+    "COMPLETED"
   ],
-  "result_policy": "FAIL_CLOSED",
-  "allow_skipped_required": false
+  "degradation_rule": "Only checks marked degradable and acceptance criteria of requirements with release_class=degradable may be DEGRADED. A DEGRADED item still needs a bound execution record, a diagnostic artifact and an upstream reference; the release status then says DEGRADED."
 }

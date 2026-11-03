@@ -6,7 +6,7 @@
 
 Project为规范化repo路径和项目ID；SpecificationRevision为Git规格内容hash；Requirement是稳定ID；AC隶属Requirement；Task是可执行工作；Run是一轮长期目标执行；Iteration是一个可验证增量；Attempt是某角色的一次可重试执行；Session是底座会话；Candidate是冻结工件；Evidence是原始观察；Decision是Commander建议；Issue是需修复的事实；Release是最终工件与证据集合。
 
-一个Run含多个Iteration，每轮含多个Task/Attempt；重试只新增Attempt，不把旧失败覆盖。Session可以续用，但QA与开发、Commander与Reviewer必须不同session identity。配置revision与role_epoch一起绑定到attempt。
+一个Run含多个Iteration，每轮含多个Task/Attempt；重试只新增Attempt，不把旧失败覆盖。Session可以续用，但QA与开发、Commander与Reviewer必须不同session identity。配置revision与role_epoch一起绑定到attempt；role_epoch按(run, role)维护（`role_bindings`），更换Commander不会隔离Developer在途结果。每个项目一个数据库（`.hoh/state.db`），因此`events.seq`就是项目内序号。
 
 ## 状态与事务
 
@@ -28,7 +28,7 @@ ACK重复：同idempotency_key且同payload hash返回原结果；同key不同pa
 
 StartRun、SetMode、SendInput、ConfigureTeam、ProposeSpecChange、PauseRun、ResumeRun、CancelRun、GetSnapshot、GetEvents、GetArtifact、GetCapabilities为内部操作。/plan/快捷键/Web按钮映射SetMode；不由每个入口重新解释Prompt。
 
-HTTP `/v1/commands` POST接收typed command，返回202（已持久接受）含command_id和revision，不能把202理解为任务完成。读取 `/v1/runs/{id}`、`/events?after=...`、`/artifacts/{id}`。写操作带expected_revision；冲突409、缺能力422、host不可用503。未知command返回400，不静默忽略。
+HTTP `/v1/commands` POST接收typed command（含 ApproveSpec、AnswerQuestion 等类型化的 Plan 交互），返回202（已持久接受）含command_id和revision，不能把202理解为任务完成；同key同payload重放返回200且replayed=true。读取 `/v1/runs`、`/v1/runs/{id}` 及其 tasks/acceptance/issues/evidence/team/timeline 分页列表、`/v1/events?after=…&run_id=…`、`/v1/artifacts/{id}`。写操作带expected_revision；冲突409、缺能力422、host不可用503、token或Host/Origin不符403。未知command返回400，不静默忽略。
 
 ## 事件流
 

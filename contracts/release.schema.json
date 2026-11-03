@@ -3,10 +3,11 @@
   "additionalProperties": false,
   "properties": {
     "schema_version": {
-      "const": "1.0"
+      "const": "1.1"
     },
     "baseline_id": {
-      "const": "HOH-BASELINE-1.0"
+      "type": "string",
+      "pattern": "^HOH-BASELINE-[0-9]+\\.[0-9]+$"
     },
     "requirements_sha256": {
       "type": "string",
@@ -14,8 +15,7 @@
     },
     "candidate_id": {
       "type": "string",
-      "minLength": 1,
-      "maxLength": 160
+      "pattern": "^CAND-[a-f0-9]{64}$"
     },
     "spec_sha256": {
       "type": "string",
@@ -41,11 +41,13 @@
           "status": {
             "enum": [
               "PASS",
+              "DEGRADED",
               "FAIL",
               "BLOCKED",
               "NOT_RUN",
               "SKIPPED",
               "INVALID",
+              "UNKNOWN",
               "FLAKY"
             ]
           },
@@ -59,11 +61,54 @@
             "properties": {
               "path": {
                 "type": "string",
-                "minLength": 1
+                "minLength": 1,
+                "pattern": "^(?!/)"
               },
               "sha256": {
                 "type": "string",
                 "pattern": "^[a-f0-9]{64}$"
+              }
+            }
+          },
+          "degradation": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "reason",
+              "upstream_ref",
+              "diagnostic"
+            ],
+            "properties": {
+              "reason": {
+                "type": "string",
+                "minLength": 16
+              },
+              "upstream_ref": {
+                "type": "string",
+                "minLength": 1
+              },
+              "diagnostic": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "path",
+                    "sha256"
+                  ],
+                  "properties": {
+                    "path": {
+                      "type": "string",
+                      "minLength": 1,
+                      "pattern": "^(?!/)"
+                    },
+                    "sha256": {
+                      "type": "string",
+                      "pattern": "^[a-f0-9]{64}$"
+                    }
+                  }
+                }
               }
             }
           }
@@ -72,6 +117,29 @@
           "id",
           "status",
           "execution"
+        ],
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "status": {
+                  "const": "DEGRADED"
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "degradation"
+              ]
+            },
+            "else": {
+              "not": {
+                "required": [
+                  "degradation"
+                ]
+              }
+            }
+          }
         ]
       }
     },
@@ -84,14 +152,18 @@
         "properties": {
           "id": {
             "type": "string",
-            "minLength": 1,
-            "maxLength": 160
+            "pattern": "^AC-[0-9]{3}-[0-9]{2}$"
           },
           "status": {
             "enum": [
               "PASS",
+              "DEGRADED",
               "FAIL",
-              "NOT_RUN"
+              "BLOCKED",
+              "FLAKY",
+              "NOT_RUN",
+              "INVALID",
+              "UNKNOWN"
             ]
           },
           "check_ids": {
@@ -114,7 +186,8 @@
             "properties": {
               "path": {
                 "type": "string",
-                "minLength": 1
+                "minLength": 1,
+                "pattern": "^(?!/)"
               },
               "sha256": {
                 "type": "string",
@@ -151,8 +224,7 @@
           },
           "candidate_id": {
             "type": "string",
-            "minLength": 1,
-            "maxLength": 160
+            "pattern": "^CAND-[a-f0-9]{64}$"
           },
           "spec_sha256": {
             "type": "string",
@@ -161,7 +233,8 @@
           "status": {
             "enum": [
               "PASS",
-              "FAIL"
+              "FAIL",
+              "UNKNOWN"
             ]
           },
           "artifact": {
@@ -174,7 +247,8 @@
             "properties": {
               "path": {
                 "type": "string",
-                "minLength": 1
+                "minLength": 1,
+                "pattern": "^(?!/)"
               },
               "sha256": {
                 "type": "string",
@@ -244,7 +318,8 @@
           "properties": {
             "path": {
               "type": "string",
-              "minLength": 1
+              "minLength": 1,
+              "pattern": "^(?!/)"
             },
             "sha256": {
               "type": "string",
@@ -269,7 +344,8 @@
       "properties": {
         "path": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "pattern": "^(?!/)"
         },
         "sha256": {
           "type": "string",
@@ -287,13 +363,19 @@
       "properties": {
         "path": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "pattern": "^(?!/)"
         },
         "sha256": {
           "type": "string",
           "pattern": "^[a-f0-9]{64}$"
         }
       }
+    },
+    "profile": {
+      "type": "string",
+      "pattern": "^[a-z0-9.]+$",
+      "description": "Release profile from release-policy.json profiles."
     }
   },
   "required": [
@@ -307,10 +389,10 @@
     "acceptance",
     "independent_reports",
     "open_issues",
-    "soak",
     "release_artifact",
-    "candidate_manifest"
+    "candidate_manifest",
+    "profile"
   ],
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:hoh:release:1.0"
+  "$id": "urn:hoh:release:1.1"
 }

@@ -1,11 +1,11 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:hoh:independent-report:1.0",
+  "$id": "urn:hoh:independent-report:1.1",
   "type": "object",
   "additionalProperties": false,
   "properties": {
     "schema_version": {
-      "const": "1.0"
+      "const": "1.1"
     },
     "role": {
       "enum": [
@@ -19,7 +19,7 @@
     },
     "candidate_id": {
       "type": "string",
-      "minLength": 1
+      "pattern": "^CAND-[a-f0-9]{64}$"
     },
     "spec_sha256": {
       "type": "string",
@@ -28,7 +28,8 @@
     "status": {
       "enum": [
         "PASS",
-        "FAIL"
+        "FAIL",
+        "UNKNOWN"
       ]
     },
     "scope": {
@@ -42,7 +43,53 @@
     "findings": {
       "type": "array",
       "items": {
-        "type": "string"
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "severity",
+          "summary"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "severity": {
+            "enum": [
+              "critical",
+              "high",
+              "medium",
+              "low"
+            ]
+          },
+          "summary": {
+            "type": "string",
+            "minLength": 1
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "path",
+                "sha256"
+              ],
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "minLength": 1,
+                  "pattern": "^(?!/)"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{64}$"
+                }
+              }
+            }
+          }
+        }
       }
     },
     "raw_session": {
@@ -55,13 +102,34 @@
       "properties": {
         "path": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "pattern": "^(?!/)"
         },
         "sha256": {
           "type": "string",
           "pattern": "^[a-f0-9]{64}$"
         }
       }
+    },
+    "native_attempt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^(?!/)"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      },
+      "description": "Attempt record of the native agent run that produced this report (tools/agent_task.py attempt.json or the runtime export). Its session_ids must contain session_id."
     }
   },
   "required": [
@@ -73,6 +141,7 @@
     "status",
     "scope",
     "findings",
-    "raw_session"
+    "raw_session",
+    "native_attempt"
   ]
 }

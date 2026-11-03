@@ -1,7 +1,9 @@
 ---
 name: hoh-bootstrap
-description: 在本HoH项目内按既定规格自主完成Rust产品开发、验证与交付。
+description: Autonomously develop, verify and deliver the HoH Rust product in this project according to the adopted specifications.
 ---
-读取项目根AGENTS.md、CONTRACT.md和docs/19-ai-development.md。启动指令见LAUNCH_PROMPT.md。按需加载resources/skills/registry.json中的内置Skill，不依赖用户手动安装其它工程Skill。不要递归创建第二顶层Commander；外部原生工具负责自举，产品Runtime在验收后逐步接管。
+Read the project root AGENTS.md, CONTRACT.md (including CR-001) and docs/19-ai-development.md. The launch instructions are in LAUNCH_PROMPT.md. Load built-in skills on demand from resources/skills/registry.json; do not depend on the user installing other engineering skills.
 
-仅供顶层启动调用。若输入含`[HOH_DELEGATED_TASK]`，不得触发本Skill；保持当前子任务范围，完成后返回。
+During bootstrap (M0–M2) this session is the single main development session; independent review runs in a separate session via `tools/agent_task.py --role reviewer`. Never start a second top-level session (refuse if `HOH_BOOTSTRAP_PARENT` is set). External native tools drive bootstrap; the product runtime takes over gradually only after it passes acceptance.
+
+For top-level launch only. If the input contains `[HOH_DELEGATED_TASK]`, do not trigger this skill; stay within the current subtask and return when done.

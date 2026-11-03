@@ -1,18 +1,18 @@
-# HoH 自主开发入口
+# HoH autonomous development entry point
 
-**先判断执行层级。** 输入以`[HOH_DELEGATED_TASK]`开头时，你只承担该子任务和指定role；不执行全项目bootstrap，不读取LAUNCH_PROMPT后另启总指挥，不领取其他工作包、不更新全局完成状态。提交当前任务结果后结束；QA/Reviewer不得修改被测源码。下列连续推进规则只适用于用户启动的顶层会话或`[HOH_TOP_LEVEL_BOOTSTRAP]`，其余项目约束仍适用。
+**First determine your execution level.** If the input starts with `[HOH_DELEGATED_TASK]`, you own only that subtask and the given role: do not run the project-wide bootstrap, do not read LAUNCH_PROMPT and start another top-level session, do not claim other tasks, and do not update global completion status. Return the task result and stop; QA/Reviewer never modify the source under test. The continuous-progress rules below apply only to the top-level session started by the user or marked `[HOH_TOP_LEVEL_BOOTSTRAP]`; all other project constraints still apply. If the environment variable `HOH_BOOTSTRAP_PARENT` is set, you are already inside a bootstrap session and must not start another top-level session.
 
-1. 先读 CONTRACT.md、docs/19-ai-development.md 和 contracts/requirements.json；这是已采纳规格，不重新采访已确定决定。
-2. 本包不是HoH成品；目标是完整实现所有required_release需求，不止MVP。
-3. 默认Codex指挥、Claude设计/编码、Pi研究/QA、独立Codex会话review；岗位可配置。
-4. Rust模块化单体；原生Agent优先；禁止第四Coding Agent与外层Python无限继续循环。
-5. Shell仅hoh/-p及attach/web/doctor；/plan在TUI；CLI与TUI统一语义而非一一命令。
-6. 执行bootstrap、bundle checks和preflight，按development-tasks依赖小步TDD/实现/测试/审查。
-7. 单写者+冻结候选+独立QA/Review；指令、代码、规格和证据版本关联。
-8. 保留并完成TUI/Web、角色/Prompt自定义、内置Skill/模板和三Pi插件，不偷偷删范围。
-9. 不伪造来源、模型能力、执行结果、费用和通过率；mock/live/not_run严格区分。
-10. 不修改baseline/required gates以绿灯；需要变更写CR/ADR，遵守用户授权。
-11. 每小步更新.hoh-dev/PROGRESS.md和任务板；会话压缩前保存恢复点。
-12. 不在M1/MVP提前停工；未遇真实外部阻塞继续下一任务。
-13. YOLO仅在用户声明的隔离VM；不做隐私/沙箱专项改造，但保留工程完整性。
-14. 最终必须运行真实验收；只有全部required通过才COMPLETED，否则明确INCOMPLETE/BLOCKED。
+1. Read CONTRACT.md (including CR-001) and docs/19-ai-development.md first; read the relevant requirements in contracts/requirements.json per task. These are adopted specifications; do not re-interview decisions that are already made.
+2. This kit is not the finished HoH product. The goal is to implement every requirement whose `release_targets` contains v1. v0.1 is an interim usable release, not the end point.
+3. Bootstrap phase (M0–M2): one main development session (Claude by default) plus an independent review session (Codex by default, via `tools/agent_task.py --role reviewer`). The product's default team is still Codex commander, Claude CTO/developer, Pi QA/researcher; roles are configurable.
+4. Rust modular monolith; native agents first. No fourth coding agent and no outer infinite Python "continue" loop.
+5. Shell surface is only `hoh`, `hoh -p`, `attach`, `web`, `doctor`; `/plan` lives in the TUI. CLI and TUI share semantics, not a one-to-one command list.
+6. Run bootstrap, `scripts/check.sh --bundle` and preflight. Claim tasks with `tools/taskboard.py claim <id> --owner <session>` and work in small TDD/implement/test/review steps along the dependencies. Implementation tasks that depend on outline requirements are refused: run that milestone's spec task first.
+7. Single writer (the taskboard allows only one running writer task) + frozen candidates + independent QA/review. Checks run only through the frozen check plan and `tools/run_check.py`. Instructions, code, specs and evidence are version-linked.
+8. Keep and finish TUI/Web, role/prompt customization, built-in skills/templates and the three Pi plugins; never silently drop scope. If a plugin is unavailable upstream, degrade it explicitly per CR-001.
+9. Never fabricate sources, model capabilities, execution results, costs or pass rates; keep mock/product/live/not_run strictly separate.
+10. Never edit the baseline or required gates to get green. Baseline changes need a CR and `tools/baseline.py relock --cr`, within the user's authorization.
+11. Update `.hoh-dev/PROGRESS.md` and the taskboard after every small step; save a recovery point before the session ends or compacts.
+12. Do not stop at M1, an MVP or v0.1; unless there is a real external blocker, continue with the next task.
+13. YOLO only in the isolated VM the user declared, as a non-root development user. No privacy/sandbox side projects, but keep engineering integrity.
+14. Real acceptance must run at the end. Report COMPLETED only when `release_gate.py` passes the v1 profile (COMPLETED_DEGRADED when plugins are degraded); otherwise report INCOMPLETE/BLOCKED explicitly.

@@ -13,11 +13,11 @@
     },
     "git_commit": {
       "type": "string",
-      "pattern": "^[a-f0-9]{40,64}$"
+      "pattern": "^([a-f0-9]{40}|[a-f0-9]{64})$"
     },
     "git_tree": {
       "type": "string",
-      "pattern": "^[a-f0-9]{40,64}$"
+      "pattern": "^([a-f0-9]{40}|[a-f0-9]{64})$"
     },
     "spec_sha256": {
       "type": "string",
@@ -41,7 +41,8 @@
       "properties": {
         "path": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "pattern": "^(?!/)"
         },
         "sha256": {
           "type": "string",
@@ -59,7 +60,8 @@
       "properties": {
         "path": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "pattern": "^(?!/)"
         },
         "sha256": {
           "type": "string",
@@ -77,7 +79,8 @@
       "properties": {
         "path": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "pattern": "^(?!/)"
         },
         "sha256": {
           "type": "string",
@@ -98,7 +101,8 @@
         "properties": {
           "path": {
             "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "pattern": "^(?!/)"
           },
           "sha256": {
             "type": "string",

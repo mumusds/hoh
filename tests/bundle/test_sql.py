@@ -40,7 +40,7 @@ class SQLContract(unittest.TestCase):
         with self.assertRaises(sqlite3.IntegrityError):self.c.execute('INSERT INTO commands VALUES(?,?,?,?,?,?)',('c2',)+args[1:])
     def test_single_writer_lease(self):
         self.c.execute("INSERT INTO tasks(task_id,run_id,spec_id,state,role,created_seq) VALUES('t','r','s','READY','developer',1)")
-        self.c.execute("INSERT INTO attempts(attempt_id,task_id,state,role_epoch,host_epoch) VALUES('a','t','PREPARED',1,1)")
+        self.c.execute("INSERT INTO attempts(attempt_id,task_id,state,role_epoch,host_epoch,config_revision) VALUES('a','t','PREPARED',1,1,0)")
         self.c.execute("INSERT INTO leases VALUES('p','writer','a',1,'later')")
         with self.assertRaises(sqlite3.IntegrityError):self.c.execute("INSERT INTO leases VALUES('p','writer','a',2,'later')")
     def test_sqlite_online_backup(self):
@@ -51,3 +51,33 @@ class SQLContract(unittest.TestCase):
             c=sqlite3.connect(str(Path(d)/'state.db'))
             try:self.assertEqual(c.execute('PRAGMA journal_mode=WAL').fetchone()[0],'wal')
             finally:c.close()
+    def test_schema_version_and_rerun_refused(self):
+        self.assertEqual(self.c.execute('PRAGMA user_version').fetchone()[0],1)
+        self.assertEqual(self.c.execute('SELECT max(version) FROM schema_migrations').fetchone()[0],1)
+        with self.assertRaises(sqlite3.Error):self.c.executescript((ROOT/'contracts/sql/001_initial.sql').read_text())
+        self.c.execute('ROLLBACK') if self.c.in_transaction else None
+        self.assertEqual(self.c.execute('SELECT count(*) FROM runs').fetchone()[0],1)
+    def test_primary_keys_not_null(self):
+        with self.assertRaises(sqlite3.IntegrityError):self.c.execute('INSERT INTO task_dependencies VALUES(NULL,NULL)')
+    def test_foreign_keys_indexed(self):
+        missing=[]
+        for (table,) in self.c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").fetchall():
+            fks={row[3] for row in self.c.execute(f'PRAGMA foreign_key_list({table})') if row[1]==0}  # leading column of each FK
+            pk=[r[1] for r in sorted(self.c.execute(f'PRAGMA table_info({table})').fetchall(),key=lambda r:r[5]) if r[5]]
+            leading={pk[0]} if pk else set()
+            for (idx,*_) in [(r[1],) for r in self.c.execute(f'PRAGMA index_list({table})')]:
+                cols=[r[2] for r in self.c.execute(f'PRAGMA index_info({idx})')]
+                if cols:leading.add(cols[0])
+            missing+=[f'{table}.{c}' for c in fks-leading]
+        allowed={'specs.project_id','role_bindings.session_id','requirements.spec_id','acceptance_criteria.requirement_id','iterations.run_id','tasks.iteration_id','tasks.spec_id','prompt_revisions.parent_revision','attempts.prompt_revision','supervisor_triggers.spec_id','change_requests.base_spec_id','change_requests.result_spec_id','handoffs.package_artifact_id','releases.candidate_id','issues.candidate_id','outbox.run_id','acceptance_results.ac_id','runs.spec_id'}
+        self.assertEqual(sorted(set(missing)-allowed),[])
+    def test_degraded_only_for_evidence_and_results(self):
+        self.c.execute("INSERT INTO requirements VALUES('REQ-048','s','plugin',1,'degradable')")
+        with self.assertRaises(sqlite3.IntegrityError):self.c.execute("INSERT INTO requirements VALUES('REQ-001','s','x',1,'optional')")
+    def test_release_status(self):
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.c.execute("INSERT INTO candidates VALUES('c','r',?,?,?,?,?,'p','now')",('a'*40,'b'*40,'c'*64,'d'*64,'e'*64))
+            self.c.execute("INSERT INTO releases VALUES('rel','r','c','v1','DONE',?, 'now')",('f'*64,))
+    def test_git_ids_exact_length(self):
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.c.execute("INSERT INTO candidates VALUES('c2','r',?,?,?,?,?,'p','now')",('a'*41,'b'*40,'c'*64,'d'*64,'e'*64))

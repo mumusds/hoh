@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:hoh:soak-event:1.0",
+  "title": "One JSONL line of the soak timeline written by the soak check under $HOH_EVIDENCE_DIR. harness_candidate_id is the HoH release candidate under test, not the candidate of the fixture project being developed.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "kind", "occurred_at", "harness_candidate_id"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "kind": {"type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,63}$"},
+    "occurred_at": {"type": "string", "format": "date-time"},
+    "harness_candidate_id": {"type": "string", "pattern": "^CAND-[a-f0-9]{64}$"},
+    "mode": {"enum": ["live", "mock", "fault-injection"]},
+    "run_id": {"type": "string", "minLength": 1, "maxLength": 160},
+    "iteration_id": {"type": "string", "minLength": 1, "maxLength": 160},
+    "details": {"type": "object"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"kind": {"const": "iteration.accepted"}}},
+      "then": {"required": ["mode", "run_id", "iteration_id"]}
+    }
+  ]
+}

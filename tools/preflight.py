@@ -3,7 +3,7 @@
 from __future__ import annotations
 import argparse,json,os,platform,shutil,subprocess,sys
 from pathlib import Path
-from common import ROOT,atomic_json,sha256,utcnow
+from common import ROOT,atomic_json,flag_supported,sha256,utcnow
 from agent_task import REQUIRED
 
 def probe(name,args=None):
@@ -19,7 +19,7 @@ def report():
     for name in ['git','node','npm','cargo','rustc','codex','claude','pi']:result['probes'][name]=probe(name)
     for name in REQUIRED:
         cap=probe(name,['exec','--help'] if name=='codex' else ['--help'])
-        text=cap.get('text','');cap['missing_flags']=[f for f in REQUIRED[name] if f not in text]
+        text=cap.get('text','');cap['missing_flags']=[f for f in REQUIRED[name] if not flag_supported(text,f)]
         cap['available']=cap['available'] and not cap['missing_flags'];result['probes'][name+'_capabilities']=cap
     node=result['probes']['node']
     try:

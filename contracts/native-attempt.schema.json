@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:hoh:native-attempt:1.0",
+  "title": "Minimal fields the release gate reads from a native agent attempt record (tools/agent_task.py attempt.json or the runtime export). Other fields are allowed.",
+  "type": "object",
+  "required": ["record_type", "role", "status", "session_ids", "candidate_id", "stdout_sha256"],
+  "properties": {
+    "record_type": {"enum": ["bootstrap_native_attempt", "runtime_attempt_export"]},
+    "role": {"type": "string", "minLength": 1, "maxLength": 160},
+    "status": {"type": "string", "minLength": 1},
+    "session_ids": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 200}},
+    "candidate_id": {"type": "string", "pattern": "^CAND-[a-f0-9]{64}$", "description": "HoH candidate under test when the attempt ran inside a check (HOH_CANDIDATE_ID)."},
+    "stdout_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+  }
+}

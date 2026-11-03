@@ -11,14 +11,16 @@ jobs:
     timeout-minutes: 20
     strategy:
       matrix:
-        python-version: ['3.11', '3.12', '3.13']
+        python-version: ['3.11', '3.12', '3.13', '3.14']
     steps:
-      # Upstream major tags verified in source registry. Pin reviewed SHAs before product release.
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      # Pinned to reviewed commits (checkout v7.0.1, setup-python v7.1.0).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
         with:
           python-version: ${{ matrix.python-version }}
       - run: python -m pip install -r requirements-dev.txt
+      - run: shellcheck -S warning scripts/*.sh
       - run: bash scripts/bootstrap.sh --yolo --dry-run
+      # Validation, baseline/CR verification, generated-view drift and all bundle tests.
       - run: bash scripts/check.sh --bundle
       # No native model credentials; these are NOT product/live acceptance tests.

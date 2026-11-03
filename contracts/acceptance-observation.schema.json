@@ -1,23 +1,23 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:hoh:acceptance-observation:1.0",
+  "$id": "urn:hoh:acceptance-observation:1.1",
   "type": "object",
   "additionalProperties": false,
   "properties": {
     "schema_version": {
-      "const": "1.0"
+      "const": "1.1"
     },
     "ac_id": {
       "type": "string",
-      "pattern": "^AC-[0-9]{3}$"
+      "pattern": "^AC-[0-9]{3}-[0-9]{2}$"
     },
     "test_id": {
       "type": "string",
-      "pattern": "^TEST-[0-9]{3}$"
+      "pattern": "^TEST-[0-9]{3}-[0-9]{2}$"
     },
     "candidate_id": {
       "type": "string",
-      "minLength": 1
+      "pattern": "^CAND-[a-f0-9]{64}$"
     },
     "spec_sha256": {
       "type": "string",
@@ -26,7 +26,13 @@
     "status": {
       "enum": [
         "PASS",
-        "FAIL"
+        "DEGRADED",
+        "FAIL",
+        "BLOCKED",
+        "FLAKY",
+        "INVALID",
+        "UNKNOWN",
+        "NOT_RUN"
       ]
     },
     "check_ids": {
@@ -55,11 +61,55 @@
         "properties": {
           "path": {
             "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "pattern": "^(?!/)"
           },
           "sha256": {
             "type": "string",
             "pattern": "^[a-f0-9]{64}$"
+          }
+        }
+      }
+    },
+    "degradation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reason",
+        "upstream_ref",
+        "diagnostic"
+      ],
+      "properties": {
+        "reason": {
+          "type": "string",
+          "minLength": 16
+        },
+        "upstream_ref": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Upstream issue/version/commit showing the third-party limitation."
+        },
+        "diagnostic": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "path",
+              "sha256"
+            ],
+            "properties": {
+              "path": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^(?!/)"
+              },
+              "sha256": {
+                "type": "string",
+                "pattern": "^[a-f0-9]{64}$"
+              }
+            }
           }
         }
       }
@@ -75,5 +125,28 @@
     "check_ids",
     "observed",
     "raw_evidence"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "DEGRADED"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "degradation"
+        ]
+      },
+      "else": {
+        "not": {
+          "required": [
+            "degradation"
+          ]
+        }
+      }
+    }
   ]
 }

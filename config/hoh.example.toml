@@ -8,8 +8,14 @@ profile = "yolo-vm"
 writer_slots = 1
 reader_slots = 2
 reserve_supervisor_slot = true
+# Per role: agent (codex|claude|pi), optional model (empty = native default, resolved model is recorded),
+# optional ordered fallback agents (none by default -> BLOCKED), optional prompt override path.
+# Unknown keys are rejected (REQ-018). Changes apply at the next checkpoint with a new role_epoch.
 [team.commander]
 agent = "codex"
+# model = ""
+# fallback = []
+# prompt = ".hoh/prompts/commander.md"
 [team.cto]
 agent = "claude"
 [team.developer]
@@ -34,5 +40,6 @@ view = "workspace"
 statusline = "standard"
 mouse = true
 [web]
-host = "127.0.0.1"
+host = "127.0.0.1"   # loopback only; remote use: ssh -L 8787:127.0.0.1:8787 vm
 port = 8787
+# Requests need the per-host token from .hoh/host.json and a loopback Host/Origin (contracts/openapi.json).

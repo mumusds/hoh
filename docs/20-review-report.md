@@ -1,6 +1,10 @@
 # 方案复核与验证状态
 
-详细实际结果见[审核报告](../reports/REVIEW.md)和[验证矩阵](../reports/verification-matrix.json)。本包包含可执行检查，不把概念文档视为已开发产品。
+详细实际结果见[审核报告](../reports/REVIEW.md)；kit 1.0.0 的原始审核记录保存在 `reports/history/kit-1.0.0/`。本包包含可执行检查，不把概念文档视为已开发产品。
+
+## kit 1.1 复核（CR-001）
+
+对 1.0.0 的复核发现：AC 模板化不可判定、门禁可被自报 mode/手写时间线绕过、插件安装缺 `--approve` 导致 bootstrap 失败、任务台账不执行单写者、schema 状态枚举互相矛盾、SQL 缺约束与索引、本地 Web API 无请求完整性保护。这些已在 1.1 修正，产品范围不变；具体见 [CR-001](cr/CR-001-kit-hardening.md) 与 CHANGELOG。M3–M7 需求仍为 outline，按滚动细化在各里程碑开始前补齐，这是有意的计划而非遗漏。
 
 ## 架构复核结果
 

@@ -22,8 +22,8 @@ if [[ "$DRY" == 1 ]]; then
   printf '%s\n' 'Keep existing agents, authentication, and model defaults.' 'Resolve native CLI help/versions; record locks; do not upgrade active runtimes.' 'Prepare isolated development venv and project-local skill entries.' 'No background agent loop and no claim of product acceptance.'
   exit 0
 fi
-if [[ "$INSTALL" == 1 && "$(id -u)" == 0 ]]; then
-  echo 'Use a normal development user in the VM, not root: Claude bypass mode rejects root.' >&2
+if [[ "$(id -u)" == 0 ]]; then
+  echo 'Use a normal development user in the VM, not root: native agents run with bypass flags and Claude rejects root.' >&2
   exit 78
 fi
 DEV="$ROOT/.hoh-dev"; mkdir -p "$DEV" "$DEV/downloads" "$DEV/runtime" "$DEV/tooling" "$DEV/attempts"
@@ -33,12 +33,14 @@ if [[ -d "$DEV/runtime/node/bin" ]]; then export PATH="$DEV/runtime/node/bin:$PA
 python3 - "$ROOT" <<'ENV'
 import pathlib,sys,shlex
 r=pathlib.Path(sys.argv[1]);d=r/'.hoh-dev';paths=[d/'venv/bin',d/'runtime/node/bin',d/'tooling/bin',pathlib.Path.home()/'.local/bin',pathlib.Path.home()/'.cargo/bin']
-(d/'env.sh').write_text('# Source this in each new development shell. No secrets.\nexport HOH_PROJECT_ROOT='+shlex.quote(str(r))+'\nexport PATH='+shlex.quote(':'.join(map(str,paths)))+':"$PATH"\n',encoding='utf-8')
+env=shlex.quote(str(r/'.env'))
+(d/'env.sh').write_text('# Source this in each new development shell. No secrets are written here.\nexport HOH_PROJECT_ROOT='+shlex.quote(str(r))+'\nexport PATH='+shlex.quote(':'.join(map(str,paths)))+':"$PATH"\n'
+  '# Optional user overrides (see .env.example); .env is gitignored.\nif [ -f '+env+' ]; then set -a; . '+env+'; set +a; fi\n',encoding='utf-8')
 ENV
 if [[ "$INSTALL" == 1 ]]; then
   [[ "$(uname -s)" == Linux ]] || { echo 'Automatic installation currently supports Linux only.' >&2; exit 78; }
   MISSING=()
-  for tool in curl git cc make pkg-config; do command -v "$tool" >/dev/null || MISSING+=("$tool"); done
+  for tool in curl git cc make pkg-config tar xz; do command -v "$tool" >/dev/null || MISSING+=("$tool"); done
   python3 -c 'import venv,ensurepip' >/dev/null 2>&1 || MISSING+=(python3-venv)
   if ((${#MISSING[@]})); then
     command -v apt-get >/dev/null || { echo "Missing ${MISSING[*]}; auto-install requires apt-get (Ubuntu/Debian)." >&2; exit 78; }
@@ -109,7 +111,10 @@ VERIFY
   fi
   PI_PACKAGE="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["native_pi_package"])' "$ROOT/config/plugins.json")"
   install_npm_cli pi "$PI_PACKAGE" pi
-  if [[ "$PLUGINS" == 1 ]]; then python3 "$ROOT/tools/install_pi_plugins.py"; fi
+  if [[ "$PLUGINS" == 1 ]]; then
+    # Plugins are degradable (CR-001): record DEGRADED in .hoh-dev/plugin-lock.json and keep going.
+    python3 "$ROOT/tools/install_pi_plugins.py" || echo 'Pi plugins DEGRADED; see .hoh-dev/plugin-lock.json. Core development continues; release reports must show DEGRADED.' >&2
+  fi
 else
   printf '%s\n' 'Offline preparation only: no toolchain, package, native agent or plugin installation attempted.'
 fi

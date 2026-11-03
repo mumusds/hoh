@@ -36,8 +36,7 @@
         },
         "git_tree": {
           "type": "string",
-          "minLength": 1,
-          "maxLength": 160
+          "pattern": "^([a-f0-9]{40}|[a-f0-9]{64})$"
         },
         "spec_sha256": {
           "type": "string",
@@ -333,7 +332,9 @@
             "ProposeSpecChange",
             "PauseRun",
             "ResumeRun",
-            "CancelRun"
+            "CancelRun",
+            "ApproveSpec",
+            "AnswerQuestion"
           ]
         },
         "run_id": {
@@ -597,6 +598,81 @@
                 "required": [
                   "reason"
                 ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "ApproveSpec"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "spec_sha256",
+                  "decision"
+                ],
+                "properties": {
+                  "spec_sha256": {
+                    "type": "string",
+                    "pattern": "^[a-f0-9]{64}$"
+                  },
+                  "decision": {
+                    "enum": [
+                      "APPROVE_AND_BUILD",
+                      "APPROVE_ONLY",
+                      "REJECT"
+                    ]
+                  },
+                  "note": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "AnswerQuestion"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "question_id",
+                  "answer"
+                ],
+                "properties": {
+                  "question_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 160
+                  },
+                  "answer": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "choice_id": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                }
               }
             }
           }

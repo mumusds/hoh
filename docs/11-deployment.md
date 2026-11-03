@@ -8,7 +8,7 @@
 
 ## 开发初始化
 
-入口 `scripts/bootstrap.sh --yolo`。默认幂等：检查环境，缺依赖自动准备；已有Agent不擅自升级；项目内建Skill/模板始终存在；安装Pi插件到项目可控范围。写 `.hoh-dev/env.sh` 、分项version.lock、python-lock.txt和preflight.json，保存实际版本/帮助检查状态，不写凭证。
+入口 `scripts/bootstrap.sh --yolo`。默认幂等：检查环境，缺依赖自动准备；已有Agent不擅自升级；项目内建Skill/模板始终存在；安装Pi插件到项目可控范围。插件安装失败时记为DEGRADED，bootstrap继续（CR-001）。写 `.hoh-dev/env.sh`（同时加载可选的 `.env`）、分项version.lock、python-lock.txt、plugin-lock.json（含npm integrity）和preflight.json，保存实际版本/帮助检查状态，不写凭证。以root运行时脚本直接拒绝（含 `--skip-install`）。
 
 `--dry-run` 不写项目、不安装、不联网，只显示将进行的步骤。`--skip-install` 只准备本地开发资源，明确缺依赖，适合离线审核；`--skip-plugins` 只用于诊断，记录未安装状态，native help检查可以单独通过，但不能据此宣告插件或最终验收通过。
 

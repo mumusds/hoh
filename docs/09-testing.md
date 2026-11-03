@@ -2,6 +2,10 @@
 
 测试分四类记录：BUNDLE（本启动包工具）、MOCK（确定性模拟Agent）、LIVE（真实CLI/模型/插件）、PRODUCT（HoH实际产物）。结果必须注明类别，任何类别不能冒充另一个。
 
+## 场景、检查与检查计划
+
+每条 AC 恰好对应一个 TEST 场景（`contracts/acceptance-scenarios.json`），场景的 `check_id` 指明哪一项 release 检查必须产出它的原始证据：unit、integration、recovery、tui-pty、web-e2e、adapter-live、plugin-live、deployment、soak、independent-qa、independent-review、traceability、build、static。产品仓库在 `tests/check-plan.json` 为每个 check_id 声明唯一的 argv、mode（product/live）、cwd 与必须产出的文件。只能经 `tools/run_check.py` 执行。检查命令可以内部运行多个测试，但必须把场景 ID（TEST-NNN-MM）写进输出，使 AC 观察能引用具体证据。live 检查须写出 `live-sessions.json`；soak 检查须写出 `timeline.jsonl`。
+
 ## 测试金字塔
 
 领域单元：状态合法性、DAG/优先级、预算、revision/epoch、Context装箱、hash匹配、事件投影。属性测试生成随机DAG/重复/乱序/中断。集成：SQLite事务/outbox、worktree、进程树、SSE、HTTP冲突。Adapter：固定真实协议fixture回放+有限真实smoke；UI：TestBackend快照+真实PTY+Playwright。最后跨天全系统。
@@ -37,7 +41,7 @@
 
 ## 本包自测
 
-`python3 tools/validate_bundle.py`：文档链接/契约/映射/资源。`python3 -m unittest discover -s tests/bundle -v`：参考调度、SQLite、不变量、进程桥与门禁负例。`bash scripts/check.sh --bundle` 汇总。该组不需要模型账户，不表示HoH已开发。
+`python3 tools/validate_bundle.py`：文档链接、契约、AC/场景/检查映射、profile 覆盖、任务 readiness、生成视图与资源。`python3 tools/baseline.py verify`：基线与 CR。`python3 -m unittest discover -s tests/bundle -v`：参考调度、SQLite、不变量、进程桥、检查计划执行与门禁负例。`bash scripts/check.sh --bundle` 汇总以上全部。该组不需要模型账户，不表示 HoH 已开发。
 
 ## CI策略
 

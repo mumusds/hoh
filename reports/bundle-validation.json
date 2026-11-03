@@ -1,16 +1,18 @@
 {
-  "schema_version": "1.0",
-  "at": "2026-10-12T19:37:15.773230+00:00",
+  "schema_version": "1.1",
+  "at": "2026-11-03T17:06:04.781348+00:00",
   "scope": "BUNDLE_ONLY",
   "status": "PASS",
   "counts": {
     "requirements": 70,
-    "acceptance": 70,
-    "development_tasks": 24,
+    "detailed_requirements": 27,
+    "acceptance": 161,
+    "interim_v0_1_requirements": 18,
+    "development_tasks": 47,
     "skills": 12,
     "templates": 16,
-    "schemas": 6,
-    "json_files": 30
+    "schemas": 10,
+    "json_files": 39
   },
   "errors": [],
   "product_accepted": false

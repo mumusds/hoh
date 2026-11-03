@@ -4,7 +4,7 @@
 |---|---|---|---|
 |R01|实际CLI版本/旗标变化|probe帮助/协议schema+live smoke，保存compat manifest|不阻断离线核心；阻断真实适配验收|
 |R02|Pi仓库/包名迁移|按官方README解析来源并锁定，不盲升级已有安装|不阻断核心|
-|R03|三插件共同hook兼容|组合测试、恢复/compact/无TUI测试|阻断插件完整验收|
+|R03|三插件共同hook兼容|组合测试、恢复/compact/无TUI测试；CR-001后上游不可用时带诊断DEGRADED|不再阻断发布；降级时发布状态为COMPLETED_DEGRADED|
 |R04|QA/Reviewer与作者上下文污染|独立session与候选，先规格后自测摘要|阻断独立验收|
 |R05|Claude中途steer能力差异|capability false时排队下轮；不伪装实时|不阻断规定的安全点steer|
 |R06|外部副作用重复|outbox/effect ledger/reconcile与lost ACK测试|阻断生产可靠性|
@@ -17,7 +17,11 @@
 |R13|GitHub自审不满足规则|机器人required checks与独立AI会话；不假设同账户review可审批自己PR|只影响远程发布策略|
 |R14|模型服务预算/认证不足|BLOCKED/INCOMPLETE，持久剩余任务；不拿mock替代live|不阻断离线实现|
 |R15|未知的“完美”标准|70项需求/机器AC/真实验收；不提供无证据零缺陷保证|以可检验规格替代|
-|R16|首次自举不具备成熟Runtime|外部Codex原生会话+持久任务板；M2后渐进接管|禁止自建外层无限循环|
+|R16|首次自举不具备成熟Runtime|主开发会话+独立Review会话+持久任务板（CR-001）；M2后渐进接管|禁止自建外层无限循环|
+|R17|outline需求在实现时被随意解读|Readiness：taskboard拒绝领取依赖outline需求的任务；各里程碑spec任务细化+CR+relock|阻断对应里程碑实现，直到细化完成|
+|R18|v0.1被误当作完成而停工|INTERIM_RELEASED状态与COMPLETED分离；AGENTS/LAUNCH明确不得在v0.1停工|不阻断|
+|R19|门禁证据被自报或手写|mode/argv/cwd取自冻结检查计划；live会话清单；AC证据须来自所引检查目录；soak时间线须由soak检查产出；报告绑定原生attempt|仍不能防止全VM写权限的刻意伪造；由独立QA/Review审查覆盖|
+|R20|本地Web被浏览器跨站请求或DNS rebinding利用|每host随机token + Host/Origin校验（openapi 1.1）|阻断Web验收|
 
 ## 本次审查已补充的设计
 

@@ -2,9 +2,10 @@ import contextlib,io,json,os,shutil,signal,subprocess,sys,tempfile,time,unittest
 from pathlib import Path
 from unittest.mock import patch
 from helpers import ROOT,init_repository,load_json,json_file
-from common import execute,ref_for,safe_path,terminate_group
+from common import Terminated,execute,install_termination_handlers,ref_for,restore_handlers,safe_path,terminate_group
 from candidate import verify,freeze
 from agent_task import command_for,inspect_output
+from common import flag_supported
 from render_prompt import render
 import run_check
 
@@ -63,9 +64,32 @@ class NativeBridge(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'unsupported'):command_for('codex',self.root,None,'--json')
     def test_claude_command(self):
         c=command_for('claude',self.root,None);self.assertIn('-p',c);self.assertIn('--verbose',c);self.assertIn('stream-json',c)
-    def test_top_level_restricted_to_commander(self):
+    def test_top_level_restricted_to_coordinator_roles(self):
         p=subprocess.run([sys.executable,str(ROOT/'tools/agent_task.py'),'--agent','codex','--prompt-file',str(self.prompt),'--role','qa','--top-level','--dry-run'],capture_output=True,text=True,env=self.env)
         self.assertEqual(p.returncode,2)
+    def test_nested_top_level_refused(self):
+        p=subprocess.run([sys.executable,str(ROOT/'tools/agent_task.py'),'--agent','claude','--prompt-file',str(self.prompt),'--role','developer','--top-level','--dry-run'],capture_output=True,text=True,env=self.env|{'HOH_BOOTSTRAP_PARENT':'outer'})
+        self.assertEqual(p.returncode,2);self.assertIn('already inside bootstrap session',p.stderr)
+    def test_child_sees_parent_marker(self):
+        p,out=self.bridge();self.assertEqual(p.returncode,0,p.stderr)
+        self.assertEqual(load_json(out/'attempt.json')['cli_version'],'MOCK_AGENT_VERSION')
+    def test_existing_attempt_dir_refused(self):
+        (self.root/'attempt').mkdir();p,_=self.bridge();self.assertEqual(p.returncode,64)
+    def test_attempt_lives_in_check_evidence_dir(self):
+        ev=self.root/'evidence';ev.mkdir()
+        p=subprocess.run([sys.executable,str(ROOT/'tools/agent_task.py'),'--agent','claude','--role','qa','--prompt-file',str(self.prompt),'--cwd',str(self.root),'--timeout','10'],
+                         capture_output=True,text=True,env=self.env|{'HOH_EVIDENCE_DIR':str(ev),'HOH_CHECK_ID':'independent-qa','HOH_CANDIDATE_ID':'CAND-'+'a'*64},timeout=20)
+        self.assertEqual(p.returncode,0,p.stderr);[rec]=list((ev/'attempts').glob('*/attempt.json'));r=load_json(rec)
+        self.assertEqual((r['candidate_id'],r['check_id'],r['role']),('CAND-'+'a'*64,'independent-qa','qa'));self.assertEqual(r['stdout_sha256'],ref_for(rec.parent/'stdout.jsonl',rec.parent)['sha256'])
+    def test_live_sessions_recorded_under_run_check(self):
+        ev=self.root/'evidence';ev.mkdir()
+        p=subprocess.run([sys.executable,str(ROOT/'tools/agent_task.py'),'--agent','claude','--prompt-file',str(self.prompt),'--cwd',str(self.root),'--output-dir',str(self.root/'a2'),'--timeout','10'],
+                         capture_output=True,text=True,env=self.env|{'HOH_EVIDENCE_DIR':str(ev),'HOH_CHECK_ID':'adapter-live','HOH_CANDIDATE_ID':'CAND-'+'a'*64},timeout=20)
+        self.assertEqual(p.returncode,0,p.stderr);s=load_json(ev/'live-sessions.json')
+        self.assertEqual([x['session_id'] for x in s['sessions']],['mock-claude']);self.assertEqual(s['sessions'][0]['cli_version'],'MOCK_AGENT_VERSION')
+    def test_whole_token_flag_detection(self):
+        self.assertFalse(flag_supported('--model NAME','--mode'));self.assertTrue(flag_supported('  --mode <m>','--mode'))
+        with self.assertRaisesRegex(ValueError,'--mode'):command_for('pi',self.root,None,'--model --session-dir')
     def test_assistant_text_not_echoed_user_prompt(self):
         p=self.root/'raw';p.write_text('{"type":"message_end","message":{"role":"user","content":[{"type":"text","text":"HOH_NATIVE_SMOKE_OK"}]}}\n')
         self.assertEqual(inspect_output('pi',p)['assistant_text_tail'],'')
@@ -107,9 +131,32 @@ class ProcessLifecycle(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             with self.assertRaises(ValueError):safe_path(Path(d),'../outside')
 
+PY=sys.executable
+PLAN={'ok':{'mode':'mock','argv':[PY,'-c','print("MOCK UNIT CHECK ONLY")']},
+      'fail':{'mode':'mock','argv':[PY,'-c','import sys;sys.exit(9)']},
+      'mutate':{'mode':'mock','argv':[PY,'-c','open("source.txt","w").write("modified")']},
+      'live':{'mode':'live','argv':[PY,'-c','pass']},
+      'artifact':{'mode':'mock','argv':[PY,'-c','import os;open(os.path.join(os.environ["HOH_EVIDENCE_DIR"],"result.json"),"w").write("{}")'],'artifacts':['result.json']},
+      'missing-artifact':{'mode':'mock','argv':[PY,'-c','pass'],'artifacts':['result.json']},
+      'escape':{'mode':'mock','argv':[PY,'-c','pass'],'cwd':'../'}}
+
+class Signals(unittest.TestCase):
+    def test_sigterm_stops_child_and_surfaces(self):
+        import threading
+        with tempfile.TemporaryDirectory() as d:
+            r=Path(d);previous=install_termination_handlers()
+            try:
+                threading.Timer(0.3,lambda:os.kill(os.getpid(),signal.SIGTERM)).start();start=time.monotonic()
+                with self.assertRaises(Terminated):execute([sys.executable,'-c','import time;time.sleep(30)'],r,r/'o',r/'e',30,grace=0.5)
+                self.assertLess(time.monotonic()-start,10)
+            finally:restore_handlers(previous)
+
 class CandidateAndChecks(unittest.TestCase):
     def setUp(self):
-        self.t=tempfile.TemporaryDirectory(prefix='hoh-candidate-');self.addCleanup(self.t.cleanup);self.root=Path(self.t.name);self.c,self.cr=init_repository(self.root)
+        self.t=tempfile.TemporaryDirectory(prefix='hoh-candidate-');self.addCleanup(self.t.cleanup);self.root=Path(self.t.name);self.c,self.cr=init_repository(self.root,PLAN)
+    def test_symlinked_artifact_rejected(self):
+        p=self.root/'.hoh-dev/environment.json';real=self.root/'.hoh-dev/env-real.json';p.rename(real);p.symlink_to(real)
+        with self.assertRaisesRegex(ValueError,'symlink'):verify(self.root,self.c)
     def test_clean_candidate(self):verify(self.root,self.c)
     def test_dirty_source(self):
         (self.root/'source.txt').write_text('changed')
@@ -123,16 +170,50 @@ class CandidateAndChecks(unittest.TestCase):
     def test_forged_candidate_id(self):
         self.c['candidate_id']='CAND-'+'0'*64
         with self.assertRaisesRegex(ValueError,'identity'):verify(self.root,self.c)
-    def check(self,code):
-        out=self.root/'.hoh-dev/check'
-        args=['--check-id','unit','--candidate-file',str(self.root/'.hoh-dev/candidate.json'),'--mode','mock','--cwd',str(self.root),'--out',str(out),'--',sys.executable,'-c',code]
-        with patch.object(run_check,'ROOT',self.root),patch.object(run_check,'ref_for',lambda p:ref_for(p,self.root)),contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):rc=run_check.main(args)
-        return rc,load_json(out/'execution.json')
+    def runcheck(self,check,extra=(),out='check'):
+        out=self.root/'.hoh-dev'/out
+        args=['--check-id',check,'--candidate-file',str(self.root/'.hoh-dev/candidate.json'),'--out',str(out),*extra]
+        err=io.StringIO()
+        with patch.object(run_check,'ROOT',self.root),patch.object(run_check,'ref_for',lambda p:ref_for(p,self.root)),contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(err):rc=run_check.main(args)
+        return rc,(load_json(out/'execution.json') if (out/'execution.json').exists() else None),err.getvalue()
     def test_real_check_record(self):
-        rc,r=self.check('print("MOCK UNIT CHECK ONLY")');self.assertEqual(rc,0);self.assertTrue(r['source_unchanged']);self.assertEqual(r['mode'],'mock')
-    def test_check_failing_exit(self):rc,r=self.check('import sys;sys.exit(9)');self.assertEqual(rc,9);self.assertEqual(r['exit_code'],9)
+        rc,r,_=self.runcheck('ok');self.assertEqual(rc,0);self.assertTrue(r['source_unchanged']);self.assertEqual((r['mode'],r['cwd']),('mock','.'))
+        self.assertEqual(r['command'],PLAN['ok']['argv']);self.assertEqual(r['producer_attempt_id'],r['record_id'])
+    def test_check_failing_exit(self):rc,r,_=self.runcheck('fail');self.assertEqual(rc,9);self.assertEqual(r['exit_code'],9)
     def test_check_mutating_source(self):
-        rc,r=self.check('open("source.txt","w").write("modified")');self.assertNotEqual(rc,0);self.assertFalse(r['source_unchanged'])
+        rc,r,_=self.runcheck('mutate');self.assertNotEqual(rc,0);self.assertFalse(r['source_unchanged'])
+    def test_mode_comes_from_plan(self):
+        rc,r,_=self.runcheck('live');self.assertEqual(r['mode'],'live')
+        with self.assertRaises(SystemExit):self.runcheck('ok',['--mode','live'],out='c2')
+    def test_unplanned_command_refused(self):
+        rc,r,err=self.runcheck('ok',['--','true']);self.assertEqual(rc,1);self.assertIsNone(r);self.assertIn('differs from the frozen check plan',err)
+    def test_planned_command_echo_allowed(self):rc,r,_=self.runcheck('ok',['--',*PLAN['ok']['argv']]);self.assertEqual(rc,0)
+    def test_candidate_file_outside_project_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            outside=Path(d)/'candidate.json';outside.write_text((self.root/'.hoh-dev/candidate.json').read_text())
+            err=io.StringIO()
+            with patch.object(run_check,'ROOT',self.root),contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(err):
+                rc=run_check.main(['--check-id','ok','--candidate-file',str(outside),'--out',str(self.root/'.hoh-dev/x')])
+            self.assertEqual(rc,1);self.assertIn('inside the project',err.getvalue());self.assertFalse((self.root/'.hoh-dev/x').exists())
+    def test_untracked_check_plan_refused(self):
+        (self.root/'.hoh-dev/plan.json').write_text((self.root/'plan.json').read_text())
+        with self.assertRaisesRegex(ValueError,'committed file'):freeze(self.root,self.root/'spec.md',self.root/'.hoh-dev/environment.json',self.root/'.hoh-dev/plan.json')
+    def test_unknown_check_refused(self):rc,r,err=self.runcheck('nonexistent');self.assertEqual(rc,1);self.assertIn('not in the frozen check plan',err)
+    def test_artifact_hashed(self):
+        rc,r,_=self.runcheck('artifact');self.assertEqual(rc,0);self.assertEqual([a['name'] for a in r['artifacts']],['result.json'])
+        self.assertTrue(r['artifacts'][0]['path'].startswith('.hoh-dev/check/artifacts/'))
+    def test_missing_artifact_fails(self):
+        rc,r,_=self.runcheck('missing-artifact');self.assertNotEqual(rc,0);self.assertEqual(r['missing_artifacts'],['result.json'])
+    def test_cwd_escape_refused(self):rc,r,err=self.runcheck('escape');self.assertEqual(rc,1);self.assertIn('escapes',err)
+    def test_evidence_dir_append_only(self):
+        self.runcheck('ok');
+        with self.assertRaises(SystemExit):self.runcheck('ok')
+    def test_candidate_manifest_immutable(self):
+        out=self.root/'.hoh-dev/cand.json';out.write_text('{}')
+        import candidate as cand
+        with patch.object(cand,'ROOT',self.root),contextlib.redirect_stderr(io.StringIO()):
+            rc=cand.main(['freeze','--spec',str(self.root/'spec.md'),'--environment',str(self.root/'.hoh-dev/environment.json'),'--test-plan',str(self.root/'plan.json'),'--out',str(out)])
+        self.assertEqual(rc,1);self.assertEqual(out.read_text(),'{}')
 
 class PromptRenderer(unittest.TestCase):
     def test_substitution(self):self.assertEqual(render('goal={{GOAL}}',{'GOAL':'中文'}),'goal=中文')

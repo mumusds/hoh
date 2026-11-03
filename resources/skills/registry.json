@@ -1,184 +1,261 @@
 {
   "schema_version": "1.0",
+  "known_phases": [
+    "discover",
+    "specify",
+    "readiness",
+    "plan",
+    "implement",
+    "verify",
+    "review",
+    "repair",
+    "recover",
+    "release",
+    "change"
+  ],
   "skills": [
     {
       "id": "requirements",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "name": "需求澄清",
+      "description": "把意图整理为带稳定ID的REQ与可观察AC；interactive真实问答，headless用假设台账并在关键未知处阻塞。",
       "roles": [
         "commander",
         "cto"
       ],
-      "dependencies": [],
+      "phases": [
+        "discover",
+        "specify",
+        "change"
+      ],
+      "interaction": "mode-aware",
       "entry": "resources/skills/requirements/SKILL.md",
-      "license": "MIT",
+      "dependencies": [],
       "output_contract": "TaskResult",
-      "interaction": "mode-aware"
+      "license": "MIT"
     },
     {
       "id": "decision-map",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "name": "跨会话决策地图",
+      "description": "把相互依赖的未知组织为持久决策DAG，逐项研究/实验/真人决定并落ADR；headless不假扮用户。",
       "roles": [
         "commander",
         "cto"
       ],
+      "phases": [
+        "discover",
+        "specify",
+        "readiness"
+      ],
+      "interaction": "mode-aware",
+      "entry": "resources/skills/decision-map/SKILL.md",
       "dependencies": [
         "requirements"
       ],
-      "entry": "resources/skills/decision-map/SKILL.md",
-      "license": "MIT",
       "output_contract": "TaskResult",
-      "interaction": "mode-aware"
+      "license": "MIT"
     },
     {
       "id": "domain-modeling",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "name": "领域与数据建模",
+      "description": "定义实体身份、生命周期、不变量、事务边界与失败例，并映射到Schema、迁移与契约测试。",
       "roles": [
         "cto",
         "developer"
       ],
+      "phases": [
+        "specify",
+        "implement"
+      ],
+      "interaction": "mode-aware",
+      "entry": "resources/skills/domain-modeling/SKILL.md",
       "dependencies": [
         "requirements"
       ],
-      "entry": "resources/skills/domain-modeling/SKILL.md",
-      "license": "MIT",
       "output_contract": "TaskResult",
-      "interaction": "mode-aware"
+      "license": "MIT"
     },
     {
       "id": "architecture",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "name": "架构设计",
+      "description": "在CONTRACT固定决策内确定模块职责、状态所有者、错误与恢复边界和依赖方向，产出架构文档、ADR与验证计划。",
       "roles": [
         "cto",
         "commander"
       ],
+      "phases": [
+        "specify",
+        "readiness"
+      ],
+      "interaction": "mode-aware",
+      "entry": "resources/skills/architecture/SKILL.md",
       "dependencies": [
         "domain-modeling"
       ],
-      "entry": "resources/skills/architecture/SKILL.md",
-      "license": "MIT",
       "output_contract": "TaskResult",
-      "interaction": "mode-aware"
+      "license": "MIT"
     },
     {
       "id": "task-planning",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "name": "可验证增量规划",
+      "description": "从就绪集中选出一个局部完整、可观察的增量，写成带REQ/AC、范围、预算与证据化完成条件的任务。",
       "roles": [
         "commander"
       ],
+      "phases": [
+        "plan",
+        "repair",
+        "change"
+      ],
+      "interaction": "mode-aware",
+      "entry": "resources/skills/task-planning/SKILL.md",
       "dependencies": [
         "requirements",
         "architecture"
       ],
-      "entry": "resources/skills/task-planning/SKILL.md",
-      "license": "MIT",
       "output_contract": "TaskResult",
-      "interaction": "mode-aware"
+      "license": "MIT"
     },
     {
       "id": "tdd",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "name": "测试驱动开发",
+      "description": "红→绿→重构；实际运行失败测试并确认失败原因，保存红灯与绿灯执行记录。",
       "roles": [
         "developer"
       ],
-      "dependencies": [],
+      "phases": [
+        "implement",
+        "repair"
+      ],
+      "interaction": "mode-aware",
       "entry": "resources/skills/tdd/SKILL.md",
-      "license": "MIT",
+      "dependencies": [],
       "output_contract": "TaskResult",
-      "interaction": "mode-aware"
+      "license": "MIT"
     },
     {
       "id": "implementation",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "name": "实现与候选提交",
+      "description": "在写租约内按范围实现、完成静态检查与回归，提交commit、冻结候选并在冻结候选上记录真实自测。",
       "roles": [
         "developer"
       ],
+      "phases": [
+        "implement",
+        "repair"
+      ],
+      "interaction": "mode-aware",
+      "entry": "resources/skills/implementation/SKILL.md",
       "dependencies": [
         "tdd"
       ],
-      "entry": "resources/skills/implementation/SKILL.md",
-      "license": "MIT",
       "output_contract": "TaskResult",
-      "interaction": "mode-aware"
+      "license": "MIT"
     },
     {
       "id": "independent-qa",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "name": "独立质量验收",
+      "description": "针对一个冻结candidate id，先依据spec/AC设计检查再真实执行，逐AC分类并产出独立报告；不修改被测源码。",
       "roles": [
         "qa"
       ],
-      "dependencies": [],
+      "phases": [
+        "verify",
+        "release"
+      ],
+      "interaction": "mode-aware",
       "entry": "resources/skills/independent-qa/SKILL.md",
-      "license": "MIT",
+      "dependencies": [],
       "output_contract": "TaskResult",
-      "interaction": "mode-aware"
+      "license": "MIT"
     },
     {
       "id": "code-review",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "name": "独立代码审查",
+      "description": "在独立会话中审查一个冻结candidate id的diff，覆盖正确性、可靠性与测试真实性；不修改源码。",
       "roles": [
         "reviewer"
       ],
-      "dependencies": [],
+      "phases": [
+        "review",
+        "readiness",
+        "release"
+      ],
+      "interaction": "mode-aware",
       "entry": "resources/skills/code-review/SKILL.md",
-      "license": "MIT",
+      "dependencies": [],
       "output_contract": "TaskResult",
-      "interaction": "mode-aware"
+      "license": "MIT"
     },
     {
       "id": "recovery",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "name": "故障诊断与恢复",
+      "description": "先保全证据并核对外部效果，再在resume/retry/repair/rollback/BLOCKED中选择并追加留痕。",
       "roles": [
         "commander",
         "developer"
       ],
-      "dependencies": [],
+      "phases": [
+        "recover",
+        "repair"
+      ],
+      "interaction": "mode-aware",
       "entry": "resources/skills/recovery/SKILL.md",
-      "license": "MIT",
+      "dependencies": [],
       "output_contract": "TaskResult",
-      "interaction": "mode-aware"
+      "license": "MIT"
     },
     {
       "id": "ux-validation",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "name": "交互与使用体验验证",
+      "description": "把用户旅程写成可执行交互断言，并用真实PTY/浏览器在宽度、宽字符、键盘、断线矩阵上验证；先断言后截图。",
       "roles": [
         "qa",
         "cto"
       ],
-      "dependencies": [],
+      "phases": [
+        "specify",
+        "verify",
+        "release"
+      ],
+      "interaction": "mode-aware",
       "entry": "resources/skills/ux-validation/SKILL.md",
-      "license": "MIT",
+      "dependencies": [],
       "output_contract": "TaskResult",
-      "interaction": "mode-aware"
+      "license": "MIT"
     },
     {
       "id": "release",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "name": "完整交付",
+      "description": "按发布profile逐项核对REQ/AC、必需检查、独立报告与交付物，运行release_gate并原样采用其结论（含COMPLETED_DEGRADED、INTERIM_RELEASED）。",
       "roles": [
         "commander",
         "qa",
         "reviewer"
       ],
+      "phases": [
+        "release"
+      ],
+      "interaction": "mode-aware",
+      "entry": "resources/skills/release/SKILL.md",
       "dependencies": [
         "independent-qa",
         "code-review",
         "ux-validation"
       ],
-      "entry": "resources/skills/release/SKILL.md",
-      "license": "MIT",
       "output_contract": "TaskResult",
-      "interaction": "mode-aware"
+      "license": "MIT"
     }
   ]
 }

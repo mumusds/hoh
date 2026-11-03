@@ -27,7 +27,7 @@ Pause请求立即持久并阻止后续派发，等待当前安全点；Cancel优
 
 ## 外部服务
 
-网络5xx/429使用持久next_retry和jitter；鉴权缺失直接BLOCKED_AUTH；上下文溢出可原生compact后恢复但不得重新生成同副作用；CLI不兼容BLOCKED_CAPABILITY。重启不清retry计数或预算。工程deadline到达输出INCOMPLETE保留余项。
+网络5xx/429使用持久next_retry和jitter；鉴权缺失直接BLOCKED_AUTH；上下文溢出可原生compact后恢复但不得重新生成同副作用；CLI不兼容BLOCKED_CAPABILITY（错误码CAPABILITY_UNSUPPORTED）。重启不清retry计数或预算。工程deadline到达输出INCOMPLETE保留余项。
 
 ## 数据与磁盘
 

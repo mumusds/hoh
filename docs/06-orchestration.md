@@ -44,4 +44,4 @@ Readiness决定是否有足够规格；Candidate Gate决定当前增量是否验
 
 ## 本产品的自举开发
 
-HoH尚不存在时，使用外部Codex原生会话当Commander，按本包任务板调用Claude/Pi桥完成小步开发。先做运行底座，不搭额外无限Python循环。达到M2之后才把局部工作迁入新HoH并保留外部监督/回滚路径；不能让未经测试的新harness自行签收自己。
+HoH尚不存在时（M0–M2），使用一个外部主开发会话（默认Claude）按本包任务板小步开发，并经单次原生桥派发独立Review会话（默认Codex）；v0.1发布时QA与Review为两个不同的独立会话（CR-001）。先做运行底座，不搭额外无限Python循环。达到M2之后才接入Codex指挥与Pi QA，把局部工作迁入新HoH，并保留外部监督/回滚路径；不能让未经测试的新harness自行签收自己。

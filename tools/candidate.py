@@ -25,8 +25,9 @@ def verify(root:Path,data:dict)->None:
     refs=data['source_files'];mapped={r['path']:r for r in refs}
     if len(mapped)!=len(refs) or set(names)!=set(mapped):raise ValueError('candidate source inventory mismatch')
     for r in refs+[data[k] for k in ['spec','environment','test_plan']]:
+        if (root/r['path']).is_symlink():raise ValueError('candidate artifact is a symlink: '+r['path'])  # check before resolving
         p=safe_path(root,r['path'])
-        if not p.is_file() or p.is_symlink() or sha256(p)!=r['sha256']:raise ValueError('candidate artifact changed: '+r['path'])
+        if not p.is_file() or sha256(p)!=r['sha256']:raise ValueError('candidate artifact changed: '+r['path'])
     for key in ['spec','environment','test_plan']:
         if data[key]['sha256']!=data[key+'_sha256']:raise ValueError('candidate '+key+' hash mismatch')
 
@@ -40,7 +41,10 @@ def freeze(root:Path,spec:Path,environment:Path,test_plan:Path)->dict:
         files.append(ref_for(p,root))
     if not files:raise ValueError('empty candidate source inventory')
     data={'schema_version':'1.0','git_commit':git(root,'rev-parse','HEAD'),'git_tree':git(root,'rev-parse','HEAD^{tree}'),'source_files':sorted(files,key=lambda x:x['path'])}
+    rel_plan=str(test_plan.resolve().relative_to(root.resolve())) if test_plan.resolve().is_relative_to(root.resolve()) else None
+    if rel_plan not in names:raise ValueError('test plan must be a committed file of the candidate so its commands are reviewed in Git')
     for k,p in [('spec',spec),('environment',environment),('test_plan',test_plan)]:
+        if p.is_symlink():raise ValueError(k+' must be a regular file, not a symlink')
         r=ref_for(p,root);data[k]=r;data[k+'_sha256']=r['sha256']
     data['candidate_id']=identity(data);verify(root,data);return data
 
@@ -55,7 +59,10 @@ def main(argv=None):
             out=a.out.resolve()
             if not out.is_relative_to(ROOT/'.hoh-dev'):raise ValueError('candidate metadata must be under ignored .hoh-dev/')
             if out.exists():raise ValueError('candidate manifest is immutable; choose a new output')
-            data=freeze(ROOT,a.spec.resolve(),a.environment.resolve(),a.test_plan.resolve());atomic_json(out,data);print(json.dumps(ref_for(out),ensure_ascii=False))
+            data=freeze(ROOT,a.spec.absolute(),a.environment.absolute(),a.test_plan.absolute())
+            try:atomic_json(out,data,exclusive=True)
+            except FileExistsError:raise ValueError('candidate manifest is immutable; choose a new output') from None
+            print(json.dumps(ref_for(out),ensure_ascii=False))
     except (ValueError,OSError,KeyError,subprocess.SubprocessError) as exc:print(str(exc),file=sys.stderr);return 1
     return 0
 if __name__=='__main__':sys.exit(main())

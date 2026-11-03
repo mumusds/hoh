@@ -34,8 +34,8 @@ Workspace看统一进展与Commander决策；Team按需分屏；选中Agent进�
 
 ## 异常解释
 
-BLOCKED_AUTH：需要原生登录；CAPABILITY_UNSUPPORTED：当前版本不支持所需接口；WAITING_EXTERNAL：已保存next_retry；INVALID_EVIDENCE：版本或文件已变；INCOMPLETE：剩余需求/预算不满足。状态不是“AI坏了”的泛化报错；每项提供诊断和恢复动作。
+BLOCKED_AUTH：需要原生登录；BLOCKED_CAPABILITY：当前版本不支持所需接口（对应错误码 CAPABILITY_UNSUPPORTED，API 返回 422）；WAITING_EXTERNAL：已保存next_retry；INVALID_EVIDENCE：版本或文件已变；INCOMPLETE：剩余需求/预算不满足。状态不是“AI坏了”的泛化报错；每项提供诊断和恢复动作。
 
 ## 最终报告
 
-包含产物版本、已验收范围、未解决事项、测试真实/模拟/未运行分类、费用实际/估算/未知、部署与回滚步骤。不能只给一句完成。模型退出与HoH完成分别显示。
+包含产物版本、发布状态（COMPLETED / COMPLETED_DEGRADED 及降级清单 / INTERIM_RELEASED / INCOMPLETE / BLOCKED）、已验收范围、未解决事项、测试真实/模拟/未运行分类、费用实际/估算/未知、部署与回滚步骤。不能只给一句完成。模型退出与HoH完成分别显示。

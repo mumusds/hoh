@@ -1,635 +1,3627 @@
 {
-  "schema_version": "1.0",
-  "scenarios": [
-    {
-      "id": "TEST-001",
-      "requirement_id": "REQ-001",
-      "acceptance_id": "AC-001",
-      "setup": "在有 TTY 的目录执行 hoh",
-      "assertion": "进入 Workspace，保留输入历史与工程状态，不新增任务直到用户提交意图",
-      "method": "PTY 启动、退出、恢复终端属性",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-002",
-      "requirement_id": "REQ-002",
-      "acceptance_id": "AC-002",
-      "setup": "执行 hoh -p 和明确目标",
-      "assertion": "只执行这一输入，stdin 无人值守不弹问卷；缺关键决策进入 BLOCKED",
-      "method": "子进程 stdin 关闭下跑 mock project",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-003",
-      "requirement_id": "REQ-003",
-      "acceptance_id": "AC-003",
-      "setup": "查看 --help 与所有子命令",
-      "assertion": "只有 attach/web/doctor 加内置 help；plan/mode/run 子命令返回 usage error",
-      "method": "CLI help golden snapshot",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-004",
-      "requirement_id": "REQ-004",
-      "acceptance_id": "AC-004",
-      "setup": "选择 text/json/stream-json",
-      "assertion": "stdout 仅对应结果；stderr 诊断；stream-json 每条含序号且以 LF 分帧",
-      "method": "并行 stderr 噪声与 Unicode 解析测试",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-005",
-      "requirement_id": "REQ-005",
-      "acceptance_id": "AC-005",
-      "setup": "hoh -p --detach 后退出 Shell，再 attach run_id",
-      "assertion": "后台运行不受客户端关闭影响；同 Run 不重复派发",
-      "method": "PTY HUP 与重连测试",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-006",
-      "requirement_id": "REQ-006",
-      "acceptance_id": "AC-006",
-      "setup": "运行 hoh doctor",
-      "assertion": "逐项输出 installed/protocol/auth_check/unknown；不读取打印密钥，不将版本探测当认证成功",
-      "method": "缺工具、错误版本、缺认证表驱动测试",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-007",
-      "requirement_id": "REQ-007",
-      "acceptance_id": "AC-007",
-      "setup": "在 TUI 用 /plan 或 Shift+Tab",
-      "assertion": "两种入口得到同一 SetMode 行为；Shell 不需要对称子命令",
-      "method": "同 CommandHandler 的集成测试",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-008",
-      "requirement_id": "REQ-008",
-      "acceptance_id": "AC-008",
-      "setup": "进入 Plan 讨论范围并修改决定",
-      "assertion": "产生版本化规格，允许提问，未批准实施不修改产品源码",
-      "method": "交互脚本检查写集只含 docs/spec",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-009",
-      "requirement_id": "REQ-009",
-      "acceptance_id": "AC-009",
-      "setup": "选择 Build 或 Auto 后提交目标",
-      "assertion": "Build 遵守既定规格；Auto 可补规划；缺必需规格均不越过 readiness",
-      "method": "模式状态迁移测试",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-010",
-      "requirement_id": "REQ-010",
-      "acceptance_id": "AC-010",
-      "setup": "多个 Agent 执行任务",
-      "assertion": "统一活动、团队摘要、输入框和 statusline；状态由事件投影产生",
-      "method": "Ratatui TestBackend 与真实 PTY 快照",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-011",
-      "requirement_id": "REQ-011",
-      "acceptance_id": "AC-011",
-      "setup": "窄屏与宽屏切换并选择一个角色",
-      "assertion": "窄屏单列/标签，宽屏可分屏；完整会话按需进入，不强制三滚动窗",
-      "method": "80/120/180列 resize 测试",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-012",
-      "requirement_id": "REQ-012",
-      "acceptance_id": "AC-012",
-      "setup": "打开 Task/Tool/Diff/Test/Evidence 块",
-      "assertion": "展开、复制、搜索、全屏、返回保留滚动锚点；键盘与鼠标可达",
-      "method": "交互序列与大日志延迟测试",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-013",
-      "requirement_id": "REQ-013",
-      "acceptance_id": "AC-013",
-      "setup": "按 Project/Iteration/Agent 筛选",
-      "assertion": "可定位需求、issue、decision、commit 与证据，重放后相同",
-      "method": "断线重放与过滤测试",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-014",
-      "requirement_id": "REQ-014",
-      "acceptance_id": "AC-014",
-      "setup": "收到验收、回归、预算事件",
-      "assertion": "显示 n/m accepted、open/reopened issues；未知成本/上下文显示未知且指明 Agent",
-      "method": "快照数据与计算断言",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-015",
-      "requirement_id": "REQ-015",
-      "acceptance_id": "AC-015",
-      "setup": "输入中文/emoji/多行粘贴并走 SSH/tmux",
-      "assertion": "按显示列宽处理；粘贴不误发送；异常退出恢复 raw/alternate screen",
-      "method": "PTY Unicode、resize、panic teardown",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-016",
-      "requirement_id": "REQ-016",
-      "acceptance_id": "AC-016",
-      "setup": "关闭鼠标/颜色并自定义键位",
-      "assertion": "所有重要操作可键盘执行；不只靠颜色；有冲突检测与恢复默认",
-      "method": "no-color与按键冲突用例",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-017",
-      "requirement_id": "REQ-017",
-      "acceptance_id": "AC-017",
-      "setup": "发送 Ask/Steer/Change/Control 和 @role",
-      "assertion": "Ask 不改任务；steer 有生效边界；CR 改规格；控制可独立于模型执行",
-      "method": "持久化输入队列测试",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-018",
-      "requirement_id": "REQ-018",
-      "acceptance_id": "AC-018",
-      "setup": "初始化或修改角色配置",
-      "assertion": "默认职位绑定正确；角色不等于固定进程；用户可修改模型/职责/回退",
-      "method": "角色配置 schema 与调用断言",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-019",
-      "requirement_id": "REQ-019",
-      "acceptance_id": "AC-019",
-      "setup": "运行中将 Commander 从 Codex 换 Pi",
-      "assertion": "旧 epoch 指令失效；checkpoint 交接含 goal/spec/decisions/issues；原任务不重复",
-      "method": "交接竞态和 stale decision 测试",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-020",
-      "requirement_id": "REQ-020",
-      "acceptance_id": "AC-020",
-      "setup": "某角色首选 Agent 不可用",
-      "assertion": "只使用满足能力的已授权 fallback；独立 QA 不降成开发者自签；否则 BLOCKED",
-      "method": "缺模型/工具/角色场景",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-021",
-      "requirement_id": "REQ-021",
-      "acceptance_id": "AC-021",
-      "setup": "出现阻塞、严重QA失败或停滞",
-      "assertion": "触发带证据的决策；普通token不逐条唤醒；可查监督延迟与决定",
-      "method": "事件聚合、去抖、优先级测试",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-022",
-      "requirement_id": "REQ-022",
-      "acceptance_id": "AC-022",
-      "setup": "Developer 提交候选并交 QA/Review",
-      "assertion": "HCP 消息持久化、去重、收据与完成分开，交接包带版本",
-      "method": "重复/乱序/丢应答/版本错误测试",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-023",
-      "requirement_id": "REQ-023",
-      "acceptance_id": "AC-023",
-      "setup": "开发者请求研究或出现架构争议",
-      "assertion": "局部咨询不绕过全局任务账本；重大决定升级 Commander；讨论有轮数上限",
-      "method": "wait-for环与讨论预算测试",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-024",
-      "requirement_id": "REQ-024",
-      "acceptance_id": "AC-024",
-      "setup": "初始化 Codex App Server",
-      "assertion": "握手、thread/turn/item、终结、取消可复原；exec作为能力降级而非静默等价",
-      "method": "录制样例+真实CLI smoke",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-025",
-      "requirement_id": "REQ-025",
-      "acceptance_id": "AC-025",
-      "setup": "以 stream-json 非交互调用 Claude",
-      "assertion": "独立捕获 stdout/stderr、result/session；有界取消；配置实际可用flags",
-      "method": "录制样例+真实CLI smoke",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-026",
-      "requirement_id": "REQ-026",
-      "acceptance_id": "AC-026",
-      "setup": "Pi RPC prompt/handled/重试/压缩",
-      "assertion": "严格 LF 分帧；完成按实际协议 settled/disposition；持久会话可恢复",
-      "method": "录制样例+真实CLI smoke",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-027",
-      "requirement_id": "REQ-027",
-      "acceptance_id": "AC-027",
-      "setup": "安装不同版本 Agent",
-      "assertion": "从版本/帮助/Schema探测能力；未知event保存；不支持能力明确降级",
-      "method": "老版本/新字段/超大帧测试",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-028",
-      "requirement_id": "REQ-028",
-      "acceptance_id": "AC-028",
-      "setup": "打开有代码测试文档的旧仓库",
-      "assertion": "建立基线，保留脏文件，不重写架构、不强制初始化远程",
-      "method": "Brownfield含未提交修改测试",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-029",
-      "requirement_id": "REQ-029",
-      "acceptance_id": "AC-029",
-      "setup": "创建 lite/standard/full项目规格",
-      "assertion": "产品/需求/功能/UX/架构/开发/测试/验收/部署/使用规范齐全；按规模选用",
-      "method": "所有模板可实例化且无必填残缺",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-030",
-      "requirement_id": "REQ-030",
-      "acceptance_id": "AC-030",
-      "setup": "模糊目标进入规划",
-      "assertion": "记录用户/范围/非目标/决策/开放问题；必要不确定性不伪造用户答案",
-      "method": "互动与无人值守分支测试",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-031",
-      "requirement_id": "REQ-031",
-      "acceptance_id": "AC-031",
-      "setup": "任务准备开始实施",
-      "assertion": "必要 AC 可观察、依赖可达、关键决定确定；仅阻断当前受影响范围",
-      "method": "缺AC/循环依赖/非阻塞未知测试",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-032",
-      "requirement_id": "REQ-032",
-      "acceptance_id": "AC-032",
-      "setup": "需求关联实现和测试",
-      "assertion": "REQ→TASK→candidate→TEST→EVIDENCE→acceptance 可双向查找",
-      "method": "断链与孤立验收检测",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-033",
-      "requirement_id": "REQ-033",
-      "acceptance_id": "AC-033",
-      "setup": "用户新增/修改已验收功能",
-      "assertion": "生成 CR、revision、影响闭包；受影响验收过期，不静默沿用旧PASS",
-      "method": "修改需求后门禁拒绝旧证据",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-034",
-      "requirement_id": "REQ-034",
-      "acceptance_id": "AC-034",
-      "setup": "用户编辑 Git 中规格",
-      "assertion": "文件是语义事实源，DB是索引/状态；冲突可检测；生成页不产生第二权威源",
-      "method": "并发编辑与哈希冲突测试",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-035",
-      "requirement_id": "REQ-035",
-      "acceptance_id": "AC-035",
-      "setup": "Commander 发布计划/派发提议",
-      "assertion": "Runtime校验依赖、epoch、预算、角色和前置版本后执行；拒绝非法迁移",
-      "method": "模型输出非法转移测试",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-036",
-      "requirement_id": "REQ-036",
-      "acceptance_id": "AC-036",
-      "setup": "run跨阶段执行",
-      "assertion": "Run/Task/Attempt/Session独立标识；每次迁移原子提交事件与投递意图",
-      "method": "每个事务边界crash-injection",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-037",
-      "requirement_id": "REQ-037",
-      "acceptance_id": "AC-037",
-      "setup": "开发完成candidate后并发QA/Review",
-      "assertion": "同工作区只一个写者；读验证绑定相同candidate；不边修边验",
-      "method": "写租约、同SHA并行barrier测试",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-038",
-      "requirement_id": "REQ-038",
-      "acceptance_id": "AC-038",
-      "setup": "多个ready任务及严重回归",
-      "assertion": "依赖优先、硬故障优先、老化防饥饿；同输入同策略有稳定排序",
-      "method": "拓扑/预算/优先级属性测试",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-039",
-      "requirement_id": "REQ-039",
-      "acceptance_id": "AC-039",
-      "setup": "跨会话或跨角色交接",
-      "assertion": "四层上下文有预算和引用；不全量复制；关键goal/spec/AC永不被裁掉",
-      "method": "上下文装箱与污染检查",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-040",
-      "requirement_id": "REQ-040",
-      "acceptance_id": "AC-040",
-      "setup": "连续无净进展或修复循环",
-      "assertion": "按问题指纹/状态变化而非commit计数诊断，升级/研究/改计划",
-      "method": "重复修复和只改文档案例",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-041",
-      "requirement_id": "REQ-041",
-      "acceptance_id": "AC-041",
-      "setup": "进程kill/断网/VM重启",
-      "assertion": "先reconcile再重试；unknown side effect不盲重放；stale lease被fence",
-      "method": "lost ACK/kill -9/reboot测试",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-042",
-      "requirement_id": "REQ-042",
-      "acceptance_id": "AC-042",
-      "setup": "资源不足/服务429/超时",
-      "assertion": "有界退避、持久next_retry；未知价格不假算；不足时INCOMPLETE/BLOCKED",
-      "method": "时钟驱动与重启不清预算测试",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-043",
-      "requirement_id": "REQ-043",
-      "acceptance_id": "AC-043",
-      "setup": "暂停、取消、detach",
-      "assertion": "pause在边界生效；cancel终止进程树并留工作；detach仅断客户端",
-      "method": "TTY HUP/SIGTERM/进程树测试",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-044",
-      "requirement_id": "REQ-044",
-      "acceptance_id": "AC-044",
-      "setup": "候选严重回归或用户目录有变更",
-      "assertion": "保存失败分支，回到已验证基线；不reset用户未提交改动",
-      "method": "Git worktree与hash验证",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-045",
-      "requirement_id": "REQ-045",
-      "acceptance_id": "AC-045",
-      "setup": "修改role/project/task/evidence来源",
-      "assertion": "合成并记录版本/内容hash；高层覆盖不改变事实证据；过长报错",
-      "method": "冲突、预算和missing variable测试",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-046",
-      "requirement_id": "REQ-046",
-      "acceptance_id": "AC-046",
-      "setup": "进入需求/实现/TDD/QA/review/release",
-      "assertion": "内置可用无需用户手装；只加载相关技能；原生Skill不可用时内容注入",
-      "method": "无外部skill安装的端到端测试",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-047",
-      "requirement_id": "REQ-047",
-      "acceptance_id": "AC-047",
-      "setup": "用户覆盖Prompt/Skill/模板后升级",
-      "assertion": "内置/global/project/run按序；显示diff；运行锁定旧版本直到checkpoint",
-      "method": "覆盖与升级迁移测试",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-048",
-      "requirement_id": "REQ-048",
-      "acceptance_id": "AC-048",
-      "setup": "长Pi会话压缩",
-      "assertion": "使用指定作者插件，保留任务/证据引用；自动压缩后继续；长期记忆不双开",
-      "method": "真实插件压缩+恢复测试",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-049",
-      "requirement_id": "REQ-049",
-      "acceptance_id": "AC-049",
-      "setup": "Pi学习经验与下轮召回",
-      "assertion": "经验标记来源/项目/失效条件；关键验收不靠召回；并发维护可恢复",
-      "method": "失败经验、跨项目隔离、锁冲突",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-050",
-      "requirement_id": "REQ-050",
-      "acceptance_id": "AC-050",
-      "setup": "Pi把任务拆成子todo并压缩恢复",
-      "assertion": "保持会话todo；可映射展示；todo完成不代表全局任务验收",
-      "method": "reload/compact/新会话作用域",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-051",
-      "requirement_id": "REQ-051",
-      "acceptance_id": "AC-051",
-      "setup": "干净环境自动准备默认插件组合",
-      "assertion": "解析固定版本、校验依赖、无手动Skill安装；不支持RPC UI有明确降级",
-      "method": "无UI/双compact hook/安装失败测试",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-052",
-      "requirement_id": "REQ-052",
-      "acceptance_id": "AC-052",
-      "setup": "提交实现并运行检查",
-      "assertion": "commit/tree/spec/env/测试计划摘要绑定；测试前后源变更则INVALID",
-      "method": "QA误写候选使验证失效",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-053",
-      "requirement_id": "REQ-053",
-      "acceptance_id": "AC-053",
-      "setup": "开发者自称完成但存在需求缺口",
-      "assertion": "QA从AC出发黑白盒验证；FAILED/UNKNOWN不可变PASS",
-      "method": "刻意漏功能fixture",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-054",
-      "requirement_id": "REQ-054",
-      "acceptance_id": "AC-054",
-      "setup": "审查正在候选的代码",
-      "assertion": "与Commander/Developer不同session；证据绑定candidate；审查意见可追踪",
-      "method": "审查旧SHA/角色冲突测试",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-055",
-      "requirement_id": "REQ-055",
-      "acceptance_id": "AC-055",
-      "setup": "修复一处导致旧功能失败或重试才过",
-      "assertion": "打开regression issue；保留所有attempt；flaky不被覆盖成纯PASS",
-      "method": "回归植入与重试证据测试",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-056",
-      "requirement_id": "REQ-056",
-      "acceptance_id": "AC-056",
-      "setup": "请求COMPLETED或合并发布",
-      "assertion": "所有required需求与检查有同版本有效证据；空集合、skip、mock不能冒充真实",
-      "method": "negative release-gate测试",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-057",
-      "requirement_id": "REQ-057",
-      "acceptance_id": "AC-057",
-      "setup": "目标为CLI/Web或服务",
-      "assertion": "执行PTY/浏览器/安装/升级/回滚实际流程；不是截图看起来不错就通过",
-      "method": "fresh VM部署验收",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-058",
-      "requirement_id": "REQ-058",
-      "acceptance_id": "AC-058",
-      "setup": "hoh web启动并连接现有run",
-      "assertion": "同一Engine，不启动第二任务循环；可查看规格/团队/时间线/证据",
-      "method": "浏览器与TUI同状态测试",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-059",
-      "requirement_id": "REQ-059",
-      "acceptance_id": "AC-059",
-      "setup": "SSE断线重连带cursor",
-      "assertion": "序号去重、replay/live交接无遗漏；过期cursor走snapshot resync",
-      "method": "disconnect/history retention测试",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-060",
-      "requirement_id": "REQ-060",
-      "acceptance_id": "AC-060",
-      "setup": "TUI/Web同时改模式/规格",
-      "assertion": "expected_revision校验；冲突明确；只有一写者，可读多个客户端",
-      "method": "并发409与重试幂等测试",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-061",
-      "requirement_id": "REQ-061",
-      "acceptance_id": "AC-061",
-      "setup": "键盘浏览/小视口/SSH端口转发",
-      "assertion": "核心功能可用；默认loopback；没有桌面环境也可访问",
-      "method": "Playwright功能+可达性",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-062",
-      "requirement_id": "REQ-062",
-      "acceptance_id": "AC-062",
-      "setup": "SQLite WAL写入事件/任务/outbox",
-      "assertion": "单写actor、FK、事务、合理busy_timeout；不把DB置于网络盘",
-      "method": "SQL约束/重复投递测试",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-063",
-      "requirement_id": "REQ-063",
-      "acceptance_id": "AC-063",
-      "setup": "活跃WAL备份、升级、回滚",
-      "assertion": "一致性备份并校验；新旧schema兼容策略；旧binary不读高版本DB",
-      "method": "backup API restore与migration roundtrip",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-064",
-      "requirement_id": "REQ-064",
-      "acceptance_id": "AC-064",
-      "setup": "百万event与大日志积累",
-      "assertion": "结构化索引+对象文件；分页虚拟列表；日志轮换；引用证据不被清理",
-      "method": "百万事件/磁盘满/慢客户端测试",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-065",
-      "requirement_id": "REQ-065",
-      "acceptance_id": "AC-065",
-      "setup": "本地或有GitHub remote",
-      "assertion": "分支候选、PR/CI可选；merge后重新绑定最终SHA；无remote本地release可验收",
-      "method": "rebase/change-base/无remote用例",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-066",
-      "requirement_id": "REQ-066",
-      "acceptance_id": "AC-066",
-      "setup": "干净Ubuntu安装产物",
-      "assertion": "二进制、内置资源、Web资产版本一致；安装配置命令经实跑",
-      "method": "全新VM安装和卸载保留数据",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-067",
-      "requirement_id": "REQ-067",
-      "acceptance_id": "AC-067",
-      "setup": "72小时受控运行含真实Agent轮次",
-      "assertion": "无未处理崩溃/重复写；服务暂不可用可恢复；至少20个有证据的真实工程轮次",
-      "method": "72h soak + crash/recovery 留原始时间证据",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-068",
-      "requirement_id": "REQ-068",
-      "acceptance_id": "AC-068",
-      "setup": "参考4vCPU/8GiB VM离线回放",
-      "assertion": "idle core RSS≤150MiB(不含Agents/浏览器)，TUI输入p95≤100ms，事件可见p95≤500ms",
-      "method": "至少1000次样本与机器配置",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-069",
-      "requirement_id": "REQ-069",
-      "acceptance_id": "AC-069",
-      "setup": "执行完整验收和最终汇总",
-      "assertion": "明确哪些测试真实、模拟、跳过；未通过绝不称生产完成",
-      "method": "交付报告与原始记录一致性审计",
-      "status": "NOT_RUN"
-    },
-    {
-      "id": "TEST-070",
-      "requirement_id": "REQ-070",
-      "acceptance_id": "AC-070",
-      "setup": "变更Adapter/Prompt/调度策略",
-      "assertion": "锁版本+固定回归任务；每次变更跑对照；不在活跃run自动升级",
-      "method": "升级迁移及基线比较",
-      "status": "NOT_RUN"
-    }
-  ]
+ "schema_version": "1.1",
+ "note": "每条 AC 一个测试场景；check_id 指定哪个 release-policy 检查必须产出它的原始证据（release_gate 强制）。",
+ "scenarios": [
+  {
+   "id": "TEST-001-01",
+   "requirement_id": "REQ-001",
+   "acceptance_id": "AC-001-01",
+   "check_id": "tui-pty",
+   "fixture": "预置 SQLite（2个 run）、FakeAgent host、PTY 120x40 TERM=xterm-256color，vt100 解析器捕获屏幕",
+   "steps": [
+    "记录 `stty -g` 与 DB 各表行数及 runs 快照",
+    "PTY 中启动 `hoh`，等待顶栏出现（测试等待上限10 s，非性能指标）",
+    "空闲5 s，输入 `draft` 不回车，再空闲2 s",
+    "对 hoh 进程发送 SIGTERM 并等待退出",
+    "比较 `stty -g`、DB 行数、runs 快照与 host 进程"
+   ],
+   "pass_criteria": [
+    "退出码=143",
+    "commands、runs、tasks、input_queue 行数与基线相等",
+    "run A state=PAUSED 且 revision=7，run B state=COMPLETED",
+    "SIGTERM 前屏幕快照含项目名、run A 短ID 与 `PAUSED`",
+    "PTY 输出中最后一个 `ESC[?1049h` 之后存在 `ESC[?1049l` 与 `ESC[?25h`",
+    "退出后 `stty -g` 与基线逐字节相同；host 进程 PID 仍存活"
+   ],
+   "observables": [
+    "PTY 原始字节流",
+    "vt100 屏幕快照",
+    "stty -g 前后值",
+    "DB 行数与 runs 行快照",
+    "events 中本时段的 run/task 状态迁移事件（应为0条）",
+    "hoh 退出码与 host PID"
+   ]
+  },
+  {
+   "id": "TEST-001-02",
+   "requirement_id": "REQ-001",
+   "acceptance_id": "AC-001-02",
+   "check_id": "tui-pty",
+   "fixture": "空 Git 仓库、FakeAgent host、PTY 100x30",
+   "steps": [
+    "启动 `hoh`，确认顶栏显示 `AUTO` 后输入 `hello` 并按 Enter",
+    "查询 commands 表",
+    "空编辑器按 Ctrl+C，选择「脱离」，记录退出码",
+    "重新启动 `hoh`，按 Ctrl+R 输入 `hel`，读取编辑器内容",
+    "再次查询 commands 表后脱离"
+   ],
+   "pass_criteria": [
+    "Enter 前 commands 行数=0，Enter 后=1 且 kind=StartRun",
+    "该 StartRun payload.goal 字节等于 `hello`，mode=AUTO，interactive=true",
+    "第一次脱离退出码=0，run 未进入 CANCEL_REQUESTED/CANCELLED",
+    "第二次会话 Ctrl+R 后编辑器文本=`hello`",
+    "第二次会话结束时 commands 行数仍=1"
+   ],
+   "observables": [
+    "PTY 原始字节流与屏幕快照",
+    "commands 表行与 payload_sha256",
+    "输入历史持久文件内容",
+    "两次退出码"
+   ]
+  },
+  {
+   "id": "TEST-001-03",
+   "requirement_id": "REQ-001",
+   "acceptance_id": "AC-001-03",
+   "check_id": "integration",
+   "fixture": "fixture 项目、进程表基线、DB 行数基线",
+   "steps": [
+    "以无 TTY 方式执行 `hoh`",
+    "在 PTY 中执行 stdout 重定向到文件的 `hoh`",
+    "检查退出码、out/err、DB 与进程表"
+   ],
+   "pass_criteria": [
+    "两次退出码均=64",
+    "out 文件大小=0",
+    "err 含字符串 `-p`",
+    "out 与 PTY 输出均不含 `ESC[?1049h`",
+    "DB 各表行数与基线相等，无新 host 进程"
+   ],
+   "observables": [
+    "stdout/stderr 原始文件",
+    "退出码",
+    "DB 行数",
+    "执行前后进程表"
+   ]
+  },
+  {
+   "id": "TEST-002-01",
+   "requirement_id": "REQ-002",
+   "acceptance_id": "AC-002-01",
+   "check_id": "integration",
+   "fixture": "mock Git 项目、FakeAgent 决策脚本、临时 `.hoh/`、无 TTY 子进程",
+   "steps": [
+    "记录 runs/commands 行数基线",
+    "以 stdin=/dev/null 执行命令，测试超时60 s",
+    "解析 stdout，查询 runs、commands、events"
+   ],
+   "pass_criteria": [
+    "退出码=3",
+    "stdout 整体 json.loads 成功，state=BLOCKED，blocked_reason=NEED_DECISION",
+    "runs 新增恰1行，state=BLOCKED",
+    "commands 新增恰1行 kind=StartRun，goal 字节=`实现登录功能`，interactive=false",
+    "events 含该决策问题原文，且无客户端产生的其它命令",
+    "stdout 与 stderr 均不含 `ESC[?1049h`"
+   ],
+   "observables": [
+    "stdout/stderr 原始字节",
+    "退出码",
+    "commands/runs 行与 payload",
+    "该 run 的事件序列"
+   ]
+  },
+  {
+   "id": "TEST-002-02",
+   "requirement_id": "REQ-002",
+   "acceptance_id": "AC-002-02",
+   "check_id": "integration",
+   "fixture": "FakeAgent 默认可决脚本、budget max_iterations=1、PTY 与管道两种 stdin",
+   "steps": [
+    "PTY 方式执行并写入 `y\\n`，等待退出（测试超时60 s）",
+    "管道方式执行，不写入也不关闭 stdin，等待退出",
+    "查询 runs、commands、input_queue、decisions"
+   ],
+   "pass_criteria": [
+    "两次退出码均=4，run state=INCOMPLETE",
+    "PTY 输出不含 `ESC[?1049h`",
+    "所有 commands/input_queue payload 不含由 stdin 写入的 `y`",
+    "每次执行 runs 新增恰1行",
+    "每个 run 的 decisions 至少1行 payload 含 assumption=true 与依据引用",
+    "管道方式未关闭 stdin 仍在超时内退出"
+   ],
+   "observables": [
+    "PTY 原始字节流",
+    "两次退出码",
+    "commands/input_queue/decisions 行",
+    "运行耗时"
+   ]
+  },
+  {
+   "id": "TEST-002-03",
+   "requirement_id": "REQ-002",
+   "acceptance_id": "AC-002-03",
+   "check_id": "integration",
+   "fixture": "预置2个 run 的 SQLite、FakeAgent 答复脚本",
+   "steps": [
+    "逐条执行 argv 表并保存输出与退出码",
+    "每条后查询 runs 行数与 run C 快照",
+    "第6条后查询 commands 与 run K 状态"
+   ],
+   "pass_criteria": [
+    "前5条退出码均=64，stdout 大小=0，stderr 非空",
+    "前5条后 runs 行数不变，run C state=COMPLETED 且 revision=5",
+    "第6条后 runs 行数不变，commands 新增恰1行 kind=SendInput 且 run_id=K",
+    "第6条退出码=4，run K 终态=INCOMPLETE"
+   ],
+   "observables": [
+    "每条 argv 的 stdout/stderr/退出码",
+    "runs 快照",
+    "commands 新增行"
+   ]
+  },
+  {
+   "id": "TEST-003-01",
+   "requirement_id": "REQ-003",
+   "acceptance_id": "AC-003-01",
+   "check_id": "integration",
+   "fixture": "golden 快照文件（随代码评审更新）、临时 HOME/项目目录",
+   "steps": [
+    "逐条执行帮助与版本命令并保存输出",
+    "与 golden 比较 `hoh --help` 输出",
+    "从帮助文本解析子命令与选项列表"
+   ],
+   "pass_criteria": [
+    "6条命令退出码均=0，stderr 大小=0",
+    "`hoh --help` 与 golden 逐字节相等",
+    "子命令集合={attach,web,doctor,help}",
+    "顶层选项集合={-p,--output,--detach,--project,--resume,--help,--version}",
+    "所有帮助输出不含 daemon、plan、mode、run 子命令条目",
+    "项目目录执行前后树 hash 相同"
+   ],
+   "observables": [
+    "各命令 stdout/stderr 原文",
+    "golden diff",
+    "退出码",
+    "目录树 hash"
+   ]
+  },
+  {
+   "id": "TEST-003-02",
+   "requirement_id": "REQ-003",
+   "acceptance_id": "AC-003-02",
+   "check_id": "integration",
+   "fixture": "argv 表驱动、目录树 hash 工具、进程表快照",
+   "steps": [
+    "逐条执行 argv 并保存 stdout/stderr/退出码",
+    "每条后计算项目目录树 hash 并列出 hoh 进程",
+    "检查 `/nonexistent` 是否存在"
+   ],
+   "pass_criteria": [
+    "9条退出码均=64",
+    "9条 stdout 大小均=0，stderr 均含 `usage`",
+    "`plan`、`mode plan` 的 stderr 含 `/plan`",
+    "目录树 hash 与基线相同，不存在 `.hoh/`",
+    "无新增 hoh 进程；`/nonexistent` 不存在"
+   ],
+   "observables": [
+    "每条 argv 的 stdout/stderr/退出码",
+    "目录树 hash",
+    "进程表快照"
+   ]
+  },
+  {
+   "id": "TEST-003-03",
+   "requirement_id": "REQ-003",
+   "acceptance_id": "AC-003-03",
+   "check_id": "integration",
+   "fixture": "预置2个 run 的 SQLite 与运行中的 FakeAgent host",
+   "steps": [
+    "记录两 run 快照与 host 订阅数",
+    "无 TTY 执行 `hoh attach`",
+    "再次读取快照与订阅数"
+   ],
+   "pass_criteria": [
+    "退出码=64",
+    "out 大小=0，err 含两个完整 run_id",
+    "两 run state 与 revision 不变",
+    "host 订阅计数与执行前相等"
+   ],
+   "observables": [
+    "stdout/stderr/退出码",
+    "runs 快照",
+    "host 订阅计数日志"
+   ]
+  },
+  {
+   "id": "TEST-004-01",
+   "requirement_id": "REQ-004",
+   "acceptance_id": "AC-004-01",
+   "check_id": "unit",
+   "fixture": "从 SQL CHECK 解析出的15个 run 状态枚举与5个客户端事件",
+   "steps": [
+    "枚举全部输入调用映射函数",
+    "与期望表逐项比较"
+   ],
+   "pass_criteria": [
+    "11个有码输入与期望值逐项相等",
+    "CREATED、DISCOVERING、SPECIFYING、READY、RUNNING、VERIFYING、PAUSE_REQUESTED、WAITING_EXTERNAL、CANCEL_REQUESTED 返回无退出码",
+    "只有 COMPLETED 映射为0",
+    "所有输入均返回且无 panic"
+   ],
+   "observables": [
+    "测试报告（逐输入的实际值）",
+    "枚举来源 SQL 的 sha256"
+   ]
+  },
+  {
+   "id": "TEST-004-02",
+   "requirement_id": "REQ-004",
+   "acceptance_id": "AC-004-02",
+   "check_id": "integration",
+   "fixture": "FakeAgent Unicode/噪声脚本、protocol.schema.json 校验器、慢速读取器",
+   "steps": [
+    "启动命令，慢速读取 stdout，同时完整收集 stderr",
+    "按 0x0A 字节分帧并逐行 JSON 解析与 schema 校验",
+    "查询 DB 中该 run 的 events.seq 集合并比较"
+   ],
+   "pass_criteria": [
+    "解析失败行数=0，schema 失败行数=0",
+    "seq 严格递增，集合与 DB 完全相等",
+    "stdout 字节中 U+2028 以 `\\u2028` 出现，原始 E2 80 A8 出现0次；解码后文本等于 FakeAgent 原文",
+    "stdout 不含 0x1B 且不含 stderr 噪声标记",
+    "最后一行 kind=run.result、exit_code=4，进程退出码=4"
+   ],
+   "observables": [
+    "stdout 原始字节与 sha256",
+    "stderr 原始字节",
+    "DB events 行",
+    "退出码"
+   ]
+  },
+  {
+   "id": "TEST-004-03",
+   "requirement_id": "REQ-004",
+   "acceptance_id": "AC-004-03",
+   "check_id": "integration",
+   "fixture": "FakeAgent 脚本、stdout 文件重定向、DB 查询钩子",
+   "steps": [
+    "执行 json 模式并解析 stdout",
+    "执行两次 text 模式并扫描 0x1B",
+    "执行 detach 模式，读到 run_id 后立即查询 DB"
+   ],
+   "pass_criteria": [
+    "json stdout 恰1个 JSON 值且尾部仅1个 LF",
+    "json 对象含 run_id、state、exit_code、blocked_reason、spec_revision、accepted、total、last_event_seq",
+    "json exit_code 字段=进程退出码=4",
+    "两次 text stdout 0x1B 出现0次，含 run_id 与 `INCOMPLETE`",
+    "三种前台模式 stderr 含噪声标记而 stdout 不含",
+    "detach 退出码=0、status=ACCEPTED，且 runs 中已存在该 run_id"
+   ],
+   "observables": [
+    "各模式 stdout/stderr 原始字节",
+    "退出码",
+    "detach 时刻 runs 查询结果"
+   ]
+  },
+  {
+   "id": "TEST-004-04",
+   "requirement_id": "REQ-004",
+   "acceptance_id": "AC-004-04",
+   "check_id": "integration",
+   "fixture": "Codex unauthorized 录制样例、长运行 FakeAgent 脚本、运行中的 host",
+   "steps": [
+    "执行第一条命令并解析 stdout",
+    "启动第二条命令，读到至少1行事件后发送 SIGINT",
+    "查询第二个 run 状态与 commands"
+   ],
+   "pass_criteria": [
+    "第一条退出码=3，blocked_reason=BLOCKED_AUTH，state≠COMPLETED",
+    "第二条退出码=130，stderr 含 run_id 与 `hoh attach`",
+    "SIGINT 后5 s 内该 run state=RUNNING，commands 中无 kind=CancelRun",
+    "stderr 不含 `panicked at`"
+   ],
+   "observables": [
+    "两次 stdout/stderr/退出码",
+    "runs 快照",
+    "commands 行"
+   ]
+  },
+  {
+   "id": "TEST-005-01",
+   "requirement_id": "REQ-005",
+   "acceptance_id": "AC-005-01",
+   "check_id": "tui-pty",
+   "fixture": "临时Git仓库+FakeAgent（确定性耗时、调用日志）+隔离XDG_RUNTIME_DIR与HOME",
+   "steps": [
+    "PTY启动bash并执行detach命令，解析stdout JSON，记录退出码与耗时",
+    "记录host的pid、sid、tty及events最大seq=S0",
+    "向PTY前台进程组发送SIGHUP并关闭PTY master",
+    "60 s后检查host存活并读取events最大seq",
+    "新PTY执行 hoh attach <run_id>，保存终端buffer与客户端收到的事件seq",
+    "比较attach前后attempts行数与FakeAgent start调用数"
+   ],
+   "pass_criteria": [
+    "detach退出码=0，耗时≤10 s，stdout恰1个JSON对象，含run_id/command_id/revision且status=ACCEPTED",
+    "HUP后host pid仍存在，ps显示tty='?'且sid≠PTY内shell的sid",
+    "HUP后60 s内events最大seq>S0",
+    "attach收到的事件seq严格递增且覆盖(S0, 当前watermark]",
+    "attach前后每个Task的Attempt行数及FakeAgent start次数完全相同"
+   ],
+   "observables": [
+    "detach命令stdout/stderr/退出码/耗时",
+    "ps -o pid,sid,tty,lstart 输出",
+    "events表(seq,kind,run_id)导出",
+    "attach终端buffer快照",
+    "FakeAgent调用日志"
+   ]
+  },
+  {
+   "id": "TEST-005-02",
+   "requirement_id": "REQ-005",
+   "acceptance_id": "AC-005-02",
+   "check_id": "integration",
+   "fixture": "预置DB（R=PAUSED，host_epoch=N）+FakeAgent+隔离运行目录",
+   "steps": [
+    "确认无host进程与控制socket",
+    "并发启动3个attach客户端，分别保存stdout",
+    "每200 ms采样该项目host进程数",
+    "10 s后断开客户端，读取projects.host_epoch、runs、attempts、outbox"
+   ],
+   "pass_criteria": [
+    "首个ready之后所有采样host进程数=1",
+    "projects.host_epoch=N+1",
+    "3份stdout的seq序列逐项相同且严格递增",
+    "R.state=PAUSED，attempts与outbox行数与开始时相同"
+   ],
+   "observables": [
+    "3个客户端stdout/stderr/退出码",
+    "host进程采样记录",
+    "projects/runs/attempts/outbox前后快照"
+   ]
+  },
+  {
+   "id": "TEST-005-03",
+   "requirement_id": "REQ-005",
+   "acceptance_id": "AC-005-03",
+   "check_id": "integration",
+   "fixture": "预置2个RUNNING Run的DB+FakeAgent",
+   "steps": [
+    "以管道方式执行 hoh attach，记录stdout/stderr/退出码",
+    "以管道方式执行 hoh attach run-does-not-exist",
+    "读取host订阅者计数与runs行数"
+   ],
+   "pass_criteria": [
+    "两次退出码均≠0",
+    "第一次stderr包含R1与R2两个run_id，stdout不含任何事件",
+    "第二次输出的错误code=RUN_NOT_FOUND",
+    "host订阅者数为0，runs行数=2"
+   ],
+   "observables": [
+    "两次命令的stdout/stderr/退出码",
+    "host订阅者计数",
+    "runs表导出"
+   ]
+  },
+  {
+   "id": "TEST-005-04",
+   "requirement_id": "REQ-005",
+   "acceptance_id": "AC-005-04",
+   "check_id": "recovery",
+   "fixture": "Ubuntu测试VM、systemd用户实例、已安装hoh与unit文件、FakeAgent（写完成marker）",
+   "steps": [
+    "启动Run R并在T2运行中detach全部客户端",
+    "记录host pid与systemctl --user show 的NRestarts",
+    "kill -9 host主pid并记录时间t0",
+    "等待新host ready后执行 hoh attach R",
+    "导出events与attempts，提取reconcile相关事件与首个被接受命令的seq"
+   ],
+   "pass_criteria": [
+    "NRestarts增加1，新host pid≠旧pid",
+    "projects.host_epoch增加1",
+    "reconcile完成事件seq小于重启后首个被接受写命令的seq",
+    "T1的Attempt行数不变",
+    "T2新增Attempt≤1，且其创建事件晚于对旧Attempt的「未执行」判定事件",
+    "reconcile开始时刻−t0≤30 s"
+   ],
+   "observables": [
+    "systemctl --user show输出与journalctl片段",
+    "events表导出",
+    "attempts/effects表导出",
+    "kill与reconcile时间戳记录"
+   ]
+  },
+  {
+   "id": "TEST-005-05",
+   "requirement_id": "REQ-005",
+   "acceptance_id": "AC-005-05",
+   "check_id": "integration",
+   "fixture": "test feature编译的host，注入点=StartRun COMMIT失败；FakeAgent",
+   "steps": [
+    "启用注入点后执行detach命令",
+    "读取stdout/stderr/退出码",
+    "查询runs/attempts行数并扫描FakeAgent进程"
+   ],
+   "pass_criteria": [
+    "退出码≠0",
+    "stdout字节数=0",
+    "stderr包含错误code",
+    "runs与attempts行数不变，FakeAgent进程数=0"
+   ],
+   "observables": [
+    "命令stdout/stderr/退出码",
+    "runs/attempts行数前后对比",
+    "进程列表快照"
+   ]
+  },
+  {
+   "id": "TEST-006-01",
+   "requirement_id": "REQ-006",
+   "acceptance_id": "AC-006-01",
+   "check_id": "integration",
+   "fixture": "fake CLI 脚本模板（--version/--help/状态命令可配置）、compat manifest、隔离 HOME 与 PATH",
+   "steps": [
+    "逐行生成 fake 二进制并执行 doctor",
+    "解析 JSON，按 component 取目标项字段",
+    "第5行记录 doctor 总耗时与 fake 进程组残留"
+   ],
+   "pass_criteria": [
+    "5行目标项字段与期望表逐项相等",
+    "退出码序列=[3,3,3,0,0]",
+    "任何行 auth_check 均不为 verified",
+    "第2行 incompatible 项列出具体缺失 flag/方法名",
+    "第4、5行 summary.unverified 含目标 agent",
+    "第5行总耗时≤25 s，挂起的 fake 进程组已被 reap"
+   ],
+   "observables": [
+    "每行 stdout JSON 与 stderr",
+    "退出码",
+    "fake CLI 调用 argv 日志",
+    "耗时与进程表"
+   ]
+  },
+  {
+   "id": "TEST-006-02",
+   "requirement_id": "REQ-006",
+   "acceptance_id": "AC-006-02",
+   "check_id": "integration",
+   "fixture": "canary 环境变量与凭证文件；hash 已登记 PASS manifest 的 fake 二进制，其状态命令不读文件、报已登录并回显 canary；strace",
+   "steps": [
+    "执行两种输出模式并保存全部输出",
+    "列出执行期间 `.hoh/` 与 HOME 下新写文件并 grep canary",
+    "在 strace 日志中搜索两个凭证路径"
+   ],
+   "pass_criteria": [
+    "canary 在 stdout、stderr、新写文件中出现次数=0",
+    "strace 日志中凭证文件路径出现次数=0",
+    "相关 agent auth_check=not_verified",
+    "两次退出码=0"
+   ],
+   "observables": [
+    "stdout/stderr 原始字节",
+    "新写文件清单及 grep 结果",
+    "strace 日志"
+   ]
+  },
+  {
+   "id": "TEST-006-03",
+   "requirement_id": "REQ-006",
+   "acceptance_id": "AC-006-03",
+   "check_id": "adapter-live",
+   "fixture": "真实 CLI、原生登录状态（不由测试提供凭证）、子进程 argv 诊断日志；Pi 未安装时其项记 NOT_RUN",
+   "steps": [
+    "记录 `codex --version`、`claude --version` 原文",
+    "执行默认 doctor，读取诊断中的子进程 argv 列表",
+    "执行 `--live` doctor，读取各 agent attempt 记录"
+   ],
+   "pass_criteria": [
+    "默认模式各项 version 与原生输出相等",
+    "默认模式 auth_check∈{not_verified,missing,unknown}",
+    "默认模式子进程 argv 均属 {--version、--help、子命令 --help、schema 生成、原生状态命令}",
+    "live 模式 verified 项各有 mode=live 的 attempt 记录与原生会话 id",
+    "live 模式任一 agent 未登录时其项=missing 且退出码=3"
+   ],
+   "observables": [
+    "两次 doctor JSON",
+    "子进程 argv 日志",
+    "live attempt 记录与原生 stdout/stderr",
+    "退出码"
+   ]
+  },
+  {
+   "id": "TEST-007-01",
+   "requirement_id": "REQ-007",
+   "acceptance_id": "AC-007-01",
+   "check_id": "tui-pty",
+   "fixture": "待该里程碑 spec 任务细化",
+   "steps": [
+    "同 CommandHandler 的集成测试"
+   ],
+   "pass_criteria": [
+    "两种入口得到同一 SetMode 行为；Shell 不需要对称子命令"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  },
+  {
+   "id": "TEST-008-01",
+   "requirement_id": "REQ-008",
+   "acceptance_id": "AC-008-01",
+   "check_id": "tui-pty",
+   "fixture": "待该里程碑 spec 任务细化",
+   "steps": [
+    "交互脚本检查写集只含 docs/spec"
+   ],
+   "pass_criteria": [
+    "产生版本化规格，允许提问，未批准实施不修改产品源码"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  },
+  {
+   "id": "TEST-009-01",
+   "requirement_id": "REQ-009",
+   "acceptance_id": "AC-009-01",
+   "check_id": "integration",
+   "fixture": "待该里程碑 spec 任务细化",
+   "steps": [
+    "模式状态迁移测试"
+   ],
+   "pass_criteria": [
+    "Build 遵守既定规格；Auto 可补规划；缺必需规格均不越过 readiness"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  },
+  {
+   "id": "TEST-010-01",
+   "requirement_id": "REQ-010",
+   "acceptance_id": "AC-010-01",
+   "check_id": "tui-pty",
+   "fixture": "待该里程碑 spec 任务细化",
+   "steps": [
+    "Ratatui TestBackend 与真实 PTY 快照"
+   ],
+   "pass_criteria": [
+    "统一活动、团队摘要、输入框和 statusline；状态由事件投影产生"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  },
+  {
+   "id": "TEST-011-01",
+   "requirement_id": "REQ-011",
+   "acceptance_id": "AC-011-01",
+   "check_id": "tui-pty",
+   "fixture": "待该里程碑 spec 任务细化",
+   "steps": [
+    "80/120/180列 resize 测试"
+   ],
+   "pass_criteria": [
+    "窄屏单列/标签，宽屏可分屏；完整会话按需进入，不强制三滚动窗"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  },
+  {
+   "id": "TEST-012-01",
+   "requirement_id": "REQ-012",
+   "acceptance_id": "AC-012-01",
+   "check_id": "tui-pty",
+   "fixture": "待该里程碑 spec 任务细化",
+   "steps": [
+    "交互序列与大日志延迟测试"
+   ],
+   "pass_criteria": [
+    "展开、复制、搜索、全屏、返回保留滚动锚点；键盘与鼠标可达"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  },
+  {
+   "id": "TEST-013-01",
+   "requirement_id": "REQ-013",
+   "acceptance_id": "AC-013-01",
+   "check_id": "tui-pty",
+   "fixture": "待该里程碑 spec 任务细化",
+   "steps": [
+    "断线重放与过滤测试"
+   ],
+   "pass_criteria": [
+    "可定位需求、issue、decision、commit 与证据，重放后相同"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  },
+  {
+   "id": "TEST-014-01",
+   "requirement_id": "REQ-014",
+   "acceptance_id": "AC-014-01",
+   "check_id": "tui-pty",
+   "fixture": "待该里程碑 spec 任务细化",
+   "steps": [
+    "快照数据与计算断言"
+   ],
+   "pass_criteria": [
+    "显示 n/m accepted、open/reopened issues；未知成本/上下文显示未知且指明 Agent"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  },
+  {
+   "id": "TEST-015-01",
+   "requirement_id": "REQ-015",
+   "acceptance_id": "AC-015-01",
+   "check_id": "tui-pty",
+   "fixture": "待该里程碑 spec 任务细化",
+   "steps": [
+    "PTY Unicode、resize、panic teardown"
+   ],
+   "pass_criteria": [
+    "按显示列宽处理；粘贴不误发送；异常退出恢复 raw/alternate screen"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  },
+  {
+   "id": "TEST-016-01",
+   "requirement_id": "REQ-016",
+   "acceptance_id": "AC-016-01",
+   "check_id": "tui-pty",
+   "fixture": "待该里程碑 spec 任务细化",
+   "steps": [
+    "no-color与按键冲突用例"
+   ],
+   "pass_criteria": [
+    "所有重要操作可键盘执行；不只靠颜色；有冲突检测与恢复默认"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  },
+  {
+   "id": "TEST-017-01",
+   "requirement_id": "REQ-017",
+   "acceptance_id": "AC-017-01",
+   "check_id": "integration",
+   "fixture": "待该里程碑 spec 任务细化",
+   "steps": [
+    "持久化输入队列测试"
+   ],
+   "pass_criteria": [
+    "Ask 不改任务；steer 有生效边界；CR 改规格；控制可独立于模型执行"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  },
+  {
+   "id": "TEST-018-01",
+   "requirement_id": "REQ-018",
+   "acceptance_id": "AC-018-01",
+   "check_id": "unit",
+   "fixture": "仓库内 config/hoh.example.toml 原文件（记录 sha256）；空临时目录",
+   "steps": [
+    "以无配置路径调用配置加载，得到 A",
+    "以 config/hoh.example.toml 调用配置加载，得到 B",
+    "把 A、B 与期望表逐字段比较"
+   ],
+   "pass_criteria": [
+    "A==B",
+    "team.<role>.agent 六项与期望表完全一致",
+    "execution/supervision/budget 的 6 个字段与 example 一致",
+    "有效配置中不存在任何 USD 预算默认值字段"
+   ],
+   "observables": [
+    "A、B 的有效配置 JSON 导出",
+    "example 文件 sha256",
+    "测试 stdout/退出码"
+   ]
+  },
+  {
+   "id": "TEST-018-02",
+   "requirement_id": "REQ-018",
+   "acceptance_id": "AC-018-02",
+   "check_id": "integration",
+   "fixture": "SQLite 临时库、FakeAgent(claude/codex)、FakeClock、FakeGit 单任务 run",
+   "steps": [
+    "启动 host，派发 developer 任务得到 A1(RUNNING)",
+    "POST /v1/commands 提交 ConfigureTeam",
+    "在 A1 运行中读取 GetSnapshot 中的团队绑定",
+    "让 A1 settle，再派发下一个任务得到 A2"
+   ],
+   "pass_criteria": [
+    "HTTP 202，body.status=ACCEPTED",
+    "A1 运行期间 snapshot 显示 pending 变更，且生效绑定仍为 claude",
+    "绑定生效事件的 seq 大于 A1 结束事件的 seq",
+    "attempts(A2) 记录 role_epoch=2、config revision=r+1、resolved_model=m-test"
+   ],
+   "observables": [
+    "HTTP 请求与响应原文",
+    "按 seq 导出的 events",
+    "attempts/sessions 行",
+    "team 配置 revision 历史"
+   ]
+  },
+  {
+   "id": "TEST-018-03",
+   "requirement_id": "REQ-018",
+   "acceptance_id": "AC-018-03",
+   "check_id": "integration",
+   "fixture": "SQLite 临时库、可记录 spawn 的 FakeAgent(claude)",
+   "steps": [
+    "派发 cto 任务和 developer 任务",
+    "kill developer 的 FakeAgent 进程",
+    "再派发 developer 任务",
+    "查询 sessions、attempts 与 team revision"
+   ],
+   "pass_criteria": [
+    "session_id(cto)≠session_id(developer)",
+    "developer 进程退出前后 team revision 相等",
+    "第三个 attempt 状态为 SETTLED，cto 的 session 行未被修改"
+   ],
+   "observables": [
+    "sessions/attempts 表导出",
+    "FakeAgent spawn 日志",
+    "events 序列"
+   ]
+  },
+  {
+   "id": "TEST-018-04",
+   "requirement_id": "REQ-018",
+   "acceptance_id": "AC-018-04",
+   "check_id": "integration",
+   "fixture": "SQLite 临时库、HTTP 本地 API、FakeAgent 团队",
+   "steps": [
+    "逐条 POST /v1/commands",
+    "每条之后读取 GetSnapshot 与 events"
+   ],
+   "pass_criteria": [
+    "状态码依次为 400,400,400,400,409",
+    "错误体都含 code、message、retryable、current_revision 字段",
+    "team revision 前后相等，role_epoch 集合前后相等",
+    "events 中没有新增的绑定生效事件"
+   ],
+   "observables": [
+    "5 组 HTTP 请求与响应",
+    "提交前后的 snapshot JSON",
+    "events 导出"
+   ]
+  },
+  {
+   "id": "TEST-018-05",
+   "requirement_id": "REQ-018",
+   "acceptance_id": "AC-018-05",
+   "check_id": "integration",
+   "fixture": "临时项目配置文件、覆盖 Prompt 文件、FakeAgent(codex)",
+   "steps": [
+    "加载含自定义职位的配置",
+    "构造并派发 security_reviewer 任务",
+    "读取 attempt 的 prompt 记录"
+   ],
+   "pass_criteria": [
+    "团队列表含 security_reviewer，role_epoch=1",
+    "attempt 的 prompt 来源路径与 sha256 等于覆盖文件",
+    "session_id(security_reviewer)≠session_id(reviewer)"
+   ],
+   "observables": [
+    "有效配置 JSON",
+    "attempt prompt 记录（hash、来源列表）",
+    "sessions 导出"
+   ]
+  },
+  {
+   "id": "TEST-019-01",
+   "requirement_id": "REQ-019",
+   "acceptance_id": "AC-019-01",
+   "check_id": "integration",
+   "fixture": "SQLite 临时库、FakeAgent(codex/pi)、FakeClock、可延迟投递的 FakeTransport",
+   "steps": [
+    "启动 run，让 T 进入 RUNNING",
+    "提交交接命令并推进到 Commander turn 结束",
+    "投递旧 epoch 的 decision",
+    "导出 decisions、tasks、outbox、events"
+   ],
+   "pass_criteria": [
+    "decisions 中该行 state=REJECTED，原因含 stale_epoch",
+    "tasks.T.revision=5",
+    "旧 decision 处理后 outbox 行数不变",
+    "交接生效事件 seq < 旧 decision 拒绝事件 seq"
+   ],
+   "observables": [
+    "events 按 seq 导出",
+    "decisions/tasks/outbox 行快照",
+    "FakeTransport 投递日志"
+   ]
+  },
+  {
+   "id": "TEST-019-02",
+   "requirement_id": "REQ-019",
+   "acceptance_id": "AC-019-02",
+   "check_id": "integration",
+   "fixture": "预置上述行的 SQLite 库、FakeAgent(pi) 捕获输入原文",
+   "steps": [
+    "触发交接并让其生效",
+    "捕获 FakeAgent(pi) 收到的首个输入",
+    "对 ContextHandoff 做 schema 校验并与 DB 比对"
+   ],
+   "pass_criteria": [
+    "schema 校验 0 错误",
+    "决策 ID 集合 == APPLIED 集合",
+    "issue ID 集合 == OPEN∪REOPENED 集合",
+    "待投递 ID 集合 == 未 ACK outbox ∪ QUEUED input_queue",
+    "哨兵串计数=0"
+   ],
+   "observables": [
+    "新 Commander 输入原文与 sha256",
+    "schema 校验输出",
+    "DB 快照"
+   ]
+  },
+  {
+   "id": "TEST-019-03",
+   "requirement_id": "REQ-019",
+   "acceptance_id": "AC-019-03",
+   "check_id": "integration",
+   "fixture": "SQLite 临时库、FakeAgent(codex/pi/claude)",
+   "steps": [
+    "准备 T(RUNNING)、T2(ACCEPTED)、M(ACKED)",
+    "执行交接",
+    "让新 Commander 返回两条 dispatch",
+    "让 T settle 后统计 attempts"
+   ],
+   "pass_criteria": [
+    "count(attempts where task_id=T)=1",
+    "count(attempts where task_id=T2) 与交接前相等",
+    "outbox(M).attempt_count 与交接前相等",
+    "两条 decision 的 state=REJECTED"
+   ],
+   "observables": [
+    "attempts/outbox/decisions 前后快照",
+    "events 导出"
+   ]
+  },
+  {
+   "id": "TEST-019-04",
+   "requirement_id": "REQ-019",
+   "acceptance_id": "AC-019-04",
+   "check_id": "integration",
+   "fixture": "SQLite 单写 actor、HTTP 本地 API、并发客户端 fixture（重复 50 轮）",
+   "steps": [
+    "两个线程同时 POST /v1/commands",
+    "交接生效后读取 snapshot",
+    "重复 50 轮"
+   ],
+   "pass_criteria": [
+    "每轮状态码组合为 {202,409}",
+    "每轮 role_epoch 增量=1",
+    "最终 agent 与 202 请求的 bindings 一致"
+   ],
+   "observables": [
+    "每轮 HTTP 响应",
+    "role_epoch 历史",
+    "events 导出"
+   ]
+  },
+  {
+   "id": "TEST-019-05",
+   "requirement_id": "REQ-019",
+   "acceptance_id": "AC-019-05",
+   "check_id": "recovery",
+   "fixture": "可在指定事务点注入崩溃的 host、FakeAgent、持久 SQLite 文件",
+   "steps": [
+    "在交接事务提交点之后注入 SIGKILL",
+    "重启 host 并记录单调时钟",
+    "让旧 Codex FakeAgent 发送 3 条旧 epoch 消息",
+    "导出 sessions/decisions/outbox"
+   ],
+   "pass_criteria": [
+    "reconcile 完成时间 - 重启时间 ≤30s",
+    "commander role_epoch=2，agent=pi",
+    "新 commander session 数=1",
+    "旧 epoch 拒绝数=3，dispatch outbox 无重复 message_id"
+   ],
+   "observables": [
+    "host 启动/reconcile 日志与时间戳",
+    "DB 快照",
+    "events 导出"
+   ]
+  },
+  {
+   "id": "TEST-020-01",
+   "requirement_id": "REQ-020",
+   "acceptance_id": "AC-020-01",
+   "check_id": "unit",
+   "fixture": "Capabilities 表驱动 fixture（不调用真实 CLI）",
+   "steps": [
+    "构造 probe 结果与授权列表",
+    "调用选择函数 100 次",
+    "收集返回值与拒绝原因"
+   ],
+   "pass_criteria": [
+    "selected=claude（100/100）",
+    "拒绝原因含 X:CAPABILITY_UNSUPPORTED:resume",
+    "codex 未出现在评估列表中",
+    "去重后输出只有 1 种"
+   ],
+   "observables": [
+    "选择函数输入与输出 JSON",
+    "测试 stdout"
+   ]
+  },
+  {
+   "id": "TEST-020-02",
+   "requirement_id": "REQ-020",
+   "acceptance_id": "AC-020-02",
+   "check_id": "integration",
+   "fixture": "SQLite 临时库、FakeAdapter(pi 不可用)、FakeAgent(claude)、已冻结的 candidate fixture",
+   "steps": [
+    "冻结 C",
+    "等待 Runtime 自动派发 QA",
+    "导出 attempts/sessions/events"
+   ],
+   "pass_criteria": [
+    "QA attempt 的 agent=claude",
+    "session_id(QA)≠S_dev",
+    "qa role_epoch=前值+1",
+    "存在含 pi:not_installed 与 probe 引用的事件"
+   ],
+   "observables": [
+    "probe 结果 JSON",
+    "attempts/sessions 导出",
+    "events 导出"
+   ]
+  },
+  {
+   "id": "TEST-020-03",
+   "requirement_id": "REQ-020",
+   "acceptance_id": "AC-020-03",
+   "check_id": "integration",
+   "fixture": "SQLite 临时库、FakeAdapter(pi 缺认证)、FakeAgent(claude developer)",
+   "steps": [
+    "冻结 C",
+    "推进 FakeClock 1 小时",
+    "导出 snapshot/attempts/outbox/acceptance_results"
+   ],
+   "pass_criteria": [
+    "snapshot 中 qa 职位为 BLOCKED，原因 BLOCKED_AUTH",
+    "count(attempts role=qa)=0",
+    "acceptance_results 中 candidate_id=C 且 status=PASS 的行数=0",
+    "T3 的 attempt 数≥1",
+    "count(outbox where recipient_role=qa and next_retry_at IS NOT NULL)=0"
+   ],
+   "observables": [
+    "snapshot JSON",
+    "DB 表导出",
+    "events 导出"
+   ]
+  },
+  {
+   "id": "TEST-020-04",
+   "requirement_id": "REQ-020",
+   "acceptance_id": "AC-020-04",
+   "check_id": "integration",
+   "fixture": "SQLite 临时库、符合 independent-report.schema.json 的伪造自签报告",
+   "steps": [
+    "以 S_dev 身份提交报告",
+    "导出 acceptance_results/candidates 状态与 events"
+   ],
+   "pass_criteria": [
+    "报告处理结果为 rejected",
+    "acceptance_results 行数不变",
+    "candidate 状态≠ACCEPTED"
+   ],
+   "observables": [
+    "提交的报告原文与 sha256",
+    "拒绝事件",
+    "DB 快照"
+   ]
+  },
+  {
+   "id": "TEST-020-05",
+   "requirement_id": "REQ-020",
+   "acceptance_id": "AC-020-05",
+   "check_id": "unit",
+   "fixture": "FakeClock、可返回 503/auth_error 的 FakeAgent",
+   "steps": [
+    "注入 503(Retry-After=30)",
+    "注入 auth_error",
+    "检查重试调度与 fallback 选择"
+   ],
+   "pass_criteria": [
+    "503：状态=WAITING_EXTERNAL，next_retry_at-t=30s，fallback 选中次数=0",
+    "auth：next_retry_at=null，选中 codex，原因含 BLOCKED_AUTH"
+   ],
+   "observables": [
+    "重试调度记录",
+    "fallback 决策记录",
+    "events 导出"
+   ]
+  },
+  {
+   "id": "TEST-021-01",
+   "requirement_id": "REQ-021",
+   "acceptance_id": "AC-021-01",
+   "check_id": "unit",
+   "fixture": "FakeClock、内存事件流 fixture、记录唤醒的 FakeCommander",
+   "steps": [
+    "按 seq 注入全部事件",
+    "推进 FakeClock 3600s",
+    "统计唤醒与 outbox"
+   ],
+   "pass_criteria": [
+    "FakeCommander 唤醒计数=0",
+    "recipient_role=qa 与 reviewer 的 kind=dispatch 消息各 1 条",
+    "decisions 行数增量=0"
+   ],
+   "observables": [
+    "唤醒计数日志",
+    "outbox 导出",
+    "输入事件流 sha256"
+   ]
+  },
+  {
+   "id": "TEST-021-02",
+   "requirement_id": "REQ-021",
+   "acceptance_id": "AC-021-02",
+   "check_id": "unit",
+   "fixture": "FakeClock、事件时间表 fixture、FakeCommander",
+   "steps": [
+    "按时间表注入事件并逐 tick 推进时钟",
+    "记录每个触发器的 dedup 键、event_seqs 与触发时刻"
+   ],
+   "pass_criteria": [
+    "K1 首组：触发时刻=3.0s，len(event_seqs)=3",
+    "K2 与 K3 触发器的 dedup 键互不相同，均不含 K1 事件",
+    "持续流：首个触发时刻-首事件时刻=10.0s，同时刻 K1 未处理触发器≤1",
+    "IntegrityViolation：触发时刻=60.0s（延迟 0 tick）"
+   ],
+   "observables": [
+    "触发器记录 JSON（键、seqs、时刻）",
+    "FakeClock tick 日志"
+   ]
+  },
+  {
+   "id": "TEST-021-03",
+   "requirement_id": "REQ-021",
+   "acceptance_id": "AC-021-03",
+   "check_id": "recovery",
+   "fixture": "持久 SQLite 文件、FakeCommander、可 SIGKILL 的 host 进程",
+   "steps": [
+    "预置事件与触发状态",
+    "SIGKILL host",
+    "重启并等待 reconcile",
+    "统计唤醒与 decisions"
+   ],
+   "pass_criteria": [
+    "重启后唤醒次数=1，该触发器 event_seqs={121..125}",
+    "count(decisions state=APPLIED) 前后相等",
+    "last_handled_seq 单调不减",
+    "reconcile 完成≤30s"
+   ],
+   "observables": [
+    "重启前后 DB 快照",
+    "FakeCommander 输入原文",
+    "host 日志与时间戳"
+   ]
+  },
+  {
+   "id": "TEST-021-04",
+   "requirement_id": "REQ-021",
+   "acceptance_id": "AC-021-04",
+   "check_id": "integration",
+   "fixture": "SQLite 临时库、脚本化 FakeCommander、FakeClock",
+   "steps": [
+    "生成触发器 K",
+    "推进 task 到 revision 8",
+    "投递过期决策，再投递新决策"
+   ],
+   "pass_criteria": [
+    "decision#1.state=REJECTED，原因 stale_revision",
+    "decision#1 处理后 outbox 增量=0",
+    "新触发器数=1，摘要中 revision=8",
+    "decision#2.state=APPLIED"
+   ],
+   "observables": [
+    "decisions/outbox/events 导出",
+    "FakeCommander 两次输入原文"
+   ]
+  },
+  {
+   "id": "TEST-021-05",
+   "requirement_id": "REQ-021",
+   "acceptance_id": "AC-021-05",
+   "check_id": "integration",
+   "fixture": "SQLite 临时库、长时 FakeAgent×3、可下线的 FakeCommander、HTTP API",
+   "steps": [
+    "占满 1 写 2 读槽",
+    "注入 critical issue 并推进时钟",
+    "下线 FakeCommander，注入 need_decision 与 candidate_ready",
+    "调用 GET /v1/events 与 GetSnapshot"
+   ],
+   "pass_criteria": [
+    "唤醒时刻=2.0s",
+    "run.state=BLOCKED，原因含 need_decision",
+    "qa 与 reviewer 的 dispatch 各 1 条",
+    "events 中触发器记录含 dedup 键、event_seqs 与非负的延迟毫秒字段"
+   ],
+   "observables": [
+    "SSE/HTTP 响应原文",
+    "槽位占用日志",
+    "DB 快照"
+   ]
+  },
+  {
+   "id": "TEST-022-01",
+   "requirement_id": "REQ-022",
+   "acceptance_id": "AC-022-01",
+   "check_id": "integration",
+   "fixture": "两个 SQLite 临时库、FakeTransport、预置 task",
+   "steps": [
+    "按组 A 顺序投递并导出状态",
+    "按组 B 顺序投递并导出状态"
+   ],
+   "pass_criteria": [
+    "A：tasks.revision=5，迁移事件数=2，receipts 行数=2",
+    "A：重复投递返回的 result_json 与首次逐字节相同",
+    "B：m2 两次结果都为 rejected，current_revision=3",
+    "B：tasks.revision=4，迁移事件数=1"
+   ],
+   "observables": [
+    "每次投递的请求与应答",
+    "receipts/events/tasks 导出"
+   ]
+  },
+  {
+   "id": "TEST-022-02",
+   "requirement_id": "REQ-022",
+   "acceptance_id": "AC-022-02",
+   "check_id": "integration",
+   "fixture": "SQLite 临时库、HTTP 本地 API",
+   "steps": [
+    "提交 (K,P) 两次",
+    "提交 (K,P')",
+    "导出 commands 与 events"
+   ],
+   "pass_criteria": [
+    "响应 1 与响应 2 的 body 相同",
+    "count(commands where idempotency_key=K)=1",
+    "第三次 HTTP 409，body.code=KEY_REUSE"
+   ],
+   "observables": [
+    "三次 HTTP 请求与响应",
+    "commands.payload_sha256 值",
+    "events 导出"
+   ]
+  },
+  {
+   "id": "TEST-022-03",
+   "requirement_id": "REQ-022",
+   "acceptance_id": "AC-022-03",
+   "check_id": "integration",
+   "fixture": "SQLite 临时库、丢 ACK 的 FakeTransport、FakeClock",
+   "steps": [
+    "派发 m 与 n",
+    "推进时钟至各次重试",
+    "导出 outbox/receipts/tasks/events"
+   ],
+   "pass_criteria": [
+    "receipts(QA,m) 行数=1",
+    "outbox(m).state=ACKED，attempt_count=2，next_retry_at 曾被持久化",
+    "TaskResult 到达前 tasks.state=VERIFYING",
+    "outbox(n).state=DEAD_LETTER，attempt_count=3，存在 dead-letter 事件"
+   ],
+   "observables": [
+    "投递日志（含丢弃点）",
+    "outbox 状态时间序列",
+    "events 导出"
+   ]
+  },
+  {
+   "id": "TEST-022-04",
+   "requirement_id": "REQ-022",
+   "acceptance_id": "AC-022-04",
+   "check_id": "integration",
+   "fixture": "SQLite 临时库、candidate fixture、FakeAgent(developer)",
+   "steps": [
+    "投递 Developer TaskResult",
+    "导出 outbox 中的 handoff 消息",
+    "做 schema 校验并与 candidates 行比对"
+   ],
+   "pass_criteria": [
+    "handoff 消息数=2，接收者集合={qa,reviewer}",
+    "schema 校验 0 错误",
+    "两条消息的 candidate 对象相同，且 id/git_commit/git_tree/spec_sha256/environment_sha256/test_plan_sha256 与 C 行一致",
+    "两条 handoff ACK 后 task.state≠ACCEPTED"
+   ],
+   "observables": [
+    "handoff 消息 JSON 原文",
+    "schema 校验输出",
+    "candidates 行"
+   ]
+  },
+  {
+   "id": "TEST-022-05",
+   "requirement_id": "REQ-022",
+   "acceptance_id": "AC-022-05",
+   "check_id": "integration",
+   "fixture": "SQLite 临时库、预置 S2/C2/epoch=2 状态",
+   "steps": [
+    "依次投递 4 条消息",
+    "导出 tasks/acceptance_results/events"
+   ],
+   "pass_criteria": [
+    "4 条消息的处理结果都不是 applied",
+    "tasks.revision 前后相等",
+    "acceptance_results 行数前后相等",
+    "拒绝事件数=4"
+   ],
+   "observables": [
+    "4 条消息原文与应答",
+    "DB 快照",
+    "events 导出"
+   ]
+  },
+  {
+   "id": "TEST-023-01",
+   "requirement_id": "REQ-023",
+   "acceptance_id": "AC-023-01",
+   "check_id": "integration",
+   "fixture": "待该里程碑 spec 任务细化",
+   "steps": [
+    "wait-for环与讨论预算测试"
+   ],
+   "pass_criteria": [
+    "局部咨询不绕过全局任务账本；重大决定升级 Commander；讨论有轮数上限"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  },
+  {
+   "id": "TEST-024-01",
+   "requirement_id": "REQ-024",
+   "acceptance_id": "AC-024-01",
+   "check_id": "integration",
+   "fixture": "录制 fixture（来源版本与 sha256 登记于 compat manifest）、记录收包顺序的 fake app-server",
+   "steps": [
+    "启动适配器并发起一轮",
+    "读取 fake 端收包日志与适配器事件",
+    "查询 attempts、sessions 行"
+   ],
+   "pass_criteria": [
+    "收包 method 序列前4项=[initialize,initialized,thread/start,turn/start]，initialized 晚于 initialize 响应",
+    "attempt state=SETTLED",
+    "HoH item 事件数=fixture 中 item/started+item/completed 数，均带 threadId/turnId/itemId",
+    "sessions.native_id=回放 threadId，resolved model=回放 model",
+    "原始 stdout 日志 sha256=fake 发送字节 sha256；adapter.unknown_event 恰1条"
+   ],
+   "observables": [
+    "fake 端收包日志",
+    "适配器原始 stdout/stderr 日志",
+    "HoH 事件序列",
+    "attempts/sessions 行"
+   ]
+  },
+  {
+   "id": "TEST-024-02",
+   "requirement_id": "REQ-024",
+   "acceptance_id": "AC-024-02",
+   "check_id": "integration",
+   "fixture": "interrupted/failed/EOF/resume 四份录制 fixture",
+   "steps": [
+    "逐份回放并按要求调用 cancel 或等待",
+    "对 (a) 调用 resume 并读取收包日志",
+    "查询 attempts、事件与重试记录"
+   ],
+   "pass_criteria": [
+    "(a) 收包含 turn/interrupt 且参数与活动 threadId/turnId 相等；attempt=CANCELLED",
+    "(b) attempt=FAILED，事件 blocked_reason=BLOCKED_AUTH，next_retry 为空",
+    "(c) attempt≠SETTLED",
+    "resume 收包含 thread/resume，threadId 与原 session 相同",
+    "三份均无 panic，进程组均已 reap"
+   ],
+   "observables": [
+    "fake 收包日志",
+    "attempts 状态与 turn.error 原文",
+    "事件序列",
+    "进程表"
+   ]
+  },
+  {
+   "id": "TEST-024-03",
+   "requirement_id": "REQ-024",
+   "acceptance_id": "AC-024-03",
+   "check_id": "integration",
+   "fixture": "三种 fake codex help 文本、带活动 turn 的 App Server fixture",
+   "steps": [
+    "启动降级 attempt，记录 argv 与 capabilities",
+    "发起 steer，查询 input_queue",
+    "在 App Server fixture 发送过期 steer",
+    "对缺 flag 版本启动 attempt"
+   ],
+   "pass_criteria": [
+    "降级 argv[0..3]=[codex,exec,--json]，含已探测的 YOLO flag",
+    "sessions.capabilities_json.mid_turn_steer=false，adapter.degraded 事件1条",
+    "降级 steer 返回 CAPABILITY_UNSUPPORTED，input_queue 该行 state=QUEUED",
+    "过期 steer 对应 input_queue state=REJECTED",
+    "缺 flag 版本无子进程启动，原因=BLOCKED_CAPABILITY"
+   ],
+   "observables": [
+    "argv 记录",
+    "capabilities_json",
+    "input_queue 行",
+    "事件序列与进程启动日志"
+   ]
+  },
+  {
+   "id": "TEST-024-04",
+   "requirement_id": "REQ-024",
+   "acceptance_id": "AC-024-04",
+   "check_id": "adapter-live",
+   "fixture": "真实 codex app-server、临时 Git 仓库、默认 grace（native 10 s、TERM 5 s，初值）",
+   "steps": [
+    "probe 并写 compat 记录",
+    "执行第1轮并等待终态",
+    "执行第2轮，观察到命令 item 开始后调用 cancel",
+    "检查进程组与原始日志"
+   ],
+   "pass_criteria": [
+    "第1轮 turn.status=completed，attempt=SETTLED，消息含 `HOH_NATIVE_SMOKE_OK`",
+    "第2轮 turn.status=interrupted，attempt=CANCELLED",
+    "cancel 后≤16 s 内进程组无存活进程与僵尸",
+    "evidence.mode=live 并记录实际版本、threadId、turnId 与 resolved model",
+    "鉴权失败时检查 outcome=BLOCKED，不得为 PASS"
+   ],
+   "observables": [
+    "原生 JSON-RPC 收发原始日志",
+    "compat manifest 记录",
+    "attempts/sessions 行",
+    "进程表快照"
+   ]
+  },
+  {
+   "id": "TEST-025-01",
+   "requirement_id": "REQ-025",
+   "acceptance_id": "AC-025-01",
+   "check_id": "integration",
+   "fixture": "录制 stdout/stderr 两个文件（来源版本与 sha256 登记）、按时序交错输出的 fake claude",
+   "steps": [
+    "执行第一轮并等待终态",
+    "比较两个原始文件与 fixture 的 sha256",
+    "执行第二轮并读取 argv 记录"
+   ],
+   "pass_criteria": [
+    "stdout.jsonl sha256=fixture stdout sha256；stderr.log sha256=fixture stderr sha256",
+    "attempt state=SETTLED",
+    "sessions.native_id 与 init/result 帧 session_id 相等",
+    "resolved model=init 帧 model",
+    "第二轮 argv 含 `--resume` 且其后一项=session_id，不含 `--permission-mode auto`"
+   ],
+   "observables": [
+    "原始 stdout/stderr 文件",
+    "argv 记录",
+    "attempts/sessions 行"
+   ]
+  },
+  {
+   "id": "TEST-025-02",
+   "requirement_id": "REQ-025",
+   "acceptance_id": "AC-025-02",
+   "check_id": "integration",
+   "fixture": "7份 fake claude 配置（help 文本与输出流）",
+   "steps": [
+    "逐行启动并等待终态或拒绝",
+    "收集 attempts 状态、argv、事件与进程启动日志"
+   ],
+   "pass_criteria": [
+    "error_max_turns、is_error、EOF、退出码1 四行 attempt=FAILED",
+    "EOF 行原因=PROTOCOL_INCOMPLETE",
+    "非 JSON 行：adapter 诊断事件恰1条，原始行字节已保存",
+    "缺 partial 行 argv 不含 `--include-partial-messages`，capabilities 对应项=false",
+    "缺 YOLO 行无子进程启动，原因=BLOCKED_CAPABILITY",
+    "全部行 argv 不含 `--permission-mode auto`"
+   ],
+   "observables": [
+    "每行 argv 与原始输出",
+    "attempts 行",
+    "事件序列",
+    "进程启动日志"
+   ]
+  },
+  {
+   "id": "TEST-025-03",
+   "requirement_id": "REQ-025",
+   "acceptance_id": "AC-025-03",
+   "check_id": "integration",
+   "fixture": "记录收到信号与时间戳的 fake claude、孙进程、/proc 扫描器",
+   "steps": [
+    "启动 attempt，确认孙进程存在",
+    "调用 cancel() 并记录时间",
+    "扫描 /proc 中该 pgid 进程并读取信号日志"
+   ],
+   "pass_criteria": [
+    "信号日志顺序=[SIGINT,SIGTERM,SIGKILL]",
+    "SIGINT→SIGTERM 间隔≥1 s，SIGTERM→SIGKILL 间隔≥1 s",
+    "cancel 后≤3 s 时 /proc 中该 pgid 进程数=0，无僵尸",
+    "attempt state=CANCELLED，非 SETTLED/FAILED"
+   ],
+   "observables": [
+    "信号与时间戳日志",
+    "/proc 扫描结果",
+    "attempts 行"
+   ]
+  },
+  {
+   "id": "TEST-025-04",
+   "requirement_id": "REQ-025",
+   "acceptance_id": "AC-025-04",
+   "check_id": "adapter-live",
+   "fixture": "真实 claude CLI、临时 Git 仓库、默认 grace（10 s/5 s，初值）",
+   "steps": [
+    "probe 并写 compat 记录",
+    "依次执行三轮并保存原始 stdout/stderr",
+    "第3轮观察到工具开始后调用 cancel 并扫描进程组"
+   ],
+   "pass_criteria": [
+    "第1轮 result.subtype=success、is_error=false，attempt=SETTLED",
+    "第2轮 init session_id=第1轮 session_id，result 文本含 token",
+    "第3轮 attempt=CANCELLED，cancel 后≤16 s 进程组进程数=0",
+    "evidence.mode=live 并记录版本、session_id、resolved model",
+    "鉴权失败时检查 outcome=BLOCKED，不得为 PASS"
+   ],
+   "observables": [
+    "三轮原始 stdout/stderr 文件",
+    "argv 记录",
+    "compat manifest",
+    "进程表快照"
+   ]
+  },
+  {
+   "id": "TEST-026-01",
+   "requirement_id": "REQ-026",
+   "acceptance_id": "AC-026-01",
+   "check_id": "integration",
+   "fixture": "录制 Pi RPC fixture（来源版本与 sha256 登记）、可控 write 切分的 fake pi",
+   "steps": [
+    "启动适配器并发送 prompt",
+    "收集适配器解析出的帧与事件序列",
+    "与 fixture 逐帧比较"
+   ],
+   "pass_criteria": [
+    "解析帧数与 fixture 相等，逐帧 JSON 值相等",
+    "含 U+2028/U+2029 的帧各保持为1帧",
+    "agent_start 事件存在且位于该 prompt 事件序列首位",
+    "解析错误计数=0",
+    "10 MiB stderr 已完整保存，终态在30 s 内到达"
+   ],
+   "observables": [
+    "fake 写出字节与切分日志",
+    "适配器原始 stdout/stderr 日志",
+    "解析帧与事件序列"
+   ]
+  },
+  {
+   "id": "TEST-026-02",
+   "requirement_id": "REQ-026",
+   "acceptance_id": "AC-026-02",
+   "check_id": "integration",
+   "fixture": "4份录制/构造 fixture、FakeClock、记录收到命令的 fake pi",
+   "steps": [
+    "回放 (a) 并记录完成时间点",
+    "回放 (b)(c)，在首个 agent_end 后读取状态，再等待终态",
+    "回放 (d)，记录状态查询命令次数与终态"
+   ],
+   "pass_criteria": [
+    "(a) 终态在 response 后到达，未发出任何等待 settled 的计时器",
+    "(b)(c) 首个 agent_end 后 attempt=RUNNING，agent_settled 后=SETTLED",
+    "(d) 状态查询次数≥2，最后一次报空闲后才 SETTLED",
+    "FakeClock 推进次数=0"
+   ],
+   "observables": [
+    "fake 收到的命令日志",
+    "适配器事件与状态迁移序列",
+    "FakeClock 调用记录"
+   ]
+  },
+  {
+   "id": "TEST-026-03",
+   "requirement_id": "REQ-026",
+   "acceptance_id": "AC-026-03",
+   "check_id": "integration",
+   "fixture": "可 kill 的 fake pi、UI 请求 fixture、会话目录",
+   "steps": [
+    "执行一轮并记录 argv 与 native_path",
+    "kill -9 fake pi，调用 resume() 并记录 argv",
+    "回放 UI 请求，收集适配器回写的帧"
+   ],
+   "pass_criteria": [
+    "两次 argv 的 `--session-dir` 与 session id 值相同，均不含 `--no-session`",
+    "resume 前后 sessions.native_path 相同，未新建 session 行",
+    "confirm、select 各1条 cancel 响应，响应中无选项值",
+    "非对话请求响应数=0，并生成对应数据事件",
+    "每个对话请求均有阻塞/决策事件记录"
+   ],
+   "observables": [
+    "argv 记录",
+    "sessions 行",
+    "适配器写入 Pi stdin 的原始帧",
+    "事件序列"
+   ]
+  },
+  {
+   "id": "TEST-026-04",
+   "requirement_id": "REQ-026",
+   "acceptance_id": "AC-026-04",
+   "check_id": "adapter-live",
+   "fixture": "真实 Pi CLI 与 RPC 模式、持久会话目录、默认 grace（初值）",
+   "steps": [
+    "probe 并写 compat 记录（含是否支持 agent_settled）",
+    "执行第1轮并等待静止",
+    "终止进程，以同 session 重启并执行第2轮",
+    "发长任务后 cancel，扫描进程组"
+   ],
+   "pass_criteria": [
+    "第1轮 response 被接受，终态依据为 agent_settled 或状态核验，回复含 token",
+    "第2轮会话 id 与第1轮相同，回复含 token",
+    "cancel 后≤16 s 进程组进程数=0，attempt=CANCELLED",
+    "argv 不含 `--no-session`；evidence.mode=live",
+    "鉴权失败时 outcome=BLOCKED；未安装时 outcome=NOT_RUN，均不得为 PASS"
+   ],
+   "observables": [
+    "RPC 收发原始日志",
+    "compat manifest",
+    "会话目录清单",
+    "attempts/sessions 行与进程表"
+   ]
+  },
+  {
+   "id": "TEST-027-01",
+   "requirement_id": "REQ-027",
+   "acceptance_id": "AC-027-01",
+   "check_id": "integration",
+   "fixture": "3组 fake 二进制与录制 help/schema 文本",
+   "steps": [
+    "对每组执行 probe() 两次",
+    "读取 compat manifest 与 capabilities",
+    "比较两次结果"
+   ],
+   "pass_criteria": [
+    "3项 manifest 字段齐全，binary_sha256 等于已知值",
+    "Claude 项 schema_sha256=null，Codex 项为64位十六进制",
+    "旧 codex capabilities.mid_turn_steer=false，transport=exec",
+    "两版 codex 能力集不同，且各自两次探测结果完全相同",
+    "旧 claude 部分消息能力=false"
+   ],
+   "observables": [
+    "compat manifest 文件",
+    "probe 子进程 argv 与输出 hash",
+    "capabilities_json"
+   ]
+  },
+  {
+   "id": "TEST-027-02",
+   "requirement_id": "REQ-027",
+   "acceptance_id": "AC-027-02",
+   "check_id": "integration",
+   "fixture": "Codex/Claude/Pi 各一对（含未知/对照）fixture",
+   "steps": [
+    "逐份回放并收集事件与原始日志",
+    "从 raw 旁路查询含 `x_future` 的帧",
+    "比较与对照回放的终态"
+   ],
+   "pass_criteria": [
+    "6次回放无 panic、进程均正常结束",
+    "每份含未知帧的回放 adapter.unknown_event 数=1，事件含帧 sha256",
+    "原始日志 sha256 与输入一致",
+    "`x_future` 字段值可从 raw 取回且等于输入",
+    "attempt 终态与对照回放逐一相等"
+   ],
+   "observables": [
+    "原始 stdout 日志",
+    "事件序列",
+    "attempts 行"
+   ]
+  },
+  {
+   "id": "TEST-027-03",
+   "requirement_id": "REQ-027",
+   "acceptance_id": "AC-027-03",
+   "check_id": "integration",
+   "fixture": "超大帧 fixture、缓冲探针、并行正常 fixture",
+   "steps": [
+    "同时启动超大帧与正常 attempt",
+    "等待两者终态并读取探针与诊断"
+   ],
+   "pass_criteria": [
+    "三个适配器最大缓冲字节均≤1,114,112",
+    "超大帧 attempt state=FAILED，原因=PROTOCOL_FRAME_TOO_LARGE",
+    "诊断记录含长度、前缀 sha256、前4096字节",
+    "并行正常 attempt state=SETTLED，host 进程未退出"
+   ],
+   "observables": [
+    "缓冲探针数据",
+    "诊断文件",
+    "attempts 行",
+    "host 进程状态"
+   ]
+  },
+  {
+   "id": "TEST-027-04",
+   "requirement_id": "REQ-027",
+   "acceptance_id": "AC-027-04",
+   "check_id": "integration",
+   "fixture": "两个 hash 不同的 fake codex、SQLite 写租约、compat 套件 fixture",
+   "steps": [
+    "替换二进制并请求新 attempt",
+    "执行 `hoh doctor --output json` 读取 codex 项",
+    "在写租约活跃时请求兼容套件",
+    "原 attempt 结束、租约释放后运行套件并重试新 attempt"
+   ],
+   "pass_criteria": [
+    "替换后首个新 attempt 被拒，错误码=COMPAT_UNVERIFIED，无子进程启动",
+    "原 attempt 最终 state=SETTLED，其进程仍为 A",
+    "doctor codex 项 protocol=unknown",
+    "租约活跃时套件请求被拒绝",
+    "套件 PASS 后 manifest 含 B 的 binary_sha256，重试 attempt 成功启动"
+   ],
+   "observables": [
+    "compat manifest 前后版本",
+    "attempts 与 leases 行",
+    "doctor JSON",
+    "进程启动日志"
+   ]
+  },
+  {
+   "id": "TEST-028-01",
+   "requirement_id": "REQ-028",
+   "acceptance_id": "AC-028-01",
+   "check_id": "integration",
+   "fixture": "待该里程碑 spec 任务细化",
+   "steps": [
+    "Brownfield含未提交修改测试"
+   ],
+   "pass_criteria": [
+    "建立基线，保留脏文件，不重写架构、不强制初始化远程"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  },
+  {
+   "id": "TEST-029-01",
+   "requirement_id": "REQ-029",
+   "acceptance_id": "AC-029-01",
+   "check_id": "unit",
+   "fixture": "待该里程碑 spec 任务细化",
+   "steps": [
+    "所有模板可实例化且无必填残缺"
+   ],
+   "pass_criteria": [
+    "产品/需求/功能/UX/架构/开发/测试/验收/部署/使用规范齐全；按规模选用"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  },
+  {
+   "id": "TEST-030-01",
+   "requirement_id": "REQ-030",
+   "acceptance_id": "AC-030-01",
+   "check_id": "integration",
+   "fixture": "待该里程碑 spec 任务细化",
+   "steps": [
+    "互动与无人值守分支测试"
+   ],
+   "pass_criteria": [
+    "记录用户/范围/非目标/决策/开放问题；必要不确定性不伪造用户答案"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  },
+  {
+   "id": "TEST-031-01",
+   "requirement_id": "REQ-031",
+   "acceptance_id": "AC-031-01",
+   "check_id": "unit",
+   "fixture": "待该里程碑 spec 任务细化",
+   "steps": [
+    "缺AC/循环依赖/非阻塞未知测试"
+   ],
+   "pass_criteria": [
+    "必要 AC 可观察、依赖可达、关键决定确定；仅阻断当前受影响范围"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  },
+  {
+   "id": "TEST-032-01",
+   "requirement_id": "REQ-032",
+   "acceptance_id": "AC-032-01",
+   "check_id": "traceability",
+   "fixture": "待该里程碑 spec 任务细化",
+   "steps": [
+    "断链与孤立验收检测"
+   ],
+   "pass_criteria": [
+    "REQ→TASK→candidate→TEST→EVIDENCE→acceptance 可双向查找"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  },
+  {
+   "id": "TEST-033-01",
+   "requirement_id": "REQ-033",
+   "acceptance_id": "AC-033-01",
+   "check_id": "integration",
+   "fixture": "待该里程碑 spec 任务细化",
+   "steps": [
+    "修改需求后门禁拒绝旧证据"
+   ],
+   "pass_criteria": [
+    "生成 CR、revision、影响闭包；受影响验收过期，不静默沿用旧PASS"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  },
+  {
+   "id": "TEST-034-01",
+   "requirement_id": "REQ-034",
+   "acceptance_id": "AC-034-01",
+   "check_id": "integration",
+   "fixture": "待该里程碑 spec 任务细化",
+   "steps": [
+    "并发编辑与哈希冲突测试"
+   ],
+   "pass_criteria": [
+    "文件是语义事实源，DB是索引/状态；冲突可检测；生成页不产生第二权威源"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  },
+  {
+   "id": "TEST-035-01",
+   "requirement_id": "REQ-035",
+   "acceptance_id": "AC-035-01",
+   "check_id": "unit",
+   "fixture": "hoh-core领域测试+内存SQLite+FakeCommander+FakeClock，表驱动6个用例",
+   "steps": [
+    "建立fixture并快照tasks/runs/outbox/attempts",
+    "逐个提交6个提议并让Runtime校验",
+    "导出decisions与events，再次快照并diff"
+   ],
+   "pass_criteria": [
+    "6个decision均为REJECTED，reason_code依次为DEPENDENCY_NOT_ACCEPTED、STALE_ROLE_EPOCH、STALE_REVISION、BUDGET_NOT_RESERVABLE、ROLE_CAPABILITY_MISSING、ILLEGAL_TRANSITION",
+    "每个拒绝恰对应1条拒绝事件",
+    "tasks/runs的state与revision前后逐字段相同",
+    "outbox与attempts新增行数=0"
+   ],
+   "observables": [
+    "decisions表导出",
+    "events表导出",
+    "前后快照diff",
+    "测试报告原文"
+   ]
+  },
+  {
+   "id": "TEST-035-02",
+   "requirement_id": "REQ-035",
+   "acceptance_id": "AC-035-02",
+   "check_id": "integration",
+   "fixture": "临时目录文件DB+真实writer actor+FakeCommander",
+   "steps": [
+    "提交合法提议并等待处理",
+    "导出decisions/tasks/leases/events/outbox",
+    "原样再提交同一提议并导出decisions"
+   ],
+   "pass_criteria": [
+    "decision1.state=APPLIED，T1.state=LEASED，T1.revision=原值+1",
+    "leases(project_id,'writer')恰1行且attempt_id属于T1",
+    "新增event 1条、outbox 1条，outbox.event_seq=该event.seq",
+    "decision2.state=REJECTED且reason=STALE_REVISION"
+   ],
+   "observables": [
+    "各表导出",
+    "events(seq,kind,payload_json)",
+    "writer actor事务日志"
+   ]
+  },
+  {
+   "id": "TEST-035-03",
+   "requirement_id": "REQ-035",
+   "acceptance_id": "AC-035-03",
+   "check_id": "integration",
+   "fixture": "FakeAgent（开发/QA/Review）+计数型FakeCommander+文件DB",
+   "steps": [
+    "运行Developer Attempt至产出C1",
+    "等待Runtime处理candidate_ready",
+    "导出outbox与FakeCommander调用计数"
+   ],
+   "pass_criteria": [
+    "outbox新增2行，recipient_role分别为qa与reviewer，payload.candidate_id=C1",
+    "两行event_seq相同（同一事务）",
+    "FakeCommander调用次数=0"
+   ],
+   "observables": [
+    "outbox/events导出",
+    "FakeCommander调用日志"
+   ]
+  },
+  {
+   "id": "TEST-035-04",
+   "requirement_id": "REQ-035",
+   "acceptance_id": "AC-035-04",
+   "check_id": "unit",
+   "fixture": "hoh-core领域测试+内存SQLite+FakeCommander",
+   "steps": [
+    "建立VERIFYING的Run与空证据",
+    "提交该决策",
+    "读取decisions/runs/acceptance_results"
+   ],
+   "pass_criteria": [
+    "decision.state=REJECTED，reason=EVIDENCE_GATE_UNMET",
+    "runs.state=VERIFYING，revision不变",
+    "acceptance_results行数=0"
+   ],
+   "observables": [
+    "decisions/runs/acceptance_results导出",
+    "测试报告原文"
+   ]
+  },
+  {
+   "id": "TEST-035-05",
+   "requirement_id": "REQ-035",
+   "acceptance_id": "AC-035-05",
+   "check_id": "integration",
+   "fixture": "不可用FakeCommander+FakeAgent+文件DB",
+   "steps": [
+    "注入candidate_ready与critical issue",
+    "等待Runtime处理",
+    "导出outbox/runs/decisions/events"
+   ],
+   "pass_criteria": [
+    "outbox含qa与reviewer的C1 dispatch各1行",
+    "runs.state=BLOCKED且阻塞原因=COMMANDER_UNAVAILABLE",
+    "新增APPLIED decision中Commander来源行数=0"
+   ],
+   "observables": [
+    "outbox/runs/decisions/events导出",
+    "FakeCommander启动失败日志"
+   ]
+  },
+  {
+   "id": "TEST-036-01",
+   "requirement_id": "REQ-036",
+   "acceptance_id": "AC-036-01",
+   "check_id": "unit",
+   "fixture": "hoh-core迁移表+从SQL文件解析的CHECK枚举",
+   "steps": [
+    "解析001_initial.sql中runs/tasks/attempts的state CHECK枚举",
+    "比较迁移表状态集合与SQL枚举",
+    "穷举355对调用校验函数并记录结果"
+   ],
+   "pass_criteria": [
+    "迁移表状态集合与SQL枚举完全相同",
+    "被测对数=355，判定与迁移表逐项一致",
+    "必拒对全部返回ILLEGAL_TRANSITION：Run终态→任意、非VERIFYING→COMPLETED、非PAUSE_REQUESTED→PAUSED、非CANCEL_REQUESTED→CANCELLED、CREATED→RUNNING；Task非VERIFYING→ACCEPTED、READY→RUNNING；Attempt SETTLED/FAILED/CANCELLED→任意"
+   ],
+   "observables": [
+    "355对判定结果表",
+    "枚举对比输出",
+    "测试报告原文"
+   ]
+  },
+  {
+   "id": "TEST-036-02",
+   "requirement_id": "REQ-036",
+   "acceptance_id": "AC-036-02",
+   "check_id": "recovery",
+   "fixture": "test feature编译的host（注入点仅测试构建存在）+FakeAgent+每轮重建的文件DB",
+   "steps": [
+    "选择注入点并启动host",
+    "提交触发READY→RUNNING的命令，host在注入点自发SIGKILL",
+    "重启host（不发任何新命令）",
+    "读取runs/events/outbox并执行integrity_check",
+    "对5个注入点各重复20次"
+   ],
+   "pass_criteria": [
+    "COMMIT前注入的80次全部为：R.state=READY、revision不变、该迁移events=0、outbox=0",
+    "COMMIT后注入的20次全部为：R.state=RUNNING、events=1、outbox=1且outbox.event_seq指向该event",
+    "100次integrity_check结果均为ok",
+    "不存在outbox.event_seq指向不存在event的行"
+   ],
+   "observables": [
+    "每次运行的注入点、退出信号与重启日志",
+    "runs/events/outbox导出",
+    "integrity_check输出"
+   ]
+  },
+  {
+   "id": "TEST-036-03",
+   "requirement_id": "REQ-036",
+   "acceptance_id": "AC-036-03",
+   "check_id": "integration",
+   "fixture": "脚本化FakeAgent（失败、失败、成功）+文件DB",
+   "steps": [
+    "启动Run并等待T1三次Attempt结束",
+    "记录A1、A2在A3开始前的行快照",
+    "等待QA Attempt创建",
+    "导出attempts与sessions"
+   ],
+   "pass_criteria": [
+    "T1的attempts行数=3，attempt_id两两不同",
+    "A1、A2的state=FAILED且raw_log_path与快照相同",
+    "全部Attempt的role_epoch/host_epoch/config_revision/session_id非空",
+    "QA Attempt.session_id≠T1任一开发Attempt.session_id"
+   ],
+   "observables": [
+    "attempts/sessions导出",
+    "A1/A2快照与最终行diff",
+    "events导出"
+   ]
+  },
+  {
+   "id": "TEST-036-04",
+   "requirement_id": "REQ-036",
+   "acceptance_id": "AC-036-04",
+   "check_id": "integration",
+   "fixture": "test feature编译的host+SSE测试客户端+投影计数器",
+   "steps": [
+    "启用COMMIT失败注入并提交PauseRun",
+    "等待5 s记录订阅者收到的事件",
+    "读取runs行",
+    "关闭注入后再次提交并记录订阅者事件"
+   ],
+   "pass_criteria": [
+    "首次HTTP状态≠202且错误体retryable=true",
+    "首次后5 s内两个订阅者收到PAUSE_REQUESTED相关事件数=0",
+    "runs.state与revision与提交前相同",
+    "第二次HTTP 202，每个订阅者恰收到1条对应事件"
+   ],
+   "observables": [
+    "HTTP请求/响应原文",
+    "SSE原始流",
+    "投影计数器日志",
+    "runs前后快照"
+   ]
+  },
+  {
+   "id": "TEST-037-01",
+   "requirement_id": "REQ-037",
+   "acceptance_id": "AC-037-01",
+   "check_id": "integration",
+   "fixture": "临时文件DB+租约服务+固定种子序列生成器",
+   "steps": [
+    "生成1000组序列并保存种子",
+    "逐步执行acquire/release/expire",
+    "每步后查询有效writer与reader租约数及epoch"
+   ],
+   "pass_criteria": [
+    "所有步骤writer有效租约数≤1",
+    "所有步骤reader有效租约数≤2",
+    "writer epoch序列严格递增",
+    "docs-only写Task的Attempt均有对应writer租约记录"
+   ],
+   "observables": [
+    "种子与序列文件",
+    "逐步租约计数日志",
+    "leases与events导出"
+   ]
+  },
+  {
+   "id": "TEST-037-02",
+   "requirement_id": "REQ-037",
+   "acceptance_id": "AC-037-02",
+   "check_id": "integration",
+   "fixture": "FakeAgent（QA=FAIL、Review=PASS，各3 s）+文件DB+冻结的C1",
+   "steps": [
+    "触发candidate_ready",
+    "记录两个Attempt的started_at/ended_at",
+    "等待barrier关闭事件",
+    "导出attempts/evidence/candidates/acceptance_results"
+   ],
+   "pass_criteria": [
+    "两Attempt绑定candidate_id=C1，git_commit/git_tree/spec/env/test_plan摘要相同",
+    "每个Attempt的started_at早于另一个的ended_at",
+    "barrier关闭事件seq大于两个Attempt终态事件seq",
+    "C1无accepted结论，evidence含2行（FAIL与PASS）"
+   ],
+   "observables": [
+    "attempts/evidence/acceptance_results导出",
+    "events导出",
+    "两个运行目录路径与tree hash"
+   ]
+  },
+  {
+   "id": "TEST-037-03",
+   "requirement_id": "REQ-037",
+   "acceptance_id": "AC-037-03",
+   "check_id": "integration",
+   "fixture": "篡改型FakeAgent QA+冻结C1+文件DB",
+   "steps": [
+    "派发QA并等待结束",
+    "读取evidence与acceptance_results",
+    "读取tree核对事件payload"
+   ],
+   "pass_criteria": [
+    "evidence.outcome=INVALID",
+    "acceptance_results中candidate_id=C1且status=PASS行数=0",
+    "事件payload含pre_tree与post_tree且不相等"
+   ],
+   "observables": [
+    "evidence/acceptance_results导出",
+    "tree核对事件",
+    "QA运行目录git status输出"
+   ]
+  },
+  {
+   "id": "TEST-037-04",
+   "requirement_id": "REQ-037",
+   "acceptance_id": "AC-037-04",
+   "check_id": "integration",
+   "fixture": "FakeAgent QA（发请求）、FakeAgent Developer（产出C2）+文件DB",
+   "steps": [
+    "在QA运行中注入请求",
+    "读取issues、tasks、wait-for图快照",
+    "等待barrier关闭与修复Task派发",
+    "C2冻结后立即读取acceptance_results"
+   ],
+   "pass_criteria": [
+    "请求结果为rejected，issues新增1行且candidate_id=C1",
+    "wait-for图无QA→Developer边",
+    "修复Task的dispatch事件seq大于C1 barrier关闭事件seq",
+    "C2冻结时acceptance_results中C2行数=0"
+   ],
+   "observables": [
+    "issues/tasks/outbox/acceptance_results导出",
+    "wait-for图快照",
+    "events导出"
+   ]
+  },
+  {
+   "id": "TEST-038-01",
+   "requirement_id": "REQ-038",
+   "acceptance_id": "AC-038-01",
+   "check_id": "unit",
+   "fixture": "hoh-core调度器纯函数+固定种子排列",
+   "steps": [
+    "构造6个Task并排序",
+    "以固定种子生成10个排列分别排序",
+    "输出每次顺序与score"
+   ],
+   "pass_criteria": [
+    "11次顺序均为[A,B,C,F,E,D]",
+    "A、B、C、D、E、F的score分别为0、6、20、9、9、20（|误差|≤1e-9）"
+   ],
+   "observables": [
+    "每次排序输出",
+    "score表",
+    "测试报告原文"
+   ]
+  },
+  {
+   "id": "TEST-038-02",
+   "requirement_id": "REQ-038",
+   "acceptance_id": "AC-038-02",
+   "check_id": "unit",
+   "fixture": "属性测试框架+固定种子+eligible独立判定器",
+   "steps": [
+    "生成1000例DAG并保存种子",
+    "对每例4种输入顺序运行选择循环（选中即视为ACCEPTED）",
+    "逐次用独立判定器检查被选Task"
+   ],
+   "pass_criteria": [
+    "1000例中4种顺序的派发序列全部相同",
+    "所有被选Task满足：依赖ACCEPTED、当前spec、未租约、能力满足、预算可预留",
+    "违反任一条件的选择次数=0",
+    "含1000个Task的例子全部在测试超时内完成"
+   ],
+   "observables": [
+    "种子与失败反例（若有）",
+    "每例派发序列hash",
+    "测试报告原文"
+   ]
+  },
+  {
+   "id": "TEST-038-03",
+   "requirement_id": "REQ-038",
+   "acceptance_id": "AC-038-03",
+   "check_id": "integration",
+   "fixture": "临时文件DB+计划导入接口",
+   "steps": [
+    "记录tasks与task_dependencies行数",
+    "依次提交P1、P2、P3",
+    "再次读取行数与错误体"
+   ],
+   "pass_criteria": [
+    "三个错误code依次为DAG_CYCLE、DAG_MISSING_DEPENDENCY、SCORE_OUT_OF_RANGE",
+    "P1错误体列出的环包含a与b",
+    "tasks与task_dependencies行数不变"
+   ],
+   "observables": [
+    "三次错误响应原文",
+    "表行数前后对比"
+   ]
+  },
+  {
+   "id": "TEST-038-04",
+   "requirement_id": "REQ-038",
+   "acceptance_id": "AC-038-04",
+   "check_id": "unit",
+   "fixture": "hoh-core调度器+FakeClock+确定性补入L的循环",
+   "steps": [
+    "初始化H与首个L",
+    "每轮选择1个并补入新L",
+    "记录每轮被选Task与各Task age_bonus"
+   ],
+   "pass_criteria": [
+    "前4轮选中L，第5轮选中H",
+    "第5轮H的age_bonus=4且score=6",
+    "全部轮次age_bonus最大值≤10"
+   ],
+   "observables": [
+    "每轮选择日志",
+    "age_bonus轨迹"
+   ]
+  },
+  {
+   "id": "TEST-038-05",
+   "requirement_id": "REQ-038",
+   "acceptance_id": "AC-038-05",
+   "check_id": "integration",
+   "fixture": "文件DB+活跃Run+FakeAgent",
+   "steps": [
+    "读取R配置快照",
+    "提交权重变更",
+    "再次读取快照并触发一次调度"
+   ],
+   "pass_criteria": [
+    "HTTP状态=409",
+    "配置快照权重=(4,3,3,2)",
+    "该次调度的score与原权重手算值一致"
+   ],
+   "observables": [
+    "请求/响应原文",
+    "配置快照前后",
+    "调度事件payload"
+   ]
+  },
+  {
+   "id": "TEST-039-01",
+   "requirement_id": "REQ-039",
+   "acceptance_id": "AC-039-01",
+   "check_id": "unit",
+   "fixture": "固定候选条目 JSON、估算 tokenizer",
+   "steps": [
+    "执行装箱",
+    "按层统计 token",
+    "比对强制项和引用索引"
+   ],
+   "pass_criteria": [
+    "强制项原文都是输出的子串",
+    "三类 token 分别 ≤2700/2100/1200，总量 ≤10000",
+    "被省略条目数 == 引用索引条目数",
+    "estimated=true"
+   ],
+   "observables": [
+    "装箱输出全文与 sha256",
+    "分层 token 统计 JSON",
+    "引用索引 JSON"
+   ]
+  },
+  {
+   "id": "TEST-039-02",
+   "requirement_id": "REQ-039",
+   "acceptance_id": "AC-039-02",
+   "check_id": "unit",
+   "fixture": "属性测试生成器（固定种子并记录）",
+   "steps": [
+    "以固定种子生成预算序列",
+    "逐个装箱并校验"
+   ],
+   "pass_criteria": [
+    "预算=M-1 时报 CONTEXT_BUDGET_TOO_SMALL",
+    "所有预算≥M 的样例中强制项完整，失败数=0",
+    "所有样例总 token≤预算"
+   ],
+   "observables": [
+    "随机种子",
+    "每个样例的预算与结果摘要",
+    "测试报告"
+   ]
+  },
+  {
+   "id": "TEST-039-03",
+   "requirement_id": "REQ-039",
+   "acceptance_id": "AC-039-03",
+   "check_id": "integration",
+   "fixture": "SQLite 临时库、含哨兵的 raw log 对象、FakeAgent 捕获输入",
+   "steps": [
+    "登记 Developer raw log",
+    "触发两次交接",
+    "捕获两份 Prompt 并检索哨兵串"
+   ],
+   "pass_criteria": [
+    "哨兵串计数=0（两份）",
+    "references 每项都有 64 位十六进制 sha256 且文件存在",
+    "token(Prompt)≤budget_tokens"
+   ],
+   "observables": [
+    "两份 Prompt 原文与 sha256",
+    "ContextHandoff JSON",
+    "raw log sha256"
+   ]
+  },
+  {
+   "id": "TEST-039-04",
+   "requirement_id": "REQ-039",
+   "acceptance_id": "AC-039-04",
+   "check_id": "integration",
+   "fixture": "SQLite 临时库、内容寻址对象目录、固定资源包",
+   "steps": [
+    "读取 attempt A 的记录",
+    "按记录重新装箱",
+    "比较 sha256"
+   ],
+   "pass_criteria": [
+    "sha256(重装) == attempts(A).prompt_sha256",
+    "4 个字段都不为空"
+   ],
+   "observables": [
+    "attempt 记录导出",
+    "重新装箱的输出与 sha256"
+   ]
+  },
+  {
+   "id": "TEST-040-01",
+   "requirement_id": "REQ-040",
+   "acceptance_id": "AC-040-01",
+   "check_id": "unit",
+   "fixture": "待该里程碑 spec 任务细化",
+   "steps": [
+    "重复修复和只改文档案例"
+   ],
+   "pass_criteria": [
+    "按问题指纹/状态变化而非commit计数诊断，升级/研究/改计划"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  },
+  {
+   "id": "TEST-041-01",
+   "requirement_id": "REQ-041",
+   "acceptance_id": "AC-041-01",
+   "check_id": "recovery",
+   "fixture": "test feature host（5个注入点）+写计数文件与marker的FakeAgent+每轮重建DB",
+   "steps": [
+    "选择注入点启动Run，host在该点自发SIGKILL并记录t0",
+    "harness 1 s内重启host",
+    "等待reconcile完成与Run推进到下一稳定点",
+    "统计计数文件与attempts/effects/events",
+    "5个注入点各重复10次"
+   ],
+   "pass_criteria": [
+    "50次运行中每个effect_key计数≤1",
+    "旧Attempt最终state∈{SETTLED,CANCELLED,UNKNOWN_EFFECT}且重投仅发生在「未发送」判定之后",
+    "UNKNOWN_EFFECT Attempt所属Task无自动新增Attempt",
+    "每次reconcile完成seq<重启后首个dispatch outbox的event_seq",
+    "每次reconcile开始时刻−t0≤30 s"
+   ],
+   "observables": [
+    "计数文件与marker文件",
+    "attempts/effects/outbox/events导出",
+    "kill/重启/reconcile时间戳"
+   ]
+  },
+  {
+   "id": "TEST-041-02",
+   "requirement_id": "REQ-041",
+   "acceptance_id": "AC-041-02",
+   "check_id": "recovery",
+   "fixture": "FakeClock+忽略SIGTERM的FakeAgent进程组+文件DB",
+   "steps": [
+    "建立A1持有的writer租约并推进FakeClock",
+    "等待新租约授予",
+    "注入epoch=4的TaskResult",
+    "用旧host_epoch调用写接口",
+    "导出events/leases/tasks并扫描进程"
+   ],
+   "pass_criteria": [
+    "相关事件seq顺序与期望完全一致",
+    "epoch=5授予事件之前A1进程组无存活进程（/proc扫描）",
+    "TaskResult响应code=STALE_LEASE_EPOCH，Task.revision不变，历史事件1条",
+    "旧host_epoch写入rowcount=0且错误类别=IntegrityViolation"
+   ],
+   "observables": [
+    "events导出",
+    "leases前后快照",
+    "/proc进程扫描记录",
+    "接口响应原文"
+   ]
+  },
+  {
+   "id": "TEST-041-03",
+   "requirement_id": "REQ-041",
+   "acceptance_id": "AC-041-03",
+   "check_id": "recovery",
+   "fixture": "预置attempts行的DB+捕获信号计数的sleep辅助进程+可注入boot_id",
+   "steps": [
+    "启动辅助进程记录其pid=P",
+    "写入A2(pid=P,错误starttime)与A3(不同boot_id)",
+    "启动host完成reconcile",
+    "检查辅助进程存活与信号计数，导出attempts"
+   ],
+   "pass_criteria": [
+    "辅助进程存活且信号计数=0",
+    "A2、A3的state∈{SETTLED,FAILED,UNKNOWN_EFFECT}",
+    "reconcile事件payload记录判定依据为starttime/boot_id不匹配"
+   ],
+   "observables": [
+    "辅助进程信号日志",
+    "attempts导出",
+    "reconcile事件payload"
+   ]
+  },
+  {
+   "id": "TEST-041-04",
+   "requirement_id": "REQ-041",
+   "acceptance_id": "AC-041-04",
+   "check_id": "integration",
+   "fixture": "test feature host（响应前断连注入）+HTTP测试客户端",
+   "steps": [
+    "启用注入并提交K+X，记录连接错误",
+    "关闭注入后以K+X重试",
+    "以K+Y提交",
+    "导出commands/events"
+   ],
+   "pass_criteria": [
+    "重试响应202，command_id与revision等于DB中首次结果",
+    "该command对应PAUSE_REQUESTED事件数=1",
+    "K+Y响应409且code=KEY_REUSE",
+    "commands中idempotency_key=K行数=1"
+   ],
+   "observables": [
+    "HTTP请求/响应原文",
+    "commands/events导出"
+   ]
+  },
+  {
+   "id": "TEST-041-05",
+   "requirement_id": "REQ-041",
+   "acceptance_id": "AC-041-05",
+   "check_id": "recovery",
+   "fixture": "FakeRemote（记录查询/创建调用）+预置effects/attempts的DB",
+   "steps": [
+    "预置E、E2与远端已有PR",
+    "启动host完成reconcile",
+    "导出effects/attempts/events与FakeRemote调用日志"
+   ],
+   "pass_criteria": [
+    "E.state∈{OBSERVED,COMMITTED}且external_ref=预置PR标识",
+    "E2.state=UNKNOWN，其Attempt.state=UNKNOWN_EFFECT",
+    "存在含E2 effect_key的诊断事件",
+    "FakeRemote创建调用次数=0"
+   ],
+   "observables": [
+    "effects/attempts/events导出",
+    "FakeRemote调用日志"
+   ]
+  },
+  {
+   "id": "TEST-042-01",
+   "requirement_id": "REQ-042",
+   "acceptance_id": "AC-042-01",
+   "check_id": "unit",
+   "fixture": "FakeClock+固定种子RNG+脚本化FakeAgent+内存SQLite",
+   "steps": [
+    "触发首次派发并依次返回脚本化错误",
+    "每次失败后读取持久的attempt_count/next_retry_at",
+    "推进FakeClock到next_retry_at−1 ms与next_retry_at分别计数派发",
+    "记录每个等待区间的Run状态"
+   ],
+   "pass_criteria": [
+    "5个503 delay均落在[0,min(300,2·2^n)] s",
+    "429后next_retry_at−失败时刻=120 s",
+    "每个等待区间末前1 ms派发数=0，到达时=1",
+    "等待区间Run.state=WAITING_EXTERNAL"
+   ],
+   "observables": [
+    "FakeClock与派发日志",
+    "attempt_count/next_retry_at逐次快照",
+    "RNG种子"
+   ]
+  },
+  {
+   "id": "TEST-042-02",
+   "requirement_id": "REQ-042",
+   "acceptance_id": "AC-042-02",
+   "check_id": "recovery",
+   "fixture": "test feature host（可注入时钟）+FakeAgent+文件DB",
+   "steps": [
+    "制造WAITING_EXTERNAL状态并快照预算与重试字段",
+    "kill -9 host后重启",
+    "再次快照并推进时钟至T+199 s、T+200 s"
+   ],
+   "pass_criteria": [
+    "重启前后attempt_count、next_retry_at、iterations、已用时长逐字段相等",
+    "T+199 s前派发数=0",
+    "T+200 s后派发数=1且attempts仅新增该1行"
+   ],
+   "observables": [
+    "前后字段快照",
+    "派发日志",
+    "events导出"
+   ]
+  },
+  {
+   "id": "TEST-042-03",
+   "requirement_id": "REQ-042",
+   "acceptance_id": "AC-042-03",
+   "check_id": "integration",
+   "fixture": "三种脚本化FakeAgent+能力探测fixture+FakeClock",
+   "steps": [
+    "并行启动R1、R2、R3",
+    "推进FakeClock直到无待重试项",
+    "导出runs/tasks/attempts/events"
+   ],
+   "pass_criteria": [
+    "R1：state=BLOCKED、原因=BLOCKED_AUTH、attempt_count=1、next_retry_at=NULL",
+    "R2：state=BLOCKED、原因=BLOCKED_CAPABILITY、attempts=0",
+    "R3：attempts=9，此后无新dispatch，Task=BLOCKED，存在need_decision事件",
+    "三个Run的state均≠COMPLETED"
+   ],
+   "observables": [
+    "runs/tasks/attempts导出",
+    "events导出",
+    "FakeClock日志"
+   ]
+  },
+  {
+   "id": "TEST-042-04",
+   "requirement_id": "REQ-042",
+   "acceptance_id": "AC-042-04",
+   "check_id": "integration",
+   "fixture": "hoh -p --output json + FakeAgent + FakeClock + 无价格条目的模型配置",
+   "steps": [
+    "以 hoh -p --output json 运行Ra并保存stdout",
+    "运行Rb并推进FakeClock",
+    "导出runs/outbox"
+   ],
+   "pass_criteria": [
+    "Ra迭代数=2，之后outbox无新dispatch",
+    "Ra最终JSON含state=INCOMPLETE、非空剩余REQ列表、cost_usd=null、cost_status=unknown",
+    "Rb.state=INCOMPLETE",
+    "Ra与Rb的state≠COMPLETED"
+   ],
+   "observables": [
+    "Ra stdout JSON与退出码",
+    "runs/outbox导出",
+    "FakeClock日志"
+   ]
+  },
+  {
+   "id": "TEST-042-05",
+   "requirement_id": "REQ-042",
+   "acceptance_id": "AC-042-05",
+   "check_id": "unit",
+   "fixture": "hoh-core重试策略+内存SQLite+重启模拟（重新加载持久计数）",
+   "steps": [
+    "写入F的3次失败与2次协议纠正",
+    "模拟重启并重新加载",
+    "请求第4次本地修复与第3次协议纠正"
+   ],
+   "pass_criteria": [
+    "重载后计数=3与2",
+    "两次请求dispatch数=0",
+    "need_decision事件数=2",
+    "相关Task.state≠ACCEPTED"
+   ],
+   "observables": [
+    "计数快照",
+    "events导出",
+    "测试报告原文"
+   ]
+  },
+  {
+   "id": "TEST-043-01",
+   "requirement_id": "REQ-043",
+   "acceptance_id": "AC-043-01",
+   "check_id": "integration",
+   "fixture": "FakeAgent（8 s，记录是否收到interrupt）+FakeClock+文件DB",
+   "steps": [
+    "启动Run并在第2 s提交PauseRun",
+    "记录Run状态序列与outbox新增",
+    "第12 s提交ResumeRun",
+    "导出events/attempts/outbox"
+   ],
+   "pass_criteria": [
+    "Pause响应202，随后runs.state=PAUSE_REQUESTED且resume_state=RUNNING",
+    "T1 FakeAgent未收到interrupt，A1.state=SETTLED，之后runs.state=PAUSED",
+    "2–12 s之间outbox新增dispatch=0",
+    "Resume后reconcile事件seq<T2 dispatch事件seq，T1 Attempt行数=1"
+   ],
+   "observables": [
+    "events/attempts/outbox导出",
+    "FakeAgent信号/interrupt日志",
+    "Run状态时间线"
+   ]
+  },
+  {
+   "id": "TEST-043-02",
+   "requirement_id": "REQ-043",
+   "acceptance_id": "AC-043-02",
+   "check_id": "integration",
+   "fixture": "生成进程树且忽略interrupt/SIGTERM的FakeAgent+含脏改动的临时Git仓库",
+   "steps": [
+    "记录cancel前git status --porcelain与进程树（pid、pgid）",
+    "提交CancelRun并记录时刻",
+    "CANCELLED后扫描/proc该pgid与僵尸",
+    "再次记录git status并导出events/candidates"
+   ],
+   "pass_criteria": [
+    "相关事件按期望顺序出现",
+    "CANCELLED事件前pgid内存活进程数=0，状态Z进程数=0",
+    "cancel前后git status --porcelain输出逐字节相同",
+    "无verified/accepted标记写入",
+    "CancelRun提交到CANCELLED耗时≤17 s"
+   ],
+   "observables": [
+    "进程树前后快照",
+    "git status输出",
+    "events导出",
+    "耗时记录"
+   ]
+  },
+  {
+   "id": "TEST-043-03",
+   "requirement_id": "REQ-043",
+   "acceptance_id": "AC-043-03",
+   "check_id": "tui-pty",
+   "fixture": "PTY测试驱动+FakeAgent（60 s）+已运行host",
+   "steps": [
+    "attach后对TUI发SIGHUP，检查进程",
+    "重新attach，发SIGTERM，读取终端buffer与stty -a",
+    "重新attach，按Ctrl+C截取选择层，选择脱离",
+    "每次后检查host/Agent pid与runs行"
+   ],
+   "pass_criteria": [
+    "3次TUI进程均退出",
+    "SIGTERM与脱离两次的输出含离开alternate screen序列，stty -a显示icanon与echo",
+    "Ctrl+C后屏幕含脱离、暂停、取消三个选项且TUI未立即退出",
+    "host与Agent pid始终存在",
+    "runs.state与revision在三次退出前后相同"
+   ],
+   "observables": [
+    "PTY原始输出与buffer快照",
+    "stty -a输出",
+    "pid存活采样",
+    "runs快照"
+   ]
+  },
+  {
+   "id": "TEST-043-04",
+   "requirement_id": "REQ-043",
+   "acceptance_id": "AC-043-04",
+   "check_id": "integration",
+   "fixture": "不可用FakeCommander+FakeAgent+文件DB",
+   "steps": [
+    "提交PauseRun并等待PAUSED",
+    "提交CancelRun并等待CANCELLED",
+    "读取FakeCommander调用计数"
+   ],
+   "pass_criteria": [
+    "两次响应均为202",
+    "runs状态时间线包含PAUSED，最终为CANCELLED",
+    "FakeCommander调用次数=0"
+   ],
+   "observables": [
+    "HTTP响应原文",
+    "events导出",
+    "FakeCommander日志"
+   ]
+  },
+  {
+   "id": "TEST-043-05",
+   "requirement_id": "REQ-043",
+   "acceptance_id": "AC-043-05",
+   "check_id": "unit",
+   "fixture": "hoh-core取消状态机+ProcessControl fake+FakeClock",
+   "steps": [
+    "提交CancelRun",
+    "推进FakeClock每1 s读取状态与投影",
+    "令fake报告退出并读取最终状态"
+   ],
+   "pass_criteria": [
+    "0–30 s所有采样runs.state=CANCEL_REQUESTED且投影标签=CANCELLING",
+    "退出报告前CANCELLED事件数=0",
+    "退出报告后恰1条CANCELLED事件"
+   ],
+   "observables": [
+    "状态采样日志",
+    "events导出"
+   ]
+  },
+  {
+   "id": "TEST-044-01",
+   "requirement_id": "REQ-044",
+   "acceptance_id": "AC-044-01",
+   "check_id": "recovery",
+   "fixture": "待该里程碑 spec 任务细化",
+   "steps": [
+    "Git worktree与hash验证"
+   ],
+   "pass_criteria": [
+    "保存失败分支，回到已验证基线；不reset用户未提交改动"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  },
+  {
+   "id": "TEST-045-01",
+   "requirement_id": "REQ-045",
+   "acceptance_id": "AC-045-01",
+   "check_id": "unit",
+   "fixture": "待该里程碑 spec 任务细化",
+   "steps": [
+    "冲突、预算和missing variable测试"
+   ],
+   "pass_criteria": [
+    "合成并记录版本/内容hash；高层覆盖不改变事实证据；过长报错"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  },
+  {
+   "id": "TEST-046-01",
+   "requirement_id": "REQ-046",
+   "acceptance_id": "AC-046-01",
+   "check_id": "integration",
+   "fixture": "待该里程碑 spec 任务细化",
+   "steps": [
+    "无外部skill安装的端到端测试"
+   ],
+   "pass_criteria": [
+    "内置可用无需用户手装；只加载相关技能；原生Skill不可用时内容注入"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  },
+  {
+   "id": "TEST-047-01",
+   "requirement_id": "REQ-047",
+   "acceptance_id": "AC-047-01",
+   "check_id": "integration",
+   "fixture": "待该里程碑 spec 任务细化",
+   "steps": [
+    "覆盖与升级迁移测试"
+   ],
+   "pass_criteria": [
+    "内置/global/project/run按序；显示diff；运行锁定旧版本直到checkpoint"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  },
+  {
+   "id": "TEST-048-01",
+   "requirement_id": "REQ-048",
+   "acceptance_id": "AC-048-01",
+   "check_id": "plugin-live",
+   "fixture": "待该里程碑 spec 任务细化",
+   "steps": [
+    "真实插件压缩+恢复测试"
+   ],
+   "pass_criteria": [
+    "使用指定作者插件，保留任务/证据引用；自动压缩后继续；长期记忆不双开"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  },
+  {
+   "id": "TEST-049-01",
+   "requirement_id": "REQ-049",
+   "acceptance_id": "AC-049-01",
+   "check_id": "plugin-live",
+   "fixture": "待该里程碑 spec 任务细化",
+   "steps": [
+    "失败经验、跨项目隔离、锁冲突"
+   ],
+   "pass_criteria": [
+    "经验标记来源/项目/失效条件；关键验收不靠召回；并发维护可恢复"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  },
+  {
+   "id": "TEST-050-01",
+   "requirement_id": "REQ-050",
+   "acceptance_id": "AC-050-01",
+   "check_id": "plugin-live",
+   "fixture": "待该里程碑 spec 任务细化",
+   "steps": [
+    "reload/compact/新会话作用域"
+   ],
+   "pass_criteria": [
+    "保持会话todo；可映射展示；todo完成不代表全局任务验收"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  },
+  {
+   "id": "TEST-051-01",
+   "requirement_id": "REQ-051",
+   "acceptance_id": "AC-051-01",
+   "check_id": "integration",
+   "fixture": "待M5 spec任务细化；安装/诊断/降级逻辑用本地fixture registry与故障注入测试，不依赖上游插件健康",
+   "steps": [
+    "无UI/双compact hook/安装失败测试"
+   ],
+   "pass_criteria": [
+    "解析固定版本、校验依赖、无手动Skill安装；不支持RPC UI有明确降级"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  },
+  {
+   "id": "TEST-052-01",
+   "requirement_id": "REQ-052",
+   "acceptance_id": "AC-052-01",
+   "check_id": "integration",
+   "fixture": "git init 的临时仓库与固定内容文件",
+   "steps": [
+    "冻结 #1、#2",
+    "新增 untracked 文件",
+    "冻结 #3",
+    "导出 candidates 表与清单"
+   ],
+   "pass_criteria": [
+    "id#1==id#2，且匹配正则",
+    "以清单内容重算的摘要等于 candidate_id",
+    "冻结 #3 返回错误",
+    "count(candidates)=1"
+   ],
+   "observables": [
+    "清单 JSON 与 sha256",
+    "git status --porcelain 输出",
+    "错误信息"
+   ]
+  },
+  {
+   "id": "TEST-052-02",
+   "requirement_id": "REQ-052",
+   "acceptance_id": "AC-052-02",
+   "check_id": "integration",
+   "fixture": "已冻结仓库、写入源文件的检查脚本两种变体",
+   "steps": [
+    "执行变体 1 并导出记录",
+    "从冻结 commit 恢复干净工作树后执行变体 2"
+   ],
+   "pass_criteria": [
+    "两种变体都是 source_unchanged=false",
+    "evidence.outcome=INVALID（两条）",
+    "acceptance_results 中 status=PASS 且 candidate_id=C 的行数=0"
+   ],
+   "observables": [
+    "execution 记录 JSON",
+    "执行前后的 git status/tree",
+    "evidence 行"
+   ]
+  },
+  {
+   "id": "TEST-052-03",
+   "requirement_id": "REQ-052",
+   "acceptance_id": "AC-052-03",
+   "check_id": "integration",
+   "fixture": "已冻结仓库、会写哨兵文件的检查命令",
+   "steps": [
+    "变体 1：修改 test plan 后执行检查",
+    "从冻结 commit 恢复后，变体 2：以不同 argv 请求同一 check_id",
+    "检查哨兵文件与拒绝原因"
+   ],
+   "pass_criteria": [
+    "两个变体都不存在哨兵文件",
+    "变体 1 的原因含 test_plan，变体 2 的原因含 argv",
+    "两个变体都没有 exit_code=0 的执行记录"
+   ],
+   "observables": [
+    "错误输出",
+    "结果记录",
+    "文件系统检查结果"
+   ]
+  },
+  {
+   "id": "TEST-052-04",
+   "requirement_id": "REQ-052",
+   "acceptance_id": "AC-052-04",
+   "check_id": "unit",
+   "fixture": "证据有效性表驱动 fixture",
+   "steps": [
+    "对 e0 与 11 个变体调用 valid(e,c,s)"
+   ],
+   "pass_criteria": [
+    "valid(e0)=true",
+    "11/11 变体 valid=false",
+    "原因码与期望表逐项一致"
+   ],
+   "observables": [
+    "表驱动输入与输出 JSON",
+    "测试报告"
+   ]
+  },
+  {
+   "id": "TEST-053-01",
+   "requirement_id": "REQ-053",
+   "acceptance_id": "AC-053-01",
+   "check_id": "integration",
+   "fixture": "漏功能仓库 fixture（含 AC-A/AC-B 测试）、FakeAgent(developer/qa)、SQLite 临时库",
+   "steps": [
+    "Developer 提交候选与自测报告",
+    "Runtime 冻结 C 并派发 QA",
+    "QA 执行两项检查",
+    "导出 acceptance_results/issues/tasks"
+   ],
+   "pass_criteria": [
+    "AC-B 对 C 的状态为 FAIL",
+    "count(issues where candidate_id=C and state=OPEN)≥1",
+    "candidate 与 task 的状态都≠ACCEPTED",
+    "acceptance_results 的 evidence_id 中不含 Developer attempt 产生的证据"
+   ],
+   "observables": [
+    "两项检查的 execution 记录与 stdout/stderr",
+    "DB 导出",
+    "Developer 自测报告 sha256"
+   ]
+  },
+  {
+   "id": "TEST-053-02",
+   "requirement_id": "REQ-053",
+   "acceptance_id": "AC-053-02",
+   "check_id": "unit",
+   "fixture": "投影函数表驱动 fixture、SQLite 内存库",
+   "steps": [
+    "对 8 个序列调用投影函数",
+    "通过仓储接口尝试 FAIL→PASS 更新"
+   ],
+   "pass_criteria": [
+    "8 个投影结果与期望表逐项一致",
+    "PASS 投影数=1",
+    "更新返回错误，行内容前后逐字段相同"
+   ],
+   "observables": [
+    "表驱动输入与输出 JSON",
+    "更新尝试的错误信息"
+   ]
+  },
+  {
+   "id": "TEST-053-03",
+   "requirement_id": "REQ-053",
+   "acceptance_id": "AC-053-03",
+   "check_id": "integration",
+   "fixture": "SQLite 临时库、自测报告对象、FakeAgent(qa) 捕获输入",
+   "steps": [
+    "冻结 C 并触发 QA 派发",
+    "捕获 QA 输入原文",
+    "计算各段字节偏移"
+   ],
+   "pass_criteria": [
+    "acceptance_ids 集合与 candidate 身份匹配",
+    "offset(AC-A 正文)<offset(哨兵) 且 offset(AC-B 正文)<offset(哨兵)",
+    "哨兵所在段的标签为 diagnostic"
+   ],
+   "observables": [
+    "QA 输入原文与 sha256",
+    "ContextHandoff JSON",
+    "偏移计算输出"
+   ]
+  },
+  {
+   "id": "TEST-053-04",
+   "requirement_id": "REQ-053",
+   "acceptance_id": "AC-053-04",
+   "check_id": "integration",
+   "fixture": "SQLite 临时库、FakeGit 两个 commit、FakeAgent 团队",
+   "steps": [
+    "建立 C1 的验收状态",
+    "提交新 commit 并冻结 C2",
+    "读取 snapshot 与 acceptance_results"
+   ],
+   "pass_criteria": [
+    "snapshot 中 AC-A 对当前 candidate 为 NOT_RUN",
+    "accepted 计数=之前-1",
+    "acceptance_results 行数前后相等",
+    "C2 的 qa 与 reviewer dispatch 各 1 条"
+   ],
+   "observables": [
+    "前后 snapshot JSON",
+    "events 中候选失效与派发记录",
+    "DB 导出"
+   ]
+  },
+  {
+   "id": "TEST-053-05",
+   "requirement_id": "REQ-053",
+   "acceptance_id": "AC-053-05",
+   "check_id": "adapter-live",
+   "fixture": "已登录的 claude 与 pi、植入缺陷仓库、compat manifest 记录版本",
+   "steps": [
+    "启动 run 并完成 Developer 提交",
+    "等待 QA attempt 终结",
+    "导出 sessions/acceptance_results/candidates"
+   ],
+   "pass_criteria": [
+    "session_id(qa)≠session_id(developer)，native_id 不同",
+    "QA 报告 candidate_id=C，且 native_attempt.session_ids 包含报告 session_id",
+    "AC-B 投影∈{FAIL,UNKNOWN,NOT_RUN,INVALID}",
+    "candidate 状态≠ACCEPTED"
+   ],
+   "observables": [
+    "两个原生会话 raw log 与 sha256",
+    "Agent 版本与 resolved model",
+    "DB 导出"
+   ]
+  },
+  {
+   "id": "TEST-054-01",
+   "requirement_id": "REQ-054",
+   "acceptance_id": "AC-054-01",
+   "check_id": "integration",
+   "fixture": "SQLite 临时库、4 个预置 session、符合 schema 的报告与 raw_session 文件",
+   "steps": [
+    "依次提交 4 份报告",
+    "导出 sessions 与 Review 结果"
+   ],
+   "pass_criteria": [
+    "被拒绝的报告数=3，原因含 session 冲突",
+    "被接受的报告数=1，session_id=S_rev",
+    "S_rev.role=reviewer"
+   ],
+   "observables": [
+    "4 份报告原文与 sha256",
+    "拒绝事件",
+    "sessions 导出"
+   ]
+  },
+  {
+   "id": "TEST-054-02",
+   "requirement_id": "REQ-054",
+   "acceptance_id": "AC-054-02",
+   "check_id": "integration",
+   "fixture": "SQLite 临时库、FakeGit 两个 commit、FakeAgent(reviewer)",
+   "steps": [
+    "冻结 C1 并派发 Review",
+    "提交新 commit，冻结 C2",
+    "投递 C1 报告",
+    "读取 snapshot 与 outbox"
+   ],
+   "pass_criteria": [
+    "C1 报告的状态为 stale/rejected for current",
+    "C2 的 review 状态=NOT_RUN",
+    "recipient_role=reviewer 且 candidate_id=C2 的 dispatch 有 1 条",
+    "C1 报告记录仍可查询"
+   ],
+   "observables": [
+    "报告与处理结果",
+    "snapshot JSON",
+    "outbox/events 导出"
+   ]
+  },
+  {
+   "id": "TEST-054-03",
+   "requirement_id": "REQ-054",
+   "acceptance_id": "AC-054-03",
+   "check_id": "integration",
+   "fixture": "SQLite 临时库、FakeClock、FakeAgent(qa 失败/reviewer 成功)",
+   "steps": [
+    "冻结 C",
+    "推进至两个 attempt 都终结",
+    "导出 attempts/outbox/报告"
+   ],
+   "pass_criteria": [
+    "qa 与 reviewer 的 attempt 各 1 个，session_id 不同",
+    "两份 handoff 中的 candidate JSON 相同",
+    "max(started_at)<min(ended_at)",
+    "Review 报告存在，raw_session 的 sha256 可校验",
+    "candidate 状态≠ACCEPTED"
+   ],
+   "observables": [
+    "attempts 时间区间",
+    "handoff 消息原文",
+    "报告与 raw_session"
+   ]
+  },
+  {
+   "id": "TEST-054-04",
+   "requirement_id": "REQ-054",
+   "acceptance_id": "AC-054-04",
+   "check_id": "integration",
+   "fixture": "SQLite 临时库、带 raw_session 文件的 Review fixture",
+   "steps": [
+    "投递报告",
+    "导出 issues",
+    "从每条 issue 回溯报告并校验 hash"
+   ],
+   "pass_criteria": [
+    "新增 issues 行数=2，severity 集合={critical,low}",
+    "每行 fingerprint 非空，且引用 F1 或 F2",
+    "回溯链上的 sha256 全部匹配",
+    "candidate 状态≠ACCEPTED"
+   ],
+   "observables": [
+    "报告 JSON 与 raw_session sha256",
+    "issues 导出",
+    "回溯校验输出"
+   ]
+  },
+  {
+   "id": "TEST-054-05",
+   "requirement_id": "REQ-054",
+   "acceptance_id": "AC-054-05",
+   "check_id": "unit",
+   "fixture": "汇合函数表驱动 fixture",
+   "steps": [
+    "生成 96 种组合",
+    "逐一调用并统计"
+   ],
+   "pass_criteria": [
+    "ACCEPTED 计数=1",
+    "含 UNKNOWN 的组合全部非 ACCEPTED",
+    "Review=PASS 且检查 FAIL 的组合全部非 ACCEPTED",
+    "检查为空列表的组合全部非 ACCEPTED"
+   ],
+   "observables": [
+    "96 行组合结果表",
+    "测试报告"
+   ]
+  },
+  {
+   "id": "TEST-055-01",
+   "requirement_id": "REQ-055",
+   "acceptance_id": "AC-055-01",
+   "check_id": "integration",
+   "fixture": "待该里程碑 spec 任务细化",
+   "steps": [
+    "回归植入与重试证据测试"
+   ],
+   "pass_criteria": [
+    "打开regression issue；保留所有attempt；flaky不被覆盖成纯PASS"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  },
+  {
+   "id": "TEST-056-01",
+   "requirement_id": "REQ-056",
+   "acceptance_id": "AC-056-01",
+   "check_id": "integration",
+   "fixture": "待该里程碑 spec 任务细化",
+   "steps": [
+    "negative release-gate测试"
+   ],
+   "pass_criteria": [
+    "所有required需求与检查有同版本有效证据；空集合、skip、mock不能冒充真实"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  },
+  {
+   "id": "TEST-057-01",
+   "requirement_id": "REQ-057",
+   "acceptance_id": "AC-057-01",
+   "check_id": "deployment",
+   "fixture": "待该里程碑 spec 任务细化",
+   "steps": [
+    "fresh VM部署验收"
+   ],
+   "pass_criteria": [
+    "执行PTY/浏览器/安装/升级/回滚实际流程；不是截图看起来不错就通过"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  },
+  {
+   "id": "TEST-058-01",
+   "requirement_id": "REQ-058",
+   "acceptance_id": "AC-058-01",
+   "check_id": "web-e2e",
+   "fixture": "待该里程碑 spec 任务细化",
+   "steps": [
+    "浏览器与TUI同状态测试"
+   ],
+   "pass_criteria": [
+    "同一Engine，不启动第二任务循环；可查看规格/团队/时间线/证据"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  },
+  {
+   "id": "TEST-059-01",
+   "requirement_id": "REQ-059",
+   "acceptance_id": "AC-059-01",
+   "check_id": "web-e2e",
+   "fixture": "待该里程碑 spec 任务细化",
+   "steps": [
+    "disconnect/history retention测试"
+   ],
+   "pass_criteria": [
+    "序号去重、replay/live交接无遗漏；过期cursor走snapshot resync"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  },
+  {
+   "id": "TEST-060-01",
+   "requirement_id": "REQ-060",
+   "acceptance_id": "AC-060-01",
+   "check_id": "web-e2e",
+   "fixture": "待该里程碑 spec 任务细化",
+   "steps": [
+    "并发409与重试幂等测试"
+   ],
+   "pass_criteria": [
+    "expected_revision校验；冲突明确；只有一写者，可读多个客户端"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  },
+  {
+   "id": "TEST-061-01",
+   "requirement_id": "REQ-061",
+   "acceptance_id": "AC-061-01",
+   "check_id": "web-e2e",
+   "fixture": "待该里程碑 spec 任务细化",
+   "steps": [
+    "Playwright功能+可达性"
+   ],
+   "pass_criteria": [
+    "核心功能可用；默认loopback；没有桌面环境也可访问"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  },
+  {
+   "id": "TEST-062-01",
+   "requirement_id": "REQ-062",
+   "acceptance_id": "AC-062-01",
+   "check_id": "integration",
+   "fixture": "本地盘临时Git项目+host+外部sqlite3持锁脚本",
+   "steps": [
+    "启动host，经诊断接口读取每个连接PRAGMA",
+    "经reader连接尝试INSERT",
+    "外部连接持锁2 s，期间提交PauseRun与GET并计时",
+    "外部连接持锁7 s，期间提交PauseRun与GET并计时",
+    "读取runs行"
+   ],
+   "pass_criteria": [
+    "每个连接PRAGMA值与期望完全相同",
+    "reader写入返回只读错误",
+    "持锁2 s：HTTP 202，耗时≤5 s",
+    "持锁7 s：HTTP 503、code=DB_BUSY、retryable=true，耗时∈[5,6] s，runs.state与revision不变",
+    "两次GET均200且耗时≤500 ms"
+   ],
+   "observables": [
+    "PRAGMA输出",
+    "HTTP请求/响应与耗时",
+    "runs快照",
+    "外部持锁脚本日志"
+   ]
+  },
+  {
+   "id": "TEST-062-02",
+   "requirement_id": "REQ-062",
+   "acceptance_id": "AC-062-02",
+   "check_id": "integration",
+   "fixture": "host（队列容量=8的测试配置）+并发HTTP负载脚本",
+   "steps": [
+    "并发提交4000条命令并记录每条响应",
+    "导出commands/events/outbox",
+    "以command_id关联响应与DB行"
+   ],
+   "pass_criteria": [
+    "响应只包含202或retryable=true的错误，无SQLITE_BUSY字样",
+    "每个202的command_id对应events恰1行、outbox恰1行",
+    "events.seq严格递增且无重复",
+    "202但DB无记录的命令数=0"
+   ],
+   "observables": [
+    "4000条响应记录",
+    "commands/events/outbox导出",
+    "关联检查输出"
+   ]
+  },
+  {
+   "id": "TEST-062-03",
+   "requirement_id": "REQ-062",
+   "acceptance_id": "AC-062-03",
+   "check_id": "integration",
+   "fixture": "临时文件DB+dispatcher+qa消费者测试实现",
+   "steps": [
+    "记录T.revision与events行数",
+    "投递M两次并记录两次结果",
+    "提交含非法外键的事务",
+    "导出receipts/tasks/events"
+   ],
+   "pass_criteria": [
+    "receipts中consumer=qa且message_id=M行数=1",
+    "T.revision=原值+1",
+    "两次投递result_json逐字节相同",
+    "非法事务错误类别=IntegrityViolation，events行数只因M增加"
+   ],
+   "observables": [
+    "receipts/tasks/events导出",
+    "两次投递结果原文",
+    "错误响应原文"
+   ]
+  },
+  {
+   "id": "TEST-062-04",
+   "requirement_id": "REQ-062",
+   "acceptance_id": "AC-062-04",
+   "check_id": "integration",
+   "fixture": "可注入的mountinfo fixture文件+临时目录模拟/p1–/p5",
+   "steps": [
+    "对5个路径调用检查函数",
+    "注入fixture后在/p1启动host",
+    "记录退出码、stderr并列出/p1/.hoh内容"
+   ],
+   "pass_criteria": [
+    "p1、p2、p3结果=DB_ON_NETWORK_FS，p4、p5结果=通过",
+    "host退出码≠0且stderr含DB_ON_NETWORK_FS",
+    "/p1/.hoh下匹配*.db、*-wal、*-shm的文件数=0"
+   ],
+   "observables": [
+    "检查结果表",
+    "host stdout/stderr/退出码",
+    "目录列表"
+   ]
+  },
+  {
+   "id": "TEST-062-05",
+   "requirement_id": "REQ-062",
+   "acceptance_id": "AC-062-05",
+   "check_id": "static",
+   "fixture": "冻结candidate源码+白名单配置文件",
+   "steps": [
+    "在candidate上运行扫描脚本",
+    "检查web/package-lock.json中的SQLite依赖"
+   ],
+   "pass_criteria": [
+    "白名单外SQL写语句及写API命中数=0",
+    "web依赖中无sqlite相关包",
+    "扫描文件数>0（防空扫描）"
+   ],
+   "observables": [
+    "扫描stdout与命中列表",
+    "白名单文件hash",
+    "candidate身份"
+   ]
+  },
+  {
+   "id": "TEST-063-01",
+   "requirement_id": "REQ-063",
+   "acceptance_id": "AC-063-01",
+   "check_id": "recovery",
+   "fixture": "待该里程碑 spec 任务细化",
+   "steps": [
+    "backup API restore与migration roundtrip"
+   ],
+   "pass_criteria": [
+    "一致性备份并校验；新旧schema兼容策略；旧binary不读高版本DB"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  },
+  {
+   "id": "TEST-064-01",
+   "requirement_id": "REQ-064",
+   "acceptance_id": "AC-064-01",
+   "check_id": "integration",
+   "fixture": "待该里程碑 spec 任务细化",
+   "steps": [
+    "百万事件/磁盘满/慢客户端测试"
+   ],
+   "pass_criteria": [
+    "结构化索引+对象文件；分页虚拟列表；日志轮换；引用证据不被清理"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  },
+  {
+   "id": "TEST-065-01",
+   "requirement_id": "REQ-065",
+   "acceptance_id": "AC-065-01",
+   "check_id": "integration",
+   "fixture": "待该里程碑 spec 任务细化",
+   "steps": [
+    "rebase/change-base/无remote用例"
+   ],
+   "pass_criteria": [
+    "分支候选、PR/CI可选；merge后重新绑定最终SHA；无remote本地release可验收"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  },
+  {
+   "id": "TEST-066-01",
+   "requirement_id": "REQ-066",
+   "acceptance_id": "AC-066-01",
+   "check_id": "deployment",
+   "fixture": "待该里程碑 spec 任务细化",
+   "steps": [
+    "全新VM安装和卸载保留数据"
+   ],
+   "pass_criteria": [
+    "二进制、内置资源、Web资产版本一致；安装配置命令经实跑"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  },
+  {
+   "id": "TEST-067-01",
+   "requirement_id": "REQ-067",
+   "acceptance_id": "AC-067-01",
+   "check_id": "soak",
+   "fixture": "待该里程碑 spec 任务细化",
+   "steps": [
+    "72h soak + crash/recovery 留原始时间证据"
+   ],
+   "pass_criteria": [
+    "无未处理崩溃/重复写；服务暂不可用可恢复；至少20个有证据的真实工程轮次"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  },
+  {
+   "id": "TEST-068-01",
+   "requirement_id": "REQ-068",
+   "acceptance_id": "AC-068-01",
+   "check_id": "integration",
+   "fixture": "待该里程碑 spec 任务细化",
+   "steps": [
+    "至少1000次样本与机器配置"
+   ],
+   "pass_criteria": [
+    "idle core RSS≤150MiB(不含Agents/浏览器)，TUI输入p95≤100ms，事件可见p95≤500ms"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  },
+  {
+   "id": "TEST-069-01",
+   "requirement_id": "REQ-069",
+   "acceptance_id": "AC-069-01",
+   "check_id": "traceability",
+   "fixture": "待该里程碑 spec 任务细化",
+   "steps": [
+    "交付报告与原始记录一致性审计"
+   ],
+   "pass_criteria": [
+    "明确哪些测试真实、模拟、跳过；未通过绝不称生产完成"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  },
+  {
+   "id": "TEST-070-01",
+   "requirement_id": "REQ-070",
+   "acceptance_id": "AC-070-01",
+   "check_id": "deployment",
+   "fixture": "待该里程碑 spec 任务细化",
+   "steps": [
+    "升级迁移及基线比较"
+   ],
+   "pass_criteria": [
+    "锁版本+固定回归任务；每次变更跑对照；不在活跃run自动升级"
+   ],
+   "observables": [
+    "输入与命令",
+    "事件序列",
+    "stdout/stderr",
+    "实际版本",
+    "判定结果"
+   ]
+  }
+ ]
 }
