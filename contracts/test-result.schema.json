@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:hoh:test-result:1.0",
+  "title": "One line of $HOH_EVIDENCE_DIR/test-results.jsonl: the outcome of one executed test case that covers one TEST id (CR-003).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "test_id",
+    "name",
+    "status"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "test_id": {
+      "type": "string",
+      "pattern": "^TEST-[0-9]{3}-[0-9]{2}$"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "description": "Test case name as reported by the runner."
+    },
+    "status": {
+      "enum": [
+        "PASS",
+        "FAIL",
+        "DEGRADED",
+        "SKIPPED"
+      ]
+    },
+    "duration_ms": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "detail": {
+      "type": "string",
+      "maxLength": 4096
+    }
+  }
+}

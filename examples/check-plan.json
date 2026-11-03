@@ -1,21 +1,21 @@
 {
   "schema_version": "1.0",
   "plan_id": "hoh-product-example",
-  "description": "Example only. M0-T03 copies this to tests/check-plan.json and replaces every command with the real one once it exists. Scripts under scripts/product/ are created by the milestone that needs them. Live checks must write live-sessions.json (contracts/live-session.schema.json) into $HOH_EVIDENCE_DIR; the soak check also writes timeline.jsonl (contracts/soak-event.schema.json).",
+  "description": "Example only. M0-T03 copies this to tests/check-plan.json and replaces every command with the real one once it exists. Scripts under scripts/product/ are created by the milestone that needs them. Live checks must write live-sessions.json (contracts/live-session.schema.json) into $HOH_EVIDENCE_DIR; the soak check also writes timeline.jsonl (contracts/soak-event.schema.json). Every check that is the scenario check of an AC writes test-results.jsonl (contracts/test-result.schema.json); independent checks write independent-report.json (tools/agent_task.py --report-out); build writes hoh-release.tar.gz (CR-003).",
   "checks": {
-    "build": {"mode": "product", "argv": ["bash", "scripts/product/build.sh"], "timeout_seconds": 3600, "description": "cargo build --workspace --release --locked; npm ci && npm run build in web/ (from M6)"},
-    "static": {"mode": "product", "argv": ["bash", "scripts/product/static.sh"], "timeout_seconds": 1800, "description": "cargo fmt --check; cargo clippy --workspace --all-targets --locked -D warnings; tsc/eslint for web/"},
-    "unit": {"mode": "product", "argv": ["cargo", "test", "--workspace", "--locked", "--lib"], "timeout_seconds": 3600},
-    "integration": {"mode": "product", "argv": ["cargo", "test", "--workspace", "--locked", "--tests"], "timeout_seconds": 3600},
-    "recovery": {"mode": "product", "argv": ["bash", "scripts/product/recovery-suite.sh"], "timeout_seconds": 7200, "description": "kill -9 / restart / lost-ACK fault matrix from docs/09-testing.md"},
-    "adapter-live": {"mode": "live", "argv": ["bash", "scripts/product/live-adapters.sh"], "timeout_seconds": 7200, "artifacts": ["live-sessions.json"]},
-    "plugin-live": {"mode": "live", "argv": ["bash", "scripts/product/live-plugins.sh"], "timeout_seconds": 7200, "artifacts": ["live-sessions.json", "plugin-matrix.json"]},
-    "tui-pty": {"mode": "product", "argv": ["bash", "scripts/product/tui-pty.sh"], "timeout_seconds": 3600},
-    "web-e2e": {"mode": "product", "argv": ["bash", "scripts/product/web-e2e.sh"], "timeout_seconds": 3600},
-    "deployment": {"mode": "product", "argv": ["bash", "scripts/product/deploy-smoke.sh"], "timeout_seconds": 3600},
-    "soak": {"mode": "live", "argv": ["bash", "scripts/product/soak.sh"], "timeout_seconds": 345600, "artifacts": ["live-sessions.json", "timeline.jsonl"]},
-    "independent-qa": {"mode": "live", "argv": ["bash", "scripts/product/independent.sh", "qa"], "timeout_seconds": 14400, "artifacts": ["live-sessions.json", "report.json"]},
-    "independent-review": {"mode": "live", "argv": ["bash", "scripts/product/independent.sh", "reviewer"], "timeout_seconds": 14400, "artifacts": ["live-sessions.json", "report.json"]},
-    "traceability": {"mode": "product", "argv": ["bash", "scripts/product/traceability.sh"], "timeout_seconds": 1800}
+    "build": {"mode": "product", "argv": ["bash", "scripts/product/build.sh"], "timeout_seconds": 3600, "description": "cargo build --workspace --release --locked; npm ci && npm run build in web/ (from M6)", "artifacts": ["hoh-release.tar.gz"]},
+    "static": {"mode": "product", "argv": ["bash", "scripts/product/static.sh"], "timeout_seconds": 1800, "description": "cargo fmt --check; cargo clippy --workspace --all-targets --locked -D warnings; tsc/eslint for web/", "artifacts": ["test-results.jsonl"]},
+    "unit": {"mode": "product", "argv": ["cargo", "test", "--workspace", "--locked", "--lib"], "timeout_seconds": 3600, "artifacts": ["test-results.jsonl"]},
+    "integration": {"mode": "product", "argv": ["cargo", "test", "--workspace", "--locked", "--tests"], "timeout_seconds": 3600, "artifacts": ["test-results.jsonl"]},
+    "recovery": {"mode": "product", "argv": ["bash", "scripts/product/recovery-suite.sh"], "timeout_seconds": 7200, "description": "kill -9 / restart / lost-ACK fault matrix from docs/09-testing.md", "artifacts": ["test-results.jsonl"]},
+    "adapter-live": {"mode": "live", "argv": ["bash", "scripts/product/live-adapters.sh"], "timeout_seconds": 7200, "artifacts": ["live-sessions.json", "test-results.jsonl"]},
+    "plugin-live": {"mode": "live", "argv": ["bash", "scripts/product/live-plugins.sh"], "timeout_seconds": 7200, "artifacts": ["live-sessions.json", "plugin-matrix.json", "test-results.jsonl"]},
+    "tui-pty": {"mode": "product", "argv": ["bash", "scripts/product/tui-pty.sh"], "timeout_seconds": 3600, "artifacts": ["test-results.jsonl"]},
+    "web-e2e": {"mode": "product", "argv": ["bash", "scripts/product/web-e2e.sh"], "timeout_seconds": 3600, "artifacts": ["test-results.jsonl"]},
+    "deployment": {"mode": "product", "argv": ["bash", "scripts/product/deploy-smoke.sh"], "timeout_seconds": 3600, "artifacts": ["test-results.jsonl"]},
+    "soak": {"mode": "live", "argv": ["bash", "scripts/product/soak.sh"], "timeout_seconds": 345600, "artifacts": ["live-sessions.json", "timeline.jsonl", "test-results.jsonl"]},
+    "independent-qa": {"mode": "live", "argv": ["bash", "scripts/product/independent.sh", "qa"], "timeout_seconds": 14400, "artifacts": ["live-sessions.json", "independent-report.json"]},
+    "independent-review": {"mode": "live", "argv": ["bash", "scripts/product/independent.sh", "reviewer"], "timeout_seconds": 14400, "artifacts": ["live-sessions.json", "independent-report.json"]},
+    "traceability": {"mode": "product", "argv": ["bash", "scripts/product/traceability.sh"], "timeout_seconds": 1800, "artifacts": ["test-results.jsonl"]}
   }
 }

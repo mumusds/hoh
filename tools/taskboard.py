@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """Small locked development ledger, not the HoH product task database.
 
-Plan: contracts/development-tasks.json. State: .hoh-dev/task-state.json.
+Plan: contracts/development-tasks.json. State: .hoh-dev/task-state.json of the MAIN worktree, so a
+linked worktree (for example a frozen soak checkout) shares one ledger instead of forking it.
 Rules enforced here: atomic claim with owner, legal transitions only, at most
 one running writer task (single writer), implementation/verification tasks
 only for requirements whose spec_maturity is "detailed" (readiness), and
 reopening a done task blocks every dependent that already started.
 """
 from __future__ import annotations
-import argparse, fcntl, json, sys
+import argparse, fcntl, json, subprocess, sys
 from pathlib import Path
 from common import ROOT,atomic_json,load_json,utcnow
 
@@ -25,6 +26,12 @@ def dependents(tasks:list[dict],task_id:str)->set[str]:
             if cur in t['depends_on'] and t['id'] not in found:found.add(t['id']);frontier.append(t['id'])
     return found
 
+def ledger_root(root:Path)->Path:
+    """Main worktree of the repository containing root; root itself outside Git."""
+    r=subprocess.run(['git','rev-parse','--path-format=absolute','--git-common-dir'],cwd=root,capture_output=True,text=True)
+    common=Path(r.stdout.strip()) if r.returncode==0 and r.stdout.strip() else None
+    return common.parent if common is not None and common.name=='.git' else root
+
 def readiness_problems(task:dict,maturity:dict[str,str])->list[str]:
     if task.get('kind') not in NEEDS_DETAILED_SPEC:return []
     return [r for r in task['requirements'] if maturity.get(r)!='detailed']
@@ -37,7 +44,7 @@ def main(argv=None):
     p.add_argument('--note',default='');a=p.parse_args(argv)
     source=load_json(ROOT/'contracts/development-tasks.json')['tasks'];index={t['id']:t for t in source}
     maturity={r['id']:r.get('spec_maturity','outline') for r in load_json(ROOT/'contracts/requirements.json')['requirements']}
-    statefile=ROOT/'.hoh-dev/task-state.json';statefile.parent.mkdir(exist_ok=True)
+    statefile=ledger_root(ROOT)/'.hoh-dev/task-state.json';statefile.parent.mkdir(exist_ok=True)
     with (statefile.parent/'task-state.lock').open('a+') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX)
         data=load_json(statefile) if statefile.exists() else {'tasks':{},'history':[]}
@@ -73,8 +80,9 @@ def main(argv=None):
                         if status(d) in ('running','done'):record(d,'blocked',f'dependency {a.task_id} reopened: {a.note}')
                 atomic_json(statefile,data)
             elif a.action=='next':
-                candidates=[t for t in source if ready(t)]
-                print(json.dumps(candidates[0] if candidates else {'message':'No ready pending task; inspect running/blocked tasks, outline requirements and actual evidence.'},ensure_ascii=False,indent=2))
+                writer_busy=any(index[i].get('writer') and status(i)=='running' for i in index)
+                candidates=[t for t in source if ready(t) and not (writer_busy and t.get('writer'))]
+                print(json.dumps(candidates[0] if candidates else {'message':'No ready pending task'+(' (a writer task is running; only non-writer tasks can start)' if writer_busy else '')+'; inspect running/blocked tasks, outline requirements and actual evidence.'},ensure_ascii=False,indent=2))
             else:
                 for t in source:
                     s=data['tasks'].get(t['id'],{});owner=f" @{s['owner']}" if s.get('owner') and status(t['id'])=='running' else ''

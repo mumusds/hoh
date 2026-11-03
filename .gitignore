@@ -10,3 +10,19 @@ __pycache__/
 .env.*
 !.env.example
 .pi/npm/
+# Machine-local Claude Code settings; the shared hook config is .claude/settings.json.
+.claude/settings.local.json
+# Node/Web dependencies and test outputs (Web GUI arrives in M6).
+node_modules/
+web/coverage/
+web/playwright-report/
+web/test-results/
+# Rust coverage and profiling output.
+*.profraw
+*.profdata
+lcov.info
+# Editors and OS files.
+.idea/
+.vscode/
+*.swp
+.DS_Store

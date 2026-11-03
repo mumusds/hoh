@@ -47,7 +47,7 @@
 ## 输出契约
 - AC状态：PASS（Then被观察满足且证据有效）/ FAIL / DEGRADED / BLOCKED / UNKNOWN / NOT_RUN / INVALID / FLAKY。每个AC写一条 `contracts/acceptance-observation.schema.json` 记录（ac_id、test_id、candidate_id、spec_sha256、status、check_ids、observed、raw_evidence；DEGRADED另需degradation）；status取schema枚举；BLOCKED在observed写明精确缺项，FLAKY保留首次失败与重试记录。
 - 执行记录：`contracts/execution.schema.json`，由工具生成，不手写。
-- 独立报告 `contracts/independent-report.schema.json`（字段以schema当前版本为准）：schema_version、role="qa"、session_id、candidate_id、spec_sha256、status、scope（AC-NNN-MM列表）、findings、raw_session{path,sha256}、native_attempt{path,sha256}（产生本报告的原生attempt记录，由Runtime/桥提供，不得伪造）。status：PASS=scope内每个AC为PASS或合规DEGRADED；FAIL=任一FAIL/INVALID；UNKNOWN=无FAIL但有UNKNOWN/NOT_RUN/BLOCKED。findings每条为{id, severity, summary, evidence}，summary以“AC-NNN-MM 状态：”开头。
+- 独立报告 `contracts/independent-report.schema.json`（字段以schema当前版本为准）：schema_version、role="qa"、session_id、candidate_id、spec_sha256、status、scope（AC-NNN-MM列表）、findings、raw_session{path,sha256}、native_attempt{path,sha256}（产生本报告的原生attempt记录，由Runtime/桥提供，不得伪造）。会话结束时，最后一条消息必须以 ```hoh-report 代码块给出 JSON 对象 {role, status, scope, findings}（role="qa"）；session_id、candidate_id、spec_sha256、raw_session、native_attempt 由桥在会话结束后填写（`tools/agent_task.py --report-out`），自己写这些字段会被拒绝。status：PASS=scope内每个AC为PASS或合规DEGRADED；FAIL=任一FAIL/INVALID；UNKNOWN=无FAIL但有UNKNOWN/NOT_RUN/BLOCKED。findings每条为{id, severity, summary, evidence}，summary以“AC-NNN-MM 状态：”开头。
 - TaskResult（`contracts/protocol.schema.json`）：role="qa"、candidate_id=被测候选、evidence引用报告/观察/执行记录、issues每项含severity、ac_id、repro、expected、observed、evidence、fingerprint；不得添加schema外字段。status：COMPLETED=报告完整产出（无论候选PASS或FAIL）；BLOCKED=候选无效或前提缺失；INCOMPLETE=预算耗尽并列出NOT_RUN项；FAILED=QA尝试本身无法运行。
 
 ## 停止条件

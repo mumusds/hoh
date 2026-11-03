@@ -73,7 +73,10 @@
           "maxLength": 160
         },
         "task_id": {
-          "type": "string",
+          "type": [
+            "string",
+            "null"
+          ],
           "minLength": 1,
           "maxLength": 160
         },
@@ -95,11 +98,17 @@
           "pattern": "^[a-f0-9]{64}$"
         },
         "candidate": {
-          "$ref": "#/$defs/Candidate"
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Candidate"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "acceptance_ids": {
           "type": "array",
-          "minItems": 1,
           "uniqueItems": true,
           "items": {
             "type": "string",
@@ -121,6 +130,66 @@
         "budget_tokens": {
           "type": "integer",
           "minimum": 1
+        },
+        "handoff_kind": {
+          "enum": [
+            "verification",
+            "role_change",
+            "task"
+          ]
+        },
+        "spec_revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "state": {
+          "description": "Checkpoint package for a role change (REQ-019 B[3]); ids reference rows, never transcripts.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "applied_decision_ids",
+            "open_issue_ids",
+            "unacked_message_ids",
+            "queued_input_ids"
+          ],
+          "properties": {
+            "applied_decision_ids": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 160
+              }
+            },
+            "open_issue_ids": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 160
+              }
+            },
+            "unacked_message_ids": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 160
+              }
+            },
+            "queued_input_ids": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 160
+              }
+            }
+          }
         }
       },
       "required": [
@@ -135,7 +204,67 @@
         "acceptance_ids",
         "references",
         "output_contract",
-        "budget_tokens"
+        "budget_tokens",
+        "handoff_kind",
+        "spec_revision"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "handoff_kind": {
+                "const": "verification"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "candidate": {
+                "$ref": "#/$defs/Candidate"
+              },
+              "task_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 160
+              },
+              "acceptance_ids": {
+                "minItems": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "handoff_kind": {
+                "const": "task"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "task_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 160
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "handoff_kind": {
+                "const": "role_change"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "state"
+            ]
+          }
+        }
       ]
     },
     "Message": {
@@ -224,6 +353,16 @@
         },
         "payload": {
           "type": "object"
+        },
+        "reason_code": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RejectionReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -243,6 +382,27 @@
         "candidate_id",
         "kind",
         "payload"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "rejected"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "reason_code"
+            ],
+            "properties": {
+              "reason_code": {
+                "$ref": "#/$defs/RejectionReason"
+              }
+            }
+          }
+        }
       ]
     },
     "Event": {
@@ -267,7 +427,10 @@
           "maxLength": 160
         },
         "run_id": {
-          "type": "string",
+          "type": [
+            "string",
+            "null"
+          ],
           "minLength": 1,
           "maxLength": 160
         },
@@ -453,7 +616,8 @@
                       "ASK",
                       "STEER",
                       "CHANGE",
-                      "CONTROL"
+                      "CONTROL",
+                      "REPLY"
                     ]
                   }
                 },
@@ -757,6 +921,351 @@
         "issues",
         "next_action"
       ]
+    },
+    "BlockedReason": {
+      "description": "runs/tasks/role_bindings.blocked_reason (CR-003). Precedence for runs: BLOCKED_AUTH > COMMANDER_UNAVAILABLE > BUDGET_UNENFORCEABLE > BLOCKED_CAPABILITY > NEED_DECISION.",
+      "enum": [
+        "NEED_DECISION",
+        "BLOCKED_AUTH",
+        "BLOCKED_CAPABILITY",
+        "COMMANDER_UNAVAILABLE",
+        "BUDGET_UNENFORCEABLE",
+        "AGENT_UNAVAILABLE",
+        "MODEL_UNAVAILABLE",
+        "COMPAT_UNVERIFIED"
+      ]
+    },
+    "RejectionReason": {
+      "description": "decisions.reason_code and Message kind=rejected payload.reason_code (CR-003).",
+      "enum": [
+        "STALE_ROLE_EPOCH",
+        "STALE_REVISION",
+        "STALE_LEASE_EPOCH",
+        "SPEC_MISMATCH",
+        "CANDIDATE_MISMATCH",
+        "ILLEGAL_TRANSITION",
+        "DEPENDENCY_NOT_ACCEPTED",
+        "BUDGET_NOT_RESERVABLE",
+        "ROLE_CAPABILITY_MISSING",
+        "EVIDENCE_GATE_UNMET",
+        "SESSION_NOT_INDEPENDENT",
+        "KEY_REUSE"
+      ]
+    },
+    "ErrorCode": {
+      "description": "API Error.code / CLI stderr code / attempt failure_reason (CR-003).",
+      "enum": [
+        "CAPABILITY_UNSUPPORTED",
+        "RUN_NOT_FOUND",
+        "DB_BUSY",
+        "DB_ON_NETWORK_FS",
+        "DB_WAL_UNSUPPORTED",
+        "INVALID_TEAM_CONFIG",
+        "CONTEXT_BUDGET_TOO_SMALL",
+        "PROTOCOL_FRAME_TOO_LARGE",
+        "PROTOCOL_INCOMPLETE",
+        "DAG_CYCLE",
+        "DAG_MISSING_DEPENDENCY",
+        "SCORE_OUT_OF_RANGE",
+        "CURSOR_EXPIRED"
+      ]
+    },
+    "ReasonCode": {
+      "description": "Every reason code HoH emits. New codes need a CR (CR-003).",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/BlockedReason"
+        },
+        {
+          "$ref": "#/$defs/RejectionReason"
+        },
+        {
+          "$ref": "#/$defs/ErrorCode"
+        }
+      ]
+    },
+    "DecisionPayload": {
+      "description": "Commander proposal body, validated by the Runtime before any state change (REQ-035, CR-003).",
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "task_id",
+            "role"
+          ],
+          "properties": {
+            "kind": {
+              "const": "dispatch"
+            },
+            "task_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 160
+            },
+            "role": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 160
+            },
+            "note": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "task_id",
+            "to_state"
+          ],
+          "properties": {
+            "kind": {
+              "const": "transition_task"
+            },
+            "task_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 160
+            },
+            "to_state": {
+              "enum": [
+                "PENDING",
+                "READY",
+                "LEASED",
+                "RUNNING",
+                "IMPLEMENTED",
+                "VERIFYING",
+                "ACCEPTED",
+                "BLOCKED",
+                "CANCELLED"
+              ]
+            },
+            "reason": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "to_state"
+          ],
+          "properties": {
+            "kind": {
+              "const": "transition_run"
+            },
+            "to_state": {
+              "enum": [
+                "CREATED",
+                "DISCOVERING",
+                "SPECIFYING",
+                "READY",
+                "RUNNING",
+                "VERIFYING",
+                "PAUSE_REQUESTED",
+                "PAUSED",
+                "WAITING_EXTERNAL",
+                "BLOCKED",
+                "CANCEL_REQUESTED",
+                "CANCELLED",
+                "INCOMPLETE",
+                "FAILED",
+                "COMPLETED"
+              ]
+            },
+            "accepted_requirements": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 160
+              }
+            },
+            "reason": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "question_id",
+            "question",
+            "requires_user"
+          ],
+          "properties": {
+            "kind": {
+              "const": "request_user_decision"
+            },
+            "question_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 160
+            },
+            "question": {
+              "type": "string",
+              "minLength": 1
+            },
+            "choices": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "choice_id",
+                  "label"
+                ],
+                "properties": {
+                  "choice_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 160
+                  },
+                  "label": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              }
+            },
+            "requires_user": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "plan"
+          ],
+          "properties": {
+            "kind": {
+              "const": "create_tasks"
+            },
+            "plan": {
+              "$ref": "#/$defs/PlanProposal"
+            }
+          }
+        },
+        {
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "statement",
+            "basis"
+          ],
+          "properties": {
+            "kind": {
+              "const": "record_assumption"
+            },
+            "statement": {
+              "type": "string",
+              "minLength": 1
+            },
+            "basis": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      ]
+    },
+    "PlanProposal": {
+      "description": "Task plan submitted for validation (REQ-038). Values outside 0..5 are refused with SCORE_OUT_OF_RANGE by the Runtime; the schema states the valid range.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tasks"
+      ],
+      "properties": {
+        "tasks": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "task_id",
+              "title",
+              "role",
+              "writer",
+              "depends_on",
+              "requirement_ids"
+            ],
+            "properties": {
+              "task_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 160
+              },
+              "title": {
+                "type": "string",
+                "minLength": 1
+              },
+              "role": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 160
+              },
+              "writer": {
+                "type": "boolean"
+              },
+              "depends_on": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 160
+                },
+                "uniqueItems": true
+              },
+              "requirement_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 160
+                },
+                "uniqueItems": true
+              },
+              "user_value": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 5
+              },
+              "unblock_value": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 5
+              },
+              "risk_reduction": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 5
+              },
+              "information_gain": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 5
+              },
+              "cost_estimate": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 5
+              }
+            }
+          }
+        }
+      }
     }
   },
   "oneOf": [

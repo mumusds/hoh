@@ -27,17 +27,42 @@
         },
         "responses": {
           "202": {
-            "description": "Accepted",
+            "description": "Durably accepted (not task completion). A replay with the same idempotency_key and the same payload hash returns the original 202 body byte for byte and sets Idempotent-Replayed: true; the same key with a different payload is 409 KEY_REUSE (CR-003).",
+            "headers": {
+              "Idempotent-Replayed": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "true"
+                  ]
+                },
+                "description": "Present only on a replay."
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
                   "type": "object",
                   "additionalProperties": false,
+                  "required": [
+                    "command_id",
+                    "run_id",
+                    "revision",
+                    "status"
+                  ],
                   "properties": {
                     "command_id": {
                       "type": "string",
                       "minLength": 1,
                       "maxLength": 160
+                    },
+                    "run_id": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "maxLength": 160,
+                      "description": "Run the command applies to; for StartRun the run created in the same transaction."
                     },
                     "revision": {
                       "type": "integer"
@@ -45,12 +70,7 @@
                     "status": {
                       "const": "ACCEPTED"
                     }
-                  },
-                  "required": [
-                    "command_id",
-                    "revision",
-                    "status"
-                  ]
+                  }
                 }
               }
             }
@@ -69,39 +89,6 @@
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
-          },
-          "200": {
-            "description": "Idempotent replay: same idempotency_key and same payload hash returns the original result (replayed=true). Same key with a different payload is 409 KEY_REUSE.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "additionalProperties": false,
-                  "required": [
-                    "command_id",
-                    "revision",
-                    "status",
-                    "replayed"
-                  ],
-                  "properties": {
-                    "command_id": {
-                      "type": "string",
-                      "minLength": 1,
-                      "maxLength": 160
-                    },
-                    "revision": {
-                      "type": "integer"
-                    },
-                    "status": {
-                      "const": "ACCEPTED"
-                    },
-                    "replayed": {
-                      "const": true
-                    }
-                  }
-                }
-              }
-            }
           }
         }
       }
@@ -654,9 +641,15 @@
         "additionalProperties": false,
         "properties": {
           "code": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 160
+            "anyOf": [
+              {
+                "$ref": "./protocol.schema.json#/$defs/ReasonCode"
+              },
+              {
+                "type": "string",
+                "pattern": "^(FORBIDDEN|BAD_REQUEST|NOT_FOUND|CONFLICT|GONE|UNPROCESSABLE)$"
+              }
+            ]
           },
           "message": {
             "type": "string"
@@ -669,6 +662,10 @@
               "integer",
               "null"
             ]
+          },
+          "details": {
+            "type": "object",
+            "description": "Machine-readable context, e.g. key_path, cycle, required/available (CR-003)."
           }
         },
         "required": [

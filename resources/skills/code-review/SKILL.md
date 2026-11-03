@@ -44,6 +44,7 @@ description: 独立代码审查——Reviewer在与开发分离的新会话中�
 - 类别：缺陷 / 风险 / 建议 / 疑问；只有确定的critical/high缺陷导致FAIL，疑问须写明还需要什么证据。
 
 ## 产出物与格式
+- 自举期经 `tools/agent_task.py --report-out` 运行时：最后一条消息以 ```hoh-report 代码块给出 {role="reviewer", status, scope, findings}，身份与哈希字段由桥在会话结束后填写，不要自己写。
 - `contracts/independent-report.schema.json`（字段以schema当前版本为准），role="reviewer"；scope=已审文件与AC；native_attempt=产生本报告的原生attempt记录（由Runtime/桥提供，不得伪造）。
 - status：PASS=scope全部审完且无critical/high缺陷；FAIL=存在critical/high缺陷；UNKNOWN=有未审范围，或可能为critical/high的疑问尚未证实。
 - findings每条{id, severity, summary, evidence}：summary写“[类别] 路径:行 — 问题；影响；修复方向”，evidence引用支撑工件。

@@ -69,6 +69,63 @@ def ancestors(tasks:dict,task_id:str)->set[str]:
         if t not in seen and t in tasks:seen.add(t);stack.extend(tasks[t]['depends_on'])
     return seen
 
+NOT_IMPLEMENTED='scripts/product/not-implemented.sh'
+
+def owned_acceptance(task:dict,req_acs:dict[str,list[str]])->list[str]:
+    """ACs a task is responsible for: its explicit `acceptance` list, else every AC of its requirements."""
+    ids=[a for r in task['requirements'] for a in req_acs.get(r,[])]
+    return [a for a in ids if a in task['acceptance']] if 'acceptance' in task else ids
+
+def ownership_problems(tasks:list[dict],req:list[dict],scen:dict,policy:dict,plan:dict|None)->list[str]:
+    """CR-003 task-graph rules: every detailed AC has exactly one implementing task; the check an AC needs is
+    delivered by that task or one of its ancestors; profile tasks come after every owner of their scope; a
+    placeholder plan entry names the task that owns the check."""
+    errors=[];tindex={t['id']:t for t in tasks}
+    req_acs={r['id']:[a['id'] for a in r['acceptance']] for r in req};maturity={r['id']:r['spec_maturity'] for r in req}
+    ac_check={a['id']:scen[a['test_id']]['check_id'] for r in req for a in r['acceptance'] if a['test_id'] in scen}
+    check_owner={}
+    for t in tasks:
+        if 'acceptance' in t and t['kind']!='implement':errors.append(f'{t["id"]}: only implement tasks may list acceptance')
+        for c in t.get('checks',[]):
+            if c not in policy['checks']:errors.append(f'{t["id"]}: unknown check {c}')
+            elif c in check_owner:errors.append(f'check {c} owned by both {check_owner[c]} and {t["id"]}')
+            else:check_owner[c]=t['id']
+    errors+=[f'check {c} has no owning task (tasks[].checks)' for c in sorted(set(policy['checks'])-set(check_owner))]
+    ac_owner={}
+    for t in tasks:
+        if t['kind']!='implement':continue
+        scope={t['id']}|ancestors(tindex,t['id'])
+        for a in owned_acceptance(t,req_acs):
+            req_id='REQ-'+a[3:6]
+            if maturity.get(req_id)=='detailed':
+                if a in ac_owner:errors.append(f'{a} implemented by both {ac_owner[a]} and {t["id"]}')
+                ac_owner[a]=t['id']
+            c=ac_check.get(a)
+            if c in check_owner and check_owner[c] not in scope:
+                errors.append(f'{t["id"]}: {a} needs check {c}, delivered by {check_owner[c]} which is not the task or an ancestor')
+    for r in req:
+        if r['spec_maturity']=='detailed':
+            errors+=[f'{a}: no implement task owns it' for a in req_acs[r['id']] if a not in ac_owner]
+    for t in tasks:
+        scope={t['id']}|ancestors(tindex,t['id'])
+        if 'profile' in t:
+            profile=policy['profiles'].get(t['profile'])
+            if profile is None:errors.append(f'{t["id"]}: unknown profile {t["profile"]}');continue
+            if t['kind'] not in ('verify','release'):errors.append(f'{t["id"]}: only verify/release tasks may carry a profile')
+            in_scope=[r for r in req if t['profile'] in r['release_targets']]
+            owners={x['id'] for x in tasks if x['kind']=='implement' and any(owned_acceptance(x,{r['id']:req_acs[r['id']] for r in in_scope}))}
+            owners|={check_owner[c] for c in profile['required_checks'] if c in check_owner}
+            errors+=[f'{t["id"]}: profile {t["profile"]} needs {o} as an ancestor' for o in sorted(owners-scope)]
+        elif t['kind']=='verify':
+            for r in t['requirements']:
+                if not any(x['kind']=='implement' and r in x['requirements'] for x in (tindex[i] for i in scope if i in tindex)):
+                    errors.append(f'{t["id"]}: verifies {r} without an implementing ancestor')
+    for cid,entry in (plan or {}).get('checks',{}).items():
+        argv=entry.get('argv',[])
+        if len(argv)>=4 and argv[1]==NOT_IMPLEMENTED and check_owner.get(cid)!=argv[3]:
+            errors.append(f'tests/check-plan.json: placeholder {cid} names {argv[3]} but the check is owned by {check_owner.get(cid)}')
+    return errors
+
 def validate(root:Path)->dict:
     errors=[];counts={}
     def check(ok,msg):
@@ -142,6 +199,8 @@ def validate(root:Path)->dict:
             for t in tasks:
                 if t['kind']=='implement' and r['id'] in t['requirements']:
                     check(bool(spec_tasks & ancestors(tindex,t['id'])),f'{t["id"]}: implements outline {r["id"]} without depending on its spec task')
+    product_plan=load_json(root/'tests/check-plan.json') if (root/'tests/check-plan.json').is_file() else None
+    errors.extend(ownership_problems(tasks,req,scen,policy,product_plan))
     proto=load_json(root/'contracts/protocol.schema.json')
     for path in ['context-handoff.json','hcp-message.json','command.json']:
         try:Draft202012Validator(proto).validate(load_json(root/'examples'/path))
@@ -159,6 +218,13 @@ def validate(root:Path)->dict:
                 check(entry['mode']==rule.get('mode'),f'{rel}: {cid} mode {entry["mode"]} but policy needs {rule.get("mode")}')
                 if entry['mode']=='live':check(policy['artifacts']['live_sessions'] in entry.get('artifacts',[]),f'{rel}: live check {cid} must declare {policy["artifacts"]["live_sessions"]}')
             check(policy['artifacts']['soak_timeline'] in plan['checks'].get('soak',{}).get('artifacts',[]),f'{rel}: soak must declare {policy["artifacts"]["soak_timeline"]}')
+            # CR-003: the gate reads per-test results, the independent report and the release bundle only as declared artifacts.
+            declared=lambda cid:plan['checks'].get(cid,{}).get('artifacts',[])
+            for cid in sorted({s['check_id'] for s in scenarios}):
+                check(policy['artifacts']['test_results'] in declared(cid),f'{rel}: {cid} is the scenario check of an AC and must declare {policy["artifacts"]["test_results"]}')
+            for cid in ('independent-qa','independent-review'):
+                check(policy['artifacts']['independent_report'] in declared(cid),f'{rel}: {cid} must declare {policy["artifacts"]["independent_report"]}')
+            check(policy['artifacts']['release_bundle'] in declared('build'),f'{rel}: build must declare {policy["artifacts"]["release_bundle"]}')
         except Exception as e:errors.append(f'{rel}: {e}')
     resources=load_json(root/'resources/skills/registry.json')['skills']
     try:topo([Task(x['id'],tuple(x.get('dependencies',[]))) for x in resources])

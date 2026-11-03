@@ -12,11 +12,22 @@ CONTRACT是已确定约束，requirements.json是正式需求/AC主表，详细�
 
 需求变更→CR描述原因/影响→Commander结合授权范围决定→新revision/AC更新→任务影响闭包→旧证据current失效→重验。已接受用户范围不可自动删；必要调整需显式用户批准或预先授权规则，决策留痕。
 
+## 细化 CR 的预授权（CR-003 D1）
+
+项目所有者已预先授权：同时满足下列四条的 CR，由 CTO（主开发会话）在独立 Review 判定 PASS 后批准，状态写 `APPROVED`，批准人写 `CTO 依 CR-003 D1 预授权（独立 Review 会话 <session_id>）`。
+
+1. 只把 outline 细化为 detailed，或修正规格之间的不一致、补齐缺失的字段与原因码。
+2. 不删除任何需求或 AC，不把 required 改为 degradable，不缩小 release_targets。
+3. 不放宽任何门禁阈值、检查或证据规则（加严可以）。
+4. 不改变 CONTRACT 中的架构与交互决定。
+
+不满足任一条的 CR 仍须项目所有者明确批准；拿不准时按需要用户批准处理，先做不依赖它的工作。项目所有者可以随时否决已批准的 CR，否决通过新的 CR 回退。独立 Review 的报告与会话 id 记入 `reports/reviews/`。
+
 ## 基线变更的机械步骤
 
-1. 写 `docs/cr/CR-00N-<主题>.md`，包含 `ID：CR-00N`、`状态：`、`批准人：` 三行，以及背景、决定、影响、不变内容和验证方式。只有用户批准或预先授权的规则才能把状态写成 APPROVED。
+1. 写 `docs/cr/CR-00N-<主题>.md`，包含 `ID：CR-00N`、`状态：`、`批准人：` 三行，以及背景、决定、影响、不变内容和验证方式。只有用户批准或上节的预授权规则才能把状态写成 APPROVED。
 2. 修改受锁文件（CONTRACT、需求、场景、policy、schema、`docs/10-acceptance.md`、门禁工具），运行 `python3 tools/gen_spec_views.py`。
-3. 运行 `python3 tools/baseline.py relock --cr docs/cr/CR-00N-….md [--baseline-id HOH-BASELINE-x.y]`。新锁记录上一锁的 hash 与 CR 列表；CR 尚未提交时用 `--amend` 重算。
+3. 运行 `python3 tools/baseline.py relock --cr docs/cr/CR-00N-….md [--baseline-id HOH-BASELINE-x.y] [--add <新契约文件>]`。新锁记录上一锁的 hash 与 CR 列表；CR 尚未提交时用 `--amend` 重算。
 4. 运行 `bash scripts/check.sh --bundle` 并提交。Git 历史与 CR 记录共同构成审计链。
 
 ## AI可编辑边界

@@ -35,9 +35,28 @@ class SQLContract(unittest.TestCase):
         with self.assertRaises(sqlite3.IntegrityError):self.c.execute("INSERT INTO receipts VALUES('qa','m','now','{}')")
     def test_invalid_json(self):
         with self.assertRaises(sqlite3.IntegrityError):self.c.execute("INSERT INTO events(project_id,event_id,run_id,kind,payload_json,created_at) VALUES('p','e','r','x','NOTJSON','now')")
+    CMD="INSERT INTO commands(command_id,run_id,idempotency_key,kind,payload_json,payload_sha256,expected_revision,accepted_at) VALUES(?,?,?,?,?,?,?,'now')"
     def test_command_idempotency_key(self):
-        args=('c1','r','same','a'*64,0,None);self.c.execute('INSERT INTO commands VALUES(?,?,?,?,?,?)',args)
-        with self.assertRaises(sqlite3.IntegrityError):self.c.execute('INSERT INTO commands VALUES(?,?,?,?,?,?)',('c2',)+args[1:])
+        args=('c1','r','same','PauseRun','{"reason":"x"}','a'*64,0);self.c.execute(self.CMD,args)
+        with self.assertRaises(sqlite3.IntegrityError):self.c.execute(self.CMD,('c2',)+args[1:])
+    def test_command_kind_and_payload_stored(self):
+        with self.assertRaises(sqlite3.IntegrityError):self.c.execute(self.CMD,('c3','r','k3','Explode','{}','a'*64,0))
+        with self.assertRaises(sqlite3.IntegrityError):self.c.execute(self.CMD,('c4','r','k4','StartRun','NOTJSON','a'*64,0))
+        self.c.execute(self.CMD,('c5',None,'k5','StartRun','{"goal":"hello","mode":"AUTO","interactive":true}','a'*64,0))
+        self.assertEqual(self.c.execute("SELECT json_extract(payload_json,'$.goal') FROM commands WHERE kind='StartRun'").fetchone()[0],'hello')
+    def test_run_without_spec_and_blocked_needs_reason(self):
+        self.c.execute("INSERT INTO runs(run_id,project_id,state,mode,created_at) VALUES('r0','p','CREATED','AUTO','now')")
+        with self.assertRaises(sqlite3.IntegrityError):self.c.execute("UPDATE runs SET state='BLOCKED' WHERE run_id='r0'")
+        self.c.execute("UPDATE runs SET state='BLOCKED',blocked_reason='NEED_DECISION',blocked_reasons_json='[\"NEED_DECISION\"]' WHERE run_id='r0'")
+    def test_task_scores_bounded(self):
+        with self.assertRaises(sqlite3.IntegrityError):self.c.execute("INSERT INTO tasks(task_id,run_id,spec_id,state,role,created_seq,user_value) VALUES('tx','r','s','READY','developer',9,7)")
+        with self.assertRaises(sqlite3.IntegrityError):self.c.execute("INSERT INTO tasks(task_id,run_id,spec_id,state,role,created_seq,cost_estimate) VALUES('ty','r','s','READY','developer',9,0)")
+    def test_one_pending_trigger_per_key(self):
+        q="INSERT INTO supervisor_triggers(trigger_id,run_id,fingerprint,spec_id,severity,event_seqs_json,first_seq,last_seq,due_at,state,created_at) VALUES(?,'r','fp1','s','high','[1,3]',1,3,'t',?,'now')"
+        self.c.execute(q,('k1','PENDING'))
+        with self.assertRaises(sqlite3.IntegrityError):self.c.execute(q,('k2','PENDING'))
+        self.c.execute("UPDATE supervisor_triggers SET state='HANDLED' WHERE trigger_id='k1'");self.c.execute(q,('k3','PENDING'))
+        with self.assertRaises(sqlite3.IntegrityError):self.c.execute(q.replace("'[1,3]'","'[]'"),('k4','HANDLED'))
     def test_single_writer_lease(self):
         self.c.execute("INSERT INTO tasks(task_id,run_id,spec_id,state,role,created_seq) VALUES('t','r','s','READY','developer',1)")
         self.c.execute("INSERT INTO attempts(attempt_id,task_id,state,role_epoch,host_epoch,config_revision) VALUES('a','t','PREPARED',1,1,0)")
@@ -79,10 +98,24 @@ class SQLContract(unittest.TestCase):
     def test_degraded_only_for_evidence_and_results(self):
         self.c.execute("INSERT INTO requirements VALUES('REQ-048','s','plugin',1,'degradable')")
         with self.assertRaises(sqlite3.IntegrityError):self.c.execute("INSERT INTO requirements VALUES('REQ-001','s','x',1,'optional')")
+    CAND="INSERT INTO candidates(candidate_id,run_id,git_commit,git_tree,spec_sha256,environment_sha256,test_plan_sha256,source_path,created_at) VALUES(?,'r',?,?,?,?,?,'p','now')"
+    def test_candidate_state_and_stale_results(self):
+        self.c.execute(self.CAND,('c9','a'*40,'b'*40,'c'*64,'d'*64,'e'*64))
+        self.assertEqual(self.c.execute("SELECT state FROM candidates WHERE candidate_id='c9'").fetchone()[0],'FROZEN')
+        with self.assertRaises(sqlite3.IntegrityError):self.c.execute("UPDATE candidates SET state='DONE' WHERE candidate_id='c9'")
+    def test_rejected_report_needs_reason(self):
+        self.c.execute(self.CAND,('c8','a'*40,'b'*40,'c'*64,'d'*64,'e'*64))
+        self.c.execute("INSERT INTO tasks(task_id,run_id,spec_id,state,role,created_seq) VALUES('tq','r','s','VERIFYING','qa',3)")
+        self.c.execute("INSERT INTO sessions VALUES('sq','claude','qa',NULL,NULL,'2.1','{}')")
+        self.c.execute("INSERT INTO attempts(attempt_id,task_id,session_id,state,role_epoch,host_epoch,config_revision) VALUES('aq','tq','sq','SETTLED',1,1,0)")
+        self.c.execute("INSERT INTO artifacts VALUES('ar',?,'r.json',1,'application/json')",('f'*64,))
+        q="INSERT INTO independent_reports VALUES(?,'r','c8','qa','sq',?,'PASS',?,?,'aq','ar','ar','now')"
+        with self.assertRaises(sqlite3.IntegrityError):self.c.execute(q,('x1','c'*64,'REJECTED',None))
+        self.c.execute(q,('x2','c'*64,'REJECTED','SESSION_NOT_INDEPENDENT'))
     def test_release_status(self):
         with self.assertRaises(sqlite3.IntegrityError):
-            self.c.execute("INSERT INTO candidates VALUES('c','r',?,?,?,?,?,'p','now')",('a'*40,'b'*40,'c'*64,'d'*64,'e'*64))
+            self.c.execute(self.CAND,('c','a'*40,'b'*40,'c'*64,'d'*64,'e'*64))
             self.c.execute("INSERT INTO releases VALUES('rel','r','c','v1','DONE',?, 'now')",('f'*64,))
     def test_git_ids_exact_length(self):
         with self.assertRaises(sqlite3.IntegrityError):
-            self.c.execute("INSERT INTO candidates VALUES('c2','r',?,?,?,?,?,'p','now')",('a'*41,'b'*40,'c'*64,'d'*64,'e'*64))
+            self.c.execute(self.CAND,('c2','a'*41,'b'*40,'c'*64,'d'*64,'e'*64))

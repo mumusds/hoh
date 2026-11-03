@@ -1,6 +1,8 @@
 {
   "schema_version": "1.0",
   "native_pi_package": "@earendil-works/pi-coding-agent",
+  "native_pi_version": "1.5.0",
+  "native_pi_integrity": "sha512-xNDZ5kqowO6Z03FS2gwAkPEGk1ssxVcYKQ6qZId84mFEvwACvvyc2l0vAMOS+c5zvxLRMLBE9r4y44IGYkMJaQ==",
   "plugins": [
     {
       "id": "smart-compact",

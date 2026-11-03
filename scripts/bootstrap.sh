@@ -100,10 +100,16 @@ VERIFY
   "$DEV/venv/bin/python" -m pip freeze > "$DEV/python-lock.txt"
   # Pin installations, preserve already available native CLIs.
   install_npm_cli() {
-    local bin="$1" package="$2" name="$3" version
+    # install_npm_cli <bin> <package> <name> [pinned version] [pinned npm integrity]
+    local bin="$1" package="$2" name="$3" pinned="${4:-}" integrity="${5:-}" version
     if command -v "$bin" >/dev/null; then printf 'Keeping existing %s: %s\n' "$bin" "$(command -v "$bin")"; return; fi
-    if [[ -f "$DEV/$name-version.lock" ]]; then version="$(cat "$DEV/$name-version.lock")"; else
-      version="$(npm view "$package" version)"; printf '%s\n' "$version" > "$DEV/$name-version.lock"
+    if [[ -n "$pinned" ]]; then version="$pinned"
+    elif [[ -f "$DEV/$name-version.lock" ]]; then version="$(cat "$DEV/$name-version.lock")"
+    else version="$(npm view "$package" version)"
+    fi
+    printf '%s\n' "$version" > "$DEV/$name-version.lock"
+    if [[ -n "$integrity" && "$(npm view "$package@$version" dist.integrity)" != "$integrity" ]]; then
+      echo "Registry integrity of $package@$version differs from config/plugins.json; refusing to install." >&2; exit 78
     fi
     npm install --global --prefix "$DEV/tooling" "$package@$version"
   }
@@ -112,8 +118,8 @@ VERIFY
     fetch https://claude.ai/install.sh "$DEV/downloads/claude-install.sh"
     bash "$DEV/downloads/claude-install.sh" stable
   fi
-  PI_PACKAGE="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["native_pi_package"])' "$ROOT/config/plugins.json")"
-  install_npm_cli pi "$PI_PACKAGE" pi
+  read -r PI_PACKAGE PI_VERSION PI_INTEGRITY < <(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));print(d["native_pi_package"],d.get("native_pi_version",""),d.get("native_pi_integrity",""))' "$ROOT/config/plugins.json")
+  install_npm_cli pi "$PI_PACKAGE" pi "$PI_VERSION" "$PI_INTEGRITY"
   if [[ "$PLUGINS" == 1 ]]; then
     # Plugins are degradable (CR-001): record DEGRADED in .hoh-dev/plugin-lock.json and keep going.
     python3 "$ROOT/tools/install_pi_plugins.py" || echo 'Pi plugins DEGRADED; see .hoh-dev/plugin-lock.json. Core development continues; release reports must show DEGRADED.' >&2

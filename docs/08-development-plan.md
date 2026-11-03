@@ -1,6 +1,8 @@
 # 开发计划与依赖
 
-机器任务板：`contracts/development-tasks.json`（49个任务）。它是可细化的计划，不在基线锁内；任务状态只写 `.hoh-dev/task-state.json`，由 `tools/taskboard.py` 维护。完成任务不等于需求验收，需求验收以冻结候选上的证据为准。
+机器任务板：`contracts/development-tasks.json`（58个任务）。它是可细化的计划，不在基线锁内；任务状态只写主 worktree 的 `.hoh-dev/task-state.json`，由 `tools/taskboard.py` 维护。完成任务不等于需求验收，需求验收以冻结候选上的证据为准。
+
+每个任务可带三个归属字段（CR-003）：`acceptance` 列出它负责的 AC（缺省为其 `requirements` 的全部 AC），`checks` 列出它落地的检查，`profile` 标记 v0.1/v1 的收口任务。`validate_bundle` 强制：每条 detailed AC 恰好归属一个实现任务；任务所需的检查由它自己或祖先任务落地；带 profile 的任务以该 profile 全部 AC 与检查的归属任务为祖先；检查计划里的占位命令写的任务名必须是该检查的归属任务。
 
 ## 任务类型与规则
 
@@ -21,24 +23,27 @@
 |M0|基线核对、真实CLI探测与协议样例、Cargo workspace、`tests/check-plan.json` 与检查脚本骨架|包检查通过；真实环境记录；缺认证记为外部阻塞|
 |M1|领域类型/HCP、进程底座、三Agent适配器、CLI命令面、doctor、基础TUI shell|M1 detailed AC 在冻结候选上有证据；fixture 与 live 分开|
 |M2|SQLite/outbox/租约、状态机、DAG、reconcile/重试/预算、host 与 pause/cancel、团队/监督/上下文、候选与 QA/Review barrier|crash/replay 与 recovery 检查；最小闭环无错误验收|
-|**v0.1**|CLI/TUI 外壳 + Claude 适配器 + 持久 Runtime + 冻结候选/独立 QA/Review|`release_gate --profile v0.1` → `INTERIM_RELEASED`；不是完成，继续推进|
+|**v0.1**|M1+M2 全部能力上的中间发布：CLI/TUI、三适配器、持久 Runtime 与 API、冻结候选/独立 QA/Review|`release_gate --profile v0.1` → `INTERIM_RELEASED`；不是完成，继续推进|
 |M3|规格追踪/CR/readiness、Prompt/Skill/模板、Plan/Build/Auto 与运行中对话|先 spec 任务细化；需求→任务→实现→验收全链路|
 |M4|Workspace/Team/Focus/Timeline、状态栏、展开块、终端兼容、容量|真实 PTY、宽度/Unicode、大日志快照|
 |M5|证据/回归/Flaky/最终门禁、备份迁移、三 Pi 插件（degradable）|插件真实组合测试；不可用时带诊断 DEGRADED；门禁负例|
 |M6|Web GUI、重连、多客户端、Git 交付、安装文档|浏览器与新 VM 部署、冲突与重连|
 |M7|性能、交付真实性、长期维护、72h soak|`release_gate --profile v1` → `COMPLETED`/`COMPLETED_DEGRADED`；否则 INCOMPLETE|
 
-## v0.1 最短路径
+## v0.1 路径（CR-003 D2）
 
-M0 → M1-T01/T02/T03/T06/T08 → M2-T01…T06、T10 → V01-T01（独立QA+Review）→ V01-T02（发布）。Codex/Pi 适配器、doctor、团队配置、Commander 监督和上下文装箱在 v0.1 之后补齐（M1-T04/T05/T07/T09、M2-T07/T08/T09/T11）。v0.1 范围由 `requirements.json` 中 `release_targets` 含 `v0.1` 的 18 项需求决定。
+M0 → M1（T01→T02→T03→T04/T05→T06→T08→T07→T09）→ M2（T01→T02→T12→T03/T04→T05→T19→T06→T14、T07→T17→T08→T09→T10→T16→T18→T15→T13）→ M2-T11（M2 独立 QA+Review）→ V01-T01（v0.1 候选全量检查）→ V01-T02（发布）→ M3-T01。实际顺序以 `taskboard next` 为准（列表顺序加依赖）。
+
+v0.1 的需求范围仍是 `release_targets` 含 `v0.1` 的 18 项，但这些需求的 AC 依赖 Codex 适配器（AC-004-04）、团队绑定与 role_epoch（AC-035-01、AC-036-03、AC-054-01）和 Commander 监督（AC-002-01），所以 v0.1 在 M2 全部完成后发布。原“最短路径”把这些能力排在 v0.1 之后，导致任务无法诚实完成（docs/23）。
 
 ## 规格滚动细化
 
 M1/M2 的 27 项需求已是 detailed。M3–M7 的需求是 outline，各里程碑第一个任务（Mx-T01，kind=spec）负责：
 
-1. 每项写 2–5 条可判定 AC（Given/When/Then 具体到命令、状态、阈值，至少一条失败路径），以及 behavior、failure_modes、测试场景（check_id、步骤、判定、需保存的观测）。
+1. 每项写 2–5 条可判定 AC（确有必要可多于 5 条，在 CR 中说明）（Given/When/Then 具体到命令、状态、阈值，至少一条失败路径），以及 behavior、failure_modes、测试场景（check_id、步骤、判定、需保存的观测）。
 2. 不删范围、不降门槛；文档没写到的地方按更严格、可验证的行为选择，并记入该需求的 decisions，在 CR 中请项目所有者确认。
-3. 运行 `tools/gen_spec_views.py`；写 CR 记录（状态 APPROVED 需要用户批准或预先授权的规则）；执行 `tools/baseline.py relock --cr`；`scripts/check.sh --bundle` 必须通过。
+3. 按每个实现任务 ≤2 项需求、≤8 条 AC 拆分本里程碑的实现任务，填好 `acceptance`/`checks`/`depends_on`。
+4. 运行 `tools/gen_spec_views.py`；写 CR 记录（只细化、不删范围、不降门槛时按 CR-003 D1 经独立 Review 后由 CTO 批准，其余需要用户批准，见 docs/21）；执行 `tools/baseline.py relock --cr`；`scripts/check.sh --bundle` 必须通过。
 
 ## 每个任务的执行契约
 

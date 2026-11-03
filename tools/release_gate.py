@@ -22,7 +22,7 @@ class GateError(ValueError): pass
 LOCK_REQUIRED=['CONTRACT.md','contracts/requirements.json','contracts/acceptance-scenarios.json','contracts/release-policy.json',
     'contracts/release.schema.json','contracts/execution.schema.json','contracts/acceptance-observation.schema.json',
     'contracts/independent-report.schema.json','contracts/candidate.schema.json','contracts/check-plan.schema.json',
-    'contracts/live-session.schema.json','contracts/soak-event.schema.json','contracts/native-attempt.schema.json',
+    'contracts/live-session.schema.json','contracts/soak-event.schema.json','contracts/native-attempt.schema.json','contracts/test-result.schema.json',
     'docs/10-acceptance.md','tools/release_gate.py','tools/candidate.py','tools/run_check.py','tools/common.py','tools/baseline.py']
 REPORT_CHECK={'qa':'independent-qa','reviewer':'independent-review'}
 EVIDENCE_TOOLS={'tools/run_check.py','hoh'}
@@ -97,6 +97,23 @@ def inside(root: Path, path: str, directory: Path) -> bool:
     try:return safe_path(root,path).is_relative_to(directory)
     except ValueError:return False
 
+def load_test_results(root: Path, ref: dict) -> dict[str,list[str]]:
+    """test_id -> statuses of every executed test case that covers it (CR-003 per-test evidence)."""
+    found={}
+    with verify_ref(root,ref).open('rb') as f:
+        for number,line in enumerate(f,1):
+            if not line.strip():continue
+            try:item=json.loads(line)
+            except ValueError:raise GateError(f'{ref["path"]} line {number}: invalid JSON') from None
+            errors=schema_errors(root,'test-result.schema.json',item)
+            need(not errors,f'{ref["path"]} line {number}: '+(errors[0].message if errors else ''))
+            found.setdefault(item['test_id'],[]).append(item['status'])
+    return found
+
+def produced_ref(execution: dict, name: str) -> dict|None:
+    ref=next((a for a in execution['artifacts'] if a['name']==name),None)
+    return {'path':ref['path'],'sha256':ref['sha256']} if ref else None
+
 def validate_manifest(root: Path, manifest: dict) -> dict:
     root=root.resolve();lock=verify_baseline(root)
     validate_schema(root,'release.schema.json',manifest)
@@ -164,6 +181,14 @@ def validate_manifest(root: Path, manifest: dict) -> dict:
             validate_schema(root,'live-session.schema.json',sessions)
             need(sessions['check_id']==check_id and sessions['harness_candidate_id']==candidate,f'{check_id}: live sessions bound to another check/candidate')
             execution['_live_session_ids']={s['session_id'] for s in sessions['sessions']}
+            agents={s['agent'] for s in sessions['sessions']}
+            required_agents=set(profile.get('live_agents',{}).get(check_id,[]))
+            if check['status']=='PASS':
+                need(required_agents<=agents,f'{check_id}: live sessions lack required agents: '+', '.join(sorted(required_agents-agents)))
+                if rule.get('requires_plugins'):
+                    need(all(s.get('plugins') for s in sessions['sessions'] if s['agent']=='pi'),f'{check_id}: every Pi session must list the plugins it loaded')
+        results=produced_ref(execution,policy['artifacts']['test_results'])
+        if results:execution['_test_results']=load_test_results(root,results)
         executions[check_id]=execution;exec_dirs[check_id]=directory
     need(len({e['record_id'] for e in executions.values()})==len(executions),'reused execution record id')
 
@@ -195,6 +220,13 @@ def validate_manifest(root: Path, manifest: dict) -> dict:
             need(any(inside(root,ref['path'],d) for d in allowed),f'{ac_id}: raw evidence is not output of its cited checks')
             verify_ref(root,ref,True)
         need(any(inside(root,ref['path'],exec_dirs[scenario['check_id']]) for ref in observation['raw_evidence']),f'{ac_id}: no raw evidence from its scenario check {scenario["check_id"]}')
+        results=executions[scenario['check_id']].get('_test_results')
+        need(results is not None,f'{ac_id}: scenario check {scenario["check_id"]} produced no {policy["artifacts"]["test_results"]}')
+        statuses=results.get(ac['test_id'],[])
+        need(bool(statuses),f'{ac_id}: no test result for {ac["test_id"]} in check {scenario["check_id"]}')
+        allowed_status={'PASS'} if entry['status']=='PASS' else {'PASS','DEGRADED'}
+        need(set(statuses)<=allowed_status and (entry['status']=='PASS' or 'DEGRADED' in statuses),
+             f'{ac_id}: test results for {ac["test_id"]} are {sorted(set(statuses))}, not {entry["status"]}')
 
     roles=unique_index(manifest['independent_reports'],'role','independent role')
     need(set(roles)=={'qa','reviewer'},'independent QA and reviewer required')
@@ -205,6 +237,8 @@ def validate_manifest(root: Path, manifest: dict) -> dict:
         need(entry['session_id'] not in session_ids,'developer/QA/reviewer sessions must be distinct')
         session_ids.add(entry['session_id'])
         need(entry['candidate_id']==candidate and entry['spec_sha256']==spec and entry['status']=='PASS',f'{role}: stale/failed report')
+        need(entry['artifact']==produced_ref(executions[check_id],policy['artifacts']['independent_report']),
+             f'{role}: report is not the {policy["artifacts"]["independent_report"]} produced by the {check_id} check')
         actual=load_json(verify_ref(root,entry['artifact'],True))
         validate_schema(root,'independent-report.schema.json',actual)
         need(all(actual[k]==entry[k] for k in ['role','session_id','candidate_id','spec_sha256','status']),f'{role}: report binding mismatch')
@@ -250,6 +284,8 @@ def validate_manifest(root: Path, manifest: dict) -> dict:
                     ids.add(event['iteration_id'])
         need(len(ids)==manifest['soak']['live_iterations'],'soak iteration count does not match raw timeline')
         need(len(ids)>=policy['minimum_live_iterations'],'insufficient live iterations')
+    need('build' in executions and manifest['release_artifact']==produced_ref(executions['build'],policy['artifacts']['release_bundle']),
+         f'release artifact must be the {policy["artifacts"]["release_bundle"]} produced by the build check')
     artifact=verify_ref(root,manifest['release_artifact'],True)
     degraded=bool(degraded_checks or degraded_ac)
     status=profile['release_status_on_degraded_pass' if degraded else 'release_status_on_pass']

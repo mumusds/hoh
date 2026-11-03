@@ -55,8 +55,11 @@ class BundleContracts(unittest.TestCase):
                 r=validate_bundle.validate(root)
                 with self.subTest(argv=argv):self.assertTrue(any(message in e for e in r['errors']),r['errors'])
     def test_original_skills_available(self):
-        skills=load_json(ROOT/'resources/skills/registry.json')['skills'];self.assertEqual(len(skills),12)
+        skills=load_json(ROOT/'resources/skills/registry.json')['skills'];self.assertEqual(len(skills),13)
         for s in skills:self.assertTrue((ROOT/s['entry']).is_file())
+        # Every role of the default team has at least one built-in skill (CR-003 added research for researcher).
+        roles={r for s in skills for r in s['roles']}
+        self.assertLessEqual({'commander','cto','developer','qa','researcher','reviewer'},roles)
     def test_bootstrap_agent_entries(self):
         for d in ['.agents','.claude','.pi']:self.assertTrue((ROOT/d/'skills/hoh-bootstrap/SKILL.md').exists())
     def test_product_check_does_not_accept_empty_product(self):
@@ -139,6 +142,18 @@ class SetupAndLedger(unittest.TestCase):
         self.assertEqual(self.ledger('claim','M1-T02','--owner','a'),0)
         self.refused('claim','M2-T01','--owner','b')
         self.assertEqual(self.ledger('claim','M0-T04','--owner','c'),0)  # non-writer research runs in parallel
+    def test_ledger_next_respects_single_writer(self):
+        self.seed(['M0-T01','M0-T02','M0-T03','M0-T04','M0-T05','M1-T01'])
+        self.assertEqual(self.ledger('claim','M1-T02','--owner','a'),0)
+        out=io.StringIO()
+        with patch.object(taskboard,'ROOT',self.root),contextlib.redirect_stdout(out):taskboard.main(['next'])
+        shown=json.loads(out.getvalue());self.assertFalse(shown.get('writer',False),shown);self.assertIn('writer task is running',shown.get('message',''))
+    def test_ledger_shared_by_linked_worktrees(self):
+        repo=self.root/'repo';repo.mkdir()
+        for cmd in (['init','-q'],['config','user.email','t@invalid.example'],['config','user.name','t'],['commit','-q','--allow-empty','-m','x'],['worktree','add','-q',str(self.root/'soak')]):
+            subprocess.run(['git','-C',str(repo),*cmd],check=True,capture_output=True)
+        self.assertEqual(taskboard.ledger_root(self.root/'soak').resolve(),repo.resolve())
+        self.assertEqual(taskboard.ledger_root(repo).resolve(),repo.resolve())
     def test_ledger_outline_requirements_not_ready(self):
         tasks=load_json(self.root/'contracts/development-tasks.json')['tasks']
         self.seed([t['id'] for t in tasks if t['milestone'] in ('M0','M1','M2','V01')]+['M3-T01'])

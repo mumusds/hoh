@@ -136,7 +136,8 @@
     "`-p` 是否接受 stdin 作为提示来源文档未定；选择从严：从不读取 stdin。",
     "缺关键决策的 blocked_reason 命名 NEED_DECISION 为初值。",
     "`--resume` 指向不存在或 COMPLETED 的 run 退出码64为初值（COMPLETED 不得重开同 run）。",
-    "前台 -p 遇 PAUSED 即返回（退出码6，见 REQ-004），遇 WAITING_EXTERNAL 继续等待，为初值选择。"
+    "前台 -p 遇 PAUSED 即返回（退出码6，见 REQ-004），遇 WAITING_EXTERNAL 继续等待，为初值选择。",
+    "（CR-003）`hoh -p <文本> --resume <run>` 提交 SendInput{input_kind=REPLY, target_role=null}：Runtime 若发现该 run 恰有一个待答问题，就把文本作为其答案（等价于 AnswerQuestion）并从 blocked_reasons 移除 NEED_DECISION，集合清空时由 Runtime 回到 resume_state；否则按 STEER 处理。前台客户端只以 seq 大于该命令接受事件的 run.result 决定退出码；stream-json 回放的历史事件带 replay=true。"
    ]
   },
   {
@@ -328,7 +329,7 @@
     {
      "id": "AC-005-01",
      "given": "临时Git项目，无host运行；FakeAgent使每个Attempt运行20 s并记录每次start调用；PTY内运行bash。",
-     "when": "在PTY执行 hoh -p --detach --output json '完成fixture目标'，读出stdout后向PTY会话发SIGHUP并关闭PTY；60 s后在新PTY执行 hoh attach <run_id>。",
+     "when": "在PTY执行 hoh -p '完成fixture目标' --detach --output json，读出stdout后向PTY会话发SIGHUP并关闭PTY；60 s后在新PTY执行 hoh attach <run_id>。",
      "then": "detach在10 s（初值）内退出码0且stdout仅1个含run_id的JSON对象；HUP后host存活且tty为'?'；attach能看到HUP期间产生的事件；各Task的Attempt数与FakeAgent start次数不因attach增加。",
      "test_id": "TEST-005-01"
     },
@@ -356,16 +357,24 @@
     {
      "id": "AC-005-05",
      "given": "测试构建故障注入使StartRun事务COMMIT返回错误。",
-     "when": "执行 hoh -p --detach --output json '目标'。",
+     "when": "执行 hoh -p '目标' --detach --output json。",
      "then": "退出码非0；stdout为空；stderr含诊断code；runs表无新行；不存在该命令启动的Agent进程。",
      "test_id": "TEST-005-05"
+    },
+    {
+     "id": "AC-005-06",
+     "test_id": "TEST-005-06",
+     "given": "全新临时 HOME（无 ~/.local/bin/hoh、无 hoh 用户 unit），候选的发布包，systemd --user 实例可用；一个已初始化 Git 的 fixture 项目",
+     "when": "执行发布包内的 `install.sh`；随后 `hoh --version`、`systemctl --user is-enabled hoh-host@<项目 hash>.service`；在 fixture 项目执行 `hoh -p 'x' --detach --output json` 与 `hoh attach <run_id> --output json`；最后执行 `install.sh --uninstall`",
+     "then": "安装后 `command -v hoh`=$HOME/.local/bin/hoh，`hoh --version` 含候选 commit；unit 已启用且 ExecStart 指向已安装二进制；detach 返回 run_id 且 attach 退出码0；卸载后二进制与 unit 都已删除、fixture 项目 .hoh/ 原样保留；安装与卸载均不需要 root"
     }
    ],
    "decisions": [
     "detach返回时限文档未定，取初值10 s（本地冷启动host、FakeAgent）。",
-    "detach的JSON对象沿用/v1/commands 202字段并增加run_id，为本选择；具体退出码数值由REQ-004统一，此处只断言0/非0。",
+    "detach的JSON对象即/v1/commands 的202响应体（含run_id，CR-003）；具体退出码数值由REQ-004统一，此处只断言0/非0。",
     "RUN_NOT_FOUND错误码名为初值。",
-    "StartLimit与RestartSec未定，初值StartLimitBurst=5、StartLimitIntervalSec=300、RestartSec=5 s。"
+    "StartLimit与RestartSec未定，初值StartLimitBurst=5、StartLimitIntervalSec=300、RestartSec=5 s。",
+    "（CR-003）POST /v1/commands 的 202 响应体为 {command_id, run_id, revision, status=ACCEPTED}；StartRun 的 run_id 由 host 在同一接受事务内分配。同 key 同 payload 的重放返回与首次逐字节相同的 202 响应体并带 `Idempotent-Replayed: true` 头。"
    ]
   },
   {
@@ -770,7 +779,8 @@
     "文档没有给出配置校验错误码。选择 HTTP 400 + code=INVALID_TEAM_CONFIG（初值），版本冲突沿用 409。",
     "[team.*] 下出现未知键时，选择拒绝并指出键路径，不静默忽略。",
     "reviewer.independent_session=false 选择直接拒绝，因为独立审查是 CONTRACT 第 7 条的硬约束，不作为可选项。",
-    "自定义职位选择必须引用一个内置角色契约或提供 prompt 覆盖文件，否则拒绝。"
+    "自定义职位选择必须引用一个内置角色契约或提供 prompt 覆盖文件，否则拒绝。",
+    "（CR-003）完整配置键表（未知键一律拒绝）：顶层 config_version；[project] default_mode、document_profile；[execution] profile、writer_slots、reader_slots、reserve_supervisor_slot、cancel_native_grace_seconds=10、cancel_term_grace_seconds=5；[delivery] max_delivery_attempts=5；[persistence] writer_queue_capacity=256；[team.<role>] agent、model、fallback、prompt、independent_session；[supervision] policy；[budget] max_duration_hours、max_iterations、max_local_repairs、max_protocol_repairs、max_usd、deadline_at；[ui] view、statusline、mouse；[web] host、port。config/hoh.example.toml 列出全部键（可选键以注释给出），内置默认值与之逐项相等。"
    ]
   },
   {
@@ -789,13 +799,13 @@
    "behavior": [
     "绑定变更必须先持久化为待交接请求，在该职位当前 turn 结束或到达 writer 安全点后才生效；生效前界面显示 pending，不显示为已完成。",
     "生效时必须在同一事务内完成：更新绑定、该职位 role_epoch+1、追加交接事件、写入新会话启动的 outbox。",
-    "role_epoch 低于当前值的 decision、steer 和消息只进入历史（decisions.state=REJECTED，原因 stale_epoch），不得改变任何 task/run 状态，也不得产生派发。",
+    "role_epoch 低于当前值的 decision、steer 和消息只进入历史（decisions.state=REJECTED，原因 STALE_ROLE_EPOCH），不得改变任何 task/run 状态，也不得产生派发。",
     "新持有者的首个输入必须是 checkpoint 交接包，包含 goal、当前 spec_sha256/revision、已 APPLIED 的决策、OPEN/REOPENED issue、未 ACK 的 outbox 与 QUEUED 输入、当前 candidate 身份；不能是旧会话全文。",
-    "交接不能重复原任务：已 LEASED/RUNNING 的 attempt 继续执行，已 ACKED 的消息不重投；新持有者对已租用或已 ACCEPTED 的 task 发出的派发，由租约/状态检查拒绝。",
+    "交接不能重复原任务：已 LEASED/RUNNING 的 Task 及其 STARTING/RUNNING attempt 继续执行，已 ACKED 的消息不重投；新持有者对已租用或已 ACCEPTED 的 task 发出的派发，由租约/状态检查拒绝。",
     "紧急中断写者时，必须把该 attempt 标为 UNKNOWN_EFFECT，先 reconcile 工作区 hash 与 commit，然后才允许新写者取得写租约。"
    ],
    "failure_modes": [
-    "旧 Codex Commander 在 epoch 1 失效后才返回 decision 时，该 decision 记为 REJECTED(stale_epoch)，task revision 不变，也不新增 outbox。",
+    "旧 Codex Commander 在 epoch 1 失效后才返回 decision 时，该 decision 记为 REJECTED(STALE_ROLE_EPOCH)，task revision 不变，也不新增 outbox。",
     "两个 ConfigureTeam 以相同 expected_revision 并发提交时，恰好一个返回 202，另一个返回 409 并带 current_revision。",
     "新绑定的 Agent 在生效前探测失败或缺认证时，交接不生效：旧绑定与 epoch 保留，同时记录失败原因并发出角色失效事件。",
     "host 在 epoch 递增事务提交之后、新会话启动之前崩溃时，重启后保持新 epoch 与新绑定，只启动一个新会话。",
@@ -816,7 +826,7 @@
      "id": "AC-019-01",
      "given": "FakeAgent run：commander=codex(role_epoch=1)，task T 为 RUNNING(revision=5)；脚本让旧 Codex 在交接后返回 decision{role_epoch:1,expected_revision:5}",
      "when": "提交 ConfigureTeam{bindings:{commander:{agent:pi}},apply_at:checkpoint}，等交接生效后投递旧 Codex 的 decision",
-     "then": "commander 变为 agent=pi、role_epoch=2；旧 decision 行 state=REJECTED，原因为 stale_epoch；T.revision 仍为 5；该 decision 之后 outbox 新增行数=0",
+     "then": "commander 变为 agent=pi、role_epoch=2；旧 decision 行 state=REJECTED，原因为 STALE_ROLE_EPOCH；T.revision 仍为 5；该 decision 之后 outbox 新增行数=0",
      "test_id": "TEST-019-01"
     },
     {
@@ -873,7 +883,7 @@
     "不在用户 fallback 列表中的 Agent，即使能力满足也不能被自动启用；默认配置不含任何 fallback。",
     "启用 fallback 等同于一次绑定变更：在 checkpoint 生效，role_epoch+1，并发出角色失效事件和替换事件。",
     "qa/reviewer 的 fallback 必须使用与该 candidate 的 developer 会话不同的 session；同一产品可以做 fallback，但只能新开会话。",
-    "没有可用 fallback 时，该职位进入 BLOCKED 并列出精确缺项（BLOCKED_AUTH、CAPABILITY_UNSUPPORTED、agent 或 model 缺失）。不依赖该职位的实现任务可以继续，但 candidate 不能 ACCEPTED。",
+    "没有可用 fallback 时，该职位进入 BLOCKED 并列出精确缺项（BLOCKED_AUTH、BLOCKED_CAPABILITY 及缺失能力名、AGENT_UNAVAILABLE、MODEL_UNAVAILABLE）。不依赖该职位的实现任务可以继续，但 candidate 不能 ACCEPTED。",
     "缺认证和能力不支持属于永久错误，不安排指数重试；临时的 429/503 进入 WAITING_EXTERNAL 并持久 next_retry，不触发 fallback。"
    ],
    "failure_modes": [
@@ -910,7 +920,7 @@
     },
     {
      "id": "AC-020-03",
-     "given": "qa 首选 pi 的 probe 中 auth_check=failed，qa 无 fallback；developer 队列中还有任务 T3",
+     "given": "qa 首选 pi 的 probe 中 auth_check=missing，qa 无 fallback；developer 队列中还有任务 T3",
      "when": "candidate C 冻结并进入验证",
      "then": "qa 职位状态为 BLOCKED，原因 BLOCKED_AUTH；qa attempt 数=0；C 不是 ACCEPTED；T3 照常派发；不存在为 qa 安排的重试（next_retry_at 非空的 qa outbox 行数=0）",
      "test_id": "TEST-020-03"
@@ -964,7 +974,7 @@
     "Agent 每秒产生数千条 token 事件时，Commander 唤醒次数仍为 0。",
     "同一问题持续重复出现时，同一去重键最多存在一个未处理的触发器，新事件并入该触发器。",
     "host 重启后，seq≤last_handled_seq 的事件不再唤醒 Commander，已 APPLIED 的决策不会重放。",
-    "决策的 expected_revision 过期时，state=REJECTED(stale_revision)，task 不变，并产生恰好一次重新触发。",
+    "决策的 expected_revision 过期时，state=REJECTED(STALE_REVISION)，task 不变，并产生恰好一次重新触发。",
     "Commander 不可用时出现 need_decision，run 进入 BLOCKED 并记录原因，不无限等待；candidate_ready 照常派发 QA/Review。",
     "Commander 决策试图直接把 AC 或 candidate 标为通过时被拒绝，验收仍以证据门禁为准。"
    ],
@@ -983,7 +993,7 @@
      "id": "AC-021-01",
      "given": "FakeClock；policy=balanced；单个 run 的事件流：10000 条 token.delta、500 条 tool.output、60 条 heartbeat、3 条 medium issue、1 条 candidate_ready",
      "when": "按 seq 把事件流送入 Supervisor，并把 FakeClock 推进 1 小时",
-     "then": "Commander 唤醒次数=0；Runtime 为 candidate_ready 生成 qa 与 reviewer 各 1 条 dispatch outbox；decisions 新增行数=0",
+     "then": "Commander 唤醒次数=0；Runtime 为 candidate_ready 生成 qa 与 reviewer 各 1 条 kind=handoff outbox；decisions 新增行数=0",
      "test_id": "TEST-021-01"
     },
     {
@@ -1004,14 +1014,14 @@
      "id": "AC-021-04",
      "given": "触发器 K 基于 task revision=7 生成；Commander 作答前，Runtime 已把该 task 推进到 revision=8",
      "when": "FakeCommander 返回 decision{expected_revision:7, role_epoch:当前值}；对随后的重新触发返回 expected_revision:8 的决策",
-     "then": "第一条 decision 为 REJECTED(stale_revision)，task revision 仍为 8 且无派发；恰好产生 1 个新触发器，其摘要基于 revision 8；第二条 decision 为 APPLIED",
+     "then": "第一条 decision 为 REJECTED(STALE_REVISION)，task revision 仍为 8 且无派发；恰好产生 1 个新触发器，其摘要基于 revision 8；第二条 decision 为 APPLIED",
      "test_id": "TEST-021-04"
     },
     {
      "id": "AC-021-05",
      "given": "writer_slots=1、reader_slots=2 全部被 FakeAgent 长任务占用；reserve_supervisor_slot=true；FakeClock",
      "when": "t=0 注入 1 条 critical issue；处理完后让 FakeCommander 不可用，再注入 need_decision 和 candidate_ready",
-     "then": "critical issue 在 t=2.0s 唤醒 Commander，不排在读写槽之后；Commander 不可用后 run=BLOCKED 且原因含 need_decision，candidate_ready 仍产生 QA/Review dispatch；GetEvents 能读到每个触发器的去重键、event_seqs 和延迟毫秒数",
+     "then": "critical issue 在 t=2.0s 唤醒 Commander，不排在读写槽之后；Commander 不可用后 run=BLOCKED、blocked_reason=COMMANDER_UNAVAILABLE 且 blocked_reasons 含 NEED_DECISION，candidate_ready 仍产生 QA/Review dispatch；GetEvents 能读到每个触发器的去重键、event_seqs 和延迟毫秒数",
      "test_id": "TEST-021-05"
     }
    ],
@@ -1043,7 +1053,7 @@
     "同一 idempotency_key 且 payload hash 相同，返回原结果；key 相同而 payload 不同，返回 409 KEY_REUSE。",
     "ACK/收据只表示送达。task 只在收到 TaskResult 并通过验证后迁移；outbox 变为 ACKED 不会使 task 变为 ACCEPTED。",
     "未 ACK 的投递按持久化的 attempt_count/next_retry_at 重试；超过投递上限后进入 DEAD_LETTER 并发出事件，记录不删除。",
-    "Developer 提交 candidate 后，Runtime 生成发往 qa 和 reviewer 的 ContextHandoff，二者带相同的 candidate 完整身份、spec_sha256、role_epoch，且 acceptance_ids 非空。",
+    "Developer 提交 candidate 后，Runtime 生成发往 qa 和 reviewer 的 ContextHandoff，二者为 kind=handoff 的消息（handoff_kind=verification），带相同的 candidate 完整身份与 spec_sha256、各自接收角色当前的 role_epoch，且 acceptance_ids 非空。",
     "role_epoch、expected_revision、spec_sha256 或 candidate_id 与当前值不符的消息，得到 kind=rejected（含 current_revision），不改变状态。"
    ],
    "failure_modes": [
@@ -1098,14 +1108,14 @@
      "id": "AC-022-05",
      "given": "当前 spec_sha256=S2、candidate=C2、qa role_epoch=2",
      "when": "分别投递 4 条 QA 消息：role_epoch=1；spec_sha256=S1；candidate_id=C1；以及一条 acceptance_ids=[] 的 handoff",
-     "then": "前 3 条得到 kind=rejected，原因分别为 stale_epoch/spec_mismatch/candidate_mismatch；第 4 条 schema 校验失败；task 与 acceptance_results 都不变；4 条拒绝都写入事件",
+     "then": "前 3 条得到 kind=rejected，原因分别为 STALE_ROLE_EPOCH/SPEC_MISMATCH/CANDIDATE_MISMATCH；第 4 条 schema 校验失败；task 与 acceptance_results 都不变；4 条拒绝都写入事件",
      "test_id": "TEST-022-05"
     }
    ],
    "decisions": [
     "文档没有给出投递上限或期限。初值 max_delivery_attempts=5（测试中配置为 3），超过后进入 DEAD_LETTER，不删除。",
     "乱序时 expected_revision 不匹配：选择直接 rejected 并写收据；发送方重算后用新的 message_id 和 expected_revision 重发，旧 message_id 不复活。",
-    "拒绝原因码 stale_epoch/spec_mismatch/candidate_mismatch 为初值。"
+    "拒绝原因码 STALE_ROLE_EPOCH/SPEC_MISMATCH/CANDIDATE_MISMATCH 为初值；CR-003 统一为大写原因码并集中登记在 protocol.schema.json 的 $defs.ReasonCode。"
    ]
   },
   {
@@ -1204,7 +1214,8 @@
    "decisions": [
     "App Server 的 YOLO 通过 thread/start 的 approvalPolicy=never、sandbox=danger-full-access 表达，依据本机 codex 0.166 generate-json-schema；docs/13 只描述 exec flag。",
     "native cancel grace 10 s 与 TERM grace 5 s 为初值，三个适配器共用。",
-    "降级 exec 的 resume 用 `codex exec resume <id>`（本机 help 存在），是否计为 resume 能力由兼容套件确认。"
+    "降级 exec 的 resume 用 `codex exec resume <id>`（本机 help 存在），是否计为 resume 能力由兼容套件确认。",
+    "（CR-003）鉴权失败识别：App Server 为 turn/completed status=failed 且 codexErrorInfo=unauthorized（0.166.0 schema 枚举值，录制中未出现，fixture 依 schema 合成并在 meta.json 标 synthetic=true，只用于 integration）；exec 降级为 turn.failed，且其 error.message 或之前的 error 事件含 `unexpected status 401`（录制样例 exec-unauthenticated）。二者都映射 BLOCKED_AUTH 且不重试。"
    ]
   },
   {
@@ -1228,11 +1239,12 @@
     "仅当 result.subtype=success、is_error=false 且进程退出码0时 attempt=SETTLED；error_max_turns、error_during_execution、中断均不是成功。",
     "后续轮次必须以 `--resume <session_id>` 继续同一会话；需要独立会话的角色不得复用开发会话 id。",
     "YOLO profile 仅在 help 含 `--dangerously-skip-permissions` 时使用；HoH Auto 不得映射为 `--permission-mode auto`；HoH Prompt 经官方追加方式或任务上下文注入，不替换原生 system prompt。",
-    "取消必须先发 SIGINT（原生中断）→ grace 后对进程组 SIGTERM → 再有界 SIGKILL 并 reap；默认 grace 10 s/5 s（初值）。"
+    "取消必须先发 SIGINT（原生中断）→ grace 后对进程组 SIGTERM → 再有界 SIGKILL 并 reap；默认 grace 10 s/5 s（初值）。",
+    "已请求取消的 attempt 一律以 CANCELLED 结束：取消优先于 result 帧与退出码判定，取消后收到的 result 帧（如 error_during_execution）只作诊断保存（CR-003）。"
    ],
    "failure_modes": [
-    "当 stdout 在 result 帧前 EOF 时，attempt=FAILED（原因 PROTOCOL_INCOMPLETE），即使退出码为0。",
-    "当 result.is_error=true 或 subtype≠success 时 attempt=FAILED 并保存原 subtype；按录制样例识别的鉴权失败映射 BLOCKED_AUTH 且不重试。",
+    "当未请求取消且 stdout 在 result 帧前 EOF 时，attempt=FAILED（原因 PROTOCOL_INCOMPLETE），即使退出码为0。",
+    "当未请求取消且 result.is_error=true 或 subtype≠success 时 attempt=FAILED 并保存原 subtype；按录制样例识别的鉴权失败映射 BLOCKED_AUTH 且不重试。",
     "当 stdout 出现非 JSON 行时保存原始字节并发诊断事件，不 panic；终态仍只由合法 result 帧决定。",
     "当以 root 运行且需要 bypass 时，不启动进程，报告 BLOCKED_CAPABILITY 并提示改用非 root VM 用户。",
     "当子进程忽略 SIGINT/SIGTERM 时，grace 合计后 SIGKILL 整个进程组，无孤儿与僵尸，attempt=CANCELLED。",
@@ -1279,7 +1291,8 @@
    "decisions": [
     "原生取消选 SIGINT；`--input-format stream-json` 下是否有协议级 interrupt 需以版本样例确认后再启用。",
     "成功判定同时要求 result success、is_error=false 与退出码0，属从严选择。",
-    "PROTOCOL_INCOMPLETE 命名为初值；`--include-partial-messages` 默认关闭，仅在需要实时增量时开启。"
+    "PROTOCOL_INCOMPLETE 命名为初值；`--include-partial-messages` 默认关闭，仅在需要实时增量时开启。",
+    "（CR-003）claude 2.1.317 录制样例 sigint-cancel 显示：SIGINT 后仍输出 result(subtype=error_during_execution, is_error=true) 且退出码0，故取消判定以「已请求取消」为准；AC-025-01 所需含 tool_use 的成功样例由 M1-T03 补录。"
    ]
   },
   {
@@ -1352,7 +1365,8 @@
    "decisions": [
     "帧名已对照本机 Pi 1.5.0 自带文档（docs/rpc.md、rpc-commands.md、rpc-extension-ui.md）核实：命令以 `id` 关联 response；prompt 的 disposition 为 started/queued/handled；事件 agent_start/agent_end/agent_settled；中止命令 `abort`；状态查询 `get_state`（isStreaming、isCompacting、pendingMessageCount）；对话类 extension_ui_request（select/confirm/input/editor）须以同 id 的 extension_ui_response 回 `cancelled: true`，notify/setStatus/setWidget/setTitle/set_editor_text 不需回应；会话参数 `--session-dir`/`--session-id`。M0-T04 仍须录制真实样例。",
     "已修正（CR-002，依据 Pi 1.5.0 docs/rpc.md）：只按 0x0A 分帧，并剥离 LF 前可选的 CR 以接受 CRLF。",
-    "会话参数为 `--session-id <id>`（Pi 1.5.0 help）；UI 请求 cancel 回应测试阈值≤1 s 为确认值。"
+    "会话参数为 `--session-id <id>`（Pi 1.5.0 help）；UI 请求 cancel 回应测试阈值≤1 s 为确认值。",
+    "（CR-003）Pi 1.5.0 没有结构化鉴权错误码：response success=false 时按录制模式分类——error 以 `No API key found` 开头→BLOCKED_AUTH，以 `Model not found` 开头→MODEL_UNAVAILABLE（样例 rpc-no-provider、rpc-invalid-model）；不匹配任何模式→PermanentExternal 并保存原文。"
    ]
   },
   {
@@ -1370,14 +1384,15 @@
    "spec_maturity": "detailed",
    "summary": "适配器从实际版本、--help 与原生 schema 探测能力并写入 compat manifest，按能力而非品牌启用功能；未知事件/字段原样保存不 panic，超大帧有界失败，不支持的能力显式降级。",
    "behavior": [
-    "probe() 必须记录 binary path、binary sha256、--version 原文、相关 --help 的 sha256、原生 schema hash（Codex 用 `codex app-server generate-json-schema` 输出），写入 compat manifest。",
+    "probe() 必须记录 launcher path 与 sha256，以及解析后的实际实现 path 与 sha256（如 pi 由 install/current-version 解析到 releases/<版本>，codex 由 npm 包装解析到 vendored 原生二进制）、--version 原文、相关 --help 的 sha256、原生 schema hash（Codex 用 `codex app-server generate-json-schema` 输出），写入符合 contracts/compat-manifest.schema.json 的 compat manifest（CR-003）。",
     "Capabilities（structured_events、resume、mid_turn_steer、custom_tools、images、browser、ui_dialogs、token_usage）必须由探测与兼容套件结果得出，不按品牌硬编码，并写入 sessions.capabilities_json。",
     "兼容套件 fixture 必须对每个 agent 覆盖成功、失败、取消、压缩、工具、未知字段6类，manifest 记录所用 fixture 集 hash 与结果。",
-    "binary/help/schema hash 与 manifest 不符时，新 attempt 不得使用该版本（COMPAT_UNVERIFIED），直到在无写租约时重跑兼容套件通过；运行中的 attempt 不受影响。",
+    "实现 sha256、help 或 schema hash 与 manifest 不符时，新 attempt 不得使用该版本（COMPAT_UNVERIFIED），直到在无写租约时重跑兼容套件通过；运行中的 attempt 不受影响。",
     "未知事件类型与已知事件中的未知字段必须保存原始帧并产生 `adapter.unknown_event` 诊断，不 panic、不改变终态判定。",
     "请求不支持的能力必须返回 CAPABILITY_UNSUPPORTED（API 为422）或走文档化降级（如 steer 排到下一轮），不得静默伪装支持。",
     "协议帧超过1 MiB（初值）必须有界失败：缓冲不超过上限加一次读块，保存诊断并使该 attempt FAILED（PROTOCOL_FRAME_TOO_LARGE）。",
-    "能力为 false 或数据缺失的指标（如 token_usage）必须显示 unknown/null，不显示0。"
+    "能力为 false 或数据缺失的指标（如 token_usage）必须显示 unknown/null，不显示0。",
+    "每个适配器按 CLI 版本维护已知帧登记表 tests/fixtures/protocol/<agent>/<version>/known-frames.json（由录制样例与官方文档汇总，含已知但忽略的辅助帧，如 Claude 的 rate_limit_event、system/task_*，Codex 的 remoteControl/status/changed、deprecationNotice）；只有不在登记表中的帧才产生 adapter.unknown_event（CR-003）。"
    ],
    "failure_modes": [
     "当安装脚本成功但兼容套件未运行时，protocol=unknown，不视为兼容。",
@@ -1407,7 +1422,7 @@
     },
     {
      "id": "AC-027-02",
-     "given": "三个适配器各1份 fixture：插入1条未知 method/type 帧，并在已知事件中加入未知字段 `x_future`；另备删除未知帧的对照 fixture",
+     "given": "三个适配器各1份 fixture：插入1条不在该版本已知帧登记表中的 method/type 帧，并在已知事件中加入未知字段 `x_future`；另备删除未知帧的对照 fixture",
      "when": "回放两组 fixture 至终态",
      "then": "无 panic；每份恰1条 adapter.unknown_event 且含原始帧 sha256；原始日志 sha256=输入字节 sha256；`x_future` 可从 raw 旁路取回；终态与对照回放一致",
      "test_id": "TEST-027-02"
@@ -1653,7 +1668,7 @@
      "id": "AC-035-03",
      "given": "Run R中Developer Attempt（FakeAgent）产出冻结candidate C1；QA与Review角色绑定可用。",
      "when": "Runtime处理candidate_ready事件。",
-     "then": "QA与Review两条dispatch outbox行在同一事务内生成且candidate_id均为C1；FakeCommander调用次数=0。",
+     "then": "QA与Review两条kind=handoff outbox行在同一事务内生成且candidate_id均为C1；FakeCommander调用次数=0。",
      "test_id": "TEST-035-03"
     },
     {
@@ -1674,7 +1689,9 @@
    "decisions": [
     "拒绝原因码（DEPENDENCY_NOT_ACCEPTED、STALE_*、BUDGET_NOT_RESERVABLE、ROLE_CAPABILITY_MISSING、ILLEGAL_TRANSITION、EVIDENCE_GATE_UNMET、COMMANDER_UNAVAILABLE）为确认值；M1-T01 实现领域类型时集中写入 protocol.schema.json 枚举（随该任务 CR 重锁）。",
     "decisions 表已含 reason_code 列（CR-001 SQL），原因码不只写在 event 中。",
-    "「已授权低风险动作」文档未枚举；本选择仅含常规QA/Review派发、已调度重试、pause/cancel与状态持久化。"
+    "「已授权低风险动作」文档未枚举；本选择仅含常规QA/Review派发、已调度重试、pause/cancel与状态持久化。",
+    "（CR-003）Run=BLOCKED 表示存在只有外部才能解除的全局阻塞：停止 Commander 决策类派发（新的实现任务），已运行的 Attempt 继续到安全点，Runtime 自动规则（candidate_ready→QA/Review、已调度重试、pause/cancel、持久化）照常执行。runs.blocked_reason 为当前阻塞集合中优先级最高的一项（BLOCKED_AUTH > COMMANDER_UNAVAILABLE > BUDGET_UNENFORCEABLE > BLOCKED_CAPABILITY > NEED_DECISION），完整集合写入 runs.blocked_reasons_json；集合清空且无 pause/cancel 请求时回到 resume_state。",
+    "（CR-003）Commander 提议的结构为 protocol.schema.json 的 $defs.DecisionPayload（dispatch、transition_task、transition_run、request_user_decision、create_tasks、record_assumption），计划校验输入为 $defs.PlanProposal；拒绝原因取 $defs.ReasonCode。"
    ]
   },
   {
@@ -2030,7 +2047,7 @@
    "spec_maturity": "detailed",
    "summary": "host在kill -9、断网或VM重启后按固定顺序reconcile：取锁与完整性检查、递增host_epoch、核对未完成Attempt的进程/会话/effect，再决定入库、重投或UNKNOWN_EFFECT；旧epoch与过期租约结果被fence。",
    "behavior": [
-    "host启动必须按序：取项目锁→schema版本与完整性检查→host_epoch+1→扫描LEASED/RUNNING Attempt→查询进程/会话/effect→处置；完成前不接受写命令。",
+    "host启动必须按序：取项目锁→schema版本与完整性检查→host_epoch+1→扫描LEASED/RUNNING Task及其PREPARED/STARTING/RUNNING Attempt→查询进程/会话/effect→处置；完成前不接受写命令。",
     "处置必须是：能确认完成则观察结果入库；确认未执行才重投；无法确认则Attempt=UNKNOWN_EFFECT并产生诊断，禁止盲目重放。",
     "进程存活判定必须同时匹配boot_id、PID与进程启动标识（如/proc/<pid>/stat starttime）；不匹配即视为非本Attempt进程，不得对其发信号。",
     "租约过期不得直接判旧进程死亡：先inspect并cancel/kill旧进程组、确认reap后才以epoch+1重授；携带旧lease epoch、旧role_epoch或旧host_epoch的写入一律拒绝并只存历史。",
@@ -2116,7 +2133,7 @@
    "summary": "外部429/5xx与超时按Retry-After或full-jitter指数退避并持久next_retry_at，重启不清计数与预算；鉴权/能力缺失直接BLOCKED；预算、迭代或deadline耗尽时停止派发并报告INCOMPLETE，未知价格显示unknown。",
    "behavior": [
     "429/503必须优先用Retry-After；没有时full-jitter：delay=uniform(0,min(cap,base·2^n))（初值base=2 s、cap=300 s），并在同事务持久attempt_count、next_retry_at、deadline。",
-    "等待期间Run为WAITING_EXTERNAL；next_retry_at之前不得派发该项；计时用单调时钟，重启后按持久UTC期限重算。",
+    "等待期间该Task不可派发；仅当Run内没有其他可派发Task时Run为WAITING_EXTERNAL，否则Run保持RUNNING（CR-003）；next_retry_at之前不得派发该项；计时用单调时钟，重启后按持久UTC期限重算。",
     "同一外部故障首次失败后最多重试8次（初值）；用尽后Task=BLOCKED并产生need_decision，不无限隐藏重试。",
     "鉴权缺失必须直接BLOCKED（BLOCKED_AUTH），CLI能力不兼容直接BLOCKED（BLOCKED_CAPABILITY）；不进入指数退避。",
     "同一问题本地修复≤3次、协议格式纠正≤2次（max_local_repairs/max_protocol_repairs）；超限即升级决策，不再派发同类修复。",
@@ -2188,7 +2205,8 @@
     "退避base=2 s、cap=300 s、瞬时重试上限8次均为初值。",
     "已修正（CR-002）：价格未知时 cost 为 null 并显示 unknown；若用户配置了费用上限而所用模型价格未知，该上限无法执行，派发前即 BLOCKED（BUDGET_UNENFORCEABLE），不在无法核算时继续花费；未配置费用上限时照常受其他预算约束。",
     "命名已统一（CR-001）：BLOCKED_AUTH/BLOCKED_CAPABILITY 为阻塞原因，CAPABILITY_UNSUPPORTED 为错误码；runs 已含 blocked_reason 列。",
-    "tasks 已含 attempt_count、next_retry_at；预算账本为 budgets 表（CR-001 SQL）。"
+    "tasks 已含 attempt_count、next_retry_at；预算账本为 budgets 表（CR-001 SQL）。",
+    "（CR-003）费用与期限配置键：[budget] max_usd（可选，缺省表示未设费用上限）、deadline_at（可选，RFC 3339 UTC）；与 max_duration_hours、max_iterations 同属 [budget]。"
    ]
   },
   {
@@ -2531,12 +2549,20 @@
      "when": "分别篡改 e0 的 11 个方面：candidate_id、git_tree、spec_sha256、environment_sha256、test_plan_sha256、observations=[]、producer attempt 不存在、finished_at<started_at、source_unchanged=false、stdout sha256 不符、missing_artifacts 非空",
      "then": "e0 判为 valid；11 个变体全部判为 not valid：observations=[] 的原因为 INSUFFICIENT，其余为 INVALID",
      "test_id": "TEST-052-04"
+    },
+    {
+     "id": "AC-052-05",
+     "test_id": "TEST-052-05",
+     "given": "冻结候选 C 及其 unit/integration/tui-pty/recovery/adapter-live 检查记录（各含 test-results.jsonl）；变体：删除一条 v0.1 AC 对应的测试后重新冻结 C'",
+     "when": "在 C 与 C' 上分别运行 traceability 检查",
+     "then": "C：退出码0，报告列出 profile 内每个 TEST id 及其来源检查与通过的测试名；C'：退出码非0，报告列出缺失的 TEST id；两次报告都绑定各自 candidate_id"
     }
    ],
    "decisions": [
     "产品中对相同内容重复冻结：选择返回已有 candidate_id，不新增行。自举工具 tools/candidate.py 则拒绝覆盖已存在的清单文件。",
     "符号链接和子模块：选择拒绝冻结，直到实现显式身份规则并有测试。",
-    "evidence.outcome 枚举里没有 INSUFFICIENT。选择存为 outcome=INVALID，并附原因码 INSUFFICIENT。"
+    "evidence.outcome 枚举里没有 INSUFFICIENT。选择存为 outcome=INVALID，并附原因码 INSUFFICIENT。",
+    "（CR-003）测试名约定：测试名含 `test_NNN_MM` 片段即覆盖 TEST-NNN-MM；检查脚本把逐测试结果写入 $HOH_EVIDENCE_DIR/test-results.jsonl（contracts/test-result.schema.json）。"
    ]
   },
   {

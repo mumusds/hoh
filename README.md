@@ -2,7 +2,19 @@
 
 **这是一套用于实现HoH的规格、资源和可执行开发工具，不是已经编译完成的HoH产品。** 所有70项产品需求都保留在 v1 交付范围；模板自测或模拟Agent通过，不能据此宣布产品验收完成。
 
-[快速开始](START_HERE.md) · [完整启动提示词](LAUNCH_PROMPT.md) · [约束基线](CONTRACT.md) · [CR-001](docs/cr/CR-001-kit-hardening.md) · [验证报告](reports/REVIEW.md) · [研究来源](research/SOURCES.md)
+[快速开始](START_HERE.md) · [开发目标](goal.md) · [完整启动提示词](LAUNCH_PROMPT.md) · [约束基线](CONTRACT.md) · [CR-003](docs/cr/CR-003-unblock-autonomous-delivery.md) · [开工前审计](docs/23-pre-m1-audit.md) · [研究来源](research/SOURCES.md)
+
+## 当前状态
+
+| 项 | 状态 |
+|---|---|
+| 基线 | HOH-BASELINE-1.1 revision 4（CR-001、CR-002、CR-003） |
+| 已完成 | M0：环境、Cargo workspace、检查计划骨架、三种 Agent 的真实协议样例，3 轮独立审查 |
+| 开工前修正 | CR-003：任务图按 AC 显式归属（58 个任务）、门禁改为逐测试证据、M2 规格缺口补齐、细化 CR 预授权、测试基础设施 |
+| 下一步 | M1-T01（领域类型与 HCP 协议类型），按 `python3 tools/taskboard.py next` 推进 |
+| 产品验收 | 未开始；产品检查中尚未实现的项以 NOT_IMPLEMENTED 失败，这是预期行为 |
+
+实时进度以 `.hoh-dev/PROGRESS.md` 与 `python3 tools/taskboard.py list` 为准；中断后用 [RESUME_PROMPT.md](RESUME_PROMPT.md) 续做。
 
 ## 用户操作
 
@@ -32,7 +44,7 @@ Rust模块化单体；Codex Commander + Claude CTO/Developer + Pi QA/Research；
 | [接口与数据](docs/05-data-api.md) | Schema、API、SQLite、幂等和约束 |
 | [编排系统](docs/06-orchestration.md) | 规格/工程循环、角色、消息、交接 |
 | [核心算法](docs/07-algorithms.md) | DAG、调度、监督、上下文、恢复 |
-| [开发计划](docs/08-development-plan.md) | v0.1 路径、M0–M7、49个任务、滚动细化 |
+| [开发计划](docs/08-development-plan.md) | v0.1 路径、M0–M7、58个任务、滚动细化 |
 | [测试方案](docs/09-testing.md) | 单元、集成、真实Agent、PTY、Web、跨天 |
 | [验收规范](docs/10-acceptance.md) | Definition of Done、证据、最终Gate |
 | [部署](docs/11-deployment.md) | 构建、安装、后台Host、备份、升级回滚 |
@@ -47,18 +59,20 @@ Rust模块化单体；Codex Commander + Claude CTO/Developer + Pi QA/Research；
 | [审核与验证](docs/20-review-report.md) | 实际检查、边界、待关闭缺口 |
 | [规格治理](docs/21-spec-governance.md) | 文档权威性、变更、漂移处理 |
 | [工程工具使用](docs/22-tooling.md) | 可执行脚本、候选冻结、证据门禁 |
+| [开工前审计](docs/23-pre-m1-audit.md) | M1 开工前的规格/门禁/计划审查、外部工具建议、交付风险 |
 | [ADR](docs/adr/ADR-001.md) | 10项关键架构决策（按编号继续） |
 | [开发规范](CONTRIBUTING.md) / [变更记录](CHANGELOG.md) | 提交、测试、审查与版本记录 |
 
 ## 机器可读交付
 
-`contracts/`含70项需求（M1/M2 的27项已细化为 detailed，其余为 outline，在各自里程碑开始前细化）、164条验收与同数测试场景（每条指定产出证据的检查）、49个任务、10个JSON Schema（含检查计划、live会话、soak时间线、原生attempt）、OpenAPI和可执行SQL；`resources/`含6个角色Prompt、12个原创工程Skill、16个文档模板；`tools/`与`scripts/`负责环境、自测、单次Agent调用、任务台账、候选冻结、按检查计划执行、证据门禁、基线/CR与生成视图。它们是开发辅助，不是Rust产品的替代实现。
+`contracts/`含70项需求（M1/M2 的27项已细化为 detailed，其余为 outline，在各自里程碑开始前细化）、166条验收与同数测试场景（每条指定产出证据的检查）、58个任务（每个任务列出负责的 AC 与落地的检查）、12个JSON Schema（含检查计划、live会话、soak时间线、原生attempt、逐测试结果、兼容清单）、OpenAPI和可执行SQL；`resources/`含6个角色Prompt、13个原创工程Skill、16个文档模板；`tools/`与`scripts/`负责环境、自测、单次Agent调用、任务台账、候选冻结、按检查计划执行、证据门禁、基线/CR与生成视图。它们是开发辅助，不是Rust产品的替代实现。
 
 ## 检查启动包
 
 ```bash
 bash scripts/bootstrap.sh --yolo --dry-run
 bash scripts/check.sh --bundle
+bash scripts/dev/test-infra.sh --dry-run   # 测试基础设施（strace、sshd、qemu/KVM、Playwright 依赖、cargo-deny、linger）
 ```
 
 第二条需要Python 3.11+与`requirements-dev.txt`中的jsonschema。完成正常bootstrap后会自动准备这些依赖；单独检查可在虚拟环境安装。
