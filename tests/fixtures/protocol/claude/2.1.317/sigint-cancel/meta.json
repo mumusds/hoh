@@ -12,7 +12,7 @@
   ],
   "cwd": "fresh temp Git repo outside the checkout",
   "exit_code": 0,
-  "recorded_at": "2026-11-03T23:25:40.992210+00:00",
+  "recorded_at": "2026-11-03T23:40:55.523398+00:00",
   "mode": "live",
   "notes": "SIGINT to the process group 4 s after a foreground Bash tool_use frame, before its tool_result",
   "sigint_after_frame_index": 4,
@@ -25,9 +25,6 @@
     "result:error_during_execution"
   ],
   "stopped": "exited",
-  "descendants_lingered": [
-    "sleep 2"
-  ],
   "valid": true,
   "problems": []
 }

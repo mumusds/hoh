@@ -286,6 +286,31 @@ class Proc:
         except ProcessLookupError:
             pass
 
+    def force_kill(self, wait: float) -> list[int]:
+        """Freeze the scope, read its members, kill them all and wait until it is empty. Frozen processes cannot exit
+        by themselves, so the returned descendants (the child excluded) are exactly those killed here (M0R8-02).
+        Without a usable cgroup.freeze the snapshot is taken just before the kill."""
+        try:
+            (self.cgroup / 'cgroup.freeze').write_text('1')
+            deadline = time.monotonic() + 1
+            while 'frozen 1' not in self.events() and populated(self.cgroup) and time.monotonic() < deadline:
+                time.sleep(0.005)
+        except OSError as exc:
+            if exc.errno in GONE:
+                return []
+        victims = [pid for pid in members(self.cgroup) if pid != self.p.pid]
+        self.descendants += [cmdline(pid) for pid in victims]
+        self.kill_tree()
+        if not self.settle(wait):
+            raise RuntimeError(f'scope {self.unit} still has processes after cgroup.kill: {members(self.cgroup)}')
+        return victims
+
+    def events(self) -> str:
+        try:
+            return (self.cgroup / 'cgroup.events').read_text()
+        except OSError:
+            return ''
+
     def kill_tree(self) -> None:
         """SIGKILL every process in the scope at once, the child included; the kernel admits no new member meanwhile."""
         try:
@@ -335,7 +360,6 @@ class Proc:
         how = 'exited'
         self.flush()
         finished = False
-        seen: dict[int, str] = {}
         killed: list[int] = []
         for stage, wait in (('', grace), ('SIGTERM', term_grace), ('SIGKILL', kill_grace)):
             if stage:
@@ -344,29 +368,21 @@ class Proc:
                 if stage == 'SIGTERM':
                     self.signal(signal.SIGTERM)
                 else:
-                    killed = [pid for pid in members(self.cgroup) if pid != self.p.pid]
-                    seen.update((pid, cmdline(pid)) for pid in killed)
-                    self.kill_tree()
+                    killed += self.force_kill(kill_grace)
             if self.drain(wait):
                 finished = True
                 break
+        seen: dict[int, str] = {}
         deadline = time.monotonic() + (descendant_grace if finished else 0)
-        while populated(self.cgroup) and time.monotonic() < deadline:  # the kernel's flag: no scan race (M0R7-03)
+        while time.monotonic() < deadline and populated(self.cgroup):  # the kernel's flag: no scan race (M0R7-03)
             for pid in members(self.cgroup):
                 seen.setdefault(pid, cmdline(pid))
             time.sleep(0.05)
-        left = members(self.cgroup)
-        for pid in left:
-            seen.setdefault(pid, cmdline(pid))
         if populated(self.cgroup):
-            self.kill_tree()
-            if not self.settle(kill_grace):
-                raise RuntimeError(f'scope {self.unit} still has processes after cgroup.kill: {members(self.cgroup)}')
-        left = [pid for pid in dict.fromkeys(killed + left) if pid != self.p.pid]
-        if left:
+            killed += self.force_kill(kill_grace)
+        if killed:  # only what a forced kill actually ended (M0R8-02)
             how += '+descendants-killed'
-        self.descendants = [seen[pid] for pid in left]
-        self.lingered = [cmd for pid, cmd in seen.items() if pid not in left and pid != self.p.pid]
+        self.lingered = [cmd for pid, cmd in seen.items() if pid not in killed and pid != self.p.pid]
         if not finished and not self.drain(kill_grace):
             self.close_pipes()
             how += '+abandoned'
@@ -1097,15 +1113,13 @@ AGENTS = {'claude': claude, 'codex': codex, 'pi': pi}
 def record(agent: str, root: Path = HERE) -> Path:
     """Record one agent into staging and publish it; raises RecordingFailed and leaves the published fixtures alone otherwise."""
     previous = install_termination_handlers()  # SIGTERM/SIGHUP raise Terminated so children are stopped (M0R4-01)
-    try:
+    rec = None
+    version = '?'
+    try:  # one cleanup for the whole lifecycle, version and provenance probes included (M0R8-01)
         version = INSTALLED_VERSION[agent]()
         before = binaries(agent)
         started = now()
         rec = Recording(agent, version, root)
-    except BaseException:
-        restore_handlers(previous)
-        raise
-    try:
         AGENTS[agent](rec)
         if INSTALLED_VERSION[agent]() != version or binaries(agent) != before:
             rec.fail('provenance', 'the installed binary changed during the recording')
@@ -1116,7 +1130,7 @@ def record(agent: str, root: Path = HERE) -> Path:
         return rec.final
     except BaseException as exc:
         stop_all()
-        where = rec.abandon()
+        where = rec.abandon() if rec is not None else 'nothing staged yet'
         if isinstance(exc, (KeyboardInterrupt, SystemExit, Terminated)):
             raise
         detail = str(exc) if isinstance(exc, RecordingFailed) else f'{type(exc).__name__}: {exc}'
@@ -1198,6 +1212,7 @@ def main() -> int:
                     print(f'NOT recorded: {exc}', file=sys.stderr)
     finally:
         try:
+            stop_all()  # last resort: nothing started by this run may outlive it
             write_manifest(HERE)  # also after an interrupt: agents published earlier in this run must be listed (M0R5-03)
             print('wrote compat-manifest.json')
         finally:

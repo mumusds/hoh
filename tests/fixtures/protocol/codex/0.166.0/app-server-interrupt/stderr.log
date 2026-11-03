@@ -1,1 +1,1 @@
-[2m2026-11-03T23:27:12.860045Z[0m [31mERROR[0m [2mcodex_core::session[0m[2m:[0m failed to record rollout items: thread 01a1a3bc-d479-7dd2-ab5a-89409bf1913c not found
+[2m2026-11-03T23:42:27.544888Z[0m [31mERROR[0m [2mcodex_core::session[0m[2m:[0m failed to record rollout items: thread 01a1a3ca-c9b2-7890-aa14-0828ddde4e95 not found
