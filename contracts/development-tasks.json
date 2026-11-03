@@ -58,12 +58,12 @@
    "kind": "setup",
    "owner_role": "researcher",
    "writer": false,
-   "title": "采集 Codex 已认证真实样例：exec turn、App Server turn/start、steer 与 interrupt（需要 codex login）",
+   "title": "采集 Codex 已认证成功样例：exec turn、App Server turn/start→turn/completed、turn/steer、turn/interrupt、thread/resume",
    "depends_on": [
     "M0-T01"
    ],
    "requirements": [],
-   "done_when": "tests/fixtures/protocol/record.py 录制的 Codex 已认证用例全部 valid，compat-manifest 中 codex auth 为 AUTHENTICATED；未登录前保持 blocked。"
+   "done_when": "record.py 录制以上五类用例且全部 valid（成功以 turn.completed / turn/completed 判定，中断以中断状态判定），compat-manifest 中对应 case 齐全；缺任一项保持 blocked。"
   },
   {
    "id": "M1-T01",
@@ -332,7 +332,8 @@
    "writer": true,
    "title": "Codex适配器：App Server优先、exec降级不冒充steer，fixture回放",
    "depends_on": [
-    "M1-T02"
+    "M1-T02",
+    "M0-T05"
    ],
    "requirements": [
     "REQ-024"

@@ -1,0 +1,15 @@
+{
+  "agent": "codex",
+  "cli_version": "0.166.0",
+  "case": "app-server-handshake",
+  "argv": [
+    "codex",
+    "app-server"
+  ],
+  "cwd": "fresh temp Git repo outside the checkout",
+  "exit_code": 0,
+  "recorded_at": "2026-11-03T17:58:58.170422+00:00",
+  "mode": "live",
+  "valid": true,
+  "notes": "initialize, initialized, thread/start; stdin closed after 10 s"
+}

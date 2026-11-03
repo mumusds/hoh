@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"01a1a28f-9e84-7703-944a-a1bd70c6ef95"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"HOH_SAMPLE_OK"}}
+{"type":"turn.completed","usage":{"input_tokens":14932,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":8,"reasoning_output_tokens":0}}

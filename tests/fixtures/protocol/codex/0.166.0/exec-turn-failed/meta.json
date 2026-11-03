@@ -1,0 +1,18 @@
+{
+  "agent": "codex",
+  "cli_version": "0.166.0",
+  "case": "exec-turn-failed",
+  "argv": [
+    "codex",
+    "exec",
+    "--json",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "-"
+  ],
+  "cwd": "fresh temp Git repo outside the checkout",
+  "exit_code": 1,
+  "recorded_at": "2026-11-03T17:54:32.600164+00:00",
+  "mode": "live",
+  "valid": true,
+  "notes": "logged in, turn failed; see the error frames"
+}

@@ -24,9 +24,18 @@ compare raw bytes; the repository is private.
 | pi 1.5.0 | `rpc-prompt` | live | `prompt` response `disposition: "started"`; `agent_start` … `agent_end` → `agent_settled` |
 | pi 1.5.0 | `rpc-resume` | live | a new process with the same `--session-dir` and `--session-id` reports the same `sessionId` and remembers the previous turn |
 | pi 1.5.0 | `rpc-abort` | live | `abort` during streaming ends the assistant message with `stopReason: "aborted"` and still emits `agent_settled` |
-| codex 0.166.0 | `exec-unauthenticated` | live, no login | `thread.started`, `turn.started`, repeated `error` frames, exit code 1 |
-| codex 0.166.0 | `app-server-handshake-unauthenticated` | live, no login | `initialize` and `thread/start` succeed without login (`thread/started` notification); failures surface only once a turn runs |
+| pi 1.5.0 | `rpc-no-provider` | live, reproducible | empty `PI_CODING_AGENT_DIR`, no key variables: `get_state` succeeds, `prompt` returns `success:false` "No API key found" → REJECTED / BLOCKED_AUTH, nothing to wait for |
+| pi 1.5.0 | `rpc-invalid-model` | live | `set_model` with an unknown provider/model returns `success:false` "Model not found" |
+| codex 0.166.0 | `exec-unauthenticated` | live, no login | `thread.started`, `turn.started`, repeated `error` frames and an `item.completed` error item, terminal `turn.failed`, exit code 1 |
+| codex 0.166.0 | `exec-turn-failed` | live, logged in | the configured model is not available to the account: `item.completed` error item, `turn.started`, `error`, terminal `turn.failed`, exit code 1 (MODEL_UNAVAILABLE surface) |
+| codex 0.166.0 | `exec` | live, logged in | `thread.started`, `turn.started`, `item.completed`, `turn.completed`, exit code 0 |
+| codex 0.166.0 | `app-server-handshake` | live, logged in | `initialize` and `thread/start` results, then `thread/started`, `mcpServer/startupStatus/updated`, `account/updated` notifications |
+| codex 0.166.0 | `app-server-turn` | live, logged in | `turn/start` result, `turn/started`, `item/started`, `item/agentMessage/delta`, `item/completed`, `turn/completed` with `turn.status: "completed"`; auxiliary `thread/tokenUsage/updated`, `account/rateLimits/updated` |
+| codex 0.166.0 | `app-server-resume` | live, logged in | a new process `thread/resume`s the thread and the next turn recalls the previous token |
+| codex 0.166.0 | `app-server-interrupt` | live, logged in | `turn/interrupt` during a command execution item returns a result, then `turn/completed` with `turn.status: "interrupted"` |
+| codex 0.166.0 | `app-server-steer` | live, logged in | `turn/steer` with a stale `expectedTurnId` → JSON-RPC error `-32600` "expected active turn id … but found …"; with the active turn id → result, and the turn completes |
+| codex 0.166.0 | `app-server-handshake-unauthenticated` | live, no login | `initialize` and `thread/start` still succeed (`thread/started`); stderr already logs a Responses WebSocket connection error |
 | codex 0.166.0 | `app-server-schema/` | offline | JSON Schema from `codex app-server generate-json-schema` (tree hash in the manifest) |
 
-Codex authenticated turns (exec and App Server `turn/start`, steer, interrupt) are NOT_RUN until
-`codex login` is done (task M0-T05). They are an external blocker, not a gap to fill with invented frames.
+`exec-turn-failed` was recorded while the operator's Codex config named a model with the wrong case
+(`gpt-6-Astra` instead of `gpt-6-astra`); it is kept as the real model-unavailable failure surface.

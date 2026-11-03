@@ -15,19 +15,40 @@ DEGRADABLE={'REQ-048','REQ-049','REQ-050'}
 TASK_KINDS={'setup','spec','implement','verify','release'}
 TRIVIAL_COMMANDS={'true',':','echo','printf','exit','yes'}
 SHELLS={'bash','sh','dash','zsh','ksh'}
-INTERPRETERS={'python','python3','node','perl','ruby'}
+
+ENV_OPTIONS_WITH_ARG={'-u','--unset','-C','--chdir'}
+INLINE_LETTERS={'shell':'c','python':'c','node':'ep','perl':'eE','ruby':'e'}
+
+def unwrap_env(args:list[str])->list[str]|None:
+    """Return the command wrapped by `env [options] [NAME=value ...]`; None for env -S/--split-string."""
+    while args and Path(args[0]).name=='env':
+        i=1
+        while i<len(args) and args[i].startswith('-') and args[i]!='-':
+            if args[i]=='--':i+=1;break
+            if args[i] in ('-S','--split-string') or args[i].startswith('--split-string='):return None
+            i+=2 if args[i] in ENV_OPTIONS_WITH_ARG else 1
+        while i<len(args) and '=' in args[i] and not args[i].startswith('-'):i+=1
+        args=args[i:]
+    return args
+
+def interpreter_kind(name:str)->str|None:
+    if name in SHELLS:return 'shell'
+    base=name.rstrip('0123456789.')
+    return 'python' if base.startswith('python') else base if base in INLINE_LETTERS else None
 
 def plan_command_problem(argv:list[str])->str|None:
     """Checks must run committed, reviewable commands: no always-succeeding builtins, no inline code."""
-    args=list(argv)
-    while args and Path(args[0]).name=='env':  # env [-i] [VAR=value ...] command
-        args=[a for a in args[1:] if not a.startswith('-')]
-        while args and '=' in args[0]:args=args[1:]
+    args=unwrap_env(list(argv))
+    if args is None:return 'env --split-string; commit a script instead'
     if not args:return 'empty command'
     name=Path(args[0]).name
     if name in TRIVIAL_COMMANDS:return f'always-succeeding command {args[0]!r}'
-    if (name in SHELLS or name.rstrip('0123456789.') in INTERPRETERS) and any(a in ('-c','-e','--eval') for a in args[1:]):
-        return f'inline code via {args[0]} {"/".join(a for a in args[1:] if a in ("-c","-e","--eval"))}; commit a script instead'
+    kind=interpreter_kind(name)
+    if kind:
+        for a in args[1:]:
+            if a in ('--eval','--print','--command') or (a.startswith('-') and not a.startswith('--') and any(ch in INLINE_LETTERS[kind] for ch in a[1:])):
+                return f'inline code via {args[0]} {a}; commit a script instead'
+            if not a.startswith('-'):break  # first operand is the script path; later args belong to the script
     return None
 
 # The kit owns these paths. Product sources (crates/, web/, tests/ fixtures …) have their own linters,

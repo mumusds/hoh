@@ -1,0 +1,15 @@
+{
+  "agent": "codex",
+  "cli_version": "0.166.0",
+  "case": "app-server-resume",
+  "argv": [
+    "codex",
+    "app-server"
+  ],
+  "cwd": "fresh temp Git repo outside the checkout",
+  "exit_code": 0,
+  "recorded_at": "2026-11-03T17:58:27.720732+00:00",
+  "mode": "live",
+  "valid": true,
+  "notes": "new app-server process: thread/resume of app-server-turn, then a turn that must recall the token"
+}

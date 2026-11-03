@@ -1,0 +1,18 @@
+{
+  "agent": "pi",
+  "cli_version": "1.5.0",
+  "case": "rpc-invalid-model",
+  "argv": [
+    "pi",
+    "--mode",
+    "rpc",
+    "--session-dir",
+    "<temp>/pi-sessions"
+  ],
+  "cwd": "fresh temp Git repo outside the checkout",
+  "exit_code": 0,
+  "recorded_at": "2026-11-03T17:55:04.683159+00:00",
+  "mode": "live",
+  "valid": true,
+  "notes": "set_model with an unknown provider/model"
+}

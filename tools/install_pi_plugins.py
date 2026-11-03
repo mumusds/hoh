@@ -11,6 +11,13 @@ from __future__ import annotations
 import argparse, shutil, subprocess, sys
 from common import ROOT,atomic_json,flag_supported,load_json,utcnow
 
+def installed_integrity(package:str)->str|None:
+    """Integrity npm recorded for the tarball it actually installed (Pi installs project packages under .pi/npm)."""
+    lock=ROOT/'.pi/npm/package-lock.json'
+    if not lock.is_file():return None
+    entry=load_json(lock).get('packages',{}).get(f'node_modules/{package}',{})
+    return entry.get('integrity')
+
 def run(cmd:list[str],timeout:int)->str:
     return subprocess.run(cmd,cwd=ROOT,capture_output=True,text=True,timeout=timeout,check=True).stdout.strip()
 
@@ -20,7 +27,7 @@ def main(argv=None):
     lock=load_json(lock_path) if lock_path.exists() else {'schema_version':'1.1','plugins':{}}
     if a.dry_run:
         for item in conf['plugins']:
-            print(f'pi install --local [--approve] npm:{item["package"]}@'+lock['plugins'].get(item['id'],{}).get('version','<resolve-and-lock>'))
+            print(f'pi install --local [--approve] npm:{item["package"]}@'+(item.get('version') or lock['plugins'].get(item['id'],{}).get('version','<resolve-and-lock>')))
         return 0
     try:
         if not shutil.which('pi') or not shutil.which('npm'):raise RuntimeError('Pi and npm must be available')
@@ -47,7 +54,10 @@ def main(argv=None):
             entry.update(version=version,integrity=integrity,state='RESOLVED')
             lock['plugins'][item['id']]=entry;atomic_json(lock_path,lock)
             run(['pi','install','--local',*approve,f'npm:{item["package"]}@{version}'],600)
-            entry.update(state='INSTALLED',installed_at=utcnow())
+            installed=installed_integrity(item['package'])
+            if installed is None:raise RuntimeError('installed package not found in .pi/npm/package-lock.json')
+            if installed!=integrity:raise RuntimeError(f'installed tarball integrity {installed} differs from {integrity}')
+            entry.update(state='INSTALLED',installed_at=utcnow(),installed_integrity=installed)
         except (RuntimeError,OSError,subprocess.SubprocessError) as exc:
             detail=(getattr(exc,'stderr',None) or str(exc)).strip()[-2000:]
             entry.update(state='DEGRADED',error=detail,failed_at=utcnow());degraded.append(item['id'])

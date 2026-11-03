@@ -13,7 +13,7 @@
   ],
   "cwd": "fresh temp Git repo outside the checkout",
   "exit_code": 0,
-  "recorded_at": "2026-11-03T17:39:29.376923+00:00",
+  "recorded_at": "2026-11-03T17:55:09.133439+00:00",
   "mode": "live",
   "valid": true,
   "notes": "new process with the same --session-dir and --session-id"

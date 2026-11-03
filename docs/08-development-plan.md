@@ -1,6 +1,6 @@
 # 开发计划与依赖
 
-机器任务板：`contracts/development-tasks.json`（47个任务）。它是可细化的计划，不在基线锁内；任务状态只写 `.hoh-dev/task-state.json`，由 `tools/taskboard.py` 维护。完成任务不等于需求验收，需求验收以冻结候选上的证据为准。
+机器任务板：`contracts/development-tasks.json`（48个任务）。它是可细化的计划，不在基线锁内；任务状态只写 `.hoh-dev/task-state.json`，由 `tools/taskboard.py` 维护。完成任务不等于需求验收，需求验收以冻结候选上的证据为准。
 
 ## 任务类型与规则
 

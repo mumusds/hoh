@@ -1,6 +1,6 @@
 {
-  "schema_version": "1.1",
-  "recorded_at": "2026-11-03T17:39:52.461733+00:00",
+  "schema_version": "1.2",
+  "recorded_at": "2026-11-03T17:58:59.212678+00:00",
   "recorder": "tests/fixtures/protocol/record.py",
   "hash_algorithms": {
     "tree_sha256": "sha256 over the sorted lines '<relative path> <sha256 of file>\\n' of every file under root.",
@@ -8,125 +8,214 @@
   },
   "agents": {
     "claude": {
-      "cli_version": "2.1.317",
-      "auth": "AUTHENTICATED (live turn recorded)",
-      "help_argv": [
-        "claude",
-        "--help"
-      ],
-      "help_sha256": "5ca3a9dac2026e56c221fdd34380c7d7d45ebbb51c1d01b7c17c75cb076a0be8",
-      "entry_path": "/home/ai/.local/share/claude/versions/2.1.317",
-      "entry_sha256": "eb224419e344575faa4a1f39b290b649425a10cd5ee2ef1d003480cd9ae57eb0",
-      "cases": {
-        "max-turns-error": {
-          "valid": true,
-          "files": {
-            "meta.json": "782413efd0b92055e4149704e291b6cd5ee805d1af704ee10a1a0838f5c49a05",
-            "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-            "stdin.txt": "e52fff24350e7ee0bdaada29ee4d16cf1bc9db971d47b7fde2ca9a13b257af77",
-            "stdout.jsonl": "349ed6089af0c3bca228e8e1ea033e97cd5eac30b18ad46596582115a24ce495"
-          }
-        },
-        "resume": {
-          "valid": true,
-          "files": {
-            "meta.json": "dbb8aa987d0e4758159db356902fbd62884259b5b44a6880e96a94f06d7363e8",
-            "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-            "stdin.txt": "9af80d144c78c30129d7defd11f1bf999079ceda14fe4c0eb5258854f6d59d30",
-            "stdout.jsonl": "b0be929d7b0553d8d3eb30342c1214b04718ba7b1978c2be7915c24194f93925"
-          }
-        },
-        "sigint-cancel": {
-          "valid": true,
-          "files": {
-            "meta.json": "8586d4663d637ddfb2563fb739b4e9d69e95758871b96e273e29376a13c24c7b",
-            "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-            "stdin.txt": "ad114cfd545a4e802b14e644a0fa51d742e450b43e21c71ccfc6c3fd75388a6d",
-            "stdout.jsonl": "70e023883392494c3635d008ac43f942352a1132432d37aaef35a603643f9ff9"
-          }
-        },
-        "success": {
-          "valid": true,
-          "files": {
-            "meta.json": "0ab7a14b886bd122a4a34d631e5559ac1fc9271bd772a8f1462afca207e39da2",
-            "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-            "stdin.txt": "41db62ec0de9f9031de948bcb36bdf9bddee41b152fc1416df9a6477245591b6",
-            "stdout.jsonl": "d947ca70d9b363fcfbcab782500630d313493bb82a286b71c6489139cdaf031c"
+      "2.1.317": {
+        "cli_version": "2.1.317",
+        "auth": "AUTHENTICATED (live turn recorded)",
+        "help_argv": [
+          "claude",
+          "--help"
+        ],
+        "help_sha256": "5ca3a9dac2026e56c221fdd34380c7d7d45ebbb51c1d01b7c17c75cb076a0be8",
+        "entry_path": "/home/ai/.local/share/claude/versions/2.1.317",
+        "entry_sha256": "eb224419e344575faa4a1f39b290b649425a10cd5ee2ef1d003480cd9ae57eb0",
+        "cases": {
+          "max-turns-error": {
+            "valid": true,
+            "files": {
+              "meta.json": "782413efd0b92055e4149704e291b6cd5ee805d1af704ee10a1a0838f5c49a05",
+              "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "stdin.txt": "e52fff24350e7ee0bdaada29ee4d16cf1bc9db971d47b7fde2ca9a13b257af77",
+              "stdout.jsonl": "349ed6089af0c3bca228e8e1ea033e97cd5eac30b18ad46596582115a24ce495"
+            }
+          },
+          "resume": {
+            "valid": true,
+            "files": {
+              "meta.json": "dbb8aa987d0e4758159db356902fbd62884259b5b44a6880e96a94f06d7363e8",
+              "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "stdin.txt": "9af80d144c78c30129d7defd11f1bf999079ceda14fe4c0eb5258854f6d59d30",
+              "stdout.jsonl": "b0be929d7b0553d8d3eb30342c1214b04718ba7b1978c2be7915c24194f93925"
+            }
+          },
+          "sigint-cancel": {
+            "valid": true,
+            "files": {
+              "meta.json": "8586d4663d637ddfb2563fb739b4e9d69e95758871b96e273e29376a13c24c7b",
+              "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "stdin.txt": "ad114cfd545a4e802b14e644a0fa51d742e450b43e21c71ccfc6c3fd75388a6d",
+              "stdout.jsonl": "70e023883392494c3635d008ac43f942352a1132432d37aaef35a603643f9ff9"
+            }
+          },
+          "success": {
+            "valid": true,
+            "files": {
+              "meta.json": "0ab7a14b886bd122a4a34d631e5559ac1fc9271bd772a8f1462afca207e39da2",
+              "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "stdin.txt": "41db62ec0de9f9031de948bcb36bdf9bddee41b152fc1416df9a6477245591b6",
+              "stdout.jsonl": "d947ca70d9b363fcfbcab782500630d313493bb82a286b71c6489139cdaf031c"
+            }
           }
         }
       }
     },
     "codex": {
-      "cli_version": "0.166.0",
-      "auth": "BLOCKED_AUTH",
-      "help_argv": [
-        "codex",
-        "exec",
-        "--help"
-      ],
-      "help_sha256": "df0d864ca2076f7654288c6a1e3394e3eaa2ea8f15021df2524efdd90c70986c",
-      "entry_path": "/home/ai/.nvm/versions/node/v26.13.0/lib/node_modules/@openai/codex/bin/codex.js",
-      "entry_sha256": "e14fc83739c13c1074b12bd1acce4010c893c7f6fbfc1593b4a31d74cabb57af",
-      "native_path": "/home/ai/.nvm/versions/node/v26.13.0/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex",
-      "native_sha256": "b8a11fedf24b2dfb59a70c9e52b030f9a508dcd49cd2dd0d41956f4c785156b8",
-      "cases": {
-        "app-server-handshake-unauthenticated": {
-          "valid": true,
-          "files": {
-            "meta.json": "9b2bad977dc148e71a12b24fbe3236266b68c513a5b57ed96666d293b8064258",
-            "stderr.log": "d1925e1c0add9adc4af16bb53a08a367f387cec0dcdb6487a9f1b3c845e7b849",
-            "stdin.txt": "88ab06ecd80801af68f11039db94967922cf004bf6b8c91c29956df3be7769a2",
-            "stdout.jsonl": "435abdf2732974faca10de12c7a8bad3633abc6cd8661bcdaa993cac9292aab3"
+      "0.166.0": {
+        "cli_version": "0.166.0",
+        "auth": "AUTHENTICATED",
+        "help_argv": [
+          "codex",
+          "exec",
+          "--help"
+        ],
+        "help_sha256": "df0d864ca2076f7654288c6a1e3394e3eaa2ea8f15021df2524efdd90c70986c",
+        "entry_path": "/home/ai/.nvm/versions/node/v26.13.0/lib/node_modules/@openai/codex/bin/codex.js",
+        "entry_sha256": "e14fc83739c13c1074b12bd1acce4010c893c7f6fbfc1593b4a31d74cabb57af",
+        "native_path": "/home/ai/.nvm/versions/node/v26.13.0/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex",
+        "native_sha256": "b8a11fedf24b2dfb59a70c9e52b030f9a508dcd49cd2dd0d41956f4c785156b8",
+        "cases": {
+          "app-server-handshake": {
+            "valid": true,
+            "files": {
+              "meta.json": "665fac1b584201106791dea7698f8f991ab5a0959b9ca904efde795cdc49af34",
+              "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "stdin.txt": "88ab06ecd80801af68f11039db94967922cf004bf6b8c91c29956df3be7769a2",
+              "stdout.jsonl": "7e6a6a6c90c3ab16d688f5a53ca1d2f0a818744006ae5d643dbe34d345b06517"
+            }
+          },
+          "app-server-handshake-unauthenticated": {
+            "valid": true,
+            "files": {
+              "meta.json": "9b2bad977dc148e71a12b24fbe3236266b68c513a5b57ed96666d293b8064258",
+              "stderr.log": "d1925e1c0add9adc4af16bb53a08a367f387cec0dcdb6487a9f1b3c845e7b849",
+              "stdin.txt": "88ab06ecd80801af68f11039db94967922cf004bf6b8c91c29956df3be7769a2",
+              "stdout.jsonl": "435abdf2732974faca10de12c7a8bad3633abc6cd8661bcdaa993cac9292aab3"
+            }
+          },
+          "app-server-interrupt": {
+            "valid": true,
+            "files": {
+              "meta.json": "be4770ce98eaea7cdb0d44a7bff19c69e9d032a7c50bfa03ec03c5415114af73",
+              "stderr.log": "02c0dd592cb861e2b4f690570b1317fa6fc411086938b3f344bc4cc74f7e9a66",
+              "stdin.txt": "137929e43679c64971eabd78c7804b004df966ef47b2549199a1ebc3335e1540",
+              "stdout.jsonl": "b355743289805647cb65ebdf930e8e4bae986b3a5f17d57eb3bce59249909db2"
+            }
+          },
+          "app-server-resume": {
+            "valid": true,
+            "files": {
+              "meta.json": "1fc012638451a7bc1de14bda315b0326228a3ac1d4bb8ec96c76088602e46cbf",
+              "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "stdin.txt": "61b5f94d833b72c305986de0a71adbc7ab731aa224316f28a495d1c9cc3ffdd7",
+              "stdout.jsonl": "42617f7eed496c0099da85b77971635e39c9654af65aa6d4abe098efc39a6090"
+            }
+          },
+          "app-server-steer": {
+            "valid": true,
+            "files": {
+              "meta.json": "e4c399373361fb1bad2862acb44981c2676a30460392b7af7680a3e639552f1b",
+              "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "stdin.txt": "b298671185fc84db8942d95d1cfb25afa5a5582849ba35930923220d9f0f6c16",
+              "stdout.jsonl": "368da1af9b4bc8267b781a77e1c9c472b1aadc19f825d7a99d251c946ef82ec2"
+            }
+          },
+          "app-server-turn": {
+            "valid": true,
+            "files": {
+              "meta.json": "008faeb9192c70ed063efc5ce2e485ae0974e47423359c251c73b986a428844f",
+              "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "stdin.txt": "398f4985a5e2889b2122e2c2c567abdcc2a0562291ea1a6c8b11fc10b2c1c3c2",
+              "stdout.jsonl": "657c6bc80c08e170c4fcbe6dc2ae2766c327af6dac3ba2d613c46055ed5f86a6"
+            }
+          },
+          "exec": {
+            "valid": true,
+            "files": {
+              "meta.json": "a6278e1aa2a7c723e214ed3e0e66d6f6f9144554c80d30f00c06a4b5e6976dc7",
+              "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "stdin.txt": "41db62ec0de9f9031de948bcb36bdf9bddee41b152fc1416df9a6477245591b6",
+              "stdout.jsonl": "3b43bdb1f7db1c699f7dcf23b8856e2c2acc317b4279a2a262dbab34036a9024"
+            }
+          },
+          "exec-turn-failed": {
+            "valid": true,
+            "files": {
+              "meta.json": "e9b82b3a6a7fe25e035e8c35451e935a42bec9f1138f46a02a2e8390f60c1249",
+              "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "stdin.txt": "41db62ec0de9f9031de948bcb36bdf9bddee41b152fc1416df9a6477245591b6",
+              "stdout.jsonl": "852309d8342837a5f7c568e0d5ce41cb8372a215c7ea5c80b0cce8e0a06d788b"
+            }
+          },
+          "exec-unauthenticated": {
+            "valid": true,
+            "files": {
+              "meta.json": "518999df195d7630bf94b84f65f2b6d65548c3e00044d373b0b6e2422f74d028",
+              "stderr.log": "6cea5343da97d678efeba543352a1bdeb9d11cc2e7484dba2a8c201aa58b2483",
+              "stdin.txt": "41db62ec0de9f9031de948bcb36bdf9bddee41b152fc1416df9a6477245591b6",
+              "stdout.jsonl": "d31a75ecafe82e6ce8f556890c5273c73021a565af11713866657545adb1e0fb"
+            }
           }
         },
-        "exec-unauthenticated": {
-          "valid": true,
-          "files": {
-            "meta.json": "518999df195d7630bf94b84f65f2b6d65548c3e00044d373b0b6e2422f74d028",
-            "stderr.log": "6cea5343da97d678efeba543352a1bdeb9d11cc2e7484dba2a8c201aa58b2483",
-            "stdin.txt": "41db62ec0de9f9031de948bcb36bdf9bddee41b152fc1416df9a6477245591b6",
-            "stdout.jsonl": "d31a75ecafe82e6ce8f556890c5273c73021a565af11713866657545adb1e0fb"
-          }
-        }
-      },
-      "app_server_schema_tree_sha256": "0f23ed3da8d4fb919b3a70a6dcdd89bc07d79a854daff85dab8ede642de67a32"
+        "app_server_schema_tree_sha256": "0f23ed3da8d4fb919b3a70a6dcdd89bc07d79a854daff85dab8ede642de67a32"
+      }
     },
     "pi": {
-      "cli_version": "1.5.0",
-      "auth": "AUTHENTICATED (live turn recorded)",
-      "help_argv": [
-        "pi",
-        "--help"
-      ],
-      "help_sha256": "d905f4bf6bcd5c760344b4dfb808bcf0db37185413ef675cef69531ccfc6b818",
-      "entry_path": "/home/ai/.pi/agent/bin/pi",
-      "entry_sha256": "da0c6a49fe94aadc9765cc7afc6ba6b17e553eed0247d0385c160bc188f5cfbb",
-      "cases": {
-        "rpc-abort": {
-          "valid": true,
-          "files": {
-            "meta.json": "a0c2d5a35e872dda809664ae8bbbdf961f27f3909fb2d58c370c45d82453dcfe",
-            "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-            "stdin.txt": "99c7a505677996869c7e80f94fd4ed338250cc63a7b03f00f3449de33029587c",
-            "stdout.jsonl": "0f14bf0787a594ea6556c3414957c8567b7024583cde1615e6f029918dce15a2"
-          }
-        },
-        "rpc-prompt": {
-          "valid": true,
-          "files": {
-            "meta.json": "165fcebb223b950d0bb809a59a65328ce177b428c051f68347b335ce3c4dda03",
-            "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-            "stdin.txt": "c10609ca526f2f0fb90a158f37860942b2a62f702030f7e4144680c7c55cae32",
-            "stdout.jsonl": "172fd92997d4f09e1f2714d29269106b684350103c2cbb8e4517e3df83cbf2c0"
-          }
-        },
-        "rpc-resume": {
-          "valid": true,
-          "files": {
-            "meta.json": "9a0a2deb8ca37eb442962a267a94019346ba08f160c789c67d2695aa14527645",
-            "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-            "stdin.txt": "0d6bc083e013717442b2e8de57f30d3ccbd82b1893a49540fa915634ad8b7208",
-            "stdout.jsonl": "0fb979813ca182b99866ccd7e96ebcda3c53e46360ec6d399157edfe820beb0d"
+      "1.5.0": {
+        "cli_version": "1.5.0",
+        "auth": "AUTHENTICATED (live turn recorded)",
+        "help_argv": [
+          "pi",
+          "--help"
+        ],
+        "help_sha256": "d905f4bf6bcd5c760344b4dfb808bcf0db37185413ef675cef69531ccfc6b818",
+        "entry_path": "/home/ai/.pi/agent/bin/pi",
+        "entry_sha256": "da0c6a49fe94aadc9765cc7afc6ba6b17e553eed0247d0385c160bc188f5cfbb",
+        "package_path": "/home/ai/.pi/agent/install/releases/1.5.0/node_modules/@earendil-works/pi-coding-agent",
+        "package_tree_sha256": "5f4fb490ce2523a59f7f3dae1f2b88e211b56ea3d3f6d1b7b7e51dee06c790d2",
+        "cases": {
+          "rpc-abort": {
+            "valid": true,
+            "files": {
+              "meta.json": "a1e6f71938b788d057bd383375f24494288c7124c65e47ab94701f47ac3b82ca",
+              "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "stdin.txt": "99c7a505677996869c7e80f94fd4ed338250cc63a7b03f00f3449de33029587c",
+              "stdout.jsonl": "d9f4adcda23127fab57c14928143ba6959ee59edb4ebc64929508d6b1fc43c7a"
+            }
+          },
+          "rpc-invalid-model": {
+            "valid": true,
+            "files": {
+              "meta.json": "fe3c4198732eb6a3d824aee194773165299033936cd55e3c77bc712d63d75019",
+              "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "stdin.txt": "77b54378e1f3a24beebb63b77a2e554caf074ea292bd3574e6c3b294323603f8",
+              "stdout.jsonl": "dc100a9ed8f843cd01f944bffae398dd679699f43b8655f035ada729cb8d70ac"
+            }
+          },
+          "rpc-no-provider": {
+            "valid": true,
+            "files": {
+              "meta.json": "fbf3464dbd734c21bf8cb29792cf28ee1e260a91786fea0d352350de84528c6e",
+              "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "stdin.txt": "c10609ca526f2f0fb90a158f37860942b2a62f702030f7e4144680c7c55cae32",
+              "stdout.jsonl": "15230d10be8325dd5dddf4aaf1a55572abf988e50ec9377165d3694b297f49db"
+            }
+          },
+          "rpc-prompt": {
+            "valid": true,
+            "files": {
+              "meta.json": "b6f31e2678d7da0554666a64e8008a11ba72320bdca07a125beaa9d82fb4bbbf",
+              "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "stdin.txt": "c10609ca526f2f0fb90a158f37860942b2a62f702030f7e4144680c7c55cae32",
+              "stdout.jsonl": "b51bff81d09c5a9de2e0affa02799b2baa3523510e3c37ff55ff734b761f931f"
+            }
+          },
+          "rpc-resume": {
+            "valid": true,
+            "files": {
+              "meta.json": "cced9b76ce36bc65a8224d3cc39e965dd1645c707667b65b9a56d23d0a0d9a92",
+              "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "stdin.txt": "0d6bc083e013717442b2e8de57f30d3ccbd82b1893a49540fa915634ad8b7208",
+              "stdout.jsonl": "a9b36cc6d4cffe2ae98fc8c79dd0fb170f82e1840b77d8679896113fcbbc3340"
+            }
           }
         }
       }

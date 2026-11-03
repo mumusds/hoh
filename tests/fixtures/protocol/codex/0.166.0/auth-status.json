@@ -1,11 +1,11 @@
 {
-  "checked_at": "2026-11-03T17:37:47.230486+00:00",
+  "checked_at": "2026-11-03T17:58:03.551025+00:00",
   "command": [
     "codex",
     "login",
     "status"
   ],
-  "exit_code": 1,
-  "output": "Not logged in",
-  "state": "BLOCKED_AUTH"
+  "exit_code": 0,
+  "output": "Logged in using ChatGPT",
+  "state": "AUTHENTICATED"
 }

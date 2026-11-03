@@ -138,17 +138,20 @@ def claude_cancel(version: str, base: list[str]) -> None:
             os.killpg(p.pid, signal.SIGINT)
             state = 'SIGINT sent during foreground tool'
             break
+    killed = False
     try:
         rest, err = p.communicate(timeout=60)
     except subprocess.TimeoutExpired:
         os.killpg(p.pid, signal.SIGKILL)
         rest, err = p.communicate()
+        killed = True
     out = buf + rest
     after = frames(out)[sigint_after_frame or 0:]
-    valid = state == 'SIGINT sent during foreground tool'
+    # Valid only if SIGINT hit a running foreground tool and the CLI then ended on its own.
+    valid = state == 'SIGINT sent during foreground tool' and not killed
     save('claude', version, 'sigint-cancel', base, prompt, out, err, p.returncode,
          'SIGINT to the process group 4 s after a foreground Bash tool_use frame, before its tool_result', valid,
-         {'sigint_after_frame_index': sigint_after_frame, 'recorder_state': state,
+         {'sigint_after_frame_index': sigint_after_frame, 'recorder_state': state, 'killed_by_recorder': killed,
           'frames_after_sigint': [f.get('type') + (':' + f['subtype'] if f.get('subtype') else '') for f in after]})
 
 
@@ -168,8 +171,20 @@ def codex() -> None:
     argv = ['codex', 'exec', '--json', '--dangerously-bypass-approvals-and-sandbox', '-']
     prompt = b'Reply with exactly HOH_SAMPLE_OK and nothing else.'
     out, err, rc = run(argv, prompt, workdir())
-    save('codex', version, 'exec' + suffix, argv, prompt, out, err, rc,
-         'one-shot exec turn' if authed else 'exec without login: records the authentication failure surface', valid=True)
+    fs = frames(out)
+    completed = rc == 0 and any(f.get('type') == 'turn.completed' for f in fs)
+    if authed and not completed:
+        # Logged in but the turn failed (e.g. the configured model is not available to this account):
+        # record the real failure surface; authenticated success cases stay NOT_RUN.
+        save('codex', version, 'exec-turn-failed', argv, prompt, out, err, rc, 'logged in, turn failed; see the error frames',
+             valid=rc != 0 and any(f.get('type') == 'turn.failed' for f in fs))
+        shutil.rmtree(d / 'exec', ignore_errors=True)
+    else:
+        ok = completed if authed else (rc != 0 and any(f.get('type') in ('error', 'turn.failed') for f in fs))
+        save('codex', version, 'exec' + suffix, argv, prompt, out, err, rc,
+             'one-shot exec turn' if authed else 'exec without login: records the authentication failure surface', valid=ok)
+        if authed:
+            codex_app_server(version)
     msgs = [{'method': 'initialize', 'id': 0, 'params': {'clientInfo': {'name': 'hoh-recorder', 'version': '0.0.0'}}},
             {'method': 'initialized'},
             {'method': 'thread/start', 'id': 1, 'params': {'approvalPolicy': 'never', 'sandbox': 'danger-full-access'}}]
@@ -187,12 +202,137 @@ def codex() -> None:
         out, err = p.communicate()
     fs = frames(out)
     save('codex', version, 'app-server-handshake' + suffix, ['codex', 'app-server'], stdin, out, err, p.returncode,
-         'initialize, initialized, thread/start; stdin closed after 10 s', valid=any(f.get('id') == 0 and 'result' in f for f in fs))
+         'initialize, initialized, thread/start; stdin closed after 10 s',
+         valid=all(any(f.get('id') == i and 'result' in f for f in fs) for i in (0, 1)))
 
 
-def pi_session(argv: list[str], cwd: Path, msgs: list[dict], until: str, abort_on: str | None = None, timeout: float = 120) -> tuple[bytes, bytes, int | None, bytes]:
-    """Drive one `pi --mode rpc` process: send msgs, optionally send abort on the first `abort_on` frame, stop after `until`."""
-    p = subprocess.Popen(argv, cwd=cwd, env=ENV, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+class AppServer:
+    """Minimal JSON-RPC driver for `codex app-server` that keeps every byte sent and received."""
+
+    def __init__(self, cwd: Path):
+        self.p = subprocess.Popen(['codex', 'app-server'], cwd=cwd, env=ENV, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, start_new_session=True)
+        self.sent = b''
+        self.buf = b''
+        self.next_id = 0
+
+    def send(self, method: str, params: dict | None = None, notify: bool = False) -> int | None:
+        msg: dict = {'method': method}
+        rid = None
+        if not notify:
+            rid = self.next_id
+            self.next_id += 1
+            msg['id'] = rid
+        if params is not None:
+            msg['params'] = params
+        data = json.dumps(msg).encode() + b'\n'
+        self.p.stdin.write(data)
+        self.p.stdin.flush()
+        self.sent += data
+        return rid
+
+    def wait(self, predicate, timeout: float = 180) -> dict | None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            for f in frames(self.buf):
+                if predicate(f):
+                    return f
+            ready, _, _ = select.select([self.p.stdout], [], [], 1.0)
+            if ready:
+                chunk = os.read(self.p.stdout.fileno(), 65536)
+                if not chunk:
+                    return None
+                self.buf += chunk
+        return None
+
+    def response(self, rid: int, timeout: float = 60) -> dict | None:
+        return self.wait(lambda f: f.get('id') == rid and ('result' in f or 'error' in f), timeout)
+
+    def start(self) -> None:
+        rid = self.send('initialize', {'clientInfo': {'name': 'hoh-recorder', 'version': '0.0.0'}})
+        self.response(rid)
+        self.send('initialized', notify=True)
+
+    def close(self) -> tuple[bytes, bytes, int | None]:
+        self.p.stdin.close()
+        try:
+            rest, err = self.p.communicate(timeout=20)
+        except subprocess.TimeoutExpired:
+            os.killpg(self.p.pid, signal.SIGTERM)
+            rest, err = self.p.communicate()
+        return self.buf + rest, err, self.p.returncode
+
+
+def text(t: str) -> list[dict]:
+    return [{'type': 'text', 'text': t}]
+
+
+def turn_done(thread_id: str):
+    return lambda f: f.get('method') == 'turn/completed' and f.get('params', {}).get('threadId') == thread_id
+
+
+def codex_app_server(version: str) -> None:
+    """Authenticated App Server cases: turn, interrupt, steer (stale + valid expectedTurnId), resume."""
+    YOLO = {'approvalPolicy': 'never', 'sandbox': 'danger-full-access'}
+    cwd = workdir()
+    s = AppServer(cwd)
+    s.start()
+    thread = s.response(s.send('thread/start', YOLO))['result']['thread']['id']
+    s.send('turn/start', {'threadId': thread, 'input': text('Reply with exactly HOH_SAMPLE_OK and nothing else.')})
+    done = s.wait(turn_done(thread))
+    out, err, rc = s.close()
+    said = any(f.get('method') == 'item/completed' and 'HOH_SAMPLE_OK' in json.dumps(f.get('params', {}).get('item', {})) for f in frames(out))
+    save('codex', version, 'app-server-turn', ['codex', 'app-server'], s.sent, out, err, rc, 'thread/start then one turn/start until turn/completed',
+         valid=bool(done) and done['params']['turn']['status'] == 'completed' and said, extra={'thread_id': thread})
+
+    s = AppServer(cwd)
+    s.start()
+    resumed = s.response(s.send('thread/resume', {'threadId': thread, **YOLO}))
+    s.send('turn/start', {'threadId': thread, 'input': text('Repeat the exact token you replied with in the previous turn, and nothing else.')})
+    done = s.wait(turn_done(thread))
+    out, err, rc = s.close()
+    said = any(f.get('method') == 'item/completed' and 'HOH_SAMPLE_OK' in json.dumps(f.get('params', {}).get('item', {})) for f in frames(out))
+    save('codex', version, 'app-server-resume', ['codex', 'app-server'], s.sent, out, err, rc,
+         'new app-server process: thread/resume of app-server-turn, then a turn that must recall the token',
+         valid=bool(resumed and 'result' in resumed) and bool(done) and done['params']['turn']['status'] == 'completed' and said)
+
+    long_task = text('Run this exact shell command and wait for it to finish: for i in $(seq 1 30); do echo tick $i; sleep 2; done. Then reply DONE.')
+    s = AppServer(workdir())
+    s.start()
+    thread = s.response(s.send('thread/start', YOLO))['result']['thread']['id']
+    s.send('turn/start', {'threadId': thread, 'input': long_task})
+    started = s.wait(lambda f: f.get('method') == 'turn/started')
+    s.wait(lambda f: f.get('method') == 'item/started' and f.get('params', {}).get('item', {}).get('type') == 'commandExecution', timeout=120)
+    turn_id = started['params']['turn']['id'] if started else 'missing'
+    ack = s.response(s.send('turn/interrupt', {'threadId': thread, 'turnId': turn_id}))
+    done = s.wait(turn_done(thread))
+    out, err, rc = s.close()
+    save('codex', version, 'app-server-interrupt', ['codex', 'app-server'], s.sent, out, err, rc,
+         'turn/interrupt while a command execution item runs', valid=bool(ack and 'result' in ack) and bool(done)
+         and done['params']['turn']['status'] == 'interrupted')
+
+    s = AppServer(workdir())
+    s.start()
+    thread = s.response(s.send('thread/start', YOLO))['result']['thread']['id']
+    s.send('turn/start', {'threadId': thread, 'input': long_task})
+    started = s.wait(lambda f: f.get('method') == 'turn/started')
+    turn_id = started['params']['turn']['id'] if started else 'missing'
+    stale = s.response(s.send('turn/steer', {'threadId': thread, 'expectedTurnId': 'hoh-stale-turn-id', 'input': text('Stop and reply STEERED.')}))
+    steer = s.response(s.send('turn/steer', {'threadId': thread, 'expectedTurnId': turn_id,
+                                             'input': text('Stop running the command now and reply exactly STEERED.')}))
+    done = s.wait(turn_done(thread))
+    out, err, rc = s.close()
+    save('codex', version, 'app-server-steer', ['codex', 'app-server'], s.sent, out, err, rc,
+         'turn/steer with a stale expectedTurnId (must be rejected) and with the active turn id',
+         valid=bool(stale and 'error' in stale) and bool(steer and 'result' in steer) and bool(done))
+
+
+def pi_session(argv: list[str], cwd: Path, msgs: list[dict], until: str, abort_on: str | None = None, timeout: float = 120,
+               env: dict | None = None, settle: float = 0) -> tuple[bytes, bytes, int | None, bytes]:
+    """Drive one `pi --mode rpc` process: send msgs, optionally abort on the first `abort_on` frame, stop once
+    `until` frames have arrived for every request (responses) or once (events), then wait `settle` seconds."""
+    p = subprocess.Popen(argv, cwd=cwd, env=env or ENV, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    want = len(msgs) if until == 'response' else 1
     sent = b''.join(json.dumps(m).encode() + b'\n' for m in msgs)
     p.stdin.write(sent)
     p.stdin.flush()
@@ -213,8 +353,9 @@ def pi_session(argv: list[str], cwd: Path, msgs: list[dict], until: str, abort_o
             p.stdin.flush()
             sent += extra
             aborted = True
-        if any(f.get('type') == until for f in fs):
+        if sum(f.get('type') == until for f in fs) >= want:
             break
+    time.sleep(settle)
     p.stdin.close()
     try:
         rest, err = p.communicate(timeout=20)
@@ -233,12 +374,26 @@ def pi() -> None:
     argv = ['pi', '--mode', 'rpc', '--session-dir', str(cwd / 'pi-sessions')]
     shown = ['pi', '--mode', 'rpc', '--session-dir', '<temp>/pi-sessions']
     msgs = [{'id': 's1', 'type': 'get_state'}, {'id': 'p1', 'type': 'prompt', 'message': 'Reply with exactly HOH_SAMPLE_OK and nothing else.'}]
-    out, err, rc, sent = pi_session(argv, cwd, msgs, until='agent_settled')
+    # Failure without any provider, reproducible regardless of the operator's setup: empty agent dir, no key variables.
+    bare = {k: v for k, v in ENV.items() if not k.endswith(('_API_KEY', '_AUTH_TOKEN', '_OAUTH_TOKEN'))}
+    bare |= {'PI_CODING_AGENT_DIR': str(cwd / 'empty-agent-dir'), 'PI_OFFLINE': '1'}
+    out, err, rc, sent = pi_session(argv, cwd, msgs, until='response', env=bare, settle=8)
+    fs = frames(out)
+    save('pi', version, 'rpc-no-provider', shown, sent, out, err, rc,
+         'empty PI_CODING_AGENT_DIR, no provider key variables, PI_OFFLINE=1: get_state then prompt',
+         valid=any(f.get('id') == 's1' and f.get('success') for f in fs) and any(f.get('id') == 'p1' and f.get('success') is False for f in fs),
+         extra={'env_overrides': ['PI_CODING_AGENT_DIR=<temp>/empty-agent-dir', 'PI_OFFLINE=1', 'provider key variables removed']})
+    msgs = [{'id': 'm1', 'type': 'set_model', 'provider': 'hoh-invalid-provider', 'modelId': 'hoh-invalid-model'}]
+    out, err, rc, sent = pi_session(argv, cwd, msgs, until='response', settle=5)
+    fs = frames(out)
+    save('pi', version, 'rpc-invalid-model', shown, sent, out, err, rc, 'set_model with an unknown provider/model',
+         valid=any(f.get('id') == 'm1' and f.get('success') is False for f in fs))
+    out, err, rc, sent = pi_session(argv, cwd, [{'id': 's1', 'type': 'get_state'},
+                                               {'id': 'p1', 'type': 'prompt', 'message': 'Reply with exactly HOH_SAMPLE_OK and nothing else.'}],
+                                    until='agent_settled')
     fs = frames(out)
     if any(f.get('id') == 'p1' and f.get('success') is False for f in fs):
-        save('pi', version, 'rpc-no-provider', shown, sent, out, err, rc, 'get_state then prompt without a configured provider',
-             valid=any(f.get('id') == 's1' and f.get('success') for f in fs))
-        return
+        return  # no provider configured for the operator: only the failure cases are recordable
     save('pi', version, 'rpc-prompt', shown, sent, out, err, rc, 'get_state then one prompt until agent_settled',
          valid=any(f.get('type') == 'agent_settled' for f in fs))
     session_id = next(f['data']['sessionId'] for f in fs if f.get('id') == 's1')
@@ -277,14 +432,32 @@ def binaries(name: str) -> dict:
         native = sorted(wrapper.parent.parent.glob('node_modules/@openai/codex-*/vendor/*/bin/codex'))
         if native:
             info |= {'native_path': str(native[0]), 'native_sha256': sha256(native[0].read_bytes())}
+    if name == 'pi':  # the entry is a shell launcher; hash the release package that implements Pi
+        pkg = sorted(wrapper.parent.parent.glob('install/releases/*/node_modules/@earendil-works/pi-coding-agent'))
+        version = first_line(['pi', '--version'])
+        pkg = [d for d in pkg if d.parts[-4] == version] or pkg
+        if pkg:
+            files = [f for f in pkg[0].rglob('*') if f.is_file() and 'node_modules' not in f.relative_to(pkg[0]).parts]
+            lines = sorted(f'{f.relative_to(pkg[0]).as_posix()} {sha256(f.read_bytes())}\n' for f in files)
+            info |= {'package_path': str(pkg[0]), 'package_tree_sha256': sha256(''.join(lines).encode())}
     return info
 
 
+INSTALLED_VERSION = {'claude': lambda: first_line(['claude', '--version']).split()[0],
+                     'codex': lambda: first_line(['codex', '--version']).split()[-1],
+                     'pi': lambda: first_line(['pi', '--version'])}
+
+
 def write_manifest() -> None:
-    agents = {}
+    """One entry per recorded (agent, version). Binary/help hashes are measured only for the version installed
+    now; entries for other versions keep what the previous manifest recorded."""
+    path = HERE / 'compat-manifest.json'
+    previous = json.loads(path.read_text()).get('agents', {}) if path.exists() else {}
+    agents: dict[str, dict] = {}
     for agent_dir in sorted(p for p in HERE.iterdir() if p.is_dir() and not p.name.startswith('_')):
+        name = agent_dir.name
+        installed = INSTALLED_VERSION[name]() if shutil.which(name) else None
         for version_dir in sorted(p for p in agent_dir.iterdir() if p.is_dir()):
-            name = agent_dir.name
             cases = {}
             for meta in sorted(version_dir.glob('*/meta.json')):
                 m = json.loads(meta.read_text())
@@ -292,17 +465,22 @@ def write_manifest() -> None:
             auth_file = version_dir / 'auth-status.json'
             if auth_file.exists():
                 auth = json.loads(auth_file.read_text())['state']
-            elif any(c in cases for c in ('success', 'rpc-prompt')):
+            elif any(cases.get(c, {}).get('valid') for c in ('success', 'rpc-prompt')):
                 auth = 'AUTHENTICATED (live turn recorded)'
             else:
                 auth = 'BLOCKED_AUTH'
             help_argv = [name, 'exec', '--help'] if name == 'codex' else [name, '--help']
-            entry = {'cli_version': version_dir.name, 'auth': auth, 'help_argv': help_argv,
-                     'help_sha256': sha256(subprocess.run(help_argv, capture_output=True, env=ENV).stdout), **binaries(name), 'cases': cases}
+            if version_dir.name == installed:
+                measured = {'help_argv': help_argv, 'help_sha256': sha256(subprocess.run(help_argv, capture_output=True, env=ENV).stdout), **binaries(name)}
+            else:
+                old = previous.get(name, {}).get(version_dir.name, {})
+                measured = {k: v for k, v in old.items() if k not in ('cli_version', 'auth', 'cases', 'app_server_schema_tree_sha256')} or \
+                           {'binary': 'not installed when this manifest was written'}
+            entry = {'cli_version': version_dir.name, 'auth': auth, **measured, 'cases': cases}
             if (version_dir / 'app-server-schema').is_dir():
                 entry['app_server_schema_tree_sha256'] = tree_sha256(version_dir / 'app-server-schema')
-            agents[name] = entry
-    manifest = {'schema_version': '1.1', 'recorded_at': now(), 'recorder': 'tests/fixtures/protocol/record.py',
+            agents.setdefault(name, {})[version_dir.name] = entry
+    manifest = {'schema_version': '1.2', 'recorded_at': now(), 'recorder': 'tests/fixtures/protocol/record.py',
                 'hash_algorithms': {'tree_sha256': tree_sha256.__doc__, 'files': 'sha256 of the raw file bytes'}, 'agents': agents}
     (HERE / 'compat-manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + '\n')
 

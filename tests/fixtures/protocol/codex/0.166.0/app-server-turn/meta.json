@@ -1,0 +1,16 @@
+{
+  "agent": "codex",
+  "cli_version": "0.166.0",
+  "case": "app-server-turn",
+  "argv": [
+    "codex",
+    "app-server"
+  ],
+  "cwd": "fresh temp Git repo outside the checkout",
+  "exit_code": 0,
+  "recorded_at": "2026-11-03T17:58:18.725841+00:00",
+  "mode": "live",
+  "valid": true,
+  "notes": "thread/start then one turn/start until turn/completed",
+  "thread_id": "01a1a28f-bd78-7c80-9988-c2527d9758f2"
+}

@@ -47,7 +47,9 @@ class BundleContracts(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d)/'kit';shutil.copytree(ROOT,root,ignore=shutil.ignore_patterns('.git','.hoh-dev','__pycache__','target','npm'))
             for argv,message in [(['true'],'always-succeeding'),(['env','X=1','true'],'always-succeeding'),(['bash','-c','exit 0'],'inline code'),
-                                 (['python3','-c','pass'],'inline code'),(['sh','-c',':'],'inline code')]:
+                                 (['python3','-c','pass'],'inline code'),(['sh','-c',':'],'inline code'),(['env','bash','-c','exit 0'],'inline code'),
+                                 (['env','python3','-c','pass'],'inline code'),(['env','-u','X','true'],'always-succeeding'),(['sh','-ec',':'],'inline code'),
+                                 (['bash','-lc','true'],'inline code'),(['python3','-Ic','pass'],'inline code'),(['env','-S','true'],'split-string')]:
                 plan=load_json(ROOT/'tests/check-plan.json');plan['checks']['recovery']['argv']=argv
                 (root/'tests/check-plan.json').write_text(json.dumps(plan))
                 r=validate_bundle.validate(root)
@@ -102,6 +104,15 @@ class SetupAndLedger(unittest.TestCase):
         p=self.shell('start.sh','pi','--headless','--dry-run');self.assertEqual(p.returncode,0,p.stderr);self.assertTrue(json.loads(p.stdout)['dry_run'])
     def test_plugin_plan_is_dry(self):
         p=subprocess.run([sys.executable,str(self.root/'tools/install_pi_plugins.py'),'--dry-run'],capture_output=True,text=True);self.assertEqual(p.returncode,0,p.stderr);self.assertIn('@juicesharp/rpiv-todo',p.stdout);self.assertFalse((self.root/'.hoh-dev').exists())
+    def test_plugin_integrity_mismatch_degrades(self):
+        fake=self.root/'fakebin';fake.mkdir()
+        (fake/'pi').write_text('#!/bin/sh\ncase "$*" in *--help*) echo "--local --approve";; *--version*) echo 1.5.0;; *) exit 0;; esac\n')
+        (fake/'npm').write_text('#!/bin/sh\ncase "$*" in *dist.integrity*) echo sha512-TAMPERED;; *) echo 1.0.0;; esac\n')
+        for f in fake.iterdir():f.chmod(0o755)
+        p=subprocess.run([sys.executable,str(self.root/'tools/install_pi_plugins.py')],capture_output=True,text=True,
+                         env=os.environ|{'PATH':str(fake)+os.pathsep+os.environ['PATH'],'PYTHONDONTWRITEBYTECODE':'1'})
+        self.assertEqual(p.returncode,3,p.stderr);lock=load_json(self.root/'.hoh-dev/plugin-lock.json')
+        self.assertTrue(all(x['state']=='DEGRADED' and 'differs from the pinned' in x['error'] for x in lock['plugins'].values()),lock)
     def ledger(self,*args):
         with patch.object(taskboard,'ROOT',self.root),contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):return taskboard.main(list(args))
     def refused(self,*args):
