@@ -19,9 +19,13 @@ Children are stopped with bounded escalation (close stdin, SIGTERM, SIGKILL of t
 child's environment carries a token (`HOH_RECORDER_PROC`), so its descendants are found wherever they
 went (other session or group, re-parented, stdio closed): those that end on their own within 5 s after
 the CLI exited are recorded in `meta.json` `descendants_lingered`; those still running are killed and
-the case is invalid, as is one whose process needed SIGKILL. A descendant that exec'd with a cleared
-environment cannot be found this way. SIGINT/SIGTERM stop every child before the temporary directories
-are removed, and the manifest is still rebuilt. Publishing swaps the directories atomically (`renameat2`).
+the case is invalid, as is one whose process needed SIGKILL. Our own processes started after the child
+whose environment cannot be read (made non-dumpable) might be descendants: they are reported, not killed,
+and the case is invalid. A descendant that exec'd with a cleared environment cannot be found this way.
+Children get default SIGINT/SIGTERM/SIGHUP dispositions even when the recorder runs with SIGINT ignored.
+SIGINT/SIGTERM/SIGHUP at any point of a run (also while a child is being stopped or between agents) stop
+every child before the temporary directories are removed, and the manifest is still rebuilt. Publishing
+swaps the directories atomically (`renameat2`).
 Keep the previous version directory until the compat suite has been rerun.
 
 Provenance limits: the operator's user-level agent configuration (plugins, hooks, account, rate-limit

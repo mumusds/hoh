@@ -111,7 +111,7 @@ class Validators(unittest.TestCase):
         fs,meta,sent=load_case('pi','1.5.0','rpc-abort')
         self.assertTrue(self.check('pi','rpc-abort',[f for f in fs if f.get('type')!='agent_settled'],meta,sent))
 
-SLEEPER=r"""import os,signal,sys,time
+SLEEPER=r"""import json,os,signal,sys,time
 mode=sys.argv[1]
 if mode=='ignore-term':signal.signal(signal.SIGTERM,signal.SIG_IGN)
 if mode=='escape':
@@ -128,6 +128,23 @@ if mode=='linger':
         for n in (0,1,2):os.dup2(fd,n)
         time.sleep(1);os._exit(0)  # like the last `sleep 2` of a cancelled tool: ends on its own shortly
     sys.exit(0)
+if mode=='relay':
+    if os.fork()==0:
+        os.setsid();fd=os.open(os.devnull,os.O_RDWR)
+        for n in (0,1,2):os.dup2(fd,n)
+        time.sleep(0.5)
+        if os.fork()==0:time.sleep(1.0);os._exit(0)  # B, born during the grace period, ends on its own
+        os._exit(0)  # A hands over to B
+    sys.exit(0)
+if mode=='hidden':
+    if os.fork()==0:
+        import ctypes;ctypes.CDLL(None).prctl(4,0,0,0,0)  # PR_SET_DUMPABLE=0: /proc/<pid>/environ unreadable
+        os.setsid();fd=os.open(os.devnull,os.O_RDWR)
+        for n in (0,1,2):os.dup2(fd,n)
+        open(sys.argv[2],'w').write(str(os.getpid()));time.sleep(30);os._exit(0)
+    time.sleep(0.3);sys.exit(0)
+if mode=='dispositions':
+    print(json.dumps({s:str(signal.getsignal(getattr(signal,s))) for s in ('SIGINT','SIGTERM','SIGHUP')}));sys.exit(0)
 if mode=='escape-quiet':
     if os.fork()==0:
         os.setsid();fd=os.open(os.devnull,os.O_RDWR)
@@ -178,6 +195,24 @@ class BoundedStop(unittest.TestCase):
         rec.save('rpc-invalid-model',['pi'],(d/'stdin.txt').read_bytes(),(d/'stdout.jsonl').read_bytes(),b'',0,'x',stop=how)
         self.assertEqual(rec.problems,{});meta=json.loads((rec.dir/'rpc-invalid-model/meta.json').read_text())
         self.assertEqual(len(meta['descendants_lingered']),1)
+    def test_grace_covers_descendants_born_during_it(self):
+        # M0R6-03: a tree that hands over to a new descendant and ends within the grace period is not killed.
+        p=self.proc('relay');how=p.stop(grace=5,descendant_grace=5)
+        self.assertEqual(how,'exited');self.assertEqual(how.descendants,[]);self.assertGreaterEqual(len(how.lingered),2)
+    def test_unreadable_descendant_invalidates_case(self):
+        # M0R6-02: a descendant whose environment cannot be read cannot be shown to be gone, so the case is invalid.
+        p=self.proc('hidden');how=p.stop(grace=5,descendant_grace=1)
+        self.assertIn('descendants-unverifiable',how)
+        t=tempfile.TemporaryDirectory();self.addCleanup(t.cleanup)
+        rec=record.Recording('pi','1.5.0',Path(t.name),Path(t.name)/'failed');d=FIXTURES/'pi/1.5.0/rpc-invalid-model'
+        rec.save('rpc-invalid-model',['pi'],(d/'stdin.txt').read_bytes(),(d/'stdout.jsonl').read_bytes(),b'',0,'x',stop=how)
+        self.assertTrue(any('process cleanup' in p for p in rec.problems['rpc-invalid-model']))
+        self.assertTrue(json.loads((rec.dir/'rpc-invalid-model/meta.json').read_text())['descendants_unverifiable'])
+    def test_child_gets_default_signal_dispositions(self):
+        # A recorder started with SIGINT ignored (background job) must not pass that on: Claude's cancel needs SIGINT.
+        old=signal.signal(signal.SIGINT,signal.SIG_IGN);self.addCleanup(signal.signal,signal.SIGINT,old)
+        out,err,rc,how=record.run([sys.executable,str(self.script),'dispositions','-'],b'',self.dir,timeout=10)
+        self.assertEqual(json.loads(out),{'SIGINT':str(signal.default_int_handler),'SIGTERM':str(signal.SIG_DFL),'SIGHUP':str(signal.SIG_DFL)})
     def test_unrelated_children_survive(self):
         # M0R5-06: only processes started by the stopped Proc (carrying its token) are killed.
         other=subprocess.Popen(['sleep','30']);self.addCleanup(lambda:(other.kill(),other.wait()))
@@ -250,6 +285,47 @@ record.record('pi',root)
         self.assertNotEqual(p.returncode,0);self.assertFalse(any((root/'pi').glob('.recording-*')))
     def test_sigint(self):self.interrupt(signal.SIGINT)
     def test_sigterm(self):self.interrupt(signal.SIGTERM)
+    def stop_interrupted(self,sig):
+        # M0R6-01: a signal while stop() waits must still end with the child terminated before its cwd goes.
+        t=tempfile.TemporaryDirectory();self.addCleanup(t.cleanup);d=Path(t.name);repo=sandbox(d);root=repo/'tests/fixtures/protocol';info=d/'child.json'
+        driver=d/'driver.py';driver.write_text(DRIVER_PREAMBLE+'''
+root=Path(sys.argv[2]);info=Path(sys.argv[3])
+def body(rec):
+    cwd=record.workdir();p=record.Proc(['sleep','60'],cwd)
+    info.write_text(json.dumps({'pid':p.p.pid,'cwd':str(cwd)}))
+    p.stop(grace=30)
+record.AGENTS['pi']=body;record.INSTALLED_VERSION['pi']=lambda:'1.5.0';record.binaries=lambda name:{}
+record.record('pi',root)
+''')
+        p=subprocess.Popen([sys.executable,str(driver),str(repo),str(root),str(info)],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        self.addCleanup(lambda:p.poll() is None and p.kill())
+        deadline=time.monotonic()+30
+        while not info.exists() and time.monotonic()<deadline:time.sleep(0.05)
+        time.sleep(0.5);child=json.loads(info.read_text());p.send_signal(sig);out,err=p.communicate(timeout=60)
+        still=record.alive(child['pid'])
+        if still:os.kill(child['pid'],signal.SIGKILL)
+        self.assertFalse(still,err.decode()[-2000:]);self.assertFalse(Path(child['cwd']).exists())
+    def test_sigint_during_stop(self):self.stop_interrupted(signal.SIGINT)
+    def test_sigterm_during_stop(self):self.stop_interrupted(signal.SIGTERM)
+    def test_sigterm_between_agents_still_rebuilds_manifest(self):
+        # M0R6-04: SIGTERM while the next agent's version is probed must still rebuild the manifest.
+        t=tempfile.TemporaryDirectory();self.addCleanup(t.cleanup);d=Path(t.name);repo=sandbox(d);root=repo/'tests/fixtures/protocol'
+        driver=d/'driver.py';driver.write_text(DRIVER_PREAMBLE+'''
+import signal
+root=Path(sys.argv[2]);src=Path(sys.argv[3])/'tests/fixtures/protocol/claude/2.1.317/max-turns-error'
+def claude(rec):
+    rec.save('max-turns-error',['claude'],(src/'stdin.txt').read_bytes(),(src/'stdout.jsonl').read_bytes(),b'',1,'x');(rec.dir/'help.txt').write_bytes(b'h')
+def pi_version():
+    os.kill(os.getpid(),signal.SIGTERM);time.sleep(5);return '1.5.0'
+record.AGENTS.update(claude=claude);record.INSTALLED_VERSION.update(claude=lambda:'2.1.317',pi=pi_version)
+record.binaries=lambda name:{};sys.argv=['record.py','--agents','claude,pi']
+sys.exit(record.main())
+''')
+        r=subprocess.run([sys.executable,str(driver),str(repo),str(root),str(ROOT)],capture_output=True,text=True,timeout=60)
+        self.assertEqual(r.returncode,128+signal.SIGTERM,r.stderr)
+        entry=json.loads((root/'compat-manifest.json').read_text())['agents']['claude']['2.1.317']
+        published=root/'claude/2.1.317/max-turns-error/stdout.jsonl'
+        self.assertEqual(entry['cases']['max-turns-error']['files']['stdout.jsonl'],record.sha256(published.read_bytes()))
     def test_signal_while_constructing_a_child(self):
         # M0R5-01: SIGTERM arriving inside Proc() is handled only once the child is registered, so it is still stopped.
         t=tempfile.TemporaryDirectory();self.addCleanup(t.cleanup);d=Path(t.name);repo=sandbox(d);root=repo/'tests/fixtures/protocol';info=d/'child.json'

@@ -1,2 +1,2 @@
-WARNING: proceeding, even though we could not create PATH aliases: Refusing to create helper binaries under temporary dir "/tmp" (codex_home: AbsolutePathBuf("/tmp/hoh-codex-home-75c0f9k_"))
-[2m2026-11-03T22:46:31.933968Z[0m [31mERROR[0m [2mcodex_api::endpoint::responses_websocket[0m[2m:[0m failed to connect to Responses WebSocket [3mstage[0m[2m=[0mUnknown
+WARNING: proceeding, even though we could not create PATH aliases: Refusing to create helper binaries under temporary dir "/tmp" (codex_home: AbsolutePathBuf("/tmp/hoh-codex-home-rzok5l6b"))
+[2m2026-11-03T23:04:02.702218Z[0m [31mERROR[0m [2mcodex_api::endpoint::responses_websocket[0m[2m:[0m failed to connect to Responses WebSocket [3mstage[0m[2m=[0mUnknown

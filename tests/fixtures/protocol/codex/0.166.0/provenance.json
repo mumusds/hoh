@@ -1,8 +1,8 @@
 {
   "cli_version": "0.166.0",
   "auth": "AUTHENTICATED",
-  "recording_started_at": "2026-11-03T22:45:59.308418+00:00",
-  "recorded_at": "2026-11-03T22:47:42.658092+00:00",
+  "recording_started_at": "2026-11-03T23:03:30.441454+00:00",
+  "recorded_at": "2026-11-03T23:05:15.136424+00:00",
   "help_argv": [
     "codex",
     "exec",
