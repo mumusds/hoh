@@ -180,6 +180,22 @@ class IndependentReport(unittest.TestCase):
         r=subprocess.run([sys.executable,str(ROOT/'tools/agent_task.py'),'--agent','claude','--role','developer','--prompt-file',str(p),'--report-out',str(self.root/'r.json'),'--dry-run'],capture_output=True,text=True)
         self.assertEqual(r.returncode,2);self.assertIn('qa or reviewer',r.stderr)
 
+class TestResultsConverter(unittest.TestCase):
+    """scripts/product/test_results.py maps libtest lines to TEST ids (CR-003 per-test evidence)."""
+    def test_mapping_and_statuses(self):
+        with tempfile.TemporaryDirectory() as d:
+            log=Path(d)/'log';out=Path(d)/'out.jsonl'
+            log.write_text('running 4 tests\ntest cli::tests::test_004_01_exit_code_table ... ok\n'
+                           'test store::test_062_03_outbox_and_test_062_04_fs ... FAILED\ntest misc::helper_works ... ok\n'
+                           'test slow::test_038_02_property ... ignored, needs time\ntest latest_test_1234_56 ... ok\n')
+            r=subprocess.run([sys.executable,str(ROOT/'scripts/product/test_results.py'),'--log',str(log),'--out',str(out)],capture_output=True,text=True)
+            self.assertEqual(r.returncode,0,r.stderr)
+            got=[(x['test_id'],x['status']) for x in map(json.loads,out.read_text().splitlines())]
+            self.assertEqual(got,[('TEST-004-01','PASS'),('TEST-062-03','FAIL'),('TEST-062-04','FAIL'),('TEST-038-02','SKIPPED')])
+            schema=load_json(ROOT/'contracts/test-result.schema.json')
+            from jsonschema import Draft202012Validator
+            for line in out.read_text().splitlines():Draft202012Validator(schema).validate(json.loads(line))
+
 class ProcessLifecycle(unittest.TestCase):
     def test_stdout_stderr_backpressure(self):
         with tempfile.TemporaryDirectory() as d:
