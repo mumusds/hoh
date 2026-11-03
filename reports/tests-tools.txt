@@ -1,0 +1,38 @@
+test_check_failing_exit (test_tools.CandidateAndChecks.test_check_failing_exit) ... ok
+test_check_mutating_source (test_tools.CandidateAndChecks.test_check_mutating_source) ... ok
+test_clean_candidate (test_tools.CandidateAndChecks.test_clean_candidate) ... ok
+test_dirty_source (test_tools.CandidateAndChecks.test_dirty_source) ... ok
+test_environment_mutation (test_tools.CandidateAndChecks.test_environment_mutation) ... ok
+test_forged_candidate_id (test_tools.CandidateAndChecks.test_forged_candidate_id) ... ok
+test_new_untracked_source (test_tools.CandidateAndChecks.test_new_untracked_source) ... ok
+test_real_check_record (test_tools.CandidateAndChecks.test_real_check_record) ... ok
+test_assistant_text_extraction (test_tools.NativeBridge.test_assistant_text_extraction) ... ok
+test_assistant_text_not_echoed_user_prompt (test_tools.NativeBridge.test_assistant_text_not_echoed_user_prompt) ... ok
+test_claude_command (test_tools.NativeBridge.test_claude_command) ... ok
+test_claude_failure_output (test_tools.NativeBridge.test_claude_failure_output) ... ok
+test_codex_real_subprocess_mock (test_tools.NativeBridge.test_codex_real_subprocess_mock) ... ok
+test_dry_run_no_attempt_dir (test_tools.NativeBridge.test_dry_run_no_attempt_dir) ... ok
+test_malformed_json (test_tools.NativeBridge.test_malformed_json) ... ok
+test_missing_terminal (test_tools.NativeBridge.test_missing_terminal) ... ok
+test_model_no_shell_interpolation (test_tools.NativeBridge.test_model_no_shell_interpolation) ... ok
+test_native_nonzero (test_tools.NativeBridge.test_native_nonzero) ... ok
+test_oversized_json_frame (test_tools.NativeBridge.test_oversized_json_frame) ... ok
+test_pi_json_one_shot (test_tools.NativeBridge.test_pi_json_one_shot) ... ok
+test_semantic_failure_zero_exit (test_tools.NativeBridge.test_semantic_failure_zero_exit) ... ok
+test_stdin_unicode_and_spaces (test_tools.NativeBridge.test_stdin_unicode_and_spaces) ... ok
+test_timeout_record (test_tools.NativeBridge.test_timeout_record) ... ok
+test_top_level_restricted_to_commander (test_tools.NativeBridge.test_top_level_restricted_to_commander) ... ok
+test_unsupported_native_flags (test_tools.NativeBridge.test_unsupported_native_flags) ... ok
+test_path_traversal (test_tools.ProcessLifecycle.test_path_traversal) ... ok
+test_stdout_stderr_backpressure (test_tools.ProcessLifecycle.test_stdout_stderr_backpressure) ... ok
+test_termination_kills_stubborn_grandchild (test_tools.ProcessLifecycle.test_termination_kills_stubborn_grandchild) ... ok
+test_all_role_templates (test_tools.PromptRenderer.test_all_role_templates) ... ok
+test_empty_field (test_tools.PromptRenderer.test_empty_field) ... ok
+test_missing_field (test_tools.PromptRenderer.test_missing_field) ... ok
+test_nested_field (test_tools.PromptRenderer.test_nested_field) ... ok
+test_substitution (test_tools.PromptRenderer.test_substitution) ... ok
+
+----------------------------------------------------------------------
+Ran 33 tests in 22.582s
+
+OK

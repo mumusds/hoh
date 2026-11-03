@@ -1,0 +1,47 @@
+test_absolute_artifact (test_gate.ReleaseGate.test_absolute_artifact) ... ok
+test_baseline_changed (test_gate.ReleaseGate.test_baseline_changed) ... ok
+test_bundle_not_product (test_gate.ReleaseGate.test_bundle_not_product) ... ok
+test_changed_stdout (test_gate.ReleaseGate.test_changed_stdout) ... ok
+test_check_source_modified (test_gate.ReleaseGate.test_check_source_modified) ... ok
+test_critical_issue (test_gate.ReleaseGate.test_critical_issue) ... ok
+test_duplicate_ac (test_gate.ReleaseGate.test_duplicate_ac) ... ok
+test_duplicate_check (test_gate.ReleaseGate.test_duplicate_check) ... ok
+test_empty_artifact (test_gate.ReleaseGate.test_empty_artifact) ... ok
+test_empty_checks (test_gate.ReleaseGate.test_empty_checks) ... ok
+test_empty_observation (test_gate.ReleaseGate.test_empty_observation) ... ok
+test_failed_ac (test_gate.ReleaseGate.test_failed_ac) ... ok
+test_failed_command (test_gate.ReleaseGate.test_failed_command) ... ok
+test_failed_observation (test_gate.ReleaseGate.test_failed_observation) ... ok
+test_failed_review (test_gate.ReleaseGate.test_failed_review) ... ok
+test_flaky_required (test_gate.ReleaseGate.test_flaky_required) ... ok
+test_high_issue (test_gate.ReleaseGate.test_high_issue) ... ok
+test_invalid_duration (test_gate.ReleaseGate.test_invalid_duration) ... ok
+test_live_source_modified (test_gate.ReleaseGate.test_live_source_modified) ... ok
+test_missing_ac (test_gate.ReleaseGate.test_missing_ac) ... ok
+test_missing_check (test_gate.ReleaseGate.test_missing_check) ... ok
+test_missing_qa (test_gate.ReleaseGate.test_missing_qa) ... ok
+test_mock_not_live (test_gate.ReleaseGate.test_mock_not_live) ... ok
+test_path_traversal (test_gate.ReleaseGate.test_path_traversal) ... ok
+test_product_not_live (test_gate.ReleaseGate.test_product_not_live) ... ok
+test_record_hash_tampered (test_gate.ReleaseGate.test_record_hash_tampered) ... ok
+test_reused_record_id (test_gate.ReleaseGate.test_reused_record_id) ... ok
+test_same_developer_qa (test_gate.ReleaseGate.test_same_developer_qa) ... ok
+test_same_qa_reviewer (test_gate.ReleaseGate.test_same_qa_reviewer) ... ok
+test_short_soak (test_gate.ReleaseGate.test_short_soak) ... ok
+test_skipped_required (test_gate.ReleaseGate.test_skipped_required) ... ok
+test_stale_candidate (test_gate.ReleaseGate.test_stale_candidate) ... ok
+test_stale_environment (test_gate.ReleaseGate.test_stale_environment) ... ok
+test_stale_observation (test_gate.ReleaseGate.test_stale_observation) ... ok
+test_stale_spec (test_gate.ReleaseGate.test_stale_spec) ... ok
+test_symlink_escape (test_gate.ReleaseGate.test_symlink_escape) ... ok
+test_synthetic_valid_envelope_only (test_gate.ReleaseGate.test_synthetic_valid_envelope_only) ... ok
+test_timed_out_command (test_gate.ReleaseGate.test_timed_out_command) ... ok
+test_unknown_check (test_gate.ReleaseGate.test_unknown_check) ... ok
+test_wrong_record_check_id (test_gate.ReleaseGate.test_wrong_record_check_id) ... ok
+test_wrong_soak_count (test_gate.ReleaseGate.test_wrong_soak_count) ... ok
+test_wrong_test_binding (test_gate.ReleaseGate.test_wrong_test_binding) ... ok
+
+----------------------------------------------------------------------
+Ran 42 tests in 3.631s
+
+OK

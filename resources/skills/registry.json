@@ -1,0 +1,184 @@
+{
+  "schema_version": "1.0",
+  "skills": [
+    {
+      "id": "requirements",
+      "version": "1.0.0",
+      "name": "需求澄清",
+      "roles": [
+        "commander",
+        "cto"
+      ],
+      "dependencies": [],
+      "entry": "resources/skills/requirements/SKILL.md",
+      "license": "MIT",
+      "output_contract": "TaskResult",
+      "interaction": "mode-aware"
+    },
+    {
+      "id": "decision-map",
+      "version": "1.0.0",
+      "name": "跨会话决策地图",
+      "roles": [
+        "commander",
+        "cto"
+      ],
+      "dependencies": [
+        "requirements"
+      ],
+      "entry": "resources/skills/decision-map/SKILL.md",
+      "license": "MIT",
+      "output_contract": "TaskResult",
+      "interaction": "mode-aware"
+    },
+    {
+      "id": "domain-modeling",
+      "version": "1.0.0",
+      "name": "领域与数据建模",
+      "roles": [
+        "cto",
+        "developer"
+      ],
+      "dependencies": [
+        "requirements"
+      ],
+      "entry": "resources/skills/domain-modeling/SKILL.md",
+      "license": "MIT",
+      "output_contract": "TaskResult",
+      "interaction": "mode-aware"
+    },
+    {
+      "id": "architecture",
+      "version": "1.0.0",
+      "name": "架构设计",
+      "roles": [
+        "cto",
+        "commander"
+      ],
+      "dependencies": [
+        "domain-modeling"
+      ],
+      "entry": "resources/skills/architecture/SKILL.md",
+      "license": "MIT",
+      "output_contract": "TaskResult",
+      "interaction": "mode-aware"
+    },
+    {
+      "id": "task-planning",
+      "version": "1.0.0",
+      "name": "可验证增量规划",
+      "roles": [
+        "commander"
+      ],
+      "dependencies": [
+        "requirements",
+        "architecture"
+      ],
+      "entry": "resources/skills/task-planning/SKILL.md",
+      "license": "MIT",
+      "output_contract": "TaskResult",
+      "interaction": "mode-aware"
+    },
+    {
+      "id": "tdd",
+      "version": "1.0.0",
+      "name": "测试驱动开发",
+      "roles": [
+        "developer"
+      ],
+      "dependencies": [],
+      "entry": "resources/skills/tdd/SKILL.md",
+      "license": "MIT",
+      "output_contract": "TaskResult",
+      "interaction": "mode-aware"
+    },
+    {
+      "id": "implementation",
+      "version": "1.0.0",
+      "name": "实现与候选提交",
+      "roles": [
+        "developer"
+      ],
+      "dependencies": [
+        "tdd"
+      ],
+      "entry": "resources/skills/implementation/SKILL.md",
+      "license": "MIT",
+      "output_contract": "TaskResult",
+      "interaction": "mode-aware"
+    },
+    {
+      "id": "independent-qa",
+      "version": "1.0.0",
+      "name": "独立质量验收",
+      "roles": [
+        "qa"
+      ],
+      "dependencies": [],
+      "entry": "resources/skills/independent-qa/SKILL.md",
+      "license": "MIT",
+      "output_contract": "TaskResult",
+      "interaction": "mode-aware"
+    },
+    {
+      "id": "code-review",
+      "version": "1.0.0",
+      "name": "独立代码审查",
+      "roles": [
+        "reviewer"
+      ],
+      "dependencies": [],
+      "entry": "resources/skills/code-review/SKILL.md",
+      "license": "MIT",
+      "output_contract": "TaskResult",
+      "interaction": "mode-aware"
+    },
+    {
+      "id": "recovery",
+      "version": "1.0.0",
+      "name": "故障诊断与恢复",
+      "roles": [
+        "commander",
+        "developer"
+      ],
+      "dependencies": [],
+      "entry": "resources/skills/recovery/SKILL.md",
+      "license": "MIT",
+      "output_contract": "TaskResult",
+      "interaction": "mode-aware"
+    },
+    {
+      "id": "ux-validation",
+      "version": "1.0.0",
+      "name": "交互与使用体验验证",
+      "roles": [
+        "qa",
+        "cto"
+      ],
+      "dependencies": [],
+      "entry": "resources/skills/ux-validation/SKILL.md",
+      "license": "MIT",
+      "output_contract": "TaskResult",
+      "interaction": "mode-aware"
+    },
+    {
+      "id": "release",
+      "version": "1.0.0",
+      "name": "完整交付",
+      "roles": [
+        "commander",
+        "qa",
+        "reviewer"
+      ],
+      "dependencies": [
+        "independent-qa",
+        "code-review",
+        "ux-validation"
+      ],
+      "entry": "resources/skills/release/SKILL.md",
+      "license": "MIT",
+      "output_contract": "TaskResult",
+      "interaction": "mode-aware"
+    }
+  ]
+}

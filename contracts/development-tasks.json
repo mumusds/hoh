@@ -1,0 +1,524 @@
+{
+  "tasks": [
+    {
+      "id": "M0-T01",
+      "milestone": "M0",
+      "title": "核对CONTRACT、记录本机CLI帮助与版本",
+      "depends_on": [],
+      "requirements": [],
+      "status": "pending",
+      "owner_role": "developer",
+      "done_when": "关联规范实现且对应测试有真实记录；里程碑内必要集成通过。任务标记不替代需求验收。"
+    },
+    {
+      "id": "M0-T02",
+      "milestone": "M0",
+      "title": "执行包自测；新建Rust workspace和精确lock",
+      "depends_on": [
+        "M0-T01"
+      ],
+      "requirements": [],
+      "status": "pending",
+      "owner_role": "developer",
+      "done_when": "关联规范实现且对应测试有真实记录；里程碑内必要集成通过。任务标记不替代需求验收。"
+    },
+    {
+      "id": "M0-T03",
+      "milestone": "M0",
+      "title": "获取真实协议样例与认证状态（不得打印token）",
+      "depends_on": [
+        "M0-T02"
+      ],
+      "requirements": [],
+      "status": "pending",
+      "owner_role": "qa",
+      "done_when": "关联规范实现且对应测试有真实记录；里程碑内必要集成通过。任务标记不替代需求验收。"
+    },
+    {
+      "id": "M1-T01",
+      "milestone": "M1",
+      "title": "实现领域类型/协议Schema",
+      "depends_on": [
+        "M0-T02"
+      ],
+      "requirements": [
+        "REQ-001",
+        "REQ-002",
+        "REQ-003",
+        "REQ-004",
+        "REQ-006",
+        "REQ-024",
+        "REQ-025",
+        "REQ-026",
+        "REQ-027"
+      ],
+      "status": "pending",
+      "owner_role": "developer",
+      "done_when": "关联规范实现且对应测试有真实记录；里程碑内必要集成通过。任务标记不替代需求验收。"
+    },
+    {
+      "id": "M1-T02",
+      "milestone": "M1",
+      "title": "完成三个Agent启动事件/退出/取消适配",
+      "depends_on": [
+        "M1-T01"
+      ],
+      "requirements": [
+        "REQ-001",
+        "REQ-002",
+        "REQ-003",
+        "REQ-004",
+        "REQ-006",
+        "REQ-024",
+        "REQ-025",
+        "REQ-026",
+        "REQ-027"
+      ],
+      "status": "pending",
+      "owner_role": "developer",
+      "done_when": "关联规范实现且对应测试有真实记录；里程碑内必要集成通过。任务标记不替代需求验收。"
+    },
+    {
+      "id": "M1-T03",
+      "milestone": "M1",
+      "title": "实现hoh/-p/doctor和基础TUI shell，测试stdout",
+      "depends_on": [
+        "M1-T02"
+      ],
+      "requirements": [
+        "REQ-001",
+        "REQ-002",
+        "REQ-003",
+        "REQ-004",
+        "REQ-006",
+        "REQ-024",
+        "REQ-025",
+        "REQ-026",
+        "REQ-027"
+      ],
+      "status": "pending",
+      "owner_role": "qa",
+      "done_when": "关联规范实现且对应测试有真实记录；里程碑内必要集成通过。任务标记不替代需求验收。"
+    },
+    {
+      "id": "M2-T01",
+      "milestone": "M2",
+      "title": "实现SQLite事务、outbox、leases、reconcile",
+      "depends_on": [
+        "M1-T03"
+      ],
+      "requirements": [
+        "REQ-005",
+        "REQ-018",
+        "REQ-019",
+        "REQ-020",
+        "REQ-021",
+        "REQ-022",
+        "REQ-035",
+        "REQ-036",
+        "REQ-037",
+        "REQ-038",
+        "REQ-039",
+        "REQ-041",
+        "REQ-042",
+        "REQ-043",
+        "REQ-052",
+        "REQ-053",
+        "REQ-054",
+        "REQ-062"
+      ],
+      "status": "pending",
+      "owner_role": "developer",
+      "done_when": "关联规范实现且对应测试有真实记录；里程碑内必要集成通过。任务标记不替代需求验收。"
+    },
+    {
+      "id": "M2-T02",
+      "milestone": "M2",
+      "title": "完成HCP handoff、Commander监督和DAG",
+      "depends_on": [
+        "M2-T01"
+      ],
+      "requirements": [
+        "REQ-005",
+        "REQ-018",
+        "REQ-019",
+        "REQ-020",
+        "REQ-021",
+        "REQ-022",
+        "REQ-035",
+        "REQ-036",
+        "REQ-037",
+        "REQ-038",
+        "REQ-039",
+        "REQ-041",
+        "REQ-042",
+        "REQ-043",
+        "REQ-052",
+        "REQ-053",
+        "REQ-054",
+        "REQ-062"
+      ],
+      "status": "pending",
+      "owner_role": "developer",
+      "done_when": "关联规范实现且对应测试有真实记录；里程碑内必要集成通过。任务标记不替代需求验收。"
+    },
+    {
+      "id": "M2-T03",
+      "milestone": "M2",
+      "title": "完成candidate QA/Review barrier与mock故障套件",
+      "depends_on": [
+        "M2-T02"
+      ],
+      "requirements": [
+        "REQ-005",
+        "REQ-018",
+        "REQ-019",
+        "REQ-020",
+        "REQ-021",
+        "REQ-022",
+        "REQ-035",
+        "REQ-036",
+        "REQ-037",
+        "REQ-038",
+        "REQ-039",
+        "REQ-041",
+        "REQ-042",
+        "REQ-043",
+        "REQ-052",
+        "REQ-053",
+        "REQ-054",
+        "REQ-062"
+      ],
+      "status": "pending",
+      "owner_role": "qa",
+      "done_when": "关联规范实现且对应测试有真实记录；里程碑内必要集成通过。任务标记不替代需求验收。"
+    },
+    {
+      "id": "M3-T01",
+      "milestone": "M3",
+      "title": "实现文档追踪与readiness/CR",
+      "depends_on": [
+        "M2-T03"
+      ],
+      "requirements": [
+        "REQ-007",
+        "REQ-008",
+        "REQ-009",
+        "REQ-017",
+        "REQ-023",
+        "REQ-028",
+        "REQ-029",
+        "REQ-030",
+        "REQ-031",
+        "REQ-032",
+        "REQ-033",
+        "REQ-034",
+        "REQ-040",
+        "REQ-045",
+        "REQ-046",
+        "REQ-047"
+      ],
+      "status": "pending",
+      "owner_role": "developer",
+      "done_when": "关联规范实现且对应测试有真实记录；里程碑内必要集成通过。任务标记不替代需求验收。"
+    },
+    {
+      "id": "M3-T02",
+      "milestone": "M3",
+      "title": "实现四层Prompt、原创Skill、模板及覆盖",
+      "depends_on": [
+        "M3-T01"
+      ],
+      "requirements": [
+        "REQ-007",
+        "REQ-008",
+        "REQ-009",
+        "REQ-017",
+        "REQ-023",
+        "REQ-028",
+        "REQ-029",
+        "REQ-030",
+        "REQ-031",
+        "REQ-032",
+        "REQ-033",
+        "REQ-034",
+        "REQ-040",
+        "REQ-045",
+        "REQ-046",
+        "REQ-047"
+      ],
+      "status": "pending",
+      "owner_role": "developer",
+      "done_when": "关联规范实现且对应测试有真实记录；里程碑内必要集成通过。任务标记不替代需求验收。"
+    },
+    {
+      "id": "M3-T03",
+      "milestone": "M3",
+      "title": "完成Plan对话到Build/Auto的同会话闭环",
+      "depends_on": [
+        "M3-T02"
+      ],
+      "requirements": [
+        "REQ-007",
+        "REQ-008",
+        "REQ-009",
+        "REQ-017",
+        "REQ-023",
+        "REQ-028",
+        "REQ-029",
+        "REQ-030",
+        "REQ-031",
+        "REQ-032",
+        "REQ-033",
+        "REQ-034",
+        "REQ-040",
+        "REQ-045",
+        "REQ-046",
+        "REQ-047"
+      ],
+      "status": "pending",
+      "owner_role": "qa",
+      "done_when": "关联规范实现且对应测试有真实记录；里程碑内必要集成通过。任务标记不替代需求验收。"
+    },
+    {
+      "id": "M4-T01",
+      "milestone": "M4",
+      "title": "实现Workspace/Team/Focus/Timeline",
+      "depends_on": [
+        "M3-T03"
+      ],
+      "requirements": [
+        "REQ-010",
+        "REQ-011",
+        "REQ-012",
+        "REQ-013",
+        "REQ-014",
+        "REQ-015",
+        "REQ-016",
+        "REQ-064"
+      ],
+      "status": "pending",
+      "owner_role": "developer",
+      "done_when": "关联规范实现且对应测试有真实记录；里程碑内必要集成通过。任务标记不替代需求验收。"
+    },
+    {
+      "id": "M4-T02",
+      "milestone": "M4",
+      "title": "展开块、statusline、Unicode/PTY/快捷键",
+      "depends_on": [
+        "M4-T01"
+      ],
+      "requirements": [
+        "REQ-010",
+        "REQ-011",
+        "REQ-012",
+        "REQ-013",
+        "REQ-014",
+        "REQ-015",
+        "REQ-016",
+        "REQ-064"
+      ],
+      "status": "pending",
+      "owner_role": "developer",
+      "done_when": "关联规范实现且对应测试有真实记录；里程碑内必要集成通过。任务标记不替代需求验收。"
+    },
+    {
+      "id": "M4-T03",
+      "milestone": "M4",
+      "title": "大事件回放、交互性能和无障碍",
+      "depends_on": [
+        "M4-T02"
+      ],
+      "requirements": [
+        "REQ-010",
+        "REQ-011",
+        "REQ-012",
+        "REQ-013",
+        "REQ-014",
+        "REQ-015",
+        "REQ-016",
+        "REQ-064"
+      ],
+      "status": "pending",
+      "owner_role": "qa",
+      "done_when": "关联规范实现且对应测试有真实记录；里程碑内必要集成通过。任务标记不替代需求验收。"
+    },
+    {
+      "id": "M5-T01",
+      "milestone": "M5",
+      "title": "安装锁定Pi三插件并真实压缩恢复测试",
+      "depends_on": [
+        "M4-T03",
+        "M0-T03"
+      ],
+      "requirements": [
+        "REQ-044",
+        "REQ-048",
+        "REQ-049",
+        "REQ-050",
+        "REQ-051",
+        "REQ-055",
+        "REQ-056",
+        "REQ-057",
+        "REQ-063"
+      ],
+      "status": "pending",
+      "owner_role": "developer",
+      "done_when": "关联规范实现且对应测试有真实记录；里程碑内必要集成通过。任务标记不替代需求验收。"
+    },
+    {
+      "id": "M5-T02",
+      "milestone": "M5",
+      "title": "实现冻结证据、flaky、回归、Final Gate",
+      "depends_on": [
+        "M4-T03"
+      ],
+      "requirements": [
+        "REQ-044",
+        "REQ-048",
+        "REQ-049",
+        "REQ-050",
+        "REQ-051",
+        "REQ-055",
+        "REQ-056",
+        "REQ-057",
+        "REQ-063"
+      ],
+      "status": "pending",
+      "owner_role": "developer",
+      "done_when": "关联规范实现且对应测试有真实记录；里程碑内必要集成通过。任务标记不替代需求验收。"
+    },
+    {
+      "id": "M5-T03",
+      "milestone": "M5",
+      "title": "备份、schema升级和故障恢复全面验证",
+      "depends_on": [
+        "M5-T02"
+      ],
+      "requirements": [
+        "REQ-044",
+        "REQ-048",
+        "REQ-049",
+        "REQ-050",
+        "REQ-051",
+        "REQ-055",
+        "REQ-056",
+        "REQ-057",
+        "REQ-063"
+      ],
+      "status": "pending",
+      "owner_role": "qa",
+      "done_when": "关联规范实现且对应测试有真实记录；里程碑内必要集成通过。任务标记不替代需求验收。"
+    },
+    {
+      "id": "M6-T01",
+      "milestone": "M6",
+      "title": "完成Web GUI和重放游标、多客户端冲突",
+      "depends_on": [
+        "M5-T03"
+      ],
+      "requirements": [
+        "REQ-058",
+        "REQ-059",
+        "REQ-060",
+        "REQ-061",
+        "REQ-065",
+        "REQ-066"
+      ],
+      "status": "pending",
+      "owner_role": "developer",
+      "done_when": "关联规范实现且对应测试有真实记录；里程碑内必要集成通过。任务标记不替代需求验收。"
+    },
+    {
+      "id": "M6-T02",
+      "milestone": "M6",
+      "title": "完成安装包内置资产/升级/本地与PR交付",
+      "depends_on": [
+        "M6-T01"
+      ],
+      "requirements": [
+        "REQ-058",
+        "REQ-059",
+        "REQ-060",
+        "REQ-061",
+        "REQ-065",
+        "REQ-066"
+      ],
+      "status": "pending",
+      "owner_role": "developer",
+      "done_when": "关联规范实现且对应测试有真实记录；里程碑内必要集成通过。任务标记不替代需求验收。"
+    },
+    {
+      "id": "M6-T03",
+      "milestone": "M6",
+      "title": "全新VM安装与浏览器、TUI双端端到端",
+      "depends_on": [
+        "M6-T02"
+      ],
+      "requirements": [
+        "REQ-058",
+        "REQ-059",
+        "REQ-060",
+        "REQ-061",
+        "REQ-065",
+        "REQ-066"
+      ],
+      "status": "pending",
+      "owner_role": "qa",
+      "done_when": "关联规范实现且对应测试有真实记录；里程碑内必要集成通过。任务标记不替代需求验收。"
+    },
+    {
+      "id": "M7-T01",
+      "milestone": "M7",
+      "title": "运行三Agent真集成、固定任务对照",
+      "depends_on": [
+        "M6-T03",
+        "M5-T01",
+        "M0-T03"
+      ],
+      "requirements": [
+        "REQ-067",
+        "REQ-068",
+        "REQ-069",
+        "REQ-070"
+      ],
+      "status": "pending",
+      "owner_role": "developer",
+      "done_when": "关联规范实现且对应测试有真实记录；里程碑内必要集成通过。任务标记不替代需求验收。"
+    },
+    {
+      "id": "M7-T02",
+      "milestone": "M7",
+      "title": "72h soak/20轮真实工程和故障注入",
+      "depends_on": [
+        "M7-T01"
+      ],
+      "requirements": [
+        "REQ-067",
+        "REQ-068",
+        "REQ-069",
+        "REQ-070"
+      ],
+      "status": "pending",
+      "owner_role": "developer",
+      "done_when": "关联规范实现且对应测试有真实记录；里程碑内必要集成通过。任务标记不替代需求验收。"
+    },
+    {
+      "id": "M7-T03",
+      "milestone": "M7",
+      "title": "核对全部需求证据并输出发布/不足报告",
+      "depends_on": [
+        "M7-T02"
+      ],
+      "requirements": [
+        "REQ-067",
+        "REQ-068",
+        "REQ-069",
+        "REQ-070"
+      ],
+      "status": "pending",
+      "owner_role": "qa",
+      "done_when": "关联规范实现且对应测试有真实记录；里程碑内必要集成通过。任务标记不替代需求验收。"
+    }
+  ]
+}

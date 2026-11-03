@@ -1,0 +1,28 @@
+test_duplicate_event (test_reference.EvidenceAndProjection.test_duplicate_event) ... ok
+test_empty_evidence (test_reference.EvidenceAndProjection.test_empty_evidence) ... ok
+test_failed (test_reference.EvidenceAndProjection.test_failed) ... ok
+test_invalidation (test_reference.EvidenceAndProjection.test_invalidation) ... ok
+test_old_event_ignored (test_reference.EvidenceAndProjection.test_old_event_ignored) ... ok
+test_source_changed (test_reference.EvidenceAndProjection.test_source_changed) ... ok
+test_valid (test_reference.EvidenceAndProjection.test_valid) ... ok
+test_wrong_environment (test_reference.EvidenceAndProjection.test_wrong_environment) ... ok
+test_accepted_unblocks (test_reference.Scheduling.test_accepted_unblocks) ... ok
+test_aging_priority (test_reference.Scheduling.test_aging_priority) ... ok
+test_bad_cost (test_reference.Scheduling.test_bad_cost) ... ok
+test_budget_limit (test_reference.Scheduling.test_budget_limit) ... ok
+test_current_decision (test_reference.Scheduling.test_current_decision) ... ok
+test_cycle (test_reference.Scheduling.test_cycle) ... ok
+test_dependency_blocks (test_reference.Scheduling.test_dependency_blocks) ... ok
+test_duplicate (test_reference.Scheduling.test_duplicate) ... ok
+test_hard_severity (test_reference.Scheduling.test_hard_severity) ... ok
+test_leased_not_chosen (test_reference.Scheduling.test_leased_not_chosen) ... ok
+test_missing_dependency (test_reference.Scheduling.test_missing_dependency) ... ok
+test_stable_tie (test_reference.Scheduling.test_stable_tie) ... ok
+test_stale_revision (test_reference.Scheduling.test_stale_revision) ... ok
+test_stale_role_epoch (test_reference.Scheduling.test_stale_role_epoch) ... ok
+test_topological_order (test_reference.Scheduling.test_topological_order) ... ok
+
+----------------------------------------------------------------------
+Ran 23 tests in 0.001s
+
+OK

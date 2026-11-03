@@ -1,0 +1,24 @@
+{
+  "checked_at": "2026-10-12T19:34:12.700230+00:00",
+  "scope": "container only; web research tool is separate",
+  "results": [
+    {
+      "host": "github.com",
+      "dns": "UNAVAILABLE_IN_CURRENT_CONTAINER",
+      "error": "[Errno -3] Temporary failure in name resolution",
+      "download_and_install": "NOT_RUN"
+    },
+    {
+      "host": "raw.githubusercontent.com",
+      "dns": "UNAVAILABLE_IN_CURRENT_CONTAINER",
+      "error": "[Errno -3] Temporary failure in name resolution",
+      "download_and_install": "NOT_RUN"
+    },
+    {
+      "host": "nodejs.org",
+      "dns": "UNAVAILABLE_IN_CURRENT_CONTAINER",
+      "error": "[Errno -3] Temporary failure in name resolution",
+      "download_and_install": "NOT_RUN"
+    }
+  ]
+}

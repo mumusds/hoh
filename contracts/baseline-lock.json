@@ -1,0 +1,20 @@
+{
+  "schema_version": "1.0",
+  "baseline_id": "HOH-BASELINE-1.0",
+  "change_policy": "Formal CR + new baseline; never lower required gates to pass",
+  "files": {
+    "CONTRACT.md": "d4b8489551e80726a101e88b657f832aa211462434cb3a19d7c72590f7f61c2c",
+    "contracts/acceptance-observation.schema.json": "20e95b6016303145b66d4467ea0326891e93ca3ee4a987f5d07799f63f50ec08",
+    "contracts/acceptance-scenarios.json": "772e724fe815c2ad8596b3894895569870e3180486221e5d77e3a670ff672dfc",
+    "contracts/candidate.schema.json": "6d521ab66e51b4766168e2dc6caa250525958f17d2201e1a0e3e1ef31802eb90",
+    "contracts/development-tasks.json": "41a729c9b0e0ad67015609dd49b472091521d7ae7e82ede079ff2433a49308b0",
+    "contracts/execution.schema.json": "5ae9d861a970d92d6013c9a7dff719758dae064a4529ca066125750aaab39cda",
+    "contracts/independent-report.schema.json": "c13fef6d439bfd7fbdd9fcd8ddd1a7113a2a190a7032e73bb0003f587685dae4",
+    "contracts/openapi.json": "a78429ad37d77bd063efbd515d94802185d8027428f67c1cda0ddaf412ddabe4",
+    "contracts/protocol.schema.json": "df9e035a5ac76ea0ab0cd1020827bd667c4b441085e62e44973bb8d9dd368b4c",
+    "contracts/release-policy.json": "982028594b17b32cac11b680d88f0ae8bc8d040368736d866b96979fd4376828",
+    "contracts/release.schema.json": "4790be920b753ba58f25bdf3504f2ea094f4a10d70044a5207ff8e91dab7d9aa",
+    "contracts/requirements.json": "ff803972236f14687dbe17b89636b64a60f71c253f58314e4127ef6b6161c25d",
+    "contracts/sql/001_initial.sql": "e350519971cbe3ba98c102b4ded51d8032a9f0dcbe5693aee512f8089dc0e9d4"
+  }
+}

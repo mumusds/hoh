@@ -1,0 +1,23 @@
+{
+  "schema_version": "1.0",
+  "run_id": "run-example",
+  "task_id": "TASK-028",
+  "goal": "验证搜索的中文边界行为",
+  "role": "qa",
+  "role_epoch": 1,
+  "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "candidate": {
+    "id": "candidate-example",
+    "git_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "git_tree": "cccccccccccccccccccccccccccccccccccccccc",
+    "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "environment_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "test_plan_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  },
+  "acceptance_ids": [
+    "AC-052"
+  ],
+  "references": [],
+  "output_contract": "TaskResult",
+  "budget_tokens": 12000
+}

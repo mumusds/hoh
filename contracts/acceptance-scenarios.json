@@ -1,0 +1,635 @@
+{
+  "schema_version": "1.0",
+  "scenarios": [
+    {
+      "id": "TEST-001",
+      "requirement_id": "REQ-001",
+      "acceptance_id": "AC-001",
+      "setup": "在有 TTY 的目录执行 hoh",
+      "assertion": "进入 Workspace，保留输入历史与工程状态，不新增任务直到用户提交意图",
+      "method": "PTY 启动、退出、恢复终端属性",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-002",
+      "requirement_id": "REQ-002",
+      "acceptance_id": "AC-002",
+      "setup": "执行 hoh -p 和明确目标",
+      "assertion": "只执行这一输入，stdin 无人值守不弹问卷；缺关键决策进入 BLOCKED",
+      "method": "子进程 stdin 关闭下跑 mock project",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-003",
+      "requirement_id": "REQ-003",
+      "acceptance_id": "AC-003",
+      "setup": "查看 --help 与所有子命令",
+      "assertion": "只有 attach/web/doctor 加内置 help；plan/mode/run 子命令返回 usage error",
+      "method": "CLI help golden snapshot",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-004",
+      "requirement_id": "REQ-004",
+      "acceptance_id": "AC-004",
+      "setup": "选择 text/json/stream-json",
+      "assertion": "stdout 仅对应结果；stderr 诊断；stream-json 每条含序号且以 LF 分帧",
+      "method": "并行 stderr 噪声与 Unicode 解析测试",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-005",
+      "requirement_id": "REQ-005",
+      "acceptance_id": "AC-005",
+      "setup": "hoh -p --detach 后退出 Shell，再 attach run_id",
+      "assertion": "后台运行不受客户端关闭影响；同 Run 不重复派发",
+      "method": "PTY HUP 与重连测试",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-006",
+      "requirement_id": "REQ-006",
+      "acceptance_id": "AC-006",
+      "setup": "运行 hoh doctor",
+      "assertion": "逐项输出 installed/protocol/auth_check/unknown；不读取打印密钥，不将版本探测当认证成功",
+      "method": "缺工具、错误版本、缺认证表驱动测试",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-007",
+      "requirement_id": "REQ-007",
+      "acceptance_id": "AC-007",
+      "setup": "在 TUI 用 /plan 或 Shift+Tab",
+      "assertion": "两种入口得到同一 SetMode 行为；Shell 不需要对称子命令",
+      "method": "同 CommandHandler 的集成测试",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-008",
+      "requirement_id": "REQ-008",
+      "acceptance_id": "AC-008",
+      "setup": "进入 Plan 讨论范围并修改决定",
+      "assertion": "产生版本化规格，允许提问，未批准实施不修改产品源码",
+      "method": "交互脚本检查写集只含 docs/spec",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-009",
+      "requirement_id": "REQ-009",
+      "acceptance_id": "AC-009",
+      "setup": "选择 Build 或 Auto 后提交目标",
+      "assertion": "Build 遵守既定规格；Auto 可补规划；缺必需规格均不越过 readiness",
+      "method": "模式状态迁移测试",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-010",
+      "requirement_id": "REQ-010",
+      "acceptance_id": "AC-010",
+      "setup": "多个 Agent 执行任务",
+      "assertion": "统一活动、团队摘要、输入框和 statusline；状态由事件投影产生",
+      "method": "Ratatui TestBackend 与真实 PTY 快照",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-011",
+      "requirement_id": "REQ-011",
+      "acceptance_id": "AC-011",
+      "setup": "窄屏与宽屏切换并选择一个角色",
+      "assertion": "窄屏单列/标签，宽屏可分屏；完整会话按需进入，不强制三滚动窗",
+      "method": "80/120/180列 resize 测试",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-012",
+      "requirement_id": "REQ-012",
+      "acceptance_id": "AC-012",
+      "setup": "打开 Task/Tool/Diff/Test/Evidence 块",
+      "assertion": "展开、复制、搜索、全屏、返回保留滚动锚点；键盘与鼠标可达",
+      "method": "交互序列与大日志延迟测试",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-013",
+      "requirement_id": "REQ-013",
+      "acceptance_id": "AC-013",
+      "setup": "按 Project/Iteration/Agent 筛选",
+      "assertion": "可定位需求、issue、decision、commit 与证据，重放后相同",
+      "method": "断线重放与过滤测试",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-014",
+      "requirement_id": "REQ-014",
+      "acceptance_id": "AC-014",
+      "setup": "收到验收、回归、预算事件",
+      "assertion": "显示 n/m accepted、open/reopened issues；未知成本/上下文显示未知且指明 Agent",
+      "method": "快照数据与计算断言",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-015",
+      "requirement_id": "REQ-015",
+      "acceptance_id": "AC-015",
+      "setup": "输入中文/emoji/多行粘贴并走 SSH/tmux",
+      "assertion": "按显示列宽处理；粘贴不误发送；异常退出恢复 raw/alternate screen",
+      "method": "PTY Unicode、resize、panic teardown",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-016",
+      "requirement_id": "REQ-016",
+      "acceptance_id": "AC-016",
+      "setup": "关闭鼠标/颜色并自定义键位",
+      "assertion": "所有重要操作可键盘执行；不只靠颜色；有冲突检测与恢复默认",
+      "method": "no-color与按键冲突用例",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-017",
+      "requirement_id": "REQ-017",
+      "acceptance_id": "AC-017",
+      "setup": "发送 Ask/Steer/Change/Control 和 @role",
+      "assertion": "Ask 不改任务；steer 有生效边界；CR 改规格；控制可独立于模型执行",
+      "method": "持久化输入队列测试",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-018",
+      "requirement_id": "REQ-018",
+      "acceptance_id": "AC-018",
+      "setup": "初始化或修改角色配置",
+      "assertion": "默认职位绑定正确；角色不等于固定进程；用户可修改模型/职责/回退",
+      "method": "角色配置 schema 与调用断言",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-019",
+      "requirement_id": "REQ-019",
+      "acceptance_id": "AC-019",
+      "setup": "运行中将 Commander 从 Codex 换 Pi",
+      "assertion": "旧 epoch 指令失效；checkpoint 交接含 goal/spec/decisions/issues；原任务不重复",
+      "method": "交接竞态和 stale decision 测试",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-020",
+      "requirement_id": "REQ-020",
+      "acceptance_id": "AC-020",
+      "setup": "某角色首选 Agent 不可用",
+      "assertion": "只使用满足能力的已授权 fallback；独立 QA 不降成开发者自签；否则 BLOCKED",
+      "method": "缺模型/工具/角色场景",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-021",
+      "requirement_id": "REQ-021",
+      "acceptance_id": "AC-021",
+      "setup": "出现阻塞、严重QA失败或停滞",
+      "assertion": "触发带证据的决策；普通token不逐条唤醒；可查监督延迟与决定",
+      "method": "事件聚合、去抖、优先级测试",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-022",
+      "requirement_id": "REQ-022",
+      "acceptance_id": "AC-022",
+      "setup": "Developer 提交候选并交 QA/Review",
+      "assertion": "HCP 消息持久化、去重、收据与完成分开，交接包带版本",
+      "method": "重复/乱序/丢应答/版本错误测试",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-023",
+      "requirement_id": "REQ-023",
+      "acceptance_id": "AC-023",
+      "setup": "开发者请求研究或出现架构争议",
+      "assertion": "局部咨询不绕过全局任务账本；重大决定升级 Commander；讨论有轮数上限",
+      "method": "wait-for环与讨论预算测试",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-024",
+      "requirement_id": "REQ-024",
+      "acceptance_id": "AC-024",
+      "setup": "初始化 Codex App Server",
+      "assertion": "握手、thread/turn/item、终结、取消可复原；exec作为能力降级而非静默等价",
+      "method": "录制样例+真实CLI smoke",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-025",
+      "requirement_id": "REQ-025",
+      "acceptance_id": "AC-025",
+      "setup": "以 stream-json 非交互调用 Claude",
+      "assertion": "独立捕获 stdout/stderr、result/session；有界取消；配置实际可用flags",
+      "method": "录制样例+真实CLI smoke",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-026",
+      "requirement_id": "REQ-026",
+      "acceptance_id": "AC-026",
+      "setup": "Pi RPC prompt/handled/重试/压缩",
+      "assertion": "严格 LF 分帧；完成按实际协议 settled/disposition；持久会话可恢复",
+      "method": "录制样例+真实CLI smoke",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-027",
+      "requirement_id": "REQ-027",
+      "acceptance_id": "AC-027",
+      "setup": "安装不同版本 Agent",
+      "assertion": "从版本/帮助/Schema探测能力；未知event保存；不支持能力明确降级",
+      "method": "老版本/新字段/超大帧测试",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-028",
+      "requirement_id": "REQ-028",
+      "acceptance_id": "AC-028",
+      "setup": "打开有代码测试文档的旧仓库",
+      "assertion": "建立基线，保留脏文件，不重写架构、不强制初始化远程",
+      "method": "Brownfield含未提交修改测试",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-029",
+      "requirement_id": "REQ-029",
+      "acceptance_id": "AC-029",
+      "setup": "创建 lite/standard/full项目规格",
+      "assertion": "产品/需求/功能/UX/架构/开发/测试/验收/部署/使用规范齐全；按规模选用",
+      "method": "所有模板可实例化且无必填残缺",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-030",
+      "requirement_id": "REQ-030",
+      "acceptance_id": "AC-030",
+      "setup": "模糊目标进入规划",
+      "assertion": "记录用户/范围/非目标/决策/开放问题；必要不确定性不伪造用户答案",
+      "method": "互动与无人值守分支测试",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-031",
+      "requirement_id": "REQ-031",
+      "acceptance_id": "AC-031",
+      "setup": "任务准备开始实施",
+      "assertion": "必要 AC 可观察、依赖可达、关键决定确定；仅阻断当前受影响范围",
+      "method": "缺AC/循环依赖/非阻塞未知测试",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-032",
+      "requirement_id": "REQ-032",
+      "acceptance_id": "AC-032",
+      "setup": "需求关联实现和测试",
+      "assertion": "REQ→TASK→candidate→TEST→EVIDENCE→acceptance 可双向查找",
+      "method": "断链与孤立验收检测",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-033",
+      "requirement_id": "REQ-033",
+      "acceptance_id": "AC-033",
+      "setup": "用户新增/修改已验收功能",
+      "assertion": "生成 CR、revision、影响闭包；受影响验收过期，不静默沿用旧PASS",
+      "method": "修改需求后门禁拒绝旧证据",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-034",
+      "requirement_id": "REQ-034",
+      "acceptance_id": "AC-034",
+      "setup": "用户编辑 Git 中规格",
+      "assertion": "文件是语义事实源，DB是索引/状态；冲突可检测；生成页不产生第二权威源",
+      "method": "并发编辑与哈希冲突测试",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-035",
+      "requirement_id": "REQ-035",
+      "acceptance_id": "AC-035",
+      "setup": "Commander 发布计划/派发提议",
+      "assertion": "Runtime校验依赖、epoch、预算、角色和前置版本后执行；拒绝非法迁移",
+      "method": "模型输出非法转移测试",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-036",
+      "requirement_id": "REQ-036",
+      "acceptance_id": "AC-036",
+      "setup": "run跨阶段执行",
+      "assertion": "Run/Task/Attempt/Session独立标识；每次迁移原子提交事件与投递意图",
+      "method": "每个事务边界crash-injection",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-037",
+      "requirement_id": "REQ-037",
+      "acceptance_id": "AC-037",
+      "setup": "开发完成candidate后并发QA/Review",
+      "assertion": "同工作区只一个写者；读验证绑定相同candidate；不边修边验",
+      "method": "写租约、同SHA并行barrier测试",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-038",
+      "requirement_id": "REQ-038",
+      "acceptance_id": "AC-038",
+      "setup": "多个ready任务及严重回归",
+      "assertion": "依赖优先、硬故障优先、老化防饥饿；同输入同策略有稳定排序",
+      "method": "拓扑/预算/优先级属性测试",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-039",
+      "requirement_id": "REQ-039",
+      "acceptance_id": "AC-039",
+      "setup": "跨会话或跨角色交接",
+      "assertion": "四层上下文有预算和引用；不全量复制；关键goal/spec/AC永不被裁掉",
+      "method": "上下文装箱与污染检查",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-040",
+      "requirement_id": "REQ-040",
+      "acceptance_id": "AC-040",
+      "setup": "连续无净进展或修复循环",
+      "assertion": "按问题指纹/状态变化而非commit计数诊断，升级/研究/改计划",
+      "method": "重复修复和只改文档案例",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-041",
+      "requirement_id": "REQ-041",
+      "acceptance_id": "AC-041",
+      "setup": "进程kill/断网/VM重启",
+      "assertion": "先reconcile再重试；unknown side effect不盲重放；stale lease被fence",
+      "method": "lost ACK/kill -9/reboot测试",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-042",
+      "requirement_id": "REQ-042",
+      "acceptance_id": "AC-042",
+      "setup": "资源不足/服务429/超时",
+      "assertion": "有界退避、持久next_retry；未知价格不假算；不足时INCOMPLETE/BLOCKED",
+      "method": "时钟驱动与重启不清预算测试",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-043",
+      "requirement_id": "REQ-043",
+      "acceptance_id": "AC-043",
+      "setup": "暂停、取消、detach",
+      "assertion": "pause在边界生效；cancel终止进程树并留工作；detach仅断客户端",
+      "method": "TTY HUP/SIGTERM/进程树测试",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-044",
+      "requirement_id": "REQ-044",
+      "acceptance_id": "AC-044",
+      "setup": "候选严重回归或用户目录有变更",
+      "assertion": "保存失败分支，回到已验证基线；不reset用户未提交改动",
+      "method": "Git worktree与hash验证",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-045",
+      "requirement_id": "REQ-045",
+      "acceptance_id": "AC-045",
+      "setup": "修改role/project/task/evidence来源",
+      "assertion": "合成并记录版本/内容hash；高层覆盖不改变事实证据；过长报错",
+      "method": "冲突、预算和missing variable测试",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-046",
+      "requirement_id": "REQ-046",
+      "acceptance_id": "AC-046",
+      "setup": "进入需求/实现/TDD/QA/review/release",
+      "assertion": "内置可用无需用户手装；只加载相关技能；原生Skill不可用时内容注入",
+      "method": "无外部skill安装的端到端测试",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-047",
+      "requirement_id": "REQ-047",
+      "acceptance_id": "AC-047",
+      "setup": "用户覆盖Prompt/Skill/模板后升级",
+      "assertion": "内置/global/project/run按序；显示diff；运行锁定旧版本直到checkpoint",
+      "method": "覆盖与升级迁移测试",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-048",
+      "requirement_id": "REQ-048",
+      "acceptance_id": "AC-048",
+      "setup": "长Pi会话压缩",
+      "assertion": "使用指定作者插件，保留任务/证据引用；自动压缩后继续；长期记忆不双开",
+      "method": "真实插件压缩+恢复测试",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-049",
+      "requirement_id": "REQ-049",
+      "acceptance_id": "AC-049",
+      "setup": "Pi学习经验与下轮召回",
+      "assertion": "经验标记来源/项目/失效条件；关键验收不靠召回；并发维护可恢复",
+      "method": "失败经验、跨项目隔离、锁冲突",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-050",
+      "requirement_id": "REQ-050",
+      "acceptance_id": "AC-050",
+      "setup": "Pi把任务拆成子todo并压缩恢复",
+      "assertion": "保持会话todo；可映射展示；todo完成不代表全局任务验收",
+      "method": "reload/compact/新会话作用域",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-051",
+      "requirement_id": "REQ-051",
+      "acceptance_id": "AC-051",
+      "setup": "干净环境自动准备默认插件组合",
+      "assertion": "解析固定版本、校验依赖、无手动Skill安装；不支持RPC UI有明确降级",
+      "method": "无UI/双compact hook/安装失败测试",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-052",
+      "requirement_id": "REQ-052",
+      "acceptance_id": "AC-052",
+      "setup": "提交实现并运行检查",
+      "assertion": "commit/tree/spec/env/测试计划摘要绑定；测试前后源变更则INVALID",
+      "method": "QA误写候选使验证失效",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-053",
+      "requirement_id": "REQ-053",
+      "acceptance_id": "AC-053",
+      "setup": "开发者自称完成但存在需求缺口",
+      "assertion": "QA从AC出发黑白盒验证；FAILED/UNKNOWN不可变PASS",
+      "method": "刻意漏功能fixture",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-054",
+      "requirement_id": "REQ-054",
+      "acceptance_id": "AC-054",
+      "setup": "审查正在候选的代码",
+      "assertion": "与Commander/Developer不同session；证据绑定candidate；审查意见可追踪",
+      "method": "审查旧SHA/角色冲突测试",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-055",
+      "requirement_id": "REQ-055",
+      "acceptance_id": "AC-055",
+      "setup": "修复一处导致旧功能失败或重试才过",
+      "assertion": "打开regression issue；保留所有attempt；flaky不被覆盖成纯PASS",
+      "method": "回归植入与重试证据测试",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-056",
+      "requirement_id": "REQ-056",
+      "acceptance_id": "AC-056",
+      "setup": "请求COMPLETED或合并发布",
+      "assertion": "所有required需求与检查有同版本有效证据；空集合、skip、mock不能冒充真实",
+      "method": "negative release-gate测试",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-057",
+      "requirement_id": "REQ-057",
+      "acceptance_id": "AC-057",
+      "setup": "目标为CLI/Web或服务",
+      "assertion": "执行PTY/浏览器/安装/升级/回滚实际流程；不是截图看起来不错就通过",
+      "method": "fresh VM部署验收",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-058",
+      "requirement_id": "REQ-058",
+      "acceptance_id": "AC-058",
+      "setup": "hoh web启动并连接现有run",
+      "assertion": "同一Engine，不启动第二任务循环；可查看规格/团队/时间线/证据",
+      "method": "浏览器与TUI同状态测试",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-059",
+      "requirement_id": "REQ-059",
+      "acceptance_id": "AC-059",
+      "setup": "SSE断线重连带cursor",
+      "assertion": "序号去重、replay/live交接无遗漏；过期cursor走snapshot resync",
+      "method": "disconnect/history retention测试",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-060",
+      "requirement_id": "REQ-060",
+      "acceptance_id": "AC-060",
+      "setup": "TUI/Web同时改模式/规格",
+      "assertion": "expected_revision校验；冲突明确；只有一写者，可读多个客户端",
+      "method": "并发409与重试幂等测试",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-061",
+      "requirement_id": "REQ-061",
+      "acceptance_id": "AC-061",
+      "setup": "键盘浏览/小视口/SSH端口转发",
+      "assertion": "核心功能可用；默认loopback；没有桌面环境也可访问",
+      "method": "Playwright功能+可达性",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-062",
+      "requirement_id": "REQ-062",
+      "acceptance_id": "AC-062",
+      "setup": "SQLite WAL写入事件/任务/outbox",
+      "assertion": "单写actor、FK、事务、合理busy_timeout；不把DB置于网络盘",
+      "method": "SQL约束/重复投递测试",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-063",
+      "requirement_id": "REQ-063",
+      "acceptance_id": "AC-063",
+      "setup": "活跃WAL备份、升级、回滚",
+      "assertion": "一致性备份并校验；新旧schema兼容策略；旧binary不读高版本DB",
+      "method": "backup API restore与migration roundtrip",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-064",
+      "requirement_id": "REQ-064",
+      "acceptance_id": "AC-064",
+      "setup": "百万event与大日志积累",
+      "assertion": "结构化索引+对象文件；分页虚拟列表；日志轮换；引用证据不被清理",
+      "method": "百万事件/磁盘满/慢客户端测试",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-065",
+      "requirement_id": "REQ-065",
+      "acceptance_id": "AC-065",
+      "setup": "本地或有GitHub remote",
+      "assertion": "分支候选、PR/CI可选；merge后重新绑定最终SHA；无remote本地release可验收",
+      "method": "rebase/change-base/无remote用例",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-066",
+      "requirement_id": "REQ-066",
+      "acceptance_id": "AC-066",
+      "setup": "干净Ubuntu安装产物",
+      "assertion": "二进制、内置资源、Web资产版本一致；安装配置命令经实跑",
+      "method": "全新VM安装和卸载保留数据",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-067",
+      "requirement_id": "REQ-067",
+      "acceptance_id": "AC-067",
+      "setup": "72小时受控运行含真实Agent轮次",
+      "assertion": "无未处理崩溃/重复写；服务暂不可用可恢复；至少20个有证据的真实工程轮次",
+      "method": "72h soak + crash/recovery 留原始时间证据",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-068",
+      "requirement_id": "REQ-068",
+      "acceptance_id": "AC-068",
+      "setup": "参考4vCPU/8GiB VM离线回放",
+      "assertion": "idle core RSS≤150MiB(不含Agents/浏览器)，TUI输入p95≤100ms，事件可见p95≤500ms",
+      "method": "至少1000次样本与机器配置",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-069",
+      "requirement_id": "REQ-069",
+      "acceptance_id": "AC-069",
+      "setup": "执行完整验收和最终汇总",
+      "assertion": "明确哪些测试真实、模拟、跳过；未通过绝不称生产完成",
+      "method": "交付报告与原始记录一致性审计",
+      "status": "NOT_RUN"
+    },
+    {
+      "id": "TEST-070",
+      "requirement_id": "REQ-070",
+      "acceptance_id": "AC-070",
+      "setup": "变更Adapter/Prompt/调度策略",
+      "assertion": "锁版本+固定回归任务；每次变更跑对照；不在活跃run自动升级",
+      "method": "升级迁移及基线比较",
+      "status": "NOT_RUN"
+    }
+  ]
+}

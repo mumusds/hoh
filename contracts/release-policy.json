@@ -1,0 +1,39 @@
+{
+  "schema_version": "1.0",
+  "baseline_id": "HOH-BASELINE-1.0",
+  "required_checks": [
+    "build",
+    "static",
+    "unit",
+    "integration",
+    "adapter-live",
+    "tui-pty",
+    "web-e2e",
+    "plugin-live",
+    "recovery",
+    "deployment",
+    "soak",
+    "independent-qa",
+    "independent-review",
+    "traceability"
+  ],
+  "required_modes": {
+    "adapter-live": "live",
+    "plugin-live": "live",
+    "soak": "live"
+  },
+  "minimum_soak_seconds": 259200,
+  "minimum_live_iterations": 20,
+  "required_zero_issue_severities": [
+    "critical",
+    "high"
+  ],
+  "required_sources": [
+    "implementation",
+    "test_execution",
+    "qa",
+    "reviewer"
+  ],
+  "result_policy": "FAIL_CLOSED",
+  "allow_skipped_required": false
+}

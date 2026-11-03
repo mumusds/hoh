@@ -1,0 +1,79 @@
+{
+  "schema_version": "1.0",
+  "at": "2026-10-12T19:37:16.511741+00:00",
+  "system": "Linux-6.18.44-x86_64-with-glibc2.41",
+  "python": "3.13.5",
+  "non_root": false,
+  "probes": {
+    "git": {
+      "available": true,
+      "path": "/usr/bin/git",
+      "exit_code": 0,
+      "text": "git version 2.47.3"
+    },
+    "node": {
+      "available": true,
+      "path": "/opt/nvm/versions/node/v22.16.0/bin/node",
+      "exit_code": 0,
+      "text": "v22.16.0",
+      "supported": false
+    },
+    "npm": {
+      "available": true,
+      "path": "/opt/nvm/versions/node/v22.16.0/bin/npm",
+      "exit_code": 0,
+      "text": "10.9.2"
+    },
+    "cargo": {
+      "available": false,
+      "error": "NOT_INSTALLED"
+    },
+    "rustc": {
+      "available": false,
+      "error": "NOT_INSTALLED"
+    },
+    "codex": {
+      "available": false,
+      "error": "NOT_INSTALLED"
+    },
+    "claude": {
+      "available": false,
+      "error": "NOT_INSTALLED"
+    },
+    "pi": {
+      "available": false,
+      "error": "NOT_INSTALLED"
+    },
+    "codex_capabilities": {
+      "available": false,
+      "error": "NOT_INSTALLED",
+      "missing_flags": [
+        "--json",
+        "--dangerously-bypass-approvals-and-sandbox"
+      ]
+    },
+    "claude_capabilities": {
+      "available": false,
+      "error": "NOT_INSTALLED",
+      "missing_flags": [
+        "--output-format",
+        "--verbose",
+        "--dangerously-skip-permissions"
+      ]
+    },
+    "pi_capabilities": {
+      "available": false,
+      "error": "NOT_INSTALLED",
+      "missing_flags": [
+        "--mode",
+        "--session-dir"
+      ]
+    }
+  },
+  "authentication": "NOT_CHECKED",
+  "live_integration": "NOT_RUN",
+  "product_acceptance": false,
+  "plugin_installation_records": {},
+  "plugin_runtime_compatibility": "NOT_VERIFIED_BY_PREFLIGHT",
+  "ready_for_native_smoke": false
+}

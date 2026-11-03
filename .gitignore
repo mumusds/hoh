@@ -1,0 +1,11 @@
+.hoh/
+.hoh-dev/
+target/
+web/node_modules/
+web/dist/
+__pycache__/
+*.pyc
+.venv/
+.env
+.env.*
+!.env.example

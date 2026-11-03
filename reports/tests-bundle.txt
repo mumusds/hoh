@@ -1,0 +1,24 @@
+test_bootstrap_agent_entries (test_bundle.BundleContracts.test_bootstrap_agent_entries) ... ok
+test_live_auth_does_not_block_offline_core (test_bundle.BundleContracts.test_live_auth_does_not_block_offline_core) ... ok
+test_missing_manifest_fails_closed (test_bundle.BundleContracts.test_missing_manifest_fails_closed) ... ok
+test_original_skills_available (test_bundle.BundleContracts.test_original_skills_available) ... ok
+test_product_check_does_not_accept_empty_product (test_bundle.BundleContracts.test_product_check_does_not_accept_empty_product) ... ok
+test_protocol_examples (test_bundle.BundleContracts.test_protocol_examples) ... ok
+test_protocol_rejects_extra_field (test_bundle.BundleContracts.test_protocol_rejects_extra_field) ... ok
+test_total_release_scope (test_bundle.BundleContracts.test_total_release_scope) ... ok
+test_whole_bundle (test_bundle.BundleContracts.test_whole_bundle) ... ok
+test_bootstrap_dry_no_writes (test_bundle.SetupAndLedger.test_bootstrap_dry_no_writes) ... ok
+test_bootstrap_requires_yolo_ack (test_bundle.SetupAndLedger.test_bootstrap_requires_yolo_ack) ... ok
+test_ledger_dependency_reject (test_bundle.SetupAndLedger.test_ledger_dependency_reject) ... ok
+test_ledger_done_needs_note (test_bundle.SetupAndLedger.test_ledger_done_needs_note) ... ok
+test_ledger_progress_and_dependencies (test_bundle.SetupAndLedger.test_ledger_progress_and_dependencies) ... ok
+test_offline_setup_idempotent (test_bundle.SetupAndLedger.test_offline_setup_idempotent) ... ok
+test_plugin_plan_is_dry (test_bundle.SetupAndLedger.test_plugin_plan_is_dry) ... ok
+test_start_headless_dry (test_bundle.SetupAndLedger.test_start_headless_dry) ... ok
+test_start_interactive_dry (test_bundle.SetupAndLedger.test_start_interactive_dry) ... ok
+test_unknown_bootstrap_option (test_bundle.SetupAndLedger.test_unknown_bootstrap_option) ... ok
+
+----------------------------------------------------------------------
+Ran 19 tests in 10.307s
+
+OK

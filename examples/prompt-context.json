@@ -1,0 +1,6 @@
+{
+  "GOAL": "实现HoH的当前最小可验证增量",
+  "PROJECT_CONTEXT": "CONTRACT.md; docs/04-architecture.md",
+  "TASK_CONTEXT": "contracts/development-tasks.json 中当前ready task",
+  "EVIDENCE_CONTEXT": "读取实际进度和最近QA记录；尚无运行证据则明确为空"
+}

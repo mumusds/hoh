@@ -1,0 +1,17 @@
+{
+  "schema_version": "1.0",
+  "scope": "BUNDLE_AND_MOCK_ONLY",
+  "started_at": "2026-10-12T19:34:08.111621+00:00",
+  "finished_at": "2026-10-12T19:34:08.116834+00:00",
+  "duration_seconds": 0.005208058999869536,
+  "tests_run": 23,
+  "failures": [],
+  "errors": [],
+  "skipped": [],
+  "status": "PASS",
+  "python": "3.13.5",
+  "platform": "Linux-6.18.44-x86_64-with-glibc2.41",
+  "product_accepted": false,
+  "live_agent_invocations": 0,
+  "notes": "Synthetic gate fixtures are only generated under temporary test repositories; they are not product acceptance evidence."
+}

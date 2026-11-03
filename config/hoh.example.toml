@@ -1,0 +1,38 @@
+# HoH product configuration design. Native CLI configs are separate.
+config_version = "1.0"
+[project]
+default_mode = "AUTO"
+document_profile = "full"
+[execution]
+profile = "yolo-vm"
+writer_slots = 1
+reader_slots = 2
+reserve_supervisor_slot = true
+[team.commander]
+agent = "codex"
+[team.cto]
+agent = "claude"
+[team.developer]
+agent = "claude"
+[team.qa]
+agent = "pi"
+[team.researcher]
+agent = "pi"
+[team.reviewer]
+agent = "codex"
+independent_session = true
+[supervision]
+policy = "balanced"
+[budget]
+max_duration_hours = 120
+max_iterations = 100
+max_local_repairs = 3
+max_protocol_repairs = 2
+# No fabricated USD default. Optional user limit is evaluated only with known prices.
+[ui]
+view = "workspace"
+statusline = "standard"
+mouse = true
+[web]
+host = "127.0.0.1"
+port = 8787

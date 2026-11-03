@@ -1,0 +1,32 @@
+{
+  "scope": "BUNDLE_AND_MOCK_ONLY",
+  "status": "PASS",
+  "groups": [
+    {
+      "group": "bundle",
+      "exit_code": 0
+    },
+    {
+      "group": "gate",
+      "exit_code": 0
+    },
+    {
+      "group": "reference",
+      "exit_code": 0
+    },
+    {
+      "group": "sql",
+      "exit_code": 0
+    },
+    {
+      "group": "tools",
+      "exit_code": 0
+    }
+  ],
+  "tests_run": 128,
+  "failures": 0,
+  "errors": 0,
+  "skipped": 0,
+  "product_accepted": false,
+  "live_agent_invocations": 0
+}

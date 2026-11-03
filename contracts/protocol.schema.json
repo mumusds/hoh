@@ -1,0 +1,703 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:hoh:protocol:1.0",
+  "title": "HoH Collaboration Protocol (HCP), not ACP",
+  "$defs": {
+    "ArtifactRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      }
+    },
+    "Candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "git_commit": {
+          "type": "string",
+          "pattern": "^([a-f0-9]{40}|[a-f0-9]{64})$"
+        },
+        "git_tree": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "spec_sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "environment_sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "test_plan_sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      },
+      "required": [
+        "id",
+        "git_commit",
+        "git_tree",
+        "spec_sha256",
+        "environment_sha256",
+        "test_plan_sha256"
+      ]
+    },
+    "ContextHandoff": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": "1.0"
+        },
+        "run_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "task_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "goal": {
+          "type": "string",
+          "minLength": 1
+        },
+        "role": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "role_epoch": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "spec_sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "candidate": {
+          "$ref": "#/$defs/Candidate"
+        },
+        "acceptance_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 160
+          }
+        },
+        "references": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ArtifactRef"
+          }
+        },
+        "output_contract": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "budget_tokens": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "schema_version",
+        "run_id",
+        "task_id",
+        "goal",
+        "role",
+        "role_epoch",
+        "spec_sha256",
+        "candidate",
+        "acceptance_ids",
+        "references",
+        "output_contract",
+        "budget_tokens"
+      ]
+    },
+    "Message": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": "1.0"
+        },
+        "message_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "run_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "task_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "attempt_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "sender_role": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "recipient_role": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "role_epoch": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "correlation_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "causation_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "idempotency_key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "expected_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "spec_sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "candidate_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "enum": [
+            "dispatch",
+            "query",
+            "handoff",
+            "result",
+            "decision",
+            "steer",
+            "cancel",
+            "ack",
+            "rejected"
+          ]
+        },
+        "payload": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "schema_version",
+        "message_id",
+        "run_id",
+        "task_id",
+        "attempt_id",
+        "sender_role",
+        "recipient_role",
+        "role_epoch",
+        "correlation_id",
+        "causation_id",
+        "idempotency_key",
+        "expected_revision",
+        "spec_sha256",
+        "candidate_id",
+        "kind",
+        "payload"
+      ]
+    },
+    "Event": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": "1.0"
+        },
+        "project_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "event_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "run_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "attempt_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "kind": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "payload": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "schema_version",
+        "project_id",
+        "seq",
+        "event_id",
+        "run_id",
+        "attempt_id",
+        "at",
+        "kind",
+        "payload"
+      ]
+    },
+    "Command": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": "1.0"
+        },
+        "command_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "idempotency_key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "expected_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "kind": {
+          "enum": [
+            "StartRun",
+            "SetMode",
+            "SendInput",
+            "ConfigureTeam",
+            "ProposeSpecChange",
+            "PauseRun",
+            "ResumeRun",
+            "CancelRun"
+          ]
+        },
+        "run_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "payload": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "schema_version",
+        "command_id",
+        "idempotency_key",
+        "expected_revision",
+        "kind",
+        "run_id",
+        "payload"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "StartRun"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "goal": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "mode": {
+                    "enum": [
+                      "PLAN",
+                      "BUILD",
+                      "AUTO"
+                    ]
+                  },
+                  "interactive": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "goal",
+                  "mode",
+                  "interactive"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "SetMode"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "mode": {
+                    "enum": [
+                      "PLAN",
+                      "BUILD",
+                      "AUTO"
+                    ]
+                  }
+                },
+                "required": [
+                  "mode"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "SendInput"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "text": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "target_role": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "input_kind": {
+                    "enum": [
+                      "ASK",
+                      "STEER",
+                      "CHANGE",
+                      "CONTROL"
+                    ]
+                  }
+                },
+                "required": [
+                  "text",
+                  "target_role",
+                  "input_kind"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "ConfigureTeam"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "bindings": {
+                    "type": "object",
+                    "minProperties": 1
+                  },
+                  "apply_at": {
+                    "const": "checkpoint"
+                  }
+                },
+                "required": [
+                  "bindings",
+                  "apply_at"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "ProposeSpecChange"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "reason": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "spec_sha256": {
+                    "type": "string",
+                    "pattern": "^[a-f0-9]{64}$"
+                  }
+                },
+                "required": [
+                  "reason",
+                  "spec_sha256"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "PauseRun"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "reason": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "reason"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "ResumeRun"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "reason": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "reason"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "CancelRun"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "reason": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "reason"
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "TaskResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": "1.0"
+        },
+        "run_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "task_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "attempt_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "role": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "role_epoch": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "status": {
+          "enum": [
+            "COMPLETED",
+            "FAILED",
+            "BLOCKED",
+            "INCOMPLETE"
+          ]
+        },
+        "summary": {
+          "type": "string"
+        },
+        "candidate_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ArtifactRef"
+          }
+        },
+        "issues": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "next_action": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_version",
+        "run_id",
+        "task_id",
+        "attempt_id",
+        "role",
+        "role_epoch",
+        "status",
+        "summary",
+        "candidate_id",
+        "evidence",
+        "issues",
+        "next_action"
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/Message"
+    },
+    {
+      "$ref": "#/$defs/ContextHandoff"
+    },
+    {
+      "$ref": "#/$defs/Event"
+    },
+    {
+      "$ref": "#/$defs/Command"
+    },
+    {
+      "$ref": "#/$defs/TaskResult"
+    }
+  ]
+}

@@ -1,0 +1,92 @@
+{
+  "schema_version": "1.0",
+  "checked_at": "2026-10-12T19:37:14.300016+00:00",
+  "scope": "DEVELOPMENT_KIT_NOT_PRODUCT",
+  "checks": [
+    {
+      "check": "规范、链接、Schema、需求与资源映射",
+      "status": "PASS",
+      "evidence": "tools/validate_bundle.py",
+      "note": "实际运行，70REQ/AC、24任务、12Skill、16模板、6Schema"
+    },
+    {
+      "check": "完整包级/模拟测试",
+      "status": "PASS",
+      "evidence": "reports/audit-summary.json",
+      "note": "128项；0失败、0错误、0跳过；包含真实子进程启动但Agent为mock"
+    },
+    {
+      "check": "证据门禁正负例",
+      "status": "PASS",
+      "evidence": "reports/tests-gate.json",
+      "note": "42项；正例为临时合成清单，仅验证门禁逻辑"
+    },
+    {
+      "check": "SQLite事务/去重/租约/备份",
+      "status": "PASS",
+      "evidence": "reports/tests-sql.json",
+      "note": "实际SQLite执行，不等于完整Rust Host已实现"
+    },
+    {
+      "check": "单次Agent桥/超时/日志/候选",
+      "status": "PASS",
+      "evidence": "reports/tests-tools.json",
+      "note": "33项；包括作用域信封、stdout/stderr和源文件修改拒绝"
+    },
+    {
+      "check": "bootstrap dry-run和离线幂等准备",
+      "status": "PASS",
+      "evidence": "reports/tests-bundle.json",
+      "note": "未下载依赖，未调用模型"
+    },
+    {
+      "check": "GitHub远程CI",
+      "status": "NOT_RUN",
+      "evidence": ".github/workflows/bundle-ci.yml",
+      "note": "只提供配置；没有远程仓库执行结果"
+    },
+    {
+      "check": "完整联网安装",
+      "status": "BLOCKED_ENV",
+      "evidence": "reports/container-network.json",
+      "note": "当前容器DNS不可用；没有声称npm/rustup/原生CLI安装成功"
+    },
+    {
+      "check": "Rust产品编译与运行",
+      "status": "NOT_RUN",
+      "evidence": "reports/environment-preflight.json",
+      "note": "此包为设计/启动工具，产品源代码未实现，当前无Rust工具链"
+    },
+    {
+      "check": "真实Codex/Claude/Pi联调",
+      "status": "NOT_RUN",
+      "evidence": "reports/environment-preflight.json",
+      "note": "当前无三CLI/模型账户；必须在目标VM完成"
+    },
+    {
+      "check": "三Pi插件共同长期运行",
+      "status": "NOT_RUN",
+      "evidence": "config/plugins.json",
+      "note": "包名/职责有源码依据，兼容性不能用README替代实测"
+    },
+    {
+      "check": "产品TUI/浏览器E2E",
+      "status": "NOT_RUN",
+      "evidence": "docs/09-testing.md",
+      "note": "未实现的产品不能声称运行通过"
+    },
+    {
+      "check": "72小时与20轮真实工程验收",
+      "status": "NOT_RUN",
+      "evidence": "contracts/release-policy.json",
+      "note": "严格保留为最终必需门槛；未伪造长时间运行"
+    },
+    {
+      "check": "最终ZIP解压复测",
+      "status": "COMPANION_REPORT",
+      "evidence": "HoH_Archive_Verification.json",
+      "note": "封包后在独立解压目录执行，结果随压缩包另附；不回写改变已校验ZIP"
+    }
+  ],
+  "product_accepted": false
+}

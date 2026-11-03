@@ -1,0 +1,16 @@
+test_atomic_state_event_rollback (test_sql.SQLContract.test_atomic_state_event_rollback) ... ok
+test_command_idempotency_key (test_sql.SQLContract.test_command_idempotency_key) ... ok
+test_foreign_key (test_sql.SQLContract.test_foreign_key) ... ok
+test_integrity (test_sql.SQLContract.test_integrity) ... ok
+test_invalid_json (test_sql.SQLContract.test_invalid_json) ... ok
+test_invalid_state (test_sql.SQLContract.test_invalid_state) ... ok
+test_outbox_receipt_deduplication (test_sql.SQLContract.test_outbox_receipt_deduplication) ... ok
+test_revision_cas (test_sql.SQLContract.test_revision_cas) ... ok
+test_single_writer_lease (test_sql.SQLContract.test_single_writer_lease) ... ok
+test_sqlite_online_backup (test_sql.SQLContract.test_sqlite_online_backup) ... ok
+test_wal_local_database (test_sql.SQLContract.test_wal_local_database) ... ok
+
+----------------------------------------------------------------------
+Ran 11 tests in 0.023s
+
+OK

@@ -1,0 +1,156 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "record_type": {
+      "const": "command_execution"
+    },
+    "record_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160
+    },
+    "check_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160
+    },
+    "candidate_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160
+    },
+    "spec_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "mode": {
+      "enum": [
+        "mock",
+        "live",
+        "product",
+        "bundle"
+      ]
+    },
+    "command": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string"
+      }
+    },
+    "cwd": {
+      "type": "string"
+    },
+    "started_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "finished_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "duration_seconds": {
+      "type": "number",
+      "minimum": 0
+    },
+    "exit_code": {
+      "type": "integer"
+    },
+    "timed_out": {
+      "type": "boolean"
+    },
+    "stdout": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      }
+    },
+    "stderr": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      }
+    },
+    "candidate_manifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      }
+    },
+    "source_unchanged": {
+      "type": "boolean"
+    },
+    "environment_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "test_plan_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    }
+  },
+  "required": [
+    "schema_version",
+    "record_type",
+    "record_id",
+    "check_id",
+    "candidate_id",
+    "spec_sha256",
+    "mode",
+    "command",
+    "cwd",
+    "started_at",
+    "finished_at",
+    "duration_seconds",
+    "exit_code",
+    "timed_out",
+    "stdout",
+    "stderr",
+    "candidate_manifest",
+    "source_unchanged",
+    "environment_sha256",
+    "test_plan_sha256"
+  ],
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:hoh:execution:1.0"
+}

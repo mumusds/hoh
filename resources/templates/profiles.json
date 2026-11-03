@@ -1,0 +1,39 @@
+{
+  "schema_version": "1.0",
+  "profiles": {
+    "lite": [
+      "feature",
+      "test-plan",
+      "acceptance"
+    ],
+    "standard": [
+      "prd",
+      "feature",
+      "ux",
+      "architecture",
+      "development-plan",
+      "test-plan",
+      "acceptance",
+      "adr"
+    ],
+    "full": [
+      "product-definition",
+      "prd",
+      "feature",
+      "ux",
+      "architecture",
+      "api-data",
+      "development-plan",
+      "test-plan",
+      "acceptance",
+      "deployment",
+      "user-guide",
+      "adr",
+      "contributing",
+      "changelog",
+      "change-request",
+      "milestone-report"
+    ]
+  },
+  "entry_pattern": "resources/templates/{id}.md"
+}

@@ -1,0 +1,30 @@
+{
+  "schema_version": "1.0",
+  "native_pi_package": "@earendil-works/pi-coding-agent",
+  "plugins": [
+    {
+      "id": "smart-compact",
+      "package": "pi-smart-compact",
+      "source": "https://github.com/alpertarhan/pi-smart-compact",
+      "purpose": "context-continuity",
+      "install_by_default": true,
+      "configuration_policy": "Resolve installed-version settings; disable optional cross-session memory if Hermes owns it. Do not invent keys."
+    },
+    {
+      "id": "hermes-memory",
+      "package": "pi-hermes-memory",
+      "source": "https://github.com/chandra447/pi-hermes-memory",
+      "purpose": "long-term-memory",
+      "install_by_default": true,
+      "configuration_policy": "Project-scoped facts; policy-only does not replace hard context; verify concurrency and compact hooks."
+    },
+    {
+      "id": "todo",
+      "package": "@juicesharp/rpiv-todo",
+      "source": "https://github.com/juicesharp/rpiv-mono",
+      "purpose": "pi-local-tasks",
+      "install_by_default": true,
+      "configuration_policy": "Do not install whole rpiv workflow; no global-state authority."
+    }
+  ]
+}

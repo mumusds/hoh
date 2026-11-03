@@ -1,0 +1,20 @@
+{
+  "schema_version": "1.0",
+  "message_id": "msg-example",
+  "run_id": "run-example",
+  "task_id": "task-example",
+  "attempt_id": "attempt-example",
+  "sender_role": "commander",
+  "recipient_role": "developer",
+  "role_epoch": 1,
+  "correlation_id": "corr-example",
+  "causation_id": null,
+  "idempotency_key": "dispatch-task-example-v1",
+  "expected_revision": 3,
+  "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "candidate_id": null,
+  "kind": "dispatch",
+  "payload": {
+    "objective": "完成一个可验证增量"
+  }
+}

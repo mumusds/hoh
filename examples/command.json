@@ -1,0 +1,11 @@
+{
+  "schema_version": "1.0",
+  "command_id": "cmd-example",
+  "idempotency_key": "mode-example",
+  "expected_revision": 0,
+  "kind": "SetMode",
+  "run_id": "run-example",
+  "payload": {
+    "mode": "PLAN"
+  }
+}

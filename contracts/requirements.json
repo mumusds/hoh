@@ -1,0 +1,1337 @@
+{
+  "schema_version": "1.0",
+  "baseline_id": "HOH-BASELINE-1.0",
+  "note": "这些是待实现需求，不是测试结果。全部required_release=true。",
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "category": "CLI",
+      "priority": "P0",
+      "milestone": "M1",
+      "title": "默认交互入口",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-001",
+          "given": "在有 TTY 的目录执行 hoh",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "进入 Workspace，保留输入历史与工程状态，不新增任务直到用户提交意图",
+          "test_id": "TEST-001"
+        }
+      ],
+      "verification": "PTY 启动、退出、恢复终端属性",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-002",
+      "category": "CLI",
+      "priority": "P0",
+      "milestone": "M1",
+      "title": "非交互入口",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-002",
+          "given": "执行 hoh -p 和明确目标",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "只执行这一输入，stdin 无人值守不弹问卷；缺关键决策进入 BLOCKED",
+          "test_id": "TEST-002"
+        }
+      ],
+      "verification": "子进程 stdin 关闭下跑 mock project",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-003",
+      "category": "CLI",
+      "priority": "P0",
+      "milestone": "M1",
+      "title": "极简命令面",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-003",
+          "given": "查看 --help 与所有子命令",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "只有 attach/web/doctor 加内置 help；plan/mode/run 子命令返回 usage error",
+          "test_id": "TEST-003"
+        }
+      ],
+      "verification": "CLI help golden snapshot",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-004",
+      "category": "CLI",
+      "priority": "P0",
+      "milestone": "M1",
+      "title": "标准输出契约",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-004",
+          "given": "选择 text/json/stream-json",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "stdout 仅对应结果；stderr 诊断；stream-json 每条含序号且以 LF 分帧",
+          "test_id": "TEST-004"
+        }
+      ],
+      "verification": "并行 stderr 噪声与 Unicode 解析测试",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-005",
+      "category": "CLI",
+      "priority": "P0",
+      "milestone": "M2",
+      "title": "脱离与附着",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-005",
+          "given": "hoh -p --detach 后退出 Shell，再 attach run_id",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "后台运行不受客户端关闭影响；同 Run 不重复派发",
+          "test_id": "TEST-005"
+        }
+      ],
+      "verification": "PTY HUP 与重连测试",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-006",
+      "category": "CLI",
+      "priority": "P0",
+      "milestone": "M1",
+      "title": "环境诊断",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-006",
+          "given": "运行 hoh doctor",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "逐项输出 installed/protocol/auth_check/unknown；不读取打印密钥，不将版本探测当认证成功",
+          "test_id": "TEST-006"
+        }
+      ],
+      "verification": "缺工具、错误版本、缺认证表驱动测试",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-007",
+      "category": "UX",
+      "priority": "P0",
+      "milestone": "M3",
+      "title": "Slash 与统一操作",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-007",
+          "given": "在 TUI 用 /plan 或 Shift+Tab",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "两种入口得到同一 SetMode 行为；Shell 不需要对称子命令",
+          "test_id": "TEST-007"
+        }
+      ],
+      "verification": "同 CommandHandler 的集成测试",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-008",
+      "category": "UX",
+      "priority": "P0",
+      "milestone": "M3",
+      "title": "Plan 互动与文档",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-008",
+          "given": "进入 Plan 讨论范围并修改决定",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "产生版本化规格，允许提问，未批准实施不修改产品源码",
+          "test_id": "TEST-008"
+        }
+      ],
+      "verification": "交互脚本检查写集只含 docs/spec",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-009",
+      "category": "UX",
+      "priority": "P0",
+      "milestone": "M3",
+      "title": "Build 与 Auto",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-009",
+          "given": "选择 Build 或 Auto 后提交目标",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "Build 遵守既定规格；Auto 可补规划；缺必需规格均不越过 readiness",
+          "test_id": "TEST-009"
+        }
+      ],
+      "verification": "模式状态迁移测试",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-010",
+      "category": "UX",
+      "priority": "P1",
+      "milestone": "M4",
+      "title": "Workspace 工作台",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-010",
+          "given": "多个 Agent 执行任务",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "统一活动、团队摘要、输入框和 statusline；状态由事件投影产生",
+          "test_id": "TEST-010"
+        }
+      ],
+      "verification": "Ratatui TestBackend 与真实 PTY 快照",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-011",
+      "category": "UX",
+      "priority": "P1",
+      "milestone": "M4",
+      "title": "Team/Focus 布局",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-011",
+          "given": "窄屏与宽屏切换并选择一个角色",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "窄屏单列/标签，宽屏可分屏；完整会话按需进入，不强制三滚动窗",
+          "test_id": "TEST-011"
+        }
+      ],
+      "verification": "80/120/180列 resize 测试",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-012",
+      "category": "UX",
+      "priority": "P1",
+      "milestone": "M4",
+      "title": "可展开内容块",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-012",
+          "given": "打开 Task/Tool/Diff/Test/Evidence 块",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "展开、复制、搜索、全屏、返回保留滚动锚点；键盘与鼠标可达",
+          "test_id": "TEST-012"
+        }
+      ],
+      "verification": "交互序列与大日志延迟测试",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-013",
+      "category": "UX",
+      "priority": "P1",
+      "milestone": "M4",
+      "title": "三级时间线",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-013",
+          "given": "按 Project/Iteration/Agent 筛选",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "可定位需求、issue、decision、commit 与证据，重放后相同",
+          "test_id": "TEST-013"
+        }
+      ],
+      "verification": "断线重放与过滤测试",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-014",
+      "category": "UX",
+      "priority": "P1",
+      "milestone": "M4",
+      "title": "真实进度状态栏",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-014",
+          "given": "收到验收、回归、预算事件",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "显示 n/m accepted、open/reopened issues；未知成本/上下文显示未知且指明 Agent",
+          "test_id": "TEST-014"
+        }
+      ],
+      "verification": "快照数据与计算断言",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-015",
+      "category": "UX",
+      "priority": "P1",
+      "milestone": "M4",
+      "title": "输入与终端兼容",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-015",
+          "given": "输入中文/emoji/多行粘贴并走 SSH/tmux",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "按显示列宽处理；粘贴不误发送；异常退出恢复 raw/alternate screen",
+          "test_id": "TEST-015"
+        }
+      ],
+      "verification": "PTY Unicode、resize、panic teardown",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-016",
+      "category": "UX",
+      "priority": "P1",
+      "milestone": "M4",
+      "title": "无障碍与键位",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-016",
+          "given": "关闭鼠标/颜色并自定义键位",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "所有重要操作可键盘执行；不只靠颜色；有冲突检测与恢复默认",
+          "test_id": "TEST-016"
+        }
+      ],
+      "verification": "no-color与按键冲突用例",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-017",
+      "category": "UX",
+      "priority": "P0",
+      "milestone": "M3",
+      "title": "运行中对话",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-017",
+          "given": "发送 Ask/Steer/Change/Control 和 @role",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "Ask 不改任务；steer 有生效边界；CR 改规格；控制可独立于模型执行",
+          "test_id": "TEST-017"
+        }
+      ],
+      "verification": "持久化输入队列测试",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-018",
+      "category": "TEAM",
+      "priority": "P0",
+      "milestone": "M2",
+      "title": "默认与自定义团队",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-018",
+          "given": "初始化或修改角色配置",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "默认职位绑定正确；角色不等于固定进程；用户可修改模型/职责/回退",
+          "test_id": "TEST-018"
+        }
+      ],
+      "verification": "角色配置 schema 与调用断言",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-019",
+      "category": "TEAM",
+      "priority": "P0",
+      "milestone": "M2",
+      "title": "角色交接",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-019",
+          "given": "运行中将 Commander 从 Codex 换 Pi",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "旧 epoch 指令失效；checkpoint 交接含 goal/spec/decisions/issues；原任务不重复",
+          "test_id": "TEST-019"
+        }
+      ],
+      "verification": "交接竞态和 stale decision 测试",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-020",
+      "category": "TEAM",
+      "priority": "P0",
+      "milestone": "M2",
+      "title": "能力匹配与缺员",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-020",
+          "given": "某角色首选 Agent 不可用",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "只使用满足能力的已授权 fallback；独立 QA 不降成开发者自签；否则 BLOCKED",
+          "test_id": "TEST-020"
+        }
+      ],
+      "verification": "缺模型/工具/角色场景",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-021",
+      "category": "TEAM",
+      "priority": "P0",
+      "milestone": "M2",
+      "title": "Commander 监督",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-021",
+          "given": "出现阻塞、严重QA失败或停滞",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "触发带证据的决策；普通token不逐条唤醒；可查监督延迟与决定",
+          "test_id": "TEST-021"
+        }
+      ],
+      "verification": "事件聚合、去抖、优先级测试",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-022",
+      "category": "TEAM",
+      "priority": "P0",
+      "milestone": "M2",
+      "title": "通信与交接",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-022",
+          "given": "Developer 提交候选并交 QA/Review",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "HCP 消息持久化、去重、收据与完成分开，交接包带版本",
+          "test_id": "TEST-022"
+        }
+      ],
+      "verification": "重复/乱序/丢应答/版本错误测试",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-023",
+      "category": "TEAM",
+      "priority": "P0",
+      "milestone": "M3",
+      "title": "局部咨询与升级",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-023",
+          "given": "开发者请求研究或出现架构争议",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "局部咨询不绕过全局任务账本；重大决定升级 Commander；讨论有轮数上限",
+          "test_id": "TEST-023"
+        }
+      ],
+      "verification": "wait-for环与讨论预算测试",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-024",
+      "category": "ADAPTER",
+      "priority": "P0",
+      "milestone": "M1",
+      "title": "Codex 原生接口",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-024",
+          "given": "初始化 Codex App Server",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "握手、thread/turn/item、终结、取消可复原；exec作为能力降级而非静默等价",
+          "test_id": "TEST-024"
+        }
+      ],
+      "verification": "录制样例+真实CLI smoke",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-025",
+      "category": "ADAPTER",
+      "priority": "P0",
+      "milestone": "M1",
+      "title": "Claude 原生接口",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-025",
+          "given": "以 stream-json 非交互调用 Claude",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "独立捕获 stdout/stderr、result/session；有界取消；配置实际可用flags",
+          "test_id": "TEST-025"
+        }
+      ],
+      "verification": "录制样例+真实CLI smoke",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-026",
+      "category": "ADAPTER",
+      "priority": "P0",
+      "milestone": "M1",
+      "title": "Pi 原生接口",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-026",
+          "given": "Pi RPC prompt/handled/重试/压缩",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "严格 LF 分帧；完成按实际协议 settled/disposition；持久会话可恢复",
+          "test_id": "TEST-026"
+        }
+      ],
+      "verification": "录制样例+真实CLI smoke",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-027",
+      "category": "ADAPTER",
+      "priority": "P0",
+      "milestone": "M1",
+      "title": "协议版本与能力",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-027",
+          "given": "安装不同版本 Agent",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "从版本/帮助/Schema探测能力；未知event保存；不支持能力明确降级",
+          "test_id": "TEST-027"
+        }
+      ],
+      "verification": "老版本/新字段/超大帧测试",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-028",
+      "category": "SPEC",
+      "priority": "P0",
+      "milestone": "M3",
+      "title": "项目发现",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-028",
+          "given": "打开有代码测试文档的旧仓库",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "建立基线，保留脏文件，不重写架构、不强制初始化远程",
+          "test_id": "TEST-028"
+        }
+      ],
+      "verification": "Brownfield含未提交修改测试",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-029",
+      "category": "SPEC",
+      "priority": "P0",
+      "milestone": "M3",
+      "title": "内置模板",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-029",
+          "given": "创建 lite/standard/full项目规格",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "产品/需求/功能/UX/架构/开发/测试/验收/部署/使用规范齐全；按规模选用",
+          "test_id": "TEST-029"
+        }
+      ],
+      "verification": "所有模板可实例化且无必填残缺",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-030",
+      "category": "SPEC",
+      "priority": "P0",
+      "milestone": "M3",
+      "title": "规格收敛",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-030",
+          "given": "模糊目标进入规划",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "记录用户/范围/非目标/决策/开放问题；必要不确定性不伪造用户答案",
+          "test_id": "TEST-030"
+        }
+      ],
+      "verification": "互动与无人值守分支测试",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-031",
+      "category": "SPEC",
+      "priority": "P0",
+      "milestone": "M3",
+      "title": "Readiness Gate",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-031",
+          "given": "任务准备开始实施",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "必要 AC 可观察、依赖可达、关键决定确定；仅阻断当前受影响范围",
+          "test_id": "TEST-031"
+        }
+      ],
+      "verification": "缺AC/循环依赖/非阻塞未知测试",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-032",
+      "category": "SPEC",
+      "priority": "P0",
+      "milestone": "M3",
+      "title": "需求追踪",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-032",
+          "given": "需求关联实现和测试",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "REQ→TASK→candidate→TEST→EVIDENCE→acceptance 可双向查找",
+          "test_id": "TEST-032"
+        }
+      ],
+      "verification": "断链与孤立验收检测",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-033",
+      "category": "SPEC",
+      "priority": "P0",
+      "milestone": "M3",
+      "title": "规格变更",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-033",
+          "given": "用户新增/修改已验收功能",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "生成 CR、revision、影响闭包；受影响验收过期，不静默沿用旧PASS",
+          "test_id": "TEST-033"
+        }
+      ],
+      "verification": "修改需求后门禁拒绝旧证据",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-034",
+      "category": "SPEC",
+      "priority": "P0",
+      "milestone": "M3",
+      "title": "文档事实源",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-034",
+          "given": "用户编辑 Git 中规格",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "文件是语义事实源，DB是索引/状态；冲突可检测；生成页不产生第二权威源",
+          "test_id": "TEST-034"
+        }
+      ],
+      "verification": "并发编辑与哈希冲突测试",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-035",
+      "category": "WORK",
+      "priority": "P0",
+      "milestone": "M2",
+      "title": "双层编排",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-035",
+          "given": "Commander 发布计划/派发提议",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "Runtime校验依赖、epoch、预算、角色和前置版本后执行；拒绝非法迁移",
+          "test_id": "TEST-035"
+        }
+      ],
+      "verification": "模型输出非法转移测试",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-036",
+      "category": "WORK",
+      "priority": "P0",
+      "milestone": "M2",
+      "title": "持久生命周期",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-036",
+          "given": "run跨阶段执行",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "Run/Task/Attempt/Session独立标识；每次迁移原子提交事件与投递意图",
+          "test_id": "TEST-036"
+        }
+      ],
+      "verification": "每个事务边界crash-injection",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-037",
+      "category": "WORK",
+      "priority": "P0",
+      "milestone": "M2",
+      "title": "单写者与并行验证",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-037",
+          "given": "开发完成candidate后并发QA/Review",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "同工作区只一个写者；读验证绑定相同candidate；不边修边验",
+          "test_id": "TEST-037"
+        }
+      ],
+      "verification": "写租约、同SHA并行barrier测试",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-038",
+      "category": "WORK",
+      "priority": "P0",
+      "milestone": "M2",
+      "title": "任务DAG调度",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-038",
+          "given": "多个ready任务及严重回归",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "依赖优先、硬故障优先、老化防饥饿；同输入同策略有稳定排序",
+          "test_id": "TEST-038"
+        }
+      ],
+      "verification": "拓扑/预算/优先级属性测试",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-039",
+      "category": "WORK",
+      "priority": "P0",
+      "milestone": "M2",
+      "title": "上下文渐进披露",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-039",
+          "given": "跨会话或跨角色交接",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "四层上下文有预算和引用；不全量复制；关键goal/spec/AC永不被裁掉",
+          "test_id": "TEST-039"
+        }
+      ],
+      "verification": "上下文装箱与污染检查",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-040",
+      "category": "WORK",
+      "priority": "P0",
+      "milestone": "M3",
+      "title": "停滞与诊断",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-040",
+          "given": "连续无净进展或修复循环",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "按问题指纹/状态变化而非commit计数诊断，升级/研究/改计划",
+          "test_id": "TEST-040"
+        }
+      ],
+      "verification": "重复修复和只改文档案例",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-041",
+      "category": "WORK",
+      "priority": "P0",
+      "milestone": "M2",
+      "title": "恢复与幂等",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-041",
+          "given": "进程kill/断网/VM重启",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "先reconcile再重试；unknown side effect不盲重放；stale lease被fence",
+          "test_id": "TEST-041"
+        }
+      ],
+      "verification": "lost ACK/kill -9/reboot测试",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-042",
+      "category": "WORK",
+      "priority": "P0",
+      "milestone": "M2",
+      "title": "预算与等待",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-042",
+          "given": "资源不足/服务429/超时",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "有界退避、持久next_retry；未知价格不假算；不足时INCOMPLETE/BLOCKED",
+          "test_id": "TEST-042"
+        }
+      ],
+      "verification": "时钟驱动与重启不清预算测试",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-043",
+      "category": "WORK",
+      "priority": "P0",
+      "milestone": "M2",
+      "title": "暂停取消分离",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-043",
+          "given": "暂停、取消、detach",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "pause在边界生效；cancel终止进程树并留工作；detach仅断客户端",
+          "test_id": "TEST-043"
+        }
+      ],
+      "verification": "TTY HUP/SIGTERM/进程树测试",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-044",
+      "category": "WORK",
+      "priority": "P1",
+      "milestone": "M5",
+      "title": "可恢复版本",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-044",
+          "given": "候选严重回归或用户目录有变更",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "保存失败分支，回到已验证基线；不reset用户未提交改动",
+          "test_id": "TEST-044"
+        }
+      ],
+      "verification": "Git worktree与hash验证",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-045",
+      "category": "PROMPT",
+      "priority": "P0",
+      "milestone": "M3",
+      "title": "四层Prompt版本",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-045",
+          "given": "修改role/project/task/evidence来源",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "合成并记录版本/内容hash；高层覆盖不改变事实证据；过长报错",
+          "test_id": "TEST-045"
+        }
+      ],
+      "verification": "冲突、预算和missing variable测试",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-046",
+      "category": "PROMPT",
+      "priority": "P0",
+      "milestone": "M3",
+      "title": "内置Skill",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-046",
+          "given": "进入需求/实现/TDD/QA/review/release",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "内置可用无需用户手装；只加载相关技能；原生Skill不可用时内容注入",
+          "test_id": "TEST-046"
+        }
+      ],
+      "verification": "无外部skill安装的端到端测试",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-047",
+      "category": "PROMPT",
+      "priority": "P0",
+      "milestone": "M3",
+      "title": "自定义与升级",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-047",
+          "given": "用户覆盖Prompt/Skill/模板后升级",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "内置/global/project/run按序；显示diff；运行锁定旧版本直到checkpoint",
+          "test_id": "TEST-047"
+        }
+      ],
+      "verification": "覆盖与升级迁移测试",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-048",
+      "category": "PLUGIN",
+      "priority": "P1",
+      "milestone": "M5",
+      "title": "Smart Compact集成",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-048",
+          "given": "长Pi会话压缩",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "使用指定作者插件，保留任务/证据引用；自动压缩后继续；长期记忆不双开",
+          "test_id": "TEST-048"
+        }
+      ],
+      "verification": "真实插件压缩+恢复测试",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-049",
+      "category": "PLUGIN",
+      "priority": "P1",
+      "milestone": "M5",
+      "title": "Hermes Memory集成",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-049",
+          "given": "Pi学习经验与下轮召回",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "经验标记来源/项目/失效条件；关键验收不靠召回；并发维护可恢复",
+          "test_id": "TEST-049"
+        }
+      ],
+      "verification": "失败经验、跨项目隔离、锁冲突",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-050",
+      "category": "PLUGIN",
+      "priority": "P1",
+      "milestone": "M5",
+      "title": "rpiv Todo集成",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-050",
+          "given": "Pi把任务拆成子todo并压缩恢复",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "保持会话todo；可映射展示；todo完成不代表全局任务验收",
+          "test_id": "TEST-050"
+        }
+      ],
+      "verification": "reload/compact/新会话作用域",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-051",
+      "category": "PLUGIN",
+      "priority": "P1",
+      "milestone": "M5",
+      "title": "三插件兼容与安装",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-051",
+          "given": "干净环境自动准备默认插件组合",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "解析固定版本、校验依赖、无手动Skill安装；不支持RPC UI有明确降级",
+          "test_id": "TEST-051"
+        }
+      ],
+      "verification": "无UI/双compact hook/安装失败测试",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-052",
+      "category": "VERIFY",
+      "priority": "P0",
+      "milestone": "M2",
+      "title": "冻结候选与证据",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-052",
+          "given": "提交实现并运行检查",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "commit/tree/spec/env/测试计划摘要绑定；测试前后源变更则INVALID",
+          "test_id": "TEST-052"
+        }
+      ],
+      "verification": "QA误写候选使验证失效",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-053",
+      "category": "VERIFY",
+      "priority": "P0",
+      "milestone": "M2",
+      "title": "独立QA",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-053",
+          "given": "开发者自称完成但存在需求缺口",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "QA从AC出发黑白盒验证；FAILED/UNKNOWN不可变PASS",
+          "test_id": "TEST-053"
+        }
+      ],
+      "verification": "刻意漏功能fixture",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-054",
+      "category": "VERIFY",
+      "priority": "P0",
+      "milestone": "M2",
+      "title": "独立Review",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-054",
+          "given": "审查正在候选的代码",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "与Commander/Developer不同session；证据绑定candidate；审查意见可追踪",
+          "test_id": "TEST-054"
+        }
+      ],
+      "verification": "审查旧SHA/角色冲突测试",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-055",
+      "category": "VERIFY",
+      "priority": "P1",
+      "milestone": "M5",
+      "title": "回归与Flaky",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-055",
+          "given": "修复一处导致旧功能失败或重试才过",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "打开regression issue；保留所有attempt；flaky不被覆盖成纯PASS",
+          "test_id": "TEST-055"
+        }
+      ],
+      "verification": "回归植入与重试证据测试",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-056",
+      "category": "VERIFY",
+      "priority": "P1",
+      "milestone": "M5",
+      "title": "最终发布门禁",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-056",
+          "given": "请求COMPLETED或合并发布",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "所有required需求与检查有同版本有效证据；空集合、skip、mock不能冒充真实",
+          "test_id": "TEST-056"
+        }
+      ],
+      "verification": "negative release-gate测试",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-057",
+      "category": "VERIFY",
+      "priority": "P1",
+      "milestone": "M5",
+      "title": "运行时UX与部署验证",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-057",
+          "given": "目标为CLI/Web或服务",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "执行PTY/浏览器/安装/升级/回滚实际流程；不是截图看起来不错就通过",
+          "test_id": "TEST-057"
+        }
+      ],
+      "verification": "fresh VM部署验收",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-058",
+      "category": "WEB",
+      "priority": "P1",
+      "milestone": "M6",
+      "title": "Web GUI入口",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-058",
+          "given": "hoh web启动并连接现有run",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "同一Engine，不启动第二任务循环；可查看规格/团队/时间线/证据",
+          "test_id": "TEST-058"
+        }
+      ],
+      "verification": "浏览器与TUI同状态测试",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-059",
+      "category": "WEB",
+      "priority": "P1",
+      "milestone": "M6",
+      "title": "事件重连",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-059",
+          "given": "SSE断线重连带cursor",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "序号去重、replay/live交接无遗漏；过期cursor走snapshot resync",
+          "test_id": "TEST-059"
+        }
+      ],
+      "verification": "disconnect/history retention测试",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-060",
+      "category": "WEB",
+      "priority": "P1",
+      "milestone": "M6",
+      "title": "多客户端操作",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-060",
+          "given": "TUI/Web同时改模式/规格",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "expected_revision校验；冲突明确；只有一写者，可读多个客户端",
+          "test_id": "TEST-060"
+        }
+      ],
+      "verification": "并发409与重试幂等测试",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-061",
+      "category": "WEB",
+      "priority": "P1",
+      "milestone": "M6",
+      "title": "无障碍和远程体验",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-061",
+          "given": "键盘浏览/小视口/SSH端口转发",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "核心功能可用；默认loopback；没有桌面环境也可访问",
+          "test_id": "TEST-061"
+        }
+      ],
+      "verification": "Playwright功能+可达性",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-062",
+      "category": "DATA",
+      "priority": "P0",
+      "milestone": "M2",
+      "title": "持久化一致性",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-062",
+          "given": "SQLite WAL写入事件/任务/outbox",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "单写actor、FK、事务、合理busy_timeout；不把DB置于网络盘",
+          "test_id": "TEST-062"
+        }
+      ],
+      "verification": "SQL约束/重复投递测试",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-063",
+      "category": "DATA",
+      "priority": "P1",
+      "milestone": "M5",
+      "title": "备份与迁移",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-063",
+          "given": "活跃WAL备份、升级、回滚",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "一致性备份并校验；新旧schema兼容策略；旧binary不读高版本DB",
+          "test_id": "TEST-063"
+        }
+      ],
+      "verification": "backup API restore与migration roundtrip",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-064",
+      "category": "DATA",
+      "priority": "P1",
+      "milestone": "M4",
+      "title": "可观测性与容量",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-064",
+          "given": "百万event与大日志积累",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "结构化索引+对象文件；分页虚拟列表；日志轮换；引用证据不被清理",
+          "test_id": "TEST-064"
+        }
+      ],
+      "verification": "百万事件/磁盘满/慢客户端测试",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-065",
+      "category": "RELEASE",
+      "priority": "P1",
+      "milestone": "M6",
+      "title": "Git集成与交付",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-065",
+          "given": "本地或有GitHub remote",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "分支候选、PR/CI可选；merge后重新绑定最终SHA；无remote本地release可验收",
+          "test_id": "TEST-065"
+        }
+      ],
+      "verification": "rebase/change-base/无remote用例",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-066",
+      "category": "RELEASE",
+      "priority": "P1",
+      "milestone": "M6",
+      "title": "安装使用文档",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-066",
+          "given": "干净Ubuntu安装产物",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "二进制、内置资源、Web资产版本一致；安装配置命令经实跑",
+          "test_id": "TEST-066"
+        }
+      ],
+      "verification": "全新VM安装和卸载保留数据",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-067",
+      "category": "NFR",
+      "priority": "P1",
+      "milestone": "M7",
+      "title": "跨天稳定性",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-067",
+          "given": "72小时受控运行含真实Agent轮次",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "无未处理崩溃/重复写；服务暂不可用可恢复；至少20个有证据的真实工程轮次",
+          "test_id": "TEST-067"
+        }
+      ],
+      "verification": "72h soak + crash/recovery 留原始时间证据",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-068",
+      "category": "NFR",
+      "priority": "P1",
+      "milestone": "M7",
+      "title": "性能预算",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-068",
+          "given": "参考4vCPU/8GiB VM离线回放",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "idle core RSS≤150MiB(不含Agents/浏览器)，TUI输入p95≤100ms，事件可见p95≤500ms",
+          "test_id": "TEST-068"
+        }
+      ],
+      "verification": "至少1000次样本与机器配置",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-069",
+      "category": "NFR",
+      "priority": "P1",
+      "milestone": "M7",
+      "title": "交付真实性",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-069",
+          "given": "执行完整验收和最终汇总",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "明确哪些测试真实、模拟、跳过；未通过绝不称生产完成",
+          "test_id": "TEST-069"
+        }
+      ],
+      "verification": "交付报告与原始记录一致性审计",
+      "implementation_status": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "REQ-070",
+      "category": "NFR",
+      "priority": "P1",
+      "milestone": "M7",
+      "title": "长期维护与升级",
+      "required_release": true,
+      "acceptance": [
+        {
+          "id": "AC-070",
+          "given": "变更Adapter/Prompt/调度策略",
+          "when": "按该功能规范操作并记录事件、版本及外部效果",
+          "then": "锁版本+固定回归任务；每次变更跑对照；不在活跃run自动升级",
+          "test_id": "TEST-070"
+        }
+      ],
+      "verification": "升级迁移及基线比较",
+      "implementation_status": "NOT_IMPLEMENTED"
+    }
+  ]
+}
