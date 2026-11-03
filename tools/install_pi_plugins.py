@@ -8,7 +8,8 @@ is recorded as DEGRADED with its error; other plugins and bootstrap continue.
 Exit code 3 means at least one plugin is DEGRADED.
 """
 from __future__ import annotations
-import argparse, shutil, subprocess, sys
+import argparse, json, shutil, subprocess, sys
+from pathlib import Path
 from common import ROOT,atomic_json,flag_supported,load_json,utcnow
 
 def installed_integrity(package:str)->str|None:
@@ -18,11 +19,47 @@ def installed_integrity(package:str)->str|None:
     entry=load_json(lock).get('packages',{}).get(f'node_modules/{package}',{})
     return entry.get('integrity')
 
+def npm_spec(source:str)->tuple[str,str|None]|None:
+    """('name', 'version' or None) for an `npm:name[@version]` package source, else None."""
+    if not source.startswith('npm:'):return None
+    spec=source[4:];at=spec.rfind('@')
+    return (spec[:at],spec[at+1:]) if at>0 else (spec,None)
+
+def verify_installed(project:Path)->dict:
+    """Check the project packages Pi would load from <project>/.pi/npm (M0R3-05). Each one that is installed must
+    match the version in .pi/settings.json and the integrity tools/install_pi_plugins.py pinned in the plugin lock.
+    A configured package that is not installed is only `absent`: started with PI_OFFLINE=1, Pi skips it instead of
+    installing it outside this guard (plugins are degradable). Non-npm sources cannot be verified."""
+    result={'verified':[],'absent':[],'problems':[]};settings=project/'.pi/settings.json'
+    if not settings.is_file():return result
+    lock_path=project/'.hoh-dev/plugin-lock.json';npm_lock=project/'.pi/npm/package-lock.json'
+    pinned={e.get('package'):e for e in (load_json(lock_path).get('plugins',{}).values() if lock_path.is_file() else [])}
+    installed=load_json(npm_lock).get('packages',{}) if npm_lock.is_file() else {}
+    for item in load_json(settings).get('packages',[]):
+        source=item if isinstance(item,str) else item.get('source','') if isinstance(item,dict) else ''
+        spec=npm_spec(source)
+        if spec is None:result['problems'].append(f'{source or item!r}: not an npm source; its integrity cannot be verified');continue
+        name,version=spec
+        if not (project/'.pi/npm/node_modules'/name).exists():result['absent'].append(name);continue
+        entry=installed.get(f'node_modules/{name}',{});lock=pinned.get(name)
+        if lock is None or lock.get('state')!='INSTALLED':result['problems'].append(f'{name}: installed but the plugin lock has no INSTALLED entry');continue
+        if entry.get('version')!=(version or lock.get('version')) or lock.get('version')!=entry.get('version'):
+            result['problems'].append(f'{name}: installed version {entry.get("version")} differs from settings {version} or lock {lock.get("version")}');continue
+        if not entry.get('integrity') or entry.get('integrity')!=lock.get('integrity'):
+            result['problems'].append(f'{name}: installed integrity {entry.get("integrity")} differs from the pinned {lock.get("integrity")}');continue
+        result['verified'].append(name)
+    return result
+
 def run(cmd:list[str],timeout:int)->str:
     return subprocess.run(cmd,cwd=ROOT,capture_output=True,text=True,timeout=timeout,check=True).stdout.strip()
 
 def main(argv=None):
-    p=argparse.ArgumentParser(description=__doc__,formatter_class=argparse.RawDescriptionHelpFormatter);p.add_argument('--dry-run',action='store_true');a=p.parse_args(argv)
+    p=argparse.ArgumentParser(description=__doc__,formatter_class=argparse.RawDescriptionHelpFormatter);p.add_argument('--dry-run',action='store_true')
+    p.add_argument('--verify',action='store_true',help='only check that installed project packages match the lock (exit 1 if not)');a=p.parse_args(argv)
+    if a.verify:
+        r=verify_installed(ROOT);print(json.dumps(r,indent=2))
+        for problem in r['problems']:print('unverified Pi package: '+problem,file=sys.stderr)
+        return 1 if r['problems'] else 0
     conf=load_json(ROOT/'config/plugins.json');lock_path=ROOT/'.hoh-dev/plugin-lock.json'
     lock=load_json(lock_path) if lock_path.exists() else {'schema_version':'1.1','plugins':{}}
     if a.dry_run:

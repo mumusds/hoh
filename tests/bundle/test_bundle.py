@@ -54,6 +54,22 @@ class BundleContracts(unittest.TestCase):
                 (root/'tests/check-plan.json').write_text(json.dumps(plan))
                 r=validate_bundle.validate(root)
                 with self.subTest(argv=argv):self.assertTrue(any(message in e for e in r['errors']),r['errors'])
+    def test_plan_command_guard_handles_operands(self):
+        # M0R3-04: env's '-' form, options with separate or attached operands and --eval= bypassed the guard.
+        from validate_bundle import plan_command_problem as problem
+        for argv,message in [(['env','-','true'],'always-succeeding'),(['env','-i','true'],'always-succeeding'),
+                             (['env','--ignore-environment','X=1','true'],'always-succeeding'),(['env','-','bash','-c','exit 0'],'inline code'),
+                             (['bash','-o','errexit','-c','exit 0'],'inline code'),(['bash','+o','posix','-c','true'],'inline code'),
+                             (['bash','-O','extglob','-c','true'],'inline code'),(['python3','-W','ignore','-c','pass'],'inline code'),
+                             (['python3','-X','dev','-c','pass'],'inline code'),(['python3','-Wignore','-c','pass'],'inline code'),
+                             (['node','--eval=0'],'inline code'),(['node','--print=1'],'inline code'),(['node','-r','x','-e','0'],'inline code'),
+                             (['node','--require','x','--eval','0'],'inline code')]:
+            with self.subTest(argv=argv):self.assertIn(message,problem(argv) or '')
+        # Committed scripts stay allowed, also behind options whose values contain the inline letters.
+        for argv in [['bash','scripts/product/check.sh','unit'],['bash','-o','pipefail','scripts/x.sh','-c'],['env','-','PATH=/usr/bin','bash','scripts/x.sh'],
+                     ['python3','-W','default::DeprecationWarning','tools/x.py'],['python3','-Wdefault::DeprecationWarning','tools/x.py','-c'],
+                     ['python3','-m','unittest','discover'],['node','-r','./setup.js','scripts/x.mjs'],['node','--input-type=module','scripts/x.mjs']]:
+            with self.subTest(argv=argv):self.assertIsNone(problem(argv))
     def test_compat_manifest_schema_matches_ac_027_01(self):
         # CR3R-04: the schema forbade the field names AC-027-01 required.
         import validate_bundle
@@ -132,6 +148,13 @@ class SetupAndLedger(unittest.TestCase):
         p=self.shell('start.sh','--headless','--dry-run');self.assertEqual(p.returncode,0,p.stderr);self.assertEqual(json.loads(p.stdout)['argv'][0],'claude')
     def test_start_refuses_nested_top_level(self):
         p=self.shell('start.sh','--dry-run',env={'HOH_BOOTSTRAP_PARENT':'outer'});self.assertEqual(p.returncode,78)
+    def test_start_pi_offline_with_verified_packages(self):
+        # M0R3-05: the interactive Pi launch runs offline and refuses unverified project packages.
+        (self.root/'.pi').mkdir();(self.root/'.pi/settings.json').write_text(json.dumps({'packages':['npm:pi-demo@1.0.0']}))
+        p=self.shell('start.sh','pi','--dry-run');self.assertEqual(p.returncode,0,p.stderr);self.assertIn('PI_OFFLINE=1',p.stdout)
+        (self.root/'.pi/npm/node_modules/pi-demo').mkdir(parents=True)
+        (self.root/'.pi/npm/package-lock.json').write_text(json.dumps({'packages':{'node_modules/pi-demo':{'version':'1.0.0','integrity':'sha512-TAMPERED'}}}))
+        p=self.shell('start.sh','pi','--dry-run');self.assertEqual(p.returncode,78);self.assertIn('pi-demo',p.stderr)
     def test_start_headless_dry(self):
         p=self.shell('start.sh','pi','--headless','--dry-run');self.assertEqual(p.returncode,0,p.stderr);self.assertTrue(json.loads(p.stdout)['dry_run'])
     def test_plugin_plan_is_dry(self):

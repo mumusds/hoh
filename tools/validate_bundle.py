@@ -18,15 +18,21 @@ SHELLS={'bash','sh','dash','zsh','ksh'}
 
 ENV_OPTIONS_WITH_ARG={'-u','--unset','-C','--chdir'}
 INLINE_LETTERS={'shell':'c','python':'c','node':'ep','perl':'eE','ruby':'e'}
+INLINE_LONG={'--eval','--print','--command'}
+# Short options whose value is the rest of the cluster or the next argument (M0R3-04: `bash -o errexit -c`,
+# `python3 -W ignore -c`); long options that take a separate value; options after which the rest is not ours.
+OPERAND_LETTERS={'shell':'oO','python':'WX','node':'rC','perl':'IMmx','ruby':'IrCx'}
+OPERAND_LONG={'node':{'--require','--import','--loader','--experimental-loader','--conditions','--input-type','--env-file','--title'}}
+END_LETTERS={'python':'m'}
 KIND_VALUE=re.compile(r'(?<![A-Za-z0-9_])kind\s*=\s*([A-Za-z_](?:[A-Za-z0-9_\-]|\.(?=[A-Za-z0-9_]))*)')
 
 def unwrap_env(args:list[str])->list[str]|None:
     """Return the command wrapped by `env [options] [NAME=value ...]`; None for env -S/--split-string."""
     while args and Path(args[0]).name=='env':
         i=1
-        while i<len(args) and args[i].startswith('-') and args[i]!='-':
+        while i<len(args) and args[i].startswith('-'):  # includes `-`, the short form of --ignore-environment
             if args[i]=='--':i+=1;break
-            if args[i] in ('-S','--split-string') or args[i].startswith('--split-string='):return None
+            if args[i] in ('-S','--split-string') or args[i].startswith(('--split-string=','-S')):return None
             i+=2 if args[i] in ENV_OPTIONS_WITH_ARG else 1
         while i<len(args) and '=' in args[i] and not args[i].startswith('-'):i+=1
         args=args[i:]
@@ -37,6 +43,25 @@ def interpreter_kind(name:str)->str|None:
     base=name.rstrip('0123456789.')
     return 'python' if base.startswith('python') else base if base in INLINE_LETTERS else None
 
+def inline_option(kind:str,args:list[str])->str|None:
+    """The interpreter option that runs inline code, scanning options up to the first operand (the script)."""
+    i=0
+    while i<len(args):
+        a=args[i];i+=1
+        if a=='--' or not (a.startswith('-') or (kind=='shell' and a.startswith('+'))) or a in ('-','+'):return None
+        if a.startswith('--'):
+            name=a.split('=',1)[0]
+            if name in INLINE_LONG:return a
+            if '=' not in a and name in OPERAND_LONG.get(kind,()):i+=1
+            continue
+        for j,ch in enumerate(a[1:],1):
+            if ch in END_LETTERS.get(kind,''):return None  # e.g. python -m: runs an installed module
+            if a[0]=='-' and ch in INLINE_LETTERS[kind]:return a
+            if ch in OPERAND_LETTERS[kind]:
+                if j==len(a)-1:i+=1  # value is the next argument, otherwise the rest of this cluster
+                break
+    return None
+
 def plan_command_problem(argv:list[str])->str|None:
     """Checks must run committed, reviewable commands: no always-succeeding builtins, no inline code."""
     args=unwrap_env(list(argv))
@@ -45,11 +70,7 @@ def plan_command_problem(argv:list[str])->str|None:
     name=Path(args[0]).name
     if name in TRIVIAL_COMMANDS:return f'always-succeeding command {args[0]!r}'
     kind=interpreter_kind(name)
-    if kind:
-        for a in args[1:]:
-            if a in ('--eval','--print','--command') or (a.startswith('-') and not a.startswith('--') and any(ch in INLINE_LETTERS[kind] for ch in a[1:])):
-                return f'inline code via {args[0]} {a}; commit a script instead'
-            if not a.startswith('-'):break  # first operand is the script path; later args belong to the script
+    if kind and (a:=inline_option(kind,args[1:])):return f'inline code via {args[0]} {a}; commit a script instead'
     return None
 
 # The kit owns these paths. Product sources (crates/, web/, tests/ fixtures …) have their own linters,

@@ -17,7 +17,7 @@ if '--help' in args:
 if '--version' in args:print('MOCK_AGENT_VERSION');sys.exit(0)
 data=sys.stdin.buffer.read()
 if os.environ.get('FAKE_TRACE'):
- open(os.environ['FAKE_TRACE'],'w').write(json.dumps({'argv':args,'stdin':data.decode(),'env':sorted(k for k in os.environ if k.startswith(('CLAUDE','CODEX','HOH_','ANTHROPIC','AI_')))}))
+ open(os.environ['FAKE_TRACE'],'w').write(json.dumps({'argv':args,'stdin':data.decode(),'env':sorted(k for k in os.environ if k.startswith(('CLAUDE','CODEX','HOH_','ANTHROPIC','AI_'))),'pi_offline':os.environ.get('PI_OFFLINE')}))
 mode=os.getenv('FAKE_MODE','ok')
 print('mock diagnostic',file=sys.stderr)
 if mode=='exit-error':sys.exit(7)
@@ -32,6 +32,43 @@ else:
  print(json.dumps({'type':'message_end','message':{'content':'Unicode \u2028 record not separator','stopReason':'error' if mode=='semantic-error' else 'stop'}},ensure_ascii=False))
  print(json.dumps({'type':'agent_end'}))
 """
+
+def pi_project(root:Path,installed:str|None,locked:str|None,version:str='1.0.0',source:str|None=None)->None:
+    """A project whose .pi/settings.json lists pi-demo, optionally installed under .pi/npm and recorded in the plugin lock."""
+    (root/'.pi').mkdir(exist_ok=True);(root/'.pi/settings.json').write_text(json.dumps({'packages':[source or 'npm:pi-demo@1.0.0']}))
+    if installed is not None:
+        (root/'.pi/npm/node_modules/pi-demo').mkdir(parents=True,exist_ok=True)
+        (root/'.pi/npm/package-lock.json').write_text(json.dumps({'packages':{'node_modules/pi-demo':{'version':version,'integrity':installed}}}))
+    if locked is not None:
+        (root/'.hoh-dev').mkdir(exist_ok=True)
+        (root/'.hoh-dev/plugin-lock.json').write_text(json.dumps({'plugins':{'demo':{'package':'pi-demo','version':'1.0.0','integrity':locked,'state':'INSTALLED'}}}))
+
+class PiPackages(unittest.TestCase):
+    """M0R3-05: project packages Pi would load must be the installations the plugin lock verified."""
+    def setUp(self):
+        self.t=tempfile.TemporaryDirectory();self.addCleanup(self.t.cleanup);self.root=Path(self.t.name)
+    def verify(self):
+        from install_pi_plugins import verify_installed
+        return verify_installed(self.root)
+    def test_no_project_settings(self):self.assertEqual(self.verify(),{'verified':[],'absent':[],'problems':[]})
+    def test_verified_installation(self):
+        pi_project(self.root,installed='sha512-PINNED',locked='sha512-PINNED');self.assertEqual(self.verify(),{'verified':['pi-demo'],'absent':[],'problems':[]})
+    def test_absent_package_is_not_a_problem(self):
+        # With PI_OFFLINE=1 Pi skips a missing package instead of installing it; plugins are degradable.
+        pi_project(self.root,installed=None,locked=None);self.assertEqual(self.verify(),{'verified':[],'absent':['pi-demo'],'problems':[]})
+    def test_problems(self):
+        for kwargs,needle in [({'installed':'sha512-TAMPERED','locked':'sha512-PINNED'},'integrity'),({'installed':'sha512-PINNED','locked':None},'plugin lock'),
+                              ({'installed':'sha512-PINNED','locked':'sha512-PINNED','version':'2.0.0'},'version'),
+                              ({'installed':None,'locked':None,'source':'git:github.com/x/pi-demo'},'not an npm')]:
+            with self.subTest(**kwargs):
+                shutil.rmtree(self.root/'.pi',ignore_errors=True);shutil.rmtree(self.root/'.hoh-dev',ignore_errors=True)
+                pi_project(self.root,**kwargs);r=self.verify()
+                self.assertEqual(r['verified'],[]);self.assertTrue(any(needle in p for p in r['problems']),r)
+    def test_repository_packages_verified(self):
+        # The checked-in .pi/settings.json against this VM's installation (skipped where plugins are not installed).
+        from install_pi_plugins import verify_installed
+        if not (ROOT/'.pi/npm/package-lock.json').is_file():self.skipTest('Pi packages not installed here')
+        self.assertEqual(verify_installed(ROOT)['problems'],[])
 
 class NativeBridge(unittest.TestCase):
     def setUp(self):
@@ -51,6 +88,12 @@ class NativeBridge(unittest.TestCase):
         p,_=self.bridge();self.assertEqual(p.returncode,0,p.stderr);t=load_json(self.root/'trace.json');self.assertTrue(t['stdin'].startswith('[HOH_DELEGATED_TASK]'));self.assertTrue(t['stdin'].endswith(self.prompt.read_text()));self.assertEqual(t['argv'][-1],'-')
     def test_pi_json_one_shot(self):
         p,out=self.bridge(agent='pi');self.assertEqual(p.returncode,0,p.stderr);self.assertIn('--approve',load_json(out/'attempt.json')['argv'])
+        # M0R3-05: Pi starts with PI_OFFLINE=1, so it never installs configured packages outside the integrity guard.
+        self.assertEqual(load_json(self.root/'trace.json')['pi_offline'],'1');self.assertEqual(load_json(out/'attempt.json')['pi_packages']['problems'],[])
+    def test_pi_refuses_unverified_project_package(self):
+        pi_project(self.root,installed='sha512-TAMPERED',locked='sha512-PINNED')
+        p,out=self.bridge(agent='pi');self.assertEqual(p.returncode,78,p.stderr);self.assertIn('pi-demo',p.stderr);self.assertFalse(out.exists())
+        self.assertFalse((self.root/'trace.json').exists())
     def test_native_nonzero(self):
         p,out=self.bridge(mode='exit-error');self.assertEqual(p.returncode,7);self.assertEqual(load_json(out/'attempt.json')['status'],'NATIVE_FAILED')
     def test_semantic_failure_zero_exit(self):p,_=self.bridge(mode='semantic-error');self.assertNotEqual(p.returncode,0)
