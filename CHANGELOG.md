@@ -1,5 +1,15 @@
 # 变更记录
 
+## 基线 HOH-BASELINE-1.1 revision 5 — 2026-11-03（CR-004）
+
+CR-003 的独立审查（Codex 新会话）判 FAIL，发现核实后修正（[CR-004](docs/cr/CR-004-cr003-review-fixes.md)）。第 1–6 轮复审 FAIL，发现逐条修正；第 7 轮独立复审（会话 01a1a352-1737-7ba2-8881-8280dbf1287d）PASS 后，CTO 按 CR-003 D1 预授权批准 CR-004 并 relock。
+
+- compat manifest：AC-027-01/04 与场景改用 schema 的 launcher/implementation 字段，schema 增加 `transport`、`capabilities` 必填；新增 `examples/compat-manifest.json`，validate_bundle 校验两者一致。
+- 任务图：7 条 AC 改到依赖闭包已提供其所需能力的任务（host、systemd、QA/Review 派发、CLI 最终结果），另有 8 个任务补了依赖：M1-T03→M2-T02、M1-T06→M2-T01（持久化与 Attempt 状态机先于适配器与 CLI），M2-T12、M2-T04→M1-T09（其余 M2 任务继承整个 M1），M2-T13→M2-T16、M2-T03→M2-T12、M2-T07→M2-T03/M2-T04、M2-T15→M2-T18；M2-T01、M2-T02 在列表中移到 M1-T02 之后。AC 数量不变（166）。
+- 验收一致性：candidate_ready 发给 qa 与 reviewer 的验证消息统一为 kind=handoff（TEST-021-01 原断言 kind=dispatch，与 AC-021-01 冲突；另有 6 处 AC/场景的泛称 “dispatch” 写明为 kind=handoff，数量不变）；validate_bundle 要求场景断言的每个 `kind=X` 按完整取值出现在其 AC 中。另修正三处场景与 AC 的冲突：TEST-027-01 旧 codex 的 schema_sha256 为 null，TEST-042-04 的 `hoh -p` 补上目标文本，TEST-021-05 的阻塞原因按 COMMANDER_UNAVAILABLE 与 NEED_DECISION 断言。
+- 台账：writer 标记写入共享台账，计划不同的 worktree 不能各领一个写任务；没有标记的运行条目一律按写任务处理。
+- 测试基础设施：不再安装系统 openssh-server；测试用 sshd 由 `scripts/dev/extract-test-sshd.sh` 从发行版包解压到 `.hoh-dev/tools`（兼容没有 sshd-session/sshd-auth 的 OpenSSH 9.6；stdout 只输出目录；失败、中断或被强杀后不留临时文件）。系统 SSH 配置只删除旧版脚本写过的带标记 drop-in，不重启、启用任何 SSH 服务。
+
 ## 基线 HOH-BASELINE-1.1 revision 4 — 2026-11-03（CR-003）
 
 M1 开工前的三路独立审查（[docs/23](docs/23-pre-m1-audit.md)）发现会卡住无人值守开发的流程堵点、M2 规格缺口和门禁漏洞，按项目所有者“全部同意，按推荐执行”的指令修正（[CR-003](docs/cr/CR-003-unblock-autonomous-delivery.md)）：

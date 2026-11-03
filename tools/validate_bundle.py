@@ -18,6 +18,7 @@ SHELLS={'bash','sh','dash','zsh','ksh'}
 
 ENV_OPTIONS_WITH_ARG={'-u','--unset','-C','--chdir'}
 INLINE_LETTERS={'shell':'c','python':'c','node':'ep','perl':'eE','ruby':'e'}
+KIND_VALUE=re.compile(r'(?<![A-Za-z0-9_])kind\s*=\s*([A-Za-z_](?:[A-Za-z0-9_\-]|\.(?=[A-Za-z0-9_]))*)')
 
 def unwrap_env(args:list[str])->list[str]|None:
     """Return the command wrapped by `env [options] [NAME=value ...]`; None for env -S/--split-string."""
@@ -172,6 +173,13 @@ def validate(root:Path)->dict:
         check(s['acceptance_id']==a['id'] and s['requirement_id']==owner[a['id']],f'{s["id"]}: wrong AC/requirement binding')
         check(s['check_id'] in policy['checks'],f'{s["id"]}: unknown check {s["check_id"]}')
         check(bool(s.get('steps')) and bool(s.get('pass_criteria')),f'{s["id"]}: steps and pass_criteria required')
+        # A scenario may only assert kinds its AC names (CR7R-01: kind=dispatch vs kind=handoff), compared as whole
+        # identifiers such as run.result or StartRun (CR8R-04); the AC may name the value bare or as the head of a
+        # property path, e.g. "SendInput(run_id=K)" or "StartRun.payload.goal".
+        ac_text='\n'.join((a['given'],a['when'],a['then']))
+        extra=sorted(v for v in set(KIND_VALUE.findall(json.dumps(s,ensure_ascii=False)))
+                     if not re.search(r'(?<![A-Za-z0-9_.\-])'+re.escape(v)+r'(?![A-Za-z0-9_\-])',ac_text))
+        check(not extra,f'{s["id"]}: asserts '+', '.join(f'kind={k}' for k in extra)+f' that {a["id"]} does not name')
     for name,profile in policy['profiles'].items():
         check(set(profile['required_checks'])<=set(policy['checks']),f'profile {name}: unknown checks')
         for r in req:
@@ -205,6 +213,13 @@ def validate(root:Path)->dict:
     for path in ['context-handoff.json','hcp-message.json','command.json']:
         try:Draft202012Validator(proto).validate(load_json(root/'examples'/path))
         except Exception as e:errors.append(f'example {path}: {e}')
+    # CR3R-04: the compat manifest schema and AC-027-01 describe the same entry fields.
+    compat=load_json(root/'contracts/compat-manifest.schema.json')
+    try:Draft202012Validator(compat).validate(load_json(root/'examples/compat-manifest.json'))
+    except Exception as e:errors.append(f'example compat-manifest.json: {e}')
+    ac27=next((a['then'] for a in ac if a['id']=='AC-027-01'),'')
+    unnamed=[f for f in compat['$defs']['agent_entry']['required'] if not re.search(r'(?<![A-Za-z0-9_])'+re.escape(f)+r'(?![A-Za-z0-9_])',ac27)]
+    check(not unnamed,'AC-027-01 must name every required compat manifest entry field: missing '+', '.join(unnamed))
     check((root/'tests/check-plan.json').is_file() or not (root/'Cargo.toml').is_file(),'tests/check-plan.json is required once the Cargo workspace exists')
     for rel in ['examples/check-plan.json','tests/check-plan.json']:
         if not (root/rel).is_file():continue

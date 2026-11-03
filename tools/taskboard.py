@@ -4,7 +4,8 @@
 Plan: contracts/development-tasks.json. State: .hoh-dev/task-state.json of the MAIN worktree, so a
 linked worktree (for example a frozen soak checkout) shares one ledger instead of forking it.
 Rules enforced here: atomic claim with owner, legal transitions only, at most
-one running writer task (single writer), implementation/verification tasks
+one running writer task (single writer; the writer flag is recorded in the shared ledger at claim time and a
+running entry without that flag counts as a writer whatever this checkout's plan says), implementation/verification tasks
 only for requirements whose spec_maturity is "detailed" (readiness), and
 reopening a done task blocks every dependent that already started.
 """
@@ -49,9 +50,13 @@ def main(argv=None):
         fcntl.flock(lock,fcntl.LOCK_EX)
         data=load_json(statefile) if statefile.exists() else {'tasks':{},'history':[]}
         def status(i):return data['tasks'].get(i,{}).get('status','pending')
-        def record(task_id,new,note,owner=''):
-            entry={'task_id':task_id,'status':new,'owner':owner,'note':note,'at':utcnow()}
+        def record(task_id,new,note,owner='',**extra):
+            entry={'task_id':task_id,'status':new,'owner':owner,'note':note,'at':utcnow(),**extra}
             data['tasks'][task_id]=entry;data['history'].append(entry)
+        def running_writers(exclude=None):
+            # The ledger is shared by worktrees whose plans may differ, so only the flag recorded at claim time
+            # decides; an entry without it (unknown task, or claimed by an older taskboard) fails closed (CR4R-01).
+            return sorted(i for i,e in data['tasks'].items() if i!=exclude and e.get('status')=='running' and e.get('writer',True) is not False)
         def ready(t):return status(t['id'])=='pending' and all(status(d)=='done' for d in t['depends_on']) and not readiness_problems(t,maturity)
         try:
             if a.action in ('claim','set') and a.task_id not in index:raise LedgerError('unknown task_id')
@@ -63,9 +68,9 @@ def main(argv=None):
                 missing=readiness_problems(t,maturity)
                 if missing:raise LedgerError('requirements still outline (run the milestone spec task first): '+', '.join(missing))
                 if t.get('writer'):
-                    busy=[i for i in index if i!=t['id'] and index[i].get('writer') and status(i)=='running']
-                    if busy:raise LedgerError('single writer: writer task already running: '+', '.join(busy))
-                record(t['id'],'running',a.note,a.owner);atomic_json(statefile,data)
+                    busy=running_writers(exclude=t['id'])
+                    if busy:raise LedgerError('single writer: writer task already running (entries without a recorded writer flag count as writers): '+', '.join(busy))
+                record(t['id'],'running',a.note,a.owner,writer=bool(t.get('writer')));atomic_json(statefile,data)
             elif a.action=='set':
                 if not a.status:raise LedgerError('status required')
                 cur=status(a.task_id);new=a.status
@@ -80,7 +85,7 @@ def main(argv=None):
                         if status(d) in ('running','done'):record(d,'blocked',f'dependency {a.task_id} reopened: {a.note}')
                 atomic_json(statefile,data)
             elif a.action=='next':
-                writer_busy=any(index[i].get('writer') and status(i)=='running' for i in index)
+                writer_busy=bool(running_writers())
                 candidates=[t for t in source if ready(t) and not (writer_busy and t.get('writer'))]
                 print(json.dumps(candidates[0] if candidates else {'message':'No ready pending task'+(' (a writer task is running; only non-writer tasks can start)' if writer_busy else '')+'; inspect running/blocked tasks, outline requirements and actual evidence.'},ensure_ascii=False,indent=2))
             else:
