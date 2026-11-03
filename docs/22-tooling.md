@@ -12,7 +12,7 @@ Pi 插件由 `tools/install_pi_plugins.py` 安装：只要 Pi 支持就带 `--ap
 
 ## 任务台账
 
-`tools/taskboard.py list|next|claim|set`：claim 原子领取并记录 owner；同一时间只允许一个 writer 任务（`next` 在已有写任务运行时只推荐非写任务）；依赖 outline 需求的 implement/verify/release 任务不可领取；状态迁移受限，重新打开已完成任务会阻塞已开始的下游任务。台账固定在主 worktree 的 `.hoh-dev/task-state.json`，链接 worktree（例如冻结的 soak 检出）共享同一台账。任务的 `acceptance`/`checks`/`profile` 字段与归属规则见 docs/08。
+`tools/taskboard.py list|next|claim|set`：claim 原子领取并记录 owner 与 writer 标记；同一时间只允许一个 writer 任务，以台账中运行条目记录的 writer 标记为准，没有该标记的运行条目（未知任务或旧版 taskboard 写入）一律按 writer 处理（`next` 在已有写任务运行时只推荐非写任务）；依赖 outline 需求的 implement/verify/release 任务不可领取；状态迁移受限，重新打开已完成任务会阻塞已开始的下游任务。台账固定在主 worktree 的 `.hoh-dev/task-state.json`，链接 worktree（例如冻结的 soak 检出）共享同一台账。任务的 `acceptance`/`checks`/`profile` 字段与归属规则见 docs/08。
 
 ## 原生单次任务桥
 
@@ -69,7 +69,8 @@ python3 tools/release_gate.py --manifest .hoh-dev/release/manifest.json
 
 ## 开发与测试基础设施
 
-- `scripts/dev/test-infra.sh [--dry-run]`：安装 strace、sqlite3、openssh-server（SSH 测试自行启动仅回环、非特权的 sshd 实例，不启用系统服务）、qemu/KVM 与 cloud-image-utils、Chromium 的 Playwright 系统依赖、cargo-deny，并把开发用户加入 kvm 组、启用 linger；结果写入 `.hoh-dev/test-infra.json`。幂等，可重跑。
+- `scripts/dev/test-infra.sh [--dry-run]`：安装 strace、sqlite3、测试用 sshd（`scripts/dev/extract-test-sshd.sh` 下载发行版 openssh-server 包并解压到 `.hoh-dev/tools/openssh-server/<版本>/`，只安装其库依赖，不作为系统包安装，因此不会创建系统 sshd 配置，也不会启用或启动 ssh.socket/ssh.service；下载或解压失败、被中断时不留临时文件；唯一会动的系统 SSH 文件是旧版脚本写过、带标记行的 `/etc/ssh/sshd_config.d/50-hoh-test-loopback.conf`，只删除它，不重启任何服务）、qemu/KVM 与 cloud-image-utils、Chromium 的 Playwright 系统依赖、cargo-deny，并把开发用户加入 kvm 组、启用 linger；结果写入 `.hoh-dev/test-infra.json`。幂等，可重跑。
+  SSH 测试（REQ-015/REQ-061）按 `.hoh-dev/test-infra.json` 的 `test_sshd` 路径自行启动 sshd：临时目录里生成主机密钥与用户密钥，配置至少包含 `ListenAddress 127.0.0.1`、空闲端口、`HostKey`、`PidFile`、`AuthorizedKeysFile`（临时文件）、`PasswordAuthentication no`、`KbdInteractiveAuthentication no`、`UsePAM no`、`StrictModes no`；包里有哪个辅助程序就加哪个配置项：`sshd_session` 非 null（OpenSSH ≥ 9.8）时加 `SshdSessionPath`，`sshd_auth` 非 null（≥ 10.0）时加 `SshdAuthPath`，指向解压目录。Ubuntu 24.04 的 9.6p1 包只有 sshd，两项都不加；Ubuntu 26.04 的 10.2p1 两项都要加；用 `sshd -D -e -f <配置>` 前台运行，测试结束时终止并删除临时目录。
 - `scripts/dev/session-context.sh`：Claude Code 的 SessionStart 钩子（`.claude/settings.json`），在会话启动、恢复或压缩后打印分支、未提交改动、运行中任务与 PROGRESS 的下一步；委派会话（设置了 `HOH_BOOTSTRAP_PARENT`）不输出，保持审查独立。
 - `deny.toml`：依赖许可、来源与禁用规则；static 检查离线运行 `cargo deny check licenses bans sources`，CI 另外检查 RustSec 公告。
 

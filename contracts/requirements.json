@@ -1021,7 +1021,7 @@
      "id": "AC-021-05",
      "given": "writer_slots=1、reader_slots=2 全部被 FakeAgent 长任务占用；reserve_supervisor_slot=true；FakeClock",
      "when": "t=0 注入 1 条 critical issue；处理完后让 FakeCommander 不可用，再注入 need_decision 和 candidate_ready",
-     "then": "critical issue 在 t=2.0s 唤醒 Commander，不排在读写槽之后；Commander 不可用后 run=BLOCKED、blocked_reason=COMMANDER_UNAVAILABLE 且 blocked_reasons 含 NEED_DECISION，candidate_ready 仍产生 QA/Review dispatch；GetEvents 能读到每个触发器的去重键、event_seqs 和延迟毫秒数",
+     "then": "critical issue 在 t=2.0s 唤醒 Commander，不排在读写槽之后；Commander 不可用后 run=BLOCKED、blocked_reason=COMMANDER_UNAVAILABLE 且 blocked_reasons 含 NEED_DECISION，candidate_ready 仍产生 qa 与 reviewer 各 1 条 kind=handoff 消息；GetEvents 能读到每个触发器的去重键、event_seqs 和延迟毫秒数",
      "test_id": "TEST-021-05"
     }
    ],
@@ -1093,7 +1093,7 @@
     {
      "id": "AC-022-03",
      "given": "FakeTransport 在接收方提交收据后丢弃第 1 次 ACK；测试配置 max_delivery_attempts=3；另有一个永不 ACK 的接收方 R2",
-     "when": "向 QA 派发 dispatch 消息 m，向 R2 派发消息 n，把 FakeClock 推进到每个 next_retry_at",
+     "when": "向 QA 派发 kind=handoff 消息 m，向 R2 派发消息 n，把 FakeClock 推进到每个 next_retry_at",
      "then": "m 第 2 次投递被收据去重并回 ACK：outbox(m).state=ACKED，attempt_count=2，task 在 QA 的 TaskResult 到达前仍为 VERIFYING；n 第 3 次失败后 outbox(n).state=DEAD_LETTER，并有对应事件",
      "test_id": "TEST-022-03"
     },
@@ -1417,7 +1417,7 @@
      "id": "AC-027-01",
      "given": "fixture 含3组 fake 二进制：codex 0.166 的 help 与 schema 输出、去掉 `app-server` 的旧 codex、缺 `--include-partial-messages` 的旧 claude，各 sha256 已知",
      "when": "对每组调用 probe() 两次并生成 compat manifest",
-     "then": "每项含 path、binary_sha256（等于已知值）、version 原文、help_sha256、schema_sha256（无 schema 为 null）；旧 codex mid_turn_steer=false 且选择 exec 降级；旧 claude 部分消息能力=false；同输入两次探测结果相同",
+     "then": "每项通过 contracts/compat-manifest.schema.json 校验，含 launcher_path 与 launcher_sha256、implementation_path 与 implementation_sha256（均等于已知值；fake 二进制自身即实现时两组相同）、cli_version（--version 原文）、transport、capabilities、help_sha256、schema_sha256（无 schema 为 null）、suite（只探测未跑套件时 status=NOT_RUN）；旧 codex capabilities.mid_turn_steer=false 且 transport=exec（降级）；旧 claude capabilities.partial_messages=false；同输入两次探测结果相同",
      "test_id": "TEST-027-01"
     },
     {
@@ -1438,7 +1438,7 @@
      "id": "AC-027-04",
      "given": "compat manifest 已登记 fake codex A 的 hash 且兼容套件 PASS；一个使用 A 的 RUNNING attempt 持有写租约",
      "when": "将 PATH 中 codex 替换为 hash 不同的 B 后请求新 attempt；请求运行兼容套件；待写租约释放后运行套件并重试",
-     "then": "新 attempt 被拒（COMPAT_UNVERIFIED）而原 attempt 继续至 SETTLED；写租约活跃时套件请求被拒；套件 PASS 后 manifest 新增 B 记录且新 attempt 成功启动；PASS 前 doctor 显示 protocol=unknown",
+     "then": "新 attempt 被拒（COMPAT_UNVERIFIED）而原 attempt 继续至 SETTLED；写租约活跃时套件请求被拒；套件 PASS 后 manifest 的 codex 项更新为 B（implementation_sha256=B 的 hash、suite.status=PASS）且新 attempt 成功启动；PASS 前 doctor 显示 protocol=unknown",
      "test_id": "TEST-027-04"
     }
    ],
@@ -1682,7 +1682,7 @@
      "id": "AC-035-05",
      "given": "FakeCommander设为不可用（启动即失败）；Run R RUNNING，C1已冻结；同时存在一个critical issue需决策。",
      "when": "Runtime处理candidate_ready与该critical issue事件。",
-     "then": "QA与Review仍被派发；Run进入BLOCKED且原因=COMMANDER_UNAVAILABLE；sender为Commander的APPLIED decision新增0行。",
+     "then": "QA与Review仍被派发（qa与reviewer各1条kind=handoff消息）；Run进入BLOCKED且原因=COMMANDER_UNAVAILABLE；sender为Commander的APPLIED decision新增0行。",
      "test_id": "TEST-035-05"
     }
    ],
@@ -2635,7 +2635,7 @@
      "id": "AC-053-04",
      "given": "candidate C1 的 AC-A 已有 QA PASS 和 Review PASS，当前已验收计数包含 AC-A",
      "when": "Developer 提交新 commit 并冻结 C2",
-     "then": "当前投影中 AC-A 对 C2 为 NOT_RUN，已验收计数减 1；C1 的 PASS 行保留（acceptance_results 行数不减）；Runtime 为 C2 自动派发新的 QA 和 Review",
+     "then": "当前投影中 AC-A 对 C2 为 NOT_RUN，已验收计数减 1；C1 的 PASS 行保留（acceptance_results 行数不减）；Runtime 为 C2 自动派发新的 QA 和 Review（qa 与 reviewer 各 1 条 kind=handoff 消息）",
      "test_id": "TEST-053-04"
     },
     {
@@ -2707,7 +2707,7 @@
      "id": "AC-054-02",
      "given": "Reviewer 开始审查时 candidate 为 C1；审查期间 Developer 提交新 commit 并冻结了 C2",
      "when": "Reviewer 提交 candidate_id=C1 的 PASS 报告",
-     "then": "报告记为 stale，不计入 C2；C2 的 review 状态为 NOT_RUN，并已自动派发新的 Review；C1 的报告保留为历史",
+     "then": "报告记为 stale，不计入 C2；C2 的 review 状态为 NOT_RUN，并已自动派发新的 Review（recipient_role=reviewer、candidate_id=C2 的 kind=handoff 消息 1 条）；C1 的报告保留为历史",
      "test_id": "TEST-054-02"
     },
     {

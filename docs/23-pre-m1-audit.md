@@ -90,7 +90,7 @@ ECC 2.2.3 是一套通用的 Agent 增强包（约 71 个 agent、314 个 skill�
 |---|---|
 | 三个原生 Agent 认证 | Codex（ChatGPT）、Claude、Pi（zai-coding-cn/glm-5.3）均可用 |
 | 机器资源 | 12 vCPU、62 GiB 内存、575 GiB 可用磁盘，`sudo -n` 与 docker 可用 |
-| 测试基础设施 | 由 `scripts/dev/test-infra.sh` 安装：strace、sqlite3、openssh-server、qemu/KVM（加入 kvm 组）、Chromium/Playwright 依赖、cargo-nextest、cargo-deny、user linger |
+| 测试基础设施 | 由 `scripts/dev/test-infra.sh` 安装：strace、sqlite3、qemu/KVM（加入 kvm 组）、Chromium/Playwright 依赖、cargo-deny、user linger；测试用 sshd 从发行版包解压到 `.hoh-dev/tools`，不安装系统 SSH 包，不重启、启用系统 SSH 服务；系统 SSH 配置只删除旧版脚本写过的带标记 drop-in |
 | 质量门控 | CI：包自检（Python 3.11–3.14）、cargo fmt/clippy/test、cargo-deny；本地：`scripts/check.sh --bundle`、产品检查计划 |
 | 会话恢复 | PROGRESS.md + 任务台账 + SessionStart 钩子；`RESUME_PROMPT.md` 按事实重建现场 |
 | 额度 | 三家订阅额度会被审查、QA、live 测试与 soak 消耗；撞到 5 小时限额时会话暂停，恢复后按台账续做 |

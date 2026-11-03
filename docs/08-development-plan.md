@@ -14,7 +14,7 @@
 |verify|reviewer（M0–M2）/ qa（M3 起）|否|同一冻结候选上的独立 QA/Review；不得修改被测源码|
 |release|developer|是|按 release profile 跑全部检查并执行 release_gate|
 
-`taskboard claim <id> --owner <会话>` 原子领取任务：依赖必须已完成，readiness 必须满足，且同一时间只能有一个 writer 任务在运行（单写者）。`set` 只允许合法迁移：done/blocked 必须写证据或阻塞说明，只有领取者能结束 running 任务。重新打开已完成的任务时，已开始的下游任务自动转为 blocked。列表顺序即默认优先级。
+`taskboard claim <id> --owner <会话>` 原子领取任务：依赖必须已完成，readiness 必须满足，且同一时间只能有一个 writer 任务在运行（单写者；writer 标记在 claim 时写入台账，没有该标记的运行条目一律按 writer 处理，计划不同的 worktree 也不能各领一个写任务）。`set` 只允许合法迁移：done/blocked 必须写证据或阻塞说明，只有领取者能结束 running 任务。重新打开已完成的任务时，已开始的下游任务自动转为 blocked。列表顺序即默认优先级。
 
 ## 阶段与出口
 
@@ -32,7 +32,7 @@
 
 ## v0.1 路径（CR-003 D2）
 
-M0 → M1（T01→T02→T03→T04/T05→T06→T08→T07→T09）→ M2（T01→T02→T12→T03/T04→T05→T19→T06→T14、T07→T17→T08→T09→T10→T16→T18→T15→T13）→ M2-T11（M2 独立 QA+Review）→ V01-T01（v0.1 候选全量检查）→ V01-T02（发布）→ M3-T01。实际顺序以 `taskboard next` 为准（列表顺序加依赖）。
+M0 → M1（T01→T02）→ M2-T01→M2-T02（持久化与 Attempt 状态机先于适配器，适配器的 AC 要查真实落库的 attempts/sessions 行）→ M1（T03→T04/T05→T06→T08→T07→T09）→ M2（其余任务经 M2-T12、M2-T04 依赖 M1-T09，继承进程底座、三个适配器、CLI、doctor 与 TUI；T12→T03/T04→T05→T19→T06→T14、T07→T17→T08→T09→T10→T16→T18→T15→T13）→ M2-T11（M2 独立 QA+Review）→ V01-T01（v0.1 候选全量检查）→ V01-T02（发布）→ M3-T01。实际顺序以 `taskboard next` 为准（列表顺序加依赖）。
 
 v0.1 的需求范围仍是 `release_targets` 含 `v0.1` 的 18 项，但这些需求的 AC 依赖 Codex 适配器（AC-004-04）、团队绑定与 role_epoch（AC-035-01、AC-036-03、AC-054-01）和 Commander 监督（AC-002-01），所以 v0.1 在 M2 全部完成后发布。原“最短路径”把这些能力排在 v0.1 之后，导致任务无法诚实完成（docs/23）。
 
@@ -42,7 +42,7 @@ M1/M2 的 27 项需求已是 detailed。M3–M7 的需求是 outline，各里程
 
 1. 每项写 2–5 条可判定 AC（确有必要可多于 5 条，在 CR 中说明）（Given/When/Then 具体到命令、状态、阈值，至少一条失败路径），以及 behavior、failure_modes、测试场景（check_id、步骤、判定、需保存的观测）。
 2. 不删范围、不降门槛；文档没写到的地方按更严格、可验证的行为选择，并记入该需求的 decisions，在 CR 中请项目所有者确认。
-3. 按每个实现任务 ≤2 项需求、≤8 条 AC 拆分本里程碑的实现任务，填好 `acceptance`/`checks`/`depends_on`。
+3. 按每个实现任务 ≤2 项需求、≤8 条 AC 拆分本里程碑的实现任务，填好 `acceptance`/`checks`/`depends_on`。每条 AC 只分给依赖闭包已经提供其所需能力（host、API、CLI 最终结果、QA/Review 循环、systemd、doctor、TUI 等）的任务；归属规则只查结构，这一条要逐条 AC 读 Given/When/Then 核对（CR-004）。
 4. 运行 `tools/gen_spec_views.py`；写 CR 记录（只细化、不删范围、不降门槛时按 CR-003 D1 经独立 Review 后由 CTO 批准，其余需要用户批准，见 docs/21）；执行 `tools/baseline.py relock --cr`；`scripts/check.sh --bundle` 必须通过。
 
 ## 每个任务的执行契约

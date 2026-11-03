@@ -54,6 +54,35 @@ class BundleContracts(unittest.TestCase):
                 (root/'tests/check-plan.json').write_text(json.dumps(plan))
                 r=validate_bundle.validate(root)
                 with self.subTest(argv=argv):self.assertTrue(any(message in e for e in r['errors']),r['errors'])
+    def test_compat_manifest_schema_matches_ac_027_01(self):
+        # CR3R-04: the schema forbade the field names AC-027-01 required.
+        import validate_bundle
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)/'kit';shutil.copytree(ROOT,root,ignore=shutil.ignore_patterns('.git','.hoh-dev','__pycache__','target','npm'))
+            reqs=load_json(root/'contracts/requirements.json')
+            ac=next(a for r in reqs['requirements'] for a in r['acceptance'] if a['id']=='AC-027-01')
+            ac['then']='每项含 path、binary_sha256（等于已知值）、version 原文、help_sha256、schema_sha256（无 schema 为 null）'
+            (root/'contracts/requirements.json').write_text(json.dumps(reqs,ensure_ascii=False))
+            ex=load_json(root/'examples/compat-manifest.json');del ex['agents']['codex']['transport']
+            (root/'examples/compat-manifest.json').write_text(json.dumps(ex))
+            errors=validate_bundle.validate(root)['errors']
+            self.assertTrue(any('AC-027-01 must name' in e and 'launcher_sha256' in e and 'transport' in e for e in errors),errors)
+            self.assertTrue(any(e.startswith('example compat-manifest.json') and 'transport' in e for e in errors),errors)
+    def test_scenario_message_kind_matches_its_ac(self):
+        # CR7R-01: TEST-021-01 asserted kind=dispatch while AC-021-01 requires kind=handoff.
+        import validate_bundle
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)/'kit';shutil.copytree(ROOT,root,ignore=shutil.ignore_patterns('.git','.hoh-dev','__pycache__','target','npm'))
+            path=root/'contracts/acceptance-scenarios.json';original=path.read_text()
+            # CR8R-04: values with dots, digits or capitals must be compared whole, not by a lowercase prefix.
+            for sid,old,new in [('TEST-021-01','kind=handoff','kind=dispatch'),('TEST-021-01','kind=handoff','kind=handoff2'),
+                                ('TEST-004-02','kind=run.result','kind=run.started'),('TEST-001-02','kind=StartRun','kind=CancelRun')]:
+                doc=json.loads(original);s=next(x for x in doc['scenarios'] if x['id']==sid)
+                text=json.dumps(s,ensure_ascii=False);self.assertIn(old,text)
+                doc['scenarios'][doc['scenarios'].index(s)]=json.loads(text.replace(old,new))
+                path.write_text(json.dumps(doc,ensure_ascii=False))
+                errors=validate_bundle.validate(root)['errors']
+                self.assertTrue(any(e.startswith(sid+':') and new in e for e in errors),(sid,new,errors))
     def test_original_skills_available(self):
         skills=load_json(ROOT/'resources/skills/registry.json')['skills'];self.assertEqual(len(skills),13)
         for s in skills:self.assertTrue((ROOT/s['entry']).is_file())
@@ -137,11 +166,49 @@ class SetupAndLedger(unittest.TestCase):
         self.assertEqual(self.ledger('set','M0-T01','done','--owner','dev','--note','TEST fixture only'),0)
         self.assertEqual(self.ledger('claim','M0-T02','--owner','dev'),0)
         state=load_json(self.root/'.hoh-dev/task-state.json');self.assertEqual(len(state['history']),3);self.assertEqual(self.state('M0-T02')['owner'],'dev')
+    def refused_with(self,text,*args):
+        err=io.StringIO()
+        with patch.object(taskboard,'ROOT',self.root),contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(err),self.assertRaises(SystemExit):taskboard.main(list(args))
+        self.assertIn(text,err.getvalue())
     def test_ledger_single_writer(self):
         self.seed(['M0-T01','M0-T02','M0-T03','M1-T01'])
         self.assertEqual(self.ledger('claim','M1-T02','--owner','a'),0)
-        self.refused('claim','M2-T01','--owner','b')
+        self.refused_with('single writer','claim','M2-T01','--owner','b')  # a writer whose dependencies are done
         self.assertEqual(self.ledger('claim','M0-T04','--owner','c'),0)  # non-writer research runs in parallel
+    def test_ledger_single_writer_across_divergent_worktree_plans(self):
+        # CR3R-01: a frozen checkout must see a writer claimed from a newer plan it does not know.
+        main=self.root;git=lambda *a:subprocess.run(['git','-C',str(main),*a],check=True,capture_output=True)
+        for cmd in (['init','-q'],['config','user.email','t@invalid.example'],['config','user.name','t'],['add','-A'],['commit','-q','-m','x'],['worktree','add','-q',str(self.root.parent/'frozen')]):git(*cmd)
+        frozen=self.root.parent/'frozen'
+        def add_task(root,tid):
+            f=root/'contracts/development-tasks.json';d=load_json(f)
+            d['tasks'].append({'id':tid,'milestone':'M0','kind':'research','writer':True,'title':tid,'requirements':[],'depends_on':[],'done_when':'x'})
+            f.write_text(json.dumps(d,ensure_ascii=False))
+        add_task(main,'NEW-WRITER');add_task(frozen,'OLD-WRITER')
+        self.assertEqual(self.ledger('claim','NEW-WRITER','--owner','a'),0)
+        self.assertTrue(self.state('NEW-WRITER')['writer'])
+        self.root=frozen
+        try:
+            self.refused_with('NEW-WRITER','claim','OLD-WRITER','--owner','b')
+            out=io.StringIO()
+            with patch.object(taskboard,'ROOT',frozen),contextlib.redirect_stdout(out):taskboard.main(['next'])
+            self.assertFalse(json.loads(out.getvalue()).get('writer',False))
+        finally:self.root=main
+    def test_ledger_legacy_entry_without_flag_counts_as_writer(self):
+        # CR4R-01: a running entry written before the writer flag existed is a writer even if this checkout's
+        # plan calls the same id a non-writer (the claiming checkout's plan may have said writer=true).
+        tasks={'M0-T01':{'task_id':'M0-T01','status':'done','owner':'seed','note':'TEST seed'},
+               'M0-T04':{'task_id':'M0-T04','status':'running','owner':'old-tool','note':''}}
+        (self.root/'.hoh-dev').mkdir(exist_ok=True)
+        (self.root/'.hoh-dev/task-state.json').write_text(json.dumps({'tasks':tasks,'history':[]}))
+        self.assertFalse(next(t for t in load_json(self.root/'contracts/development-tasks.json')['tasks'] if t['id']=='M0-T04')['writer'])
+        self.refused_with('M0-T04','claim','M0-T02','--owner','dev')
+    def test_ledger_unknown_running_task_counts_as_writer(self):
+        (self.root/'.hoh-dev').mkdir(exist_ok=True)
+        tasks={'M0-T01':{'task_id':'M0-T01','status':'done','owner':'seed','note':'TEST seed'},'FUTURE-T01':{'task_id':'FUTURE-T01','status':'running','owner':'x','note':''}}
+        (self.root/'.hoh-dev/task-state.json').write_text(json.dumps({'tasks':tasks,'history':[]}))
+        self.refused_with('FUTURE-T01','claim','M0-T02','--owner','dev')  # legacy entry without a writer flag fails closed
+        self.assertEqual(self.ledger('claim','M0-T04','--owner','dev'),0)  # non-writer work is not blocked
     def test_ledger_next_respects_single_writer(self):
         self.seed(['M0-T01','M0-T02','M0-T03','M0-T04','M0-T05','M1-T01'])
         self.assertEqual(self.ledger('claim','M1-T02','--owner','a'),0)
@@ -166,3 +233,60 @@ class SetupAndLedger(unittest.TestCase):
         self.assertEqual(self.ledger('claim','M0-T03','--owner','dev'),0)
         self.assertEqual(self.ledger('set','M0-T01','pending','--note','preflight was wrong'),0)
         self.assertEqual(self.state('M0-T02')['status'],'blocked');self.assertEqual(self.state('M0-T03')['status'],'blocked')
+
+class TestSshdExtraction(unittest.TestCase):
+    # CR4R-03/CR5R-02/CR5R-03: extract (never install) the distribution sshd, accept packages without the
+    # OpenSSH >= 9.8 helpers, and leave nothing behind when download or extraction fails.
+    VERSION='1:9.6p1-3ubuntu13.20'
+    def setUp(self):
+        t=tempfile.TemporaryDirectory(prefix='hoh-sshd-');self.addCleanup(t.cleanup);self.tmp=Path(t.name)
+        self.fake=self.tmp/'bin';self.fake.mkdir();self.tools=self.tmp/'tools';self.calls=self.tmp/'calls.log'
+        (self.fake/'apt-get').write_text('#!/bin/sh\necho "apt-get $*" >> "$CALLS"\n'
+            '[ "$1" = download ] || exit 64\n'
+            'if [ "$MODE" = download-fail ]; then echo partial > partial.deb; exit 100; fi\n'
+            'v="${2#openssh-server=}"; echo "Get:1 http://archive.example openssh-server $v [9 kB]"\n'
+            'echo deb > "openssh-server_${v}_amd64.deb"; echo "Fetched 9 kB in 0s (9 kB/s)"\n')
+        (self.fake/'dpkg-deb').write_text('#!/bin/sh\n[ "$1" = -x ] || exit 64\nd="$3"\n'
+            'if [ "$MODE" = corrupt ]; then mkdir -p "$d/usr"; echo junk > "$d/usr/half"; exit 2; fi\n'
+            'mkdir -p "$d/usr/sbin" "$d/usr/lib/openssh"\n'
+            '[ "$MODE" = no-sshd ] || { printf "#!/bin/sh\\n" > "$d/usr/sbin/sshd"; chmod +x "$d/usr/sbin/sshd"; }\n'
+            'if [ "$MODE" = openssh10 ]; then for b in sshd-session sshd-auth; do printf "#!/bin/sh\\n" > "$d/usr/lib/openssh/$b"; chmod +x "$d/usr/lib/openssh/$b"; done; fi\n')
+        for f in self.fake.iterdir():f.chmod(0o755)
+    def run_extract(self,mode):
+        env=os.environ|{'PATH':str(self.fake)+os.pathsep+os.environ['PATH'],'MODE':mode,'CALLS':str(self.calls),'HOH_TEST_SSHD_VERSION':self.VERSION}
+        return subprocess.run(['bash',str(ROOT/'scripts/dev/extract-test-sshd.sh'),str(self.tools)],capture_output=True,text=True,timeout=30,env=env)
+    def leftovers(self):
+        base=self.tools/'openssh-server'
+        return sorted(p.name for p in base.iterdir() if p.name.startswith('.')) if base.is_dir() else []
+    def dest(self):return self.tools/'openssh-server'/self.VERSION.replace(':','_')
+    def test_package_without_helpers_is_usable(self):
+        p=self.run_extract('openssh96');self.assertEqual(p.returncode,0,p.stderr)
+        self.assertEqual(p.stdout,str(self.dest())+'\n')  # CR6R-02: download logs never reach stdout
+        self.assertIn('Fetched',p.stderr);self.assertTrue((self.dest()/'usr/sbin/sshd').is_file())
+        self.assertFalse((self.dest()/'usr/lib/openssh/sshd-session').exists());self.assertEqual(self.leftovers(),[])
+    def test_openssh10_layout_and_reuse(self):
+        self.assertEqual(self.run_extract('openssh10').returncode,0)
+        self.assertTrue((self.dest()/'usr/lib/openssh/sshd-auth').is_file())
+        before=self.calls.read_text().count('apt-get download')
+        p=self.run_extract('openssh10');self.assertEqual(p.returncode,0,p.stderr)
+        self.assertEqual(self.calls.read_text().count('apt-get download'),before)  # usable result is reused
+    def test_failed_download_leaves_nothing(self):
+        p=self.run_extract('download-fail');self.assertNotEqual(p.returncode,0)
+        self.assertEqual(self.leftovers(),[]);self.assertFalse(self.dest().exists())
+    def test_failed_extraction_leaves_nothing(self):
+        p=self.run_extract('corrupt');self.assertNotEqual(p.returncode,0)
+        self.assertEqual(self.leftovers(),[]);self.assertFalse(self.dest().exists())
+    def test_package_without_sshd_is_rejected(self):
+        p=self.run_extract('no-sshd');self.assertEqual(p.returncode,69);self.assertIn('lacks usr/sbin/sshd',p.stderr)
+        self.assertEqual(self.leftovers(),[]);self.assertFalse(self.dest().exists())
+    def test_stale_temp_dirs_removed_on_cache_hit(self):
+        # CR6R-03: killed after publishing the result but before the EXIT trap; the next (cached) run cleans up.
+        self.assertEqual(self.run_extract('openssh10').returncode,0)
+        stale=self.tools/'openssh-server/.download.crash';stale.mkdir();(stale/'partial.deb').write_text('x')
+        (self.tools/'openssh-server/.extract.crash').mkdir()
+        p=self.run_extract('openssh10');self.assertEqual(p.returncode,0,p.stderr);self.assertEqual(p.stdout,str(self.dest())+'\n')
+        self.assertEqual(self.leftovers(),[])
+    def test_incomplete_earlier_result_is_replaced(self):
+        (self.dest()/'usr').mkdir(parents=True);(self.tools/'openssh-server/.extract.stale').mkdir()
+        p=self.run_extract('openssh96');self.assertEqual(p.returncode,0,p.stderr)
+        self.assertTrue((self.dest()/'usr/sbin/sshd').is_file());self.assertEqual(self.leftovers(),[])

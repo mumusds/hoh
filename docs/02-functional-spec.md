@@ -536,15 +536,15 @@ Commander 只被重要事件或策略规定的轮次边界唤醒；同类事件�
 **验收**
 
 - **AC-021-01**（TEST-021-01 · 检查 `unit`）Given FakeClock；policy=balanced；单个 run 的事件流：10000 条 token.delta、500 条 tool.output、60 条 heartbeat、3 条 medium issue、1 条 candidate_ready；When 按 seq 把事件流送入 Supervisor，并把 FakeClock 推进 1 小时；Then Commander 唤醒次数=0；Runtime 为 candidate_ready 生成 qa 与 reviewer 各 1 条 kind=handoff outbox；decisions 新增行数=0
-  - 判定：FakeCommander 唤醒计数=0；recipient_role=qa 与 reviewer 的 kind=dispatch 消息各 1 条；decisions 行数增量=0
+  - 判定：FakeCommander 唤醒计数=0；recipient_role=qa 与 reviewer 的 kind=handoff 消息各 1 条；decisions 行数增量=0
 - **AC-021-02**（TEST-021-02 · 检查 `unit`）Given FakeClock t=0；去重键 K1=(run,fp1,rev3)、K2=(run,fp2,rev3)、K3=(run,fp1,rev4)；When 在 t=0、0.5、1.0s 注入 K1 事件；在 t=0.2s 注入 K2，t=0.3s 注入 K3；t=30s 起每 1s 注入一条 K1 事件，持续 15s；t=60s 注入 IntegrityViolation；Then K1 首组在 t=3.0s 合并为 1 个触发器（3 个 seq）；K2、K3 各自独立触发；持续流的首个触发在 t=40.0s；IntegrityViolation 在 t=60s 的同一 tick 触发
   - 判定：K1 首组：触发时刻=3.0s，len(event_seqs)=3；K2 与 K3 触发器的 dedup 键互不相同，均不含 K1 事件；持续流：首个触发时刻-首事件时刻=10.0s，同时刻 K1 未处理触发器≤1；IntegrityViolation：触发时刻=60.0s（延迟 0 tick）
 - **AC-021-03**（TEST-021-03 · 检查 `recovery`）Given 监督器已处理到 last_handled_seq=120，对应决策为 APPLIED；seq 121–125 为已持久化但未处理的同键重要事件；When kill -9 host 后重启；Then seq≤120 不再唤醒；121–125 合并为恰好 1 个触发器；APPLIED 决策数不增加；重启后 last_handled_seq≥120
   - 判定：重启后唤醒次数=1，该触发器 event_seqs={121..125}；count(decisions state=APPLIED) 前后相等；last_handled_seq 单调不减；reconcile 完成≤30s
 - **AC-021-04**（TEST-021-04 · 检查 `integration`）Given 触发器 K 基于 task revision=7 生成；Commander 作答前，Runtime 已把该 task 推进到 revision=8；When FakeCommander 返回 decision{expected_revision:7, role_epoch:当前值}；对随后的重新触发返回 expected_revision:8 的决策；Then 第一条 decision 为 REJECTED(STALE_REVISION)，task revision 仍为 8 且无派发；恰好产生 1 个新触发器，其摘要基于 revision 8；第二条 decision 为 APPLIED
   - 判定：decision#1.state=REJECTED，原因 STALE_REVISION；decision#1 处理后 outbox 增量=0；新触发器数=1，摘要中 revision=8；decision#2.state=APPLIED
-- **AC-021-05**（TEST-021-05 · 检查 `integration`）Given writer_slots=1、reader_slots=2 全部被 FakeAgent 长任务占用；reserve_supervisor_slot=true；FakeClock；When t=0 注入 1 条 critical issue；处理完后让 FakeCommander 不可用，再注入 need_decision 和 candidate_ready；Then critical issue 在 t=2.0s 唤醒 Commander，不排在读写槽之后；Commander 不可用后 run=BLOCKED、blocked_reason=COMMANDER_UNAVAILABLE 且 blocked_reasons 含 NEED_DECISION，candidate_ready 仍产生 QA/Review dispatch；GetEvents 能读到每个触发器的去重键、event_seqs 和延迟毫秒数
-  - 判定：唤醒时刻=2.0s；run.state=BLOCKED，原因含 need_decision；qa 与 reviewer 的 dispatch 各 1 条；events 中触发器记录含 dedup 键、event_seqs 与非负的延迟毫秒字段
+- **AC-021-05**（TEST-021-05 · 检查 `integration`）Given writer_slots=1、reader_slots=2 全部被 FakeAgent 长任务占用；reserve_supervisor_slot=true；FakeClock；When t=0 注入 1 条 critical issue；处理完后让 FakeCommander 不可用，再注入 need_decision 和 candidate_ready；Then critical issue 在 t=2.0s 唤醒 Commander，不排在读写槽之后；Commander 不可用后 run=BLOCKED、blocked_reason=COMMANDER_UNAVAILABLE 且 blocked_reasons 含 NEED_DECISION，candidate_ready 仍产生 qa 与 reviewer 各 1 条 kind=handoff 消息；GetEvents 能读到每个触发器的去重键、event_seqs 和延迟毫秒数
+  - 判定：唤醒时刻=2.0s；run.state=BLOCKED，blocked_reason=COMMANDER_UNAVAILABLE，blocked_reasons 含 NEED_DECISION；qa 与 reviewer 的 kind=handoff 消息各 1 条；events 中触发器记录含 dedup 键、event_seqs 与非负的延迟毫秒字段
 
 **已确认的设计选择**（项目所有者 2026-11-03 确认，CR-002；“初值”指可经 CR 调整的基线值）
 
@@ -586,7 +586,7 @@ HCP 消息与状态迁移在同一事务中持久化，并按消费者与 messag
   - 判定：A：tasks.revision=5，迁移事件数=2，receipts 行数=2；A：重复投递返回的 result_json 与首次逐字节相同；B：m2 两次结果都为 rejected，current_revision=3；B：tasks.revision=4，迁移事件数=1
 - **AC-022-02**（TEST-022-02 · 检查 `integration`）Given commands 表为空；When POST /v1/commands：以 idempotency_key=K、payload P 提交两次，再以 K、payload P' 提交一次；Then 前两次都返回 202，command_id 和 revision 相同，commands 行数=1，事件只增加 1 条；第三次返回 409 且 code=KEY_REUSE
   - 判定：响应 1 与响应 2 的 body 相同；count(commands where idempotency_key=K)=1；第三次 HTTP 409，body.code=KEY_REUSE
-- **AC-022-03**（TEST-022-03 · 检查 `integration`）Given FakeTransport 在接收方提交收据后丢弃第 1 次 ACK；测试配置 max_delivery_attempts=3；另有一个永不 ACK 的接收方 R2；When 向 QA 派发 dispatch 消息 m，向 R2 派发消息 n，把 FakeClock 推进到每个 next_retry_at；Then m 第 2 次投递被收据去重并回 ACK：outbox(m).state=ACKED，attempt_count=2，task 在 QA 的 TaskResult 到达前仍为 VERIFYING；n 第 3 次失败后 outbox(n).state=DEAD_LETTER，并有对应事件
+- **AC-022-03**（TEST-022-03 · 检查 `integration`）Given FakeTransport 在接收方提交收据后丢弃第 1 次 ACK；测试配置 max_delivery_attempts=3；另有一个永不 ACK 的接收方 R2；When 向 QA 派发 kind=handoff 消息 m，向 R2 派发消息 n，把 FakeClock 推进到每个 next_retry_at；Then m 第 2 次投递被收据去重并回 ACK：outbox(m).state=ACKED，attempt_count=2，task 在 QA 的 TaskResult 到达前仍为 VERIFYING；n 第 3 次失败后 outbox(n).state=DEAD_LETTER，并有对应事件
   - 判定：receipts(QA,m) 行数=1；outbox(m).state=ACKED，attempt_count=2，next_retry_at 曾被持久化；TaskResult 到达前 tasks.state=VERIFYING；outbox(n).state=DEAD_LETTER，attempt_count=3，存在 dead-letter 事件
 - **AC-022-04**（TEST-022-04 · 检查 `integration`）Given candidate C 已冻结并写入 candidates 表；当前 spec_sha256=S；When Developer 的 TaskResult{status:COMPLETED,candidate_id:C} 被 Runtime 处理；Then 恰好生成 2 条 kind=handoff 消息，recipient_role 为 qa 和 reviewer；payload 通过 ContextHandoff 校验，candidate 对象逐字段相同且等于 candidates(C) 行；spec_sha256=S；acceptance_ids 非空
   - 判定：handoff 消息数=2，接收者集合={qa,reviewer}；schema 校验 0 错误；两条消息的 candidate 对象相同，且 id/git_commit/git_tree/spec_sha256/environment_sha256/test_plan_sha256 与 C 行一致；两条 handoff ACK 后 task.state≠ACCEPTED
@@ -771,14 +771,14 @@ M1 · P0 · 发布类 required · 目标 v1, v0.1 · 成熟度 detailed，参考
 
 **验收**
 
-- **AC-027-01**（TEST-027-01 · 检查 `integration`）Given fixture 含3组 fake 二进制：codex 0.166 的 help 与 schema 输出、去掉 `app-server` 的旧 codex、缺 `--include-partial-messages` 的旧 claude，各 sha256 已知；When 对每组调用 probe() 两次并生成 compat manifest；Then 每项含 path、binary_sha256（等于已知值）、version 原文、help_sha256、schema_sha256（无 schema 为 null）；旧 codex mid_turn_steer=false 且选择 exec 降级；旧 claude 部分消息能力=false；同输入两次探测结果相同
-  - 判定：3项 manifest 字段齐全，binary_sha256 等于已知值；Claude 项 schema_sha256=null，Codex 项为64位十六进制；旧 codex capabilities.mid_turn_steer=false，transport=exec；两版 codex 能力集不同，且各自两次探测结果完全相同；旧 claude 部分消息能力=false
+- **AC-027-01**（TEST-027-01 · 检查 `integration`）Given fixture 含3组 fake 二进制：codex 0.166 的 help 与 schema 输出、去掉 `app-server` 的旧 codex、缺 `--include-partial-messages` 的旧 claude，各 sha256 已知；When 对每组调用 probe() 两次并生成 compat manifest；Then 每项通过 contracts/compat-manifest.schema.json 校验，含 launcher_path 与 launcher_sha256、implementation_path 与 implementation_sha256（均等于已知值；fake 二进制自身即实现时两组相同）、cli_version（--version 原文）、transport、capabilities、help_sha256、schema_sha256（无 schema 为 null）、suite（只探测未跑套件时 status=NOT_RUN）；旧 codex capabilities.mid_turn_steer=false 且 transport=exec（降级）；旧 claude capabilities.partial_messages=false；同输入两次探测结果相同
+  - 判定：3项 manifest 均通过 compat-manifest.schema.json 校验，launcher_sha256 与 implementation_sha256 等于已知值；Claude 与旧 codex 项 schema_sha256=null，codex 0.166 项为其 schema 输出的 sha256（64位十六进制）；旧 codex capabilities.mid_turn_steer=false，transport=exec；两版 codex 能力集不同，且各自两次探测结果完全相同；旧 claude capabilities.partial_messages=false
 - **AC-027-02**（TEST-027-02 · 检查 `integration`）Given 三个适配器各1份 fixture：插入1条不在该版本已知帧登记表中的 method/type 帧，并在已知事件中加入未知字段 `x_future`；另备删除未知帧的对照 fixture；When 回放两组 fixture 至终态；Then 无 panic；每份恰1条 adapter.unknown_event 且含原始帧 sha256；原始日志 sha256=输入字节 sha256；`x_future` 可从 raw 旁路取回；终态与对照回放一致
   - 判定：6次回放无 panic、进程均正常结束；每份含未知帧的回放 adapter.unknown_event 数=1，事件含帧 sha256；原始日志 sha256 与输入一致；`x_future` 字段值可从 raw 取回且等于输入；attempt 终态与对照回放逐一相等
 - **AC-027-03**（TEST-027-03 · 检查 `integration`）Given 三个适配器各1份 fixture：若干正常帧后接8 MiB 无 LF 的单行；帧上限为默认1 MiB；同 host 另有1个正常 fake attempt 并行；When 回放并通过测试探针记录 reader 最大缓冲字节；Then 最大缓冲≤1 MiB+64 KiB；attempt=FAILED、原因 PROTOCOL_FRAME_TOO_LARGE；诊断含帧长度、前缀 sha256 与前4 KiB；并行 attempt=SETTLED
   - 判定：三个适配器最大缓冲字节均≤1,114,112；超大帧 attempt state=FAILED，原因=PROTOCOL_FRAME_TOO_LARGE；诊断记录含长度、前缀 sha256、前4096字节；并行正常 attempt state=SETTLED，host 进程未退出
-- **AC-027-04**（TEST-027-04 · 检查 `integration`）Given compat manifest 已登记 fake codex A 的 hash 且兼容套件 PASS；一个使用 A 的 RUNNING attempt 持有写租约；When 将 PATH 中 codex 替换为 hash 不同的 B 后请求新 attempt；请求运行兼容套件；待写租约释放后运行套件并重试；Then 新 attempt 被拒（COMPAT_UNVERIFIED）而原 attempt 继续至 SETTLED；写租约活跃时套件请求被拒；套件 PASS 后 manifest 新增 B 记录且新 attempt 成功启动；PASS 前 doctor 显示 protocol=unknown
-  - 判定：替换后首个新 attempt 被拒，错误码=COMPAT_UNVERIFIED，无子进程启动；原 attempt 最终 state=SETTLED，其进程仍为 A；doctor codex 项 protocol=unknown；租约活跃时套件请求被拒绝；套件 PASS 后 manifest 含 B 的 binary_sha256，重试 attempt 成功启动
+- **AC-027-04**（TEST-027-04 · 检查 `integration`）Given compat manifest 已登记 fake codex A 的 hash 且兼容套件 PASS；一个使用 A 的 RUNNING attempt 持有写租约；When 将 PATH 中 codex 替换为 hash 不同的 B 后请求新 attempt；请求运行兼容套件；待写租约释放后运行套件并重试；Then 新 attempt 被拒（COMPAT_UNVERIFIED）而原 attempt 继续至 SETTLED；写租约活跃时套件请求被拒；套件 PASS 后 manifest 的 codex 项更新为 B（implementation_sha256=B 的 hash、suite.status=PASS）且新 attempt 成功启动；PASS 前 doctor 显示 protocol=unknown
+  - 判定：替换后首个新 attempt 被拒，错误码=COMPAT_UNVERIFIED，无子进程启动；原 attempt 最终 state=SETTLED，其进程仍为 A；doctor codex 项 protocol=unknown；租约活跃时套件请求被拒绝；套件 PASS 后 manifest 的 codex 项 implementation_sha256 等于 B 的 hash 且 suite.status=PASS，重试 attempt 成功启动
 
 **已确认的设计选择**（项目所有者 2026-11-03 确认，CR-002；“初值”指可经 CR 调整的基线值）
 
@@ -897,8 +897,8 @@ Commander只提交带role_epoch与expected_revision的决策提议，Runtime确�
   - 判定：outbox新增2行，recipient_role分别为qa与reviewer，payload.candidate_id=C1；两行event_seq相同（同一事务）；FakeCommander调用次数=0
 - **AC-035-04**（TEST-035-04 · 检查 `unit`）Given Run R处于VERIFYING，C1无evidence与acceptance_results。；When FakeCommander以当前role_epoch与revision提交决策：「所有AC已通过，标记REQ已验收并将Run置COMPLETED」。；Then decision=REJECTED、reason=EVIDENCE_GATE_UNMET；Run仍VERIFYING；acceptance_results行数=0。
   - 判定：decision.state=REJECTED，reason=EVIDENCE_GATE_UNMET；runs.state=VERIFYING，revision不变；acceptance_results行数=0
-- **AC-035-05**（TEST-035-05 · 检查 `integration`）Given FakeCommander设为不可用（启动即失败）；Run R RUNNING，C1已冻结；同时存在一个critical issue需决策。；When Runtime处理candidate_ready与该critical issue事件。；Then QA与Review仍被派发；Run进入BLOCKED且原因=COMMANDER_UNAVAILABLE；sender为Commander的APPLIED decision新增0行。
-  - 判定：outbox含qa与reviewer的C1 dispatch各1行；runs.state=BLOCKED且阻塞原因=COMMANDER_UNAVAILABLE；新增APPLIED decision中Commander来源行数=0
+- **AC-035-05**（TEST-035-05 · 检查 `integration`）Given FakeCommander设为不可用（启动即失败）；Run R RUNNING，C1已冻结；同时存在一个critical issue需决策。；When Runtime处理candidate_ready与该critical issue事件。；Then QA与Review仍被派发（qa与reviewer各1条kind=handoff消息）；Run进入BLOCKED且原因=COMMANDER_UNAVAILABLE；sender为Commander的APPLIED decision新增0行。
+  - 判定：outbox含qa与reviewer的C1 kind=handoff消息各1行；runs.state=BLOCKED且阻塞原因=COMMANDER_UNAVAILABLE；新增APPLIED decision中Commander来源行数=0
 
 **已确认的设计选择**（项目所有者 2026-11-03 确认，CR-002；“初值”指可经 CR 调整的基线值）
 
@@ -1393,8 +1393,8 @@ QA 在独立会话中，以 spec/AC 和冻结候选为起点逐条验收；开�
   - 判定：8 个投影结果与期望表逐项一致；PASS 投影数=1；更新返回错误，行内容前后逐字段相同
 - **AC-053-03**（TEST-053-03 · 检查 `integration`）Given candidate C 附带开发者自测报告 R（内容含 ALL TESTS PASSED 哨兵）；in-scope AC 为 AC-A、AC-B；When Runtime 生成 QA 的 ContextHandoff 和 Prompt；Then ContextHandoff.acceptance_ids={AC-A,AC-B}，candidate 等于 C；Prompt 中 AC-A、AC-B 正文首次出现的位置早于 R 的内容；R 位于 Evidence Context 层，并带 diagnostic 标签
   - 判定：acceptance_ids 集合与 candidate 身份匹配；offset(AC-A 正文)<offset(哨兵) 且 offset(AC-B 正文)<offset(哨兵)；哨兵所在段的标签为 diagnostic
-- **AC-053-04**（TEST-053-04 · 检查 `integration`）Given candidate C1 的 AC-A 已有 QA PASS 和 Review PASS，当前已验收计数包含 AC-A；When Developer 提交新 commit 并冻结 C2；Then 当前投影中 AC-A 对 C2 为 NOT_RUN，已验收计数减 1；C1 的 PASS 行保留（acceptance_results 行数不减）；Runtime 为 C2 自动派发新的 QA 和 Review
-  - 判定：snapshot 中 AC-A 对当前 candidate 为 NOT_RUN；accepted 计数=之前-1；acceptance_results 行数前后相等；C2 的 qa 与 reviewer dispatch 各 1 条
+- **AC-053-04**（TEST-053-04 · 检查 `integration`）Given candidate C1 的 AC-A 已有 QA PASS 和 Review PASS，当前已验收计数包含 AC-A；When Developer 提交新 commit 并冻结 C2；Then 当前投影中 AC-A 对 C2 为 NOT_RUN，已验收计数减 1；C1 的 PASS 行保留（acceptance_results 行数不减）；Runtime 为 C2 自动派发新的 QA 和 Review（qa 与 reviewer 各 1 条 kind=handoff 消息）
+  - 判定：snapshot 中 AC-A 对当前 candidate 为 NOT_RUN；accepted 计数=之前-1；acceptance_results 行数前后相等；C2 的 qa 与 reviewer kind=handoff 消息各 1 条
 - **AC-053-05**（TEST-053-05 · 检查 `adapter-live`）Given 真实 Developer 会话与真实 QA 会话（不同原生会话；默认绑定 Claude/Pi，v0.1 可为两个 Claude 会话）；植入缺陷的小仓库，其中 AC-B 的确定性测试必然失败；When 以 hoh 真实运行一次 candidate→QA 循环；Then QA 的 native session id 与 Developer 不同，二者都记录在 sessions 表；QA 报告绑定 C，其 native_attempt 记录中包含报告的 session_id；不论 QA 是否执行该测试，AC-B 的投影都不是 PASS，candidate 不是 ACCEPTED
   - 判定：session_id(qa)≠session_id(developer)，native_id 不同；QA 报告 candidate_id=C，且 native_attempt.session_ids 包含报告 session_id；AC-B 投影∈{FAIL,UNKNOWN,NOT_RUN,INVALID}；candidate 状态≠ACCEPTED
 
@@ -1432,8 +1432,8 @@ Reviewer 在独立会话中审查与 QA 相同的冻结候选，报告绑定 can
 
 - **AC-054-01**（TEST-054-01 · 检查 `integration`）Given Commander 会话 S_cmd(codex)、Developer 会话 S_dev(claude)、QA 会话 S_qa(pi)，candidate C；When 依次提交 session_id 为 S_cmd、S_dev、S_qa 的 reviewer PASS 报告，最后提交新 codex 会话 S_rev 的报告；Then 前 3 条因 session 冲突被拒绝且不计入；只接受 S_rev 的报告；sessions 表中 S_rev.role=reviewer，且 S_rev∉{S_cmd,S_dev,S_qa}
   - 判定：被拒绝的报告数=3，原因含 session 冲突；被接受的报告数=1，session_id=S_rev；S_rev.role=reviewer
-- **AC-054-02**（TEST-054-02 · 检查 `integration`）Given Reviewer 开始审查时 candidate 为 C1；审查期间 Developer 提交新 commit 并冻结了 C2；When Reviewer 提交 candidate_id=C1 的 PASS 报告；Then 报告记为 stale，不计入 C2；C2 的 review 状态为 NOT_RUN，并已自动派发新的 Review；C1 的报告保留为历史
-  - 判定：C1 报告的状态为 stale/rejected for current；C2 的 review 状态=NOT_RUN；recipient_role=reviewer 且 candidate_id=C2 的 dispatch 有 1 条；C1 报告记录仍可查询
+- **AC-054-02**（TEST-054-02 · 检查 `integration`）Given Reviewer 开始审查时 candidate 为 C1；审查期间 Developer 提交新 commit 并冻结了 C2；When Reviewer 提交 candidate_id=C1 的 PASS 报告；Then 报告记为 stale，不计入 C2；C2 的 review 状态为 NOT_RUN，并已自动派发新的 Review（recipient_role=reviewer、candidate_id=C2 的 kind=handoff 消息 1 条）；C1 的报告保留为历史
+  - 判定：C1 报告的状态为 stale/rejected for current；C2 的 review 状态=NOT_RUN；recipient_role=reviewer 且 candidate_id=C2 的 kind=handoff 消息有 1 条；C1 报告记录仍可查询
 - **AC-054-03**（TEST-054-03 · 检查 `integration`）Given candidate C 已冻结；reader_slots=2；QA FakeAgent 的检查结果为 FAIL，Reviewer FakeAgent 正常完成；When Runtime 处理 candidate_ready；Then QA 和 Review 各有 1 个 attempt，session_id 不同；两份 handoff 的 candidate 逐字段相同；两个 attempt 的运行区间有重叠；QA FAIL 后 Review 仍完成并保存报告；candidate 不是 ACCEPTED
   - 判定：qa 与 reviewer 的 attempt 各 1 个，session_id 不同；两份 handoff 中的 candidate JSON 相同；max(started_at)<min(ended_at)；Review 报告存在，raw_session 的 sha256 可校验；candidate 状态≠ACCEPTED
 - **AC-054-04**（TEST-054-04 · 检查 `integration`）Given Reviewer 为 C 提交 status=FAIL 的报告，findings 含 2 条：F1 severity=critical（evidence 指向 src/a.rs 的审查摘录），F2 severity=low；When Runtime 接收该报告；Then issues 新增 2 行，severity 分别为 critical 和 low，candidate_id=C，各有 fingerprint 并引用 finding.id；Issue→报告→raw_session 的 sha256 链可校验；存在 OPEN critical 时 candidate 不 ACCEPTED

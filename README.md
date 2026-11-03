@@ -8,7 +8,7 @@
 
 | 项 | 状态 |
 |---|---|
-| 基线 | HOH-BASELINE-1.1 revision 4（CR-001、CR-002、CR-003） |
+| 基线 | HOH-BASELINE-1.1 revision 5（CR-001、CR-002、CR-003、CR-004） |
 | 已完成 | M0：环境、Cargo workspace、检查计划骨架、三种 Agent 的真实协议样例，3 轮独立审查 |
 | 开工前修正 | CR-003：任务图按 AC 显式归属（58 个任务）、门禁改为逐测试证据、M2 规格缺口补齐、细化 CR 预授权、测试基础设施 |
 | 下一步 | M1-T01（领域类型与 HCP 协议类型），按 `python3 tools/taskboard.py next` 推进 |

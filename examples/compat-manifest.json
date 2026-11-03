@@ -1,0 +1,75 @@
+{
+  "schema_version": "1.0",
+  "generated_at": "2026-11-03T00:00:00Z",
+  "agents": {
+    "codex": {
+      "cli_version": "codex-cli 0.166.0",
+      "launcher_path": "/home/dev/.local/bin/codex",
+      "launcher_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "implementation_path": "/home/dev/.local/lib/node_modules/@openai/codex/vendor/x86_64-unknown-linux-musl/codex/codex",
+      "implementation_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "transport": "app-server",
+      "help_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+      "schema_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+      "capabilities": {
+        "structured_events": true,
+        "resume": true,
+        "mid_turn_steer": true,
+        "token_usage": true
+      },
+      "suite": {
+        "status": "PASS",
+        "fixture_set_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+        "run_at": "2026-11-03T00:00:00Z",
+        "cases": [
+          {
+            "case": "success",
+            "status": "PASS"
+          },
+          {
+            "case": "failure",
+            "status": "PASS"
+          },
+          {
+            "case": "cancel",
+            "status": "PASS"
+          },
+          {
+            "case": "compaction",
+            "status": "PASS"
+          },
+          {
+            "case": "tool",
+            "status": "PASS"
+          },
+          {
+            "case": "unknown_field",
+            "status": "PASS"
+          }
+        ]
+      }
+    },
+    "claude": {
+      "cli_version": "2.1.317 (Claude Code)",
+      "launcher_path": "/home/dev/.local/bin/claude",
+      "launcher_sha256": "6666666666666666666666666666666666666666666666666666666666666666",
+      "implementation_path": "/home/dev/.local/bin/claude",
+      "implementation_sha256": "6666666666666666666666666666666666666666666666666666666666666666",
+      "transport": "stream-json",
+      "help_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
+      "schema_sha256": null,
+      "capabilities": {
+        "structured_events": true,
+        "resume": true,
+        "mid_turn_steer": false,
+        "partial_messages": true,
+        "token_usage": true
+      },
+      "suite": {
+        "status": "NOT_RUN",
+        "fixture_set_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
+        "run_at": null
+      }
+    }
+  }
+}
