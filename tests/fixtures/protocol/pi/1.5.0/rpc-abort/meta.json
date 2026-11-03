@@ -13,11 +13,13 @@
   ],
   "cwd": "fresh temp Git repo outside the checkout",
   "exit_code": 0,
-  "recorded_at": "2026-11-03T17:55:10.210871+00:00",
+  "recorded_at": "2026-11-03T22:01:52.777578+00:00",
   "mode": "live",
-  "valid": true,
   "notes": "abort command sent on the first message_update",
   "assistant_stop_reasons": [
     "aborted"
-  ]
+  ],
+  "stopped": "exited",
+  "valid": true,
+  "problems": []
 }

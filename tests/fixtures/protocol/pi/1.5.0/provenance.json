@@ -1,0 +1,15 @@
+{
+  "cli_version": "1.5.0",
+  "auth": "AUTHENTICATED (live turn recorded)",
+  "recording_started_at": "2026-11-03T22:01:30.450124+00:00",
+  "recorded_at": "2026-11-03T22:01:53.111279+00:00",
+  "help_argv": [
+    "pi",
+    "--help"
+  ],
+  "help_sha256": "d905f4bf6bcd5c760344b4dfb808bcf0db37185413ef675cef69531ccfc6b818",
+  "entry_path": "/home/ai/.pi/agent/bin/pi",
+  "entry_sha256": "da0c6a49fe94aadc9765cc7afc6ba6b17e553eed0247d0385c160bc188f5cfbb",
+  "package_path": "/home/ai/.pi/agent/install/releases/1.5.0/node_modules/@earendil-works/pi-coding-agent",
+  "package_tree_sha256": "5f4fb490ce2523a59f7f3dae1f2b88e211b56ea3d3f6d1b7b7e51dee06c790d2"
+}

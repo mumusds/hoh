@@ -7,12 +7,16 @@
     "exec",
     "--json",
     "--dangerously-bypass-approvals-and-sandbox",
+    "--model",
+    "hoh-invalid-model",
     "-"
   ],
   "cwd": "fresh temp Git repo outside the checkout",
   "exit_code": 1,
-  "recorded_at": "2026-11-03T17:54:32.600164+00:00",
+  "recorded_at": "2026-11-03T21:59:01.574867+00:00",
   "mode": "live",
+  "notes": "logged in, model unavailable to the account: the MODEL_UNAVAILABLE surface",
+  "stopped": "exited",
   "valid": true,
-  "notes": "logged in, turn failed; see the error frames"
+  "problems": []
 }

@@ -11,8 +11,10 @@
   ],
   "cwd": "fresh temp Git repo outside the checkout",
   "exit_code": 0,
-  "recorded_at": "2026-11-03T17:55:04.683159+00:00",
+  "recorded_at": "2026-11-03T22:01:44.005061+00:00",
   "mode": "live",
+  "notes": "set_model with an unknown provider/model",
+  "stopped": "exited",
   "valid": true,
-  "notes": "set_model with an unknown provider/model"
+  "problems": []
 }

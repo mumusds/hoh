@@ -12,16 +12,19 @@
   ],
   "cwd": "fresh temp Git repo outside the checkout",
   "exit_code": 0,
-  "recorded_at": "2026-11-03T17:37:37.828699+00:00",
+  "recorded_at": "2026-11-03T22:00:18.892662+00:00",
   "mode": "live",
-  "valid": true,
   "notes": "SIGINT to the process group 4 s after a foreground Bash tool_use frame, before its tool_result",
   "sigint_after_frame_index": 4,
   "recorder_state": "SIGINT sent during foreground tool",
+  "killed_by_recorder": false,
   "frames_after_sigint": [
     "system:task_notification",
     "user",
     "user",
     "result:error_during_execution"
-  ]
+  ],
+  "stopped": "exited",
+  "valid": true,
+  "problems": []
 }
