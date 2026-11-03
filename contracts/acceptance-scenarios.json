@@ -454,6 +454,32 @@
    ]
   },
   {
+   "id": "TEST-005-06",
+   "requirement_id": "REQ-005",
+   "acceptance_id": "AC-005-06",
+   "check_id": "deployment",
+   "fixture": "临时 HOME（XDG_* 指向临时目录）、systemd --user、候选发布包、fixture Git 项目",
+   "steps": [
+    "解压候选发布包并执行 install.sh",
+    "记录 command -v hoh、hoh --version 与 unit 状态",
+    "在 fixture 项目 detach 一个 run 并 attach",
+    "执行 install.sh --uninstall 并记录残留文件"
+   ],
+   "pass_criteria": [
+    "hoh 位于 $HOME/.local/bin 且版本含候选 commit",
+    "unit 已启用且 ExecStart 指向已安装二进制",
+    "detach 输出 run_id，attach 退出码0",
+    "卸载后二进制与 unit 不存在，.hoh/ 文件树 hash 不变",
+    "全程 euid≠0 且未调用 sudo"
+   ],
+   "observables": [
+    "install/uninstall 输出",
+    "systemctl --user show 输出",
+    "detach/attach 原文",
+    "卸载前后文件清单"
+   ]
+  },
+  {
    "id": "TEST-006-01",
    "requirement_id": "REQ-006",
    "acceptance_id": "AC-006-01",
@@ -875,7 +901,7 @@
     "导出 decisions、tasks、outbox、events"
    ],
    "pass_criteria": [
-    "decisions 中该行 state=REJECTED，原因含 stale_epoch",
+    "decisions 中该行 state=REJECTED，原因含 STALE_ROLE_EPOCH",
     "tasks.T.revision=5",
     "旧 decision 处理后 outbox 行数不变",
     "交接生效事件 seq < 旧 decision 拒绝事件 seq"
@@ -1169,7 +1195,7 @@
     "投递过期决策，再投递新决策"
    ],
    "pass_criteria": [
-    "decision#1.state=REJECTED，原因 stale_revision",
+    "decision#1.state=REJECTED，原因 STALE_REVISION",
     "decision#1 处理后 outbox 增量=0",
     "新触发器数=1，摘要中 revision=8",
     "decision#2.state=APPLIED"
@@ -3022,6 +3048,28 @@
    "observables": [
     "表驱动输入与输出 JSON",
     "测试报告"
+   ]
+  },
+  {
+   "id": "TEST-052-05",
+   "requirement_id": "REQ-052",
+   "acceptance_id": "AC-052-05",
+   "check_id": "traceability",
+   "fixture": "冻结候选 C 与 C'（删除一条测试）及其检查记录",
+   "steps": [
+    "在 C 上运行 traceability 检查",
+    "删除一条 v0.1 AC 的测试并冻结 C'，重跑相关检查",
+    "在 C' 上运行 traceability 检查"
+   ],
+   "pass_criteria": [
+    "C 退出码0，profile 内每个 TEST id 至少一条 PASS 的 test-results 记录",
+    "C' 退出码非0且列出缺失的 TEST id",
+    "报告 candidate_id 分别等于 C 与 C'"
+   ],
+   "observables": [
+    "两次 traceability 报告",
+    "各检查的 test-results.jsonl",
+    "退出码"
    ]
   },
   {

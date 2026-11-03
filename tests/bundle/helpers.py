@@ -47,13 +47,20 @@ class ReleaseFixture:
         plan_checks={}
         for key,rule in policy['checks'].items():
             entry={'mode':rule['mode'],'argv':['SYNTHETIC_FIXTURE_NOT_EXECUTED',key]}
-            arts=([names['live_sessions']] if rule['mode']=='live' else [])+([names['soak_timeline']] if key=='soak' else [])
+            arts=([names['live_sessions']] if rule['mode']=='live' else [])+([names['soak_timeline']] if key=='soak' else [])+[names['test_results']]
+            arts+=[names['independent_report']] if key in ROLE_CHECK.values() else []
+            arts+=[names['release_bundle']] if key=='build' else []
             if arts:entry['artifacts']=arts
             entry.update((plan_overrides or {}).get(key,{}))
             plan_checks[key]=entry
         self.plan=plan_checks
         c,cr=init_repository(r,plan_checks);self.candidate=c;cid=c['candidate_id']
         prof=policy['profiles'][profile];self.profile=prof
+        tests_by_check={}
+        for item in req:
+            if profile in item['release_targets']:
+                for ac in item['acceptance']:tests_by_check.setdefault(scen[ac['test_id']]['check_id'],[]).append(ac['test_id'])
+        self.attempts={};self.report_paths={}
         start=datetime(2020,1,1,tzinfo=timezone.utc);duration=policy['minimum_soak_seconds'];self.start=start
         checks=[];self.records={};self.dirs={}
         for key in prof['required_checks']:
@@ -65,7 +72,23 @@ class ReleaseFixture:
             for name in plan_checks[key].get('artifacts',[]):
                 f=r/p/'artifacts'/name;f.parent.mkdir(parents=True,exist_ok=True)
                 if name==names['live_sessions']:
-                    f.write_text(json.dumps({'schema_version':'1.0','check_id':key,'harness_candidate_id':cid,'sessions':[{'agent':'claude','cli_version':'SYNTHETIC','session_id':REPORT_SESSION.get(key,'synthetic-'+key),'resolved_model':'unknown'}]}))
+                    agents=prof.get('live_agents',{}).get(key,['claude'])
+                    sessions=[{'agent':a,'cli_version':'SYNTHETIC','session_id':REPORT_SESSION.get(key,f'synthetic-{key}-{a}'),'resolved_model':'unknown'} for a in agents]
+                    for x in sessions:
+                        if x['agent']=='pi' and policy['checks'][key].get('requires_plugins'):x['plugins']=[{'package':'synthetic-plugin','version':'0.0.0'}]
+                    f.write_text(json.dumps({'schema_version':'1.0','check_id':key,'harness_candidate_id':cid,'sessions':sessions}))
+                elif name==names['test_results']:
+                    f.write_text(''.join(json.dumps({'schema_version':'1.0','test_id':t,'name':'synthetic_'+t.lower().replace('-','_'),'status':'PASS'})+'\n' for t in tests_by_check.get(key,[])))
+                elif name==names['independent_report']:
+                    role=next(k for k,v in ROLE_CHECK.items() if v==key);sid=role+'-independent-fixture'
+                    raw=r/p/'artifacts/attempts/a1/stdout.jsonl';raw.parent.mkdir(parents=True);raw.write_text('{"synthetic_fixture_only":true}\n')
+                    attempt={'schema_version':'1.1','record_type':'bootstrap_native_attempt','role':role,'status':'NATIVE_TURN_COMPLETED','session_ids':[sid],
+                             'candidate_id':cid,'stdout_sha256':sha256(raw),'product_accepted':False}
+                    self.attempts[role]=attempt
+                    report={'schema_version':'1.1','role':role,'session_id':sid,'candidate_id':cid,'spec_sha256':c['spec_sha256'],'status':'PASS','scope':['SYNTHETIC schema test only'],
+                            'findings':[],'raw_session':ref_for(raw,r),'native_attempt':json_file(r,f'{p}/artifacts/attempts/a1/attempt.json',attempt)}
+                    f.write_text(json.dumps(report));self.report_paths[role]=(key,name)
+                elif name==names['release_bundle']:f.write_bytes(b'SYNTHETIC_NOT_A_HOH_RELEASE')
                 elif name==names['soak_timeline']:
                     events=[{'schema_version':'1.0','kind':'iteration.accepted','mode':'live','run_id':'fixture-run','iteration_id':f'fixture-{i}','harness_candidate_id':cid,
                              'occurred_at':(start+timedelta(seconds=i*duration/19)).isoformat()} for i in range(20)]
@@ -88,20 +111,14 @@ class ReleaseFixture:
                 ob={'schema_version':'1.1','ac_id':ac['id'],'test_id':ac['test_id'],'candidate_id':cid,'spec_sha256':c['spec_sha256'],'status':'PASS','check_ids':[ck],
                     'observed':'SYNTHETIC envelope used only to exercise gate invariants, not product coverage.','raw_evidence':[self.records[ck]['stdout']]}
                 accept.append({'id':ac['id'],'status':'PASS','check_ids':[ck],'observation':json_file(r,f'.hoh-dev/observations/{ac["id"]}.json',ob)})
-        reports=[];self.attempts={}
-        for role in ['qa','reviewer']:
-            sid=role+'-independent-fixture';d=self.dirs[ROLE_CHECK[role]]
-            p=r/d/'artifacts/attempts/a1/stdout.jsonl';p.parent.mkdir(parents=True);p.write_text('{"synthetic_fixture_only":true}\n')
-            attempt={'schema_version':'1.1','record_type':'bootstrap_native_attempt','role':role,'status':'NATIVE_TURN_COMPLETED','session_ids':[sid],
-                     'candidate_id':cid,'stdout_sha256':sha256(p),'product_accepted':False}
-            self.attempts[role]=attempt
-            report={'schema_version':'1.1','role':role,'session_id':sid,'candidate_id':cid,'spec_sha256':c['spec_sha256'],'status':'PASS','scope':['SYNTHETIC schema test only'],
-                    'findings':[],'raw_session':ref_for(p,r),'native_attempt':json_file(r,f'{d}/artifacts/attempts/a1/attempt.json',attempt)}
-            reports.append({k:report[k] for k in ['role','session_id','candidate_id','spec_sha256','status']}|{'artifact':json_file(r,f'{d}/artifacts/report-{role}.json',report)})
-        artifact=r/'.hoh-dev/synthetic-release.bin';artifact.write_bytes(b'SYNTHETIC_NOT_A_HOH_BINARY')
+        reports=[]
+        for role,(key,name) in self.report_paths.items():
+            art=next(a for a in self.records[key]['artifacts'] if a['name']==name);report=load_json(r/art['path'])
+            reports.append({k:report[k] for k in ['role','session_id','candidate_id','spec_sha256','status']}|{'artifact':{'path':art['path'],'sha256':art['sha256']}})
+        bundle=next(a for a in self.records['build']['artifacts'] if a['name']==names['release_bundle'])
         self.manifest={'schema_version':'1.1','baseline_id':policy['baseline_id'],'profile':profile,'requirements_sha256':sha256(r/'contracts/requirements.json'),
                        'candidate_id':cid,'candidate_manifest':cr,'spec_sha256':c['spec_sha256'],'developer_session_id':'developer-fixture',
-                       'checks':checks,'acceptance':accept,'independent_reports':reports,'open_issues':[],'release_artifact':ref_for(artifact,r)}
+                       'checks':checks,'acceptance':accept,'independent_reports':reports,'open_issues':[],'release_artifact':{'path':bundle['path'],'sha256':bundle['sha256']}}
         if prof['requires_soak']:
             t=next(a for a in self.records['soak']['artifacts'] if a['name']==names['soak_timeline'])
             self.manifest['soak']={'execution_check_id':'soak','live_iterations':20,'timeline':{'path':t['path'],'sha256':t['sha256']}}
@@ -124,18 +141,30 @@ class ReleaseFixture:
         if status:row['status']=status;fields['status']=status
         if check_ids:row['check_ids']=check_ids;fields['check_ids']=check_ids
         self.edit_observation(ac_id,**fields)
+    def rebind_report(self,which,report):
+        """Rewrite a report and re-bind its hash in the check record (a self-consistent but altered record)."""
+        row=next(x for x in self.manifest['independent_reports'] if x['role']==which);key,name=self.report_paths[which]
+        self.rewrite_artifact(key,name,json.dumps(report))
+        art=next(a for a in self.records[key]['artifacts'] if a['name']==name);row['artifact']={'path':art['path'],'sha256':art['sha256']}
     def edit_attempt(self,which,**fields):
         row=next(x for x in self.manifest['independent_reports'] if x['role']==which)
         report=load_json(self.root/row['artifact']['path']);attempt=self.attempts[which];attempt.update(fields)
         report['native_attempt']=json_file(self.root,report['native_attempt']['path'],attempt)
-        row['artifact']=json_file(self.root,row['artifact']['path'],report)
+        self.rebind_report(which,report)
     def edit_report(self,which,**fields):
         row=next(x for x in self.manifest['independent_reports'] if x['role']==which)
-        report=load_json(self.root/row['artifact']['path']);report.update(fields)
-        row['artifact']=json_file(self.root,row['artifact']['path'],report)
+        report=load_json(self.root/row['artifact']['path']);report.update(fields);self.rebind_report(which,report)
+    def edit_test_results(self,key,lines):
+        self.rewrite_artifact(key,self.policy['artifacts']['test_results'],''.join(json.dumps(x)+'\n' for x in lines))
     def degrade_check(self,key):
         row=self.check_row(key);row['status']='DEGRADED'
         row['degradation']={'reason':'Upstream plugin hook API incompatible with installed Pi version','upstream_ref':'example/upstream#1','diagnostic':[self.records[key]['stdout']]}
     def degrade_ac(self,ac_id,key):
+        scenario_check=self.ac_check[ac_id];tid='TEST-'+ac_id[3:]
+        art=next(a for a in self.records[scenario_check]['artifacts'] if a['name']==self.policy['artifacts']['test_results'])
+        lines=[json.loads(l) for l in (self.root/art['path']).read_text().splitlines() if l.strip()]
+        for l in lines:
+            if l['test_id']==tid:l['status']='DEGRADED'
+        self.edit_test_results(scenario_check,lines)
         self.set_ac(ac_id,status='DEGRADED',degradation={'reason':'Upstream plugin hook API incompatible with installed Pi version','upstream_ref':'example/upstream#1','diagnostic':[self.records[key]['stdout']]})
     def close(self):self.temp.cleanup()

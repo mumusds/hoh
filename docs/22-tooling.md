@@ -12,7 +12,7 @@ Pi 插件由 `tools/install_pi_plugins.py` 安装：只要 Pi 支持就带 `--ap
 
 ## 任务台账
 
-`tools/taskboard.py list|next|claim|set`：claim 原子领取并记录 owner；同一时间只允许一个 writer 任务；依赖 outline 需求的 implement/verify/release 任务不可领取；状态迁移受限，重新打开已完成任务会阻塞已开始的下游任务。详见 docs/08。
+`tools/taskboard.py list|next|claim|set`：claim 原子领取并记录 owner；同一时间只允许一个 writer 任务（`next` 在已有写任务运行时只推荐非写任务）；依赖 outline 需求的 implement/verify/release 任务不可领取；状态迁移受限，重新打开已完成任务会阻塞已开始的下游任务。台账固定在主 worktree 的 `.hoh-dev/task-state.json`，链接 worktree（例如冻结的 soak 检出）共享同一台账。任务的 `acceptance`/`checks`/`profile` 字段与归属规则见 docs/08。
 
 ## 原生单次任务桥
 
@@ -26,7 +26,9 @@ python3 tools/agent_task.py --agent codex --role reviewer --prompt-file .hoh-dev
 
 真实任务必须引用当前 REQ 与候选，不能拿示例上下文验收。桥会探测实际 help（按整词匹配参数），记录 CLI 版本、会话 id 和解析出的模型，不把聊天中的“完成”当最终成功。Pi 的 JSON 单次进程退出，不能替代产品 Pi RPC 中对 `agent_settled` 的协商。
 
-桥默认插入局部任务信封，并给子进程设置 `HOH_BOOTSTRAP_PARENT`，阻止下级会话递归启动顶层会话。`--top-level` 只允许 commander/developer 角色，且只能在不处于任何自举会话中时使用。桥不重试、不调度下一任务、不充当总指挥。原生子进程的完成记录永远是 `product_accepted:false`。超时会终止本次进程组并保存失败；收到 SIGTERM 时记录 INTERRUPTED。在 `run_check` 之下运行时（存在 `HOH_EVIDENCE_DIR`），attempt 目录默认放在该检查的证据目录内，记录被测 candidate_id 与 check_id，并把观察到的会话追加到该检查的 `live-sessions.json`。这正是独立 QA/Review 检查应有的运行方式。SIGTERM/SIGHUP 会先停止原生进程组，再写入 INTERRUPTED 记录。
+桥默认插入局部任务信封，并给子进程设置 `HOH_BOOTSTRAP_PARENT`，阻止下级会话递归启动顶层会话。`--top-level` 只允许 commander/developer 角色，且只能在不处于任何自举会话中时使用。桥不重试、不调度下一任务、不充当总指挥。原生子进程的完成记录永远是 `product_accepted:false`。成功判定只看终态：Codex 的 `turn.completed`/`turn.failed`，Claude 的 `result`，Pi 的最后一条助手消息与 `auto_retry_end`；原生 CLI 自己重试的瞬时错误计入 `transient_errors`，不判失败。Pi JSON 模式的会话 id 取自首行 `{"type":"session","id":…}`。
+
+**独立报告（`--report-out`，仅 qa/reviewer）：** 会话结束后，桥从最后一条助手消息的 ```hoh-report 代码块读取 `{role, status, scope, findings}`，补上 session_id（必须恰好一个）、candidate_id 与 spec_sha256（来自 run_check 设置的 `HOH_CANDIDATE_ID`、`HOH_SPEC_SHA256`）、raw_session 与 native_attempt 的路径和哈希，按 `contracts/independent-report.schema.json` 校验后写出。Agent 自己写身份或哈希字段会被拒绝（退出码 65，原因写入 attempt.json 的 `report_error`）。超时会终止本次进程组并保存失败；收到 SIGTERM 时记录 INTERRUPTED。在 `run_check` 之下运行时（存在 `HOH_EVIDENCE_DIR`），attempt 目录默认放在该检查的证据目录内，记录被测 candidate_id 与 check_id，并把观察到的会话追加到该检查的 `live-sessions.json`。这正是独立 QA/Review 检查应有的运行方式。SIGTERM/SIGHUP 会先停止原生进程组，再写入 INTERRUPTED 记录。
 
 ## 检查计划、冻结候选与执行检查
 
@@ -42,7 +44,8 @@ python3 tools/run_check.py --check-id unit \
 ```
 
 - **执行内容：** `run_check` 只执行计划中的 argv；`--` 后给出命令时必须与计划完全一致。mode 与 cwd 只能来自计划。
-- **环境变量：** 子进程拿到 `HOH_EVIDENCE_DIR`、`HOH_CHECK_ID`、`HOH_CANDIDATE_ID`。
+- **环境变量：** 子进程拿到 `HOH_EVIDENCE_DIR`、`HOH_CHECK_ID`、`HOH_CANDIDATE_ID`、`HOH_SPEC_SHA256`、`HOH_CANDIDATE_FILE`、`HOH_CHECK_RECORD_ID`。
+- **逐测试结果：** 凡是某条 AC 的场景检查，都要在 `$HOH_EVIDENCE_DIR/test-results.jsonl` 写逐测试结果（`contracts/test-result.schema.json`）；build 检查产出 `hoh-release.tar.gz`；independent-qa/independent-review 产出 `independent-report.json`。validate_bundle 要求检查计划声明这些产物。
 - **产物：** 计划声明的产物缺失时检查失败；证据目录只能追加，不能覆盖。
 - **信号：** SIGTERM/SIGHUP/Ctrl-C 时先停止检查进程组（给内层 agent_task 留 15 s 收尾），再写入退出码 130 的执行记录。候选清单必须位于项目内。
 - **候选校验：** 冻结清单保存 Git commit/tree、全部已跟踪文件的 hash 和 spec/environment/test plan 的 hash，检查前后都会校验。候选改动、环境清单被改、出现未跟踪源码都会被拒绝。
@@ -61,13 +64,19 @@ python3 tools/release_gate.py --manifest .hoh-dev/release/manifest.json
 ## 基线、CR 与生成视图
 
 - `tools/baseline.py verify`：核对基线锁和 CR 记录（`docs/cr/`；必须包含 `ID：`、`状态：APPROVED`、`批准人：` 三行）。
-- `tools/baseline.py relock --cr docs/cr/CR-00N-….md [--baseline-id …]`：为已批准的 CR 生成新的基线修订；CR 尚未提交时可用 `--amend` 重新计算。
+- `tools/baseline.py relock --cr docs/cr/CR-00N-….md [--baseline-id …] [--add <新契约文件>] [--drop <非门禁文件>]`：为已批准的 CR 生成新的基线修订；CR 尚未提交时可用 `--amend` 重新计算。
 - `tools/gen_spec_views.py`：由契约生成 `docs/02-functional-spec.md` 与 `docs/18-traceability.md`。`validate_bundle` 发现视图过期就会失败。
+
+## 开发与测试基础设施
+
+- `scripts/dev/test-infra.sh [--dry-run]`：安装 strace、sqlite3、openssh-server（SSH 测试自行启动仅回环、非特权的 sshd 实例，不启用系统服务）、qemu/KVM 与 cloud-image-utils、Chromium 的 Playwright 系统依赖、cargo-deny，并把开发用户加入 kvm 组、启用 linger；结果写入 `.hoh-dev/test-infra.json`。幂等，可重跑。
+- `scripts/dev/session-context.sh`：Claude Code 的 SessionStart 钩子（`.claude/settings.json`），在会话启动、恢复或压缩后打印分支、未提交改动、运行中任务与 PROGRESS 的下一步；委派会话（设置了 `HOH_BOOTSTRAP_PARENT`）不输出，保持审查独立。
+- `deny.toml`：依赖许可、来源与禁用规则；static 检查离线运行 `cargo deny check licenses bans sources`，CI 另外检查 RustSec 公告。
 
 ## 工具退出语义
 
 - 包自测：0 表示启动包通过；product 缺实现或清单时返回 3。
-- 原生桥：原生进程失败返回非 0；超时 124，中断 130，缺 CLI 127，不支持参数或以 root 运行 78，attempt 目录已存在 64。
+- 原生桥：原生进程失败返回非 0；超时 124，中断 130，缺 CLI 127，不支持参数或以 root 运行 78，attempt 目录已存在 64，`--report-out` 无法生成有效报告 65。
 - bootstrap：用法错误 64，能力缺失 3/78。
 - run_check：拒绝执行时返回 1，否则返回命令退出码；源码被改或产物缺失时返回非 0。
 

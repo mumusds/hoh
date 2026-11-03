@@ -34,12 +34,18 @@ def functional_spec(req:list,scen:dict)->str:
     return '\n'.join(out).rstrip()+'\n'
 
 def traceability(req:list,scen:dict,tasks:list)->str:
-    by_req={}
+    by_req={};owner={}
     for t in tasks:
         for r in t['requirements']:by_req.setdefault(r,[]).append(t['id'])
-    out=['# 需求—验收—任务追踪\n',HEADER,'|需求|功能|阶段|发布类|目标|成熟度|验收（测试·检查）|任务|','|---|---|---|---|---|---|---|---|']
+    for t in tasks:
+        if t['kind']!='implement':continue
+        for r in req:
+            if r['id'] in t['requirements']:
+                for ac in r['acceptance']:
+                    if 'acceptance' not in t or ac['id'] in t['acceptance']:owner.setdefault(ac['id'],[]).append(t['id'])
+    out=['# 需求—验收—任务追踪\n',HEADER,'|需求|功能|阶段|发布类|目标|成熟度|验收（测试·检查·实现任务）|任务|','|---|---|---|---|---|---|---|---|']
     for r in req:
-        acs='<br>'.join(f'{ac["id"]}（{ac["test_id"]}·{scen[ac["test_id"]]["check_id"]}）' for ac in r['acceptance'])
+        acs='<br>'.join(f'{ac["id"]}（{ac["test_id"]}·{scen[ac["test_id"]]["check_id"]}·{"/".join(owner.get(ac["id"],["?"]))}）' for ac in r['acceptance'])
         out.append(f'|{r["id"]}|{cell(r["title"])}|{r["milestone"]}|{r["release_class"]}|{", ".join(r["release_targets"])}|{r["spec_maturity"]}|{acs}|{", ".join(by_req.get(r["id"],[]))}|')
     n_ac=sum(len(r['acceptance']) for r in req);detailed=sum(r['spec_maturity']=='detailed' for r in req)
     out.append(f'\n合计：{len(req)} 项需求（{detailed} 项 detailed），{n_ac} 条验收。v0.1 范围：{sum("v0.1" in r["release_targets"] for r in req)} 项需求。\n')

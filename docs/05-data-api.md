@@ -28,7 +28,7 @@ ACK重复：同idempotency_key且同payload hash返回原结果；同key不同pa
 
 StartRun、SetMode、SendInput、ConfigureTeam、ProposeSpecChange、PauseRun、ResumeRun、CancelRun、GetSnapshot、GetEvents、GetArtifact、GetCapabilities为内部操作。/plan/快捷键/Web按钮映射SetMode；不由每个入口重新解释Prompt。
 
-HTTP `/v1/commands` POST接收typed command（含 ApproveSpec、AnswerQuestion 等类型化的 Plan 交互），返回202（已持久接受）含command_id和revision，不能把202理解为任务完成；同key同payload重放返回200且replayed=true。读取 `/v1/runs`、`/v1/runs/{id}` 及其 tasks/acceptance/issues/evidence/team/timeline 分页列表、`/v1/events?after=…&run_id=…`、`/v1/artifacts/{id}`。写操作带expected_revision；冲突409、缺能力422、host不可用503、token或Host/Origin不符403。未知command返回400，不静默忽略。
+HTTP `/v1/commands` POST接收typed command（含 ApproveSpec、AnswerQuestion 等类型化的 Plan 交互），返回202（已持久接受）含command_id、run_id和revision，不能把202理解为任务完成；StartRun 的 run_id 由 host 在同一接受事务内分配。同key同payload重放逐字节返回首次的202响应体并带 `Idempotent-Replayed: true` 头，同key不同payload返回409 KEY_REUSE（CR-003）。错误体的 code 取 protocol.schema.json 的 ReasonCode，附加上下文放在 details（键路径、环成员、required/available 等）。读取 `/v1/runs`、`/v1/runs/{id}` 及其 tasks/acceptance/issues/evidence/team/timeline 分页列表、`/v1/events?after=…&run_id=…`、`/v1/artifacts/{id}`。写操作带expected_revision；冲突409、缺能力422、host不可用503、token或Host/Origin不符403。未知command返回400，不静默忽略。
 
 ## 事件流
 

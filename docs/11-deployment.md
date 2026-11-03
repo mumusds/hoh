@@ -22,13 +22,13 @@ Claude优先原生官方安装 [S30]；Codex官方npm包；Pi按当前官方READ
 
 ## 生产构建目标
 
-M1创建Cargo workspace；M6实现 `cargo build --release --locked` 和 `npm ci --prefix web && npm run build --prefix web`。构建资产版本写同一manifest；缺Web或resources时发布构建必须失败。安装器支持安装到 ~/.local/bin，资源按版本目录，current原子切换；现有用户覆盖文件不覆盖。
+Cargo workspace 已在 M0-T02 建立；build 检查（`scripts/product/build.sh`）执行 `cargo build --workspace --release --locked`，在 run_check 下把二进制、resources 与（M6 起的）Web 资产打成可复现的 `hoh-release.tar.gz`（CR-003）。M6-T02 起执行 `npm ci --prefix web && npm run build --prefix web`，并把缺少 web/ 改为构建失败；v0.1 的发布包不含 Web 资产。构建资产版本写同一manifest。安装器支持安装到 ~/.local/bin，资源按版本目录，current原子切换；现有用户覆盖文件不覆盖。
 
-本包没有未实现的hoh假二进制，因此上述cargo命令在AI创建项目之前预期不可运行；完整build/check门禁初始应失败，不以占位Cargo项目假装已有产品。
+当前 `hoh` 只是不提供功能的骨架；检查计划中尚未实现的检查以 NOT_IMPLEMENTED（退出码3）失败，不以占位程序假装已有产品。安装器（M2-T14）把二进制装到 ~/.local/bin、安装 systemd --user unit，卸载时保留项目 .hoh/（AC-005-06）。
 
 ## 后台运行
 
-正式host与TUI分进程，通过Unix socket和锁文件发现。TUI关闭/SSH断开只是detach。systemd --user负责host异常重启，Restart=on-failure +有界StartLimit；ExecStart只用已安装受支持隐藏daemon入口。用户logout后持续运行需linger，脚本只在明确启用时配置。
+正式host与TUI分进程，通过Unix socket和锁文件发现。TUI关闭/SSH断开只是detach。systemd --user负责host异常重启，Restart=on-failure +有界StartLimit；ExecStart只用已安装受支持隐藏daemon入口。用户logout后持续运行需linger，脚本只在明确启用时配置（本开发 VM 已由 `scripts/dev/test-infra.sh` 经项目所有者授权启用）。
 
 自举开发可选 `scripts/start.sh codex --headless`，只是一个原生Agent调用，不宣称它本身拥有完整HoH持续恢复。原生Agent达到限制退出后记录checkpoint；使用RESUME_PROMPT继续，不用无限“继续”循环掩盖退出。
 

@@ -11,7 +11,7 @@
 7. Single writer (the taskboard allows only one running writer task) + frozen candidates + independent QA/review. Checks run only through the frozen check plan and `tools/run_check.py`. Instructions, code, specs and evidence are version-linked.
 8. Keep and finish TUI/Web, role/prompt customization, built-in skills/templates and the three Pi plugins; never silently drop scope. If a plugin is unavailable upstream, degrade it explicitly per CR-001.
 9. Never fabricate sources, model capabilities, execution results, costs or pass rates; keep mock/product/live/not_run strictly separate.
-10. Never edit the baseline or required gates to get green. Baseline changes need a CR and `tools/baseline.py relock --cr`, within the user's authorization.
+10. Never edit the baseline or required gates to get green. Baseline changes need a CR and `tools/baseline.py relock --cr`, within the user's authorization; refinement CRs that remove no scope and lower no gate are pre-authorized after an independent review (CR-003 D1, docs/21).
 11. Update `.hoh-dev/PROGRESS.md` and the taskboard after every small step; save a recovery point before the session ends or compacts.
 12. Do not stop at M1, an MVP or v0.1; unless there is a real external blocker, continue with the next task.
 13. YOLO only in the isolated VM the user declared, as a non-root development user. No privacy/sandbox side projects, but keep engineering integrity.

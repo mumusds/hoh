@@ -1,0 +1,360 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:hoh:compat-manifest:1.0",
+  "title": "Product compatibility manifest written by probe() (REQ-027, CR-003). A version is usable only while its implementation, help and schema hashes match and suite.status=PASS.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "generated_at",
+    "agents"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "agents": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "codex": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "cli_version",
+            "launcher_path",
+            "launcher_sha256",
+            "implementation_path",
+            "implementation_sha256",
+            "help_sha256",
+            "schema_sha256",
+            "suite"
+          ],
+          "properties": {
+            "cli_version": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 160
+            },
+            "launcher_path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "launcher_sha256": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            "implementation_path": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Resolved real implementation (pi release dir entry, codex vendored binary)."
+            },
+            "implementation_sha256": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            "help_sha256": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            "schema_sha256": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^[a-f0-9]{64}$",
+              "description": "Native protocol schema hash; null when the CLI has no schema command."
+            },
+            "capabilities": {
+              "type": "object",
+              "additionalProperties": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              }
+            },
+            "suite": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "status",
+                "fixture_set_sha256"
+              ],
+              "properties": {
+                "status": {
+                  "enum": [
+                    "PASS",
+                    "FAIL",
+                    "NOT_RUN"
+                  ]
+                },
+                "fixture_set_sha256": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{64}$"
+                },
+                "run_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "date-time"
+                },
+                "cases": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "case",
+                      "status"
+                    ],
+                    "properties": {
+                      "case": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "status": {
+                        "enum": [
+                          "PASS",
+                          "FAIL",
+                          "NOT_RUN"
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "claude": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "cli_version",
+            "launcher_path",
+            "launcher_sha256",
+            "implementation_path",
+            "implementation_sha256",
+            "help_sha256",
+            "schema_sha256",
+            "suite"
+          ],
+          "properties": {
+            "cli_version": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 160
+            },
+            "launcher_path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "launcher_sha256": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            "implementation_path": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Resolved real implementation (pi release dir entry, codex vendored binary)."
+            },
+            "implementation_sha256": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            "help_sha256": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            "schema_sha256": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^[a-f0-9]{64}$",
+              "description": "Native protocol schema hash; null when the CLI has no schema command."
+            },
+            "capabilities": {
+              "type": "object",
+              "additionalProperties": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              }
+            },
+            "suite": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "status",
+                "fixture_set_sha256"
+              ],
+              "properties": {
+                "status": {
+                  "enum": [
+                    "PASS",
+                    "FAIL",
+                    "NOT_RUN"
+                  ]
+                },
+                "fixture_set_sha256": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{64}$"
+                },
+                "run_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "date-time"
+                },
+                "cases": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "case",
+                      "status"
+                    ],
+                    "properties": {
+                      "case": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "status": {
+                        "enum": [
+                          "PASS",
+                          "FAIL",
+                          "NOT_RUN"
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "pi": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "cli_version",
+            "launcher_path",
+            "launcher_sha256",
+            "implementation_path",
+            "implementation_sha256",
+            "help_sha256",
+            "schema_sha256",
+            "suite"
+          ],
+          "properties": {
+            "cli_version": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 160
+            },
+            "launcher_path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "launcher_sha256": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            "implementation_path": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Resolved real implementation (pi release dir entry, codex vendored binary)."
+            },
+            "implementation_sha256": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            "help_sha256": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            "schema_sha256": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^[a-f0-9]{64}$",
+              "description": "Native protocol schema hash; null when the CLI has no schema command."
+            },
+            "capabilities": {
+              "type": "object",
+              "additionalProperties": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              }
+            },
+            "suite": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "status",
+                "fixture_set_sha256"
+              ],
+              "properties": {
+                "status": {
+                  "enum": [
+                    "PASS",
+                    "FAIL",
+                    "NOT_RUN"
+                  ]
+                },
+                "fixture_set_sha256": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{64}$"
+                },
+                "run_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "date-time"
+                },
+                "cases": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "case",
+                      "status"
+                    ],
+                    "properties": {
+                      "case": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "status": {
+                        "enum": [
+                          "PASS",
+                          "FAIL",
+                          "NOT_RUN"
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

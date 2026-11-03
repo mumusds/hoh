@@ -10,7 +10,7 @@
 
 ## 常用操作
 
-`hoh -p "依据docs/PRD.md完成项目"`：前台非交互；`--output json`最终机器结果，`--output stream-json`实时事件。`--detach`先输出run_id和提交确认，任务后台继续。`hoh attach <id>`打开该运行。`hoh web`连接相同host。`hoh doctor`看环境能力。
+`hoh -p "依据docs/PRD.md完成项目"`：前台非交互；`--output json`最终机器结果，`--output stream-json`实时事件。`--detach`先输出run_id和提交确认，任务后台继续。`hoh attach <id>`打开该运行。`hoh web`连接相同host。`hoh doctor`看环境能力：默认不调用模型，退出码0只表示没有缺失项，不代表已认证；`hoh doctor --live`才用一次小任务确认真能工作（可能产生费用）。
 
 不存在hoh plan/hoh mode plan/hoh run子命令。Shell帮助保持短；TUI输入/可搜索命令，低频设置从面板进入。
 
@@ -34,8 +34,10 @@ Workspace看统一进展与Commander决策；Team按需分屏；选中Agent进�
 
 ## 异常解释
 
-BLOCKED_AUTH：需要原生登录；BLOCKED_CAPABILITY：当前版本不支持所需接口（对应错误码 CAPABILITY_UNSUPPORTED，API 返回 422）；WAITING_EXTERNAL：已保存next_retry；INVALID_EVIDENCE：版本或文件已变；INCOMPLETE：剩余需求/预算不满足。状态不是“AI坏了”的泛化报错；每项提供诊断和恢复动作。
+NEED_DECISION：缺少只能由你给出的决定，用 `hoh -p '<答复>' --resume <run_id>` 或在 TUI 中回答；BLOCKED_AUTH：需要原生登录；BLOCKED_CAPABILITY：当前版本不支持所需接口（对应错误码 CAPABILITY_UNSUPPORTED，API 返回 422）；COMMANDER_UNAVAILABLE：Commander 无法启动，已派发的 QA/Review 照常进行；BUDGET_UNENFORCEABLE：设置了费用上限但模型价格未知，不会继续花费；COMPAT_UNVERIFIED：原生 CLI 版本变了，需要先跑兼容套件；DB_WAL_UNSUPPORTED / DB_ON_NETWORK_FS：项目所在文件系统不支持可靠的 SQLite WAL；WAITING_EXTERNAL：已保存next_retry；INVALID_EVIDENCE：版本或文件已变；INCOMPLETE：剩余需求/预算不满足；FAILED：不可恢复的运行失败或数据完整性异常。状态不是“AI坏了”的泛化报错；每项提供诊断和恢复动作。
+
+`hoh` 与 `hoh -p` 的退出码（REQ-004）：0 COMPLETED；1 FAILED；3 BLOCKED；4 INCOMPLETE；5 CANCELLED；6 PAUSED；64 用法错误；69 host 不可用；78 配置错误；130 被 SIGINT 中断（后台任务继续）；143 被 SIGTERM 中断。
 
 ## 最终报告
 
-包含产物版本、发布状态（COMPLETED / COMPLETED_DEGRADED 及降级清单 / INTERIM_RELEASED / INCOMPLETE / BLOCKED）、已验收范围、未解决事项、测试真实/模拟/未运行分类、费用实际/估算/未知、部署与回滚步骤。不能只给一句完成。模型退出与HoH完成分别显示。
+包含产物版本、发布状态（COMPLETED / COMPLETED_DEGRADED 及降级清单 / INTERIM_RELEASED / INCOMPLETE / BLOCKED / FAILED）、已验收范围、未解决事项、测试真实/模拟/未运行分类、费用实际/估算/未知、部署与回滚步骤。不能只给一句完成。模型退出与HoH完成分别显示。

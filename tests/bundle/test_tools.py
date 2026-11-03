@@ -108,11 +108,77 @@ class NativeBridge(unittest.TestCase):
         self.assertEqual(inspect_output('codex',p)['assistant_text_tail'],'HOH_NATIVE_SMOKE_OK')
     def test_claude_failure_output(self):
         p=self.root/'raw';p.write_text('{"type":"result","is_error":true,"subtype":"error_max_turns"}\n');self.assertTrue(inspect_output('claude',p)['native_error_observed'])
+    def raw(self,*records):
+        p=self.root/'raw';p.write_text(''.join(json.dumps(r)+'\n' for r in records));return p
+    def test_pi_session_header_is_the_session_id(self):
+        # Pi 1.5.0 JSON mode: first line is the session header {"type":"session","id":...} (print-mode.js, session-manager.js).
+        o=inspect_output('pi',self.raw({'type':'session','version':3,'id':'pi-session-1','cwd':'/x'},
+                                       {'type':'message_end','message':{'role':'assistant','content':[],'stopReason':'stop'}},{'type':'agent_end'}))
+        self.assertEqual(o['session_ids'],['pi-session-1']);self.assertFalse(o['native_error_observed'])
+    def test_codex_transient_error_then_completed(self):
+        o=inspect_output('codex',self.raw({'type':'thread.started','thread_id':'t'},{'type':'error','message':'Reconnecting... 1/5'},{'type':'turn.completed','usage':{}}))
+        self.assertTrue(o['terminal_observed']);self.assertFalse(o['native_error_observed']);self.assertEqual(o['transient_errors'],1)
+    def test_codex_errors_without_completion_fail(self):
+        o=inspect_output('codex',self.raw({'type':'error','message':'Reconnecting... 5/5'},{'type':'turn.failed','error':{'message':'401'}}))
+        self.assertTrue(o['native_error_observed'])
+    def test_pi_auto_retry_recovered(self):
+        o=inspect_output('pi',self.raw({'type':'message_end','message':{'role':'assistant','content':[],'stopReason':'error'}},
+                                       {'type':'auto_retry_start','attempt':1},{'type':'auto_retry_end','success':True,'attempt':1},
+                                       {'type':'message_end','message':{'role':'assistant','content':[{'type':'text','text':'ok'}],'stopReason':'stop'}},{'type':'agent_end'}))
+        self.assertFalse(o['native_error_observed']);self.assertEqual(o['transient_errors'],1)
+    def test_pi_auto_retry_exhausted_fails(self):
+        o=inspect_output('pi',self.raw({'type':'auto_retry_start','attempt':3},{'type':'auto_retry_end','success':False,'attempt':3,'finalError':'x'},
+                                       {'type':'message_end','message':{'role':'assistant','content':[],'stopReason':'error'}},{'type':'agent_end'}))
+        self.assertTrue(o['native_error_observed'])
+    def test_final_text_is_complete_last_message(self):
+        long='x'*20000+'END'
+        o=inspect_output('claude',self.raw({'type':'result','subtype':'success','result':long,'session_id':'s'}))
+        self.assertEqual(o['_final_text'],long)
     def test_oversized_json_frame(self):
         p=self.root/'raw';p.write_bytes(b'{"text":"'+b'x'*(1024*1024)+b'"}\n');self.assertEqual(inspect_output('pi',p)['malformed_records'],1)
     def test_dry_run_no_attempt_dir(self):
         p=subprocess.run([sys.executable,str(ROOT/'tools/agent_task.py'),'--agent','codex','--prompt-file',str(self.prompt),'--cwd',str(self.root),'--output-dir',str(self.root/'unused'),'--dry-run'],capture_output=True,text=True,env=self.env)
         self.assertEqual(p.returncode,0,p.stderr);self.assertFalse((self.root/'unused').exists())
+
+REPORT_BLOCK='Review done.\n```hoh-report\n'+json.dumps({'role':'reviewer','status':'FAIL','scope':['AC-001-01'],'findings':[{'id':'F1','severity':'high','summary':'AC-001-01 FAIL: x'}]})+'\n```\n'
+
+class IndependentReport(unittest.TestCase):
+    """--report-out: identity and hashes come from the bridge after the native process exited."""
+    def setUp(self):
+        self.t=tempfile.TemporaryDirectory(prefix='hoh-report-');self.addCleanup(self.t.cleanup);self.root=Path(self.t.name)
+        (self.root/'contracts').mkdir();shutil.copy(ROOT/'contracts/independent-report.schema.json',self.root/'contracts')
+        self.att=self.root/'attempt';self.att.mkdir();(self.att/'stdout.jsonl').write_text('{}\n');(self.att/'attempt.json').write_text('{}\n')
+        self.env={'HOH_CANDIDATE_ID':'CAND-'+'a'*64,'HOH_SPEC_SHA256':'b'*64}
+    def build(self,text,sessions=('s-rev',),role='reviewer',env=None):
+        import agent_task
+        with patch.object(agent_task,'ROOT',self.root),patch.dict(os.environ,self.env if env is None else env):
+            return agent_task.build_report(role,text,list(sessions),self.att/'stdout.jsonl',self.att/'attempt.json')
+    def test_report_filled_by_bridge(self):
+        r=self.build(REPORT_BLOCK)
+        self.assertEqual((r['session_id'],r['candidate_id'],r['spec_sha256'],r['status']),('s-rev','CAND-'+'a'*64,'b'*64,'FAIL'))
+        self.assertEqual(r['raw_session'],{'path':'attempt/stdout.jsonl','sha256':ref_for(self.att/'stdout.jsonl',self.root)['sha256']})
+        self.assertEqual(r['native_attempt']['path'],'attempt/attempt.json')
+    def test_last_block_wins(self):
+        first=REPORT_BLOCK.replace('"FAIL"','"PASS"',1)
+        self.assertEqual(self.build(first+REPORT_BLOCK)['status'],'FAIL')
+    def test_missing_block(self):
+        with self.assertRaisesRegex(ValueError,'no ```hoh-report'):self.build('All good, PASS.')
+    def test_agent_cannot_supply_identity_or_hashes(self):
+        forged=REPORT_BLOCK.replace('"role"','"session_id": "dev", "role"',1)
+        with self.assertRaisesRegex(ValueError,'may only contain'):self.build(forged)
+    def test_role_mismatch(self):
+        with self.assertRaisesRegex(ValueError,'differs from --role'):self.build(REPORT_BLOCK,role='qa')
+    def test_needs_exactly_one_session(self):
+        with self.assertRaisesRegex(ValueError,'exactly one'):self.build(REPORT_BLOCK,sessions=('a','b'))
+    def test_needs_candidate_binding(self):
+        with self.assertRaisesRegex(ValueError,'HOH_SPEC_SHA256'):self.build(REPORT_BLOCK,env={'HOH_CANDIDATE_ID':'CAND-'+'a'*64,'HOH_SPEC_SHA256':''})
+    def test_schema_enforced(self):
+        bad=REPORT_BLOCK.replace('"high"','"blocker"',1)
+        with self.assertRaisesRegex(ValueError,'invalid'):self.build(bad)
+    def test_report_out_requires_reviewer_or_qa(self):
+        p=self.root/'p.md';p.write_text('x')
+        r=subprocess.run([sys.executable,str(ROOT/'tools/agent_task.py'),'--agent','claude','--role','developer','--prompt-file',str(p),'--report-out',str(self.root/'r.json'),'--dry-run'],capture_output=True,text=True)
+        self.assertEqual(r.returncode,2);self.assertIn('qa or reviewer',r.stderr)
 
 class ProcessLifecycle(unittest.TestCase):
     def test_stdout_stderr_backpressure(self):

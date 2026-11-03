@@ -40,6 +40,7 @@ description: 独立质量验收——QA在独立会话中针对一个冻结candi
 10. 写观察记录与独立报告，提交TaskResult。需要修复时只开Issue，不等待开发者修改当前候选。
 
 ## 产出物与格式
+- 自举期经 `tools/agent_task.py --report-out` 运行时：最后一条消息以 ```hoh-report 代码块给出 {role="qa", status, scope, findings}，身份与哈希字段由桥在会话结束后填写，不要自己写。
 - 每个AC一条 `contracts/acceptance-observation.schema.json` 记录：status取schema枚举（PASS/DEGRADED/FAIL/BLOCKED/FLAKY/INVALID/UNKNOWN/NOT_RUN）；BLOCKED在observed写明精确缺项，FLAKY保留首次失败与重试记录；DEGRADED附degradation{reason, upstream_ref, diagnostic}；raw_evidence引用原始输出（未执行时引用阻塞诊断）。
 - 执行记录：`contracts/execution.schema.json`，由工具生成，不手写。
 - 独立报告：`contracts/independent-report.schema.json`（字段以schema当前版本为准），role="qa"，含native_attempt（产生本报告的原生attempt记录，由Runtime/桥提供，不得伪造）。status：PASS=scope内每个AC为PASS或合规DEGRADED；FAIL=任一FAIL/INVALID；UNKNOWN=无FAIL但有UNKNOWN/NOT_RUN。findings每条{id, severity, summary, evidence}，summary以“AC-NNN-MM 状态：”开头，severity按对required AC的影响取值。

@@ -1,6 +1,6 @@
 {
  "schema_version": "1.1",
- "note": "开发计划（可细化，不在基线锁内）。状态只写.hoh-dev/task-state.json（tools/taskboard.py）。kind=implement/verify/release只能领取依赖detailed需求的任务；writer任务同一时间只能有一个在运行。 列表顺序即默认领取优先级：先走 v0.1 最短路径，再补齐 M1/M2 其余部分。",
+ "note": "开发计划（可细化，不在基线锁内）。状态只写 .hoh-dev/task-state.json（tools/taskboard.py）。kind=implement/verify/release 只能领取依赖 detailed 需求的任务；writer 任务同一时间只能有一个在运行。列表顺序即默认领取优先级。acceptance 列出任务负责的 AC（缺省时为其 requirements 的全部 AC），checks 列出任务落地的检查；validate_bundle 强制：每条 detailed AC 恰好归属一个实现任务；任务所需检查由它自己或祖先任务落地；带 profile 的任务以该 profile 全部 AC 与检查的归属任务为祖先（CR-003）。",
  "tasks": [
   {
    "id": "M0-T01",
@@ -37,6 +37,12 @@
     "M0-T02"
    ],
    "requirements": [],
+   "checks": [
+    "build",
+    "static",
+    "unit",
+    "integration"
+   ],
    "done_when": "tests/check-plan.json通过schema；对骨架执行一次product模式unit检查并留execution.json；未实现的检查明确失败而非echo成功。"
   },
   {
@@ -66,6 +72,19 @@
    "done_when": "record.py 录制以上五类用例且全部 valid（成功以 turn.completed / turn/completed 判定，中断以中断状态判定），compat-manifest 中对应 case 齐全；缺任一项保持 blocked。"
   },
   {
+   "id": "M0-T07",
+   "milestone": "M0",
+   "kind": "setup",
+   "owner_role": "cto",
+   "writer": true,
+   "title": "CR-003 打通自主开发堵点：修正任务图与工具缺陷、补齐 M2 规格缺口与门禁漏洞、细化 CR 预授权规则、测试基础设施与质量门控",
+   "depends_on": [
+    "M0-T05"
+   ],
+   "requirements": [],
+   "done_when": "CR-003 已 APPROVED 并 relock；validate_bundle 新增任务/检查归属规则且全部任务通过；agent_task 正确识别 Pi 会话与瞬时重试；unit/integration 产出 test-results.jsonl；release_gate 强制逐测试证据、live 检查的 Agent 集合、独立报告与发布物归属；docs/23 审计报告与 CLAUDE.md/README/goal.md 已更新；check.sh --bundle 与 product 静态/单元检查通过；独立 Review 无 critical/high。"
+  },
+  {
    "id": "M0-T06",
    "milestone": "M0",
    "kind": "setup",
@@ -91,7 +110,10 @@
    "requirements": [
     "REQ-027"
    ],
-   "done_when": "Rust类型与contracts/protocol.schema.json往返测试通过；未知字段/事件保留不panic。"
+   "acceptance": [
+    "AC-027-01"
+   ],
+   "done_when": "Rust 类型与 contracts/protocol.schema.json 往返测试通过；未知字段/事件保留不 panic；产品 compat manifest 符合 contracts/compat-manifest.schema.json；AC-027-01 通过。"
   },
   {
    "id": "M1-T02",
@@ -119,7 +141,43 @@
    "requirements": [
     "REQ-025"
    ],
-   "done_when": "REQ-025全部fixture AC通过；live AC在有认证时执行，否则BLOCKED。"
+   "checks": [
+    "adapter-live"
+   ],
+   "done_when": "REQ-025 全部 AC 通过（adapter-live 在有认证时执行，否则 BLOCKED）；adapter-live 检查脚本落地（tests/check-plan.json 不再指向 not-implemented.sh，产出 live-sessions.json 与 test-results.jsonl）；补录含 tool_use 的 Claude 成功样例。"
+  },
+  {
+   "id": "M1-T04",
+   "milestone": "M1",
+   "kind": "implement",
+   "owner_role": "developer",
+   "writer": true,
+   "title": "Codex适配器：App Server优先、exec降级不冒充steer，fixture回放",
+   "depends_on": [
+    "M1-T02",
+    "M0-T05",
+    "M1-T03"
+   ],
+   "requirements": [
+    "REQ-024"
+   ],
+   "done_when": "REQ-024全部fixture AC通过；live AC在有认证时执行，否则BLOCKED。"
+  },
+  {
+   "id": "M1-T05",
+   "milestone": "M1",
+   "kind": "implement",
+   "owner_role": "developer",
+   "writer": true,
+   "title": "Pi RPC适配器：LF字节分帧、disposition/settled、UI请求响应或取消，fixture回放",
+   "depends_on": [
+    "M1-T02",
+    "M1-T03"
+   ],
+   "requirements": [
+    "REQ-026"
+   ],
+   "done_when": "REQ-026全部fixture AC通过；live AC在有认证时执行，否则BLOCKED。"
   },
   {
    "id": "M1-T06",
@@ -127,7 +185,7 @@
    "kind": "implement",
    "owner_role": "developer",
    "writer": true,
-   "title": "CLI命令面：hoh / -p / attach / web / doctor 解析，输出通道与退出码表",
+   "title": "CLI命令面：hoh / -p / attach / web / doctor 参数解析、usage 错误与退出码映射",
    "depends_on": [
     "M1-T01"
    ],
@@ -136,7 +194,12 @@
     "REQ-003",
     "REQ-004"
    ],
-   "done_when": "REQ-002/003/004全部AC通过；help golden快照入库。"
+   "acceptance": [
+    "AC-003-01",
+    "AC-003-02",
+    "AC-004-01"
+   ],
+   "done_when": "AC-003-01/02、AC-004-01 通过；help golden 快照入库。需要 host/Runtime 的端到端 AC 归 M2-T13。"
   },
   {
    "id": "M1-T08",
@@ -151,7 +214,67 @@
    "requirements": [
     "REQ-001"
    ],
-   "done_when": "REQ-001全部AC在PTY中通过。"
+   "acceptance": [
+    "AC-001-03"
+   ],
+   "checks": [
+    "tui-pty"
+   ],
+   "done_when": "TUI shell 可进入 Workspace（无 host 时显示离线状态）、输入历史可用，SIGTERM/SIGHUP/panic 后终端状态恢复的 PTY 测试通过；tui-pty 检查脚本落地并产出 test-results.jsonl；AC-001-03 通过。AC-001-01/02 归 M2-T13。"
+  },
+  {
+   "id": "M1-T07",
+   "milestone": "M1",
+   "kind": "implement",
+   "owner_role": "developer",
+   "writer": true,
+   "title": "hoh doctor 与跨适配器协议一致性（已知/未知帧登记、1 MiB 帧上限）",
+   "depends_on": [
+    "M1-T03",
+    "M1-T04",
+    "M1-T05",
+    "M1-T06"
+   ],
+   "requirements": [
+    "REQ-006",
+    "REQ-027"
+   ],
+   "acceptance": [
+    "AC-006-01",
+    "AC-006-02",
+    "AC-006-03",
+    "AC-027-02",
+    "AC-027-03"
+   ],
+   "done_when": "REQ-006 全部 AC 与 AC-027-02/03 通过；三个适配器的已知帧登记表随样例入库。"
+  },
+  {
+   "id": "M1-T09",
+   "milestone": "M1",
+   "kind": "verify",
+   "owner_role": "reviewer",
+   "writer": false,
+   "title": "M1独立QA+Review（独立会话，fixture与live结果分开报告）",
+   "depends_on": [
+    "M1-T03",
+    "M1-T04",
+    "M1-T05",
+    "M1-T06",
+    "M1-T07",
+    "M1-T08"
+   ],
+   "requirements": [
+    "REQ-001",
+    "REQ-002",
+    "REQ-003",
+    "REQ-004",
+    "REQ-006",
+    "REQ-024",
+    "REQ-025",
+    "REQ-026",
+    "REQ-027"
+   ],
+   "done_when": "同一冻结候选上由独立会话完成QA与Review（不同于开发会话），对祖先任务已实现的每条 AC 给出 PASS/FAIL/BLOCKED/NOT_RUN 及原始证据（fixture 与 live 分开）；critical/high 问题为零或已开修复任务。"
   },
   {
    "id": "M2-T01",
@@ -164,10 +287,14 @@
     "M1-T01"
    ],
    "requirements": [
-    "REQ-062",
-    "REQ-036"
+    "REQ-062"
    ],
-   "done_when": "REQ-062全部AC通过；事务原子性故障注入测试通过。"
+   "acceptance": [
+    "AC-062-04",
+    "AC-062-05",
+    "AC-062-06"
+   ],
+   "done_when": "writer actor、迁移/user_version、WAL/FK/busy_timeout、state+event+outbox 单事务的单元与故障注入测试通过；AC-062-04/05/06 通过。"
   },
   {
    "id": "M2-T02",
@@ -183,7 +310,37 @@
     "REQ-035",
     "REQ-036"
    ],
-   "done_when": "REQ-035/036全部AC通过；非法迁移被拒绝且不写事件。"
+   "acceptance": [
+    "AC-035-01",
+    "AC-035-04",
+    "AC-036-01"
+   ],
+   "done_when": "AC-035-01/04、AC-036-01 通过；非法迁移被拒绝且不写事件；Decision 提议按 protocol.schema.json 的 DecisionPayload 校验。"
+  },
+  {
+   "id": "M2-T12",
+   "milestone": "M2",
+   "kind": "implement",
+   "owner_role": "developer",
+   "writer": true,
+   "title": "Engine host 骨架与本地命令/查询 API：项目锁与 host_epoch、Unix socket 与 loopback HTTP、per-host token 与 Host/Origin 校验、命令幂等（202/409）、查询、COMMIT 后 SSE",
+   "depends_on": [
+    "M2-T02"
+   ],
+   "requirements": [
+    "REQ-022",
+    "REQ-036",
+    "REQ-041",
+    "REQ-062"
+   ],
+   "acceptance": [
+    "AC-022-02",
+    "AC-036-04",
+    "AC-041-04",
+    "AC-062-01",
+    "AC-062-02"
+   ],
+   "done_when": "AC-022-02、AC-036-04、AC-041-04、AC-062-01/02 通过；openapi.json 中 M2 用到的端点有契约测试。"
   },
   {
    "id": "M2-T03",
@@ -196,10 +353,21 @@
     "M2-T02"
    ],
    "requirements": [
-    "REQ-038",
-    "REQ-037"
+    "REQ-035",
+    "REQ-037",
+    "REQ-038"
    ],
-   "done_when": "REQ-037/038全部AC通过；属性测试覆盖排序稳定与租约互斥。"
+   "acceptance": [
+    "AC-035-02",
+    "AC-037-01",
+    "AC-038-01",
+    "AC-038-02",
+    "AC-038-03",
+    "AC-038-04",
+    "AC-038-05",
+    "AC-038-06"
+   ],
+   "done_when": "AC-035-02、AC-037-01、REQ-038 全部 AC 通过；属性测试覆盖排序稳定与租约互斥。"
   },
   {
    "id": "M2-T04",
@@ -213,9 +381,16 @@
    ],
    "requirements": [
     "REQ-022",
-    "REQ-019"
+    "REQ-062"
    ],
-   "done_when": "REQ-022全部AC通过；重复/乱序/旧epoch消息测试通过。"
+   "acceptance": [
+    "AC-022-01",
+    "AC-022-03",
+    "AC-022-04",
+    "AC-022-05",
+    "AC-062-03"
+   ],
+   "done_when": "AC-022-01/03/04/05、AC-062-03 通过；重复/乱序/旧 epoch 消息测试通过；candidate_ready 时由 Runtime 为 qa 与 reviewer 各生成 1 条 kind=handoff 消息。"
   },
   {
    "id": "M2-T05",
@@ -223,16 +398,42 @@
    "kind": "implement",
    "owner_role": "developer",
    "writer": true,
-   "title": "启动reconcile、effect ledger、重试/退避/预算持久化",
+   "title": "启动 reconcile、effect ledger、租约 fencing 与 kill -9 恢复矩阵（recovery 检查）",
    "depends_on": [
     "M2-T03",
-    "M2-T04"
+    "M2-T04",
+    "M2-T12"
    ],
    "requirements": [
-    "REQ-041",
+    "REQ-036",
+    "REQ-041"
+   ],
+   "acceptance": [
+    "AC-036-02",
+    "AC-041-01",
+    "AC-041-02",
+    "AC-041-03",
+    "AC-041-05"
+   ],
+   "checks": [
+    "recovery"
+   ],
+   "done_when": "AC-036-02、AC-041-01/02/03/05 通过；recovery 检查脚本落地并产出 test-results.jsonl。"
+  },
+  {
+   "id": "M2-T19",
+   "milestone": "M2",
+   "kind": "implement",
+   "owner_role": "developer",
+   "writer": true,
+   "title": "重试/退避/预算持久化与等待：Retry-After、WAITING_EXTERNAL、迭代/时长/费用上限（BUDGET_UNENFORCEABLE）",
+   "depends_on": [
+    "M2-T05"
+   ],
+   "requirements": [
     "REQ-042"
    ],
-   "done_when": "REQ-041/042全部AC通过；kill -9矩阵（recovery）通过。"
+   "done_when": "REQ-042 全部 AC 通过；预算与重试状态跨 host 重启保持。"
   },
   {
    "id": "M2-T06",
@@ -243,13 +444,122 @@
    "title": "后台host、detach/attach、pause与cancel分离",
    "depends_on": [
     "M2-T05",
-    "M1-T06"
+    "M1-T08"
    ],
    "requirements": [
     "REQ-005",
     "REQ-043"
    ],
-   "done_when": "REQ-005/043全部AC通过；关闭客户端不中断已接受任务。"
+   "acceptance": [
+    "AC-005-01",
+    "AC-005-02",
+    "AC-005-03",
+    "AC-005-04",
+    "AC-005-05",
+    "AC-043-01",
+    "AC-043-02",
+    "AC-043-03",
+    "AC-043-04",
+    "AC-043-05"
+   ],
+   "done_when": "AC-005-01..05 与 REQ-043 全部 AC 通过；关闭客户端不中断已接受任务。"
+  },
+  {
+   "id": "M2-T14",
+   "milestone": "M2",
+   "kind": "implement",
+   "owner_role": "developer",
+   "writer": true,
+   "title": "安装与部署：安装/卸载脚本、systemd --user unit、deployment 检查脚本",
+   "depends_on": [
+    "M2-T06"
+   ],
+   "requirements": [
+    "REQ-005"
+   ],
+   "acceptance": [
+    "AC-005-06"
+   ],
+   "checks": [
+    "deployment"
+   ],
+   "done_when": "AC-005-06 通过；deployment 检查脚本落地（tests/check-plan.json 不再指向 not-implemented.sh）并产出 test-results.jsonl。"
+  },
+  {
+   "id": "M2-T07",
+   "milestone": "M2",
+   "kind": "implement",
+   "owner_role": "developer",
+   "writer": true,
+   "title": "团队配置、角色绑定与 role_epoch（ConfigureTeam，checkpoint 生效）",
+   "depends_on": [
+    "M2-T02",
+    "M2-T12"
+   ],
+   "requirements": [
+    "REQ-018"
+   ],
+   "done_when": "REQ-018 全部 AC 通过；未知配置键被拒绝；hoh.example.toml 与内置默认等价。"
+  },
+  {
+   "id": "M2-T17",
+   "milestone": "M2",
+   "kind": "implement",
+   "owner_role": "developer",
+   "writer": true,
+   "title": "角色交接：checkpoint 交接、旧 epoch fencing、Commander 交接包、交接后崩溃恢复",
+   "depends_on": [
+    "M2-T07",
+    "M2-T04",
+    "M2-T05"
+   ],
+   "requirements": [
+    "REQ-019"
+   ],
+   "done_when": "REQ-019 全部 AC 通过；交接包通过 ContextHandoff schema 校验。"
+  },
+  {
+   "id": "M2-T08",
+   "milestone": "M2",
+   "kind": "implement",
+   "owner_role": "developer",
+   "writer": true,
+   "title": "Commander监督触发器：聚合、去抖、去重键、last_handled_seq",
+   "depends_on": [
+    "M2-T04",
+    "M2-T07",
+    "M2-T05"
+   ],
+   "requirements": [
+    "REQ-021",
+    "REQ-035"
+   ],
+   "acceptance": [
+    "AC-021-01",
+    "AC-021-02",
+    "AC-021-03",
+    "AC-021-04",
+    "AC-021-05",
+    "AC-035-05"
+   ],
+   "done_when": "REQ-021 全部 AC 与 AC-035-05 通过（FakeClock）；Commander 不可用时 Run 进入 BLOCKED 而 Runtime 自动规则继续。"
+  },
+  {
+   "id": "M2-T09",
+   "milestone": "M2",
+   "kind": "implement",
+   "owner_role": "developer",
+   "writer": true,
+   "title": "上下文装箱：四层、预算分配、强制项不可裁剪",
+   "depends_on": [
+    "M2-T07",
+    "M2-T04",
+    "M2-T17"
+   ],
+   "requirements": [
+    "REQ-039"
+   ],
+   "done_when": "REQ-039全部AC通过。"
   },
   {
    "id": "M2-T10",
@@ -257,18 +567,185 @@
    "kind": "implement",
    "owner_role": "developer",
    "writer": true,
-   "title": "冻结候选、证据有效性、QA/Review barrier与结果投影；提供 v0.1 所需的 independent-qa / independent-review / traceability 检查脚本（经 run_check 运行原生独立会话并产出 live-sessions.json）",
+   "title": "冻结候选与证据有效性；independent-qa / independent-review / traceability 检查脚本",
    "depends_on": [
     "M2-T03",
     "M2-T05",
     "M1-T03"
    ],
    "requirements": [
-    "REQ-052",
+    "REQ-052"
+   ],
+   "acceptance": [
+    "AC-052-01",
+    "AC-052-02",
+    "AC-052-03",
+    "AC-052-04",
+    "AC-052-05"
+   ],
+   "checks": [
+    "independent-qa",
+    "independent-review",
+    "traceability"
+   ],
+   "done_when": "REQ-052 全部 AC 通过；independent-qa/independent-review 检查经 run_check→agent_task 运行全新原生会话并产出 live-sessions.json、independent-report.json、native-attempt.json、raw-session.jsonl；traceability 检查逐条核对范围内 TEST id 的 test-results.jsonl 通过记录；三项检查不再指向 not-implemented.sh。"
+  },
+  {
+   "id": "M2-T16",
+   "milestone": "M2",
+   "kind": "implement",
+   "owner_role": "developer",
+   "writer": true,
+   "title": "QA/Review 并行 barrier 与派发：同一冻结候选并行验证、运行后 tree 核对、barrier 期间拒绝改写、修复后新候选",
+   "depends_on": [
+    "M2-T10",
+    "M2-T08",
+    "M2-T09",
+    "M2-T19"
+   ],
+   "requirements": [
+    "REQ-035",
+    "REQ-036",
+    "REQ-037",
     "REQ-053",
     "REQ-054"
    ],
-   "done_when": "REQ-052/053/054全部AC通过；FAILED/UNKNOWN永不投影为PASS。 tests/check-plan.json 中这三项检查不再指向 not-implemented.sh。"
+   "acceptance": [
+    "AC-035-03",
+    "AC-036-03",
+    "AC-037-02",
+    "AC-037-03",
+    "AC-037-04",
+    "AC-053-03",
+    "AC-054-03"
+   ],
+   "done_when": "AC-035-03、AC-036-03、AC-037-02/03/04、AC-053-03、AC-054-03 通过；FAILED/UNKNOWN 永不投影为 PASS。"
+  },
+  {
+   "id": "M2-T18",
+   "milestone": "M2",
+   "kind": "implement",
+   "owner_role": "developer",
+   "writer": true,
+   "title": "验收结果投影与独立报告：会话独立性、过期报告、finding→issue 追踪、候选汇合函数",
+   "depends_on": [
+    "M2-T16"
+   ],
+   "requirements": [
+    "REQ-053",
+    "REQ-054"
+   ],
+   "acceptance": [
+    "AC-053-01",
+    "AC-053-02",
+    "AC-053-04",
+    "AC-053-05",
+    "AC-054-01",
+    "AC-054-02",
+    "AC-054-04",
+    "AC-054-05"
+   ],
+   "done_when": "AC-053-01/02/04/05、AC-054-01/02/04/05 通过；独立报告写入 independent_reports 表并可追溯到原始会话。"
+  },
+  {
+   "id": "M2-T15",
+   "milestone": "M2",
+   "kind": "implement",
+   "owner_role": "developer",
+   "writer": true,
+   "title": "能力匹配与缺员：fallback 选择、缺员 BLOCKED 不阻塞其他角色、compat 变化后的兼容套件闸门",
+   "depends_on": [
+    "M2-T16",
+    "M2-T03"
+   ],
+   "requirements": [
+    "REQ-020",
+    "REQ-027"
+   ],
+   "acceptance": [
+    "AC-020-01",
+    "AC-020-02",
+    "AC-020-03",
+    "AC-020-04",
+    "AC-020-05",
+    "AC-027-04"
+   ],
+   "done_when": "REQ-020 全部 AC 与 AC-027-04 通过。"
+  },
+  {
+   "id": "M2-T13",
+   "milestone": "M2",
+   "kind": "implement",
+   "owner_role": "developer",
+   "writer": true,
+   "title": "CLI/TUI 端到端：-p 的 NEED_DECISION/INCOMPLETE/--resume、stream-json 与 json 输出、attach 选择、TUI 进入已有 Run",
+   "depends_on": [
+    "M2-T06",
+    "M2-T08",
+    "M2-T19",
+    "M1-T04"
+   ],
+   "requirements": [
+    "REQ-001",
+    "REQ-002",
+    "REQ-003",
+    "REQ-004"
+   ],
+   "acceptance": [
+    "AC-001-01",
+    "AC-001-02",
+    "AC-002-01",
+    "AC-002-02",
+    "AC-002-03",
+    "AC-003-03",
+    "AC-004-02",
+    "AC-004-03",
+    "AC-004-04"
+   ],
+   "done_when": "AC-001-01/02、REQ-002 全部 AC、AC-003-03、AC-004-02/03/04 通过。"
+  },
+  {
+   "id": "M2-T11",
+   "milestone": "M2",
+   "kind": "verify",
+   "owner_role": "reviewer",
+   "writer": false,
+   "title": "M2独立QA+Review（独立会话，含mock故障矩阵与recovery检查）",
+   "depends_on": [
+    "M1-T09",
+    "M2-T13",
+    "M2-T14",
+    "M2-T15",
+    "M2-T17",
+    "M2-T18"
+   ],
+   "requirements": [
+    "REQ-001",
+    "REQ-002",
+    "REQ-003",
+    "REQ-004",
+    "REQ-005",
+    "REQ-018",
+    "REQ-019",
+    "REQ-020",
+    "REQ-021",
+    "REQ-022",
+    "REQ-025",
+    "REQ-027",
+    "REQ-035",
+    "REQ-036",
+    "REQ-037",
+    "REQ-038",
+    "REQ-039",
+    "REQ-041",
+    "REQ-042",
+    "REQ-043",
+    "REQ-052",
+    "REQ-053",
+    "REQ-054",
+    "REQ-062"
+   ],
+   "done_when": "同一冻结候选上由独立会话完成QA与Review（不同于开发会话），含 mock 故障矩阵与 recovery 检查；对 M1/M2 每条 AC 给出 PASS/FAIL/BLOCKED/NOT_RUN 及原始证据；critical/high 问题为零或已开修复任务。"
   },
   {
    "id": "V01-T01",
@@ -276,12 +753,9 @@
    "kind": "verify",
    "owner_role": "reviewer",
    "writer": false,
-   "title": "v0.1范围独立QA+Review：QA与Review为两个不同独立会话，对同一冻结候选",
+   "title": "v0.1 发布候选全量检查：经 run_check 运行全部 v0.1 检查，independent-qa 与 independent-review 为两个不同的全新原生会话",
    "depends_on": [
-    "M1-T03",
-    "M1-T08",
-    "M2-T06",
-    "M2-T10"
+    "M2-T11"
    ],
    "requirements": [
     "REQ-001",
@@ -303,7 +777,8 @@
     "REQ-054",
     "REQ-062"
    ],
-   "done_when": "v0.1全部AC在同一冻结候选上有PASS证据或明确FAIL/BLOCKED；critical/high为零或已开修复任务；QA、Review、开发三者会话互不相同。"
+   "profile": "v0.1",
+   "done_when": "同一冻结候选上 v0.1 profile 的全部检查有执行记录；v0.1 全部 AC 有 PASS 证据或明确 FAIL/BLOCKED；QA、Review、开发三者会话互不相同；critical/high 为零或已开修复任务（修复后重新冻结并重跑）。"
   },
   {
    "id": "V01-T02",
@@ -311,7 +786,7 @@
    "kind": "release",
    "owner_role": "developer",
    "writer": true,
-   "title": "v0.1中间版本：check plan v0.1子集、安装说明、全部v0.1检查、release_gate --profile v0.1",
+   "title": "v0.1 中间版本：汇总 release manifest、release_gate --profile v0.1、安装与发布说明",
    "depends_on": [
     "V01-T01"
    ],
@@ -335,166 +810,8 @@
     "REQ-054",
     "REQ-062"
    ],
-   "done_when": "release_gate输出release_status=INTERIM_RELEASED；QA与Review为两个不同独立会话；从未报告COMPLETED。"
-  },
-  {
-   "id": "M1-T04",
-   "milestone": "M1",
-   "kind": "implement",
-   "owner_role": "developer",
-   "writer": true,
-   "title": "Codex适配器：App Server优先、exec降级不冒充steer，fixture回放",
-   "depends_on": [
-    "M1-T02",
-    "M0-T05"
-   ],
-   "requirements": [
-    "REQ-024"
-   ],
-   "done_when": "REQ-024全部fixture AC通过；live AC在有认证时执行，否则BLOCKED。"
-  },
-  {
-   "id": "M1-T05",
-   "milestone": "M1",
-   "kind": "implement",
-   "owner_role": "developer",
-   "writer": true,
-   "title": "Pi RPC适配器：LF字节分帧、disposition/settled、UI请求响应或取消，fixture回放",
-   "depends_on": [
-    "M1-T02"
-   ],
-   "requirements": [
-    "REQ-026"
-   ],
-   "done_when": "REQ-026全部fixture AC通过；live AC在有认证时执行，否则BLOCKED。"
-  },
-  {
-   "id": "M1-T07",
-   "milestone": "M1",
-   "kind": "implement",
-   "owner_role": "developer",
-   "writer": true,
-   "title": "hoh doctor：installed/protocol/auth/unknown分项诊断，不读取或打印密钥",
-   "depends_on": [
-    "M1-T03",
-    "M1-T04",
-    "M1-T05",
-    "M1-T06"
-   ],
-   "requirements": [
-    "REQ-006"
-   ],
-   "done_when": "REQ-006全部AC通过。"
-  },
-  {
-   "id": "M1-T09",
-   "milestone": "M1",
-   "kind": "verify",
-   "owner_role": "reviewer",
-   "writer": false,
-   "title": "M1独立QA+Review（独立会话，fixture与live结果分开报告）",
-   "depends_on": [
-    "M1-T03",
-    "M1-T04",
-    "M1-T05",
-    "M1-T07",
-    "M1-T08"
-   ],
-   "requirements": [
-    "REQ-001",
-    "REQ-002",
-    "REQ-003",
-    "REQ-004",
-    "REQ-006",
-    "REQ-024",
-    "REQ-025",
-    "REQ-026",
-    "REQ-027"
-   ],
-   "done_when": "同一冻结候选上由独立会话完成QA与Review（不同于开发会话），对本阶段每条AC给出PASS/FAIL/BLOCKED/NOT_RUN及原始证据；critical/high问题为零或已开修复任务。"
-  },
-  {
-   "id": "M2-T07",
-   "milestone": "M2",
-   "kind": "implement",
-   "owner_role": "developer",
-   "writer": true,
-   "title": "团队配置、角色绑定与role_epoch、能力匹配与缺员策略",
-   "depends_on": [
-    "M2-T02"
-   ],
-   "requirements": [
-    "REQ-018",
-    "REQ-019",
-    "REQ-020"
-   ],
-   "done_when": "REQ-018/019/020全部AC通过。"
-  },
-  {
-   "id": "M2-T08",
-   "milestone": "M2",
-   "kind": "implement",
-   "owner_role": "developer",
-   "writer": true,
-   "title": "Commander监督触发器：聚合、去抖、去重键、last_handled_seq",
-   "depends_on": [
-    "M2-T04",
-    "M2-T07"
-   ],
-   "requirements": [
-    "REQ-021"
-   ],
-   "done_when": "REQ-021全部AC通过（FakeClock）。"
-  },
-  {
-   "id": "M2-T09",
-   "milestone": "M2",
-   "kind": "implement",
-   "owner_role": "developer",
-   "writer": true,
-   "title": "上下文装箱：四层、预算分配、强制项不可裁剪",
-   "depends_on": [
-    "M2-T07"
-   ],
-   "requirements": [
-    "REQ-039"
-   ],
-   "done_when": "REQ-039全部AC通过。"
-  },
-  {
-   "id": "M2-T11",
-   "milestone": "M2",
-   "kind": "verify",
-   "owner_role": "reviewer",
-   "writer": false,
-   "title": "M2独立QA+Review（独立会话，含mock故障矩阵与recovery检查）",
-   "depends_on": [
-    "M2-T06",
-    "M2-T08",
-    "M2-T09",
-    "M2-T10"
-   ],
-   "requirements": [
-    "REQ-005",
-    "REQ-018",
-    "REQ-019",
-    "REQ-020",
-    "REQ-021",
-    "REQ-022",
-    "REQ-035",
-    "REQ-036",
-    "REQ-037",
-    "REQ-038",
-    "REQ-039",
-    "REQ-041",
-    "REQ-042",
-    "REQ-043",
-    "REQ-052",
-    "REQ-053",
-    "REQ-054",
-    "REQ-062"
-   ],
-   "done_when": "同一冻结候选上由独立会话完成QA与Review（不同于开发会话），对本阶段每条AC给出PASS/FAIL/BLOCKED/NOT_RUN及原始证据；critical/high问题为零或已开修复任务。"
+   "profile": "v0.1",
+   "done_when": "release_gate 输出 release_status=INTERIM_RELEASED，manifest 引用 V01-T01 的同一候选与检查记录；从未报告 COMPLETED；随后继续 M3。"
   },
   {
    "id": "M3-T01",
@@ -504,7 +821,7 @@
    "writer": true,
    "title": "细化M3需求为detailed：每项2–5条可判定AC与场景，写CR并relock基线",
    "depends_on": [
-    "M2-T11"
+    "V01-T02"
    ],
    "requirements": [
     "REQ-007",
@@ -524,7 +841,7 @@
     "REQ-046",
     "REQ-047"
    ],
-   "done_when": "本里程碑全部需求spec_maturity=detailed；validate_bundle通过；CR已APPROVED并relock。"
+   "done_when": "本里程碑全部需求spec_maturity=detailed；validate_bundle通过；CR已APPROVED并relock；按每个实现任务≤2项需求、≤8条AC拆分本里程碑实现任务（更新 development-tasks.json 的 requirements/acceptance/checks/depends_on，validate_bundle 的归属规则通过）。"
   },
   {
    "id": "M3-T02",
@@ -638,7 +955,7 @@
     "REQ-016",
     "REQ-064"
    ],
-   "done_when": "本里程碑全部需求spec_maturity=detailed；validate_bundle通过；CR已APPROVED并relock。"
+   "done_when": "本里程碑全部需求spec_maturity=detailed；validate_bundle通过；CR已APPROVED并relock；按每个实现任务≤2项需求、≤8条AC拆分本里程碑实现任务（更新 development-tasks.json 的 requirements/acceptance/checks/depends_on，validate_bundle 的归属规则通过）。"
   },
   {
    "id": "M4-T02",
@@ -720,7 +1037,7 @@
     "REQ-057",
     "REQ-063"
    ],
-   "done_when": "本里程碑全部需求spec_maturity=detailed；validate_bundle通过；CR已APPROVED并relock。"
+   "done_when": "本里程碑全部需求spec_maturity=detailed；validate_bundle通过；CR已APPROVED并relock；按每个实现任务≤2项需求、≤8条AC拆分本里程碑实现任务（更新 development-tasks.json 的 requirements/acceptance/checks/depends_on，validate_bundle 的归属规则通过）。"
   },
   {
    "id": "M5-T02",
@@ -757,6 +1074,9 @@
     "REQ-049",
     "REQ-050",
     "REQ-051"
+   ],
+   "checks": [
+    "plugin-live"
    ],
    "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。"
   },
@@ -802,7 +1122,7 @@
     "REQ-065",
     "REQ-066"
    ],
-   "done_when": "本里程碑全部需求spec_maturity=detailed；validate_bundle通过；CR已APPROVED并relock。"
+   "done_when": "本里程碑全部需求spec_maturity=detailed；validate_bundle通过；CR已APPROVED并relock；按每个实现任务≤2项需求、≤8条AC拆分本里程碑实现任务（更新 development-tasks.json 的 requirements/acceptance/checks/depends_on，validate_bundle 的归属规则通过）。"
   },
   {
    "id": "M6-T02",
@@ -819,6 +1139,9 @@
     "REQ-059",
     "REQ-060",
     "REQ-061"
+   ],
+   "checks": [
+    "web-e2e"
    ],
    "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。"
   },
@@ -875,7 +1198,7 @@
     "REQ-069",
     "REQ-070"
    ],
-   "done_when": "本里程碑全部需求spec_maturity=detailed；validate_bundle通过；CR已APPROVED并relock。"
+   "done_when": "本里程碑全部需求spec_maturity=detailed；validate_bundle通过；CR已APPROVED并relock；按每个实现任务≤2项需求、≤8条AC拆分本里程碑实现任务（更新 development-tasks.json 的 requirements/acceptance/checks/depends_on，validate_bundle 的归属规则通过）。"
   },
   {
    "id": "M7-T02",
@@ -907,6 +1230,9 @@
    ],
    "requirements": [
     "REQ-067"
+   ],
+   "checks": [
+    "soak"
    ],
    "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。"
   },
@@ -994,6 +1320,7 @@
     "REQ-069",
     "REQ-070"
    ],
+   "profile": "v1",
    "done_when": "release_gate --profile v1 PASS，release_status为COMPLETED或COMPLETED_DEGRADED；否则如实INCOMPLETE/BLOCKED。"
   }
  ]

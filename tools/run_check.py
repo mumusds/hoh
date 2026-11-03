@@ -51,7 +51,8 @@ def main(argv=None):
     except (ValueError,KeyError,OSError) as e:print('Refusing to run check: '+str(e),file=sys.stderr);return 1
     timeout=a.timeout or float(entry.get('timeout_seconds',3600))
     record_id=str(uuid.uuid4());artifact_dir=out/'artifacts';artifact_dir.mkdir(parents=True)
-    env=os.environ|{'HOH_EVIDENCE_DIR':str(artifact_dir),'HOH_CHECK_ID':a.check_id,'HOH_CANDIDATE_ID':candidate['candidate_id'],'HOH_CHECK_RECORD_ID':record_id}
+    env=os.environ|{'HOH_EVIDENCE_DIR':str(artifact_dir),'HOH_CHECK_ID':a.check_id,'HOH_CANDIDATE_ID':candidate['candidate_id'],'HOH_SPEC_SHA256':candidate['spec_sha256'],
+         'HOH_CANDIDATE_FILE':str(candidate_file),'HOH_CHECK_RECORD_ID':record_id}
     started=utcnow();interrupted=False;previous=install_termination_handlers()
     try:rc,timed,duration=execute(entry['argv'],cwd,out/'stdout.log',out/'stderr.log',timeout,env=env,grace=CHILD_GRACE)
     except OSError as exc:

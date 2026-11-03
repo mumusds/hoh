@@ -32,13 +32,16 @@
 
 1. **候选**：`tools/candidate.py freeze` 绑定已提交的源码、环境清单和测试计划。测试计划必须是已提交到 Git 的检查计划 JSON（`contracts/check-plan.schema.json`），以保证它的命令经过审查。
 2. **检查执行**：`tools/run_check.py --check-id X` 只执行计划中 X 的 argv；mode 和 cwd 由计划决定，执行前后都核对候选，并把声明的产物写入 `$HOH_EVIDENCE_DIR` 后哈希。门禁比对执行记录与计划的 command、mode、cwd 和产物，并要求：计划中的 mode 等于 policy 要求的 mode；记录由 run_check（或产品 hoh）以非 root 用户产生；各检查的执行目录互不重叠。
-3. **live 检查**：必须产出 `live-sessions.json`（`contracts/live-session.schema.json`），列出实际使用的原生会话（agent、CLI 版本、session_id、解析出的模型），并绑定本检查和被测候选。经 `tools/agent_task.py` 运行时会自动追加。
+3. **live 检查**：必须产出 `live-sessions.json`（`contracts/live-session.schema.json`），列出实际使用的原生会话（agent、CLI 版本、session_id、解析出的模型），并绑定本检查和被测候选。经 `tools/agent_task.py` 运行时会自动追加。profile 的 `live_agents` 规定 live 检查必须包含的 Agent：v0.1 的 adapter-live 至少有 claude 会话；v1 的 adapter-live 必须有 claude、codex、pi 三种会话，plugin-live 必须有 pi 会话且每个 Pi 会话列出已加载的插件（CR-003）。
 4. **AC 观察**：`check_ids` 必须包含其场景要求的检查；`raw_evidence` 必须位于所引用检查的执行目录内（按解析后的真实路径判断，`..` 与符号链接不能越界），且至少一项来自场景检查本身。
-5. **独立报告**：QA 与 Reviewer 的报告、原始会话和原生 attempt 记录都必须是 independent-qa / independent-review 检查的输出。attempt 记录需满足 `contracts/native-attempt.schema.json`，并且：role 一致、状态为已完成、candidate_id 为被测候选、session_ids 包含报告的 session_id 而不含开发会话、stdout 哈希等于原始会话。报告的 session_id 还必须出现在该检查的 `live-sessions.json` 中。报告中的 critical/high finding 会阻断发布。开发、QA、Review 三个会话互不相同。
+4a. **逐测试证据（CR-003）**：场景检查必须产出 `test-results.jsonl`（每行符合 `contracts/test-result.schema.json`），其中至少有一条该 AC 的 TEST id 记录，且全部为 PASS；DEGRADED 的 AC 只允许 PASS/DEGRADED 并至少有一条 DEGRADED。测试名含 `test_NNN_MM` 片段即覆盖 TEST-NNN-MM。同一份日志不能再同时充当多条 AC 的证据。
+5. **独立报告**：QA 与 Reviewer 的报告、原始会话和原生 attempt 记录都必须是 independent-qa / independent-review 检查的输出。attempt 记录需满足 `contracts/native-attempt.schema.json`，并且：role 一致、状态为已完成、candidate_id 为被测候选、session_ids 包含报告的 session_id 而不含开发会话、stdout 哈希等于原始会话。报告的 session_id 还必须出现在该检查的 `live-sessions.json` 中。报告中的 critical/high finding 会阻断发布。报告本身必须是该检查声明的 `independent-report.json` 产物（由 `agent_task.py --report-out` 在会话结束后生成并由 run_check 哈希），检查结束后改写报告会使哈希不符（CR-003）。开发、QA、Review 三个会话互不相同。
 6. **soak**：时间线必须是 soak 检查自己产出的 `timeline.jsonl`。每行都要符合 `contracts/soak-event.schema.json`，绑定被测 HoH 候选，按时间有序，且落在执行窗口内；live `iteration.accepted` 不少于 20 个且不重复；持续时长不少于 72h（取墙钟起止差与记录时长中较小者）。
 7. **基线**：`contracts/baseline-lock.json` 锁定 CONTRACT、需求、场景、policy、全部 schema、本文件，以及门禁工具及其依赖（release_gate、candidate、run_check、common、baseline）。任何改动都需要 APPROVED 的 CR，并执行 `tools/baseline.py relock`。门禁本身也会校验 CR 记录的状态；已提交的 CR 不能再用 `--amend` 修改。
 
 这是证据一致性门禁，不是软件正确性的数学证明。即使记录形式合法，仍要审核测试是否真正覆盖需求；禁止用 echo 成功模拟测试。它也不能防止拥有整个 VM 写权限的执行者刻意伪造全部材料。
+
+**发布物（CR-003）**：manifest 的 `release_artifact` 必须是 build 检查声明的 `hoh-release.tar.gz` 产物，不能是任意文件。
 
 ## 发布结果
 

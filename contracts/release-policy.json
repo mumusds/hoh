@@ -25,7 +25,8 @@
     },
     "plugin-live": {
       "mode": "live",
-      "degradable": true
+      "degradable": true,
+      "requires_plugins": true
     },
     "recovery": {
       "mode": "product"
@@ -67,7 +68,17 @@
         "independent-review",
         "traceability"
       ],
-      "requires_soak": true
+      "requires_soak": true,
+      "live_agents": {
+        "adapter-live": [
+          "claude",
+          "codex",
+          "pi"
+        ],
+        "plugin-live": [
+          "pi"
+        ]
+      }
     },
     "v0.1": {
       "description": "Interim usable release: requirements whose release_targets contains v0.1 (CLI/TUI shell, Claude adapter, durable runtime, frozen candidate with independent QA/review). Never reported as COMPLETED.",
@@ -86,7 +97,12 @@
         "independent-review",
         "traceability"
       ],
-      "requires_soak": false
+      "requires_soak": false,
+      "live_agents": {
+        "adapter-live": [
+          "claude"
+        ]
+      }
     }
   },
   "minimum_soak_seconds": 259200,
@@ -97,11 +113,15 @@
   ],
   "artifacts": {
     "live_sessions": "live-sessions.json",
-    "soak_timeline": "timeline.jsonl"
+    "soak_timeline": "timeline.jsonl",
+    "test_results": "test-results.jsonl",
+    "independent_report": "independent-report.json",
+    "release_bundle": "hoh-release.tar.gz"
   },
   "accepted_attempt_statuses": [
     "NATIVE_TURN_COMPLETED",
     "COMPLETED"
   ],
-  "degradation_rule": "Only checks marked degradable and acceptance criteria of requirements with release_class=degradable may be DEGRADED. A DEGRADED item still needs a bound execution record, a diagnostic artifact and an upstream reference; the release status then says DEGRADED."
+  "degradation_rule": "Only checks marked degradable and acceptance criteria of requirements with release_class=degradable may be DEGRADED. A DEGRADED item still needs a bound execution record, a diagnostic artifact and an upstream reference; the release status then says DEGRADED.",
+  "evidence_rule": "Every acceptance criterion needs per-test evidence: the test_results artifact of its scenario check lists its test_id at least once and every such line is PASS (DEGRADED for a degraded AC). live_agents lists the agents whose sessions a live check must contain; plugin-live sessions must name the plugins they loaded. The release artifact is the release_bundle produced by the build check (CR-003)."
 }

@@ -159,6 +159,26 @@
       "license": "MIT"
     },
     {
+      "id": "research",
+      "version": "1.1.0",
+      "name": "局部咨询与事实研究",
+      "description": "在独立会话中回答界定清楚的问题，区分事实、实验观察、判断与未知，并给出可复核的来源；不修改产品源码。",
+      "roles": [
+        "researcher"
+      ],
+      "phases": [
+        "discover",
+        "specify",
+        "readiness",
+        "repair"
+      ],
+      "interaction": "mode-aware",
+      "entry": "resources/skills/research/SKILL.md",
+      "dependencies": [],
+      "output_contract": "TaskResult",
+      "license": "MIT"
+    },
+    {
       "id": "independent-qa",
       "version": "1.1.0",
       "name": "独立质量验收",
@@ -240,6 +260,7 @@
       "name": "完整交付",
       "description": "按发布profile逐项核对REQ/AC、必需检查、独立报告与交付物，运行release_gate并原样采用其结论（含COMPLETED_DEGRADED、INTERIM_RELEASED）。",
       "roles": [
+        "developer",
         "commander",
         "qa",
         "reviewer"

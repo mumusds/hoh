@@ -118,7 +118,7 @@ class ReleaseGate(unittest.TestCase):
         self.f.rewrite_artifact('independent-qa','live-sessions.json',json.dumps(s));self.reject('not listed in independent-qa live sessions')
     def test_report_material_from_its_check(self):
         row=next(x for x in self.m['independent_reports'] if x['role']=='qa');report=load_json(self.f.root/row['artifact']['path'])
-        row['artifact']=json_file(self.f.root,'.hoh-dev/handwritten-qa-report.json',report);self.reject('not output of the independent-qa check')
+        row['artifact']=json_file(self.f.root,'.hoh-dev/handwritten-qa-report.json',report);self.reject('not the independent-report.json produced by the independent-qa check')
     def test_report_blocking_finding(self):
         self.f.edit_report('reviewer',findings=[{'id':'F1','severity':'critical','summary':'data loss on restart'}]);self.reject('blocking findings')
     def test_root_evidence_rejected(self):self.f.edit_execution('unit',runner={'tool':'tools/run_check.py','euid':0});self.reject('non-root')
@@ -145,7 +145,8 @@ class ReleaseGate(unittest.TestCase):
         self.f.edit_execution('soak',finished_at=short.isoformat());self.reject('soak duration')
     # Baseline and identity
     def test_empty_artifact(self):
-        p=self.f.root/self.m['release_artifact']['path'];p.write_bytes(b'');self.m['release_artifact']=ref_for(p,self.f.root);self.reject('empty artifact')
+        self.f.rewrite_artifact('build','hoh-release.tar.gz','');art=next(a for a in self.f.records['build']['artifacts'] if a['name']=='hoh-release.tar.gz')
+        self.m['release_artifact']={'path':art['path'],'sha256':art['sha256']};self.reject('empty artifact')
     def test_baseline_changed(self):
         p=self.f.root/'contracts/release-policy.json';d=load_json(p);d['minimum_soak_seconds']=0;p.write_text(json.dumps(d));self.reject('baseline contract changed')
     def test_gate_tool_changed(self):
@@ -159,6 +160,47 @@ class ReleaseGate(unittest.TestCase):
     def test_committed_change_request_cannot_be_amended(self):
         lock=load_json(self.f.root/'contracts/baseline-lock.json');cr=self.f.root/lock['change_requests'][-1]['path']
         with self.assertRaisesRegex(ValueError,'already committed'):baseline.relock(self.f.root,cr,None,amend=True)
+    def test_relock_add_keeps_change_request_identity(self):
+        # Regression (CR-003 review): --add must not replace the CR path recorded in the lock.
+        cr=self.f.root/'docs/cr/CR-099-test.md';cr.parent.mkdir(parents=True,exist_ok=True)
+        cr.write_text('# test\n\nID：CR-099\n状态：APPROVED\n批准人：bundle test\n')
+        extra=self.f.root/'contracts/extra.schema.json';extra.write_text('{}\n')
+        lock=baseline.relock(self.f.root,cr,None,add=['contracts/extra.schema.json'])
+        self.assertEqual(lock['change_requests'][-1],{'id':'CR-099','path':'docs/cr/CR-099-test.md','sha256':sha256(cr)})
+        self.assertIn('contracts/extra.schema.json',lock['files']);baseline.verify_baseline(self.f.root)
+    def test_relock_add_requires_existing_file(self):
+        cr=self.f.root/'docs/cr/CR-098-test.md';cr.parent.mkdir(parents=True,exist_ok=True);cr.write_text('ID：CR-098\n状态：APPROVED\n批准人：bundle test\n')
+        with self.assertRaisesRegex(ValueError,'not a file'):baseline.relock(self.f.root,cr,None,add=['contracts/missing.json'])
+    def test_ac_needs_its_own_test_result(self):
+        ac=self.m['acceptance'][0]['id'];key=self.f.ac_check[ac];tid='TEST-'+ac[3:]
+        lines=[l for l in map(json.loads,(self.f.root/next(a for a in self.f.records[key]['artifacts'] if a['name']=='test-results.jsonl')['path']).read_text().splitlines()) if l['test_id']!=tid]
+        self.f.edit_test_results(key,lines);self.reject('no test result for '+tid)
+    def test_ac_test_result_must_pass(self):
+        ac=self.m['acceptance'][0]['id'];key=self.f.ac_check[ac];tid='TEST-'+ac[3:]
+        path=self.f.root/next(a for a in self.f.records[key]['artifacts'] if a['name']=='test-results.jsonl')['path']
+        lines=list(map(json.loads,path.read_text().splitlines()))+[{'schema_version':'1.0','test_id':tid,'name':'test_flaky','status':'FAIL'}]
+        self.f.edit_test_results(key,lines);self.reject('not PASS')
+    def test_test_results_schema(self):
+        key=self.f.ac_check[self.m['acceptance'][0]['id']]
+        self.f.edit_test_results(key,[{'test_id':'AC-001-01','status':'ok'}]);self.reject('line 1')
+    def test_scenario_check_without_test_results(self):
+        key=self.f.ac_check[self.m['acceptance'][0]['id']];rec=self.f.records[key]
+        self.f.edit_execution(key,artifacts=[a for a in rec['artifacts'] if a['name']!='test-results.jsonl']);self.reject('artifacts differ')
+    def test_live_check_needs_required_agents(self):
+        art=next(a for a in self.f.records['adapter-live']['artifacts'] if a['name']=='live-sessions.json');s=load_json(self.f.root/art['path'])
+        s['sessions']=[x for x in s['sessions'] if x['agent']!='pi'];self.f.rewrite_artifact('adapter-live','live-sessions.json',json.dumps(s));self.reject('lack required agents: pi')
+    def test_plugin_sessions_must_list_plugins(self):
+        art=next(a for a in self.f.records['plugin-live']['artifacts'] if a['name']=='live-sessions.json');s=load_json(self.f.root/art['path'])
+        for x in s['sessions']:x.pop('plugins',None)
+        self.f.rewrite_artifact('plugin-live','live-sessions.json',json.dumps(s));self.reject('plugins it loaded')
+    def test_report_must_be_declared_artifact(self):
+        row=self.m['independent_reports'][0];other=self.f.root/self.f.dirs['independent-qa']/'artifacts/other-report.json'
+        other.write_text((self.f.root/row['artifact']['path']).read_text());row['artifact']=ref_for(other,self.f.root);self.reject('is not the independent-report.json')
+    def test_report_edited_after_check(self):
+        row=self.m['independent_reports'][1];p=self.f.root/row['artifact']['path'];r=load_json(p);r['findings']=[]
+        p.write_text(json.dumps(r)+' ');row['artifact']=ref_for(p,self.f.root);self.reject('hash mismatch')
+    def test_release_artifact_must_be_build_bundle(self):
+        p=self.f.root/'.hoh-dev/other.bin';p.write_bytes(b'x');self.m['release_artifact']=ref_for(p,self.f.root);self.reject('hoh-release.tar.gz produced by the build check')
     def test_unknown_profile(self):self.m['profile']='v9';self.reject('unknown release profile')
 
 class InterimRelease(unittest.TestCase):
@@ -179,5 +221,5 @@ class PlanBinding(unittest.TestCase):
         f=ReleaseFixture(plan_overrides={'adapter-live':{'mode':'mock','artifacts':[]}});self.addCleanup(f.close)
         with self.assertRaisesRegex(GateError,'policy needs live'):validate_manifest(f.root,f.manifest)
     def test_live_check_must_declare_sessions(self):
-        f=ReleaseFixture(plan_overrides={'independent-qa':{'artifacts':[]}});self.addCleanup(f.close)
+        f=ReleaseFixture(plan_overrides={'adapter-live':{'artifacts':['test-results.jsonl']}});self.addCleanup(f.close)
         with self.assertRaisesRegex(GateError,'lacks live-sessions.json'):validate_manifest(f.root,f.manifest)

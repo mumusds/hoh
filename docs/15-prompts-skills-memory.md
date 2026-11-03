@@ -8,9 +8,9 @@ Role Contract固定职责和输出Schema；Project Context包含规格/ADR/约�
 
 ## 内置资源
 
-`resources/skills/` 为本包原创HoH工程技能，完整文件随产品分发。含需求澄清、决策地图、领域建模、设计、任务拆解、TDD、实现、QA、review、恢复、发布。参考原作方法但不冒充Matt原版，避免原Skill依赖未安装工具 [S18,S19]。
+`resources/skills/` 为本包原创HoH工程技能，完整文件随产品分发。含需求澄清、决策地图、领域建模、设计、任务拆解、TDD、实现、研究（researcher 的局部咨询，CR-003 新增）、QA、review、UX 验证、恢复、发布，共 13 个。参考原作方法但不冒充Matt原版，避免原Skill依赖未安装工具 [S18,S19]。
 
-上游grill-with-docs仅组合两个Skill；原Wayfinder真人讨论不能由Agent自问自答当用户批准。因此本包Plan_skill明确interaction=interactive/headless：前者真实问答，后者使用既有授权默认与assumption ledger，关键未知block。
+上游grill-with-docs仅组合两个Skill；原Wayfinder真人讨论不能由Agent自问自答当用户批准。因此 Plan 阶段使用的 Skill（requirements、decision-map 等）都声明 interaction=mode-aware：交互模式下真实问答，无人值守模式下使用既有授权默认与 assumption ledger，关键未知 block。没有单独的 Plan Skill；Plan 是 HoH 的行为模式（REQ-008）。
 
 `resources/templates/`包括Lite/Standard/Full manifest，按项目等级引用规范模板。部署/用户手册早期写待验证设计，完成时对真实命令更新，不能把设想留成假文档。
 

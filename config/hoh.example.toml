@@ -2,12 +2,21 @@
 config_version = "1.0"
 [project]
 default_mode = "AUTO"
-document_profile = "full"
+document_profile = "full"   # profile selection by project size is specified in M3 (REQ-029)
 [execution]
 profile = "yolo-vm"
 writer_slots = 1
 reader_slots = 2
 reserve_supervisor_slot = true
+# Cancel escalation (REQ-025/043): native interrupt, then SIGTERM to the process group, then bounded SIGKILL.
+cancel_native_grace_seconds = 10
+cancel_term_grace_seconds = 5
+[delivery]
+# Outbox redelivery limit before DEAD_LETTER (REQ-022).
+max_delivery_attempts = 5
+[persistence]
+# Bounded writer actor queue; a full queue rejects with 503 DB_BUSY instead of growing (REQ-062).
+writer_queue_capacity = 256
 # Per role: agent (codex|claude|pi), optional model (empty = native default, resolved model is recorded),
 # optional ordered fallback agents (none by default -> BLOCKED), optional prompt override path.
 # Unknown keys are rejected (REQ-018). Changes apply at the next checkpoint with a new role_epoch.
@@ -34,7 +43,10 @@ max_duration_hours = 120
 max_iterations = 100
 max_local_repairs = 3
 max_protocol_repairs = 2
-# No fabricated USD default. Optional user limit is evaluated only with known prices.
+# No fabricated USD default. Optional cost cap: if it is set and the model price is unknown, dispatch is
+# refused with BUDGET_UNENFORCEABLE (fail closed, CR-002).
+# max_usd = 20.0
+# deadline_at = "2026-12-31T00:00:00Z"   # RFC 3339 UTC; reaching it ends the run as INCOMPLETE
 [ui]
 view = "workspace"
 statusline = "standard"

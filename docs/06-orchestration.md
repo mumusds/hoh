@@ -22,6 +22,8 @@ Commander=Codex；CTO/Developer=Claude；QA/Research=Pi；Reviewer=独立Codex s
 
 Balanced默认：轮次/重要事件唤醒。Efficient减少常规检查；Intensive增加高风险task边界检查。不是定时无限“继续”。Commander不可用时已授权低风险动作可完成，遇新重大决策则BLOCKED；不要无限等待假装有人盯。
 
+**Run 级 BLOCKED 的含义（CR-003）**：BLOCKED 只停 Commander 决策类派发（新的实现任务）；已运行的 Attempt 继续到安全点，Runtime 自动规则（candidate_ready→QA/Review、已调度重试、pause/cancel、持久化）照常执行。`runs.blocked_reason` 是当前阻塞集合里优先级最高的一项（BLOCKED_AUTH > COMMANDER_UNAVAILABLE > BUDGET_UNENFORCEABLE > BLOCKED_CAPABILITY > NEED_DECISION），完整集合在 `blocked_reasons_json`；集合清空且没有 pause/cancel 请求时回到 resume_state。只有在没有其他可派发 Task、且至少一个 Task 在等待外部（next_retry_at 未到）时，Run 才是 WAITING_EXTERNAL。
+
 ## 协作与上下文
 
 角色间咨询经Router生成子task或request，带预算、parent、deadline。没有独立工具接口时用规范化结构化输出/文件提交桥；不假设所有Agent都有相同自定义工具。Runtime在安全点接收请求，再dispatch；Codex有实际steer能力时可走原生通道。

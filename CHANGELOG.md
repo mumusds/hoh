@@ -1,5 +1,18 @@
 # 变更记录
 
+## 基线 HOH-BASELINE-1.1 revision 4 — 2026-11-03（CR-003）
+
+M1 开工前的三路独立审查（[docs/23](docs/23-pre-m1-audit.md)）发现会卡住无人值守开发的流程堵点、M2 规格缺口和门禁漏洞，按项目所有者“全部同意，按推荐执行”的指令修正（[CR-003](docs/cr/CR-003-unblock-autonomous-delivery.md)）：
+
+- 流程：细化 CR 的预授权规则（docs/21）；v0.1 改在 M2 全部完成后发布（范围与门槛不变）；任务图重排为 58 个任务，每个任务显式列出负责的 AC 与落地的检查，validate_bundle 强制归属与祖先规则。
+- 工具：agent_task 识别 Pi 会话、只按终态判失败、`--report-out` 在会话结束后生成独立报告；taskboard 台账跨 worktree 共享、`next` 遵守单写者；baseline `relock --add`。
+- 门禁（加严）：每条 AC 需要场景检查产出的逐测试 PASS 记录（`test-results.jsonl`）；live 检查核对 Agent 集合与插件；独立报告与发布物必须是对应检查声明的产物。
+- 规格：统一原因码（protocol.schema.json 的 ReasonCode）、重放语义、SQL 补齐 commands/candidates/reports/team/triggers 等字段、ContextHandoff 支持角色交接、DecisionPayload/PlanProposal、Claude 取消优先、已知帧登记、鉴权失败分类、compat manifest schema、`--resume` 语义、完整配置键表。
+- 新增 AC-005-06（安装/卸载/systemd --user，deployment 检查）与 AC-052-05（traceability 检查），验收数从 164 增至 166。
+- 环境与质量门控：`scripts/dev/test-infra.sh`、cargo-deny（deny.toml，static 检查与 CI）、项目级 SessionStart 恢复钩子；新增 research Skill；CLAUDE.md、goal.md、README 更新。
+
+此前记录中“27 项 detailed 需求共 161 条 AC”的说法有误：当时 detailed 需求实有 118 条 AC（CR-002 后 121 条），161/164 是含 outline 占位 AC 的总数。
+
 ## 基线 HOH-BASELINE-1.1 revision 3 — 2026-11-03（CR-002）
 
 项目所有者确认 CR-001 批准人、v0.1 范围（18 项需求）和 M1/M2 全部暂定选择（字段更名为 `decisions`）。复审后修正四处设计缺陷：

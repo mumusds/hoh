@@ -22,6 +22,10 @@
 |R18|v0.1被误当作完成而停工|INTERIM_RELEASED状态与COMPLETED分离；AGENTS/LAUNCH明确不得在v0.1停工|不阻断|
 |R19|门禁证据被自报或手写|mode/argv/cwd取自冻结检查计划；live会话清单；AC证据须来自所引检查目录；soak时间线须由soak检查产出；报告绑定原生attempt|仍不能防止全VM写权限的刻意伪造；由独立QA/Review审查覆盖|
 |R20|本地Web被浏览器跨站请求或DNS rebinding利用|每host随机token + Host/Origin校验（openapi 1.1）|阻断Web验收|
+|R21|预授权的细化 CR 被用来悄悄缩小范围或放宽门禁（CR-003 D1）|四条授权条件 + 独立 Review 判定 PASS + validate_bundle 的范围/归属检查 + 项目所有者可随时否决|不阻断；超出条件的 CR 必须等用户批准|
+|R22|72 h soak 期间发现缺陷，修复后必须在新候选上重跑全部检查与 soak|M5 先做试运行 soak；soak 在独立 worktree 运行，台账共享（taskboard）；计划至少两个 72 h 窗口|阻断 v1 发布时间，不阻断开发|
+|R23|长会话上下文压缩后连续性下降，偏离已定流程|SessionStart 钩子注入 PROGRESS 下一步与台账状态；goal.md 防走偏规则；每步更新 PROGRESS；独立 Review 检查流程合规|不阻断|
+|R24|测试基础设施缺失或与生产环境不一致（本机只有 Ubuntu 26.04）|`scripts/dev/test-infra.sh` 幂等安装并记录版本；24.04 支持声明须在 24.04 VM（qemu/KVM）中实测|阻断对应部署验收|
 
 ## 本次审查已补充的设计
 

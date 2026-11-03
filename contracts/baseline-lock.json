@@ -1,11 +1,11 @@
 {
   "schema_version": "1.1",
   "baseline_id": "HOH-BASELINE-1.1",
-  "revision": 3,
+  "revision": 4,
   "change_policy": "Formal CR + new baseline; never lower required gates to pass",
   "previous": {
     "baseline_id": "HOH-BASELINE-1.1",
-    "lock_sha256": "5fd8647091758bbd1286d5ed8c5040b1c05738d61617ddec6458a5852cb57530"
+    "lock_sha256": "2106a1ee2d6966a445f56bf4174ae248596090b2589a3fa3a353d50f1bed5f0b"
   },
   "change_requests": [
     {
@@ -17,30 +17,37 @@
       "id": "CR-002",
       "path": "docs/cr/CR-002-confirm-m1-m2-decisions.md",
       "sha256": "0c6e1e0f55292f565dbe54410feac648391610688eb6cc8dd50a280f0b5d8316"
+    },
+    {
+      "id": "CR-003",
+      "path": "docs/cr/CR-003-unblock-autonomous-delivery.md",
+      "sha256": "cbb115970e80c4df143708023a3af83d6a96854c486be05d04859f17eb3d373a"
     }
   ],
   "files": {
     "CONTRACT.md": "39e15a3ed45fc60026386c7df2522eb895cd8fef07aa45bd923ded5f3f0df8a6",
     "contracts/acceptance-observation.schema.json": "6778331658ba0d47797185f5e2d322f62020ea8747c00d2ce9f1247440c1490e",
-    "contracts/acceptance-scenarios.json": "602f988556eeda86d0706cad71113fd1a9c748594c2b7d43192cca3766b6b7ab",
+    "contracts/acceptance-scenarios.json": "c12773bfd8896611d6582d7253e0030272a2e304454e2bbcf5f977cfcc0cc988",
     "contracts/candidate.schema.json": "5965712d9f1c16e8804f3e00dbc1e2faec0b878435ba868afd637b242bb439cb",
     "contracts/check-plan.schema.json": "d4dac3c7c3ebee4356d332541035ecf9c03d12e101acb5f7c717b1598359a86a",
+    "contracts/compat-manifest.schema.json": "d7e1ae68264a460627477ad3a8a82c2e9f10535e2af5ff6b14e8a07e278ed527",
     "contracts/execution.schema.json": "42f4dce4c68641f3eb07f8c699ba8e7a096d14a4514f4793c979cd4c3751128f",
     "contracts/independent-report.schema.json": "5d241c3689e29d9512402f1606701e2c555888eefcec681fafd64a5a709b1615",
     "contracts/live-session.schema.json": "06ee125373701d6569477be0396e6e11e6b28b7f89903a020f0f241e3ce32793",
     "contracts/native-attempt.schema.json": "34fce4de57f4dcf79a9023d66f546ef75f96a0bbccd569c982e8a4c300a25220",
-    "contracts/openapi.json": "e1b06a79ab982b1f0620127692deec566738c37d725807006dcbf21f840ac66a",
-    "contracts/protocol.schema.json": "3d40ca4da783ab755d6a56e74532de4847e5289aeb4bd9f6cd520db5fde90aff",
-    "contracts/release-policy.json": "15505aea3acb910c5b966a0ee10e33e1ffef788d8e927537e7a367a61f39ebd3",
+    "contracts/openapi.json": "3159572fd5dc18f4f32a91c754b607223a085aca2c76d5f7ce28696a0417ffd7",
+    "contracts/protocol.schema.json": "7df61dbed72e716fec0767831e4e163184d1b515a17f97080e3c81b7ebf0f027",
+    "contracts/release-policy.json": "e54581614356ad310351994a6cdb94bfe5a170f8c9d06d852d92c3e9bbb03204",
     "contracts/release.schema.json": "c482028ebde16055ed00c4e3c2d1a86b27114fae447669c3dab17d1a5eb43ab7",
-    "contracts/requirements.json": "b277beda5245e4f6d6c465b7e86c5a83b7f8bb54a5a66650a186ba22b7939ff9",
+    "contracts/requirements.json": "b07d6081a702736afbca8025a1512864d401b2efa07fa3311a39d0d857dfa424",
     "contracts/soak-event.schema.json": "87f1f9590bf2467308e38d9fe00d5a9395f06a887187e58ee4670ce586c25c6b",
-    "contracts/sql/001_initial.sql": "6416aa327597671a5180a96fbf4a126f99ed8c25ddbc19d51aba1e150d95d91a",
-    "docs/10-acceptance.md": "a9bc0b1f994c6da1d9dda871714f179ca0267f496ddee193bc114dec1d3ed959",
-    "tools/baseline.py": "f511931b779133c4bff4ef7c3cec8ab7b82eae265484ae9595d5f9fe9f29e678",
+    "contracts/sql/001_initial.sql": "286f56252a4f113ff121fd57935909617a30b849628aecfb5fb1c9bae407c36b",
+    "contracts/test-result.schema.json": "9bffa29e3bd9ed19c6b40de93bc15394c87d55d43f668b4e0083b5b6a1f8ed51",
+    "docs/10-acceptance.md": "ccd6309ba74af59c33401039f9a1d660a1fcf168cffaa029bf083732f989615d",
+    "tools/baseline.py": "2a402141ba6e810eb85613947be508a1e066a27de2f736cd15ef5891bb9380c2",
     "tools/candidate.py": "83682c51735bcc84c1ac81217111f6eecd63ef660a57a9c4f182394d4001b98c",
     "tools/common.py": "e0df9f5e3208342b72670dcbc458229cf898a57b02b79615d723707645e7e44a",
-    "tools/release_gate.py": "c0e0bdeb41e1d84425a3bb89fb1925735ef5ac167d2f446e3d5e6be108f78405",
-    "tools/run_check.py": "548393f7583e52c51de8bf63aeee9d892f13755b1ae2a2da5169c5e847b83a24"
+    "tools/release_gate.py": "a9dd44beca4e56e8744b456f02a766f8898189dbe1ddf62189cffbd90f1555d0",
+    "tools/run_check.py": "d155bf2f31c87133a0a8be426c85f301147fc785d4da5b8d48bc59a2ee3d99bf"
   }
 }

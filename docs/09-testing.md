@@ -8,6 +8,8 @@
 
 ## 测试金字塔
 
+**测试命名与逐测试证据（CR-003）：** 覆盖 TEST-NNN-MM 的测试，名字里必须含 `test_NNN_MM` 片段（如 `fn test_004_01_exit_code_table`、`#[test] fn test_062_03_outbox_redelivery()`）。检查脚本把每个测试的结果写入 `$HOH_EVIDENCE_DIR/test-results.jsonl`（`contracts/test-result.schema.json`，Rust 由 `scripts/product/test_results.py` 从 libtest 输出转换）；门禁要求每条 AC 在其场景检查里至少有一条自己的 PASS 记录，同一份日志不能替多条 AC 作证。一条 AC 可以由多个测试共同覆盖，任何一个失败该 AC 就不是 PASS。
+
 领域单元：状态合法性、DAG/优先级、预算、revision/epoch、Context装箱、hash匹配、事件投影。属性测试生成随机DAG/重复/乱序/中断。集成：SQLite事务/outbox、worktree、进程树、SSE、HTTP冲突。Adapter：固定真实协议fixture回放+有限真实smoke；UI：TestBackend快照+真实PTY+Playwright。最后跨天全系统。
 
 ## 必须的故障矩阵

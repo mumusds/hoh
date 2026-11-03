@@ -43,7 +43,7 @@
 - 协议格式纠正≤2次。
 
 ## 输出契约
-- 独立报告 `contracts/independent-report.schema.json`（字段以schema当前版本为准）：schema_version、role="reviewer"、session_id、candidate_id、spec_sha256、status、scope（已审文件与AC）、findings、raw_session{path,sha256}、native_attempt{path,sha256}（产生本报告的原生attempt记录，由Runtime/桥提供，不得伪造）。
+- 独立报告 `contracts/independent-report.schema.json`（字段以schema当前版本为准）：schema_version、role="reviewer"、session_id、candidate_id、spec_sha256、status、scope（已审文件与AC）、findings、raw_session{path,sha256}、native_attempt{path,sha256}（产生本报告的原生attempt记录，由Runtime/桥提供，不得伪造）。会话结束时，最后一条消息必须以 ```hoh-report 代码块给出 JSON 对象 {role, status, scope, findings}（role="reviewer"）；session_id、candidate_id、spec_sha256、raw_session、native_attempt 由桥在会话结束后填写（`tools/agent_task.py --report-out`），自己写这些字段会被拒绝。
 - findings每条为{id, severity, summary, evidence}；summary写“[缺陷|风险|建议|疑问] 路径:行 — 问题；影响；修复方向”，evidence引用支撑工件。
 - status：PASS=scope全部审完且无critical/high缺陷；FAIL=存在critical/high缺陷；UNKNOWN=有未审范围或可能为critical/high的疑问尚未证实。
 - TaskResult（`contracts/protocol.schema.json`）：role="reviewer"、candidate_id、evidence（报告及只读验证的执行记录）、issues（每条含severity、kind、location、evidence、fingerprint）、next_action；不得添加schema外字段。status：COMPLETED=报告完整产出（无论PASS或FAIL）；BLOCKED=候选无效或无法访问；INCOMPLETE=预算耗尽并列出未审范围；FAILED=审查尝试本身失败。引用的检查保留PASS/FAIL/BLOCKED/UNKNOWN/NOT_RUN原状态。

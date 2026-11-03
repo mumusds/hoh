@@ -17,7 +17,7 @@ def committed_crs(root:Path)->set[str]:
     try:return {c['id'] for c in json.loads(r.stdout).get('change_requests',[])}
     except ValueError:return set()
 
-def relock(root:Path,cr_path:Path,baseline_id:str|None,amend:bool=False,drop:list[str]|None=None)->dict:
+def relock(root:Path,cr_path:Path,baseline_id:str|None,amend:bool=False,drop:list[str]|None=None,add:list[str]|None=None)->dict:
     """New baseline revision for an APPROVED CR. amend=True re-hashes for the latest, still uncommitted CR."""
     old_path=root/'contracts/baseline-lock.json';old=load_json(old_path)
     rel=str(cr_path.resolve().relative_to(root.resolve()));info=parse_cr(root/rel)
@@ -32,7 +32,9 @@ def relock(root:Path,cr_path:Path,baseline_id:str|None,amend:bool=False,drop:lis
     new_id=baseline_id or old['baseline_id']
     policy=load_json(root/'contracts/release-policy.json')
     if policy['baseline_id']!=new_id:raise ValueError(f'release-policy.json baseline_id is {policy["baseline_id"]}; update it to {new_id} first')
-    files=sorted((set(old['files'])|set(LOCK_REQUIRED))-set(drop or []))
+    for extra in add or []:
+        if not safe_path(root,extra).is_file():raise ValueError(f'--add {extra}: not a file in the project')
+    files=sorted((set(old['files'])|set(LOCK_REQUIRED)|set(add or []))-set(drop or []))
     if set(LOCK_REQUIRED)-set(files):raise ValueError('cannot drop gate-defining contracts from the lock')
     lock={'schema_version':'1.1','baseline_id':new_id,'revision':revision,
           'change_policy':old.get('change_policy','Formal CR + new baseline; never lower required gates to pass'),
@@ -46,10 +48,11 @@ def main(argv=None)->int:
     r=sub.add_parser('relock');r.add_argument('--cr',type=Path,required=True,help='APPROVED change request record');r.add_argument('--baseline-id')
     r.add_argument('--amend',action='store_true',help='Re-hash for the most recent CR (before it is committed).')
     r.add_argument('--drop',action='append',default=[],help='Remove a non-gate file from the lock (record why in the CR).')
+    r.add_argument('--add',action='append',default=[],help='Add a contract file to the lock (record why in the CR).')
     a=p.parse_args(argv)
     try:
         if a.action=='relock':
-            lock=relock(ROOT,a.cr,a.baseline_id,a.amend,a.drop);print(json.dumps({'baseline_id':lock['baseline_id'],'revision':lock['revision'],'files':len(lock['files'])},ensure_ascii=False))
+            lock=relock(ROOT,a.cr,a.baseline_id,a.amend,a.drop,a.add);print(json.dumps({'baseline_id':lock['baseline_id'],'revision':lock['revision'],'files':len(lock['files'])},ensure_ascii=False))
         lock=verify_baseline(ROOT);errors=check_records(ROOT,lock)
         if errors:raise ValueError('; '.join(errors))
         print(f'Baseline {lock["baseline_id"]} revision {lock.get("revision",1)} verified ({len(lock["files"])} files).')
