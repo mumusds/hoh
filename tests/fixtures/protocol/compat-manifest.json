@@ -1,6 +1,6 @@
 {
   "schema_version": "1.3",
-  "recorded_at": "2026-11-03T22:23:55.635534+00:00",
+  "recorded_at": "2026-11-03T22:48:01.497536+00:00",
   "recorder": "tests/fixtures/protocol/record.py",
   "hash_algorithms": {
     "tree_sha256": "sha256 over the sorted lines '<relative path> <sha256 of file>\\n' of every file under root.",
@@ -11,8 +11,8 @@
       "2.1.317": {
         "cli_version": "2.1.317",
         "auth": "AUTHENTICATED (live turn recorded)",
-        "recording_started_at": "2026-11-03T22:21:31.642723+00:00",
-        "recorded_at": "2026-11-03T22:21:53.868667+00:00",
+        "recording_started_at": "2026-11-03T22:45:40.510981+00:00",
+        "recorded_at": "2026-11-03T22:45:59.072305+00:00",
         "help_argv": [
           "claude",
           "--help"
@@ -24,37 +24,37 @@
           "max-turns-error": {
             "valid": true,
             "files": {
-              "meta.json": "51fcac42a2f22c87c4788e699be1c80d6f58882b008f77d6d1679f95a4322ccf",
+              "meta.json": "dabf712f3d94b5fd2c7c9b00854321e9d7667a7b63ef65b9445e3e7180f1b053",
               "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
               "stdin.txt": "e52fff24350e7ee0bdaada29ee4d16cf1bc9db971d47b7fde2ca9a13b257af77",
-              "stdout.jsonl": "a37edaa858637e9862b3f61fa7b53da9365fd077290ce91f5f757310db75e96d"
+              "stdout.jsonl": "6d58cdcba18b76b2d3d296c846f4ce16db16192a5017ce376c3a5b8f07fd406e"
             }
           },
           "resume": {
             "valid": true,
             "files": {
-              "meta.json": "10c9370a79bb24e0166eb156c006502b9e5d620226587d1facb1bd8b61ff413b",
+              "meta.json": "7a78e24b3db49c15e658b1b3561c1b03b82f116474ecef266f7f0852b949bcb3",
               "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
               "stdin.txt": "9af80d144c78c30129d7defd11f1bf999079ceda14fe4c0eb5258854f6d59d30",
-              "stdout.jsonl": "3b41b042bfcb2497804f1739e6df58b97ff2e2e8ed7cf85423daccba0280cac6"
+              "stdout.jsonl": "f09efaa37fb1659d02650a417121ac737e8fb94d030f0cbd7c1058f04231d6a7"
             }
           },
           "sigint-cancel": {
             "valid": true,
             "files": {
-              "meta.json": "f9d934e41ba395f2204a366e7cb6d3f1c56168858a52bda5da56b8d9bf0ef64f",
+              "meta.json": "c44a3a098e1179e4eca2e46f8df757b071ae15199e95e9ad4dbcabff0f85179a",
               "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
               "stdin.txt": "ad114cfd545a4e802b14e644a0fa51d742e450b43e21c71ccfc6c3fd75388a6d",
-              "stdout.jsonl": "14f3f3039ddef72e5eda127a189a4c7319e5f5ed0b8f6b6159e44468f3cc10b7"
+              "stdout.jsonl": "d500640561a87e440d95054757be3bd3001a4457d24058182935a4a049280ab5"
             }
           },
           "success": {
             "valid": true,
             "files": {
-              "meta.json": "8be5063c8f54628457395ebf2eed07630b9c8e5430bceaa49c984270d65c72d1",
+              "meta.json": "b7e844eb0b07d3c0f45bb19d1610d655bc96661537ee35402cf375416e28a97a",
               "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
               "stdin.txt": "41db62ec0de9f9031de948bcb36bdf9bddee41b152fc1416df9a6477245591b6",
-              "stdout.jsonl": "c773e6d4036d353134d458ba722ae439e8da7ea91b2d6565cf3cc4b12f4bf6e7"
+              "stdout.jsonl": "a9ff0b9af7627ca7058b88f447a915c655ca5f050982de5e0242366a06028f48"
             }
           }
         }
@@ -64,8 +64,8 @@
       "0.166.0": {
         "cli_version": "0.166.0",
         "auth": "AUTHENTICATED",
-        "recording_started_at": "2026-11-03T22:21:54.109702+00:00",
-        "recorded_at": "2026-11-03T22:23:36.288659+00:00",
+        "recording_started_at": "2026-11-03T22:45:59.308418+00:00",
+        "recorded_at": "2026-11-03T22:47:42.658092+00:00",
         "help_argv": [
           "codex",
           "exec",
@@ -80,82 +80,82 @@
           "app-server-handshake": {
             "valid": true,
             "files": {
-              "meta.json": "0838c4202a8e8b847a27bcc676c73341a7bd9b408891db6da5c38e07774a5a16",
+              "meta.json": "4fa54b2eea7ce60dd42221e1095790c552bf5d5479c4f2642ce98763c51a94f9",
               "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
               "stdin.txt": "88ab06ecd80801af68f11039db94967922cf004bf6b8c91c29956df3be7769a2",
-              "stdout.jsonl": "a7233684be38cb03165486fc9371e3552bcc0d5217f516ca12830427a7745abe"
+              "stdout.jsonl": "bf9463b71e58675ce86c2708a07b6e13420f8007375fd1335f90a73a1e82374f"
             }
           },
           "app-server-handshake-unauthenticated": {
             "valid": true,
             "files": {
-              "meta.json": "c9474acbb001cbfa15b52f4c19faa8bd062fbb8a9a7040c98c5ef431555ac6c1",
-              "stderr.log": "4d5e750e7a18c0c63736250f87184f6cbc525dfa808606de2c3f4dc7f3d3ef59",
+              "meta.json": "ffe25e0fb4bd9a43d783e2b9fe08913729dbbb2e35e8f36abbdbaee25d127c65",
+              "stderr.log": "8ecff9d2a2328d45bbc05a30704b1fe8cde51fdce7c091e2c224de9e6168ce7f",
               "stdin.txt": "88ab06ecd80801af68f11039db94967922cf004bf6b8c91c29956df3be7769a2",
-              "stdout.jsonl": "66f7a63ea8992acea28ac56c027c7bbe408f4b73bc92d6829836663b7c72eba9"
+              "stdout.jsonl": "6ae35d5d1b44c6f0185905bc3165ed382db969c56a60fb1df91f485153241794"
             }
           },
           "app-server-interrupt": {
             "valid": true,
             "files": {
-              "meta.json": "3d817472cfd35a4aa102d34b6988dfcfd02b676c5c58167537928c4446fca779",
-              "stderr.log": "860e52485cc6958b565596edf47d3c5904421605a1f4f4886971afffe3c0cb1a",
-              "stdin.txt": "f35ad1e2e3aac86f619cbb9aa0ae425b10fa3c6e0da9e7532362df0ee8ec348e",
-              "stdout.jsonl": "d58c4d1e5a96d46ff1c58a55128f26e343902168393452db7b92a34c488de73b"
+              "meta.json": "a4c80efc71783ae37832df524d28a316f2402274c347206e0a1b3d9fcc578aec",
+              "stderr.log": "3ece4ed6a197288f95047f4aae46461e53401ea4ba1188fe43b4d50e060b44ad",
+              "stdin.txt": "b29785004232441175fe03af28090704073eabc536ab671c01a98f018f2a43f5",
+              "stdout.jsonl": "011594b2f2a43e04e8538577ba530db0a23fe5dd3158ad87bd33bd51724bcf5a"
             }
           },
           "app-server-resume": {
             "valid": true,
             "files": {
-              "meta.json": "e18eb31d83ed1be3c0be2345643a95e4dc903a31e8ac1a2c48419ef46a53ad19",
+              "meta.json": "27e146b8399927c9353c1ee54fcb48069bd40fc35907f98690975d431dfe0608",
               "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-              "stdin.txt": "ea76ec3200e353f6a63ae893821c679dbe830bf2772512e01463170e7f98aa7e",
-              "stdout.jsonl": "895de4964690460f0af13456d738c48e9c0354c5eb789c3dfe545ce3352d27f8"
+              "stdin.txt": "aabc636180f3e58f3a55a78165ba81efa45480d291af2aa22cb1efb0dea5ee1f",
+              "stdout.jsonl": "d9fc11ee90aa430cc9b596f0167f50d237f1aa63682cc7aee359d1c2c0a28709"
             }
           },
           "app-server-steer": {
             "valid": true,
             "files": {
-              "meta.json": "377f198c44474f4c480d4220e85a8563a2e795f39d4827f607781c1f30f823b6",
+              "meta.json": "6feebb8d702d202596229116dce9220cb24151b92a5eb7aff8c10600ca43e624",
               "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-              "stdin.txt": "03a3e1a88446134ddab903da9c5f31f0f050bb0db215d6f96f1babf258ed6870",
-              "stdout.jsonl": "85b901a8942c73888b575f9000570bedca9fa53b1fd2b3fa0f85390a34773e27"
+              "stdin.txt": "213556ac1fc979be3c04404c894b0a7f6322aa8307a6353bcbfc732c52e92a17",
+              "stdout.jsonl": "cb42e75bd996c442549b4e4d64cb8b4bacef19e3402bb62abc1f112f9cac58ff"
             }
           },
           "app-server-turn": {
             "valid": true,
             "files": {
-              "meta.json": "94c8c00f3f5fa8e42abf7dae3aaa75851c892d9741edfa7f6340e651227bbbd4",
+              "meta.json": "c8c2173173cbee945007d0b65191d3b4b368931dae132e2bd9631f0d31255cdc",
               "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-              "stdin.txt": "3f8f37d192b051679765b635d3ecc95c2085d04b6f68e89e677a5b5d58586c60",
-              "stdout.jsonl": "683daf09886ae27548eeed1158883d9860264d4fb9dd4f4c1d8a51c70c9027ed"
+              "stdin.txt": "9ed326c04057acf24475f8b3dab92438d449cd04c5c5c7b727c273abd36d88a6",
+              "stdout.jsonl": "f0f2ad1443e60e9f037b5c6828cf5a8f60e645ad57dca3664c812daafe7c1ca1"
             }
           },
           "exec": {
             "valid": true,
             "files": {
-              "meta.json": "616e5c2d98047947de352b4070529a74215a80f9f0f3cff40153e4774fce3616",
+              "meta.json": "b4d031191ea2b89aa745cf1d680229c00b6fa7ba482174f814473ea9b050c610",
               "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
               "stdin.txt": "41db62ec0de9f9031de948bcb36bdf9bddee41b152fc1416df9a6477245591b6",
-              "stdout.jsonl": "a0cf75a4aaa66fc5711c39daddb286441f492905bdb7318f813e640859664d3f"
+              "stdout.jsonl": "dcad6c3b88ac8a19e8ec5ac9b4c9b79b111d9144356a43947c40d484db383bfe"
             }
           },
           "exec-turn-failed": {
             "valid": true,
             "files": {
-              "meta.json": "b3db8ac69b6b4b90a2475fca094200549595285241b9dda902c024118954c704",
+              "meta.json": "198923ae1f8a0d9a656f3c9eecd9f817bf4892062256644416fff635cd94b4b3",
               "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
               "stdin.txt": "41db62ec0de9f9031de948bcb36bdf9bddee41b152fc1416df9a6477245591b6",
-              "stdout.jsonl": "0dae0f04f3a44f2bca699b0351838d2aca8f16ca485725141f180699361a6436"
+              "stdout.jsonl": "86bb955f74db65e16265099688d6e8a99919555e1d0551d26a40ea0b679a7144"
             }
           },
           "exec-unauthenticated": {
             "valid": true,
             "files": {
-              "meta.json": "fd3d1c9674693f69a99c5ae588ffd2139b236ceabc85056e392456f1496d3ce5",
-              "stderr.log": "5c3ec0c9c56c1ac131d679f54829a89691be100c1348ec1f8af8458056cf6948",
+              "meta.json": "c1d9aa6cb8c5d67e1cd7b08e87cfa75e7613f3139c820bc232e015002f791fe0",
+              "stderr.log": "fb59657c2204d1af2fad174f7d64a47e060a1661b958372afefb6c97dde19b78",
               "stdin.txt": "41db62ec0de9f9031de948bcb36bdf9bddee41b152fc1416df9a6477245591b6",
-              "stdout.jsonl": "12ec926bedfd585d40e12effe378d80cf0644bf2725d7784db81775ad85296db"
+              "stdout.jsonl": "d737fcb5aacfab55f1e7261c701fdd33346e66c81908001ca8f336a6f6029456"
             }
           }
         },
@@ -166,8 +166,8 @@
       "1.5.0": {
         "cli_version": "1.5.0",
         "auth": "AUTHENTICATED (live turn recorded)",
-        "recording_started_at": "2026-11-03T22:23:36.639556+00:00",
-        "recorded_at": "2026-11-03T22:23:55.622907+00:00",
+        "recording_started_at": "2026-11-03T22:47:42.986900+00:00",
+        "recorded_at": "2026-11-03T22:48:01.491234+00:00",
         "help_argv": [
           "pi",
           "--help"
@@ -181,16 +181,16 @@
           "rpc-abort": {
             "valid": true,
             "files": {
-              "meta.json": "cb53a1225a2b36bae82e1430c8bc41940b4043e3d50062a7043e5cbcf786f8f9",
+              "meta.json": "531e6f4f40c6f4c67205a8932fd83bd5b68257f34a167a247bbcce106191616d",
               "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
               "stdin.txt": "99c7a505677996869c7e80f94fd4ed338250cc63a7b03f00f3449de33029587c",
-              "stdout.jsonl": "0cfde124e4f36ca687c2db25b9f719c6461f7b1bb0cf3853ec96c64360b4122d"
+              "stdout.jsonl": "5c01e65d2b0b230c59c91af5353415f754ccbdf3aedae044e730bcd9422b209b"
             }
           },
           "rpc-invalid-model": {
             "valid": true,
             "files": {
-              "meta.json": "f23c94dbdd2e181c6e9a80ac1f38d8f5d6a50972408dbc4099ae3e0d18400fb2",
+              "meta.json": "37271fb97cda87195fe91f5b39ab59ce2735baec5ca098b5d6dbbfb309210c4e",
               "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
               "stdin.txt": "77b54378e1f3a24beebb63b77a2e554caf074ea292bd3574e6c3b294323603f8",
               "stdout.jsonl": "dc100a9ed8f843cd01f944bffae398dd679699f43b8655f035ada729cb8d70ac"
@@ -199,28 +199,28 @@
           "rpc-no-provider": {
             "valid": true,
             "files": {
-              "meta.json": "357427840d8faf83148a21999814fe01b3542cc417eb00e07d470e5fc1a3720d",
+              "meta.json": "0e0ed5b4a2970f3d74ed0e761d859a6a2aff297a8495f346192bb16c17276efe",
               "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
               "stdin.txt": "c10609ca526f2f0fb90a158f37860942b2a62f702030f7e4144680c7c55cae32",
-              "stdout.jsonl": "14d41c31af755c937c628c91a1901c890c5ad748b0c221ec7768a5e4f63da0f5"
+              "stdout.jsonl": "3861e0186ccf7ff59fdf5092fe06495c3527aa2a173069972fd9fcb1af5d61b3"
             }
           },
           "rpc-prompt": {
             "valid": true,
             "files": {
-              "meta.json": "cb6313f3c099a2feff92fe18b50e1deddb4e3c0a357aa727ec8a5b943aca11e7",
+              "meta.json": "7807dc6447705af1df34de695fc8cbfe2b9db0f75fa72ec005224554e04d5ff3",
               "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
               "stdin.txt": "c10609ca526f2f0fb90a158f37860942b2a62f702030f7e4144680c7c55cae32",
-              "stdout.jsonl": "fa4885cd62b490b81fdd80c8198d4b01197eaa0cd89be4395ac07ae019cf492b"
+              "stdout.jsonl": "cfdab34dba282c91494d9fe5238b8bf5d5c3cd04112513c7d6b839bb2e205b38"
             }
           },
           "rpc-resume": {
             "valid": true,
             "files": {
-              "meta.json": "5cb664f899e5d013a915bf55aff32ee3582b0edc30587c5ff2da474605a6140b",
+              "meta.json": "108b8cf8203a0fd01f0709a95f7a94ffcc0573b12fe307d5b6c8d1142d6e61b5",
               "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
               "stdin.txt": "0d6bc083e013717442b2e8de57f30d3ccbd82b1893a49540fa915634ad8b7208",
-              "stdout.jsonl": "7f33d87342af2a9cc38633a6318f8af78e9f7179b473860df3612befaf2ddc47"
+              "stdout.jsonl": "8e7c0d8d738d6910f48444243ad6264a80b9d30fcd9c581c39f4797c0ffc4d14"
             }
           }
         }

@@ -1,4 +1,4 @@
-{"type":"thread.started","thread_id":"01a1a381-f22c-7ff2-b71f-c08e9017a650"}
+{"type":"thread.started","thread_id":"01a1a397-fa74-75e1-95aa-a59e2746759e"}
 {"type":"turn.started"}
 {"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"HOH_SAMPLE_OK"}}
-{"type":"turn.completed","usage":{"input_tokens":15478,"cached_input_tokens":8064,"cache_write_input_tokens":0,"output_tokens":8,"reasoning_output_tokens":0}}
+{"type":"turn.completed","usage":{"input_tokens":14634,"cached_input_tokens":12160,"cache_write_input_tokens":0,"output_tokens":8,"reasoning_output_tokens":0}}

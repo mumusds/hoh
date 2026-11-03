@@ -15,10 +15,13 @@ every case is valid and the binary did not change meanwhile; otherwise the publi
 they were, the staging directory moves to `.hoh-dev/protocol-failed/` and the recorder exits 1 (also
 when an agent is not logged in). `provenance.json` holds the binary and help hashes and the auth state
 measured while recording; the manifest is rebuilt from those files and never re-measures binaries.
-Children are stopped with bounded escalation (close stdin, SIGTERM, SIGKILL of the process group); the
-recorder is the child subreaper, so descendants that left the group are killed too, and a case whose
-process needed SIGKILL or left descendants is invalid. SIGINT/SIGTERM stop every child before the
-temporary directories are removed. Publishing swaps the directories atomically (`renameat2`).
+Children are stopped with bounded escalation (close stdin, SIGTERM, SIGKILL of the process group). Each
+child's environment carries a token (`HOH_RECORDER_PROC`), so its descendants are found wherever they
+went (other session or group, re-parented, stdio closed): those that end on their own within 5 s after
+the CLI exited are recorded in `meta.json` `descendants_lingered`; those still running are killed and
+the case is invalid, as is one whose process needed SIGKILL. A descendant that exec'd with a cleared
+environment cannot be found this way. SIGINT/SIGTERM stop every child before the temporary directories
+are removed, and the manifest is still rebuilt. Publishing swaps the directories atomically (`renameat2`).
 Keep the previous version directory until the compat suite has been rerun.
 
 Provenance limits: the operator's user-level agent configuration (plugins, hooks, account, rate-limit
@@ -31,7 +34,7 @@ compare raw bytes; the repository is private.
 | claude 2.1.317 | `success` | live | `system:init` carries `session_id` and `model`; an undocumented `rate_limit_event` frame precedes `result` and must be kept as an unknown/auxiliary event |
 | claude 2.1.317 | `resume` | live | `--resume <session_id>` continues the same session id |
 | claude 2.1.317 | `max-turns-error` | live | `result` subtype `error_max_turns`, exit code 1 |
-| claude 2.1.317 | `sigint-cancel` | live | SIGINT while a foreground tool runs yields `result` subtype `error_during_execution`, `is_error: true`, **exit code 0** — success must come from the result frame, never from the exit code |
+| claude 2.1.317 | `sigint-cancel` | live | SIGINT while a foreground tool runs yields `result` subtype `error_during_execution`, `is_error: true`, **exit code 0** — success must come from the result frame, never from the exit code. The CLI may exit before the cancelled tool's last child ends (`sleep 2` outlived it in 2 of 5 runs during M0-T06), so the adapter must reap the attempt's whole process tree |
 | pi 1.5.0 | `rpc-prompt` | live | `prompt` response `disposition: "started"`; `agent_start` … `agent_end` → `agent_settled` |
 | pi 1.5.0 | `rpc-resume` | live | a new process with the same `--session-dir` and `--session-id` reports the same `sessionId` and remembers the previous turn |
 | pi 1.5.0 | `rpc-abort` | live | `abort` during streaming ends the assistant message with `stopReason: "aborted"` and still emits `agent_settled` |
