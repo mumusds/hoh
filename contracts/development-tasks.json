@@ -66,6 +66,19 @@
    "done_when": "record.py 录制以上五类用例且全部 valid（成功以 turn.completed / turn/completed 判定，中断以中断状态判定），compat-manifest 中对应 case 齐全；缺任一项保持 blocked。"
   },
   {
+   "id": "M0-T06",
+   "milestone": "M0",
+   "kind": "setup",
+   "owner_role": "developer",
+   "writer": true,
+   "title": "加固协议样例录制器：用例专属结果校验、按 Agent 原子替换样例、有界终止（独立 Review M0R3-01..05）",
+   "depends_on": [
+    "M0-T05"
+   ],
+   "requirements": [],
+   "done_when": "record.py 对每个用例校验其声明的结果（含负例测试）；失败的重录不保留旧成功样例冒充当前状态；SIGTERM 后有界升级并回收；plan 命令守卫覆盖 env -、选项参数与 --eval=；Pi 原生自动安装路径受 integrity 校验或明确记录为风险。"
+  },
+  {
    "id": "M1-T01",
    "milestone": "M1",
    "kind": "implement",

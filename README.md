@@ -32,7 +32,7 @@ Rust模块化单体；Codex Commander + Claude CTO/Developer + Pi QA/Research；
 | [接口与数据](docs/05-data-api.md) | Schema、API、SQLite、幂等和约束 |
 | [编排系统](docs/06-orchestration.md) | 规格/工程循环、角色、消息、交接 |
 | [核心算法](docs/07-algorithms.md) | DAG、调度、监督、上下文、恢复 |
-| [开发计划](docs/08-development-plan.md) | v0.1 路径、M0–M7、48个任务、滚动细化 |
+| [开发计划](docs/08-development-plan.md) | v0.1 路径、M0–M7、49个任务、滚动细化 |
 | [测试方案](docs/09-testing.md) | 单元、集成、真实Agent、PTY、Web、跨天 |
 | [验收规范](docs/10-acceptance.md) | Definition of Done、证据、最终Gate |
 | [部署](docs/11-deployment.md) | 构建、安装、后台Host、备份、升级回滚 |
@@ -52,7 +52,7 @@ Rust模块化单体；Codex Commander + Claude CTO/Developer + Pi QA/Research；
 
 ## 机器可读交付
 
-`contracts/`含70项需求（M1/M2 的27项已细化为 detailed，其余为 outline，在各自里程碑开始前细化）、164条验收与同数测试场景（每条指定产出证据的检查）、48个任务、10个JSON Schema（含检查计划、live会话、soak时间线、原生attempt）、OpenAPI和可执行SQL；`resources/`含6个角色Prompt、12个原创工程Skill、16个文档模板；`tools/`与`scripts/`负责环境、自测、单次Agent调用、任务台账、候选冻结、按检查计划执行、证据门禁、基线/CR与生成视图。它们是开发辅助，不是Rust产品的替代实现。
+`contracts/`含70项需求（M1/M2 的27项已细化为 detailed，其余为 outline，在各自里程碑开始前细化）、164条验收与同数测试场景（每条指定产出证据的检查）、49个任务、10个JSON Schema（含检查计划、live会话、soak时间线、原生attempt）、OpenAPI和可执行SQL；`resources/`含6个角色Prompt、12个原创工程Skill、16个文档模板；`tools/`与`scripts/`负责环境、自测、单次Agent调用、任务台账、候选冻结、按检查计划执行、证据门禁、基线/CR与生成视图。它们是开发辅助，不是Rust产品的替代实现。
 
 ## 检查启动包
 

@@ -28,13 +28,18 @@
     },
     {
       "path": ".github/workflows/bundle-ci.yml",
-      "bytes": 940,
-      "sha256": "770b1e576a09a75bb1f288f8368aba31c04c842a2746c5567338442860b5e669"
+      "bytes": 1454,
+      "sha256": "fbb7fed8bfc22c9283a1c113d20833d33e7821ffcdc3f5d7697bc2ea21798489"
     },
     {
       "path": ".gitignore",
-      "bytes": 104,
-      "sha256": "e203a24ba5e64b3b1e942093c6fe33f0f240a96b0707bc444d084888e653681d"
+      "bytes": 113,
+      "sha256": "c4e6c05f4080ebc5b40572bd1c507807c302959ac7d17da8f033d72697452095"
+    },
+    {
+      "path": ".pi/settings.json",
+      "bytes": 132,
+      "sha256": "bece0f485ea5656b290fd39b65acf4b46a4ad0218ec7359752d7ddda6c839899"
     },
     {
       "path": ".pi/skills/hoh-bootstrap/SKILL.md",
@@ -67,6 +72,16 @@
       "sha256": "be4793a4bdb1004ff0f1f35eb4978d7c81b578153d9f0a69271308fd27f8c22a"
     },
     {
+      "path": "Cargo.lock",
+      "bytes": 330,
+      "sha256": "8e7c34a887b3ea26b2b913eeb8250c4f77ddde3f4a5841afefc93dcb884f2ef9"
+    },
+    {
+      "path": "Cargo.toml",
+      "bytes": 416,
+      "sha256": "2fe282e8b6295ac9395c786362ecd46a2794414061bb92c5583fc692ee770623"
+    },
+    {
       "path": "KIT_VERSION",
       "bytes": 6,
       "sha256": "1575e1af4a95f12f70b4ee6a6adce8160953d93ea17dc2611b90883ccc3ad3b8"
@@ -84,7 +99,7 @@
     {
       "path": "README.md",
       "bytes": 6117,
-      "sha256": "575e4ae15ffc830a2ede7755e1accf999e6a994fce05c0f0e3b77fca09380449"
+      "sha256": "bf4faea4e15a651190ee915cea22d0aa5546255acff6fa6c7bf5de062b19dde6"
     },
     {
       "path": "RESUME_PROMPT.md",
@@ -102,14 +117,19 @@
       "sha256": "c2f36e0001fd24893963e1a2037e3d6a7956374a3bdebcff80b1da32ba8c714d"
     },
     {
+      "path": "clippy.toml",
+      "bytes": 58,
+      "sha256": "741d8b6cbd57d7b01ff8918083bbf313e281cce0dbdcb1ed669dc8cb84f44578"
+    },
+    {
       "path": "config/hoh.example.toml",
       "bytes": 1313,
       "sha256": "624eb7ff25d439ef776e43a5bc7ea3c160549790fb67ca05258081ddc00a2788"
     },
     {
       "path": "config/plugins.json",
-      "bytes": 1120,
-      "sha256": "3cc57a717fb0c70185f93b2c93e31318d3e31c3bd2efb71d1987a7d808e2f7e6"
+      "bytes": 1555,
+      "sha256": "7fc3a42e7da843314eff1cc1e37181ad9f7423b1250c5a668bf30ab6e48bd605"
     },
     {
       "path": "contracts/acceptance-observation.schema.json",
@@ -138,8 +158,8 @@
     },
     {
       "path": "contracts/development-tasks.json",
-      "bytes": 23927,
-      "sha256": "7878acce8eb57902319fa0d745723c6db9f0965eba55fdbbc858bfe34795a0c3"
+      "bytes": 25484,
+      "sha256": "92c9deb7b7c1c36d048c7504e2c64d46173313e120df536007203537e6da489a"
     },
     {
       "path": "contracts/execution.schema.json",
@@ -197,6 +217,41 @@
       "sha256": "6416aa327597671a5180a96fbf4a126f99ed8c25ddbc19d51aba1e150d95d91a"
     },
     {
+      "path": "crates/hoh-agents/Cargo.toml",
+      "bytes": 348,
+      "sha256": "7e803a0a21f02d1c02fd68fcd9d7ce98e501db98efa6899f15d77158b4938a37"
+    },
+    {
+      "path": "crates/hoh-agents/src/lib.rs",
+      "bytes": 282,
+      "sha256": "9f9667eacc44aebf920bf191e9367784146e989be3c6f33c1725e0c0c8880e31"
+    },
+    {
+      "path": "crates/hoh-app/Cargo.toml",
+      "bytes": 408,
+      "sha256": "65699effdb0723931fdc2fc56c7c6ff420c7c1eb7c0213aedf045c708883a01c"
+    },
+    {
+      "path": "crates/hoh-app/src/main.rs",
+      "bytes": 444,
+      "sha256": "0bf6aa7b3b9430b740a93d026b2158393166f7cf934db2c24550d5c9fa6b771e"
+    },
+    {
+      "path": "crates/hoh-app/tests/cli.rs",
+      "bytes": 638,
+      "sha256": "131b2f4a9949c4f7946d7adacb0aa4757fb4e5b6568b182cb5df05795bb0615b"
+    },
+    {
+      "path": "crates/hoh-core/Cargo.toml",
+      "bytes": 298,
+      "sha256": "6687a57313e222ed67295162f314e5ed667d4c56b68f1ced6c80134c9b1c5ddb"
+    },
+    {
+      "path": "crates/hoh-core/src/lib.rs",
+      "bytes": 286,
+      "sha256": "22a14b82bf1608b09a07187550797d26a05ea2eb6bab03ffdc7a3dbb2f19c83a"
+    },
+    {
       "path": "docs/00-product-definition.md",
       "bytes": 2842,
       "sha256": "a0c2e5caec5483312baa35bd230db56eb33493d8c4ed5d932adef55bf1571a99"
@@ -239,7 +294,7 @@
     {
       "path": "docs/08-development-plan.md",
       "bytes": 5240,
-      "sha256": "3f3ed424aa015b2e0a1de83aad79cef206233922fc740e8a308b39944691f639"
+      "sha256": "4fe9f303fccb4cdd38cf287e09a04938bb74d8128dc632cf5a016cacb467ea7a"
     },
     {
       "path": "docs/09-testing.md",
@@ -308,8 +363,8 @@
     },
     {
       "path": "docs/22-tooling.md",
-      "bytes": 7151,
-      "sha256": "e46f1e39d5f21fe68100f7bd588898d668a335e0d38af3e951aff8299ba3266b"
+      "bytes": 7267,
+      "sha256": "8b8b500ea28ddbc86ff281a3820dbac4c35f6ad0971e01bb90f57446d2c3448d"
     },
     {
       "path": "docs/adr/ADR-001.md",
@@ -515,6 +570,11 @@
       "path": "reports/history/kit-1.0.0/verification-matrix.json",
       "bytes": 3172,
       "sha256": "73fabfebaff2622431dbe05a0a89898e33f6e230dc83dd80f07c896c8b7cca3c"
+    },
+    {
+      "path": "reports/reviews/M0.md",
+      "bytes": 8484,
+      "sha256": "6e23d0c45b35133d61b69397157742e6926680b2e696153410ad34e992f37b97"
     },
     {
       "path": "reports/tests-bundle.json",
@@ -727,14 +787,39 @@
       "sha256": "ae5ecc39a1703c9999ae4a0145e904ec5de3e7cbed50754eb1f3fbabb1383c07"
     },
     {
+      "path": "rust-toolchain.toml",
+      "bytes": 86,
+      "sha256": "d13306be0ecda81ce779baa290ffb417380d525928477f16200884b5169cca33"
+    },
+    {
       "path": "scripts/bootstrap.sh",
-      "bytes": 8657,
-      "sha256": "e3ab151bba313873b853be9f0802407ae8b9b43b14469840f1e0a9705d310ff9"
+      "bytes": 8836,
+      "sha256": "c8eab4d8a07c2b42775ec5291ae3440a6af7ce3ba159ca5fd2fab6641bfd6bb1"
     },
     {
       "path": "scripts/check.sh",
       "bytes": 1474,
       "sha256": "50b730afd6b8b70bf5ed06f9855444e1a38b384cac37ce193832ed72b3f22023"
+    },
+    {
+      "path": "scripts/product/build.sh",
+      "bytes": 465,
+      "sha256": "339423b7c7163640e906e7c9666ae80d34618606527dd7d40e2bde0b010962b3"
+    },
+    {
+      "path": "scripts/product/cargo-tests.sh",
+      "bytes": 1047,
+      "sha256": "10eb4ca5b6905c27da0baebe98b510eab8c4e2f1520e1e04452fd2cecb904871"
+    },
+    {
+      "path": "scripts/product/not-implemented.sh",
+      "bytes": 446,
+      "sha256": "629fb1b80bba51d7be828c97b6e9566450407f037041f0d6ef0c281858ca0ccc"
+    },
+    {
+      "path": "scripts/product/static.sh",
+      "bytes": 235,
+      "sha256": "ce56375c46570ca0f6070df28cbe0008a786ba37146f6e93eec923a26825e775"
     },
     {
       "path": "scripts/start.sh",
@@ -748,8 +833,8 @@
     },
     {
       "path": "tests/bundle/test_bundle.py",
-      "bytes": 9945,
-      "sha256": "57ec54a401f096a8f4c63724310efe25313798f8a83c139a5d2e398af068b185"
+      "bytes": 12595,
+      "sha256": "d21b5ded948e6ee580dea29a55dd9eb8bd177d7388538cba84de9a467f359911"
     },
     {
       "path": "tests/bundle/test_gate.py",
@@ -768,13 +853,2023 @@
     },
     {
       "path": "tests/bundle/test_tools.py",
-      "bytes": 18186,
-      "sha256": "3806d2c73adf079ee5bd91c86c7ee27bbdd79a9205628fc2952a0b9cdbd8c2f0"
+      "bytes": 19349,
+      "sha256": "dfa39505548251290b285ce18b45c2e13ee155d3851d006b40e49f0ad64113c9"
+    },
+    {
+      "path": "tests/check-plan.json",
+      "bytes": 3355,
+      "sha256": "e50f994dec79aee3239973582016aa358d2fbad4661bf426d93f263042920e1c"
+    },
+    {
+      "path": "tests/fixtures/protocol/README.md",
+      "bytes": 4659,
+      "sha256": "2a46370d5dd6b56abee55ee803370295e8c698b5c0cbc4b81c9d025d3d7f2a7c"
+    },
+    {
+      "path": "tests/fixtures/protocol/claude/2.1.317/help.txt",
+      "bytes": 22344,
+      "sha256": "5ca3a9dac2026e56c221fdd34380c7d7d45ebbb51c1d01b7c17c75cb076a0be8"
+    },
+    {
+      "path": "tests/fixtures/protocol/claude/2.1.317/max-turns-error/meta.json",
+      "bytes": 448,
+      "sha256": "782413efd0b92055e4149704e291b6cd5ee805d1af704ee10a1a0838f5c49a05"
+    },
+    {
+      "path": "tests/fixtures/protocol/claude/2.1.317/max-turns-error/stderr.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "tests/fixtures/protocol/claude/2.1.317/max-turns-error/stdin.txt",
+      "bytes": 56,
+      "sha256": "e52fff24350e7ee0bdaada29ee4d16cf1bc9db971d47b7fde2ca9a13b257af77"
+    },
+    {
+      "path": "tests/fixtures/protocol/claude/2.1.317/max-turns-error/stdout.jsonl",
+      "bytes": 7116,
+      "sha256": "349ed6089af0c3bca228e8e1ea033e97cd5eac30b18ad46596582115a24ce495"
+    },
+    {
+      "path": "tests/fixtures/protocol/claude/2.1.317/resume/meta.json",
+      "bytes": 454,
+      "sha256": "dbb8aa987d0e4758159db356902fbd62884259b5b44a6880e96a94f06d7363e8"
+    },
+    {
+      "path": "tests/fixtures/protocol/claude/2.1.317/resume/stderr.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "tests/fixtures/protocol/claude/2.1.317/resume/stdin.txt",
+      "bytes": 79,
+      "sha256": "9af80d144c78c30129d7defd11f1bf999079ceda14fe4c0eb5258854f6d59d30"
+    },
+    {
+      "path": "tests/fixtures/protocol/claude/2.1.317/resume/stdout.jsonl",
+      "bytes": 6600,
+      "sha256": "b0be929d7b0553d8d3eb30342c1214b04718ba7b1978c2be7915c24194f93925"
+    },
+    {
+      "path": "tests/fixtures/protocol/claude/2.1.317/sigint-cancel/meta.json",
+      "bytes": 699,
+      "sha256": "8586d4663d637ddfb2563fb739b4e9d69e95758871b96e273e29376a13c24c7b"
+    },
+    {
+      "path": "tests/fixtures/protocol/claude/2.1.317/sigint-cancel/stderr.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "tests/fixtures/protocol/claude/2.1.317/sigint-cancel/stdin.txt",
+      "bytes": 183,
+      "sha256": "ad114cfd545a4e802b14e644a0fa51d742e450b43e21c71ccfc6c3fd75388a6d"
+    },
+    {
+      "path": "tests/fixtures/protocol/claude/2.1.317/sigint-cancel/stdout.jsonl",
+      "bytes": 8350,
+      "sha256": "70e023883392494c3635d008ac43f942352a1132432d37aaef35a603643f9ff9"
+    },
+    {
+      "path": "tests/fixtures/protocol/claude/2.1.317/success/meta.json",
+      "bytes": 395,
+      "sha256": "0ab7a14b886bd122a4a34d631e5559ac1fc9271bd772a8f1462afca207e39da2"
+    },
+    {
+      "path": "tests/fixtures/protocol/claude/2.1.317/success/stderr.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "tests/fixtures/protocol/claude/2.1.317/success/stdin.txt",
+      "bytes": 50,
+      "sha256": "41db62ec0de9f9031de948bcb36bdf9bddee41b152fc1416df9a6477245591b6"
+    },
+    {
+      "path": "tests/fixtures/protocol/claude/2.1.317/success/stdout.jsonl",
+      "bytes": 6504,
+      "sha256": "d947ca70d9b363fcfbcab782500630d313493bb82a286b71c6489139cdaf031c"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-handshake-unauthenticated/meta.json",
+      "bytes": 384,
+      "sha256": "9b2bad977dc148e71a12b24fbe3236266b68c513a5b57ed96666d293b8064258"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-handshake-unauthenticated/stderr.log",
+      "bytes": 180,
+      "sha256": "d1925e1c0add9adc4af16bb53a08a367f387cec0dcdb6487a9f1b3c845e7b849"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-handshake-unauthenticated/stdin.txt",
+      "bytes": 240,
+      "sha256": "88ab06ecd80801af68f11039db94967922cf004bf6b8c91c29956df3be7769a2"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-handshake-unauthenticated/stdout.jsonl",
+      "bytes": 2740,
+      "sha256": "435abdf2732974faca10de12c7a8bad3633abc6cd8661bcdaa993cac9292aab3"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-handshake/meta.json",
+      "bytes": 368,
+      "sha256": "665fac1b584201106791dea7698f8f991ab5a0959b9ca904efde795cdc49af34"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-handshake/stderr.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-handshake/stdin.txt",
+      "bytes": 240,
+      "sha256": "88ab06ecd80801af68f11039db94967922cf004bf6b8c91c29956df3be7769a2"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-handshake/stdout.jsonl",
+      "bytes": 3268,
+      "sha256": "7e6a6a6c90c3ab16d688f5a53ca1d2f0a818744006ae5d643dbe34d345b06517"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-interrupt/meta.json",
+      "bytes": 356,
+      "sha256": "be4770ce98eaea7cdb0d44a7bff19c69e9d032a7c50bfa03ec03c5415114af73"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-interrupt/stderr.log",
+      "bytes": 174,
+      "sha256": "02c0dd592cb861e2b4f690570b1317fa6fc411086938b3f344bc4cc74f7e9a66"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-interrupt/stdin.txt",
+      "bytes": 657,
+      "sha256": "137929e43679c64971eabd78c7804b004df966ef47b2549199a1ebc3335e1540"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-interrupt/stdout.jsonl",
+      "bytes": 11983,
+      "sha256": "b355743289805647cb65ebdf930e8e4bae986b3a5f17d57eb3bce59249909db2"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-resume/meta.json",
+      "bytes": 399,
+      "sha256": "1fc012638451a7bc1de14bda315b0326228a3ac1d4bb8ec96c76088602e46cbf"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-resume/stderr.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-resume/stdin.txt",
+      "bytes": 511,
+      "sha256": "61b5f94d833b72c305986de0a71adbc7ab731aa224316f28a495d1c9cc3ffdd7"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-resume/stdout.jsonl",
+      "bytes": 9806,
+      "sha256": "42617f7eed496c0099da85b77971635e39c9654af65aa6d4abe098efc39a6090"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/ApplyPatchApprovalParams.json",
+      "bytes": 2657,
+      "sha256": "179d91081c3c84d0f79fc544a3d6d423f280c0f9d93512cdd0344c80e09b99a3"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/ApplyPatchApprovalResponse.json",
+      "bytes": 4278,
+      "sha256": "a5e145b4794ea91da6eb478626fac96bbbd4485c3399fabd1c9972d53d2d9010"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/AttestationGenerateParams.json",
+      "bytes": 118,
+      "sha256": "b85df8f169cfbca98724df3a5f7550fc4649fa69b23f5160aafdb52e027133a8"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/AttestationGenerateResponse.json",
+      "bytes": 277,
+      "sha256": "2eb86b2a37bca01a8cb5d0822f28cf13d46dd106c8b1d38e7ba097e436b5ab30"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/ChatgptAuthTokensRefreshParams.json",
+      "bytes": 971,
+      "sha256": "03b7a734b8b3180d9cb477b33564385d29b22a2528165a614891f13849060503"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/ChatgptAuthTokensRefreshResponse.json",
+      "bytes": 406,
+      "sha256": "06d6b30436fc962d80b5d7920f8f323de12a052214d9148c5f0dfbaedd5eec6c"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/ClientNotification.json",
+      "bytes": 431,
+      "sha256": "706cf248d75027c84a3c63348d0ed507182e8eba40069dd17541793de029145a"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/ClientRequest.json",
+      "bytes": 217081,
+      "sha256": "42caef9e6f7a544f2565d7696b03b34cd77771b91b50e639faed673bb276c262"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/CommandExecutionRequestApprovalParams.json",
+      "bytes": 15559,
+      "sha256": "16a71816c2d66e319c2c4aa83dd636dfdc43c61e72b6d5475e421ce08d8e6558"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/CommandExecutionRequestApprovalResponse.json",
+      "bytes": 3202,
+      "sha256": "6d0767113e22f311381809b6b236b0dde2b99b01992879c26bf7b1ea0e003cb7"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/DynamicToolCallParams.json",
+      "bytes": 519,
+      "sha256": "401bba20cfbd95762bef0467d840430c46be53369093ad9f26425ba757e34efc"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/DynamicToolCallResponse.json",
+      "bytes": 2010,
+      "sha256": "abb082cad67f11fcc98ba75f2eff75d7d1723af0c657655329b83ff160451a02"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/ExecCommandApprovalParams.json",
+      "bytes": 3768,
+      "sha256": "653116614df1aa5011c3cc399cf79bae6b9eb28c1d527df27275abf61ceb1365"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/ExecCommandApprovalResponse.json",
+      "bytes": 4279,
+      "sha256": "80dba6d9f28d19c57960db72340554c193624f014cd496714a0c7aabe1120046"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/FileChangeRequestApprovalParams.json",
+      "bytes": 968,
+      "sha256": "13848b26814c286ad6425a20d01c1691c86790e1f9e2529399677a8a22fe0d18"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/FileChangeRequestApprovalResponse.json",
+      "bytes": 1158,
+      "sha256": "b95b03ee6be674e25cee2e863cc135a28620e1070addd2f34685aadee27cde08"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/FuzzyFileSearchParams.json",
+      "bytes": 413,
+      "sha256": "0291dbb87a7c3d8ef7f7cdf8d5d61f929deabab8c0ea79f064da95984d7d5f4f"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/FuzzyFileSearchResponse.json",
+      "bytes": 1332,
+      "sha256": "4984c3dba591e240407c39531d41c6b499c4816017de70a3371c7d6fa2d0951f"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/FuzzyFileSearchSessionCompletedNotification.json",
+      "bytes": 244,
+      "sha256": "d3af2e301142ac0cb2462d95b052162ff4f25d83f9c1b21e319d5ce9c860d401"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/FuzzyFileSearchSessionUpdatedNotification.json",
+      "bytes": 1474,
+      "sha256": "b8626521028e0c68611c57d458f27dbc9bf8be542e804865ae0d14acd78cf2e6"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/JSONRPCError.json",
+      "bytes": 893,
+      "sha256": "d7ea353d4875ae204625da5a00a1ecb5afc69101d5778b9acc253a49f8932992"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/JSONRPCErrorError.json",
+      "bytes": 314,
+      "sha256": "12cc5cd5d9df9246defa609c472375020fe5250f3aeabd7d529076cecd9f541e"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/JSONRPCMessage.json",
+      "bytes": 2888,
+      "sha256": "6da4cc373a7ccd01f5608ad4496eeb4d44b6a9b0d3158e85ed66b59f3c0b5114"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/JSONRPCNotification.json",
+      "bytes": 303,
+      "sha256": "c2b43f26880db331393fe09f34bdd76dfeb4dc30d8418d1c26e18db166d6c8c8"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/JSONRPCRequest.json",
+      "bytes": 1093,
+      "sha256": "31bd6f360b2dd8a7ceaf682708105d40d38cb0b9d0821357a04da67028438f73"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/JSONRPCResponse.json",
+      "bytes": 520,
+      "sha256": "4796738c04c74288213a08fb8d820c7b4df19e0977cdcd35b65ffcb43cfc93ab"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/McpServerElicitationRequestParams.json",
+      "bytes": 13636,
+      "sha256": "5cbeb6bc702d2efa076da4c1dfb00672c970c1bad747031eb880b9ab907815c0"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/McpServerElicitationRequestResponse.json",
+      "bytes": 741,
+      "sha256": "792a012fdfe53ac211575a6c37ffbd492be848d15cb313d1bb4b534ade1f54ac"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/PermissionsRequestApprovalParams.json",
+      "bytes": 7286,
+      "sha256": "c11fbe632472ab0923aba5c0a53da3d6d86929bcd5c78e7c13c51c6b2db508ff"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/PermissionsRequestApprovalResponse.json",
+      "bytes": 7068,
+      "sha256": "23f3f24e9dbf35db3e0b85703f0d934da5a1cff3cbb611fba8bcd41f3b4a04b0"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/RequestId.json",
+      "bytes": 197,
+      "sha256": "9c72d59a306d827113020c6d31a14c326d55210d9bd6954f825196a52009f1c7"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/ServerNotification.json",
+      "bytes": 215730,
+      "sha256": "cc06d031345c7f1f08f0ac8ccb42d889b3246fadada1aabdf4688027975efad7"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/ServerRequest.json",
+      "bytes": 49887,
+      "sha256": "f339be472737a0003efa25fba2e6e6c9237e621cd065b6d6995c51256e9dc1fb"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/ToolRequestUserInputParams.json",
+      "bytes": 2143,
+      "sha256": "fda15b62e7446105b59c8ed85c908abed2a47db70653e57c92c47a2f204fa77a"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/ToolRequestUserInputResponse.json",
+      "bytes": 793,
+      "sha256": "5073b245f741fa8ce62ec52e4dd1809b7831f9c4284c279a78abc9b171f8e3f2"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/codex_app_server_protocol.schemas.json",
+      "bytes": 749825,
+      "sha256": "9b6d53647b00d68a04181b826599025a810cfa78acb3ec4d518c68b4120499c0"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/codex_app_server_protocol.v2.schemas.json",
+      "bytes": 646070,
+      "sha256": "e025e54fb11354eb82767ea040b40efa17b34dfc706c9433a6115b5f4771c465"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v1/InitializeParams.json",
+      "bytes": 2401,
+      "sha256": "b55124e7c0f36a1789396daa5578217a92be67f053903696236686e59f6f212e"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v1/InitializeResponse.json",
+      "bytes": 1286,
+      "sha256": "62ad689c2cb6379913c1d72749cfd8de5089d35760214123518eb92eef11acc9"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/AccountLoginCompletedNotification.json",
+      "bytes": 720,
+      "sha256": "d81e8821fd5a4a9ad118dfc3506ea156d32dcb18da388b336501bbc6a5ccb4a6"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/AccountRateLimitsUpdatedNotification.json",
+      "bytes": 4807,
+      "sha256": "fb62719b2edf989399a744e06e38b1828bf81bd10afaf6910d91c39b2e48d952"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/AccountUpdatedNotification.json",
+      "bytes": 2798,
+      "sha256": "963599d45751f44b79b668d521fc8e2f1a4a7201fc1f7411a36b391bc941f941"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/AgentMessageDeltaNotification.json",
+      "bytes": 406,
+      "sha256": "996e6c0ea65e57bed5a00f410b94381fe5ebf804333e5d00c2b6e6d47e5c55f6"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/AppListUpdatedNotification.json",
+      "bytes": 5703,
+      "sha256": "2c67a3bc676309afdd0d6952ad454c2a040a3d4c09d38c8f63ca7fb632034cce"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/AppsInstalledParams.json",
+      "bytes": 570,
+      "sha256": "c2027510d5d041c2205349036f9c2bea10b20df309de5330beab9de8a9e50bdb"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/AppsInstalledResponse.json",
+      "bytes": 1343,
+      "sha256": "d8ef8dd14dcba8aaaaaf2b0b80db90d66edf8f4ff422589b844ae2b0edcb46d4"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/AppsListParams.json",
+      "bytes": 904,
+      "sha256": "e880d0c24811118a2d3c2c7f0569a14aae5b12a31b0efe56809ccca8bbd85802"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/AppsListResponse.json",
+      "bytes": 5888,
+      "sha256": "5811fda68d6274decfc11744ad72bbe93e601d8514549e94f361ba3131d1adeb"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/AppsReadParams.json",
+      "bytes": 823,
+      "sha256": "61e6a9d35515f3164a7f7e7a5b0c5ac92817c5a3b5d7fb27e9a704fe2935ddf7"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/AppsReadResponse.json",
+      "bytes": 2443,
+      "sha256": "f3b73c2c31f16a2cff013c9682dfea48f26571f94002195c93ce10722a288791"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/AuthRecoveryNotification.json",
+      "bytes": 409,
+      "sha256": "c19238d43cf8bf610ea346afefc390b9ffa4f01e98ec6b42af0addf29d6cb7d5"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/CancelLoginAccountParams.json",
+      "bytes": 221,
+      "sha256": "a4570a7542b82b918f69199f1e214ef747151c678473a5af58c58b088fdf58b6"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/CancelLoginAccountResponse.json",
+      "bytes": 404,
+      "sha256": "06bc17624df01600fdc399d3c0f222f875c010d2d952c1d1191cb84de9b59014"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/CommandExecOutputDeltaNotification.json",
+      "bytes": 1585,
+      "sha256": "28e74454b211ab677a256129e623fc5a2a29ce5394da1c69d3bc5136f7e37c57"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/CommandExecParams.json",
+      "bytes": 7397,
+      "sha256": "e4f20080b92c6199cf132941840c4bd0fb9a90e3fec197ceb0e1ce9084346e18"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/CommandExecResizeParams.json",
+      "bytes": 1216,
+      "sha256": "b748fee19979d2c32ac17a460ccfdc761e125cc2939bc551945e1e2c2af34197"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/CommandExecResizeResponse.json",
+      "bytes": 188,
+      "sha256": "01da20d70957fa5b43cf41365c5fee4fb3a69927947a45f92866f9bcf0895d0f"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/CommandExecResponse.json",
+      "bytes": 699,
+      "sha256": "dec52d187121e8dd48124b47a4a8d8428ef3717b98b9200345bb404f73b62c9d"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/CommandExecTerminateParams.json",
+      "bytes": 404,
+      "sha256": "979ece7059c6713d0909ab1690daec27149510f4ea2ec10014600bfb1d631c97"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/CommandExecTerminateResponse.json",
+      "bytes": 194,
+      "sha256": "d46aa76d952bb3ac95d0bd64de609fb8a82efd98d9ee38264fe3673fd184ce5d"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/CommandExecWriteParams.json",
+      "bytes": 716,
+      "sha256": "3e8e849ce321c85987bbe96ce1f913df0047696a5207bc97dfa1409b0142eda8"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/CommandExecWriteResponse.json",
+      "bytes": 186,
+      "sha256": "22887250f84443b2a6f5fc6f9c46cf9e2af072ff631574340018c48771411571"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/CommandExecutionOutputDeltaNotification.json",
+      "bytes": 416,
+      "sha256": "841fa94098ddb63a71acf1bf5f9e3fac1b0491f4ed3fa8ef86f9a6ca1260b539"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ConfigBatchWriteParams.json",
+      "bytes": 1369,
+      "sha256": "d092c4412237735cdc9516b396ab1445f079e956cc10271be7c53f0d0e1e650e"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ConfigReadParams.json",
+      "bytes": 495,
+      "sha256": "257c54a423b47c1d209ff1076765a1564d82322fd5161670fd489a2874de1bac"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ConfigReadResponse.json",
+      "bytes": 28443,
+      "sha256": "69a32e3d84e16045802dff8abf01770d759ebc758965c3258a30ea4a93159fce"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ConfigRequirementsReadResponse.json",
+      "bytes": 33293,
+      "sha256": "8c51b24591d65b2c8137aec7e423febff648b3bda72a2d5db19514bd1991e4b8"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ConfigValueWriteParams.json",
+      "bytes": 763,
+      "sha256": "b9032e35bf64d4628bfc72e22b58b71bbcf754aeb720a86eacb091e0137547c9"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ConfigWarningNotification.json",
+      "bytes": 1640,
+      "sha256": "533e713405b582cce4d772d0b4ebbc75e840f0fe71cedbb17c2c83da285a21d4"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ConfigWriteResponse.json",
+      "bytes": 8685,
+      "sha256": "1d690287d9e8a0c552f664038d3810dfc3903ec8042eb2c0f772856414f59954"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ConsumeAccountRateLimitResetCreditParams.json",
+      "bytes": 594,
+      "sha256": "ce36a9f59ce3b8138fccdca042538f723e93d0e34d08441e6846d3153ee0b291"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ConsumeAccountRateLimitResetCreditResponse.json",
+      "bytes": 1177,
+      "sha256": "6d4144c00dcb7f73be6ad24693ff7e539bad56064e4432f7f2bf8d20b3bab724"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ContextCompactedNotification.json",
+      "bytes": 362,
+      "sha256": "c9f9a58ef680e09d568cff5f24b45895841e1cf138b650bae64dcf6c85f177af"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/DeprecationNoticeNotification.json",
+      "bytes": 457,
+      "sha256": "29fdb44fc0a09bfdc5c4924ff34e33679acc9201730fa4fe9be7ed1978af0b72"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/EnvironmentConnectionNotification.json",
+      "bytes": 306,
+      "sha256": "007e9a6ccae0003a56476bb7cdc9a097141e964c168e7ae43d213a763c93fb56"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ErrorNotification.json",
+      "bytes": 7353,
+      "sha256": "4b6e588b00241f0d1565b92991ec83b73bfdcf8dea0b96707278834ce719b444"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ExperimentalFeatureEnablementSetParams.json",
+      "bytes": 509,
+      "sha256": "00aaf2ef719cc336e4d20eb26dd6158be1eb26161fb7647372804b80a02e3131"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ExperimentalFeatureEnablementSetResponse.json",
+      "bytes": 386,
+      "sha256": "5ecd92ee95380d7cadc4c109091530aa71245e41b9f1b530a5e9d5c5c9eda95b"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ExperimentalFeatureListParams.json",
+      "bytes": 827,
+      "sha256": "4db92977e59fea4125710babb4cd2128dc2cebef8292e3619d0844089e7fc1f5"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ExperimentalFeatureListResponse.json",
+      "bytes": 3066,
+      "sha256": "4084a25f32333b3f58eb5e9803a5983739b57f945c4e7e4002e85851622ce597"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ExternalAgentConfigDetectParams.json",
+      "bytes": 1414,
+      "sha256": "db6c6ea654efb4095dc745a1e65bee76d0d063b03f2bc3202b9077a1569211f8"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ExternalAgentConfigDetectResponse.json",
+      "bytes": 5240,
+      "sha256": "36c4173d5f30ebd04be3d40389c904bc4ecadfbb8e5d1dd46b9b589254f7e1d9"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ExternalAgentConfigImportCompletedNotification.json",
+      "bytes": 3025,
+      "sha256": "c54702d40c3a40bcb3e3e835d99860473831725acbd3576fc26d2d4fa3a7617a"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ExternalAgentConfigImportHistoriesReadResponse.json",
+      "bytes": 3890,
+      "sha256": "1c09641e957333a2f602a350532acd99cf538a73ea45f39a2294289907a0bd96"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ExternalAgentConfigImportHistoryRecordParams.json",
+      "bytes": 3237,
+      "sha256": "6a3e8071854771b0f34c6623fb7dcfbeaa7518a90779cc4a40c97fe92ac6f3ed"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ExternalAgentConfigImportHistoryRecordResponse.json",
+      "bytes": 245,
+      "sha256": "a252a2c2a03b4460bf3635d517c0735fa487a2f8a97de1aa0637f930419ae656"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ExternalAgentConfigImportParams.json",
+      "bytes": 5152,
+      "sha256": "6b8d0a8fbd5a7ddd455ec0dea6d1b578f56841480c8a5fffbfcd045db79458ee"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ExternalAgentConfigImportProgressNotification.json",
+      "bytes": 3024,
+      "sha256": "dae7bfc12026811ba24cc6f32dc01ae9ffaee7d9340d7768f9afce94575c23d2"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ExternalAgentConfigImportResponse.json",
+      "bytes": 232,
+      "sha256": "0ad2fc7dff7b1bdc471cc365985f559490f253ea127263417f0a0a1edcb33cef"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/FeedbackSaveParams.json",
+      "bytes": 1094,
+      "sha256": "1c2cb8b988b832b50db4705af4d234da50a5d3f1377384dd638563da9275bfee"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/FeedbackSaveResponse.json",
+      "bytes": 576,
+      "sha256": "4563a3b28f6ae444e0fe559f09bc4cc6393ad20df9627526dc96328b47c1e2fa"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/FeedbackUploadParams.json",
+      "bytes": 726,
+      "sha256": "aa958cd74b37fb28cc49ce22345a1efcda9d4cf5fa47e7cce6949e5366ff8b2e"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/FeedbackUploadResponse.json",
+      "bytes": 555,
+      "sha256": "d23cb7bfa94f59fbb423b1e042239ac1b6dc344be15c5efc69ef04badff01a91"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/FileChangeOutputDeltaNotification.json",
+      "bytes": 544,
+      "sha256": "04c3df83d46725ffc048577e7a5aa25de9a6c8ea9eff713bbae2b408672481c5"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/FileChangePatchUpdatedNotification.json",
+      "bytes": 2159,
+      "sha256": "cfb69d18658610a0510f213e09c6847f70517410ed91cf99cc4713c15a795213"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/FsChangedNotification.json",
+      "bytes": 1061,
+      "sha256": "197693fcb852a85fedfbcf1cd00c9a3cc74dddfa09bdf6b11fdafebbcd12ea2d"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/FsCopyParams.json",
+      "bytes": 1198,
+      "sha256": "bc1135070827681e4d9a14f79b5b06a4f5652e538ae6a89642d27dbc8b2a2af1"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/FsCopyResponse.json",
+      "bytes": 162,
+      "sha256": "c88392d6c3ff394441231cdf5614794ba0c2b4ba683811f6033a01fe65528a59"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/FsCreateDirectoryParams.json",
+      "bytes": 1047,
+      "sha256": "405fd718ebafe7f47ffd82c86540ab4af663659c737ea2b25acd3e04a1bc94ea"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/FsCreateDirectoryResponse.json",
+      "bytes": 184,
+      "sha256": "a658fbd34d5e3d6300bcb7015f10fc1764aa8aca3088abc79af9caa2e848e527"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/FsGetMetadataParams.json",
+      "bytes": 851,
+      "sha256": "382bbf3a8b5c7e8cb16a1a29f853ce49c2904e563325e33a9e41dcbf632dab5e"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/FsGetMetadataResponse.json",
+      "bytes": 1005,
+      "sha256": "b8355f112eda37d7ff25ad0eda7dae912dba695961855c5cb8444a7f867d66c2"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/FsReadDirectoryParams.json",
+      "bytes": 862,
+      "sha256": "c4ca6cdc129d70375fe638c723c1b1bb07a9716101525970cf77bf7560fec657"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/FsReadDirectoryResponse.json",
+      "bytes": 1139,
+      "sha256": "2cfb28c3c1ab1487f6b778f4d76871e3a9f590597bdf0da502cc41b202269dbc"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/FsReadFileParams.json",
+      "bytes": 844,
+      "sha256": "74b325108195fe955e6ffcb6032e9380d3bfdee8aed7d115f5f1e4b127c5d706"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/FsReadFileResponse.json",
+      "bytes": 354,
+      "sha256": "fd67dd725b5bf5c7f27e78cc3d66fe24314f08913fc00ace9dbb663bf2f487e1"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/FsRemoveParams.json",
+      "bytes": 1199,
+      "sha256": "c453f8ae4b3311f5da88f67f743fdabbcdc323dc3d9eaa40d750ceae147bb630"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/FsRemoveResponse.json",
+      "bytes": 166,
+      "sha256": "6371aba2cae2f92be487be05c1ce531ca4139da5004b740a0010ccfdba548100"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/FsUnwatchParams.json",
+      "bytes": 368,
+      "sha256": "3134d42c231f40769a4d1ac4adcf051be5205e7a1b70bb32c4a8655fea730175"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/FsUnwatchResponse.json",
+      "bytes": 168,
+      "sha256": "9c59c3473df1f1873ee0d87ed33cecec0766b24c8357ee7dc8b29a57ca21e104"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/FsWatchParams.json",
+      "bytes": 1042,
+      "sha256": "10bd9c01b3819db1ed8e2487a277f20b35e3a9f74ae77214654f1a529fc1444d"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/FsWatchResponse.json",
+      "bytes": 864,
+      "sha256": "d32e77e7d6f619c5f4183c335ecddd3c4ffb95a51761198985c47838ae891a6c"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/FsWriteFileParams.json",
+      "bytes": 970,
+      "sha256": "2167e05c7f3eb26d475f9c1ce71697ba3b635efd8761a00b22abfd6af175bd2f"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/FsWriteFileResponse.json",
+      "bytes": 172,
+      "sha256": "0e4153ee7baa5c1203c2c573504baaa40e1dd8738d78e4c1e3a179fb49df6b16"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/GatewayOAuthCancelResponse.json",
+      "bytes": 119,
+      "sha256": "4a9e0055de416774443ec00e3ecfe49a585fedc48da38dc14cb474f2019eb5fd"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/GatewayOAuthChangedNotification.json",
+      "bytes": 758,
+      "sha256": "c36528330ab426fd137e50aa5e5e351f1af9f3f72be29edd2dc64f910ab12d74"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/GatewayOAuthLoginResponse.json",
+      "bytes": 118,
+      "sha256": "03a413b9fe9359aeba086dad3a1780fdefaa018b3fc03372f99a37a73b969e1e"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/GatewayOAuthReadResponse.json",
+      "bytes": 1088,
+      "sha256": "db30683d7b042570533120f0effb2396ada3ac9cf5cf02d72e911a30e28534ae"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/GetAccountParams.json",
+      "bytes": 485,
+      "sha256": "30b545275f60975b55bd6fbaafd70f15505801d14168ee82d3931b6e93c78aab"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/GetAccountRateLimitsResponse.json",
+      "bytes": 8239,
+      "sha256": "9c0def7f8ab2396122af939dffbf01b34b8d66082fe4129dd20917bfd4313fdc"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/GetAccountResponse.json",
+      "bytes": 3793,
+      "sha256": "1d44d4274ea35e1f866c4b0e3db64678fab108914c276353bdc3b1b0de286459"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/GetAccountTokenUsageResponse.json",
+      "bytes": 4098,
+      "sha256": "e725ed04b39667eec1494f1f269d4afc7b27034477c1f5429a3051b8721741de"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/GetWorkspaceMessagesResponse.json",
+      "bytes": 1565,
+      "sha256": "3ebd00f0acca088e5ee0309ec09b9a571e7f2eea5b63a32cda67be01c6886d67"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/GuardianWarningNotification.json",
+      "bytes": 423,
+      "sha256": "5325551d2efb47d578665e3deb846f6369e05f98fbc5bfbffc5d9fe0cb0bd167"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/HookCompletedNotification.json",
+      "bytes": 3968,
+      "sha256": "7051ae75b558032ca6c13a4aae91ee0734ef8384890575af9821f87206989179"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/HookStartedNotification.json",
+      "bytes": 3966,
+      "sha256": "79f69e20fcad493d17118a2c1d700ce606ae97341fed46a3155d048d24eb4146"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/HooksListParams.json",
+      "bytes": 543,
+      "sha256": "7f7f9f554df5ea7cd95fd9623bdfaf31e74e99ce1a13287becf40970b2547939"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/HooksListResponse.json",
+      "bytes": 6119,
+      "sha256": "44220325afe944298cabc29067cf29bdb5201167ebdc6cabf658c40fdb425c94"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ItemCompletedNotification.json",
+      "bytes": 51419,
+      "sha256": "f12a69b4f26a7fd2accadd87db4edd5e96e67ff78a1cac203dd12b91462031d7"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ItemGuardianApprovalReviewCompletedNotification.json",
+      "bytes": 16915,
+      "sha256": "a9f56c22fa2bdac445e4099bb0b16d92a4166f119127c871c24716977fcacdae"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ItemGuardianApprovalReviewStartedNotification.json",
+      "bytes": 16417,
+      "sha256": "eb6283bd8ab1f7d23439cb9f140ea6bf13d6ebb47f59aeb73f46f9948d5c9657"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ItemStartedNotification.json",
+      "bytes": 51411,
+      "sha256": "6a16ca46dafb5495a100870bdcdc50bb4d4555eab54f4f0c3bbb75f9f3337da9"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ListMcpServerStatusParams.json",
+      "bytes": 1223,
+      "sha256": "30b978c6502b37c9f0002aeba241f41c91d4c6adf0f92d89242b62ffde415a2d"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ListMcpServerStatusResponse.json",
+      "bytes": 6444,
+      "sha256": "c5a6c05092a9b1fa90c7cb3a319685a769a67c16e19048e8bbab5007b358be74"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/LoginAccountParams.json",
+      "bytes": 4353,
+      "sha256": "48fb9bea54d7e0890052653ac06737efb3200ba2261515b2c4014027f36bea3d"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/LoginAccountResponse.json",
+      "bytes": 2521,
+      "sha256": "72e6d77f49bc5809c3af50f183e2a0862dd8f7836816d4796ff69bb13eae0e89"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/LogoutAccountResponse.json",
+      "bytes": 114,
+      "sha256": "ac14ddfca2ec6092b0039be8720262d5a9930484d23e62544d2ef0b7e1db7926"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/MarketplaceAddParams.json",
+      "bytes": 431,
+      "sha256": "e6c92ca2a3889641ca2281cca7684569b1187653b25b57f9beabf85519d638a2"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/MarketplaceAddResponse.json",
+      "bytes": 865,
+      "sha256": "a37633e9ecc2fdd87ea582861bcdcbf7963a8fab6db9fbc1bc8eac7d2f7f9a8b"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/MarketplaceRemoveParams.json",
+      "bytes": 236,
+      "sha256": "220c2475a96f32ca095f80f3ecbad427477b4ba37dfad7fb48a0acabdeb1f4eb"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/MarketplaceRemoveResponse.json",
+      "bytes": 869,
+      "sha256": "98deb2f721d57ed727f7cc7b4f478db5f604b6b6d40e6261928dfd5f586405e3"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/MarketplaceUpgradeParams.json",
+      "bytes": 228,
+      "sha256": "93fc5d331d353b1b89262625c38eed54c6c16b2fb8aa0eac718245c7bdcbe4dc"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/MarketplaceUpgradeResponse.json",
+      "bytes": 1348,
+      "sha256": "2402379cb0ed1168a7dc327c412fd61bafdea2ad13ea7a3b3ebaee3b43c45963"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/McpResourceReadParams.json",
+      "bytes": 1330,
+      "sha256": "7ff0e4de6d70bd1c86b6d32ae781c9a841fee4d2e6d11eff8d8d0f224f7ad801"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/McpResourceReadResponse.json",
+      "bytes": 1664,
+      "sha256": "a48af749203ed3307414750d5070facb5ae6ef8b00253f1cfd9a8124bdfcfe41"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/McpServerEventStreamNotification.json",
+      "bytes": 614,
+      "sha256": "44b04b6cc079ec0b99b4d29af1a69d99037505c19a2a07cff955aa298d7c181b"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/McpServerOauthLoginCompletedNotification.json",
+      "bytes": 630,
+      "sha256": "6bddb335e7a9a6bb1bde6a32532a903a8968aaf7854afc37857c641b723302cc"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/McpServerOauthLoginParams.json",
+      "bytes": 1003,
+      "sha256": "83446fb61e04a361691f84fe236a51fff2ee4fb12a8f58e2e828a32cf6f6cc75"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/McpServerOauthLoginResponse.json",
+      "bytes": 514,
+      "sha256": "dd17c57725bfda17c1f4ab7319a3bfd78aa084ec0191fa0fcf0d17b4106bc597"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/McpServerRefreshResponse.json",
+      "bytes": 117,
+      "sha256": "54a77812db02175dc69053870e582d3b314af6f161f0c76846f3563b0f9487c4"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/McpServerStatusUpdatedNotification.json",
+      "bytes": 973,
+      "sha256": "d6f4cb120b2363d321247592f03b9afbbf2762ad6d8af31b88c1b1bf39c4c7aa"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/McpServerToolCallParams.json",
+      "bytes": 380,
+      "sha256": "7039a7583a1cbf38e9e0f5fe6398ff3711acd4d654b81b0be562514087fce6ba"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/McpServerToolCallResponse.json",
+      "bytes": 374,
+      "sha256": "04a59b2064922c37b0c49bdb2470b8fff08d943e56dba4f7280a6b34bfa52c68"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/McpToolCallProgressNotification.json",
+      "bytes": 412,
+      "sha256": "64a32b8282226876e749bc107a81db89d20d5ce5cb86ee6a043b960763214b1d"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ModelListParams.json",
+      "bytes": 688,
+      "sha256": "de29a536c00a5b8f46f34dba417dabd93365305571a8ed200e33bea85db68b5a"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ModelListResponse.json",
+      "bytes": 7169,
+      "sha256": "2fb387a2ed258fc74258828ea342d68f89ce4e8e22cd0329ca59d2b423f9108b"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ModelProviderCapabilitiesReadParams.json",
+      "bytes": 128,
+      "sha256": "9db732188a15476cabb42cf05e495ae0803a1ada993fca7348c21c30a998388d"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ModelProviderCapabilitiesReadResponse.json",
+      "bytes": 318,
+      "sha256": "96979d0111a38cb35a313e111c2f7c449441aee7fd51e1757f2d11c2213d4e77"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ModelProviderError.json",
+      "bytes": 1831,
+      "sha256": "a038bc2605df850147bceeeb780430f853f276e1be1addd4ebc485a2a01b679a"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ModelReroutedNotification.json",
+      "bytes": 636,
+      "sha256": "37cd3c1b3a3560b85b01d4061a07d830fc9ed93b80e4663f975f9197cdb501ef"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ModelSafetyBufferingUpdatedNotification.json",
+      "bytes": 746,
+      "sha256": "4cf853e3a2f968fdfde75206fd497d3d530b26769026bee343c3ef09ce438cfd"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ModelVerificationNotification.json",
+      "bytes": 574,
+      "sha256": "4f27a99d0c8664c29abb4d65384ab16853bbc29b61de5e749111cefdc6994655"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/NullableGetAccountRateLimitsParams.json",
+      "bytes": 1002,
+      "sha256": "072f813ca1c696831a7f2fbd934feaa8cad228a6b3d44a4be8877547c796341b"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/NullableGetAccountTokenUsageParams.json",
+      "bytes": 573,
+      "sha256": "a992c6ea0fe02b0e9f46b18afb51b8ee2635e7f0c7d546f71e7f95e2a98bebba"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/PermissionProfileListParams.json",
+      "bytes": 667,
+      "sha256": "576d405f6c94cbde982a9f65c9301717043683b83ca35d564247907feb16b1b4"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/PermissionProfileListResponse.json",
+      "bytes": 1174,
+      "sha256": "4a290b5b9d47c2fc671033e22754671161bc563027ba387e861bd935398f0def"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/PlanDeltaNotification.json",
+      "bytes": 565,
+      "sha256": "a5cf42ccfc6cf905ede0fa9041e9c951ea7870aba4e3a7c7f68d85f01416d3af"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/PluginInstallParams.json",
+      "bytes": 1136,
+      "sha256": "d6a8ff6356aed22c916cfd5a791ecce34ee2ac509750f690e7d0ef483fec7472"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/PluginInstallResponse.json",
+      "bytes": 1190,
+      "sha256": "ae283e1ecb9f454f7614c6a4348fda5a7aba5af99e9ab9177b9a0cd3e1cd7db7"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/PluginInstalledParams.json",
+      "bytes": 1174,
+      "sha256": "0b56f55a817b6e82ea104496281cd43714ee96800f9b984412a3a858f444f68c"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/PluginInstalledResponse.json",
+      "bytes": 15679,
+      "sha256": "8afc8a16fa5c21d67f66d1855bf29890bad10a6229bafc960b3503281fc878e2"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/PluginListParams.json",
+      "bytes": 1629,
+      "sha256": "bc6b499161306df7082c5a8cc51fd793cd6d28dda93555b12ae299445132270a"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/PluginListResponse.json",
+      "bytes": 15802,
+      "sha256": "a405d2514d6236df75130c87c749e0e070b946a889f143a0448bbcd27d1d8501"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/PluginReadParams.json",
+      "bytes": 947,
+      "sha256": "f15952a2828c90501cc32f347c1e1691ea65cd2d97f503ab40e7be08757de74d"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/PluginReadResponse.json",
+      "bytes": 24097,
+      "sha256": "fecc4792b298b66cad24b418f9c34d80ffe3dcf1572d9d05fd5a4ac1f824acb7"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/PluginReconcileParams.json",
+      "bytes": 314,
+      "sha256": "91dfe0967326b876e50ddf8d896c6c516440c43a36b08efd4746c0bd770882dc"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/PluginReconcileResponse.json",
+      "bytes": 2424,
+      "sha256": "ba2a8e317c9098beed39d4decc433d9dc29ba0c8164e8d4c229481b9243c5ec8"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/PluginShareCheckoutParams.json",
+      "bytes": 236,
+      "sha256": "25fd868fff9500ff244150a4ecd36322c0d31b339a4709649594b79aa1349185"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/PluginShareCheckoutResponse.json",
+      "bytes": 1187,
+      "sha256": "d6271afa9bba5531574ba255d22b03f70fe10b8ef159185355625d92b6f9fac6"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/PluginShareDeleteParams.json",
+      "bytes": 234,
+      "sha256": "d422a3fdecf91612bdf839d4fea6f1cddccb794869dc03ad3b8998bcb8e27fff"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/PluginShareDeleteResponse.json",
+      "bytes": 118,
+      "sha256": "ae881a7f898f5287354de5adf6f42094cef9029a9b9376bfd12aa1b0fe0b3106"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/PluginShareListParams.json",
+      "bytes": 114,
+      "sha256": "0d71280d2a655ffc26375044ec1693203848614f99fdb4563e0cb5a4ee40122b"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/PluginShareListResponse.json",
+      "bytes": 14477,
+      "sha256": "d349a496947956fd5f4d125b8348faa2ef0c91daf7f3cd74ae0616f55c8e328b"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/PluginShareSaveParams.json",
+      "bytes": 1974,
+      "sha256": "ec937521a40437506ceb2dcfe79cedd03812dd1b8233c651b89c2ddd76e148fe"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/PluginShareSaveResponse.json",
+      "bytes": 417,
+      "sha256": "3eb7c0ed6e6c72126c7bb3d845e73d5de98ad0d4ea8639d2f227fecd16c15411"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/PluginShareUpdateTargetsParams.json",
+      "bytes": 1369,
+      "sha256": "0ecf16212022bca115211cbf13a1302f8995d7be5664ca268b926b7d00add7b0"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/PluginShareUpdateTargetsResponse.json",
+      "bytes": 1380,
+      "sha256": "caf42dec67940f9e686ac7b4e77484921d62fee400b3af73fc85e6f46eaa03f4"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/PluginSkillReadParams.json",
+      "bytes": 388,
+      "sha256": "8850a9a45b9cf6e8b016f014c7c65f7062937be896d4fa0eafdaccc816909a56"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/PluginSkillReadResponse.json",
+      "bytes": 220,
+      "sha256": "dedaf95c4a8f70c022f5cac6fe3882603ed2b27d5efef710b52ae370869956cc"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/PluginUninstallParams.json",
+      "bytes": 220,
+      "sha256": "4c9e1da7048fc99ef5269d4c3f4c6c3297dac01992c2756340fa210ae8f800cc"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/PluginUninstallResponse.json",
+      "bytes": 116,
+      "sha256": "f6a0c9c8dfd9e3fc4a535ecfa606f12922c09e469a37d6b1c6e189f45cacb89e"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ProcessExitedNotification.json",
+      "bytes": 1692,
+      "sha256": "d8c8050fc7715dda340157c787807f3bde40e233eac1149a95ef463b5042e800"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ProcessOutputDeltaNotification.json",
+      "bytes": 1436,
+      "sha256": "c31714aa83297b83fd69dee98db877be7d4a3f98551dbeb517750efba0ecd79d"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ProjectChangedNotification.json",
+      "bytes": 481,
+      "sha256": "b32151fcb7ef78fc5c969db44255756e5e6e1754398a5b6b09244dcff0c1eab9"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/RawResponseCompletedNotification.json",
+      "bytes": 1998,
+      "sha256": "aba140e87952c900f96e0308a8849d3e313d985de1f1aa2b77f193884a76357c"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/RawResponseItemCompletedNotification.json",
+      "bytes": 36105,
+      "sha256": "6b5ec5c46b0224af45a46953d64735a1067677b2959f4780a628fffb307a75d2"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ReasoningSummaryPartAddedNotification.json",
+      "bytes": 454,
+      "sha256": "c8dfcb82d773d0f5d297ae1a47749e2b719013e82030a3af5d4550f9feb8eed6"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ReasoningSummaryTextDeltaNotification.json",
+      "bytes": 512,
+      "sha256": "895bdca00b4674634c25a5c4d1f82e55e65767d81ddcac4bb7b00aa3d438e62f"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ReasoningTextDeltaNotification.json",
+      "bytes": 505,
+      "sha256": "16cdc13080a7523b44f00fb6fdb660c56a7c4c8cda96b2f9b87b7e72264170fb"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/RemoteControlStatusChangedNotification.json",
+      "bytes": 800,
+      "sha256": "56aa1d58294238557cd8b16199909c2c157a7542b9259ef2deddf40fe4c02c91"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ReviewStartParams.json",
+      "bytes": 3202,
+      "sha256": "cac942a9a9f53da711217f3cc4de72ff39cd2db7fe78f1b504ee602c53bde15c"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ReviewStartResponse.json",
+      "bytes": 61102,
+      "sha256": "634eea6283cc09012d3aa3d80c28c1c4c5c1037bbc662ecfba0601d834a12ce5"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/SendAddCreditsNudgeEmailParams.json",
+      "bytes": 420,
+      "sha256": "91b380293f5685573f8dcdf46c99eba6f8a2adb7a206df9ac987f7fe6cb282a1"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/SendAddCreditsNudgeEmailResponse.json",
+      "bytes": 417,
+      "sha256": "389978f741476c7cbcaec716b11a5bfb7f17581a28013e18cbf7a73ec8a45ae6"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ServerRequestResolvedNotification.json",
+      "bytes": 514,
+      "sha256": "4f03d586a5af04edd912cad08cc97eceb658e7e06744565e6d41a93e04a55966"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/SkillsChangedNotification.json",
+      "bytes": 341,
+      "sha256": "84f7f1d327c5c774899992f32c98e9e95ee3e010a410d233ec0c33221e4ccbfb"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/SkillsConfigWriteParams.json",
+      "bytes": 1011,
+      "sha256": "6e7dea83b649bfd118828b60446eb2eab2f5ce3cafe287c933b830c9cae9b170"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/SkillsConfigWriteResponse.json",
+      "bytes": 241,
+      "sha256": "628bc112ca64f5475eb02a0eda718e82d670c40299444494e02a8dc278a772c7"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/SkillsExtraRootsSetParams.json",
+      "bytes": 761,
+      "sha256": "bb60389a0c7d4b73f625b9a40965e5e67b56b6503989f2d732cae12e9ca9698a"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/SkillsExtraRootsSetResponse.json",
+      "bytes": 120,
+      "sha256": "b659ec17a196eaa3a23273a3e2d5596460ea329bc3ade249971576bc723d9e96"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/SkillsListParams.json",
+      "bytes": 453,
+      "sha256": "1d245374e64c5acc9739dfc68a4fe5114c6c9147af04c480886f1846d2ca6239"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/SkillsListResponse.json",
+      "bytes": 5358,
+      "sha256": "d11084bd4bfa50f747e880ab9a08eb8e8073c67d67c79907f4cff090db7b48f4"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/StrictReviewRequiredNotification.json",
+      "bytes": 470,
+      "sha256": "16b50621c0982d84bd83b6e85586c1038ff309337e4253219895be7c118df470"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/TerminalInteractionNotification.json",
+      "bytes": 474,
+      "sha256": "5383b3d9681d3c071c9845fd4f043afd60fbe1bcc3650939356cb03848a7d627"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadApproveGuardianDeniedActionParams.json",
+      "bytes": 360,
+      "sha256": "082e5278ed4fb1fc23eafbe658e95ec21d81c446bb6daf2b57e25e8cd3aebd5e"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadApproveGuardianDeniedActionResponse.json",
+      "bytes": 134,
+      "sha256": "628336c7cdabd508d5202695502bb0f9ce42fdde380f5efdd4b033cf215d93e5"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadArchiveParams.json",
+      "bytes": 218,
+      "sha256": "dc2c0b133b814a5d9d543cc37afdb3f4f22feca35b7cea4272834b20a1e47705"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadArchiveResponse.json",
+      "bytes": 114,
+      "sha256": "2e021dabd0930ae3e2beb68cd0ddbafc40fc20cfbf8dbcb5e2f9c0493d06a08c"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadArchivedNotification.json",
+      "bytes": 225,
+      "sha256": "54ca94956719ade8682c766f31419ee9953dee8f4587b5b30efd0927de6ca26e"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadAttachmentAddParams.json",
+      "bytes": 498,
+      "sha256": "9fb9d132c284d92759f39605177eef49ede6605106a211f121ad8b0cde240b3f"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadAttachmentAddResponse.json",
+      "bytes": 1249,
+      "sha256": "06fd0a224722c962687bf808bd3f4d5233e35ae9fbcccd88711fa6f55334d626"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadAttachmentListParams.json",
+      "bytes": 505,
+      "sha256": "1e999a37aa4ea451887d6cb9154c6c6aec0130ba8b56eef65827bf864b5810cc"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadAttachmentListResponse.json",
+      "bytes": 1086,
+      "sha256": "1ba64dc8c5d173c044753e1207ba906550be15b67c4ee105957bdaf4489cc1e8"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadAttachmentOwnerListParams.json",
+      "bytes": 806,
+      "sha256": "a4bb0c34e975fc81ab551957b5a9fdba3f88c0a5241de4a31ba1f1e00057e4a0"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadAttachmentOwnerListResponse.json",
+      "bytes": 999,
+      "sha256": "3ce366f00d2f4fcebf16abba56d20752661789cc38189ce688f854c247754e58"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadAttachmentRemoveParams.json",
+      "bytes": 468,
+      "sha256": "9b262d87755c4ccbd1bf6d17dc71d45d173d80f26e4af9dc6df65bc2c206203d"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadAttachmentRemoveResponse.json",
+      "bytes": 207,
+      "sha256": "905003d0d531365a3557f42dfdcc9a2d5ff13c4992f860d7e6145cbd74083dbe"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadAttachmentUpdatedNotification.json",
+      "bytes": 880,
+      "sha256": "4470f2a0322b9a179e6970f02c5a862dc05ef4c052d948d4baa21934668c1408"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadClosedNotification.json",
+      "bytes": 223,
+      "sha256": "d504cceb70e3397ad684924b08d3bff328a927be02ef4e3d482a18e27bab73de"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadCompactStartParams.json",
+      "bytes": 223,
+      "sha256": "684b20adf20213a9fcbca31b59108feadcd5a8b693c16431c20d701049df3737"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadCompactStartResponse.json",
+      "bytes": 119,
+      "sha256": "74674e47f33e37d7d97d144eac1789ef0580a1fc12d45a5675bb97caa08d803a"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadDeleteParams.json",
+      "bytes": 217,
+      "sha256": "0d5425d94af95e3dd20971cee052b2cb8c7d0d23195db1d17fde4e59cfbdec4a"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadDeleteResponse.json",
+      "bytes": 113,
+      "sha256": "333c0c5df96d78d1bcbdb19b57ddfa941de9a02bdae1c29d13c5311c2cdf6527"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadDeletedNotification.json",
+      "bytes": 224,
+      "sha256": "6f8d6fa96700ec6fff4b8c2bddf6768539b7ec7ba5dc05483aba53f5183386f9"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadForkParams.json",
+      "bytes": 5385,
+      "sha256": "60540b97d453ddbc5e12bfaa007a3718f31847d18dec0da59a5e4b89be4717ad"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadForkResponse.json",
+      "bytes": 82156,
+      "sha256": "455feff51361beee60eea7e8e64b8b29ba494d8683a83dae2a2353a84982e84d"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadGoalClearParams.json",
+      "bytes": 721,
+      "sha256": "9f40b83771b3cc733e05579041600db6371968e1547ef9626a589525022cb8ae"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadGoalClearResponse.json",
+      "bytes": 221,
+      "sha256": "2652c2d0072be8ccb71c8dcaaa054aa74f974e68156a73451baf72c8597669c2"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadGoalClearedNotification.json",
+      "bytes": 228,
+      "sha256": "ad6c2cf53970e45cae55d36dbddd84ecc7b34837846616493efa7b132a35a051"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadGoalGetParams.json",
+      "bytes": 218,
+      "sha256": "1a5de89b3c5c49528af404a65411a73ef05dc7c9c49c3f00c90d9926dfe34137"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadGoalGetResponse.json",
+      "bytes": 1491,
+      "sha256": "f610000963194731c96ce2b45e46722ca700f1b6ccc1fc55a2fd95e526018fd9"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadGoalSetParams.json",
+      "bytes": 1282,
+      "sha256": "36c1f1935e1a352865512433aae44c9fffde4a7fa3db127449da088a8a212287"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadGoalSetResponse.json",
+      "bytes": 1428,
+      "sha256": "b1c61b6068b3b73dd3d97b38f8a269593f8f7added4643bfdb2016315b71ad8e"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadGoalUpdatedNotification.json",
+      "bytes": 1580,
+      "sha256": "52010479c7efcc6dc749e2d9bf1e27c134453d92a1f0b367193d8125eec1fedc"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadInjectItemsParams.json",
+      "bytes": 397,
+      "sha256": "8d7e754402a2bb71bd817882076d2f8ac4cd75d4573306db082a83b841aa3532"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadInjectItemsResponse.json",
+      "bytes": 118,
+      "sha256": "93d909e5b49b44da02072d340f8ad0ecd417d448ccf27fe50be7e369c7864159"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadItemsListParams.json",
+      "bytes": 2291,
+      "sha256": "d5cf9784413f1d1abba756e04e48b273a9d12ab2c5675442e91b6a4ee55e19f0"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadItemsListResponse.json",
+      "bytes": 52459,
+      "sha256": "5bcd27fa23f443b790dcae8d0045a700b4aff6025602b032cb2c558694c921e6"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadListParams.json",
+      "bytes": 4375,
+      "sha256": "e9da2e0bf099d21ab7982210073f927a50370c4e28be7140c314f82c524070bd"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadListResponse.json",
+      "bytes": 77221,
+      "sha256": "8ffb6a66d99d98f0c1db0e90ed5c9758ecb600066a1fbf56a50a8c145ab306cf"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadLoadedListParams.json",
+      "bytes": 489,
+      "sha256": "42c2d124ab2b2998d84f0126daae2d32b0bf9c5a7ea7266e3a0814e5e37cf00d"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadLoadedListResponse.json",
+      "bytes": 565,
+      "sha256": "1ea02c4710083e552b2a3a89b931b9049d5bf05b7db46278b8352cf9fd80cd52"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadMetadataUpdateParams.json",
+      "bytes": 1465,
+      "sha256": "190da07d8c7c89c44b1e44b4e57fb5d803f356953534498a7a7f39fe29a8a6a4"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadMetadataUpdateResponse.json",
+      "bytes": 74874,
+      "sha256": "97d4796915b72942b74dd06a37be212a2fc62e547a0494b13985cbf517a2d746"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadNameUpdatedNotification.json",
+      "bytes": 312,
+      "sha256": "06d5e6b0e1eaf03eb88891af58eff14368a76e300a40a9bed71bacce2093b960"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadPredictionUpdatedNotification.json",
+      "bytes": 1389,
+      "sha256": "bf2f8f8f99eb47222a7b578246bea1a509b9814795669c48c22d7fffe40815c8"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadProjectUpdatedNotification.json",
+      "bytes": 331,
+      "sha256": "ad31b029957a9259f26352ce879219cbe25f0314ae883d02ab811a0c6427a1e5"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadQueueChangedNotification.json",
+      "bytes": 229,
+      "sha256": "0a960da43fb14f69dae2550ac4f8517760464eedbf95a9977718548739fdcf21"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadReadParams.json",
+      "bytes": 502,
+      "sha256": "dfe040c6ac71d30795b8be3f3ff232e66f362a37f883b491e5d1ea367f470db4"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadReadResponse.json",
+      "bytes": 76557,
+      "sha256": "6eb05cf9bf73d9f873e782868189cd37dc393d12c7a7c49118adb9756b30c485"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadReadStateChangedNotification.json",
+      "bytes": 2038,
+      "sha256": "e3387ae0890ac14ed45ba1046f706b51a57b97caef645b080d6946b257a17c4b"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadRealtimeClosedNotification.json",
+      "bytes": 393,
+      "sha256": "5290a73f8d4652b59d2f82d89c7bd289003fe2981fb0c628a61e801fa2123364"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadRealtimeErrorNotification.json",
+      "bytes": 377,
+      "sha256": "aeba7e4b477b4825b41990a4da69b0f3cb3a00f44cf9e2e42e275b944b7cb040"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadRealtimeItemAddedNotification.json",
+      "bytes": 358,
+      "sha256": "48aabfcbfd2361b5830a93257bc9eb31a6933f6e390694e188bfb287acbad9b4"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadRealtimeItemCompletedNotification.json",
+      "bytes": 5063,
+      "sha256": "b2a5e38840b8afc2111620c332801603e832b91ad4c95dd1f13c926923b760ef"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadRealtimeItemStartedNotification.json",
+      "bytes": 5063,
+      "sha256": "ef1a68a635ce680b321e276fd9144ef614b37bab16942368bdc16bb8ee217f46"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadRealtimeItemTranscriptDeltaNotification.json",
+      "bytes": 450,
+      "sha256": "42f2456726367b90a2626a32f3f88495de87032243beecd9bfbad28734f4b62d"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadRealtimeOutputAudioDeltaNotification.json",
+      "bytes": 1261,
+      "sha256": "4f73a5c606fda4984da4fc14e4cd98f62c8f9aa75b2db17cff76562c2d176ec0"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadRealtimeSdpNotification.json",
+      "bytes": 376,
+      "sha256": "1e276f48d346e6cace65551f84ef9b0bc8daba2a3ce93499f3a902551de239fc"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadRealtimeStartedNotification.json",
+      "bytes": 661,
+      "sha256": "483d324381a8ced04c8ab158c825bca2b64c06a4e85b350a086730050fe8f188"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadRealtimeTranscriptDeltaNotification.json",
+      "bytes": 533,
+      "sha256": "1a6add677534de891026eb56aac815b2585fbd4a6d6475f679a722c52b778703"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadRealtimeTranscriptDoneNotification.json",
+      "bytes": 528,
+      "sha256": "0000453425e300fd19ac2bc5fba4ebf3fbce48ac9a9b62ceb8bc5db8b6c77fff"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadResumeParams.json",
+      "bytes": 43009,
+      "sha256": "8dceca415b2c16693b55658ea629cba5ffc82ac300dcd403db0ba7455e491496"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadResumeResponse.json",
+      "bytes": 84698,
+      "sha256": "2f8aa868ca008731622673d518b12f70ea8920eaf00fa5e80bfeb49cd8f2a77c"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadRevertParams.json",
+      "bytes": 579,
+      "sha256": "3a5e85a67906c8ea3ad9f5065559d263d968a28a957739e7a1d9e4e1981e4eb8"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadRevertResponse.json",
+      "bytes": 75674,
+      "sha256": "8901b843ee07b30bc941ed63bd5f58f998b4f58aad42da4ea786833731369a52"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadRevertedNotification.json",
+      "bytes": 225,
+      "sha256": "570995a91a4436d403bafbf9a4c34ead666b137ecd5406803e14826a6d84cf22"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadSectionCreateParams.json",
+      "bytes": 969,
+      "sha256": "e3bf941ceab7a4dd39ce1b4063168621d60162aa97f7171cef59819c999c501e"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadSectionCreateResponse.json",
+      "bytes": 1548,
+      "sha256": "2b0b0e7a2651354aac35aa5d1a423b9f207ee8d46b2de077df747f4ed4f4c8de"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadSectionDeleteParams.json",
+      "bytes": 401,
+      "sha256": "93cc3d12bd5580966b59bbab8f2ccddd31b3b4bce56f76d49cfe41f1916b5deb"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadSectionDeleteResponse.json",
+      "bytes": 201,
+      "sha256": "9bbee5cca1fca02e4a65c2481dc3b24f090bca7afb786923ee481017b133b091"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadSectionListParams.json",
+      "bytes": 570,
+      "sha256": "6aea71b3fba46351fcaf648eab0da564080ba424599a012648abd9fd44464cf8"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadSectionListResponse.json",
+      "bytes": 1760,
+      "sha256": "dc3b5e5501a56ea2a1a83cb97c5221b355629f8c9468793d94e22673424140bc"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadSectionMoveParams.json",
+      "bytes": 768,
+      "sha256": "48bc921055838df25c5595c96be7bd25beef3accb8bd1d28026fcaa7d81487b1"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadSectionMoveResponse.json",
+      "bytes": 118,
+      "sha256": "243299d7eebd4fb264d4e75efeb5058982681202371c2b83ff1a63b3369ddbb6"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadSectionUpdateParams.json",
+      "bytes": 1211,
+      "sha256": "6cc7b7e486026a59d6fcc0701407d9293c0fe8b96e41894630c3a39fee967980"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadSectionUpdateResponse.json",
+      "bytes": 1552,
+      "sha256": "4588cbf0374204c17f02f15eecb5390cd5346bc551675e07e541bbfd28d020bf"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadSetNameParams.json",
+      "bytes": 274,
+      "sha256": "8e334c816bbaeb80f807aca61bf659246f3f60c245c21b5cb7e3ca4ee3ce4820"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadSetNameResponse.json",
+      "bytes": 114,
+      "sha256": "f8763716433feea94f7c1ebd59b6cea4c261432e83240c13a8d49ba8185aa567"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadSettingsUpdatedNotification.json",
+      "bytes": 10787,
+      "sha256": "1decdf57238a1573ffbbf0bf695acba50888c1580e44670471dd88bfc2bd540f"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadShellCommandParams.json",
+      "bytes": 917,
+      "sha256": "dc646457ca36be601c8c3d15c44d14907d9a165ccf2b9635a8e9a878f0ca0727"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadShellCommandResponse.json",
+      "bytes": 119,
+      "sha256": "fd4911613f6a6da2ca13b75342501d4d61f64e00a1083c6d60038369b8caeefe"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadStartParams.json",
+      "bytes": 10358,
+      "sha256": "e9c6d3cc18d049bfbc0249add3808fb8e5a27e1a0b5a423767aafbc3859a9428"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadStartResponse.json",
+      "bytes": 82157,
+      "sha256": "c655daa1616548f6b3b0960acee9dcfefa8aba5965ec4fc636c84ee840a8626a"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadStartedNotification.json",
+      "bytes": 74871,
+      "sha256": "ac449a3acbd1d75bee25e6b662ba0e9f5a6b3791cbb145f12bfa08f76cbff0dc"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadStatusChangedNotification.json",
+      "bytes": 2207,
+      "sha256": "26f3c60c1b73f7fa2d31c74429cdc36f8746c76c33e3d314b3fb61d3661f05f6"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadTokenUsageUpdatedNotification.json",
+      "bytes": 1727,
+      "sha256": "aba4f6c7e4a19b2b842c08ee793b57000c07dafd57b922ad0d8e7c76609108c2"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadTurnsListParams.json",
+      "bytes": 1889,
+      "sha256": "2a8b93d7d4437cc25e16a1dde16d8db3c338d39e16c5eece2a56e943a21577d7"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadTurnsListResponse.json",
+      "bytes": 61588,
+      "sha256": "7953d842384fbc572c0b33f03c0fb1c6b746d3a3cc9c25302e6a03f9dce6d46a"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadUnarchiveParams.json",
+      "bytes": 220,
+      "sha256": "a1d5d847b61ea16ab09d5b9d1c1461134a7829292aae02a7e11b0a69b00c76ca"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadUnarchiveResponse.json",
+      "bytes": 74869,
+      "sha256": "5f1886e0eb98920026e1194ef0f4dd0924eb7f2ac3e7d5638c3c522efa4c260a"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadUnarchivedNotification.json",
+      "bytes": 227,
+      "sha256": "fc00949cdc588b84800a26403647eda0e22d6f28663dc032a90db9c20dfa822d"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadUnsubscribeParams.json",
+      "bytes": 222,
+      "sha256": "77c67e0dc0a729af2d4612f30ed63f1297160232e96cd32b7cb9cc3e7fff0233"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ThreadUnsubscribeResponse.json",
+      "bytes": 431,
+      "sha256": "9cad5e71a589c3c20e0980ce34a894a29e2898a075b10b1493bc87f32500081a"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/TurnCompletedNotification.json",
+      "bytes": 61030,
+      "sha256": "e9a5e3bcddaeee04afc60abafbbdcb5b0a531b5578db573fcacdd1477565bd0a"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/TurnDiffUpdatedNotification.json",
+      "bytes": 494,
+      "sha256": "59a02535094b591b926cdc11a8e5f5babf73b442323a02cace1661c62f0c2918"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/TurnInterruptParams.json",
+      "bytes": 278,
+      "sha256": "6dff382dae73d1dbc58406ed045605f647e7a49660e2540fbd2c6c24d60c5f2b"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/TurnInterruptResponse.json",
+      "bytes": 114,
+      "sha256": "531de6be06fe979b5963f249bab82498a175e614bf65ac12fb2e849dfe60bcf1"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/TurnModerationMetadataNotification.json",
+      "bytes": 331,
+      "sha256": "90fe9ade83c46fd42af9d023737a9990595dac71e059158744950f538e802876"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/TurnPlanUpdatedNotification.json",
+      "bytes": 948,
+      "sha256": "2522f743be0a1e9666dec5ad4f18d8ecba3c4f16e66d510b1491d4117d1dd0ba"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/TurnStartParams.json",
+      "bytes": 23520,
+      "sha256": "49e53282f327c25e7b39d97afacd038ef10ad5c4fb0431608b354d3a7bf6bcea"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/TurnStartResponse.json",
+      "bytes": 60958,
+      "sha256": "85da8d16c86432da14440504ae1e76d13527058920d4ed81632dd50c3fbd054d"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/TurnStartedNotification.json",
+      "bytes": 61028,
+      "sha256": "f5b0ea97eea0d28c8b009a82b9ede7bba5c194dc5bbf91b8e268b2874e0d9eee"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/TurnSteerParams.json",
+      "bytes": 7121,
+      "sha256": "0ed9b59bc284e8405ca88948a12bd411c39103b19c0797f73236cefedb96771f"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/TurnSteerResponse.json",
+      "bytes": 212,
+      "sha256": "866ba9a77c12b5d570c837d58f73bf40b24e50fa93404bdf792dd984d313b1aa"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/WarningNotification.json",
+      "bytes": 454,
+      "sha256": "f83c400591b923400ca0beaaaab1341c712d5ac0dee4ce6868a8e590f46490f9"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/WindowsSandboxReadinessResponse.json",
+      "bytes": 435,
+      "sha256": "077f60a3d6d1fc226c45059472b29caf675fdc3fdebb29569eaab94bd05ceb00"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/WindowsSandboxSetupCompletedNotification.json",
+      "bytes": 556,
+      "sha256": "dc5383ae8fc2a46badbc2dab3ccd0447fed97729c2d5a177e28c4a7e2a60c329"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/WindowsSandboxSetupStartParams.json",
+      "bytes": 1002,
+      "sha256": "8610d077fff4fc5811f2e33dea82617a15ffb82f08e55e1540aef877133f5b4f"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/WindowsSandboxSetupStartResponse.json",
+      "bytes": 230,
+      "sha256": "830bf89deac3e73e36b7d9799ceed32ee25e782c30b1d25266374aa020d3bc7e"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/WindowsWorldWritableWarningNotification.json",
+      "bytes": 478,
+      "sha256": "bfa34d4890c8121a04412b8d53314a13adf98289fdd948857fd97b808dcbe79e"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-steer/meta.json",
+      "bytes": 387,
+      "sha256": "e4c399373361fb1bad2862acb44981c2676a30460392b7af7680a3e639552f1b"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-steer/stderr.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-steer/stdin.txt",
+      "bytes": 958,
+      "sha256": "b298671185fc84db8942d95d1cfb25afa5a5582849ba35930923220d9f0f6c16"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-steer/stdout.jsonl",
+      "bytes": 10360,
+      "sha256": "368da1af9b4bc8267b781a77e1c9c472b1aadc19f825d7a99d251c946ef82ec2"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-turn/meta.json",
+      "bytes": 409,
+      "sha256": "008faeb9192c70ed063efc5ce2e485ae0974e47423359c251c73b986a428844f"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-turn/stderr.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-turn/stdin.txt",
+      "bytes": 429,
+      "sha256": "398f4985a5e2889b2122e2c2c567abdcc2a0562291ea1a6c8b11fc10b2c1c3c2"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/app-server-turn/stdout.jsonl",
+      "bytes": 8460,
+      "sha256": "657c6bc80c08e170c4fcbe6dc2ae2766c327af6dac3ba2d613c46055ed5f86a6"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/auth-status.json",
+      "bytes": 199,
+      "sha256": "3801809382b6ae3f9462104f6c780d4ef570b41c14561318549faf4677c47232"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/exec-turn-failed/meta.json",
+      "bytes": 413,
+      "sha256": "e9b82b3a6a7fe25e035e8c35451e935a42bec9f1138f46a02a2e8390f60c1249"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/exec-turn-failed/stderr.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/exec-turn-failed/stdin.txt",
+      "bytes": 50,
+      "sha256": "41db62ec0de9f9031de948bcb36bdf9bddee41b152fc1416df9a6477245591b6"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/exec-turn-failed/stdout.jsonl",
+      "bytes": 539,
+      "sha256": "852309d8342837a5f7c568e0d5ce41cb8372a215c7ea5c80b0cce8e0a06d788b"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/exec-unauthenticated/meta.json",
+      "bytes": 435,
+      "sha256": "518999df195d7630bf94b84f65f2b6d65548c3e00044d373b0b6e2422f74d028"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/exec-unauthenticated/stderr.log",
+      "bytes": 917,
+      "sha256": "6cea5343da97d678efeba543352a1bdeb9d11cc2e7484dba2a8c201aa58b2483"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/exec-unauthenticated/stdin.txt",
+      "bytes": 50,
+      "sha256": "41db62ec0de9f9031de948bcb36bdf9bddee41b152fc1416df9a6477245591b6"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/exec-unauthenticated/stdout.jsonl",
+      "bytes": 2983,
+      "sha256": "d31a75ecafe82e6ce8f556890c5273c73021a565af11713866657545adb1e0fb"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/exec/meta.json",
+      "bytes": 375,
+      "sha256": "a6278e1aa2a7c723e214ed3e0e66d6f6f9144554c80d30f00c06a4b5e6976dc7"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/exec/stderr.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/exec/stdin.txt",
+      "bytes": 50,
+      "sha256": "41db62ec0de9f9031de948bcb36bdf9bddee41b152fc1416df9a6477245591b6"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/exec/stdout.jsonl",
+      "bytes": 352,
+      "sha256": "3b43bdb1f7db1c699f7dcf23b8856e2c2acc317b4279a2a262dbab34036a9024"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/help-app-server.txt",
+      "bytes": 3703,
+      "sha256": "d2854a3ad9c9733f8be8034feb198ba017ddce07d539d8e777167fc96dffbd10"
+    },
+    {
+      "path": "tests/fixtures/protocol/codex/0.166.0/help-exec.txt",
+      "bytes": 4331,
+      "sha256": "df0d864ca2076f7654288c6a1e3394e3eaa2ea8f15021df2524efdd90c70986c"
+    },
+    {
+      "path": "tests/fixtures/protocol/compat-manifest.json",
+      "bytes": 11239,
+      "sha256": "4c2b5fba25d5e99f3f6016f26f56b267aeb78f987930fce1ba29ad3043db8f6d"
+    },
+    {
+      "path": "tests/fixtures/protocol/pi/1.5.0/help.txt",
+      "bytes": 10867,
+      "sha256": "d905f4bf6bcd5c760344b4dfb808bcf0db37185413ef675cef69531ccfc6b818"
+    },
+    {
+      "path": "tests/fixtures/protocol/pi/1.5.0/rpc-abort/meta.json",
+      "bytes": 490,
+      "sha256": "a1e6f71938b788d057bd383375f24494288c7124c65e47ab94701f47ac3b82ca"
+    },
+    {
+      "path": "tests/fixtures/protocol/pi/1.5.0/rpc-abort/stderr.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "tests/fixtures/protocol/pi/1.5.0/rpc-abort/stdin.txt",
+      "bytes": 137,
+      "sha256": "99c7a505677996869c7e80f94fd4ed338250cc63a7b03f00f3449de33029587c"
+    },
+    {
+      "path": "tests/fixtures/protocol/pi/1.5.0/rpc-abort/stdout.jsonl",
+      "bytes": 3442,
+      "sha256": "d9f4adcda23127fab57c14928143ba6959ee59edb4ebc64929508d6b1fc43c7a"
+    },
+    {
+      "path": "tests/fixtures/protocol/pi/1.5.0/rpc-invalid-model/meta.json",
+      "bytes": 389,
+      "sha256": "fe3c4198732eb6a3d824aee194773165299033936cd55e3c77bc712d63d75019"
+    },
+    {
+      "path": "tests/fixtures/protocol/pi/1.5.0/rpc-invalid-model/stderr.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "tests/fixtures/protocol/pi/1.5.0/rpc-invalid-model/stdin.txt",
+      "bytes": 102,
+      "sha256": "77b54378e1f3a24beebb63b77a2e554caf074ea292bd3574e6c3b294323603f8"
+    },
+    {
+      "path": "tests/fixtures/protocol/pi/1.5.0/rpc-invalid-model/stdout.jsonl",
+      "bytes": 134,
+      "sha256": "dc100a9ed8f843cd01f944bffae398dd679699f43b8655f035ada729cb8d70ac"
+    },
+    {
+      "path": "tests/fixtures/protocol/pi/1.5.0/rpc-no-provider/meta.json",
+      "bytes": 569,
+      "sha256": "fbf3464dbd734c21bf8cb29792cf28ee1e260a91786fea0d352350de84528c6e"
+    },
+    {
+      "path": "tests/fixtures/protocol/pi/1.5.0/rpc-no-provider/stderr.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "tests/fixtures/protocol/pi/1.5.0/rpc-no-provider/stdin.txt",
+      "bytes": 130,
+      "sha256": "c10609ca526f2f0fb90a158f37860942b2a62f702030f7e4144680c7c55cae32"
+    },
+    {
+      "path": "tests/fixtures/protocol/pi/1.5.0/rpc-no-provider/stdout.jsonl",
+      "bytes": 1050,
+      "sha256": "15230d10be8325dd5dddf4aaf1a55572abf988e50ec9377165d3694b297f49db"
+    },
+    {
+      "path": "tests/fixtures/protocol/pi/1.5.0/rpc-prompt/meta.json",
+      "bytes": 387,
+      "sha256": "b6f31e2678d7da0554666a64e8008a11ba72320bdca07a125beaa9d82fb4bbbf"
+    },
+    {
+      "path": "tests/fixtures/protocol/pi/1.5.0/rpc-prompt/stderr.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "tests/fixtures/protocol/pi/1.5.0/rpc-prompt/stdin.txt",
+      "bytes": 130,
+      "sha256": "c10609ca526f2f0fb90a158f37860942b2a62f702030f7e4144680c7c55cae32"
+    },
+    {
+      "path": "tests/fixtures/protocol/pi/1.5.0/rpc-prompt/stdout.jsonl",
+      "bytes": 21310,
+      "sha256": "b51bff81d09c5a9de2e0affa02799b2baa3523510e3c37ff55ff734b761f931f"
+    },
+    {
+      "path": "tests/fixtures/protocol/pi/1.5.0/rpc-resume/meta.json",
+      "bytes": 452,
+      "sha256": "cced9b76ce36bc65a8224d3cc39e965dd1645c707667b65b9a56d23d0a0d9a92"
+    },
+    {
+      "path": "tests/fixtures/protocol/pi/1.5.0/rpc-resume/stderr.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "tests/fixtures/protocol/pi/1.5.0/rpc-resume/stdin.txt",
+      "bytes": 159,
+      "sha256": "0d6bc083e013717442b2e8de57f30d3ccbd82b1893a49540fa915634ad8b7208"
+    },
+    {
+      "path": "tests/fixtures/protocol/pi/1.5.0/rpc-resume/stdout.jsonl",
+      "bytes": 12550,
+      "sha256": "a9b36cc6d4cffe2ae98fc8c79dd0fb170f82e1840b77d8679896113fcbbc3340"
+    },
+    {
+      "path": "tests/fixtures/protocol/record.py",
+      "bytes": 28053,
+      "sha256": "ecf69b5dec4caf018951140882260753c89961cbaf4f2f27bed8570303a5ab0e"
     },
     {
       "path": "tools/agent_task.py",
-      "bytes": 11662,
-      "sha256": "613298bfda72fe4e605703bcea65faf4474fb5c96b007b33e52addb2d9146d69"
+      "bytes": 12652,
+      "sha256": "55de6ee6ff7aea1a00c9781d840ccbeb9078b5971cdae1517c00668b591ae24b"
     },
     {
       "path": "tools/baseline.py",
@@ -803,8 +2898,8 @@
     },
     {
       "path": "tools/install_pi_plugins.py",
-      "bytes": 4234,
-      "sha256": "42c17a80917ba0f0e723999f9a7d91f9e7e1e41c228c0cd9ebf38f5f3a7a12f5"
+      "bytes": 5110,
+      "sha256": "105cd3cfb09eb237d482aa573b2c8d03ce5a1072802f825fc4afd05486583474"
     },
     {
       "path": "tools/preflight.py",
@@ -843,8 +2938,8 @@
     },
     {
       "path": "tools/validate_bundle.py",
-      "bytes": 11362,
-      "sha256": "f0b2cd638b1d199ec0fa30ee22ec1ed6d760a56e503236bdb068bb27c8b0c399"
+      "bytes": 14376,
+      "sha256": "dc5d8bf5d2a312e4443b5458e69b02c21d1f5ec4b2bfccd4fb04157caa92d4fd"
     }
   ]
 }
