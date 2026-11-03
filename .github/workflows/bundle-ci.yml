@@ -19,7 +19,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: python -m pip install -r requirements-dev.txt
-      - run: shellcheck -S warning scripts/*.sh
+      - run: shellcheck -S warning scripts/*.sh scripts/product/*.sh
       - run: bash scripts/bootstrap.sh --yolo --dry-run
       # Validation, baseline/CR verification, generated-view drift and all bundle tests.
       - run: bash scripts/check.sh --bundle

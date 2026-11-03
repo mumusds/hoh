@@ -35,6 +35,20 @@ class BundleContracts(unittest.TestCase):
         self.assertEqual({x['id'] for x in r if x['release_class']=='degradable'},{'REQ-048','REQ-049','REQ-050'})
         self.assertTrue(all('v1' in x['release_targets'] for x in r))
         self.assertTrue(all(x['spec_maturity']=='detailed' for x in r if x['milestone'] in ('M1','M2')))
+    def test_unimplemented_checks_fail(self):
+        plan=load_json(ROOT/'tests/check-plan.json')
+        for cid,entry in plan['checks'].items():
+            if entry['argv'][-3:-2]==['scripts/product/not-implemented.sh'] or 'not-implemented.sh' in ' '.join(entry['argv']):
+                with self.subTest(check=cid):
+                    p=subprocess.run(entry['argv'],cwd=ROOT,capture_output=True,text=True,timeout=30)
+                    self.assertEqual(p.returncode,3);self.assertIn('NOT_IMPLEMENTED',p.stderr)
+    def test_trivial_plan_command_rejected(self):
+        import validate_bundle
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)/'kit';shutil.copytree(ROOT,root,ignore=shutil.ignore_patterns('.git','.hoh-dev','__pycache__','target','npm'))
+            plan=load_json(root/'tests/check-plan.json');plan['checks']['recovery']['argv']=['true']
+            (root/'tests/check-plan.json').write_text(json.dumps(plan))
+            r=validate_bundle.validate(root);self.assertTrue(any('always-succeeding' in e for e in r['errors']),r['errors'])
     def test_original_skills_available(self):
         skills=load_json(ROOT/'resources/skills/registry.json')['skills'];self.assertEqual(len(skills),12)
         for s in skills:self.assertTrue((ROOT/s['entry']).is_file())
@@ -52,7 +66,7 @@ class BundleContracts(unittest.TestCase):
 class ValidatorScope(unittest.TestCase):
     def test_product_files_are_not_kit_files(self):
         with tempfile.TemporaryDirectory() as d:
-            root=Path(d)/'kit';shutil.copytree(ROOT,root,ignore=shutil.ignore_patterns('.git','.hoh-dev','__pycache__'))
+            root=Path(d)/'kit';shutil.copytree(ROOT,root,ignore=shutil.ignore_patterns('.git','.hoh-dev','__pycache__','target','npm'))
             (root/'web').mkdir();(root/'web/tsconfig.json').write_text('{ // comments are valid here\n}\n')
             (root/'crates/core').mkdir(parents=True);(root/'crates/core/README.md').write_text('```rust\n/// see [Foo](crate::Foo)\n```\n')
             (root/'tests/fixtures').mkdir(parents=True);(root/'tests/fixtures/broken.json').write_text('{not json')

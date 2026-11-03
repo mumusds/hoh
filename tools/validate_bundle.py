@@ -13,6 +13,7 @@ from gen_spec_views import stale as stale_views
 # CR-001: only these requirements may be released as DEGRADED (third-party Pi plugins).
 DEGRADABLE={'REQ-048','REQ-049','REQ-050'}
 TASK_KINDS={'setup','spec','implement','verify','release'}
+TRIVIAL_COMMANDS={'true',':','echo','printf','exit','yes'}
 
 # The kit owns these paths. Product sources (crates/, web/, tests/ fixtures …) have their own linters,
 # so their JSON/TOML/Markdown is never parsed or link-checked here.
@@ -109,8 +110,18 @@ def validate(root:Path)->dict:
     for path in ['context-handoff.json','hcp-message.json','command.json']:
         try:Draft202012Validator(proto).validate(load_json(root/'examples'/path))
         except Exception as e:errors.append(f'example {path}: {e}')
-    try:Draft202012Validator(load_json(root/'contracts/check-plan.schema.json')).validate(load_json(root/'examples/check-plan.json'))
-    except Exception as e:errors.append(f'example check-plan.json: {e}')
+    for rel in ['examples/check-plan.json','tests/check-plan.json']:
+        if not (root/rel).is_file():continue
+        try:
+            plan=load_json(root/rel);Draft202012Validator(load_json(root/'contracts/check-plan.schema.json')).validate(plan)
+            check(set(plan['checks'])==set(policy['checks']),f'{rel}: must declare exactly the release-policy checks')
+            for cid,entry in plan['checks'].items():
+                rule=policy['checks'].get(cid,{})
+                check(Path(entry['argv'][0]).name not in TRIVIAL_COMMANDS,f'{rel}: {cid} uses an always-succeeding command {entry["argv"][0]!r}')
+                check(entry['mode']==rule.get('mode'),f'{rel}: {cid} mode {entry["mode"]} but policy needs {rule.get("mode")}')
+                if entry['mode']=='live':check(policy['artifacts']['live_sessions'] in entry.get('artifacts',[]),f'{rel}: live check {cid} must declare {policy["artifacts"]["live_sessions"]}')
+            check(policy['artifacts']['soak_timeline'] in plan['checks'].get('soak',{}).get('artifacts',[]),f'{rel}: soak must declare {policy["artifacts"]["soak_timeline"]}')
+        except Exception as e:errors.append(f'{rel}: {e}')
     resources=load_json(root/'resources/skills/registry.json')['skills']
     try:topo([Task(x['id'],tuple(x.get('dependencies',[]))) for x in resources])
     except ValueError as e:errors.append('skill DAG: '+str(e))
@@ -127,7 +138,7 @@ def validate(root:Path)->dict:
     for p in sorted((root/'tools').glob('*.py'))+sorted((root/'tests/bundle').glob('*.py')):
         try:ast.parse(p.read_text(),filename=str(p))
         except SyntaxError as e:errors.append(str(e))
-    for p in (root/'scripts').glob('*.sh'):
+    for p in sorted((root/'scripts').rglob('*.sh')):
         r=subprocess.run(['bash','-n',str(p)],capture_output=True,text=True)
         check(r.returncode==0,p.name+': '+r.stderr)
     try:
