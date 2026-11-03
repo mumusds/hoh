@@ -1,0 +1,16 @@
+{
+  "cli_version": "0.166.0",
+  "auth": "AUTHENTICATED",
+  "recording_started_at": "2026-11-03T21:58:11.580921+00:00",
+  "recorded_at": "2026-11-03T21:59:52.783817+00:00",
+  "help_argv": [
+    "codex",
+    "exec",
+    "--help"
+  ],
+  "help_sha256": "df0d864ca2076f7654288c6a1e3394e3eaa2ea8f15021df2524efdd90c70986c",
+  "entry_path": "/home/ai/.nvm/versions/node/v26.13.0/lib/node_modules/@openai/codex/bin/codex.js",
+  "entry_sha256": "e14fc83739c13c1074b12bd1acce4010c893c7f6fbfc1593b4a31d74cabb57af",
+  "native_path": "/home/ai/.nvm/versions/node/v26.13.0/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex",
+  "native_sha256": "b8a11fedf24b2dfb59a70c9e52b030f9a508dcd49cd2dd0d41956f4c785156b8"
+}

@@ -1,4 +1,4 @@
 {"method": "initialize", "id": 0, "params": {"clientInfo": {"name": "hoh-recorder", "version": "0.0.0"}}}
 {"method": "initialized"}
-{"method": "thread/resume", "id": 1, "params": {"threadId": "01a1a28f-bd78-7c80-9988-c2527d9758f2", "approvalPolicy": "never", "sandbox": "danger-full-access"}}
-{"method": "turn/start", "id": 2, "params": {"threadId": "01a1a28f-bd78-7c80-9988-c2527d9758f2", "input": [{"type": "text", "text": "Repeat the exact token you replied with in the previous turn, and nothing else."}]}}
+{"method": "thread/resume", "id": 1, "params": {"threadId": "01a1a36c-80f1-7df2-9ba7-ce3e733a83fe", "approvalPolicy": "never", "sandbox": "danger-full-access"}}
+{"method": "turn/start", "id": 2, "params": {"threadId": "01a1a36c-80f1-7df2-9ba7-ce3e733a83fe", "input": [{"type": "text", "text": "Repeat the exact token you replied with in the previous turn, and nothing else."}]}}

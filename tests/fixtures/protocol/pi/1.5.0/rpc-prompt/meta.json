@@ -11,8 +11,10 @@
   ],
   "cwd": "fresh temp Git repo outside the checkout",
   "exit_code": 0,
-  "recorded_at": "2026-11-03T17:55:06.771110+00:00",
+  "recorded_at": "2026-11-03T22:01:45.617669+00:00",
   "mode": "live",
+  "notes": "get_state then one prompt until agent_settled",
+  "stopped": "exited",
   "valid": true,
-  "notes": "get_state then one prompt until agent_settled"
+  "problems": []
 }

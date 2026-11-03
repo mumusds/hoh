@@ -1,6 +1,6 @@
 {"method": "initialize", "id": 0, "params": {"clientInfo": {"name": "hoh-recorder", "version": "0.0.0"}}}
 {"method": "initialized"}
 {"method": "thread/start", "id": 1, "params": {"approvalPolicy": "never", "sandbox": "danger-full-access"}}
-{"method": "turn/start", "id": 2, "params": {"threadId": "01a1a290-21ff-7c51-b808-cac6c4b5cbd1", "input": [{"type": "text", "text": "Run this exact shell command and wait for it to finish: for i in $(seq 1 30); do echo tick $i; sleep 2; done. Then reply DONE."}]}}
-{"method": "turn/steer", "id": 3, "params": {"threadId": "01a1a290-21ff-7c51-b808-cac6c4b5cbd1", "expectedTurnId": "hoh-stale-turn-id", "input": [{"type": "text", "text": "Stop and reply STEERED."}]}}
-{"method": "turn/steer", "id": 4, "params": {"threadId": "01a1a290-21ff-7c51-b808-cac6c4b5cbd1", "expectedTurnId": "01a1a290-2214-7612-a390-64262e2d5440", "input": [{"type": "text", "text": "Stop running the command now and reply exactly STEERED."}]}}
+{"method": "turn/start", "id": 2, "params": {"threadId": "01a1a36c-df14-7831-8825-28c97157c333", "input": [{"type": "text", "text": "Run this exact shell command and wait for it to finish: for i in $(seq 1 30); do echo tick $i; sleep 2; done. Then reply DONE."}]}}
+{"method": "turn/steer", "id": 3, "params": {"threadId": "01a1a36c-df14-7831-8825-28c97157c333", "expectedTurnId": "hoh-stale-turn-id", "input": [{"type": "text", "text": "Stop and reply STEERED."}]}}
+{"method": "turn/steer", "id": 4, "params": {"threadId": "01a1a36c-df14-7831-8825-28c97157c333", "expectedTurnId": "01a1a36c-df28-7ab3-8e6d-6a76798666dd", "input": [{"type": "text", "text": "Stop running the command now and reply exactly STEERED."}]}}

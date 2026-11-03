@@ -6,7 +6,7 @@
 
 `bootstrap.sh --yolo` 按需安装系统构建依赖、Node（满足 Pi 要求）、Rust、jsonschema 开发 venv 和缺少的原生 Agent；已有安装、认证和模型默认值保留。新安装的版本只解析一次，记录到 `.hoh-dev/*version.lock`，不在正在执行的 Run 里自动追最新版。Rust 产品由 Cargo.lock 与 rust-toolchain 进一步锁定，Web 由 package-lock 锁定。Node 包下载后核对官方 SHA256。
 
-Pi 插件由 `tools/install_pi_plugins.py` 安装：只要 Pi 支持就带 `--approve`，版本与 npm integrity 固定在受版本控制的 `config/plugins.json`（安装时与 registry 比对，不符即 DEGRADED），安装状态记录在 `.hoh-dev/plugin-lock.json`。某个插件装不上时，它被记为 DEGRADED（附错误信息），其余插件与 bootstrap 继续（CR-001）。之后 AI 必须读取已安装版本的配置 schema，明确 Smart Compact 可选记忆的关闭方式、Hermes 的项目作用域，以及 RPC 扩展 UI 的响应方式。无法证实的配置不能凭空生成。
+Pi 插件由 `tools/install_pi_plugins.py` 安装：只要 Pi 支持就带 `--approve`，版本与 npm integrity 固定在受版本控制的 `config/plugins.json`（安装时与 registry 比对，不符即 DEGRADED），安装状态记录在 `.hoh-dev/plugin-lock.json`。某个插件装不上时，它被记为 DEGRADED（附错误信息），其余插件与 bootstrap 继续（CR-001）。Pi 在非离线模式下启动时会自动安装 `.pi/settings.json` 中缺失的包，这一步不经过上述校验；因此 `tools/agent_task.py` 与 `scripts/start.sh` 都以 `PI_OFFLINE=1` 启动 Pi（Pi 1.5.0 源码确认离线时跳过缺失或版本不符的包，不安装），启动前用 `python3 tools/install_pi_plugins.py --verify` 核对每个已安装的项目包：版本须与 settings 一致，integrity 须等于锁中固定的值，非 npm 来源一律拒绝；有不符即拒绝启动（退出码 78）。未安装的包只记为 absent，Pi 不加载它。剩余风险：校验的是 npm 记录的 tarball integrity，不检测安装后磁盘上的改动；用户级 `~/.pi/agent/settings.json` 的包不在项目校验范围内，离线模式只保证启动时不会安装它们。之后 AI 必须读取已安装版本的配置 schema，明确 Smart Compact 可选记忆的关闭方式、Hermes 的项目作用域，以及 RPC 扩展 UI 的响应方式。无法证实的配置不能凭空生成。
 
 `--skip-install` 不访问发行源，但会探测本机版本；返回 3 表示能力缺失。`--dry-run` 不写入、不下载、不调用模型。bootstrap 子 Shell 不会改变父 Shell 环境，**之后每个新 Shell 都要先 `source .hoh-dev/env.sh`**；它也会加载可选的、已被 gitignore 的 `.env`（见 `.env.example`）。脚本不能提供认证；`preflight --live` 需要显式选择，并可能产生模型费用。
 

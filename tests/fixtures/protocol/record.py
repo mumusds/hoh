@@ -1,54 +1,60 @@
 #!/usr/bin/env python3
-"""Re-record native protocol fixtures (M0-T04). Live: costs model calls for authenticated agents.
+"""Re-record native protocol fixtures (M0-T04, hardened in M0-T06). Live: costs model calls for authenticated agents.
 
 Usage: python3 tests/fixtures/protocol/record.py [--agents claude,codex,pi]
 
 Every case runs in a fresh temporary Git repository OUTSIDE this checkout (no project CLAUDE.md or
 AGENTS.md leaks in) with the parent agent session variables removed. The operator's user-level agent
 configuration (plugins, hooks, auth) still applies and is recorded as-is; it cannot be isolated
-without copying credentials. Each case stores meta.json (argv, prompt, exit code, validity), the
-exact stdin, raw stdout.jsonl and stderr.log. Cases that do not show what they claim fail the run.
+without copying credentials. Each case stores meta.json (argv, exit code, validity and the problems
+found), the exact stdin, raw stdout.jsonl and stderr.log.
+
+Each agent version is recorded into a staging directory next to the published one. It replaces the
+published directory in one rename only when every case shows what it specifically claims (VALIDATORS)
+and the binary did not change during the run. Otherwise the published fixtures and their provenance
+stay as they were, the staging directory moves to .hoh-dev/protocol-failed/ and the run exits 1, so a
+failed re-recording never leaves older successes looking current (M0R3-01, M0R3-02). Provenance
+(binary and help hashes, auth state) is measured while recording and stored with the fixtures.
+Child processes are stopped with bounded escalation: close stdin, SIGTERM, SIGKILL, reap (M0R3-03).
 """
 from __future__ import annotations
-import argparse, json, os, select, shutil, signal, subprocess, sys, tempfile, time
+import argparse, hashlib, json, os, selectors, shutil, signal, subprocess, sys, tempfile, time
 from datetime import datetime, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE.parents[2] / 'tools'))
+REPO = HERE.parents[2]
+sys.path.insert(0, str(REPO / 'tools'))
 from agent_task import PARENT_SESSION_VARS  # noqa: E402  (single source of the stripped variable list)
 
 ENV = {k: v for k, v in os.environ.items() if k not in PARENT_SESSION_VARS}
+TOKEN = 'HOH_SAMPLE_OK'
+TEMP_DIRS: list[Path] = []  # temporary repositories and homes of the current recording, removed by record()
 
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
 def first_line(argv: list[str]) -> str:
-    out = subprocess.run(argv, capture_output=True, text=True, env=ENV).stdout.strip().splitlines()
+    out = subprocess.run(argv, capture_output=True, text=True, env=ENV, timeout=60).stdout.strip().splitlines()
     return out[0] if out else 'unknown'
 
 
-def workdir() -> Path:
-    d = Path(tempfile.mkdtemp(prefix='hoh-protocol-'))
-    subprocess.run(['git', 'init', '-q', str(d)], check=True)
+def tempdir(prefix: str) -> Path:
+    d = Path(tempfile.mkdtemp(prefix=prefix))
+    TEMP_DIRS.append(d)
     return d
 
 
-def save(agent: str, version: str, case: str, argv: list[str], stdin: bytes, stdout: bytes, stderr: bytes,
-         rc: int | None, notes: str, valid: bool, extra: dict | None = None) -> None:
-    d = HERE / agent / version / case
-    shutil.rmtree(d, ignore_errors=True)
-    d.mkdir(parents=True)
-    (d / 'stdin.txt').write_bytes(stdin)
-    (d / 'stdout.jsonl').write_bytes(stdout)
-    (d / 'stderr.log').write_bytes(stderr)
-    meta = {'agent': agent, 'cli_version': version, 'case': case, 'argv': argv, 'cwd': 'fresh temp Git repo outside the checkout',
-            'exit_code': rc, 'recorded_at': now(), 'mode': 'live', 'valid': valid, 'notes': notes, **(extra or {})}
-    (d / 'meta.json').write_text(json.dumps(meta, ensure_ascii=False, indent=2) + '\n')
-    if not valid:
-        raise SystemExit(f'{agent}/{case}: recorded output does not show what the case claims; see {d}')
+def workdir() -> Path:
+    d = tempdir('hoh-protocol-')
+    subprocess.run(['git', 'init', '-q', str(d)], check=True)
+    return d
 
 
 def frames(raw: bytes) -> list[dict]:
@@ -56,164 +62,549 @@ def frames(raw: bytes) -> list[dict]:
     for line in raw.splitlines():
         if line.strip():
             try:
-                out.append(json.loads(line))
+                f = json.loads(line)
             except ValueError:
-                pass
+                continue
+            if isinstance(f, dict):
+                out.append(f)
     return out
 
 
-def run(argv: list[str], stdin: bytes, cwd: Path, timeout: float = 300) -> tuple[bytes, bytes, int]:
-    p = subprocess.run(argv, input=stdin, capture_output=True, cwd=cwd, env=ENV, timeout=timeout)
-    return p.stdout, p.stderr, p.returncode
+# --- processes ------------------------------------------------------------------------------------------
+
+class Proc:
+    """A child in its own process group whose stdout and stderr are drained together, so neither pipe fills up."""
+
+    def __init__(self, argv: list[str], cwd: Path, env: dict | None = None):
+        self.p = subprocess.Popen(argv, cwd=cwd, env=env or ENV, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, start_new_session=True)
+        self.out = b''
+        self.err = b''
+        self.sent = b''
+        self.sel = selectors.DefaultSelector()
+        self.sel.register(self.p.stdout, selectors.EVENT_READ)
+        self.sel.register(self.p.stderr, selectors.EVENT_READ)
+
+    def write(self, data: bytes) -> None:
+        self.sent += data
+        try:
+            self.p.stdin.write(data)
+            self.p.stdin.flush()
+        except BrokenPipeError:  # the CLI stopped reading; what it printed is still collected
+            pass
+
+    def pump(self, timeout: float) -> bool:
+        """Read what arrives within `timeout`; False once both streams are closed."""
+        if not self.sel.get_map():
+            return False
+        for key, _ in self.sel.select(timeout):
+            chunk = os.read(key.fd, 65536)
+            if not chunk:
+                self.sel.unregister(key.fileobj)
+                key.fileobj.close()
+            elif key.fileobj is self.p.stdout:
+                self.out += chunk
+            else:
+                self.err += chunk
+        return bool(self.sel.get_map())
+
+    def frames(self) -> list[dict]:
+        return frames(self.out)
+
+    def wait_for(self, predicate, timeout: float) -> dict | None:
+        deadline = time.monotonic() + timeout
+        while True:
+            for f in self.frames():
+                if predicate(f):
+                    return f
+            if time.monotonic() >= deadline or not self.pump(min(1.0, max(0.0, deadline - time.monotonic()))):
+                return next((f for f in self.frames() if predicate(f)), None)
+
+    def signal(self, sig: int) -> None:
+        try:
+            os.killpg(self.p.pid, sig)
+        except ProcessLookupError:
+            pass
+
+    def stop(self, grace: float = 20, term_grace: float = 10, kill_grace: float = 5) -> str:
+        """Close stdin and wait `grace` s for exit; then SIGTERM the group, then SIGKILL it, each bounded.
+        Returns how it ended: exited, SIGTERM, SIGKILL, or SIGKILL+abandoned when a descendant outside the
+        group still held a pipe open (those pipes are closed so the recorder never hangs)."""
+        try:
+            self.p.stdin.close()
+        except OSError:
+            pass
+        how = 'exited'
+        for sig, wait in ((None, grace), (signal.SIGTERM, term_grace), (signal.SIGKILL, kill_grace)):
+            if sig is not None:
+                how = sig.name
+                self.signal(sig)
+            deadline = time.monotonic() + wait
+            while time.monotonic() < deadline:
+                if self.pump(min(0.5, max(0.0, deadline - time.monotonic()))):
+                    continue
+                try:
+                    self.p.wait(timeout=max(0.0, deadline - time.monotonic()))
+                    return how
+                except subprocess.TimeoutExpired:
+                    break
+        for key in list(self.sel.get_map().values()):
+            self.sel.unregister(key.fileobj)
+            key.fileobj.close()
+        try:
+            self.p.wait(timeout=kill_grace)
+        except subprocess.TimeoutExpired:
+            pass
+        return how + '+abandoned'
+
+    @property
+    def returncode(self) -> int | None:
+        return self.p.returncode
 
 
-def claude() -> None:
-    version = first_line(['claude', '--version']).split()[0]
-    (HERE / 'claude' / version).mkdir(parents=True, exist_ok=True)
-    (HERE / 'claude' / version / 'help.txt').write_text(subprocess.run(['claude', '--help'], capture_output=True, text=True, env=ENV).stdout)
+def run(argv: list[str], stdin: bytes, cwd: Path, timeout: float = 300, env: dict | None = None) -> tuple[bytes, bytes, int | None, str]:
+    p = Proc(argv, cwd, env)
+    p.write(stdin)
+    how = p.stop(grace=timeout)
+    return p.out, p.err, p.returncode, how
+
+
+# --- case validators (M0R3-01) ----------------------------------------------------------------------------
+# Each returns the problems found; a case is valid only with none. They see the raw frames, the exit code,
+# the case's meta.json, the requests sent (JSON-RPC/RPC stdin) and identifiers from earlier cases (ctx).
+
+def expect(out: list[str], cond: bool, msg: str) -> None:
+    if not cond:
+        out.append(msg)
+
+
+def typed(fs: list[dict], t: str) -> list[dict]:
+    return [f for f in fs if f.get('type') == t]
+
+
+def claude_result(fs: list[dict], rc, out: list[str]) -> dict:
+    results = typed(fs, 'result')
+    expect(out, len(results) == 1, f'{len(results)} result frames, expected 1')
+    return results[-1] if results else {}
+
+
+def v_claude_success(fs, rc, meta, sent, ctx):
+    out: list[str] = []
+    r = claude_result(fs, rc, out)
+    expect(out, rc == 0, f'exit code {rc}, expected 0')
+    expect(out, r.get('subtype') == 'success' and r.get('is_error') is False, f'result {r.get("subtype")!r} is_error={r.get("is_error")!r}')
+    expect(out, TOKEN in str(r.get('result', '')), f'assistant result lacks {TOKEN}')
+    expect(out, any(f.get('type') == 'system' and f.get('subtype') == 'init' and f.get('session_id') for f in fs), 'no system:init with session_id')
+    return out
+
+
+def v_claude_resume(fs, rc, meta, sent, ctx):
+    out = v_claude_success(fs, rc, meta, sent, ctx)
+    ids = {f.get('session_id') for f in fs if f.get('type') in ('system', 'result')}
+    expect(out, ids == {ctx.get('session_id')}, f'session ids {sorted(map(str, ids))}, expected only {ctx.get("session_id")}')
+    return out
+
+
+def v_claude_max_turns(fs, rc, meta, sent, ctx):
+    out: list[str] = []
+    r = claude_result(fs, rc, out)
+    expect(out, r.get('subtype') == 'error_max_turns' and r.get('is_error') is True, f'result {r.get("subtype")!r} is_error={r.get("is_error")!r}')
+    expect(out, rc not in (0, None), f'exit code {rc}, expected non-zero')
+    return out
+
+
+def v_claude_sigint(fs, rc, meta, sent, ctx):
+    out: list[str] = []
+    expect(out, meta.get('recorder_state') == 'SIGINT sent during foreground tool', f'recorder state {meta.get("recorder_state")!r}')
+    expect(out, not meta.get('killed_by_recorder'), 'the recorder had to kill the CLI after SIGINT')
+    cut = meta.get('sigint_after_frame_index') or 0
+    expect(out, not typed(fs[:cut], 'result'), 'a result frame arrived before SIGINT')
+    after = typed(fs[cut:], 'result')
+    expect(out, bool(after), 'no result frame after SIGINT')
+    expect(out, all(r.get('is_error') is True and r.get('subtype') != 'success' for r in after),
+           'a result after SIGINT reports success: ' + ', '.join(str(r.get('subtype')) for r in after))
+    return out
+
+
+def codex_agent_text(fs: list[dict]) -> str:
+    return '\n'.join(str(f['item'].get('text', '')) for f in typed(fs, 'item.completed')
+                     if isinstance(f.get('item'), dict) and f['item'].get('type') == 'agent_message')
+
+
+def failed_message(fs: list[dict]) -> str:
+    return ' '.join(str((f.get('error') or {}).get('message', '')) for f in typed(fs, 'turn.failed'))
+
+
+def v_codex_exec(fs, rc, meta, sent, ctx):
+    out: list[str] = []
+    expect(out, rc == 0, f'exit code {rc}, expected 0')
+    expect(out, bool(typed(fs, 'turn.completed')) and not typed(fs, 'turn.failed'), 'no turn.completed, or a turn.failed')
+    expect(out, TOKEN in codex_agent_text(fs), f'no agent_message containing {TOKEN}')
+    return out
+
+
+def v_codex_exec_failed(needle: str):
+    def check(fs, rc, meta, sent, ctx):
+        out: list[str] = []
+        expect(out, rc not in (0, None), f'exit code {rc}, expected non-zero')
+        expect(out, bool(typed(fs, 'turn.failed')) and not typed(fs, 'turn.completed'), 'no turn.failed, or a turn.completed')
+        expect(out, needle.lower() in failed_message(fs).lower(), f'turn.failed message lacks {needle!r}: {failed_message(fs)[:200]!r}')
+        return out
+    return check
+
+
+def requests(sent: list[dict], method: str) -> list[dict]:
+    return [m for m in sent if m.get('method') == method and 'id' in m]
+
+
+def reply(fs: list[dict], sent: list[dict], method: str, nth: int = 0) -> dict:
+    """The JSON-RPC response to the nth request of `method`, or {} when it never came."""
+    reqs = requests(sent, method)
+    if len(reqs) <= nth:
+        return {}
+    rid = reqs[nth]['id']
+    return next((f for f in fs if f.get('id') == rid and ('result' in f or 'error' in f) and 'method' not in f), {})
+
+
+def turns_completed(fs: list[dict], thread: str | None = None) -> list[dict]:
+    return [f['params']['turn'] for f in fs if f.get('method') == 'turn/completed'
+            and (thread is None or f.get('params', {}).get('threadId') == thread)]
+
+
+def agent_messages(fs: list[dict]) -> str:
+    # Only items the agent wrote: a userMessage item echoes the prompt, which may contain the token (M0R3-01).
+    return '\n'.join(str(f['params']['item'].get('text', '')) for f in fs if f.get('method') == 'item/completed'
+                     and f.get('params', {}).get('item', {}).get('type') == 'agentMessage')
+
+
+def v_app_handshake(fs, rc, meta, sent, ctx):
+    out: list[str] = []
+    for method in ('initialize', 'thread/start'):
+        expect(out, 'result' in reply(fs, sent, method), f'no result for {method}')
+    expect(out, any(f.get('method') == 'thread/started' for f in fs), 'no thread/started notification')
+    return out
+
+
+def one_turn(fs, sent, out, status: str, thread: str | None = None) -> None:
+    done = turns_completed(fs, thread)
+    expect(out, len(done) == 1, f'{len(done)} turn/completed, expected 1')
+    expect(out, bool(done) and done[-1].get('status') == status, f'turn status {done[-1].get("status") if done else None!r}, expected {status!r}')
+
+
+def v_app_turn(fs, rc, meta, sent, ctx):
+    out: list[str] = []
+    expect(out, 'result' in reply(fs, sent, 'thread/start'), 'no thread/start result')
+    expect(out, 'result' in reply(fs, sent, 'turn/start'), 'no turn/start result')
+    one_turn(fs, sent, out, 'completed')
+    expect(out, TOKEN in agent_messages(fs), f'no agentMessage containing {TOKEN}')
+    return out
+
+
+def v_app_resume(fs, rc, meta, sent, ctx):
+    out: list[str] = []
+    expect(out, 'result' in reply(fs, sent, 'thread/resume'), 'no thread/resume result')
+    one_turn(fs, sent, out, 'completed', ctx.get('thread_id'))
+    expect(out, TOKEN in agent_messages(fs), f'no agentMessage containing {TOKEN}')
+    return out
+
+
+def v_app_interrupt(fs, rc, meta, sent, ctx):
+    out: list[str] = []
+    expect(out, 'result' in reply(fs, sent, 'turn/interrupt'), 'no turn/interrupt result')
+    one_turn(fs, sent, out, 'interrupted')
+    return out
+
+
+def v_app_steer(fs, rc, meta, sent, ctx):
+    out: list[str] = []
+    expect(out, 'error' in reply(fs, sent, 'turn/steer', 0), 'stale expectedTurnId was not rejected')
+    expect(out, 'result' in reply(fs, sent, 'turn/steer', 1), 'steer with the active turn id was not accepted')
+    one_turn(fs, sent, out, 'completed')
+    expect(out, 'STEERED' in agent_messages(fs), 'the agent did not follow the steer (no agentMessage containing STEERED)')
+    return out
+
+
+def pi_response(fs: list[dict], rid: str) -> dict:
+    return next((f for f in typed(fs, 'response') if f.get('id') == rid), {})
+
+
+def pi_assistant(fs: list[dict]) -> list[dict]:
+    return [f['message'] for f in typed(fs, 'message_end') if isinstance(f.get('message'), dict) and f['message'].get('role') == 'assistant']
+
+
+def pi_text(message: dict) -> str:
+    content = message.get('content')
+    return ''.join(b.get('text', '') for b in content if isinstance(b, dict)) if isinstance(content, list) else str(content or '')
+
+
+def pi_turn_ok(fs, out: list[str], prompt_id: str) -> None:
+    expect(out, pi_response(fs, prompt_id).get('success') is True, f'prompt {prompt_id} was not accepted')
+    msgs = pi_assistant(fs)
+    expect(out, bool(msgs) and all(m.get('stopReason') not in ('error', 'aborted') for m in msgs),
+           'assistant stop reasons ' + ', '.join(str(m.get('stopReason')) for m in msgs))
+    expect(out, any(TOKEN in pi_text(m) for m in msgs), f'no assistant message containing {TOKEN}')
+    settled = typed(fs, 'agent_settled')
+    expect(out, len(settled) == 1 and settled[0].get('aborted') is False, f'agent_settled frames {settled}')
+    expect(out, not typed(fs, 'error') and not typed(fs, 'agent_error'), 'error frames present')
+
+
+def v_pi_prompt(fs, rc, meta, sent, ctx):
+    out: list[str] = []
+    expect(out, pi_response(fs, 's1').get('success') is True, 'get_state failed')
+    pi_turn_ok(fs, out, 'p1')
+    return out
+
+
+def v_pi_resume(fs, rc, meta, sent, ctx):
+    out: list[str] = []
+    sid = pi_response(fs, 's2').get('data', {}).get('sessionId')
+    expect(out, sid == ctx.get('session_id'), f'session id {sid!r}, expected {ctx.get("session_id")!r}')
+    pi_turn_ok(fs, out, 'p2')
+    return out
+
+
+def v_pi_abort(fs, rc, meta, sent, ctx):
+    out: list[str] = []
+    expect(out, pi_response(fs, 'p3').get('success') is True, 'prompt p3 was not accepted')
+    expect(out, pi_response(fs, 'a1').get('success') is True, 'abort was not acknowledged')
+    expect(out, 'aborted' in [m.get('stopReason') for m in pi_assistant(fs)], 'no assistant message ended with stopReason aborted')
+    expect(out, any(f.get('aborted') is True for f in typed(fs, 'agent_settled')), 'no agent_settled with aborted=true')
+    return out
+
+
+def v_pi_no_provider(fs, rc, meta, sent, ctx):
+    out: list[str] = []
+    expect(out, pi_response(fs, 's1').get('success') is True, 'get_state failed')
+    expect(out, pi_response(fs, 'p1').get('success') is False, 'prompt without a provider was accepted')
+    return out
+
+
+def v_pi_invalid_model(fs, rc, meta, sent, ctx):
+    out: list[str] = []
+    expect(out, pi_response(fs, 'm1').get('success') is False, 'set_model with an unknown model was accepted')
+    return out
+
+
+VALIDATORS = {
+    ('claude', 'success'): v_claude_success, ('claude', 'resume'): v_claude_resume,
+    ('claude', 'max-turns-error'): v_claude_max_turns, ('claude', 'sigint-cancel'): v_claude_sigint,
+    ('codex', 'exec'): v_codex_exec, ('codex', 'exec-unauthenticated'): v_codex_exec_failed('401'),
+    ('codex', 'exec-turn-failed'): v_codex_exec_failed('model'),
+    ('codex', 'app-server-handshake'): v_app_handshake, ('codex', 'app-server-handshake-unauthenticated'): v_app_handshake,
+    ('codex', 'app-server-turn'): v_app_turn, ('codex', 'app-server-resume'): v_app_resume,
+    ('codex', 'app-server-interrupt'): v_app_interrupt, ('codex', 'app-server-steer'): v_app_steer,
+    ('pi', 'rpc-no-provider'): v_pi_no_provider, ('pi', 'rpc-invalid-model'): v_pi_invalid_model,
+    ('pi', 'rpc-prompt'): v_pi_prompt, ('pi', 'rpc-resume'): v_pi_resume, ('pi', 'rpc-abort'): v_pi_abort,
+}
+
+
+def sent_messages(stdin: bytes) -> list[dict]:
+    return frames(stdin)
+
+
+# --- staging and atomic publication (M0R3-02) ----------------------------------------------------------
+
+class RecordingFailed(Exception):
+    pass
+
+
+def recover(agent_dir: Path) -> None:
+    """Undo what a run killed mid-publish or mid-recording left: restore a displaced version directory whose
+    replacement never landed, drop displaced ones that were replaced, and drop abandoned staging directories."""
+    for old in sorted(agent_dir.glob('.replaced-*')):
+        version = old.name[len('.replaced-'):].rsplit('-', 1)[0]
+        if (agent_dir / version).exists():
+            shutil.rmtree(old)
+        else:
+            old.rename(agent_dir / version)
+    for stale in agent_dir.glob('.recording-*'):
+        shutil.rmtree(stale)
+
+
+class Recording:
+    def __init__(self, agent: str, version: str, root: Path = HERE, failed_root: Path | None = None):
+        self.agent, self.version = agent, version
+        self.parent = root / agent
+        self.final = self.parent / version
+        self.failed_root = failed_root or REPO / '.hoh-dev' / 'protocol-failed'
+        self.parent.mkdir(parents=True, exist_ok=True)
+        recover(self.parent)
+        self.dir = Path(tempfile.mkdtemp(prefix=f'.recording-{version}-', dir=self.parent))
+        self.problems: dict[str, list[str]] = {}
+        self.ctx: dict = {}
+        self.auth = 'UNKNOWN'
+
+    def save(self, case: str, argv: list[str], stdin: bytes, stdout: bytes, stderr: bytes, rc: int | None, notes: str,
+             extra: dict | None = None, stop: str | None = None) -> list[dict]:
+        d = self.dir / case
+        d.mkdir()
+        (d / 'stdin.txt').write_bytes(stdin)
+        (d / 'stdout.jsonl').write_bytes(stdout)
+        (d / 'stderr.log').write_bytes(stderr)
+        meta = {'agent': self.agent, 'cli_version': self.version, 'case': case, 'argv': argv, 'cwd': 'fresh temp Git repo outside the checkout',
+                'exit_code': rc, 'recorded_at': now(), 'mode': 'live', 'notes': notes, **(extra or {})}
+        if stop is not None:
+            meta['stopped'] = stop
+        fs = frames(stdout)
+        problems = VALIDATORS[(self.agent, case)](fs, rc, meta, sent_messages(stdin), self.ctx)
+        meta |= {'valid': not problems, 'problems': problems}
+        (d / 'meta.json').write_text(json.dumps(meta, ensure_ascii=False, indent=2) + '\n')
+        if problems:
+            self.problems[case] = problems
+            print(f'{self.agent}/{case}: INVALID: ' + '; '.join(problems), file=sys.stderr)
+        return fs
+
+    def fail(self, what: str, message: str) -> None:
+        self.problems.setdefault(what, []).append(message)
+
+    def publish(self, provenance: dict) -> None:
+        if self.problems:
+            raise RecordingFailed('; '.join(f'{k}: {", ".join(v)}' for k, v in self.problems.items()))
+        (self.dir / 'provenance.json').write_text(json.dumps(provenance, ensure_ascii=False, indent=2) + '\n')
+        old = None
+        if self.final.exists():
+            old = self.parent / f'.replaced-{self.version}-{os.getpid()}'
+            self.final.rename(old)
+        try:
+            self.dir.rename(self.final)
+        except BaseException:
+            if old is not None and not self.final.exists():
+                old.rename(self.final)
+            raise
+        if old is not None:
+            shutil.rmtree(old)
+
+    def abandon(self) -> Path:
+        if not self.dir.exists():  # already published
+            return self.final
+        self.failed_root.mkdir(parents=True, exist_ok=True)
+        dest = self.failed_root / f'{self.agent}-{self.version}-{datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")}'
+        shutil.move(str(self.dir), dest)
+        return dest
+
+
+def help_file(rec: Recording, name: str, argv: list[str]) -> bytes:
+    data = subprocess.run(argv, capture_output=True, env=ENV, timeout=60).stdout
+    (rec.dir / name).write_bytes(data)
+    return data
+
+
+# --- agents ---------------------------------------------------------------------------------------------
+
+def claude(rec: Recording) -> None:
+    help_file(rec, 'help.txt', ['claude', '--help'])
     base = ['claude', '-p', '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions']
     cwd = workdir()
-    prompt = b'Reply with exactly HOH_SAMPLE_OK and nothing else.'
-    out, err, rc = run(base, prompt, cwd)
-    fs = frames(out)
-    result = [f for f in fs if f.get('type') == 'result']
-    save('claude', version, 'success', base, prompt, out, err, rc, 'single turn',
-         valid=rc == 0 and len(result) == 1 and result[0].get('subtype') == 'success')
-    sid = next(f['session_id'] for f in fs if f.get('type') == 'system' and f.get('subtype') == 'init')
+    prompt = f'Reply with exactly {TOKEN} and nothing else.'.encode()
+    out, err, rc, how = run(base, prompt, cwd)
+    fs = rec.save('success', base, prompt, out, err, rc, 'single turn', stop=how)
+    sid = next((f.get('session_id') for f in fs if f.get('type') == 'system' and f.get('subtype') == 'init'), None)
+    if not sid:
+        rec.fail('success', 'no session id; the remaining cases need it')
+        return
+    rec.ctx['session_id'] = sid
+    rec.auth = 'AUTHENTICATED (live turn recorded)'
 
-    argv = base + ['--resume', sid]
     prompt = b'Repeat the exact token you replied with in the previous turn, and nothing else.'
-    out, err, rc = run(argv, prompt, cwd)
-    fs = frames(out)
-    save('claude', version, 'resume', base + ['--resume', '<session_id of success>'], prompt, out, err, rc, 'second turn via --resume',
-         valid=rc == 0 and any(f.get('type') == 'result' and 'HOH_SAMPLE_OK' in str(f.get('result')) for f in fs)
-         and all(f.get('session_id', sid) == sid for f in fs if f.get('type') in ('system', 'result')))
+    out, err, rc, how = run(base + ['--resume', sid], prompt, cwd)
+    rec.save('resume', base + ['--resume', '<session_id of success>'], prompt, out, err, rc, 'second turn via --resume',
+             {'resumed_session_id': sid}, stop=how)
 
     argv = base + ['--max-turns', '1']
     prompt = b'Use the Bash tool to run `echo hoh` and then reply DONE.'
-    out, err, rc = run(argv, prompt, workdir())
-    fs = frames(out)
-    save('claude', version, 'max-turns-error', argv, prompt, out, err, rc, 'tool use needs a second turn',
-         valid=any(f.get('type') == 'result' and f.get('subtype') == 'error_max_turns' for f in fs))
-
-    claude_cancel(version, base)
+    out, err, rc, how = run(argv, prompt, workdir())
+    rec.save('max-turns-error', argv, prompt, out, err, rc, 'tool use needs a second turn', stop=how)
+    claude_cancel(rec, base)
 
 
-def claude_cancel(version: str, base: list[str]) -> None:
+def claude_cancel(rec: Recording, base: list[str]) -> None:
     """SIGINT while a foreground tool call is still running; valid only if no result frame preceded it."""
     prompt = (b'Run this exact command with the Bash tool in the foreground (not in the background) and wait for it '
               b'to finish: `for i in $(seq 1 20); do echo tick $i; sleep 2; done`. Then reply DONE.')
-    p = subprocess.Popen(base, cwd=workdir(), env=ENV, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                         start_new_session=True)
-    p.stdin.write(prompt)
-    p.stdin.close()
-    buf = b''
+    p = Proc(base, workdir())
+    p.write(prompt)
+    p.p.stdin.close()
     tool_id = None
+    armed = 0.0
     sigint_after_frame = None
     state = 'waiting for tool_use'
     deadline = time.monotonic() + 240
-    while time.monotonic() < deadline:
-        ready, _, _ = select.select([p.stdout], [], [], 1.0)
-        if ready:
-            chunk = os.read(p.stdout.fileno(), 65536)
-            if not chunk:
-                break
-            buf += chunk
-        fs = frames(buf)
+    while time.monotonic() < deadline and p.pump(1.0):
+        fs = p.frames()
         if tool_id is None:
-            for f in fs:
-                if f.get('type') == 'assistant':
-                    for c in f.get('message', {}).get('content', []):
-                        if c.get('type') == 'tool_use' and c.get('name') == 'Bash' and not c.get('input', {}).get('run_in_background'):
-                            tool_id, armed = c['id'], time.monotonic()
+            for f in typed(fs, 'assistant'):
+                for c in f.get('message', {}).get('content', []):
+                    if c.get('type') == 'tool_use' and c.get('name') == 'Bash' and not c.get('input', {}).get('run_in_background'):
+                        tool_id, armed = c['id'], time.monotonic()
             continue
-        finished = any(f.get('type') == 'result' for f in fs) or any(
+        finished = bool(typed(fs, 'result')) or any(
             c.get('type') == 'tool_result' and c.get('tool_use_id') == tool_id
-            for f in fs if f.get('type') == 'user' for c in (f.get('message', {}).get('content') or []) if isinstance(c, dict))
+            for f in typed(fs, 'user') for c in (f.get('message', {}).get('content') or []) if isinstance(c, dict))
         if finished:
             state = 'tool finished before SIGINT'
             break
         if time.monotonic() - armed >= 4:
             sigint_after_frame = len(fs)
-            os.killpg(p.pid, signal.SIGINT)
+            p.signal(signal.SIGINT)
             state = 'SIGINT sent during foreground tool'
             break
-    killed = False
-    try:
-        rest, err = p.communicate(timeout=60)
-    except subprocess.TimeoutExpired:
-        os.killpg(p.pid, signal.SIGKILL)
-        rest, err = p.communicate()
-        killed = True
-    out = buf + rest
-    after = frames(out)[sigint_after_frame or 0:]
-    # Valid only if SIGINT hit a running foreground tool and the CLI then ended on its own.
-    valid = state == 'SIGINT sent during foreground tool' and not killed
-    save('claude', version, 'sigint-cancel', base, prompt, out, err, p.returncode,
-         'SIGINT to the process group 4 s after a foreground Bash tool_use frame, before its tool_result', valid,
-         {'sigint_after_frame_index': sigint_after_frame, 'recorder_state': state, 'killed_by_recorder': killed,
-          'frames_after_sigint': [f.get('type') + (':' + f['subtype'] if f.get('subtype') else '') for f in after]})
+    how = p.stop(grace=60)
+    after = p.frames()[sigint_after_frame or 0:]
+    rec.save('sigint-cancel', base, prompt, p.out, p.err, p.returncode,
+             'SIGINT to the process group 4 s after a foreground Bash tool_use frame, before its tool_result',
+             {'sigint_after_frame_index': sigint_after_frame, 'recorder_state': state, 'killed_by_recorder': how != 'exited',
+              'frames_after_sigint': [f.get('type', '') + (':' + f['subtype'] if f.get('subtype') else '') for f in after]}, stop=how)
 
 
-def codex() -> None:
-    version = first_line(['codex', '--version']).split()[-1]
-    d = HERE / 'codex' / version
-    d.mkdir(parents=True, exist_ok=True)
-    subprocess.run(['codex', 'app-server', 'generate-json-schema', '--out', str(d / 'app-server-schema')], check=True, capture_output=True, env=ENV)
-    for name, argv in [('help-exec.txt', ['codex', 'exec', '--help']), ('help-app-server.txt', ['codex', 'app-server', '--help'])]:
-        (d / name).write_text(subprocess.run(argv, capture_output=True, text=True, env=ENV).stdout)
-    status = subprocess.run(['codex', 'login', 'status'], capture_output=True, text=True, env=ENV)
+def codex(rec: Recording) -> None:
+    subprocess.run(['codex', 'app-server', 'generate-json-schema', '--out', str(rec.dir / 'app-server-schema')], check=True,
+                   capture_output=True, env=ENV, timeout=120)
+    help_file(rec, 'help-exec.txt', ['codex', 'exec', '--help'])
+    help_file(rec, 'help-app-server.txt', ['codex', 'app-server', '--help'])
+    status = subprocess.run(['codex', 'login', 'status'], capture_output=True, text=True, env=ENV, timeout=60)
     authed = status.returncode == 0
-    (d / 'auth-status.json').write_text(json.dumps({'checked_at': now(), 'command': ['codex', 'login', 'status'], 'exit_code': status.returncode,
-                                                    'output': (status.stdout + status.stderr).strip(),
-                                                    'state': 'AUTHENTICATED' if authed else 'BLOCKED_AUTH'}, indent=2) + '\n')
-    suffix = '' if authed else '-unauthenticated'
+    rec.auth = 'AUTHENTICATED' if authed else 'BLOCKED_AUTH'
+    (rec.dir / 'auth-status.json').write_text(json.dumps({'checked_at': now(), 'command': ['codex', 'login', 'status'], 'exit_code': status.returncode,
+                                                          'output': (status.stdout + status.stderr).strip(), 'state': rec.auth}, indent=2) + '\n')
     argv = ['codex', 'exec', '--json', '--dangerously-bypass-approvals-and-sandbox', '-']
-    prompt = b'Reply with exactly HOH_SAMPLE_OK and nothing else.'
-    out, err, rc = run(argv, prompt, workdir())
-    fs = frames(out)
-    completed = rc == 0 and any(f.get('type') == 'turn.completed' for f in fs)
-    if authed and not completed:
-        # Logged in but the turn failed (e.g. the configured model is not available to this account):
-        # record the real failure surface; authenticated success cases stay NOT_RUN.
-        save('codex', version, 'exec-turn-failed', argv, prompt, out, err, rc, 'logged in, turn failed; see the error frames',
-             valid=rc != 0 and any(f.get('type') == 'turn.failed' for f in fs))
-        shutil.rmtree(d / 'exec', ignore_errors=True)
-    else:
-        ok = completed if authed else (rc != 0 and any(f.get('type') in ('error', 'turn.failed') for f in fs))
-        save('codex', version, 'exec' + suffix, argv, prompt, out, err, rc,
-             'one-shot exec turn' if authed else 'exec without login: records the authentication failure surface', valid=ok)
-        if authed:
-            codex_app_server(version)
+    prompt = f'Reply with exactly {TOKEN} and nothing else.'.encode()
+    # The unauthenticated surfaces are reproducible with an empty CODEX_HOME, whatever the operator's login.
+    unauth = ENV | {'CODEX_HOME': str(tempdir('hoh-codex-home-'))}
+    out, err, rc, how = run(argv, prompt, workdir(), env=unauth)
+    rec.save('exec-unauthenticated', argv, prompt, out, err, rc, 'exec with an empty CODEX_HOME: the authentication failure surface',
+             {'env_overrides': ['CODEX_HOME=<empty temp dir>']}, stop=how)
+    codex_handshake(rec, 'app-server-handshake-unauthenticated', unauth, 'empty CODEX_HOME: ')
+    if not authed:
+        rec.fail('auth', 'BLOCKED_AUTH: codex login status failed; the authenticated cases cannot be recorded')
+        return
+    bad = argv[:-1] + ['--model', 'hoh-invalid-model', '-']
+    out, err, rc, how = run(bad, prompt, workdir())
+    rec.save('exec-turn-failed', bad, prompt, out, err, rc, 'logged in, model unavailable to the account: the MODEL_UNAVAILABLE surface', stop=how)
+    out, err, rc, how = run(argv, prompt, workdir())
+    rec.save('exec', argv, prompt, out, err, rc, 'one-shot exec turn', stop=how)
+    codex_handshake(rec, 'app-server-handshake', ENV, '')
+    codex_app_server(rec)
+
+
+def codex_handshake(rec: Recording, case: str, env: dict, note: str) -> None:
     msgs = [{'method': 'initialize', 'id': 0, 'params': {'clientInfo': {'name': 'hoh-recorder', 'version': '0.0.0'}}},
             {'method': 'initialized'},
             {'method': 'thread/start', 'id': 1, 'params': {'approvalPolicy': 'never', 'sandbox': 'danger-full-access'}}]
-    stdin = b''.join(json.dumps(m).encode() + b'\n' for m in msgs)
-    p = subprocess.Popen(['codex', 'app-server'], cwd=workdir(), env=ENV, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                         start_new_session=True)
-    p.stdin.write(stdin)
-    p.stdin.flush()
-    time.sleep(10)
-    p.stdin.close()
-    try:
-        out, err = p.communicate(timeout=20)
-    except subprocess.TimeoutExpired:
-        os.killpg(p.pid, signal.SIGTERM)
-        out, err = p.communicate()
-    fs = frames(out)
-    save('codex', version, 'app-server-handshake' + suffix, ['codex', 'app-server'], stdin, out, err, p.returncode,
-         'initialize, initialized, thread/start; stdin closed after 10 s',
-         valid=all(any(f.get('id') == i and 'result' in f for f in fs) for i in (0, 1)))
+    p = Proc(['codex', 'app-server'], workdir(), env)
+    p.write(b''.join(json.dumps(m).encode() + b'\n' for m in msgs))
+    end = time.monotonic() + 10
+    while time.monotonic() < end and p.pump(end - time.monotonic()):
+        pass
+    how = p.stop(grace=20)
+    rec.save(case, ['codex', 'app-server'], p.sent, p.out, p.err, p.returncode, note + 'initialize, initialized, thread/start; stdin closed after 10 s',
+             {'env_overrides': ['CODEX_HOME=<empty temp dir>']} if env is not ENV else None, stop=how)
 
 
 class AppServer:
     """Minimal JSON-RPC driver for `codex app-server` that keeps every byte sent and received."""
 
     def __init__(self, cwd: Path):
-        self.p = subprocess.Popen(['codex', 'app-server'], cwd=cwd, env=ENV, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  stderr=subprocess.PIPE, start_new_session=True)
-        self.sent = b''
-        self.buf = b''
+        self.p = Proc(['codex', 'app-server'], cwd)
         self.next_id = 0
 
     def send(self, method: str, params: dict | None = None, notify: bool = False) -> int | None:
@@ -225,199 +616,145 @@ class AppServer:
             msg['id'] = rid
         if params is not None:
             msg['params'] = params
-        data = json.dumps(msg).encode() + b'\n'
-        self.p.stdin.write(data)
-        self.p.stdin.flush()
-        self.sent += data
+        self.p.write(json.dumps(msg).encode() + b'\n')
         return rid
 
     def wait(self, predicate, timeout: float = 180) -> dict | None:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            for f in frames(self.buf):
-                if predicate(f):
-                    return f
-            ready, _, _ = select.select([self.p.stdout], [], [], 1.0)
-            if ready:
-                chunk = os.read(self.p.stdout.fileno(), 65536)
-                if not chunk:
-                    return None
-                self.buf += chunk
-        return None
+        return self.p.wait_for(predicate, timeout)
 
-    def response(self, rid: int, timeout: float = 60) -> dict | None:
-        return self.wait(lambda f: f.get('id') == rid and ('result' in f or 'error' in f), timeout)
+    def response(self, rid: int | None, timeout: float = 60) -> dict:
+        return self.wait(lambda f: f.get('id') == rid and ('result' in f or 'error' in f), timeout) or {}
 
     def start(self) -> None:
-        rid = self.send('initialize', {'clientInfo': {'name': 'hoh-recorder', 'version': '0.0.0'}})
-        self.response(rid)
+        self.response(self.send('initialize', {'clientInfo': {'name': 'hoh-recorder', 'version': '0.0.0'}}))
         self.send('initialized', notify=True)
 
-    def close(self) -> tuple[bytes, bytes, int | None]:
-        self.p.stdin.close()
-        try:
-            rest, err = self.p.communicate(timeout=20)
-        except subprocess.TimeoutExpired:
-            os.killpg(self.p.pid, signal.SIGTERM)
-            rest, err = self.p.communicate()
-        return self.buf + rest, err, self.p.returncode
+    def thread(self, params: dict) -> str | None:
+        return self.response(self.send('thread/start', params)).get('result', {}).get('thread', {}).get('id')
+
+    def save(self, rec: Recording, case: str, notes: str, extra: dict | None = None) -> list[dict]:
+        how = self.p.stop(grace=20)
+        return rec.save(case, ['codex', 'app-server'], self.p.sent, self.p.out, self.p.err, self.p.returncode, notes, extra, stop=how)
 
 
 def text(t: str) -> list[dict]:
     return [{'type': 'text', 'text': t}]
 
 
-def turn_done(thread_id: str):
+def turn_done(thread_id: str | None):
     return lambda f: f.get('method') == 'turn/completed' and f.get('params', {}).get('threadId') == thread_id
 
 
-def codex_app_server(version: str) -> None:
-    """Authenticated App Server cases: turn, interrupt, steer (stale + valid expectedTurnId), resume."""
+def codex_app_server(rec: Recording) -> None:
+    """Authenticated App Server cases: turn, resume, interrupt, steer (stale + valid expectedTurnId)."""
     YOLO = {'approvalPolicy': 'never', 'sandbox': 'danger-full-access'}
     cwd = workdir()
     s = AppServer(cwd)
     s.start()
-    thread = s.response(s.send('thread/start', YOLO))['result']['thread']['id']
-    s.send('turn/start', {'threadId': thread, 'input': text('Reply with exactly HOH_SAMPLE_OK and nothing else.')})
-    done = s.wait(turn_done(thread))
-    out, err, rc = s.close()
-    said = any(f.get('method') == 'item/completed' and 'HOH_SAMPLE_OK' in json.dumps(f.get('params', {}).get('item', {})) for f in frames(out))
-    save('codex', version, 'app-server-turn', ['codex', 'app-server'], s.sent, out, err, rc, 'thread/start then one turn/start until turn/completed',
-         valid=bool(done) and done['params']['turn']['status'] == 'completed' and said, extra={'thread_id': thread})
+    thread = s.thread(YOLO)
+    s.send('turn/start', {'threadId': thread, 'input': text(f'Reply with exactly {TOKEN} and nothing else.')})
+    s.wait(turn_done(thread))
+    s.save(rec, 'app-server-turn', 'thread/start then one turn/start until turn/completed', {'thread_id': thread})
+    rec.ctx['thread_id'] = thread
 
     s = AppServer(cwd)
     s.start()
-    resumed = s.response(s.send('thread/resume', {'threadId': thread, **YOLO}))
+    s.response(s.send('thread/resume', {'threadId': thread, **YOLO}))
     s.send('turn/start', {'threadId': thread, 'input': text('Repeat the exact token you replied with in the previous turn, and nothing else.')})
-    done = s.wait(turn_done(thread))
-    out, err, rc = s.close()
-    said = any(f.get('method') == 'item/completed' and 'HOH_SAMPLE_OK' in json.dumps(f.get('params', {}).get('item', {})) for f in frames(out))
-    save('codex', version, 'app-server-resume', ['codex', 'app-server'], s.sent, out, err, rc,
-         'new app-server process: thread/resume of app-server-turn, then a turn that must recall the token',
-         valid=bool(resumed and 'result' in resumed) and bool(done) and done['params']['turn']['status'] == 'completed' and said)
+    s.wait(turn_done(thread))
+    s.save(rec, 'app-server-resume', 'new app-server process: thread/resume of app-server-turn, then a turn that must recall the token',
+           {'resumed_thread_id': thread})
 
     long_task = text('Run this exact shell command and wait for it to finish: for i in $(seq 1 30); do echo tick $i; sleep 2; done. Then reply DONE.')
     s = AppServer(workdir())
     s.start()
-    thread = s.response(s.send('thread/start', YOLO))['result']['thread']['id']
+    thread = s.thread(YOLO)
     s.send('turn/start', {'threadId': thread, 'input': long_task})
-    started = s.wait(lambda f: f.get('method') == 'turn/started')
+    started = s.wait(lambda f: f.get('method') == 'turn/started') or {}
     s.wait(lambda f: f.get('method') == 'item/started' and f.get('params', {}).get('item', {}).get('type') == 'commandExecution', timeout=120)
-    turn_id = started['params']['turn']['id'] if started else 'missing'
-    ack = s.response(s.send('turn/interrupt', {'threadId': thread, 'turnId': turn_id}))
-    done = s.wait(turn_done(thread))
-    out, err, rc = s.close()
-    save('codex', version, 'app-server-interrupt', ['codex', 'app-server'], s.sent, out, err, rc,
-         'turn/interrupt while a command execution item runs', valid=bool(ack and 'result' in ack) and bool(done)
-         and done['params']['turn']['status'] == 'interrupted')
+    turn_id = started.get('params', {}).get('turn', {}).get('id', 'missing')
+    s.response(s.send('turn/interrupt', {'threadId': thread, 'turnId': turn_id}))
+    s.wait(turn_done(thread))
+    s.save(rec, 'app-server-interrupt', 'turn/interrupt while a command execution item runs')
 
     s = AppServer(workdir())
     s.start()
-    thread = s.response(s.send('thread/start', YOLO))['result']['thread']['id']
+    thread = s.thread(YOLO)
     s.send('turn/start', {'threadId': thread, 'input': long_task})
-    started = s.wait(lambda f: f.get('method') == 'turn/started')
-    turn_id = started['params']['turn']['id'] if started else 'missing'
-    stale = s.response(s.send('turn/steer', {'threadId': thread, 'expectedTurnId': 'hoh-stale-turn-id', 'input': text('Stop and reply STEERED.')}))
-    steer = s.response(s.send('turn/steer', {'threadId': thread, 'expectedTurnId': turn_id,
-                                             'input': text('Stop running the command now and reply exactly STEERED.')}))
-    done = s.wait(turn_done(thread))
-    out, err, rc = s.close()
-    save('codex', version, 'app-server-steer', ['codex', 'app-server'], s.sent, out, err, rc,
-         'turn/steer with a stale expectedTurnId (must be rejected) and with the active turn id',
-         valid=bool(stale and 'error' in stale) and bool(steer and 'result' in steer) and bool(done))
+    started = s.wait(lambda f: f.get('method') == 'turn/started') or {}
+    turn_id = started.get('params', {}).get('turn', {}).get('id', 'missing')
+    s.response(s.send('turn/steer', {'threadId': thread, 'expectedTurnId': 'hoh-stale-turn-id', 'input': text('Stop and reply STEERED.')}))
+    s.response(s.send('turn/steer', {'threadId': thread, 'expectedTurnId': turn_id, 'input': text('Stop running the command now and reply exactly STEERED.')}))
+    s.wait(turn_done(thread))
+    s.save(rec, 'app-server-steer', 'turn/steer with a stale expectedTurnId (must be rejected) and with the active turn id')
 
 
 def pi_session(argv: list[str], cwd: Path, msgs: list[dict], until: str, abort_on: str | None = None, timeout: float = 120,
-               env: dict | None = None, settle: float = 0) -> tuple[bytes, bytes, int | None, bytes]:
+               env: dict | None = None, settle: float = 0) -> tuple[Proc, str]:
     """Drive one `pi --mode rpc` process: send msgs, optionally abort on the first `abort_on` frame, stop once
     `until` frames have arrived for every request (responses) or once (events), then wait `settle` seconds."""
-    p = subprocess.Popen(argv, cwd=cwd, env=env or ENV, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    p = Proc(argv, cwd, env)
     want = len(msgs) if until == 'response' else 1
-    sent = b''.join(json.dumps(m).encode() + b'\n' for m in msgs)
-    p.stdin.write(sent)
-    p.stdin.flush()
-    buf = b''
+    p.write(b''.join(json.dumps(m).encode() + b'\n' for m in msgs))
     aborted = False
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        ready, _, _ = select.select([p.stdout], [], [], 1.0)
-        if ready:
-            chunk = os.read(p.stdout.fileno(), 65536)
-            if not chunk:
-                break
-            buf += chunk
-        fs = frames(buf)
-        if abort_on and not aborted and any(f.get('type') == abort_on for f in fs):
-            extra = json.dumps({'id': 'a1', 'type': 'abort'}).encode() + b'\n'
-            p.stdin.write(extra)
-            p.stdin.flush()
-            sent += extra
+    while time.monotonic() < deadline and p.pump(1.0):
+        fs = p.frames()
+        if abort_on and not aborted and typed(fs, abort_on):
+            p.write(json.dumps({'id': 'a1', 'type': 'abort'}).encode() + b'\n')
             aborted = True
-        if sum(f.get('type') == until for f in fs) >= want:
+        if len(typed(fs, until)) >= want:
             break
-    time.sleep(settle)
-    p.stdin.close()
-    try:
-        rest, err = p.communicate(timeout=20)
-    except subprocess.TimeoutExpired:
-        os.killpg(p.pid, signal.SIGTERM)
-        rest, err = p.communicate()
-    return buf + rest, err, p.returncode, sent
+    end = time.monotonic() + settle
+    while time.monotonic() < end and p.pump(end - time.monotonic()):
+        pass
+    return p, p.stop(grace=20)
 
 
-def pi() -> None:
-    version = first_line(['pi', '--version'])
-    d = HERE / 'pi' / version
-    d.mkdir(parents=True, exist_ok=True)
-    (d / 'help.txt').write_text(subprocess.run(['pi', '--help'], capture_output=True, text=True, env=ENV).stdout)
+def pi(rec: Recording) -> None:
+    help_file(rec, 'help.txt', ['pi', '--help'])
     cwd = workdir()
     argv = ['pi', '--mode', 'rpc', '--session-dir', str(cwd / 'pi-sessions')]
     shown = ['pi', '--mode', 'rpc', '--session-dir', '<temp>/pi-sessions']
-    msgs = [{'id': 's1', 'type': 'get_state'}, {'id': 'p1', 'type': 'prompt', 'message': 'Reply with exactly HOH_SAMPLE_OK and nothing else.'}]
+    prompt = f'Reply with exactly {TOKEN} and nothing else.'
     # Failure without any provider, reproducible regardless of the operator's setup: empty agent dir, no key variables.
     bare = {k: v for k, v in ENV.items() if not k.endswith(('_API_KEY', '_AUTH_TOKEN', '_OAUTH_TOKEN'))}
     bare |= {'PI_CODING_AGENT_DIR': str(cwd / 'empty-agent-dir'), 'PI_OFFLINE': '1'}
-    out, err, rc, sent = pi_session(argv, cwd, msgs, until='response', env=bare, settle=8)
-    fs = frames(out)
-    save('pi', version, 'rpc-no-provider', shown, sent, out, err, rc,
-         'empty PI_CODING_AGENT_DIR, no provider key variables, PI_OFFLINE=1: get_state then prompt',
-         valid=any(f.get('id') == 's1' and f.get('success') for f in fs) and any(f.get('id') == 'p1' and f.get('success') is False for f in fs),
-         extra={'env_overrides': ['PI_CODING_AGENT_DIR=<temp>/empty-agent-dir', 'PI_OFFLINE=1', 'provider key variables removed']})
-    msgs = [{'id': 'm1', 'type': 'set_model', 'provider': 'hoh-invalid-provider', 'modelId': 'hoh-invalid-model'}]
-    out, err, rc, sent = pi_session(argv, cwd, msgs, until='response', settle=5)
-    fs = frames(out)
-    save('pi', version, 'rpc-invalid-model', shown, sent, out, err, rc, 'set_model with an unknown provider/model',
-         valid=any(f.get('id') == 'm1' and f.get('success') is False for f in fs))
-    out, err, rc, sent = pi_session(argv, cwd, [{'id': 's1', 'type': 'get_state'},
-                                               {'id': 'p1', 'type': 'prompt', 'message': 'Reply with exactly HOH_SAMPLE_OK and nothing else.'}],
-                                    until='agent_settled')
-    fs = frames(out)
-    if any(f.get('id') == 'p1' and f.get('success') is False for f in fs):
-        return  # no provider configured for the operator: only the failure cases are recordable
-    save('pi', version, 'rpc-prompt', shown, sent, out, err, rc, 'get_state then one prompt until agent_settled',
-         valid=any(f.get('type') == 'agent_settled' for f in fs))
-    session_id = next(f['data']['sessionId'] for f in fs if f.get('id') == 's1')
+    p, how = pi_session(argv, cwd, [{'id': 's1', 'type': 'get_state'}, {'id': 'p1', 'type': 'prompt', 'message': prompt}],
+                        until='response', env=bare, settle=8)
+    rec.save('rpc-no-provider', shown, p.sent, p.out, p.err, p.returncode,
+             'empty PI_CODING_AGENT_DIR, no provider key variables, PI_OFFLINE=1: get_state then prompt',
+             {'env_overrides': ['PI_CODING_AGENT_DIR=<temp>/empty-agent-dir', 'PI_OFFLINE=1', 'provider key variables removed']}, stop=how)
+    p, how = pi_session(argv, cwd, [{'id': 'm1', 'type': 'set_model', 'provider': 'hoh-invalid-provider', 'modelId': 'hoh-invalid-model'}],
+                        until='response', settle=5)
+    rec.save('rpc-invalid-model', shown, p.sent, p.out, p.err, p.returncode, 'set_model with an unknown provider/model', stop=how)
+    p, how = pi_session(argv, cwd, [{'id': 's1', 'type': 'get_state'}, {'id': 'p1', 'type': 'prompt', 'message': prompt}], until='agent_settled')
+    fs = p.frames()
+    if pi_response(fs, 'p1').get('success') is False:
+        rec.auth = 'BLOCKED_AUTH'
+        rec.fail('auth', 'BLOCKED_AUTH: no provider configured; the live cases cannot be recorded')
+        return
+    rec.save('rpc-prompt', shown, p.sent, p.out, p.err, p.returncode, 'get_state then one prompt until agent_settled', stop=how)
+    session_id = pi_response(fs, 's1').get('data', {}).get('sessionId')
+    if not session_id:
+        rec.fail('rpc-prompt', 'get_state returned no sessionId; the remaining cases need it')
+        return
+    rec.ctx['session_id'] = session_id
+    rec.auth = 'AUTHENTICATED (live turn recorded)'
     argv2 = argv + ['--session-id', session_id]
-    msgs = [{'id': 's2', 'type': 'get_state'}, {'id': 'p2', 'type': 'prompt', 'message': 'Repeat the exact token you replied with in the previous turn, and nothing else.'}]
-    out, err, rc, sent = pi_session(argv2, cwd, msgs, until='agent_settled')
-    fs = frames(out)
-    same = any(f.get('id') == 's2' and f.get('data', {}).get('sessionId') == session_id for f in fs)
-    said = any(f.get('type') == 'message_end' and f.get('message', {}).get('role') == 'assistant' and 'HOH_SAMPLE_OK' in json.dumps(f) for f in fs)
-    save('pi', version, 'rpc-resume', shown + ['--session-id', '<session id of rpc-prompt>'], sent, out, err, rc,
-         'new process with the same --session-dir and --session-id', valid=same and said)
-    msgs = [{'id': 'p3', 'type': 'prompt', 'message': 'Count from 1 to 400, one number per line, with no other text.'}]
-    out, err, rc, sent = pi_session(argv2, cwd, msgs, until='agent_settled', abort_on='message_update')
-    fs = frames(out)
-    stops = [f.get('message', {}).get('stopReason') for f in fs if f.get('type') == 'message_end' and f.get('message', {}).get('role') == 'assistant']
-    save('pi', version, 'rpc-abort', shown + ['--session-id', '<session id of rpc-prompt>'], sent, out, err, rc,
-         'abort command sent on the first message_update', valid='aborted' in stops and any(f.get('type') == 'agent_settled' for f in fs),
-         extra={'assistant_stop_reasons': stops})
+    shown2 = shown + ['--session-id', '<session id of rpc-prompt>']
+    p, how = pi_session(argv2, cwd, [{'id': 's2', 'type': 'get_state'},
+                                     {'id': 'p2', 'type': 'prompt', 'message': 'Repeat the exact token you replied with in the previous turn, and nothing else.'}],
+                        until='agent_settled')
+    rec.save('rpc-resume', shown2, p.sent, p.out, p.err, p.returncode, 'new process with the same --session-dir and --session-id',
+             {'resumed_session_id': session_id}, stop=how)
+    p, how = pi_session(argv2, cwd, [{'id': 'p3', 'type': 'prompt', 'message': 'Count from 1 to 400, one number per line, with no other text.'}],
+                        until='agent_settled', abort_on='message_update')
+    rec.save('rpc-abort', shown2, p.sent, p.out, p.err, p.returncode, 'abort command sent on the first message_update',
+             {'assistant_stop_reasons': [m.get('stopReason') for m in pi_assistant(p.frames())]}, stop=how)
 
 
-def sha256(data: bytes) -> str:
-    import hashlib
-    return hashlib.sha256(data).hexdigest()
-
+# --- provenance and manifest ------------------------------------------------------------------------------
 
 def tree_sha256(root: Path) -> str:
     """sha256 over the sorted lines '<relative path> <sha256 of file>\\n' of every file under root."""
@@ -446,56 +783,83 @@ def binaries(name: str) -> dict:
 INSTALLED_VERSION = {'claude': lambda: first_line(['claude', '--version']).split()[0],
                      'codex': lambda: first_line(['codex', '--version']).split()[-1],
                      'pi': lambda: first_line(['pi', '--version'])}
+HELP = {'claude': ('help.txt', ['claude', '--help']), 'codex': ('help-exec.txt', ['codex', 'exec', '--help']), 'pi': ('help.txt', ['pi', '--help'])}
+AGENTS = {'claude': claude, 'codex': codex, 'pi': pi}
 
 
-def write_manifest() -> None:
-    """One entry per recorded (agent, version). Binary/help hashes are measured only for the version installed
-    now; entries for other versions keep what the previous manifest recorded."""
-    path = HERE / 'compat-manifest.json'
+def record(agent: str, root: Path = HERE) -> Path:
+    """Record one agent into staging and publish it; raises RecordingFailed and leaves the published fixtures alone otherwise."""
+    version = INSTALLED_VERSION[agent]()
+    before = binaries(agent)
+    started = now()
+    rec = Recording(agent, version, root)
+    try:
+        AGENTS[agent](rec)
+        if INSTALLED_VERSION[agent]() != version or binaries(agent) != before:
+            rec.fail('provenance', 'the installed binary changed during the recording')
+        name, argv = HELP[agent]
+        help_bytes = (rec.dir / name).read_bytes()
+        rec.publish({'cli_version': version, 'auth': rec.auth, 'recording_started_at': started, 'recorded_at': now(),
+                     'help_argv': argv, 'help_sha256': sha256(help_bytes), **before})
+        return rec.final
+    except BaseException as exc:
+        where = rec.abandon()
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
+        detail = str(exc) if isinstance(exc, RecordingFailed) else f'{type(exc).__name__}: {exc}'
+        raise RecordingFailed(f'{agent} {version}: {detail}; published fixtures unchanged; staging kept at {where}') from exc
+    finally:
+        while TEMP_DIRS:
+            shutil.rmtree(TEMP_DIRS.pop(), ignore_errors=True)
+
+
+def write_manifest(root: Path = HERE) -> None:
+    """One entry per published (agent, version), built from what is on disk: provenance.json written when that
+    directory was recorded, or for older directories without one, the provenance the previous manifest recorded.
+    Nothing is re-measured here, so an entry never pairs old fixtures with a newer binary (M0R3-02)."""
+    path = root / 'compat-manifest.json'
     previous = json.loads(path.read_text()).get('agents', {}) if path.exists() else {}
     agents: dict[str, dict] = {}
-    for agent_dir in sorted(p for p in HERE.iterdir() if p.is_dir() and not p.name.startswith('_')):
+    for agent_dir in sorted(p for p in root.iterdir() if p.is_dir() and not p.name.startswith(('_', '.'))):
         name = agent_dir.name
-        installed = INSTALLED_VERSION[name]() if shutil.which(name) else None
-        for version_dir in sorted(p for p in agent_dir.iterdir() if p.is_dir()):
+        for version_dir in sorted(p for p in agent_dir.iterdir() if p.is_dir() and not p.name.startswith('.')):
             cases = {}
             for meta in sorted(version_dir.glob('*/meta.json')):
                 m = json.loads(meta.read_text())
                 cases[meta.parent.name] = {'valid': m['valid'], 'files': {f.name: sha256(f.read_bytes()) for f in sorted(meta.parent.iterdir())}}
-            auth_file = version_dir / 'auth-status.json'
-            if auth_file.exists():
-                auth = json.loads(auth_file.read_text())['state']
-            elif any(cases.get(c, {}).get('valid') for c in ('success', 'rpc-prompt')):
-                auth = 'AUTHENTICATED (live turn recorded)'
+            prov_file = version_dir / 'provenance.json'
+            if prov_file.exists():
+                prov = json.loads(prov_file.read_text())
             else:
-                auth = 'BLOCKED_AUTH'
-            help_argv = [name, 'exec', '--help'] if name == 'codex' else [name, '--help']
-            if version_dir.name == installed:
-                measured = {'help_argv': help_argv, 'help_sha256': sha256(subprocess.run(help_argv, capture_output=True, env=ENV).stdout), **binaries(name)}
-            else:
-                old = previous.get(name, {}).get(version_dir.name, {})
-                measured = {k: v for k, v in old.items() if k not in ('cli_version', 'auth', 'cases', 'app_server_schema_tree_sha256')} or \
-                           {'binary': 'not installed when this manifest was written'}
-            entry = {'cli_version': version_dir.name, 'auth': auth, **measured, 'cases': cases}
+                prov = {k: v for k, v in previous.get(name, {}).get(version_dir.name, {}).items() if k not in ('cases', 'app_server_schema_tree_sha256')}
+                prov = prov or {'cli_version': version_dir.name, 'auth': 'UNKNOWN', 'binary': 'not recorded'}
+            entry = {**prov, 'cli_version': version_dir.name, 'cases': cases}
             if (version_dir / 'app-server-schema').is_dir():
                 entry['app_server_schema_tree_sha256'] = tree_sha256(version_dir / 'app-server-schema')
             agents.setdefault(name, {})[version_dir.name] = entry
-    manifest = {'schema_version': '1.2', 'recorded_at': now(), 'recorder': 'tests/fixtures/protocol/record.py',
+    manifest = {'schema_version': '1.3', 'recorded_at': now(), 'recorder': 'tests/fixtures/protocol/record.py',
                 'hash_algorithms': {'tree_sha256': tree_sha256.__doc__, 'files': 'sha256 of the raw file bytes'}, 'agents': agents}
-    (HERE / 'compat-manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + '\n')
+    path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + '\n')
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--agents', default='claude,codex,pi')
     selected = ap.parse_args().agents.split(',')
-    for name, fn in [('claude', claude), ('codex', codex), ('pi', pi)]:
+    unknown = set(selected) - set(AGENTS)
+    if unknown:
+        ap.error('unknown agents: ' + ', '.join(sorted(unknown)))
+    failures = []
+    for name in AGENTS:
         if name in selected:
-            fn()
-            print(f'recorded {name}')
+            try:
+                print(f'recorded {name}: {record(name)}')
+            except RecordingFailed as exc:
+                failures.append(str(exc))
+                print(f'NOT recorded: {exc}', file=sys.stderr)
     write_manifest()
     print('wrote compat-manifest.json')
-    return 0
+    return 1 if failures else 0
 
 
 if __name__ == '__main__':
