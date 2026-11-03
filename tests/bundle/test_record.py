@@ -247,6 +247,15 @@ class BoundedStop(unittest.TestCase):
         # M0R7-03: a descendant that hands over to a new one at once still counts as one tree ending on its own.
         p=self.proc('relay-fast');how=p.stop(grace=5,descendant_grace=3)
         self.assertEqual(how,'exited');self.assertEqual(how.descendants,[])
+    def test_stale_member_snapshot_is_not_reported_as_killed(self):
+        # M0R8-02: a process that had already exited when no forced kill was needed must not be labelled killed.
+        p=self.proc('exit-on-eof')
+        with patch.object(record,'members',side_effect=lambda cg:[999999]):how=p.stop(grace=5,descendant_grace=0)
+        self.assertEqual(how,'exited');self.assertEqual(how.descendants,[])
+    def test_forced_kill_reports_what_it_froze(self):
+        # Members are read while the scope is frozen, so nothing can exit between the snapshot and the kill.
+        p=self.proc('escape-quiet');how=p.stop(grace=5,descendant_grace=0.2)
+        self.assertEqual(how,'exited+descendants-killed');self.assertEqual(len(how.descendants),1);self.assertFalse(self.escaped_alive())
     def test_terminate_survives_cleanup_errors(self):
         # M0R7-02: an error inside terminate() must not skip the kill, the wait or the confirmation.
         p=self.proc('ignore-term');time.sleep(0.3)
@@ -393,6 +402,29 @@ sys.argv=['record.py','--agents','pi'];sys.exit(record.main())
         still=record.alive(pid)
         if still:os.kill(pid,signal.SIGKILL)
         self.assertEqual(p.returncode,128+signal.SIGTERM,err.decode()[-2000:]);self.assertFalse(still)
+    def test_sigterm_while_constructing_the_version_probe(self):
+        # M0R8-01: the version probe runs before the recording; a signal while its Proc is built must still stop it.
+        t=tempfile.TemporaryDirectory();self.addCleanup(t.cleanup);d=Path(t.name);repo=sandbox(d);root=repo/'tests/fixtures/protocol'
+        pidfile=d/'probe.pid';script=d/'child.py';script.write_text(SLEEPER)
+        driver=d/'driver.py';driver.write_text(DRIVER_PREAMBLE+'''
+import signal
+probe=[sys.executable,sys.argv[3],'version-probe',sys.argv[4],'block'];real=os.set_blocking
+def set_blocking(fd,flag):
+    os.kill(os.getpid(),signal.SIGTERM);real(fd,flag)
+def version():
+    os.set_blocking=set_blocking
+    try:return record.first_line(probe)
+    finally:os.set_blocking=real
+record.INSTALLED_VERSION['pi']=version
+sys.argv=['record.py','--agents','pi'];sys.exit(record.main())
+''')
+        p=subprocess.run([sys.executable,str(driver),str(repo),str(root),str(script),str(pidfile)],capture_output=True,text=True,timeout=90)
+        scopes=subprocess.run(['systemctl','--user','list-units',f'hoh-recorder-{os.getpid()}-*',f'hoh-recorder-*','--no-legend','--plain'],capture_output=True,text=True).stdout
+        mine=[line for line in scopes.splitlines() if line.strip()]
+        leaked=pidfile.exists() and record.alive(int(pidfile.read_text()))
+        if leaked:os.kill(int(pidfile.read_text()),signal.SIGKILL)
+        for line in mine:subprocess.run(['systemctl','--user','stop',line.split()[0]],capture_output=True)
+        self.assertEqual(p.returncode,128+signal.SIGTERM,p.stderr[-2000:]);self.assertEqual(mine,[]);self.assertFalse(leaked)
     def test_version_probe_leaves_nothing_behind(self):
         t=tempfile.TemporaryDirectory();self.addCleanup(t.cleanup);d=Path(t.name);script=d/'child.py';script.write_text(SLEEPER)
         self.assertEqual(record.first_line([sys.executable,str(script),'version-probe',str(d/'probe.pid')]),'9.9.9')

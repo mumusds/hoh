@@ -13,7 +13,7 @@
   ],
   "cwd": "fresh temp Git repo outside the checkout",
   "exit_code": 0,
-  "recorded_at": "2026-11-03T23:27:41.913791+00:00",
+  "recorded_at": "2026-11-03T23:42:55.236534+00:00",
   "mode": "live",
   "notes": "abort command sent on the first message_update",
   "assistant_stop_reasons": [
