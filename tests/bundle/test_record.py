@@ -120,6 +120,20 @@ if mode=='escape':
     sys.exit(0)
 if mode=='exit-on-eof':sys.stdin.read();print('bye');sys.exit(0)
 if mode=='count-stdin':print(len(sys.stdin.buffer.read()));sys.exit(0)
+if mode=='close-then-read':
+    os.close(1);os.close(2);n=len(sys.stdin.buffer.read());open(sys.argv[2],'w').write(str(n));sys.exit(0)
+if mode=='linger':
+    if os.fork()==0:
+        os.setsid();fd=os.open(os.devnull,os.O_RDWR)
+        for n in (0,1,2):os.dup2(fd,n)
+        time.sleep(1);os._exit(0)  # like the last `sleep 2` of a cancelled tool: ends on its own shortly
+    sys.exit(0)
+if mode=='escape-quiet':
+    if os.fork()==0:
+        os.setsid();fd=os.open(os.devnull,os.O_RDWR)
+        for n in (0,1,2):os.dup2(fd,n)
+        open(sys.argv[2],'w').write(str(os.getpid()));time.sleep(30);os._exit(0)  # leaves the group and closes its stdio
+    time.sleep(0.3);sys.exit(0)
 if mode=='chatty':
     sys.stderr.write('e'*1_000_000);sys.stderr.flush();print('done');sys.exit(0)
 time.sleep(60)
@@ -133,6 +147,7 @@ class BoundedStop(unittest.TestCase):
     def proc(self,mode):
         p=record.Proc([sys.executable,str(self.script),mode,str(self.dir/'escaped.pid')],self.dir,dict(os.environ))
         self.addCleanup(lambda:p.signal(signal.SIGKILL))
+        self.addCleanup(lambda:(self.dir/'escaped.pid').exists() and record.alive(int((self.dir/'escaped.pid').read_text())) and os.kill(int((self.dir/'escaped.pid').read_text()),signal.SIGKILL))
         return p
     def timed_stop(self,p,**kw):
         t=time.monotonic();how=p.stop(**kw);return how,time.monotonic()-t
@@ -143,25 +158,44 @@ class BoundedStop(unittest.TestCase):
     def test_kill_when_term_ignored(self):
         p=self.proc('ignore-term');time.sleep(0.3)
         how,took=self.timed_stop(p,grace=0.5,term_grace=0.5,kill_grace=5);self.assertEqual(how,'SIGKILL');self.assertLess(took,5);self.assertEqual(p.returncode,-signal.SIGKILL)
+    def escaped_alive(self)->bool:
+        pid=int((self.dir/'escaped.pid').read_text())
+        return record.alive(pid)
     def test_descendant_outside_group_killed(self):
-        # M0R4-07: as a child subreaper the recorder adopts and kills descendants that left the process group.
-        driver=self.dir/'driver.py'
-        driver.write_text(DRIVER_PREAMBLE+'''
-record.enable_subreaper()
-p=record.Proc([sys.executable,sys.argv[2],'escape',sys.argv[3]],Path(sys.argv[3]).parent,dict(os.environ))
-t=time.monotonic();how=p.stop(grace=0.5,term_grace=0.5,kill_grace=0.5)
-pid=int(Path(sys.argv[3]).read_text())
-try:os.kill(pid,0);alive=True
-except ProcessLookupError:alive=False
-print(json.dumps({'how':how,'took':time.monotonic()-t,'alive':alive}))
-''')
-        r=subprocess.run([sys.executable,str(driver),str(ROOT),str(self.script),str(self.dir/'escaped.pid')],capture_output=True,text=True,timeout=60)
-        self.assertEqual(r.returncode,0,r.stderr);res=json.loads(r.stdout)
-        self.assertFalse(res['alive'],res);self.assertIn('orphans-killed',res['how']);self.assertLess(res['took'],5)
+        # M0R4-07: descendants that left the process group and hold a pipe are found by the Proc's token and killed.
+        p=self.proc('escape');how,took=self.timed_stop(p,grace=0.5,term_grace=0.5,kill_grace=2)
+        self.assertIn('descendants-killed',how);self.assertLess(took,6);self.assertFalse(self.escaped_alive())
+    def test_quiet_escaped_descendant_killed_after_clean_exit(self):
+        # M0R5-02: the child exits normally but leaves a setsid descendant with closed stdio.
+        p=self.proc('escape-quiet');how,_=self.timed_stop(p,grace=5)
+        self.assertEqual(how,'exited+descendants-killed');self.assertFalse(self.escaped_alive())
+    def test_descendant_ending_on_its_own_is_only_recorded(self):
+        # A descendant that exits within the grace period by itself is reported, not killed and not a failure.
+        p=self.proc('linger');how=p.stop(grace=5)
+        self.assertEqual(how,'exited');self.assertEqual(len(how.lingered),1);self.assertEqual(how.descendants,[])
+        t=tempfile.TemporaryDirectory();self.addCleanup(t.cleanup)
+        rec=record.Recording('pi','1.5.0',Path(t.name),Path(t.name)/'failed');d=FIXTURES/'pi/1.5.0/rpc-invalid-model'
+        rec.save('rpc-invalid-model',['pi'],(d/'stdin.txt').read_bytes(),(d/'stdout.jsonl').read_bytes(),b'',0,'x',stop=how)
+        self.assertEqual(rec.problems,{});meta=json.loads((rec.dir/'rpc-invalid-model/meta.json').read_text())
+        self.assertEqual(len(meta['descendants_lingered']),1)
+    def test_unrelated_children_survive(self):
+        # M0R5-06: only processes started by the stopped Proc (carrying its token) are killed.
+        other=subprocess.Popen(['sleep','30']);self.addCleanup(lambda:(other.kill(),other.wait()))
+        p=self.proc('escape-quiet');p.stop(grace=5);record.stop_all()
+        self.assertIsNone(other.poll())
+    def test_output_closed_input_still_delivered(self):
+        # M0R5-04: pending stdin is still written after the child closed stdout and stderr.
+        p=record.Proc([sys.executable,str(self.script),'close-then-read',str(self.dir/'n')],self.dir,dict(os.environ))
+        p.write(b'z'*(3<<20));how=p.stop(grace=10)
+        self.assertEqual((how,(self.dir/'n').read_text()),('exited',str(3<<20)))
+    def test_stop_all_survives_a_failing_stop(self):
+        a=self.proc('sleep');b=self.proc('sleep')
+        with patch.object(a,'stop',side_effect=RuntimeError('boom')):record.stop_all()
+        self.assertIsNotNone(b.p.poll());a.signal(signal.SIGKILL);a.p.wait()
     def test_unclean_stop_invalidates_case(self):
         t=tempfile.TemporaryDirectory();self.addCleanup(t.cleanup)
         rec=record.Recording('pi','1.5.0',Path(t.name),Path(t.name)/'failed');d=FIXTURES/'pi/1.5.0/rpc-invalid-model'
-        rec.save('rpc-invalid-model',['pi'],(d/'stdin.txt').read_bytes(),(d/'stdout.jsonl').read_bytes(),b'',0,'x',stop='SIGKILL+orphans-killed')
+        rec.save('rpc-invalid-model',['pi'],(d/'stdin.txt').read_bytes(),(d/'stdout.jsonl').read_bytes(),b'',0,'x',stop='exited+descendants-killed')
         self.assertTrue(any('process cleanup' in p for p in rec.problems['rpc-invalid-model']))
     def test_stderr_drained_while_waiting(self):
         p=self.proc('chatty');how,_=self.timed_stop(p,grace=10);self.assertEqual(how,'exited');self.assertEqual(len(p.err),1_000_000);self.assertEqual(p.out,b'done\n')
@@ -178,14 +212,22 @@ print(json.dumps({'how':how,'took':time.monotonic()-t,'alive':alive}))
 
 DRIVER_PREAMBLE='''import importlib.util,json,os,sys,time
 from pathlib import Path
+# argv[1] is a sandbox repository (see sandbox()), so record.HERE and every default path are temporary.
 spec=importlib.util.spec_from_file_location('record',Path(sys.argv[1])/'tests/fixtures/protocol/record.py')
 record=importlib.util.module_from_spec(spec);spec.loader.exec_module(record)
 '''
 
+def sandbox(d:Path)->Path:
+    """A throw-away repository layout holding a copy of record.py: drivers can never touch the real fixtures,
+    whichever version of the recorder they run."""
+    repo=d/'repo';(repo/'tests/fixtures/protocol').mkdir(parents=True)
+    shutil.copy(FIXTURES/'record.py',repo/'tests/fixtures/protocol/record.py');(repo/'tools').symlink_to(ROOT/'tools')
+    return repo
+
 class Interrupted(unittest.TestCase):
     """M0R4-01: SIGINT or SIGTERM to the recorder stops every child before its directories are removed."""
     def interrupt(self,sig):
-        t=tempfile.TemporaryDirectory();self.addCleanup(t.cleanup);d=Path(t.name);root=d/'protocol';root.mkdir()
+        t=tempfile.TemporaryDirectory();self.addCleanup(t.cleanup);d=Path(t.name);repo=sandbox(d);root=repo/'tests/fixtures/protocol'
         driver=d/'driver.py';info=d/'child.json'
         driver.write_text(DRIVER_PREAMBLE+'''
 root=Path(sys.argv[2]);info=Path(sys.argv[3])
@@ -193,10 +235,10 @@ def body(rec):
     p=record.Proc(['sleep','60'],record.workdir())
     info.write_text(json.dumps({'pid':p.p.pid,'cwd':str(record.TEMP_DIRS[-1])}))
     time.sleep(60)
-record.AGENTS['pi']=body;record.INSTALLED_VERSION['pi']=lambda:'1.5.0';record.binaries=lambda name:{};record.REPO=root.parent
+record.AGENTS['pi']=body;record.INSTALLED_VERSION['pi']=lambda:'1.5.0';record.binaries=lambda name:{}
 record.record('pi',root)
 ''')
-        p=subprocess.Popen([sys.executable,str(driver),str(ROOT),str(root),str(info)],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        p=subprocess.Popen([sys.executable,str(driver),str(repo),str(root),str(info)],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
         self.addCleanup(lambda:p.poll() is None and p.kill())
         deadline=time.monotonic()+30
         while not info.exists() and time.monotonic()<deadline:time.sleep(0.05)
@@ -208,6 +250,44 @@ record.record('pi',root)
         self.assertNotEqual(p.returncode,0);self.assertFalse(any((root/'pi').glob('.recording-*')))
     def test_sigint(self):self.interrupt(signal.SIGINT)
     def test_sigterm(self):self.interrupt(signal.SIGTERM)
+    def test_signal_while_constructing_a_child(self):
+        # M0R5-01: SIGTERM arriving inside Proc() is handled only once the child is registered, so it is still stopped.
+        t=tempfile.TemporaryDirectory();self.addCleanup(t.cleanup);d=Path(t.name);repo=sandbox(d);root=repo/'tests/fixtures/protocol';info=d/'child.json'
+        driver=d/'driver.py';driver.write_text(DRIVER_PREAMBLE+'''
+import signal
+root=Path(sys.argv[2]);info=Path(sys.argv[3]);real=os.set_blocking
+def set_blocking(fd,flag):
+    os.kill(os.getpid(),signal.SIGTERM);real(fd,flag)
+def body(rec):
+    cwd=record.workdir();os.set_blocking=set_blocking
+    try:record.Proc(['sleep','60'],cwd)
+    finally:
+        os.set_blocking=real
+        info.write_text(json.dumps({'pids':[p.p.pid for p in record.LIVE],'cwd':str(cwd)}))
+record.AGENTS['pi']=body;record.INSTALLED_VERSION['pi']=lambda:'1.5.0';record.binaries=lambda name:{}
+record.record('pi',root)
+''')
+        r=subprocess.run([sys.executable,str(driver),str(repo),str(root),str(info)],capture_output=True,text=True,timeout=60)
+        child=json.loads(info.read_text());self.assertEqual(len(child['pids']),1,r.stderr)
+        self.assertFalse(record.alive(child['pids'][0]),r.stderr[-2000:]);self.assertFalse(Path(child['cwd']).exists())
+        self.assertIn('Terminated',r.stderr);self.assertFalse(any((root/'pi').glob('.recording-*')))
+    def test_interrupt_still_rebuilds_manifest(self):
+        # M0R5-03: an agent published before the interrupt must appear in the manifest with its new hashes.
+        t=tempfile.TemporaryDirectory();self.addCleanup(t.cleanup);d=Path(t.name);repo=sandbox(d);root=repo/'tests/fixtures/protocol'
+        driver=d/'driver.py';driver.write_text(DRIVER_PREAMBLE+'''
+root=Path(sys.argv[2]);src=Path(sys.argv[3])/'tests/fixtures/protocol/claude/2.1.317/max-turns-error'
+def claude(rec):
+    rec.save('max-turns-error',['claude'],(src/'stdin.txt').read_bytes(),(src/'stdout.jsonl').read_bytes(),b'',1,'x');(rec.dir/'help.txt').write_bytes(b'h')
+def pi(rec):raise KeyboardInterrupt
+record.AGENTS.update(claude=claude,pi=pi);record.INSTALLED_VERSION.update(claude=lambda:'2.1.317',pi=lambda:'1.5.0')
+record.binaries=lambda name:{};sys.argv=['record.py','--agents','claude,pi']
+sys.exit(record.main())
+''')
+        r=subprocess.run([sys.executable,str(driver),str(repo),str(root),str(ROOT)],capture_output=True,text=True,timeout=60)
+        self.assertEqual(r.returncode,130,r.stderr)
+        entry=json.loads((root/'compat-manifest.json').read_text())['agents']['claude']['2.1.317']
+        published=root/'claude/2.1.317/max-turns-error/stdout.jsonl'
+        self.assertEqual(entry['cases']['max-turns-error']['files']['stdout.jsonl'],record.sha256(published.read_bytes()))
 
 class StagedPublication(unittest.TestCase):
     """M0R3-02: a version directory is replaced only by a complete, valid recording."""
@@ -288,6 +368,14 @@ class StagedPublication(unittest.TestCase):
         record.write_manifest(self.root)
         self.assertEqual(json.loads((self.root/'compat-manifest.json').read_text())['agents']['pi']['1.5.0']['entry_sha256'],'e')
         self.assertEqual(sorted(p.name for p in self.root.iterdir()),['compat-manifest.json','pi'])
+    def test_failed_exchange_keeps_the_new_recording(self):
+        # M0R5-05: a publish that fails before the swap keeps the new recording as failure evidence.
+        rec=self.recording();self.save_invalid_model(rec)
+        with patch.object(record,'exchange',side_effect=PermissionError(13,'Permission denied')):
+            with self.assertRaises(PermissionError):rec.publish({'cli_version':'1.5.0'})
+        where=rec.abandon();self.assertTrue(str(where).startswith(str(self.failed)),where)
+        self.assertTrue((where/'rpc-invalid-model/meta.json').is_file());self.assertTrue((where/'provenance.json').is_file())
+        self.assertTrue((self.published/'old-only.txt').exists())
     def test_manifest_ignores_staging_directories(self):
         (self.root/'pi/.recording-1.5.0-x/rpc-prompt').mkdir(parents=True);record.write_manifest(self.root)
         self.assertEqual(list(json.loads((self.root/'compat-manifest.json').read_text())['agents']['pi']),['1.5.0'])

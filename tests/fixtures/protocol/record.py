@@ -75,58 +75,93 @@ def frames(raw: bytes) -> list[dict]:
 
 LIBC = ctypes.CDLL(None, use_errno=True)
 LIVE: set['Proc'] = set()  # children not yet stopped, so an interrupted recording can stop them (M0R4-01)
+TOKEN_VAR = 'HOH_RECORDER_PROC'
+SIGNALS = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
 
 
-def enable_subreaper() -> bool:
-    """Make this process the Linux child subreaper: descendants that leave a child's process group (setsid) are
-    re-parented here instead of to init when their parent exits, so they can still be found and killed (M0R4-07)."""
-    return LIBC.prctl(36, 1, 0, 0, 0) == 0  # PR_SET_CHILD_SUBREAPER
+def proc_state(pid: int) -> str | None:
+    """Process state letter from /proc (Z for a zombie), None when the process is gone."""
+    try:
+        return Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[0]
+    except (OSError, IndexError):
+        return None
 
 
-def reap_orphans() -> int:
-    """Kill and reap every process re-parented to us that is not one of our live children; returns how many."""
-    live = {p.p.pid for p in LIVE}
-    killed = 0
-    for stat in Path('/proc').glob('[0-9]*/stat'):
+def alive(pid: int) -> bool:
+    return proc_state(pid) not in (None, 'Z')
+
+
+def carrying(token: str) -> list[int]:
+    """Live processes whose environment holds this Proc's token: the child and every descendant that kept the
+    inherited environment, wherever it was re-parented and whatever session or group it moved to (M0R5-02/06).
+    A descendant that exec'd with a cleared environment cannot be found this way."""
+    needle = f'{TOKEN_VAR}={token}'.encode()
+    found = []
+    for environ in Path('/proc').glob('[0-9]*/environ'):
         try:
-            pid, ppid = int(stat.parent.name), int(stat.read_text().rsplit(')', 1)[1].split()[1])
-        except (OSError, ValueError, IndexError):
+            if needle in environ.read_bytes().split(b'\0') and alive(int(environ.parent.name)):
+                found.append(int(environ.parent.name))
+        except (OSError, ValueError):
             continue
-        if ppid == os.getpid() and pid not in live:
-            try:
-                os.kill(pid, signal.SIGKILL)
-                os.waitpid(pid, 0)
-                killed += 1
-            except (ProcessLookupError, ChildProcessError):
-                pass
-    return killed
+    return found
+
+
+class Stopped(str):
+    """How a child ended (exited, SIGTERM, ...), with the command lines of descendants that outlived it: `lingered`
+    ended by themselves within the grace period, `descendants` had to be killed."""
+    descendants: list[str] = []
+    lingered: list[str] = []
+
+
+def cmdline(pid: int) -> str:
+    try:
+        return Path(f'/proc/{pid}/cmdline').read_bytes().replace(b'\0', b' ').decode('utf-8', 'replace').strip()[:300]
+    except OSError:
+        return f'pid {pid}'
 
 
 class Proc:
     """A child in its own process group. stdin is written without blocking and stdout/stderr are drained in the same
-    loop, so no pipe can stall the recorder and every wait is bounded (M0R3-03, M0R4-06)."""
+    loop, so no pipe can stall the recorder and every wait is bounded (M0R3-03, M0R4-06). Its environment carries a
+    unique token so its descendants can be found and killed when it stops."""
 
     def __init__(self, argv: list[str], cwd: Path, env: dict | None = None):
-        self.p = subprocess.Popen(argv, cwd=cwd, env=env or ENV, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  stderr=subprocess.PIPE, start_new_session=True)
-        LIVE.add(self)
+        self.token = os.urandom(8).hex()
         self.out = b''
         self.err = b''
         self.sent = b''
         self.pending = bytearray()
         self.close_requested = False
-        os.set_blocking(self.p.stdin.fileno(), False)
+        self.descendants: list[str] = []  # command lines of descendants killed by stop()
+        self.lingered: list[str] = []  # descendants that outlived the child but ended on their own
         self.sel = selectors.DefaultSelector()
-        self.sel.register(self.p.stdout, selectors.EVENT_READ)
-        self.sel.register(self.p.stderr, selectors.EVENT_READ)
+        # Signals stay blocked until the child is fully registered, so an interrupt is handled only once stop_all()
+        # can find it (M0R5-01); the child unblocks them before exec.
+        blocked = signal.pthread_sigmask(signal.SIG_BLOCK, SIGNALS)
+        try:
+            self.p = subprocess.Popen(argv, cwd=cwd, env=(env or ENV) | {TOKEN_VAR: self.token}, stdin=subprocess.PIPE,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+                                      preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_UNBLOCK, SIGNALS))
+            LIVE.add(self)
+            os.set_blocking(self.p.stdin.fileno(), False)
+            self.sel.register(self.p.stdout, selectors.EVENT_READ)
+            self.sel.register(self.p.stderr, selectors.EVENT_READ)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
+
+    def registered(self, f) -> bool:
+        return f in [k.fileobj for k in self.sel.get_map().values()]
 
     def reading(self) -> bool:
-        return any(k.fileobj is not self.p.stdin for k in self.sel.get_map().values())
+        return self.registered(self.p.stdout) or self.registered(self.p.stderr)
+
+    def stdin_busy(self) -> bool:
+        return not self.p.stdin.closed and bool(self.pending)
 
     def close_stdin(self) -> None:
         self.pending.clear()
         if not self.p.stdin.closed:
-            if self.p.stdin in [k.fileobj for k in self.sel.get_map().values()]:
+            if self.registered(self.p.stdin):
                 self.sel.unregister(self.p.stdin)
             try:
                 self.p.stdin.close()
@@ -140,16 +175,15 @@ class Proc:
                 n = os.write(self.p.stdin.fileno(), self.pending[:65536])
             except BlockingIOError:
                 break
-            except (BrokenPipeError, OSError):  # the CLI stopped reading; what it printed is still collected
+            except OSError:  # the CLI stopped reading (EPIPE); what it printed is still collected
                 self.close_stdin()
                 return
             del self.pending[:n]
         if self.p.stdin.closed:
             return
-        waiting = self.p.stdin in [k.fileobj for k in self.sel.get_map().values()]
-        if self.pending and not waiting:
+        if self.pending and not self.registered(self.p.stdin):
             self.sel.register(self.p.stdin, selectors.EVENT_WRITE)
-        elif not self.pending and waiting:
+        elif not self.pending and self.registered(self.p.stdin):
             self.sel.unregister(self.p.stdin)
         if not self.pending and self.close_requested:
             self.close_stdin()
@@ -161,8 +195,9 @@ class Proc:
             self.flush()
 
     def pump(self, timeout: float) -> bool:
-        """Write pending input and read what arrives within `timeout`; False once stdout and stderr are closed."""
-        if not self.reading():
+        """Write pending input and read what arrives within `timeout`. Returns whether stdout or stderr is still
+        open; pending input keeps being written after both closed (M0R5-04)."""
+        if not self.sel.get_map():
             return False
         for key, _ in self.sel.select(timeout):
             if key.fileobj is self.p.stdin:
@@ -197,46 +232,80 @@ class Proc:
             pass
 
     def drain(self, wait: float) -> bool:
-        """Pump until stdout/stderr close and the child exits, at most `wait` seconds; True if it exited."""
+        """Write and read until stdin is done, stdout/stderr close and the child exits, at most `wait` s."""
         deadline = time.monotonic() + wait
         while time.monotonic() < deadline:
-            if self.pump(min(0.5, max(0.0, deadline - time.monotonic()))):
+            remaining = max(0.0, deadline - time.monotonic())
+            if self.pump(min(0.5, remaining)) or self.stdin_busy():
                 continue
             try:
-                self.p.wait(timeout=max(0.0, deadline - time.monotonic()))
+                self.p.wait(timeout=remaining)
                 return True
             except subprocess.TimeoutExpired:
                 return False
         return False
 
-    def stop(self, grace: float = 20, term_grace: float = 10, kill_grace: float = 5) -> str:
+    def kill_descendants(self, wait: float) -> int:
+        """SIGKILL every process still carrying our token and wait until they are gone; returns how many there were."""
+        pids = carrying(self.token)
+        for pid in pids:
+            self.descendants.append(cmdline(pid))
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        deadline = time.monotonic() + wait
+        while carrying(self.token) and time.monotonic() < deadline:
+            self.p.poll()  # reaps the child itself if it was among them
+            time.sleep(0.05)
+        return len(pids)
+
+    def outlived(self, grace: float) -> None:
+        """Give descendants that outlived the child up to `grace` s to end by themselves (Claude can leave the last
+        `sleep` of a cancelled tool for a moment); they are recorded, and only those still running get killed."""
+        deadline = time.monotonic() + grace
+        seen = {pid: cmdline(pid) for pid in carrying(self.token) if pid != self.p.pid}
+        while seen and time.monotonic() < deadline:
+            running = set(carrying(self.token))
+            for pid in [pid for pid in seen if pid not in running]:
+                self.lingered.append(seen.pop(pid))
+            if seen:
+                time.sleep(0.05)
+
+    def stop(self, grace: float = 20, term_grace: float = 10, kill_grace: float = 5, descendant_grace: float = 5) -> Stopped:
         """Finish writing stdin, close it and wait `grace` s for exit; then SIGTERM the group, then SIGKILL it, each
-        bounded. Descendants that left the group and still hold a pipe are killed when we are their subreaper
-        (`+orphans-killed`); if pipes stay open even then they are closed (`+abandoned`). Returns how it ended."""
+        bounded. Afterwards, on every path, processes still carrying the token (descendants that left the group,
+        with or without its pipes) are killed: `+descendants-killed`. Pipes still open even then are closed
+        (`+abandoned`). Returns how it ended."""
         self.close_requested = True
-        self.flush()
         how = 'exited'
         try:
+            self.flush()
+            finished = False
             for sig, wait in ((None, grace), (signal.SIGTERM, term_grace), (signal.SIGKILL, kill_grace)):
                 if sig is not None:
                     how = sig.name
                     self.close_stdin()
                     self.signal(sig)
                 if self.drain(wait):
+                    finished = True
                     break
-            else:
-                if reap_orphans():
-                    how += '+orphans-killed'
-                if not self.drain(kill_grace):
-                    for key in list(self.sel.get_map().values()):
-                        self.sel.unregister(key.fileobj)
-                        key.fileobj.close()
-                    how += '+abandoned'
-                    try:
-                        self.p.wait(timeout=kill_grace)
-                    except subprocess.TimeoutExpired:
-                        pass
-            return how
+            if finished:
+                self.outlived(descendant_grace)
+            if self.kill_descendants(kill_grace):
+                how += '+descendants-killed'
+            if not finished and not self.drain(kill_grace):
+                for key in list(self.sel.get_map().values()):
+                    self.sel.unregister(key.fileobj)
+                    key.fileobj.close()
+                how += '+abandoned'
+                try:
+                    self.p.wait(timeout=kill_grace)
+                except subprocess.TimeoutExpired:
+                    pass
+            result = Stopped(how)
+            result.descendants, result.lingered = list(self.descendants), list(self.lingered)
+            return result
         finally:
             self.close_stdin()
             LIVE.discard(self)
@@ -247,10 +316,14 @@ class Proc:
 
 
 def stop_all() -> None:
-    """Stop every child still running, e.g. after SIGINT/SIGTERM interrupted a case (M0R4-01)."""
+    """Stop every child still running, e.g. after SIGINT/SIGTERM interrupted a case (M0R4-01). A failure to stop one
+    is reported and does not prevent stopping the others (M0R5-01)."""
     for p in list(LIVE):
-        p.stop(grace=0, term_grace=5, kill_grace=5)
-    reap_orphans()
+        try:
+            p.stop(grace=0, term_grace=5, kill_grace=5, descendant_grace=0)
+        except Exception as exc:  # keep going: the remaining children and the caller's cleanup still matter
+            LIVE.discard(p)
+            print(f'warning: could not stop child {getattr(getattr(p, "p", None), "pid", "?")}: {type(exc).__name__}: {exc}', file=sys.stderr)
 
 
 def run(argv: list[str], stdin: bytes, cwd: Path, timeout: float = 300, env: dict | None = None) -> tuple[bytes, bytes, int | None, str]:
@@ -548,6 +621,7 @@ class Recording:
         self.problems: dict[str, list[str]] = {}
         self.ctx: dict = {}
         self.auth = 'UNKNOWN'
+        self.published = False
 
     def save(self, case: str, argv: list[str], stdin: bytes, stdout: bytes, stderr: bytes, rc: int | None, notes: str,
              extra: dict | None = None, stop: str | None = None) -> list[dict]:
@@ -560,10 +634,14 @@ class Recording:
                 'exit_code': rc, 'recorded_at': now(), 'mode': 'live', 'notes': notes, **(extra or {})}
         if stop is not None:
             meta['stopped'] = stop
+        if getattr(stop, 'descendants', None):
+            meta['descendants_killed'] = stop.descendants
+        if getattr(stop, 'lingered', None):
+            meta['descendants_lingered'] = stop.lingered  # outlived the CLI briefly, ended on their own
         fs = frames(stdout)
         problems = VALIDATORS[(self.agent, case)](fs, rc, meta, sent_messages(stdin), self.ctx)
-        if stop is not None and any(word in stop for word in ('SIGKILL', 'orphans', 'abandoned')):
-            problems.append(f'process cleanup: {stop}')  # a child that had to be killed or left descendants (M0R4-07)
+        if stop is not None and any(word in stop for word in ('SIGKILL', 'descendants', 'abandoned')):
+            problems.append(f'process cleanup: {stop}')  # a child that had to be killed or left descendants (M0R4-07, M0R5-02)
         meta |= {'valid': not problems, 'problems': problems}
         (d / 'meta.json').write_text(json.dumps(meta, ensure_ascii=False, indent=2) + '\n')
         if problems:
@@ -580,6 +658,7 @@ class Recording:
         (self.dir / 'provenance.json').write_text(json.dumps(provenance, ensure_ascii=False, indent=2) + '\n')
         if not self.final.exists():
             self.dir.rename(self.final)
+            self.published = True
             return
         try:
             exchange(self.dir, self.final)  # staging now holds the old version (M0R4-02)
@@ -589,13 +668,21 @@ class Recording:
             # No RENAME_EXCHANGE here: two renames; recover() restores the old version if we die in between.
             old = self.parent / f'.replaced-{self.version}-{os.getpid()}'
             self.final.rename(old)
-            self.dir.rename(self.final)
+            try:
+                self.dir.rename(self.final)
+            except BaseException:
+                old.rename(self.final)
+                raise
+            self.published = True
             shutil.rmtree(old)
             return
+        self.published = True
         shutil.rmtree(self.dir)
 
     def abandon(self) -> Path:
-        if not self.dir.exists() or (self.dir / 'provenance.json').exists():  # already published
+        """Keep an unpublished recording as failure evidence; after publication only the displaced old copy remains
+        here, which is removed (M0R5-05: decided by the publication itself, not by which files exist)."""
+        if self.published or not self.dir.exists():
             shutil.rmtree(self.dir, ignore_errors=True)
             return self.final
         self.failed_root.mkdir(parents=True, exist_ok=True)
@@ -914,7 +1001,6 @@ def record(agent: str, root: Path = HERE) -> Path:
     before = binaries(agent)
     started = now()
     rec = Recording(agent, version, root)
-    enable_subreaper()
     previous = install_termination_handlers()  # SIGTERM/SIGHUP raise Terminated so children are stopped (M0R4-01)
     try:
         AGENTS[agent](rec)
@@ -933,10 +1019,12 @@ def record(agent: str, root: Path = HERE) -> Path:
         detail = str(exc) if isinstance(exc, RecordingFailed) else f'{type(exc).__name__}: {exc}'
         raise RecordingFailed(f'{agent} {version}: {detail}; published fixtures unchanged; staging kept at {where}') from exc
     finally:
-        stop_all()  # children first, then their directories
-        restore_handlers(previous)
-        while TEMP_DIRS:
-            shutil.rmtree(TEMP_DIRS.pop(), ignore_errors=True)
+        try:
+            stop_all()  # children first, then their directories
+        finally:
+            restore_handlers(previous)
+            while TEMP_DIRS:
+                shutil.rmtree(TEMP_DIRS.pop(), ignore_errors=True)
 
 
 def write_manifest(root: Path = HERE) -> None:
@@ -984,18 +1072,20 @@ def main() -> int:
     if unknown:
         ap.error('unknown agents: ' + ', '.join(sorted(unknown)))
     failures = []
-    for name in AGENTS:
-        if name in selected:
-            try:
-                print(f'recorded {name}: {record(name)}')
-            except (KeyboardInterrupt, Terminated) as exc:
-                print(f'interrupted while recording {name} ({type(exc).__name__}); its published fixtures are unchanged', file=sys.stderr)
-                return 130
-            except RecordingFailed as exc:
-                failures.append(str(exc))
-                print(f'NOT recorded: {exc}', file=sys.stderr)
-    write_manifest()
-    print('wrote compat-manifest.json')
+    try:
+        for name in AGENTS:
+            if name in selected:
+                try:
+                    print(f'recorded {name}: {record(name, HERE)}')
+                except (KeyboardInterrupt, Terminated) as exc:
+                    print(f'interrupted while recording {name} ({type(exc).__name__}); its published fixtures are unchanged', file=sys.stderr)
+                    return 130
+                except RecordingFailed as exc:
+                    failures.append(str(exc))
+                    print(f'NOT recorded: {exc}', file=sys.stderr)
+    finally:
+        write_manifest(HERE)  # also after an interrupt: agents published earlier in this run must be listed (M0R5-03)
+        print('wrote compat-manifest.json')
     return 1 if failures else 0
 
 
