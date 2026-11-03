@@ -1,4 +1,4 @@
 {"method": "initialize", "id": 0, "params": {"clientInfo": {"name": "hoh-recorder", "version": "0.0.0"}}}
 {"method": "initialized"}
 {"method": "thread/start", "id": 1, "params": {"approvalPolicy": "never", "sandbox": "danger-full-access"}}
-{"method": "turn/start", "id": 2, "params": {"threadId": "01a1a3a8-4f74-7c81-92a6-0224a34e4281", "input": [{"type": "text", "text": "Reply with exactly HOH_SAMPLE_OK and nothing else."}]}}
+{"method": "turn/start", "id": 2, "params": {"threadId": "01a1a3bc-98b9-7242-aeba-ef9f5841ab96", "input": [{"type": "text", "text": "Reply with exactly HOH_SAMPLE_OK and nothing else."}]}}

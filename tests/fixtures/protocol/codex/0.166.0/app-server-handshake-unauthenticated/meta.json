@@ -8,7 +8,7 @@
   ],
   "cwd": "fresh temp Git repo outside the checkout",
   "exit_code": 0,
-  "recorded_at": "2026-11-03T23:04:11.321915+00:00",
+  "recorded_at": "2026-11-03T23:26:22.722696+00:00",
   "mode": "live",
   "notes": "empty CODEX_HOME: initialize, initialized, thread/start; stdin closed after 10 s",
   "env_overrides": [
