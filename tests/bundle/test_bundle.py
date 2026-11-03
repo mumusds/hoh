@@ -69,7 +69,7 @@ class ValidatorScope(unittest.TestCase):
             root=Path(d)/'kit';shutil.copytree(ROOT,root,ignore=shutil.ignore_patterns('.git','.hoh-dev','__pycache__','target','npm'))
             (root/'web').mkdir();(root/'web/tsconfig.json').write_text('{ // comments are valid here\n}\n')
             (root/'crates/core').mkdir(parents=True);(root/'crates/core/README.md').write_text('```rust\n/// see [Foo](crate::Foo)\n```\n')
-            (root/'tests/fixtures').mkdir(parents=True);(root/'tests/fixtures/broken.json').write_text('{not json')
+            (root/'tests/fixtures').mkdir(parents=True,exist_ok=True);(root/'tests/fixtures/broken.json').write_text('{not json')
             r=validate(root);self.assertEqual(r['status'],'PASS',r['errors'])
 
 class SetupAndLedger(unittest.TestCase):

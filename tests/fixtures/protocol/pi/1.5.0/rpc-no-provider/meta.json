@@ -1,0 +1,17 @@
+{
+  "agent": "pi",
+  "cli_version": "1.5.0",
+  "case": "rpc-no-provider",
+  "argv": [
+    "pi",
+    "--mode",
+    "rpc",
+    "--session-dir",
+    "<temp>/pi-sessions"
+  ],
+  "cwd": "<temp git repo>",
+  "exit_code": 0,
+  "recorded_at": "2026-11-03T17:20:45.442845+00:00",
+  "mode": "live",
+  "notes": "get_state then prompt with no provider configured; stdin closed after 15 s"
+}

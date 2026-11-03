@@ -1,0 +1,20 @@
+{
+  "agent": "claude",
+  "cli_version": "2.1.317",
+  "case": "resume",
+  "argv": [
+    "claude",
+    "-p",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--dangerously-skip-permissions",
+    "--resume",
+    "37511cf5-39bd-480c-9e3f-130e000802d1"
+  ],
+  "cwd": "<temp git repo>",
+  "exit_code": 0,
+  "recorded_at": "2026-11-03T17:20:14.623862+00:00",
+  "mode": "live",
+  "notes": "second turn of the success session via --resume"
+}

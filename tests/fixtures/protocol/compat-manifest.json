@@ -1,0 +1,42 @@
+{
+  "schema_version": "1.0",
+  "recorded_at": "2026-11-03T17:21:32.890859+00:00",
+  "purpose": "docs/13-adapters.md compat manifest: what the fixtures were recorded against",
+  "agents": {
+    "codex": {
+      "cli_version": "0.166.0",
+      "binary_path": "/home/ai/.nvm/versions/node/v26.13.0/lib/node_modules/@openai/codex/bin/codex.js",
+      "binary_sha256": "e14fc83739c13c1074b12bd1acce4010c893c7f6fbfc1593b4a31d74cabb57af",
+      "help_argv": [
+        "codex",
+        "exec",
+        "--help"
+      ],
+      "help_sha256": "df0d864ca2076f7654288c6a1e3394e3eaa2ea8f15021df2524efdd90c70986c",
+      "app_server_schema_sha256": "7da29d127549c7fae5a9a9d2f19ecf30bbb8c6abbbdbd36e8763be5526871c89",
+      "auth": "BLOCKED_AUTH (codex login status: Not logged in)"
+    },
+    "claude": {
+      "cli_version": "2.1.317",
+      "binary_path": "/home/ai/.local/share/claude/versions/2.1.317",
+      "binary_sha256": "eb224419e344575faa4a1f39b290b649425a10cd5ee2ef1d003480cd9ae57eb0",
+      "help_argv": [
+        "claude",
+        "--help"
+      ],
+      "help_sha256": "5ca3a9dac2026e56c221fdd34380c7d7d45ebbb51c1d01b7c17c75cb076a0be8",
+      "auth": "AUTHENTICATED (live samples recorded)"
+    },
+    "pi": {
+      "cli_version": "1.5.0",
+      "binary_path": "/home/ai/.pi/agent/bin/pi",
+      "binary_sha256": "da0c6a49fe94aadc9765cc7afc6ba6b17e553eed0247d0385c160bc188f5cfbb",
+      "help_argv": [
+        "pi",
+        "--help"
+      ],
+      "help_sha256": "d905f4bf6bcd5c760344b4dfb808bcf0db37185413ef675cef69531ccfc6b818",
+      "auth": "BLOCKED_AUTH (no provider; prompt response: No API key found)"
+    }
+  }
+}

@@ -12,6 +12,18 @@ from common import ROOT, Terminated, atomic_json, execute, flag_supported, insta
 # so a delegated or already-running top-level session cannot start another commander.
 PARENT_ENV='HOH_BOOTSTRAP_PARENT'
 TOP_LEVEL_ROLES={'commander','developer'}
+# Identity/IPC variables a parent agent session sets for its own children (observed for Claude Code 2.1,
+# documented for Codex). A delegated agent must start as an independent session, so these are removed;
+# provider/auth configuration (ANTHROPIC_*, CLAUDE_CODE_USE_BEDROCK, ...) is kept.
+PARENT_SESSION_VARS=frozenset({'CLAUDECODE','CLAUDE_PID','CLAUDE_EFFORT','CLAUDE_CODE_SESSION_ID','CLAUDE_CODE_CHILD_SESSION',
+    'CLAUDE_CODE_MESSAGING_SOCKET','CLAUDE_CODE_MESSAGING_TOKEN','CLAUDE_CODE_SESSION_ATTENDED','CLAUDE_CODE_ENTRYPOINT',
+    'CLAUDE_CODE_EXECPATH','CLAUDE_CODE_HIDE_CWD','CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN','CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS',
+    'CODEX_SANDBOX','CODEX_SANDBOX_NETWORK_DISABLED'})
+
+def child_env(attempt_id:str)->dict[str,str]:
+    env={k:v for k,v in os.environ.items() if k not in PARENT_SESSION_VARS}
+    env[PARENT_ENV]=attempt_id
+    return env
 
 REQUIRED={
  'codex':['--json','--dangerously-bypass-approvals-and-sandbox'],
@@ -153,7 +165,7 @@ def main(argv=None)->int:
     print(f'Native {a.agent} invocation; logs: {out}',file=sys.stderr,flush=True)
     previous=install_termination_handlers()
     try:
-        rc,timed,dur=execute(cmd,a.cwd.resolve(),out/'stdout.jsonl',out/'stderr.log',a.timeout,data,env=os.environ|{PARENT_ENV:attempt_id})
+        rc,timed,dur=execute(cmd,a.cwd.resolve(),out/'stdout.jsonl',out/'stderr.log',a.timeout,data,env=child_env(attempt_id))
         observed=inspect_output(a.agent,out/'stdout.jsonl')
         ok=rc==0 and observed['terminal_observed'] and not observed['native_error_observed'] and observed['malformed_records']==0
         record.update(observed,exit_code=rc,timed_out=timed,duration_seconds=dur,finished_at=utcnow(),status='NATIVE_TURN_COMPLETED' if ok else 'NATIVE_FAILED',stdout_sha256=sha256(out/'stdout.jsonl'),stderr_sha256=sha256(out/'stderr.log'))

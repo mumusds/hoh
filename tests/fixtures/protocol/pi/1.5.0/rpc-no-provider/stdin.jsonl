@@ -1,0 +1,2 @@
+{"id": "s1", "type": "get_state"}
+{"id": "p1", "type": "prompt", "message": "Reply with exactly HOH_SAMPLE_OK and nothing else."}
