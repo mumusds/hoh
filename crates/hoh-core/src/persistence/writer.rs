@@ -79,7 +79,7 @@ enum Job {
 /// Test-only fault injection inside the writer.
 #[cfg(test)]
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum Fault {
+pub(super) enum Fault {
     /// Sleep before handling each request.
     Stall(std::time::Duration),
     /// Abort the process after the events of a commit are inserted, inside the open transaction.
@@ -87,7 +87,7 @@ pub(crate) enum Fault {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct Writer {
+pub(super) struct Writer {
     jobs: mpsc::Sender<Job>,
     busy_timeout: std::time::Duration,
 }
@@ -102,12 +102,12 @@ impl std::fmt::Debug for Job {
 }
 
 impl Writer {
-    pub(crate) fn spawn(conn: Connection, options: &Options) -> Result<Writer, PersistError> {
+    pub(super) fn spawn(conn: Connection, options: &Options) -> Result<Writer, PersistError> {
         Self::start(conn, options, || {}, || {})
     }
 
     #[cfg(test)]
-    pub(crate) fn spawn_with(
+    pub(super) fn spawn_with(
         conn: Connection,
         options: &Options,
         fault: Fault,
@@ -177,11 +177,11 @@ impl Writer {
         rx.await.map_err(|_| PersistError::WriterStopped)?
     }
 
-    pub(crate) async fn commit(&self, commit: Commit) -> Result<Committed, PersistError> {
+    pub(super) async fn commit(&self, commit: Commit) -> Result<Committed, PersistError> {
         self.submit(|tx| Job::Commit(commit, tx)).await
     }
 
-    pub(crate) async fn ensure_project(
+    pub(super) async fn ensure_project(
         &self,
         project_id: String,
         repo_path: String,

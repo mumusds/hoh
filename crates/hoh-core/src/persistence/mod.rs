@@ -148,7 +148,7 @@ impl std::fmt::Display for PersistError {
 impl std::error::Error for PersistError {}
 
 /// Map a SQLite error: constraint failures are integrity violations, lock timeouts are busy.
-pub(crate) fn sqlite_error(e: rusqlite::Error) -> PersistError {
+fn sqlite_error(e: rusqlite::Error) -> PersistError {
     match e.sqlite_error_code() {
         Some(rusqlite::ErrorCode::ConstraintViolation) => {
             PersistError::IntegrityViolation(e.to_string())
@@ -171,7 +171,7 @@ pub struct Pragmas {
 }
 
 /// Read a connection's settings.
-pub(crate) fn pragmas(conn: &Connection) -> Result<Pragmas, PersistError> {
+fn pragmas(conn: &Connection) -> Result<Pragmas, PersistError> {
     let text = |name: &str| conn.pragma_query_value(None, name, |r| r.get::<_, String>(0));
     let int = |name: &str| conn.pragma_query_value(None, name, |r| r.get::<_, i64>(0));
     Ok(Pragmas {
@@ -185,10 +185,7 @@ pub(crate) fn pragmas(conn: &Connection) -> Result<Pragmas, PersistError> {
 }
 
 /// Check that a connection runs with the required settings; the first mismatch is an error.
-pub(crate) fn verify_pragmas(
-    conn: &Connection,
-    busy_timeout: Duration,
-) -> Result<(), PersistError> {
+fn verify_pragmas(conn: &Connection, busy_timeout: Duration) -> Result<(), PersistError> {
     let got = pragmas(conn)?;
     let expected_busy = i64::try_from(busy_timeout.as_millis()).unwrap_or(i64::MAX);
     let checks: [(&'static str, String, String); 4] = [
@@ -238,13 +235,13 @@ fn configure(conn: &Connection, options: &Options, writer: bool) -> Result<(), P
 
 /// Schema migrations in order: `(user_version after it, SQL)`. A script sets its own `user_version`; the runner owns
 /// the transaction, so `BEGIN`/`COMMIT` statements in a script (the contract schema has them) are skipped.
-pub(crate) const MIGRATIONS: &[(i64, &str)] =
+const MIGRATIONS: &[(i64, &str)] =
     &[(1, include_str!("../../../../contracts/sql/001_initial.sql"))];
 
 /// Bring the database to the latest schema version; refuse one newer than this binary. Each migration runs in one
 /// IMMEDIATE transaction that commits only if the script ran without ending it and set `user_version` to its
 /// version (M2T01R-05, -09); any failure, COMMIT included, rolls it back (M2T01R-12).
-pub(crate) fn migrate(conn: &Connection, migrations: &[(i64, &str)]) -> Result<i64, PersistError> {
+fn migrate(conn: &Connection, migrations: &[(i64, &str)]) -> Result<i64, PersistError> {
     let latest = migrations.last().map_or(0, |m| m.0);
     let mut version = user_version(conn)?;
     if version > latest {
@@ -287,15 +284,27 @@ fn user_version(conn: &Connection) -> Result<i64, PersistError> {
         .map_err(sqlite_error)
 }
 
-/// Run a script's statements one by one inside the caller's transaction. Its own `BEGIN`, `COMMIT` and `END`
-/// (after any comments) are skipped; any other statement that ends the transaction fails the script.
+/// Run a script's statements one by one inside the caller's transaction. Transaction control is decided before
+/// anything runs (M2T01R-15): SQLite reports it as read-only, so a read-only statement runs only if its keyword is a
+/// known read (`SELECT`, `WITH`, `VALUES`, `EXPLAIN`, `PRAGMA`); the script's own `BEGIN`, `COMMIT` and `END` are
+/// skipped and any other read-only statement (`ROLLBACK`, `SAVEPOINT`, `RELEASE`, or one not recognised) fails the
+/// script unexecuted. A statement that still ends the transaction fails it afterwards.
 fn run_script(conn: &Connection, sql: &str) -> Result<(), String> {
     use rusqlite::fallible_iterator::FallibleIterator;
     let mut batch = rusqlite::Batch::new(conn, sql);
     while let Some(mut statement) = batch.next().map_err(|e| e.to_string())? {
         let text = statement.expanded_sql().unwrap_or_default();
-        if matches!(leading_keyword(&text).as_str(), "BEGIN" | "COMMIT" | "END") {
-            continue;
+        if statement.readonly() {
+            match leading_keyword(&text).as_str() {
+                "BEGIN" | "COMMIT" | "END" => continue,
+                "SELECT" | "WITH" | "VALUES" | "EXPLAIN" | "PRAGMA" => {}
+                _ => {
+                    return Err(format!(
+                        "the statement `{}` is not allowed in a migration",
+                        text.trim()
+                    ));
+                }
+            }
         }
         statement.raw_execute().map_err(|e| e.to_string())?;
         if conn.is_autocommit() {
@@ -308,11 +317,12 @@ fn run_script(conn: &Connection, sql: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The first keyword of a statement, after whitespace and `--` / `/* */` comments, upper-cased.
+/// The first keyword of a statement, after whitespace, a byte-order mark, empty statements (`;`) and `--` / `/* */`
+/// comments, upper-cased.
 fn leading_keyword(sql: &str) -> String {
     let mut rest = sql;
     loop {
-        rest = rest.trim_start();
+        rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == '\u{feff}' || c == ';');
         if let Some(after) = rest.strip_prefix("--") {
             rest = after.split_once('\n').map_or("", |(_, tail)| tail);
         } else if let Some(after) = rest.strip_prefix("/*") {
@@ -453,7 +463,7 @@ impl Reader {
     /// Run a query on the connection (tests only); writes fail because it is read-only. No SQLite type leaves the
     /// persistence module (AC-062-05): product queries are typed methods, added with their callers.
     #[cfg(test)]
-    pub(crate) fn with<T>(
+    fn with<T>(
         &self,
         f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
     ) -> Result<T, PersistError> {

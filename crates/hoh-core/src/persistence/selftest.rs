@@ -77,7 +77,7 @@ pub fn wal_self_test(dir: &Path, probe: &ProbeCommand) -> Result<(), PersistErro
 }
 
 /// The self-test with `inject` called before each step; an `Err` from it fails that step (fault injection).
-pub(crate) fn run(
+pub(super) fn run(
     dir: &Path,
     probe: &ProbeCommand,
     inject: &dyn Fn(Step) -> Result<(), String>,
@@ -310,19 +310,19 @@ pub fn probe_main() -> i32 {
 
 /// Misbehaviour of the probe process, for tests; the product runs it with the default (none).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct ChildFault {
+pub(super) struct ChildFault {
     /// Open without file locking (`nolock=1`).
-    pub(crate) nolock: bool,
+    pub(super) nolock: bool,
     /// Keep answering the first row count, as with a wal-index that is not shared.
-    pub(crate) stale_counts: bool,
+    pub(super) stale_counts: bool,
     /// Claim the write lock without taking it, as with file locks that do nothing.
-    pub(crate) fake_lock: bool,
+    pub(super) fake_lock: bool,
     /// Get past our write lock but take its own for real, as with locks seen in one direction only.
-    pub(crate) ignore_held_lock: bool,
+    pub(super) ignore_held_lock: bool,
 }
 
 /// The probe's side of the protocol.
-pub(crate) fn probe_child(
+pub(super) fn probe_child(
     db: &Path,
     input: impl BufRead,
     mut output: impl Write,
@@ -421,7 +421,7 @@ fn uri_path(path: &Path) -> String {
 
 /// The probe for tests: this test binary running only `probe_helper`, with `fault` passed in the environment.
 #[cfg(test)]
-pub(crate) fn test_probe(fault: Option<&str>) -> ProbeCommand {
+pub(super) fn test_probe(fault: Option<&str>) -> ProbeCommand {
     ProbeCommand {
         program: std::env::current_exe().unwrap_or_default(),
         args: [
