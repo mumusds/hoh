@@ -1,0 +1,244 @@
+//! The argv, verdict and headless rules of the Codex adapter.
+
+use super::*;
+
+const FIXTURES: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/protocol/codex/0.166.0"
+);
+
+fn help(name: &str) -> String {
+    std::fs::read_to_string(format!("{FIXTURES}/{name}")).expect("recorded help")
+}
+
+fn launch() -> Launch {
+    Launch {
+        program: PathBuf::from("codex"),
+        app_server_help: Some(help("help-app-server.txt")),
+        exec_help: help("help-exec.txt"),
+        exec_resume_help: None,
+        cwd: PathBuf::from("/tmp"),
+        yolo: true,
+        resume: None,
+        model: None,
+        known: BTreeSet::new(),
+    }
+}
+
+#[test]
+fn app_server_runs_on_stdio_when_the_help_offers_it() {
+    assert_eq!(
+        app_server_args(&help("help-app-server.txt")),
+        ["app-server", "--listen", "stdio://"]
+    );
+    assert_eq!(app_server_args("Usage: codex app-server\n"), ["app-server"]);
+}
+
+#[test]
+fn exec_args_come_from_the_help() {
+    let mut l = launch();
+    assert_eq!(
+        exec_args(&l).expect("argv"),
+        ["exec", "--json", YOLO_FLAG, "-"]
+    );
+    l.model = Some("gpt-x".to_owned());
+    assert_eq!(
+        exec_args(&l).expect("argv"),
+        ["exec", "--json", YOLO_FLAG, "--model", "gpt-x", "-"]
+    );
+    // The YOLO profile needs its flag; without YOLO it is not added.
+    l.exec_help = l.exec_help.replace(YOLO_FLAG, "");
+    assert!(matches!(exec_args(&l), Err(Blocked(d)) if d.contains(YOLO_FLAG)));
+    l.yolo = false;
+    assert!(!exec_args(&l).expect("argv").iter().any(|a| a == YOLO_FLAG));
+    // No --json, no exec.
+    l.exec_help = "Usage: codex exec [PROMPT]\n".to_owned();
+    assert!(exec_args(&l).is_err());
+    // A resumed exec turn needs the probed `exec resume` help.
+    let mut l = launch();
+    l.resume = Some("thread-1".to_owned());
+    assert!(exec_args(&l).is_err());
+    l.exec_resume_help = Some(l.exec_help.clone());
+    assert_eq!(
+        exec_args(&l).expect("argv"),
+        ["exec", "resume", "--json", YOLO_FLAG, "thread-1", "-"]
+    );
+}
+
+#[test]
+fn known_notifications_are_read_from_the_schema() {
+    let schema: Value = serde_json::from_str(
+        &std::fs::read_to_string(format!(
+            "{FIXTURES}/app-server-schema/ServerNotification.json"
+        ))
+        .expect("schema"),
+    )
+    .expect("json");
+    let known = known_notifications(&schema);
+    for m in [
+        "turn/completed",
+        "item/started",
+        "error",
+        "deprecationNotice",
+        "thread/goal/cleared",
+    ] {
+        assert!(known.contains(m), "{m}");
+    }
+    assert!(!known.contains("hoh/unrecorded"));
+    assert_eq!(known.len(), 85);
+}
+
+#[test]
+fn headless_answers_decline_or_refuse_never_choose() {
+    assert_eq!(
+        headless_answer("item/commandExecution/requestApproval"),
+        Ok(json!({"decision": "decline"}))
+    );
+    assert_eq!(
+        headless_answer("item/fileChange/requestApproval"),
+        Ok(json!({"decision": "decline"}))
+    );
+    assert_eq!(
+        headless_answer("execCommandApproval"),
+        Ok(json!({"decision": "denied"}))
+    );
+    assert_eq!(
+        headless_answer("applyPatchApproval"),
+        Ok(json!({"decision": "denied"}))
+    );
+    assert_eq!(
+        headless_answer("mcpServer/elicitation/request"),
+        Ok(json!({"action": "decline"}))
+    );
+    for m in [
+        "item/tool/requestUserInput",
+        "item/permissions/requestApproval",
+        "item/tool/call",
+        "account/chatgptAuthTokens/refresh",
+        "attestation/generate",
+        "something/new",
+    ] {
+        assert!(headless_answer(m).is_err(), "{m}");
+    }
+}
+
+#[test]
+fn the_turn_status_decides_and_a_cancel_wins() {
+    let failed = |why: &str| (AttemptState::Failed, Some(why.to_owned()));
+    let done = Ending {
+        status: Some("completed"),
+        ..Ending::default()
+    };
+    assert_eq!(verdict(&done), (AttemptState::Settled, None));
+    assert_eq!(
+        verdict(&Ending {
+            status: Some("interrupted"),
+            ..done
+        }),
+        (AttemptState::Cancelled, None)
+    );
+    let unauthorized = json!({"message": "x", "codexErrorInfo": "unauthorized"});
+    let busy = json!({"message": "x", "codexErrorInfo": "serverOverloaded"});
+    let limited = json!({"message": "x", "codexErrorInfo": "rateLimitExceeded"});
+    let other = json!({"message": "x", "codexErrorInfo": "contextWindowExceeded"});
+    let exec_401 = json!({"message": "unexpected status 401 Unauthorized: ..."});
+    let plain = json!({"message": "The model is not supported"});
+    for (error, why) in [
+        (&unauthorized, "BLOCKED_AUTH"),
+        (&busy, "TRANSIENT_EXTERNAL"),
+        (&limited, "TRANSIENT_EXTERNAL"),
+        (&other, "contextWindowExceeded"),
+        (&exec_401, "BLOCKED_AUTH"),
+        (&plain, "turn failed"),
+    ] {
+        assert_eq!(
+            verdict(&Ending {
+                status: Some("failed"),
+                error: Some(error),
+                ..done
+            }),
+            failed(why),
+            "{error}"
+        );
+    }
+    // exec: an earlier `error` event with 401 marks the failure as authentication.
+    assert_eq!(
+        verdict(&Ending {
+            status: Some("failed"),
+            error: Some(&plain),
+            auth_hint: true,
+            ..done
+        }),
+        failed("BLOCKED_AUTH")
+    );
+    // No turn/completed: unknown effect once a tool item had started, else a protocol failure.
+    let cut = Ending {
+        status: None,
+        ..done
+    };
+    assert_eq!(verdict(&cut), failed("PROTOCOL_INCOMPLETE"));
+    assert_eq!(
+        verdict(&Ending {
+            tool_started: true,
+            ..cut
+        }),
+        (
+            AttemptState::UnknownEffect,
+            Some("PROTOCOL_INCOMPLETE".to_owned())
+        )
+    );
+    // exec's exit code counts; the App Server's does not (stdin is closed once the turn is done).
+    let exec_done = Ending {
+        exit_matters: true,
+        exit: Some(Termination::Code(1)),
+        ..done
+    };
+    assert_eq!(verdict(&exec_done), failed("exit code 1"));
+    assert_eq!(
+        verdict(&Ending {
+            exit_matters: false,
+            ..exec_done
+        }),
+        (AttemptState::Settled, None)
+    );
+    // Order: cancel > refused frame > deadline > raw logs > protocol failure > the turn.
+    let all = Ending {
+        too_large: true,
+        deadline: true,
+        logs_incomplete: true,
+        failure: Some("thread/start: no"),
+        ..done
+    };
+    assert_eq!(
+        verdict(&Ending {
+            cancelled: true,
+            ..all
+        }),
+        (AttemptState::Cancelled, None)
+    );
+    assert_eq!(verdict(&all), failed("PROTOCOL_FRAME_TOO_LARGE"));
+    assert_eq!(
+        verdict(&Ending {
+            too_large: false,
+            ..all
+        }),
+        failed("DEADLINE_EXCEEDED")
+    );
+    assert_eq!(
+        verdict(&Ending {
+            too_large: false,
+            deadline: false,
+            ..all
+        }),
+        failed("RAW_LOG_INCOMPLETE")
+    );
+    assert_eq!(
+        verdict(&Ending {
+            too_large: false,
+            deadline: false,
+            logs_incomplete: false,
+            ..all
+        }),
+        failed("thread/start: no")
+    );
+}
