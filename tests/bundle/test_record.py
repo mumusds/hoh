@@ -51,6 +51,16 @@ class Validators(unittest.TestCase):
         early=copy.deepcopy(meta);early['sigint_after_frame_index']=len(fs)
         self.assertTrue(any('before SIGINT' in p for p in self.check('claude','sigint-cancel',fs,early)))
         self.assertTrue(self.check('claude','sigint-cancel',fs,meta|{'killed_by_recorder':True}))
+    # M1-T03: a tool-using success needs a tool_use and its tool_result as well as a successful result.
+    def test_claude_tool_success_needs_the_tool_round_trip(self):
+        fs,meta,_=load_case('claude','2.1.318','max-turns-error')
+        # The max-turns run has the tool_use and tool_result but no successful result.
+        self.assertTrue(any('result' in p for p in self.check('claude','tool-success',fs,meta|{'exit_code':0},rc=0)))
+        ok,ok_meta,_=load_case('claude','2.1.318','success')
+        self.assertTrue(any('no tool_use' in p for p in self.check('claude','tool-success',ok,ok_meta)))
+        tool_use=next(f for f in fs if f.get('type')=='assistant')
+        unanswered=[ok[0],tool_use]+ok[1:]
+        self.assertTrue(any('without its tool_result' in p for p in self.check('claude','tool-success',unanswered,ok_meta)))
     def test_codex_echoed_user_token_without_assistant_output_rejected(self):
         fs,meta,sent=load_case('codex','0.166.0','app-server-turn')
         # Drop the agent's message items; the userMessage item still echoes the prompt containing the token.

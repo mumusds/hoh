@@ -516,6 +516,21 @@ def v_claude_success(fs, rc, meta, sent, ctx):
     return out
 
 
+def v_claude_tool_success(fs, rc, meta, sent, ctx):
+    """A successful run that used a tool: each tool_use of an assistant message has its tool_result (M1-T03,
+    AC-025-01's fixture)."""
+    out = v_claude_success(fs, rc, meta, sent, ctx)
+    def content(frame):
+        c = (frame.get('message') or {}).get('content')
+        return c if isinstance(c, list) else []
+    uses = {c.get('id') for f in typed(fs, 'assistant') for c in content(f) if isinstance(c, dict) and c.get('type') == 'tool_use'}
+    results = {c.get('tool_use_id') for f in typed(fs, 'user') for c in content(f)
+               if isinstance(c, dict) and c.get('type') == 'tool_result'}
+    expect(out, bool(uses), 'no tool_use in an assistant message')
+    expect(out, uses <= results, f'tool_use without its tool_result: {sorted(map(str, uses - results))}')
+    return out
+
+
 def v_claude_resume(fs, rc, meta, sent, ctx):
     out = v_claude_success(fs, rc, meta, sent, ctx)
     ids = {f.get('session_id') for f in fs if f.get('type') in ('system', 'result')}
@@ -722,6 +737,7 @@ def v_pi_invalid_model(fs, rc, meta, sent, ctx):
 
 VALIDATORS = {
     ('claude', 'success'): v_claude_success, ('claude', 'resume'): v_claude_resume,
+    ('claude', 'tool-success'): v_claude_tool_success,
     ('claude', 'max-turns-error'): v_claude_max_turns, ('claude', 'sigint-cancel'): v_claude_sigint,
     ('codex', 'exec'): v_codex_exec, ('codex', 'exec-unauthenticated'): v_codex_exec_failed('401'),
     ('codex', 'exec-turn-failed'): v_codex_exec_failed(requested_model),
@@ -876,6 +892,9 @@ def claude(rec: Recording) -> None:
     prompt = b'Use the Bash tool to run `echo hoh` and then reply DONE.'
     out, err, rc, how = run(argv, prompt, workdir())
     rec.save('max-turns-error', argv, prompt, out, err, rc, 'tool use needs a second turn', stop=how)
+    prompt = f'Use the Bash tool to run `echo hoh`, then reply with exactly {TOKEN} and nothing else.'.encode()
+    out, err, rc, how = run(base, prompt, workdir())
+    rec.save('tool-success', base, prompt, out, err, rc, 'a tool call, then the final reply', stop=how)
     claude_cancel(rec, base)
 
 
