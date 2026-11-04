@@ -393,6 +393,11 @@ class PersistenceScan(unittest.TestCase):
         # M2T01R-64: macro names are Rust identifiers, not only ASCII ones.
         rule='macro_rules! {name} {{ (#[doc = $s:literal]) => {{ std::process::Command::new($s.trim()) }}; }}\n'
         # M2T01R-69: a raw keyword (r#while) and a name with a combining mark (e + U+0301) are macro names too.
+        # M2T01R-71: an invocation of a macro named r#macro_rules is an invocation, not a definition.
+        for call in ['r#macro_rules!(#[doc = "sqlite3"])','r#macro_rules!{ #[cfg(test)] mod helper { fn h() { let _ = "SQLite helper"; } } }']:
+            src='macro_rules! r#macro_rules { ($($t:tt)*) => { () }; }\nfn main(){ let _ = '+call+'; }'
+            res=self.run_scan({'crates/hoh-app/src/main.rs':src})[1]
+            self.assertEqual(self.kinds(res),[('crates/hoh-app/src/main.rs','sqlite-literal')],call)
         for name,call in [('run','run!(\n    /// sqlite3\n)'),('运行','运行!(#[doc = "sqlite3"])'),('r#try_it','r#try_it!(#[doc = "sqlite3"])'),
                           ('r#while','r#while!(#[doc = "sqlite3"])'),('r#while','r#while!(\n    /// sqlite3\n)'),
                           ('e\u0301','e\u0301!(#[doc = "sqlite3"])')]:
@@ -405,7 +410,8 @@ class PersistenceScan(unittest.TestCase):
         ok={'crates/hoh-app/src/main.rs':'macro_rules! documented { () => { #[doc = "Uses SQLite only through persistence."] fn f() {} }; }\n'
                                           'documented!();\nfn main(){}\n'
                                           '#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() { assert_eq!(["SQL", "ite"].concat(), "SQLite"); }\n}\n'
-                                          '#[cfg(test)]\n#[allow(dead_code)]\npub(crate) mod r#unit { fn t() { let _ = "sqlite3"; } }'}
+                                          '#[cfg(test)]\n#[allow(dead_code)]\npub(crate) mod r#unit { fn t() { let _ = "sqlite3"; } }\n'
+                                          '#[cfg(test)]\nmod e\u0301 { fn t() { assert_eq!(["SQL", "ite"].concat(), "SQLite"); } }'}
         rc,res=self.run_scan(ok)
         self.assertEqual((rc,res['hits']),(0,[]))
     def test_only_real_inline_cfg_test_modules_are_test_code(self):
