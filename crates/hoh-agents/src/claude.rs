@@ -13,7 +13,7 @@
 //! the process group with graces between.
 
 use crate::frame::Frame;
-use crate::process::{Config, Escalation, Event, Process, Signal, Termination};
+use crate::process::{Config, Escalation, Event, Process, Signal, Step, Termination};
 use hoh_core::lifecycle::AttemptState;
 use hoh_core::persistence::{AttemptFacts, AttemptMove, PersistError, Session, Store};
 use serde_json::{Value, json};
@@ -202,6 +202,8 @@ pub struct Outcome {
     /// Lines that were not JSON (each also an `adapter.diagnostic` event).
     pub diagnostics: usize,
     pub pid: Option<u32>,
+    /// The signals sent to stop the process, with their times (a cancel or the deadline).
+    pub steps: Vec<Step>,
 }
 
 /// Why a turn could not be recorded or run.
@@ -312,9 +314,22 @@ pub async fn run(
                 stderr_sha256: String::new(),
                 diagnostics: 0,
                 pid: None,
+                steps: Vec::new(),
             });
         }
     };
+    // The session row exists before the attempt names it.
+    store
+        .upsert_session(Session {
+            session_id: attempt.session_id.clone(),
+            agent: "claude".to_owned(),
+            role: attempt.role.clone(),
+            native_id: turn.launch.resume.clone(),
+            native_path: None,
+            agent_version: attempt.agent_version.clone(),
+            capabilities: argv.capabilities.clone(),
+        })
+        .await?;
     step(
         store,
         attempt,
@@ -328,17 +343,6 @@ pub async fn run(
         },
     )
     .await?;
-    store
-        .upsert_session(Session {
-            session_id: attempt.session_id.clone(),
-            agent: "claude".to_owned(),
-            role: attempt.role.clone(),
-            native_id: turn.launch.resume.clone(),
-            native_path: None,
-            agent_version: attempt.agent_version.clone(),
-            capabilities: argv.capabilities.clone(),
-        })
-        .await?;
     let mut command = Command::new(&turn.launch.program);
     command
         .args(argv.args.iter().map(OsString::from))
@@ -491,6 +495,7 @@ pub async fn run(
         stderr,
         diagnostics,
         pid: Some(pid),
+        steps: report.map(|r| r.steps).unwrap_or_default(),
     })
 }
 
