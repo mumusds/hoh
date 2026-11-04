@@ -242,7 +242,8 @@ pub(crate) const MIGRATIONS: &[(i64, &str)] =
     &[(1, include_str!("../../../../contracts/sql/001_initial.sql"))];
 
 /// Bring the database to the latest schema version; refuse one newer than this binary. Each migration runs in one
-/// IMMEDIATE transaction that commits only if the script ran and set `user_version` to its version (M2T01R-05).
+/// IMMEDIATE transaction that commits only if the script ran without ending it and set `user_version` to its
+/// version (M2T01R-05, -09); any failure, COMMIT included, rolls it back (M2T01R-12).
 pub(crate) fn migrate(conn: &Connection, migrations: &[(i64, &str)]) -> Result<i64, PersistError> {
     let latest = migrations.last().map_or(0, |m| m.0);
     let mut version = user_version(conn)?;
@@ -261,7 +262,6 @@ pub(crate) fn migrate(conn: &Connection, migrations: &[(i64, &str)]) -> Result<i
         conn.execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| failed(e.to_string()))?;
         let ran = run_script(conn, sql)
-            .map_err(|e| e.to_string())
             .and_then(|()| {
                 let after = user_version(conn).map_err(|e| e.to_string())?;
                 if after == target {
@@ -269,15 +269,13 @@ pub(crate) fn migrate(conn: &Connection, migrations: &[(i64, &str)]) -> Result<i
                 } else {
                     Err(format!("user_version is {after} afterwards"))
                 }
-            });
-        match ran {
-            Ok(()) => conn
-                .execute_batch("COMMIT")
-                .map_err(|e| failed(e.to_string()))?,
-            Err(detail) => {
+            })
+            .and_then(|()| conn.execute_batch("COMMIT").map_err(|e| e.to_string()));
+        if let Err(detail) = ran {
+            if !conn.is_autocommit() {
                 let _ = conn.execute_batch("ROLLBACK");
-                return Err(failed(detail));
             }
+            return Err(failed(detail));
         }
         version = target;
     }
@@ -289,23 +287,44 @@ fn user_version(conn: &Connection) -> Result<i64, PersistError> {
         .map_err(sqlite_error)
 }
 
-/// Run a script's statements one by one inside the caller's transaction, skipping its transaction control.
-fn run_script(conn: &Connection, sql: &str) -> rusqlite::Result<()> {
+/// Run a script's statements one by one inside the caller's transaction. Its own `BEGIN`, `COMMIT` and `END`
+/// (after any comments) are skipped; any other statement that ends the transaction fails the script.
+fn run_script(conn: &Connection, sql: &str) -> Result<(), String> {
     use rusqlite::fallible_iterator::FallibleIterator;
     let mut batch = rusqlite::Batch::new(conn, sql);
-    while let Some(mut statement) = batch.next()? {
+    while let Some(mut statement) = batch.next().map_err(|e| e.to_string())? {
         let text = statement.expanded_sql().unwrap_or_default();
-        let verb = text
-            .trim_start()
-            .split(|c: char| !c.is_ascii_alphabetic())
-            .next()
-            .unwrap_or("")
-            .to_ascii_uppercase();
-        if !matches!(verb.as_str(), "BEGIN" | "COMMIT" | "END") {
-            statement.raw_execute()?;
+        if matches!(leading_keyword(&text).as_str(), "BEGIN" | "COMMIT" | "END") {
+            continue;
+        }
+        statement.raw_execute().map_err(|e| e.to_string())?;
+        if conn.is_autocommit() {
+            return Err(format!(
+                "the statement `{}` ended the transaction",
+                text.trim()
+            ));
         }
     }
     Ok(())
+}
+
+/// The first keyword of a statement, after whitespace and `--` / `/* */` comments, upper-cased.
+fn leading_keyword(sql: &str) -> String {
+    let mut rest = sql;
+    loop {
+        rest = rest.trim_start();
+        if let Some(after) = rest.strip_prefix("--") {
+            rest = after.split_once('\n').map_or("", |(_, tail)| tail);
+        } else if let Some(after) = rest.strip_prefix("/*") {
+            rest = after.split_once("*/").map_or("", |(_, tail)| tail);
+        } else {
+            break;
+        }
+    }
+    rest.split(|c: char| !c.is_ascii_alphabetic())
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase()
 }
 
 /// An open project database: the writer actor and the means to open readers.
@@ -330,23 +349,50 @@ impl Store {
         options: Options,
         mountinfo: &str,
     ) -> Result<Store, PersistError> {
+        Self::open_inner(path, options, mountinfo, MIGRATIONS, &|| {})
+    }
+
+    /// `after_check` runs right after the location check (tests swap the path there).
+    fn open_inner(
+        path: &Path,
+        options: Options,
+        mountinfo: &str,
+        migrations: &[(i64, &str)],
+        after_check: &dyn Fn(),
+    ) -> Result<Store, PersistError> {
         // Where the database really goes: links (also a dangling one for the file) and `..` after missing
         // directories resolved, so the check, the self-test and the open all see the same place (M2T01R-01).
         let storage = |e: std::io::Error| PersistError::Storage(e.to_string());
+        let network = |path: &Path| {
+            let path = path.to_path_buf();
+            move |fstype| PersistError::OnNetworkFs { path, fstype }
+        };
         let path = location::resolve(path).map_err(storage)?;
         let dir = path.parent().unwrap_or(Path::new("/")).to_path_buf();
         let existing = location::existing_ancestor(&dir).map_err(storage)?;
-        location::check(&existing, mountinfo).map_err(|fstype| PersistError::OnNetworkFs {
-            path: existing.clone(),
-            fstype,
-        })?;
+        location::check(&existing, mountinfo).map_err(network(&existing))?;
         std::fs::create_dir_all(&dir).map_err(storage)?;
+        after_check();
+        // The resolved path has no links. If one appeared since (M2T01R-08), the directory no longer resolves to
+        // itself, and every open below uses SQLITE_OPEN_NOFOLLOW, which refuses a link anywhere in the path before
+        // creating anything. Moving a real directory from another file system into place is impossible (rename
+        // does not cross file systems); a mount over it needs root. The device of the directory and of the
+        // database file are also checked against the mount table.
+        if location::resolve(&dir).map_err(storage)? != dir {
+            return Err(PersistError::Storage(format!(
+                "{} changed while it was being checked",
+                dir.display()
+            )));
+        }
+        location::check_device(&dir, mountinfo).map_err(network(&dir))?;
         let probe = match &options.wal_probe {
             Some(probe) => probe.clone(),
             None => selftest::ProbeCommand::current_exe().map_err(storage)?,
         };
         selftest::wal_self_test(&dir, &probe)?;
-        Self::open_checked(&path, options, MIGRATIONS)
+        let store = Self::open_checked(&path, options, migrations)?;
+        location::check_device(&path, mountinfo).map_err(network(&path))?;
+        Ok(store)
     }
 
     fn open_checked(
@@ -354,7 +400,8 @@ impl Store {
         options: Options,
         migrations: &[(i64, &str)],
     ) -> Result<Store, PersistError> {
-        let conn = Connection::open(path).map_err(sqlite_error)?;
+        let flags = OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        let conn = Connection::open_with_flags(path, flags).map_err(sqlite_error)?;
         configure(&conn, &options, true)?;
         migrate(&conn, migrations)?;
         let writer = writer::Writer::spawn(conn, &options)?;
@@ -383,7 +430,9 @@ impl Store {
 
     /// A new read-only connection with verified settings.
     pub fn reader(&self) -> Result<Reader, PersistError> {
-        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW;
         let conn = Connection::open_with_flags(&self.path, flags).map_err(sqlite_error)?;
         configure(&conn, &self.options, false)?;
         Ok(Reader { conn })

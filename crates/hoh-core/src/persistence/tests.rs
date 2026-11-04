@@ -190,6 +190,29 @@ async fn a_failing_migration_is_rolled_back() -> R {
         (1, 0),
         "the failed migration left schema changes"
     );
+    // Comments before the script's transaction control do not let it commit early (M2T01R-09).
+    for script in [
+        "-- leading comment\nBEGIN; CREATE TABLE extra(x); -- before commit\nCOMMIT;",
+        "/* block */ BEGIN TRANSACTION; CREATE TABLE extra(x); /* before end */ END;",
+    ] {
+        match Store::open_checked(&path, test_options(), &[MIGRATIONS[0], (2, script)]) {
+            Err(PersistError::Migration { version: 2, .. }) => {}
+            other => return Err(format!("{script}: {other:?}").into()),
+        }
+        assert_eq!(schema(&path)?, (1, 0), "{script} left schema changes");
+    }
+    // A statement that ends the runner's transaction fails the migration.
+    match Store::open_checked(
+        &path,
+        test_options(),
+        &[MIGRATIONS[0], (2, "CREATE TABLE extra(x); ROLLBACK;")],
+    ) {
+        Err(PersistError::Migration { version: 2, detail }) => {
+            assert!(detail.contains("ended the transaction"), "{detail}")
+        }
+        other => return Err(format!("{other:?}").into()),
+    }
+    assert_eq!(schema(&path)?, (1, 0));
     // Once fixed, the same migration applies.
     let fixed = [
         MIGRATIONS[0],
@@ -200,6 +223,42 @@ async fn a_failing_migration_is_rolled_back() -> R {
     ];
     drop(Store::open_checked(&path, test_options(), &fixed)?);
     assert_eq!(schema(&path)?, (2, 1));
+    Ok(())
+}
+
+#[test]
+fn migration_scripts_keep_trigger_bodies_and_roll_back_a_failed_commit() -> R {
+    let dir = tempfile::tempdir()?;
+    let conn = Connection::open(dir.path().join("m.db"))?;
+    conn.pragma_update(None, "foreign_keys", true)?;
+    // A trigger's BEGIN ... END body is part of its CREATE statement, not transaction control.
+    let trigger = "BEGIN; CREATE TABLE a(x); CREATE TABLE log(x); \
+                   CREATE TRIGGER t AFTER INSERT ON a BEGIN INSERT INTO log VALUES (new.x); END; \
+                   PRAGMA user_version = 1; COMMIT;";
+    assert_eq!(migrate(&conn, &[(1, trigger)])?, 1);
+    conn.execute("INSERT INTO a VALUES (7)", [])?;
+    let logged: i64 = conn.query_row("SELECT x FROM log", [], |r| r.get(0))?;
+    assert_eq!(logged, 7);
+    // COMMIT itself fails on a deferred foreign key: the migration is rolled back and the connection is usable
+    // (M2T01R-12).
+    let deferred = "CREATE TABLE p(id INTEGER PRIMARY KEY); \
+                    CREATE TABLE c(pid INTEGER REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED); \
+                    INSERT INTO c VALUES (1); PRAGMA user_version = 2;";
+    match migrate(&conn, &[(1, trigger), (2, deferred)]) {
+        Err(PersistError::Migration { version: 2, .. }) => {}
+        other => return Err(format!("{other:?}").into()),
+    }
+    assert!(
+        conn.is_autocommit(),
+        "the failed migration left its transaction open"
+    );
+    let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    let tables: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE name IN ('p', 'c')",
+        [],
+        |r| r.get(0),
+    )?;
+    assert_eq!((version, tables), (1, 0));
     Ok(())
 }
 
@@ -569,6 +628,48 @@ fn links_and_parent_components_are_resolved_before_the_location_check() -> R {
         Store::open_with_mountinfo(&root.join("local/state.db"), test_options(), &mountinfo)?;
     assert_eq!(store.path(), root.join("elsewhere/state.db"));
     assert!(root.join("elsewhere/state.db").exists());
+    Ok(())
+}
+
+#[test]
+fn a_path_swapped_after_the_check_is_refused() -> R {
+    // M2T01R-08: between the location check and the open, the checked file or its directory is replaced by a link to
+    // a network mount. Nothing may be opened or created there.
+    for swap in ["file", "directory"] {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().canonicalize()?;
+        std::fs::create_dir_all(root.join("local"))?;
+        std::fs::create_dir_all(root.join("network"))?;
+        let mountinfo = format!(
+            "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n2 1 0:50 / {} rw,relatime - nfs4 server:/export rw\n",
+            root.join("network").display()
+        );
+        let swap_in = || {
+            let replaced = match swap {
+                "file" => std::os::unix::fs::symlink(
+                    root.join("network/state.db"),
+                    root.join("local/state.db"),
+                ),
+                _ => std::fs::rename(root.join("local"), root.join("moved")).and_then(|()| {
+                    std::os::unix::fs::symlink(root.join("network"), root.join("local"))
+                }),
+            };
+            assert!(replaced.is_ok(), "{swap}: {replaced:?}");
+        };
+        let opened = Store::open_inner(
+            &root.join("local/state.db"),
+            test_options(),
+            &mountinfo,
+            MIGRATIONS,
+            &swap_in,
+        );
+        assert!(opened.is_err(), "{swap}: the swapped path was opened");
+        let created: Vec<_> = std::fs::read_dir(root.join("network"))?.collect();
+        assert!(
+            created.is_empty(),
+            "{swap}: files were created on the network mount: {created:?}"
+        );
+    }
     Ok(())
 }
 

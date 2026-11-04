@@ -31,6 +31,8 @@ pub const NETWORK_FS: &[&str] = &[
 /// One mount from mountinfo.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mount {
+    /// `major:minor` of the mounted device.
+    pub device: (u64, u64),
     pub mount_point: PathBuf,
     pub fstype: String,
 }
@@ -41,10 +43,13 @@ pub fn parse_mountinfo(text: &str) -> Vec<Mount> {
     text.lines()
         .filter_map(|line| {
             let fields: Vec<&str> = line.split(' ').collect();
+            let (major, minor) = fields.get(2)?.split_once(':')?;
+            let device = (major.parse().ok()?, minor.parse().ok()?);
             let mount_point = fields.get(4)?;
             let separator = fields.iter().skip(6).position(|f| *f == "-")? + 6;
             let fstype = fields.get(separator + 1)?;
             Some(Mount {
+                device,
                 mount_point: PathBuf::from(unescape(mount_point)),
                 fstype: (*fstype).to_owned(),
             })
@@ -166,6 +171,32 @@ pub fn check(path: &Path, mountinfo: &str) -> Result<Option<String>, String> {
     }
 }
 
+/// `major:minor` of a Linux `st_dev` (glibc's encoding).
+pub fn device_numbers(dev: u64) -> (u64, u64) {
+    let major = ((dev >> 32) & 0xffff_f000) | ((dev >> 8) & 0x0000_0fff);
+    let minor = ((dev >> 12) & 0xffff_ff00) | (dev & 0x0000_00ff);
+    (major, minor)
+}
+
+/// Whether the file system holding `path` (an existing file or directory) is a network one, by its device: `Err`
+/// with the type if a mount of that device is. No mount with the device (as for btrfs subvolumes) is not an error;
+/// the path check has already run.
+pub fn check_device(path: &Path, mountinfo: &str) -> Result<Option<String>, String> {
+    use std::os::unix::fs::MetadataExt;
+    let device = std::fs::metadata(path)
+        .map(|m| device_numbers(m.dev()))
+        .map_err(|e| format!("cannot stat {}: {e}", path.display()))?;
+    let mounts = parse_mountinfo(mountinfo);
+    let on_device: Vec<&Mount> = mounts.iter().filter(|m| m.device == device).collect();
+    if let Some(m) = on_device
+        .iter()
+        .find(|m| NETWORK_FS.contains(&m.fstype.as_str()))
+    {
+        return Err(m.fstype.clone());
+    }
+    Ok(on_device.first().map(|m| m.fstype.clone()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,6 +241,7 @@ mod tests {
         assert_eq!(
             parse_mountinfo(text),
             vec![Mount {
+                device: (0, 1),
                 mount_point: PathBuf::from("/ok"),
                 fstype: "ext4".to_owned()
             }]
@@ -231,6 +263,37 @@ mod tests {
             root.parent().unwrap_or(&root).join("z")
         );
         assert!(resolve(&root.join("loop/x")).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn devices_are_matched_against_the_mount_table() -> std::io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(device_numbers((8 << 8) | 1), (8, 1));
+        // glibc's makedev, with numbers wide enough to use the high bits of both halves.
+        let makedev = |major: u64, minor: u64| {
+            ((major & 0xffff_f000) << 32)
+                | ((major & 0xfff) << 8)
+                | ((minor & 0xffff_ff00) << 12)
+                | (minor & 0xff)
+        };
+        assert_eq!(
+            device_numbers(makedev(0x1234, 0x5_6789)),
+            (0x1234, 0x5_6789)
+        );
+        let dir = tempfile::tempdir()?;
+        let (major, minor) = device_numbers(std::fs::metadata(dir.path())?.dev());
+        let as_nfs = format!("1 0 {major}:{minor} / /elsewhere rw - nfs4 server:/x rw\n");
+        assert_eq!(check_device(dir.path(), &as_nfs), Err("nfs4".to_owned()));
+        let as_ext4 = format!("1 0 {major}:{minor} / /elsewhere rw - ext4 /dev/x rw\n");
+        assert_eq!(
+            check_device(dir.path(), &as_ext4),
+            Ok(Some("ext4".to_owned()))
+        );
+        assert_eq!(
+            check_device(dir.path(), "1 0 250:250 / / rw - ext4 /dev/y rw\n"),
+            Ok(None)
+        );
         Ok(())
     }
 

@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
 """AC-062-05: SQL writes and SQLite access only in the Persistence module (crates/hoh-core/src/persistence/).
 
-The guarantee rests on what the compiler enforces, checked here (M2T01R-03/-04/-06):
+Product sources are every workspace member's src/**/*.rs and build script (tests, benches and examples are not
+product code). The checks (M2T01R-03/-04/-06/-07):
 1. Dependencies, by package identity from `cargo metadata` (renamed packages and workspace inheritance resolved):
    no workspace member but hoh-core reaches a SQLite package (any package whose name contains "sqlite", such as
-   rusqlite and libsqlite3-sys) through normal or build dependencies, other than through hoh-core itself.
-   Dev-dependencies (test code) are allowed and listed.
-2. Inside hoh-core, the crate names under which hoh-core sees SQLite packages (e.g. `rusqlite`, or an alias) occur
-   only in persistence/ (code only: comments and string literals do not count).
-3. No public item of persistence/ (plain `pub`, not `pub(crate)`/`pub(super)`/`pub(in ..)`) mentions a SQLite crate
+   rusqlite and libsqlite3-sys) through normal or build dependencies, other than through hoh-core itself; hoh-core
+   has it only as a normal dependency (so its build script cannot use it). Dev-dependencies (test code) are allowed
+   and listed.
+2. SQLite names: the crate names under which hoh-core sees SQLite packages, closed over the aliases hoh-core's
+   sources define for them (`extern crate X as Y`, `use ... as Y` in a use naming one, `type Y = ...` naming one).
+   They occur only in persistence/ — in code (comments and string literals do not count) in any product source,
+   and also in string literals of proc-macro crates (which can emit code).
+3. No public item of persistence/ (plain `pub`, not `pub(crate)`/`pub(super)`/`pub(in ..)`) mentions a SQLite name
    or a connection type, so no other code can obtain a SQLite connection.
 4. Defence in depth: string literals outside persistence/ that hold a SQL write statement (INSERT/REPLACE INTO,
    UPDATE ... SET, DELETE FROM, UPSERT, ON CONFLICT ... DO UPDATE), decoded as Rust does (escapes, line
    continuations), with literals separated only by commas joined (concat!), are hits.
-5. web/ (when present): no SQLite package in package.json or lockfile dependencies (by name or npm: alias spec), and
-   no import of one.
+5. web/ (when present): no SQLite package in package.json dependencies (by name or npm: alias spec), nowhere in a
+   lockfile (every key and string value is looked at: package paths, names, nested dependencies), and no import of
+   one.
+This is a check of source text against ordinary and accidental violations; identifiers assembled at compile time
+(e.g. from strings in a build script or by `include!` of non-Rust files) are beyond it and left to review.
 Scanning no file at all fails (no empty scan). Prints a JSON summary; with --out appends one test-results.jsonl
 line for TEST-062-05. --metadata reads `cargo metadata` JSON from a file (tests).
 """
@@ -174,6 +181,9 @@ def dependency_checks(metadata: dict, hits: list) -> tuple[set[str], list[dict]]
         for dep, _ in edges(core, False):
             if sqlite_package(packages[dep['pkg']]['name']):
                 core_names.add(dep['name'])
+                if any(k['kind'] == 'build' for k in dep['dep_kinds']):
+                    hits.append({'path': packages[core]['manifest_path'], 'kind': 'build-dependency',
+                                 'match': f"{CORE} build -> {packages[dep['pkg']]['name']}"})
     for member in members:
         if member in core_ids:
             continue
@@ -197,21 +207,67 @@ def dependency_checks(metadata: dict, hits: list) -> tuple[set[str], list[dict]]
     return core_names, dev_uses
 
 
+def product_files(root: Path, metadata: dict) -> tuple[list[Path], set[Path]]:
+    """(every product source, the files of proc-macro crates)."""
+    files = set(root.glob('crates/*/src/**/*.rs')) | set(root.glob('crates/*/build.rs'))
+    macro_dirs = []
+    for package in metadata.get('packages', []):
+        for target in package.get('targets') or []:
+            src = Path(target.get('src_path', ''))
+            kinds = set(target.get('kind') or [])
+            if 'custom-build' in kinds and src.is_file() and src.resolve().is_relative_to(root.resolve()):
+                files.add(src)
+            if 'proc-macro' in kinds:
+                macro_dirs.append(src.parent.resolve())
+    macro_files = {f for f in files if any(f.resolve().is_relative_to(d) for d in macro_dirs)}
+    return sorted(files), macro_files
+
+
+def alias_closure(names: set[str], sources: list[str]) -> set[str]:
+    """`names` plus every alias the sources define for one of them."""
+    names = set(names)
+    while True:
+        token = re.compile(r'\b(?:' + '|'.join(map(re.escape, sorted(names))) + r')\b')
+        found = set()
+        for code in sources:
+            for m in re.finditer(r'\bextern\s+crate\s+(\w+)\s+as\s+(\w+)', code):
+                if m.group(1) in names:
+                    found.add(m.group(2))
+            for m in re.finditer(r'\buse\s+([^;]*);', code):
+                if token.search(m.group(1)):
+                    found.update(re.findall(r'\bas\s+(\w+)', m.group(1)))
+            for m in re.finditer(r'\btype\s+(\w+)\b[^=;]*=\s*([^;]*);', code):
+                if token.search(m.group(2)):
+                    found.add(m.group(1))
+        found.discard('_')
+        if found <= names:
+            return names
+        names |= found
+
+
 def scan(root: Path, metadata: dict) -> dict:
-    hits, files = [], 0
+    hits, scanned = [], 0
     core_names, dev_uses = dependency_checks(metadata, hits)
-    names = re.compile(r'\b(?:' + '|'.join(map(re.escape, sorted(core_names))) + r')\b') if core_names else None
-    for path in sorted(root.glob('crates/*/src/**/*.rs')):
+    files, macro_files = product_files(root, metadata)
+    parsed = {path: split_rust(path.read_text(encoding='utf-8', errors='replace')) for path in files}
+    core_sources = [code for path, (code, _) in parsed.items() if path.relative_to(root).as_posix().startswith('crates/hoh-core/')]
+    names = alias_closure(core_names, core_sources) if core_names else set()
+    token = re.compile(r'\b(?:' + '|'.join(map(re.escape, sorted(names))) + r')\b') if names else None
+    for path in files:
         rel = path.relative_to(root).as_posix()
-        files += 1
-        code, literals = split_rust(path.read_text(encoding='utf-8', errors='replace'))
+        scanned += 1
+        code, literals = parsed[path]
         if rel.startswith(PERSISTENCE):
             for sig in public_items(code):
-                if (names and names.search(sig)) or CONNECTION_TYPES.search(sig):
+                if (token and token.search(sig)) or CONNECTION_TYPES.search(sig):
                     hits.append({'path': rel, 'kind': 'public-api', 'match': sig[:200]})
             continue
-        if rel.startswith('crates/hoh-core/') and names and (m := names.search(code)):
-            hits.append({'path': rel, 'kind': 'sqlite-crate', 'match': m.group(0)})
+        if token and (m := token.search(code)):
+            hits.append({'path': rel, 'kind': 'sqlite-name', 'match': m.group(0)})
+        if token and path in macro_files:
+            for _, _, value in literals:
+                if m := token.search(value):
+                    hits.append({'path': rel, 'kind': 'sqlite-name-in-macro', 'match': m.group(0)})
         for value in literal_strings(code, literals):
             if m := SQL_WRITE.search(value):
                 hits.append({'path': rel, 'kind': 'sql', 'match': ' '.join(m.group(0).split())})
@@ -222,25 +278,39 @@ def scan(root: Path, metadata: dict) -> dict:
             rel = path.relative_to(root).as_posix()
             web_files += 1
             text = path.read_text(encoding='utf-8', errors='replace')
-            if path.name in ('package.json', 'package-lock.json', 'npm-shrinkwrap.json'):
+            if path.name == 'package.json' or path.name in LOCKFILES:
                 try:
                     data = json.loads(text)
                 except ValueError:
                     hits.append({'path': rel, 'kind': 'web-manifest', 'match': 'not JSON'})
                     continue
-                specs = {}
-                for section in ('dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'):
-                    specs.update(data.get(section) or {})
-                specs.update({key: '' for key in (data.get('packages') or {})})
-                for dep, spec in specs.items():
-                    if sqlite_package(dep) or (isinstance(spec, str) and sqlite_package(spec)) or dep.endswith('sql.js'):
-                        hits.append({'path': rel, 'kind': 'web-dependency', 'match': f'{dep} {spec}'.strip()})
+                if path.name in LOCKFILES:
+                    found = [s for s in json_strings(data) if sqlite_package(s) or s.endswith('sql.js')]
+                else:
+                    specs = {}
+                    for section in ('dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'):
+                        specs.update(data.get(section) or {})
+                    found = [f'{d} {s}'.strip() for d, s in specs.items()
+                             if sqlite_package(d) or (isinstance(s, str) and sqlite_package(s)) or d.endswith('sql.js')]
+                hits.extend({'path': rel, 'kind': 'web-dependency', 'match': s[:200]} for s in found)
             elif re.search(r'''(?:\bfrom|\bimport|require\()\s*\(?\s*['"][^'"]*sqlite''', text, re.IGNORECASE):
                 hits.append({'path': rel, 'kind': 'web-import', 'match': 'sqlite'})
-    files += web_files
-    return {'files_scanned': files, 'web_files_scanned': web_files, 'web_present': web.is_dir(),
-            'core_sqlite_crate_names': sorted(core_names), 'dev_dependency_uses': dev_uses, 'hits': hits,
-            'status': 'PASS' if files > 0 and not hits else 'FAIL'}
+    scanned += web_files
+    return {'files_scanned': scanned, 'web_files_scanned': web_files, 'web_present': web.is_dir(),
+            'sqlite_names': sorted(names), 'dev_dependency_uses': dev_uses, 'hits': hits,
+            'status': 'PASS' if scanned > 0 and not hits else 'FAIL'}
+
+
+LOCKFILES = ('package-lock.json', 'npm-shrinkwrap.json')
+
+
+def json_strings(value) -> list[str]:
+    """Every key and string value in a JSON document."""
+    if isinstance(value, dict):
+        return [s for k, v in value.items() for s in [k, *json_strings(v)]]
+    if isinstance(value, list):
+        return [s for v in value for s in json_strings(v)]
+    return [value] if isinstance(value, str) else []
 
 
 def main(argv: list[str] | None = None) -> int:
