@@ -21,8 +21,10 @@ Every child, including version/help/schema/auth probes, runs in its own transien
 in that cgroup whatever it does (fork, setsid, closed stdio, non-dumpable), `cgroup.kill` kills all of
 them at once and `cgroup.events` reports when none is left. Children are stopped with bounded
 escalation: close stdin, SIGTERM to the process group, then kill the scope. Descendants still in the
-scope after the CLI exited get 5 s to end by themselves (`meta.json` `descendants_lingered`); the rest
-are killed and the case is invalid (`descendants_killed`), as is one whose process needed SIGKILL.
+scope after the CLI exited get 5 s to end by themselves (`meta.json` `descendants_lingered`); those the
+kernel still lists as members when that period ends outlived it (`descendants_outlived`): they are
+killed and the case is invalid, as is one whose process needed SIGKILL. The verdict is that single
+observation; the recorder never claims which process it killed.
 Children get default SIGINT/SIGTERM/SIGHUP dispositions even when the recorder runs with SIGINT ignored.
 SIGINT/SIGTERM/SIGHUP at any point of a run stop every child before the temporary directories are
 removed (directories of a child that could not be confirmed gone are kept), and the manifest is still
