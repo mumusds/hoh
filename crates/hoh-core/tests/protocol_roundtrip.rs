@@ -8,7 +8,7 @@
 use hoh_core::protocol::{
     self, AllVariants, BlockedReason, Candidate, CommandKind, ContextHandoff, DecisionPayload,
     ErrorCode, Event, HandoffKind, InputKind, Message, MessageKind, Mode, PlanProposal,
-    RejectionReason, RunState, SpecDecision, TaskResult, TaskState, TaskStatus,
+    RejectionReason, RunResult, RunState, SpecDecision, TaskResult, TaskState, TaskStatus,
 };
 use hoh_core::protocol::{ArtifactRef, Command};
 use hoh_core::schema;
@@ -61,6 +61,7 @@ fn every_corpus_document_round_trips_or_is_rejected() -> R {
             "PlanProposal" => check::<PlanProposal>(case)?,
             "ArtifactRef" => check::<ArtifactRef>(case)?,
             "Candidate" => check::<Candidate>(case)?,
+            "RunResult" => check::<RunResult>(case)?,
             _ => continue,
         };
         seen += 1;
@@ -137,6 +138,48 @@ fn same<T: AllVariants + Serialize>(pointer: &str) -> R {
         schema_enum(pointer)?,
         "enum at {pointer}"
     );
+    Ok(())
+}
+
+#[test]
+fn a_run_result_is_a_run_state_that_ends_the_client() -> R {
+    // CR-005: RunResult states are run states, exactly those with an exit code in REQ-004's table, each paired with
+    // its code.
+    let states = schema_enum("/$defs/RunResult/properties/state/enum")?;
+    let all = rust_values::<RunState>()?;
+    assert!(states.iter().all(|s| all.contains(s)), "{states:?}");
+    assert_eq!(
+        states,
+        [
+            "COMPLETED",
+            "FAILED",
+            "BLOCKED",
+            "INCOMPLETE",
+            "CANCELLED",
+            "PAUSED"
+        ]
+    );
+    let doc = schema::protocol().document();
+    let pairs: Vec<(String, i64)> = doc
+        .pointer("/$defs/RunResult/allOf")
+        .and_then(Value::as_array)
+        .ok_or("no allOf")?
+        .iter()
+        .filter_map(|rule| {
+            let state = rule.pointer("/if/properties/state/const")?.as_str()?;
+            let code = rule.pointer("/then/properties/exit_code/const")?.as_i64()?;
+            Some((state.to_owned(), code))
+        })
+        .collect();
+    let expected = [
+        ("COMPLETED", 0),
+        ("FAILED", 1),
+        ("BLOCKED", 3),
+        ("INCOMPLETE", 4),
+        ("CANCELLED", 5),
+        ("PAUSED", 6),
+    ];
+    assert_eq!(pairs, expected.map(|(s, c)| (s.to_owned(), c)));
     Ok(())
 }
 

@@ -2275,6 +2275,395 @@
      }
     }
    }
+  },
+  {
+   "schema": "protocol",
+   "def": "RunResult",
+   "valid": true,
+   "note": "json result of an INCOMPLETE run (CR-005)",
+   "instance": {
+    "run_id": "r1",
+    "state": "INCOMPLETE",
+    "exit_code": 4,
+    "blocked_reason": null,
+    "spec_revision": 2,
+    "accepted": 18,
+    "total": 25,
+    "last_event_seq": 41
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "RunResult",
+   "valid": true,
+   "note": "json result of a run blocked before any specification exists",
+   "instance": {
+    "run_id": "r1",
+    "state": "BLOCKED",
+    "exit_code": 3,
+    "blocked_reason": "NEED_DECISION",
+    "spec_revision": null,
+    "accepted": 0,
+    "total": 0,
+    "last_event_seq": 41
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "RunResult",
+   "valid": false,
+   "note": "run result without last_event_seq",
+   "instance": {
+    "run_id": "r1",
+    "state": "INCOMPLETE",
+    "exit_code": 4,
+    "blocked_reason": null,
+    "spec_revision": 2,
+    "accepted": 18,
+    "total": 25
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "RunResult",
+   "valid": false,
+   "note": "run result with an unknown field",
+   "instance": {
+    "run_id": "r1",
+    "state": "INCOMPLETE",
+    "exit_code": 4,
+    "blocked_reason": null,
+    "spec_revision": 2,
+    "accepted": 18,
+    "total": 25,
+    "last_event_seq": 41,
+    "extra": 1
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "RunResult",
+   "valid": false,
+   "note": "exit code beyond 255",
+   "instance": {
+    "run_id": "r1",
+    "state": "INCOMPLETE",
+    "exit_code": 256,
+    "blocked_reason": null,
+    "spec_revision": 2,
+    "accepted": 18,
+    "total": 25,
+    "last_event_seq": 41
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "RunResult",
+   "valid": false,
+   "note": "unknown run state",
+   "instance": {
+    "run_id": "r1",
+    "state": "DONE",
+    "exit_code": 4,
+    "blocked_reason": null,
+    "spec_revision": 2,
+    "accepted": 18,
+    "total": 25,
+    "last_event_seq": 41
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "RunResult",
+   "valid": false,
+   "note": "blocked reason in lower case",
+   "instance": {
+    "run_id": "r1",
+    "state": "BLOCKED",
+    "exit_code": 3,
+    "blocked_reason": "need_decision",
+    "spec_revision": null,
+    "accepted": 0,
+    "total": 0,
+    "last_event_seq": 41
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "RunResult",
+   "valid": false,
+   "note": "specification revisions start at 1",
+   "instance": {
+    "run_id": "r1",
+    "state": "INCOMPLETE",
+    "exit_code": 4,
+    "blocked_reason": null,
+    "spec_revision": 0,
+    "accepted": 18,
+    "total": 25,
+    "last_event_seq": 41
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "RunResultEvent",
+   "valid": true,
+   "note": "last stream-json line: run.result carrying the run result",
+   "instance": {
+    "schema_version": "1.0",
+    "project_id": "p1",
+    "seq": 42,
+    "event_id": "e42",
+    "run_id": "r1",
+    "attempt_id": null,
+    "at": "2026-11-04T01:02:03Z",
+    "kind": "run.result",
+    "payload": {
+     "run_id": "r1",
+     "state": "INCOMPLETE",
+     "exit_code": 4,
+     "blocked_reason": null,
+     "spec_revision": 2,
+     "accepted": 18,
+     "total": 25,
+     "last_event_seq": 41
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "RunResultEvent",
+   "valid": false,
+   "note": "a run result line must be of kind run.result",
+   "instance": {
+    "schema_version": "1.0",
+    "project_id": "p1",
+    "seq": 42,
+    "event_id": "e42",
+    "run_id": "r1",
+    "attempt_id": null,
+    "at": "2026-11-04T01:02:03Z",
+    "kind": "run.state_changed",
+    "payload": {
+     "run_id": "r1",
+     "state": "INCOMPLETE",
+     "exit_code": 4,
+     "blocked_reason": null,
+     "spec_revision": 2,
+     "accepted": 18,
+     "total": 25,
+     "last_event_seq": 41
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "RunResultEvent",
+   "valid": false,
+   "note": "run.result payload must be a complete run result",
+   "instance": {
+    "schema_version": "1.0",
+    "project_id": "p1",
+    "seq": 42,
+    "event_id": "e42",
+    "run_id": "r1",
+    "attempt_id": null,
+    "at": "2026-11-04T01:02:03Z",
+    "kind": "run.result",
+    "payload": {
+     "state": "INCOMPLETE",
+     "exit_code": 4
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "RunResultEvent",
+   "valid": false,
+   "note": "run.result is still an Event (seq required)",
+   "instance": {
+    "schema_version": "1.0",
+    "project_id": "p1",
+    "event_id": "e42",
+    "run_id": "r1",
+    "attempt_id": null,
+    "at": "2026-11-04T01:02:03Z",
+    "kind": "run.result",
+    "payload": {
+     "run_id": "r1",
+     "state": "INCOMPLETE",
+     "exit_code": 4,
+     "blocked_reason": null,
+     "spec_revision": 2,
+     "accepted": 18,
+     "total": 25,
+     "last_event_seq": 41
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "RunResult",
+   "valid": false,
+   "note": "INCOMPLETE must exit 4, not 0 (REQ-004 table)",
+   "instance": {
+    "run_id": "r1",
+    "state": "INCOMPLETE",
+    "exit_code": 0,
+    "blocked_reason": null,
+    "spec_revision": 2,
+    "accepted": 18,
+    "total": 25,
+    "last_event_seq": 41
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "RunResult",
+   "valid": false,
+   "note": "2 is no exit code of the table",
+   "instance": {
+    "run_id": "r1",
+    "state": "INCOMPLETE",
+    "exit_code": 2,
+    "blocked_reason": null,
+    "spec_revision": 2,
+    "accepted": 18,
+    "total": 25,
+    "last_event_seq": 41
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "RunResult",
+   "valid": false,
+   "note": "a client that detached on SIGINT writes no run result (stderr notice only)",
+   "instance": {
+    "run_id": "r1",
+    "state": "RUNNING",
+    "exit_code": 130,
+    "blocked_reason": null,
+    "spec_revision": 2,
+    "accepted": 18,
+    "total": 25,
+    "last_event_seq": 41
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "RunResult",
+   "valid": false,
+   "note": "a run still running cannot end the client with 0",
+   "instance": {
+    "run_id": "r1",
+    "state": "RUNNING",
+    "exit_code": 0,
+    "blocked_reason": null,
+    "spec_revision": 2,
+    "accepted": 18,
+    "total": 25,
+    "last_event_seq": 41
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "RunResult",
+   "valid": false,
+   "note": "host unavailable: no run result, json stdout stays empty",
+   "instance": {
+    "run_id": "r1",
+    "state": "WAITING_EXTERNAL",
+    "exit_code": 69,
+    "blocked_reason": null,
+    "spec_revision": 2,
+    "accepted": 18,
+    "total": 25,
+    "last_event_seq": 41
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "RunResult",
+   "valid": false,
+   "note": "a BLOCKED result names its blocked reason",
+   "instance": {
+    "run_id": "r1",
+    "state": "BLOCKED",
+    "exit_code": 3,
+    "blocked_reason": null,
+    "spec_revision": 2,
+    "accepted": 18,
+    "total": 25,
+    "last_event_seq": 41
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "RunResult",
+   "valid": false,
+   "note": "only a BLOCKED result has a blocked reason",
+   "instance": {
+    "run_id": "r1",
+    "state": "INCOMPLETE",
+    "exit_code": 4,
+    "blocked_reason": "NEED_DECISION",
+    "spec_revision": 2,
+    "accepted": 18,
+    "total": 25,
+    "last_event_seq": 41
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "RunResultEvent",
+   "valid": false,
+   "note": "run.result is the persisted final event: never a running run",
+   "instance": {
+    "schema_version": "1.0",
+    "project_id": "p1",
+    "seq": 42,
+    "event_id": "e42",
+    "run_id": "r1",
+    "attempt_id": null,
+    "at": "2026-11-04T01:02:03Z",
+    "kind": "run.result",
+    "payload": {
+     "run_id": "r1",
+     "state": "RUNNING",
+     "exit_code": 130,
+     "blocked_reason": null,
+     "spec_revision": 2,
+     "accepted": 18,
+     "total": 25,
+     "last_event_seq": 41
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "RunResultEvent",
+   "valid": true,
+   "note": "run.result of a completed run",
+   "instance": {
+    "schema_version": "1.0",
+    "project_id": "p1",
+    "seq": 42,
+    "event_id": "e42",
+    "run_id": "r1",
+    "attempt_id": null,
+    "at": "2026-11-04T01:02:03Z",
+    "kind": "run.result",
+    "payload": {
+     "run_id": "r1",
+     "state": "COMPLETED",
+     "exit_code": 0,
+     "blocked_reason": null,
+     "spec_revision": 2,
+     "accepted": 18,
+     "total": 25,
+     "last_event_seq": 41
+    }
+   }
   }
  ]
 }

@@ -275,6 +275,30 @@ pub struct TaskResult {
     pub next_action: String,
 }
 
+/// `RunResult`: the result object of `--output json` and the payload of the final `run.result` event of
+/// `--output stream-json` (REQ-004). `accepted`/`total` count the requirements of the current specification revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunResult {
+    pub run_id: String,
+    pub state: RunState,
+    #[serde(deserialize_with = "crate::integer::deserialize")]
+    pub exit_code: u8,
+    pub blocked_reason: Option<BlockedReason>,
+    #[serde(deserialize_with = "crate::integer::option")]
+    pub spec_revision: Option<u64>,
+    #[serde(deserialize_with = "crate::integer::deserialize")]
+    pub accepted: u64,
+    #[serde(deserialize_with = "crate::integer::deserialize")]
+    pub total: u64,
+    #[serde(deserialize_with = "crate::integer::deserialize")]
+    pub last_event_seq: u64,
+}
+
+impl RunResult {
+    /// The `kind` of the event that carries a run result.
+    pub const EVENT_KIND: &'static str = "run.result";
+}
+
 /// `Command`; the payload shape depends on the kind.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Command {
@@ -492,5 +516,6 @@ schema_def!(
     TaskResult,
     Command,
     DecisionPayload,
-    PlanProposal
+    PlanProposal,
+    RunResult
 );
