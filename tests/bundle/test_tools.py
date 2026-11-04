@@ -239,6 +239,45 @@ class TestResultsConverter(unittest.TestCase):
             from jsonschema import Draft202012Validator
             for line in out.read_text().splitlines():Draft202012Validator(schema).validate(json.loads(line))
 
+class PersistenceScan(unittest.TestCase):
+    """scripts/product/persistence_scan.py: AC-062-05, SQL writes only in the Persistence module."""
+    def run_scan(self,files,out=None):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)
+            for rel,text in files.items():
+                p=root/rel;p.parent.mkdir(parents=True,exist_ok=True);p.write_text(text)
+            argv=[sys.executable,str(ROOT/'scripts/product/persistence_scan.py'),'--root',str(root)]
+            if out:argv+=['--out',str(out)]
+            r=subprocess.run(argv,capture_output=True,text=True)
+            return r.returncode,json.loads(r.stdout)
+    def test_writes_inside_the_persistence_module_pass(self):
+        rc,res=self.run_scan({'crates/hoh-core/src/persistence/writer.rs':'fn f(c:&rusqlite::Connection){c.execute("INSERT INTO t VALUES (1)",[]);}',
+                              'crates/hoh-core/Cargo.toml':'[dependencies]\nrusqlite = "1"\n',
+                              'crates/hoh-app/src/main.rs':'// INSERT INTO t is only a comment\n/* DELETE FROM t */ fn main(){let s="update the docs";}'})
+        self.assertEqual((rc,res['status'],res['hits']),(0,'PASS',[]))
+        self.assertGreater(res['files_scanned'],0)
+    def test_writes_elsewhere_are_hits(self):
+        rc,res=self.run_scan({'crates/hoh-app/src/api.rs':'fn f(){let q="insert or replace into runs(x) values (1)";}',
+                              'crates/hoh-app/src/raw.rs':'fn g(){let q=r#"UPDATE tasks SET state = 1"#; let d="DELETE\\\n   FROM x";}',
+                              'crates/hoh-agents/src/x.rs':'fn h(c:&C){c.execute_batch(q);}',
+                              'crates/hoh-app/src/y.rs':'use rusqlite::Connection;',
+                              'crates/hoh-app/Cargo.toml':'[dependencies]\nrusqlite = "1"\n',
+                              'web/package.json':json.dumps({'dependencies':{'better-sqlite3':'1'}})})
+        self.assertEqual(rc,1);self.assertEqual(res['status'],'FAIL')
+        kinds=sorted((h['path'],h['kind']) for h in res['hits'])
+        self.assertEqual(kinds,[('crates/hoh-agents/src/x.rs','call'),('crates/hoh-app/Cargo.toml','dependency'),('crates/hoh-app/src/api.rs','sql'),
+                                ('crates/hoh-app/src/raw.rs','sql'),('crates/hoh-app/src/raw.rs','sql'),('crates/hoh-app/src/y.rs','rusqlite'),
+                                ('web/package.json','web-dependency')])
+    def test_an_empty_scan_fails_and_the_result_is_recorded(self):
+        with tempfile.TemporaryDirectory() as d:
+            out=Path(d)/'test-results.jsonl'
+            rc,res=self.run_scan({},out)
+            self.assertEqual((rc,res['status'],res['files_scanned']),(1,'FAIL',0))
+            line=json.loads(out.read_text())
+            self.assertEqual((line['test_id'],line['status']),('TEST-062-05','FAIL'))
+            from jsonschema import Draft202012Validator
+            Draft202012Validator(load_json(ROOT/'contracts/test-result.schema.json')).validate(line)
+
 class ProcessLifecycle(unittest.TestCase):
     def test_stdout_stderr_backpressure(self):
         with tempfile.TemporaryDirectory() as d:
