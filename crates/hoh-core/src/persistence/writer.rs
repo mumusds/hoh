@@ -3,8 +3,12 @@
 //! gets a retryable `DB_BUSY`, so nothing is dropped silently. Each [`Commit`] is one `BEGIN IMMEDIATE` transaction:
 //! state compare-and-set, event appends and outbox inserts succeed together or not at all.
 
+use super::decide::{self, Decided};
 use super::{Options, PersistError, sqlite_error};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use crate::decision::{Context, Proposal};
+use crate::lifecycle::{self, Lifecycle};
+use crate::protocol::{RunState, TaskState};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use tokio::sync::{mpsc, oneshot};
 
 /// Entities with a state and a revision.
@@ -23,14 +27,35 @@ impl Entity {
     }
 }
 
-/// Move `entity` `id` to `state` if its revision is still `expected_revision`; the revision then grows by one.
-/// Whether the move is legal is the state machine's decision (M2-T02), not the store's.
+/// What a compare-and-set changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Change {
+    /// Move the run to this state; the transition table and the resume_state rule decide whether that is legal
+    /// (ADR-011 §1).
+    Run(RunState),
+    /// Move the task to this state, checked against the task machine.
+    Task(TaskState),
+    /// Grow only the revision (a decision that changes no state still orders later ones).
+    Touch(Entity),
+}
+
+impl Change {
+    pub fn entity(self) -> Entity {
+        match self {
+            Change::Run(_) => Entity::Run,
+            Change::Task(_) => Entity::Task,
+            Change::Touch(entity) => entity,
+        }
+    }
+}
+
+/// Apply `change` to entity `id` if its revision is still `expected_revision`; the revision then grows by one. An
+/// illegal move fails the whole commit with `ILLEGAL_TRANSITION`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateCas {
-    pub entity: Entity,
     pub id: String,
     pub expected_revision: i64,
-    pub state: String,
+    pub change: Change,
 }
 
 /// An event to append; its `seq` is assigned by the database.
@@ -74,6 +99,10 @@ pub struct Committed {
 enum Job {
     Commit(Commit, oneshot::Sender<Result<Committed, PersistError>>),
     EnsureProject(String, String, oneshot::Sender<Result<(), PersistError>>),
+    Decide(
+        Box<(Proposal, Context)>,
+        oneshot::Sender<Result<Decided, PersistError>>,
+    ),
 }
 
 /// Test-only fault injection inside the writer.
@@ -97,6 +126,7 @@ impl std::fmt::Debug for Job {
         f.write_str(match self {
             Job::Commit(..) => "Commit",
             Job::EnsureProject(..) => "EnsureProject",
+            Job::Decide(..) => "Decide",
         })
     }
 }
@@ -147,6 +177,15 @@ impl Writer {
                         Job::EnsureProject(id, repo, reply) => {
                             let _ = reply.send(ensure_project(&conn, &id, &repo));
                         }
+                        Job::Decide(request, reply) => {
+                            let (proposal, context) = *request;
+                            let _ = reply.send(decide::decide(
+                                &mut conn,
+                                &proposal,
+                                &context,
+                                &after_events,
+                            ));
+                        }
                     }
                 }
             })
@@ -181,6 +220,15 @@ impl Writer {
         self.submit(|tx| Job::Commit(commit, tx)).await
     }
 
+    pub(super) async fn decide(
+        &self,
+        proposal: Proposal,
+        context: Context,
+    ) -> Result<Decided, PersistError> {
+        self.submit(|tx| Job::Decide(Box::new((proposal, context)), tx))
+            .await
+    }
+
     pub(super) async fn ensure_project(
         &self,
         project_id: String,
@@ -213,32 +261,20 @@ fn apply(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(sqlite_error)?;
+    let done = write(&tx, commit, after_events)?;
+    tx.commit().map_err(sqlite_error)?;
+    Ok(done)
+}
+
+/// The writes of `commit` inside the caller's transaction.
+pub(super) fn write(
+    tx: &Transaction<'_>,
+    commit: &Commit,
+    after_events: &dyn Fn(),
+) -> Result<Committed, PersistError> {
     let mut revisions = Vec::with_capacity(commit.cas.len());
     for cas in &commit.cas {
-        let (table, key) = cas.entity.table();
-        let changed = tx
-            .execute(
-                &format!("UPDATE {table} SET state = ?1, revision = revision + 1 WHERE {key} = ?2 AND revision = ?3"),
-                params![cas.state, cas.id, cas.expected_revision],
-            )
-            .map_err(sqlite_error)?;
-        if changed != 1 {
-            let actual = tx
-                .query_row(
-                    &format!("SELECT revision FROM {table} WHERE {key} = ?1"),
-                    params![cas.id],
-                    |r| r.get::<_, i64>(0),
-                )
-                .optional()
-                .map_err(sqlite_error)?;
-            return Err(PersistError::StaleRevision {
-                entity: cas.entity,
-                id: cas.id.clone(),
-                expected: cas.expected_revision,
-                actual,
-            });
-        }
-        revisions.push(cas.expected_revision + 1);
+        revisions.push(compare_and_set(tx, cas)?);
     }
     let now = crate::time::now_rfc3339();
     let mut event_seqs = Vec::with_capacity(commit.events.len());
@@ -281,9 +317,93 @@ fn apply(
         )
         .map_err(sqlite_error)?;
     }
-    tx.commit().map_err(sqlite_error)?;
     Ok(Committed {
         revisions,
         event_seqs,
+    })
+}
+
+/// One compare-and-set inside `tx`: read the row, check the revision and the move, then write it guarded by the
+/// state and revision just read. Returns the new revision.
+fn compare_and_set(tx: &Transaction<'_>, cas: &StateCas) -> Result<i64, PersistError> {
+    let entity = cas.change.entity();
+    let (table, key) = entity.table();
+    let stale = |actual| PersistError::StaleRevision {
+        entity,
+        id: cas.id.clone(),
+        expected: cas.expected_revision,
+        actual,
+    };
+    let row: Option<(String, i64, Option<String>)> = tx
+        .query_row(
+            &format!(
+                "SELECT state, revision, {} FROM {table} WHERE {key} = ?1",
+                if entity == Entity::Run {
+                    "resume_state"
+                } else {
+                    "NULL"
+                }
+            ),
+            params![cas.id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some((state, revision, saved)) = row else {
+        return Err(stale(None));
+    };
+    if revision != cas.expected_revision {
+        return Err(stale(Some(revision)));
+    }
+    let illegal = |from: &str, to: &str| PersistError::IllegalTransition {
+        entity,
+        id: cas.id.clone(),
+        from: from.to_owned(),
+        to: to.to_owned(),
+    };
+    let changed = match cas.change {
+        Change::Touch(_) => tx.execute(
+            &format!("UPDATE {table} SET revision = revision + 1 WHERE {key} = ?1 AND revision = ?2"),
+            params![cas.id, revision],
+        ),
+        Change::Run(to) => {
+            let from = parse::<RunState>(&state)?;
+            let saved = saved.as_deref().map(parse::<RunState>).transpose()?;
+            let resume = lifecycle::resume_state(from, to, saved)
+                .map_err(|_| illegal(from.as_str(), to.as_str()))?;
+            // Leaving BLOCKED clears its reasons; entering it needs them (CHECK, ADR-011 §2).
+            tx.execute(
+                "UPDATE runs SET state = ?1, revision = revision + 1, resume_state = ?2, \
+                 blocked_reason = CASE WHEN ?1 = 'BLOCKED' THEN blocked_reason END, \
+                 blocked_reasons_json = CASE WHEN ?1 = 'BLOCKED' THEN blocked_reasons_json ELSE '[]' END \
+                 WHERE run_id = ?3 AND revision = ?4 AND state = ?5",
+                params![to.as_str(), resume.map(Lifecycle::as_str), cas.id, revision, state],
+            )
+        }
+        Change::Task(to) => {
+            let from = parse::<TaskState>(&state)?;
+            lifecycle::check(from, to).map_err(|_| illegal(from.as_str(), to.as_str()))?;
+            tx.execute(
+                "UPDATE tasks SET state = ?1, revision = revision + 1, \
+                 blocked_reason = CASE WHEN ?1 = 'BLOCKED' THEN blocked_reason END \
+                 WHERE task_id = ?2 AND revision = ?3 AND state = ?4",
+                params![to.as_str(), cas.id, revision, state],
+            )
+        }
+    }
+    .map_err(sqlite_error)?;
+    if changed != 1 {
+        return Err(stale(Some(revision)));
+    }
+    Ok(revision + 1)
+}
+
+/// A state read from the database; the CHECK constraints keep unknown names out.
+pub(super) fn parse<S: Lifecycle>(name: &str) -> Result<S, PersistError> {
+    S::parse(name).ok_or_else(|| {
+        PersistError::IntegrityViolation(format!(
+            "unknown {} state {name:?} in the database",
+            S::MACHINE
+        ))
     })
 }
