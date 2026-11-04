@@ -1,5 +1,8 @@
 //! The binary must never pretend to be a working product before the CLI exists (M1-T06).
 
+// No SQLite outside hoh-core::persistence (AC-062-05); see clippy.toml.
+#![forbid(clippy::disallowed_methods)]
+
 use std::process::Command;
 
 #[test]

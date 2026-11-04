@@ -1,6 +1,9 @@
 //! HCP types round-trip every valid corpus document byte-for-byte as JSON values, reject every invalid one with an
 //! error (never a panic), keep unknown event kinds and payload fields, and list exactly the schema's enum values.
 
+// No SQLite outside hoh-core::persistence (AC-062-05); see clippy.toml.
+#![forbid(clippy::disallowed_methods)]
+
 use hoh_core::protocol::{
     self, AllVariants, BlockedReason, Candidate, CommandKind, ContextHandoff, DecisionPayload,
     ErrorCode, Event, HandoffKind, InputKind, Message, MessageKind, Mode, PlanProposal,

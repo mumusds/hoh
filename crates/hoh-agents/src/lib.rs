@@ -2,6 +2,9 @@
 //! (docs/13-adapters.md, REQ-027), protocol framing and process supervision (M1-T02). The adapters follow in
 //! M1-T03..M1-T05.
 
+// No SQLite outside hoh-core::persistence (AC-062-05); see clippy.toml.
+#![forbid(clippy::disallowed_methods)]
+
 pub mod compat;
 pub mod frame;
 pub mod probe;

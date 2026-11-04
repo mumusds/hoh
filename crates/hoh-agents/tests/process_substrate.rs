@@ -1,6 +1,9 @@
 //! M1-T02 process substrate: orphans, backpressure, oversized frames and children that ignore SIGTERM
 //! (docs/13-adapters.md "进程与终结").
 
+// No SQLite outside hoh-core::persistence (AC-062-05); see clippy.toml.
+#![forbid(clippy::disallowed_methods)]
+
 use hoh_agents::frame::{Frame, HEAD_BYTES};
 use hoh_agents::process::{
     Cause, Config, Escalation, Event, ExitReport, Process, Signal, Target, Termination,

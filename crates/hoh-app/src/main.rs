@@ -1,6 +1,9 @@
 //! `hoh` binary. Placeholder until the CLI lands in M1-T06: it reports NOT_IMPLEMENTED
 //! on stderr and exits 3 so no script can mistake it for a working product.
 
+// No SQLite outside hoh-core::persistence (AC-062-05); see clippy.toml.
+#![forbid(clippy::disallowed_methods)]
+
 fn main() {
     // Internal mode: the second process of the WAL self-test (REQ-062); not a user command.
     if std::env::args_os().nth(1).as_deref()
