@@ -280,3 +280,21 @@ fn valid_commands_that_are_not_built_yet_say_so_and_exit_3() -> R {
     assert!(!env.project.path().join(".hoh").exists());
     Ok(())
 }
+
+#[test]
+fn help_does_not_skip_the_project_check_or_the_version_rule() -> R {
+    // M1T06R-03/04: these exit 64 like the forms without --help.
+    let env = Env::new()?;
+    for args in [
+        &["--project", "/nonexistent", "-p", "x", "--help"][..],
+        &["--project", "/nonexistent", "--help"],
+        &["help", "--version"],
+        &["help", "attach", "--version"],
+    ] {
+        let out = env.hoh(args)?;
+        assert_eq!(out.status.code(), Some(64), "{args:?}");
+        assert!(out.stdout.is_empty(), "{args:?}");
+    }
+    assert!(!Path::new("/nonexistent").exists());
+    Ok(())
+}

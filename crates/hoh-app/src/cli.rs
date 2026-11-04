@@ -25,7 +25,11 @@ pub enum Topic {
 /// A valid command line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Invocation {
-    Help(Topic),
+    /// Help on `topic`; `project` is kept so that a missing `--project` directory is still refused.
+    Help {
+        topic: Topic,
+        project: Option<PathBuf>,
+    },
     Version,
     /// Bare `hoh`: the TUI workspace.
     Workspace {
@@ -57,6 +61,13 @@ pub enum Invocation {
 /// Why a command line is refused (exit 64).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageError(pub String);
+
+fn help_on(topic: Topic) -> Invocation {
+    Invocation::Help {
+        topic,
+        project: None,
+    }
+}
 
 fn usage<T>(message: impl Into<String>) -> Result<T, UsageError> {
     Err(UsageError(message.into()))
@@ -176,14 +187,16 @@ pub fn parse(args: &[OsString]) -> Result<Invocation, UsageError> {
                 || o.resume.is_some()
                 || o.detach
                 || o.live
+                || o.help
+                || o.version
             {
                 return usage("help 不接受选项");
             }
             return match args {
-                [] => Ok(Invocation::Help(Topic::Top)),
-                ["attach"] => Ok(Invocation::Help(Topic::Attach)),
-                ["web"] => Ok(Invocation::Help(Topic::Web)),
-                ["doctor"] => Ok(Invocation::Help(Topic::Doctor)),
+                [] => Ok(help_on(Topic::Top)),
+                ["attach"] => Ok(help_on(Topic::Attach)),
+                ["web"] => Ok(help_on(Topic::Web)),
+                ["doctor"] => Ok(help_on(Topic::Doctor)),
                 _ => usage(format!(
                     "没有 {} 的帮助：子命令只有 attach、web、doctor",
                     args.join(" ")
@@ -227,6 +240,7 @@ pub fn parse(args: &[OsString]) -> Result<Invocation, UsageError> {
     let help = o.help;
     let version = o.version;
     let project = o.project.map(PathBuf::from);
+    let kept_project = project.clone();
     let only = |allowed: bool, name: &str, with: &str| {
         if allowed {
             Ok(())
@@ -303,7 +317,10 @@ pub fn parse(args: &[OsString]) -> Result<Invocation, UsageError> {
         }
     }?;
     Ok(if help {
-        Invocation::Help(topic)
+        Invocation::Help {
+            topic,
+            project: kept_project,
+        }
     } else if version {
         Invocation::Version
     } else {

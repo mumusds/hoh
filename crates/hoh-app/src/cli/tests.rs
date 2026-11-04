@@ -24,16 +24,13 @@ fn help_and_version() {
         let expected = if words.is_empty() {
             Invocation::Workspace { project: None }
         } else {
-            Invocation::Help(Topic::Top)
+            help_on(Topic::Top)
         };
         assert_eq!(ok(words), expected, "{words:?}");
     }
-    assert_eq!(ok(&["attach", "--help"]), Invocation::Help(Topic::Attach));
-    assert_eq!(ok(&["help", "web"]), Invocation::Help(Topic::Web));
-    assert_eq!(
-        ok(&["doctor", "--live", "--help"]),
-        Invocation::Help(Topic::Doctor)
-    );
+    assert_eq!(ok(&["attach", "--help"]), help_on(Topic::Attach));
+    assert_eq!(ok(&["help", "web"]), help_on(Topic::Web));
+    assert_eq!(ok(&["doctor", "--live", "--help"]), help_on(Topic::Doctor));
     assert_eq!(ok(&["--version"]), Invocation::Version);
     refused(&["attach", "--version"]);
     // Help and version do not make an invalid command line valid (M1T06R-01).
@@ -48,10 +45,17 @@ fn help_and_version() {
     ] {
         refused(words);
     }
-    assert_eq!(ok(&["-p", "x", "--help"]), Invocation::Help(Topic::Top));
+    assert_eq!(ok(&["-p", "x", "--help"]), help_on(Topic::Top));
+    assert_eq!(ok(&["attach", "r1", "--help"]), help_on(Topic::Attach));
+    // `help` takes no option, --version included (M1T06R-03); --help keeps --project for main to check (M1T06R-04).
+    refused(&["help", "--version"]);
+    refused(&["help", "attach", "--version"]);
     assert_eq!(
-        ok(&["attach", "r1", "--help"]),
-        Invocation::Help(Topic::Attach)
+        ok(&["--project", "/nonexistent", "-p", "x", "--help"]),
+        Invocation::Help {
+            topic: Topic::Top,
+            project: Some(PathBuf::from("/nonexistent"))
+        }
     );
     refused(&["help", "plan"]);
     refused(&["help", "--live"]);

@@ -50,8 +50,9 @@ fn project(invocation: &Invocation) -> Option<&Path> {
         | Invocation::Prompt { project, .. }
         | Invocation::Attach { project, .. }
         | Invocation::Web { project }
-        | Invocation::Doctor { project, .. } => project.as_deref(),
-        Invocation::Help(_) | Invocation::Version => None,
+        | Invocation::Doctor { project, .. }
+        | Invocation::Help { project, .. } => project.as_deref(),
+        Invocation::Version => None,
     }
 }
 
@@ -67,7 +68,7 @@ fn run(args: &[OsString]) -> u8 {
         return refuse(&format!("--project 不是已有的目录：{}", dir.display()));
     }
     let what = match invocation {
-        Invocation::Help(topic) => return print(help::text(topic)),
+        Invocation::Help { topic, .. } => return print(help::text(topic)),
         Invocation::Version => return print(&help::version()),
         Invocation::Workspace { .. } => "TUI 工作区（hoh）",
         Invocation::Prompt { .. } => "非交互运行（hoh -p）",
