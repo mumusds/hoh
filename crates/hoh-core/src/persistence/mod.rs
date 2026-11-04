@@ -17,7 +17,9 @@ pub mod location;
 pub mod selftest;
 mod writer;
 
-pub use attempts::{AttemptFacts, AttemptMove, AttemptRow, NewAttempt, Session};
+pub use attempts::{
+    AttemptFacts, AttemptMove, AttemptRow, CancelLatch, CancelReceipt, NewAttempt, Session,
+};
 pub use decide::Decided;
 pub use writer::{Change, Commit, Committed, Entity, NewEvent, NewOutbox, StateCas};
 
@@ -541,6 +543,16 @@ impl Store {
         self.writer
             .attempt(attempts::AttemptJob::Move(change))
             .await
+    }
+
+    /// End an attempt: the terminal move `change`, or CANCELLED (with the same facts, no failure reason) if `latch`
+    /// accepted a cancel before this commits; the state written. Once it succeeds, `latch` refuses cancels.
+    pub async fn end_attempt(
+        &self,
+        change: AttemptMove,
+        latch: &CancelLatch,
+    ) -> Result<crate::lifecycle::AttemptState, PersistError> {
+        self.writer.end_attempt(change, latch.clone()).await
     }
 
     /// Append an event of attempt `attempt_id` (kind and payload as given); `name` makes its id unique within the

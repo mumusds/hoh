@@ -3,10 +3,11 @@
 //! gets a retryable `DB_BUSY`, so nothing is dropped silently. Each [`Commit`] is one `BEGIN IMMEDIATE` transaction:
 //! state compare-and-set, event appends and outbox inserts succeed together or not at all.
 
-use super::attempts::{self, AttemptJob};
+use super::attempts::{self, AttemptJob, AttemptMove, CancelLatch};
 use super::decide::{self, Decided};
 use super::{Options, PersistError, sqlite_error};
 use crate::decision::{Context, Proposal};
+use crate::lifecycle::AttemptState;
 use crate::lifecycle::{self, Lifecycle};
 use crate::protocol::{RunState, TaskState};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -108,6 +109,11 @@ enum Job {
         oneshot::Sender<Result<Decided, PersistError>>,
     ),
     Attempt(Box<AttemptJob>, oneshot::Sender<Result<(), PersistError>>),
+    /// A terminal attempt move decided with its cancel latch.
+    EndAttempt(
+        Box<(AttemptMove, CancelLatch)>,
+        oneshot::Sender<Result<AttemptState, PersistError>>,
+    ),
 }
 
 /// Test-only fault injection inside the writer.
@@ -133,6 +139,7 @@ impl std::fmt::Debug for Job {
             Job::EnsureProject(..) => "EnsureProject",
             Job::Decide(..) => "Decide",
             Job::Attempt(..) => "Attempt",
+            Job::EndAttempt(..) => "EndAttempt",
         })
     }
 }
@@ -185,6 +192,10 @@ impl Writer {
                         }
                         Job::Attempt(job, reply) => {
                             let _ = reply.send(attempts::apply(&mut conn, &job));
+                        }
+                        Job::EndAttempt(request, reply) => {
+                            let (change, latch) = *request;
+                            let _ = reply.send(attempts::end(&mut conn, &change, &latch));
                         }
                         Job::Decide(request, reply) => {
                             let (proposal, context) = *request;
@@ -240,6 +251,15 @@ impl Writer {
 
     pub(super) async fn attempt(&self, job: AttemptJob) -> Result<(), PersistError> {
         self.submit(|tx| Job::Attempt(Box::new(job), tx)).await
+    }
+
+    pub(super) async fn end_attempt(
+        &self,
+        change: AttemptMove,
+        latch: CancelLatch,
+    ) -> Result<AttemptState, PersistError> {
+        self.submit(|tx| Job::EndAttempt(Box::new((change, latch)), tx))
+            .await
     }
 
     pub(super) async fn ensure_project(
