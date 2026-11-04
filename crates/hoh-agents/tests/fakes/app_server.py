@@ -23,7 +23,8 @@ def main() -> int:
     frames_path, requests_path, logdir = sys.argv[1], sys.argv[2], Path(sys.argv[3])
     exit_when_done = '--exit-when-done' in sys.argv[4:]
     logdir.mkdir(parents=True, exist_ok=True)
-    frames = [line for line in Path(frames_path).read_text(encoding='utf-8').splitlines() if line.strip()]
+    # LF only: str.splitlines() would also split on U+2028/U+2029 inside JSON strings.
+    frames = [line for line in Path(frames_path).read_text(encoding='utf-8').split('\n') if line.strip()]
     recorded = {int(k): v for k, v in json.loads(Path(requests_path).read_text(encoding='utf-8')).items()}
     received = open(logdir / 'received.jsonl', 'a', encoding='utf-8')
     sent = open(logdir / 'sent.jsonl', 'ab')
