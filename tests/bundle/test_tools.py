@@ -239,14 +239,14 @@ class TestResultsConverter(unittest.TestCase):
             from jsonschema import Draft202012Validator
             for line in out.read_text().splitlines():Draft202012Validator(schema).validate(json.loads(line))
 
-def scan_metadata(root,graph,dirs=None,features=None,targets=None,member_features=None,path_deps=()):
+def scan_metadata(root,graph,dirs=None,features=None,targets=None,member_features=None,path_deps=(),target_dir=None):
     """cargo metadata JSON for persistence_scan.py: graph maps a package to [(extern name, package, kind)]; dirs maps a
     workspace member to its directory under root (default crates/<name>); features lists rusqlite's features."""
     members=['hoh-core','hoh-agents','hoh-app']
     names=set(graph)|{p for deps in graph.values() for _,p,_ in deps}|set(members)
     pid=lambda n:f'id:{n}'
     where=lambda n:(Path(root)/(dirs or {}).get(n,f'crates/{n}')/'Cargo.toml') if n in members else Path(f'/registry/{n}/Cargo.toml')
-    return {'workspace_members':[pid(m) for m in members],
+    return {'workspace_members':[pid(m) for m in members],'target_directory':str(Path(root)/(target_dir or 'target')),
             'packages':[{'id':pid(n),'name':n,'manifest_path':str(where(n)),'features':(member_features or {}).get(n,{}),
                          'source':None if n in members or n in (path_deps or ()) else 'registry+https://github.com/rust-lang/crates.io-index',
                          'targets':[{'kind':[k],'src_path':str(Path(root)/s)} for k,s in (targets or {}).get(n,[])]} for n in sorted(names)],
@@ -264,7 +264,7 @@ def clippy_toml(skip=()):
 class PersistenceScan(unittest.TestCase):
     """scripts/product/persistence_scan.py: AC-062-05, SQLite only through the Persistence module."""
     def run_scan(self,files,graph=BASE_GRAPH,out=None,dirs=None,features=None,clippy=None,targets=None,member_features=None,path_deps=(),
-                 whitelist=None,symlinks=None,git=None):
+                 whitelist=None,symlinks=None,git=None,target_dir=None):
         """whitelist: the files of scripts/product/persistence-whitelist.json; None lists every fixture file the
         content rule would flag (so a test of another rule sees only that rule), False writes no whitelist.
         git: a .gitignore text to make the root a git work tree with."""
@@ -289,7 +289,7 @@ class PersistenceScan(unittest.TestCase):
             if git is not None:
                 (root/'.gitignore').write_text(git)
                 subprocess.run(['git','init','-q',str(root)],check=True)
-            meta=Path(d)/'metadata.json';meta.write_text(json.dumps(scan_metadata(root,graph,dirs,features,targets,member_features,path_deps)))
+            meta=Path(d)/'metadata.json';meta.write_text(json.dumps(scan_metadata(root,graph,dirs,features,targets,member_features,path_deps,target_dir)))
             argv=[sys.executable,str(ROOT/'scripts/product/persistence_scan.py'),'--root',str(root),'--metadata',str(meta)]
             if out:argv+=['--out',str(out)]
             r=subprocess.run(argv,capture_output=True,text=True)
@@ -348,6 +348,31 @@ class PersistenceScan(unittest.TestCase):
         files={'scripts/new_helper.py':'import sqlite3\n','ignored/local.py':'import sqlite3\n'}
         rc,res=self.run_scan(files,whitelist={'clippy.toml':'ok'},git='ignored/\n')
         self.assertEqual((rc,self.kinds(res)),(1,[('scripts/new_helper.py','unlisted-file')]))
+    def test_a_moved_build_output_hides_no_candidate_file(self):
+        # M2T01R-55: with the build output moved into the repository, a helper beside it is still a candidate file
+        # (git's ignore rules alone decide), and the cargo configuration that moved it is refused.
+        files={'.cargo/config.toml':'[build]\ntarget-dir = "build"\n','build/helpers/db_helper.py':'import sqlite3\n',
+               'build/debug/out.py':'import sqlite3\n'}
+        rc,res=self.run_scan(files,whitelist={'clippy.toml':'ok'},git='build/debug/\n',target_dir='build')
+        self.assertEqual(rc,1)
+        self.assertEqual(self.kinds(res),[('.cargo/config.toml','cargo-config'),('build/helpers/db_helper.py','unlisted-file')])
+        self.assertIn('build.target-dir',[h['match'] for h in res['hits']])
+    def test_doc_attributes_are_documentation_not_literals(self):
+        # M2T01R-56: `#[doc = "..."]` is what `///` writes; a named macro argument called doc is still a value.
+        ok={'crates/hoh-app/src/main.rs':'#![doc = "Talks to SQLite only through hoh-core."]\n'
+                                          '#[doc = "Uses SQLite only through the Persistence API."]\n'
+                                          '#[cfg_attr(docsrs, doc = "INSERT INTO happens in persistence")]\nfn main(){}'}
+        self.assertEqual(self.run_scan(ok)[1]['hits'],[])
+        bad={'crates/hoh-app/src/main.rs':'fn main(){ let doc = "sqlite3"; let _ = format!("{doc}", doc = "sqlite3"); }'}
+        self.assertEqual(self.kinds(self.run_scan(bad)[1]),[('crates/hoh-app/src/main.rs','sqlite-literal')])
+    def test_every_whitelist_entry_states_its_reason(self):
+        # M2T01R-58.
+        files={'a.py':'import sqlite3\n','b.py':'import sqlite3\n'}
+        rc,res=self.run_scan(files,whitelist={'clippy.toml':'ok','a.py':'','b.py':'  '})
+        self.assertEqual((rc,sorted(h['match'] for h in res['hits'])),(1,['a.py: no reason given','b.py: no reason given']))
+        rc,res=self.run_scan({},whitelist=['clippy.toml'])
+        self.assertEqual(rc,1)
+        self.assertIn('scripts/product/persistence-whitelist.json',[h['path'] for h in res['hits'] if h['kind']=='whitelist'])
     def test_symlinks_are_refused(self):
         # M2T01R-52: a product module linked to a test helper (or a linked directory) would run code that the checks
         # classify as test code.
