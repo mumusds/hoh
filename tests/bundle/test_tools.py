@@ -365,6 +365,24 @@ class PersistenceScan(unittest.TestCase):
         self.assertEqual(self.run_scan(ok)[1]['hits'],[])
         bad={'crates/hoh-app/src/main.rs':'fn main(){ let doc = "sqlite3"; let _ = format!("{doc}", doc = "sqlite3"); }'}
         self.assertEqual(self.kinds(self.run_scan(bad)[1]),[('crates/hoh-app/src/main.rs','sqlite-literal')])
+    def test_rust_sources_under_a_moved_build_output_are_read(self):
+        # M2T01R-59: CARGO_TARGET_DIR=build with a member at build/helper; only git's ignore rules decide.
+        files={'build/helper/src/lib.rs':'pub fn w(){ let _ = std::process::Command::new("sqlite3"); }','build/debug/gen.rs':'// sqlite3'}
+        rc,res=self.run_scan(files,dirs={'hoh-agents':'build/helper'},git='build/debug/\n',target_dir='build')
+        self.assertEqual((rc,self.kinds(res)),(1,[('build/helper/src/lib.rs','sqlite-literal')]))
+    def test_documentation_forms_are_documentation(self):
+        # M2T01R-60: doc = include_str!(…), doc = concat!(…) and doc text naming a file are documentation.
+        ok={'README.md':'HoH stores its state in SQLite.\n','CONTRACT.md':'SQLite is the store.\n',
+            'crates/hoh-app/src/main.rs':'#![doc = include_str!("../../../README.md")]\n'
+                                          '#[doc = concat!("Talks to ", "SQLite only through persistence.")]\n'
+                                          '#[doc = "See CONTRACT.md"]\n#[doc = "CONTRACT.md"]\nfn main(){}'}
+        rc,res=self.run_scan(ok)
+        self.assertEqual((rc,res['hits']),(0,[]))
+    def test_doc_tokens_handed_to_a_macro_are_values(self):
+        # M2T01R-61: `#[doc = "sqlite3"]` inside a macro invocation is input the macro may use at run time.
+        bad={'crates/hoh-app/src/main.rs':'macro_rules! run { (#[doc = $s:literal]) => { std::process::Command::new($s) }; }\n'
+                                           'fn main(){ let _ = run!(#[doc = "sqlite3"]); }'}
+        self.assertEqual(self.kinds(self.run_scan(bad)[1]),[('crates/hoh-app/src/main.rs','sqlite-literal')])
     def test_every_whitelist_entry_states_its_reason(self):
         # M2T01R-58.
         files={'a.py':'import sqlite3\n','b.py':'import sqlite3\n'}
