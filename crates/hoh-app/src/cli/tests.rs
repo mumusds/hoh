@@ -36,6 +36,23 @@ fn help_and_version() {
     );
     assert_eq!(ok(&["--version"]), Invocation::Version);
     refused(&["attach", "--version"]);
+    // Help and version do not make an invalid command line valid (M1T06R-01).
+    for words in [
+        &["--resume", "r1", "--version"][..],
+        &["--project", "/tmp", "--version"],
+        &["-p", "x", "--version"],
+        &["doctor", "--detach", "--help"],
+        &["-p", "", "--help"],
+        &["--output", "json", "--help"],
+        &["attach", "r1", "r2", "--help"],
+    ] {
+        refused(words);
+    }
+    assert_eq!(ok(&["-p", "x", "--help"]), Invocation::Help(Topic::Top));
+    assert_eq!(
+        ok(&["attach", "r1", "--help"]),
+        Invocation::Help(Topic::Attach)
+    );
     refused(&["help", "plan"]);
     refused(&["help", "--live"]);
 }
