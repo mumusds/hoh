@@ -239,7 +239,7 @@ class TestResultsConverter(unittest.TestCase):
             from jsonschema import Draft202012Validator
             for line in out.read_text().splitlines():Draft202012Validator(schema).validate(json.loads(line))
 
-def scan_metadata(root,graph,dirs=None,features=None,targets=None,member_features=None):
+def scan_metadata(root,graph,dirs=None,features=None,targets=None,member_features=None,path_deps=()):
     """cargo metadata JSON for persistence_scan.py: graph maps a package to [(extern name, package, kind)]; dirs maps a
     workspace member to its directory under root (default crates/<name>); features lists rusqlite's features."""
     members=['hoh-core','hoh-agents','hoh-app']
@@ -248,6 +248,7 @@ def scan_metadata(root,graph,dirs=None,features=None,targets=None,member_feature
     where=lambda n:(Path(root)/(dirs or {}).get(n,f'crates/{n}')/'Cargo.toml') if n in members else Path(f'/registry/{n}/Cargo.toml')
     return {'workspace_members':[pid(m) for m in members],
             'packages':[{'id':pid(n),'name':n,'manifest_path':str(where(n)),'features':(member_features or {}).get(n,{}),
+                         'source':None if n in members or n in (path_deps or ()) else 'registry+https://github.com/rust-lang/crates.io-index',
                          'targets':[{'kind':[k],'src_path':str(Path(root)/s)} for k,s in (targets or {}).get(n,[])]} for n in sorted(names)],
             'resolve':{'nodes':[{'id':pid(n),'features':(features if n=='rusqlite' and features is not None else ['bundled','default']) if n=='rusqlite' else [],
                                  'deps':[{'name':e,'pkg':pid(p),'dep_kinds':[{'kind':k,'target':None}]} for e,p,k in graph.get(n,[])]} for n in sorted(names)]}}
@@ -262,7 +263,7 @@ def clippy_toml(skip=()):
 
 class PersistenceScan(unittest.TestCase):
     """scripts/product/persistence_scan.py: AC-062-05, SQLite only through the Persistence module."""
-    def run_scan(self,files,graph=BASE_GRAPH,out=None,dirs=None,features=None,clippy=None,targets=None,member_features=None):
+    def run_scan(self,files,graph=BASE_GRAPH,out=None,dirs=None,features=None,clippy=None,targets=None,member_features=None,path_deps=()):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d)
             files={'clippy.toml':clippy_toml() if clippy is None else clippy,**files}
@@ -270,7 +271,7 @@ class PersistenceScan(unittest.TestCase):
                 files.setdefault(f"{(dirs or {}).get(m,f'crates/{m}')}/Cargo.toml",'[package]\n')
             for rel,text in files.items():
                 p=root/rel;p.parent.mkdir(parents=True,exist_ok=True);p.write_text(text)
-            meta=root/'metadata.json';meta.write_text(json.dumps(scan_metadata(root,graph,dirs,features,targets,member_features)))
+            meta=root/'metadata.json';meta.write_text(json.dumps(scan_metadata(root,graph,dirs,features,targets,member_features,path_deps)))
             argv=[sys.executable,str(ROOT/'scripts/product/persistence_scan.py'),'--root',str(root),'--metadata',str(meta)]
             if out:argv+=['--out',str(out)]
             r=subprocess.run(argv,capture_output=True,text=True)
@@ -379,7 +380,8 @@ class PersistenceScan(unittest.TestCase):
                           ('crates/hoh-app/src/bin/no_unsafe.rs','missing-forbid','hoh-app bin root: unsafe_code'),
                           ('crates/hoh-app/src/main.rs','missing-forbid','hoh-app bin root'),('crates/hoh-app/src/main.rs','missing-forbid','hoh-app bin root: unsafe_code'),
                           ('crates/hoh-core/src/lib.rs','core-root','fn extra() {}'),('crates/hoh-core/src/lib.rs','missing-forbid','mod protocol'),
-                          ('outside.rs','missing-forbid','hoh-app bin root'),('outside.rs','target-outside-members','a target root outside the member directories')])
+                          ('outside.rs','missing-forbid','hoh-app bin root'),('outside.rs','product-root-outside-src',"a product target root outside its member's src/"),
+                          ('outside.rs','target-outside-members','a target root outside the member directories')])
     def test_features_clippy_cfgs_and_sqlite_subprocesses_are_hits(self):
         # M2T01R-35..38: member features (code clippy never compiles, or extra dependency APIs), cfg(not(clippy)), and
         # SQLite run as a subprocess from product code; test-only files may mention sqlite.
@@ -411,7 +413,27 @@ class PersistenceScan(unittest.TestCase):
         self.assertEqual(rc,1)
         self.assertEqual(sorted((h['path'].rsplit('/',1)[-1],h['kind'],h['match']) for h in res['hits']),
                          [('main.rs','clippy-cfg','not($c)'),('main.rs','included-file','db_helper.py: mentions SQLite or holds a SQL write'),
-                          ('main.rs','included-file','include_str!/include_bytes! of a computed path'),('mod.rs','sqlite-literal','sqlite3')])
+                          ('main.rs','included-file','include_str!/include_bytes! of a computed path'),
+                          ('main.rs','named-file','db_helper.py: mentions SQLite or holds a SQL write'),('mod.rs','sqlite-literal','sqlite3')])
+    def test_profiles_scripts_roots_include_aliases_path_deps_and_persistence_macros(self):
+        # M2T01R-44..49.
+        F='#![forbid(clippy::disallowed_methods)]\n#![forbid(unsafe_code)]\n'
+        files={'Cargo.toml':'[workspace]\n[profile.production]\ninherits = "release"\n[profile.release]\npanic = "abort"\n',
+               'crates/hoh-app/src/main.rs':F+'fn main(){ let _ = std::process::Command::new("python3").arg("scripts/db_helper.py"); }',
+               'scripts/db_helper.py':'import sqlite3\n',
+               'crates/hoh-app/tool.rs':F+'mod tests { pub mod db_helper; }\nfn main(){}',
+               'crates/hoh-app/tests/db_helper.rs':'pub fn w(){}',
+               'crates/hoh-app/src/embed.rs':'use std::include_str as embed_text;\nconst S: &str = embed_text!("x.txt");',
+               'crates/hoh-core/src/persistence/mod.rs':'macro_rules! gate { () => {} }'}
+        graph=dict(BASE_GRAPH);graph['hoh-core']=BASE_GRAPH['hoh-core']+[('db_helper','db-helper',None)]
+        targets={'hoh-app':[('bin','crates/hoh-app/src/main.rs'),('bin','crates/hoh-app/tool.rs')]}
+        rc,res=self.run_scan(files,graph=graph,targets=targets,path_deps=('db-helper',))
+        self.assertEqual(rc,1)
+        self.assertEqual(sorted((h['path'].rsplit('/',1)[-1],h['kind'],h['match']) for h in res['hits']),
+                         [('Cargo.toml','path-dependency','db-helper is not a workspace member'),('Cargo.toml','profile','profile.production'),
+                          ('Cargo.toml','profile','profile.release.panic'),('embed.rs','included-file','an include macro imported under another name'),
+                          ('main.rs','named-file','scripts/db_helper.py: mentions SQLite or holds a SQL write'),
+                          ('mod.rs','persistence-macro','macro_rules! in persistence'),('tool.rs','product-root-outside-src',"a product target root outside its member's src/")])
     def test_new_rusqlite_features_need_the_boundary_extended(self):
         rc,res=self.run_scan({},features=['bundled','default','backup'])
         self.assertEqual(self.kinds(res),[('Cargo.lock','rusqlite-feature')])
