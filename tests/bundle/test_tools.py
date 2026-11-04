@@ -239,39 +239,70 @@ class TestResultsConverter(unittest.TestCase):
             from jsonschema import Draft202012Validator
             for line in out.read_text().splitlines():Draft202012Validator(schema).validate(json.loads(line))
 
+def scan_metadata(graph):
+    """cargo metadata JSON for persistence_scan.py: graph maps a package to [(extern name, package, kind)]."""
+    members=['hoh-core','hoh-agents','hoh-app']
+    names=set(graph)|{p for deps in graph.values() for _,p,_ in deps}|set(members)
+    pid=lambda n:f'id:{n}'
+    return {'workspace_members':[pid(m) for m in members],
+            'packages':[{'id':pid(n),'name':n,'manifest_path':f'/w/{n}/Cargo.toml'} for n in sorted(names)],
+            'resolve':{'nodes':[{'id':pid(n),'deps':[{'name':e,'pkg':pid(p),'dep_kinds':[{'kind':k,'target':None}]} for e,p,k in graph.get(n,[])]} for n in sorted(names)]}}
+
+BASE_GRAPH={'hoh-core':[('rusqlite','rusqlite',None)],'rusqlite':[('libsqlite3_sys','libsqlite3-sys',None)],
+            'hoh-agents':[('hoh_core','hoh-core',None)],'hoh-app':[('hoh_core','hoh-core',None),('hoh_agents','hoh-agents',None)]}
+
 class PersistenceScan(unittest.TestCase):
-    """scripts/product/persistence_scan.py: AC-062-05, SQL writes only in the Persistence module."""
-    def run_scan(self,files,out=None):
+    """scripts/product/persistence_scan.py: AC-062-05, SQL writes and SQLite access only in the Persistence module."""
+    def run_scan(self,files,graph=BASE_GRAPH,out=None):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d)
             for rel,text in files.items():
                 p=root/rel;p.parent.mkdir(parents=True,exist_ok=True);p.write_text(text)
-            argv=[sys.executable,str(ROOT/'scripts/product/persistence_scan.py'),'--root',str(root)]
+            meta=root/'metadata.json';meta.write_text(json.dumps(scan_metadata(graph)))
+            argv=[sys.executable,str(ROOT/'scripts/product/persistence_scan.py'),'--root',str(root),'--metadata',str(meta)]
             if out:argv+=['--out',str(out)]
             r=subprocess.run(argv,capture_output=True,text=True)
             return r.returncode,json.loads(r.stdout)
-    def test_writes_inside_the_persistence_module_pass(self):
-        rc,res=self.run_scan({'crates/hoh-core/src/persistence/writer.rs':'fn f(c:&rusqlite::Connection){c.execute("INSERT INTO t VALUES (1)",[]);}',
-                              'crates/hoh-core/Cargo.toml':'[dependencies]\nrusqlite = "1"\n',
-                              'crates/hoh-app/src/main.rs':'// INSERT INTO t is only a comment\n/* DELETE FROM t */ fn main(){let s="update the docs";}'})
-        self.assertEqual((rc,res['status'],res['hits']),(0,'PASS',[]))
-        self.assertGreater(res['files_scanned'],0)
-    def test_writes_elsewhere_are_hits(self):
-        rc,res=self.run_scan({'crates/hoh-app/src/api.rs':'fn f(){let q="insert or replace into runs(x) values (1)";}',
-                              'crates/hoh-app/src/raw.rs':'fn g(){let q=r#"UPDATE tasks SET state = 1"#; let d="DELETE\\\n   FROM x";}',
-                              'crates/hoh-agents/src/x.rs':'fn h(c:&C){c.execute_batch(q);}',
-                              'crates/hoh-app/src/y.rs':'use rusqlite::Connection;',
-                              'crates/hoh-app/Cargo.toml':'[dependencies]\nrusqlite = "1"\n',
-                              'web/package.json':json.dumps({'dependencies':{'better-sqlite3':'1'}})})
-        self.assertEqual(rc,1);self.assertEqual(res['status'],'FAIL')
-        kinds=sorted((h['path'],h['kind']) for h in res['hits'])
-        self.assertEqual(kinds,[('crates/hoh-agents/src/x.rs','call'),('crates/hoh-app/Cargo.toml','dependency'),('crates/hoh-app/src/api.rs','sql'),
-                                ('crates/hoh-app/src/raw.rs','sql'),('crates/hoh-app/src/raw.rs','sql'),('crates/hoh-app/src/y.rs','rusqlite'),
-                                ('web/package.json','web-dependency')])
+    def kinds(self,res):return sorted((h['path'],h['kind']) for h in res['hits'])
+    def test_the_persistence_module_may_use_sqlite_and_others_may_name_things_freely(self):
+        rc,res=self.run_scan({'crates/hoh-core/src/persistence/writer.rs':'pub(crate) fn f(c:&rusqlite::Connection){c.execute("INSERT INTO t VALUES (1)",[]);}\npub struct Store { conn: rusqlite::Connection }',
+                              'crates/hoh-app/src/main.rs':'// INSERT INTO t is only a comment\n/* DELETE FROM t */ fn main(){let s="update the docs"; let c=Command::new("x"); c.execute(); tx.transaction();}',
+                              'crates/hoh-core/src/protocol.rs':'// rusqlite in a comment\nfn g(){let s="rusqlite in a string";}'})
+        self.assertEqual((rc,res['status'],res['hits']),(0,'PASS',[]))  # M2T01R-06: method names alone are not hits
+        self.assertEqual(res['core_sqlite_crate_names'],['rusqlite'])
+    def test_sqlite_dependencies_outside_hoh_core_are_hits_by_package_identity(self):
+        # M2T01R-04: a renamed package, a workspace-inherited one (resolved by cargo) and one reached through another crate.
+        graph=dict(BASE_GRAPH)
+        graph['hoh-app']=BASE_GRAPH['hoh-app']+[('db','rusqlite',None)]
+        graph['hoh-agents']=BASE_GRAPH['hoh-agents']+[('orm','orm',None),('fixture_db','rusqlite','dev')]
+        graph['orm']=[('ffi','libsqlite3-sys',None)]
+        rc,res=self.run_scan({'crates/hoh-app/src/main.rs':'fn main(){db::Connection::open("x");}'},graph)
+        self.assertEqual(rc,1)
+        self.assertEqual(sorted(h['match'] for h in res['hits']),['hoh-agents -> orm -> libsqlite3-sys','hoh-app -> rusqlite'])
+        self.assertEqual(res['dev_dependency_uses'],[{'member':'hoh-agents','package':'rusqlite'}])
+    def test_hoh_core_outside_persistence_and_public_sqlite_types_are_hits(self):
+        graph=dict(BASE_GRAPH);graph['hoh-core']=[('db','rusqlite',None)]
+        rc,res=self.run_scan({'crates/hoh-core/src/scheduler.rs':'use db::Connection;',
+                              'crates/hoh-core/src/persistence/mod.rs':'pub fn raw(&self) -> &Connection {&self.c}\npub use db::Transaction;\npub(crate) fn ok(c:&db::Connection){}\npub struct S {\n    pub conn: db::Connection,\n}'},graph)
+        self.assertEqual(rc,1)
+        self.assertEqual(self.kinds(res),[('crates/hoh-core/src/persistence/mod.rs','public-api')]*3+[('crates/hoh-core/src/scheduler.rs','sqlite-crate')])
+    def test_sql_write_literals_are_decoded_and_joined_like_rust(self):
+        # M2T01R-03: format! placeholders, concat!, a continuation inside a word, a hex escape, a raw string, upserts.
+        src=('fn g(){let a=format!("UPDATE {table} SET state = ?1"); let b=concat!("INSERT ", "INTO t VALUES (1)");\n'
+             'let c="INS\\\n      ERT INTO t VALUES (2)"; let d="DELETE\\x20FROM t"; let e=r#"replace into t values (3)"#;\n'
+             'let f="INSERT OR IGNORE INTO t VALUES (4)"; let g="... ON CONFLICT(id) DO UPDATE SET x = 1";}')
+        rc,res=self.run_scan({'crates/hoh-app/src/api.rs':src})
+        self.assertEqual(rc,1)
+        self.assertEqual(sorted(h['match'].upper() for h in res['hits']),sorted(['UPDATE {TABLE} SET','INSERT INTO','INSERT INTO','DELETE FROM','REPLACE INTO','INSERT OR IGNORE INTO','ON CONFLICT(ID) DO UPDATE']))
+    def test_web_sqlite_dependencies_and_imports_are_hits(self):
+        rc,res=self.run_scan({'crates/hoh-app/src/main.rs':'fn main(){}',
+                              'web/package.json':json.dumps({'dependencies':{'db':'npm:better-sqlite3@12','react':'18'}}),
+                              'web/src/a.ts':'import x from "sql.js-wrapper-sqlite";'})
+        self.assertEqual(self.kinds(res),[('web/package.json','web-dependency'),('web/src/a.ts','web-import')])
     def test_an_empty_scan_fails_and_the_result_is_recorded(self):
         with tempfile.TemporaryDirectory() as d:
             out=Path(d)/'test-results.jsonl'
-            rc,res=self.run_scan({},out)
+            rc,res=self.run_scan({},out=out)
             self.assertEqual((rc,res['status'],res['files_scanned']),(1,'FAIL',0))
             line=json.loads(out.read_text())
             self.assertEqual((line['test_id'],line['status']),('TEST-062-05','FAIL'))

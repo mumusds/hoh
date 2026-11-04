@@ -26,6 +26,9 @@ pub struct Options {
     pub busy_timeout: Duration,
     /// Requests waiting for the writer before callers are held back.
     pub queue: usize,
+    /// The second process of the WAL self-test; `None` is this executable with
+    /// [`selftest::PROBE_ARG`] (the `hoh` binary).
+    pub wal_probe: Option<selftest::ProbeCommand>,
 }
 
 impl Default for Options {
@@ -33,6 +36,7 @@ impl Default for Options {
         Self {
             busy_timeout: Duration::from_millis(5000),
             queue: 64,
+            wal_probe: None,
         }
     }
 }
@@ -167,7 +171,7 @@ pub struct Pragmas {
 }
 
 /// Read a connection's settings.
-pub fn pragmas(conn: &Connection) -> Result<Pragmas, PersistError> {
+pub(crate) fn pragmas(conn: &Connection) -> Result<Pragmas, PersistError> {
     let text = |name: &str| conn.pragma_query_value(None, name, |r| r.get::<_, String>(0));
     let int = |name: &str| conn.pragma_query_value(None, name, |r| r.get::<_, i64>(0));
     Ok(Pragmas {
@@ -181,7 +185,10 @@ pub fn pragmas(conn: &Connection) -> Result<Pragmas, PersistError> {
 }
 
 /// Check that a connection runs with the required settings; the first mismatch is an error.
-pub fn verify_pragmas(conn: &Connection, busy_timeout: Duration) -> Result<(), PersistError> {
+pub(crate) fn verify_pragmas(
+    conn: &Connection,
+    busy_timeout: Duration,
+) -> Result<(), PersistError> {
     let got = pragmas(conn)?;
     let expected_busy = i64::try_from(busy_timeout.as_millis()).unwrap_or(i64::MAX);
     let checks: [(&'static str, String, String); 4] = [
@@ -229,17 +236,16 @@ fn configure(conn: &Connection, options: &Options, writer: bool) -> Result<(), P
     verify_pragmas(conn, options.busy_timeout)
 }
 
-/// Schema migrations in order: `(user_version after it, SQL)`. Each script runs its own transaction and sets
-/// `user_version` (as the contract schema does).
+/// Schema migrations in order: `(user_version after it, SQL)`. A script sets its own `user_version`; the runner owns
+/// the transaction, so `BEGIN`/`COMMIT` statements in a script (the contract schema has them) are skipped.
 pub(crate) const MIGRATIONS: &[(i64, &str)] =
     &[(1, include_str!("../../../../contracts/sql/001_initial.sql"))];
 
-/// Bring the database to the latest schema version; refuse one newer than this binary.
+/// Bring the database to the latest schema version; refuse one newer than this binary. Each migration runs in one
+/// IMMEDIATE transaction that commits only if the script ran and set `user_version` to its version (M2T01R-05).
 pub(crate) fn migrate(conn: &Connection, migrations: &[(i64, &str)]) -> Result<i64, PersistError> {
     let latest = migrations.last().map_or(0, |m| m.0);
-    let mut version: i64 = conn
-        .pragma_query_value(None, "user_version", |r| r.get(0))
-        .map_err(sqlite_error)?;
+    let mut version = user_version(conn)?;
     if version > latest {
         return Err(PersistError::SchemaTooNew {
             found: version,
@@ -252,20 +258,54 @@ pub(crate) fn migrate(conn: &Connection, migrations: &[(i64, &str)]) -> Result<i
             version: target,
             detail,
         };
-        if let Err(e) = conn.execute_batch(sql) {
-            if !conn.is_autocommit() {
+        conn.execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| failed(e.to_string()))?;
+        let ran = run_script(conn, sql)
+            .map_err(|e| e.to_string())
+            .and_then(|()| {
+                let after = user_version(conn).map_err(|e| e.to_string())?;
+                if after == target {
+                    Ok(())
+                } else {
+                    Err(format!("user_version is {after} afterwards"))
+                }
+            });
+        match ran {
+            Ok(()) => conn
+                .execute_batch("COMMIT")
+                .map_err(|e| failed(e.to_string()))?,
+            Err(detail) => {
                 let _ = conn.execute_batch("ROLLBACK");
+                return Err(failed(detail));
             }
-            return Err(failed(e.to_string()));
         }
-        version = conn
-            .pragma_query_value(None, "user_version", |r| r.get(0))
-            .map_err(sqlite_error)?;
-        if version != target {
-            return Err(failed(format!("user_version is {version} afterwards")));
-        }
+        version = target;
     }
     Ok(version)
+}
+
+fn user_version(conn: &Connection) -> Result<i64, PersistError> {
+    conn.pragma_query_value(None, "user_version", |r| r.get(0))
+        .map_err(sqlite_error)
+}
+
+/// Run a script's statements one by one inside the caller's transaction, skipping its transaction control.
+fn run_script(conn: &Connection, sql: &str) -> rusqlite::Result<()> {
+    use rusqlite::fallible_iterator::FallibleIterator;
+    let mut batch = rusqlite::Batch::new(conn, sql);
+    while let Some(mut statement) = batch.next()? {
+        let text = statement.expanded_sql().unwrap_or_default();
+        let verb = text
+            .trim_start()
+            .split(|c: char| !c.is_ascii_alphabetic())
+            .next()
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        if !matches!(verb.as_str(), "BEGIN" | "COMMIT" | "END") {
+            statement.raw_execute()?;
+        }
+    }
+    Ok(())
 }
 
 /// An open project database: the writer actor and the means to open readers.
@@ -290,16 +330,23 @@ impl Store {
         options: Options,
         mountinfo: &str,
     ) -> Result<Store, PersistError> {
-        let dir = path.parent().unwrap_or(Path::new("."));
-        let resolved =
-            location::existing_ancestor(dir).map_err(|e| PersistError::Storage(e.to_string()))?;
-        location::check(&resolved, mountinfo).map_err(|fstype| PersistError::OnNetworkFs {
-            path: resolved.clone(),
+        // Where the database really goes: links (also a dangling one for the file) and `..` after missing
+        // directories resolved, so the check, the self-test and the open all see the same place (M2T01R-01).
+        let storage = |e: std::io::Error| PersistError::Storage(e.to_string());
+        let path = location::resolve(path).map_err(storage)?;
+        let dir = path.parent().unwrap_or(Path::new("/")).to_path_buf();
+        let existing = location::existing_ancestor(&dir).map_err(storage)?;
+        location::check(&existing, mountinfo).map_err(|fstype| PersistError::OnNetworkFs {
+            path: existing.clone(),
             fstype,
         })?;
-        std::fs::create_dir_all(dir).map_err(|e| PersistError::Storage(e.to_string()))?;
-        selftest::wal_self_test(dir)?;
-        Self::open_checked(path, options, MIGRATIONS)
+        std::fs::create_dir_all(&dir).map_err(storage)?;
+        let probe = match &options.wal_probe {
+            Some(probe) => probe.clone(),
+            None => selftest::ProbeCommand::current_exe().map_err(storage)?,
+        };
+        selftest::wal_self_test(&dir, &probe)?;
+        Self::open_checked(&path, options, MIGRATIONS)
     }
 
     fn open_checked(
@@ -354,8 +401,10 @@ pub struct Reader {
 }
 
 impl Reader {
-    /// Run a query on the connection; writes fail because it is read-only.
-    pub fn with<T>(
+    /// Run a query on the connection (tests only); writes fail because it is read-only. No SQLite type leaves the
+    /// persistence module (AC-062-05): product queries are typed methods, added with their callers.
+    #[cfg(test)]
+    pub(crate) fn with<T>(
         &self,
         f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
     ) -> Result<T, PersistError> {

@@ -2,6 +2,12 @@
 //! on stderr and exits 3 so no script can mistake it for a working product.
 
 fn main() {
+    // Internal mode: the second process of the WAL self-test (REQ-062); not a user command.
+    if std::env::args_os().nth(1).as_deref()
+        == Some(hoh_core::persistence::selftest::PROBE_ARG.as_ref())
+    {
+        std::process::exit(hoh_core::persistence::selftest::probe_main());
+    }
     eprintln!(
         "hoh {} (core {}, agents {}): NOT_IMPLEMENTED - the product CLI arrives in M1-T06; see docs/08-development-plan.md",
         env!("CARGO_PKG_VERSION"),
