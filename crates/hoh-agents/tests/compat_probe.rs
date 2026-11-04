@@ -404,6 +404,11 @@ fn method_branches_must_use_the_known_schema_form() -> R {
             "params-anyof-bad-member",
             "{\"oneOf\":[{\"type\":\"object\",\"properties\":{\"method\":{\"type\":\"string\",\"enum\":[\"turn/steer\"]},\"params\":{\"anyOf\":[{\"$ref\":\"#/definitions/P\"},{\"type\":\"nil\"}]}}}]}",
         ),
+        // M1T01R-28: serde_json reads 0.9999999999999999 as 1.0; only integer literals count as integers.
+        (
+            "minlength-lossy",
+            "{\"oneOf\":[{\"type\":\"object\",\"properties\":{\"method\":{\"type\":\"string\",\"enum\":[\"turn/steer\"]},\"params\":{\"minLength\":0.9999999999999999}}}]}",
+        ),
         // M1T01R-26/-27: references, the root, definitions and every branch are checked against draft-07.
         (
             "ref-not-uri",

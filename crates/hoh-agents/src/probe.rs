@@ -181,7 +181,8 @@ const DRAFT_07: &str = "http://json-schema.org/draft-07/schema#";
 /// `additionalProperties`, `format`, `minimum`, `minLength`, `default`, and `$schema`/`definitions` at the root).
 /// Every schema position is checked against the draft-07 meta-schema rule for its keyword; any other keyword, an
 /// ill-typed value, or a `$ref` other than `#/definitions/<name>` naming a root definition refuses the document, so a
-/// newer schema form fails the probe instead of being half-read (M1T01R-25, -26, -27).
+/// newer schema form fails the probe instead of being half-read (M1T01R-25, -26, -27). `minLength` must be written as
+/// an integer literal (M1T01R-28).
 fn draft7_well_formed(root: &serde_json::Value) -> Result<(), String> {
     use serde_json::{Map, Value};
     fn type_name(v: &Value) -> bool {
@@ -222,9 +223,9 @@ fn draft7_well_formed(root: &serde_json::Value) -> Result<(), String> {
                 "enum" => v.is_array(),
                 "required" => unique_strings(v),
                 "minimum" => v.is_number(),
-                "minLength" => {
-                    v.is_u64() || v.as_f64().is_some_and(|f| f >= 0.0 && f.fract() == 0.0)
-                }
+                // A JSON integer literal only: serde_json rounds other spellings (`0.9999999999999999` reads as
+                // 1.0), so integral-looking floats are refused rather than judged after rounding (M1T01R-28).
+                "minLength" => v.is_u64(),
                 "$ref" => v
                     .as_str()
                     .and_then(|r| r.strip_prefix("#/definitions/"))
