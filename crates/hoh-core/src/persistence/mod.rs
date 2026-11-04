@@ -72,13 +72,14 @@ pub enum PersistError {
         expected: i64,
         actual: Option<i64>,
     },
-    /// The transition table does not allow the move (`ILLEGAL_TRANSITION`, ADR-011); nothing of the transaction was
-    /// written.
+    /// The move is not allowed (`ILLEGAL_TRANSITION`, ADR-011): not in the transition table, not to the saved
+    /// resume state, or past unresolved blockers; nothing of the transaction was written.
     IllegalTransition {
         entity: Entity,
         id: String,
         from: String,
         to: String,
+        why: String,
     },
     /// The run does not exist (`RUN_NOT_FOUND`); nothing was written.
     RunNotFound(String),
@@ -168,9 +169,10 @@ impl std::fmt::Display for PersistError {
                 id,
                 from,
                 to,
+                why,
             } => write!(
                 f,
-                "ILLEGAL_TRANSITION: {entity:?} {id} {from} -> {to} is not in the transition table"
+                "ILLEGAL_TRANSITION: {entity:?} {id} {from} -> {to}: {why}"
             ),
             PersistError::RunNotFound(id) => write!(f, "RUN_NOT_FOUND: {id}"),
             PersistError::InvalidProposal(detail) => write!(f, "invalid proposal: {detail}"),

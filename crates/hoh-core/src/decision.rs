@@ -24,6 +24,8 @@ pub struct Proposal {
     pub expected_revision: u64,
     /// The specification the Commander decided on.
     pub spec_sha256: String,
+    /// The candidate the Commander's verdict is about; acceptance is judged on it alone (CONTRACT 7).
+    pub candidate_id: Option<String>,
     pub payload: DecisionPayload,
 }
 
@@ -67,6 +69,7 @@ impl Proposal {
             role_epoch: message.role_epoch,
             expected_revision: message.expected_revision,
             spec_sha256: message.spec_sha256.clone(),
+            candidate_id: message.candidate_id.clone(),
             payload,
         })
     }
@@ -176,18 +179,50 @@ pub struct BindingView {
 pub struct Evidence {
     /// The required_release requirements of the specification.
     pub required: BTreeSet<String>,
+    /// The run's candidates in use (FROZEN, VERIFYING or ACCEPTED).
+    pub live: BTreeSet<String>,
     /// For each eligible candidate of the run, the requirements whose every acceptance criterion passed.
     pub candidates: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl Evidence {
-    /// Whether one candidate has passed every requirement in `needed` (which must not be empty).
-    fn covers(&self, needed: &BTreeSet<String>) -> bool {
-        !needed.is_empty()
-            && self
+    /// The gate for `what`: `candidate` must be the run's one candidate in use and have passed every requirement in
+    /// `needed`, which must not be empty.
+    fn gate(
+        &self,
+        candidate: Option<&str>,
+        needed: &BTreeSet<String>,
+        what: &str,
+    ) -> Result<(), Rejection> {
+        let Some(candidate) = candidate else {
+            return reject(
+                RejectionReason::EvidenceGateUnmet,
+                format!("{what}: the proposal names no candidate"),
+            );
+        };
+        if self.live.len() != 1 || !self.live.contains(candidate) {
+            return reject(
+                RejectionReason::CandidateMismatch,
+                format!(
+                    "{what}: {candidate} is not the run's one candidate in use {:?}",
+                    self.live
+                ),
+            );
+        }
+        if needed.is_empty()
+            || !self
                 .candidates
-                .values()
-                .any(|passed| needed.is_subset(passed))
+                .get(candidate)
+                .is_some_and(|passed| needed.is_subset(passed))
+        {
+            return reject(
+                RejectionReason::EvidenceGateUnmet,
+                format!(
+                    "{what}: {candidate} lacks passing evidence for every acceptance criterion of {needed:?}"
+                ),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -301,13 +336,19 @@ pub fn validate(proposal: &Proposal, snapshot: &Snapshot) -> Result<Effect, Reje
         DecisionPayload::Dispatch { task_id, role, .. } => dispatch(snapshot, task_id, role),
         DecisionPayload::TransitionTask {
             task_id, to_state, ..
-        } => transition_task(snapshot, task_id, *to_state),
+        } => transition_task(
+            snapshot,
+            proposal.candidate_id.as_deref(),
+            task_id,
+            *to_state,
+        ),
         DecisionPayload::TransitionRun {
             to_state,
             accepted_requirements,
             ..
         } => transition_run(
             snapshot,
+            proposal.candidate_id.as_deref(),
             *to_state,
             accepted_requirements.as_deref().unwrap_or_default(),
         ),
@@ -421,7 +462,12 @@ fn dispatch(snapshot: &Snapshot, task_id: &str, role: &str) -> Result<Effect, Re
     })
 }
 
-fn transition_task(snapshot: &Snapshot, task_id: &str, to: TaskState) -> Result<Effect, Rejection> {
+fn transition_task(
+    snapshot: &Snapshot,
+    candidate: Option<&str>,
+    task_id: &str,
+    to: TaskState,
+) -> Result<Effect, Rejection> {
     let task = named_task(snapshot, task_id)?;
     table(task.state, to)?;
     if !COMMANDER_TASK_MOVES.contains(&(task.state, to)) {
@@ -437,14 +483,12 @@ fn transition_task(snapshot: &Snapshot, task_id: &str, to: TaskState) -> Result<
     if to == TaskState::Ready {
         dependencies_accepted(task)?;
     }
-    if to == TaskState::Accepted && !snapshot.evidence.covers(&task.requirements) {
-        return reject(
-            RejectionReason::EvidenceGateUnmet,
-            format!(
-                "no candidate has passing evidence for every acceptance criterion of {task_id}'s requirements {:?}",
-                task.requirements
-            ),
-        );
+    if to == TaskState::Accepted {
+        snapshot.evidence.gate(
+            candidate,
+            &task.requirements,
+            &format!("accepting {task_id}"),
+        )?;
     }
     Ok(Effect::TransitionTask {
         task_id: task_id.to_owned(),
@@ -456,6 +500,7 @@ fn transition_task(snapshot: &Snapshot, task_id: &str, to: TaskState) -> Result<
 
 fn transition_run(
     snapshot: &Snapshot,
+    candidate: Option<&str>,
     to: RunState,
     accepted: &[String],
 ) -> Result<Effect, Rejection> {
@@ -486,13 +531,12 @@ fn transition_run(
             );
         }
     }
-    if !needed.is_empty() && !snapshot.evidence.covers(&needed) {
-        return reject(
-            RejectionReason::EvidenceGateUnmet,
-            format!(
-                "no candidate has passing evidence for every acceptance criterion of {needed:?}"
-            ),
-        );
+    if !needed.is_empty() {
+        snapshot.evidence.gate(
+            candidate,
+            &needed,
+            &format!("run {} -> {}", from.as_str(), to.as_str()),
+        )?;
     }
     Ok(Effect::TransitionRun { from, to })
 }

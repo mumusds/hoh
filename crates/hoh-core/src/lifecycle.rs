@@ -211,6 +211,8 @@ impl Lifecycle for RunState {
                 Failed,
             ],
             PauseRequested => &[Paused, CancelRequested, Failed],
+            // BLOCKED again when the pause ends while blockers remain (docs/06: the run returns to resume_state only
+            // once the blocker set is empty).
             Paused => &[
                 Created,
                 Discovering,
@@ -218,6 +220,7 @@ impl Lifecycle for RunState {
                 Ready,
                 Running,
                 Verifying,
+                Blocked,
                 CancelRequested,
                 Incomplete,
                 Failed,
