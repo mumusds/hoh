@@ -302,6 +302,8 @@ pub(crate) struct ChildFault {
     pub(crate) stale_counts: bool,
     /// Claim the write lock without taking it, as with file locks that do nothing.
     pub(crate) fake_lock: bool,
+    /// Get past our write lock but take its own for real, as with locks seen in one direction only.
+    pub(crate) ignore_held_lock: bool,
 }
 
 /// The probe's side of the protocol.
@@ -352,7 +354,7 @@ pub(crate) fn probe_child(
                     }
                     Err(e) => format!("error {e}"),
                 },
-                "try-lock" if fault.fake_lock => "acquired".to_owned(),
+                "try-lock" if fault.fake_lock || fault.ignore_held_lock => "acquired".to_owned(),
                 "hold" if fault.fake_lock => "held".to_owned(),
                 "insert-commit" if fault.fake_lock => {
                     match c.execute_batch("INSERT INTO t VALUES (3);") {
@@ -459,6 +461,10 @@ mod tests {
                 fake_lock: true,
                 ..ChildFault::default()
             },
+            Ok("one-way-lock") => ChildFault {
+                ignore_held_lock: true,
+                ..ChildFault::default()
+            },
             _ => ChildFault::default(),
         };
         probe_child(
@@ -483,10 +489,12 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         // M2T01R-02: the second process sees through what one process cannot.
         // `nolock` is a real connection without file locks (SQLite then cannot share the wal-index either);
-        // `fake-lock` claims locks it does not take and `stale` answers like a private wal-index.
+        // `fake-lock` claims locks it does not take, `one-way-lock` ignores ours only, and `stale` answers like a
+        // private wal-index.
         for (fault, steps) in [
             ("nolock", [Step::SharedMemory, Step::Locking].as_slice()),
             ("fake-lock", &[Step::Locking]),
+            ("one-way-lock", &[Step::Locking]),
             ("stale", &[Step::SharedMemory]),
         ] {
             let dir = tempfile::tempdir()?;
