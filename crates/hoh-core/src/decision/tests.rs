@@ -217,14 +217,32 @@ fn the_commander_proposes_only_its_task_moves() {
                 .insert("C1".to_owned(), caps(&["REQ-1"]));
             let p = proposal(json!({"kind": "transition_task", "task_id": "T1", "to_state": to}));
             let verdict = validate(&p, &s);
-            let expected =
-                lifecycle::check(from, to).is_ok() && COMMANDER_TASK_MOVES.contains(&(from, to));
+            // ADR-011 §3.3, stated here independently of the implementation's table (M2T02R-05).
+            use TaskState::*;
+            let expected = matches!(
+                (from, to),
+                (Pending, Ready)
+                    | (Pending, Cancelled)
+                    | (Ready, Pending)
+                    | (Ready, Cancelled)
+                    | (Implemented, Ready)
+                    | (Implemented, Cancelled)
+                    | (Verifying, Accepted)
+            );
             assert_eq!(verdict.is_ok(), expected, "{from:?} -> {to:?}: {verdict:?}");
             if !expected {
                 assert_eq!(reason(&p, &s), IllegalTransition);
             }
         }
     }
+}
+
+#[test]
+fn leasing_goes_through_dispatch_only() {
+    // READY -> LEASED is in the table, but only a dispatch, with its dependency, capability and budget checks, takes it.
+    let lease = proposal(json!({"kind": "transition_task", "task_id": "T1", "to_state": "LEASED"}));
+    assert_eq!(reason(&lease, &snapshot()), IllegalTransition);
+    assert!(validate(&dispatch_t1(), &snapshot()).is_ok());
 }
 
 #[test]

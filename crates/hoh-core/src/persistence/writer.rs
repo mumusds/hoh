@@ -334,13 +334,15 @@ fn compare_and_set(tx: &Transaction<'_>, cas: &StateCas) -> Result<i64, PersistE
         expected: cas.expected_revision,
         actual,
     };
-    // The state, the revision, the saved resume state and whether blockers are recorded.
+    // The state, the revision, the saved resume state and whether blockers are recorded (the set is judged by its JSON
+    // content, so `[ ]` is empty; anything but an array counts as blocked, M2T02R-04).
     let row: Option<(String, i64, Option<String>, bool)> = tx
         .query_row(
             &format!(
                 "SELECT state, revision, {} FROM {table} WHERE {key} = ?1",
                 if entity == Entity::Run {
-                    "resume_state, blocked_reason IS NOT NULL OR blocked_reasons_json <> '[]'"
+                    "resume_state, blocked_reason IS NOT NULL OR json_type(blocked_reasons_json) <> 'array' \
+                     OR json_array_length(blocked_reasons_json) > 0"
                 } else {
                     "NULL, blocked_reason IS NOT NULL"
                 }
