@@ -56,9 +56,12 @@ The boundary is enforced by the compiler, and this scan checks that nothing swit
    not a member's Rust source, still mentioning SQLite). No file of the candidate is a symbolic link (M2T01R-52), and
    `include_str!`/`include_bytes!` may not reach outside the repository. Cargo configurations follow the profile rule
    of check 3 (M2T01R-50) and may not move the build output (`build.target-dir`; only git's ignore rules decide
-   which files are the candidate's, M2T01R-55), and static.sh clears CARGO_PROFILE_* from its environment. Every
-   whitelist entry gives its reason (M2T01R-58). The text of doc attributes (`#[doc = "…"]`, what `///` writes) is
-   documentation, not a literal of check 4 (M2T01R-56).
+   which files are the candidate's, M2T01R-55), and static.sh clears CARGO_PROFILE_* from its environment. The
+   members' Rust sources of checks 3 and 4 are likewise the candidate's files (M2T01R-59). Every whitelist entry
+   gives its reason (M2T01R-58). The value of a doc attribute (`#[doc = …]`, what `///` writes, also in `cfg_attr`)
+   that is not inside a macro invocation is documentation: its literals, the files it embeds and the files its text
+   names are not checked as in check 4 (M2T01R-56, -60); inside a macro invocation it is input the macro may use at
+   run time and is checked (M2T01R-61).
 Out of reach of any of this (docs/22-tooling.md): a program, script or SQL that exists only at run time (a name or
 text assembled from pieces, read from the environment or a file outside the candidate), conditional compilation
 produced by a macro (M2T01R-53/54), and product code that uses a whitelisted development file (a kit test or tool)
@@ -231,13 +234,41 @@ def attribute_spans(code: str) -> list[tuple[int, int]]:
     return out
 
 
+def macro_spans(code: str) -> list[tuple[int, int]]:
+    """(start, end) of every macro invocation and definition (`name!(…)`, `name![…]`, `name!{…}`) in comment- and
+    literal-free code."""
+    out = []
+    pairs = {'(': ')', '[': ']', '{': '}'}
+    for m in re.finditer(r'\b[A-Za-z_]\w*\s*!\s*(?:[A-Za-z_]\w*\s*)?([(\[{])', code):
+        opening, closing, depth, i = m.group(1), pairs[m.group(1)], 0, m.end() - 1
+        while i < len(code):
+            depth += 1 if code[i] == opening else -1 if code[i] == closing else 0
+            if depth == 0:
+                break
+            i += 1
+        out.append((m.start(), i + 1))
+    return out
+
+
+def documentation_spans(code: str) -> list[tuple[int, int]]:
+    """The value of each doc attribute (`#[doc = …]`, also in `cfg_attr`) that is a real attribute: not inside a
+    macro invocation, where `#[doc = "…"]` is only input the macro may use at run time (M2T01R-61). Its literals, the
+    files it embeds and the files its text names are documentation, what `///` writes (M2T01R-56, -60)."""
+    macros = macro_spans(code)
+    out = []
+    for a, b in attribute_spans(code):
+        if any(x < a < y for x, y in macros):
+            continue
+        # The value starts right after `=` (literals are blanked to spaces in `code`).
+        for m in re.finditer(r'[\[(,]\s*doc\s*=', code[a:b]):
+            out.append((a + m.end(), b))
+    return out
+
+
 def runtime_literals(code: str, literals: list[tuple[int, int, str]]) -> list[tuple[int, int, str]]:
-    """The literals but the text of doc attributes (`#[doc = "…"]`, also in `cfg_attr`), which is what `///` writes
-    and never a value at run time (M2T01R-56)."""
-    spans = attribute_spans(code)
-    def documentation(start: int) -> bool:
-        return any(a <= start < b and re.search(r'[\[(,]\s*doc\s*=\s*$', code[a:start]) for a, b in spans)
-    return [lit for lit in literals if not documentation(lit[0])]
+    """The literals but those of documentation (`documentation_spans`)."""
+    docs = documentation_spans(code)
+    return [lit for lit in literals if not any(a <= lit[0] < b for a, b in docs)]
 
 
 def literal_strings(code: str, literals: list[tuple[int, int, str]]) -> list[str]:
@@ -345,13 +376,18 @@ def member_dirs(metadata: dict) -> list[Path]:
     return sorted({Path(packages[m]['manifest_path']).parent for m in metadata['workspace_members']})
 
 
-def rust_files(metadata: dict) -> list[Path]:
-    """Every .rs file in the member directories but the build output (`cargo metadata`'s target directory). Which of
-    them are compiled into the product depends on targets and module paths, so the lint checks look at all of them
-    (M2T01R-25, -29)."""
+def rust_files(root: Path, metadata: dict) -> list[Path]:
+    """Every .rs file of the candidate in the member directories: in a git work tree the candidate's files (git's
+    ignore rules alone decide, so a member beside a moved build output is read, M2T01R-59), elsewhere every file but
+    the build output. Which of them are compiled into the product depends on targets and module paths, so the lint
+    checks look at all of them (M2T01R-25, -29)."""
+    dirs = member_dirs(metadata)
+    if (root / '.git').exists():
+        return [p for p in repository_files(root, metadata)
+                if p.suffix == '.rs' and p.is_file() and not p.is_symlink() and any(p.is_relative_to(d) for d in dirs)]
     build = Path(metadata.get('target_directory') or '/nonexistent').resolve()
     files = set()
-    for d in member_dirs(metadata):
+    for d in dirs:
         files |= {p for p in d.rglob('*.rs') if not p.resolve().is_relative_to(build)}
     return sorted(files)
 
@@ -550,7 +586,7 @@ def scan(root: Path, metadata: dict) -> dict:
     hits = []
     dev_uses = dependency_checks(metadata, hits)
     lint_configuration_checks(root, metadata, hits)
-    files = rust_files(metadata)
+    files = rust_files(root, metadata)
     forbid_checks(root, metadata, hits)
     for src in targets_outside_members(metadata):
         hits.append({'path': rel_to(Path(src), root), 'kind': 'target-outside-members',
@@ -583,18 +619,20 @@ def scan(root: Path, metadata: dict) -> dict:
                 hits.append({'path': rel, 'kind': 'clippy-cfg', 'match': predicate[:200]})
         if is_test_code(path, metadata):
             continue
-        for kind, value in included_contents(path, code, literals, root):
+        runtime = runtime_literals(code, literals)
+        docs = documentation_spans(code)
+        for kind, value in included_contents(path, code, literals, root, skip=docs):
             if kind == 'unverifiable':
                 hits.append({'path': rel, 'kind': 'included-file', 'match': value})
             elif re.search(r'sqlite', value, re.IGNORECASE) or SQL_WRITE.search(value):
                 hits.append({'path': rel, 'kind': 'included-file', 'match': f'{kind}: mentions SQLite or holds a SQL write'})
-        for named, text in named_repository_files(root, path, literals):
+        for named, text in named_repository_files(root, path, runtime):
             # A literal naming a repository file that something runs or reads (`python3 scripts/db_helper.py`) is
             # checked like the literal itself (M2T01R-45).
             if re.search(r'sqlite', text, re.IGNORECASE) or SQL_WRITE.search(text):
                 hits.append({'path': rel, 'kind': 'named-file', 'match': f'{named}: mentions SQLite or holds a SQL write'})
         sqlite_seen = []
-        for value in literal_strings(code, runtime_literals(code, literals)):
+        for value in literal_strings(code, runtime):
             if m := SQL_WRITE.search(value):
                 hits.append({'path': rel, 'kind': 'sql', 'match': ' '.join(m.group(0).split())})
             elif re.search(r'sqlite', value, re.IGNORECASE) and not any(s in value for s in sqlite_seen):
@@ -742,12 +780,15 @@ def content_checks(root: Path, metadata: dict, hits: list) -> int:
     return read
 
 
-def included_contents(path: Path, code: str, literals: list[tuple[int, int, str]], root: Path) -> list[tuple[str, str]]:
+def included_contents(path: Path, code: str, literals: list[tuple[int, int, str]], root: Path,
+                      skip: list[tuple[int, int]] = ()) -> list[tuple[str, str]]:
     """The contents of the files a source embeds with `include_str!`/`include_bytes!` ((file, text) pairs), read like
     its literals: an embedded helper run by an interpreter is code too (M2T01R-41). A path that is not a plain literal
     cannot be read here and is reported as unverifiable."""
     out = []
     for m in re.finditer(r'\binclude_(?:str|bytes)\s*!\s*[(\[{]', code):
+        if any(a <= m.start() < b for a, b in skip):
+            continue  # embedded into documentation only
         lit = next((l for l in literals if l[0] >= m.end()), None)
         if lit is None or code[m.end():lit[0]].strip():
             out.append(('unverifiable', 'include_str!/include_bytes! of a computed path'))
