@@ -259,6 +259,19 @@ fn migration_statements_are_classified_by_their_keyword() -> R {
             2,
             "BEGIN EXCLUSIVE TRANSACTION; CREATE TABLE b(x); REINDEX b; ANALYZE; PRAGMA user_version = 2; END;",
         ),
+        // A byte-order mark, an empty statement or a comment before the script's own BEGIN does not hide it.
+        (
+            3,
+            "\u{feff}BEGIN; CREATE TABLE c(x); PRAGMA user_version = 3; COMMIT;",
+        ),
+        (
+            4,
+            "; BEGIN IMMEDIATE; CREATE TABLE d(x); PRAGMA user_version = 4; ; COMMIT;",
+        ),
+        (
+            5,
+            "-- header\n/* note */ ; BEGIN; CREATE TABLE e(x); PRAGMA user_version = 5; END;",
+        ),
     ] {
         let conn = Connection::open(dir.path().join(format!("ok{version}.db")))?;
         assert_eq!(migrate(&conn, &[(version, script)])?, version, "{script}");
