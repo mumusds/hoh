@@ -154,7 +154,6 @@ async fn moves_outside_the_table_or_from_another_state_write_nothing() -> R {
     store.upsert_session(session(None)).await?;
     store.create_attempt(attempt()).await?;
     let events = || store.reader().and_then(|r| r.events("R")).map(|e| e.len());
-    let before = events()?;
     // PREPARED never becomes UNKNOWN_EFFECT: nothing external has happened yet.
     match store
         .move_attempt(step(Prepared, UnknownEffect, AttemptFacts::default()))
@@ -181,6 +180,28 @@ async fn moves_outside_the_table_or_from_another_state_write_nothing() -> R {
         store.move_attempt(unknown).await,
         Err(PersistError::StaleState { actual: None, .. })
     ));
+    // An attempt event is recorded once under its name.
+    store
+        .attempt_event(
+            "A1",
+            "diag-1",
+            "adapter.diagnostic",
+            json!({"line": "not json"}),
+        )
+        .await?;
+    assert!(matches!(
+        store
+            .attempt_event("A1", "diag-1", "adapter.diagnostic", json!({}))
+            .await,
+        Err(PersistError::IntegrityViolation(_))
+    ));
+    assert!(matches!(
+        store
+            .attempt_event("A9", "diag-1", "adapter.diagnostic", json!({}))
+            .await,
+        Err(PersistError::IntegrityViolation(_))
+    ));
+    let before = events()?;
     // A terminal attempt stays terminal; a retry is a new attempt.
     store
         .move_attempt(step(Prepared, Failed, AttemptFacts::default()))

@@ -543,6 +543,25 @@ impl Store {
             .await
     }
 
+    /// Append an event of attempt `attempt_id` (kind and payload as given); `name` makes its id unique within the
+    /// attempt, so recording the same one twice fails instead of duplicating it.
+    pub async fn attempt_event(
+        &self,
+        attempt_id: &str,
+        name: &str,
+        kind: &str,
+        payload: serde_json::Value,
+    ) -> Result<(), PersistError> {
+        self.writer
+            .attempt(attempts::AttemptJob::Event {
+                attempt_id: attempt_id.to_owned(),
+                name: name.to_owned(),
+                kind: kind.to_owned(),
+                payload,
+            })
+            .await
+    }
+
     /// Record the project row if it is not there yet.
     pub async fn ensure_project(
         &self,
