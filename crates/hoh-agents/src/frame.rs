@@ -3,7 +3,7 @@
 //! Frames are split on the byte 0x0A only, never on U+2028/U+2029 or other line separators, and one CR before the
 //! LF is dropped (it does not count against the limit, however the CR and LF are split across reads); decoding
 //! (UTF-8, JSON) is the adapter's job. A frame longer than the limit is refused without buffering further: the reader
-//! holds at most `limit + chunk` bytes, reports the length it saw, the sha256 of those bytes and their first 4 KiB,
+//! holds at most `limit + chunk` bytes (`chunk` is at least 2), reports the length it saw, the sha256 of those bytes and their first 4 KiB,
 //! and yields no further frames.
 
 use sha2::{Digest, Sha256};
@@ -56,7 +56,9 @@ pub struct FrameReader<R> {
 }
 
 impl<R: AsyncRead + Unpin> FrameReader<R> {
-    /// A reader refusing frames longer than `limit` bytes and reading at most `chunk` bytes at a time.
+    /// A reader refusing frames longer than `limit` bytes. `chunk` (raised to at least 2) is the allocation step: the
+    /// buffer grows by at most `chunk` bytes per read and never holds more than `limit + chunk` bytes in total; a
+    /// single read may return more than `chunk` bytes when earlier growth left spare capacity (M1T02R-04).
     pub fn new(inner: R, limit: usize, chunk: usize) -> Self {
         Self {
             inner,
