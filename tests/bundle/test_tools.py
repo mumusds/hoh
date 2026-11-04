@@ -354,22 +354,32 @@ class PersistenceScan(unittest.TestCase):
             self.assertEqual(sorted(h['match'] for h in res['hits'] if h['kind']=='cargo-config'),
                              ['alias.clippy','build.rustc-wrapper','env','target.x86_64-unknown-linux-gnu.rustflags'])
     def test_every_target_root_forbids_the_lint(self):
-        # M2T01R-27..29: `forbid` makes the compiler reject any later allow (raw identifier, cfg_attr, macro-generated),
-        # so the scan checks that every target root has it, wherever the root lies, and hoh-core's root structure.
-        F='// boundary\n#![forbid(clippy::disallowed_methods)]\n'
+        # M2T01R-27..29, -31, -33, -34: `forbid` makes the compiler reject any later allow (raw identifier, cfg_attr,
+        # macro-generated), so every target root, wherever it lies, must carry it in its leading inner attributes (one in
+        # an inline module covers that module only), together with forbid(unsafe_code); no build scripts.
+        F='// boundary\n#![forbid(clippy::disallowed_methods)]\n#![forbid(unsafe_code)]\n'
         files={'crates/hoh-agents/src/lib.rs':'//! docs\n'+F+'pub mod x;',
                'crates/hoh-app/src/main.rs':'fn main(){}',
-               'outside.rs':'#![forbid(clippy::style)]\nfn main(){}',
+               'crates/hoh-app/src/bin/inner.rs':'#![forbid(unsafe_code)]\nmod m { #![forbid(clippy::disallowed_methods)] }\nfn main(){}',
+               'crates/hoh-app/src/bin/no_unsafe.rs':'#![forbid(clippy::disallowed_methods)]\nfn main(){}',
+               'outside.rs':'#![forbid(clippy::style)]\n#![forbid(unsafe_code)]\nfn main(){}',
                'crates/hoh-app/tests/t.rs':F+'#[test] fn t(){}',
-               'crates/hoh-core/src/lib.rs':'//! core\n#[cfg(x)]\n#[forbid(clippy::disallowed_methods)]\nmod a;\npub mod persistence;\n'
+               'crates/hoh-app/build.rs':F+'fn main(){}',
+               'crates/hoh-core/src/lib.rs':'//! core\n#![forbid(unsafe_code)]\n#[cfg(x)]\n#[forbid(clippy::disallowed_methods)]\nmod a;\npub mod persistence;\n'
                                            'pub mod protocol;\npub const VERSION: &str = env!("CARGO_PKG_VERSION");\nfn extra() {}'}
-        targets={'hoh-agents':[('lib','crates/hoh-agents/src/lib.rs')],'hoh-app':[('bin','crates/hoh-app/src/main.rs'),('bin','outside.rs'),('test','crates/hoh-app/tests/t.rs')],
+        targets={'hoh-agents':[('lib','crates/hoh-agents/src/lib.rs')],
+                 'hoh-app':[('bin','crates/hoh-app/src/main.rs'),('bin','crates/hoh-app/src/bin/inner.rs'),('bin','crates/hoh-app/src/bin/no_unsafe.rs'),
+                            ('bin','outside.rs'),('test','crates/hoh-app/tests/t.rs'),('custom-build','crates/hoh-app/build.rs')],
                  'hoh-core':[('lib','crates/hoh-core/src/lib.rs')]}
         rc,res=self.run_scan(files,targets=targets)
         self.assertEqual(rc,1)
         self.assertEqual(sorted((h['path'],h['kind'],h['match']) for h in res['hits']),
-                         [('crates/hoh-app/src/main.rs','missing-forbid','hoh-app bin root'),('crates/hoh-core/src/lib.rs','core-root','fn extra() {}'),
-                          ('crates/hoh-core/src/lib.rs','missing-forbid','mod protocol'),('outside.rs','missing-forbid','hoh-app bin root')])
+                         [('crates/hoh-app/build.rs','build-script','hoh-app build script'),
+                          ('crates/hoh-app/src/bin/inner.rs','missing-forbid','hoh-app bin root'),
+                          ('crates/hoh-app/src/bin/no_unsafe.rs','missing-forbid','hoh-app bin root: unsafe_code'),
+                          ('crates/hoh-app/src/main.rs','missing-forbid','hoh-app bin root'),('crates/hoh-app/src/main.rs','missing-forbid','hoh-app bin root: unsafe_code'),
+                          ('crates/hoh-core/src/lib.rs','core-root','fn extra() {}'),('crates/hoh-core/src/lib.rs','missing-forbid','mod protocol'),
+                          ('outside.rs','missing-forbid','hoh-app bin root')])
     def test_new_rusqlite_features_need_the_boundary_extended(self):
         rc,res=self.run_scan({},features=['bundled','default','backup'])
         self.assertEqual(self.kinds(res),[('Cargo.lock','rusqlite-feature')])

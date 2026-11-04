@@ -17,9 +17,13 @@ The boundary is enforced by the compiler, and this scan checks that nothing swit
    cargo configuration that applies (the repository's, its ancestors', `$CARGO_HOME`'s) sets rustflags, a compiler or
    wrapper, compiler environment or aliases of the check's commands, and that no source outside persistence/ allows or expects
    `clippy::disallowed_methods` or a group holding it (`clippy::style`, `clippy::all`, `warnings`).
-3. Lint levels: every target root of every workspace member (from `cargo metadata`, wherever it lies) starts with
-   `#![forbid(clippy::disallowed_methods)]`, and hoh-core's library root holds only module declarations, each but
-   `persistence` with `#[forbid(clippy::disallowed_methods)]`, and the VERSION constant. `forbid` makes the compiler
+3. Lint levels: every target root of every workspace member (from `cargo metadata`, wherever it lies) starts — in
+   its leading inner attributes, which alone apply to the whole crate — with `#![forbid(unsafe_code)]` (no way around
+   through SQLite's C interface) and `#![forbid(clippy::disallowed_methods)]`, except hoh-core's library root, which
+   holds `#![forbid(unsafe_code)]`, only module declarations, each but `persistence` with
+   `#[forbid(clippy::disallowed_methods)]`, and the VERSION constant. The workspace has no build scripts (one could
+   give its crate another clippy configuration through `cargo:rustc-env`). static.sh lints with `--all-features`, so
+   targets with required-features are compiled too. `forbid` makes the compiler
    reject any later `allow` of the lint, however it is written or generated (raw identifiers, `cfg_attr`, macros).
    Every .rs file of the member directories but the build output is also read: no `allow`/`expect` of the lint or a
    group holding it outside persistence/ (an early, readable signal), and no `#[path = …]` (also in `cfg_attr`) or
@@ -281,6 +285,7 @@ def rust_files(metadata: dict) -> list[Path]:
 
 
 FORBID = '#![forbid(clippy::disallowed_methods)]'
+FORBID_UNSAFE = '#![forbid(unsafe_code)]'
 CORE_LIB_ITEM = re.compile(r'(?P<attrs>(?:#\[[^\]]*\]\s*)*)(?:pub\s+)?mod\s+(?P<name>\w+)\s*;')
 CORE_VERSION = re.compile(r'pub\s+const\s+VERSION\s*:\s*&\s*str\s*=\s*env!\s*\(\s*\)\s*;')
 
@@ -303,7 +308,17 @@ def forbid_checks(root: Path, metadata: dict, hits: list) -> None:
             except OSError as exc:
                 hits.append({'path': rel, 'kind': 'target-root', 'match': f'unreadable: {exc}'})
                 continue
-            if package['name'] == CORE and 'lib' in (target.get('kind') or []):
+            kinds = set(target.get('kind') or [])
+            if 'custom-build' in kinds:
+                # A build script can give the crate's compilation its own clippy configuration
+                # (`cargo:rustc-env=CLIPPY_CONF_DIR=…`); the workspace has none (M2T01R-33).
+                hits.append({'path': rel, 'kind': 'build-script', 'match': f"{package['name']} build script"})
+                continue
+            leading = leading_inner_attributes(code)
+            if FORBID_UNSAFE not in leading:
+                # Without it SQLite's C interface is reachable through unsafe code (M2T01R-34).
+                hits.append({'path': rel, 'kind': 'missing-forbid', 'match': f"{package['name']} {'/'.join(sorted(kinds))} root: unsafe_code"})
+            if package['name'] == CORE and 'lib' in kinds:
                 rest = code
                 for m in CORE_LIB_ITEM.finditer(code):
                     attrs = re.sub(r'\s+', '', m.group('attrs'))
@@ -311,13 +326,29 @@ def forbid_checks(root: Path, metadata: dict, hits: list) -> None:
                         hits.append({'path': rel, 'kind': 'missing-forbid', 'match': f"mod {m.group('name')}"})
                     rest = rest.replace(m.group(0), ' ', 1)
                 rest = CORE_VERSION.sub(' ', rest)
-                rest = re.sub(r'#\s*!\s*\[[^\]]*\]', ' ', rest)
+                rest = re.sub(r'#\s*!\s*\[[^\]]*\]', ' ', rest, count=len(leading))
                 if rest.strip():
                     hits.append({'path': rel, 'kind': 'core-root', 'match': ' '.join(rest.split())[:200]})
-            else:
-                inner = [re.sub(r'\br#', '', re.sub(r'\s+', '', a)) for a in attributes(code) if re.match(r'#\s*!', a)]
-                if FORBID not in inner:
-                    hits.append({'path': rel, 'kind': 'missing-forbid', 'match': f"{package['name']} {'/'.join(target.get('kind') or [])} root"})
+            elif FORBID not in leading:
+                hits.append({'path': rel, 'kind': 'missing-forbid', 'match': f"{package['name']} {'/'.join(sorted(kinds))} root"})
+
+
+def leading_inner_attributes(code: str) -> list[str]:
+    """The inner attributes at the very start of a root file (comments already blanked), normalised: only these apply
+    to the whole crate; one inside an inline module applies to that module alone (M2T01R-31)."""
+    out, i = [], 0
+    while True:
+        m = re.match(r'\s*#\s*!\s*\[', code[i:])
+        if not m:
+            return out
+        start, depth, j = i + m.end() - 1, 0, i + m.end() - 1
+        while j < len(code):
+            depth += {'[': 1, ']': -1}.get(code[j], 0)
+            if depth == 0:
+                break
+            j += 1
+        out.append(re.sub(r'\br#', '', re.sub(r'\s+', '', code[i:j + 1])))
+        i = j + 1
 
 
 def is_test_code(path: Path, metadata: dict) -> bool:

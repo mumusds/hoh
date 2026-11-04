@@ -3,7 +3,10 @@
 //!
 //! Only `persistence` may call SQLite (AC-062-05): every other module forbids clippy's `disallowed_methods`, so no
 //! attribute inside it, however written or generated, can allow the lint. This file holds module declarations only
-//! (scripts/product/persistence_scan.py checks it).
+//! (scripts/product/persistence_scan.py checks it). Unsafe code is forbidden in the whole crate, so SQLite's C interface
+//! cannot be reached either.
+
+#![forbid(unsafe_code)]
 
 #[cfg(hoh_clippy_canary)]
 #[forbid(clippy::disallowed_methods)]

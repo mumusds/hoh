@@ -1,8 +1,9 @@
 //! M1-T02 process substrate: orphans, backpressure, oversized frames and children that ignore SIGTERM
 //! (docs/13-adapters.md "进程与终结").
 
-// No SQLite outside hoh-core::persistence (AC-062-05); see clippy.toml.
+// No SQLite outside hoh-core::persistence (AC-062-05; see clippy.toml), and no unsafe code (no FFI way around it).
 #![forbid(clippy::disallowed_methods)]
+#![forbid(unsafe_code)]
 
 use hoh_agents::frame::{Frame, HEAD_BYTES};
 use hoh_agents::process::{
