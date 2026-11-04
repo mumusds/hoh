@@ -2,8 +2,8 @@
 # Check "adapter-live" (mode live, TEST-025-04): the Claude adapter against the installed `claude` CLI, with model
 # calls. Runs crates/hoh-agents/tests/claude_live.rs (an ignored test whose name carries no TEST id, so the integration
 # check never reports TEST-025-04 as skipped) and turns its verdict into $HOH_EVIDENCE_DIR/test-results.jsonl
-# and live-sessions.json (contracts/live-session.schema.json). Exit 0 = PASS, 3 = BLOCKED (claude missing or not
-# logged in; never reported as PASS), 1 = FAIL. The parent agent session's variables are removed first, as the
+# and live-sessions.json (contracts/live-session.schema.json). Exit 0 = PASS, 3 = BLOCKED (claude missing, not logged
+# in, or run as root; never reported as PASS), 1 = FAIL. The parent agent session's variables are removed first, as the
 # protocol recorder does, so a nested run is a fresh native session.
 set -Eeuo pipefail
 cd "$(dirname -- "${BASH_SOURCE[0]}")/../.."
@@ -17,6 +17,9 @@ rm -f "$verdict"
 claude_bin="$(command -v claude || true)"
 if [[ -z "$claude_bin" ]]; then
   printf '{"status": "BLOCKED", "detail": "claude is not installed", "sessions": []}\n' > "$verdict"
+elif [[ "$(id -u)" == 0 ]]; then
+  # AC-025-04 runs as a non-root user: the adapter never bypasses permissions as root.
+  printf '{"status": "BLOCKED", "detail": "running as root", "sessions": []}\n' > "$verdict"
 else
   HOH_LIVE_OUT="$out" HOH_LIVE_CLAUDE="$claude_bin" cargo test -p hoh-agents --locked --test claude_live -- \
     --ignored --exact claude_live_turns_resume_and_cancel --nocapture > "$out/claude-live.log" 2>&1 || true
