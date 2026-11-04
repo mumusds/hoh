@@ -22,8 +22,9 @@ The boundary is enforced by the compiler, and this scan checks that nothing swit
    through SQLite's C interface) and `#![forbid(clippy::disallowed_methods)]`, except hoh-core's library root, which
    holds `#![forbid(unsafe_code)]`, only module declarations, each but `persistence` with
    `#[forbid(clippy::disallowed_methods)]`, and the VERSION constant. The workspace has no build scripts (one could
-   give its crate another clippy configuration through `cargo:rustc-env`). static.sh lints with `--all-features`, so
-   targets with required-features are compiled too. `forbid` makes the compiler
+   give its crate another clippy configuration through `cargo:rustc-env`), the members declare no Cargo features (so
+   the one build clippy checks is the build, M2T01R-32/-35), and no product source has a `clippy` cfg predicate
+   (`cfg(not(clippy))` would compile code clippy never sees, M2T01R-36). `forbid` makes the compiler
    reject any later `allow` of the lint, however it is written or generated (raw identifiers, `cfg_attr`, macros).
    Every .rs file of the member directories but the build output is also read: no `allow`/`expect` of the lint or a
    group holding it outside persistence/ (an early, readable signal), and no `#[path = …]` (also in `cfg_attr`) or
@@ -34,7 +35,9 @@ The boundary is enforced by the compiler, and this scan checks that nothing swit
    --canary-log checks that clippy refused each of them there and failed for no other reason. This proves the lint in
    force for hoh-core's library in the environment the check runs in; for the other targets the forbid levels and
    the configuration checks of 2 hold it.
-4. Defence in depth: string literals outside persistence/ (and outside tests, benches, examples) that hold a SQL write statement (INSERT/REPLACE INTO,
+4. String literals outside persistence/ in non-test code (test code: files of test, bench and example targets only,
+   from `cargo metadata`) may not mention sqlite at all — no SQLite command line or interpreter module run as a
+   subprocess (M2T01R-38) — and, in depth, may not hold a SQL write statement (INSERT/REPLACE INTO,
    UPDATE ... SET, DELETE FROM, UPSERT, ON CONFLICT ... DO UPDATE), decoded as Rust does (escapes, line
    continuations), with literals separated only by commas joined (concat!), are hits.
 5. web/ (when present): no SQLite package in package.json dependencies (by name or npm: alias spec), nowhere in a
@@ -213,7 +216,8 @@ def attributes(code: str) -> list[str]:
 def load_metadata(root: Path, path: Path | None) -> dict:
     if path:
         return json.loads(path.read_text(encoding='utf-8'))
-    r = subprocess.run(['cargo', 'metadata', '--format-version', '1', '--locked'], cwd=root,
+    # --all-features: the dependency features that any build could enable are the ones checked (M2T01R-37).
+    r = subprocess.run(['cargo', 'metadata', '--format-version', '1', '--locked', '--all-features'], cwd=root,
                        capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError(f'cargo metadata failed: {r.stderr.strip()[-2000:]}')
@@ -239,6 +243,12 @@ def dependency_checks(metadata: dict, hits: list) -> list[dict]:
             if sqlite_package(packages[dep['pkg']]['name']) and any(k['kind'] == 'build' for k in dep['dep_kinds']):
                 hits.append({'path': packages[core]['manifest_path'], 'kind': 'build-dependency',
                              'match': f"{CORE} build -> {packages[dep['pkg']]['name']}"})
+    for member in members:
+        if packages[member].get('features'):
+            # A feature can compile code clippy never sees (`cfg(not(feature = …))` against an all-features lint, or
+            # the reverse) and can switch on dependency APIs; the members declare none (M2T01R-35).
+            hits.append({'path': packages[member]['manifest_path'], 'kind': 'features',
+                         'match': f"{packages[member]['name']} declares {sorted(packages[member]['features'])}"})
     for node in nodes.values():
         if packages[node['id']]['name'] == 'rusqlite':
             extra = sorted(set(node.get('features') or []) - KNOWN_RUSQLITE_FEATURES)
@@ -352,9 +362,23 @@ def leading_inner_attributes(code: str) -> list[str]:
 
 
 def is_test_code(path: Path, metadata: dict) -> bool:
-    """Under tests/, benches/ or examples/ of a member (only for the SQL-literal check)."""
-    return any(path.is_relative_to(d) and {'tests', 'benches', 'examples'} & set(path.relative_to(d).parts[:-1])
-               for d in member_dirs(metadata))
+    """Whether a file belongs to test, bench or example targets only: it lies in the directory of such a target's root
+    and no other target's root lies in that directory (from `cargo metadata`; without target information, the
+    member's tests/, benches/ and examples/ directories)."""
+    members = set(metadata['workspace_members'])
+    roots = [(set(t.get('kind') or []), Path(t['src_path']).resolve()) for p in metadata['packages'] if p['id'] in members
+             for t in p.get('targets') or []]
+    if not roots:
+        return any(path.is_relative_to(d) and {'tests', 'benches', 'examples'} & set(path.relative_to(d).parts[:-1])
+                   for d in member_dirs(metadata))
+    test_kinds = {'test', 'bench', 'example'}
+    path = path.resolve()
+    for kinds, root in roots:
+        d = root.parent
+        if kinds <= test_kinds and path.is_relative_to(d) and \
+                not any(not k <= test_kinds and r.is_relative_to(d) for k, r in roots):
+            return True
+    return False
 
 
 def lint_configuration_checks(root: Path, metadata: dict, hits: list) -> None:
@@ -443,12 +467,21 @@ def scan(root: Path, metadata: dict) -> dict:
         for attr in compact:
             if re.search(r'(?:allow|expect)\(', attr) and SUPPRESSING.search(attr):
                 hits.append({'path': rel, 'kind': 'lint-suppressed', 'match': attr[:200]})
-
+        # Code compiled only outside clippy (`cfg(not(clippy))`) escapes the lint (M2T01R-36).
+        for predicate in cfg_predicates(code):
+            if re.search(r'\bclippy\b', predicate):
+                hits.append({'path': rel, 'kind': 'clippy-cfg', 'match': predicate[:200]})
         if is_test_code(path, metadata):
             continue
+        sqlite_seen = []
         for value in literal_strings(code, literals):
             if m := SQL_WRITE.search(value):
                 hits.append({'path': rel, 'kind': 'sql', 'match': ' '.join(m.group(0).split())})
+            elif re.search(r'sqlite', value, re.IGNORECASE) and not any(s in value for s in sqlite_seen):
+                # e.g. `Command::new("sqlite3")` or `import sqlite3` for another interpreter (M2T01R-38); a joined run
+                # is reported only when no literal of it was.
+                sqlite_seen.append(value)
+                hits.append({'path': rel, 'kind': 'sqlite-literal', 'match': value[:200]})
     web = root / 'web'
     web_files = 0
     if web.is_dir():
@@ -496,6 +529,22 @@ def canary_verdict(log: str) -> dict:
             other.append(line[:200])
     problems = [f'not refused: {p}' for p in sorted(CANARY_REQUIRED - refused)] + other
     return {'refused': len(refused), 'required': len(CANARY_REQUIRED), 'problems': problems}
+
+
+def cfg_predicates(code: str) -> list[str]:
+    """The predicates of every `cfg(…)`, `cfg_attr(…)` and `cfg!(…)` in comment- and literal-free code."""
+    out = []
+    for m in re.finditer(r'\bcfg(_attr)?\s*!?\s*\(', code):
+        depth, i, cut = 0, m.end() - 1, None
+        while i < len(code):
+            depth += {'(': 1, ')': -1}.get(code[i], 0)
+            if depth == 0:
+                break
+            if depth == 1 and code[i] == ',' and m.group(1) and cut is None:
+                cut = i  # cfg_attr(predicate, attributes…): only the predicate is a condition
+            i += 1
+        out.append(' '.join(code[m.end():cut if cut is not None else i].split()))
+    return out
 
 
 def json_strings(value) -> list[str]:
