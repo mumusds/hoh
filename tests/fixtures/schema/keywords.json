@@ -1,5 +1,5 @@
 {
- "note": "JSON Schema keyword semantics the product validator implements (M1-T01). `valid` is the verdict the product validator must give; tests/bundle/test_bundle.py checks that Python jsonschema gives the same verdict, or `python_valid` where Python knowingly differs.",
+ "note": "JSON Schema keyword semantics the product validator implements (M1-T01). `valid` is the verdict the product validator must give; tests/bundle/test_bundle.py checks that Python jsonschema gives the same verdict, or `python_valid` where Python knowingly differs (ECMA-262 `$`, and numbers HoH cannot compare exactly, which it refuses).",
  "cases": [
   {
    "note": "maximum compares integers exactly beyond 2^53",
@@ -119,12 +119,13 @@
    "valid": false
   },
   {
-   "note": "integer: a huge integral float",
+   "note": "1e300 is outside the range HoH compares exactly (|n| >= 2^63 negative or >= 2^64), so it is refused; Python accepts it as an integer",
    "schema": {
     "type": "integer"
    },
    "instance": 1e+300,
-   "valid": true
+   "valid": false,
+   "python_valid": true
   },
   {
    "note": "minLength given as 1.0",
@@ -434,6 +435,51 @@
     }
    },
    "valid": false
+  },
+  {
+   "note": "an integer beyond u64 is refused (serde_json would round it); Python agrees it exceeds the maximum",
+   "schema": {
+    "maximum": 9223372036854775807
+   },
+   "instance": 18446744073709551617,
+   "valid": false
+  },
+  {
+   "note": "an integer beyond u64 is refused even where Python accepts it",
+   "schema": {
+    "type": "integer"
+   },
+   "instance": 18446744073709551617,
+   "valid": false,
+   "python_valid": true
+  },
+  {
+   "note": "distinct integers beyond u64 are refused rather than compared after rounding",
+   "schema": {
+    "uniqueItems": true
+   },
+   "instance": [
+    18446744073709551616,
+    18446744073709551617
+   ],
+   "valid": false,
+   "python_valid": true
+  },
+  {
+   "note": "an integer below i64 is refused",
+   "schema": {
+    "minimum": -9223372036854775808
+   },
+   "instance": -9223372036854775809,
+   "valid": false
+  },
+  {
+   "note": "u64 max is still exact",
+   "schema": {
+    "maximum": 18446744073709551615
+   },
+   "instance": 18446744073709551615,
+   "valid": true
   }
  ]
 }

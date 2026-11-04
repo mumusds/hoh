@@ -231,3 +231,22 @@ fn integral_floats_decode_like_integers() -> R {
     assert!(protocol::decode::<Event>(&event_raw).is_err());
     Ok(())
 }
+
+#[test]
+fn deep_unknown_payloads_are_an_error_not_a_crash() -> R {
+    // M1T01R-11: the Event schema leaves payload free-form; decode must refuse an absurdly deep one without recursing.
+    let cases = corpus()?;
+    let event = cases
+        .iter()
+        .find(|c| c["def"] == "Event" && c["valid"] == true)
+        .ok_or("event")?;
+    let mut raw = event["instance"].clone();
+    let mut deep = serde_json::json!([]);
+    for _ in 0..100_000 {
+        deep = Value::Array(vec![deep]);
+    }
+    raw["payload"]["deep"] = deep;
+    assert!(protocol::decode::<Event>(&raw).is_err());
+    std::mem::forget(raw); // a 100k-deep value cannot be dropped recursively on the test stack
+    Ok(())
+}

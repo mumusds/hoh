@@ -270,3 +270,48 @@ fn codex_schema_output_must_be_a_schema() -> R {
     }
     Ok(())
 }
+
+#[test]
+fn codex_capabilities_come_from_the_schema_method_lists() -> R {
+    // M1T01R-15: JSON that is not a protocol schema is a failure; capabilities come from the request/notification
+    // method lists, not from strings found anywhere in the output.
+    let tmp = tempfile::tempdir()?;
+    let codex_fix = fixtures().join("codex/0.166.0");
+    let write = |files: &str| {
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n exec) cat '{f}/help-exec.txt';;\n \
+             app-server) case \"$2\" in --help) cat '{f}/help-app-server.txt';; generate-json-schema) mkdir -p \"$4\" && cd \"$4\" && {files};; esac;;\nesac\n",
+            f = codex_fix.display()
+        )
+    };
+    let methods = |list: &[&str]| {
+        let items: Vec<String> = list
+            .iter()
+            .map(|m| format!("{{\"properties\":{{\"method\":{{\"enum\":[\"{m}\"]}}}}}}"))
+            .collect();
+        format!("{{\"oneOf\":[{}]}}", items.join(","))
+    };
+    for (name, files) in [
+        ("null", "echo null > ClientRequest.json && echo null > ServerNotification.json".to_owned()),
+        ("array", "echo '[\"turn/steer\",\"thread/resume\"]' > ClientRequest.json && echo '{}' > ServerNotification.json".to_owned()),
+        ("no-notifications", format!("echo '{}' > ClientRequest.json", methods(&["turn/steer"]))),
+    ] {
+        let (dir, _) = fake(tmp.path(), name, "codex", &write(&files))?;
+        assert!(probe(Agent::Codex, &env_for(&dir)).is_err(), "{name} schema output accepted");
+    }
+    // A minimal well-formed schema: steer requests exist, resume and deltas do not; a stray string elsewhere is ignored.
+    let files = format!(
+        "echo '{}' > ClientRequest.json && echo '{}' > ServerNotification.json && echo '\"thread/resume\"' > Other.json",
+        methods(&["initialize", "turn/steer"]),
+        methods(&["turn/completed"])
+    );
+    let (dir, _) = fake(tmp.path(), "minimal", "codex", &write(&files))?;
+    let entry = probe(Agent::Codex, &env_for(&dir))?;
+    assert_eq!(entry.capabilities.get("mid_turn_steer"), Some(&Some(true)));
+    assert_eq!(entry.capabilities.get("resume"), Some(&Some(false)));
+    assert_eq!(
+        entry.capabilities.get("partial_messages"),
+        Some(&Some(false))
+    );
+    Ok(())
+}

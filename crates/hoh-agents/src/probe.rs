@@ -145,29 +145,62 @@ fn probe_codex(
         return Ok((Transport::Exec, help, None));
     }
     help.extend_from_slice(&app.stdout);
-    let (schema_hash, schema_text) = codex_schema(launcher, env)?;
+    let schema = codex_schema(launcher, env)?;
     set(caps, "structured_events", true);
-    set(caps, "resume", contains(&schema_text, "\"thread/resume\""));
+    set(caps, "resume", schema.requests.contains("thread/resume"));
     set(
         caps,
         "mid_turn_steer",
-        contains(&schema_text, "\"turn/steer\""),
+        schema.requests.contains("turn/steer"),
     );
     set(
         caps,
         "partial_messages",
-        contains(&schema_text, "item/agentMessage/delta"),
+        schema.notifications.contains("item/agentMessage/delta"),
     );
     set(
         caps,
         "token_usage",
-        contains(&schema_text, "thread/tokenUsage/updated"),
+        schema.notifications.contains("thread/tokenUsage/updated"),
     );
-    Ok((Transport::AppServer, help, Some(schema_hash)))
+    Ok((Transport::AppServer, help, Some(schema.hash)))
 }
 
-/// `codex app-server generate-json-schema --out <dir>`: the tree hash of the output and its concatenated text.
-fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<(String, Vec<u8>), ProbeError> {
+/// What `codex app-server generate-json-schema` produced: its tree hash and the request and notification methods.
+struct CodexSchema {
+    hash: String,
+    requests: std::collections::BTreeSet<String>,
+    notifications: std::collections::BTreeSet<String>,
+}
+
+/// The `method` names a protocol schema file lists (`oneOf[*].properties.method.enum`/`const`); `None` unless it is
+/// an object with a non-empty `oneOf` naming at least one method.
+fn schema_methods(value: &serde_json::Value) -> Option<std::collections::BTreeSet<String>> {
+    let variants = value
+        .as_object()?
+        .get("oneOf")?
+        .as_array()
+        .filter(|v| !v.is_empty())?;
+    let methods: std::collections::BTreeSet<String> = variants
+        .iter()
+        .filter_map(|v| v.pointer("/properties/method"))
+        .flat_map(|m| {
+            let listed = m
+                .get("enum")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            listed.into_iter().chain(m.get("const").cloned())
+        })
+        .filter_map(|m| m.as_str().map(str::to_owned))
+        .collect();
+    (!methods.is_empty()).then_some(methods)
+}
+
+/// `codex app-server generate-json-schema --out <dir>`: every `.json` file must parse, and `ClientRequest.json` and
+/// `ServerNotification.json` must be protocol schemas whose method lists the capabilities are read from; anything
+/// else is a failure, not an empty or guessed schema (M1T01R-08, M1T01R-15).
+fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<CodexSchema, ProbeError> {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -181,28 +214,29 @@ fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<(String, Vec<u8>), Pr
             &["app-server", "generate-json-schema", "--out", &out],
             env,
         )?;
-        // A command that exits 0 without writing a usable schema has not provided one (M1T01R-08).
         let unusable = |detail: String| ProbeError::Failed {
             argv: argv(launcher, &["app-server", "generate-json-schema"]),
             detail,
         };
-        let files = files_under(&dir)?;
-        if !dir.join("ClientRequest.json").is_file() {
-            return Err(unusable(
-                "no ClientRequest.json in the schema output".to_owned(),
-            ));
-        }
-        let mut text = Vec::new();
-        for file in &files {
-            let bytes = std::fs::read(file)?;
-            if file.extension().is_some_and(|e| e == "json")
-                && serde_json::from_slice::<serde_json::Value>(&bytes).is_err()
-            {
-                return Err(unusable(format!("{} is not JSON", file.display())));
+        let mut parsed = BTreeMap::new();
+        for file in files_under(&dir)? {
+            if file.extension().is_some_and(|e| e == "json") {
+                let value = serde_json::from_slice::<serde_json::Value>(&std::fs::read(&file)?)
+                    .map_err(|e| unusable(format!("{} is not JSON: {e}", file.display())))?;
+                parsed.insert(file, value);
             }
-            text.extend(bytes);
         }
-        Ok((tree_sha256(&dir)?, text))
+        let methods = |name: &str| {
+            parsed
+                .get(&dir.join(name))
+                .and_then(schema_methods)
+                .ok_or_else(|| unusable(format!("{name} is missing or lists no methods")))
+        };
+        Ok(CodexSchema {
+            requests: methods("ClientRequest.json")?,
+            notifications: methods("ServerNotification.json")?,
+            hash: tree_sha256(&dir)?,
+        })
     })();
     let _ = std::fs::remove_dir_all(&dir);
     result
@@ -322,17 +356,58 @@ fn codex_target() -> Option<(&'static str, &'static str)> {
 
 /// Node's `require.resolve(<package>/package.json)` from `start`: `node_modules/<package>` in `start` and each
 /// ancestor (directories that are themselves named node_modules are skipped), returning the package directory.
+/// The first package found is the answer: if its `exports` do not export `./package.json`, Node throws
+/// (ERR_PACKAGE_PATH_NOT_EXPORTED) instead of looking further, and this returns `None` (M1T01R-13).
 fn node_resolve(start: &Path, package: &str) -> Option<PathBuf> {
-    start
+    let found = start
         .ancestors()
         .filter(|dir| dir.file_name() != Some(OsStr::new("node_modules")))
         .map(|dir| dir.join("node_modules").join(package))
-        .find(|candidate| candidate.join("package.json").is_file())
+        .find(|candidate| candidate.join("package.json").is_file())?;
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(found.join("package.json")).ok()?).ok()?;
+    exports_package_json(manifest.get("exports")).then_some(found)
+}
+
+/// Whether a package's `exports` field lets `<package>/package.json` be resolved: no field (or null) does; a string,
+/// an array or a conditions object exports only the main entry; a subpath map must list `./package.json` or a
+/// pattern covering it.
+fn exports_package_json(exports: Option<&serde_json::Value>) -> bool {
+    use serde_json::Value;
+    match exports {
+        None | Some(Value::Null) => true,
+        Some(Value::Object(map)) if map.keys().all(|k| k.starts_with('.')) => {
+            map.iter().any(|(key, target)| {
+                !target.is_null()
+                    && (key == "./package.json"
+                        || key.split_once('*').is_some_and(|(prefix, suffix)| {
+                            "./package.json".starts_with(prefix)
+                                && "./package.json".ends_with(suffix)
+                        }))
+            })
+        }
+        Some(_) => false,
+    }
+}
+
+/// Whether `launcher` (a real path) is the npm wrapper `bin/codex.js` of the `@openai/codex` package; only then does
+/// it run a vendored binary. Anything else (a directly installed binary, a fake) is its own implementation.
+fn is_codex_npm_wrapper(launcher: &Path) -> bool {
+    let package = launcher.parent().and_then(Path::parent);
+    let manifest = package
+        .and_then(|p| std::fs::read(p.join("package.json")).ok())
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    launcher.file_name() == Some(OsStr::new("codex.js"))
+        && launcher.parent().and_then(Path::file_name) == Some(OsStr::new("bin"))
+        && manifest.is_some_and(|m| m["name"] == "@openai/codex")
 }
 
 /// The native binary `codex.js` (at its real path `launcher`) executes: `vendor/<triple>/bin/codex` in the platform
 /// package it resolves, else in the codex package's own `vendor` directory (M1T01R-02).
 fn codex_native(launcher: &Path) -> Option<PathBuf> {
+    if !is_codex_npm_wrapper(launcher) {
+        return None;
+    }
     let (triple, package) = codex_target()?;
     let start = launcher.parent()?;
     let vendor = match node_resolve(start, package) {
@@ -540,6 +615,10 @@ mod tests {
         let package = root.join("lib/node_modules/@openai/codex");
         std::fs::create_dir_all(package.join("bin"))?;
         std::fs::write(package.join("bin/codex.js"), "#!/usr/bin/env node\n")?;
+        std::fs::write(
+            package.join("package.json"),
+            r#"{"name": "@openai/codex", "bin": {"codex": "bin/codex.js"}}"#,
+        )?;
         std::fs::create_dir_all(root.join("bin"))?;
         let launcher = root.join("bin/codex");
         std::os::unix::fs::symlink(package.join("bin/codex.js"), &launcher)?;
@@ -585,6 +664,49 @@ mod tests {
             );
             std::fs::remove_dir_all(&root)?;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn codex_resolution_honours_exports_and_needs_the_npm_wrapper()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // M1T01R-13: require.resolve fails when the platform package does not export package.json, and codex.js
+        // then uses its own vendor directory; a directly installed binary is its own implementation.
+        let (triple, platform) = codex_target().ok_or("unsupported test platform")?;
+        let root = std::env::temp_dir().join(format!("hoh-codex-exports-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let platform_dir = root.join("lib/node_modules").join(platform);
+        let (launcher, platform_native) = codex_layout(&root, Some(&platform_dir))?;
+        std::fs::write(
+            platform_dir.join("package.json"),
+            r#"{"exports": {".": "./index.js"}}"#,
+        )?;
+        let own = root
+            .join("lib/node_modules/@openai/codex/vendor")
+            .join(triple)
+            .join("bin/codex");
+        std::fs::create_dir_all(own.parent().ok_or("parent")?)?;
+        std::fs::write(&own, b"\x7fELF own vendor")?;
+        assert_eq!(
+            resolve_implementation(Agent::Codex, &launcher)?,
+            std::fs::canonicalize(&own)?
+        );
+        std::fs::write(
+            platform_dir.join("package.json"),
+            r#"{"exports": {".": "./index.js", "./package.json": "./package.json"}}"#,
+        )?;
+        assert_eq!(
+            resolve_implementation(Agent::Codex, &launcher)?,
+            std::fs::canonicalize(&platform_native)?
+        );
+        // A native codex binary next to an unrelated node_modules tree stays its own implementation.
+        let direct = root.join("lib/node_modules/@openai/codex/bin/codex");
+        std::fs::write(&direct, b"\x7fELF direct")?;
+        assert_eq!(
+            resolve_implementation(Agent::Codex, &direct)?,
+            std::fs::canonicalize(&direct)?
+        );
+        std::fs::remove_dir_all(&root)?;
         Ok(())
     }
 

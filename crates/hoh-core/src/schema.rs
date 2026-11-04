@@ -4,10 +4,13 @@
 //! Only the draft 2020-12 keywords these contracts use are implemented; a schema using any other keyword is refused
 //! when it is loaded, so a contract change cannot silently stop being enforced. `$ref` names a local definition
 //! (`#/$defs/<name>`) only, and a reference cycle that does not descend into the instance is refused; instances nested
-//! deeper than [`MAX_DEPTH`] are a violation instead of a stack overflow. Numbers compare exactly (integers beyond 2^53
-//! included, 1 == 1.0) and count keywords such as `minLength` accept integral floats. `pattern` follows ECMA-262 as
-//! JSON Schema requires (`$` is the end of input; Python's `re` also matches before a final newline, the one known
-//! divergence). `format` supports `date-time` (RFC 3339 with ASCII digits and, like Python's checker, no second 60).
+//! deeper than [`MAX_DEPTH`] are refused by one iterative pass before anything recurses. Numbers compare exactly
+//! (integers beyond 2^53 included, 1 == 1.0); numbers serde_json cannot hold exactly (integers outside i64/u64, which
+//! it rounds to f64) are refused instead of compared. Count keywords such as `minLength` accept integral floats.
+//! `pattern` is limited to constructs that mean the same in ECMA-262 (which JSON Schema specifies) and the regex
+//! crate; in both `$` is the end of input, while Python's `re` also matches before a final newline. `format` supports
+//! `date-time` (RFC 3339 with ASCII digits and, like Python's checker, no second 60). Where Python knowingly differs,
+//! the keyword corpus records it (`python_valid`).
 //! The corpora in `tests/fixtures/schema/` (contract documents and keyword semantics) pin the verdicts to those of
 //! Python jsonschema (the bundle test checks Python, `tests/schema_corpus.rs` this code).
 
@@ -80,8 +83,62 @@ const TYPES: &[&str] = &[
     "null", "boolean", "object", "array", "number", "integer", "string",
 ];
 
-/// Instances nested deeper than this are reported instead of validated further.
-pub const MAX_DEPTH: usize = 256;
+/// Arrays and objects allowed on any path of a value: the most serde_json itself parses from text. Deeper values (only
+/// constructible in memory) are refused before anything recurses into them (M1T01R-11).
+pub const MAX_DEPTH: usize = 127;
+
+/// Whether a number is exactly what was written: serde_json keeps integers within i64/u64 exactly and turns larger
+/// ones into f64, rounding them; every value of that magnitude is therefore refused instead of compared (M1T01R-14).
+/// An f64 of exactly -2^63 can only come from a rounded literal (-2^63 itself parses as i64), so the low end is open.
+fn exact(n: &Number) -> bool {
+    n.is_i64()
+        || n.is_u64()
+        || n.as_f64()
+            .is_some_and(|f| f > -9_223_372_036_854_775_808.0 && f < 18_446_744_073_709_551_616.0)
+}
+
+/// One iterative pass over the whole value, before any recursive step: nesting depth and number exactness.
+fn precheck(value: &Value) -> Option<Violation> {
+    let mut stack: Vec<(&Value, usize, String)> = vec![(value, 0, String::new())];
+    while let Some((v, depth, path)) = stack.pop() {
+        let violation = |message: String| Violation {
+            instance_path: path.clone(),
+            schema_path: String::new(),
+            message,
+        };
+        match v {
+            Value::Array(_) | Value::Object(_) if depth + 1 > MAX_DEPTH => {
+                return Some(violation(format!("nested deeper than {MAX_DEPTH} levels")));
+            }
+            Value::Array(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    stack.push((item, depth + 1, format!("{path}/{i}")));
+                }
+            }
+            Value::Object(members) => {
+                for (key, item) in members {
+                    stack.push((item, depth + 1, format!("{path}/{}", escape(key))));
+                }
+            }
+            Value::Number(n) if !exact(n) => {
+                return Some(violation(format!(
+                    "{n} is outside the range HoH compares exactly (integers within i64/u64)"
+                )));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// A short rendering of a value for messages.
+fn brief(v: &Value) -> String {
+    let text = v.to_string();
+    match text.char_indices().nth(120) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None => text,
+    }
+}
 
 /// A loaded schema document.
 #[derive(Debug)]
@@ -93,6 +150,9 @@ pub struct Schema {
 impl Schema {
     /// Load a schema document, refusing keywords and values this validator does not implement.
     pub fn new(document: Value) -> Result<Self, SchemaError> {
+        if let Some(v) = precheck(&document) {
+            return Err(SchemaError(format!("{}: {}", v.instance_path, v.message)));
+        }
         let mut patterns = HashMap::new();
         check_schema(&document, &document, "", &mut patterns)?;
         check_reference_cycles(&document)?;
@@ -106,6 +166,9 @@ impl Schema {
 
     /// Validate an instance against the document's root schema.
     pub fn validate(&self, instance: &Value) -> Result<(), Vec<Violation>> {
+        if let Some(v) = precheck(instance) {
+            return Err(vec![v]);
+        }
         let mut out = Vec::new();
         self.node(&self.document, instance, "", "", &mut out);
         if out.is_empty() { Ok(()) } else { Err(out) }
@@ -122,6 +185,9 @@ impl Schema {
             .document
             .pointer(&pointer)
             .ok_or_else(|| SchemaError(format!("no definition {def}")))?;
+        if let Some(v) = precheck(instance) {
+            return Ok(Err(vec![v]));
+        }
         let mut out = Vec::new();
         self.node(schema, instance, "", &pointer, &mut out);
         Ok(if out.is_empty() { Ok(()) } else { Err(out) })
@@ -141,14 +207,6 @@ impl Schema {
         spath: &str,
         out: &mut Vec<Violation>,
     ) {
-        if ipath.matches('/').count() > MAX_DEPTH {
-            return fail(
-                out,
-                ipath,
-                spath,
-                &format!("nested deeper than {MAX_DEPTH} levels"),
-            );
-        }
         let obj = match schema {
             Value::Bool(true) => return,
             Value::Bool(false) => return fail(out, ipath, spath, "no value is allowed here"),
@@ -194,13 +252,18 @@ impl Schema {
                 out,
                 ipath,
                 &at("enum"),
-                &format!("{inst} is not one of the allowed values"),
+                &format!("{} is not one of the allowed values", brief(inst)),
             );
         }
         if let Some(expected) = obj.get("const")
             && !json_eq(expected, inst)
         {
-            fail(out, ipath, &at("const"), &format!("expected {expected}"));
+            fail(
+                out,
+                ipath,
+                &at("const"),
+                &format!("expected {}", brief(expected)),
+            );
         }
         match inst {
             Value::String(s) => self.string(obj, s, ipath, spath, out),
@@ -673,6 +736,7 @@ fn check_schema(
                 let source = value
                     .as_str()
                     .ok_or_else(|| bad("pattern must be a string"))?;
+                portable_pattern(source).map_err(|e| bad(&format!("pattern {source}: {e}")))?;
                 let re = Regex::new(source).map_err(|e| bad(&format!("pattern {source}: {e}")))?;
                 patterns.insert(source.to_owned(), re);
             }
@@ -696,16 +760,63 @@ fn check_schema(
     Ok(())
 }
 
-/// `name` for a reference to `#/$defs/<name>` (a single pointer segment), else `None`.
-fn definition_name(target: &str) -> Option<&str> {
-    target
-        .strip_prefix("#/$defs/")
-        .filter(|name| !name.is_empty() && !name.contains('/'))
+/// Refuse pattern constructs whose meaning differs between ECMA-262 (what JSON Schema specifies) and the regex
+/// crate: class escapes such as `\d`, `\w`, `\s`, `\b`, `\p` (Unicode-aware here, ASCII there), `.` outside a class
+/// (line terminators differ) and `(?` groups. What remains (ASCII classes and ranges, literals, escaped punctuation,
+/// alternation, groups, quantifiers, `^` and `$`) means the same in both (M1T01R-16).
+fn portable_pattern(source: &str) -> Result<(), String> {
+    let mut chars = source.chars().peekable();
+    let mut in_class = false;
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some(e) if e.is_ascii_punctuation() => {}
+                Some(e) => {
+                    return Err(format!(
+                        "escape \\{e} differs between ECMA-262 and this validator"
+                    ));
+                }
+                None => return Err("trailing backslash".to_owned()),
+            },
+            '[' if !in_class => in_class = true,
+            ']' if in_class => in_class = false,
+            '.' if !in_class => {
+                return Err("`.` outside a class differs between dialects; use a class".to_owned());
+            }
+            '(' if !in_class && chars.peek() == Some(&'?') => {
+                return Err("(? groups are not supported".to_owned());
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// The definition name a reference `#/$defs/<segment>` names, with the JSON Pointer escapes (`~1`, `~0`) decoded;
+/// `None` unless the target is exactly one well-formed segment.
+fn definition_name(target: &str) -> Option<String> {
+    let segment = target.strip_prefix("#/$defs/")?;
+    if segment.is_empty() || segment.contains('/') {
+        return None;
+    }
+    let mut name = String::new();
+    let mut chars = segment.chars();
+    while let Some(c) = chars.next() {
+        match (c, c == '~') {
+            (_, true) => match chars.next() {
+                Some('0') => name.push('~'),
+                Some('1') => name.push('/'),
+                _ => return None,
+            },
+            (c, false) => name.push(c),
+        }
+    }
+    Some(name)
 }
 
 /// The definitions a schema reaches without descending into the instance (`$ref` directly or inside
 /// allOf/anyOf/oneOf/if/then/else); `properties`, `items` and `additionalProperties` descend and end the walk.
-fn same_instance_refs<'a>(schema: &'a Value, found: &mut Vec<&'a str>) {
+fn same_instance_refs(schema: &Value, found: &mut Vec<String>) {
     let Value::Object(obj) = schema else { return };
     if let Some(name) = obj
         .get("$ref")
@@ -739,17 +850,17 @@ fn check_reference_cycles(doc: &Value) -> Result<(), SchemaError> {
         found
     };
     for start in defs.keys() {
-        let mut stack: Vec<&str> = edges(start);
-        let mut seen: Vec<&str> = Vec::new();
+        let mut stack: Vec<String> = edges(start);
+        let mut seen: Vec<String> = Vec::new();
         while let Some(next) = stack.pop() {
-            if next == start {
+            if &next == start {
                 return Err(SchemaError(format!(
                     "#/$defs/{start} refers back to itself without descending into the instance"
                 )));
             }
             if !seen.contains(&next) {
+                stack.extend(edges(&next));
                 seen.push(next);
-                stack.extend(edges(next));
             }
         }
     }
@@ -850,6 +961,78 @@ mod tests {
         );
         std::mem::forget(deep); // dropping a 100k-deep value recursively would itself overflow the test stack
         Ok(())
+    }
+
+    #[test]
+    fn escaped_definition_names_are_followed_for_cycles() -> Result<(), SchemaError> {
+        // M1T01R-12: `a~1b` names the definition "a/b"; the cycle check must see it.
+        for schema in [
+            json!({"$defs": {"a/b": {"$ref": "#/$defs/a~1b"}}, "$ref": "#/$defs/a~1b"}),
+            json!({"$defs": {"a~b": {"$ref": "#/$defs/a~0b"}}, "$ref": "#/$defs/a~0b"}),
+        ] {
+            assert!(Schema::new(schema.clone()).is_err(), "{schema}");
+        }
+        let fine =
+            Schema::new(json!({"$defs": {"a/b": {"type": "string"}}, "$ref": "#/$defs/a~1b"}))?;
+        assert!(fine.validate(&json!("x")).is_ok());
+        assert!(fine.validate(&json!(1)).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn dialect_dependent_pattern_constructs_are_refused() {
+        // M1T01R-16: \d, \w, \s, \b and `.` mean different things in ECMA-262 and the regex crate.
+        for pattern in [r"^\d+$", r"\w", r"\s", r"\bx", r"^.$", r"(?i)a", r"\p{L}"] {
+            assert!(
+                Schema::new(json!({"pattern": pattern})).is_err(),
+                "{pattern}"
+            );
+        }
+        for pattern in [
+            "^[a-f0-9]{64}$",
+            "^([a-f0-9]{40}|[a-f0-9]{64})$",
+            r"^a\.b[.]c$",
+            "x+y*z?",
+        ] {
+            assert!(
+                Schema::new(json!({"pattern": pattern})).is_ok(),
+                "{pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn deep_values_are_refused_before_any_recursion() {
+        // M1T01R-11: free-form members are not walked by the schema, so the depth check covers the whole value.
+        let schema = match Schema::new(json!({"type": "object"})) {
+            Ok(s) => s,
+            Err(e) => panic!("{e}"),
+        };
+        let mut deep = json!([]);
+        for _ in 0..100_000 {
+            deep = Value::Array(vec![deep]);
+        }
+        let wrapped = json!({"payload": null});
+        let mut wrapped = wrapped;
+        wrapped["payload"] = deep;
+        let errors = schema.validate(&wrapped).err().unwrap_or_default();
+        assert!(
+            errors.iter().any(|v| v.message.contains("nested")),
+            "{:?}",
+            errors.first()
+        );
+        std::mem::forget(wrapped);
+        // The outer object is one level: MAX_DEPTH - 1 arrays inside it fit, MAX_DEPTH do not.
+        let nest = |levels: usize| (0..levels).fold(json!(1), |v, _| Value::Array(vec![v]));
+        assert!(schema.validate(&json!({"p": nest(MAX_DEPTH)})).is_err());
+        assert!(schema.validate(&json!({"p": nest(MAX_DEPTH - 1)})).is_ok());
+    }
+
+    #[test]
+    fn inexact_schema_numbers_are_refused() {
+        assert!(Schema::new(json!({"maximum": 18_446_744_073_709_551_616.0_f64})).is_err());
+        assert!(Schema::new(json!({"const": [1e300]})).is_err());
+        assert!(Schema::new(json!({"maximum": 18_446_744_073_709_551_615_u64})).is_ok());
     }
 
     #[test]
