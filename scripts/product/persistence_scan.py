@@ -55,10 +55,14 @@ The boundary is enforced by the compiler, and this scan checks that nothing swit
    reports/ is prose and needs no entry. The whitelist names only files that need it (existing, outside persistence,
    not a member's Rust source, still mentioning SQLite). No file of the candidate is a symbolic link (M2T01R-52), and
    `include_str!`/`include_bytes!` may not reach outside the repository. Cargo configurations follow the profile rule
-   of check 3 (M2T01R-50), and static.sh clears CARGO_PROFILE_* from its environment.
+   of check 3 (M2T01R-50) and may not move the build output (`build.target-dir`; only git's ignore rules decide
+   which files are the candidate's, M2T01R-55), and static.sh clears CARGO_PROFILE_* from its environment. Every
+   whitelist entry gives its reason (M2T01R-58). The text of doc attributes (`#[doc = "…"]`, what `///` writes) is
+   documentation, not a literal of check 4 (M2T01R-56).
 Out of reach of any of this (docs/22-tooling.md): a program, script or SQL that exists only at run time (a name or
-text assembled from pieces, read from the environment or a file outside the candidate) and conditional compilation
-produced by a macro (M2T01R-53/54). Writing such code is deliberate circumvention, which this check does not claim to
+text assembled from pieces, read from the environment or a file outside the candidate), conditional compilation
+produced by a macro (M2T01R-53/54), and product code that uses a whitelisted development file (a kit test or tool)
+as a run-time component (M2T01R-57). Writing such code is deliberate circumvention, which this check does not claim to
 stop (docs/21: the checks guard against accidental drift, not against someone rewriting files on purpose); review
 does.
 Scanning no file at all fails (no empty scan). Prints a JSON summary; with --out appends one test-results.jsonl
@@ -211,6 +215,29 @@ def split_rust(text: str) -> tuple[str, list[tuple[int, int, str]]]:
                 continue
         i += 1
     return ''.join(code), literals
+
+
+def attribute_spans(code: str) -> list[tuple[int, int]]:
+    """(start, end) of every attribute (`#[…]`, `#![…]`, brackets balanced) in comment- and literal-free code."""
+    out = []
+    for m in re.finditer(r'#\s*!?\s*\[', code):
+        depth, i = 0, m.end() - 1
+        while i < len(code):
+            depth += {'[': 1, ']': -1}.get(code[i], 0)
+            if depth == 0:
+                break
+            i += 1
+        out.append((m.start(), i + 1))
+    return out
+
+
+def runtime_literals(code: str, literals: list[tuple[int, int, str]]) -> list[tuple[int, int, str]]:
+    """The literals but the text of doc attributes (`#[doc = "…"]`, also in `cfg_attr`), which is what `///` writes
+    and never a value at run time (M2T01R-56)."""
+    spans = attribute_spans(code)
+    def documentation(start: int) -> bool:
+        return any(a <= start < b and re.search(r'[\[(,]\s*doc\s*=\s*$', code[a:start]) for a, b in spans)
+    return [lit for lit in literals if not documentation(lit[0])]
 
 
 def literal_strings(code: str, literals: list[tuple[int, int, str]]) -> list[str]:
@@ -500,7 +527,8 @@ def forbidden_cargo_keys(cfg: Path) -> list[str]:
         return [f'unreadable: {exc}']
     found = []
     build = data.get('build') or {}
-    found += [f'build.{k}' for k in ('rustflags', 'rustc', 'rustc-wrapper', 'rustc-workspace-wrapper', 'rustdocflags') if k in build]
+    found += [f'build.{k}' for k in ('rustflags', 'rustc', 'rustc-wrapper', 'rustc-workspace-wrapper', 'rustdocflags',
+                                     'target-dir') if k in build]
     found += [f'target.{name}.rustflags' for name, t in (data.get('target') or {}).items() if isinstance(t, dict) and 'rustflags' in t]
     found += ['env' for _ in [1] if data.get('env')]
     found += [f'alias.{a}' for a in (data.get('alias') or {}) if a in ('clippy', 'check', 'build', 'metadata', 'deny', 'fmt')]
@@ -566,7 +594,7 @@ def scan(root: Path, metadata: dict) -> dict:
             if re.search(r'sqlite', text, re.IGNORECASE) or SQL_WRITE.search(text):
                 hits.append({'path': rel, 'kind': 'named-file', 'match': f'{named}: mentions SQLite or holds a SQL write'})
         sqlite_seen = []
-        for value in literal_strings(code, literals):
+        for value in literal_strings(code, runtime_literals(code, literals)):
             if m := SQL_WRITE.search(value):
                 hits.append({'path': rel, 'kind': 'sql', 'match': ' '.join(m.group(0).split())})
             elif re.search(r'sqlite', value, re.IGNORECASE) and not any(s in value for s in sqlite_seen):
@@ -650,9 +678,12 @@ def repository_files(root: Path, metadata: dict) -> list[Path]:
     left out."""
     target = Path(metadata.get('target_directory') or root / 'target').resolve()
     if (root / '.git').exists():
+        # Only git's ignore rules decide; the build output is ignored like any generated file, and a candidate file
+        # inside it is still read (M2T01R-55).
         out = subprocess.run(['git', '-C', str(root), 'ls-files', '-z', '--cached', '--others', '--exclude-standard'],
                              capture_output=True, check=True).stdout
-        paths = [root / name for name in out.decode('utf-8', 'surrogateescape').split('\0') if name]
+        return sorted(p for p in (root / name for name in out.decode('utf-8', 'surrogateescape').split('\0') if name)
+                      if os.path.lexists(p))
     else:
         paths = []
         for d, dirs, names in os.walk(root):
@@ -671,10 +702,16 @@ def content_checks(root: Path, metadata: dict, hits: list) -> int:
     Returns the number of files read."""
     members = tuple(f'{rel_to(d, root)}/' for d in member_dirs(metadata))
     try:
-        listed = json.loads((root / WHITELIST).read_text(encoding='utf-8')).get('files') or {}
-    except (OSError, ValueError) as exc:
+        listed = json.loads((root / WHITELIST).read_text(encoding='utf-8'))['files']
+        if not isinstance(listed, dict):
+            raise ValueError('"files" is not an object of path -> reason')
+    except (OSError, ValueError, KeyError, TypeError) as exc:
         hits.append({'path': WHITELIST, 'kind': 'whitelist', 'match': f'missing or unreadable: {exc}'})
         listed = {}
+    for rel, why in sorted(listed.items()):
+        # Each entry says why the file may mention SQLite (M2T01R-58).
+        if not isinstance(why, str) or not why.strip():
+            hits.append({'path': WHITELIST, 'kind': 'whitelist', 'match': f'{rel}: no reason given'})
     read = 0
     for path in repository_files(root, metadata):
         rel = rel_to(path, root)
