@@ -1,0 +1,2280 @@
+{
+ "note": "Shared JSON Schema conformance corpus (M1-T01). Every instance carries the verdict that Python jsonschema (Draft 2020-12 with the date-time format checker) gives for it; tests/bundle/test_bundle.py checks those verdicts and crates/hoh-core/tests/schema_corpus.rs checks that the product validator agrees.",
+ "cases": [
+  {
+   "schema": "protocol",
+   "def": "Message",
+   "valid": true,
+   "note": "dispatch with a free-form payload (unknown payload fields are kept)",
+   "instance": {
+    "schema_version": "1.0",
+    "message_id": "m1",
+    "run_id": "r1",
+    "task_id": "t1",
+    "attempt_id": "a1",
+    "sender_role": "commander",
+    "recipient_role": "developer",
+    "role_epoch": 1,
+    "correlation_id": "c1",
+    "causation_id": null,
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "candidate_id": null,
+    "kind": "dispatch",
+    "payload": {
+     "note": "x",
+     "extra": {
+      "kept": true
+     }
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Message",
+   "valid": true,
+   "note": "rejected with reason_code",
+   "instance": {
+    "schema_version": "1.0",
+    "message_id": "m1",
+    "run_id": "r1",
+    "task_id": "t1",
+    "attempt_id": "a1",
+    "sender_role": "commander",
+    "recipient_role": "developer",
+    "role_epoch": 1,
+    "correlation_id": "c1",
+    "causation_id": "m0",
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "candidate_id": "C1",
+    "kind": "rejected",
+    "payload": {
+     "note": "x",
+     "extra": {
+      "kept": true
+     }
+    },
+    "reason_code": "STALE_ROLE_EPOCH"
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Message",
+   "valid": true,
+   "note": "reason_code may be null when not rejected",
+   "instance": {
+    "schema_version": "1.0",
+    "message_id": "m1",
+    "run_id": "r1",
+    "task_id": "t1",
+    "attempt_id": "a1",
+    "sender_role": "commander",
+    "recipient_role": "developer",
+    "role_epoch": 1,
+    "correlation_id": "c1",
+    "causation_id": null,
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "candidate_id": null,
+    "kind": "ack",
+    "payload": {
+     "note": "x",
+     "extra": {
+      "kept": true
+     }
+    },
+    "reason_code": null
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "ContextHandoff",
+   "valid": true,
+   "note": "verification handoff",
+   "instance": {
+    "schema_version": "1.0",
+    "run_id": "r1",
+    "task_id": "t1",
+    "goal": "verify",
+    "role": "qa",
+    "role_epoch": 2,
+    "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "candidate": {
+     "id": "C1",
+     "git_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+     "git_tree": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+     "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "environment_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "test_plan_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "acceptance_ids": [
+     "AC-001-01"
+    ],
+    "references": [
+     {
+      "path": "reports/x.json",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+     }
+    ],
+    "output_contract": "TaskResult",
+    "budget_tokens": 1000,
+    "handoff_kind": "verification",
+    "spec_revision": 1
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "ContextHandoff",
+   "valid": true,
+   "note": "role change with checkpoint state",
+   "instance": {
+    "schema_version": "1.0",
+    "run_id": "r1",
+    "task_id": null,
+    "goal": "verify",
+    "role": "qa",
+    "role_epoch": 2,
+    "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "candidate": null,
+    "acceptance_ids": [],
+    "references": [
+     {
+      "path": "reports/x.json",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+     }
+    ],
+    "output_contract": "TaskResult",
+    "budget_tokens": 1000,
+    "handoff_kind": "role_change",
+    "spec_revision": 1,
+    "state": {
+     "applied_decision_ids": [
+      "d1"
+     ],
+     "open_issue_ids": [],
+     "unacked_message_ids": [],
+     "queued_input_ids": [
+      "i1"
+     ]
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "ContextHandoff",
+   "valid": true,
+   "note": "task handoff without candidate",
+   "instance": {
+    "schema_version": "1.0",
+    "run_id": "r1",
+    "task_id": "t1",
+    "goal": "verify",
+    "role": "qa",
+    "role_epoch": 2,
+    "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "candidate": null,
+    "acceptance_ids": [
+     "AC-001-01"
+    ],
+    "references": [
+     {
+      "path": "reports/x.json",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+     }
+    ],
+    "output_contract": "TaskResult",
+    "budget_tokens": 1000,
+    "handoff_kind": "task",
+    "spec_revision": 1
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Event",
+   "valid": true,
+   "note": "unknown event kind and payload fields are kept",
+   "instance": {
+    "schema_version": "1.0",
+    "project_id": "p1",
+    "seq": 1,
+    "event_id": "e1",
+    "run_id": null,
+    "attempt_id": null,
+    "at": "2026-11-04T01:02:03Z",
+    "kind": "adapter.unknown_event",
+    "payload": {
+     "raw": "{\"type\":\"new_frame\"}",
+     "anything": [
+      1,
+      2,
+      {
+       "x": null
+      }
+     ]
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Event",
+   "valid": true,
+   "note": "event with ids and offset time",
+   "instance": {
+    "schema_version": "1.0",
+    "project_id": "p1",
+    "seq": 42,
+    "event_id": "e1",
+    "run_id": "r1",
+    "attempt_id": "a1",
+    "at": "2026-11-04T01:02:03.123456+08:00",
+    "kind": "run.result",
+    "payload": {}
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Command",
+   "valid": true,
+   "note": "StartRun command",
+   "instance": {
+    "schema_version": "1.0",
+    "command_id": "cmd1",
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "kind": "StartRun",
+    "run_id": "r1",
+    "payload": {
+     "goal": "g",
+     "mode": "AUTO",
+     "interactive": false
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Command",
+   "valid": true,
+   "note": "SetMode command",
+   "instance": {
+    "schema_version": "1.0",
+    "command_id": "cmd1",
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "kind": "SetMode",
+    "run_id": "r1",
+    "payload": {
+     "mode": "PLAN"
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Command",
+   "valid": true,
+   "note": "SendInput command",
+   "instance": {
+    "schema_version": "1.0",
+    "command_id": "cmd1",
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "kind": "SendInput",
+    "run_id": "r1",
+    "payload": {
+     "text": "hi",
+     "target_role": null,
+     "input_kind": "REPLY"
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Command",
+   "valid": true,
+   "note": "ConfigureTeam command",
+   "instance": {
+    "schema_version": "1.0",
+    "command_id": "cmd1",
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "kind": "ConfigureTeam",
+    "run_id": "r1",
+    "payload": {
+     "bindings": {
+      "qa": "pi"
+     },
+     "apply_at": "checkpoint"
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Command",
+   "valid": true,
+   "note": "ProposeSpecChange command",
+   "instance": {
+    "schema_version": "1.0",
+    "command_id": "cmd1",
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "kind": "ProposeSpecChange",
+    "run_id": "r1",
+    "payload": {
+     "reason": "r",
+     "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Command",
+   "valid": true,
+   "note": "PauseRun command",
+   "instance": {
+    "schema_version": "1.0",
+    "command_id": "cmd1",
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "kind": "PauseRun",
+    "run_id": "r1",
+    "payload": {
+     "reason": ""
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Command",
+   "valid": true,
+   "note": "ResumeRun command",
+   "instance": {
+    "schema_version": "1.0",
+    "command_id": "cmd1",
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "kind": "ResumeRun",
+    "run_id": "r1",
+    "payload": {
+     "reason": "r"
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Command",
+   "valid": true,
+   "note": "CancelRun command",
+   "instance": {
+    "schema_version": "1.0",
+    "command_id": "cmd1",
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "kind": "CancelRun",
+    "run_id": "r1",
+    "payload": {
+     "reason": "r"
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Command",
+   "valid": true,
+   "note": "ApproveSpec command",
+   "instance": {
+    "schema_version": "1.0",
+    "command_id": "cmd1",
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "kind": "ApproveSpec",
+    "run_id": "r1",
+    "payload": {
+     "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "decision": "APPROVE_AND_BUILD",
+     "note": "ok"
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Command",
+   "valid": true,
+   "note": "AnswerQuestion command",
+   "instance": {
+    "schema_version": "1.0",
+    "command_id": "cmd1",
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "kind": "AnswerQuestion",
+    "run_id": "r1",
+    "payload": {
+     "question_id": "q1",
+     "answer": "A",
+     "choice_id": null
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Command",
+   "valid": true,
+   "note": "StartRun before a run exists",
+   "instance": {
+    "schema_version": "1.0",
+    "command_id": "cmd1",
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "kind": "StartRun",
+    "run_id": null,
+    "payload": {
+     "goal": "g",
+     "mode": "PLAN",
+     "interactive": true
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "TaskResult",
+   "valid": true,
+   "note": "completed result with evidence and issues",
+   "instance": {
+    "schema_version": "1.0",
+    "run_id": "r1",
+    "task_id": "t1",
+    "attempt_id": "a1",
+    "role": "developer",
+    "role_epoch": 1,
+    "status": "COMPLETED",
+    "summary": "done",
+    "candidate_id": "C1",
+    "evidence": [
+     {
+      "path": "evidence/x",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+     }
+    ],
+    "issues": [
+     {
+      "severity": "low",
+      "text": "nit"
+     }
+    ],
+    "next_action": "verify"
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "TaskResult",
+   "valid": true,
+   "note": "blocked result",
+   "instance": {
+    "schema_version": "1.0",
+    "run_id": "r1",
+    "task_id": "t1",
+    "attempt_id": "a1",
+    "role": "developer",
+    "role_epoch": 1,
+    "status": "BLOCKED",
+    "summary": "done",
+    "candidate_id": null,
+    "evidence": [],
+    "issues": [],
+    "next_action": "verify"
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "DecisionPayload",
+   "valid": true,
+   "note": "dispatch decision",
+   "instance": {
+    "kind": "dispatch",
+    "task_id": "T1",
+    "role": "developer",
+    "note": "go"
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "DecisionPayload",
+   "valid": true,
+   "note": "transition_task decision",
+   "instance": {
+    "kind": "transition_task",
+    "task_id": "T1",
+    "to_state": "READY"
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "DecisionPayload",
+   "valid": true,
+   "note": "transition_run decision",
+   "instance": {
+    "kind": "transition_run",
+    "to_state": "WAITING_EXTERNAL",
+    "accepted_requirements": [
+     "REQ-001"
+    ],
+    "reason": "r"
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "DecisionPayload",
+   "valid": true,
+   "note": "request_user_decision decision",
+   "instance": {
+    "kind": "request_user_decision",
+    "question_id": "q1",
+    "question": "Which?",
+    "choices": [
+     {
+      "choice_id": "a",
+      "label": "A"
+     }
+    ],
+    "requires_user": true
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "DecisionPayload",
+   "valid": true,
+   "note": "create_tasks decision",
+   "instance": {
+    "kind": "create_tasks",
+    "plan": {
+     "tasks": [
+      {
+       "task_id": "T1",
+       "title": "Build",
+       "role": "developer",
+       "writer": true,
+       "depends_on": [],
+       "requirement_ids": [
+        "REQ-001"
+       ],
+       "user_value": 5,
+       "unblock_value": 0,
+       "risk_reduction": 3,
+       "information_gain": 2,
+       "cost_estimate": 1
+      }
+     ]
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "DecisionPayload",
+   "valid": true,
+   "note": "record_assumption decision",
+   "instance": {
+    "kind": "record_assumption",
+    "statement": "s",
+    "basis": "b"
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "PlanProposal",
+   "valid": true,
+   "note": "plan with scores",
+   "instance": {
+    "tasks": [
+     {
+      "task_id": "T1",
+      "title": "Build",
+      "role": "developer",
+      "writer": true,
+      "depends_on": [],
+      "requirement_ids": [
+       "REQ-001"
+      ],
+      "user_value": 5,
+      "unblock_value": 0,
+      "risk_reduction": 3,
+      "information_gain": 2,
+      "cost_estimate": 1
+     }
+    ]
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "PlanProposal",
+   "valid": true,
+   "note": "plan without optional scores",
+   "instance": {
+    "tasks": [
+     {
+      "task_id": "T2",
+      "title": "t",
+      "role": "qa",
+      "writer": false,
+      "depends_on": [
+       "T1"
+      ],
+      "requirement_ids": []
+     }
+    ]
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "ArtifactRef",
+   "valid": true,
+   "note": "artifact ref",
+   "instance": {
+    "path": "a",
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Candidate",
+   "valid": true,
+   "note": "sha256 object ids",
+   "instance": {
+    "id": "C1",
+    "git_commit": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "git_tree": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "environment_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "test_plan_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "root",
+   "valid": true,
+   "note": "root oneOf: a message",
+   "instance": {
+    "schema_version": "1.0",
+    "message_id": "m1",
+    "run_id": "r1",
+    "task_id": "t1",
+    "attempt_id": "a1",
+    "sender_role": "commander",
+    "recipient_role": "developer",
+    "role_epoch": 1,
+    "correlation_id": "c1",
+    "causation_id": null,
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "candidate_id": null,
+    "kind": "dispatch",
+    "payload": {
+     "note": "x",
+     "extra": {
+      "kept": true
+     }
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "root",
+   "valid": true,
+   "note": "root oneOf: an event",
+   "instance": {
+    "schema_version": "1.0",
+    "project_id": "p1",
+    "seq": 1,
+    "event_id": "e1",
+    "run_id": null,
+    "attempt_id": null,
+    "at": "2026-11-04T01:02:03Z",
+    "kind": "adapter.unknown_event",
+    "payload": {
+     "raw": "{\"type\":\"new_frame\"}",
+     "anything": [
+      1,
+      2,
+      {
+       "x": null
+      }
+     ]
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Message",
+   "valid": false,
+   "note": "required: payload missing",
+   "instance": {
+    "schema_version": "1.0",
+    "message_id": "m1",
+    "run_id": "r1",
+    "task_id": "t1",
+    "attempt_id": "a1",
+    "sender_role": "commander",
+    "recipient_role": "developer",
+    "role_epoch": 1,
+    "correlation_id": "c1",
+    "causation_id": null,
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "candidate_id": null,
+    "kind": "dispatch"
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Message",
+   "valid": false,
+   "note": "additionalProperties: unknown top-level field",
+   "instance": {
+    "schema_version": "1.0",
+    "message_id": "m1",
+    "run_id": "r1",
+    "task_id": "t1",
+    "attempt_id": "a1",
+    "sender_role": "commander",
+    "recipient_role": "developer",
+    "role_epoch": 1,
+    "correlation_id": "c1",
+    "causation_id": null,
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "candidate_id": null,
+    "kind": "dispatch",
+    "payload": {
+     "note": "x",
+     "extra": {
+      "kept": true
+     }
+    },
+    "extra": 1
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Message",
+   "valid": false,
+   "note": "if/then: rejected needs reason_code",
+   "instance": {
+    "schema_version": "1.0",
+    "message_id": "m1",
+    "run_id": "r1",
+    "task_id": "t1",
+    "attempt_id": "a1",
+    "sender_role": "commander",
+    "recipient_role": "developer",
+    "role_epoch": 1,
+    "correlation_id": "c1",
+    "causation_id": null,
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "candidate_id": null,
+    "kind": "rejected",
+    "payload": {
+     "note": "x",
+     "extra": {
+      "kept": true
+     }
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Message",
+   "valid": false,
+   "note": "if/then: rejected needs a non-null reason_code",
+   "instance": {
+    "schema_version": "1.0",
+    "message_id": "m1",
+    "run_id": "r1",
+    "task_id": "t1",
+    "attempt_id": "a1",
+    "sender_role": "commander",
+    "recipient_role": "developer",
+    "role_epoch": 1,
+    "correlation_id": "c1",
+    "causation_id": null,
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "candidate_id": null,
+    "kind": "rejected",
+    "payload": {
+     "note": "x",
+     "extra": {
+      "kept": true
+     }
+    },
+    "reason_code": null
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Message",
+   "valid": false,
+   "note": "enum: unknown message kind",
+   "instance": {
+    "schema_version": "1.0",
+    "message_id": "m1",
+    "run_id": "r1",
+    "task_id": "t1",
+    "attempt_id": "a1",
+    "sender_role": "commander",
+    "recipient_role": "developer",
+    "role_epoch": 1,
+    "correlation_id": "c1",
+    "causation_id": null,
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "candidate_id": null,
+    "kind": "broadcast",
+    "payload": {
+     "note": "x",
+     "extra": {
+      "kept": true
+     }
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Message",
+   "valid": false,
+   "note": "const: schema_version",
+   "instance": {
+    "schema_version": "2.0",
+    "message_id": "m1",
+    "run_id": "r1",
+    "task_id": "t1",
+    "attempt_id": "a1",
+    "sender_role": "commander",
+    "recipient_role": "developer",
+    "role_epoch": 1,
+    "correlation_id": "c1",
+    "causation_id": null,
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "candidate_id": null,
+    "kind": "dispatch",
+    "payload": {
+     "note": "x",
+     "extra": {
+      "kept": true
+     }
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Message",
+   "valid": false,
+   "note": "minimum: role_epoch",
+   "instance": {
+    "schema_version": "1.0",
+    "message_id": "m1",
+    "run_id": "r1",
+    "task_id": "t1",
+    "attempt_id": "a1",
+    "sender_role": "commander",
+    "recipient_role": "developer",
+    "role_epoch": 0,
+    "correlation_id": "c1",
+    "causation_id": null,
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "candidate_id": null,
+    "kind": "dispatch",
+    "payload": {
+     "note": "x",
+     "extra": {
+      "kept": true
+     }
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Message",
+   "valid": false,
+   "note": "type: integer",
+   "instance": {
+    "schema_version": "1.0",
+    "message_id": "m1",
+    "run_id": "r1",
+    "task_id": "t1",
+    "attempt_id": "a1",
+    "sender_role": "commander",
+    "recipient_role": "developer",
+    "role_epoch": 1.5,
+    "correlation_id": "c1",
+    "causation_id": null,
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "candidate_id": null,
+    "kind": "dispatch",
+    "payload": {
+     "note": "x",
+     "extra": {
+      "kept": true
+     }
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Message",
+   "valid": false,
+   "note": "type: string is not an integer",
+   "instance": {
+    "schema_version": "1.0",
+    "message_id": "m1",
+    "run_id": "r1",
+    "task_id": "t1",
+    "attempt_id": "a1",
+    "sender_role": "commander",
+    "recipient_role": "developer",
+    "role_epoch": "1",
+    "correlation_id": "c1",
+    "causation_id": null,
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "candidate_id": null,
+    "kind": "dispatch",
+    "payload": {
+     "note": "x",
+     "extra": {
+      "kept": true
+     }
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Message",
+   "valid": false,
+   "note": "pattern: uppercase hex",
+   "instance": {
+    "schema_version": "1.0",
+    "message_id": "m1",
+    "run_id": "r1",
+    "task_id": "t1",
+    "attempt_id": "a1",
+    "sender_role": "commander",
+    "recipient_role": "developer",
+    "role_epoch": 1,
+    "correlation_id": "c1",
+    "causation_id": null,
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "spec_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "candidate_id": null,
+    "kind": "dispatch",
+    "payload": {
+     "note": "x",
+     "extra": {
+      "kept": true
+     }
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Message",
+   "valid": false,
+   "note": "minLength",
+   "instance": {
+    "schema_version": "1.0",
+    "message_id": "",
+    "run_id": "r1",
+    "task_id": "t1",
+    "attempt_id": "a1",
+    "sender_role": "commander",
+    "recipient_role": "developer",
+    "role_epoch": 1,
+    "correlation_id": "c1",
+    "causation_id": null,
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "candidate_id": null,
+    "kind": "dispatch",
+    "payload": {
+     "note": "x",
+     "extra": {
+      "kept": true
+     }
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Message",
+   "valid": false,
+   "note": "maxLength",
+   "instance": {
+    "schema_version": "1.0",
+    "message_id": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "run_id": "r1",
+    "task_id": "t1",
+    "attempt_id": "a1",
+    "sender_role": "commander",
+    "recipient_role": "developer",
+    "role_epoch": 1,
+    "correlation_id": "c1",
+    "causation_id": null,
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "candidate_id": null,
+    "kind": "dispatch",
+    "payload": {
+     "note": "x",
+     "extra": {
+      "kept": true
+     }
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Message",
+   "valid": false,
+   "note": "type: [string, null]",
+   "instance": {
+    "schema_version": "1.0",
+    "message_id": "m1",
+    "run_id": "r1",
+    "task_id": "t1",
+    "attempt_id": "a1",
+    "sender_role": "commander",
+    "recipient_role": "developer",
+    "role_epoch": 1,
+    "correlation_id": "c1",
+    "causation_id": 7,
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "candidate_id": null,
+    "kind": "dispatch",
+    "payload": {
+     "note": "x",
+     "extra": {
+      "kept": true
+     }
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Message",
+   "valid": false,
+   "note": "type: object",
+   "instance": {
+    "schema_version": "1.0",
+    "message_id": "m1",
+    "run_id": "r1",
+    "task_id": "t1",
+    "attempt_id": "a1",
+    "sender_role": "commander",
+    "recipient_role": "developer",
+    "role_epoch": 1,
+    "correlation_id": "c1",
+    "causation_id": null,
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "candidate_id": null,
+    "kind": "dispatch",
+    "payload": []
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Message",
+   "valid": false,
+   "note": "anyOf/enum: unknown rejection reason",
+   "instance": {
+    "schema_version": "1.0",
+    "message_id": "m1",
+    "run_id": "r1",
+    "task_id": "t1",
+    "attempt_id": "a1",
+    "sender_role": "commander",
+    "recipient_role": "developer",
+    "role_epoch": 1,
+    "correlation_id": "c1",
+    "causation_id": null,
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "candidate_id": null,
+    "kind": "rejected",
+    "payload": {
+     "note": "x",
+     "extra": {
+      "kept": true
+     }
+    },
+    "reason_code": "NOPE"
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "ContextHandoff",
+   "valid": false,
+   "note": "if/then: verification needs a candidate",
+   "instance": {
+    "schema_version": "1.0",
+    "run_id": "r1",
+    "task_id": "t1",
+    "goal": "verify",
+    "role": "qa",
+    "role_epoch": 2,
+    "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "candidate": null,
+    "acceptance_ids": [
+     "AC-001-01"
+    ],
+    "references": [
+     {
+      "path": "reports/x.json",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+     }
+    ],
+    "output_contract": "TaskResult",
+    "budget_tokens": 1000,
+    "handoff_kind": "verification",
+    "spec_revision": 1
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "ContextHandoff",
+   "valid": false,
+   "note": "if/then minItems: verification needs acceptance ids",
+   "instance": {
+    "schema_version": "1.0",
+    "run_id": "r1",
+    "task_id": "t1",
+    "goal": "verify",
+    "role": "qa",
+    "role_epoch": 2,
+    "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "candidate": {
+     "id": "C1",
+     "git_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+     "git_tree": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+     "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "environment_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "test_plan_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "acceptance_ids": [],
+    "references": [
+     {
+      "path": "reports/x.json",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+     }
+    ],
+    "output_contract": "TaskResult",
+    "budget_tokens": 1000,
+    "handoff_kind": "verification",
+    "spec_revision": 1
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "ContextHandoff",
+   "valid": false,
+   "note": "if/then: verification needs a task id",
+   "instance": {
+    "schema_version": "1.0",
+    "run_id": "r1",
+    "task_id": null,
+    "goal": "verify",
+    "role": "qa",
+    "role_epoch": 2,
+    "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "candidate": {
+     "id": "C1",
+     "git_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+     "git_tree": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+     "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "environment_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "test_plan_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "acceptance_ids": [
+     "AC-001-01"
+    ],
+    "references": [
+     {
+      "path": "reports/x.json",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+     }
+    ],
+    "output_contract": "TaskResult",
+    "budget_tokens": 1000,
+    "handoff_kind": "verification",
+    "spec_revision": 1
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "ContextHandoff",
+   "valid": false,
+   "note": "if/then required: role change needs state",
+   "instance": {
+    "schema_version": "1.0",
+    "run_id": "r1",
+    "task_id": "t1",
+    "goal": "verify",
+    "role": "qa",
+    "role_epoch": 2,
+    "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "candidate": null,
+    "acceptance_ids": [
+     "AC-001-01"
+    ],
+    "references": [
+     {
+      "path": "reports/x.json",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+     }
+    ],
+    "output_contract": "TaskResult",
+    "budget_tokens": 1000,
+    "handoff_kind": "role_change",
+    "spec_revision": 1
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "ContextHandoff",
+   "valid": false,
+   "note": "uniqueItems",
+   "instance": {
+    "schema_version": "1.0",
+    "run_id": "r1",
+    "task_id": "t1",
+    "goal": "verify",
+    "role": "qa",
+    "role_epoch": 2,
+    "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "candidate": {
+     "id": "C1",
+     "git_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+     "git_tree": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+     "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "environment_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "test_plan_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "acceptance_ids": [
+     "AC-1",
+     "AC-1"
+    ],
+    "references": [
+     {
+      "path": "reports/x.json",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+     }
+    ],
+    "output_contract": "TaskResult",
+    "budget_tokens": 1000,
+    "handoff_kind": "verification",
+    "spec_revision": 1
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "ContextHandoff",
+   "valid": false,
+   "note": "additionalProperties in nested state",
+   "instance": {
+    "schema_version": "1.0",
+    "run_id": "r1",
+    "task_id": "t1",
+    "goal": "verify",
+    "role": "qa",
+    "role_epoch": 2,
+    "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "candidate": {
+     "id": "C1",
+     "git_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+     "git_tree": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+     "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "environment_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "test_plan_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "acceptance_ids": [
+     "AC-001-01"
+    ],
+    "references": [
+     {
+      "path": "reports/x.json",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+     }
+    ],
+    "output_contract": "TaskResult",
+    "budget_tokens": 1000,
+    "handoff_kind": "role_change",
+    "spec_revision": 1,
+    "state": {
+     "applied_decision_ids": [
+      "d1"
+     ],
+     "open_issue_ids": [],
+     "unacked_message_ids": [],
+     "queued_input_ids": [
+      "i1"
+     ],
+     "extra": []
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "ContextHandoff",
+   "valid": false,
+   "note": "$ref ArtifactRef required sha256",
+   "instance": {
+    "schema_version": "1.0",
+    "run_id": "r1",
+    "task_id": "t1",
+    "goal": "verify",
+    "role": "qa",
+    "role_epoch": 2,
+    "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "candidate": {
+     "id": "C1",
+     "git_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+     "git_tree": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+     "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "environment_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "test_plan_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "acceptance_ids": [
+     "AC-001-01"
+    ],
+    "references": [
+     {
+      "path": "x"
+     }
+    ],
+    "output_contract": "TaskResult",
+    "budget_tokens": 1000,
+    "handoff_kind": "verification",
+    "spec_revision": 1
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "ContextHandoff",
+   "valid": false,
+   "note": "minLength without maxLength",
+   "instance": {
+    "schema_version": "1.0",
+    "run_id": "r1",
+    "task_id": "t1",
+    "goal": "",
+    "role": "qa",
+    "role_epoch": 2,
+    "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "candidate": {
+     "id": "C1",
+     "git_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+     "git_tree": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+     "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "environment_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "test_plan_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "acceptance_ids": [
+     "AC-001-01"
+    ],
+    "references": [
+     {
+      "path": "reports/x.json",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+     }
+    ],
+    "output_contract": "TaskResult",
+    "budget_tokens": 1000,
+    "handoff_kind": "verification",
+    "spec_revision": 1
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Event",
+   "valid": false,
+   "note": "format: date-time",
+   "instance": {
+    "schema_version": "1.0",
+    "project_id": "p1",
+    "seq": 1,
+    "event_id": "e1",
+    "run_id": null,
+    "attempt_id": null,
+    "at": "yesterday",
+    "kind": "adapter.unknown_event",
+    "payload": {
+     "raw": "{\"type\":\"new_frame\"}",
+     "anything": [
+      1,
+      2,
+      {
+       "x": null
+      }
+     ]
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Event",
+   "valid": false,
+   "note": "format: date-time needs T and offset",
+   "instance": {
+    "schema_version": "1.0",
+    "project_id": "p1",
+    "seq": 1,
+    "event_id": "e1",
+    "run_id": null,
+    "attempt_id": null,
+    "at": "2026-11-04 01:02:03",
+    "kind": "adapter.unknown_event",
+    "payload": {
+     "raw": "{\"type\":\"new_frame\"}",
+     "anything": [
+      1,
+      2,
+      {
+       "x": null
+      }
+     ]
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Event",
+   "valid": false,
+   "note": "minimum: seq",
+   "instance": {
+    "schema_version": "1.0",
+    "project_id": "p1",
+    "seq": 0,
+    "event_id": "e1",
+    "run_id": null,
+    "attempt_id": null,
+    "at": "2026-11-04T01:02:03Z",
+    "kind": "adapter.unknown_event",
+    "payload": {
+     "raw": "{\"type\":\"new_frame\"}",
+     "anything": [
+      1,
+      2,
+      {
+       "x": null
+      }
+     ]
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Event",
+   "valid": false,
+   "note": "minLength: kind",
+   "instance": {
+    "schema_version": "1.0",
+    "project_id": "p1",
+    "seq": 1,
+    "event_id": "e1",
+    "run_id": null,
+    "attempt_id": null,
+    "at": "2026-11-04T01:02:03Z",
+    "kind": "",
+    "payload": {
+     "raw": "{\"type\":\"new_frame\"}",
+     "anything": [
+      1,
+      2,
+      {
+       "x": null
+      }
+     ]
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Command",
+   "valid": false,
+   "note": "if/then required: StartRun interactive",
+   "instance": {
+    "schema_version": "1.0",
+    "command_id": "cmd1",
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "kind": "StartRun",
+    "run_id": "r1",
+    "payload": {
+     "goal": "g",
+     "mode": "AUTO"
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Command",
+   "valid": false,
+   "note": "if/then enum: mode",
+   "instance": {
+    "schema_version": "1.0",
+    "command_id": "cmd1",
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "kind": "StartRun",
+    "run_id": "r1",
+    "payload": {
+     "goal": "g",
+     "mode": "FAST",
+     "interactive": true
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Command",
+   "valid": false,
+   "note": "if/then additionalProperties: payload",
+   "instance": {
+    "schema_version": "1.0",
+    "command_id": "cmd1",
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "kind": "StartRun",
+    "run_id": "r1",
+    "payload": {
+     "goal": "g",
+     "mode": "AUTO",
+     "interactive": true,
+     "x": 1
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Command",
+   "valid": false,
+   "note": "minProperties: bindings",
+   "instance": {
+    "schema_version": "1.0",
+    "command_id": "cmd1",
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "kind": "ConfigureTeam",
+    "run_id": "r1",
+    "payload": {
+     "bindings": {},
+     "apply_at": "checkpoint"
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Command",
+   "valid": false,
+   "note": "const: apply_at",
+   "instance": {
+    "schema_version": "1.0",
+    "command_id": "cmd1",
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "kind": "ConfigureTeam",
+    "run_id": "r1",
+    "payload": {
+     "bindings": {
+      "qa": "pi"
+     },
+     "apply_at": "now"
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Command",
+   "valid": false,
+   "note": "enum: approval decision",
+   "instance": {
+    "schema_version": "1.0",
+    "command_id": "cmd1",
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "kind": "ApproveSpec",
+    "run_id": "r1",
+    "payload": {
+     "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "decision": "MAYBE"
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Command",
+   "valid": false,
+   "note": "enum: command kind",
+   "instance": {
+    "schema_version": "1.0",
+    "command_id": "cmd1",
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "kind": "Shutdown",
+    "run_id": "r1",
+    "payload": {}
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Command",
+   "valid": false,
+   "note": "minLength: input text",
+   "instance": {
+    "schema_version": "1.0",
+    "command_id": "cmd1",
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "kind": "SendInput",
+    "run_id": "r1",
+    "payload": {
+     "text": "",
+     "target_role": null,
+     "input_kind": "ASK"
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "TaskResult",
+   "valid": false,
+   "note": "enum: status",
+   "instance": {
+    "schema_version": "1.0",
+    "run_id": "r1",
+    "task_id": "t1",
+    "attempt_id": "a1",
+    "role": "developer",
+    "role_epoch": 1,
+    "status": "DONE",
+    "summary": "done",
+    "candidate_id": "C1",
+    "evidence": [
+     {
+      "path": "evidence/x",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+     }
+    ],
+    "issues": [
+     {
+      "severity": "low",
+      "text": "nit"
+     }
+    ],
+    "next_action": "verify"
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "TaskResult",
+   "valid": false,
+   "note": "items type: object",
+   "instance": {
+    "schema_version": "1.0",
+    "run_id": "r1",
+    "task_id": "t1",
+    "attempt_id": "a1",
+    "role": "developer",
+    "role_epoch": 1,
+    "status": "COMPLETED",
+    "summary": "done",
+    "candidate_id": "C1",
+    "evidence": [
+     {
+      "path": "evidence/x",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+     }
+    ],
+    "issues": [
+     1
+    ],
+    "next_action": "verify"
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "TaskResult",
+   "valid": false,
+   "note": "additionalProperties in ArtifactRef",
+   "instance": {
+    "schema_version": "1.0",
+    "run_id": "r1",
+    "task_id": "t1",
+    "attempt_id": "a1",
+    "role": "developer",
+    "role_epoch": 1,
+    "status": "COMPLETED",
+    "summary": "done",
+    "candidate_id": "C1",
+    "evidence": [
+     {
+      "path": "x",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "size": 1
+     }
+    ],
+    "issues": [
+     {
+      "severity": "low",
+      "text": "nit"
+     }
+    ],
+    "next_action": "verify"
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "DecisionPayload",
+   "valid": false,
+   "note": "oneOf: no alternative",
+   "instance": {
+    "kind": "retire_agent"
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "DecisionPayload",
+   "valid": false,
+   "note": "oneOf: additionalProperties",
+   "instance": {
+    "kind": "dispatch",
+    "task_id": "T1",
+    "role": "developer",
+    "extra": 1
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "DecisionPayload",
+   "valid": false,
+   "note": "oneOf: enum to_state",
+   "instance": {
+    "kind": "transition_task",
+    "task_id": "T1",
+    "to_state": "DONE"
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "DecisionPayload",
+   "valid": false,
+   "note": "oneOf: $ref PlanProposal minItems",
+   "instance": {
+    "kind": "create_tasks",
+    "plan": {
+     "tasks": []
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "DecisionPayload",
+   "valid": false,
+   "note": "oneOf: nested required",
+   "instance": {
+    "kind": "request_user_decision",
+    "question_id": "q",
+    "question": "?",
+    "requires_user": true,
+    "choices": [
+     {
+      "choice_id": "a"
+     }
+    ]
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "PlanProposal",
+   "valid": false,
+   "note": "maximum",
+   "instance": {
+    "tasks": [
+     {
+      "task_id": "T1",
+      "title": "Build",
+      "role": "developer",
+      "writer": true,
+      "depends_on": [],
+      "requirement_ids": [
+       "REQ-001"
+      ],
+      "user_value": 6,
+      "unblock_value": 0,
+      "risk_reduction": 3,
+      "information_gain": 2,
+      "cost_estimate": 1
+     }
+    ]
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "PlanProposal",
+   "valid": false,
+   "note": "minimum",
+   "instance": {
+    "tasks": [
+     {
+      "task_id": "T1",
+      "title": "Build",
+      "role": "developer",
+      "writer": true,
+      "depends_on": [],
+      "requirement_ids": [
+       "REQ-001"
+      ],
+      "user_value": 5,
+      "unblock_value": 0,
+      "risk_reduction": 3,
+      "information_gain": 2,
+      "cost_estimate": 0
+     }
+    ]
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "PlanProposal",
+   "valid": false,
+   "note": "uniqueItems",
+   "instance": {
+    "tasks": [
+     {
+      "task_id": "T1",
+      "title": "Build",
+      "role": "developer",
+      "writer": true,
+      "depends_on": [
+       "T0",
+       "T0"
+      ],
+      "requirement_ids": [
+       "REQ-001"
+      ],
+      "user_value": 5,
+      "unblock_value": 0,
+      "risk_reduction": 3,
+      "information_gain": 2,
+      "cost_estimate": 1
+     }
+    ]
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "PlanProposal",
+   "valid": false,
+   "note": "type: boolean",
+   "instance": {
+    "tasks": [
+     {
+      "task_id": "T1",
+      "title": "Build",
+      "role": "developer",
+      "writer": "yes",
+      "depends_on": [],
+      "requirement_ids": [
+       "REQ-001"
+      ],
+      "user_value": 5,
+      "unblock_value": 0,
+      "risk_reduction": 3,
+      "information_gain": 2,
+      "cost_estimate": 1
+     }
+    ]
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Candidate",
+   "valid": false,
+   "note": "pattern alternation: 39 hex",
+   "instance": {
+    "id": "C1",
+    "git_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "git_tree": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "environment_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "test_plan_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Candidate",
+   "valid": false,
+   "note": "pattern anchors: 41 hex",
+   "instance": {
+    "id": "C1",
+    "git_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "git_tree": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "environment_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "test_plan_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "root",
+   "valid": false,
+   "note": "root oneOf: nothing matches",
+   "instance": {
+    "schema_version": "1.0"
+   }
+  },
+  {
+   "schema": "compat-manifest",
+   "def": "root",
+   "valid": true,
+   "note": "codex entry, suite not run",
+   "instance": {
+    "schema_version": "1.0",
+    "generated_at": "2026-11-04T01:02:03Z",
+    "agents": {
+     "codex": {
+      "cli_version": "codex-cli 0.166.0",
+      "launcher_path": "/usr/bin/codex",
+      "launcher_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "implementation_path": "/opt/codex",
+      "implementation_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "transport": "app-server",
+      "help_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "schema_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "capabilities": {
+       "mid_turn_steer": true,
+       "images": null
+      },
+      "suite": {
+       "status": "NOT_RUN",
+       "fixture_set_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+     }
+    }
+   }
+  },
+  {
+   "schema": "compat-manifest",
+   "def": "root",
+   "valid": true,
+   "note": "two agents, suite run",
+   "instance": {
+    "schema_version": "1.0",
+    "generated_at": "2026-11-04T01:02:03Z",
+    "agents": {
+     "codex": {
+      "cli_version": "codex-cli 0.166.0",
+      "launcher_path": "/usr/bin/codex",
+      "launcher_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "implementation_path": "/opt/codex",
+      "implementation_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "transport": "app-server",
+      "help_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "schema_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "capabilities": {
+       "mid_turn_steer": true,
+       "images": null
+      },
+      "suite": {
+       "status": "NOT_RUN",
+       "fixture_set_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+     },
+     "claude": {
+      "cli_version": "2.1.318 (Claude Code)",
+      "launcher_path": "/usr/bin/codex",
+      "launcher_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "implementation_path": "/opt/codex",
+      "implementation_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "transport": "stream-json",
+      "help_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "schema_sha256": null,
+      "capabilities": {
+       "mid_turn_steer": true,
+       "images": null
+      },
+      "suite": {
+       "status": "PASS",
+       "fixture_set_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "run_at": "2026-11-04T02:00:00Z",
+       "cases": [
+        {
+         "case": "success",
+         "status": "PASS"
+        }
+       ]
+      }
+     }
+    }
+   }
+  },
+  {
+   "schema": "compat-manifest",
+   "def": "root",
+   "valid": false,
+   "note": "enum: transport",
+   "instance": {
+    "schema_version": "1.0",
+    "generated_at": "2026-11-04T01:02:03Z",
+    "agents": {
+     "codex": {
+      "cli_version": "codex-cli 0.166.0",
+      "launcher_path": "/usr/bin/codex",
+      "launcher_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "implementation_path": "/opt/codex",
+      "implementation_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "transport": "grpc",
+      "help_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "schema_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "capabilities": {
+       "mid_turn_steer": true,
+       "images": null
+      },
+      "suite": {
+       "status": "NOT_RUN",
+       "fixture_set_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+     }
+    }
+   }
+  },
+  {
+   "schema": "compat-manifest",
+   "def": "root",
+   "valid": false,
+   "note": "pattern on [string, null]",
+   "instance": {
+    "schema_version": "1.0",
+    "generated_at": "2026-11-04T01:02:03Z",
+    "agents": {
+     "codex": {
+      "cli_version": "codex-cli 0.166.0",
+      "launcher_path": "/usr/bin/codex",
+      "launcher_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "implementation_path": "/opt/codex",
+      "implementation_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "transport": "app-server",
+      "help_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "schema_sha256": "x",
+      "capabilities": {
+       "mid_turn_steer": true,
+       "images": null
+      },
+      "suite": {
+       "status": "NOT_RUN",
+       "fixture_set_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+     }
+    }
+   }
+  },
+  {
+   "schema": "compat-manifest",
+   "def": "root",
+   "valid": false,
+   "note": "additionalProperties schema: boolean or null",
+   "instance": {
+    "schema_version": "1.0",
+    "generated_at": "2026-11-04T01:02:03Z",
+    "agents": {
+     "codex": {
+      "cli_version": "codex-cli 0.166.0",
+      "launcher_path": "/usr/bin/codex",
+      "launcher_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "implementation_path": "/opt/codex",
+      "implementation_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "transport": "app-server",
+      "help_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "schema_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "capabilities": {
+       "images": "yes"
+      },
+      "suite": {
+       "status": "NOT_RUN",
+       "fixture_set_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+     }
+    }
+   }
+  },
+  {
+   "schema": "compat-manifest",
+   "def": "root",
+   "valid": false,
+   "note": "minProperties: agents",
+   "instance": {
+    "schema_version": "1.0",
+    "generated_at": "2026-11-04T01:02:03Z",
+    "agents": {}
+   }
+  },
+  {
+   "schema": "compat-manifest",
+   "def": "root",
+   "valid": false,
+   "note": "additionalProperties false: unknown agent",
+   "instance": {
+    "schema_version": "1.0",
+    "generated_at": "2026-11-04T01:02:03Z",
+    "agents": {
+     "codex": {
+      "cli_version": "codex-cli 0.166.0",
+      "launcher_path": "/usr/bin/codex",
+      "launcher_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "implementation_path": "/opt/codex",
+      "implementation_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "transport": "app-server",
+      "help_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "schema_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "capabilities": {
+       "mid_turn_steer": true,
+       "images": null
+      },
+      "suite": {
+       "status": "NOT_RUN",
+       "fixture_set_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+     },
+     "gemini": {
+      "cli_version": "codex-cli 0.166.0",
+      "launcher_path": "/usr/bin/codex",
+      "launcher_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "implementation_path": "/opt/codex",
+      "implementation_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "transport": "app-server",
+      "help_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "schema_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "capabilities": {
+       "mid_turn_steer": true,
+       "images": null
+      },
+      "suite": {
+       "status": "NOT_RUN",
+       "fixture_set_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+     }
+    }
+   }
+  },
+  {
+   "schema": "compat-manifest",
+   "def": "root",
+   "valid": false,
+   "note": "enum: suite status",
+   "instance": {
+    "schema_version": "1.0",
+    "generated_at": "2026-11-04T01:02:03Z",
+    "agents": {
+     "codex": {
+      "cli_version": "codex-cli 0.166.0",
+      "launcher_path": "/usr/bin/codex",
+      "launcher_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "implementation_path": "/opt/codex",
+      "implementation_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "transport": "app-server",
+      "help_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "schema_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "capabilities": {
+       "mid_turn_steer": true,
+       "images": null
+      },
+      "suite": {
+       "status": "OK",
+       "fixture_set_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+     }
+    }
+   }
+  },
+  {
+   "schema": "compat-manifest",
+   "def": "root",
+   "valid": false,
+   "note": "format: generated_at",
+   "instance": {
+    "schema_version": "1.0",
+    "generated_at": "now",
+    "agents": {
+     "codex": {
+      "cli_version": "codex-cli 0.166.0",
+      "launcher_path": "/usr/bin/codex",
+      "launcher_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "implementation_path": "/opt/codex",
+      "implementation_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "transport": "app-server",
+      "help_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "schema_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "capabilities": {
+       "mid_turn_steer": true,
+       "images": null
+      },
+      "suite": {
+       "status": "NOT_RUN",
+       "fixture_set_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+     }
+    }
+   }
+  },
+  {
+   "schema": "compat-manifest",
+   "def": "root",
+   "valid": false,
+   "note": "required: implementation_sha256",
+   "instance": {
+    "schema_version": "1.0",
+    "generated_at": "2026-11-04T01:02:03Z",
+    "agents": {
+     "codex": {
+      "cli_version": "codex-cli 0.166.0",
+      "launcher_path": "/usr/bin/codex",
+      "launcher_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "implementation_path": "/opt/codex",
+      "transport": "app-server",
+      "help_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "schema_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "capabilities": {
+       "mid_turn_steer": true,
+       "images": null
+      },
+      "suite": {
+       "status": "NOT_RUN",
+       "fixture_set_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+     }
+    }
+   }
+  }
+ ]
+}
