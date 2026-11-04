@@ -153,18 +153,20 @@ fn left_of(tools: &[(u32, u32)]) -> Vec<u32> {
     left
 }
 
-/// When `clear` first held, polled from `at` until `at + bound`; `None` if it never did by then.
+/// When a check of `clear` that held ended, polled from `at` until `at + bound`; `None` if none held by then. The time
+/// is taken after each check, so a scan that ends past the bound is too late (M1T03R-15).
 async fn clear_by(
     at: Instant,
     bound: Duration,
     mut clear: impl FnMut() -> bool,
 ) -> Option<Duration> {
     loop {
+        let held = clear();
         let checked = at.elapsed();
         if checked > bound {
             return None;
         }
-        if clear() {
+        if held {
             return Some(checked);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -487,6 +489,14 @@ async fn the_observer_needs_descent_counts_zombies_and_keeps_its_deadline() -> R
     })
     .await;
     assert_eq!(late, None);
+    // A scan that starts before the bound but ends after it is too late as well (M1T03R-15).
+    let at = Instant::now();
+    let slow = clear_by(at, Duration::from_millis(300), || {
+        std::thread::sleep(Duration::from_millis(400));
+        true
+    })
+    .await;
+    assert_eq!(slow, None);
     let cleared = clear_by(Instant::now(), Duration::from_millis(300), || true).await;
     assert!(cleared.is_some_and(|d| d <= Duration::from_millis(300)));
     Ok(())
