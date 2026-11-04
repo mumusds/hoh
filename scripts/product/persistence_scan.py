@@ -1,27 +1,29 @@
 #!/usr/bin/env python3
 """AC-062-05: SQL writes and SQLite access only in the Persistence module (crates/hoh-core/src/persistence/).
 
-Product sources are every workspace member's src/**/*.rs and build script (tests, benches and examples are not
-product code). The checks (M2T01R-03/-04/-06/-07):
+The boundary is Rust's module visibility; this scan checks that nothing opens it (M2T01R-03/-04/-06/-07/-13/-14).
+Product sources are all .rs files of the workspace members' directories except tests/, benches/ and examples/.
 1. Dependencies, by package identity from `cargo metadata` (renamed packages and workspace inheritance resolved):
    no workspace member but hoh-core reaches a SQLite package (any package whose name contains "sqlite", such as
    rusqlite and libsqlite3-sys) through normal or build dependencies, other than through hoh-core itself; hoh-core
    has it only as a normal dependency (so its build script cannot use it). Dev-dependencies (test code) are allowed
    and listed.
-2. SQLite names: the crate names under which hoh-core sees SQLite packages, closed over the aliases hoh-core's
-   sources define for them (`extern crate X as Y`, `use ... as Y` in a use naming one, `type Y = ...` naming one).
-   They occur only in persistence/ — in code (comments and string literals do not count) in any product source,
-   and also in string literals of proc-macro crates (which can emit code).
-3. No public item of persistence/ (plain `pub`, not `pub(crate)`/`pub(super)`/`pub(in ..)`) mentions a SQLite name
-   or a connection type, so no other code can obtain a SQLite connection.
-4. Defence in depth: string literals outside persistence/ that hold a SQL write statement (INSERT/REPLACE INTO,
+2. The crate names under which hoh-core sees SQLite packages, and the aliases hoh-core defines for them
+   (`extern crate X as Y`, `use X as Y`, `type Y = X…`), occur only in persistence/: in the code of every product
+   source (comments and string literals do not count) and also in the string literals of proc-macro crates.
+3. Nothing in persistence/ that is visible outside it mentions a SQLite name: items and fields declared `pub`,
+   `pub(crate)`, `pub(in …)` outside persistence, or `pub(super)` in persistence/mod.rs. A file's SQLite names are
+   the crate names, everything its `use` statements import from them, and every alias or re-export of one defined
+   anywhere in persistence/. A `type` alias of a SQLite type (associated types of trait impls included), a trait
+   impl whose header names one, and a `#[macro_export]` macro in persistence/ are hits too.
+4. `#[path = …]` and `include!` are not used in product sources, so every compiled file is one this scan reads.
+5. Defence in depth: string literals outside persistence/ that hold a SQL write statement (INSERT/REPLACE INTO,
    UPDATE ... SET, DELETE FROM, UPSERT, ON CONFLICT ... DO UPDATE), decoded as Rust does (escapes, line
    continuations), with literals separated only by commas joined (concat!), are hits.
-5. web/ (when present): no SQLite package in package.json dependencies (by name or npm: alias spec), nowhere in a
-   lockfile (every key and string value is looked at: package paths, names, nested dependencies), and no import of
-   one.
-This is a check of source text against ordinary and accidental violations; identifiers assembled at compile time
-(e.g. from strings in a build script or by `include!` of non-Rust files) are beyond it and left to review.
+6. web/ (when present): no SQLite package in package.json dependencies (by name or npm: alias spec), nowhere in a
+   lockfile (every key and string value), and no import of one.
+This checks source text against ordinary and accidental violations; identifiers assembled at compile time (e.g.
+generated from strings by a build script) are beyond it and left to review.
 Scanning no file at all fails (no empty scan). Prints a JSON summary; with --out appends one test-results.jsonl
 line for TEST-062-05. --metadata reads `cargo metadata` JSON from a file (tests).
 """
@@ -34,7 +36,6 @@ CORE = 'hoh-core'
 SQL_WRITE = re.compile(
     r'\b(?:INSERT\s+(?:OR\s+\w+\s+)?INTO|REPLACE\s+INTO|UPDATE\s+(?:OR\s+\w+\s+)?\S+\s+SET|DELETE\s+FROM|UPSERT'
     r'|ON\s+CONFLICT\b[^;]*?\bDO\s+UPDATE)\b', re.IGNORECASE)
-CONNECTION_TYPES = re.compile(r'\b(?:Connection|Transaction|Savepoint|Statement|CachedStatement|Batch|Rows?)\b')
 ESCAPE = {'n': '\n', 't': '\t', 'r': '\r', '0': '\0', '\\': '\\', '"': '"', "'": "'"}
 
 
@@ -140,17 +141,48 @@ def literal_strings(code: str, literals: list[tuple[int, int, str]]) -> list[str
     return out
 
 
-def public_items(code: str) -> list[str]:
-    """Signatures of plainly public items (from `pub` to the first `{` or `;`) and fields (to the end of the line)."""
+VISIBLE = re.compile(r'(?m)^[ \t]*(pub(?:[ \t]*\((?:crate|super|self|in[ \t]+[\w:]+)\))?)[ \t]')
+
+
+def leaks(vis: str, rel: str) -> bool:
+    """Whether an item with visibility `vis` in persistence file `rel` is visible outside persistence/."""
+    vis = ' '.join(vis.split()).replace('( ', '(').replace(' )', ')')
+    if vis in ('pub', 'pub(crate)'):
+        return True
+    if vis == 'pub(super)':
+        return rel == PERSISTENCE + 'mod.rs'
+    if vis.startswith('pub(in'):
+        return not re.match(r'pub\(in (?:crate::persistence|self|super)\b', vis)
+    return False  # pub(self)
+
+
+def visible_items(code: str, rel: str) -> list[str]:
+    """Signatures of items and fields visible outside persistence/ (from the visibility to the first `{` or `;`; a
+    field to the end of its line)."""
     sigs = []
-    for m in re.finditer(r'(?m)^[ \t]*pub\b(?![ \t]*\()', code):
+    for m in VISIBLE.finditer(code):
+        if not leaks(m.group(1), rel):
+            continue
         rest = code[m.start():]
         cut = min([p for p in (rest.find('{'), rest.find(';')) if p >= 0] or [len(rest)])
         sig = rest[:cut]
-        if re.match(r'[ \t]*pub[ \t]+\w+[ \t]*:', sig):
+        if re.match(r'[ \t]*pub[^:]*?[ \t]\w+[ \t]*:(?!:)', sig):
             sig = sig.split('\n', 1)[0]
         sigs.append(' '.join(sig.split()))
     return sigs
+
+
+def imported_names(code: str, names: set[str]) -> set[str]:
+    """Everything the `use` statements of a file import from (or through) one of `names`."""
+    if not names:
+        return set()
+    token = re.compile(r'\b(?:' + '|'.join(map(re.escape, sorted(names))) + r')\b')
+    out = set()
+    for m in re.finditer(r'\buse\s+([^;]*);', code):
+        if token.search(m.group(1)):
+            out.update(w for w in re.findall(r'\b[A-Za-z_]\w*\b', m.group(1))
+                       if w not in ('as', 'self', 'super', 'crate', '_'))
+    return out
 
 
 def load_metadata(root: Path, path: Path | None) -> dict:
@@ -209,7 +241,8 @@ def dependency_checks(metadata: dict, hits: list) -> tuple[set[str], list[dict]]
 
 def product_files(root: Path, metadata: dict) -> tuple[list[Path], set[Path]]:
     """(every product source, the files of proc-macro crates)."""
-    files = set(root.glob('crates/*/src/**/*.rs')) | set(root.glob('crates/*/build.rs'))
+    skip = {'tests', 'benches', 'examples', 'target'}
+    files = {p for p in root.glob('crates/*/**/*.rs') if not skip & set(p.relative_to(root).parts[2:-1])}
     macro_dirs = []
     for package in metadata.get('packages', []):
         for target in package.get('targets') or []:
@@ -253,14 +286,40 @@ def scan(root: Path, metadata: dict) -> dict:
     core_sources = [code for path, (code, _) in parsed.items() if path.relative_to(root).as_posix().startswith('crates/hoh-core/')]
     names = alias_closure(core_names, core_sources) if core_names else set()
     token = re.compile(r'\b(?:' + '|'.join(map(re.escape, sorted(names))) + r')\b') if names else None
+    rel_of = {path: path.relative_to(root).as_posix() for path in files}
+    persistence = [p for p in files if rel_of[p].startswith(PERSISTENCE)]
+    # Aliases and re-exports of SQLite items made anywhere in persistence/ count in all of it.
+    shared = set(names)
+    for path in persistence:
+        code = parsed[path][0]
+        local = names | imported_names(code, names)
+        local_token = re.compile(r'\b(?:' + '|'.join(map(re.escape, sorted(local))) + r')\b') if local else None
+        for m in re.finditer(r'\btype\s+(\w+)\b[^=;]*=\s*([^;]*);', code):
+            if local_token and local_token.search(m.group(2)):
+                shared.add(m.group(1))
+                # Persistence needs no alias of a SQLite type; one (an associated type of a trait impl such as
+                # `Deref::Target` included) can hand a connection to other code.
+                hits.append({'path': rel_of[path], 'kind': 'sqlite-type-alias', 'match': ' '.join(m.group(0).split())[:200]})
+        for m in re.finditer(r'(?m)^[ \t]*pub\b[^;\n]*?\buse\s+([^;]*);', code):
+            if local_token and local_token.search(m.group(1)):
+                shared.update(imported_names('use ' + m.group(1) + ';', local))
     for path in files:
-        rel = path.relative_to(root).as_posix()
+        rel = rel_of[path]
         scanned += 1
         code, literals = parsed[path]
+        if re.search(r'#\s*!?\[\s*path\s*=', code) or re.search(r'\binclude!\s*[(\[{]', code):
+            hits.append({'path': rel, 'kind': 'path-or-include', 'match': '#[path] or include!'})
         if rel.startswith(PERSISTENCE):
-            for sig in public_items(code):
-                if (token and token.search(sig)) or CONNECTION_TYPES.search(sig):
-                    hits.append({'path': rel, 'kind': 'public-api', 'match': sig[:200]})
+            visible = shared | imported_names(code, shared)
+            vis_token = re.compile(r'\b(?:' + '|'.join(map(re.escape, sorted(visible))) + r')\b') if visible else None
+            for sig in visible_items(code, rel):
+                if vis_token and vis_token.search(sig):
+                    hits.append({'path': rel, 'kind': 'visible-api', 'match': sig[:200]})
+            for m in re.finditer(r'(?m)^[ \t]*impl\b[^{;]*', code):
+                if vis_token and vis_token.search(m.group(0)):
+                    hits.append({'path': rel, 'kind': 'trait-impl', 'match': ' '.join(m.group(0).split())[:200]})
+            if re.search(r'#\s*\[\s*macro_export\b', code):
+                hits.append({'path': rel, 'kind': 'macro-export', 'match': '#[macro_export]'})
             continue
         if token and (m := token.search(code)):
             hits.append({'path': rel, 'kind': 'sqlite-name', 'match': m.group(0)})

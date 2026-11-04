@@ -208,6 +208,18 @@ async fn a_failing_migration_is_rolled_back() -> R {
         }
         assert_eq!(schema(&path)?, (1, 0), "{script} left schema changes");
     }
+    // Empty statements and a byte-order mark before transaction control do not hide it either (M2T01R-15).
+    for script in [
+        "CREATE TABLE extra(x); ; COMMIT;",
+        "CREATE TABLE extra(x); /* c */ ; END;",
+        "\u{feff}CREATE TABLE extra(x); \u{feff}COMMIT;",
+    ] {
+        match Store::open_checked(&path, test_options(), &[MIGRATIONS[0], (2, script)]) {
+            Err(PersistError::Migration { version: 2, .. }) => {}
+            other => return Err(format!("{script:?}: {other:?}").into()),
+        }
+        assert_eq!(schema(&path)?, (1, 0), "{script:?} left schema changes");
+    }
     // A statement that ends the runner's transaction fails the migration.
     match Store::open_checked(
         &path,
@@ -215,7 +227,7 @@ async fn a_failing_migration_is_rolled_back() -> R {
         &[MIGRATIONS[0], (2, "CREATE TABLE extra(x); ROLLBACK;")],
     ) {
         Err(PersistError::Migration { version: 2, detail }) => {
-            assert!(detail.contains("ended the transaction"), "{detail}")
+            assert!(detail.contains("not allowed in a migration"), "{detail}")
         }
         other => return Err(format!("{other:?}").into()),
     }

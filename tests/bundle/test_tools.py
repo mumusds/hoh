@@ -267,7 +267,7 @@ class PersistenceScan(unittest.TestCase):
             return r.returncode,json.loads(r.stdout)
     def kinds(self,res):return sorted((h['path'],h['kind']) for h in res['hits'])
     def test_the_persistence_module_may_use_sqlite_and_others_may_name_things_freely(self):
-        rc,res=self.run_scan({'crates/hoh-core/src/persistence/writer.rs':'pub(crate) fn f(c:&rusqlite::Connection){c.execute("INSERT INTO t VALUES (1)",[]);}\npub struct Store { conn: rusqlite::Connection }',
+        rc,res=self.run_scan({'crates/hoh-core/src/persistence/writer.rs':'pub(super) fn f(c:&rusqlite::Connection){c.execute("INSERT INTO t VALUES (1)",[]);}\npub struct Store { conn: rusqlite::Connection }',
                               'crates/hoh-app/src/main.rs':'// INSERT INTO t is only a comment\n/* DELETE FROM t */ fn main(){let s="update the docs"; let c=Command::new("x"); c.execute(); tx.transaction();}',
                               'crates/hoh-core/src/protocol.rs':'// rusqlite in a comment\nfn g(){let s="rusqlite in a string";}'})
         self.assertEqual((rc,res['status'],res['hits']),(0,'PASS',[]))  # M2T01R-06: method names alone are not hits
@@ -284,10 +284,16 @@ class PersistenceScan(unittest.TestCase):
         self.assertEqual(res['dev_dependency_uses'],[{'member':'hoh-agents','package':'rusqlite'}])
     def test_hoh_core_outside_persistence_and_public_sqlite_types_are_hits(self):
         graph=dict(BASE_GRAPH);graph['hoh-core']=[('db','rusqlite',None)]
+        # Visible outside persistence: pub, pub(crate), and pub(super) in mod.rs; pub(in crate::persistence) and private
+        # fields are not.
         rc,res=self.run_scan({'crates/hoh-core/src/scheduler.rs':'use db::Connection;',
-                              'crates/hoh-core/src/persistence/mod.rs':'pub fn raw(&self) -> &Connection {&self.c}\npub use db::Transaction;\npub(crate) fn ok(c:&db::Connection){}\npub struct S {\n    pub conn: db::Connection,\n}'},graph)
+                              'crates/hoh-core/src/persistence/mod.rs':'use db::Connection;\npub fn raw(&self) -> &Connection {&self.c}\npub use db::Transaction;\n'
+                              'pub(crate) fn ok(c:&db::Connection){}\npub(super) fn sup(c:&Connection){}\npub(in crate::persistence) fn inside(c:&Connection){}\n'
+                              'pub struct S {\n    pub conn: db::Connection,\n    private: Connection,\n}'},graph)
         self.assertEqual(rc,1)
-        self.assertEqual(self.kinds(res),[('crates/hoh-core/src/persistence/mod.rs','public-api')]*3+[('crates/hoh-core/src/scheduler.rs','sqlite-name')])
+        self.assertEqual(sorted(h['match'] for h in res['hits'] if h['kind']=='visible-api'),
+                         ['pub conn: db::Connection,','pub fn raw(&self) -> &Connection','pub use db::Transaction','pub(crate) fn ok(c:&db::Connection)','pub(super) fn sup(c:&Connection)'])
+        self.assertEqual([h['path'] for h in res['hits'] if h['kind']=='sqlite-name'],['crates/hoh-core/src/scheduler.rs'])
     def test_sql_write_literals_are_decoded_and_joined_like_rust(self):
         # M2T01R-03: format! placeholders, concat!, a continuation inside a word, a hex escape, a raw string, upserts.
         src=('fn g(){let a=format!("UPDATE {table} SET state = ?1"); let b=concat!("INSERT ", "INTO t VALUES (1)");\n'
@@ -313,8 +319,30 @@ class PersistenceScan(unittest.TestCase):
         self.assertEqual(res['sqlite_names'],['Db','R2Db','r2db','rusqlite'])
         self.assertEqual(self.kinds(res),[('/w/hoh-core/Cargo.toml','build-dependency'),('crates/hoh-agents/src/lib.rs','sqlite-name'),
                                           ('crates/hoh-core/build.rs','sqlite-name'),('crates/hoh-core/src/other.rs','sqlite-name'),
-                                          ('crates/hoh-core/src/persistence/mod.rs','public-api'),('crates/hoh-core/src/scheduler.rs','sqlite-name'),
+                                          ('crates/hoh-core/src/persistence/mod.rs','sqlite-type-alias')]+[('crates/hoh-core/src/persistence/mod.rs','visible-api')]*3+
+                                         [('crates/hoh-core/src/scheduler.rs','sqlite-name'),
                                           ('crates/hoh-macros/src/lib.rs','sqlite-name'),('crates/hoh-macros/src/lib.rs','sqlite-name-in-macro')])
+    def test_unrenamed_imports_aliases_and_trait_impls_are_followed(self):
+        # M2T01R-13: `use rusqlite::Connection; type R3Db = Connection;` returned publicly; an alias made in one persistence
+        # file and used in another's public signature; a Deref impl handing out the connection.
+        files={'crates/hoh-core/src/persistence/mod.rs':'use rusqlite::Connection;\ntype R3Db = Connection;\npub fn open() -> R3Db { todo() }\n'
+                                                        'mod writer;\nuse writer::Handle;\npub fn handle() -> Handle { todo() }',
+               'crates/hoh-core/src/persistence/writer.rs':'pub(super) use rusqlite::Connection as Handle;',
+               'crates/hoh-core/src/persistence/store.rs':'use rusqlite::Connection;\npub struct Store { conn: Connection }\n'
+                                                          'impl std::ops::Deref for Store { type Target = Connection; fn deref(&self) -> &Connection { &self.conn } }\n'
+                                                          'impl AsRef<Connection> for Store { fn as_ref(&self) -> &Connection { &self.conn } }'}
+        rc,res=self.run_scan(files)
+        self.assertEqual(rc,1)
+        self.assertEqual(sorted((h['path'].rsplit('/',1)[1],h['kind'],h['match']) for h in res['hits']),
+                         [('mod.rs','sqlite-type-alias','type R3Db = Connection;'),('mod.rs','visible-api','pub fn handle() -> Handle'),
+                          ('mod.rs','visible-api','pub fn open() -> R3Db'),('store.rs','sqlite-type-alias','type Target = Connection;'),
+                          ('store.rs','trait-impl','impl AsRef<Connection> for Store')])
+    def test_path_attributes_and_include_are_hits_and_stray_files_are_scanned(self):
+        # M2T01R-14: a module compiled from outside src/ through #[path].
+        rc,res=self.run_scan({'crates/hoh-core/src/lib.rs':'#[path = "../database_ops.rs"]\nmod ops;\nconst X: &str = include!("../sql.rs");',
+                              'crates/hoh-core/database_ops.rs':'fn w(){ rusqlite::Connection::open("x"); }'})
+        self.assertEqual(rc,1)
+        self.assertEqual(self.kinds(res),[('crates/hoh-core/database_ops.rs','sqlite-name'),('crates/hoh-core/src/lib.rs','path-or-include')])
     def test_web_lockfiles_are_searched_through(self):
         # M2T01R-10: a transitive npm alias and a package object's name in a v3 lockfile.
         lock={'lockfileVersion':3,'packages':{'':{'dependencies':{'orm':'1'}},'node_modules/orm':{'version':'1','dependencies':{'db':'npm:better-sqlite3@12'}},
