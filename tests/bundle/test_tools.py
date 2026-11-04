@@ -239,61 +239,88 @@ class TestResultsConverter(unittest.TestCase):
             from jsonschema import Draft202012Validator
             for line in out.read_text().splitlines():Draft202012Validator(schema).validate(json.loads(line))
 
-def scan_metadata(graph,targets=None,extra_members=()):
-    """cargo metadata JSON for persistence_scan.py: graph maps a package to [(extern name, package, kind)];
-    targets maps a package to its targets ([{kind, src_path}])."""
-    members=['hoh-core','hoh-agents','hoh-app',*extra_members]
+def scan_metadata(root,graph,dirs=None,features=None):
+    """cargo metadata JSON for persistence_scan.py: graph maps a package to [(extern name, package, kind)]; dirs maps a
+    workspace member to its directory under root (default crates/<name>); features lists rusqlite's features."""
+    members=['hoh-core','hoh-agents','hoh-app']
     names=set(graph)|{p for deps in graph.values() for _,p,_ in deps}|set(members)
     pid=lambda n:f'id:{n}'
+    where=lambda n:(Path(root)/(dirs or {}).get(n,f'crates/{n}')/'Cargo.toml') if n in members else Path(f'/registry/{n}/Cargo.toml')
     return {'workspace_members':[pid(m) for m in members],
-            'packages':[{'id':pid(n),'name':n,'manifest_path':f'/w/{n}/Cargo.toml','targets':(targets or {}).get(n,[])} for n in sorted(names)],
-            'resolve':{'nodes':[{'id':pid(n),'deps':[{'name':e,'pkg':pid(p),'dep_kinds':[{'kind':k,'target':None}]} for e,p,k in graph.get(n,[])]} for n in sorted(names)]}}
+            'packages':[{'id':pid(n),'name':n,'manifest_path':str(where(n))} for n in sorted(names)],
+            'resolve':{'nodes':[{'id':pid(n),'features':(features if n=='rusqlite' and features is not None else ['bundled','default']) if n=='rusqlite' else [],
+                                 'deps':[{'name':e,'pkg':pid(p),'dep_kinds':[{'kind':k,'target':None}]} for e,p,k in graph.get(n,[])]} for n in sorted(names)]}}
 
 BASE_GRAPH={'hoh-core':[('rusqlite','rusqlite',None)],'rusqlite':[('libsqlite3_sys','libsqlite3-sys',None)],
             'hoh-agents':[('hoh_core','hoh-core',None)],'hoh-app':[('hoh_core','hoh-core',None),('hoh_agents','hoh-agents',None)]}
 
+def clippy_toml(skip=()):
+    sys.path.insert(0,str(ROOT/'scripts/product'))
+    import persistence_scan
+    return 'disallowed-methods = [\n'+''.join(f'  {{ path = "{p}", reason = "AC-062-05" }},\n' for p in sorted(persistence_scan.REQUIRED) if p not in skip)+']\n'
+
 class PersistenceScan(unittest.TestCase):
-    """scripts/product/persistence_scan.py: AC-062-05, SQL writes and SQLite access only in the Persistence module."""
-    def run_scan(self,files,graph=BASE_GRAPH,out=None,targets=None,extra_members=()):
+    """scripts/product/persistence_scan.py: AC-062-05, SQLite only through the Persistence module."""
+    def run_scan(self,files,graph=BASE_GRAPH,out=None,dirs=None,features=None,clippy=None):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d)
+            files={'clippy.toml':clippy_toml() if clippy is None else clippy,**files}
+            for m in ('hoh-core','hoh-agents','hoh-app'):
+                files.setdefault(f"{(dirs or {}).get(m,f'crates/{m}')}/Cargo.toml",'[package]\n')
             for rel,text in files.items():
                 p=root/rel;p.parent.mkdir(parents=True,exist_ok=True);p.write_text(text)
-            targets={k:[{**x,'src_path':str(root/x['src_path'])} for x in v] for k,v in (targets or {}).items()}
-            meta=root/'metadata.json';meta.write_text(json.dumps(scan_metadata(graph,targets,extra_members)))
+            meta=root/'metadata.json';meta.write_text(json.dumps(scan_metadata(root,graph,dirs,features)))
             argv=[sys.executable,str(ROOT/'scripts/product/persistence_scan.py'),'--root',str(root),'--metadata',str(meta)]
             if out:argv+=['--out',str(out)]
             r=subprocess.run(argv,capture_output=True,text=True)
             return r.returncode,json.loads(r.stdout)
     def kinds(self,res):return sorted((h['path'],h['kind']) for h in res['hits'])
     def test_the_persistence_module_may_use_sqlite_and_others_may_name_things_freely(self):
-        rc,res=self.run_scan({'crates/hoh-core/src/persistence/writer.rs':'pub(super) fn f(c:&rusqlite::Connection){c.execute("INSERT INTO t VALUES (1)",[]);}\npub struct Store { conn: rusqlite::Connection }',
-                              'crates/hoh-app/src/main.rs':'// INSERT INTO t is only a comment\n/* DELETE FROM t */ fn main(){let s="update the docs"; let c=Command::new("x"); c.execute(); tx.transaction();}',
-                              'crates/hoh-core/src/protocol.rs':'// rusqlite in a comment\nfn g(){let s="rusqlite in a string";}'})
+        rc,res=self.run_scan({'crates/hoh-core/src/persistence/mod.rs':'#![allow(clippy::disallowed_methods)]\nfn f(c:&rusqlite::Connection){c.execute("INSERT INTO t VALUES (1)",[]);}',
+                              'crates/hoh-app/src/main.rs':'// INSERT INTO t is only a comment\n/* DELETE FROM t */ fn main(){let s="update the docs"; Command.execute(); tx.transaction();}\n#[allow(dead_code)] fn x(){}',
+                              'crates/hoh-app/tests/db.rs':'#![allow(clippy::disallowed_methods)]\nfn t(){ let q = "INSERT INTO t VALUES (1)"; }'})
         self.assertEqual((rc,res['status'],res['hits']),(0,'PASS',[]))  # M2T01R-06: method names alone are not hits
-        self.assertEqual(res['sqlite_names'],['rusqlite'])
     def test_sqlite_dependencies_outside_hoh_core_are_hits_by_package_identity(self):
         # M2T01R-04: a renamed package, a workspace-inherited one (resolved by cargo) and one reached through another crate.
         graph=dict(BASE_GRAPH)
         graph['hoh-app']=BASE_GRAPH['hoh-app']+[('db','rusqlite',None)]
         graph['hoh-agents']=BASE_GRAPH['hoh-agents']+[('orm','orm',None),('fixture_db','rusqlite','dev')]
         graph['orm']=[('ffi','libsqlite3-sys',None)]
-        rc,res=self.run_scan({'crates/hoh-app/src/main.rs':'fn main(){db::Connection::open("x");}'},graph)
+        graph['hoh-core']=BASE_GRAPH['hoh-core']+[('rusqlite','rusqlite','build')]
+        rc,res=self.run_scan({'crates/hoh-app/src/main.rs':'fn main(){}'},graph)
         self.assertEqual(rc,1)
-        self.assertEqual(sorted(h['match'] for h in res['hits']),['hoh-agents -> orm -> libsqlite3-sys','hoh-app -> rusqlite'])
+        self.assertEqual(sorted(h['match'] for h in res['hits']),['hoh-agents -> orm -> libsqlite3-sys','hoh-app -> rusqlite','hoh-core build -> rusqlite'])
         self.assertEqual(res['dev_dependency_uses'],[{'member':'hoh-agents','package':'rusqlite'}])
-    def test_hoh_core_outside_persistence_and_public_sqlite_types_are_hits(self):
-        graph=dict(BASE_GRAPH);graph['hoh-core']=[('db','rusqlite',None)]
-        # Visible outside persistence: pub, pub(crate), and pub(super) in mod.rs; pub(in crate::persistence) and private
-        # fields are not.
-        rc,res=self.run_scan({'crates/hoh-core/src/scheduler.rs':'use db::Connection;',
-                              'crates/hoh-core/src/persistence/mod.rs':'use db::Connection;\npub fn raw(&self) -> &Connection {&self.c}\npub use db::Transaction;\n'
-                              'pub(crate) fn ok(c:&db::Connection){}\npub(super) fn sup(c:&Connection){}\npub(in crate::persistence) fn inside(c:&Connection){}\n'
-                              'pub struct S {\n    pub conn: db::Connection,\n    private: Connection,\n}'},graph)
+    def test_the_clippy_boundary_cannot_be_switched_off(self):
+        # M2T01R-16..19: the boundary is clippy's disallowed-methods; its configuration and every way to allow the lint
+        # outside persistence are checked.
+        files={'crates/hoh-app/src/main.rs':'#[allow(clippy::disallowed_methods)]\nfn a(){}\n#[cfg_attr(test, allow(warnings))]\nfn b(){}',
+               'crates/hoh-core/src/lib.rs':'#![allow(clippy::style)]\n#[expect(clippy::all)]\nmod m {}\n#[allow(dead_code, clippy::too_many_lines)] fn ok(){}',
+               'crates/hoh-agents/clippy.toml':'',
+               'crates/hoh-agents/Cargo.toml':'[package]\nname = "hoh-agents"\n[lints.clippy]\ndisallowed_methods = "allow"\n',
+               'Cargo.toml':'[workspace]\n[workspace.lints.clippy]\nstyle = { level = "allow", priority = -1 }\n',
+               '.cargo/config.toml':'[build]\nrustflags = ["-A", "clippy::disallowed_methods"]\n'}
+        rc,res=self.run_scan(files,clippy=clippy_toml(skip={'rusqlite::Connection::execute'})+'')
         self.assertEqual(rc,1)
-        self.assertEqual(sorted(h['match'] for h in res['hits'] if h['kind']=='visible-api'),
-                         ['pub conn: db::Connection,','pub fn raw(&self) -> &Connection','pub use db::Transaction','pub(crate) fn ok(c:&db::Connection)','pub(super) fn sup(c:&Connection)'])
-        self.assertEqual([h['path'] for h in res['hits'] if h['kind']=='sqlite-name'],['crates/hoh-core/src/scheduler.rs'])
+        self.assertEqual(self.kinds(res),[('.cargo/config.toml','rustflags'),('Cargo.toml','lint-table'),('clippy.toml','clippy-config'),
+                                          ('crates/hoh-agents/Cargo.toml','lint-table'),('crates/hoh-agents/clippy.toml','clippy-config'),
+                                          ('crates/hoh-app/src/main.rs','lint-suppressed'),('crates/hoh-app/src/main.rs','lint-suppressed'),
+                                          ('crates/hoh-core/src/lib.rs','lint-suppressed'),('crates/hoh-core/src/lib.rs','lint-suppressed')])
+        self.assertIn('rusqlite::Connection::execute not disallowed',[h['match'] for h in res['hits']])
+        rc,res=self.run_scan({},clippy='disallowed-methods = [ { path = "rusqlite::Connection::open", allow-invalid = true } ]\n')
+        self.assertIn('rusqlite::Connection::open: allow-invalid',[h['match'] for h in res['hits']])
+    def test_new_rusqlite_features_need_the_boundary_extended(self):
+        rc,res=self.run_scan({},features=['bundled','default','backup'])
+        self.assertEqual(self.kinds(res),[('Cargo.lock','rusqlite-feature')])
+    def test_members_are_found_from_metadata_and_path_or_include_are_hits(self):
+        # M2T01R-14/-21: a member outside crates/, a module compiled through #[path], and include!.
+        dirs={'hoh-core':'engine/hoh-core'}
+        rc,res=self.run_scan({'engine/hoh-core/src/lib.rs':'#[path = "../database_ops.rs"]\nmod ops;\nconst X: &str = include!("../sql.rs");',
+                              'engine/hoh-core/database_ops.rs':'#![allow(clippy::disallowed_methods)]\nfn w(){}',
+                              'engine/hoh-core/src/persistence/mod.rs':'fn p(){}'},dirs=dirs)
+        self.assertEqual(rc,1)
+        self.assertEqual(self.kinds(res),[('engine/hoh-core/database_ops.rs','lint-suppressed'),('engine/hoh-core/src/lib.rs','path-or-include')])
+        self.assertEqual(res['files_scanned'],3)
     def test_sql_write_literals_are_decoded_and_joined_like_rust(self):
         # M2T01R-03: format! placeholders, concat!, a continuation inside a word, a hex escape, a raw string, upserts.
         src=('fn g(){let a=format!("UPDATE {table} SET state = ?1"); let b=concat!("INSERT ", "INTO t VALUES (1)");\n'
@@ -302,47 +329,6 @@ class PersistenceScan(unittest.TestCase):
         rc,res=self.run_scan({'crates/hoh-app/src/api.rs':src})
         self.assertEqual(rc,1)
         self.assertEqual(sorted(h['match'].upper() for h in res['hits']),sorted(['UPDATE {TABLE} SET','INSERT INTO','INSERT INTO','DELETE FROM','REPLACE INTO','INSERT OR IGNORE INTO','ON CONFLICT(ID) DO UPDATE']))
-    def test_aliases_build_scripts_and_proc_macros_are_followed(self):
-        # M2T01R-07: a type alias re-exported elsewhere, an extern crate alias, a type definition, a build script and a
-        # proc-macro crate emitting SQLite code.
-        graph=dict(BASE_GRAPH);graph['hoh-core']=[('rusqlite','rusqlite',None),('rusqlite','rusqlite','build')]
-        graph['hoh-macros']=[];graph['hoh-core']=graph['hoh-core']+[('hoh_macros','hoh-macros',None)]
-        files={'crates/hoh-core/src/persistence/mod.rs':'use rusqlite::Connection as R2Db;\npub fn get() -> R2Db { todo() }\n'
-                                                        'pub(crate) extern crate rusqlite as r2db;\npub(crate) type Db = rusqlite::Connection;',
-               'crates/hoh-agents/src/lib.rs':'pub use hoh_core::persistence::R2Db;',
-               'crates/hoh-core/src/scheduler.rs':'fn f(){ r2db::Connection::open("x"); }',
-               'crates/hoh-core/src/other.rs':'fn g(c: &crate::persistence::Db){}',
-               'crates/hoh-core/build.rs':'fn main(){ rusqlite::Connection::open("x").unwrap(); }',
-               'crates/hoh-macros/src/lib.rs':'fn expand() -> TokenStream { quote! { rusqlite::Connection::open("x") } }\nfn other(){ syn::parse_str::<Expr>("rusqlite::Connection::open(1)"); }'}
-        rc,res=self.run_scan(files,graph,targets={'hoh-macros':[{'kind':['proc-macro'],'src_path':'crates/hoh-macros/src/lib.rs'}]},extra_members=('hoh-macros',))
-        self.assertEqual(rc,1)
-        self.assertEqual(res['sqlite_names'],['Db','R2Db','r2db','rusqlite'])
-        self.assertEqual(self.kinds(res),[('/w/hoh-core/Cargo.toml','build-dependency'),('crates/hoh-agents/src/lib.rs','sqlite-name'),
-                                          ('crates/hoh-core/build.rs','sqlite-name'),('crates/hoh-core/src/other.rs','sqlite-name'),
-                                          ('crates/hoh-core/src/persistence/mod.rs','sqlite-type-alias')]+[('crates/hoh-core/src/persistence/mod.rs','visible-api')]*3+
-                                         [('crates/hoh-core/src/scheduler.rs','sqlite-name'),
-                                          ('crates/hoh-macros/src/lib.rs','sqlite-name'),('crates/hoh-macros/src/lib.rs','sqlite-name-in-macro')])
-    def test_unrenamed_imports_aliases_and_trait_impls_are_followed(self):
-        # M2T01R-13: `use rusqlite::Connection; type R3Db = Connection;` returned publicly; an alias made in one persistence
-        # file and used in another's public signature; a Deref impl handing out the connection.
-        files={'crates/hoh-core/src/persistence/mod.rs':'use rusqlite::Connection;\ntype R3Db = Connection;\npub fn open() -> R3Db { todo() }\n'
-                                                        'mod writer;\nuse writer::Handle;\npub fn handle() -> Handle { todo() }',
-               'crates/hoh-core/src/persistence/writer.rs':'pub(super) use rusqlite::Connection as Handle;',
-               'crates/hoh-core/src/persistence/store.rs':'use rusqlite::Connection;\npub struct Store { conn: Connection }\n'
-                                                          'impl std::ops::Deref for Store { type Target = Connection; fn deref(&self) -> &Connection { &self.conn } }\n'
-                                                          'impl AsRef<Connection> for Store { fn as_ref(&self) -> &Connection { &self.conn } }'}
-        rc,res=self.run_scan(files)
-        self.assertEqual(rc,1)
-        self.assertEqual(sorted((h['path'].rsplit('/',1)[1],h['kind'],h['match']) for h in res['hits']),
-                         [('mod.rs','sqlite-type-alias','type R3Db = Connection;'),('mod.rs','visible-api','pub fn handle() -> Handle'),
-                          ('mod.rs','visible-api','pub fn open() -> R3Db'),('store.rs','sqlite-type-alias','type Target = Connection;'),
-                          ('store.rs','trait-impl','impl AsRef<Connection> for Store')])
-    def test_path_attributes_and_include_are_hits_and_stray_files_are_scanned(self):
-        # M2T01R-14: a module compiled from outside src/ through #[path].
-        rc,res=self.run_scan({'crates/hoh-core/src/lib.rs':'#[path = "../database_ops.rs"]\nmod ops;\nconst X: &str = include!("../sql.rs");',
-                              'crates/hoh-core/database_ops.rs':'fn w(){ rusqlite::Connection::open("x"); }'})
-        self.assertEqual(rc,1)
-        self.assertEqual(self.kinds(res),[('crates/hoh-core/database_ops.rs','sqlite-name'),('crates/hoh-core/src/lib.rs','path-or-include')])
     def test_web_lockfiles_are_searched_through(self):
         # M2T01R-10: a transitive npm alias and a package object's name in a v3 lockfile.
         lock={'lockfileVersion':3,'packages':{'':{'dependencies':{'orm':'1'}},'node_modules/orm':{'version':'1','dependencies':{'db':'npm:better-sqlite3@12'}},

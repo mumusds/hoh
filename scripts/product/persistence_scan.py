@@ -1,34 +1,32 @@
 #!/usr/bin/env python3
-"""AC-062-05: SQL writes and SQLite access only in the Persistence module (crates/hoh-core/src/persistence/).
+"""AC-062-05: SQLite is opened and SQL executed only by the Persistence module (crates/hoh-core/src/persistence/).
 
-The boundary is Rust's module visibility; this scan checks that nothing opens it (M2T01R-03/-04/-06/-07/-13/-14).
-Product sources are all .rs files of the workspace members' directories except tests/, benches/ and examples/.
+The boundary is enforced by the compiler, and this scan checks that nothing switches it off (M2T01R-16..21):
 1. Dependencies, by package identity from `cargo metadata` (renamed packages and workspace inheritance resolved):
    no workspace member but hoh-core reaches a SQLite package (any package whose name contains "sqlite", such as
    rusqlite and libsqlite3-sys) through normal or build dependencies, other than through hoh-core itself; hoh-core
-   has it only as a normal dependency (so its build script cannot use it). Dev-dependencies (test code) are allowed
-   and listed.
-2. The crate names under which hoh-core sees SQLite packages, and the aliases hoh-core defines for them
-   (`extern crate X as Y`, `use X as Y`, `type Y = X…`), occur only in persistence/: in the code of every product
-   source (comments and string literals do not count) and also in the string literals of proc-macro crates.
-3. Nothing in persistence/ that is visible outside it mentions a SQLite name: items and fields declared `pub`,
-   `pub(crate)`, `pub(in …)` outside persistence, or `pub(super)` in persistence/mod.rs. A file's SQLite names are
-   the crate names, everything its `use` statements import from them, and every alias or re-export of one defined
-   anywhere in persistence/. A `type` alias of a SQLite type (associated types of trait impls included), a trait
-   impl whose header names one, and a `#[macro_export]` macro in persistence/ are hits too.
-4. `#[path = …]` and `include!` are not used in product sources, so every compiled file is one this scan reads.
-5. Defence in depth: string literals outside persistence/ that hold a SQL write statement (INSERT/REPLACE INTO,
+   has it only as a normal dependency (its build script cannot use it). Dev-dependencies (test code) are allowed and
+   listed. rusqlite may not enable features beyond the known set (others add APIs that write the database).
+2. Inside hoh-core, clippy's `disallowed-methods` (clippy.toml) forbids every rusqlite call that opens a database or
+   executes SQL. Clippy resolves each call with type information, so it holds however a connection was obtained
+   (aliases, re-exports, generics, closures, trait methods, macros); the static check runs clippy with -D warnings
+   and fails on an entry that does not resolve. This scan checks that clippy.toml lists all REQUIRED methods
+   without `allow-invalid`, that no other clippy configuration exists, that no Cargo `[lints]` table or
+   `.cargo/config` rustflags allow the lint, and that no product source outside persistence/ allows or expects
+   `clippy::disallowed_methods` or a group holding it (`clippy::style`, `clippy::all`, `warnings`).
+3. Product sources are all .rs files in the directories of the workspace members (from `cargo metadata`) except
+   tests/, benches/ and examples/; `#[path = …]` and `include!` are not allowed in them, so every compiled file is
+   one this scan reads.
+4. Defence in depth: string literals outside persistence/ that hold a SQL write statement (INSERT/REPLACE INTO,
    UPDATE ... SET, DELETE FROM, UPSERT, ON CONFLICT ... DO UPDATE), decoded as Rust does (escapes, line
    continuations), with literals separated only by commas joined (concat!), are hits.
-6. web/ (when present): no SQLite package in package.json dependencies (by name or npm: alias spec), nowhere in a
+5. web/ (when present): no SQLite package in package.json dependencies (by name or npm: alias spec), nowhere in a
    lockfile (every key and string value), and no import of one.
-This checks source text against ordinary and accidental violations; identifiers assembled at compile time (e.g.
-generated from strings by a build script) are beyond it and left to review.
 Scanning no file at all fails (no empty scan). Prints a JSON summary; with --out appends one test-results.jsonl
 line for TEST-062-05. --metadata reads `cargo metadata` JSON from a file (tests).
 """
 from __future__ import annotations
-import argparse, json, re, subprocess, sys
+import argparse, json, re, subprocess, sys, tomllib
 from pathlib import Path
 
 PERSISTENCE = 'crates/hoh-core/src/persistence/'
@@ -37,6 +35,22 @@ SQL_WRITE = re.compile(
     r'\b(?:INSERT\s+(?:OR\s+\w+\s+)?INTO|REPLACE\s+INTO|UPDATE\s+(?:OR\s+\w+\s+)?\S+\s+SET|DELETE\s+FROM|UPSERT'
     r'|ON\s+CONFLICT\b[^;]*?\bDO\s+UPDATE)\b', re.IGNORECASE)
 ESCAPE = {'n': '\n', 't': '\t', 'r': '\r', '0': '\0', '\\': '\\', '"': '"', "'": "'"}
+LOCKFILES = ('package-lock.json', 'npm-shrinkwrap.json')
+# Every rusqlite API that opens a database or executes SQL with the features below.
+REQUIRED = {f'rusqlite::{ty}::{m}' for ty, ms in {
+    'Connection': ['open', 'open_with_flags', 'open_with_flags_and_vfs', 'open_in_memory', 'open_in_memory_with_flags',
+                   'open_in_memory_with_flags_and_vfs', 'execute', 'execute_batch', 'prepare', 'prepare_cached',
+                   'prepare_with_flags', 'query_row', 'query_row_and_then', 'query_one', 'pragma', 'pragma_query',
+                   'pragma_query_value', 'pragma_update', 'pragma_update_and_check', 'transaction',
+                   'transaction_with_behavior', 'unchecked_transaction', 'savepoint', 'savepoint_with_name'],
+    'Statement': ['execute', 'insert', 'raw_execute', 'query', 'query_map', 'query_and_then', 'query_row', 'query_one',
+                  'exists', 'raw_query'],
+    'Transaction': ['new', 'new_unchecked', 'commit', 'rollback', 'finish', 'savepoint', 'savepoint_with_name'],
+    'Savepoint': ['new', 'with_name', 'commit', 'rollback', 'finish', 'savepoint', 'savepoint_with_name'],
+    'Batch': ['new'],
+}.items() for m in ms}
+KNOWN_RUSQLITE_FEATURES = {'bundled', 'cache', 'default', 'modern_sqlite', 'ffi-sqlite-wasm-rs', 'hashlink'}
+SUPPRESSING = re.compile(r'\b(?:clippy::(?:disallowed_methods|style|all)|warnings)\b')
 
 
 def sqlite_package(name: str) -> bool:
@@ -141,47 +155,17 @@ def literal_strings(code: str, literals: list[tuple[int, int, str]]) -> list[str
     return out
 
 
-VISIBLE = re.compile(r'(?m)^[ \t]*(pub(?:[ \t]*\((?:crate|super|self|in[ \t]+[\w:]+)\))?)[ \t]')
-
-
-def leaks(vis: str, rel: str) -> bool:
-    """Whether an item with visibility `vis` in persistence file `rel` is visible outside persistence/."""
-    vis = ' '.join(vis.split()).replace('( ', '(').replace(' )', ')')
-    if vis in ('pub', 'pub(crate)'):
-        return True
-    if vis == 'pub(super)':
-        return rel == PERSISTENCE + 'mod.rs'
-    if vis.startswith('pub(in'):
-        return not re.match(r'pub\(in (?:crate::persistence|self|super)\b', vis)
-    return False  # pub(self)
-
-
-def visible_items(code: str, rel: str) -> list[str]:
-    """Signatures of items and fields visible outside persistence/ (from the visibility to the first `{` or `;`; a
-    field to the end of its line)."""
-    sigs = []
-    for m in VISIBLE.finditer(code):
-        if not leaks(m.group(1), rel):
-            continue
-        rest = code[m.start():]
-        cut = min([p for p in (rest.find('{'), rest.find(';')) if p >= 0] or [len(rest)])
-        sig = rest[:cut]
-        if re.match(r'[ \t]*pub[^:]*?[ \t]\w+[ \t]*:(?!:)', sig):
-            sig = sig.split('\n', 1)[0]
-        sigs.append(' '.join(sig.split()))
-    return sigs
-
-
-def imported_names(code: str, names: set[str]) -> set[str]:
-    """Everything the `use` statements of a file import from (or through) one of `names`."""
-    if not names:
-        return set()
-    token = re.compile(r'\b(?:' + '|'.join(map(re.escape, sorted(names))) + r')\b')
-    out = set()
-    for m in re.finditer(r'\buse\s+([^;]*);', code):
-        if token.search(m.group(1)):
-            out.update(w for w in re.findall(r'\b[A-Za-z_]\w*\b', m.group(1))
-                       if w not in ('as', 'self', 'super', 'crate', '_'))
+def attributes(code: str) -> list[str]:
+    """The text of every attribute (`#[…]` and `#![…]`, brackets balanced) in comment- and literal-free code."""
+    out = []
+    for m in re.finditer(r'#\s*!?\s*\[', code):
+        depth, i = 0, m.end() - 1
+        while i < len(code):
+            depth += {'[': 1, ']': -1}.get(code[i], 0)
+            if depth == 0:
+                break
+            i += 1
+        out.append(' '.join(code[m.start():i + 1].split()))
     return out
 
 
@@ -195,13 +179,13 @@ def load_metadata(root: Path, path: Path | None) -> dict:
     return json.loads(r.stdout)
 
 
-def dependency_checks(metadata: dict, hits: list) -> tuple[set[str], list[dict]]:
-    """Check 1; returns hoh-core's crate names for SQLite packages and the allowed dev-dependency uses."""
+def dependency_checks(metadata: dict, hits: list) -> list[dict]:
+    """Check 1; returns the allowed dev-dependency uses."""
     packages = {p['id']: p for p in metadata['packages']}
     nodes = {n['id']: n for n in metadata['resolve']['nodes']}
     members = metadata['workspace_members']
     core_ids = {m for m in members if packages[m]['name'] == CORE}
-    core_names, dev_uses = set(), []
+    dev_uses = []
 
     def edges(node_id: str, include_dev: bool):
         for dep in nodes[node_id]['deps']:
@@ -211,11 +195,15 @@ def dependency_checks(metadata: dict, hits: list) -> tuple[set[str], list[dict]]
                 yield dep, normal
     for core in core_ids:
         for dep, _ in edges(core, False):
-            if sqlite_package(packages[dep['pkg']]['name']):
-                core_names.add(dep['name'])
-                if any(k['kind'] == 'build' for k in dep['dep_kinds']):
-                    hits.append({'path': packages[core]['manifest_path'], 'kind': 'build-dependency',
-                                 'match': f"{CORE} build -> {packages[dep['pkg']]['name']}"})
+            if sqlite_package(packages[dep['pkg']]['name']) and any(k['kind'] == 'build' for k in dep['dep_kinds']):
+                hits.append({'path': packages[core]['manifest_path'], 'kind': 'build-dependency',
+                             'match': f"{CORE} build -> {packages[dep['pkg']]['name']}"})
+    for node in nodes.values():
+        if packages[node['id']]['name'] == 'rusqlite':
+            extra = sorted(set(node.get('features') or []) - KNOWN_RUSQLITE_FEATURES)
+            if extra:
+                hits.append({'path': 'Cargo.lock', 'kind': 'rusqlite-feature',
+                             'match': f"features {extra} may add write APIs: extend clippy.toml and this scan"})
     for member in members:
         if member in core_ids:
             continue
@@ -236,97 +224,79 @@ def dependency_checks(metadata: dict, hits: list) -> tuple[set[str], list[dict]]
                              'match': ' -> '.join([name] + via)})
                 continue
             stack.extend((d['pkg'], via + [packages[d['pkg']]['name']]) for d, _ in edges(pkg, False))
-    return core_names, dev_uses
+    return dev_uses
 
 
-def product_files(root: Path, metadata: dict) -> tuple[list[Path], set[Path]]:
-    """(every product source, the files of proc-macro crates)."""
+def member_dirs(metadata: dict) -> list[Path]:
+    packages = {p['id']: p for p in metadata['packages']}
+    return sorted({Path(packages[m]['manifest_path']).parent for m in metadata['workspace_members']})
+
+
+def product_files(metadata: dict) -> list[Path]:
     skip = {'tests', 'benches', 'examples', 'target'}
-    files = {p for p in root.glob('crates/*/**/*.rs') if not skip & set(p.relative_to(root).parts[2:-1])}
-    macro_dirs = []
-    for package in metadata.get('packages', []):
-        for target in package.get('targets') or []:
-            src = Path(target.get('src_path', ''))
-            kinds = set(target.get('kind') or [])
-            if 'custom-build' in kinds and src.is_file() and src.resolve().is_relative_to(root.resolve()):
-                files.add(src)
-            if 'proc-macro' in kinds:
-                macro_dirs.append(src.parent.resolve())
-    macro_files = {f for f in files if any(f.resolve().is_relative_to(d) for d in macro_dirs)}
-    return sorted(files), macro_files
+    files = set()
+    for d in member_dirs(metadata):
+        files |= {p for p in d.rglob('*.rs') if not skip & set(p.relative_to(d).parts[:-1])}
+    return sorted(files)
 
 
-def alias_closure(names: set[str], sources: list[str]) -> set[str]:
-    """`names` plus every alias the sources define for one of them."""
-    names = set(names)
-    while True:
-        token = re.compile(r'\b(?:' + '|'.join(map(re.escape, sorted(names))) + r')\b')
-        found = set()
-        for code in sources:
-            for m in re.finditer(r'\bextern\s+crate\s+(\w+)\s+as\s+(\w+)', code):
-                if m.group(1) in names:
-                    found.add(m.group(2))
-            for m in re.finditer(r'\buse\s+([^;]*);', code):
-                if token.search(m.group(1)):
-                    found.update(re.findall(r'\bas\s+(\w+)', m.group(1)))
-            for m in re.finditer(r'\btype\s+(\w+)\b[^=;]*=\s*([^;]*);', code):
-                if token.search(m.group(2)):
-                    found.add(m.group(1))
-        found.discard('_')
-        if found <= names:
-            return names
-        names |= found
+def lint_configuration_checks(root: Path, metadata: dict, hits: list) -> None:
+    """Check 2 outside the sources: clippy.toml, other clippy configs, Cargo lint tables, rustflags."""
+    config = root / 'clippy.toml'
+    try:
+        entries = tomllib.loads(config.read_text(encoding='utf-8')).get('disallowed-methods', [])
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        hits.append({'path': 'clippy.toml', 'kind': 'clippy-config', 'match': f'unreadable: {exc}'})
+        entries = []
+    listed = {e if isinstance(e, str) else e.get('path') for e in entries}
+    for missing in sorted(REQUIRED - listed):
+        hits.append({'path': 'clippy.toml', 'kind': 'clippy-config', 'match': f'{missing} not disallowed'})
+    for e in entries:
+        if isinstance(e, dict) and e.get('allow-invalid'):
+            hits.append({'path': 'clippy.toml', 'kind': 'clippy-config', 'match': f"{e.get('path')}: allow-invalid"})
+    dirs = member_dirs(metadata)
+    places = {root} | set(dirs) | {p for d in dirs for p in d.parents if p.is_relative_to(root)}
+    for d in sorted(places):
+        for name in ('clippy.toml', '.clippy.toml'):
+            p = d / name
+            if p.is_file() and p != config:
+                hits.append({'path': rel_to(p, root), 'kind': 'clippy-config', 'match': 'another clippy configuration'})
+    for manifest in sorted({root / 'Cargo.toml'} | {d / 'Cargo.toml' for d in dirs}):
+        try:
+            data = tomllib.loads(manifest.read_text(encoding='utf-8'))
+        except (OSError, tomllib.TOMLDecodeError):
+            continue
+        for table in (data.get('lints') or {}, (data.get('workspace') or {}).get('lints') or {}):
+            for tool, lints in table.items():
+                for lint, level in (lints.items() if isinstance(lints, dict) else []):
+                    level = level.get('level') if isinstance(level, dict) else level
+                    full = lint if tool == 'rust' else f'{tool}::{lint}'
+                    if level in ('allow', 'expect') and SUPPRESSING.search(full):
+                        hits.append({'path': rel_to(manifest, root), 'kind': 'lint-table', 'match': f'{full} = {level}'})
+    for cfg in (root / '.cargo/config.toml', root / '.cargo/config'):
+        if cfg.is_file() and re.search(r'(?:-A|--allow|--cap-lints)', cfg.read_text(encoding='utf-8')):
+            hits.append({'path': rel_to(cfg, root), 'kind': 'rustflags', 'match': 'lint level flags'})
+
+
+def rel_to(path: Path, root: Path) -> str:
+    return path.relative_to(root).as_posix() if path.is_relative_to(root) else path.as_posix()
 
 
 def scan(root: Path, metadata: dict) -> dict:
-    hits, scanned = [], 0
-    core_names, dev_uses = dependency_checks(metadata, hits)
-    files, macro_files = product_files(root, metadata)
-    parsed = {path: split_rust(path.read_text(encoding='utf-8', errors='replace')) for path in files}
-    core_sources = [code for path, (code, _) in parsed.items() if path.relative_to(root).as_posix().startswith('crates/hoh-core/')]
-    names = alias_closure(core_names, core_sources) if core_names else set()
-    token = re.compile(r'\b(?:' + '|'.join(map(re.escape, sorted(names))) + r')\b') if names else None
-    rel_of = {path: path.relative_to(root).as_posix() for path in files}
-    persistence = [p for p in files if rel_of[p].startswith(PERSISTENCE)]
-    # Aliases and re-exports of SQLite items made anywhere in persistence/ count in all of it.
-    shared = set(names)
-    for path in persistence:
-        code = parsed[path][0]
-        local = names | imported_names(code, names)
-        local_token = re.compile(r'\b(?:' + '|'.join(map(re.escape, sorted(local))) + r')\b') if local else None
-        for m in re.finditer(r'\btype\s+(\w+)\b[^=;]*=\s*([^;]*);', code):
-            if local_token and local_token.search(m.group(2)):
-                shared.add(m.group(1))
-                # Persistence needs no alias of a SQLite type; one (an associated type of a trait impl such as
-                # `Deref::Target` included) can hand a connection to other code.
-                hits.append({'path': rel_of[path], 'kind': 'sqlite-type-alias', 'match': ' '.join(m.group(0).split())[:200]})
-        for m in re.finditer(r'(?m)^[ \t]*pub\b[^;\n]*?\buse\s+([^;]*);', code):
-            if local_token and local_token.search(m.group(1)):
-                shared.update(imported_names('use ' + m.group(1) + ';', local))
+    hits = []
+    dev_uses = dependency_checks(metadata, hits)
+    lint_configuration_checks(root, metadata, hits)
+    files = product_files(metadata)
     for path in files:
-        rel = rel_of[path]
-        scanned += 1
-        code, literals = parsed[path]
-        if re.search(r'#\s*!?\[\s*path\s*=', code) or re.search(r'\binclude!\s*[(\[{]', code):
+        rel = rel_to(path, root)
+        code, literals = split_rust(path.read_text(encoding='utf-8', errors='replace'))
+        if re.search(r'#\s*!?\s*\[\s*path\s*=', code) or re.search(r'\binclude!\s*[(\[{]', code):
             hits.append({'path': rel, 'kind': 'path-or-include', 'match': '#[path] or include!'})
         if rel.startswith(PERSISTENCE):
-            visible = shared | imported_names(code, shared)
-            vis_token = re.compile(r'\b(?:' + '|'.join(map(re.escape, sorted(visible))) + r')\b') if visible else None
-            for sig in visible_items(code, rel):
-                if vis_token and vis_token.search(sig):
-                    hits.append({'path': rel, 'kind': 'visible-api', 'match': sig[:200]})
-            for m in re.finditer(r'(?m)^[ \t]*impl\b[^{;]*', code):
-                if vis_token and vis_token.search(m.group(0)):
-                    hits.append({'path': rel, 'kind': 'trait-impl', 'match': ' '.join(m.group(0).split())[:200]})
-            if re.search(r'#\s*\[\s*macro_export\b', code):
-                hits.append({'path': rel, 'kind': 'macro-export', 'match': '#[macro_export]'})
             continue
-        if token and (m := token.search(code)):
-            hits.append({'path': rel, 'kind': 'sqlite-name', 'match': m.group(0)})
-        if token and path in macro_files:
-            for _, _, value in literals:
-                if m := token.search(value):
-                    hits.append({'path': rel, 'kind': 'sqlite-name-in-macro', 'match': m.group(0)})
+        for attr in attributes(code):
+            if re.search(r'\b(?:allow|expect)\s*\(', attr) and SUPPRESSING.search(attr):
+                hits.append({'path': rel, 'kind': 'lint-suppressed', 'match': attr[:200]})
         for value in literal_strings(code, literals):
             if m := SQL_WRITE.search(value):
                 hits.append({'path': rel, 'kind': 'sql', 'match': ' '.join(m.group(0).split())})
@@ -334,7 +304,7 @@ def scan(root: Path, metadata: dict) -> dict:
     web_files = 0
     if web.is_dir():
         for path in sorted(p for p in web.rglob('*') if p.is_file() and 'node_modules' not in p.parts):
-            rel = path.relative_to(root).as_posix()
+            rel = rel_to(path, root)
             web_files += 1
             text = path.read_text(encoding='utf-8', errors='replace')
             if path.name == 'package.json' or path.name in LOCKFILES:
@@ -354,13 +324,9 @@ def scan(root: Path, metadata: dict) -> dict:
                 hits.extend({'path': rel, 'kind': 'web-dependency', 'match': s[:200]} for s in found)
             elif re.search(r'''(?:\bfrom|\bimport|require\()\s*\(?\s*['"][^'"]*sqlite''', text, re.IGNORECASE):
                 hits.append({'path': rel, 'kind': 'web-import', 'match': 'sqlite'})
-    scanned += web_files
+    scanned = len(files) + web_files
     return {'files_scanned': scanned, 'web_files_scanned': web_files, 'web_present': web.is_dir(),
-            'sqlite_names': sorted(names), 'dev_dependency_uses': dev_uses, 'hits': hits,
-            'status': 'PASS' if scanned > 0 and not hits else 'FAIL'}
-
-
-LOCKFILES = ('package-lock.json', 'npm-shrinkwrap.json')
+            'dev_dependency_uses': dev_uses, 'hits': hits, 'status': 'PASS' if scanned > 0 and not hits else 'FAIL'}
 
 
 def json_strings(value) -> list[str]:
@@ -379,13 +345,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument('--out', type=Path, help='test-results.jsonl to append the TEST-062-05 line to')
     a = p.parse_args(argv)
     try:
-        result = scan(a.root, load_metadata(a.root, a.metadata))
+        result = scan(a.root.resolve(), load_metadata(a.root, a.metadata))
     except (RuntimeError, KeyError, ValueError, OSError) as exc:
         result = {'files_scanned': 0, 'hits': [], 'status': 'FAIL', 'error': str(exc)}
     print(json.dumps(result, ensure_ascii=False, indent=1))
     if a.out:
-        detail = result.get('error') or (f"{result['files_scanned']} files scanned, {len(result['hits'])} hits "
-                                         f"outside {PERSISTENCE}")
+        detail = result.get('error') or (f"{result['files_scanned']} files scanned, {len(result['hits'])} hits; "
+                                         f"SQLite calls outside {PERSISTENCE} are refused by clippy disallowed-methods")
         line = {'schema_version': '1.0', 'test_id': 'TEST-062-05', 'name': 'scripts/product/persistence_scan.py',
                 'status': result['status'], 'detail': detail[:4096]}
         with a.out.open('a', encoding='utf-8') as f:

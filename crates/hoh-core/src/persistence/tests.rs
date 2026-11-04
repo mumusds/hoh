@@ -246,6 +246,49 @@ async fn a_failing_migration_is_rolled_back() -> R {
 }
 
 #[test]
+fn migration_statements_are_classified_by_their_keyword() -> R {
+    // M2T01R-20: SQLite's read-only flag is not a statement class. BEGIN IMMEDIATE/EXCLUSIVE are not read-only but are
+    // the script's own transaction control; REINDEX of a table without indexes is read-only but a legitimate step.
+    let dir = tempfile::tempdir()?;
+    for (version, script) in [
+        (
+            1,
+            "BEGIN IMMEDIATE; CREATE TABLE a(x); PRAGMA user_version = 1; COMMIT;",
+        ),
+        (
+            2,
+            "BEGIN EXCLUSIVE TRANSACTION; CREATE TABLE b(x); REINDEX b; ANALYZE; PRAGMA user_version = 2; END;",
+        ),
+    ] {
+        let conn = Connection::open(dir.path().join(format!("ok{version}.db")))?;
+        assert_eq!(migrate(&conn, &[(version, script)])?, version, "{script}");
+    }
+    // Statements that cannot run inside the runner's transaction, or would leave it, are refused unexecuted.
+    for script in [
+        "VACUUM;",
+        "ATTACH 'x.db' AS x;",
+        "SAVEPOINT s;",
+        "RELEASE s;",
+        "ROLLBACK;",
+    ] {
+        let conn = Connection::open(dir.path().join("refused.db"))?;
+        let full = format!("CREATE TABLE c(x); {script} PRAGMA user_version = 1;");
+        match migrate(&conn, &[(1, full.as_str())]) {
+            Err(PersistError::Migration { version: 1, detail }) => {
+                assert!(
+                    detail.contains("not allowed in a migration"),
+                    "{script}: {detail}"
+                )
+            }
+            other => return Err(format!("{script}: {other:?}").into()),
+        }
+        let tables: i64 = conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))?;
+        assert_eq!(tables, 0, "{script} left schema changes");
+    }
+    Ok(())
+}
+
+#[test]
 fn migration_scripts_keep_trigger_bodies_and_roll_back_a_failed_commit() -> R {
     let dir = tempfile::tempdir()?;
     let conn = Connection::open(dir.path().join("m.db"))?;
