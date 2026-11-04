@@ -4,8 +4,12 @@
 //! and turn; those of this thread that come before turn/start is answered wait until this turn's id is known and are
 //! dropped if they turn out to be another turn's (M1T04R-01). Once the turn is being stopped or exec is to be used, a
 //! late answer moves nothing (M1T04R-02). stdin is written by a task the loop watches: a write failure stops the
-//! turn, and the task is aborted, not awaited, once the process has exited (M1T04R-04). A steer is APPLIED when its
-//! user message item has been seen and codex has answered the turn/steer, in either order (M1T04R-05).
+//! process (recorded; the stream's end still decides), and the task is aborted, not awaited, once the process has
+//! exited (M1T04R-04). A user message item is matched
+//! to the first steer of the same text that was sent and has no item yet; the steer is APPLIED when both its item and
+//! codex's answer have come, in either order (M1T04R-05). A refused steer gives its item up with it, and an item id
+//! counts once (M1T04R-08/09). Notifications of this thread still waiting for an unconfirmed turn are looked at when
+//! the stream ends: a tool item among them makes the end UNKNOWN_EFFECT (M1T04R-06).
 
 use super::{
     Ending, METHOD_NOT_FOUND, Mode, Outcome, Steer, SteerReceipt, Turn, app_server_args,
@@ -17,7 +21,7 @@ use crate::process::{Config, Event, Process};
 use hoh_core::lifecycle::{AttemptState, InputState};
 use hoh_core::persistence::{AttemptFacts, CancelLatch, InputMove, PersistError, Store};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -112,6 +116,16 @@ fn scope_of(method: &str, params: &Value) -> Option<(Option<String>, Option<Stri
     }
 }
 
+/// A steer sent with turn/steer, until it is APPLIED or REJECTED.
+struct SentSteer {
+    input_id: String,
+    text: String,
+    /// The user message item matched to it.
+    item: Option<String>,
+    /// codex answered the turn/steer (the input is DELIVERED).
+    acked: bool,
+}
+
 /// Everything one App Server turn knows.
 struct State<'a> {
     store: &'a Store,
@@ -138,10 +152,11 @@ struct State<'a> {
     stopped: bool,
     interrupted: bool,
     counters: HashMap<&'static str, usize>,
-    /// Steers codex has taken, waiting for their user message item: (input id, text).
-    delivered: Vec<(String, String)>,
-    /// User message texts of this turn not matched to a steer yet (the prompt's is consumed first).
-    seen: Vec<String>,
+    /// Steers sent and not yet APPLIED or REJECTED, in the order sent.
+    sent: Vec<SentSteer>,
+    /// User message item ids already looked at.
+    seen_items: HashSet<String>,
+    /// The prompt's own user message has been seen (it is matched before any steer).
     prompt_seen: bool,
     /// Turn-scoped notifications of this thread that came before this turn's id was known.
     early: Vec<(String, Value)>,
@@ -202,6 +217,12 @@ impl State<'_> {
     }
 
     fn send_steer(&mut self, s: Steer) {
+        self.sent.push(SentSteer {
+            input_id: s.input_id.clone(),
+            text: s.text.clone(),
+            item: None,
+            acked: false,
+        });
         let expected = s.expected_turn.clone().or_else(|| self.turn_id.clone());
         let params = json!({"threadId": self.thread_id, "expectedTurnId": expected,
                             "input": [{"type": "text", "text": s.text}]});
@@ -244,15 +265,24 @@ impl State<'_> {
                 if method == "item/started" && !is_text_item(kind) {
                     self.tool_started = true;
                 }
-                if method == "item/started" && kind == "userMessage" {
+                let id = item["id"].as_str().unwrap_or_default().to_owned();
+                if method == "item/started"
+                    && kind == "userMessage"
+                    && self.seen_items.insert(id.clone())
+                {
                     let text = text_of(item);
                     if !self.prompt_seen && text == self.turn.prompt {
                         self.prompt_seen = true;
-                    } else if let Some(at) = self.delivered.iter().position(|(_, t)| *t == text) {
-                        let (input_id, _) = self.delivered.remove(at);
-                        self.apply(input_id).await?;
-                    } else {
-                        self.seen.push(text);
+                    } else if let Some(at) = self
+                        .sent
+                        .iter()
+                        .position(|x| x.item.is_none() && x.text == text)
+                    {
+                        self.sent[at].item = Some(id);
+                        if self.sent[at].acked {
+                            let x = self.sent.remove(at);
+                            self.apply(x.input_id).await?;
+                        }
                     }
                 }
             }
@@ -463,6 +493,8 @@ impl State<'_> {
             Pending::Interrupt => {}
             Pending::Steer(s) => match refused {
                 Some(_) => {
+                    // A refused steer gives up the item matched to it.
+                    self.sent.retain(|x| x.input_id != s.input_id);
                     self.store
                         .move_input(InputMove {
                             input_id: s.input_id.clone(),
@@ -488,11 +520,13 @@ impl State<'_> {
                         .or_else(|| self.turn_id.clone())
                         .unwrap_or_default();
                     // Its user message may have come first.
-                    if let Some(at) = self.seen.iter().position(|t| *t == s.text) {
-                        self.seen.remove(at);
-                        self.apply(s.input_id.clone()).await?;
-                    } else {
-                        self.delivered.push((s.input_id, s.text));
+                    if let Some(at) = self.sent.iter().position(|x| x.input_id == s.input_id) {
+                        if self.sent[at].item.is_some() {
+                            let x = self.sent.remove(at);
+                            self.apply(x.input_id).await?;
+                        } else {
+                            self.sent[at].acked = true;
+                        }
                     }
                     let _ = s.reply.send(SteerReceipt::Delivered { turn_id: took });
                 }
@@ -583,8 +617,8 @@ pub(super) async fn run(
         stopped: false,
         interrupted: false,
         counters: HashMap::new(),
-        delivered: Vec::new(),
-        seen: Vec::new(),
+        sent: Vec::new(),
+        seen_items: HashSet::new(),
         prompt_seen: false,
         early: Vec::new(),
     };
@@ -630,8 +664,10 @@ pub(super) async fn run(
                     Ok(Err(e)) => Some(e.to_string()),
                     Err(e) => Some(e.to_string()),
                 };
+                // codex can no longer be told anything (it closed stdin or is gone): stop it. The stream's end decides
+                // the outcome, so a tool that had started still makes it UNKNOWN_EFFECT.
                 if let Some(e) = failed.filter(|_| s.conn.open()) {
-                    s.failure.get_or_insert(format!("stdin: {e}"));
+                    s.diagnostic(json!({"reason": "stdin failed", "error": e})).await?;
                     s.hard_stop(&process);
                 }
                 continue;
@@ -696,6 +732,29 @@ pub(super) async fn run(
     }
     for st in held.drain(..) {
         let _ = st.reply.send(SteerReceipt::NotNow);
+    }
+    // This thread's notifications still waiting for a turn that was never confirmed: a tool among them may have acted.
+    if !s.early.is_empty() {
+        let early = std::mem::take(&mut s.early);
+        let started: Vec<Value> = early
+            .iter()
+            .filter(|(m, _)| m == "item/started")
+            .map(|(_, f)| f["params"]["item"].clone())
+            .collect();
+        if started
+            .iter()
+            .any(|i| !is_text_item(i["type"].as_str().unwrap_or_default()))
+        {
+            s.tool_started = true;
+        }
+        s.event(
+            "unconfirmed-turn",
+            "adapter.diagnostic",
+            json!({"reason": "notifications of this thread for a turn never confirmed",
+                   "methods": early.iter().map(|(m, _)| m.clone()).collect::<Vec<_>>(),
+                   "items_started": started.iter().map(|i| json!({"id": i["id"], "type": i["type"]})).collect::<Vec<_>>()}),
+        )
+        .await?;
     }
     let logs_incomplete = report.as_ref().is_none_or(|r| {
         r.stdout.error.is_some() || r.stderr.error.is_some() || !r.stdout.eof || !r.stderr.eof

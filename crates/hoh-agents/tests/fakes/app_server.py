@@ -7,10 +7,13 @@ id to its method ({"0": "initialize", ...}). Frames are sent in order. A respons
 request of that method that is not answered yet, and goes out with the client's id; notifications and server
 requests go out as soon as everything before them has. When every frame is out the fake waits for stdin to close
 (or exits at once with --exit-when-done, a stream cut short). A frame {"hoh_sleep": SECONDS} is not sent: the fake
-pauses there. In LOGDIR it keeps received.jsonl (every client line),
+pauses there; {"hoh_wait": {"method": M, "count": N}} is not sent either: the fake waits there until the client
+has sent N requests of method M; {"hoh_close_stdin": true} closes the fake's stdin (it sends what follows, then
+exits); {"hoh_batch": [FRAME, ...]} sends those frames in one write. In LOGDIR it keeps received.jsonl (every client line),
 sent.jsonl (the exact bytes sent) and trace.jsonl (both directions in order).
 """
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -26,17 +29,30 @@ def main() -> int:
     sent = open(logdir / 'sent.jsonl', 'ab')
     trace = open(logdir / 'trace.jsonl', 'a', encoding='utf-8')
     unanswered: list[tuple[object, str]] = []  # client requests (id, method) in arrival order
+    received_methods: list[str] = []  # methods of every client request so far
+    closed = []  # set once stdin is closed by {"hoh_close_stdin": true}
     out = sys.stdout.buffer
 
-    def emit(frame: dict) -> None:
-        data = (json.dumps(frame, ensure_ascii=False, separators=(',', ':')) + '\n').encode('utf-8')
+    def emit(*batch: dict) -> None:
+        """Send frames in one write (one frame, or a batch the client reads together)."""
+        data = b''.join((json.dumps(f, ensure_ascii=False, separators=(',', ':')) + '\n').encode('utf-8') for f in batch)
         out.write(data)
         out.flush()
         sent.write(data)
         sent.flush()
-        trace.write(json.dumps({'dir': 'out', 'method': frame.get('method'), 'id': frame.get('id'),
-                                'response': 'method' not in frame}) + '\n')
+        for frame in batch:
+            trace.write(json.dumps({'dir': 'out', 'method': frame.get('method'), 'id': frame.get('id'),
+                                    'response': 'method' not in frame}) + '\n')
         trace.flush()
+
+    def answer(frame: dict) -> bool:
+        """Give a recorded response the id of the client request it answers; False if that request has not come."""
+        method = recorded.get(frame.get('id'))
+        match = next((i for i, (_, m) in enumerate(unanswered) if m == method), None)
+        if match is None:
+            return False
+        frame['id'] = unanswered.pop(match)[0]
+        return True
 
     def pump() -> None:
         while frames:
@@ -45,18 +61,32 @@ def main() -> int:
                 frames.pop(0)
                 time.sleep(float(frame['hoh_sleep']))
                 continue
-            if 'method' not in frame:  # a response to a recorded request
-                method = recorded.get(frame.get('id'))
-                match = next((i for i, (_, m) in enumerate(unanswered) if m == method), None)
-                if match is None:
+            if 'hoh_close_stdin' in frame:  # not sent: close stdin, so the client's next write fails
+                frames.pop(0)
+                os.close(0)
+                closed.append(True)
+                continue
+            if 'hoh_wait' in frame:  # not sent: wait until the client has sent this many requests of a method
+                want = frame['hoh_wait']
+                if received_methods.count(want['method']) < want['count']:
                     return
-                frame['id'] = unanswered.pop(match)[0]
+                frames.pop(0)
+                continue
+            if 'hoh_batch' in frame:  # these frames in one write; its responses must be answerable now
+                batch = frame['hoh_batch']
+                if not all(answer(f) for f in batch if 'method' not in f):
+                    return
+                frames.pop(0)
+                emit(*batch)
+                continue
+            if 'method' not in frame and not answer(frame):  # a response to a recorded request
+                return
             frames.pop(0)
             emit(frame)
 
     pump()
     while True:
-        if exit_when_done and not frames:
+        if (exit_when_done and not frames) or closed:
             return 0
         line = sys.stdin.readline()
         if not line:
@@ -72,7 +102,10 @@ def main() -> int:
         trace.flush()
         if 'method' in message and 'id' in message:
             unanswered.append((message['id'], message['method']))
+            received_methods.append(message['method'])
         pump()
+        if closed:
+            return 0
 
 
 if __name__ == '__main__':
