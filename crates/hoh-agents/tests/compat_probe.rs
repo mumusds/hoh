@@ -315,3 +315,38 @@ fn codex_capabilities_come_from_the_schema_method_lists() -> R {
     );
     Ok(())
 }
+
+#[test]
+fn malformed_method_branches_are_refused() -> R {
+    // M1T01R-18: a method only counts if the branch naming it is a well-formed object schema with a string method.
+    let tmp = tempfile::tempdir()?;
+    let codex_fix = fixtures().join("codex/0.166.0");
+    let notifications = "{\"oneOf\":[{\"type\":\"object\",\"properties\":{\"method\":{\"type\":\"string\",\"enum\":[\"turn/completed\"]}}}]}";
+    for (name, requests) in [
+        (
+            "type-number",
+            "{\"oneOf\":[{\"type\":123,\"properties\":{\"method\":{\"enum\":[\"turn/steer\"]}}}]}",
+        ),
+        (
+            "method-number",
+            "{\"oneOf\":[{\"type\":\"object\",\"properties\":{\"method\":{\"type\":\"number\",\"enum\":[\"turn/steer\"]}}}]}",
+        ),
+        (
+            "enum-mixed",
+            "{\"oneOf\":[{\"type\":\"object\",\"properties\":{\"method\":{\"enum\":[\"turn/steer\",7]}}}]}",
+        ),
+    ] {
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n exec) cat '{f}/help-exec.txt';;\n \
+             app-server) case \"$2\" in --help) cat '{f}/help-app-server.txt';; generate-json-schema) mkdir -p \"$4\" && cd \"$4\" && \
+             echo '{requests}' > ClientRequest.json && echo '{notifications}' > ServerNotification.json;; esac;;\nesac\n",
+            f = codex_fix.display()
+        );
+        let (dir, _) = fake(tmp.path(), name, "codex", &script)?;
+        assert!(
+            probe(Agent::Codex, &env_for(&dir)).is_err(),
+            "{name} accepted"
+        );
+    }
+    Ok(())
+}
