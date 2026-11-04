@@ -463,7 +463,8 @@ fn stubborn(world: &World) -> R<(PathBuf, PathBuf)> {
     Ok((script, log))
 }
 
-/// Cancel attempt `id` 300 ms after it runs; the cancel time, the pid, and the group members `mark` after the cancel.
+/// Cancel attempt `id` 300 ms after it runs; the cancel time, the pid, and the group members by `mark` after the
+/// cancel: the scan starts 100 ms before the mark and must end by it, so it never sees a later state (M1T03R-15).
 async fn cancel_and_sample(
     world: &World,
     id: &str,
@@ -474,8 +475,13 @@ async fn cancel_and_sample(
     tokio::time::sleep(Duration::from_millis(300)).await;
     let at = Instant::now();
     assert_eq!(cancel.request(), CancelReceipt::Accepted);
-    tokio::time::sleep_until((at + mark).into()).await;
-    Ok((at, pid, group_members(pid)))
+    tokio::time::sleep_until((at + mark - Duration::from_millis(100)).into()).await;
+    let left = group_members(pid);
+    let ended = at.elapsed();
+    if ended > mark {
+        return Err(format!("the scan ended {ended:?} after the cancel").into());
+    }
+    Ok((at, pid, left))
 }
 
 #[tokio::test]
@@ -487,7 +493,7 @@ async fn test_025_03_cancel_escalates_to_the_group_and_ends_cancelled() -> R {
     turn.escalation = quick();
     let cancel = CancelLatch::new();
     let running = claude::run(&world.store, &attempt, &turn, &cancel);
-    // The group is sampled exactly 3 s after the cancel (AC-025-03), zombies included.
+    // The group is sampled by 3 s after the cancel (AC-025-03), zombies included.
     let sample = cancel_and_sample(&world, "A1", &cancel, Duration::from_secs(3));
     let (outcome, sample) = tokio::join!(running, sample);
     let (outcome, (at, pid, left)) = (outcome?, sample?);
@@ -495,7 +501,7 @@ async fn test_025_03_cancel_escalates_to_the_group_and_ends_cancelled() -> R {
         left.is_empty(),
         "the group still has {left:?} 3 s after the cancel"
     );
-    assert!(at.elapsed() >= Duration::from_secs(3));
+    assert!(at.elapsed() >= Duration::from_millis(2900));
     assert_eq!(outcome.state, AttemptState::Cancelled);
     assert_eq!(outcome.pid, Some(pid));
     let order: Vec<(Signal, Target)> = outcome.steps.iter().map(|s| (s.signal, s.target)).collect();
