@@ -8,6 +8,7 @@
 
 pub mod adapter;
 pub mod claude;
+pub mod codex;
 pub mod compat;
 pub mod frame;
 pub mod probe;
