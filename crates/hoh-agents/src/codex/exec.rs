@@ -93,7 +93,7 @@ pub(super) async fn run(
         process.cancel(interrupt_first(turn.escalation));
     }
     let (mut thread_id, mut usage) = (None::<String>, None::<Value>);
-    let (mut status, mut error) = (None::<String>, None::<Value>);
+    let (mut status, mut error, mut reply) = (None::<String>, None::<Value>, None::<String>);
     let (mut too_large, mut tool_started, mut auth_hint) = (false, false, false);
     let (mut items, mut unknown, mut diagnostics, mut errors) = (0, 0, 0, 0);
     let mut steers_open = true;
@@ -172,6 +172,9 @@ pub(super) async fn run(
                                "itemId": item["id"], "itemType": item_type}),
                     )
                     .await?;
+                if kind == "item.completed" && item_type == "agent_message" {
+                    reply = item["text"].as_str().map(str::to_owned);
+                }
                 if kind == "item.started" && !is_text_item(item_type) {
                     tool_started = true;
                 }
@@ -286,6 +289,7 @@ pub(super) async fn run(
         turn_id: None,
         model: None,
         status,
+        reply,
         exit,
         stdout,
         stderr,

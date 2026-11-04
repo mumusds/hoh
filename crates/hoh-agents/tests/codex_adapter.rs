@@ -263,6 +263,7 @@ async fn test_024_01_a_recorded_turn_settles_in_handshake_order_with_one_unknown
         (outcome.state, outcome.mode),
         (AttemptState::Settled, Mode::AppServer)
     );
+    assert_eq!(outcome.reply.as_deref(), Some("HOH_SAMPLE_OK"));
     // The client spoke in the handshake order, and `initialized` only after the initialize response.
     let methods: Vec<String> = received(&fake)?
         .iter()
@@ -523,6 +524,7 @@ async fn test_024_03_degraded_exec_steer_and_missing_flag() -> R {
             SteerReceipt::CapabilityUnsupported,
             "{name}"
         );
+        assert_eq!(outcome.reply.as_deref(), Some("HOH_SAMPLE_OK"), "{name}");
         assert_eq!(
             input_state(&world, &format!("I{i}"))?,
             InputState::Queued,
