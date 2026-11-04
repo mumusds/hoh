@@ -40,7 +40,11 @@ fn snapshot() -> Snapshot {
         }),
         required_capabilities: Some(caps(&["structured_events", "command_exec"])),
         budget_headroom: Some(1),
-        evidence: Evidence::default(),
+        // C1 is the run's one candidate in use; it has no passing evidence yet.
+        evidence: Evidence {
+            live: caps(&["C1"]),
+            ..Evidence::default()
+        },
     }
 }
 
@@ -51,6 +55,7 @@ fn proposal(payload: serde_json::Value) -> Proposal {
         role_epoch: 3,
         expected_revision: 7,
         spec_sha256: "b".repeat(64),
+        candidate_id: Some("C1".to_owned()),
         payload: serde_json::from_value(payload).expect("payload"),
     }
 }
@@ -240,14 +245,21 @@ fn a_task_is_accepted_only_on_evidence_and_ready_only_on_accepted_dependencies()
     if let Some(t) = &mut none.task {
         t.requirements.clear();
     }
-    none.evidence
-        .candidates
-        .insert("C2".to_owned(), BTreeSet::new());
     assert_eq!(reason(&accept, &none), EvidenceGateUnmet);
     s.evidence
         .candidates
-        .insert("C2".to_owned(), caps(&["REQ-1", "REQ-2"]));
+        .insert("C1".to_owned(), caps(&["REQ-1", "REQ-2"]));
     assert!(validate(&accept, &s).is_ok());
+    // Only the candidate the proposal names counts, and only as the run's one candidate in use (M2T02R-01).
+    let mut unnamed = accept.clone();
+    unnamed.candidate_id = None;
+    assert_eq!(reason(&unnamed, &s), EvidenceGateUnmet);
+    let mut other = accept.clone();
+    other.candidate_id = Some("C2".to_owned());
+    assert_eq!(reason(&other, &s), CandidateMismatch);
+    let mut two = s.clone();
+    two.evidence.live.insert("C2".to_owned());
+    assert_eq!(reason(&accept, &two), CandidateMismatch);
 
     let ready = proposal(json!({"kind": "transition_task", "task_id": "T1", "to_state": "READY"}));
     let mut s = snapshot();
@@ -269,17 +281,18 @@ fn the_commander_cannot_complete_a_run_without_evidence_or_drive_suspension() {
     s.run.state = RunState::Verifying;
     s.evidence.required = caps(&["REQ-1", "REQ-2"]);
     assert_eq!(reason(&complete(json!(["REQ-1"])), &s), EvidenceGateUnmet);
-    // Passing evidence split across candidates does not add up.
     s.evidence
         .candidates
         .insert("C1".to_owned(), caps(&["REQ-1"]));
+    assert_eq!(reason(&complete(json!([])), &s), EvidenceGateUnmet);
+    // Evidence of another candidate does not count for the named one (M2T02R-01).
     s.evidence
         .candidates
-        .insert("C2".to_owned(), caps(&["REQ-2"]));
+        .insert("C0".to_owned(), caps(&["REQ-1", "REQ-2"]));
     assert_eq!(reason(&complete(json!([])), &s), EvidenceGateUnmet);
     s.evidence
         .candidates
-        .insert("C3".to_owned(), caps(&["REQ-1", "REQ-2"]));
+        .insert("C1".to_owned(), caps(&["REQ-1", "REQ-2"]));
     assert_eq!(
         validate(&complete(json!(["REQ-1"])), &s),
         Ok(Effect::TransitionRun {
@@ -287,6 +300,13 @@ fn the_commander_cannot_complete_a_run_without_evidence_or_drive_suspension() {
             to: RunState::Completed
         })
     );
+    // An older candidate that passed is not the current one while a newer one is in use.
+    let mut stale = complete(json!([]));
+    stale.candidate_id = Some("C0".to_owned());
+    assert_eq!(reason(&stale, &s), CandidateMismatch);
+    let mut two = s.clone();
+    two.evidence.live.insert("C0".to_owned());
+    assert_eq!(reason(&complete(json!([])), &two), CandidateMismatch);
     // Claiming an extra requirement needs its evidence too.
     assert_eq!(reason(&complete(json!(["REQ-3"])), &s), EvidenceGateUnmet);
     // A specification without required requirements gives nothing to complete.
@@ -342,7 +362,7 @@ fn message(payload: serde_json::Value) -> Message {
         "schema_version": "1.0", "message_id": "m1", "run_id": "R", "task_id": "T1", "attempt_id": "A1",
         "sender_role": "commander", "recipient_role": "runtime", "role_epoch": 3, "correlation_id": "c1",
         "causation_id": null, "idempotency_key": "k1", "expected_revision": 7, "spec_sha256": "b".repeat(64),
-        "candidate_id": null, "kind": "decision", "payload": payload
+        "candidate_id": "C1", "kind": "decision", "payload": payload
     }))
     .expect("message")
 }
@@ -362,6 +382,7 @@ fn a_proposal_is_read_from_a_commander_decision_message_with_a_schema_valid_payl
         ),
         ("m1", "R", 3, 7)
     );
+    assert_eq!(p.candidate_id.as_deref(), Some("C1"));
     assert_eq!(
         (p.kind(), p.task_id(), p.target_role()),
         ("dispatch", Some("T1"), Some("developer"))

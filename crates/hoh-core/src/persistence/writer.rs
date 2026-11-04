@@ -334,33 +334,39 @@ fn compare_and_set(tx: &Transaction<'_>, cas: &StateCas) -> Result<i64, PersistE
         expected: cas.expected_revision,
         actual,
     };
-    let row: Option<(String, i64, Option<String>)> = tx
+    // The state, the revision, the saved resume state and whether blockers are recorded.
+    let row: Option<(String, i64, Option<String>, bool)> = tx
         .query_row(
             &format!(
                 "SELECT state, revision, {} FROM {table} WHERE {key} = ?1",
                 if entity == Entity::Run {
-                    "resume_state"
+                    "resume_state, blocked_reason IS NOT NULL OR blocked_reasons_json <> '[]'"
                 } else {
-                    "NULL"
+                    "NULL, blocked_reason IS NOT NULL"
                 }
             ),
             params![cas.id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()
         .map_err(sqlite_error)?;
-    let Some((state, revision, saved)) = row else {
+    let Some((state, revision, saved, blocked)) = row else {
         return Err(stale(None));
     };
     if revision != cas.expected_revision {
         return Err(stale(Some(revision)));
     }
-    let illegal = |from: &str, to: &str| PersistError::IllegalTransition {
+    let illegal = |from: &str, to: &str, why: String| PersistError::IllegalTransition {
         entity,
         id: cas.id.clone(),
         from: from.to_owned(),
         to: to.to_owned(),
+        why,
     };
+    let not_in_table = || "not in the transition table".to_owned();
+    // Blockers are facts: no move clears them, and no run works or task becomes ready while one is recorded; only
+    // the blocking mechanism removes them (ADR-011 §1, M2T02R-02).
+    let unresolved = || "blockers are recorded and unresolved".to_owned();
     let changed = match cas.change {
         Change::Touch(_) => tx.execute(
             &format!("UPDATE {table} SET revision = revision + 1 WHERE {key} = ?1 AND revision = ?2"),
@@ -369,24 +375,31 @@ fn compare_and_set(tx: &Transaction<'_>, cas: &StateCas) -> Result<i64, PersistE
         Change::Run(to) => {
             let from = parse::<RunState>(&state)?;
             let saved = saved.as_deref().map(parse::<RunState>).transpose()?;
-            let resume = lifecycle::resume_state(from, to, saved)
-                .map_err(|_| illegal(from.as_str(), to.as_str()))?;
-            // Leaving BLOCKED clears its reasons; entering it needs them (CHECK, ADR-011 §2).
+            let resume = lifecycle::resume_state(from, to, saved).map_err(|_| {
+                let why = if lifecycle::check(from, to).is_ok() {
+                    format!("resume_state is {}", saved.map_or("unset", Lifecycle::as_str))
+                } else {
+                    not_in_table()
+                };
+                illegal(from.as_str(), to.as_str(), why)
+            })?;
+            if lifecycle::is_working(to) && blocked {
+                return Err(illegal(from.as_str(), to.as_str(), unresolved()));
+            }
             tx.execute(
-                "UPDATE runs SET state = ?1, revision = revision + 1, resume_state = ?2, \
-                 blocked_reason = CASE WHEN ?1 = 'BLOCKED' THEN blocked_reason END, \
-                 blocked_reasons_json = CASE WHEN ?1 = 'BLOCKED' THEN blocked_reasons_json ELSE '[]' END \
+                "UPDATE runs SET state = ?1, revision = revision + 1, resume_state = ?2 \
                  WHERE run_id = ?3 AND revision = ?4 AND state = ?5",
                 params![to.as_str(), resume.map(Lifecycle::as_str), cas.id, revision, state],
             )
         }
         Change::Task(to) => {
             let from = parse::<TaskState>(&state)?;
-            lifecycle::check(from, to).map_err(|_| illegal(from.as_str(), to.as_str()))?;
+            lifecycle::check(from, to).map_err(|_| illegal(from.as_str(), to.as_str(), not_in_table()))?;
+            if matches!(to, TaskState::Pending | TaskState::Ready) && blocked {
+                return Err(illegal(from.as_str(), to.as_str(), unresolved()));
+            }
             tx.execute(
-                "UPDATE tasks SET state = ?1, revision = revision + 1, \
-                 blocked_reason = CASE WHEN ?1 = 'BLOCKED' THEN blocked_reason END \
-                 WHERE task_id = ?2 AND revision = ?3 AND state = ?4",
+                "UPDATE tasks SET state = ?1, revision = revision + 1 WHERE task_id = ?2 AND revision = ?3 AND state = ?4",
                 params![to.as_str(), cas.id, revision, state],
             )
         }

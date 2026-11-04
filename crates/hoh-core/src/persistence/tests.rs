@@ -613,23 +613,110 @@ async fn every_legal_run_edge_is_written_and_every_illegal_one_refused() -> R {
                 })
                 .await;
             let legal = crate::lifecycle::check(from, to).is_ok();
+            let working = crate::lifecycle::is_working(to);
             match (legal, to, result) {
                 (true, _, Ok(done)) => {
                     assert_eq!(done.revisions, vec![1]);
+                    // Blockers are facts that no move clears (M2T02R-02).
                     let reason: Option<String> = conn.query_row(
                         "SELECT blocked_reason FROM runs WHERE run_id = 'r1'",
                         [],
                         |r| r.get(0),
                     )?;
-                    assert_eq!(reason, None, "{from:?} -> {to:?} kept a blocked reason");
+                    assert_eq!(reason.as_deref(), blocked, "{from:?} -> {to:?}");
                 }
                 // A blocked run needs its reason, which this commit does not carry (ADR-011 §2).
                 (true, RunState::Blocked, Err(PersistError::IntegrityViolation(_))) => {}
+                // A blocked run does not work again while its blockers are recorded.
+                (true, _, Err(PersistError::IllegalTransition { why, .. }))
+                    if from == RunState::Blocked && working && why.contains("blockers") => {}
                 (false, _, Err(PersistError::IllegalTransition { .. })) => {}
                 (_, _, other) => return Err(format!("{from:?} -> {to:?}: {other:?}").into()),
             }
         }
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn blockers_survive_a_pause_and_hold_back_work() -> R {
+    // M2T02R-02: a run BLOCKED on NEED_DECISION that is paused and resumed stays blocked; it works again only once
+    // its blockers are removed (by the blocking mechanism; here by hand).
+    let dir = tempfile::tempdir()?;
+    let path = db_in(&dir);
+    let store = Store::open(&path, test_options())?;
+    seed(&path)?;
+    let conn = Connection::open(&path)?;
+    conn.execute_batch(
+        "UPDATE runs SET state = 'BLOCKED', resume_state = 'RUNNING', blocked_reason = 'NEED_DECISION',
+         blocked_reasons_json = '[\"NEED_DECISION\"]' WHERE run_id = 'r1'",
+    )?;
+    let step = |revision, to| {
+        store.commit(Commit {
+            cas: vec![cas(revision, to)],
+            ..Commit::default()
+        })
+    };
+    step(0, RunState::PauseRequested).await?;
+    step(1, RunState::Paused).await?;
+    let blockers = |conn: &Connection| -> rusqlite::Result<(Option<String>, String)> {
+        conn.query_row(
+            "SELECT blocked_reason, blocked_reasons_json FROM runs WHERE run_id = 'r1'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+    };
+    assert_eq!(
+        blockers(&conn)?,
+        (
+            Some("NEED_DECISION".to_owned()),
+            "[\"NEED_DECISION\"]".to_owned()
+        )
+    );
+    match step(2, RunState::Running).await {
+        Err(PersistError::IllegalTransition { why, .. }) => {
+            assert!(why.contains("blockers"), "{why}")
+        }
+        other => return Err(format!("PAUSED -> RUNNING with blockers: {other:?}").into()),
+    }
+    step(2, RunState::Blocked).await?;
+    assert_eq!(
+        run_row(&path)?,
+        ("BLOCKED".to_owned(), 3, Some("RUNNING".to_owned()))
+    );
+    conn.execute_batch(
+        "UPDATE runs SET blocked_reason = NULL, blocked_reasons_json = '[]', state = 'PAUSED' WHERE run_id = 'r1'",
+    )?;
+    step(3, RunState::Running).await?;
+    assert_eq!(run_row(&path)?, ("RUNNING".to_owned(), 4, None));
+    // Tasks likewise: a blocked task with a recorded reason becomes ready only once the reason is removed.
+    conn.execute_batch(
+        "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', 'p1', printf('%064d', 1), 1);
+         INSERT INTO tasks(task_id, run_id, spec_id, state, role, created_seq, blocked_reason)
+           VALUES ('t1', 'r1', 's1', 'BLOCKED', 'developer', 1, 'BLOCKED_AUTH');",
+    )?;
+    let task = |to| StateCas {
+        id: "t1".to_owned(),
+        expected_revision: 0,
+        change: Change::Task(to),
+    };
+    for to in [TaskState::Ready, TaskState::Pending] {
+        let Err(PersistError::IllegalTransition { .. }) = store
+            .commit(Commit {
+                cas: vec![task(to)],
+                ..Commit::default()
+            })
+            .await
+        else {
+            return Err(format!("blocked task -> {to:?} was not refused").into());
+        };
+    }
+    store
+        .commit(Commit {
+            cas: vec![task(TaskState::Cancelled)],
+            ..Commit::default()
+        })
+        .await?;
     Ok(())
 }
 

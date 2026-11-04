@@ -43,7 +43,9 @@ fn run_rule(from: Run, to: Run) -> bool {
                 || [PauseRequested, CancelRequested, Incomplete, Failed].contains(&to)
         }
         PauseRequested => [Paused, CancelRequested, Failed].contains(&to),
-        Paused => WORKING.contains(&to) || [CancelRequested, Incomplete, Failed].contains(&to),
+        Paused => {
+            WORKING.contains(&to) || [Blocked, CancelRequested, Incomplete, Failed].contains(&to)
+        }
         CancelRequested => [Cancelled, Failed].contains(&to),
         Incomplete => WORKING.contains(&to) || [CancelRequested, Failed].contains(&to),
         _ => false,
@@ -172,7 +174,7 @@ fn test_036_01_every_ordered_pair_is_judged_as_the_table_says() {
     assert_eq!(run_pairs + task_pairs + attempt_pairs, 355);
     assert_eq!(
         (run_legal, task_legal, attempt_legal),
-        (86, 26, 14),
+        (87, 26, 14),
         "legal edges per ADR-011"
     );
     rows.extend(task_rows);

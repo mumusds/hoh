@@ -434,9 +434,10 @@ fn load_binding(
     }))
 }
 
-/// ADR-011 §3 gate: requirement R counts for candidate C when C belongs to the run, is VERIFYING or ACCEPTED and was
-/// frozen on the run's current specification, R has acceptance criteria there, and every one of them has at least
-/// one acceptance result for C and only PASS results, each backed by PASS evidence of C.
+/// ADR-011 §3 gate: the run's candidates in use, and for each candidate of the run that is VERIFYING or ACCEPTED and
+/// was frozen on the run's current specification, the requirements R that have acceptance criteria there each of
+/// which has at least one acceptance result for C and only PASS results, each backed by PASS evidence of C from the
+/// criterion's own check (M2T02R-03).
 fn load_evidence(
     tx: &Transaction<'_>,
     run_id: &str,
@@ -463,7 +464,7 @@ fn load_evidence(
                                WHERE x.ac_id = a.ac_id AND x.spec_id = a.spec_id AND x.candidate_id = c.candidate_id \
                                AND (x.status <> 'PASS' OR NOT EXISTS (SELECT 1 FROM evidence e \
                                     WHERE e.evidence_id = x.evidence_id AND e.candidate_id = c.candidate_id \
-                                    AND e.outcome = 'PASS'))))) \
+                                    AND e.outcome = 'PASS' AND e.check_id = a.check_id))))) \
              ORDER BY c.candidate_id, q.requirement_id",
         )
         .map_err(sqlite_error)?;
@@ -472,8 +473,14 @@ fn load_evidence(
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })
         .map_err(sqlite_error)?;
+    let live = strings(
+        tx,
+        "SELECT candidate_id FROM candidates WHERE run_id = ?1 AND state IN ('FROZEN', 'VERIFYING', 'ACCEPTED')",
+        &[&run_id],
+    )?;
     let mut evidence = Evidence {
         required,
+        live,
         ..Evidence::default()
     };
     for row in rows {

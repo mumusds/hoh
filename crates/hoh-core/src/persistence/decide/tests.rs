@@ -73,9 +73,10 @@ fn context() -> Context {
     }
 }
 
-/// Sends decision messages as the Commander of run R would.
+/// Sends decision messages as the Commander of run R would, about `candidate` when it names one.
 struct FakeCommander {
     sent: usize,
+    candidate: Option<&'static str>,
 }
 
 impl FakeCommander {
@@ -85,7 +86,7 @@ impl FakeCommander {
             "schema_version": "1.0", "message_id": format!("d{}", self.sent), "run_id": "R", "task_id": "-",
             "attempt_id": "-", "sender_role": "commander", "recipient_role": "runtime", "role_epoch": epoch,
             "correlation_id": "c", "causation_id": null, "idempotency_key": format!("k{}", self.sent),
-            "expected_revision": revision, "spec_sha256": sha(2), "candidate_id": null, "kind": "decision",
+            "expected_revision": revision, "spec_sha256": sha(2), "candidate_id": self.candidate, "kind": "decision",
             "payload": payload
         }))
         .expect("a message");
@@ -151,7 +152,10 @@ async fn test_035_01_six_invalid_proposals_are_rejected_without_changing_state()
     let (store, path) = open(&dir)?;
     seed(&path, WORLD)?;
     let before = tables(&path)?;
-    let mut commander = FakeCommander { sent: 0 };
+    let mut commander = FakeCommander {
+        sent: 0,
+        candidate: None,
+    };
     let proposals = [
         commander.decide(
             3,
@@ -271,7 +275,10 @@ async fn test_035_04_completion_without_evidence_is_rejected() -> R {
     let (store, path) = open(&dir)?;
     seed(&path, WORLD)?;
     seed(&path, VERIFYING)?;
-    let mut commander = FakeCommander { sent: 0 };
+    let mut commander = FakeCommander {
+        sent: 0,
+        candidate: Some("C1"),
+    };
     let decided = store
         .decide(commander.decide(3, 7, complete()), context())
         .await?;
@@ -310,7 +317,8 @@ fn evidence(criteria: &[&str], extra: &str) -> String {
          INSERT INTO evidence(evidence_id, candidate_id, attempt_id, artifact_id, check_id, kind, outcome, mode, created_at)
            VALUES ('E1', 'C1', 'A1', 'a1', 'unit', 'test', 'PASS', 'product', '2026-11-04T00:00:00Z'),
                   ('E2', 'C1', 'A1', 'a1', 'unit', 'test', 'FAIL', 'product', '2026-11-04T00:00:00Z'),
-                  ('E3', 'C1', 'A1', 'a1', 'unit', 'test', 'PASS', 'product', '2026-11-04T00:00:00Z');",
+                  ('E3', 'C1', 'A1', 'a1', 'unit', 'test', 'PASS', 'product', '2026-11-04T00:00:00Z'),
+                  ('E4', 'C1', 'A1', 'a1', 'unrelated-check', 'test', 'PASS', 'product', '2026-11-04T00:00:00Z');",
     );
     for ac in criteria {
         sql.push_str(&format!(
@@ -323,56 +331,129 @@ fn evidence(criteria: &[&str], extra: &str) -> String {
 
 #[tokio::test]
 async fn completion_is_applied_only_when_one_candidate_passed_every_criterion() -> R {
-    // (criteria with PASS results, extra rows, applied?)
+    // (criteria with PASS results, extra rows, the rejection or None when applied)
     let cases = [
-        (vec!["AC-1-01"], "", false),
+        (
+            vec!["AC-1-01"],
+            "",
+            Some(RejectionReason::EvidenceGateUnmet),
+        ),
         (
             vec!["AC-1-01", "AC-1-02"],
             "INSERT INTO acceptance_results(ac_id, spec_id, candidate_id, evidence_id, status) VALUES ('AC-1-02', 's2', 'C1', 'E3', 'FLAKY');",
-            false,
+            Some(RejectionReason::EvidenceGateUnmet),
         ),
         (
             vec!["AC-1-01"],
             "INSERT INTO acceptance_results(ac_id, spec_id, candidate_id, evidence_id, status) VALUES ('AC-1-02', 's2', 'C1', 'E2', 'PASS');",
-            false,
+            Some(RejectionReason::EvidenceGateUnmet),
         ),
         (
             vec!["AC-1-01", "AC-1-02"],
             "UPDATE candidates SET state = 'STALE';",
-            false,
+            Some(RejectionReason::CandidateMismatch),
         ),
-        (vec!["AC-1-01", "AC-1-02"], "", true),
+        // In use but not yet under verification: its evidence does not count yet.
+        (
+            vec!["AC-1-01", "AC-1-02"],
+            "UPDATE candidates SET state = 'FROZEN';",
+            Some(RejectionReason::EvidenceGateUnmet),
+        ),
+        // Passing evidence from another check than the criterion's (M2T02R-03).
+        (
+            vec!["AC-1-01"],
+            "INSERT INTO acceptance_results(ac_id, spec_id, candidate_id, evidence_id, status) VALUES ('AC-1-02', 's2', 'C1', 'E4', 'PASS');",
+            Some(RejectionReason::EvidenceGateUnmet),
+        ),
+        (vec!["AC-1-01", "AC-1-02"], "", None),
     ];
-    for (i, (criteria, extra, applies)) in cases.into_iter().enumerate() {
+    for (i, (criteria, extra, rejection)) in cases.into_iter().enumerate() {
         let dir = tempfile::tempdir()?;
         let (store, path) = open(&dir)?;
         seed(&path, WORLD)?;
         seed(&path, VERIFYING)?;
         seed(&path, &evidence(&criteria, extra))?;
-        let mut commander = FakeCommander { sent: 0 };
+        let mut commander = FakeCommander {
+            sent: 0,
+            candidate: Some("C1"),
+        };
         let decided = store
             .decide(commander.decide(3, 7, complete()), context())
             .await?;
         let state = rows(&path, "SELECT state, revision FROM runs")?;
-        match (applies, decided) {
+        match (rejection, decided) {
             (
-                true,
+                None,
                 Decided::Applied {
                     run_revision: 8, ..
                 },
             ) => {
                 assert_eq!(state, [vec![json!("COMPLETED"), json!(8)]]);
             }
-            (
-                false,
-                Decided::Rejected {
-                    reason: RejectionReason::EvidenceGateUnmet,
-                    ..
-                },
-            ) => assert_eq!(state, [vec![json!("VERIFYING"), json!(7)]], "case {i}"),
+            (Some(want), Decided::Rejected { reason, .. }) if reason == want => {
+                assert_eq!(state, [vec![json!("VERIFYING"), json!(7)]], "case {i}")
+            }
             (_, other) => return Err(format!("case {i}: {other:?}").into()),
         }
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn acceptance_is_judged_on_the_named_current_candidate_only() -> R {
+    // M2T02R-01: C1 passed everything and is ACCEPTED, C2 is newer and has no evidence. While both are in use the
+    // current candidate is unknown; once C1 is STALE, completing on C2 needs C2's evidence and C1's cannot be named.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    seed(&path, WORLD)?;
+    seed(&path, VERIFYING)?;
+    seed(&path, &evidence(&["AC-1-01", "AC-1-02"], ""))?;
+    seed(
+        &path,
+        "UPDATE candidates SET state = 'ACCEPTED';
+         INSERT INTO candidates(candidate_id, run_id, git_commit, git_tree, spec_sha256, environment_sha256,
+           test_plan_sha256, source_path, state, created_at) VALUES
+           ('C2', 'R', printf('%040d', 5), printf('%040d', 6), printf('%064d', 2), printf('%064d', 3),
+            printf('%064d', 4), '/repo', 'VERIFYING', '2026-11-04T00:00:01Z');",
+    )?;
+    let mut sent = 0;
+    let mut verdict = |candidate: Option<&'static str>| {
+        sent += 1;
+        let mut commander = FakeCommander { sent, candidate };
+        let proposal = commander.decide(3, 7, complete());
+        let store = &store;
+        async move {
+            match store.decide(proposal, context()).await {
+                Ok(Decided::Rejected { reason, .. }) => Ok(reason),
+                other => Err(format!("{candidate:?}: {other:?}")),
+            }
+        }
+    };
+    assert_eq!(
+        verdict(Some("C2")).await?,
+        RejectionReason::CandidateMismatch
+    );
+    assert_eq!(
+        verdict(Some("C1")).await?,
+        RejectionReason::CandidateMismatch
+    );
+    assert_eq!(verdict(None).await?, RejectionReason::EvidenceGateUnmet);
+    seed(
+        &path,
+        "UPDATE candidates SET state = 'STALE' WHERE candidate_id = 'C1';",
+    )?;
+    assert_eq!(
+        verdict(Some("C2")).await?,
+        RejectionReason::EvidenceGateUnmet
+    );
+    assert_eq!(
+        verdict(Some("C1")).await?,
+        RejectionReason::CandidateMismatch
+    );
+    assert_eq!(
+        rows(&path, "SELECT state, revision FROM runs")?,
+        [vec![json!("VERIFYING"), json!(7)]]
+    );
     Ok(())
 }
 
@@ -381,7 +462,10 @@ async fn an_applied_dispatch_leases_the_task_queues_its_message_and_fences_later
     let dir = tempfile::tempdir()?;
     let (store, path) = open(&dir)?;
     seed(&path, WORLD)?;
-    let mut commander = FakeCommander { sent: 0 };
+    let mut commander = FakeCommander {
+        sent: 0,
+        candidate: None,
+    };
     let decided = store
         .decide(
             commander.decide(
@@ -470,7 +554,10 @@ async fn task_decisions_follow_the_commanders_boundary_and_the_table() -> R {
     let dir = tempfile::tempdir()?;
     let (store, path) = open(&dir)?;
     seed(&path, WORLD)?;
-    let mut commander = FakeCommander { sent: 0 };
+    let mut commander = FakeCommander {
+        sent: 0,
+        candidate: None,
+    };
     let mut revision = 7;
     // (task, target, expected reason or None when applied)
     let cases = [
@@ -551,7 +638,10 @@ async fn proposals_that_cannot_be_recorded_write_nothing() -> R {
         rows(&path, "SELECT count(*) FROM decisions")?,
         rows(&path, "SELECT count(*) FROM events")?,
     );
-    let mut commander = FakeCommander { sent: 0 };
+    let mut commander = FakeCommander {
+        sent: 0,
+        candidate: None,
+    };
     // Kinds applied by later tasks.
     let ask = commander.decide(
         3,
