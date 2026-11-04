@@ -437,6 +437,12 @@ async fn test_024_02_interrupt_unauthorized_eof_and_resume() -> R {
     assert_eq!(resume["params"]["threadId"], json!(thread));
     assert!(!got.iter().any(|m| m["method"] == "thread/start"));
     assert_eq!(resumed.state, AttemptState::Settled);
+    // Every notification of the resumed run (deprecationNotice, thread/goal/cleared, ...) is in the 0.166.0 schema.
+    let unknown: Vec<Value> = events(&world, "adapter.unknown_event")?
+        .into_iter()
+        .filter(|e| e["attempt_id"] == "A4")
+        .collect();
+    assert!(unknown.is_empty(), "{unknown:?}");
     // No retry was made: one attempt per case, none created by the adapter.
     assert_eq!(count(&world, "SELECT count(*) FROM attempts")?, 4);
     assert_eq!(
@@ -775,5 +781,92 @@ async fn an_error_codex_retries_is_no_end() -> R {
     let errors = events(&world, "adapter.error")?;
     assert_eq!(errors.len(), 1);
     assert_eq!(errors[0]["willRetry"], true);
+    Ok(())
+}
+
+/// Replace the exec lines a fake replays.
+fn rewrite_exec(fake: &Path, lines: &[Value]) -> R {
+    let d = fake.parent().ok_or("no dir")?;
+    for entry in std::fs::read_dir(d)? {
+        let path = entry?.path();
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("exec."))
+        {
+            std::fs::remove_file(path)?;
+        }
+    }
+    for (i, line) in lines.iter().enumerate() {
+        std::fs::write(d.join(format!("exec.{i:04}")), format!("{line}\n"))?;
+    }
+    Ok(())
+}
+
+/// exec's recorded failures (CR-003): a 401 in turn.failed or in an earlier `error` event is BLOCKED_AUTH; another
+/// failure keeps its own reason.
+#[tokio::test]
+async fn exec_failures_are_classified_from_the_recording() -> R {
+    let world = World::new()?;
+    let recorded: Vec<Value> = read(format!("{FIXTURES}/exec-unauthenticated/stdout.jsonl"))?
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()?;
+    // Only the earlier `error` events say 401.
+    let mut hinted = recorded.clone();
+    let last = hinted.len() - 1;
+    assert_eq!(hinted[last]["type"], "turn.failed");
+    hinted[last]["error"]["message"] = json!("stream disconnected before completion");
+    for (i, (exec, lines, reason)) in [
+        ("exec-unauthenticated", None, "BLOCKED_AUTH"),
+        ("exec-unauthenticated", Some(&hinted), "BLOCKED_AUTH"),
+        ("exec-turn-failed", None, "turn failed"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let fake = world.fake(&format!("exec-failed-{i}"), None, exec, false)?;
+        if let Some(lines) = lines {
+            rewrite_exec(&fake, lines)?;
+        }
+        let attempt = world.attempt(&format!("A{i}")).await?;
+        let mut turn = world.turn(&fake, &format!("logs/exec-failed-{i}"))?;
+        turn.launch.app_server_help = None;
+        let outcome = run(&world, &attempt, &turn).await?;
+        assert_eq!(
+            (outcome.state, outcome.failure.as_deref(), outcome.mode),
+            (AttemptState::Failed, Some(reason), Mode::Exec),
+            "{exec} {i}"
+        );
+        let failed: Vec<Value> = events(&world, "adapter.turn_failed")?
+            .into_iter()
+            .filter(|e| e["attempt_id"] == format!("A{i}"))
+            .collect();
+        let blocked = (reason == "BLOCKED_AUTH").then_some("BLOCKED_AUTH");
+        assert_eq!(failed.len(), 1, "{exec} {i}");
+        assert_eq!(failed[0]["blocked_reason"], json!(blocked), "{exec} {i}");
+    }
+    Ok(())
+}
+
+/// A turn codex reports interrupted without our cancel is CANCELLED, with no cancel recorded as requested.
+#[tokio::test]
+async fn an_interrupted_turn_is_cancelled_without_a_cancel_request() -> R {
+    let world = World::new()?;
+    let mut case = Case::load("app-server-turn")?;
+    let at = case.position("turn/completed")?;
+    case.frames[at]["params"]["turn"]["status"] = json!("interrupted");
+    let fake = world.fake("interrupted", Some(&case), "exec", false)?;
+    let attempt = world.attempt("A1").await?;
+    let outcome = run(&world, &attempt, &world.turn(&fake, "logs/A1")?).await?;
+    assert_eq!(
+        (outcome.state, outcome.failure),
+        (AttemptState::Cancelled, None)
+    );
+    let row = world.store.reader()?.attempt("A1")?.ok_or("no attempt")?;
+    assert_eq!(
+        (row.state, row.cancel_requested),
+        (AttemptState::Cancelled, false)
+    );
     Ok(())
 }
