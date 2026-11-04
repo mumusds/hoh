@@ -14,6 +14,7 @@ use super::PersistError;
 use rusqlite::{Connection, ErrorCode, OpenFlags};
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -112,7 +113,9 @@ struct Probe {
 
 impl Probe {
     fn start(command: &ProbeCommand, db: &Path) -> std::io::Result<Probe> {
+        // Its own process group, so that whatever it starts goes with it (M2T01R-11).
         let mut process = std::process::Command::new(&command.program)
+            .process_group(0)
             .args(&command.args)
             .envs(command.env.iter().map(|(k, v)| (k, v)))
             .env(PROBE_DB_ENV, db)
@@ -165,7 +168,11 @@ impl Probe {
 
 impl Drop for Probe {
     fn drop(&mut self) {
-        let _ = self.process.kill();
+        // The group id stays valid until the leader is reaped, so the group is killed first. Its members holding
+        // the stdout pipe die with it, which ends the reading thread.
+        if let Some(pid) = rustix::process::Pid::from_raw(self.process.id() as i32) {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        }
         let _ = self.process.wait();
     }
 }
@@ -187,7 +194,8 @@ fn steps(
     let sql = |step: Step| move |e: rusqlite::Error| failed(step, e.to_string());
 
     at(Step::Open)?;
-    let ours = Connection::open(db).map_err(sql(Step::Open))?;
+    let flags = OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    let ours = Connection::open_with_flags(db, flags).map_err(sql(Step::Open))?;
 
     at(Step::EnableWal)?;
     let mode: String = ours
@@ -536,6 +544,40 @@ mod tests {
             }
         }
         assert_eq!(leftovers(dir.path()), Vec::<String>::new());
+        Ok(())
+    }
+
+    #[test]
+    fn a_probe_that_hangs_is_killed_with_everything_it_started()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // M2T01R-11: the probe starts a child that keeps its stdout, then never answers.
+        let dir = tempfile::tempdir()?;
+        let pidfile = dir.path().join("child.pid");
+        let probe = ProbeCommand {
+            program: PathBuf::from("/bin/sh"),
+            args: vec![
+                "-c".into(),
+                format!(
+                    "sleep 600 & echo $! > '{}'; cat > /dev/null",
+                    pidfile.display()
+                )
+                .into(),
+            ],
+            env: Vec::new(),
+            answer_timeout: Duration::from_millis(300),
+        };
+        let work = dir.path().join("work");
+        std::fs::create_dir(&work)?;
+        assert!(wal_self_test(&work, &probe).is_err());
+        let pid: u32 = std::fs::read_to_string(&pidfile)?.trim().parse()?;
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while Path::new(&format!("/proc/{pid}")).exists() && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "the probe's child {pid} survived"
+        );
         Ok(())
     }
 
