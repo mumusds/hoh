@@ -61,6 +61,14 @@ class Validators(unittest.TestCase):
         tool_use=next(f for f in fs if f.get('type')=='assistant')
         unanswered=[ok[0],tool_use]+ok[1:]
         self.assertTrue(any('without its tool_result' in p for p in self.check('claude','tool-success',unanswered,ok_meta)))
+    # M1-T03: the not-logged-in surface needs Claude's own authentication_failed marker, not just a failure.
+    def test_claude_unauthenticated_needs_the_authentication_marker(self):
+        fs,meta,_=load_case('claude','2.1.318','unauthenticated')
+        self.assertEqual(self.check('claude','unauthenticated',fs,meta,rc=meta['exit_code']),[])
+        unmarked=[{k:v for k,v in f.items() if k!='error'} for f in fs]
+        self.assertTrue(any('authentication_failed' in p for p in self.check('claude','unauthenticated',unmarked,meta,rc=meta['exit_code'])))
+        ok,ok_meta,_=load_case('claude','2.1.318','success')
+        self.assertTrue(self.check('claude','unauthenticated',ok,ok_meta,rc=0))
     def test_codex_echoed_user_token_without_assistant_output_rejected(self):
         fs,meta,sent=load_case('codex','0.166.0','app-server-turn')
         # Drop the agent's message items; the userMessage item still echoes the prompt containing the token.
