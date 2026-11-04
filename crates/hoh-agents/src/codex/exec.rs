@@ -1,4 +1,5 @@
-//! One turn over `codex exec --json`, when the App Server is not there (see the module docs of [`super`]).
+//! One turn over `codex exec --json`, when the App Server is not there (see the module docs of [`super`]). Its event
+//! names start with `exec-`, so they never collide with the App Server's of the same attempt (M1T04R-03).
 
 use super::{
     Ending, Mode, Outcome, Steer, SteerReceipt, Turn, failure_of, hard_stop, hashes,
@@ -127,7 +128,7 @@ pub(super) async fn run(
                 store
                     .attempt_event(
                         id,
-                        "frame-too-large",
+                        "exec-frame-too-large",
                         "adapter.diagnostic",
                         json!({"attempt_id": id, "reason": "PROTOCOL_FRAME_TOO_LARGE",
                                "length": refused.length, "prefix_sha256": refused.prefix_sha256}),
@@ -138,14 +139,17 @@ pub(super) async fn run(
             Some(Event::Exit(report)) => break Some(*report),
             None => break None,
         };
-        let Ok(frame) = serde_json::from_slice::<Value>(&line) else {
+        let Some(frame) = serde_json::from_slice::<Value>(&line)
+            .ok()
+            .filter(Value::is_object)
+        else {
             diagnostics += 1;
             store
                 .attempt_event(
                     id,
-                    &format!("diagnostic-{diagnostics}"),
+                    &format!("exec-diagnostic-{diagnostics}"),
                     "adapter.diagnostic",
-                    json!({"attempt_id": id, "reason": "stdout line is not JSON", "bytes": line.len(),
+                    json!({"attempt_id": id, "reason": "stdout line is not a JSON object", "bytes": line.len(),
                            "head": String::from_utf8_lossy(&line[..line.len().min(256)])}),
                 )
                 .await?;
@@ -166,7 +170,7 @@ pub(super) async fn run(
                 store
                     .attempt_event(
                         id,
-                        &format!("item-{items}"),
+                        &format!("exec-item-{items}"),
                         "adapter.item",
                         json!({"attempt_id": id, "method": kind, "threadId": thread_id, "turnId": null,
                                "itemId": item["id"], "itemType": item_type}),
@@ -194,7 +198,7 @@ pub(super) async fn run(
                 store
                     .attempt_event(
                         id,
-                        &format!("error-{errors}"),
+                        &format!("exec-error-{errors}"),
                         "adapter.error",
                         json!({"attempt_id": id, "error": {"message": message}}),
                     )
@@ -206,7 +210,7 @@ pub(super) async fn run(
                 store
                     .attempt_event(
                         id,
-                        &format!("unknown-{unknown}"),
+                        &format!("exec-unknown-{unknown}"),
                         "adapter.unknown_event",
                         json!({"attempt_id": id, "method": kind, "frame": frame}),
                     )
@@ -221,7 +225,7 @@ pub(super) async fn run(
         store
             .attempt_event(
                 id,
-                "raw-log-incomplete",
+                "exec-raw-log-incomplete",
                 "adapter.diagnostic",
                 json!({"attempt_id": id, "reason": "RAW_LOG_INCOMPLETE",
                        "stdout": {"eof": r.stdout.eof, "error": r.stdout.error},
@@ -256,7 +260,7 @@ pub(super) async fn run(
         store
             .attempt_event(
                 id,
-                "turn-failed",
+                "exec-turn-failed",
                 "adapter.turn_failed",
                 json!({"attempt_id": id, "status": status, "error": error,
                        "blocked_reason": (reason == "BLOCKED_AUTH").then_some("BLOCKED_AUTH"),

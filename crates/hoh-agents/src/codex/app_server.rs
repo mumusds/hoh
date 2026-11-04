@@ -1,4 +1,11 @@
 //! One turn over `codex app-server` (see the module docs of [`super`]).
+//!
+//! Turn-scoped notifications (items, token usage, turn/started, turn/completed) count only for this attempt's thread
+//! and turn; those of this thread that come before turn/start is answered wait until this turn's id is known and are
+//! dropped if they turn out to be another turn's (M1T04R-01). Once the turn is being stopped or exec is to be used, a
+//! late answer moves nothing (M1T04R-02). stdin is written by a task the loop watches: a write failure stops the
+//! turn, and the task is aborted, not awaited, once the process has exited (M1T04R-04). A steer is APPLIED when its
+//! user message item has been seen and codex has answered the turn/steer, in either order (M1T04R-05).
 
 use super::{
     Ending, METHOD_NOT_FOUND, Mode, Outcome, Steer, SteerReceipt, Turn, app_server_args,
@@ -8,7 +15,7 @@ use crate::adapter::{AdapterError, AttemptRef, finish, now, step};
 use crate::frame::Frame;
 use crate::process::{Config, Event, Process};
 use hoh_core::lifecycle::{AttemptState, InputState};
-use hoh_core::persistence::{AttemptFacts, CancelLatch, InputMove, Store};
+use hoh_core::persistence::{AttemptFacts, CancelLatch, InputMove, PersistError, Store};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::process::Command;
@@ -65,10 +72,6 @@ impl Conn {
         self.send(&json!({"method": method, "id": id, "params": params}));
     }
 
-    fn notify(&self, method: &str) {
-        self.send(&json!({"method": method}));
-    }
-
     fn open(&self) -> bool {
         self.lines.is_some()
     }
@@ -95,6 +98,410 @@ fn text_of(item: &Value) -> String {
         .join("")
 }
 
+/// The thread and turn a turn-scoped notification is about; `None` for other notifications.
+fn scope_of(method: &str, params: &Value) -> Option<(Option<String>, Option<String>)> {
+    let s = |v: &Value| v.as_str().map(str::to_owned);
+    match method {
+        "item/started" | "item/completed" | "thread/tokenUsage/updated" => {
+            Some((s(&params["threadId"]), s(&params["turnId"])))
+        }
+        "turn/started" | "turn/completed" => {
+            Some((s(&params["threadId"]), s(&params["turn"]["id"])))
+        }
+        _ => None,
+    }
+}
+
+/// Everything one App Server turn knows.
+struct State<'a> {
+    store: &'a Store,
+    attempt: &'a AttemptRef,
+    turn: &'a Turn,
+    conn: Conn,
+    pid: u32,
+    phase: Phase,
+    running: bool,
+    thread_id: Option<String>,
+    turn_id: Option<String>,
+    model: Option<String>,
+    usage: Option<Value>,
+    status: Option<String>,
+    error: Option<Value>,
+    reply: Option<String>,
+    cancelled: bool,
+    deadline: bool,
+    too_large: bool,
+    tool_started: bool,
+    failure: Option<String>,
+    degrade: Option<String>,
+    stop_at: Option<Instant>,
+    stopped: bool,
+    interrupted: bool,
+    counters: HashMap<&'static str, usize>,
+    /// Steers codex has taken, waiting for their user message item: (input id, text).
+    delivered: Vec<(String, String)>,
+    /// User message texts of this turn not matched to a steer yet (the prompt's is consumed first).
+    seen: Vec<String>,
+    prompt_seen: bool,
+    /// Turn-scoped notifications of this thread that came before this turn's id was known.
+    early: Vec<(String, Value)>,
+}
+
+impl State<'_> {
+    /// The next number for events named `name-N`.
+    fn next(&mut self, name: &'static str) -> usize {
+        let n = self.counters.entry(name).or_insert(0);
+        *n += 1;
+        *n
+    }
+
+    async fn event(&self, name: &str, kind: &str, mut payload: Value) -> Result<(), PersistError> {
+        payload["attempt_id"] = json!(self.attempt.attempt_id);
+        self.store
+            .attempt_event(&self.attempt.attempt_id, name, kind, payload)
+            .await
+    }
+
+    async fn diagnostic(&mut self, payload: Value) -> Result<(), PersistError> {
+        let n = self.next("diagnostic");
+        self.event(&format!("diagnostic-{n}"), "adapter.diagnostic", payload)
+            .await
+    }
+
+    /// End the process now: close stdin, then SIGTERM and SIGKILL to the group.
+    fn hard_stop(&mut self, process: &Process) {
+        self.conn.close();
+        if !self.stopped {
+            process.cancel(hard_stop(self.turn.escalation));
+            self.stopped = true;
+        }
+    }
+
+    /// Stop the turn: interrupt the active turn and give it the native grace; before a turn is active, end the
+    /// process.
+    fn begin_stop(&mut self, process: &Process) {
+        if self.phase == Phase::Active && self.conn.open() && !self.interrupted {
+            if let (Some(t), Some(u)) = (&self.thread_id, &self.turn_id) {
+                let params = json!({"threadId": t, "turnId": u});
+                self.conn
+                    .request("turn/interrupt", params, Pending::Interrupt);
+            }
+            self.interrupted = true;
+            self.stop_at = Some(Instant::now() + self.turn.escalation.native_grace);
+        } else {
+            self.hard_stop(process);
+        }
+    }
+
+    /// Close stdin and give the process the term grace to exit by itself.
+    fn close_gently(&mut self) {
+        self.conn.close();
+        if self.stop_at.is_none() || self.interrupted {
+            self.stop_at = Some(Instant::now() + self.turn.escalation.term_grace);
+        }
+    }
+
+    fn send_steer(&mut self, s: Steer) {
+        let expected = s.expected_turn.clone().or_else(|| self.turn_id.clone());
+        let params = json!({"threadId": self.thread_id, "expectedTurnId": expected,
+                            "input": [{"type": "text", "text": s.text}]});
+        self.conn.request("turn/steer", params, Pending::Steer(s));
+    }
+
+    async fn apply(&self, input_id: String) -> Result<(), PersistError> {
+        self.store
+            .move_input(InputMove {
+                input_id,
+                from: InputState::Delivered,
+                to: InputState::Applied,
+                reason: None,
+            })
+            .await
+    }
+
+    /// A notification of this thread and turn.
+    async fn on_turn_notification(
+        &mut self,
+        method: &str,
+        frame: &Value,
+    ) -> Result<(), PersistError> {
+        let params = &frame["params"];
+        match method {
+            "item/started" | "item/completed" => {
+                let n = self.next("item");
+                let item = &params["item"];
+                let kind = item["type"].as_str().unwrap_or_default();
+                self.event(
+                    &format!("item-{n}"),
+                    "adapter.item",
+                    json!({"method": method, "threadId": params["threadId"], "turnId": params["turnId"],
+                           "itemId": item["id"], "itemType": kind}),
+                )
+                .await?;
+                if method == "item/completed" && kind == "agentMessage" {
+                    self.reply = item["text"].as_str().map(str::to_owned);
+                }
+                if method == "item/started" && !is_text_item(kind) {
+                    self.tool_started = true;
+                }
+                if method == "item/started" && kind == "userMessage" {
+                    let text = text_of(item);
+                    if !self.prompt_seen && text == self.turn.prompt {
+                        self.prompt_seen = true;
+                    } else if let Some(at) = self.delivered.iter().position(|(_, t)| *t == text) {
+                        let (input_id, _) = self.delivered.remove(at);
+                        self.apply(input_id).await?;
+                    } else {
+                        self.seen.push(text);
+                    }
+                }
+            }
+            "thread/tokenUsage/updated" => self.usage = Some(params["tokenUsage"].clone()),
+            "turn/completed" => {
+                self.status = params["turn"]["status"].as_str().map(str::to_owned);
+                self.error = Some(params["turn"]["error"].clone()).filter(|e| !e.is_null());
+                self.phase = Phase::Done;
+                self.close_gently();
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// A notification (not a request) from codex.
+    async fn on_notification(&mut self, method: &str, frame: &Value) -> Result<(), PersistError> {
+        let params = &frame["params"];
+        if let Some((thread, turn)) = scope_of(method, params) {
+            let this_thread = self.thread_id.is_some() && thread == self.thread_id;
+            if this_thread && self.turn_id.is_none() && self.phase < Phase::Done {
+                self.early.push((method.to_owned(), frame.clone()));
+            } else if this_thread && turn == self.turn_id {
+                self.on_turn_notification(method, frame).await?;
+            } else if method != "turn/started" {
+                self.diagnostic(
+                    json!({"reason": "a notification of another thread or turn", "method": method,
+                                       "threadId": thread, "turnId": turn}),
+                )
+                .await?;
+            }
+            return Ok(());
+        }
+        match method {
+            "error" => {
+                let n = self.next("error");
+                self.event(
+                    &format!("error-{n}"),
+                    "adapter.error",
+                    json!({"error": params["error"], "willRetry": params["willRetry"],
+                           "threadId": params["threadId"], "turnId": params["turnId"]}),
+                )
+                .await?;
+            }
+            _ if !self.turn.launch.known.contains(method) => {
+                let n = self.next("unknown");
+                self.event(
+                    &format!("unknown-{n}"),
+                    "adapter.unknown_event",
+                    json!({"method": method, "frame": frame}),
+                )
+                .await?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// A server request: the headless policy answers it at once.
+    async fn on_request(&mut self, method: &str, id: Value) -> Result<(), PersistError> {
+        let n = self.next("server-request");
+        let answer = super::headless_answer(method);
+        let (reply, recorded) = match answer {
+            Ok(result) => (
+                json!({"id": id, "result": result}),
+                json!({"result": result}),
+            ),
+            Err((code, message)) => {
+                let error = json!({"code": code, "message": message});
+                (json!({"id": id, "error": error}), json!({"error": error}))
+            }
+        };
+        self.conn.send(&reply);
+        self.event(
+            &format!("server-request-{n}"),
+            "adapter.server_request",
+            json!({"method": method, "id": id, "answer": recorded}),
+        )
+        .await
+    }
+
+    /// The answer to one of our requests.
+    async fn on_response(
+        &mut self,
+        process: &Process,
+        held: &mut Vec<Steer>,
+        frame: &Value,
+    ) -> Result<(), PersistError> {
+        use AttemptState::*;
+        let Some(what) = frame["id"]
+            .as_i64()
+            .and_then(|n| self.conn.pending.remove(&n))
+        else {
+            return self
+                .diagnostic(json!({"reason": "a response to no request of ours", "frame": frame}))
+                .await;
+        };
+        let refused = frame.get("error").filter(|e| !e.is_null()).cloned();
+        let message = refused
+            .as_ref()
+            .and_then(|e| e["message"].as_str())
+            .unwrap_or_default()
+            .to_owned();
+        // Once the turn is being stopped or exec is to be used, an answer to the handshake moves nothing.
+        let settled_elsewhere = self.degrade.is_some() || self.stopped || !self.conn.open();
+        match what {
+            Pending::Initialize | Pending::Thread | Pending::TurnStart if settled_elsewhere => {
+                self.diagnostic(json!({"reason": "an answer after the turn stopped or moved to exec", "frame": frame}))
+                    .await?;
+            }
+            Pending::Initialize => match refused {
+                Some(e) if e["code"].as_i64() == Some(METHOD_NOT_FOUND) => {
+                    self.degrade = Some(format!("initialize: method not found ({message})"));
+                    self.close_gently();
+                }
+                Some(_) => {
+                    self.failure = Some(format!("initialize: {message}"));
+                    self.begin_stop(process);
+                }
+                None => {
+                    self.conn.send(&json!({"method": "initialized"}));
+                    step(
+                        self.store,
+                        self.attempt,
+                        Starting,
+                        Running,
+                        AttemptFacts {
+                            pid: Some(i64::from(self.pid)),
+                            ..AttemptFacts::default()
+                        },
+                    )
+                    .await?;
+                    self.running = true;
+                    self.phase = Phase::Thread;
+                    let launch = &self.turn.launch;
+                    let mut params = if launch.yolo {
+                        json!({"approvalPolicy": "never", "sandbox": "danger-full-access"})
+                    } else {
+                        json!({})
+                    };
+                    if let Some(m) = &launch.model {
+                        params["model"] = json!(m);
+                    }
+                    match &launch.resume {
+                        Some(thread) => {
+                            params["threadId"] = json!(thread);
+                            self.conn.request("thread/resume", params, Pending::Thread);
+                        }
+                        None => self.conn.request("thread/start", params, Pending::Thread),
+                    }
+                }
+            },
+            Pending::Thread => match refused {
+                Some(_) => {
+                    let what = if self.turn.launch.resume.is_some() {
+                        "thread/resume"
+                    } else {
+                        "thread/start"
+                    };
+                    self.failure = Some(format!("{what}: {message}"));
+                    self.begin_stop(process);
+                }
+                None => {
+                    let result = &frame["result"];
+                    self.thread_id = result["thread"]["id"].as_str().map(str::to_owned);
+                    self.model = result["model"].as_str().map(str::to_owned);
+                    self.store
+                        .upsert_session(super::session(
+                            self.attempt,
+                            self.turn,
+                            true,
+                            self.thread_id.clone(),
+                        ))
+                        .await?;
+                    self.phase = Phase::TurnStart;
+                    let params = json!({"threadId": self.thread_id,
+                                        "input": [{"type": "text", "text": self.turn.prompt}]});
+                    self.conn.request("turn/start", params, Pending::TurnStart);
+                }
+            },
+            Pending::TurnStart => match refused {
+                Some(_) => {
+                    self.failure = Some(format!("turn/start: {message}"));
+                    self.begin_stop(process);
+                }
+                None => {
+                    self.turn_id = frame["result"]["turn"]["id"].as_str().map(str::to_owned);
+                    self.phase = Phase::Active;
+                    self.event(
+                        "turn",
+                        "adapter.turn",
+                        json!({"threadId": self.thread_id, "turnId": self.turn_id}),
+                    )
+                    .await?;
+                    // What came before this turn's id was known counts now, if it is this turn's.
+                    for (method, early) in std::mem::take(&mut self.early) {
+                        Box::pin(self.on_notification(&method, &early)).await?;
+                    }
+                    for s in held.drain(..) {
+                        if self.phase == Phase::Active {
+                            self.send_steer(s);
+                        } else {
+                            let _ = s.reply.send(SteerReceipt::NotNow);
+                        }
+                    }
+                }
+            },
+            Pending::Interrupt => {}
+            Pending::Steer(s) => match refused {
+                Some(_) => {
+                    self.store
+                        .move_input(InputMove {
+                            input_id: s.input_id.clone(),
+                            from: InputState::Queued,
+                            to: InputState::Rejected,
+                            reason: Some(message.clone()),
+                        })
+                        .await?;
+                    let _ = s.reply.send(SteerReceipt::Rejected { reason: message });
+                }
+                None => {
+                    self.store
+                        .move_input(InputMove {
+                            input_id: s.input_id.clone(),
+                            from: InputState::Queued,
+                            to: InputState::Delivered,
+                            reason: None,
+                        })
+                        .await?;
+                    let took = frame["result"]["turnId"]
+                        .as_str()
+                        .map(str::to_owned)
+                        .or_else(|| self.turn_id.clone())
+                        .unwrap_or_default();
+                    // Its user message may have come first.
+                    if let Some(at) = self.seen.iter().position(|t| *t == s.text) {
+                        self.seen.remove(at);
+                        self.apply(s.input_id.clone()).await?;
+                    } else {
+                        self.delivered.push((s.input_id, s.text));
+                    }
+                    let _ = s.reply.send(SteerReceipt::Delivered { turn_id: took });
+                }
+            },
+        }
+        Ok(())
+    }
+}
+
 pub(super) async fn run(
     store: &Store,
     attempt: &AttemptRef,
@@ -105,7 +512,6 @@ pub(super) async fn run(
     held: &mut Vec<Steer>,
 ) -> Result<End, AdapterError> {
     use AttemptState::*;
-    let id = &attempt.attempt_id;
     let (stdout, stderr) = (
         turn.logs.join("app-server.stdout.jsonl"),
         turn.logs.join("app-server.stderr.log"),
@@ -139,104 +545,104 @@ pub(super) async fn run(
             return Err(e.into());
         }
     };
-    let pid = process.pid();
     let (lines, mut queue) = mpsc::unbounded_channel::<Vec<u8>>();
     let input = process.take_stdin();
-    let writer = tokio::spawn(async move {
+    let mut writer = tokio::spawn(async move {
         let mut input = input.ok_or_else(|| std::io::Error::other("no stdin pipe"))?;
         while let Some(line) = queue.recv().await {
             input.write_all(&line).await?;
         }
         input.shutdown().await
     });
-    let mut conn = Conn {
-        lines: Some(lines),
-        next_id: 0,
-        pending: HashMap::new(),
+    let mut s = State {
+        store,
+        attempt,
+        turn,
+        conn: Conn {
+            lines: Some(lines),
+            next_id: 0,
+            pending: HashMap::new(),
+        },
+        pid: process.pid(),
+        phase: Phase::Init,
+        running: false,
+        thread_id: None,
+        turn_id: None,
+        model: None,
+        usage: None,
+        status: None,
+        error: None,
+        reply: None,
+        cancelled: cancel.is_requested(),
+        deadline: false,
+        too_large: false,
+        tool_started: false,
+        failure: None,
+        degrade: None,
+        stop_at: None,
+        stopped: false,
+        interrupted: false,
+        counters: HashMap::new(),
+        delivered: Vec::new(),
+        seen: Vec::new(),
+        prompt_seen: false,
+        early: Vec::new(),
     };
-    conn.request(
+    s.conn.request(
         "initialize",
         json!({"clientInfo": {"name": "hoh", "version": crate::VERSION}}),
         Pending::Initialize,
     );
-    let launch = &turn.launch;
     let handshake_until = Instant::now() + turn.handshake_timeout;
     let deadline_at = turn.deadline.map(|d| Instant::now() + d);
-    let mut phase = Phase::Init;
-    let mut running = false;
-    let (mut thread_id, mut turn_id, mut model, mut usage) =
-        (None::<String>, None::<String>, None, None);
-    let (mut status, mut error, mut reply) = (None::<String>, None::<Value>, None::<String>);
-    let mut cancelled = cancel.is_requested();
-    let (mut deadline, mut too_large, mut tool_started) = (false, false, false);
-    let (mut failure, mut degrade) = (None::<String>, None::<String>);
-    let (mut stop_at, mut stopped, mut interrupted) = (None::<Instant>, false, false);
-    let (mut items, mut unknown, mut diagnostics, mut requests, mut errors) = (0, 0, 0, 0, 0);
-    let mut delivered: Vec<(String, String)> = Vec::new();
-    let mut steers_open = true;
-    // Stop: interrupt the active turn and give it the native grace; before a turn is active, end the process.
-    macro_rules! begin_stop {
-        () => {
-            if phase == Phase::Active && conn.open() && !interrupted {
-                if let (Some(t), Some(u)) = (&thread_id, &turn_id) {
-                    conn.request(
-                        "turn/interrupt",
-                        json!({"threadId": t, "turnId": u}),
-                        Pending::Interrupt,
-                    );
-                }
-                interrupted = true;
-                stop_at = Some(Instant::now() + turn.escalation.native_grace);
-            } else if !stopped {
-                conn.close();
-                process.cancel(hard_stop(turn.escalation));
-                stopped = true;
-            }
-        };
-    }
-    if cancelled {
-        begin_stop!();
+    let (mut steers_open, mut written) = (true, false);
+    if s.cancelled {
+        s.begin_stop(&process);
     }
     let report = loop {
         let event = tokio::select! {
             biased;
-            () = cancel.requested(), if !cancelled => {
-                cancelled = true;
-                begin_stop!();
+            () = cancel.requested(), if !s.cancelled => {
+                s.cancelled = true;
+                s.begin_stop(&process);
                 continue;
             }
-            _ = tokio::time::sleep_until(at(deadline_at)), if deadline_at.is_some() && !deadline => {
-                deadline = true;
-                begin_stop!();
+            _ = tokio::time::sleep_until(at(deadline_at)), if deadline_at.is_some() && !s.deadline => {
+                s.deadline = true;
+                s.begin_stop(&process);
                 continue;
             }
-            _ = tokio::time::sleep_until(handshake_until), if phase == Phase::Init && degrade.is_none() && !stopped => {
-                degrade = Some(format!("initialize did not answer within {:?}", turn.handshake_timeout));
-                conn.close();
-                stop_at = Some(Instant::now() + turn.escalation.term_grace);
+            _ = tokio::time::sleep_until(handshake_until),
+                if s.phase == Phase::Init && s.degrade.is_none() && !s.stopped => {
+                s.degrade = Some(format!("initialize did not answer within {:?}", turn.handshake_timeout));
+                s.close_gently();
                 continue;
             }
-            _ = tokio::time::sleep_until(at(stop_at)), if stop_at.is_some() && !stopped => {
-                conn.close();
-                process.cancel(hard_stop(turn.escalation));
-                stopped = true;
+            _ = tokio::time::sleep_until(at(s.stop_at)), if s.stop_at.is_some() && !s.stopped => {
+                s.hard_stop(&process);
+                continue;
+            }
+            result = &mut writer, if !written => {
+                written = true;
+                // stdin failed while we still had something to say: the protocol is broken.
+                let failed = match result {
+                    Ok(Ok(())) => None,
+                    Ok(Err(e)) => Some(e.to_string()),
+                    Err(e) => Some(e.to_string()),
+                };
+                if let Some(e) = failed.filter(|_| s.conn.open()) {
+                    s.failure.get_or_insert(format!("stdin: {e}"));
+                    s.hard_stop(&process);
+                }
                 continue;
             }
             steer = steers.recv(), if steers_open => {
                 match steer {
                     None => steers_open = false,
-                    Some(s) if phase == Phase::Active && conn.open() && !interrupted => {
-                        let expected = s.expected_turn.clone().or_else(|| turn_id.clone());
-                        conn.request(
-                            "turn/steer",
-                            json!({"threadId": thread_id, "expectedTurnId": expected,
-                                   "input": [{"type": "text", "text": s.text}]}),
-                            Pending::Steer(s),
-                        );
-                    }
-                    Some(s) if phase < Phase::Active && degrade.is_none() && !stopped => held.push(s),
-                    Some(s) => {
-                        let _ = s.reply.send(SteerReceipt::NotNow);
+                    Some(st) if s.phase == Phase::Active && s.conn.open() && !s.interrupted => s.send_steer(st),
+                    Some(st) if s.phase < Phase::Active && s.degrade.is_none() && !s.stopped => held.push(st),
+                    Some(st) => {
+                        let _ = st.reply.send(SteerReceipt::NotNow);
                     }
                 }
                 continue;
@@ -246,358 +652,100 @@ pub(super) async fn run(
         let line = match event {
             Some(Event::Frame(Frame::Line(bytes) | Frame::Partial(bytes))) => bytes,
             Some(Event::Frame(Frame::TooLarge(refused))) => {
-                too_large = true;
-                conn.close();
-                process.cancel(hard_stop(turn.escalation));
-                stopped = true;
-                store
-                    .attempt_event(
-                        id,
-                        "frame-too-large",
-                        "adapter.diagnostic",
-                        json!({"attempt_id": id, "reason": "PROTOCOL_FRAME_TOO_LARGE",
-                               "length": refused.length, "prefix_sha256": refused.prefix_sha256}),
-                    )
-                    .await?;
+                s.too_large = true;
+                s.hard_stop(&process);
+                s.event(
+                    "frame-too-large",
+                    "adapter.diagnostic",
+                    json!({"reason": "PROTOCOL_FRAME_TOO_LARGE",
+                           "length": refused.length, "prefix_sha256": refused.prefix_sha256}),
+                )
+                .await?;
                 continue;
             }
             Some(Event::Exit(report)) => break Some(*report),
             None => break None,
         };
         let Ok(frame) = serde_json::from_slice::<Value>(&line) else {
-            diagnostics += 1;
-            store
-                .attempt_event(
-                    id,
-                    &format!("diagnostic-{diagnostics}"),
-                    "adapter.diagnostic",
-                    json!({"attempt_id": id, "reason": "stdout line is not JSON", "bytes": line.len(),
-                           "head": String::from_utf8_lossy(&line[..line.len().min(256)])}),
-                )
-                .await?;
+            s.diagnostic(
+                json!({"reason": "stdout line is not JSON", "bytes": line.len(),
+                                "head": String::from_utf8_lossy(&line[..line.len().min(256)])}),
+            )
+            .await?;
             continue;
         };
-        if let Some(method) = frame["method"].as_str() {
-            if let Some(request) = frame.get("id").cloned() {
-                // A server request: the headless policy answers it at once.
-                requests += 1;
-                let answer = super::headless_answer(method);
-                match &answer {
-                    Ok(result) => conn.send(&json!({"id": request, "result": result})),
-                    Err((code, message)) => conn
-                        .send(&json!({"id": request, "error": {"code": code, "message": message}})),
-                }
-                store
-                    .attempt_event(
-                        id,
-                        &format!("server-request-{requests}"),
-                        "adapter.server_request",
-                        json!({"attempt_id": id, "method": method, "id": request,
-                               "answer": match answer {
-                                   Ok(result) => json!({"result": result}),
-                                   Err((code, message)) => json!({"error": {"code": code, "message": message}}),
-                               }}),
-                    )
-                    .await?;
-                continue;
-            }
-            let params = &frame["params"];
-            match method {
-                "item/started" | "item/completed" => {
-                    items += 1;
-                    let item = &params["item"];
-                    let kind = item["type"].as_str().unwrap_or_default();
-                    store
-                        .attempt_event(
-                            id,
-                            &format!("item-{items}"),
-                            "adapter.item",
-                            json!({"attempt_id": id, "method": method, "threadId": params["threadId"],
-                                   "turnId": params["turnId"], "itemId": item["id"], "itemType": kind}),
-                        )
-                        .await?;
-                    if method == "item/completed" && kind == "agentMessage" {
-                        reply = item["text"].as_str().map(str::to_owned);
-                    }
-                    if method == "item/started" && !is_text_item(kind) {
-                        tool_started = true;
-                    }
-                    if method == "item/started" && kind == "userMessage" {
-                        let text = text_of(item);
-                        if let Some(at) = delivered.iter().position(|(_, t)| *t == text) {
-                            let (input_id, _) = delivered.remove(at);
-                            store
-                                .move_input(InputMove {
-                                    input_id,
-                                    from: InputState::Delivered,
-                                    to: InputState::Applied,
-                                    reason: None,
-                                })
-                                .await?;
-                        }
-                    }
-                }
-                "thread/tokenUsage/updated" => usage = Some(params["tokenUsage"].clone()),
-                "error" => {
-                    errors += 1;
-                    store
-                        .attempt_event(
-                            id,
-                            &format!("error-{errors}"),
-                            "adapter.error",
-                            json!({"attempt_id": id, "error": params["error"], "willRetry": params["willRetry"]}),
-                        )
-                        .await?;
-                }
-                "turn/started" => {
-                    if turn_id.is_none() {
-                        turn_id = params["turn"]["id"].as_str().map(str::to_owned);
-                    }
-                }
-                "turn/completed" => {
-                    let ours = turn_id.as_deref().is_none_or(|t| params["turn"]["id"] == t);
-                    if ours {
-                        status = params["turn"]["status"].as_str().map(str::to_owned);
-                        error = Some(params["turn"]["error"].clone()).filter(|e| !e.is_null());
-                        phase = Phase::Done;
-                        conn.close();
-                        if stop_at.is_none() || interrupted {
-                            stop_at = Some(Instant::now() + turn.escalation.term_grace);
-                        }
-                    }
-                }
-                _ if !launch.known.contains(method) => {
-                    unknown += 1;
-                    store
-                        .attempt_event(
-                            id,
-                            &format!("unknown-{unknown}"),
-                            "adapter.unknown_event",
-                            json!({"attempt_id": id, "method": method, "frame": frame}),
-                        )
-                        .await?;
-                }
-                _ => {}
-            }
-            continue;
-        }
-        // A response to one of our requests.
-        let what = frame["id"].as_i64().and_then(|n| conn.pending.remove(&n));
-        let refused = frame.get("error").filter(|e| !e.is_null()).cloned();
-        let message = refused
-            .as_ref()
-            .and_then(|e| e["message"].as_str())
-            .unwrap_or_default()
-            .to_owned();
-        match what {
-            Some(Pending::Initialize) => match refused {
-                Some(e) if e["code"].as_i64() == Some(METHOD_NOT_FOUND) => {
-                    degrade = Some(format!("initialize: method not found ({message})"));
-                    conn.close();
-                    stop_at = Some(Instant::now() + turn.escalation.term_grace);
-                }
-                Some(_) => {
-                    failure = Some(format!("initialize: {message}"));
-                    begin_stop!();
-                }
-                None => {
-                    conn.notify("initialized");
-                    step(
-                        store,
-                        attempt,
-                        Starting,
-                        Running,
-                        AttemptFacts {
-                            pid: Some(i64::from(pid)),
-                            ..AttemptFacts::default()
-                        },
-                    )
-                    .await?;
-                    running = true;
-                    phase = Phase::Thread;
-                    let mut params = if launch.yolo {
-                        json!({"approvalPolicy": "never", "sandbox": "danger-full-access"})
-                    } else {
-                        json!({})
-                    };
-                    if let Some(m) = &launch.model {
-                        params["model"] = json!(m);
-                    }
-                    match &launch.resume {
-                        Some(thread) => {
-                            params["threadId"] = json!(thread);
-                            conn.request("thread/resume", params, Pending::Thread);
-                        }
-                        None => conn.request("thread/start", params, Pending::Thread),
-                    }
-                }
-            },
-            Some(Pending::Thread) => match refused {
-                Some(_) => {
-                    let what = if launch.resume.is_some() {
-                        "thread/resume"
-                    } else {
-                        "thread/start"
-                    };
-                    failure = Some(format!("{what}: {message}"));
-                    begin_stop!();
-                }
-                None => {
-                    let result = &frame["result"];
-                    thread_id = result["thread"]["id"].as_str().map(str::to_owned);
-                    model = result["model"].as_str().map(str::to_owned);
-                    store
-                        .upsert_session(super::session(attempt, turn, true, thread_id.clone()))
-                        .await?;
-                    phase = Phase::TurnStart;
-                    conn.request(
-                        "turn/start",
-                        json!({"threadId": thread_id, "input": [{"type": "text", "text": turn.prompt}]}),
-                        Pending::TurnStart,
-                    );
-                }
-            },
-            Some(Pending::TurnStart) => match refused {
-                Some(_) => {
-                    failure = Some(format!("turn/start: {message}"));
-                    begin_stop!();
-                }
-                None => {
-                    turn_id = frame["result"]["turn"]["id"]
-                        .as_str()
-                        .map(str::to_owned)
-                        .or(turn_id);
-                    phase = Phase::Active;
-                    store
-                        .attempt_event(
-                            id,
-                            "turn",
-                            "adapter.turn",
-                            json!({"attempt_id": id, "threadId": thread_id, "turnId": turn_id}),
-                        )
-                        .await?;
-                    for s in held.drain(..) {
-                        let expected = s.expected_turn.clone().or_else(|| turn_id.clone());
-                        conn.request(
-                            "turn/steer",
-                            json!({"threadId": thread_id, "expectedTurnId": expected,
-                                   "input": [{"type": "text", "text": s.text}]}),
-                            Pending::Steer(s),
-                        );
-                    }
-                }
-            },
-            Some(Pending::Interrupt) => {}
-            Some(Pending::Steer(s)) => match refused {
-                Some(_) => {
-                    store
-                        .move_input(InputMove {
-                            input_id: s.input_id.clone(),
-                            from: InputState::Queued,
-                            to: InputState::Rejected,
-                            reason: Some(message.clone()),
-                        })
-                        .await?;
-                    let _ = s.reply.send(SteerReceipt::Rejected { reason: message });
-                }
-                None => {
-                    store
-                        .move_input(InputMove {
-                            input_id: s.input_id.clone(),
-                            from: InputState::Queued,
-                            to: InputState::Delivered,
-                            reason: None,
-                        })
-                        .await?;
-                    let took = frame["result"]["turnId"]
-                        .as_str()
-                        .map(str::to_owned)
-                        .or_else(|| turn_id.clone())
-                        .unwrap_or_default();
-                    delivered.push((s.input_id, s.text));
-                    let _ = s.reply.send(SteerReceipt::Delivered { turn_id: took });
-                }
-            },
-            None => {
-                diagnostics += 1;
-                store
-                    .attempt_event(
-                        id,
-                        &format!("diagnostic-{diagnostics}"),
-                        "adapter.diagnostic",
-                        json!({"attempt_id": id, "reason": "a response to no request of ours", "frame": frame}),
-                    )
-                    .await?;
-            }
+        match (frame["method"].as_str(), frame.get("id").cloned()) {
+            (Some(method), Some(id)) => s.on_request(method, id).await?,
+            (Some(method), None) => s.on_notification(method, &frame).await?,
+            (None, _) => s.on_response(&process, held, &frame).await?,
         }
     };
-    conn.close();
-    let _ = writer.await;
+    s.conn.close();
+    // The process has exited: whatever is left to write goes nowhere, so the writer is not waited for.
+    if !written {
+        writer.abort();
+    }
     // Steers nobody answered stay QUEUED.
-    for (_, what) in conn.pending.drain() {
-        if let Pending::Steer(s) = what {
-            let _ = s.reply.send(SteerReceipt::NotNow);
+    for (_, what) in s.conn.pending.drain() {
+        if let Pending::Steer(st) = what {
+            let _ = st.reply.send(SteerReceipt::NotNow);
         }
     }
-    if let Some(reason) = degrade.filter(|_| !cancelled && !deadline) {
+    if let Some(reason) = s.degrade.clone().filter(|_| !s.cancelled && !s.deadline) {
         return Ok(End::Degrade(reason));
     }
-    for s in held.drain(..) {
-        let _ = s.reply.send(SteerReceipt::NotNow);
+    for st in held.drain(..) {
+        let _ = st.reply.send(SteerReceipt::NotNow);
     }
     let logs_incomplete = report.as_ref().is_none_or(|r| {
         r.stdout.error.is_some() || r.stderr.error.is_some() || !r.stdout.eof || !r.stderr.eof
     });
     if logs_incomplete && let Some(r) = &report {
-        store
-            .attempt_event(
-                id,
-                "raw-log-incomplete",
-                "adapter.diagnostic",
-                json!({"attempt_id": id, "reason": "RAW_LOG_INCOMPLETE",
-                       "stdout": {"eof": r.stdout.eof, "error": r.stdout.error},
-                       "stderr": {"eof": r.stderr.eof, "error": r.stderr.error}}),
-            )
-            .await?;
+        s.event(
+            "raw-log-incomplete",
+            "adapter.diagnostic",
+            json!({"reason": "RAW_LOG_INCOMPLETE",
+                   "stdout": {"eof": r.stdout.eof, "error": r.stdout.error},
+                   "stderr": {"eof": r.stderr.eof, "error": r.stderr.error}}),
+        )
+        .await?;
     }
     let exit = report.as_ref().and_then(|r| r.status);
     let (state, failure) = verdict(&Ending {
-        cancelled,
-        too_large,
-        deadline,
+        cancelled: s.cancelled,
+        too_large: s.too_large,
+        deadline: s.deadline,
         logs_incomplete,
-        failure: failure.as_deref(),
-        status: status.as_deref(),
-        error: error.as_ref(),
+        failure: s.failure.as_deref(),
+        status: s.status.as_deref(),
+        error: s.error.as_ref(),
         auth_hint: false,
-        tool_started,
+        tool_started: s.tool_started,
         exit_matters: false,
         exit,
     });
-    if status.as_deref() == Some("failed") {
-        let reason = failure_of(error.as_ref(), false);
-        store
-            .attempt_event(
-                id,
-                "turn-failed",
-                "adapter.turn_failed",
-                json!({"attempt_id": id, "status": status, "error": error,
-                       "blocked_reason": (reason == "BLOCKED_AUTH").then_some("BLOCKED_AUTH"),
-                       "retry": if reason == "TRANSIENT_EXTERNAL" { "transient" } else { "none" }}),
-            )
-            .await?;
+    if s.status.as_deref() == Some("failed") {
+        let reason = failure_of(s.error.as_ref(), false);
+        s.event(
+            "turn-failed",
+            "adapter.turn_failed",
+            json!({"status": s.status, "error": s.error,
+                   "blocked_reason": (reason == "BLOCKED_AUTH").then_some("BLOCKED_AUTH"),
+                   "retry": if reason == "TRANSIENT_EXTERNAL" { "transient" } else { "none" }}),
+        )
+        .await?;
     }
     let state = finish(
         store,
         attempt,
-        if running { Running } else { Starting },
+        if s.running { Running } else { Starting },
         state,
         AttemptFacts {
             ended_at: now(),
-            resolved_model: model.clone(),
+            resolved_model: s.model.clone(),
             failure_reason: failure.clone(),
-            cancel_requested: Some(cancelled),
-            usage,
+            cancel_requested: Some(s.cancelled),
+            usage: s.usage.clone(),
             ..AttemptFacts::default()
         },
         cancel,
@@ -609,20 +757,20 @@ pub(super) async fn run(
         state,
         mode: Mode::AppServer,
         args,
-        native_session: thread_id,
-        turn_id,
-        model,
-        status,
-        reply,
+        native_session: s.thread_id,
+        turn_id: s.turn_id,
+        model: s.model,
+        status: s.status,
+        reply: s.reply,
         exit,
         stdout,
         stderr,
         stdout_sha256,
         stderr_sha256,
-        items,
-        unknown_events: unknown,
+        items: s.counters.get("item").copied().unwrap_or(0),
+        unknown_events: s.counters.get("unknown").copied().unwrap_or(0),
         degraded: None,
-        pid: Some(pid),
+        pid: Some(s.pid),
         steps: report.map(|r| r.steps).unwrap_or_default(),
     })))
 }
