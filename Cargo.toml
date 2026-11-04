@@ -12,6 +12,8 @@ publish = false
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_debug_implementations = "warn"
+# scripts/product/static.sh compiles the clippy canary of hoh-core with this cfg (AC-062-05).
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(hoh_clippy_canary)"] }
 
 [workspace.lints.clippy]
 unwrap_used = "deny"
