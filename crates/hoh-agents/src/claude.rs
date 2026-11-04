@@ -17,14 +17,15 @@
 //! prints after. Stopping sends SIGINT, then SIGTERM and SIGKILL to the process group with graces between. Stdin,
 //! stdout and the cancel are driven together, so a child that never reads its prompt cannot hold up a cancel.
 
+pub use crate::adapter::{AdapterError, AttemptRef};
+use crate::adapter::{finish, now, sha256_file, step};
 use crate::frame::Frame;
 use crate::process::{Cause, Config, Escalation, Event, Process, Signal, Step, Termination};
 use hoh_core::lifecycle::AttemptState;
-use hoh_core::persistence::{AttemptFacts, AttemptMove, CancelLatch, PersistError, Session, Store};
+use hoh_core::persistence::{AttemptFacts, CancelLatch, Session, Store};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -109,16 +110,6 @@ pub fn argv(launch: &Launch) -> Result<Argv, Blocked> {
         args,
         capabilities: json!({"structured_events": true, "resume": resume, "partial_messages": partial}),
     })
-}
-
-/// The attempt a turn runs as, and its session.
-#[derive(Debug, Clone)]
-pub struct AttemptRef {
-    pub attempt_id: String,
-    /// HoH's session id (`sessions.session_id`).
-    pub session_id: String,
-    pub role: String,
-    pub agent_version: String,
 }
 
 /// A turn to run.
@@ -237,87 +228,6 @@ pub struct Outcome {
     pub pid: Option<u32>,
     /// The signals sent to stop the process, with their times (a cancel or the deadline).
     pub steps: Vec<Step>,
-}
-
-/// Why a turn could not be recorded or run.
-#[derive(Debug)]
-pub enum AdapterError {
-    Store(PersistError),
-    Io(std::io::Error),
-}
-
-impl From<PersistError> for AdapterError {
-    fn from(e: PersistError) -> Self {
-        AdapterError::Store(e)
-    }
-}
-
-impl From<std::io::Error> for AdapterError {
-    fn from(e: std::io::Error) -> Self {
-        AdapterError::Io(e)
-    }
-}
-
-impl std::fmt::Display for AdapterError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            AdapterError::Store(e) => write!(f, "store: {e}"),
-            AdapterError::Io(e) => write!(f, "io: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for AdapterError {}
-
-fn sha256_file(path: &Path) -> std::io::Result<String> {
-    let bytes = std::fs::read(path)?;
-    Ok(Sha256::digest(&bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect())
-}
-
-fn now() -> Option<String> {
-    Some(hoh_core::time::now_rfc3339())
-}
-
-async fn step(
-    store: &Store,
-    attempt: &AttemptRef,
-    from: AttemptState,
-    to: AttemptState,
-    facts: AttemptFacts,
-) -> Result<(), PersistError> {
-    store
-        .move_attempt(AttemptMove {
-            attempt_id: attempt.attempt_id.clone(),
-            from,
-            to,
-            facts,
-        })
-        .await
-}
-
-/// End the attempt through the latch: the state written (CANCELLED if a cancel was accepted first).
-async fn finish(
-    store: &Store,
-    attempt: &AttemptRef,
-    from: AttemptState,
-    to: AttemptState,
-    facts: AttemptFacts,
-    cancel: &CancelLatch,
-) -> Result<AttemptState, PersistError> {
-    store
-        .end_attempt(
-            AttemptMove {
-                attempt_id: attempt.attempt_id.clone(),
-                from,
-                to,
-                facts,
-            },
-            cancel,
-        )
-        .await
 }
 
 /// Run one turn as `attempt` (created PREPARED by the caller); a cancel accepted by `cancel` cancels it.
