@@ -303,8 +303,19 @@ fn a_cancel_requested_before_the_exit_is_seen_is_reported_as_cancelled() -> R {
             native: Some(Signal::Interrupt),
             ..Escalation::default()
         });
-        // Block the only runtime thread past the child's exit, so the supervisor has not run yet.
-        std::thread::sleep(Duration::from_millis(400));
+        // Block the only runtime thread until the child has exited (a zombie), so the supervisor has not run yet.
+        let stat = format!("/proc/{}/stat", p.pid());
+        let until = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < until {
+            let state = std::fs::read_to_string(&stat)?;
+            if state[state.rfind(')').ok_or("bad stat")? + 1..]
+                .trim_start()
+                .starts_with('Z')
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let (_, report) = until_exit(&mut p, Duration::from_secs(10)).await?;
         Ok::<_, Box<dyn std::error::Error>>(report)
     })?;
