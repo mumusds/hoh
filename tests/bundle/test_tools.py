@@ -379,7 +379,7 @@ class PersistenceScan(unittest.TestCase):
                           ('crates/hoh-app/src/bin/no_unsafe.rs','missing-forbid','hoh-app bin root: unsafe_code'),
                           ('crates/hoh-app/src/main.rs','missing-forbid','hoh-app bin root'),('crates/hoh-app/src/main.rs','missing-forbid','hoh-app bin root: unsafe_code'),
                           ('crates/hoh-core/src/lib.rs','core-root','fn extra() {}'),('crates/hoh-core/src/lib.rs','missing-forbid','mod protocol'),
-                          ('outside.rs','missing-forbid','hoh-app bin root')])
+                          ('outside.rs','missing-forbid','hoh-app bin root'),('outside.rs','target-outside-members','a target root outside the member directories')])
     def test_features_clippy_cfgs_and_sqlite_subprocesses_are_hits(self):
         # M2T01R-35..38: member features (code clippy never compiles, or extra dependency APIs), cfg(not(clippy)), and
         # SQLite run as a subprocess from product code; test-only files may mention sqlite.
@@ -394,6 +394,24 @@ class PersistenceScan(unittest.TestCase):
         self.assertEqual(sorted((h['path'].rsplit('/',1)[-1],h['kind'],h['match']) for h in res['hits']),
                          [('Cargo.toml','features',"hoh-core declares ['r8']"),('main.rs','clippy-cfg','clippy'),('main.rs','clippy-cfg','not(clippy)'),
                           ('main.rs','sqlite-literal','sqlite3'),('py.rs','sqlite-literal','import sqlite3')])
+    def test_embedded_files_test_classification_and_macro_cfgs(self):
+        # M2T01R-41..43: an embedded helper run by an interpreter, a test target beside product modules exempting nothing,
+        # and a cfg predicate taken from a macro argument.
+        F='#![forbid(clippy::disallowed_methods)]\n#![forbid(unsafe_code)]\n'
+        files={'crates/hoh-app/src/main.rs':F+'mod helper;\nfn main(){ let _ = include_str!("db_helper.py"); let _ = include_str!("schema.json"); '
+                                              'let _ = include_bytes!(concat!(env!("OUT_DIR"), "/x")); }\n'
+                                              'macro_rules! hide { ($c:meta) => { #[cfg(not($c))] fn w(){} } }',
+               'crates/hoh-app/src/db_helper.py':'import sqlite3\n',
+               'crates/hoh-app/src/schema.json':'{"type": "object"}',
+               'crates/hoh-app/src/helper/mod.rs':'pub fn w(){ let _ = std::process::Command::new("sqlite3"); }',
+               'crates/hoh-app/src/helper/tests.rs':F+'#[test] fn t(){}',
+               'crates/hoh-app/tests/ok.rs':F+'fn t(){ let _ = "sqlite3"; }'}
+        targets={'hoh-app':[('bin','crates/hoh-app/src/main.rs'),('test','crates/hoh-app/src/helper/tests.rs'),('test','crates/hoh-app/tests/ok.rs')]}
+        rc,res=self.run_scan(files,targets=targets)
+        self.assertEqual(rc,1)
+        self.assertEqual(sorted((h['path'].rsplit('/',1)[-1],h['kind'],h['match']) for h in res['hits']),
+                         [('main.rs','clippy-cfg','not($c)'),('main.rs','included-file','db_helper.py: mentions SQLite or holds a SQL write'),
+                          ('main.rs','included-file','include_str!/include_bytes! of a computed path'),('mod.rs','sqlite-literal','sqlite3')])
     def test_new_rusqlite_features_need_the_boundary_extended(self):
         rc,res=self.run_scan({},features=['bundled','default','backup'])
         self.assertEqual(self.kinds(res),[('Cargo.lock','rusqlite-feature')])

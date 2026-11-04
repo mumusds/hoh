@@ -15,8 +15,10 @@ for var in $(compgen -e); do
 done
 export CLIPPY_CONF_DIR="$PWD"
 logs="$(mktemp -d)"; trap 'rm -rf "$logs"' EXIT
-# The members declare no features (the scan refuses them), so this one build is every build (M2T01R-32, -35).
+# The members declare no features (the scan refuses them), so the dev and the release build are every build
+# (M2T01R-32, -35, -39: code under cfg(not(debug_assertions)) is compiled in the release profile only).
 cargo clippy --workspace --all-targets --locked -- -D warnings 2>&1 | tee "$logs/clippy.log"
+cargo clippy --workspace --all-targets --release --locked -- -D warnings 2>&1 | tee -a "$logs/clippy.log"
 # An entry that does not resolve is only a warning of clippy's configuration, so it fails here.
 if grep -q 'does not refer to a reachable function' "$logs/clippy.log"; then
   echo 'static: a clippy.toml disallowed-methods entry does not resolve' >&2
