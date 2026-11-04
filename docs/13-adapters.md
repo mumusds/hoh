@@ -40,7 +40,7 @@ RPC ctx.hasUI=true只表示部分协议UI能力。confirm/select/input/editor需
 
 **已知帧登记**：每个 CLI 版本在 `tests/fixtures/protocol/<agent>/<version>/known-frames.json` 列出已知帧（含已知但忽略的辅助帧：Claude 的 `rate_limit_event`、`system/task_*`；Codex 的 `remoteControl/status/changed`、`deprecationNotice`、`thread/goal/cleared` 等），由录制样例与官方文档汇总（M1-T07）。只有不在登记表中的帧才产生 `adapter.unknown_event`，这样“未知帧”可判定。
 
-**鉴权失败分类**（CR-003）：Codex App Server 为 `turn/completed` status=failed 且 `codexErrorInfo=unauthorized`（0.166.0 schema 的枚举值，录制中未出现，fixture 依 schema 合成并标 `synthetic=true`）；Codex exec 为 `turn.failed`，其消息或之前的 `error` 事件含 `unexpected status 401`。Pi 1.5.0 没有结构化错误码，`success:false` 的 error 文本以 `No API key found` 开头为 BLOCKED_AUTH，以 `Model not found` 开头为 MODEL_UNAVAILABLE，其余保存原文并按 PermanentExternal 处理。
+**鉴权失败分类**（CR-003）：Codex App Server 为 `turn/completed` status=failed 且 `codexErrorInfo=unauthorized`（0.166.0 schema 的枚举值，录制中未出现，fixture 依 schema 合成并标 `synthetic=true`）；Codex exec 为 `turn.failed`，其消息或之前的 `error` 事件含 `unexpected status 401`。Pi 1.5.0 没有结构化错误码，`success:false` 的 error 文本以 `No API key found` 开头为 BLOCKED_AUTH，以 `Model not found` 开头为 MODEL_UNAVAILABLE，其余保存原文并按 PermanentExternal 处理。 Claude 2.1.318 为 assistant 帧带 `error=authentication_failed`（录制样例 `unauthenticated`：空 HOME 下运行，无模型调用；随后 result 为 is_error=true、退出码1），失败的轮次据此记为 BLOCKED_AUTH（M1-T03）。
 
 **取消优先**（CR-003）：已请求取消的 attempt 一律以 CANCELLED 结束。claude 2.1.317 的样例显示 SIGINT 后仍会输出 `result(subtype=error_during_execution, is_error=true)` 且退出码 0，这个帧只作诊断保存。
 

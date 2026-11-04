@@ -89,10 +89,12 @@ fn only_a_clean_success_settles_and_a_cancel_always_wins() {
         text: None,
     };
     let ok = Some(Termination::Code(0));
-    assert_eq!(
-        verdict(false, false, Some(&success), ok),
-        (AttemptState::Settled, None)
-    );
+    let clean = Ending {
+        result: Some(&success),
+        exit: ok,
+        ..Ending::default()
+    };
+    assert_eq!(verdict(&clean), (AttemptState::Settled, None));
     let failed = |reason: &str| (AttemptState::Failed, Some(reason.to_owned()));
     let max_turns = ResultFrame {
         subtype: Some("error_max_turns".to_owned()),
@@ -100,7 +102,11 @@ fn only_a_clean_success_settles_and_a_cancel_always_wins() {
         text: None,
     };
     assert_eq!(
-        verdict(false, false, Some(&max_turns), Some(Termination::Code(1))),
+        verdict(&Ending {
+            result: Some(&max_turns),
+            exit: Some(Termination::Code(1)),
+            ..clean
+        }),
         failed("error_max_turns")
     );
     let error = ResultFrame {
@@ -108,31 +114,101 @@ fn only_a_clean_success_settles_and_a_cancel_always_wins() {
         is_error: Some(true),
         text: None,
     };
-    assert_eq!(verdict(false, false, Some(&error), ok), failed("is_error"));
+    let errored = Ending {
+        result: Some(&error),
+        ..clean
+    };
+    assert_eq!(verdict(&errored), failed("is_error"));
     assert_eq!(
-        verdict(false, false, None, ok),
+        verdict(&Ending {
+            result: None,
+            ..clean
+        }),
         failed("PROTOCOL_INCOMPLETE")
     );
     assert_eq!(
-        verdict(false, false, Some(&success), Some(Termination::Code(1))),
+        verdict(&Ending {
+            exit: Some(Termination::Code(1)),
+            ..clean
+        }),
         failed("exit code 1")
     );
     assert_eq!(
-        verdict(false, true, Some(&success), ok),
+        verdict(&Ending {
+            too_large: true,
+            ..clean
+        }),
         failed("PROTOCOL_FRAME_TOO_LARGE")
     );
-    // After SIGINT Claude still prints result(error_during_execution) and exits 0: cancelled all the same.
+    // A turn stopped by its deadline, or whose raw logs are incomplete, is no success whatever it printed.
+    assert_eq!(
+        verdict(&Ending {
+            deadline: true,
+            ..clean
+        }),
+        failed("DEADLINE_EXCEEDED")
+    );
+    assert_eq!(
+        verdict(&Ending {
+            logs_incomplete: true,
+            ..clean
+        }),
+        failed("RAW_LOG_INCOMPLETE")
+    );
+    // An undelivered prompt spoils a success but does not hide a failure the result names.
+    assert_eq!(
+        verdict(&Ending {
+            prompt_undelivered: true,
+            ..clean
+        }),
+        failed("PROMPT_NOT_DELIVERED")
+    );
+    assert_eq!(
+        verdict(&Ending {
+            prompt_undelivered: true,
+            ..errored
+        }),
+        failed("is_error")
+    );
+    // Claude's own authentication error marker turns a failed turn into BLOCKED_AUTH (recorded case unauthenticated).
+    assert_eq!(
+        verdict(&Ending {
+            auth_failed: true,
+            exit: Some(Termination::Code(1)),
+            ..errored
+        }),
+        failed("BLOCKED_AUTH")
+    );
+    // After SIGINT Claude still prints result(error_during_execution) and exits 0: cancelled all the same, and a cancel
+    // wins over every other cause.
     let interrupted = ResultFrame {
         subtype: Some("error_during_execution".to_owned()),
         is_error: Some(true),
         text: None,
     };
-    assert_eq!(
-        verdict(true, false, Some(&interrupted), ok),
-        (AttemptState::Cancelled, None)
-    );
-    assert_eq!(
-        verdict(true, false, Some(&success), ok),
-        (AttemptState::Cancelled, None)
-    );
+    for ending in [
+        Ending {
+            result: Some(&interrupted),
+            ..clean
+        },
+        clean,
+        Ending {
+            too_large: true,
+            deadline: true,
+            logs_incomplete: true,
+            prompt_undelivered: true,
+            auth_failed: true,
+            result: None,
+            exit: None,
+            ..clean
+        },
+    ] {
+        assert_eq!(
+            verdict(&Ending {
+                cancelled: true,
+                ..ending
+            }),
+            (AttemptState::Cancelled, None)
+        );
+    }
 }

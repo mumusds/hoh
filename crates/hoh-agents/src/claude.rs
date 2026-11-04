@@ -6,14 +6,18 @@
 //! only. The attempt moves through the store (PREPARED -> STARTING -> RUNNING -> SETTLED/FAILED/CANCELLED) and the
 //! session row records Claude's own session id.
 //!
-//! An attempt SETTLES only on a `result` frame with `subtype=success` and `is_error=false` and exit code 0; a stream
-//! that ends before its `result` frame is FAILED (PROTOCOL_INCOMPLETE) even with exit code 0; any other result is
-//! FAILED with its subtype kept. A cancelled attempt is CANCELLED whatever follows (Claude still prints
-//! `result(error_during_execution)` and exits 0 after SIGINT, CR-003); cancel sends SIGINT, then SIGTERM and SIGKILL to
-//! the process group with graces between.
+//! An attempt SETTLES only on a `result` frame with `subtype=success` and `is_error=false` and exit code 0, with its
+//! prompt delivered whole and both raw logs complete; a stream that ends before its `result` frame is FAILED
+//! (PROTOCOL_INCOMPLETE) even with exit code 0; any other result is FAILED with its subtype kept (also in the
+//! `adapter.result` event), or BLOCKED_AUTH when an assistant frame carried Claude's `authentication_failed` error
+//! (recorded case `unauthenticated`). A cancel requested before the end is recorded makes the attempt CANCELLED
+//! whatever follows (Claude still prints `result(error_during_execution)` and exits 0 after SIGINT, CR-003); a refused
+//! frame (PROTOCOL_FRAME_TOO_LARGE) and the deadline (DEADLINE_EXCEEDED) stop the process and fail the turn whatever it
+//! prints after. Stopping sends SIGINT, then SIGTERM and SIGKILL to the process group with graces between. Stdin,
+//! stdout and the cancel are driven together, so a child that never reads its prompt cannot hold up a cancel.
 
 use crate::frame::Frame;
-use crate::process::{Config, Escalation, Event, Process, Signal, Step, Termination};
+use crate::process::{Cause, Config, Escalation, Event, Process, Signal, Step, Termination};
 use hoh_core::lifecycle::AttemptState;
 use hoh_core::persistence::{AttemptFacts, AttemptMove, PersistError, Session, Store};
 use serde_json::{Value, json};
@@ -150,25 +154,52 @@ pub struct ResultFrame {
     pub text: Option<String>,
 }
 
+/// What the end of a turn is judged on (see [`verdict`]).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Ending<'a> {
+    /// The caller asked to cancel before the end was recorded.
+    pub cancelled: bool,
+    /// A stdout frame was over the frame limit.
+    pub too_large: bool,
+    /// The turn's deadline stopped the process.
+    pub deadline: bool,
+    /// A raw log misses bytes: a copy failed or a stream never reached its end.
+    pub logs_incomplete: bool,
+    /// The prompt could not be written whole to stdin.
+    pub prompt_undelivered: bool,
+    /// An assistant frame carried Claude's `authentication_failed` error.
+    pub auth_failed: bool,
+    pub result: Option<&'a ResultFrame>,
+    pub exit: Option<Termination>,
+}
+
 /// The end state and failure reason of a turn (pure; module docs).
-pub fn verdict(
-    cancelled: bool,
-    too_large: bool,
-    result: Option<&ResultFrame>,
-    exit: Option<Termination>,
-) -> (AttemptState, Option<String>) {
-    if cancelled {
+pub fn verdict(e: &Ending<'_>) -> (AttemptState, Option<String>) {
+    let failed = |why: &str| (AttemptState::Failed, Some(why.to_owned()));
+    if e.cancelled {
         return (AttemptState::Cancelled, None);
     }
-    if too_large {
-        return (
-            AttemptState::Failed,
-            Some("PROTOCOL_FRAME_TOO_LARGE".to_owned()),
-        );
+    if e.too_large {
+        return failed("PROTOCOL_FRAME_TOO_LARGE");
     }
-    let Some(result) = result else {
-        return (AttemptState::Failed, Some("PROTOCOL_INCOMPLETE".to_owned()));
+    if e.deadline {
+        return failed("DEADLINE_EXCEEDED");
+    }
+    if e.logs_incomplete {
+        return failed("RAW_LOG_INCOMPLETE");
+    }
+    let Some(result) = e.result else {
+        return failed("PROTOCOL_INCOMPLETE");
     };
+    match judge(result, e.exit) {
+        (AttemptState::Settled, _) if e.prompt_undelivered => failed("PROMPT_NOT_DELIVERED"),
+        (AttemptState::Failed, _) if e.auth_failed => failed("BLOCKED_AUTH"),
+        judged => judged,
+    }
+}
+
+/// The `result` frame and the exit code alone.
+fn judge(result: &ResultFrame, exit: Option<Termination>) -> (AttemptState, Option<String>) {
     let subtype = result.subtype.as_deref().unwrap_or("unknown");
     if subtype != "success" {
         return (AttemptState::Failed, Some(subtype.to_owned()));
@@ -275,7 +306,6 @@ pub async fn run(
     mut cancel: watch::Receiver<bool>,
 ) -> Result<Outcome, AdapterError> {
     use AttemptState::*;
-    std::fs::create_dir_all(&turn.logs)?;
     let (stdout, stderr) = (turn.logs.join("stdout.jsonl"), turn.logs.join("stderr.log"));
     let log_path = Some(turn.logs.to_string_lossy().into_owned());
     let argv = match argv(&turn.launch) {
@@ -320,6 +350,22 @@ pub async fn run(
             });
         }
     };
+    if let Err(e) = std::fs::create_dir_all(&turn.logs) {
+        // Nothing starts without its raw logs; the attempt does not stay PREPARED.
+        step(
+            store,
+            attempt,
+            Prepared,
+            Failed,
+            AttemptFacts {
+                ended_at: now(),
+                failure_reason: Some(format!("LOGS: {e}")),
+                ..AttemptFacts::default()
+            },
+        )
+        .await?;
+        return Err(e.into());
+    }
     // The session row exists before the attempt names it.
     store
         .upsert_session(Session {
@@ -386,37 +432,69 @@ pub async fn run(
         },
     )
     .await?;
-    if let Some(mut input) = process.take_stdin() {
-        // A child that exits before reading its prompt is judged by what it printed.
-        let _ = input.write_all(&turn.prompt).await;
-        let _ = input.shutdown().await;
-    }
+    // The prompt is written while the output and the cancel are watched; the pipe closes when it is written.
+    let input = process.take_stdin();
+    let mut feed = std::pin::pin!(async {
+        let mut input = input.ok_or_else(|| std::io::Error::other("no stdin pipe"))?;
+        input.write_all(&turn.prompt).await?;
+        input.shutdown().await
+    });
+    let mut fed: Option<std::io::Result<()>> = None;
     let mut native_session = None;
     let mut model = None;
     let mut result: Option<ResultFrame> = None;
+    let mut results = 0;
     let mut usage = None;
     let mut cost = None;
     let mut diagnostics = 0;
     let mut too_large = false;
-    let mut cancelled = *cancel.borrow();
+    let mut auth_failed = false;
+    let mut cancelled = *cancel.borrow_and_update();
     if cancelled {
         process.cancel(turn.escalation);
     }
+    let mut watching = !cancelled;
     let report = loop {
+        // A cancel is seen before output that is ready at the same time.
         let event = tokio::select! {
-            event = process.next() => event,
-            changed = cancel.changed(), if !cancelled => {
-                if changed.is_ok() && *cancel.borrow() {
-                    cancelled = true;
-                    process.cancel(turn.escalation);
+            biased;
+            changed = cancel.changed(), if watching => {
+                match changed {
+                    Ok(()) if *cancel.borrow_and_update() => {
+                        cancelled = true;
+                        watching = false;
+                        process.cancel(turn.escalation);
+                    }
+                    Ok(()) => {}
+                    // No one can cancel any more.
+                    Err(_) => watching = false,
                 }
                 continue;
             }
+            written = &mut feed, if fed.is_none() => {
+                fed = Some(written);
+                continue;
+            }
+            event = process.next() => event,
         };
         let line = match event {
             Some(Event::Frame(Frame::Line(bytes) | Frame::Partial(bytes))) => bytes,
-            Some(Event::Frame(Frame::TooLarge(_))) => {
+            Some(Event::Frame(Frame::TooLarge(refused))) => {
+                // Nothing more is framed: end the process rather than wait for it.
                 too_large = true;
+                process.cancel(turn.escalation);
+                store
+                    .attempt_event(
+                        &attempt.attempt_id,
+                        "frame-too-large",
+                        "adapter.diagnostic",
+                        json!({
+                            "reason": "PROTOCOL_FRAME_TOO_LARGE",
+                            "length": refused.length,
+                            "prefix_sha256": refused.prefix_sha256,
+                        }),
+                    )
+                    .await?;
                 continue;
             }
             Some(Event::Exit(report)) => break Some(*report),
@@ -454,20 +532,68 @@ pub async fn run(
                     })
                     .await?;
             }
+            Some("assistant") if frame["error"] == "authentication_failed" => auth_failed = true,
             Some("result") => {
-                result = Some(ResultFrame {
+                let frame_result = ResultFrame {
                     subtype: frame["subtype"].as_str().map(str::to_owned),
                     is_error: frame["is_error"].as_bool(),
                     text: frame["result"].as_str().map(str::to_owned),
-                });
+                };
                 usage = frame.get("usage").filter(|u| u.is_object()).cloned();
                 cost = frame["total_cost_usd"].as_f64();
+                results += 1;
+                // Kept whatever the end: after a cancel it is only a diagnostic (CR-003).
+                store
+                    .attempt_event(
+                        &attempt.attempt_id,
+                        &format!("result-{results}"),
+                        "adapter.result",
+                        json!({
+                            "subtype": frame_result.subtype,
+                            "is_error": frame_result.is_error,
+                            "terminal_reason": frame["terminal_reason"],
+                            "after_cancel": cancelled,
+                        }),
+                    )
+                    .await?;
+                result = Some(frame_result);
             }
             _ => {}
         }
     };
+    let logs_incomplete = report.as_ref().is_none_or(|r| {
+        r.stdout.error.is_some() || r.stderr.error.is_some() || !r.stdout.eof || !r.stderr.eof
+    });
+    if logs_incomplete && let Some(r) = &report {
+        store
+            .attempt_event(
+                &attempt.attempt_id,
+                "raw-log-incomplete",
+                "adapter.diagnostic",
+                json!({
+                    "reason": "RAW_LOG_INCOMPLETE",
+                    "stdout": {"eof": r.stdout.eof, "error": r.stdout.error},
+                    "stderr": {"eof": r.stderr.eof, "error": r.stderr.error},
+                }),
+            )
+            .await?;
+    }
     let exit = report.as_ref().and_then(|r| r.status);
-    let (state, failure) = verdict(cancelled, too_large, result.as_ref(), exit);
+    // A cancel requested up to here still decides the end (M1T03R-03); the biased select above sees one that is ready
+    // with the last output, this sees one sent while the exit was being handled.
+    cancelled = cancelled || *cancel.borrow();
+    let (state, failure) = verdict(&Ending {
+        cancelled,
+        too_large,
+        deadline: report
+            .as_ref()
+            .is_some_and(|r| r.cause == Cause::DeadlineExceeded),
+        logs_incomplete,
+        prompt_undelivered: !matches!(fed, Some(Ok(()))),
+        auth_failed,
+        result: result.as_ref(),
+        exit,
+    });
     step(
         store,
         attempt,
