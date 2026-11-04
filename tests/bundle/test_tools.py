@@ -239,7 +239,7 @@ class TestResultsConverter(unittest.TestCase):
             from jsonschema import Draft202012Validator
             for line in out.read_text().splitlines():Draft202012Validator(schema).validate(json.loads(line))
 
-def scan_metadata(root,graph,dirs=None,features=None):
+def scan_metadata(root,graph,dirs=None,features=None,targets=None):
     """cargo metadata JSON for persistence_scan.py: graph maps a package to [(extern name, package, kind)]; dirs maps a
     workspace member to its directory under root (default crates/<name>); features lists rusqlite's features."""
     members=['hoh-core','hoh-agents','hoh-app']
@@ -247,7 +247,8 @@ def scan_metadata(root,graph,dirs=None,features=None):
     pid=lambda n:f'id:{n}'
     where=lambda n:(Path(root)/(dirs or {}).get(n,f'crates/{n}')/'Cargo.toml') if n in members else Path(f'/registry/{n}/Cargo.toml')
     return {'workspace_members':[pid(m) for m in members],
-            'packages':[{'id':pid(n),'name':n,'manifest_path':str(where(n))} for n in sorted(names)],
+            'packages':[{'id':pid(n),'name':n,'manifest_path':str(where(n)),
+                         'targets':[{'kind':[k],'src_path':str(Path(root)/s)} for k,s in (targets or {}).get(n,[])]} for n in sorted(names)],
             'resolve':{'nodes':[{'id':pid(n),'features':(features if n=='rusqlite' and features is not None else ['bundled','default']) if n=='rusqlite' else [],
                                  'deps':[{'name':e,'pkg':pid(p),'dep_kinds':[{'kind':k,'target':None}]} for e,p,k in graph.get(n,[])]} for n in sorted(names)]}}
 
@@ -261,7 +262,7 @@ def clippy_toml(skip=()):
 
 class PersistenceScan(unittest.TestCase):
     """scripts/product/persistence_scan.py: AC-062-05, SQLite only through the Persistence module."""
-    def run_scan(self,files,graph=BASE_GRAPH,out=None,dirs=None,features=None,clippy=None):
+    def run_scan(self,files,graph=BASE_GRAPH,out=None,dirs=None,features=None,clippy=None,targets=None):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d)
             files={'clippy.toml':clippy_toml() if clippy is None else clippy,**files}
@@ -269,7 +270,7 @@ class PersistenceScan(unittest.TestCase):
                 files.setdefault(f"{(dirs or {}).get(m,f'crates/{m}')}/Cargo.toml",'[package]\n')
             for rel,text in files.items():
                 p=root/rel;p.parent.mkdir(parents=True,exist_ok=True);p.write_text(text)
-            meta=root/'metadata.json';meta.write_text(json.dumps(scan_metadata(root,graph,dirs,features)))
+            meta=root/'metadata.json';meta.write_text(json.dumps(scan_metadata(root,graph,dirs,features,targets)))
             argv=[sys.executable,str(ROOT/'scripts/product/persistence_scan.py'),'--root',str(root),'--metadata',str(meta)]
             if out:argv+=['--out',str(out)]
             r=subprocess.run(argv,capture_output=True,text=True)
@@ -302,7 +303,7 @@ class PersistenceScan(unittest.TestCase):
                '.cargo/config.toml':'[build]\nrustflags = ["-A", "clippy::disallowed_methods"]\n'}
         rc,res=self.run_scan(files,clippy=clippy_toml(skip={'rusqlite::Connection::execute'})+'')
         self.assertEqual(rc,1)
-        self.assertEqual(self.kinds(res),[('.cargo/config.toml','rustflags'),('Cargo.toml','lint-table'),('clippy.toml','clippy-config'),
+        self.assertEqual(self.kinds(res),[('.cargo/config.toml','cargo-config'),('Cargo.toml','lint-table'),('clippy.toml','clippy-config'),
                                           ('crates/hoh-agents/Cargo.toml','lint-table'),('crates/hoh-agents/clippy.toml','clippy-config'),
                                           ('crates/hoh-app/src/main.rs','lint-suppressed'),('crates/hoh-app/src/main.rs','lint-suppressed'),
                                           ('crates/hoh-core/src/lib.rs','lint-suppressed'),('crates/hoh-core/src/lib.rs','lint-suppressed')])
@@ -329,14 +330,46 @@ class PersistenceScan(unittest.TestCase):
         import persistence_scan as ps
         canary=ps.CANARY
         log=lambda paths,where=canary,extra='':''.join(f'error: use of a disallowed method `{p}`\n --> {where}:1:1\n' for p in paths)+extra+'error: could not compile `hoh-core`\n'
-        self.assertEqual(ps.canary_verdict(log(sorted(ps.REQUIRED)))['problems'],[])
-        missing=sorted(ps.REQUIRED)[1:]
-        self.assertEqual(ps.canary_verdict(log(missing))['problems'],[f'not refused: {sorted(ps.REQUIRED)[0]}'])
-        elsewhere=ps.canary_verdict(log(sorted(ps.REQUIRED))+log(['rusqlite::Connection::open'],'crates/hoh-app/src/main.rs'))['problems']
+        self.assertEqual(ps.canary_verdict(log(sorted(ps.CANARY_REQUIRED)))['problems'],[])
+        missing=sorted(ps.CANARY_REQUIRED)[1:]
+        self.assertEqual(ps.canary_verdict(log(missing))['problems'],[f'not refused: {sorted(ps.CANARY_REQUIRED)[0]}'])
+        elsewhere=ps.canary_verdict(log(sorted(ps.CANARY_REQUIRED))+log(['rusqlite::Connection::open'],'crates/hoh-app/src/main.rs'))['problems']
         self.assertEqual(len(elsewhere),1);self.assertIn('crates/hoh-app/src/main.rs',elsewhere[0])
-        broken=ps.canary_verdict(log(sorted(ps.REQUIRED),extra='error[E0308]: mismatched types\n'))['problems']
+        broken=ps.canary_verdict(log(sorted(ps.CANARY_REQUIRED),extra='error[E0308]: mismatched types\n'))['problems']
         self.assertEqual(broken,['error[E0308]: mismatched types'])
-        self.assertEqual(len(ps.canary_verdict('')['problems']),len(ps.REQUIRED))  # a canary that compiled refuses nothing
+        self.assertEqual(len(ps.canary_verdict('')['problems']),len(ps.CANARY_REQUIRED))  # a canary that compiled refuses nothing
+    def test_cargo_configuration_outside_the_repository_is_checked(self):
+        # M2T01R-30: a wrapper or rustflags in an ancestor's or CARGO_HOME's configuration apply to the check as well.
+        with tempfile.TemporaryDirectory() as d:
+            base=Path(d);root=base/'repo';home=base/'home'
+            (base/'.cargo').mkdir();(base/'.cargo/config.toml').write_text('[build]\nrustc-wrapper = "/tmp/w"\n[env]\nX = "1"\n')
+            home.mkdir();(home/'config.toml').write_text('[target.x86_64-unknown-linux-gnu]\nrustflags = ["--cap-lints=allow"]\n[alias]\nclippy = "check"\n[net]\nretry = 3\n')
+            for rel,text in {'clippy.toml':clippy_toml(),'crates/hoh-app/src/main.rs':'fn main(){}'}.items():
+                p=root/rel;p.parent.mkdir(parents=True,exist_ok=True);p.write_text(text)
+            for m in ('hoh-core','hoh-agents','hoh-app'):(root/f'crates/{m}').mkdir(parents=True,exist_ok=True);(root/f'crates/{m}/Cargo.toml').write_text('[package]\n')
+            meta=base/'m.json';meta.write_text(json.dumps(scan_metadata(root,BASE_GRAPH)))
+            r=subprocess.run([sys.executable,str(ROOT/'scripts/product/persistence_scan.py'),'--root',str(root),'--metadata',str(meta)],
+                             capture_output=True,text=True,env={**os.environ,'CARGO_HOME':str(home)})
+            res=json.loads(r.stdout)
+            self.assertEqual(sorted(h['match'] for h in res['hits'] if h['kind']=='cargo-config'),
+                             ['alias.clippy','build.rustc-wrapper','env','target.x86_64-unknown-linux-gnu.rustflags'])
+    def test_every_target_root_forbids_the_lint(self):
+        # M2T01R-27..29: `forbid` makes the compiler reject any later allow (raw identifier, cfg_attr, macro-generated),
+        # so the scan checks that every target root has it, wherever the root lies, and hoh-core's root structure.
+        F='// boundary\n#![forbid(clippy::disallowed_methods)]\n'
+        files={'crates/hoh-agents/src/lib.rs':'//! docs\n'+F+'pub mod x;',
+               'crates/hoh-app/src/main.rs':'fn main(){}',
+               'outside.rs':'#![forbid(clippy::style)]\nfn main(){}',
+               'crates/hoh-app/tests/t.rs':F+'#[test] fn t(){}',
+               'crates/hoh-core/src/lib.rs':'//! core\n#[cfg(x)]\n#[forbid(clippy::disallowed_methods)]\nmod a;\npub mod persistence;\n'
+                                           'pub mod protocol;\npub const VERSION: &str = env!("CARGO_PKG_VERSION");\nfn extra() {}'}
+        targets={'hoh-agents':[('lib','crates/hoh-agents/src/lib.rs')],'hoh-app':[('bin','crates/hoh-app/src/main.rs'),('bin','outside.rs'),('test','crates/hoh-app/tests/t.rs')],
+                 'hoh-core':[('lib','crates/hoh-core/src/lib.rs')]}
+        rc,res=self.run_scan(files,targets=targets)
+        self.assertEqual(rc,1)
+        self.assertEqual(sorted((h['path'],h['kind'],h['match']) for h in res['hits']),
+                         [('crates/hoh-app/src/main.rs','missing-forbid','hoh-app bin root'),('crates/hoh-core/src/lib.rs','core-root','fn extra() {}'),
+                          ('crates/hoh-core/src/lib.rs','missing-forbid','mod protocol'),('outside.rs','missing-forbid','hoh-app bin root')])
     def test_new_rusqlite_features_need_the_boundary_extended(self):
         rc,res=self.run_scan({},features=['bundled','default','backup'])
         self.assertEqual(self.kinds(res),[('Cargo.lock','rusqlite-feature')])

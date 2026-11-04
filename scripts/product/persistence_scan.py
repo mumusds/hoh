@@ -14,15 +14,22 @@ The boundary is enforced by the compiler, and this scan checks that nothing swit
    (a `MappedRows`) goes through `Iterator::next` and cannot be told apart: persistence hands out no SQLite object.
    This scan checks that clippy.toml lists all REQUIRED methods
    without `allow-invalid`, that no other clippy configuration exists, that no Cargo `[lints]` table or
-   `.cargo/config` rustflags allow the lint, and that no product source outside persistence/ allows or expects
+   cargo configuration that applies (the repository's, its ancestors', `$CARGO_HOME`'s) sets rustflags, a compiler or
+   wrapper, compiler environment or aliases of the check's commands, and that no source outside persistence/ allows or expects
    `clippy::disallowed_methods` or a group holding it (`clippy::style`, `clippy::all`, `warnings`).
-3. Every .rs file in the directories of the workspace members (from `cargo metadata`), tests, benches and examples
-   included (a target may compile any of them): no lint suppression as in 2 outside persistence/, and no
-   `#[path = …]` (also inside `cfg_attr`) or `include!`, so every compiled file is one this scan reads.
-   scripts/product/static.sh clears rustflags and compiler wrappers from the environment, makes the repository's
-   clippy.toml the configuration (CLIPPY_CONF_DIR), and compiles crates/hoh-core/src/clippy_canary.rs, which calls
-   every REQUIRED method outside persistence; --canary-log checks that clippy refused each of them there and failed
-   for no other reason, which proves the boundary in force in the environment the check runs in (M2T01R-24).
+3. Lint levels: every target root of every workspace member (from `cargo metadata`, wherever it lies) starts with
+   `#![forbid(clippy::disallowed_methods)]`, and hoh-core's library root holds only module declarations, each but
+   `persistence` with `#[forbid(clippy::disallowed_methods)]`, and the VERSION constant. `forbid` makes the compiler
+   reject any later `allow` of the lint, however it is written or generated (raw identifiers, `cfg_attr`, macros).
+   Every .rs file of the member directories but the build output is also read: no `allow`/`expect` of the lint or a
+   group holding it outside persistence/ (an early, readable signal), and no `#[path = …]` (also in `cfg_attr`) or
+   `include!`.
+   scripts/product/static.sh clears rustflags, compiler and wrappers from the environment (an empty wrapper variable
+   overrides any configured one), makes the repository's clippy.toml the configuration (CLIPPY_CONF_DIR), and
+   compiles crates/hoh-core/src/clippy_canary.rs, which calls the CANARY_REQUIRED methods outside persistence;
+   --canary-log checks that clippy refused each of them there and failed for no other reason. This proves the lint in
+   force for hoh-core's library in the environment the check runs in; for the other targets the forbid levels and
+   the configuration checks of 2 hold it.
 4. Defence in depth: string literals outside persistence/ (and outside tests, benches, examples) that hold a SQL write statement (INSERT/REPLACE INTO,
    UPDATE ... SET, DELETE FROM, UPSERT, ON CONFLICT ... DO UPDATE), decoded as Rust does (escapes, line
    continuations), with literals separated only by commas joined (concat!), are hits.
@@ -56,11 +63,27 @@ REQUIRED = {f'rusqlite::{ty}::{m}' for ty, ms in {
     'Savepoint': ['new', 'with_name', 'commit', 'rollback', 'finish', 'savepoint', 'savepoint_with_name',
                   'set_drop_behavior'],
     'Batch': ['new'],
-    # Stepping a statement (M2T01R-22); the iterator traits are used by rusqlite alone in this dependency graph.
+    # Stepping a statement (M2T01R-22).
     'Rows': ['next', 'map', 'mapped', 'and_then'],
-}.items() for m in ms} | {'fallible_streaming_iterator::FallibleStreamingIterator::advance',
-                         'fallible_streaming_iterator::FallibleStreamingIterator::next',
-                         'fallible_iterator::FallibleIterator::next'}
+}.items() for m in ms}
+# The canary calls each of these; the iterator-trait methods below are checked to resolve but not each called.
+CANARY_REQUIRED = REQUIRED | {'fallible_streaming_iterator::FallibleStreamingIterator::advance',
+                              'fallible_streaming_iterator::FallibleStreamingIterator::next',
+                              'fallible_iterator::FallibleIterator::next'}
+# Every method of the iterator traits rusqlite's results implement, provided ones included (`count`, `nth`, …;
+# M2T01R-26): rusqlite alone uses these traits in this dependency graph.
+TRAIT_METHODS = {
+    'fallible_streaming_iterator::FallibleStreamingIterator': [
+        'advance', 'all', 'any', 'by_ref', 'count', 'filter', 'find', 'for_each', 'fuse', 'get', 'map', 'map_err',
+        'map_ref', 'next', 'nth', 'position', 'size_hint', 'skip', 'skip_while', 'take', 'take_while'],
+    'fallible_iterator::FallibleIterator': [
+        'all', 'any', 'by_ref', 'chain', 'cloned', 'cmp', 'collect', 'count', 'cycle', 'enumerate', 'eq', 'filter',
+        'filter_map', 'find', 'find_map', 'flat_map', 'flatten', 'fold', 'for_each', 'fuse', 'ge', 'gt', 'inspect',
+        'iterator', 'last', 'le', 'lt', 'map', 'map_err', 'max', 'max_by', 'max_by_key', 'min', 'min_by', 'min_by_key',
+        'ne', 'next', 'nth', 'partial_cmp', 'partition', 'peekable', 'position', 'rev', 'scan', 'size_hint', 'skip',
+        'skip_while', 'step_by', 'take', 'take_while', 'try_fold', 'unwrap', 'unzip', 'zip'],
+}
+REQUIRED = CANARY_REQUIRED | {f'{trait}::{m}' for trait, ms in TRAIT_METHODS.items() for m in ms}
 KNOWN_RUSQLITE_FEATURES = {'bundled', 'cache', 'default', 'modern_sqlite', 'ffi-sqlite-wasm-rs', 'hashlink'}
 # Matched on attribute and Cargo lint text with whitespace removed and `-` read as `_` (M2T01R-23); `disallowed_method`
 # is the lint's former name, still accepted by clippy.
@@ -247,12 +270,54 @@ def member_dirs(metadata: dict) -> list[Path]:
 
 
 def rust_files(metadata: dict) -> list[Path]:
-    """Every .rs file in the member directories (build output excluded). Which of them are compiled into the product
-    depends on targets and module paths, so the lint checks look at all of them (M2T01R-25)."""
+    """Every .rs file in the member directories but the build output (`cargo metadata`'s target directory). Which of
+    them are compiled into the product depends on targets and module paths, so the lint checks look at all of them
+    (M2T01R-25, -29)."""
+    build = Path(metadata.get('target_directory') or '/nonexistent').resolve()
     files = set()
     for d in member_dirs(metadata):
-        files |= {p for p in d.rglob('*.rs') if 'target' not in p.relative_to(d).parts[:-1]}
+        files |= {p for p in d.rglob('*.rs') if not p.resolve().is_relative_to(build)}
     return sorted(files)
+
+
+FORBID = '#![forbid(clippy::disallowed_methods)]'
+CORE_LIB_ITEM = re.compile(r'(?P<attrs>(?:#\[[^\]]*\]\s*)*)(?:pub\s+)?mod\s+(?P<name>\w+)\s*;')
+CORE_VERSION = re.compile(r'pub\s+const\s+VERSION\s*:\s*&\s*str\s*=\s*env!\s*\(\s*\)\s*;')
+
+
+def forbid_checks(root: Path, metadata: dict, hits: list) -> None:
+    """The compiler-enforced part of check 3 (M2T01R-27, -28, -29): a lint level of `forbid` makes any later `allow`
+    of the lint a hard error (E0453), whether written, raw-identifier-spelled, behind `cfg_attr` or generated by a
+    macro. Every target root of every workspace member (from `cargo metadata`, wherever it lies) starts with
+    `#![forbid(clippy::disallowed_methods)]`, except hoh-core's library root, which holds only module declarations —
+    each but `persistence` carrying `#[forbid(clippy::disallowed_methods)]` — and the VERSION constant."""
+    members = set(metadata['workspace_members'])
+    for package in metadata['packages']:
+        if package['id'] not in members:
+            continue
+        for target in package.get('targets') or []:
+            src = Path(target['src_path'])
+            rel = rel_to(src, root)
+            try:
+                code, _ = split_rust(src.read_text(encoding='utf-8', errors='replace'))
+            except OSError as exc:
+                hits.append({'path': rel, 'kind': 'target-root', 'match': f'unreadable: {exc}'})
+                continue
+            if package['name'] == CORE and 'lib' in (target.get('kind') or []):
+                rest = code
+                for m in CORE_LIB_ITEM.finditer(code):
+                    attrs = re.sub(r'\s+', '', m.group('attrs'))
+                    if m.group('name') != 'persistence' and '#[forbid(clippy::disallowed_methods)]' not in attrs:
+                        hits.append({'path': rel, 'kind': 'missing-forbid', 'match': f"mod {m.group('name')}"})
+                    rest = rest.replace(m.group(0), ' ', 1)
+                rest = CORE_VERSION.sub(' ', rest)
+                rest = re.sub(r'#\s*!\s*\[[^\]]*\]', ' ', rest)
+                if rest.strip():
+                    hits.append({'path': rel, 'kind': 'core-root', 'match': ' '.join(rest.split())[:200]})
+            else:
+                inner = [re.sub(r'\br#', '', re.sub(r'\s+', '', a)) for a in attributes(code) if re.match(r'#\s*!', a)]
+                if FORBID not in inner:
+                    hits.append({'path': rel, 'kind': 'missing-forbid', 'match': f"{package['name']} {'/'.join(target.get('kind') or [])} root"})
 
 
 def is_test_code(path: Path, metadata: dict) -> bool:
@@ -294,9 +359,35 @@ def lint_configuration_checks(root: Path, metadata: dict, hits: list) -> None:
                     full = (lint if tool == 'rust' else f'{tool}::{lint}').replace('-', '_')
                     if level in ('allow', 'expect') and SUPPRESSING.fullmatch(full):
                         hits.append({'path': rel_to(manifest, root), 'kind': 'lint-table', 'match': f'{full} = {level}'})
-    for cfg in (root / '.cargo/config.toml', root / '.cargo/config'):
-        if cfg.is_file() and re.search(r'(?:-A|--allow|--cap-lints)', cfg.read_text(encoding='utf-8')):
-            hits.append({'path': rel_to(cfg, root), 'kind': 'rustflags', 'match': 'lint level flags'})
+    for cfg in cargo_configs(root):
+        for key in forbidden_cargo_keys(cfg):
+            hits.append({'path': rel_to(cfg, root), 'kind': 'cargo-config', 'match': key})
+
+
+def cargo_configs(root: Path) -> list[Path]:
+    """Cargo configuration files that apply when cargo runs in the repository: the repository's and every ancestor's
+    `.cargo/config(.toml)`, and `$CARGO_HOME/config(.toml)` (M2T01R-30)."""
+    import os
+    homes = [Path(os.environ.get('CARGO_HOME') or Path.home() / '.cargo')]
+    dirs = [d / '.cargo' for d in [root, *root.parents]] + homes
+    return [d / name for d in dirs for name in ('config.toml', 'config') if (d / name).is_file()]
+
+
+def forbidden_cargo_keys(cfg: Path) -> list[str]:
+    """Settings that can change how the static check compiles or lints: rustflags, compiler and wrappers, environment
+    for the compiler, and aliases for the check's commands."""
+    try:
+        data = tomllib.loads(cfg.read_text(encoding='utf-8'))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        return [f'unreadable: {exc}']
+    found = []
+    build = data.get('build') or {}
+    found += [f'build.{k}' for k in ('rustflags', 'rustc', 'rustc-wrapper', 'rustc-workspace-wrapper', 'rustdocflags') if k in build]
+    found += [f'target.{name}.rustflags' for name, t in (data.get('target') or {}).items() if isinstance(t, dict) and 'rustflags' in t]
+    found += ['env' for _ in [1] if data.get('env')]
+    found += [f'alias.{a}' for a in (data.get('alias') or {}) if a in ('clippy', 'check', 'build', 'metadata', 'deny', 'fmt')]
+    found += ['unstable' for _ in [1] if data.get('unstable')]
+    return found
 
 
 def rel_to(path: Path, root: Path) -> str:
@@ -308,10 +399,12 @@ def scan(root: Path, metadata: dict) -> dict:
     dev_uses = dependency_checks(metadata, hits)
     lint_configuration_checks(root, metadata, hits)
     files = rust_files(metadata)
+    forbid_checks(root, metadata, hits)
     for path in files:
         rel = rel_to(path, root)
         code, literals = split_rust(path.read_text(encoding='utf-8', errors='replace'))
-        compact = [re.sub(r'\s+', '', attr) for attr in attributes(code)]
+        # Whitespace removed and raw identifiers read as plain ones (M2T01R-23, -27).
+        compact = [re.sub(r'\br#', '', re.sub(r'\s+', '', attr)) for attr in attributes(code)]
         if any(re.search(r'[\[(,]path=', attr) for attr in compact) or re.search(r'\binclude\s*!\s*[(\[{]', code):
             hits.append({'path': rel, 'kind': 'path-or-include', 'match': '#[path] (also in cfg_attr) or include!'})
         if rel.startswith(PERSISTENCE):
@@ -319,6 +412,7 @@ def scan(root: Path, metadata: dict) -> dict:
         for attr in compact:
             if re.search(r'(?:allow|expect)\(', attr) and SUPPRESSING.search(attr):
                 hits.append({'path': rel, 'kind': 'lint-suppressed', 'match': attr[:200]})
+
         if is_test_code(path, metadata):
             continue
         for value in literal_strings(code, literals):
@@ -369,8 +463,8 @@ def canary_verdict(log: str) -> dict:
                 other.append(f'{m.group(1)} reported at {where.strip()}')
         elif line.startswith('error') and not line.startswith('error: could not compile'):
             other.append(line[:200])
-    problems = [f'not refused: {p}' for p in sorted(REQUIRED - refused)] + other
-    return {'refused': len(refused), 'required': len(REQUIRED), 'problems': problems}
+    problems = [f'not refused: {p}' for p in sorted(CANARY_REQUIRED - refused)] + other
+    return {'refused': len(refused), 'required': len(CANARY_REQUIRED), 'problems': problems}
 
 
 def json_strings(value) -> list[str]:

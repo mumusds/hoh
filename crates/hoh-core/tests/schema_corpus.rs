@@ -1,6 +1,9 @@
 //! The product schema validator agrees with Python jsonschema on the shared corpus
 //! (tests/fixtures/schema/corpus.json; the bundle test confirms each recorded verdict with Python).
 
+// No SQLite outside hoh-core::persistence (AC-062-05); see clippy.toml.
+#![forbid(clippy::disallowed_methods)]
+
 use hoh_core::schema;
 use serde_json::Value;
 

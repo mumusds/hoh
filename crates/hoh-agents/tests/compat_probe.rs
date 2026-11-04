@@ -1,6 +1,9 @@
 //! AC-027-01 / TEST-027-01: probe() on three groups of fake binaries yields schema-valid compat manifest entries with
 //! the known hashes, the version text verbatim, capabilities from the probed help/schema, and identical results twice.
 
+// No SQLite outside hoh-core::persistence (AC-062-05); see clippy.toml.
+#![forbid(clippy::disallowed_methods)]
+
 use hoh_agents::compat::{Agent, AgentEntry, CompatManifest, SuiteStatus, Transport};
 use hoh_agents::probe::{ProbeEnv, probe, tree_sha256};
 use hoh_core::schema;

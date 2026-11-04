@@ -6,8 +6,10 @@ cargo fmt --all -- --check
 # AC-062-05: clippy.toml's disallowed-methods keep SQLite inside hoh-core::persistence. Nothing from the environment may
 # change lint levels or the clippy configuration (M2T01R-24): rustflags and compiler wrappers are cleared, and the
 # repository's clippy.toml is the configuration.
-unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS RUSTC_WRAPPER CARGO_BUILD_RUSTC_WRAPPER \
-  RUSTC_WORKSPACE_WRAPPER CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER CLIPPY_ARGS
+unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS CARGO_BUILD_RUSTC RUSTC CLIPPY_ARGS
+# An empty wrapper variable overrides a wrapper set in any cargo configuration; such configuration is also refused by
+# the scan below (M2T01R-30).
+export RUSTC_WRAPPER= CARGO_BUILD_RUSTC_WRAPPER= RUSTC_WORKSPACE_WRAPPER= CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER=
 for var in $(compgen -e); do
   if [[ "$var" =~ ^CARGO_TARGET_.*_RUSTFLAGS$ ]]; then unset "$var"; fi
 done
