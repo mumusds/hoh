@@ -62,10 +62,11 @@ The boundary is enforced by the compiler, and this scan checks that nothing swit
    that is not inside a macro invocation is documentation: its literals, the files it embeds and the files its text
    names are not checked as in check 4 (M2T01R-56, -60); inside a macro invocation it is input the macro may use at
    run time and is checked (M2T01R-61), as are doc comments there (M2T01R-63); macro names are Rust identifiers
-   (raw and non-ASCII ones too, M2T01R-64); a doc attribute a `macro_rules!` definition writes documents the generated
-   item (M2T01R-65). Code under exactly `#[cfg(test)]` (an inline module, or a module file no target root reaches
-   through plain declarations) is test code for the literal, include and named-file checks, like tests/
-   (M2T01R-66). A cargo configuration may not `include` another (M2T01R-62).
+   (raw ones, keywords included, and any XID identifier, M2T01R-64/-69); a doc attribute a `macro_rules!` definition
+   writes documents the generated item (M2T01R-65). The body of an inline module under exactly `#[cfg(test)]` that is
+   not inside a macro invocation is test code for the literal, include and named-file checks, like tests/ (M2T01R-66,
+   -68, -70); module files are never exempt that way (`#[cfg(test)] mod tests;` follows the product rules, M2T01R-67):
+   a unit test outside persistence that needs SQLite text belongs under tests/ or in an inline test module. A cargo configuration may not `include` another (M2T01R-62).
 Out of reach of any of this (docs/22-tooling.md): a program, script or SQL that exists only at run time (a name or
 text assembled from pieces, read from the environment or a file outside the candidate), conditional compilation
 produced by a macro (M2T01R-53/54), and product code that uses a whitelisted development file (a kit test or tool)
@@ -249,21 +250,45 @@ KEYWORDS = {'if', 'while', 'match', 'return', 'in', 'let', 'else', 'for', 'loop'
             'async', 'await', 'unsafe', 'dyn', 'impl', 'break', 'continue', 'yield'}
 
 
+def identifier_before(code: str, end: int) -> tuple[int, str, bool]:
+    """(start, name, raw) of the Rust identifier ending at `end` (XID rules, as `str.isidentifier`), `r#` included;
+    name is '' when there is none."""
+    i = end
+    while i > 0 and ('a' + code[i - 1]).isidentifier():
+        i -= 1
+    name = code[i:end]
+    if not name.isidentifier():
+        return end, '', False
+    raw = i >= 2 and code[i - 2:i] == 'r#' and (i == 2 or not ('a' + code[i - 3]).isidentifier())
+    return (i - 2 if raw else i), name, raw
+
+
 def macro_spans(code: str) -> list[tuple[int, int, str]]:
-    """(start, end, name) of every macro invocation and definition (`name!(…)`, `name![…]`, `name!{…}`, also with a
-    raw or non-ASCII identifier, M2T01R-64) in comment- and literal-free code."""
+    """(start, end, name) of every macro invocation and definition (`name!(…)`, `name![…]`, `name!{…}`,
+    `macro_rules! name {…}`) in comment- and literal-free code. Names follow Rust identifiers: raw ones (`r#while!`,
+    keywords included) and any XID identifier (`运行!`, a combining mark, M2T01R-64/-69); a keyword that is not raw
+    (`if !(…)`) invokes nothing."""
     out = []
     pairs = {'(': ')', '[': ']', '{': '}'}
-    for m in re.finditer(r'(?<![\w#])(?:r#)?([^\W\d]\w*)\s*!\s*(?:(?:r#)?[^\W\d]\w*\s*)?([(\[{])', code):
-        if m.group(1) in KEYWORDS:
-            continue  # `if !(…)` negates, it invokes nothing
-        opening, closing, depth, i = m.group(2), pairs[m.group(2)], 0, m.end() - 1
+    for bang in re.finditer(r'!', code):
+        j = bang.start()
+        k = j
+        while k > 0 and code[k - 1].isspace():
+            k -= 1
+        start, name, raw = identifier_before(code, k)
+        if not name or (name in KEYWORDS and not raw):
+            continue
+        rest = re.match(r'\s*(?:(?:r#)?[^\W\d]\w*\s*)?([(\[{])', code[j + 1:])
+        if not rest:
+            continue
+        opening = rest.group(1)
+        closing, depth, i = pairs[opening], 0, j + 1 + rest.end() - 1
         while i < len(code):
             depth += 1 if code[i] == opening else -1 if code[i] == closing else 0
             if depth == 0:
                 break
             i += 1
-        out.append((m.start(), i + 1, m.group(1)))
+        out.append((start, i + 1, name))
     return out
 
 
@@ -514,10 +539,15 @@ CFG_TEST = r'#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]'
 
 
 def cfg_test_spans(code: str) -> list[tuple[int, int]]:
-    """The bodies of inline modules under exactly `#[cfg(test)]` (other attributes may follow it), in comment- and
-    literal-free code: compiled only into test builds (M2T01R-66)."""
+    """The bodies of inline modules under exactly `#[cfg(test)]` (other attributes may follow it, the name may be raw)
+    in comment- and literal-free code: compiled only into test builds (M2T01R-66, -70). Inside a macro invocation the
+    attribute is only input the macro may drop (M2T01R-68), and a module file (`#[cfg(test)] mod tests;`) is never
+    exempt: which files a build compiles is not decided here (M2T01R-67)."""
+    macros = invocation_spans(code)
     out = []
-    for m in re.finditer(CFG_TEST + r'(?:\s*#\s*\[[^\]]*\])*\s*(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+\w+\s*\{', code):
+    for m in re.finditer(CFG_TEST + r'(?:\s*#\s*\[[^\]]*\])*\s*(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+(?:r#)?\w+\s*\{', code):
+        if any(a < m.start() < b for a, b in macros):
+            continue
         depth, i = 0, m.end() - 1
         while i < len(code):
             depth += {'{': 1, '}': -1}.get(code[i], 0)
@@ -526,44 +556,6 @@ def cfg_test_spans(code: str) -> list[tuple[int, int]]:
             i += 1
         out.append((m.start(), i + 1))
     return out
-
-
-def cfg_test_files(files: list[Path], metadata: dict) -> set[Path]:
-    """Module files reachable only through declarations under exactly `#[cfg(test)]` (`#[cfg(test)] mod tests;`) and
-    the module files below them: compiled only into test builds (M2T01R-66). A file that any target root also reaches
-    through plain declarations is product code (`mod a;` in lib.rs and `#[cfg(test)] mod a;` in main.rs both name
-    src/a.rs). A module file resolves as rustc resolves it: next to a crate root or `mod.rs`, otherwise in the
-    directory named after the declaring file; a declaration inside an inline module may resolve wrongly here, which
-    only ever makes a file product code."""
-    roots = {Path(t['src_path']).resolve() for p in metadata['packages'] for t in p.get('targets') or []}
-    known = {p.resolve(): p for p in files}
-    declaration = re.compile(r'(?:pub(?:\s*\([^)]*\))?\s+)?\bmod\s+(\w+)\s*;')
-    under_cfg_test = re.compile(CFG_TEST + r'(?:\s*#\s*\[[^\]]*\])*\s*$')
-
-    def declared(path: Path) -> tuple[set[Path], set[Path]]:
-        """(plain, cfg(test)) module files `path` declares."""
-        code, _ = split_rust(path.read_text(encoding='utf-8', errors='replace'))
-        base = path.parent if path in roots or path.name == 'mod.rs' else path.parent / path.stem
-        plain, test = set(), set()
-        for m in declaration.finditer(code):
-            targets = {c.resolve() for c in (base / f'{m.group(1)}.rs', base / m.group(1) / 'mod.rs')} & known.keys()
-            (test if under_cfg_test.search(code[max(0, m.start() - 400):m.start()]) else plain).update(targets)
-        return plain, test
-
-    edges = {p: declared(p) for p in known}
-
-    def closure(start: set[Path], follow_test: bool) -> set[Path]:
-        seen, todo = set(start), list(start)
-        while todo:
-            plain, test = edges.get(todo.pop(), (set(), set()))
-            for child in plain | (test if follow_test else set()):
-                if child not in seen:
-                    seen.add(child)
-                    todo.append(child)
-        return seen
-    product = closure(roots & known.keys(), follow_test=False)
-    test_only = closure(set().union(*(t for _, t in edges.values())) if edges else set(), follow_test=True) - product
-    return {known[p] for p in test_only}
 
 
 def is_test_code(path: Path, metadata: dict) -> bool:
@@ -678,7 +670,6 @@ def scan(root: Path, metadata: dict) -> dict:
     for src in product_roots_outside_src(metadata):
         hits.append({'path': rel_to(Path(src), root), 'kind': 'product-root-outside-src',
                      'match': "a product target root outside its member's src/"})
-    unit_tests = cfg_test_files(files, metadata)
     for path in files:
         rel = rel_to(path, root)
         doc_comments: list = []
@@ -703,7 +694,7 @@ def scan(root: Path, metadata: dict) -> dict:
             # A predicate taken from a macro argument (`cfg($cond)`) cannot be read here (M2T01R-43).
             if re.search(r'\bclippy\b', predicate) or '$' in predicate:
                 hits.append({'path': rel, 'kind': 'clippy-cfg', 'match': predicate[:200]})
-        if is_test_code(path, metadata) or path in unit_tests:
+        if is_test_code(path, metadata):
             continue
         # Doc comments inside a macro invocation are its input (M2T01R-63); code under #[cfg(test)] is test code
         # (M2T01R-66).

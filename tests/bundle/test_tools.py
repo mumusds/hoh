@@ -392,30 +392,37 @@ class PersistenceScan(unittest.TestCase):
         # M2T01R-63: a doc comment inside a macro invocation is input the macro may take as #[doc = $s:literal];
         # M2T01R-64: macro names are Rust identifiers, not only ASCII ones.
         rule='macro_rules! {name} {{ (#[doc = $s:literal]) => {{ std::process::Command::new($s.trim()) }}; }}\n'
-        for name,call in [('run','run!(\n    /// sqlite3\n)'),('运行','运行!(#[doc = "sqlite3"])'),('r#try_it','r#try_it!(#[doc = "sqlite3"])')]:
+        # M2T01R-69: a raw keyword (r#while) and a name with a combining mark (e + U+0301) are macro names too.
+        for name,call in [('run','run!(\n    /// sqlite3\n)'),('运行','运行!(#[doc = "sqlite3"])'),('r#try_it','r#try_it!(#[doc = "sqlite3"])'),
+                          ('r#while','r#while!(#[doc = "sqlite3"])'),('r#while','r#while!(\n    /// sqlite3\n)'),
+                          ('e\u0301','e\u0301!(#[doc = "sqlite3"])')]:
             src=rule.format(name=name)+'fn main(){ let _ = '+call+'; }'
             res=self.run_scan({'crates/hoh-app/src/main.rs':src})[1]
             self.assertEqual(self.kinds(res),[('crates/hoh-app/src/main.rs','sqlite-literal')],name)
     def test_docs_a_macro_writes_and_inline_unit_tests_are_not_product_literals(self):
         # M2T01R-65: a macro definition that writes a doc attribute documents what it generates.
-        # M2T01R-66: code under #[cfg(test)] (an inline module or a module file) is test code, like tests/.
+        # M2T01R-66/-70: an inline module under exactly #[cfg(test)] (also with a raw name) is test code, like tests/.
         ok={'crates/hoh-app/src/main.rs':'macro_rules! documented { () => { #[doc = "Uses SQLite only through persistence."] fn f() {} }; }\n'
-                                          'documented!();\nmod util;\n#[cfg(test)]\nmod unit;\nfn main(){}\n'
-                                          '#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() { assert_eq!(["SQL", "ite"].concat(), "SQLite"); }\n}',
-            'crates/hoh-app/src/util.rs':'pub fn f() {}\n#[cfg(test)]\nmod tests;',
-            'crates/hoh-app/src/util/tests.rs':'#[test]\nfn t() { let _ = "sqlite3"; }\nmod deeper;',
-            'crates/hoh-app/src/util/tests/deeper.rs':'fn d() { let _ = "INSERT INTO t VALUES (1)"; }',
-            'crates/hoh-app/src/unit.rs':'#[test]\nfn t() { let _ = "sqlite3"; }'}
-        rc,res=self.run_scan(ok,targets={'hoh-app':[('bin','crates/hoh-app/src/main.rs')]})
-        self.assertEqual([h for h in res['hits'] if h['kind']!='missing-forbid'],[])
-        bad={'crates/hoh-app/src/main.rs':'mod u;\nfn main(){}\n#[cfg(not(test))]\nmod v { fn f() { let _ = "sqlite3"; } }\n'
-                                           '#[cfg(any(test, unix))]\nmod w { fn f() { let _ = "libsqlite.so"; } }',
-             'crates/hoh-app/src/u.rs':'fn f() { let _ = "sqlite3"; }'}
-        # A file a product root reaches through a plain declaration stays product code, whatever else declares it.
-        bad['crates/hoh-app/src/lib.rs']='#[cfg(test)]\nmod u;'
+                                          'documented!();\nfn main(){}\n'
+                                          '#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() { assert_eq!(["SQL", "ite"].concat(), "SQLite"); }\n}\n'
+                                          '#[cfg(test)]\n#[allow(dead_code)]\npub(crate) mod r#unit { fn t() { let _ = "sqlite3"; } }'}
+        rc,res=self.run_scan(ok)
+        self.assertEqual((rc,res['hits']),(0,[]))
+    def test_only_real_inline_cfg_test_modules_are_test_code(self):
+        # M2T01R-67: module files are never exempt (resolving them misjudged a file the product compiles); M2T01R-68:
+        # #[cfg(test)] handed to a macro is its input; other predicates are product code.
+        bad={'crates/hoh-app/src/main.rs':'mod api { pub mod helper; }\nfn main(){}\n#[cfg(not(test))]\nmod v { fn f() { let _ = "sqlite3"; } }\n'
+                                           '#[cfg(any(test, unix))]\nmod w { fn f() { let _ = "libsqlite.so"; } }\n'
+                                           'product!(#[cfg(test)] mod helper { fn f() { let _ = "SQLite helper"; } });',
+             'crates/hoh-app/src/lib.rs':'#[cfg(test)]\nmod api;',
+             'crates/hoh-app/src/api.rs':'pub mod helper;',
+             'crates/hoh-app/src/api/helper.rs':'pub fn f() { let _ = std::process::Command::new("sqlite3"); }',
+             'crates/hoh-app/src/util.rs':'#[cfg(test)]\nmod tests;',
+             'crates/hoh-app/src/util/tests.rs':'#[test]\nfn t() { let _ = "sqlite3"; }'}
         res=self.run_scan(bad,targets={'hoh-app':[('bin','crates/hoh-app/src/main.rs'),('lib','crates/hoh-app/src/lib.rs')]})[1]
         self.assertEqual(sorted(h['path'] for h in res['hits'] if h['kind']=='sqlite-literal'),
-                         ['crates/hoh-app/src/main.rs','crates/hoh-app/src/main.rs','crates/hoh-app/src/u.rs'])
+                         ['crates/hoh-app/src/api/helper.rs','crates/hoh-app/src/main.rs','crates/hoh-app/src/main.rs',
+                          'crates/hoh-app/src/main.rs','crates/hoh-app/src/util/tests.rs'])
     def test_every_whitelist_entry_states_its_reason(self):
         # M2T01R-58.
         files={'a.py':'import sqlite3\n','b.py':'import sqlite3\n'}
