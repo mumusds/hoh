@@ -173,92 +173,150 @@ struct CodexSchema {
     notifications: std::collections::BTreeSet<String>,
 }
 
-/// The `method` names a protocol schema file lists, read only from the form the App Server schema uses: `oneOf`
-/// branches `{type: "object", required: [unique names], properties: {method: {type: "string", enum: [names]}, ...}}`
-/// with optional `title`/`description` strings; every other property is `true`/`false` or an object of `$ref`
-/// (string), `type` (a type name) and `anyOf` (a non-empty list of `$ref`/`type` objects). A method-bearing branch
-/// with any other keyword or an ill-typed value rejects the whole file, so malformed output never yields a
-/// capability (M1T01R-15, -18, -23, -25).
-fn schema_methods(value: &serde_json::Value) -> Option<std::collections::BTreeSet<String>> {
-    use serde_json::Value;
-    let strings = |v: &Value| v.as_array().is_some_and(|a| a.iter().all(Value::is_string));
-    let annotation = |key: &str, v: &Value| matches!(key, "title" | "description") && v.is_string();
-    let unique = |v: &Value| {
-        v.as_array().is_some_and(|a| {
-            a.iter()
-                .filter_map(Value::as_str)
-                .collect::<std::collections::BTreeSet<_>>()
-                .len()
-                == a.len()
-        })
-    };
-    let type_name = |v: &Value| {
+/// The draft-07 `$schema` the App Server schema files declare.
+const DRAFT_07: &str = "http://json-schema.org/draft-07/schema#";
+
+/// Draft-07 well-formedness for the keyword set the App Server schema uses (recorded 0.166.0: `title`,
+/// `description`, `type`, `enum`, `properties`, `required`, `$ref`, `oneOf`, `anyOf`, `allOf`, `items`,
+/// `additionalProperties`, `format`, `minimum`, `minLength`, `default`, and `$schema`/`definitions` at the root).
+/// Every schema position is checked against the draft-07 meta-schema rule for its keyword; any other keyword, an
+/// ill-typed value, or a `$ref` other than `#/definitions/<name>` naming a root definition refuses the document, so a
+/// newer schema form fails the probe instead of being half-read (M1T01R-25, -26, -27).
+fn draft7_well_formed(root: &serde_json::Value) -> Result<(), String> {
+    use serde_json::{Map, Value};
+    fn type_name(v: &Value) -> bool {
         matches!(
             v.as_str(),
             Some("null" | "boolean" | "object" | "array" | "number" | "integer" | "string")
         )
-    };
-    let alternative = |v: &Value| {
-        v.as_object().is_some_and(|o| {
-            o.iter().all(|(key, v)| match key.as_str() {
-                "$ref" => v.is_string(),
-                "type" => type_name(v),
-                other => annotation(other, v),
-            })
+    }
+    fn unique_strings(v: &Value) -> bool {
+        v.as_array().is_some_and(|a| {
+            a.iter().all(Value::is_string)
+                && a.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    == a.len()
         })
+    }
+    fn schema(v: &Value, defs: &Map<String, Value>, path: &str) -> Result<(), String> {
+        let obj = match v {
+            Value::Bool(_) => return Ok(()),
+            Value::Object(obj) => obj,
+            _ => return Err(format!("{path}: a schema must be an object or a boolean")),
+        };
+        for (key, v) in obj {
+            let at = format!("{path}/{key}");
+            let ok = match key.as_str() {
+                "$schema" => path.is_empty() && v == DRAFT_07,
+                "definitions" => path.is_empty(),
+                "title" | "description" | "format" => v.is_string(),
+                "default" => true,
+                "type" => {
+                    type_name(v)
+                        || (unique_strings(v)
+                            && v.as_array()
+                                .is_some_and(|a| !a.is_empty() && a.iter().all(type_name)))
+                }
+                "enum" => v.is_array(),
+                "required" => unique_strings(v),
+                "minimum" => v.is_number(),
+                "minLength" => {
+                    v.is_u64() || v.as_f64().is_some_and(|f| f >= 0.0 && f.fract() == 0.0)
+                }
+                "$ref" => v
+                    .as_str()
+                    .and_then(|r| r.strip_prefix("#/definitions/"))
+                    .is_some_and(|name| {
+                        !name.is_empty()
+                            && name
+                                .bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b))
+                            && defs.contains_key(name)
+                    }),
+                "properties" => match v.as_object() {
+                    Some(props) => {
+                        for (name, s) in props {
+                            schema(s, defs, &format!("{at}/{name}"))?;
+                        }
+                        true
+                    }
+                    None => false,
+                },
+                "items" | "additionalProperties" => {
+                    schema(v, defs, &at)?;
+                    true
+                }
+                "oneOf" | "anyOf" | "allOf" => match v.as_array().filter(|a| !a.is_empty()) {
+                    Some(list) => {
+                        for (i, s) in list.iter().enumerate() {
+                            schema(s, defs, &format!("{at}/{i}"))?;
+                        }
+                        true
+                    }
+                    None => false,
+                },
+                _ => return Err(format!("{at}: unsupported keyword")),
+            };
+            if !ok {
+                return Err(format!("{at}: ill-formed value"));
+            }
+        }
+        Ok(())
+    }
+    let empty = Map::new();
+    let defs = match root.get("definitions") {
+        None => &empty,
+        Some(Value::Object(defs)) => defs,
+        Some(_) => return Err("/definitions: not an object".to_owned()),
     };
-    let property = |v: &Value| {
-        v.is_boolean()
-            || v.as_object().is_some_and(|o| {
-                o.iter().all(|(key, v)| match key.as_str() {
-                    "$ref" => v.is_string(),
-                    "type" => type_name(v),
-                    "anyOf" => v
-                        .as_array()
-                        .is_some_and(|a| !a.is_empty() && a.iter().all(alternative)),
-                    other => annotation(other, v),
-                })
-            })
-    };
-    let variants = value
-        .as_object()?
-        .get("oneOf")?
-        .as_array()
-        .filter(|v| !v.is_empty())?;
+    for (name, s) in defs {
+        schema(s, defs, &format!("/definitions/{name}"))?;
+    }
+    schema(root, defs, "")
+}
+
+/// The `method` names a well-formed protocol schema file (see [`draft7_well_formed`]) lists, read only from the form
+/// the App Server schema uses: a root `oneOf` (with `$schema`, `definitions`, `properties`, `title`, `description`
+/// beside it) whose every branch is `{type: "object", required, properties: {method: {type: "string", enum:
+/// [names]}, ...}}` with optional `title`/`description`. Any other shape rejects the whole file, so malformed output
+/// never yields a capability (M1T01R-15, -18, -23, -27).
+fn schema_methods(value: &serde_json::Value) -> Option<std::collections::BTreeSet<String>> {
+    use serde_json::Value;
+    let root = value.as_object()?;
+    let root_ok = root.keys().all(|k| {
+        matches!(
+            k.as_str(),
+            "$schema" | "definitions" | "properties" | "title" | "description" | "oneOf"
+        )
+    });
+    let variants = root.get("oneOf")?.as_array().filter(|v| !v.is_empty())?;
     let mut methods = std::collections::BTreeSet::new();
     for branch in variants {
         let branch = branch.as_object()?;
-        let properties = branch.get("properties").and_then(Value::as_object);
-        let Some(method) = properties.and_then(|p| p.get("method")) else {
-            continue;
-        };
         let branch_ok = branch.iter().all(|(key, v)| match key.as_str() {
             "type" => v == "object",
-            "required" => strings(v) && unique(v),
-            "properties" => v
-                .as_object()
-                .is_some_and(|p| p.iter().all(|(name, s)| name == "method" || property(s))),
-            other => annotation(other, v),
+            "required" | "properties" | "title" | "description" => true,
+            _ => false,
         });
-        let method = method.as_object()?;
+        let method = branch.get("properties")?.get("method")?.as_object()?;
         let method_ok = method.get("type").is_some_and(|t| t == "string")
-            && method.iter().all(|(key, v)| match key.as_str() {
-                "type" => true,
-                "enum" => strings(v) && v.as_array().is_some_and(|a| !a.is_empty()),
-                other => annotation(other, v),
-            });
-        let names = method.get("enum").and_then(Value::as_array)?;
-        if !branch_ok || !method_ok {
+            && method
+                .keys()
+                .all(|k| matches!(k.as_str(), "type" | "enum" | "title" | "description"));
+        let names = method.get("enum")?.as_array().filter(|a| !a.is_empty())?;
+        if !root_ok || !branch_ok || !method_ok || !names.iter().all(Value::is_string) {
             return None;
         }
         methods.extend(names.iter().filter_map(Value::as_str).map(str::to_owned));
     }
-    (!methods.is_empty()).then_some(methods)
+    Some(methods)
 }
 
 /// `codex app-server generate-json-schema --out <dir>`: every `.json` file must parse, and `ClientRequest.json` and
 /// `ServerNotification.json` must be protocol schemas whose method lists the capabilities are read from; anything
-/// else is a failure, not an empty or guessed schema (M1T01R-08, M1T01R-15).
+/// else is a failure, not an empty or guessed schema (M1T01R-08, -15, -26, -27).
 fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<CodexSchema, ProbeError> {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -286,10 +344,16 @@ fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<CodexSchema, ProbeErr
             }
         }
         let methods = |name: &str| {
-            parsed
+            let value = parsed
                 .get(&dir.join(name))
-                .and_then(schema_methods)
-                .ok_or_else(|| unusable(format!("{name} is missing or lists no methods")))
+                .ok_or_else(|| unusable(format!("{name} is missing")))?;
+            draft7_well_formed(value)
+                .map_err(|e| unusable(format!("{name} is not a well-formed schema: {e}")))?;
+            schema_methods(value).ok_or_else(|| {
+                unusable(format!(
+                    "{name} does not list its methods in the known form"
+                ))
+            })
         };
         Ok(CodexSchema {
             requests: methods("ClientRequest.json")?,

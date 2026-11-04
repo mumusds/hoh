@@ -404,6 +404,43 @@ fn method_branches_must_use_the_known_schema_form() -> R {
             "params-anyof-bad-member",
             "{\"oneOf\":[{\"type\":\"object\",\"properties\":{\"method\":{\"type\":\"string\",\"enum\":[\"turn/steer\"]},\"params\":{\"anyOf\":[{\"$ref\":\"#/definitions/P\"},{\"type\":\"nil\"}]}}}]}",
         ),
+        // M1T01R-26/-27: references, the root, definitions and every branch are checked against draft-07.
+        (
+            "ref-not-uri",
+            "{\"definitions\":{\"P\":true},\"oneOf\":[{\"type\":\"object\",\"properties\":{\"method\":{\"type\":\"string\",\"enum\":[\"turn/steer\"]},\"params\":{\"$ref\":\"not a URI\"}}}]}",
+        ),
+        (
+            "ref-percent",
+            "{\"definitions\":{\"P\":true},\"oneOf\":[{\"type\":\"object\",\"properties\":{\"method\":{\"type\":\"string\",\"enum\":[\"turn/steer\"]},\"params\":{\"anyOf\":[{\"$ref\":\"#bad%zz\"},{\"type\":\"null\"}]}}}]}",
+        ),
+        (
+            "ref-unresolved",
+            "{\"definitions\":{\"P\":true},\"oneOf\":[{\"type\":\"object\",\"properties\":{\"method\":{\"type\":\"string\",\"enum\":[\"turn/steer\"]},\"params\":{\"$ref\":\"#/definitions/Missing\"}}}]}",
+        ),
+        (
+            "root-required-number",
+            "{\"required\":123,\"oneOf\":[{\"type\":\"object\",\"properties\":{\"method\":{\"type\":\"string\",\"enum\":[\"turn/steer\"]}}}]}",
+        ),
+        (
+            "definition-type-number",
+            "{\"definitions\":{\"P\":{\"type\":123}},\"oneOf\":[{\"type\":\"object\",\"properties\":{\"method\":{\"type\":\"string\",\"enum\":[\"turn/steer\"]},\"params\":{\"$ref\":\"#/definitions/P\"}}}]}",
+        ),
+        (
+            "branch-type-number",
+            "{\"oneOf\":[{\"type\":\"object\",\"properties\":{\"method\":{\"type\":\"string\",\"enum\":[\"turn/steer\"]}}},{\"type\":123}]}",
+        ),
+        (
+            "branch-without-method",
+            "{\"oneOf\":[{\"type\":\"object\",\"properties\":{\"method\":{\"type\":\"string\",\"enum\":[\"turn/steer\"]}}},{\"type\":\"object\"}]}",
+        ),
+        (
+            "root-unknown-keyword",
+            "{\"not\":{},\"oneOf\":[{\"type\":\"object\",\"properties\":{\"method\":{\"type\":\"string\",\"enum\":[\"turn/steer\"]}}}]}",
+        ),
+        (
+            "schema-not-draft-07",
+            "{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"oneOf\":[{\"type\":\"object\",\"properties\":{\"method\":{\"type\":\"string\",\"enum\":[\"turn/steer\"]}}}]}",
+        ),
     ] {
         let script = format!(
             "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n exec) cat '{f}/help-exec.txt';;\n \
