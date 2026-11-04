@@ -1,0 +1,1 @@
+Use the Bash tool to run `echo hoh`, then reply with exactly HOH_SAMPLE_OK and nothing else.
