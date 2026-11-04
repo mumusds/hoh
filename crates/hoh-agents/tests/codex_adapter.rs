@@ -870,3 +870,227 @@ async fn an_interrupted_turn_is_cancelled_without_a_cancel_request() -> R {
     );
     Ok(())
 }
+
+/// Notifications of another thread or turn neither end this turn nor change its reply or items (M1T04R-01), also
+/// when they come before this turn's id is known.
+#[tokio::test]
+async fn notifications_of_another_thread_or_turn_are_not_this_turns() -> R {
+    let world = World::new()?;
+    let mut case = Case::load("app-server-turn")?;
+    let thread = case.thread_id()?;
+    let foreign_done = |thread: &str, turn: &str| {
+        json!({"method": "turn/completed", "params": {"threadId": thread,
+               "turn": {"id": turn, "status": "completed", "items": [], "error": null}}})
+    };
+    let foreign_reply = json!({"method": "item/completed", "params": {"threadId": thread, "turnId": "other-turn",
+        "item": {"type": "agentMessage", "id": "m-x", "text": "FOREIGN_REPLY"}}});
+    // Before turn/start is answered (this turn's id unknown yet) and after it.
+    let start = case
+        .frames
+        .iter()
+        .position(|f| f["id"] == 2)
+        .ok_or("no turn/start response")?;
+    // An item of this very turn before its id is known: kept, and counted once the id is known.
+    let early_item = case
+        .frames
+        .iter()
+        .find(|f| f["method"] == "item/completed")
+        .cloned()
+        .ok_or("no item")?;
+    case.frames.insert(start, early_item);
+    let start = start + 1;
+    case.frames
+        .insert(start, foreign_done("other-thread", "t-1"));
+    case.frames
+        .insert(start + 1, foreign_done(&thread, "other-turn"));
+    case.frames.insert(start + 2, foreign_reply.clone());
+    let done = case.position("turn/completed")?;
+    let late = case.frames[done..]
+        .iter()
+        .position(|f| f["method"] == "turn/completed")
+        .ok_or("no end")?
+        + done;
+    case.frames.insert(late, foreign_reply.clone());
+    case.frames
+        .insert(late + 1, foreign_done(&thread, "other-turn"));
+    let ours = Case::load("app-server-turn")?
+        .frames
+        .iter()
+        .filter(|f| f["method"] == "item/started" || f["method"] == "item/completed")
+        .count();
+    let fake = world.fake("foreign", Some(&case), "exec", false)?;
+    let attempt = world.attempt("A1").await?;
+    let outcome = run(&world, &attempt, &world.turn(&fake, "logs/A1")?).await?;
+    assert_eq!(outcome.state, AttemptState::Settled);
+    assert_eq!(outcome.reply.as_deref(), Some("HOH_SAMPLE_OK"));
+    assert_eq!(
+        events(&world, "adapter.item")?.len(),
+        ours + 1,
+        "this turn's early item was dropped"
+    );
+
+    // Only another turn's end, then the stream ends: not SETTLED.
+    let mut case = Case::load("app-server-turn")?;
+    let start = case
+        .frames
+        .iter()
+        .position(|f| f["id"] == 2)
+        .ok_or("no turn/start response")?;
+    case.frames.truncate(start + 1);
+    case.frames.push(foreign_done(&thread, "other-turn"));
+    case.frames.push(foreign_done("other-thread", "t-2"));
+    let fake = world.fake("foreign-only", Some(&case), "exec", true)?;
+    let attempt = world.attempt_in("codex", "A2", "S2", "0.166.0").await?;
+    let outcome = run(&world, &attempt, &world.turn(&fake, "logs/A2")?).await?;
+    assert_ne!(
+        outcome.state,
+        AttemptState::Settled,
+        "{:?}",
+        outcome.failure
+    );
+    let row = world.store.reader()?.attempt("A2")?.ok_or("no A2")?;
+    assert_ne!(row.state, AttemptState::Settled);
+    Ok(())
+}
+
+/// An initialize answer that comes after the handshake timed out does not undo the move to exec (M1T04R-02).
+#[tokio::test]
+async fn a_late_initialize_answer_does_not_undo_the_degradation() -> R {
+    let world = World::new()?;
+    let mut case = Case::load("app-server-turn")?;
+    case.frames.insert(0, json!({"hoh_sleep": 0.4}));
+    let fake = world.fake("late", Some(&case), "exec", false)?;
+    let attempt = world.attempt("A1").await?;
+    let mut turn = world.turn(&fake, "logs/A1")?;
+    turn.handshake_timeout = Duration::from_millis(50);
+    let outcome = run(&world, &attempt, &turn).await?;
+    assert_eq!(
+        (outcome.state, outcome.mode),
+        (AttemptState::Settled, Mode::Exec)
+    );
+    let row = world.store.reader()?.attempt("A1")?.ok_or("no attempt")?;
+    assert_eq!(row.state, AttemptState::Settled);
+    assert!(row.ended_at.is_some());
+    assert_eq!(events(&world, "adapter.degraded")?.len(), 1);
+    Ok(())
+}
+
+/// App Server and exec events of one attempt never collide (M1T04R-03).
+#[tokio::test]
+async fn app_server_and_exec_events_of_one_attempt_do_not_collide() -> R {
+    let world = World::new()?;
+    let mut case = Case {
+        frames: Vec::new(),
+        requests: BTreeMap::new(),
+    };
+    case.requests.insert(0, "initialize".to_owned());
+    case.frames
+        .push(json!({"method": "hoh/unrecorded", "params": {}}));
+    case.frames
+        .push(json!({"id": 0, "error": {"code": -32601, "message": "Method not found"}}));
+    let fake = world.fake("collide", Some(&case), "exec", false)?;
+    let mut lines: Vec<Value> = read(format!("{FIXTURES}/exec/stdout.jsonl"))?
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()?;
+    lines.insert(1, json!({"type": "hoh.unrecorded"}));
+    lines.insert(2, json!("not an object"));
+    rewrite_exec(&fake, &lines)?;
+    let attempt = world.attempt("A1").await?;
+    let outcome = run(&world, &attempt, &world.turn(&fake, "logs/A1")?).await?;
+    assert_eq!(
+        (outcome.state, outcome.mode),
+        (AttemptState::Settled, Mode::Exec)
+    );
+    assert_eq!(events(&world, "adapter.unknown_event")?.len(), 2);
+    Ok(())
+}
+
+/// After the app-server exits, a prompt still being written (its stdin held open, unread, by a process outside the
+/// group) does not hold the turn up (M1T04R-04).
+#[tokio::test]
+async fn an_unwritten_prompt_does_not_hold_up_the_end() -> R {
+    let world = World::new()?;
+    let mut case = Case::load("app-server-turn")?;
+    let thread_response = case
+        .frames
+        .iter()
+        .position(|f| f["id"] == 1)
+        .ok_or("no thread response")?;
+    case.frames.truncate(thread_response + 1);
+    let fake = world.fake("holder", Some(&case), "exec", true)?;
+    // The fake leaves a sleeper in its own session holding stdin's read end (`<&0`: bash gives a background job
+    // /dev/null otherwise) and reading nothing.
+    let d = fake.parent().ok_or("no dir")?.to_path_buf();
+    let script = read(&fake)?.replace(
+        "if [ \"$1\" = app-server ]; then exec",
+        &format!(
+            "if [ \"$1\" = app-server ]; then setsid sleep 30 <&0 >/dev/null 2>&1 & echo $! > '{}/sleeper.pid'; exec",
+            d.display()
+        ),
+    );
+    std::fs::write(&fake, script)?;
+    let attempt = world.attempt("A1").await?;
+    let mut turn = world.turn(&fake, "logs/A1")?;
+    turn.prompt = "p".repeat(4 << 20);
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(Duration::from_secs(20), run(&world, &attempt, &turn)).await;
+    let took = started.elapsed();
+    if let Ok(pid) = read(d.join("sleeper.pid")) {
+        let _ = std::process::Command::new("kill").arg(pid.trim()).status();
+    }
+    let outcome = outcome??;
+    assert!(took < Duration::from_secs(5), "{took:?}");
+    assert_ne!(outcome.state, AttemptState::Settled);
+    Ok(())
+}
+
+/// A steer whose user message arrives before codex's answer to turn/steer still ends APPLIED (M1T04R-05).
+#[tokio::test]
+async fn a_steer_seen_before_its_answer_is_applied() -> R {
+    let world = World::new()?;
+    let mut case = Case::load("app-server-steer")?;
+    let text = "Stop running the command now and reply exactly STEERED.";
+    let item = case
+        .frames
+        .iter()
+        .position(|f| {
+            f["method"] == "item/started" && f["params"]["item"]["content"][0]["text"] == text
+        })
+        .ok_or("no steer item")?;
+    let moved = case.frames.remove(item);
+    let ack = case
+        .frames
+        .iter()
+        .position(|f| f["id"] == 4)
+        .ok_or("no steer answer")?;
+    case.frames.insert(ack, moved);
+    // The stale steer is not part of this case.
+    let stale = case
+        .frames
+        .iter()
+        .position(|f| f["id"] == 3)
+        .ok_or("no stale answer")?;
+    case.frames.remove(stale);
+    case.requests.remove(&3);
+    let fake = world.fake("early-item", Some(&case), "exec", false)?;
+    let attempt = world.attempt("A1").await?;
+    let turn = world.turn(&fake, "logs/A1")?;
+    let (tx, steers) = mpsc::channel(4);
+    let latch = CancelLatch::new();
+    let running = codex::run(&world.store, &attempt, &turn, &latch, steers);
+    let steering = async {
+        active_turn(&world, "A1").await?;
+        let receipt = steer(&world, &tx, "I1", text, None).await?;
+        Ok::<SteerReceipt, Box<dyn std::error::Error>>(receipt.await?)
+    };
+    let (outcome, receipt) = tokio::join!(running, steering);
+    let (outcome, receipt) = (outcome?, receipt?);
+    assert!(
+        matches!(receipt, SteerReceipt::Delivered { .. }),
+        "{receipt:?}"
+    );
+    assert_eq!(input_state(&world, "I1")?, InputState::Applied);
+    assert_eq!(outcome.state, AttemptState::Settled);
+    Ok(())
+}

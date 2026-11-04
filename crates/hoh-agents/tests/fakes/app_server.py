@@ -6,11 +6,13 @@ FRAMES is the recorded server output (one JSON frame per line, ids as recorded);
 id to its method ({"0": "initialize", ...}). Frames are sent in order. A response waits until the client has sent a
 request of that method that is not answered yet, and goes out with the client's id; notifications and server
 requests go out as soon as everything before them has. When every frame is out the fake waits for stdin to close
-(or exits at once with --exit-when-done, a stream cut short). In LOGDIR it keeps received.jsonl (every client line),
+(or exits at once with --exit-when-done, a stream cut short). A frame {"hoh_sleep": SECONDS} is not sent: the fake
+pauses there. In LOGDIR it keeps received.jsonl (every client line),
 sent.jsonl (the exact bytes sent) and trace.jsonl (both directions in order).
 """
 import json
 import sys
+import time
 from pathlib import Path
 
 
@@ -39,6 +41,10 @@ def main() -> int:
     def pump() -> None:
         while frames:
             frame = json.loads(frames[0])
+            if 'hoh_sleep' in frame:  # not sent: a pause before what follows
+                frames.pop(0)
+                time.sleep(float(frame['hoh_sleep']))
+                continue
             if 'method' not in frame:  # a response to a recorded request
                 method = recorded.get(frame.get('id'))
                 match = next((i for i, (_, m) in enumerate(unanswered) if m == method), None)
