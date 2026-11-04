@@ -90,6 +90,51 @@ pub fn fs_type<'a>(path: &Path, mounts: &'a [Mount]) -> Option<&'a str> {
     best.map(|(m, _)| m.fstype.as_str())
 }
 
+/// `path` made absolute with every symbolic link resolved, including a dangling link for the last component (its
+/// target is where a new file would be created) and `..` after directories that do not exist yet (resolved
+/// lexically: they cannot be links). At most 40 links are followed.
+pub fn resolve(path: &Path) -> std::io::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut budget = 40;
+    resolve_links(&absolute, &mut budget)
+}
+
+fn resolve_links(path: &Path, budget: &mut u32) -> std::io::Result<PathBuf> {
+    use std::path::Component;
+    // `out` stays canonical for its existing part, so `..` can pop it.
+    let mut out = PathBuf::from("/");
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::Prefix(_) => out = PathBuf::from("/"),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Normal(name) => {
+                let next = out.join(name);
+                match std::fs::symlink_metadata(&next) {
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        if *budget == 0 {
+                            return Err(std::io::Error::other("too many levels of symbolic links"));
+                        }
+                        *budget -= 1;
+                        let target = std::fs::read_link(&next)?;
+                        out = resolve_links(&out.join(target), budget)?;
+                    }
+                    Ok(_) => out = next,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => out = next,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// The deepest existing directory at or above `path`, canonicalised (a database directory that does not exist yet
 /// lies on the same file system as it).
 pub fn existing_ancestor(path: &Path) -> std::io::Result<PathBuf> {
@@ -169,6 +214,24 @@ mod tests {
                 fstype: "ext4".to_owned()
             }]
         );
+    }
+
+    #[test]
+    fn resolve_follows_links_and_dangling_links() -> std::io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().canonicalize()?;
+        std::fs::create_dir_all(root.join("a/b"))?;
+        std::os::unix::fs::symlink("a/b", root.join("ab"))?;
+        std::os::unix::fs::symlink(root.join("target/file"), root.join("dangling"))?;
+        std::os::unix::fs::symlink("loop", root.join("loop"))?;
+        assert_eq!(resolve(&root.join("ab/x/../y"))?, root.join("a/b/y"));
+        assert_eq!(resolve(&root.join("dangling"))?, root.join("target/file"));
+        assert_eq!(
+            resolve(&root.join("missing/../../z"))?,
+            root.parent().unwrap_or(&root).join("z")
+        );
+        assert!(resolve(&root.join("loop/x")).is_err());
+        Ok(())
     }
 
     #[test]

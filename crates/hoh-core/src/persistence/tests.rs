@@ -11,6 +11,14 @@ fn db_in(dir: &tempfile::TempDir) -> PathBuf {
     dir.path().join(".hoh/state.db")
 }
 
+/// Options for stores opened by these tests.
+fn test_options() -> Options {
+    Options {
+        wal_probe: Some(selftest::test_probe(None)),
+        ..Options::default()
+    }
+}
+
 /// A store whose writer has `fault` injected.
 fn store_with(path: &Path, options: Options, fault: Fault) -> Result<Store, PersistError> {
     std::fs::create_dir_all(path.parent().unwrap_or(Path::new(".")))
@@ -83,7 +91,7 @@ fn snapshot(path: &Path) -> Result<(String, i64, i64, i64), Box<dyn std::error::
 async fn opening_creates_a_migrated_database_with_verified_settings() -> R {
     let dir = tempfile::tempdir()?;
     let path = db_in(&dir);
-    let store = Store::open(&path, Options::default())?;
+    let store = Store::open(&path, test_options())?;
     let reader = store.reader()?;
     let expected = Pragmas {
         journal_mode: "wal".to_owned(),
@@ -123,15 +131,15 @@ async fn opening_creates_a_migrated_database_with_verified_settings() -> R {
 async fn reopening_keeps_the_schema_and_a_newer_one_is_refused() -> R {
     let dir = tempfile::tempdir()?;
     let path = db_in(&dir);
-    drop(Store::open(&path, Options::default())?);
-    let store = Store::open(&path, Options::default())?;
+    drop(Store::open(&path, test_options())?);
+    let store = Store::open(&path, test_options())?;
     let applied: i64 = store
         .reader()?
         .with(|c| c.query_row("SELECT count(*) FROM schema_migrations", [], |r| r.get(0)))?;
     assert_eq!(applied, 1, "migration 1 ran once");
     drop(store);
     Connection::open(&path)?.pragma_update(None, "user_version", 2)?;
-    match Store::open(&path, Options::default()) {
+    match Store::open(&path, test_options()) {
         Err(PersistError::SchemaTooNew {
             found: 2,
             supported: 1,
@@ -144,10 +152,10 @@ async fn reopening_keeps_the_schema_and_a_newer_one_is_refused() -> R {
 async fn a_failing_migration_is_rolled_back() -> R {
     let dir = tempfile::tempdir()?;
     let path = db_in(&dir);
-    drop(Store::open(&path, Options::default())?);
+    drop(Store::open(&path, test_options())?);
     let broken = "BEGIN; CREATE TABLE extra(x); INSERT INTO missing VALUES (1); PRAGMA user_version = 2; COMMIT;";
     let migrations = [MIGRATIONS[0], (2, broken)];
-    match Store::open_checked(&path, Options::default(), &migrations) {
+    match Store::open_checked(&path, test_options(), &migrations) {
         Err(PersistError::Migration { version: 2, .. }) => {}
         other => return Err(format!("{other:?}").into()),
     }
@@ -159,21 +167,46 @@ async fn a_failing_migration_is_rolled_back() -> R {
         |r| r.get(0),
     )?;
     assert_eq!((version, extra), (1, 0));
-    // A script that runs but does not set its version is a failure too.
+    // A script that runs but does not set its version is a failure too, and leaves no schema change (M2T01R-05).
     let silent = [MIGRATIONS[0], (2, "BEGIN; CREATE TABLE extra(x); COMMIT;")];
-    match Store::open_checked(&path, Options::default(), &silent) {
+    match Store::open_checked(&path, test_options(), &silent) {
         Err(PersistError::Migration { version: 2, detail }) => {
             assert!(detail.contains("user_version is 1"), "{detail}")
         }
         other => return Err(format!("{other:?}").into()),
     }
+    let schema = |path: &Path| -> Result<(i64, i64), Box<dyn std::error::Error>> {
+        let conn = Connection::open(path)?;
+        let version = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        let extra = conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name = 'extra'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok((version, extra))
+    };
+    assert_eq!(
+        schema(&path)?,
+        (1, 0),
+        "the failed migration left schema changes"
+    );
+    // Once fixed, the same migration applies.
+    let fixed = [
+        MIGRATIONS[0],
+        (
+            2,
+            "BEGIN; CREATE TABLE extra(x); PRAGMA user_version = 2; COMMIT;",
+        ),
+    ];
+    drop(Store::open_checked(&path, test_options(), &fixed)?);
+    assert_eq!(schema(&path)?, (2, 1));
     Ok(())
 }
 
 #[test]
 fn a_connection_with_a_wrong_setting_is_refused() -> R {
     let dir = tempfile::tempdir()?;
-    let options = Options::default();
+    let options = test_options();
     let wal = |name: &str| -> Result<Connection, Box<dyn std::error::Error>> {
         let conn = Connection::open(dir.path().join(name))?;
         configure(&conn, &options, true)?;
@@ -205,7 +238,7 @@ fn a_connection_with_a_wrong_setting_is_refused() -> R {
 async fn state_event_and_outbox_commit_together() -> R {
     let dir = tempfile::tempdir()?;
     let path = db_in(&dir);
-    let store = Store::open(&path, Options::default())?;
+    let store = Store::open(&path, test_options())?;
     seed(&path)?;
     let done = store
         .commit(Commit {
@@ -245,7 +278,7 @@ async fn state_event_and_outbox_commit_together() -> R {
 async fn any_violation_rolls_back_the_whole_commit() -> R {
     let dir = tempfile::tempdir()?;
     let path = db_in(&dir);
-    let store = Store::open(&path, Options::default())?;
+    let store = Store::open(&path, test_options())?;
     seed(&path)?;
     store
         .commit(Commit {
@@ -341,7 +374,7 @@ async fn a_locked_database_is_busy_and_changes_nothing() -> R {
     let path = db_in(&dir);
     let options = Options {
         busy_timeout: Duration::from_millis(300),
-        ..Options::default()
+        ..test_options()
     };
     let store = Store::open(&path, options)?;
     seed(&path)?;
@@ -387,6 +420,7 @@ async fn a_full_queue_holds_callers_back_and_loses_nothing() -> R {
     let options = Options {
         busy_timeout: Duration::from_millis(200),
         queue: 1,
+        ..test_options()
     };
     let store = std::sync::Arc::new(store_with(
         &path,
@@ -439,7 +473,7 @@ const CRASH_DB: &str = "HOH_TEST_CRASH_DB";
 async fn a_crash_inside_a_transaction_leaves_no_partial_commit() -> R {
     let dir = tempfile::tempdir()?;
     let path = db_in(&dir);
-    drop(Store::open(&path, Options::default())?);
+    drop(Store::open(&path, test_options())?);
     seed(&path)?;
     let before = snapshot(&path)?;
     // The child is this test binary running only `crash_child`, which aborts inside the transaction.
@@ -465,7 +499,7 @@ async fn a_crash_inside_a_transaction_leaves_no_partial_commit() -> R {
         Connection::open(&path)?.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
     assert_eq!(check, "ok");
     // A store opened afterwards commits normally.
-    let store = Store::open(&path, Options::default())?;
+    let store = Store::open(&path, test_options())?;
     store
         .commit(Commit {
             cas: vec![cas(0, "DISCOVERING")],
@@ -484,11 +518,7 @@ async fn crash_child() -> R {
     let Some(path) = std::env::var_os(CRASH_DB) else {
         return Ok(());
     };
-    let store = store_with(
-        Path::new(&path),
-        Options::default(),
-        Fault::AbortAfterEvents,
-    )?;
+    let store = store_with(Path::new(&path), test_options(), Fault::AbortAfterEvents)?;
     let _ = store
         .commit(Commit {
             cas: vec![cas(0, "DISCOVERING")],
@@ -500,6 +530,49 @@ async fn crash_child() -> R {
 }
 
 #[test]
+fn links_and_parent_components_are_resolved_before_the_location_check() -> R {
+    // M2T01R-01: the check must look at where the database really goes, not at the path as written.
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().canonicalize()?;
+    std::fs::create_dir_all(root.join("local"))?;
+    std::fs::create_dir_all(root.join("network"))?;
+    let mountinfo = format!(
+        "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n2 1 0:50 / {} rw,relatime - nfs4 server:/export rw\n",
+        root.join("network").display()
+    );
+    // A dangling link for the database file itself, and a linked directory.
+    std::os::unix::fs::symlink(root.join("network/state.db"), root.join("local/state.db"))?;
+    std::os::unix::fs::symlink("../network", root.join("local/linked"))?;
+    for path in [
+        root.join("local/state.db"),
+        root.join("local/linked/.hoh/state.db"),
+        root.join("local/missing/../../network/state.db"),
+    ] {
+        match Store::open_with_mountinfo(&path, test_options(), &mountinfo) {
+            Err(PersistError::OnNetworkFs { fstype, .. }) => {
+                assert_eq!(fstype, "nfs4", "{}", path.display())
+            }
+            other => return Err(format!("{}: {other:?}", path.display()).into()),
+        }
+    }
+    let created: Vec<_> = std::fs::read_dir(root.join("network"))?.collect();
+    assert!(
+        created.is_empty(),
+        "files were created on the network mount: {created:?}"
+    );
+    assert!(!root.join("local/missing").exists());
+    // The same kind of link to local storage is followed: the database is created at the link's target.
+    std::fs::remove_file(root.join("local/state.db"))?;
+    std::fs::create_dir_all(root.join("elsewhere"))?;
+    std::os::unix::fs::symlink(root.join("elsewhere/state.db"), root.join("local/state.db"))?;
+    let store =
+        Store::open_with_mountinfo(&root.join("local/state.db"), test_options(), &mountinfo)?;
+    assert_eq!(store.path(), root.join("elsewhere/state.db"));
+    assert!(root.join("elsewhere/state.db").exists());
+    Ok(())
+}
+
+#[test]
 fn a_database_on_a_network_file_system_is_refused_before_any_file_exists() -> R {
     let dir = tempfile::tempdir()?;
     let root = dir.path().canonicalize()?;
@@ -508,7 +581,7 @@ fn a_database_on_a_network_file_system_is_refused_before_any_file_exists() -> R 
         root.display()
     );
     let path = root.join("project/.hoh/state.db");
-    match Store::open_with_mountinfo(&path, Options::default(), &mountinfo) {
+    match Store::open_with_mountinfo(&path, test_options(), &mountinfo) {
         Err(e @ PersistError::OnNetworkFs { .. }) => {
             assert_eq!(e.error_code(), Some(ErrorCode::DbOnNetworkFs));
             assert!(e.to_string().contains("DB_ON_NETWORK_FS"), "{e}");
