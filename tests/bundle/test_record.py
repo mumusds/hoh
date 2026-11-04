@@ -181,6 +181,14 @@ if mode=='subcgroup':
         for n in (0,1,2):os.dup2(fd,n)
         open(sys.argv[2],'w').write(str(os.getpid()));time.sleep(30);os._exit(0)
     time.sleep(0.3);sys.exit(0)
+if mode=='unlistable':
+    own='/sys/fs/cgroup'+open('/proc/self/cgroup').read().strip().rsplit(':',1)[-1]
+    if os.fork()==0:
+        os.chmod(own,0o111)  # the scope directory can still be traversed but no longer listed
+        fd=os.open(os.devnull,os.O_RDWR)
+        for n in (0,1,2):os.dup2(fd,n)
+        open(sys.argv[2],'w').write(str(os.getpid()));time.sleep(30);os._exit(0)
+    time.sleep(0.3);sys.exit(0)
 if mode=='escape-quiet':
     if os.fork()==0:
         os.setsid();fd=os.open(os.devnull,os.O_RDWR)
@@ -328,6 +336,11 @@ class BoundedStop(unittest.TestCase):
         p=self.proc('subcgroup');how=p.stop(grace=5,descendant_grace=0.3)
         self.assertEqual(how,'exited+descendants-outlived');self.assertEqual(len(how.descendants),1);self.assertFalse(self.escaped_alive())
         self.assertFalse(record.populated(p.cgroup))
+    def test_unlistable_scope_fails_instead_of_looking_empty(self):
+        # M0R12-01: an error listing the scope tree is not an empty member list; the stop fails, the scope is still cleaned.
+        p=self.proc('unlistable')
+        with self.assertRaises(PermissionError):p.stop(grace=5,descendant_grace=0.3)
+        self.assertFalse(self.escaped_alive());self.assertFalse(record.populated(p.cgroup));self.assertNotIn(p,record.LIVE)
     def test_unrelated_children_survive(self):
         # M0R5-06: only processes started by the stopped Proc (carrying its token) are killed.
         other=subprocess.Popen(['sleep','30']);self.addCleanup(lambda:(other.kill(),other.wait()))
