@@ -14,10 +14,10 @@
   ],
   "cwd": "fresh temp Git repo outside the checkout",
   "exit_code": 0,
-  "recorded_at": "2026-11-03T23:40:43.313853+00:00",
+  "recorded_at": "2026-11-04T00:02:02.037105+00:00",
   "mode": "live",
   "notes": "second turn via --resume",
-  "resumed_session_id": "2865e2c6-4e23-45a9-a7b4-ff062d4726a1",
+  "resumed_session_id": "b38159a5-bf99-420a-b265-93cb773cc9a1",
   "stopped": "exited",
   "valid": true,
   "problems": []

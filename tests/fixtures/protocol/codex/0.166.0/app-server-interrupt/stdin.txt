@@ -1,5 +1,5 @@
 {"method": "initialize", "id": 0, "params": {"clientInfo": {"name": "hoh-recorder", "version": "0.0.0"}}}
 {"method": "initialized"}
 {"method": "thread/start", "id": 1, "params": {"approvalPolicy": "never", "sandbox": "danger-full-access"}}
-{"method": "turn/start", "id": 2, "params": {"threadId": "01a1a3ca-c9b2-7890-aa14-0828ddde4e95", "input": [{"type": "text", "text": "Run this exact shell command and wait for it to finish: for i in $(seq 1 30); do echo tick $i; sleep 2; done. Then reply DONE."}]}}
-{"method": "turn/interrupt", "id": 3, "params": {"threadId": "01a1a3ca-c9b2-7890-aa14-0828ddde4e95", "turnId": "01a1a3ca-c9c8-7031-a71e-ad9718ab4479"}}
+{"method": "turn/start", "id": 2, "params": {"threadId": "01a1a3de-659b-7e02-be49-9db6f06afad9", "input": [{"type": "text", "text": "Run this exact shell command and wait for it to finish: for i in $(seq 1 30); do echo tick $i; sleep 2; done. Then reply DONE."}]}}
+{"method": "turn/interrupt", "id": 3, "params": {"threadId": "01a1a3de-659b-7e02-be49-9db6f06afad9", "turnId": "01a1a3de-65b1-73a2-addd-e2b59fb1719c"}}

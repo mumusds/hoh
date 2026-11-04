@@ -1,4 +1,4 @@
-{"type":"thread.started","thread_id":"01a1a3ca-2bce-7e00-b813-6d1198f21cba"}
+{"type":"thread.started","thread_id":"01a1a3dd-bc62-73d3-8571-d9f688326c37"}
 {"type":"item.completed","item":{"id":"item_0","type":"error","message":"Model metadata for `hoh-invalid-model` not found. Defaulting to fallback metadata; this can degrade performance and cause issues."}}
 {"type":"turn.started"}
 {"type":"error","message":"The 'hoh-invalid-model' model is not supported when using Codex with a ChatGPT account."}

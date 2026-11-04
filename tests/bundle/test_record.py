@@ -196,6 +196,16 @@ class BoundedStop(unittest.TestCase):
         return p
     def timed_stop(self,p,**kw):
         t=time.monotonic();how=p.stop(**kw);return how,time.monotonic()-t
+    def test_child_that_exits_right_after_entering_its_scope(self):
+        # Live run: `git init` entered its scope and exited before a second read of cgroup.procs; that is not a failure.
+        real=record.members;seen={'entered':False}
+        def once(cg):
+            got=real(cg)
+            if seen['entered']:return []
+            if got:seen['entered']=True
+            return got
+        with patch.object(record,'members',side_effect=once):p=self.proc('sleep')
+        self.assertTrue(seen['entered']);p.terminate()
     def test_exits_on_stdin_close(self):
         p=self.proc('exit-on-eof');how,_=self.timed_stop(p,grace=10);self.assertEqual(how,'exited');self.assertEqual(p.out,b'bye\n');self.assertEqual(p.returncode,0)
     def test_term_escalation(self):
@@ -252,10 +262,35 @@ class BoundedStop(unittest.TestCase):
         p=self.proc('exit-on-eof')
         with patch.object(record,'members',side_effect=lambda cg:[999999]):how=p.stop(grace=5,descendant_grace=0)
         self.assertEqual(how,'exited');self.assertEqual(how.descendants,[])
-    def test_forced_kill_reports_what_it_froze(self):
-        # Members are read while the scope is frozen, so nothing can exit between the snapshot and the kill.
+    def test_forced_kill_reports_what_it_signalled(self):
         p=self.proc('escape-quiet');how=p.stop(grace=5,descendant_grace=0.2)
         self.assertEqual(how,'exited+descendants-killed');self.assertEqual(len(how.descendants),1);self.assertFalse(self.escaped_alive())
+    def test_exit_between_listing_and_kill_is_not_counted(self):
+        # M0R9-02: a member listed while the scope looked populated but gone when signalled was not killed by us.
+        p=self.proc('exit-on-eof');gone=subprocess.Popen(['true']);gone.wait()
+        real=record.populated;calls={'n':0}
+        def stale(cg):
+            calls['n']+=1;return True if calls['n']==1 else real(cg)
+        with patch.object(record,'members',side_effect=lambda cg:[gone.pid]),patch.object(record,'populated',side_effect=stale):
+            how=p.stop(grace=5,descendant_grace=0)
+        self.assertEqual(how,'exited');self.assertEqual(how.descendants,[])
+    def test_cleanup_without_cgroup_kill(self):
+        # M0R9-01: an unusable cgroup control file is not taken for an empty scope; members are killed one by one.
+        real=record.write_control
+        def no_kill(cg,name,value):
+            if name=='cgroup.kill':raise FileNotFoundError(2,'No such file or directory')
+            return real(cg,name,value)
+        p=self.proc('escape-quiet')
+        with patch.object(record,'write_control',side_effect=no_kill):how=p.stop(grace=5,descendant_grace=0.2)
+        self.assertEqual(how,'exited+descendants-killed');self.assertFalse(self.escaped_alive())
+        self.assertFalse(record.populated(p.cgroup));self.assertNotIn(p,record.LIVE)
+    def test_unkillable_scope_keeps_the_child_registered(self):
+        def no_kill(cg,name,value):raise FileNotFoundError(2,'No such file or directory')
+        p=self.proc('escape-quiet')
+        with patch.object(record,'write_control',side_effect=no_kill),patch.object(record,'kill_pid',return_value=False),\
+             patch.object(record,'CONFIRM_SECONDS',0.5):
+            with self.assertRaises(RuntimeError):p.stop(grace=5,descendant_grace=0.2,kill_grace=0.5)
+        self.assertIn(p,record.LIVE);self.assertTrue(self.escaped_alive());p.terminate();self.assertFalse(self.escaped_alive())
     def test_terminate_survives_cleanup_errors(self):
         # M0R7-02: an error inside terminate() must not skip the kill, the wait or the confirmation.
         p=self.proc('ignore-term');time.sleep(0.3)

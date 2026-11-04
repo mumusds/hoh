@@ -151,6 +151,28 @@ def members(cgroup: Path) -> list[int]:
         raise
 
 
+def write_control(cgroup: Path, name: str, value: str) -> None:
+    (cgroup / name).write_text(value)
+
+
+def kill_pid(pid: int) -> bool:
+    """SIGKILL one process through a pidfd (no PID-reuse race); True only if it was still running when signalled,
+    so a process that already exited on its own is never counted as killed (M0R9-02)."""
+    if not alive(pid):
+        return False
+    try:
+        fd = os.pidfd_open(pid)
+    except ProcessLookupError:
+        return False
+    try:
+        signal.pidfd_send_signal(fd, signal.SIGKILL)
+        return True
+    except ProcessLookupError:
+        return False
+    finally:
+        os.close(fd)
+
+
 class Stopped(str):
     """How a child ended (exited, SIGTERM, ...), with the command lines of descendants that outlived it: `lingered`
     ended by themselves within the grace period, `descendants` were still running and had to be killed."""
@@ -182,6 +204,7 @@ class Proc:
         self.close_requested = False
         self.descendants: list[str] = []  # command lines of descendants killed by stop()
         self.lingered: list[str] = []  # descendants that outlived the child but ended on their own
+        self.forced = False  # the cgroup.kill backstop had to end processes that were not attributed
         self.sel = selectors.DefaultSelector()
         # Signals stay blocked until the child is registered and inside its scope, so an interrupt is handled only
         # once stop_all() can find and kill it (M0R5-01); the child resets them before exec.
@@ -196,9 +219,12 @@ class Proc:
             self.sel.register(self.p.stdout, selectors.EVENT_READ)
             self.sel.register(self.p.stderr, selectors.EVENT_READ)
             deadline = time.monotonic() + 30
-            while self.p.poll() is None and self.p.pid not in members(self.cgroup) and time.monotonic() < deadline:
-                time.sleep(0.005)
-            if self.p.poll() is None and self.p.pid not in members(self.cgroup):
+            entered = False  # judged on one observation: a quick child may leave the scope right after entering it
+            while not entered and self.p.poll() is None and time.monotonic() < deadline:
+                entered = self.p.pid in members(self.cgroup)
+                if not entered:
+                    time.sleep(0.005)
+            if not entered and self.p.poll() is None:
                 self.terminate()
                 raise RuntimeError(f'{argv[0]} did not enter its scope {self.unit} within 30 s')
         finally:
@@ -287,37 +313,43 @@ class Proc:
             pass
 
     def force_kill(self, wait: float) -> list[int]:
-        """Freeze the scope, read its members, kill them all and wait until it is empty. Frozen processes cannot exit
-        by themselves, so the returned descendants (the child excluded) are exactly those killed here (M0R8-02).
-        Without a usable cgroup.freeze the snapshot is taken just before the kill."""
-        try:
-            (self.cgroup / 'cgroup.freeze').write_text('1')
-            deadline = time.monotonic() + 1
-            while 'frozen 1' not in self.events() and populated(self.cgroup) and time.monotonic() < deadline:
-                time.sleep(0.005)
-        except OSError as exc:
-            if exc.errno in GONE:
-                return []
-        victims = [pid for pid in members(self.cgroup) if pid != self.p.pid]
-        self.descendants += [cmdline(pid) for pid in victims]
-        self.kill_tree()
+        """Kill everything in the scope and wait until the kernel reports it empty; returns the descendants (the child
+        excluded) this killed. Members are killed one by one through pidfds, rescanning until none is left, so only
+        processes still running when signalled are reported (M0R9-02); cgroup.kill is the backstop for a tree that
+        forks faster than that. Raises when the scope cannot be confirmed empty."""
+        killed: list[int] = []
+        deadline = time.monotonic() + min(wait, 1.0)
+        while populated(self.cgroup) and time.monotonic() < deadline:
+            for pid in members(self.cgroup):
+                command = cmdline(pid)
+                if kill_pid(pid) and pid != self.p.pid:
+                    killed.append(pid)
+                    self.descendants.append(command)
+            time.sleep(0.01)
+        if populated(self.cgroup):
+            self.forced = True
+            self.kill_tree()
         if not self.settle(wait):
-            raise RuntimeError(f'scope {self.unit} still has processes after cgroup.kill: {members(self.cgroup)}')
-        return victims
-
-    def events(self) -> str:
-        try:
-            return (self.cgroup / 'cgroup.events').read_text()
-        except OSError:
-            return ''
+            raise RuntimeError(f'scope {self.unit} still has processes after killing them: {members(self.cgroup)}')
+        return killed
 
     def kill_tree(self) -> None:
-        """SIGKILL every process in the scope at once, the child included; the kernel admits no new member meanwhile."""
+        """SIGKILL every process in the scope at once, the child included (cgroup.kill). If that control file cannot be
+        written, the members are killed one by one instead; the scope is never assumed empty here (M0R9-01), callers
+        confirm it with populated()/settle()."""
         try:
-            (self.cgroup / 'cgroup.kill').write_text('1')
+            write_control(self.cgroup, 'cgroup.kill', '1')
+            return
         except OSError as exc:
-            if exc.errno not in GONE:  # otherwise already empty and collected
-                raise
+            if not populated(self.cgroup):
+                return
+            print(f'warning: cgroup.kill unusable for {self.unit} ({exc}); killing its members one by one', file=sys.stderr)
+        for _ in range(100):
+            if not populated(self.cgroup):
+                return
+            for pid in members(self.cgroup):
+                kill_pid(pid)
+            time.sleep(0.01)
 
     def drain(self, wait: float) -> bool:
         """Write and read until stdin is done, stdout/stderr close and the child exits, at most `wait` s."""
@@ -350,10 +382,12 @@ class Proc:
         self.close_requested = True
         try:
             result = self.stop_gracefully(grace, term_grace, kill_grace, descendant_grace)
+            if self.p.returncode is None or populated(self.cgroup):
+                raise RuntimeError(f'could not confirm that scope {self.unit} is empty: members {members(self.cgroup)}')
         except BaseException:
             self.terminate()
             raise
-        LIVE.discard(self)
+        LIVE.discard(self)  # only once the scope is empty and the child reaped (M0R9-01)
         return result
 
     def stop_gracefully(self, grace: float, term_grace: float, kill_grace: float, descendant_grace: float) -> Stopped:
@@ -380,7 +414,7 @@ class Proc:
             time.sleep(0.05)
         if populated(self.cgroup):
             killed += self.force_kill(kill_grace)
-        if killed:  # only what a forced kill actually ended (M0R8-02)
+        if killed or self.forced:  # only what a forced kill actually ended (M0R8-02, M0R9-02)
             how += '+descendants-killed'
         self.lingered = [cmd for pid, cmd in seen.items() if pid not in killed and pid != self.p.pid]
         if not finished and not self.drain(kill_grace):
