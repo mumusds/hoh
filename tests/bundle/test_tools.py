@@ -414,6 +414,12 @@ class PersistenceScan(unittest.TestCase):
                                           '#[cfg(test)]\nmod e\u0301 { fn t() { assert_eq!(["SQL", "ite"].concat(), "SQLite"); } }'}
         rc,res=self.run_scan(ok)
         self.assertEqual((rc,res['hits']),(0,[]))
+        # M2T01R-73: `count != { … }` compares; its block is no macro input.
+        ne={'crates/hoh-app/src/main.rs':'fn main() {\n    let count = 1;\n    let _ = count != {\n'
+                                          '        #[cfg(test)]\n        mod tests { fn t() { assert_eq!(["SQL", "ite"].concat(), "SQLite"); } }\n'
+                                          '        #[doc = "Uses SQLite only through persistence."]\n        fn g() {}\n        1\n    };\n}'}
+        rc,res=self.run_scan(ne)
+        self.assertEqual((rc,res['hits']),(0,[]))
     def test_only_real_inline_cfg_test_modules_are_test_code(self):
         # M2T01R-67: module files are never exempt (resolving them misjudged a file the product compiles); M2T01R-68:
         # #[cfg(test)] handed to a macro is its input; other predicates are product code.

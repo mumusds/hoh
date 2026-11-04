@@ -9,7 +9,7 @@ cargo fmt --all -- --check
 unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS CARGO_BUILD_RUSTC RUSTC CLIPPY_ARGS
 # An empty wrapper variable overrides a wrapper set in any cargo configuration; such configuration is also refused by
 # the scan below (M2T01R-30).
-export RUSTC_WRAPPER= CARGO_BUILD_RUSTC_WRAPPER= RUSTC_WORKSPACE_WRAPPER= CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER=
+export RUSTC_WRAPPER='' CARGO_BUILD_RUSTC_WRAPPER='' RUSTC_WORKSPACE_WRAPPER='' CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER=''
 for var in $(compgen -e); do
   if [[ "$var" =~ ^CARGO_TARGET_.*_RUSTFLAGS$ || "$var" =~ ^CARGO_PROFILE_ ]]; then unset "$var"; fi
 done

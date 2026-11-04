@@ -280,12 +280,15 @@ def macro_spans(code: str) -> list[tuple[int, int, str]]:
         start, name, raw = identifier_before(code, k)
         if not name or (name in KEYWORDS and not raw):
             continue
-        rest = re.match(r'\s*(?:((?:r#)?[^\s(\[{;]+?)\s*)?([(\[{])', code[j + 1:])
+        # An invocation has its delimiter right after `!`, so `count != { … }` compares (M2T01R-73); only a plain
+        # `macro_rules!` followed by an identifier defines a macro, and `r#macro_rules!(…)` invokes one (M2T01R-71).
+        after = code[j + 1:]
+        named = re.match(r'\s*(r#)?([^\s(\[{;!=]+)\s*([(\[{])', after) if name == 'macro_rules' and not raw else None
+        definition = bool(named and named.group(2).isidentifier())
+        rest = named if definition else re.match(r'\s*([(\[{])', after)
         if not rest:
             continue
-        # Only a plain `macro_rules!` followed by a name defines a macro; `r#macro_rules!(…)` invokes one (M2T01R-71).
-        definition = name == 'macro_rules' and not raw and bool(rest.group(1))
-        opening = rest.group(2)
+        opening = rest.group(rest.lastindex)
         closing, depth, i = pairs[opening], 0, j + 1 + rest.end() - 1
         while i < len(code):
             depth += 1 if code[i] == opening else -1 if code[i] == closing else 0
