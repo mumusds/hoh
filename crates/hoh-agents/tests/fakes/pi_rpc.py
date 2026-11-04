@@ -11,7 +11,7 @@ place of the recorded session id.
 
 Pseudo-records (not sent as such): {"hoh_wait": {"command": T, "count": N}} waits until N commands of type T came;
 {"hoh_batch": [R, ...]} sends records in one write; {"hoh_split": [R, N]} sends R in N writes; {"hoh_stderr": BYTES}
-writes that many bytes to stderr; {"hoh_hold": PATH} waits until PATH exists; {"hoh_exit": CODE} exits at once.
+writes that many bytes to stderr; {"hoh_hold": PATH} waits until PATH exists; {"hoh_exit": CODE} exits at once; a {"hoh_keep_session": true} anywhere keeps the recorded session id.
 LOGDIR gets received.jsonl (every client line) and sent.jsonl (the bytes sent). Records are split on LF only:
 str.splitlines() would also split on U+2028/U+2029 inside JSON strings, which is what this fake exists to test.
 """
@@ -30,7 +30,9 @@ def main() -> int:
     ordinal = {cid: [c for c, t in recorded.items() if t == kind].index(cid) for cid, kind in recorded.items()}
     text = Path(frames_path).read_text(encoding='utf-8')
     session_id = argv[argv.index('--session-id') + 1] if '--session-id' in argv else None
-    if session_id:
+    keep = '"hoh_keep_session"' in text  # a pi that reports another session than the one asked for
+    text = '\n'.join(l for l in text.split('\n') if '"hoh_keep_session"' not in l)
+    if session_id and not keep:
         old = next((json.loads(l)['data']['sessionId'] for l in text.split('\n')
                     if l.strip() and json.loads(l).get('command') == 'get_state' and 'data' in json.loads(l)), None)
         if old:
