@@ -1,0 +1,23 @@
+{
+  "agent": "claude",
+  "cli_version": "2.1.318",
+  "case": "max-turns-error",
+  "argv": [
+    "claude",
+    "-p",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--dangerously-skip-permissions",
+    "--max-turns",
+    "1"
+  ],
+  "cwd": "fresh temp Git repo outside the checkout",
+  "exit_code": 1,
+  "recorded_at": "2026-11-04T00:38:06.337194+00:00",
+  "mode": "live",
+  "notes": "tool use needs a second turn",
+  "stopped": "exited",
+  "valid": true,
+  "problems": []
+}

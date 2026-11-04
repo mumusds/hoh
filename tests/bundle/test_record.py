@@ -172,6 +172,15 @@ if mode=='version-probe':
         for n in (0,1,2):os.dup2(fd,n)
         open(sys.argv[2],'w').write(str(os.getpid()));time.sleep(30);os._exit(0)
     print('9.9.9');sys.stdout.flush();sys.exit(0) if len(sys.argv)<4 else time.sleep(30)
+if mode=='subcgroup':
+    own='/sys/fs/cgroup'+open('/proc/self/cgroup').read().strip().rsplit(':',1)[-1]
+    worker=os.path.join(own,'worker');os.mkdir(worker)
+    if os.fork()==0:
+        open(os.path.join(worker,'cgroup.procs'),'w').write(str(os.getpid()))  # into a child cgroup of the scope
+        fd=os.open(os.devnull,os.O_RDWR)
+        for n in (0,1,2):os.dup2(fd,n)
+        open(sys.argv[2],'w').write(str(os.getpid()));time.sleep(30);os._exit(0)
+    time.sleep(0.3);sys.exit(0)
 if mode=='escape-quiet':
     if os.fork()==0:
         os.setsid();fd=os.open(os.devnull,os.O_RDWR)
@@ -314,6 +323,11 @@ class BoundedStop(unittest.TestCase):
         old=signal.signal(signal.SIGINT,signal.SIG_IGN);self.addCleanup(signal.signal,signal.SIGINT,old)
         out,err,rc,how=record.run([sys.executable,str(self.script),'dispositions','-'],b'',self.dir,timeout=10)
         self.assertEqual(json.loads(out),{'SIGINT':str(signal.default_int_handler),'SIGTERM':str(signal.SIG_DFL),'SIGHUP':str(signal.SIG_DFL)})
+    def test_descendant_in_a_child_cgroup_outlives(self):
+        # M0R11-01: the deadline observation covers the whole scope subtree, like cgroup.events and cgroup.kill.
+        p=self.proc('subcgroup');how=p.stop(grace=5,descendant_grace=0.3)
+        self.assertEqual(how,'exited+descendants-outlived');self.assertEqual(len(how.descendants),1);self.assertFalse(self.escaped_alive())
+        self.assertFalse(record.populated(p.cgroup))
     def test_unrelated_children_survive(self):
         # M0R5-06: only processes started by the stopped Proc (carrying its token) are killed.
         other=subprocess.Popen(['sleep','30']);self.addCleanup(lambda:(other.kill(),other.wait()))

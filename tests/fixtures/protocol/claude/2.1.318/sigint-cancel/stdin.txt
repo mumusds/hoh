@@ -1,0 +1,1 @@
+Run this exact command with the Bash tool in the foreground (not in the background) and wait for it to finish: `for i in $(seq 1 20); do echo tick $i; sleep 2; done`. Then reply DONE.

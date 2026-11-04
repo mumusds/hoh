@@ -1,0 +1,24 @@
+{
+  "agent": "claude",
+  "cli_version": "2.1.318",
+  "case": "resume",
+  "argv": [
+    "claude",
+    "-p",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--dangerously-skip-permissions",
+    "--resume",
+    "<session_id of success>"
+  ],
+  "cwd": "fresh temp Git repo outside the checkout",
+  "exit_code": 0,
+  "recorded_at": "2026-11-04T00:38:02.726127+00:00",
+  "mode": "live",
+  "notes": "second turn via --resume",
+  "resumed_session_id": "9fcce4a1-63e8-446f-ad6d-45dea24dd915",
+  "stopped": "exited",
+  "valid": true,
+  "problems": []
+}
