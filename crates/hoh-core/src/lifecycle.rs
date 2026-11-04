@@ -1,4 +1,4 @@
-//! The single transition table of Run, Task and Attempt states (REQ-036, docs/adr/ADR-011.md §1). Every state change
+//! The single transition table of Run, Task, Attempt and input states (REQ-036, docs/adr/ADR-011.md §1). Every state change
 //! the product makes is checked against it: the persistence writer refuses an illegal compare-and-set, and Commander
 //! proposals are validated against it before they are applied ([`crate::decision`]).
 
@@ -29,6 +29,22 @@ impl AllVariants for AttemptState {
         Self::Cancelled,
         Self::UnknownEffect,
     ];
+}
+
+/// Input queue states (`input_queue.state`, docs/06-orchestration.md): QUEUED -> DELIVERED -> APPLIED/REJECTED.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum InputState {
+    Queued,
+    /// The agent took it (an ACK only means arrival).
+    Delivered,
+    /// The agent acted on it.
+    Applied,
+    Rejected,
+}
+
+impl AllVariants for InputState {
+    const ALL: &'static [Self] = &[Self::Queued, Self::Delivered, Self::Applied, Self::Rejected];
 }
 
 /// One state machine of the table.
@@ -291,6 +307,29 @@ impl Lifecycle for TaskState {
             Self::Accepted => "ACCEPTED",
             Self::Blocked => "BLOCKED",
             Self::Cancelled => "CANCELLED",
+        }
+    }
+}
+
+impl Lifecycle for InputState {
+    const MACHINE: &'static str = "input";
+
+    fn successors(self) -> &'static [Self] {
+        use InputState::*;
+        match self {
+            // A queued input may be refused before it is delivered (e.g. a steer for a turn that is no longer active).
+            Queued => &[Delivered, Rejected],
+            Delivered => &[Applied, Rejected],
+            Applied | Rejected => &[],
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "QUEUED",
+            Self::Delivered => "DELIVERED",
+            Self::Applied => "APPLIED",
+            Self::Rejected => "REJECTED",
         }
     }
 }

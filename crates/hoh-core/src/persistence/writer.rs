@@ -20,6 +20,8 @@ pub enum Entity {
     Task,
     /// Moved with `AttemptMove` (the attempts table has no revision column).
     Attempt,
+    /// An `input_queue` row, moved with `InputMove` (no revision column either).
+    Input,
 }
 
 impl Entity {
@@ -28,6 +30,7 @@ impl Entity {
             Entity::Run => ("runs", "run_id"),
             Entity::Task => ("tasks", "task_id"),
             Entity::Attempt => ("attempts", "attempt_id"),
+            Entity::Input => ("input_queue", "input_id"),
         }
     }
 }
@@ -360,9 +363,9 @@ pub(super) fn write(
 /// state and revision just read. Returns the new revision.
 fn compare_and_set(tx: &Transaction<'_>, cas: &StateCas) -> Result<i64, PersistError> {
     let entity = cas.change.entity();
-    if entity == Entity::Attempt {
+    if matches!(entity, Entity::Attempt | Entity::Input) {
         return Err(PersistError::IntegrityViolation(format!(
-            "attempt {} has no revision; it moves with an AttemptMove",
+            "{entity:?} {} has no revision; it moves with its own move",
             cas.id
         )));
     }

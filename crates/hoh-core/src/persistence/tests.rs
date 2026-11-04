@@ -1118,6 +1118,7 @@ fn test_036_01_state_sets_equal_the_sql_check_enumerations() -> R {
         ("runs", names::<RunState>(), 15),
         ("tasks", names::<TaskState>(), 9),
         ("attempts", names::<crate::lifecycle::AttemptState>(), 7),
+        ("input_queue", names::<crate::lifecycle::InputState>(), 4),
     ] {
         let sql_names = state_check(sql, table)?;
         assert_eq!(sql_names.len(), count, "{table}: {sql_names:?}");

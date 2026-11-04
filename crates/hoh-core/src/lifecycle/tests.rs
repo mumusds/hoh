@@ -273,3 +273,24 @@ fn resuming_returns_only_to_the_saved_working_state() {
     );
     assert!(resume_state(Run::Created, Run::Running, None).is_err());
 }
+
+/// docs/06-orchestration.md: QUEUED -> DELIVERED -> APPLIED/REJECTED; a queued input may also be refused before it is
+/// delivered (a stale steer).
+fn input_rule(from: InputState, to: InputState) -> bool {
+    use InputState::*;
+    matches!(
+        (from, to),
+        (Queued, Delivered) | (Queued, Rejected) | (Delivered, Applied) | (Delivered, Rejected)
+    )
+}
+
+#[test]
+fn every_input_pair_is_judged_as_the_queue_says() {
+    let (pairs, legal, rows) = judge(input_rule, |from, _| {
+        matches!(from, InputState::Applied | InputState::Rejected)
+    });
+    assert_eq!((pairs, legal, rows.len()), (16, 4, 16));
+    let terminal: Vec<_> = InputState::ALL.iter().filter(|s| s.is_terminal()).collect();
+    assert_eq!(terminal, [&InputState::Applied, &InputState::Rejected]);
+    names_round_trip::<InputState>();
+}

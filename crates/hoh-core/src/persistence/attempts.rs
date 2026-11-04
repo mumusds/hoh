@@ -177,6 +177,9 @@ pub(super) enum AttemptJob {
     Session(Session),
     Create(NewAttempt),
     Move(AttemptMove),
+    /// An input queue row, created QUEUED (persistence/inputs.rs).
+    Enqueue(super::inputs::NewInput),
+    MoveInput(super::inputs::InputMove),
     /// An event of the attempt (e.g. an adapter diagnostic); `name` makes its id unique within the attempt.
     Event {
         attempt_id: String,
@@ -194,6 +197,8 @@ pub(super) fn apply(conn: &mut Connection, job: &AttemptJob) -> Result<(), Persi
         AttemptJob::Session(session) => upsert_session(&tx, session)?,
         AttemptJob::Create(attempt) => create(&tx, attempt)?,
         AttemptJob::Move(change) => move_attempt(&tx, change)?,
+        AttemptJob::Enqueue(input) => super::inputs::enqueue(&tx, input)?,
+        AttemptJob::MoveInput(change) => super::inputs::move_input(&tx, change)?,
         AttemptJob::Event {
             attempt_id,
             name,
