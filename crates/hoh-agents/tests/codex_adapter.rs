@@ -1361,3 +1361,66 @@ async fn a_broken_stdin_leaves_the_end_to_the_stream() -> R {
     assert!(stdin_failed, "the stdin failure is recorded");
     Ok(())
 }
+
+/// Two same-text steers in flight, one aimed at a stale turn: the message of this turn goes to the steer aimed at it,
+/// whatever order the answers come in (M1T04R-10).
+#[tokio::test]
+async fn a_message_goes_to_the_steer_aimed_at_its_turn() -> R {
+    let world = World::new()?;
+    let mut case = Case::load("app-server-steer")?;
+    let text = "Stop running the command now and reply exactly STEERED.";
+    let item = case
+        .frames
+        .iter()
+        .position(|f| {
+            f["method"] == "item/started" && f["params"]["item"]["content"][0]["text"] == text
+        })
+        .ok_or("no steer item")?;
+    let message = case.frames.remove(item);
+    // Both steers arrive, then this turn's message, then I2's answer, then I1's refusal.
+    let refusal = case
+        .frames
+        .iter()
+        .position(|f| f["id"] == 3)
+        .ok_or("no refusal")?;
+    let refused = case.frames.remove(refusal);
+    let ack = case
+        .frames
+        .iter()
+        .position(|f| f["id"] == 4)
+        .ok_or("no answer")?;
+    case.frames.insert(
+        ack,
+        json!({"hoh_wait": {"method": "turn/steer", "count": 2}}),
+    );
+    case.frames.insert(ack + 1, message);
+    case.frames.insert(ack + 3, refused);
+    let fake = world.fake("aimed", Some(&case), "exec", false)?;
+    let attempt = world.attempt("A1").await?;
+    let turn = world.turn(&fake, "logs/A1")?;
+    let (tx, steers) = mpsc::channel(4);
+    let latch = CancelLatch::new();
+    let running = codex::run(&world.store, &attempt, &turn, &latch, steers);
+    let steering = async {
+        active_turn(&world, "A1").await?;
+        let first = steer(&world, &tx, "I1", text, Some("hoh-stale-turn-id")).await?;
+        let second = steer(&world, &tx, "I2", text, None).await?;
+        Ok::<(SteerReceipt, SteerReceipt), Box<dyn std::error::Error>>((
+            first.await?,
+            second.await?,
+        ))
+    };
+    let (outcome, receipts) = tokio::join!(running, steering);
+    let (outcome, (first, second)) = (outcome?, receipts?);
+    assert!(matches!(first, SteerReceipt::Rejected { .. }), "{first:?}");
+    assert!(
+        matches!(second, SteerReceipt::Delivered { .. }),
+        "{second:?}"
+    );
+    assert_eq!(
+        [input_state(&world, "I1")?, input_state(&world, "I2")?],
+        [InputState::Rejected, InputState::Applied]
+    );
+    assert_eq!(outcome.state, AttemptState::Settled);
+    Ok(())
+}

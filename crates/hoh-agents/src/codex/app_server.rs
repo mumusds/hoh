@@ -5,9 +5,9 @@
 //! dropped if they turn out to be another turn's (M1T04R-01). Once the turn is being stopped or exec is to be used, a
 //! late answer moves nothing (M1T04R-02). stdin is written by a task the loop watches: a write failure stops the
 //! process (recorded; the stream's end still decides), and the task is aborted, not awaited, once the process has
-//! exited (M1T04R-04). A user message item is matched
-//! to the first steer of the same text that was sent and has no item yet; the steer is APPLIED when both its item and
-//! codex's answer have come, in either order (M1T04R-05). A refused steer gives its item up with it, and an item id
+//! exited (M1T04R-04). A user message item is matched to the first steer of the same text that was sent to this turn
+//! and has no item yet (M1T04R-10); the steer is APPLIED when both its item and codex's answer have come, in either
+//! order (M1T04R-05). A refused steer gives its item up with it, and an item id
 //! counts once (M1T04R-08/09). Notifications of this thread still waiting for an unconfirmed turn are looked at when
 //! the stream ends: a tool item among them makes the end UNKNOWN_EFFECT (M1T04R-06).
 
@@ -120,6 +120,8 @@ fn scope_of(method: &str, params: &Value) -> Option<(Option<String>, Option<Stri
 struct SentSteer {
     input_id: String,
     text: String,
+    /// The turn it was aimed at (its expectedTurnId): only a message of that turn can be its.
+    target: Option<String>,
     /// The user message item matched to it.
     item: Option<String>,
     /// codex answered the turn/steer (the input is DELIVERED).
@@ -217,13 +219,14 @@ impl State<'_> {
     }
 
     fn send_steer(&mut self, s: Steer) {
+        let expected = s.expected_turn.clone().or_else(|| self.turn_id.clone());
         self.sent.push(SentSteer {
             input_id: s.input_id.clone(),
             text: s.text.clone(),
+            target: expected.clone(),
             item: None,
             acked: false,
         });
-        let expected = s.expected_turn.clone().or_else(|| self.turn_id.clone());
         let params = json!({"threadId": self.thread_id, "expectedTurnId": expected,
                             "input": [{"type": "text", "text": s.text}]});
         self.conn.request("turn/steer", params, Pending::Steer(s));
@@ -273,11 +276,9 @@ impl State<'_> {
                     let text = text_of(item);
                     if !self.prompt_seen && text == self.turn.prompt {
                         self.prompt_seen = true;
-                    } else if let Some(at) = self
-                        .sent
-                        .iter()
-                        .position(|x| x.item.is_none() && x.text == text)
-                    {
+                    } else if let Some(at) = self.sent.iter().position(|x| {
+                        x.item.is_none() && x.text == text && x.target == self.turn_id
+                    }) {
                         self.sent[at].item = Some(id);
                         if self.sent[at].acked {
                             let x = self.sent.remove(at);

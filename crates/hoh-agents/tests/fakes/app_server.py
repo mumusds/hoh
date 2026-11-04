@@ -3,8 +3,8 @@
 Usage: app_server.py FRAMES REQUESTS LOGDIR [--exit-when-done]
 
 FRAMES is the recorded server output (one JSON frame per line, ids as recorded); REQUESTS maps each recorded request
-id to its method ({"0": "initialize", ...}). Frames are sent in order. A response waits until the client has sent a
-request of that method that is not answered yet, and goes out with the client's id; notifications and server
+id to its method ({"0": "initialize", ...}). Frames are sent in order. A response to the k-th recorded request of a
+method waits until the client has sent its k-th request of that method, and goes out with the client's id; notifications and server
 requests go out as soon as everything before them has. When every frame is out the fake waits for stdin to close
 (or exits at once with --exit-when-done, a stream cut short). A frame {"hoh_sleep": SECONDS} is not sent: the fake
 pauses there; {"hoh_wait": {"method": M, "count": N}} is not sent either: the fake waits there until the client
@@ -28,7 +28,9 @@ def main() -> int:
     received = open(logdir / 'received.jsonl', 'a', encoding='utf-8')
     sent = open(logdir / 'sent.jsonl', 'ab')
     trace = open(logdir / 'trace.jsonl', 'a', encoding='utf-8')
-    unanswered: list[tuple[object, str]] = []  # client requests (id, method) in arrival order
+    by_method: dict[str, list] = {}  # client request ids per method, in arrival order
+    # A recorded request answers the client request of its method with the same position (the k-th of that method).
+    ordinal = {rid: sorted(r for r, m in recorded.items() if m == method).index(rid) for rid, method in recorded.items()}
     received_methods: list[str] = []  # methods of every client request so far
     closed = []  # set once stdin is closed by {"hoh_close_stdin": true}
     out = sys.stdout.buffer
@@ -47,11 +49,12 @@ def main() -> int:
 
     def answer(frame: dict) -> bool:
         """Give a recorded response the id of the client request it answers; False if that request has not come."""
-        method = recorded.get(frame.get('id'))
-        match = next((i for i, (_, m) in enumerate(unanswered) if m == method), None)
-        if match is None:
+        rid = frame.get('id')
+        method, k = recorded.get(rid), ordinal.get(rid)
+        ids = by_method.get(method, [])
+        if k is None or len(ids) <= k:
             return False
-        frame['id'] = unanswered.pop(match)[0]
+        frame['id'] = ids[k]
         return True
 
     def pump() -> None:
@@ -101,7 +104,7 @@ def main() -> int:
                                 'response': 'method' not in message}) + '\n')
         trace.flush()
         if 'method' in message and 'id' in message:
-            unanswered.append((message['id'], message['method']))
+            by_method.setdefault(message['method'], []).append(message['id'])
             received_methods.append(message['method'])
         pump()
         if closed:
