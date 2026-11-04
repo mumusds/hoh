@@ -390,47 +390,53 @@ async fn test_026_02_the_end_is_the_disposition_agent_settled_or_the_state_never
         );
     }
 
-    // (d) a version without agent_settled: SETTLED only once a state query says idle.
-    let hold = world.dir.path().join("go-d");
-    let mut d = Case::load("rpc-prompt")?;
-    let state = d.frames[d.response("s1")?].clone();
-    let busy = {
-        let mut s = state.clone();
-        s["id"] = json!("s2");
-        s["data"]["isStreaming"] = json!(true);
-        s["data"]["pendingMessageCount"] = json!(1);
-        s
-    };
-    let idle = {
-        let mut s = state.clone();
-        s["id"] = json!("s3");
-        s
-    };
-    d.frames.retain(|f| f["type"] != "agent_settled");
-    let end = d.position("agent_end")?;
-    d.frames.splice(
-        end + 1..end + 1,
-        [
-            json!({"hoh_hold": hold.display().to_string()}),
-            busy,
-            json!({"type": "agent_start"}),
-            json!({"type": "agent_end", "messages": [], "willRetry": false}),
-            idle,
-        ],
-    );
-    d.commands.push(("s2".to_owned(), "get_state".to_owned()));
-    d.commands.push(("s3".to_owned(), "get_state".to_owned()));
-    let (outcome, seen, timers) = settle(&world, "d", &d, false, Some(&hold)).await?;
-    assert_eq!(seen, Some(AttemptState::Running));
-    assert_eq!(
-        (
-            outcome.state,
-            outcome.settled_by,
-            outcome.state_queries,
-            timers
-        ),
-        (AttemptState::Settled, Some(SettledBy::State), 2, 0)
-    );
+    // (d) a version without agent_settled: SETTLED only once a state query says idle; each sign of work counts.
+    for (name, busy_field, busy_value) in [
+        ("d-streaming", "isStreaming", json!(true)),
+        ("d-compacting", "isCompacting", json!(true)),
+        ("d-pending", "pendingMessageCount", json!(1)),
+    ] {
+        let hold = world.dir.path().join(format!("go-{name}"));
+        let mut d = Case::load("rpc-prompt")?;
+        let state = d.frames[d.response("s1")?].clone();
+        let busy = {
+            let mut s = state.clone();
+            s["id"] = json!("s2");
+            s["data"][busy_field] = busy_value;
+            s
+        };
+        let idle = {
+            let mut s = state.clone();
+            s["id"] = json!("s3");
+            s
+        };
+        d.frames.retain(|f| f["type"] != "agent_settled");
+        let end = d.position("agent_end")?;
+        d.frames.splice(
+            end + 1..end + 1,
+            [
+                json!({"hoh_hold": hold.display().to_string()}),
+                busy,
+                json!({"type": "agent_start"}),
+                json!({"type": "agent_end", "messages": [], "willRetry": false}),
+                idle,
+            ],
+        );
+        d.commands.push(("s2".to_owned(), "get_state".to_owned()));
+        d.commands.push(("s3".to_owned(), "get_state".to_owned()));
+        let (outcome, seen, timers) = settle(&world, name, &d, false, Some(&hold)).await?;
+        assert_eq!(seen, Some(AttemptState::Running), "{name}");
+        assert_eq!(
+            (
+                outcome.state,
+                outcome.settled_by,
+                outcome.state_queries,
+                timers
+            ),
+            (AttemptState::Settled, Some(SettledBy::State), 2, 0),
+            "{name}"
+        );
+    }
     Ok(())
 }
 
@@ -757,5 +763,25 @@ async fn a_deadline_aborts_and_fails_the_turn() -> R {
         (AttemptState::Failed, Some("DEADLINE_EXCEEDED"))
     );
     assert!(received(&fake)?.iter().any(|m| m["type"] == "abort"));
+    Ok(())
+}
+
+/// A pi that reports another session than the one asked for is not taken at its word: FAILED, no prompt sent.
+#[tokio::test]
+async fn another_session_than_the_one_asked_for_fails() -> R {
+    let world = World::new()?;
+    let mut case = Case::load("rpc-prompt")?;
+    case.frames.insert(0, json!({"hoh_keep_session": true}));
+    let fake = world.fake("other-session", &case)?;
+    let attempt = world.attempt("A1").await?;
+    let outcome = run(&world, &attempt, &world.turn(&fake, "logs/A1")?).await?;
+    assert_eq!(
+        (outcome.state, outcome.failure.as_deref()),
+        (AttemptState::Failed, Some("SESSION_MISMATCH"))
+    );
+    assert!(
+        !received(&fake)?.iter().any(|m| m["type"] == "prompt"),
+        "no prompt may be sent"
+    );
     Ok(())
 }
