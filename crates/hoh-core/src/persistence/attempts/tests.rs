@@ -340,3 +340,50 @@ async fn a_cancel_and_the_end_are_decided_under_one_latch() -> R {
     tokio::time::timeout(std::time::Duration::from_secs(5), woke).await??;
     Ok(())
 }
+
+/// A cancelled end clears a failure reason stored by an earlier move, in the row as in its event (M1T03R-16).
+#[tokio::test]
+async fn a_cancelled_end_clears_an_earlier_failure_reason() -> R {
+    use AttemptState::*;
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    seed(&path)?;
+    store.upsert_session(session(None)).await?;
+    store.create_attempt(attempt()).await?;
+    store
+        .move_attempt(step(Prepared, Starting, AttemptFacts::default()))
+        .await?;
+    store
+        .move_attempt(step(
+            Starting,
+            UnknownEffect,
+            AttemptFacts {
+                failure_reason: Some("lost the agent".to_owned()),
+                ..AttemptFacts::default()
+            },
+        ))
+        .await?;
+    let latch = CancelLatch::new();
+    assert_eq!(latch.request(), CancelReceipt::Accepted);
+    let end = step(
+        UnknownEffect,
+        Failed,
+        AttemptFacts {
+            failure_reason: Some("diagnosed".to_owned()),
+            ..AttemptFacts::default()
+        },
+    );
+    assert_eq!(store.end_attempt(end, &latch).await?, Cancelled);
+    let row = store.reader()?.attempt("A1")?.ok_or("no A1")?;
+    assert_eq!(
+        (row.state, row.cancel_requested, row.failure_reason),
+        (Cancelled, true, None)
+    );
+    let events = store.reader()?.events("R")?;
+    let (_, last) = events.last().ok_or("no events")?;
+    assert_eq!(
+        (&last["to"], &last["failure_reason"]),
+        (&json!("CANCELLED"), &Value::Null)
+    );
+    Ok(())
+}

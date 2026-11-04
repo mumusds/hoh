@@ -248,6 +248,14 @@ pub(super) fn end(
             m.facts.cancel_requested = Some(true);
         }
         move_attempt(&tx, &m)?;
+        if requested {
+            // The move keeps stored facts it is not given; a cancelled end has no failure reason at all (M1T03R-16).
+            tx.execute(
+                "UPDATE attempts SET failure_reason = NULL WHERE attempt_id = ?1",
+                params![m.attempt_id],
+            )
+            .map_err(sqlite_error)?;
+        }
         tx.commit().map_err(sqlite_error)?;
         Ok(m.to)
     })
