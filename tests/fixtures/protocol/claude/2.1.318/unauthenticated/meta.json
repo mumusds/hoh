@@ -3,6 +3,9 @@
   "cli_version": "2.1.318",
   "case": "unauthenticated",
   "argv": [
+    "env",
+    "--unset=XDG_RUNTIME_DIR",
+    "--unset=DBUS_SESSION_BUS_ADDRESS",
     "claude",
     "-p",
     "--output-format",
@@ -12,16 +15,19 @@
   ],
   "cwd": "fresh temp Git repo outside the checkout",
   "exit_code": 1,
-  "recorded_at": "2026-11-04T14:38:30.998089+00:00",
+  "recorded_at": "2026-11-04T15:12:33.497517+00:00",
   "mode": "live",
-  "notes": "claude with an empty HOME: the authentication failure surface",
+  "notes": "claude in an isolated environment: the authentication failure surface",
   "env_overrides": [
-    "HOME=<empty temp dir>"
+    "HOME, XDG_*_HOME and TMPDIR=<fresh empty temp dirs>"
   ],
-  "env_removed": [
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "CLAUDE_CODE_OAUTH_TOKEN"
+  "env_kept": [
+    "LANG",
+    "LOGNAME",
+    "PATH",
+    "SHELL",
+    "TERM",
+    "USER"
   ],
   "stopped": "exited",
   "valid": true,

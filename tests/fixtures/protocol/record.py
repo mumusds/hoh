@@ -913,18 +913,41 @@ def claude(rec: Recording) -> None:
     claude_unauthenticated(rec, base)
 
 
-# Variables that would log claude in without the files under HOME.
-CLAUDE_AUTH_VARS = ('ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN')
+# The only variables a not-logged-in run keeps; everything else (API keys, tokens, CLAUDE_CONFIG_DIR,
+# CLAUDE_SECURESTORAGE_CONFIG_DIR, XDG directories, ...) could point claude at credentials (M1T03R-14).
+CLAUDE_UNAUTH_KEEP = ('PATH', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TERM', 'TZ', 'USER', 'LOGNAME', 'SHELL')
+# What systemd-run needs to start the scope; `env -u` removes it again before claude runs (systemd-run execs in place),
+# so claude cannot reach the user bus (a keyring) either.
+SCOPE_ONLY = ('XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS')
+
+
+def claude_isolated_env(base: dict[str, str]) -> dict[str, str]:
+    """An environment with no way to the operator's login: an allow-list of `base` and a fresh empty HOME that also
+    holds the XDG and temporary directories."""
+    home = tempdir('hoh-claude-home-')
+    env = {k: v for k, v in base.items() if k in CLAUDE_UNAUTH_KEEP + SCOPE_ONLY}
+    for name, sub in (('XDG_CONFIG_HOME', '.config'), ('XDG_DATA_HOME', '.local/share'), ('XDG_STATE_HOME', '.local/state'),
+                      ('XDG_CACHE_HOME', '.cache'), ('TMPDIR', 'tmp')):
+        (home / sub).mkdir(parents=True)
+        env[name] = str(home / sub)
+    return env | {'HOME': str(home)}
+
+
+def claude_isolated_argv(argv: list[str]) -> list[str]:
+    """`argv` with the scope-only variables removed from its environment."""
+    return ['env', *(f'--unset={name}' for name in SCOPE_ONLY), *argv]
 
 
 def claude_unauthenticated(rec: Recording, base: list[str]) -> None:
-    """Not logged in, reproducible whatever the operator's login: an empty HOME holds no credentials, so no model is
-    called (M1-T03: REQ-025 maps the recorded authentication failure to BLOCKED_AUTH)."""
-    env = {k: v for k, v in ENV.items() if k not in CLAUDE_AUTH_VARS} | {'HOME': str(tempdir('hoh-claude-home-'))}
+    """Not logged in, reproducible whatever the operator's login: the isolated environment holds no credentials and
+    names none, so no model is called (M1-T03: REQ-025 maps the recorded authentication failure to BLOCKED_AUTH)."""
+    env = claude_isolated_env(ENV)
+    argv = claude_isolated_argv(base)
     prompt = f'Reply with exactly {TOKEN} and nothing else.'.encode()
-    out, err, rc, how = run(base, prompt, workdir(), env=env)
-    rec.save('unauthenticated', base, prompt, out, err, rc, 'claude with an empty HOME: the authentication failure surface',
-             {'env_overrides': ['HOME=<empty temp dir>'], 'env_removed': list(CLAUDE_AUTH_VARS)}, stop=how)
+    out, err, rc, how = run(argv, prompt, workdir(), env=env)
+    rec.save('unauthenticated', argv, prompt, out, err, rc, 'claude in an isolated environment: the authentication failure surface',
+             {'env_overrides': ['HOME, XDG_*_HOME and TMPDIR=<fresh empty temp dirs>'],
+              'env_kept': sorted(k for k in env if k in CLAUDE_UNAUTH_KEEP)}, stop=how)
 
 
 def claude_cancel(rec: Recording, base: list[str]) -> None:
