@@ -1,0 +1,29 @@
+{
+  "agent": "claude",
+  "cli_version": "2.1.318",
+  "case": "unauthenticated",
+  "argv": [
+    "claude",
+    "-p",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--dangerously-skip-permissions"
+  ],
+  "cwd": "fresh temp Git repo outside the checkout",
+  "exit_code": 1,
+  "recorded_at": "2026-11-04T14:38:30.998089+00:00",
+  "mode": "live",
+  "notes": "claude with an empty HOME: the authentication failure surface",
+  "env_overrides": [
+    "HOME=<empty temp dir>"
+  ],
+  "env_removed": [
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN"
+  ],
+  "stopped": "exited",
+  "valid": true,
+  "problems": []
+}

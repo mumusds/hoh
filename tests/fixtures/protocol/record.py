@@ -546,6 +546,19 @@ def v_claude_max_turns(fs, rc, meta, sent, ctx):
     return out
 
 
+def v_claude_unauthenticated(fs, rc, meta, sent, ctx):
+    """Not logged in: an assistant frame with Claude's error=authentication_failed, a failed result, a non-zero exit and
+    no model reply."""
+    out: list[str] = []
+    r = claude_result(fs, rc, out)
+    expect(out, r.get('is_error') is True, f'result is_error={r.get("is_error")!r}, expected true')
+    expect(out, any(f.get('error') == 'authentication_failed' for f in typed(fs, 'assistant')),
+           'no assistant frame with error=authentication_failed')
+    expect(out, rc not in (0, None), f'exit code {rc}, expected non-zero')
+    expect(out, TOKEN not in str(r.get('result', '')), f'a model replied {TOKEN}')
+    return out
+
+
 def v_claude_sigint(fs, rc, meta, sent, ctx):
     out: list[str] = []
     expect(out, meta.get('recorder_state') == 'SIGINT sent during foreground tool', f'recorder state {meta.get("recorder_state")!r}')
@@ -739,6 +752,7 @@ VALIDATORS = {
     ('claude', 'success'): v_claude_success, ('claude', 'resume'): v_claude_resume,
     ('claude', 'tool-success'): v_claude_tool_success,
     ('claude', 'max-turns-error'): v_claude_max_turns, ('claude', 'sigint-cancel'): v_claude_sigint,
+    ('claude', 'unauthenticated'): v_claude_unauthenticated,
     ('codex', 'exec'): v_codex_exec, ('codex', 'exec-unauthenticated'): v_codex_exec_failed('401'),
     ('codex', 'exec-turn-failed'): v_codex_exec_failed(requested_model),
     ('codex', 'app-server-handshake'): v_app_handshake, ('codex', 'app-server-handshake-unauthenticated'): v_app_handshake,
@@ -896,6 +910,21 @@ def claude(rec: Recording) -> None:
     out, err, rc, how = run(base, prompt, workdir())
     rec.save('tool-success', base, prompt, out, err, rc, 'a tool call, then the final reply', stop=how)
     claude_cancel(rec, base)
+    claude_unauthenticated(rec, base)
+
+
+# Variables that would log claude in without the files under HOME.
+CLAUDE_AUTH_VARS = ('ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN')
+
+
+def claude_unauthenticated(rec: Recording, base: list[str]) -> None:
+    """Not logged in, reproducible whatever the operator's login: an empty HOME holds no credentials, so no model is
+    called (M1-T03: REQ-025 maps the recorded authentication failure to BLOCKED_AUTH)."""
+    env = {k: v for k, v in ENV.items() if k not in CLAUDE_AUTH_VARS} | {'HOME': str(tempdir('hoh-claude-home-'))}
+    prompt = f'Reply with exactly {TOKEN} and nothing else.'.encode()
+    out, err, rc, how = run(base, prompt, workdir(), env=env)
+    rec.save('unauthenticated', base, prompt, out, err, rc, 'claude with an empty HOME: the authentication failure surface',
+             {'env_overrides': ['HOME=<empty temp dir>'], 'env_removed': list(CLAUDE_AUTH_VARS)}, stop=how)
 
 
 def claude_cancel(rec: Recording, base: list[str]) -> None:
