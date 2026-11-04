@@ -61,7 +61,11 @@ The boundary is enforced by the compiler, and this scan checks that nothing swit
    gives its reason (M2T01R-58). The value of a doc attribute (`#[doc = …]`, what `///` writes, also in `cfg_attr`)
    that is not inside a macro invocation is documentation: its literals, the files it embeds and the files its text
    names are not checked as in check 4 (M2T01R-56, -60); inside a macro invocation it is input the macro may use at
-   run time and is checked (M2T01R-61).
+   run time and is checked (M2T01R-61), as are doc comments there (M2T01R-63); macro names are Rust identifiers
+   (raw and non-ASCII ones too, M2T01R-64); a doc attribute a `macro_rules!` definition writes documents the generated
+   item (M2T01R-65). Code under exactly `#[cfg(test)]` (an inline module, or a module file no target root reaches
+   through plain declarations) is test code for the literal, include and named-file checks, like tests/
+   (M2T01R-66). A cargo configuration may not `include` another (M2T01R-62).
 Out of reach of any of this (docs/22-tooling.md): a program, script or SQL that exists only at run time (a name or
 text assembled from pieces, read from the environment or a file outside the candidate), conditional compilation
 produced by a macro (M2T01R-53/54), and product code that uses a whitelisted development file (a kit test or tool)
@@ -164,8 +168,10 @@ def decode(body: str) -> str:
     return ''.join(out)
 
 
-def split_rust(text: str) -> tuple[str, list[tuple[int, int, str]]]:
-    """(code with comments and literals blanked to spaces, [(start, end, decoded literal)])."""
+def split_rust(text: str, docs: list | None = None) -> tuple[str, list[tuple[int, int, str]]]:
+    """(code with comments and literals blanked to spaces, [(start, end, decoded literal)]). With `docs`, the doc
+    comments (`///`, `//!`, `/** */`, `/*! */`) are appended to it as (start, end, text): a macro may take them as
+    `#[doc = $s:literal]` (M2T01R-63)."""
     code, literals, i, n = list(text), [], 0, len(text)
 
     def blank(a: int, b: int) -> None:
@@ -176,6 +182,8 @@ def split_rust(text: str) -> tuple[str, list[tuple[int, int, str]]]:
         if text.startswith('//', i):
             j = text.find('\n', i)
             j = n if j < 0 else j
+            if docs is not None and (text.startswith('//!', i) or (text.startswith('///', i) and not text.startswith('////', i))):
+                docs.append((i, j, text[i + 3:j]))
             blank(i, j)
             i = j
             continue
@@ -188,6 +196,9 @@ def split_rust(text: str) -> tuple[str, list[tuple[int, int, str]]]:
                     depth, i = depth - 1, i + 2
                 else:
                     i += 1
+            if docs is not None and (text.startswith('/*!', start) or (text.startswith('/**', start)
+                                     and not text.startswith('/***', start) and not text.startswith('/**/', start))):
+                docs.append((start, i, text[start + 3:i - 2]))
             blank(start, i)
             continue
         ident_before = i > 0 and (text[i - 1].isalnum() or text[i - 1] == '_')
@@ -234,29 +245,44 @@ def attribute_spans(code: str) -> list[tuple[int, int]]:
     return out
 
 
-def macro_spans(code: str) -> list[tuple[int, int]]:
-    """(start, end) of every macro invocation and definition (`name!(…)`, `name![…]`, `name!{…}`) in comment- and
-    literal-free code."""
+KEYWORDS = {'if', 'while', 'match', 'return', 'in', 'let', 'else', 'for', 'loop', 'mut', 'ref', 'as', 'where', 'move',
+            'async', 'await', 'unsafe', 'dyn', 'impl', 'break', 'continue', 'yield'}
+
+
+def macro_spans(code: str) -> list[tuple[int, int, str]]:
+    """(start, end, name) of every macro invocation and definition (`name!(…)`, `name![…]`, `name!{…}`, also with a
+    raw or non-ASCII identifier, M2T01R-64) in comment- and literal-free code."""
     out = []
     pairs = {'(': ')', '[': ']', '{': '}'}
-    for m in re.finditer(r'\b[A-Za-z_]\w*\s*!\s*(?:[A-Za-z_]\w*\s*)?([(\[{])', code):
-        opening, closing, depth, i = m.group(1), pairs[m.group(1)], 0, m.end() - 1
+    for m in re.finditer(r'(?<![\w#])(?:r#)?([^\W\d]\w*)\s*!\s*(?:(?:r#)?[^\W\d]\w*\s*)?([(\[{])', code):
+        if m.group(1) in KEYWORDS:
+            continue  # `if !(…)` negates, it invokes nothing
+        opening, closing, depth, i = m.group(2), pairs[m.group(2)], 0, m.end() - 1
         while i < len(code):
             depth += 1 if code[i] == opening else -1 if code[i] == closing else 0
             if depth == 0:
                 break
             i += 1
-        out.append((m.start(), i + 1))
+        out.append((m.start(), i + 1, m.group(1)))
     return out
+
+
+def invocation_spans(code: str) -> list[tuple[int, int]]:
+    """The macro invocations (not `macro_rules!` definitions): what lies inside them is input the macro may use at run
+    time, whatever it looks like (M2T01R-61, -63)."""
+    return [(a, b) for a, b, name in macro_spans(code) if name != 'macro_rules']
 
 
 def documentation_spans(code: str) -> list[tuple[int, int]]:
     """The value of each doc attribute (`#[doc = …]`, also in `cfg_attr`) that is a real attribute: not inside a
-    macro invocation, where `#[doc = "…"]` is only input the macro may use at run time (M2T01R-61). Its literals, the
+    macro invocation, where `#[doc = "…"]` is only input the macro may use at run time (M2T01R-61); one a
+    `macro_rules!` definition writes documents the generated item (M2T01R-65). Its literals, the
     files it embeds and the files its text names are documentation, what `///` writes (M2T01R-56, -60)."""
-    macros = macro_spans(code)
+    macros = invocation_spans(code)
     out = []
     for a, b in attribute_spans(code):
+        # A doc attribute that a macro definition writes documents what it generates (M2T01R-65); inside an
+        # invocation it is the invoked macro's input.
         if any(x < a < y for x, y in macros):
             continue
         # The value starts right after `=` (literals are blanked to spaces in `code`).
@@ -484,6 +510,62 @@ def leading_inner_attributes(code: str) -> list[str]:
         i = j + 1
 
 
+CFG_TEST = r'#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]'
+
+
+def cfg_test_spans(code: str) -> list[tuple[int, int]]:
+    """The bodies of inline modules under exactly `#[cfg(test)]` (other attributes may follow it), in comment- and
+    literal-free code: compiled only into test builds (M2T01R-66)."""
+    out = []
+    for m in re.finditer(CFG_TEST + r'(?:\s*#\s*\[[^\]]*\])*\s*(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+\w+\s*\{', code):
+        depth, i = 0, m.end() - 1
+        while i < len(code):
+            depth += {'{': 1, '}': -1}.get(code[i], 0)
+            if depth == 0:
+                break
+            i += 1
+        out.append((m.start(), i + 1))
+    return out
+
+
+def cfg_test_files(files: list[Path], metadata: dict) -> set[Path]:
+    """Module files reachable only through declarations under exactly `#[cfg(test)]` (`#[cfg(test)] mod tests;`) and
+    the module files below them: compiled only into test builds (M2T01R-66). A file that any target root also reaches
+    through plain declarations is product code (`mod a;` in lib.rs and `#[cfg(test)] mod a;` in main.rs both name
+    src/a.rs). A module file resolves as rustc resolves it: next to a crate root or `mod.rs`, otherwise in the
+    directory named after the declaring file; a declaration inside an inline module may resolve wrongly here, which
+    only ever makes a file product code."""
+    roots = {Path(t['src_path']).resolve() for p in metadata['packages'] for t in p.get('targets') or []}
+    known = {p.resolve(): p for p in files}
+    declaration = re.compile(r'(?:pub(?:\s*\([^)]*\))?\s+)?\bmod\s+(\w+)\s*;')
+    under_cfg_test = re.compile(CFG_TEST + r'(?:\s*#\s*\[[^\]]*\])*\s*$')
+
+    def declared(path: Path) -> tuple[set[Path], set[Path]]:
+        """(plain, cfg(test)) module files `path` declares."""
+        code, _ = split_rust(path.read_text(encoding='utf-8', errors='replace'))
+        base = path.parent if path in roots or path.name == 'mod.rs' else path.parent / path.stem
+        plain, test = set(), set()
+        for m in declaration.finditer(code):
+            targets = {c.resolve() for c in (base / f'{m.group(1)}.rs', base / m.group(1) / 'mod.rs')} & known.keys()
+            (test if under_cfg_test.search(code[max(0, m.start() - 400):m.start()]) else plain).update(targets)
+        return plain, test
+
+    edges = {p: declared(p) for p in known}
+
+    def closure(start: set[Path], follow_test: bool) -> set[Path]:
+        seen, todo = set(start), list(start)
+        while todo:
+            plain, test = edges.get(todo.pop(), (set(), set()))
+            for child in plain | (test if follow_test else set()):
+                if child not in seen:
+                    seen.add(child)
+                    todo.append(child)
+        return seen
+    product = closure(roots & known.keys(), follow_test=False)
+    test_only = closure(set().union(*(t for _, t in edges.values())) if edges else set(), follow_test=True) - product
+    return {known[p] for p in test_only}
+
+
 def is_test_code(path: Path, metadata: dict) -> bool:
     """Whether a file is test code: it lies under a member's own tests/, benches/ or examples/ directory and no product
     target root (lib, bin, proc-macro, build script) lies there. Product modules cannot reach such a file (module files
@@ -569,6 +651,8 @@ def forbidden_cargo_keys(cfg: Path) -> list[str]:
     found += ['env' for _ in [1] if data.get('env')]
     found += [f'alias.{a}' for a in (data.get('alias') or {}) if a in ('clippy', 'check', 'build', 'metadata', 'deny', 'fmt')]
     found += ['unstable' for _ in [1] if data.get('unstable')]
+    # An included configuration would apply without being read here (M2T01R-62).
+    found += ['include' for _ in [1] if 'include' in data]
     # The profile rule of the manifests holds for configurations too (M2T01R-50).
     for name, profile in (data.get('profile') or {}).items():
         if name not in ('dev', 'release'):
@@ -594,9 +678,11 @@ def scan(root: Path, metadata: dict) -> dict:
     for src in product_roots_outside_src(metadata):
         hits.append({'path': rel_to(Path(src), root), 'kind': 'product-root-outside-src',
                      'match': "a product target root outside its member's src/"})
+    unit_tests = cfg_test_files(files, metadata)
     for path in files:
         rel = rel_to(path, root)
-        code, literals = split_rust(path.read_text(encoding='utf-8', errors='replace'))
+        doc_comments: list = []
+        code, literals = split_rust(path.read_text(encoding='utf-8', errors='replace'), doc_comments)
         # Whitespace removed and raw identifiers read as plain ones (M2T01R-23, -27).
         compact = [re.sub(r'\br#', '', re.sub(r'\s+', '', attr)) for attr in attributes(code)]
         if any(re.search(r'[\[(,]path=', attr) for attr in compact) or re.search(r'\binclude\s*!\s*[(\[{]', code):
@@ -617,10 +703,17 @@ def scan(root: Path, metadata: dict) -> dict:
             # A predicate taken from a macro argument (`cfg($cond)`) cannot be read here (M2T01R-43).
             if re.search(r'\bclippy\b', predicate) or '$' in predicate:
                 hits.append({'path': rel, 'kind': 'clippy-cfg', 'match': predicate[:200]})
-        if is_test_code(path, metadata):
+        if is_test_code(path, metadata) or path in unit_tests:
             continue
-        runtime = runtime_literals(code, literals)
-        docs = documentation_spans(code)
+        # Doc comments inside a macro invocation are its input (M2T01R-63); code under #[cfg(test)] is test code
+        # (M2T01R-66).
+        invocations = invocation_spans(code)
+        tests = cfg_test_spans(code)
+        def product(start: int) -> bool:
+            return not any(a <= start < b for a, b in tests)
+        runtime = sorted([lit for lit in runtime_literals(code, literals) if product(lit[0])]
+                         + [d for d in doc_comments if product(d[0]) and any(a < d[0] < b for a, b in invocations)])
+        docs = documentation_spans(code) + tests
         for kind, value in included_contents(path, code, literals, root, skip=docs):
             if kind == 'unverifiable':
                 hits.append({'path': rel, 'kind': 'included-file', 'match': value})
