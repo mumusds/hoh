@@ -2,10 +2,12 @@
 # Check "adapter-live" (mode live): the native adapters against the installed CLIs, with model calls.
 #   TEST-025-04  claude  crates/hoh-agents/tests/claude_live.rs::claude_live_turns_resume_and_cancel
 #   TEST-024-04  codex   crates/hoh-agents/tests/codex_live.rs::codex_live_turn_and_cancel
+#   TEST-026-04  pi      crates/hoh-agents/tests/pi_live.rs::pi_live_turns_resume_and_cancel
 # Each is an ignored test whose name carries no TEST id (so the integration check never reports it as skipped); it
 # writes $HOH_EVIDENCE_DIR/<agent>-live-verdict.json, which this script turns into test-results.jsonl lines and
 # live-sessions.json (contracts/live-session.schema.json). A verdict is PASS, BLOCKED (CLI missing, not logged in, or
-# claude run as root; reported SKIPPED, never PASS) or FAIL. Exit 0 = all PASS, 1 = any FAIL, 3 = otherwise BLOCKED.
+# claude run as root), NOT_RUN (pi not installed, AC-026-04) or FAIL; BLOCKED and NOT_RUN are reported SKIPPED, never
+# PASS. Exit 0 = all PASS, 1 = any FAIL, 3 = otherwise BLOCKED or NOT_RUN.
 # The parent agent session's variables are removed first, as the protocol recorder does, so a nested run is a fresh
 # native session.
 set -Eeuo pipefail
@@ -22,25 +24,29 @@ live() {
   verdict="$out/$agent-live-verdict.json"
   rm -f "$verdict"
   bin="$(command -v "$agent" || true)"
-  if [[ -z "$bin" ]]; then
+  if [[ -z "$bin" && "$agent" == pi ]]; then
+    printf '{"status": "NOT_RUN", "detail": "pi is not installed", "sessions": []}\n' > "$verdict"
+  elif [[ -z "$bin" ]]; then
     printf '{"status": "BLOCKED", "detail": "%s is not installed", "sessions": []}\n' "$agent" > "$verdict"
   elif [[ "$agent" == claude && "$(id -u)" == 0 ]]; then
     # AC-025-04 runs as a non-root user: the adapter never bypasses permissions as root.
     printf '{"status": "BLOCKED", "detail": "running as root", "sessions": []}\n' > "$verdict"
   else
-    HOH_LIVE_OUT="$out" HOH_LIVE_CLAUDE="$bin" HOH_LIVE_CODEX="$bin" cargo test -p hoh-agents --locked \
+    HOH_LIVE_OUT="$out" HOH_LIVE_CLAUDE="$bin" HOH_LIVE_CODEX="$bin" HOH_LIVE_PI="$bin" cargo test -p hoh-agents --locked \
       --test "$binary" -- --ignored --exact "$name" --nocapture > "$out/$agent-live.log" 2>&1 || true
   fi
 }
 live claude claude_live claude_live_turns_resume_and_cancel
 live codex codex_live codex_live_turn_and_cancel
+live pi pi_live pi_live_turns_resume_and_cancel
 
 python3 - "$out" <<'PY'
 import json, os, sys
 from pathlib import Path
 out = Path(sys.argv[1])
 cases = [('claude', 'TEST-025-04', 'crates/hoh-agents/tests/claude_live.rs::claude_live_turns_resume_and_cancel'),
-         ('codex', 'TEST-024-04', 'crates/hoh-agents/tests/codex_live.rs::codex_live_turn_and_cancel')]
+         ('codex', 'TEST-024-04', 'crates/hoh-agents/tests/codex_live.rs::codex_live_turn_and_cancel'),
+         ('pi', 'TEST-026-04', 'crates/hoh-agents/tests/pi_live.rs::pi_live_turns_resume_and_cancel')]
 statuses, sessions = [], []
 with (out / 'test-results.jsonl').open('a', encoding='utf-8') as results:
     for agent, test_id, name in cases:
@@ -51,7 +57,7 @@ with (out / 'test-results.jsonl').open('a', encoding='utf-8') as results:
         status = v.get('status')
         statuses.append(status)
         results.write(json.dumps({'schema_version': '1.0', 'test_id': test_id, 'name': name,
-                                  'status': {'PASS': 'PASS', 'BLOCKED': 'SKIPPED'}.get(status, 'FAIL'),
+                                  'status': {'PASS': 'PASS', 'BLOCKED': 'SKIPPED', 'NOT_RUN': 'SKIPPED'}.get(status, 'FAIL'),
                                   'detail': f"{status}: {v.get('detail', '')}"[:4096]}, ensure_ascii=False) + '\n')
         sessions += [s for s in v.get('sessions', []) if s.get('session_id')]
         print(f"adapter-live: {agent}: {status}: {v.get('detail', '')}", file=sys.stderr)
@@ -59,5 +65,6 @@ candidate = os.environ.get('HOH_CANDIDATE_ID')
 if sessions and candidate:
     (out / 'live-sessions.json').write_text(json.dumps({'schema_version': '1.0', 'check_id': os.environ.get('HOH_CHECK_ID', 'adapter-live'),
                                                         'harness_candidate_id': candidate, 'sessions': sessions}, indent=1))
-sys.exit(1 if any(s not in ('PASS', 'BLOCKED') for s in statuses) else 3 if 'BLOCKED' in statuses else 0)
+sys.exit(1 if any(s not in ('PASS', 'BLOCKED', 'NOT_RUN') for s in statuses)
+         else 3 if {'BLOCKED', 'NOT_RUN'} & set(statuses) else 0)
 PY
