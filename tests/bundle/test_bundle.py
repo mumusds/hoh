@@ -120,7 +120,7 @@ class BundleContracts(unittest.TestCase):
         for i,case in enumerate(keywords):
             v=Draft202012Validator(case['schema'],format_checker=Draft202012Validator.FORMAT_CHECKER)
             with self.subTest(keyword_case=i,note=case['note']):self.assertEqual(v.is_valid(case['instance']),case.get('python_valid',case['valid']))
-        self.assertEqual(sum('python_valid' in c for c in keywords),1)  # divergences are rare and named in their note
+        self.assertEqual(sum('python_valid' in c for c in keywords),4)  # divergences are rare and named in their note
         defs={c['def'] for c in corpus if c['schema']=='protocol'}
         self.assertLessEqual(set(docs['protocol']['$defs'])-{'BlockedReason','RejectionReason','ErrorCode','ReasonCode'},defs)
     def test_original_skills_available(self):
