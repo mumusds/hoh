@@ -73,6 +73,7 @@ python3 tools/release_gate.py --manifest .hoh-dev/release/manifest.json
   SSH 测试（REQ-015/REQ-061）按 `.hoh-dev/test-infra.json` 的 `test_sshd` 路径自行启动 sshd：临时目录里生成主机密钥与用户密钥，配置至少包含 `ListenAddress 127.0.0.1`、空闲端口、`HostKey`、`PidFile`、`AuthorizedKeysFile`（临时文件）、`PasswordAuthentication no`、`KbdInteractiveAuthentication no`、`UsePAM no`、`StrictModes no`；包里有哪个辅助程序就加哪个配置项：`sshd_session` 非 null（OpenSSH ≥ 9.8）时加 `SshdSessionPath`，`sshd_auth` 非 null（≥ 10.0）时加 `SshdAuthPath`，指向解压目录。Ubuntu 24.04 的 9.6p1 包只有 sshd，两项都不加；Ubuntu 26.04 的 10.2p1 两项都要加；用 `sshd -D -e -f <配置>` 前台运行，测试结束时终止并删除临时目录。
 - `scripts/dev/session-context.sh`：Claude Code 的 SessionStart 钩子（`.claude/settings.json`），在会话启动、恢复或压缩后打印分支、未提交改动、运行中任务与 PROGRESS 的下一步；委派会话（设置了 `HOH_BOOTSTRAP_PARENT`）不输出，保持审查独立。
 - `deny.toml`：依赖许可、来源与禁用规则；static 检查离线运行 `cargo deny check licenses bans sources`，CI 另外检查 RustSec 公告。
+- `scripts/product/persistence_scan.py`：AC-062-05 的静态扫描，由 static 检查运行。扫描 `crates/*/src/**/*.rs`、各 crate 的 `Cargo.toml` 与 `web/`（存在时），在 `crates/hoh-core/src/persistence/` 以外查找 SQL 写语句（字符串字面量中的 INSERT/REPLACE INTO、UPDATE … SET、DELETE FROM、UPSERT）、rusqlite 写调用与任何 rusqlite 引用、hoh-core 以外的 rusqlite 依赖以及 web 的 SQLite 依赖；注释不计。命中数为 0 且扫描文件数大于 0 才 PASS；在 run_check 下把 TEST-062-05 的结果追加到 `test-results.jsonl`。
 
 ## 工具退出语义
 

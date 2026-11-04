@@ -3,6 +3,7 @@
 
 pub mod integer;
 pub mod nullable;
+pub mod persistence;
 pub mod protocol;
 pub mod schema;
 pub mod time;
