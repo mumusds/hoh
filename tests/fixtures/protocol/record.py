@@ -146,7 +146,12 @@ def members(cgroup: Path) -> list[int]:
     """Processes in the cgroup and all its child cgroups: the same subtree that cgroup.events and cgroup.kill cover,
     since a descendant may move into a child cgroup of the scope it owns (M0R11-01)."""
     found: list[int] = []
-    for directory, _, _ in os.walk(cgroup):
+
+    def unlisted(exc: OSError) -> None:  # only a vanished directory is an empty one (M0R12-01)
+        if exc.errno not in GONE:
+            raise exc
+
+    for directory, _, _ in os.walk(cgroup, onerror=unlisted):
         try:
             found += [int(x) for x in (Path(directory) / 'cgroup.procs').read_text().split()]
         except OSError as exc:
