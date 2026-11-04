@@ -1064,7 +1064,13 @@ async fn a_steer_seen_before_its_answer_is_applied() -> R {
         .iter()
         .position(|f| f["id"] == 4)
         .ok_or("no steer answer")?;
-    case.frames.insert(ack, moved);
+    // codex can only show the steer's message once it has the steer: wait for the turn/steer, then the message, then
+    // the answer.
+    case.frames.insert(
+        ack,
+        json!({"hoh_wait": {"method": "turn/steer", "count": 1}}),
+    );
+    case.frames.insert(ack + 1, moved);
     // The stale steer is not part of this case.
     let stale = case
         .frames
@@ -1092,5 +1098,266 @@ async fn a_steer_seen_before_its_answer_is_applied() -> R {
     );
     assert_eq!(input_state(&world, "I1")?, InputState::Applied);
     assert_eq!(outcome.state, AttemptState::Settled);
+    Ok(())
+}
+
+/// A tool that started before the stream ended leaves an UNKNOWN_EFFECT attempt in the store, ended, for the
+/// reconciler — over the App Server, also when this turn's id was never confirmed, and over exec (M1T04R-06/07).
+#[tokio::test]
+async fn a_tool_started_before_the_stream_ended_is_an_unknown_effect() -> R {
+    let world = World::new()?;
+    // Turn known: the interrupt case cut right after its command started.
+    let mut case = Case::load("app-server-interrupt")?;
+    let tool = case
+        .frames
+        .iter()
+        .position(|f| {
+            f["method"] == "item/started" && f["params"]["item"]["type"] == "commandExecution"
+        })
+        .ok_or("no command")?;
+    let command = case.frames[tool].clone();
+    case.frames.truncate(tool + 1);
+    // Turn never confirmed: this thread's turn and command arrive before turn/start is answered, then the stream ends.
+    let mut early = Case::load("app-server-interrupt")?;
+    let start = early
+        .frames
+        .iter()
+        .position(|f| f["id"] == 2)
+        .ok_or("no turn/start answer")?;
+    let started = early
+        .frames
+        .iter()
+        .find(|f| f["method"] == "turn/started")
+        .cloned()
+        .ok_or("no turn/started")?;
+    early.frames.truncate(start);
+    early.frames.push(started);
+    early.frames.push(command);
+    for (i, case) in [case, early].iter().enumerate() {
+        let fake = world.fake(&format!("tool-eof-{i}"), Some(case), "exec", true)?;
+        let attempt = world
+            .attempt_in("codex", &format!("A{i}"), &format!("S{i}"), "0.166.0")
+            .await?;
+        let outcome = run(&world, &attempt, &world.turn(&fake, &format!("logs/A{i}"))?).await?;
+        assert_eq!(
+            (outcome.state, outcome.failure.as_deref()),
+            (AttemptState::UnknownEffect, Some("PROTOCOL_INCOMPLETE")),
+            "case {i}"
+        );
+        let row = world
+            .store
+            .reader()?
+            .attempt(&format!("A{i}"))?
+            .ok_or("no attempt")?;
+        assert_eq!(
+            (row.state, row.ended_at.is_some()),
+            (AttemptState::UnknownEffect, true),
+            "case {i}"
+        );
+    }
+    // exec: a command started, then the process ends without turn.completed.
+    let fake = world.fake("exec-tool-eof", None, "exec", false)?;
+    rewrite_exec(
+        &fake,
+        &[
+            json!({"type": "thread.started", "thread_id": "t-exec"}),
+            json!({"type": "turn.started"}),
+            json!({"type": "item.started", "item": {"id": "item_0", "type": "command_execution", "command": "touch x"}}),
+        ],
+    )?;
+    let attempt = world.attempt_in("codex", "A9", "S9", "0.166.0").await?;
+    let mut turn = world.turn(&fake, "logs/A9")?;
+    turn.launch.app_server_help = None;
+    let outcome = run(&world, &attempt, &turn).await?;
+    assert_eq!(outcome.state, AttemptState::UnknownEffect);
+    let row = world.store.reader()?.attempt("A9")?.ok_or("no A9")?;
+    assert_eq!(
+        (row.state, row.ended_at.is_some()),
+        (AttemptState::UnknownEffect, true)
+    );
+    Ok(())
+}
+
+/// A user message that came while a steer was waiting for its answer belongs to that steer: when codex refuses it,
+/// a later steer with the same text does not take the message over (M1T04R-08).
+#[tokio::test]
+async fn a_refused_steers_message_is_not_taken_by_a_later_one() -> R {
+    let world = World::new()?;
+    let mut case = Case::load("app-server-steer")?;
+    let text = "Stop running the command now and reply exactly STEERED.";
+    let item = case
+        .frames
+        .iter()
+        .position(|f| {
+            f["method"] == "item/started" && f["params"]["item"]["content"][0]["text"] == text
+        })
+        .ok_or("no steer item")?;
+    let message = case.frames.remove(item);
+    let refusal = case
+        .frames
+        .iter()
+        .position(|f| f["id"] == 3)
+        .ok_or("no refusal")?;
+    case.frames.insert(
+        refusal,
+        json!({"hoh_wait": {"method": "turn/steer", "count": 1}}),
+    );
+    case.frames.insert(refusal + 1, message);
+    let fake = world.fake("refused-then", Some(&case), "exec", false)?;
+    let attempt = world.attempt("A1").await?;
+    let turn = world.turn(&fake, "logs/A1")?;
+    let (tx, steers) = mpsc::channel(4);
+    let latch = CancelLatch::new();
+    let running = codex::run(&world.store, &attempt, &turn, &latch, steers);
+    let steering = async {
+        active_turn(&world, "A1").await?;
+        let first = steer(&world, &tx, "I1", text, Some("hoh-stale-turn-id"))
+            .await?
+            .await?;
+        let second = steer(&world, &tx, "I2", text, None).await?.await?;
+        Ok::<(SteerReceipt, SteerReceipt), Box<dyn std::error::Error>>((first, second))
+    };
+    let (outcome, receipts) = tokio::join!(running, steering);
+    let (outcome, (first, second)) = (outcome?, receipts?);
+    assert!(matches!(first, SteerReceipt::Rejected { .. }), "{first:?}");
+    assert!(
+        matches!(second, SteerReceipt::Delivered { .. }),
+        "{second:?}"
+    );
+    assert_eq!(input_state(&world, "I1")?, InputState::Rejected);
+    assert_eq!(input_state(&world, "I2")?, InputState::Delivered);
+    assert_eq!(outcome.state, AttemptState::Settled);
+    Ok(())
+}
+
+/// One user message item applies one steer, even if codex repeats it (M1T04R-09).
+#[tokio::test]
+async fn one_message_item_applies_one_steer() -> R {
+    let world = World::new()?;
+    let mut case = Case::load("app-server-steer")?;
+    let text = "Stop running the command now and reply exactly STEERED.";
+    let turn_id = case
+        .frames
+        .iter()
+        .find_map(|f| f["result"]["turn"]["id"].as_str())
+        .ok_or("no turn")?
+        .to_owned();
+    // Both steers are taken; the message item comes twice with one id.
+    let refusal = case
+        .frames
+        .iter()
+        .position(|f| f["id"] == 3)
+        .ok_or("no refusal")?;
+    case.frames[refusal] = json!({"id": 3, "result": {"turnId": turn_id}});
+    let item = case
+        .frames
+        .iter()
+        .position(|f| {
+            f["method"] == "item/started" && f["params"]["item"]["content"][0]["text"] == text
+        })
+        .ok_or("no steer item")?;
+    let again = case.frames[item].clone();
+    case.frames.insert(item + 1, again);
+    let fake = world.fake("twice", Some(&case), "exec", false)?;
+    let attempt = world.attempt("A1").await?;
+    let turn = world.turn(&fake, "logs/A1")?;
+    let (tx, steers) = mpsc::channel(4);
+    let latch = CancelLatch::new();
+    let running = codex::run(&world.store, &attempt, &turn, &latch, steers);
+    let steering = async {
+        active_turn(&world, "A1").await?;
+        let first = steer(&world, &tx, "I1", text, None).await?.await?;
+        let second = steer(&world, &tx, "I2", text, None).await?.await?;
+        Ok::<(SteerReceipt, SteerReceipt), Box<dyn std::error::Error>>((first, second))
+    };
+    let (outcome, receipts) = tokio::join!(running, steering);
+    let (outcome, _) = (outcome?, receipts?);
+    let states = [input_state(&world, "I1")?, input_state(&world, "I2")?];
+    assert_eq!(states, [InputState::Applied, InputState::Delivered]);
+    assert_eq!(outcome.state, AttemptState::Settled);
+    Ok(())
+}
+
+/// A message that comes after the refusal of a same-text steer goes to the later steer (the refused one is gone).
+#[tokio::test]
+async fn a_message_after_a_refusal_goes_to_the_later_steer() -> R {
+    let world = World::new()?;
+    let case = Case::load("app-server-steer")?;
+    let text = "Stop running the command now and reply exactly STEERED.";
+    let fake = world.fake("after-refusal", Some(&case), "exec", false)?;
+    let attempt = world.attempt("A1").await?;
+    let turn = world.turn(&fake, "logs/A1")?;
+    let (tx, steers) = mpsc::channel(4);
+    let latch = CancelLatch::new();
+    let running = codex::run(&world.store, &attempt, &turn, &latch, steers);
+    let steering = async {
+        active_turn(&world, "A1").await?;
+        let first = steer(&world, &tx, "I1", text, Some("hoh-stale-turn-id"))
+            .await?
+            .await?;
+        let second = steer(&world, &tx, "I2", text, None).await?.await?;
+        Ok::<(SteerReceipt, SteerReceipt), Box<dyn std::error::Error>>((first, second))
+    };
+    let (outcome, receipts) = tokio::join!(running, steering);
+    let (outcome, (first, _)) = (outcome?, receipts?);
+    assert!(matches!(first, SteerReceipt::Rejected { .. }), "{first:?}");
+    assert_eq!(
+        [input_state(&world, "I1")?, input_state(&world, "I2")?],
+        [InputState::Rejected, InputState::Applied]
+    );
+    assert_eq!(outcome.state, AttemptState::Settled);
+    Ok(())
+}
+
+/// stdin that breaks while codex goes on (it closed its end) stops the process, but the stream's end decides: a tool
+/// that had started still makes the end UNKNOWN_EFFECT, not a stdin failure.
+#[tokio::test]
+async fn a_broken_stdin_leaves_the_end_to_the_stream() -> R {
+    let world = World::new()?;
+    let full = Case::load("app-server-interrupt")?;
+    let started = full
+        .frames
+        .iter()
+        .find(|f| f["method"] == "turn/started")
+        .cloned()
+        .ok_or("no turn/started")?;
+    let command = full
+        .frames
+        .iter()
+        .find(|f| {
+            f["method"] == "item/started" && f["params"]["item"]["type"] == "commandExecution"
+        })
+        .cloned()
+        .ok_or("no command")?;
+    let thread_answer = full
+        .frames
+        .iter()
+        .position(|f| f["id"] == 1)
+        .ok_or("no thread answer")?;
+    let mut case = Case {
+        frames: full.frames[..thread_answer].to_vec(),
+        requests: full.requests.clone(),
+    };
+    // After thread/start arrives codex closes stdin, answers it, and its turn and command follow: turn/start can
+    // no longer be written.
+    case.frames
+        .push(json!({"hoh_wait": {"method": "thread/start", "count": 1}}));
+    case.frames.push(json!({"hoh_close_stdin": true}));
+    // One write: the client reads the answer and this turn's frames together, before it can stop codex.
+    case.frames
+        .push(json!({"hoh_batch": [full.frames[thread_answer].clone(), started, command]}));
+    // codex stays up after that, so the failed write is seen while it runs (the adapter then stops it).
+    case.frames.push(json!({"hoh_sleep": 5.0}));
+    let fake = world.fake("broken-stdin", Some(&case), "exec", false)?;
+    let attempt = world.attempt("A1").await?;
+    let outcome = run(&world, &attempt, &world.turn(&fake, "logs/A1")?).await?;
+    assert_eq!(
+        (outcome.state, outcome.failure.as_deref()),
+        (AttemptState::UnknownEffect, Some("PROTOCOL_INCOMPLETE"))
+    );
+    let stdin_failed = events(&world, "adapter.diagnostic")?
+        .into_iter()
+        .any(|d| d["reason"] == "stdin failed");
+    assert!(stdin_failed, "the stdin failure is recorded");
     Ok(())
 }
