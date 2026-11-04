@@ -689,6 +689,21 @@ async fn blockers_survive_a_pause_and_hold_back_work() -> R {
     )?;
     step(3, RunState::Running).await?;
     assert_eq!(run_row(&path)?, ("RUNNING".to_owned(), 4, None));
+    // The blocker set is judged by its JSON content: any empty array is empty, anything but an array is blocked.
+    for (json, resumes) in [
+        ("[ ]", true),
+        ("[\n]", true),
+        ("{}", false),
+        ("[\"NEED_DECISION\"]", false),
+    ] {
+        conn.execute(
+            "UPDATE runs SET state = 'PAUSED', revision = 0, resume_state = 'RUNNING', blocked_reason = NULL, \
+             blocked_reasons_json = ?1 WHERE run_id = 'r1'",
+            [json],
+        )?;
+        let result = step(0, RunState::Running).await;
+        assert_eq!(result.is_ok(), resumes, "{json:?}: {result:?}");
+    }
     // Tasks likewise: a blocked task with a recorded reason becomes ready only once the reason is removed.
     conn.execute_batch(
         "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', 'p1', printf('%064d', 1), 1);
