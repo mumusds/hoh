@@ -174,26 +174,37 @@ struct CodexSchema {
 }
 
 /// The `method` names a protocol schema file lists (`oneOf[*].properties.method.enum`/`const`); `None` unless it is
-/// an object with a non-empty `oneOf` naming at least one method.
+/// an object with a non-empty `oneOf` whose method-bearing branches are well-formed object schemas with a string
+/// method (M1T01R-15, M1T01R-18), naming at least one method.
 fn schema_methods(value: &serde_json::Value) -> Option<std::collections::BTreeSet<String>> {
+    use serde_json::Value;
     let variants = value
         .as_object()?
         .get("oneOf")?
         .as_array()
         .filter(|v| !v.is_empty())?;
-    let methods: std::collections::BTreeSet<String> = variants
-        .iter()
-        .filter_map(|v| v.pointer("/properties/method"))
-        .flat_map(|m| {
-            let listed = m
-                .get("enum")
-                .and_then(serde_json::Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            listed.into_iter().chain(m.get("const").cloned())
-        })
-        .filter_map(|m| m.as_str().map(str::to_owned))
-        .collect();
+    let mut methods = std::collections::BTreeSet::new();
+    for branch in variants {
+        let branch = branch.as_object()?;
+        let Some(method) = branch.get("properties").and_then(|p| p.get("method")) else {
+            continue;
+        };
+        let method = method.as_object()?;
+        let typed = |schema: &serde_json::Map<String, Value>, want: &str| {
+            schema.get("type").is_none_or(|t| t == want)
+        };
+        if !typed(branch, "object") || !typed(method, "string") {
+            return None;
+        }
+        let listed = match (method.get("enum"), method.get("const")) {
+            (Some(Value::Array(names)), None) if !names.is_empty() => names.clone(),
+            (None, Some(name)) => vec![name.clone()],
+            _ => return None,
+        };
+        for name in listed {
+            methods.insert(name.as_str()?.to_owned());
+        }
+    }
     (!methods.is_empty()).then_some(methods)
 }
 
@@ -329,7 +340,7 @@ pub fn find_on_path(name: &str, path: &OsStr) -> Option<PathBuf> {
 pub fn resolve_implementation(agent: Agent, launcher: &Path) -> Result<PathBuf, ProbeError> {
     let real = std::fs::canonicalize(launcher)?;
     let found = match agent {
-        Agent::Codex => codex_native(&real),
+        Agent::Codex => codex_native(&real)?,
         Agent::Pi => real.parent().and_then(Path::parent).and_then(pi_release),
         Agent::Claude => None,
     };
@@ -357,36 +368,57 @@ fn codex_target() -> Option<(&'static str, &'static str)> {
 /// Node's `require.resolve(<package>/package.json)` from `start`: `node_modules/<package>` in `start` and each
 /// ancestor (directories that are themselves named node_modules are skipped), returning the package directory.
 /// The first package found is the answer: if its `exports` do not export `./package.json`, Node throws
-/// (ERR_PACKAGE_PATH_NOT_EXPORTED) instead of looking further, and this returns `None` (M1T01R-13).
-fn node_resolve(start: &Path, package: &str) -> Option<PathBuf> {
-    let found = start
+/// (ERR_PACKAGE_PATH_NOT_EXPORTED) instead of looking further, and this returns `Ok(None)` (M1T01R-13). Export
+/// forms whose outcome needs Node's full resolver are refused (M1T01R-17).
+fn node_resolve(start: &Path, package: &str) -> Result<Option<PathBuf>, String> {
+    let Some(found) = start
         .ancestors()
         .filter(|dir| dir.file_name() != Some(OsStr::new("node_modules")))
         .map(|dir| dir.join("node_modules").join(package))
-        .find(|candidate| candidate.join("package.json").is_file())?;
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(found.join("package.json")).ok()?).ok()?;
-    exports_package_json(manifest.get("exports")).then_some(found)
+        .find(|candidate| candidate.join("package.json").is_file())
+    else {
+        return Ok(None);
+    };
+    let manifest: serde_json::Value = std::fs::read(found.join("package.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .ok_or_else(|| format!("{}: unreadable package.json", found.display()))?;
+    match package_json_export(manifest.get("exports")) {
+        Export::Resolvable => Ok(Some(found)),
+        Export::NotExported => Ok(None),
+        Export::Unsupported => Err(format!(
+            "{}: its exports need Node's full resolver to tell which codex binary runs",
+            found.display()
+        )),
+    }
 }
 
-/// Whether a package's `exports` field lets `<package>/package.json` be resolved: no field (or null) does; a string,
-/// an array or a conditions object exports only the main entry; a subpath map must list `./package.json` or a
-/// pattern covering it.
-fn exports_package_json(exports: Option<&serde_json::Value>) -> bool {
+enum Export {
+    Resolvable,
+    NotExported,
+    Unsupported,
+}
+
+/// What `require.resolve("<package>/package.json")` does for an `exports` field, in the forms whose outcome is
+/// certain: no field (or null) resolves it; a string or a subpath map without `./package.json` and without
+/// patterns exports only other entries; `"./package.json": "./package.json"` resolves it. Conditions, arrays,
+/// patterns, redirects and null overrides are left to Node and refused here.
+fn package_json_export(exports: Option<&serde_json::Value>) -> Export {
     use serde_json::Value;
     match exports {
-        None | Some(Value::Null) => true,
-        Some(Value::Object(map)) if map.keys().all(|k| k.starts_with('.')) => {
-            map.iter().any(|(key, target)| {
-                !target.is_null()
-                    && (key == "./package.json"
-                        || key.split_once('*').is_some_and(|(prefix, suffix)| {
-                            "./package.json".starts_with(prefix)
-                                && "./package.json".ends_with(suffix)
-                        }))
-            })
+        None | Some(Value::Null) => Export::Resolvable,
+        Some(Value::String(_)) => Export::NotExported,
+        Some(Value::Object(map)) if !map.is_empty() && map.keys().all(|k| k.starts_with('.')) => {
+            if map.keys().any(|k| k.contains('*')) {
+                return Export::Unsupported;
+            }
+            match map.get("./package.json") {
+                None => Export::NotExported,
+                Some(Value::String(target)) if target == "./package.json" => Export::Resolvable,
+                Some(_) => Export::Unsupported,
+            }
         }
-        Some(_) => false,
+        Some(_) => Export::Unsupported,
     }
 }
 
@@ -404,18 +436,27 @@ fn is_codex_npm_wrapper(launcher: &Path) -> bool {
 
 /// The native binary `codex.js` (at its real path `launcher`) executes: `vendor/<triple>/bin/codex` in the platform
 /// package it resolves, else in the codex package's own `vendor` directory (M1T01R-02).
-fn codex_native(launcher: &Path) -> Option<PathBuf> {
-    if !is_codex_npm_wrapper(launcher) {
-        return None;
-    }
-    let (triple, package) = codex_target()?;
-    let start = launcher.parent()?;
-    let vendor = match node_resolve(start, package) {
-        Some(dir) => std::fs::canonicalize(dir).ok()?.join("vendor"),
-        None => start.parent()?.join("vendor"),
+fn codex_native(launcher: &Path) -> Result<Option<PathBuf>, ProbeError> {
+    let (Some((triple, package)), Some(start), true) = (
+        codex_target(),
+        launcher.parent(),
+        is_codex_npm_wrapper(launcher),
+    ) else {
+        return Ok(None);
+    };
+    let unsupported = |detail: String| ProbeError::Unsupported {
+        agent: Agent::Codex,
+        detail,
+    };
+    let vendor = match node_resolve(start, package).map_err(unsupported)? {
+        Some(dir) => std::fs::canonicalize(dir)?.join("vendor"),
+        None => match start.parent() {
+            Some(root) => root.join("vendor"),
+            None => return Ok(None),
+        },
     };
     let native = vendor.join(triple).join("bin/codex");
-    native.is_file().then_some(native)
+    Ok(native.is_file().then_some(native))
 }
 
 fn pi_release(agent_dir: &Path) -> Option<PathBuf> {
@@ -706,6 +747,37 @@ mod tests {
             resolve_implementation(Agent::Codex, &direct)?,
             std::fs::canonicalize(&direct)?
         );
+        std::fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_exports_forms_are_refused_not_guessed() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // M1T01R-17: conditions, arrays, patterns, redirects and null overrides need Node's full resolver; the probe
+        // refuses them instead of recording a binary the launcher might not run.
+        let (_, platform) = codex_target().ok_or("unsupported test platform")?;
+        let root = std::env::temp_dir().join(format!("hoh-codex-exports2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let platform_dir = root.join("lib/node_modules").join(platform);
+        let (launcher, _) = codex_layout(&root, Some(&platform_dir))?;
+        for exports in [
+            r#"{"./package.json": {"import": "./package.json"}}"#,
+            r#"{"./package.json": []}"#,
+            r#"{"./package.json": "./sub/package.json"}"#,
+            r#"{"./*": "./*", "./package.json": null}"#,
+            r#"{"./*": "./*"}"#,
+            r#"{"import": "./index.js"}"#,
+        ] {
+            std::fs::write(
+                platform_dir.join("package.json"),
+                format!("{{\"exports\": {exports}}}"),
+            )?;
+            assert!(
+                resolve_implementation(Agent::Codex, &launcher).is_err(),
+                "{exports}"
+            );
+        }
         std::fs::remove_dir_all(&root)?;
         Ok(())
     }

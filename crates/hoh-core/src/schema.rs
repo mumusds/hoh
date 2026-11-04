@@ -16,9 +16,49 @@
 
 use regex::Regex;
 use serde_json::{Map, Number, Value};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::OnceLock;
+
+/// Nested schema evaluations allowed on one thread; deeper is a violation, not a stack overflow.
+const MAX_EVAL_DEPTH: usize = 512;
+
+thread_local! {
+    static EVAL_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+/// One level of schema evaluation on this thread; released when dropped.
+struct EvalDepth;
+
+impl EvalDepth {
+    fn enter() -> Option<Self> {
+        EVAL_DEPTH.with(|d| {
+            (d.get() < MAX_EVAL_DEPTH).then(|| {
+                d.set(d.get() + 1);
+                EvalDepth
+            })
+        })
+    }
+}
+
+impl Drop for EvalDepth {
+    fn drop(&mut self) {
+        EVAL_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// Drop a value without recursion (serde_json drops nested values recursively).
+fn dismantle(value: Value) {
+    let mut stack = vec![value];
+    while let Some(v) = stack.pop() {
+        match v {
+            Value::Array(items) => stack.extend(items),
+            Value::Object(members) => stack.extend(members.into_iter().map(|(_, v)| v)),
+            _ => {}
+        }
+    }
+}
 
 /// One way an instance fails a schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,6 +191,7 @@ impl Schema {
     /// Load a schema document, refusing keywords and values this validator does not implement.
     pub fn new(document: Value) -> Result<Self, SchemaError> {
         if let Some(v) = precheck(&document) {
+            dismantle(document); // too deep to drop recursively (M1T01R-20)
             return Err(SchemaError(format!("{}: {}", v.instance_path, v.message)));
         }
         let mut patterns = HashMap::new();
@@ -207,6 +248,10 @@ impl Schema {
         spath: &str,
         out: &mut Vec<Violation>,
     ) {
+        // Bounded however the schema is built, e.g. a long acyclic chain of references (M1T01R-21).
+        let Some(_depth) = EvalDepth::enter() else {
+            return fail(out, ipath, spath, "schema evaluation nested too deep");
+        };
         let obj = match schema {
             Value::Bool(true) => return,
             Value::Bool(false) => return fail(out, ipath, spath, "no value is allowed here"),
@@ -780,6 +825,11 @@ fn portable_pattern(source: &str) -> Result<(), String> {
             },
             '[' if !in_class => in_class = true,
             ']' if in_class => in_class = false,
+            // Nested brackets (POSIX classes, unions) and the set operators && ~~ -- exist in the regex crate only.
+            '[' => return Err("brackets inside a class differ between dialects".to_owned()),
+            '&' | '~' | '-' if in_class && chars.peek() == Some(&c) => {
+                return Err(format!("{c}{c} inside a class differs between dialects"));
+            }
             '.' if !in_class => {
                 return Err("`.` outside a class differs between dialects; use a class".to_owned());
             }
@@ -1033,6 +1083,69 @@ mod tests {
         assert!(Schema::new(json!({"maximum": 18_446_744_073_709_551_616.0_f64})).is_err());
         assert!(Schema::new(json!({"const": [1e300]})).is_err());
         assert!(Schema::new(json!({"maximum": 18_446_744_073_709_551_615_u64})).is_ok());
+    }
+
+    #[test]
+    fn deep_owned_schema_documents_are_refused_without_overflow() {
+        // M1T01R-20: Schema::new owns its document; refusing a deep one must not drop it recursively.
+        let mut deep = json!([]);
+        for _ in 0..100_000 {
+            deep = Value::Array(vec![deep]);
+        }
+        // Built by hand: json!() would serialize the interpolated value recursively.
+        let mut document = serde_json::Map::new();
+        document.insert("const".to_owned(), deep);
+        assert!(Schema::new(Value::Object(document)).is_err());
+    }
+
+    #[test]
+    fn long_reference_chains_are_bounded() -> Result<(), SchemaError> {
+        // M1T01R-21: an acyclic chain of references is legal but must not exhaust the stack when evaluated.
+        let mut defs = serde_json::Map::new();
+        for i in 0..1000 {
+            defs.insert(
+                format!("d{i}"),
+                json!({"$ref": format!("#/$defs/d{}", i + 1)}),
+            );
+        }
+        defs.insert("d1000".to_owned(), json!({"type": "null"}));
+        let chain = Schema::new(json!({"$defs": defs, "$ref": "#/$defs/d0"}))?;
+        let errors = chain.validate(&json!(null)).err().unwrap_or_default();
+        assert!(
+            errors.iter().any(|v| v.message.contains("too deep")),
+            "{:?}",
+            errors.first()
+        );
+        // A recursive schema over an instance at the nesting limit still evaluates.
+        let tree = Schema::new(
+            json!({"$defs": {"n": {"type": "array", "items": {"$ref": "#/$defs/n"}}}, "$ref": "#/$defs/n"}),
+        )?;
+        let nested = (0..(MAX_DEPTH - 1)).fold(json!([]), |v, _| Value::Array(vec![v]));
+        assert!(tree.validate(&nested).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn character_classes_are_limited_to_portable_forms() {
+        // M1T01R-19: set operations, POSIX classes and nested brackets differ between ECMA-262 and the regex crate.
+        for pattern in [
+            "^[a&&b]$",
+            "^[a~~b]$",
+            "^[a-z--b]$",
+            "^[[:alpha:]]$",
+            "^[a[b]]$",
+        ] {
+            assert!(
+                Schema::new(json!({"pattern": pattern})).is_err(),
+                "{pattern}"
+            );
+        }
+        for pattern in ["^[^a-z]$", r"^[a\-z]$", "^[A-Z0-9_]+$"] {
+            assert!(
+                Schema::new(json!({"pattern": pattern})).is_ok(),
+                "{pattern}"
+            );
+        }
     }
 
     #[test]
