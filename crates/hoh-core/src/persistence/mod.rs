@@ -547,8 +547,9 @@ impl Store {
             .await
     }
 
-    /// End an attempt: the terminal move `change`, or CANCELLED (with the same facts, no failure reason) if `latch`
-    /// accepted a cancel before this commits; the state written. Once it succeeds, `latch` refuses cancels.
+    /// End an attempt's turn: the terminal or UNKNOWN_EFFECT move `change`, or CANCELLED (with the same facts, no
+    /// failure reason) if `latch` accepted a cancel before this commits; the state written. Once it succeeds, `latch`
+    /// refuses cancels.
     pub async fn end_attempt(
         &self,
         change: AttemptMove,
