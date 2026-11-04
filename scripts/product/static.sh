@@ -11,7 +11,7 @@ unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS CARGO_BUILD_RUSTC 
 # the scan below (M2T01R-30).
 export RUSTC_WRAPPER= CARGO_BUILD_RUSTC_WRAPPER= RUSTC_WORKSPACE_WRAPPER= CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER=
 for var in $(compgen -e); do
-  if [[ "$var" =~ ^CARGO_TARGET_.*_RUSTFLAGS$ ]]; then unset "$var"; fi
+  if [[ "$var" =~ ^CARGO_TARGET_.*_RUSTFLAGS$ || "$var" =~ ^CARGO_PROFILE_ ]]; then unset "$var"; fi
 done
 export CLIPPY_CONF_DIR="$PWD"
 logs="$(mktemp -d)"; trap 'rm -rf "$logs"' EXIT

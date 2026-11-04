@@ -48,11 +48,24 @@ The boundary is enforced by the compiler, and this scan checks that nothing swit
    continuations), with literals separated only by commas joined (concat!), are hits.
 5. web/ (when present): no SQLite package in package.json dependencies (by name or npm: alias spec), nowhere in a
    lockfile (every key and string value), and no import of one.
+6. Every other file of the candidate (git: tracked, and untracked but not ignored), wherever it lies and however
+   product code would reach it (a joined path, `python3 -m`, a driver importing it, an embedded driver; M2T01R-51):
+   if it mentions SQLite or holds a SQL write, it must be named in the whitelist configuration
+   scripts/product/persistence-whitelist.json (AC-062-05), each entry with its reason; Markdown under docs/ and
+   reports/ is prose and needs no entry. The whitelist names only files that need it (existing, outside persistence,
+   not a member's Rust source, still mentioning SQLite). No file of the candidate is a symbolic link (M2T01R-52), and
+   `include_str!`/`include_bytes!` may not reach outside the repository. Cargo configurations follow the profile rule
+   of check 3 (M2T01R-50), and static.sh clears CARGO_PROFILE_* from its environment.
+Out of reach of any of this (docs/22-tooling.md): a program, script or SQL that exists only at run time (a name or
+text assembled from pieces, read from the environment or a file outside the candidate) and conditional compilation
+produced by a macro (M2T01R-53/54). Writing such code is deliberate circumvention, which this check does not claim to
+stop (docs/21: the checks guard against accidental drift, not against someone rewriting files on purpose); review
+does.
 Scanning no file at all fails (no empty scan). Prints a JSON summary; with --out appends one test-results.jsonl
 line for TEST-062-05. --metadata reads `cargo metadata` JSON from a file (tests).
 """
 from __future__ import annotations
-import argparse, json, re, subprocess, sys, tomllib
+import argparse, json, os, re, subprocess, sys, tomllib
 from pathlib import Path
 
 PERSISTENCE = 'crates/hoh-core/src/persistence/'
@@ -105,6 +118,17 @@ SUPPRESSING = re.compile(r'(?<![\w:])(?:clippy::(?:disallowed_methods?|style|all
 
 def sqlite_package(name: str) -> bool:
     return 'sqlite' in name.lower()
+
+
+def mentions(text: str) -> bool:
+    """Whether a text mentions SQLite or holds a SQL write statement (what check 6 looks for in every file)."""
+    return bool(re.search(r'sqlite', text, re.IGNORECASE) or SQL_WRITE.search(text))
+
+
+# AC-062-05's whitelist configuration: the files besides the Persistence module that may mention SQLite (check 6).
+WHITELIST = 'scripts/product/persistence-whitelist.json'
+# Markdown here is prose about the system, not something the product runs or embeds.
+DOCUMENTATION = ('docs/', 'reports/')
 
 
 def decode(body: str) -> str:
@@ -462,7 +486,6 @@ def lint_configuration_checks(root: Path, metadata: dict, hits: list) -> None:
 def cargo_configs(root: Path) -> list[Path]:
     """Cargo configuration files that apply when cargo runs in the repository: the repository's and every ancestor's
     `.cargo/config(.toml)`, and `$CARGO_HOME/config(.toml)` (M2T01R-30)."""
-    import os
     homes = [Path(os.environ.get('CARGO_HOME') or Path.home() / '.cargo')]
     dirs = [d / '.cargo' for d in [root, *root.parents]] + homes
     return [d / name for d in dirs for name in ('config.toml', 'config') if (d / name).is_file()]
@@ -482,6 +505,12 @@ def forbidden_cargo_keys(cfg: Path) -> list[str]:
     found += ['env' for _ in [1] if data.get('env')]
     found += [f'alias.{a}' for a in (data.get('alias') or {}) if a in ('clippy', 'check', 'build', 'metadata', 'deny', 'fmt')]
     found += ['unstable' for _ in [1] if data.get('unstable')]
+    # The profile rule of the manifests holds for configurations too (M2T01R-50).
+    for name, profile in (data.get('profile') or {}).items():
+        if name not in ('dev', 'release'):
+            found.append(f'profile.{name}')
+        elif isinstance(profile, dict) and 'panic' in profile:
+            found.append(f'profile.{name}.panic')
     return found
 
 
@@ -526,7 +555,7 @@ def scan(root: Path, metadata: dict) -> dict:
                 hits.append({'path': rel, 'kind': 'clippy-cfg', 'match': predicate[:200]})
         if is_test_code(path, metadata):
             continue
-        for kind, value in included_contents(path, code, literals):
+        for kind, value in included_contents(path, code, literals, root):
             if kind == 'unverifiable':
                 hits.append({'path': rel, 'kind': 'included-file', 'match': value})
             elif re.search(r'sqlite', value, re.IGNORECASE) or SQL_WRITE.search(value):
@@ -569,8 +598,10 @@ def scan(root: Path, metadata: dict) -> dict:
                 hits.extend({'path': rel, 'kind': 'web-dependency', 'match': s[:200]} for s in found)
             elif re.search(r'''(?:\bfrom|\bimport|require\()\s*\(?\s*['"][^'"]*sqlite''', text, re.IGNORECASE):
                 hits.append({'path': rel, 'kind': 'web-import', 'match': 'sqlite'})
+    other_files = content_checks(root, metadata, hits)
     scanned = len(files) + web_files
     return {'files_scanned': scanned, 'web_files_scanned': web_files, 'web_present': web.is_dir(),
+            'other_files_scanned': other_files,
             'dev_dependency_uses': dev_uses, 'hits': hits, 'status': 'PASS' if scanned > 0 and not hits else 'FAIL'}
 
 
@@ -613,7 +644,68 @@ def named_repository_files(root: Path, path: Path, literals: list[tuple[int, int
     return out
 
 
-def included_contents(path: Path, code: str, literals: list[tuple[int, int, str]]) -> list[tuple[str, str]]:
+def repository_files(root: Path, metadata: dict) -> list[Path]:
+    """The candidate's files: in a git work tree the tracked and the untracked files that are not ignored (an ignored
+    file is part of no candidate); elsewhere every file. Symbolic links are listed, not followed; the build output is
+    left out."""
+    target = Path(metadata.get('target_directory') or root / 'target').resolve()
+    if (root / '.git').exists():
+        out = subprocess.run(['git', '-C', str(root), 'ls-files', '-z', '--cached', '--others', '--exclude-standard'],
+                             capture_output=True, check=True).stdout
+        paths = [root / name for name in out.decode('utf-8', 'surrogateescape').split('\0') if name]
+    else:
+        paths = []
+        for d, dirs, names in os.walk(root):
+            dirs[:] = [n for n in dirs if n != '.git']
+            paths += [Path(d) / n for n in names]
+            paths += [Path(d) / n for n in dirs if (Path(d) / n).is_symlink()]
+            dirs[:] = [n for n in dirs if not (Path(d) / n).is_symlink()]
+    return sorted(p for p in paths if os.path.lexists(p) and not p.is_relative_to(target))
+
+
+def content_checks(root: Path, metadata: dict, hits: list) -> int:
+    """Check 6: every file of the candidate but the Persistence module and the members' Rust sources (checks 2-4) that
+    mentions SQLite or holds a SQL write must be in the whitelist (Markdown under DOCUMENTATION is prose), so a helper
+    is caught wherever it lies and however it is reached; the whitelist names only files that need it; no file is a
+    symbolic link (a linked module would let product code run what the checks treat as test code, M2T01R-52).
+    Returns the number of files read."""
+    members = tuple(f'{rel_to(d, root)}/' for d in member_dirs(metadata))
+    try:
+        listed = json.loads((root / WHITELIST).read_text(encoding='utf-8')).get('files') or {}
+    except (OSError, ValueError) as exc:
+        hits.append({'path': WHITELIST, 'kind': 'whitelist', 'match': f'missing or unreadable: {exc}'})
+        listed = {}
+    read = 0
+    for path in repository_files(root, metadata):
+        rel = rel_to(path, root)
+        if path.is_symlink():
+            hits.append({'path': rel, 'kind': 'symlink', 'match': f'-> {os.readlink(path)}'})
+            continue
+        if (rel.startswith(PERSISTENCE) or rel == WHITELIST or (rel.endswith('.rs') and rel.startswith(members))
+                or not path.is_file()):
+            continue
+        read += 1
+        if rel in listed or (rel.endswith('.md') and rel.startswith(DOCUMENTATION)):
+            continue
+        if mentions(path.read_bytes().decode('utf-8', errors='replace')):
+            hits.append({'path': rel, 'kind': 'unlisted-file', 'match': 'mentions SQLite or holds a SQL write; not in the whitelist'})
+    for rel in sorted(listed):
+        path = root / rel
+        if rel.startswith(PERSISTENCE):
+            why = 'inside the Persistence module'
+        elif rel.endswith('.rs') and rel.startswith(members):
+            why = 'Rust sources of the members follow the literal and clippy rules'
+        elif path.is_symlink() or not path.is_file():
+            why = 'not a file of the repository'
+        elif not mentions(path.read_bytes().decode('utf-8', errors='replace')):
+            why = 'mentions no SQLite and holds no SQL write'
+        else:
+            continue
+        hits.append({'path': WHITELIST, 'kind': 'whitelist', 'match': f'{rel}: {why}'})
+    return read
+
+
+def included_contents(path: Path, code: str, literals: list[tuple[int, int, str]], root: Path) -> list[tuple[str, str]]:
     """The contents of the files a source embeds with `include_str!`/`include_bytes!` ((file, text) pairs), read like
     its literals: an embedded helper run by an interpreter is code too (M2T01R-41). A path that is not a plain literal
     cannot be read here and is reported as unverifiable."""
@@ -624,6 +716,9 @@ def included_contents(path: Path, code: str, literals: list[tuple[int, int, str]
             out.append(('unverifiable', 'include_str!/include_bytes! of a computed path'))
             continue
         target = (path.parent / lit[2]).resolve()
+        if not target.is_relative_to(root):
+            out.append(('unverifiable', f'{lit[2]}: outside the repository'))
+            continue
         try:
             out.append((target.name, target.read_bytes().decode('utf-8', errors='replace')))
         except OSError as exc:
@@ -674,7 +769,8 @@ def main(argv: list[str] | None = None) -> int:
     print(json.dumps(result, ensure_ascii=False, indent=1))
     if a.out:
         canary = result.get('canary')
-        detail = result.get('error') or (f"{result['files_scanned']} files scanned, {len(result['hits'])} hits; " + (
+        detail = result.get('error') or (f"{result['files_scanned']} Rust/web files and {result.get('other_files_scanned', 0)} other "
+                                         f"files scanned, {len(result['hits'])} hits; " + (
             f"canary: {canary['refused']}/{canary['required']} disallowed calls refused"
             + (f", problems: {canary['problems'][:5]}" if canary['problems'] else '') if canary
             else 'canary not run'))

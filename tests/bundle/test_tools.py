@@ -263,15 +263,33 @@ def clippy_toml(skip=()):
 
 class PersistenceScan(unittest.TestCase):
     """scripts/product/persistence_scan.py: AC-062-05, SQLite only through the Persistence module."""
-    def run_scan(self,files,graph=BASE_GRAPH,out=None,dirs=None,features=None,clippy=None,targets=None,member_features=None,path_deps=()):
+    def run_scan(self,files,graph=BASE_GRAPH,out=None,dirs=None,features=None,clippy=None,targets=None,member_features=None,path_deps=(),
+                 whitelist=None,symlinks=None,git=None):
+        """whitelist: the files of scripts/product/persistence-whitelist.json; None lists every fixture file the
+        content rule would flag (so a test of another rule sees only that rule), False writes no whitelist.
+        git: a .gitignore text to make the root a git work tree with."""
         with tempfile.TemporaryDirectory() as d:
-            root=Path(d)
+            root=Path(d)/'repo';root.mkdir()
             files={'clippy.toml':clippy_toml() if clippy is None else clippy,**files}
             for m in ('hoh-core','hoh-agents','hoh-app'):
                 files.setdefault(f"{(dirs or {}).get(m,f'crates/{m}')}/Cargo.toml",'[package]\n')
+            if whitelist is None:
+                sys.path.insert(0,str(ROOT/'scripts/product'))
+                import persistence_scan
+                members=tuple(f"{(dirs or {}).get(m,f'crates/{m}')}/" for m in ('hoh-core','hoh-agents','hoh-app'))
+                whitelist={rel:'fixture' for rel,text in files.items()
+                           if persistence_scan.mentions(text) and not rel.startswith(persistence_scan.PERSISTENCE)
+                           and not (rel.endswith('.rs') and rel.startswith(members))}
+            if whitelist is not False:
+                files.setdefault('scripts/product/persistence-whitelist.json',json.dumps({'files':whitelist}))
             for rel,text in files.items():
                 p=root/rel;p.parent.mkdir(parents=True,exist_ok=True);p.write_text(text)
-            meta=root/'metadata.json';meta.write_text(json.dumps(scan_metadata(root,graph,dirs,features,targets,member_features,path_deps)))
+            for rel,target in (symlinks or {}).items():
+                p=root/rel;p.parent.mkdir(parents=True,exist_ok=True);p.symlink_to(target)
+            if git is not None:
+                (root/'.gitignore').write_text(git)
+                subprocess.run(['git','init','-q',str(root)],check=True)
+            meta=Path(d)/'metadata.json';meta.write_text(json.dumps(scan_metadata(root,graph,dirs,features,targets,member_features,path_deps)))
             argv=[sys.executable,str(ROOT/'scripts/product/persistence_scan.py'),'--root',str(root),'--metadata',str(meta)]
             if out:argv+=['--out',str(out)]
             r=subprocess.run(argv,capture_output=True,text=True)
@@ -293,6 +311,65 @@ class PersistenceScan(unittest.TestCase):
         self.assertEqual(rc,1)
         self.assertEqual(sorted(h['match'] for h in res['hits']),['hoh-agents -> orm -> libsqlite3-sys','hoh-app -> rusqlite','hoh-core build -> rusqlite'])
         self.assertEqual(res['dev_dependency_uses'],[{'member':'hoh-agents','package':'rusqlite'}])
+    def test_every_repository_file_that_mentions_sqlite_is_whitelisted(self):
+        # M2T01R-51: wherever a helper lies and however product code reaches it (Path::join, python3 -m, a driver
+        # importing it, an embedded driver), the file that mentions SQLite or holds a SQL write is itself a hit unless
+        # the whitelist (AC-062-05's whitelist configuration) names it. Markdown under docs/ and reports/ is prose.
+        files={'crates/hoh-app/src/bin/r.rs':'fn main(){std::process::Command::new("python3").arg(std::path::Path::new("scripts").join("db_helper.py"));}',
+               'scripts/db_helper.py':'import sqlite3\nsqlite3.connect("x").execute("INSERT INTO t VALUES (42)")\n',
+               'tools/driver.py':'import db_helper\n',
+               'crates/hoh-app/assets/q.sql':'DELETE FROM t;',
+               'resources/prompt.md':'Write the SQLite database.',
+               'docs/04-architecture.md':'The writer owns SQLite.',
+               'reports/reviews/M2.md':'INSERT INTO is a SQL write.',
+               'docs/run.sh':'sqlite3 db < x',
+               'scripts/tool.rs':'fn main(){ let _ = "sqlite3"; }',
+               'listed.py':'import sqlite3\n',
+               'crates/hoh-core/src/persistence/mod.rs':'#![allow(clippy::disallowed_methods)]\n// SQLite'}
+        rc,res=self.run_scan(files,whitelist={'clippy.toml':'the boundary configuration','listed.py':'a reviewed helper'})
+        self.assertEqual(rc,1)
+        self.assertEqual(self.kinds(res),[('crates/hoh-app/assets/q.sql','unlisted-file'),('docs/run.sh','unlisted-file'),
+                                          ('resources/prompt.md','unlisted-file'),('scripts/db_helper.py','unlisted-file'),
+                                          ('scripts/tool.rs','unlisted-file')])
+    def test_the_whitelist_names_only_files_that_need_it(self):
+        files={'old.py':'print(1)\n','crates/hoh-core/src/persistence/mod.rs':'#![allow(clippy::disallowed_methods)]\n// SQLite',
+               'crates/hoh-app/src/main.rs':'// SQLite\nfn main(){}'}
+        rc,res=self.run_scan(files,whitelist={'clippy.toml':'ok','old.py':'no longer mentions it','gone.py':'deleted',
+                                              'crates/hoh-core/src/persistence/mod.rs':'covered by the module','crates/hoh-app/src/main.rs':'rust'})
+        self.assertEqual(rc,1)
+        self.assertEqual(sorted(h['match'] for h in res['hits'] if h['kind']=='whitelist'),
+                         ['crates/hoh-app/src/main.rs: Rust sources of the members follow the literal and clippy rules',
+                          'crates/hoh-core/src/persistence/mod.rs: inside the Persistence module',
+                          'gone.py: not a file of the repository','old.py: mentions no SQLite and holds no SQL write'])
+        rc,res=self.run_scan({},whitelist=False)
+        self.assertEqual((rc,self.kinds(res)),(1,[('clippy.toml','unlisted-file'),('scripts/product/persistence-whitelist.json','whitelist')]))
+    def test_in_a_git_work_tree_the_candidate_files_are_scanned(self):
+        # Tracked and untracked files are scanned; ignored ones are not part of any candidate.
+        files={'scripts/new_helper.py':'import sqlite3\n','ignored/local.py':'import sqlite3\n'}
+        rc,res=self.run_scan(files,whitelist={'clippy.toml':'ok'},git='ignored/\n')
+        self.assertEqual((rc,self.kinds(res)),(1,[('scripts/new_helper.py','unlisted-file')]))
+    def test_symlinks_are_refused(self):
+        # M2T01R-52: a product module linked to a test helper (or a linked directory) would run code that the checks
+        # classify as test code.
+        files={'crates/hoh-app/src/bin/r10/main.rs':'mod helper;\nfn main(){helper::write()}',
+               'crates/hoh-app/tests/helper.rs':'pub fn write(){ std::process::Command::new("sqlite3"); }'}
+        rc,res=self.run_scan(files,symlinks={'crates/hoh-app/src/bin/r10/helper.rs':'../../../tests/helper.rs',
+                                             'crates/hoh-app/src/shared':'../tests'})
+        self.assertEqual(rc,1)
+        self.assertEqual([k for k in self.kinds(res) if k[1]=='symlink'],
+                         [('crates/hoh-app/src/bin/r10/helper.rs','symlink'),('crates/hoh-app/src/shared','symlink')])
+    def test_profiles_in_cargo_configurations_are_refused(self):
+        # M2T01R-50: a profile declared in a cargo configuration builds code that static.sh never lints.
+        files={'.cargo/config.toml':'[profile.production]\ninherits = "release"\npanic = "abort"\n[profile.release]\npanic = "abort"\n[profile.dev]\nopt-level = 1\n'}
+        rc,res=self.run_scan(files)
+        self.assertEqual(rc,1)
+        self.assertEqual(sorted(h['match'] for h in res['hits'] if h['kind']=='cargo-config'),['profile.production','profile.release.panic'])
+    def test_files_embedded_from_outside_the_repository_are_refused(self):
+        with tempfile.TemporaryDirectory() as outside:
+            p=Path(outside)/'plain.txt';p.write_text('nothing here\n')
+            rc,res=self.run_scan({'crates/hoh-app/src/main.rs':f'const S: &str = include_str!("{p}");\nfn main(){{}}'})
+        self.assertEqual(rc,1)
+        self.assertEqual([h['match'] for h in res['hits'] if h['kind']=='included-file'],[f'{p}: outside the repository'])
     def test_the_clippy_boundary_cannot_be_switched_off(self):
         # M2T01R-16..19: the boundary is clippy's disallowed-methods; its configuration and every way to allow the lint
         # outside persistence are checked.
