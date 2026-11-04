@@ -219,12 +219,15 @@ async fn the_wall_deadline_escalates_without_a_cancel() -> R {
 
 #[tokio::test]
 async fn a_descendant_that_left_the_group_cannot_hold_up_the_exit() -> R {
-    // `setsid` puts the sleeper in its own session; it keeps stdout open after the group is gone.
+    // `setsid` puts the sleeper in its own session; it keeps stdout open after the group is gone. The leader waits
+    // until the sleeper has left its group: before that, the group kill at the leader's exit rightly takes it too.
     let config = Config {
         drain_grace: Duration::from_millis(300),
         ..Config::default()
     };
-    let mut p = Process::spawn(sh("setsid sleep 600 & echo \"$!\"; exit 0"), config)?;
+    let script = "setsid sleep 600 & pid=$!; \
+                  while [ \"$(cut -d' ' -f5 /proc/$pid/stat)\" = \"$$\" ]; do sleep 0.01; done; echo \"$pid\"; exit 0";
+    let mut p = Process::spawn(sh(script), config)?;
     let escaped: u32 = first_line(&mut p).await?.parse()?;
     let started = Instant::now();
     let outcome = until_exit(&mut p, Duration::from_secs(10)).await;
