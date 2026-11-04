@@ -55,7 +55,7 @@ fn looks_unauthenticated(outcome: &Outcome) -> bool {
 
 #[tokio::test]
 #[ignore = "live: runs the installed claude through scripts/product/adapter-live.sh"]
-async fn test_025_04_live_turns_resume_and_cancel() -> R {
+async fn claude_live_turns_resume_and_cancel() -> R {
     let out = PathBuf::from(std::env::var_os("HOH_LIVE_OUT").ok_or("HOH_LIVE_OUT is not set")?);
     let program =
         PathBuf::from(std::env::var_os("HOH_LIVE_CLAUDE").ok_or("HOH_LIVE_CLAUDE is not set")?);
