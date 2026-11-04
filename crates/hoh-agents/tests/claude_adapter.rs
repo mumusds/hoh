@@ -39,7 +39,7 @@ trait Fakes {
 
 impl Fakes for World {
     async fn attempt(&self, id: &str) -> R<AttemptRef> {
-        self.attempt_in(id, "S1", "2.1.318").await
+        self.attempt_in("claude", id, "S1", "2.1.318").await
     }
 
     /// A fake `claude` replaying `stdout` line by line with `stderr` interleaved in as many chunks, then exiting with

@@ -38,7 +38,7 @@ async fn a_raw_log_that_cannot_be_written_whole_fails_the_turn() -> R {
     )?;
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))?;
-    let attempt = world.attempt_in("A1", "S1", "2.1.318").await?;
+    let attempt = world.attempt_in("claude", "A1", "S1", "2.1.318").await?;
     let turn = Turn {
         launch: Launch {
             program: fake,
