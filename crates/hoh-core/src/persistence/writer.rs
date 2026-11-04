@@ -3,6 +3,7 @@
 //! gets a retryable `DB_BUSY`, so nothing is dropped silently. Each [`Commit`] is one `BEGIN IMMEDIATE` transaction:
 //! state compare-and-set, event appends and outbox inserts succeed together or not at all.
 
+use super::attempts::{self, AttemptJob};
 use super::decide::{self, Decided};
 use super::{Options, PersistError, sqlite_error};
 use crate::decision::{Context, Proposal};
@@ -16,6 +17,8 @@ use tokio::sync::{mpsc, oneshot};
 pub enum Entity {
     Run,
     Task,
+    /// Moved with `AttemptMove` (the attempts table has no revision column).
+    Attempt,
 }
 
 impl Entity {
@@ -23,6 +26,7 @@ impl Entity {
         match self {
             Entity::Run => ("runs", "run_id"),
             Entity::Task => ("tasks", "task_id"),
+            Entity::Attempt => ("attempts", "attempt_id"),
         }
     }
 }
@@ -103,6 +107,7 @@ enum Job {
         Box<(Proposal, Context)>,
         oneshot::Sender<Result<Decided, PersistError>>,
     ),
+    Attempt(Box<AttemptJob>, oneshot::Sender<Result<(), PersistError>>),
 }
 
 /// Test-only fault injection inside the writer.
@@ -127,6 +132,7 @@ impl std::fmt::Debug for Job {
             Job::Commit(..) => "Commit",
             Job::EnsureProject(..) => "EnsureProject",
             Job::Decide(..) => "Decide",
+            Job::Attempt(..) => "Attempt",
         })
     }
 }
@@ -176,6 +182,9 @@ impl Writer {
                         }
                         Job::EnsureProject(id, repo, reply) => {
                             let _ = reply.send(ensure_project(&conn, &id, &repo));
+                        }
+                        Job::Attempt(job, reply) => {
+                            let _ = reply.send(attempts::apply(&mut conn, &job));
                         }
                         Job::Decide(request, reply) => {
                             let (proposal, context) = *request;
@@ -227,6 +236,10 @@ impl Writer {
     ) -> Result<Decided, PersistError> {
         self.submit(|tx| Job::Decide(Box::new((proposal, context)), tx))
             .await
+    }
+
+    pub(super) async fn attempt(&self, job: AttemptJob) -> Result<(), PersistError> {
+        self.submit(|tx| Job::Attempt(Box::new(job), tx)).await
     }
 
     pub(super) async fn ensure_project(
@@ -327,6 +340,12 @@ pub(super) fn write(
 /// state and revision just read. Returns the new revision.
 fn compare_and_set(tx: &Transaction<'_>, cas: &StateCas) -> Result<i64, PersistError> {
     let entity = cas.change.entity();
+    if entity == Entity::Attempt {
+        return Err(PersistError::IntegrityViolation(format!(
+            "attempt {} has no revision; it moves with an AttemptMove",
+            cas.id
+        )));
+    }
     let (table, key) = entity.table();
     let stale = |actual| PersistError::StaleRevision {
         entity,

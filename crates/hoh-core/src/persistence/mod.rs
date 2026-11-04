@@ -11,11 +11,13 @@
 // The one module allowed to call SQLite (clippy.toml `disallowed-methods`, AC-062-05).
 #![allow(clippy::disallowed_methods)]
 
+mod attempts;
 mod decide;
 pub mod location;
 pub mod selftest;
 mod writer;
 
+pub use attempts::{AttemptFacts, AttemptMove, AttemptRow, NewAttempt, Session};
 pub use decide::Decided;
 pub use writer::{Change, Commit, Committed, Entity, NewEvent, NewOutbox, StateCas};
 
@@ -81,6 +83,13 @@ pub enum PersistError {
         to: String,
         why: String,
     },
+    /// A move found another state than the one it expected (an attempt changed meanwhile); nothing was written.
+    StaleState {
+        entity: Entity,
+        id: String,
+        expected: String,
+        actual: Option<String>,
+    },
     /// The run does not exist (`RUN_NOT_FOUND`); nothing was written.
     RunNotFound(String),
     /// A proposal that cannot be recorded (its payload violates `$defs.DecisionPayload`, or a number is out of
@@ -114,6 +123,7 @@ impl PersistError {
         match self {
             PersistError::StaleRevision { .. } => Some(RejectionReason::StaleRevision),
             PersistError::IllegalTransition { .. } => Some(RejectionReason::IllegalTransition),
+            PersistError::StaleState { .. } => Some(RejectionReason::StaleRevision),
             _ => None,
         }
     }
@@ -173,6 +183,15 @@ impl std::fmt::Display for PersistError {
             } => write!(
                 f,
                 "ILLEGAL_TRANSITION: {entity:?} {id} {from} -> {to}: {why}"
+            ),
+            PersistError::StaleState {
+                entity,
+                id,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "{entity:?} {id} expected state {expected}, found {actual:?}"
             ),
             PersistError::RunNotFound(id) => write!(f, "RUN_NOT_FOUND: {id}"),
             PersistError::InvalidProposal(detail) => write!(f, "invalid proposal: {detail}"),
@@ -503,6 +522,27 @@ impl Store {
         self.writer.decide(proposal, context).await
     }
 
+    /// Record a native session, or update the row of a resumed one (never a second row for it).
+    pub async fn upsert_session(&self, session: Session) -> Result<(), PersistError> {
+        self.writer
+            .attempt(attempts::AttemptJob::Session(session))
+            .await
+    }
+
+    /// Create an attempt in state PREPARED, with its `attempt.created` event.
+    pub async fn create_attempt(&self, attempt: NewAttempt) -> Result<(), PersistError> {
+        self.writer
+            .attempt(attempts::AttemptJob::Create(attempt))
+            .await
+    }
+
+    /// Move an attempt along the transition table, with its `attempt.moved` event.
+    pub async fn move_attempt(&self, change: AttemptMove) -> Result<(), PersistError> {
+        self.writer
+            .attempt(attempts::AttemptJob::Move(change))
+            .await
+    }
+
     /// Record the project row if it is not there yet.
     pub async fn ensure_project(
         &self,
@@ -548,6 +588,21 @@ impl Reader {
 
     pub fn pragmas(&self) -> Result<Pragmas, PersistError> {
         pragmas(&self.conn)
+    }
+
+    /// The attempt `attempt_id`, if it exists.
+    pub fn attempt(&self, attempt_id: &str) -> Result<Option<AttemptRow>, PersistError> {
+        attempts::read_attempt(&self.conn, attempt_id)
+    }
+
+    /// The session `session_id`, if it exists.
+    pub fn session(&self, session_id: &str) -> Result<Option<Session>, PersistError> {
+        attempts::read_session(&self.conn, session_id)
+    }
+
+    /// (kind, payload) of every event of `run_id`, in seq order.
+    pub fn events(&self, run_id: &str) -> Result<Vec<(String, serde_json::Value)>, PersistError> {
+        attempts::read_events(&self.conn, run_id)
     }
 }
 
