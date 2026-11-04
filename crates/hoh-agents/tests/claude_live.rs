@@ -1,7 +1,7 @@
 //! TEST-025-04 against the installed `claude` (live; model calls). Run only by scripts/product/adapter-live.sh, which
 //! sets HOH_LIVE_OUT and turns the verdict written there into the check's evidence: three turns in a temporary Git
 //! repository with the default graces — a reply, a resumed reply, a cancelled tool run. Not logged in is BLOCKED,
-//! never PASS.
+//! never PASS. The installed CLI (path, version, sha256, help hash) is recorded in claude-install.json.
 
 // No SQLite outside hoh-core::persistence (AC-062-05; see clippy.toml), and no unsafe code (no FFI way around it).
 #![forbid(clippy::disallowed_methods)]
@@ -14,6 +14,7 @@ use hoh_agents::claude::{self, Launch, Outcome, Turn};
 use hoh_agents::process::group_members;
 use hoh_core::lifecycle::AttemptState;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -29,6 +30,27 @@ fn write_verdict(out: &Path, status: &str, detail: &str, sessions: &[serde_json:
         )?,
     )?;
     Ok(())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Processes whose working directory is inside `dir` (a tool run that outlived its turn, in any process group).
+fn processes_in(dir: &Path) -> Vec<u32> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| {
+            std::fs::read_link(format!("/proc/{pid}/cwd")).is_ok_and(|cwd| cwd.starts_with(dir))
+        })
+        .collect()
 }
 
 /// A failed first turn that reads as "not logged in" (no recorded sample exists yet, so this errs on BLOCKED, never
@@ -59,6 +81,7 @@ async fn claude_live_turns_resume_and_cancel() -> R {
     let out = PathBuf::from(std::env::var_os("HOH_LIVE_OUT").ok_or("HOH_LIVE_OUT is not set")?);
     let program =
         PathBuf::from(std::env::var_os("HOH_LIVE_CLAUDE").ok_or("HOH_LIVE_CLAUDE is not set")?);
+    let program = program.canonicalize()?;
     let help = String::from_utf8(Command::new(&program).arg("--help").output()?.stdout)?;
     let version_line = String::from_utf8(Command::new(&program).arg("--version").output()?.stdout)?;
     let version = version_line
@@ -66,9 +89,19 @@ async fn claude_live_turns_resume_and_cancel() -> R {
         .next()
         .ok_or("no version")?
         .to_owned();
+    std::fs::write(
+        out.join("claude-install.json"),
+        serde_json::to_vec_pretty(&json!({
+            "path": program,
+            "version": version,
+            "sha256": hex(&std::fs::read(&program)?),
+            "help_sha256": hex(help.as_bytes()),
+        }))?,
+    )?;
     let world = World::new()?;
     let repo = world.dir.path().join("repo");
     std::fs::create_dir_all(&repo)?;
+    let repo = repo.canonicalize()?;
     if !Command::new("git")
         .args(["init", "-q"])
         .current_dir(&repo)
@@ -171,10 +204,11 @@ async fn claude_live_turns_resume_and_cancel() -> R {
         ));
     }
 
-    // 3. A long tool run, cancelled once the tool is in flight: CANCELLED and the group gone within 16 s.
+    // 3. A long tool run, cancelled once the tool is in flight: CANCELLED and the group gone within 16 s, with no
+    //    process left in the repository either.
     let a3 = world.attempt_in("A3", "S2", &version).await?;
     let third_turn = turn(
-        "Use the Bash tool to run `sleep 120`, then reply DONE.",
+        "Use the Bash tool to run `sleep 120` in the foreground (not in the background), then reply DONE.",
         "live/A3",
         None,
     );
@@ -200,10 +234,18 @@ async fn claude_live_turns_resume_and_cancel() -> R {
     let third = third?;
     let took = at.elapsed();
     let left = third.pid.map(group_members).unwrap_or_default();
-    if third.state != AttemptState::Cancelled || took > Duration::from_secs(16) || !left.is_empty()
+    let mut stray = processes_in(&repo);
+    while !stray.is_empty() && at.elapsed() < Duration::from_secs(16) {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        stray = processes_in(&repo);
+    }
+    if third.state != AttemptState::Cancelled
+        || took > Duration::from_secs(16)
+        || !left.is_empty()
+        || !stray.is_empty()
     {
         problems.push(format!(
-            "turn 3: {:?} after {took:?}, group {left:?}",
+            "turn 3: {:?} after {took:?}, group {left:?}, processes in the repository {stray:?}",
             third.state
         ));
     }
