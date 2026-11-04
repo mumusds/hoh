@@ -361,6 +361,7 @@ fn method_branches_must_use_the_known_schema_form() -> R {
     let tmp = tempfile::tempdir()?;
     let codex_fix = fixtures().join("codex/0.166.0");
     let notifications = "{\"oneOf\":[{\"type\":\"object\",\"required\":[\"method\"],\"properties\":{\"method\":{\"type\":\"string\",\"enum\":[\"turn/completed\"]}}}]}";
+    let mut accepted = Vec::new();
     for (name, requests) in [
         (
             "required-number",
@@ -378,6 +379,31 @@ fn method_branches_must_use_the_known_schema_form() -> R {
             "title-number",
             "{\"oneOf\":[{\"type\":\"object\",\"title\":5,\"properties\":{\"method\":{\"type\":\"string\",\"enum\":[\"turn/steer\"]}}}]}",
         ),
+        // M1T01R-25: duplicate required names and ill-formed sibling property schemas.
+        (
+            "required-duplicate",
+            "{\"oneOf\":[{\"type\":\"object\",\"required\":[\"method\",\"method\"],\"properties\":{\"method\":{\"type\":\"string\",\"enum\":[\"turn/steer\"]}}}]}",
+        ),
+        (
+            "params-type-number",
+            "{\"oneOf\":[{\"type\":\"object\",\"properties\":{\"method\":{\"type\":\"string\",\"enum\":[\"turn/steer\"]},\"params\":{\"type\":123}}}]}",
+        ),
+        (
+            "params-unknown-keyword",
+            "{\"oneOf\":[{\"type\":\"object\",\"properties\":{\"method\":{\"type\":\"string\",\"enum\":[\"turn/steer\"]},\"params\":{\"minimum\":\"x\"}}}]}",
+        ),
+        (
+            "params-ref-number",
+            "{\"oneOf\":[{\"type\":\"object\",\"properties\":{\"method\":{\"type\":\"string\",\"enum\":[\"turn/steer\"]},\"params\":{\"$ref\":5}}}]}",
+        ),
+        (
+            "params-anyof-empty",
+            "{\"oneOf\":[{\"type\":\"object\",\"properties\":{\"method\":{\"type\":\"string\",\"enum\":[\"turn/steer\"]},\"params\":{\"anyOf\":[]}}}]}",
+        ),
+        (
+            "params-anyof-bad-member",
+            "{\"oneOf\":[{\"type\":\"object\",\"properties\":{\"method\":{\"type\":\"string\",\"enum\":[\"turn/steer\"]},\"params\":{\"anyOf\":[{\"$ref\":\"#/definitions/P\"},{\"type\":\"nil\"}]}}}]}",
+        ),
     ] {
         let script = format!(
             "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n exec) cat '{f}/help-exec.txt';;\n \
@@ -386,10 +412,10 @@ fn method_branches_must_use_the_known_schema_form() -> R {
             f = codex_fix.display()
         );
         let (dir, _) = fake(tmp.path(), name, "codex", &script)?;
-        assert!(
-            probe(Agent::Codex, &env_for(&dir)).is_err(),
-            "{name} accepted"
-        );
+        if probe(Agent::Codex, &env_for(&dir)).is_ok() {
+            accepted.push(name);
+        }
     }
+    assert!(accepted.is_empty(), "accepted: {accepted:?}");
     Ok(())
 }
