@@ -211,16 +211,21 @@ pub fn parse(args: &[OsString]) -> Result<Invocation, UsageError> {
             ));
         }
     };
-    if o.help {
-        return Ok(Invocation::Help(topic));
+    // `--version` stands alone; with `--help`, every other check still applies (M1T06R-01).
+    if o.version
+        && (topic != Topic::Top
+            || o.prompt.is_some()
+            || o.output.is_some()
+            || o.project.is_some()
+            || o.resume.is_some()
+            || o.detach
+            || o.live
+            || o.help)
+    {
+        return usage("--version 只能单独使用");
     }
-    if o.version {
-        return if topic == Topic::Top && o.prompt.is_none() {
-            Ok(Invocation::Version)
-        } else {
-            usage("--version 只能单独使用")
-        };
-    }
+    let help = o.help;
+    let version = o.version;
     let project = o.project.map(PathBuf::from);
     let only = |allowed: bool, name: &str, with: &str| {
         if allowed {
@@ -240,7 +245,7 @@ pub fn parse(args: &[OsString]) -> Result<Invocation, UsageError> {
     if o.prompt.is_some() && topic != Topic::Top {
         return usage("-p 不能与子命令一起使用");
     }
-    match topic {
+    let invocation = match topic {
         Topic::Top => match o.prompt {
             Some(text) => {
                 if text.trim().is_empty() {
@@ -296,7 +301,14 @@ pub fn parse(args: &[OsString]) -> Result<Invocation, UsageError> {
                 project,
             })
         }
-    }
+    }?;
+    Ok(if help {
+        Invocation::Help(topic)
+    } else if version {
+        Invocation::Version
+    } else {
+        invocation
+    })
 }
 
 #[cfg(test)]
