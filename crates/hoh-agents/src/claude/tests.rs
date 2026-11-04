@@ -86,6 +86,7 @@ fn only_a_clean_success_settles_and_a_cancel_always_wins() {
     let success = ResultFrame {
         subtype: Some("success".to_owned()),
         is_error: Some(false),
+        text: None,
     };
     let ok = Some(Termination::Code(0));
     assert_eq!(
@@ -96,6 +97,7 @@ fn only_a_clean_success_settles_and_a_cancel_always_wins() {
     let max_turns = ResultFrame {
         subtype: Some("error_max_turns".to_owned()),
         is_error: Some(true),
+        text: None,
     };
     assert_eq!(
         verdict(false, false, Some(&max_turns), Some(Termination::Code(1))),
@@ -104,6 +106,7 @@ fn only_a_clean_success_settles_and_a_cancel_always_wins() {
     let error = ResultFrame {
         subtype: Some("success".to_owned()),
         is_error: Some(true),
+        text: None,
     };
     assert_eq!(verdict(false, false, Some(&error), ok), failed("is_error"));
     assert_eq!(
@@ -122,6 +125,7 @@ fn only_a_clean_success_settles_and_a_cancel_always_wins() {
     let interrupted = ResultFrame {
         subtype: Some("error_during_execution".to_owned()),
         is_error: Some(true),
+        text: None,
     };
     assert_eq!(
         verdict(true, false, Some(&interrupted), ok),

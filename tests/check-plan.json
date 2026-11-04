@@ -66,9 +66,7 @@
       "mode": "live",
       "argv": [
         "bash",
-        "scripts/product/not-implemented.sh",
-        "adapter-live",
-        "M1-T03"
+        "scripts/product/adapter-live.sh"
       ],
       "timeout_seconds": 7200,
       "artifacts": [

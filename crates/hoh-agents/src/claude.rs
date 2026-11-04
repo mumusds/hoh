@@ -146,6 +146,8 @@ impl Turn {
 pub struct ResultFrame {
     pub subtype: Option<String>,
     pub is_error: Option<bool>,
+    /// The final reply (`result`), as Claude reported it.
+    pub text: Option<String>,
 }
 
 /// The end state and failure reason of a turn (pure; module docs).
@@ -456,6 +458,7 @@ pub async fn run(
                 result = Some(ResultFrame {
                     subtype: frame["subtype"].as_str().map(str::to_owned),
                     is_error: frame["is_error"].as_bool(),
+                    text: frame["result"].as_str().map(str::to_owned),
                 });
                 usage = frame.get("usage").filter(|u| u.is_object()).cloned();
                 cost = frame["total_cost_usd"].as_f64();
