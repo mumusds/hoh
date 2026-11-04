@@ -5,32 +5,21 @@
 #![forbid(clippy::disallowed_methods)]
 #![forbid(unsafe_code)]
 
+mod common;
+
+use common::{R, World};
 use hoh_agents::claude::{self, AttemptRef, Launch, Outcome, PARTIAL_FLAG, Turn, YOLO_FLAG};
 use hoh_agents::process::{Escalation, Signal, Target, group_members};
 use hoh_core::lifecycle::AttemptState;
-use hoh_core::persistence::selftest::{PROBE_DB_ENV, ProbeCommand, probe_main};
-use hoh_core::persistence::{NewAttempt, Options, Store};
 use sha2::{Digest, Sha256};
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
-
-type R<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 const FIXTURES: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/fixtures/protocol/claude/2.1.318"
 );
-
-/// The second process of the store's WAL self-test; does nothing unless started by it.
-#[test]
-#[ignore = "helper process of the WAL self-test"]
-fn wal_probe_helper() {
-    if std::env::var_os(PROBE_DB_ENV).is_some() {
-        std::process::exit(probe_main());
-    }
-}
 
 fn hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
@@ -39,70 +28,17 @@ fn hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-struct World {
-    dir: tempfile::TempDir,
-    store: Store,
+/// Fakes and turns for the fixture tests.
+trait Fakes {
+    fn fake(&self, name: &str, stdout: &[u8], stderr: &[u8], exit: i32) -> R<PathBuf>;
+    fn turn(&self, program: &Path, logs: &str) -> R<Turn>;
+    async fn run(&self, attempt: &AttemptRef, turn: &Turn) -> R<Outcome>;
+    async fn attempt(&self, id: &str) -> R<AttemptRef>;
 }
 
-impl World {
-    /// A store with run R (RUNNING) and task T1 (LEASED), seeded with Python's sqlite3 (test code).
-    fn new() -> R<World> {
-        let dir = tempfile::tempdir()?;
-        let db = dir.path().join(".hoh/state.db");
-        let probe = ProbeCommand {
-            program: std::env::current_exe()?,
-            args: [
-                "wal_probe_helper",
-                "--exact",
-                "--ignored",
-                "--nocapture",
-                "--test-threads=1",
-            ]
-            .map(OsString::from)
-            .to_vec(),
-            env: Vec::new(),
-            answer_timeout: Duration::from_secs(10),
-        };
-        let store = Store::open(
-            &db,
-            Options {
-                wal_probe: Some(probe),
-                ..Options::default()
-            },
-        )?;
-        let seed = "INSERT INTO projects(project_id, repo_path, created_at) VALUES ('p1', '/repo', '2026-11-04T00:00:00Z');
-             INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', 'p1', printf('%064d', 1), 1);
-             INSERT INTO runs(run_id, project_id, spec_id, state, mode, created_at) VALUES ('R', 'p1', 's1', 'RUNNING', 'AUTO', '2026-11-04T00:00:00Z');
-             INSERT INTO tasks(task_id, run_id, spec_id, state, role, created_seq) VALUES ('T1', 'R', 's1', 'LEASED', 'developer', 1);";
-        let status = std::process::Command::new("python3")
-            .args(["-c", "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.executescript(sys.argv[2]); c.commit()"])
-            .arg(&db)
-            .arg(seed)
-            .status()?;
-        if !status.success() {
-            return Err("seeding the store failed".into());
-        }
-        Ok(World { dir, store })
-    }
-
+impl Fakes for World {
     async fn attempt(&self, id: &str) -> R<AttemptRef> {
-        self.store
-            .create_attempt(NewAttempt {
-                attempt_id: id.to_owned(),
-                task_id: "T1".to_owned(),
-                session_id: None,
-                role_epoch: 1,
-                host_epoch: 1,
-                config_revision: 0,
-                agent: Some("claude".to_owned()),
-            })
-            .await?;
-        Ok(AttemptRef {
-            attempt_id: id.to_owned(),
-            session_id: "S1".to_owned(),
-            role: "developer".to_owned(),
-            agent_version: "2.1.318".to_owned(),
-        })
+        self.attempt_in(id, "S1", "2.1.318").await
     }
 
     /// A fake `claude` replaying `stdout` line by line with `stderr` interleaved in as many chunks, then exiting with
