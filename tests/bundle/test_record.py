@@ -69,6 +69,30 @@ class Validators(unittest.TestCase):
         self.assertTrue(any('authentication_failed' in p for p in self.check('claude','unauthenticated',unmarked,meta,rc=meta['exit_code'])))
         ok,ok_meta,_=load_case('claude','2.1.318','success')
         self.assertTrue(self.check('claude','unauthenticated',ok,ok_meta,rc=0))
+    # M1T03R-14: the not-logged-in recording keeps no variable that could reach the operator's credentials.
+    def test_claude_isolated_env_keeps_no_way_to_credentials(self):
+        base={'PATH':'/usr/bin','LANG':'C.UTF-8','HOME':'/home/op','ANTHROPIC_API_KEY':'k','ANTHROPIC_AUTH_TOKEN':'t',
+              'CLAUDE_CODE_OAUTH_TOKEN':'o','CLAUDE_CONFIG_DIR':'/home/op/.claude','CLAUDE_SECURESTORAGE_CONFIG_DIR':'/home/op/.s',
+              'XDG_CONFIG_HOME':'/home/op/.config','AWS_PROFILE':'p','CLAUDE_CODE_USE_BEDROCK':'1'}
+        env=record.claude_isolated_env(base)
+        self.assertEqual(env['PATH'],'/usr/bin')
+        self.assertFalse({'ANTHROPIC_API_KEY','ANTHROPIC_AUTH_TOKEN','CLAUDE_CODE_OAUTH_TOKEN','CLAUDE_CONFIG_DIR',
+                          'CLAUDE_SECURESTORAGE_CONFIG_DIR','AWS_PROFILE','CLAUDE_CODE_USE_BEDROCK'} & set(env))
+        home=Path(env['HOME'])
+        self.assertNotEqual(str(home),'/home/op')
+        for k in ('XDG_CONFIG_HOME','XDG_DATA_HOME','XDG_STATE_HOME','XDG_CACHE_HOME','TMPDIR'):
+            self.assertTrue(Path(env[k]).is_relative_to(home),k)
+        self.assertEqual([p.name for p in home.rglob('*') if p.is_file()],[])
+        shutil.rmtree(home); record.TEMP_DIRS.remove(home)
+        # systemd-run needs the user bus to start the scope; claude itself runs without it.
+        env=record.claude_isolated_env(base|{'XDG_RUNTIME_DIR':'/run/user/1','DBUS_SESSION_BUS_ADDRESS':'unix:path=/run/user/1/bus'})
+        self.assertEqual(env['XDG_RUNTIME_DIR'],'/run/user/1')
+        shutil.rmtree(env['HOME']); record.TEMP_DIRS.remove(Path(env['HOME']))
+        argv=record.claude_isolated_argv(['claude','-p'])
+        self.assertEqual(argv,['env','--unset=XDG_RUNTIME_DIR','--unset=DBUS_SESSION_BUS_ADDRESS','claude','-p'])
+        out=subprocess.run(record.claude_isolated_argv(['env']),env={'PATH':os.environ['PATH'],'XDG_RUNTIME_DIR':'/x','DBUS_SESSION_BUS_ADDRESS':'y','KEEP':'1'},
+                           capture_output=True,text=True,check=True).stdout.splitlines()
+        self.assertEqual(sorted(l.split('=')[0] for l in out),['KEEP','PATH'])
     def test_codex_echoed_user_token_without_assistant_output_rejected(self):
         fs,meta,sent=load_case('codex','0.166.0','app-server-turn')
         # Drop the agent's message items; the userMessage item still echoes the prompt containing the token.

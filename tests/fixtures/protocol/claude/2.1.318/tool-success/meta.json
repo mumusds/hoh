@@ -12,7 +12,7 @@
   ],
   "cwd": "fresh temp Git repo outside the checkout",
   "exit_code": 0,
-  "recorded_at": "2026-11-04T14:38:22.615369+00:00",
+  "recorded_at": "2026-11-04T15:12:22.883938+00:00",
   "mode": "live",
   "notes": "a tool call, then the final reply",
   "stopped": "exited",
