@@ -89,6 +89,13 @@ pub(super) enum AttemptJob {
     Session(Session),
     Create(NewAttempt),
     Move(AttemptMove),
+    /// An event of the attempt (e.g. an adapter diagnostic); `name` makes its id unique within the attempt.
+    Event {
+        attempt_id: String,
+        name: String,
+        kind: String,
+        payload: Value,
+    },
 }
 
 pub(super) fn apply(conn: &mut Connection, job: &AttemptJob) -> Result<(), PersistError> {
@@ -99,6 +106,31 @@ pub(super) fn apply(conn: &mut Connection, job: &AttemptJob) -> Result<(), Persi
         AttemptJob::Session(session) => upsert_session(&tx, session)?,
         AttemptJob::Create(attempt) => create(&tx, attempt)?,
         AttemptJob::Move(change) => move_attempt(&tx, change)?,
+        AttemptJob::Event {
+            attempt_id,
+            name,
+            kind,
+            payload,
+        } => {
+            let task_id: String = tx
+                .query_row(
+                    "SELECT task_id FROM attempts WHERE attempt_id = ?1",
+                    params![attempt_id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(sqlite_error)?
+                .ok_or_else(|| {
+                    PersistError::IntegrityViolation(format!("no attempt {attempt_id}"))
+                })?;
+            event(
+                &tx,
+                &task_id,
+                child_id(attempt_id, name),
+                kind,
+                payload.clone(),
+            )?
+        }
     }
     tx.commit().map_err(sqlite_error)
 }
