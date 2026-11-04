@@ -277,6 +277,24 @@ fn configure(conn: &Connection, options: &Options, writer: bool) -> Result<(), P
 const MIGRATIONS: &[(i64, &str)] =
     &[(1, include_str!("../../../../contracts/sql/001_initial.sql"))];
 
+/// The values `CHECK(<column> IN (...))` allows for `table` in the schema this binary migrates to, in schema order;
+/// `None` if the table or the check does not exist. For code that must agree with the stored schema, such as the
+/// CLI's exit code for every run state (AC-004-01).
+pub fn allowed_values(table: &str, column: &str) -> Option<Vec<String>> {
+    let create = format!("CREATE TABLE {table}(");
+    let (_, sql) = MIGRATIONS.iter().find(|(_, sql)| sql.contains(&create))?;
+    let start = sql.find(&create)?;
+    let statement = &sql[start..start + sql[start..].find(");")?];
+    let check = format!("CHECK({column} IN (");
+    let list = &statement[statement.find(&check)? + check.len()..];
+    let list = &list[..list.find(')')?];
+    Some(
+        list.split(',')
+            .map(|v| v.trim().trim_matches('\'').to_owned())
+            .collect(),
+    )
+}
+
 /// Bring the database to the latest schema version; refuse one newer than this binary. Each migration runs in one
 /// IMMEDIATE transaction that commits only if the script ran without ending it and set `user_version` to its
 /// version (M2T01R-05, -09); any failure, COMMIT included, rolls it back (M2T01R-12).

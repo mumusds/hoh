@@ -1129,3 +1129,24 @@ fn test_036_01_state_sets_equal_the_sql_check_enumerations() -> R {
     }
     Ok(())
 }
+
+#[test]
+fn allowed_values_are_read_from_the_schema() {
+    let runs = allowed_values("runs", "state").expect("runs.state");
+    assert_eq!(runs.len(), 15);
+    assert_eq!(
+        (runs[0].as_str(), runs[14].as_str()),
+        ("CREATED", "COMPLETED")
+    );
+    assert_eq!(
+        allowed_values("runs", "mode"),
+        Some(vec![
+            "PLAN".to_owned(),
+            "BUILD".to_owned(),
+            "AUTO".to_owned()
+        ])
+    );
+    assert_eq!(allowed_values("tasks", "state").map(|v| v.len()), Some(9));
+    assert_eq!(allowed_values("runs", "no_such_column"), None);
+    assert_eq!(allowed_values("no_such_table", "state"), None);
+}

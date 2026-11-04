@@ -1,0 +1,25 @@
+hoh：多 Agent 协作的自主软件工程 Harness
+
+用法：
+  hoh [--project <目录>]       打开 TUI 工作区
+  hoh -p <文本> [选项]         非交互运行，到终态或需要你决定时退出
+  hoh <子命令> [选项]
+
+子命令：
+  attach [run_id]    重新接上一个 Run（关闭窗口不会取消任务）
+  web                在浏览器中打开同一个 host 的界面
+  doctor             检查原生 Agent 与运行环境的能力
+  help               显示帮助；hoh help <子命令> 显示子命令的帮助
+
+选项：
+  -p <文本>          以这段文本创建一个非交互 Run（从不读取 stdin）
+  --output <格式>    text（默认）、json 或 stream-json
+  --detach           提交后输出 run_id 并立即返回（只与 -p 同用）
+  --project <目录>   项目目录（默认为当前目录）
+  --resume <run_id>  把输入交给已有的 Run（只与 -p 或 attach 同用）
+  --help             显示帮助
+  --version          显示版本
+
+退出码：0 COMPLETED  1 FAILED  3 BLOCKED  4 INCOMPLETE  5 CANCELLED
+6 PAUSED  64 用法错误  69 host 不可用  78 配置错误
+130/143 被 SIGINT/SIGTERM 中断（后台任务继续）
