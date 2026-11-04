@@ -286,3 +286,70 @@ fn shutting_down_the_runtime_kills_the_group() -> R {
     assert!(!alive(pgid), "leader {pgid} was not reaped");
     Ok(())
 }
+
+#[test]
+fn a_cancel_requested_before_the_exit_is_seen_is_reported_as_cancelled() -> R {
+    // M1T02R-01: the cancel is requested while the child runs; the supervisor only gets to run after the child
+    // exited, so it sees the exit first. The request must still decide the outcome.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let report = runtime.block_on(async {
+        let mut p = Process::spawn(sh("sleep 0.1; exit 0"), Config::default())?;
+        p.cancel(Escalation {
+            native: Some(Signal::Interrupt),
+            ..Escalation::default()
+        });
+        // Block the only runtime thread past the child's exit, so the supervisor has not run yet.
+        std::thread::sleep(Duration::from_millis(400));
+        let (_, report) = until_exit(&mut p, Duration::from_secs(10)).await?;
+        Ok::<_, Box<dyn std::error::Error>>(report)
+    })?;
+    assert_eq!(report.cause, Cause::Cancelled);
+    assert_eq!(report.status, Some(Termination::Code(0)));
+    assert!(report.group_reaped);
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_first_cancel_wins_and_repeats_are_dropped() -> R {
+    // M1T02R-03: repeated cancels from any clone keep the first plan and queue nothing.
+    let mut p = Process::spawn(
+        sh("trap '' INT; echo up; while :; do sleep 1; done"),
+        Config::default(),
+    )?;
+    first_line(&mut p).await?;
+    let first = Escalation {
+        native: Some(Signal::Interrupt),
+        native_grace: Duration::from_millis(100),
+        term_grace: Duration::from_secs(2),
+        kill_grace: Duration::from_secs(2),
+    };
+    let control = p.control();
+    control.cancel(first);
+    let later = Escalation {
+        native: None,
+        native_grace: Duration::ZERO,
+        term_grace: Duration::ZERO,
+        kill_grace: Duration::from_secs(2),
+    };
+    for i in 0..100_000 {
+        if i % 2 == 0 {
+            p.cancel(later)
+        } else {
+            control.clone().cancel(later)
+        }
+    }
+    let (_, report) = until_exit(&mut p, Duration::from_secs(10)).await?;
+    let sent: Vec<_> = report.steps.iter().map(|s| (s.target, s.signal)).collect();
+    assert_eq!(
+        sent,
+        vec![
+            (Target::Leader, Signal::Interrupt),
+            (Target::Group, Signal::Terminate)
+        ]
+    );
+    assert_eq!(report.cause, Cause::Cancelled);
+    assert_eq!(report.status, Some(Termination::Signal(15)));
+    Ok(())
+}
