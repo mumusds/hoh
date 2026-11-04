@@ -4,7 +4,9 @@
 //! Only the draft 2020-12 keywords these contracts use are implemented; a schema using any other keyword is refused
 //! when it is loaded, so a contract change cannot silently stop being enforced. `$ref` names a local definition
 //! (`#/$defs/<name>`) only, and a reference cycle that does not descend into the instance is refused; instances nested
-//! deeper than [`MAX_DEPTH`] are refused by one iterative pass before anything recurses. Numbers compare exactly
+//! deeper than [`MAX_DEPTH`] are refused by one iterative pass before anything recurses. Evaluation itself is bounded
+//! separately (512 nested schema evaluations per thread, which a schema can need even for a shallow instance); running
+//! out of it fails the whole validation, never a single branch of oneOf/anyOf/if. Numbers compare exactly
 //! (integers beyond 2^53 included, 1 == 1.0); numbers serde_json cannot hold exactly (integers outside i64/u64, which
 //! it rounds to f64) are refused instead of compared. Count keywords such as `minLength` accept integral floats.
 //! `pattern` is limited to constructs that mean the same in ECMA-262 (which JSON Schema specifies) and the regex
@@ -26,6 +28,9 @@ const MAX_EVAL_DEPTH: usize = 512;
 
 thread_local! {
     static EVAL_DEPTH: Cell<usize> = const { Cell::new(0) };
+    /// Set when an evaluation ran out of depth: the whole validation then fails, whatever combinators made of the
+    /// branch that ran out (M1T01R-22).
+    static EXHAUSTED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// One level of schema evaluation on this thread; released when dropped.
@@ -210,9 +215,26 @@ impl Schema {
         if let Some(v) = precheck(instance) {
             return Err(vec![v]);
         }
-        let mut out = Vec::new();
-        self.node(&self.document, instance, "", "", &mut out);
+        let out = self.evaluate(&self.document, instance, "");
         if out.is_empty() { Ok(()) } else { Err(out) }
+    }
+
+    /// Evaluate from the top: a run out of evaluation depth anywhere, even inside a branch that oneOf, anyOf or if
+    /// discarded, fails the whole validation.
+    fn evaluate(&self, schema: &Value, instance: &Value, spath: &str) -> Vec<Violation> {
+        EXHAUSTED.with(|e| e.set(false));
+        let mut out = Vec::new();
+        self.node(schema, instance, "", spath, &mut out);
+        if EXHAUSTED.with(|e| e.replace(false)) {
+            return vec![Violation {
+                instance_path: String::new(),
+                schema_path: spath.to_owned(),
+                message: format!(
+                    "schema evaluation nested too deep (more than {MAX_EVAL_DEPTH} levels)"
+                ),
+            }];
+        }
+        out
     }
 
     /// Validate an instance against `#/$defs/<def>`.
@@ -229,8 +251,7 @@ impl Schema {
         if let Some(v) = precheck(instance) {
             return Ok(Err(vec![v]));
         }
-        let mut out = Vec::new();
-        self.node(schema, instance, "", &pointer, &mut out);
+        let out = self.evaluate(schema, instance, &pointer);
         Ok(if out.is_empty() { Ok(()) } else { Err(out) })
     }
 
@@ -250,6 +271,7 @@ impl Schema {
     ) {
         // Bounded however the schema is built, e.g. a long acyclic chain of references (M1T01R-21).
         let Some(_depth) = EvalDepth::enter() else {
+            EXHAUSTED.with(|e| e.set(true));
             return fail(out, ipath, spath, "schema evaluation nested too deep");
         };
         let obj = match schema {
@@ -823,7 +845,18 @@ fn portable_pattern(source: &str) -> Result<(), String> {
                 }
                 None => return Err("trailing backslash".to_owned()),
             },
-            '[' if !in_class => in_class = true,
+            '[' if !in_class => {
+                // ECMA-262 reads `[]` as an empty class and `[^]` as any character; the regex crate reads a leading
+                // `]` as a literal (M1T01R-24).
+                let mut ahead = chars.clone();
+                if ahead.peek() == Some(&'^') {
+                    ahead.next();
+                }
+                if ahead.peek() == Some(&']') {
+                    return Err("a class starting with ] differs between dialects".to_owned());
+                }
+                in_class = true;
+            }
             ']' if in_class => in_class = false,
             // Nested brackets (POSIX classes, unions) and the set operators && ~~ -- exist in the regex crate only.
             '[' => return Err("brackets inside a class differ between dialects".to_owned()),
@@ -1126,6 +1159,38 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_evaluation_is_never_a_match() -> Result<(), SchemaError> {
+        // M1T01R-22: running out of evaluation depth inside oneOf or if must fail the whole validation instead of
+        // counting as "does not match" (which would let oneOf accept or if take the else branch).
+        let mut defs = serde_json::Map::new();
+        for i in 0..520 {
+            defs.insert(
+                format!("d{i}"),
+                json!({"$ref": format!("#/$defs/d{}", i + 1)}),
+            );
+        }
+        defs.insert("d520".to_owned(), json!({"type": "null"}));
+        let one_of =
+            Schema::new(json!({"$defs": defs.clone(), "oneOf": [true, {"$ref": "#/$defs/d0"}]}))?;
+        let errors = one_of.validate(&json!(null)).err().unwrap_or_default();
+        assert!(
+            errors.iter().any(|v| v.message.contains("too deep")),
+            "{errors:?}"
+        );
+        let cond = Schema::new(
+            json!({"$defs": defs, "if": {"$ref": "#/$defs/d0"}, "then": false, "else": true}),
+        )?;
+        assert!(cond.validate(&json!(null)).is_err());
+        // The next, unrelated validation on this thread is unaffected.
+        assert!(
+            Schema::new(json!({"type": "null"}))?
+                .validate(&json!(null))
+                .is_ok()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn character_classes_are_limited_to_portable_forms() {
         // M1T01R-19: set operations, POSIX classes and nested brackets differ between ECMA-262 and the regex crate.
         for pattern in [
@@ -1134,6 +1199,11 @@ mod tests {
             "^[a-z--b]$",
             "^[[:alpha:]]$",
             "^[a[b]]$",
+            // M1T01R-24: a class starting with ] (ECMA-262: empty class; regex crate: literal ]).
+            "^[]a]$",
+            "^[]a~~b]$",
+            "^[^]a]$",
+            "^[]$",
         ] {
             assert!(
                 Schema::new(json!({"pattern": pattern})).is_err(),
