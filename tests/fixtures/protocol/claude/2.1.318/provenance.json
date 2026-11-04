@@ -1,0 +1,13 @@
+{
+  "cli_version": "2.1.318",
+  "auth": "AUTHENTICATED (live turn recorded)",
+  "recording_started_at": "2026-11-04T00:37:55.525118+00:00",
+  "recorded_at": "2026-11-04T00:38:14.098164+00:00",
+  "help_argv": [
+    "claude",
+    "--help"
+  ],
+  "help_sha256": "5ca3a9dac2026e56c221fdd34380c7d7d45ebbb51c1d01b7c17c75cb076a0be8",
+  "entry_path": "/home/ai/.local/share/claude/versions/2.1.318",
+  "entry_sha256": "708c77b204db30086ff6f1ed34577bda03e1be74ced80557cbf7b54249ebf0bd"
+}

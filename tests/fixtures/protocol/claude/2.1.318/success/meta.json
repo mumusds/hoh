@@ -1,0 +1,21 @@
+{
+  "agent": "claude",
+  "cli_version": "2.1.318",
+  "case": "success",
+  "argv": [
+    "claude",
+    "-p",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--dangerously-skip-permissions"
+  ],
+  "cwd": "fresh temp Git repo outside the checkout",
+  "exit_code": 0,
+  "recorded_at": "2026-11-04T00:37:59.802923+00:00",
+  "mode": "live",
+  "notes": "single turn",
+  "stopped": "exited",
+  "valid": true,
+  "problems": []
+}

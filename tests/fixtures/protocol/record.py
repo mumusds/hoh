@@ -143,12 +143,16 @@ def populated(cgroup: Path) -> bool:
 
 
 def members(cgroup: Path) -> list[int]:
-    try:
-        return [int(x) for x in (cgroup / 'cgroup.procs').read_text().split()]
-    except OSError as exc:
-        if exc.errno in GONE:
-            return []
-        raise
+    """Processes in the cgroup and all its child cgroups: the same subtree that cgroup.events and cgroup.kill cover,
+    since a descendant may move into a child cgroup of the scope it owns (M0R11-01)."""
+    found: list[int] = []
+    for directory, _, _ in os.walk(cgroup):
+        try:
+            found += [int(x) for x in (Path(directory) / 'cgroup.procs').read_text().split()]
+        except OSError as exc:
+            if exc.errno not in GONE:
+                raise
+    return found
 
 
 def write_control(cgroup: Path, name: str, value: str) -> None:

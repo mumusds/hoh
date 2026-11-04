@@ -24,7 +24,9 @@ escalation: close stdin, SIGTERM to the process group, then kill the scope. Desc
 scope after the CLI exited get 5 s to end by themselves (`meta.json` `descendants_lingered`); those the
 kernel still lists as members when that period ends outlived it (`descendants_outlived`): they are
 killed and the case is invalid, as is one whose process needed SIGKILL. The verdict is that single
-observation; the recorder never claims which process it killed.
+observation (over the whole scope subtree, child cgroups included); the recorder never claims which
+process it killed. A descendant that starts its own systemd unit (e.g. `systemd-run --user`) or moves
+itself into a cgroup outside the scope is not tracked; agent CLIs are not known to do either.
 Children get default SIGINT/SIGTERM/SIGHUP dispositions even when the recorder runs with SIGINT ignored.
 SIGINT/SIGTERM/SIGHUP at any point of a run stop every child before the temporary directories are
 removed (directories of a child that could not be confirmed gone are kept), and the manifest is still
@@ -57,6 +59,10 @@ compare raw bytes; the repository is private.
 | codex 0.166.0 | `app-server-steer` | live, logged in | `turn/steer` with a stale `expectedTurnId` → JSON-RPC error `-32600` "expected active turn id … but found …"; with the active turn id → result, and the turn completes |
 | codex 0.166.0 | `app-server-handshake-unauthenticated` | live, empty `CODEX_HOME` | `initialize` and `thread/start` still succeed (`thread/started`); stderr already logs a Responses WebSocket connection error |
 | codex 0.166.0 | `app-server-schema/` | offline | JSON Schema from `codex app-server generate-json-schema` (tree hash in the manifest) |
+
+Claude Code updates itself on the development VM: 2.1.318 replaced 2.1.317 on 2026-11-04 and was recorded
+with the same four cases (same frame types after SIGINT and in `success`, identical `--help`); the 2.1.317
+directory is kept until the compat suite has been rerun. Re-record after every CLI update.
 
 Since M0-T06 every case is reproducible on each run: the unauthenticated surfaces use an empty
 `CODEX_HOME` and the model-unavailable surface an invalid `--model`, so a re-recording never mixes cases
