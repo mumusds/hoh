@@ -278,7 +278,7 @@ class PersistenceScan(unittest.TestCase):
     def test_the_persistence_module_may_use_sqlite_and_others_may_name_things_freely(self):
         rc,res=self.run_scan({'crates/hoh-core/src/persistence/mod.rs':'#![allow(clippy::disallowed_methods)]\nfn f(c:&rusqlite::Connection){c.execute("INSERT INTO t VALUES (1)",[]);}',
                               'crates/hoh-app/src/main.rs':'// INSERT INTO t is only a comment\n/* DELETE FROM t */ fn main(){let s="update the docs"; Command.execute(); tx.transaction();}\n#[allow(dead_code)] fn x(){}',
-                              'crates/hoh-app/tests/db.rs':'#![allow(clippy::disallowed_methods)]\nfn t(){ let q = "INSERT INTO t VALUES (1)"; }'})
+                              'crates/hoh-app/tests/db.rs':'fn t(){ let q = "INSERT INTO t VALUES (1)"; }'})  # SQL in tests is no hit
         self.assertEqual((rc,res['status'],res['hits']),(0,'PASS',[]))  # M2T01R-06: method names alone are not hits
     def test_sqlite_dependencies_outside_hoh_core_are_hits_by_package_identity(self):
         # M2T01R-04: a renamed package, a workspace-inherited one (resolved by cargo) and one reached through another crate.
@@ -309,6 +309,34 @@ class PersistenceScan(unittest.TestCase):
         self.assertIn('rusqlite::Connection::execute not disallowed',[h['match'] for h in res['hits']])
         rc,res=self.run_scan({},clippy='disallowed-methods = [ { path = "rusqlite::Connection::open", allow-invalid = true } ]\n')
         self.assertIn('rusqlite::Connection::open: allow-invalid',[h['match'] for h in res['hits']])
+    def test_lint_names_are_normalised_and_test_or_example_files_are_not_exempt(self):
+        # M2T01R-23: Cargo's hyphenated lint key (inherited through workspace = true), spaced paths kept by rustfmt::skip,
+        # cfg_attr and the lint's former name. M2T01R-25: any .rs file may be compiled into the product (a bin path into
+        # examples/, a cfg_attr(path) module from tests/), so none is exempt.
+        files={'Cargo.toml':'[workspace]\n[workspace.lints.clippy]\ndisallowed-methods = { level = "allow", priority = 1 }\n',
+               'crates/hoh-app/src/main.rs':'#[rustfmt::skip]\n#[allow(clippy :: disallowed_methods)]\nfn a(){}\n'
+                                            '#[cfg_attr(unix, allow(clippy::disallowed_method))]\nfn b(){}\n'
+                                            '#[cfg_attr(unix, path = "../tests/r5outside.rs")]\nmod outside;',
+               'crates/hoh-app/tests/r5outside.rs':'#![allow(clippy::disallowed_methods)]\npub fn w(){}',
+               'crates/hoh-app/examples/r5.rs':'#![expect(warnings)]\nfn main(){}'}
+        rc,res=self.run_scan(files)
+        self.assertEqual(rc,1)
+        self.assertEqual(self.kinds(res),[('Cargo.toml','lint-table'),('crates/hoh-app/examples/r5.rs','lint-suppressed'),
+                                          ('crates/hoh-app/src/main.rs','lint-suppressed'),('crates/hoh-app/src/main.rs','lint-suppressed'),
+                                          ('crates/hoh-app/src/main.rs','path-or-include'),('crates/hoh-app/tests/r5outside.rs','lint-suppressed')])
+    def test_the_canary_must_refuse_every_disallowed_method(self):
+        sys.path.insert(0,str(ROOT/'scripts/product'))
+        import persistence_scan as ps
+        canary=ps.CANARY
+        log=lambda paths,where=canary,extra='':''.join(f'error: use of a disallowed method `{p}`\n --> {where}:1:1\n' for p in paths)+extra+'error: could not compile `hoh-core`\n'
+        self.assertEqual(ps.canary_verdict(log(sorted(ps.REQUIRED)))['problems'],[])
+        missing=sorted(ps.REQUIRED)[1:]
+        self.assertEqual(ps.canary_verdict(log(missing))['problems'],[f'not refused: {sorted(ps.REQUIRED)[0]}'])
+        elsewhere=ps.canary_verdict(log(sorted(ps.REQUIRED))+log(['rusqlite::Connection::open'],'crates/hoh-app/src/main.rs'))['problems']
+        self.assertEqual(len(elsewhere),1);self.assertIn('crates/hoh-app/src/main.rs',elsewhere[0])
+        broken=ps.canary_verdict(log(sorted(ps.REQUIRED),extra='error[E0308]: mismatched types\n'))['problems']
+        self.assertEqual(broken,['error[E0308]: mismatched types'])
+        self.assertEqual(len(ps.canary_verdict('')['problems']),len(ps.REQUIRED))  # a canary that compiled refuses nothing
     def test_new_rusqlite_features_need_the_boundary_extended(self):
         rc,res=self.run_scan({},features=['bundled','default','backup'])
         self.assertEqual(self.kinds(res),[('Cargo.lock','rusqlite-feature')])

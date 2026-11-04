@@ -10,14 +10,20 @@ The boundary is enforced by the compiler, and this scan checks that nothing swit
 2. Inside hoh-core, clippy's `disallowed-methods` (clippy.toml) forbids every rusqlite call that opens a database or
    executes SQL. Clippy resolves each call with type information, so it holds however a connection was obtained
    (aliases, re-exports, generics, closures, trait methods, macros); the static check runs clippy with -D warnings
-   and fails on an entry that does not resolve. This scan checks that clippy.toml lists all REQUIRED methods
+   and fails on an entry that does not resolve. Iterating a result that persistence itself prepared and handed out
+   (a `MappedRows`) goes through `Iterator::next` and cannot be told apart: persistence hands out no SQLite object.
+   This scan checks that clippy.toml lists all REQUIRED methods
    without `allow-invalid`, that no other clippy configuration exists, that no Cargo `[lints]` table or
    `.cargo/config` rustflags allow the lint, and that no product source outside persistence/ allows or expects
    `clippy::disallowed_methods` or a group holding it (`clippy::style`, `clippy::all`, `warnings`).
-3. Product sources are all .rs files in the directories of the workspace members (from `cargo metadata`) except
-   tests/, benches/ and examples/; `#[path = …]` and `include!` are not allowed in them, so every compiled file is
-   one this scan reads.
-4. Defence in depth: string literals outside persistence/ that hold a SQL write statement (INSERT/REPLACE INTO,
+3. Every .rs file in the directories of the workspace members (from `cargo metadata`), tests, benches and examples
+   included (a target may compile any of them): no lint suppression as in 2 outside persistence/, and no
+   `#[path = …]` (also inside `cfg_attr`) or `include!`, so every compiled file is one this scan reads.
+   scripts/product/static.sh clears rustflags and compiler wrappers from the environment, makes the repository's
+   clippy.toml the configuration (CLIPPY_CONF_DIR), and compiles crates/hoh-core/src/clippy_canary.rs, which calls
+   every REQUIRED method outside persistence; --canary-log checks that clippy refused each of them there and failed
+   for no other reason, which proves the boundary in force in the environment the check runs in (M2T01R-24).
+4. Defence in depth: string literals outside persistence/ (and outside tests, benches, examples) that hold a SQL write statement (INSERT/REPLACE INTO,
    UPDATE ... SET, DELETE FROM, UPSERT, ON CONFLICT ... DO UPDATE), decoded as Rust does (escapes, line
    continuations), with literals separated only by commas joined (concat!), are hits.
 5. web/ (when present): no SQLite package in package.json dependencies (by name or npm: alias spec), nowhere in a
@@ -45,12 +51,20 @@ REQUIRED = {f'rusqlite::{ty}::{m}' for ty, ms in {
                    'transaction_with_behavior', 'unchecked_transaction', 'savepoint', 'savepoint_with_name'],
     'Statement': ['execute', 'insert', 'raw_execute', 'query', 'query_map', 'query_and_then', 'query_row', 'query_one',
                   'exists', 'raw_query'],
-    'Transaction': ['new', 'new_unchecked', 'commit', 'rollback', 'finish', 'savepoint', 'savepoint_with_name'],
-    'Savepoint': ['new', 'with_name', 'commit', 'rollback', 'finish', 'savepoint', 'savepoint_with_name'],
+    'Transaction': ['new', 'new_unchecked', 'commit', 'rollback', 'finish', 'savepoint', 'savepoint_with_name',
+                    'set_drop_behavior'],
+    'Savepoint': ['new', 'with_name', 'commit', 'rollback', 'finish', 'savepoint', 'savepoint_with_name',
+                  'set_drop_behavior'],
     'Batch': ['new'],
-}.items() for m in ms}
+    # Stepping a statement (M2T01R-22); the iterator traits are used by rusqlite alone in this dependency graph.
+    'Rows': ['next', 'map', 'mapped', 'and_then'],
+}.items() for m in ms} | {'fallible_streaming_iterator::FallibleStreamingIterator::advance',
+                         'fallible_streaming_iterator::FallibleStreamingIterator::next',
+                         'fallible_iterator::FallibleIterator::next'}
 KNOWN_RUSQLITE_FEATURES = {'bundled', 'cache', 'default', 'modern_sqlite', 'ffi-sqlite-wasm-rs', 'hashlink'}
-SUPPRESSING = re.compile(r'\b(?:clippy::(?:disallowed_methods|style|all)|warnings)\b')
+# Matched on attribute and Cargo lint text with whitespace removed and `-` read as `_` (M2T01R-23); `disallowed_method`
+# is the lint's former name, still accepted by clippy.
+SUPPRESSING = re.compile(r'(?<![\w:])(?:clippy::(?:disallowed_methods?|style|all)|warnings)(?![\w:])')
 
 
 def sqlite_package(name: str) -> bool:
@@ -232,12 +246,19 @@ def member_dirs(metadata: dict) -> list[Path]:
     return sorted({Path(packages[m]['manifest_path']).parent for m in metadata['workspace_members']})
 
 
-def product_files(metadata: dict) -> list[Path]:
-    skip = {'tests', 'benches', 'examples', 'target'}
+def rust_files(metadata: dict) -> list[Path]:
+    """Every .rs file in the member directories (build output excluded). Which of them are compiled into the product
+    depends on targets and module paths, so the lint checks look at all of them (M2T01R-25)."""
     files = set()
     for d in member_dirs(metadata):
-        files |= {p for p in d.rglob('*.rs') if not skip & set(p.relative_to(d).parts[:-1])}
+        files |= {p for p in d.rglob('*.rs') if 'target' not in p.relative_to(d).parts[:-1]}
     return sorted(files)
+
+
+def is_test_code(path: Path, metadata: dict) -> bool:
+    """Under tests/, benches/ or examples/ of a member (only for the SQL-literal check)."""
+    return any(path.is_relative_to(d) and {'tests', 'benches', 'examples'} & set(path.relative_to(d).parts[:-1])
+               for d in member_dirs(metadata))
 
 
 def lint_configuration_checks(root: Path, metadata: dict, hits: list) -> None:
@@ -270,8 +291,8 @@ def lint_configuration_checks(root: Path, metadata: dict, hits: list) -> None:
             for tool, lints in table.items():
                 for lint, level in (lints.items() if isinstance(lints, dict) else []):
                     level = level.get('level') if isinstance(level, dict) else level
-                    full = lint if tool == 'rust' else f'{tool}::{lint}'
-                    if level in ('allow', 'expect') and SUPPRESSING.search(full):
+                    full = (lint if tool == 'rust' else f'{tool}::{lint}').replace('-', '_')
+                    if level in ('allow', 'expect') and SUPPRESSING.fullmatch(full):
                         hits.append({'path': rel_to(manifest, root), 'kind': 'lint-table', 'match': f'{full} = {level}'})
     for cfg in (root / '.cargo/config.toml', root / '.cargo/config'):
         if cfg.is_file() and re.search(r'(?:-A|--allow|--cap-lints)', cfg.read_text(encoding='utf-8')):
@@ -286,17 +307,20 @@ def scan(root: Path, metadata: dict) -> dict:
     hits = []
     dev_uses = dependency_checks(metadata, hits)
     lint_configuration_checks(root, metadata, hits)
-    files = product_files(metadata)
+    files = rust_files(metadata)
     for path in files:
         rel = rel_to(path, root)
         code, literals = split_rust(path.read_text(encoding='utf-8', errors='replace'))
-        if re.search(r'#\s*!?\s*\[\s*path\s*=', code) or re.search(r'\binclude!\s*[(\[{]', code):
-            hits.append({'path': rel, 'kind': 'path-or-include', 'match': '#[path] or include!'})
+        compact = [re.sub(r'\s+', '', attr) for attr in attributes(code)]
+        if any(re.search(r'[\[(,]path=', attr) for attr in compact) or re.search(r'\binclude\s*!\s*[(\[{]', code):
+            hits.append({'path': rel, 'kind': 'path-or-include', 'match': '#[path] (also in cfg_attr) or include!'})
         if rel.startswith(PERSISTENCE):
             continue
-        for attr in attributes(code):
-            if re.search(r'\b(?:allow|expect)\s*\(', attr) and SUPPRESSING.search(attr):
+        for attr in compact:
+            if re.search(r'(?:allow|expect)\(', attr) and SUPPRESSING.search(attr):
                 hits.append({'path': rel, 'kind': 'lint-suppressed', 'match': attr[:200]})
+        if is_test_code(path, metadata):
+            continue
         for value in literal_strings(code, literals):
             if m := SQL_WRITE.search(value):
                 hits.append({'path': rel, 'kind': 'sql', 'match': ' '.join(m.group(0).split())})
@@ -329,6 +353,26 @@ def scan(root: Path, metadata: dict) -> dict:
             'dev_dependency_uses': dev_uses, 'hits': hits, 'status': 'PASS' if scanned > 0 and not hits else 'FAIL'}
 
 
+CANARY = 'crates/hoh-core/src/clippy_canary.rs'
+
+
+def canary_verdict(log: str) -> dict:
+    """Clippy on the canary must refuse every REQUIRED method there, and fail for no other reason."""
+    refused, other = set(), []
+    lines = log.splitlines()
+    for i, line in enumerate(lines):
+        if m := re.match(r'error: use of a disallowed method `([^`]+)`', line):
+            where = next((l for l in lines[i + 1:i + 4] if '-->' in l), '')
+            if CANARY in where:
+                refused.add(m.group(1))
+            else:
+                other.append(f'{m.group(1)} reported at {where.strip()}')
+        elif line.startswith('error') and not line.startswith('error: could not compile'):
+            other.append(line[:200])
+    problems = [f'not refused: {p}' for p in sorted(REQUIRED - refused)] + other
+    return {'refused': len(refused), 'required': len(REQUIRED), 'problems': problems}
+
+
 def json_strings(value) -> list[str]:
     """Every key and string value in a JSON document."""
     if isinstance(value, dict):
@@ -343,15 +387,23 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument('--root', type=Path, default=Path(__file__).resolve().parents[2])
     p.add_argument('--metadata', type=Path, help='cargo metadata JSON to use instead of running cargo')
     p.add_argument('--out', type=Path, help='test-results.jsonl to append the TEST-062-05 line to')
+    p.add_argument('--canary-log', type=Path, help='output of clippy on the canary (scripts/product/static.sh)')
     a = p.parse_args(argv)
     try:
         result = scan(a.root.resolve(), load_metadata(a.root, a.metadata))
+        if a.canary_log:
+            result['canary'] = canary_verdict(a.canary_log.read_text(encoding='utf-8', errors='replace'))
+            if result['canary']['problems']:
+                result['status'] = 'FAIL'
     except (RuntimeError, KeyError, ValueError, OSError) as exc:
         result = {'files_scanned': 0, 'hits': [], 'status': 'FAIL', 'error': str(exc)}
     print(json.dumps(result, ensure_ascii=False, indent=1))
     if a.out:
-        detail = result.get('error') or (f"{result['files_scanned']} files scanned, {len(result['hits'])} hits; "
-                                         f"SQLite calls outside {PERSISTENCE} are refused by clippy disallowed-methods")
+        canary = result.get('canary')
+        detail = result.get('error') or (f"{result['files_scanned']} files scanned, {len(result['hits'])} hits; " + (
+            f"canary: {canary['refused']}/{canary['required']} disallowed calls refused"
+            + (f", problems: {canary['problems'][:5]}" if canary['problems'] else '') if canary
+            else 'canary not run'))
         line = {'schema_version': '1.0', 'test_id': 'TEST-062-05', 'name': 'scripts/product/persistence_scan.py',
                 'status': result['status'], 'detail': detail[:4096]}
         with a.out.open('a', encoding='utf-8') as f:

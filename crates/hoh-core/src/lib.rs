@@ -1,6 +1,8 @@
 //! HoH domain core: specification, orchestration, execution state, verification and
 //! persistence ports (docs/04-architecture.md).
 
+#[cfg(hoh_clippy_canary)]
+mod clippy_canary;
 pub mod integer;
 pub mod nullable;
 pub mod persistence;
