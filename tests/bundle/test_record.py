@@ -184,6 +184,8 @@ if mode=='subcgroup':
 if mode=='unlistable':
     own='/sys/fs/cgroup'+open('/proc/self/cgroup').read().strip().rsplit(':',1)[-1]
     if os.fork()==0:
+        go=sys.argv[2]+'.go'
+        while not os.path.exists(go):time.sleep(0.01)  # only once the recorder has finished building the Proc
         os.chmod(own,0o111)  # the scope directory can still be traversed but no longer listed
         fd=os.open(os.devnull,os.O_RDWR)
         for n in (0,1,2):os.dup2(fd,n)
@@ -205,6 +207,7 @@ class BoundedStop(unittest.TestCase):
     """M0R3-03: stopping a child never waits without bound."""
     def setUp(self):
         t=tempfile.TemporaryDirectory();self.addCleanup(t.cleanup);self.dir=Path(t.name)
+        self.addCleanup(record.stop_all)  # also covers a Proc whose construction raised (M0R13-01); runs before the cleanup above
         self.script=self.dir/'child.py';self.script.write_text(SLEEPER)
     def proc(self,mode):
         p=record.Proc([sys.executable,str(self.script),mode,str(self.dir/'escaped.pid')],self.dir,dict(os.environ))
@@ -338,7 +341,9 @@ class BoundedStop(unittest.TestCase):
         self.assertFalse(record.populated(p.cgroup))
     def test_unlistable_scope_fails_instead_of_looking_empty(self):
         # M0R12-01: an error listing the scope tree is not an empty member list; the stop fails, the scope is still cleaned.
-        p=self.proc('unlistable')
+        p=self.proc('unlistable');(self.dir/'escaped.pid.go').touch()
+        deadline=time.monotonic()+10
+        while time.monotonic()<deadline and os.stat(p.cgroup).st_mode&0o777!=0o111:time.sleep(0.01)
         with self.assertRaises(PermissionError):p.stop(grace=5,descendant_grace=0.3)
         self.assertFalse(self.escaped_alive());self.assertFalse(record.populated(p.cgroup));self.assertNotIn(p,record.LIVE)
     def test_unrelated_children_survive(self):
