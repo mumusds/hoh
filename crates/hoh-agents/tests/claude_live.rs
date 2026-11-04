@@ -1,7 +1,13 @@
 //! TEST-025-04 against the installed `claude` (live; model calls). Run only by scripts/product/adapter-live.sh, which
 //! sets HOH_LIVE_OUT and turns the verdict written there into the check's evidence: three turns in a temporary Git
-//! repository with the default graces — a reply, a resumed reply, a cancelled tool run. Not logged in is BLOCKED,
-//! never PASS. The installed CLI (path, version, sha256, help hash) is recorded in claude-install.json.
+//! repository with the default graces — a reply, a resumed reply, a cancelled tool run. Not logged in (the adapter's
+//! BLOCKED_AUTH, from Claude's recorded `authentication_failed` marker) is BLOCKED, never PASS. The installed CLI
+//! (path, version, sha256, help hash) is recorded in claude-install.json.
+//!
+//! claude 2.1.318 refuses a foreground `sleep 120` ("Blocked: standalone sleep"), so the third turn runs it as a
+//! background task, which Claude starts in a process group of its own. The cancel is sent only once that `sleep 120`
+//! process is seen alive in the repository; the turn fails if it never starts, or if it or any other process is left
+//! in the repository 16 s after the cancel.
 
 // No SQLite outside hoh-core::persistence (AC-062-05; see clippy.toml), and no unsafe code (no FFI way around it).
 #![forbid(clippy::disallowed_methods)]
@@ -22,12 +28,21 @@ use tokio::sync::watch;
 
 const TOKEN: &str = "HOH_NATIVE_SMOKE_OK";
 
-fn write_verdict(out: &Path, status: &str, detail: &str, sessions: &[serde_json::Value]) -> R {
+fn write_verdict(
+    out: &Path,
+    status: &str,
+    detail: &str,
+    sessions: &[serde_json::Value],
+    observations: &serde_json::Value,
+) -> R {
     std::fs::write(
         out.join("claude-live-verdict.json"),
-        serde_json::to_vec_pretty(
-            &json!({"status": status, "detail": detail, "sessions": sessions}),
-        )?,
+        serde_json::to_vec_pretty(&json!({
+            "status": status,
+            "detail": detail,
+            "sessions": sessions,
+            "observations": observations,
+        }))?,
     )?;
     Ok(())
 }
@@ -53,26 +68,26 @@ fn processes_in(dir: &Path) -> Vec<u32> {
         .collect()
 }
 
-/// A failed first turn that reads as "not logged in" (no recorded sample exists yet, so this errs on BLOCKED, never
-/// on PASS).
-fn looks_unauthenticated(outcome: &Outcome) -> bool {
-    let text = outcome
-        .result
-        .as_ref()
-        .and_then(|r| r.text.clone())
-        .unwrap_or_default();
-    let stderr = std::fs::read(&outcome.stderr).unwrap_or_default();
-    let all = format!("{text}\n{}", String::from_utf8_lossy(&stderr)).to_lowercase();
-    [
-        "/login",
-        "not logged in",
-        "invalid api key",
-        "authentication",
-        "unauthorized",
-        "401",
-    ]
-    .iter()
-    .any(|p| all.contains(p))
+/// `sleep 120` processes working in `dir`: (pid, process group).
+fn sleeps_in(dir: &Path) -> Vec<(u32, u32)> {
+    processes_in(dir)
+        .into_iter()
+        .filter(|pid| {
+            std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| c == b"sleep\x00120\x00")
+        })
+        .filter_map(|pid| {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            // After the command name: state, ppid, pgrp.
+            let pgrp = stat
+                .rsplit_once(')')?
+                .1
+                .split_whitespace()
+                .nth(2)?
+                .parse()
+                .ok()?;
+            Some((pid, pgrp))
+        })
+        .collect()
 }
 
 #[tokio::test]
@@ -149,13 +164,15 @@ async fn claude_live_turns_resume_and_cancel() -> R {
         quiet(),
     )
     .await?;
+    let none = json!({});
     if first.state != AttemptState::Settled {
-        if looks_unauthenticated(&first) {
+        if first.failure.as_deref() == Some("BLOCKED_AUTH") {
             write_verdict(
                 &out,
                 "BLOCKED",
                 "BLOCKED_AUTH: claude is not logged in",
                 &sessions,
+                &none,
             )?;
             return Ok(());
         }
@@ -164,6 +181,7 @@ async fn claude_live_turns_resume_and_cancel() -> R {
             "FAIL",
             &format!("turn 1 ended {:?} ({:?})", first.state, first.failure),
             &sessions,
+            &none,
         )?;
         return Err(format!("turn 1: {first:?}").into());
     }
@@ -204,33 +222,36 @@ async fn claude_live_turns_resume_and_cancel() -> R {
         ));
     }
 
-    // 3. A long tool run, cancelled once the tool is in flight: CANCELLED and the group gone within 16 s, with no
-    //    process left in the repository either.
+    // 3. A long tool run, cancelled once its `sleep 120` is seen alive: CANCELLED, the group gone within 16 s, and no
+    //    process left in the repository (the sleep runs in a group of its own).
     let a3 = world.attempt_in("A3", "S2", &version).await?;
     let third_turn = turn(
-        "Use the Bash tool to run `sleep 120` in the foreground (not in the background), then reply DONE.",
+        "Use the Bash tool with run_in_background: true to run `sleep 120`. Then wait until that background command \
+         has finished before you reply; when it has finished, reply DONE.",
         "live/A3",
         None,
     );
-    let stdout = third_turn.logs.join("stdout.jsonl");
     let (cancel, cancelled) = watch::channel(false);
     let running = claude::run(&world.store, &a3, &third_turn, cancelled);
     let trigger = async {
         let started = Instant::now();
-        while started.elapsed() < Duration::from_secs(180) {
-            if std::fs::read(&stdout)
-                .is_ok_and(|b| String::from_utf8_lossy(&b).contains("\"tool_use\""))
-            {
-                break;
-            }
+        let mut seen = Vec::new();
+        while started.elapsed() < Duration::from_secs(180) && seen.is_empty() {
             tokio::time::sleep(Duration::from_millis(200)).await;
+            seen = sleeps_in(&repo);
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        // Still alive when the cancel is sent?
+        let alive: Vec<u32> = seen
+            .iter()
+            .map(|(pid, _)| *pid)
+            .filter(|pid| sleeps_in(&repo).iter().any(|(p, _)| p == pid))
+            .collect();
         let at = Instant::now();
         let _ = cancel.send(true);
-        at
+        (at, seen, alive)
     };
-    let (third, at) = tokio::join!(running, trigger);
+    let (third, (at, seen, alive)) = tokio::join!(running, trigger);
     let third = third?;
     let took = at.elapsed();
     let left = third.pid.map(group_members).unwrap_or_default();
@@ -238,6 +259,21 @@ async fn claude_live_turns_resume_and_cancel() -> R {
     while !stray.is_empty() && at.elapsed() < Duration::from_secs(16) {
         tokio::time::sleep(Duration::from_millis(200)).await;
         stray = processes_in(&repo);
+    }
+    let observations = json!({
+        "turn3": {
+            "sleep_processes_seen": seen.iter().map(|(pid, pgid)| json!({"pid": pid, "pgid": pgid})).collect::<Vec<_>>(),
+            "alive_at_cancel": alive,
+            "claude_pid": third.pid,
+            "cancel_to_end_ms": took.as_millis(),
+            "group_left": left,
+            "processes_left_in_repository": stray,
+        }
+    });
+    if alive.is_empty() {
+        problems.push(format!(
+            "turn 3: no `sleep 120` was alive in the repository when the cancel was sent (seen {seen:?})"
+        ));
     }
     if third.state != AttemptState::Cancelled
         || took > Duration::from_secs(16)
@@ -265,12 +301,15 @@ async fn claude_live_turns_resume_and_cancel() -> R {
         write_verdict(
             &out,
             "PASS",
-            &format!("claude {version}: reply, resumed reply, cancelled tool run in {took:?}"),
+            &format!(
+                "claude {version}: reply, resumed reply, `sleep 120` tool run cancelled in {took:?}"
+            ),
             &sessions,
+            &observations,
         )?;
         Ok(())
     } else {
-        write_verdict(&out, "FAIL", &problems.join("; "), &sessions)?;
+        write_verdict(&out, "FAIL", &problems.join("; "), &sessions, &observations)?;
         Err(problems.join("; ").into())
     }
 }
