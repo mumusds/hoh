@@ -8,6 +8,9 @@
 //! foreign_keys=1, busy_timeout, synchronous=FULL; any mismatch refuses the store), and the schema migrated
 //! (`user_version`; a database from a newer binary is refused).
 
+// The one module allowed to call SQLite (clippy.toml `disallowed-methods`, AC-062-05).
+#![allow(clippy::disallowed_methods)]
+
 pub mod location;
 pub mod selftest;
 mod writer;
@@ -284,27 +287,32 @@ fn user_version(conn: &Connection) -> Result<i64, PersistError> {
         .map_err(sqlite_error)
 }
 
-/// Run a script's statements one by one inside the caller's transaction. Transaction control is decided before
-/// anything runs (M2T01R-15): SQLite reports it as read-only, so a read-only statement runs only if its keyword is a
-/// known read (`SELECT`, `WITH`, `VALUES`, `EXPLAIN`, `PRAGMA`); the script's own `BEGIN`, `COMMIT` and `END` are
-/// skipped and any other read-only statement (`ROLLBACK`, `SAVEPOINT`, `RELEASE`, or one not recognised) fails the
-/// script unexecuted. A statement that still ends the transaction fails it afterwards.
+/// Run a script's statements one by one inside the caller's transaction. Each statement is classified by its first
+/// keyword (after whitespace, a byte-order mark, empty statements and comments) before anything runs (M2T01R-15,
+/// -20): the script's own `BEGIN`/`COMMIT`/`END` are skipped; `ROLLBACK`, `SAVEPOINT`, `RELEASE`, `VACUUM`, `ATTACH`
+/// and `DETACH` fail the script unexecuted (they would leave or cannot run in the transaction). SQLite's read-only
+/// flag is a fail-closed net, not the classifier: a read-only statement with any other keyword than a known read or
+/// maintenance step (`SELECT`, `WITH`, `VALUES`, `EXPLAIN`, `PRAGMA`, `REINDEX`, `ANALYZE`) fails unexecuted too,
+/// since transaction control is read-only. A statement that still ends the transaction fails the script afterwards.
 fn run_script(conn: &Connection, sql: &str) -> Result<(), String> {
     use rusqlite::fallible_iterator::FallibleIterator;
     let mut batch = rusqlite::Batch::new(conn, sql);
     while let Some(mut statement) = batch.next().map_err(|e| e.to_string())? {
         let text = statement.expanded_sql().unwrap_or_default();
-        if statement.readonly() {
-            match leading_keyword(&text).as_str() {
-                "BEGIN" | "COMMIT" | "END" => continue,
-                "SELECT" | "WITH" | "VALUES" | "EXPLAIN" | "PRAGMA" => {}
-                _ => {
-                    return Err(format!(
-                        "the statement `{}` is not allowed in a migration",
-                        text.trim()
-                    ));
-                }
+        let refused = || {
+            format!(
+                "the statement `{}` is not allowed in a migration",
+                text.trim()
+            )
+        };
+        match leading_keyword(&text).as_str() {
+            "BEGIN" | "COMMIT" | "END" => continue,
+            "ROLLBACK" | "SAVEPOINT" | "RELEASE" | "VACUUM" | "ATTACH" | "DETACH" => {
+                return Err(refused());
             }
+            "SELECT" | "WITH" | "VALUES" | "EXPLAIN" | "PRAGMA" | "REINDEX" | "ANALYZE" => {}
+            _ if statement.readonly() => return Err(refused()),
+            _ => {}
         }
         statement.raw_execute().map_err(|e| e.to_string())?;
         if conn.is_autocommit() {
