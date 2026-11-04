@@ -720,4 +720,23 @@ fn derived_ids_stay_within_the_protocol_limit_and_distinct() {
     // Multi-byte characters are cut on a boundary.
     let wide = "é".repeat(80);
     assert!(child_id(&wide, "dispatch").len() <= MAX_ID);
+    // Any suffix, however long, still gives a bounded id (M1T03R-06): suffixes are caller-supplied event names.
+    for (parent, suffix) in [
+        ("A1", "x".repeat(160)),
+        (long_a.as_str(), "x".repeat(400)),
+        (wide.as_str(), "é".repeat(200)),
+        ("", String::new()),
+    ] {
+        let id = child_id(parent, &suffix);
+        assert!(
+            id.len() <= MAX_ID,
+            "{} for a {}-byte suffix",
+            id.len(),
+            suffix.len()
+        );
+    }
+    assert_ne!(
+        child_id("A1", &"x".repeat(160)),
+        child_id("A1", &format!("{}y", "x".repeat(159)))
+    );
 }
