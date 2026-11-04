@@ -174,13 +174,52 @@ struct CodexSchema {
 }
 
 /// The `method` names a protocol schema file lists, read only from the form the App Server schema uses: `oneOf`
-/// branches `{type: "object", required: [names], properties: {method: {type: "string", enum: [names]}, ...}}` with
-/// optional `title`/`description` strings. A method-bearing branch with any other keyword or an ill-typed value
-/// rejects the whole file, so malformed output never yields a capability (M1T01R-15, -18, -23).
+/// branches `{type: "object", required: [unique names], properties: {method: {type: "string", enum: [names]}, ...}}`
+/// with optional `title`/`description` strings; every other property is `true`/`false` or an object of `$ref`
+/// (string), `type` (a type name) and `anyOf` (a non-empty list of `$ref`/`type` objects). A method-bearing branch
+/// with any other keyword or an ill-typed value rejects the whole file, so malformed output never yields a
+/// capability (M1T01R-15, -18, -23, -25).
 fn schema_methods(value: &serde_json::Value) -> Option<std::collections::BTreeSet<String>> {
     use serde_json::Value;
     let strings = |v: &Value| v.as_array().is_some_and(|a| a.iter().all(Value::is_string));
     let annotation = |key: &str, v: &Value| matches!(key, "title" | "description") && v.is_string();
+    let unique = |v: &Value| {
+        v.as_array().is_some_and(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                == a.len()
+        })
+    };
+    let type_name = |v: &Value| {
+        matches!(
+            v.as_str(),
+            Some("null" | "boolean" | "object" | "array" | "number" | "integer" | "string")
+        )
+    };
+    let alternative = |v: &Value| {
+        v.as_object().is_some_and(|o| {
+            o.iter().all(|(key, v)| match key.as_str() {
+                "$ref" => v.is_string(),
+                "type" => type_name(v),
+                other => annotation(other, v),
+            })
+        })
+    };
+    let property = |v: &Value| {
+        v.is_boolean()
+            || v.as_object().is_some_and(|o| {
+                o.iter().all(|(key, v)| match key.as_str() {
+                    "$ref" => v.is_string(),
+                    "type" => type_name(v),
+                    "anyOf" => v
+                        .as_array()
+                        .is_some_and(|a| !a.is_empty() && a.iter().all(alternative)),
+                    other => annotation(other, v),
+                })
+            })
+    };
     let variants = value
         .as_object()?
         .get("oneOf")?
@@ -195,10 +234,10 @@ fn schema_methods(value: &serde_json::Value) -> Option<std::collections::BTreeSe
         };
         let branch_ok = branch.iter().all(|(key, v)| match key.as_str() {
             "type" => v == "object",
-            "required" => strings(v),
+            "required" => strings(v) && unique(v),
             "properties" => v
                 .as_object()
-                .is_some_and(|p| p.values().all(|s| s.is_object() || s.is_boolean())),
+                .is_some_and(|p| p.iter().all(|(name, s)| name == "method" || property(s))),
             other => annotation(other, v),
         });
         let method = method.as_object()?;
