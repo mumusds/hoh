@@ -104,6 +104,20 @@ class BundleContracts(unittest.TestCase):
                 path.write_text(json.dumps(doc,ensure_ascii=False))
                 errors=validate_bundle.validate(root)['errors']
                 self.assertTrue(any(e.startswith(sid+':') and new in e for e in errors),(sid,new,errors))
+    def test_schema_corpus_verdicts_match_python_jsonschema(self):
+        # M1-T01: the product validator (crates/hoh-core/src/schema.rs) is checked against this corpus in Rust; here
+        # each recorded verdict is confirmed with Python jsonschema, so both implementations agree on every case.
+        from jsonschema import Draft202012Validator
+        corpus=load_json(ROOT/'tests/fixtures/schema/corpus.json')['cases']
+        docs={'protocol':load_json(ROOT/'contracts/protocol.schema.json'),'compat-manifest':load_json(ROOT/'contracts/compat-manifest.schema.json')}
+        self.assertGreaterEqual(len(corpus),90)
+        for i,case in enumerate(corpus):
+            doc=docs[case['schema']]
+            schema=doc if case['def']=='root' else {'$defs':doc['$defs'],'$ref':'#/$defs/'+case['def']}
+            v=Draft202012Validator(schema,format_checker=Draft202012Validator.FORMAT_CHECKER)
+            with self.subTest(case=i,note=case['note']):self.assertEqual(v.is_valid(case['instance']),case['valid'])
+        defs={c['def'] for c in corpus if c['schema']=='protocol'}
+        self.assertLessEqual(set(docs['protocol']['$defs'])-{'BlockedReason','RejectionReason','ErrorCode','ReasonCode'},defs)
     def test_original_skills_available(self):
         skills=load_json(ROOT/'resources/skills/registry.json')['skills'];self.assertEqual(len(skills),13)
         for s in skills:self.assertTrue((ROOT/s['entry']).is_file())

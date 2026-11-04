@@ -1,5 +1,10 @@
 //! HoH domain core: specification, orchestration, execution state, verification and
-//! persistence ports (docs/04-architecture.md). Implementation starts in M1-T01.
+//! persistence ports (docs/04-architecture.md).
+
+pub mod nullable;
+pub mod protocol;
+pub mod schema;
+pub mod time;
 
 /// Crate version, reported by the `hoh` binary for diagnostics.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
