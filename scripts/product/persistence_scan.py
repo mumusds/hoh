@@ -23,7 +23,9 @@ The boundary is enforced by the compiler, and this scan checks that nothing swit
    holds `#![forbid(unsafe_code)]`, only module declarations, each but `persistence` with
    `#[forbid(clippy::disallowed_methods)]`, and the VERSION constant. The workspace has no build scripts (one could
    give its crate another clippy configuration through `cargo:rustc-env`), no target root lies outside the member
-   directories (M2T01R-40), static.sh lints the dev and the release profile (`cfg(debug_assertions)`, M2T01R-39),
+   directories (M2T01R-40) and no product root outside its member's src/ (M2T01R-46), no path dependency is outside
+   the workspace (M2T01R-48), static.sh lints the dev and the release profile (`cfg(debug_assertions)`, M2T01R-39)
+   and no other profile or `panic` setting exists (M2T01R-44), persistence/ defines no macros (M2T01R-49),
    the members declare no Cargo features (so
    the one build clippy checks is the build, M2T01R-32/-35), and no product source has a `clippy` cfg predicate
    (`cfg(not(clippy))` would compile code clippy never sees, M2T01R-36) or one taken from a macro argument. `forbid` makes the compiler
@@ -38,8 +40,9 @@ The boundary is enforced by the compiler, and this scan checks that nothing swit
    force for hoh-core's library in the environment the check runs in; for the other targets the forbid levels and
    the configuration checks of 2 hold it.
 4. String literals outside persistence/ in non-test code (test code: files under a member's tests/, benches/ or
-   examples/ directory where no product target root lies), and the files such code embeds with `include_str!` or
-   `include_bytes!`, may not mention sqlite at all — no SQLite command line or interpreter module run as a
+   examples/ directory where no product target root lies), the files such code embeds with `include_str!` or
+   `include_bytes!` (which may not be imported under another name), and the repository files its literals name (a
+   script it runs), may not mention sqlite at all — no SQLite command line or interpreter module run as a
    subprocess (M2T01R-38) — and, in depth, may not hold a SQL write statement (INSERT/REPLACE INTO,
    UPDATE ... SET, DELETE FROM, UPSERT, ON CONFLICT ... DO UPDATE), decoded as Rust does (escapes, line
    continuations), with literals separated only by commas joined (concat!), are hits.
@@ -246,6 +249,11 @@ def dependency_checks(metadata: dict, hits: list) -> list[dict]:
             if sqlite_package(packages[dep['pkg']]['name']) and any(k['kind'] == 'build' for k in dep['dep_kinds']):
                 hits.append({'path': packages[core]['manifest_path'], 'kind': 'build-dependency',
                              'match': f"{CORE} build -> {packages[dep['pkg']]['name']}"})
+    for p in packages.values():
+        # A path dependency that is no workspace member would be compiled into the product without the workspace's
+        # clippy run or the source checks (M2T01R-48).
+        if p.get('source') is None and p['id'] not in members:
+            hits.append({'path': p['manifest_path'], 'kind': 'path-dependency', 'match': f"{p['name']} is not a workspace member"})
     for member in members:
         if packages[member].get('features'):
             # A feature can compile code clippy never sees (`cfg(not(feature = …))` against an all-features lint, or
@@ -301,6 +309,22 @@ FORBID = '#![forbid(clippy::disallowed_methods)]'
 FORBID_UNSAFE = '#![forbid(unsafe_code)]'
 CORE_LIB_ITEM = re.compile(r'(?P<attrs>(?:#\[[^\]]*\]\s*)*)(?:pub\s+)?mod\s+(?P<name>\w+)\s*;')
 CORE_VERSION = re.compile(r'pub\s+const\s+VERSION\s*:\s*&\s*str\s*=\s*env!\s*\(\s*\)\s*;')
+
+
+def product_roots_outside_src(metadata: dict) -> list[str]:
+    """Product target roots (lib, bin, proc-macro) that do not lie under their member's src/: module files resolve
+    below a root's directory, so a root elsewhere (e.g. `tool.rs` at the member's top) could `mod`-import files from
+    tests/ that the checks treat as test code (M2T01R-46)."""
+    members = set(metadata['workspace_members'])
+    out = []
+    for p in metadata['packages']:
+        if p['id'] not in members:
+            continue
+        src = (Path(p['manifest_path']).parent / 'src').resolve()
+        out += [t['src_path'] for t in p.get('targets') or []
+                if not set(t.get('kind') or []) <= {'test', 'bench', 'example', 'custom-build'}
+                and not Path(t['src_path']).resolve().is_relative_to(src)]
+    return sorted(out)
 
 
 def targets_outside_members(metadata: dict) -> list[str]:
@@ -416,6 +440,13 @@ def lint_configuration_checks(root: Path, metadata: dict, hits: list) -> None:
             data = tomllib.loads(manifest.read_text(encoding='utf-8'))
         except (OSError, tomllib.TOMLDecodeError):
             continue
+        for name, profile in (data.get('profile') or {}).items():
+            # static.sh lints dev and release; another profile, or `panic`, would compile code it never sees
+            # (`cfg(panic = "abort")`, M2T01R-44).
+            if name not in ('dev', 'release'):
+                hits.append({'path': rel_to(manifest, root), 'kind': 'profile', 'match': f'profile.{name}'})
+            elif isinstance(profile, dict) and 'panic' in profile:
+                hits.append({'path': rel_to(manifest, root), 'kind': 'profile', 'match': f'profile.{name}.panic'})
         for table in (data.get('lints') or {}, (data.get('workspace') or {}).get('lints') or {}):
             for tool, lints in table.items():
                 for lint, level in (lints.items() if isinstance(lints, dict) else []):
@@ -467,6 +498,9 @@ def scan(root: Path, metadata: dict) -> dict:
     for src in targets_outside_members(metadata):
         hits.append({'path': rel_to(Path(src), root), 'kind': 'target-outside-members',
                      'match': 'a target root outside the member directories'})
+    for src in product_roots_outside_src(metadata):
+        hits.append({'path': rel_to(Path(src), root), 'kind': 'product-root-outside-src',
+                     'match': "a product target root outside its member's src/"})
     for path in files:
         rel = rel_to(path, root)
         code, literals = split_rust(path.read_text(encoding='utf-8', errors='replace'))
@@ -475,7 +509,13 @@ def scan(root: Path, metadata: dict) -> dict:
         if any(re.search(r'[\[(,]path=', attr) for attr in compact) or re.search(r'\binclude\s*!\s*[(\[{]', code):
             hits.append({'path': rel, 'kind': 'path-or-include', 'match': '#[path] (also in cfg_attr) or include!'})
         if rel.startswith(PERSISTENCE):
+            if re.search(r'\bmacro_rules\s*!', code):
+                # A macro made in persistence could carry its allowance or a cfg into other code (M2T01R-49).
+                hits.append({'path': rel, 'kind': 'persistence-macro', 'match': 'macro_rules! in persistence'})
             continue
+        if re.search(r'\buse\b[^;]*\binclude(?:_str|_bytes)?\b', code):
+            # A renamed include macro (`use std::include_str as embed`) hides what is embedded (M2T01R-47).
+            hits.append({'path': rel, 'kind': 'included-file', 'match': 'an include macro imported under another name'})
         for attr in compact:
             if re.search(r'(?:allow|expect)\(', attr) and SUPPRESSING.search(attr):
                 hits.append({'path': rel, 'kind': 'lint-suppressed', 'match': attr[:200]})
@@ -491,6 +531,11 @@ def scan(root: Path, metadata: dict) -> dict:
                 hits.append({'path': rel, 'kind': 'included-file', 'match': value})
             elif re.search(r'sqlite', value, re.IGNORECASE) or SQL_WRITE.search(value):
                 hits.append({'path': rel, 'kind': 'included-file', 'match': f'{kind}: mentions SQLite or holds a SQL write'})
+        for named, text in named_repository_files(root, path, literals):
+            # A literal naming a repository file that something runs or reads (`python3 scripts/db_helper.py`) is
+            # checked like the literal itself (M2T01R-45).
+            if re.search(r'sqlite', text, re.IGNORECASE) or SQL_WRITE.search(text):
+                hits.append({'path': rel, 'kind': 'named-file', 'match': f'{named}: mentions SQLite or holds a SQL write'})
         sqlite_seen = []
         for value in literal_strings(code, literals):
             if m := SQL_WRITE.search(value):
@@ -547,6 +592,25 @@ def canary_verdict(log: str) -> dict:
             other.append(line[:200])
     problems = [f'not refused: {p}' for p in sorted(CANARY_REQUIRED - refused)] + other
     return {'refused': len(refused), 'required': len(CANARY_REQUIRED), 'problems': problems}
+
+
+def named_repository_files(root: Path, path: Path, literals: list[tuple[int, int, str]]) -> list[tuple[str, str]]:
+    """(literal, contents) for every string literal that names an existing file of the repository, relative to the
+    repository, the source's directory or its member's directory."""
+    out = []
+    bases = [root, path.parent] + [p for p in path.parents if (p / 'Cargo.toml').is_file()][:1]
+    for _, _, value in literals:
+        if not value or len(value) > 255 or '\n' in value or '\0' in value:
+            continue
+        for base in bases:
+            candidate = (base / value).resolve()
+            if candidate.is_relative_to(root) and candidate.is_file():
+                try:
+                    out.append((value, candidate.read_bytes().decode('utf-8', errors='replace')))
+                except OSError:
+                    pass
+                break
+    return out
 
 
 def included_contents(path: Path, code: str, literals: list[tuple[int, int, str]]) -> list[tuple[str, str]]:
