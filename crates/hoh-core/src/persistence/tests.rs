@@ -2,6 +2,8 @@
 
 use super::writer::{Fault, Writer};
 use super::*;
+use crate::lifecycle::Lifecycle;
+use crate::protocol::{AllVariants, RunState, TaskState};
 use serde_json::json;
 use std::time::Instant;
 
@@ -65,12 +67,11 @@ fn message(id: &str, event: usize) -> NewOutbox {
     }
 }
 
-fn cas(expected: i64, state: &str) -> StateCas {
+fn cas(expected: i64, state: RunState) -> StateCas {
     StateCas {
-        entity: Entity::Run,
         id: "r1".to_owned(),
         expected_revision: expected,
-        state: state.to_owned(),
+        change: Change::Run(state),
     }
 }
 
@@ -376,7 +377,7 @@ async fn state_event_and_outbox_commit_together() -> R {
     seed(&path)?;
     let done = store
         .commit(Commit {
-            cas: vec![cas(0, "DISCOVERING")],
+            cas: vec![cas(0, RunState::Discovering)],
             events: vec![event("e1"), event("e2")],
             outbox: vec![message("m1", 1)],
         })
@@ -398,7 +399,7 @@ async fn state_event_and_outbox_commit_together() -> R {
     // The next commit's events come after.
     let next = store
         .commit(Commit {
-            cas: vec![cas(1, "SPECIFYING")],
+            cas: vec![cas(1, RunState::Specifying)],
             events: vec![event("e3")],
             outbox: vec![],
         })
@@ -426,15 +427,16 @@ async fn any_violation_rolls_back_the_whole_commit() -> R {
     unknown_run.run_id = Some("no-such-run".to_owned());
     // Every commit starts with a valid state change and event, then breaks one rule.
     let valid = || Commit {
-        cas: vec![cas(0, "DISCOVERING")],
+        cas: vec![cas(0, RunState::Discovering)],
         events: vec![event("e-ok")],
         outbox: vec![],
     };
     let cases: Vec<(&str, Commit)> = vec![
         (
-            "CHECK state",
+            // CREATED -> BLOCKED is in the table, but a blocked run needs a blocked_reason (CHECK).
+            "CHECK blocked_reason",
             Commit {
-                cas: vec![cas(0, "BOGUS")],
+                cas: vec![cas(0, RunState::Blocked)],
                 ..valid()
             },
         ),
@@ -476,7 +478,7 @@ async fn any_violation_rolls_back_the_whole_commit() -> R {
     }
     match store
         .commit(Commit {
-            cas: vec![cas(0, "DISCOVERING"), cas(7, "READY")],
+            cas: vec![cas(0, RunState::Discovering), cas(7, RunState::Ready)],
             ..valid()
         })
         .await
@@ -502,6 +504,209 @@ async fn any_violation_rolls_back_the_whole_commit() -> R {
     Ok(())
 }
 
+/// (state, revision, resume_state) of run r1.
+fn run_row(path: &Path) -> Result<(String, i64, Option<String>), Box<dyn std::error::Error>> {
+    Ok(Connection::open(path)?.query_row(
+        "SELECT state, revision, resume_state FROM runs WHERE run_id = 'r1'",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?)
+}
+
+#[tokio::test]
+async fn an_illegal_transition_is_refused_and_writes_nothing() -> R {
+    let dir = tempfile::tempdir()?;
+    let path = db_in(&dir);
+    let store = Store::open(&path, test_options())?;
+    seed(&path)?;
+    let before = snapshot(&path)?;
+    for to in [RunState::Running, RunState::Completed, RunState::Paused] {
+        match store
+            .commit(Commit {
+                cas: vec![cas(0, to)],
+                events: vec![event("e-illegal")],
+                outbox: vec![message("m-illegal", 0)],
+            })
+            .await
+        {
+            Err(e @ PersistError::IllegalTransition { .. }) => {
+                assert_eq!(e.rejection(), Some(RejectionReason::IllegalTransition));
+                assert!(
+                    e.to_string()
+                        .contains(&format!("CREATED -> {}", to.as_str())),
+                    "{e}"
+                );
+            }
+            other => return Err(format!("CREATED -> {to:?}: {other:?}").into()),
+        }
+        assert_eq!(snapshot(&path)?, before, "CREATED -> {to:?} left a write");
+    }
+    // A legal change in the same commit as an illegal one is rolled back with it.
+    let mixed = Commit {
+        cas: vec![cas(0, RunState::Discovering), cas(1, RunState::Completed)],
+        events: vec![event("e-mixed")],
+        outbox: vec![],
+    };
+    assert!(matches!(
+        store.commit(mixed).await,
+        Err(PersistError::IllegalTransition { .. })
+    ));
+    assert_eq!(snapshot(&path)?, before);
+    // Tasks are checked against their own machine.
+    Connection::open(&path)?.execute_batch(
+        "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', 'p1', printf('%064d', 1), 1);
+         INSERT INTO tasks(task_id, run_id, spec_id, state, role, created_seq) VALUES ('t1', 'r1', 's1', 'READY', 'developer', 1);",
+    )?;
+    let task = |to| StateCas {
+        id: "t1".to_owned(),
+        expected_revision: 0,
+        change: Change::Task(to),
+    };
+    for to in [TaskState::Running, TaskState::Accepted] {
+        let Err(PersistError::IllegalTransition {
+            entity: Entity::Task,
+            ..
+        }) = store
+            .commit(Commit {
+                cas: vec![task(to)],
+                events: vec![event("e-task")],
+                outbox: vec![],
+            })
+            .await
+        else {
+            return Err(format!("READY -> {to:?} was not refused").into());
+        };
+    }
+    assert_eq!(snapshot(&path)?, before);
+    let done = store
+        .commit(Commit {
+            cas: vec![task(TaskState::Leased)],
+            events: vec![event("e-task")],
+            outbox: vec![],
+        })
+        .await?;
+    assert_eq!(done.revisions, vec![1]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn every_legal_run_edge_is_written_and_every_illegal_one_refused() -> R {
+    let dir = tempfile::tempdir()?;
+    let path = db_in(&dir);
+    let store = Store::open(&path, test_options())?;
+    seed(&path)?;
+    let conn = Connection::open(&path)?;
+    for &from in RunState::ALL {
+        for &to in RunState::ALL {
+            // Place r1 in `from`, with a resume_state that admits a resume to `to` when `to` is a working state.
+            let resume = (!crate::lifecycle::is_working(from) && crate::lifecycle::is_working(to))
+                .then_some(to.as_str());
+            let blocked = (from == RunState::Blocked).then_some("NEED_DECISION");
+            conn.execute(
+                "UPDATE runs SET state = ?1, revision = 0, resume_state = ?2, blocked_reason = ?3 WHERE run_id = 'r1'",
+                rusqlite::params![from.as_str(), resume, blocked],
+            )?;
+            let result = store
+                .commit(Commit {
+                    cas: vec![cas(0, to)],
+                    ..Commit::default()
+                })
+                .await;
+            let legal = crate::lifecycle::check(from, to).is_ok();
+            match (legal, to, result) {
+                (true, _, Ok(done)) => {
+                    assert_eq!(done.revisions, vec![1]);
+                    let reason: Option<String> = conn.query_row(
+                        "SELECT blocked_reason FROM runs WHERE run_id = 'r1'",
+                        [],
+                        |r| r.get(0),
+                    )?;
+                    assert_eq!(reason, None, "{from:?} -> {to:?} kept a blocked reason");
+                }
+                // A blocked run needs its reason, which this commit does not carry (ADR-011 §2).
+                (true, RunState::Blocked, Err(PersistError::IntegrityViolation(_))) => {}
+                (false, _, Err(PersistError::IllegalTransition { .. })) => {}
+                (_, _, other) => return Err(format!("{from:?} -> {to:?}: {other:?}").into()),
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_suspended_run_resumes_only_to_its_saved_state() -> R {
+    let dir = tempfile::tempdir()?;
+    let path = db_in(&dir);
+    let store = Store::open(&path, test_options())?;
+    seed(&path)?;
+    let step = |revision, to| {
+        store.commit(Commit {
+            cas: vec![cas(revision, to)],
+            ..Commit::default()
+        })
+    };
+    for (revision, to) in [
+        (0, RunState::Discovering),
+        (1, RunState::WaitingExternal),
+        (2, RunState::PauseRequested),
+        (3, RunState::Paused),
+    ] {
+        step(revision, to).await?;
+        assert_eq!(run_row(&path)?.0, to.as_str());
+    }
+    // Entered from DISCOVERING; kept through the other suspended states.
+    assert_eq!(run_row(&path)?.2.as_deref(), Some("DISCOVERING"));
+    for wrong in [RunState::Running, RunState::Created, RunState::Verifying] {
+        match step(4, wrong).await {
+            Err(PersistError::IllegalTransition { .. }) => {}
+            other => return Err(format!("PAUSED -> {wrong:?}: {other:?}").into()),
+        }
+    }
+    step(4, RunState::Discovering).await?;
+    assert_eq!(run_row(&path)?, ("DISCOVERING".to_owned(), 5, None));
+    step(5, RunState::Incomplete).await?;
+    assert_eq!(run_row(&path)?.2.as_deref(), Some("DISCOVERING"));
+    // A run that reaches a terminal state keeps no resume_state.
+    step(6, RunState::Failed).await?;
+    assert_eq!(run_row(&path)?, ("FAILED".to_owned(), 7, None));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_revision_only_change_keeps_the_state() -> R {
+    let dir = tempfile::tempdir()?;
+    let path = db_in(&dir);
+    let store = Store::open(&path, test_options())?;
+    seed(&path)?;
+    let touch = |expected| StateCas {
+        id: "r1".to_owned(),
+        expected_revision: expected,
+        change: Change::Touch(Entity::Run),
+    };
+    let done = store
+        .commit(Commit {
+            cas: vec![touch(0)],
+            ..Commit::default()
+        })
+        .await?;
+    assert_eq!(done.revisions, vec![1]);
+    assert_eq!(run_row(&path)?, ("CREATED".to_owned(), 1, None));
+    assert!(matches!(
+        store
+            .commit(Commit {
+                cas: vec![touch(0)],
+                ..Commit::default()
+            })
+            .await,
+        Err(PersistError::StaleRevision {
+            expected: 0,
+            actual: Some(1),
+            ..
+        })
+    ));
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_locked_database_is_busy_and_changes_nothing() -> R {
     let dir = tempfile::tempdir()?;
@@ -518,7 +723,7 @@ async fn a_locked_database_is_busy_and_changes_nothing() -> R {
     let started = Instant::now();
     let result = store
         .commit(Commit {
-            cas: vec![cas(0, "DISCOVERING")],
+            cas: vec![cas(0, RunState::Discovering)],
             events: vec![event("e1")],
             outbox: vec![],
         })
@@ -539,7 +744,7 @@ async fn a_locked_database_is_busy_and_changes_nothing() -> R {
     assert_eq!(snapshot(&path)?, before);
     store
         .commit(Commit {
-            cas: vec![cas(0, "DISCOVERING")],
+            cas: vec![cas(0, RunState::Discovering)],
             events: vec![event("e1")],
             outbox: vec![],
         })
@@ -636,7 +841,7 @@ async fn a_crash_inside_a_transaction_leaves_no_partial_commit() -> R {
     let store = Store::open(&path, test_options())?;
     store
         .commit(Commit {
-            cas: vec![cas(0, "DISCOVERING")],
+            cas: vec![cas(0, RunState::Discovering)],
             events: vec![event("after")],
             outbox: vec![message("m-after", 0)],
         })
@@ -655,7 +860,7 @@ async fn crash_child() -> R {
     let store = store_with(Path::new(&path), test_options(), Fault::AbortAfterEvents)?;
     let _ = store
         .commit(Commit {
-            cas: vec![cas(0, "DISCOVERING")],
+            cas: vec![cas(0, RunState::Discovering)],
             events: vec![event("lost-1"), event("lost-2")],
             outbox: vec![message("lost", 0)],
         })
@@ -772,5 +977,53 @@ fn a_database_on_a_network_file_system_is_refused_before_any_file_exists() -> R 
         other => return Err(format!("{other:?}").into()),
     }
     assert!(!root.join("project").exists(), "nothing may be created");
+    Ok(())
+}
+
+/// The values of `CHECK(state IN (...))` in the CREATE TABLE statement of `table`.
+fn state_check(sql: &str, table: &str) -> Result<Vec<String>, String> {
+    let start = sql
+        .find(&format!("CREATE TABLE {table}("))
+        .ok_or(format!("no table {table}"))?;
+    let statement = &sql[start..start + sql[start..].find(");").ok_or("unterminated")?];
+    let open = "CHECK(state IN (";
+    let list = &statement[statement
+        .find(open)
+        .ok_or(format!("{table}: no state CHECK"))?
+        + open.len()..];
+    let list = &list[..list.find(')').ok_or("unterminated list")?];
+    Ok(list
+        .split(',')
+        .map(|v| v.trim().trim_matches('\'').to_owned())
+        .collect())
+}
+
+fn names<S: Lifecycle>() -> Vec<String> {
+    S::ALL.iter().map(|s| s.as_str().to_owned()).collect()
+}
+
+#[test]
+fn test_036_01_state_sets_equal_the_sql_check_enumerations() -> R {
+    // The script the store migrates with, i.e. contracts/sql/001_initial.sql.
+    let [(1, sql)] = MIGRATIONS else {
+        return Err("expected exactly migration 1".into());
+    };
+    let sorted = |mut v: Vec<String>| {
+        v.sort();
+        v
+    };
+    for (table, table_names, count) in [
+        ("runs", names::<RunState>(), 15),
+        ("tasks", names::<TaskState>(), 9),
+        ("attempts", names::<crate::lifecycle::AttemptState>(), 7),
+    ] {
+        let sql_names = state_check(sql, table)?;
+        assert_eq!(sql_names.len(), count, "{table}: {sql_names:?}");
+        assert_eq!(
+            sorted(sql_names),
+            sorted(table_names),
+            "{table}: SQL CHECK and transition table differ"
+        );
+    }
     Ok(())
 }

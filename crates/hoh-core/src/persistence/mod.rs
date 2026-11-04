@@ -11,11 +11,13 @@
 // The one module allowed to call SQLite (clippy.toml `disallowed-methods`, AC-062-05).
 #![allow(clippy::disallowed_methods)]
 
+mod decide;
 pub mod location;
 pub mod selftest;
 mod writer;
 
-pub use writer::{Commit, Committed, Entity, NewEvent, NewOutbox, StateCas};
+pub use decide::Decided;
+pub use writer::{Change, Commit, Committed, Entity, NewEvent, NewOutbox, StateCas};
 
 use crate::protocol::{ErrorCode, RejectionReason};
 use rusqlite::{Connection, OpenFlags};
@@ -70,6 +72,21 @@ pub enum PersistError {
         expected: i64,
         actual: Option<i64>,
     },
+    /// The transition table does not allow the move (`ILLEGAL_TRANSITION`, ADR-011); nothing of the transaction was
+    /// written.
+    IllegalTransition {
+        entity: Entity,
+        id: String,
+        from: String,
+        to: String,
+    },
+    /// The run does not exist (`RUN_NOT_FOUND`); nothing was written.
+    RunNotFound(String),
+    /// A proposal that cannot be recorded (its payload violates `$defs.DecisionPayload`, or a number is out of
+    /// range); nothing was written.
+    InvalidProposal(String),
+    /// A decision kind that is not applied yet (docs/adr/ADR-011.md §3.6); nothing was written.
+    Unsupported(&'static str),
     /// The database stayed locked for busy_timeout, or the writer queue stayed full that long (`DB_BUSY`,
     /// retryable); nothing was written.
     Busy(String),
@@ -86,13 +103,18 @@ impl PersistError {
             PersistError::OnNetworkFs { .. } => Some(ErrorCode::DbOnNetworkFs),
             PersistError::WalUnsupported { .. } => Some(ErrorCode::DbWalUnsupported),
             PersistError::Busy(_) => Some(ErrorCode::DbBusy),
+            PersistError::RunNotFound(_) => Some(ErrorCode::RunNotFound),
             _ => None,
         }
     }
 
     /// The rejection reason, where one exists.
     pub fn rejection(&self) -> Option<RejectionReason> {
-        matches!(self, PersistError::StaleRevision { .. }).then_some(RejectionReason::StaleRevision)
+        match self {
+            PersistError::StaleRevision { .. } => Some(RejectionReason::StaleRevision),
+            PersistError::IllegalTransition { .. } => Some(RejectionReason::IllegalTransition),
+            _ => None,
+        }
     }
 
     /// Whether the same request may succeed later unchanged.
@@ -141,6 +163,18 @@ impl std::fmt::Display for PersistError {
                 f,
                 "STALE_REVISION: {entity:?} {id} expected revision {expected}, found {actual:?}"
             ),
+            PersistError::IllegalTransition {
+                entity,
+                id,
+                from,
+                to,
+            } => write!(
+                f,
+                "ILLEGAL_TRANSITION: {entity:?} {id} {from} -> {to} is not in the transition table"
+            ),
+            PersistError::RunNotFound(id) => write!(f, "RUN_NOT_FOUND: {id}"),
+            PersistError::InvalidProposal(detail) => write!(f, "invalid proposal: {detail}"),
+            PersistError::Unsupported(kind) => write!(f, "{kind} decisions are not applied yet"),
             PersistError::Busy(detail) => write!(f, "DB_BUSY: {detail}"),
             PersistError::WriterStopped => write!(f, "the database writer is not running"),
             PersistError::Storage(detail) => write!(f, "storage error: {detail}"),
@@ -433,6 +467,20 @@ impl Store {
     /// Commit `commit` in one IMMEDIATE transaction on the writer: all of it or nothing.
     pub async fn commit(&self, commit: Commit) -> Result<Committed, PersistError> {
         self.writer.commit(commit).await
+    }
+
+    /// Record a Commander proposal, judge it against the state it names, and apply or reject it, all in one
+    /// transaction (REQ-035, docs/adr/ADR-011.md §3). A kind that is not applied yet is refused before anything is
+    /// written.
+    pub async fn decide(
+        &self,
+        proposal: crate::decision::Proposal,
+        context: crate::decision::Context,
+    ) -> Result<Decided, PersistError> {
+        if !proposal.applicable() {
+            return Err(PersistError::Unsupported(proposal.kind()));
+        }
+        self.writer.decide(proposal, context).await
     }
 
     /// Record the project row if it is not there yet.
