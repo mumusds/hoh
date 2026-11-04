@@ -3,6 +3,10 @@
 //! (a different one is `StaleState`, a move outside the table `ILLEGAL_TRANSITION`). Each write is one IMMEDIATE
 //! transaction; creating and moving an attempt append their event in it. A session row is metadata of a native
 //! session: written again for a resumed session, never duplicated.
+//!
+//! The end of an attempt and a cancel of it are decided under one [`CancelLatch`] (M1T03R-10): [`end`] commits the
+//! terminal move while holding it, so a cancel requested before that commit makes the end CANCELLED and one requested
+//! after it is refused ([`CancelReceipt::AlreadyEnded`]).
 
 use super::decide::child_id;
 use super::writer::{self, Commit, Entity, NewEvent};
@@ -10,6 +14,90 @@ use super::{PersistError, sqlite_error};
 use crate::lifecycle::{self, AttemptState, Lifecycle};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::{Value, json};
+use std::sync::{Arc, Mutex, MutexGuard};
+use tokio::sync::watch;
+
+/// Whether a cancel was taken (docs/13: `cancel() -> CancelReceipt`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelReceipt {
+    /// The attempt had not ended; it ends CANCELLED.
+    Accepted,
+    /// The attempt had already ended; nothing changes.
+    AlreadyEnded,
+}
+
+#[derive(Debug, Default)]
+struct Latch {
+    requested: bool,
+    ended: bool,
+}
+
+/// One attempt's cancel request and its end, decided under one lock (module docs). Clones share the latch.
+#[derive(Clone)]
+pub struct CancelLatch {
+    state: Arc<Mutex<Latch>>,
+    wake: Arc<watch::Sender<bool>>,
+}
+
+impl std::fmt::Debug for CancelLatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CancelLatch")
+            .field("state", &*self.lock())
+            .finish()
+    }
+}
+
+impl Default for CancelLatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CancelLatch {
+    pub fn new() -> Self {
+        CancelLatch {
+            state: Arc::default(),
+            wake: Arc::new(watch::channel(false).0),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Latch> {
+        // The state is two flags; one a panicking holder left behind is still meaningful.
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Ask to cancel: accepted unless the attempt has already ended, and then it ends CANCELLED.
+    pub fn request(&self) -> CancelReceipt {
+        let mut state = self.lock();
+        if state.ended {
+            return CancelReceipt::AlreadyEnded;
+        }
+        state.requested = true;
+        drop(state);
+        self.wake.send_replace(true);
+        CancelReceipt::Accepted
+    }
+
+    pub fn is_requested(&self) -> bool {
+        self.lock().requested
+    }
+
+    /// Wait until a cancel is accepted.
+    pub async fn requested(&self) {
+        let mut woken = self.wake.subscribe();
+        let _ = woken.wait_for(|requested| *requested).await;
+    }
+
+    /// Run `commit` holding the latch: it learns whether a cancel was accepted, and once it succeeds no cancel is.
+    fn end<T, E>(&self, commit: impl FnOnce(bool) -> Result<T, E>) -> Result<T, E> {
+        let mut state = self.lock();
+        let ended = commit(state.requested)?;
+        state.ended = true;
+        Ok(ended)
+    }
+}
 
 /// A native session (`sessions` row).
 #[derive(Debug, Clone, PartialEq)]
@@ -133,6 +221,36 @@ pub(super) fn apply(conn: &mut Connection, job: &AttemptJob) -> Result<(), Persi
         }
     }
     tx.commit().map_err(sqlite_error)
+}
+
+/// The terminal move `m`, or CANCELLED with its facts if a cancel was accepted first; the state written.
+pub(super) fn end(
+    conn: &mut Connection,
+    m: &AttemptMove,
+    latch: &CancelLatch,
+) -> Result<AttemptState, PersistError> {
+    if !m.to.is_terminal() {
+        return Err(PersistError::IntegrityViolation(format!(
+            "attempt {}: {} is not an end",
+            m.attempt_id,
+            m.to.as_str()
+        )));
+    }
+    // BEGIN IMMEDIATE waits for the database before the latch is taken, so a cancel is never held up by that wait.
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error)?;
+    latch.end(|requested| {
+        let mut m = m.clone();
+        if requested {
+            m.to = AttemptState::Cancelled;
+            m.facts.failure_reason = None;
+            m.facts.cancel_requested = Some(true);
+        }
+        move_attempt(&tx, &m)?;
+        tx.commit().map_err(sqlite_error)?;
+        Ok(m.to)
+    })
 }
 
 fn upsert_session(tx: &Transaction<'_>, s: &Session) -> Result<(), PersistError> {

@@ -254,3 +254,89 @@ async fn moves_outside_the_table_or_from_another_state_write_nothing() -> R {
     assert_eq!(events()?, after_fail);
     Ok(())
 }
+
+#[tokio::test]
+async fn a_cancel_and_the_end_are_decided_under_one_latch() -> R {
+    use AttemptState::*;
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    seed(&path)?;
+    store.upsert_session(session(None)).await?;
+    let to_running = |id: &str| -> [AttemptMove; 2] {
+        let mut a = step(Prepared, Starting, AttemptFacts::default());
+        let mut b = step(Starting, Running, AttemptFacts::default());
+        a.attempt_id = id.to_owned();
+        b.attempt_id = id.to_owned();
+        [a, b]
+    };
+    let settle = |id: &str| {
+        let mut m = step(
+            Running,
+            Settled,
+            AttemptFacts {
+                failure_reason: Some("ignored when cancelled".to_owned()),
+                resolved_model: Some("m".to_owned()),
+                ..AttemptFacts::default()
+            },
+        );
+        m.attempt_id = id.to_owned();
+        m
+    };
+    // A cancel requested before the end makes the end CANCELLED, keeping its other facts.
+    store.create_attempt(attempt()).await?;
+    for m in to_running("A1") {
+        store.move_attempt(m).await?;
+    }
+    let latch = CancelLatch::new();
+    assert_eq!(latch.request(), CancelReceipt::Accepted);
+    assert!(latch.is_requested());
+    assert_eq!(store.end_attempt(settle("A1"), &latch).await?, Cancelled);
+    let row = store.reader()?.attempt("A1")?.ok_or("no A1")?;
+    assert_eq!(
+        (
+            row.state,
+            row.cancel_requested,
+            row.failure_reason.as_deref(),
+            row.resolved_model.as_deref()
+        ),
+        (Cancelled, true, None, Some("m"))
+    );
+    // After the end a cancel is refused.
+    assert_eq!(latch.request(), CancelReceipt::AlreadyEnded);
+    // Without a cancel the end is the one asked for; a failed end leaves the latch open.
+    let mut second = attempt();
+    second.attempt_id = "A2".to_owned();
+    store.create_attempt(second).await?;
+    let latch = CancelLatch::new();
+    let mut stale = settle("A2");
+    stale.from = Starting;
+    assert!(matches!(
+        store.end_attempt(stale, &latch).await,
+        Err(PersistError::StaleState { .. })
+    ));
+    for m in to_running("A2") {
+        store.move_attempt(m).await?;
+    }
+    assert_eq!(store.end_attempt(settle("A2"), &latch).await?, Settled);
+    assert_eq!(latch.request(), CancelReceipt::AlreadyEnded);
+    assert!(!latch.is_requested());
+    let row = store.reader()?.attempt("A2")?.ok_or("no A2")?;
+    assert_eq!((row.state, row.cancel_requested), (Settled, false));
+    // Only an end goes through the latch.
+    let mut third = attempt();
+    third.attempt_id = "A3".to_owned();
+    store.create_attempt(third).await?;
+    let mut not_an_end = step(Prepared, Starting, AttemptFacts::default());
+    not_an_end.attempt_id = "A3".to_owned();
+    assert!(matches!(
+        store.end_attempt(not_an_end, &CancelLatch::new()).await,
+        Err(PersistError::IntegrityViolation(_))
+    ));
+    // A waiter wakes on the request.
+    let latch = CancelLatch::new();
+    let waiter = latch.clone();
+    let woke = tokio::spawn(async move { waiter.requested().await });
+    latch.request();
+    tokio::time::timeout(std::time::Duration::from_secs(5), woke).await??;
+    Ok(())
+}
