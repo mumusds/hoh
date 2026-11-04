@@ -58,3 +58,25 @@ fn violations_name_the_instance_location() -> Result<(), Box<dyn std::error::Err
     );
     Ok(())
 }
+
+#[test]
+fn keyword_semantics_match_the_keyword_corpus() -> Result<(), Box<dyn std::error::Error>> {
+    // M1T01R-04/05/09/10: exact numbers, RFC 3339 date-times, ECMA-262 `$`, integral-float keyword values.
+    let text = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/schema/keywords.json"
+    ))?;
+    let doc: Value = serde_json::from_str(&text)?;
+    let cases = doc["cases"].as_array().ok_or("cases")?;
+    assert!(cases.len() >= 35);
+    let mut wrong = Vec::new();
+    for case in cases {
+        let schema = schema::Schema::new(case["schema"].clone())?;
+        let valid = schema.validate(&case["instance"]).is_ok();
+        if valid != case["valid"].as_bool().ok_or("valid")? {
+            wrong.push(format!("{}: got valid={valid}", case["note"]));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    Ok(())
+}

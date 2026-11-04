@@ -2,9 +2,14 @@
 //! the wire types (docs/04-architecture.md: Rust types and schema must not drift apart).
 //!
 //! Only the draft 2020-12 keywords these contracts use are implemented; a schema using any other keyword is refused
-//! when it is loaded, so a contract change cannot silently stop being enforced. `$ref` resolves local `#/$defs/...`
-//! pointers only. `format` supports `date-time` (RFC 3339). The shared corpus in `tests/fixtures/schema/corpus.json`
-//! pins the verdicts to those of Python jsonschema (the bundle test checks Python, `tests/schema_corpus.rs` this code).
+//! when it is loaded, so a contract change cannot silently stop being enforced. `$ref` names a local definition
+//! (`#/$defs/<name>`) only, and a reference cycle that does not descend into the instance is refused; instances nested
+//! deeper than [`MAX_DEPTH`] are a violation instead of a stack overflow. Numbers compare exactly (integers beyond 2^53
+//! included, 1 == 1.0) and count keywords such as `minLength` accept integral floats. `pattern` follows ECMA-262 as
+//! JSON Schema requires (`$` is the end of input; Python's `re` also matches before a final newline, the one known
+//! divergence). `format` supports `date-time` (RFC 3339 with ASCII digits and, like Python's checker, no second 60).
+//! The corpora in `tests/fixtures/schema/` (contract documents and keyword semantics) pin the verdicts to those of
+//! Python jsonschema (the bundle test checks Python, `tests/schema_corpus.rs` this code).
 
 use regex::Regex;
 use serde_json::{Map, Number, Value};
@@ -75,6 +80,9 @@ const TYPES: &[&str] = &[
     "null", "boolean", "object", "array", "number", "integer", "string",
 ];
 
+/// Instances nested deeper than this are reported instead of validated further.
+pub const MAX_DEPTH: usize = 256;
+
 /// A loaded schema document.
 #[derive(Debug)]
 pub struct Schema {
@@ -87,6 +95,7 @@ impl Schema {
     pub fn new(document: Value) -> Result<Self, SchemaError> {
         let mut patterns = HashMap::new();
         check_schema(&document, &document, "", &mut patterns)?;
+        check_reference_cycles(&document)?;
         Ok(Self { document, patterns })
     }
 
@@ -132,6 +141,14 @@ impl Schema {
         spath: &str,
         out: &mut Vec<Violation>,
     ) {
+        if ipath.matches('/').count() > MAX_DEPTH {
+            return fail(
+                out,
+                ipath,
+                spath,
+                &format!("nested deeper than {MAX_DEPTH} levels"),
+            );
+        }
         let obj = match schema {
             Value::Bool(true) => return,
             Value::Bool(false) => return fail(out, ipath, spath, "no value is allowed here"),
@@ -241,7 +258,7 @@ impl Schema {
         out: &mut Vec<Violation>,
     ) {
         let length = s.chars().count() as u64;
-        if let Some(min) = obj.get("minLength").and_then(Value::as_u64)
+        if let Some(min) = obj.get("minLength").and_then(count)
             && length < min
         {
             fail(
@@ -251,7 +268,7 @@ impl Schema {
                 &format!("shorter than {min} characters"),
             );
         }
-        if let Some(max) = obj.get("maxLength").and_then(Value::as_u64)
+        if let Some(max) = obj.get("maxLength").and_then(count)
             && length > max
         {
             fail(
@@ -300,18 +317,18 @@ impl Schema {
                 );
             }
         }
-        let count = items.len() as u64;
+        let len = items.len() as u64;
         if obj
             .get("minItems")
-            .and_then(Value::as_u64)
-            .is_some_and(|min| count < min)
+            .and_then(count)
+            .is_some_and(|min| len < min)
         {
             fail(out, ipath, &format!("{spath}/minItems"), "too few items");
         }
         if obj
             .get("maxItems")
-            .and_then(Value::as_u64)
-            .is_some_and(|max| count > max)
+            .and_then(count)
+            .is_some_and(|max| len > max)
         {
             fail(out, ipath, &format!("{spath}/maxItems"), "too many items");
         }
@@ -386,7 +403,7 @@ impl Schema {
         }
         if obj
             .get("minProperties")
-            .and_then(Value::as_u64)
+            .and_then(count)
             .is_some_and(|min| (members.len() as u64) < min)
         {
             fail(
@@ -406,9 +423,9 @@ fn number(
     spath: &str,
     out: &mut Vec<Violation>,
 ) {
-    let value = n.as_f64().unwrap_or(f64::NAN);
-    if let Some(min) = obj.get("minimum").and_then(Value::as_f64)
-        && (value.is_nan() || value < min)
+    use std::cmp::Ordering;
+    if let Some(Value::Number(min)) = obj.get("minimum")
+        && cmp_numbers(n, min).is_none_or(|o| o == Ordering::Less)
     {
         fail(
             out,
@@ -417,8 +434,8 @@ fn number(
             &format!("less than {min}"),
         );
     }
-    if let Some(max) = obj.get("maximum").and_then(Value::as_f64)
-        && (value.is_nan() || value > max)
+    if let Some(Value::Number(max)) = obj.get("maximum")
+        && cmp_numbers(n, max).is_none_or(|o| o == Ordering::Greater)
     {
         fail(
             out,
@@ -467,15 +484,68 @@ fn has_type(v: &Value, t: &str) -> bool {
     }
 }
 
-/// JSON equality as JSON Schema defines it: numbers compare by value (1 == 1.0), objects regardless of key order.
+fn as_int(n: &Number) -> Option<i128> {
+    n.as_i64()
+        .map(i128::from)
+        .or_else(|| n.as_u64().map(i128::from))
+}
+
+/// Exact order of an integer and a float (no rounding of the integer through f64).
+fn cmp_int_float(i: i128, f: f64) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    if f.is_nan() {
+        return None;
+    }
+    if f.is_infinite() {
+        return Some(if f > 0.0 {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        });
+    }
+    let floor = f.floor();
+    if floor.abs() >= 1.0e38 {
+        // Far beyond any integer serde_json keeps exactly.
+        return Some(if f > 0.0 {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        });
+    }
+    let whole = floor as i128;
+    Some(match i.cmp(&whole) {
+        Ordering::Equal if f > floor => Ordering::Less,
+        other => other,
+    })
+}
+
+/// Exact numeric order (integers beyond 2^53 included); `None` only for NaN.
+pub fn cmp_numbers(a: &Number, b: &Number) -> Option<std::cmp::Ordering> {
+    match (as_int(a), as_int(b)) {
+        (Some(x), Some(y)) => Some(x.cmp(&y)),
+        (Some(x), None) => cmp_int_float(x, b.as_f64()?),
+        (None, Some(y)) => cmp_int_float(y, a.as_f64()?).map(std::cmp::Ordering::reverse),
+        (None, None) => a.as_f64()?.partial_cmp(&b.as_f64()?),
+    }
+}
+
+/// A count keyword's value (`minLength` …): a non-negative integer, also written as an integral float.
+fn count(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(n) => n.as_u64().or_else(|| {
+            n.as_f64()
+                .filter(|f| f.fract() == 0.0 && *f >= 0.0 && *f < 18_446_744_073_709_551_616.0)
+                .map(|f| f as u64)
+        }),
+        _ => None,
+    }
+}
+
+/// JSON equality as JSON Schema defines it: numbers compare by exact value (1 == 1.0), objects regardless of key order.
 pub fn json_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Number(x), Value::Number(y)) => {
-            match (x.as_i64(), y.as_i64(), x.as_u64(), y.as_u64()) {
-                (Some(i), Some(j), _, _) => i == j,
-                (_, _, Some(i), Some(j)) => i == j,
-                _ => x.as_f64() == y.as_f64(),
-            }
+            cmp_numbers(x, y) == Some(std::cmp::Ordering::Equal)
         }
         (Value::Array(x), Value::Array(y)) => {
             x.len() == y.len() && x.iter().zip(y).all(|(a, b)| json_eq(a, b))
@@ -489,12 +559,13 @@ pub fn json_eq(a: &Value, b: &Value) -> bool {
     }
 }
 
-/// RFC 3339 `date-time` (section 5.6): full-date "T" full-time, with "Z" or a numeric offset; T and Z in any case.
+/// RFC 3339 `date-time` (section 5.6): full-date "T" full-time, with "Z" or a numeric offset; T and Z in any case;
+/// ASCII digits only; seconds 00-59 (Python's checker, which the corpora pin, refuses leap seconds).
 pub fn is_date_time(s: &str) -> bool {
     static RE: OnceLock<Option<Regex>> = OnceLock::new();
     let re = RE.get_or_init(|| {
         Regex::new(
-            r"(?i)^(\d{4})-(\d{2})-(\d{2})t(\d{2}):(\d{2}):(\d{2})(\.\d+)?(z|[+-](\d{2}):(\d{2}))$",
+            r"(?i)^([0-9]{4})-([0-9]{2})-([0-9]{2})t([0-9]{2}):([0-9]{2}):([0-9]{2})(\.[0-9]+)?(z|[+-]([0-9]{2}):([0-9]{2}))$",
         )
         .ok()
     });
@@ -517,7 +588,7 @@ pub fn is_date_time(s: &str) -> bool {
     };
     let offset_ok = caps.get(9).is_none()
         || (num(9).is_some_and(|h| h < 24) && num(10).is_some_and(|m| m < 60));
-    (1..=days).contains(&day) && hour < 24 && minute < 60 && second <= 60 && offset_ok
+    (1..=days).contains(&day) && hour < 24 && minute < 60 && second < 60 && offset_ok
 }
 
 fn check_schema(
@@ -566,10 +637,13 @@ fn check_schema(
                 check_schema(doc, value, &here, patterns)?
             }
             "$ref" => {
-                let target = value
-                    .as_str()
-                    .filter(|t| t.starts_with("#/$defs/"))
-                    .ok_or_else(|| bad("only local #/$defs/ references are supported"))?;
+                // Only whole definitions: a pointer deeper into a definition could reach an unchecked subtree.
+                let target = value.as_str().unwrap_or_default();
+                if definition_name(target).is_none() {
+                    return Err(bad(&format!(
+                        "only references to a definition (#/$defs/<name>) are supported, not {value}"
+                    )));
+                }
                 if doc.pointer(target.trim_start_matches('#')).is_none() {
                     return Err(bad(&format!("unresolvable reference {target}")));
                 }
@@ -603,7 +677,7 @@ fn check_schema(
                 patterns.insert(source.to_owned(), re);
             }
             "minLength" | "maxLength" | "minItems" | "maxItems" | "minProperties"
-                if value.as_u64().is_none() =>
+                if count(value).is_none() =>
             {
                 return Err(bad(&format!("{key} must be a non-negative integer")));
             }
@@ -617,6 +691,66 @@ fn check_schema(
                 return Err(bad(&format!("unsupported format {value}")));
             }
             _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// `name` for a reference to `#/$defs/<name>` (a single pointer segment), else `None`.
+fn definition_name(target: &str) -> Option<&str> {
+    target
+        .strip_prefix("#/$defs/")
+        .filter(|name| !name.is_empty() && !name.contains('/'))
+}
+
+/// The definitions a schema reaches without descending into the instance (`$ref` directly or inside
+/// allOf/anyOf/oneOf/if/then/else); `properties`, `items` and `additionalProperties` descend and end the walk.
+fn same_instance_refs<'a>(schema: &'a Value, found: &mut Vec<&'a str>) {
+    let Value::Object(obj) = schema else { return };
+    if let Some(name) = obj
+        .get("$ref")
+        .and_then(Value::as_str)
+        .and_then(definition_name)
+    {
+        found.push(name);
+    }
+    for key in ["allOf", "anyOf", "oneOf"] {
+        for sub in obj.get(key).and_then(Value::as_array).into_iter().flatten() {
+            same_instance_refs(sub, found);
+        }
+    }
+    for key in ["if", "then", "else"] {
+        if let Some(sub) = obj.get(key) {
+            same_instance_refs(sub, found);
+        }
+    }
+}
+
+/// Refuse reference cycles that never descend into the instance: they would recurse forever on any value (M1T01R-07).
+fn check_reference_cycles(doc: &Value) -> Result<(), SchemaError> {
+    let Some(defs) = doc.get("$defs").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    let edges = |name: &str| {
+        let mut found = Vec::new();
+        if let Some(def) = defs.get(name) {
+            same_instance_refs(def, &mut found);
+        }
+        found
+    };
+    for start in defs.keys() {
+        let mut stack: Vec<&str> = edges(start);
+        let mut seen: Vec<&str> = Vec::new();
+        while let Some(next) = stack.pop() {
+            if next == start {
+                return Err(SchemaError(format!(
+                    "#/$defs/{start} refers back to itself without descending into the instance"
+                )));
+            }
+            if !seen.contains(&next) {
+                seen.push(next);
+                stack.extend(edges(next));
+            }
         }
     }
     Ok(())
@@ -678,6 +812,47 @@ mod tests {
     }
 
     #[test]
+    fn references_must_name_a_definition() {
+        // M1T01R-06: a pointer into an annotation would reach an unchecked subtree.
+        let into_annotation =
+            json!({"$defs": {"x": {"default": {"not": {}}}}, "$ref": "#/$defs/x/default"});
+        assert!(Schema::new(into_annotation).is_err());
+        let nested = json!({"$defs": {"x": {"properties": {"a": {"type": "string"}}}}, "$ref": "#/$defs/x/properties/a"});
+        assert!(Schema::new(nested).is_err());
+    }
+
+    #[test]
+    fn reference_cycles_without_progress_are_refused() {
+        // M1T01R-07: these would recurse forever on any instance.
+        for schema in [
+            json!({"$defs": {"a": {"$ref": "#/$defs/a"}}, "$ref": "#/$defs/a"}),
+            json!({"$defs": {"a": {"$ref": "#/$defs/b"}, "b": {"allOf": [{"$ref": "#/$defs/a"}]}}, "$ref": "#/$defs/a"}),
+            json!({"$defs": {"a": {"if": {"$ref": "#/$defs/a"}}}, "$ref": "#/$defs/a"}),
+        ] {
+            assert!(Schema::new(schema.clone()).is_err(), "{schema}");
+        }
+    }
+
+    #[test]
+    fn deep_instances_fail_instead_of_overflowing_the_stack() -> Result<(), SchemaError> {
+        let schema = Schema::new(
+            json!({"$defs": {"n": {"type": "array", "items": {"$ref": "#/$defs/n"}}}, "$ref": "#/$defs/n"}),
+        )?;
+        let mut deep = json!([]);
+        for _ in 0..100_000 {
+            deep = Value::Array(vec![deep]);
+        }
+        let errors = schema.validate(&deep).err().unwrap_or_default();
+        assert!(
+            errors.iter().any(|v| v.message.contains("nested")),
+            "{:?}",
+            errors.first()
+        );
+        std::mem::forget(deep); // dropping a 100k-deep value recursively would itself overflow the test stack
+        Ok(())
+    }
+
+    #[test]
     fn json_equality_follows_json_schema() {
         assert!(json_eq(&json!(1), &json!(1.0)));
         assert!(json_eq(
@@ -692,7 +867,7 @@ mod tests {
     fn date_time_follows_rfc_3339() {
         for ok in [
             "2026-11-04T01:02:03Z",
-            "2024-02-29t23:59:60.5z",
+            "2024-02-29t23:59:59.5z",
             "2026-11-04T01:02:03-08:00",
         ] {
             assert!(is_date_time(ok), "{ok}");
@@ -705,6 +880,7 @@ mod tests {
             "2026-11-04T24:00:00Z",
             "2026-11-04T01:02:03",
             "2026-11-04T01:02:03+24:00",
+            "2016-12-31T23:59:60Z",
         ] {
             assert!(!is_date_time(bad), "{bad}");
         }

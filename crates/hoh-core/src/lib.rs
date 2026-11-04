@@ -1,6 +1,7 @@
 //! HoH domain core: specification, orchestration, execution state, verification and
 //! persistence ports (docs/04-architecture.md).
 
+pub mod integer;
 pub mod nullable;
 pub mod protocol;
 pub mod schema;

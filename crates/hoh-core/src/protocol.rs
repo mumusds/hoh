@@ -193,10 +193,12 @@ pub struct Message {
     pub attempt_id: String,
     pub sender_role: String,
     pub recipient_role: String,
+    #[serde(deserialize_with = "crate::integer::deserialize")]
     pub role_epoch: u64,
     pub correlation_id: String,
     pub causation_id: Option<String>,
     pub idempotency_key: String,
+    #[serde(deserialize_with = "crate::integer::deserialize")]
     pub expected_revision: u64,
     pub spec_sha256: String,
     pub candidate_id: Option<String>,
@@ -224,14 +226,17 @@ pub struct ContextHandoff {
     pub task_id: Option<String>,
     pub goal: String,
     pub role: String,
+    #[serde(deserialize_with = "crate::integer::deserialize")]
     pub role_epoch: u64,
     pub spec_sha256: String,
     pub candidate: Option<Candidate>,
     pub acceptance_ids: Vec<String>,
     pub references: Vec<ArtifactRef>,
     pub output_contract: String,
+    #[serde(deserialize_with = "crate::integer::deserialize")]
     pub budget_tokens: u64,
     pub handoff_kind: HandoffKind,
+    #[serde(deserialize_with = "crate::integer::deserialize")]
     pub spec_revision: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<HandoffState>,
@@ -242,6 +247,7 @@ pub struct ContextHandoff {
 pub struct Event {
     pub schema_version: String,
     pub project_id: String,
+    #[serde(deserialize_with = "crate::integer::deserialize")]
     pub seq: u64,
     pub event_id: String,
     pub run_id: Option<String>,
@@ -259,6 +265,7 @@ pub struct TaskResult {
     pub task_id: String,
     pub attempt_id: String,
     pub role: String,
+    #[serde(deserialize_with = "crate::integer::deserialize")]
     pub role_epoch: u64,
     pub status: TaskStatus,
     pub summary: String,
@@ -274,6 +281,7 @@ pub struct Command {
     pub schema_version: String,
     pub command_id: String,
     pub idempotency_key: String,
+    #[serde(deserialize_with = "crate::integer::deserialize")]
     pub expected_revision: u64,
     pub run_id: Option<String>,
     #[serde(flatten)]
@@ -440,15 +448,35 @@ pub struct PlannedTask {
     pub writer: bool,
     pub depends_on: Vec<String>,
     pub requirement_ids: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::integer::option"
+    )]
     pub user_value: Option<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::integer::option"
+    )]
     pub unblock_value: Option<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::integer::option"
+    )]
     pub risk_reduction: Option<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::integer::option"
+    )]
     pub information_gain: Option<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::integer::option"
+    )]
     pub cost_estimate: Option<u8>,
 }
 

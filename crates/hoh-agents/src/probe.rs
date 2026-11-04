@@ -4,7 +4,7 @@
 //! with a timeout, in their own process group, which is killed on timeout (the full process substrate is M1-T02).
 
 use crate::compat::{Agent, AgentEntry, Suite, SuiteStatus, Transport};
-use rustix::process::{Pid, Signal, kill_process_group};
+use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -181,12 +181,28 @@ fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<(String, Vec<u8>), Pr
             &["app-server", "generate-json-schema", "--out", &out],
             env,
         )?;
-        let hash = tree_sha256(&dir)?;
-        let mut text = Vec::new();
-        for file in files_under(&dir)? {
-            text.extend(std::fs::read(&file)?);
+        // A command that exits 0 without writing a usable schema has not provided one (M1T01R-08).
+        let unusable = |detail: String| ProbeError::Failed {
+            argv: argv(launcher, &["app-server", "generate-json-schema"]),
+            detail,
+        };
+        let files = files_under(&dir)?;
+        if !dir.join("ClientRequest.json").is_file() {
+            return Err(unusable(
+                "no ClientRequest.json in the schema output".to_owned(),
+            ));
         }
-        Ok((hash, text))
+        let mut text = Vec::new();
+        for file in &files {
+            let bytes = std::fs::read(file)?;
+            if file.extension().is_some_and(|e| e == "json")
+                && serde_json::from_slice::<serde_json::Value>(&bytes).is_err()
+            {
+                return Err(unusable(format!("{} is not JSON", file.display())));
+            }
+            text.extend(bytes);
+        }
+        Ok((tree_sha256(&dir)?, text))
     })();
     let _ = std::fs::remove_dir_all(&dir);
     result
@@ -279,10 +295,7 @@ pub fn find_on_path(name: &str, path: &OsStr) -> Option<PathBuf> {
 pub fn resolve_implementation(agent: Agent, launcher: &Path) -> Result<PathBuf, ProbeError> {
     let real = std::fs::canonicalize(launcher)?;
     let found = match agent {
-        Agent::Codex => real
-            .parent()
-            .and_then(Path::parent)
-            .and_then(|root| codex_native(&root.join("node_modules/@openai"))),
+        Agent::Codex => codex_native(&real),
         Agent::Pi => real.parent().and_then(Path::parent).and_then(pi_release),
         Agent::Claude => None,
     };
@@ -292,29 +305,42 @@ pub fn resolve_implementation(agent: Agent, launcher: &Path) -> Result<PathBuf, 
     })
 }
 
-fn sorted_dirs(dir: &Path) -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = std::fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_dir())
-        .collect();
-    dirs.sort();
-    dirs
+/// The target triple and platform package `codex.js` selects for this host (its `PLATFORM_PACKAGE_BY_TARGET`).
+fn codex_target() -> Option<(&'static str, &'static str)> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux" | "android", "x86_64") => {
+            Some(("x86_64-unknown-linux-musl", "@openai/codex-linux-x64"))
+        }
+        ("linux" | "android", "aarch64") => {
+            Some(("aarch64-unknown-linux-musl", "@openai/codex-linux-arm64"))
+        }
+        ("macos", "x86_64") => Some(("x86_64-apple-darwin", "@openai/codex-darwin-x64")),
+        ("macos", "aarch64") => Some(("aarch64-apple-darwin", "@openai/codex-darwin-arm64")),
+        _ => None,
+    }
 }
 
-fn codex_native(scope: &Path) -> Option<PathBuf> {
-    sorted_dirs(scope)
-        .into_iter()
-        .filter(|p| {
-            p.file_name()
-                .and_then(OsStr::to_str)
-                .is_some_and(|n| n.starts_with("codex-"))
-        })
-        .flat_map(|pkg| sorted_dirs(&pkg.join("vendor")))
-        .map(|triple| triple.join("bin/codex"))
-        .find(|bin| bin.is_file())
+/// Node's `require.resolve(<package>/package.json)` from `start`: `node_modules/<package>` in `start` and each
+/// ancestor (directories that are themselves named node_modules are skipped), returning the package directory.
+fn node_resolve(start: &Path, package: &str) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .filter(|dir| dir.file_name() != Some(OsStr::new("node_modules")))
+        .map(|dir| dir.join("node_modules").join(package))
+        .find(|candidate| candidate.join("package.json").is_file())
+}
+
+/// The native binary `codex.js` (at its real path `launcher`) executes: `vendor/<triple>/bin/codex` in the platform
+/// package it resolves, else in the codex package's own `vendor` directory (M1T01R-02).
+fn codex_native(launcher: &Path) -> Option<PathBuf> {
+    let (triple, package) = codex_target()?;
+    let start = launcher.parent()?;
+    let vendor = match node_resolve(start, package) {
+        Some(dir) => std::fs::canonicalize(dir).ok()?.join("vendor"),
+        None => start.parent()?.join("vendor"),
+    };
+    let native = vendor.join(triple).join("bin/codex");
+    native.is_file().then_some(native)
 }
 
 fn pi_release(agent_dir: &Path) -> Option<PathBuf> {
@@ -451,17 +477,26 @@ fn run(program: &Path, args: &[&str], env: &ProbeEnv) -> Result<Captured, ProbeE
         });
     }
     let deadline = Instant::now() + env.timeout;
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
+    let pid = Pid::from_child(&child);
+    let exited = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG;
+    loop {
+        // Observe the exit without reaping: while the leader is a zombie its process group id cannot be reused.
+        if waitid(WaitId::Pid(pid), exited)
+            .map_err(io::Error::from)?
+            .is_some()
+        {
+            break;
         }
         if Instant::now() >= deadline {
-            let _ = kill_process_group(Pid::from_child(&child), Signal::KILL);
+            let _ = kill_process_group(pid, Signal::KILL);
             let _ = child.wait();
             return Err(failed(format!("timed out after {:?}", env.timeout)));
         }
         std::thread::sleep(Duration::from_millis(10));
-    };
+    }
+    // Whatever the command left running in its group goes with it (M1T01R-03), then the leader is reaped.
+    let _ = kill_process_group(pid, Signal::KILL);
+    let status = child.wait()?;
     // A descendant that keeps the pipe open must not stall the probe either.
     let remaining = deadline
         .saturating_duration_since(Instant::now())
@@ -496,15 +531,60 @@ mod tests {
         Ok(())
     }
 
+    fn codex_layout(
+        root: &Path,
+        platform_dir: Option<&Path>,
+    ) -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> {
+        // <root>/lib/node_modules/@openai/codex/bin/codex.js, linked from <root>/bin/codex like an npm global install.
+        let (triple, _) = codex_target().ok_or("unsupported test platform")?;
+        let package = root.join("lib/node_modules/@openai/codex");
+        std::fs::create_dir_all(package.join("bin"))?;
+        std::fs::write(package.join("bin/codex.js"), "#!/usr/bin/env node\n")?;
+        std::fs::create_dir_all(root.join("bin"))?;
+        let launcher = root.join("bin/codex");
+        std::os::unix::fs::symlink(package.join("bin/codex.js"), &launcher)?;
+        let vendor_root = match platform_dir {
+            Some(dir) => {
+                std::fs::create_dir_all(dir)?;
+                std::fs::write(dir.join("package.json"), "{}")?;
+                dir.join("vendor")
+            }
+            None => package.join("vendor"),
+        };
+        let native = vendor_root.join(triple).join("bin/codex");
+        std::fs::create_dir_all(native.parent().ok_or("parent")?)?;
+        std::fs::write(&native, b"\x7fELF native")?;
+        Ok((launcher, native))
+    }
+
     #[test]
-    fn codex_native_is_the_vendored_binary() -> Result<(), Box<dyn std::error::Error>> {
-        let root = std::env::temp_dir().join(format!("hoh-codex-layout-{}", std::process::id()));
-        let bin = root.join("codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin");
-        std::fs::create_dir_all(&bin)?;
-        std::fs::write(bin.join("codex"), b"\x7fELF")?;
-        assert_eq!(codex_native(&root), Some(bin.join("codex")));
-        assert_eq!(codex_native(&root.join("missing")), None);
-        std::fs::remove_dir_all(&root)?;
+    fn codex_implementation_follows_the_launcher_resolution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // M1T01R-02: codex.js resolves @openai/codex-<platform> through Node's node_modules lookup (nested or
+        // hoisted next to the codex package) and falls back to the package's own vendor directory.
+        let (_, platform) = codex_target().ok_or("unsupported test platform")?;
+        for layout in ["nested", "sibling", "vendor"] {
+            let root =
+                std::env::temp_dir().join(format!("hoh-codex-{layout}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            let modules = root.join("lib/node_modules");
+            let platform_dir = match layout {
+                "nested" => Some(modules.join("@openai/codex/node_modules").join(platform)),
+                "sibling" => Some(modules.join(platform)),
+                _ => None,
+            };
+            let (launcher, native) = codex_layout(&root, platform_dir.as_deref())?;
+            let resolved = resolve_implementation(Agent::Codex, &launcher)?;
+            assert_eq!(resolved, std::fs::canonicalize(&native)?, "{layout}");
+            let before = file_sha256(&resolved)?;
+            std::fs::write(&native, b"\x7fELF replaced")?;
+            assert_ne!(
+                file_sha256(&resolve_implementation(Agent::Codex, &launcher)?)?,
+                before,
+                "{layout}"
+            );
+            std::fs::remove_dir_all(&root)?;
+        }
         Ok(())
     }
 
