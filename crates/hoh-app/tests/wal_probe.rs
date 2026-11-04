@@ -1,7 +1,8 @@
 //! The `hoh` binary serves as the WAL self-test's second process (REQ-062, M2T01R-02).
 
-// No SQLite outside hoh-core::persistence (AC-062-05); see clippy.toml.
+// No SQLite outside hoh-core::persistence (AC-062-05; see clippy.toml), and no unsafe code (no FFI way around it).
 #![forbid(clippy::disallowed_methods)]
+#![forbid(unsafe_code)]
 
 use hoh_core::persistence::selftest::{PROBE_ARG, ProbeCommand, wal_self_test};
 use std::time::Duration;

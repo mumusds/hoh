@@ -15,7 +15,8 @@ for var in $(compgen -e); do
 done
 export CLIPPY_CONF_DIR="$PWD"
 logs="$(mktemp -d)"; trap 'rm -rf "$logs"' EXIT
-cargo clippy --workspace --all-targets --locked -- -D warnings 2>&1 | tee "$logs/clippy.log"
+# --all-features: targets with required-features are compiled too (M2T01R-32).
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings 2>&1 | tee "$logs/clippy.log"
 # An entry that does not resolve is only a warning of clippy's configuration, so it fails here.
 if grep -q 'does not refer to a reachable function' "$logs/clippy.log"; then
   echo 'static: a clippy.toml disallowed-methods entry does not resolve' >&2
