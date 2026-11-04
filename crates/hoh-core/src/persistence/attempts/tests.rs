@@ -174,6 +174,16 @@ async fn moves_outside_the_table_or_from_another_state_write_nothing() -> R {
         }
         other => return Err(format!("stale move: {other:?}").into()),
     }
+    // A move from another state is stale even when its pair is outside the table too: the caller's view is old.
+    match store
+        .move_attempt(step(Settled, Starting, AttemptFacts::default()))
+        .await
+    {
+        Err(PersistError::StaleState { actual, .. }) => {
+            assert_eq!(actual.as_deref(), Some("PREPARED"))
+        }
+        other => return Err(format!("stale and illegal move: {other:?}").into()),
+    }
     let mut unknown = step(Prepared, Starting, AttemptFacts::default());
     unknown.attempt_id = "nope".to_owned();
     assert!(matches!(

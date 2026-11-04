@@ -377,6 +377,44 @@ async fn test_025_02_failed_turns_and_missing_flags() -> R {
     Ok(())
 }
 
+/// Each non-JSON line is its own diagnostic event; the result frame still decides the end.
+#[tokio::test]
+async fn every_line_that_is_not_json_is_its_own_diagnostic_event() -> R {
+    let world = World::new()?;
+    let success = fixture("success")?;
+    let lines: Vec<&[u8]> = success.split_inclusive(|b| *b == b'\n').collect();
+    let mut stdout = lines[..1].concat();
+    stdout.extend_from_slice(b"first line that is not JSON\n");
+    stdout.extend(lines[1..2].concat());
+    stdout.extend_from_slice(b"second line that is not JSON\n");
+    stdout.extend(lines[2..].concat());
+    let fake = world.fake("two-junk", &stdout, b"", 0)?;
+    let attempt = world.attempt("A1").await?;
+    let outcome = world
+        .run(&attempt, &world.turn(&fake, "logs/two-junk")?)
+        .await?;
+    assert_eq!(
+        (outcome.state, outcome.diagnostics),
+        (AttemptState::Settled, 2)
+    );
+    let heads: Vec<String> = world
+        .store
+        .reader()?
+        .events("R")?
+        .into_iter()
+        .filter(|(k, _)| k == "adapter.diagnostic")
+        .map(|(_, p)| p["head"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert_eq!(
+        heads,
+        [
+            "first line that is not JSON",
+            "second line that is not JSON"
+        ]
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_025_03_cancel_escalates_to_the_group_and_ends_cancelled() -> R {
     let world = World::new()?;
