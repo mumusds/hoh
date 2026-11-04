@@ -21,12 +21,15 @@ use rustix::process::{
     Pid, PidfdFlags, Signal as RawSignal, WaitId, WaitIdOptions, kill_process_group, pidfd_open,
     pidfd_send_signal, test_kill_process_group, waitid,
 };
-use std::io;
+use std::io::{self, Write};
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
+use std::pin::Pin;
 use std::process::{Command, Stdio};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 use tokio::net::unix::pipe;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{mpsc, watch};
@@ -103,6 +106,10 @@ pub struct Config {
     pub reap_grace: Duration,
     /// How long stdout/stderr may stay open once the group is gone (held by escaped descendants).
     pub drain_grace: Duration,
+    /// Write every stdout byte, as read and before framing, to this file (created or truncated at spawn).
+    pub stdout_copy: Option<PathBuf>,
+    /// Write every stderr byte to this file; the bounded tail is kept as well.
+    pub stderr_copy: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -116,6 +123,8 @@ impl Default for Config {
             escalation: Escalation::default(),
             reap_grace: Duration::from_secs(2),
             drain_grace: Duration::from_secs(2),
+            stdout_copy: None,
+            stderr_copy: None,
         }
     }
 }
@@ -211,6 +220,10 @@ impl Process {
     /// Start `command` with piped stdio in a new process group. Must be called within a Tokio runtime with IO and
     /// time enabled.
     pub fn spawn(mut command: Command, config: Config) -> io::Result<Process> {
+        // The copies exist before the child does, so a file that cannot be created starts nothing.
+        let create = |path: &Option<PathBuf>| path.as_ref().map(std::fs::File::create).transpose();
+        let stdout_copy = create(&config.stdout_copy)?;
+        let stderr_copy = create(&config.stderr_copy)?;
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -246,11 +259,23 @@ impl Process {
         let (cancel_tx, cancel_rx) = watch::channel(None);
         let (abandon_tx, abandon) = watch::channel(false);
         let out = tokio::spawn(read_stdout(
-            FrameReader::new(stdout, config.frame_limit, config.read_chunk),
+            FrameReader::new(
+                Tee {
+                    inner: stdout,
+                    copy: stdout_copy,
+                },
+                config.frame_limit,
+                config.read_chunk,
+            ),
             events_tx.clone(),
             abandon.clone(),
         ));
-        let err = tokio::spawn(drain_stderr(stderr, config.stderr_tail, abandon));
+        let err = tokio::spawn(drain_stderr(
+            stderr,
+            config.stderr_tail,
+            stderr_copy,
+            abandon,
+        ));
         tokio::spawn(supervise(Supervisor {
             leader,
             sigchld,
@@ -549,8 +574,32 @@ async fn abandoned(abandon: &mut watch::Receiver<bool>) {
     let _ = abandon.wait_for(|a| *a).await;
 }
 
+/// A reader that writes what it reads to a file. The writes are plain blocking writes of what one read returned (at
+/// most one chunk); a failed write fails the read, so an incomplete copy is reported as a stream error.
+struct Tee<R> {
+    inner: R,
+    copy: Option<std::fs::File>,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for Tee<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let polled = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let (Poll::Ready(Ok(())), Some(copy)) = (&polled, self.copy.as_mut())
+            && let Err(e) = copy.write_all(&buf.filled()[before..])
+        {
+            return Poll::Ready(Err(e));
+        }
+        polled
+    }
+}
+
 async fn read_stdout(
-    mut reader: FrameReader<pipe::Receiver>,
+    mut reader: FrameReader<Tee<pipe::Receiver>>,
     events: mpsc::Sender<Event>,
     mut abandon: watch::Receiver<bool>,
 ) -> StreamReport {
@@ -612,6 +661,7 @@ async fn read_stdout(
 async fn drain_stderr(
     mut stderr: pipe::Receiver,
     keep: usize,
+    mut copy: Option<std::fs::File>,
     mut abandon: watch::Receiver<bool>,
 ) -> (StreamReport, Vec<u8>) {
     let mut report = StreamReport::default();
@@ -630,6 +680,12 @@ async fn drain_stderr(
             }
             Ok(n) => {
                 report.bytes += n as u64;
+                if let Some(file) = copy.as_mut()
+                    && let Err(e) = file.write_all(&chunk[..n])
+                {
+                    report.error = Some(format!("stderr copy: {e}"));
+                    copy = None;
+                }
                 tail.extend_from_slice(&chunk[..n]);
                 if tail.len() > keep {
                     tail.drain(..tail.len() - keep);

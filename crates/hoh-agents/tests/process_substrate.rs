@@ -371,3 +371,42 @@ async fn the_first_cancel_wins_and_repeats_are_dropped() -> R {
     assert_eq!(report.status, Some(Termination::Signal(15)));
     Ok(())
 }
+
+#[tokio::test]
+async fn both_streams_can_be_copied_byte_for_byte() -> R {
+    // REQ-025: an adapter keeps stdout and stderr as separate raw files (with their sha256); the frames and the
+    // bounded stderr tail work as before.
+    let dir = tempfile::tempdir()?;
+    let (out, err) = (
+        dir.path().join("stdout.jsonl"),
+        dir.path().join("stderr.log"),
+    );
+    let script = "printf 'a\\r\\nb\\n'; head -c 2097152 /dev/zero | tr '\\000' 'e' >&2; printf 'c'";
+    let config = Config {
+        stdout_copy: Some(out.clone()),
+        stderr_copy: Some(err.clone()),
+        ..Config::default()
+    };
+    let tail = config.stderr_tail;
+    let mut p = Process::spawn(sh(script), config)?;
+    let (frames, report) = until_exit(&mut p, Duration::from_secs(30)).await?;
+    assert_eq!(
+        frames,
+        [
+            Frame::Line(b"a".to_vec()),
+            Frame::Line(b"b".to_vec()),
+            Frame::Partial(b"c".to_vec())
+        ]
+    );
+    assert_eq!(std::fs::read(&out)?, b"a\r\nb\nc");
+    let copied = std::fs::read(&err)?;
+    assert_eq!(copied.len(), 2 << 20);
+    assert!(copied.iter().all(|b| *b == b'e'));
+    assert_eq!(report.stderr.bytes, 2 << 20);
+    assert!(report.stderr_tail.len() <= tail);
+    assert_eq!(
+        Sha256::digest(&copied).to_vec(),
+        Sha256::digest(vec![b'e'; 2 << 20]).to_vec()
+    );
+    Ok(())
+}
