@@ -166,7 +166,7 @@ pub(super) async fn run(
     let mut running = false;
     let (mut thread_id, mut turn_id, mut model, mut usage) =
         (None::<String>, None::<String>, None, None);
-    let (mut status, mut error) = (None::<String>, None::<Value>);
+    let (mut status, mut error, mut reply) = (None::<String>, None::<Value>, None::<String>);
     let mut cancelled = cancel.is_requested();
     let (mut deadline, mut too_large, mut tool_started) = (false, false, false);
     let (mut failure, mut degrade) = (None::<String>, None::<String>);
@@ -316,6 +316,9 @@ pub(super) async fn run(
                                    "turnId": params["turnId"], "itemId": item["id"], "itemType": kind}),
                         )
                         .await?;
+                    if method == "item/completed" && kind == "agentMessage" {
+                        reply = item["text"].as_str().map(str::to_owned);
+                    }
                     if method == "item/started" && !is_text_item(kind) {
                         tool_started = true;
                     }
@@ -610,6 +613,7 @@ pub(super) async fn run(
         turn_id,
         model,
         status,
+        reply,
         exit,
         stdout,
         stderr,
