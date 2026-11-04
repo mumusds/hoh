@@ -1,9 +1,10 @@
 //! LF-delimited protocol frames with a hard size limit (docs/13-adapters.md "进程与终结", docs/02 REQ-026/REQ-027).
 //!
 //! Frames are split on the byte 0x0A only, never on U+2028/U+2029 or other line separators, and one CR before the
-//! LF is dropped; decoding (UTF-8, JSON) is the adapter's job. A frame longer than the limit is refused without
-//! buffering further: the reader holds at most `limit + chunk` bytes, reports the length it saw, the sha256 of
-//! those bytes and their first 4 KiB, and yields no further frames.
+//! LF is dropped (it does not count against the limit, however the CR and LF are split across reads); decoding
+//! (UTF-8, JSON) is the adapter's job. A frame longer than the limit is refused without buffering further: the reader
+//! holds at most `limit + chunk` bytes, reports the length it saw, the sha256 of those bytes and their first 4 KiB,
+//! and yields no further frames.
 
 use sha2::{Digest, Sha256};
 use std::io;
@@ -63,7 +64,8 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
             start: 0,
             scanned: 0,
             limit,
-            chunk: chunk.max(1),
+            // At least two, so a read is still possible while a frame at the limit waits for the LF after its CR.
+            chunk: chunk.max(2),
             max_buffered: 0,
             bytes: 0,
             done: false,
@@ -111,22 +113,35 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
                 )));
             }
             self.scanned = self.buf.len() - self.start;
-            if self.scanned > self.limit {
+            // Pending bytes may exceed the limit by one CR that an LF in the next read would drop (M1T02R-02).
+            let over = self.scanned > self.limit + 1
+                || (self.scanned == self.limit + 1 && self.buf.last() != Some(&b'\r'));
+            if over {
                 return Ok(Some(self.refuse(self.start, self.buf.len())));
             }
             if self.start > 0 {
                 self.buf.drain(..self.start);
                 self.start = 0;
             }
-            // Capacity stays within limit + chunk: it only grows here, while at most `limit` bytes are pending.
-            if self.buf.capacity() - self.buf.len() < self.chunk {
-                self.buf.reserve_exact(self.chunk);
+            // Reads are capped so that at most limit + chunk bytes are ever held (at least one byte: chunk >= 2);
+            // memory grows by at most one chunk per read, never to the whole limit up front.
+            let room = self.limit + self.chunk - self.buf.len();
+            let want = room.min(self.chunk);
+            if self.buf.capacity() - self.buf.len() < want {
+                self.buf.reserve_exact(want);
             }
-            let n = self.inner.read_buf(&mut self.buf).await?;
+            let n = (&mut self.inner)
+                .take(room as u64)
+                .read_buf(&mut self.buf)
+                .await?;
             self.max_buffered = self.max_buffered.max(self.buf.len());
             self.bytes += n as u64;
             if n == 0 {
                 self.done = true;
+                if self.buf.len() > self.limit {
+                    // A trailing CR without LF is content.
+                    return Ok(Some(self.refuse(0, self.buf.len())));
+                }
                 let rest = std::mem::take(&mut self.buf);
                 return Ok((!rest.is_empty()).then_some(Frame::Partial(rest)));
             }
@@ -208,6 +223,63 @@ mod tests {
         assert_eq!(refused.length, 17);
         assert_eq!(refused.head, vec![b'y'; 17]);
         assert_eq!(refused.prefix_sha256, hex(&Sha256::digest(vec![b'y'; 17])));
+        Ok(())
+    }
+
+    /// Feeds `parts` as separate reads.
+    struct Parts(std::collections::VecDeque<Vec<u8>>);
+
+    impl AsyncRead for Parts {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            if let Some(mut part) = self.0.pop_front() {
+                let n = part.len().min(buf.remaining());
+                buf.put_slice(&part[..n]);
+                if n < part.len() {
+                    self.0.push_front(part.split_off(n));
+                }
+            }
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_crlf_split_across_reads_does_not_count_against_the_limit() -> R {
+        // M1T02R-02: a frame at the limit followed by CR and LF in separate reads is the same frame as in one read.
+        for chunk in [1, 2, 3, 16, 64] {
+            for split in [16, 17] {
+                let input = [vec![b'x'; 16], b"\r\nnext\n".to_vec()].concat();
+                let (head, tail) = input.split_at(split);
+                let parts = Parts([head.to_vec(), tail.to_vec()].into());
+                let mut reader = FrameReader::new(parts, 16, chunk);
+                let mut got = Vec::new();
+                while let Some(frame) = reader.next().await? {
+                    got.push(frame);
+                }
+                assert_eq!(
+                    got,
+                    vec![Frame::Line(vec![b'x'; 16]), line("next")],
+                    "chunk {chunk}, split {split}"
+                );
+                assert!(
+                    reader.max_buffered() <= 16 + chunk.max(2),
+                    "chunk {chunk}: {}",
+                    reader.max_buffered()
+                );
+            }
+        }
+        // A CR that is not followed by LF is content: one byte over the limit.
+        for rest in [&b"y\n"[..], &b""[..]] {
+            let input = [vec![b'x'; 16], b"\r".to_vec(), rest.to_vec()].concat();
+            let (got, _) = frames(&input, 16, 4).await?;
+            let [Frame::TooLarge(refused)] = got.as_slice() else {
+                return Err(format!("expected a refusal for {rest:?}, got {got:?}").into());
+            };
+            assert!(refused.length >= 17, "{}", refused.length);
+        }
         Ok(())
     }
 

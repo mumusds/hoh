@@ -178,13 +178,23 @@ pub enum Event {
 /// Requests escalation from any task.
 #[derive(Debug, Clone)]
 pub struct Control {
-    tx: mpsc::UnboundedSender<Escalation>,
+    /// A single slot: the first plan is latched at once and later ones are dropped, so requests never queue
+    /// (M1T02R-03) and a request made before the supervisor sees the exit still decides the cause (M1T02R-01).
+    slot: std::sync::Arc<watch::Sender<Option<Escalation>>>,
 }
 
 impl Control {
-    /// Start ending the process with `plan`; ignored once an escalation runs or the process ended.
+    /// Ask to end the process with `plan`. The first request wins; it makes the exit report's cause
+    /// [`Cause::Cancelled`] unless a deadline or abandonment escalation was already running, even if the process
+    /// exits by itself before the plan takes effect.
     pub fn cancel(&self, plan: Escalation) {
-        let _ = self.tx.send(plan);
+        self.slot.send_if_modified(|slot| {
+            let first = slot.is_none();
+            if first {
+                *slot = Some(plan);
+            }
+            first
+        });
     }
 }
 
@@ -233,7 +243,7 @@ impl Process {
         drop(child);
 
         let (events_tx, events) = mpsc::channel(config.queue.max(1));
-        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let (cancel_tx, cancel_rx) = watch::channel(None);
         let (abandon_tx, abandon) = watch::channel(false);
         let out = tokio::spawn(read_stdout(
             FrameReader::new(stdout, config.frame_limit, config.read_chunk),
@@ -247,7 +257,7 @@ impl Process {
             config,
             started: tokio::time::Instant::now(),
             events: events_tx,
-            control: control_rx,
+            cancel: cancel_rx,
             abandon: abandon_tx,
             out,
             err,
@@ -256,7 +266,9 @@ impl Process {
             pid: pid.as_raw_pid() as u32,
             stdin: Some(stdin),
             events,
-            control: Control { tx: control_tx },
+            control: Control {
+                slot: std::sync::Arc::new(cancel_tx),
+            },
         })
     }
 
@@ -380,7 +392,7 @@ struct Supervisor {
     config: Config,
     started: tokio::time::Instant,
     events: mpsc::Sender<Event>,
-    control: mpsc::UnboundedReceiver<Escalation>,
+    cancel: watch::Receiver<Option<Escalation>>,
     abandon: watch::Sender<bool>,
     out: tokio::task::JoinHandle<StreamReport>,
     err: tokio::task::JoinHandle<(StreamReport, Vec<u8>)>,
@@ -449,10 +461,9 @@ async fn supervise(mut s: Supervisor) {
         let why = tokio::select! {
             biased;
             status = s.leader.exited(&mut s.sigchld) => break status.ok(),
-            request = s.control.recv(), if control_open => match request {
-                Some(plan) if idle => Some((plan, Cause::Cancelled)),
-                Some(_) => None,
-                None => {
+            changed = s.cancel.changed(), if control_open && idle => match changed {
+                Ok(()) => s.cancel.borrow_and_update().map(|plan| (plan, Cause::Cancelled)),
+                Err(_) => {
                     control_open = false;
                     None
                 }
@@ -500,6 +511,10 @@ async fn supervise(mut s: Supervisor) {
         error: Some(e.to_string()),
         ..StreamReport::default()
     };
+    // A cancel latched before the report is made decides the cause even if the exit was seen first (M1T02R-01).
+    if cause == Cause::Exited && s.cancel.borrow().is_some() {
+        cause = Cause::Cancelled;
+    }
     let stdout = out.unwrap_or_else(joined);
     let (stderr, stderr_tail) = err.unwrap_or_else(|e| (joined(e), Vec::new()));
     let report = ExitReport {
