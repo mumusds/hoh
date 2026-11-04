@@ -387,3 +387,56 @@ async fn a_cancelled_end_clears_an_earlier_failure_reason() -> R {
     );
     Ok(())
 }
+
+/// UNKNOWN_EFFECT ends a turn too (the reconciler settles it later): the latch closes, and an accepted cancel still
+/// wins (M1T04R-07).
+#[tokio::test]
+async fn a_turn_can_end_with_an_unknown_effect() -> R {
+    use AttemptState::*;
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    seed(&path)?;
+    store.upsert_session(session(None)).await?;
+    for id in ["A1", "A2"] {
+        let mut a = attempt();
+        a.attempt_id = id.to_owned();
+        store.create_attempt(a).await?;
+        for (from, to) in [(Prepared, Starting), (Starting, Running)] {
+            let mut m = step(from, to, AttemptFacts::default());
+            m.attempt_id = id.to_owned();
+            store.move_attempt(m).await?;
+        }
+    }
+    let unknown = |id: &str| {
+        let mut m = step(
+            Running,
+            UnknownEffect,
+            AttemptFacts {
+                ended_at: Some("2026-11-04T00:00:09Z".to_owned()),
+                failure_reason: Some("PROTOCOL_INCOMPLETE".to_owned()),
+                ..AttemptFacts::default()
+            },
+        );
+        m.attempt_id = id.to_owned();
+        m
+    };
+    let latch = CancelLatch::new();
+    assert_eq!(
+        store.end_attempt(unknown("A1"), &latch).await?,
+        UnknownEffect
+    );
+    let row = store.reader()?.attempt("A1")?.ok_or("no A1")?;
+    assert_eq!(
+        (
+            row.state,
+            row.failure_reason.as_deref(),
+            row.ended_at.is_some()
+        ),
+        (UnknownEffect, Some("PROTOCOL_INCOMPLETE"), true)
+    );
+    assert_eq!(latch.request(), CancelReceipt::AlreadyEnded);
+    let latch = CancelLatch::new();
+    latch.request();
+    assert_eq!(store.end_attempt(unknown("A2"), &latch).await?, Cancelled);
+    Ok(())
+}

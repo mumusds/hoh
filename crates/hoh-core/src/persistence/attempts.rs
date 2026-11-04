@@ -4,9 +4,10 @@
 //! transaction; creating and moving an attempt append their event in it. A session row is metadata of a native
 //! session: written again for a resumed session, never duplicated.
 //!
-//! The end of an attempt and a cancel of it are decided under one [`CancelLatch`] (M1T03R-10): [`end`] commits the
-//! terminal move while holding it, so a cancel requested before that commit makes the end CANCELLED and one requested
-//! after it is refused ([`CancelReceipt::AlreadyEnded`]).
+//! The end of an attempt's turn and a cancel of it are decided under one [`CancelLatch`] (M1T03R-10): [`end`] commits
+//! the terminal move (or UNKNOWN_EFFECT, which ends the turn and leaves the outcome to the reconciler) while holding
+//! it, so a cancel requested before that commit makes the end CANCELLED and one requested after it is refused
+//! ([`CancelReceipt::AlreadyEnded`]).
 
 use super::decide::child_id;
 use super::writer::{self, Commit, Entity, NewEvent};
@@ -234,7 +235,9 @@ pub(super) fn end(
     m: &AttemptMove,
     latch: &CancelLatch,
 ) -> Result<AttemptState, PersistError> {
-    if !m.to.is_terminal() {
+    // UNKNOWN_EFFECT ends the turn although not the attempt: the agent is gone and what it did is for the reconciler
+    // to find out (M1T04R-07).
+    if !m.to.is_terminal() && m.to != AttemptState::UnknownEffect {
         return Err(PersistError::IntegrityViolation(format!(
             "attempt {}: {} is not an end",
             m.attempt_id,
