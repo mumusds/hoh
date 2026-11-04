@@ -106,7 +106,7 @@ fn with_suffix(db: &Path, suffix: &str) -> PathBuf {
 /// The probe process; killed and reaped when dropped.
 struct Probe {
     process: std::process::Child,
-    stdin: std::process::ChildStdin,
+    stdin: Option<std::process::ChildStdin>,
     answers: mpsc::Receiver<String>,
     timeout: Duration,
 }
@@ -139,15 +139,19 @@ impl Probe {
         });
         Ok(Probe {
             process,
-            stdin,
+            stdin: Some(stdin),
             answers,
             timeout: command.answer_timeout,
         })
     }
 
     fn ask(&mut self, command: &str) -> Result<String, String> {
-        writeln!(self.stdin, "{command}")
-            .and_then(|()| self.stdin.flush())
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| format!("cannot send `{command}`: the probe's stdin is closed"))?;
+        writeln!(stdin, "{command}")
+            .and_then(|()| stdin.flush())
             .map_err(|e| format!("cannot send `{command}` to the probe: {e}"))?;
         self.answers
             .recv_timeout(self.timeout)
@@ -169,10 +173,13 @@ impl Probe {
 impl Drop for Probe {
     fn drop(&mut self) {
         // The group id stays valid until the leader is reaped, so the group is killed first. Its members holding
-        // the stdout pipe die with it, which ends the reading thread.
+        // the stdout pipe die with it, which ends the reading thread. The leader is also killed on its own and its
+        // stdin closed, so the wait below cannot hang even if the group kill failed.
         if let Some(pid) = rustix::process::Pid::from_raw(self.process.id() as i32) {
             let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
         }
+        let _ = self.process.kill();
+        drop(self.stdin.take());
         let _ = self.process.wait();
     }
 }
