@@ -62,10 +62,11 @@ The boundary is enforced by the compiler, and this scan checks that nothing swit
    that is not inside a macro invocation is documentation: its literals, the files it embeds and the files its text
    names are not checked as in check 4 (M2T01R-56, -60); inside a macro invocation it is input the macro may use at
    run time and is checked (M2T01R-61), as are doc comments there (M2T01R-63); macro names are Rust identifiers
-   (raw ones, keywords included, and any XID identifier, M2T01R-64/-69); a doc attribute a `macro_rules!` definition
+   (raw ones, keywords included, and any XID identifier, M2T01R-64/-69; `r#macro_rules!(…)` is an invocation,
+   M2T01R-71); a doc attribute a `macro_rules!` definition
    writes documents the generated item (M2T01R-65). The body of an inline module under exactly `#[cfg(test)]` that is
-   not inside a macro invocation is test code for the literal, include and named-file checks, like tests/ (M2T01R-66,
-   -68, -70); module files are never exempt that way (`#[cfg(test)] mod tests;` follows the product rules, M2T01R-67):
+   not inside a macro invocation (its name any XID identifier, M2T01R-72) is test code for the literal, include and
+   named-file checks, like tests/ (M2T01R-66, -68, -70); module files are never exempt that way (`#[cfg(test)] mod tests;` follows the product rules, M2T01R-67):
    a unit test outside persistence that needs SQLite text belongs under tests/ or in an inline test module. A cargo configuration may not `include` another (M2T01R-62).
 Out of reach of any of this (docs/22-tooling.md): a program, script or SQL that exists only at run time (a name or
 text assembled from pieces, read from the environment or a file outside the candidate), conditional compilation
@@ -264,7 +265,8 @@ def identifier_before(code: str, end: int) -> tuple[int, str, bool]:
 
 
 def macro_spans(code: str) -> list[tuple[int, int, str]]:
-    """(start, end, name) of every macro invocation and definition (`name!(…)`, `name![…]`, `name!{…}`,
+    """(start, end, kind) — kind 'definition' for `macro_rules! name {…}`, else 'invocation' — of every macro invocation
+    and definition (`name!(…)`, `name![…]`, `name!{…}`,
     `macro_rules! name {…}`) in comment- and literal-free code. Names follow Rust identifiers: raw ones (`r#while!`,
     keywords included) and any XID identifier (`运行!`, a combining mark, M2T01R-64/-69); a keyword that is not raw
     (`if !(…)`) invokes nothing."""
@@ -278,24 +280,26 @@ def macro_spans(code: str) -> list[tuple[int, int, str]]:
         start, name, raw = identifier_before(code, k)
         if not name or (name in KEYWORDS and not raw):
             continue
-        rest = re.match(r'\s*(?:(?:r#)?[^\W\d]\w*\s*)?([(\[{])', code[j + 1:])
+        rest = re.match(r'\s*(?:((?:r#)?[^\s(\[{;]+?)\s*)?([(\[{])', code[j + 1:])
         if not rest:
             continue
-        opening = rest.group(1)
+        # Only a plain `macro_rules!` followed by a name defines a macro; `r#macro_rules!(…)` invokes one (M2T01R-71).
+        definition = name == 'macro_rules' and not raw and bool(rest.group(1))
+        opening = rest.group(2)
         closing, depth, i = pairs[opening], 0, j + 1 + rest.end() - 1
         while i < len(code):
             depth += 1 if code[i] == opening else -1 if code[i] == closing else 0
             if depth == 0:
                 break
             i += 1
-        out.append((start, i + 1, name))
+        out.append((start, i + 1, 'definition' if definition else 'invocation'))
     return out
 
 
 def invocation_spans(code: str) -> list[tuple[int, int]]:
     """The macro invocations (not `macro_rules!` definitions): what lies inside them is input the macro may use at run
     time, whatever it looks like (M2T01R-61, -63)."""
-    return [(a, b) for a, b, name in macro_spans(code) if name != 'macro_rules']
+    return [(a, b) for a, b, kind in macro_spans(code) if kind == 'invocation']
 
 
 def documentation_spans(code: str) -> list[tuple[int, int]]:
@@ -545,8 +549,10 @@ def cfg_test_spans(code: str) -> list[tuple[int, int]]:
     exempt: which files a build compiles is not decided here (M2T01R-67)."""
     macros = invocation_spans(code)
     out = []
-    for m in re.finditer(CFG_TEST + r'(?:\s*#\s*\[[^\]]*\])*\s*(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+(?:r#)?\w+\s*\{', code):
-        if any(a < m.start() < b for a, b in macros):
+    pattern = CFG_TEST + r'(?:\s*#\s*\[[^\]]*\])*\s*(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+(?:r#)?([^\s{};]+)\s*\{'
+    for m in re.finditer(pattern, code):
+        # Any Rust (XID) identifier names the module, combining marks included (M2T01R-72).
+        if not m.group(1).isidentifier() or any(a < m.start() < b for a, b in macros):
             continue
         depth, i = 0, m.end() - 1
         while i < len(code):
