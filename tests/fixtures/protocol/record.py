@@ -156,8 +156,8 @@ def write_control(cgroup: Path, name: str, value: str) -> None:
 
 
 def kill_pid(pid: int) -> bool:
-    """SIGKILL one process through a pidfd (no PID-reuse race); True only if it was still running when signalled,
-    so a process that already exited on its own is never counted as killed (M0R9-02)."""
+    """SIGKILL one process through a pidfd (no PID-reuse race), the fallback when cgroup.kill cannot be written;
+    False when it was already gone. Not evidence of who ended a process (M0R10-02)."""
     if not alive(pid):
         return False
     try:
@@ -175,7 +175,7 @@ def kill_pid(pid: int) -> bool:
 
 class Stopped(str):
     """How a child ended (exited, SIGTERM, ...), with the command lines of descendants that outlived it: `lingered`
-    ended by themselves within the grace period, `descendants` were still running and had to be killed."""
+    ended by themselves within the grace period, `descendants` were still in the scope when it ended (then killed)."""
     descendants: list[str] = []
     lingered: list[str] = []
 
@@ -204,7 +204,6 @@ class Proc:
         self.close_requested = False
         self.descendants: list[str] = []  # command lines of descendants killed by stop()
         self.lingered: list[str] = []  # descendants that outlived the child but ended on their own
-        self.forced = False  # the cgroup.kill backstop had to end processes that were not attributed
         self.sel = selectors.DefaultSelector()
         # Signals stay blocked until the child is registered and inside its scope, so an interrupt is handled only
         # once stop_all() can find and kill it (M0R5-01); the child resets them before exec.
@@ -312,26 +311,12 @@ class Proc:
         except ProcessLookupError:
             pass
 
-    def force_kill(self, wait: float) -> list[int]:
-        """Kill everything in the scope and wait until the kernel reports it empty; returns the descendants (the child
-        excluded) this killed. Members are killed one by one through pidfds, rescanning until none is left, so only
-        processes still running when signalled are reported (M0R9-02); cgroup.kill is the backstop for a tree that
-        forks faster than that. Raises when the scope cannot be confirmed empty."""
-        killed: list[int] = []
-        deadline = time.monotonic() + min(wait, 1.0)
-        while populated(self.cgroup) and time.monotonic() < deadline:
-            for pid in members(self.cgroup):
-                command = cmdline(pid)
-                if kill_pid(pid) and pid != self.p.pid:
-                    killed.append(pid)
-                    self.descendants.append(command)
-            time.sleep(0.01)
-        if populated(self.cgroup):
-            self.forced = True
-            self.kill_tree()
+    def force_kill(self, wait: float) -> None:
+        """Kill everything in the scope and wait until the kernel reports it empty; raises when it cannot be confirmed.
+        Nothing here claims who ended which process: that is not knowable at an exit boundary (M0R10-02/03)."""
+        self.kill_tree()
         if not self.settle(wait):
             raise RuntimeError(f'scope {self.unit} still has processes after killing them: {members(self.cgroup)}')
-        return killed
 
     def kill_tree(self) -> None:
         """SIGKILL every process in the scope at once, the child included (cgroup.kill). If that control file cannot be
@@ -377,7 +362,7 @@ class Proc:
     def stop(self, grace: float = 20, term_grace: float = 10, kill_grace: float = 5, descendant_grace: float = 5) -> Stopped:
         """Finish writing stdin, close it and wait `grace` s for exit; then SIGTERM the group, then kill the scope, each
         bounded. Afterwards descendants still in the scope get `descendant_grace` s to end by themselves (`lingered`);
-        the rest are killed with the scope (`+descendants-killed`). If an exception (SIGINT, SIGTERM) interrupts this,
+        those still there when it ends outlived it (`+descendants-outlived`) and are killed with the scope. If an exception (SIGINT, SIGTERM) interrupts this,
         terminate() runs before it propagates, and the child stays registered until confirmed gone (M0R6-01)."""
         self.close_requested = True
         try:
@@ -391,10 +376,21 @@ class Proc:
         return result
 
     def stop_gracefully(self, grace: float, term_grace: float, kill_grace: float, descendant_grace: float) -> Stopped:
+        """The verdict on descendants is one kernel observation: the members of the scope (the child excluded) when the
+        grace period ends, or when the child itself had to be killed, are the descendants that outlived it
+        (`+descendants-outlived`). Members seen earlier that were gone by then ended on their own (`lingered`)."""
         how = 'exited'
         self.flush()
         finished = False
-        killed: list[int] = []
+        seen: dict[int, str] = {}
+        outlived: list[int] = []
+
+        def snapshot() -> None:
+            for pid in members(self.cgroup):
+                if pid != self.p.pid and pid not in outlived:
+                    seen.setdefault(pid, cmdline(pid))
+                    outlived.append(pid)
+
         for stage, wait in (('', grace), ('SIGTERM', term_grace), ('SIGKILL', kill_grace)):
             if stage:
                 how = stage
@@ -402,21 +398,24 @@ class Proc:
                 if stage == 'SIGTERM':
                     self.signal(signal.SIGTERM)
                 else:
-                    killed += self.force_kill(kill_grace)
+                    snapshot()
+                    self.force_kill(kill_grace)
             if self.drain(wait):
                 finished = True
                 break
-        seen: dict[int, str] = {}
         deadline = time.monotonic() + (descendant_grace if finished else 0)
         while time.monotonic() < deadline and populated(self.cgroup):  # the kernel's flag: no scan race (M0R7-03)
             for pid in members(self.cgroup):
-                seen.setdefault(pid, cmdline(pid))
+                if pid != self.p.pid:
+                    seen.setdefault(pid, cmdline(pid))
             time.sleep(0.05)
+        snapshot()  # the deadline observation
         if populated(self.cgroup):
-            killed += self.force_kill(kill_grace)
-        if killed or self.forced:  # only what a forced kill actually ended (M0R8-02, M0R9-02)
-            how += '+descendants-killed'
-        self.lingered = [cmd for pid, cmd in seen.items() if pid not in killed and pid != self.p.pid]
+            self.force_kill(kill_grace)
+        if outlived:
+            how += '+descendants-outlived'
+        self.descendants = [seen[pid] for pid in outlived]
+        self.lingered = [cmd for pid, cmd in seen.items() if pid not in outlived]
         if not finished and not self.drain(kill_grace):
             self.close_pipes()
             how += '+abandoned'
@@ -781,12 +780,12 @@ class Recording:
         if stop is not None:
             meta['stopped'] = stop
         if getattr(stop, 'descendants', None):
-            meta['descendants_killed'] = stop.descendants
+            meta['descendants_outlived'] = stop.descendants  # still in the scope when the grace period ended
         if getattr(stop, 'lingered', None):
             meta['descendants_lingered'] = stop.lingered  # outlived the CLI briefly, ended on their own
         fs = frames(stdout)
         problems = VALIDATORS[(self.agent, case)](fs, rc, meta, sent_messages(stdin), self.ctx)
-        if stop is not None and any(word in stop for word in ('SIGKILL', 'descendants-killed', 'abandoned')):
+        if stop is not None and any(word in stop for word in ('SIGKILL', 'descendants-outlived', 'abandoned')):
             problems.append(f'process cleanup: {stop}')  # a child that had to be killed or left descendants (M0R4-07, M0R5-02)
         meta |= {'valid': not problems, 'problems': problems}
         (d / 'meta.json').write_text(json.dumps(meta, ensure_ascii=False, indent=2) + '\n')

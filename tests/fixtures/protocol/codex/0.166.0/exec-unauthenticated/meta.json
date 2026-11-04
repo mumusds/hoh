@@ -11,7 +11,7 @@
   ],
   "cwd": "fresh temp Git repo outside the checkout",
   "exit_code": 1,
-  "recorded_at": "2026-11-04T00:02:50.118299+00:00",
+  "recorded_at": "2026-11-04T00:23:23.560605+00:00",
   "mode": "live",
   "notes": "exec with an empty CODEX_HOME: the authentication failure surface",
   "env_overrides": [

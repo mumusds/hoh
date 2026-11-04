@@ -219,11 +219,11 @@ class BoundedStop(unittest.TestCase):
     def test_descendant_outside_group_killed(self):
         # M0R4-07: descendants that left the process group and hold a pipe are found by the Proc's token and killed.
         p=self.proc('escape');how,took=self.timed_stop(p,grace=0.5,term_grace=0.5,kill_grace=2)
-        self.assertIn('descendants-killed',how);self.assertLess(took,6);self.assertFalse(self.escaped_alive())
+        self.assertIn('descendants-outlived',how);self.assertLess(took,6);self.assertFalse(self.escaped_alive())
     def test_quiet_escaped_descendant_killed_after_clean_exit(self):
         # M0R5-02: the child exits normally but leaves a setsid descendant with closed stdio.
         p=self.proc('escape-quiet');how,_=self.timed_stop(p,grace=5)
-        self.assertEqual(how,'exited+descendants-killed');self.assertFalse(self.escaped_alive())
+        self.assertEqual(how,'exited+descendants-outlived');self.assertFalse(self.escaped_alive())
     def test_descendant_ending_on_its_own_is_only_recorded(self):
         # A descendant that exits within the grace period by itself is reported, not killed and not a failure.
         p=self.proc('linger');how=p.stop(grace=5)
@@ -240,7 +240,7 @@ class BoundedStop(unittest.TestCase):
     def test_nondumpable_descendant_killed(self):
         # M0R6-02: membership of the child's cgroup does not depend on reading /proc/<pid>/environ.
         p=self.proc('hidden');how=p.stop(grace=5,descendant_grace=1)
-        self.assertEqual(how,'exited+descendants-killed');self.assertFalse(self.escaped_alive())
+        self.assertEqual(how,'exited+descendants-outlived');self.assertFalse(self.escaped_alive())
         t=tempfile.TemporaryDirectory();self.addCleanup(t.cleanup)
         rec=record.Recording('pi','1.5.0',Path(t.name),Path(t.name)/'failed');d=FIXTURES/'pi/1.5.0/rpc-invalid-model'
         rec.save('rpc-invalid-model',['pi'],(d/'stdin.txt').read_bytes(),(d/'stdout.jsonl').read_bytes(),b'',0,'x',stop=how)
@@ -251,38 +251,46 @@ class BoundedStop(unittest.TestCase):
         p=record.Proc([sys.executable,str(self.script),'spawner',str(spawned)],self.dir,dict(os.environ))
         how=p.stop(grace=5,descendant_grace=0.5);time.sleep(0.2)
         pids=[int(x.name) for x in spawned.iterdir()];self.assertGreater(len(pids),3)
-        self.assertEqual(how,'exited+descendants-killed');self.assertEqual([x for x in pids if record.alive(x)],[])
+        self.assertEqual(how,'exited+descendants-outlived');self.assertEqual([x for x in pids if record.alive(x)],[])
         self.assertFalse(record.populated(p.cgroup));self.assertNotIn(p,record.LIVE)
     def test_fast_handover_within_grace_is_not_killed(self):
         # M0R7-03: a descendant that hands over to a new one at once still counts as one tree ending on its own.
         p=self.proc('relay-fast');how=p.stop(grace=5,descendant_grace=3)
         self.assertEqual(how,'exited');self.assertEqual(how.descendants,[])
-    def test_stale_member_snapshot_is_not_reported_as_killed(self):
-        # M0R8-02: a process that had already exited when no forced kill was needed must not be labelled killed.
-        p=self.proc('exit-on-eof')
-        with patch.object(record,'members',side_effect=lambda cg:[999999]):how=p.stop(grace=5,descendant_grace=0)
-        self.assertEqual(how,'exited');self.assertEqual(how.descendants,[])
-    def test_forced_kill_reports_what_it_signalled(self):
-        p=self.proc('escape-quiet');how=p.stop(grace=5,descendant_grace=0.2)
-        self.assertEqual(how,'exited+descendants-killed');self.assertEqual(len(how.descendants),1);self.assertFalse(self.escaped_alive())
-    def test_exit_between_listing_and_kill_is_not_counted(self):
-        # M0R9-02: a member listed while the scope looked populated but gone when signalled was not killed by us.
-        p=self.proc('exit-on-eof');gone=subprocess.Popen(['true']);gone.wait()
-        real=record.populated;calls={'n':0}
-        def stale(cg):
-            calls['n']+=1;return True if calls['n']==1 else real(cg)
-        with patch.object(record,'members',side_effect=lambda cg:[gone.pid]),patch.object(record,'populated',side_effect=stale):
-            how=p.stop(grace=5,descendant_grace=0)
-        self.assertEqual(how,'exited');self.assertEqual(how.descendants,[])
-    def test_cleanup_without_cgroup_kill(self):
-        # M0R9-01: an unusable cgroup control file is not taken for an empty scope; members are killed one by one.
-        real=record.write_control
-        def no_kill(cg,name,value):
-            if name=='cgroup.kill':raise FileNotFoundError(2,'No such file or directory')
-            return real(cg,name,value)
+    def test_outlived_is_what_the_deadline_snapshot_lists(self):
+        # M0R10-02/03: the verdict is one observation at the end of the grace period, never an attribution of who
+        # ended a process. The kernel's members of the scope at that moment are the descendants that outlived it.
+        real=record.members;snaps=[]
+        def spy(cg):
+            got=real(cg);snaps.append(list(got));return got
         p=self.proc('escape-quiet')
-        with patch.object(record,'write_control',side_effect=no_kill):how=p.stop(grace=5,descendant_grace=0.2)
-        self.assertEqual(how,'exited+descendants-killed');self.assertFalse(self.escaped_alive())
+        with patch.object(record,'members',side_effect=spy):how=p.stop(grace=5,descendant_grace=0.2)
+        self.assertEqual(how,'exited+descendants-outlived');self.assertEqual(len(how.descendants),1);self.assertFalse(self.escaped_alive())
+        self.assertTrue(any(snaps))
+    def test_populated_flag_alone_does_not_mark_outlived(self):
+        # M0R10-03: a scope that reads populated but lists no descendant at the deadline (the last one just exited)
+        # is cleaned up without a verdict against the case.
+        p=self.proc('exit-on-eof');real=record.populated;calls={'n':0};until=[None]
+        def stale(cg):  # reads populated for 1.5 s after the deadline, then the truth
+            calls['n']+=1
+            if until[0] is None:until[0]=time.monotonic()+1.5
+            return True if time.monotonic()<until[0] else real(cg)
+        with patch.object(record,'populated',side_effect=stale),patch.object(record,'members',side_effect=lambda cg:[]):
+            how=p.stop(grace=5,descendant_grace=0)
+        self.assertEqual(how,'exited');self.assertEqual(how.descendants,[]);self.assertGreaterEqual(calls['n'],2)
+    def test_backstop_without_cgroup_kill_kills_members(self):
+        # M0R9-01 / M0R10-01: cgroup.kill is written and fails, so the per-member fallback must run and empty the scope.
+        real_write=record.write_control;real_kill=record.kill_pid;used={'cgroup.kill':0,'kill_pid':0}
+        def no_kill(cg,name,value):
+            if name=='cgroup.kill':used['cgroup.kill']+=1;raise FileNotFoundError(2,'No such file or directory')
+            return real_write(cg,name,value)
+        def spy_kill(pid):
+            used['kill_pid']+=1;return real_kill(pid)
+        p=self.proc('escape-quiet')
+        with patch.object(record,'write_control',side_effect=no_kill),patch.object(record,'kill_pid',side_effect=spy_kill):
+            how=p.stop(grace=5,descendant_grace=0.2)
+        self.assertGreaterEqual(used['cgroup.kill'],1);self.assertGreaterEqual(used['kill_pid'],1)
+        self.assertEqual(how,'exited+descendants-outlived');self.assertFalse(self.escaped_alive())
         self.assertFalse(record.populated(p.cgroup));self.assertNotIn(p,record.LIVE)
     def test_unkillable_scope_keeps_the_child_registered(self):
         def no_kill(cg,name,value):raise FileNotFoundError(2,'No such file or directory')
@@ -323,7 +331,7 @@ class BoundedStop(unittest.TestCase):
     def test_unclean_stop_invalidates_case(self):
         t=tempfile.TemporaryDirectory();self.addCleanup(t.cleanup)
         rec=record.Recording('pi','1.5.0',Path(t.name),Path(t.name)/'failed');d=FIXTURES/'pi/1.5.0/rpc-invalid-model'
-        rec.save('rpc-invalid-model',['pi'],(d/'stdin.txt').read_bytes(),(d/'stdout.jsonl').read_bytes(),b'',0,'x',stop='exited+descendants-killed')
+        rec.save('rpc-invalid-model',['pi'],(d/'stdin.txt').read_bytes(),(d/'stdout.jsonl').read_bytes(),b'',0,'x',stop='exited+descendants-outlived')
         self.assertTrue(any('process cleanup' in p for p in rec.problems['rpc-invalid-model']))
     def test_stderr_drained_while_waiting(self):
         p=self.proc('chatty');how,_=self.timed_stop(p,grace=10);self.assertEqual(how,'exited');self.assertEqual(len(p.err),1_000_000);self.assertEqual(p.out,b'done\n')
