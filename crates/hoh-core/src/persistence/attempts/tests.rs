@@ -211,6 +211,10 @@ async fn moves_outside_the_table_or_from_another_state_write_nothing() -> R {
             .await,
         Err(PersistError::IntegrityViolation(_))
     ));
+    // A long event name gives a bounded id and leaves the writer working (M1T03R-06).
+    store
+        .attempt_event("A1", &"n".repeat(400), "adapter.diagnostic", json!({}))
+        .await?;
     let before = events()?;
     // A terminal attempt stays terminal; a retry is a new attempt.
     store
