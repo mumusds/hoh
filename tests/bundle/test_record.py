@@ -494,8 +494,9 @@ record.INSTALLED_VERSION['pi']=version
 sys.argv=['record.py','--agents','pi'];sys.exit(record.main())
 ''')
         p=subprocess.run([sys.executable,str(driver),str(repo),str(root),str(script),str(pidfile)],capture_output=True,text=True,timeout=90)
-        scopes=subprocess.run(['systemctl','--user','list-units',f'hoh-recorder-{os.getpid()}-*',f'hoh-recorder-*','--no-legend','--plain'],capture_output=True,text=True).stdout
-        mine=[line for line in scopes.splitlines() if line.strip()]
+        # Only scopes running this test's own child count (and are stopped): concurrent bundle runs have their own.
+        scopes=subprocess.run(['systemctl','--user','list-units','hoh-recorder-*','--no-legend','--plain','--full'],capture_output=True,text=True).stdout
+        mine=[line for line in scopes.splitlines() if str(script) in line]
         leaked=pidfile.exists() and record.alive(int(pidfile.read_text()))
         if leaked:os.kill(int(pidfile.read_text()),signal.SIGKILL)
         for line in mine:subprocess.run(['systemctl','--user','stop',line.split()[0]],capture_output=True)
