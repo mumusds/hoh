@@ -13,6 +13,7 @@
 
 mod attempts;
 mod decide;
+mod inputs;
 pub mod location;
 pub mod selftest;
 mod writer;
@@ -21,6 +22,7 @@ pub use attempts::{
     AttemptFacts, AttemptMove, AttemptRow, CancelLatch, CancelReceipt, NewAttempt, Session,
 };
 pub use decide::Decided;
+pub use inputs::{InputMove, InputRow, NewInput};
 pub use writer::{Change, Commit, Committed, Entity, NewEvent, NewOutbox, StateCas};
 
 use crate::protocol::{ErrorCode, RejectionReason};
@@ -555,6 +557,20 @@ impl Store {
         self.writer.end_attempt(change, latch.clone()).await
     }
 
+    /// Queue an input (QUEUED, with its `input.queued` event).
+    pub async fn enqueue_input(&self, input: NewInput) -> Result<(), PersistError> {
+        self.writer
+            .attempt(attempts::AttemptJob::Enqueue(input))
+            .await
+    }
+
+    /// Move an input along the queue (with its `input.moved` event); see [`InputMove`].
+    pub async fn move_input(&self, change: InputMove) -> Result<(), PersistError> {
+        self.writer
+            .attempt(attempts::AttemptJob::MoveInput(change))
+            .await
+    }
+
     /// Append an event of attempt `attempt_id` (kind and payload as given); `name` makes its id unique within the
     /// attempt, so recording the same one twice fails instead of duplicating it.
     pub async fn attempt_event(
@@ -634,6 +650,11 @@ impl Reader {
     /// (kind, payload) of every event of `run_id`, in seq order.
     pub fn events(&self, run_id: &str) -> Result<Vec<(String, serde_json::Value)>, PersistError> {
         attempts::read_events(&self.conn, run_id)
+    }
+
+    /// The input queue row `input_id`.
+    pub fn input(&self, input_id: &str) -> Result<Option<InputRow>, PersistError> {
+        inputs::read_input(&self.conn, input_id)
     }
 }
 
