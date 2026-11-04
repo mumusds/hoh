@@ -193,3 +193,41 @@ fn command_payload_kinds_follow_the_schema_order() -> R {
     );
     Ok(())
 }
+
+#[test]
+fn integral_floats_decode_like_integers() -> R {
+    // M1T01R-01: JSON Schema counts 1.0 as an integer, so decode must accept it; encode writes canonical integers.
+    let cases = corpus()?;
+    let event = cases
+        .iter()
+        .find(|c| c["def"] == "Event" && c["valid"] == true)
+        .ok_or("event")?;
+    let mut raw = event["instance"].clone();
+    raw["seq"] = serde_json::json!(7.0);
+    let decoded: Event = protocol::decode(&raw)?;
+    assert_eq!(decoded.seq, 7);
+    assert!(schema::json_eq(&protocol::encode(&decoded)?, &raw));
+    let message = cases
+        .iter()
+        .find(|c| c["def"] == "Message" && c["valid"] == true)
+        .ok_or("message")?;
+    let mut raw = message["instance"].clone();
+    raw["role_epoch"] = serde_json::json!(2.0);
+    raw["expected_revision"] = serde_json::json!(1e1);
+    let decoded: Message = protocol::decode(&raw)?;
+    assert_eq!((decoded.role_epoch, decoded.expected_revision), (2, 10));
+    let plan = cases
+        .iter()
+        .find(|c| c["note"] == "plan with scores")
+        .ok_or("plan")?;
+    let mut raw = plan["instance"].clone();
+    raw["tasks"][0]["user_value"] = serde_json::json!(5.0);
+    let decoded: PlanProposal = protocol::decode(&raw)?;
+    assert_eq!(decoded.tasks[0].user_value, Some(5));
+    // Schema-valid but not representable: an error, never a panic or a silent truncation.
+    raw["tasks"][0]["user_value"] = serde_json::json!(5);
+    let mut event_raw = event["instance"].clone();
+    event_raw["seq"] = serde_json::json!(1e20);
+    assert!(protocol::decode::<Event>(&event_raw).is_err());
+    Ok(())
+}

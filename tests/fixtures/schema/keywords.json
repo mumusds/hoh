@@ -1,0 +1,439 @@
+{
+ "note": "JSON Schema keyword semantics the product validator implements (M1-T01). `valid` is the verdict the product validator must give; tests/bundle/test_bundle.py checks that Python jsonschema gives the same verdict, or `python_valid` where Python knowingly differs.",
+ "cases": [
+  {
+   "note": "maximum compares integers exactly beyond 2^53",
+   "schema": {
+    "maximum": 9007199254740992
+   },
+   "instance": 9007199254740993,
+   "valid": false
+  },
+  {
+   "note": "minimum compares integers exactly beyond 2^53",
+   "schema": {
+    "minimum": 9007199254740993
+   },
+   "instance": 9007199254740992,
+   "valid": false
+  },
+  {
+   "note": "maximum is inclusive",
+   "schema": {
+    "maximum": 9007199254740993
+   },
+   "instance": 9007199254740993,
+   "valid": true
+  },
+  {
+   "note": "const: 2^53+1 differs from 2^53.0",
+   "schema": {
+    "const": 9007199254740993
+   },
+   "instance": 9007199254740992.0,
+   "valid": false
+  },
+  {
+   "note": "enum: 1 equals 1.0",
+   "schema": {
+    "enum": [
+     1
+    ]
+   },
+   "instance": 1.0,
+   "valid": true
+  },
+  {
+   "note": "uniqueItems: distinct large numbers",
+   "schema": {
+    "uniqueItems": true
+   },
+   "instance": [
+    9007199254740993,
+    9007199254740992.0
+   ],
+   "valid": true
+  },
+  {
+   "note": "uniqueItems: 1 and 1.0 are equal",
+   "schema": {
+    "uniqueItems": true
+   },
+   "instance": [
+    1,
+    1.0
+   ],
+   "valid": false
+  },
+  {
+   "note": "uniqueItems: equal objects regardless of order and number form",
+   "schema": {
+    "uniqueItems": true
+   },
+   "instance": [
+    {
+     "a": 1,
+     "b": [
+      2
+     ]
+    },
+    {
+     "b": [
+      2.0
+     ],
+     "a": 1.0
+    }
+   ],
+   "valid": false
+  },
+  {
+   "note": "minimum with a fractional bound",
+   "schema": {
+    "minimum": 0.5
+   },
+   "instance": 0,
+   "valid": false
+  },
+  {
+   "note": "maximum with a negative fractional bound",
+   "schema": {
+    "maximum": -0.5
+   },
+   "instance": -1,
+   "valid": true
+  },
+  {
+   "note": "integer: 1.0 is an integer",
+   "schema": {
+    "type": "integer"
+   },
+   "instance": 1.0,
+   "valid": true
+  },
+  {
+   "note": "integer: 1.5 is not",
+   "schema": {
+    "type": "integer"
+   },
+   "instance": 1.5,
+   "valid": false
+  },
+  {
+   "note": "integer: a huge integral float",
+   "schema": {
+    "type": "integer"
+   },
+   "instance": 1e+300,
+   "valid": true
+  },
+  {
+   "note": "minLength given as 1.0",
+   "schema": {
+    "minLength": 1.0
+   },
+   "instance": "x",
+   "valid": true
+  },
+  {
+   "note": "minLength given as 1.0 rejects empty",
+   "schema": {
+    "minLength": 1.0
+   },
+   "instance": "",
+   "valid": false
+  },
+  {
+   "note": "maxItems given as 2.0",
+   "schema": {
+    "maxItems": 2.0
+   },
+   "instance": [
+    1,
+    2,
+    3
+   ],
+   "valid": false
+  },
+  {
+   "note": "maxLength counts code points (one code point)",
+   "schema": {
+    "maxLength": 1
+   },
+   "instance": "é",
+   "valid": true
+  },
+  {
+   "note": "maxLength counts code points, not UTF-16 units",
+   "schema": {
+    "maxLength": 1
+   },
+   "instance": "👍",
+   "valid": true
+  },
+  {
+   "note": "maxLength: e + combining accent is two code points",
+   "schema": {
+    "maxLength": 1
+   },
+   "instance": "é",
+   "valid": false
+  },
+  {
+   "note": "date-time: second 60 outside a leap second",
+   "schema": {
+    "type": "string",
+    "format": "date-time"
+   },
+   "instance": "2026-11-04T01:02:60Z",
+   "valid": false
+  },
+  {
+   "note": "date-time: Python's checker rejects leap seconds",
+   "schema": {
+    "type": "string",
+    "format": "date-time"
+   },
+   "instance": "2026-12-31T23:59:60Z",
+   "valid": false
+  },
+  {
+   "note": "date-time: non-ASCII digit in fraction",
+   "schema": {
+    "type": "string",
+    "format": "date-time"
+   },
+   "instance": "2026-11-04T01:02:03.١Z",
+   "valid": false
+  },
+  {
+   "note": "date-time: non-ASCII digit in year",
+   "schema": {
+    "type": "string",
+    "format": "date-time"
+   },
+   "instance": "٢026-11-04T01:02:03Z",
+   "valid": false
+  },
+  {
+   "note": "date-time: fraction",
+   "schema": {
+    "type": "string",
+    "format": "date-time"
+   },
+   "instance": "2026-11-04T01:02:03.5Z",
+   "valid": true
+  },
+  {
+   "note": "date-time: lowercase t and z",
+   "schema": {
+    "type": "string",
+    "format": "date-time"
+   },
+   "instance": "2026-11-04t01:02:03z",
+   "valid": true
+  },
+  {
+   "note": "date-time: largest offset",
+   "schema": {
+    "type": "string",
+    "format": "date-time"
+   },
+   "instance": "2026-11-04T01:02:03+23:59",
+   "valid": true
+  },
+  {
+   "note": "date-time: empty fraction",
+   "schema": {
+    "type": "string",
+    "format": "date-time"
+   },
+   "instance": "2026-11-04T01:02:03.Z",
+   "valid": false
+  },
+  {
+   "note": "pattern searches, it is not anchored",
+   "schema": {
+    "pattern": "b"
+   },
+   "instance": "abc",
+   "valid": true
+  },
+  {
+   "note": "pattern: $ is the end of input (ECMA-262); Python's re also matches before a final newline",
+   "schema": {
+    "pattern": "^[a-f0-9]{64}$"
+   },
+   "instance": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+   "valid": false,
+   "python_valid": true
+  },
+  {
+   "note": "$ref with sibling keywords: both apply",
+   "schema": {
+    "$defs": {
+     "s": {
+      "type": "string"
+     }
+    },
+    "$ref": "#/$defs/s",
+    "minLength": 2
+   },
+   "instance": "a",
+   "valid": false
+  },
+  {
+   "note": "$ref with sibling keywords: both satisfied",
+   "schema": {
+    "$defs": {
+     "s": {
+      "type": "string"
+     }
+    },
+    "$ref": "#/$defs/s",
+    "minLength": 2
+   },
+   "instance": "ab",
+   "valid": true
+  },
+  {
+   "note": "oneOf: two alternatives match",
+   "schema": {
+    "oneOf": [
+     {
+      "type": "integer"
+     },
+     {
+      "minimum": 0
+     }
+    ]
+   },
+   "instance": 1,
+   "valid": false
+  },
+  {
+   "note": "oneOf: exactly one matches",
+   "schema": {
+    "oneOf": [
+     {
+      "type": "integer"
+     },
+     {
+      "minimum": 0
+     }
+    ]
+   },
+   "instance": -1,
+   "valid": true
+  },
+  {
+   "note": "if without then/else has no effect",
+   "schema": {
+    "if": {
+     "type": "string"
+    }
+   },
+   "instance": 5,
+   "valid": true
+  },
+  {
+   "note": "else applies when if fails",
+   "schema": {
+    "if": {
+     "minimum": 0
+    },
+    "then": {
+     "maximum": 10
+    },
+    "else": {
+     "type": "integer"
+    }
+   },
+   "instance": -1.5,
+   "valid": false
+  },
+  {
+   "note": "additionalProperties schema for unlisted members",
+   "schema": {
+    "additionalProperties": {
+     "type": "integer"
+    },
+    "properties": {
+     "a": {
+      "type": "string"
+     }
+    }
+   },
+   "instance": {
+    "a": "x",
+    "b": 1
+   },
+   "valid": true
+  },
+  {
+   "note": "additionalProperties schema rejects",
+   "schema": {
+    "additionalProperties": {
+     "type": "integer"
+    },
+    "properties": {
+     "a": {
+      "type": "string"
+     }
+    }
+   },
+   "instance": {
+    "a": "x",
+    "b": "y"
+   },
+   "valid": false
+  },
+  {
+   "note": "recursive $ref that descends into a property",
+   "schema": {
+    "$defs": {
+     "node": {
+      "type": "object",
+      "properties": {
+       "next": {
+        "$ref": "#/$defs/node"
+       }
+      }
+     }
+    },
+    "$ref": "#/$defs/node"
+   },
+   "instance": {
+    "next": {
+     "next": {
+      "next": {}
+     }
+    }
+   },
+   "valid": true
+  },
+  {
+   "note": "recursive $ref finds a violation deep down",
+   "schema": {
+    "$defs": {
+     "node": {
+      "type": "object",
+      "properties": {
+       "next": {
+        "$ref": "#/$defs/node"
+       }
+      }
+     }
+    },
+    "$ref": "#/$defs/node"
+   },
+   "instance": {
+    "next": {
+     "next": {
+      "next": 1
+     }
+    }
+   },
+   "valid": false
+  }
+ ]
+}

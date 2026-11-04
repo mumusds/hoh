@@ -210,3 +210,63 @@ fn probe_is_bounded_by_its_timeout() -> R {
     );
     Ok(())
 }
+
+#[test]
+fn probe_leaves_no_descendant_behind() -> R {
+    // M1T01R-03: a probe command that starts a background child must not leave it running.
+    let tmp = tempfile::tempdir()?;
+    let pidfile = tmp.path().join("bg.pid");
+    let help = tmp.path().join("help.txt");
+    std::fs::write(&help, "--output-format stream-json --resume\n")?;
+    let script = format!(
+        "#!/bin/sh\ncase \"$1\" in\n --version) sleep 60 >/dev/null 2>&1 & echo $! > '{}'; echo '2.0.0 (Claude Code)';;\n --help) cat '{}';;\nesac\n",
+        pidfile.display(),
+        help.display()
+    );
+    let (dir, _) = fake(tmp.path(), "bg", "claude", &script)?;
+    probe(Agent::Claude, &env_for(&dir))?;
+    let pid = std::fs::read_to_string(&pidfile)?.trim().to_owned();
+    std::thread::sleep(Duration::from_millis(200));
+    let alive = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .map(|s| {
+            !s.rsplit(')')
+                .next()
+                .unwrap_or_default()
+                .trim_start()
+                .starts_with('Z')
+        })
+        .unwrap_or(false);
+    if alive {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid])
+            .status();
+    }
+    assert!(!alive, "background child {pid} outlived the probe");
+    Ok(())
+}
+
+#[test]
+fn codex_schema_output_must_be_a_schema() -> R {
+    // M1T01R-08: a schema command that exits 0 but writes nothing usable is a failure, not an empty schema.
+    let tmp = tempfile::tempdir()?;
+    let codex_fix = fixtures().join("codex/0.166.0");
+    for (name, generate) in [
+        ("empty", "mkdir -p \"$4\""),
+        (
+            "garbage",
+            "mkdir -p \"$4\" && echo nope > \"$4/ClientRequest.json\"",
+        ),
+    ] {
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n exec) cat '{f}/help-exec.txt';;\n \
+             app-server) case \"$2\" in --help) cat '{f}/help-app-server.txt';; generate-json-schema) {generate};; esac;;\nesac\n",
+            f = codex_fix.display()
+        );
+        let (dir, _) = fake(tmp.path(), name, "codex", &script)?;
+        assert!(
+            probe(Agent::Codex, &env_for(&dir)).is_err(),
+            "{name} schema output accepted"
+        );
+    }
+    Ok(())
+}
