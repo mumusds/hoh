@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Check "adapter-live" (mode live, TEST-025-04): the Claude adapter against the installed `claude` CLI, with model
-# calls. Runs crates/hoh-agents/tests/claude_live.rs and turns its verdict into $HOH_EVIDENCE_DIR/test-results.jsonl
+# calls. Runs crates/hoh-agents/tests/claude_live.rs (an ignored test whose name carries no TEST id, so the integration
+# check never reports TEST-025-04 as skipped) and turns its verdict into $HOH_EVIDENCE_DIR/test-results.jsonl
 # and live-sessions.json (contracts/live-session.schema.json). Exit 0 = PASS, 3 = BLOCKED (claude missing or not
 # logged in; never reported as PASS), 1 = FAIL. The parent agent session's variables are removed first, as the
 # protocol recorder does, so a nested run is a fresh native session.
@@ -18,7 +19,7 @@ if [[ -z "$claude_bin" ]]; then
   printf '{"status": "BLOCKED", "detail": "claude is not installed", "sessions": []}\n' > "$verdict"
 else
   HOH_LIVE_OUT="$out" HOH_LIVE_CLAUDE="$claude_bin" cargo test -p hoh-agents --locked --test claude_live -- \
-    --ignored --exact test_025_04_live_turns_resume_and_cancel --nocapture > "$out/claude-live.log" 2>&1 || true
+    --ignored --exact claude_live_turns_resume_and_cancel --nocapture > "$out/claude-live.log" 2>&1 || true
 fi
 python3 - "$verdict" "$out" <<'PY'
 import json, os, sys
@@ -29,7 +30,7 @@ try:
 except (OSError, ValueError) as exc:
     v = {'status': 'FAIL', 'detail': f'no verdict ({exc}); see claude-live.log', 'sessions': []}
 status = v.get('status')
-line = {'schema_version': '1.0', 'test_id': 'TEST-025-04', 'name': 'hoh-agents/tests/claude_live.rs::test_025_04_live_turns_resume_and_cancel',
+line = {'schema_version': '1.0', 'test_id': 'TEST-025-04', 'name': 'crates/hoh-agents/tests/claude_live.rs::claude_live_turns_resume_and_cancel',
         'status': {'PASS': 'PASS', 'BLOCKED': 'SKIPPED'}.get(status, 'FAIL'), 'detail': f"{status}: {v.get('detail', '')}"[:4096]}
 with (out / 'test-results.jsonl').open('a', encoding='utf-8') as f:
     f.write(json.dumps(line, ensure_ascii=False) + '\n')
