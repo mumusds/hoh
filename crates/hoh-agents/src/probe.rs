@@ -173,11 +173,14 @@ struct CodexSchema {
     notifications: std::collections::BTreeSet<String>,
 }
 
-/// The `method` names a protocol schema file lists (`oneOf[*].properties.method.enum`/`const`); `None` unless it is
-/// an object with a non-empty `oneOf` whose method-bearing branches are well-formed object schemas with a string
-/// method (M1T01R-15, M1T01R-18), naming at least one method.
+/// The `method` names a protocol schema file lists, read only from the form the App Server schema uses: `oneOf`
+/// branches `{type: "object", required: [names], properties: {method: {type: "string", enum: [names]}, ...}}` with
+/// optional `title`/`description` strings. A method-bearing branch with any other keyword or an ill-typed value
+/// rejects the whole file, so malformed output never yields a capability (M1T01R-15, -18, -23).
 fn schema_methods(value: &serde_json::Value) -> Option<std::collections::BTreeSet<String>> {
     use serde_json::Value;
+    let strings = |v: &Value| v.as_array().is_some_and(|a| a.iter().all(Value::is_string));
+    let annotation = |key: &str, v: &Value| matches!(key, "title" | "description") && v.is_string();
     let variants = value
         .as_object()?
         .get("oneOf")?
@@ -186,24 +189,30 @@ fn schema_methods(value: &serde_json::Value) -> Option<std::collections::BTreeSe
     let mut methods = std::collections::BTreeSet::new();
     for branch in variants {
         let branch = branch.as_object()?;
-        let Some(method) = branch.get("properties").and_then(|p| p.get("method")) else {
+        let properties = branch.get("properties").and_then(Value::as_object);
+        let Some(method) = properties.and_then(|p| p.get("method")) else {
             continue;
         };
+        let branch_ok = branch.iter().all(|(key, v)| match key.as_str() {
+            "type" => v == "object",
+            "required" => strings(v),
+            "properties" => v
+                .as_object()
+                .is_some_and(|p| p.values().all(|s| s.is_object() || s.is_boolean())),
+            other => annotation(other, v),
+        });
         let method = method.as_object()?;
-        let typed = |schema: &serde_json::Map<String, Value>, want: &str| {
-            schema.get("type").is_none_or(|t| t == want)
-        };
-        if !typed(branch, "object") || !typed(method, "string") {
+        let method_ok = method.get("type").is_some_and(|t| t == "string")
+            && method.iter().all(|(key, v)| match key.as_str() {
+                "type" => true,
+                "enum" => strings(v) && v.as_array().is_some_and(|a| !a.is_empty()),
+                other => annotation(other, v),
+            });
+        let names = method.get("enum").and_then(Value::as_array)?;
+        if !branch_ok || !method_ok {
             return None;
         }
-        let listed = match (method.get("enum"), method.get("const")) {
-            (Some(Value::Array(names)), None) if !names.is_empty() => names.clone(),
-            (None, Some(name)) => vec![name.clone()],
-            _ => return None,
-        };
-        for name in listed {
-            methods.insert(name.as_str()?.to_owned());
-        }
+        methods.extend(names.iter().filter_map(Value::as_str).map(str::to_owned));
     }
     (!methods.is_empty()).then_some(methods)
 }
@@ -576,15 +585,28 @@ fn run(program: &Path, args: &[&str], env: &ProbeEnv) -> Result<Captured, ProbeE
         argv: argv(program, args),
         detail,
     };
-    let mut child = Command::new(program)
-        .args(args)
-        .env("PATH", &env.path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn()
-        .map_err(|e| failed(format!("cannot start: {e}")))?;
+    let spawn = || {
+        Command::new(program)
+            .args(args)
+            .env("PATH", &env.path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+    };
+    // ETXTBSY is transient: a process forked elsewhere still holds a just-written executable open for writing until
+    // it execs (a known Linux race when files are written and executed concurrently). Retry a few times.
+    let mut attempt = 0;
+    let mut child = loop {
+        match spawn() {
+            Err(e) if e.kind() == io::ErrorKind::ExecutableFileBusy && attempt < 20 => {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(10 * attempt));
+            }
+            other => break other.map_err(|e| failed(format!("cannot start: {e}")))?,
+        }
+    };
     let (tx, rx) = mpsc::channel();
     if let Some(mut stdout) = child.stdout.take() {
         std::thread::spawn(move || {

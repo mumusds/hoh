@@ -287,7 +287,11 @@ fn codex_capabilities_come_from_the_schema_method_lists() -> R {
     let methods = |list: &[&str]| {
         let items: Vec<String> = list
             .iter()
-            .map(|m| format!("{{\"properties\":{{\"method\":{{\"enum\":[\"{m}\"]}}}}}}"))
+            .map(|m| {
+                format!(
+                    "{{\"type\":\"object\",\"required\":[\"method\"],\"properties\":{{\"method\":{{\"type\":\"string\",\"enum\":[\"{m}\"]}}}}}}"
+                )
+            })
             .collect();
         format!("{{\"oneOf\":[{}]}}", items.join(","))
     };
@@ -334,6 +338,45 @@ fn malformed_method_branches_are_refused() -> R {
         (
             "enum-mixed",
             "{\"oneOf\":[{\"type\":\"object\",\"properties\":{\"method\":{\"enum\":[\"turn/steer\",7]}}}]}",
+        ),
+    ] {
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n exec) cat '{f}/help-exec.txt';;\n \
+             app-server) case \"$2\" in --help) cat '{f}/help-app-server.txt';; generate-json-schema) mkdir -p \"$4\" && cd \"$4\" && \
+             echo '{requests}' > ClientRequest.json && echo '{notifications}' > ServerNotification.json;; esac;;\nesac\n",
+            f = codex_fix.display()
+        );
+        let (dir, _) = fake(tmp.path(), name, "codex", &script)?;
+        assert!(
+            probe(Agent::Codex, &env_for(&dir)).is_err(),
+            "{name} accepted"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn method_branches_must_use_the_known_schema_form() -> R {
+    // M1T01R-23: keywords outside the form the App Server schema uses, or with ill-typed values, reject the file.
+    let tmp = tempfile::tempdir()?;
+    let codex_fix = fixtures().join("codex/0.166.0");
+    let notifications = "{\"oneOf\":[{\"type\":\"object\",\"required\":[\"method\"],\"properties\":{\"method\":{\"type\":\"string\",\"enum\":[\"turn/completed\"]}}}]}";
+    for (name, requests) in [
+        (
+            "required-number",
+            "{\"oneOf\":[{\"type\":\"object\",\"required\":123,\"properties\":{\"method\":{\"type\":\"string\",\"enum\":[\"turn/steer\"]}}}]}",
+        ),
+        (
+            "method-minlength",
+            "{\"oneOf\":[{\"type\":\"object\",\"properties\":{\"method\":{\"type\":\"string\",\"minLength\":\"bad\",\"enum\":[\"turn/steer\"]}}}]}",
+        ),
+        (
+            "branch-unknown",
+            "{\"oneOf\":[{\"type\":\"object\",\"patternProperties\":{},\"properties\":{\"method\":{\"type\":\"string\",\"enum\":[\"turn/steer\"]}}}]}",
+        ),
+        (
+            "title-number",
+            "{\"oneOf\":[{\"type\":\"object\",\"title\":5,\"properties\":{\"method\":{\"type\":\"string\",\"enum\":[\"turn/steer\"]}}}]}",
         ),
     ] {
         let script = format!(
