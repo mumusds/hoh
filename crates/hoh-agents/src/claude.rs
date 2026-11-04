@@ -11,7 +11,8 @@
 //! (PROTOCOL_INCOMPLETE) even with exit code 0; any other result is FAILED with its subtype kept (also in the
 //! `adapter.result` event), or BLOCKED_AUTH when an assistant frame carried Claude's `authentication_failed` error
 //! (recorded case `unauthenticated`). A cancel requested before the end is recorded makes the attempt CANCELLED
-//! whatever follows (Claude still prints `result(error_during_execution)` and exits 0 after SIGINT, CR-003); a refused
+//! whatever follows (Claude still prints `result(error_during_execution)` and exits 0 after SIGINT, CR-003): every end
+//! is committed through the attempt's [`CancelLatch`], so a cancel accepted before that commit wins; a refused
 //! frame (PROTOCOL_FRAME_TOO_LARGE) and the deadline (DEADLINE_EXCEEDED) stop the process and fail the turn whatever it
 //! prints after. Stopping sends SIGINT, then SIGTERM and SIGKILL to the process group with graces between. Stdin,
 //! stdout and the cancel are driven together, so a child that never reads its prompt cannot hold up a cancel.
@@ -19,7 +20,7 @@
 use crate::frame::Frame;
 use crate::process::{Cause, Config, Escalation, Event, Process, Signal, Step, Termination};
 use hoh_core::lifecycle::AttemptState;
-use hoh_core::persistence::{AttemptFacts, AttemptMove, PersistError, Session, Store};
+use hoh_core::persistence::{AttemptFacts, AttemptMove, CancelLatch, PersistError, Session, Store};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
@@ -27,7 +28,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::watch;
 
 /// The YOLO permission flag; offered by the probed help or the profile is refused.
 pub const YOLO_FLAG: &str = "--dangerously-skip-permissions";
@@ -298,12 +298,34 @@ async fn step(
         .await
 }
 
-/// Run one turn as `attempt` (created PREPARED by the caller). `cancel` turning true cancels it.
+/// End the attempt through the latch: the state written (CANCELLED if a cancel was accepted first).
+async fn finish(
+    store: &Store,
+    attempt: &AttemptRef,
+    from: AttemptState,
+    to: AttemptState,
+    facts: AttemptFacts,
+    cancel: &CancelLatch,
+) -> Result<AttemptState, PersistError> {
+    store
+        .end_attempt(
+            AttemptMove {
+                attempt_id: attempt.attempt_id.clone(),
+                from,
+                to,
+                facts,
+            },
+            cancel,
+        )
+        .await
+}
+
+/// Run one turn as `attempt` (created PREPARED by the caller); a cancel accepted by `cancel` cancels it.
 pub async fn run(
     store: &Store,
     attempt: &AttemptRef,
     turn: &Turn,
-    mut cancel: watch::Receiver<bool>,
+    cancel: &CancelLatch,
 ) -> Result<Outcome, AdapterError> {
     use AttemptState::*;
     let (stdout, stderr) = (turn.logs.join("stdout.jsonl"), turn.logs.join("stderr.log"));
@@ -312,7 +334,7 @@ pub async fn run(
         Ok(argv) => argv,
         Err(Blocked(detail)) => {
             // Nothing starts; the attempt ends where it is.
-            step(
+            let state = finish(
                 store,
                 attempt,
                 Prepared,
@@ -322,6 +344,7 @@ pub async fn run(
                     failure_reason: Some("BLOCKED_CAPABILITY".to_owned()),
                     ..AttemptFacts::default()
                 },
+                cancel,
             )
             .await?;
             store
@@ -333,8 +356,8 @@ pub async fn run(
                 )
                 .await?;
             return Ok(Outcome {
-                state: Failed,
-                failure: Some("BLOCKED_CAPABILITY".to_owned()),
+                state,
+                failure: (state == Failed).then(|| "BLOCKED_CAPABILITY".to_owned()),
                 args: Vec::new(),
                 native_session: None,
                 model: None,
@@ -352,7 +375,7 @@ pub async fn run(
     };
     if let Err(e) = std::fs::create_dir_all(&turn.logs) {
         // Nothing starts without its raw logs; the attempt does not stay PREPARED.
-        step(
+        finish(
             store,
             attempt,
             Prepared,
@@ -362,6 +385,7 @@ pub async fn run(
                 failure_reason: Some(format!("LOGS: {e}")),
                 ..AttemptFacts::default()
             },
+            cancel,
         )
         .await?;
         return Err(e.into());
@@ -405,7 +429,7 @@ pub async fn run(
     let mut process = match Process::spawn(command, config) {
         Ok(p) => p,
         Err(e) => {
-            step(
+            finish(
                 store,
                 attempt,
                 Starting,
@@ -415,6 +439,7 @@ pub async fn run(
                     failure_reason: Some(format!("spawn: {e}")),
                     ..AttemptFacts::default()
                 },
+                cancel,
             )
             .await?;
             return Err(e.into());
@@ -449,26 +474,17 @@ pub async fn run(
     let mut diagnostics = 0;
     let mut too_large = false;
     let mut auth_failed = false;
-    let mut cancelled = *cancel.borrow_and_update();
+    let mut cancelled = cancel.is_requested();
     if cancelled {
         process.cancel(turn.escalation);
     }
-    let mut watching = !cancelled;
     let report = loop {
         // A cancel is seen before output that is ready at the same time.
         let event = tokio::select! {
             biased;
-            changed = cancel.changed(), if watching => {
-                match changed {
-                    Ok(()) if *cancel.borrow_and_update() => {
-                        cancelled = true;
-                        watching = false;
-                        process.cancel(turn.escalation);
-                    }
-                    Ok(()) => {}
-                    // No one can cancel any more.
-                    Err(_) => watching = false,
-                }
+            () = cancel.requested(), if !cancelled => {
+                cancelled = true;
+                process.cancel(turn.escalation);
                 continue;
             }
             written = &mut feed, if fed.is_none() => {
@@ -579,9 +595,7 @@ pub async fn run(
             .await?;
     }
     let exit = report.as_ref().and_then(|r| r.status);
-    // A cancel requested up to here still decides the end (M1T03R-03); the biased select above sees one that is ready
-    // with the last output, this sees one sent while the exit was being handled.
-    cancelled = cancelled || *cancel.borrow();
+    // A cancel accepted from here on still wins: the store commits the end through the latch (M1T03R-03, M1T03R-10).
     let (state, failure) = verdict(&Ending {
         cancelled,
         too_large,
@@ -594,7 +608,7 @@ pub async fn run(
         result: result.as_ref(),
         exit,
     });
-    step(
+    let state = finish(
         store,
         attempt,
         Running,
@@ -608,8 +622,10 @@ pub async fn run(
             cost_usd: cost,
             ..AttemptFacts::default()
         },
+        cancel,
     )
     .await?;
+    let failure = if state == Cancelled { None } else { failure };
     Ok(Outcome {
         state,
         failure,

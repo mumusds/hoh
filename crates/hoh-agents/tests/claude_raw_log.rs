@@ -10,10 +10,10 @@ mod common;
 use common::{R, World};
 use hoh_agents::claude::{self, Launch, Turn};
 use hoh_core::lifecycle::AttemptState;
+use hoh_core::persistence::CancelLatch;
 use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
 use std::time::Duration;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::watch;
 
 /// SIGXFSZ on Linux (x86_64 and aarch64).
 const SIGXFSZ: i32 = 25;
@@ -54,7 +54,6 @@ async fn a_raw_log_that_cannot_be_written_whole_fails_the_turn() -> R {
         escalation: Turn::default_escalation(),
         deadline: Some(Duration::from_secs(60)),
     };
-    let (_cancel, quiet) = watch::channel(false);
     // stderr.log stops at 4 MiB of the 8 MiB written; nothing else this process writes meanwhile comes near it.
     let before = getrlimit(Resource::Fsize);
     setrlimit(
@@ -64,7 +63,7 @@ async fn a_raw_log_that_cannot_be_written_whole_fails_the_turn() -> R {
             maximum: before.maximum,
         },
     )?;
-    let outcome = claude::run(&world.store, &attempt, &turn, quiet).await;
+    let outcome = claude::run(&world.store, &attempt, &turn, &CancelLatch::new()).await;
     setrlimit(Resource::Fsize, before)?;
     let outcome = outcome?;
     assert_eq!(

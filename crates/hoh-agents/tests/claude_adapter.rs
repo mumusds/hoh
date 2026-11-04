@@ -11,10 +11,10 @@ use common::{R, World};
 use hoh_agents::claude::{self, AttemptRef, Launch, Outcome, PARTIAL_FLAG, Turn, YOLO_FLAG};
 use hoh_agents::process::{Escalation, Signal, Target, group_members};
 use hoh_core::lifecycle::AttemptState;
+use hoh_core::persistence::{CancelLatch, CancelReceipt};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use tokio::sync::watch;
 
 const FIXTURES: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -100,8 +100,7 @@ impl Fakes for World {
     }
 
     async fn run(&self, attempt: &AttemptRef, turn: &Turn) -> R<Outcome> {
-        let (_cancel, quiet) = watch::channel(false);
-        Ok(claude::run(&self.store, attempt, turn, quiet).await?)
+        Ok(claude::run(&self.store, attempt, turn, &CancelLatch::new()).await?)
     }
 }
 
@@ -468,13 +467,13 @@ fn stubborn(world: &World) -> R<(PathBuf, PathBuf)> {
 async fn cancel_and_sample(
     world: &World,
     id: &str,
-    cancel: watch::Sender<bool>,
+    cancel: &CancelLatch,
     mark: Duration,
 ) -> R<(Instant, u32, Vec<u32>)> {
     let pid = running_pid(world, id).await?;
     tokio::time::sleep(Duration::from_millis(300)).await;
     let at = Instant::now();
-    cancel.send(true)?;
+    assert_eq!(cancel.request(), CancelReceipt::Accepted);
     tokio::time::sleep_until((at + mark).into()).await;
     Ok((at, pid, group_members(pid)))
 }
@@ -486,10 +485,10 @@ async fn test_025_03_cancel_escalates_to_the_group_and_ends_cancelled() -> R {
     let attempt = world.attempt("A1").await?;
     let mut turn = world.turn(&script, "logs/A1")?;
     turn.escalation = quick();
-    let (cancel, cancelled) = watch::channel(false);
-    let running = claude::run(&world.store, &attempt, &turn, cancelled);
+    let cancel = CancelLatch::new();
+    let running = claude::run(&world.store, &attempt, &turn, &cancel);
     // The group is sampled exactly 3 s after the cancel (AC-025-03), zombies included.
-    let sample = cancel_and_sample(&world, "A1", cancel, Duration::from_secs(3));
+    let sample = cancel_and_sample(&world, "A1", &cancel, Duration::from_secs(3));
     let (outcome, sample) = tokio::join!(running, sample);
     let (outcome, (at, pid, left)) = (outcome?, sample?);
     assert!(
@@ -540,9 +539,9 @@ async fn the_three_second_sample_catches_a_slow_stop() -> R {
         term_grace: Duration::from_secs(2),
         ..quick()
     };
-    let (cancel, cancelled) = watch::channel(false);
-    let running = claude::run(&world.store, &attempt, &turn, cancelled);
-    let sample = cancel_and_sample(&world, "A1", cancel, Duration::from_secs(3));
+    let cancel = CancelLatch::new();
+    let running = claude::run(&world.store, &attempt, &turn, &cancel);
+    let sample = cancel_and_sample(&world, "A1", &cancel, Duration::from_secs(3));
     let (outcome, sample) = tokio::join!(running, sample);
     let (outcome, (_, pid, left)) = (outcome?, sample?);
     assert!(!left.is_empty(), "the group was gone before its kill");
@@ -606,12 +605,12 @@ async fn a_prompt_that_is_never_read_does_not_hold_up_cancel_or_count_as_deliver
     let mut turn = world.turn(&stuck, "logs/stuck")?;
     turn.prompt = vec![b'p'; 2 << 20];
     turn.escalation = quick();
-    let (cancel, cancelled) = watch::channel(false);
-    let running = claude::run(&world.store, &attempt, &turn, cancelled);
+    let cancel = CancelLatch::new();
+    let running = claude::run(&world.store, &attempt, &turn, &cancel);
     let trigger = async {
         running_pid(&world, "A1").await?;
         tokio::time::sleep(Duration::from_millis(300)).await;
-        cancel.send(true)?;
+        assert_eq!(cancel.request(), CancelReceipt::Accepted);
         Ok::<Instant, Box<dyn std::error::Error>>(Instant::now())
     };
     let (outcome, at) = tokio::time::timeout(Duration::from_secs(10), async {
@@ -658,8 +657,8 @@ async fn a_cancel_queued_with_the_exit_still_cancels() -> R {
     )?;
     let attempt = world.attempt("A1").await?;
     let turn = world.turn(&fake, "logs/racer")?;
-    let (cancel, cancelled) = watch::channel(false);
-    let running = claude::run(&world.store, &attempt, &turn, cancelled);
+    let cancel = CancelLatch::new();
+    let running = claude::run(&world.store, &attempt, &turn, &cancel);
     let trigger = async {
         let pid = running_pid(&world, "A1").await?;
         // Hold the database while the fake speaks and exits; the adapter blocks on the init frame's write.
@@ -670,7 +669,7 @@ async fn a_cancel_queued_with_the_exit_still_cancels() -> R {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        cancel.send(true)?;
+        assert_eq!(cancel.request(), CancelReceipt::Accepted);
         let held = holder.wait()?;
         Ok::<bool, Box<dyn std::error::Error>>(held.success())
     };
@@ -848,5 +847,62 @@ async fn the_recorded_login_failure_is_blocked_auth() -> R {
         (outcome.state, outcome.failure.as_deref()),
         (AttemptState::Failed, Some("is_error"))
     );
+    Ok(())
+}
+
+/// A cancel accepted while the end is being committed (the store held by another connection) still ends the attempt
+/// CANCELLED; once the end is committed a cancel is refused (M1T03R-10).
+#[tokio::test]
+async fn a_cancel_while_the_end_is_committed_wins() -> R {
+    let world = World::new()?;
+    let go = world.dir.path().join("go");
+    let fake = world.script(
+        "ender",
+        &format!(
+            "cat > /dev/null\necho '{INIT}'\necho '{SUCCESS}'\nwhile [ ! -e '{}' ]; do sleep 0.02; done\nexit 0",
+            go.display()
+        ),
+    )?;
+    let attempt = world.attempt("A1").await?;
+    let turn = world.turn(&fake, "logs/ender")?;
+    let cancel = CancelLatch::new();
+    let running = claude::run(&world.store, &attempt, &turn, &cancel);
+    let trigger = async {
+        // The result is recorded; then the store is held, the fake exits and the adapter commits its end.
+        for _ in 0..400 {
+            if world
+                .store
+                .reader()?
+                .events("R")?
+                .iter()
+                .any(|(k, _)| k == "adapter.result")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let mut holder = hold_store(&world, &go, Duration::from_millis(1500))?;
+        while !go.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let receipt = cancel.request();
+        let held = holder.wait()?;
+        Ok::<(CancelReceipt, bool), Box<dyn std::error::Error>>((receipt, held.success()))
+    };
+    let (outcome, trigger) = tokio::join!(running, trigger);
+    let (outcome, (receipt, held)) = (outcome?, trigger?);
+    assert!(held, "the store was not held");
+    assert_eq!(receipt, CancelReceipt::Accepted);
+    assert_eq!(
+        (outcome.state, outcome.failure),
+        (AttemptState::Cancelled, None)
+    );
+    let row = world.store.reader()?.attempt("A1")?.ok_or("no attempt")?;
+    assert_eq!(
+        (row.state, row.cancel_requested),
+        (AttemptState::Cancelled, true)
+    );
+    assert_eq!(cancel.request(), CancelReceipt::AlreadyEnded);
     Ok(())
 }
