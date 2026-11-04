@@ -6,6 +6,7 @@
 #![forbid(clippy::disallowed_methods)]
 #![forbid(unsafe_code)]
 
+pub mod adapter;
 pub mod claude;
 pub mod compat;
 pub mod frame;
