@@ -234,7 +234,7 @@ async fn claude_live_turns_resume_and_cancel() -> R {
     };
 
     // 1. A reply.
-    let a1 = world.attempt_in("A1", "S1", &version).await?;
+    let a1 = world.attempt_in("claude", "A1", "S1", &version).await?;
     let first = claude::run(
         &world.store,
         &a1,
@@ -282,7 +282,7 @@ async fn claude_live_turns_resume_and_cancel() -> R {
     sessions.push(session_of(&first));
 
     // 2. The same session, resumed: it remembers the token.
-    let a2 = world.attempt_in("A2", "S1", &version).await?;
+    let a2 = world.attempt_in("claude", "A2", "S1", &version).await?;
     let second = claude::run(
         &world.store,
         &a2,
@@ -306,7 +306,7 @@ async fn claude_live_turns_resume_and_cancel() -> R {
 
     // 3. A long tool run, cancelled once its `sleep 120` is seen alive: CANCELLED, the group gone within 16 s, and no
     //    process left in the repository (the sleep runs in a group of its own).
-    let a3 = world.attempt_in("A3", "S2", &version).await?;
+    let a3 = world.attempt_in("claude", "A3", "S2", &version).await?;
     let third_turn = turn(
         "Use the Bash tool with run_in_background: true to run `sleep 120`. Then wait until that background command \
          has finished before you reply; when it has finished, reply DONE.",

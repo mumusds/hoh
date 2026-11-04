@@ -1,6 +1,6 @@
 //! Shared by the adapter test binaries: a store with a run and a task, opened with this binary as its WAL probe.
 
-use hoh_agents::claude::AttemptRef;
+use hoh_agents::adapter::AttemptRef;
 use hoh_core::persistence::selftest::{PROBE_DB_ENV, ProbeCommand, probe_main};
 use hoh_core::persistence::{NewAttempt, Options, Store};
 use std::ffi::OsString;
@@ -63,8 +63,14 @@ impl World {
         Ok(World { dir, store })
     }
 
-    /// Attempt `id` of task T1 in session `session`, created PREPARED.
-    pub async fn attempt_in(&self, id: &str, session: &str, version: &str) -> R<AttemptRef> {
+    /// Attempt `id` of task T1 by `agent` in session `session`, created PREPARED.
+    pub async fn attempt_in(
+        &self,
+        agent: &str,
+        id: &str,
+        session: &str,
+        version: &str,
+    ) -> R<AttemptRef> {
         self.store
             .create_attempt(NewAttempt {
                 attempt_id: id.to_owned(),
@@ -73,7 +79,7 @@ impl World {
                 role_epoch: 1,
                 host_epoch: 1,
                 config_revision: 0,
-                agent: Some("claude".to_owned()),
+                agent: Some(agent.to_owned()),
             })
             .await?;
         Ok(AttemptRef {

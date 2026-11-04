@@ -18,7 +18,7 @@
 //! stdout and the cancel are driven together, so a child that never reads its prompt cannot hold up a cancel.
 
 pub use crate::adapter::{AdapterError, AttemptRef};
-use crate::adapter::{finish, now, sha256_file, step};
+use crate::adapter::{finish, now, offers, sha256_file, step};
 use crate::frame::Frame;
 use crate::process::{Cause, Config, Escalation, Event, Process, Signal, Step, Termination};
 use hoh_core::lifecycle::AttemptState;
@@ -62,11 +62,6 @@ pub struct Argv {
     pub args: Vec<String>,
     /// `partial_messages`, `resume`, `structured_events` as offered by the help.
     pub capabilities: Value,
-}
-
-fn offers(help: &str, flag: &str) -> bool {
-    help.split(|c: char| c.is_whitespace() || c == ',' || c == '[' || c == ']' || c == '=')
-        .any(|word| word == flag)
 }
 
 /// The argv of a turn, or why it cannot start.

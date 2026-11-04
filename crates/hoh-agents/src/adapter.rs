@@ -96,3 +96,9 @@ pub(crate) async fn finish(
         )
         .await
 }
+
+/// Whether `help` (a probed `--help` text) offers `flag` as a word of its own.
+pub(crate) fn offers(help: &str, flag: &str) -> bool {
+    help.split(|c: char| c.is_whitespace() || c == ',' || c == '[' || c == ']' || c == '=')
+        .any(|word| word == flag)
+}
