@@ -190,13 +190,20 @@ async fn a_failing_migration_is_rolled_back() -> R {
         (1, 0),
         "the failed migration left schema changes"
     );
-    // Comments before the script's transaction control do not let it commit early (M2T01R-09).
+    // Comments before the script's transaction control do not hide it (M2T01R-09): each script is skipped past its
+    // own BEGIN/COMMIT/END and then fails only for its missing version, leaving no schema change.
     for script in [
-        "-- leading comment\nBEGIN; CREATE TABLE extra(x); -- before commit\nCOMMIT;",
+        "-- leading comment\nBEGIN; CREATE TABLE extra(x);",
+        "CREATE TABLE extra(x); -- before commit\nCOMMIT;",
         "/* block */ BEGIN TRANSACTION; CREATE TABLE extra(x); /* before end */ END;",
     ] {
         match Store::open_checked(&path, test_options(), &[MIGRATIONS[0], (2, script)]) {
-            Err(PersistError::Migration { version: 2, .. }) => {}
+            Err(PersistError::Migration { version: 2, detail }) => {
+                assert!(
+                    detail.contains("user_version is 1 afterwards"),
+                    "{script}: {detail}"
+                )
+            }
             other => return Err(format!("{script}: {other:?}").into()),
         }
         assert_eq!(schema(&path)?, (1, 0), "{script} left schema changes");
@@ -663,7 +670,14 @@ fn a_path_swapped_after_the_check_is_refused() -> R {
             MIGRATIONS,
             &swap_in,
         );
-        assert!(opened.is_err(), "{swap}: the swapped path was opened");
+        match (swap, &opened) {
+            // A link in place of the directory is caught before the self-test touches it.
+            ("directory", Err(PersistError::Storage(m))) => {
+                assert!(m.contains("changed while it was being checked"), "{m}")
+            }
+            ("file", Err(_)) => {}
+            _ => return Err(format!("{swap}: {opened:?}").into()),
+        }
         let created: Vec<_> = std::fs::read_dir(root.join("network"))?.collect();
         assert!(
             created.is_empty(),
