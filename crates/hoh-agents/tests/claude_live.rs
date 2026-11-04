@@ -5,9 +5,11 @@
 //! (path, version, sha256, help hash) is recorded in claude-install.json.
 //!
 //! claude 2.1.318 refuses a foreground `sleep 120` ("Blocked: standalone sleep"), so the third turn runs it as a
-//! background task, which Claude starts in a process group of its own. The cancel is sent only once that `sleep 120`
-//! process is seen alive in the repository; the turn fails if it never starts, or if it or any other process is left
-//! in the repository 16 s after the cancel.
+//! background task, which Claude starts in a process group of its own. The cancel is sent only once this turn's Bash
+//! `tool_use` for `sleep 120` stands unrefused and a `sleep 120` descending from this claude is alive; the turn fails
+//! if that never happens, or unless claude's group, the tool's process and group (zombies included) and every process
+//! working in the repository are all seen gone within 16 s of the cancel. The observer's checks have tests of their
+//! own below.
 
 // No SQLite outside hoh-core::persistence (AC-062-05; see clippy.toml), and no unsafe code (no FFI way around it).
 #![forbid(clippy::disallowed_methods)]
@@ -19,12 +21,12 @@ use common::{R, World};
 use hoh_agents::claude::{self, Launch, Outcome, Turn};
 use hoh_agents::process::group_members;
 use hoh_core::lifecycle::AttemptState;
+use hoh_core::persistence::CancelLatch;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
-use tokio::sync::watch;
 
 const TOKEN: &str = "HOH_NATIVE_SMOKE_OK";
 
@@ -68,26 +70,105 @@ fn processes_in(dir: &Path) -> Vec<u32> {
         .collect()
 }
 
-/// `sleep 120` processes working in `dir`: (pid, process group).
-fn sleeps_in(dir: &Path) -> Vec<(u32, u32)> {
+/// `(state, ppid, pgrp)` of `pid` from /proc, zombies included.
+fn stat_of(pid: u32) -> Option<(char, u32, u32)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let mut rest = stat.rsplit_once(')')?.1.split_whitespace();
+    let state = rest.next()?.chars().next()?;
+    Some((
+        state,
+        rest.next()?.parse().ok()?,
+        rest.next()?.parse().ok()?,
+    ))
+}
+
+/// Whether `pid` is a descendant of `ancestor`.
+fn descends_from(pid: u32, ancestor: u32) -> bool {
+    let mut at = pid;
+    for _ in 0..64 {
+        match stat_of(at) {
+            Some((_, ppid, _)) if ppid == ancestor => return true,
+            Some((_, ppid, _)) if ppid > 1 => at = ppid,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// `sleep 120` processes started by `claude` (its descendants) working in `dir`: (pid, process group).
+fn tool_sleeps(dir: &Path, claude: u32) -> Vec<(u32, u32)> {
     processes_in(dir)
         .into_iter()
         .filter(|pid| {
             std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| c == b"sleep\x00120\x00")
         })
-        .filter_map(|pid| {
-            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-            // After the command name: state, ppid, pgrp.
-            let pgrp = stat
-                .rsplit_once(')')?
-                .1
-                .split_whitespace()
-                .nth(2)?
-                .parse()
-                .ok()?;
-            Some((pid, pgrp))
-        })
+        .filter(|pid| descends_from(*pid, claude))
+        .filter_map(|pid| Some((pid, stat_of(pid)?.2)))
         .collect()
+}
+
+/// Whether `stdout` (stream-json) shows a Bash `tool_use` running `command` that no error `tool_result` answered.
+fn tool_started(stdout: &[u8], command: &str) -> bool {
+    let frames: Vec<serde_json::Value> = stdout
+        .split(|b| *b == b'\n')
+        .filter_map(|l| serde_json::from_slice(l).ok())
+        .collect();
+    let content = |f: &serde_json::Value| {
+        f["message"]["content"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    };
+    let uses: Vec<String> = frames
+        .iter()
+        .filter(|f| f["type"] == "assistant")
+        .flat_map(content)
+        .filter(|c| {
+            c["type"] == "tool_use" && c["name"] == "Bash" && c["input"]["command"] == command
+        })
+        .filter_map(|c| c["id"].as_str().map(str::to_owned))
+        .collect();
+    let refused = |id: &str| {
+        frames
+            .iter()
+            .filter(|f| f["type"] == "user")
+            .flat_map(content)
+            .any(|c| c["type"] == "tool_result" && c["tool_use_id"] == id && c["is_error"] == true)
+    };
+    uses.iter().any(|id| !refused(id))
+}
+
+/// Processes of `tools` (pid, group) still there, zombies included.
+fn left_of(tools: &[(u32, u32)]) -> Vec<u32> {
+    let mut left: Vec<u32> = tools
+        .iter()
+        .flat_map(|(pid, pgid)| {
+            let mut v = group_members(*pgid);
+            v.extend(stat_of(*pid).map(|_| *pid));
+            v
+        })
+        .collect();
+    left.sort_unstable();
+    left.dedup();
+    left
+}
+
+/// When `clear` first held, polled from `at` until `at + bound`; `None` if it never did by then.
+async fn clear_by(
+    at: Instant,
+    bound: Duration,
+    mut clear: impl FnMut() -> bool,
+) -> Option<Duration> {
+    loop {
+        let checked = at.elapsed();
+        if checked > bound {
+            return None;
+        }
+        if clear() {
+            return Some(checked);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 #[tokio::test]
@@ -140,7 +221,6 @@ async fn claude_live_turns_resume_and_cancel() -> R {
         escalation: Turn::default_escalation(),
         deadline: Some(Duration::from_secs(600)),
     };
-    let quiet = || watch::channel(false).1;
     let mut sessions = Vec::new();
     let session_of = |o: &Outcome| {
         json!({
@@ -161,7 +241,7 @@ async fn claude_live_turns_resume_and_cancel() -> R {
             "live/A1",
             None,
         ),
-        quiet(),
+        &CancelLatch::new(),
     )
     .await?;
     let none = json!({});
@@ -209,7 +289,7 @@ async fn claude_live_turns_resume_and_cancel() -> R {
             "live/A2",
             first.native_session.clone(),
         ),
-        quiet(),
+        &CancelLatch::new(),
     )
     .await?;
     if second.state != AttemptState::Settled
@@ -231,57 +311,75 @@ async fn claude_live_turns_resume_and_cancel() -> R {
         "live/A3",
         None,
     );
-    let (cancel, cancelled) = watch::channel(false);
-    let running = claude::run(&world.store, &a3, &third_turn, cancelled);
+    let stdout = third_turn.logs.join("stdout.jsonl");
+    let cancel = CancelLatch::new();
+    let running = claude::run(&world.store, &a3, &third_turn, &cancel);
+    let store = &world.store;
     let trigger = async {
+        // The tool is this turn's: its Bash tool_use, not refused, and a `sleep 120` that descends from this claude.
         let started = Instant::now();
-        let mut seen = Vec::new();
-        while started.elapsed() < Duration::from_secs(180) && seen.is_empty() {
+        let mut claude_pid = None;
+        let mut tools = Vec::new();
+        while started.elapsed() < Duration::from_secs(180) && tools.is_empty() {
             tokio::time::sleep(Duration::from_millis(200)).await;
-            seen = sleeps_in(&repo);
+            if claude_pid.is_none() {
+                claude_pid = store
+                    .reader()
+                    .ok()
+                    .and_then(|r| r.attempt("A3").ok().flatten())
+                    .and_then(|a| a.pid)
+                    .and_then(|p| u32::try_from(p).ok());
+            }
+            let Some(claude_pid) = claude_pid else {
+                continue;
+            };
+            if tool_started(&std::fs::read(&stdout).unwrap_or_default(), "sleep 120") {
+                tools = tool_sleeps(&repo, claude_pid);
+            }
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
-        // Still alive when the cancel is sent?
-        let alive: Vec<u32> = seen
+        let alive: Vec<u32> = tools
             .iter()
             .map(|(pid, _)| *pid)
-            .filter(|pid| sleeps_in(&repo).iter().any(|(p, _)| p == pid))
+            .filter(|pid| stat_of(*pid).is_some_and(|(state, _, _)| state != 'Z'))
             .collect();
         let at = Instant::now();
-        let _ = cancel.send(true);
-        (at, seen, alive)
+        let receipt = cancel.request();
+        (at, tools, alive, receipt)
     };
-    let (third, (at, seen, alive)) = tokio::join!(running, trigger);
+    let (third, (at, tools, alive, receipt)) = tokio::join!(running, trigger);
     let third = third?;
     let took = at.elapsed();
-    let left = third.pid.map(group_members).unwrap_or_default();
-    let mut stray = processes_in(&repo);
-    while !stray.is_empty() && at.elapsed() < Duration::from_secs(16) {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        stray = processes_in(&repo);
-    }
+    let claude_pid = third.pid.unwrap_or_default();
+    // Everything is gone within 16 s of the cancel: claude's group, the tool's process and group (zombies included),
+    // and any process working in the repository.
+    let mut left = Vec::new();
+    let cleared = clear_by(at, Duration::from_secs(16), || {
+        left = group_members(claude_pid);
+        left.extend(left_of(&tools));
+        left.extend(processes_in(&repo));
+        left.is_empty()
+    })
+    .await;
     let observations = json!({
         "turn3": {
-            "sleep_processes_seen": seen.iter().map(|(pid, pgid)| json!({"pid": pid, "pgid": pgid})).collect::<Vec<_>>(),
-            "alive_at_cancel": alive,
             "claude_pid": third.pid,
+            "tool_processes": tools.iter().map(|(pid, pgid)| json!({"pid": pid, "pgid": pgid})).collect::<Vec<_>>(),
+            "alive_at_cancel": alive,
+            "cancel_receipt": format!("{receipt:?}"),
             "cancel_to_end_ms": took.as_millis(),
-            "group_left": left,
-            "processes_left_in_repository": stray,
+            "cleared_after_ms": cleared.map(|d| d.as_millis()),
+            "left": left,
         }
     });
     if alive.is_empty() {
         problems.push(format!(
-            "turn 3: no `sleep 120` was alive in the repository when the cancel was sent (seen {seen:?})"
+            "turn 3: no `sleep 120` of this turn's Bash tool was alive when the cancel was sent (seen {tools:?})"
         ));
     }
-    if third.state != AttemptState::Cancelled
-        || took > Duration::from_secs(16)
-        || !left.is_empty()
-        || !stray.is_empty()
-    {
+    if third.state != AttemptState::Cancelled || cleared.is_none() {
         problems.push(format!(
-            "turn 3: {:?} after {took:?}, group {left:?}, processes in the repository {stray:?}",
+            "turn 3: {:?} after {took:?}; still there 16 s after the cancel: {left:?}",
             third.state
         ));
     }
@@ -312,4 +410,84 @@ async fn claude_live_turns_resume_and_cancel() -> R {
         write_verdict(&out, "FAIL", &problems.join("; "), &sessions, &observations)?;
         Err(problems.join("; ").into())
     }
+}
+
+// The observer's own checks (not live).
+
+#[test]
+fn a_tool_counts_only_with_its_unrefused_bash_tool_use() {
+    let frame = |v: serde_json::Value| format!("{v}\n");
+    let use_ = frame(json!({"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "sleep 120", "run_in_background": true}}
+    ]}}));
+    let ok = frame(json!({"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "t1", "content": "Command running in background"}
+    ]}}));
+    let refused = frame(json!({"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "t1", "is_error": true, "content": "Blocked: standalone sleep 120"}
+    ]}}));
+    let init = frame(json!({"type": "system", "subtype": "init"}));
+    assert!(tool_started(
+        format!("{init}{use_}{ok}").as_bytes(),
+        "sleep 120"
+    ));
+    assert!(tool_started(
+        format!("{init}{use_}").as_bytes(),
+        "sleep 120"
+    ));
+    assert!(
+        !tool_started(init.as_bytes(), "sleep 120"),
+        "no tool frames"
+    );
+    assert!(!tool_started(
+        format!("{init}{use_}{refused}").as_bytes(),
+        "sleep 120"
+    ));
+    assert!(!tool_started(
+        format!("{init}{use_}").as_bytes(),
+        "sleep 60"
+    ));
+}
+
+#[tokio::test]
+async fn the_observer_needs_descent_counts_zombies_and_keeps_its_deadline() -> R {
+    use std::os::unix::process::CommandExt;
+    let me = std::process::id();
+    // A child in a group of its own descends from this process; pid 1 does not.
+    let mut child = Command::new("sleep").arg("30").process_group(0).spawn()?;
+    let pid = child.id();
+    assert!(descends_from(pid, me));
+    assert!(!descends_from(1, me));
+    let group = stat_of(pid).ok_or("no stat")?.2;
+    assert_eq!(group, pid);
+    // Killed but not reaped, it is a zombie: still left.
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(i32::try_from(pid)?).ok_or("pid 0")?,
+        rustix::process::Signal::KILL,
+    )?;
+    let zombie = clear_by(Instant::now(), Duration::from_secs(5), || {
+        stat_of(pid).is_some_and(|(state, _, _)| state == 'Z')
+    })
+    .await;
+    assert!(zombie.is_some(), "never a zombie");
+    assert_eq!(left_of(&[(pid, group)]), [pid]);
+    // The pid itself counts, not only its group (no group has this id: it is above any pid_max).
+    assert_eq!(left_of(&[(pid, 4_000_000_000)]), [pid]);
+    child.wait()?;
+    assert!(left_of(&[(pid, group)]).is_empty());
+    // Cleared only if seen clear by the bound; a check that clears later is too late.
+    let at = Instant::now();
+    assert_eq!(
+        clear_by(at, Duration::from_millis(300), || false).await,
+        None
+    );
+    let at = Instant::now();
+    let late = clear_by(at, Duration::from_millis(300), || {
+        at.elapsed() > Duration::from_millis(500)
+    })
+    .await;
+    assert_eq!(late, None);
+    let cleared = clear_by(Instant::now(), Duration::from_millis(300), || true).await;
+    assert!(cleared.is_some_and(|d| d <= Duration::from_millis(300)));
+    Ok(())
 }
