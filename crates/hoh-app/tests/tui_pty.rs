@@ -293,7 +293,8 @@ fn a_signal_while_output_is_held_leaves_later_input_for_the_shell() -> R {
 
 /// A slow link may split a sequence: what follows `ESC [` within half a second still completes it, so Up recalls
 /// the last input instead of typing `A`; a paste whose start marker comes in two parts is still one paste, not lines
-/// submitted one by one (M1T08R-20).
+/// submitted one by one (M1T08R-20). The gap starts once hoh has read the first part, so it is waited for
+/// (M1T08R-30).
 #[test]
 fn a_sequence_split_by_a_slow_link_is_still_one_key() -> R {
     let (home, project) = (tempfile::tempdir()?, tempfile::tempdir()?);
@@ -306,6 +307,7 @@ fn a_sequence_split_by_a_slow_link_is_still_one_key() -> R {
         (b"\x1b[20", b"0~line1\rline2\x1b[201~\r"),
     ] {
         s.pty.send(start)?;
+        s.pty.wait_until_read(WAIT)?;
         std::thread::sleep(Duration::from_millis(150));
         s.pty.send(rest)?;
     }

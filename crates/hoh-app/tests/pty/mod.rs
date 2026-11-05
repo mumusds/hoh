@@ -189,6 +189,19 @@ impl Pty {
         Ok(())
     }
 
+    /// Wait until the program has read everything typed so far (nothing left in the terminal's input queue).
+    pub fn wait_until_read(&self, timeout: Duration) -> R {
+        let slave = self.slave.as_ref().ok_or("the PTY is closed")?;
+        let end = Instant::now() + timeout;
+        while rustix::io::ioctl_fionread(slave)? != 0 {
+            if Instant::now() >= end {
+                return Err(format!("the input was not read within {timeout:?}").into());
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        Ok(())
+    }
+
     /// Type `bytes` as the user would.
     pub fn send(&mut self, bytes: &[u8]) -> R {
         let master = self.master.as_mut().ok_or("the terminal was hung up")?;
