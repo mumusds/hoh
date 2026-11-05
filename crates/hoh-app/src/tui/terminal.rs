@@ -1,58 +1,98 @@
 //! Entering and leaving the full-screen terminal, in one place (ADR-014 decision 2).
 //!
-//! Every step to undo is tracked on its own and cleared only once it is undone. The three escape sequences of the
-//! screen (bracketed paste off, normal screen, cursor shown) also record how much of each is out. So [`restore`]
-//! undoes what is left: a sequence that went out is never sent again (a second "leave the alternate screen" puts the
-//! saved cursor back over what was printed since), one cut short goes on from where it stopped, a failed step is
-//! retried by the next call, and raw mode is given back even when the screen fails (M1T08R-01/07).
+//! Every escape sequence the shell sends to enter or leave is a [`Step`]. Rules:
+//! - An undo is armed only once what it undoes is entirely out, so a terminal that never entered the alternate screen
+//!   is never told to leave it (M1T08R-09).
+//! - A sequence that went out is never sent again: a second "leave the alternate screen" puts the saved cursor back
+//!   over what was printed since (M1T08R-07).
+//! - A sequence cut short is sent again from its start after a CAN (0x18), which ends a sequence the terminal is still
+//!   parsing and does nothing otherwise. [`settle`] sends that CAN before any diagnostic, so text never lands inside a
+//!   cut sequence (M1T08R-08).
+//! - Raw mode has its own flag and is given back even when the screen fails (M1T08R-01).
 //!
-//! The sequences go to a duplicate of stdout without a buffer, and the TUI draws through [`Output`], whose buffer is
-//! dropped unwritten. Nothing of the TUI's waits in the process's stdout buffer to be flushed after the restore.
-//!
-//! [`restore`] is called on a normal exit (bounded retries; the result decides the exit code), by the guard on the
-//! way out, and by the panic hook before the panic message. Raw mode is crossterm's: it keeps the termios from
-//! before and writes it back, so `stty -g` is what it was.
+//! The sequences go to a duplicate of stdout without a buffer. The TUI draws through [`Output`], whose buffer is
+//! dropped unwritten, so nothing of the TUI waits in the process's stdout buffer to be flushed after the restore. The
+//! guard exists before the first step, so a partial entry is undone too (M1T08R-05). [`restore`] is called on a
+//! normal exit (bounded retries; the result decides the exit code), by the guard on the way out, and by the panic
+//! hook (retries, then the message). Raw mode is crossterm's: it keeps the termios from before and writes it back, so
+//! `stty -g` is what it was.
 
 use ratatui::crossterm::Command;
 use ratatui::crossterm::cursor::Show;
 use ratatui::crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
-use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use std::fs::File;
 use std::io::{self, Write};
 use std::os::fd::AsFd;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-/// One escape sequence of the restore: still to send, and how many of its bytes are out.
+/// Cancel: ends an escape sequence under way, ignored otherwise.
+const CAN: u8 = 0x18;
+
+/// One escape sequence: still to send, and whether a try of it was cut short (the terminal may be inside it).
 #[derive(Debug)]
 pub struct Step {
     pending: AtomicBool,
-    sent: AtomicUsize,
+    cut: AtomicBool,
 }
 
 impl Step {
     pub const fn new() -> Step {
         Step {
             pending: AtomicBool::new(false),
-            sent: AtomicUsize::new(0),
+            cut: AtomicBool::new(false),
         }
     }
 
-    /// To be sent, from the start.
-    pub fn arm(&self) {
-        self.sent.store(0, Ordering::SeqCst);
+    fn arm(&self) {
+        self.cut.store(false, Ordering::SeqCst);
         self.pending.store(true, Ordering::SeqCst);
     }
 
-    pub fn is_pending(&self) -> bool {
+    fn is_pending(&self) -> bool {
         self.pending.load(Ordering::SeqCst)
+    }
+
+    fn is_cut(&self) -> bool {
+        self.cut.load(Ordering::SeqCst)
     }
 }
 
-/// Bracketed paste off, normal screen, cursor shown: in this order.
-static SCREEN: [Step; 3] = [Step::new(), Step::new(), Step::new()];
+/// The sequences of entering and of leaving, in their orders.
+#[derive(Debug)]
+pub struct Steps {
+    enter_screen: Step,
+    enter_paste: Step,
+    paste_off: Step,
+    leave_screen: Step,
+    show: Step,
+}
+
+impl Steps {
+    pub const fn new() -> Steps {
+        Steps {
+            enter_screen: Step::new(),
+            enter_paste: Step::new(),
+            paste_off: Step::new(),
+            leave_screen: Step::new(),
+            show: Step::new(),
+        }
+    }
+
+    fn all(&self) -> [&Step; 5] {
+        [
+            &self.enter_screen,
+            &self.enter_paste,
+            &self.paste_off,
+            &self.leave_screen,
+            &self.show,
+        ]
+    }
+}
+
+static STEPS: Steps = Steps::new();
 /// Raw mode is on.
 static RAW: AtomicBool = AtomicBool::new(false);
 
@@ -65,6 +105,76 @@ fn ansi(command: impl Command) -> Vec<u8> {
 /// A duplicate of stdout without a buffer.
 fn terminal_out() -> io::Result<File> {
     Ok(File::from(io::stdout().as_fd().try_clone_to_owned()?))
+}
+
+/// Send `bytes` for `step` if it is pending: from the start, after a CAN if an earlier try was cut short. It is done
+/// once all is out; a try that fails after some bytes marks it cut.
+fn send(out: &mut impl Write, step: &Step, bytes: &[u8]) -> io::Result<()> {
+    if !step.is_pending() {
+        return Ok(());
+    }
+    let mut data = Vec::with_capacity(bytes.len() + 1);
+    if step.is_cut() {
+        data.push(CAN);
+    }
+    data.extend_from_slice(bytes);
+    let mut sent = 0;
+    while let Some(rest) = data.get(sent..).filter(|rest| !rest.is_empty()) {
+        let failure = match out.write(rest) {
+            Ok(0) => io::ErrorKind::WriteZero.into(),
+            Ok(n) => {
+                sent += n;
+                continue;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => e,
+        };
+        if sent > 0 {
+            step.cut.store(true, Ordering::SeqCst);
+        }
+        return Err(failure);
+    }
+    out.flush()?;
+    step.cut.store(false, Ordering::SeqCst);
+    step.pending.store(false, Ordering::SeqCst);
+    Ok(())
+}
+
+/// Enter the alternate screen, then bracketed paste; each undo is armed once its entry is entirely out (the cursor
+/// with the screen: ratatui hides it there).
+pub fn open(out: &mut impl Write, steps: &Steps) -> io::Result<()> {
+    steps.enter_screen.arm();
+    send(out, &steps.enter_screen, &ansi(EnterAlternateScreen))?;
+    steps.leave_screen.arm();
+    steps.show.arm();
+    steps.enter_paste.arm();
+    send(out, &steps.enter_paste, &ansi(EnableBracketedPaste))?;
+    steps.paste_off.arm();
+    Ok(())
+}
+
+/// Give up an entry that did not finish (a CAN ends it if it was cut), then bracketed paste off, normal screen and
+/// cursor shown, as far as armed; stops at the first error (later steps wait for the earlier ones).
+pub fn close(out: &mut impl Write, steps: &Steps) -> io::Result<()> {
+    send(out, &steps.enter_screen, b"")?;
+    send(out, &steps.enter_paste, b"")?;
+    send(out, &steps.paste_off, &ansi(DisableBracketedPaste))?;
+    send(out, &steps.leave_screen, &ansi(LeaveAlternateScreen))?;
+    send(out, &steps.show, &ansi(Show))
+}
+
+/// Before text that is not ours goes to the terminal: a CAN if a sequence was cut short (best effort).
+pub fn settle_on(out: &mut impl Write, steps: &Steps) {
+    if steps.all().iter().any(|s| s.is_cut()) {
+        let _ = out.write_all(&[CAN]).and_then(|()| out.flush());
+    }
+}
+
+/// [`settle_on`] the terminal, before a diagnostic.
+pub fn settle() {
+    if let Ok(mut out) = terminal_out() {
+        settle_on(&mut out, &STEPS);
+    }
 }
 
 /// Restores the terminal when dropped (a retry if [`Guard::finish`] was not reached or failed). It exists from the
@@ -89,29 +199,19 @@ impl Drop for Guard {
 /// was done.
 pub fn enter() -> (Guard, io::Result<()>) {
     let guard = Guard(());
-    let entered = (|| {
-        enable_raw_mode()?;
+    let entered = enable_raw_mode().and_then(|()| {
         RAW.store(true, Ordering::SeqCst);
-        for step in &SCREEN {
-            step.arm();
-        }
-        execute!(terminal_out()?, EnterAlternateScreen, EnableBracketedPaste)
-    })();
+        open(&mut terminal_out()?, &STEPS)
+    });
     (guard, entered)
 }
 
 /// Leave the alternate screen, show the cursor and give back the terminal's attributes, as far as still to do.
 pub fn restore() -> io::Result<()> {
-    let sequences = [
-        ansi(DisableBracketedPaste),
-        ansi(LeaveAlternateScreen),
-        ansi(Show),
-    ];
-    let sequences = sequences.each_ref().map(Vec::as_slice);
     undo(
         || {
-            if SCREEN.iter().any(Step::is_pending) {
-                send(&mut terminal_out()?, &SCREEN, &sequences)
+            if STEPS.all().iter().any(|s| s.is_pending()) {
+                close(&mut terminal_out()?, &STEPS)
             } else {
                 Ok(())
             }
@@ -136,31 +236,6 @@ pub fn undo(
     screen.and(raw)
 }
 
-/// Write what is left of each pending step, in order; a step is done once all its bytes are out. Stops at the
-/// first error, so later steps wait for the earlier ones.
-pub fn send(out: &mut impl Write, steps: &[Step], sequences: &[&[u8]]) -> io::Result<()> {
-    for (step, bytes) in steps.iter().zip(sequences) {
-        if !step.is_pending() {
-            continue;
-        }
-        let mut sent = step.sent.load(Ordering::SeqCst);
-        while let Some(rest) = bytes.get(sent..).filter(|rest| !rest.is_empty()) {
-            match out.write(rest) {
-                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-                Ok(n) => {
-                    sent += n;
-                    step.sent.store(sent, Ordering::SeqCst);
-                }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e),
-            }
-        }
-        out.flush()?;
-        step.pending.store(false, Ordering::SeqCst);
-    }
-    Ok(())
-}
-
 /// `attempt` until it succeeds, at most `tries` times; the last error.
 pub fn with_retries(tries: usize, mut attempt: impl FnMut() -> io::Result<()>) -> io::Result<()> {
     let mut last = Ok(());
@@ -173,11 +248,12 @@ pub fn with_retries(tries: usize, mut attempt: impl FnMut() -> io::Result<()>) -
     last
 }
 
-/// Restore the terminal before the current panic hook prints its message.
+/// Restore the terminal (with retries) before the current panic hook prints its message.
 pub fn restore_on_panic() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        if let Err(e) = restore() {
+        if let Err(e) = with_retries(3, restore) {
+            settle();
             eprintln!("hoh：终端未能恢复：{e}；可运行 stty sane 或 reset");
         }
         previous(info);
@@ -208,7 +284,8 @@ impl Write for Output {
         Ok(bytes.len())
     }
 
-    /// A frame that fails is not written again (part of it may be out); the next frame and the error follow.
+    /// A frame that fails is not written again (part of it may be out; the restore's first sequence starts with ESC,
+    /// which ends anything left open); the error follows.
     fn flush(&mut self) -> io::Result<()> {
         let frame = std::mem::take(&mut self.buffer);
         self.out.write_all(&frame)

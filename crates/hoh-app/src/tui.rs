@@ -65,6 +65,7 @@ pub fn run(project: &Path) -> u8 {
     // Loaded after the restore: a signal that came while restoring decides too (M1T08R-06).
     let (code, message) = outcome(end, restored, signal.load(Ordering::SeqCst));
     if let Some(message) = message {
+        terminal::settle();
         eprintln!("hoh：{message}");
     }
     code
