@@ -11,7 +11,7 @@ mod pty;
 
 use hoh_core::persistence::selftest::{PROBE_ARG, ProbeCommand};
 use hoh_core::persistence::{Options, Store};
-use pty::{Pty, R, exit_within, processes_in, tree};
+use pty::{Hoh, Pty, R, exit_within, processes_in, tree};
 use std::fs::File;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -83,7 +83,7 @@ fn test_001_03_without_a_terminal_bare_hoh_is_a_usage_error() -> R {
 
     // 1. No controlling terminal (a new session without one), stdin /dev/null, stdout and stderr files.
     let (out, err) = (files.path().join("out"), files.path().join("err"));
-    let mut child = Command::new("setsid")
+    let mut child = Hoh(Command::new("setsid")
         .arg(env!("CARGO_BIN_EXE_hoh"))
         .current_dir(&project)
         .env_clear()
@@ -92,7 +92,7 @@ fn test_001_03_without_a_terminal_bare_hoh_is_a_usage_error() -> R {
         .stdin(Stdio::null())
         .stdout(File::create(&out)?)
         .stderr(File::create(&err)?)
-        .spawn()?;
+        .spawn()?);
     let status = exit_within(&mut child, Duration::from_secs(10))?;
     assert_eq!(status.code(), Some(64), "no terminal at all");
     assert_eq!(std::fs::read(&out)?, b"", "stdout");
@@ -102,7 +102,7 @@ fn test_001_03_without_a_terminal_bare_hoh_is_a_usage_error() -> R {
     // 2. In a PTY (its controlling terminal, stdin and stderr) with only stdout redirected to a file.
     let pty = Pty::new(30, 100)?;
     let out = files.path().join("out2");
-    let mut child = Command::new("setsid")
+    let mut child = Hoh(Command::new("setsid")
         .arg("--ctty")
         .arg(env!("CARGO_BIN_EXE_hoh"))
         .current_dir(&project)
@@ -113,7 +113,7 @@ fn test_001_03_without_a_terminal_bare_hoh_is_a_usage_error() -> R {
         .stdin(pty.stdio()?)
         .stdout(File::create(&out)?)
         .stderr(pty.stdio()?)
-        .spawn()?;
+        .spawn()?);
     let status = exit_within(&mut child, Duration::from_secs(10))?;
     assert_eq!(status.code(), Some(64), "stdout redirected");
     assert_eq!(std::fs::read(&out)?, b"", "stdout");

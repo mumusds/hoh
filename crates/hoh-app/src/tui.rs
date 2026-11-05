@@ -25,6 +25,7 @@ use std::time::Duration;
 const TICK: Duration = Duration::from_millis(100);
 
 /// What ended the loop.
+#[derive(Debug, PartialEq, Eq)]
 enum End {
     Left(Exit),
     Signal(usize),
@@ -58,20 +59,45 @@ pub fn run(project: &Path) -> u8 {
     );
     let mut app = App::new(name, History::load(project));
     terminal::restore_on_panic();
-    let result = terminal::enter().and_then(|guard| {
-        let end = event_loop(&mut app, &signal);
-        drop(guard);
-        end
-    });
-    match result {
-        Ok(End::Left(Exit::Detach)) => 0,
-        Ok(End::Signal(sig)) => signal_code(sig),
-        // A hangup also makes the terminal fail: the signal decides.
-        Err(_) if signal.load(Ordering::SeqCst) != 0 => signal_code(signal.load(Ordering::SeqCst)),
-        Err(e) => {
-            eprintln!("hoh：终端读写失败，TUI 已退出：{e}");
-            code(ClientEvent::TerminalIo)
+    let (code, message) = match terminal::enter() {
+        Ok(guard) => {
+            let end = event_loop(&mut app, &signal);
+            let restored = guard.finish();
+            outcome(end, restored, signal.load(Ordering::SeqCst))
         }
+        Err(e) => outcome(Err(e), Ok(()), signal.load(Ordering::SeqCst)),
+    };
+    if let Some(message) = message {
+        eprintln!("hoh：{message}");
+    }
+    code
+}
+
+/// The exit code of a way out and what to say on stderr (ADR-014 decision 3): a received signal decides the code (a
+/// hangup also makes the terminal fail); otherwise a failing terminal or a restore that did not complete is 74, never
+/// 0.
+fn outcome(
+    end: std::io::Result<End>,
+    restored: std::io::Result<()>,
+    signal: usize,
+) -> (u8, Option<String>) {
+    let not_restored = restored
+        .err()
+        .map(|e| format!("终端未能恢复：{e}；可运行 stty sane 或 reset"));
+    match end {
+        Ok(End::Signal(sig)) => (signal_code(sig), not_restored),
+        Err(_) if signal != 0 => (signal_code(signal), not_restored),
+        Ok(End::Left(Exit::Detach)) => match not_restored {
+            None => (0, None),
+            Some(m) => (code(ClientEvent::TerminalIo), Some(m)),
+        },
+        Err(e) => (
+            code(ClientEvent::TerminalIo),
+            Some(match not_restored {
+                None => format!("终端读写失败，TUI 已退出：{e}"),
+                Some(m) => format!("终端读写失败，TUI 已退出：{e}；{m}"),
+            }),
+        ),
     }
 }
 

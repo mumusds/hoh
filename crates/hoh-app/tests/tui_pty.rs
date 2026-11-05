@@ -15,10 +15,9 @@
 
 mod pty;
 
-use pty::{Pty, R, exit_within, find, signal, spawn_in, tree};
+use pty::{Hoh, Pty, R, exit_within, find, signal, spawn_in, tree};
 use rustix::process::Signal;
 use std::path::Path;
-use std::process::Child;
 use std::time::Duration;
 
 const ENTER_ALT: &[u8] = b"\x1b[?1049h";
@@ -26,9 +25,10 @@ const LEAVE_ALT: &[u8] = b"\x1b[?1049l";
 const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
 const WAIT: Duration = Duration::from_secs(10);
 
+/// Fields drop in order: `hoh` is stopped before its PTY is closed.
 struct Session {
+    child: Hoh,
     pty: Pty,
-    child: Child,
     baseline: String,
 }
 
@@ -36,6 +36,7 @@ struct Session {
 fn open(project: &Path, home: &Path, env: &[(&str, &str)]) -> R<Session> {
     let pty = Pty::new(30, 100)?;
     let baseline = pty.stty()?;
+    // From here on a failure drops `child`, which stops `hoh`.
     let child = spawn_in(&pty, project, home, &[], env)?;
     let name = project
         .file_name()
@@ -45,8 +46,8 @@ fn open(project: &Path, home: &Path, env: &[(&str, &str)]) -> R<Session> {
     pty.wait_for("AUTO", 0, WAIT)?;
     pty.wait_for("host 离线", 0, WAIT)?;
     Ok(Session {
-        pty,
         child,
+        pty,
         baseline,
     })
 }
@@ -175,5 +176,23 @@ fn sigint_from_outside_restores_the_terminal_and_exits_130() -> R {
     let s = open(project.path(), home.path(), &[])?;
     signal(&s.child, Signal::INT)?;
     assert_eq!(s.ended()?, Some(130));
+    Ok(())
+}
+
+#[test]
+fn a_test_that_fails_early_leaves_no_hoh_behind() -> R {
+    let (home, project) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    let s = open(project.path(), home.path(), &[])?;
+    let pid = s.child.0.id();
+    assert!(
+        s.pty
+            .wait_for("never drawn", 0, Duration::from_millis(200))
+            .is_err()
+    );
+    drop(s);
+    assert!(
+        !Path::new(&format!("/proc/{pid}")).exists(),
+        "hoh {pid} is still there"
+    );
     Ok(())
 }
