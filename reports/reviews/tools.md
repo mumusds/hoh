@@ -77,3 +77,9 @@ Mutation check: dropping the strip from `child_env`, keeping a variable in the N
 |---|---|---|---|
 | TB-08 | medium | test_tools.py:154 — the recorder's `#!/usr/bin/env -S <interpreter>` split an interpreter path with a space, so the bundle self-test failed (rc 127) in a checkout on such a path; a regression of `a7dcb39`. | Fixed: the recorder is a `.py` file started by a `/bin/sh` shim that execs the quoted interpreter and recorder. Verified with a venv on a path with a space. |
 | TB-09 | low | test_tools.py:145 — reading constant keys from the syntax tree missed keys built otherwise (an f-string, `**`, a key set after the dict), and the disposition of TB-07 claimed "however they are spelt". | Fixed by a behavioural test instead: `CandidateAndChecks.test_the_check_variables_are_those_run_check_sets` runs a real check through run_check, with every outer `HOH_` variable removed, whose command records the `HOH_` variables it sees; they must be exactly `CHECK_VARIABLES`. An f-string key and a key set after the dict both fail it now. TB-07's disposition above overstated the syntax-tree test. |
+
+### Round 4 (focused on TB-08, TB-09, fresh Codex session)
+
+- Agent: `codex` codex-cli 0.166.0 with `--model gpt-6.1-sol`, session `01a1ad98-3ad1-7ca2-be52-76dc10fe2949`, 311 s; attempt record sha256 `37915746d525bf9c13509001f59ec768171b80e5efa380e2a29bb75807647fa9`, stdout sha256 `0d6809cd3a018129e2d477d362207cffb3e2f5bafdd87296bd65244b1bec4811`.
+- Scope: `a7dcb39..9438f58`; both guard tests against their regressions, machine dependence (spaced or odd interpreter paths, outer `HOH_` variables, PATH), the restoring of `os.environ`, the new PLAN entry's effect on the other CandidateAndChecks tests.
+- Verdict: **PASS**, no findings.
