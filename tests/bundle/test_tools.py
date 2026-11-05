@@ -138,16 +138,29 @@ class NativeBridge(unittest.TestCase):
         self.assertEqual([s['session_id'] for s in load_json(ev/'live-sessions.json')['sessions']],['mock-thread'])
         self.assertTrue(set(CHECK_VARS)<=set(load_json(self.root/'a3/attempt.json')['env_removed']))
     def test_the_check_variables_are_those_run_check_sets(self):
-        # TB-01: one list for the bridge, the bundle self-test and check.sh, equal to what run_check.py exports.
-        import re
-        text=(ROOT/'tools/run_check.py').read_text();block=text[text.index("env=os.environ|{"):]
-        block=block[:block.index('}')]
-        self.assertEqual(set(re.findall(r"'(HOH_[A-Z0-9_]+)'",block)),set(CHECK_VARS))
+        # TB-01, TB-07: one list for the bridge, the bundle self-test and check.sh, equal to the keys of the dict
+        # run_check.py merges into the check's environment (read from its syntax tree, however they are spelt).
+        import ast
+        tree=ast.parse((ROOT/'tools/run_check.py').read_text())
+        exported=[{k.value for k in node.value.right.keys if isinstance(k,ast.Constant)}
+                  for node in ast.walk(tree) if isinstance(node,ast.Assign) and any(getattr(t,'id',None)=='env' for t in node.targets)
+                  and isinstance(node.value,ast.BinOp) and isinstance(node.value.right,ast.Dict)]
+        self.assertEqual(exported,[set(CHECK_VARS)])
     def test_the_bundle_self_test_unsets_every_check_variable(self):
-        # TB-03: scripts/check.sh --bundle starts the unittest run without any of run_check's variables.
-        text=(ROOT/'scripts/check.sh').read_text();bundle=text[text.index(' --bundle)'):]
-        bundle=bundle[:bundle.index(';;')];run=bundle[:bundle.index('unittest discover -s tests/bundle')]
-        self.assertEqual({v for v in CHECK_VARS if f'-u {v} ' in run},set(CHECK_VARS),run)
+        # TB-03, TB-06: scripts/check.sh --bundle, run in a copy whose python3 records how it was started, starts the
+        # unittest run without any of run_check's variables.
+        (self.root/'scripts').mkdir();shutil.copy(ROOT/'scripts/check.sh',self.root/'scripts/check.sh')
+        calls=self.root/'calls.jsonl'
+        (self.bin/'python3').write_text('#!/usr/bin/env -S '+sys.executable+'\nimport json,os,sys\n'
+            'open(os.environ["CALLS"],"a").write(json.dumps({"argv":sys.argv[1:],"env":sorted(os.environ)})+"\\n")\n')
+        (self.bin/'python3').chmod(0o755)
+        outer=dict.fromkeys(CHECK_VARS,'x')|{'CALLS':str(calls)}
+        p=subprocess.run(['bash',str(self.root/'scripts/check.sh'),'--bundle'],capture_output=True,text=True,env=self.env|outer,timeout=20)
+        self.assertEqual(p.returncode,0,p.stderr)
+        runs=[json.loads(l) for l in calls.read_text().splitlines()]
+        [unittest_run]=[r for r in runs if r['argv'][:2]==['-m','unittest']]
+        self.assertFalse(set(CHECK_VARS)&set(unittest_run['env']),unittest_run['env'])
+        self.assertTrue(all(set(CHECK_VARS)<=set(r['env']) for r in runs if r is not unittest_run),'the other steps keep the environment')
     def test_grok_error_result_fails_the_turn_despite_a_zero_exit(self):
         p,out=self.bridge(agent='grok',mode='semantic-error');self.assertEqual(p.returncode,1,p.stderr);r=load_json(out/'attempt.json')
         self.assertEqual((r['status'],r['exit_code'],r['terminal_observed'],r['native_error_observed']),('NATIVE_FAILED',0,True,True))

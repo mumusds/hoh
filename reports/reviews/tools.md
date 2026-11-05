@@ -55,3 +55,14 @@ Found by the M1-T08 round-7 reviewer: with run_check's variables in the environm
 | TB-05 | low | test_bundle.py:164 (outside the diff) — `test_offline_setup_idempotent` ran the copied bootstrap with the test's own working directory, so preflight's real `pi --version` let a user-level pi extension write `.pi-lens-probe-home/` into the repository. | Fixed: the scripts run in the copy (`cwd=self.root`). Not reproduced on this VM; the change makes it impossible by construction. |
 
 Mutation check: dropping the strip from `child_env`, keeping a variable in the NativeBridge environment, removing one `-u` from check.sh and leaving a variable out of the list each make a new test fail (4/4).
+
+### Round 2 (focused, fresh Codex session)
+
+- Agent: `codex` codex-cli 0.166.0 with `--model gpt-6.1-sol`, session `01a1ad7e-54b0-7803-bba7-175aca0b9edb`, 464 s; attempt record sha256 `b695700e0e5dbeacdb80833c202086fcf01ec85728fdec99e9a799c70bb36e11`, stdout sha256 `3f2f59b8248c09ccc186996e5b9a4af68b45de94cff80ec4fe38fed231e852b5`.
+- Scope: `2e17782..f3bd36d` and the whole branch; what stripping the variables from native sessions means for independent-qa/review, adapter-live, live-sessions.json, report binding and the release gate's provenance checks; the new tests against mutated copies.
+- Verdict: **PASS** (2 low). TB-01..05 resolved.
+
+| ID | Severity | Summary | Disposition |
+|---|---|---|---|
+| TB-06 | low | test_tools.py:148 — the check.sh test only searched for the `-u` text: with the whole `env` command commented out it still passed. | Fixed: the test runs a copy of check.sh whose `python3` records its argv and environment, and asserts the unittest run has none of the six variables while the other steps keep them. |
+| TB-07 | low | test_tools.py:143 — the regex over run_check.py read single-quoted keys only. | Fixed: the keys are read from run_check.py's syntax tree (the dict merged into `env`). Both reviewer mutants (the `env -u` removed, a double-quoted key added) now fail the tests. |
