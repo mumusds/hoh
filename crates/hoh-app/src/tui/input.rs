@@ -259,6 +259,11 @@ fn csi(buf: &[u8]) -> Front {
 /// `1;5:3C` its release). The event type is a number, as in crossterm (M1T08R-28); a modifier that is no number
 /// makes a plain press whatever follows it, crossterm's fallback (M1T08R-35).
 fn csi_key(params: &[u8], fin: u8) -> Option<Event> {
+    // Only what crossterm's `parse_csi` hands on to a key parser: no parameters, or parameters that start with a
+    // digit or `;` (`<` is a mouse report, `?` a terminal's answer, anything else no key; M1T08R-39).
+    if !matches!(params.first(), None | Some(b'0'..=b'9' | b';')) {
+        return None;
+    }
     let text = std::str::from_utf8(params).ok()?;
     let mut fields = text.split(';');
     let first = fields.next().unwrap_or_default();
@@ -687,6 +692,28 @@ mod tests {
                 (KeyCode::Char('x'), N, Press),
             ]
         );
+    }
+
+    /// Parameters that start with anything but a digit or `;` (`?`, `<`, `=`, `>`, `+`) make no key, as crossterm's
+    /// `parse_csi` hands only those on to its key parsers, however the bytes arrive (M1T08R-39).
+    #[test]
+    fn a_csi_whose_parameters_start_otherwise_is_no_key() {
+        let bytes = b"\x1b[+13ux\x1b[?1Dy\x1b[=5Az\x1b[>1;5C!\x1b[<0;1;1M.";
+        let keys = [
+            k(KeyCode::Char('x'), N),
+            k(KeyCode::Char('y'), N),
+            k(KeyCode::Char('z'), N),
+            k(KeyCode::Char('!'), N),
+            k(KeyCode::Char('.'), N),
+        ];
+        assert_eq!(all(bytes, false), keys);
+        let mut d = Decoder::default();
+        let mut one_by_one = Vec::new();
+        for b in bytes {
+            d.feed(&[*b]);
+            one_by_one.extend(std::iter::from_fn(|| d.next(false)));
+        }
+        assert_eq!(one_by_one, keys);
     }
 
     /// A CSI u whose codepoint is no Unicode scalar value is no key, whatever its alternate (M1T08R-29).
