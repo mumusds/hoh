@@ -140,7 +140,11 @@ impl Sandbox {
     }
 
     fn claude(&self, status: Status) -> R {
-        let help = fixtures().join("claude/2.1.318/help.txt");
+        self.claude_with_help(status, &fixtures().join("claude/2.1.318/help.txt"))
+    }
+
+    /// A claude whose `--help` is the file `help`.
+    fn claude_with_help(&self, status: Status, help: &Path) -> R {
         let answer = self.status(
             status,
             "echo '{\"loggedIn\": true, \"authMethod\": \"claude.ai\"}'\nexit 0\n",
@@ -162,7 +166,11 @@ impl Sandbox {
 
     /// A pi whose `list` runs `list` (shell).
     fn pi_listing(&self, status: Status, list: &str) -> R {
-        let help = fixtures().join("pi/1.5.0/help.txt");
+        self.pi_with(status, list, &fixtures().join("pi/1.5.0/help.txt"))
+    }
+
+    /// A pi whose `list` runs `list` (shell) and whose `--help` is the file `help`.
+    fn pi_with(&self, status: Status, list: &str, help: &Path) -> R {
         let answer = self.status(
             status,
             "echo '{\"status\":\"ready\",\"provider\":\"fake-provider\",\"authType\":\"api_key\"}'\nexit 0\n",
@@ -262,6 +270,51 @@ fn processes_mentioning(dir: &Path) -> Vec<String> {
         .map(|c| String::from_utf8_lossy(&c).replace('\0', " "))
         .filter(|c| c.contains(&needle))
         .collect()
+}
+
+/// An installed CLI its adapter cannot start is incompatible and blocks (exit 3), for every agent and not only codex
+/// (REQ-006; M1R-03): claude without `--output-format`, pi without `--session-id` or `--session-dir`. The probe refuses
+/// it, so no compat manifest entry can make it compatible.
+#[test]
+fn a_cli_without_what_its_adapter_needs_is_incompatible() -> R {
+    for (agent, fixture, flag) in [
+        ("claude", "claude/2.1.318/help.txt", "--output-format"),
+        ("pi", "pi/1.5.0/help.txt", "--session-id"),
+        ("pi", "pi/1.5.0/help.txt", "--session-dir"),
+    ] {
+        let s = Sandbox::new()?;
+        s.codex(Status::LoggedIn)?;
+        let recorded = std::fs::read_to_string(fixtures().join(fixture))?;
+        let help: String = recorded
+            .lines()
+            .filter(|l| !l.contains(flag))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let help_file = s.home.path().join("help.txt");
+        std::fs::write(&help_file, help)?;
+        if agent == "claude" {
+            s.claude_with_help(Status::LoggedIn, &help_file)?;
+            s.pi(Status::LoggedIn)?;
+        } else {
+            s.claude(Status::LoggedIn)?;
+            s.pi_with(
+                Status::LoggedIn,
+                "echo 'No packages installed.'",
+                &help_file,
+            )?;
+        }
+        let (out, report, _) = s.doctor()?;
+        let item = &report["agents"][agent];
+        assert_eq!(item["protocol"], "incompatible", "{agent} {flag}: {item}");
+        assert!(
+            item["protocol_detail"]
+                .as_str()
+                .is_some_and(|d| d.contains(flag)),
+            "{agent} {flag}: {item}"
+        );
+        assert_eq!(out.status.code(), Some(3), "{agent} {flag}");
+    }
+    Ok(())
 }
 
 #[test]

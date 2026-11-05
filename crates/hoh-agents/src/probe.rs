@@ -184,10 +184,12 @@ fn probe_codex(
     let app = run(launcher, &["app-server", "--help"], env)?;
     let mut help = exec_help.clone();
     if !app.status.success() {
-        if !contains(&exec_help, "--json") {
+        if let Some(why) =
+            crate::codex::exec_interface_missing(&String::from_utf8_lossy(&exec_help))
+        {
             return Err(ProbeError::Unsupported {
                 agent: Agent::Codex,
-                detail: "neither app-server nor exec --json".to_owned(),
+                detail: format!("no app-server, and {why}"),
             });
         }
         set(caps, "structured_events", true);
@@ -425,10 +427,11 @@ fn probe_claude(
     caps: &mut BTreeMap<String, Option<bool>>,
 ) -> Result<Probed, ProbeError> {
     let help = run_ok(launcher, &["--help"], env)?.stdout;
-    if !contains(&help, "stream-json") {
+    // What the adapter needs to start a turn, by its own rule (M1R-03).
+    if let Some(detail) = crate::claude::interface_missing(&String::from_utf8_lossy(&help)) {
         return Err(ProbeError::Unsupported {
             agent: Agent::Claude,
-            detail: "no stream-json output format".to_owned(),
+            detail,
         });
     }
     set(caps, "structured_events", true);
@@ -448,10 +451,11 @@ fn probe_pi(
     caps: &mut BTreeMap<String, Option<bool>>,
 ) -> Result<Probed, ProbeError> {
     let help = run_ok(launcher, &["--help"], env)?.stdout;
-    if !(contains(&help, "--mode") && contains(&help, "rpc")) {
+    // What the adapter needs to start a turn, by its own rule (M1R-03).
+    if let Some(detail) = crate::pi::interface_missing(&String::from_utf8_lossy(&help)) {
         return Err(ProbeError::Unsupported {
             agent: Agent::Pi,
-            detail: "no --mode rpc".to_owned(),
+            detail,
         });
     }
     set(caps, "structured_events", true);

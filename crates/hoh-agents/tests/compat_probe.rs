@@ -186,6 +186,63 @@ fn test_027_01_probe_three_fake_binaries_into_a_valid_manifest() -> R {
     Ok(())
 }
 
+/// A CLI its adapter cannot start is refused by the probe, by the adapter's own rule (M1R-03): claude without
+/// `--output-format`, pi without `--session-id` or `--session-dir`. The recorded help minus every line naming the flag.
+#[test]
+fn a_cli_without_what_its_adapter_needs_is_unsupported() -> R {
+    let tmp = tempfile::tempdir()?;
+    for (agent, fixture, version, flag) in [
+        (
+            Agent::Claude,
+            "claude/2.1.318/help.txt",
+            "2.1.318 (Claude Code)",
+            "--output-format",
+        ),
+        (Agent::Pi, "pi/1.5.0/help.txt", "1.5.0", "--session-id"),
+        (Agent::Pi, "pi/1.5.0/help.txt", "1.5.0", "--session-dir"),
+    ] {
+        let recorded = std::fs::read_to_string(fixtures().join(fixture))?;
+        let help: String = recorded
+            .lines()
+            .filter(|l| !l.contains(flag))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert_ne!(help.len(), recorded.len(), "the recorded help names {flag}");
+        let group = format!("{}{flag}", agent.command());
+        let help_file = tmp.path().join(format!("{group}.txt"));
+        std::fs::write(&help_file, &help)?;
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n --version) echo '{version}';;\n --help) cat '{}';;\n *) exit 2;;\nesac\n",
+            help_file.display()
+        );
+        let (dir, _) = fake(tmp.path(), &group, agent.command(), &script)?;
+        match probe(agent, &env_for(&dir)) {
+            Err(ProbeError::Unsupported { detail, .. }) => {
+                assert!(detail.contains(flag), "{group}: {detail}");
+            }
+            other => return Err(format!("{group}: not refused: {other:?}").into()),
+        }
+    }
+    // A flag is a whole word: a codex without an App Server whose exec help offers `--json-lines` but not `--json`.
+    let exec_help = std::fs::read_to_string(fixtures().join("codex/0.166.0/help-exec.txt"))?
+        .replace("--json", "--json-lines");
+    let help_file = tmp.path().join("codex-exec-help.txt");
+    std::fs::write(&help_file, exec_help)?;
+    let script = format!(
+        "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.100.0';;\n exec) [ \"$2\" = --help ] && cat '{}';;\n \
+         *) echo \"error: unrecognized subcommand '$1'\" >&2; exit 2;;\nesac\n",
+        help_file.display()
+    );
+    let (dir, _) = fake(tmp.path(), "codex-json-lines", "codex", &script)?;
+    match probe(Agent::Codex, &env_for(&dir)) {
+        Err(ProbeError::Unsupported { detail, .. }) => {
+            assert!(detail.contains("--json"), "{detail}")
+        }
+        other => return Err(format!("codex --json-lines: not refused: {other:?}").into()),
+    }
+    Ok(())
+}
+
 #[test]
 fn probe_fails_cleanly_when_the_cli_is_missing() -> R {
     let tmp = tempfile::tempdir()?;

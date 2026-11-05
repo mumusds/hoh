@@ -69,13 +69,19 @@ pub struct Argv {
     pub capabilities: Value,
 }
 
+/// Why this claude's help gives the adapter no way to run a turn at all (no `--output-format` with `stream-json`), or
+/// `None`. The probe applies the same rule, so doctor never calls a claude compatible that the adapter cannot drive
+/// (M1R-03).
+pub fn interface_missing(help: &str) -> Option<String> {
+    (!offers(help, "--output-format") || !help.contains("stream-json")).then(|| {
+        "claude --help offers no --output-format stream-json (protocol incompatible)".to_owned()
+    })
+}
+
 /// The argv of a turn, or why it cannot start.
 pub fn argv(launch: &Launch) -> Result<Argv, Blocked> {
-    if !offers(&launch.help, "--output-format") || !launch.help.contains("stream-json") {
-        return Err(Blocked(
-            "claude --help offers no --output-format stream-json (protocol incompatible)"
-                .to_owned(),
-        ));
+    if let Some(why) = interface_missing(&launch.help) {
+        return Err(Blocked(why));
     }
     let partial = offers(&launch.help, PARTIAL_FLAG);
     let resume = offers(&launch.help, "--resume");

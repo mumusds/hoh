@@ -66,12 +66,23 @@ pub struct Launch {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Blocked(pub String);
 
+/// Why this pi's help gives the adapter no way to run a turn at all (no `--mode` with `rpc`, no `--session-dir` or
+/// `--session-id`), or `None`. The probe applies the same rule, so doctor never calls a pi compatible that the adapter
+/// cannot drive (M1R-03).
+pub fn interface_missing(help: &str) -> Option<String> {
+    if let Some(flag) = ["--mode", "--session-dir", "--session-id"]
+        .into_iter()
+        .find(|flag| !offers(help, flag))
+    {
+        return Some(format!("pi --help offers no {flag}"));
+    }
+    (!help.contains("rpc")).then(|| "pi --help offers no rpc mode".to_owned())
+}
+
 /// The arguments of `pi --mode rpc` on the session (never `--no-session`).
 pub fn args(launch: &Launch) -> Result<Vec<String>, Blocked> {
-    for flag in ["--mode", "--session-dir", "--session-id"] {
-        if !offers(&launch.help, flag) {
-            return Err(Blocked(format!("pi --help offers no {flag}")));
-        }
+    if let Some(why) = interface_missing(&launch.help) {
+        return Err(Blocked(why));
     }
     let mut args = vec![
         "--mode".to_owned(),

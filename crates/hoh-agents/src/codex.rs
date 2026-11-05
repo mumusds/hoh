@@ -107,6 +107,12 @@ pub fn exec_resumable(launch: &Launch) -> bool {
             .all(|flag| !offers(&launch.exec_help, flag) || offers(help, flag))
 }
 
+/// Why this `codex exec --help` gives the exec fallback no way to run a turn (no `--json`), or `None`; the probe applies
+/// the same rule (M1R-03).
+pub fn exec_interface_missing(help: &str) -> Option<String> {
+    (!offers(help, "--json")).then(|| "codex exec --help offers no --json".to_owned())
+}
+
 /// The arguments of `codex exec --json` (or `codex exec resume --json ... <thread>`), the prompt on stdin.
 pub fn exec_args(launch: &Launch) -> Result<Vec<String>, Blocked> {
     let help = match &launch.resume {
