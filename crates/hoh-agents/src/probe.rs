@@ -793,6 +793,8 @@ fn capture(
             argv: argv(program, args),
         });
     }
+    // One absolute end for the retries below and the wait after the start (M1T07R-11).
+    let end = Instant::now() + limit;
     let spawn = || {
         Command::new(program)
             .args(args)
@@ -809,12 +811,24 @@ fn capture(
     };
     // ETXTBSY is transient: a process forked elsewhere still holds a just-written executable open for writing until
     // it execs (a known Linux race when files are written and executed concurrently). Retry a few times.
+    // Retry a few times, but never past the end: then the command is not started.
     let mut attempt = 0;
     let mut child = loop {
         match spawn() {
             Err(e) if e.kind() == io::ErrorKind::ExecutableFileBusy && attempt < 20 => {
                 attempt += 1;
-                std::thread::sleep(Duration::from_millis(10 * attempt));
+                let left = end.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(ProbeError::NotStarted {
+                        argv: argv(program, args),
+                    });
+                }
+                std::thread::sleep(Duration::from_millis(10 * attempt).min(left));
+                if Instant::now() >= end {
+                    return Err(ProbeError::NotStarted {
+                        argv: argv(program, args),
+                    });
+                }
             }
             other => break other.map_err(|e| failed(format!("cannot start: {e}")))?,
         }
@@ -835,7 +849,7 @@ fn capture(
     } else {
         let _ = etx.send(Ok(Vec::new()));
     }
-    let deadline = Instant::now() + limit;
+    let deadline = end;
     let pid = Pid::from_child(&child);
     let exited = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG;
     loop {

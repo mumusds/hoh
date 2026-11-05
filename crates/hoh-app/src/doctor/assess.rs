@@ -107,14 +107,17 @@ pub fn conclusion(agent: Agent, out: &Captured) -> Option<Auth> {
                 None
             }
         }
+        // A positive answer counts only from a command that succeeded; "not logged in" comes with a failing exit
+        // (M1T07R-12).
         Agent::Claude => match json_object(&out.stdout)?.get("loggedIn")?.as_bool()? {
-            true => Some(Auth::NotVerified),
+            true if out.status.success() => Some(Auth::NotVerified),
+            true => None,
             false => Some(Auth::Missing),
         },
         Agent::Pi => {
             let answer = json_object(&out.stdout)?;
             match (answer["status"].as_str()?, answer["reason"].as_str()) {
-                ("ready", _) => Some(Auth::NotVerified),
+                ("ready", _) if out.status.success() => Some(Auth::NotVerified),
                 ("not_ready", Some("credentials_not_configured")) => Some(Auth::Missing),
                 _ => None,
             }
