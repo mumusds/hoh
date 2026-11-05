@@ -189,17 +189,38 @@ impl Pty {
         Ok(())
     }
 
-    /// Wait until the program has read everything typed so far (nothing left in the terminal's input queue).
-    pub fn wait_until_read(&self, timeout: Duration) -> R {
+    /// Wait until the terminal's input queue holds `bytes` bytes typed and not yet read.
+    fn wait_for_queued(&self, bytes: u64, timeout: Duration) -> R {
         let slave = self.slave.as_ref().ok_or("the PTY is closed")?;
         let end = Instant::now() + timeout;
-        while rustix::io::ioctl_fionread(slave)? != 0 {
+        loop {
+            let queued = rustix::io::ioctl_fionread(slave)?;
+            if queued == bytes {
+                return Ok(());
+            }
             if Instant::now() >= end {
-                return Err(format!("the input was not read within {timeout:?}").into());
+                return Err(
+                    format!("{queued} bytes queued, not {bytes}, after {timeout:?}").into(),
+                );
             }
             std::thread::sleep(Duration::from_millis(2));
         }
-        Ok(())
+    }
+
+    /// Type `bytes` and wait until `hoh` has read them. A write to the master reaches the input queue later, so an
+    /// empty queue right after it proves nothing (M1T08R-33): `hoh` is stopped while they are typed, they are seen
+    /// waiting in the queue, and once it continues they are seen gone; nothing else reads this terminal. Anything typed
+    /// before must have been read already.
+    pub fn send_and_wait_until_read(&mut self, hoh: &Hoh, bytes: &[u8], timeout: Duration) -> R {
+        signal(hoh, rustix::process::Signal::STOP)?;
+        let continued = (|| {
+            wait_for_state(hoh, 'T', timeout)?;
+            self.send(bytes)?;
+            self.wait_for_queued(u64::try_from(bytes.len())?, timeout)
+        })();
+        signal(hoh, rustix::process::Signal::CONT)?;
+        continued?;
+        self.wait_for_queued(0, timeout)
     }
 
     /// Type `bytes` as the user would.
@@ -328,6 +349,26 @@ pub fn exit_within(Hoh(child): &mut Hoh, timeout: Duration) -> R<ExitStatus> {
             return Err(format!("hoh did not exit within {timeout:?}").into());
         }
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Wait until `hoh` is in `state` (`/proc/<pid>/stat`: `T` stopped).
+fn wait_for_state(Hoh(child): &Hoh, state: char, timeout: Duration) -> R {
+    let path = format!("/proc/{}/stat", child.id());
+    let end = Instant::now() + timeout;
+    loop {
+        let stat = std::fs::read_to_string(&path)?;
+        // The state follows the command name, which is in parentheses and may hold anything.
+        let now = stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.trim_start().chars().next());
+        if now == Some(state) {
+            return Ok(());
+        }
+        if Instant::now() >= end {
+            return Err(format!("hoh not in state {state} within {timeout:?} ({now:?})").into());
+        }
+        std::thread::sleep(Duration::from_millis(2));
     }
 }
 

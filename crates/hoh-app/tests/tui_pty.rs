@@ -293,8 +293,8 @@ fn a_signal_while_output_is_held_leaves_later_input_for_the_shell() -> R {
 
 /// A slow link may split a sequence: what follows `ESC [` within half a second still completes it, so Up recalls
 /// the last input instead of typing `A`; a paste whose start marker comes in two parts is still one paste, not lines
-/// submitted one by one (M1T08R-20). The gap starts once hoh has read the first part, so it is waited for
-/// (M1T08R-30).
+/// submitted one by one (M1T08R-20). The gap starts once hoh is known to have read the first part, so it is waited
+/// for (M1T08R-30, -33).
 #[test]
 fn a_sequence_split_by_a_slow_link_is_still_one_key() -> R {
     let (home, project) = (tempfile::tempdir()?, tempfile::tempdir()?);
@@ -306,16 +306,34 @@ fn a_sequence_split_by_a_slow_link_is_still_one_key() -> R {
         (&b"\x1b["[..], &b"A\r"[..]),
         (b"\x1b[20", b"0~line1\rline2\x1b[201~\r"),
     ] {
-        s.pty.send(start)?;
-        s.pty.wait_until_read(WAIT)?;
+        s.pty.send_and_wait_until_read(&s.child, start, WAIT)?;
         std::thread::sleep(Duration::from_millis(150));
-        s.pty.send(rest)?;
+        // Read before the next step, which starts from an empty queue.
+        s.pty.send_and_wait_until_read(&s.child, rest, WAIT)?;
     }
     assert_eq!(s.detach()?, Some(0));
     assert_eq!(
         std::fs::read_to_string(&history)?,
         "{\"text\":\"one\"}\n{\"text\":\"one\"}\n{\"text\":\"line1 line2\"}\n"
     );
+    Ok(())
+}
+
+/// The read handshake the slow-link test relies on fails when nothing reads the terminal: a process that never
+/// reads its input leaves the typed bytes queued (M1T08R-33). Its terminal is not in raw mode, so a whole line is
+/// typed: only a finished line counts as queued.
+#[test]
+fn the_read_handshake_fails_when_nothing_reads() -> R {
+    let mut pty = Pty::new(30, 100)?;
+    let sleeper = Hoh(std::process::Command::new("sleep")
+        .arg("30")
+        .stdin(pty.stdio()?)
+        .spawn()?);
+    let err = pty
+        .send_and_wait_until_read(&sleeper, b"ab\n", Duration::from_secs(1))
+        .err()
+        .ok_or("the handshake passed with nothing reading")?;
+    assert!(err.to_string().contains("3 bytes queued, not 0"), "{err}");
     Ok(())
 }
 
