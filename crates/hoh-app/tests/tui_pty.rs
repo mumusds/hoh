@@ -356,20 +356,24 @@ fn a_lone_esc_is_the_esc_key() -> R {
     Ok(())
 }
 
-/// A burst of keys larger than one read is taken in full: 1100 characters and Enter make one 1100-character line in
-/// the history, with nothing left behind waiting for another key.
+/// A burst of keys larger than one read (4 KiB) is taken in full: 5000 characters and Enter make one 5000-character
+/// line in the history, with nothing left behind waiting for another key (M1T08R-25).
 #[test]
 fn a_burst_of_keys_is_taken_in_full() -> R {
     let (home, project) = (tempfile::tempdir()?, tempfile::tempdir()?);
     let history = project.path().join(".hoh/input-history.jsonl");
     let mut s = open(project.path(), home.path(), &[])?;
-    let line = "x".repeat(1100);
+    let line = "x".repeat(5000);
     s.pty.send(format!("{line}\r").as_bytes())?;
-    s.pty.wait_for("未发送", 0, WAIT)?;
-    assert_eq!(
-        std::fs::read_to_string(&history)?,
-        format!("{{\"text\":\"{line}\"}}\n")
-    );
+    // The message of so long a line fills the screen, so the history file says when it was submitted.
+    let want = format!("{{\"text\":\"{line}\"}}\n");
+    let end = std::time::Instant::now() + WAIT;
+    while std::fs::read_to_string(&history).unwrap_or_default() != want
+        && std::time::Instant::now() < end
+    {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(std::fs::read_to_string(&history)?, want);
     assert_eq!(s.detach()?, Some(0));
     Ok(())
 }

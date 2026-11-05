@@ -653,9 +653,9 @@ mod tests {
 
     #[test]
     fn a_burst_larger_than_any_read_is_decoded_in_full() {
-        let burst = "x".repeat(1100) + "\r";
+        let burst = "x".repeat(5000) + "\r";
         let events = all(burst.as_bytes(), false);
-        assert_eq!(events.len(), 1101);
-        assert_eq!(events[1100], k(KeyCode::Enter, N));
+        assert_eq!(events.len(), 5001);
+        assert_eq!(events[5000], k(KeyCode::Enter, N));
     }
 }
