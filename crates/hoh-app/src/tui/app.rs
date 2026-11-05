@@ -8,7 +8,7 @@ use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 /// How the user leaves the shell.
@@ -260,7 +260,12 @@ impl App {
         let prompt = "> ";
         let room = usize::from(input.width).saturating_sub(prompt.len());
         let (visible, column) = self.editor.view(room);
-        frame.render_widget(Paragraph::new(format!("{prompt}{visible}")), input);
+        // Two spans: ratatui splits each into graphemes on its own, so the text's first character never joins the
+        // prompt's space (a halfwidth sound mark would, three cells wide; M1T08R-38).
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![Span::raw(prompt), Span::raw(visible)])),
+            input,
+        );
         let line = match &self.search {
             Some(s) => format!(
                 " 反向搜索：{}{} │ Enter 选定 · Esc 取消 · Ctrl+R 更早",

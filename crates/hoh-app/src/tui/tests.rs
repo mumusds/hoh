@@ -730,3 +730,26 @@ fn the_view_is_measured_as_ratatui_draws_it() {
     e.insert("abلاcd");
     assert_eq!(e.view(5), ("لاcd", 4));
 }
+
+/// The prompt and the text are drawn apart: a halfwidth sound mark at the start of the text, which would join the
+/// prompt's space into one grapheme three cells wide, stays the text's own, and the cursor lands on the cell of the
+/// character after it (M1T08R-38).
+#[test]
+fn the_prompt_and_the_text_are_drawn_apart() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut app = app_in(dir.path());
+    app.paste("\u{ff9e}x");
+    assert_eq!(app.key(key(KeyCode::Left)), None);
+    let mut terminal = Terminal::new(TestBackend::new(40, 10)).expect("terminal");
+    terminal.draw(|f| app.draw(f)).expect("draw");
+    let cursor = terminal.get_cursor_position().expect("cursor");
+    let cell = terminal.backend().buffer()[(cursor.x, cursor.y)]
+        .symbol()
+        .to_owned();
+    assert_eq!(cell, "x", "the cursor is on the x after the mark");
+    assert_eq!(
+        terminal.backend().buffer()[(1, cursor.y)].symbol(),
+        " ",
+        "the prompt's space"
+    );
+}

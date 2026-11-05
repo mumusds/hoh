@@ -210,7 +210,8 @@ impl Pty {
     /// Type `bytes` and wait until `hoh` has read them. A write to the master reaches the input queue later, so an
     /// empty queue right after it proves nothing (M1T08R-33): `hoh` is stopped while they are typed, they are seen
     /// waiting in the queue, and once it continues they are seen gone; nothing else reads this terminal. Anything typed
-    /// before must have been read already.
+    /// before must have been read already. Under a tracer (`strace -f`) a stopped process shows `t`, not `T`, and is
+    /// not taken for stopped: the handshake then fails, so run the PTY tests untraced (M1T08R-37).
     pub fn send_and_wait_until_read(&mut self, hoh: &Hoh, bytes: &[u8], timeout: Duration) -> R {
         signal(hoh, rustix::process::Signal::STOP)?;
         let continued = (|| {
