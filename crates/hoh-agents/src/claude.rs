@@ -415,6 +415,7 @@ pub async fn run(
                             "reason": "PROTOCOL_FRAME_TOO_LARGE",
                             "length": refused.length,
                             "prefix_sha256": refused.prefix_sha256,
+                            "head": String::from_utf8_lossy(&refused.head),
                         }),
                     )
                     .await?;

@@ -731,6 +731,17 @@ async fn a_frame_too_large_ends_the_turn() -> R {
         )
     );
     assert!(group_members(outcome.pid.ok_or("no pid")?).is_empty());
+    let diagnosis = world
+        .store
+        .reader()?
+        .events("R")?
+        .into_iter()
+        .find(|(k, p)| k == "adapter.diagnostic" && p["reason"] == "PROTOCOL_FRAME_TOO_LARGE")
+        .map(|(_, p)| p)
+        .ok_or("no diagnosis")?;
+    assert!(diagnosis["length"].as_u64().is_some_and(|n| n > 1 << 20));
+    assert_eq!(diagnosis["prefix_sha256"].as_str().map(str::len), Some(64));
+    assert_eq!(diagnosis["head"].as_str().map(str::len), Some(4 << 10));
     Ok(())
 }
 

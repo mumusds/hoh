@@ -120,7 +120,8 @@ pub(super) async fn run(
                         "exec-frame-too-large",
                         "adapter.diagnostic",
                         json!({"attempt_id": id, "reason": "PROTOCOL_FRAME_TOO_LARGE",
-                               "length": refused.length, "prefix_sha256": refused.prefix_sha256}),
+                               "length": refused.length, "prefix_sha256": refused.prefix_sha256,
+                               "head": String::from_utf8_lossy(&refused.head)}),
                     )
                     .await?;
                 continue;

@@ -1596,3 +1596,58 @@ fn the_known_methods_are_the_registry() -> R {
     assert_eq!(exec, ours);
     Ok(())
 }
+
+/// A frame longer than the 1 MiB limit, on app-server or on exec, fails the turn as PROTOCOL_FRAME_TOO_LARGE with its
+/// diagnosis (length, prefix sha256, first 4 KiB); nothing more is read as frames and codex's group is stopped
+/// (M1-T07 done_when; the host-level AC-027-03 is M2-T05's).
+#[tokio::test]
+async fn a_frame_too_large_fails_the_turn_with_its_diagnosis() -> R {
+    let world = World::new()?;
+    let mut case = Case::load("app-server-turn")?;
+    let at = case.position("turn/completed")?;
+    case.frames.insert(
+        at,
+        json!({"method": "item/agentMessage/delta", "params": {"delta": "x".repeat(1 << 20)}}),
+    );
+    let fake = world.fake("huge", Some(&case), "exec", false)?;
+    let attempt = world.attempt("A1").await?;
+    let outcome = run(&world, &attempt, &world.turn(&fake, "logs/A1")?).await?;
+    assert_eq!(
+        (outcome.state, outcome.failure.as_deref()),
+        (AttemptState::Failed, Some("PROTOCOL_FRAME_TOO_LARGE"))
+    );
+    let diagnosis = events(&world, "adapter.diagnostic")?
+        .into_iter()
+        .find(|d| d["reason"] == "PROTOCOL_FRAME_TOO_LARGE")
+        .ok_or("no diagnosis")?;
+    assert!(diagnosis["length"].as_u64().is_some_and(|n| n > 1 << 20));
+    assert_eq!(diagnosis["prefix_sha256"].as_str().map(str::len), Some(64));
+    assert_eq!(diagnosis["head"].as_str().map(str::len), Some(4 << 10));
+    assert!(
+        group_members(outcome.pid.ok_or("no pid")?).is_empty(),
+        "codex's group is stopped"
+    );
+
+    // exec: one event line over the limit.
+    let fake = world.fake("huge-exec", None, "exec", false)?;
+    let line = format!(
+        "{}\n",
+        json!({"type": "item.completed", "item": {"type": "agent_message", "text": "x".repeat(1 << 20)}})
+    );
+    std::fs::write(fake.parent().ok_or("no dir")?.join("exec.0001"), line)?;
+    let attempt = world.attempt("A2").await?;
+    let mut turn = world.turn(&fake, "logs/A2")?;
+    turn.launch.app_server_help = None;
+    let outcome = run(&world, &attempt, &turn).await?;
+    assert_eq!(
+        (outcome.state, outcome.failure.as_deref()),
+        (AttemptState::Failed, Some("PROTOCOL_FRAME_TOO_LARGE"))
+    );
+    let exec_diagnosis = events(&world, "adapter.diagnostic")?
+        .into_iter()
+        .filter(|d| d["reason"] == "PROTOCOL_FRAME_TOO_LARGE")
+        .nth(1)
+        .ok_or("no exec diagnosis")?;
+    assert_eq!(exec_diagnosis["head"].as_str().map(str::len), Some(4 << 10));
+    Ok(())
+}
