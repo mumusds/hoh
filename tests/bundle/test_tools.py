@@ -32,7 +32,7 @@ elif name=='claude':print(json.dumps({'type':'result','subtype':'success','is_er
 elif name=='grok':
  print(json.dumps({'type':'system','subtype':'init','session_id':'mock-grok','model':'grok-mock'}))
  print(json.dumps({'type':'assistant','message':{'role':'assistant','content':[{'type':'text','text':'done'}]},'session_id':'mock-grok'}))
- print(json.dumps({'type':'result','subtype':'error' if mode=='semantic-error' else 'success','is_error':mode=='semantic-error','result':'done','session_id':'mock-grok'}))
+ print(json.dumps({'type':'result','subtype':'error_during_execution' if mode=='semantic-error' else 'success','is_error':mode=='semantic-error','result':'done','session_id':'mock-grok'}))
 else:
  print(json.dumps({'type':'message_end','message':{'content':'Unicode \u2028 record not separator','stopReason':'error' if mode=='semantic-error' else 'stop'}},ensure_ascii=False))
  print(json.dumps({'type':'agent_end'}))
@@ -106,7 +106,16 @@ class NativeBridge(unittest.TestCase):
         argv=r['argv'];self.assertEqual(argv[argv.index('--prompt-file')+1],'/dev/stdin');self.assertEqual(argv[argv.index('--output-format')+1],'streaming-messages-json')
         self.assertIn('--always-approve',argv)
         t=load_json(self.root/'trace.json');self.assertTrue(t['stdin'].startswith('[HOH_DELEGATED_TASK]'));self.assertTrue(t['stdin'].endswith(self.prompt.read_text()))
-        p,out=self.bridge(agent='grok',mode='semantic-error');self.assertNotEqual(p.returncode,0)
+    def test_grok_error_result_fails_the_turn_despite_a_zero_exit(self):
+        p,out=self.bridge(agent='grok',mode='semantic-error');self.assertEqual(p.returncode,1,p.stderr);r=load_json(out/'attempt.json')
+        self.assertEqual((r['status'],r['exit_code'],r['terminal_observed'],r['native_error_observed']),('NATIVE_FAILED',0,True,True))
+    def test_a_live_check_refuses_an_agent_its_session_schema_does_not_accept(self):
+        # TG-01: live-sessions.json may only name agents contracts/live-session.schema.json accepts; Grok is not one.
+        ev=self.root/'evidence';ev.mkdir()
+        p=subprocess.run([sys.executable,str(ROOT/'tools/agent_task.py'),'--agent','grok','--role','reviewer','--prompt-file',str(self.prompt),'--cwd',str(self.root),'--timeout','10'],
+                         capture_output=True,text=True,env=self.env|{'HOH_EVIDENCE_DIR':str(ev),'HOH_CHECK_ID':'independent-review','HOH_CANDIDATE_ID':'CAND-'+'a'*64},timeout=20)
+        self.assertEqual(p.returncode,64,p.stderr);self.assertIn('live-session.schema.json',p.stderr)
+        self.assertEqual(list(ev.iterdir()),[]);self.assertFalse((self.root/'trace.json').exists())
     def test_native_nonzero(self):
         p,out=self.bridge(mode='exit-error');self.assertEqual(p.returncode,7);self.assertEqual(load_json(out/'attempt.json')['status'],'NATIVE_FAILED')
     def test_semantic_failure_zero_exit(self):p,_=self.bridge(mode='semantic-error');self.assertNotEqual(p.returncode,0)
@@ -155,6 +164,8 @@ class NativeBridge(unittest.TestCase):
                          capture_output=True,text=True,env=self.env|{'HOH_EVIDENCE_DIR':str(ev),'HOH_CHECK_ID':'adapter-live','HOH_CANDIDATE_ID':'CAND-'+'a'*64},timeout=20)
         self.assertEqual(p.returncode,0,p.stderr);s=load_json(ev/'live-sessions.json')
         self.assertEqual([x['session_id'] for x in s['sessions']],['mock-claude']);self.assertEqual(s['sessions'][0]['cli_version'],'MOCK_AGENT_VERSION')
+        from jsonschema import Draft202012Validator
+        Draft202012Validator(load_json(ROOT/'contracts/live-session.schema.json')).validate(s)
     def test_whole_token_flag_detection(self):
         self.assertFalse(flag_supported('--model NAME','--mode'));self.assertTrue(flag_supported('  --mode <m>','--mode'))
         with self.assertRaisesRegex(ValueError,'--mode'):command_for('pi',self.root,None,'--model --session-dir')
@@ -166,9 +177,16 @@ class NativeBridge(unittest.TestCase):
         self.assertEqual(inspect_output('codex',p)['assistant_text_tail'],'HOH_NATIVE_SMOKE_OK')
     def test_claude_failure_output(self):
         p=self.root/'raw';p.write_text('{"type":"result","is_error":true,"subtype":"error_max_turns"}\n');self.assertTrue(inspect_output('claude',p)['native_error_observed'])
-        # Grok reports a model at capacity as an error result (observed with grok 1.0.70).
-        p.write_text('{"type":"result","subtype":"error","is_error":true,"result":"Selected model is at capacity."}\n');o=inspect_output('grok',p)
+        # Grok 1.0.70 reports a turn that could not run (here an unknown --model, observed 2026-11-05) as an error result.
+        p.write_text('{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":0,"errors":["unknown model id"]}\n');o=inspect_output('grok',p)
         self.assertTrue(o['terminal_observed']);self.assertTrue(o['native_error_observed'])
+    def test_the_last_result_alone_is_the_final_text(self):
+        # TG-03: a report in an earlier result must not stand in for a last result that carries none.
+        for agent in ['claude','grok']:
+            p=self.raw({'type':'result','subtype':'success','result':REPORT_BLOCK},{'type':'result','subtype':'success','result':''})
+            self.assertEqual(inspect_output(agent,p)['_final_text'],'',agent)
+            p=self.raw({'type':'result','subtype':'success','result':REPORT_BLOCK},{'type':'result','subtype':'success'})
+            self.assertEqual(inspect_output(agent,p)['_final_text'],'',agent)
     def raw(self,*records):
         p=self.root/'raw';p.write_text(''.join(json.dumps(r)+'\n' for r in records));return p
     def test_pi_session_header_is_the_session_id(self):
