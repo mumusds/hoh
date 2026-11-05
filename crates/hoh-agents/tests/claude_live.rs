@@ -20,6 +20,8 @@ mod live;
 
 use common::{R, World};
 use hoh_agents::claude::{self, Launch, Outcome, Turn};
+use hoh_agents::compat::Agent;
+use hoh_agents::probe::{self, ProbeEnv};
 use hoh_agents::process::group_members;
 use hoh_core::lifecycle::AttemptState;
 use hoh_core::persistence::CancelLatch;
@@ -69,6 +71,24 @@ async fn claude_live_turns_resume_and_cancel() -> R {
     let program =
         PathBuf::from(std::env::var_os("HOH_LIVE_CLAUDE").ok_or("HOH_LIVE_CLAUDE is not set")?);
     let program = program.canonicalize()?;
+    // The capabilities of the session row come from the probe of this claude (REQ-027).
+    let entry = probe::probe(
+        Agent::Claude,
+        &ProbeEnv {
+            path: std::env::var_os("PATH").ok_or("no PATH")?,
+            fixture_root: None,
+            timeout: Duration::from_secs(120),
+            log: None,
+            deadline: None,
+        },
+    )?;
+    if PathBuf::from(&entry.launcher_path).canonicalize()? != program {
+        return Err(format!(
+            "PATH's claude is {}, not HOH_LIVE_CLAUDE",
+            entry.launcher_path
+        )
+        .into());
+    }
     let help = String::from_utf8(Command::new(&program).arg("--help").output()?.stdout)?;
     let version_line = String::from_utf8(Command::new(&program).arg("--version").output()?.stdout)?;
     let version = version_line
@@ -106,6 +126,7 @@ async fn claude_live_turns_resume_and_cancel() -> R {
             partial: false,
             resume,
             root: rustix::process::getuid().is_root(),
+            capabilities: entry.capabilities.clone(),
         },
         prompt: prompt.as_bytes().to_vec(),
         logs: out.join(logs),

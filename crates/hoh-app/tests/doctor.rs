@@ -633,6 +633,19 @@ fn live_drives_an_exec_only_codex_through_exec() -> R {
     assert!(live["error"].is_null(), "the live turn did not run: {live}");
     assert_eq!(live["state"], "SETTLED", "{live}");
     assert_eq!(live["stored"]["state"], "SETTLED", "{live}");
+    // The session row records what the probe found, narrowed to exec: no steer, no deltas (REQ-027, M1R-01).
+    let probed = &report["agents"]["codex"]["capabilities"];
+    let session = &live["stored"]["session_capabilities"];
+    assert_eq!(probed["structured_events"], true, "{probed}");
+    for name in [
+        "structured_events",
+        "resume",
+        "mid_turn_steer",
+        "partial_messages",
+    ] {
+        assert_eq!(session[name], probed[name], "{name}: {session} vs {probed}");
+    }
+    assert_eq!(session["mid_turn_steer"], false, "{session}");
     assert_eq!(
         report["agents"]["codex"]["auth_check"], "unknown",
         "the recorded reply has no token"

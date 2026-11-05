@@ -7,11 +7,12 @@
 
 mod common;
 
-use common::{R, World};
+use common::{R, World, probed};
 use hoh_agents::claude::{self, AttemptRef, Launch, Outcome, PARTIAL_FLAG, Turn, YOLO_FLAG};
 use hoh_agents::process::{Escalation, Signal, Target, group_members};
 use hoh_core::lifecycle::AttemptState;
 use hoh_core::persistence::{CancelLatch, CancelReceipt};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -91,6 +92,12 @@ impl Fakes for World {
                 partial: false,
                 resume: None,
                 root: false,
+                // What `probe()` finds for the recorded 2.1.318 help.
+                capabilities: probed(&[
+                    ("structured_events", true),
+                    ("partial_messages", true),
+                    ("resume", true),
+                ]),
             },
             prompt: b"Use the Bash tool to run `echo hoh`, then reply.".to_vec(),
             logs: self.dir.path().join(logs),
@@ -409,6 +416,45 @@ async fn test_025_02_failed_turns_and_missing_flags() -> R {
 }
 
 /// Each non-JSON line is its own diagnostic event; the result frame still decides the end.
+/// The session row records what the probe found, never more than this claude's help offers: a probe that found no
+/// resume makes a session without it although the help has `--resume`, and partial messages the help does not offer
+/// are no capability whatever the probe said (M1R-01, REQ-027).
+#[tokio::test]
+async fn the_session_has_the_capabilities_the_probe_found() -> R {
+    let world = World::new()?;
+    let fake = world.fake("probed", &fixture("tool-success")?, b"", 0)?;
+    let mut turn = world.turn(&fake, "logs/A1")?;
+    turn.launch.capabilities = probed(&[
+        ("structured_events", true),
+        ("partial_messages", true),
+        ("resume", false),
+    ]);
+    turn.launch.help = turn.launch.help.replace(PARTIAL_FLAG, "");
+    let attempt = world.attempt("A1").await?;
+    let outcome = world.run(&attempt, &turn).await?;
+    assert_eq!(outcome.state, AttemptState::Settled);
+    let caps = world
+        .store
+        .reader()?
+        .session("S1")?
+        .ok_or("no session")?
+        .capabilities;
+    assert_eq!(
+        (
+            &caps["structured_events"],
+            &caps["resume"],
+            &caps["partial_messages"]
+        ),
+        (&json!(true), &json!(false), &json!(false)),
+        "{caps}"
+    );
+    assert_eq!(
+        hoh_core::decision::granted_capabilities(&caps),
+        ["structured_events".to_owned()].into_iter().collect()
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn every_line_that_is_not_json_is_its_own_diagnostic_event() -> R {
     let world = World::new()?;

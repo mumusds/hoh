@@ -57,6 +57,9 @@ pub struct Launch {
     pub model: Option<String>,
     /// This version emits `agent_settled` (pi 1.5.0 does); otherwise `get_state` checks for idle.
     pub settled_event: bool,
+    /// What the probe found for this pi (its compat manifest entry); the session row records them, without what this
+    /// adapter does not offer (REQ-027).
+    pub capabilities: crate::capabilities::Probed,
 }
 
 /// Why a turn was not started (`BLOCKED_CAPABILITY`).
@@ -359,13 +362,15 @@ pub async fn run(
             native_id: Some(launch.session_id.clone()),
             native_path: Some(launch.session_dir.to_string_lossy().into_owned()),
             agent_version: attempt.agent_version.clone(),
-            capabilities: json!({
-                "structured_events": true,
-                "resume": true,
-                "mid_turn_steer": false,
-                "ui_dialogs": false,
-                "agent_settled": launch.settled_event,
-            }),
+            // The probed capabilities (M1R-01); this adapter takes no steer and answers no dialog.
+            capabilities: {
+                let mut caps = crate::capabilities::of_session(
+                    &launch.capabilities,
+                    &[("mid_turn_steer", false), ("ui_dialogs", false)],
+                );
+                caps["agent_settled"] = json!(launch.settled_event);
+                caps
+            },
         })
         .await?;
     step(

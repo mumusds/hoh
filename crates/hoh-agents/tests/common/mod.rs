@@ -90,3 +90,17 @@ impl World {
         })
     }
 }
+
+/// Probed capabilities as `probe()` reports them: every known capability unknown except `known`.
+#[allow(dead_code)]
+pub fn probed(known: &[(&str, bool)]) -> std::collections::BTreeMap<String, Option<bool>> {
+    let mut caps: std::collections::BTreeMap<String, Option<bool>> =
+        hoh_agents::probe::CAPABILITIES
+            .iter()
+            .map(|c| ((*c).to_owned(), None))
+            .collect();
+    for (name, value) in known {
+        caps.insert((*name).to_owned(), Some(*value));
+    }
+    caps
+}

@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 pub mod adapter;
+pub mod capabilities;
 pub mod claude;
 pub mod clock;
 pub mod codex;

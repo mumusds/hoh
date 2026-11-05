@@ -51,17 +51,21 @@ pub struct Launch {
     pub resume: Option<String>,
     /// Whether this process runs as root (Claude refuses the bypass as root).
     pub root: bool,
+    /// What the probe found for this claude (its compat manifest entry); the session row records them, never more
+    /// than this help offers (REQ-027).
+    pub capabilities: crate::capabilities::Probed,
 }
 
 /// Why a turn was not started (`BLOCKED_CAPABILITY`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Blocked(pub String);
 
-/// The command line of a turn and the capabilities it reveals.
+/// The command line of a turn and the capabilities its session has.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Argv {
     pub args: Vec<String>,
-    /// `partial_messages`, `resume`, `structured_events` as offered by the help.
+    /// The session row's capabilities: the probed ones, `partial_messages` and `resume` no more than the help
+    /// offers (M1R-01).
     pub capabilities: Value,
 }
 
@@ -104,7 +108,10 @@ pub fn argv(launch: &Launch) -> Result<Argv, Blocked> {
     }
     Ok(Argv {
         args,
-        capabilities: json!({"structured_events": true, "resume": resume, "partial_messages": partial}),
+        capabilities: crate::capabilities::of_session(
+            &launch.capabilities,
+            &[("partial_messages", partial), ("resume", resume)],
+        ),
     })
 }
 

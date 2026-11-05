@@ -543,3 +543,18 @@ fn transition_run(
 
 #[cfg(test)]
 mod tests;
+
+/// The capabilities a session's `capabilities_json` grants: the names set to `true` in an object; a probed capability
+/// that is false or unknown is none, and anything but an object grants none. Dispatch checks a role's required
+/// capabilities against these (`ROLE_CAPABILITY_MISSING`).
+pub fn granted_capabilities(capabilities: &Value) -> BTreeSet<String> {
+    capabilities
+        .as_object()
+        .map(|map| {
+            map.iter()
+                .filter(|(_, v)| **v == Value::Bool(true))
+                .map(|(k, _)| k.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}

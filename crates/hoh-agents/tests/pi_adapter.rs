@@ -8,7 +8,7 @@
 
 mod common;
 
-use common::{R, World};
+use common::{R, World, probed};
 use hoh_agents::adapter::AttemptRef;
 use hoh_agents::clock::{Clock, SystemClock, Timer};
 use hoh_agents::pi::{self, Launch, Outcome, SettledBy, Turn};
@@ -151,6 +151,8 @@ impl Fakes for World {
             provider: None,
             model: None,
             settled_event: true,
+            // What `probe()` finds for the recorded pi 1.5.0 help.
+            capabilities: probed(&[("structured_events", true), ("resume", true)]),
         })
     }
 
@@ -235,6 +237,47 @@ async fn run(world: &World, attempt: &AttemptRef, turn: &Turn) -> R<Outcome> {
 
 fn value_of(value: Value, path: &[&str]) -> Value {
     path.iter().fold(value, |v, k| v[*k].clone())
+}
+
+/// The session row records what the probe found: a pi whose help offers no session resume makes a session without
+/// resume, and this adapter offers no mid-turn steer and no UI dialogs whatever was probed (M1R-01, REQ-027).
+#[tokio::test]
+async fn the_session_has_the_capabilities_the_probe_found() -> R {
+    let world = World::new()?;
+    let fake = world.fake("probed", &Case::load("rpc-prompt")?)?;
+    let mut turn = world.turn(&fake, "logs/A1")?;
+    turn.launch.capabilities = probed(&[
+        ("structured_events", true),
+        ("resume", false),
+        ("mid_turn_steer", true),
+        ("ui_dialogs", true),
+    ]);
+    let attempt = world.attempt("A1").await?;
+    assert_eq!(
+        run(&world, &attempt, &turn).await?.state,
+        AttemptState::Settled
+    );
+    let caps = world
+        .store
+        .reader()?
+        .session("S1")?
+        .ok_or("no session")?
+        .capabilities;
+    for (name, value) in [
+        ("structured_events", true),
+        ("resume", false),
+        ("mid_turn_steer", false),
+        ("ui_dialogs", false),
+        ("agent_settled", true),
+    ] {
+        assert_eq!(caps[name], json!(value), "{name}: {caps}");
+    }
+    let granted = hoh_core::decision::granted_capabilities(&caps);
+    assert!(
+        !granted.contains("resume") && !granted.contains("mid_turn_steer"),
+        "{granted:?}"
+    );
+    Ok(())
 }
 
 #[tokio::test]

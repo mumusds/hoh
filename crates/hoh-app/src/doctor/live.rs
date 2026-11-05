@@ -52,12 +52,14 @@ enum Prepared {
     Pi(pi::Turn),
 }
 
+/// The turn of `agent`; `capabilities` are what its probe found, for the session row (REQ-027).
 fn prepare(
     agent: Agent,
     launcher: &Path,
     work: &Path,
     logs: PathBuf,
     env: &ProbeEnv,
+    capabilities: &hoh_agents::capabilities::Probed,
 ) -> Result<Prepared, String> {
     Ok(match agent {
         Agent::Claude => Prepared::Claude(claude::Turn {
@@ -69,6 +71,7 @@ fn prepare(
                 partial: false,
                 resume: None,
                 root: rustix::process::geteuid().is_root(),
+                capabilities: capabilities.clone(),
             },
             prompt: PROMPT.as_bytes().to_vec(),
             logs,
@@ -110,6 +113,7 @@ fn prepare(
                     resume: None,
                     model: None,
                     known,
+                    capabilities: capabilities.clone(),
                 },
                 prompt: PROMPT.to_owned(),
                 logs,
@@ -131,6 +135,7 @@ fn prepare(
                 provider: None,
                 model: None,
                 settled_event: true,
+                capabilities: capabilities.clone(),
             },
             prompt: PROMPT.to_owned(),
             input_id: None,
@@ -209,7 +214,14 @@ async fn one(
         let git = probe::find_on_path("git", &env.path).ok_or("git is not installed")?;
         let work_arg = work.display().to_string();
         stdout_of(&git, &["-C", &work_arg, "init", "-q"], env)?;
-        let prepared = prepare(agent, &launcher, &work, logs.clone(), env)?;
+        let prepared = prepare(
+            agent,
+            &launcher,
+            &work,
+            logs.clone(),
+            env,
+            &item.capabilities,
+        )?;
         store
             .create_attempt(NewAttempt {
                 attempt_id: attempt_id.clone(),
@@ -225,13 +237,18 @@ async fn one(
         run(store, &attempt, &prepared).await
     }
     .await;
-    let row = store
-        .reader()
-        .ok()
+    let reader = store.reader().ok();
+    let row = reader
+        .as_ref()
         .and_then(|r| r.attempt(&attempt_id).ok().flatten());
+    // The session row's capabilities: what the probe found, narrowed by the transport the turn used (REQ-027).
+    let session_capabilities = reader
+        .as_ref()
+        .and_then(|r| r.session(&attempt.session_id).ok().flatten())
+        .map(|s| s.capabilities);
     let stored = row.map(|r| {
         json!({"state": r.state, "failure_reason": r.failure_reason, "started_at": r.started_at, "ended_at": r.ended_at,
-               "resolved_model": r.resolved_model, "pid": r.pid})
+               "resolved_model": r.resolved_model, "pid": r.pid, "session_capabilities": session_capabilities})
     });
     match ended {
         Ok(e) => {

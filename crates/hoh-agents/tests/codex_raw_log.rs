@@ -52,6 +52,7 @@ async fn a_raw_log_cut_short_during_a_refused_handshake_fails_the_attempt() -> R
             resume: None,
             model: None,
             known: Default::default(),
+            capabilities: Default::default(),
         },
         prompt: "hello".to_owned(),
         logs: world.dir.path().join("logs"),

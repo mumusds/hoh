@@ -130,6 +130,7 @@ async fn codex_live_turn_and_cancel() -> R {
         resume: None,
         model: None,
         known,
+        capabilities: entry.capabilities.clone(),
     };
     let turn = |prompt: &str, logs: &str| Turn {
         launch: launch.clone(),

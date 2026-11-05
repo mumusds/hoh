@@ -8,7 +8,7 @@
 
 mod common;
 
-use common::{R, World};
+use common::{R, World, probed};
 use hoh_agents::adapter::AttemptRef;
 use hoh_agents::codex::{self, Launch, Mode, Outcome, Steer, SteerReceipt, Turn};
 use hoh_agents::process::{Escalation, group_members};
@@ -95,7 +95,20 @@ fn launch(program: &Path, cwd: &Path) -> R<Launch> {
         resume: None,
         model: None,
         known: codex::known_notifications(&schema),
+        capabilities: recorded_capabilities(),
     })
+}
+
+/// What `probe()` finds for the recorded codex 0.166.0: its schema has `thread/resume`, `turn/steer`,
+/// `item/agentMessage/delta` and `thread/tokenUsage/updated` (compat_probe tests the probe itself).
+fn recorded_capabilities() -> BTreeMap<String, Option<bool>> {
+    probed(&[
+        ("structured_events", true),
+        ("resume", true),
+        ("mid_turn_steer", true),
+        ("partial_messages", true),
+        ("token_usage", true),
+    ])
 }
 
 /// Fakes, turns and runs for the tests.
@@ -1594,6 +1607,84 @@ fn the_known_methods_are_the_registry() -> R {
     let mut ours: Vec<String> = hoh_agents::known::codex_exec().keys().cloned().collect();
     ours.sort();
     assert_eq!(exec, ours);
+    Ok(())
+}
+
+/// The session row records what the probe found, not what the brand suggests: an App Server whose schema has no
+/// `thread/resume`, `turn/steer` or `thread/tokenUsage/updated` makes a session without resume, steer or token usage,
+/// so a dispatch that needs resume finds none (M1R-01, REQ-027). Probe, adapter and dispatch rule in one chain.
+#[tokio::test]
+async fn the_session_has_the_capabilities_the_probe_found() -> R {
+    use hoh_agents::compat::Agent;
+    use hoh_agents::probe::{ProbeEnv, probe};
+    let world = World::new()?;
+    let fake = world.dir.path().join("codex");
+    std::fs::write(
+        &fake,
+        r#"#!/usr/bin/python3
+import sys, json, pathlib
+args = sys.argv[1:]
+if args == ['--version']: print('codex-cli 0.166.0'); sys.exit(0)
+if args == ['exec', '--help']: print('--json'); sys.exit(0)
+if args == ['app-server', '--help']: print('--listen'); sys.exit(0)
+if args[:2] == ['app-server', 'generate-json-schema']:
+    out = pathlib.Path(args[args.index('--out') + 1]); out.mkdir(parents=True, exist_ok=True)
+    for name, methods in [('ClientRequest', ['initialize', 'thread/start', 'turn/start']), ('ServerNotification', ['turn/completed'])]:
+        schema = {'oneOf': [{'type': 'object', 'properties': {'method': {'type': 'string', 'enum': [m]}}} for m in methods]}
+        (out / (name + '.json')).write_text(json.dumps(schema))
+    sys.exit(0)
+for line in sys.stdin:
+    q = json.loads(line); m = q.get('method')
+    if m == 'initialize': r = {'userAgent': 'fake'}
+    elif m == 'thread/start': r = {'thread': {'id': 'thread-fake'}, 'model': 'fake'}
+    elif m == 'turn/start': r = {'turn': {'id': 'turn-fake'}}
+    else: continue
+    print(json.dumps({'id': q['id'], 'result': r}), flush=True)
+    if m == 'turn/start':
+        print(json.dumps({'method': 'turn/completed', 'params': {'threadId': 'thread-fake', 'turn': {'id': 'turn-fake', 'status': 'completed'}}}), flush=True)
+"#,
+    )?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))?;
+    let env = ProbeEnv {
+        path: world.dir.path().as_os_str().to_owned(),
+        fixture_root: None,
+        timeout: Duration::from_secs(10),
+        log: None,
+        deadline: None,
+    };
+    let entry = probe(Agent::Codex, &env)?;
+    for absent in ["resume", "mid_turn_steer", "token_usage"] {
+        assert_eq!(
+            entry.capabilities.get(absent),
+            Some(&Some(false)),
+            "{absent}"
+        );
+    }
+    let mut turn = world.turn(&fake, "logs/A1")?;
+    turn.launch.app_server_help = Some("--listen".to_owned());
+    turn.launch.exec_help = "--json".to_owned();
+    turn.launch.yolo = false;
+    turn.launch.known = ["turn/completed".to_owned()].into_iter().collect();
+    turn.launch.capabilities = entry.capabilities.clone();
+    let attempt = world.attempt("A1").await?;
+    let outcome = run(&world, &attempt, &turn).await?;
+    assert_eq!(
+        (outcome.state, outcome.mode),
+        (AttemptState::Settled, Mode::AppServer)
+    );
+    let session = world.store.reader()?.session("S1")?.ok_or("no session")?;
+    for absent in ["resume", "mid_turn_steer", "token_usage"] {
+        assert_eq!(session.capabilities[absent], false, "{absent}: {session:?}");
+    }
+    assert_eq!(session.capabilities["structured_events"], true);
+    // The rule dispatch reads the row with: no resume, so a task that needs it is ROLE_CAPABILITY_MISSING.
+    let granted = hoh_core::decision::granted_capabilities(&session.capabilities);
+    assert!(
+        !granted.contains("resume") && !granted.contains("mid_turn_steer"),
+        "{granted:?}"
+    );
+    assert!(granted.contains("structured_events"));
     Ok(())
 }
 
