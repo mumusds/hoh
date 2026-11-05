@@ -1060,3 +1060,36 @@ async fn an_input_moved_elsewhere_does_not_stop_the_pi_turn() -> R {
     );
     Ok(())
 }
+
+/// The session file found before the start is gone and pi names a new path it has not written yet: both sides do
+/// not resolve to the same file, so no prompt goes out (M1T05R-06).
+#[tokio::test]
+async fn a_session_file_that_vanished_is_not_the_session() -> R {
+    let world = World::new()?;
+    let mut case = Case::load("rpc-resume")?;
+    case.frames.insert(0, json!({"hoh_lose_session": true}));
+    let fake = world.fake("lost", &case)?;
+    let attempt = world.attempt("A1").await?;
+    let mut turn = world.turn(&fake, "logs/A1")?;
+    turn.launch.resume = true;
+    std::fs::create_dir_all(&turn.launch.session_dir)?;
+    let header = json!({"type": "session", "version": 3, "id": turn.launch.session_id,
+                        "timestamp": "2026-11-04T00:00:00.000Z", "cwd": world.dir.path().canonicalize()?});
+    std::fs::write(
+        turn.launch.session_dir.join(format!(
+            "2026-11-03T00-00-00-000Z_{}.jsonl",
+            turn.launch.session_id
+        )),
+        format!("{header}\n"),
+    )?;
+    let outcome = run(&world, &attempt, &turn).await?;
+    assert_eq!(
+        (outcome.state, outcome.failure.as_deref()),
+        (AttemptState::Failed, Some("SESSION_MISMATCH"))
+    );
+    assert!(
+        !received(&fake)?.iter().any(|m| m["type"] == "prompt"),
+        "no prompt may be sent"
+    );
+    Ok(())
+}
