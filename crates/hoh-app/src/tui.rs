@@ -29,8 +29,12 @@ use std::time::Duration;
 /// How long one wait for input lasts before the signal flags are looked at again (a signal also ends it early).
 const TICK: Duration = Duration::from_millis(100);
 
-/// How long the loop waits for the rest of an escape sequence once its start was read: then a lone ESC is the Esc key.
+/// How long the loop waits for more after a lone ESC: then it is the Esc key.
 const ESC_WAIT: Duration = Duration::from_millis(30);
+
+/// How long the loop waits for the rest of a begun sequence (`ESC [`, a paste marker, a character in pieces), which
+/// a slow link may split: then what came is settled (M1T08R-20). A signal still ends the wait at once.
+const SEQUENCE_WAIT: Duration = Duration::from_millis(500);
 
 /// What ended the loop.
 #[derive(Debug, PartialEq, Eq)]
@@ -138,8 +142,18 @@ fn event_loop(app: &mut App, signal: &AtomicUsize, resized: &AtomicBool) -> std:
             dirty = false;
             debug_panic();
         }
-        let idle = match wait(&stdin, if decoder.pending() { ESC_WAIT } else { TICK })? {
+        let limit = match decoder.pending() {
+            input::Pending::Nothing => TICK,
+            input::Pending::Esc => ESC_WAIT,
+            input::Pending::Sequence => SEQUENCE_WAIT,
+        };
+        let idle = match wait(&stdin, limit)? {
             Wait::Input => {
+                // A signal that came while the loop drew (a held terminal blocks the write) ends it before it reads
+                // what was typed after the signal (M1T08R-19).
+                if signal.load(Ordering::SeqCst) != 0 {
+                    continue;
+                }
                 // poll said there is input (or end of file): this read does not block.
                 let n = match rustix::io::read(&stdin, &mut buf) {
                     Ok(n) => n,

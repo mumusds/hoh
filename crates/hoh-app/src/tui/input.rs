@@ -15,6 +15,18 @@ const PASTE_END: &[u8] = b"\x1b[201~";
 #[derive(Debug, Default)]
 pub struct Decoder {
     buf: Vec<u8>,
+    /// While a paste is unfinished: how much of `buf` has been searched for its end marker (M1T08R-18).
+    searched: usize,
+}
+
+/// What the bytes not yet decoded wait for, which says how long the loop waits for more (M1T08R-20).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Pending {
+    Nothing,
+    /// A lone ESC: the Esc key unless the rest of a sequence follows at once.
+    Esc,
+    /// A begun escape sequence, paste or character: its rest may come later on a slow link.
+    Sequence,
 }
 
 /// What the front of the buffer is.
@@ -32,16 +44,22 @@ impl Decoder {
         self.buf.extend_from_slice(bytes);
     }
 
-    /// Whether bytes are waiting: the caller then waits only briefly for the rest of a sequence.
-    pub fn pending(&self) -> bool {
-        !self.buf.is_empty()
+    pub fn pending(&self) -> Pending {
+        match self.buf.as_slice() {
+            [] => Pending::Nothing,
+            [ESC] => Pending::Esc,
+            _ => Pending::Sequence,
+        }
     }
 
-    /// The next decoded event. `idle` says no more input came after the last read: then a lone ESC is the Esc key,
-    /// ESC and one byte are Alt with that key, and a longer unfinished sequence is dropped. An unfinished paste or
-    /// UTF-8 character keeps waiting for its rest.
+    /// The next decoded event. `idle` says no more input came within the wait `pending` asked for: then a lone ESC
+    /// is the Esc key, ESC and one byte are Alt with that key, and a longer unfinished sequence is dropped. An
+    /// unfinished paste or UTF-8 character keeps waiting for its rest.
     pub fn next(&mut self, idle: bool) -> Option<Event> {
         loop {
+            if self.buf.starts_with(PASTE_START) {
+                return self.paste();
+            }
             match front(&self.buf) {
                 Front::Event(event, used) => {
                     self.buf.drain(..used);
@@ -51,7 +69,6 @@ impl Decoder {
                     self.buf.drain(..used);
                 }
                 Front::Unfinished if !idle || self.buf.first() != Some(&ESC) => return None,
-                Front::Unfinished if self.buf.starts_with(PASTE_START) => return None,
                 Front::Unfinished => {
                     let event = match self.buf.len() {
                         1 => Some(key(KeyCode::Esc, KeyModifiers::NONE)),
@@ -65,6 +82,27 @@ impl Decoder {
                 }
             }
         }
+    }
+
+    /// The bracketed paste at the front once its end marker is there. Only bytes not searched before are searched,
+    /// from a marker's length back so that a marker split between reads is found.
+    fn paste(&mut self) -> Option<Event> {
+        let from = self
+            .searched
+            .saturating_sub(PASTE_END.len() - 1)
+            .max(PASTE_START.len());
+        let Some(at) = self.buf[from..]
+            .windows(PASTE_END.len())
+            .position(|w| w == PASTE_END)
+        else {
+            self.searched = self.buf.len();
+            return None;
+        };
+        let end = from + at;
+        let text = String::from_utf8_lossy(&self.buf[PASTE_START.len()..end]).into_owned();
+        self.buf.drain(..end + PASTE_END.len());
+        self.searched = 0;
+        Some(Event::Paste(text))
     }
 }
 
@@ -184,16 +222,20 @@ fn utf8(buf: &[u8]) -> Front {
     }
 }
 
-/// `ESC [` parameters, intermediates and a final byte (ECMA-48); bracketed paste runs to its end marker.
+/// `ESC [` parameters, intermediates and a final byte (ECMA-48). Two forms carry bytes past what ends a CSI:
+/// the Linux console's F1-F5, `ESC [ [` and a letter, and an X10 mouse report, `ESC [ M` and three raw bytes.
+/// A bracketed paste is taken before this (`Decoder::paste`).
 fn csi(buf: &[u8]) -> Front {
-    if buf.starts_with(PASTE_START) {
-        let body = &buf[PASTE_START.len()..];
-        return match body.windows(PASTE_END.len()).position(|w| w == PASTE_END) {
-            Some(end) => Front::Event(
-                Event::Paste(String::from_utf8_lossy(&body[..end]).into_owned()),
-                PASTE_START.len() + end + PASTE_END.len(),
-            ),
-            None => Front::Unfinished,
+    let whole = match buf.get(2) {
+        Some(b'[') => Some(4),
+        Some(b'M') => Some(6),
+        _ => None,
+    };
+    if let Some(len) = whole {
+        return if buf.len() < len {
+            Front::Unfinished
+        } else {
+            Front::Skip(len)
         };
     }
     let mut i = 2;
@@ -348,9 +390,9 @@ mod tests {
         let mut d = Decoder::default();
         d.feed(b"\x1b");
         assert_eq!(d.next(false), None, "the rest of a sequence may follow");
-        assert!(d.pending());
+        assert_eq!(d.pending(), Pending::Esc);
         assert_eq!(d.next(true), Some(k(KeyCode::Esc, N)));
-        assert!(!d.pending());
+        assert_eq!(d.pending(), Pending::Nothing);
         assert_eq!(all(b"\x1b\x1b", false), [k(KeyCode::Esc, N)]);
     }
 
@@ -412,11 +454,94 @@ mod tests {
             Some(Event::Paste("line one\r\n草".to_owned()))
         );
         assert_eq!(d.next(false), Some(k(KeyCode::Char('x'), N)));
+        // The next paste is searched from its own start.
+        d.feed(b"\x1b[200~z\x1b[201~");
+        assert_eq!(d.next(false), Some(Event::Paste("z".to_owned())));
         let big = "y".repeat(5000);
         assert_eq!(
             all(format!("\x1b[200~{big}\x1b[201~").as_bytes(), false),
             [Event::Paste(big)]
         );
+    }
+
+    /// A lone ESC may be the Esc key and is settled soon; once a sequence has begun (`ESC [`, `ESC O`, a paste
+    /// marker, a character in pieces) the rest is waited for longer, as a slow link may split it (M1T08R-20).
+    #[test]
+    fn pending_says_whether_a_lone_esc_or_a_begun_sequence_waits() {
+        let pending = |bytes: &[u8]| {
+            let mut d = Decoder::default();
+            d.feed(bytes);
+            assert_eq!(d.next(false), None, "{bytes:?}");
+            d.pending()
+        };
+        assert_eq!(Decoder::default().pending(), Pending::Nothing);
+        assert_eq!(pending(b"\x1b"), Pending::Esc);
+        for begun in [
+            &b"\x1b["[..],
+            b"\x1bO",
+            b"\x1b[1;",
+            b"\x1b[20",
+            b"\x1b[200~par",
+            b"\x1b[[",
+            b"\x1b[M !",
+            "草".as_bytes().get(..2).unwrap_or_default(),
+        ] {
+            assert_eq!(pending(begun), Pending::Sequence, "{begun:?}");
+        }
+    }
+
+    /// The Linux console's F1-F5 are `ESC [ [` and a letter (terminfo `linux` kf1-kf5): the letter is part of the
+    /// key, not typed text (M1T08R-16).
+    #[test]
+    fn linux_console_function_keys_are_skipped_whole() {
+        for f in b'A'..=b'E' {
+            assert_eq!(
+                all(&[0x1b, b'[', b'[', f, b'x'], false),
+                [k(KeyCode::Char('x'), N)],
+                "{}",
+                char::from(f)
+            );
+        }
+    }
+
+    /// An X10 mouse report is `ESC [ M` and three raw bytes (button, column, row), which may be anything: none of
+    /// them is typed text (M1T08R-17).
+    #[test]
+    fn an_x10_mouse_report_is_skipped_with_its_three_bytes() {
+        assert_eq!(all(b"\x1b[M !!x", false), [k(KeyCode::Char('x'), N)]);
+        assert_eq!(
+            all(b"\x1b[M\xe0\xa1\xa1x", false),
+            [k(KeyCode::Char('x'), N)]
+        );
+        assert_eq!(
+            all(b"\x1b[M\x1b\x1b\x1bx", false),
+            [k(KeyCode::Char('x'), N)]
+        );
+        // Parameters make it another sequence: SGR mouse and the like end at `M` as before.
+        assert_eq!(all(b"\x1b[<0;1;1Mx", false), [k(KeyCode::Char('x'), N)]);
+    }
+
+    /// A paste arriving in reads of 4 KiB is searched for its end marker once, not again from its start on every read
+    /// (M1T08R-18): 4 MiB takes well under a second even in a debug build, where searching it afresh each read takes
+    /// over ten.
+    #[test]
+    fn a_long_paste_in_pieces_is_searched_once() {
+        let body = "p".repeat(4 << 20);
+        let mut d = Decoder::default();
+        let started = std::time::Instant::now();
+        d.feed(PASTE_START);
+        for piece in body.as_bytes().chunks(4096) {
+            d.feed(piece);
+            assert_eq!(d.next(false), None);
+        }
+        d.feed(PASTE_END);
+        let pasted = d.next(false);
+        let took = started.elapsed();
+        assert_eq!(
+            pasted.map(|e| matches!(e, Event::Paste(t) if t == body)),
+            Some(true)
+        );
+        assert!(took < std::time::Duration::from_secs(3), "took {took:?}");
     }
 
     #[test]
