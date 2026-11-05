@@ -173,6 +173,7 @@ name = "hoh-agents"
 version = "0.0.0"
 dependencies = [
  "hoh-core",
+ "regex",
  "rustix",
  "serde",
  "serde_json",

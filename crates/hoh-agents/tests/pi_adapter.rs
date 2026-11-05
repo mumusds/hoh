@@ -990,6 +990,25 @@ async fn a_provider_failure_after_acceptance_fails_the_turn() -> R {
             false,
             (AttemptState::Failed, Some("PERMANENT_EXTERNAL")),
         ),
+        // As pi 1.5.0's formatProviderError writes them for OpenAI and Azure (M1T05R-14).
+        (
+            "formatted-limit",
+            r#"OpenAI API error (429): {"message":"Too Many Requests"}"#,
+            false,
+            (AttemptState::Failed, Some("TRANSIENT_EXTERNAL")),
+        ),
+        (
+            "formatted-auth",
+            r#"Azure OpenAI API error (401): {"message":"Your token has expired"}"#,
+            false,
+            (AttemptState::Failed, Some("BLOCKED_AUTH")),
+        ),
+        (
+            "formatted-model",
+            r#"OpenAI API error (404): {"message":"model gpt-x does not exist"}"#,
+            false,
+            (AttemptState::Failed, Some("MODEL_UNAVAILABLE")),
+        ),
         (
             "retried",
             "529 overloaded",

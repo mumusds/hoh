@@ -195,6 +195,16 @@ fn the_noted_session_files_are_the_regular_ones() {
     let mut want = vec![id(&a), id(&outside)];
     want.sort();
     assert_eq!(files, want);
+    // pi skips what fails at once: a directory named like a session file, also one it may not search (M1T05R-15).
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(sessions.join("a_directory.jsonl")).expect("dir");
+    let closed = sessions.join("closed.jsonl");
+    std::fs::create_dir_all(&closed).expect("dir");
+    std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    let seen = session_files(&sessions);
+    std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    assert_eq!(seen, Ok(want));
+    // What would block or flood pi's read does not pass: a FIFO, a device.
     let fifo = sessions.join("0000_fifo.jsonl");
     assert!(
         std::process::Command::new("mkfifo")
@@ -204,6 +214,67 @@ fn the_noted_session_files_are_the_regular_ones() {
             .success()
     );
     assert_eq!(session_files(&sessions), Err("0000_fifo.jsonl".to_owned()));
+    std::fs::remove_file(&fifo).expect("remove");
+    std::os::unix::fs::symlink("/dev/zero", sessions.join("0001_zero.jsonl")).expect("symlink");
+    assert_eq!(session_files(&sessions), Err("0001_zero.jsonl".to_owned()));
+}
+
+/// The status as pi writes it (pi-ai error-body.js `formatProviderError`: `<label> error (NNN): …` or `NNN: …`; a raw
+/// SDK message starting `NNN` and a space, a colon or the end), or named as `HTTP NNN` / `status NNN` with word
+/// boundaries; never a number inside a body, a key, an id or a unit (M1T05R-14/16).
+#[test]
+fn provider_statuses_are_read_as_pi_writes_them() {
+    for (message, class) in [
+        (
+            r#"OpenAI API error (429): {"message":"Too Many Requests"}"#,
+            "TRANSIENT_EXTERNAL",
+        ),
+        (
+            r#"Azure OpenAI API error (503): {"message":"Service Unavailable"}"#,
+            "TRANSIENT_EXTERNAL",
+        ),
+        (
+            r#"OpenAI API error (401): {"message":"bad key"}"#,
+            "BLOCKED_AUTH",
+        ),
+        ("OpenAI Decisions error (403): forbidden", "BLOCKED_AUTH"),
+        (
+            "llama.cpp error (500): slot unavailable",
+            "TRANSIENT_EXTERNAL",
+        ),
+        (
+            "Mistral API error (404): model foo-1 does not exist",
+            "MODEL_UNAVAILABLE",
+        ),
+        ("error (413): request too large", "PERMANENT_EXTERNAL"),
+        (r#"429: {"error":"slow down"}"#, "TRANSIENT_EXTERNAL"),
+        ("429 Too Many Requests", "TRANSIENT_EXTERNAL"),
+        ("403 status code (no body)", "BLOCKED_AUTH"),
+        ("529", "TRANSIENT_EXTERNAL"),
+        ("HTTP 429 from the upstream gateway", "TRANSIENT_EXTERNAL"),
+        ("upstream returned status 503", "TRANSIENT_EXTERNAL"),
+        ("request failed with status code 401", "BLOCKED_AUTH"),
+        ("  No API key found for the selected model.", "BLOCKED_AUTH"),
+        ("\tModel not found: x/y", "MODEL_UNAVAILABLE"),
+        ("too many requests, slow down", "TRANSIENT_EXTERNAL"),
+        ("429abc request failed: bad input", "PERMANENT_EXTERNAL"),
+        (
+            "Request status 429abc failed: bad input",
+            "PERMANENT_EXTERNAL",
+        ),
+        ("HTTP 4290 is not a status", "PERMANENT_EXTERNAL"),
+        ("400ms timeout exceeded", "TRANSIENT_EXTERNAL"),
+        (
+            r#"OpenAI API error (500): {"note":"401 in the body is not the status"}"#,
+            "TRANSIENT_EXTERNAL",
+        ),
+        (
+            "Something failed: OpenAI API error (401): later in the text",
+            "PERMANENT_EXTERNAL",
+        ),
+    ] {
+        assert_eq!(provider_failure(message), class, "{message}");
+    }
 }
 
 #[test]
