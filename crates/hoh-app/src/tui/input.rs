@@ -256,20 +256,23 @@ fn csi(buf: &[u8]) -> Front {
 }
 
 /// The key a complete CSI names, with the modifiers and event type of its second parameter (`1;5C` is Ctrl+Right,
-/// `1;5:3C` its release). The event type is a number, as in crossterm (M1T08R-28).
+/// `1;5:3C` its release). The event type is a number, as in crossterm (M1T08R-28); a modifier that is no number
+/// makes a plain press whatever follows it, crossterm's fallback (M1T08R-35).
 fn csi_key(params: &[u8], fin: u8) -> Option<Event> {
     let text = std::str::from_utf8(params).ok()?;
     let mut fields = text.split(';');
     let first = fields.next().unwrap_or_default();
     let mut second = fields.next().unwrap_or_default().split(':');
-    let modifiers = second
-        .next()
-        .and_then(|m| m.parse::<u8>().ok())
-        .map_or(KeyModifiers::NONE, modifiers);
-    let kind = match second.next().and_then(|k| k.parse::<u8>().ok()) {
-        Some(2) => KeyEventKind::Repeat,
-        Some(3) => KeyEventKind::Release,
-        _ => KeyEventKind::Press,
+    let (modifiers, kind) = match second.next().and_then(|m| m.parse::<u8>().ok()) {
+        Some(mask) => (
+            modifiers(mask),
+            match second.next().and_then(|k| k.parse::<u8>().ok()) {
+                Some(2) => KeyEventKind::Repeat,
+                Some(3) => KeyEventKind::Release,
+                _ => KeyEventKind::Press,
+            },
+        ),
+        None => (KeyModifiers::NONE, KeyEventKind::Press),
     };
     if fin == b'u' {
         return csi_u(first, modifiers, kind);
@@ -639,6 +642,29 @@ mod tests {
                 (KeyCode::Right, KeyModifiers::CONTROL, Release),
                 (KeyCode::Delete, KeyModifiers::CONTROL, Press),
                 (KeyCode::Left, KeyModifiers::ALT, Press),
+            ]
+        );
+    }
+
+    /// A modifier parameter that is no number (empty, or past 255) makes the key a plain press whatever event type
+    /// follows it, as crossterm falls back (M1T08R-35).
+    #[test]
+    fn an_unreadable_modifier_makes_a_plain_press() {
+        use ratatui::crossterm::event::KeyEventKind::Press;
+        let raw: Vec<_> = all(b"\x1b[97;256:3u\x1b[97;:3u\x1b[3;:3~\x1b[1;999:3A", false)
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::Key(key) => Some((key.code, key.modifiers, key.kind)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            raw,
+            [
+                (KeyCode::Char('a'), N, Press),
+                (KeyCode::Char('a'), N, Press),
+                (KeyCode::Delete, N, Press),
+                (KeyCode::Up, N, Press),
             ]
         );
     }

@@ -639,25 +639,19 @@ fn a_signal_ends_a_batch_between_two_events() {
     assert_eq!(History::load(dir.path()).entries(), ["x", "y", "z"]);
 }
 
-/// The view of the old algorithm: whole graphemes dropped from the front until the text before the cursor fits.
-fn view_by_dropping(e: &Editor, width: usize) -> (String, usize) {
-    use unicode_segmentation::UnicodeSegmentation;
-    let text = e.text();
-    let room = width.saturating_sub(1);
-    let before = &text[..e.cursor_byte()];
-    let mut start = 0;
-    while before[start..].width() > room {
-        match before[start..].graphemes(true).next() {
-            Some(g) => start += g.len(),
-            None => break,
-        }
+/// The cells a grapheme takes when ratatui draws it (a control character is not drawn).
+fn cells(g: &str) -> usize {
+    use ratatui::buffer::CellWidth;
+    if g.chars().any(char::is_control) {
+        0
+    } else {
+        usize::from(g.cell_width())
     }
-    (text[start..].to_owned(), before[start..].width())
 }
 
-/// The visible part of a long line is found walking back from the cursor, once per draw: 64 KiB takes far less than
-/// a second, where dropping graphemes from the front one by one took tens of seconds, all that time without looking
-/// at the signal flags (M1T08R-31). It is the same part as before, for wide and combining characters too.
+/// The view of a long line is found walking back from the cursor, once per draw: 64 KiB takes far less than a
+/// second, where dropping graphemes from the front one by one took tens of seconds, all that time without looking at
+/// the signal flags (M1T08R-31).
 #[test]
 fn the_view_of_a_long_line_is_found_in_linear_time() {
     let mut e = Editor::default();
@@ -670,17 +664,69 @@ fn the_view_of_a_long_line_is_found_in_linear_time() {
         started.elapsed()
     );
     assert_eq!((shown.len(), column), (99, 99));
-    let mut e = Editor::default();
-    e.insert("ab草稿e\u{301}👩\u{200d}👩c草");
-    for left in 0..8 {
-        for width in 0..12 {
-            let (shown, column) = e.view(width);
-            assert_eq!(
-                (shown.to_owned(), column),
-                view_by_dropping(&e, width),
-                "left {left}, width {width}"
-            );
+}
+
+/// The view and the cursor's column are measured as ratatui draws the line, grapheme by grapheme: the text before
+/// the cursor fills as much of the room as it can and the cursor lands on the cell after it, also where a whole
+/// string measures narrower than its graphemes drawn one by one (lam-alef, halfwidth sound marks) and for wide,
+/// combining, joined and control characters (M1T08R-34).
+#[test]
+fn the_view_is_measured_as_ratatui_draws_it() {
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::widgets::{Paragraph, Widget};
+    use unicode_segmentation::UnicodeSegmentation;
+    for text in [
+        "abلاcd",
+        "xｶﾞｷﾞy",
+        "ab草稿e\u{301}👩\u{200d}👩c草",
+        "a\tb\u{7}c",
+        "א\u{200d}לב",
+    ] {
+        let mut e = Editor::default();
+        e.insert(text);
+        let graphemes = text.graphemes(true).count();
+        for left in 0..=graphemes {
+            let before = &e.text()[..e.cursor_byte()];
+            for width in 1..14 {
+                let room = width - 1;
+                let (shown, column) = e.view(width);
+                let start = e.text().len() - shown.len();
+                let drawn: usize = e.text()[start..e.cursor_byte()]
+                    .graphemes(true)
+                    .map(cells)
+                    .sum();
+                assert_eq!(column, drawn, "{text:?} left {left} width {width}");
+                assert!(column <= room, "{text:?} left {left} width {width}");
+                // As much as fits: the grapheme before the shown part would not.
+                if let Some(g) = before[..start].graphemes(true).next_back() {
+                    assert!(
+                        column + cells(g) > room,
+                        "{text:?} left {left} width {width}"
+                    );
+                }
+                // The cursor's cell is where ratatui draws the first grapheme after the cursor.
+                let next = e.text()[e.cursor_byte()..]
+                    .graphemes(true)
+                    .find(|g| cells(g) > 0);
+                if let Some(g) = next.filter(|g| column + cells(g) <= width) {
+                    let mut buf =
+                        Buffer::empty(Rect::new(0, 0, u16::try_from(width).unwrap_or(1), 1));
+                    Paragraph::new(shown).render(buf.area, &mut buf);
+                    let x = u16::try_from(column).unwrap_or(0);
+                    assert_eq!(
+                        buf[(x, 0)].symbol(),
+                        g,
+                        "{text:?} left {left} width {width}"
+                    );
+                }
+            }
+            e.left();
         }
-        e.left();
     }
+    // abلاcd with the cursor at the end in five columns: ratatui draws ل and ا in a cell each, so four cells come
+    // before the cursor, not the three the whole string measures.
+    let mut e = Editor::default();
+    e.insert("abلاcd");
+    assert_eq!(e.view(5), ("لاcd", 4));
 }

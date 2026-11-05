@@ -1,8 +1,18 @@
 //! The single-line input editor: the cursor moves by grapheme cluster and its column is the display width of the text
 //! before it (docs/03: wide characters by display width, not bytes). Multi-line editing is REQ-015 (M4).
 
+use ratatui::buffer::CellWidth;
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
+
+/// The cells a grapheme takes when ratatui draws it: ratatui measures and draws a line grapheme by grapheme, and
+/// leaves out a control character (M1T08R-34).
+fn cells(g: &str) -> usize {
+    if g.chars().any(char::is_control) {
+        0
+    } else {
+        usize::from(g.cell_width())
+    }
+}
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Editor {
@@ -108,10 +118,10 @@ impl Editor {
         self.cursor = self.text.len();
     }
 
-    /// Display width of the text before the cursor.
+    /// Display width of the text before the cursor, as drawn.
     #[cfg(test)]
     pub fn cursor_column(&self) -> usize {
-        self.text[..self.cursor].width()
+        self.text[..self.cursor].graphemes(true).map(cells).sum()
     }
 
     #[cfg(test)]
@@ -121,19 +131,19 @@ impl Editor {
 
     /// The part of the text to show in `width` columns so that the cursor stays visible, and the cursor's column in
     /// it: as many whole graphemes before the cursor as fit, found walking back from it, so that a draw is linear in
-    /// the line's length (M1T08R-31).
+    /// the line's length (M1T08R-31). Both are measured in the cells ratatui draws (M1T08R-34).
     pub fn view(&self, width: usize) -> (&str, usize) {
         let room = width.saturating_sub(1);
         let mut start = self.cursor;
         let mut column = 0;
         for (i, g) in self.text[..self.cursor].grapheme_indices(true).rev() {
-            let w = g.width();
+            let w = cells(g);
             if column + w > room {
                 break;
             }
             column += w;
             start = i;
         }
-        (&self.text[start..], self.text[start..self.cursor].width())
+        (&self.text[start..], column)
     }
 }
