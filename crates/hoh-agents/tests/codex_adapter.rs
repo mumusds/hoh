@@ -85,6 +85,9 @@ fn launch(program: &Path, cwd: &Path) -> R<Launch> {
     let schema: Value = serde_json::from_str(&read(format!(
         "{FIXTURES}/app-server-schema/ServerNotification.json"
     ))?)?;
+    let requests: Value = serde_json::from_str(&read(format!(
+        "{FIXTURES}/app-server-schema/ClientRequest.json"
+    ))?)?;
     Ok(Launch {
         program: program.to_path_buf(),
         app_server_help: Some(read(format!("{FIXTURES}/help-app-server.txt"))?),
@@ -95,6 +98,7 @@ fn launch(program: &Path, cwd: &Path) -> R<Launch> {
         resume: None,
         model: None,
         known: codex::known_notifications(&schema),
+        requests: codex::listed_methods(&requests),
         capabilities: recorded_capabilities(),
     })
 }
@@ -1783,6 +1787,38 @@ async fn an_exec_session_resumes_only_if_a_resumed_exec_turn_could_start() -> R 
             .ok_or("no attempt")?;
         assert_eq!(row.usage, Some(recorded_exec_usage.clone()), "{name}");
     }
+    Ok(())
+}
+
+/// The App Server is used only if its schema has what every turn needs: with no `turn/start` among its requests,
+/// `codex::run` takes exec at once and never starts it, as the probe chooses exec (M1T07R-15).
+#[tokio::test]
+async fn an_app_server_without_turn_start_is_never_started() -> R {
+    let world = World::new()?;
+    let case = Case::load("app-server-turn")?;
+    let fake = world.fake("no-turn-start", Some(&case), "exec", false)?;
+    let mut turn = world.turn(&fake, "logs/A1")?;
+    assert!(turn.launch.requests.remove("turn/start"));
+    let attempt = world.attempt("A1").await?;
+    let outcome = run(&world, &attempt, &turn).await?;
+    assert_eq!(
+        (outcome.state, outcome.mode),
+        (AttemptState::Settled, Mode::Exec)
+    );
+    assert!(
+        argvs(&fake)?
+            .iter()
+            .all(|a| a.first().map(String::as_str) != Some("app-server")),
+        "the App Server was started"
+    );
+    let degraded = events(&world, "adapter.degraded")?;
+    assert!(
+        degraded.len() == 1
+            && degraded[0]["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("turn/start")),
+        "{degraded:?}"
+    );
     Ok(())
 }
 

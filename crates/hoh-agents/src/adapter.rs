@@ -105,45 +105,110 @@ pub(crate) async fn finish(
 /// their continuation lines are indented further.
 const DECLARATION_INDENT: usize = 8;
 
-/// The declaration of an option line (its names and value placeholders, up to the two spaces before its
-/// description), or `None` for a line that declares no option.
-fn declaration(line: &str) -> Option<&str> {
-    let text = line.trim_start();
-    (line.len() - text.len() <= DECLARATION_INDENT && text.starts_with('-'))
-        .then(|| text.split("  ").next().unwrap_or(text))
+/// The option names a line declares, or `None` for a line that declares no option. A declaration, indented at most
+/// [`DECLARATION_INDENT`] spaces, is one or more names (`-x`, `--name`, comma-separated, a name may carry `=<value>` or
+/// `[=value]`) and then only value placeholders (`<value>`, `[value]`, `VALUE`, each maybe ending in `...`), up to two
+/// spaces or a tab before its description, or the end of the line. Anything else is text: a continuation line, a list
+/// item `- x`, a mention like `--output-format=stream-json)` (M1R-03, M1T07R-18).
+fn declared(line: &str) -> Option<Vec<&str>> {
+    let text = line.trim_start_matches(' ');
+    if line.len() - text.len() > DECLARATION_INDENT || !text.starts_with('-') {
+        return None;
+    }
+    let end = [text.find("  "), text.find('\t')]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(text.len());
+    let mut names = Vec::new();
+    let mut placeholders = false;
+    for word in text[..end].split(' ') {
+        let word = word.strip_suffix(',').unwrap_or(word);
+        if !placeholders && let Some(name) = flag_name(word) {
+            names.push(name);
+        } else if is_placeholder(word) && !names.is_empty() {
+            placeholders = true;
+        } else {
+            return None;
+        }
+    }
+    (!names.is_empty()).then_some(names)
 }
 
-/// Whether `help` (a probed `--help` text) declares the option `flag` as a word of its own. A flag only named in
-/// another option's text is not offered (M1R-03).
+/// The name of an option word (`-x`, `--name`, `--name=<value>`, `--name[=value]`), or `None`.
+fn flag_name(word: &str) -> Option<&str> {
+    let cut = word.find(['=', '[']).unwrap_or(word.len());
+    let (name, rest) = word.split_at(cut);
+    let rest = rest.strip_prefix('=').unwrap_or(rest);
+    let named = match name.strip_prefix("--") {
+        Some(long) => {
+            long.starts_with(|c: char| c.is_ascii_alphanumeric())
+                && long.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        }
+        None => name.len() == 2 && name[1..].starts_with(|c: char| c.is_ascii_alphanumeric()),
+    };
+    (named && name.starts_with('-') && (rest.is_empty() || is_placeholder(rest))).then_some(name)
+}
+
+/// A value placeholder: `<value>`, `[value]` or an upper-case `VALUE`, maybe ending in `...`.
+fn is_placeholder(word: &str) -> bool {
+    let word = word.strip_suffix("...").unwrap_or(word);
+    (word.len() > 2 && word.starts_with('<') && word.ends_with('>'))
+        || (word.len() > 2 && word.starts_with('[') && word.ends_with(']'))
+        || (!word.is_empty()
+            && word
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit()))
+}
+
+/// Whether `help` (a probed `--help` text) declares the option `flag`. A flag only named in other text is not offered
+/// (M1R-03).
 pub fn offers(help: &str, flag: &str) -> bool {
-    help.lines().filter_map(declaration).any(|declared| {
-        declared
-            .split(|c: char| c.is_whitespace() || c == ',')
-            .any(|word| word.split(['=', '[']).next() == Some(flag))
-    })
-}
-
-/// The text of the option `flag`: its declaration line and the description lines that follow it, up to the next
-/// declaration or a blank line; `None` if `help` does not declare it.
-pub fn option_text(help: &str, flag: &str) -> Option<String> {
-    let mut lines = help.lines().skip_while(|line| !offers(line, flag));
-    let first = lines.next()?;
-    let rest = lines.take_while(|line| !line.trim().is_empty() && declaration(line).is_none());
-    Some(
-        std::iter::once(first)
-            .chain(rest)
-            .collect::<Vec<_>>()
-            .join("\n"),
-    )
-}
-
-/// Whether `help` lists the subcommand `name` under its `Commands:` heading.
-pub fn lists_command(help: &str, name: &str) -> bool {
     help.lines()
+        .filter_map(declared)
+        .any(|names| names.contains(&flag))
+}
+
+/// The text of the option `flag`, over every declaration of it: each declaration line and the lines that follow it
+/// up to the next declaration or a blank line; `None` if `help` does not declare it (M1T07R-19).
+pub fn option_text(help: &str, flag: &str) -> Option<String> {
+    let lines: Vec<&str> = help.lines().collect();
+    let mut text = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if declared(line).is_some_and(|names| names.contains(&flag)) {
+            text.push(*line);
+            text.extend(
+                lines[i + 1..]
+                    .iter()
+                    .take_while(|l| !l.trim().is_empty() && declared(l).is_none()),
+            );
+        }
+    }
+    (!text.is_empty()).then(|| text.join("\n"))
+}
+
+/// Whether `word` is a whole word of `text`: words are runs of letters, digits, `-` and `_` (`stream-json-v2` is not
+/// `stream-json`, `grpc` is not `rpc`; M1T07R-17).
+pub fn has_word(text: &str, word: &str) -> bool {
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        .any(|w| w == word)
+}
+
+/// Whether `help` lists the subcommand `name` in the command column of its `Commands:` section (the least indented
+/// lines of that section; wrapped descriptions are indented further), which ends at a blank line or the next
+/// heading (M1T07R-20).
+pub fn lists_command(help: &str, name: &str) -> bool {
+    let section: Vec<&str> = help
+        .lines()
         .skip_while(|line| !line.trim().eq_ignore_ascii_case("commands:"))
         .skip(1)
-        .take_while(|line| !line.trim().is_empty())
-        .any(|line| line.split_whitespace().next() == Some(name))
+        .take_while(|line| !line.trim().is_empty() && line.starts_with([' ', '\t']))
+        .collect();
+    let indent = |line: &&str| line.len() - line.trim_start().len();
+    let column = section.iter().map(indent).min();
+    section
+        .iter()
+        .any(|line| Some(indent(line)) == column && line.split_whitespace().next() == Some(name))
 }
 
 /// Numbers the diagnostics of input moves that did not happen, so two of one attempt never share an event id.
@@ -182,5 +247,67 @@ pub(crate) async fn soft_move(
             Ok(false)
         }
         Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod help_tests {
+    use super::*;
+
+    const HELP: &str = "Usage: tool [options]\n\nOptions:\n  -p, --print                 Print and exit\n  --verbose\tOverride verbose mode (see --quiet)\n  --output-format <format>    Output format: \"text\", \"json\" or\n                              \"stream-json\" (with --print)\n                              --quiet\n  -i, --image <FILE>...\n          Images to attach; works with\n      --output-format=stream-json)\n  --mode <mode>               Output mode: text or json\n      - text\n      - json\n  --mode <mode>               Also: rpc\n  --level <LEVEL>             One of: stream-json-v2, grpc\n\nCommands:\n  help    Print help\n          resume a session through another tool\n  review  Review code\nOther:\n  resume  Not a command\n";
+
+    /// A flag counts only where an option line declares it: not in a continuation line, a description, a list item or
+    /// after a tab (M1R-03).
+    #[test]
+    fn only_declarations_offer_a_flag() {
+        for flag in [
+            "-p",
+            "--print",
+            "--verbose",
+            "--output-format",
+            "-i",
+            "--image",
+            "--mode",
+            "--level",
+        ] {
+            assert!(offers(HELP, flag), "{flag}");
+        }
+        for flag in ["--quiet", "--with", "-", "--print)"] {
+            assert!(!offers(HELP, flag), "{flag}");
+        }
+        // The real --output-format declaration gone: its mention in --image's continuation line does not count.
+        let without = HELP.replace(
+            "  --output-format <format>    Output format: \"text\", \"json\" or\n",
+            "",
+        );
+        assert!(!offers(&without, "--output-format"));
+    }
+
+    /// An option's text is the text of every declaration of it, list items included; a value is a whole word of it
+    /// (M1T07R-17..19).
+    #[test]
+    fn values_are_whole_words_of_every_declaration_of_the_option() {
+        let words = |flag: &str| option_text(HELP, flag).map(|t| has_word(&t, "stream-json"));
+        assert_eq!(words("--output-format"), Some(true));
+        assert_eq!(
+            words("--level"),
+            Some(false),
+            "stream-json-v2 is not stream-json"
+        );
+        assert!(
+            option_text(HELP, "--level").is_some_and(|t| !has_word(&t, "rpc")),
+            "grpc is not rpc"
+        );
+        let mode = option_text(HELP, "--mode").unwrap_or_default();
+        assert!(has_word(&mode, "json") && has_word(&mode, "rpc"), "{mode}");
+        assert!(option_text(HELP, "--quiet").is_none());
+    }
+
+    /// A subcommand is a name in the command column of the `Commands:` section, not a wrapped description and not a
+    /// later section (M1T07R-20).
+    #[test]
+    fn commands_are_read_from_their_column() {
+        assert!(lists_command(HELP, "help") && lists_command(HELP, "review"));
+        assert!(!lists_command(HELP, "resume"));
     }
 }

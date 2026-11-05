@@ -22,6 +22,7 @@ fn launch() -> Launch {
         resume: None,
         model: None,
         known: BTreeSet::new(),
+        requests: BTreeSet::new(),
         capabilities: crate::capabilities::Probed::new(),
     }
 }

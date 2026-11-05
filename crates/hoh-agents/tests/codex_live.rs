@@ -100,6 +100,9 @@ async fn codex_live_turn_and_cancel() -> R {
     }
     let notifications = std::fs::read(schema_dir.join("ServerNotification.json"))?;
     let known = codex::known_notifications(&serde_json::from_slice(&notifications)?);
+    let requests = codex::listed_methods(&serde_json::from_slice(&std::fs::read(
+        schema_dir.join("ClientRequest.json"),
+    )?)?);
     std::fs::write(
         out.join("codex-install.json"),
         serde_json::to_vec_pretty(&json!({
@@ -130,6 +133,7 @@ async fn codex_live_turn_and_cancel() -> R {
         resume: None,
         model: None,
         known,
+        requests,
         capabilities: entry.capabilities.clone(),
     };
     let turn = |prompt: &str, logs: &str| Turn {

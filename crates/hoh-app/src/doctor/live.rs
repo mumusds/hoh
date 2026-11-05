@@ -79,10 +79,10 @@ fn prepare(
             deadline: Some(DEADLINE),
         }),
         Agent::Codex => {
-            // app-server when the CLI has one whose schema has what every turn needs (the schema then names the known
-            // notifications); exec otherwise, as the probe decides (M1T07R-15).
-            let mut app_server_help = stdout_of(launcher, &["app-server", "--help"], env).ok();
-            let known = match &app_server_help {
+            // app-server when the CLI has one; its schema names the request and notification methods, and codex::run
+            // uses it only if they have what every turn needs, as the probe decides (M1T07R-15).
+            let app_server_help = stdout_of(launcher, &["app-server", "--help"], env).ok();
+            let (known, requests) = match &app_server_help {
                 None => Default::default(),
                 Some(_) => {
                     let schema = work.join("..").join("codex-schema");
@@ -100,18 +100,12 @@ fn prepare(
                                 .ok_or(format!(
                                     "codex app-server generate-json-schema gave no {name}"
                                 ))?;
-                            Ok(codex::known_notifications(&file))
+                            Ok(codex::listed_methods(&file))
                         };
-                    let notifications = methods("ServerNotification.json")?;
-                    if codex::app_server_interface_missing(
-                        &methods("ClientRequest.json")?,
-                        &notifications,
+                    (
+                        methods("ServerNotification.json")?,
+                        methods("ClientRequest.json")?,
                     )
-                    .is_some()
-                    {
-                        app_server_help = None;
-                    }
-                    notifications
                 }
             };
             Prepared::Codex(codex::Turn {
@@ -125,6 +119,7 @@ fn prepare(
                     resume: None,
                     model: None,
                     known,
+                    requests,
                     capabilities: capabilities.clone(),
                 },
                 prompt: PROMPT.to_owned(),
