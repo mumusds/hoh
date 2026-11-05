@@ -318,47 +318,139 @@ fn an_entry_after_an_unterminated_last_line_stays_its_own_line() {
     }
 }
 
-/// Restoring undoes each step still marked, the screen first; a step that fails stays marked, its error is returned,
-/// and the next call tries it again (M1T08R-01).
+/// Restoring undoes the screen, then raw mode even if the screen failed; a raw mode that fails stays marked, its
+/// error is returned, and the next call tries it again (M1T08R-01).
 #[test]
 fn a_restore_step_that_fails_is_reported_and_retried() {
     use super::terminal::undo;
     use std::sync::atomic::{AtomicBool, Ordering};
-    let (screen, raw) = (AtomicBool::new(true), AtomicBool::new(true));
+    let raw = AtomicBool::new(true);
     let order = std::cell::RefCell::new(Vec::new());
     let failed = undo(
-        &screen,
         || {
             order.borrow_mut().push("screen");
-            Ok(())
+            Err(std::io::Error::other("screen EIO"))
         },
         &raw,
         || {
             order.borrow_mut().push("raw");
-            Err(std::io::Error::other("EIO"))
+            Err(std::io::Error::other("raw EIO"))
         },
     );
-    assert_eq!(failed.map_err(|e| e.to_string()), Err("EIO".to_owned()));
-    assert_eq!(*order.borrow(), ["screen", "raw"]);
-    assert!(!screen.load(Ordering::SeqCst), "done");
-    assert!(raw.load(Ordering::SeqCst), "still to undo");
-    let again = undo(
-        &screen,
-        || panic!("the screen is not left twice"),
-        &raw,
-        || Ok(()),
+    assert_eq!(
+        failed.map_err(|e| e.to_string()),
+        Err("screen EIO".to_owned()),
+        "the first error"
     );
-    assert!(again.is_ok());
+    assert_eq!(
+        *order.borrow(),
+        ["screen", "raw"],
+        "raw mode is tried although the screen failed"
+    );
+    assert!(raw.load(Ordering::SeqCst), "still to undo");
+    assert!(undo(|| Ok(()), &raw, || Ok(())).is_ok());
     assert!(!raw.load(Ordering::SeqCst));
     assert!(
         undo(
-            &screen,
-            || panic!("nothing left"),
+            || Ok(()),
             &raw,
-            || panic!("nothing left")
+            || panic!("raw mode is not given back twice")
         )
         .is_ok()
     );
+}
+
+/// A writer that takes at most `limit` bytes per write and fails once at each byte count in `fail_at`.
+struct Flaky {
+    out: Vec<u8>,
+    limit: usize,
+    fail_at: Vec<usize>,
+    interrupt_at: Vec<usize>,
+}
+
+impl std::io::Write for Flaky {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.interrupt_at.first() == Some(&self.out.len()) {
+            self.interrupt_at.remove(0);
+            return Err(std::io::ErrorKind::Interrupted.into());
+        }
+        if self.fail_at.first() == Some(&self.out.len()) {
+            self.fail_at.remove(0);
+            return Err(std::io::Error::other("EIO"));
+        }
+        let n = bytes.len().min(self.limit);
+        self.out.extend_from_slice(&bytes[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Each restore sequence is sent exactly once, however the writes are cut: a sequence that is out is never sent
+/// again (a second "leave the alternate screen" would put the saved cursor back over what was printed since), and
+/// one cut short goes on from where it stopped (M1T08R-07).
+#[test]
+fn restore_sequences_go_out_once_whatever_fails_in_between() {
+    use super::terminal::{Step, send};
+    let sequences: [&[u8]; 3] = [b"\x1b[?2004l", b"\x1b[?1049l", b"\x1b[?25h"];
+    let whole: Vec<u8> = sequences.concat();
+    // Writes of 3 bytes reach 0, 3, 6, 8 | 11, 14, 16 | 19, 22: fail inside the second sequence (11), then at the
+    // start of the third (16); an EINTR at 3 is just retried.
+    let mut out = Flaky {
+        out: Vec::new(),
+        limit: 3,
+        fail_at: vec![11, 16],
+        interrupt_at: vec![3],
+    };
+    let steps = [Step::new(), Step::new(), Step::new()];
+    for step in &steps {
+        step.arm();
+    }
+    let mut calls = 0;
+    while send(&mut out, &steps, &sequences).is_err() {
+        calls += 1;
+        assert!(calls < 10, "it never finished");
+    }
+    assert_eq!(calls, 2);
+    assert!(
+        out.fail_at.is_empty() && out.interrupt_at.is_empty(),
+        "every fault was hit"
+    );
+    assert_eq!(out.out, whole, "every sequence exactly once, in order");
+    assert!(steps.iter().all(|s| !s.is_pending()));
+    // Nothing left: a further restore writes nothing.
+    send(&mut out, &steps, &sequences).expect("nothing to send");
+    assert_eq!(out.out, whole);
+}
+
+/// A normal exit tries the restore a bounded number of times (M1T08R-05).
+#[test]
+fn a_restore_is_retried_a_bounded_number_of_times() {
+    use super::terminal::with_retries;
+    let mut tries = 0;
+    assert!(
+        with_retries(3, || {
+            tries += 1;
+            if tries < 3 {
+                Err(std::io::Error::other("EIO"))
+            } else {
+                Ok(())
+            }
+        })
+        .is_ok()
+    );
+    assert_eq!(tries, 3);
+    let mut tries = 0;
+    assert!(
+        with_retries(3, || {
+            tries += 1;
+            Err(std::io::Error::other("EIO"))
+        })
+        .is_err()
+    );
+    assert_eq!(tries, 3);
 }
 
 /// The exit code and the message of each way out (ADR-014 decision 3): a restore that failed is 74 with a message
@@ -384,4 +476,13 @@ fn every_way_out_has_its_code_and_a_failed_restore_is_not_0() {
     let (code, message) = outcome(Err(eio()), Ok(()), 0);
     assert_eq!(code, 74);
     assert!(message.is_some_and(|m| m.contains("EIO")));
+    // A terminal that failed on the way in and a restore that failed too: both said, with the way out.
+    let (code, message) = outcome(Err(eio()), Err(eio()), 0);
+    assert_eq!(code, 74);
+    assert!(message.is_some_and(|m| m.contains("stty sane")));
+    // A signal that comes while a detach is being restored still decides (M1T08R-06).
+    assert_eq!(outcome(Ok(End::Left(Exit::Detach)), Ok(()), 1), (129, None));
+    let (code, message) = outcome(Ok(End::Left(Exit::Detach)), Err(eio()), 1);
+    assert_eq!(code, 129);
+    assert!(message.is_some_and(|m| m.contains("stty sane")));
 }

@@ -59,23 +59,20 @@ pub fn run(project: &Path) -> u8 {
     );
     let mut app = App::new(name, History::load(project));
     terminal::restore_on_panic();
-    let (code, message) = match terminal::enter() {
-        Ok(guard) => {
-            let end = event_loop(&mut app, &signal);
-            let restored = guard.finish();
-            outcome(end, restored, signal.load(Ordering::SeqCst))
-        }
-        Err(e) => outcome(Err(e), Ok(()), signal.load(Ordering::SeqCst)),
-    };
+    let (guard, entered) = terminal::enter();
+    let end = entered.and_then(|()| event_loop(&mut app, &signal));
+    let restored = guard.finish();
+    // Loaded after the restore: a signal that came while restoring decides too (M1T08R-06).
+    let (code, message) = outcome(end, restored, signal.load(Ordering::SeqCst));
     if let Some(message) = message {
         eprintln!("hoh：{message}");
     }
     code
 }
 
-/// The exit code of a way out and what to say on stderr (ADR-014 decision 3): a received signal decides the code (a
-/// hangup also makes the terminal fail); otherwise a failing terminal or a restore that did not complete is 74, never
-/// 0.
+/// The exit code of a way out and what to say on stderr (ADR-014 decision 3): a received signal decides the code on
+/// every path (a hangup also makes the terminal fail; one may come while a detach is restored); otherwise a failing
+/// terminal or a restore that did not complete is 74, never 0.
 fn outcome(
     end: std::io::Result<End>,
     restored: std::io::Result<()>,
@@ -84,9 +81,15 @@ fn outcome(
     let not_restored = restored
         .err()
         .map(|e| format!("终端未能恢复：{e}；可运行 stty sane 或 reset"));
+    let signal = match end {
+        Ok(End::Signal(sig)) => sig,
+        _ => signal,
+    };
+    if signal != 0 {
+        return (signal_code(signal), not_restored);
+    }
     match end {
-        Ok(End::Signal(sig)) => (signal_code(sig), not_restored),
-        Err(_) if signal != 0 => (signal_code(signal), not_restored),
+        Ok(End::Signal(_)) => (signal_code(signal), not_restored),
         Ok(End::Left(Exit::Detach)) => match not_restored {
             None => (0, None),
             Some(m) => (code(ClientEvent::TerminalIo), Some(m)),
@@ -102,7 +105,7 @@ fn outcome(
 }
 
 fn event_loop(app: &mut App, signal: &AtomicUsize) -> std::io::Result<End> {
-    let mut terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(terminal::Output::new()?))?;
     let mut dirty = true;
     loop {
         let sig = signal.load(Ordering::SeqCst);
