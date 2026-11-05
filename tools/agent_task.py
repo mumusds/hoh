@@ -22,8 +22,13 @@ PARENT_SESSION_VARS=frozenset({'AI_AGENT','CLAUDECODE','CLAUDE_PID','CLAUDE_EFFO
     'CLAUDE_CODE_MESSAGING_SOCKET','CLAUDE_CODE_MESSAGING_TOKEN','CLAUDE_CODE_SESSION_ATTENDED','CLAUDE_CODE_ENTRYPOINT',
     'CLAUDE_CODE_EXECPATH','CODEX_SANDBOX','CODEX_SANDBOX_NETWORK_DISABLED'})
 
+# What tools/run_check.py sets for the check it runs (tests/bundle/test_tools.py keeps the two equal). Only the check's
+# own processes see them: the bridge records the session there, but the agent it starts and the bundle self-test run
+# without them, so nothing they start writes into that check's evidence (TB-01, TB-04).
+CHECK_VARIABLES=('HOH_EVIDENCE_DIR','HOH_CHECK_ID','HOH_CANDIDATE_ID','HOH_SPEC_SHA256','HOH_CANDIDATE_FILE','HOH_CHECK_RECORD_ID')
+
 def child_env(attempt_id:str|None=None)->dict[str,str]:
-    env={k:v for k,v in os.environ.items() if k not in PARENT_SESSION_VARS}
+    env={k:v for k,v in os.environ.items() if k not in PARENT_SESSION_VARS and k not in CHECK_VARIABLES}
     if attempt_id:env[PARENT_ENV]=attempt_id
     return env
 
@@ -220,7 +225,7 @@ def main(argv=None)->int:
     (out/'prompt.md').write_bytes(data)
     (out/'native-help.txt').write_text(help_output,encoding='utf-8')
     version=cli_version(a.agent,a.cwd)
-    record={'schema_version':'1.1','record_type':'bootstrap_native_attempt','attempt_id':attempt_id,'candidate_id':os.getenv('HOH_CANDIDATE_ID'),'check_id':os.getenv('HOH_CHECK_ID'),'parent_attempt':os.getenv(PARENT_ENV),'agent':a.agent,'cli_version':version,'role':a.role,'argv':cmd,'cwd':str(a.cwd.resolve()),'started_at':utcnow(),'prompt_sha256':sha256(out/'prompt.md'),'model_requested':model,'top_level_bootstrap':a.top_level,'env_removed':sorted(PARENT_SESSION_VARS&os.environ.keys()),'status':'RUNNING','product_accepted':False}
+    record={'schema_version':'1.1','record_type':'bootstrap_native_attempt','attempt_id':attempt_id,'candidate_id':os.getenv('HOH_CANDIDATE_ID'),'check_id':os.getenv('HOH_CHECK_ID'),'parent_attempt':os.getenv(PARENT_ENV),'agent':a.agent,'cli_version':version,'role':a.role,'argv':cmd,'cwd':str(a.cwd.resolve()),'started_at':utcnow(),'prompt_sha256':sha256(out/'prompt.md'),'model_requested':model,'top_level_bootstrap':a.top_level,'env_removed':sorted((PARENT_SESSION_VARS|set(CHECK_VARIABLES))&os.environ.keys()),'status':'RUNNING','product_accepted':False}
     if pi_packages is not None:record.update(env_set={'PI_OFFLINE':'1'},pi_packages=pi_packages)
     atomic_json(out/'attempt.json',record)
     print(f'Native {a.agent} invocation; logs: {out}',file=sys.stderr,flush=True)

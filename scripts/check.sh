@@ -8,8 +8,9 @@ case "${1:---bundle}" in
  --bundle)
   python3 tools/validate_bundle.py
   python3 tools/baseline.py verify
-  # The self-test never writes into a check it runs inside: no run_check variable reaches its tools and scripts.
-  env -u HOH_EVIDENCE_DIR -u HOH_CHECK_ID -u HOH_CANDIDATE_ID -u HOH_SPEC_SHA256 \
+  # The self-test never writes into a check it runs inside: none of tools/agent_task.py CHECK_VARIABLES reaches its
+  # tools and scripts (tests/bundle/test_tools.py checks this list).
+  env -u HOH_EVIDENCE_DIR -u HOH_CHECK_ID -u HOH_CANDIDATE_ID -u HOH_SPEC_SHA256 -u HOH_CANDIDATE_FILE -u HOH_CHECK_RECORD_ID \
     python3 -m unittest discover -s tests/bundle -p 'test_*.py' -v
   ;;
  --reports)
