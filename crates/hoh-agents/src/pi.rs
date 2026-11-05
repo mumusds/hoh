@@ -105,26 +105,23 @@ pub fn refusal(error: &str) -> &'static str {
 /// else.
 pub fn provider_failure(message: &str) -> &'static str {
     let m = message.to_lowercase();
-    if message.starts_with("No API key found")
-        || m.contains("401")
-        || m.contains("unauthorized")
-        || m.contains("api key")
+    let any = |patterns: &[&str]| patterns.iter().any(|p| m.contains(p));
+    // A limit or an overload first: their texts may well mention the key (M1T05R-09).
+    if any(&["429", "503", "529", "rate limit", "overloaded"]) {
+        "TRANSIENT_EXTERNAL"
+    } else if message.starts_with("No API key found")
+        || any(&[
+            "401",
+            "unauthorized",
+            "invalid api key",
+            "incorrect api key",
+            "authentication",
+        ])
     {
         "BLOCKED_AUTH"
     } else if message.starts_with("Model not found") {
         "MODEL_UNAVAILABLE"
-    } else if [
-        "429",
-        "503",
-        "529",
-        "rate limit",
-        "overloaded",
-        "timed out",
-        "timeout",
-    ]
-    .iter()
-    .any(|p| m.contains(p))
-    {
+    } else if any(&["timed out", "timeout"]) {
         "TRANSIENT_EXTERNAL"
     } else {
         "PERMANENT_EXTERNAL"
@@ -675,12 +672,14 @@ pub async fn run(
                         native_session = record["data"]["sessionId"].as_str().map(str::to_owned);
                         model = record["data"]["model"]["id"].as_str().map(str::to_owned);
                         // A resumed session must be the file found before the start, not a new one for the id.
+                        // Both sides must resolve: a file that is gone, or one pi has named but not written yet, is
+                        // not the session found before the start (M1T05R-06).
                         let opened = record["data"]["sessionFile"]
                             .as_str()
                             .and_then(|f| std::path::Path::new(f).canonicalize().ok());
                         let other_file = session_file
                             .as_ref()
-                            .is_some_and(|f| f.canonicalize().ok() != opened);
+                            .is_some_and(|f| opened.as_ref() != Some(f));
                         if native_session.as_deref() != Some(launch.session_id.as_str())
                             || other_file
                         {
@@ -921,42 +920,113 @@ pub async fn run(
 }
 
 /// Whether the session's file (`<timestamp>_<id>.jsonl`, as pi names it) is in its directory.
-/// The session's file as pi 1.5.0 finds it (`SessionManager.findById` with a session directory): the first `*.jsonl`
-/// in it whose header line is `{"type":"session", "id": <id>, "cwd": <this cwd>, ...}` (M1T05R-03). A file merely
-/// named after the id, empty, or of another cwd is not the session: pi would start a new one for the id.
+/// The session's file as pi 1.5.0 finds it (`SessionManager.findById` with a session directory, read from its
+/// source; M1T05R-03/07): the `*.jsonl` files of the directory in name order, the first whose header has this id and
+/// whose cwd names this directory. Only regular files are read (a FIFO would block, M1T05R-08). The canonical path of
+/// the file, or `None` when pi would start a new session for the id.
 pub fn find_session(launch: &Launch) -> Option<PathBuf> {
+    // pi compares with its own process.cwd(), the physical directory it runs in.
     let cwd = launch.cwd.canonicalize().ok()?;
-    let mut files: Vec<PathBuf> = std::fs::read_dir(&launch.session_dir)
+    let mut names: Vec<std::ffi::OsString> = std::fs::read_dir(&launch.session_dir)
         .ok()?
         .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
+        .map(|e| e.file_name())
+        .filter(|n| n.as_encoded_bytes().ends_with(b".jsonl"))
         .collect();
-    files.sort();
-    files.into_iter().find(|path| {
-        let Ok(file) = std::fs::File::open(path) else {
-            return false;
-        };
-        let mut first = String::new();
-        // The header is one short line; a bounded read keeps a huge or odd file from costing much.
-        if std::io::BufRead::read_line(
-            &mut std::io::BufReader::new(std::io::Read::take(file, 64 << 10)),
-            &mut first,
-        )
-        .is_err()
-        {
-            return false;
+    names.sort();
+    names
+        .into_iter()
+        .map(|name| launch.session_dir.join(name))
+        .find(|path| {
+            std::fs::metadata(path).is_ok_and(|m| m.is_file())
+                && session_header(path).is_some_and(|h| {
+                    h["id"] == launch.session_id
+                        && h["cwd"]
+                            .as_str()
+                            .filter(|c| !c.is_empty())
+                            .is_some_and(|c| resolve_like_pi(c, &cwd) == cwd)
+                })
+        })
+        .and_then(|path| path.canonicalize().ok())
+}
+
+/// pi's bound on reading a session header.
+const HEADER_SCAN: usize = 1 << 20;
+
+/// pi's `readSessionHeader`: within the first MiB, blank lines (JS `trim`, which also drops a BOM) and lines that are
+/// not JSON, or are JSON that is falsy in JS, are skipped; the first other JSON value decides — a session header with
+/// a string id, or not a session at all. A last line without LF counts only if the file ends within the bound.
+fn session_header(path: &std::path::Path) -> Option<Value> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(file, HEADER_SCAN as u64 + 1),
+        &mut bytes,
+    )
+    .ok()?;
+    let ended = bytes.len() <= HEADER_SCAN;
+    bytes.truncate(HEADER_SCAN);
+    let text = String::from_utf8_lossy(&bytes);
+    let mut lines: Vec<&str> = text.split('\n').collect();
+    if !ended {
+        // The bound cut the last line short: pi does not read it.
+        lines.pop();
+    }
+    for line in lines {
+        let blank = line
+            .trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}')
+            .is_empty();
+        if blank {
+            continue;
         }
-        let Ok(header) = serde_json::from_str::<Value>(&first) else {
-            return false;
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
         };
-        header["type"] == "session"
-            && header["id"] == launch.session_id
-            && header["cwd"]
-                .as_str()
-                .and_then(|c| std::path::Path::new(c).canonicalize().ok())
-                .is_some_and(|c| c == cwd)
-    })
+        let falsy = match &value {
+            Value::Null => true,
+            Value::Bool(b) => !b,
+            Value::Number(n) => n.as_f64() == Some(0.0),
+            Value::String(s) => s.is_empty(),
+            _ => false,
+        };
+        if falsy {
+            continue;
+        }
+        return (value["type"] == "session" && value["id"].is_string()).then_some(value);
+    }
+    None
+}
+
+/// pi's `resolvePath`: `~` is the home directory, a relative path is taken from `base` (pi's cwd), and `.`/`..` are
+/// resolved by name only, never through symlinks.
+fn resolve_like_pi(path: &str, base: &std::path::Path) -> PathBuf {
+    use std::path::Component;
+    let home = || {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default()
+    };
+    let expanded = match path {
+        "~" => home(),
+        p if p.starts_with("~/") => home().join(&p[2..]),
+        p => PathBuf::from(p),
+    };
+    let joined = if expanded.is_absolute() {
+        expanded
+    } else {
+        base.join(expanded)
+    };
+    let mut out = PathBuf::new();
+    for c in joined.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// The reply and any provider error of a final assistant message; a later message without an error clears an earlier

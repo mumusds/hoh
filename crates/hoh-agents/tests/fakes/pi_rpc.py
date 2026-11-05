@@ -13,7 +13,8 @@ session id and file.
 Pseudo-records (not sent as such): {"hoh_wait": {"command": T, "count": N}} waits until N commands of type T came;
 {"hoh_batch": [R, ...]} sends records in one write; {"hoh_split": [R, N]} sends R in N writes; {"hoh_stderr": BYTES}
 writes that many bytes to stderr; {"hoh_hold": PATH} waits until PATH exists; {"hoh_exit": CODE} exits at once; a {"hoh_keep_session": true} anywhere keeps the recorded session id; a {"hoh_new_file": true} anywhere makes
-a new session file even if one is found.
+a new session file even if one is found; a {"hoh_lose_session": true} anywhere deletes the found file and reports a new
+path it never writes.
 LOGDIR gets received.jsonl (every client line) and sent.jsonl (the bytes sent). Records are split on LF only:
 str.splitlines() would also split on U+2028/U+2029 inside JSON strings, which is what this fake exists to test.
 """
@@ -22,6 +23,30 @@ import os
 import sys
 import time
 from pathlib import Path
+
+
+HEADER_SCAN = 1 << 20
+
+
+def header_of(path: Path):
+    """pi's readSessionHeader: within the first MiB, skip blank lines and lines that are not JSON or are JSON that is
+    falsy in JS; the first other value decides (a session header with a string id, or not a session)."""
+    data = path.read_bytes()[:HEADER_SCAN + 1]
+    ended = len(data) <= HEADER_SCAN
+    lines = data[:HEADER_SCAN].decode('utf-8', 'replace').split('\n')
+    if not ended:
+        lines.pop()
+    for line in lines:
+        if not line.strip().strip('\ufeff').strip():
+            continue
+        try:
+            value = json.loads(line)
+        except ValueError:
+            continue
+        if value in (None, False, 0, '') and not isinstance(value, (dict, list)):
+            continue
+        return value if isinstance(value, dict) and value.get('type') == 'session' and isinstance(value.get('id'), str) else None
+    return None
 
 
 def main() -> int:
@@ -34,27 +59,31 @@ def main() -> int:
     session_id = argv[argv.index('--session-id') + 1] if '--session-id' in argv else None
     keep = '"hoh_keep_session"' in text  # a pi that reports another session than the one asked for
     fresh = '"hoh_new_file"' in text  # a pi that does not find the session and makes a new file for the id
-    text = '\n'.join(l for l in text.split('\n') if '"hoh_keep_session"' not in l and '"hoh_new_file"' not in l)
+    lose = '"hoh_lose_session"' in text  # the session file vanishes; pi names a new path it has not written yet
+    text = '\n'.join(l for l in text.split('\n')
+                     if not any(k in l for k in ('"hoh_keep_session"', '"hoh_new_file"', '"hoh_lose_session"')))
     if session_id and not keep:
         recorded_state = next((json.loads(l)['data'] for l in text.split('\n')
                                if l.strip() and json.loads(l).get('command') == 'get_state' and 'data' in json.loads(l)), None)
         if '--session-dir' in argv:
-            # As pi 1.5.0 SessionManager.findById: the first *.jsonl whose header has this id and this cwd, else a
-            # new file with that header.
+            # As pi 1.5.0 SessionManager.findById: the *.jsonl files in name order, the first whose header (see
+            # header_of) has this id and a cwd that resolves, by name, to this directory; else a new file.
             d = Path(argv[argv.index('--session-dir') + 1])
             d.mkdir(parents=True, exist_ok=True)
-            cwd = os.path.realpath(os.getcwd())
+            cwd = os.getcwd()  # physical, as process.cwd()
             found = None
-            for f in sorted(d.glob('*.jsonl')):
-                try:
-                    header = json.loads(f.read_text(encoding='utf-8').split('\n', 1)[0])
-                except (ValueError, OSError):
+            for f in sorted(p for p in d.iterdir() if p.name.endswith('.jsonl')):
+                if not f.is_file():
                     continue
-                if isinstance(header, dict) and header.get('type') == 'session' and header.get('id') == session_id \
-                        and os.path.realpath(header.get('cwd', '')) == cwd:
+                header = header_of(f)
+                if header and header.get('id') == session_id and isinstance(header.get('cwd'), str) and header['cwd'] \
+                        and os.path.normpath(os.path.join(cwd, os.path.expanduser(header['cwd']))) == cwd:
                     found = f
                     break
-            if found is None or fresh:
+            if lose and found is not None:
+                found.unlink()
+                found = d / f'2026-11-04T09-09-09-000Z_{session_id}.jsonl'
+            elif found is None or fresh:
                 found = d / f'2026-11-04T00-00-{len(list(d.glob("*.jsonl"))):02d}-000Z_{session_id}.jsonl'
                 found.write_text(json.dumps({'type': 'session', 'version': 3, 'id': session_id,
                                              'timestamp': '2026-11-04T00:00:00.000Z', 'cwd': cwd}) + '\n')
