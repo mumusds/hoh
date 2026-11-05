@@ -362,15 +362,12 @@ pub async fn run(
             native_id: Some(launch.session_id.clone()),
             native_path: Some(launch.session_dir.to_string_lossy().into_owned()),
             agent_version: attempt.agent_version.clone(),
-            // The probed capabilities (M1R-01); this adapter takes no steer and answers no dialog.
-            capabilities: {
-                let mut caps = crate::capabilities::of_session(
-                    &launch.capabilities,
-                    &[("mid_turn_steer", false), ("ui_dialogs", false)],
-                );
-                caps["agent_settled"] = json!(launch.settled_event);
-                caps
-            },
+            // The probed capabilities (M1R-01); this adapter takes no steer and answers no dialog. Whether pi emits
+            // agent_settled is the adapter's setting, not a capability of the session (M1T04R-13).
+            capabilities: crate::capabilities::of_session(
+                &launch.capabilities,
+                &[("mid_turn_steer", false), ("ui_dialogs", false)],
+            ),
         })
         .await?;
     step(

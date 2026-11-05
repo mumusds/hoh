@@ -485,23 +485,30 @@ pub async fn run(
     exec::run(store, attempt, turn, args, reason, cancel, &mut steers).await
 }
 
-/// The session row of a turn: the probed capabilities (M1R-01); on exec there is no steer and no delta, and resume
-/// only if `codex exec` offers it.
+/// The session row of a turn: the probed capabilities (M1R-01). Server requests are answered headless, so there are
+/// no dialogs; on exec there is no steer and no delta, and resume only if a resumed exec turn of this launch could
+/// start, by the same rule as that turn (M1T04R-11).
 fn session(
     attempt: &AttemptRef,
     turn: &Turn,
     app_server: bool,
     native_id: Option<String>,
 ) -> Session {
-    let limits = if app_server {
-        Vec::new()
-    } else {
-        vec![
+    let mut limits = vec![("ui_dialogs", false)];
+    if !app_server {
+        let resumed = Launch {
+            resume: Some(String::new()),
+            ..turn.launch.clone()
+        };
+        limits.extend([
             ("mid_turn_steer", false),
             ("partial_messages", false),
-            ("resume", offers(&turn.launch.exec_help, "resume")),
-        ]
-    };
+            (
+                "resume",
+                offers(&turn.launch.exec_help, "resume") && exec_args(&resumed).is_ok(),
+            ),
+        ]);
+    }
     Session {
         session_id: attempt.session_id.clone(),
         agent: "codex".to_owned(),

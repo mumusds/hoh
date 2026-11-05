@@ -1678,6 +1678,10 @@ for line in sys.stdin:
         assert_eq!(session.capabilities[absent], false, "{absent}: {session:?}");
     }
     assert_eq!(session.capabilities["structured_events"], true);
+    assert_eq!(
+        session.capabilities["ui_dialogs"], false,
+        "server requests are answered headless"
+    );
     // The rule dispatch reads the row with: no resume, so a task that needs it is ROLE_CAPABILITY_MISSING.
     let granted = hoh_core::decision::granted_capabilities(&session.capabilities);
     assert!(
@@ -1685,6 +1689,51 @@ for line in sys.stdin:
         "{granted:?}"
     );
     assert!(granted.contains("structured_events"));
+    Ok(())
+}
+
+/// On exec a session can be resumed only if a resumed exec turn could start: `codex exec resume --help` was probed
+/// and offers what the turn needs (`--json`, the YOLO flag). The probe's resume alone, from `codex exec --help`, is not
+/// enough (M1T04R-11).
+#[tokio::test]
+async fn an_exec_session_resumes_only_if_a_resumed_exec_turn_could_start() -> R {
+    let world = World::new()?;
+    let resume_help = "Usage: codex exec resume [OPTIONS] [SESSION_ID] [PROMPT]\n  --json\n  --dangerously-bypass-approvals-and-sandbox\n";
+    for (i, (help, resumable)) in [
+        (None, false),
+        (
+            Some("Usage: codex exec resume [SESSION_ID]\n  --json\n"),
+            false,
+        ),
+        (Some(resume_help), true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = format!("exec-resume-{i}");
+        let fake = world.fake(&name, None, "exec", false)?;
+        let mut turn = world.turn(&fake, &format!("logs/{name}"))?;
+        turn.launch.app_server_help = None;
+        turn.launch.exec_resume_help = help.map(str::to_owned);
+        let attempt = world
+            .attempt_in("codex", &format!("A{i}"), &format!("S{i}"), "0.166.0")
+            .await?;
+        let outcome = run(&world, &attempt, &turn).await?;
+        assert_eq!(
+            (outcome.state, outcome.mode),
+            (AttemptState::Settled, Mode::Exec),
+            "{name}"
+        );
+        let session = world
+            .store
+            .reader()?
+            .session(&format!("S{i}"))?
+            .ok_or("no session")?;
+        assert_eq!(
+            session.capabilities["resume"], resumable,
+            "{name}: {session:?}"
+        );
+    }
     Ok(())
 }
 
