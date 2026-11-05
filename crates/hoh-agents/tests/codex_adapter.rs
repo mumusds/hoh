@@ -1424,3 +1424,72 @@ async fn a_message_goes_to_the_steer_aimed_at_its_turn() -> R {
     assert_eq!(outcome.state, AttemptState::Settled);
     Ok(())
 }
+
+/// A steer whose input someone else has already moved on (here REJECTED) is recorded and does not stop the turn.
+#[tokio::test]
+async fn an_input_moved_elsewhere_does_not_stop_the_turn() -> R {
+    let world = World::new()?;
+    let case = Case::load("app-server-steer")?;
+    let fake = world.fake("moved-elsewhere", Some(&case), "exec", false)?;
+    let attempt = world.attempt("A1").await?;
+    let turn = world.turn(&fake, "logs/A1")?;
+    let (tx, steers) = mpsc::channel(4);
+    let latch = CancelLatch::new();
+    let running = codex::run(&world.store, &attempt, &turn, &latch, steers);
+    let steering = async {
+        active_turn(&world, "A1").await?;
+        world
+            .store
+            .enqueue_input(NewInput {
+                input_id: "I1".to_owned(),
+                run_id: "R".to_owned(),
+                kind: "STEER".to_owned(),
+                target_role: Some("developer".to_owned()),
+                payload: json!({"text": "x"}),
+            })
+            .await?;
+        world
+            .store
+            .move_input(hoh_core::persistence::InputMove {
+                input_id: "I1".to_owned(),
+                from: InputState::Queued,
+                to: InputState::Rejected,
+                reason: Some("withdrawn".to_owned()),
+            })
+            .await?;
+        let (reply, receipt) = oneshot::channel();
+        tx.send(Steer {
+            input_id: "I1".to_owned(),
+            text: "Stop running the command now and reply exactly STEERED.".to_owned(),
+            expected_turn: Some("hoh-stale-turn-id".to_owned()),
+            reply,
+        })
+        .await
+        .map_err(|_| "no steer channel")?;
+        let first = receipt.await?;
+        let (reply, receipt) = oneshot::channel();
+        tx.send(Steer {
+            input_id: "I1".to_owned(),
+            text: "Stop running the command now and reply exactly STEERED.".to_owned(),
+            expected_turn: None,
+            reply,
+        })
+        .await
+        .map_err(|_| "no steer channel")?;
+        Ok::<(SteerReceipt, SteerReceipt), Box<dyn std::error::Error>>((first, receipt.await?))
+    };
+    let (outcome, receipts) = tokio::join!(running, steering);
+    let (outcome, _) = (outcome?, receipts?);
+    assert_eq!(outcome.state, AttemptState::Settled);
+    assert_eq!(
+        input_state(&world, "I1")?,
+        InputState::Rejected,
+        "the other move stands"
+    );
+    let notes = events(&world, "adapter.diagnostic")?
+        .into_iter()
+        .filter(|d| d["reason"] == "input not moved")
+        .count();
+    assert!(notes >= 1, "the refused moves are recorded");
+    Ok(())
+}
