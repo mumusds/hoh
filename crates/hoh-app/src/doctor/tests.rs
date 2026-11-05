@@ -60,6 +60,13 @@ fn status_commands_say_logged_in_or_not_and_nothing_else_counts() {
             Some(Auth::NotVerified),
         ),
         (Agent::Claude, out(0, "logged in", ""), None),
+        // A positive answer counts only from a command that succeeded (M1T07R-12).
+        (Agent::Claude, out(1, "{\"loggedIn\": true}", ""), None),
+        (
+            Agent::Pi,
+            out(1, "{\"status\":\"ready\",\"provider\":\"p\"}\n", ""),
+            None,
+        ),
         (Agent::Claude, out(0, "{\"loggedIn\": \"yes\"}", ""), None),
         (
             Agent::Pi,

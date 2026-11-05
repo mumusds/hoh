@@ -204,10 +204,11 @@ async fn one(
     };
     let ended = async {
         std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
-        let _ = std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(&work)
-            .status();
+        // The CLIs expect a repository; its `git init` is bounded, logged and group-killed like every other command
+        // (M1T07R-10), and past the preparation limit it is not started.
+        let git = probe::find_on_path("git", &env.path).ok_or("git is not installed")?;
+        let work_arg = work.display().to_string();
+        stdout_of(&git, &["-C", &work_arg, "init", "-q"], env)?;
         let prepared = prepare(agent, &launcher, &work, logs.clone(), env)?;
         store
             .create_attempt(NewAttempt {

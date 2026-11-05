@@ -618,3 +618,35 @@ fn a_shared_deadline_bounds_commands_run_one_after_another() -> R {
     );
     Ok(())
 }
+
+/// A launcher that cannot be started yet (ETXTBSY: it is still open for writing) is retried only while the shared
+/// deadline lasts; past it, it is not started at all, even if it becomes startable later (M1T07R-11).
+#[test]
+fn a_busy_launcher_is_not_started_past_the_shared_deadline() -> R {
+    let tmp = tempfile::tempdir()?;
+    let (dir, path) = fake(tmp.path(), "busy", "codex", "#!/bin/sh\necho started\n")?;
+    let writer = std::fs::OpenOptions::new().write(true).open(&path)?;
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(800));
+        drop(writer);
+    });
+    let log: RunLog = Default::default();
+    let mut env = env_for(&dir);
+    env.log = Some(log.clone());
+    let started = std::time::Instant::now();
+    env.deadline = Some(started + Duration::from_millis(300));
+    let result = run_status(&path, &["login", "status"], &env);
+    let took = started.elapsed();
+    release.join().map_err(|_| "release thread")?;
+    assert!(
+        matches!(result, Err(ProbeError::NotStarted { .. })),
+        "{result:?}"
+    );
+    assert!(
+        took < Duration::from_millis(700),
+        "retried past the deadline: {took:?}"
+    );
+    let runs = log.lock().map_err(|_| "poisoned")?.clone();
+    assert_eq!(runs.iter().map(|r| r.started).collect::<Vec<_>>(), [false]);
+    Ok(())
+}

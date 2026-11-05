@@ -54,7 +54,7 @@ impl Sandbox {
         };
         s.write(
             "git",
-            "#!/bin/sh\n[ \"$1\" = --version ] && echo 'git version 2.43.0'\n",
+            "#!/bin/sh\ncase \"$1\" in\n --version) echo 'git version 2.43.0';;\n -C) mkdir -p \"$2/.git\";;\n *) exit 1;;\nesac\n",
         )?;
         s.write(
             "node",
@@ -649,5 +649,54 @@ fn a_tool_without_a_version_is_installed_in_both_forms() -> R {
         !line.contains("未安装") && line.contains("版本未知"),
         "{line}"
     );
+    Ok(())
+}
+
+/// The live phase's `git init` of its scratch work directory is bounded too (M1T07R-10): one that hangs is stopped
+/// at the preparation limit with its group, the agent gets no attempt, and doctor ends.
+#[test]
+fn a_hung_git_init_does_not_hold_up_live() -> R {
+    let s = Sandbox::new()?;
+    s.write(
+        "git",
+        "#!/bin/sh\ncase \"$1\" in\n --version) echo 'git version 2.43.0';;\n *) sleep 60 & sleep 60;;\nesac\n",
+    )?;
+    s.codex(Status::LoggedIn)?;
+    let (out, took) = s.doctor_in(&[], &["--live", "--output", "json"], &[])?;
+    let report: Value = serde_json::from_slice(&out.stdout)?;
+    let live = &report["agents"]["codex"]["live"];
+    assert!(
+        took <= Duration::from_secs(30),
+        "doctor --live took {took:?}"
+    );
+    assert!(
+        live["error"].as_str().is_some_and(|e| e.contains("git")),
+        "{live}"
+    );
+    assert!(
+        live["stored"].is_null(),
+        "no attempt for a turn that could not be prepared: {live}"
+    );
+    assert!(
+        processes_mentioning(s.bin.path()).is_empty(),
+        "a hung git init is still there"
+    );
+    let ran: Vec<String> = report["probes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|p| p["argv"].to_string())
+        .collect();
+    assert!(
+        ran.iter().any(|a| a.contains("init")),
+        "the git init is in the probe log: {ran:?}"
+    );
+    if let Some(scratch) = live["logs"]
+        .as_str()
+        .and_then(|logs| Path::new(logs).parent())
+        .and_then(Path::parent)
+    {
+        let _ = std::fs::remove_dir_all(scratch);
+    }
     Ok(())
 }
