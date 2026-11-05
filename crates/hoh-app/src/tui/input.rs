@@ -259,9 +259,11 @@ fn csi(buf: &[u8]) -> Front {
 /// `1;5:3C` its release). The event type is a number, as in crossterm (M1T08R-28); a modifier that is no number
 /// makes a plain press whatever follows it, crossterm's fallback (M1T08R-35).
 fn csi_key(params: &[u8], fin: u8) -> Option<Event> {
-    // Only what crossterm's `parse_csi` hands on to a key parser: no parameters, or parameters that start with a
-    // digit or `;` (`<` is a mouse report, `?` a terminal's answer, anything else no key; M1T08R-39).
-    if !matches!(params.first(), None | Some(b'0'..=b'9' | b';')) {
+    // Only what crossterm's reader takes for a key: no parameters, or parameters that start with a digit (`<` is a
+    // mouse report, `?` a terminal's answer, anything else no key; M1T08R-39). It reads byte by byte and fails on
+    // `ESC [ ;` already, so a `;` first is no key either (M1T08R-40); unlike crossterm, the rest of the sequence is
+    // not typed as text.
+    if !matches!(params.first(), None | Some(b'0'..=b'9')) {
         return None;
     }
     let text = std::str::from_utf8(params).ok()?;
@@ -694,17 +696,23 @@ mod tests {
         );
     }
 
-    /// Parameters that start with anything but a digit or `;` (`?`, `<`, `=`, `>`, `+`) make no key, as crossterm's
-    /// `parse_csi` hands only those on to its key parsers, however the bytes arrive (M1T08R-39).
+    /// Parameters that start with anything but a digit (`;`, `?`, `<`, `=`, `>`, `+`, `:`, a space) make no key:
+    /// crossterm's reader hands only those to its key parsers, and fails on `ESC [ ;` before the rest arrives
+    /// (M1T08R-39, -40). The whole sequence is skipped, however the bytes arrive.
     #[test]
     fn a_csi_whose_parameters_start_otherwise_is_no_key() {
-        let bytes = b"\x1b[+13ux\x1b[?1Dy\x1b[=5Az\x1b[>1;5C!\x1b[<0;1;1M.";
+        let bytes = b"\x1b[+13ux\x1b[?1Dy\x1b[=5Az\x1b[>1;5C!\x1b[<0A.\x1b[;1D,\x1b[;5A-\x1b[;2H_\x1b[:1A/\x1b[ 1A#";
         let keys = [
             k(KeyCode::Char('x'), N),
             k(KeyCode::Char('y'), N),
             k(KeyCode::Char('z'), N),
             k(KeyCode::Char('!'), N),
             k(KeyCode::Char('.'), N),
+            k(KeyCode::Char(','), N),
+            k(KeyCode::Char('-'), N),
+            k(KeyCode::Char('_'), N),
+            k(KeyCode::Char('/'), N),
+            k(KeyCode::Char('#'), N),
         ];
         assert_eq!(all(bytes, false), keys);
         let mut d = Decoder::default();
