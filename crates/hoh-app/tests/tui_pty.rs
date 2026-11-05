@@ -17,7 +17,9 @@
 
 mod pty;
 
-use pty::{Hoh, Pty, R, exit_within, find, signal, spawn_in, spawn_without_ctty_in, tree};
+use pty::{
+    Hoh, Pty, R, exit_within, find, in_write, signal, spawn_in, spawn_without_ctty_in, tree,
+};
 use rustix::process::Signal;
 use std::path::Path;
 use std::time::Duration;
@@ -232,6 +234,56 @@ fn an_unfinished_escape_sequence_holds_up_neither_the_exit_nor_the_next_input() 
         String::from_utf8_lossy(&unread),
         "echo NEXT\n",
         "hoh read the input typed after the signal"
+    );
+    Ok(())
+}
+
+/// A signal that comes while hoh is held in a write (its terminal's output stopped, as Ctrl+S or a stalled link
+/// does) ends it before it reads anything typed after the signal (M1T08R-19).
+#[test]
+fn a_signal_while_output_is_held_leaves_later_input_for_the_shell() -> R {
+    let (home, project) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    let mut s = open(project.path(), home.path(), &[])?;
+    s.pty.hold_output(true)?;
+    // A key to draw, and the draw is held.
+    s.pty.send(b"a")?;
+    in_write(&s.child, WAIT)?;
+    signal(&s.child, Signal::TERM)?;
+    s.pty.send(b"echo NEXT\n")?;
+    s.pty.hold_output(false)?;
+    let status = exit_within(&mut s.child, WAIT)?;
+    assert_eq!(status.code(), Some(143));
+    assert_eq!(s.pty.stty()?, s.baseline, "terminal attributes");
+    assert_eq!(
+        String::from_utf8_lossy(&s.pty.unread_input(Duration::from_secs(2))?),
+        "echo NEXT\n",
+        "hoh read the input typed after the signal"
+    );
+    Ok(())
+}
+
+/// A slow link may split a sequence: what follows `ESC [` within half a second still completes it, so Up recalls
+/// the last input instead of typing `A`; a paste whose start marker comes in two parts is still one paste, not lines
+/// submitted one by one (M1T08R-20).
+#[test]
+fn a_sequence_split_by_a_slow_link_is_still_one_key() -> R {
+    let (home, project) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    let history = project.path().join(".hoh/input-history.jsonl");
+    let mut s = open(project.path(), home.path(), &[])?;
+    s.pty.send(b"one\r")?;
+    s.pty.wait_for("未发送", 0, WAIT)?;
+    for (start, rest) in [
+        (&b"\x1b["[..], &b"A\r"[..]),
+        (b"\x1b[20", b"0~line1\rline2\x1b[201~\r"),
+    ] {
+        s.pty.send(start)?;
+        std::thread::sleep(Duration::from_millis(150));
+        s.pty.send(rest)?;
+    }
+    assert_eq!(s.detach()?, Some(0));
+    assert_eq!(
+        std::fs::read_to_string(&history)?,
+        "{\"text\":\"one\"}\n{\"text\":\"one\"}\n{\"text\":\"line1 line2\"}\n"
     );
     Ok(())
 }

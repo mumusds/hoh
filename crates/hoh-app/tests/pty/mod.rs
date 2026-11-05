@@ -9,7 +9,7 @@ use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::fd::OwnedFd;
 use rustix::fs::{Mode, OFlags};
 use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
-use rustix::termios::{Winsize, tcsetwinsize};
+use rustix::termios::{Action, Winsize, tcflow, tcsetwinsize};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -181,6 +181,14 @@ impl Pty {
         Ok(())
     }
 
+    /// Stop or restart the terminal's output, as Ctrl+S and Ctrl+Q or a stalled link do: a program writing to it
+    /// meanwhile is held in write(2).
+    pub fn hold_output(&self, held: bool) -> R {
+        let slave = self.slave.as_ref().ok_or("the PTY is closed")?;
+        tcflow(slave, if held { Action::OOff } else { Action::OOn })?;
+        Ok(())
+    }
+
     /// Type `bytes` as the user would.
     pub fn send(&mut self, bytes: &[u8]) -> R {
         let master = self.master.as_mut().ok_or("the terminal was hung up")?;
@@ -311,6 +319,23 @@ pub fn exit_within(Hoh(child): &mut Hoh, timeout: Duration) -> R<ExitStatus> {
 }
 
 /// Send `signal` to the process `child`.
+/// Wait until `hoh` (single-threaded) is inside write(2), as its `/proc/<pid>/syscall` says.
+pub fn in_write(Hoh(child): &Hoh, timeout: Duration) -> R {
+    #[cfg(target_arch = "x86_64")]
+    const WRITE: &str = "1";
+    #[cfg(target_arch = "aarch64")]
+    const WRITE: &str = "64";
+    let path = format!("/proc/{}/syscall", child.id());
+    let end = Instant::now() + timeout;
+    while Instant::now() < end {
+        if std::fs::read_to_string(&path)?.split(' ').next() == Some(WRITE) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Err(format!("hoh was not seen in write(2) within {timeout:?}").into())
+}
+
 pub fn signal(Hoh(child): &Hoh, signal: rustix::process::Signal) -> R {
     let pid = rustix::process::Pid::from_child(child);
     rustix::process::kill_process(pid, signal)?;
