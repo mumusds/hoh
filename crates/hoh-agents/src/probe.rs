@@ -174,50 +174,60 @@ fn set(capabilities: &mut BTreeMap<String, Option<bool>>, key: &str, value: bool
     capabilities.insert(key.to_owned(), Some(value));
 }
 
-/// Codex: App Server when `codex app-server --help` works (its schema decides steer/resume/deltas), else `exec --json`.
+/// Codex: App Server when `codex app-server --help` works and its schema has what every turn needs (its schema then
+/// decides steer, resume, deltas and token usage), else `exec --json`; refused when neither can run a turn (M1T07R-15).
 fn probe_codex(
     launcher: &Path,
     env: &ProbeEnv,
     caps: &mut BTreeMap<String, Option<bool>>,
 ) -> Result<Probed, ProbeError> {
     let exec_help = run_ok(launcher, &["exec", "--help"], env)?.stdout;
+    let exec_text = String::from_utf8_lossy(&exec_help).into_owned();
     let app = run(launcher, &["app-server", "--help"], env)?;
     let mut help = exec_help.clone();
-    if !app.status.success() {
-        if let Some(why) =
-            crate::codex::exec_interface_missing(&String::from_utf8_lossy(&exec_help))
-        {
-            return Err(ProbeError::Unsupported {
-                agent: Agent::Codex,
-                detail: format!("no app-server, and {why}"),
-            });
+    let mut no_app_server = "no app-server".to_owned();
+    if app.status.success() {
+        let schema = codex_schema(launcher, env)?;
+        match crate::codex::app_server_interface_missing(&schema.requests, &schema.notifications) {
+            None => {
+                help.extend_from_slice(&app.stdout);
+                set(caps, "structured_events", true);
+                set(caps, "resume", schema.requests.contains("thread/resume"));
+                set(
+                    caps,
+                    "mid_turn_steer",
+                    schema.requests.contains("turn/steer"),
+                );
+                set(
+                    caps,
+                    "partial_messages",
+                    schema.notifications.contains("item/agentMessage/delta"),
+                );
+                set(
+                    caps,
+                    "token_usage",
+                    schema.notifications.contains("thread/tokenUsage/updated"),
+                );
+                return Ok((Transport::AppServer, help, Some(schema.hash)));
+            }
+            Some(why) => no_app_server = why,
         }
-        set(caps, "structured_events", true);
-        set(caps, "resume", contains(&exec_help, "resume"));
-        set(caps, "mid_turn_steer", false);
-        set(caps, "partial_messages", false);
-        return Ok((Transport::Exec, help, None));
     }
-    help.extend_from_slice(&app.stdout);
-    let schema = codex_schema(launcher, env)?;
+    if let Some(why) = crate::codex::exec_interface_missing(&exec_text) {
+        return Err(ProbeError::Unsupported {
+            agent: Agent::Codex,
+            detail: format!("{no_app_server}, and {why}"),
+        });
+    }
     set(caps, "structured_events", true);
-    set(caps, "resume", schema.requests.contains("thread/resume"));
     set(
         caps,
-        "mid_turn_steer",
-        schema.requests.contains("turn/steer"),
+        "resume",
+        crate::adapter::lists_command(&exec_text, "resume"),
     );
-    set(
-        caps,
-        "partial_messages",
-        schema.notifications.contains("item/agentMessage/delta"),
-    );
-    set(
-        caps,
-        "token_usage",
-        schema.notifications.contains("thread/tokenUsage/updated"),
-    );
-    Ok((Transport::AppServer, help, Some(schema.hash)))
+    set(caps, "mid_turn_steer", false);
+    set(caps, "partial_messages", false);
+    Ok((Transport::Exec, help, None))
 }
 
 /// What `codex app-server generate-json-schema` produced: its tree hash and the request and notification methods.
@@ -438,9 +448,13 @@ fn probe_claude(
     set(
         caps,
         "partial_messages",
-        contains(&help, "--include-partial-messages"),
+        crate::adapter::offers(&String::from_utf8_lossy(&help), crate::claude::PARTIAL_FLAG),
     );
-    set(caps, "resume", contains(&help, "--resume"));
+    set(
+        caps,
+        "resume",
+        crate::adapter::offers(&String::from_utf8_lossy(&help), "--resume"),
+    );
     Ok((Transport::StreamJson, help, None))
 }
 
@@ -462,15 +476,10 @@ fn probe_pi(
     set(
         caps,
         "resume",
-        contains(&help, "--session-id") || contains(&help, "--resume"),
+        crate::adapter::offers(&String::from_utf8_lossy(&help), "--session-id")
+            || crate::adapter::offers(&String::from_utf8_lossy(&help), "--resume"),
     );
     Ok((Transport::Rpc, help, None))
-}
-
-fn contains(haystack: &[u8], needle: &str) -> bool {
-    haystack
-        .windows(needle.len())
-        .any(|w| w == needle.as_bytes())
 }
 
 /// First stdout line of `<cli> --version`, verbatim.

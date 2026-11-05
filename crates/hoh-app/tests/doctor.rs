@@ -273,23 +273,37 @@ fn processes_mentioning(dir: &Path) -> Vec<String> {
 }
 
 /// An installed CLI its adapter cannot start is incompatible and blocks (exit 3), for every agent and not only codex
-/// (REQ-006; M1R-03): claude without `--output-format`, pi without `--session-id` or `--session-dir`. The probe refuses
-/// it, so no compat manifest entry can make it compatible.
+/// (REQ-006; M1R-03, M1T07R-14): claude without `-p`, `--verbose` or `--output-format`, pi without `--session-id` or
+/// `--session-dir`. Only the option's declaration is removed (a flag named in another option's text is not offered).
+/// The probe refuses such a CLI, so no compat manifest entry can make it compatible.
 #[test]
 fn a_cli_without_what_its_adapter_needs_is_incompatible() -> R {
     for (agent, fixture, flag) in [
         ("claude", "claude/2.1.318/help.txt", "--output-format"),
+        ("claude", "claude/2.1.318/help.txt", "-p"),
+        ("claude", "claude/2.1.318/help.txt", "--verbose"),
         ("pi", "pi/1.5.0/help.txt", "--session-id"),
         ("pi", "pi/1.5.0/help.txt", "--session-dir"),
     ] {
         let s = Sandbox::new()?;
         s.codex(Status::LoggedIn)?;
         let recorded = std::fs::read_to_string(fixtures().join(fixture))?;
+        // Without the line that declares the option, indented as declarations are.
         let help: String = recorded
             .lines()
-            .filter(|l| !l.contains(flag))
+            .filter(|l| {
+                let t = l.trim_start();
+                !(l.len() - t.len() <= 8
+                    && t.starts_with('-')
+                    && t.split("  ")
+                        .next()
+                        .unwrap_or(t)
+                        .split(|c: char| c.is_whitespace() || c == ',')
+                        .any(|w| w.split(['=', '[']).next() == Some(flag)))
+            })
             .map(|l| format!("{l}\n"))
             .collect();
+        assert_eq!(recorded.lines().count() - help.lines().count(), 1, "{flag}");
         let help_file = s.home.path().join("help.txt");
         std::fs::write(&help_file, help)?;
         if agent == "claude" {
@@ -672,7 +686,7 @@ fn live_drives_an_exec_only_codex_through_exec() -> R {
         "codex",
         &format!(
             "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n \
-             exec) if [ \"$2\" = --help ]; then cat '{f}/help-exec.txt'; elif [ \"$2\" = resume ]; then echo 'Usage: codex exec resume --json --dangerously-bypass-approvals-and-sandbox --model'; \
+             exec) if [ \"$2\" = --help ]; then cat '{f}/help-exec.txt'; elif [ \"$2\" = resume ]; then printf 'Usage: codex exec resume\\n      --json\\n      --dangerously-bypass-approvals-and-sandbox\\n  -m, --model <MODEL>\\n'; \
              else cat > /dev/null; cat '{f}/exec/stdout.jsonl'; fi;;\n \
              login) echo 'Logged in using ChatGPT' >&2;;\n *) echo \"error: unrecognized subcommand '$1'\" >&2; exit 2;;\nesac\n",
             f = f.display()
@@ -719,6 +733,58 @@ fn live_drives_an_exec_only_codex_through_exec() -> R {
             .as_str()
             .is_some_and(|logs| Path::new(logs).starts_with(s.tmp.path())),
         "{live}"
+    );
+    Ok(())
+}
+
+/// An App Server whose schema lacks what every turn needs (`turn/start`) is not used: the probe takes exec, and so does
+/// the live turn (M1T07R-15).
+#[test]
+fn live_drives_codex_through_exec_when_its_app_server_lacks_turn_start() -> R {
+    let s = Sandbox::new()?;
+    let f = fixtures().join("codex/0.166.0");
+    let schema = s.home.path().join("schema");
+    std::fs::create_dir(&schema)?;
+    assert!(
+        std::process::Command::new("cp")
+            .arg("-R")
+            .arg(f.join("app-server-schema/."))
+            .arg(&schema)
+            .status()?
+            .success()
+    );
+    let mut requests: Value =
+        serde_json::from_slice(&std::fs::read(schema.join("ClientRequest.json"))?)?;
+    requests["oneOf"]
+        .as_array_mut()
+        .ok_or("no oneOf")?
+        .retain(|v| v["properties"]["method"]["enum"] != serde_json::json!(["turn/start"]));
+    std::fs::write(
+        schema.join("ClientRequest.json"),
+        serde_json::to_vec(&requests)?,
+    )?;
+    s.write(
+        "codex",
+        &format!(
+            "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n \
+             exec) if [ \"$2\" = --help ]; then cat '{f}/help-exec.txt'; elif [ \"$2\" = resume ]; then printf 'Usage: codex exec resume\\n      --json\\n'; \
+             else cat > /dev/null; cat '{f}/exec/stdout.jsonl'; fi;;\n \
+             app-server) case \"$2\" in\n  --help) cat '{f}/help-app-server.txt';;\n  generate-json-schema) [ \"$3\" = --out ] && mkdir -p \"$4\" && cp -R '{s}/.' \"$4/\";;\n  \
+             *) exit 9;;\n esac;;\n \
+             login) echo 'Logged in using ChatGPT' >&2;;\n *) echo \"error: unrecognized subcommand '$1'\" >&2; exit 2;;\nesac\n",
+            f = f.display(),
+            s = schema.display()
+        ),
+    )?;
+    let (out, _) = s.doctor_in(&[], &["--live", "--output", "json"], &[])?;
+    let report: Value = serde_json::from_slice(&out.stdout)?;
+    let live = &report["agents"]["codex"]["live"];
+    assert_eq!(live["state"], "SETTLED", "{live}");
+    let logs = Path::new(live["logs"].as_str().ok_or("no logs")?);
+    assert!(
+        !logs.join("app-server.stdout.jsonl").exists(),
+        "the App Server was started: {}",
+        logs.display()
     );
     Ok(())
 }

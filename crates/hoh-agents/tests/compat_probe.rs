@@ -186,8 +186,29 @@ fn test_027_01_probe_three_fake_binaries_into_a_valid_manifest() -> R {
     Ok(())
 }
 
-/// A CLI its adapter cannot start is refused by the probe, by the adapter's own rule (M1R-03): claude without
-/// `--output-format`, pi without `--session-id` or `--session-dir`. The recorded help minus every line naming the flag.
+/// The recorded help without the declaration of `flag` (the option line naming it, indented as declarations are);
+/// other options' text that mentions the flag stays.
+fn without_declaration(help: &str, flag: &str) -> String {
+    help.lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            let declares = l.len() - t.len() <= 8
+                && t.starts_with('-')
+                && t.split("  ")
+                    .next()
+                    .unwrap_or(t)
+                    .split(|c: char| c.is_whitespace() || c == ',')
+                    .any(|w| w.split(['=', '[']).next() == Some(flag));
+            !declares
+        })
+        .map(|l| format!("{l}\n"))
+        .collect()
+}
+
+/// A CLI its adapter cannot start is refused by the probe, by the adapter's own rule (M1R-03, M1T07R-14): claude
+/// without `-p`, `--verbose` or `--output-format`, pi without `--mode`, `--session-id` or `--session-dir`. Only the
+/// option's declaration is removed: a flag named in another option's text is not offered (claude's help mentions
+/// `--output-format=stream-json` in two others).
 #[test]
 fn a_cli_without_what_its_adapter_needs_is_unsupported() -> R {
     let tmp = tempfile::tempdir()?;
@@ -198,16 +219,29 @@ fn a_cli_without_what_its_adapter_needs_is_unsupported() -> R {
             "2.1.318 (Claude Code)",
             "--output-format",
         ),
+        (
+            Agent::Claude,
+            "claude/2.1.318/help.txt",
+            "2.1.318 (Claude Code)",
+            "-p",
+        ),
+        (
+            Agent::Claude,
+            "claude/2.1.318/help.txt",
+            "2.1.318 (Claude Code)",
+            "--verbose",
+        ),
+        (Agent::Pi, "pi/1.5.0/help.txt", "1.5.0", "--mode"),
         (Agent::Pi, "pi/1.5.0/help.txt", "1.5.0", "--session-id"),
         (Agent::Pi, "pi/1.5.0/help.txt", "1.5.0", "--session-dir"),
     ] {
         let recorded = std::fs::read_to_string(fixtures().join(fixture))?;
-        let help: String = recorded
-            .lines()
-            .filter(|l| !l.contains(flag))
-            .map(|l| format!("{l}\n"))
-            .collect();
-        assert_ne!(help.len(), recorded.len(), "the recorded help names {flag}");
+        let help = without_declaration(&recorded, flag);
+        assert_eq!(
+            recorded.lines().count() - help.lines().count(),
+            1,
+            "one declaration of {flag}"
+        );
         let group = format!("{}{flag}", agent.command());
         let help_file = tmp.path().join(format!("{group}.txt"));
         std::fs::write(&help_file, &help)?;
@@ -219,6 +253,57 @@ fn a_cli_without_what_its_adapter_needs_is_unsupported() -> R {
         match probe(agent, &env_for(&dir)) {
             Err(ProbeError::Unsupported { detail, .. }) => {
                 assert!(detail.contains(flag), "{group}: {detail}");
+            }
+            other => return Err(format!("{group}: not refused: {other:?}").into()),
+        }
+    }
+    // A value counts only in its option's own text: claude's --output-format offering text and json only (stream-json
+    // left in --input-format's text), pi's --mode without rpc (rpc left elsewhere in the help).
+    let claude = std::fs::read_to_string(fixtures().join("claude/2.1.318/help.txt"))?;
+    let at = claude
+        .find("  --output-format <format>")
+        .ok_or("no --output-format block")?;
+    let end = claude[at..]
+        .find("  --permission-mode")
+        .ok_or("no next option")?
+        + at;
+    let no_stream = format!(
+        "{}{}{}",
+        &claude[..at],
+        claude[at..end].replace("stream-json", "ndjson"),
+        &claude[end..]
+    );
+    assert!(
+        no_stream.contains("stream-json"),
+        "stream-json stays in other options' text"
+    );
+    let pi = std::fs::read_to_string(fixtures().join("pi/1.5.0/help.txt"))?;
+    let no_rpc = pi.replace(
+        "Output mode: text (default), json, or rpc",
+        "Output mode: text (default) or json",
+    );
+    assert_ne!(no_rpc, pi);
+    let no_rpc = format!("{no_rpc}\n  --rpc-socket <path>            Socket for rpc clients\n");
+    for (agent, version, help, why) in [
+        (
+            Agent::Claude,
+            "2.1.318 (Claude Code)",
+            no_stream,
+            "--output-format stream-json",
+        ),
+        (Agent::Pi, "1.5.0", no_rpc, "--mode rpc"),
+    ] {
+        let group = format!("{}-values", agent.command());
+        let help_file = tmp.path().join(format!("{group}.txt"));
+        std::fs::write(&help_file, &help)?;
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n --version) echo '{version}';;\n --help) cat '{}';;\n *) exit 2;;\nesac\n",
+            help_file.display()
+        );
+        let (dir, _) = fake(tmp.path(), &group, agent.command(), &script)?;
+        match probe(agent, &env_for(&dir)) {
+            Err(ProbeError::Unsupported { detail, .. }) => {
+                assert!(detail.contains(why), "{group}: {detail}")
             }
             other => return Err(format!("{group}: not refused: {other:?}").into()),
         }
@@ -240,6 +325,100 @@ fn a_cli_without_what_its_adapter_needs_is_unsupported() -> R {
         }
         other => return Err(format!("codex --json-lines: not refused: {other:?}").into()),
     }
+    Ok(())
+}
+
+/// An App Server whose schema lacks what every turn needs (here `turn/start`) is no App Server for HoH: the probe
+/// takes exec when `codex exec` can run a turn, and refuses the CLI when it cannot either (M1T07R-15).
+#[test]
+fn an_app_server_without_turn_start_falls_back_to_exec_or_is_unsupported() -> R {
+    let tmp = tempfile::tempdir()?;
+    let f = fixtures().join("codex/0.166.0");
+    let schema = tmp.path().join("schema");
+    std::fs::create_dir(&schema)?;
+    let requests: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
+        f.join("app-server-schema/ClientRequest.json"),
+    )?)?;
+    let mut requests = requests;
+    let variants = requests["oneOf"]
+        .as_array_mut()
+        .ok_or("ClientRequest.json has no oneOf")?;
+    let before = variants.len();
+    variants.retain(|v| v["properties"]["method"]["enum"] != serde_json::json!(["turn/start"]));
+    assert_eq!(
+        before - variants.len(),
+        1,
+        "the recorded schema has one turn/start variant"
+    );
+    let copied = std::process::Command::new("cp")
+        .arg("-R")
+        .arg(f.join("app-server-schema/."))
+        .arg(&schema)
+        .status()?;
+    assert!(copied.success());
+    std::fs::write(
+        schema.join("ClientRequest.json"),
+        serde_json::to_vec_pretty(&requests)?,
+    )?;
+    let lines_help = tmp.path().join("exec-json-lines.txt");
+    std::fs::write(
+        &lines_help,
+        std::fs::read_to_string(f.join("help-exec.txt"))?.replace("--json", "--json-lines"),
+    )?;
+    for (group, exec_help, usable) in [
+        ("no-turn-start-exec", f.join("help-exec.txt"), true),
+        ("no-turn-start-no-exec", lines_help, false),
+    ] {
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n exec) [ \"$2\" = --help ] && cat '{e}';;\n \
+             app-server) case \"$2\" in\n  --help) cat '{f}/help-app-server.txt';;\n  generate-json-schema) [ \"$3\" = --out ] && mkdir -p \"$4\" && cp -R '{s}/.' \"$4/\";;\n  \
+             *) exit 2;;\n esac;;\n *) exit 2;;\nesac\n",
+            e = exec_help.display(),
+            f = f.display(),
+            s = schema.display()
+        );
+        let (dir, _) = fake(tmp.path(), group, "codex", &script)?;
+        match (probe(Agent::Codex, &env_for(&dir)), usable) {
+            (Ok(entry), true) => {
+                assert_eq!(entry.transport, Transport::Exec, "{group}");
+                assert_eq!(entry.capabilities.get("mid_turn_steer"), Some(&Some(false)));
+            }
+            (Err(ProbeError::Unsupported { detail, .. }), false) => {
+                assert!(
+                    detail.contains("turn/start") && detail.contains("--json"),
+                    "{detail}"
+                );
+            }
+            (other, _) => return Err(format!("{group}: {other:?}").into()),
+        }
+    }
+    Ok(())
+}
+
+/// Probed capabilities follow the adapter's own whole-word rule: a claude whose help offers `--resume-v2` and
+/// `--include-partial-messages-v2` offers neither resume nor partial messages (M1T07R-16).
+#[test]
+fn a_flag_with_a_longer_name_is_not_the_flag() -> R {
+    let tmp = tempfile::tempdir()?;
+    let help = std::fs::read_to_string(fixtures().join("claude/2.1.318/help.txt"))?
+        .replace("--resume", "--resume-v2")
+        .replace(
+            "--include-partial-messages",
+            "--include-partial-messages-v2",
+        );
+    let help_file = tmp.path().join("claude-v2.txt");
+    std::fs::write(&help_file, help)?;
+    let script = format!(
+        "#!/bin/sh\ncase \"$1\" in\n --version) echo '2.1.318 (Claude Code)';;\n --help) cat '{}';;\n *) exit 2;;\nesac\n",
+        help_file.display()
+    );
+    let (dir, _) = fake(tmp.path(), "claude-v2", "claude", &script)?;
+    let entry = probe(Agent::Claude, &env_for(&dir))?;
+    assert_eq!(entry.capabilities.get("resume"), Some(&Some(false)));
+    assert_eq!(
+        entry.capabilities.get("partial_messages"),
+        Some(&Some(false))
+    );
     Ok(())
 }
 
@@ -284,7 +463,11 @@ fn probe_leaves_no_descendant_behind() -> R {
     let tmp = tempfile::tempdir()?;
     let pidfile = tmp.path().join("bg.pid");
     let help = tmp.path().join("help.txt");
-    std::fs::write(&help, "--output-format stream-json --resume\n")?;
+    // A help the claude adapter can drive (M1T07R-14); this test is about the background child.
+    std::fs::write(
+        &help,
+        "  -p, --print\n  --verbose\n  --output-format <format>  stream-json\n  --resume\n",
+    )?;
     let script = format!(
         "#!/bin/sh\ncase \"$1\" in\n --version) sleep 60 >/dev/null 2>&1 & echo $! > '{}'; echo '2.0.0 (Claude Code)';;\n --help) cat '{}';;\nesac\n",
         pidfile.display(),
@@ -370,10 +553,11 @@ fn codex_capabilities_come_from_the_schema_method_lists() -> R {
         let (dir, _) = fake(tmp.path(), name, "codex", &write(&files))?;
         assert!(probe(Agent::Codex, &env_for(&dir)).is_err(), "{name} schema output accepted");
     }
-    // A minimal well-formed schema: steer requests exist, resume and deltas do not; a stray string elsewhere is ignored.
+    // A minimal well-formed schema with what every turn needs (M1T07R-15): steer requests exist, resume and deltas do
+    // not; a stray string elsewhere is ignored.
     let files = format!(
         "echo '{}' > ClientRequest.json && echo '{}' > ServerNotification.json && echo '\"thread/resume\"' > Other.json",
-        methods(&["initialize", "turn/steer"]),
+        methods(&["initialize", "thread/start", "turn/start", "turn/steer"]),
         methods(&["turn/completed"])
     );
     let (dir, _) = fake(tmp.path(), "minimal", "codex", &write(&files))?;

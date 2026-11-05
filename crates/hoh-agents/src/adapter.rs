@@ -101,10 +101,49 @@ pub(crate) async fn finish(
         .await
 }
 
-/// Whether `help` (a probed `--help` text) offers `flag` as a word of its own.
-pub(crate) fn offers(help: &str, flag: &str) -> bool {
-    help.split(|c: char| c.is_whitespace() || c == ',' || c == '[' || c == ']' || c == '=')
-        .any(|word| word == flag)
+/// The deepest indentation of an option's declaration in the recorded helps (clap: 2 or 6 spaces); descriptions and
+/// their continuation lines are indented further.
+const DECLARATION_INDENT: usize = 8;
+
+/// The declaration of an option line (its names and value placeholders, up to the two spaces before its
+/// description), or `None` for a line that declares no option.
+fn declaration(line: &str) -> Option<&str> {
+    let text = line.trim_start();
+    (line.len() - text.len() <= DECLARATION_INDENT && text.starts_with('-'))
+        .then(|| text.split("  ").next().unwrap_or(text))
+}
+
+/// Whether `help` (a probed `--help` text) declares the option `flag` as a word of its own. A flag only named in
+/// another option's text is not offered (M1R-03).
+pub fn offers(help: &str, flag: &str) -> bool {
+    help.lines().filter_map(declaration).any(|declared| {
+        declared
+            .split(|c: char| c.is_whitespace() || c == ',')
+            .any(|word| word.split(['=', '[']).next() == Some(flag))
+    })
+}
+
+/// The text of the option `flag`: its declaration line and the description lines that follow it, up to the next
+/// declaration or a blank line; `None` if `help` does not declare it.
+pub fn option_text(help: &str, flag: &str) -> Option<String> {
+    let mut lines = help.lines().skip_while(|line| !offers(line, flag));
+    let first = lines.next()?;
+    let rest = lines.take_while(|line| !line.trim().is_empty() && declaration(line).is_none());
+    Some(
+        std::iter::once(first)
+            .chain(rest)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+/// Whether `help` lists the subcommand `name` under its `Commands:` heading.
+pub fn lists_command(help: &str, name: &str) -> bool {
+    help.lines()
+        .skip_while(|line| !line.trim().eq_ignore_ascii_case("commands:"))
+        .skip(1)
+        .take_while(|line| !line.trim().is_empty())
+        .any(|line| line.split_whitespace().next() == Some(name))
 }
 
 /// Numbers the diagnostics of input moves that did not happen, so two of one attempt never share an event id.

@@ -76,7 +76,9 @@ pub fn interface_missing(help: &str) -> Option<String> {
     {
         return Some(format!("pi --help offers no {flag}"));
     }
-    (!help.contains("rpc")).then(|| "pi --help offers no rpc mode".to_owned())
+    // rpc among --mode's own values.
+    (!crate::adapter::option_text(help, "--mode").is_some_and(|t| t.contains("rpc")))
+        .then(|| "pi --help offers no --mode rpc".to_owned())
 }
 
 /// The arguments of `pi --mode rpc` on the session (never `--no-session`).
