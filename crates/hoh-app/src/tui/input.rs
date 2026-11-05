@@ -272,6 +272,12 @@ fn csi_key(params: &[u8], fin: u8) -> Option<Event> {
                 _ => KeyEventKind::Press,
             },
         ),
+        // A cursor key with parameters takes the digit just before the final byte, or is no key (crossterm's
+        // `parse_csi_modifier_key_code`, M1T08R-36); CSI u and `~` keys are plain.
+        None if !params.is_empty() && fin.is_ascii_uppercase() => {
+            let digit = params.last()?.checked_sub(b'0').filter(|d| *d <= 9)?;
+            (modifiers(digit), KeyEventKind::Press)
+        }
         None => (KeyModifiers::NONE, KeyEventKind::Press),
     };
     if fin == b'u' {
@@ -284,7 +290,8 @@ fn csi_key(params: &[u8], fin: u8) -> Option<Event> {
         b'D' => KeyCode::Left,
         b'H' => KeyCode::Home,
         b'F' => KeyCode::End,
-        b'Z' => return Some(key(KeyCode::BackTab, KeyModifiers::SHIFT)),
+        // Only `ESC [ Z` is BackTab; with parameters crossterm takes it for no key.
+        b'Z' if params.is_empty() => return Some(key(KeyCode::BackTab, KeyModifiers::SHIFT)),
         b'~' => match first.parse::<u8>().ok()? {
             1 | 7 => KeyCode::Home,
             2 => KeyCode::Insert,
@@ -646,25 +653,38 @@ mod tests {
         );
     }
 
-    /// A modifier parameter that is no number (empty, or past 255) makes the key a plain press whatever event type
-    /// follows it, as crossterm falls back (M1T08R-35).
+    /// A modifier parameter that is no number (empty, or past 255) falls back as in crossterm: a plain press on CSI u
+    /// and `~` keys whatever event type follows (M1T08R-35); on a cursor key the digit just before the final byte is
+    /// the modifier, and without one there is no key; with no parameters a cursor key and BackTab are plain
+    /// (M1T08R-36).
     #[test]
-    fn an_unreadable_modifier_makes_a_plain_press() {
+    fn an_unreadable_modifier_falls_back_as_in_crossterm() {
         use ratatui::crossterm::event::KeyEventKind::Press;
-        let raw: Vec<_> = all(b"\x1b[97;256:3u\x1b[97;:3u\x1b[3;:3~\x1b[1;999:3A", false)
-            .into_iter()
-            .filter_map(|e| match e {
-                Event::Key(key) => Some((key.code, key.modifiers, key.kind)),
-                _ => None,
-            })
-            .collect();
+        let raw: Vec<_> = all(
+            b"\x1b[97;256:3u\x1b[97;:3u\x1b[3;:3~\x1b[1;999:3A\x1b[1;256A\x1b[1;:3A\x1b[1;256:2B\x1b[2A\x1b[1;256:A\x1b[;A\x1b[A\x1b[Z\x1b[1;2Zx",
+            false,
+        )
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::Key(key) => Some((key.code, key.modifiers, key.kind)),
+            _ => None,
+        })
+        .collect();
+        let shift_ctrl = KeyModifiers::SHIFT | KeyModifiers::CONTROL;
         assert_eq!(
             raw,
             [
                 (KeyCode::Char('a'), N, Press),
                 (KeyCode::Char('a'), N, Press),
                 (KeyCode::Delete, N, Press),
+                (KeyCode::Up, KeyModifiers::ALT, Press),
+                (KeyCode::Up, shift_ctrl, Press),
+                (KeyCode::Up, KeyModifiers::ALT, Press),
+                (KeyCode::Down, KeyModifiers::SHIFT, Press),
+                (KeyCode::Up, KeyModifiers::SHIFT, Press),
                 (KeyCode::Up, N, Press),
+                (KeyCode::BackTab, KeyModifiers::SHIFT, Press),
+                (KeyCode::Char('x'), N, Press),
             ]
         );
     }
