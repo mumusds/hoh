@@ -254,15 +254,20 @@ pub fn with_retries(tries: usize, mut attempt: impl FnMut() -> io::Result<()>) -
 }
 
 /// Debug builds only: `HOH_DEBUG_TUI_RESTORE_GATE=<path>` holds the restore back, once the loop has ended and in the
-/// panic hook, until `<path>` exists (10 s at most), saying so on stderr. The PTY test types into that window and only
-/// then opens the gate, so its input is known to come before the restore (M1T08R-15). Release builds have no such
-/// entry.
+/// panic hook, until `<path>` exists, saying so on stderr. The PTY test types into that window and only then opens the
+/// gate, so its input is known to come before the restore (M1T08R-15). A gate still shut after 10 s aborts, so a test
+/// whose input came too late fails instead of passing on a terminal hoh no longer reads (M1T08R-22). Release builds
+/// have no such entry.
 pub fn debug_restore_gate() {
     #[cfg(debug_assertions)]
     if let Some(gate) = std::env::var_os("HOH_DEBUG_TUI_RESTORE_GATE") {
         say!("HOH_DEBUG_TUI_RESTORE_GATE");
         let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !std::path::Path::new(&gate).exists() && std::time::Instant::now() < end {
+        while !std::path::Path::new(&gate).exists() {
+            if std::time::Instant::now() >= end {
+                say!("HOH_DEBUG_TUI_RESTORE_GATE: not opened within 10 s");
+                std::process::abort();
+            }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }

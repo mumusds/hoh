@@ -181,10 +181,39 @@ fn type_into_the_restore_window(
 ) -> R<(Option<i32>, Vec<u8>)> {
     s.pty.wait_for("HOH_DEBUG_TUI_RESTORE_GATE", 0, WAIT)?;
     s.pty.send(text)?;
+    // Still at the gate once the input is typed: a gate left shut too long aborts hoh (M1T08R-22).
+    assert!(
+        s.child.0.try_wait()?.is_none(),
+        "hoh left the gate before the input was typed"
+    );
     std::fs::write(gate, b"")?;
     let status = exit_within(&mut s.child, WAIT)?;
     assert_eq!(s.pty.stty()?, s.baseline, "terminal attributes");
     Ok((status.code(), s.pty.unread_input(Duration::from_secs(2))?))
+}
+
+/// The gate the restore-window tests rely on cannot be outwaited: left shut, it aborts hoh after 10 s, so input typed
+/// too late fails those tests instead of passing on a terminal hoh no longer reads (M1T08R-22).
+#[test]
+fn a_restore_gate_left_shut_aborts_hoh() -> R {
+    use std::os::unix::process::ExitStatusExt;
+    let (home, project) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    let gate = home.path().join("gate");
+    let gate_env = gate.to_str().ok_or("gate path")?;
+    let mut s = open(
+        project.path(),
+        home.path(),
+        &[("HOH_DEBUG_TUI_RESTORE_GATE", gate_env)],
+    )?;
+    let from = s.pty.output().len();
+    s.pty.send(b"\x03")?;
+    s.pty.wait_for("脱离", from, WAIT)?;
+    s.pty.send(b"\r")?;
+    s.pty.wait_for("HOH_DEBUG_TUI_RESTORE_GATE", 0, WAIT)?;
+    let status = exit_within(&mut s.child, Duration::from_secs(20))?;
+    assert_eq!(status.signal(), Some(6), "{status:?}");
+    s.pty.wait_for("not opened within 10 s", 0, WAIT)?;
+    Ok(())
 }
 
 /// What is typed once the user has chosen to leave belongs to the shell: hoh reads nothing once its loop has ended,

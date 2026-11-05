@@ -5,7 +5,7 @@
 //! TUI loop instead waits in poll(2) itself and reads only what poll said is there; this decoder turns those bytes
 //! into the same `Event`s crossterm's parser gives for the keys the Workspace uses, and never waits.
 
-use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 const ESC: u8 = 0x1b;
 const PASTE_START: &[u8] = b"\x1b[200~";
@@ -69,6 +69,8 @@ impl Decoder {
                     self.buf.drain(..used);
                 }
                 Front::Unfinished if !idle || self.buf.first() != Some(&ESC) => return None,
+                // Alt and a character in pieces waits for its rest as the character alone does (M1T08R-24).
+                Front::Unfinished if self.buf.get(1).is_some_and(|&b| b >= 0x80) => return None,
                 Front::Unfinished => {
                     let event = match self.buf.len() {
                         1 => Some(key(KeyCode::Esc, KeyModifiers::NONE)),
@@ -258,11 +260,19 @@ fn csi_key(params: &[u8], fin: u8) -> Option<Event> {
     let text = std::str::from_utf8(params).ok()?;
     let mut fields = text.split(';');
     let first = fields.next().unwrap_or_default();
-    let modifiers = fields
+    let mut second = fields.next().unwrap_or_default().split(':');
+    let modifiers = second
         .next()
-        .and_then(|m| m.split(':').next())
         .and_then(|m| m.parse::<u8>().ok())
         .map_or(KeyModifiers::NONE, modifiers);
+    if fin == b'u' {
+        let kind = match second.next() {
+            Some("2") => KeyEventKind::Repeat,
+            Some("3") => KeyEventKind::Release,
+            _ => KeyEventKind::Press,
+        };
+        return csi_u(first, modifiers, kind);
+    }
     let code = match fin {
         b'A' => KeyCode::Up,
         b'B' => KeyCode::Down,
@@ -283,6 +293,40 @@ fn csi_key(params: &[u8], fin: u8) -> Option<Event> {
         _ => return None,
     };
     Some(key(code, modifiers))
+}
+
+/// `CSI codepoint[:alternates] ; modifiers[:event type] u` (fixterms and the kitty keyboard protocol; kitty sends it
+/// for some combinations in its legacy mode too, Ctrl+Shift+R as `114;6u`), as crossterm decodes it (M1T08R-23).
+/// kitty's own functional keys, private use codepoints, are not keys the Workspace uses.
+fn csi_u(first: &str, mut modifiers: KeyModifiers, kind: KeyEventKind) -> Option<Event> {
+    let mut codepoints = first.split(':');
+    let codepoint: u32 = codepoints.next()?.parse().ok()?;
+    if (0xe000..=0xf8ff).contains(&codepoint) {
+        return None;
+    }
+    // With Shift, an alternate codepoint is the shifted key: that character, without Shift.
+    let shifted = codepoints
+        .next()
+        .and_then(|c| c.parse::<u32>().ok())
+        .and_then(char::from_u32)
+        .filter(|_| modifiers.contains(KeyModifiers::SHIFT));
+    if let Some(c) = shifted {
+        modifiers.remove(KeyModifiers::SHIFT);
+        return Some(Event::Key(KeyEvent::new_with_kind(
+            KeyCode::Char(c),
+            modifiers,
+            kind,
+        )));
+    }
+    let code = match char::from_u32(codepoint)? {
+        '\x1b' => KeyCode::Esc,
+        '\r' => KeyCode::Enter,
+        '\t' if modifiers.contains(KeyModifiers::SHIFT) => KeyCode::BackTab,
+        '\t' => KeyCode::Tab,
+        '\x7f' => KeyCode::Backspace,
+        c => KeyCode::Char(c),
+    };
+    Some(Event::Key(KeyEvent::new_with_kind(code, modifiers, kind)))
 }
 
 /// xterm's modifier parameter: 1 + a bit mask of Shift 1, Alt 2, Ctrl 4.
@@ -519,6 +563,69 @@ mod tests {
         );
         // Parameters make it another sequence: SGR mouse and the like end at `M` as before.
         assert_eq!(all(b"\x1b[<0;1;1Mx", false), [k(KeyCode::Char('x'), N)]);
+    }
+
+    /// kitty sends some combinations as `CSI codepoint ; modifiers u` even in its legacy mode (Ctrl+Shift+R is
+    /// `ESC [ 114 ; 6 u`); they decode as crossterm decodes them (M1T08R-23).
+    #[test]
+    fn csi_u_keys_decode_as_crossterm_does() {
+        use ratatui::crossterm::event::KeyEventKind;
+        let ctrl_shift = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+        assert_eq!(
+            all(
+                b"\x1b[114;6u\x1b[99;5u\x1b[13u\x1b[9;2u\x1b[127;3u\x1b[27u",
+                false
+            ),
+            [
+                k(KeyCode::Char('r'), ctrl_shift),
+                k(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                k(KeyCode::Enter, N),
+                k(KeyCode::BackTab, KeyModifiers::SHIFT),
+                k(KeyCode::Backspace, KeyModifiers::ALT),
+                k(KeyCode::Esc, N),
+            ]
+        );
+        // `KeyEvent` equality folds Shift into the letter's case, so codes, modifiers and kinds are compared as they
+        // are.
+        let raw: Vec<(KeyCode, KeyModifiers, KeyEventKind)> = all(
+            b"\x1b[114;6u\x1b[114;6:2u\x1b[114;6:3u\x1b[97:65;2u\x1b[97;2u",
+            false,
+        )
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::Key(key) => Some((key.code, key.modifiers, key.kind)),
+            _ => None,
+        })
+        .collect();
+        let r = KeyCode::Char('r');
+        assert_eq!(
+            raw,
+            [
+                (r, ctrl_shift, KeyEventKind::Press),
+                (r, ctrl_shift, KeyEventKind::Repeat),
+                (r, ctrl_shift, KeyEventKind::Release),
+                (KeyCode::Char('A'), N, KeyEventKind::Press),
+                (KeyCode::Char('a'), KeyModifiers::SHIFT, KeyEventKind::Press),
+            ]
+        );
+        // kitty's own functional keys (private use codepoints) are not keys the Workspace uses.
+        assert_eq!(all(b"\x1b[57399ux", false), [k(KeyCode::Char('x'), N)]);
+    }
+
+    /// Alt and a character arriving in pieces waits for its rest as the character alone does, past any idle wait
+    /// (M1T08R-24).
+    #[test]
+    fn alt_and_a_character_in_pieces_waits_for_its_rest() {
+        let mut d = Decoder::default();
+        let bytes = "草".as_bytes();
+        d.feed(&[0x1b, bytes[0], bytes[1]]);
+        assert_eq!(d.next(true), None, "idle or not");
+        assert_eq!(d.pending(), Pending::Sequence);
+        d.feed(&bytes[2..]);
+        assert_eq!(
+            d.next(false),
+            Some(k(KeyCode::Char('草'), KeyModifiers::ALT))
+        );
     }
 
     /// A paste arriving in reads of 4 KiB is searched for its end marker once, not again from its start on every read
