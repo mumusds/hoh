@@ -294,6 +294,19 @@ mod tests {
         );
     }
 
+    /// crossterm's `KeyEvent` equality ignores SHIFT on an upper-case letter, so it is checked on its own.
+    #[test]
+    fn an_upper_case_letter_carries_shift_as_in_crossterm() {
+        let modifiers: Vec<KeyModifiers> = all(b"Za", false)
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::Key(key) => Some(key.modifiers),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(modifiers, [KeyModifiers::SHIFT, KeyModifiers::NONE]);
+    }
+
     #[test]
     fn cursor_and_editing_keys_in_their_csi_and_ss3_forms() {
         assert_eq!(
@@ -380,8 +393,10 @@ mod tests {
         d.feed(&bytes[2..]);
         assert_eq!(d.next(false), Some(k(KeyCode::Char('草'), N)));
         assert_eq!(d.next(false), Some(k(KeyCode::Char('稿'), N)));
-        // A broken start is skipped; what follows still counts.
+        // A broken start is skipped; what follows still counts, also when it is shorter than the character
+        // would have been.
         assert_eq!(all(b"\xe8a\xff", false), [k(KeyCode::Char('a'), N)]);
+        assert_eq!(all(b"\xe8a", false), [k(KeyCode::Char('a'), N)]);
     }
 
     #[test]
