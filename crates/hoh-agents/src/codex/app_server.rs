@@ -15,11 +15,11 @@ use super::{
     Ending, METHOD_NOT_FOUND, Mode, Outcome, Steer, SteerReceipt, Turn, app_server_args,
     failure_of, hard_stop, hashes, is_text_item, verdict,
 };
-use crate::adapter::{AdapterError, AttemptRef, finish, now, step};
+use crate::adapter::{AdapterError, AttemptRef, finish, now, soft_move, step};
 use crate::frame::Frame;
 use crate::process::{Config, Event, Process};
 use hoh_core::lifecycle::{AttemptState, InputState};
-use hoh_core::persistence::{AttemptFacts, CancelLatch, InputMove, PersistError, Store};
+use hoh_core::persistence::{AttemptFacts, CancelLatch, PersistError, Store};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::process::Command;
@@ -233,14 +233,16 @@ impl State<'_> {
     }
 
     async fn apply(&self, input_id: String) -> Result<(), PersistError> {
-        self.store
-            .move_input(InputMove {
-                input_id,
-                from: InputState::Delivered,
-                to: InputState::Applied,
-                reason: None,
-            })
-            .await
+        soft_move(
+            self.store,
+            &self.attempt.attempt_id,
+            &input_id,
+            InputState::Delivered,
+            InputState::Applied,
+            None,
+        )
+        .await
+        .map(drop)
     }
 
     /// A notification of this thread and turn.
@@ -496,25 +498,28 @@ impl State<'_> {
                 Some(_) => {
                     // A refused steer gives up the item matched to it.
                     self.sent.retain(|x| x.input_id != s.input_id);
-                    self.store
-                        .move_input(InputMove {
-                            input_id: s.input_id.clone(),
-                            from: InputState::Queued,
-                            to: InputState::Rejected,
-                            reason: Some(message.clone()),
-                        })
-                        .await?;
+                    // Someone else may have moved the input on; that is recorded, not fatal (M1T05R-01).
+                    soft_move(
+                        self.store,
+                        &self.attempt.attempt_id,
+                        &s.input_id,
+                        InputState::Queued,
+                        InputState::Rejected,
+                        Some(message.clone()),
+                    )
+                    .await?;
                     let _ = s.reply.send(SteerReceipt::Rejected { reason: message });
                 }
                 None => {
-                    self.store
-                        .move_input(InputMove {
-                            input_id: s.input_id.clone(),
-                            from: InputState::Queued,
-                            to: InputState::Delivered,
-                            reason: None,
-                        })
-                        .await?;
+                    soft_move(
+                        self.store,
+                        &self.attempt.attempt_id,
+                        &s.input_id,
+                        InputState::Queued,
+                        InputState::Delivered,
+                        None,
+                    )
+                    .await?;
                     let took = frame["result"]["turnId"]
                         .as_str()
                         .map(str::to_owned)
