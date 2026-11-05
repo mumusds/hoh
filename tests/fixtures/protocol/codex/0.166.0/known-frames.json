@@ -1,0 +1,657 @@
+{
+ "schema_version": "1.0",
+ "agent": "codex",
+ "cli_version": "0.166.0",
+ "key": "app-server: the JSON-RPC \"method\" of a server notification or server request (responses are matched by id); exec --json: \"type\"",
+ "sources": {
+  "recorded": "stdout.jsonl of the cases recorded for this version (tests/fixtures/protocol/codex/0.166.0/*)",
+  "schema": "ServerNotification.json and ServerRequest.json of app-server-schema (codex app-server generate-json-schema, recorded)",
+  "docs": "the exec --json event types of the codex exec documentation, as handled by crates/hoh-agents/src/codex/exec.rs"
+ },
+ "app_server": {
+  "notifications": [
+   {
+    "key": "account/gatewayOAuth/changed",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "account/login/completed",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "account/rateLimits/updated",
+    "sources": [
+     "recorded",
+     "schema"
+    ]
+   },
+   {
+    "key": "account/updated",
+    "sources": [
+     "recorded",
+     "schema"
+    ]
+   },
+   {
+    "key": "app/list/updated",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "autoApprovalReview/strictReviewRequired",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "command/exec/outputDelta",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "configWarning",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "deprecationNotice",
+    "sources": [
+     "recorded",
+     "schema"
+    ]
+   },
+   {
+    "key": "error",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "externalAgentConfig/import/completed",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "externalAgentConfig/import/progress",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "fs/changed",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "fuzzyFileSearch/sessionCompleted",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "fuzzyFileSearch/sessionUpdated",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "guardianWarning",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "hook/completed",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "hook/started",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "item/agentMessage/delta",
+    "sources": [
+     "recorded",
+     "schema"
+    ]
+   },
+   {
+    "key": "item/autoApprovalReview/completed",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "item/autoApprovalReview/started",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "item/commandExecution/outputDelta",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "item/commandExecution/terminalInteraction",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "item/completed",
+    "sources": [
+     "recorded",
+     "schema"
+    ]
+   },
+   {
+    "key": "item/fileChange/outputDelta",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "item/fileChange/patchUpdated",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "item/mcpToolCall/progress",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "item/plan/delta",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "item/reasoning/summaryPartAdded",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "item/reasoning/summaryTextDelta",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "item/reasoning/textDelta",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "item/started",
+    "sources": [
+     "recorded",
+     "schema"
+    ]
+   },
+   {
+    "key": "mcpServer/event/stream/notification",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "mcpServer/oauthLogin/completed",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "mcpServer/startupStatus/updated",
+    "sources": [
+     "recorded",
+     "schema"
+    ]
+   },
+   {
+    "key": "model/rerouted",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "model/safetyBuffering/updated",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "model/verification",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "modelProvider/authRecoveryCompleted",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "modelProvider/authRecoveryStarted",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "process/exited",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "process/outputDelta",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "project/changed",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "remoteControl/status/changed",
+    "sources": [
+     "recorded",
+     "schema"
+    ]
+   },
+   {
+    "key": "serverRequest/resolved",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "skills/changed",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "thread/archived",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "thread/attachment/updated",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "thread/closed",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "thread/compacted",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "thread/deleted",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "thread/environment/connected",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "thread/environment/disconnected",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "thread/goal/cleared",
+    "sources": [
+     "recorded",
+     "schema"
+    ]
+   },
+   {
+    "key": "thread/goal/updated",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "thread/name/updated",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "thread/prediction/updated",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "thread/project/updated",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "thread/queue/changed",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "thread/readState/changed",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "thread/realtime/closed",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "thread/realtime/error",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "thread/realtime/item/completed",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "thread/realtime/item/started",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "thread/realtime/item/transcript/delta",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "thread/realtime/itemAdded",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "thread/realtime/outputAudio/delta",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "thread/realtime/sdp",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "thread/realtime/started",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "thread/realtime/transcript/delta",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "thread/realtime/transcript/done",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "thread/reverted",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "thread/settings/updated",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "thread/started",
+    "sources": [
+     "recorded",
+     "schema"
+    ]
+   },
+   {
+    "key": "thread/status/changed",
+    "sources": [
+     "recorded",
+     "schema"
+    ]
+   },
+   {
+    "key": "thread/tokenUsage/updated",
+    "sources": [
+     "recorded",
+     "schema"
+    ]
+   },
+   {
+    "key": "thread/unarchived",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "turn/completed",
+    "sources": [
+     "recorded",
+     "schema"
+    ]
+   },
+   {
+    "key": "turn/diff/updated",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "turn/moderationMetadata",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "turn/plan/updated",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "turn/started",
+    "sources": [
+     "recorded",
+     "schema"
+    ]
+   },
+   {
+    "key": "warning",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "windows/worldWritableWarning",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "windowsSandbox/setupCompleted",
+    "sources": [
+     "schema"
+    ]
+   }
+  ],
+  "requests": [
+   {
+    "key": "account/chatgptAuthTokens/refresh",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "applyPatchApproval",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "attestation/generate",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "execCommandApproval",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "item/commandExecution/requestApproval",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "item/fileChange/requestApproval",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "item/permissions/requestApproval",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "item/tool/call",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "item/tool/requestUserInput",
+    "sources": [
+     "schema"
+    ]
+   },
+   {
+    "key": "mcpServer/elicitation/request",
+    "sources": [
+     "schema"
+    ]
+   }
+  ]
+ },
+ "exec": [
+  {
+   "key": "thread.started",
+   "sources": [
+    "recorded",
+    "docs"
+   ]
+  },
+  {
+   "key": "turn.started",
+   "sources": [
+    "recorded",
+    "docs"
+   ]
+  },
+  {
+   "key": "turn.completed",
+   "sources": [
+    "recorded",
+    "docs"
+   ]
+  },
+  {
+   "key": "turn.failed",
+   "sources": [
+    "recorded",
+    "docs"
+   ]
+  },
+  {
+   "key": "item.started",
+   "sources": [
+    "docs"
+   ]
+  },
+  {
+   "key": "item.updated",
+   "sources": [
+    "docs"
+   ]
+  },
+  {
+   "key": "item.completed",
+   "sources": [
+    "recorded",
+    "docs"
+   ]
+  },
+  {
+   "key": "error",
+   "sources": [
+    "recorded",
+    "docs"
+   ]
+  }
+ ]
+}

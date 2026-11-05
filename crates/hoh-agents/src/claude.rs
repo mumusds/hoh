@@ -20,6 +20,7 @@
 pub use crate::adapter::{AdapterError, AttemptRef};
 use crate::adapter::{finish, now, offers, sha256_file, step};
 use crate::frame::Frame;
+use crate::known;
 use crate::process::{Cause, Config, Escalation, Event, Process, Signal, Step, Termination};
 use hoh_core::lifecycle::AttemptState;
 use hoh_core::persistence::{AttemptFacts, CancelLatch, Session, Store};
@@ -377,6 +378,7 @@ pub async fn run(
     let mut usage = None;
     let mut cost = None;
     let mut diagnostics = 0;
+    let mut unknown_records = 0;
     let mut too_large = false;
     let mut auth_failed = false;
     let mut cancelled = cancel.is_requested();
@@ -437,6 +439,18 @@ pub async fn run(
                 .await?;
             continue;
         };
+        let key = known::claude_key(&frame);
+        if !known::is_known(known::claude(), key.as_deref()) {
+            unknown_records += 1;
+            store
+                .attempt_event(
+                    &attempt.attempt_id,
+                    &format!("unknown-{unknown_records}"),
+                    "adapter.unknown_event",
+                    known::unknown_event(&attempt.attempt_id, key.as_deref(), &line, &frame),
+                )
+                .await?;
+        }
         match frame["type"].as_str() {
             Some("system") if frame["subtype"] == "init" => {
                 native_session = frame["session_id"].as_str().map(str::to_owned);

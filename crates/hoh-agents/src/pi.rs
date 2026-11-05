@@ -27,6 +27,7 @@
 use crate::adapter::{AdapterError, AttemptRef, finish, now, offers, sha256_file, soft_move, step};
 use crate::clock::{Clock, Timer};
 use crate::frame::Frame;
+use crate::known;
 use crate::process::{Config, Escalation, Event, Process, Step, Termination};
 use hoh_core::lifecycle::{AttemptState, InputState};
 use hoh_core::persistence::{AttemptFacts, CancelLatch, Session, Store};
@@ -457,6 +458,7 @@ pub async fn run(
         (None::<String>, None::<SettledBy>, None::<String>);
     let (mut native_session, mut model, mut reply) =
         (None::<String>, None::<String>, None::<String>);
+    let mut unknown_records = 0;
     let (mut parse_errors, mut state_queries, mut agent_starts, mut dialogs, mut data) =
         (0, 0, 0, 0, 0);
     let (mut prompt_sent, mut stopped, mut abort_sent, mut written) = (false, false, false, false);
@@ -646,6 +648,18 @@ pub async fn run(
         };
         if let Some(events) = &turn.events {
             let _ = events.send(record.clone());
+        }
+        let key = known::pi_key(&record);
+        if !known::is_known(known::pi(), key.as_deref()) {
+            unknown_records += 1;
+            store
+                .attempt_event(
+                    id,
+                    &format!("unknown-{unknown_records}"),
+                    "adapter.unknown_event",
+                    known::unknown_event(id, key.as_deref(), &bytes, &record),
+                )
+                .await?;
         }
         match record["type"].as_str().unwrap_or_default() {
             "response" => {

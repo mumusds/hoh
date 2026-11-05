@@ -12,6 +12,7 @@ pub mod clock;
 pub mod codex;
 pub mod compat;
 pub mod frame;
+pub mod known;
 pub mod pi;
 pub mod probe;
 pub mod process;

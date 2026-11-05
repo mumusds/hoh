@@ -912,3 +912,87 @@ async fn a_cancel_while_the_end_is_committed_wins() -> R {
     assert_eq!(cancel.request(), CancelReceipt::AlreadyEnded);
     Ok(())
 }
+
+/// TEST-027-02 (claude): a recorded turn with one record whose type is not in 2.1.318's known-frame registry
+/// (`tests/fixtures/protocol/claude/2.1.318/known-frames.json`) and an `x_future` field in a known record, against the
+/// same turn without that record. Expected: no panic; exactly one `adapter.unknown_event`, with the record as received
+/// and the sha256 of its bytes; the raw log is the bytes the fake wrote; `x_future` comes back from the raw log as
+/// sent; both turns end alike, as returned and as stored.
+#[tokio::test]
+async fn test_027_02_claude_keeps_an_unregistered_record_once_and_ends_as_without_it() -> R {
+    let world = World::new()?;
+    let recorded = fixture("success")?;
+    let mut lines: Vec<Vec<u8>> = recorded
+        .split(|b| *b == b'\n')
+        .filter(|l| !l.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect();
+    let at = lines
+        .iter()
+        .position(|l| {
+            serde_json::from_slice::<serde_json::Value>(l).is_ok_and(|f| f["type"] == "assistant")
+        })
+        .ok_or("no assistant record")?;
+    let mut known: serde_json::Value = serde_json::from_slice(&lines[at])?;
+    known["x_future"] = serde_json::json!({"nested": [1, "二"], "flag": true});
+    lines[at] = serde_json::to_vec(&known)?;
+    let join = |lines: &[Vec<u8>]| -> Vec<u8> {
+        lines
+            .iter()
+            .flat_map(|l| [l.as_slice(), b"\n"].concat())
+            .collect()
+    };
+    let control = join(&lines);
+    let unknown = br#"{"type":"hoh_future_record","detail":{"n":1}}"#.to_vec();
+    lines.insert(at, unknown.clone());
+    let with = join(&lines);
+    let mut ends = Vec::new();
+    for (id, name, stdout) in [("A1", "with", &with), ("A2", "control", &control)] {
+        let attempt = world.attempt(id).await?;
+        let fake = world.fake(name, stdout, b"", 0)?;
+        let outcome = world
+            .run(&attempt, &world.turn(&fake, &format!("logs/{name}"))?)
+            .await?;
+        let row = world.store.reader()?.attempt(id)?.ok_or("no attempt")?;
+        ends.push((
+            (outcome.state, outcome.failure),
+            (row.state, row.failure_reason),
+        ));
+        let raw = std::fs::read(world.dir.path().join(format!("logs/{name}/stdout.jsonl")))?;
+        assert_eq!(
+            hex(&raw),
+            hex(stdout),
+            "{name}: the raw log is what the fake wrote"
+        );
+        let kept = raw
+            .split(|b| *b == b'\n')
+            .filter_map(|l| serde_json::from_slice::<serde_json::Value>(l).ok())
+            .find_map(|f| f.get("x_future").cloned());
+        assert_eq!(
+            kept.as_ref(),
+            Some(&known["x_future"]),
+            "{name}: x_future in the raw log"
+        );
+    }
+    let unknowns: Vec<serde_json::Value> = world
+        .store
+        .reader()?
+        .events("R")?
+        .into_iter()
+        .filter(|(k, _)| k == "adapter.unknown_event")
+        .map(|(_, p)| p)
+        .collect();
+    assert_eq!(unknowns.len(), 1, "{unknowns:?}");
+    assert_eq!(unknowns[0]["attempt_id"], "A1");
+    assert_eq!(unknowns[0]["key"], "hoh_future_record");
+    assert_eq!(unknowns[0]["frame_sha256"], hex(&unknown));
+    assert_eq!(
+        unknowns[0]["frame"],
+        serde_json::from_slice::<serde_json::Value>(&unknown)?
+    );
+    assert_eq!(
+        ends[0], ends[1],
+        "the same end with and without the unknown record"
+    );
+    Ok(())
+}

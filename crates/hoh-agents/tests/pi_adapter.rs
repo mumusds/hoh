@@ -46,6 +46,15 @@ impl Clock for FrozenClock {
 }
 
 /// A recorded case: the records pi wrote and the type of each command, in order.
+/// sha256 (lowercase hex).
+fn hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 #[derive(Clone)]
 struct Case {
     frames: Vec<Value>,
@@ -1186,5 +1195,89 @@ async fn a_session_directory_that_would_block_pi_is_refused() -> R {
         (AttemptState::Failed, Some("SESSION_DIR_UNSAFE"))
     );
     assert!(argvs(&fake)?.is_empty(), "no process may start");
+    Ok(())
+}
+
+/// TEST-027-02 (pi): a recorded turn with one record whose type is not in 1.5.0's known-frame registry
+/// (`tests/fixtures/protocol/pi/1.5.0/known-frames.json`) and an `x_future` field in a known record, against the same
+/// turn without that record. Expected: no panic; exactly one `adapter.unknown_event`, with the record as received and
+/// the sha256 of its bytes; the raw log is the bytes the fake wrote; `x_future` comes back from the raw log as sent;
+/// both turns end alike, as returned and as stored.
+#[tokio::test]
+async fn test_027_02_pi_keeps_an_unregistered_record_once_and_ends_as_without_it() -> R {
+    let world = World::new()?;
+    let mut case = Case::load("rpc-prompt")?;
+    let at = case
+        .frames
+        .iter()
+        .rposition(|f| f["type"] == "message_end" && f["message"]["role"] == "assistant")
+        .ok_or("no assistant message")?;
+    case.frames[at]["x_future"] = json!({"nested": [1, "二"], "flag": true});
+    let x_future = case.frames[at]["x_future"].clone();
+    let control = case.clone();
+    let unknown = json!({"type": "hoh_future_record", "detail": {"n": 1}});
+    case.frames.insert(at, unknown.clone());
+    let mut ends = Vec::new();
+    for (name, case) in [("with", &case), ("control", &control)] {
+        let fake = world.fake(name, case)?;
+        let attempt = world.attempt_in("pi", name, name, "1.5.0").await?;
+        let outcome = run(
+            &world,
+            &attempt,
+            &world.turn(&fake, &format!("logs/{name}"))?,
+        )
+        .await?;
+        let row = world.store.reader()?.attempt(name)?.ok_or("no attempt")?;
+        ends.push((
+            (outcome.state, outcome.failure),
+            (row.state, row.failure_reason),
+        ));
+        let raw = std::fs::read(world.dir.path().join(format!("logs/{name}/stdout.jsonl")))?;
+        let sent = std::fs::read(fake.parent().ok_or("no dir")?.join("log/sent.jsonl"))?;
+        assert_eq!(
+            hex(&raw),
+            hex(&sent),
+            "{name}: the raw log is what the fake wrote"
+        );
+        let kept = raw
+            .split(|b| *b == b'\n')
+            .filter_map(|l| serde_json::from_slice::<Value>(l).ok())
+            .find_map(|f| f.get("x_future").cloned());
+        assert_eq!(
+            kept.as_ref(),
+            Some(&x_future),
+            "{name}: x_future in the raw log"
+        );
+        if name == "with" {
+            let line = sent
+                .split(|b| *b == b'\n')
+                .find(|l| serde_json::from_slice::<Value>(l).is_ok_and(|f| f == unknown))
+                .ok_or("the unknown record was not sent")?;
+            let unknowns: Vec<Value> = world
+                .store
+                .reader()?
+                .events("R")?
+                .into_iter()
+                .filter(|(k, p)| k == "adapter.unknown_event" && p["attempt_id"] == name)
+                .map(|(_, p)| p)
+                .collect();
+            assert_eq!(unknowns.len(), 1, "{unknowns:?}");
+            assert_eq!(unknowns[0]["key"], "hoh_future_record");
+            assert_eq!(unknowns[0]["frame_sha256"], hex(line));
+            assert_eq!(unknowns[0]["frame"], unknown);
+        }
+    }
+    let total = world
+        .store
+        .reader()?
+        .events("R")?
+        .into_iter()
+        .filter(|(k, _)| k == "adapter.unknown_event")
+        .count();
+    assert_eq!(total, 1, "none for the control");
+    assert_eq!(
+        ends[0], ends[1],
+        "the same end with and without the unknown record"
+    );
     Ok(())
 }
