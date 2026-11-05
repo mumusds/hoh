@@ -362,11 +362,12 @@ pub async fn run(
             native_id: Some(launch.session_id.clone()),
             native_path: Some(launch.session_dir.to_string_lossy().into_owned()),
             agent_version: attempt.agent_version.clone(),
-            // The probed capabilities (M1R-01); this adapter takes no steer and answers no dialog. Whether pi emits
-            // agent_settled is the adapter's setting, not a capability of the session (M1T04R-13).
+            // The probed capabilities this adapter implements: events and resume (M1R-01). It takes no steer, answers
+            // no dialog and records no token usage (M1T04R-16); whether pi emits agent_settled is the adapter's
+            // setting, not a capability of the session (M1T04R-13).
             capabilities: crate::capabilities::of_session(
                 &launch.capabilities,
-                &[("mid_turn_steer", false), ("ui_dialogs", false)],
+                &[("structured_events", true), ("resume", true)],
             ),
         })
         .await?;

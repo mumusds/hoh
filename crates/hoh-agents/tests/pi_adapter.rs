@@ -251,6 +251,7 @@ async fn the_session_has_the_capabilities_the_probe_found() -> R {
         ("resume", false),
         ("mid_turn_steer", true),
         ("ui_dialogs", true),
+        ("token_usage", true),
     ]);
     let attempt = world.attempt("A1").await?;
     assert_eq!(
@@ -268,6 +269,8 @@ async fn the_session_has_the_capabilities_the_probe_found() -> R {
         ("resume", false),
         ("mid_turn_steer", false),
         ("ui_dialogs", false),
+        // The adapter records no token usage (M1T04R-16).
+        ("token_usage", false),
     ] {
         assert_eq!(caps[name], json!(value), "{name}: {caps}");
     }

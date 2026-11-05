@@ -619,7 +619,7 @@ fn live_drives_an_exec_only_codex_through_exec() -> R {
         "codex",
         &format!(
             "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n \
-             exec) if [ \"$2\" = --help ]; then cat '{f}/help-exec.txt'; elif [ \"$2\" = resume ]; then echo 'Usage: codex exec resume --json'; \
+             exec) if [ \"$2\" = --help ]; then cat '{f}/help-exec.txt'; elif [ \"$2\" = resume ]; then echo 'Usage: codex exec resume --json --dangerously-bypass-approvals-and-sandbox --model'; \
              else cat > /dev/null; cat '{f}/exec/stdout.jsonl'; fi;;\n \
              login) echo 'Logged in using ChatGPT' >&2;;\n *) echo \"error: unrecognized subcommand '$1'\" >&2; exit 2;;\nesac\n",
             f = f.display()

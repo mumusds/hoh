@@ -64,8 +64,8 @@ pub struct Blocked(pub String);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Argv {
     pub args: Vec<String>,
-    /// The session row's capabilities: the probed ones, `partial_messages` and `resume` no more than the help
-    /// offers, no steer and no dialogs (M1R-01).
+    /// The session row's capabilities: the probed ones this adapter implements, `partial_messages` and `resume` no
+    /// more than the help offers (M1R-01).
     pub capabilities: Value,
 }
 
@@ -108,15 +108,14 @@ pub fn argv(launch: &Launch) -> Result<Argv, Blocked> {
     }
     Ok(Argv {
         args,
+        // What this adapter implements: events, resume and deltas where the help offers them. One prompt on stdin, then
+        // stdin closes, so no steer and no dialog; it records no token usage (M1T04R-12, -15, -16).
         capabilities: crate::capabilities::of_session(
             &launch.capabilities,
-            // One prompt on stdin, then stdin closes: no steer reaches a running turn, and nobody answers a dialog
-            // (M1T04R-12).
             &[
-                ("partial_messages", partial),
+                ("structured_events", true),
                 ("resume", resume),
-                ("mid_turn_steer", false),
-                ("ui_dialogs", false),
+                ("partial_messages", partial),
             ],
         ),
     })

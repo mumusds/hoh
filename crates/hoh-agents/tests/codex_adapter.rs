@@ -1667,6 +1667,13 @@ for line in sys.stdin:
     turn.launch.yolo = false;
     turn.launch.known = ["turn/completed".to_owned()].into_iter().collect();
     turn.launch.capabilities = entry.capabilities.clone();
+    // What this adapter does not do is no capability whatever a compat suite found (M1T04R-15): it refuses
+    // item/tool/call, sends text prompts only, has no browser and answers no dialog.
+    for unsupported in ["custom_tools", "images", "browser", "ui_dialogs"] {
+        turn.launch
+            .capabilities
+            .insert(unsupported.to_owned(), Some(true));
+    }
     let attempt = world.attempt("A1").await?;
     let outcome = run(&world, &attempt, &turn).await?;
     assert_eq!(
@@ -1678,10 +1685,12 @@ for line in sys.stdin:
         assert_eq!(session.capabilities[absent], false, "{absent}: {session:?}");
     }
     assert_eq!(session.capabilities["structured_events"], true);
-    assert_eq!(
-        session.capabilities["ui_dialogs"], false,
-        "server requests are answered headless"
-    );
+    for unsupported in ["custom_tools", "images", "browser", "ui_dialogs"] {
+        assert_eq!(
+            session.capabilities[unsupported], false,
+            "{unsupported}: {session:?}"
+        );
+    }
     // The rule dispatch reads the row with: no resume, so a task that needs it is ROLE_CAPABILITY_MISSING.
     let granted = hoh_core::decision::granted_capabilities(&session.capabilities);
     assert!(
@@ -1692,20 +1701,22 @@ for line in sys.stdin:
     Ok(())
 }
 
-/// On exec a session can be resumed only if a resumed exec turn could start: `codex exec resume --help` was probed
-/// and offers what the turn needs (`--json`, the YOLO flag). The probe's resume alone, from `codex exec --help`, is not
-/// enough (M1T04R-11).
+/// On exec a session can be resumed only if a resumed exec turn can do whatever a new one can: `codex exec resume
+/// --help` was probed and offers `--json`, and the YOLO flag and `--model` wherever `codex exec --help` offers them, so a
+/// later turn with another profile or model is not refused. The probe's resume alone, from `codex exec --help`, is
+/// not enough, and the launch that wrote the row does not decide (M1T04R-11, -14).
 #[tokio::test]
 async fn an_exec_session_resumes_only_if_a_resumed_exec_turn_could_start() -> R {
     let world = World::new()?;
-    let resume_help = "Usage: codex exec resume [OPTIONS] [SESSION_ID] [PROMPT]\n  --json\n  --dangerously-bypass-approvals-and-sandbox\n";
-    for (i, (help, resumable)) in [
-        (None, false),
-        (
-            Some("Usage: codex exec resume [SESSION_ID]\n  --json\n"),
-            false,
-        ),
-        (Some(resume_help), true),
+    let resume_help = "Usage: codex exec resume [OPTIONS] [SESSION_ID] [PROMPT]\n  --json\n  --dangerously-bypass-approvals-and-sandbox\n  -m, --model <MODEL>\n";
+    let json_only = "Usage: codex exec resume [SESSION_ID]\n  --json\n";
+    for (i, (help, yolo, resumable)) in [
+        (None, true, false),
+        (Some(json_only), true, false),
+        // Written by a turn that needs neither: a later YOLO turn or one with a model could not resume.
+        (Some(json_only), false, false),
+        (Some(resume_help), true, true),
+        (Some(resume_help), false, true),
     ]
     .into_iter()
     .enumerate()
@@ -1715,6 +1726,7 @@ async fn an_exec_session_resumes_only_if_a_resumed_exec_turn_could_start() -> R 
         let mut turn = world.turn(&fake, &format!("logs/{name}"))?;
         turn.launch.app_server_help = None;
         turn.launch.exec_resume_help = help.map(str::to_owned);
+        turn.launch.yolo = yolo;
         let attempt = world
             .attempt_in("codex", &format!("A{i}"), &format!("S{i}"), "0.166.0")
             .await?;
