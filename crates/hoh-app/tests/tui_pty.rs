@@ -380,6 +380,23 @@ fn a_burst_of_keys_is_taken_in_full() -> R {
     Ok(())
 }
 
+/// A long paste is drawn at once: 128 KiB in the single-line editor shows its end within seconds (it took minutes
+/// when the view was found by dropping graphemes from the front one by one, all that time without looking at the
+/// signal flags; M1T08R-31).
+#[test]
+fn a_long_paste_is_drawn_at_once() -> R {
+    let (home, project) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    let mut s = open(project.path(), home.path(), &[])?;
+    let from = s.pty.output().len();
+    s.pty
+        .send(format!("\x1b[200~{}PASTE_END\x1b[201~", "x".repeat(128 << 10)).as_bytes())?;
+    s.pty.wait_for("PASTE_END", from, WAIT)?;
+    // Ctrl+C clears the editor first; the next one offers to leave.
+    s.pty.send(b"\x03")?;
+    assert_eq!(s.detach()?, Some(0));
+    Ok(())
+}
+
 /// Closing the terminal hangs it up, and hoh's input then reads end of file. As its controlling terminal the kernel
 /// also sends SIGHUP: 129. As only its stdio there is no signal: the terminal failed, 74. Either way hoh ends within
 /// a few seconds instead of spinning on the hung-up input (M1QA-01). The terminal is gone, so there is nothing to

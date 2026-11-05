@@ -114,16 +114,25 @@ impl Editor {
         self.text[..self.cursor].width()
     }
 
+    #[cfg(test)]
+    pub fn cursor_byte(&self) -> usize {
+        self.cursor
+    }
+
     /// The part of the text to show in `width` columns so that the cursor stays visible, and the cursor's column in
-    /// it: whole graphemes are dropped from the front until the text before the cursor fits.
+    /// it: as many whole graphemes before the cursor as fit, found walking back from it, so that a draw is linear in
+    /// the line's length (M1T08R-31).
     pub fn view(&self, width: usize) -> (&str, usize) {
-        let mut start = 0;
         let room = width.saturating_sub(1);
-        while self.text[start..self.cursor].width() > room {
-            match self.text[start..self.cursor].graphemes(true).next() {
-                Some(g) => start += g.len(),
-                None => break,
+        let mut start = self.cursor;
+        let mut column = 0;
+        for (i, g) in self.text[..self.cursor].grapheme_indices(true).rev() {
+            let w = g.width();
+            if column + w > room {
+                break;
             }
+            column += w;
+            start = i;
         }
         (&self.text[start..], self.text[start..self.cursor].width())
     }
