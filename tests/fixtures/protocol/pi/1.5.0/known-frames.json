@@ -1,0 +1,177 @@
+{
+ "schema_version": "1.0",
+ "agent": "pi",
+ "cli_version": "1.5.0",
+ "key": "\"type\" of a stdout record in --mode rpc",
+ "sources": {
+  "recorded": "stdout.jsonl of the cases recorded for this version (tests/fixtures/protocol/pi/1.5.0/*)",
+  "docs": "docs/json.md (session events), docs/rpc.md (response), docs/rpc-extension-ui.md (extension_ui_request) of pi-coding-agent 1.5.0"
+ },
+ "frames": [
+  {
+   "key": "agent_end",
+   "sources": [
+    "recorded",
+    "docs"
+   ]
+  },
+  {
+   "key": "agent_settled",
+   "sources": [
+    "recorded",
+    "docs"
+   ]
+  },
+  {
+   "key": "agent_start",
+   "sources": [
+    "recorded",
+    "docs"
+   ]
+  },
+  {
+   "key": "auto_retry_end",
+   "sources": [
+    "docs"
+   ]
+  },
+  {
+   "key": "auto_retry_start",
+   "sources": [
+    "docs"
+   ]
+  },
+  {
+   "key": "bash_execution_update",
+   "sources": [
+    "docs"
+   ]
+  },
+  {
+   "key": "compaction_end",
+   "sources": [
+    "docs"
+   ]
+  },
+  {
+   "key": "compaction_start",
+   "sources": [
+    "docs"
+   ]
+  },
+  {
+   "key": "entry_appended",
+   "sources": [
+    "docs"
+   ]
+  },
+  {
+   "key": "extension_error",
+   "sources": [
+    "docs"
+   ]
+  },
+  {
+   "key": "extension_ui_request",
+   "sources": [
+    "docs"
+   ]
+  },
+  {
+   "key": "message_end",
+   "sources": [
+    "recorded",
+    "docs"
+   ]
+  },
+  {
+   "key": "message_start",
+   "sources": [
+    "recorded",
+    "docs"
+   ]
+  },
+  {
+   "key": "message_update",
+   "sources": [
+    "recorded",
+    "docs"
+   ]
+  },
+  {
+   "key": "queue_update",
+   "sources": [
+    "docs"
+   ]
+  },
+  {
+   "key": "response",
+   "sources": [
+    "recorded",
+    "docs"
+   ]
+  },
+  {
+   "key": "session_info_changed",
+   "sources": [
+    "docs"
+   ]
+  },
+  {
+   "key": "summarization_retry_attempt_start",
+   "sources": [
+    "docs"
+   ]
+  },
+  {
+   "key": "summarization_retry_finished",
+   "sources": [
+    "docs"
+   ]
+  },
+  {
+   "key": "summarization_retry_scheduled",
+   "sources": [
+    "docs"
+   ]
+  },
+  {
+   "key": "thinking_level_changed",
+   "sources": [
+    "docs"
+   ]
+  },
+  {
+   "key": "tool_execution_end",
+   "sources": [
+    "docs"
+   ]
+  },
+  {
+   "key": "tool_execution_start",
+   "sources": [
+    "docs"
+   ]
+  },
+  {
+   "key": "tool_execution_update",
+   "sources": [
+    "docs"
+   ]
+  },
+  {
+   "key": "turn_end",
+   "sources": [
+    "recorded",
+    "docs"
+   ]
+  },
+  {
+   "key": "turn_start",
+   "sources": [
+    "recorded",
+    "docs"
+   ]
+  }
+ ]
+}

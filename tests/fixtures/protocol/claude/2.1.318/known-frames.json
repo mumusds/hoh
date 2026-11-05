@@ -1,0 +1,573 @@
+{
+ "schema_version": "1.0",
+ "agent": "claude",
+ "cli_version": "2.1.318",
+ "key": "stdout records of --output-format stream-json: \"type\", or \"type/subtype\" for system and result records",
+ "sources": {
+  "recorded": "stdout.jsonl of the cases recorded for this version (tests/fixtures/protocol/claude/2.1.318/*)",
+  "binary": "record type and subtype literals of the 2.1.318 executable (type:\"system\",subtype:\"...\", result subtypes, top-level type literals)"
+ },
+ "frames": [
+  {
+   "key": "assistant",
+   "sources": [
+    "recorded",
+    "binary"
+   ]
+  },
+  {
+   "key": "auth_status",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "control_cancel_request",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "control_request",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "control_response",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "keep_alive",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "prompt_suggestion",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "rate_limit_event",
+   "sources": [
+    "recorded",
+    "binary"
+   ]
+  },
+  {
+   "key": "result/error_during_execution",
+   "sources": [
+    "recorded",
+    "binary"
+   ]
+  },
+  {
+   "key": "result/error_max_budget_usd",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "result/error_max_structured_output_retries",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "result/error_max_turns",
+   "sources": [
+    "recorded",
+    "binary"
+   ]
+  },
+  {
+   "key": "result/success",
+   "sources": [
+    "recorded",
+    "binary"
+   ]
+  },
+  {
+   "key": "stream_event",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/agents_killed",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/api_error",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/api_retry",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/away_summary",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/background_tasks_changed",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/bridge_state",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/bridge_status",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/checkpoint_done",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/cloud_session_delta",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/cloud_session_status",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/code_change_published",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/commands_changed",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/compact_boundary",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/control_request_progress",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/dev_intent",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/elicitation_complete",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/feedback_draft_queued",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/file_attachments_missing",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/file_snapshot",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/hook_callback",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/hook_progress",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/hook_response",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/hook_started",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/informational",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/inherited_asks_settled",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/init",
+   "sources": [
+    "recorded",
+    "binary"
+   ]
+  },
+  {
+   "key": "system/instruction_size_warning",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/local_command",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/memory_recall",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/memory_saved",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/mirror_error",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/model_consent_fallback",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/model_fallback",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/model_refusal_fallback",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/model_refusal_no_fallback",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/notification",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/peer_message_hold",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/per_turn_effort_changed",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/permission_check_status",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/permission_denied",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/permission_retry",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/placed",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/plugin_install",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/post_turn_summary",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/rewind_stand_in",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/scheduled_task_fire",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/session_metadata",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/session_state_changed",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/session_title_changed",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/session_writes_lost",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/start_folder",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/status",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/stop_hook_summary",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/task_notification",
+   "sources": [
+    "recorded",
+    "binary"
+   ]
+  },
+  {
+   "key": "system/task_progress",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/task_started",
+   "sources": [
+    "recorded",
+    "binary"
+   ]
+  },
+  {
+   "key": "system/task_summary",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/task_updated",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/thinking_tokens",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/tool_host_result",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/turn_began_before_init",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/turn_duration",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/turn_handoff_available",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/turn_preempted",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/turn_starting",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/ui_focus",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/ui_invalidate",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/ui_log",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/ui_panes",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/ui_placed",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/ui_scroll",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/ui_status",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/ui_toast",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/vcs_state_changed",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "system/worker_shutting_down",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "tool_progress",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "tool_use_summary",
+   "sources": [
+    "binary"
+   ]
+  },
+  {
+   "key": "user",
+   "sources": [
+    "recorded",
+    "binary"
+   ]
+  }
+ ]
+}

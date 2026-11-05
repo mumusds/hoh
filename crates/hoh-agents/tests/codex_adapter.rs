@@ -1493,3 +1493,106 @@ async fn an_input_moved_elsewhere_does_not_stop_the_turn() -> R {
     assert!(notes >= 1, "the refused moves are recorded");
     Ok(())
 }
+
+/// TEST-027-02 (codex): a recorded app-server turn with one notification whose method is not in 0.166.0's known-frame
+/// registry (`tests/fixtures/protocol/codex/0.166.0/known-frames.json`, the schema's methods) and an `x_future` field
+/// in a known notification, against the same turn without that notification. Expected: no panic; exactly one
+/// `adapter.unknown_event`, with the frame as received and the sha256 of its bytes; the raw log is the bytes the fake
+/// wrote; `x_future` comes back from the raw log as sent; both turns end alike, as returned and as stored.
+#[tokio::test]
+async fn test_027_02_codex_keeps_an_unregistered_notification_once_and_ends_as_without_it() -> R {
+    let world = World::new()?;
+    let mut case = Case::load("app-server-turn")?;
+    let at = case.position("item/completed")?;
+    case.frames[at]["params"]["x_future"] = json!({"nested": [1, "二"], "flag": true});
+    let x_future = case.frames[at]["params"]["x_future"].clone();
+    let control = Case {
+        frames: case.frames.clone(),
+        ..Case::load("app-server-turn")?
+    };
+    let unknown = json!({"method": "hoh/futureNotification", "params": {"n": 1}});
+    let at = case.position("turn/completed")?;
+    case.frames.insert(at, unknown.clone());
+    let mut ends = Vec::new();
+    for (id, name, case) in [("A1", "with", &case), ("A2", "control", &control)] {
+        let fake = world.fake(name, Some(case), "exec", false)?;
+        let attempt = world.attempt(id).await?;
+        let outcome = run(&world, &attempt, &world.turn(&fake, &format!("logs/{id}"))?).await?;
+        let row = world.store.reader()?.attempt(id)?.ok_or("no attempt")?;
+        ends.push((
+            (outcome.state, outcome.failure.clone()),
+            (row.state, row.failure_reason),
+        ));
+        let sent = std::fs::read(fake.parent().ok_or("no dir")?.join("log/sent.jsonl"))?;
+        let raw = std::fs::read(&outcome.stdout)?;
+        assert_eq!(
+            hex(&raw),
+            hex(&sent),
+            "{name}: the raw log is what the fake wrote"
+        );
+        let kept = raw
+            .split(|b| *b == b'\n')
+            .filter_map(|l| serde_json::from_slice::<Value>(l).ok())
+            .find_map(|f| f["params"].get("x_future").cloned());
+        assert_eq!(
+            kept.as_ref(),
+            Some(&x_future),
+            "{name}: x_future in the raw log"
+        );
+        if name == "with" {
+            let line = sent
+                .split(|b| *b == b'\n')
+                .find(|l| serde_json::from_slice::<Value>(l).is_ok_and(|f| f == unknown))
+                .ok_or("the unknown notification was not sent")?;
+            let unknowns = events(&world, "adapter.unknown_event")?;
+            assert_eq!(unknowns.len(), 1, "{unknowns:?}");
+            assert_eq!(unknowns[0]["attempt_id"], id);
+            assert_eq!(unknowns[0]["frame_sha256"], hex(line));
+            assert_eq!(unknowns[0]["frame"], unknown);
+        }
+    }
+    assert_eq!(
+        events(&world, "adapter.unknown_event")?.len(),
+        1,
+        "none for the control"
+    );
+    assert_eq!(
+        ends[0], ends[1],
+        "the same end with and without the unknown notification"
+    );
+    Ok(())
+}
+
+/// The adapter's known methods for 0.166.0 (its schema's server notifications) and exec event types are the
+/// version's known-frame registry, so "unknown" means the same in both (docs/13).
+#[test]
+fn the_known_methods_are_the_registry() -> R {
+    let registry: Value = serde_json::from_str(&std::fs::read_to_string(format!(
+        "{FIXTURES}/known-frames.json"
+    ))?)?;
+    let keys = |path: &[&str]| -> Vec<String> {
+        let mut v = &registry;
+        for p in path {
+            v = &v[*p];
+        }
+        v.as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|e| e["key"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let schema: Value = serde_json::from_str(&std::fs::read_to_string(format!(
+        "{FIXTURES}/app-server-schema/ServerNotification.json"
+    ))?)?;
+    let known: Vec<String> = codex::known_notifications(&schema).into_iter().collect();
+    assert_eq!(keys(&["app_server", "notifications"]), known);
+    assert_eq!(keys(&["exec"]).len(), 8);
+    let mut exec = keys(&["exec"]);
+    exec.sort();
+    let mut ours: Vec<String> = hoh_agents::known::codex_exec().keys().cloned().collect();
+    ours.sort();
+    assert_eq!(exec, ours);
+    Ok(())
+}

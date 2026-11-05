@@ -7,6 +7,7 @@ use super::{
 };
 use crate::adapter::{AdapterError, AttemptRef, finish, now, step};
 use crate::frame::Frame;
+use crate::known;
 use crate::process::{Cause, Config, Event, Process};
 use hoh_core::lifecycle::AttemptState;
 use hoh_core::persistence::{AttemptFacts, CancelLatch, Store};
@@ -14,18 +15,6 @@ use serde_json::{Value, json};
 use std::process::Command;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
-
-/// exec's event types (`--json`); any other is kept as an `adapter.unknown_event`.
-const KNOWN: &[&str] = &[
-    "thread.started",
-    "turn.started",
-    "turn.completed",
-    "turn.failed",
-    "item.started",
-    "item.updated",
-    "item.completed",
-    "error",
-];
 
 pub(super) async fn run(
     store: &Store,
@@ -204,7 +193,8 @@ pub(super) async fn run(
                     )
                     .await?;
             }
-            _ if KNOWN.contains(&kind) => {}
+            // exec's event types (`--json`, the version's registry); any other is kept as an `adapter.unknown_event`.
+            _ if known::codex_exec().contains(kind) => {}
             _ => {
                 unknown += 1;
                 store
@@ -212,7 +202,8 @@ pub(super) async fn run(
                         id,
                         &format!("exec-unknown-{unknown}"),
                         "adapter.unknown_event",
-                        json!({"attempt_id": id, "method": kind, "frame": frame}),
+                        json!({"attempt_id": id, "method": kind, "key": kind,
+                               "frame_sha256": known::frame_sha256(&line), "frame": frame}),
                     )
                     .await?;
             }

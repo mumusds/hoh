@@ -17,6 +17,7 @@ use super::{
 };
 use crate::adapter::{AdapterError, AttemptRef, finish, now, soft_move, step};
 use crate::frame::Frame;
+use crate::known;
 use crate::process::{Config, Event, Process};
 use hoh_core::lifecycle::{AttemptState, InputState};
 use hoh_core::persistence::{AttemptFacts, CancelLatch, PersistError, Store};
@@ -160,8 +161,8 @@ struct State<'a> {
     seen_items: HashSet<String>,
     /// The prompt's own user message has been seen (it is matched before any steer).
     prompt_seen: bool,
-    /// Turn-scoped notifications of this thread that came before this turn's id was known.
-    early: Vec<(String, Value)>,
+    /// Turn-scoped notifications of this thread that came before this turn's id was known, with their bytes.
+    early: Vec<(String, Value, Vec<u8>)>,
 }
 
 impl State<'_> {
@@ -302,12 +303,18 @@ impl State<'_> {
     }
 
     /// A notification (not a request) from codex.
-    async fn on_notification(&mut self, method: &str, frame: &Value) -> Result<(), PersistError> {
+    async fn on_notification(
+        &mut self,
+        method: &str,
+        frame: &Value,
+        line: &[u8],
+    ) -> Result<(), PersistError> {
         let params = &frame["params"];
         if let Some((thread, turn)) = scope_of(method, params) {
             let this_thread = self.thread_id.is_some() && thread == self.thread_id;
             if this_thread && self.turn_id.is_none() && self.phase < Phase::Done {
-                self.early.push((method.to_owned(), frame.clone()));
+                self.early
+                    .push((method.to_owned(), frame.clone(), line.to_vec()));
             } else if this_thread && turn == self.turn_id {
                 self.on_turn_notification(method, frame).await?;
             } else if method != "turn/started" {
@@ -335,7 +342,8 @@ impl State<'_> {
                 self.event(
                     &format!("unknown-{n}"),
                     "adapter.unknown_event",
-                    json!({"method": method, "frame": frame}),
+                    json!({"method": method, "key": method, "frame_sha256": known::frame_sha256(line),
+                           "frame": frame}),
                 )
                 .await?;
             }
@@ -344,8 +352,25 @@ impl State<'_> {
         Ok(())
     }
 
-    /// A server request: the headless policy answers it at once.
-    async fn on_request(&mut self, method: &str, id: Value) -> Result<(), PersistError> {
+    /// A server request: the headless policy answers it at once; one not in the version's registry is also kept as an
+    /// `adapter.unknown_event`.
+    async fn on_request(
+        &mut self,
+        method: &str,
+        id: Value,
+        frame: &Value,
+        line: &[u8],
+    ) -> Result<(), PersistError> {
+        if !known::codex_app_server().contains(method) {
+            let n = self.next("unknown");
+            self.event(
+                &format!("unknown-{n}"),
+                "adapter.unknown_event",
+                json!({"method": method, "key": method, "frame_sha256": known::frame_sha256(line),
+                       "frame": frame}),
+            )
+            .await?;
+        }
         let n = self.next("server-request");
         let answer = super::headless_answer(method);
         let (reply, recorded) = match answer {
@@ -481,8 +506,8 @@ impl State<'_> {
                     )
                     .await?;
                     // What came before this turn's id was known counts now, if it is this turn's.
-                    for (method, early) in std::mem::take(&mut self.early) {
-                        Box::pin(self.on_notification(&method, &early)).await?;
+                    for (method, early, bytes) in std::mem::take(&mut self.early) {
+                        Box::pin(self.on_notification(&method, &early, &bytes)).await?;
                     }
                     for s in held.drain(..) {
                         if self.phase == Phase::Active {
@@ -717,8 +742,8 @@ pub(super) async fn run(
             continue;
         };
         match (frame["method"].as_str(), frame.get("id").cloned()) {
-            (Some(method), Some(id)) => s.on_request(method, id).await?,
-            (Some(method), None) => s.on_notification(method, &frame).await?,
+            (Some(method), Some(id)) => s.on_request(method, id, &frame, &line).await?,
+            (Some(method), None) => s.on_notification(method, &frame, &line).await?,
             (None, _) => s.on_response(&process, held, &frame).await?,
         }
     };
@@ -744,8 +769,8 @@ pub(super) async fn run(
         let early = std::mem::take(&mut s.early);
         let started: Vec<Value> = early
             .iter()
-            .filter(|(m, _)| m == "item/started")
-            .map(|(_, f)| f["params"]["item"].clone())
+            .filter(|(m, _, _)| m == "item/started")
+            .map(|(_, f, _)| f["params"]["item"].clone())
             .collect();
         if started
             .iter()
@@ -757,7 +782,7 @@ pub(super) async fn run(
             "unconfirmed-turn",
             "adapter.diagnostic",
             json!({"reason": "notifications of this thread for a turn never confirmed",
-                   "methods": early.iter().map(|(m, _)| m.clone()).collect::<Vec<_>>(),
+                   "methods": early.iter().map(|(m, _, _)| m.clone()).collect::<Vec<_>>(),
                    "items_started": started.iter().map(|i| json!({"id": i["id"], "type": i["type"]})).collect::<Vec<_>>()}),
         )
         .await?;
