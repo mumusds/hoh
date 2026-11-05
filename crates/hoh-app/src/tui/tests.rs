@@ -368,6 +368,17 @@ struct Flaky {
     interrupt_at: Vec<usize>,
 }
 
+impl Flaky {
+    fn new(limit: usize) -> Flaky {
+        Flaky {
+            out: Vec::new(),
+            limit,
+            fail_at: Vec::new(),
+            interrupt_at: Vec::new(),
+        }
+    }
+}
+
 impl std::io::Write for Flaky {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         if self.interrupt_at.first() == Some(&self.out.len()) {
@@ -388,41 +399,106 @@ impl std::io::Write for Flaky {
     }
 }
 
-/// Each restore sequence is sent exactly once, however the writes are cut: a sequence that is out is never sent
-/// again (a second "leave the alternate screen" would put the saved cursor back over what was printed since), and
-/// one cut short goes on from where it stopped (M1T08R-07).
+/// The control sequences a VT-style parser carries out from `bytes` (test oracle): ESC starts a sequence, aborting
+/// one under way; CAN aborts; a CSI ends at its final byte (0x40..=0x7e); other bytes in the ground state are text.
+fn carried_out(bytes: &[u8]) -> Vec<String> {
+    enum State {
+        Ground,
+        Escape,
+        Csi(Vec<u8>),
+    }
+    let mut state = State::Ground;
+    let mut done = Vec::new();
+    for &b in bytes {
+        state = match (state, b) {
+            (_, 0x1b) => State::Escape,
+            (_, 0x18) => State::Ground,
+            (State::Escape, b'[') => State::Csi(Vec::new()),
+            (State::Escape, _) | (State::Ground, _) => State::Ground,
+            (State::Csi(mut p), b) if (0x40..=0x7e).contains(&b) => {
+                p.push(b);
+                done.push(String::from_utf8_lossy(&p).into_owned());
+                State::Ground
+            }
+            (State::Csi(mut p), b) => {
+                p.push(b);
+                State::Csi(p)
+            }
+        };
+    }
+    done
+}
+
+/// Each restore sequence takes effect exactly once, whatever fails in between: one that went out is never sent again
+/// (a second "leave the alternate screen" puts the saved cursor back over what was printed since; M1T08R-07); one cut
+/// short is sent again from its start after a CAN, which ends what the terminal was still parsing, so a diagnostic
+/// printed in between (after `settle`) neither breaks it nor is swallowed by it (M1T08R-08).
 #[test]
-fn restore_sequences_go_out_once_whatever_fails_in_between() {
-    use super::terminal::{Step, send};
-    let sequences: [&[u8]; 3] = [b"\x1b[?2004l", b"\x1b[?1049l", b"\x1b[?25h"];
-    let whole: Vec<u8> = sequences.concat();
-    // Writes of 3 bytes reach 0, 3, 6, 8 | 11, 14, 16 | 19, 22: fail inside the second sequence (11), then at the
-    // start of the third (16); an EINTR at 3 is just retried.
-    let mut out = Flaky {
-        out: Vec::new(),
-        limit: 3,
-        fail_at: vec![11, 16],
-        interrupt_at: vec![3],
-    };
-    let steps = [Step::new(), Step::new(), Step::new()];
-    for step in &steps {
-        step.arm();
+fn restore_sequences_take_effect_once_whatever_fails_in_between() {
+    use super::terminal::{Steps, close, open, settle_on};
+    for (fail_at, label) in [(27, "inside the leave"), (32, "at the start of the cursor")] {
+        let steps = Steps::new();
+        let mut out = Flaky::new(3);
+        open(&mut out, &steps).expect("entered");
+        // close: paste off 16..24, leave 24..32, cursor 32..38 in writes of 3 bytes (24, 27, 30, 32, 35, 38).
+        out.fail_at = vec![fail_at];
+        out.interrupt_at = vec![19];
+        assert!(
+            close(&mut out, &steps).is_err(),
+            "{label}: the first try fails"
+        );
+        settle_on(&mut out, &steps);
+        out.out.extend_from_slice("hoh：终端未能恢复".as_bytes());
+        close(&mut out, &steps).expect("the retry finishes");
+        assert!(
+            out.fail_at.is_empty() && out.interrupt_at.is_empty(),
+            "{label}: every fault was hit"
+        );
+        assert_eq!(
+            carried_out(&out.out),
+            ["?1049h", "?2004h", "?2004l", "?1049l", "?25h"],
+            "{label}: {:?}",
+            String::from_utf8_lossy(&out.out)
+        );
+        // Nothing is left: a further restore sends nothing.
+        let before = out.out.len();
+        close(&mut out, &steps).expect("nothing to send");
+        assert_eq!(out.out.len(), before, "{label}");
     }
-    let mut calls = 0;
-    while send(&mut out, &steps, &sequences).is_err() {
-        calls += 1;
-        assert!(calls < 10, "it never finished");
-    }
-    assert_eq!(calls, 2);
-    assert!(
-        out.fail_at.is_empty() && out.interrupt_at.is_empty(),
-        "every fault was hit"
+}
+
+/// An undo is sent only once what it undoes is out (M1T08R-09): an entry that sent nothing leaves nothing to undo,
+/// one cut short is ended with a CAN, and a leave never goes to a terminal that never entered the alternate screen.
+#[test]
+fn only_what_was_entered_is_undone() {
+    use super::terminal::{Steps, close, open};
+    // Nothing out: nothing to undo.
+    let steps = Steps::new();
+    let mut out = Flaky::new(64);
+    out.fail_at = vec![0];
+    assert!(open(&mut out, &steps).is_err());
+    close(&mut out, &steps).expect("closed");
+    assert_eq!(out.out, b"", "nothing at all is sent");
+    // The alternate screen cut short: ended with a CAN, no leave.
+    let steps = Steps::new();
+    let mut out = Flaky::new(3);
+    out.fail_at = vec![3];
+    assert!(open(&mut out, &steps).is_err());
+    close(&mut out, &steps).expect("closed");
+    assert_eq!(out.out, b"\x1b[?\x18");
+    assert!(carried_out(&out.out).is_empty());
+    // The screen entered, bracketed paste cut short: the paste sequence ended, the screen left, no paste-off.
+    let steps = Steps::new();
+    let mut out = Flaky::new(3);
+    out.fail_at = vec![11];
+    assert!(open(&mut out, &steps).is_err());
+    close(&mut out, &steps).expect("closed");
+    assert_eq!(
+        carried_out(&out.out),
+        ["?1049h", "?1049l", "?25h"],
+        "{:?}",
+        String::from_utf8_lossy(&out.out)
     );
-    assert_eq!(out.out, whole, "every sequence exactly once, in order");
-    assert!(steps.iter().all(|s| !s.is_pending()));
-    // Nothing left: a further restore writes nothing.
-    send(&mut out, &steps, &sequences).expect("nothing to send");
-    assert_eq!(out.out, whole);
 }
 
 /// A normal exit tries the restore a bounded number of times (M1T08R-05).
