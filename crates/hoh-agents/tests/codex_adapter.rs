@@ -1597,6 +1597,46 @@ fn the_known_methods_are_the_registry() -> R {
     Ok(())
 }
 
+/// A frame too large while the handshake is refused fails the attempt: in ADR-012 §3 an oversized frame comes before
+/// a refused protocol request, so codex is not tried again on exec and the attempt is not settled (M1R-02).
+#[tokio::test]
+async fn a_frame_too_large_during_a_refused_handshake_fails_the_attempt() -> R {
+    let world = World::new()?;
+    let mut case = Case {
+        frames: Vec::new(),
+        requests: BTreeMap::new(),
+    };
+    case.requests.insert(0, "initialize".to_owned());
+    case.frames.push(json!({"hoh_batch": [
+        {"id": 0, "error": {"code": -32601, "message": "Method not found: initialize"}},
+        {"method": "item/agentMessage/delta", "params": {"delta": "x".repeat(1 << 20)}},
+    ]}));
+    let fake = world.fake("refused-huge", Some(&case), "exec", false)?;
+    let attempt = world.attempt("A1").await?;
+    let outcome = run(&world, &attempt, &world.turn(&fake, "logs/A1")?).await?;
+    assert_eq!(
+        (outcome.state, outcome.failure.as_deref(), outcome.mode),
+        (
+            AttemptState::Failed,
+            Some("PROTOCOL_FRAME_TOO_LARGE"),
+            Mode::AppServer
+        )
+    );
+    let row = world.store.reader()?.attempt("A1")?.ok_or("no attempt")?;
+    assert_eq!(
+        (row.state, row.failure_reason.as_deref()),
+        (AttemptState::Failed, Some("PROTOCOL_FRAME_TOO_LARGE"))
+    );
+    assert!(
+        argvs(&fake)?
+            .iter()
+            .all(|a| a.first().map(String::as_str) != Some("exec")),
+        "exec was not started"
+    );
+    assert!(events(&world, "adapter.degraded")?.is_empty());
+    Ok(())
+}
+
 /// A frame longer than the 1 MiB limit, on app-server or on exec, fails the turn as PROTOCOL_FRAME_TOO_LARGE with its
 /// diagnosis (length, prefix sha256, first 4 KiB); nothing more is read as frames and codex's group is stopped
 /// (M1-T07 done_when; the host-level AC-027-03 is M2-T05's).
