@@ -1,4 +1,4 @@
-//! The argv, refusal and verdict rules of the Pi adapter.
+//! The argv, error-class and verdict rules of the Pi adapter.
 
 use super::*;
 
@@ -47,14 +47,39 @@ fn the_session_is_on_every_command_line_and_never_ephemeral() {
     assert!(matches!(args(&l), Err(Blocked(d)) if d.contains("--session-id")));
 }
 
+/// Pi 1.5.0 has no structured error codes, so its error texts are classified only by the recorded patterns
+/// (REQ-026, CR-003; docs/13): `No API key found` → BLOCKED_AUTH, `Model not found` → MODEL_UNAVAILABLE, anything else
+/// PERMANENT_EXTERNAL with the text kept. That holds for a refused prompt and for a provider error after acceptance:
+/// HoH does not read statuses or phrases out of provider text (M1T05R-17..20; pi has already retried what it judged
+/// transient).
 #[test]
-fn refusals_are_classified_by_their_recorded_text() {
-    assert_eq!(
-        refusal("No API key found for the selected model."),
-        "BLOCKED_AUTH"
-    );
-    assert_eq!(refusal("Model not found: a/b"), "MODEL_UNAVAILABLE");
-    assert_eq!(refusal("boom"), "PERMANENT_EXTERNAL");
+fn pi_errors_are_classified_only_by_their_recorded_text() {
+    for (text, class) in [
+        ("No API key found for the selected model.", "BLOCKED_AUTH"),
+        ("  No API key found for key sk-status429", "BLOCKED_AUTH"),
+        ("Model not found: a/b", "MODEL_UNAVAILABLE"),
+        ("\tModel not found: vendor/status503", "MODEL_UNAVAILABLE"),
+        ("boom", "PERMANENT_EXTERNAL"),
+    ] {
+        assert_eq!(error_class(text), class, "{text}");
+    }
+    for text in [
+        r#"OpenAI API error (429): {"message":"Too Many Requests"}"#,
+        r#"Azure OpenAI API error (401): {"message":"Your token has expired"}"#,
+        r#"OpenAI API error (404): {"message":"model gpt-x does not exist"}"#,
+        r#"acme/eu API error (503): {"message":"Service Unavailable"}"#,
+        r#"{"error":{"code":429,"message":"Resource exhausted","status":"RESOURCE_EXHAUSTED"}}"#,
+        "Throttling error: Resource exhausted",
+        "AccessDeniedException: Permission denied",
+        "429 Too Many Requests",
+        "401 Unauthorized",
+        "rate limit exceeded",
+        "Request timed out",
+        "Invalid API key provided",
+        "the provider said: No API key found",
+    ] {
+        assert_eq!(error_class(text), "PERMANENT_EXTERNAL", "{text}");
+    }
 }
 
 #[test]
@@ -126,36 +151,17 @@ fn only_a_settled_turn_settles_and_a_cancel_wins() {
     );
 }
 
+/// A settled turn whose last message failed is a failure; a cancel still wins.
 #[test]
-fn provider_failures_are_classified() {
-    assert_eq!(provider_failure("No API key found for x"), "BLOCKED_AUTH");
-    assert_eq!(provider_failure("401 Unauthorized"), "BLOCKED_AUTH");
-    assert_eq!(
-        provider_failure("Model not found: a/b"),
-        "MODEL_UNAVAILABLE"
-    );
-    for m in [
-        "429 Too Many Requests",
-        "529 overloaded",
-        "rate limit exceeded",
-        "503 Service Unavailable",
-        "Request timed out",
-    ] {
-        assert_eq!(provider_failure(m), "TRANSIENT_EXTERNAL", "{m}");
-    }
-    assert_eq!(
-        provider_failure("400 malformed request"),
-        "PERMANENT_EXTERNAL"
-    );
-    // A settled turn whose last message failed is a failure; a cancel still wins.
+fn a_provider_error_fails_a_settled_turn() {
     let failed = Ending {
         settled: Some(SettledBy::AgentSettled),
-        provider_error: Some("TRANSIENT_EXTERNAL"),
+        provider_error: Some("PERMANENT_EXTERNAL"),
         ..Ending::default()
     };
     assert_eq!(
         verdict(&failed),
-        (AttemptState::Failed, Some("TRANSIENT_EXTERNAL".to_owned()))
+        (AttemptState::Failed, Some("PERMANENT_EXTERNAL".to_owned()))
     );
     assert_eq!(
         verdict(&Ending {
@@ -203,7 +209,17 @@ fn the_noted_session_files_are_the_regular_ones() {
     std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000)).expect("chmod");
     let seen = session_files(&sessions);
     std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-    assert_eq!(seen, Ok(want));
+    // A socket: pi's open fails at once (ENXIO) and it goes on (M1T05R-21); also through a symlink.
+    let socket =
+        std::os::unix::net::UnixListener::bind(sessions.join("a_socket.jsonl")).expect("bind");
+    std::os::unix::fs::symlink(
+        sessions.join("a_socket.jsonl"),
+        sessions.join("linked_socket.jsonl"),
+    )
+    .expect("symlink");
+    assert_eq!(seen, Ok(want.clone()));
+    assert_eq!(session_files(&sessions), Ok(want));
+    drop(socket);
     // What would block or flood pi's read does not pass: a FIFO, a device.
     let fifo = sessions.join("0000_fifo.jsonl");
     assert!(
@@ -217,110 +233,4 @@ fn the_noted_session_files_are_the_regular_ones() {
     std::fs::remove_file(&fifo).expect("remove");
     std::os::unix::fs::symlink("/dev/zero", sessions.join("0001_zero.jsonl")).expect("symlink");
     assert_eq!(session_files(&sessions), Err("0001_zero.jsonl".to_owned()));
-}
-
-/// The status as pi writes it (pi-ai error-body.js `formatProviderError`: `<label> error (NNN): …` or `NNN: …`; a raw
-/// SDK message starting `NNN` and a space, a colon or the end), or named as `HTTP NNN` / `status NNN` with word
-/// boundaries; never a number inside a body, a key, an id or a unit (M1T05R-14/16).
-#[test]
-fn provider_statuses_are_read_as_pi_writes_them() {
-    for (message, class) in [
-        (
-            r#"OpenAI API error (429): {"message":"Too Many Requests"}"#,
-            "TRANSIENT_EXTERNAL",
-        ),
-        (
-            r#"Azure OpenAI API error (503): {"message":"Service Unavailable"}"#,
-            "TRANSIENT_EXTERNAL",
-        ),
-        (
-            r#"OpenAI API error (401): {"message":"bad key"}"#,
-            "BLOCKED_AUTH",
-        ),
-        ("OpenAI Decisions error (403): forbidden", "BLOCKED_AUTH"),
-        (
-            "llama.cpp error (500): slot unavailable",
-            "TRANSIENT_EXTERNAL",
-        ),
-        (
-            "Mistral API error (404): model foo-1 does not exist",
-            "MODEL_UNAVAILABLE",
-        ),
-        ("error (413): request too large", "PERMANENT_EXTERNAL"),
-        (r#"429: {"error":"slow down"}"#, "TRANSIENT_EXTERNAL"),
-        ("429 Too Many Requests", "TRANSIENT_EXTERNAL"),
-        ("403 status code (no body)", "BLOCKED_AUTH"),
-        ("529", "TRANSIENT_EXTERNAL"),
-        ("HTTP 429 from the upstream gateway", "TRANSIENT_EXTERNAL"),
-        ("upstream returned status 503", "TRANSIENT_EXTERNAL"),
-        ("request failed with status code 401", "BLOCKED_AUTH"),
-        ("  No API key found for the selected model.", "BLOCKED_AUTH"),
-        ("\tModel not found: x/y", "MODEL_UNAVAILABLE"),
-        ("too many requests, slow down", "TRANSIENT_EXTERNAL"),
-        ("429abc request failed: bad input", "PERMANENT_EXTERNAL"),
-        (
-            "Request status 429abc failed: bad input",
-            "PERMANENT_EXTERNAL",
-        ),
-        ("HTTP 4290 is not a status", "PERMANENT_EXTERNAL"),
-        ("400ms timeout exceeded", "TRANSIENT_EXTERNAL"),
-        (
-            r#"OpenAI API error (500): {"note":"401 in the body is not the status"}"#,
-            "TRANSIENT_EXTERNAL",
-        ),
-        (
-            "Something failed: OpenAI API error (401): later in the text",
-            "PERMANENT_EXTERNAL",
-        ),
-    ] {
-        assert_eq!(provider_failure(message), class, "{message}");
-    }
-}
-
-#[test]
-fn a_rate_limit_that_mentions_the_key_is_not_an_authentication_failure() {
-    assert_eq!(
-        provider_failure("429 rate limit reached for this API key"),
-        "TRANSIENT_EXTERNAL"
-    );
-    assert_eq!(
-        provider_failure("This model's context is too long for this API key's tier"),
-        "PERMANENT_EXTERNAL"
-    );
-    assert_eq!(provider_failure("Invalid API key provided"), "BLOCKED_AUTH");
-    assert_eq!(provider_failure("Incorrect API key"), "BLOCKED_AUTH");
-    assert_eq!(provider_failure("authentication failed"), "BLOCKED_AUTH");
-    // Numbers that belong to a key, a model or an id do not decide (M1T05R-13).
-    assert_eq!(
-        provider_failure("401 Invalid API key provided: sk-test429"),
-        "BLOCKED_AUTH"
-    );
-    assert_eq!(
-        provider_failure("Model not found: vendor/model-503"),
-        "MODEL_UNAVAILABLE"
-    );
-    assert_eq!(
-        provider_failure("No API key found for model-529"),
-        "BLOCKED_AUTH"
-    );
-    assert_eq!(
-        provider_failure("Request req_503abc failed: bad input"),
-        "PERMANENT_EXTERNAL"
-    );
-    assert_eq!(
-        provider_failure("503 Service Unavailable"),
-        "TRANSIENT_EXTERNAL"
-    );
-    assert_eq!(
-        provider_failure("404 model gpt-x does not exist"),
-        "MODEL_UNAVAILABLE"
-    );
-    assert_eq!(provider_failure("400 bad request"), "PERMANENT_EXTERNAL");
-    // Only the status says what these are.
-    assert_eq!(
-        provider_failure("401 Your token has expired"),
-        "BLOCKED_AUTH"
-    );
-    assert_eq!(provider_failure("403 Forbidden"), "BLOCKED_AUTH");
-    assert_eq!(provider_failure("502 Bad Gateway"), "TRANSIENT_EXTERNAL");
 }
