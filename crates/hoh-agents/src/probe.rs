@@ -54,6 +54,8 @@ pub struct Run {
     pub exit_code: Option<i32>,
     pub duration_ms: u64,
     pub timed_out: bool,
+    /// `false` when the shared deadline had passed before it (it was not run).
+    pub started: bool,
 }
 
 /// The commands run so far, shared between the threads that probe.
@@ -66,10 +68,16 @@ pub enum ProbeError {
     NotFound {
         agent: Agent,
     },
-    /// A probe command did not end within the timeout; its process group was killed.
+    /// A probe command did not end within its limit; its process group was killed.
     TimedOut {
         argv: Vec<String>,
         after: Duration,
+        /// The limit was the time left before the shared deadline, shorter than the command's own timeout.
+        cut_by_deadline: bool,
+    },
+    /// The shared deadline had passed before the command, so it was not started.
+    NotStarted {
+        argv: Vec<String>,
     },
     /// A probe command could not be run or failed.
     Failed {
@@ -88,8 +96,26 @@ impl fmt::Display for ProbeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotFound { agent } => write!(f, "{} is not on PATH", agent.command()),
-            Self::TimedOut { argv, after } => {
-                write!(f, "{}: timed out after {after:?}", argv.join(" "))
+            Self::TimedOut {
+                argv,
+                after,
+                cut_by_deadline,
+            } => write!(
+                f,
+                "{}: timed out after {after:?}{}",
+                argv.join(" "),
+                if *cut_by_deadline {
+                    " (what was left of the shared limit)"
+                } else {
+                    ""
+                }
+            ),
+            Self::NotStarted { argv } => {
+                write!(
+                    f,
+                    "{}: not started: the shared limit was used up",
+                    argv.join(" ")
+                )
             }
             Self::Failed { argv, detail } => write!(f, "{}: {detail}", argv.join(" ")),
             Self::Unsupported { agent, detail } => {
@@ -741,6 +767,7 @@ fn logged(
             exit_code: result.as_ref().ok().and_then(|c| c.status.code()),
             duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             timed_out: matches!(result, Err(ProbeError::TimedOut { .. })),
+            started: !matches!(result, Err(ProbeError::NotStarted { .. })),
         });
     }
     result
@@ -756,6 +783,16 @@ fn capture(
         argv: argv(program, args),
         detail,
     };
+    // The limit is known before anything starts: past the shared deadline nothing is run (M1T07R-08).
+    let limit = env.deadline.map_or(env.timeout, |shared| {
+        env.timeout
+            .min(shared.saturating_duration_since(Instant::now()))
+    });
+    if limit.is_zero() {
+        return Err(ProbeError::NotStarted {
+            argv: argv(program, args),
+        });
+    }
     let spawn = || {
         Command::new(program)
             .args(args)
@@ -798,10 +835,6 @@ fn capture(
     } else {
         let _ = etx.send(Ok(Vec::new()));
     }
-    let limit = env.deadline.map_or(env.timeout, |shared| {
-        env.timeout
-            .min(shared.saturating_duration_since(Instant::now()))
-    });
     let deadline = Instant::now() + limit;
     let pid = Pid::from_child(&child);
     let exited = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG;
@@ -819,6 +852,7 @@ fn capture(
             return Err(ProbeError::TimedOut {
                 argv: argv(program, args),
                 after: limit,
+                cut_by_deadline: limit < env.timeout,
             });
         }
         std::thread::sleep(Duration::from_millis(10));

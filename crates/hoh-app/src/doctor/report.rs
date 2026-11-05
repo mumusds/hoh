@@ -202,7 +202,11 @@ pub fn text(report: &Report) -> String {
     for (name, tool) in [("git", &r.git), ("node", &r.node)] {
         out.push_str(&format!(
             "{name:<7} {}{}\n",
-            tool.version.as_deref().unwrap_or("未安装"),
+            match (tool.installed, tool.version.as_deref()) {
+                (false, _) => "未安装",
+                (true, Some(v)) => v,
+                (true, None) => "版本未知",
+            },
             tool.detail
                 .as_deref()
                 .map(|d| format!("（{d}）"))
