@@ -125,3 +125,43 @@ fn only_a_settled_turn_settles_and_a_cancel_wins() {
         failed("BLOCKED_AUTH")
     );
 }
+
+#[test]
+fn provider_failures_are_classified() {
+    assert_eq!(provider_failure("No API key found for x"), "BLOCKED_AUTH");
+    assert_eq!(provider_failure("401 Unauthorized"), "BLOCKED_AUTH");
+    assert_eq!(
+        provider_failure("Model not found: a/b"),
+        "MODEL_UNAVAILABLE"
+    );
+    for m in [
+        "429 Too Many Requests",
+        "529 overloaded",
+        "rate limit exceeded",
+        "503 Service Unavailable",
+        "Request timed out",
+    ] {
+        assert_eq!(provider_failure(m), "TRANSIENT_EXTERNAL", "{m}");
+    }
+    assert_eq!(
+        provider_failure("400 malformed request"),
+        "PERMANENT_EXTERNAL"
+    );
+    // A settled turn whose last message failed is a failure; a cancel still wins.
+    let failed = Ending {
+        settled: Some(SettledBy::AgentSettled),
+        provider_error: Some("TRANSIENT_EXTERNAL"),
+        ..Ending::default()
+    };
+    assert_eq!(
+        verdict(&failed),
+        (AttemptState::Failed, Some("TRANSIENT_EXTERNAL".to_owned()))
+    );
+    assert_eq!(
+        verdict(&Ending {
+            cancelled: true,
+            ..failed
+        }),
+        (AttemptState::Cancelled, None)
+    );
+}

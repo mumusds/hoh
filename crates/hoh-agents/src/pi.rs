@@ -7,7 +7,8 @@
 //! the session id `get_state` reports must be the one asked for (SESSION_NOT_FOUND / SESSION_MISMATCH, nothing new
 //! made up). stdout is framed by the process substrate on LF bytes only (one CR before it dropped, U+2028/U+2029 kept
 //! inside frames, 1 MiB per frame) and read from the start, stderr is drained alongside; every record goes to the
-//! turn's subscriber, if any.
+//! turn's subscriber, if any. The session's file is the one pi itself would find ([`find_session`]): a resumed turn
+//! needs it before the start and needs pi to have opened that same file.
 //!
 //! The turn: `get_state` (to check the session), then `prompt` with its own id. Its response only says the prompt was
 //! taken: `success=false` fails the turn at once (`No API key found` -> BLOCKED_AUTH, `Model not found` ->
@@ -21,12 +22,12 @@
 //! to the process group. A stream that ends before Pi settled is FAILED (PROTOCOL_INCOMPLETE), or UNKNOWN_EFFECT once
 //! a tool had started. Every end is committed through the attempt's cancel latch.
 
-use crate::adapter::{AdapterError, AttemptRef, finish, now, offers, sha256_file, step};
+use crate::adapter::{AdapterError, AttemptRef, finish, now, offers, sha256_file, soft_move, step};
 use crate::clock::{Clock, Timer};
 use crate::frame::Frame;
 use crate::process::{Config, Escalation, Event, Process, Step, Termination};
 use hoh_core::lifecycle::{AttemptState, InputState};
-use hoh_core::persistence::{AttemptFacts, CancelLatch, InputMove, PersistError, Session, Store};
+use hoh_core::persistence::{AttemptFacts, CancelLatch, Session, Store};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -99,6 +100,37 @@ pub fn refusal(error: &str) -> &'static str {
     }
 }
 
+/// The failure reason of a provider error after the prompt was taken (the final assistant message's
+/// `errorMessage`, M1T05R-04): authentication, a model that is not there, a passing overload or limit, or anything
+/// else.
+pub fn provider_failure(message: &str) -> &'static str {
+    let m = message.to_lowercase();
+    if message.starts_with("No API key found")
+        || m.contains("401")
+        || m.contains("unauthorized")
+        || m.contains("api key")
+    {
+        "BLOCKED_AUTH"
+    } else if message.starts_with("Model not found") {
+        "MODEL_UNAVAILABLE"
+    } else if [
+        "429",
+        "503",
+        "529",
+        "rate limit",
+        "overloaded",
+        "timed out",
+        "timeout",
+    ]
+    .iter()
+    .any(|p| m.contains(p))
+    {
+        "TRANSIENT_EXTERNAL"
+    } else {
+        "PERMANENT_EXTERNAL"
+    }
+}
+
 /// A turn to run.
 #[derive(Debug, Clone)]
 pub struct Turn {
@@ -153,6 +185,8 @@ pub struct Ending<'a> {
     /// Pi's `agent_settled` said the run was aborted.
     pub aborted: bool,
     pub tool_started: bool,
+    /// The class of the provider error the final assistant message stopped with, if it did.
+    pub provider_error: Option<&'a str>,
 }
 
 /// The end state and failure reason of a turn (pure; module docs).
@@ -175,6 +209,7 @@ pub fn verdict(e: &Ending<'_>) -> (AttemptState, Option<String>) {
     }
     match e.settled {
         Some(_) if e.aborted => (AttemptState::Cancelled, None),
+        Some(_) if e.provider_error.is_some() => failed(e.provider_error.unwrap_or_default()),
         Some(_) => (AttemptState::Settled, None),
         None if e.tool_started => (
             AttemptState::UnknownEffect,
@@ -273,13 +308,15 @@ pub async fn run(
         steps: Vec::new(),
     };
     // Nothing starts without its capability, or for a session whose file is gone.
+    let session_file = launch.resume.then(|| find_session(launch)).flatten();
     let refused = match args(launch) {
         Err(Blocked(detail)) => Some(("BLOCKED_CAPABILITY", detail)),
-        Ok(_) if launch.resume && !session_file_exists(launch) => Some((
+        Ok(_) if launch.resume && session_file.is_none() => Some((
             "SESSION_NOT_FOUND",
             format!(
-                "no file of session {} in {}",
+                "no file of session {} for {} in {}",
                 launch.session_id,
+                launch.cwd.display(),
                 launch.session_dir.display()
             ),
         )),
@@ -441,6 +478,13 @@ pub async fn run(
     let (mut parse_errors, mut state_queries, mut agent_starts, mut dialogs, mut data) =
         (0, 0, 0, 0, 0);
     let (mut prompt_sent, mut stopped, mut abort_sent, mut written) = (false, false, false, false);
+    // The input's facts, applied in order whichever comes first (M1T05R-01): Pi took the prompt, its run began.
+    let (mut accepted, mut begun, mut input_at) = (false, false, InputState::Queued);
+    // Once a move of it is refused (someone else moved it on), the turn leaves the input alone.
+    let mut input = turn.input_id.clone();
+    // A busy answer is checked again once work ends (M1T05R-02).
+    let (mut recheck, mut ended_since_query) = (false, false);
+    let mut provider_error: Option<String> = None;
     let mut deadline_timer: Option<Timer> = turn.deadline.map(|d| turn.clock.sleep(d));
     let mut abort_timer: Option<Timer> = None;
     // Process lifecycle, not a judgement of the turn: how long Pi may take to exit once stdin is closed.
@@ -472,6 +516,60 @@ pub async fn run(
                 lines = None;
                 hard_stop(&process);
                 stopped = true;
+            }
+        };
+    }
+    macro_rules! sync_input {
+        () => {
+            if accepted
+                && input_at == InputState::Queued
+                && let Some(i) = &input
+            {
+                if soft_move(
+                    store,
+                    id,
+                    i,
+                    InputState::Queued,
+                    InputState::Delivered,
+                    None,
+                )
+                .await?
+                {
+                    input_at = InputState::Delivered;
+                } else {
+                    input = None;
+                }
+            }
+            if begun
+                && input_at == InputState::Delivered
+                && let Some(i) = &input
+            {
+                if soft_move(
+                    store,
+                    id,
+                    i,
+                    InputState::Delivered,
+                    InputState::Applied,
+                    None,
+                )
+                .await?
+                {
+                    input_at = InputState::Applied;
+                } else {
+                    input = None;
+                }
+            }
+        };
+    }
+    macro_rules! check_idle {
+        () => {
+            let asking = pending.values().any(|p| matches!(p, Pending::Idle));
+            if !launch.settled_event && settled.is_none() && lines.is_some() && !asking {
+                let check = command_id("state");
+                pending.insert(check.clone(), Pending::Idle);
+                send(&lines, json!({"id": check, "type": "get_state"}));
+                state_queries += 1;
+                ended_since_query = false;
             }
         };
     }
@@ -576,12 +674,22 @@ pub async fn run(
                     Some(Pending::Session) if ok => {
                         native_session = record["data"]["sessionId"].as_str().map(str::to_owned);
                         model = record["data"]["model"]["id"].as_str().map(str::to_owned);
-                        if native_session.as_deref() != Some(launch.session_id.as_str()) {
+                        // A resumed session must be the file found before the start, not a new one for the id.
+                        let opened = record["data"]["sessionFile"]
+                            .as_str()
+                            .and_then(|f| std::path::Path::new(f).canonicalize().ok());
+                        let other_file = session_file
+                            .as_ref()
+                            .is_some_and(|f| f.canonicalize().ok() != opened);
+                        if native_session.as_deref() != Some(launch.session_id.as_str())
+                            || other_file
+                        {
                             failure = Some("SESSION_MISMATCH".to_owned());
                             store
                                 .attempt_event(id, "session-mismatch", "adapter.diagnostic",
                                                json!({"attempt_id": id, "reason": "SESSION_MISMATCH",
-                                                      "asked": launch.session_id, "got": native_session}))
+                                                      "asked": launch.session_id, "got": native_session,
+                                                      "file": session_file, "opened": record["data"]["sessionFile"]}))
                                 .await?;
                             close!();
                         } else if lines.is_some() {
@@ -600,24 +708,13 @@ pub async fn run(
                     }
                     Some(Pending::Prompt) if ok => {
                         disposition = record["data"]["disposition"].as_str().map(str::to_owned);
-                        if let Some(input) = &turn.input_id {
-                            let to = InputState::Delivered;
-                            move_input(store, input, InputState::Queued, to, None).await?;
-                        }
+                        accepted = true;
                         if disposition.as_deref() == Some("handled") {
                             settled = Some(SettledBy::Handled);
-                            if let Some(input) = &turn.input_id {
-                                move_input(
-                                    store,
-                                    input,
-                                    InputState::Delivered,
-                                    InputState::Applied,
-                                    None,
-                                )
-                                .await?;
-                            }
+                            begun = true;
                             close!();
                         }
+                        sync_input!();
                     }
                     Some(Pending::Prompt) => {
                         let reason = refusal(&error);
@@ -630,15 +727,19 @@ pub async fn run(
                                 json!({"attempt_id": id, "reason": reason, "error": error}),
                             )
                             .await?;
-                        if let Some(input) = &turn.input_id {
-                            move_input(
+                        if input_at == InputState::Queued
+                            && let Some(i) = input.take()
+                            && soft_move(
                                 store,
-                                input,
+                                id,
+                                &i,
                                 InputState::Queued,
                                 InputState::Rejected,
                                 Some(error),
                             )
-                            .await?;
+                            .await?
+                        {
+                            input_at = InputState::Rejected;
                         }
                         close!();
                     }
@@ -651,6 +752,11 @@ pub async fn run(
                         if idle && settled.is_none() {
                             settled = Some(SettledBy::State);
                             close!();
+                        } else if !idle && ended_since_query {
+                            // Work ended while this answer was on its way: it may be stale already.
+                            check_idle!();
+                        } else if !idle {
+                            recheck = true;
                         }
                     }
                     // Pi answers an abort once it is idle; its agent_settled came first.
@@ -670,25 +776,26 @@ pub async fn run(
                         json!({"attempt_id": id}),
                     )
                     .await?;
-                if agent_starts == 1
-                    && let Some(input) = &turn.input_id
-                {
-                    move_input(
-                        store,
-                        input,
-                        InputState::Delivered,
-                        InputState::Applied,
-                        None,
-                    )
-                    .await?;
-                }
+                begun = true;
+                sync_input!();
             }
             "agent_end" => {
-                if !launch.settled_event && settled.is_none() && lines.is_some() {
-                    let check = command_id("state");
-                    pending.insert(check.clone(), Pending::Idle);
-                    send(&lines, json!({"id": check, "type": "get_state"}));
-                    state_queries += 1;
+                ended_since_query = true;
+                recheck = false;
+                check_idle!();
+            }
+            // Ends of work after a run: a busy answer is checked again.
+            "compaction_end" | "auto_retry_end" | "queue_update" | "turn_end" | "message_end"
+            | "tool_execution_end"
+                if !launch.settled_event =>
+            {
+                ended_since_query = true;
+                if recheck {
+                    recheck = false;
+                    check_idle!();
+                }
+                if record["type"] == "message_end" && record["message"]["role"] == "assistant" {
+                    note_message(&record["message"], &mut reply, &mut provider_error);
                 }
             }
             "agent_settled" => {
@@ -700,7 +807,7 @@ pub async fn run(
             }
             "tool_execution_start" => tool_started = true,
             "message_end" if record["message"]["role"] == "assistant" => {
-                reply = Some(text_of(&record["message"]));
+                note_message(&record["message"], &mut reply, &mut provider_error);
             }
             "extension_ui_request" => {
                 let method = record["method"].as_str().unwrap_or_default();
@@ -754,6 +861,7 @@ pub async fn run(
             )
             .await?;
     }
+    let provider_class = provider_error.as_deref().map(provider_failure);
     let (state, failure) = verdict(&Ending {
         cancelled,
         too_large,
@@ -763,7 +871,18 @@ pub async fn run(
         settled,
         aborted,
         tool_started,
+        provider_error: provider_class,
     });
+    if let (Some(class), Some(message)) = (provider_class, &provider_error) {
+        store
+            .attempt_event(
+                id,
+                "provider-failed",
+                "adapter.turn_failed",
+                json!({"attempt_id": id, "reason": class, "errorMessage": message}),
+            )
+            .await?;
+    }
     let state = finish(
         store,
         attempt,
@@ -802,30 +921,58 @@ pub async fn run(
 }
 
 /// Whether the session's file (`<timestamp>_<id>.jsonl`, as pi names it) is in its directory.
-fn session_file_exists(launch: &Launch) -> bool {
-    let suffix = format!("_{}.jsonl", launch.session_id);
-    std::fs::read_dir(&launch.session_dir).is_ok_and(|entries| {
-        entries
-            .flatten()
-            .any(|e| e.file_name().to_string_lossy().ends_with(&suffix))
+/// The session's file as pi 1.5.0 finds it (`SessionManager.findById` with a session directory): the first `*.jsonl`
+/// in it whose header line is `{"type":"session", "id": <id>, "cwd": <this cwd>, ...}` (M1T05R-03). A file merely
+/// named after the id, empty, or of another cwd is not the session: pi would start a new one for the id.
+pub fn find_session(launch: &Launch) -> Option<PathBuf> {
+    let cwd = launch.cwd.canonicalize().ok()?;
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&launch.session_dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
+        .collect();
+    files.sort();
+    files.into_iter().find(|path| {
+        let Ok(file) = std::fs::File::open(path) else {
+            return false;
+        };
+        let mut first = String::new();
+        // The header is one short line; a bounded read keeps a huge or odd file from costing much.
+        if std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(std::io::Read::take(file, 64 << 10)),
+            &mut first,
+        )
+        .is_err()
+        {
+            return false;
+        }
+        let Ok(header) = serde_json::from_str::<Value>(&first) else {
+            return false;
+        };
+        header["type"] == "session"
+            && header["id"] == launch.session_id
+            && header["cwd"]
+                .as_str()
+                .and_then(|c| std::path::Path::new(c).canonicalize().ok())
+                .is_some_and(|c| c == cwd)
     })
 }
 
-async fn move_input(
-    store: &Store,
-    input_id: &str,
-    from: InputState,
-    to: InputState,
-    reason: Option<String>,
-) -> Result<(), PersistError> {
-    store
-        .move_input(InputMove {
-            input_id: input_id.to_owned(),
-            from,
-            to,
-            reason,
-        })
-        .await
+/// The reply and any provider error of a final assistant message; a later message without an error clears an earlier
+/// one (a retry that worked).
+fn note_message(message: &Value, reply: &mut Option<String>, error: &mut Option<String>) {
+    if message["stopReason"] == "error" {
+        *error = Some(
+            message["errorMessage"]
+                .as_str()
+                .unwrap_or("provider error")
+                .to_owned(),
+        );
+    } else {
+        *error = None;
+        *reply = Some(text_of(message));
+    }
 }
 
 #[cfg(test)]
