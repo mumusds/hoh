@@ -106,6 +106,8 @@ pub enum PersistError {
     Busy(String),
     /// The writer actor is no longer running.
     WriterStopped,
+    /// A scratch-only write ([`Store::scratch_task`]) on a database that is not empty; nothing was written.
+    NotScratch(String),
     /// Any other SQLite or I/O failure.
     Storage(String),
 }
@@ -202,6 +204,7 @@ impl std::fmt::Display for PersistError {
             PersistError::Unsupported(kind) => write!(f, "{kind} decisions are not applied yet"),
             PersistError::Busy(detail) => write!(f, "DB_BUSY: {detail}"),
             PersistError::WriterStopped => write!(f, "the database writer is not running"),
+            PersistError::NotScratch(why) => write!(f, "not a scratch database: {why}"),
             PersistError::Storage(detail) => write!(f, "storage error: {detail}"),
         }
     }
@@ -588,6 +591,26 @@ impl Store {
                 kind: kind.to_owned(),
                 payload,
             })
+            .await
+    }
+
+    /// For a scratch database only (`hoh doctor --live`, ADR-015): a project, a spec, a RUNNING run `run_id` and a
+    /// LEASED task `task_id` to hang attempts on, in one transaction. Refused ([`PersistError::NotScratch`], nothing
+    /// written) if the database has any run, so it never stands in for the command path of a real project.
+    pub async fn scratch_task(
+        &self,
+        project_id: &str,
+        repo_path: &str,
+        run_id: &str,
+        task_id: &str,
+    ) -> Result<(), PersistError> {
+        self.writer
+            .scratch_task([
+                project_id.to_owned(),
+                repo_path.to_owned(),
+                run_id.to_owned(),
+                task_id.to_owned(),
+            ])
             .await
     }
 

@@ -107,6 +107,8 @@ pub struct Committed {
 enum Job {
     Commit(Commit, oneshot::Sender<Result<Committed, PersistError>>),
     EnsureProject(String, String, oneshot::Sender<Result<(), PersistError>>),
+    /// Project, run and task ids (and the repo path) for [`scratch_task`].
+    ScratchTask(Box<[String; 4]>, oneshot::Sender<Result<(), PersistError>>),
     Decide(
         Box<(Proposal, Context)>,
         oneshot::Sender<Result<Decided, PersistError>>,
@@ -140,6 +142,7 @@ impl std::fmt::Debug for Job {
         f.write_str(match self {
             Job::Commit(..) => "Commit",
             Job::EnsureProject(..) => "EnsureProject",
+            Job::ScratchTask(..) => "ScratchTask",
             Job::Decide(..) => "Decide",
             Job::Attempt(..) => "Attempt",
             Job::EndAttempt(..) => "EndAttempt",
@@ -192,6 +195,9 @@ impl Writer {
                         }
                         Job::EnsureProject(id, repo, reply) => {
                             let _ = reply.send(ensure_project(&conn, &id, &repo));
+                        }
+                        Job::ScratchTask(ids, reply) => {
+                            let _ = reply.send(scratch_task(&mut conn, &ids));
                         }
                         Job::Attempt(job, reply) => {
                             let _ = reply.send(attempts::apply(&mut conn, &job));
@@ -273,6 +279,49 @@ impl Writer {
         self.submit(|tx| Job::EnsureProject(project_id, repo_path, tx))
             .await
     }
+
+    pub(super) async fn scratch_task(&self, ids: [String; 4]) -> Result<(), PersistError> {
+        self.submit(|tx| Job::ScratchTask(Box::new(ids), tx)).await
+    }
+}
+
+/// [`super::Store::scratch_task`]: the rows, in one IMMEDIATE transaction, only where no run exists.
+fn scratch_task(conn: &mut Connection, ids: &[String; 4]) -> Result<(), PersistError> {
+    let [project_id, repo_path, run_id, task_id] = ids;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error)?;
+    let runs: i64 = tx
+        .query_row("SELECT count(*) FROM runs", [], |r| r.get(0))
+        .map_err(sqlite_error)?;
+    if runs > 0 {
+        return Err(PersistError::NotScratch(format!(
+            "the database already has {runs} run(s)"
+        )));
+    }
+    let now = crate::time::now_rfc3339();
+    let spec_id = format!("{run_id}-spec");
+    tx.execute(
+        "INSERT INTO projects(project_id, repo_path, created_at) VALUES (?1, ?2, ?3) ON CONFLICT(project_id) DO NOTHING",
+        params![project_id, repo_path, now],
+    )
+    .map_err(sqlite_error)?;
+    tx.execute(
+        "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES (?1, ?2, ?3, 1)",
+        params![spec_id, project_id, "0".repeat(64)],
+    )
+    .map_err(sqlite_error)?;
+    tx.execute(
+        "INSERT INTO runs(run_id, project_id, spec_id, state, mode, created_at) VALUES (?1, ?2, ?3, 'RUNNING', 'AUTO', ?4)",
+        params![run_id, project_id, spec_id, now],
+    )
+    .map_err(sqlite_error)?;
+    tx.execute(
+        "INSERT INTO tasks(task_id, run_id, spec_id, state, role, created_seq) VALUES (?1, ?2, ?3, 'LEASED', 'doctor', 1)",
+        params![task_id, run_id, spec_id],
+    )
+    .map_err(sqlite_error)?;
+    tx.commit().map_err(sqlite_error)
 }
 
 fn ensure_project(

@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 mod cli;
+mod doctor;
 mod exit;
 mod help;
 mod tui;
@@ -93,7 +94,24 @@ fn run(args: &[OsString]) -> u8 {
         Invocation::Prompt { .. } => "非交互运行（hoh -p）",
         Invocation::Attach { .. } => "hoh attach",
         Invocation::Web { .. } => "hoh web",
-        Invocation::Doctor { .. } => "hoh doctor",
+        Invocation::Doctor {
+            live,
+            output,
+            project,
+        } => {
+            if output == cli::Output::StreamJson {
+                return refuse("hoh doctor 只支持 --output text 或 --output json");
+            }
+            let dir = match project.map_or_else(std::env::current_dir, Ok) {
+                Ok(dir) => dir,
+                Err(e) => return refuse(&format!("无法确定当前目录：{e}")),
+            };
+            return doctor::run(
+                &dir.canonicalize().unwrap_or(dir),
+                live,
+                output == cli::Output::Json,
+            );
+        }
     };
     eprintln!(
         "hoh {}: NOT_IMPLEMENTED: {what} 尚未实现（见 docs/08-development-plan.md）",

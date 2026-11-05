@@ -1,0 +1,288 @@
+//! `hoh doctor` (REQ-006; ADR-015): what is installed, whether HoH can drive it, and what is known about each login,
+//! without a model call unless `--live` is given. It never reads credential files or credential variables and never
+//! shows a status command's output, only its conclusion. Every external command has a 20 s limit and runs in its own
+//! process group; the agents and tools are probed in parallel. The exit code is 3 if a required item is not installed,
+//! incompatible or has no login, else 0, which does not mean logged in.
+
+mod assess;
+mod live;
+mod report;
+#[cfg(test)]
+mod tests;
+
+use hoh_agents::compat::{Agent, CompatManifest};
+use hoh_agents::probe::{self, ProbeEnv, RunLog};
+use report::{AgentItem, Auth, HohDir, Plugin, Protocol, Report, Runtime, Summary, Tool};
+use serde_json::{Value, json};
+use std::collections::BTreeMap;
+use std::io::Write;
+use std::path::Path;
+use std::time::Duration;
+
+/// The limit of each external command (REQ-006).
+const TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The project's plugin set (REQ-048..050).
+const PLUGINS: &str = include_str!("../../../config/plugins.json");
+
+/// The compat manifest of the project, if there is a readable one (ADR-015 decision 2); a warning otherwise.
+fn manifest(project: &Path) -> (Option<CompatManifest>, Option<String>) {
+    let path = project.join(".hoh/compat-manifest.json");
+    match std::fs::read(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, None),
+        Err(e) => (
+            None,
+            Some(format!(
+                "compat manifest 无法读取（{}）：{e}",
+                path.display()
+            )),
+        ),
+        Ok(bytes) => match serde_json::from_slice::<CompatManifest>(&bytes) {
+            Ok(m) => (Some(m), None),
+            Err(e) => (
+                None,
+                Some(format!(
+                    "compat manifest 无法解析（{}）：{e}",
+                    path.display()
+                )),
+            ),
+        },
+    }
+}
+
+/// `<tool> --version`'s first line; `minimum` (major, minor) for node.
+fn tool(name: &str, env: &ProbeEnv, minimum: Option<(u64, u64)>) -> Tool {
+    let Some(path) = probe::find_on_path(name, &env.path) else {
+        return Tool {
+            installed: false,
+            path: None,
+            version: None,
+            ok: false,
+            detail: Some(format!("{name} 未安装")),
+        };
+    };
+    let version = probe::run_status(&path, &["--version"], env)
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .next()
+                .map(str::to_owned)
+        });
+    let (ok, detail) = match (minimum, version.as_deref()) {
+        (_, None) => (false, Some(format!("{name} --version 没有给出版本"))),
+        (None, Some(_)) => (true, None),
+        (Some((major, minor)), Some(v)) => {
+            let mut parts = v
+                .trim_start_matches('v')
+                .split('.')
+                .map(|p| p.parse::<u64>().ok());
+            match (parts.next().flatten(), parts.next().flatten()) {
+                (Some(a), Some(b)) if (a, b) >= (major, minor) => {
+                    (true, Some(format!("需要 ≥ {major}.{minor}")))
+                }
+                _ => (false, Some(format!("需要 ≥ {major}.{minor}（pi 需要）"))),
+            }
+        }
+    };
+    Tool {
+        installed: true,
+        path: Some(path.display().to_string()),
+        version,
+        ok,
+        detail,
+    }
+}
+
+/// The three plugins and whether `pi list --no-approve` lists them (ADR-015 decision 6).
+fn plugins(pi: Option<&str>, env: &ProbeEnv) -> Vec<Plugin> {
+    let listed = pi.and_then(|launcher| {
+        probe::run_status(Path::new(launcher), &["list", "--no-approve"], env)
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| {
+                format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                )
+            })
+    });
+    let config: Value = serde_json::from_str(PLUGINS).unwrap_or(Value::Null);
+    config["plugins"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|p| {
+            let package = p["package"].as_str().unwrap_or_default().to_owned();
+            Plugin {
+                id: p["id"].as_str().unwrap_or_default().to_owned(),
+                listed: listed
+                    .as_ref()
+                    .map(|text| !package.is_empty() && text.contains(&package)),
+                package,
+                version: p["version"].as_str().map(str::to_owned),
+                runtime: "unknown",
+            }
+        })
+        .collect()
+}
+
+/// The project's `.hoh/`: it exists and can be written, or the nearest existing directory above it can.
+fn hoh_dir(project: &Path) -> HohDir {
+    let path = project.join(".hoh");
+    let exists = path.is_dir();
+    let probe_at = if exists {
+        path.clone()
+    } else {
+        project.to_path_buf()
+    };
+    let writable = rustix::fs::access(&probe_at, rustix::fs::Access::WRITE_OK).is_ok();
+    HohDir {
+        path: path.display().to_string(),
+        exists,
+        writable,
+    }
+}
+
+/// The summary and exit code (REQ-006): 3 if a required item is not installed, is incompatible or has no login.
+fn summary(
+    agents: &BTreeMap<&'static str, AgentItem>,
+    runtime: &Runtime,
+    mut warnings: Vec<String>,
+) -> Summary {
+    let mut blocking = Vec::new();
+    let mut unverified = Vec::new();
+    for (name, item) in agents {
+        if !item.installed {
+            blocking.push(format!("{name} 未安装"));
+        }
+        if item.protocol == Protocol::Incompatible {
+            blocking.push(format!("{name} protocol=incompatible"));
+        }
+        if item.auth_check == Auth::Missing {
+            blocking.push(format!("{name} 未登录"));
+        }
+        if item.installed
+            && (matches!(item.auth_check, Auth::Unknown | Auth::NotVerified)
+                || item.protocol == Protocol::Unknown)
+        {
+            unverified.push((*name).to_owned());
+        }
+    }
+    for (name, t) in [("git", &runtime.git), ("node", &runtime.node)] {
+        if !t.installed {
+            blocking.push(format!("{name} 未安装"));
+        } else if !t.ok {
+            blocking.push(format!(
+                "{name} protocol=incompatible（{}）",
+                t.detail.as_deref().unwrap_or("版本不符")
+            ));
+        }
+    }
+    if !runtime.project_hoh.writable {
+        warnings.push(format!(
+            "{} 不可写：HoH 无法保存本项目的状态",
+            runtime.project_hoh.path
+        ));
+    }
+    if runtime.pi_plugins.iter().any(|p| p.listed == Some(false)) {
+        warnings.push(
+            "有 Pi 插件未被 pi list --no-approve 列出（项目本地安装不在其中）；插件可降级，不影响退出码".to_owned(),
+        );
+    }
+    let exit_code = if blocking.is_empty() { 0 } else { 3 };
+    Summary {
+        blocking,
+        unverified,
+        warnings,
+        exit_code,
+    }
+}
+
+/// Everything, with the live checks if `live`.
+fn examine(project: &Path, live: bool) -> Report {
+    let log: RunLog = RunLog::default();
+    let env = ProbeEnv {
+        path: std::env::var_os("PATH").unwrap_or_default(),
+        fixture_root: None,
+        timeout: TIMEOUT,
+        log: Some(log.clone()),
+    };
+    let (manifest, warning) = manifest(project);
+    let mut warnings: Vec<String> = warning.into_iter().collect();
+    let (mut agents, git, node, pi_plugins) = std::thread::scope(|scope| {
+        let probe_agent = |agent: Agent| {
+            let env = &env;
+            let manifest = manifest.as_ref();
+            scope.spawn(move || assess::agent(agent, env, manifest))
+        };
+        let codex = probe_agent(Agent::Codex);
+        let claude = probe_agent(Agent::Claude);
+        let pi = scope.spawn(|| {
+            let item = assess::agent(Agent::Pi, &env, manifest.as_ref());
+            let plugins = plugins(item.path.as_deref().filter(|_| item.installed), &env);
+            (item, plugins)
+        });
+        let git = scope.spawn(|| tool("git", &env, None));
+        let node = scope.spawn(|| tool("node", &env, Some((22, 19))));
+        let lost = |what: &str| AgentItem::missing(format!("{what} 的探测线程异常结束"));
+        let (pi, plugins) = pi.join().unwrap_or_else(|_| (lost("pi"), Vec::new()));
+        let gone = |name: &str| Tool {
+            installed: false,
+            path: None,
+            version: None,
+            ok: false,
+            detail: Some(format!("{name} 的探测线程异常结束")),
+        };
+        (
+            BTreeMap::from([
+                ("codex", codex.join().unwrap_or_else(|_| lost("codex"))),
+                ("claude", claude.join().unwrap_or_else(|_| lost("claude"))),
+                ("pi", pi),
+            ]),
+            git.join().unwrap_or_else(|_| gone("git")),
+            node.join().unwrap_or_else(|_| gone("node")),
+            plugins,
+        )
+    });
+    if live {
+        match live::check(&mut agents, &env) {
+            Ok(dir) => warnings.push(format!(
+                "live 检查的原始日志与临时 store 保留在 {}",
+                dir.display()
+            )),
+            Err(why) => warnings.push(format!("live 检查没有完成：{why}")),
+        }
+    }
+    let runtime = Runtime {
+        git,
+        node,
+        pi_plugins,
+        project_hoh: hoh_dir(project),
+        host: json!({"state": "not_running", "detail": "M1 还没有 host"}),
+    };
+    let summary = summary(&agents, &runtime, warnings);
+    let probes = log.lock().map(|runs| runs.clone()).unwrap_or_default();
+    Report {
+        schema_version: "1.0",
+        mode: if live { "live" } else { "default" },
+        agents,
+        runtime,
+        summary,
+        probes,
+    }
+}
+
+/// Run doctor for `project`; the exit code.
+pub fn run(project: &Path, live: bool, json_output: bool) -> u8 {
+    let report = examine(project, live);
+    let text = if json_output {
+        report::json(&report)
+    } else {
+        report::text(&report)
+    };
+    let _ = std::io::stdout().lock().write_all(text.as_bytes());
+    report.summary.exit_code
+}

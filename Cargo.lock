@@ -366,9 +366,11 @@ dependencies = [
  "hoh-core",
  "ratatui",
  "rustix",
+ "serde",
  "serde_json",
  "signal-hook",
  "tempfile",
+ "tokio",
  "unicode-segmentation",
  "unicode-width",
 ]

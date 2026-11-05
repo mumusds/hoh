@@ -39,7 +39,22 @@ pub struct ProbeEnv {
     pub fixture_root: Option<PathBuf>,
     /// Limit for each probe command.
     pub timeout: Duration,
+    /// Where every command run is written down, if anywhere (doctor lists them, REQ-006).
+    pub log: Option<RunLog>,
 }
+
+/// One command a probe ran.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Run {
+    pub argv: Vec<String>,
+    /// `None` when it did not start, timed out or was ended by a signal.
+    pub exit_code: Option<i32>,
+    pub duration_ms: u64,
+    pub timed_out: bool,
+}
+
+/// The commands run so far, shared between the threads that probe.
+pub type RunLog = std::sync::Arc<std::sync::Mutex<Vec<Run>>>;
 
 /// Why a probe failed.
 #[derive(Debug)]
@@ -48,7 +63,12 @@ pub enum ProbeError {
     NotFound {
         agent: Agent,
     },
-    /// A probe command could not be run, failed, or timed out.
+    /// A probe command did not end within the timeout; its process group was killed.
+    TimedOut {
+        argv: Vec<String>,
+        after: Duration,
+    },
+    /// A probe command could not be run or failed.
     Failed {
         argv: Vec<String>,
         detail: String,
@@ -65,6 +85,9 @@ impl fmt::Display for ProbeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotFound { agent } => write!(f, "{} is not on PATH", agent.command()),
+            Self::TimedOut { argv, after } => {
+                write!(f, "{}: timed out after {after:?}", argv.join(" "))
+            }
             Self::Failed { argv, detail } => write!(f, "{}: {detail}", argv.join(" ")),
             Self::Unsupported { agent, detail } => {
                 write!(f, "{} cannot be driven: {detail}", agent.command())
@@ -660,9 +683,13 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-struct Captured {
-    status: ExitStatus,
-    stdout: Vec<u8>,
+/// The end and output of a command.
+#[derive(Debug)]
+pub struct Captured {
+    pub status: ExitStatus,
+    pub stdout: Vec<u8>,
+    /// Empty unless asked for ([`run_status`]).
+    pub stderr: Vec<u8>,
 }
 
 fn argv(program: &Path, args: &[&str]) -> Vec<String> {
@@ -685,6 +712,43 @@ fn run_ok(program: &Path, args: &[&str], env: &ProbeEnv) -> Result<Captured, Pro
 
 /// Run a probe command with no stdin in its own process group; kill the group if it outlives the timeout.
 fn run(program: &Path, args: &[&str], env: &ProbeEnv) -> Result<Captured, ProbeError> {
+    logged(program, args, env, false)
+}
+
+/// Run a native status command (no model call) as [`run`] does, keeping stdout and stderr: some CLIs write their
+/// conclusion to stderr (`codex login status`).
+pub fn run_status(program: &Path, args: &[&str], env: &ProbeEnv) -> Result<Captured, ProbeError> {
+    logged(program, args, env, true)
+}
+
+/// [`capture`], written down in `env.log`.
+fn logged(
+    program: &Path,
+    args: &[&str],
+    env: &ProbeEnv,
+    stderr: bool,
+) -> Result<Captured, ProbeError> {
+    let started = Instant::now();
+    let result = capture(program, args, env, stderr);
+    if let Some(log) = &env.log
+        && let Ok(mut runs) = log.lock()
+    {
+        runs.push(Run {
+            argv: argv(program, args),
+            exit_code: result.as_ref().ok().and_then(|c| c.status.code()),
+            duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            timed_out: matches!(result, Err(ProbeError::TimedOut { .. })),
+        });
+    }
+    result
+}
+
+fn capture(
+    program: &Path,
+    args: &[&str],
+    env: &ProbeEnv,
+    keep_stderr: bool,
+) -> Result<Captured, ProbeError> {
     let failed = |detail: String| ProbeError::Failed {
         argv: argv(program, args),
         detail,
@@ -695,7 +759,11 @@ fn run(program: &Path, args: &[&str], env: &ProbeEnv) -> Result<Captured, ProbeE
             .env("PATH", &env.path)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(if keep_stderr {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .process_group(0)
             .spawn()
     };
@@ -718,6 +786,15 @@ fn run(program: &Path, args: &[&str], env: &ProbeEnv) -> Result<Captured, ProbeE
             let _ = tx.send(stdout.read_to_end(&mut buf).map(|_| buf));
         });
     }
+    let (etx, erx) = mpsc::channel();
+    if let Some(mut stderr) = child.stderr.take() {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = etx.send(stderr.read_to_end(&mut buf).map(|_| buf));
+        });
+    } else {
+        let _ = etx.send(Ok(Vec::new()));
+    }
     let deadline = Instant::now() + env.timeout;
     let pid = Pid::from_child(&child);
     let exited = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG;
@@ -732,7 +809,10 @@ fn run(program: &Path, args: &[&str], env: &ProbeEnv) -> Result<Captured, ProbeE
         if Instant::now() >= deadline {
             let _ = kill_process_group(pid, Signal::KILL);
             let _ = child.wait();
-            return Err(failed(format!("timed out after {:?}", env.timeout)));
+            return Err(ProbeError::TimedOut {
+                argv: argv(program, args),
+                after: env.timeout,
+            });
         }
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -743,16 +823,22 @@ fn run(program: &Path, args: &[&str], env: &ProbeEnv) -> Result<Captured, ProbeE
     let remaining = deadline
         .saturating_duration_since(Instant::now())
         .max(Duration::from_millis(500));
-    let stdout = match rx.recv_timeout(remaining) {
-        Ok(read) => read.map_err(|e| failed(format!("reading output: {e}")))?,
+    let read = |rx: mpsc::Receiver<io::Result<Vec<u8>>>| match rx.recv_timeout(remaining) {
+        Ok(read) => read.map_err(|e| failed(format!("reading output: {e}"))),
         Err(_) => {
             let _ = kill_process_group(Pid::from_child(&child), Signal::KILL);
-            return Err(failed(
+            Err(failed(
                 "output stayed open after the command exited".to_owned(),
-            ));
+            ))
         }
     };
-    Ok(Captured { status, stdout })
+    let stdout = read(rx)?;
+    let stderr = read(erx)?;
+    Ok(Captured {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 #[cfg(test)]
