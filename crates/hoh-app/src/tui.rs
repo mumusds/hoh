@@ -1,11 +1,13 @@
 //! `hoh` with a terminal on stdin and stdout: the Workspace shell (REQ-001; ADR-014). Signals are registered before
-//! the terminal changes, so a SIGTERM, SIGHUP or SIGINT at any point after that restores it. Terminal events are read
-//! on a thread of their own; the loop waits for them in short slices, looks at the signal flag between them, and ends
-//! when the terminal hangs up. Leaving only closes this client.
+//! the terminal changes, so a SIGTERM, SIGHUP or SIGINT at any point after that restores it. One thread does it all:
+//! the loop waits for input in poll(2), in short slices, looks at the signal flags between them, reads only what poll
+//! said is there and decodes it itself (`input`), and ends when the terminal hangs up. Leaving only closes this
+//! client.
 
 mod app;
 mod editor;
 mod history;
+mod input;
 mod terminal;
 #[cfg(test)]
 mod tests;
@@ -15,18 +17,20 @@ use app::{App, Exit};
 use history::History;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use ratatui::crossterm::event::{Event, KeyEventKind};
 use rustix::event::{PollFd, PollFlags, Timespec};
-use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
+use std::io::Stdin;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-/// How long one wait for input lasts before the signal flag is looked at again.
+/// How long one wait for input lasts before the signal flags are looked at again (a signal also ends it early).
 const TICK: Duration = Duration::from_millis(100);
+
+/// How long the loop waits for the rest of an escape sequence once its start was read: then a lone ESC is the Esc key.
+const ESC_WAIT: Duration = Duration::from_millis(30);
 
 /// What ended the loop.
 #[derive(Debug, PartialEq, Eq)]
@@ -57,6 +61,11 @@ pub fn run(project: &Path) -> u8 {
             return code(ClientEvent::TerminalIo);
         }
     }
+    let resized = Arc::new(AtomicBool::new(false));
+    if let Err(e) = signal_hook::flag::register(SIGWINCH, Arc::clone(&resized)) {
+        say!("hoh：无法登记信号处理：{e}");
+        return code(ClientEvent::TerminalIo);
+    }
     let name = project.file_name().map_or_else(
         || project.display().to_string(),
         |n| n.to_string_lossy().into_owned(),
@@ -64,8 +73,8 @@ pub fn run(project: &Path) -> u8 {
     let mut app = App::new(name, History::load(project));
     terminal::restore_on_panic();
     let (guard, entered) = terminal::enter();
-    let end = entered.and_then(|()| event_loop(&mut app, &signal));
-    debug_restore_delay();
+    let end = entered.and_then(|()| event_loop(&mut app, &signal, &resized));
+    terminal::debug_restore_gate();
     let restored = guard.finish();
     // Loaded after the restore: a signal that came while restoring decides too (M1T08R-06).
     let (code, message) = outcome(end, restored, signal.load(Ordering::SeqCst));
@@ -110,23 +119,44 @@ fn outcome(
     }
 }
 
-fn event_loop(app: &mut App, signal: &AtomicUsize) -> std::io::Result<End> {
+fn event_loop(app: &mut App, signal: &AtomicUsize, resized: &AtomicBool) -> std::io::Result<End> {
     let mut terminal = Terminal::new(CrosstermBackend::new(terminal::Output::new()?))?;
-    // Dropped when the loop ends, on every path: reading stops before the terminal is handed back.
-    let input = Input::start()?;
+    let stdin = std::io::stdin();
+    let mut decoder = input::Decoder::default();
+    let mut buf = [0u8; 4096];
     let mut dirty = true;
     loop {
         let sig = signal.load(Ordering::SeqCst);
         if sig != 0 {
             return Ok(End::Signal(sig));
         }
+        if resized.swap(false, Ordering::SeqCst) {
+            dirty = true;
+        }
         if dirty {
             terminal.draw(|f| app.draw(f))?;
             dirty = false;
             debug_panic();
         }
-        match input.events.recv_timeout(TICK) {
-            Ok(event) => match event? {
+        let idle = match wait(&stdin, if decoder.pending() { ESC_WAIT } else { TICK })? {
+            Wait::Input => {
+                // poll said there is input (or end of file): this read does not block.
+                let n = match rustix::io::read(&stdin, &mut buf) {
+                    Ok(n) => n,
+                    Err(rustix::io::Errno::INTR) => continue,
+                    Err(e) => return Err(e.into()),
+                };
+                if n == 0 {
+                    return Err(hangup());
+                }
+                decoder.feed(&buf[..n]);
+                false
+            }
+            Wait::Idle => true,
+            Wait::Interrupted => continue,
+        };
+        while let Some(event) = decoder.next(idle) {
+            match event {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     if let Some(exit) = app.key(key) {
                         return Ok(End::Left(exit));
@@ -137,155 +167,47 @@ fn event_loop(app: &mut App, signal: &AtomicUsize) -> std::io::Result<End> {
                     app.paste(&text);
                     dirty = true;
                 }
-                Event::Resize(..) => dirty = true,
                 _ => {}
-            },
-            // A reader caught inside crossterm by a hang-up says nothing more; the loop sees the hang-up itself.
-            Err(RecvTimeoutError::Timeout) if hung_up() => return Err(hangup()),
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => {
-                return Err(std::io::Error::other("终端输入的读取已停止"));
             }
         }
     }
 }
 
-/// How long the reader waits on the terminal before it looks at its stop flag, and for a resize, again.
-const READ_TICK: Duration = Duration::from_millis(20);
-
-/// How long an ending loop waits for the reader to stop. Only a reader caught inside crossterm by a hang-up at that
-/// very moment takes longer, and a hung-up terminal has no input left to keep.
-const STOP_WAIT: Duration = Duration::from_millis(300);
-
-/// Terminal input, read on a thread of its own (ADR-014 decision 1).
-///
-/// crossterm 0.29 never returns from a read once the terminal is at end of file, as a hung-up one is: it retries the
-/// zero-byte read forever, whatever the timeout. So the loop never waits inside crossterm: it waits on this channel
-/// and stays free to see a signal or a hang-up (M1QA-01). The reader in turn waits in poll(2), not in crossterm, and
-/// asks crossterm only for what is there to take; so it can be stopped, and it is, when this is dropped, before the
-/// terminal is handed back: what is typed from then on stays for the shell (M1T08R-12).
-struct Input {
-    events: Receiver<std::io::Result<Event>>,
-    stop: Arc<AtomicBool>,
-    reader: Option<JoinHandle<()>>,
+/// How a wait for input ended.
+enum Wait {
+    /// There is something to read.
+    Input,
+    /// Nothing came within the time.
+    Idle,
+    /// A signal came: its flag is to be looked at.
+    Interrupted,
 }
 
-impl Input {
-    fn start() -> std::io::Result<Input> {
-        let (tx, events) = sync_channel(64);
-        let stop = Arc::new(AtomicBool::new(false));
-        let stopped = Arc::clone(&stop);
-        let reader = std::thread::Builder::new()
-            .name("hoh-tui-input".to_owned())
-            .spawn(move || read_input(&tx, &stopped))?;
-        Ok(Input {
-            events,
-            stop,
-            reader: Some(reader),
-        })
-    }
-}
-
-impl Drop for Input {
-    /// Stop the reader and wait for it, up to [`STOP_WAIT`]. Events still in the channel are dropped, so a reader
-    /// waiting to send can see the flag.
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        if let Some(reader) = self.reader.take() {
-            let end = Instant::now() + STOP_WAIT;
-            while !reader.is_finished() && Instant::now() < end {
-                while self.events.try_recv().is_ok() {}
-                std::thread::sleep(Duration::from_millis(2));
-            }
-            if reader.is_finished() {
-                let _ = reader.join();
-            }
-        }
-    }
-}
-
-/// The reader: the terminal's events, until `stop` is set or the terminal fails or hangs up.
-fn read_input(tx: &SyncSender<std::io::Result<Event>>, stop: &AtomicBool) {
-    let stdin = std::io::stdin();
-    let tick = Timespec {
-        tv_sec: 0,
-        tv_nsec: i64::from(READ_TICK.subsec_nanos()),
+/// Wait up to `timeout` for input on the terminal (stdin, which bare `hoh` requires to be one), without reading
+/// anything. A hung-up terminal (its window or connection closed) is an error.
+fn wait(stdin: &Stdin, timeout: Duration) -> std::io::Result<Wait> {
+    let mut fds = [PollFd::new(stdin, PollFlags::IN)];
+    let limit = Timespec {
+        tv_sec: i64::try_from(timeout.as_secs()).unwrap_or(i64::MAX),
+        tv_nsec: i64::from(timeout.subsec_nanos()),
     };
-    while !stop.load(Ordering::SeqCst) {
-        let mut fds = [PollFd::new(&stdin, PollFlags::IN)];
-        let ready = match rustix::event::poll(&mut fds, Some(&tick)) {
-            Ok(n) => n > 0,
-            Err(rustix::io::Errno::INTR) => false,
-            Err(e) => {
-                let _ = tx.send(Err(e.into()));
-                return;
-            }
-        };
-        if ready && gone(fds[0].revents()) {
-            let _ = tx.send(Err(hangup()));
-            return;
+    match rustix::event::poll(&mut fds, Some(&limit)) {
+        Ok(0) => Ok(Wait::Idle),
+        Ok(_)
+            if fds[0]
+                .revents()
+                .intersects(PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL) =>
+        {
+            Err(hangup())
         }
-        // What crossterm has now, without waiting: the input poll saw, or a resize it noted (crossterm hears of
-        // SIGWINCH itself, not through this poll). The flag is looked at before each take, so nothing is read once
-        // the loop has ended.
-        let mut taken = false;
-        while !stop.load(Ordering::SeqCst) {
-            match event::poll(Duration::ZERO) {
-                Ok(true) => {}
-                Ok(false) => break,
-                Err(e) => {
-                    let _ = tx.send(Err(e));
-                    return;
-                }
-            }
-            let event = event::read();
-            let failed = event.is_err();
-            if tx.send(event).is_err() || failed {
-                return;
-            }
-            taken = true;
-        }
-        // Input poll saw that crossterm did not take (it waits for its own readiness edges): wait a tick rather than
-        // spin on the same readiness.
-        if ready && !taken {
-            std::thread::sleep(READ_TICK);
-        }
+        Ok(_) => Ok(Wait::Input),
+        Err(rustix::io::Errno::INTR) => Ok(Wait::Interrupted),
+        Err(e) => Err(e.into()),
     }
-}
-
-/// Whether poll(2) flags say the terminal is gone: its window or connection was closed.
-fn gone(flags: PollFlags) -> bool {
-    flags.intersects(PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL)
 }
 
 fn hangup() -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::BrokenPipe, "终端已断开")
-}
-
-/// Whether the terminal has hung up. crossterm reads stdin, which is the terminal here (bare `hoh` needs one);
-/// poll(2) reports the hang-up on it without reading.
-fn hung_up() -> bool {
-    let stdin = std::io::stdin();
-    let mut fds = [PollFd::new(&stdin, PollFlags::IN)];
-    let now = Timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    matches!(rustix::event::poll(&mut fds, Some(&now)), Ok(1..)) && gone(fds[0].revents())
-}
-
-/// Debug builds only: `HOH_DEBUG_TUI_RESTORE_DELAY_MS` holds the restore back that long once the loop has ended,
-/// saying so on stderr, so the PTY test can type into that window and find its input left for the shell
-/// (M1T08R-12). Release builds have no such entry.
-fn debug_restore_delay() {
-    #[cfg(debug_assertions)]
-    if let Some(ms) = std::env::var("HOH_DEBUG_TUI_RESTORE_DELAY_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-    {
-        say!("HOH_DEBUG_TUI_RESTORE_DELAY");
-        std::thread::sleep(Duration::from_millis(ms));
-    }
 }
 
 /// Debug builds only: `HOH_DEBUG_TUI_PANIC` panics after a draw, so the PTY test can see the terminal restored

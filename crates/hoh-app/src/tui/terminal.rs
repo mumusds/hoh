@@ -253,10 +253,26 @@ pub fn with_retries(tries: usize, mut attempt: impl FnMut() -> io::Result<()>) -
     last
 }
 
+/// Debug builds only: `HOH_DEBUG_TUI_RESTORE_GATE=<path>` holds the restore back, once the loop has ended and in the
+/// panic hook, until `<path>` exists (10 s at most), saying so on stderr. The PTY test types into that window and only
+/// then opens the gate, so its input is known to come before the restore (M1T08R-15). Release builds have no such
+/// entry.
+pub fn debug_restore_gate() {
+    #[cfg(debug_assertions)]
+    if let Some(gate) = std::env::var_os("HOH_DEBUG_TUI_RESTORE_GATE") {
+        say!("HOH_DEBUG_TUI_RESTORE_GATE");
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !std::path::Path::new(&gate).exists() && std::time::Instant::now() < end {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
+
 /// Restore the terminal (with retries) before the current panic hook prints its message.
 pub fn restore_on_panic() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        debug_restore_gate();
         if let Err(e) = with_retries(3, restore) {
             settle();
             say!("hoh：终端未能恢复：{e}；可运行 stty sane 或 reset");

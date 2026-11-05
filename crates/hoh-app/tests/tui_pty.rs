@@ -169,31 +169,127 @@ fn a_resize_redraws_the_workspace_without_a_key() -> R {
     Ok(())
 }
 
-/// What is typed once the user has chosen to leave belongs to the shell: hoh stops reading before it hands the
-/// terminal back, so input typed while it restores the terminal stays unread (M1T08R-12). A debug-build delay holds
-/// the restore open while the test types.
+/// Text typed into the restore window, held open by the debug-build gate (`HOH_DEBUG_TUI_RESTORE_GATE`): the test
+/// sees hoh waiting at the gate, types, and only then opens it, so the input is known to come before the restore
+/// (M1T08R-15). The exit code and what was left unread on the terminal.
+fn type_into_the_restore_window(
+    mut s: Session,
+    gate: &Path,
+    text: &[u8],
+) -> R<(Option<i32>, Vec<u8>)> {
+    s.pty.wait_for("HOH_DEBUG_TUI_RESTORE_GATE", 0, WAIT)?;
+    s.pty.send(text)?;
+    std::fs::write(gate, b"")?;
+    let status = exit_within(&mut s.child, WAIT)?;
+    assert_eq!(s.pty.stty()?, s.baseline, "terminal attributes");
+    Ok((status.code(), s.pty.unread_input(Duration::from_secs(2))?))
+}
+
+/// What is typed once the user has chosen to leave belongs to the shell: hoh reads nothing once its loop has ended,
+/// so input typed while it restores the terminal stays unread (M1T08R-12).
 #[test]
 fn input_typed_while_the_tui_restores_the_terminal_is_left_for_the_shell() -> R {
     let (home, project) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    let gate = home.path().join("gate");
+    let gate_env = gate.to_str().ok_or("gate path")?;
     let mut s = open(
         project.path(),
         home.path(),
-        &[("HOH_DEBUG_TUI_RESTORE_DELAY_MS", "1000")],
+        &[("HOH_DEBUG_TUI_RESTORE_GATE", gate_env)],
     )?;
     let from = s.pty.output().len();
     s.pty.send(b"\x03")?;
     s.pty.wait_for("脱离", from, WAIT)?;
     s.pty.send(b"\r")?;
-    s.pty.wait_for("HOH_DEBUG_TUI_RESTORE_DELAY", from, WAIT)?;
-    s.pty.send(b"echo NEXT\n")?;
-    let status = exit_within(&mut s.child, WAIT)?;
-    assert_eq!(status.code(), Some(0));
-    assert_eq!(s.pty.stty()?, s.baseline, "terminal attributes");
+    let (code, unread) = type_into_the_restore_window(s, &gate, b"echo NEXT\n")?;
+    assert_eq!(code, Some(0));
     assert_eq!(
-        String::from_utf8_lossy(&s.pty.unread_input(Duration::from_secs(2))?),
+        String::from_utf8_lossy(&unread),
         "echo NEXT\n",
-        "the input typed after leaving was read by hoh"
+        "hoh read the input typed after leaving"
     );
+    Ok(())
+}
+
+/// An unfinished escape sequence (`ESC [` and no more) leaves nothing waiting on the terminal: a SIGTERM still ends
+/// hoh at once, and what is typed while it restores the terminal stays for the shell (M1T08R-13).
+#[test]
+fn an_unfinished_escape_sequence_holds_up_neither_the_exit_nor_the_next_input() -> R {
+    let (home, project) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    let gate = home.path().join("gate");
+    let gate_env = gate.to_str().ok_or("gate path")?;
+    let mut s = open(
+        project.path(),
+        home.path(),
+        &[("HOH_DEBUG_TUI_RESTORE_GATE", gate_env)],
+    )?;
+    s.pty.send(b"\x1b[")?;
+    std::thread::sleep(Duration::from_millis(200));
+    signal(&s.child, Signal::TERM)?;
+    let (code, unread) = type_into_the_restore_window(s, &gate, b"echo NEXT\n")?;
+    assert_eq!(code, Some(143));
+    assert_eq!(
+        String::from_utf8_lossy(&unread),
+        "echo NEXT\n",
+        "hoh read the input typed after the signal"
+    );
+    Ok(())
+}
+
+/// A panic restores the terminal from its hook, before anything is unwound; by then nothing reads the terminal any
+/// more, so what is typed while the hook restores it stays for the shell (M1T08R-14).
+#[test]
+fn input_typed_while_a_panic_restores_the_terminal_is_left_for_the_shell() -> R {
+    let (home, project) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    let gate = home.path().join("gate");
+    let gate_env = gate.to_str().ok_or("gate path")?;
+    let s = open(
+        project.path(),
+        home.path(),
+        &[
+            ("HOH_DEBUG_TUI_PANIC", "1"),
+            ("HOH_DEBUG_TUI_RESTORE_GATE", gate_env),
+        ],
+    )?;
+    let (code, unread) = type_into_the_restore_window(s, &gate, b"echo NEXT\n")?;
+    assert_eq!(code, Some(101));
+    assert_eq!(
+        String::from_utf8_lossy(&unread),
+        "echo NEXT\n",
+        "hoh read the input typed during the panic"
+    );
+    Ok(())
+}
+
+/// A lone ESC is the Esc key once no more input follows it: Esc ends the reverse search (ADR-014 decision 1).
+#[test]
+fn a_lone_esc_is_the_esc_key() -> R {
+    let (home, project) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    let mut s = open(project.path(), home.path(), &[])?;
+    let from = s.pty.output().len();
+    s.pty.send(b"\x12")?;
+    let from = s.pty.wait_for("反向搜索", from, WAIT)?;
+    s.pty.send(b"\x1b")?;
+    s.pty.wait_for("Enter 记录", from, WAIT)?;
+    assert_eq!(s.detach()?, Some(0));
+    Ok(())
+}
+
+/// A burst of keys larger than one read is taken in full: 1100 characters and Enter make one 1100-character line in
+/// the history, with nothing left behind waiting for another key.
+#[test]
+fn a_burst_of_keys_is_taken_in_full() -> R {
+    let (home, project) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    let history = project.path().join(".hoh/input-history.jsonl");
+    let mut s = open(project.path(), home.path(), &[])?;
+    let line = "x".repeat(1100);
+    s.pty.send(format!("{line}\r").as_bytes())?;
+    s.pty.wait_for("未发送", 0, WAIT)?;
+    assert_eq!(
+        std::fs::read_to_string(&history)?,
+        format!("{{\"text\":\"{line}\"}}\n")
+    );
+    assert_eq!(s.detach()?, Some(0));
     Ok(())
 }
 
