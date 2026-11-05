@@ -6,12 +6,14 @@ FRAMES is the recorded stdout (one JSON record per line); COMMANDS maps each rec
 ({"s1": "get_state", "p1": "prompt"}), in the order recorded. Records are sent in order. A response to the k-th recorded
 command of a type waits until the client has sent its k-th command of that type, and goes out with the client's id;
 other records go out as soon as everything before them has. When every record is out the fake waits for stdin to
-close. With `--session-dir D --session-id I` in PI-ARGV it keeps a session file for I in D (as pi does) and puts I in
-place of the recorded session id.
+close. With `--session-dir D --session-id I` in PI-ARGV it finds or makes the session file as pi 1.5.0 does (the first
+*.jsonl of D whose header has id I and this cwd, else a new one) and puts I and that file in place of the recorded
+session id and file.
 
 Pseudo-records (not sent as such): {"hoh_wait": {"command": T, "count": N}} waits until N commands of type T came;
 {"hoh_batch": [R, ...]} sends records in one write; {"hoh_split": [R, N]} sends R in N writes; {"hoh_stderr": BYTES}
-writes that many bytes to stderr; {"hoh_hold": PATH} waits until PATH exists; {"hoh_exit": CODE} exits at once; a {"hoh_keep_session": true} anywhere keeps the recorded session id.
+writes that many bytes to stderr; {"hoh_hold": PATH} waits until PATH exists; {"hoh_exit": CODE} exits at once; a {"hoh_keep_session": true} anywhere keeps the recorded session id; a {"hoh_new_file": true} anywhere makes
+a new session file even if one is found.
 LOGDIR gets received.jsonl (every client line) and sent.jsonl (the bytes sent). Records are split on LF only:
 str.splitlines() would also split on U+2028/U+2029 inside JSON strings, which is what this fake exists to test.
 """
@@ -31,17 +33,35 @@ def main() -> int:
     text = Path(frames_path).read_text(encoding='utf-8')
     session_id = argv[argv.index('--session-id') + 1] if '--session-id' in argv else None
     keep = '"hoh_keep_session"' in text  # a pi that reports another session than the one asked for
-    text = '\n'.join(l for l in text.split('\n') if '"hoh_keep_session"' not in l)
+    fresh = '"hoh_new_file"' in text  # a pi that does not find the session and makes a new file for the id
+    text = '\n'.join(l for l in text.split('\n') if '"hoh_keep_session"' not in l and '"hoh_new_file"' not in l)
     if session_id and not keep:
-        old = next((json.loads(l)['data']['sessionId'] for l in text.split('\n')
-                    if l.strip() and json.loads(l).get('command') == 'get_state' and 'data' in json.loads(l)), None)
-        if old:
-            text = text.replace(old, session_id)
+        recorded_state = next((json.loads(l)['data'] for l in text.split('\n')
+                               if l.strip() and json.loads(l).get('command') == 'get_state' and 'data' in json.loads(l)), None)
         if '--session-dir' in argv:
+            # As pi 1.5.0 SessionManager.findById: the first *.jsonl whose header has this id and this cwd, else a
+            # new file with that header.
             d = Path(argv[argv.index('--session-dir') + 1])
             d.mkdir(parents=True, exist_ok=True)
-            if not any(p.name.endswith(f'_{session_id}.jsonl') for p in d.iterdir()):
-                (d / f'2026-11-04T00-00-00-000Z_{session_id}.jsonl').write_text('{"type":"session"}\n')
+            cwd = os.path.realpath(os.getcwd())
+            found = None
+            for f in sorted(d.glob('*.jsonl')):
+                try:
+                    header = json.loads(f.read_text(encoding='utf-8').split('\n', 1)[0])
+                except (ValueError, OSError):
+                    continue
+                if isinstance(header, dict) and header.get('type') == 'session' and header.get('id') == session_id \
+                        and os.path.realpath(header.get('cwd', '')) == cwd:
+                    found = f
+                    break
+            if found is None or fresh:
+                found = d / f'2026-11-04T00-00-{len(list(d.glob("*.jsonl"))):02d}-000Z_{session_id}.jsonl'
+                found.write_text(json.dumps({'type': 'session', 'version': 3, 'id': session_id,
+                                             'timestamp': '2026-11-04T00:00:00.000Z', 'cwd': cwd}) + '\n')
+            if recorded_state and recorded_state.get('sessionFile'):
+                text = text.replace(json.dumps(recorded_state['sessionFile'])[1:-1], str(found))
+        if recorded_state and recorded_state.get('sessionId'):
+            text = text.replace(recorded_state['sessionId'], session_id)
     frames = [l for l in text.split('\n') if l.strip()]
     received = open(logdir / 'received.jsonl', 'a', encoding='utf-8')
     sent = open(logdir / 'sent.jsonl', 'ab')

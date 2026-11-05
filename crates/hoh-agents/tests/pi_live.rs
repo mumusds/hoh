@@ -32,6 +32,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
+/// A count from the store, read with Python's sqlite3 (test code).
+fn count(world: &World, sql: &str) -> R<i64> {
+    let out = Command::new("python3")
+        .args(["-c", "import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute(sys.argv[2]).fetchone()[0])"])
+        .arg(world.dir.path().join(".hoh/state.db"))
+        .arg(sql)
+        .output()?;
+    Ok(String::from_utf8(out.stdout)?.trim().parse()?)
+}
+
 #[tokio::test]
 #[ignore = "live: runs the installed pi through scripts/product/adapter-live.sh"]
 async fn pi_live_turns_resume_and_cancel() -> R {
@@ -145,7 +155,10 @@ async fn pi_live_turns_resume_and_cancel() -> R {
     }
     sessions.push(session_of(&first));
 
-    // 2. That process has ended; a new one on the same session repeats the token.
+    // 2. That process has ended; a new one on the same session repeats the token. CR5R-01: the session row before and
+    //    after is the same one, and no other row is made.
+    let before = world.store.reader()?.session("S1")?.ok_or("no session")?;
+    let rows_before = count(&world, "SELECT count(*) FROM sessions")?;
     let a2 = world.attempt_in("pi", "A2", "S1", &version).await?;
     let second = pi::run(
         &world.store,
@@ -168,8 +181,16 @@ async fn pi_live_turns_resume_and_cancel() -> R {
         ));
     }
     let row = world.store.reader()?.session("S1")?.ok_or("no session")?;
-    if row.native_path.as_deref() != Some(launch.session_dir.to_string_lossy().as_ref()) {
-        problems.push(format!("session row native_path {:?}", row.native_path));
+    if row != before
+        || row.native_path.as_deref() != Some(launch.session_dir.to_string_lossy().as_ref())
+    {
+        problems.push(format!("session row before {before:?}, after {row:?}"));
+    }
+    let rows_after = count(&world, "SELECT count(*) FROM sessions")?;
+    if rows_after != rows_before {
+        problems.push(format!(
+            "sessions rows {rows_before} before the resume, {rows_after} after"
+        ));
     }
 
     // 3. `sleep 120`, cancelled once its bash tool runs it.
@@ -244,6 +265,22 @@ async fn pi_live_turns_resume_and_cancel() -> R {
         }
     }
     sessions.push(session_of(&third));
+    // The ends as stored, not only as returned.
+    for (attempt, want) in [
+        ("A1", AttemptState::Settled),
+        ("A2", AttemptState::Settled),
+        ("A3", AttemptState::Cancelled),
+    ] {
+        let stored = world
+            .store
+            .reader()?
+            .attempt(attempt)?
+            .map(|a| (a.state, a.cancel_requested));
+        let cancel = want == AttemptState::Cancelled;
+        if stored != Some((want, cancel)) {
+            problems.push(format!("{attempt} in the store: {stored:?}"));
+        }
+    }
     let observations = json!({
         "turn1": {"session": first.native_session, "model": first.model, "settled_by": format!("{:?}", first.settled_by),
                   "reply": first.reply, "args": first.args},

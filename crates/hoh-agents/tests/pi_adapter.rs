@@ -210,6 +210,16 @@ fn events(world: &World, kind: &str) -> R<Vec<Value>> {
         .collect())
 }
 
+/// A count from the store, read with Python's sqlite3 (test code).
+fn count(world: &World, sql: &str) -> R<i64> {
+    let out = std::process::Command::new("python3")
+        .args(["-c", "import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute(sys.argv[2]).fetchone()[0])"])
+        .arg(world.dir.path().join(".hoh/state.db"))
+        .arg(sql)
+        .output()?;
+    Ok(String::from_utf8(out.stdout)?.trim().parse()?)
+}
+
 async fn run(world: &World, attempt: &AttemptRef, turn: &Turn) -> R<Outcome> {
     Ok(pi::run(&world.store, attempt, turn, &CancelLatch::new()).await?)
 }
@@ -472,6 +482,11 @@ async fn test_026_03_the_session_survives_a_kill_and_dialogs_are_cancelled() -> 
     killed?;
     assert_eq!(outcome?.state, AttemptState::Settled);
     let before = world.store.reader()?.session("S1")?.ok_or("no session")?;
+    assert_eq!(count(&world, "SELECT count(*) FROM sessions")?, 1);
+    assert_eq!(
+        world.store.reader()?.attempt("A1")?.map(|a| a.state),
+        Some(AttemptState::Settled)
+    );
 
     // resume(): the same session dir and id; the dialogs are cancelled, the status request is only data.
     let mut second = Case::load("rpc-resume")?;
@@ -510,9 +525,14 @@ async fn test_026_03_the_session_survives_a_kill_and_dialogs_are_cancelled() -> 
         flag(&both[0], "--session-id"),
         flag(&both[1], "--session-id")
     );
+    // CR5R-01: the resumed session is the same row, unchanged, and no other row was made.
     let after = world.store.reader()?.session("S1")?.ok_or("no session")?;
-    assert_eq!(after.native_path, before.native_path);
-    assert_eq!(after.native_id, before.native_id);
+    assert_eq!(after, before);
+    assert_eq!(count(&world, "SELECT count(*) FROM sessions")?, 1);
+    assert_eq!(
+        world.store.reader()?.attempt("A2")?.map(|a| a.state),
+        Some(AttemptState::Settled)
+    );
     assert_eq!(outcome.native_session, before.native_id);
     let answers: Vec<Value> = received(&fake2)?
         .into_iter()
@@ -782,6 +802,261 @@ async fn another_session_than_the_one_asked_for_fails() -> R {
     assert!(
         !received(&fake)?.iter().any(|m| m["type"] == "prompt"),
         "no prompt may be sent"
+    );
+    Ok(())
+}
+
+fn ask(id: &str) -> NewInput {
+    NewInput {
+        input_id: id.to_owned(),
+        run_id: "R".to_owned(),
+        kind: "ASK".to_owned(),
+        target_role: Some("developer".to_owned()),
+        payload: json!({"text": "Reply"}),
+    }
+}
+
+/// agent_start before the prompt's response (AC-026-01's order) with a real input: DELIVERED then APPLIED, in that
+/// order, and the attempt ends (M1T05R-01).
+#[tokio::test]
+async fn a_run_that_starts_before_its_answer_still_applies_its_input() -> R {
+    let world = World::new()?;
+    let mut case = Case::load("rpc-prompt")?;
+    let answer = case.response("p1")?;
+    let start = case.frames.remove(case.position("agent_start")?);
+    case.frames.insert(
+        answer,
+        json!({"hoh_wait": {"command": "prompt", "count": 1}}),
+    );
+    case.frames.insert(answer + 1, start);
+    let fake = world.fake("early-start", &case)?;
+    let attempt = world.attempt("A1").await?;
+    world.store.enqueue_input(ask("I1")).await?;
+    let mut turn = world.turn(&fake, "logs/A1")?;
+    turn.input_id = Some("I1".to_owned());
+    let outcome = run(&world, &attempt, &turn).await?;
+    assert_eq!(outcome.state, AttemptState::Settled);
+    assert_eq!(
+        world.store.reader()?.input("I1")?.map(|r| r.state),
+        Some(InputState::Applied)
+    );
+    assert_eq!(
+        world.store.reader()?.attempt("A1")?.map(|a| a.state),
+        Some(AttemptState::Settled)
+    );
+    let moves: Vec<String> = events(&world, "input.moved")?
+        .iter()
+        .map(|e| e["to"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert_eq!(moves, ["DELIVERED", "APPLIED"]);
+    Ok(())
+}
+
+/// Without agent_settled, a busy answer after the last agent_end is checked again when that work ends, e.g. a
+/// compaction, with no further agent_end (M1T05R-02).
+#[tokio::test]
+async fn a_busy_answer_is_checked_again_when_the_work_ends() -> R {
+    let world = World::new()?;
+    let mut case = Case::load("rpc-prompt")?;
+    let state = case.frames[case.response("s1")?].clone();
+    let mut busy = state.clone();
+    busy["id"] = json!("s2");
+    busy["data"]["isCompacting"] = json!(true);
+    let mut idle = state;
+    idle["id"] = json!("s3");
+    case.frames.retain(|f| f["type"] != "agent_settled");
+    let end = case.position("agent_end")?;
+    case.frames.splice(
+        end + 1..end + 1,
+        [
+            busy,
+            json!({"type": "compaction_start", "reason": "threshold"}),
+            json!({"type": "compaction_end", "reason": "threshold", "willRetry": false}),
+            idle,
+        ],
+    );
+    case.commands
+        .push(("s2".to_owned(), "get_state".to_owned()));
+    case.commands
+        .push(("s3".to_owned(), "get_state".to_owned()));
+    let fake = world.fake("busy-then-done", &case)?;
+    let attempt = world.attempt("A1").await?;
+    let mut turn = world.turn(&fake, "logs/A1")?;
+    turn.launch.settled_event = false;
+    let clock = Arc::new(FrozenClock::default());
+    turn.clock = clock.clone();
+    let outcome =
+        tokio::time::timeout(Duration::from_secs(20), run(&world, &attempt, &turn)).await??;
+    assert_eq!(
+        (outcome.state, outcome.settled_by, outcome.state_queries),
+        (AttemptState::Settled, Some(SettledBy::State), 2)
+    );
+    assert_eq!(clock.timers.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+/// A session file that is not the session (empty, or of another cwd) is not resumed, and a pi that opens another file
+/// for the id is not taken at its word (M1T05R-03).
+#[tokio::test]
+async fn only_the_sessions_own_file_is_resumed() -> R {
+    let world = World::new()?;
+    let resume = Case::load("rpc-resume")?;
+    let header = |cwd: &Path, id: &str| json!({"type": "session", "version": 3, "id": id, "timestamp": "2026-11-04T00:00:00.000Z", "cwd": cwd});
+    for (name, content) in [
+        ("empty", None),
+        ("other-cwd", Some(Path::new("/elsewhere"))),
+    ] {
+        let fake = world.fake(name, &resume)?;
+        let attempt = world.attempt_in("pi", name, name, "1.5.0").await?;
+        let mut turn = world.turn(&fake, &format!("logs/{name}"))?;
+        turn.launch.resume = true;
+        std::fs::create_dir_all(&turn.launch.session_dir)?;
+        let file = turn.launch.session_dir.join(format!(
+            "2026-11-04T00-00-00-000Z_{}.jsonl",
+            turn.launch.session_id
+        ));
+        let body = content.map_or(String::new(), |cwd| {
+            format!("{}\n", header(cwd, &turn.launch.session_id))
+        });
+        std::fs::write(&file, body)?;
+        let outcome = run(&world, &attempt, &turn).await?;
+        assert_eq!(
+            (outcome.state, outcome.failure.as_deref()),
+            (AttemptState::Failed, Some("SESSION_NOT_FOUND")),
+            "{name}"
+        );
+        assert!(argvs(&fake)?.is_empty(), "{name}: no process may start");
+    }
+    // The session's own file exists, but this pi opens a new one for the id.
+    let mut fresh = resume.clone();
+    fresh.frames.insert(0, json!({"hoh_new_file": true}));
+    let fake = world.fake("fresh", &fresh)?;
+    let attempt = world.attempt_in("pi", "fresh", "fresh", "1.5.0").await?;
+    let mut turn = world.turn(&fake, "logs/fresh")?;
+    turn.launch.resume = true;
+    std::fs::create_dir_all(&turn.launch.session_dir)?;
+    std::fs::write(
+        turn.launch.session_dir.join(format!(
+            "2026-11-03T00-00-00-000Z_{}.jsonl",
+            turn.launch.session_id
+        )),
+        format!(
+            "{}\n",
+            header(&world.dir.path().canonicalize()?, &turn.launch.session_id)
+        ),
+    )?;
+    let outcome = run(&world, &attempt, &turn).await?;
+    assert_eq!(
+        (outcome.state, outcome.failure.as_deref()),
+        (AttemptState::Failed, Some("SESSION_MISMATCH"))
+    );
+    assert!(
+        !received(&fake)?.iter().any(|m| m["type"] == "prompt"),
+        "no prompt may be sent"
+    );
+    Ok(())
+}
+
+/// A provider failure after the prompt was taken (the final assistant message stopped with an error) fails the turn
+/// with its class; a retry that then succeeds clears it (M1T05R-04).
+#[tokio::test]
+async fn a_provider_failure_after_acceptance_fails_the_turn() -> R {
+    let world = World::new()?;
+    let failed_message = |text: &str| {
+        json!({"type": "message_end", "message": {"role": "assistant", "content": [], "stopReason": "error",
+               "errorMessage": text}})
+    };
+    for (name, error, retried, expect) in [
+        (
+            "limit",
+            "429 rate limit exceeded",
+            false,
+            (AttemptState::Failed, Some("TRANSIENT_EXTERNAL")),
+        ),
+        (
+            "key",
+            "No API key found for the selected model.",
+            false,
+            (AttemptState::Failed, Some("BLOCKED_AUTH")),
+        ),
+        (
+            "other",
+            "Request was malformed",
+            false,
+            (AttemptState::Failed, Some("PERMANENT_EXTERNAL")),
+        ),
+        (
+            "retried",
+            "529 overloaded",
+            true,
+            (AttemptState::Settled, None),
+        ),
+    ] {
+        let mut case = Case::load("rpc-prompt")?;
+        let last = case
+            .frames
+            .iter()
+            .rposition(|f| f["type"] == "message_end" && f["message"]["role"] == "assistant")
+            .ok_or("no assistant message")?;
+        let good = case.frames[last].clone();
+        case.frames[last] = failed_message(error);
+        if retried {
+            case.frames.splice(
+                last + 1..last + 1,
+                [json!({"type": "auto_retry_start", "attempt": 1, "maxAttempts": 3, "delayMs": 1, "errorMessage": error}), good],
+            );
+        }
+        let fake = world.fake(name, &case)?;
+        let attempt = world.attempt_in("pi", name, name, "1.5.0").await?;
+        let outcome = run(
+            &world,
+            &attempt,
+            &world.turn(&fake, &format!("logs/{name}"))?,
+        )
+        .await?;
+        assert_eq!(
+            (outcome.state, outcome.failure.as_deref()),
+            expect,
+            "{name}"
+        );
+        let row = world.store.reader()?.attempt(name)?.ok_or("no attempt")?;
+        assert_eq!(
+            (row.state, row.failure_reason.as_deref()),
+            expect,
+            "{name} in the store"
+        );
+    }
+    Ok(())
+}
+
+/// An input someone else has moved on before Pi took the prompt is recorded and does not stop the turn.
+#[tokio::test]
+async fn an_input_moved_elsewhere_does_not_stop_the_pi_turn() -> R {
+    let world = World::new()?;
+    let fake = world.fake("moved", &Case::load("rpc-prompt")?)?;
+    let attempt = world.attempt("A1").await?;
+    world.store.enqueue_input(ask("I1")).await?;
+    world
+        .store
+        .move_input(hoh_core::persistence::InputMove {
+            input_id: "I1".to_owned(),
+            from: InputState::Queued,
+            to: InputState::Rejected,
+            reason: Some("withdrawn".to_owned()),
+        })
+        .await?;
+    let mut turn = world.turn(&fake, "logs/A1")?;
+    turn.input_id = Some("I1".to_owned());
+    let outcome = run(&world, &attempt, &turn).await?;
+    assert_eq!(outcome.state, AttemptState::Settled);
+    assert_eq!(
+        world.store.reader()?.input("I1")?.map(|r| r.state),
+        Some(InputState::Rejected)
+    );
+    assert!(
+        events(&world, "adapter.diagnostic")?
+            .iter()
+            .any(|d| d["reason"] == "input not moved")
     );
     Ok(())
 }
