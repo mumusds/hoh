@@ -93,6 +93,8 @@ def inspect_output(agent:str,path:Path)->dict:
             if isinstance(text,str):
                 assistant_text.append(text[-4096:]);assistant_text=assistant_text[-16:]
                 if text.strip():final_text=text[-FINAL_TEXT_LIMIT:]
+            # The terminal result alone carries the final answer: an earlier report must not outlive a last result without one.
+            if agent in ('claude','grok') and t=='result':final_text=text[-FINAL_TEXT_LIMIT:] if isinstance(text,str) else ''
             for k in ['session_id','sessionId','thread_id']:
                 if isinstance(r.get(k),str):session_ids.add(r[k])
             if agent=='pi' and t=='session' and isinstance(r.get('id'),str):session_ids.add(r['id'])
@@ -143,6 +145,10 @@ def cli_version(agent:str,cwd:Path)->str:
         return text[0][:160] if r.returncode==0 and text else 'unknown'
     except (OSError,subprocess.TimeoutExpired):return 'unknown'
 
+def live_session_agents()->list[str]:
+    """Agents a live check's live-sessions.json may name (contracts/live-session.schema.json)."""
+    return load_json(ROOT/'contracts/live-session.schema.json')['properties']['sessions']['items']['properties']['agent']['enum']
+
 def record_live_sessions(agent:str,version:str,observed:dict)->None:
     """When run inside tools/run_check.py, append observed native sessions to the check's live-sessions.json."""
     directory=os.getenv('HOH_EVIDENCE_DIR');check=os.getenv('HOH_CHECK_ID');candidate=os.getenv('HOH_CANDIDATE_ID')
@@ -176,6 +182,9 @@ def main(argv=None)->int:
     if a.top_level and a.role not in TOP_LEVEL_ROLES:p.error('--top-level requires role commander or developer')
     if a.report_out and a.role not in REPORT_ROLES:p.error('--report-out requires role qa or reviewer')
     if a.report_out and a.report_out.exists():p.error(f'report already exists: {a.report_out}; evidence is append-only')
+    if os.getenv('HOH_EVIDENCE_DIR') and a.agent not in live_session_agents():
+        # The release gate rejects a live session the schema does not accept, so the session would be evidence of nothing.
+        print(f'--agent {a.agent} cannot run inside a check: contracts/live-session.schema.json accepts only '+', '.join(live_session_agents()),file=sys.stderr);return 64
     if a.top_level and os.getenv(PARENT_ENV):p.error(f'--top-level refused: already inside bootstrap session {os.getenv(PARENT_ENV)}; a nested session cannot start another top-level coordinator')
     if a.top_level:data=b'[HOH_TOP_LEVEL_BOOTSTRAP]\n'+original
     else:
