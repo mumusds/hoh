@@ -1,6 +1,7 @@
 //! A session's capabilities (`sessions.capabilities_json`, REQ-027): what the probe found for the CLI (its compat
-//! manifest entry), never more than the transport a turn actually used offers. They are never set from the agent's
-//! brand: a dispatch that needs one the CLI does not have is refused (`ROLE_CAPABILITY_MISSING`, M1R-01).
+//! manifest entry), and only where the adapter implements the capability on the transport a turn used. They are never
+//! set from the agent's brand: a dispatch that needs one the session does not have is refused
+//! (`ROLE_CAPABILITY_MISSING`, M1R-01).
 
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
@@ -8,16 +9,24 @@ use std::collections::BTreeMap;
 /// Probed capabilities by name; `None` is unknown (`AgentEntry::capabilities`).
 pub type Probed = BTreeMap<String, Option<bool>>;
 
-/// The session row's capabilities: each one the probe found, false where `limits` says the turn's transport cannot
-/// have it; one the probe left unknown is left out unless a limit rules it out.
-pub fn of_session(probed: &Probed, limits: &[(&str, bool)]) -> Value {
-    let mut caps: Map<String, Value> = probed
+/// The session row's capabilities. `supported` lists what the adapter implements on this turn's transport, true where
+/// the CLI offers it there: each of those is what the probe found (left out if unknown); every other capability, probed
+/// or not, is false. A capability a compat suite finds but the adapter does not handle is never granted (M1T04R-15).
+pub fn of_session(probed: &Probed, supported: &[(&str, bool)]) -> Value {
+    let mut caps = Map::new();
+    let names = crate::probe::CAPABILITIES
         .iter()
-        .filter_map(|(name, value)| value.map(|v| (name.clone(), Value::Bool(v))))
-        .collect();
-    for (name, allowed) in limits {
-        if !allowed {
-            caps.insert((*name).to_owned(), Value::Bool(false));
+        .copied()
+        .chain(probed.keys().map(String::as_str));
+    for name in names {
+        let offered = supported.iter().any(|(n, ok)| *n == name && *ok);
+        let value = if offered {
+            probed.get(name).copied().flatten()
+        } else {
+            Some(false)
+        };
+        if let Some(v) = value {
+            caps.insert(name.to_owned(), Value::Bool(v));
         }
     }
     Value::Object(caps)
@@ -29,27 +38,44 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn the_probe_decides_and_a_limit_only_takes_away() {
+    fn only_what_the_adapter_supports_and_the_probe_found() {
         let probed: Probed = [
             ("resume".to_owned(), Some(true)),
             ("mid_turn_steer".to_owned(), Some(true)),
             ("token_usage".to_owned(), Some(false)),
             ("images".to_owned(), None),
+            ("x_future".to_owned(), Some(true)),
         ]
         .into_iter()
         .collect();
-        assert_eq!(
-            of_session(
-                &probed,
-                &[
-                    ("mid_turn_steer", false),
-                    ("token_usage", true),
-                    ("ui_dialogs", false),
-                    ("images", true)
-                ]
-            ),
-            json!({"resume": true, "mid_turn_steer": false, "token_usage": false, "ui_dialogs": false})
+        let caps = of_session(
+            &probed,
+            &[
+                ("resume", true),
+                ("mid_turn_steer", false),
+                ("token_usage", true),
+                ("images", true),
+            ],
         );
-        assert_eq!(of_session(&Probed::new(), &[]), json!({}));
+        // Supported and found: the probe's value; supported but unknown: left out; anything else: false.
+        assert_eq!(caps["resume"], json!(true));
+        assert_eq!(caps["token_usage"], json!(false));
+        assert!(caps.get("images").is_none(), "{caps}");
+        for no in [
+            "mid_turn_steer",
+            "x_future",
+            "structured_events",
+            "partial_messages",
+            "custom_tools",
+            "browser",
+            "ui_dialogs",
+        ] {
+            assert_eq!(caps[no], json!(false), "{no}: {caps}");
+        }
+        assert!(
+            of_session(&Probed::new(), &[])
+                .as_object()
+                .is_some_and(|m| m.values().all(|v| *v == json!(false)))
+        );
     }
 }

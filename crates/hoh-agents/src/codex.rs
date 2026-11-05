@@ -94,6 +94,19 @@ pub fn app_server_args(help: &str) -> Vec<String> {
     args
 }
 
+/// Whether a resumed exec turn can do whatever a new one can: `codex exec resume --help` was probed and offers
+/// `--json`, and the YOLO flag and `--model` wherever `codex exec --help` offers them. It does not depend on one
+/// launch's profile or model, since a later turn of the session may use others (M1T04R-11, -14).
+pub fn exec_resumable(launch: &Launch) -> bool {
+    let Some(help) = launch.exec_resume_help.as_deref() else {
+        return false;
+    };
+    offers(help, "--json")
+        && [YOLO_FLAG, "--model"]
+            .iter()
+            .all(|flag| !offers(&launch.exec_help, flag) || offers(help, flag))
+}
+
 /// The arguments of `codex exec --json` (or `codex exec resume --json ... <thread>`), the prompt on stdin.
 pub fn exec_args(launch: &Launch) -> Result<Vec<String>, Blocked> {
     let help = match &launch.resume {
@@ -485,30 +498,33 @@ pub async fn run(
     exec::run(store, attempt, turn, args, reason, cancel, &mut steers).await
 }
 
-/// The session row of a turn: the probed capabilities (M1R-01). Server requests are answered headless, so there are
-/// no dialogs; on exec there is no steer and no delta, and resume only if a resumed exec turn of this launch could
-/// start, by the same rule as that turn (M1T04R-11).
+/// The session row of a turn: the probed capabilities, only those this adapter implements on the transport the turn
+/// used (M1R-01, M1T04R-15). On App Server: events, resume (`thread/resume`), steer, deltas and token usage; on exec:
+/// events, and resume if a resumed exec turn can do whatever a new one can (M1T04R-11, -14). Server requests are
+/// answered headless (no dialogs, no custom tools), prompts are text only, there is no browser.
 fn session(
     attempt: &AttemptRef,
     turn: &Turn,
     app_server: bool,
     native_id: Option<String>,
 ) -> Session {
-    let mut limits = vec![("ui_dialogs", false)];
-    if !app_server {
-        let resumed = Launch {
-            resume: Some(String::new()),
-            ..turn.launch.clone()
-        };
-        limits.extend([
-            ("mid_turn_steer", false),
-            ("partial_messages", false),
+    let supported: Vec<(&str, bool)> = if app_server {
+        vec![
+            ("structured_events", true),
+            ("resume", true),
+            ("mid_turn_steer", true),
+            ("partial_messages", true),
+            ("token_usage", true),
+        ]
+    } else {
+        vec![
+            ("structured_events", true),
             (
                 "resume",
-                offers(&turn.launch.exec_help, "resume") && exec_args(&resumed).is_ok(),
+                offers(&turn.launch.exec_help, "resume") && exec_resumable(&turn.launch),
             ),
-        ]);
-    }
+        ]
+    };
     Session {
         session_id: attempt.session_id.clone(),
         agent: "codex".to_owned(),
@@ -516,7 +532,7 @@ fn session(
         native_id,
         native_path: None,
         agent_version: attempt.agent_version.clone(),
-        capabilities: crate::capabilities::of_session(&turn.launch.capabilities, &limits),
+        capabilities: crate::capabilities::of_session(&turn.launch.capabilities, &supported),
     }
 }
 

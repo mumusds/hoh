@@ -430,6 +430,8 @@ async fn the_session_has_the_capabilities_the_probe_found() -> R {
         ("resume", false),
         ("mid_turn_steer", true),
         ("ui_dialogs", true),
+        ("token_usage", true),
+        ("custom_tools", true),
     ]);
     turn.launch.help = turn.launch.help.replace(PARTIAL_FLAG, "");
     let attempt = world.attempt("A1").await?;
@@ -454,6 +456,12 @@ async fn the_session_has_the_capabilities_the_probe_found() -> R {
     // (M1T04R-12).
     assert_eq!(
         (&caps["mid_turn_steer"], &caps["ui_dialogs"]),
+        (&json!(false), &json!(false)),
+        "{caps}"
+    );
+    // Nor what the adapter does not do: it records no token usage and offers no custom tools (M1T04R-15, -16).
+    assert_eq!(
+        (&caps["token_usage"], &caps["custom_tools"]),
         (&json!(false), &json!(false)),
         "{caps}"
     );
