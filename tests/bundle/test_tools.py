@@ -137,22 +137,15 @@ class NativeBridge(unittest.TestCase):
         self.assertFalse(set(CHECK_VARS)&seen,seen);self.assertIn('HOH_BOOTSTRAP_PARENT',seen)
         self.assertEqual([s['session_id'] for s in load_json(ev/'live-sessions.json')['sessions']],['mock-thread'])
         self.assertTrue(set(CHECK_VARS)<=set(load_json(self.root/'a3/attempt.json')['env_removed']))
-    def test_the_check_variables_are_those_run_check_sets(self):
-        # TB-01, TB-07: one list for the bridge, the bundle self-test and check.sh, equal to the keys of the dict
-        # run_check.py merges into the check's environment (read from its syntax tree, however they are spelt).
-        import ast
-        tree=ast.parse((ROOT/'tools/run_check.py').read_text())
-        exported=[{k.value for k in node.value.right.keys if isinstance(k,ast.Constant)}
-                  for node in ast.walk(tree) if isinstance(node,ast.Assign) and any(getattr(t,'id',None)=='env' for t in node.targets)
-                  and isinstance(node.value,ast.BinOp) and isinstance(node.value.right,ast.Dict)]
-        self.assertEqual(exported,[set(CHECK_VARS)])
     def test_the_bundle_self_test_unsets_every_check_variable(self):
         # TB-03, TB-06: scripts/check.sh --bundle, run in a copy whose python3 records how it was started, starts the
         # unittest run without any of run_check's variables.
         (self.root/'scripts').mkdir();shutil.copy(ROOT/'scripts/check.sh',self.root/'scripts/check.sh')
-        calls=self.root/'calls.jsonl'
-        (self.bin/'python3').write_text('#!/usr/bin/env -S '+sys.executable+'\nimport json,os,sys\n'
-            'open(os.environ["CALLS"],"a").write(json.dumps({"argv":sys.argv[1:],"env":sorted(os.environ)})+"\\n")\n')
+        calls=self.root/'calls.jsonl';recorder=self.bin/'recorder.py'
+        recorder.write_text('import json,os,sys\nopen(os.environ["CALLS"],"a").write(json.dumps({"argv":sys.argv[1:],"env":sorted(os.environ)})+"\\n")\n')
+        # A shell shim, not a shebang with the interpreter's path: that path may hold spaces (TB-08).
+        import shlex
+        (self.bin/'python3').write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(recorder))} "$@"\n')
         (self.bin/'python3').chmod(0o755)
         outer=dict.fromkeys(CHECK_VARS,'x')|{'CALLS':str(calls)}
         p=subprocess.run(['bash',str(self.root/'scripts/check.sh'),'--bundle'],capture_output=True,text=True,env=self.env|outer,timeout=20)
@@ -774,7 +767,8 @@ PLAN={'ok':{'mode':'mock','argv':[PY,'-c','print("MOCK UNIT CHECK ONLY")']},
       'live':{'mode':'live','argv':[PY,'-c','pass']},
       'artifact':{'mode':'mock','argv':[PY,'-c','import os;open(os.path.join(os.environ["HOH_EVIDENCE_DIR"],"result.json"),"w").write("{}")'],'artifacts':['result.json']},
       'missing-artifact':{'mode':'mock','argv':[PY,'-c','pass'],'artifacts':['result.json']},
-      'escape':{'mode':'mock','argv':[PY,'-c','pass'],'cwd':'../'}}
+      'escape':{'mode':'mock','argv':[PY,'-c','pass'],'cwd':'../'},
+      'env':{'mode':'mock','argv':[PY,'-c','import json,os;open(os.path.join(os.environ["HOH_EVIDENCE_DIR"],"env.json"),"w").write(json.dumps(sorted(k for k in os.environ if k.startswith("HOH_"))))'],'artifacts':['env.json']}}
 
 class Signals(unittest.TestCase):
     def test_sigterm_stops_child_and_surfaces(self):
@@ -841,6 +835,15 @@ class CandidateAndChecks(unittest.TestCase):
     def test_missing_artifact_fails(self):
         rc,r,_=self.runcheck('missing-artifact');self.assertNotEqual(rc,0);self.assertEqual(r['missing_artifacts'],['result.json'])
     def test_cwd_escape_refused(self):rc,r,err=self.runcheck('escape');self.assertEqual(rc,1);self.assertIn('escapes',err)
+    def test_the_check_variables_are_those_run_check_sets(self):
+        # TB-01, TB-09: one list for the bridge, the bundle self-test and check.sh, equal to the HOH_ variables a real
+        # run_check adds to a check's environment, however run_check.py builds them.
+        from agent_task import CHECK_VARIABLES
+        outer={k:os.environ.pop(k) for k in list(os.environ) if k.startswith('HOH_')}
+        try:rc,r,_=self.runcheck('env')
+        finally:os.environ.update(outer)
+        self.assertEqual(rc,0)
+        self.assertEqual(set(load_json(self.root/'.hoh-dev/check/artifacts/env.json')),set(CHECK_VARIABLES))
     def test_evidence_dir_append_only(self):
         self.runcheck('ok');
         with self.assertRaises(SystemExit):self.runcheck('ok')
