@@ -309,6 +309,15 @@ async fn test_024_01_a_recorded_turn_settles_in_handshake_order_with_one_unknown
         (row.state, row.resolved_model.as_deref()),
         (AttemptState::Settled, Some("gpt-6-astra"))
     );
+    // The token usage of the last thread/tokenUsage/updated is the attempt's (M1T04R-19).
+    let usage = case
+        .frames
+        .iter()
+        .rev()
+        .find(|f| f["method"] == "thread/tokenUsage/updated")
+        .map(|f| f["params"]["tokenUsage"].clone())
+        .ok_or("no token usage in the recording")?;
+    assert_eq!(row.usage, Some(usage));
     let session = reader.session("S1")?.ok_or("no session")?;
     assert_eq!(session.native_id, Some(case.thread_id()?));
     assert_eq!(session.capabilities["mid_turn_steer"], true);
@@ -1710,14 +1719,25 @@ async fn an_exec_session_resumes_only_if_a_resumed_exec_turn_could_start() -> R 
     let world = World::new()?;
     let resume_help = "Usage: codex exec resume [OPTIONS] [SESSION_ID] [PROMPT]\n  --json\n  --dangerously-bypass-approvals-and-sandbox\n  -m, --model <MODEL>\n";
     let json_only = "Usage: codex exec resume [SESSION_ID]\n  --json\n";
+    // The usage of the recording's turn.completed, which the attempt row must hold.
+    let recorded_exec_usage = read(format!("{FIXTURES}/exec/stdout.jsonl"))?
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .find(|f| f["type"] == "turn.completed")
+        .map(|f| f["usage"].clone())
+        .ok_or("no turn.completed")?;
     let no_model = "Usage: codex exec resume [SESSION_ID]\n  --json\n  --dangerously-bypass-approvals-and-sandbox\n";
+    let no_yolo = "Usage: codex exec resume [SESSION_ID]\n  --json\n  -m, --model <MODEL>\n";
     for (i, (help, yolo, resumable)) in [
         (None, true, false),
         (Some(json_only), true, false),
         // Written by a turn that needs neither: a later YOLO turn or one with a model could not resume.
         (Some(json_only), false, false),
-        // A later turn with a model could not resume (M1T04R-18).
+        // A later turn with a model could not resume (M1T04R-18), nor a later YOLO turn (M1T04R-20).
         (Some(no_model), true, false),
+        (Some(no_yolo), false, false),
         (Some(resume_help), true, true),
         (Some(resume_help), false, true),
     ]
@@ -1730,6 +1750,9 @@ async fn an_exec_session_resumes_only_if_a_resumed_exec_turn_could_start() -> R 
         turn.launch.app_server_help = None;
         turn.launch.exec_resume_help = help.map(str::to_owned);
         turn.launch.yolo = yolo;
+        turn.launch
+            .capabilities
+            .insert("token_usage".to_owned(), Some(true));
         let attempt = world
             .attempt_in("codex", &format!("A{i}"), &format!("S{i}"), "0.166.0")
             .await?;
@@ -1748,6 +1771,17 @@ async fn an_exec_session_resumes_only_if_a_resumed_exec_turn_could_start() -> R 
             session.capabilities["resume"], resumable,
             "{name}: {session:?}"
         );
+        // exec records the usage of turn.completed, so a probed token usage stays (M1T04R-17, -19).
+        assert_eq!(
+            session.capabilities["token_usage"], true,
+            "{name}: {session:?}"
+        );
+        let row = world
+            .store
+            .reader()?
+            .attempt(&format!("A{i}"))?
+            .ok_or("no attempt")?;
+        assert_eq!(row.usage, Some(recorded_exec_usage.clone()), "{name}");
     }
     Ok(())
 }
