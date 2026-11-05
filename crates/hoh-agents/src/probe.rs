@@ -849,6 +849,11 @@ fn capture(
     } else {
         let _ = etx.send(Ok(Vec::new()));
     }
+    let timed_out = || ProbeError::TimedOut {
+        argv: argv(program, args),
+        after: limit,
+        cut_by_deadline: limit < env.timeout,
+    };
     let deadline = end;
     let pid = Pid::from_child(&child);
     let exited = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG;
@@ -863,29 +868,25 @@ fn capture(
         if Instant::now() >= deadline {
             let _ = kill_process_group(pid, Signal::KILL);
             let _ = child.wait();
-            return Err(ProbeError::TimedOut {
-                argv: argv(program, args),
-                after: limit,
-                cut_by_deadline: limit < env.timeout,
-            });
+            return Err(timed_out());
         }
         std::thread::sleep(Duration::from_millis(10));
     }
     // Whatever the command left running in its group goes with it (M1T01R-03), then the leader is reaped.
     let _ = kill_process_group(pid, Signal::KILL);
     let status = child.wait()?;
-    // A descendant that keeps the pipe open must not stall the probe either.
-    let remaining = deadline
-        .saturating_duration_since(Instant::now())
-        .max(Duration::from_millis(500));
-    let read = |rx: mpsc::Receiver<io::Result<Vec<u8>>>| match rx.recv_timeout(remaining) {
+    // A descendant that left the group and keeps a pipe open must not stall the probe either. Both reads end at the
+    // same absolute end as the wait above, each waiting only for what is left of it, so the two never add up past the
+    // limit; output still open then is a timeout and what comes later is not taken (M1T07R-13). The group is not
+    // signalled again: it was killed before the leader was reaped, and its id may since belong to another process.
+    let read = |rx: mpsc::Receiver<io::Result<Vec<u8>>>| match rx
+        .recv_timeout(end.saturating_duration_since(Instant::now()))
+    {
         Ok(read) => read.map_err(|e| failed(format!("reading output: {e}"))),
-        Err(_) => {
-            let _ = kill_process_group(Pid::from_child(&child), Signal::KILL);
-            Err(failed(
-                "output stayed open after the command exited".to_owned(),
-            ))
-        }
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(timed_out()),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(failed(
+            "the output reader ended without a result".to_owned(),
+        )),
     };
     let stdout = read(rx)?;
     let stderr = read(erx)?;

@@ -34,6 +34,10 @@ enum Status {
     NotLoggedIn,
     /// Sleeps 60 s, with a child in its group.
     Hangs,
+    /// Exits as soon as a helper it started is in a session of its own (pid in `$HOME/helper.pid`), leaving
+    /// `$HOME/launcher.exited`. The helper holds both pipes: it closes stdout at 12 s and gives the logged-in answer on
+    /// stderr at 28 s, past doctor's 20 s limit.
+    Escapes,
 }
 
 struct Sandbox {
@@ -95,6 +99,12 @@ impl Sandbox {
             Status::LoggedIn => format!("{}{logged}", self.echo()),
             Status::NotLoggedIn => format!("{}{not}", self.echo()),
             Status::Hangs => "sleep 60 & sleep 60\n".to_owned(),
+            Status::Escapes => format!(
+                "setsid sh -s <<'HELPER' &\necho $$ > \"{home}/helper.tmp\"; mv \"{home}/helper.tmp\" \"{home}/helper.pid\"\n\
+                 sleep 12\nexec >&-\nsleep 16\n{logged}HELPER\nwhile [ ! -s '{home}/helper.pid' ]; do sleep 0.01; done\n\
+                 : > '{home}/launcher.exited'\nexit 0\n",
+                home = self.home.path().display()
+            ),
         }
     }
 
@@ -459,11 +469,12 @@ fn test_006_02_credentials_are_never_read_or_shown() -> R {
 
 /// One shared limit for every command (M1T07R-02): a pi whose status hangs and whose `list` is slow, and a node whose
 /// `--version` hangs, still let doctor end within the limit + 5 s. A tool that does not answer is unknown, not
-/// incompatible, so it blocks nothing (M1T07R-03).
+/// incompatible, so it blocks nothing (M1T07R-03). A codex whose status answer comes past the limit through a pipe a
+/// helper holds open is unknown too, not logged in (M1T07R-13).
 #[test]
 fn slow_and_hung_commands_share_one_limit_and_stay_unknown() -> R {
     let s = Sandbox::new()?;
-    s.codex(Status::LoggedIn)?;
+    s.codex(Status::Escapes)?;
     s.claude(Status::LoggedIn)?;
     s.pi_listing(Status::Hangs, "sleep 6; echo 'No packages installed.'")?;
     s.write("node", "#!/bin/sh\nsleep 60\n")?;
@@ -479,7 +490,25 @@ fn slow_and_hung_commands_share_one_limit_and_stay_unknown() -> R {
         ),
     )?;
     let (out, report, took) = s.doctor()?;
+    // The helper left codex's group, out of doctor's reach: stop it here.
+    if let Ok(pid) = std::fs::read_to_string(s.home.path().join("helper.pid")) {
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &format!("-{}", pid.trim())])
+            .status();
+    }
     assert!(took <= Duration::from_secs(25), "doctor took {took:?}");
+    assert!(
+        s.home.path().join("launcher.exited").exists(),
+        "codex's status launcher did not exit"
+    );
+    let codex = &report["agents"]["codex"];
+    assert_eq!(codex["auth_check"], "unknown", "{codex}");
+    assert!(
+        codex["remedy"]
+            .as_str()
+            .is_some_and(|r| r.contains("总时限")),
+        "{codex}"
+    );
     assert_eq!(
         report["agents"]["claude"]["protocol"], "unknown",
         "{}",
