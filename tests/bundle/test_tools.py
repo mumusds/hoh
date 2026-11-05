@@ -9,6 +9,8 @@ from common import flag_supported
 from render_prompt import render
 import run_check
 
+# What tools/run_check.py sets for the check it runs (agent_task.py and the product scripts read them).
+CHECK_VARS=('HOH_EVIDENCE_DIR','HOH_CHECK_ID','HOH_CANDIDATE_ID','HOH_SPEC_SHA256')
 FAKE=r"""#!/usr/bin/env python3
 import json,os,sys,time
 name=os.path.basename(sys.argv[0]);args=sys.argv[1:]
@@ -82,7 +84,9 @@ class NativeBridge(unittest.TestCase):
         for name in ['codex','claude','pi','grok']:
             p=self.bin/name;p.write_text(FAKE);p.chmod(0o755)
         self.prompt=self.root/'prompt with spaces.md';self.prompt.write_text('真实Unicode input，不是产品验收。')
-        self.env=os.environ|{'PATH':str(self.bin)+os.pathsep+os.environ.get('PATH',''),'FAKE_TRACE':str(self.root/'trace.json'),'PYTHONDONTWRITEBYTECODE':'1'}
+        # Outside any check: run_check's variables would send the mock sessions into that check's evidence.
+        outside={k:v for k,v in os.environ.items() if k not in CHECK_VARS}
+        self.env=outside|{'PATH':str(self.bin)+os.pathsep+os.environ.get('PATH',''),'FAKE_TRACE':str(self.root/'trace.json'),'PYTHONDONTWRITEBYTECODE':'1'}
     def bridge(self,agent='codex',mode='ok',timeout='10'):
         env=self.env|{'FAKE_MODE':mode};out=self.root/'attempt'
         p=subprocess.run([sys.executable,str(ROOT/'tools/agent_task.py'),'--agent',agent,'--prompt-file',str(self.prompt),'--cwd',str(self.root),'--output-dir',str(out),'--timeout',timeout],capture_output=True,text=True,env=env,timeout=20)
@@ -106,6 +110,15 @@ class NativeBridge(unittest.TestCase):
         argv=r['argv'];self.assertEqual(argv[argv.index('--prompt-file')+1],'/dev/stdin');self.assertEqual(argv[argv.index('--output-format')+1],'streaming-messages-json')
         self.assertIn('--always-approve',argv)
         t=load_json(self.root/'trace.json');self.assertTrue(t['stdin'].startswith('[HOH_DELEGATED_TASK]'));self.assertTrue(t['stdin'].endswith(self.prompt.read_text()))
+    def test_the_bridge_tests_run_outside_any_check(self):
+        # A self-test run inside a check, or in a reviewer's shell, inherits run_check's variables: the bridge tests
+        # must neither write into that check's evidence nor meet the bridge's in-check refusal.
+        ev=self.root/'outer-evidence';ev.mkdir()
+        with patch.dict(os.environ,{'HOH_EVIDENCE_DIR':str(ev),'HOH_CHECK_ID':'static','HOH_CANDIDATE_ID':'CAND-'+'c'*64,'HOH_SPEC_SHA256':'d'*64}):
+            self.setUp()
+        self.assertFalse({'HOH_EVIDENCE_DIR','HOH_CHECK_ID','HOH_CANDIDATE_ID','HOH_SPEC_SHA256'}&self.env.keys())
+        p,out=self.bridge(agent='grok');self.assertEqual(p.returncode,0,p.stderr)
+        self.assertEqual(list(ev.iterdir()),[])
     def test_grok_error_result_fails_the_turn_despite_a_zero_exit(self):
         p,out=self.bridge(agent='grok',mode='semantic-error');self.assertEqual(p.returncode,1,p.stderr);r=load_json(out/'attempt.json')
         self.assertEqual((r['status'],r['exit_code'],r['terminal_observed'],r['native_error_observed']),('NATIVE_FAILED',0,True,True))
