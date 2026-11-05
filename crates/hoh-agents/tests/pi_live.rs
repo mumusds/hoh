@@ -54,6 +54,7 @@ async fn pi_live_turns_resume_and_cancel() -> R {
             path: std::env::var_os("PATH").ok_or("no PATH")?,
             fixture_root: None,
             timeout: Duration::from_secs(120),
+            log: None,
         },
     )?;
     let version = entry

@@ -6,7 +6,7 @@
 #![forbid(unsafe_code)]
 
 use hoh_agents::compat::{Agent, AgentEntry, CompatManifest, SuiteStatus, Transport};
-use hoh_agents::probe::{ProbeEnv, probe, tree_sha256};
+use hoh_agents::probe::{ProbeEnv, ProbeError, RunLog, probe, run_status, tree_sha256};
 use hoh_core::schema;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -47,6 +47,7 @@ fn env_for(dir: &Path) -> ProbeEnv {
         path: format!("{}:/usr/bin:/bin", dir.display()).into(),
         fixture_root: Some(fixtures()),
         timeout: Duration::from_secs(30),
+        log: None,
     }
 }
 
@@ -191,6 +192,7 @@ fn probe_fails_cleanly_when_the_cli_is_missing() -> R {
         path: tmp.path().as_os_str().to_owned(),
         fixture_root: None,
         timeout: Duration::from_secs(5),
+        log: None,
     };
     assert!(probe(Agent::Pi, &env).is_err());
     Ok(())
@@ -204,6 +206,7 @@ fn probe_is_bounded_by_its_timeout() -> R {
         path: format!("{}:/usr/bin:/bin", dir.display()).into(),
         fixture_root: None,
         timeout: Duration::from_millis(500),
+        log: None,
     };
     let started = std::time::Instant::now();
     assert!(probe(Agent::Claude, &env).is_err());
@@ -463,5 +466,106 @@ fn method_branches_must_use_the_known_schema_form() -> R {
         }
     }
     assert!(accepted.is_empty(), "accepted: {accepted:?}");
+    Ok(())
+}
+
+/// Every command a probe runs is written down with its argv, exit code, duration and whether it timed out, in the
+/// order run (REQ-006: doctor lists them).
+#[test]
+fn the_run_log_lists_every_command_a_probe_ran() -> R {
+    let tmp = tempfile::tempdir()?;
+    let f = fixtures().join("codex/0.166.0");
+    let script = format!(
+        "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n exec) [ \"$2\" = --help ] && cat '{f}/help-exec.txt';;\n \
+         app-server) case \"$2\" in\n  --help) cat '{f}/help-app-server.txt';;\n  generate-json-schema) [ \"$3\" = --out ] && mkdir -p \"$4\" && cp -R '{f}/app-server-schema/.' \"$4/\";;\n  \
+         *) exit 2;;\n esac;;\n *) exit 2;;\nesac\n",
+        f = f.display()
+    );
+    let (dir, path) = fake(tmp.path(), "codex", "codex", &script)?;
+    let log: RunLog = Default::default();
+    let mut env = env_for(&dir);
+    env.log = Some(log.clone());
+    probe(Agent::Codex, &env)?;
+    let runs = log.lock().map_err(|_| "poisoned")?.clone();
+    let argv: Vec<Vec<String>> = runs.iter().map(|r| r.argv.clone()).collect();
+    let program = path.display().to_string();
+    assert_eq!(
+        argv.first(),
+        Some(&vec![program.clone(), "--version".to_owned()])
+    );
+    for args in [&["app-server", "--help"][..], &["exec", "--help"]] {
+        let want: Vec<String> = std::iter::once(program.clone())
+            .chain(args.iter().map(|a| (*a).to_owned()))
+            .collect();
+        assert!(argv.contains(&want), "{want:?} in {argv:?}");
+    }
+    assert!(
+        argv.iter().any(|a| a
+            .get(1..3)
+            .is_some_and(|w| w == ["app-server", "generate-json-schema"])),
+        "{argv:?}"
+    );
+    assert!(
+        runs.iter().all(|r| r.exit_code == Some(0) && !r.timed_out),
+        "{runs:?}"
+    );
+    Ok(())
+}
+
+/// A status command's output is captured on both streams (codex writes its login status to stderr); one that hangs
+/// is stopped at the timeout with its whole group, and the log says so.
+#[test]
+fn a_status_command_is_captured_on_both_streams_and_bounded() -> R {
+    let tmp = tempfile::tempdir()?;
+    let (dir, path) = fake(
+        tmp.path(),
+        "talk",
+        "codex",
+        "#!/bin/sh\necho out-text\necho err-text >&2\nexit 1\n",
+    )?;
+    let log: RunLog = Default::default();
+    let mut env = env_for(&dir);
+    env.log = Some(log.clone());
+    let out = run_status(&path, &["login", "status"], &env)?;
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.stdout, b"out-text\n");
+    assert_eq!(out.stderr, b"err-text\n");
+    let pidfile = tmp.path().join("child.pid");
+    let (_, slow) = fake(
+        tmp.path(),
+        "slow",
+        "codex",
+        &format!(
+            "#!/bin/sh\nsleep 60 & echo $! > '{}'\nwait\n",
+            pidfile.display()
+        ),
+    )?;
+    env.timeout = Duration::from_millis(500);
+    let started = std::time::Instant::now();
+    let hung = run_status(&slow, &["login", "status"], &env);
+    assert!(matches!(hung, Err(ProbeError::TimedOut { .. })), "{hung:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    let child = std::fs::read_to_string(&pidfile)?.trim().to_owned();
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        !Path::new(&format!("/proc/{child}")).exists(),
+        "the hung command's child {child} is still there"
+    );
+    let runs = log.lock().map_err(|_| "poisoned")?.clone();
+    assert_eq!(runs.len(), 2);
+    assert_eq!((runs[0].exit_code, runs[0].timed_out), (Some(1), false));
+    assert_eq!((runs[1].exit_code, runs[1].timed_out), (None, true));
+    assert_eq!(
+        runs[1].argv,
+        [
+            slow.display().to_string(),
+            "login".to_owned(),
+            "status".to_owned()
+        ]
+    );
     Ok(())
 }

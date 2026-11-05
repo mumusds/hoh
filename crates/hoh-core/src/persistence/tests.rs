@@ -1151,3 +1151,51 @@ fn allowed_values_are_read_from_the_schema() {
     assert_eq!(allowed_values("runs", "no_such_column"), None);
     assert_eq!(allowed_values("no_such_table", "state"), None);
 }
+
+/// `scratch_task` gives an empty scratch database (`hoh doctor --live`) a project, spec, RUNNING run and LEASED task
+/// to hang attempts on, and is refused, writing nothing, wherever a run exists: it never stands in for the command
+/// path of a real project.
+#[tokio::test]
+async fn a_scratch_task_is_only_for_an_empty_database() -> R {
+    let dir = tempfile::tempdir()?;
+    let store = Store::open(&db_in(&dir), test_options())?;
+    store.scratch_task("p1", "/repo", "R", "T1").await?;
+    store
+        .create_attempt(NewAttempt {
+            attempt_id: "A1".to_owned(),
+            task_id: "T1".to_owned(),
+            session_id: None,
+            role_epoch: 1,
+            host_epoch: 1,
+            config_revision: 0,
+            agent: Some("claude".to_owned()),
+        })
+        .await?;
+    let reader = store.reader()?;
+    let states: (String, String, i64) = reader.with(|c| {
+        Ok((
+            c.query_row("SELECT state FROM runs WHERE run_id = 'R'", [], |r| {
+                r.get(0)
+            })?,
+            c.query_row("SELECT state FROM tasks WHERE task_id = 'T1'", [], |r| {
+                r.get(0)
+            })?,
+            c.query_row("SELECT count(*) FROM attempts", [], |r| r.get(0))?,
+        ))
+    })?;
+    assert_eq!(states, ("RUNNING".to_owned(), "LEASED".to_owned(), 1));
+    let again = store.scratch_task("p2", "/other", "R2", "T2").await;
+    assert!(
+        matches!(again, Err(PersistError::NotScratch(_))),
+        "{again:?}"
+    );
+    let counts: (i64, i64, i64) = reader.with(|c| {
+        Ok((
+            c.query_row("SELECT count(*) FROM projects", [], |r| r.get(0))?,
+            c.query_row("SELECT count(*) FROM runs", [], |r| r.get(0))?,
+            c.query_row("SELECT count(*) FROM tasks", [], |r| r.get(0))?,
+        ))
+    })?;
+    assert_eq!(counts, (1, 1, 1), "nothing written by the refused call");
+    Ok(())
+}
