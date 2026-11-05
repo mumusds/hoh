@@ -63,12 +63,19 @@ impl History {
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let mut line = serde_json::to_vec(&serde_json::json!({ "text": text }))?;
-        line.push(b'\n');
         let mut file = std::fs::OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .open(&self.path)?;
+        // An unterminated last line (a crash mid-write, an edit by hand) gets its line break first, so this entry is
+        // a line of its own (M1T08R-02). Two shells doing this at once leave an empty line, which loading skips.
+        let mut line = Vec::new();
+        if !ends_with_newline(&mut file)? {
+            line.push(b'\n');
+        }
+        line.extend(serde_json::to_vec(&serde_json::json!({ "text": text }))?);
+        line.push(b'\n');
         file.write_all(&line)?;
         file.sync_data()?;
         self.entries.push(text.to_owned());
@@ -81,4 +88,16 @@ impl History {
             .iter()
             .rposition(|e| e.contains(query))
     }
+}
+
+/// The file is empty or its last byte is a line break.
+fn ends_with_newline(file: &mut std::fs::File) -> std::io::Result<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+    if file.metadata()?.len() == 0 {
+        return Ok(true);
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last)?;
+    Ok(last[0] == b'\n')
 }

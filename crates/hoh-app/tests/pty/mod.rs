@@ -19,8 +19,39 @@ pub type R<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 pub struct Pty {
     master: std::fs::File,
-    slave: OwnedFd,
+    /// `None` once dropped: the reader then ends with EIO when the program's copies are closed too.
+    slave: Option<OwnedFd>,
     output: Arc<Mutex<Vec<u8>>>,
+    reader: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for Pty {
+    /// Close the slave and collect the reader (it ends once no slave is open; given up after 2 s).
+    fn drop(&mut self) {
+        self.slave = None;
+        if let Some(reader) = self.reader.take() {
+            let started = Instant::now();
+            while !reader.is_finished() && started.elapsed() < Duration::from_secs(2) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if reader.is_finished() {
+                let _ = reader.join();
+            }
+        }
+    }
+}
+
+/// A started `hoh`: killed and reaped when dropped if it is still running, so a test that fails early leaves no
+/// process behind (M1T08R-04).
+pub struct Hoh(pub Child);
+
+impl Drop for Hoh {
+    fn drop(&mut self) {
+        if let Ok(None) = self.0.try_wait() {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
 }
 
 impl Pty {
@@ -47,7 +78,7 @@ impl Pty {
         let mut reader = master.try_clone()?;
         let output = Arc::new(Mutex::new(Vec::new()));
         let sink = output.clone();
-        std::thread::spawn(move || {
+        let reader = std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
             // Ends with EIO once every slave descriptor is closed.
             while let Ok(n @ 1..) = reader.read(&mut buf) {
@@ -58,14 +89,16 @@ impl Pty {
         });
         Ok(Pty {
             master,
-            slave,
+            slave: Some(slave),
             output,
+            reader: Some(reader),
         })
     }
 
     /// The slave side, for a child's stdin, stdout or stderr.
     pub fn stdio(&self) -> R<Stdio> {
-        Ok(Stdio::from(self.slave.try_clone()?))
+        let slave = self.slave.as_ref().ok_or("the PTY is closed")?;
+        Ok(Stdio::from(slave.try_clone()?))
     }
 
     /// `stty -g` of the terminal.
@@ -154,7 +187,7 @@ pub fn spawn_in(
     home: &Path,
     args: &[&str],
     env: &[(&str, &str)],
-) -> R<Child> {
+) -> R<Hoh> {
     let mut cmd = Command::new("setsid");
     cmd.arg("--ctty")
         .arg(env!("CARGO_BIN_EXE_hoh"))
@@ -170,11 +203,11 @@ pub fn spawn_in(
     for (k, v) in env {
         cmd.env(k, v);
     }
-    Ok(cmd.spawn()?)
+    Ok(Hoh(cmd.spawn()?))
 }
 
 /// The exit status of `child` within `timeout`; killed and an error otherwise.
-pub fn exit_within(child: &mut Child, timeout: Duration) -> R<ExitStatus> {
+pub fn exit_within(Hoh(child): &mut Hoh, timeout: Duration) -> R<ExitStatus> {
     let started = Instant::now();
     loop {
         if let Some(status) = child.try_wait()? {
@@ -190,7 +223,7 @@ pub fn exit_within(child: &mut Child, timeout: Duration) -> R<ExitStatus> {
 }
 
 /// Send `signal` to the process `child`.
-pub fn signal(child: &Child, signal: rustix::process::Signal) -> R {
+pub fn signal(Hoh(child): &Hoh, signal: rustix::process::Signal) -> R {
     let pid = rustix::process::Pid::from_child(child);
     rustix::process::kill_process(pid, signal)?;
     Ok(())

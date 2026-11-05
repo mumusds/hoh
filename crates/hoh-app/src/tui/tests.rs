@@ -263,3 +263,125 @@ fn a_long_input_keeps_its_end_and_the_cursor_on_screen() {
         assert!(cursor.x < 40);
     }
 }
+
+/// An insert that joins the graphemes around the cursor (a zero-width joiner between two emoji, M1T08R-03) leaves
+/// the cursor on a boundary of the whole text, so moving, deleting and drawing in a narrow editor stay safe.
+#[test]
+fn an_edit_that_joins_graphemes_keeps_the_cursor_on_a_boundary() {
+    let mut e = Editor::default();
+    e.insert("👩👩");
+    e.left();
+    e.insert("\u{200d}");
+    assert_eq!(e.text(), "👩\u{200d}👩");
+    assert_eq!(
+        e.cursor_column(),
+        e.text().width(),
+        "the cursor is after the joined grapheme"
+    );
+    for width in 0..8 {
+        let (shown, column) = e.view(width);
+        assert!(column <= shown.width());
+    }
+    e.backspace();
+    assert_eq!(e.text(), "", "one grapheme, one backspace");
+    // A delete that lets a combining mark join the letter before it: a zero-width space (a control) kept them apart.
+    e.insert("e\u{200b}\u{301}");
+    e.home();
+    e.right();
+    e.delete();
+    assert_eq!(e.text(), "e\u{301}");
+    assert_eq!(e.cursor_column(), 1);
+    let (shown, _) = e.view(1);
+    assert!(shown.is_empty() || shown == "e\u{301}");
+    e.left();
+    assert_eq!(e.cursor_column(), 0);
+}
+
+/// A history whose last line has no line break (a crash mid-write, an edit by hand) does not swallow the next entry
+/// (M1T08R-02).
+#[test]
+fn an_entry_after_an_unterminated_last_line_stays_its_own_line() {
+    for (tail, before) in [
+        ("{\"text\":\"a\"}", vec!["a"]),
+        ("{\"text\":\"trunc", vec![]),
+        ("garbage", vec![]),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join(".hoh/input-history.jsonl");
+        std::fs::create_dir_all(file.parent().expect("dir")).expect("dir");
+        std::fs::write(&file, tail).expect("write");
+        let mut h = History::load(dir.path());
+        h.append("b").expect("append");
+        let mut want: Vec<&str> = before.clone();
+        want.push("b");
+        assert_eq!(History::load(dir.path()).entries(), want, "after {tail:?}");
+    }
+}
+
+/// Restoring undoes each step still marked, the screen first; a step that fails stays marked, its error is returned,
+/// and the next call tries it again (M1T08R-01).
+#[test]
+fn a_restore_step_that_fails_is_reported_and_retried() {
+    use super::terminal::undo;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (screen, raw) = (AtomicBool::new(true), AtomicBool::new(true));
+    let order = std::cell::RefCell::new(Vec::new());
+    let failed = undo(
+        &screen,
+        || {
+            order.borrow_mut().push("screen");
+            Ok(())
+        },
+        &raw,
+        || {
+            order.borrow_mut().push("raw");
+            Err(std::io::Error::other("EIO"))
+        },
+    );
+    assert_eq!(failed.map_err(|e| e.to_string()), Err("EIO".to_owned()));
+    assert_eq!(*order.borrow(), ["screen", "raw"]);
+    assert!(!screen.load(Ordering::SeqCst), "done");
+    assert!(raw.load(Ordering::SeqCst), "still to undo");
+    let again = undo(
+        &screen,
+        || panic!("the screen is not left twice"),
+        &raw,
+        || Ok(()),
+    );
+    assert!(again.is_ok());
+    assert!(!raw.load(Ordering::SeqCst));
+    assert!(
+        undo(
+            &screen,
+            || panic!("nothing left"),
+            &raw,
+            || panic!("nothing left")
+        )
+        .is_ok()
+    );
+}
+
+/// The exit code and the message of each way out (ADR-014 decision 3): a restore that failed is 74 with a message
+/// unless a signal decided; a signal's code wins over a failing terminal.
+#[test]
+fn every_way_out_has_its_code_and_a_failed_restore_is_not_0() {
+    use super::{End, outcome};
+    let eio = || std::io::Error::other("EIO");
+    assert_eq!(outcome(Ok(End::Left(Exit::Detach)), Ok(()), 0), (0, None));
+    let (code, message) = outcome(Ok(End::Left(Exit::Detach)), Err(eio()), 0);
+    assert_eq!(code, 74);
+    assert!(message.is_some_and(|m| m.contains("EIO") && m.contains("stty sane")));
+    assert_eq!(outcome(Ok(End::Signal(15)), Ok(()), 15), (143, None));
+    let (code, message) = outcome(Ok(End::Signal(1)), Err(eio()), 1);
+    assert_eq!(code, 129);
+    assert!(message.is_some());
+    assert_eq!(
+        outcome(Err(eio()), Ok(()), 1).0,
+        129,
+        "a hangup also fails the terminal"
+    );
+    assert_eq!(outcome(Ok(End::Signal(2)), Ok(()), 2), (130, None));
+    let (code, message) = outcome(Err(eio()), Ok(()), 0);
+    assert_eq!(code, 74);
+    assert!(message.is_some_and(|m| m.contains("EIO")));
+}

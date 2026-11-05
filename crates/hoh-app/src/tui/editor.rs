@@ -25,6 +25,21 @@ impl Editor {
         let flat = text.replace("\r\n", " ").replace(['\r', '\n'], " ");
         self.text.insert_str(self.cursor, &flat);
         self.cursor += flat.len();
+        self.snap();
+    }
+
+    /// Move the cursor to the end of the grapheme it is in, if an edit joined graphemes around it (a zero-width
+    /// joiner, a combining mark; M1T08R-03): it is always on a boundary of the whole text.
+    fn snap(&mut self) {
+        if let Some(boundary) = self
+            .text
+            .grapheme_indices(true)
+            .map(|(i, _)| i)
+            .chain(std::iter::once(self.text.len()))
+            .find(|b| *b >= self.cursor)
+        {
+            self.cursor = boundary;
+        }
     }
 
     /// Replace the whole text, cursor at the end.
@@ -62,12 +77,14 @@ impl Editor {
         if let Some(start) = self.previous() {
             self.text.replace_range(start..self.cursor, "");
             self.cursor = start;
+            self.snap();
         }
     }
 
     pub fn delete(&mut self) {
         if let Some(end) = self.next() {
             self.text.replace_range(self.cursor..end, "");
+            self.snap();
         }
     }
 
@@ -103,7 +120,7 @@ impl Editor {
         let mut start = 0;
         let room = width.saturating_sub(1);
         while self.text[start..self.cursor].width() > room {
-            match self.text[start..].graphemes(true).next() {
+            match self.text[start..self.cursor].graphemes(true).next() {
                 Some(g) => start += g.len(),
                 None => break,
             }
