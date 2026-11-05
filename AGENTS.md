@@ -4,7 +4,7 @@
 
 1. Read CONTRACT.md (including CR-001) and docs/19-ai-development.md first; read the relevant requirements in contracts/requirements.json per task. These are adopted specifications; do not re-interview decisions that are already made.
 2. This kit is not the finished HoH product. The goal is to implement every requirement whose `release_targets` contains v1. v0.1 is an interim usable release, not the end point.
-3. Bootstrap phase (M0–M2): one main development session (Claude by default) plus an independent review session (Codex by default, via `tools/agent_task.py --role reviewer`). The product's default team is still Codex commander, Claude CTO/developer, Pi QA/researcher; roles are configurable.
+3. Bootstrap phase (M0–M2): one main development session (Claude by default) plus an independent review session (Codex by default, via `tools/agent_task.py --role reviewer`; Claude or Grok when Codex is unavailable, or as a second reviewer). The product's default team is still Codex commander, Claude CTO/developer, Pi QA/researcher; roles are configurable.
 4. Rust modular monolith; native agents first. No fourth coding agent and no outer infinite Python "continue" loop.
 5. Shell surface is only `hoh`, `hoh -p`, `attach`, `web`, `doctor`; `/plan` lives in the TUI. CLI and TUI share semantics, not a one-to-one command list.
 6. Run bootstrap, `scripts/check.sh --bundle` and preflight. Claim tasks with `tools/taskboard.py claim <id> --owner <session>` and work in small TDD/implement/test/review steps along the dependencies. Implementation tasks that depend on outline requirements are refused: run that milestone's spec task first.

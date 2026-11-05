@@ -22,7 +22,7 @@ Language: reply to and ask the user in Simplified Chinese; new documents under `
 - Rust: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`, `cargo deny --locked check licenses bans sources`.
 - Ledger: `python3 tools/taskboard.py next|claim <id> --owner main-dev|set <id> done --owner main-dev --note "<evidence paths>"`.
 - Candidate and checks: `python3 tools/candidate.py freeze --spec contracts/requirements.json --environment .hoh-dev/environment.json --test-plan tests/check-plan.json --out .hoh-dev/candidates/<id>.json`, then `python3 tools/run_check.py --check-id <check> --candidate-file … --out .hoh-dev/evidence/<id>/<check>` (fresh `--out` each run, no commits in between).
-- Independent review: `python3 tools/render_prompt.py --role reviewer --context <ctx.json> --output <prompt.md>` then `python3 tools/agent_task.py --agent codex --role reviewer --prompt-file <prompt.md>` (fresh Claude session if Codex is unavailable). Under run_check add `--report-out "$HOH_EVIDENCE_DIR/independent-report.json"`.
+- Independent review: `python3 tools/render_prompt.py --role reviewer --context <ctx.json> --output <prompt.md>` then `python3 tools/agent_task.py --agent codex --role reviewer --prompt-file <prompt.md>`. `--agent` is codex, claude, pi or grok: when Codex is unavailable (for example "model at capacity"), use a fresh Claude or Grok session; a second independent reviewer of another agent may run on the same candidate in parallel. Under run_check add `--report-out "$HOH_EVIDENCE_DIR/independent-report.json"`.
 - Baseline change: write `docs/cr/CR-00N-*.md` → edit locked files → `python3 tools/gen_spec_views.py` → `python3 tools/baseline.py relock --cr <cr> [--amend] [--add <new contract>]` → bundle check.
 
 ## Engineering rules
@@ -47,7 +47,7 @@ Language: reply to and ask the user in Simplified Chinese; new documents under `
 
 ## Autonomy and consent (owner decision, 2026-11-03)
 
-Authorized: YOLO work in this VM; `sudo -n` for development/test infrastructure; pushing task branches, opening PRs and merging them after green CI plus a passing independent review; approving refinement CRs under CR-003 D1 (docs/21); spending the existing Codex/Claude/Pi subscription quota on reviews, QA, live checks and the soak.
+Authorized: YOLO work in this VM; `sudo -n` for development/test infrastructure; pushing task branches, opening PRs and merging them after green CI plus a passing independent review; approving refinement CRs under CR-003 D1 (docs/21); spending the existing Codex/Claude/Pi/Grok subscription quota on reviews, QA, live checks and the soak (owner, 2026-11-05: all four are full subscriptions with ample quota; plan the agents to work together, e.g. parallel independent reviewers and QA, and fall back from one to another on capacity errors).
 Still ask the owner first (do the independent work meanwhile): reducing scope, lowering any gate or threshold, changing CONTRACT architecture or interaction decisions, paid API or other external costs, force-push or rewriting published history, deleting data git cannot restore, publishing packages.
 
 ## Do not

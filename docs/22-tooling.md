@@ -22,6 +22,7 @@ Pi 插件由 `tools/install_pi_plugins.py` 安装：只要 Pi 支持就带 `--ap
 source .hoh-dev/env.sh
 python3 tools/render_prompt.py --role reviewer --context .hoh-dev/review-context.json --output .hoh-dev/reviewer-prompt.md
 python3 tools/agent_task.py --agent codex --role reviewer --prompt-file .hoh-dev/reviewer-prompt.md --timeout 3600
+# --agent 可选 codex、claude、pi、grok；grok 以无头单轮方式运行（--prompt-file /dev/stdin --output-format streaming-messages-json --always-approve）
 ```
 
 真实任务必须引用当前 REQ 与候选，不能拿示例上下文验收。桥会探测实际 help（按整词匹配参数），记录 CLI 版本、会话 id 和解析出的模型，不把聊天中的“完成”当最终成功。Pi 的 JSON 单次进程退出，不能替代产品 Pi RPC 中对 `agent_settled` 的协商。
