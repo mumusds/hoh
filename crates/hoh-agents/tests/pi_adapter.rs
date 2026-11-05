@@ -268,10 +268,11 @@ async fn the_session_has_the_capabilities_the_probe_found() -> R {
         ("resume", false),
         ("mid_turn_steer", false),
         ("ui_dialogs", false),
-        ("agent_settled", true),
     ] {
         assert_eq!(caps[name], json!(value), "{name}: {caps}");
     }
+    // Whether pi emits agent_settled is the adapter's own setting, not a probed capability (M1T04R-13).
+    assert!(caps.get("agent_settled").is_none(), "{caps}");
     let granted = hoh_core::decision::granted_capabilities(&caps);
     assert!(
         !granted.contains("resume") && !granted.contains("mid_turn_steer"),

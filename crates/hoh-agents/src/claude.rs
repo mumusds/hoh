@@ -65,7 +65,7 @@ pub struct Blocked(pub String);
 pub struct Argv {
     pub args: Vec<String>,
     /// The session row's capabilities: the probed ones, `partial_messages` and `resume` no more than the help
-    /// offers (M1R-01).
+    /// offers, no steer and no dialogs (M1R-01).
     pub capabilities: Value,
 }
 
@@ -110,7 +110,14 @@ pub fn argv(launch: &Launch) -> Result<Argv, Blocked> {
         args,
         capabilities: crate::capabilities::of_session(
             &launch.capabilities,
-            &[("partial_messages", partial), ("resume", resume)],
+            // One prompt on stdin, then stdin closes: no steer reaches a running turn, and nobody answers a dialog
+            // (M1T04R-12).
+            &[
+                ("partial_messages", partial),
+                ("resume", resume),
+                ("mid_turn_steer", false),
+                ("ui_dialogs", false),
+            ],
         ),
     })
 }

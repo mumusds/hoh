@@ -418,7 +418,7 @@ async fn test_025_02_failed_turns_and_missing_flags() -> R {
 /// Each non-JSON line is its own diagnostic event; the result frame still decides the end.
 /// The session row records what the probe found, never more than this claude's help offers: a probe that found no
 /// resume makes a session without it although the help has `--resume`, and partial messages the help does not offer
-/// are no capability whatever the probe said (M1R-01, REQ-027).
+/// are no capability whatever the probe said (M1R-01, REQ-027); no steer and no dialog whatever was probed.
 #[tokio::test]
 async fn the_session_has_the_capabilities_the_probe_found() -> R {
     let world = World::new()?;
@@ -428,6 +428,8 @@ async fn the_session_has_the_capabilities_the_probe_found() -> R {
         ("structured_events", true),
         ("partial_messages", true),
         ("resume", false),
+        ("mid_turn_steer", true),
+        ("ui_dialogs", true),
     ]);
     turn.launch.help = turn.launch.help.replace(PARTIAL_FLAG, "");
     let attempt = world.attempt("A1").await?;
@@ -446,6 +448,13 @@ async fn the_session_has_the_capabilities_the_probe_found() -> R {
             &caps["partial_messages"]
         ),
         (&json!(true), &json!(false), &json!(false)),
+        "{caps}"
+    );
+    // One prompt on stdin, then stdin closes: nothing reaches a running turn, and nobody answers a dialog
+    // (M1T04R-12).
+    assert_eq!(
+        (&caps["mid_turn_steer"], &caps["ui_dialogs"]),
+        (&json!(false), &json!(false)),
         "{caps}"
     );
     assert_eq!(
