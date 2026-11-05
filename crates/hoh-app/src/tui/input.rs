@@ -255,7 +255,8 @@ fn csi(buf: &[u8]) -> Front {
     Front::Unfinished
 }
 
-/// The key a complete CSI names, with the modifiers of its second parameter (`1;5C` is Ctrl+Right).
+/// The key a complete CSI names, with the modifiers and event type of its second parameter (`1;5C` is Ctrl+Right,
+/// `1;5:3C` its release). The event type is a number, as in crossterm (M1T08R-28).
 fn csi_key(params: &[u8], fin: u8) -> Option<Event> {
     let text = std::str::from_utf8(params).ok()?;
     let mut fields = text.split(';');
@@ -265,12 +266,12 @@ fn csi_key(params: &[u8], fin: u8) -> Option<Event> {
         .next()
         .and_then(|m| m.parse::<u8>().ok())
         .map_or(KeyModifiers::NONE, modifiers);
+    let kind = match second.next().and_then(|k| k.parse::<u8>().ok()) {
+        Some(2) => KeyEventKind::Repeat,
+        Some(3) => KeyEventKind::Release,
+        _ => KeyEventKind::Press,
+    };
     if fin == b'u' {
-        let kind = match second.next() {
-            Some("2") => KeyEventKind::Repeat,
-            Some("3") => KeyEventKind::Release,
-            _ => KeyEventKind::Press,
-        };
         return csi_u(first, modifiers, kind);
     }
     let code = match fin {
@@ -292,7 +293,7 @@ fn csi_key(params: &[u8], fin: u8) -> Option<Event> {
         },
         _ => return None,
     };
-    Some(key(code, modifiers))
+    Some(Event::Key(KeyEvent::new_with_kind(code, modifiers, kind)))
 }
 
 /// `CSI codepoint[:alternates] ; modifiers[:event type] u` (fixterms and the kitty keyboard protocol; kitty sends it
@@ -301,6 +302,8 @@ fn csi_key(params: &[u8], fin: u8) -> Option<Event> {
 fn csi_u(first: &str, mut modifiers: KeyModifiers, kind: KeyEventKind) -> Option<Event> {
     let mut codepoints = first.split(':');
     let codepoint: u32 = codepoints.next()?.parse().ok()?;
+    // The key's own codepoint must be a character, whatever its alternate (M1T08R-29).
+    let base = char::from_u32(codepoint)?;
     if (0xe000..=0xf8ff).contains(&codepoint) {
         return None;
     }
@@ -318,7 +321,7 @@ fn csi_u(first: &str, mut modifiers: KeyModifiers, kind: KeyEventKind) -> Option
             kind,
         )));
     }
-    let code = match char::from_u32(codepoint)? {
+    let code = match base {
         '\x1b' => KeyCode::Esc,
         '\r' => KeyCode::Enter,
         '\t' if modifiers.contains(KeyModifiers::SHIFT) => KeyCode::BackTab,
@@ -610,6 +613,48 @@ mod tests {
         );
         // kitty's own functional keys (private use codepoints) are not keys the Workspace uses.
         assert_eq!(all(b"\x1b[57399ux", false), [k(KeyCode::Char('x'), N)]);
+    }
+
+    /// The event type after the modifiers (`:2` repeat, `:3` release) is a number on every CSI key, as in
+    /// crossterm: a released key is not pressed again (M1T08R-28).
+    #[test]
+    fn the_event_type_of_any_csi_key_is_read_as_a_number() {
+        use ratatui::crossterm::event::KeyEventKind::{Press, Release, Repeat};
+        let raw: Vec<_> = all(
+            b"\x1b[99;5:03u\x1b[3;1:3~\x1b[1;1:2A\x1b[1;5:3C\x1b[3;5~\x1b[1;3D",
+            false,
+        )
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::Key(key) => Some((key.code, key.modifiers, key.kind)),
+            _ => None,
+        })
+        .collect();
+        assert_eq!(
+            raw,
+            [
+                (KeyCode::Char('c'), KeyModifiers::CONTROL, Release),
+                (KeyCode::Delete, N, Release),
+                (KeyCode::Up, N, Repeat),
+                (KeyCode::Right, KeyModifiers::CONTROL, Release),
+                (KeyCode::Delete, KeyModifiers::CONTROL, Press),
+                (KeyCode::Left, KeyModifiers::ALT, Press),
+            ]
+        );
+    }
+
+    /// A CSI u whose codepoint is no Unicode scalar value is no key, whatever its alternate (M1T08R-29).
+    #[test]
+    fn an_invalid_csi_u_codepoint_is_no_key_even_with_an_alternate() {
+        for bad in [
+            &b"\x1b[55296:65;2ux"[..],
+            b"\x1b[1114112:65;2ux",
+            b"\x1b[4294967295:65;2ux",
+            b"\x1b[99999999999:65;2ux",
+            b"\x1b[55296ux",
+        ] {
+            assert_eq!(all(bad, false), [k(KeyCode::Char('x'), N)], "{bad:?}");
+        }
     }
 
     /// Alt and a character arriving in pieces waits for its rest as the character alone does, past any idle wait
