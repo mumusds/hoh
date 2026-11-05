@@ -401,6 +401,8 @@ impl std::io::Write for Flaky {
 
 /// The control sequences a VT-style parser carries out from `bytes` (test oracle): ESC starts a sequence, aborting
 /// one under way; CAN aborts; a CSI ends at its final byte (0x40..=0x7e); other bytes in the ground state are text.
+/// It models only what the shell sends, CSI sequences and the ground state; OSC and DCS, where terminals differ on
+/// CAN, are not modelled and the shell sends none (M1T08R-11).
 fn carried_out(bytes: &[u8]) -> Vec<String> {
     enum State {
         Ground,
@@ -561,4 +563,46 @@ fn every_way_out_has_its_code_and_a_failed_restore_is_not_0() {
     let (code, message) = outcome(Ok(End::Left(Exit::Detach)), Err(eio()), 1);
     assert_eq!(code, 129);
     assert!(message.is_some_and(|m| m.contains("stty sane")));
+}
+
+/// Every frame gives ratatui a cursor position, the open choice included, so ratatui never hides the cursor and has
+/// nothing to show again when it is dropped. Its drop would write that outside the restore's care and print a failure
+/// straight to stderr (M1T08R-10). The restore shows the cursor in any case.
+#[test]
+fn the_cursor_is_never_hidden_by_ratatui() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut app = app_in(dir.path());
+    let mut terminal = Terminal::new(TestBackend::new(60, 12)).expect("terminal");
+    terminal.draw(|f| app.draw(f)).expect("draw");
+    assert!(terminal.backend().cursor_visible());
+    app.key(ctrl('c'));
+    terminal.draw(|f| app.draw(f)).expect("draw");
+    assert!(terminal.backend().cursor_visible(), "with the choice open");
+    let rows = screen(&app, 60, 12);
+    let at = terminal.get_cursor_position().expect("cursor");
+    assert!(
+        rows[usize::from(at.y)].contains("脱离"),
+        "on the selected choice: {at:?}"
+    );
+}
+
+/// A frame cut short leaves the terminal inside one of its sequences: `settle` then ends it with a CAN before a
+/// diagnostic; a frame that went out leaves nothing to end (M1T08R-10).
+#[test]
+fn a_frame_cut_short_is_ended_before_a_diagnostic() {
+    use super::terminal::{Output, Steps, settle_on};
+    use std::io::Write;
+    let steps = Steps::new();
+    let mut out = Output::over(Flaky::new(3), &steps);
+    out.write_all(b"\x1b[2;5Hhello").expect("buffered");
+    out.inner_mut().fail_at = vec![3];
+    assert!(out.flush().is_err());
+    let mut tty = Flaky::new(64);
+    settle_on(&mut tty, &steps);
+    assert_eq!(tty.out, b"\x18");
+    out.write_all(b"\x1b[3;1Hok").expect("buffered");
+    out.flush().expect("the next frame goes out");
+    let mut tty = Flaky::new(64);
+    settle_on(&mut tty, &steps);
+    assert_eq!(tty.out, b"", "nothing left open");
 }
