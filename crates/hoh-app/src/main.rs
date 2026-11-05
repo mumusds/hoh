@@ -1,7 +1,7 @@
 //! `hoh` binary (REQ-003, REQ-004): parses the command line, answers help and version, and refuses a usage error with
-//! exit 64 before touching anything (no host, no `.hoh/`, no database, stdout empty). The commands themselves arrive
-//! with later tasks; until then each reports NOT_IMPLEMENTED on stderr and exits 3, so no script can mistake the
-//! binary for a working product.
+//! exit 64 before touching anything (no host, no `.hoh/`, no database, stdout empty). Bare `hoh` opens the TUI shell
+//! (`tui`, M1-T08). The other commands arrive with later tasks; until then each reports NOT_IMPLEMENTED on stderr and
+//! exits 3, so no script can mistake the binary for a working product.
 
 // No SQLite outside hoh-core::persistence (AC-062-05; see clippy.toml), and no unsafe code (no FFI way around it).
 #![forbid(clippy::disallowed_methods)]
@@ -10,11 +10,12 @@
 mod cli;
 mod exit;
 mod help;
+mod tui;
 
 use cli::Invocation;
 use exit::{ClientEvent, Ending};
 use std::ffi::OsString;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::Path;
 
 fn main() {
@@ -56,6 +57,24 @@ fn project(invocation: &Invocation) -> Option<&Path> {
     }
 }
 
+/// Bare `hoh`: the TUI only with a terminal on both stdin and stdout (REQ-001); otherwise a usage error that reads
+/// nothing and writes only stderr.
+fn workspace(project: Option<&Path>) -> u8 {
+    if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+        return refuse(
+            "hoh 只在 stdin 与 stdout 都是终端时打开 TUI 工作区；非交互运行请用 hoh -p '<文本>'",
+        );
+    }
+    let dir = match project {
+        Some(dir) => dir.to_path_buf(),
+        None => match std::env::current_dir() {
+            Ok(dir) => dir,
+            Err(e) => return refuse(&format!("无法确定当前目录：{e}")),
+        },
+    };
+    tui::run(&dir.canonicalize().unwrap_or(dir))
+}
+
 fn run(args: &[OsString]) -> u8 {
     let invocation = match cli::parse(args) {
         Ok(invocation) => invocation,
@@ -70,7 +89,7 @@ fn run(args: &[OsString]) -> u8 {
     let what = match invocation {
         Invocation::Help { topic, .. } => return print(help::text(topic)),
         Invocation::Version => return print(&help::version()),
-        Invocation::Workspace { .. } => "TUI 工作区（hoh）",
+        Invocation::Workspace { project } => return workspace(project.as_deref()),
         Invocation::Prompt { .. } => "非交互运行（hoh -p）",
         Invocation::Attach { .. } => "hoh attach",
         Invocation::Web { .. } => "hoh web",
