@@ -143,6 +143,11 @@ impl Sandbox {
     }
 
     fn pi(&self, status: Status) -> R {
+        self.pi_listing(status, "echo 'No packages installed.'")
+    }
+
+    /// A pi whose `list` runs `list` (shell).
+    fn pi_listing(&self, status: Status, list: &str) -> R {
         let help = fixtures().join("pi/1.5.0/help.txt");
         let answer = self.status(
             status,
@@ -153,7 +158,7 @@ impl Sandbox {
             "pi",
             &format!(
                 "#!/bin/sh\ncase \"$1\" in\n --version) echo '1.5.0';;\n --help) cat '{}';;\n \
-                 auth) if [ \"$2\" = check ]; then\n{answer}fi;;\n list) echo 'No packages installed.';;\n *) exit 2;;\nesac\n",
+                 auth) if [ \"$2\" = check ]; then\n{answer}fi;;\n list) {list};;\n *) exit 2;;\nesac\n",
                 help.display()
             ),
         )
@@ -170,6 +175,7 @@ impl Sandbox {
             fixture_root: Some(fixtures()),
             timeout: Duration::from_secs(30),
             log: None,
+            deadline: None,
         };
         let mut entries = BTreeMap::new();
         for agent in agents {
@@ -447,6 +453,166 @@ fn test_006_02_credentials_are_never_read_or_shown() -> R {
                 );
             }
         }
+    }
+    Ok(())
+}
+
+/// One shared limit for every command (M1T07R-02): a pi whose status hangs and whose `list` is slow, and a node whose
+/// `--version` hangs, still let doctor end within the limit + 5 s. A tool that does not answer is unknown, not
+/// incompatible, so it blocks nothing (M1T07R-03).
+#[test]
+fn slow_and_hung_commands_share_one_limit_and_stay_unknown() -> R {
+    let s = Sandbox::new()?;
+    s.codex(Status::LoggedIn)?;
+    s.claude(Status::LoggedIn)?;
+    s.pi_listing(Status::Hangs, "sleep 6; echo 'No packages installed.'")?;
+    s.write("node", "#!/bin/sh\nsleep 60\n")?;
+    s.register(&[Agent::Codex, Agent::Pi])?;
+    // A claude whose probe commands, run one after another, take 14 s each: 28 s without one shared limit.
+    let help = fixtures().join("claude/2.1.318/help.txt");
+    s.write(
+        "claude",
+        &format!(
+            "#!/bin/sh\ncase \"$1\" in\n --version) sleep 14; echo '2.1.318 (Claude Code)';;\n --help) sleep 14; cat '{}';;\n \
+             auth) echo '{{\"loggedIn\": true}}';;\n *) exit 2;;\nesac\n",
+            help.display()
+        ),
+    )?;
+    let (out, report, took) = s.doctor()?;
+    assert!(took <= Duration::from_secs(25), "doctor took {took:?}");
+    assert_eq!(
+        report["agents"]["claude"]["protocol"], "unknown",
+        "{}",
+        report["agents"]["claude"]
+    );
+    assert_eq!(report["agents"]["pi"]["auth_check"], "unknown");
+    let node = &report["runtime"]["node"];
+    assert_eq!(
+        (node["installed"].as_bool(), node["protocol"].as_str()),
+        (Some(true), Some("unknown")),
+        "{node}"
+    );
+    assert!(
+        node["detail"].as_str().is_some_and(|d| !d.is_empty()),
+        "{node}"
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", report["summary"]);
+    assert!(
+        processes_mentioning(s.bin.path()).is_empty(),
+        "a hung command is still there"
+    );
+    Ok(())
+}
+
+/// The text form carries what the JSON carries for each agent: path, binary sha256, protocol, auth and capabilities
+/// (M1T07R-05).
+#[test]
+fn the_text_form_shows_each_agents_fields() -> R {
+    let s = Sandbox::new()?;
+    s.codex(Status::LoggedIn)?;
+    s.claude(Status::LoggedIn)?;
+    s.pi(Status::LoggedIn)?;
+    s.register(&[Agent::Codex, Agent::Claude, Agent::Pi])?;
+    let (_, report, _) = s.doctor()?;
+    let (out, _) = s.doctor_in(&[], &["--output", "text"], &[])?;
+    let text = String::from_utf8(out.stdout)?;
+    for agent in ["codex", "claude", "pi"] {
+        let item = &report["agents"][agent];
+        for field in ["path", "binary_sha256", "version", "protocol", "auth_check"] {
+            let value = item[field].as_str().ok_or(format!("{agent}.{field}"))?;
+            assert!(
+                text.contains(value),
+                "{agent}.{field} {value:?} not in the text:\n{text}"
+            );
+        }
+        for (capability, _) in item["capabilities"].as_object().ok_or("capabilities")? {
+            assert!(
+                text.contains(capability.as_str()),
+                "{agent}: capability {capability} not in the text"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `.hoh` taken by a file or a dangling link cannot hold the project's state: not writable, with why (M1T07R-06).
+#[test]
+fn a_hoh_that_is_not_a_directory_is_reported_unusable() -> R {
+    for kind in ["file", "dangling link"] {
+        let s = Sandbox::new()?;
+        s.codex(Status::LoggedIn)?;
+        s.claude(Status::LoggedIn)?;
+        s.pi(Status::LoggedIn)?;
+        let hoh = s.project.path().join(".hoh");
+        match kind {
+            "file" => std::fs::write(&hoh, "x")?,
+            _ => std::os::unix::fs::symlink(s.project.path().join("gone"), &hoh)?,
+        }
+        let (_, report, _) = s.doctor()?;
+        let dir = &report["runtime"]["project_hoh"];
+        assert_eq!(
+            (dir["exists"].as_bool(), dir["writable"].as_bool()),
+            (Some(true), Some(false)),
+            "{kind}: {dir}"
+        );
+        assert!(
+            dir["detail"].as_str().is_some_and(|d| !d.is_empty()),
+            "{kind}: {dir}"
+        );
+        assert!(
+            report["summary"]["warnings"].as_array().is_some_and(|w| w
+                .iter()
+                .any(|x| x.as_str().is_some_and(|x| x.contains(".hoh")))),
+            "{kind}: {}",
+            report["summary"]
+        );
+    }
+    Ok(())
+}
+
+/// `--live` drives a codex that only has exec through exec (M1T07R-04): no app-server schema is asked for, the turn
+/// runs and its attempt ends. The recorded reply has no token, so the login stays unknown; no model is called.
+#[test]
+fn live_drives_an_exec_only_codex_through_exec() -> R {
+    let s = Sandbox::new()?;
+    let f = fixtures().join("codex/0.166.0");
+    s.write(
+        "codex",
+        &format!(
+            "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n \
+             exec) if [ \"$2\" = --help ]; then cat '{f}/help-exec.txt'; elif [ \"$2\" = resume ]; then echo 'Usage: codex exec resume --json'; \
+             else cat > /dev/null; cat '{f}/exec/stdout.jsonl'; fi;;\n \
+             login) echo 'Logged in using ChatGPT' >&2;;\n *) echo \"error: unrecognized subcommand '$1'\" >&2; exit 2;;\nesac\n",
+            f = f.display()
+        ),
+    )?;
+    let (out, _) = s.doctor_in(&[], &["--live", "--output", "json"], &[])?;
+    let report: Value = serde_json::from_slice(&out.stdout)?;
+    let live = &report["agents"]["codex"]["live"];
+    assert!(live["error"].is_null(), "the live turn did not run: {live}");
+    assert_eq!(live["state"], "SETTLED", "{live}");
+    assert_eq!(live["stored"]["state"], "SETTLED", "{live}");
+    assert_eq!(
+        report["agents"]["codex"]["auth_check"], "unknown",
+        "the recorded reply has no token"
+    );
+    let argv: Vec<String> = report["probes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|p| p["argv"].to_string())
+        .collect();
+    assert!(
+        !argv.iter().any(|a| a.contains("generate-json-schema")),
+        "{argv:?}"
+    );
+    // The scratch directory doctor kept for the logs.
+    if let Some(scratch) = live["logs"]
+        .as_str()
+        .and_then(|logs| Path::new(logs).parent())
+        .and_then(Path::parent)
+    {
+        let _ = std::fs::remove_dir_all(scratch);
     }
     Ok(())
 }

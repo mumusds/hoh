@@ -48,6 +48,7 @@ fn env_for(dir: &Path) -> ProbeEnv {
         fixture_root: Some(fixtures()),
         timeout: Duration::from_secs(30),
         log: None,
+        deadline: None,
     }
 }
 
@@ -193,6 +194,7 @@ fn probe_fails_cleanly_when_the_cli_is_missing() -> R {
         fixture_root: None,
         timeout: Duration::from_secs(5),
         log: None,
+        deadline: None,
     };
     assert!(probe(Agent::Pi, &env).is_err());
     Ok(())
@@ -207,6 +209,7 @@ fn probe_is_bounded_by_its_timeout() -> R {
         fixture_root: None,
         timeout: Duration::from_millis(500),
         log: None,
+        deadline: None,
     };
     let started = std::time::Instant::now();
     assert!(probe(Agent::Claude, &env).is_err());
@@ -566,6 +569,28 @@ fn a_status_command_is_captured_on_both_streams_and_bounded() -> R {
             "login".to_owned(),
             "status".to_owned()
         ]
+    );
+    Ok(())
+}
+
+/// With a shared deadline, each command gets only the time left before it, so slow commands one after another end
+/// together within the deadline, not one timeout each (REQ-006: doctor ends within its limit + 5 s).
+#[test]
+fn a_shared_deadline_bounds_commands_run_one_after_another() -> R {
+    let tmp = tempfile::tempdir()?;
+    let (dir, slow) = fake(tmp.path(), "slow", "codex", "#!/bin/sh\nexec sleep 30\n")?;
+    let mut env = env_for(&dir);
+    env.timeout = Duration::from_secs(30);
+    let started = std::time::Instant::now();
+    env.deadline = Some(started + Duration::from_secs(1));
+    for _ in 0..3 {
+        let hung = run_status(&slow, &["login", "status"], &env);
+        assert!(matches!(hung, Err(ProbeError::TimedOut { .. })), "{hung:?}");
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
     );
     Ok(())
 }

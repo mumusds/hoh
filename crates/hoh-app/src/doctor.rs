@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The limit of each external command (REQ-006).
 const TIMEOUT: Duration = Duration::from_secs(20);
@@ -57,32 +57,44 @@ fn tool(name: &str, env: &ProbeEnv, minimum: Option<(u64, u64)>) -> Tool {
             installed: false,
             path: None,
             version: None,
-            ok: false,
+            protocol: Protocol::Unknown,
             detail: Some(format!("{name} 未安装")),
         };
     };
-    let version = probe::run_status(&path, &["--version"], env)
-        .ok()
-        .filter(|out| out.status.success())
-        .and_then(|out| {
+    // Only a version known to be too old is incompatible; one that cannot be read is unknown (M1T07R-03).
+    let (version, unread) = match probe::run_status(&path, &["--version"], env) {
+        Ok(out) if out.status.success() => (
             String::from_utf8_lossy(&out.stdout)
                 .lines()
                 .next()
-                .map(str::to_owned)
-        });
-    let (ok, detail) = match (minimum, version.as_deref()) {
-        (_, None) => (false, Some(format!("{name} --version 没有给出版本"))),
-        (None, Some(_)) => (true, None),
+                .map(str::to_owned),
+            format!("{name} --version 没有给出版本"),
+        ),
+        Ok(out) => (None, format!("{name} --version 以 {} 结束", out.status)),
+        Err(probe::ProbeError::TimedOut { after, .. }) => (
+            None,
+            format!("{name} --version {after:?} 内没有结束，已终止"),
+        ),
+        Err(e) => (None, format!("{name} --version 无法运行：{e}")),
+    };
+    let (protocol, detail) = match (minimum, version.as_deref()) {
+        (_, None) => (Protocol::Unknown, Some(unread)),
+        (None, Some(_)) => (Protocol::Compatible, None),
         (Some((major, minor)), Some(v)) => {
             let mut parts = v
                 .trim_start_matches('v')
                 .split('.')
                 .map(|p| p.parse::<u64>().ok());
             match (parts.next().flatten(), parts.next().flatten()) {
-                (Some(a), Some(b)) if (a, b) >= (major, minor) => {
-                    (true, Some(format!("需要 ≥ {major}.{minor}")))
-                }
-                _ => (false, Some(format!("需要 ≥ {major}.{minor}（pi 需要）"))),
+                (Some(a), Some(b)) if (a, b) >= (major, minor) => (
+                    Protocol::Compatible,
+                    Some(format!("需要 ≥ {major}.{minor}")),
+                ),
+                (Some(_), Some(_)) => (
+                    Protocol::Incompatible,
+                    Some(format!("需要 ≥ {major}.{minor}（pi 需要）")),
+                ),
+                _ => (Protocol::Unknown, Some(format!("无法从 {v:?} 读出版本"))),
             }
         }
     };
@@ -90,7 +102,7 @@ fn tool(name: &str, env: &ProbeEnv, minimum: Option<(u64, u64)>) -> Tool {
         installed: true,
         path: Some(path.display().to_string()),
         version,
-        ok,
+        protocol,
         detail,
     }
 }
@@ -129,20 +141,33 @@ fn plugins(pi: Option<&str>, env: &ProbeEnv) -> Vec<Plugin> {
         .collect()
 }
 
-/// The project's `.hoh/`: it exists and can be written, or the nearest existing directory above it can.
+/// The project's `.hoh/`: a directory that can be written, or nothing yet in a project that can be (M1T07R-06). A
+/// file, or a link that leads nowhere or to a file, in its place cannot hold the project's state.
 fn hoh_dir(project: &Path) -> HohDir {
     let path = project.join(".hoh");
-    let exists = path.is_dir();
-    let probe_at = if exists {
-        path.clone()
-    } else {
-        project.to_path_buf()
+    let writable = |dir: &Path| rustix::fs::access(dir, rustix::fs::Access::WRITE_OK).is_ok();
+    let (exists, ok, detail) = match std::fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (false, writable(project), None),
+        Err(e) => (true, false, Some(format!("无法查看：{e}"))),
+        Ok(_) => match std::fs::metadata(&path) {
+            Ok(meta) if meta.is_dir() => (true, writable(&path), None),
+            Ok(_) => (
+                true,
+                false,
+                Some("这里是文件，不是目录；移走它后 HoH 才能保存状态".to_owned()),
+            ),
+            Err(_) => (
+                true,
+                false,
+                Some("这里是指向不存在位置的符号链接；移走它后 HoH 才能保存状态".to_owned()),
+            ),
+        },
     };
-    let writable = rustix::fs::access(&probe_at, rustix::fs::Access::WRITE_OK).is_ok();
     HohDir {
         path: path.display().to_string(),
         exists,
-        writable,
+        writable: ok,
+        detail,
     }
 }
 
@@ -174,17 +199,28 @@ fn summary(
     for (name, t) in [("git", &runtime.git), ("node", &runtime.node)] {
         if !t.installed {
             blocking.push(format!("{name} 未安装"));
-        } else if !t.ok {
+        } else if t.protocol == Protocol::Incompatible {
             blocking.push(format!(
                 "{name} protocol=incompatible（{}）",
                 t.detail.as_deref().unwrap_or("版本不符")
+            ));
+        } else if t.protocol == Protocol::Unknown {
+            warnings.push(format!(
+                "{name} 的版本未能确认：{}",
+                t.detail.as_deref().unwrap_or("原因未知")
             ));
         }
     }
     if !runtime.project_hoh.writable {
         warnings.push(format!(
-            "{} 不可写：HoH 无法保存本项目的状态",
-            runtime.project_hoh.path
+            "{} 不可写：HoH 无法保存本项目的状态{}",
+            runtime.project_hoh.path,
+            runtime
+                .project_hoh
+                .detail
+                .as_deref()
+                .map(|d| format!("（{d}）"))
+                .unwrap_or_default()
         ));
     }
     if runtime.pi_plugins.iter().any(|p| p.listed == Some(false)) {
@@ -209,6 +245,8 @@ fn examine(project: &Path, live: bool) -> Report {
         fixture_root: None,
         timeout: TIMEOUT,
         log: Some(log.clone()),
+        // One limit for all commands, also those run one after another (M1T07R-02).
+        deadline: Some(Instant::now() + TIMEOUT),
     };
     let (manifest, warning) = manifest(project);
     let mut warnings: Vec<String> = warning.into_iter().collect();
@@ -220,20 +258,22 @@ fn examine(project: &Path, live: bool) -> Report {
         };
         let codex = probe_agent(Agent::Codex);
         let claude = probe_agent(Agent::Claude);
-        let pi = scope.spawn(|| {
-            let item = assess::agent(Agent::Pi, &env, manifest.as_ref());
-            let plugins = plugins(item.path.as_deref().filter(|_| item.installed), &env);
-            (item, plugins)
+        let pi = probe_agent(Agent::Pi);
+        // Alongside pi's probe, not after it (M1T07R-02).
+        let pi_plugins = scope.spawn(|| {
+            let launcher = probe::find_on_path("pi", &env.path);
+            plugins(launcher.as_deref().and_then(Path::to_str), &env)
         });
         let git = scope.spawn(|| tool("git", &env, None));
         let node = scope.spawn(|| tool("node", &env, Some((22, 19))));
         let lost = |what: &str| AgentItem::missing(format!("{what} 的探测线程异常结束"));
-        let (pi, plugins) = pi.join().unwrap_or_else(|_| (lost("pi"), Vec::new()));
+        let pi = pi.join().unwrap_or_else(|_| lost("pi"));
+        let plugins = pi_plugins.join().unwrap_or_default();
         let gone = |name: &str| Tool {
             installed: false,
             path: None,
             version: None,
-            ok: false,
+            protocol: Protocol::Unknown,
             detail: Some(format!("{name} 的探测线程异常结束")),
         };
         (

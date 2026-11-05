@@ -127,25 +127,46 @@ fn doctor_live_versions_whitelist_and_verified_logins() -> R {
         }
     }
     let (live_code, live) = doctor(&["--live", "--output", "json"])?;
-    // The raw logs of the live turns go into the evidence; the scratch directory doctor kept is removed.
+    // Every live turn's raw logs go into the evidence first; only then is the scratch directory doctor kept removed.
+    // A verified agent without its logs fails the check (M1T07R-01).
+    let mut scratch_dirs = std::collections::BTreeSet::new();
     for agent in ["codex", "claude", "pi"] {
-        if let Some(logs) = live["agents"][agent]["live"]["logs"]
-            .as_str()
-            .map(PathBuf::from)
-        {
-            let into = out.join("doctor-live").join(agent);
-            std::fs::create_dir_all(&into)?;
-            for entry in std::fs::read_dir(&logs).into_iter().flatten().flatten() {
-                std::fs::copy(entry.path(), into.join(entry.file_name()))?;
+        let item = &live["agents"][agent];
+        let Some(logs) = item["live"]["logs"].as_str().map(PathBuf::from) else {
+            continue;
+        };
+        let into = out.join("doctor-live").join(agent);
+        std::fs::create_dir_all(&into)?;
+        let mut copied = 0;
+        match std::fs::read_dir(&logs) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry?;
+                    std::fs::copy(entry.path(), into.join(entry.file_name()))?;
+                    copied += 1;
+                }
             }
-            if let Some(scratch) = logs.parent().and_then(|p| p.parent())
-                && scratch
-                    .file_name()
-                    .is_some_and(|n| n.to_string_lossy().starts_with("hoh-doctor-live-"))
-            {
-                let _ = std::fs::remove_dir_all(scratch);
-            }
+            Err(e) => problems.push(format!(
+                "live: {agent}: its logs {} cannot be read: {e}",
+                logs.display()
+            )),
         }
+        if item["auth_check"] == "verified" && copied == 0 {
+            problems.push(format!(
+                "live: {agent} is verified but left no raw logs in {}",
+                logs.display()
+            ));
+        }
+        if let Some(scratch) = logs.parent().and_then(|p| p.parent())
+            && scratch
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("hoh-doctor-live-"))
+        {
+            scratch_dirs.insert(scratch.to_path_buf());
+        }
+    }
+    for dir in scratch_dirs {
+        let _ = std::fs::remove_dir_all(dir);
     }
     let mut sessions = Vec::new();
     let mut missing = false;

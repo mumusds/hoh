@@ -79,6 +79,7 @@ async fn codex_live_turn_and_cancel() -> R {
             fixture_root: None,
             timeout: Duration::from_secs(120),
             log: None,
+            deadline: None,
         },
     )?;
     let version = entry
