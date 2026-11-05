@@ -155,6 +155,48 @@ fn sighup_restores_the_terminal_and_exits_129() -> R {
     Ok(())
 }
 
+/// A resized window is redrawn at once, without a key: the input reader also hears of a resize while no input
+/// comes (M1T08R-12 moved its wait from crossterm to poll(2)).
+#[test]
+fn a_resize_redraws_the_workspace_without_a_key() -> R {
+    let (home, project) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    let s = open(project.path(), home.path(), &[])?;
+    std::thread::sleep(Duration::from_millis(300));
+    let from = s.pty.output().len();
+    s.pty.resize(40, 120)?;
+    s.pty.wait_for("host 离线", from, Duration::from_secs(2))?;
+    assert_eq!(s.detach()?, Some(0));
+    Ok(())
+}
+
+/// What is typed once the user has chosen to leave belongs to the shell: hoh stops reading before it hands the
+/// terminal back, so input typed while it restores the terminal stays unread (M1T08R-12). A debug-build delay holds
+/// the restore open while the test types.
+#[test]
+fn input_typed_while_the_tui_restores_the_terminal_is_left_for_the_shell() -> R {
+    let (home, project) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    let mut s = open(
+        project.path(),
+        home.path(),
+        &[("HOH_DEBUG_TUI_RESTORE_DELAY_MS", "1000")],
+    )?;
+    let from = s.pty.output().len();
+    s.pty.send(b"\x03")?;
+    s.pty.wait_for("脱离", from, WAIT)?;
+    s.pty.send(b"\r")?;
+    s.pty.wait_for("HOH_DEBUG_TUI_RESTORE_DELAY", from, WAIT)?;
+    s.pty.send(b"echo NEXT\n")?;
+    let status = exit_within(&mut s.child, WAIT)?;
+    assert_eq!(status.code(), Some(0));
+    assert_eq!(s.pty.stty()?, s.baseline, "terminal attributes");
+    assert_eq!(
+        String::from_utf8_lossy(&s.pty.unread_input(Duration::from_secs(2))?),
+        "echo NEXT\n",
+        "the input typed after leaving was read by hoh"
+    );
+    Ok(())
+}
+
 /// Closing the terminal hangs it up, and hoh's input then reads end of file. As its controlling terminal the kernel
 /// also sends SIGHUP: 129. As only its stdio there is no signal: the terminal failed, 74. Either way hoh ends within
 /// a few seconds instead of spinning on the hung-up input (M1QA-01). The terminal is gone, so there is nothing to
