@@ -500,7 +500,8 @@ pub async fn run(
 
 /// The session row of a turn: the probed capabilities, only those this adapter implements on the transport the turn
 /// used (M1R-01, M1T04R-15). On App Server: events, resume (`thread/resume`), steer, deltas and token usage; on exec:
-/// events, and resume if a resumed exec turn can do whatever a new one can (M1T04R-11, -14). Server requests are
+/// events, token usage (`turn.completed`), and resume if a resumed exec turn can do whatever a new one can
+/// (M1T04R-11, -14, -17). Server requests are
 /// answered headless (no dialogs, no custom tools), prompts are text only, there is no browser.
 fn session(
     attempt: &AttemptRef,
@@ -519,6 +520,7 @@ fn session(
     } else {
         vec![
             ("structured_events", true),
+            ("token_usage", true),
             (
                 "resume",
                 offers(&turn.launch.exec_help, "resume") && exec_resumable(&turn.launch),
