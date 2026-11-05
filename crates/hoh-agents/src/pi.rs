@@ -30,11 +30,12 @@ use crate::frame::Frame;
 use crate::process::{Config, Escalation, Event, Process, Step, Termination};
 use hoh_core::lifecycle::{AttemptState, InputState};
 use hoh_core::persistence::{AttemptFacts, CancelLatch, Session, Store};
+use regex::Regex;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
@@ -108,22 +109,15 @@ pub fn refusal(error: &str) -> &'static str {
 pub fn provider_failure(message: &str) -> &'static str {
     let m = message.to_lowercase();
     let any = |patterns: &[&str]| patterns.iter().any(|p| m.contains(p));
-    // A status code the message starts with decides (numbers elsewhere may be part of a key, a model or an id;
-    // M1T05R-13).
-    let status: Option<u16> = message
-        .trim_start()
-        .split(|c: char| !c.is_ascii_digit())
-        .next()
-        .filter(|d| d.len() == 3)
-        .and_then(|d| d.parse().ok());
-    match status {
+    match status(message) {
         Some(401 | 403) => return "BLOCKED_AUTH",
         Some(404) if m.contains("model") => return "MODEL_UNAVAILABLE",
         Some(408 | 429 | 500 | 502 | 503 | 504 | 529) => return "TRANSIENT_EXTERNAL",
         Some(400..=499) => return "PERMANENT_EXTERNAL",
         _ => {}
     }
-    if message.starts_with("No API key found")
+    let text = message.trim_start();
+    if text.starts_with("No API key found")
         || any(&[
             "invalid api key",
             "incorrect api key",
@@ -132,21 +126,41 @@ pub fn provider_failure(message: &str) -> &'static str {
         ])
     {
         "BLOCKED_AUTH"
-    } else if message.starts_with("Model not found") {
+    } else if text.starts_with("Model not found") {
         "MODEL_UNAVAILABLE"
     } else if any(&[
         "rate limit",
+        "too many requests",
         "overloaded",
         "timed out",
         "timeout",
-        "status 429",
-        "status 503",
-        "status 529",
     ]) {
         "TRANSIENT_EXTERNAL"
     } else {
         "PERMANENT_EXTERNAL"
     }
+}
+
+/// The HTTP status of a provider error, read only where pi puts one (pi-ai error-body.js `formatProviderError`:
+/// `<label> error (NNN): …` or `NNN: …`; raw SDK messages such as `429 Too Many Requests`, `403 status code (no
+/// body)`) or where it is named (`HTTP NNN`, `status NNN`, `status code NNN` as whole words). A number anywhere else
+/// may belong to a body, a key, a model, an id or a unit (M1T05R-13/14/16).
+fn status(message: &str) -> Option<u16> {
+    // Fixed patterns (the unit tests show both compile); the leading form first.
+    static LEADING: LazyLock<Option<Regex>> = LazyLock::new(|| {
+        Regex::new(r"(?i)^\s*(?:(?:[\w .-]+ )?error \((\d{3})\):|(\d{3})(?:\s|:|$))").ok()
+    });
+    static NAMED: LazyLock<Option<Regex>> =
+        LazyLock::new(|| Regex::new(r"(?i)\b(?:HTTP|status(?: code)?)\s*(\d{3})\b").ok());
+    let caps = [&*LEADING, &*NAMED]
+        .into_iter()
+        .flatten()
+        .find_map(|re| re.captures(message))?;
+    caps.iter()
+        .skip(1)
+        .flatten()
+        .next()
+        .and_then(|d| d.as_str().parse().ok())
 }
 
 /// A turn to run.
@@ -955,7 +969,8 @@ fn identity(path: &str) -> Option<SessionFile> {
 }
 
 /// The `*.jsonl` files of a session directory, as pi lists them (names ending in `.jsonl`; a missing directory has
-/// none); `Err(name)` for an entry that is not a regular file once symlinks are followed (a FIFO would block pi).
+/// none); `Err(name)` for an entry, symlinks followed, that is neither a regular file nor a directory nor unreachable
+/// (a FIFO, a socket, a device: it would block or flood pi's read).
 pub fn session_files(dir: &std::path::Path) -> Result<Vec<SessionFile>, String> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Ok(Vec::new());
@@ -967,11 +982,14 @@ pub fn session_files(dir: &std::path::Path) -> Result<Vec<SessionFile>, String> 
             continue;
         }
         let path = entry.path();
-        match identity(&path.to_string_lossy()) {
-            Some(file) => files.push(file),
-            None if path.exists() => return Err(name.to_string_lossy().into_owned()),
-            // A dangling symlink: pi cannot open it either; it is not a session file.
-            None => {}
+        match std::fs::metadata(&path) {
+            Ok(meta) if meta.is_file() => files.extend(identity(&path.to_string_lossy())),
+            // pi's read fails at once and it goes on: a directory (searchable or not), a dangling symlink, an entry
+            // it may not reach (M1T05R-15).
+            Ok(meta) if meta.is_dir() => {}
+            Err(_) => {}
+            // A FIFO, a socket or a device would block or flood pi's read.
+            Ok(_) => return Err(name.to_string_lossy().into_owned()),
         }
     }
     files.sort();
