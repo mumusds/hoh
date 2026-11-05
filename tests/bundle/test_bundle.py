@@ -156,7 +156,8 @@ class SetupAndLedger(unittest.TestCase):
         for f in ['LAUNCH_PROMPT.md','requirements-dev.txt']:shutil.copy(ROOT/f,self.root/f)
     def shell(self,*args,env=None):
         e={k:v for k,v in os.environ.items() if k!='HOH_BOOTSTRAP_PARENT'}|(env or {})
-        return subprocess.run(['bash',str(self.root/'scripts'/args[0]),*args[1:]],capture_output=True,text=True,timeout=30,env=e)
+        # In the copy: a probe the scripts run (preflight's pi --version) may write into its working directory (TB-05).
+        return subprocess.run(['bash',str(self.root/'scripts'/args[0]),*args[1:]],cwd=self.root,capture_output=True,text=True,timeout=30,env=e)
     def test_bootstrap_requires_yolo_ack(self):self.assertEqual(self.shell('bootstrap.sh','--dry-run').returncode,64)
     def test_bootstrap_dry_no_writes(self):
         before=set(self.root.rglob('*'));p=self.shell('bootstrap.sh','--yolo','--dry-run');self.assertEqual(p.returncode,0,p.stderr);self.assertEqual(set(self.root.rglob('*')),before)

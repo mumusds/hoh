@@ -10,7 +10,7 @@ from render_prompt import render
 import run_check
 
 # What tools/run_check.py sets for the check it runs (agent_task.py and the product scripts read them).
-CHECK_VARS=('HOH_EVIDENCE_DIR','HOH_CHECK_ID','HOH_CANDIDATE_ID','HOH_SPEC_SHA256')
+from agent_task import CHECK_VARIABLES as CHECK_VARS
 FAKE=r"""#!/usr/bin/env python3
 import json,os,sys,time
 name=os.path.basename(sys.argv[0]);args=sys.argv[1:]
@@ -114,11 +114,40 @@ class NativeBridge(unittest.TestCase):
         # A self-test run inside a check, or in a reviewer's shell, inherits run_check's variables: the bridge tests
         # must neither write into that check's evidence nor meet the bridge's in-check refusal.
         ev=self.root/'outer-evidence';ev.mkdir()
-        with patch.dict(os.environ,{'HOH_EVIDENCE_DIR':str(ev),'HOH_CHECK_ID':'static','HOH_CANDIDATE_ID':'CAND-'+'c'*64,'HOH_SPEC_SHA256':'d'*64}):
+        outer={'HOH_EVIDENCE_DIR':str(ev),'HOH_CHECK_ID':'static','HOH_CANDIDATE_ID':'CAND-'+'c'*64,'HOH_SPEC_SHA256':'d'*64,
+               'HOH_CANDIDATE_FILE':str(self.root/'candidate.json'),'HOH_CHECK_RECORD_ID':'r-1'}
+        self.assertEqual(set(outer),set(CHECK_VARS))
+        with patch.dict(os.environ,outer):
             self.setUp()
-        self.assertFalse({'HOH_EVIDENCE_DIR','HOH_CHECK_ID','HOH_CANDIDATE_ID','HOH_SPEC_SHA256'}&self.env.keys())
-        p,out=self.bridge(agent='grok');self.assertEqual(p.returncode,0,p.stderr)
+        self.assertFalse(set(CHECK_VARS)&self.env.keys())
+        # Grok would be refused inside a check; codex would record its session there (TB-02).
+        for agent in ['grok','codex']:
+            p,out=self.bridge(agent=agent);self.assertEqual(p.returncode,0,p.stderr);shutil.rmtree(out)
         self.assertEqual(list(ev.iterdir()),[])
+    def test_a_native_session_never_sees_the_check_it_runs_in(self):
+        # TB-04: the bridge itself records the session in the check; the agent it starts gets none of run_check's
+        # variables, so a product script it runs (static.sh, cargo test) cannot write into that check's evidence.
+        ev=self.root/'evidence';ev.mkdir()
+        outer={'HOH_EVIDENCE_DIR':str(ev),'HOH_CHECK_ID':'adapter-live','HOH_CANDIDATE_ID':'CAND-'+'a'*64,'HOH_SPEC_SHA256':'b'*64,
+               'HOH_CANDIDATE_FILE':str(self.root/'candidate.json'),'HOH_CHECK_RECORD_ID':'r-1'}
+        p=subprocess.run([sys.executable,str(ROOT/'tools/agent_task.py'),'--agent','codex','--prompt-file',str(self.prompt),'--cwd',str(self.root),'--output-dir',str(self.root/'a3'),'--timeout','10'],
+                         capture_output=True,text=True,env=self.env|outer,timeout=20)
+        self.assertEqual(p.returncode,0,p.stderr)
+        seen=set(load_json(self.root/'trace.json')['env'])
+        self.assertFalse(set(CHECK_VARS)&seen,seen);self.assertIn('HOH_BOOTSTRAP_PARENT',seen)
+        self.assertEqual([s['session_id'] for s in load_json(ev/'live-sessions.json')['sessions']],['mock-thread'])
+        self.assertTrue(set(CHECK_VARS)<=set(load_json(self.root/'a3/attempt.json')['env_removed']))
+    def test_the_check_variables_are_those_run_check_sets(self):
+        # TB-01: one list for the bridge, the bundle self-test and check.sh, equal to what run_check.py exports.
+        import re
+        text=(ROOT/'tools/run_check.py').read_text();block=text[text.index("env=os.environ|{"):]
+        block=block[:block.index('}')]
+        self.assertEqual(set(re.findall(r"'(HOH_[A-Z0-9_]+)'",block)),set(CHECK_VARS))
+    def test_the_bundle_self_test_unsets_every_check_variable(self):
+        # TB-03: scripts/check.sh --bundle starts the unittest run without any of run_check's variables.
+        text=(ROOT/'scripts/check.sh').read_text();bundle=text[text.index(' --bundle)'):]
+        bundle=bundle[:bundle.index(';;')];run=bundle[:bundle.index('unittest discover -s tests/bundle')]
+        self.assertEqual({v for v in CHECK_VARS if f'-u {v} ' in run},set(CHECK_VARS),run)
     def test_grok_error_result_fails_the_turn_despite_a_zero_exit(self):
         p,out=self.bridge(agent='grok',mode='semantic-error');self.assertEqual(p.returncode,1,p.stderr);r=load_json(out/'attempt.json')
         self.assertEqual((r['status'],r['exit_code'],r['terminal_observed'],r['native_error_observed']),('NATIVE_FAILED',0,True,True))

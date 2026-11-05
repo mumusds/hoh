@@ -35,3 +35,23 @@ Owner decision of 2026-11-05: Codex, Claude, Pi and Grok are full subscriptions 
 - Verdict: **PASS**, no findings.
 
 Observed in use: a Grok review session (M1-T08 round 3) gave its report in an assistant message and then, as background commands ended, a few short closing messages; its final `result` held only the last of those. Under `--report-out` the bridge would refuse such a session (no `hoh-report` in the last result), which fails safe. Outside checks the report is read from the stream.
+
+## The bundle self-test never writes into a check it runs inside (branch `tools/bundle-env`)
+
+Found by the M1-T08 round-7 reviewer: with run_check's variables in the environment (inside a check, or a reviewer's shell), the NativeBridge bundle tests started the mock bridge with them inherited; the Grok tests met the bridge's in-check refusal and the other mock sessions were appended to that check's `live-sessions.json`. Fix `2e17782`: the NativeBridge environment drops the variables and `scripts/check.sh --bundle` runs the unittest discovery without them.
+
+### Round 1 (fresh Claude session)
+
+- Agent: `claude` 2.1.318, session `a6b55032-7f1f-487c-bcf0-25d67234ed86`, 905 s; attempt record sha256 `0cdd8a74de29dbea93e283e77ba0d460c94b524ba14e2ae7bbad9acdaa77835f`, stdout sha256 `e91b03ca9f240369706147d1cd1955bb3f6d8a0cdc1578ac6f449fa6fea6bafc`.
+- Scope: `31848a6..2e17782`; every reader of run_check's variables among the bundle tests, tools and product scripts; the new test against the old code; the bundle with and without the variables, in clones of both commits.
+- Verdict: **PASS** (5 low).
+
+| ID | Severity | Summary | Disposition |
+|---|---|---|---|
+| TB-01 | low | check.sh:11, test_tools.py:12 — run_check sets six variables (also `HOH_CANDIDATE_FILE`, `HOH_CHECK_RECORD_ID`); the fix named four. | Fixed: `CHECK_VARIABLES` in `tools/agent_task.py` names all six (`tools/run_check.py` and `tools/common.py` are locked, so the list is not moved there); `test_the_check_variables_are_those_run_check_sets` keeps it equal to what run_check.py exports. |
+| TB-02 | low | test_tools.py:120 — the new test ran Grok only, which the bridge refuses inside a check before writing anything, so it could not see a leak into live-sessions. | Fixed: the test also runs codex, which would record its session there. |
+| TB-03 | low | check.sh:12 — the `env -u` line had no test. | Fixed: `test_the_bundle_self_test_unsets_every_check_variable` checks the bundle command unsets each of `CHECK_VARIABLES`. |
+| TB-04 | low | agent_task.py:25 (outside the diff) — `child_env` passed the variables to real agent sessions, so a reviewer or QA session under a check that ran static.sh or cargo test would write into that check's evidence. | Fixed: `child_env` drops `CHECK_VARIABLES` (the bridge still records the session in the check), and the attempt record lists them in `env_removed`. Test `test_a_native_session_never_sees_the_check_it_runs_in`. |
+| TB-05 | low | test_bundle.py:164 (outside the diff) — `test_offline_setup_idempotent` ran the copied bootstrap with the test's own working directory, so preflight's real `pi --version` let a user-level pi extension write `.pi-lens-probe-home/` into the repository. | Fixed: the scripts run in the copy (`cwd=self.root`). Not reproduced on this VM; the change makes it impossible by construction. |
+
+Mutation check: dropping the strip from `child_env`, keeping a variable in the NativeBridge environment, removing one `-u` from check.sh and leaving a variable out of the list each make a new test fail (4/4).
