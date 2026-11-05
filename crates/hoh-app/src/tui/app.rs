@@ -303,6 +303,14 @@ impl App {
                 Line::from(format!("{} {label}", if i == selected { ">" } else { " " }))
             })
             .collect();
+        // The cursor on the selected choice: every frame sets one, so ratatui never hides the cursor (M1T08R-10).
+        let row = u16::try_from(selected).unwrap_or(0).saturating_add(1);
+        frame.set_cursor_position((
+            area.x.saturating_add(1),
+            area.y
+                .saturating_add(row)
+                .min(area.bottom().saturating_sub(1)),
+        ));
         frame.render_widget(Clear, area);
         frame.render_widget(
             Paragraph::new(items).block(

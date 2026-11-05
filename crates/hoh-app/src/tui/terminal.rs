@@ -5,9 +5,11 @@
 //!   is never told to leave it (M1T08R-09).
 //! - A sequence that went out is never sent again: a second "leave the alternate screen" puts the saved cursor back
 //!   over what was printed since (M1T08R-07).
-//! - A sequence cut short is sent again from its start after a CAN (0x18), which ends a sequence the terminal is still
-//!   parsing and does nothing otherwise. [`settle`] sends that CAN before any diagnostic, so text never lands inside a
-//!   cut sequence (M1T08R-08).
+//! - A sequence cut short is sent again from its start after a CAN (0x18). [`settle`] sends that CAN before any
+//!   diagnostic, also after a frame cut short, so text never lands inside a cut sequence (M1T08R-08/10). This relies on
+//!   CAN only for what the shell sends: CSI sequences, which a CAN ends (VT100 and its successors, xterm, VTE, tmux),
+//!   and the ground state, where it does nothing. Inside an OSC or a DCS terminals differ (tmux applies part of an OSC
+//!   title, and its DCS goes on swallowing text), so the shell sends none of those (M1T08R-11).
 //! - Raw mode has its own flag and is given back even when the screen fails (M1T08R-01).
 //!
 //! The sequences go to a duplicate of stdout without a buffer. The TUI draws through [`Output`], whose buffer is
@@ -60,7 +62,7 @@ impl Step {
     }
 }
 
-/// The sequences of entering and of leaving, in their orders.
+/// The sequences of entering and of leaving, in their orders; and the frames, whose last one may have been cut.
 #[derive(Debug)]
 pub struct Steps {
     enter_screen: Step,
@@ -68,6 +70,7 @@ pub struct Steps {
     paste_off: Step,
     leave_screen: Step,
     show: Step,
+    frame: Step,
 }
 
 impl Steps {
@@ -78,16 +81,18 @@ impl Steps {
             paste_off: Step::new(),
             leave_screen: Step::new(),
             show: Step::new(),
+            frame: Step::new(),
         }
     }
 
-    fn all(&self) -> [&Step; 5] {
+    fn all(&self) -> [&Step; 6] {
         [
             &self.enter_screen,
             &self.enter_paste,
             &self.paste_off,
             &self.leave_screen,
             &self.show,
+            &self.frame,
         ]
     }
 }
@@ -264,30 +269,60 @@ pub fn restore_on_panic() {
 /// after each frame). What is still buffered when it is dropped is discarded: it was meant for the alternate
 /// screen, and after the restore it would land on the normal one.
 #[derive(Debug)]
-pub struct Output {
-    out: File,
+pub struct Output<'a, W> {
+    out: W,
     buffer: Vec<u8>,
+    steps: &'a Steps,
 }
 
-impl Output {
-    pub fn new() -> io::Result<Output> {
-        Ok(Output {
-            out: terminal_out()?,
-            buffer: Vec::new(),
-        })
+impl Output<'static, File> {
+    pub fn new() -> io::Result<Self> {
+        Ok(Output::over(terminal_out()?, &STEPS))
     }
 }
 
-impl Write for Output {
+impl<'a, W: Write> Output<'a, W> {
+    pub fn over(out: W, steps: &'a Steps) -> Self {
+        Output {
+            out,
+            buffer: Vec::new(),
+            steps,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn inner_mut(&mut self) -> &mut W {
+        &mut self.out
+    }
+}
+
+impl<W: Write> Write for Output<'_, W> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         self.buffer.extend_from_slice(bytes);
         Ok(bytes.len())
     }
 
-    /// A frame that fails is not written again (part of it may be out; the restore's first sequence starts with ESC,
-    /// which ends anything left open); the error follows.
+    /// A frame that fails is not written again; if part of it is out, the frame step is marked cut, so [`settle`]
+    /// ends what it left open before a diagnostic. The error follows.
     fn flush(&mut self) -> io::Result<()> {
         let frame = std::mem::take(&mut self.buffer);
-        self.out.write_all(&frame)
+        let mut sent = 0;
+        while let Some(rest) = frame.get(sent..).filter(|rest| !rest.is_empty()) {
+            let failure = match self.out.write(rest) {
+                Ok(0) => io::ErrorKind::WriteZero.into(),
+                Ok(n) => {
+                    sent += n;
+                    continue;
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => e,
+            };
+            if sent > 0 {
+                self.steps.frame.cut.store(true, Ordering::SeqCst);
+            }
+            return Err(failure);
+        }
+        self.steps.frame.cut.store(false, Ordering::SeqCst);
+        self.out.flush()
     }
 }
