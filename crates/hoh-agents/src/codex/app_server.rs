@@ -759,7 +759,16 @@ pub(super) async fn run(
             let _ = st.reply.send(SteerReceipt::NotNow);
         }
     }
-    if let Some(reason) = s.degrade.clone().filter(|_| !s.cancelled && !s.deadline) {
+    let logs_incomplete = report.as_ref().is_none_or(|r| {
+        r.stdout.error.is_some() || r.stderr.error.is_some() || !r.stdout.eof || !r.stderr.eof
+    });
+    // A refused handshake moves the turn to exec only when nothing ranked above a refused request in ADR-012 §3
+    // happened: a cancel, a frame too large, the deadline, a raw log cut short (M1R-02).
+    if let Some(reason) = s
+        .degrade
+        .clone()
+        .filter(|_| !s.cancelled && !s.too_large && !s.deadline && !logs_incomplete)
+    {
         return Ok(End::Degrade(reason));
     }
     for st in held.drain(..) {
@@ -788,9 +797,6 @@ pub(super) async fn run(
         )
         .await?;
     }
-    let logs_incomplete = report.as_ref().is_none_or(|r| {
-        r.stdout.error.is_some() || r.stderr.error.is_some() || !r.stdout.eof || !r.stderr.eof
-    });
     if logs_incomplete && let Some(r) = &report {
         s.event(
             "raw-log-incomplete",
