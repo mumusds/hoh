@@ -41,6 +41,9 @@ pub struct ProbeEnv {
     pub timeout: Duration,
     /// Where every command run is written down, if anywhere (doctor lists them, REQ-006).
     pub log: Option<RunLog>,
+    /// A limit shared by every command: each gets the smaller of `timeout` and the time left before it, so commands
+    /// run one after another end together by then (doctor's total limit, REQ-006).
+    pub deadline: Option<Instant>,
 }
 
 /// One command a probe ran.
@@ -795,7 +798,11 @@ fn capture(
     } else {
         let _ = etx.send(Ok(Vec::new()));
     }
-    let deadline = Instant::now() + env.timeout;
+    let limit = env.deadline.map_or(env.timeout, |shared| {
+        env.timeout
+            .min(shared.saturating_duration_since(Instant::now()))
+    });
+    let deadline = Instant::now() + limit;
     let pid = Pid::from_child(&child);
     let exited = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG;
     loop {
@@ -811,7 +818,7 @@ fn capture(
             let _ = child.wait();
             return Err(ProbeError::TimedOut {
                 argv: argv(program, args),
-                after: env.timeout,
+                after: limit,
             });
         }
         std::thread::sleep(Duration::from_millis(10));

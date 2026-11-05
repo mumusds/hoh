@@ -166,7 +166,7 @@ fn the_json_form_is_one_line_with_line_separators_escaped() {
         installed: false,
         path: None,
         version: None,
-        ok: false,
+        protocol: Protocol::Unknown,
         detail: Some("a\u{2028}b\u{2029}c".to_owned()),
     };
     let report = Report {
@@ -181,6 +181,7 @@ fn the_json_form_is_one_line_with_line_separators_escaped() {
                 path: "/p/.hoh".to_owned(),
                 exists: false,
                 writable: true,
+                detail: None,
             },
             host: serde_json::json!({"state": "not_running"}),
         },

@@ -44,131 +44,142 @@ fn stdout_of(launcher: &Path, args: &[&str], env: &ProbeEnv) -> Result<String, S
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-async fn claude_turn(
-    store: &Store,
-    attempt: &AttemptRef,
+/// A live turn ready to run: everything asked of the CLI before the attempt exists, so a turn that cannot be prepared
+/// leaves no attempt behind (M1T07R-04).
+enum Prepared {
+    Claude(claude::Turn),
+    Codex(codex::Turn),
+    Pi(pi::Turn),
+}
+
+fn prepare(
+    agent: Agent,
     launcher: &Path,
     work: &Path,
     logs: PathBuf,
     env: &ProbeEnv,
-) -> Result<Ended, String> {
-    let launch = claude::Launch {
-        program: launcher.to_path_buf(),
-        help: stdout_of(launcher, &["--help"], env)?,
-        cwd: work.to_path_buf(),
-        yolo: false,
-        partial: false,
-        resume: None,
-        root: rustix::process::geteuid().is_root(),
-    };
-    let turn = claude::Turn {
-        launch,
-        prompt: PROMPT.as_bytes().to_vec(),
-        logs,
-        escalation: claude::Turn::default_escalation(),
-        deadline: Some(DEADLINE),
-    };
-    let o = claude::run(store, attempt, &turn, &CancelLatch::new())
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(Ended {
-        state: o.state,
-        failure: o.failure,
-        native_session: o.native_session,
-        reply: o.result.and_then(|r| r.text),
+) -> Result<Prepared, String> {
+    Ok(match agent {
+        Agent::Claude => Prepared::Claude(claude::Turn {
+            launch: claude::Launch {
+                program: launcher.to_path_buf(),
+                help: stdout_of(launcher, &["--help"], env)?,
+                cwd: work.to_path_buf(),
+                yolo: false,
+                partial: false,
+                resume: None,
+                root: rustix::process::geteuid().is_root(),
+            },
+            prompt: PROMPT.as_bytes().to_vec(),
+            logs,
+            escalation: claude::Turn::default_escalation(),
+            deadline: Some(DEADLINE),
+        }),
+        Agent::Codex => {
+            // app-server when the CLI has one (its schema then names the known notifications); exec otherwise.
+            let app_server_help = stdout_of(launcher, &["app-server", "--help"], env).ok();
+            let known = match &app_server_help {
+                None => Default::default(),
+                Some(_) => {
+                    let schema = work.join("..").join("codex-schema");
+                    let schema_arg = schema.display().to_string();
+                    stdout_of(
+                        launcher,
+                        &["app-server", "generate-json-schema", "--out", &schema_arg],
+                        env,
+                    )?;
+                    let notifications: Value = std::fs::read(
+                        schema.join("ServerNotification.json"),
+                    )
+                    .ok()
+                    .and_then(|b| serde_json::from_slice(&b).ok())
+                    .ok_or(
+                        "codex app-server generate-json-schema gave no ServerNotification.json",
+                    )?;
+                    codex::known_notifications(&notifications)
+                }
+            };
+            Prepared::Codex(codex::Turn {
+                launch: codex::Launch {
+                    program: launcher.to_path_buf(),
+                    app_server_help,
+                    exec_help: stdout_of(launcher, &["exec", "--help"], env)?,
+                    exec_resume_help: stdout_of(launcher, &["exec", "resume", "--help"], env).ok(),
+                    cwd: work.to_path_buf(),
+                    yolo: false,
+                    resume: None,
+                    model: None,
+                    known,
+                },
+                prompt: PROMPT.to_owned(),
+                logs,
+                escalation: codex::Turn::default_escalation(),
+                handshake_timeout: Duration::from_secs(60),
+                deadline: Some(DEADLINE),
+            })
+        }
+        Agent::Pi => Prepared::Pi(pi::Turn {
+            launch: pi::Launch {
+                program: launcher.to_path_buf(),
+                help: stdout_of(launcher, &["--help"], env)?,
+                cwd: work.to_path_buf(),
+                session_dir: work.join("..").join("pi-sessions"),
+                session_id: std::fs::read_to_string("/proc/sys/kernel/random/uuid")
+                    .map(|s| s.trim().to_owned())
+                    .map_err(|e| e.to_string())?,
+                resume: false,
+                provider: None,
+                model: None,
+                settled_event: true,
+            },
+            prompt: PROMPT.to_owned(),
+            input_id: None,
+            logs,
+            escalation: pi::Turn::default_escalation(),
+            deadline: Some(DEADLINE),
+            clock: Arc::new(SystemClock),
+            events: None,
+        }),
     })
 }
 
-async fn codex_turn(
-    store: &Store,
-    attempt: &AttemptRef,
-    launcher: &Path,
-    work: &Path,
-    logs: PathBuf,
-    env: &ProbeEnv,
-) -> Result<Ended, String> {
-    let schema = work.join("..").join("codex-schema");
-    let schema_arg = schema.display().to_string();
-    stdout_of(
-        launcher,
-        &["app-server", "generate-json-schema", "--out", &schema_arg],
-        env,
-    )?;
-    let notifications: Value = std::fs::read(schema.join("ServerNotification.json"))
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .ok_or("codex app-server generate-json-schema gave no ServerNotification.json")?;
-    let launch = codex::Launch {
-        program: launcher.to_path_buf(),
-        app_server_help: Some(stdout_of(launcher, &["app-server", "--help"], env)?),
-        exec_help: stdout_of(launcher, &["exec", "--help"], env)?,
-        exec_resume_help: stdout_of(launcher, &["exec", "resume", "--help"], env).ok(),
-        cwd: work.to_path_buf(),
-        yolo: false,
-        resume: None,
-        model: None,
-        known: codex::known_notifications(&notifications),
-    };
-    let turn = codex::Turn {
-        launch,
-        prompt: PROMPT.to_owned(),
-        logs,
-        escalation: codex::Turn::default_escalation(),
-        handshake_timeout: Duration::from_secs(60),
-        deadline: Some(DEADLINE),
-    };
-    let (_steer, steers) = tokio::sync::mpsc::channel(1);
-    let o = codex::run(store, attempt, &turn, &CancelLatch::new(), steers)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(Ended {
-        state: o.state,
-        failure: o.failure,
-        native_session: o.native_session,
-        reply: o.reply,
-    })
-}
-
-async fn pi_turn(
-    store: &Store,
-    attempt: &AttemptRef,
-    launcher: &Path,
-    work: &Path,
-    logs: PathBuf,
-    env: &ProbeEnv,
-) -> Result<Ended, String> {
-    let session_id = std::fs::read_to_string("/proc/sys/kernel/random/uuid")
-        .map(|s| s.trim().to_owned())
-        .map_err(|e| e.to_string())?;
-    let launch = pi::Launch {
-        program: launcher.to_path_buf(),
-        help: stdout_of(launcher, &["--help"], env)?,
-        cwd: work.to_path_buf(),
-        session_dir: work.join("..").join("pi-sessions"),
-        session_id,
-        resume: false,
-        provider: None,
-        model: None,
-        settled_event: true,
-    };
-    let turn = pi::Turn {
-        launch,
-        prompt: PROMPT.to_owned(),
-        input_id: None,
-        logs,
-        escalation: pi::Turn::default_escalation(),
-        deadline: Some(DEADLINE),
-        clock: Arc::new(SystemClock),
-        events: None,
-    };
-    let o = pi::run(store, attempt, &turn, &CancelLatch::new())
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(Ended {
-        state: o.state,
-        failure: o.failure,
-        native_session: o.native_session,
-        reply: o.reply,
+async fn run(store: &Store, attempt: &AttemptRef, prepared: &Prepared) -> Result<Ended, String> {
+    let latch = CancelLatch::new();
+    Ok(match prepared {
+        Prepared::Claude(turn) => {
+            let o = claude::run(store, attempt, turn, &latch)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ended {
+                state: o.state,
+                failure: o.failure,
+                native_session: o.native_session,
+                reply: o.result.and_then(|r| r.text),
+            }
+        }
+        Prepared::Codex(turn) => {
+            let (_steer, steers) = tokio::sync::mpsc::channel(1);
+            let o = codex::run(store, attempt, turn, &latch, steers)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ended {
+                state: o.state,
+                failure: o.failure,
+                native_session: o.native_session,
+                reply: o.reply,
+            }
+        }
+        Prepared::Pi(turn) => {
+            let o = pi::run(store, attempt, turn, &latch)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ended {
+                state: o.state,
+                failure: o.failure,
+                native_session: o.native_session,
+                reply: o.reply,
+            }
+        }
     })
 }
 
@@ -183,48 +194,36 @@ async fn one(
     let name = agent.command();
     let attempt_id = format!("doctor-{name}");
     let launcher = PathBuf::from(item.path.clone().unwrap_or_default());
-    let created = store
-        .create_attempt(NewAttempt {
-            attempt_id: attempt_id.clone(),
-            task_id: "doctor".to_owned(),
-            session_id: None,
-            role_epoch: 1,
-            host_epoch: 1,
-            config_revision: 0,
-            agent: Some(name.to_owned()),
-        })
-        .await;
+    let work = scratch.join(name).join("work");
+    let logs = scratch.join(name).join("logs");
     let attempt = AttemptRef {
         attempt_id: attempt_id.clone(),
         session_id: format!("doctor-{name}-session"),
         role: "doctor".to_owned(),
         agent_version: item.version.clone().unwrap_or_default(),
     };
-    let work = scratch.join(name).join("work");
-    let logs = scratch.join(name).join("logs");
-    let ended = match created {
-        Err(e) => Err(e.to_string()),
-        Ok(()) => match std::fs::create_dir_all(&work) {
-            Err(e) => Err(e.to_string()),
-            Ok(()) => {
-                let _ = std::process::Command::new("git")
-                    .args(["init", "-q"])
-                    .current_dir(&work)
-                    .status();
-                match agent {
-                    Agent::Claude => {
-                        claude_turn(store, &attempt, &launcher, &work, logs.clone(), env).await
-                    }
-                    Agent::Codex => {
-                        codex_turn(store, &attempt, &launcher, &work, logs.clone(), env).await
-                    }
-                    Agent::Pi => {
-                        pi_turn(store, &attempt, &launcher, &work, logs.clone(), env).await
-                    }
-                }
-            }
-        },
-    };
+    let ended = async {
+        std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
+        let _ = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&work)
+            .status();
+        let prepared = prepare(agent, &launcher, &work, logs.clone(), env)?;
+        store
+            .create_attempt(NewAttempt {
+                attempt_id: attempt_id.clone(),
+                task_id: "doctor".to_owned(),
+                session_id: None,
+                role_epoch: 1,
+                host_epoch: 1,
+                config_revision: 0,
+                agent: Some(name.to_owned()),
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        run(store, &attempt, &prepared).await
+    }
+    .await;
     let row = store
         .reader()
         .ok()

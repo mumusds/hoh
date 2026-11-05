@@ -66,8 +66,8 @@ pub struct Tool {
     pub installed: bool,
     pub path: Option<String>,
     pub version: Option<String>,
-    /// Installed and new enough.
-    pub ok: bool,
+    /// Compatible: a version new enough; incompatible: one known to be too old; unknown: none could be read.
+    pub protocol: Protocol,
     pub detail: Option<String>,
 }
 
@@ -86,7 +86,9 @@ pub struct Plugin {
 pub struct HohDir {
     pub path: String,
     pub exists: bool,
+    /// It can hold the project's state.
     pub writable: bool,
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -158,6 +160,37 @@ pub fn text(report: &Report) -> String {
         } else {
             out.push_str(&format!("{name:<7} 未安装\n"));
         }
+        if let Some(path) = &item.path {
+            out.push_str(&format!("        path={path}\n"));
+        }
+        if let Some(sha) = &item.binary_sha256 {
+            out.push_str(&format!("        binary_sha256={sha}\n"));
+        }
+        if !item.capabilities.is_empty() {
+            let caps: Vec<String> = item
+                .capabilities
+                .iter()
+                .map(|(k, v)| {
+                    format!(
+                        "{k}={}",
+                        v.map_or("unknown", |b| if b { "true" } else { "false" })
+                    )
+                })
+                .collect();
+            out.push_str(&format!("        capabilities: {}\n", caps.join(" ")));
+        }
+        if let Some(live) = &item.live {
+            out.push_str(&format!(
+                "        live：attempt {} {}，原生会话 {}{}\n",
+                live["attempt_id"].as_str().unwrap_or("?"),
+                live["state"].as_str().unwrap_or("未开始"),
+                live["native_session_id"].as_str().unwrap_or("无"),
+                live["error"]
+                    .as_str()
+                    .map(|e| format!("，错误：{e}"))
+                    .unwrap_or_default()
+            ));
+        }
         if let Some(detail) = &item.protocol_detail {
             out.push_str(&format!("        {detail}\n"));
         }
@@ -188,13 +221,18 @@ pub fn text(report: &Report) -> String {
         ));
     }
     out.push_str(&format!(
-        ".hoh    {}：{}\n",
+        ".hoh    {}：{}{}\n",
         r.project_hoh.path,
         if r.project_hoh.writable {
             "可写"
         } else {
             "不可写"
-        }
+        },
+        r.project_hoh
+            .detail
+            .as_deref()
+            .map(|d| format!("（{d}）"))
+            .unwrap_or_default()
     ));
     out.push_str("host    未运行（M1 还没有 host）\n");
     let s = &report.summary;
