@@ -349,7 +349,7 @@ fn csi_u(first: &str, mut modifiers: KeyModifiers, kind: KeyEventKind) -> Option
     Some(Event::Key(KeyEvent::new_with_kind(code, modifiers, kind)))
 }
 
-/// xterm's modifier parameter: 1 + a bit mask of Shift 1, Alt 2, Ctrl 4.
+/// xterm's modifier parameter: 1 + a bit mask of Shift 1, Alt 2, Ctrl 4, Super 8, Hyper 16, Meta 32.
 fn modifiers(param: u8) -> KeyModifiers {
     let mask = param.saturating_sub(1);
     let mut m = KeyModifiers::NONE;
@@ -361,6 +361,16 @@ fn modifiers(param: u8) -> KeyModifiers {
     }
     if mask & 4 != 0 {
         m |= KeyModifiers::CONTROL;
+    }
+    // Super, Hyper and Meta as crossterm's `parse_modifiers` reads them (M1T08R-44).
+    if mask & 8 != 0 {
+        m |= KeyModifiers::SUPER;
+    }
+    if mask & 16 != 0 {
+        m |= KeyModifiers::HYPER;
+    }
+    if mask & 32 != 0 {
+        m |= KeyModifiers::META;
     }
     m
 }
@@ -722,6 +732,27 @@ mod tests {
             one_by_one.extend(std::iter::from_fn(|| d.next(false)));
         }
         assert_eq!(one_by_one, keys);
+    }
+
+    /// The modifier parameter carries Super, Hyper and Meta too (bits 8, 16, 32), as crossterm reads it (M1T08R-44).
+    #[test]
+    fn the_modifier_parameter_carries_every_bit_crossterm_reads() {
+        let mods: Vec<KeyModifiers> = all(b"\x1b[1;9A\x1b[1;17A\x1b[1;33A\x1b[1;64A", false)
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::Key(key) => Some(key.modifiers),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            mods,
+            [
+                KeyModifiers::SUPER,
+                KeyModifiers::HYPER,
+                KeyModifiers::META,
+                KeyModifiers::all(),
+            ]
+        );
     }
 
     /// A CSI u whose codepoint is no Unicode scalar value is no key, whatever its alternate (M1T08R-29).
