@@ -61,6 +61,9 @@ pub struct Launch {
     pub model: Option<String>,
     /// Server notification methods of this version (its app-server schema, [`known_notifications`]).
     pub known: BTreeSet<String>,
+    /// Client request methods of this version (its app-server schema's `ClientRequest.json`, [`listed_methods`]): the
+    /// App Server is used only if they and `known` have what every turn needs (M1T07R-15).
+    pub requests: BTreeSet<String>,
     /// What the probe found for this codex (its compat manifest entry); the session row records them, narrowed by
     /// the transport the turn used (REQ-027).
     pub capabilities: crate::capabilities::Probed,
@@ -72,7 +75,13 @@ pub struct Blocked(pub String);
 
 /// The notification methods `ServerNotification.json` of `codex app-server generate-json-schema` names.
 pub fn known_notifications(server_notification_schema: &Value) -> BTreeSet<String> {
-    server_notification_schema["oneOf"]
+    listed_methods(server_notification_schema)
+}
+
+/// The methods an App Server schema file lists (its `oneOf` branches' `method` values): `ClientRequest.json`'s
+/// requests, `ServerNotification.json`'s notifications.
+pub fn listed_methods(schema: &Value) -> BTreeSet<String> {
+    schema["oneOf"]
         .as_array()
         .into_iter()
         .flatten()
@@ -408,8 +417,19 @@ pub async fn run(
             steps: Vec::new(),
         })
     };
-    // Without an App Server, exec must be possible before anything starts.
-    if turn.launch.app_server_help.is_none()
+    // The App Server only if its schema has what every turn needs (the probe's choice too, M1T07R-15); without one,
+    // exec must be possible before anything starts.
+    let unusable = turn
+        .launch
+        .app_server_help
+        .as_ref()
+        .and_then(|_| app_server_interface_missing(&turn.launch.requests, &turn.launch.known));
+    let app_server_help = turn
+        .launch
+        .app_server_help
+        .as_deref()
+        .filter(|_| unusable.is_none());
+    if app_server_help.is_none()
         && let Err(Blocked(detail)) = exec_args(&turn.launch)
     {
         return blocked(detail).await;
@@ -430,7 +450,7 @@ pub async fn run(
         .await?;
         return Err(e.into());
     }
-    let app_server = turn.launch.app_server_help.is_some();
+    let app_server = app_server_help.is_some();
     store
         .upsert_session(session(
             attempt,
@@ -453,7 +473,7 @@ pub async fn run(
     )
     .await?;
     let mut held = Vec::new();
-    let reason = match &turn.launch.app_server_help {
+    let reason = match app_server_help {
         Some(help) => {
             match app_server::run(store, attempt, turn, help, cancel, &mut steers, &mut held)
                 .await?
@@ -462,7 +482,7 @@ pub async fn run(
                 app_server::End::Degrade(reason) => reason,
             }
         }
-        None => "codex --help offers no app-server".to_owned(),
+        None => unusable.unwrap_or_else(|| "codex --help offers no app-server".to_owned()),
     };
     store
         .attempt_event(

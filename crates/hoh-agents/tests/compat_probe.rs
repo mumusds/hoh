@@ -288,10 +288,10 @@ fn a_cli_without_what_its_adapter_needs_is_unsupported() -> R {
         (
             Agent::Claude,
             "2.1.318 (Claude Code)",
-            no_stream,
+            no_stream.clone(),
             "--output-format stream-json",
         ),
-        (Agent::Pi, "1.5.0", no_rpc, "--mode rpc"),
+        (Agent::Pi, "1.5.0", no_rpc.clone(), "--mode rpc"),
     ] {
         let group = format!("{}-values", agent.command());
         let help_file = tmp.path().join(format!("{group}.txt"));
@@ -307,6 +307,76 @@ fn a_cli_without_what_its_adapter_needs_is_unsupported() -> R {
             }
             other => return Err(format!("{group}: not refused: {other:?}").into()),
         }
+    }
+    // A declaration is a declaration: claude's `--output-format` declaration gone, a continuation line indented six
+    // spaces that starts with `--output-format=stream-json)` does not declare it (M1R-03); a value is a whole word:
+    // `stream-json-v2` is not stream-json, `grpc` is not rpc (M1T07R-17).
+    let without = without_declaration(&claude, "--output-format")
+        + "  --other <x>                           Other\n      --output-format=stream-json)\n";
+    let v2 = claude.replace("\"stream-json\"", "\"stream-json-v2\"");
+    let grpc = pi.replace(
+        "Output mode: text (default), json, or rpc",
+        "Output mode: text (default), json, or grpc",
+    );
+    for (agent, version, help, why, group) in [
+        (
+            Agent::Claude,
+            "2.1.318 (Claude Code)",
+            without,
+            "--output-format",
+            "claude-continuation",
+        ),
+        (
+            Agent::Claude,
+            "2.1.318 (Claude Code)",
+            v2,
+            "--output-format stream-json",
+            "claude-v2",
+        ),
+        (Agent::Pi, "1.5.0", grpc, "--mode rpc", "pi-grpc"),
+    ] {
+        let help_file = tmp.path().join(format!("{group}.txt"));
+        std::fs::write(&help_file, &help)?;
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n --version) echo '{version}';;\n --help) cat '{}';;\n *) exit 2;;\nesac\n",
+            help_file.display()
+        );
+        let (dir, _) = fake(tmp.path(), group, agent.command(), &script)?;
+        match probe(agent, &env_for(&dir)) {
+            Err(ProbeError::Unsupported { detail, .. }) => {
+                assert!(detail.contains(why), "{group}: {detail}")
+            }
+            other => return Err(format!("{group}: not refused: {other:?}").into()),
+        }
+    }
+    // A usable CLI stays usable: rpc listed in a second declaration of pi's --mode, claude's values as a list.
+    let second = pi.replace(
+        "Output mode: text (default), json, or rpc",
+        "Output mode: text (default) or json",
+    ) + "  --mode <mode>                  Also: rpc\n";
+    // (no_stream: claude's help with stream-json gone from --output-format's own text.)
+    let listed = no_stream.replace(
+        "  --output-format <format>              Output format (only works with --print):\n",
+        "  --output-format <format>              Output format (only works with --print):\n      - stream-json\n",
+    );
+    assert_ne!(listed, no_stream);
+    for (agent, version, help, group) in [
+        (Agent::Pi, "1.5.0", second, "pi-second-mode"),
+        (
+            Agent::Claude,
+            "2.1.318 (Claude Code)",
+            listed,
+            "claude-listed",
+        ),
+    ] {
+        let help_file = tmp.path().join(format!("{group}.txt"));
+        std::fs::write(&help_file, &help)?;
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n --version) echo '{version}';;\n --help) cat '{}';;\n *) exit 2;;\nesac\n",
+            help_file.display()
+        );
+        let (dir, _) = fake(tmp.path(), group, agent.command(), &script)?;
+        probe(agent, &env_for(&dir)).map_err(|e| format!("{group}: refused: {e}"))?;
     }
     // A flag is a whole word: a codex without an App Server whose exec help offers `--json-lines` but not `--json`.
     let exec_help = std::fs::read_to_string(fixtures().join("codex/0.166.0/help-exec.txt"))?
@@ -418,6 +488,29 @@ fn a_flag_with_a_longer_name_is_not_the_flag() -> R {
     assert_eq!(
         entry.capabilities.get("partial_messages"),
         Some(&Some(false))
+    );
+    // codex exec resumes only through a `resume` subcommand: a help whose Commands section lacks it, though its text
+    // still says "resume", offers no resume (M1T07R-21).
+    let exec_help = std::fs::read_to_string(fixtures().join("codex/0.166.0/help-exec.txt"))?;
+    let without: String = exec_help
+        .lines()
+        .filter(|l| !l.starts_with("  resume "))
+        .map(|l| format!("{l}\n"))
+        .collect::<String>()
+        + "\nA previous session cannot resume here.\n";
+    assert!(without.contains("resume") && !without.contains("  resume "));
+    let help_file = tmp.path().join("codex-no-resume.txt");
+    std::fs::write(&help_file, without)?;
+    let script = format!(
+        "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.100.0';;\n exec) [ \"$2\" = --help ] && cat '{}';;\n \
+         *) echo \"error: unrecognized subcommand '$1'\" >&2; exit 2;;\nesac\n",
+        help_file.display()
+    );
+    let (dir, _) = fake(tmp.path(), "codex-no-resume", "codex", &script)?;
+    let entry = probe(Agent::Codex, &env_for(&dir))?;
+    assert_eq!(
+        (entry.transport, entry.capabilities.get("resume")),
+        (Transport::Exec, Some(&Some(false)))
     );
     Ok(())
 }

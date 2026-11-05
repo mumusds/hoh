@@ -51,7 +51,12 @@ async fn a_raw_log_cut_short_during_a_refused_handshake_fails_the_attempt() -> R
             yolo: false,
             resume: None,
             model: None,
-            known: Default::default(),
+            // What every App Server turn needs, so the App Server is tried and its handshake refused.
+            known: ["turn/completed".to_owned()].into_iter().collect(),
+            requests: ["initialize", "thread/start", "turn/start"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
             capabilities: Default::default(),
         },
         prompt: "hello".to_owned(),

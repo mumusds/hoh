@@ -80,7 +80,7 @@ pub fn interface_missing(help: &str) -> Option<String> {
         ));
     }
     (!crate::adapter::option_text(help, "--output-format")
-        .is_some_and(|t| t.contains("stream-json")))
+        .is_some_and(|t| crate::adapter::has_word(&t, "stream-json")))
     .then(|| {
         "claude --help offers no --output-format stream-json (protocol incompatible)".to_owned()
     })
