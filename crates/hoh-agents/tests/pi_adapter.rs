@@ -962,8 +962,10 @@ async fn only_the_sessions_own_file_is_resumed() -> R {
     Ok(())
 }
 
-/// A provider failure after the prompt was taken (the final assistant message stopped with an error) fails the turn
-/// with its class; a retry that then succeeds clears it (M1T05R-04).
+/// A provider error after the prompt was taken fails the turn, classified as a refused prompt is (REQ-026, CR-003):
+/// only the recorded `No API key found` / `Model not found` texts are BLOCKED_AUTH / MODEL_UNAVAILABLE; any other text,
+/// pi's own formatted ones included, and one pi gave up retrying, is PERMANENT_EXTERNAL with the text kept in
+/// `adapter.turn_failed` (M1T05R-04, M1T05R-17..20). A retry that worked settles the turn.
 #[tokio::test]
 async fn a_provider_failure_after_acceptance_fails_the_turn() -> R {
     let world = World::new()?;
@@ -971,48 +973,56 @@ async fn a_provider_failure_after_acceptance_fails_the_turn() -> R {
         json!({"type": "message_end", "message": {"role": "assistant", "content": [], "stopReason": "error",
                "errorMessage": text}})
     };
+    let retry = |error: &str| json!({"type": "auto_retry_start", "attempt": 1, "maxAttempts": 1, "delayMs": 1, "errorMessage": error});
+    let gave_up = |error: &str| json!({"type": "auto_retry_end", "success": false, "attempt": 1, "finalError": error});
+    let failed = |class: &'static str| (AttemptState::Failed, Some(class));
     for (name, error, retried, expect) in [
-        (
-            "limit",
-            "429 rate limit exceeded",
-            false,
-            (AttemptState::Failed, Some("TRANSIENT_EXTERNAL")),
-        ),
         (
             "key",
             "No API key found for the selected model.",
-            false,
-            (AttemptState::Failed, Some("BLOCKED_AUTH")),
+            None,
+            failed("BLOCKED_AUTH"),
+        ),
+        (
+            "model",
+            "Model not found: vendor/model-503",
+            None,
+            failed("MODEL_UNAVAILABLE"),
         ),
         (
             "other",
             "Request was malformed",
-            false,
-            (AttemptState::Failed, Some("PERMANENT_EXTERNAL")),
+            None,
+            failed("PERMANENT_EXTERNAL"),
         ),
-        // As pi 1.5.0's formatProviderError writes them for OpenAI and Azure (M1T05R-14).
         (
-            "formatted-limit",
+            "limit",
+            "429 rate limit exceeded",
+            None,
+            failed("PERMANENT_EXTERNAL"),
+        ),
+        (
+            "formatted",
             r#"OpenAI API error (429): {"message":"Too Many Requests"}"#,
-            false,
-            (AttemptState::Failed, Some("TRANSIENT_EXTERNAL")),
+            None,
+            failed("PERMANENT_EXTERNAL"),
         ),
         (
             "formatted-auth",
             r#"Azure OpenAI API error (401): {"message":"Your token has expired"}"#,
-            false,
-            (AttemptState::Failed, Some("BLOCKED_AUTH")),
+            None,
+            failed("PERMANENT_EXTERNAL"),
         ),
         (
-            "formatted-model",
-            r#"OpenAI API error (404): {"message":"model gpt-x does not exist"}"#,
-            false,
-            (AttemptState::Failed, Some("MODEL_UNAVAILABLE")),
+            "gave-up",
+            "503 Service Unavailable",
+            Some(false),
+            failed("PERMANENT_EXTERNAL"),
         ),
         (
             "retried",
             "529 overloaded",
-            true,
+            Some(true),
             (AttemptState::Settled, None),
         ),
     ] {
@@ -1024,11 +1034,19 @@ async fn a_provider_failure_after_acceptance_fails_the_turn() -> R {
             .ok_or("no assistant message")?;
         let good = case.frames[last].clone();
         case.frames[last] = failed_message(error);
-        if retried {
-            case.frames.splice(
-                last + 1..last + 1,
-                [json!({"type": "auto_retry_start", "attempt": 1, "maxAttempts": 3, "delayMs": 1, "errorMessage": error}), good],
-            );
+        match retried {
+            // pi retried and the retry worked.
+            Some(true) => {
+                case.frames.splice(last + 1..last + 1, [retry(error), good]);
+            }
+            // pi retried, failed again and gave up.
+            Some(false) => {
+                case.frames.splice(
+                    last + 1..last + 1,
+                    [retry(error), failed_message(error), gave_up(error)],
+                );
+            }
+            None => {}
         }
         let fake = world.fake(name, &case)?;
         let attempt = world.attempt_in("pi", name, name, "1.5.0").await?;
@@ -1049,6 +1067,21 @@ async fn a_provider_failure_after_acceptance_fails_the_turn() -> R {
             expect,
             "{name} in the store"
         );
+        let kept: Vec<Value> = world
+            .store
+            .reader()?
+            .events("R")?
+            .into_iter()
+            .filter(|(k, p)| k == "adapter.turn_failed" && p["attempt_id"] == name)
+            .map(|(_, p)| p)
+            .collect();
+        let want: Vec<Value> = match expect {
+            (AttemptState::Failed, Some(class)) => {
+                vec![json!({"attempt_id": name, "reason": class, "errorMessage": error})]
+            }
+            _ => Vec::new(),
+        };
+        assert_eq!(kept, want, "{name}: the text is kept");
     }
     Ok(())
 }

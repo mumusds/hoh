@@ -30,12 +30,11 @@ use crate::frame::Frame;
 use crate::process::{Config, Escalation, Event, Process, Step, Termination};
 use hoh_core::lifecycle::{AttemptState, InputState};
 use hoh_core::persistence::{AttemptFacts, CancelLatch, Session, Store};
-use regex::Regex;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
@@ -92,75 +91,21 @@ pub fn args(launch: &Launch) -> Result<Vec<String>, Blocked> {
 /// Dialog UI methods: they wait for an answer, which headless HoH gives as `cancelled`.
 pub const DIALOGS: &[&str] = &["select", "confirm", "input", "editor"];
 
-/// The failure reason of a refused prompt (docs/13, pi 1.5.0 has no structured error codes).
-pub fn refusal(error: &str) -> &'static str {
-    if error.starts_with("No API key found") {
-        "BLOCKED_AUTH"
-    } else if error.starts_with("Model not found") {
-        "MODEL_UNAVAILABLE"
-    } else {
-        "PERMANENT_EXTERNAL"
-    }
-}
-
-/// The failure reason of a provider error after the prompt was taken (the final assistant message's
-/// `errorMessage`, M1T05R-04): authentication, a model that is not there, a passing overload or limit, or anything
-/// else.
-pub fn provider_failure(message: &str) -> &'static str {
-    let m = message.to_lowercase();
-    let any = |patterns: &[&str]| patterns.iter().any(|p| m.contains(p));
-    match status(message) {
-        Some(401 | 403) => return "BLOCKED_AUTH",
-        Some(404) if m.contains("model") => return "MODEL_UNAVAILABLE",
-        Some(408 | 429 | 500 | 502 | 503 | 504 | 529) => return "TRANSIENT_EXTERNAL",
-        Some(400..=499) => return "PERMANENT_EXTERNAL",
-        _ => {}
-    }
-    let text = message.trim_start();
-    if text.starts_with("No API key found")
-        || any(&[
-            "invalid api key",
-            "incorrect api key",
-            "unauthorized",
-            "authentication failed",
-        ])
-    {
+/// The failure reason of a pi error text (REQ-026, CR-003; docs/13): pi 1.5.0 has no structured error codes, so only
+/// the recorded patterns count — `No API key found` → BLOCKED_AUTH, `Model not found` → MODEL_UNAVAILABLE (leading
+/// blanks aside) — and anything else is PERMANENT_EXTERNAL, its text kept in the event. The same rule serves a refused
+/// prompt and a provider error after acceptance (the final assistant message's `errorMessage`, M1T05R-04). HoH does
+/// not read statuses or phrases out of provider text (M1T05R-17..20): the formats differ by provider and SDK, and pi
+/// has already retried what it judged transient before the turn ends with the error.
+pub fn error_class(error: &str) -> &'static str {
+    let text = error.trim_start();
+    if text.starts_with("No API key found") {
         "BLOCKED_AUTH"
     } else if text.starts_with("Model not found") {
         "MODEL_UNAVAILABLE"
-    } else if any(&[
-        "rate limit",
-        "too many requests",
-        "overloaded",
-        "timed out",
-        "timeout",
-    ]) {
-        "TRANSIENT_EXTERNAL"
     } else {
         "PERMANENT_EXTERNAL"
     }
-}
-
-/// The HTTP status of a provider error, read only where pi puts one (pi-ai error-body.js `formatProviderError`:
-/// `<label> error (NNN): …` or `NNN: …`; raw SDK messages such as `429 Too Many Requests`, `403 status code (no
-/// body)`) or where it is named (`HTTP NNN`, `status NNN`, `status code NNN` as whole words). A number anywhere else
-/// may belong to a body, a key, a model, an id or a unit (M1T05R-13/14/16).
-fn status(message: &str) -> Option<u16> {
-    // Fixed patterns (the unit tests show both compile); the leading form first.
-    static LEADING: LazyLock<Option<Regex>> = LazyLock::new(|| {
-        Regex::new(r"(?i)^\s*(?:(?:[\w .-]+ )?error \((\d{3})\):|(\d{3})(?:\s|:|$))").ok()
-    });
-    static NAMED: LazyLock<Option<Regex>> =
-        LazyLock::new(|| Regex::new(r"(?i)\b(?:HTTP|status(?: code)?)\s*(\d{3})\b").ok());
-    let caps = [&*LEADING, &*NAMED]
-        .into_iter()
-        .flatten()
-        .find_map(|re| re.captures(message))?;
-    caps.iter()
-        .skip(1)
-        .flatten()
-        .next()
-        .and_then(|d| d.as_str().parse().ok())
 }
 
 /// A turn to run.
@@ -753,7 +698,7 @@ pub async fn run(
                         sync_input!();
                     }
                     Some(Pending::Prompt) => {
-                        let reason = refusal(&error);
+                        let reason = error_class(&error);
                         failure = Some(reason.to_owned());
                         store
                             .attempt_event(
@@ -897,7 +842,7 @@ pub async fn run(
             )
             .await?;
     }
-    let provider_class = provider_error.as_deref().map(provider_failure);
+    let provider_class = provider_error.as_deref().map(error_class);
     let (state, failure) = verdict(&Ending {
         cancelled,
         too_large,
@@ -969,9 +914,9 @@ fn identity(path: &str) -> Option<SessionFile> {
 }
 
 /// The `*.jsonl` files of a session directory, as pi lists them (names ending in `.jsonl`; a missing directory has
-/// none); `Err(name)` for an entry, symlinks followed, that is neither a regular file nor a directory nor unreachable
-/// (a FIFO, a socket, a device: it would block or flood pi's read).
+/// none); `Err(name)` for an entry, symlinks followed, that would block pi's lookup or may (a FIFO, a device).
 pub fn session_files(dir: &std::path::Path) -> Result<Vec<SessionFile>, String> {
+    use std::os::unix::fs::FileTypeExt;
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Ok(Vec::new());
     };
@@ -984,11 +929,11 @@ pub fn session_files(dir: &std::path::Path) -> Result<Vec<SessionFile>, String> 
         let path = entry.path();
         match std::fs::metadata(&path) {
             Ok(meta) if meta.is_file() => files.extend(identity(&path.to_string_lossy())),
-            // pi's read fails at once and it goes on: a directory (searchable or not), a dangling symlink, an entry
-            // it may not reach (M1T05R-15).
-            Ok(meta) if meta.is_dir() => {}
+            // pi's open or read fails at once and it goes on: a directory (searchable or not), a socket (ENXIO), a
+            // dangling or looping symlink, an entry it may not reach (M1T05R-15/21).
+            Ok(meta) if meta.is_dir() || meta.file_type().is_socket() => {}
             Err(_) => {}
-            // A FIFO, a socket or a device would block or flood pi's read.
+            // A FIFO blocks pi's open; a device may block or never end (HoH cannot tell which without reading it).
             Ok(_) => return Err(name.to_string_lossy().into_owned()),
         }
     }
