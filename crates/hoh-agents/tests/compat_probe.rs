@@ -583,14 +583,38 @@ fn a_shared_deadline_bounds_commands_run_one_after_another() -> R {
     env.timeout = Duration::from_secs(30);
     let started = std::time::Instant::now();
     env.deadline = Some(started + Duration::from_secs(1));
-    for _ in 0..3 {
-        let hung = run_status(&slow, &["login", "status"], &env);
-        assert!(matches!(hung, Err(ProbeError::TimedOut { .. })), "{hung:?}");
+    let log: RunLog = Default::default();
+    env.log = Some(log.clone());
+    let first = run_status(&slow, &["login", "status"], &env);
+    assert!(
+        matches!(
+            first,
+            Err(ProbeError::TimedOut {
+                cut_by_deadline: true,
+                ..
+            })
+        ),
+        "the first is cut short by the shared deadline: {first:?}"
+    );
+    // Once the deadline has passed, a command is not started at all, and says so (M1T07R-08).
+    for _ in 0..2 {
+        let late = run_status(&slow, &["login", "status"], &env);
+        assert!(
+            matches!(late, Err(ProbeError::NotStarted { .. })),
+            "{late:?}"
+        );
     }
     assert!(
         started.elapsed() < Duration::from_secs(3),
         "{:?}",
         started.elapsed()
+    );
+    let runs = log.lock().map_err(|_| "poisoned")?.clone();
+    assert_eq!(
+        runs.iter()
+            .map(|r| (r.started, r.timed_out))
+            .collect::<Vec<_>>(),
+        [(true, true), (false, false), (false, false)]
     );
     Ok(())
 }

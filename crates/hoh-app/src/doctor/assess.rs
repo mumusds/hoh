@@ -136,6 +136,23 @@ pub fn pi_provider() -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Why `what` gave no answer, if it timed out or was not started: its own limit, the time left of doctor's total limit,
+/// or none of it left (M1T07R-08).
+pub fn unfinished(what: &str, e: &ProbeError) -> Option<String> {
+    match e {
+        ProbeError::TimedOut {
+            after,
+            cut_by_deadline: false,
+            ..
+        } => Some(format!("{what} {after:?} 内没有结束，已终止其进程组")),
+        ProbeError::TimedOut { after, .. } => Some(format!(
+            "doctor 的总时限只剩 {after:?}，{what}没有在其中结束，已终止其进程组"
+        )),
+        ProbeError::NotStarted { .. } => Some(format!("doctor 的总时限已用完，{what}没有运行")),
+        _ => None,
+    }
+}
+
 /// Run the agent's status command; the conclusion and, if it is not clear, why.
 fn auth(agent: Agent, launcher: &Path, env: &ProbeEnv) -> (Auth, Option<String>) {
     let provider = (agent == Agent::Pi).then(pi_provider).flatten();
@@ -161,11 +178,10 @@ fn auth(agent: Agent, launcher: &Path, env: &ProbeEnv) -> (Auth, Option<String>)
                 Some("状态命令的输出无法判断登录状态".to_owned()),
             ),
         },
-        Err(ProbeError::TimedOut { after, .. }) => (
+        Err(e) => (
             Auth::Unknown,
-            Some(format!("状态命令 {after:?} 内没有结束，已终止其进程组")),
+            Some(unfinished("状态命令", &e).unwrap_or_else(|| "状态命令无法运行".to_owned())),
         ),
-        Err(_) => (Auth::Unknown, Some("状态命令无法运行".to_owned())),
     }
 }
 
@@ -182,9 +198,9 @@ pub fn agent(agent: Agent, env: &ProbeEnv, manifest: Option<&CompatManifest>) ->
                     format!("缺少 HoH 需要的接口：{detail}"),
                     format!("升级 {} 到受支持的版本", agent.command()),
                 ),
-                ProbeError::TimedOut { after, .. } => (
+                ProbeError::TimedOut { .. } | ProbeError::NotStarted { .. } => (
                     Protocol::Unknown,
-                    format!("探测命令 {after:?} 内没有结束，已终止"),
+                    unfinished("探测命令", &e).unwrap_or_default(),
                     "检查该 CLI 能否正常启动后重试".to_owned(),
                 ),
                 _ => (

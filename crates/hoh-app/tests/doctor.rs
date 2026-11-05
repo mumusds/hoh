@@ -485,6 +485,11 @@ fn slow_and_hung_commands_share_one_limit_and_stay_unknown() -> R {
         "{}",
         report["agents"]["claude"]
     );
+    // Cut short by the shared limit, and said so (M1T07R-08).
+    let detail = report["agents"]["claude"]["protocol_detail"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(detail.contains("总时限"), "{detail}");
     assert_eq!(report["agents"]["pi"]["auth_check"], "unknown");
     let node = &report["runtime"]["node"];
     assert_eq!(
@@ -586,6 +591,8 @@ fn live_drives_an_exec_only_codex_through_exec() -> R {
             f = f.display()
         ),
     )?;
+    // A default-mode command that uses up the shared limit leaves --live its own time (M1T07R-07).
+    s.write("node", "#!/bin/sh\nsleep 60\n")?;
     let (out, _) = s.doctor_in(&[], &["--live", "--output", "json"], &[])?;
     let report: Value = serde_json::from_slice(&out.stdout)?;
     let live = &report["agents"]["codex"]["live"];
@@ -614,5 +621,33 @@ fn live_drives_an_exec_only_codex_through_exec() -> R {
     {
         let _ = std::fs::remove_dir_all(scratch);
     }
+    Ok(())
+}
+
+/// A tool that is there but gives no version is installed in both forms, with its version unknown (M1T07R-09).
+#[test]
+fn a_tool_without_a_version_is_installed_in_both_forms() -> R {
+    let s = Sandbox::new()?;
+    s.codex(Status::LoggedIn)?;
+    s.claude(Status::LoggedIn)?;
+    s.pi(Status::LoggedIn)?;
+    s.write("node", "#!/bin/sh\nexit 1\n")?;
+    let (_, report, _) = s.doctor()?;
+    let node = &report["runtime"]["node"];
+    assert_eq!(
+        (node["installed"].as_bool(), node["protocol"].as_str()),
+        (Some(true), Some("unknown")),
+        "{node}"
+    );
+    let (out, _) = s.doctor_in(&[], &["--output", "text"], &[])?;
+    let text = String::from_utf8(out.stdout)?;
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("node"))
+        .ok_or("no node line")?;
+    assert!(
+        !line.contains("未安装") && line.contains("版本未知"),
+        "{line}"
+    );
     Ok(())
 }

@@ -71,11 +71,11 @@ fn tool(name: &str, env: &ProbeEnv, minimum: Option<(u64, u64)>) -> Tool {
             format!("{name} --version 没有给出版本"),
         ),
         Ok(out) => (None, format!("{name} --version 以 {} 结束", out.status)),
-        Err(probe::ProbeError::TimedOut { after, .. }) => (
+        Err(e) => (
             None,
-            format!("{name} --version {after:?} 内没有结束，已终止"),
+            assess::unfinished(&format!("{name} --version"), &e)
+                .unwrap_or_else(|| format!("{name} --version 无法运行：{e}")),
         ),
-        Err(e) => (None, format!("{name} --version 无法运行：{e}")),
     };
     let (protocol, detail) = match (minimum, version.as_deref()) {
         (_, None) => (Protocol::Unknown, Some(unread)),
@@ -288,7 +288,13 @@ fn examine(project: &Path, live: bool) -> Report {
         )
     });
     if live {
-        match live::check(&mut agents, &env) {
+        // The live turns' preparation gets a limit of its own: the default probes may have used up theirs
+        // (M1T07R-07). Each turn itself is bounded by its adapter's deadline.
+        let live_env = ProbeEnv {
+            deadline: Some(Instant::now() + TIMEOUT),
+            ..env.clone()
+        };
+        match live::check(&mut agents, &live_env) {
             Ok(dir) => warnings.push(format!(
                 "live 检查的原始日志与临时 store 保留在 {}",
                 dir.display()
