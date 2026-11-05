@@ -92,9 +92,7 @@
       "mode": "product",
       "argv": [
         "bash",
-        "scripts/product/not-implemented.sh",
-        "tui-pty",
-        "M1-T08"
+        "scripts/product/tui-pty.sh"
       ],
       "timeout_seconds": 3600,
       "artifacts": [

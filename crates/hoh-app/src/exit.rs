@@ -1,5 +1,6 @@
 //! The exit code table of REQ-004, one place for every client: a run's final state, or what ended the client.
-//! Until the clients that wait for runs and hosts arrive (M2-T13), only the usage code is used outside the tests.
+//! Until the clients that wait for runs and hosts arrive (M2-T13), only the usage code and the TUI shell's codes are
+//! used outside the tests.
 #![allow(dead_code)]
 
 use hoh_core::protocol::RunState;
@@ -17,6 +18,12 @@ pub enum ClientEvent {
     Sigint,
     /// The client detached on SIGTERM; the run goes on.
     Sigterm,
+    /// The client's terminal hung up (SIGHUP); the run goes on. Not in REQ-004's table: 128 + 1, the rule of the
+    /// SIGINT and SIGTERM codes (ADR-014).
+    Sighup,
+    /// The TUI's terminal failed (read, write or mode change). Not in REQ-004's table: sysexits EX_IOERR, the family
+    /// of 64, 69 and 78 (ADR-014).
+    TerminalIo,
 }
 
 /// What ends an invocation.
@@ -53,6 +60,8 @@ pub fn exit_code(ending: Ending) -> Option<u8> {
             ClientEvent::Config => 78,
             ClientEvent::Sigint => 130,
             ClientEvent::Sigterm => 143,
+            ClientEvent::Sighup => 129,
+            ClientEvent::TerminalIo => 74,
         }),
     }
 }

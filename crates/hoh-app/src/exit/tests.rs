@@ -56,3 +56,11 @@ fn test_004_01_every_state_and_client_event_maps_as_the_table_says() {
             .expect("write the table");
     }
 }
+
+/// Not in REQ-004's table: a hangup detaches with 129 (128 + SIGHUP, the rule of 130 and 143), a terminal that fails
+/// under the TUI is 74 (sysexits EX_IOERR, the family of 64, 69 and 78; ADR-014).
+#[test]
+fn a_hangup_and_a_failing_terminal_have_their_own_codes() {
+    assert_eq!(exit_code(Ending::Client(ClientEvent::Sighup)), Some(129));
+    assert_eq!(exit_code(Ending::Client(ClientEvent::TerminalIo)), Some(74));
+}

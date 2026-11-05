@@ -266,7 +266,8 @@ fn test_003_02_undefined_commands_and_combinations_are_usage_errors_without_side
 #[test]
 fn valid_commands_that_are_not_built_yet_say_so_and_exit_3() -> R {
     let env = Env::new()?;
-    for args in [&[][..], &["-p", "x"], &["attach"], &["web"], &["doctor"]] {
+    // Bare `hoh` is built (M1-T08): without a terminal it is a usage error, tests/tui.rs (TEST-001-03).
+    for args in [&["-p", "x"][..], &["attach"], &["web"], &["doctor"]] {
         let out = env.hoh(args)?;
         assert_eq!(
             out.status.code(),
