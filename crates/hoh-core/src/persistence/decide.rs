@@ -432,13 +432,8 @@ fn load_binding(
     };
     // Probed capabilities are an object of booleans (REQ-024); anything else counts as none.
     let capabilities = capabilities
-        .and_then(|json| serde_json::from_str::<serde_json::Map<String, Value>>(&json).ok())
-        .map(|map| {
-            map.into_iter()
-                .filter(|(_, v)| *v == Value::Bool(true))
-                .map(|(k, _)| k)
-                .collect()
-        })
+        .and_then(|json| serde_json::from_str::<Value>(&json).ok())
+        .map(|v| crate::decision::granted_capabilities(&v))
         .unwrap_or_default();
     Ok(Some(BindingView {
         role_epoch: revision(epoch)?,

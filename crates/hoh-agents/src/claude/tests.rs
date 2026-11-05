@@ -13,6 +13,15 @@ fn launch() -> Launch {
         partial: false,
         resume: None,
         root: false,
+        // What the probe finds for HELP.
+        capabilities: [
+            ("structured_events", Some(true)),
+            ("partial_messages", Some(true)),
+            ("resume", Some(true)),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v))
+        .collect(),
     }
 }
 

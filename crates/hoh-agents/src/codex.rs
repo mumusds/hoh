@@ -61,6 +61,9 @@ pub struct Launch {
     pub model: Option<String>,
     /// Server notification methods of this version (its app-server schema, [`known_notifications`]).
     pub known: BTreeSet<String>,
+    /// What the probe found for this codex (its compat manifest entry); the session row records them, narrowed by
+    /// the transport the turn used (REQ-027).
+    pub capabilities: crate::capabilities::Probed,
 }
 
 /// Why a turn was not started (`BLOCKED_CAPABILITY`).
@@ -482,13 +485,23 @@ pub async fn run(
     exec::run(store, attempt, turn, args, reason, cancel, &mut steers).await
 }
 
-/// The session row of a turn: App Server sessions take steers, exec ones do not.
+/// The session row of a turn: the probed capabilities (M1R-01); on exec there is no steer and no delta, and resume
+/// only if `codex exec` offers it.
 fn session(
     attempt: &AttemptRef,
     turn: &Turn,
     app_server: bool,
     native_id: Option<String>,
 ) -> Session {
+    let limits = if app_server {
+        Vec::new()
+    } else {
+        vec![
+            ("mid_turn_steer", false),
+            ("partial_messages", false),
+            ("resume", offers(&turn.launch.exec_help, "resume")),
+        ]
+    };
     Session {
         session_id: attempt.session_id.clone(),
         agent: "codex".to_owned(),
@@ -496,12 +509,7 @@ fn session(
         native_id,
         native_path: None,
         agent_version: attempt.agent_version.clone(),
-        capabilities: json!({
-            "structured_events": true,
-            "resume": app_server || offers(&turn.launch.exec_help, "resume"),
-            "mid_turn_steer": app_server,
-            "token_usage": true,
-        }),
+        capabilities: crate::capabilities::of_session(&turn.launch.capabilities, &limits),
     }
 }
 

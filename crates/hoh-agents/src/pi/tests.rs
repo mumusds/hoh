@@ -18,6 +18,7 @@ fn launch() -> Launch {
         provider: None,
         model: None,
         settled_event: true,
+        capabilities: crate::capabilities::Probed::new(),
     }
 }
 

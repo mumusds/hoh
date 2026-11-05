@@ -48,6 +48,7 @@ async fn a_raw_log_that_cannot_be_written_whole_fails_the_turn() -> R {
             partial: false,
             resume: None,
             root: false,
+            capabilities: Default::default(),
         },
         prompt: b"hello".to_vec(),
         logs: world.dir.path().join("logs"),

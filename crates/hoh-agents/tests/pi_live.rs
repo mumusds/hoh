@@ -97,6 +97,7 @@ async fn pi_live_turns_resume_and_cancel() -> R {
         provider: None,
         model: None,
         settled_event: true,
+        capabilities: entry.capabilities.clone(),
     };
     let turn = |prompt: &str, logs: &str, resume: bool| {
         let mut launch = launch.clone();
