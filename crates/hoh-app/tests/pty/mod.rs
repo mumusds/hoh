@@ -150,6 +150,37 @@ impl Pty {
         Ok(String::from_utf8(out.stdout)?.trim().to_owned())
     }
 
+    /// What is waiting to be read on the terminal (typed and not read by any program), within `timeout`.
+    pub fn unread_input(&self, timeout: Duration) -> R<Vec<u8>> {
+        let slave = self.slave.as_ref().ok_or("the PTY is closed")?;
+        let wait = Timespec {
+            tv_sec: i64::try_from(timeout.as_secs())?,
+            tv_nsec: i64::from(timeout.subsec_nanos()),
+        };
+        let mut fds = [PollFd::new(slave, PollFlags::IN)];
+        if rustix::event::poll(&mut fds, Some(&wait))? == 0 {
+            return Ok(Vec::new());
+        }
+        let mut buf = [0u8; 4096];
+        let n = rustix::io::read(slave, &mut buf)?;
+        Ok(buf[..n].to_vec())
+    }
+
+    /// Resize the terminal as its window would be: the kernel then sends SIGWINCH to its foreground process group.
+    pub fn resize(&self, rows: u16, cols: u16) -> R {
+        let slave = self.slave.as_ref().ok_or("the PTY is closed")?;
+        tcsetwinsize(
+            slave,
+            Winsize {
+                ws_row: rows,
+                ws_col: cols,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            },
+        )?;
+        Ok(())
+    }
+
     /// Type `bytes` as the user would.
     pub fn send(&mut self, bytes: &[u8]) -> R {
         let master = self.master.as_mut().ok_or("the terminal was hung up")?;
