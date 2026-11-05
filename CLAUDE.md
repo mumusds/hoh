@@ -47,7 +47,7 @@ Language: reply to and ask the user in Simplified Chinese; new documents under `
 
 ## Autonomy and consent (owner decision, 2026-11-03)
 
-Authorized: YOLO work in this VM; `sudo -n` for development/test infrastructure; pushing task branches, opening PRs and merging them after green CI plus a passing independent review; approving refinement CRs under CR-003 D1 (docs/21); spending the existing Codex/Claude/Pi/Grok subscription quota on reviews, QA, live checks and the soak (owner, 2026-11-05: all four are full subscriptions with ample quota; plan the agents to work together, e.g. parallel independent reviewers and QA, and fall back from one to another on capacity errors).
+Authorized: YOLO work in this VM; `sudo -n` for development/test infrastructure; pushing task branches, opening PRs and merging them after green CI plus a passing independent review; approving refinement CRs under CR-003 D1 (docs/21); spending the existing Codex/Claude/Pi subscription quota on reviews, QA, live checks and the soak, and the Grok subscription on bootstrap reviews and QA outside checks (owner, 2026-11-05: all four are full subscriptions with ample quota; plan the agents to work together, e.g. parallel independent reviewers and QA, and fall back from one to another on capacity errors).
 Still ask the owner first (do the independent work meanwhile): reducing scope, lowering any gate or threshold, changing CONTRACT architecture or interaction decisions, paid API or other external costs, force-push or rewriting published history, deleting data git cannot restore, publishing packages.
 
 ## Do not
