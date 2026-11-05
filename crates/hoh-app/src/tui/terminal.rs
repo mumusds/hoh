@@ -259,7 +259,7 @@ pub fn restore_on_panic() {
     std::panic::set_hook(Box::new(move |info| {
         if let Err(e) = with_retries(3, restore) {
             settle();
-            eprintln!("hoh：终端未能恢复：{e}；可运行 stty sane 或 reset");
+            say!("hoh：终端未能恢复：{e}；可运行 stty sane 或 reset");
         }
         previous(info);
     }));

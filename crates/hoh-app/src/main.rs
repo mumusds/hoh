@@ -7,6 +7,15 @@
 #![forbid(clippy::disallowed_methods)]
 #![forbid(unsafe_code)]
 
+/// A line on stderr, whatever becomes of it: `eprintln!` panics when the write fails (a hung-up terminal, a full
+/// device), which would turn the exit code into 101 (M1QA-01). Defined before the modules, so they can use it.
+macro_rules! say {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
 mod cli;
 mod doctor;
 mod exit;
@@ -36,7 +45,7 @@ fn usage_code() -> u8 {
 }
 
 fn refuse(message: &str) -> u8 {
-    eprintln!("hoh: {message}\n{}", help::SYNOPSIS);
+    say!("hoh: {message}\n{}", help::SYNOPSIS);
     usage_code()
 }
 
@@ -113,7 +122,7 @@ fn run(args: &[OsString]) -> u8 {
             );
         }
     };
-    eprintln!(
+    say!(
         "hoh {}: NOT_IMPLEMENTED: {what} 尚未实现（见 docs/08-development-plan.md）",
         env!("CARGO_PKG_VERSION")
     );

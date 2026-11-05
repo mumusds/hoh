@@ -5,6 +5,8 @@
 //!   sending anything;
 //! - Ctrl+C then "脱离" exits 0;
 //! - SIGTERM exits 143, SIGHUP 129 and SIGINT 130; a panic exits 101 with its message after the terminal is restored.
+//! - a terminal that is closed under it (its window, an SSH connection) ends it: 129, or 74 when it was not the
+//!   controlling terminal.
 //!
 //! In every case the alternate screen is entered and left, and the terminal attributes are those of before. The
 //! names carry no TEST id: TEST-001-01/02 (the host parts) are M2-T13's.
@@ -15,7 +17,7 @@
 
 mod pty;
 
-use pty::{Hoh, Pty, R, exit_within, find, signal, spawn_in, tree};
+use pty::{Hoh, Pty, R, exit_within, find, signal, spawn_in, spawn_without_ctty_in, tree};
 use rustix::process::Signal;
 use std::path::Path;
 use std::time::Duration;
@@ -150,6 +152,34 @@ fn sighup_restores_the_terminal_and_exits_129() -> R {
     let s = open(project.path(), home.path(), &[])?;
     signal(&s.child, Signal::HUP)?;
     assert_eq!(s.ended()?, Some(129));
+    Ok(())
+}
+
+/// Closing the terminal hangs it up, and hoh's input then reads end of file. As its controlling terminal the kernel
+/// also sends SIGHUP: 129. As only its stdio there is no signal: the terminal failed, 74. Either way hoh ends within
+/// a few seconds instead of spinning on the hung-up input (M1QA-01). The terminal is gone, so there is nothing to
+/// compare `stty -g` with.
+#[test]
+fn a_terminal_closed_under_the_tui_ends_it() -> R {
+    for ctty in [true, false] {
+        let (home, project) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let mut pty = Pty::new(30, 100)?;
+        // Declared after the PTY, so dropped before it: a failure stops `hoh` first.
+        let mut child = if ctty {
+            spawn_in(&pty, project.path(), home.path(), &[], &[])?
+        } else {
+            spawn_without_ctty_in(&pty, project.path(), home.path())?
+        };
+        pty.wait_for("host 离线", 0, WAIT)?;
+        pty.hang_up()?;
+        let status = exit_within(&mut child, Duration::from_secs(3))
+            .map_err(|e| format!("ctty={ctty}: {e}"))?;
+        assert_eq!(
+            status.code(),
+            Some(if ctty { 129 } else { 74 }),
+            "ctty={ctty}"
+        );
+    }
     Ok(())
 }
 

@@ -5,6 +5,7 @@
 
 #![allow(dead_code)] // each test binary uses a part of it
 
+use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::fd::OwnedFd;
 use rustix::fs::{Mode, OFlags};
 use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
@@ -12,16 +13,20 @@ use rustix::termios::{Winsize, tcsetwinsize};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub type R<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 pub struct Pty {
-    master: std::fs::File,
+    /// `None` once the terminal was hung up.
+    master: Option<std::fs::File>,
     /// `None` once dropped: the reader then ends with EIO when the program's copies are closed too.
     slave: Option<OwnedFd>,
     output: Arc<Mutex<Vec<u8>>>,
+    /// Asks the reader to close its copy of the master.
+    stop: Arc<AtomicBool>,
     reader: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -29,6 +34,7 @@ impl Drop for Pty {
     /// Close the slave and collect the reader (it ends once no slave is open; given up after 2 s).
     fn drop(&mut self) {
         self.slave = None;
+        self.stop.store(true, Ordering::SeqCst);
         if let Some(reader) = self.reader.take() {
             let started = Instant::now();
             while !reader.is_finished() && started.elapsed() < Duration::from_secs(2) {
@@ -78,21 +84,52 @@ impl Pty {
         let mut reader = master.try_clone()?;
         let output = Arc::new(Mutex::new(Vec::new()));
         let sink = output.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
         let reader = std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
-            // Ends with EIO once every slave descriptor is closed.
-            while let Ok(n @ 1..) = reader.read(&mut buf) {
-                if let Ok(mut out) = sink.lock() {
-                    out.extend_from_slice(&buf[..n]);
+            let tick = Timespec {
+                tv_sec: 0,
+                tv_nsec: 20_000_000,
+            };
+            // Ends with EIO once every slave descriptor is closed, or when asked to stop: its copy of the master
+            // must close too for the terminal to hang up.
+            while !stopped.load(Ordering::SeqCst) {
+                let mut fds = [PollFd::new(&reader, PollFlags::IN)];
+                match rustix::event::poll(&mut fds, Some(&tick)) {
+                    Ok(0) | Err(rustix::io::Errno::INTR) => continue,
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+                match reader.read(&mut buf) {
+                    Ok(n @ 1..) => {
+                        if let Ok(mut out) = sink.lock() {
+                            out.extend_from_slice(&buf[..n]);
+                        }
+                    }
+                    _ => break,
                 }
             }
         });
         Ok(Pty {
-            master,
+            master: Some(master),
             slave: Some(slave),
             output,
+            stop,
             reader: Some(reader),
         })
+    }
+
+    /// Hang the terminal up as closing its window does: every descriptor of the master is closed (the reader's
+    /// copy first), so the kernel hangs up the slave and sends SIGHUP to the session it is the controlling terminal
+    /// of. The test's own slave stays open, hung up.
+    pub fn hang_up(&mut self) -> R {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(reader) = self.reader.take() {
+            reader.join().map_err(|_| "the PTY reader panicked")?;
+        }
+        self.master = None;
+        Ok(())
     }
 
     /// The slave side, for a child's stdin, stdout or stderr.
@@ -115,8 +152,9 @@ impl Pty {
 
     /// Type `bytes` as the user would.
     pub fn send(&mut self, bytes: &[u8]) -> R {
-        self.master.write_all(bytes)?;
-        self.master.flush()?;
+        let master = self.master.as_mut().ok_or("the terminal was hung up")?;
+        master.write_all(bytes)?;
+        master.flush()?;
         Ok(())
     }
 
@@ -188,9 +226,28 @@ pub fn spawn_in(
     args: &[&str],
     env: &[(&str, &str)],
 ) -> R<Hoh> {
+    spawn(pty, true, project, home, args, env)
+}
+
+/// As [`spawn_in`], but in a session of its own without a controlling terminal: the PTY is only its stdio, so a
+/// hang-up sends it no SIGHUP.
+pub fn spawn_without_ctty_in(pty: &Pty, project: &Path, home: &Path) -> R<Hoh> {
+    spawn(pty, false, project, home, &[], &[])
+}
+
+fn spawn(
+    pty: &Pty,
+    ctty: bool,
+    project: &Path,
+    home: &Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> R<Hoh> {
     let mut cmd = Command::new("setsid");
-    cmd.arg("--ctty")
-        .arg(env!("CARGO_BIN_EXE_hoh"))
+    if ctty {
+        cmd.arg("--ctty");
+    }
+    cmd.arg(env!("CARGO_BIN_EXE_hoh"))
         .args(args)
         .current_dir(project)
         .env_clear()
