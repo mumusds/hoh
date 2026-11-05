@@ -606,3 +606,35 @@ fn a_frame_cut_short_is_ended_before_a_diagnostic() {
     settle_on(&mut tty, &steps);
     assert_eq!(tty.out, b"", "nothing left open");
 }
+
+/// A signal ends the handling of a batch between two events: what was read after it is not acted on, so a long batch
+/// (each Enter writes the history) cannot hold up the exit (M1T08R-21).
+#[test]
+fn a_signal_ends_a_batch_between_two_events() {
+    use super::{End, handle, input::Decoder};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut app = App::new("p".to_owned(), History::load(dir.path()));
+    let mut decoder = Decoder::default();
+    decoder.feed(b"x\ry\rz\r");
+    // The flag is raised once two events (x, Enter) have been handled.
+    let looks = std::cell::Cell::new(0);
+    let signal = || {
+        looks.set(looks.get() + 1);
+        if looks.get() > 2 { 15 } else { 0 }
+    };
+    let mut dirty = false;
+    assert_eq!(
+        handle(&mut app, &mut decoder, false, signal, &mut dirty),
+        Some(End::Signal(15))
+    );
+    assert!(dirty);
+    assert_eq!(History::load(dir.path()).entries(), ["x"]);
+    // Without a signal the batch is handled in full.
+    let mut decoder = Decoder::default();
+    decoder.feed(b"y\rz\r");
+    assert_eq!(
+        handle(&mut app, &mut decoder, false, || 0, &mut dirty),
+        None
+    );
+    assert_eq!(History::load(dir.path()).entries(), ["x", "y", "z"]);
+}

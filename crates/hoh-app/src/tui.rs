@@ -169,20 +169,44 @@ fn event_loop(app: &mut App, signal: &AtomicUsize, resized: &AtomicBool) -> std:
             Wait::Idle => true,
             Wait::Interrupted => continue,
         };
-        while let Some(event) = decoder.next(idle) {
-            match event {
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    if let Some(exit) = app.key(key) {
-                        return Ok(End::Left(exit));
-                    }
-                    dirty = true;
+        if let Some(end) = handle(
+            app,
+            &mut decoder,
+            idle,
+            || signal.load(Ordering::SeqCst),
+            &mut dirty,
+        ) {
+            return Ok(end);
+        }
+    }
+}
+
+/// Act on the events decoded from what was read, one at a time. The signal flag is looked at before each, so a long
+/// batch (each Enter writes the history) cannot hold up the exit (M1T08R-21); what is left is not acted on.
+fn handle(
+    app: &mut App,
+    decoder: &mut input::Decoder,
+    idle: bool,
+    signal: impl Fn() -> usize,
+    dirty: &mut bool,
+) -> Option<End> {
+    loop {
+        let sig = signal();
+        if sig != 0 {
+            return Some(End::Signal(sig));
+        }
+        match decoder.next(idle)? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                if let Some(exit) = app.key(key) {
+                    return Some(End::Left(exit));
                 }
-                Event::Paste(text) => {
-                    app.paste(&text);
-                    dirty = true;
-                }
-                _ => {}
+                *dirty = true;
             }
+            Event::Paste(text) => {
+                app.paste(&text);
+                *dirty = true;
+            }
+            _ => {}
         }
     }
 }
