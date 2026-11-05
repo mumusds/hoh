@@ -127,6 +127,26 @@ fn doctor_live_versions_whitelist_and_verified_logins() -> R {
         }
     }
     let (live_code, live) = doctor(&["--live", "--output", "json"])?;
+    // The raw logs of the live turns go into the evidence; the scratch directory doctor kept is removed.
+    for agent in ["codex", "claude", "pi"] {
+        if let Some(logs) = live["agents"][agent]["live"]["logs"]
+            .as_str()
+            .map(PathBuf::from)
+        {
+            let into = out.join("doctor-live").join(agent);
+            std::fs::create_dir_all(&into)?;
+            for entry in std::fs::read_dir(&logs).into_iter().flatten().flatten() {
+                std::fs::copy(entry.path(), into.join(entry.file_name()))?;
+            }
+            if let Some(scratch) = logs.parent().and_then(|p| p.parent())
+                && scratch
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("hoh-doctor-live-"))
+            {
+                let _ = std::fs::remove_dir_all(scratch);
+            }
+        }
+    }
     let mut sessions = Vec::new();
     let mut missing = false;
     let mut verified = 0;
