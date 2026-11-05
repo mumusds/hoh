@@ -108,12 +108,13 @@ pub fn argv(launch: &Launch) -> Result<Argv, Blocked> {
     }
     Ok(Argv {
         args,
-        // What this adapter implements: events, resume and deltas where the help offers them. One prompt on stdin, then
-        // stdin closes, so no steer and no dialog; it records no token usage (M1T04R-12, -15, -16).
+        // What this adapter implements: events, the result's token usage, and resume and deltas where the help offers
+        // them. One prompt on stdin, then stdin closes, so no steer and no dialog (M1T04R-12, -15, -17).
         capabilities: crate::capabilities::of_session(
             &launch.capabilities,
             &[
                 ("structured_events", true),
+                ("token_usage", true),
                 ("resume", resume),
                 ("partial_messages", partial),
             ],

@@ -1710,11 +1710,14 @@ async fn an_exec_session_resumes_only_if_a_resumed_exec_turn_could_start() -> R 
     let world = World::new()?;
     let resume_help = "Usage: codex exec resume [OPTIONS] [SESSION_ID] [PROMPT]\n  --json\n  --dangerously-bypass-approvals-and-sandbox\n  -m, --model <MODEL>\n";
     let json_only = "Usage: codex exec resume [SESSION_ID]\n  --json\n";
+    let no_model = "Usage: codex exec resume [SESSION_ID]\n  --json\n  --dangerously-bypass-approvals-and-sandbox\n";
     for (i, (help, yolo, resumable)) in [
         (None, true, false),
         (Some(json_only), true, false),
         // Written by a turn that needs neither: a later YOLO turn or one with a model could not resume.
         (Some(json_only), false, false),
+        // A later turn with a model could not resume (M1T04R-18).
+        (Some(no_model), true, false),
         (Some(resume_help), true, true),
         (Some(resume_help), false, true),
     ]

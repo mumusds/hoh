@@ -459,15 +459,17 @@ async fn the_session_has_the_capabilities_the_probe_found() -> R {
         (&json!(false), &json!(false)),
         "{caps}"
     );
-    // Nor what the adapter does not do: it records no token usage and offers no custom tools (M1T04R-15, -16).
+    // It records the result's token usage, so the probe decides that one; it offers no custom tools (M1T04R-15, -17).
     assert_eq!(
         (&caps["token_usage"], &caps["custom_tools"]),
-        (&json!(false), &json!(false)),
+        (&json!(true), &json!(false)),
         "{caps}"
     );
     assert_eq!(
         hoh_core::decision::granted_capabilities(&caps),
-        ["structured_events".to_owned()].into_iter().collect()
+        ["structured_events".to_owned(), "token_usage".to_owned()]
+            .into_iter()
+            .collect()
     );
     Ok(())
 }
