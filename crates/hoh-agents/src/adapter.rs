@@ -135,18 +135,23 @@ fn declared(line: &str) -> Option<Vec<&str>> {
     (!names.is_empty()).then_some(names)
 }
 
-/// The name of an option word (`-x`, `-xy`, `--name`, `--name=<value>`, `--name[=value]`), or `None`.
+/// The name of an option word (`-x`, `-xy` starting with a letter, `--name`, `--name=<value>`, `--name[=value]`), or `None`.
 fn flag_name(word: &str) -> Option<&str> {
     let cut = word.find(['=', '[']).unwrap_or(word.len());
     let (name, rest) = word.split_at(cut);
     let rest = rest.strip_prefix('=').unwrap_or(rest);
-    let named = match name.strip_prefix("--") {
-        Some(long) => {
+    let named = match (name.strip_prefix("--"), name.strip_prefix('-')) {
+        (Some(long), _) => {
             long.starts_with(|c: char| c.is_ascii_alphanumeric())
                 && long.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
         }
-        // A short name may have several letters (pi: `--no-tools, -nt`; M1T07R-22).
-        None => name.len() >= 2 && name[1..].chars().all(|c| c.is_ascii_alphanumeric()),
+        // A short name starts with a letter and may have several letters or digits (pi: `--no-tools, -nt`;
+        // M1T07R-22); `-123` is a number, not an option (M1T07R-24).
+        (None, Some(short)) => {
+            short.starts_with(|c: char| c.is_ascii_alphabetic())
+                && short.chars().all(|c| c.is_ascii_alphanumeric())
+        }
+        (None, None) => false,
     };
     (named && name.starts_with('-') && (rest.is_empty() || is_placeholder(rest))).then_some(name)
 }
@@ -304,30 +309,48 @@ mod help_tests {
         assert!(option_text(HELP, "--quiet").is_none());
     }
 
-    /// Every declaration of the recorded pi 1.5.0 help is one, multi-letter short aliases (`--no-tools, -nt`)
-    /// included, and none is read as the previous option's text (M1T07R-22).
+    /// Every declaration of the recorded pi 1.5.0 help is one, all eight multi-letter short aliases included, and
+    /// none is read as the previous option's text (M1T07R-22, -25).
     #[test]
     fn the_recorded_pi_declarations_are_all_declarations() {
         let help = include_str!("../../../tests/fixtures/protocol/pi/1.5.0/help.txt");
-        for flag in [
-            "--no-tools",
-            "-nt",
-            "--no-builtin-tools",
-            "-nbt",
-            "--exclude-tools",
-            "-xt",
-            "--no-approve",
-            "-na",
+        for (long, short) in [
+            ("--no-tools", "-nt"),
+            ("--no-builtin-tools", "-nbt"),
+            ("--exclude-tools", "-xt"),
+            ("--no-extensions", "-ne"),
+            ("--no-skills", "-ns"),
+            ("--no-prompt-templates", "-np"),
+            ("--no-context-files", "-nc"),
+            ("--no-approve", "-na"),
         ] {
-            assert!(offers(help, flag), "{flag}");
+            assert!(offers(help, long) && offers(help, short), "{long}, {short}");
         }
-        for (option, other) in [("--models", "--no-tools"), ("--tools", "--exclude-tools")] {
-            let text = option_text(help, option).unwrap_or_default();
+        for (option, own, other) in [
+            ("--models", "fuzzy matching", "--no-tools"),
+            ("--tools", "mcp__", "--exclude-tools"),
+        ] {
+            let text =
+                option_text(help, option).unwrap_or_else(|| panic!("{option} is not declared"));
+            assert!(text.contains(own), "{option} lost its own text: {text}");
             assert!(
                 !text.contains(other),
                 "{option} took {other}'s text: {text}"
             );
         }
+    }
+
+    /// Text that is no declaration is refused without fail: a word of any script, a negative number (M1T07R-23, -24).
+    #[test]
+    fn other_text_is_no_declaration() {
+        assert_eq!(declared("  --other 中文说明"), None);
+        assert_eq!(declared("  -中文"), None);
+        assert_eq!(declared("      -123"), None);
+        assert_eq!(declared("  -1"), None);
+        assert_eq!(
+            declared("  -nt, --no-tools"),
+            Some(vec!["-nt", "--no-tools"])
+        );
     }
 
     /// A subcommand is a name in the command column of the `Commands:` section, not a wrapped description and not a
