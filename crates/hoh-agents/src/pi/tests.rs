@@ -166,74 +166,36 @@ fn provider_failures_are_classified() {
     );
 }
 
-/// pi 1.5.0's findById, mirrored: the cases where pi finds the session must be found, those where it does not must
-/// not (M1T05R-07/08).
+/// The files noted before a resumed start: every regular `*.jsonl` (symlinks followed) with its identity; a FIFO
+/// would block pi itself, so it makes the directory unsafe (M1T05R-12).
 #[test]
-fn the_session_is_found_as_pi_finds_it() {
+fn the_noted_session_files_are_the_regular_ones() {
+    use std::os::unix::fs::MetadataExt;
     let dir = tempfile::tempdir().expect("tempdir");
-    let cwd = dir.path().join("repo");
-    std::fs::create_dir_all(&cwd).expect("cwd");
-    let cwd = cwd.canonicalize().expect("canonical cwd");
     let sessions = dir.path().join("sessions");
+    assert_eq!(
+        session_files(&sessions),
+        Ok(Vec::new()),
+        "a missing directory has none"
+    );
     std::fs::create_dir_all(&sessions).expect("sessions");
-    let mut l = launch();
-    l.cwd = cwd.clone();
-    l.session_dir = sessions.clone();
-    let header = |cwd: &str| {
-        format!(
-            "{{\"type\":\"session\",\"version\":3,\"id\":\"sid-1\",\"timestamp\":\"2026-11-04T00:00:00.000Z\",\"cwd\":{}}}\n",
-            serde_json::to_string(cwd).expect("json")
-        )
+    let a = sessions.join("2026-11-04T00-00-00-000Z_sid-1.jsonl");
+    std::fs::write(&a, "{}\n").expect("write");
+    std::fs::write(sessions.join("notes.txt"), "x").expect("write");
+    let outside = dir.path().join("elsewhere.jsonl");
+    std::fs::write(&outside, "{}\n").expect("write");
+    std::os::unix::fs::symlink(&outside, sessions.join("linked.jsonl")).expect("symlink");
+    std::os::unix::fs::symlink(dir.path().join("gone"), sessions.join("dangling.jsonl"))
+        .expect("symlink");
+    let files = session_files(&sessions).expect("no unsafe entry");
+    let id = |p: &std::path::Path| {
+        let m = std::fs::metadata(p).expect("meta");
+        (p.canonicalize().expect("canonical"), m.dev(), m.ino())
     };
-    let file = sessions.join("2026-11-04T00-00-00-000Z_sid-1.jsonl");
-    let here = cwd.to_str().expect("utf-8 cwd");
-    let found = |body: &str| {
-        std::fs::write(&file, body).expect("write");
-        find_session(&l)
-    };
-    // Found by pi: blank lines, a BOM-only line and lines that are not JSON come first; a long header; a relative cwd
-    // (taken from pi's own cwd); a header without a newline at the end.
-    for body in [
-        header(here),
-        format!("\n   \n{}", header(here)),
-        format!("\u{feff}\n{}", header(here)),
-        format!("not json\n{{broken\n{}", header(here)),
-        format!("null\nfalse\n0\n\"\"\n{}", header(here)),
-        header(here).replace(
-            "\"version\":3",
-            &format!("\"pad\":\"{}\",\"version\":3", "x".repeat(70 << 10)),
-        ),
-        header("."),
-        header(&format!("{here}/sub/..")),
-        header(here).trim_end().to_owned(),
-    ] {
-        assert_eq!(
-            found(&body).as_deref(),
-            Some(file.canonicalize().expect("file").as_path()),
-            "{}",
-            &body[..body.len().min(120)]
-        );
-    }
-    // Not found by pi: empty, another cwd, the first JSON line is not a header, a number, no string id, a header past
-    // 1 MiB, a cwd that names the same directory only through a symlink.
-    let link = dir.path().join("link");
-    std::os::unix::fs::symlink(&cwd, &link).expect("symlink");
-    for body in [
-        String::new(),
-        header("/elsewhere"),
-        format!("{{\"type\":\"message\",\"id\":\"x\"}}\n{}", header(here)),
-        header(here).replace("\"type\":\"session\"", "\"type\":\"message\""),
-        format!("7\n{}", header(here)),
-        header(here).replace("\"id\":\"sid-1\"", "\"id\":1"),
-        format!("{}\n{}", "x".repeat((1 << 20) + 10), header(here)),
-        header(link.to_str().expect("utf-8")),
-        header(""),
-    ] {
-        assert_eq!(found(&body), None, "{}", &body[..body.len().min(120)]);
-    }
-    // A FIFO named like a session file is skipped, not opened (it would block).
-    std::fs::remove_file(&file).expect("remove");
-    let fifo = sessions.join("2026-11-04T00-00-00-000Z_sid-1.jsonl");
+    let mut want = vec![id(&a), id(&outside)];
+    want.sort();
+    assert_eq!(files, want);
+    let fifo = sessions.join("0000_fifo.jsonl");
     assert!(
         std::process::Command::new("mkfifo")
             .arg(&fifo)
@@ -241,12 +203,7 @@ fn the_session_is_found_as_pi_finds_it() {
             .expect("mkfifo")
             .success()
     );
-    let other = sessions.join("2026-11-05T00-00-00-000Z_sid-1.jsonl");
-    std::fs::write(&other, header(here)).expect("write");
-    assert_eq!(
-        find_session(&l).as_deref(),
-        Some(other.canonicalize().expect("other").as_path())
-    );
+    assert_eq!(session_files(&sessions), Err("0000_fifo.jsonl".to_owned()));
 }
 
 #[test]
@@ -262,4 +219,37 @@ fn a_rate_limit_that_mentions_the_key_is_not_an_authentication_failure() {
     assert_eq!(provider_failure("Invalid API key provided"), "BLOCKED_AUTH");
     assert_eq!(provider_failure("Incorrect API key"), "BLOCKED_AUTH");
     assert_eq!(provider_failure("authentication failed"), "BLOCKED_AUTH");
+    // Numbers that belong to a key, a model or an id do not decide (M1T05R-13).
+    assert_eq!(
+        provider_failure("401 Invalid API key provided: sk-test429"),
+        "BLOCKED_AUTH"
+    );
+    assert_eq!(
+        provider_failure("Model not found: vendor/model-503"),
+        "MODEL_UNAVAILABLE"
+    );
+    assert_eq!(
+        provider_failure("No API key found for model-529"),
+        "BLOCKED_AUTH"
+    );
+    assert_eq!(
+        provider_failure("Request req_503abc failed: bad input"),
+        "PERMANENT_EXTERNAL"
+    );
+    assert_eq!(
+        provider_failure("503 Service Unavailable"),
+        "TRANSIENT_EXTERNAL"
+    );
+    assert_eq!(
+        provider_failure("404 model gpt-x does not exist"),
+        "MODEL_UNAVAILABLE"
+    );
+    assert_eq!(provider_failure("400 bad request"), "PERMANENT_EXTERNAL");
+    // Only the status says what these are.
+    assert_eq!(
+        provider_failure("401 Your token has expired"),
+        "BLOCKED_AUTH"
+    );
+    assert_eq!(provider_failure("403 Forbidden"), "BLOCKED_AUTH");
+    assert_eq!(provider_failure("502 Bad Gateway"), "TRANSIENT_EXTERNAL");
 }

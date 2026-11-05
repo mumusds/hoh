@@ -895,8 +895,8 @@ async fn a_busy_answer_is_checked_again_when_the_work_ends() -> R {
     Ok(())
 }
 
-/// A session file that is not the session (empty, or of another cwd) is not resumed, and a pi that opens another file
-/// for the id is not taken at its word (M1T05R-03).
+/// A session file pi does not take (empty, or of another cwd), and a pi that opens another file for the id: the
+/// session was not resumed, so no prompt goes out (M1T05R-03, M1T05R-10/11: pi chooses, HoH checks the choice).
 #[tokio::test]
 async fn only_the_sessions_own_file_is_resumed() -> R {
     let world = World::new()?;
@@ -910,6 +910,7 @@ async fn only_the_sessions_own_file_is_resumed() -> R {
         let attempt = world.attempt_in("pi", name, name, "1.5.0").await?;
         let mut turn = world.turn(&fake, &format!("logs/{name}"))?;
         turn.launch.resume = true;
+        turn.launch.session_dir = world.dir.path().join(".hoh/pi-sessions").join(name);
         std::fs::create_dir_all(&turn.launch.session_dir)?;
         let file = turn.launch.session_dir.join(format!(
             "2026-11-04T00-00-00-000Z_{}.jsonl",
@@ -919,13 +920,17 @@ async fn only_the_sessions_own_file_is_resumed() -> R {
             format!("{}\n", header(cwd, &turn.launch.session_id))
         });
         std::fs::write(&file, body)?;
+        // pi decides which file is the session; it does not take these, so it did not resume the session.
         let outcome = run(&world, &attempt, &turn).await?;
         assert_eq!(
             (outcome.state, outcome.failure.as_deref()),
-            (AttemptState::Failed, Some("SESSION_NOT_FOUND")),
+            (AttemptState::Failed, Some("SESSION_MISMATCH")),
             "{name}"
         );
-        assert!(argvs(&fake)?.is_empty(), "{name}: no process may start");
+        assert!(
+            !received(&fake)?.iter().any(|m| m["type"] == "prompt"),
+            "{name}: no prompt may be sent"
+        );
     }
     // The session's own file exists, but this pi opens a new one for the id.
     let mut fresh = resume.clone();
@@ -1091,5 +1096,43 @@ async fn a_session_file_that_vanished_is_not_the_session() -> R {
         !received(&fake)?.iter().any(|m| m["type"] == "prompt"),
         "no prompt may be sent"
     );
+    Ok(())
+}
+
+/// A `*.jsonl` entry that is not a regular file would block pi's own session lookup: nothing starts (M1T05R-12).
+#[tokio::test]
+async fn a_session_directory_that_would_block_pi_is_refused() -> R {
+    let world = World::new()?;
+    let fake = world.fake("fifo", &Case::load("rpc-resume")?)?;
+    let attempt = world.attempt("A1").await?;
+    let mut turn = world.turn(&fake, "logs/A1")?;
+    turn.launch.resume = true;
+    std::fs::create_dir_all(&turn.launch.session_dir)?;
+    let header = json!({"type": "session", "version": 3, "id": turn.launch.session_id,
+                        "timestamp": "2026-11-04T00:00:00.000Z", "cwd": world.dir.path().canonicalize()?});
+    std::fs::write(
+        turn.launch.session_dir.join(format!(
+            "2026-11-05T00-00-00-000Z_{}.jsonl",
+            turn.launch.session_id
+        )),
+        format!("{header}\n"),
+    )?;
+    let fifo = turn
+        .launch
+        .session_dir
+        .join("2026-11-04T00-00-00-000Z_fifo.jsonl");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()?
+            .success()
+    );
+    let outcome =
+        tokio::time::timeout(Duration::from_secs(10), run(&world, &attempt, &turn)).await??;
+    assert_eq!(
+        (outcome.state, outcome.failure.as_deref()),
+        (AttemptState::Failed, Some("SESSION_DIR_UNSAFE"))
+    );
+    assert!(argvs(&fake)?.is_empty(), "no process may start");
     Ok(())
 }
