@@ -300,3 +300,22 @@ fn help_does_not_skip_the_project_check_or_the_version_rule() -> R {
     assert!(!Path::new("/nonexistent").exists());
     Ok(())
 }
+
+/// A message that cannot be written does not change the exit code: with stderr on a full device, a usage error still
+/// exits 64 and a command not built yet still exits 3, not 101 from a panic while printing (M1QA-01).
+#[test]
+fn the_exit_code_holds_when_stderr_cannot_be_written() -> R {
+    let env = Env::new()?;
+    for (args, code) in [(&["--no-such-flag"][..], 64), (&["attach"], 3)] {
+        let out = Command::new(env!("CARGO_BIN_EXE_hoh"))
+            .args(args)
+            .current_dir(env.project.path())
+            .env_clear()
+            .env("HOME", env.home.path())
+            .stderr(std::fs::OpenOptions::new().write(true).open("/dev/full")?)
+            .output()?;
+        assert_eq!(out.status.code(), Some(code), "{args:?}");
+        assert!(out.stdout.is_empty(), "{args:?}");
+    }
+    Ok(())
+}

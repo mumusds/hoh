@@ -1,6 +1,7 @@
 //! `hoh` with a terminal on stdin and stdout: the Workspace shell (REQ-001; ADR-014). Signals are registered before
-//! the terminal changes, so a SIGTERM, SIGHUP or SIGINT at any point after that restores it; the loop polls input in
-//! short slices and looks at the signal flag between them. Leaving only closes this client.
+//! the terminal changes, so a SIGTERM, SIGHUP or SIGINT at any point after that restores it. Terminal events are read
+//! on a thread of their own; the loop waits for them in short slices, looks at the signal flag between them, and ends
+//! when the terminal hangs up. Leaving only closes this client.
 
 mod app;
 mod editor;
@@ -15,10 +16,12 @@ use history::History;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use rustix::event::{PollFd, PollFlags, Timespec};
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, sync_channel};
 use std::time::Duration;
 
 /// How long one wait for input lasts before the signal flag is looked at again.
@@ -49,7 +52,7 @@ pub fn run(project: &Path) -> u8 {
     for sig in [SIGTERM, SIGHUP, SIGINT] {
         let value = usize::try_from(sig).unwrap_or(usize::MAX);
         if let Err(e) = signal_hook::flag::register_usize(sig, Arc::clone(&signal), value) {
-            eprintln!("hoh：无法登记信号处理：{e}");
+            say!("hoh：无法登记信号处理：{e}");
             return code(ClientEvent::TerminalIo);
         }
     }
@@ -66,7 +69,7 @@ pub fn run(project: &Path) -> u8 {
     let (code, message) = outcome(end, restored, signal.load(Ordering::SeqCst));
     if let Some(message) = message {
         terminal::settle();
-        eprintln!("hoh：{message}");
+        say!("hoh：{message}");
     }
     code
 }
@@ -107,6 +110,7 @@ fn outcome(
 
 fn event_loop(app: &mut App, signal: &AtomicUsize) -> std::io::Result<End> {
     let mut terminal = Terminal::new(CrosstermBackend::new(terminal::Output::new()?))?;
+    let events = events()?;
     let mut dirty = true;
     loop {
         let sig = signal.load(Ordering::SeqCst);
@@ -118,8 +122,8 @@ fn event_loop(app: &mut App, signal: &AtomicUsize) -> std::io::Result<End> {
             dirty = false;
             debug_panic();
         }
-        if event::poll(TICK)? {
-            match event::read()? {
+        match events.recv_timeout(TICK) {
+            Ok(event) => match event? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     if let Some(exit) = app.key(key) {
                         return Ok(End::Left(exit));
@@ -132,9 +136,54 @@ fn event_loop(app: &mut App, signal: &AtomicUsize) -> std::io::Result<End> {
                 }
                 Event::Resize(..) => dirty = true,
                 _ => {}
+            },
+            Err(RecvTimeoutError::Timeout) if hung_up() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "终端已断开",
+                ));
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(std::io::Error::other("终端输入的读取已停止"));
             }
         }
     }
+}
+
+/// Terminal events, read on a thread of their own. crossterm 0.29 never returns from a read once the terminal is at
+/// end of file, as a hung-up one is: it retries the zero-byte read forever, whatever the timeout. So the loop waits
+/// on this channel, never inside crossterm, and stays free to see a signal or the hang-up (M1QA-01). The thread ends
+/// with the process.
+fn events() -> std::io::Result<Receiver<std::io::Result<Event>>> {
+    let (tx, rx) = sync_channel(64);
+    std::thread::Builder::new()
+        .name("hoh-tui-input".to_owned())
+        .spawn(move || {
+            loop {
+                let event = event::read();
+                let failed = event.is_err();
+                if tx.send(event).is_err() || failed {
+                    break;
+                }
+            }
+        })?;
+    Ok(rx)
+}
+
+/// Whether the terminal has hung up: its window or connection was closed. crossterm reads stdin, which is the
+/// terminal here (bare `hoh` needs one); poll(2) reports the hang-up on it without reading.
+fn hung_up() -> bool {
+    let stdin = std::io::stdin();
+    let mut fds = [PollFd::new(&stdin, PollFlags::IN)];
+    let now = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    matches!(rustix::event::poll(&mut fds, Some(&now)), Ok(1..))
+        && fds[0]
+            .revents()
+            .intersects(PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL)
 }
 
 /// Debug builds only: `HOH_DEBUG_TUI_PANIC` panics after a draw, so the PTY test can see the terminal restored
