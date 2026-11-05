@@ -66,3 +66,14 @@ Mutation check: dropping the strip from `child_env`, keeping a variable in the N
 |---|---|---|---|
 | TB-06 | low | test_tools.py:148 — the check.sh test only searched for the `-u` text: with the whole `env` command commented out it still passed. | Fixed: the test runs a copy of check.sh whose `python3` records its argv and environment, and asserts the unittest run has none of the six variables while the other steps keep them. |
 | TB-07 | low | test_tools.py:143 — the regex over run_check.py read single-quoted keys only. | Fixed: the keys are read from run_check.py's syntax tree (the dict merged into `env`). Both reviewer mutants (the `env -u` removed, a double-quoted key added) now fail the tests. |
+
+### Round 3 (focused on TB-06, TB-07, fresh Claude session)
+
+- Agent: `claude` 2.1.318, session `370230f1-7020-4270-9201-6ec3423fd1da`, 612 s; attempt record sha256 `794dbdb51553547946b41d5c1c0648a2654d28db6a1b2d37ddf2a9a863b26858`, stdout sha256 `00de5c71c75fd01d764b5d4d230aa609fe880b504b778422b326e516dc46bc59`.
+- Scope: `f3bd36d..a7dcb39`; the two guard tests against 13 mutants and a project venv on a path with a space.
+- Verdict: **PASS** (1 medium, 1 low).
+
+| ID | Severity | Summary | Disposition |
+|---|---|---|---|
+| TB-08 | medium | test_tools.py:154 — the recorder's `#!/usr/bin/env -S <interpreter>` split an interpreter path with a space, so the bundle self-test failed (rc 127) in a checkout on such a path; a regression of `a7dcb39`. | Fixed: the recorder is a `.py` file started by a `/bin/sh` shim that execs the quoted interpreter and recorder. Verified with a venv on a path with a space. |
+| TB-09 | low | test_tools.py:145 — reading constant keys from the syntax tree missed keys built otherwise (an f-string, `**`, a key set after the dict), and the disposition of TB-07 claimed "however they are spelt". | Fixed by a behavioural test instead: `CandidateAndChecks.test_the_check_variables_are_those_run_check_sets` runs a real check through run_check, with every outer `HOH_` variable removed, whose command records the `HOH_` variables it sees; they must be exactly `CHECK_VARIABLES`. An f-string key and a key set after the dict both fail it now. TB-07's disposition above overstated the syntax-tree test. |
