@@ -69,11 +69,19 @@ pub struct Argv {
     pub capabilities: Value,
 }
 
-/// Why this claude's help gives the adapter no way to run a turn at all (no `--output-format` with `stream-json`), or
-/// `None`. The probe applies the same rule, so doctor never calls a claude compatible that the adapter cannot drive
-/// (M1R-03).
+/// Why this claude's help gives the adapter no way to run a turn at all, or `None`: every turn passes `-p`,
+/// `--output-format stream-json` and `--verbose`, so each must be declared, `stream-json` among `--output-format`'s
+/// own values. The probe applies the same rule, so doctor never calls a claude compatible that the adapter cannot
+/// drive (M1R-03, M1T07R-14).
 pub fn interface_missing(help: &str) -> Option<String> {
-    (!offers(help, "--output-format") || !help.contains("stream-json")).then(|| {
+    if let Some(flag) = ["-p", "--verbose"].into_iter().find(|f| !offers(help, f)) {
+        return Some(format!(
+            "claude --help offers no {flag} (protocol incompatible)"
+        ));
+    }
+    (!crate::adapter::option_text(help, "--output-format")
+        .is_some_and(|t| t.contains("stream-json")))
+    .then(|| {
         "claude --help offers no --output-format stream-json (protocol incompatible)".to_owned()
     })
 }

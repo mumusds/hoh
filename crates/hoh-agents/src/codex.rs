@@ -107,6 +107,30 @@ pub fn exec_resumable(launch: &Launch) -> bool {
             .all(|flag| !offers(&launch.exec_help, flag) || offers(help, flag))
 }
 
+/// The App Server requests and notification every turn uses: the handshake, the thread and the turn, and the turn's
+/// end. An App Server whose schema lacks one cannot run a turn (M1T07R-15).
+pub const APP_SERVER_REQUESTS: &[&str] = &["initialize", "thread/start", "turn/start"];
+pub const APP_SERVER_NOTIFICATIONS: &[&str] = &["turn/completed"];
+
+/// Why an App Server with these request and notification methods (its schema's) cannot run a turn, or `None`. The
+/// probe and doctor --live apply it before choosing the App Server over exec (M1T07R-15).
+pub fn app_server_interface_missing(
+    requests: &BTreeSet<String>,
+    notifications: &BTreeSet<String>,
+) -> Option<String> {
+    let missing: Vec<&str> = APP_SERVER_REQUESTS
+        .iter()
+        .filter(|m| !requests.contains(**m))
+        .chain(
+            APP_SERVER_NOTIFICATIONS
+                .iter()
+                .filter(|m| !notifications.contains(**m)),
+        )
+        .copied()
+        .collect();
+    (!missing.is_empty()).then(|| format!("the App Server schema has no {}", missing.join(", ")))
+}
+
 /// Why this `codex exec --help` gives the exec fallback no way to run a turn (no `--json`), or `None`; the probe applies
 /// the same rule (M1R-03).
 pub fn exec_interface_missing(help: &str) -> Option<String> {
@@ -529,7 +553,8 @@ fn session(
             ("token_usage", true),
             (
                 "resume",
-                offers(&turn.launch.exec_help, "resume") && exec_resumable(&turn.launch),
+                crate::adapter::lists_command(&turn.launch.exec_help, "resume")
+                    && exec_resumable(&turn.launch),
             ),
         ]
     };

@@ -79,8 +79,9 @@ fn prepare(
             deadline: Some(DEADLINE),
         }),
         Agent::Codex => {
-            // app-server when the CLI has one (its schema then names the known notifications); exec otherwise.
-            let app_server_help = stdout_of(launcher, &["app-server", "--help"], env).ok();
+            // app-server when the CLI has one whose schema has what every turn needs (the schema then names the known
+            // notifications); exec otherwise, as the probe decides (M1T07R-15).
+            let mut app_server_help = stdout_of(launcher, &["app-server", "--help"], env).ok();
             let known = match &app_server_help {
                 None => Default::default(),
                 Some(_) => {
@@ -91,15 +92,26 @@ fn prepare(
                         &["app-server", "generate-json-schema", "--out", &schema_arg],
                         env,
                     )?;
-                    let notifications: Value = std::fs::read(
-                        schema.join("ServerNotification.json"),
+                    let methods =
+                        |name: &str| -> Result<std::collections::BTreeSet<String>, String> {
+                            let file: Value = std::fs::read(schema.join(name))
+                                .ok()
+                                .and_then(|b| serde_json::from_slice(&b).ok())
+                                .ok_or(format!(
+                                    "codex app-server generate-json-schema gave no {name}"
+                                ))?;
+                            Ok(codex::known_notifications(&file))
+                        };
+                    let notifications = methods("ServerNotification.json")?;
+                    if codex::app_server_interface_missing(
+                        &methods("ClientRequest.json")?,
+                        &notifications,
                     )
-                    .ok()
-                    .and_then(|b| serde_json::from_slice(&b).ok())
-                    .ok_or(
-                        "codex app-server generate-json-schema gave no ServerNotification.json",
-                    )?;
-                    codex::known_notifications(&notifications)
+                    .is_some()
+                    {
+                        app_server_help = None;
+                    }
+                    notifications
                 }
             };
             Prepared::Codex(codex::Turn {
