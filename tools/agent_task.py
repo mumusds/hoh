@@ -31,6 +31,7 @@ REQUIRED={
  'codex':['--json','--dangerously-bypass-approvals-and-sandbox'],
  'claude':['--output-format','--verbose','--dangerously-skip-permissions'],
  'pi':['--mode','--session-dir'],
+ 'grok':['--prompt-file','--output-format','--always-approve'],
 }
 def help_text(agent:str,cwd:Path)->str:
     cmd=[agent,'exec','--help'] if agent=='codex' else [agent,'--help']
@@ -44,6 +45,9 @@ def command_for(agent:str,session_dir:Path,model:str|None,help_output:str|None=N
         if missing:raise ValueError('unsupported native CLI flags: '+','.join(missing))
     if agent=='codex':cmd=['codex','exec','--json','--dangerously-bypass-approvals-and-sandbox','-']
     elif agent=='claude':cmd=['claude','-p','--dangerously-skip-permissions','--output-format','stream-json','--verbose']
+    # Grok's headless single turn reads its prompt from a file; the bridge sends it on stdin like the others.
+    # streaming-messages-json is Claude-style: system/init with session_id, messages, a final result.
+    elif agent=='grok':cmd=['grok','--prompt-file','/dev/stdin','--output-format','streaming-messages-json','--always-approve']
     else:
         cmd=['pi','--mode','json','--session-dir',str(session_dir)]
         if help_output and flag_supported(help_output,'--approve'):cmd+=['--approve']
@@ -79,7 +83,7 @@ def inspect_output(agent:str,path:Path)->dict:
             if agent=='codex' and t=='item.completed':
                 item=r.get('item',{})
                 if isinstance(item,dict) and item.get('type')=='agent_message':text=item.get('text')
-            elif agent=='claude' and t=='result':text=r.get('result')
+            elif agent in ('claude','grok') and t=='result':text=r.get('result')
             elif agent=='pi' and t=='message_end':
                 message=r.get('message',{})
                 if isinstance(message,dict) and message.get('role')=='assistant':
@@ -97,7 +101,7 @@ def inspect_output(agent:str,path:Path)->dict:
                 terminal|=t=='turn.completed'
                 failed|=t=='turn.failed'
                 transient+=t=='error'
-            elif agent=='claude' and t=='result':
+            elif agent in ('claude','grok') and t=='result':
                 terminal=True;failed|=r.get('is_error',False) or r.get('subtype') not in [None,'success']
             elif agent=='pi':
                 # JSON mode is a one-shot process: observed process exit is also

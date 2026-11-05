@@ -8,7 +8,7 @@
 
 ## 自举编排（CR-001）
 
-- **M0–M2：** 一个主开发会话（顶层，单写者）加独立 Review 会话。Review 通过 `python3 tools/agent_task.py --agent codex --role reviewer --prompt-file <渲染后的prompt>` 发起一个全新会话；Codex 不可用时用另一个全新 Claude 会话。Review 只读冻结候选、不改代码。
+- **M0–M2：** 一个主开发会话（顶层，单写者）加独立 Review 会话。Review 通过 `python3 tools/agent_task.py --agent codex --role reviewer --prompt-file <渲染后的prompt>` 发起一个全新会话；Codex 不可用（如“模型容量已满”）时改用另一个全新的 Claude 或 Grok 会话；需要时可让另一个 Agent 的全新会话在同一候选上并行做第二份独立 Review。四个 Agent（Codex、Claude、Pi、Grok）都是足额订阅（项目所有者，2026-11-05）。Review 只读冻结候选、不改代码。
 - **v0.1 发布：** 在 M2 全部完成后（CR-003 D2）。QA 与 Review 必须是两个不同的独立会话，且都不同于开发会话（门禁会核对原生 attempt 记录中的 session_ids）。检查内的独立会话用 `agent_task.py --report-out "$HOH_EVIDENCE_DIR/independent-report.json"` 运行：Agent 在最后一条消息里给出 ```hoh-report 代码块，身份与哈希由桥在会话结束后填写。
 - **M2 通过后：** 按产品默认团队接入 Codex 指挥与 Pi QA，并先用小任务与外部结果比对，不让未验证的 Runtime 自己签收自己。
 - **防嵌套：** `agent_task.py` 给每个原生子进程设置 `HOH_BOOTSTRAP_PARENT`；带这个变量的会话不能再以 `--top-level` 或 `start.sh` 启动顶层会话。
