@@ -106,7 +106,7 @@ pub(crate) async fn finish(
 const DECLARATION_INDENT: usize = 8;
 
 /// The option names a line declares, or `None` for a line that declares no option. A declaration, indented at most
-/// [`DECLARATION_INDENT`] spaces, is one or more names (`-x`, `--name`, comma-separated, a name may carry `=<value>` or
+/// [`DECLARATION_INDENT`] spaces, is one or more names (`-x` or `-xy`, `--name`, comma-separated, a name may carry `=<value>` or
 /// `[=value]`) and then only value placeholders (`<value>`, `[value]`, `VALUE`, each maybe ending in `...`), up to two
 /// spaces or a tab before its description, or the end of the line. Anything else is text: a continuation line, a list
 /// item `- x`, a mention like `--output-format=stream-json)` (M1R-03, M1T07R-18).
@@ -135,7 +135,7 @@ fn declared(line: &str) -> Option<Vec<&str>> {
     (!names.is_empty()).then_some(names)
 }
 
-/// The name of an option word (`-x`, `--name`, `--name=<value>`, `--name[=value]`), or `None`.
+/// The name of an option word (`-x`, `-xy`, `--name`, `--name=<value>`, `--name[=value]`), or `None`.
 fn flag_name(word: &str) -> Option<&str> {
     let cut = word.find(['=', '[']).unwrap_or(word.len());
     let (name, rest) = word.split_at(cut);
@@ -145,7 +145,8 @@ fn flag_name(word: &str) -> Option<&str> {
             long.starts_with(|c: char| c.is_ascii_alphanumeric())
                 && long.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
         }
-        None => name.len() == 2 && name[1..].starts_with(|c: char| c.is_ascii_alphanumeric()),
+        // A short name may have several letters (pi: `--no-tools, -nt`; M1T07R-22).
+        None => name.len() >= 2 && name[1..].chars().all(|c| c.is_ascii_alphanumeric()),
     };
     (named && name.starts_with('-') && (rest.is_empty() || is_placeholder(rest))).then_some(name)
 }
@@ -301,6 +302,32 @@ mod help_tests {
         let mode = option_text(HELP, "--mode").unwrap_or_default();
         assert!(has_word(&mode, "json") && has_word(&mode, "rpc"), "{mode}");
         assert!(option_text(HELP, "--quiet").is_none());
+    }
+
+    /// Every declaration of the recorded pi 1.5.0 help is one, multi-letter short aliases (`--no-tools, -nt`)
+    /// included, and none is read as the previous option's text (M1T07R-22).
+    #[test]
+    fn the_recorded_pi_declarations_are_all_declarations() {
+        let help = include_str!("../../../tests/fixtures/protocol/pi/1.5.0/help.txt");
+        for flag in [
+            "--no-tools",
+            "-nt",
+            "--no-builtin-tools",
+            "-nbt",
+            "--exclude-tools",
+            "-xt",
+            "--no-approve",
+            "-na",
+        ] {
+            assert!(offers(help, flag), "{flag}");
+        }
+        for (option, other) in [("--models", "--no-tools"), ("--tools", "--exclude-tools")] {
+            let text = option_text(help, option).unwrap_or_default();
+            assert!(
+                !text.contains(other),
+                "{option} took {other}'s text: {text}"
+            );
+        }
     }
 
     /// A subcommand is a name in the command column of the `Commands:` section, not a wrapped description and not a
