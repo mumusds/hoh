@@ -638,3 +638,49 @@ fn a_signal_ends_a_batch_between_two_events() {
     );
     assert_eq!(History::load(dir.path()).entries(), ["x", "y", "z"]);
 }
+
+/// The view of the old algorithm: whole graphemes dropped from the front until the text before the cursor fits.
+fn view_by_dropping(e: &Editor, width: usize) -> (String, usize) {
+    use unicode_segmentation::UnicodeSegmentation;
+    let text = e.text();
+    let room = width.saturating_sub(1);
+    let before = &text[..e.cursor_byte()];
+    let mut start = 0;
+    while before[start..].width() > room {
+        match before[start..].graphemes(true).next() {
+            Some(g) => start += g.len(),
+            None => break,
+        }
+    }
+    (text[start..].to_owned(), before[start..].width())
+}
+
+/// The visible part of a long line is found walking back from the cursor, once per draw: 64 KiB takes far less than
+/// a second, where dropping graphemes from the front one by one took tens of seconds, all that time without looking
+/// at the signal flags (M1T08R-31). It is the same part as before, for wide and combining characters too.
+#[test]
+fn the_view_of_a_long_line_is_found_in_linear_time() {
+    let mut e = Editor::default();
+    e.insert(&"x".repeat(64 << 10));
+    let started = std::time::Instant::now();
+    let (shown, column) = e.view(100);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!((shown.len(), column), (99, 99));
+    let mut e = Editor::default();
+    e.insert("ab草稿e\u{301}👩\u{200d}👩c草");
+    for left in 0..8 {
+        for width in 0..12 {
+            let (shown, column) = e.view(width);
+            assert_eq!(
+                (shown.to_owned(), column),
+                view_by_dropping(&e, width),
+                "left {left}, width {width}"
+            );
+        }
+        e.left();
+    }
+}

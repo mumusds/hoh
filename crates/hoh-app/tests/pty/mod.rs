@@ -331,7 +331,6 @@ pub fn exit_within(Hoh(child): &mut Hoh, timeout: Duration) -> R<ExitStatus> {
     }
 }
 
-/// Send `signal` to the process `child`.
 /// Wait until `hoh` (single-threaded) is inside write(2), as its `/proc/<pid>/syscall` says.
 pub fn in_write(Hoh(child): &Hoh, timeout: Duration) -> R {
     #[cfg(target_arch = "x86_64")]
@@ -349,6 +348,7 @@ pub fn in_write(Hoh(child): &Hoh, timeout: Duration) -> R {
     Err(format!("hoh was not seen in write(2) within {timeout:?}").into())
 }
 
+/// Send `signal` to the process `child`.
 pub fn signal(Hoh(child): &Hoh, signal: rustix::process::Signal) -> R {
     let pid = rustix::process::Pid::from_child(child);
     rustix::process::kill_process(pid, signal)?;
