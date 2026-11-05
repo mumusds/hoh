@@ -44,6 +44,9 @@ struct Sandbox {
     home: tempfile::TempDir,
     project: tempfile::TempDir,
     bin: tempfile::TempDir,
+    /// doctor's TMPDIR: the scratch directory `--live` keeps goes here and is removed with the sandbox, also when a
+    /// test fails.
+    tmp: tempfile::TempDir,
     /// Printed by every status command (a key-like string the doctor must never show).
     canary: Option<String>,
 }
@@ -54,6 +57,7 @@ impl Sandbox {
             home: tempfile::tempdir()?,
             project: tempfile::tempdir()?,
             bin: tempfile::tempdir()?,
+            tmp: tempfile::tempdir()?,
             canary: None,
         };
         s.write(
@@ -222,6 +226,7 @@ impl Sandbox {
             .current_dir(self.project.path())
             .env_clear()
             .env("HOME", self.home.path())
+            .env("TMPDIR", self.tmp.path())
             .env("PATH", self.path())
             .env("NO_COLOR", "1");
         for (k, v) in env {
@@ -642,14 +647,13 @@ fn live_drives_an_exec_only_codex_through_exec() -> R {
         !argv.iter().any(|a| a.contains("generate-json-schema")),
         "{argv:?}"
     );
-    // The scratch directory doctor kept for the logs.
-    if let Some(scratch) = live["logs"]
-        .as_str()
-        .and_then(|logs| Path::new(logs).parent())
-        .and_then(Path::parent)
-    {
-        let _ = std::fs::remove_dir_all(scratch);
-    }
+    // The scratch directory doctor kept for the logs is in the sandbox's TMPDIR, removed with it.
+    assert!(
+        live["logs"]
+            .as_str()
+            .is_some_and(|logs| Path::new(logs).starts_with(s.tmp.path())),
+        "{live}"
+    );
     Ok(())
 }
 
@@ -720,12 +724,12 @@ fn a_hung_git_init_does_not_hold_up_live() -> R {
         ran.iter().any(|a| a.contains("init")),
         "the git init is in the probe log: {ran:?}"
     );
-    if let Some(scratch) = live["logs"]
-        .as_str()
-        .and_then(|logs| Path::new(logs).parent())
-        .and_then(Path::parent)
-    {
-        let _ = std::fs::remove_dir_all(scratch);
-    }
+    // The scratch directory doctor kept for the logs is in the sandbox's TMPDIR, removed with it.
+    assert!(
+        live["logs"]
+            .as_str()
+            .is_some_and(|logs| Path::new(logs).starts_with(s.tmp.path())),
+        "{live}"
+    );
     Ok(())
 }
