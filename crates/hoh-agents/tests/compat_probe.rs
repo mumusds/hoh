@@ -573,6 +573,57 @@ fn a_status_command_is_captured_on_both_streams_and_bounded() -> R {
     Ok(())
 }
 
+/// The reads after the command exits end at the command's own limit: a helper that leaves the group and closes stdout
+/// within the limit but stderr only after it makes the command time out, and the late answer is not taken. Two waits
+/// that each got the time left would end past the limit (M1T07R-13).
+#[test]
+fn output_held_open_past_the_limit_by_an_escaped_helper_times_out() -> R {
+    let tmp = tempfile::tempdir()?;
+    let pidfile = tmp.path().join("helper.pid");
+    let exited = tmp.path().join("launcher.exited");
+    // The launcher exits only once the helper is in a session of its own, else the group kill could take it too; the
+    // marker shows the launcher did exit, so the timeout below is the reads', not the wait for the launcher.
+    let (dir, path) = fake(
+        tmp.path(),
+        "escape",
+        "codex",
+        &format!(
+            "#!/bin/sh\nsetsid sh -c 'echo $$ > \"{pid}.tmp\"; mv \"{pid}.tmp\" \"{pid}\"; sleep 1; exec >&-; sleep 1.5; echo late >&2' &\n\
+             while [ ! -s '{pid}' ]; do sleep 0.01; done\n: > '{exited}'\nexit 0\n",
+            pid = pidfile.display(),
+            exited = exited.display()
+        ),
+    )?;
+    let log: RunLog = Default::default();
+    let mut env = env_for(&dir);
+    env.timeout = Duration::from_secs(2);
+    env.log = Some(log.clone());
+    let started = std::time::Instant::now();
+    let held = run_status(&path, &["login", "status"], &env);
+    let took = started.elapsed();
+    if let Ok(pid) = std::fs::read_to_string(&pidfile) {
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", "--", &format!("-{}", pid.trim())])
+            .status();
+    }
+    assert!(
+        matches!(
+            held,
+            Err(ProbeError::TimedOut {
+                cut_by_deadline: false,
+                ..
+            })
+        ),
+        "{held:?}"
+    );
+    assert!(took < Duration::from_millis(2400), "{took:?}");
+    assert!(exited.exists(), "the launcher did not exit");
+    let runs = log.lock().map_err(|_| "poisoned")?.clone();
+    assert_eq!(runs.len(), 1);
+    assert_eq!((runs[0].exit_code, runs[0].timed_out), (None, true));
+    Ok(())
+}
+
 /// With a shared deadline, each command gets only the time left before it, so slow commands one after another end
 /// together within the deadline, not one timeout each (REQ-006: doctor ends within its limit + 5 s).
 #[test]
