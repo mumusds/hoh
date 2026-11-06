@@ -384,12 +384,17 @@ impl Leader {
         let _ = match target {
             Target::Leader => pidfd_send_signal(&self.pidfd, signal.raw()),
             Target::Group => {
-                let sent = kill_process_group(self.pid, signal.raw());
                 // A leader that moved itself into another group is not reached through the one it left
-                // (M1T07R-103); its pidfd still names it until it is reaped. SIGKILL goes to it in any case (a
-                // second one changes nothing), another signal only once it has left, so a leader still in its group
-                // never gets one twice.
-                if signal == Signal::Kill || self.left_group() {
+                // (M1T07R-103); its pidfd still names it until it is reaped. Whether it left is decided before the
+                // group is signalled, so a leader that leaves in its handler for this very signal is not sent it
+                // again (FU-01): any signal but SIGKILL reaches the leader at most once, and one that leaves just
+                // between the check and the group signal misses it and gets SIGKILL after the grace. SIGKILL goes to
+                // the leader in any case (a second one changes nothing).
+                let left = self.left_group();
+                let sent = kill_process_group(self.pid, signal.raw());
+                #[cfg(test)]
+                tests::after_group_signal(self.pid);
+                if signal == Signal::Kill || left {
                     let _ = pidfd_send_signal(&self.pidfd, signal.raw());
                 }
                 sent
@@ -717,4 +722,86 @@ async fn drain_stderr(
         }
     }
     (report, tail)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    /// Set by a test: after a group signal to this leader, wait until this file exists (the leader's handler ran).
+    static AFTER_GROUP_SIGNAL: std::sync::Mutex<Option<(Pid, PathBuf)>> =
+        std::sync::Mutex::new(None);
+
+    pub(super) fn after_group_signal(pid: Pid) {
+        let marker = AFTER_GROUP_SIGNAL.lock().ok().and_then(|hook| {
+            hook.as_ref()
+                .filter(|(leader, _)| *leader == pid)
+                .map(|(_, marker)| marker.clone())
+        });
+        if let Some(marker) = marker {
+            let until = Instant::now() + Duration::from_secs(2);
+            while !marker.exists() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    /// A leader whose SIGTERM handler moves it out of its group gets SIGTERM once, not again through its pidfd, and
+    /// is still killed after the grace (FU-01).
+    #[tokio::test]
+    async fn a_leader_leaving_its_group_on_sigterm_gets_it_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempfile::tempdir()?;
+        let (count, marker) = (tmp.path().join("terms"), tmp.path().join("moved"));
+        let mut command = std::process::Command::new("python3");
+        command.arg("-c").arg(format!(
+            "import os, signal, time\n\
+             def on_term(*_):\n    open('{count}', 'a').write('term\\n')\n    \
+             if not os.path.exists('{marker}'):\n        \
+             os.setpgid(0, os.getpgid(os.getppid()))\n        open('{marker}', 'w').close()\n\
+             signal.signal(signal.SIGTERM, on_term)\n\
+             print(os.getpid(), flush=True)\n\
+             while True:\n    time.sleep(1)\n",
+            count = count.display(),
+            marker = marker.display()
+        ));
+        let config = Config {
+            deadline: Some(Duration::from_millis(300)),
+            escalation: Escalation {
+                native: None,
+                native_grace: Duration::ZERO,
+                term_grace: Duration::from_millis(500),
+                kill_grace: Duration::from_secs(2),
+            },
+            ..Config::default()
+        };
+        let mut p = Process::spawn(command, config)?;
+        let leader = Pid::from_raw(p.pid() as i32).ok_or("a pid")?;
+        *AFTER_GROUP_SIGNAL.lock().map_err(|_| "hook")? = Some((leader, marker.clone()));
+        let report = tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(event) = p.next().await {
+                if let Event::Exit(report) = event {
+                    return Some(*report);
+                }
+            }
+            None
+        })
+        .await;
+        *AFTER_GROUP_SIGNAL.lock().map_err(|_| "hook")? = None;
+        let left = Path::new(&format!("/proc/{}", leader.as_raw_pid())).exists();
+        if left {
+            let _ = rustix::process::kill_process(leader, RawSignal::KILL);
+        }
+        let report = report?.ok_or("no exit report")?;
+        let terms = std::fs::read_to_string(&count)
+            .unwrap_or_default()
+            .lines()
+            .count();
+        assert!(marker.exists(), "the handler did not move the leader");
+        assert_eq!(terms, 1, "SIGTERM delivered {terms} times");
+        assert_eq!(report.status, Some(Termination::Signal(9)), "{report:?}");
+        assert!(!left, "leader survived");
+        Ok(())
+    }
 }
