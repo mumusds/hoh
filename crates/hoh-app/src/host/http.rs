@@ -307,6 +307,44 @@ async fn read<T: Send + 'static>(
     .map_err(|e| PersistError::Storage(format!("a read did not finish: {e}")))?
 }
 
+/// A ConfigureTeam that changes scheduler parameters (CR-007): a run's snapshot never changes, so for an existing run
+/// it is 409 RUN_CONFIG_FROZEN with nothing written (the change applies to runs started later); for the project
+/// (`run_id` null) it needs team revisions (M2-T07), not served yet.
+async fn configure_scheduler(shared: &Arc<Shared>, run_id: Option<&str>) -> Response {
+    let Some(run_id) = run_id.map(str::to_owned) else {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "CAPABILITY_UNSUPPORTED",
+            "project configuration revisions are not supported by this host yet",
+            false,
+            None,
+        );
+    };
+    let wanted = run_id.clone();
+    match read(shared, move |reader| reader.snapshot(&wanted)).await {
+        Ok(Some(_)) => {
+            let body = json!({
+                "code": "RUN_CONFIG_FROZEN",
+                "message": format!(
+                    "run {run_id} keeps the scheduler parameters of its snapshot; a change applies to runs started later"
+                ),
+                "retryable": false,
+                "current_revision": null,
+                "details": {"key_path": "scheduler"},
+            });
+            (StatusCode::CONFLICT, axum::Json(body)).into_response()
+        }
+        Ok(None) => error(
+            StatusCode::CONFLICT,
+            "RUN_NOT_FOUND",
+            format!("run {run_id} does not exist"),
+            false,
+            None,
+        ),
+        Err(e) => store_error(shared, &run_id, e).await,
+    }
+}
+
 /// The revision of `run_id` now, for a conflict's `current_revision`.
 async fn current_revision(shared: &Arc<Shared>, run_id: &str) -> Option<i64> {
     let run_id = run_id.to_owned();
@@ -440,6 +478,11 @@ async fn submit_command(
             );
         }
     };
+    if let CommandBody::ConfigureTeam(team) = &command.body
+        && team.scheduler.is_some()
+    {
+        return configure_scheduler(&shared, command.run_id.as_deref()).await;
+    }
     let (CommandBody::PauseRun(reason), Some(run_id)) = (&command.body, &command.run_id) else {
         let kind = command.kind();
         return if kind == CommandKind::PauseRun {
