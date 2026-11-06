@@ -851,6 +851,7 @@ fn live_drives_codex_through_exec_when_its_app_server_lacks_what_a_turn_uses() -
         ),
         ("help-app-server.txt", "stdio://", "pipe://"),
         ("help-app-server.txt", "stdio://", "stdio:///socket"),
+        ("help-app-server.txt", "stdio://", "stdio://.."),
     ] {
         let s = Sandbox::new()?;
         let f = fixtures().join("codex/0.166.0");
@@ -867,7 +868,7 @@ fn live_drives_codex_through_exec_when_its_app_server_lacks_what_a_turn_uses() -
         );
         let text = std::fs::read_to_string(copy.join(file))?;
         let changed = match method {
-            "stdio://" => text.replace(method, other),
+            "stdio://" => text.replace("`stdio://`", other),
             _ => {
                 let quoted = format!("\"{method}\"");
                 assert_eq!(
