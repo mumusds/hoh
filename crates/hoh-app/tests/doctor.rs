@@ -913,32 +913,43 @@ fn live_drives_codex_through_exec_when_its_app_server_lacks_what_a_turn_uses() -
     Ok(())
 }
 
-/// `--live` reads the App Server's schema as the probe does, validated: a schema the probe refuses (here a root `not`
-/// keyword, outside the form the App Server schema uses) prepares no attempt and starts no App Server, so no request
-/// it may exclude is sent (M1T07R-31).
+/// `--live` reads the App Server's schema as the probe does, validated: a schema the probe refuses (a root `not` keyword
+/// or a root constraint on `method`, outside the form the App Server schema uses) prepares no attempt and starts no
+/// App Server, so no request it may exclude is sent (M1T07R-31, -32).
 #[test]
 fn live_prepares_nothing_with_a_schema_the_probe_refuses() -> R {
-    let s = Sandbox::new()?;
-    let f = fixtures().join("codex/0.166.0");
-    let schema = s.home.path().join("schema");
-    std::fs::create_dir(&schema)?;
-    assert!(
-        Command::new("cp")
-            .arg("-R")
-            .arg(f.join("app-server-schema/."))
-            .arg(&schema)
-            .status()?
-            .success()
-    );
-    let mut requests: Value =
-        serde_json::from_slice(&std::fs::read(schema.join("ClientRequest.json"))?)?;
-    requests["not"] = serde_json::json!({"properties": {"method": {"enum": ["initialize"]}}});
-    std::fs::write(
-        schema.join("ClientRequest.json"),
-        serde_json::to_vec(&requests)?,
-    )?;
-    let started = s.home.path().join("app-server-started");
-    s.write(
+    // A root `not`, and a root `properties.method` that leaves `initialize` out (M1T07R-32).
+    for constraint in [
+        (
+            "not",
+            serde_json::json!({"properties": {"method": {"enum": ["initialize"]}}}),
+        ),
+        (
+            "properties",
+            serde_json::json!({"method": {"type": "string", "enum": ["thread/start"]}}),
+        ),
+    ] {
+        let s = Sandbox::new()?;
+        let f = fixtures().join("codex/0.166.0");
+        let schema = s.home.path().join("schema");
+        std::fs::create_dir(&schema)?;
+        assert!(
+            Command::new("cp")
+                .arg("-R")
+                .arg(f.join("app-server-schema/."))
+                .arg(&schema)
+                .status()?
+                .success()
+        );
+        let mut requests: Value =
+            serde_json::from_slice(&std::fs::read(schema.join("ClientRequest.json"))?)?;
+        requests[constraint.0] = constraint.1;
+        std::fs::write(
+            schema.join("ClientRequest.json"),
+            serde_json::to_vec(&requests)?,
+        )?;
+        let started = s.home.path().join("app-server-started");
+        s.write(
         "codex",
         &format!(
             "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n --help) grep -v '^  exec ' '{f}/help.txt';;\n \
@@ -950,18 +961,19 @@ fn live_prepares_nothing_with_a_schema_the_probe_refuses() -> R {
             started = started.display()
         ),
     )?;
-    let (out, _) = s.doctor_in(&[], &["--live", "--output", "json"], &[])?;
-    let report: Value = serde_json::from_slice(&out.stdout)?;
-    let live = &report["agents"]["codex"]["live"];
-    assert!(live["stored"].is_null(), "an attempt was prepared: {live}");
-    assert!(
-        live["error"]
-            .as_str()
-            .is_some_and(|e| e.contains("ClientRequest.json")),
-        "{live}"
-    );
-    assert!(!started.exists(), "the App Server was started: {live}");
-    assert_ne!(report["agents"]["codex"]["auth_check"], "verified");
+        let (out, _) = s.doctor_in(&[], &["--live", "--output", "json"], &[])?;
+        let report: Value = serde_json::from_slice(&out.stdout)?;
+        let live = &report["agents"]["codex"]["live"];
+        assert!(live["stored"].is_null(), "an attempt was prepared: {live}");
+        assert!(
+            live["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("ClientRequest.json")),
+            "{live}"
+        );
+        assert!(!started.exists(), "the App Server was started: {live}");
+        assert_ne!(report["agents"]["codex"]["auth_check"], "verified");
+    }
     Ok(())
 }
 
