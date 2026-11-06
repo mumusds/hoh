@@ -7,6 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[lib]
+name = "hoh_app"
+path = "src/lib.rs"
+
 [[bin]]
 name = "hoh"
 path = "src/main.rs"
@@ -15,12 +19,15 @@ path = "src/main.rs"
 hoh-core = { path = "../hoh-core" }
 hoh-agents = { path = "../hoh-agents" }
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
-rustix = { version = "1.1.6", default-features = false, features = ["std", "event", "fs", "process"] }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }
+futures-util = { version = "0.3.31", default-features = false, features = ["std"] }
+rustix = { version = "1.1.6", default-features = false, features = ["std", "event", "fs", "process", "rand"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+sha2 = "0.11.1"
 signal-hook = "0.3.18"
 unicode-segmentation = "1.13.3"
-tokio = { version = "1.53.3", features = ["rt", "sync", "macros"] }
+tokio = { version = "1.53.3", features = ["rt", "rt-multi-thread", "sync", "macros", "net", "time", "io-util", "signal"] }
 
 [lints]
 workspace = true
