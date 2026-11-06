@@ -1259,12 +1259,14 @@ impl Held {
     }
 }
 
-/// Where the directory `fd` is now (`/proc/self/fd`), `None` once it is removed.
+/// Where the directory `fd` is now (`/proc/self/fd`), `None` once it is removed (no link left: told by its link count,
+/// not by the ` (deleted)` the kernel appends, which a directory's own name may end with, M1T07R-58).
 fn where_now(fd: std::os::fd::BorrowedFd<'_>) -> Option<PathBuf> {
+    if rustix::fs::fstat(fd).is_ok_and(|s| s.st_nlink == 0) {
+        return None;
+    }
     let link = format!("/proc/self/fd/{}", std::os::fd::AsRawFd::as_raw_fd(&fd));
-    std::fs::read_link(link)
-        .ok()
-        .filter(|now| !now.to_string_lossy().ends_with(" (deleted)"))
+    std::fs::read_link(link).ok()
 }
 
 /// Make the scratch directory, generate the schema into it, read it and remove it: [`codex_schema`]'s work, apart.
@@ -1520,7 +1522,7 @@ impl Scratch {
         given_up: std::sync::Arc<std::sync::atomic::AtomicBool>,
         held: Held,
     ) -> io::Result<Scratch> {
-        use rustix::fs::{AtFlags, Mode, OFlags};
+        use rustix::fs::{Mode, OFlags};
         let (Some(parent), Some(name)) = (dir.parent(), dir.file_name()) else {
             return Err(io::Error::other("a scratch directory needs a parent"));
         };
@@ -1530,44 +1532,17 @@ impl Scratch {
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
             Mode::empty(),
         )?;
-        rustix::fs::mkdirat(&temp, name, Mode::from_raw_mode(0o700))?;
-        between("made", &dir);
-        let opened = open_beneath(
-            temp.as_fd(),
-            Path::new(name),
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::NONBLOCK,
-        )
-        .map_err(io::Error::from)
-        .and_then(|owned| {
-            // What was opened is the directory just made: the process's own and empty, not one put in its place
-            // between making and opening it (M1T07R-51).
-            if is_fresh(owned.as_fd()) {
-                Ok(owned)
-            } else {
-                Err(io::Error::other(format!(
-                    "the scratch directory {} was replaced as it was made",
-                    dir.display()
-                )))
-            }
-        });
-        match opened {
-            Ok(owned) => {
-                held.add(owned.as_fd());
-                Ok(Scratch {
-                    dir,
-                    temp,
-                    owned,
-                    given_up,
-                    held,
-                    until,
-                    removed: None,
-                })
-            }
-            Err(e) => {
-                let _ = rustix::fs::unlinkat(&temp, name, AtFlags::REMOVEDIR);
-                Err(e)
-            }
-        }
+        let owned = make_dir(temp.as_fd(), name, &dir)?;
+        held.add(owned.as_fd());
+        Ok(Scratch {
+            dir,
+            temp,
+            owned,
+            given_up,
+            held,
+            until,
+            removed: None,
+        })
     }
 
     /// Whether `dir` is still the directory the probe made.
@@ -1608,15 +1583,68 @@ impl Drop for Scratch {
     }
 }
 
-/// Whether the directory `fd` is this process's own and empty.
-fn is_fresh(fd: std::os::fd::BorrowedFd<'_>) -> bool {
-    let owner =
-        rustix::fs::fstat(fd).is_ok_and(|s| s.st_uid == rustix::process::geteuid().as_raw());
-    owner
-        && rustix::fs::Dir::read_from(fd).is_ok_and(|mut dir| {
-            std::iter::from_fn(|| dir.read())
-                .all(|e| e.is_ok_and(|e| e.file_name() == c"." || e.file_name() == c".."))
-        })
+/// A new directory `name` in `temp` (at `path`), made and opened as the probe's own: the directory opened must be the
+/// one just made, not one put in its place between making and opening it (M1T07R-51, -57). Linux cannot make and open a
+/// directory in one call, so what is opened is checked: this process's own, empty, and made no earlier than the call
+/// (its birth time; a directory that existed before cannot pass). On any doubt nothing is removed by name — whatever
+/// is at `name` may not be the probe's — and the error says where it may be left.
+fn make_dir(
+    temp: std::os::fd::BorrowedFd<'_>,
+    name: &OsStr,
+    path: &Path,
+) -> io::Result<std::os::fd::OwnedFd> {
+    use rustix::fs::{Mode, OFlags};
+    // File system clocks are coarse: a second of room, never enough for a directory made before the probe ran.
+    let since = SystemTime::now() - Duration::from_secs(1);
+    rustix::fs::mkdirat(temp, name, Mode::from_raw_mode(0o700))?;
+    between("made", path);
+    let refused = |why: &str| {
+        io::Error::other(format!(
+            "the directory {} {why}; it may be left there",
+            path.display()
+        ))
+    };
+    let owned = open_beneath(
+        temp,
+        Path::new(name),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+    )
+    .map_err(|e| refused(&format!("could not be opened as made ({e})")))?;
+    match made_since(owned.as_fd(), since) {
+        Some(true) => Ok(owned),
+        Some(false) => Err(refused("was replaced as it was made")),
+        None => Err(refused(
+            "cannot be told from one put in its place: its file system records no birth time",
+        )),
+    }
+}
+
+/// Whether the directory `fd` is this process's own, empty and born at `since` or later; `None` when its file system
+/// records no birth time.
+fn made_since(fd: std::os::fd::BorrowedFd<'_>, since: SystemTime) -> Option<bool> {
+    use rustix::fs::{AtFlags, StatxFlags, statx};
+    let stat = statx(
+        fd,
+        "",
+        AtFlags::EMPTY_PATH,
+        StatxFlags::BTIME | StatxFlags::UID,
+    )
+    .ok()?;
+    if stat.stx_mask & StatxFlags::BTIME.bits() == 0 {
+        return None;
+    }
+    let born = u64::try_from(stat.stx_btime.tv_sec)
+        .ok()
+        .map(|s| UNIX_EPOCH + Duration::new(s, stat.stx_btime.tv_nsec));
+    let empty = rustix::fs::Dir::read_from(fd).is_ok_and(|mut dir| {
+        std::iter::from_fn(|| dir.read())
+            .all(|e| e.is_ok_and(|e| e.file_name() == c"." || e.file_name() == c".."))
+    });
+    Some(
+        stat.stx_uid == rustix::process::geteuid().as_raw()
+            && empty
+            && born.is_some_and(|born| born >= since),
+    )
 }
 
 /// `<prefix>-<pid>-<nanoseconds>`.
@@ -1809,15 +1837,9 @@ struct Quarantine {
 impl Quarantine {
     /// Made in `temp`, named after the scratch directory `of`; shared in `held` so what stays in it can be named.
     fn new(temp: std::os::fd::BorrowedFd<'_>, of: &OsStr, held: &Held) -> Option<Quarantine> {
-        use rustix::fs::{Mode, OFlags};
         let name = unique_name(&format!("{}-q", of.to_string_lossy()));
-        rustix::fs::mkdirat(temp, name.as_str(), Mode::from_raw_mode(0o700)).ok()?;
-        let fd = open_beneath(
-            temp,
-            Path::new(&name),
-            OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW,
-        )
-        .ok()?;
+        // Its own as the scratch directory is: one put in its place is never moved into or removed (M1T07R-57).
+        let fd = make_dir(temp, OsStr::new(&name), Path::new(&name)).ok()?;
         let made = inode(&rustix::fs::fstat(&fd).ok()?);
         held.add(fd.as_fd());
         Some(Quarantine {
@@ -3549,6 +3571,93 @@ mod tests {
             dir.join("keep.json").exists(),
             "the directory put in its place was not left whole"
         );
+        Ok(())
+    }
+
+    /// An empty directory that existed before, put in place of the scratch directory between its making and its
+    /// opening, is not taken for it and is left; so is one put there that cannot be opened as a directory; in neither
+    /// case is anything removed by name (M1T07R-57).
+    #[test]
+    fn a_directory_that_existed_before_is_never_the_scratch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let (before, away) = (root.path().join("before"), root.path().join("away"));
+        std::fs::create_dir(&before)?;
+        // Older than the probe's room for coarse clocks.
+        std::thread::sleep(Duration::from_millis(1300));
+        for case in ["empty", "link"] {
+            let dir = root.path().join(format!("out-{case}"));
+            let swaps = std::rc::Rc::new(std::cell::Cell::new(0));
+            let counted = swaps.clone();
+            let (made, from, to) = (dir.clone(), before.clone(), away.join(case));
+            std::fs::create_dir_all(&away)?;
+            BETWEEN.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |at: &str, path: &Path| {
+                    if at == "made" && path == made {
+                        std::fs::rename(&made, &to).expect("move the new directory away");
+                        if case == "empty" {
+                            std::fs::rename(&from, &made).expect("put the old one in its place");
+                        } else {
+                            std::os::unix::fs::symlink(&from, &made)
+                                .expect("put a link in its place");
+                        }
+                        counted.set(counted.get() + 1);
+                    }
+                }));
+            });
+            let made = Scratch::at(
+                dir.clone(),
+                Instant::now() + Duration::from_secs(60),
+                Default::default(),
+                Held::default(),
+            );
+            BETWEEN.with(|hook| *hook.borrow_mut() = None);
+            assert_eq!(swaps.get(), 1, "{case}");
+            let refused = made
+                .as_ref()
+                .err()
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            assert!(refused.contains("may be left"), "{case}: {refused}");
+            if case == "empty" {
+                assert!(
+                    refused.contains("was replaced as it was made"),
+                    "{case}: {refused}"
+                );
+                assert!(
+                    dir.is_dir(),
+                    "{case}: the directory put in its place was removed"
+                );
+                std::fs::rename(&dir, &before)?;
+            } else {
+                assert!(
+                    std::fs::symlink_metadata(&dir).is_ok_and(|m| m.file_type().is_symlink()),
+                    "{case}"
+                );
+                assert!(before.is_dir(), "{case}");
+            }
+        }
+        Ok(())
+    }
+
+    /// A directory whose own name ends in ` (deleted)` is named where it is, not taken for removed (M1T07R-58).
+    #[test]
+    fn a_directory_named_deleted_is_still_named() -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let scratch = Scratch::at(
+            root.path().join("out"),
+            Instant::now() + Duration::from_secs(60),
+            Default::default(),
+            Held::default(),
+        )?;
+        let renamed = root.path().join("out (deleted)");
+        std::fs::rename(root.path().join("out"), &renamed)?;
+        assert_eq!(
+            scratch.held.may_be_left(),
+            format!("it may be left at {}", renamed.display())
+        );
+        std::fs::remove_dir(&renamed)?;
+        assert_eq!(scratch.held.may_be_left(), "nothing of it is left");
         Ok(())
     }
 
