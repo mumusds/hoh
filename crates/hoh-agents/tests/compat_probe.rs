@@ -1360,6 +1360,12 @@ fn a_schema_number_that_cannot_be_read_exactly_refuses_the_file() -> R {
         // Above 2^53 a decimal must be the integer it is stored as (M1T07R-39, round 10).
         ("large-decimal", "1000000000000000100.0", true),
         ("large-exact", "1000000000000000128.0", false),
+        // A number token is at most 64 characters, so reading it is bounded (M1T07R-42).
+        (
+            "long-number",
+            "1.000000000000000000000000000000000000000000000000000000000000000000000",
+            true,
+        ),
         ("a-tenth", "0.7", false),
         ("zero", "0", false),
     ] {
@@ -1398,6 +1404,56 @@ fn a_schema_number_that_cannot_be_read_exactly_refuses_the_file() -> R {
     Ok(())
 }
 
+/// A definition name or `$ref` target is at most 256 bytes, so resolving a reference costs a bounded amount: a longer
+/// one refuses the file, at once, however the file uses it (M1T07R-40, round 12).
+#[test]
+fn a_long_definition_name_refuses_the_file_at_once() -> R {
+    let tmp = tempfile::tempdir()?;
+    let f = fixtures().join("codex/0.166.0");
+    for (group, length) in [("name-257", 257), ("name-2m", 2_000_000)] {
+        let schema = tmp.path().join(group);
+        std::fs::create_dir(&schema)?;
+        let copied = std::process::Command::new("cp")
+            .arg("-R")
+            .arg(f.join("app-server-schema/."))
+            .arg(&schema)
+            .status()?;
+        assert!(copied.success());
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(schema.join("ClientRequest.json"))?)?;
+        let name = "x".repeat(length);
+        let target = format!("#/definitions/{name}");
+        value["definitions"][name.as_str()] =
+            serde_json::json!({"anyOf": [{"$ref": target}, {"$ref": target}]});
+        value["definitions"]["RequestId"] = serde_json::json!({"$ref": target});
+        std::fs::write(
+            schema.join("ClientRequest.json"),
+            serde_json::to_vec(&value)?,
+        )?;
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n --help) cat '{f}/help.txt';;\n \
+             exec) [ \"$2\" = --help ] && cat '{f}/help-exec.txt';;\n \
+             app-server) case \"$2\" in\n  --help) cat '{f}/help-app-server.txt';;\n  generate-json-schema) [ \"$3\" = --out ] && mkdir -p \"$4\" && cp -R '{s}/.' \"$4/\";;\n  \
+             *) exit 2;;\n esac;;\n *) exit 2;;\nesac\n",
+            f = f.display(),
+            s = schema.display()
+        );
+        let (dir, _) = fake(tmp.path(), &format!("{group}-bin"), "codex", &script)?;
+        let started = std::time::Instant::now();
+        let result = probe(Agent::Codex, &env_for(&dir));
+        assert!(
+            schema_refused(&result, "ClientRequest.json"),
+            "{group}: {result:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{group}: {:?}",
+            started.elapsed()
+        );
+    }
+    Ok(())
+}
+
 /// Validation is bounded in work, not only in depth: a `RequestId` whose `anyOf` names itself twice, or a chain of
 /// definitions each naming the next twice, would take exponential time; within its budget the probe calls the ids
 /// undecided, so the requests are absent, and it ends at once (M1T07R-40).
@@ -1407,11 +1463,15 @@ fn a_schema_that_branches_without_end_is_undecided_at_once() -> R {
     let f = fixtures().join("codex/0.166.0");
     type Change = fn(&mut serde_json::Value);
     let cases: [(&str, Change); 6] = [
-        // A long key over many members: the well-formedness check writes its path out only on error (round 11).
+        // A long property key over many members: the well-formedness check writes its path out only on error (round
+        // 11; a long definition name is refused, round 12).
         ("long-key", |v| {
             let members: Vec<serde_json::Value> =
                 (0..50_000).map(|_| serde_json::json!(true)).collect();
-            v["definitions"]["x".repeat(2_000_000)] = serde_json::json!({"anyOf": members});
+            let mut properties = serde_json::Map::new();
+            properties.insert("x".repeat(2_000_000), serde_json::json!({"anyOf": members}));
+            v["definitions"]["Unused"] =
+                serde_json::json!({"type": "object", "properties": properties});
         }),
         // Wide members and long enums cost a step each, cloned or scanned (M1T07R-40, round 10).
         ("wide-reused", |v| {
