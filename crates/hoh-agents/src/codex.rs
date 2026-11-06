@@ -97,13 +97,29 @@ pub fn listed_methods(schema: &Value) -> BTreeSet<String> {
         .collect()
 }
 
-/// The arguments of `codex app-server` on stdio.
-pub fn app_server_args(help: &str) -> Vec<String> {
+/// The App Server's transport: stdio, given as `--listen stdio://` where its help declares `--listen`.
+pub const LISTEN_STDIO: &str = "stdio://";
+
+/// Why this `codex app-server --help` gives no way to start the App Server on stdio, or `None`: a `--listen` whose
+/// text does not list `stdio://` (without `--listen`, stdio is the App Server's only transport). The probe and
+/// `codex::run` apply it before choosing the App Server (M1T07R-27).
+pub fn app_server_launch_missing(help: &str) -> Option<String> {
+    (offers(help, "--listen")
+        && !crate::adapter::option_text(help, "--listen")
+            .is_some_and(|text| crate::adapter::has_word(&text, LISTEN_STDIO)))
+    .then(|| format!("codex app-server --help offers --listen without {LISTEN_STDIO}"))
+}
+
+/// The arguments of `codex app-server` on stdio, or why it cannot be started so.
+pub fn app_server_args(help: &str) -> Result<Vec<String>, Blocked> {
+    if let Some(why) = app_server_launch_missing(help) {
+        return Err(Blocked(why));
+    }
     let mut args = vec!["app-server".to_owned()];
     if offers(help, "--listen") {
-        args.extend(["--listen".to_owned(), "stdio://".to_owned()]);
+        args.extend(["--listen".to_owned(), LISTEN_STDIO.to_owned()]);
     }
-    args
+    Ok(args)
 }
 
 /// Whether a resumed exec turn can do whatever a new one can: `codex exec resume --help` was probed and offers
@@ -127,10 +143,14 @@ pub const APP_SERVER_REQUESTS: &[&str] =
     &["initialize", "thread/start", "turn/start", "turn/interrupt"];
 pub const APP_SERVER_CLIENT_NOTIFICATIONS: &[&str] = &["initialized"];
 pub const APP_SERVER_NOTIFICATIONS: &[&str] = &["turn/completed", "item/started", "item/completed"];
-/// Requests the adapter sends only on a turn that uses the capability: (method, capability).
+/// Requests the adapter sends only on a turn that uses the capability, and only where the schema has them: (method,
+/// capability). Without `thread/resume` a resumed turn does not use the App Server; without `turn/steer` a steer
+/// waits for a later turn (M1T07R-28).
+pub const RESUME_REQUEST: &str = "thread/resume";
+pub const STEER_REQUEST: &str = "turn/steer";
 pub const APP_SERVER_GATED: &[(&str, &str)] = &[
-    ("thread/resume", "resume"),
-    ("turn/steer", "mid_turn_steer"),
+    (RESUME_REQUEST, "resume"),
+    (STEER_REQUEST, "mid_turn_steer"),
 ];
 
 /// Why an App Server with these methods (its schema's `ClientRequest.json`, `ClientNotification.json` and
@@ -430,14 +450,23 @@ pub async fn run(
             steps: Vec::new(),
         })
     };
-    // The App Server only if its schema has what every turn needs (the probe's choice too, M1T07R-15); without one,
-    // exec must be possible before anything starts.
-    let unusable = turn.launch.app_server_help.as_ref().and_then(|_| {
-        app_server_interface_missing(
-            &turn.launch.requests,
-            &turn.launch.client_notifications,
-            &turn.launch.known,
-        )
+    // The App Server only if it starts on stdio and its schema has what this turn uses (the probe's choice too, but for
+    // the resume this turn may need; M1T07R-15, -27, -28); without one, exec must be possible before anything starts.
+    let unusable = turn.launch.app_server_help.as_deref().and_then(|help| {
+        app_server_launch_missing(help)
+            .or_else(|| {
+                app_server_interface_missing(
+                    &turn.launch.requests,
+                    &turn.launch.client_notifications,
+                    &turn.launch.known,
+                )
+            })
+            .or_else(|| {
+                (turn.launch.resume.is_some() && !turn.launch.requests.contains(RESUME_REQUEST))
+                    .then(|| {
+                        format!("the App Server schema has no {RESUME_REQUEST} to resume with")
+                    })
+            })
     });
     let app_server_help = turn
         .launch
@@ -577,8 +606,11 @@ fn session(
     let supported: Vec<(&str, bool)> = if app_server {
         vec![
             ("structured_events", true),
-            ("resume", true),
-            ("mid_turn_steer", true),
+            ("resume", turn.launch.requests.contains(RESUME_REQUEST)),
+            (
+                "mid_turn_steer",
+                turn.launch.requests.contains(STEER_REQUEST),
+            ),
             ("partial_messages", true),
             ("token_usage", true),
         ]

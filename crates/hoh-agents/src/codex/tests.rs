@@ -32,9 +32,22 @@ fn launch() -> Launch {
 fn app_server_runs_on_stdio_when_the_help_offers_it() {
     assert_eq!(
         app_server_args(&help("help-app-server.txt")),
-        ["app-server", "--listen", "stdio://"]
+        Ok(["app-server", "--listen", "stdio://"]
+            .map(str::to_owned)
+            .to_vec())
     );
-    assert_eq!(app_server_args("Usage: codex app-server\n"), ["app-server"]);
+    assert_eq!(
+        app_server_args("Usage: codex app-server\n"),
+        Ok(vec!["app-server".to_owned()])
+    );
+    // A --listen that does not list stdio:// cannot start a stdio App Server, and the probe says so (M1T07R-27).
+    let no_stdio = help("help-app-server.txt").replace("stdio://", "pipe://");
+    assert!(app_server_args(&no_stdio).is_err());
+    assert!(app_server_launch_missing(&no_stdio).is_some());
+    assert_eq!(
+        app_server_launch_missing(&help("help-app-server.txt")),
+        None
+    );
 }
 
 #[test]

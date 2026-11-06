@@ -228,23 +228,21 @@ fn received(fake: &Path) -> R<Vec<Value>> {
 }
 
 /// Every method the adapter sent `fake` is in the App Server interface the probe requires (codex::APP_SERVER_REQUESTS
-/// and APP_SERVER_CLIENT_NOTIFICATIONS) or is gated by one of `capabilities` this turn used (APP_SERVER_GATED), so the
-/// probe never takes an App Server whose schema lacks something the adapter sends (M1R-04).
-fn sent_only_its_interface(fake: &Path, capabilities: &[&str]) -> R {
-    let gated: Vec<&str> = codex::APP_SERVER_GATED
-        .iter()
-        .filter(|(_, capability)| capabilities.contains(capability))
-        .map(|(method, _)| *method)
-        .collect();
+/// and APP_SERVER_CLIENT_NOTIFICATIONS), or is a gated request (APP_SERVER_GATED) that the launch's schema has, so
+/// the probe never takes an App Server whose schema lacks something the adapter sends (M1R-04, M1T07R-28).
+fn sent_only_its_interface(fake: &Path, launch: &Launch) -> R {
     let sent = received(fake)?;
     let methods: Vec<&str> = sent.iter().filter_map(|m| m["method"].as_str()).collect();
     assert!(!methods.is_empty(), "nothing was sent");
     for method in methods {
+        let gated = codex::APP_SERVER_GATED
+            .iter()
+            .any(|(gated, _)| *gated == method && launch.requests.contains(method));
         assert!(
             codex::APP_SERVER_REQUESTS.contains(&method)
                 || codex::APP_SERVER_CLIENT_NOTIFICATIONS.contains(&method)
-                || gated.contains(&method),
-            "{method} was sent but is not in the App Server interface"
+                || gated,
+            "{method} was sent but is not in the App Server interface of this launch"
         );
     }
     Ok(())
@@ -302,7 +300,8 @@ async fn test_024_01_a_recorded_turn_settles_in_handshake_order_with_one_unknown
     case.frames.insert(at, unknown.clone());
     let fake = world.fake("turn", Some(&case), "exec", false)?;
     let attempt = world.attempt("A1").await?;
-    let outcome = run(&world, &attempt, &world.turn(&fake, "logs/A1")?).await?;
+    let turn = world.turn(&fake, "logs/A1")?;
+    let outcome = run(&world, &attempt, &turn).await?;
     assert_eq!(
         (outcome.state, outcome.mode),
         (AttemptState::Settled, Mode::AppServer)
@@ -317,7 +316,7 @@ async fn test_024_01_a_recorded_turn_settles_in_handshake_order_with_one_unknown
         methods[..4],
         ["initialize", "initialized", "thread/start", "turn/start"]
     );
-    sent_only_its_interface(&fake, &[])?;
+    sent_only_its_interface(&fake, &turn.launch)?;
     let trace: Vec<Value> = read(fake.parent().ok_or("no dir")?.join("log/trace.jsonl"))?
         .lines()
         .map(serde_json::from_str)
@@ -409,7 +408,7 @@ async fn test_024_02_interrupt_unauthorized_eof_and_resume() -> R {
         interrupt["params"],
         json!({"threadId": thread, "turnId": turn_id})
     );
-    sent_only_its_interface(&fake, &[])?;
+    sent_only_its_interface(&fake, &turn.launch)?;
     assert_eq!(a.status.as_deref(), Some("interrupted"));
     assert!(group_members(a.pid.ok_or("no pid")?).is_empty());
     let row = world.store.reader()?.attempt("A1")?.ok_or("no A1")?;
@@ -491,7 +490,7 @@ async fn test_024_02_interrupt_unauthorized_eof_and_resume() -> R {
         .ok_or("no thread/resume")?;
     assert_eq!(resume["params"]["threadId"], json!(thread));
     assert!(!got.iter().any(|m| m["method"] == "thread/start"));
-    sent_only_its_interface(&fake, &["resume"])?;
+    sent_only_its_interface(&fake, &turn.launch)?;
     assert_eq!(resumed.state, AttemptState::Settled);
     // Every notification of the resumed run (deprecationNotice, thread/goal/cleared, ...) is in the 0.166.0 schema.
     let unknown: Vec<Value> = events(&world, "adapter.unknown_event")?
@@ -1154,7 +1153,7 @@ async fn a_steer_seen_before_its_answer_is_applied() -> R {
     );
     assert_eq!(input_state(&world, "I1")?, InputState::Applied);
     assert_eq!(outcome.state, AttemptState::Settled);
-    sent_only_its_interface(&fake, &["mid_turn_steer"])?;
+    sent_only_its_interface(&fake, &turn.launch)?;
     Ok(())
 }
 
@@ -1671,7 +1670,7 @@ args = sys.argv[1:]
 if args == ['--version']: print('codex-cli 0.166.0'); sys.exit(0)
 if args == ['--help']: print('Usage: codex [OPTIONS] <COMMAND>\n\nCommands:\n  exec        Run Codex non-interactively\n  app-server  Run the app server'); sys.exit(0)
 if args == ['exec', '--help']: print('--json'); sys.exit(0)
-if args == ['app-server', '--help']: print('--listen'); sys.exit(0)
+if args == ['app-server', '--help']: print('  --listen <URL>  Supported values: `stdio://` (default)'); sys.exit(0)
 if args[:2] == ['app-server', 'generate-json-schema']:
     out = pathlib.Path(args[args.index('--out') + 1]); out.mkdir(parents=True, exist_ok=True)
     for name, methods in [('ClientRequest', ['initialize', 'thread/start', 'turn/start', 'turn/interrupt']), ('ClientNotification', ['initialized']),
@@ -1708,7 +1707,8 @@ for line in sys.stdin:
         );
     }
     let mut turn = world.turn(&fake, "logs/A1")?;
-    turn.launch.app_server_help = Some("--listen".to_owned());
+    turn.launch.app_server_help =
+        Some("  --listen <URL>  Supported values: `stdio://` (default)".to_owned());
     turn.launch.exec_help = "--json".to_owned();
     turn.launch.yolo = false;
     turn.launch.known = codex::APP_SERVER_NOTIFICATIONS
@@ -1828,6 +1828,85 @@ async fn an_exec_session_resumes_only_if_a_resumed_exec_turn_could_start() -> R 
 
 /// The App Server is used only if its schema has what every turn needs: with no `turn/start` among its requests,
 /// `codex::run` takes exec at once and never starts it, as the probe chooses exec (M1T07R-15).
+/// The gated requests are sent only where the schema has them (M1T07R-28): a resumed turn whose App Server schema has
+/// no `thread/resume` runs on exec and never starts the App Server; a steer for a turn whose schema has no
+/// `turn/steer` is answered CAPABILITY_UNSUPPORTED, its input stays QUEUED for a later turn, nothing is sent, and the
+/// session row has no steer whatever the probe said.
+#[tokio::test]
+async fn gated_requests_are_sent_only_where_the_schema_has_them() -> R {
+    let world = World::new()?;
+    // A resume without thread/resume.
+    let fake = world.fake(
+        "no-resume",
+        Some(&Case::load("app-server-resume")?),
+        "exec",
+        false,
+    )?;
+    let mut turn = world.turn(&fake, "logs/A1")?;
+    assert!(turn.launch.requests.remove(codex::RESUME_REQUEST));
+    turn.launch.resume = Some("thread-1".to_owned());
+    turn.launch.exec_resume_help =
+        Some("--json\n  --dangerously-bypass-approvals-and-sandbox\n".to_owned());
+    let attempt = world.attempt("A1").await?;
+    let outcome = run(&world, &attempt, &turn).await?;
+    assert_eq!(
+        (outcome.state, outcome.mode),
+        (AttemptState::Settled, Mode::Exec)
+    );
+    assert!(
+        argvs(&fake)?
+            .iter()
+            .all(|a| a.first().map(String::as_str) != Some("app-server")),
+        "the App Server was started for a resume its schema cannot do"
+    );
+    let degraded = events(&world, "adapter.degraded")?;
+    assert!(
+        degraded.len() == 1
+            && degraded[0]["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains(codex::RESUME_REQUEST)),
+        "{degraded:?}"
+    );
+    // A steer without turn/steer, the probe having said mid_turn_steer.
+    let fake = world.fake(
+        "no-steer",
+        Some(&Case::load("app-server-interrupt")?),
+        "exec",
+        false,
+    )?;
+    let mut turn = world.turn(&fake, "logs/A2")?;
+    assert!(turn.launch.requests.remove(codex::STEER_REQUEST));
+    assert_eq!(
+        turn.launch.capabilities.get("mid_turn_steer"),
+        Some(&Some(true))
+    );
+    let attempt = world.attempt_in("codex", "A2", "S2", "0.166.0").await?;
+    let (tx, steers) = mpsc::channel(4);
+    let cancel = CancelLatch::new();
+    let running = codex::run(&world.store, &attempt, &turn, &cancel, steers);
+    let steering = async {
+        active_turn(&world, "A2").await?;
+        let receipt = steer(&world, &tx, "I1", "Stop now.", None).await?.await?;
+        assert_eq!(cancel.request(), CancelReceipt::Accepted);
+        Ok::<SteerReceipt, Box<dyn std::error::Error>>(receipt)
+    };
+    let (outcome, receipt) = tokio::join!(running, steering);
+    let (outcome, receipt) = (outcome?, receipt?);
+    assert_eq!(receipt, SteerReceipt::CapabilityUnsupported);
+    assert_eq!(input_state(&world, "I1")?, InputState::Queued);
+    assert_eq!(outcome.state, AttemptState::Cancelled);
+    assert!(
+        !received(&fake)?
+            .iter()
+            .any(|m| m["method"] == codex::STEER_REQUEST),
+        "turn/steer was sent"
+    );
+    sent_only_its_interface(&fake, &turn.launch)?;
+    let session = world.store.reader()?.session("S2")?.ok_or("no S2")?;
+    assert_eq!(session.capabilities["mid_turn_steer"], false, "{session:?}");
+    Ok(())
+}
+
 /// Where a launch keeps the methods of one schema file.
 type Listed = fn(&mut Launch) -> &mut std::collections::BTreeSet<String>;
 
