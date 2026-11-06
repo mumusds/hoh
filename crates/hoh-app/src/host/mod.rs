@@ -116,6 +116,8 @@ pub struct Host {
     stop: tokio::sync::watch::Sender<bool>,
     served: Vec<tokio::task::JoinHandle<()>>,
     files: PathBuf,
+    /// The socket this host bound (device, inode): only it is removed at the stop.
+    socket_id: Option<(u64, u64)>,
 }
 
 impl std::fmt::Debug for Host {
@@ -223,6 +225,7 @@ impl Host {
             let _ = std::fs::remove_file(&socket);
             return Err(e);
         }
+        let socket_id = file_id(&socket);
         let port = tcp
             .local_addr()
             .map_err(|e| StartError::other(e.to_string()))?
@@ -267,7 +270,7 @@ impl Host {
             for task in served.iter_mut() {
                 let _ = task.await;
             }
-            let _ = std::fs::remove_file(&socket);
+            remove_if_ours(&files, &socket, socket_id, &token);
             return Err(e);
         }
         Ok(Host {
@@ -280,6 +283,7 @@ impl Host {
             stop,
             served,
             files,
+            socket_id,
         })
     }
 
@@ -316,14 +320,15 @@ impl Host {
             served,
             files,
             socket,
+            socket_id,
+            token,
             ..
         } = self;
         let _ = stop.send(true);
         for task in served {
             let _ = task.await;
         }
-        let _ = std::fs::remove_file(files.join("host.json"));
-        let _ = std::fs::remove_file(&socket);
+        remove_if_ours(&files, &socket, socket_id, &token);
         let ended = shared.store.writer_ended();
         drop(shared);
         drop(stop);
@@ -359,6 +364,30 @@ pub async fn run(config: HostConfig) -> u8 {
     signals.await;
     host.shutdown().await;
     0
+}
+
+/// The device and inode of `path`, not following a link.
+fn file_id(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path)
+        .ok()
+        .map(|m| (m.dev(), m.ino()))
+}
+
+/// Remove `host.json` if it is this host's (its token) and the socket if it is the one this host bound; a later
+/// host's files are never touched (M2T12R-120).
+fn remove_if_ours(files: &Path, socket: &Path, socket_id: Option<(u64, u64)>, token: &str) {
+    let host_json = files.join("host.json");
+    let ours = std::fs::read(&host_json)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .is_some_and(|info| info["token"].as_str() == Some(token));
+    if ours {
+        let _ = std::fs::remove_file(&host_json);
+    }
+    if socket_id.is_some() && file_id(socket) == socket_id {
+        let _ = std::fs::remove_file(socket);
+    }
 }
 
 /// Take `.hoh/host.lock` without waiting, with this process's pid in it; a held lock names its holder.
