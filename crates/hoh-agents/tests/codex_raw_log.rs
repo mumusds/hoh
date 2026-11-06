@@ -49,7 +49,9 @@ async fn a_raw_log_cut_short_during_a_refused_handshake_fails_the_attempt() -> R
     let turn = Turn {
         launch: Launch {
             program: fake.clone(),
-            app_server_help: Some("--listen".to_owned()),
+            app_server_help: Some(
+                "  --listen <URL>  Supported values: `stdio://` (default)".to_owned(),
+            ),
             exec_help: "--json --dangerously-bypass-approvals-and-sandbox".to_owned(),
             exec_resume_help: None,
             cwd: world.dir.path().to_path_buf(),

@@ -835,47 +835,56 @@ fn live_drives_an_exec_only_codex_through_exec() -> R {
     Ok(())
 }
 
-/// An App Server whose schema lacks something a turn uses (`turn/start`, the `initialized` notification) is not
-/// used: the probe takes exec, and so does the live turn (M1T07R-15, M1R-04).
+/// An App Server whose schema lacks something a turn uses (`turn/start`, the `initialized` notification), or whose
+/// `--listen` does not list `stdio://`, is not used: the probe takes exec, and so does the live turn (M1T07R-15,
+/// M1R-04, M1T07R-27).
 #[test]
 fn live_drives_codex_through_exec_when_its_app_server_lacks_what_a_turn_uses() -> R {
     for (file, method) in [
-        ("ClientRequest.json", "turn/start"),
-        ("ClientNotification.json", "initialized"),
+        ("app-server-schema/ClientRequest.json", "turn/start"),
+        ("app-server-schema/ClientNotification.json", "initialized"),
+        ("help-app-server.txt", "stdio://"),
     ] {
         let s = Sandbox::new()?;
         let f = fixtures().join("codex/0.166.0");
-        let schema = s.home.path().join("schema");
-        std::fs::create_dir(&schema)?;
+        // A copy of the recording with `method` taken out of `file`.
+        let copy = s.home.path().join("recording");
+        std::fs::create_dir(&copy)?;
         assert!(
             std::process::Command::new("cp")
                 .arg("-R")
-                .arg(f.join("app-server-schema/."))
-                .arg(&schema)
+                .arg(f.join("."))
+                .arg(&copy)
                 .status()?
                 .success()
         );
-        let text = std::fs::read_to_string(schema.join(file))?;
-        let quoted = format!("\"{method}\"");
-        assert_eq!(
-            text.matches(&quoted).count(),
-            1,
-            "{file} lists {method} once"
-        );
-        std::fs::write(
-            schema.join(file),
-            text.replace(&quoted, &format!("\"{method}-gone\"")),
-        )?;
+        let text = std::fs::read_to_string(copy.join(file))?;
+        let changed = match method {
+            "stdio://" => text.replace(method, "pipe://"),
+            _ => {
+                let quoted = format!("\"{method}\"");
+                assert_eq!(
+                    text.matches(&quoted).count(),
+                    1,
+                    "{file} lists {method} once"
+                );
+                text.replace(&quoted, &format!("\"{method}-gone\""))
+            }
+        };
+        assert_ne!(changed, text);
+        std::fs::write(copy.join(file), changed)?;
+        let schema = copy.join("app-server-schema");
         s.write(
             "codex",
             &format!(
                 "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n --help) cat '{f}/help.txt';;\n \
                  exec) if [ \"$2\" = --help ]; then cat '{f}/help-exec.txt'; elif [ \"$2\" = resume ]; then printf 'Usage: codex exec resume\\n      --json\\n'; \
                  else cat > /dev/null; cat '{f}/exec/stdout.jsonl'; fi;;\n \
-                 app-server) case \"$2\" in\n  --help) cat '{f}/help-app-server.txt';;\n  generate-json-schema) [ \"$3\" = --out ] && mkdir -p \"$4\" && cp -R '{s}/.' \"$4/\";;\n  \
+                 app-server) case \"$2\" in\n  --help) cat '{c}/help-app-server.txt';;\n  generate-json-schema) [ \"$3\" = --out ] && mkdir -p \"$4\" && cp -R '{s}/.' \"$4/\";;\n  \
                  *) exit 9;;\n esac;;\n \
                  login) echo 'Logged in using ChatGPT' >&2;;\n *) echo \"error: unrecognized subcommand '$1'\" >&2; exit 2;;\nesac\n",
                 f = f.display(),
+                c = copy.display(),
                 s = schema.display()
             ),
         )?;

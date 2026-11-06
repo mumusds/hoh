@@ -127,18 +127,21 @@ fn declaration(line: &str) -> Option<(Vec<&str>, &str)> {
         .min()
         .unwrap_or(text.len());
     let mut names = Vec::new();
-    let mut placeholders = false;
+    // A name comes first or after a comma; a name without one ends the names (M1T07R-26).
+    let mut name_next = true;
     for word in text[..end].split(' ') {
-        let word = word.strip_suffix(',').unwrap_or(word);
-        if !placeholders && let Some(name) = flag_name(word) {
+        let (word, comma) = match word.strip_suffix(',') {
+            Some(word) => (word, true),
+            None => (word, false),
+        };
+        if name_next && let Some(name) = flag_name(word) {
             names.push(name);
-        } else if is_placeholder(word) && !names.is_empty() {
-            placeholders = true;
-        } else {
+            name_next = comma;
+        } else if name_next || !is_placeholder(word) || comma {
             return None;
         }
     }
-    (!names.is_empty()).then_some((names, &text[end..]))
+    (!names.is_empty() && !name_next).then_some((names, &text[end..]))
 }
 
 /// The name of an option word (`-x`, `-xy` starting with a letter, `--name`, `--name=<value>`, `--name[=VALUE]`), or
@@ -167,10 +170,11 @@ fn flag_name(word: &str) -> Option<&str> {
     (named && value).then_some(name)
 }
 
-/// A placeholder that names a value: `<value>` or an upper-case `VALUE`.
+/// A placeholder that names a value: `<value>` or an upper-case `VALUE` (a letter first, so `0`, `123` and `_` are
+/// literals; M1R-03).
 fn names_a_value(word: &str) -> bool {
     (word.len() > 2 && word.starts_with('<') && word.ends_with('>'))
-        || (!word.is_empty()
+        || (word.starts_with(|c: char| c.is_ascii_uppercase())
             && word
                 .chars()
                 .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit()))
@@ -212,11 +216,16 @@ pub fn option_text(help: &str, flag: &str) -> Option<String> {
     text.map(|text| text.join("\n"))
 }
 
-/// Whether `word` is a whole word of `text`: words are runs of letters, digits, `-` and `_` (`stream-json-v2` is not
-/// `stream-json`, `grpc` is not `rpc`; M1T07R-17).
+/// Whether `word` is a whole token of `text`: found where neither the character before it nor the one after it is a
+/// letter, digit, `-` or `_` (`stream-json-v2` is not `stream-json`, `grpc` is not `rpc`, `stdio://x` is not
+/// `stdio://`; M1T07R-17, -27).
 pub fn has_word(text: &str, word: &str) -> bool {
-    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
-        .any(|w| w == word)
+    let inner = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    !word.is_empty()
+        && text.match_indices(word).any(|(at, _)| {
+            !text[..at].chars().next_back().is_some_and(inner)
+                && !text[at + word.len()..].chars().next().is_some_and(inner)
+        })
 }
 
 /// Whether `help` lists the subcommand `name` in the command column of its `Commands:` section (the least indented
@@ -407,6 +416,53 @@ mod help_tests {
         let pi = include_str!("../../../tests/fixtures/protocol/pi/1.5.0/help.txt");
         assert_eq!(value(claude, "--output-format", "stream-json"), Some(true));
         assert_eq!(value(pi, "--mode", "rpc"), Some(true));
+    }
+
+    /// A placeholder names a value: a number or `_` is a literal; and two names of one declaration are separated by
+    /// a comma, so a description that names two options is not a declaration of them (M1R-03, M1T07R-26).
+    #[test]
+    fn literals_and_option_lists_are_no_declarations() {
+        for line in [
+            "  --json=0",
+            "  --json[=0]",
+            "  --json[=_]",
+            "  --json=123",
+            "  --json 0",
+            "      --other --json  mentioned alongside another option",
+            "  -p --print",
+            "  --json,",
+            "  -c, <FILE>",
+        ] {
+            assert_eq!(declared(line), None, "{line}");
+        }
+        for (line, names) in [
+            ("  -p, --print  Print", vec!["-p", "--print"]),
+            ("  --no-tools, -nt", vec!["--no-tools", "-nt"]),
+            ("  -c, --config <key=value>", vec!["-c", "--config"]),
+            (
+                "  -p, --profile <CONFIG_PROFILE_V2>",
+                vec!["-p", "--profile"],
+            ),
+            ("  --level LEVEL2  One", vec!["--level"]),
+        ] {
+            assert_eq!(declared(line), Some(names), "{line}");
+        }
+    }
+
+    /// A value is a whole token of the text, whatever it is made of: `stdio://` as codex lists it, not `stdio://x`
+    /// or `pipe://` (M1T07R-27); words as before.
+    #[test]
+    fn a_value_is_a_whole_token() {
+        let listen = "Transport endpoint URL. Supported values: `stdio://` (default), `unix://`";
+        assert!(has_word(listen, "stdio://") && has_word(listen, "unix://"));
+        assert!(!has_word(
+            "Supported values: `stdio://x`, `pipe://`",
+            "stdio://"
+        ));
+        assert!(has_word("text, json, or rpc", "rpc") && !has_word("grpc", "rpc"));
+        assert!(
+            !has_word("stream-json-v2", "stream-json") && has_word("(stream-json)", "stream-json")
+        );
     }
 
     /// A subcommand is a name in the command column of the `Commands:` section, not a wrapped description and not a

@@ -239,13 +239,15 @@ fn passed_options(args: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Every option an adapter passes is declared by the help it was given, and what every turn passes the probe
-/// requires: with an option's declaration gone from the recorded help, a turn that would pass it is blocked or does
-/// without it, and if the plainest turn passes it, that turn is blocked and the probe refuses the CLI too. Likewise a
-/// value the help lists for such an option (claude's `stream-json`, pi's `rpc`). So the probe never accepts a CLI
-/// its adapter cannot start, whatever the adapter comes to pass (M1R-03).
+/// Every option an adapter passes is declared by the help it was given, and the plainest turn is blocked exactly when
+/// the probe refuses the CLI: with an option's declaration gone from the recorded help, a turn that would pass it is
+/// blocked or does without it, and the plainest turn is blocked if and only if the probe's rule refuses that help.
+/// Likewise a value the help lists for an option the plainest turn passes (claude's `stream-json`, pi's `rpc`, the App
+/// Server's `stdio://`): without it the turn does not pass it, and is blocked if and only if the probe refuses. So the
+/// probe neither accepts a CLI its adapter cannot start nor refuses one it can (M1R-03, M1T07R-27).
 #[test]
-fn every_option_an_adapter_passes_is_declared_and_what_every_turn_passes_is_required() -> R {
+fn every_option_an_adapter_passes_is_declared_and_the_probe_refuses_exactly_what_cannot_start() -> R
+{
     use hoh_agents::adapter::{has_word, offers, option_text};
     use hoh_agents::{claude, codex, pi};
     let help = |path: &str| std::fs::read_to_string(fixtures().join(path));
@@ -295,7 +297,9 @@ fn every_option_an_adapter_passes_is_declared_and_what_every_turn_passes_is_requ
         })
         .map_err(|blocked| blocked.0)
     });
-    let cases: [Adapter; 3] = [
+    let app_server_start: Start =
+        Box::new(|help, _| codex::app_server_args(help).map_err(|blocked| blocked.0));
+    let cases: [Adapter; 4] = [
         (
             "claude",
             help("claude/2.1.318/help.txt")?,
@@ -314,8 +318,14 @@ fn every_option_an_adapter_passes_is_declared_and_what_every_turn_passes_is_requ
             exec_start,
             codex::exec_interface_missing,
         ),
+        (
+            "codex app-server",
+            help("codex/0.166.0/help-app-server.txt")?,
+            app_server_start,
+            codex::app_server_launch_missing,
+        ),
     ];
-    let mut values = Vec::new();
+    let (mut values, mut blocking) = (Vec::new(), Vec::new());
     for (agent, help, start, interface_missing) in cases {
         assert_eq!(interface_missing(&help), None, "{agent}");
         let every = start(&help, false)?;
@@ -332,15 +342,13 @@ fn every_option_an_adapter_passes_is_declared_and_what_every_turn_passes_is_requ
                     "{agent} passes {option}, which its help does not declare"
                 );
             }
-            if every.contains(&option) {
-                assert!(
-                    start(&without, false).is_err(),
-                    "{agent} starts without {option}"
-                );
-                assert!(
-                    interface_missing(&without).is_some(),
-                    "the probe takes a {agent} whose help lacks {option}, which every turn passes"
-                );
+            assert_eq!(
+                start(&without, false).is_err(),
+                interface_missing(&without).is_some(),
+                "{agent} without {option}: the plainest turn blocked, the probe refusing"
+            );
+            if every.contains(&option) && start(&without, false).is_err() {
+                blocking.push(format!("{agent} {option}"));
             }
         }
         for pair in every.windows(2) {
@@ -349,19 +357,43 @@ fn every_option_an_adapter_passes_is_declared_and_what_every_turn_passes_is_requ
                 && option_text(&help, option).is_some_and(|text| has_word(&text, value))
             {
                 let without = help.replace(value.as_str(), &format!("{value}-gone"));
+                let plainest = start(&without, false);
                 assert!(
-                    start(&without, false).is_err(),
-                    "{agent} starts without {option} {value}"
+                    !plainest.as_ref().is_ok_and(|args| args
+                        .windows(2)
+                        .any(|p| p[0] == *option && p[1] == *value)),
+                    "{agent} passes {option} {value}, which its help does not list"
                 );
-                assert!(
+                assert_eq!(
+                    plainest.is_err(),
                     interface_missing(&without).is_some(),
-                    "the probe takes a {agent} whose help lists no {option} {value}"
+                    "{agent} without {option} {value}: the plainest turn blocked, the probe refusing"
                 );
                 values.push(format!("{option} {value}"));
             }
         }
     }
-    assert_eq!(values, ["--output-format stream-json", "--mode rpc"]);
+    assert_eq!(
+        values,
+        [
+            "--output-format stream-json",
+            "--mode rpc",
+            "--listen stdio://"
+        ]
+    );
+    // The options without which nothing starts: those the probe requires.
+    assert_eq!(
+        blocking,
+        [
+            "claude -p",
+            "claude --output-format",
+            "claude --verbose",
+            "pi --mode",
+            "pi --session-dir",
+            "pi --session-id",
+            "codex exec --json"
+        ]
+    );
     Ok(())
 }
 
@@ -644,6 +676,47 @@ fn an_app_server_without_any_method_a_turn_uses_falls_back_to_exec_or_is_unsuppo
                     (other, _) => return Err(format!("without {method}: {other:?}").into()),
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+/// An App Server whose `--listen` does not list `stdio://` cannot be started on stdio: the probe takes exec when
+/// `codex exec` can run a turn, and refuses the CLI when it cannot either (M1T07R-27).
+#[test]
+fn an_app_server_that_cannot_listen_on_stdio_falls_back_to_exec_or_is_unsupported() -> R {
+    let tmp = tempfile::tempdir()?;
+    let f = fixtures().join("codex/0.166.0");
+    let app_help = tmp.path().join("app-server-pipe.txt");
+    std::fs::write(
+        &app_help,
+        std::fs::read_to_string(f.join("help-app-server.txt"))?.replace("stdio://", "pipe://"),
+    )?;
+    let lines_help = tmp.path().join("exec-json-lines.txt");
+    std::fs::write(
+        &lines_help,
+        std::fs::read_to_string(f.join("help-exec.txt"))?.replace("--json", "--json-lines"),
+    )?;
+    for (exec_help, usable) in [(f.join("help-exec.txt"), true), (lines_help, false)] {
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n --help) cat '{f}/help.txt';;\n \
+             exec) [ \"$2\" = --help ] && cat '{e}';;\n \
+             app-server) case \"$2\" in\n  --help) cat '{a}';;\n  generate-json-schema) [ \"$3\" = --out ] && mkdir -p \"$4\" && cp -R '{f}/app-server-schema/.' \"$4/\";;\n  \
+             *) exit 2;;\n esac;;\n *) exit 2;;\nesac\n",
+            e = exec_help.display(),
+            a = app_help.display(),
+            f = f.display()
+        );
+        let (dir, _) = fake(tmp.path(), &format!("pipe-{usable}"), "codex", &script)?;
+        match (probe(Agent::Codex, &env_for(&dir)), usable) {
+            (Ok(entry), true) => assert_eq!(entry.transport, Transport::Exec),
+            (Err(ProbeError::Unsupported { detail, .. }), false) => {
+                assert!(
+                    detail.contains("stdio://") && detail.contains("--json"),
+                    "{detail}"
+                )
+            }
+            (other, _) => return Err(format!("usable exec {usable}: {other:?}").into()),
         }
     }
     Ok(())

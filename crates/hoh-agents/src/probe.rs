@@ -231,13 +231,23 @@ fn probe_codex(
     let mut no_app_server = "codex --help lists no app-server".to_owned();
     if listed("app-server") {
         let app = run_ok(launcher, &["app-server", "--help"], env)?.stdout;
-        let schema = codex_schema(launcher, env)?;
-        match crate::codex::app_server_interface_missing(
-            &schema.requests,
-            &schema.client_notifications,
-            &schema.notifications,
-        ) {
+        // It must start on stdio before its schema is worth reading (M1T07R-27).
+        let usable = match crate::codex::app_server_launch_missing(&String::from_utf8_lossy(&app)) {
+            Some(why) => Err(why),
             None => {
+                let schema = codex_schema(launcher, env)?;
+                match crate::codex::app_server_interface_missing(
+                    &schema.requests,
+                    &schema.client_notifications,
+                    &schema.notifications,
+                ) {
+                    None => Ok(schema),
+                    Some(why) => Err(why),
+                }
+            }
+        };
+        match usable {
+            Ok(schema) => {
                 help.extend_from_slice(&app);
                 set(caps, "structured_events", true);
                 for (method, capability) in crate::codex::APP_SERVER_GATED {
@@ -255,7 +265,7 @@ fn probe_codex(
                 );
                 return Ok((Transport::AppServer, help, Some(schema.hash)));
             }
-            Some(why) => no_app_server = why,
+            Err(why) => no_app_server = why,
         }
     }
     let why = match &exec_text {

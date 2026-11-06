@@ -220,6 +220,12 @@ impl State<'_> {
     }
 
     fn send_steer(&mut self, s: Steer) {
+        // Only where the schema has turn/steer (the probe's mid_turn_steer); otherwise the input waits for a later
+        // turn, as on exec (M1T07R-28, REQ-027).
+        if !self.turn.launch.requests.contains(super::STEER_REQUEST) {
+            let _ = s.reply.send(SteerReceipt::CapabilityUnsupported);
+            return;
+        }
         let expected = s.expected_turn.clone().or_else(|| self.turn_id.clone());
         self.sent.push(SentSteer {
             input_id: s.input_id.clone(),
@@ -230,7 +236,8 @@ impl State<'_> {
         });
         let params = json!({"threadId": self.thread_id, "expectedTurnId": expected,
                             "input": [{"type": "text", "text": s.text}]});
-        self.conn.request("turn/steer", params, Pending::Steer(s));
+        self.conn
+            .request(super::STEER_REQUEST, params, Pending::Steer(s));
     }
 
     async fn apply(&self, input_id: String) -> Result<(), PersistError> {
@@ -457,7 +464,8 @@ impl State<'_> {
                     match &launch.resume {
                         Some(thread) => {
                             params["threadId"] = json!(thread);
-                            self.conn.request("thread/resume", params, Pending::Thread);
+                            self.conn
+                                .request(super::RESUME_REQUEST, params, Pending::Thread);
                         }
                         None => self.conn.request("thread/start", params, Pending::Thread),
                     }
@@ -581,7 +589,10 @@ pub(super) async fn run(
         turn.logs.join("app-server.stdout.jsonl"),
         turn.logs.join("app-server.stderr.log"),
     );
-    let args = app_server_args(help);
+    let args = match app_server_args(help) {
+        Ok(args) => args,
+        Err(super::Blocked(why)) => return Ok(End::Degrade(why)),
+    };
     let mut command = Command::new(&turn.launch.program);
     command.args(&args).current_dir(&turn.launch.cwd);
     let config = Config {
