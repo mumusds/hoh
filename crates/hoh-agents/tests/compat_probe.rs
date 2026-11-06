@@ -687,36 +687,46 @@ fn an_app_server_without_any_method_a_turn_uses_falls_back_to_exec_or_is_unsuppo
 fn an_app_server_that_cannot_listen_on_stdio_falls_back_to_exec_or_is_unsupported() -> R {
     let tmp = tempfile::tempdir()?;
     let f = fixtures().join("codex/0.166.0");
-    let app_help = tmp.path().join("app-server-pipe.txt");
-    std::fs::write(
-        &app_help,
-        std::fs::read_to_string(f.join("help-app-server.txt"))?.replace("stdio://", "pipe://"),
-    )?;
     let lines_help = tmp.path().join("exec-json-lines.txt");
     std::fs::write(
         &lines_help,
         std::fs::read_to_string(f.join("help-exec.txt"))?.replace("--json", "--json-lines"),
     )?;
-    for (exec_help, usable) in [(f.join("help-exec.txt"), true), (lines_help, false)] {
-        let script = format!(
-            "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n --help) cat '{f}/help.txt';;\n \
-             exec) [ \"$2\" = --help ] && cat '{e}';;\n \
-             app-server) case \"$2\" in\n  --help) cat '{a}';;\n  generate-json-schema) [ \"$3\" = --out ] && mkdir -p \"$4\" && cp -R '{f}/app-server-schema/.' \"$4/\";;\n  \
-             *) exit 2;;\n esac;;\n *) exit 2;;\nesac\n",
-            e = exec_help.display(),
-            a = app_help.display(),
-            f = f.display()
-        );
-        let (dir, _) = fake(tmp.path(), &format!("pipe-{usable}"), "codex", &script)?;
-        match (probe(Agent::Codex, &env_for(&dir)), usable) {
-            (Ok(entry), true) => assert_eq!(entry.transport, Transport::Exec),
-            (Err(ProbeError::Unsupported { detail, .. }), false) => {
-                assert!(
-                    detail.contains("stdio://") && detail.contains("--json"),
-                    "{detail}"
-                )
+    // Another endpoint, or a longer URI that only starts like `stdio://` (M1T07R-27).
+    for (n, other) in ["pipe://", "stdio:///socket"].into_iter().enumerate() {
+        let app_help = tmp.path().join(format!("app-server-{n}.txt"));
+        std::fs::write(
+            &app_help,
+            std::fs::read_to_string(f.join("help-app-server.txt"))?.replace("stdio://", other),
+        )?;
+        for (exec_help, usable) in [(f.join("help-exec.txt"), true), (lines_help.clone(), false)] {
+            let script = format!(
+                "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n --help) cat '{f}/help.txt';;\n \
+                 exec) [ \"$2\" = --help ] && cat '{e}';;\n \
+                 app-server) case \"$2\" in\n  --help) cat '{a}';;\n  generate-json-schema) [ \"$3\" = --out ] && mkdir -p \"$4\" && cp -R '{f}/app-server-schema/.' \"$4/\";;\n  \
+                 *) exit 2;;\n esac;;\n *) exit 2;;\nesac\n",
+                e = exec_help.display(),
+                a = app_help.display(),
+                f = f.display()
+            );
+            let (dir, _) = fake(
+                tmp.path(),
+                &format!("listen-{n}-{usable}"),
+                "codex",
+                &script,
+            )?;
+            match (probe(Agent::Codex, &env_for(&dir)), usable) {
+                (Ok(entry), true) => assert_eq!(entry.transport, Transport::Exec, "{other}"),
+                (Err(ProbeError::Unsupported { detail, .. }), false) => {
+                    assert!(
+                        detail.contains("stdio://") && detail.contains("--json"),
+                        "{other}: {detail}"
+                    )
+                }
+                (result, _) => {
+                    return Err(format!("{other}, usable exec {usable}: {result:?}").into());
+                }
             }
-            (other, _) => return Err(format!("usable exec {usable}: {other:?}").into()),
         }
     }
     Ok(())
