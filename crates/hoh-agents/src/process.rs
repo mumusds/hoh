@@ -741,9 +741,9 @@ mod tests {
         }
     }
 
-    /// A leader that left its group before it is signalled gets no SIGTERM, whichever group it is in when the group
-    /// is signalled (it may come back in between): only the group is sent SIGTERM, so the leader gets it at most once,
-    /// as a member; SIGKILL still reaches it through its pidfd after the grace (FU-21, M1T07R-103).
+    /// Only the group is sent SIGTERM, so the leader gets it at most once, as a member when the group is signalled:
+    /// a leader outside its group then gets none (this test), one back in it gets it once; SIGKILL still reaches a
+    /// leader outside its group through its pidfd after the grace (FU-21, FU-30, M1T07R-103).
     #[tokio::test]
     async fn a_leader_outside_its_group_gets_sigkill_not_sigterm()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -758,19 +758,20 @@ mod tests {
              while True:\n    time.sleep(1)\n",
             count = count.display()
         ));
-        let config = Config {
-            deadline: Some(Duration::from_millis(500)),
-            escalation: Escalation {
-                native: None,
-                native_grace: Duration::ZERO,
-                term_grace: Duration::from_millis(500),
-                kill_grace: Duration::from_secs(2),
-            },
-            ..Config::default()
-        };
-        let started = Instant::now();
-        let mut p = Process::spawn(command, config)?;
+        let mut p = Process::spawn(command, Config::default())?;
         let leader = Pid::from_raw(p.pid() as i32).ok_or("a pid")?;
+        // Out of its group once it says its pid; only then is it ended (FU-32).
+        match tokio::time::timeout(Duration::from_secs(10), p.next()).await? {
+            Some(Event::Frame(_)) => {}
+            other => return Err(format!("expected the leader's pid, got {other:?}").into()),
+        }
+        let started = Instant::now();
+        p.cancel(Escalation {
+            native: None,
+            native_grace: Duration::ZERO,
+            term_grace: Duration::from_millis(500),
+            kill_grace: Duration::from_secs(2),
+        });
         let report = tokio::time::timeout(Duration::from_secs(10), async {
             while let Some(event) = p.next().await {
                 if let Event::Exit(report) = event {
@@ -795,7 +796,7 @@ mod tests {
         );
         assert_eq!(report.status, Some(Termination::Signal(9)), "{report:?}");
         assert!(
-            started.elapsed() >= Duration::from_secs(1),
+            started.elapsed() >= Duration::from_millis(500),
             "killed before the grace"
         );
         assert!(!left, "leader survived");
