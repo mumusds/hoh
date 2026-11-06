@@ -30,6 +30,7 @@
   "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ConfigBatchWriteParams.json": "recorded Codex schema (merge strategy value upsert)",
   "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ConfigRequirementsReadResponse.json": "recorded Codex schema (sqliteHome setting)",
   "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ConfigValueWriteParams.json": "recorded Codex schema (merge strategy value upsert)",
+  "tests/fixtures/protocol/codex/0.166.0/help.txt": "recorded Codex help (migrate-nfs-db subcommand: SQLite databases)",
   "tools/validate_bundle.py": "kit validator checking the SQL contract on a temporary database"
  }
 }

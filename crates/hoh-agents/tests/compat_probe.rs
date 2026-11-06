@@ -42,6 +42,14 @@ fn fake(
     Ok((dir, path))
 }
 
+/// A well-formed `ClientNotification.json` with what every App Server turn sends (M1R-04).
+const CLIENT_NOTIFICATIONS: &str = "{\"oneOf\":[{\"type\":\"object\",\"required\":[\"method\"],\"properties\":{\"method\":{\"type\":\"string\",\"enum\":[\"initialized\"]}}}]}";
+
+/// Whether the probe refused the schema output itself: a failure that names `file`.
+fn schema_refused(result: &Result<AgentEntry, ProbeError>, file: &str) -> bool {
+    matches!(result, Err(ProbeError::Failed { detail, .. }) if detail.contains(file))
+}
+
 fn env_for(dir: &Path) -> ProbeEnv {
     ProbeEnv {
         path: format!("{}:/usr/bin:/bin", dir.display()).into(),
@@ -81,13 +89,13 @@ fn test_027_01_probe_three_fake_binaries_into_a_valid_manifest() -> R {
     std::fs::write(&old_help_file, &old_claude_help)?;
 
     let new_codex = format!(
-        "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n exec) [ \"$2\" = --help ] && cat '{f}/help-exec.txt';;\n \
+        "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n --help) cat '{f}/help.txt';;\n exec) [ \"$2\" = --help ] && cat '{f}/help-exec.txt';;\n \
          app-server) case \"$2\" in\n  --help) cat '{f}/help-app-server.txt';;\n  generate-json-schema) [ \"$3\" = --out ] && mkdir -p \"$4\" && cp -R '{f}/app-server-schema/.' \"$4/\";;\n  \
          *) exit 2;;\n esac;;\n *) echo \"unknown command $1\" >&2; exit 2;;\nesac\n",
         f = codex_fix.display()
     );
     let old_codex = format!(
-        "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.100.0';;\n exec) [ \"$2\" = --help ] && cat '{f}/help-exec.txt';;\n \
+        "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.100.0';;\n --help) grep -v '^  app-server ' '{f}/help.txt';;\n exec) [ \"$2\" = --help ] && cat '{f}/help-exec.txt';;\n \
          *) echo \"error: unrecognized subcommand '$1'\" >&2; exit 2;;\nesac\n",
         f = codex_fix.display()
     );
@@ -128,14 +136,25 @@ fn test_027_01_probe_three_fake_binaries_into_a_valid_manifest() -> R {
         )
     );
 
-    // Help and schema hashes; transports.
+    // Help and schema hashes over every help probed (codex: `--help`, whose Commands column names the transports, then
+    // `exec --help` and `app-server --help`); transports.
+    let top_help = std::fs::read_to_string(codex_fix.join("help.txt"))?;
+    let old_top_help: String = top_help
+        .lines()
+        .filter(|l| !l.starts_with("  app-server "))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert_ne!(old_top_help.len(), top_help.len());
     let exec_help = std::fs::read(codex_fix.join("help-exec.txt"))?;
     let app_help = std::fs::read(codex_fix.join("help-app-server.txt"))?;
     assert_eq!(
         new.help_sha256,
-        sha256(&[exec_help.clone(), app_help].concat())
+        sha256(&[top_help.into_bytes(), exec_help.clone(), app_help].concat())
     );
-    assert_eq!(old.help_sha256, sha256(&exec_help));
+    assert_eq!(
+        old.help_sha256,
+        sha256(&[old_top_help.into_bytes(), exec_help].concat())
+    );
     assert_eq!(claude.help_sha256, sha256(old_claude_help.as_bytes()));
     assert_eq!(
         new.schema_sha256.as_deref(),
@@ -203,6 +222,147 @@ fn without_declaration(help: &str, flag: &str) -> String {
         })
         .map(|l| format!("{l}\n"))
         .collect()
+}
+
+/// How an adapter would start a turn with this help: `true` for a turn with every option this test sets (YOLO,
+/// resume, partial messages, provider, model), `false` for the plainest turn; the argv, or why it was blocked.
+type Start = Box<dyn Fn(&str, bool) -> Result<Vec<String>, String>>;
+
+/// An adapter under test: its name, a recorded help, how it starts a turn, and the probe's rule for it.
+type Adapter = (&'static str, String, Start, fn(&str) -> Option<String>);
+
+/// The options in an argv: words starting with `-`, other than `-` (stdin).
+fn passed_options(args: &[String]) -> Vec<String> {
+    args.iter()
+        .filter(|a| a.starts_with('-') && a.as_str() != "-")
+        .cloned()
+        .collect()
+}
+
+/// Every option an adapter passes is declared by the help it was given, and what every turn passes the probe
+/// requires: with an option's declaration gone from the recorded help, a turn that would pass it is blocked or does
+/// without it, and if the plainest turn passes it, that turn is blocked and the probe refuses the CLI too. Likewise a
+/// value the help lists for such an option (claude's `stream-json`, pi's `rpc`). So the probe never accepts a CLI
+/// its adapter cannot start, whatever the adapter comes to pass (M1R-03).
+#[test]
+fn every_option_an_adapter_passes_is_declared_and_what_every_turn_passes_is_required() -> R {
+    use hoh_agents::adapter::{has_word, offers, option_text};
+    use hoh_agents::{claude, codex, pi};
+    let help = |path: &str| std::fs::read_to_string(fixtures().join(path));
+    let claude_start: Start = Box::new(|help, full| {
+        claude::argv(&claude::Launch {
+            program: "claude".into(),
+            help: help.to_owned(),
+            cwd: "/".into(),
+            yolo: full,
+            partial: full,
+            resume: full.then(|| "hoh-id".to_owned()),
+            root: false,
+            capabilities: Default::default(),
+        })
+        .map(|argv| argv.args)
+        .map_err(|blocked| blocked.0)
+    });
+    let pi_start: Start = Box::new(|help, full| {
+        pi::args(&pi::Launch {
+            program: "pi".into(),
+            help: help.to_owned(),
+            cwd: "/".into(),
+            session_dir: "/hoh-dir".into(),
+            session_id: "hoh-id".to_owned(),
+            resume: full,
+            provider: full.then(|| "provider".to_owned()),
+            model: full.then(|| "model".to_owned()),
+            settled_event: false,
+            capabilities: Default::default(),
+        })
+        .map_err(|blocked| blocked.0)
+    });
+    let exec_start: Start = Box::new(|help, full| {
+        codex::exec_args(&codex::Launch {
+            program: "codex".into(),
+            app_server_help: None,
+            exec_help: help.to_owned(),
+            exec_resume_help: None,
+            cwd: "/".into(),
+            yolo: full,
+            resume: None,
+            model: full.then(|| "model".to_owned()),
+            known: Default::default(),
+            requests: Default::default(),
+            client_notifications: Default::default(),
+            capabilities: Default::default(),
+        })
+        .map_err(|blocked| blocked.0)
+    });
+    let cases: [Adapter; 3] = [
+        (
+            "claude",
+            help("claude/2.1.318/help.txt")?,
+            claude_start,
+            claude::interface_missing,
+        ),
+        (
+            "pi",
+            help("pi/1.5.0/help.txt")?,
+            pi_start,
+            pi::interface_missing,
+        ),
+        (
+            "codex exec",
+            help("codex/0.166.0/help-exec.txt")?,
+            exec_start,
+            codex::exec_interface_missing,
+        ),
+    ];
+    let mut values = Vec::new();
+    for (agent, help, start, interface_missing) in cases {
+        assert_eq!(interface_missing(&help), None, "{agent}");
+        let every = start(&help, false)?;
+        let all = start(&help, true)?;
+        for option in passed_options(&all) {
+            let without = without_declaration(&help, &option);
+            assert!(
+                !offers(&without, &option),
+                "{agent}: {option} is still declared"
+            );
+            if let Ok(args) = start(&without, true) {
+                assert!(
+                    !args.contains(&option),
+                    "{agent} passes {option}, which its help does not declare"
+                );
+            }
+            if every.contains(&option) {
+                assert!(
+                    start(&without, false).is_err(),
+                    "{agent} starts without {option}"
+                );
+                assert!(
+                    interface_missing(&without).is_some(),
+                    "the probe takes a {agent} whose help lacks {option}, which every turn passes"
+                );
+            }
+        }
+        for pair in every.windows(2) {
+            let (option, value) = (&pair[0], &pair[1]);
+            if option.starts_with('-')
+                && option_text(&help, option).is_some_and(|text| has_word(&text, value))
+            {
+                let without = help.replace(value.as_str(), &format!("{value}-gone"));
+                assert!(
+                    start(&without, false).is_err(),
+                    "{agent} starts without {option} {value}"
+                );
+                assert!(
+                    interface_missing(&without).is_some(),
+                    "the probe takes a {agent} whose help lists no {option} {value}"
+                );
+                values.push(format!("{option} {value}"));
+            }
+        }
+    }
+    assert_eq!(values, ["--output-format stream-json", "--mode rpc"]);
+    Ok(())
 }
 
 /// A CLI its adapter cannot start is refused by the probe, by the adapter's own rule (M1R-03, M1T07R-14): claude
@@ -384,9 +544,10 @@ fn a_cli_without_what_its_adapter_needs_is_unsupported() -> R {
     let help_file = tmp.path().join("codex-exec-help.txt");
     std::fs::write(&help_file, exec_help)?;
     let script = format!(
-        "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.100.0';;\n exec) [ \"$2\" = --help ] && cat '{}';;\n \
+        "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.100.0';;\n --help) grep -v '^  app-server ' '{top}';;\n exec) [ \"$2\" = --help ] && cat '{}';;\n \
          *) echo \"error: unrecognized subcommand '$1'\" >&2; exit 2;;\nesac\n",
-        help_file.display()
+        help_file.display(),
+        top = fixtures().join("codex/0.166.0/help.txt").display()
     );
     let (dir, _) = fake(tmp.path(), "codex-json-lines", "codex", &script)?;
     match probe(Agent::Codex, &env_for(&dir)) {
@@ -398,68 +559,135 @@ fn a_cli_without_what_its_adapter_needs_is_unsupported() -> R {
     Ok(())
 }
 
-/// An App Server whose schema lacks what every turn needs (here `turn/start`) is no App Server for HoH: the probe
-/// takes exec when `codex exec` can run a turn, and refuses the CLI when it cannot either (M1T07R-15).
+/// An App Server whose schema lacks anything a turn uses (a request or notification HoH sends on every turn, or a
+/// notification it needs to end the turn and read its reply) is no App Server for HoH: the probe takes exec when
+/// `codex exec` can run a turn, and refuses the CLI when it cannot either (M1T07R-15, M1R-04). Each method is taken
+/// out of its file by renaming it, so the file stays a well-formed schema.
 #[test]
-fn an_app_server_without_turn_start_falls_back_to_exec_or_is_unsupported() -> R {
+fn an_app_server_without_any_method_a_turn_uses_falls_back_to_exec_or_is_unsupported() -> R {
+    use hoh_agents::codex::{
+        APP_SERVER_CLIENT_NOTIFICATIONS, APP_SERVER_NOTIFICATIONS, APP_SERVER_REQUESTS,
+    };
+    // The interface of ADR-015 decision 2; codex_adapter checks that the adapter sends nothing else (M1R-04).
+    assert_eq!(
+        APP_SERVER_REQUESTS,
+        ["initialize", "thread/start", "turn/start", "turn/interrupt"]
+    );
+    assert_eq!(APP_SERVER_CLIENT_NOTIFICATIONS, ["initialized"]);
+    assert_eq!(
+        APP_SERVER_NOTIFICATIONS,
+        ["turn/completed", "item/started", "item/completed"]
+    );
     let tmp = tempfile::tempdir()?;
     let f = fixtures().join("codex/0.166.0");
-    let schema = tmp.path().join("schema");
-    std::fs::create_dir(&schema)?;
-    let requests: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
-        f.join("app-server-schema/ClientRequest.json"),
-    )?)?;
-    let mut requests = requests;
-    let variants = requests["oneOf"]
-        .as_array_mut()
-        .ok_or("ClientRequest.json has no oneOf")?;
-    let before = variants.len();
-    variants.retain(|v| v["properties"]["method"]["enum"] != serde_json::json!(["turn/start"]));
-    assert_eq!(
-        before - variants.len(),
-        1,
-        "the recorded schema has one turn/start variant"
-    );
-    let copied = std::process::Command::new("cp")
-        .arg("-R")
-        .arg(f.join("app-server-schema/."))
-        .arg(&schema)
-        .status()?;
-    assert!(copied.success());
-    std::fs::write(
-        schema.join("ClientRequest.json"),
-        serde_json::to_vec_pretty(&requests)?,
-    )?;
     let lines_help = tmp.path().join("exec-json-lines.txt");
     std::fs::write(
         &lines_help,
         std::fs::read_to_string(f.join("help-exec.txt"))?.replace("--json", "--json-lines"),
     )?;
-    for (group, exec_help, usable) in [
-        ("no-turn-start-exec", f.join("help-exec.txt"), true),
-        ("no-turn-start-no-exec", lines_help, false),
+    for (file, methods) in [
+        ("ClientRequest.json", APP_SERVER_REQUESTS),
+        ("ClientNotification.json", APP_SERVER_CLIENT_NOTIFICATIONS),
+        ("ServerNotification.json", APP_SERVER_NOTIFICATIONS),
     ] {
+        for method in methods {
+            let group = method.replace('/', "-");
+            let schema = tmp.path().join(format!("schema-{group}"));
+            std::fs::create_dir(&schema)?;
+            let copied = std::process::Command::new("cp")
+                .arg("-R")
+                .arg(f.join("app-server-schema/."))
+                .arg(&schema)
+                .status()?;
+            assert!(copied.success());
+            let mut value: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(schema.join(file))?)?;
+            let mut renamed = 0;
+            for variant in value["oneOf"].as_array_mut().ok_or("no oneOf")? {
+                for m in variant["properties"]["method"]["enum"]
+                    .as_array_mut()
+                    .into_iter()
+                    .flatten()
+                {
+                    if m == method {
+                        *m = serde_json::json!(format!("{method}-gone"));
+                        renamed += 1;
+                    }
+                }
+            }
+            assert_eq!(renamed, 1, "{file} lists {method} once");
+            std::fs::write(schema.join(file), serde_json::to_vec_pretty(&value)?)?;
+            for (exec_help, usable) in
+                [(f.join("help-exec.txt"), true), (lines_help.clone(), false)]
+            {
+                let script = format!(
+                    "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n --help) cat '{f}/help.txt';;\n \
+                     exec) [ \"$2\" = --help ] && cat '{e}';;\n \
+                     app-server) case \"$2\" in\n  --help) cat '{f}/help-app-server.txt';;\n  generate-json-schema) [ \"$3\" = --out ] && mkdir -p \"$4\" && cp -R '{s}/.' \"$4/\";;\n  \
+                     *) exit 2;;\n esac;;\n *) exit 2;;\nesac\n",
+                    e = exec_help.display(),
+                    f = f.display(),
+                    s = schema.display()
+                );
+                let (dir, _) = fake(tmp.path(), &format!("{group}-{usable}"), "codex", &script)?;
+                match (probe(Agent::Codex, &env_for(&dir)), usable) {
+                    (Ok(entry), true) => {
+                        assert_eq!(entry.transport, Transport::Exec, "without {method}");
+                        assert_eq!(entry.capabilities.get("mid_turn_steer"), Some(&Some(false)));
+                    }
+                    (Err(ProbeError::Unsupported { detail, .. }), false) => {
+                        assert!(
+                            detail.contains(method) && detail.contains("--json"),
+                            "{detail}"
+                        );
+                    }
+                    (other, _) => return Err(format!("without {method}: {other:?}").into()),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// codex's transports are subcommands, read from the Commands column of `codex --help`: a codex that lists neither
+/// `exec` nor `app-server` cannot be driven, whatever those words do when run; one that lists them but cannot show
+/// their help is a failed probe, not a missing interface (M1R-03).
+#[test]
+fn a_codex_without_its_subcommands_is_unsupported() -> R {
+    let tmp = tempfile::tempdir()?;
+    let f = fixtures().join("codex/0.166.0");
+    let only_login = format!(
+        "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n \
+         --help) grep -v -e '^  exec ' -e '^  app-server ' '{f}/help.txt';;\n login) exit 0;;\n \
+         exec) [ \"$2\" = --help ] && cat '{f}/help-exec.txt';;\n \
+         *) echo \"error: unrecognized subcommand '$1'\" >&2; exit 2;;\nesac\n",
+        f = f.display()
+    );
+    let (dir, _) = fake(tmp.path(), "only-login", "codex", &only_login)?;
+    match probe(Agent::Codex, &env_for(&dir)) {
+        Err(ProbeError::Unsupported { detail, .. }) => {
+            assert!(
+                detail.contains("exec") && detail.contains("app-server"),
+                "{detail}"
+            )
+        }
+        other => return Err(format!("a codex with only login: {other:?}").into()),
+    }
+    // A listed subcommand whose help fails, the other one working: a failed probe, not the other transport (M1R-03).
+    for (group, fails) in [("exec-fails", "exec"), ("app-server-fails", "app-server")] {
         let script = format!(
-            "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n exec) [ \"$2\" = --help ] && cat '{e}';;\n \
-             app-server) case \"$2\" in\n  --help) cat '{f}/help-app-server.txt';;\n  generate-json-schema) [ \"$3\" = --out ] && mkdir -p \"$4\" && cp -R '{s}/.' \"$4/\";;\n  \
+            "#!/bin/sh\n[ \"$1 $2\" = '{fails} --help' ] && {{ echo 'crashed' >&2; exit 1; }}\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n --help) cat '{f}/help.txt';;\n \
+             exec) [ \"$2\" = --help ] && cat '{f}/help-exec.txt';;\n \
+             app-server) case \"$2\" in\n  --help) cat '{f}/help-app-server.txt';;\n  generate-json-schema) [ \"$3\" = --out ] && mkdir -p \"$4\" && cp -R '{f}/app-server-schema/.' \"$4/\";;\n  \
              *) exit 2;;\n esac;;\n *) exit 2;;\nesac\n",
-            e = exec_help.display(),
-            f = f.display(),
-            s = schema.display()
+            f = f.display()
         );
         let (dir, _) = fake(tmp.path(), group, "codex", &script)?;
-        match (probe(Agent::Codex, &env_for(&dir)), usable) {
-            (Ok(entry), true) => {
-                assert_eq!(entry.transport, Transport::Exec, "{group}");
-                assert_eq!(entry.capabilities.get("mid_turn_steer"), Some(&Some(false)));
+        match probe(Agent::Codex, &env_for(&dir)) {
+            Err(ProbeError::Failed { argv, .. }) => {
+                assert_eq!(argv[1..], [fails, "--help"], "{group}: {argv:?}")
             }
-            (Err(ProbeError::Unsupported { detail, .. }), false) => {
-                assert!(
-                    detail.contains("turn/start") && detail.contains("--json"),
-                    "{detail}"
-                );
-            }
-            (other, _) => return Err(format!("{group}: {other:?}").into()),
+            other => return Err(format!("{group}: {other:?}").into()),
         }
     }
     Ok(())
@@ -502,9 +730,10 @@ fn a_flag_with_a_longer_name_is_not_the_flag() -> R {
     let help_file = tmp.path().join("codex-no-resume.txt");
     std::fs::write(&help_file, without)?;
     let script = format!(
-        "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.100.0';;\n exec) [ \"$2\" = --help ] && cat '{}';;\n \
+        "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.100.0';;\n --help) grep -v '^  app-server ' '{top}';;\n exec) [ \"$2\" = --help ] && cat '{}';;\n \
          *) echo \"error: unrecognized subcommand '$1'\" >&2; exit 2;;\nesac\n",
-        help_file.display()
+        help_file.display(),
+        top = fixtures().join("codex/0.166.0/help.txt").display()
     );
     let (dir, _) = fake(tmp.path(), "codex-no-resume", "codex", &script)?;
     let entry = probe(Agent::Codex, &env_for(&dir))?;
@@ -601,14 +830,15 @@ fn codex_schema_output_must_be_a_schema() -> R {
         ),
     ] {
         let script = format!(
-            "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n exec) cat '{f}/help-exec.txt';;\n \
+            "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n --help) cat '{f}/help.txt';;\n exec) cat '{f}/help-exec.txt';;\n \
              app-server) case \"$2\" in --help) cat '{f}/help-app-server.txt';; generate-json-schema) {generate};; esac;;\nesac\n",
             f = codex_fix.display()
         );
         let (dir, _) = fake(tmp.path(), name, "codex", &script)?;
+        let result = probe(Agent::Codex, &env_for(&dir));
         assert!(
-            probe(Agent::Codex, &env_for(&dir)).is_err(),
-            "{name} schema output accepted"
+            schema_refused(&result, "ClientRequest.json"),
+            "{name} schema output accepted: {result:?}"
         );
     }
     Ok(())
@@ -622,7 +852,7 @@ fn codex_capabilities_come_from_the_schema_method_lists() -> R {
     let codex_fix = fixtures().join("codex/0.166.0");
     let write = |files: &str| {
         format!(
-            "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n exec) cat '{f}/help-exec.txt';;\n \
+            "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n --help) cat '{f}/help.txt';;\n exec) cat '{f}/help-exec.txt';;\n \
              app-server) case \"$2\" in --help) cat '{f}/help-app-server.txt';; generate-json-schema) mkdir -p \"$4\" && cd \"$4\" && {files};; esac;;\nesac\n",
             f = codex_fix.display()
         )
@@ -638,20 +868,22 @@ fn codex_capabilities_come_from_the_schema_method_lists() -> R {
             .collect();
         format!("{{\"oneOf\":[{}]}}", items.join(","))
     };
-    for (name, files) in [
-        ("null", "echo null > ClientRequest.json && echo null > ServerNotification.json".to_owned()),
-        ("array", "echo '[\"turn/steer\",\"thread/resume\"]' > ClientRequest.json && echo '{}' > ServerNotification.json".to_owned()),
-        ("no-notifications", format!("echo '{}' > ClientRequest.json", methods(&["turn/steer"]))),
+    for (name, files, refused) in [
+        ("null", "echo null > ClientRequest.json && echo null > ServerNotification.json".to_owned(), "ClientRequest.json"),
+        ("array", "echo '[\"turn/steer\",\"thread/resume\"]' > ClientRequest.json && echo '{}' > ServerNotification.json".to_owned(), "ClientRequest.json"),
+        ("no-notifications", format!("echo '{}' > ClientRequest.json && echo '{CLIENT_NOTIFICATIONS}' > ClientNotification.json", methods(&["turn/steer"])), "ServerNotification.json"),
     ] {
         let (dir, _) = fake(tmp.path(), name, "codex", &write(&files))?;
-        assert!(probe(Agent::Codex, &env_for(&dir)).is_err(), "{name} schema output accepted");
+        let result = probe(Agent::Codex, &env_for(&dir));
+        assert!(schema_refused(&result, refused), "{name} schema output accepted: {result:?}");
     }
-    // A minimal well-formed schema with what every turn needs (M1T07R-15): steer requests exist, resume and deltas do
-    // not; a stray string elsewhere is ignored.
+    // A minimal well-formed schema with what every turn uses (M1T07R-15, M1R-04): steer requests exist, resume and
+    // deltas do not; a stray string elsewhere is ignored.
     let files = format!(
-        "echo '{}' > ClientRequest.json && echo '{}' > ServerNotification.json && echo '\"thread/resume\"' > Other.json",
-        methods(&["initialize", "thread/start", "turn/start", "turn/steer"]),
-        methods(&["turn/completed"])
+        "echo '{}' > ClientRequest.json && echo '{}' > ClientNotification.json && echo '{}' > ServerNotification.json && echo '\"thread/resume\"' > Other.json",
+        methods(&[hoh_agents::codex::APP_SERVER_REQUESTS, &["turn/steer"]].concat()),
+        methods(hoh_agents::codex::APP_SERVER_CLIENT_NOTIFICATIONS),
+        methods(hoh_agents::codex::APP_SERVER_NOTIFICATIONS)
     );
     let (dir, _) = fake(tmp.path(), "minimal", "codex", &write(&files))?;
     let entry = probe(Agent::Codex, &env_for(&dir))?;
@@ -685,15 +917,17 @@ fn malformed_method_branches_are_refused() -> R {
         ),
     ] {
         let script = format!(
-            "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n exec) cat '{f}/help-exec.txt';;\n \
+            "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n --help) cat '{f}/help.txt';;\n exec) cat '{f}/help-exec.txt';;\n \
              app-server) case \"$2\" in --help) cat '{f}/help-app-server.txt';; generate-json-schema) mkdir -p \"$4\" && cd \"$4\" && \
-             echo '{requests}' > ClientRequest.json && echo '{notifications}' > ServerNotification.json;; esac;;\nesac\n",
+             echo '{requests}' > ClientRequest.json && echo '{CLIENT_NOTIFICATIONS}' > ClientNotification.json && \
+             echo '{notifications}' > ServerNotification.json;; esac;;\nesac\n",
             f = codex_fix.display()
         );
         let (dir, _) = fake(tmp.path(), name, "codex", &script)?;
+        let result = probe(Agent::Codex, &env_for(&dir));
         assert!(
-            probe(Agent::Codex, &env_for(&dir)).is_err(),
-            "{name} accepted"
+            schema_refused(&result, "ClientRequest.json"),
+            "{name} accepted: {result:?}"
         );
     }
     Ok(())
@@ -792,13 +1026,14 @@ fn method_branches_must_use_the_known_schema_form() -> R {
         ),
     ] {
         let script = format!(
-            "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n exec) cat '{f}/help-exec.txt';;\n \
+            "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n --help) cat '{f}/help.txt';;\n exec) cat '{f}/help-exec.txt';;\n \
              app-server) case \"$2\" in --help) cat '{f}/help-app-server.txt';; generate-json-schema) mkdir -p \"$4\" && cd \"$4\" && \
-             echo '{requests}' > ClientRequest.json && echo '{notifications}' > ServerNotification.json;; esac;;\nesac\n",
+             echo '{requests}' > ClientRequest.json && echo '{CLIENT_NOTIFICATIONS}' > ClientNotification.json && \
+             echo '{notifications}' > ServerNotification.json;; esac;;\nesac\n",
             f = codex_fix.display()
         );
         let (dir, _) = fake(tmp.path(), name, "codex", &script)?;
-        if probe(Agent::Codex, &env_for(&dir)).is_ok() {
+        if !schema_refused(&probe(Agent::Codex, &env_for(&dir)), "ClientRequest.json") {
             accepted.push(name);
         }
     }
@@ -813,7 +1048,7 @@ fn the_run_log_lists_every_command_a_probe_ran() -> R {
     let tmp = tempfile::tempdir()?;
     let f = fixtures().join("codex/0.166.0");
     let script = format!(
-        "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n exec) [ \"$2\" = --help ] && cat '{f}/help-exec.txt';;\n \
+        "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n --help) cat '{f}/help.txt';;\n exec) [ \"$2\" = --help ] && cat '{f}/help-exec.txt';;\n \
          app-server) case \"$2\" in\n  --help) cat '{f}/help-app-server.txt';;\n  generate-json-schema) [ \"$3\" = --out ] && mkdir -p \"$4\" && cp -R '{f}/app-server-schema/.' \"$4/\";;\n  \
          *) exit 2;;\n esac;;\n *) exit 2;;\nesac\n",
         f = f.display()
@@ -830,7 +1065,11 @@ fn the_run_log_lists_every_command_a_probe_ran() -> R {
         argv.first(),
         Some(&vec![program.clone(), "--version".to_owned()])
     );
-    for args in [&["app-server", "--help"][..], &["exec", "--help"]] {
+    for args in [
+        &["--help"][..],
+        &["app-server", "--help"],
+        &["exec", "--help"],
+    ] {
         let want: Vec<String> = std::iter::once(program.clone())
             .chain(args.iter().map(|a| (*a).to_owned()))
             .collect();

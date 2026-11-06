@@ -64,6 +64,9 @@ pub struct Launch {
     /// Client request methods of this version (its app-server schema's `ClientRequest.json`, [`listed_methods`]): the
     /// App Server is used only if they and `known` have what every turn needs (M1T07R-15).
     pub requests: BTreeSet<String>,
+    /// Client notification methods of this version (its app-server schema's `ClientNotification.json`); the App
+    /// Server is used only if they have what every turn sends (M1R-04).
+    pub client_notifications: BTreeSet<String>,
     /// What the probe found for this codex (its compat manifest entry); the session row records them, narrowed by
     /// the transport the turn used (REQ-027).
     pub capabilities: crate::capabilities::Probed,
@@ -116,27 +119,37 @@ pub fn exec_resumable(launch: &Launch) -> bool {
             .all(|flag| !offers(&launch.exec_help, flag) || offers(help, flag))
 }
 
-/// The App Server requests and notification every turn uses: the handshake, the thread and the turn, and the turn's
-/// end. An App Server whose schema lacks one cannot run a turn (M1T07R-15).
-pub const APP_SERVER_REQUESTS: &[&str] = &["initialize", "thread/start", "turn/start"];
-pub const APP_SERVER_NOTIFICATIONS: &[&str] = &["turn/completed"];
+/// What the App Server adapter sends on every turn: the handshake (`initialize`, then the `initialized`
+/// notification), the thread, the turn and its interrupt (a cancel); and what it needs to hear back: the turn's end,
+/// its items (the reply, a tool that started, a steer's message). An App Server whose schema lacks one cannot run a
+/// turn (M1T07R-15, M1R-04); the adapter sends nothing else but [`APP_SERVER_GATED`].
+pub const APP_SERVER_REQUESTS: &[&str] =
+    &["initialize", "thread/start", "turn/start", "turn/interrupt"];
+pub const APP_SERVER_CLIENT_NOTIFICATIONS: &[&str] = &["initialized"];
+pub const APP_SERVER_NOTIFICATIONS: &[&str] = &["turn/completed", "item/started", "item/completed"];
+/// Requests the adapter sends only on a turn that uses the capability: (method, capability).
+pub const APP_SERVER_GATED: &[(&str, &str)] = &[
+    ("thread/resume", "resume"),
+    ("turn/steer", "mid_turn_steer"),
+];
 
-/// Why an App Server with these request and notification methods (its schema's) cannot run a turn, or `None`. The
-/// probe and doctor --live apply it before choosing the App Server over exec (M1T07R-15).
+/// Why an App Server with these methods (its schema's `ClientRequest.json`, `ClientNotification.json` and
+/// `ServerNotification.json`) cannot run a turn, or `None`. The probe and doctor --live apply it before choosing the
+/// App Server over exec (M1T07R-15, M1R-04).
 pub fn app_server_interface_missing(
     requests: &BTreeSet<String>,
+    client_notifications: &BTreeSet<String>,
     notifications: &BTreeSet<String>,
 ) -> Option<String> {
-    let missing: Vec<&str> = APP_SERVER_REQUESTS
-        .iter()
-        .filter(|m| !requests.contains(**m))
-        .chain(
-            APP_SERVER_NOTIFICATIONS
-                .iter()
-                .filter(|m| !notifications.contains(**m)),
-        )
-        .copied()
-        .collect();
+    let missing: Vec<&str> = [
+        (APP_SERVER_REQUESTS, requests),
+        (APP_SERVER_CLIENT_NOTIFICATIONS, client_notifications),
+        (APP_SERVER_NOTIFICATIONS, notifications),
+    ]
+    .into_iter()
+    .flat_map(|(needed, listed)| needed.iter().filter(|m| !listed.contains(**m)))
+    .copied()
+    .collect();
     (!missing.is_empty()).then(|| format!("the App Server schema has no {}", missing.join(", ")))
 }
 
@@ -419,11 +432,13 @@ pub async fn run(
     };
     // The App Server only if its schema has what every turn needs (the probe's choice too, M1T07R-15); without one,
     // exec must be possible before anything starts.
-    let unusable = turn
-        .launch
-        .app_server_help
-        .as_ref()
-        .and_then(|_| app_server_interface_missing(&turn.launch.requests, &turn.launch.known));
+    let unusable = turn.launch.app_server_help.as_ref().and_then(|_| {
+        app_server_interface_missing(
+            &turn.launch.requests,
+            &turn.launch.client_notifications,
+            &turn.launch.known,
+        )
+    });
     let app_server_help = turn
         .launch
         .app_server_help

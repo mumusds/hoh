@@ -134,33 +134,66 @@ impl From<io::Error> for ProbeError {
     }
 }
 
-/// Probe one agent: the entry it would get in the compat manifest (suite not run).
-pub fn probe(agent: Agent, env: &ProbeEnv) -> Result<AgentEntry, ProbeError> {
+/// What an installed agent CLI is, before what it can do is probed: its launcher and implementation with their sha256,
+/// and its `--version` line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Identity {
+    pub launcher: PathBuf,
+    pub launcher_sha256: String,
+    pub implementation: PathBuf,
+    pub implementation_sha256: String,
+    pub cli_version: String,
+}
+
+/// Find the agent's CLI and identify it: launcher, implementation, `--version`.
+pub fn identify(agent: Agent, env: &ProbeEnv) -> Result<Identity, ProbeError> {
     let launcher =
         find_on_path(agent.command(), &env.path).ok_or(ProbeError::NotFound { agent })?;
     let implementation = resolve_implementation(agent, &launcher)?;
     let cli_version = version_line(&launcher, env)?;
+    Ok(Identity {
+        launcher_sha256: file_sha256(&launcher)?,
+        implementation_sha256: file_sha256(&implementation)?,
+        launcher,
+        implementation,
+        cli_version,
+    })
+}
+
+/// Probe one agent: the entry it would get in the compat manifest (suite not run).
+pub fn probe(agent: Agent, env: &ProbeEnv) -> Result<AgentEntry, ProbeError> {
+    probe_identified(agent, identify(agent, env)?, env)
+}
+
+/// Probe what an identified agent CLI can do (its help and schema), so a caller that is refused here still knows
+/// what was installed (doctor reports its version and hash, M1QA-08).
+pub fn probe_identified(
+    agent: Agent,
+    identity: Identity,
+    env: &ProbeEnv,
+) -> Result<AgentEntry, ProbeError> {
     let mut capabilities: BTreeMap<String, Option<bool>> = CAPABILITIES
         .iter()
         .map(|c| ((*c).to_owned(), None))
         .collect();
+    let launcher = &identity.launcher;
     let (transport, help, schema_sha256) = match agent {
-        Agent::Codex => probe_codex(&launcher, env, &mut capabilities)?,
-        Agent::Claude => probe_claude(&launcher, env, &mut capabilities)?,
-        Agent::Pi => probe_pi(&launcher, env, &mut capabilities)?,
+        Agent::Codex => probe_codex(launcher, env, &mut capabilities)?,
+        Agent::Claude => probe_claude(launcher, env, &mut capabilities)?,
+        Agent::Pi => probe_pi(launcher, env, &mut capabilities)?,
     };
     Ok(AgentEntry {
-        launcher_sha256: file_sha256(&launcher)?,
-        launcher_path: launcher.display().to_string(),
-        implementation_sha256: file_sha256(&implementation)?,
-        implementation_path: implementation.display().to_string(),
+        launcher_sha256: identity.launcher_sha256,
+        launcher_path: identity.launcher.display().to_string(),
+        implementation_sha256: identity.implementation_sha256,
+        implementation_path: identity.implementation.display().to_string(),
         suite: Suite {
             status: SuiteStatus::NotRun,
-            fixture_set_sha256: fixture_set_sha256(env, agent, &cli_version)?,
+            fixture_set_sha256: fixture_set_sha256(env, agent, &identity.cli_version)?,
             run_at: None,
             cases: None,
         },
-        cli_version,
+        cli_version: identity.cli_version,
         transport,
         help_sha256: hex(&Sha256::digest(&help)),
         schema_sha256,
@@ -174,30 +207,42 @@ fn set(capabilities: &mut BTreeMap<String, Option<bool>>, key: &str, value: bool
     capabilities.insert(key.to_owned(), Some(value));
 }
 
-/// Codex: App Server when `codex app-server --help` works and its schema has what every turn needs (its schema then
-/// decides steer, resume, deltas and token usage), else `exec --json`; refused when neither can run a turn (M1T07R-15).
+/// Codex: its transports are the subcommands `codex --help` lists in its Commands column (M1R-03). App Server when it
+/// lists `app-server` and the schema has everything a turn uses (the schema then decides steer, resume, deltas and
+/// token usage), else `exec --json`; refused when neither can run a turn (M1T07R-15, M1R-04). A listed subcommand
+/// whose help cannot be shown fails the probe.
 fn probe_codex(
     launcher: &Path,
     env: &ProbeEnv,
     caps: &mut BTreeMap<String, Option<bool>>,
 ) -> Result<Probed, ProbeError> {
-    let exec_help = run_ok(launcher, &["exec", "--help"], env)?.stdout;
-    let exec_text = String::from_utf8_lossy(&exec_help).into_owned();
-    let app = run(launcher, &["app-server", "--help"], env)?;
-    let mut help = exec_help.clone();
-    let mut no_app_server = "no app-server".to_owned();
-    if app.status.success() {
+    let top = run_ok(launcher, &["--help"], env)?.stdout;
+    let top_text = String::from_utf8_lossy(&top).into_owned();
+    let listed = |name: &str| crate::adapter::lists_command(&top_text, name);
+    let mut help = top.clone();
+    let exec_text = match listed("exec") {
+        true => {
+            let exec_help = run_ok(launcher, &["exec", "--help"], env)?.stdout;
+            help.extend_from_slice(&exec_help);
+            Some(String::from_utf8_lossy(&exec_help).into_owned())
+        }
+        false => None,
+    };
+    let mut no_app_server = "codex --help lists no app-server".to_owned();
+    if listed("app-server") {
+        let app = run_ok(launcher, &["app-server", "--help"], env)?.stdout;
         let schema = codex_schema(launcher, env)?;
-        match crate::codex::app_server_interface_missing(&schema.requests, &schema.notifications) {
+        match crate::codex::app_server_interface_missing(
+            &schema.requests,
+            &schema.client_notifications,
+            &schema.notifications,
+        ) {
             None => {
-                help.extend_from_slice(&app.stdout);
+                help.extend_from_slice(&app);
                 set(caps, "structured_events", true);
-                set(caps, "resume", schema.requests.contains("thread/resume"));
-                set(
-                    caps,
-                    "mid_turn_steer",
-                    schema.requests.contains("turn/steer"),
-                );
+                for (method, capability) in crate::codex::APP_SERVER_GATED {
+                    set(caps, capability, schema.requests.contains(*method));
+                }
                 set(
                     caps,
                     "partial_messages",
@@ -213,12 +258,17 @@ fn probe_codex(
             Some(why) => no_app_server = why,
         }
     }
-    if let Some(why) = crate::codex::exec_interface_missing(&exec_text) {
+    let why = match &exec_text {
+        None => Some("codex --help lists no exec".to_owned()),
+        Some(text) => crate::codex::exec_interface_missing(text),
+    };
+    if let Some(why) = why {
         return Err(ProbeError::Unsupported {
             agent: Agent::Codex,
             detail: format!("{no_app_server}, and {why}"),
         });
     }
+    let exec_text = exec_text.unwrap_or_default();
     set(caps, "structured_events", true);
     set(
         caps,
@@ -230,10 +280,12 @@ fn probe_codex(
     Ok((Transport::Exec, help, None))
 }
 
-/// What `codex app-server generate-json-schema` produced: its tree hash and the request and notification methods.
+/// What `codex app-server generate-json-schema` produced: its tree hash and the request and notification methods
+/// of both directions.
 struct CodexSchema {
     hash: String,
     requests: std::collections::BTreeSet<String>,
+    client_notifications: std::collections::BTreeSet<String>,
     notifications: std::collections::BTreeSet<String>,
 }
 
@@ -379,9 +431,10 @@ fn schema_methods(value: &serde_json::Value) -> Option<std::collections::BTreeSe
     Some(methods)
 }
 
-/// `codex app-server generate-json-schema --out <dir>`: every `.json` file must parse, and `ClientRequest.json` and
-/// `ServerNotification.json` must be protocol schemas whose method lists the capabilities are read from; anything
-/// else is a failure, not an empty or guessed schema (M1T01R-08, -15, -26, -27).
+/// `codex app-server generate-json-schema --out <dir>`: every `.json` file must parse, and `ClientRequest.json`,
+/// `ClientNotification.json` and `ServerNotification.json` must be protocol schemas whose method lists the interface
+/// and the capabilities are read from; anything else is a failure, not an empty or guessed schema (M1T01R-08, -15,
+/// -26, -27, M1R-04).
 fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<CodexSchema, ProbeError> {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -422,6 +475,7 @@ fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<CodexSchema, ProbeErr
         };
         Ok(CodexSchema {
             requests: methods("ClientRequest.json")?,
+            client_notifications: methods("ClientNotification.json")?,
             notifications: methods("ServerNotification.json")?,
             hash: tree_sha256(&dir)?,
         })

@@ -16,6 +16,11 @@ use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
 use std::time::Duration;
 use tokio::signal::unix::{SignalKind, signal};
 
+/// The methods of an interface list, as a schema would list them.
+fn listed(methods: &[&str]) -> std::collections::BTreeSet<String> {
+    methods.iter().map(|m| (*m).to_owned()).collect()
+}
+
 /// SIGXFSZ on Linux (x86_64 and aarch64).
 const SIGXFSZ: i32 = 25;
 
@@ -52,11 +57,9 @@ async fn a_raw_log_cut_short_during_a_refused_handshake_fails_the_attempt() -> R
             resume: None,
             model: None,
             // What every App Server turn needs, so the App Server is tried and its handshake refused.
-            known: ["turn/completed".to_owned()].into_iter().collect(),
-            requests: ["initialize", "thread/start", "turn/start"]
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
+            known: listed(codex::APP_SERVER_NOTIFICATIONS),
+            requests: listed(codex::APP_SERVER_REQUESTS),
+            client_notifications: listed(codex::APP_SERVER_CLIENT_NOTIFICATIONS),
             capabilities: Default::default(),
         },
         prompt: "hello".to_owned(),

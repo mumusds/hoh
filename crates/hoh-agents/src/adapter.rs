@@ -106,11 +106,17 @@ pub(crate) async fn finish(
 const DECLARATION_INDENT: usize = 8;
 
 /// The option names a line declares, or `None` for a line that declares no option. A declaration, indented at most
-/// [`DECLARATION_INDENT`] spaces, is one or more names (`-x` or `-xy`, `--name`, comma-separated, a name may carry `=<value>` or
-/// `[=value]`) and then only value placeholders (`<value>`, `[value]`, `VALUE`, each maybe ending in `...`), up to two
-/// spaces or a tab before its description, or the end of the line. Anything else is text: a continuation line, a list
-/// item `- x`, a mention like `--output-format=stream-json)` (M1R-03, M1T07R-18).
+/// [`DECLARATION_INDENT`] spaces, is one or more names (`-x` or `-xy`, `--name`, comma-separated, a name may carry a
+/// placeholder as `=<value>`, `=VALUE`, `[=<value>]` or `[=VALUE]`) and then only value placeholders (`<value>`,
+/// `[value]`, `VALUE`, each maybe ending in `...`), up to two spaces or a tab before its description, or the end of
+/// the line. Anything else is text: a continuation line, a list item `- x`, a mention like
+/// `--output-format=stream-json)` or `--mode[=rpc]` (M1R-03, M1T07R-18).
 fn declared(line: &str) -> Option<Vec<&str>> {
+    declaration(line).map(|(names, _)| names)
+}
+
+/// The names a declaration line declares (see [`declared`]) and its description: the rest of the line after them.
+fn declaration(line: &str) -> Option<(Vec<&str>, &str)> {
     let text = line.trim_start_matches(' ');
     if line.len() - text.len() > DECLARATION_INDENT || !text.starts_with('-') {
         return None;
@@ -132,14 +138,19 @@ fn declared(line: &str) -> Option<Vec<&str>> {
             return None;
         }
     }
-    (!names.is_empty()).then_some(names)
+    (!names.is_empty()).then_some((names, &text[end..]))
 }
 
-/// The name of an option word (`-x`, `-xy` starting with a letter, `--name`, `--name=<value>`, `--name[=value]`), or `None`.
+/// The name of an option word (`-x`, `-xy` starting with a letter, `--name`, `--name=<value>`, `--name[=VALUE]`), or
+/// `None`; what follows `=` or `[=` must be a placeholder, not a value (M1R-03).
 fn flag_name(word: &str) -> Option<&str> {
     let cut = word.find(['=', '[']).unwrap_or(word.len());
     let (name, rest) = word.split_at(cut);
-    let rest = rest.strip_prefix('=').unwrap_or(rest);
+    let value = rest.is_empty()
+        || rest
+            .strip_prefix('=')
+            .or_else(|| rest.strip_prefix("[=").and_then(|r| r.strip_suffix(']')))
+            .is_some_and(names_a_value);
     let named = match (name.strip_prefix("--"), name.strip_prefix('-')) {
         (Some(long), _) => {
             long.starts_with(|c: char| c.is_ascii_alphanumeric())
@@ -153,18 +164,22 @@ fn flag_name(word: &str) -> Option<&str> {
         }
         (None, None) => false,
     };
-    (named && name.starts_with('-') && (rest.is_empty() || is_placeholder(rest))).then_some(name)
+    (named && value).then_some(name)
+}
+
+/// A placeholder that names a value: `<value>` or an upper-case `VALUE`.
+fn names_a_value(word: &str) -> bool {
+    (word.len() > 2 && word.starts_with('<') && word.ends_with('>'))
+        || (!word.is_empty()
+            && word
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit()))
 }
 
 /// A value placeholder: `<value>`, `[value]` or an upper-case `VALUE`, maybe ending in `...`.
 fn is_placeholder(word: &str) -> bool {
     let word = word.strip_suffix("...").unwrap_or(word);
-    (word.len() > 2 && word.starts_with('<') && word.ends_with('>'))
-        || (word.len() > 2 && word.starts_with('[') && word.ends_with(']'))
-        || (!word.is_empty()
-            && word
-                .chars()
-                .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit()))
+    names_a_value(word) || (word.len() > 2 && word.starts_with('[') && word.ends_with(']'))
 }
 
 /// Whether `help` (a probed `--help` text) declares the option `flag`. A flag only named in other text is not offered
@@ -175,14 +190,18 @@ pub fn offers(help: &str, flag: &str) -> bool {
         .any(|names| names.contains(&flag))
 }
 
-/// The text of the option `flag`, over every declaration of it: each declaration line and the lines that follow it
-/// up to the next declaration or a blank line; `None` if `help` does not declare it (M1T07R-19).
+/// What `help` says about the option `flag`, over every declaration of it: each declaration's description and the
+/// lines that follow it up to the next declaration or a blank line; `None` if `help` does not declare it. A value
+/// counts only where the help says it, never as the declaration's placeholder (`--mode <rpc>`; M1T07R-19, M1R-03).
 pub fn option_text(help: &str, flag: &str) -> Option<String> {
     let lines: Vec<&str> = help.lines().collect();
-    let mut text = Vec::new();
+    let mut text: Option<Vec<&str>> = None;
     for (i, line) in lines.iter().enumerate() {
-        if declared(line).is_some_and(|names| names.contains(&flag)) {
-            text.push(*line);
+        if let Some((names, description)) = declaration(line)
+            && names.contains(&flag)
+        {
+            let text = text.get_or_insert_with(Vec::new);
+            text.push(description);
             text.extend(
                 lines[i + 1..]
                     .iter()
@@ -190,7 +209,7 @@ pub fn option_text(help: &str, flag: &str) -> Option<String> {
             );
         }
     }
-    (!text.is_empty()).then(|| text.join("\n"))
+    text.map(|text| text.join("\n"))
 }
 
 /// Whether `word` is a whole word of `text`: words are runs of letters, digits, `-` and `_` (`stream-json-v2` is not
@@ -351,6 +370,43 @@ mod help_tests {
             declared("  -nt, --no-tools"),
             Some(vec!["-nt", "--no-tools"])
         );
+    }
+
+    /// A value in the declaration's own syntax is no value: `=…` and `[=…]` hold a placeholder, not a literal, and an
+    /// option's values are what its description says, never its placeholder (M1R-03).
+    #[test]
+    fn a_value_is_read_from_the_description_only() {
+        for mention in [
+            "      --output-format[=stream-json]",
+            "      --mode[=rpc]",
+            "      --json[=no]    not a real flag",
+            "  --mode=rpc  Output mode",
+        ] {
+            assert_eq!(declared(mention), None, "{mention}");
+        }
+        for (line, name) in [
+            ("  --color[=<WHEN>]  Colorize", "--color"),
+            ("  --color[=WHEN]", "--color"),
+            ("  --out=<FILE>  Write it", "--out"),
+            ("  -r, --resume [value]  Resume", "--resume"),
+        ] {
+            assert!(
+                declared(line).is_some_and(|names| names.contains(&name)),
+                "{line}"
+            );
+        }
+        let help = "Options:\n  --mode <rpc>  Output mode: text or json\n  --output-format <stream-json>\n  --level LEVEL  One of: rpc\n";
+        let value = |help: &str, flag: &str, word: &str| {
+            option_text(help, flag).map(|text| has_word(&text, word))
+        };
+        assert_eq!(value(help, "--mode", "rpc"), Some(false));
+        assert_eq!(value(help, "--output-format", "stream-json"), Some(false));
+        assert_eq!(value(help, "--level", "rpc"), Some(true));
+        // The recorded helps still offer the values the adapters need.
+        let claude = include_str!("../../../tests/fixtures/protocol/claude/2.1.318/help.txt");
+        let pi = include_str!("../../../tests/fixtures/protocol/pi/1.5.0/help.txt");
+        assert_eq!(value(claude, "--output-format", "stream-json"), Some(true));
+        assert_eq!(value(pi, "--mode", "rpc"), Some(true));
     }
 
     /// A subcommand is a name in the command column of the `Commands:` section, not a wrapped description and not a

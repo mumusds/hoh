@@ -188,37 +188,53 @@ fn auth(agent: Agent, launcher: &Path, env: &ProbeEnv) -> (Auth, Option<String>)
     }
 }
 
+/// The item of an installed agent whose probe was refused or failed, with what was found before it: the version and
+/// the implementation's hash (REQ-006; M1QA-08).
+fn not_probed(
+    agent: Agent,
+    env: &ProbeEnv,
+    identity: Option<probe::Identity>,
+    e: &ProbeError,
+) -> AgentItem {
+    let (protocol, detail, remedy) = match e {
+        ProbeError::Unsupported { detail, .. } => (
+            Protocol::Incompatible,
+            format!("缺少 HoH 需要的接口：{detail}"),
+            format!("升级 {} 到受支持的版本", agent.command()),
+        ),
+        ProbeError::TimedOut { .. } | ProbeError::NotStarted { .. } => (
+            Protocol::Unknown,
+            unfinished("探测命令", e).unwrap_or_default(),
+            "检查该 CLI 能否正常启动后重试".to_owned(),
+        ),
+        _ => (
+            Protocol::Unknown,
+            format!("探测失败：{e}"),
+            "检查该 CLI 能否正常运行后重试".to_owned(),
+        ),
+    };
+    let mut item = AgentItem::missing(remedy);
+    item.installed = true;
+    item.path = probe::find_on_path(agent.command(), &env.path).map(|p| p.display().to_string());
+    if let Some(identity) = identity {
+        item.version = Some(identity.cli_version);
+        item.binary_sha256 = Some(identity.implementation_sha256);
+    }
+    item.protocol = protocol;
+    item.protocol_detail = Some(detail);
+    item
+}
+
 /// One agent's item, without `--live`.
 pub fn agent(agent: Agent, env: &ProbeEnv, manifest: Option<&CompatManifest>) -> AgentItem {
-    let launcher = probe::find_on_path(agent.command(), &env.path);
-    let entry = match probe::probe(agent, env) {
-        Ok(entry) => entry,
+    let identity = match probe::identify(agent, env) {
+        Ok(identity) => identity,
         Err(ProbeError::NotFound { .. }) => return AgentItem::missing(install(agent).to_owned()),
-        Err(e) => {
-            let (protocol, detail, remedy) = match &e {
-                ProbeError::Unsupported { detail, .. } => (
-                    Protocol::Incompatible,
-                    format!("缺少 HoH 需要的接口：{detail}"),
-                    format!("升级 {} 到受支持的版本", agent.command()),
-                ),
-                ProbeError::TimedOut { .. } | ProbeError::NotStarted { .. } => (
-                    Protocol::Unknown,
-                    unfinished("探测命令", &e).unwrap_or_default(),
-                    "检查该 CLI 能否正常启动后重试".to_owned(),
-                ),
-                _ => (
-                    Protocol::Unknown,
-                    format!("探测失败：{e}"),
-                    "检查该 CLI 能否正常运行后重试".to_owned(),
-                ),
-            };
-            let mut item = AgentItem::missing(remedy);
-            item.installed = true;
-            item.path = launcher.map(|p| p.display().to_string());
-            item.protocol = protocol;
-            item.protocol_detail = Some(detail);
-            return item;
-        }
+        Err(e) => return not_probed(agent, env, None, &e),
+    };
+    let entry = match probe::probe_identified(agent, identity.clone(), env) {
+        Ok(entry) => entry,
+        Err(e) => return not_probed(agent, env, Some(identity), &e),
     };
     let (protocol, protocol_detail) = protocol(&entry, manifest, agent);
     let (auth_check, auth_note) = auth(agent, Path::new(&entry.launcher_path), env);
