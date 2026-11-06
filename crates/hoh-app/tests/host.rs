@@ -2485,3 +2485,142 @@ async fn a_pid_file_that_cannot_be_opened_still_refuses_a_held_project() -> R {
     host.shutdown().await;
     Ok(())
 }
+
+/// TEST-038-05: a running run's scheduler weights cannot change (CR-007: 409 RUN_CONFIG_FROZEN, nothing written);
+/// its snapshot stays (4,3,3,2) and the next round scores with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_038_05_a_running_runs_weights_change_is_409_and_its_snapshot_stays() -> R {
+    let dir = tempfile::tempdir()?;
+    let host = Host::start(config(dir.path())).await?;
+    let world = "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.executescript(sys.stdin.read()); c.commit()";
+    let snapshot = r#"{"scheduler": {"weights": {"user_value": 4, "unblock_value": 3, "risk_reduction": 3, "information_gain": 2}, "max_wait_rounds": 20}}"#;
+    let sql = format!(
+        "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', '{p}', printf('%064d', 1), 1);
+INSERT INTO runs(run_id, project_id, spec_id, state, mode, revision, config_snapshot_json, created_at) VALUES ('R', '{p}', 's1', 'RUNNING', 'AUTO', 4, '{snapshot}', '2026-11-06T00:00:00Z');
+INSERT INTO sessions(session_id, agent, role, agent_version, capabilities_json) VALUES ('sd', 'claude', 'developer', '1', '{{\"structured_events\": true}}');
+INSERT INTO role_bindings(run_id, role, agent, session_id, role_epoch, config_revision, bound_at) VALUES ('R', 'developer', 'claude', 'sd', 1, 1, '2026-11-06T00:00:00Z');
+INSERT INTO tasks(task_id, run_id, spec_id, state, role, writer, created_seq, user_value, unblock_value, risk_reduction, information_gain, cost_estimate) VALUES ('T1', 'R', 's1', 'READY', 'developer', 1, 1, 2, 1, 1, 1, 2);",
+        p = host.project_id
+    );
+    python(&db(dir.path()), world, &sql)?;
+    let read_snapshot = || {
+        scalar(
+            dir.path(),
+            "SELECT config_snapshot_json FROM runs WHERE run_id = 'R'",
+        )
+    };
+    let before = read_snapshot()?;
+    let (commands, events) = (
+        scalar(dir.path(), "SELECT count(*) FROM commands")?,
+        scalar(dir.path(), "SELECT count(*) FROM events")?,
+    );
+    let request = serde_json::to_vec(&json!({
+        "schema_version": "1.0", "command_id": "c1", "idempotency_key": "k1", "expected_revision": 4,
+        "kind": "ConfigureTeam", "run_id": "R",
+        "payload": {"scheduler": {"weights": {"user_value": 1, "unblock_value": 1, "risk_reduction": 1,
+                                              "information_gain": 1}}, "apply_at": "checkpoint"}
+    }))?;
+    let reply = call(
+        &To::Tcp(host.port),
+        "POST",
+        "/v1/commands",
+        &host.token,
+        &request,
+    )
+    .await?;
+    assert_eq!(reply.status, 409, "{reply:?}");
+    let body = reply.json()?;
+    assert_eq!(
+        (
+            &body["code"],
+            &body["retryable"],
+            &body["current_revision"],
+            &body["details"]["key_path"]
+        ),
+        (
+            &json!("RUN_CONFIG_FROZEN"),
+            &json!(false),
+            &json!(null),
+            &json!("scheduler")
+        ),
+        "{body}"
+    );
+    let after = read_snapshot()?;
+    assert_eq!(after, before);
+    let weights: Value = serde_json::from_str(&after)?;
+    assert_eq!(
+        weights["scheduler"]["weights"],
+        json!({"user_value": 4, "unblock_value": 3, "risk_reduction": 3, "information_gain": 2})
+    );
+    assert_eq!(
+        scalar(dir.path(), "SELECT count(*) FROM commands")?,
+        commands
+    );
+    assert_eq!(scalar(dir.path(), "SELECT count(*) FROM events")?, events);
+    // A run that does not exist is 409 RUN_NOT_FOUND; bindings alone are not served yet (M2-T07): 422.
+    let mut missing: Value = serde_json::from_slice(&request)?;
+    missing["run_id"] = json!("nope");
+    let reply = call(
+        &To::Tcp(host.port),
+        "POST",
+        "/v1/commands",
+        &host.token,
+        &serde_json::to_vec(&missing)?,
+    )
+    .await?;
+    assert_eq!(
+        (reply.status, reply.json()?["code"].clone()),
+        (409, json!("RUN_NOT_FOUND"))
+    );
+    let mut bindings: Value = serde_json::from_slice(&request)?;
+    bindings["payload"] = json!({"bindings": {"qa": "pi"}, "apply_at": "checkpoint"});
+    let reply = call(
+        &To::Tcp(host.port),
+        "POST",
+        "/v1/commands",
+        &host.token,
+        &serde_json::to_vec(&bindings)?,
+    )
+    .await?;
+    assert_eq!(reply.status, 422, "{reply:?}");
+    host.shutdown().await;
+    // One round on the same database scores T1 with the snapshot's weights: (4*2 + 3*1 + 3*1 + 2*1) / 2 = 8.
+    let store = hoh_core::persistence::Store::open(&db(dir.path()), config(dir.path()).store)?;
+    let context = hoh_core::decision::Context {
+        required_capabilities: [(
+            "developer".to_owned(),
+            ["structured_events".to_owned()].into(),
+        )]
+        .into(),
+        ..Default::default()
+    };
+    let round = store.schedule_round("R", context).await?;
+    let dispatched = round.dispatched.ok_or("nothing dispatched")?;
+    assert_eq!(dispatched.task_id, "T1");
+    assert!(
+        (dispatched.score.value() - 8.0).abs() <= 1e-9,
+        "{:?}",
+        dispatched.score
+    );
+    let event: Value = serde_json::from_str(&scalar(
+        dir.path(),
+        "SELECT payload_json FROM events WHERE kind = 'schedule.round'",
+    )?)?;
+    assert_eq!(
+        event["weights"],
+        json!({"user_value": 4, "unblock_value": 3, "risk_reduction": 3, "information_gain": 2})
+    );
+    if let Some(evidence) = std::env::var_os("HOH_EVIDENCE_DIR") {
+        std::fs::write(
+            Path::new(&evidence).join("test-038-05.json"),
+            serde_json::to_vec_pretty(&json!({
+                "request": serde_json::from_slice::<Value>(&request)?,
+                "response": {"status": 409, "body": body},
+                "snapshot_before": serde_json::from_str::<Value>(&before)?,
+                "snapshot_after": weights,
+                "round_event": event,
+            }))?,
+        )?;
+    }
+    Ok(())
+}
