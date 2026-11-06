@@ -88,6 +88,9 @@ fn launch(program: &Path, cwd: &Path) -> R<Launch> {
     let requests: Value = serde_json::from_str(&read(format!(
         "{FIXTURES}/app-server-schema/ClientRequest.json"
     ))?)?;
+    let client_notifications: Value = serde_json::from_str(&read(format!(
+        "{FIXTURES}/app-server-schema/ClientNotification.json"
+    ))?)?;
     Ok(Launch {
         program: program.to_path_buf(),
         app_server_help: Some(read(format!("{FIXTURES}/help-app-server.txt"))?),
@@ -99,6 +102,7 @@ fn launch(program: &Path, cwd: &Path) -> R<Launch> {
         model: None,
         known: codex::known_notifications(&schema),
         requests: codex::listed_methods(&requests),
+        client_notifications: codex::listed_methods(&client_notifications),
         capabilities: recorded_capabilities(),
     })
 }
@@ -223,6 +227,29 @@ fn received(fake: &Path) -> R<Vec<Value>> {
         .collect())
 }
 
+/// Every method the adapter sent `fake` is in the App Server interface the probe requires (codex::APP_SERVER_REQUESTS
+/// and APP_SERVER_CLIENT_NOTIFICATIONS) or is gated by one of `capabilities` this turn used (APP_SERVER_GATED), so the
+/// probe never takes an App Server whose schema lacks something the adapter sends (M1R-04).
+fn sent_only_its_interface(fake: &Path, capabilities: &[&str]) -> R {
+    let gated: Vec<&str> = codex::APP_SERVER_GATED
+        .iter()
+        .filter(|(_, capability)| capabilities.contains(capability))
+        .map(|(method, _)| *method)
+        .collect();
+    let sent = received(fake)?;
+    let methods: Vec<&str> = sent.iter().filter_map(|m| m["method"].as_str()).collect();
+    assert!(!methods.is_empty(), "nothing was sent");
+    for method in methods {
+        assert!(
+            codex::APP_SERVER_REQUESTS.contains(&method)
+                || codex::APP_SERVER_CLIENT_NOTIFICATIONS.contains(&method)
+                || gated.contains(&method),
+            "{method} was sent but is not in the App Server interface"
+        );
+    }
+    Ok(())
+}
+
 async fn run(world: &World, attempt: &AttemptRef, turn: &Turn) -> R<Outcome> {
     let (_steer, steers) = mpsc::channel(4);
     Ok(codex::run(&world.store, attempt, turn, &CancelLatch::new(), steers).await?)
@@ -290,6 +317,7 @@ async fn test_024_01_a_recorded_turn_settles_in_handshake_order_with_one_unknown
         methods[..4],
         ["initialize", "initialized", "thread/start", "turn/start"]
     );
+    sent_only_its_interface(&fake, &[])?;
     let trace: Vec<Value> = read(fake.parent().ok_or("no dir")?.join("log/trace.jsonl"))?
         .lines()
         .map(serde_json::from_str)
@@ -381,6 +409,7 @@ async fn test_024_02_interrupt_unauthorized_eof_and_resume() -> R {
         interrupt["params"],
         json!({"threadId": thread, "turnId": turn_id})
     );
+    sent_only_its_interface(&fake, &[])?;
     assert_eq!(a.status.as_deref(), Some("interrupted"));
     assert!(group_members(a.pid.ok_or("no pid")?).is_empty());
     let row = world.store.reader()?.attempt("A1")?.ok_or("no A1")?;
@@ -462,6 +491,7 @@ async fn test_024_02_interrupt_unauthorized_eof_and_resume() -> R {
         .ok_or("no thread/resume")?;
     assert_eq!(resume["params"]["threadId"], json!(thread));
     assert!(!got.iter().any(|m| m["method"] == "thread/start"));
+    sent_only_its_interface(&fake, &["resume"])?;
     assert_eq!(resumed.state, AttemptState::Settled);
     // Every notification of the resumed run (deprecationNotice, thread/goal/cleared, ...) is in the 0.166.0 schema.
     let unknown: Vec<Value> = events(&world, "adapter.unknown_event")?
@@ -1124,6 +1154,7 @@ async fn a_steer_seen_before_its_answer_is_applied() -> R {
     );
     assert_eq!(input_state(&world, "I1")?, InputState::Applied);
     assert_eq!(outcome.state, AttemptState::Settled);
+    sent_only_its_interface(&fake, &["mid_turn_steer"])?;
     Ok(())
 }
 
@@ -1638,11 +1669,13 @@ async fn the_session_has_the_capabilities_the_probe_found() -> R {
 import sys, json, pathlib
 args = sys.argv[1:]
 if args == ['--version']: print('codex-cli 0.166.0'); sys.exit(0)
+if args == ['--help']: print('Usage: codex [OPTIONS] <COMMAND>\n\nCommands:\n  exec        Run Codex non-interactively\n  app-server  Run the app server'); sys.exit(0)
 if args == ['exec', '--help']: print('--json'); sys.exit(0)
 if args == ['app-server', '--help']: print('--listen'); sys.exit(0)
 if args[:2] == ['app-server', 'generate-json-schema']:
     out = pathlib.Path(args[args.index('--out') + 1]); out.mkdir(parents=True, exist_ok=True)
-    for name, methods in [('ClientRequest', ['initialize', 'thread/start', 'turn/start']), ('ServerNotification', ['turn/completed'])]:
+    for name, methods in [('ClientRequest', ['initialize', 'thread/start', 'turn/start', 'turn/interrupt']), ('ClientNotification', ['initialized']),
+                          ('ServerNotification', ['turn/completed', 'item/started', 'item/completed'])]:
         schema = {'oneOf': [{'type': 'object', 'properties': {'method': {'type': 'string', 'enum': [m]}}} for m in methods]}
         (out / (name + '.json')).write_text(json.dumps(schema))
     sys.exit(0)
@@ -1678,7 +1711,10 @@ for line in sys.stdin:
     turn.launch.app_server_help = Some("--listen".to_owned());
     turn.launch.exec_help = "--json".to_owned();
     turn.launch.yolo = false;
-    turn.launch.known = ["turn/completed".to_owned()].into_iter().collect();
+    turn.launch.known = codex::APP_SERVER_NOTIFICATIONS
+        .iter()
+        .map(|m| (*m).to_owned())
+        .collect();
     turn.launch.capabilities = entry.capabilities.clone();
     // What this adapter does not do is no capability whatever a compat suite found (M1T04R-15): it refuses
     // item/tool/call, sends text prompts only, has no browser and answers no dialog.
@@ -1792,33 +1828,57 @@ async fn an_exec_session_resumes_only_if_a_resumed_exec_turn_could_start() -> R 
 
 /// The App Server is used only if its schema has what every turn needs: with no `turn/start` among its requests,
 /// `codex::run` takes exec at once and never starts it, as the probe chooses exec (M1T07R-15).
+/// Where a launch keeps the methods of one schema file.
+type Listed = fn(&mut Launch) -> &mut std::collections::BTreeSet<String>;
+
+/// An App Server whose schema lacks anything a turn uses is never started: the turn runs on exec, with one
+/// adapter.degraded naming what is missing (M1T07R-15, M1R-04).
 #[tokio::test]
-async fn an_app_server_without_turn_start_is_never_started() -> R {
+async fn an_app_server_without_any_method_a_turn_uses_is_never_started() -> R {
     let world = World::new()?;
     let case = Case::load("app-server-turn")?;
-    let fake = world.fake("no-turn-start", Some(&case), "exec", false)?;
-    let mut turn = world.turn(&fake, "logs/A1")?;
-    assert!(turn.launch.requests.remove("turn/start"));
-    let attempt = world.attempt("A1").await?;
-    let outcome = run(&world, &attempt, &turn).await?;
-    assert_eq!(
-        (outcome.state, outcome.mode),
-        (AttemptState::Settled, Mode::Exec)
-    );
-    assert!(
-        argvs(&fake)?
-            .iter()
-            .all(|a| a.first().map(String::as_str) != Some("app-server")),
-        "the App Server was started"
-    );
-    let degraded = events(&world, "adapter.degraded")?;
-    assert!(
-        degraded.len() == 1
-            && degraded[0]["reason"]
-                .as_str()
-                .is_some_and(|r| r.contains("turn/start")),
-        "{degraded:?}"
-    );
+    let lists: [(&[&str], Listed); 3] = [
+        (codex::APP_SERVER_REQUESTS, |l| &mut l.requests),
+        (codex::APP_SERVER_CLIENT_NOTIFICATIONS, |l| {
+            &mut l.client_notifications
+        }),
+        (codex::APP_SERVER_NOTIFICATIONS, |l| &mut l.known),
+    ];
+    let mut n = 0;
+    for (methods, listed) in lists {
+        for method in methods {
+            n += 1;
+            let fake = world.fake(&format!("without-{n}"), Some(&case), "exec", false)?;
+            let mut turn = world.turn(&fake, &format!("logs/A{n}"))?;
+            assert!(listed(&mut turn.launch).remove(*method), "{method}");
+            let attempt = world
+                .attempt_in("codex", &format!("A{n}"), &format!("S{n}"), "0.166.0")
+                .await?;
+            let outcome = run(&world, &attempt, &turn).await?;
+            assert_eq!(
+                (outcome.state, outcome.mode),
+                (AttemptState::Settled, Mode::Exec),
+                "without {method}"
+            );
+            assert!(
+                argvs(&fake)?
+                    .iter()
+                    .all(|a| a.first().map(String::as_str) != Some("app-server")),
+                "without {method}, the App Server was started"
+            );
+            let degraded: Vec<Value> = events(&world, "adapter.degraded")?
+                .into_iter()
+                .filter(|e| e["attempt_id"] == format!("A{n}"))
+                .collect();
+            assert!(
+                degraded.len() == 1
+                    && degraded[0]["reason"]
+                        .as_str()
+                        .is_some_and(|r| r.contains(*method)),
+                "without {method}: {degraded:?}"
+            );
+        }
+    }
     Ok(())
 }
 

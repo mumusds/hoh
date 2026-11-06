@@ -79,10 +79,16 @@ fn prepare(
             deadline: Some(DEADLINE),
         }),
         Agent::Codex => {
-            // app-server when the CLI has one; its schema names the request and notification methods, and codex::run
-            // uses it only if they have what every turn needs, as the probe decides (M1T07R-15).
-            let app_server_help = stdout_of(launcher, &["app-server", "--help"], env).ok();
-            let (known, requests) = match &app_server_help {
+            // The transports `codex --help` lists, read as the probe reads them (M1R-03); app-server's schema names the
+            // methods of both directions, and codex::run uses it only if they have everything a turn uses, as the probe
+            // decides (M1T07R-15, M1R-04).
+            let top = stdout_of(launcher, &["--help"], env)?;
+            let listed = |name: &str| hoh_agents::adapter::lists_command(&top, name);
+            let app_server_help = match listed("app-server") {
+                true => Some(stdout_of(launcher, &["app-server", "--help"], env)?),
+                false => None,
+            };
+            let (known, requests, client_notifications) = match &app_server_help {
                 None => Default::default(),
                 Some(_) => {
                     let schema = work.join("..").join("codex-schema");
@@ -105,21 +111,31 @@ fn prepare(
                     (
                         methods("ServerNotification.json")?,
                         methods("ClientRequest.json")?,
+                        methods("ClientNotification.json")?,
                     )
                 }
+            };
+            // Without an exec subcommand the exec fallback has no help, so it cannot start (codex::exec_args).
+            let (exec_help, exec_resume_help) = match listed("exec") {
+                true => (
+                    stdout_of(launcher, &["exec", "--help"], env)?,
+                    stdout_of(launcher, &["exec", "resume", "--help"], env).ok(),
+                ),
+                false => (String::new(), None),
             };
             Prepared::Codex(codex::Turn {
                 launch: codex::Launch {
                     program: launcher.to_path_buf(),
                     app_server_help,
-                    exec_help: stdout_of(launcher, &["exec", "--help"], env)?,
-                    exec_resume_help: stdout_of(launcher, &["exec", "resume", "--help"], env).ok(),
+                    exec_help,
+                    exec_resume_help,
                     cwd: work.to_path_buf(),
                     yolo: false,
                     resume: None,
                     model: None,
                     known,
                     requests,
+                    client_notifications,
                     capabilities: capabilities.clone(),
                 },
                 prompt: PROMPT.to_owned(),

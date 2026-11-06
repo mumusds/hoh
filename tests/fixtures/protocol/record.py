@@ -994,6 +994,7 @@ def codex(rec: Recording) -> None:
                           timeout=120, descendant_grace=1)
     if rc != 0:
         raise RuntimeError(f'codex app-server generate-json-schema exited {rc}: {err.decode("utf-8", "replace")[-500:]}')
+    help_file(rec, 'help.txt', ['codex', '--help'])  # its Commands column lists the transports' subcommands (M1R-03)
     help_file(rec, 'help-exec.txt', ['codex', 'exec', '--help'])
     help_file(rec, 'help-app-server.txt', ['codex', 'app-server', '--help'])
     out, err, rc, _ = run(['codex', 'login', 'status'], b'', rec.dir, timeout=60, descendant_grace=1)

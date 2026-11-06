@@ -114,6 +114,16 @@ impl Sandbox {
 
     fn codex(&self, status: Status) -> R {
         let f = fixtures().join("codex/0.166.0");
+        self.codex_with(
+            status,
+            &f.join("app-server-schema"),
+            &f.join("help-exec.txt"),
+        )
+    }
+
+    /// The recorded codex with the App Server schema in `schema` and `exec --help` from `exec_help`.
+    fn codex_with(&self, status: Status, schema: &Path, exec_help: &Path) -> R {
+        let f = fixtures().join("codex/0.166.0");
         let answer = self.status(
             status,
             "echo 'Logged in using ChatGPT' >&2\nexit 0\n",
@@ -122,10 +132,13 @@ impl Sandbox {
         self.write(
             "codex",
             &format!(
-                "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n exec) [ \"$2\" = --help ] && cat '{f}/help-exec.txt';;\n \
-                 app-server) case \"$2\" in\n  --help) cat '{f}/help-app-server.txt';;\n  generate-json-schema) [ \"$3\" = --out ] && mkdir -p \"$4\" && cp -R '{f}/app-server-schema/.' \"$4/\";;\n  \
+                "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n --help) cat '{f}/help.txt';;\n \
+                 exec) [ \"$2\" = --help ] && cat '{exec}';;\n \
+                 app-server) case \"$2\" in\n  --help) cat '{f}/help-app-server.txt';;\n  generate-json-schema) [ \"$3\" = --out ] && mkdir -p \"$4\" && cp -R '{schema}/.' \"$4/\";;\n  \
                  *) exit 2;;\n esac;;\n login) if [ \"$2\" = status ]; then\n{answer}fi;;\n *) exit 2;;\nesac\n",
-                f = f.display()
+                f = f.display(),
+                exec = exec_help.display(),
+                schema = schema.display()
             ),
         )
     }
@@ -134,7 +147,9 @@ impl Sandbox {
     fn old_codex(&self) -> R {
         self.write(
             "codex",
-            "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.1.0';;\n exec) [ \"$2\" = --help ] && echo 'Usage: codex exec [PROMPT]';;\n \
+            "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.1.0';;\n \
+             --help) printf 'Usage: codex [OPTIONS] <COMMAND>\\n\\nCommands:\\n  exec  Run Codex non-interactively\\n';;\n \
+             exec) [ \"$2\" = --help ] && echo 'Usage: codex exec [PROMPT]';;\n \
              *) echo \"error: unrecognized subcommand '$1'\" >&2; exit 2;;\nesac\n",
         )
     }
@@ -320,6 +335,7 @@ fn a_cli_without_what_its_adapter_needs_is_incompatible() -> R {
         let (out, report, _) = s.doctor()?;
         let item = &report["agents"][agent];
         assert_eq!(item["protocol"], "incompatible", "{agent} {flag}: {item}");
+        identified(&s, agent, item)?;
         assert!(
             item["protocol_detail"]
                 .as_str()
@@ -327,6 +343,88 @@ fn a_cli_without_what_its_adapter_needs_is_incompatible() -> R {
             "{agent} {flag}: {item}"
         );
         assert_eq!(out.status.code(), Some(3), "{agent} {flag}");
+    }
+    Ok(())
+}
+
+/// An incompatible item still names what doctor found: the `--version` line and the implementation's sha256 (REQ-006,
+/// ADR-015 decision 8; M1QA-08). The fakes are their own implementations.
+fn identified(s: &Sandbox, agent: &str, item: &Value) -> R {
+    let version = Command::new(s.bin.path().join(agent))
+        .arg("--version")
+        .output()?
+        .stdout;
+    let version = String::from_utf8(version)?;
+    assert_eq!(item["version"], version.trim_end(), "{agent}: {item}");
+    let sum = Command::new("sha256sum")
+        .arg(s.bin.path().join(agent))
+        .output()?
+        .stdout;
+    let sum = String::from_utf8(sum)?;
+    assert_eq!(
+        item["binary_sha256"].as_str(),
+        sum.split_whitespace().next(),
+        "{agent}: {item}"
+    );
+    Ok(())
+}
+
+/// A codex HoH cannot drive is incompatible and blocks (exit 3), as REQ-006 says of one with neither app-server nor
+/// `exec --json` (M1R-03, M1R-04): one whose `codex --help` lists neither subcommand, and one whose App Server schema
+/// has no `initialized` notification while its exec has no `--json`. The item names the version and hash doctor
+/// found (M1QA-08).
+#[test]
+fn a_codex_without_what_its_adapter_needs_is_incompatible() -> R {
+    let f = fixtures().join("codex/0.166.0");
+    for (row, missing) in [
+        ("only-login", ["exec", "app-server"]),
+        ("no-initialized", ["initialized", "--json"]),
+    ] {
+        let s = Sandbox::new()?;
+        s.claude(Status::LoggedIn)?;
+        s.pi(Status::LoggedIn)?;
+        if row == "only-login" {
+            s.write(
+                "codex",
+                &format!(
+                    "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n \
+                     --help) grep -v -e '^  exec ' -e '^  app-server ' '{f}/help.txt';;\n \
+                     login) echo 'Logged in using ChatGPT' >&2;;\n *) echo \"error: unrecognized subcommand '$1'\" >&2; exit 2;;\nesac\n",
+                    f = f.display()
+                ),
+            )?;
+        } else {
+            let schema = s.home.path().join("schema");
+            std::fs::create_dir(&schema)?;
+            assert!(
+                Command::new("cp")
+                    .arg("-R")
+                    .arg(f.join("app-server-schema/."))
+                    .arg(&schema)
+                    .status()?
+                    .success()
+            );
+            let file = schema.join("ClientNotification.json");
+            let text = std::fs::read_to_string(&file)?;
+            assert!(text.contains("\"initialized\""));
+            std::fs::write(
+                &file,
+                text.replace("\"initialized\"", "\"initialized-gone\""),
+            )?;
+            let exec_help = s.home.path().join("exec-help.txt");
+            std::fs::write(
+                &exec_help,
+                std::fs::read_to_string(f.join("help-exec.txt"))?.replace("--json", "--json-lines"),
+            )?;
+            s.codex_with(Status::LoggedIn, &schema, &exec_help)?;
+        }
+        let (out, report, _) = s.doctor()?;
+        let item = &report["agents"]["codex"];
+        assert_eq!(item["protocol"], "incompatible", "{row}: {item}");
+        let detail = item["protocol_detail"].as_str().unwrap_or_default();
+        assert!(missing.iter().all(|m| detail.contains(m)), "{row}: {item}");
+        assert_eq!(out.status.code(), Some(3), "{row}");
+        identified(&s, "codex", item)?;
     }
     Ok(())
 }
@@ -685,7 +783,7 @@ fn live_drives_an_exec_only_codex_through_exec() -> R {
     s.write(
         "codex",
         &format!(
-            "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n \
+            "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n --help) grep -v '^  app-server ' '{f}/help.txt';;\n \
              exec) if [ \"$2\" = --help ]; then cat '{f}/help-exec.txt'; elif [ \"$2\" = resume ]; then printf 'Usage: codex exec resume\\n      --json\\n      --dangerously-bypass-approvals-and-sandbox\\n  -m, --model <MODEL>\\n'; \
              else cat > /dev/null; cat '{f}/exec/stdout.jsonl'; fi;;\n \
              login) echo 'Logged in using ChatGPT' >&2;;\n *) echo \"error: unrecognized subcommand '$1'\" >&2; exit 2;;\nesac\n",
@@ -737,55 +835,61 @@ fn live_drives_an_exec_only_codex_through_exec() -> R {
     Ok(())
 }
 
-/// An App Server whose schema lacks what every turn needs (`turn/start`) is not used: the probe takes exec, and so does
-/// the live turn (M1T07R-15).
+/// An App Server whose schema lacks something a turn uses (`turn/start`, the `initialized` notification) is not
+/// used: the probe takes exec, and so does the live turn (M1T07R-15, M1R-04).
 #[test]
-fn live_drives_codex_through_exec_when_its_app_server_lacks_turn_start() -> R {
-    let s = Sandbox::new()?;
-    let f = fixtures().join("codex/0.166.0");
-    let schema = s.home.path().join("schema");
-    std::fs::create_dir(&schema)?;
-    assert!(
-        std::process::Command::new("cp")
-            .arg("-R")
-            .arg(f.join("app-server-schema/."))
-            .arg(&schema)
-            .status()?
-            .success()
-    );
-    let mut requests: Value =
-        serde_json::from_slice(&std::fs::read(schema.join("ClientRequest.json"))?)?;
-    requests["oneOf"]
-        .as_array_mut()
-        .ok_or("no oneOf")?
-        .retain(|v| v["properties"]["method"]["enum"] != serde_json::json!(["turn/start"]));
-    std::fs::write(
-        schema.join("ClientRequest.json"),
-        serde_json::to_vec(&requests)?,
-    )?;
-    s.write(
-        "codex",
-        &format!(
-            "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n \
-             exec) if [ \"$2\" = --help ]; then cat '{f}/help-exec.txt'; elif [ \"$2\" = resume ]; then printf 'Usage: codex exec resume\\n      --json\\n'; \
-             else cat > /dev/null; cat '{f}/exec/stdout.jsonl'; fi;;\n \
-             app-server) case \"$2\" in\n  --help) cat '{f}/help-app-server.txt';;\n  generate-json-schema) [ \"$3\" = --out ] && mkdir -p \"$4\" && cp -R '{s}/.' \"$4/\";;\n  \
-             *) exit 9;;\n esac;;\n \
-             login) echo 'Logged in using ChatGPT' >&2;;\n *) echo \"error: unrecognized subcommand '$1'\" >&2; exit 2;;\nesac\n",
-            f = f.display(),
-            s = schema.display()
-        ),
-    )?;
-    let (out, _) = s.doctor_in(&[], &["--live", "--output", "json"], &[])?;
-    let report: Value = serde_json::from_slice(&out.stdout)?;
-    let live = &report["agents"]["codex"]["live"];
-    assert_eq!(live["state"], "SETTLED", "{live}");
-    let logs = Path::new(live["logs"].as_str().ok_or("no logs")?);
-    assert!(
-        !logs.join("app-server.stdout.jsonl").exists(),
-        "the App Server was started: {}",
-        logs.display()
-    );
+fn live_drives_codex_through_exec_when_its_app_server_lacks_what_a_turn_uses() -> R {
+    for (file, method) in [
+        ("ClientRequest.json", "turn/start"),
+        ("ClientNotification.json", "initialized"),
+    ] {
+        let s = Sandbox::new()?;
+        let f = fixtures().join("codex/0.166.0");
+        let schema = s.home.path().join("schema");
+        std::fs::create_dir(&schema)?;
+        assert!(
+            std::process::Command::new("cp")
+                .arg("-R")
+                .arg(f.join("app-server-schema/."))
+                .arg(&schema)
+                .status()?
+                .success()
+        );
+        let text = std::fs::read_to_string(schema.join(file))?;
+        let quoted = format!("\"{method}\"");
+        assert_eq!(
+            text.matches(&quoted).count(),
+            1,
+            "{file} lists {method} once"
+        );
+        std::fs::write(
+            schema.join(file),
+            text.replace(&quoted, &format!("\"{method}-gone\"")),
+        )?;
+        s.write(
+            "codex",
+            &format!(
+                "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n --help) cat '{f}/help.txt';;\n \
+                 exec) if [ \"$2\" = --help ]; then cat '{f}/help-exec.txt'; elif [ \"$2\" = resume ]; then printf 'Usage: codex exec resume\\n      --json\\n'; \
+                 else cat > /dev/null; cat '{f}/exec/stdout.jsonl'; fi;;\n \
+                 app-server) case \"$2\" in\n  --help) cat '{f}/help-app-server.txt';;\n  generate-json-schema) [ \"$3\" = --out ] && mkdir -p \"$4\" && cp -R '{s}/.' \"$4/\";;\n  \
+                 *) exit 9;;\n esac;;\n \
+                 login) echo 'Logged in using ChatGPT' >&2;;\n *) echo \"error: unrecognized subcommand '$1'\" >&2; exit 2;;\nesac\n",
+                f = f.display(),
+                s = schema.display()
+            ),
+        )?;
+        let (out, _) = s.doctor_in(&[], &["--live", "--output", "json"], &[])?;
+        let report: Value = serde_json::from_slice(&out.stdout)?;
+        let live = &report["agents"]["codex"]["live"];
+        assert_eq!(live["state"], "SETTLED", "without {method}: {live}");
+        let logs = Path::new(live["logs"].as_str().ok_or("no logs")?);
+        assert!(
+            !logs.join("app-server.stdout.jsonl").exists(),
+            "without {method}, the App Server was started: {}",
+            logs.display()
+        );
+    }
     Ok(())
 }
 

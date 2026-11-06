@@ -23,6 +23,7 @@ fn launch() -> Launch {
         model: None,
         known: BTreeSet::new(),
         requests: BTreeSet::new(),
+        client_notifications: BTreeSet::new(),
         capabilities: crate::capabilities::Probed::new(),
     }
 }
