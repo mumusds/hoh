@@ -1,9 +1,10 @@
 //! The Engine host of one project (REQ-022, REQ-036, REQ-041, REQ-062; docs/adr/ADR-016.md).
 //!
 //! Start, in order: the database location is checked read-only; the project lock (a `flock` on the `.hoh` directory,
-//! the holder's pid in `.hoh/host.lock`) is taken and handed to the writer; the store is opened (the location checked
-//! again, the WAL self-test, settings, migrations); the host epoch moves on after an integrity check; the readers are
-//! checked; only then are the loopback port and the Unix socket `.hoh/host.sock` bound and `.hoh/host.json` written.
+//! the holder's pid in `.hoh/host.lock`) is taken; the store is opened (the location checked again, the WAL self-test,
+//! settings, migrations) and the lock handed to its writer; the host epoch moves on after an integrity check; the
+//! readers are checked; only then are the loopback port and the Unix socket `.hoh/host.sock` bound and
+//! `.hoh/host.json` written.
 //! Any failure before that ends the start with nothing served, and no database file is made when the location or the
 //! WAL self-test refuses.
 
