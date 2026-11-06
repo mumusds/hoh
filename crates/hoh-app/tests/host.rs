@@ -23,6 +23,8 @@ type R<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 const CHILD_PROJECT: &str = "HOH_TEST_HOST_PROJECT";
 const CHILD_MOUNTINFO: &str = "HOH_TEST_HOST_MOUNTINFO";
 const CHILD_WAL_FAIL: &str = "HOH_TEST_HOST_WAL_FAIL";
+/// The child's open-file limit, to run it out of descriptors.
+const CHILD_NOFILE: &str = "HOH_TEST_HOST_NOFILE";
 
 /// The product binary's WAL self-test probe.
 fn probe() -> ProbeCommand {
@@ -121,11 +123,20 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     request: Vec<u8>,
 ) -> R<Vec<u8>> {
-    stream.write_all(&request).await?;
+    // A server may answer and close before the whole request is written (an oversized body): what it sent is still
+    // read (M2T12R-99).
+    let _ = stream.write_all(&request).await;
     let mut raw = Vec::new();
-    // A reset after the request counts as an empty response.
-    let _ = stream.read_to_end(&mut raw).await;
-    Ok(raw)
+    // A reset after the request counts as an empty response; a stream that does not end fails the test, not hangs it
+    // (M2T12R-96).
+    match tokio::time::timeout(Duration::from_secs(30), stream.read_to_end(&mut raw)).await {
+        Ok(_) => Ok(raw),
+        Err(_) => Err(format!(
+            "no end of response after 30 s: {}",
+            String::from_utf8_lossy(&raw)
+        )
+        .into()),
+    }
 }
 
 fn request_bytes(
@@ -486,6 +497,20 @@ fn host_child() {
         .enable_all()
         .build()
         .expect("a runtime");
+    if let Some(limit) =
+        std::env::var_os(CHILD_NOFILE).and_then(|l| l.to_str()?.parse::<u64>().ok())
+    {
+        use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+        let old = getrlimit(Resource::Nofile);
+        setrlimit(
+            Resource::Nofile,
+            Rlimit {
+                current: Some(limit),
+                maximum: old.maximum,
+            },
+        )
+        .expect("the limit");
+    }
     let code = runtime.block_on(hoh_app::host::run(config));
     std::process::exit(i32::from(code));
 }
@@ -1374,12 +1399,11 @@ async fn events_follow_the_openapi_contract() -> R {
     Ok(())
 }
 
-/// A host stops with event streams open and a connection that never sent a whole request: the streams end, the
-/// connections get the grace, host.json and the socket go, and the lock is free again (M2T12R-01).
+/// A host stops with event streams open: they end with the stop itself, well before the grace; host.json and the
+/// socket go, and the lock is free again (M2T12R-01).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_host_stops_with_subscribers_and_half_requests() -> R {
+async fn a_host_stops_with_subscribers() -> R {
     let dir = tempfile::tempdir()?;
-    // Event streams end with the stop itself, well before the grace (M2T12R-01).
     let host = Host::start(config(dir.path())).await?;
     let tcp = Subscriber::connect(To::Tcp(host.port), &host.token, "/v1/events").await?;
     let unix =
@@ -1395,38 +1419,82 @@ async fn a_host_stops_with_subscribers_and_half_requests() -> R {
     assert!(!socket.exists());
     assert!(!dir.path().join(".hoh/host.json").exists());
     drop((tcp, unix));
-    // A request whose body never arrives whole: its connection closes with the stop (a handler that outlasts the
-    // grace is ended, see a_stopping_host_finishes_its_writes_before_the_lock_goes); the lock is free again.
-    let host = Host::start(config(dir.path())).await?;
-    assert_eq!(host.host_epoch, 2);
-    seed_runs(&host, dir.path(), &["r1".to_owned()])?;
-    let body = pause("c-half", "k-half", "r1", 0, "half");
-    let mut half = tokio::net::TcpStream::connect(("127.0.0.1", host.port)).await?;
-    let head = format!(
-        "POST /v1/commands HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nX-HoH-Token: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
-        host.port,
-        host.token,
-        body.len()
-    );
-    half.write_all(head.as_bytes()).await?;
-    half.write_all(b"\r\n").await?;
-    half.write_all(&body[..body.len() / 2]).await?;
-    let started = Instant::now();
-    tokio::time::timeout(Duration::from_secs(15), host.shutdown()).await?;
-    assert!(
-        started.elapsed() < Duration::from_secs(10),
-        "stopped after {:?}",
-        started.elapsed()
-    );
-    assert!(!dir.path().join(".hoh/host.json").exists());
-    // The stopped host's connection is gone: finishing the request gets nothing, and nothing is written (M2T12R-60).
-    let _ = half.write_all(&body[body.len() / 2..]).await;
-    let mut answer = Vec::new();
-    let _ = tokio::time::timeout(Duration::from_secs(5), half.read_to_end(&mut answer)).await?;
-    assert!(answer.is_empty(), "{}", String::from_utf8_lossy(&answer));
-    assert_eq!(scalar(dir.path(), "SELECT count(*) FROM commands")?, "0");
     let next = Host::start(config(dir.path())).await?;
+    assert_eq!(next.host_epoch, 2);
     next.shutdown().await;
+    Ok(())
+}
+
+/// One response read from a kept-alive connection (by its Content-Length).
+async fn read_one(stream: &mut tokio::net::TcpStream) -> R<Option<Reply>> {
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        if let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&raw[..end]).to_ascii_lowercase();
+            let length: usize = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            if raw.len() >= end + 4 + length {
+                return parse(&raw[..end + 4 + length]);
+            }
+        }
+        let n = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buf)).await??;
+        if n == 0 {
+            return parse(&raw);
+        }
+        raw.extend_from_slice(&buf[..n]);
+    }
+}
+
+/// After the stop nothing more is taken: a new connection is refused, and a kept-alive one is closed or answered
+/// 503 GONE (retryable); either way nothing is written (ADR-016 decision 12, M2T12R-90, -94).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn requests_after_the_stop_get_nothing() -> R {
+    let dir = tempfile::tempdir()?;
+    let host = Host::start(config(dir.path())).await?;
+    seed_runs(&host, dir.path(), &["r1".to_owned()])?;
+    let (port, token) = (host.port, host.token.clone());
+    let mut kept = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
+    kept.write_all(format!("GET /healthz HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n").as_bytes())
+        .await?;
+    assert_eq!(
+        read_one(&mut kept).await?.ok_or("no health answer")?.status,
+        200
+    );
+    let stopping = tokio::spawn(host.shutdown());
+    // The stop has happened once the port takes no new connection.
+    let end = Instant::now() + Duration::from_secs(10);
+    while tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .is_ok()
+    {
+        assert!(Instant::now() < end, "the port still takes connections");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let body = pause("c-late", "k-late", "r1", 0, "late");
+    let request = request_bytes(
+        &To::Tcp(port),
+        "POST",
+        "/v1/commands",
+        Some(&token),
+        &[],
+        &body,
+    );
+    let _ = kept.write_all(&request).await;
+    if let Some(reply) = read_one(&mut kept).await.ok().flatten() {
+        assert_eq!(reply.status, 503, "{reply:?}");
+        let error = reply.json()?;
+        assert_eq!(
+            (&error["code"], &error["retryable"]),
+            (&json!("GONE"), &json!(true)),
+            "{error}"
+        );
+    }
+    tokio::time::timeout(Duration::from_secs(15), stopping).await??;
+    assert_eq!(scalar(dir.path(), "SELECT count(*) FROM commands")?, "0");
     Ok(())
 }
 
@@ -1724,22 +1792,31 @@ async fn malformed_requests_get_error_bodies() -> R {
     Ok(())
 }
 
-/// A commit slower than the grace: its connection is ended, but the host lets the project go only after the writer
-/// finished it, so no write of a stopped host can follow the next host's start (ADR-016 decision 12, M2T12R-60).
+/// A commit held past the grace: its connection is ended without a response, but the project stays locked until the
+/// writer has finished it, so no write of a stopped host can follow the next host's start (ADR-016 decision 12,
+/// M2T12R-60, -91, -97).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stopping_host_finishes_its_writes_before_the_lock_goes() -> R {
+    use std::sync::mpsc;
     #[derive(Debug)]
-    struct SlowCommit;
-    impl FaultHooks for SlowCommit {
+    struct Latched(Mutex<(mpsc::Sender<()>, mpsc::Receiver<()>)>);
+    impl FaultHooks for Latched {
         fn before_commit(&self) -> Result<(), PersistError> {
-            std::thread::sleep(Duration::from_secs(6));
+            let latch = self
+                .0
+                .lock()
+                .map_err(|_| PersistError::Storage("latch".to_owned()))?;
+            let _ = latch.0.send(());
+            let _ = latch.1.recv();
             Ok(())
         }
     }
+    let (entered_tx, entered) = mpsc::channel();
+    let (release, release_rx) = mpsc::channel();
     let dir = tempfile::tempdir()?;
-    let mut slow = config(dir.path());
-    slow.store.faults = Arc::new(SlowCommit);
-    let host = Host::start(slow).await?;
+    let mut held = config(dir.path());
+    held.store.faults = Arc::new(Latched(Mutex::new((entered_tx, release_rx))));
+    let host = Host::start(held).await?;
     seed_runs(&host, dir.path(), &["r1".to_owned()])?;
     let to = To::Tcp(host.port);
     let token = host.token.clone();
@@ -1754,18 +1831,53 @@ async fn a_stopping_host_finishes_its_writes_before_the_lock_goes() -> R {
         )
         .await
     });
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    host.shutdown().await;
-    assert_eq!(
-        scalar(dir.path(), "SELECT count(*) FROM commands")?,
-        "1",
-        "the lock went before the write was done"
-    );
-    // The commit outlasted the grace, so its connection was ended without a response; a retry replays it.
-    let answer = command.await??;
+    tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(10))).await??;
+    let stopping = tokio::spawn(host.shutdown());
+    // Past the grace: the connection is ended, the commit still waits, and the project is still locked.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let answer = tokio::time::timeout(Duration::from_secs(5), command).await???;
     assert!(answer.is_none(), "{answer:?}");
+    assert!(
+        !stopping.is_finished(),
+        "shutdown returned with a write pending"
+    );
+    let refused = Host::start(config(dir.path()))
+        .await
+        .err()
+        .ok_or("a second host started while the first wrote")?;
+    assert_eq!(refused.exit_code, 69, "{refused}");
+    assert_eq!(scalar(dir.path(), "SELECT count(*) FROM commands")?, "0");
+    release.send(())?;
+    tokio::time::timeout(Duration::from_secs(10), stopping).await??;
+    assert_eq!(scalar(dir.path(), "SELECT count(*) FROM commands")?, "1");
     let next = Host::start(config(dir.path())).await?;
     assert_eq!(next.host_epoch, 2);
+    next.shutdown().await;
+    Ok(())
+}
+
+/// A Host dropped without `shutdown` stops the same way: the project is locked until its writer has ended, and only
+/// then can another host start (ADR-016 decision 12, M2T12R-93).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dropped_host_keeps_the_project_until_its_writer_ends() -> R {
+    let dir = tempfile::tempdir()?;
+    let host = Host::start(config(dir.path())).await?;
+    let subscriber =
+        Subscriber::connect(To::Unix(host.socket.clone()), &host.token, "/v1/events").await?;
+    drop(host);
+    let end = Instant::now() + Duration::from_secs(15);
+    let next = loop {
+        match Host::start(config(dir.path())).await {
+            Ok(next) => break next,
+            Err(e) if e.exit_code == 69 && Instant::now() < end => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    };
+    assert_eq!(next.host_epoch, 2);
+    // The dropped host's stream ended with it.
+    assert!(until(Duration::from_secs(5), || subscriber.task.is_finished()).await);
     next.shutdown().await;
     Ok(())
 }
@@ -1833,5 +1945,99 @@ async fn the_socket_and_cursor_edges_are_refused() -> R {
     assert_eq!(reply.status, 409, "{reply:?}");
     assert_eq!(reply.json()?["code"], "CONFLICT");
     host.shutdown().await;
+    Ok(())
+}
+
+/// CPU time (user + system, clock ticks) of process `pid`.
+fn cpu_ticks(pid: u32) -> R<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let after = &stat[stat.rfind(')').ok_or("no comm")? + 2..];
+    let fields: Vec<&str> = after.split(' ').collect();
+    Ok(fields[11].parse::<u64>()? + fields[12].parse::<u64>()?)
+}
+
+/// A host out of file descriptors does not spin on its listener: an accept error other than a per-connection one
+/// waits 1 s (M2T12R-92).
+#[test]
+fn a_host_out_of_descriptors_does_not_spin() -> R {
+    let dir = tempfile::tempdir()?;
+    let mut child = Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "host_child",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env(CHILD_PROJECT, dir.path())
+        .env(CHILD_NOFILE, "80")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    let host_json = dir.path().join(".hoh/host.json");
+    let end = Instant::now() + Duration::from_secs(30);
+    while !host_json.exists() && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let outcome = (|| -> R {
+        let info: Value = serde_json::from_str(&std::fs::read_to_string(&host_json)?)?;
+        let port = u16::try_from(info["port"].as_u64().ok_or("no port")?)?;
+        // More connections than the child has descriptors for.
+        let mut held = Vec::new();
+        for _ in 0..150 {
+            if let Ok(stream) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+                held.push(stream);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        let before = cpu_ticks(child.id())?;
+        std::thread::sleep(Duration::from_secs(2));
+        let used = cpu_ticks(child.id())? - before;
+        // Spinning burns about 200 ticks (a whole core) in 2 s; waiting a few.
+        assert!(used < 40, "the host used {used} ticks in 2 s");
+        drop(held);
+        Ok(())
+    })();
+    let pid = rustix::process::Pid::from_raw(i32::try_from(child.id())?).ok_or("no pid")?;
+    let _ = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
+    let end = Instant::now() + Duration::from_secs(15);
+    while child.try_wait()?.is_none() && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if child.try_wait()?.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    outcome
+}
+
+/// A stream still replaying ends with the stop, even when its client reads nothing (M2T12R-98).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replaying_stream_ends_with_the_stop() -> R {
+    let dir = tempfile::tempdir()?;
+    let host = Host::start(config(dir.path())).await?;
+    let script = "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); p=sys.stdin.read().strip(); \
+                  c.executemany(\"INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES (?, ?, NULL, 'test.fill', '{}', '2026-11-06T00:00:00Z')\", \
+                  [(p, 'fill-%d' % i) for i in range(60000)]); c.commit(); c.close()";
+    python(&db(dir.path()), script, &host.project_id)?;
+    let mut idle = tokio::net::TcpStream::connect(("127.0.0.1", host.port)).await?;
+    idle.write_all(
+        format!(
+            "GET /v1/events HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nX-HoH-Token: {}\r\n\r\n",
+            host.port, host.token
+        )
+        .as_bytes(),
+    )
+    .await?;
+    // Let the replay fill the socket buffers.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let started = Instant::now();
+    tokio::time::timeout(Duration::from_secs(15), host.shutdown()).await?;
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "stopped after {:?}",
+        started.elapsed()
+    );
+    drop(idle);
     Ok(())
 }

@@ -1398,37 +1398,68 @@ fn a_full_disk_is_db_full_and_retryable() {
     assert_eq!(full.error_code(), Some(crate::protocol::ErrorCode::DbFull));
 }
 
-/// The barrier answers only after the writes queued before it: a slow commit queued first is done when it returns.
+/// What a store keeps is dropped only after the writer ended, so after every queued write: a commit held in its hook
+/// keeps it while it waits, and the writer ends only once it is done (ADR-016 decision 12).
 #[tokio::test]
-async fn the_barrier_waits_for_the_writes_queued_before_it() -> R {
+async fn what_the_writer_keeps_goes_after_the_last_write() -> R {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
     #[derive(Debug)]
-    struct SlowCommit;
-    impl FaultHooks for SlowCommit {
+    struct Held(Arc<AtomicBool>);
+    impl Drop for Held {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    #[derive(Debug)]
+    struct Latched(std::sync::Mutex<(mpsc::Sender<()>, mpsc::Receiver<()>)>);
+    impl FaultHooks for Latched {
         fn before_commit(&self) -> Result<(), PersistError> {
-            std::thread::sleep(Duration::from_millis(500));
+            let latch = self
+                .0
+                .lock()
+                .map_err(|_| PersistError::Storage("latch".to_owned()))?;
+            let _ = latch.0.send(());
+            let _ = latch.1.recv();
             Ok(())
         }
     }
+    let (entered_tx, entered) = mpsc::channel();
+    let (release, release_rx) = mpsc::channel();
     let dir = tempfile::tempdir()?;
     let path = db_in(&dir);
     let store = Arc::new(Store::open(
         &path,
         Options {
-            faults: Arc::new(SlowCommit),
+            faults: Arc::new(Latched(std::sync::Mutex::new((entered_tx, release_rx)))),
             ..test_options()
         },
     )?);
     seed(&path)?;
+    let dropped = Arc::new(AtomicBool::new(false));
+    store
+        .keep_until_closed(Box::new(Held(dropped.clone())))
+        .await?;
+    let ended = store.writer_ended();
     let writer = store.clone();
     let command = tokio::spawn(async move { writer.submit_command(pause("k", "a", 0)).await });
-    // Let the command reach the writer first.
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    store.barrier().await?;
-    assert_eq!(
-        command_rows(&store)?,
-        (1, 1, 1),
-        "the barrier came back before the queued commit"
+    drop(store);
+    // Waited for off the runtime's thread, so the command's task can reach the writer.
+    tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(5))).await??;
+    // The commit waits in its hook; the command's task holds the last handle.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !dropped.load(Ordering::SeqCst),
+        "kept item dropped while a write was pending"
     );
-    command.await??;
+    release.send(())?;
+    assert!(matches!(command.await??, CommandOutcome::Accepted { .. }));
+    tokio::time::timeout(Duration::from_secs(5), ended).await?;
+    assert!(dropped.load(Ordering::SeqCst));
+    let (state, revision, events, outbox) = snapshot(&path)?;
+    assert_eq!(
+        (state.as_str(), revision, events, outbox),
+        ("PAUSE_REQUESTED", 1, 1, 1)
+    );
     Ok(())
 }
