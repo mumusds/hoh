@@ -291,12 +291,13 @@ fn probe_codex(
 }
 
 /// What `codex app-server generate-json-schema` produced: its tree hash and the request and notification methods
-/// of both directions.
-struct CodexSchema {
-    hash: String,
-    requests: std::collections::BTreeSet<String>,
-    client_notifications: std::collections::BTreeSet<String>,
-    notifications: std::collections::BTreeSet<String>,
+/// of both directions, read only from validated schema files ([`codex_schema`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexSchema {
+    pub hash: String,
+    pub requests: std::collections::BTreeSet<String>,
+    pub client_notifications: std::collections::BTreeSet<String>,
+    pub notifications: std::collections::BTreeSet<String>,
 }
 
 /// The draft-07 `$schema` the App Server schema files declare.
@@ -444,8 +445,9 @@ fn schema_methods(value: &serde_json::Value) -> Option<std::collections::BTreeSe
 /// `codex app-server generate-json-schema --out <dir>`: every `.json` file must parse, and `ClientRequest.json`,
 /// `ClientNotification.json` and `ServerNotification.json` must be protocol schemas whose method lists the interface
 /// and the capabilities are read from; anything else is a failure, not an empty or guessed schema (M1T01R-08, -15,
-/// -26, -27, M1R-04).
-fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<CodexSchema, ProbeError> {
+/// -26, -27, M1R-04). doctor --live reads the schema through it too, so it never drives an App Server whose schema the
+/// probe refused (M1T07R-31).
+pub fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<CodexSchema, ProbeError> {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())

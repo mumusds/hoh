@@ -82,7 +82,8 @@ pub fn known_notifications(server_notification_schema: &Value) -> BTreeSet<Strin
 }
 
 /// The methods an App Server schema file lists (its `oneOf` branches' `method` values): `ClientRequest.json`'s
-/// requests, `ServerNotification.json`'s notifications.
+/// requests, `ServerNotification.json`'s notifications. It does not validate the file: what decides whether to use
+/// the App Server reads the schema through `probe::codex_schema` (M1T07R-31).
 pub fn listed_methods(schema: &Value) -> BTreeSet<String> {
     schema["oneOf"]
         .as_array()
