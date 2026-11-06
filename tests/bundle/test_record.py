@@ -551,9 +551,12 @@ sys.argv=['record.py','--agents','pi'];sys.exit(record.main())
             while listed and not occupied and time.monotonic()<deadline:
                 time.sleep(0.01);listed=mine();seen.update(listed)
         finally:
-            leaked=pidfile.exists() and record.alive(int(pidfile.read_text()))
-            if leaked:os.kill(int(pidfile.read_text()),signal.SIGKILL)
-            for unit in seen:subprocess.run(['systemctl','--user','stop',unit],capture_output=True)
+            try:  # the probe creates its pidfile before writing it: an empty one is not written yet (TR-02)
+                pid=pidfile.read_text().strip() if pidfile.exists() else ''
+                leaked=pid.isdigit() and record.alive(int(pid))
+                if leaked:os.kill(int(pid),signal.SIGKILL)
+            finally:
+                for unit in seen:subprocess.run(['systemctl','--user','stop',unit],capture_output=True)
         self.assertEqual(p.returncode,128+signal.SIGTERM,p.stderr[-2000:]);self.assertEqual(occupied,{});self.assertEqual(listed,[])
         self.assertFalse(leaked)
     def test_version_probe_leaves_nothing_behind(self):

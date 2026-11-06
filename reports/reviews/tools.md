@@ -83,3 +83,27 @@ Mutation check: dropping the strip from `child_env`, keeping a variable in the N
 - Agent: `codex` codex-cli 0.166.0 with `--model gpt-6.1-sol`, session `01a1ad98-3ad1-7ca2-be52-76dc10fe2949`, 311 s; attempt record sha256 `37915746d525bf9c13509001f59ec768171b80e5efa380e2a29bb75807647fa9`, stdout sha256 `0d6809cd3a018129e2d477d362207cffb3e2f5bafdd87296bd65244b1bec4811`.
 - Scope: `a7dcb39..9438f58`; both guard tests against their regressions, machine dependence (spaced or odd interpreter paths, outer `HOH_` variables, PATH), the restoring of `os.environ`, the new PLAN entry's effect on the other CandidateAndChecks tests.
 - Verdict: **PASS**, no findings.
+
+## The recorder SIGTERM test judges a leak by the kernel, not by systemd's listing (branch `tools/record-scope-listing`)
+
+`tests/bundle/test_record.py` `Interrupted.test_sigterm_while_constructing_the_version_probe` failed in about 4% of runs (1/40 and 5/120 on this VM; the follow-up from the M1-T08 round-8 review and M1-T09). Root cause, measured: the recorder had already seen the probe's scope empty in the kernel (`cgroup.events` populated 0, or the cgroup gone), but systemd removes the transient unit a few ms after it sees the cgroup empty (3-5 ms here), so `systemctl --user list-units` still listed it as `loaded active running`. The test now requires every listed scope of its own to be empty in the kernel at once, and gives the listing a bounded 5 s wait to drop it. 0 failures in 200 runs; mutants (stop_all does nothing; Proc does not register its child) still fail at the kernel check, leaving nothing behind.
+
+### Round 1 (fresh Grok session)
+
+- Agent: `grok` 1.0.70, model grok-4.7, session `01a1ae2b-11f2-7421-a180-a3b903765ed2`, 1300 s; attempt record sha256 `0088ec9c603f7359d291ca96daf1a6be8190c7b6df9939dc52fe6f3974231530`, stdout sha256 `a81d058f5904fcf1c643a50120c84e20ec91eacc4fd56968f007749ba43bfbf4`.
+- Scope: `ca76e82..a099387`. The reviewer measured the race itself (79/80 listings still running right after the cgroup emptied; median 7.7 ms, max 13.4 ms to the unit's removal), ran the test 80 times, and three mutants (stop_all no-op, no registration, a kill of the leader only with `populated()` always false), all failing.
+- Verdict: **PASS** (1 low).
+
+| ID | Severity | Summary | Disposition |
+|---|---|---|---|
+| TR-01 | low | test_record.py:545 — once the kernel check had seen a process in the scope, the test still waited the full 5 s before killing it and stopping the unit, and an OSError other than ENOENT/ENODEV from `members()` skipped the cleanup. | Fixed in `a8c7d57`: sampling and waiting run in `try`, the wait ends once a scope holds a process, and the `finally` stops every unit seen and a probe still alive. |
+
+### Round 2 (focused on TR-01, fresh Claude session)
+
+- Agent: `claude` 2.1.318, model claude-opus-5-5, session `a793510e-bf45-46c5-ad61-b580084ce882`, 442 s; attempt record sha256 `df742feaff07066013217e653180fe652cadd66613ff97e27c1bbd77e79a978f`, stdout sha256 `9da7f2248b36e5af80318582dffee0e3d99e6e520b3b1f798fec2839a52d67a1`.
+- Scope: `a099387..a8c7d57`, in `git archive` copies: 90 unmutated runs; the stop_all no-op mutant now fails in about 200 ms instead of after the 5 s wait; with `members()` raising EACCES the units seen are still stopped.
+- Verdict: **PASS** (1 low).
+
+| ID | Severity | Summary | Disposition |
+|---|---|---|---|
+| TR-02 | low | test_record.py:554 — the `finally` read `probe.pid` before stopping the units; the probe creates the file before writing it, so against a defective recorder an empty file raised ValueError (no-op mutant 1/40, 1/8, 1/10), the units were not stopped and the error hid the kernel assertion. Present before this branch too. | Fixed: an empty pidfile counts as not yet written, and the units are stopped in an inner `finally` whatever the pidfile read does. 60 unmutated runs pass; the no-op mutant fails at the kernel assertion in 20/20 runs, never with ValueError, leaving nothing behind. |
