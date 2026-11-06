@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Claude Code SessionStart hook (startup|resume|compact|clear): print the facts a resumed or compacted
-# main development session needs first. Plain stdout becomes model context. Delegated sessions started by
-# tools/agent_task.py carry HOH_BOOTSTRAP_PARENT and get nothing, so reviewers/QA stay independent of the
-# author's notes. Read-only; never fails the session (exit 0 on any problem).
+# main development session needs first. Plain stdout becomes model context. Sessions tools/agent_task.py starts for
+# delegated work carry HOH_DELEGATED_TASK and get nothing, so reviewers/QA stay independent of the author's notes;
+# HOH_BOOTSTRAP_PARENT alone (also set for the top-level session by scripts/start.sh) does not make a session delegated
+# (SAR-01). Read-only apart from the seen-counter; never fails the session (exit 0 on any problem).
 set -u
-[[ -z "${HOH_BOOTSTRAP_PARENT:-}" ]] || exit 0
+[[ -z "${HOH_DELEGATED_TASK:-}" ]] || exit 0
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)" || exit 0
 cd "$root" || exit 0
 echo '[hoh-session] Main development session context (scripts/dev/session-context.sh).'
@@ -33,6 +34,7 @@ lines=open('.hoh-dev/session-alerts.jsonl').read().splitlines()
 try: seen=int(open('.hoh-dev/session-alerts.seen').read().strip() or 0)
 except (OSError,ValueError): seen=0
 new=lines[seen:] if seen<=len(lines) else lines
+if len(new)>5: print(f"[hoh-session] {len(new)-5} older new alert(s) not shown: .hoh-dev/session-alerts.jsonl")
 for line in new[-5:]:
     try: r=json.loads(line)
     except ValueError: continue
