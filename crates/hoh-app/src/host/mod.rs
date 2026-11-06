@@ -115,8 +115,6 @@ pub struct Host {
     shared: Arc<http::Shared>,
     stop: tokio::sync::watch::Sender<bool>,
     served: Vec<tokio::task::JoinHandle<()>>,
-    /// Held while the host runs: the project lock.
-    _lock: std::fs::File,
     files: PathBuf,
 }
 
@@ -164,6 +162,30 @@ impl Host {
         let store =
             Store::open_with_mountinfo(&files.join("state.db"), config.store.clone(), &mountinfo)
                 .map_err(StartError::store)?;
+        // The writer holds the lock from here on: it lets the project go only after its last write (ADR-016
+        // decision 12). A start that fails from here waits for that before it returns.
+        let ended = store.writer_ended();
+        if let Err(e) = store.keep_until_closed(Box::new(lock)).await {
+            drop(store);
+            ended.await;
+            return Err(StartError::store(e));
+        }
+        match Self::serve_store(config, files, store).await {
+            Ok(host) => Ok(host),
+            Err(e) => {
+                ended.await;
+                Err(e)
+            }
+        }
+    }
+
+    /// The rest of the start, with the store open and holding the lock; on an error the store is gone when it
+    /// returns.
+    async fn serve_store(
+        config: HostConfig,
+        files: PathBuf,
+        store: Store,
+    ) -> Result<Host, StartError> {
         let repo =
             std::fs::canonicalize(&config.project).map_err(|e| StartError::other(e.to_string()))?;
         let started = store
@@ -240,12 +262,11 @@ impl Host {
             }),
         );
         if let Err(e) = written {
-            // Stop serving before the lock goes with the error (M2T12R-08).
+            // Stop serving; the store (and the lock with it) goes when this returns (M2T12R-08).
             let _ = stop.send(true);
             for task in served.iter_mut() {
                 let _ = task.await;
             }
-            let _ = shared.store.barrier().await;
             let _ = std::fs::remove_file(&socket);
             return Err(e);
         }
@@ -258,7 +279,6 @@ impl Host {
             shared,
             stop,
             served,
-            _lock: lock,
             files,
         })
     }
@@ -285,18 +305,29 @@ impl Host {
         })
     }
 
-    /// Stop (ADR-016 decision 12): no more requests, event streams end, every connection finishes or is ended after
-    /// the grace, every queued write is done; then `host.json` and the socket go, and only then the project lock.
-    /// The database stays.
+    /// Stop (ADR-016 decision 12): no new connections, event streams end, every connection finishes or is ended
+    /// after the grace; `host.json` and the socket go; then the store, and the writer ends after its last write and
+    /// lets the project lock go. Returns after that. The database stays. A Host dropped without this stops the same
+    /// way, without waiting.
     pub async fn shutdown(self) {
-        let _ = self.stop.send(true);
-        for task in self.served {
+        let Host {
+            shared,
+            stop,
+            served,
+            files,
+            socket,
+            ..
+        } = self;
+        let _ = stop.send(true);
+        for task in served {
             let _ = task.await;
         }
-        let _ = self.shared.store.barrier().await;
-        let _ = std::fs::remove_file(self.files.join("host.json"));
-        let _ = std::fs::remove_file(&self.socket);
-        drop(self._lock);
+        let _ = std::fs::remove_file(files.join("host.json"));
+        let _ = std::fs::remove_file(&socket);
+        let ended = shared.store.writer_ended();
+        drop(shared);
+        drop(stop);
+        ended.await;
     }
 }
 

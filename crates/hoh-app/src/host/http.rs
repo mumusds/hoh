@@ -100,7 +100,24 @@ pub(super) async fn serve(
     loop {
         tokio::select! {
             accepted = listener.accept() => {
-                let Ok(stream) = accepted else { continue };
+                let stream = match accepted {
+                    Ok(stream) => stream,
+                    Err(e) if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionRefused
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::ConnectionReset
+                    ) => continue,
+                    // Out of descriptors and the like: the listener stays readable, so wait rather than spin
+                    // (M2T12R-92).
+                    Err(_) => {
+                        tokio::select! {
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                            _ = stopped(stop.clone()) => break,
+                        }
+                        continue;
+                    }
+                };
                 let service = hyper_util::service::TowerToHyperService::new(router.clone());
                 let mut conn_stop = stop.clone();
                 connections.spawn(async move {
@@ -661,6 +678,10 @@ struct Stream_ {
 fn events(state: Stream_) -> impl Stream<Item = Result<SseEvent, Infallible>> {
     stream::unfold(state, |mut s| async move {
         loop {
+            // Every step looks at the stop, so a stream that is replaying ends with it too (M2T12R-98).
+            if *s.stop.borrow() {
+                return None;
+            }
             if let Some(event) = s.pending.pop_front() {
                 let wanted = s
                     .run_id

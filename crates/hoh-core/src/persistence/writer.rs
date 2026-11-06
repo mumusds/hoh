@@ -131,8 +131,11 @@ enum Job {
     ),
     /// The writer connection's settings.
     Pragmas(oneshot::Sender<Result<Pragmas, PersistError>>),
-    /// Answered once every request queued before it is done.
-    Barrier(oneshot::Sender<Result<(), PersistError>>),
+    /// Something to hold until the writer ends (a host's project lock, ADR-016 decision 12).
+    Keep(
+        Box<dyn std::any::Any + Send>,
+        oneshot::Sender<Result<(), PersistError>>,
+    ),
 }
 
 /// Test-only fault injection inside the writer.
@@ -149,6 +152,9 @@ pub(super) enum Fault {
 pub(super) struct Writer {
     jobs: mpsc::Sender<Job>,
     busy_timeout: std::time::Duration,
+    /// Becomes true when the writer thread has ended: every request done, its connection closed, what it kept
+    /// dropped.
+    ended: watch::Receiver<bool>,
 }
 
 impl std::fmt::Debug for Job {
@@ -163,7 +169,7 @@ impl std::fmt::Debug for Job {
             Job::Command(..) => "Command",
             Job::BeginHost(..) => "BeginHost",
             Job::Pragmas(..) => "Pragmas",
-            Job::Barrier(..) => "Barrier",
+            Job::Keep(..) => "Keep",
         })
     }
 }
@@ -210,10 +216,12 @@ impl Writer {
     ) -> Result<Writer, PersistError> {
         let (jobs, mut rx) = mpsc::channel(options.queue.max(1));
         let faults = options.faults.clone();
+        let (end, ended) = watch::channel(false);
         std::thread::Builder::new()
             .name("hoh-db-writer".to_owned())
             .spawn(move || {
-                // Ends when every handle is gone; the connection closes with the thread.
+                // Ends when every handle is gone and every queued request is done.
+                let mut kept: Vec<Box<dyn std::any::Any + Send>> = Vec::new();
                 while let Some(job) = rx.blocking_recv() {
                     before();
                     match job {
@@ -235,7 +243,8 @@ impl Writer {
                         Job::Pragmas(reply) => {
                             let _ = reply.send(super::pragmas(&conn));
                         }
-                        Job::Barrier(reply) => {
+                        Job::Keep(held, reply) => {
+                            kept.push(held);
                             let _ = reply.send(Ok(()));
                         }
                         Job::EnsureProject(id, repo, reply) => {
@@ -272,11 +281,16 @@ impl Writer {
                         });
                     }
                 }
+                // The connection first, then what was kept (a lock goes only after the last write), then the word.
+                drop(conn);
+                drop(kept);
+                let _ = end.send(true);
             })
             .map_err(|e| PersistError::Storage(format!("cannot start the writer thread: {e}")))?;
         Ok(Writer {
             jobs,
             busy_timeout: options.busy_timeout,
+            ended,
         })
     }
 
@@ -355,8 +369,23 @@ impl Writer {
         self.submit(Job::Pragmas).await
     }
 
-    pub(super) async fn barrier(&self) -> Result<(), PersistError> {
-        self.submit(Job::Barrier).await
+    pub(super) async fn keep(
+        &self,
+        held: Box<dyn std::any::Any + Send>,
+    ) -> Result<(), PersistError> {
+        self.submit(|tx| Job::Keep(held, tx)).await
+    }
+
+    /// Resolves once the writer thread has ended.
+    pub(super) fn ended(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let mut ended = self.ended.clone();
+        async move {
+            while !*ended.borrow_and_update() {
+                if ended.changed().await.is_err() {
+                    return;
+                }
+            }
+        }
     }
 
     pub(super) async fn scratch_task(&self, ids: [String; 4]) -> Result<(), PersistError> {

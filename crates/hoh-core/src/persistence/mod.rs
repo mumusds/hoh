@@ -694,10 +694,19 @@ impl Store {
         self.writer.pragmas().await
     }
 
-    /// Wait until every write queued before this call has committed or rolled back: the writer takes requests in
-    /// order, one at a time (a stopping host's last step before it lets the project go, ADR-016 decision 12).
-    pub async fn barrier(&self) -> Result<(), PersistError> {
-        self.writer.barrier().await
+    /// Hand `held` to the writer thread: it is dropped only when the writer has ended, after every write is done
+    /// and the connection is closed (a host's project lock, ADR-016 decision 12). The writer ends once every handle
+    /// of this store is gone.
+    pub async fn keep_until_closed(
+        &self,
+        held: Box<dyn std::any::Any + Send>,
+    ) -> Result<(), PersistError> {
+        self.writer.keep(held).await
+    }
+
+    /// Resolves once the writer thread has ended (after this store and every other handle are dropped).
+    pub fn writer_ended(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        self.writer.ended()
     }
 
     /// The highest committed event seq, updated after each commit (REQ-036: subscribers learn of an event only after
