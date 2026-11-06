@@ -541,14 +541,19 @@ sys.argv=['record.py','--agents','pi'];sys.exit(record.main())
             scopes=subprocess.run(['systemctl','--user','list-units','hoh-recorder-*','--no-legend','--plain','--full'],capture_output=True,text=True).stdout
             return [line.split()[0] for line in scopes.splitlines() if str(script) in line]
         # The kernel decides at once: a scope still listed must already be empty. systemd removes the unit only after
-        # it has seen the cgroup empty, a few ms after the recorder did, so the listing gets a bounded wait.
-        base=record.require_scopes();occupied={unit:record.members(base/unit) for unit in mine()}
-        occupied={unit:pids for unit,pids in occupied.items() if pids}
-        deadline=time.monotonic()+5;listed=mine()
-        while listed and time.monotonic()<deadline:time.sleep(0.01);listed=mine()
-        leaked=pidfile.exists() and record.alive(int(pidfile.read_text()))
-        if leaked:os.kill(int(pidfile.read_text()),signal.SIGKILL)
-        for unit in listed:subprocess.run(['systemctl','--user','stop',unit],capture_output=True)
+        # it has seen the cgroup empty, a few ms after the recorder did, so the listing gets a bounded wait, unless a
+        # scope still holds a process. Whatever happens, every unit seen and a probe still alive are stopped (TR-01).
+        seen=set();occupied={};listed=[]
+        try:
+            base=record.require_scopes();listed=mine();seen.update(listed)
+            occupied={unit:pids for unit in listed if (pids:=record.members(base/unit))}
+            deadline=time.monotonic()+5
+            while listed and not occupied and time.monotonic()<deadline:
+                time.sleep(0.01);listed=mine();seen.update(listed)
+        finally:
+            leaked=pidfile.exists() and record.alive(int(pidfile.read_text()))
+            if leaked:os.kill(int(pidfile.read_text()),signal.SIGKILL)
+            for unit in seen:subprocess.run(['systemctl','--user','stop',unit],capture_output=True)
         self.assertEqual(p.returncode,128+signal.SIGTERM,p.stderr[-2000:]);self.assertEqual(occupied,{});self.assertEqual(listed,[])
         self.assertFalse(leaked)
     def test_version_probe_leaves_nothing_behind(self):
