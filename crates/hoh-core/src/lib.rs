@@ -12,6 +12,8 @@
 #[forbid(clippy::disallowed_methods)]
 mod clippy_canary;
 #[forbid(clippy::disallowed_methods)]
+pub mod dag;
+#[forbid(clippy::disallowed_methods)]
 pub mod decision;
 #[forbid(clippy::disallowed_methods)]
 pub mod integer;
