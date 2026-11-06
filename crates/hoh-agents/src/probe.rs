@@ -329,7 +329,7 @@ fn hold_after_result() {
     }
 }
 
-/// Released by the test that stalls the reading (see [`between`]).
+/// Released by the test that stalls the reading, all stalls at once (see [`between`]).
 #[cfg(test)]
 static RELEASE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -337,10 +337,20 @@ static RELEASE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 fn between(moment: &str, path: &Path) {
     // An entry named `hoh-test-stall-<moment>`, at `path` or in it, stalls the reading there, on whatever thread, as
     // a call that does not return would, until the test releases it (M1T07R-47).
+    // Removing the entry releases it too, so a test can release its own stall alone.
     let marker = format!("hoh-test-stall-{moment}");
-    if path.file_name().is_some_and(|name| name == marker.as_str()) || path.join(&marker).exists() {
+    let at = if path.file_name().is_some_and(|name| name == marker.as_str()) {
+        path.to_path_buf()
+    } else {
+        path.join(&marker)
+    };
+    // Held open, it releases the stall when it is removed wherever it was moved meanwhile.
+    if let Ok(held) = std::fs::File::open(&at) {
         let started = Instant::now();
         while !RELEASE.load(std::sync::atomic::Ordering::SeqCst)
+            && held
+                .metadata()
+                .is_ok_and(|m| std::os::unix::fs::MetadataExt::nlink(&m) > 0)
             && started.elapsed() < Duration::from_secs(120)
         {
             std::thread::sleep(Duration::from_millis(5));
@@ -1147,35 +1157,32 @@ fn takes_every_id(
 /// -26, -27, M1R-04). doctor --live reads the schema through it too, so it never drives an App Server whose schema the
 /// probe refused (M1T07R-31).
 pub fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<CodexSchema, ProbeError> {
-    // Generating, reading and removing the schema share one window: doctor's shared deadline, or without one the
-    // probe's own command limit (M1T07R-40).
+    // Making the scratch directory, generating, reading and removing the schema share one window: doctor's shared
+    // deadline, or without one the probe's own command limit (M1T07R-40).
     let until = reading_deadline(env, Instant::now());
     let generate = argv(launcher, &["app-server", "generate-json-schema"]);
-    let scratch = Scratch::new(until + CLEANUP_GRACE)?;
-    let dir = scratch.dir.clone();
-    let out = dir.to_string_lossy().into_owned();
-    let generated = run_ok(
-        launcher,
-        &["app-server", "generate-json-schema", "--out", &out],
-        env,
-    )
-    .map(|_| ());
-    // What follows works over what the CLI wrote. It runs apart and is waited for only until the window and the
-    // cleanup grace end, so no operation over the output, counted or not, blocking or not, holds the probe longer
-    // (M1T07R-40); the counted work inside ends it earlier (budgets and deadline), so it is not left running.
-    // Given up on, it does nothing more to the output past the step in progress: every step checks the flag
-    // (M1T07R-47).
-    let given_up = scratch.given_up.clone();
+    // All of it runs apart; the caller does no file-system work and starts no process for it, and waits only until
+    // the window and the cleanup grace end, so no step, counted or not, blocking or not, holds the probe longer
+    // (M1T07R-40, -54). Given up on, the work does nothing more to the output past the step in progress: every step
+    // checks the flag (M1T07R-47).
+    let given_up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let held = Held::default();
     let (tx, rx) = mpsc::channel();
-    let reader = generate.clone();
-    let started = std::thread::Builder::new()
-        .name("hoh-schema".to_owned())
-        .spawn(move || {
-            let _ = tx.send(read_and_remove(scratch, generated, &reader, Some(until)));
+    let work = {
+        let (launcher, env, generate) = (launcher.to_path_buf(), env.clone(), generate.clone());
+        let (given_up, held) = (given_up.clone(), held.clone());
+        move || {
+            let _ = tx.send(schema_in_scratch(
+                &launcher, &env, &generate, until, &given_up, &held,
+            ));
             #[cfg(test)]
             hold_after_result();
-        });
-    let worker = match started {
+        }
+    };
+    let worker = match std::thread::Builder::new()
+        .name("hoh-schema".to_owned())
+        .spawn(work)
+    {
         Ok(worker) => worker,
         Err(e) => {
             return Err(ProbeError::Failed {
@@ -1192,28 +1199,110 @@ pub fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<CodexSchema, Prob
     });
     match received {
         Ok(result) => {
-            // Its result sent, the reading ends at once: joined, it holds nothing past the probe.
+            // Its result sent, the work ends at once: joined, it holds nothing past the probe.
             let _ = worker.join();
             result
         }
         Err(e) => Err(ProbeError::Failed {
             argv: generate,
-            detail: match e {
-                mpsc::RecvTimeoutError::Timeout => format!(
-                    "the schema output was not read and removed within the time limit; it may be left at {}",
-                    dir.display()
-                ),
-                mpsc::RecvTimeoutError::Disconnected => format!(
-                    "reading the schema output ended without a result; it may be left at {}",
-                    dir.display()
-                ),
-            },
+            detail: format!(
+                "{}; {}",
+                match e {
+                    mpsc::RecvTimeoutError::Timeout =>
+                        "the schema output was not read and removed within the time limit",
+                    mpsc::RecvTimeoutError::Disconnected =>
+                        "reading the schema output ended without a result",
+                },
+                held.may_be_left()
+            ),
         }),
     }
 }
 
 /// How long past the cleanup grace [`codex_schema`] waits for the reading to report.
 const READER_MARGIN: Duration = Duration::from_millis(500);
+
+/// The directories a schema reading holds (its scratch directory, then its quarantine), shared with the caller as
+/// they are made, so a caller that gives up names where they are when it does (M1T07R-52).
+#[derive(Clone, Default)]
+struct Held(std::sync::Arc<std::sync::Mutex<Vec<std::os::fd::OwnedFd>>>);
+
+impl Held {
+    fn add(&self, fd: std::os::fd::BorrowedFd<'_>) {
+        if let (Ok(copy), Ok(mut held)) = (fd.try_clone_to_owned(), self.0.lock()) {
+            held.push(copy);
+        }
+    }
+
+    /// Where the output may be left, as far as the directories held tell now.
+    fn may_be_left(&self) -> String {
+        let held = match self.0.lock() {
+            Ok(held) => held,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut places = held.iter().filter_map(|fd| where_now(fd.as_fd()));
+        match places.next() {
+            None if held.is_empty() => format!(
+                "its scratch directory under {} may be left",
+                std::env::temp_dir().display()
+            ),
+            None => "nothing of it is left".to_owned(),
+            Some(first) => {
+                let rest: Vec<_> = places.map(|p| p.display().to_string()).collect();
+                let mut said = format!("it may be left at {}", first.display());
+                if !rest.is_empty() {
+                    said.push_str(&format!(" (and {})", rest.join(", ")));
+                }
+                said
+            }
+        }
+    }
+}
+
+/// Where the directory `fd` is now (`/proc/self/fd`), `None` once it is removed.
+fn where_now(fd: std::os::fd::BorrowedFd<'_>) -> Option<PathBuf> {
+    let link = format!("/proc/self/fd/{}", std::os::fd::AsRawFd::as_raw_fd(&fd));
+    std::fs::read_link(link)
+        .ok()
+        .filter(|now| !now.to_string_lossy().ends_with(" (deleted)"))
+}
+
+/// Make the scratch directory, generate the schema into it, read it and remove it: [`codex_schema`]'s work, apart.
+fn schema_in_scratch(
+    launcher: &Path,
+    env: &ProbeEnv,
+    generate: &[String],
+    until: Instant,
+    given_up: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    held: &Held,
+) -> Result<CodexSchema, ProbeError> {
+    let stopped = || ProbeError::Failed {
+        argv: generate.to_vec(),
+        detail: "given up before the schema was generated".to_owned(),
+    };
+    between("scratch", launcher.parent().unwrap_or(launcher));
+    if given_up.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(stopped());
+    }
+    let scratch = Scratch::new(until + CLEANUP_GRACE, given_up.clone(), held.clone())?;
+    // Nothing is started for a caller that has gone.
+    if given_up.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(stopped());
+    }
+    let out = scratch.dir.to_string_lossy().into_owned();
+    // Generation ends with the window, however long making the directory took.
+    let env = ProbeEnv {
+        deadline: Some(until),
+        ..env.clone()
+    };
+    let generated = run_ok(
+        launcher,
+        &["app-server", "generate-json-schema", "--out", &out],
+        &env,
+    )
+    .map(|_| ());
+    read_and_remove(scratch, generated, generate, Some(until))
+}
 
 /// Read the schema the CLI generated into `scratch` (if it did), then remove the output; what is not removed fails
 /// the probe, saying where it is left, whatever the reading came to (M1T07R-40, -45).
@@ -1250,14 +1339,14 @@ fn read_and_remove(
     if scratch.remove() {
         return result;
     }
-    let left = format!("its output is left at {}", scratch.left_at());
+    let left = scratch.held.may_be_left();
     Err(match result {
         Err(ProbeError::Failed { argv, detail }) => ProbeError::Failed {
             argv,
-            detail: format!("{detail}; {left}"),
+            detail: format!("{detail}; the output could not be removed: {left}"),
         },
-        Ok(_) => unusable(format!("the schema output could not be removed; {left}")),
-        Err(other) => unusable(format!("{other}; {left}")),
+        Ok(_) => unusable(format!("the schema output could not be removed: {left}")),
+        Err(other) => unusable(format!("{other}; the output could not be removed: {left}")),
     })
 }
 
@@ -1391,82 +1480,101 @@ fn read_schema(
 /// How long removing a probe's scratch directory may run past the reading window.
 const CLEANUP_GRACE: Duration = Duration::from_secs(2);
 
+/// A device and inode: what an entry was when it was opened.
+type Inode = (u64, u64);
+
+fn inode(stat: &rustix::fs::Stat) -> Inode {
+    (stat.st_dev, stat.st_ino)
+}
+
 /// A probe's scratch directory, removed within its window once ([`remove_within`]), at the latest when dropped.
 struct Scratch {
     dir: PathBuf,
-    /// The directory holding `dir`, so `dir`'s own entry is looked at without crossing into a mount (M1T07R-49).
-    parent: std::os::fd::OwnedFd,
-    /// The directory the probe made at `dir`.
+    /// The temporary directory the scratch directory was made in.
+    temp: std::os::fd::OwnedFd,
+    /// The directory the probe made at `dir`: everything under it is reached from here (M1T07R-44, -51).
     owned: std::os::fd::OwnedFd,
     /// Set when the probe stopped waiting for the reading: nothing more is done to the output (M1T07R-47).
     given_up: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The directories held, shared with the caller (M1T07R-52).
+    held: Held,
     until: Instant,
     removed: Option<bool>,
 }
 
 impl Scratch {
     /// A new directory under the system's temporary directory, held open, to be removed by `until` (M1T07R-44).
-    fn new(until: Instant) -> Result<Scratch, ProbeError> {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let name = format!("hoh-probe-{}-{nanos}", std::process::id());
-        let temp = std::env::temp_dir();
-        let parent = rustix::fs::openat(
+    fn new(
+        until: Instant,
+        given_up: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        held: Held,
+    ) -> Result<Scratch, ProbeError> {
+        let dir = std::env::temp_dir().join(unique_name("hoh-probe"));
+        Scratch::at(dir, until, given_up, held).map_err(ProbeError::from)
+    }
+
+    /// A new directory at `dir`, held open.
+    fn at(
+        dir: PathBuf,
+        until: Instant,
+        given_up: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        held: Held,
+    ) -> io::Result<Scratch> {
+        use rustix::fs::{AtFlags, Mode, OFlags};
+        let (Some(parent), Some(name)) = (dir.parent(), dir.file_name()) else {
+            return Err(io::Error::other("a scratch directory needs a parent"));
+        };
+        let temp = rustix::fs::openat(
             rustix::fs::CWD,
-            &temp,
-            rustix::fs::OFlags::RDONLY
-                | rustix::fs::OFlags::DIRECTORY
-                | rustix::fs::OFlags::CLOEXEC,
-            rustix::fs::Mode::empty(),
+            parent,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        rustix::fs::mkdirat(&temp, name, Mode::from_raw_mode(0o700))?;
+        between("made", &dir);
+        let opened = open_beneath(
+            temp.as_fd(),
+            Path::new(name),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::NONBLOCK,
         )
-        .map_err(io::Error::from)?;
-        rustix::fs::mkdirat(
-            &parent,
-            name.as_str(),
-            rustix::fs::Mode::from_raw_mode(0o700),
-        )
-        .map_err(io::Error::from)?;
-        match open_directory(&parent, name.as_str()) {
-            Ok(owned) => Ok(Scratch {
-                dir: temp.join(name),
-                parent,
-                owned,
-                given_up: Default::default(),
-                until,
-                removed: None,
-            }),
+        .map_err(io::Error::from)
+        .and_then(|owned| {
+            // What was opened is the directory just made: the process's own and empty, not one put in its place
+            // between making and opening it (M1T07R-51).
+            if is_fresh(owned.as_fd()) {
+                Ok(owned)
+            } else {
+                Err(io::Error::other(format!(
+                    "the scratch directory {} was replaced as it was made",
+                    dir.display()
+                )))
+            }
+        });
+        match opened {
+            Ok(owned) => {
+                held.add(owned.as_fd());
+                Ok(Scratch {
+                    dir,
+                    temp,
+                    owned,
+                    given_up,
+                    held,
+                    until,
+                    removed: None,
+                })
+            }
             Err(e) => {
-                let _ =
-                    rustix::fs::unlinkat(&parent, name.as_str(), rustix::fs::AtFlags::REMOVEDIR);
-                Err(io::Error::from(e).into())
+                let _ = rustix::fs::unlinkat(&temp, name, AtFlags::REMOVEDIR);
+                Err(e)
             }
         }
     }
 
     /// Whether `dir` is still the directory the probe made.
     fn holds(&self) -> bool {
-        self.dir
-            .file_name()
-            .is_some_and(|name| names(self.parent.as_fd(), name, self.owned.as_fd()))
-    }
-
-    /// Where what was not removed is: its path, or where it was moved, as far as the held directory tells
-    /// (M1T07R-45).
-    fn left_at(&self) -> String {
-        if self.holds() {
-            return self.dir.display().to_string();
-        }
-        let link = format!(
-            "/proc/self/fd/{}",
-            std::os::fd::AsRawFd::as_raw_fd(&self.owned)
-        );
-        match std::fs::read_link(link) {
-            Ok(now) if !now.to_string_lossy().ends_with(" (deleted)") => {
-                format!("{} (moved from {})", now.display(), self.dir.display())
-            }
-            _ => format!("{}, which the CLI replaced", self.dir.display()),
+        match (self.dir.file_name(), rustix::fs::fstat(&self.owned)) {
+            (Some(name), Ok(made)) => names(self.temp.as_fd(), Path::new(name), inode(&made)),
+            _ => false,
         }
     }
 
@@ -1475,12 +1583,20 @@ impl Scratch {
         if let Some(gone) = self.removed {
             return gone;
         }
-        let gone = remove_within(
-            &self.dir,
-            self.parent.as_fd(),
-            self.owned.as_fd(),
-            &Work::new(u64::MAX, Some(self.until)).stopped_by(&self.given_up),
-        );
+        let work = Work::new(u64::MAX, Some(self.until)).stopped_by(&self.given_up);
+        let gone = match self.dir.file_name() {
+            Some(name) if work.spend(1) => Quarantine::new(self.temp.as_fd(), name, &self.held)
+                .is_some_and(|quarantine| {
+                    remove_within(
+                        &self.dir,
+                        self.temp.as_fd(),
+                        self.owned.as_fd(),
+                        &quarantine,
+                        &work,
+                    ) & quarantine.remove(self.temp.as_fd())
+                }),
+            _ => false,
+        };
         self.removed = Some(gone);
         gone
     }
@@ -1492,112 +1608,111 @@ impl Drop for Scratch {
     }
 }
 
-/// `name` under `at` as a directory, opened without following a link or waiting (M1T07R-44).
-fn open_directory<Fd: std::os::fd::AsFd, P: rustix::path::Arg>(
-    at: Fd,
-    name: P,
-) -> rustix::io::Result<std::os::fd::OwnedFd> {
-    use rustix::fs::{Mode, OFlags};
-    let flags =
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
-    rustix::fs::openat(at, name, flags, Mode::empty())
+/// Whether the directory `fd` is this process's own and empty.
+fn is_fresh(fd: std::os::fd::BorrowedFd<'_>) -> bool {
+    let owner =
+        rustix::fs::fstat(fd).is_ok_and(|s| s.st_uid == rustix::process::geteuid().as_raw());
+    owner
+        && rustix::fs::Dir::read_from(fd).is_ok_and(|mut dir| {
+            std::iter::from_fn(|| dir.read())
+                .all(|e| e.is_ok_and(|e| e.file_name() == c"." || e.file_name() == c".."))
+        })
 }
 
-/// `name` under `at`, opened without crossing into another file system mounted there; a mount is `EXDEV`
-/// (M1T07R-49). `openat2` with `RESOLVE_NO_XDEV` refuses before the other file system is asked anything, so one that
-/// never answers (a FUSE mount a helper put there) cannot hold the probe; where the kernel has no `openat2`, `openat`
-/// and a check that what was opened is on `at`'s device keep the probe on its own file system, and the bounded wait
-/// in [`codex_schema`] ends a call that does not return.
-fn open_beneath<P: rustix::path::Arg + Copy>(
+/// `<prefix>-<pid>-<nanoseconds>`.
+fn unique_name(prefix: &str) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{prefix}-{}-{nanos}", std::process::id())
+}
+
+/// How everything under the scratch directory is reached: never above where the resolution starts, never through a
+/// link, never into another file system. A mount is `EXDEV` before the file system mounted there is asked anything,
+/// so one that never answers (a FUSE mount a helper put there) cannot hold the probe (M1T07R-44, -49, -51).
+const BENEATH: rustix::fs::ResolveFlags = rustix::fs::ResolveFlags::BENEATH
+    .union(rustix::fs::ResolveFlags::NO_SYMLINKS)
+    .union(rustix::fs::ResolveFlags::NO_XDEV)
+    .union(rustix::fs::ResolveFlags::NO_MAGICLINKS);
+
+/// `rel` (names from listings, joined; empty for `at` itself) opened from `at` as it is now, [`BENEATH`] it: what is
+/// opened was under `at` at that moment, wherever a directory on the way was before or is after (M1T07R-51). Never
+/// waits on a FIFO (`flags` carries `O_NONBLOCK` where it could be one). A kernel without `openat2`, or one a seccomp
+/// filter keeps from it, opens nothing (`ENOSYS`): the probe fails rather than reach the output another way.
+fn open_beneath(
     at: std::os::fd::BorrowedFd<'_>,
-    name: P,
+    rel: &Path,
     flags: rustix::fs::OFlags,
 ) -> rustix::io::Result<std::os::fd::OwnedFd> {
-    use rustix::fs::{Mode, ResolveFlags, openat2};
+    use rustix::fs::{Mode, OFlags, openat2};
     #[cfg(test)]
-    if name.to_string_lossy() == "hoh-test-mount" {
+    if rel.components().any(|c| c.as_os_str() == "hoh-test-mount") {
         return Err(rustix::io::Errno::XDEV);
     }
-    match openat2(
-        at,
-        name,
-        flags,
-        Mode::empty(),
-        ResolveFlags::NO_XDEV | ResolveFlags::NO_MAGICLINKS,
-    ) {
-        Err(rustix::io::Errno::NOSYS | rustix::io::Errno::PERM) => open_on_device(at, name, flags),
+    let rel = if rel.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        rel
+    };
+    match openat2(at, rel, flags | OFlags::CLOEXEC, Mode::empty(), BENEATH) {
+        Err(rustix::io::Errno::NOSYS | rustix::io::Errno::PERM) => Err(rustix::io::Errno::NOSYS),
         other => other,
     }
 }
 
-/// `name` under `at` by `openat`, refused (`EXDEV`) when what was opened is on another device than `at`.
-fn open_on_device<P: rustix::path::Arg>(
-    at: std::os::fd::BorrowedFd<'_>,
-    name: P,
-    flags: rustix::fs::OFlags,
-) -> rustix::io::Result<std::os::fd::OwnedFd> {
-    let fd = rustix::fs::openat(at, name, flags, rustix::fs::Mode::empty())?;
-    if rustix::fs::fstat(&fd)?.st_dev != rustix::fs::fstat(at)?.st_dev {
-        return Err(rustix::io::Errno::XDEV);
-    }
-    Ok(fd)
-}
-
-/// `name` under `parent` itself, as a path: not followed, and not crossing into a mount there (M1T07R-49).
-fn open_path(
-    parent: std::os::fd::BorrowedFd<'_>,
-    name: &OsStr,
-) -> rustix::io::Result<std::os::fd::OwnedFd> {
+/// Whether `rel` under `at`, not followed and not crossing into a mount, is `made` (M1T07R-44, -49).
+fn names(at: std::os::fd::BorrowedFd<'_>, rel: &Path, made: Inode) -> bool {
     use rustix::fs::OFlags;
-    open_beneath(
-        parent,
-        name,
-        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-    )
+    open_beneath(at, rel, OFlags::PATH | OFlags::NOFOLLOW)
+        .and_then(|fd| rustix::fs::fstat(&fd))
+        .is_ok_and(|now| inode(&now) == made)
 }
 
-/// Whether `name` under `parent`, not followed, is the directory `owned` (M1T07R-44, -49).
-fn names(
-    parent: std::os::fd::BorrowedFd<'_>,
-    name: &OsStr,
-    owned: std::os::fd::BorrowedFd<'_>,
-) -> bool {
-    use rustix::fs::fstat;
-    match (open_path(parent, name), fstat(owned)) {
-        (Ok(at), Ok(made)) => {
-            fstat(&at).is_ok_and(|at| at.st_dev == made.st_dev && at.st_ino == made.st_ino)
+/// What a failed `open_beneath` means for the output.
+fn beneath_error(path: &Path, e: rustix::io::Errno) -> String {
+    match e {
+        rustix::io::Errno::XDEV => format!(
+            "{} is a mount point or left the output while it was read; the probe reads no other file system and \
+             nothing outside its output",
+            path.display()
+        ),
+        rustix::io::Errno::NOSYS => {
+            "the kernel refuses openat2, which the probe reads its output with".to_owned()
         }
-        _ => false,
+        e => format!("{}: {e}", path.display()),
     }
 }
 
-/// The files of the schema output directory `owned` (at `root`) with their bytes, by path (M1T07R-40, -44). Every
-/// directory is opened
-/// relative to the one holding it and every entry is opened before it is judged, never following a link and never
-/// waiting on a FIFO, so what a helper the CLI left running changes during the walk cannot take it outside the
-/// output: links and what is neither a directory nor a regular file are skipped. Every entry costs a step; more than
-/// [`MAX_SCHEMA_FILES`] entries, or nesting deeper than [`MAX_SCHEMA_DEPTH`], refuse the output; a file is refused
-/// by its size before it is read and read no further than the limits leave, so one that grows meanwhile cannot grow
-/// the reading.
+/// The files of the schema output directory `owned` (at `root`) with their bytes, by path (M1T07R-40, -44, -51).
+/// Directories are listed for names only; every entry is opened from `owned` by its path under it, [`BENEATH`] it,
+/// and judged as opened, so what a helper the CLI left running moves, links or mounts during the walk cannot take it
+/// outside the output: links and what is neither a directory nor a regular file are skipped, a mount refuses the
+/// output. Every entry costs a step; more than [`MAX_SCHEMA_FILES`] entries, or nesting deeper than
+/// [`MAX_SCHEMA_DEPTH`], refuse the output; a file is refused by its size before it is read and read no further than
+/// the limits leave, so one that grows meanwhile cannot grow the reading.
 fn schema_files(
     root: &Path,
     owned: std::os::fd::BorrowedFd<'_>,
     work: &Work,
 ) -> Result<Vec<(PathBuf, Vec<u8>)>, String> {
     use rustix::fs::{Dir, OFlags};
-    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK;
     let failed = |path: &Path, e: &dyn fmt::Display| format!("{}: {e}", path.display());
     between("walk", root);
-    let top = Dir::read_from(owned).map_err(|e| failed(root, &e))?;
+    let top = open_beneath(owned, Path::new(""), flags | OFlags::DIRECTORY)
+        .and_then(Dir::new)
+        .map_err(|e| beneath_error(root, e))?;
     let mut out = Vec::new();
     let (mut entries, mut total) = (0usize, 0u64);
-    let mut stack = vec![(top, root.to_path_buf())];
+    // Each directory being listed, with its path under the output.
+    let mut stack = vec![(top, PathBuf::new())];
     while let Some((reader, at)) = stack.last_mut() {
         let Some(entry) = reader.read() else {
             stack.pop();
             continue;
         };
-        let entry = entry.map_err(|e| failed(at, &e))?;
+        let entry = entry.map_err(|e| failed(&root.join(&*at), &e))?;
         let name = entry.file_name();
         if name == c"." || name == c".." {
             continue;
@@ -1611,24 +1726,17 @@ fn schema_files(
         if !work.spend(1) {
             return Err("the schema output was not read within the time limit".to_owned());
         }
-        let path = at.join(OsStr::from_bytes(name.to_bytes()));
+        let rel = at.join(OsStr::from_bytes(name.to_bytes()));
+        let path = root.join(&rel);
         between("entry", &path);
         // What is judged is what is read: the entry as opened, not as listed.
-        let fd = reader.fd().and_then(|at| open_beneath(at, name, flags));
-        let file = match fd {
+        let file = match open_beneath(owned, &rel, flags) {
             Ok(fd) => std::fs::File::from(fd),
-            // Another file system mounted in the output is not the CLI's output, and is not entered (M1T07R-49).
-            Err(rustix::io::Errno::XDEV) => {
-                return Err(format!(
-                    "{} is a mount point; the probe reads no other file system",
-                    path.display()
-                ));
-            }
-            // A link, a socket, or an entry removed meanwhile.
+            // A link, a socket, or an entry moved or removed meanwhile.
             Err(rustix::io::Errno::LOOP | rustix::io::Errno::NXIO | rustix::io::Errno::NOENT) => {
                 continue;
             }
-            Err(e) => return Err(failed(&path, &e)),
+            Err(e) => return Err(beneath_error(&path, e)),
         };
         let meta = file.metadata().map_err(|e| failed(&path, &e))?;
         if meta.is_dir() {
@@ -1639,7 +1747,7 @@ fn schema_files(
                 ));
             }
             let dir = Dir::new(std::os::fd::OwnedFd::from(file)).map_err(|e| failed(&path, &e))?;
-            stack.push((dir, path));
+            stack.push((dir, rel));
         } else if meta.is_file() {
             // Another link can be a file outside the output: such a file is not read (M1T07R-46).
             if std::os::unix::fs::MetadataExt::nlink(&meta) > 1 {
@@ -1685,42 +1793,193 @@ fn read_bounded(file: impl Read, room: u64) -> io::Result<Option<Vec<u8>>> {
     Ok((u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= room).then_some(bytes))
 }
 
-/// Empty the directory `owned` and remove it from `dir`, every step spending from `work`; true when it is gone
-/// (M1T07R-40, -44). Every directory under it is opened relative to the one holding it without following a link and
-/// what it holds is removed relative to it, so an entry a helper the CLI left running replaces by a link is removed
-/// itself, never followed; what is nested deeper than [`MAX_SCHEMA_DEPTH`] is left. `dir` is removed only while it
-/// names `owned`; a link put in its place is removed itself, and another directory put there is left.
+/// A directory of the probe's own, made beside its scratch directory once the CLI has exited and never named to it,
+/// that what is removed passes through: an entry is moved in, checked to be what was opened under the output, and
+/// only then removed (M1T07R-51).
+struct Quarantine {
+    name: String,
+    fd: std::os::fd::OwnedFd,
+    made: Inode,
+    /// How many entries were moved in.
+    taken: std::cell::Cell<u64>,
+    /// Entries moved in that are still there.
+    left: std::cell::Cell<u64>,
+}
+
+impl Quarantine {
+    /// Made in `temp`, named after the scratch directory `of`; shared in `held` so what stays in it can be named.
+    fn new(temp: std::os::fd::BorrowedFd<'_>, of: &OsStr, held: &Held) -> Option<Quarantine> {
+        use rustix::fs::{Mode, OFlags};
+        let name = unique_name(&format!("{}-q", of.to_string_lossy()));
+        rustix::fs::mkdirat(temp, name.as_str(), Mode::from_raw_mode(0o700)).ok()?;
+        let fd = open_beneath(
+            temp,
+            Path::new(&name),
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+        )
+        .ok()?;
+        let made = inode(&rustix::fs::fstat(&fd).ok()?);
+        held.add(fd.as_fd());
+        Some(Quarantine {
+            name,
+            fd,
+            made,
+            taken: Default::default(),
+            left: Default::default(),
+        })
+    }
+
+    /// Move `name` out of `parent` and remove it, if it is `opened`: true when it is gone. Whatever else was moved
+    /// in (something put in its place since it was opened, or a directory not empty) goes back where it was found, or
+    /// stays here.
+    fn take(
+        &self,
+        parent: std::os::fd::BorrowedFd<'_>,
+        name: &OsStr,
+        opened: Inode,
+        directory: bool,
+        path: &Path,
+    ) -> bool {
+        use rustix::fs::{AtFlags, RenameFlags, renameat_with, statat, unlinkat};
+        let n = self.taken.get();
+        self.taken.set(n + 1);
+        let here = n.to_string();
+        between("take", path);
+        if renameat_with(
+            parent,
+            name,
+            &self.fd,
+            here.as_str(),
+            RenameFlags::NOREPLACE,
+        )
+        .is_err()
+        {
+            return false;
+        }
+        let what = statat(&self.fd, here.as_str(), AtFlags::SYMLINK_NOFOLLOW);
+        let flags = if directory {
+            AtFlags::REMOVEDIR
+        } else {
+            AtFlags::empty()
+        };
+        if what.is_ok_and(|s| inode(&s) == opened)
+            && unlinkat(&self.fd, here.as_str(), flags).is_ok()
+        {
+            return true;
+        }
+        if renameat_with(
+            &self.fd,
+            here.as_str(),
+            parent,
+            name,
+            RenameFlags::NOREPLACE,
+        )
+        .is_err()
+        {
+            self.left.set(self.left.get() + 1);
+        }
+        false
+    }
+
+    /// Remove the quarantine itself if nothing stayed in it: true when it is gone.
+    fn remove(&self, temp: std::os::fd::BorrowedFd<'_>) -> bool {
+        self.left.get() == 0
+            && names(temp, Path::new(&self.name), self.made)
+            && rustix::fs::unlinkat(temp, self.name.as_str(), rustix::fs::AtFlags::REMOVEDIR)
+                .is_ok()
+    }
+}
+
+/// Remove what is under the scratch directory `owned` (made as `dir` in `temp`) and then `owned` itself, every step
+/// spending from `work`; true when it is gone (M1T07R-40, -44, -51). Entries are reached as the reading reaches them
+/// ([`open_beneath`] from `owned`) and none is unlinked where it is: each is moved from its parent, opened under
+/// `owned` just before, through `quarantine`, where it is removed only if it is the entry opened under `owned`, held
+/// open until then so its inode cannot be another's; so nothing that was never under the output is removed, whatever
+/// a helper the CLI left running moves meanwhile. Everything but directories goes first, then the directories,
+/// children before their parent: a directory enters the quarantine, where a helper holding it could find the
+/// quarantine (`..`), only once nothing but empty directories is left to remove. A mount is left untouched, and so is
+/// what is nested deeper than [`MAX_SCHEMA_DEPTH`]. `dir` itself goes last, only while `dir` still names it; a link
+/// put in its place is removed the same way.
 fn remove_within(
     dir: &Path,
-    parent: std::os::fd::BorrowedFd<'_>,
+    temp: std::os::fd::BorrowedFd<'_>,
     owned: std::os::fd::BorrowedFd<'_>,
+    quarantine: &Quarantine,
     work: &Work,
 ) -> bool {
-    use rustix::fs::{AtFlags, Dir, FileType, OFlags, fstat, unlinkat};
-    let dir_flags =
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
-    let Ok(top) = Dir::read_from(owned) else {
+    use rustix::fs::fstat;
+    if !remove_pass(dir, owned, quarantine, work, false)
+        || !remove_pass(dir, owned, quarantine, work, true)
+    {
+        return false;
+    }
+    let (Ok(made), Some(name)) = (fstat(owned), dir.file_name()) else {
         return false;
     };
-    // Each directory being emptied, with its path.
-    let mut stack = vec![(top, dir.to_path_buf())];
+    // At `dir` now: the directory itself, or a link put in its place, which goes too (removing a link never touches
+    // what it names); anything else put there is left.
+    if let Ok(at) = open_beneath(
+        temp,
+        Path::new(name),
+        rustix::fs::OFlags::PATH | rustix::fs::OFlags::NOFOLLOW,
+    ) && let Ok(now) = fstat(&at)
+    {
+        if inode(&now) == inode(&made) {
+            quarantine.take(temp, name, inode(&made), true, dir);
+        } else if rustix::fs::FileType::from_raw_mode(now.st_mode) == rustix::fs::FileType::Symlink
+        {
+            quarantine.take(temp, name, inode(&now), false, dir);
+        }
+    }
+    fstat(owned).is_ok_and(|made| made.st_nlink == 0)
+}
+
+/// One pass of [`remove_within`] over what is under `owned`: the directories (`directories`), children first, or
+/// everything else; false when the work ran out.
+fn remove_pass(
+    dir: &Path,
+    owned: std::os::fd::BorrowedFd<'_>,
+    quarantine: &Quarantine,
+    work: &Work,
+    directories: bool,
+) -> bool {
+    use rustix::fs::{Dir, FileType, OFlags, fstat};
+    let listing = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::NONBLOCK;
+    // `rel`'s entry taken out of its parent, if it is still `opened`, which is held open meanwhile.
+    let take = |rel: &Path, opened: std::os::fd::BorrowedFd<'_>, directory: bool| {
+        let (Some(parent), Some(name), Ok(stat)) = (rel.parent(), rel.file_name(), fstat(opened))
+        else {
+            return;
+        };
+        if let Ok(at) = open_beneath(
+            owned,
+            parent,
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+        ) {
+            quarantine.take(at.as_fd(), name, inode(&stat), directory, &dir.join(rel));
+        }
+    };
+    let Ok(top) = open_beneath(owned, Path::new(""), listing).and_then(Dir::new) else {
+        return false;
+    };
+    // Each directory being gone through: its listing (which holds it open) and its path under `owned`.
+    let mut stack = vec![(top, PathBuf::new())];
     loop {
         if !work.spend(1) {
             return false;
         }
         let within = stack.len() <= MAX_SCHEMA_DEPTH;
         let Some((reader, at)) = stack.last_mut() else {
-            break;
+            return true;
         };
         let Some(Ok(entry)) = reader.read() else {
-            // Emptied, as far as it can be: removed from the directory holding it.
-            let Some((_, path)) = stack.pop() else {
-                break;
-            };
-            if let (Some((parent, _)), Some(name)) = (stack.last(), path.file_name())
-                && let Ok(at) = parent.fd()
+            // Gone through: in the directories' pass, taken out of the directory holding it.
+            if let Some((reader, rel)) = stack.pop()
+                && directories
+                && !rel.as_os_str().is_empty()
+                && let Ok(opened) = reader.fd()
             {
-                let _ = unlinkat(at, name, AtFlags::REMOVEDIR);
+                take(&rel, opened, true);
             }
             continue;
         };
@@ -1728,38 +1987,23 @@ fn remove_within(
         if name == c"." || name == c".." {
             continue;
         }
-        let path = at.join(OsStr::from_bytes(name.to_bytes()));
-        between("remove", &path);
-        let Ok(at) = reader.fd() else {
-            return false;
+        let rel = at.join(OsStr::from_bytes(name.to_bytes()));
+        between("remove", &dir.join(&rel));
+        let Ok(opened) = open_beneath(owned, &rel, OFlags::PATH | OFlags::NOFOLLOW) else {
+            // Gone, moved out, or a mount point: a mount is left, and nothing in it is touched (M1T07R-49).
+            continue;
         };
-        match open_beneath(at, name, dir_flags).and_then(Dir::new) {
-            Ok(child) if within => stack.push((child, path)),
-            Ok(_) => {}
-            // A mount point is left, and nothing in it is touched (M1T07R-49).
-            Err(rustix::io::Errno::XDEV) => {}
-            Err(_) => {
-                let _ = unlinkat(at, name, AtFlags::empty());
+        let Ok(stat) = fstat(&opened) else {
+            continue;
+        };
+        if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
+            if !directories {
+                take(&rel, opened.as_fd(), false);
             }
+        } else if within && let Ok(child) = open_beneath(owned, &rel, listing).and_then(Dir::new) {
+            stack.push((child, rel));
         }
     }
-    let Some(name) = dir.file_name() else {
-        return false;
-    };
-    // What is at `dir` now, looked at without following it or crossing into a mount: `None` for nothing.
-    let at_dir = || match open_path(parent, name) {
-        Err(rustix::io::Errno::NOENT) => None,
-        Ok(fd) => {
-            Some(fstat(&fd).is_ok_and(|s| FileType::from_raw_mode(s.st_mode) == FileType::Symlink))
-        }
-        Err(_) => Some(false),
-    };
-    if names(parent, name, owned) {
-        let _ = unlinkat(parent, name, AtFlags::REMOVEDIR);
-    } else if at_dir() == Some(true) {
-        let _ = unlinkat(parent, name, AtFlags::empty());
-    }
-    fstat(owned).is_ok_and(|made| made.st_nlink == 0) && at_dir().is_none()
 }
 
 /// Claude Code: `-p --output-format stream-json`; partial messages and resume from `--help`.
@@ -2201,19 +2445,22 @@ fn capture(
             other => break other.map_err(|e| failed(format!("cannot start: {e}")))?,
         }
     };
+    let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
+    // From here on every exit, an error or a panic included, ends the command (M1T07R-53).
+    let mut owned = Owned::new(child);
     // Both outputs are read here, between looks at the command, up to their limit and the end: nothing reads them
     // once the probe returns, so a helper that left the group and holds a pipe open keeps nothing of it (M1T07R-44,
     // -47).
     let mut outputs = [
-        Output::new(child.stdout.take().map(std::os::fd::OwnedFd::from))?,
-        Output::new(child.stderr.take().map(std::os::fd::OwnedFd::from))?,
+        Output::new(stdout.map(std::os::fd::OwnedFd::from))?,
+        Output::new(stderr.map(std::os::fd::OwnedFd::from))?,
     ];
     let timed_out = || ProbeError::TimedOut {
         argv: argv(program, args),
         after: limit,
         cut_by_deadline: limit < env.timeout,
     };
-    let pid = Pid::from_child(&child);
+    let pid = owned.pid;
     let exited = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG;
     let mut status = None;
     loop {
@@ -2222,12 +2469,8 @@ fn capture(
         }
         let now = Instant::now();
         if now >= end {
-            // Output still open at the end is a timeout too, and what comes later is not taken (M1T07R-13). The
-            // group is not signalled again once the leader is reaped: its id may since belong to another process.
-            if status.is_none() {
-                let _ = kill_process_group(pid, Signal::KILL);
-                let _ = child.wait();
-            }
+            // Output still open at the end is a timeout too, and what comes later is not taken (M1T07R-13).
+            owned.end();
             return Err(timed_out());
         }
         let wait = end
@@ -2246,8 +2489,11 @@ fn capture(
                 .is_some()
         {
             // Whatever the command left running in its group goes with it (M1T01R-03), then the leader is reaped.
-            let _ = kill_process_group(pid, Signal::KILL);
-            status = Some(child.wait()?);
+            status = Some(
+                owned
+                    .end()
+                    .ok_or_else(|| io::Error::other("the command exited but was not reaped"))?,
+            );
         }
     }
     let Some(status) = status else {
@@ -2264,6 +2510,55 @@ fn capture(
         stdout,
         stderr,
     })
+}
+
+/// How long [`Owned::end`] waits for a killed command's leader to be reaped.
+const REAP_WAIT: Duration = Duration::from_secs(1);
+
+/// A command the probe started, owned from the moment it started: ended ([`Owned::end`]) when dropped, so no exit
+/// of [`capture`] leaves it running (M1T07R-53).
+struct Owned {
+    /// `None` once ended.
+    child: Option<std::process::Child>,
+    pid: Pid,
+}
+
+impl Owned {
+    fn new(child: std::process::Child) -> Owned {
+        let pid = Pid::from_child(&child);
+        Owned {
+            child: Some(child),
+            pid,
+        }
+    }
+
+    /// Kill its process group and reap its leader, once; the exit status when reaped within [`REAP_WAIT`]. The
+    /// group is signalled only while the leader is not reaped, so the id is still its own. A leader that does not
+    /// die by then (a call SIGKILL does not end) is reaped by a thread of its own.
+    fn end(&mut self) -> Option<ExitStatus> {
+        let mut child = self.child.take()?;
+        let _ = kill_process_group(self.pid, Signal::KILL);
+        let until = Instant::now() + REAP_WAIT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return Some(status),
+                Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(2)),
+                _ => break,
+            }
+        }
+        let _ = std::thread::Builder::new()
+            .name("hoh-reap".to_owned())
+            .spawn(move || {
+                let _ = child.wait();
+            });
+        None
+    }
+}
+
+impl Drop for Owned {
+    fn drop(&mut self) {
+        self.end();
+    }
 }
 
 /// One output of a probe command, read without blocking up to [`MAX_OUTPUT`].
@@ -2315,9 +2610,20 @@ impl Output {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Set by a test: once this file exists, waits for output on this thread fail as a poll that cannot get memory
+    /// would.
+    static POLL_FAILS: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
 /// Wait at most `wait` for output on any open one.
 fn wait_for_output(outputs: &[Output], wait: Duration) -> io::Result<()> {
     use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    #[cfg(test)]
+    if POLL_FAILS.with(|f| f.borrow().as_ref().is_some_and(|p| p.exists())) {
+        return Err(io::Error::from_raw_os_error(12));
+    }
     let mut fds: Vec<PollFd<'_>> = outputs
         .iter()
         .filter_map(|o| o.file.as_ref())
@@ -2343,7 +2649,9 @@ mod tests {
 
     /// `dir` held open, as the probe holds the scratch directory it made.
     fn held(dir: &Path) -> std::os::fd::OwnedFd {
-        open_directory(rustix::fs::CWD, dir).expect("open the directory")
+        use rustix::fs::{Mode, OFlags};
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        rustix::fs::openat(rustix::fs::CWD, dir, flags, Mode::empty()).expect("open the directory")
     }
 
     /// [`schema_files`] of `root` as the probe made it.
@@ -2353,12 +2661,31 @@ mod tests {
 
     /// The directory holding `dir`.
     fn parent_of(dir: &Path) -> std::os::fd::OwnedFd {
-        open_directory(rustix::fs::CWD, dir.parent().expect("a parent")).expect("open the parent")
+        held(dir.parent().expect("a parent"))
     }
 
-    /// [`remove_within`] of `dir` as the probe made it.
+    /// What `fd` is.
+    fn inode_of(fd: &std::os::fd::OwnedFd) -> Inode {
+        inode(&rustix::fs::fstat(fd).expect("stat"))
+    }
+
+    /// [`remove_within`] of `dir` as the probe made it: true when it and its quarantine are gone.
     fn remove(dir: &Path, work: &Work) -> bool {
-        remove_within(dir, parent_of(dir).as_fd(), held(dir).as_fd(), work)
+        remove_held(dir, &held(dir), work)
+    }
+
+    /// [`remove_within`] of the directory `owned`, made as `dir`, through a quarantine beside it, as
+    /// [`Scratch::remove`] does it.
+    fn remove_held(dir: &Path, owned: &std::os::fd::OwnedFd, work: &Work) -> bool {
+        let temp = parent_of(dir);
+        let quarantine = Quarantine::new(
+            temp.as_fd(),
+            dir.file_name().expect("a name"),
+            &Held::default(),
+        )
+        .expect("make a quarantine");
+        remove_within(dir, temp.as_fd(), owned.as_fd(), &quarantine, work)
+            & quarantine.remove(temp.as_fd())
     }
 
     #[test]
@@ -2975,13 +3302,11 @@ mod tests {
             }
             let parent = parent_of(&dir);
             let name = dir.file_name().ok_or("a name")?;
-            assert!(!names(parent.as_fd(), name, owned.as_fd()), "{case}");
-            let gone = remove_within(
-                &dir,
-                parent.as_fd(),
-                owned.as_fd(),
-                &Work::new(u64::MAX, None),
+            assert!(
+                !names(parent.as_fd(), Path::new(name), inode_of(&owned)),
+                "{case}"
             );
+            let gone = remove_held(&dir, &owned, &Work::new(u64::MAX, None));
             if case == "linked" {
                 assert!(gone, "{case}");
                 assert!(
@@ -3052,21 +3377,26 @@ mod tests {
     fn scratch_is_removed_when_the_reading_panics() -> Result<(), Box<dyn std::error::Error>> {
         let root = tempfile::tempdir()?;
         let dir = root.path().join("scratch");
-        std::fs::create_dir_all(dir.join("v2"))?;
-        std::fs::write(dir.join("v2/a.json"), "{}")?;
         let panicked = std::panic::catch_unwind(|| {
-            let _scratch = Scratch {
-                parent: parent_of(&dir),
-                owned: held(&dir),
-                given_up: Default::default(),
-                dir: dir.clone(),
-                until: Instant::now() + Duration::from_secs(60),
-                removed: None,
-            };
+            let scratch = Scratch::at(
+                dir.clone(),
+                Instant::now() + Duration::from_secs(60),
+                Default::default(),
+                Held::default(),
+            )
+            .expect("make the scratch directory");
+            std::fs::create_dir_all(dir.join("v2")).expect("write the output");
+            std::fs::write(dir.join("v2/a.json"), "{}").expect("write the output");
+            let _scratch = scratch;
             panic!("a reading that fails");
         });
         assert!(panicked.is_err());
         assert!(!dir.exists(), "the scratch directory was left");
+        assert_eq!(
+            std::fs::read_dir(root.path())?.count(),
+            0,
+            "its quarantine was left"
+        );
         Ok(())
     }
 
@@ -3101,12 +3431,7 @@ mod tests {
                 }));
             });
             if moment == "remove" {
-                assert!(remove_within(
-                    &dir,
-                    parent_of(&dir).as_fd(),
-                    owned.as_fd(),
-                    &Work::new(u64::MAX, None)
-                ));
+                assert!(remove_held(&dir, &owned, &Work::new(u64::MAX, None)));
             } else {
                 let listed = schema_files(&dir, owned.as_fd(), &Work::new(u64::MAX, None))?;
                 assert!(listed.is_empty(), "{moment}: {listed:?}");
@@ -3119,6 +3444,306 @@ mod tests {
                 "{moment}: removed outside"
             );
         }
+        Ok(())
+    }
+
+    /// A directory a helper moves out of the output after the probe listed or opened it takes nothing of the
+    /// reading or the removal with it: a file put into it outside is neither read nor removed, whether the move
+    /// comes before an entry is opened or between its parent's opening and its removal (M1T07R-51).
+    #[test]
+    fn a_directory_moved_out_takes_nothing_with_it() -> Result<(), Box<dyn std::error::Error>> {
+        for moment in ["entry", "remove", "take"] {
+            let root = tempfile::tempdir()?;
+            let (out, outside) = (root.path().join("out"), root.path().join("outside"));
+            std::fs::create_dir_all(out.join("v2"))?;
+            std::fs::create_dir(&outside)?;
+            std::fs::write(out.join("v2/a.json"), "{}")?;
+            std::fs::write(out.join("b.json"), "{}")?;
+            std::fs::write(outside.join("secret.json"), "outside")?;
+            let (target, child) = (out.join("v2/a.json"), out.join("v2"));
+            let (escaped, secret) = (outside.join("escaped"), outside.join("secret.json"));
+            let moves = std::rc::Rc::new(std::cell::Cell::new(0));
+            let counted = moves.clone();
+            let (to, from) = (escaped.clone(), secret.clone());
+            BETWEEN.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |at: &str, path: &Path| {
+                    if at == moment && path == target && counted.get() == 0 {
+                        std::fs::rename(&child, &to).expect("move the directory out");
+                        std::fs::rename(&from, to.join("a.json"))
+                            .expect("put a file outside into it");
+                        counted.set(counted.get() + 1);
+                    }
+                }));
+            });
+            let (read, gone) = if moment == "entry" {
+                (
+                    walk(&out, &Work::new(u64::MAX, None))?,
+                    remove(&out, &Work::new(u64::MAX, None)),
+                )
+            } else {
+                (Vec::new(), remove(&out, &Work::new(u64::MAX, None)))
+            };
+            BETWEEN.with(|hook| *hook.borrow_mut() = None);
+            assert_eq!(moves.get(), 1, "{moment}: moved");
+            assert!(
+                read.iter().all(|(_, bytes)| bytes != b"outside"),
+                "{moment}: read the file put outside"
+            );
+            assert_eq!(
+                std::fs::read_to_string(escaped.join("a.json"))?,
+                "outside",
+                "{moment}: the file put outside is not where it was put"
+            );
+            // What stayed under the output went; what left it is the helper's.
+            assert!(gone, "{moment}");
+            assert!(!out.exists(), "{moment}");
+            assert_eq!(
+                std::fs::read_dir(root.path())?.count(),
+                1,
+                "{moment}: a quarantine was left"
+            );
+        }
+        Ok(())
+    }
+
+    /// A directory put in place of the scratch directory between its making and its opening is not taken for it, and
+    /// is left whole (M1T07R-51).
+    #[test]
+    fn a_scratch_directory_replaced_as_it_is_made_is_refused()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let (dir, other, away) = (
+            root.path().join("out"),
+            root.path().join("other"),
+            root.path().join("away"),
+        );
+        std::fs::create_dir(&other)?;
+        std::fs::write(other.join("keep.json"), "{}")?;
+        let swaps = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counted = swaps.clone();
+        let (made, from, to) = (dir.clone(), other.clone(), away.clone());
+        BETWEEN.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |at: &str, path: &Path| {
+                if at == "made" && path == made {
+                    std::fs::rename(&made, &to).expect("move the new directory away");
+                    std::fs::rename(&from, &made).expect("put another in its place");
+                    counted.set(counted.get() + 1);
+                }
+            }));
+        });
+        let made = Scratch::at(
+            dir.clone(),
+            Instant::now() + Duration::from_secs(60),
+            Default::default(),
+            Held::default(),
+        );
+        BETWEEN.with(|hook| *hook.borrow_mut() = None);
+        assert_eq!(swaps.get(), 1);
+        assert!(
+            made.as_ref()
+                .is_err_and(|e| e.to_string().contains("replaced as it was made")),
+            "{:?}",
+            made.as_ref().err()
+        );
+        assert!(
+            dir.join("keep.json").exists(),
+            "the directory put in its place was not left whole"
+        );
+        Ok(())
+    }
+
+    /// An entry is removed only while the probe holds it open, so a file made in its place after it was unlinked
+    /// cannot take its inode and be removed for it; on ext4 (the build directory) a freed inode is reused at once
+    /// (M1T07R-51).
+    #[test]
+    fn a_new_file_with_a_freed_inode_is_not_removed_for_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let build = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
+        std::fs::create_dir_all(&build)?;
+        let root = tempfile::tempdir_in(&build)?;
+        let (out, outside) = (root.path().join("out"), root.path().join("outside"));
+        std::fs::create_dir_all(out.join("d"))?;
+        std::fs::create_dir(&outside)?;
+        std::fs::write(out.join("d/a.json"), "{}")?;
+        let (target, child, escaped) = (out.join("d/a.json"), out.join("d"), outside.join("x"));
+        let fresh = std::rc::Rc::new(std::cell::Cell::new(None));
+        let (seen, to) = (fresh.clone(), escaped.clone());
+        BETWEEN.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |at: &str, path: &Path| {
+                if at == "take" && path == target && seen.get().is_none() {
+                    let before = std::os::unix::fs::MetadataExt::ino(
+                        &std::fs::metadata(path).expect("stat"),
+                    );
+                    std::fs::remove_file(path).expect("unlink it");
+                    std::fs::rename(&child, &to).expect("move its directory out");
+                    std::fs::write(to.join("a.json"), "outside").expect("make a new file there");
+                    let after = std::os::unix::fs::MetadataExt::ino(
+                        &std::fs::metadata(to.join("a.json")).expect("stat"),
+                    );
+                    seen.set(Some(before == after));
+                }
+            }));
+        });
+        let gone = remove(&out, &Work::new(u64::MAX, None));
+        BETWEEN.with(|hook| *hook.borrow_mut() = None);
+        assert_eq!(
+            fresh.get(),
+            Some(false),
+            "the new file took the inode of one the probe held"
+        );
+        assert_eq!(std::fs::read_to_string(escaped.join("a.json"))?, "outside");
+        assert!(gone);
+        Ok(())
+    }
+
+    /// Every entry but the directories is removed before any directory enters the quarantine (M1T07R-51).
+    #[test]
+    fn directories_are_removed_after_everything_else() -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let out = root.path().join("out");
+        for d in ["a", "b/c", "d"] {
+            std::fs::create_dir_all(out.join(d))?;
+            std::fs::write(out.join(d).join("f.json"), "{}")?;
+        }
+        std::os::unix::fs::symlink("/", out.join("b/link"))?;
+        let order = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen = order.clone();
+        BETWEEN.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |at: &str, path: &Path| {
+                if at == "take" {
+                    seen.borrow_mut().push((
+                        path.to_path_buf(),
+                        std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()),
+                    ));
+                }
+            }));
+        });
+        let gone = remove(&out, &Work::new(u64::MAX, None));
+        BETWEEN.with(|hook| *hook.borrow_mut() = None);
+        assert!(gone);
+        let order = order.borrow();
+        let first_directory = order
+            .iter()
+            .position(|(_, dir)| *dir)
+            .ok_or("no directory taken")?;
+        assert!(
+            order[first_directory..].iter().all(|(_, dir)| *dir),
+            "{order:?}"
+        );
+        assert_eq!(order.len(), 9, "{order:?}");
+        Ok(())
+    }
+
+    /// Generation ends with the probe's window, however long making the scratch directory took (M1T07R-54).
+    #[test]
+    fn generation_ends_with_the_window_after_a_slow_scratch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempfile::tempdir()?;
+        let launcher = tmp.path().join("codex");
+        std::fs::write(&launcher, "#!/bin/sh\nexec sleep 30\n")?;
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))?;
+        let stall = tmp.path().join("hoh-test-stall-scratch");
+        std::fs::write(&stall, "")?;
+        let env = ProbeEnv {
+            path: std::env::var_os("PATH").unwrap_or_default(),
+            fixture_root: None,
+            timeout: Duration::from_millis(1500),
+            log: None,
+            deadline: None,
+        };
+        let started = Instant::now();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1000));
+            std::fs::remove_file(stall)
+        });
+        let result = codex_schema(&launcher, &env);
+        let took = started.elapsed();
+        release.join().map_err(|_| "the release panicked")??;
+        assert!(
+            matches!(result, Err(ProbeError::TimedOut { .. })),
+            "{result:?}"
+        );
+        assert!(
+            took < Duration::from_millis(2100),
+            "generation ran past the window: {took:?}"
+        );
+        Ok(())
+    }
+
+    /// What cannot be removed is named where it is when that is said, after the scratch directory or the directory
+    /// holding it moved (M1T07R-52).
+    #[test]
+    fn what_is_left_is_named_where_it_is() -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let (before, after) = (root.path().join("before"), root.path().join("after"));
+        std::fs::create_dir(&before)?;
+        let scratch = Scratch::at(
+            before.join("out"),
+            Instant::now() + Duration::from_secs(60),
+            Default::default(),
+            Held::default(),
+        )?;
+        std::fs::rename(&before, &after)?;
+        let said = scratch.held.may_be_left();
+        assert_eq!(
+            said,
+            format!("it may be left at {}", after.join("out").display())
+        );
+        std::fs::rename(after.join("out"), root.path().join("moved"))?;
+        assert_eq!(
+            scratch.held.may_be_left(),
+            format!("it may be left at {}", root.path().join("moved").display())
+        );
+        drop(scratch);
+        Ok(())
+    }
+
+    /// A probe that gives up while its reading is stalled names the scratch directory where it is then, though the
+    /// CLI moved it after writing (M1T07R-52).
+    #[test]
+    fn a_reading_given_up_names_the_output_where_it_is() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempfile::tempdir()?;
+        let (said, launcher) = (tmp.path().join("out-path"), tmp.path().join("codex"));
+        std::fs::write(
+            &launcher,
+            format!(
+                "#!/bin/sh\necho \"$4\" > '{}.new' && mv '{0}.new' '{0}'\ntouch \"$4/hoh-test-stall-walk\"\n",
+                said.display()
+            ),
+        )?;
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))?;
+        let env = ProbeEnv {
+            path: std::env::var_os("PATH").unwrap_or_default(),
+            fixture_root: None,
+            timeout: Duration::from_millis(500),
+            log: None,
+            deadline: None,
+        };
+        let caller = std::thread::spawn(move || codex_schema(&launcher, &env));
+        let until = Instant::now() + Duration::from_secs(10);
+        while !said.exists() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let dir = PathBuf::from(std::fs::read_to_string(&said)?.trim());
+        // Moved while the reading is stalled at the walk.
+        std::thread::sleep(Duration::from_millis(200));
+        let moved = dir.with_extension("moved");
+        std::fs::rename(&dir, &moved)?;
+        let result = caller.join().map_err(|_| "the caller panicked")?;
+        std::fs::remove_file(moved.join("hoh-test-stall-walk"))?;
+        let detail = match result {
+            Err(ProbeError::Failed { detail, .. }) => detail,
+            other => return Err(format!("{other:?}").into()),
+        };
+        let until = Instant::now() + Duration::from_secs(10);
+        // Released, the reading does nothing more to the output and ends.
+        std::thread::sleep(Duration::from_millis(100));
+        let _ = until;
+        std::fs::remove_dir_all(&moved)?;
+        assert!(
+            detail.contains(&format!("may be left at {}", moved.display())),
+            "{detail}"
+        );
         Ok(())
     }
 
@@ -3336,7 +3961,7 @@ mod tests {
         Ok(())
     }
 
-    /// A mount point is not crossed: `openat2` refuses it, and so does the fallback by device (M1T07R-49). `/dev/shm`
+    /// A mount point is not crossed: `openat2` refuses it (M1T07R-49). `/dev/shm`
     /// is a mount point on Linux; `/dev/null` is on `/dev`'s own file system. Opened as paths, neither is opened.
     #[test]
     fn a_mount_point_is_not_crossed() -> Result<(), Box<dyn std::error::Error>> {
@@ -3348,18 +3973,13 @@ mod tests {
                 .any(|l| l.split(' ').nth(4) == Some("/dev/shm")),
             "/dev/shm is not a mount point here"
         );
-        let dev = open_directory(rustix::fs::CWD, "/dev")?;
-        let flags = OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let dev = held(Path::new("/dev"));
+        let flags = OFlags::PATH | OFlags::NOFOLLOW;
         assert_eq!(
-            open_beneath(dev.as_fd(), "shm", flags).err(),
+            open_beneath(dev.as_fd(), Path::new("shm"), flags).err(),
             Some(rustix::io::Errno::XDEV)
         );
-        assert_eq!(
-            open_on_device(dev.as_fd(), "shm", flags).err(),
-            Some(rustix::io::Errno::XDEV)
-        );
-        assert!(open_beneath(dev.as_fd(), "null", flags).is_ok());
-        assert!(open_on_device(dev.as_fd(), "null", flags).is_ok());
+        assert!(open_beneath(dev.as_fd(), Path::new("null"), flags).is_ok());
         Ok(())
     }
 
@@ -3389,15 +4009,10 @@ mod tests {
         let (parent, owned) = (parent_of(&over), held(&over));
         assert!(!names(
             parent.as_fd(),
-            OsStr::new("hoh-test-mount"),
-            owned.as_fd()
+            Path::new("hoh-test-mount"),
+            inode_of(&owned)
         ));
-        assert!(!remove_within(
-            &over,
-            parent.as_fd(),
-            owned.as_fd(),
-            &Work::new(u64::MAX, None)
-        ));
+        assert!(!remove_held(&over, &owned, &Work::new(u64::MAX, None)));
         assert!(over.exists());
         Ok(())
     }
@@ -3504,12 +4119,20 @@ mod tests {
                     Err(ProbeError::Failed { detail, .. }) => detail,
                     other => return Err(format!("{round} {moment}: {other:?}").into()),
                 };
+                // `it may be left at <scratch>`, with ` (and <quarantine>)` once removal began.
                 let at = detail
                     .split("may be left at ")
                     .nth(1)
                     .ok_or_else(|| format!("{round} {moment}: {detail}"))?;
-                let dir = PathBuf::from(at);
-                left.push((moment, listing(&dir), dir));
+                let (dir, also) = at.split_once(" (and ").unwrap_or((at, ""));
+                for dir in std::iter::once(dir).chain(
+                    also.strip_suffix(')')
+                        .into_iter()
+                        .flat_map(|a| a.split(", ")),
+                ) {
+                    let dir = PathBuf::from(dir);
+                    left.push((moment, listing(&dir), dir));
+                }
             }
             // Stalled: one thread each, and at most the walk's directories, a file, the scratch and its parent.
             let (fds, threads) = (count("/proc/self/fd"), count("/proc/self/task"));
@@ -3543,7 +4166,9 @@ mod tests {
                     gone.is_empty() || (*moment == "remove" && gone == [&stalled]),
                     "{round} {moment}: removed after the probe returned: {gone:?}"
                 );
-                std::fs::remove_dir_all(&dir)?;
+                if dir.exists() {
+                    std::fs::remove_dir_all(&dir)?;
+                }
             }
         }
         let plain = tmp.path().join("codex-plain");
@@ -3581,6 +4206,101 @@ mod tests {
             baseline,
             "file descriptors and threads once the reading ended"
         );
+        // Making the scratch directory stalls (its file system does not answer): the probe returns on time all the
+        // same and starts nothing; released, the work ends and lets everything go (M1T07R-54).
+        let slow = tmp.path().join("slow");
+        std::fs::create_dir(&slow)?;
+        let (launcher, ran) = (slow.join("codex"), slow.join("ran"));
+        std::fs::write(&launcher, format!("#!/bin/sh\ntouch '{}'\n", ran.display()))?;
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))?;
+        let stall = slow.join("hoh-test-stall-scratch");
+        std::fs::write(&stall, "")?;
+        // Released by removing the entry, not by the rounds' release.
+        RELEASE.store(false, std::sync::atomic::Ordering::SeqCst);
+        let started = Instant::now();
+        let result = codex_schema(&launcher, &env);
+        let took = started.elapsed();
+        assert!(
+            took < env.timeout + CLEANUP_GRACE + READER_MARGIN + Duration::from_millis(700),
+            "a stalled scratch: returned after {took:?}"
+        );
+        assert!(
+            matches!(&result, Err(ProbeError::Failed { detail, .. }) if detail.contains("its scratch directory under")),
+            "{result:?}"
+        );
+        assert_eq!(
+            count("/proc/self/task"),
+            baseline.1 + 1,
+            "a stalled scratch: threads"
+        );
+        std::fs::remove_file(&stall)?;
+        let released = Instant::now();
+        while count("/proc/self/task") > baseline.1 && released.elapsed() < Duration::from_secs(10)
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            (count("/proc/self/fd"), count("/proc/self/task")),
+            baseline,
+            "file descriptors and threads once the stalled scratch was released"
+        );
+        assert!(
+            !ran.exists(),
+            "the CLI was started for a probe that had given up"
+        );
+        let mine = format!("hoh-probe-{}-", std::process::id());
+        let left: Vec<_> = std::fs::read_dir(std::env::temp_dir())?
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(&mine))
+            .map(|e| e.path())
+            .collect();
+        assert!(left.is_empty(), "left in the temporary directory: {left:?}");
+        Ok(())
+    }
+
+    /// A command whose output cannot be waited for is not left running: it is killed with its group and reaped
+    /// before the error is returned, whatever the exit (M1T07R-53).
+    #[test]
+    fn a_command_is_ended_on_every_exit() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempfile::tempdir()?;
+        let env = ProbeEnv {
+            path: std::env::var_os("PATH").unwrap_or_default(),
+            fixture_root: None,
+            timeout: Duration::from_secs(5),
+            log: None,
+            deadline: None,
+        };
+        for n in 0..3 {
+            let pidfile = tmp.path().join(format!("pid-{n}"));
+            // Written whole before it appears.
+            let script = format!(
+                "echo $$ > '{0}.new' && mv '{0}.new' '{0}'; exec sleep 30",
+                pidfile.display()
+            );
+            // The wait for its output fails once the command has written its pid.
+            POLL_FAILS.with(|f| *f.borrow_mut() = Some(pidfile.clone()));
+            let started = Instant::now();
+            let result = run_status(Path::new("/bin/sh"), &["-c", &script], &env);
+            POLL_FAILS.with(|f| *f.borrow_mut() = None);
+            assert!(
+                matches!(
+                    result,
+                    Err(ProbeError::Io(_)) | Err(ProbeError::Failed { .. })
+                ),
+                "{n}: {result:?}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "{n}: returned after {:?}",
+                started.elapsed()
+            );
+            let pid = std::fs::read_to_string(&pidfile)?.trim().parse::<i32>()?;
+            // Neither running nor a zombie: no /proc entry is left for it.
+            assert!(
+                !Path::new(&format!("/proc/{pid}")).exists(),
+                "{n}: command {pid} left after the error"
+            );
+        }
         Ok(())
     }
 

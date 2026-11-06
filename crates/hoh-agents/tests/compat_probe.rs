@@ -1548,8 +1548,8 @@ fn schema_output_beyond_its_size_limits_is_refused_before_it_is_read() -> R {
 
 /// The probe reads and removes only the scratch directory it made: a CLI that replaces its `--out` directory by a
 /// link to another is refused and the other keeps every file (M1T07R-44); output the probe cannot remove fails the
-/// probe and names where it is left, whether the reading succeeded or the command timed out, and where it was moved
-/// to when the CLI moved it (M1T07R-45).
+/// probe and names where it is left, whether the reading succeeded or the command timed out: where it is now when the
+/// CLI moved it (M1T07R-45, -52).
 #[test]
 fn schema_output_is_read_and_removed_only_where_the_probe_made_it() -> R {
     let tmp = tempfile::tempdir()?;
@@ -1565,7 +1565,8 @@ fn schema_output_is_read_and_removed_only_where_the_probe_made_it() -> R {
         let out = tmp.path().join(format!("{group}-out.txt"));
         let generate = match group {
             "replaced" => format!(
-                "cp -R '{s}/.' '{e}/' && rmdir \"$4\" && ln -s '{e}' \"$4\"",
+                "echo \"$4\" > '{o}.name' && cp -R '{s}/.' '{e}/' && rmdir \"$4\" && ln -s '{e}' \"$4\"",
+                o = out.display(),
                 s = f.join("app-server-schema").display(),
                 e = elsewhere.display()
             ),
@@ -1611,7 +1612,7 @@ fn schema_output_is_read_and_removed_only_where_the_probe_made_it() -> R {
                     "kept" => "left at".to_owned(),
                     // Where it is now, not where it was made.
                     "moved" => format!(
-                        "left at {} (moved from",
+                        "left at {}",
                         kept.as_ref()
                             .map_err(|e| format!("{group}: {e}"))?
                             .display()
@@ -1626,6 +1627,16 @@ fn schema_output_is_read_and_removed_only_where_the_probe_made_it() -> R {
             other => return Err(format!("{group}: {other:?}").into()),
         }
         assert!(elsewhere.join("keep.txt").exists(), "{group}");
+        // The link put in place of the output directory is removed (never what it names).
+        if group == "replaced" {
+            let name =
+                PathBuf::from(std::fs::read_to_string(format!("{}.name", out.display()))?.trim());
+            assert!(
+                std::fs::symlink_metadata(&name).is_err(),
+                "{group}: {} is left",
+                name.display()
+            );
+        }
         assert!(
             elsewhere.join("ClientRequest.json").exists() || group != "replaced",
             "{group}"
