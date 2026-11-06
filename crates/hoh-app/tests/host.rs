@@ -2011,33 +2011,153 @@ fn a_host_out_of_descriptors_does_not_spin() -> R {
     outcome
 }
 
-/// A stream still replaying ends with the stop, even when its client reads nothing (M2T12R-98).
+/// A host whose writer committed after 200,000 events written outside it: the replay of all of them is due.
+async fn host_with_a_long_replay(dir: &Path) -> R<Host> {
+    let host = Host::start(config(dir)).await?;
+    let script = "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); p=sys.stdin.read().strip(); \
+                  c.executemany(\"INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES (?, ?, NULL, 'test.fill', '{}', '2026-11-06T00:00:00Z')\", \
+                  [(p, 'fill-%d' % i) for i in range(200000)]); c.commit(); c.close()";
+    python(&db(dir), script, &host.project_id)?;
+    // One command through the writer moves the watermark past the filled events.
+    seed_runs(&host, dir, &["r1".to_owned()])?;
+    let reply = call(
+        &To::Tcp(host.port),
+        "POST",
+        "/v1/commands",
+        &host.token,
+        &pause("c1", "k1", "r1", 0, "fill"),
+    )
+    .await?;
+    assert_eq!(reply.status, 202);
+    Ok(host)
+}
+
+/// An SSE request on a new connection, read until the replay has begun.
+async fn replay_begun(host: &Host) -> R<tokio::net::TcpStream> {
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", host.port)).await?;
+    stream
+        .write_all(
+            format!(
+                "GET /v1/events HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nX-HoH-Token: {}\r\n\r\n",
+                host.port, host.token
+            )
+            .as_bytes(),
+        )
+        .await?;
+    let mut buf = vec![0u8; 65536];
+    let mut seen = Vec::new();
+    while !String::from_utf8_lossy(&seen).contains("\"test.fill\"") {
+        let n = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buf)).await??;
+        assert!(n > 0, "the stream closed before replaying");
+        seen.extend_from_slice(&buf[..n]);
+    }
+    Ok(stream)
+}
+
+/// A replaying stream that its client keeps reading ends with the stop at its next step, long before the replay is
+/// done (M2T12R-98, -121).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_replaying_stream_ends_with_the_stop() -> R {
     let dir = tempfile::tempdir()?;
-    let host = Host::start(config(dir.path())).await?;
-    let script = "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); p=sys.stdin.read().strip(); \
-                  c.executemany(\"INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES (?, ?, NULL, 'test.fill', '{}', '2026-11-06T00:00:00Z')\", \
-                  [(p, 'fill-%d' % i) for i in range(60000)]); c.commit(); c.close()";
-    python(&db(dir.path()), script, &host.project_id)?;
-    let mut idle = tokio::net::TcpStream::connect(("127.0.0.1", host.port)).await?;
-    idle.write_all(
-        format!(
-            "GET /v1/events HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nX-HoH-Token: {}\r\n\r\n",
-            host.port, host.token
-        )
-        .as_bytes(),
-    )
-    .await?;
-    // Let the replay fill the socket buffers.
+    let host = host_with_a_long_replay(dir.path()).await?;
+    let mut stream = replay_begun(&host).await?;
+    // A slow reader: the stream keeps being polled, and the replay would take far longer than the grace.
+    let reader = tokio::spawn(async move {
+        let mut buf = vec![0u8; 4096];
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => tokio::time::sleep(Duration::from_millis(2)).await,
+            }
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let started = Instant::now();
+    tokio::time::timeout(Duration::from_secs(15), host.shutdown()).await?;
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "stopped after {:?}",
+        started.elapsed()
+    );
+    tokio::time::timeout(Duration::from_secs(5), reader).await??;
+    Ok(())
+}
+
+/// A replaying stream whose client reads nothing is not polled, so it cannot see the stop: its connection is ended
+/// after the grace (ADR-016 decision 12).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_blocked_stream_is_ended_after_the_grace() -> R {
+    let dir = tempfile::tempdir()?;
+    let host = host_with_a_long_replay(dir.path()).await?;
+    let idle = replay_begun(&host).await?;
     tokio::time::sleep(Duration::from_millis(500)).await;
     let started = Instant::now();
     tokio::time::timeout(Duration::from_secs(15), host.shutdown()).await?;
     assert!(
-        started.elapsed() < Duration::from_secs(2),
+        started.elapsed() < Duration::from_secs(7),
         "stopped after {:?}",
         started.elapsed()
     );
     drop(idle);
+    Ok(())
+}
+
+/// A writer that panics does not let the project go: the lock stays held (until the process ends) while the rest of
+/// its host still runs, so no other host can take over (ADR-016 decision 12, M2T12R-120).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_writer_panic_keeps_the_project_locked() -> R {
+    #[derive(Debug)]
+    struct Panicking;
+    impl FaultHooks for Panicking {
+        fn before_commit(&self) -> Result<(), PersistError> {
+            std::panic::resume_unwind(Box::new("writer panic"));
+        }
+    }
+    let dir = tempfile::tempdir()?;
+    let mut panicking = config(dir.path());
+    panicking.store.faults = Arc::new(Panicking);
+    let host = Host::start(panicking).await?;
+    seed_runs(&host, dir.path(), &["r1".to_owned()])?;
+    let to = To::Tcp(host.port);
+    let reply = call(
+        &to,
+        "POST",
+        "/v1/commands",
+        &host.token,
+        &pause("c1", "k1", "r1", 0, "boom"),
+    )
+    .await?;
+    assert_eq!(reply.status, 503, "{reply:?}");
+    let refused = Host::start(config(dir.path()))
+        .await
+        .err()
+        .ok_or("another host took over")?;
+    assert_eq!(refused.exit_code, 69, "{refused}");
+    host.shutdown().await;
+    let still = Host::start(config(dir.path()))
+        .await
+        .err()
+        .ok_or("the lock went with the panic")?;
+    assert_eq!(still.exit_code, 69, "{still}");
+    Ok(())
+}
+
+/// A stopping host removes only its own host.json (by its token) and the socket it bound (by inode): files another
+/// host put there are left (M2T12R-120).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stopping_host_removes_only_its_own_files() -> R {
+    let dir = tempfile::tempdir()?;
+    let host = Host::start(config(dir.path())).await?;
+    let files = dir.path().join(".hoh");
+    std::fs::write(files.join("host.json"), r#"{"token": "another host's"}"#)?;
+    std::fs::remove_file(&host.socket)?;
+    let other = std::os::unix::net::UnixListener::bind(&host.socket)?;
+    host.shutdown().await;
+    assert_eq!(
+        std::fs::read_to_string(files.join("host.json"))?,
+        r#"{"token": "another host's"}"#
+    );
+    assert!(files.join("host.sock").exists());
+    drop(other);
     Ok(())
 }

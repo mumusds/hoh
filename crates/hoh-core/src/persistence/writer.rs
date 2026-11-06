@@ -138,6 +138,19 @@ enum Job {
     ),
 }
 
+/// What the writer holds until it ends (a host's project lock). If the thread unwinds from a panic instead, what it
+/// holds is leaked, not dropped: a lock stays held until the process ends rather than letting the project go while the
+/// rest of its host still runs (ADR-016 decision 12, M2T12R-120).
+struct Kept(Vec<Box<dyn std::any::Any + Send>>);
+
+impl Drop for Kept {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            std::mem::forget(std::mem::take(&mut self.0));
+        }
+    }
+}
+
 /// Test-only fault injection inside the writer.
 #[cfg(test)]
 #[derive(Debug, Clone, Copy)]
@@ -221,7 +234,7 @@ impl Writer {
             .name("hoh-db-writer".to_owned())
             .spawn(move || {
                 // Ends when every handle is gone and every queued request is done.
-                let mut kept: Vec<Box<dyn std::any::Any + Send>> = Vec::new();
+                let mut kept = Kept(Vec::new());
                 while let Some(job) = rx.blocking_recv() {
                     before();
                     match job {
@@ -244,7 +257,7 @@ impl Writer {
                             let _ = reply.send(super::pragmas(&conn));
                         }
                         Job::Keep(held, reply) => {
-                            kept.push(held);
+                            kept.0.push(held);
                             let _ = reply.send(Ok(()));
                         }
                         Job::EnsureProject(id, repo, reply) => {
