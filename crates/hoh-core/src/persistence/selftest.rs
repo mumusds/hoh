@@ -298,7 +298,7 @@ pub fn probe_main() -> i32 {
         Path::new(&db),
         std::io::stdin().lock(),
         std::io::stdout().lock(),
-        ChildFault::default(),
+        &NormalProbe,
     ) {
         Ok(()) => 0,
         Err(e) => {
@@ -308,25 +308,37 @@ pub fn probe_main() -> i32 {
     }
 }
 
-/// Misbehaviour of the probe process, for tests; the product runs it with the default (none).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(super) struct ChildFault {
-    /// Open without file locking (`nolock=1`).
-    pub(super) nolock: bool,
-    /// Keep answering the first row count, as with a wal-index that is not shared.
-    pub(super) stale_counts: bool,
-    /// Claim the write lock without taking it, as with file locks that do nothing.
-    pub(super) fake_lock: bool,
-    /// Get past our write lock but take its own for real, as with locks seen in one direction only.
-    pub(super) ignore_held_lock: bool,
+/// How the probe process acts at each point where a broken file system would show. The product's is
+/// [`NormalProbe`], which only uses these defaults; the misbehaving ones that stand in for broken file systems are
+/// test code (CR-006).
+pub(super) trait ProbeBehaviour {
+    /// Open the database.
+    fn open(&self, db: &Path) -> rusqlite::Result<Connection> {
+        Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_WRITE)
+    }
+
+    /// The row count to answer, given the count read now and the first one answered.
+    fn count(&self, now: i64, _first: i64) -> i64 {
+        now
+    }
+
+    /// An answer that stands for the probe's own to `command`, if any.
+    fn answer(&self, _command: &str, _conn: &Connection) -> Option<String> {
+        None
+    }
 }
+
+/// The product's probe: the protocol as it is.
+pub(super) struct NormalProbe;
+
+impl ProbeBehaviour for NormalProbe {}
 
 /// The probe's side of the protocol.
 pub(super) fn probe_child(
     db: &Path,
     input: impl BufRead,
     mut output: impl Write,
-    fault: ChildFault,
+    behaviour: &dyn ProbeBehaviour,
 ) -> Result<(), String> {
     let mut conn: Option<Connection> = None;
     let mut first_count = None;
@@ -334,15 +346,9 @@ pub(super) fn probe_child(
         let line = line.map_err(|e| e.to_string())?;
         let command = line.trim();
         let answer = if command == "open" {
-            let opened = if fault.nolock {
-                Connection::open_with_flags(
-                    format!("file:{}?nolock=1", uri_path(db)),
-                    OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI,
-                )
-            } else {
-                Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_WRITE)
-            };
-            let opened = opened.and_then(|c| c.busy_timeout(Duration::ZERO).map(|()| c));
+            let opened = behaviour
+                .open(db)
+                .and_then(|c| c.busy_timeout(Duration::ZERO).map(|()| c));
             match opened {
                 Ok(c) => {
                     conn = Some(c);
@@ -357,45 +363,37 @@ pub(super) fn probe_child(
             let Some(c) = conn.as_ref() else {
                 return Err(format!("`{command}` before `open`"));
             };
-            match command {
-                "count" => match count(c) {
-                    Ok(n) => {
-                        let n = if fault.stale_counts {
-                            *first_count.get_or_insert(n)
-                        } else {
-                            n
-                        };
-                        format!("count {n}")
-                    }
-                    Err(e) => format!("error {e}"),
-                },
-                "try-lock" if fault.fake_lock || fault.ignore_held_lock => "acquired".to_owned(),
-                "hold" if fault.fake_lock => "held".to_owned(),
-                "insert-commit" if fault.fake_lock => {
-                    match c.execute_batch("INSERT INTO t VALUES (3);") {
+            if let Some(answer) = behaviour.answer(command, c) {
+                answer
+            } else {
+                match command {
+                    "count" => match count(c) {
+                        Ok(n) => {
+                            let first = *first_count.get_or_insert(n);
+                            format!("count {}", behaviour.count(n, first))
+                        }
+                        Err(e) => format!("error {e}"),
+                    },
+                    "try-lock" => match c.execute_batch("BEGIN IMMEDIATE") {
+                        Ok(()) => {
+                            let _ = c.execute_batch("ROLLBACK");
+                            "acquired".to_owned()
+                        }
+                        Err(e) if e.sqlite_error_code() == Some(ErrorCode::DatabaseBusy) => {
+                            "busy".to_owned()
+                        }
+                        Err(e) => format!("error {e}"),
+                    },
+                    "hold" => match c.execute_batch("BEGIN IMMEDIATE") {
+                        Ok(()) => "held".to_owned(),
+                        Err(e) => format!("error {e}"),
+                    },
+                    "insert-commit" => match c.execute_batch("INSERT INTO t VALUES (3); COMMIT;") {
                         Ok(()) => "committed".to_owned(),
                         Err(e) => format!("error {e}"),
-                    }
+                    },
+                    other => format!("error unknown command `{other}`"),
                 }
-                "try-lock" => match c.execute_batch("BEGIN IMMEDIATE") {
-                    Ok(()) => {
-                        let _ = c.execute_batch("ROLLBACK");
-                        "acquired".to_owned()
-                    }
-                    Err(e) if e.sqlite_error_code() == Some(ErrorCode::DatabaseBusy) => {
-                        "busy".to_owned()
-                    }
-                    Err(e) => format!("error {e}"),
-                },
-                "hold" => match c.execute_batch("BEGIN IMMEDIATE") {
-                    Ok(()) => "held".to_owned(),
-                    Err(e) => format!("error {e}"),
-                },
-                "insert-commit" => match c.execute_batch("INSERT INTO t VALUES (3); COMMIT;") {
-                    Ok(()) => "committed".to_owned(),
-                    Err(e) => format!("error {e}"),
-                },
-                other => format!("error unknown command `{other}`"),
             }
         };
         writeln!(output, "{REPLY}{answer}")
@@ -403,20 +401,6 @@ pub(super) fn probe_child(
             .map_err(|e| e.to_string())?;
     }
     Ok(())
-}
-
-/// A path for a `file:` URI: `%`, `?` and `#` percent-encoded.
-fn uri_path(path: &Path) -> String {
-    let mut out = String::new();
-    for c in path.to_string_lossy().chars() {
-        match c {
-            '%' => out.push_str("%25"),
-            '?' => out.push_str("%3f"),
-            '#' => out.push_str("%23"),
-            c => out.push(c),
-        }
-    }
-    out
 }
 
 /// The probe for tests: this test binary running only `probe_helper`, with `fault` passed in the environment.
@@ -446,6 +430,67 @@ mod tests {
 
     pub(super) const FAULT_ENV: &str = "HOH_WAL_PROBE_TEST_FAULT";
 
+    /// Opens without file locking (`nolock=1`).
+    struct NoLock;
+
+    impl ProbeBehaviour for NoLock {
+        fn open(&self, db: &Path) -> rusqlite::Result<Connection> {
+            Connection::open_with_flags(
+                format!("file:{}?nolock=1", uri_path(db)),
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI,
+            )
+        }
+    }
+
+    /// Keeps answering the first row count, as with a wal-index that is not shared.
+    struct StaleCounts;
+
+    impl ProbeBehaviour for StaleCounts {
+        fn count(&self, _now: i64, first: i64) -> i64 {
+            first
+        }
+    }
+
+    /// Claims the write lock without taking it, as with file locks that do nothing.
+    struct FakeLock;
+
+    impl ProbeBehaviour for FakeLock {
+        fn answer(&self, command: &str, conn: &Connection) -> Option<String> {
+            match command {
+                "try-lock" => Some("acquired".to_owned()),
+                "hold" => Some("held".to_owned()),
+                "insert-commit" => Some(match conn.execute_batch("INSERT INTO t VALUES (3);") {
+                    Ok(()) => "committed".to_owned(),
+                    Err(e) => format!("error {e}"),
+                }),
+                _ => None,
+            }
+        }
+    }
+
+    /// Gets past our write lock but takes its own for real, as with locks seen in one direction only.
+    struct OneWayLock;
+
+    impl ProbeBehaviour for OneWayLock {
+        fn answer(&self, command: &str, _conn: &Connection) -> Option<String> {
+            (command == "try-lock").then(|| "acquired".to_owned())
+        }
+    }
+
+    /// A path for a `file:` URI: `%`, `?` and `#` percent-encoded.
+    fn uri_path(path: &Path) -> String {
+        let mut out = String::new();
+        for c in path.to_string_lossy().chars() {
+            match c {
+                '%' => out.push_str("%25"),
+                '?' => out.push_str("%3f"),
+                '#' => out.push_str("%23"),
+                c => out.push(c),
+            }
+        }
+        out
+    }
+
     fn leftovers(dir: &Path) -> Vec<String> {
         std::fs::read_dir(dir)
             .map(|entries| {
@@ -463,31 +508,34 @@ mod tests {
         let Some(db) = std::env::var_os(PROBE_DB_ENV) else {
             return Ok(());
         };
-        let fault = match std::env::var(FAULT_ENV).as_deref() {
-            Ok("nolock") => ChildFault {
-                nolock: true,
-                ..ChildFault::default()
-            },
-            Ok("stale") => ChildFault {
-                stale_counts: true,
-                ..ChildFault::default()
-            },
-            Ok("fake-lock") => ChildFault {
-                fake_lock: true,
-                ..ChildFault::default()
-            },
-            Ok("one-way-lock") => ChildFault {
-                ignore_held_lock: true,
-                ..ChildFault::default()
-            },
-            _ => ChildFault::default(),
+        let behaviour: &dyn ProbeBehaviour = match std::env::var(FAULT_ENV).as_deref() {
+            Ok("nolock") => &NoLock,
+            Ok("stale") => &StaleCounts,
+            Ok("fake-lock") => &FakeLock,
+            Ok("one-way-lock") => &OneWayLock,
+            _ => &NormalProbe,
         };
         probe_child(
             Path::new(&db),
             std::io::stdin().lock(),
             std::io::stdout().lock(),
-            fault,
+            behaviour,
         )
+    }
+
+    /// The product's probe answers as the protocol says: its count as read, no answer of its own (CR-006).
+    #[test]
+    fn the_product_probe_follows_the_protocol() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let db = dir.path().join("p.db");
+        // The self-test makes the database; the probe only opens it.
+        drop(Connection::open(&db)?);
+        let conn = NormalProbe.open(&db)?;
+        assert_eq!(NormalProbe.count(5, 3), 5);
+        for command in ["try-lock", "hold", "insert-commit", "count"] {
+            assert_eq!(NormalProbe.answer(command, &conn), None, "{command}");
+        }
+        Ok(())
     }
 
     #[test]
