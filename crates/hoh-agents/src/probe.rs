@@ -310,6 +310,12 @@ thread_local! {
 /// amount, however often it is used (M1T07R-40). The recorded 0.166.0 schema's longest is 54 bytes.
 const MAX_NAME: usize = 256;
 
+/// The largest App Server schema output the probe reads: a file, all files, the number of files (the recorded 0.166.0
+/// output is 321 files, 3.7 MB in all, the largest 750 KB); beyond them it is refused before parsing (M1T07R-40).
+const MAX_SCHEMA_FILE: u64 = 16 * 1024 * 1024;
+const MAX_SCHEMA_TOTAL: u64 = 64 * 1024 * 1024;
+const MAX_SCHEMA_FILES: usize = 4096;
+
 /// The longest number token the probe reads; longer ones are refused, so reading one is bounded (M1T07R-42). The
 /// recorded 0.166.0 schema's longest is 3 characters.
 const MAX_NUMBER: usize = 64;
@@ -381,6 +387,15 @@ fn draft7_well_formed(root: &serde_json::Value, work: &Work) -> Result<(), Strin
         let root = path.is_empty();
         for (key, v) in obj {
             path.push(Step::Key(key));
+            // An array or string a keyword walks costs its length (M1T07R-40).
+            let length = match (key.as_str(), v) {
+                ("required" | "type", Value::Array(items)) => items.len(),
+                ("$ref", Value::String(target)) => target.len(),
+                _ => 0,
+            };
+            if !work.spend(length) {
+                return Err(format!("{}: not read within the time limit", render(path)));
+            }
             let ok = match key.as_str() {
                 "$schema" => root && v == DRAFT_07,
                 "definitions" => root,
@@ -468,52 +483,82 @@ fn draft7_well_formed(root: &serde_json::Value, work: &Work) -> Result<(), Strin
 /// [names]}, ...}}` with optional `title`/`description`. Any other shape rejects the whole file, so malformed output
 /// never yields a capability (M1T01R-15, -18, -23, -27).
 ///
-/// What the probe does not interpret cannot narrow the methods (M1T07R-32): in a file of what HoH sends (`sent`:
+/// What the probe does not interpret cannot narrow the methods (M1T07R-32); `Err` when the file was not read within
+/// `work` (M1T07R-40): in a file of what HoH sends (`sent`:
 /// ClientRequest.json, ClientNotification.json) the root has no `properties`, which would constrain HoH's messages; in
 /// ServerNotification.json the root `properties` may describe other fields (0.166.0: `emittedAtMs`) but not `method`;
 /// and no method is listed by two branches, which `oneOf` would refuse.
 fn schema_methods(
     value: &serde_json::Value,
     sent: bool,
-) -> Option<std::collections::BTreeSet<String>> {
+    work: &Work,
+) -> Result<Option<std::collections::BTreeSet<String>>, ()> {
     use serde_json::Value;
-    let root = value.as_object()?;
+    let Some(root) = value.as_object() else {
+        return Ok(None);
+    };
     let root_ok = root.iter().all(|(k, v)| match k.as_str() {
         "$schema" | "definitions" | "title" | "description" | "oneOf" => true,
         "properties" => !sent && v.get("method").is_none(),
         _ => false,
     });
-    let variants = root.get("oneOf")?.as_array().filter(|v| !v.is_empty())?;
+    let Some(variants) = root
+        .get("oneOf")
+        .and_then(Value::as_array)
+        .filter(|v| !v.is_empty())
+    else {
+        return Ok(None);
+    };
     let mut methods = std::collections::BTreeSet::new();
     for branch in variants {
-        let branch = branch.as_object()?;
+        let Some(branch) = branch.as_object() else {
+            return Ok(None);
+        };
         let branch_ok = branch.iter().all(|(key, v)| match key.as_str() {
             "type" => v == "object",
             "required" | "properties" | "title" | "description" => true,
             _ => false,
         });
-        let method = branch.get("properties")?.get("method")?.as_object()?;
+        let Some(method) = branch
+            .get("properties")
+            .and_then(|p| p.get("method"))
+            .and_then(Value::as_object)
+        else {
+            return Ok(None);
+        };
         let method_ok = method.get("type").is_some_and(|t| t == "string")
             && method
                 .keys()
                 .all(|k| matches!(k.as_str(), "type" | "enum" | "title" | "description"));
-        let names = method.get("enum")?.as_array().filter(|a| !a.is_empty())?;
+        let Some(names) = method
+            .get("enum")
+            .and_then(Value::as_array)
+            .filter(|a| !a.is_empty())
+        else {
+            return Ok(None);
+        };
+        // Each branch and each of its names cost a step (M1T07R-40).
+        if !work.spend(names.len() + 1) {
+            return Err(());
+        }
         if !root_ok || !branch_ok || !method_ok || !names.iter().all(Value::is_string) {
-            return None;
+            return Ok(None);
         }
         for name in names.iter().filter_map(Value::as_str) {
             if !methods.insert(name.to_owned()) {
-                return None;
+                return Ok(None);
             }
         }
     }
-    Some(methods)
+    Ok(Some(methods))
 }
 
-/// The `oneOf` branch of a protocol schema file listing each method, in one pass (the known form lists a method once).
-fn branches_by_method(
-    file: &serde_json::Value,
-) -> std::collections::HashMap<&str, &serde_json::Value> {
+/// The `oneOf` branch of a protocol schema file listing each method, in one pass (the known form lists a method once),
+/// a step per method.
+fn branches_by_method<'a>(
+    file: &'a serde_json::Value,
+    work: &Work,
+) -> std::collections::HashMap<&'a str, &'a serde_json::Value> {
     let mut branches = std::collections::HashMap::new();
     for branch in file["oneOf"].as_array().into_iter().flatten() {
         for name in branch["properties"]["method"]["enum"]
@@ -522,6 +567,10 @@ fn branches_by_method(
             .flatten()
             .filter_map(serde_json::Value::as_str)
         {
+            // Past the deadline a method has no branch, so a request is not kept (M1T07R-40).
+            if !work.spend(1) {
+                return branches;
+            }
             branches.insert(name, branch);
         }
     }
@@ -1014,9 +1063,28 @@ pub fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<CodexSchema, Prob
         // The checks before validation are linear in the files; only the deadline bounds them, each file's bytes
         // counted before it is parsed (M1T07R-40, -42).
         let checks = Work::new(u64::MAX, until);
+        // Bounded before anything is read, so parsing and hashing are bounded too (M1T07R-40).
+        let files = files_under(&dir)?;
+        if files.len() > MAX_SCHEMA_FILES {
+            return Err(unusable(format!(
+                "too many schema files: {} (at most {MAX_SCHEMA_FILES})",
+                files.len()
+            )));
+        }
+        let mut total = 0u64;
+        for file in &files {
+            let size = std::fs::metadata(file)?.len();
+            total += size;
+            if size > MAX_SCHEMA_FILE || total > MAX_SCHEMA_TOTAL {
+                return Err(unusable(format!(
+                    "the schema output is too large: {} is {size} bytes, {total} in all (at most {MAX_SCHEMA_FILE} a file, {MAX_SCHEMA_TOTAL} in all)",
+                    file.display()
+                )));
+            }
+        }
         let mut parsed = BTreeMap::new();
         let mut texts = BTreeMap::new();
-        for file in files_under(&dir)? {
+        for file in files {
             if file.extension().is_some_and(|e| e == "json") {
                 let bytes = std::fs::read(&file)?;
                 if !checks.spend(bytes.len()) {
@@ -1055,18 +1123,20 @@ pub fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<CodexSchema, Prob
                 }
                 _ => {}
             }
-            let listed = schema_methods(value, sent).ok_or_else(|| {
-                unusable(format!(
-                    "{name} does not list its methods in the known form"
-                ))
-            })?;
+            let listed = schema_methods(value, sent, &checks)
+                .map_err(|()| unusable(format!("{name} was not read within the time limit")))?
+                .ok_or_else(|| {
+                    unusable(format!(
+                        "{name} does not list its methods in the known form"
+                    ))
+                })?;
             let open = params_open(value);
             let empty = serde_json::Map::new();
             let defs = open
                 .get("definitions")
                 .and_then(serde_json::Value::as_object)
                 .unwrap_or(&empty);
-            let branches = branches_by_method(&open);
+            let branches = branches_by_method(&open, &checks);
             Ok::<_, ProbeError>(
                 listed
                     .into_iter()
@@ -2008,7 +2078,10 @@ mod tests {
             let value: serde_json::Value = serde_json::from_str(&text)?;
             let open = params_open(&value);
             let defs = open["definitions"].as_object().cloned().unwrap_or_default();
-            for method in schema_methods(&value, sent).ok_or("not the known form")? {
+            for method in schema_methods(&value, sent, &Work::new(u64::MAX, None))
+                .map_err(|()| "out of time")?
+                .ok_or("not the known form")?
+            {
                 let envelope = match name {
                     "ClientRequest.json" => {
                         serde_json::json!({"id": 0, "method": method, "params": {}})
@@ -2022,7 +2095,7 @@ mod tests {
                     "{name} {method}"
                 );
                 if sent && name == "ClientRequest.json" {
-                    let branches = branches_by_method(&open);
+                    let branches = branches_by_method(&open, &Work::new(u64::MAX, None));
                     let id = &branches.get(method.as_str()).ok_or("no branch")?["properties"]["id"];
                     assert!(takes_every_id(id, &defs, 0, &work), "{method}");
                 }
@@ -2105,6 +2178,36 @@ mod tests {
         assert!(
             draft7_well_formed(&bad, &Work::new(u64::MAX, None))
                 .is_err_and(|e| e.starts_with("/definitions/D/anyOf/1/not"))
+        );
+    }
+
+    /// Every array a check walks costs its length: a large `required` array, a long type list, a method enum or many
+    /// branches reach the deadline too (M1T07R-40, round 13).
+    #[test]
+    fn array_walks_before_validation_reach_the_deadline() {
+        let past = Some(Instant::now() - Duration::from_secs(1));
+        let names: Vec<String> = (0..100_000).map(|n| format!("n{n}")).collect();
+        let required =
+            serde_json::json!({"definitions": {"D": {"required": names}}, "oneOf": [true]});
+        assert!(draft7_well_formed(&required, &Work::new(u64::MAX, None)).is_ok());
+        assert!(
+            draft7_well_formed(&required, &Work::new(u64::MAX, past))
+                .is_err_and(|e| e.contains("time limit"))
+        );
+        let types = serde_json::json!({"type": vec!["string"; 100_000]});
+        assert!(
+            draft7_well_formed(&types, &Work::new(u64::MAX, past))
+                .is_err_and(|e| e.contains("time limit"))
+        );
+        let methods: Vec<String> = (0..100_000).map(|n| format!("m{n}")).collect();
+        let file = serde_json::json!({"oneOf": [{"type": "object", "properties": {"method": {"type": "string", "enum": methods}}}]});
+        assert!(
+            schema_methods(&file, false, &Work::new(u64::MAX, None))
+                .is_ok_and(|m| m.is_some_and(|m| m.len() == 100_000))
+        );
+        assert_eq!(
+            schema_methods(&file, false, &Work::new(u64::MAX, past)),
+            Err(())
         );
     }
 }
