@@ -96,7 +96,8 @@ async fn pi_live_turns_resume_and_cancel() -> R {
         resume: false,
         provider: None,
         model: None,
-        settled_event: true,
+        // The same rule as doctor --live: the event only for a recorded version (M1R-06, M1R-07).
+        settled_event: pi::emits_settled(Some(&entry.cli_version)),
         capabilities: entry.capabilities.clone(),
     };
     let turn = |prompt: &str, logs: &str, resume: bool| {

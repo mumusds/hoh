@@ -240,12 +240,15 @@ fn the_noted_session_files_are_the_regular_ones() {
 /// with `get_state` (ADR-013 decision 3), which ends a turn on `agent_settled` too (M1R-06).
 #[test]
 fn only_a_recorded_version_is_trusted_to_send_agent_settled() {
-    let recorded = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../tests/fixtures/protocol/pi/1.5.0/rpc-prompt/stdout.jsonl"
-    ))
-    .expect("recorded traffic");
-    assert!(recorded.contains("\"agent_settled\""));
+    // Every version trusted has recorded traffic with the event (M1R-09).
+    for version in SETTLED_EVENT_VERSIONS {
+        let recorded = std::fs::read_to_string(format!(
+            "{}/../../tests/fixtures/protocol/pi/{version}/rpc-prompt/stdout.jsonl",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .expect("recorded traffic");
+        assert!(recorded.contains("\"agent_settled\""), "{version}");
+    }
     assert!(emits_settled(Some("1.5.0")));
     assert!(emits_settled(Some("1.5.0\n")));
     for other in [

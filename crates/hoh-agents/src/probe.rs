@@ -2409,18 +2409,9 @@ fn tree_sha256_from(root: &Path, digests: &[(PathBuf, String)]) -> io::Result<St
     Ok(hex(&Sha256::digest(lines.concat().as_bytes())))
 }
 
+/// The adapters' streaming hash, one helper for both (M1R-10).
 fn file_sha256(path: &Path) -> io::Result<String> {
-    let mut file = std::fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 1 << 16];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(hex(&hasher.finalize()))
+    crate::adapter::sha256_file(path)
 }
 
 fn hex(bytes: &[u8]) -> String {
