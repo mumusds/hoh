@@ -1780,6 +1780,78 @@
   },
   {
    "schema": "protocol",
+   "def": "SchedulerSettings",
+   "valid": true,
+   "note": "scheduler settings, all members (CR-007)",
+   "instance": {
+    "weights": {
+     "user_value": 4,
+     "unblock_value": 3,
+     "risk_reduction": 3,
+     "information_gain": 2
+    },
+    "max_wait_rounds": 20
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "SchedulerSettings",
+   "valid": true,
+   "note": "scheduler settings, one member (CR-007)",
+   "instance": {
+    "max_wait_rounds": 1
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "SchedulerSettings",
+   "valid": false,
+   "note": "minProperties: scheduler settings (CR-007)",
+   "instance": {}
+  },
+  {
+   "schema": "protocol",
+   "def": "SchedulerSettings",
+   "valid": false,
+   "note": "minimum: scheduler weight (CR-007)",
+   "instance": {
+    "weights": {
+     "information_gain": -1
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "SchedulerSettings",
+   "valid": false,
+   "note": "maximum: max_wait_rounds (CR-007)",
+   "instance": {
+    "max_wait_rounds": 1001
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "SchedulerSettings",
+   "valid": false,
+   "note": "additionalProperties: scheduler weights (CR-007)",
+   "instance": {
+    "weights": {
+     "user_value": 4,
+     "cost": 1
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "SchedulerSettings",
+   "valid": false,
+   "note": "type: max_wait_rounds (CR-007)",
+   "instance": {
+    "max_wait_rounds": 20.5
+   }
+  },
+  {
+   "schema": "protocol",
    "def": "Command",
    "valid": false,
    "note": "enum: approval decision",

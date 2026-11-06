@@ -71,4 +71,6 @@ REQ-018 decisions 5、REQ-037 decisions、REQ-038 decisions 中相应补记（�
 
 ## 审查记录
 
-（待独立 Review）
+- 第 1 轮（Codex，会话 01a1b30c-690d-7462-82b9-5b9596587160）：FAIL。D1 四条均判定满足（ConfigureTeam 扩展不需所有者批准；对任何已存在的 Run 返回 409 与 REQ-038 一致；三个新码都有必要；current_revision=null 可以接受）。
+  - CR7-01（high）：新定义 SchedulerSettings 没有直接语料，bundle 的定义覆盖测试必然失败（relock 之后才会显出来）。已补七条 `def: SchedulerSettings` 的有效与无效语料。
+  - CR7-02（medium）：五个新整数字段未用 `crate::integer::option`，schema 合法的 `20.0`、`1e1` 解码失败。已改用它，并在整值浮点测试中覆盖这五个字段。

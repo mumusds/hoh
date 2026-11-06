@@ -10,7 +10,7 @@ use hoh_core::protocol::{
     ErrorCode, Event, HandoffKind, InputKind, Message, MessageKind, Mode, PlanProposal,
     RejectionReason, RunResult, RunState, SpecDecision, TaskResult, TaskState, TaskStatus,
 };
-use hoh_core::protocol::{ArtifactRef, Command};
+use hoh_core::protocol::{ArtifactRef, Command, SchedulerSettings};
 use hoh_core::schema;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -62,6 +62,7 @@ fn every_corpus_document_round_trips_or_is_rejected() -> R {
             "ArtifactRef" => check::<ArtifactRef>(case)?,
             "Candidate" => check::<Candidate>(case)?,
             "RunResult" => check::<RunResult>(case)?,
+            "SchedulerSettings" => check::<SchedulerSettings>(case)?,
             _ => continue,
         };
         seen += 1;
@@ -271,6 +272,33 @@ fn integral_floats_decode_like_integers() -> R {
     raw["tasks"][0]["user_value"] = serde_json::json!(5.0);
     let decoded: PlanProposal = protocol::decode(&raw)?;
     assert_eq!(decoded.tasks[0].user_value, Some(5));
+    // CR7-02: the scheduler settings of ConfigureTeam (CR-007) take integral floats too.
+    let configure = cases
+        .iter()
+        .find(|c| c["note"] == "ConfigureTeam with scheduler only (CR-007)")
+        .ok_or("configure")?;
+    let mut team_raw = configure["instance"].clone();
+    team_raw["payload"]["scheduler"] = serde_json::json!({
+        "weights": {"user_value": 1.0, "unblock_value": 10.0, "risk_reduction": 0.0, "information_gain": 2e0},
+        "max_wait_rounds": 2e1
+    });
+    let team_command: Command = protocol::decode(&team_raw)?;
+    let protocol::CommandBody::ConfigureTeam(team) = &team_command.body else {
+        return Err("not a ConfigureTeam".into());
+    };
+    let scheduler = team.scheduler.as_ref().ok_or("no scheduler")?;
+    let weights = scheduler.weights.as_ref().ok_or("no weights")?;
+    assert_eq!(
+        (
+            weights.user_value,
+            weights.unblock_value,
+            weights.risk_reduction,
+            weights.information_gain,
+            scheduler.max_wait_rounds
+        ),
+        (Some(1), Some(10), Some(0), Some(2), Some(20))
+    );
+    assert!(schema::json_eq(&protocol::encode(&team_command)?, &team_raw));
     // Schema-valid but not representable: an error, never a panic or a silent truncation.
     raw["tasks"][0]["user_value"] = serde_json::json!(5);
     let mut event_raw = event["instance"].clone();
