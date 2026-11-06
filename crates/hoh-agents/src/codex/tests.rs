@@ -41,7 +41,7 @@ fn app_server_runs_on_stdio_when_the_help_offers_it() {
         Ok(vec!["app-server".to_owned()])
     );
     // A --listen that does not list stdio:// cannot start a stdio App Server, and the probe says so (M1T07R-27).
-    for other in ["pipe://", "stdio:///socket"] {
+    for other in ["pipe://", "stdio:///socket", "stdio://[::1]"] {
         let no_stdio = help("help-app-server.txt").replace("stdio://", other);
         assert!(app_server_args(&no_stdio).is_err(), "{other}");
         assert!(app_server_launch_missing(&no_stdio).is_some(), "{other}");
