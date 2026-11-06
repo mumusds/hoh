@@ -17,6 +17,8 @@ const WRITER_QUEUE: usize = 256;
 const READERS: usize = 4;
 /// Unix socket paths longer than this do not fit `sockaddr_un`.
 const SOCKET_PATH_MAX: usize = 107;
+/// How long a stopping host waits for its connections to finish before it ends them (M2T12R-01).
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// What a host serves and how.
 #[derive(Clone, Debug)]
@@ -188,20 +190,25 @@ impl Host {
                 socket.display()
             )));
         }
-        remove_stale_socket(&socket)?;
-        let unix = tokio::net::UnixListener::bind(&socket)
-            .map_err(|e| StartError::other(format!("cannot bind {}: {e}", socket.display())))?;
-        set_mode(&socket, 0o600)?;
+        // The port first: a port in use leaves no socket behind (M2T12R-08).
         let tcp = tokio::net::TcpListener::bind(("127.0.0.1", config.port))
             .await
             .map_err(|e| {
                 StartError::other(format!("cannot bind 127.0.0.1:{}: {e}", config.port))
             })?;
+        remove_stale_socket(&socket)?;
+        let unix = tokio::net::UnixListener::bind(&socket)
+            .map_err(|e| StartError::other(format!("cannot bind {}: {e}", socket.display())))?;
+        if let Err(e) = set_mode(&socket, 0o600) {
+            let _ = std::fs::remove_file(&socket);
+            return Err(e);
+        }
         let port = tcp
             .local_addr()
             .map_err(|e| StartError::other(e.to_string()))?
             .port();
         let token = token()?;
+        let (stop, stopped) = tokio::sync::watch::channel(false);
         let shared = Arc::new(http::Shared {
             store,
             readers: Mutex::new(readers),
@@ -209,13 +216,13 @@ impl Host {
             token: token.clone(),
             port,
             hooks: config.hooks.clone(),
+            stop: stopped.clone(),
         });
-        let (stop, stopped) = tokio::sync::watch::channel(false);
-        let served = vec![
+        let mut served = vec![
             tokio::spawn(http::serve_tcp(tcp, shared.clone(), stopped.clone())),
             tokio::spawn(http::serve_unix(unix, shared.clone(), stopped)),
         ];
-        write_host_json(
+        let written = write_host_json(
             &files,
             &serde_json::json!({
                 "pid": std::process::id(),
@@ -225,7 +232,14 @@ impl Host {
                 "socket": socket,
                 "token": token,
             }),
-        )?;
+        );
+        if let Err(e) = written {
+            // Stop serving before the lock goes with the error (M2T12R-08).
+            let _ = stop.send(true);
+            drain(&mut served).await;
+            let _ = std::fs::remove_file(&socket);
+            return Err(e);
+        }
         Ok(Host {
             project_id: started.project_id,
             host_epoch: started.host_epoch,
@@ -262,14 +276,29 @@ impl Host {
         })
     }
 
-    /// Stop serving, then remove `host.json` and the socket; the lock and the database stay.
-    pub async fn shutdown(self) {
+    /// Stop serving (event streams end, connections get [`SHUTDOWN_GRACE`] to finish and are then ended), then
+    /// remove `host.json` and the socket; the lock and the database stay.
+    pub async fn shutdown(mut self) {
         let _ = self.stop.send(true);
-        for task in self.served {
-            let _ = task.await;
-        }
+        drain(&mut self.served).await;
         let _ = std::fs::remove_file(self.files.join("host.json"));
         let _ = std::fs::remove_file(&self.socket);
+    }
+}
+
+/// Wait for the serving tasks, at most [`SHUTDOWN_GRACE`]; then end what is left (a connection that never sent a
+/// whole request, M2T12R-01).
+async fn drain(served: &mut [tokio::task::JoinHandle<()>]) {
+    let waited = tokio::time::timeout(SHUTDOWN_GRACE, async {
+        for task in served.iter_mut() {
+            let _ = task.await;
+        }
+    })
+    .await;
+    if waited.is_err() {
+        for task in served.iter() {
+            task.abort();
+        }
     }
 }
 

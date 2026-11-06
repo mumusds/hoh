@@ -31,6 +31,8 @@ pub(super) struct Shared {
     pub(super) token: String,
     pub(super) port: u16,
     pub(super) hooks: Arc<dyn HostHooks>,
+    /// Becomes true when the host stops: event streams end then, so the connections can finish (M2T12R-01).
+    pub(super) stop: tokio::sync::watch::Receiver<bool>,
 }
 
 /// Which listener a request came through.
@@ -49,6 +51,8 @@ fn routes(shared: Arc<Shared>, via: Via) -> Router {
         .route("/v1/runs/{run_id}", get(get_run))
         .route("/v1/events", get(stream_events))
         .route("/healthz", get(health))
+        .fallback(no_route)
+        .method_not_allowed_fallback(no_route)
         .layer(middleware::from_fn_with_state(
             (shared.clone(), via),
             check_request,
@@ -101,6 +105,23 @@ fn error(
     (status, axum::Json(body)).into_response()
 }
 
+/// Anything else: an Error body too (M2T12R-03).
+async fn no_route() -> Response {
+    error(
+        StatusCode::NOT_FOUND,
+        "NOT_FOUND",
+        "no such route or method",
+        false,
+        None,
+    )
+}
+
+/// A store failure's own text goes to the host's stderr, never to a client (ADR-016 decision 6, M2T12R-02).
+fn log(detail: &str) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "hoh host: {detail}");
+}
+
 fn forbidden(message: &str) -> Response {
     error(StatusCode::FORBIDDEN, "FORBIDDEN", message, false, None)
 }
@@ -123,20 +144,35 @@ async fn check_request(
     next: Next,
 ) -> Response {
     let headers = request.headers();
-    let origin = headers.get(header::ORIGIN);
+    let origins: Vec<&HeaderValue> = headers.get_all(header::ORIGIN).iter().collect();
+    // More than one Origin is refused, and so is a request target naming any authority (M2T12R-05).
+    if origins.len() > 1 {
+        return forbidden("more than one Origin");
+    }
+    let authority = request.uri().authority().map(|a| a.as_str().to_owned());
     match via {
         Via::Tcp => {
             let bound = format!("127.0.0.1:{}", shared.port);
-            if headers.get(header::HOST).and_then(|h| h.to_str().ok()) != Some(bound.as_str()) {
+            let hosts: Vec<&HeaderValue> = headers.get_all(header::HOST).iter().collect();
+            if hosts.len() != 1 || hosts[0].to_str().ok() != Some(bound.as_str()) {
                 return forbidden("the Host header is not the host's loopback address");
             }
-            if origin.is_some_and(|o| o.to_str().ok() != Some(format!("http://{bound}").as_str())) {
+            if authority.is_some_and(|a| a != bound) {
+                return forbidden("the request target names another authority");
+            }
+            if origins
+                .first()
+                .is_some_and(|o| o.to_str().ok() != Some(format!("http://{bound}").as_str()))
+            {
                 return forbidden("the Origin is not the host's loopback address");
             }
         }
         Via::Unix => {
-            if origin.is_some() {
+            if !origins.is_empty() {
                 return forbidden("requests on the socket carry no Origin");
+            }
+            if authority.is_some() {
+                return forbidden("the request target names an authority");
             }
         }
     }
@@ -204,7 +240,12 @@ async fn store_error(shared: &Arc<Shared>, run_id: &str, e: PersistError) -> Res
         } => error(
             StatusCode::CONFLICT,
             "STALE_REVISION",
-            format!("expected revision {expected}, the run is at {actual:?}"),
+            match actual {
+                Some(actual) => {
+                    format!("expected revision {expected}, the run is at revision {actual}")
+                }
+                None => format!("expected revision {expected}, the run has no revision"),
+            },
             false,
             actual,
         ),
@@ -236,26 +277,44 @@ async fn store_error(shared: &Arc<Shared>, run_id: &str, e: PersistError) -> Res
             true,
             current_revision(shared, run_id).await,
         ),
-        PersistError::IntegrityViolation(detail) => error(
-            StatusCode::CONFLICT,
-            "CONFLICT",
-            format!("the command violates a database constraint: {detail}"),
-            false,
-            current_revision(shared, run_id).await,
-        ),
-        other => error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "UNPROCESSABLE",
-            format!("the command could not be applied: {other}"),
-            false,
-            None,
-        ),
+        PersistError::IntegrityViolation(detail) => {
+            log(&detail);
+            error(
+                StatusCode::CONFLICT,
+                "CONFLICT",
+                "the command conflicts with stored data (its command_id may be used by another command)",
+                false,
+                current_revision(shared, run_id).await,
+            )
+        }
+        other => {
+            log(&other.to_string());
+            error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "UNPROCESSABLE",
+                "the store could not apply the request",
+                false,
+                None,
+            )
+        }
     }
 }
 
 /// `POST /v1/commands` (openapi `submitCommand`). PauseRun is applied; the other kinds come with their tasks and are
 /// refused as not yet supported, with nothing written.
-async fn submit_command(State(shared): State<Arc<Shared>>, body: axum::body::Bytes) -> Response {
+async fn submit_command(
+    State(shared): State<Arc<Shared>>,
+    body: Result<axum::body::Bytes, axum::extract::rejection::BytesRejection>,
+) -> Response {
+    let Ok(body) = body else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "the request body could not be read (too large or broken)",
+            false,
+            None,
+        );
+    };
     let value: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(e) => {
@@ -377,7 +436,20 @@ fn accepted(result_json: String, replayed: bool) -> Response {
 }
 
 /// `GET /v1/runs/{run_id}` (openapi `getRun`): the run with the watermark it was read at.
-async fn get_run(State(shared): State<Arc<Shared>>, UrlPath(run_id): UrlPath<String>) -> Response {
+async fn get_run(
+    State(shared): State<Arc<Shared>>,
+    run_id: Result<UrlPath<String>, axum::extract::rejection::PathRejection>,
+) -> Response {
+    // A run id that is not text names no run (openapi getRun answers 404, M2T12R-03).
+    let Ok(UrlPath(run_id)) = run_id else {
+        return error(
+            StatusCode::NOT_FOUND,
+            "RUN_NOT_FOUND",
+            "no run has that id",
+            false,
+            None,
+        );
+    };
     let wanted = run_id.clone();
     match read(&shared, move |reader| reader.snapshot(&wanted)).await {
         Ok(Some((run, watermark))) => (
@@ -433,9 +505,19 @@ fn event_json(event: &EventRow) -> Value {
 /// once, in seq order, and nothing that did not commit.
 async fn stream_events(
     State(shared): State<Arc<Shared>>,
-    Query(query): Query<EventsQuery>,
+    query: Result<Query<EventsQuery>, axum::extract::rejection::QueryRejection>,
     headers: HeaderMap,
 ) -> Response {
+    // A cursor or filter that cannot be read is answered within openapi's codes for streamEvents: 409 (M2T12R-03).
+    let Ok(Query(query)) = query else {
+        return error(
+            StatusCode::CONFLICT,
+            "CONFLICT",
+            "after must be a non-negative event seq; run_id and kinds must be text",
+            false,
+            None,
+        );
+    };
     let last_id = headers
         .get("last-event-id")
         .and_then(|v| v.to_str().ok())
@@ -443,8 +525,8 @@ async fn stream_events(
     let after = match (query.after, last_id) {
         (_, Some(Err(_))) => {
             return error(
-                StatusCode::BAD_REQUEST,
-                "BAD_REQUEST",
+                StatusCode::CONFLICT,
+                "CONFLICT",
                 "Last-Event-ID is not an event seq",
                 false,
                 None,
@@ -465,9 +547,9 @@ async fn stream_events(
     };
     if after < 0 {
         return error(
-            StatusCode::BAD_REQUEST,
-            "BAD_REQUEST",
-            "after must not be negative",
+            StatusCode::CONFLICT,
+            "CONFLICT",
+            "after must be a non-negative event seq",
             false,
             None,
         );
@@ -478,6 +560,7 @@ async fn stream_events(
     let mut watermark = shared.store.watermark();
     let high = *watermark.borrow_and_update();
     let state = Stream_ {
+        stop: shared.stop.clone(),
         shared,
         watermark,
         cursor: after,
@@ -494,6 +577,8 @@ async fn stream_events(
 /// Where one SSE stream stands.
 struct Stream_ {
     shared: Arc<Shared>,
+    /// The host's stop: the stream ends with it.
+    stop: tokio::sync::watch::Receiver<bool>,
     watermark: tokio::sync::watch::Receiver<i64>,
     /// The last seq read from the database.
     cursor: i64,
@@ -542,8 +627,16 @@ fn events(state: Stream_) -> impl Stream<Item = Result<SseEvent, Infallible>> {
                 }
                 continue;
             }
-            if s.watermark.changed().await.is_err() {
+            if *s.stop.borrow() {
                 return None;
+            }
+            tokio::select! {
+                changed = s.watermark.changed() => {
+                    if changed.is_err() {
+                        return None;
+                    }
+                }
+                _ = stopped(s.stop.clone()) => return None,
             }
             s.target = *s.watermark.borrow_and_update();
         }

@@ -261,7 +261,16 @@ struct Subscriber {
 
 impl Subscriber {
     async fn connect(to: To, token: &str, path: &str) -> R<Subscriber> {
-        let request = request_bytes(&to, "GET", path, Some(token), &[], b"");
+        Self::connect_with(to, token, path, &[]).await
+    }
+
+    async fn connect_with(
+        to: To,
+        token: &str,
+        path: &str,
+        extra: &[(&str, &str)],
+    ) -> R<Subscriber> {
+        let request = request_bytes(&to, "GET", path, Some(token), extra, b"");
         let seen = Arc::new(Mutex::new(Vec::new()));
         let into = seen.clone();
         let stream: Box<dyn AsyncReadWrite> = match &to {
@@ -603,13 +612,37 @@ async fn test_041_04_retry_after_disconnect_returns_first_result() -> R {
     let body = pause("c1", "K", "r1", 0, "X");
     let lost = send(&to, "POST", "/v1/commands", Some(&host.token), &[], &body).await?;
     assert!(lost.is_none(), "a response came: {lost:?}");
+    // Before any retry: the first request committed (its command, result, event and the run's move are there).
+    let stored_text = scalar(
+        dir.path(),
+        "SELECT result_json FROM commands WHERE idempotency_key = 'K'",
+    )?;
+    let stored: Value = serde_json::from_str(&stored_text)?;
+    assert_eq!(
+        (&stored["command_id"], &stored["revision"]),
+        (&json!("c1"), &json!(1)),
+        "{stored}"
+    );
+    assert_eq!(
+        scalar(
+            dir.path(),
+            "SELECT count(*) FROM events WHERE json_extract(payload_json, '$.command_id') = 'c1'"
+        )?,
+        "1"
+    );
+    assert_eq!(
+        scalar(
+            dir.path(),
+            "SELECT state || ' ' || revision FROM runs WHERE run_id = 'r1'"
+        )?,
+        "PAUSE_REQUESTED 1"
+    );
     dropping.0.store(false, Ordering::SeqCst);
     let retry = call(&to, "POST", "/v1/commands", &host.token, &body).await?;
     assert_eq!(retry.status, 202, "{retry:?}");
-    let stored: Value = serde_json::from_str(&scalar(
-        dir.path(),
-        "SELECT result_json FROM commands WHERE idempotency_key = 'K'",
-    )?)?;
+    // The retry is the first result replayed, byte for byte.
+    assert_eq!(retry.header("idempotent-replayed"), Some("true"));
+    assert_eq!(String::from_utf8(retry.body.clone())?, stored_text);
     let retried = retry.json()?;
     assert_eq!(
         (&retried["command_id"], &retried["revision"]),
@@ -750,7 +783,7 @@ async fn test_062_02_queue_8_under_4000_commands_loses_nothing() -> R {
         let (to, token) = (to.clone(), host.token.clone());
         clients.push(tokio::spawn(async move {
             let mut accepted = Vec::new();
-            let mut retryable = 0usize;
+            let mut retryable = Vec::new();
             for n in 0..500 {
                 let run = format!("run-{}", client * 500 + n);
                 let id = format!("cmd-{client}-{n}");
@@ -767,34 +800,51 @@ async fn test_062_02_queue_8_under_4000_commands_loses_nothing() -> R {
                     return Err(format!("a client saw SQLITE_BUSY: {text}").into());
                 }
                 match reply.status {
-                    202 => accepted.push(id),
-                    503 if reply.json()?["retryable"] == true => retryable += 1,
+                    202 => accepted.push(
+                        json!({"id": id, "run": run, "body": text, "client": client, "n": n}),
+                    ),
+                    503 if reply.json()?["retryable"] == true => {
+                        retryable.push(json!({"id": id, "run": run}))
+                    }
                     other => return Err(format!("{id}: {other} {text}").into()),
                 }
             }
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>((accepted, retryable))
         }));
     }
-    let mut accepted = Vec::new();
-    let mut answered = 0;
+    let (mut accepted, mut retried) = (Vec::new(), Vec::new());
     for client in clients {
-        let (ids, retryable) = client.await??;
-        answered += ids.len() + retryable;
-        accepted.extend(ids);
+        let (ok, again) = client.await??;
+        accepted.extend(ok);
+        retried.extend(again);
     }
-    assert_eq!(answered, 4000);
-    // Each accepted command: one event and one outbox row; seqs unique and increasing.
-    let check = "import sqlite3,sys,json; c=sqlite3.connect(sys.argv[1]); ids=[l.strip() for l in sys.stdin if l.strip()]; \
-                 ev={r[0]: r[1] for r in c.execute(\"SELECT json_extract(payload_json,'$.command_id'), count(*) FROM events GROUP BY 1\")}; \
-                 ob={r[0]: r[1] for r in c.execute(\"SELECT json_extract(payload_json,'$.command_id'), count(*) FROM outbox GROUP BY 1\")}; \
+    assert_eq!(accepted.len() + retried.len(), 4000);
+    // Each 202: its command row with the exact result returned, the run moved to that revision, one event and one
+    // outbox row pointing at it. Each retryable answer: nothing written, the run unchanged. Seqs are unique, and the
+    // commands one client sent one after another got increasing seqs (commit order is seq order, M2T12R-06).
+    let check = "import sqlite3,sys,json; c=sqlite3.connect(sys.argv[1]); d=json.load(sys.stdin); \
+                 cmd={r[0]: r[1:] for r in c.execute('SELECT command_id, run_id, result_json FROM commands')}; \
+                 run={r[0]: r[1:] for r in c.execute('SELECT run_id, state, revision FROM runs')}; \
+                 ev={}; [ev.setdefault(r[0], []).append(r[1]) for r in c.execute(\"SELECT json_extract(payload_json,'$.command_id'), seq FROM events\")]; \
+                 ob={}; [ob.setdefault(r[0], []).append(r[1]) for r in c.execute(\"SELECT json_extract(payload_json,'$.command_id'), event_seq FROM outbox\")]; \
                  seqs=[r[0] for r in c.execute('SELECT seq FROM events ORDER BY rowid')]; \
-                 print(json.dumps({'missing_event': sum(1 for i in ids if ev.get(i,0)!=1), 'missing_outbox': sum(1 for i in ids if ob.get(i,0)!=1), \
-                 'events': len(seqs), 'increasing': all(a<b for a,b in zip(seqs, seqs[1:])), 'unique': len(set(seqs))==len(seqs)}))";
-    let summary: Value =
-        serde_json::from_str(&python(&db(dir.path()), check, &accepted.join("\n"))?)?;
+                 ok=d['accepted']; no=d['retried']; \
+                 print(json.dumps({'commands': len(cmd), \
+                   'missing_command': sum(1 for a in ok if a['id'] not in cmd), \
+                   'result_differs': sum(1 for a in ok if a['id'] in cmd and (cmd[a['id']][0]!=a['run'] or cmd[a['id']][1]!=a['body'])), \
+                   'run_not_moved': sum(1 for a in ok if tuple(run.get(a['run'], ())) != ('PAUSE_REQUESTED', json.loads(a['body'])['revision'])), \
+                   'events_not_one': sum(1 for a in ok if len(ev.get(a['id'], []))!=1), \
+                   'outbox_not_its_event': sum(1 for a in ok if ob.get(a['id'], []) != ev.get(a['id'], [None])), \
+                   'retried_wrote': sum(1 for a in no if a['id'] in cmd or a['id'] in ev or tuple(run.get(a['run'], ())) != ('CREATED', 0)), \
+                   'events': len(seqs), 'unique': len(set(seqs))==len(seqs), \
+                   'client_order': all(all(x<y for x,y in zip(l, l[1:])) for l in [[ev[a['id']][0] for a in sorted((a for a in ok if a['client']==k and len(ev.get(a['id'], []))==1), key=lambda a: a['n'])] for k in range(8)])}))";
+    let input = json!({"accepted": accepted, "retried": retried}).to_string();
+    let summary: Value = serde_json::from_str(&python(&db(dir.path()), check, &input)?)?;
     assert_eq!(
         summary,
-        json!({"missing_event": 0, "missing_outbox": 0, "events": accepted.len(), "increasing": true, "unique": true})
+        json!({"commands": accepted.len(), "missing_command": 0, "result_differs": 0, "run_not_moved": 0,
+               "events_not_one": 0, "outbox_not_its_event": 0, "retried_wrote": 0,
+               "events": accepted.len(), "unique": true, "client_order": true})
     );
     host.shutdown().await;
     Ok(())
@@ -859,8 +909,17 @@ fn test_062_04_network_fs_refused_and_no_db_files() -> R {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_062_06_wal_self_test_failure_refuses_start() -> R {
     let dir = tempfile::tempdir()?;
-    let p4 = dir.path().join("p4");
+    // /p4 on ext4, as the Given says (the temporary directory may be tmpfs, M2T12R-07).
+    let ext4 = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))?;
+    let p4 = ext4.path().canonicalize()?.join("p4");
     std::fs::create_dir(&p4)?;
+    let mounts = std::fs::read_to_string("/proc/self/mountinfo")?;
+    assert_eq!(
+        location::check(&p4, &mounts),
+        Ok(Some("ext4".to_owned())),
+        "{}",
+        p4.display()
+    );
     let host = Host::start(config(&p4)).await?;
     seed_runs(&host, &p4, &["r1".to_owned()])?;
     let to = To::Tcp(host.port);
@@ -885,6 +944,9 @@ async fn test_062_06_wal_self_test_failure_refuses_start() -> R {
         assert_ne!(code, 0, "{name}: {stderr}");
         assert!(stderr.contains("DB_WAL_UNSUPPORTED"), "{name}: {stderr}");
         assert_eq!(db_files(&project), Vec::<String>::new(), "{name}");
+        // Nothing was served: no socket, no host.json.
+        assert!(!project.join(".hoh/host.sock").exists(), "{name}");
+        assert!(!project.join(".hoh/host.json").exists(), "{name}");
     }
     Ok(())
 }
@@ -1308,6 +1370,347 @@ async fn events_follow_the_openapi_contract() -> R {
     assert_eq!(conflict.status, 409, "{conflict:?}");
     conforms(&error, &conflict.json()?)?;
     drop((subscriber, filtered));
+    host.shutdown().await;
+    Ok(())
+}
+
+/// A host stops with event streams open and a connection that never sent a whole request: the streams end, the
+/// connections get the grace, host.json and the socket go, and the lock is free again (M2T12R-01).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_stops_with_subscribers_and_half_requests() -> R {
+    let dir = tempfile::tempdir()?;
+    // Event streams end with the stop itself, well before the grace (M2T12R-01).
+    let host = Host::start(config(dir.path())).await?;
+    let tcp = Subscriber::connect(To::Tcp(host.port), &host.token, "/v1/events").await?;
+    let unix =
+        Subscriber::connect(To::Unix(host.socket.clone()), &host.token, "/v1/events").await?;
+    let socket = host.socket.clone();
+    let started = Instant::now();
+    tokio::time::timeout(Duration::from_secs(15), host.shutdown()).await?;
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "stopped after {:?}",
+        started.elapsed()
+    );
+    assert!(!socket.exists());
+    assert!(!dir.path().join(".hoh/host.json").exists());
+    drop((tcp, unix));
+    // A connection that never sends a whole request is ended after the grace; the lock is free again.
+    let host = Host::start(config(dir.path())).await?;
+    assert_eq!(host.host_epoch, 2);
+    let mut half = tokio::net::TcpStream::connect(("127.0.0.1", host.port)).await?;
+    half.write_all(
+        format!(
+            "GET /v1/runs/r1 HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n",
+            host.port
+        )
+        .as_bytes(),
+    )
+    .await?;
+    let started = Instant::now();
+    tokio::time::timeout(Duration::from_secs(15), host.shutdown()).await?;
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "stopped after {:?}",
+        started.elapsed()
+    );
+    assert!(!dir.path().join(".hoh/host.json").exists());
+    let next = Host::start(config(dir.path())).await?;
+    next.shutdown().await;
+    drop(half);
+    Ok(())
+}
+
+/// A host process ends on SIGTERM though a client is subscribed, and removes host.json and the socket.
+#[test]
+fn a_host_process_ends_on_sigterm_with_a_subscriber() -> R {
+    let dir = tempfile::tempdir()?;
+    let mut child = Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "host_child",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env(CHILD_PROJECT, dir.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let host_json = dir.path().join(".hoh/host.json");
+    let end = Instant::now() + Duration::from_secs(30);
+    while !host_json.exists() && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let info: Value = serde_json::from_str(&std::fs::read_to_string(&host_json)?)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let subscriber = runtime.block_on(Subscriber::connect(
+        To::Unix(PathBuf::from(info["socket"].as_str().ok_or("no socket")?)),
+        info["token"].as_str().ok_or("no token")?,
+        "/v1/events",
+    ))?;
+    let pid = rustix::process::Pid::from_raw(i32::try_from(child.id())?).ok_or("no pid")?;
+    rustix::process::kill_process(pid, rustix::process::Signal::TERM)?;
+    let end = Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() > end {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("the host did not end on SIGTERM".into());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    drop(subscriber);
+    assert_eq!(status.code(), Some(0));
+    assert!(!host_json.exists());
+    assert!(!dir.path().join(".hoh/host.sock").exists());
+    Ok(())
+}
+
+/// What a running host leaves for its clients (ADR-016 decision 1): host.json readable by the owner only, written
+/// whole, naming the pid, project, epoch, port, socket and token; the socket also 0600; a second host in the project
+/// exits 69 naming the holder (M2T12R-04).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_leaves_its_files_and_holds_the_project() -> R {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir()?;
+    let host = Host::start(config(dir.path())).await?;
+    let files = dir.path().join(".hoh");
+    let mode = |path: &Path| std::fs::metadata(path).map(|m| m.permissions().mode() & 0o777);
+    assert_eq!(mode(&files.join("host.json"))?, 0o600);
+    assert_eq!(mode(&host.socket)?, 0o600);
+    let info: Value = serde_json::from_str(&std::fs::read_to_string(files.join("host.json"))?)?;
+    assert_eq!(
+        info,
+        json!({"pid": std::process::id(), "project_id": host.project_id, "host_epoch": host.host_epoch,
+               "port": host.port, "socket": host.socket, "token": host.token})
+    );
+    assert_eq!(host.token.len(), 64);
+    let leftovers: Vec<String> = std::fs::read_dir(&files)?
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("host.json."))
+        .collect();
+    assert_eq!(leftovers, Vec::<String>::new());
+    let second = Host::start(config(dir.path())).await;
+    let refused = second.err().ok_or("a second host started")?;
+    assert_eq!(refused.exit_code, 69, "{refused}");
+    assert!(
+        refused
+            .message
+            .contains(&format!("pid {}", std::process::id())),
+        "{refused}"
+    );
+    host.shutdown().await;
+    Ok(())
+}
+
+/// A socket left by a host that did not clean up is removed at the next start; a file that is not a socket is left
+/// and the start refused (ADR-016 decision 1, M2T12R-04).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_socket_is_replaced_and_anything_else_is_left() -> R {
+    let dir = tempfile::tempdir()?;
+    let files = dir.path().join(".hoh");
+    std::fs::create_dir_all(&files)?;
+    drop(std::os::unix::net::UnixListener::bind(
+        files.join("host.sock"),
+    )?);
+    assert!(files.join("host.sock").exists());
+    let host = Host::start(config(dir.path())).await?;
+    let reply = call(
+        &To::Unix(host.socket.clone()),
+        "GET",
+        "/healthz",
+        &host.token,
+        b"",
+    )
+    .await?;
+    assert_eq!(reply.status, 200);
+    host.shutdown().await;
+    std::fs::write(files.join("host.sock"), "not a socket")?;
+    let refused = Host::start(config(dir.path()))
+        .await
+        .err()
+        .ok_or("started over a file")?;
+    assert!(refused.message.contains("is not a socket"), "{refused}");
+    assert_eq!(
+        std::fs::read_to_string(files.join("host.sock"))?,
+        "not a socket"
+    );
+    assert!(!files.join("host.json").exists());
+    Ok(())
+}
+
+/// More of the request checks (M2T12R-04, -05): the loopback Origin passes; /healthz checks Host; a second Host or
+/// Origin, and a request target naming another authority, are refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_request_checks_hold_at_their_edges() -> R {
+    let dir = tempfile::tempdir()?;
+    let host = Host::start(config(dir.path())).await?;
+    seed_runs(&host, dir.path(), &["r1".to_owned()])?;
+    let to = To::Tcp(host.port);
+    let loopback = format!("http://127.0.0.1:{}", host.port);
+    let ok = send(
+        &to,
+        "GET",
+        "/v1/runs/r1",
+        Some(&host.token),
+        &[("Origin", &loopback)],
+        b"",
+    )
+    .await?
+    .ok_or("no response")?;
+    assert_eq!(ok.status, 200, "{ok:?}");
+    let raw = |text: String| {
+        let port = host.port;
+        async move {
+            let bytes = exchange(
+                tokio::net::TcpStream::connect(("127.0.0.1", port)).await?,
+                text.into_bytes(),
+            )
+            .await?;
+            parse(&bytes)?
+                .ok_or_else(|| Box::<dyn std::error::Error + Send + Sync>::from("no response"))
+        }
+    };
+    let bound = format!("127.0.0.1:{}", host.port);
+    for request in [
+        "GET /healthz HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n".to_owned(),
+        format!(
+            "GET /v1/runs/r1 HTTP/1.1\r\nHost: {bound}\r\nHost: evil.example\r\nX-HoH-Token: {}\r\nConnection: close\r\n\r\n",
+            host.token
+        ),
+        format!(
+            "GET /v1/runs/r1 HTTP/1.1\r\nHost: {bound}\r\nOrigin: {loopback}\r\nOrigin: http://evil.example\r\nX-HoH-Token: {}\r\nConnection: close\r\n\r\n",
+            host.token
+        ),
+        format!(
+            "GET http://evil.example/v1/runs/r1 HTTP/1.1\r\nHost: {bound}\r\nX-HoH-Token: {}\r\nConnection: close\r\n\r\n",
+            host.token
+        ),
+    ] {
+        let reply = raw(request.clone()).await?;
+        assert_eq!(reply.status, 403, "{request:?}: {reply:?}");
+        assert_eq!(reply.json()?["code"], "FORBIDDEN");
+    }
+    host.shutdown().await;
+    Ok(())
+}
+
+/// Malformed requests get Error bodies with the contract's codes, and no database text reaches a client
+/// (M2T12R-02, -03): a bad cursor is 409, a run id that is not text 404, an oversized body 400, an unknown route 404,
+/// a command_id another command used 409 CONFLICT with a fixed message; and a resume by Last-Event-ID alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn malformed_requests_get_error_bodies() -> R {
+    let dir = tempfile::tempdir()?;
+    let host = Host::start(config(dir.path())).await?;
+    seed_runs(&host, dir.path(), &["r1".to_owned(), "r2".to_owned()])?;
+    let to = To::Tcp(host.port);
+    let error = openapi_schema("/components/schemas/Error")?;
+    let big = vec![b' '; 3 << 20];
+    for (method, path, body, status, code) in [
+        (
+            "GET",
+            "/v1/events?after=abc",
+            b"".as_slice(),
+            409,
+            "CONFLICT",
+        ),
+        (
+            "GET",
+            "/v1/events?after=99999999999999999999",
+            b"".as_slice(),
+            409,
+            "CONFLICT",
+        ),
+        (
+            "GET",
+            "/v1/events?after=-1",
+            b"".as_slice(),
+            409,
+            "CONFLICT",
+        ),
+        ("GET", "/v1/runs/%FF", b"".as_slice(), 404, "RUN_NOT_FOUND"),
+        ("POST", "/v1/commands", big.as_slice(), 400, "BAD_REQUEST"),
+        ("GET", "/v1/nothing", b"".as_slice(), 404, "NOT_FOUND"),
+        ("DELETE", "/v1/runs/r1", b"".as_slice(), 404, "NOT_FOUND"),
+    ] {
+        let reply = call(&to, method, path, &host.token, body).await?;
+        assert_eq!(reply.status, status, "{method} {path}: {reply:?}");
+        let body = reply.json()?;
+        conforms(&error, &body)?;
+        assert_eq!(body["code"], code, "{method} {path}: {body}");
+    }
+    let bad_id = send(
+        &to,
+        "GET",
+        "/v1/events",
+        Some(&host.token),
+        &[("Last-Event-ID", "x")],
+        b"",
+    )
+    .await?
+    .ok_or("no response")?;
+    assert_eq!(bad_id.status, 409, "{bad_id:?}");
+    // The same command_id under another key: refused without the database's text.
+    let first = call(
+        &to,
+        "POST",
+        "/v1/commands",
+        &host.token,
+        &pause("dup", "ka", "r1", 0, "a"),
+    )
+    .await?;
+    assert_eq!(first.status, 202);
+    let clash = call(
+        &to,
+        "POST",
+        "/v1/commands",
+        &host.token,
+        &pause("dup", "kb", "r2", 0, "b"),
+    )
+    .await?;
+    assert_eq!(clash.status, 409, "{clash:?}");
+    let text = String::from_utf8_lossy(&clash.body).into_owned();
+    conforms(&error, &clash.json()?)?;
+    assert_eq!(clash.json()?["code"], "CONFLICT");
+    for database_text in ["UNIQUE", "constraint", "commands.", "SQLITE", "sqlite"] {
+        assert!(!text.contains(database_text), "{text}");
+    }
+    assert_eq!(
+        scalar(dir.path(), "SELECT state FROM runs WHERE run_id = 'r2'")?,
+        "CREATED"
+    );
+    // Resuming by Last-Event-ID alone: only what came after it.
+    let first_seq = scalar(dir.path(), "SELECT max(seq) FROM events")?;
+    let resumed = Subscriber::connect_with(
+        to.clone(),
+        &host.token,
+        "/v1/events",
+        &[("Last-Event-ID", &first_seq)],
+    )
+    .await?;
+    let next = call(
+        &to,
+        "POST",
+        "/v1/commands",
+        &host.token,
+        &pause("c2", "k2", "r2", 0, "next"),
+    )
+    .await?;
+    assert_eq!(next.status, 202);
+    assert!(
+        until(Duration::from_secs(5), || resumed.events().len() == 1).await,
+        "{:?}",
+        resumed.events()
+    );
+    assert_eq!(resumed.events()[0].1["run_id"], "r2");
+    drop(resumed);
     host.shutdown().await;
     Ok(())
 }
