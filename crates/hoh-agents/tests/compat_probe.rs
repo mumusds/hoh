@@ -1345,6 +1345,115 @@ fn a_method_whose_envelope_cannot_be_valid_is_absent() -> R {
     Ok(())
 }
 
+/// A schema number the probe cannot read exactly refuses the file: an integer beyond 64 bits, or a decimal whose parsed
+/// value is another decimal (`1e-400` reads as 0). Numbers that read back as written (`0.7`, `0`) are fine
+/// (M1T07R-39).
+#[test]
+fn a_schema_number_that_cannot_be_read_exactly_refuses_the_file() -> R {
+    let tmp = tempfile::tempdir()?;
+    let f = fixtures().join("codex/0.166.0");
+    for (group, number, refused) in [
+        ("underflow", "1e-400", true),
+        ("rounded-up", "0.99999999999999999", true),
+        ("beyond-64-bits", "18446744073709551616", true),
+        ("half-past-2-53", "9007199254740993.5", true),
+        ("a-tenth", "0.7", false),
+        ("zero", "0", false),
+    ] {
+        let schema = tmp.path().join(group);
+        std::fs::create_dir(&schema)?;
+        let copied = std::process::Command::new("cp")
+            .arg("-R")
+            .arg(f.join("app-server-schema/."))
+            .arg(&schema)
+            .status()?;
+        assert!(copied.success());
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(schema.join("ClientRequest.json"))?)?;
+        value["definitions"]["RequestId"] = serde_json::json!({"anyOf": [{"type": "string"}, {"type": "integer", "minimum": "NUMBER"}]});
+        // The number as written, not as serde_json would print it.
+        let text = serde_json::to_string_pretty(&value)?.replace("\"NUMBER\"", number);
+        std::fs::write(schema.join("ClientRequest.json"), text)?;
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n --help) cat '{f}/help.txt';;\n \
+             exec) [ \"$2\" = --help ] && cat '{f}/help-exec.txt';;\n \
+             app-server) case \"$2\" in\n  --help) cat '{f}/help-app-server.txt';;\n  generate-json-schema) [ \"$3\" = --out ] && mkdir -p \"$4\" && cp -R '{s}/.' \"$4/\";;\n  \
+             *) exit 2;;\n esac;;\n *) exit 2;;\nesac\n",
+            f = f.display(),
+            s = schema.display()
+        );
+        let (dir, _) = fake(tmp.path(), &format!("{group}-bin"), "codex", &script)?;
+        let result = probe(Agent::Codex, &env_for(&dir));
+        match refused {
+            true => assert!(
+                schema_refused(&result, "ClientRequest.json"),
+                "{group}: {result:?}"
+            ),
+            false => assert!(result.is_ok(), "{group}: {result:?}"),
+        }
+    }
+    Ok(())
+}
+
+/// Validation is bounded in work, not only in depth: a `RequestId` whose `anyOf` names itself twice, or a chain of
+/// definitions each naming the next twice, would take exponential time; within its budget the probe calls the ids
+/// undecided, so the requests are absent, and it ends at once (M1T07R-40).
+#[test]
+fn a_schema_that_branches_without_end_is_undecided_at_once() -> R {
+    let tmp = tempfile::tempdir()?;
+    let f = fixtures().join("codex/0.166.0");
+    type Change = fn(&mut serde_json::Value);
+    let cases: [(&str, Change); 2] = [
+        ("branching-cycle", |v| {
+            v["definitions"]["RequestId"] = serde_json::json!({"anyOf": [
+                {"$ref": "#/definitions/RequestId"}, {"$ref": "#/definitions/RequestId"}]});
+        }),
+        ("branching-chain", |v| {
+            for n in 0..60 {
+                v["definitions"][format!("D{n}")] = serde_json::json!({"anyOf": [
+                    {"$ref": format!("#/definitions/D{}", n + 1)}, {"$ref": format!("#/definitions/D{}", n + 1)}]});
+            }
+            v["definitions"]["D60"] = serde_json::json!({"type": "string"});
+            v["definitions"]["RequestId"] = serde_json::json!({"$ref": "#/definitions/D0"});
+        }),
+    ];
+    for (group, change) in cases {
+        let schema = tmp.path().join(group);
+        std::fs::create_dir(&schema)?;
+        let copied = std::process::Command::new("cp")
+            .arg("-R")
+            .arg(f.join("app-server-schema/."))
+            .arg(&schema)
+            .status()?;
+        assert!(copied.success());
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(schema.join("ClientRequest.json"))?)?;
+        change(&mut value);
+        std::fs::write(
+            schema.join("ClientRequest.json"),
+            serde_json::to_vec_pretty(&value)?,
+        )?;
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n --help) cat '{f}/help.txt';;\n \
+             exec) [ \"$2\" = --help ] && cat '{f}/help-exec.txt';;\n \
+             app-server) case \"$2\" in\n  --help) cat '{f}/help-app-server.txt';;\n  generate-json-schema) [ \"$3\" = --out ] && mkdir -p \"$4\" && cp -R '{s}/.' \"$4/\";;\n  \
+             *) exit 2;;\n esac;;\n *) exit 2;;\nesac\n",
+            f = f.display(),
+            s = schema.display()
+        );
+        let (dir, _) = fake(tmp.path(), &format!("{group}-bin"), "codex", &script)?;
+        let started = std::time::Instant::now();
+        let entry = probe(Agent::Codex, &env_for(&dir)).map_err(|e| format!("{group}: {e}"))?;
+        assert_eq!(entry.transport, Transport::Exec, "{group}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{group}: the probe took {:?}",
+            started.elapsed()
+        );
+    }
+    Ok(())
+}
+
 /// Every command a probe runs is written down with its argv, exit code, duration and whether it timed out, in the
 /// order run (REQ-006: doctor lists them).
 #[test]
