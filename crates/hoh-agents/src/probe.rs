@@ -453,13 +453,22 @@ fn schema_methods(
     Some(methods)
 }
 
-/// The `oneOf` branch of a protocol schema file that lists `method`.
-fn branch_of<'a>(file: &'a serde_json::Value, method: &str) -> Option<&'a serde_json::Value> {
-    file["oneOf"].as_array()?.iter().find(|branch| {
-        branch["properties"]["method"]["enum"]
+/// The `oneOf` branch of a protocol schema file listing each method, in one pass (the known form lists a method once).
+fn branches_by_method(
+    file: &serde_json::Value,
+) -> std::collections::HashMap<&str, &serde_json::Value> {
+    let mut branches = std::collections::HashMap::new();
+    for branch in file["oneOf"].as_array().into_iter().flatten() {
+        for name in branch["properties"]["method"]["enum"]
             .as_array()
-            .is_some_and(|names| names.iter().any(|n| n == method))
-    })
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+        {
+            branches.insert(name, branch);
+        }
+    }
+    branches
 }
 
 /// A copy of a protocol schema file whose branches accept any `params`: the probe checks a method's envelope, not its
@@ -481,17 +490,49 @@ fn params_open(file: &serde_json::Value) -> serde_json::Value {
 /// How deep schemas may nest while validating; deeper is undecided, so a cyclic definition cannot loop.
 const REF_DEPTH: usize = 64;
 
-/// How many schema nodes one reading of the App Server schema may visit in all: depth alone does not bound the work of
-/// a definition naming itself, or a chain of definitions naming the next, twice (exponential); past the budget a
-/// validation is undecided, so the method is absent and the probe ends within a second (M1T07R-40). The recorded
-/// 0.166.0 schema needs about 83,000: each envelope is checked against every branch of its file.
+/// How many steps one reading of the App Server schema may take in all: every schema node visited and every element it
+/// examines (members of `allOf`/`anyOf`/`oneOf`, values of `enum`, names of `required`, properties, an instance's
+/// keys) is a step. Depth alone does not bound the work of a definition naming itself twice, or of wide members and
+/// long enums reused many times; past the budget a validation is undecided, so the method is absent and the probe
+/// ends within a second (M1T07R-40). The recorded 0.166.0 schema needs about 150,000.
 const VALIDATION_BUDGET: u64 = 4_000_000;
 
-/// Take one step of the budget; false when it is used up.
-fn spend(budget: &std::cell::Cell<u64>) -> bool {
-    let left = budget.get();
-    budget.set(left.saturating_sub(1));
-    left > 0
+/// What one reading of the App Server schema may still spend: steps ([`VALIDATION_BUDGET`]) and, if set, doctor's
+/// shared deadline, read every 4096 steps; once either is used up validation is undecided (M1T07R-40).
+struct Work {
+    steps: std::cell::Cell<u64>,
+    until: Option<Instant>,
+}
+
+impl Work {
+    fn new(steps: u64, until: Option<Instant>) -> Work {
+        Work {
+            steps: std::cell::Cell::new(steps),
+            until,
+        }
+    }
+
+    /// Take `n` steps; false once the budget or the deadline is used up.
+    fn spend(&self, n: usize) -> bool {
+        let n = u64::try_from(n).unwrap_or(u64::MAX);
+        let left = self.steps.get();
+        if left < n {
+            self.steps.set(0);
+            return false;
+        }
+        let after = left - n;
+        self.steps.set(after);
+        if left / 4096 != after / 4096 && self.until.is_some_and(|until| Instant::now() >= until) {
+            self.steps.set(0);
+            return false;
+        }
+        true
+    }
+
+    #[cfg(test)]
+    fn left(&self) -> u64 {
+        self.steps.get()
+    }
 }
 
 /// The value of a JSON number token as (negative, significant digits, power of ten), without leading or trailing zero
@@ -528,7 +569,7 @@ fn decimal(token: &str) -> Option<(bool, String, i64)> {
 }
 
 /// Whether a JSON number token reads back as written: an integer within 64 bits, or a number whose parsed value prints
-/// (shortest, round-trip) as the same decimal. Such a number compares with an integer exactly as its decimal does, so
+/// (shortest, round-trip) as the same decimal, and from 2^53 on is that very integer. Such a number compares with an integer exactly as its decimal does, so
 /// `valid` stays exact on the probe's envelopes; `1e-400` (read as 0), `0.99999999999999999` (read as 1),
 /// `18446744073709551616` (beyond 64 bits) do not (M1T07R-39).
 fn reads_exactly(token: &str) -> bool {
@@ -536,6 +577,11 @@ fn reads_exactly(token: &str) -> bool {
         return token.parse::<i64>().is_ok() || token.parse::<u64>().is_ok();
     }
     match token.parse::<f64>() {
+        // From 2^53 on every float is an integer, and its shortest print may differ from it (1000000000000000100.0
+        // is stored as 1000000000000000128): the token must be that integer itself (M1T07R-39).
+        Ok(f) if f.is_finite() && f.abs() >= 9_007_199_254_740_992.0 => {
+            decimal(token).is_some() && decimal(token) == decimal(&format!("{f:.0}"))
+        }
         Ok(f) if f.is_finite() => {
             decimal(token).is_some() && decimal(token) == decimal(&format!("{f:e}"))
         }
@@ -698,10 +744,10 @@ fn valid(
     instance: &serde_json::Value,
     defs: &serde_json::Map<String, serde_json::Value>,
     depth: usize,
-    budget: &std::cell::Cell<u64>,
+    work: &Work,
 ) -> Truth {
     use serde_json::Value;
-    if !spend(budget) {
+    if !work.spend(1) {
         return Truth::Unknown;
     }
     let obj = match schema {
@@ -710,7 +756,7 @@ fn valid(
         Value::Object(obj) => obj,
         _ => return Truth::No,
     };
-    let sub = |s: &Value, x: &Value| valid(s, x, defs, depth + 1, budget);
+    let sub = |s: &Value, x: &Value| valid(s, x, defs, depth + 1, work);
     if let Some(target) = obj.get("$ref") {
         return match target
             .as_str()
@@ -735,7 +781,10 @@ fn valid(
         "string" => instance.is_string(),
         _ => false,
     };
-    let schemas = |v: &Value| v.as_array().cloned().unwrap_or_default();
+    // A keyword that examines `n` elements spends `n` steps first; members are visited in place (M1T07R-40).
+    fn members(v: &serde_json::Value) -> &[serde_json::Value] {
+        v.as_array().map(Vec::as_slice).unwrap_or_default()
+    }
     Truth::all(obj.iter().map(|(key, v)| {
         match key.as_str() {
             "type" => Truth::of(match v {
@@ -743,20 +792,25 @@ fn valid(
                 Value::Array(names) => names.iter().filter_map(Value::as_str).any(is_type),
                 _ => false,
             }),
-            "enum" => Truth::of(
-                v.as_array()
-                    .is_some_and(|values| values.iter().any(|e| json_equal(e, instance))),
-            ),
-            "required" => Truth::of(instance.as_object().is_none_or(|o| {
-                v.as_array().is_some_and(|names| {
+            "enum" => match v.as_array() {
+                None => Truth::No,
+                Some(values) if !work.spend(values.len()) => Truth::Unknown,
+                Some(values) => Truth::of(values.iter().any(|e| json_equal(e, instance))),
+            },
+            "required" => match (instance.as_object(), v.as_array()) {
+                (None, _) => Truth::Yes,
+                (Some(_), None) => Truth::No,
+                (Some(_), Some(names)) if !work.spend(names.len()) => Truth::Unknown,
+                (Some(o), Some(names)) => Truth::of(
                     names
                         .iter()
-                        .all(|n| n.as_str().is_some_and(|n| o.contains_key(n)))
-                })
-            })),
+                        .all(|n| n.as_str().is_some_and(|n| o.contains_key(n))),
+                ),
+            },
             "properties" => match (instance.as_object(), v.as_object()) {
                 (None, _) => Truth::Yes,
                 (Some(_), None) => Truth::No,
+                (Some(_), Some(props)) if !work.spend(props.len()) => Truth::Unknown,
                 (Some(o), Some(props)) => Truth::all(
                     props
                         .iter()
@@ -765,6 +819,7 @@ fn valid(
             },
             "additionalProperties" => match instance.as_object() {
                 None => Truth::Yes,
+                Some(o) if !work.spend(o.len()) => Truth::Unknown,
                 Some(o) => {
                     let declared = obj.get("properties").and_then(Value::as_object);
                     Truth::all(
@@ -778,9 +833,9 @@ fn valid(
                 None => Truth::Yes,
                 Some(a) => Truth::all(a.iter().map(|x| sub(v, x))),
             },
-            "allOf" => Truth::all(schemas(v).iter().map(|s| sub(s, instance))),
-            "anyOf" => Truth::any(schemas(v).iter().map(|s| sub(s, instance))),
-            "oneOf" => Truth::one(schemas(v).iter().map(|s| sub(s, instance))),
+            "allOf" => Truth::all(members(v).iter().map(|s| sub(s, instance))),
+            "anyOf" => Truth::any(members(v).iter().map(|s| sub(s, instance))),
+            "oneOf" => Truth::one(members(v).iter().map(|s| sub(s, instance))),
             "minimum" => match (instance.as_number(), v.as_number()) {
                 (None, _) => Truth::Yes,
                 (Some(x), Some(m)) => match number_order(x, m) {
@@ -810,10 +865,10 @@ fn takes_every_id(
     schema: &serde_json::Value,
     defs: &serde_json::Map<String, serde_json::Value>,
     depth: usize,
-    budget: &std::cell::Cell<u64>,
+    work: &Work,
 ) -> bool {
     use serde_json::Value;
-    if !spend(budget) {
+    if !work.spend(1) {
         return false;
     }
     let obj = match schema {
@@ -821,7 +876,7 @@ fn takes_every_id(
         Value::Object(obj) if depth <= REF_DEPTH => obj,
         _ => return false,
     };
-    let sub = |s: &Value| takes_every_id(s, defs, depth + 1, budget);
+    let sub = |s: &Value| takes_every_id(s, defs, depth + 1, work);
     if let Some(target) = obj.get("$ref") {
         return target
             .as_str()
@@ -889,7 +944,7 @@ pub fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<CodexSchema, Prob
                 texts.insert(file, String::from_utf8_lossy(&bytes).into_owned());
             }
         }
-        let budget = std::cell::Cell::new(VALIDATION_BUDGET);
+        let work = Work::new(VALIDATION_BUDGET, env.deadline);
         // The methods a file lists in the known form whose message can be valid: `envelope` is the message for a
         // method, checked against the file with the params left to the compat suite (M1T07R-33).
         let methods = |name: &str, sent: bool, envelope: &dyn Fn(&str) -> serde_json::Value| {
@@ -914,17 +969,18 @@ pub fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<CodexSchema, Prob
                 .get("definitions")
                 .and_then(serde_json::Value::as_object)
                 .unwrap_or(&empty);
+            let branches = branches_by_method(&open);
             Ok::<_, ProbeError>(
                 listed
                     .into_iter()
-                    .filter(|m| valid(&open, &envelope(m), defs, 0, &budget) == Truth::Yes)
+                    .filter(|m| valid(&open, &envelope(m), defs, 0, &work) == Truth::Yes)
                     .filter(|m| {
                         // A request also needs an id schema that takes every id the adapter numbers (M1T07R-36).
                         !name.starts_with("ClientRequest")
-                            || branch_of(&open, m).is_some_and(|branch| {
+                            || branches.get(m.as_str()).is_some_and(|branch| {
                                 branch["properties"]
                                     .get("id")
-                                    .is_none_or(|id| takes_every_id(id, defs, 0, &budget))
+                                    .is_none_or(|id| takes_every_id(id, defs, 0, &work))
                             })
                     })
                     .collect(),
@@ -1618,7 +1674,7 @@ mod tests {
                 &instance,
                 &defs,
                 0,
-                &std::cell::Cell::new(VALIDATION_BUDGET),
+                &Work::new(VALIDATION_BUDGET, None),
             )
         };
         let ok = |schema: serde_json::Value, instance: serde_json::Value| {
@@ -1762,7 +1818,7 @@ mod tests {
                           "Loop": {"$ref": "#/definitions/Loop"}});
         let defs = defs.as_object().cloned().unwrap_or_default();
         let takes = |schema: serde_json::Value| {
-            takes_every_id(&schema, &defs, 0, &std::cell::Cell::new(VALIDATION_BUDGET))
+            takes_every_id(&schema, &defs, 0, &Work::new(VALIDATION_BUDGET, None))
         };
         for yes in [
             json!(true),
@@ -1833,7 +1889,7 @@ mod tests {
     fn the_recorded_schema_needs_little_of_the_budget() -> Result<(), Box<dyn std::error::Error>> {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/protocol/codex/0.166.0/app-server-schema");
-        let budget = std::cell::Cell::new(VALIDATION_BUDGET);
+        let work = Work::new(VALIDATION_BUDGET, None);
         let mut kept = 0;
         for (name, sent) in [
             ("ClientRequest.json", true),
@@ -1854,23 +1910,36 @@ mod tests {
                     _ => serde_json::json!({"method": method, "params": {}}),
                 };
                 assert_eq!(
-                    valid(&open, &envelope, &defs, 0, &budget),
+                    valid(&open, &envelope, &defs, 0, &work),
                     Truth::Yes,
                     "{name} {method}"
                 );
                 if sent && name == "ClientRequest.json" {
-                    let id = &branch_of(&open, &method).ok_or("no branch")?["properties"]["id"];
-                    assert!(takes_every_id(id, &defs, 0, &budget), "{method}");
+                    let branches = branches_by_method(&open);
+                    let id = &branches.get(method.as_str()).ok_or("no branch")?["properties"]["id"];
+                    assert!(takes_every_id(id, &defs, 0, &work), "{method}");
                 }
                 kept += 1;
             }
         }
         assert_eq!(kept, 192);
-        let used = VALIDATION_BUDGET - budget.get();
+        let used = VALIDATION_BUDGET - work.left();
         assert!(
-            used < VALIDATION_BUDGET / 20,
+            used < VALIDATION_BUDGET / 10,
             "the recorded schema used {used} steps"
         );
         Ok(())
+    }
+
+    /// Work stops at doctor's shared deadline as well as at its step budget (M1T07R-40).
+    #[test]
+    fn work_ends_at_the_deadline() {
+        let past = Instant::now() - Duration::from_secs(1);
+        let work = Work::new(VALIDATION_BUDGET, Some(past));
+        let steps = (0..10_000).take_while(|_| work.spend(1)).count();
+        assert!(steps < 4096, "{steps} steps after the deadline");
+        assert_eq!(work.left(), 0);
+        let work = Work::new(10, None);
+        assert!(work.spend(10) && !work.spend(1), "the budget ends");
     }
 }
