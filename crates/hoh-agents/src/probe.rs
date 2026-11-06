@@ -1233,6 +1233,8 @@ struct Held(std::sync::Arc<std::sync::Mutex<Vec<Option<std::os::fd::OwnedFd>>>>)
 impl Held {
     fn add(&self, fd: std::os::fd::BorrowedFd<'_>) {
         let copy = fd.try_clone_to_owned().ok();
+        #[cfg(test)]
+        let copy = copy.filter(|_| !COPY_FAILS.with(std::cell::Cell::get));
         match self.0.lock() {
             Ok(mut held) => held.push(copy),
             Err(poisoned) => poisoned.into_inner().push(copy),
@@ -1628,10 +1630,11 @@ impl Drop for Scratch {
 /// A new directory `name` in `temp` (at `path`), made and opened as the probe's own: the directory opened must be the
 /// one just made, not one put in its place between making and opening it (M1T07R-51, -57). Linux cannot make and open a
 /// directory in one call, so what is opened is checked: this process's own, empty, and born no earlier than a second
-/// before the call: a directory that existed before is refused. One a same-user process watching `temp` makes and puts
-/// in place within that second cannot be told from the probe's own; that is outside the guarantee (ADR-015 decision 2,
-/// M1T07R-57, -91): a birth time cannot close the gap, a shorter room only narrows it. On any doubt nothing is removed
-/// by name — whatever is at `name` may not be the probe's — and the error says where it may be left.
+/// before the call: a directory born more than a second before is refused (M1T07R-102). One a same-user process
+/// watching `temp` makes and puts in place within that second cannot be told from the probe's own; that is outside the
+/// guarantee (ADR-015 decision 2, M1T07R-57, -91): a birth time cannot close the gap, a shorter room only narrows it.
+/// On any doubt nothing is removed by name — whatever is at `name` may not be the probe's — and the error says where
+/// it may be left.
 fn make_dir(
     temp: std::os::fd::BorrowedFd<'_>,
     name: &OsStr,
@@ -1964,8 +1967,11 @@ impl Quarantine {
 /// `owned` just before, through `quarantine`, where it is removed only if it is the entry opened under `owned`, held
 /// open until then so its inode cannot be another's; so nothing that was never under the output is removed, whatever
 /// a helper the CLI left running moves meanwhile. Everything but directories goes first, then the directories,
-/// children before their parent: a directory enters the quarantine, where a helper holding it could find the
-/// quarantine (`..`), only once nothing but empty directories is left to remove. A mount is left untouched, and so is
+/// children before their parent, so a directory enters the quarantine, where a helper holding it could find the
+/// quarantine (`..`), once nothing but empty directories is left to remove; but one a helper refilled after it was
+/// walked enters it too, refused as not empty and moved back, and its new entries then pass through the same quarantine
+/// in the next round: that is outside the guarantee (a helper reaching the quarantine, ADR-015 decision 2), and every
+/// take still checks the entry it opened (M1T07R-101). A mount is left untouched, and so is
 /// what is nested deeper than [`MAX_SCHEMA_DEPTH`]. `dir` itself goes last, only while `dir` still names it; a link
 /// put in its place is removed the same way.
 fn remove_within(
@@ -1979,8 +1985,6 @@ fn remove_within(
     // Everything but directories, again while a pass removes something, then the directories; a helper may have put
     // other entries in meanwhile (a directory replaced by a link after it was walked): met by the directories' pass,
     // they start another round, at most [`REMOVE_ROUNDS`]. What cannot be removed, such as a mount, ends the passes.
-    // A directory removed in a round is gone from the quarantine (its `..` leads nowhere), so a later round's other
-    // entries enter a quarantine no helper reached through a directory of the output.
     for _ in 0..REMOVE_ROUNDS {
         loop {
             match remove_pass(dir, owned, quarantine, work, false) {
@@ -2016,8 +2020,9 @@ fn remove_within(
     fstat(owned).is_ok_and(|made| made.st_nlink == 0)
 }
 
-/// How many rounds [`remove_within`] goes through at most.
-const REMOVE_ROUNDS: usize = 3;
+/// How many rounds [`remove_within`] goes through at most: one more for what a helper put in after its directory was
+/// walked. What a helper keeps putting in is left and named; the deadline bounds the passes (M1T07R-100).
+const REMOVE_ROUNDS: usize = 2;
 
 /// What one pass of [`remove_pass`] did.
 struct Pass {
@@ -2709,6 +2714,8 @@ impl Output {
 
 #[cfg(test)]
 thread_local! {
+    /// Set by a test: [`Held::add`] on this thread cannot copy the descriptor, as when no descriptor is left.
+    static COPY_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Set by a test: once this file exists, waits for output on this thread fail as a poll that cannot get memory
     /// would.
     static POLL_FAILS: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
@@ -3811,6 +3818,93 @@ mod tests {
             "{order:?}"
         );
         assert_eq!(order.len(), 9, "{order:?}");
+        Ok(())
+    }
+
+    /// What a helper puts into a directory already walked while everything but directories is removed goes in the
+    /// next pass of the same kind, so that directory never enters the quarantine with something in it (M1T07R-100).
+    #[test]
+    fn a_directory_refilled_while_files_are_removed_never_enters_the_quarantine_full()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let out = root.path().join("out");
+        for d in ["a", "b"] {
+            std::fs::create_dir_all(out.join(d))?;
+            std::fs::write(out.join(d).join("f.json"), "{}")?;
+        }
+        // Into whichever directory was walked first, once the other's file is reached: the first is walked through.
+        let first = std::rc::Rc::new(std::cell::RefCell::new(None::<PathBuf>));
+        let full = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let (walked, seen, put) = (
+            first.clone(),
+            full.clone(),
+            std::rc::Rc::new(std::cell::Cell::new(false)),
+        );
+        let refilled = put.clone();
+        BETWEEN.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |at: &str, path: &Path| {
+                if at == "remove" && path.file_name() == Some(OsStr::new("f.json")) {
+                    let dir = path.parent().expect("a parent").to_path_buf();
+                    let mut walked = walked.borrow_mut();
+                    match walked.as_ref() {
+                        None => *walked = Some(dir),
+                        Some(first) if *first != dir && !put.get() => {
+                            std::fs::write(first.join("late.json"), "{}").expect("refill");
+                            put.set(true);
+                        }
+                        Some(_) => {}
+                    }
+                }
+                if at == "take"
+                    && std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
+                    && std::fs::read_dir(path).is_ok_and(|mut d| d.next().is_some())
+                {
+                    seen.borrow_mut().push(path.to_path_buf());
+                }
+            }));
+        });
+        let gone = remove(&out, &Work::new(u64::MAX, None));
+        BETWEEN.with(|hook| *hook.borrow_mut() = None);
+        assert!(refilled.get(), "the refill did not happen");
+        assert!(gone);
+        assert_eq!(*full.borrow(), Vec::<PathBuf>::new());
+        Ok(())
+    }
+
+    /// A directory held whose copy could not be kept, or kept under a lock a panicking thread poisoned, is never
+    /// taken for gone (M1T07R-82, -100).
+    #[test]
+    fn a_directory_held_without_a_copy_is_not_said_to_be_gone()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        COPY_FAILS.with(|f| f.set(true));
+        let scratch = Scratch::at(
+            root.path().join("out"),
+            Instant::now() + Duration::from_secs(60),
+            Default::default(),
+            Held::default(),
+        );
+        COPY_FAILS.with(|f| f.set(false));
+        let mut scratch = scratch?;
+        assert_eq!(
+            scratch.held.may_be_left(),
+            "it may be left in a directory whose path cannot be read"
+        );
+        assert!(scratch.remove());
+        let poisoned = Held::default();
+        let holder = poisoned.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = holder.0.lock();
+            panic!("poison the lock");
+        })
+        .join();
+        let dir = root.path().join("kept");
+        std::fs::create_dir(&dir)?;
+        poisoned.add(held(&dir).as_fd());
+        assert_eq!(
+            poisoned.may_be_left(),
+            format!("it may be left at {}", dir.display())
+        );
         Ok(())
     }
 
