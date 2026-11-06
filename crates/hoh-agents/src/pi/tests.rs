@@ -235,3 +235,27 @@ fn the_noted_session_files_are_the_regular_ones() {
     std::os::unix::fs::symlink("/dev/zero", sessions.join("0001_zero.jsonl")).expect("symlink");
     assert_eq!(session_files(&sessions), Err("0001_zero.jsonl".to_owned()));
 }
+
+/// `agent_settled` is relied on only for a version whose recorded traffic has it; any other version checks for idle
+/// with `get_state` (ADR-013 decision 3), which ends a turn on `agent_settled` too (M1R-06).
+#[test]
+fn only_a_recorded_version_is_trusted_to_send_agent_settled() {
+    let recorded = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/protocol/pi/1.5.0/rpc-prompt/stdout.jsonl"
+    ))
+    .expect("recorded traffic");
+    assert!(recorded.contains("\"agent_settled\""));
+    assert!(emits_settled(Some("1.5.0")));
+    assert!(emits_settled(Some("1.5.0\n")));
+    for other in [
+        None,
+        Some(""),
+        Some("1.5.1"),
+        Some("1.6.0"),
+        Some("pi 1.5.0"),
+        Some("1.5.0-beta"),
+    ] {
+        assert!(!emits_settled(other), "{other:?}");
+    }
+}

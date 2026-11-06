@@ -109,6 +109,16 @@ pub fn args(launch: &Launch) -> Result<Vec<String>, Blocked> {
 /// Dialog UI methods: they wait for an answer, which headless HoH gives as `cancelled`.
 pub const DIALOGS: &[&str] = &["select", "confirm", "input", "editor"];
 
+/// The pi versions whose recorded traffic has `agent_settled` (`tests/fixtures/protocol/pi/<version>/`).
+const SETTLED_EVENT_VERSIONS: &[&str] = &["1.5.0"];
+
+/// Whether a turn of the pi whose `--version` says `version` can rely on `agent_settled` ([`Launch::settled_event`]):
+/// only a recorded version; any other checks for idle with `get_state` (ADR-013 decision 3), which ends a turn on
+/// `agent_settled` too, so either kind of version settles (M1R-06).
+pub fn emits_settled(version: Option<&str>) -> bool {
+    version.is_some_and(|v| SETTLED_EVENT_VERSIONS.contains(&v.trim()))
+}
+
 /// The failure reason of a pi error text (REQ-026, CR-003; docs/13): pi 1.5.0 has no structured error codes, so only
 /// the recorded patterns count — `No API key found` → BLOCKED_AUTH, `Model not found` → MODEL_UNAVAILABLE (leading
 /// blanks aside) — and anything else is PERMANENT_EXTERNAL, its text kept in the event. The same rule serves a refused
