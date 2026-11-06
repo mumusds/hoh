@@ -300,6 +300,12 @@ pub struct CodexSchema {
     pub notifications: std::collections::BTreeSet<String>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many diagnostic paths this thread has written out (a well-formed schema writes none; M1T07R-40).
+    static RENDERED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The draft-07 `$schema` the App Server schema files declare.
 const DRAFT_07: &str = "http://json-schema.org/draft-07/schema#";
 
@@ -310,8 +316,25 @@ const DRAFT_07: &str = "http://json-schema.org/draft-07/schema#";
 /// ill-typed value, or a `$ref` other than `#/definitions/<name>` naming a root definition refuses the document, so a
 /// newer schema form fails the probe instead of being half-read (M1T01R-25, -26, -27). `minLength` must be written as
 /// an integer literal (M1T01R-28).
-fn draft7_well_formed(root: &serde_json::Value) -> Result<(), String> {
+fn draft7_well_formed(root: &serde_json::Value, work: &Work) -> Result<(), String> {
     use serde_json::{Map, Value};
+    /// One step of the path to a schema position; the path is written out only for an error, so a long key is never
+    /// copied once per descendant (M1T07R-40).
+    #[derive(Clone, Copy)]
+    enum Step<'a> {
+        Key(&'a str),
+        Index(usize),
+    }
+    fn render(path: &[Step]) -> String {
+        #[cfg(test)]
+        RENDERED.with(|n| n.set(n.get() + 1));
+        path.iter()
+            .map(|step| match step {
+                Step::Key(key) => format!("/{key}"),
+                Step::Index(i) => format!("/{i}"),
+            })
+            .collect()
+    }
     fn type_name(v: &Value) -> bool {
         matches!(
             v.as_str(),
@@ -328,17 +351,31 @@ fn draft7_well_formed(root: &serde_json::Value) -> Result<(), String> {
                     == a.len()
         })
     }
-    fn schema(v: &Value, defs: &Map<String, Value>, path: &str) -> Result<(), String> {
+    fn schema<'a>(
+        v: &'a Value,
+        defs: &Map<String, Value>,
+        path: &mut Vec<Step<'a>>,
+        work: &Work,
+    ) -> Result<(), String> {
+        if !work.spend(1) {
+            return Err(format!("{}: not read within the time limit", render(path)));
+        }
         let obj = match v {
             Value::Bool(_) => return Ok(()),
             Value::Object(obj) => obj,
-            _ => return Err(format!("{path}: a schema must be an object or a boolean")),
+            _ => {
+                return Err(format!(
+                    "{}: a schema must be an object or a boolean",
+                    render(path)
+                ));
+            }
         };
+        let root = path.is_empty();
         for (key, v) in obj {
-            let at = format!("{path}/{key}");
+            path.push(Step::Key(key));
             let ok = match key.as_str() {
-                "$schema" => path.is_empty() && v == DRAFT_07,
-                "definitions" => path.is_empty(),
+                "$schema" => root && v == DRAFT_07,
+                "definitions" => root,
                 "title" | "description" | "format" => v.is_string(),
                 "default" => true,
                 "type" => {
@@ -366,30 +403,35 @@ fn draft7_well_formed(root: &serde_json::Value) -> Result<(), String> {
                 "properties" => match v.as_object() {
                     Some(props) => {
                         for (name, s) in props {
-                            schema(s, defs, &format!("{at}/{name}"))?;
+                            path.push(Step::Key(name));
+                            schema(s, defs, path, work)?;
+                            path.pop();
                         }
                         true
                     }
                     None => false,
                 },
                 "items" | "additionalProperties" => {
-                    schema(v, defs, &at)?;
+                    schema(v, defs, path, work)?;
                     true
                 }
                 "oneOf" | "anyOf" | "allOf" => match v.as_array().filter(|a| !a.is_empty()) {
                     Some(list) => {
                         for (i, s) in list.iter().enumerate() {
-                            schema(s, defs, &format!("{at}/{i}"))?;
+                            path.push(Step::Index(i));
+                            schema(s, defs, path, work)?;
+                            path.pop();
                         }
                         true
                     }
                     None => false,
                 },
-                _ => return Err(format!("{at}: unsupported keyword")),
+                _ => return Err(format!("{}: unsupported keyword", render(path))),
             };
             if !ok {
-                return Err(format!("{at}: ill-formed value"));
+                return Err(format!("{}: ill-formed value", render(path)));
             }
+            path.pop();
         }
         Ok(())
     }
@@ -400,9 +442,10 @@ fn draft7_well_formed(root: &serde_json::Value) -> Result<(), String> {
         Some(_) => return Err("/definitions: not an object".to_owned()),
     };
     for (name, s) in defs {
-        schema(s, defs, &format!("/definitions/{name}"))?;
+        let mut path = vec![Step::Key("definitions"), Step::Key(name)];
+        schema(s, defs, &mut path, work)?;
     }
-    schema(root, defs, "")
+    schema(root, defs, &mut Vec::new(), work)
 }
 
 /// The `method` names a well-formed protocol schema file (see [`draft7_well_formed`]) lists, read only from the form
@@ -589,11 +632,15 @@ fn reads_exactly(token: &str) -> bool {
     }
 }
 
-/// The first number token of a JSON text (outside its strings) that does not read back as written ([`reads_exactly`]).
-fn inexact_number(text: &str) -> Option<String> {
+/// The first number token of a JSON text (outside its strings) that does not read back as written ([`reads_exactly`]);
+/// `Err` when the text could not be scanned within `work` (doctor's deadline; M1T07R-40).
+fn inexact_number(text: &str, work: &Work) -> Result<Option<String>, ()> {
     let bytes = text.as_bytes();
     let (mut at, mut in_string) = (0, false);
     while at < bytes.len() {
+        if !work.spend(1) {
+            return Err(());
+        }
         let b = bytes[at];
         if in_string {
             match b {
@@ -612,14 +659,14 @@ fn inexact_number(text: &str) -> Option<String> {
                 .map_or(bytes.len(), |n| at + n);
             let token = &text[at..end];
             if !reads_exactly(token) {
-                return Some(token.to_owned());
+                return Ok(Some(token.to_owned()));
             }
             at = end;
         } else {
             at += 1;
         }
     }
-    None
+    Ok(None)
 }
 
 /// A validation result: what the probe cannot decide exactly is `Unknown`, and only `Yes` keeps a method, so an
@@ -945,18 +992,31 @@ pub fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<CodexSchema, Prob
             }
         }
         let work = Work::new(VALIDATION_BUDGET, env.deadline);
+        // The checks before validation are linear in the files; only doctor's deadline bounds them (M1T07R-40).
+        let checks = Work::new(u64::MAX, env.deadline);
         // The methods a file lists in the known form whose message can be valid: `envelope` is the message for a
         // method, checked against the file with the params left to the compat suite (M1T07R-33).
         let methods = |name: &str, sent: bool, envelope: &dyn Fn(&str) -> serde_json::Value| {
             let value = parsed
                 .get(&dir.join(name))
                 .ok_or_else(|| unusable(format!("{name} is missing")))?;
-            draft7_well_formed(value)
+            draft7_well_formed(value, &checks)
                 .map_err(|e| unusable(format!("{name} is not a well-formed schema: {e}")))?;
-            if let Some(number) = texts.get(&dir.join(name)).and_then(|t| inexact_number(t)) {
-                return Err(unusable(format!(
-                    "{name} has a number the probe cannot read exactly: {number}"
-                )));
+            match texts
+                .get(&dir.join(name))
+                .map(|t| inexact_number(t, &checks))
+            {
+                Some(Ok(Some(number))) => {
+                    return Err(unusable(format!(
+                        "{name} has a number the probe cannot read exactly: {number}"
+                    )));
+                }
+                Some(Err(())) => {
+                    return Err(unusable(format!(
+                        "{name} was not read within the time limit"
+                    )));
+                }
+                _ => {}
             }
             let listed = schema_methods(value, sent).ok_or_else(|| {
                 unusable(format!(
@@ -1874,12 +1934,18 @@ mod tests {
             assert!(!reads_exactly(inexact), "{inexact}");
         }
         assert_eq!(
-            inexact_number(r#"{"a": "1e-400", "b": "x\"1e-400", "c": [0, 0.7, -3]}"#),
-            None
+            inexact_number(
+                r#"{"a": "1e-400", "b": "x\"1e-400", "c": [0, 0.7, -3]}"#,
+                &Work::new(u64::MAX, None)
+            ),
+            Ok(None)
         );
         assert_eq!(
-            inexact_number(r#"{"a": "\\", "minimum": 1e-400}"#).as_deref(),
-            Some("1e-400")
+            inexact_number(
+                r#"{"a": "\\", "minimum": 1e-400}"#,
+                &Work::new(u64::MAX, None)
+            ),
+            Ok(Some("1e-400".to_owned()))
         );
     }
 
@@ -1897,7 +1963,11 @@ mod tests {
             ("ServerNotification.json", false),
         ] {
             let text = std::fs::read_to_string(root.join(name))?;
-            assert_eq!(inexact_number(&text), None, "{name}");
+            assert_eq!(
+                inexact_number(&text, &Work::new(u64::MAX, None)),
+                Ok(None),
+                "{name}"
+            );
             let value: serde_json::Value = serde_json::from_str(&text)?;
             let open = params_open(&value);
             let defs = open["definitions"].as_object().cloned().unwrap_or_default();
@@ -1941,5 +2011,35 @@ mod tests {
         assert_eq!(work.left(), 0);
         let work = Work::new(10, None);
         assert!(work.spend(10) && !work.spend(1), "the budget ends");
+    }
+
+    /// The checks before validation stop at doctor's deadline too, and their paths are written out only on error, so
+    /// a long key under many members costs no more than the file's size (M1T07R-40).
+    #[test]
+    fn the_checks_before_validation_end_at_the_deadline() {
+        let past = Some(Instant::now() - Duration::from_secs(1));
+        let members: Vec<serde_json::Value> =
+            (0..10_000).map(|_| serde_json::json!(true)).collect();
+        let wide = serde_json::json!({"definitions": {"D": {"anyOf": members}}, "oneOf": [true]});
+        RENDERED.with(|n| n.set(0));
+        assert!(draft7_well_formed(&wide, &Work::new(u64::MAX, None)).is_ok());
+        assert_eq!(
+            RENDERED.with(std::cell::Cell::get),
+            0,
+            "a path was written out without an error"
+        );
+        assert!(
+            draft7_well_formed(&wide, &Work::new(u64::MAX, past))
+                .is_err_and(|e| e.contains("time limit"))
+        );
+        let text = "[".to_owned() + &"0, ".repeat(10_000) + "0]";
+        assert_eq!(inexact_number(&text, &Work::new(u64::MAX, None)), Ok(None));
+        assert_eq!(inexact_number(&text, &Work::new(u64::MAX, past)), Err(()));
+        // An error names its position.
+        let bad = serde_json::json!({"definitions": {"D": {"anyOf": [true, {"not": {}}]}}});
+        assert!(
+            draft7_well_formed(&bad, &Work::new(u64::MAX, None))
+                .is_err_and(|e| e.starts_with("/definitions/D/anyOf/1/not"))
+        );
     }
 }
