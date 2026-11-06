@@ -25,6 +25,60 @@ const CHILD_MOUNTINFO: &str = "HOH_TEST_HOST_MOUNTINFO";
 const CHILD_WAL_FAIL: &str = "HOH_TEST_HOST_WAL_FAIL";
 /// The child's open-file limit, to run it out of descriptors.
 const CHILD_NOFILE: &str = "HOH_TEST_HOST_NOFILE";
+/// Set for a child whose writer panics at its first commit.
+const CHILD_PANIC: &str = "HOH_TEST_HOST_PANIC";
+
+/// A commit hook that panics: the writer thread unwinds (CR-006: a fault made by test code).
+#[derive(Debug)]
+struct Panicking;
+
+impl FaultHooks for Panicking {
+    fn before_commit(&self) -> Result<(), PersistError> {
+        std::panic::resume_unwind(Box::new("writer panic"));
+    }
+}
+
+/// A child process that is always ended: on any way out of a test, a failed assertion included, it gets SIGTERM, a
+/// moment, then SIGKILL, and is reaped (M2T12R-154).
+struct ChildGuard(std::process::Child);
+
+impl ChildGuard {
+    fn spawn(command: &mut Command) -> R<ChildGuard> {
+        Ok(ChildGuard(command.spawn()?))
+    }
+}
+
+impl std::ops::Deref for ChildGuard {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ChildGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if matches!(self.0.try_wait(), Ok(None)) {
+            if let Some(pid) = i32::try_from(self.0.id())
+                .ok()
+                .and_then(rustix::process::Pid::from_raw)
+            {
+                let _ = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
+            }
+            let end = Instant::now() + Duration::from_secs(5);
+            while matches!(self.0.try_wait(), Ok(None)) && Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let _ = self.0.kill();
+        }
+        let _ = self.0.wait();
+    }
+}
 
 /// The product binary's WAL self-test probe.
 fn probe() -> ProbeCommand {
@@ -42,6 +96,22 @@ fn config(project: &Path) -> HostConfig {
     config.port = 0;
     config.store.wal_probe = Some(probe());
     config
+}
+
+/// Start a host in a project another host of this process just let go. A process that spawns children (the WAL
+/// self-test's probe of a parallel test) shares every open file with each child until it execs, so a lock just
+/// released can still be held for that instant: a refusal (69) is tried again for a moment. Tests that expect the
+/// refusal call [`Host::start`] themselves.
+async fn start_when_free(config: HostConfig) -> Result<Host, hoh_app::host::StartError> {
+    let end = Instant::now() + Duration::from_secs(5);
+    loop {
+        match Host::start(config.clone()).await {
+            Err(e) if e.exit_code == 69 && Instant::now() < end => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            other => return other,
+        }
+    }
 }
 
 /// Run `script` (Python, sqlite3 module) against the project's database; its stdout. Test code: the product never
@@ -73,10 +143,15 @@ fn db(project: &Path) -> PathBuf {
 
 /// CREATED runs `ids` in the host's project.
 fn seed_runs(host: &Host, project: &Path, ids: &[String]) -> R {
+    seed_runs_in(project, &host.project_id, ids)
+}
+
+/// CREATED runs `ids` in project `project_id`.
+fn seed_runs_in(project: &Path, project_id: &str, ids: &[String]) -> R {
     let script = "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); p=sys.stdin.readline().strip(); \
                   c.executemany(\"INSERT INTO runs(run_id, project_id, state, mode, created_at) VALUES (?, ?, 'CREATED', 'AUTO', '2026-11-06T00:00:00Z')\", \
                   [(l.strip(), p) for l in sys.stdin if l.strip()]); c.commit(); c.close()";
-    let mut input = format!("{}\n", host.project_id);
+    let mut input = format!("{project_id}\n");
     for id in ids {
         input.push_str(id);
         input.push('\n');
@@ -485,6 +560,9 @@ fn host_child() {
     let mut config = config(Path::new(&project));
     if let Some(file) = std::env::var_os(CHILD_MOUNTINFO) {
         config.mountinfo = std::fs::read_to_string(file).ok();
+    }
+    if std::env::var_os(CHILD_PANIC).is_some() {
+        config.store.faults = Arc::new(Panicking);
     }
     if let Some(step) = std::env::var_os(CHILD_WAL_FAIL) {
         let failing = match step.to_str() {
@@ -1419,7 +1497,7 @@ async fn a_host_stops_with_subscribers() -> R {
     assert!(!socket.exists());
     assert!(!dir.path().join(".hoh/host.json").exists());
     drop((tcp, unix));
-    let next = Host::start(config(dir.path())).await?;
+    let next = start_when_free(config(dir.path())).await?;
     assert_eq!(next.host_epoch, 2);
     next.shutdown().await;
     Ok(())
@@ -1502,18 +1580,19 @@ async fn requests_after_the_stop_get_nothing() -> R {
 #[test]
 fn a_host_process_ends_on_sigterm_with_a_subscriber() -> R {
     let dir = tempfile::tempdir()?;
-    let mut child = Command::new(std::env::current_exe()?)
-        .args([
-            "--exact",
-            "host_child",
-            "--ignored",
-            "--test-threads=1",
-            "--nocapture",
-        ])
-        .env(CHILD_PROJECT, dir.path())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
+    let mut child = ChildGuard::spawn(
+        Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "host_child",
+                "--ignored",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(CHILD_PROJECT, dir.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped()),
+    )?;
     let host_json = dir.path().join(".hoh/host.json");
     let end = Instant::now() + Duration::from_secs(30);
     while !host_json.exists() && Instant::now() < end {
@@ -1610,7 +1689,7 @@ async fn a_stale_socket_is_replaced_and_anything_else_is_left() -> R {
     assert_eq!(reply.status, 200);
     host.shutdown().await;
     std::fs::write(files.join("host.sock"), "not a socket")?;
-    let refused = Host::start(config(dir.path()))
+    let refused = start_when_free(config(dir.path()))
         .await
         .err()
         .ok_or("started over a file")?;
@@ -1850,7 +1929,7 @@ async fn a_stopping_host_finishes_its_writes_before_the_lock_goes() -> R {
     release.send(())?;
     tokio::time::timeout(Duration::from_secs(10), stopping).await??;
     assert_eq!(scalar(dir.path(), "SELECT count(*) FROM commands")?, "1");
-    let next = Host::start(config(dir.path())).await?;
+    let next = start_when_free(config(dir.path())).await?;
     assert_eq!(next.host_epoch, 2);
     next.shutdown().await;
     Ok(())
@@ -1864,7 +1943,11 @@ async fn a_dropped_host_keeps_the_project_until_its_writer_ends() -> R {
     let host = Host::start(config(dir.path())).await?;
     let subscriber =
         Subscriber::connect(To::Unix(host.socket.clone()), &host.token, "/v1/events").await?;
+    let socket = host.socket.clone();
     drop(host);
+    // Its files go with it (M2T12R-153).
+    assert!(!socket.exists());
+    assert!(!dir.path().join(".hoh/host.json").exists());
     let end = Instant::now() + Duration::from_secs(15);
     let next = loop {
         match Host::start(config(dir.path())).await {
@@ -1900,14 +1983,14 @@ async fn a_failed_start_leaves_nothing_served() -> R {
     // host.json is a directory with something in it: it cannot be replaced.
     std::fs::create_dir_all(dir.path().join(".hoh/host.json"))?;
     std::fs::write(dir.path().join(".hoh/host.json/keep"), "")?;
-    let refused = Host::start(config(dir.path()))
+    let refused = start_when_free(config(dir.path()))
         .await
         .err()
         .ok_or("started without host.json")?;
     assert!(refused.message.contains("host.json"), "{refused}");
     assert!(!dir.path().join(".hoh/host.sock").exists());
     std::fs::remove_dir_all(dir.path().join(".hoh/host.json"))?;
-    let host = Host::start(config(dir.path())).await?;
+    let host = start_when_free(config(dir.path())).await?;
     host.shutdown().await;
     Ok(())
 }
@@ -1961,19 +2044,20 @@ fn cpu_ticks(pid: u32) -> R<u64> {
 #[test]
 fn a_host_out_of_descriptors_does_not_spin() -> R {
     let dir = tempfile::tempdir()?;
-    let mut child = Command::new(std::env::current_exe()?)
-        .args([
-            "--exact",
-            "host_child",
-            "--ignored",
-            "--test-threads=1",
-            "--nocapture",
-        ])
-        .env(CHILD_PROJECT, dir.path())
-        .env(CHILD_NOFILE, "80")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
+    let mut child = ChildGuard::spawn(
+        Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "host_child",
+                "--ignored",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(CHILD_PROJECT, dir.path())
+            .env(CHILD_NOFILE, "80")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    )?;
     let host_json = dir.path().join(".hoh/host.json");
     let end = Instant::now() + Duration::from_secs(30);
     while !host_json.exists() && Instant::now() < end {
@@ -2106,13 +2190,6 @@ async fn a_blocked_stream_is_ended_after_the_grace() -> R {
 /// its host still runs, so no other host can take over (ADR-016 decision 12, M2T12R-120).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_writer_panic_keeps_the_project_locked() -> R {
-    #[derive(Debug)]
-    struct Panicking;
-    impl FaultHooks for Panicking {
-        fn before_commit(&self) -> Result<(), PersistError> {
-            std::panic::resume_unwind(Box::new("writer panic"));
-        }
-    }
     let dir = tempfile::tempdir()?;
     let mut panicking = config(dir.path());
     panicking.store.faults = Arc::new(Panicking);
@@ -2128,6 +2205,17 @@ async fn a_writer_panic_keeps_the_project_locked() -> R {
     )
     .await?;
     assert_eq!(reply.status, 503, "{reply:?}");
+    let error = reply.json()?;
+    assert_eq!(
+        (&error["code"], &error["retryable"]),
+        (&json!("GONE"), &json!(true)),
+        "{error}"
+    );
+    assert!(!host.writer_alive());
+    let health = send(&to, "GET", "/healthz", None, &[], b"")
+        .await?
+        .ok_or("no health answer")?;
+    assert_eq!(health.status, 503, "{health:?}");
     let refused = Host::start(config(dir.path()))
         .await
         .err()
@@ -2159,5 +2247,91 @@ async fn a_stopping_host_removes_only_its_own_files() -> R {
     );
     assert!(files.join("host.sock").exists());
     drop(other);
+    Ok(())
+}
+
+/// A host whose writer dies stops and its process exits 1: commands are 503 GONE (retry with the next host) and
+/// `/healthz` 503 meanwhile; once the process is gone the next host starts (ADR-016 decision 12, M2T12R-150).
+#[test]
+fn a_host_whose_writer_dies_exits_non_zero() -> R {
+    let dir = tempfile::tempdir()?;
+    let mut child = ChildGuard::spawn(
+        Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "host_child",
+                "--ignored",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(CHILD_PROJECT, dir.path())
+            .env(CHILD_PANIC, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    )?;
+    let host_json = dir.path().join(".hoh/host.json");
+    let end = Instant::now() + Duration::from_secs(30);
+    while !host_json.exists() && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let info: Value = serde_json::from_str(&std::fs::read_to_string(&host_json)?)?;
+    seed_runs_in(
+        dir.path(),
+        info["project_id"].as_str().ok_or("no project")?,
+        &["r1".to_owned()],
+    )?;
+    let port = u16::try_from(info["port"].as_u64().ok_or("no port")?)?;
+    let token = info["token"].as_str().ok_or("no token")?.to_owned();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let to = To::Tcp(port);
+        let reply = call(
+            &to,
+            "POST",
+            "/v1/commands",
+            &token,
+            &pause("c1", "k1", "r1", 0, "boom"),
+        )
+        .await?;
+        assert_eq!(reply.status, 503, "{reply:?}");
+        assert_eq!(reply.json()?["code"], "GONE");
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+    })?;
+    let end = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        assert!(
+            Instant::now() < end,
+            "the host did not stop after its writer died"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(status.code(), Some(1));
+    assert!(!host_json.exists());
+    runtime.block_on(async {
+        let next = start_when_free(config(dir.path())).await?;
+        assert_eq!(next.host_epoch, 2);
+        next.shutdown().await;
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+    })
+}
+
+/// The lock is the `.hoh` directory itself: removing host.lock while a host runs does not let a second host start
+/// (M2T12R-152).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removing_the_pid_file_does_not_free_the_project() -> R {
+    let dir = tempfile::tempdir()?;
+    let host = Host::start(config(dir.path())).await?;
+    std::fs::remove_file(dir.path().join(".hoh/host.lock"))?;
+    let refused = Host::start(config(dir.path()))
+        .await
+        .err()
+        .ok_or("a second host started")?;
+    assert_eq!(refused.exit_code, 69, "{refused}");
+    host.shutdown().await;
     Ok(())
 }
