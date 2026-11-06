@@ -1454,6 +1454,63 @@ fn a_long_definition_name_refuses_the_file_at_once() -> R {
     Ok(())
 }
 
+/// The schema output is bounded before it is read: a file over 16 MiB, more than 64 MiB in all, or more than 4096
+/// files is refused before parsing, so parsing and hashing it are bounded too (M1T07R-40, round 13). The recorded
+/// 0.166.0 output is 321 files, 3.7 MB, the largest 750 KB.
+#[test]
+fn schema_output_beyond_its_size_limits_is_refused_before_it_is_read() -> R {
+    let tmp = tempfile::tempdir()?;
+    let f = fixtures().join("codex/0.166.0");
+    for group in ["big-file", "many-files"] {
+        let schema = tmp.path().join(group);
+        std::fs::create_dir(&schema)?;
+        let copied = std::process::Command::new("cp")
+            .arg("-R")
+            .arg(f.join("app-server-schema/."))
+            .arg(&schema)
+            .status()?;
+        assert!(copied.success());
+        match group {
+            "big-file" => {
+                let mut value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
+                    schema.join("ClientRequest.json"),
+                )?)?;
+                value["description"] = serde_json::json!("x".repeat(17 * 1024 * 1024));
+                std::fs::write(
+                    schema.join("ClientRequest.json"),
+                    serde_json::to_vec(&value)?,
+                )?;
+            }
+            _ => {
+                let extra = schema.join("extra");
+                std::fs::create_dir(&extra)?;
+                for n in 0..4096 {
+                    std::fs::write(extra.join(format!("{n}.json")), "{}")?;
+                }
+            }
+        }
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n --help) cat '{f}/help.txt';;\n \
+             exec) [ \"$2\" = --help ] && cat '{f}/help-exec.txt';;\n \
+             app-server) case \"$2\" in\n  --help) cat '{f}/help-app-server.txt';;\n  generate-json-schema) [ \"$3\" = --out ] && mkdir -p \"$4\" && cp -R '{s}/.' \"$4/\";;\n  \
+             *) exit 2;;\n esac;;\n *) exit 2;;\nesac\n",
+            f = f.display(),
+            s = schema.display()
+        );
+        let (dir, _) = fake(tmp.path(), &format!("{group}-bin"), "codex", &script)?;
+        match probe(Agent::Codex, &env_for(&dir)) {
+            Err(ProbeError::Failed { detail, .. }) => {
+                assert!(
+                    detail.contains("too large") || detail.contains("too many"),
+                    "{group}: {detail}"
+                )
+            }
+            other => return Err(format!("{group}: {other:?}").into()),
+        }
+    }
+    Ok(())
+}
+
 /// Validation is bounded in work, not only in depth: a `RequestId` whose `anyOf` names itself twice, or a chain of
 /// definitions each naming the next twice, would take exponential time; within its budget the probe calls the ids
 /// undecided, so the requests are absent, and it ends at once (M1T07R-40).
@@ -1521,9 +1578,10 @@ fn a_schema_that_branches_without_end_is_undecided_at_once() -> R {
         let mut value: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(schema.join("ClientRequest.json"))?)?;
         change(&mut value);
+        // Compact, so the largest case stays within the 16 MiB a schema file may have.
         std::fs::write(
             schema.join("ClientRequest.json"),
-            serde_json::to_vec_pretty(&value)?,
+            serde_json::to_vec(&value)?,
         )?;
         let script = format!(
             "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n --help) cat '{f}/help.txt';;\n \
