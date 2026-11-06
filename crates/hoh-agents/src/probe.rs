@@ -310,8 +310,9 @@ thread_local! {
 /// amount, however often it is used (M1T07R-40). The recorded 0.166.0 schema's longest is 54 bytes.
 const MAX_NAME: usize = 256;
 
-/// The largest App Server schema output the probe reads: a file, all files, the number of files (the recorded 0.166.0
-/// output is 321 files, 3.7 MB in all, the largest 750 KB); beyond them it is refused before parsing (M1T07R-40).
+/// The largest App Server schema output the probe reads: a file, all files, the number of entries (files and
+/// directories; the recorded 0.166.0 output is 321 files, 3.7 MB in all, the largest 750 KB); beyond them it is
+/// refused before parsing (M1T07R-40).
 const MAX_SCHEMA_FILE: u64 = 16 * 1024 * 1024;
 const MAX_SCHEMA_TOTAL: u64 = 64 * 1024 * 1024;
 const MAX_SCHEMA_FILES: usize = 4096;
@@ -1039,6 +1040,9 @@ fn takes_every_id(
 /// -26, -27, M1R-04). doctor --live reads the schema through it too, so it never drives an App Server whose schema the
 /// probe refused (M1T07R-31).
 pub fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<CodexSchema, ProbeError> {
+    // Generating, reading and removing the schema share one window: doctor's shared deadline, or without one the
+    // probe's own command limit (M1T07R-40).
+    let until = reading_deadline(env, Instant::now());
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -1058,19 +1062,13 @@ pub fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<CodexSchema, Prob
         };
         // Reading the schema is bounded by doctor's shared deadline, or without one by the probe's own command limit
         // (M1T07R-40).
-        let until = Some(reading_deadline(env, Instant::now()));
+        let until = Some(until);
         let work = Work::new(VALIDATION_BUDGET, until);
         // The checks before validation are linear in the files; only the deadline bounds them, each file's bytes
         // counted before it is parsed (M1T07R-40, -42).
         let checks = Work::new(u64::MAX, until);
-        // Bounded before anything is read, so parsing and hashing are bounded too (M1T07R-40).
-        let files = files_under(&dir)?;
-        if files.len() > MAX_SCHEMA_FILES {
-            return Err(unusable(format!(
-                "too many schema files: {} (at most {MAX_SCHEMA_FILES})",
-                files.len()
-            )));
-        }
+        // Bounded before anything is read, so walking, parsing and hashing are bounded too (M1T07R-40).
+        let files = schema_files(&dir, &checks).map_err(unusable)?;
         let mut total = 0u64;
         for file in &files {
             let size = std::fs::metadata(file)?.len();
@@ -1084,7 +1082,7 @@ pub fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<CodexSchema, Prob
         }
         let mut parsed = BTreeMap::new();
         let mut texts = BTreeMap::new();
-        for file in files {
+        for file in files.iter().cloned() {
             if file.extension().is_some_and(|e| e == "json") {
                 let bytes = std::fs::read(&file)?;
                 if !checks.spend(bytes.len()) {
@@ -1168,11 +1166,80 @@ pub fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<CodexSchema, Prob
                 false,
                 &|m: &str| serde_json::json!({"method": m, "params": {}}),
             )?,
-            hash: tree_sha256(&dir)?,
+            hash: tree_sha256_of(&dir, &files)?,
         })
     })();
-    let _ = std::fs::remove_dir_all(&dir);
-    result
+    // A CLI that filled its output cannot hold the probe past the window: what is not removed by then is left, and
+    // the probe's failure says where (M1T07R-40).
+    match (result, remove_within(&dir, until + CLEANUP_GRACE)) {
+        (Err(ProbeError::Failed { argv, detail }), false) => Err(ProbeError::Failed {
+            argv,
+            detail: format!("{detail}; its output is left at {}", dir.display()),
+        }),
+        (result, _) => result,
+    }
+}
+
+/// How long removing a probe's scratch directory may run past the reading window.
+const CLEANUP_GRACE: Duration = Duration::from_secs(2);
+
+/// The files of a schema output directory. Every entry, directory or file, costs a step, and more than
+/// [`MAX_SCHEMA_FILES`] entries refuse the output, so the walk cannot grow with what the CLI wrote (M1T07R-40).
+fn schema_files(root: &Path, work: &Work) -> Result<Vec<PathBuf>, String> {
+    let mut out = Vec::new();
+    let mut entries = 0usize;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))? {
+            entries += 1;
+            if entries > MAX_SCHEMA_FILES {
+                return Err(format!(
+                    "too many schema files or directories (more than {MAX_SCHEMA_FILES})"
+                ));
+            }
+            if !work.spend(1) {
+                return Err("the schema output was not read within the time limit".to_owned());
+            }
+            let entry = entry.map_err(|e| e.to_string())?;
+            let kind = entry.file_type().map_err(|e| e.to_string())?;
+            if kind.is_dir() {
+                stack.push(entry.path());
+            } else if kind.is_file() {
+                out.push(entry.path());
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Remove `dir` and what it holds, giving up at `until`; true when it is gone.
+fn remove_within(dir: &Path, until: Instant) -> bool {
+    let mut stack = vec![(dir.to_path_buf(), false)];
+    let mut seen = 0u64;
+    while let Some((path, emptied)) = stack.pop() {
+        if emptied {
+            let _ = std::fs::remove_dir(&path);
+            continue;
+        }
+        stack.push((path.clone(), true));
+        let Ok(entries) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            seen += 1;
+            if seen.is_multiple_of(256) && Instant::now() >= until {
+                return false;
+            }
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => stack.push((entry.path(), false)),
+                _ => {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+    !dir.exists()
 }
 
 /// Claude Code: `-p --output-format stream-json`; partial messages and resume from `--help`.
@@ -1438,15 +1505,20 @@ fn files_under(root: &Path) -> io::Result<Vec<PathBuf>> {
 /// sha256 over the sorted lines `<relative path> <sha256 of file>\n` of every file under `root` (the same tree hash
 /// tests/fixtures/protocol/record.py uses).
 pub fn tree_sha256(root: &Path) -> io::Result<String> {
+    tree_sha256_of(root, &files_under(root)?)
+}
+
+/// [`tree_sha256`] over files already listed (each under `root`).
+fn tree_sha256_of(root: &Path, files: &[PathBuf]) -> io::Result<String> {
     let mut lines = Vec::new();
-    for file in files_under(root)? {
+    for file in files {
         let rel = file.strip_prefix(root).map_err(io::Error::other)?;
         let rel = rel
             .components()
             .map(|c| c.as_os_str().to_string_lossy().into_owned())
             .collect::<Vec<_>>()
             .join("/");
-        lines.push(format!("{rel} {}\n", file_sha256(&file)?));
+        lines.push(format!("{rel} {}\n", file_sha256(file)?));
     }
     lines.sort();
     Ok(hex(&Sha256::digest(lines.concat().as_bytes())))
@@ -2209,5 +2281,48 @@ mod tests {
             schema_methods(&file, false, &Work::new(u64::MAX, past)),
             Err(())
         );
+    }
+
+    /// The walk of a schema output counts every entry and reads the deadline (M1T07R-40, round 14).
+    #[test]
+    fn the_schema_walk_counts_entries_and_reads_the_deadline()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        for n in 0..MAX_SCHEMA_FILES {
+            std::fs::write(root.path().join(format!("{n}.json")), "{}")?;
+        }
+        let past = Some(Instant::now() - Duration::from_secs(1));
+        assert_eq!(
+            schema_files(root.path(), &Work::new(u64::MAX, None))?.len(),
+            MAX_SCHEMA_FILES
+        );
+        assert!(
+            schema_files(root.path(), &Work::new(u64::MAX, past))
+                .is_err_and(|e| e.contains("time limit"))
+        );
+        std::fs::create_dir(root.path().join("one-more"))?;
+        assert!(
+            schema_files(root.path(), &Work::new(u64::MAX, None))
+                .is_err_and(|e| e.contains("too many"))
+        );
+        Ok(())
+    }
+
+    /// A scratch directory is removed within its deadline, or left (M1T07R-40, round 14).
+    #[test]
+    fn scratch_is_removed_within_its_deadline() -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        for (name, until, gone) in [
+            ("in-time", Instant::now() + Duration::from_secs(60), true),
+            ("late", Instant::now() - Duration::from_secs(1), false),
+        ] {
+            let dir = root.path().join(name);
+            for n in 0..5_000 {
+                std::fs::create_dir_all(dir.join(format!("{}/{n}", n % 7)))?;
+            }
+            assert_eq!(remove_within(&dir, until), gone, "{name}");
+            assert_eq!(dir.exists(), !gone, "{name}");
+        }
+        Ok(())
     }
 }
