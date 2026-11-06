@@ -562,3 +562,54 @@ async fn test_037_01_random_lease_sequences_keep_one_writer_and_rising_epochs() 
     assert!(refused_rounds > 0, "no round ever found its slot held");
     Ok(())
 }
+
+#[tokio::test]
+async fn a_round_ranks_with_the_snapshot_weights_and_the_tasks_left_wait() -> R {
+    let dir = tempfile::tempdir()?;
+    let (store, db) = open(&dir)?;
+    seed(&db, WORLD)?;
+    // Only information gain counts in R's snapshot: T2 (information 1) outranks T1 (user value 5), which would win
+    // under the default weights.
+    seed(
+        &db,
+        "UPDATE runs SET config_snapshot_json = '{\"scheduler\": {\"weights\": {\"user_value\": 0, \"unblock_value\": 0, \
+         \"risk_reduction\": 0, \"information_gain\": 1}}}' WHERE run_id = 'R';
+         UPDATE tasks SET user_value = 5 WHERE task_id = 'T1';
+         UPDATE tasks SET information_gain = 1 WHERE task_id = 'T2';",
+    )?;
+    let round = store.schedule_round("R", context()).await?;
+    let dispatched = round.dispatched.ok_or("nothing dispatched")?;
+    assert_eq!(dispatched.task_id, "T2", "{:?}", dispatched.score);
+    assert_eq!(round.waited, ["T1"]);
+    let seq = round.event_seq.ok_or("no event")?;
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT task_id, state, wait_rounds, first_eligible_seq FROM tasks WHERE task_id IN ('T1', 'T2') ORDER BY task_id"
+        )?,
+        [
+            [json!("T1"), json!("READY"), json!(1), json!(seq)],
+            [json!("T2"), json!("LEASED"), json!(0), json!(seq)]
+        ]
+    );
+    let event: Value = serde_json::from_str(
+        rows(
+            &db,
+            "SELECT payload_json FROM events WHERE kind = 'schedule.round'",
+        )?[0][0]
+            .as_str()
+            .ok_or("no payload")?,
+    )?;
+    assert_eq!(event["weights"]["information_gain"], json!(1));
+    assert_eq!(event["weights"]["user_value"], json!(0));
+    // Both are writer tasks and T2 holds the writer lease now: the next round can select nothing, so it writes
+    // nothing (T1 does not age for it).
+    let next = store.schedule_round("R", context()).await?;
+    assert_eq!(next.dispatched, None);
+    assert_eq!(
+        rows(&db, "SELECT wait_rounds FROM tasks WHERE task_id = 'T1'")?,
+        [[json!(1)]],
+        "a round that selects nothing writes nothing"
+    );
+    Ok(())
+}
