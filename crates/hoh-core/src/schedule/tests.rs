@@ -267,3 +267,270 @@ fn layer_0_stays_ahead_of_aged_tasks() {
     assert_eq!(ids(&ranked), ["crit", "aged"]);
     assert_eq!(ranked[1].tier, Tier::Aged);
 }
+
+/// How a generated task starts (AC-038-02: some are accepted already, leased, bound to an old spec revision,
+/// missing a role capability or over budget).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Start {
+    Open,
+    Accepted,
+    Leased,
+    OldSpec,
+    Incapable,
+    OverBudget,
+}
+
+/// One generated task: dependencies are picks among the tasks before it, so the graph is acyclic.
+#[derive(Debug, Clone)]
+struct GenTask {
+    picks: Vec<u16>,
+    layer: u8,
+    writer: bool,
+    scores: [u8; 4],
+    cost: Option<u8>,
+    start: Start,
+    waited: u32,
+    name: u32,
+}
+
+fn gen_task() -> impl proptest::strategy::Strategy<Value = GenTask> {
+    use proptest::prelude::*;
+    let start = prop_oneof![
+        14 => Just(Start::Open),
+        2 => Just(Start::Accepted),
+        1 => Just(Start::Leased),
+        1 => Just(Start::OldSpec),
+        1 => Just(Start::Incapable),
+        1 => Just(Start::OverBudget),
+    ];
+    (
+        proptest::collection::vec(any::<u16>(), 0..=3),
+        0u8..=2,
+        any::<bool>(),
+        proptest::array::uniform4(0u8..=5),
+        proptest::option::of(1u8..=5),
+        start,
+        0u32..=25,
+        any::<u32>(),
+    )
+        .prop_map(
+            |(picks, layer, writer, scores, cost, start, waited, name)| GenTask {
+                picks,
+                layer,
+                writer,
+                scores,
+                cost,
+                start,
+                waited,
+                name,
+            },
+        )
+}
+
+/// A generated world: tasks, their dependency lists (by index) and their dependents.
+struct World {
+    tasks: Vec<GenTask>,
+    deps: Vec<Vec<usize>>,
+    dependents: Vec<Vec<usize>>,
+    ids: Vec<String>,
+}
+
+impl World {
+    fn new(tasks: Vec<GenTask>) -> World {
+        let mut deps = Vec::with_capacity(tasks.len());
+        let mut dependents = vec![Vec::new(); tasks.len()];
+        for (i, t) in tasks.iter().enumerate() {
+            let mut mine: Vec<usize> = if i == 0 {
+                Vec::new()
+            } else {
+                t.picks.iter().map(|p| usize::from(*p) % i).collect()
+            };
+            mine.sort_unstable();
+            mine.dedup();
+            for &d in &mine {
+                dependents[d].push(i);
+            }
+            deps.push(mine);
+        }
+        let ids = tasks
+            .iter()
+            .enumerate()
+            .map(|(i, t)| format!("t{:08x}-{i}", t.name))
+            .collect();
+        World {
+            tasks,
+            deps,
+            dependents,
+            ids,
+        }
+    }
+
+    fn candidate(&self, i: usize) -> Candidate {
+        let t = &self.tasks[i];
+        Candidate {
+            task_id: self.ids[i].clone(),
+            created_seq: i64::try_from(i).unwrap_or(i64::MAX),
+            layer: t.layer,
+            writer: t.writer,
+            user_value: t.scores[0],
+            unblock_value: t.scores[1],
+            risk_reduction: t.scores[2],
+            information_gain: t.scores[3],
+            cost_estimate: t.cost,
+            wait_rounds: t.waited,
+            first_eligible_seq: None,
+            eligibility: Eligibility {
+                dependencies_accepted: true,
+                current_spec: t.start != Start::OldSpec,
+                not_leased: t.start != Start::Leased,
+                capable: t.start != Start::Incapable,
+                budget_reservable: t.start != Start::OverBudget,
+            },
+        }
+    }
+
+    /// Select until nothing is eligible, the tasks given in `order`; a selected task counts as accepted. Each pick is
+    /// checked against the world itself (not against the scheduler's own facts). The dispatch sequence and the number
+    /// of picks that broke an eligibility condition.
+    fn dispatch(&self, params: &Params, order: &[usize]) -> (Vec<String>, usize) {
+        let n = self.tasks.len();
+        let mut accepted: Vec<bool> = self
+            .tasks
+            .iter()
+            .map(|t| t.start == Start::Accepted)
+            .collect();
+        let mut open: Vec<usize> = (0..n)
+            .map(|i| self.deps[i].iter().filter(|d| !accepted[**d]).count())
+            .collect();
+        // The board as two parallel vectors: world index and candidate (the scheduler reads the candidates as is).
+        let position: Vec<usize> = {
+            let mut at = vec![0; n];
+            for (p, &i) in order.iter().enumerate() {
+                at[i] = p;
+            }
+            at
+        };
+        let mut index: Vec<usize> = order
+            .iter()
+            .copied()
+            .filter(|i| !accepted[*i] && open[*i] == 0)
+            .collect();
+        let mut board: Vec<Candidate> = index.iter().map(|&i| self.candidate(i)).collect();
+        let mut sequence = Vec::new();
+        let mut violations = 0;
+        let mut round_seq = 0_i64;
+        loop {
+            round_seq += 1;
+            for c in &mut board {
+                if c.eligibility.eligible() {
+                    c.first_eligible_seq.get_or_insert(round_seq);
+                }
+            }
+            let outcome = round(params, &board, FREE);
+            let Some(selected) = outcome.selected else {
+                break;
+            };
+            for &w in &outcome.waited {
+                board[w].wait_rounds += 1;
+            }
+            let at = board
+                .iter()
+                .position(|c| c.task_id == selected.task_id)
+                .unwrap_or(usize::MAX);
+            board.swap_remove(at);
+            let chosen = index.swap_remove(at);
+            let t = &self.tasks[chosen];
+            let fits = self.deps[chosen].iter().all(|d| accepted[*d])
+                && !accepted[chosen]
+                && t.start == Start::Open;
+            if !fits {
+                violations += 1;
+            }
+            sequence.push(selected.task_id);
+            accepted[chosen] = true;
+            let mut newly: Vec<usize> = Vec::new();
+            for &d in &self.dependents[chosen] {
+                open[d] -= 1;
+                if open[d] == 0 && !accepted[d] {
+                    newly.push(d);
+                }
+            }
+            // They join in the given order's sense: by their position in `order`.
+            newly.sort_by_key(|d| position[*d]);
+            for d in newly {
+                index.push(d);
+                board.push(self.candidate(d));
+            }
+        }
+        (sequence, violations)
+    }
+}
+
+#[test]
+fn test_038_02_random_dags_dispatch_identically_in_any_order() {
+    use proptest::prelude::*;
+    use proptest::test_runner::{Config, RngAlgorithm, TestRng, TestRunner};
+    use std::sync::Mutex;
+    let config = Config {
+        cases: 1000,
+        failure_persistence: None,
+        max_shrink_iters: 0,
+        ..Config::default()
+    };
+    let seed = *b"hoh-test-038-02-fixed-seed-00001";
+    let mut runner =
+        TestRunner::new_with_rng(config, TestRng::from_seed(RngAlgorithm::ChaCha, &seed));
+    // Mostly sizes across 10..=999, about one in twenty exactly 1000.
+    let size = prop_oneof![19 => 10usize..=999, 1 => Just(1000usize)];
+    let worlds = size.prop_flat_map(|n| proptest::collection::vec(gen_task(), n));
+    let log: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
+    let params = Params::default();
+    let result = runner.run(&worlds, |tasks| {
+        let world = World::new(tasks);
+        let n = world.tasks.len();
+        let original: Vec<usize> = (0..n).collect();
+        let (first, violations) = world.dispatch(&params, &original);
+        prop_assert_eq!(violations, 0, "a pick broke an eligibility condition");
+        for seed in 1..=3_u64 {
+            let order = shuffled(&original, seed ^ u64::try_from(n).unwrap_or(0));
+            let (again, violations) = world.dispatch(&params, &order);
+            prop_assert_eq!(violations, 0, "a pick broke an eligibility condition");
+            prop_assert_eq!(
+                &again,
+                &first,
+                "the order of the input changed the dispatch"
+            );
+        }
+        if let Ok(mut log) = log.lock() {
+            log.push((n, first.len(), violations));
+        }
+        Ok(())
+    });
+    assert!(result.is_ok(), "{result:?}");
+    let log = log.into_inner().unwrap_or_default();
+    assert_eq!(log.len(), 1000);
+    assert!(
+        log.iter().any(|(n, _, _)| *n == 1000),
+        "no case of 1000 tasks"
+    );
+    assert!(log.iter().all(|(n, _, _)| (10..=1000).contains(n)));
+    if let Some(dir) = std::env::var_os("HOH_EVIDENCE_DIR") {
+        let cases: Vec<serde_json::Value> = log
+            .iter()
+            .map(|(n, picks, violations)| {
+                serde_json::json!({"tasks": n, "dispatched": picks, "violations": violations})
+            })
+            .collect();
+        let doc = serde_json::json!({
+            "test": "TEST-038-02",
+            "seed": String::from_utf8_lossy(&seed),
+            "rng": "ChaCha",
+            "orders_per_case": 4,
+            "cases": cases,
+        });
+        let _ = std::fs::write(
+            std::path::Path::new(&dir).join("test-038-02-cases.json"),
+            serde_json::to_vec_pretty(&doc).unwrap_or_default(),
+        );
+    }
+}
