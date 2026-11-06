@@ -537,12 +537,20 @@ sys.argv=['record.py','--agents','pi'];sys.exit(record.main())
 ''')
         p=subprocess.run([sys.executable,str(driver),str(repo),str(root),str(script),str(pidfile)],capture_output=True,text=True,timeout=90)
         # Only scopes running this test's own child count (and are stopped): concurrent bundle runs have their own.
-        scopes=subprocess.run(['systemctl','--user','list-units','hoh-recorder-*','--no-legend','--plain','--full'],capture_output=True,text=True).stdout
-        mine=[line for line in scopes.splitlines() if str(script) in line]
+        def mine():
+            scopes=subprocess.run(['systemctl','--user','list-units','hoh-recorder-*','--no-legend','--plain','--full'],capture_output=True,text=True).stdout
+            return [line.split()[0] for line in scopes.splitlines() if str(script) in line]
+        # The kernel decides at once: a scope still listed must already be empty. systemd removes the unit only after
+        # it has seen the cgroup empty, a few ms after the recorder did, so the listing gets a bounded wait.
+        base=record.require_scopes();occupied={unit:record.members(base/unit) for unit in mine()}
+        occupied={unit:pids for unit,pids in occupied.items() if pids}
+        deadline=time.monotonic()+5;listed=mine()
+        while listed and time.monotonic()<deadline:time.sleep(0.01);listed=mine()
         leaked=pidfile.exists() and record.alive(int(pidfile.read_text()))
         if leaked:os.kill(int(pidfile.read_text()),signal.SIGKILL)
-        for line in mine:subprocess.run(['systemctl','--user','stop',line.split()[0]],capture_output=True)
-        self.assertEqual(p.returncode,128+signal.SIGTERM,p.stderr[-2000:]);self.assertEqual(mine,[]);self.assertFalse(leaked)
+        for unit in listed:subprocess.run(['systemctl','--user','stop',unit],capture_output=True)
+        self.assertEqual(p.returncode,128+signal.SIGTERM,p.stderr[-2000:]);self.assertEqual(occupied,{});self.assertEqual(listed,[])
+        self.assertFalse(leaked)
     def test_version_probe_leaves_nothing_behind(self):
         t=tempfile.TemporaryDirectory();self.addCleanup(t.cleanup);d=Path(t.name);script=d/'child.py';script.write_text(SLEEPER)
         self.assertEqual(record.first_line([sys.executable,str(script),'version-probe',str(d/'probe.pid')]),'9.9.9')
