@@ -1454,7 +1454,10 @@ async fn what_the_writer_keeps_goes_after_the_last_write() -> R {
     );
     release.send(())?;
     assert!(matches!(command.await??, CommandOutcome::Accepted { .. }));
-    tokio::time::timeout(Duration::from_secs(5), ended).await?;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), ended).await?,
+        "a writer that finished read as failed"
+    );
     assert!(dropped.load(Ordering::SeqCst));
     let (state, revision, events, outbox) = snapshot(&path)?;
     assert_eq!(
