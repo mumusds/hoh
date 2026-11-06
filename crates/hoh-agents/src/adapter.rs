@@ -50,9 +50,23 @@ impl std::fmt::Display for AdapterError {
 
 impl std::error::Error for AdapterError {}
 
+/// The sha256 of a raw log, read in fixed-size pieces: a turn's logs are not bounded by the frame limit or the stderr
+/// tail, so the whole file is never held in memory (M1R-05).
 pub(crate) fn sha256_file(path: &Path) -> std::io::Result<String> {
-    let bytes = std::fs::read(path)?;
-    Ok(Sha256::digest(&bytes)
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut piece = vec![0u8; 1 << 16];
+    loop {
+        match file.read(&mut piece) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&piece[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(hasher
+        .finalize()
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect())
@@ -541,5 +555,71 @@ mod help_tests {
     fn commands_are_read_from_their_column() {
         assert!(lists_command(HELP, "help") && lists_command(HELP, "review"));
         assert!(!lists_command(HELP, "resume"));
+    }
+}
+
+#[cfg(test)]
+mod hash_tests {
+    use super::*;
+
+    /// Set for the child process [`a_raw_log_larger_than_the_memory_allowed_is_hashed`] starts.
+    const BOUNDED_CHILD: &str = "HOH_TEST_BOUNDED_HASH_FILE";
+
+    /// A raw log is hashed in fixed-size pieces: a process allowed 64 MiB of data hashes a 256 MiB log, so a large log
+    /// never turns a finished turn into an I/O error (M1R-05).
+    #[test]
+    fn a_raw_log_larger_than_the_memory_allowed_is_hashed() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let tmp = tempfile::tempdir()?;
+        let log = tmp.path().join("stderr.log");
+        std::fs::File::create(&log)?.set_len(256 << 20)?;
+        // The same bytes hashed here, piece by piece, without the function under test.
+        let mut expected = Sha256::new();
+        let zeros = vec![0u8; 1 << 20];
+        for _ in 0..256 {
+            expected.update(&zeros);
+        }
+        let expected: String = expected
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let out = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "adapter::hash_tests::bounded_hash_child",
+                "--ignored",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(BOUNDED_CHILD, &log)
+            .output()?;
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{said}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(said.contains(&format!("hashed {expected}")), "{said}");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "run by a_raw_log_larger_than_the_memory_allowed_is_hashed in a process of its own"]
+    fn bounded_hash_child() -> Result<(), Box<dyn std::error::Error>> {
+        let Some(log) = std::env::var_os(BOUNDED_CHILD) else {
+            return Ok(());
+        };
+        use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+        let old = getrlimit(Resource::Data);
+        setrlimit(
+            Resource::Data,
+            Rlimit {
+                current: Some(64 << 20),
+                maximum: old.maximum,
+            },
+        )?;
+        println!("hashed {}", sha256_file(Path::new(&log))?);
+        Ok(())
     }
 }
