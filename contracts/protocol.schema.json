@@ -648,13 +648,27 @@
                     "type": "object",
                     "minProperties": 1
                   },
+                  "scheduler": {
+                    "$ref": "#/$defs/SchedulerSettings"
+                  },
                   "apply_at": {
                     "const": "checkpoint"
                   }
                 },
                 "required": [
-                  "bindings",
                   "apply_at"
+                ],
+                "anyOf": [
+                  {
+                    "required": [
+                      "bindings"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "scheduler"
+                    ]
+                  }
                 ]
               }
             }
@@ -949,7 +963,8 @@
         "ROLE_CAPABILITY_MISSING",
         "EVIDENCE_GATE_UNMET",
         "SESSION_NOT_INDEPENDENT",
-        "KEY_REUSE"
+        "KEY_REUSE",
+        "LEASE_UNAVAILABLE"
       ]
     },
     "ErrorCode": {
@@ -968,8 +983,50 @@
         "DAG_CYCLE",
         "DAG_MISSING_DEPENDENCY",
         "SCORE_OUT_OF_RANGE",
-        "CURSOR_EXPIRED"
+        "CURSOR_EXPIRED",
+        "DAG_DUPLICATE_TASK",
+        "RUN_CONFIG_FROZEN"
       ]
+    },
+    "SchedulerSettings": {
+      "description": "Scheduler parameters (CR-007): the [scheduler] config keys, the run config snapshot key `scheduler` and ConfigureTeam payload.scheduler share this shape. In a command every member is optional and at least one is given; a missing member of a snapshot reads as its default (weights 4/3/3/2, max_wait_rounds 20).",
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "weights": {
+          "type": "object",
+          "additionalProperties": false,
+          "minProperties": 1,
+          "properties": {
+            "user_value": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 10
+            },
+            "unblock_value": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 10
+            },
+            "risk_reduction": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 10
+            },
+            "information_gain": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 10
+            }
+          }
+        },
+        "max_wait_rounds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        }
+      }
     },
     "ReasonCode": {
       "description": "Every reason code HoH emits. New codes need a CR (CR-003).",

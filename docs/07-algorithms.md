@@ -8,6 +8,8 @@
 
 排序分层：关键回归/数据完整性问题→解阻任务→普通任务；层内score=(4*user_value+3*unblock_value+3*risk_reduction+2*information_gain+age_bonus)/max(cost_estimate,1)。输入分值限定0..5，cost是粗粒度工作量而非虚假精确美元；无估计用中位桶。最后按created_seq,task_id稳定打破平局。age_bonus上限10，用于普通排序中的轻度老化；但有上限的老化不能保证不饥饿（分差超过10/cost时永远追不上）。因此另设max_wait_rounds（初值20，CR-002）：eligible但未被选的轮数达到上限的任务进入位于层0与层1之间的老化子层，子层内按首次eligible序号FIFO。这样只要层0为空，任一任务的等待轮数都有上界。
 
+权重（上式中的 4、3、3、2）与 max_wait_rounds 是配置 `[scheduler]` 的键（CR-007），StartRun 时写入 Run 配置快照的 `scheduler` 键，快照缺键按默认值读。快照写入后不再改变：对已存在的 Run 提交带 `scheduler` 的 ConfigureTeam 返回 409 RUN_CONFIG_FROZEN，变更只对之后启动的 Run 生效。每轮调度的事件记下所用的参数。age_bonus 的上限 10 与缺估计时的中位桶是固定规则，不可配置。
+
 租约申请在同事务CAS revision；记录lease_owner/epoch/expiry。过期不能直接认为旧进程死：先检查/取消并fence旧结果。每个repo写槽=1；QA/Review读槽独立；Commander有保留槽。不要让排队并发过高吃完模型限额。
 
 ## 2. 双状态增量与净进展

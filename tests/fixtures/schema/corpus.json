@@ -1616,6 +1616,171 @@
   {
    "schema": "protocol",
    "def": "Command",
+   "valid": true,
+   "note": "ConfigureTeam with scheduler only (CR-007)",
+   "instance": {
+    "schema_version": "1.0",
+    "command_id": "cmd1",
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "kind": "ConfigureTeam",
+    "run_id": "r1",
+    "payload": {
+     "scheduler": {
+      "weights": {
+       "user_value": 1,
+       "unblock_value": 1,
+       "risk_reduction": 1,
+       "information_gain": 1
+      }
+     },
+     "apply_at": "checkpoint"
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Command",
+   "valid": true,
+   "note": "ConfigureTeam with bindings and scheduler (CR-007)",
+   "instance": {
+    "schema_version": "1.0",
+    "command_id": "cmd1",
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "kind": "ConfigureTeam",
+    "run_id": "r1",
+    "payload": {
+     "bindings": {
+      "qa": "pi"
+     },
+     "scheduler": {
+      "max_wait_rounds": 30
+     },
+     "apply_at": "checkpoint"
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Command",
+   "valid": false,
+   "note": "anyOf: ConfigureTeam needs bindings or scheduler (CR-007)",
+   "instance": {
+    "schema_version": "1.0",
+    "command_id": "cmd1",
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "kind": "ConfigureTeam",
+    "run_id": "r1",
+    "payload": {
+     "apply_at": "checkpoint"
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Command",
+   "valid": false,
+   "note": "minProperties: scheduler (CR-007)",
+   "instance": {
+    "schema_version": "1.0",
+    "command_id": "cmd1",
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "kind": "ConfigureTeam",
+    "run_id": "r1",
+    "payload": {
+     "scheduler": {},
+     "apply_at": "checkpoint"
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Command",
+   "valid": false,
+   "note": "additionalProperties: scheduler (CR-007)",
+   "instance": {
+    "schema_version": "1.0",
+    "command_id": "cmd1",
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "kind": "ConfigureTeam",
+    "run_id": "r1",
+    "payload": {
+     "scheduler": {
+      "age_bonus_cap": 5
+     },
+     "apply_at": "checkpoint"
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Command",
+   "valid": false,
+   "note": "maximum: scheduler weight (CR-007)",
+   "instance": {
+    "schema_version": "1.0",
+    "command_id": "cmd1",
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "kind": "ConfigureTeam",
+    "run_id": "r1",
+    "payload": {
+     "scheduler": {
+      "weights": {
+       "user_value": 11
+      }
+     },
+     "apply_at": "checkpoint"
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Command",
+   "valid": false,
+   "note": "minimum: max_wait_rounds (CR-007)",
+   "instance": {
+    "schema_version": "1.0",
+    "command_id": "cmd1",
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "kind": "ConfigureTeam",
+    "run_id": "r1",
+    "payload": {
+     "scheduler": {
+      "max_wait_rounds": 0
+     },
+     "apply_at": "checkpoint"
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Command",
+   "valid": false,
+   "note": "minProperties: scheduler weights (CR-007)",
+   "instance": {
+    "schema_version": "1.0",
+    "command_id": "cmd1",
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "kind": "ConfigureTeam",
+    "run_id": "r1",
+    "payload": {
+     "scheduler": {
+      "weights": {}
+     },
+     "apply_at": "checkpoint"
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Command",
    "valid": false,
    "note": "enum: approval decision",
    "instance": {

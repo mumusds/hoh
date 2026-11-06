@@ -17,6 +17,15 @@ max_delivery_attempts = 5
 [persistence]
 # Bounded writer actor queue; a full queue rejects with 503 DB_BUSY instead of growing (REQ-062).
 writer_queue_capacity = 256
+[scheduler]
+# Task scheduling (REQ-038, CR-007). Copied into each run's config snapshot at StartRun; a run keeps its snapshot
+# (a ConfigureTeam that changes these for an existing run is refused: 409 RUN_CONFIG_FROZEN).
+max_wait_rounds = 20
+[scheduler.weights]
+user_value = 4
+unblock_value = 3
+risk_reduction = 3
+information_gain = 2
 # Per role: agent (codex|claude|pi), optional model (empty = native default, resolved model is recorded),
 # optional ordered fallback agents (none by default -> BLOCKED), optional prompt override path.
 # Unknown keys are rejected (REQ-018). Changes apply at the next checkpoint with a new role_epoch.
