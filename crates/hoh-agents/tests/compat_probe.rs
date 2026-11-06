@@ -1357,6 +1357,9 @@ fn a_schema_number_that_cannot_be_read_exactly_refuses_the_file() -> R {
         ("rounded-up", "0.99999999999999999", true),
         ("beyond-64-bits", "18446744073709551616", true),
         ("half-past-2-53", "9007199254740993.5", true),
+        // Above 2^53 a decimal must be the integer it is stored as (M1T07R-39, round 10).
+        ("large-decimal", "1000000000000000100.0", true),
+        ("large-exact", "1000000000000000128.0", false),
         ("a-tenth", "0.7", false),
         ("zero", "0", false),
     ] {
@@ -1403,7 +1406,30 @@ fn a_schema_that_branches_without_end_is_undecided_at_once() -> R {
     let tmp = tempfile::tempdir()?;
     let f = fixtures().join("codex/0.166.0");
     type Change = fn(&mut serde_json::Value);
-    let cases: [(&str, Change); 2] = [
+    let cases: [(&str, Change); 5] = [
+        // Wide members and long enums cost a step each, cloned or scanned (M1T07R-40, round 10).
+        ("wide-reused", |v| {
+            let members: Vec<serde_json::Value> = (0..12_000)
+                .map(|_| serde_json::json!({"type": "integer"}))
+                .collect();
+            v["definitions"]["D"] = serde_json::json!({"anyOf": members});
+            let refs: Vec<serde_json::Value> = (0..12_000)
+                .map(|_| serde_json::json!({"$ref": "#/definitions/D"}))
+                .collect();
+            v["definitions"]["RequestId"] = serde_json::json!({"allOf": refs});
+        }),
+        ("enum-cycle", |v| {
+            let values: Vec<i64> = (1..8_001).collect();
+            v["definitions"]["RequestId"] = serde_json::json!({"anyOf": [
+                {"anyOf": [{"$ref": "#/definitions/RequestId"}, {"enum": values}]},
+                {"anyOf": [{"$ref": "#/definitions/RequestId"}, {"enum": values}]}]});
+        }),
+        ("long-enum", |v| {
+            let values: Vec<i64> = (1..20_001).collect();
+            for branch in v["oneOf"].as_array_mut().into_iter().flatten() {
+                branch["properties"]["id"] = serde_json::json!({"enum": values});
+            }
+        }),
         ("branching-cycle", |v| {
             v["definitions"]["RequestId"] = serde_json::json!({"anyOf": [
                 {"$ref": "#/definitions/RequestId"}, {"$ref": "#/definitions/RequestId"}]});
