@@ -183,3 +183,11 @@ Owner instructions of 2026-11-06 (continuing and waiting, session identity, revi
 | PRC-09 | low | The PR #21 record said StopFailure's path did not change in round 3, though round 3 added the top-level gate every event passes and cut the collection timeout to 1 s (shared parts covered by the SessionEnd re-run and bundle tests). | Fixed: the record says StopFailure's own handling did not change and names what covered the shared parts. |
 | PRC-10 | low | The re-verification paragraph named main 07b7233 at ~16:00 UTC while the run was at cbbab8b at 15:24 UTC, and omitted each run's argv and environment. | Fixed: real time and commit (hooks identical to 07b7233) in the tracked record; argv and environment of both runs in the evidence README. |
 | PRC-11 | low | The record named f7dd0b4, a pre-rebase commit no branch reaches. | Fixed: its main equivalents fedf1ce and 8c037cf are named too. |
+
+## Docs follow-ups: repository settings and deferred review lows (PR #24, branch `docs/followups`)
+
+docs/22 records the main branch protection and branch auto-delete; bootstrap's PROGRESS template has the docs/19 headings with a bundle test (PRC-07); the PR #21/#22 records are corrected (PRC-09..11, PR #22 round 2 above); M2's AC-062-05 closure is reworded (D2R-06).
+
+### Round 1 (fresh Grok session)
+
+`grok` 1.0.70, model grok-4.7, session `01a1b1b6-2ca6-7c51-bd09-e8d2e0f7d3e0`, 838 s; attempt record sha256 `a03c0dcf69c8d5ef09f2e1395b91700958af960d8274d422043a4c77e657f400`, stdout sha256 `f460a23999bbb3475c6ea5ecaf850f7c27a008ca1c71aa6dac832538663a49fa`. Candidate 9b7767a. Scope: docs/22's new section against the live settings (`gh api …/branches/main/protection`, `delete_branch_on_merge`), the template with `scripts/dev/session-context.sh` on a temporary copy, the corrected records against their attempt records and evidence, D2R-06 against docs/22's 范围与限制; bundle on a git archive of the commit (395 OK). Verdict **PASS**, no findings.
