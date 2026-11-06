@@ -1930,10 +1930,24 @@ fn remove_within(
     work: &Work,
 ) -> bool {
     use rustix::fs::fstat;
-    if !remove_pass(dir, owned, quarantine, work, false)
-        || !remove_pass(dir, owned, quarantine, work, true)
-    {
-        return false;
+    // Everything but directories, again while a pass removes something, then the directories; a helper may have put
+    // other entries in meanwhile (a directory replaced by a link after it was walked): met by the directories' pass,
+    // they start another round, at most [`REMOVE_ROUNDS`]. What cannot be removed, such as a mount, ends the passes.
+    // A directory removed in a round is gone from the quarantine (its `..` leads nowhere), so a later round's other
+    // entries enter a quarantine no helper reached through a directory of the output.
+    for _ in 0..REMOVE_ROUNDS {
+        loop {
+            match remove_pass(dir, owned, quarantine, work, false) {
+                None => return false,
+                Some(pass) if pass.removed == 0 => break,
+                Some(_) => {}
+            }
+        }
+        match remove_pass(dir, owned, quarantine, work, true) {
+            None => return false,
+            Some(pass) if pass.others == 0 => break,
+            Some(_) => {}
+        }
     }
     let (Ok(made), Some(name)) = (fstat(owned), dir.file_name()) else {
         return false;
@@ -1956,43 +1970,54 @@ fn remove_within(
     fstat(owned).is_ok_and(|made| made.st_nlink == 0)
 }
 
+/// How many rounds [`remove_within`] goes through at most.
+const REMOVE_ROUNDS: usize = 3;
+
+/// What one pass of [`remove_pass`] did.
+struct Pass {
+    /// Entries removed.
+    removed: usize,
+    /// Entries other than directories met by a directories' pass (left for the next round).
+    others: usize,
+}
+
 /// One pass of [`remove_within`] over what is under `owned`: the directories (`directories`), children first, or
-/// everything else; false when the work ran out.
+/// everything else; `None` when the work ran out.
 fn remove_pass(
     dir: &Path,
     owned: std::os::fd::BorrowedFd<'_>,
     quarantine: &Quarantine,
     work: &Work,
     directories: bool,
-) -> bool {
+) -> Option<Pass> {
     use rustix::fs::{Dir, FileType, OFlags, fstat};
     let listing = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::NONBLOCK;
     // `rel`'s entry taken out of its parent, if it is still `opened`, which is held open meanwhile.
-    let take = |rel: &Path, opened: std::os::fd::BorrowedFd<'_>, directory: bool| {
+    let take = |rel: &Path, opened: std::os::fd::BorrowedFd<'_>, directory: bool| -> bool {
         let (Some(parent), Some(name), Ok(stat)) = (rel.parent(), rel.file_name(), fstat(opened))
         else {
-            return;
+            return false;
         };
-        if let Ok(at) = open_beneath(
+        open_beneath(
             owned,
             parent,
             OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW,
-        ) {
-            quarantine.take(at.as_fd(), name, inode(&stat), directory, &dir.join(rel));
-        }
+        )
+        .is_ok_and(|at| quarantine.take(at.as_fd(), name, inode(&stat), directory, &dir.join(rel)))
     };
+    let (mut removed, mut others) = (0, 0);
     let Ok(top) = open_beneath(owned, Path::new(""), listing).and_then(Dir::new) else {
-        return false;
+        return None;
     };
     // Each directory being gone through: its listing (which holds it open) and its path under `owned`.
     let mut stack = vec![(top, PathBuf::new())];
     loop {
         if !work.spend(1) {
-            return false;
+            return None;
         }
         let within = stack.len() <= MAX_SCHEMA_DEPTH;
         let Some((reader, at)) = stack.last_mut() else {
-            return true;
+            return Some(Pass { removed, others });
         };
         let Some(Ok(entry)) = reader.read() else {
             // Gone through: in the directories' pass, taken out of the directory holding it.
@@ -2001,7 +2026,7 @@ fn remove_pass(
                 && !rel.as_os_str().is_empty()
                 && let Ok(opened) = reader.fd()
             {
-                take(&rel, opened, true);
+                removed += usize::from(take(&rel, opened, true));
             }
             continue;
         };
@@ -2019,8 +2044,10 @@ fn remove_pass(
             continue;
         };
         if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
-            if !directories {
-                take(&rel, opened.as_fd(), false);
+            if directories {
+                others += 1;
+            } else {
+                removed += usize::from(take(&rel, opened.as_fd(), false));
             }
         } else if within && let Ok(child) = open_beneath(owned, &rel, listing).and_then(Dir::new) {
             stack.push((child, rel));
@@ -3775,6 +3802,68 @@ mod tests {
         assert!(
             took < Duration::from_millis(2100),
             "generation ran past the window: {took:?}"
+        );
+        Ok(())
+    }
+
+    /// A directory on the way to an entry, replaced by a link to another after it was listed, is not followed: what
+    /// the link names is neither read nor removed (M1T07R-51; `RESOLVE_NO_SYMLINKS`).
+    #[test]
+    fn a_directory_replaced_by_a_link_on_the_way_is_not_followed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for moment in ["entry", "remove", "take"] {
+            let root = tempfile::tempdir()?;
+            let (out, outside) = (root.path().join("out"), root.path().join("outside"));
+            std::fs::create_dir_all(out.join("v2"))?;
+            std::fs::create_dir(&outside)?;
+            std::fs::write(out.join("v2/a.json"), "{}")?;
+            std::fs::write(outside.join("a.json"), "outside")?;
+            let (target, child, to) = (out.join("v2/a.json"), out.join("v2"), outside.clone());
+            let swaps = std::rc::Rc::new(std::cell::Cell::new(0));
+            let counted = swaps.clone();
+            BETWEEN.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |at: &str, path: &Path| {
+                    if at == moment && path == target && counted.get() == 0 {
+                        std::fs::remove_dir_all(&child).expect("remove the directory");
+                        std::os::unix::fs::symlink(&to, &child).expect("link it elsewhere");
+                        counted.set(1);
+                    }
+                }));
+            });
+            let read = if moment == "entry" {
+                walk(&out, &Work::new(u64::MAX, None))?
+            } else {
+                Vec::new()
+            };
+            let gone = remove(&out, &Work::new(u64::MAX, None));
+            BETWEEN.with(|hook| *hook.borrow_mut() = None);
+            assert_eq!(swaps.get(), 1, "{moment}: replaced");
+            assert!(
+                read.iter().all(|(_, bytes)| bytes != b"outside"),
+                "{moment}: read through the link"
+            );
+            assert_eq!(
+                std::fs::read_to_string(outside.join("a.json"))?,
+                "outside",
+                "{moment}: removed through the link"
+            );
+            assert!(gone, "{moment}");
+        }
+        Ok(())
+    }
+
+    /// Resolution never leaves the directory it starts from, even by a name the listings would never give (`..`):
+    /// `RESOLVE_BENEATH` (M1T07R-51).
+    #[test]
+    fn resolution_never_leaves_where_it_starts() -> Result<(), Box<dyn std::error::Error>> {
+        use rustix::fs::OFlags;
+        let root = tempfile::tempdir()?;
+        std::fs::create_dir(root.path().join("out"))?;
+        std::fs::write(root.path().join("beside.json"), "{}")?;
+        let out = held(&root.path().join("out"));
+        assert_eq!(
+            open_beneath(out.as_fd(), Path::new("../beside.json"), OFlags::RDONLY).err(),
+            Some(rustix::io::Errno::XDEV)
         );
         Ok(())
     }
