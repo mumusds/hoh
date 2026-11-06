@@ -67,7 +67,7 @@ pub(super) fn child_id(parent: &str, suffix: &str) -> String {
     format!("{}/{suffix}", shorten(parent, MAX_ID - 1 - suffix.len()))
 }
 
-fn to_i64(value: u64, field: &str) -> Result<i64, PersistError> {
+pub(super) fn to_i64(value: u64, field: &str) -> Result<i64, PersistError> {
     i64::try_from(value)
         .map_err(|_| PersistError::InvalidProposal(format!("{field} {value} is out of range")))
 }
@@ -119,13 +119,16 @@ pub(super) fn decide(
                     ..
                 } => Some(lease_task(
                     &tx,
-                    &project_id,
-                    proposal,
-                    task_id,
-                    role,
-                    *role_epoch,
-                    lease_kind,
-                    context.now(),
+                    &LeaseRequest {
+                        project_id: &project_id,
+                        run_id: &proposal.run_id,
+                        attempt_id: child_id(&proposal.decision_id, "attempt"),
+                        task_id,
+                        role,
+                        role_epoch: *role_epoch,
+                        kind: lease_kind,
+                        now: context.now(),
+                    },
                 )?),
                 _ => None,
             };
@@ -295,51 +298,64 @@ pub(super) struct Leased {
     pub(super) grant: leases::Grant,
 }
 
-/// Create the PREPARED attempt of a dispatch (its row only: the decision's event records it) and grant it the lease
-/// `kind`, in the decision's transaction (AC-035-02). The attempt carries the target role's epoch, the host epoch and
-/// the run's config revision.
-#[allow(clippy::too_many_arguments)]
-fn lease_task(
+/// What a dispatch leases: a new PREPARED attempt of `task_id` for `role` (at `role_epoch`) holding `kind`.
+pub(super) struct LeaseRequest<'a> {
+    pub(super) project_id: &'a str,
+    pub(super) run_id: &'a str,
+    pub(super) attempt_id: String,
+    pub(super) task_id: &'a str,
+    pub(super) role: &'a str,
+    pub(super) role_epoch: u64,
+    pub(super) kind: &'a str,
+    pub(super) now: std::time::SystemTime,
+}
+
+/// Create the PREPARED attempt of a dispatch (its row only: the dispatch's event records it) and grant it the lease,
+/// in the caller's transaction (AC-035-02). The attempt carries the role's epoch, the host epoch and the run's config
+/// revision.
+pub(super) fn lease_task(
     tx: &Transaction<'_>,
-    project_id: &str,
-    proposal: &Proposal,
-    task_id: &str,
-    role: &str,
-    role_epoch: u64,
-    kind: &str,
-    now: std::time::SystemTime,
+    request: &LeaseRequest<'_>,
 ) -> Result<Leased, PersistError> {
     let (host_epoch, config_revision): (i64, i64) = tx
         .query_row(
             "SELECT p.host_epoch, r.config_revision FROM runs r JOIN projects p ON p.project_id = r.project_id \
              WHERE r.run_id = ?1",
-            params![proposal.run_id],
+            params![request.run_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .map_err(sqlite_error)?;
     let agent: Option<String> = tx
         .query_row(
             "SELECT agent FROM role_bindings WHERE run_id = ?1 AND role = ?2",
-            params![proposal.run_id, role],
+            params![request.run_id, request.role],
             |r| r.get(0),
         )
         .optional()
         .map_err(sqlite_error)?;
-    let attempt_id = child_id(&proposal.decision_id, "attempt");
     attempts::insert_prepared(
         tx,
         &NewAttempt {
-            attempt_id: attempt_id.clone(),
-            task_id: task_id.to_owned(),
+            attempt_id: request.attempt_id.clone(),
+            task_id: request.task_id.to_owned(),
             session_id: None,
-            role_epoch: to_i64(role_epoch, "role_epoch")?,
+            role_epoch: to_i64(request.role_epoch, "role_epoch")?,
             host_epoch,
             config_revision,
             agent,
         },
     )?;
-    let grant = leases::grant(tx, project_id, kind, &attempt_id, now)?;
-    Ok(Leased { attempt_id, grant })
+    let grant = leases::grant(
+        tx,
+        request.project_id,
+        request.kind,
+        &request.attempt_id,
+        request.now,
+    )?;
+    Ok(Leased {
+        attempt_id: request.attempt_id.clone(),
+        grant,
+    })
 }
 
 /// The one event of a rejected proposal, with the fences and inputs the verdict read.
@@ -521,7 +537,7 @@ fn load_task(
     }))
 }
 
-fn load_binding(
+pub(super) fn load_binding(
     tx: &Transaction<'_>,
     run_id: &str,
     role: &str,

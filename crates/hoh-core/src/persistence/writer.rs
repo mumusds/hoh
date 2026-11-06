@@ -131,6 +131,16 @@ enum Job {
     ),
     /// The writer connection's settings.
     Pragmas(oneshot::Sender<Result<Pragmas, PersistError>>),
+    /// A run id and a plan for [`super::plan::import`].
+    Plan(
+        Box<(String, serde_json::Value)>,
+        oneshot::Sender<Result<super::plan::Imported, PersistError>>,
+    ),
+    /// A run id and the context of [`super::rounds::round`].
+    Round(
+        Box<(String, Context)>,
+        oneshot::Sender<Result<super::rounds::RoundOutcome, PersistError>>,
+    ),
     /// Something to hold until the writer ends (a host's project lock, ADR-016 decision 12).
     Keep(
         Box<dyn std::any::Any + Send>,
@@ -183,6 +193,8 @@ impl std::fmt::Debug for Job {
             Job::Command(..) => "Command",
             Job::BeginHost(..) => "BeginHost",
             Job::Pragmas(..) => "Pragmas",
+            Job::Plan(..) => "Plan",
+            Job::Round(..) => "Round",
             Job::Keep(..) => "Keep",
         })
     }
@@ -256,6 +268,24 @@ impl Writer {
                         }
                         Job::Pragmas(reply) => {
                             let _ = reply.send(super::pragmas(&conn));
+                        }
+                        Job::Plan(request, reply) => {
+                            let (run_id, plan) = *request;
+                            let _ = reply.send(super::plan::import(
+                                &mut conn,
+                                &run_id,
+                                &plan,
+                                &after_events,
+                            ));
+                        }
+                        Job::Round(request, reply) => {
+                            let (run_id, context) = *request;
+                            let _ = reply.send(super::rounds::round(
+                                &mut conn,
+                                &run_id,
+                                &context,
+                                &after_events,
+                            ));
                         }
                         Job::Keep(held, reply) => {
                             kept.0.push(held);
@@ -343,6 +373,24 @@ impl Writer {
 
     pub(super) async fn attempt(&self, job: AttemptJob) -> Result<(), PersistError> {
         self.submit(|tx| Job::Attempt(Box::new(job), tx)).await
+    }
+
+    pub(super) async fn import_plan(
+        &self,
+        run_id: String,
+        plan: serde_json::Value,
+    ) -> Result<super::plan::Imported, PersistError> {
+        self.submit(|tx| Job::Plan(Box::new((run_id, plan)), tx))
+            .await
+    }
+
+    pub(super) async fn schedule_round(
+        &self,
+        run_id: String,
+        context: Context,
+    ) -> Result<super::rounds::RoundOutcome, PersistError> {
+        self.submit(|tx| Job::Round(Box::new((run_id, context)), tx))
+            .await
     }
 
     pub(super) async fn end_attempt(

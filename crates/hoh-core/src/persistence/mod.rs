@@ -16,7 +16,11 @@ mod commands;
 mod decide;
 mod inputs;
 mod leases;
-pub use leases::{LEASE_TTL, LeaseView};
+mod plan;
+mod rounds;
+pub use leases::{Grant, LEASE_TTL, LeaseView};
+pub use plan::Imported;
+pub use rounds::{Dispatched, RoundOutcome};
 pub mod location;
 pub mod selftest;
 mod writer;
@@ -144,6 +148,9 @@ pub enum PersistError {
     /// A lease compare-and-set found another epoch: someone else was granted it meanwhile (`STALE_LEASE_EPOCH`);
     /// nothing was written.
     StaleLeaseEpoch(String),
+    /// A plan was refused (REQ-038: SCORE_OUT_OF_RANGE, DAG_DUPLICATE_TASK, DAG_MISSING_DEPENDENCY, DAG_CYCLE, or a
+    /// schema failure); nothing of it was imported.
+    Plan(crate::dag::PlanError),
     /// The writer actor is no longer running.
     WriterStopped,
     /// A scratch-only write ([`Store::scratch_task`]) on a database that is not empty; nothing was written.
@@ -161,6 +168,7 @@ impl PersistError {
             PersistError::Busy(_) => Some(ErrorCode::DbBusy),
             PersistError::Full(_) => Some(ErrorCode::DbFull),
             PersistError::RunNotFound(_) => Some(ErrorCode::RunNotFound),
+            PersistError::Plan(plan) => plan.code(),
             _ => None,
         }
     }
@@ -254,6 +262,10 @@ impl std::fmt::Display for PersistError {
             ),
             PersistError::LeaseUnavailable(detail) => write!(f, "LEASE_UNAVAILABLE: {detail}"),
             PersistError::StaleLeaseEpoch(detail) => write!(f, "STALE_LEASE_EPOCH: {detail}"),
+            PersistError::Plan(plan) => match plan.code() {
+                Some(code) => write!(f, "plan refused: {code:?} {}", plan.details()),
+                None => write!(f, "plan refused: {}", plan.details()),
+            },
             PersistError::WriterStopped => write!(f, "the database writer is not running"),
             PersistError::NotScratch(why) => write!(f, "not a scratch database: {why}"),
             PersistError::Storage(detail) => write!(f, "storage error: {detail}"),
@@ -583,6 +595,26 @@ impl Store {
             return Err(PersistError::Unsupported(proposal.kind()));
         }
         self.writer.decide(proposal, context).await
+    }
+
+    /// Validate a plan (`$defs.PlanProposal`) for `run_id` and import it whole, or refuse it with nothing written
+    /// (REQ-038, AC-038-03).
+    pub async fn import_plan(
+        &self,
+        run_id: &str,
+        plan: serde_json::Value,
+    ) -> Result<Imported, PersistError> {
+        self.writer.import_plan(run_id.to_owned(), plan).await
+    }
+
+    /// One scheduling round of `run_id` (REQ-038): the best eligible task whose slot is free is leased to a new
+    /// PREPARED attempt; nothing is written when none is.
+    pub async fn schedule_round(
+        &self,
+        run_id: &str,
+        context: crate::decision::Context,
+    ) -> Result<RoundOutcome, PersistError> {
+        self.writer.schedule_round(run_id.to_owned(), context).await
     }
 
     /// Record a native session, or update the row of a resumed one (never a second row for it).
