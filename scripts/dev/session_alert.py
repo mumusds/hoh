@@ -30,7 +30,8 @@ def safe(collect):
 
 
 def run(*argv):
-    return subprocess.run(argv, capture_output=True, text=True, timeout=3).stdout.strip()
+    # Three of these at most: well inside the hook's 10 s, so the record is written before it is cut (SAR-09).
+    return subprocess.run(argv, capture_output=True, text=True, timeout=1).stdout.strip()
 
 
 def running_tasks():

@@ -20,7 +20,7 @@ if '--version' in args:print('MOCK_AGENT_VERSION');sys.exit(0)
 # Grok takes its prompt from the file --prompt-file names (the bridge passes /dev/stdin).
 data=open(args[args.index('--prompt-file')+1],'rb').read() if name=='grok' else sys.stdin.buffer.read()
 if os.environ.get('FAKE_TRACE'):
- open(os.environ['FAKE_TRACE'],'w').write(json.dumps({'argv':args,'stdin':data.decode(),'env':sorted(k for k in os.environ if k.startswith(('CLAUDE','CODEX','HOH_','ANTHROPIC','AI_'))),'pi_offline':os.environ.get('PI_OFFLINE')}))
+ open(os.environ['FAKE_TRACE'],'w').write(json.dumps({'argv':args,'stdin':data.decode(),'env':sorted(k for k in os.environ if k.startswith(('CLAUDE','CODEX','HOH_','ANTHROPIC','AI_'))),'hoh':{k:v for k,v in os.environ.items() if k.startswith('HOH_')},'pi_offline':os.environ.get('PI_OFFLINE')}))
 mode=os.getenv('FAKE_MODE','ok')
 print('mock diagnostic',file=sys.stderr)
 if mode=='exit-error':sys.exit(7)
@@ -77,6 +77,7 @@ class PiPackages(unittest.TestCase):
         if not (ROOT/'.pi/npm/package-lock.json').is_file():self.skipTest('Pi packages not installed here')
         self.assertEqual(verify_installed(ROOT)['problems'],[])
 
+SESSION_MARKERS=('HOH_BOOTSTRAP_PARENT','HOH_DELEGATED_TASK','HOH_TOP_LEVEL_SESSION')
 class NativeBridge(unittest.TestCase):
     def setUp(self):
         self.t=tempfile.TemporaryDirectory(prefix='hoh mock 中文 ');self.addCleanup(self.t.cleanup);self.root=Path(self.t.name)
@@ -85,7 +86,8 @@ class NativeBridge(unittest.TestCase):
             p=self.bin/name;p.write_text(FAKE);p.chmod(0o755)
         self.prompt=self.root/'prompt with spaces.md';self.prompt.write_text('真实Unicode input，不是产品验收。')
         # Outside any check: run_check's variables would send the mock sessions into that check's evidence.
-        outside={k:v for k,v in os.environ.items() if k not in CHECK_VARS}
+        # Nor inside a session: a session's own markers would make --top-level refuse (SAR-07).
+        outside={k:v for k,v in os.environ.items() if k not in CHECK_VARS and k not in SESSION_MARKERS}
         self.env=outside|{'PATH':str(self.bin)+os.pathsep+os.environ.get('PATH',''),'FAKE_TRACE':str(self.root/'trace.json'),'PYTHONDONTWRITEBYTECODE':'1'}
     def bridge(self,agent='codex',mode='ok',timeout='10'):
         env=self.env|{'FAKE_MODE':mode};out=self.root/'attempt'
@@ -196,15 +198,30 @@ class NativeBridge(unittest.TestCase):
         self.assertTrue({'CLAUDE_CODE_USE_BEDROCK','ANTHROPIC_MODEL','CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS','HOH_BOOTSTRAP_PARENT'}<=seen)  # config and our marker stay
         self.assertTrue(removed|{'AI_AGENT'}<=set(load_json(out/'attempt.json')['env_removed']))
     def test_only_a_delegated_session_is_marked_delegated(self):
-        # SAR-01: the session hooks skip only sessions marked HOH_DELEGATED_TASK; a top-level session (also carrying
-        # HOH_BOOTSTRAP_PARENT) is not marked, even if the shell that starts it was.
+        # SAR-01, SAR-08, SAR-10: a delegated session carries HOH_DELEGATED_TASK=<role> and a HOH_BOOTSTRAP_PARENT that
+        # is not the top-level session's; a top-level one carries HOH_TOP_LEVEL_SESSION equal to its own
+        # HOH_BOOTSTRAP_PARENT and no HOH_DELEGATED_TASK, even if the shell that starts it had one.
         p,out=self.bridge();self.assertEqual(p.returncode,0,p.stderr)
-        self.assertEqual(load_json(self.root/'trace.json')['env'].count('HOH_DELEGATED_TASK'),1)
+        hoh=load_json(self.root/'trace.json')['hoh']
+        self.assertEqual(hoh['HOH_DELEGATED_TASK'],'developer')
+        self.assertEqual(hoh['HOH_BOOTSTRAP_PARENT'],load_json(out/'attempt.json')['attempt_id'])
+        self.assertNotIn('HOH_TOP_LEVEL_SESSION',hoh)
         p=subprocess.run([sys.executable,str(ROOT/'tools/agent_task.py'),'--agent','codex','--role','commander','--top-level','--prompt-file',str(self.prompt),'--cwd',str(self.root),'--output-dir',str(self.root/'top'),'--timeout','10'],
                          capture_output=True,text=True,env=self.env|{'FAKE_MODE':'ok','HOH_DELEGATED_TASK':'qa'},timeout=20)
         self.assertEqual(p.returncode,0,p.stderr)
-        seen=load_json(self.root/'trace.json')['env']
-        self.assertNotIn('HOH_DELEGATED_TASK',seen);self.assertIn('HOH_BOOTSTRAP_PARENT',seen)
+        hoh=load_json(self.root/'trace.json')['hoh']
+        self.assertNotIn('HOH_DELEGATED_TASK',hoh)
+        self.assertEqual(hoh['HOH_TOP_LEVEL_SESSION'],hoh['HOH_BOOTSTRAP_PARENT'])
+        self.assertEqual(hoh['HOH_BOOTSTRAP_PARENT'],load_json(self.root/'top/attempt.json')['attempt_id'])
+        # A delegated session started by that top-level one keeps its id and gets its own parent.
+        p=subprocess.run([sys.executable,str(ROOT/'tools/agent_task.py'),'--agent','codex','--role','reviewer','--prompt-file',str(self.prompt),'--cwd',str(self.root),'--output-dir',str(self.root/'child'),'--timeout','10'],
+                         capture_output=True,text=True,env=self.env|{'FAKE_MODE':'ok','HOH_BOOTSTRAP_PARENT':'top-1','HOH_TOP_LEVEL_SESSION':'top-1'},timeout=20)
+        self.assertEqual(p.returncode,0,p.stderr)
+        hoh=load_json(self.root/'trace.json')['hoh']
+        self.assertEqual((hoh['HOH_DELEGATED_TASK'],hoh['HOH_TOP_LEVEL_SESSION']),('reviewer','top-1'))
+        self.assertNotEqual(hoh['HOH_BOOTSTRAP_PARENT'],'top-1')
+        p=subprocess.run([sys.executable,str(ROOT/'tools/agent_task.py'),'--agent','codex','--role','','--prompt-file',str(self.prompt),'--dry-run'],capture_output=True,text=True,env=self.env)
+        self.assertEqual(p.returncode,2,p.stderr)
     def test_child_sees_parent_marker(self):
         p,out=self.bridge();self.assertEqual(p.returncode,0,p.stderr)
         self.assertEqual(load_json(out/'attempt.json')['cli_version'],'MOCK_AGENT_VERSION')

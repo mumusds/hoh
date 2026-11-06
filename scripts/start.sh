@@ -40,4 +40,7 @@ if [[ "$AGENT" == pi ]]; then
 else
  FLAG="${CMD[1]}"; has_flag "$FLAG" || { echo "Installed $AGENT does not support $FLAG" >&2; exit 78; }
 fi
-HOH_BOOTSTRAP_PARENT="interactive-$(date -u +%Y%m%dT%H%M%SZ)-$$" exec env "${ENVS[@]}" "${CMD[@]}" "$(printf '[HOH_TOP_LEVEL_BOOTSTRAP]\n%s' "$(cat LAUNCH_PROMPT.md)")"
+# The top-level session names itself twice: HOH_BOOTSTRAP_PARENT (no second top-level below it) and
+# HOH_TOP_LEVEL_SESSION (the session hooks tell it from sessions started inside it, SAR-08).
+SESSION_ID="interactive-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+HOH_BOOTSTRAP_PARENT="$SESSION_ID" HOH_TOP_LEVEL_SESSION="$SESSION_ID" exec env "${ENVS[@]}" "${CMD[@]}" "$(printf '[HOH_TOP_LEVEL_BOOTSTRAP]\n%s' "$(cat LAUNCH_PROMPT.md)")"
