@@ -15,6 +15,8 @@ mod attempts;
 mod commands;
 mod decide;
 mod inputs;
+mod leases;
+pub use leases::{LEASE_TTL, LeaseView};
 pub mod location;
 pub mod selftest;
 mod writer;
@@ -136,6 +138,12 @@ pub enum PersistError {
     Full(String),
     /// The idempotency key was accepted before with another payload (`KEY_REUSE`); nothing was written.
     KeyReuse(String),
+    /// The lease a dispatch needs is held: unexpired, or its holder attempt has not ended (`LEASE_UNAVAILABLE`,
+    /// CR-007); nothing was written.
+    LeaseUnavailable(String),
+    /// A lease compare-and-set found another epoch: someone else was granted it meanwhile (`STALE_LEASE_EPOCH`);
+    /// nothing was written.
+    StaleLeaseEpoch(String),
     /// The writer actor is no longer running.
     WriterStopped,
     /// A scratch-only write ([`Store::scratch_task`]) on a database that is not empty; nothing was written.
@@ -164,6 +172,8 @@ impl PersistError {
             PersistError::IllegalTransition { .. } => Some(RejectionReason::IllegalTransition),
             PersistError::StaleState { .. } => Some(RejectionReason::StaleRevision),
             PersistError::KeyReuse(_) => Some(RejectionReason::KeyReuse),
+            PersistError::LeaseUnavailable(_) => Some(RejectionReason::LeaseUnavailable),
+            PersistError::StaleLeaseEpoch(_) => Some(RejectionReason::StaleLeaseEpoch),
             _ => None,
         }
     }
@@ -242,6 +252,8 @@ impl std::fmt::Display for PersistError {
                 f,
                 "KEY_REUSE: idempotency key {key} was accepted with another payload"
             ),
+            PersistError::LeaseUnavailable(detail) => write!(f, "LEASE_UNAVAILABLE: {detail}"),
+            PersistError::StaleLeaseEpoch(detail) => write!(f, "STALE_LEASE_EPOCH: {detail}"),
             PersistError::WriterStopped => write!(f, "the database writer is not running"),
             PersistError::NotScratch(why) => write!(f, "not a scratch database: {why}"),
             PersistError::Storage(detail) => write!(f, "storage error: {detail}"),
@@ -778,6 +790,15 @@ impl Reader {
     /// The input queue row `input_id`.
     pub fn input(&self, input_id: &str) -> Result<Option<InputRow>, PersistError> {
         inputs::read_input(&self.conn, input_id)
+    }
+
+    /// The project's leases as of `now`, by kind (REQ-037).
+    pub fn leases(
+        &self,
+        project_id: &str,
+        now: std::time::SystemTime,
+    ) -> Result<Vec<LeaseView>, PersistError> {
+        leases::held(&self.conn, project_id, now)
     }
 
     /// The run `run_id` with the highest event seq, read together.

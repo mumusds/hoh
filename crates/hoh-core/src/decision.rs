@@ -138,6 +138,23 @@ impl Proposal {
 pub struct Context {
     pub required_capabilities: BTreeMap<String, BTreeSet<String>>,
     pub budget_headroom: Option<u32>,
+    /// The time leases are judged and granted at (`None`: the system clock).
+    pub now: Option<std::time::SystemTime>,
+    /// `execution.reader_slots` (REQ-037; `None`: the initial value 2).
+    pub reader_slots: Option<u32>,
+}
+
+impl Context {
+    /// The initial `execution.reader_slots` (REQ-037).
+    pub const READER_SLOTS: u32 = 2;
+
+    pub fn now(&self) -> std::time::SystemTime {
+        self.now.unwrap_or_else(std::time::SystemTime::now)
+    }
+
+    pub fn reader_slots(&self) -> u32 {
+        self.reader_slots.unwrap_or(Self::READER_SLOTS)
+    }
 }
 
 /// The run a proposal is for.
@@ -158,6 +175,8 @@ pub struct TaskView {
     pub spec_id: String,
     pub role: String,
     pub cost_estimate: u32,
+    /// It writes the work tree, so it needs the writer lease (REQ-037); otherwise a reader slot.
+    pub writer: bool,
     /// Each dependency with its state.
     pub dependencies: Vec<(String, TaskState)>,
     /// The task's requirements under the run's current specification.
@@ -239,6 +258,8 @@ pub struct Snapshot {
     /// The capabilities the contract of the named task's role requires; `None` when no contract names the role.
     pub required_capabilities: Option<BTreeSet<String>>,
     pub budget_headroom: Option<u32>,
+    /// For a dispatch, the free slot the named task needs (`writer` or `reader-k`); `None` when it is held (CR-007).
+    pub free_slot: Option<String>,
     pub evidence: Evidence,
 }
 
@@ -252,12 +273,14 @@ pub struct Rejection {
 /// What an accepted proposal does; persistence applies it in the same transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
-    /// The task goes READY -> LEASED and a dispatch message to `role` (at its epoch) is queued.
+    /// The task goes READY -> LEASED with a PREPARED attempt holding the lease `lease_kind`, and a dispatch message to
+    /// `role` (at its epoch) is queued, all in the decision's transaction (AC-035-02).
     Dispatch {
         task_id: String,
         task_revision: u64,
         role: String,
         role_epoch: u64,
+        lease_kind: String,
     },
     TransitionTask {
         task_id: String,
@@ -454,11 +477,21 @@ fn dispatch(snapshot: &Snapshot, task_id: &str, role: &str) -> Result<Effect, Re
             ),
         );
     }
+    let Some(lease_kind) = &snapshot.free_slot else {
+        return reject(
+            LeaseUnavailable,
+            format!(
+                "the {} lease {task_id} needs is held",
+                if task.writer { "writer" } else { "reader" }
+            ),
+        );
+    };
     Ok(Effect::Dispatch {
         task_id: task_id.to_owned(),
         task_revision: task.revision,
         role: role.to_owned(),
         role_epoch: binding.role_epoch,
+        lease_kind: lease_kind.clone(),
     })
 }
 
