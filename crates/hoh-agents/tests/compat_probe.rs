@@ -1546,6 +1546,81 @@ fn schema_output_beyond_its_size_limits_is_refused_before_it_is_read() -> R {
     Ok(())
 }
 
+/// The probe reads and removes only the scratch directory it made: a CLI that replaces its `--out` directory by a
+/// link to another is refused and the other keeps every file (M1T07R-44); output the probe cannot remove fails the
+/// probe and names where it is left, whether the reading succeeded or the command timed out (M1T07R-45).
+#[test]
+fn schema_output_is_read_and_removed_only_where_the_probe_made_it() -> R {
+    let tmp = tempfile::tempdir()?;
+    let f = fixtures().join("codex/0.166.0");
+    if rustix::process::geteuid().is_root() {
+        // A read-only directory does not stop root from emptying it.
+        return Ok(());
+    }
+    for group in ["replaced", "kept", "kept-then-hangs"] {
+        let elsewhere = tmp.path().join(format!("{group}-elsewhere"));
+        std::fs::create_dir(&elsewhere)?;
+        std::fs::write(elsewhere.join("keep.txt"), "kept")?;
+        let out = tmp.path().join(format!("{group}-out.txt"));
+        let generate = match group {
+            "replaced" => format!(
+                "cp -R '{s}/.' '{e}/' && rmdir \"$4\" && ln -s '{e}' \"$4\"",
+                s = f.join("app-server-schema").display(),
+                e = elsewhere.display()
+            ),
+            "kept" => format!(
+                "echo \"$4\" > '{o}' && cp -R '{s}/.' \"$4/\" && chmod 0555 \"$4\"",
+                o = out.display(),
+                s = f.join("app-server-schema").display()
+            ),
+            _ => format!(
+                "echo \"$4\" > '{o}' && cp -R '{s}/.' \"$4/\" && chmod 0555 \"$4\" && sleep 30",
+                o = out.display(),
+                s = f.join("app-server-schema").display()
+            ),
+        };
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n --help) cat '{f}/help.txt';;\n \
+             exec) [ \"$2\" = --help ] && cat '{f}/help-exec.txt';;\n \
+             app-server) case \"$2\" in\n  --help) cat '{f}/help-app-server.txt';;\n  generate-json-schema) [ \"$3\" = --out ] && {generate};;\n  \
+             *) exit 2;;\n esac;;\n *) exit 2;;\nesac\n",
+            f = f.display()
+        );
+        let (dir, _) = fake(tmp.path(), &format!("{group}-bin"), "codex", &script)?;
+        let mut env = env_for(&dir);
+        if group == "kept-then-hangs" {
+            env.timeout = Duration::from_secs(2);
+        }
+        let result = probe(Agent::Codex, &env);
+        // What was kept is made removable again, so the test leaves nothing behind.
+        if let Ok(kept) = std::fs::read_to_string(&out) {
+            let kept = PathBuf::from(kept.trim());
+            std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o755))?;
+            std::fs::remove_dir_all(&kept)?;
+        }
+        match result {
+            Err(ProbeError::Failed { detail, .. }) => {
+                let expected = match group {
+                    "replaced" => "was replaced",
+                    "kept" => "left at",
+                    _ => "timed out",
+                };
+                assert!(detail.contains(expected), "{group}: {detail}");
+                if group != "replaced" {
+                    assert!(detail.contains("left at"), "{group}: {detail}");
+                }
+            }
+            other => return Err(format!("{group}: {other:?}").into()),
+        }
+        assert!(elsewhere.join("keep.txt").exists(), "{group}");
+        assert!(
+            elsewhere.join("ClientRequest.json").exists() || group != "replaced",
+            "{group}"
+        );
+    }
+    Ok(())
+}
+
 /// Validation is bounded in work, not only in depth: a `RequestId` whose `anyOf` names itself twice, or a chain of
 /// definitions each naming the next twice, would take exponential time; within its budget the probe calls the ids
 /// undecided, so the requests are absent, and it ends at once (M1T07R-40).
