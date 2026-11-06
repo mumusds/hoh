@@ -125,13 +125,14 @@ schema_enum!(
     /// `RejectionReason`: decisions.reason_code and rejected messages.
     RejectionReason, "SCREAMING_SNAKE_CASE",
     [StaleRoleEpoch, StaleRevision, StaleLeaseEpoch, SpecMismatch, CandidateMismatch, IllegalTransition, DependencyNotAccepted,
-     BudgetNotReservable, RoleCapabilityMissing, EvidenceGateUnmet, SessionNotIndependent, KeyReuse]
+     BudgetNotReservable, RoleCapabilityMissing, EvidenceGateUnmet, SessionNotIndependent, KeyReuse, LeaseUnavailable]
 );
 schema_enum!(
     /// `ErrorCode`: API errors, CLI stderr codes and attempt failure reasons.
     ErrorCode, "SCREAMING_SNAKE_CASE",
     [CapabilityUnsupported, RunNotFound, DbBusy, DbOnNetworkFs, DbWalUnsupported, DbFull, InvalidTeamConfig, ContextBudgetTooSmall,
-     ProtocolFrameTooLarge, ProtocolIncomplete, DagCycle, DagMissingDependency, ScoreOutOfRange, CursorExpired]
+     ProtocolFrameTooLarge, ProtocolIncomplete, DagCycle, DagMissingDependency, ScoreOutOfRange, CursorExpired,
+     DagDuplicateTask, RunConfigFrozen]
 );
 schema_enum!(
     /// Task states (`transition_task.to_state`).
@@ -364,11 +365,38 @@ pub struct SendInput {
     pub input_kind: InputKind,
 }
 
+/// Payload of `ConfigureTeam`: bindings, scheduler parameters or both (CR-007).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConfigureTeam {
-    pub bindings: Object,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bindings: Option<Object>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler: Option<SchedulerSettings>,
     /// Always `checkpoint`.
     pub apply_at: String,
+}
+
+/// `SchedulerSettings` (CR-007): the `[scheduler]` config keys, the run config snapshot key `scheduler` and
+/// `ConfigureTeam.scheduler`. A member left out reads as its default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchedulerSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weights: Option<SchedulerWeights>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_wait_rounds: Option<u32>,
+}
+
+/// The four score weights of REQ-038; each 0..=10.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchedulerWeights {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_value: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unblock_value: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk_reduction: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub information_gain: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

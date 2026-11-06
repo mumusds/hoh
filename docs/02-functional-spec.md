@@ -419,7 +419,7 @@ M2 · P0 · 发布类 required · 目标 v1 · 成熟度 detailed，参考：`co
 - [team.*] 下出现未知键时，选择拒绝并指出键路径，不静默忽略。
 - reviewer.independent_session=false 选择直接拒绝，因为独立审查是 CONTRACT 第 7 条的硬约束，不作为可选项。
 - 自定义职位选择必须引用一个内置角色契约或提供 prompt 覆盖文件，否则拒绝。
-- （CR-003）完整配置键表（未知键一律拒绝）：顶层 config_version；[project] default_mode、document_profile；[execution] profile、writer_slots、reader_slots、reserve_supervisor_slot、cancel_native_grace_seconds=10、cancel_term_grace_seconds=5；[delivery] max_delivery_attempts=5；[persistence] writer_queue_capacity=256；[team.<role>] agent、model、fallback、prompt、independent_session；[supervision] policy；[budget] max_duration_hours、max_iterations、max_local_repairs、max_protocol_repairs、max_usd、deadline_at；[ui] view、statusline、mouse；[web] host、port。config/hoh.example.toml 列出全部键（可选键以注释给出），内置默认值与之逐项相等。
+- （CR-003）完整配置键表（未知键一律拒绝）：顶层 config_version；[project] default_mode、document_profile；[execution] profile、writer_slots、reader_slots、reserve_supervisor_slot、cancel_native_grace_seconds=10、cancel_term_grace_seconds=5；[delivery] max_delivery_attempts=5；[persistence] writer_queue_capacity=256；（CR-007）[scheduler] max_wait_rounds=20，[scheduler.weights] user_value=4、unblock_value=3、risk_reduction=3、information_gain=2；[team.<role>] agent、model、fallback、prompt、independent_session；[supervision] policy；[budget] max_duration_hours、max_iterations、max_local_repairs、max_protocol_repairs、max_usd、deadline_at；[ui] view、statusline、mouse；[web] host、port。config/hoh.example.toml 列出全部键（可选键以注释给出），内置默认值与之逐项相等。
 
 ## REQ-019 · 角色交接
 
@@ -990,6 +990,7 @@ M2 · P0 · 发布类 required · 目标 v1, v0.1 · 成熟度 detailed，参考
 - barrier开放期间Developer是否可在写目录做不相关增量文档未定；本选择允许不相关写Task，但源自当前candidate Issue的修复须待barrier关闭后派发。
 - reader_slots=2取自config示例，作为初值。
 - 多读槽使用编号 kind（reader-1、reader-2…）；SQL leases.kind 约束已相应放宽（CR-002）。
+- （CR-007）派发提议所需的租约被占用时，提议 REJECTED、reason=LEASE_UNAVAILABLE，Task 保持 READY，tasks 与 leases 不变，只写一条拒绝事件。写租约被占用指未过期，或其持有 Attempt 尚未结束；读槽全部占用时同理。
 
 ## REQ-038 · 任务DAG调度
 
@@ -1037,7 +1038,8 @@ M2 · P0 · 发布类 required · 目标 v1, v0.1 · 成熟度 detailed，参考
 - 已修正（CR-002）：age_bonus 上限 10 只能追平有限分差，无法防饥饿。新增 max_wait_rounds（初值 20）：eligible 但未被选的轮数达到上限的 Task 进入位于层0与层1之间的老化子层，子层内按首次 eligible 的序号 FIFO；层0为空时任何 eligible Task 的等待轮数有上界。
 - cost_estimate桶未定；初值为整数1..5，缺估计取中位桶3。
 - 分层赋值规则未定；本选择：critical/high回归或数据完整性Issue→0，被阻塞Task依赖→1，其余→2。
-- 超出0..5的分值选择拒绝而非截断；SCORE_OUT_OF_RANGE、DAG_CYCLE、DAG_MISSING_DEPENDENCY为初值错误码。
+- 超出0..5的分值选择拒绝而非截断；SCORE_OUT_OF_RANGE、DAG_CYCLE、DAG_MISSING_DEPENDENCY、DAG_DUPLICATE_TASK（CR-007）为初值错误码。
+- （CR-007）调度参数为配置 [scheduler] 的 max_wait_rounds 与 [scheduler.weights] 的四个权重（$defs.SchedulerSettings），StartRun 时写入 runs.config_snapshot_json 的 scheduler 键；快照缺键按默认值读；每轮调度事件记下所用参数。修改调度参数的配置变更是带 scheduler 的 ConfigureTeam：run_id 指向已存在的 Run 时返回 409 RUN_CONFIG_FROZEN，不写任何东西，快照与之后的 score 不变；run_id 为 null 时形成新的项目配置 revision，只对之后启动的 Run 生效（随 team revision 由 M2-T07 实现）。
 
 ## REQ-039 · 上下文渐进披露
 
