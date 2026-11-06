@@ -992,6 +992,69 @@ fn live_prepares_nothing_with_a_schema_the_probe_refuses() -> R {
     Ok(())
 }
 
+/// A schema output within its size limits made to parse into huge values (60 MiB of one-key objects in other files,
+/// a protocol file padded up to its value limit) keeps doctor within a 1 GiB data limit: it still writes its report
+/// (M1T07R-50). Such output used to take gigabytes, and doctor aborted with no report.
+#[test]
+fn doctor_reports_a_bloated_schema_within_a_memory_limit() -> R {
+    let s = Sandbox::new()?;
+    let f = fixtures().join("codex/0.166.0");
+    let schema = s.home.path().join("schema");
+    std::fs::create_dir(&schema)?;
+    assert!(
+        Command::new("cp")
+            .arg("-R")
+            .arg(f.join("app-server-schema/."))
+            .arg(&schema)
+            .status()?
+            .success()
+    );
+    let mut pad = b"[".to_vec();
+    pad.extend(br#"{"":0},"#.repeat(15 * 1024 * 1024 / 7));
+    pad.extend(br#"{"":0}]"#);
+    for n in 0..4 {
+        std::fs::write(schema.join(format!("pad{n}.json")), &pad)?;
+    }
+    let mut requests: Value =
+        serde_json::from_slice(&std::fs::read(schema.join("ClientRequest.json"))?)?;
+    requests["definitions"]["Pad"] =
+        Value::Array((0..60_000).map(|_| serde_json::json!({"": 0})).collect());
+    std::fs::write(
+        schema.join("ClientRequest.json"),
+        serde_json::to_vec(&requests)?,
+    )?;
+    s.write(
+        "codex",
+        &format!(
+            "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n --help) cat '{f}/help.txt';;\n \
+             exec) [ \"$2\" = --help ] && cat '{f}/help-exec.txt';;\n \
+             app-server) case \"$2\" in\n  --help) cat '{f}/help-app-server.txt';;\n  generate-json-schema) [ \"$3\" = --out ] && mkdir -p \"$4\" && cp -R '{s}/.' \"$4/\";;\n  \
+             *) exit 9;;\n esac;;\n \
+             login) echo 'Logged in using ChatGPT' >&2;;\n *) echo \"error: unrecognized subcommand '$1'\" >&2; exit 2;;\nesac\n",
+            f = f.display(),
+            s = schema.display()
+        ),
+    )?;
+    let (out, _) = s.doctor_in(
+        &["/usr/bin/prlimit", "--data=1073741824", "--"],
+        &["--output", "json"],
+        &[],
+    )?;
+    assert!(
+        out.status.code().is_some(),
+        "doctor was ended by a signal: {:?}; {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: Value = serde_json::from_slice(&out.stdout)
+        .map_err(|e| format!("{e}: {}", String::from_utf8_lossy(&out.stderr)))?;
+    assert!(
+        report["agents"]["codex"]["installed"].as_bool() == Some(true),
+        "{report}"
+    );
+    Ok(())
+}
+
 /// A tool that is there but gives no version is installed in both forms, with its version unknown (M1T07R-09).
 #[test]
 fn a_tool_without_a_version_is_installed_in_both_forms() -> R {
