@@ -410,14 +410,21 @@ fn draft7_well_formed(root: &serde_json::Value) -> Result<(), String> {
 /// beside it) whose every branch is `{type: "object", required, properties: {method: {type: "string", enum:
 /// [names]}, ...}}` with optional `title`/`description`. Any other shape rejects the whole file, so malformed output
 /// never yields a capability (M1T01R-15, -18, -23, -27).
-fn schema_methods(value: &serde_json::Value) -> Option<std::collections::BTreeSet<String>> {
+///
+/// What the probe does not interpret cannot narrow the methods (M1T07R-32): in a file of what HoH sends (`sent`:
+/// ClientRequest.json, ClientNotification.json) the root has no `properties`, which would constrain HoH's messages; in
+/// ServerNotification.json the root `properties` may describe other fields (0.166.0: `emittedAtMs`) but not `method`;
+/// and no method is listed by two branches, which `oneOf` would refuse.
+fn schema_methods(
+    value: &serde_json::Value,
+    sent: bool,
+) -> Option<std::collections::BTreeSet<String>> {
     use serde_json::Value;
     let root = value.as_object()?;
-    let root_ok = root.keys().all(|k| {
-        matches!(
-            k.as_str(),
-            "$schema" | "definitions" | "properties" | "title" | "description" | "oneOf"
-        )
+    let root_ok = root.iter().all(|(k, v)| match k.as_str() {
+        "$schema" | "definitions" | "title" | "description" | "oneOf" => true,
+        "properties" => !sent && v.get("method").is_none(),
+        _ => false,
     });
     let variants = root.get("oneOf")?.as_array().filter(|v| !v.is_empty())?;
     let mut methods = std::collections::BTreeSet::new();
@@ -437,7 +444,11 @@ fn schema_methods(value: &serde_json::Value) -> Option<std::collections::BTreeSe
         if !root_ok || !branch_ok || !method_ok || !names.iter().all(Value::is_string) {
             return None;
         }
-        methods.extend(names.iter().filter_map(Value::as_str).map(str::to_owned));
+        for name in names.iter().filter_map(Value::as_str) {
+            if !methods.insert(name.to_owned()) {
+                return None;
+            }
+        }
     }
     Some(methods)
 }
@@ -473,22 +484,22 @@ pub fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<CodexSchema, Prob
                 parsed.insert(file, value);
             }
         }
-        let methods = |name: &str| {
+        let methods = |name: &str, sent: bool| {
             let value = parsed
                 .get(&dir.join(name))
                 .ok_or_else(|| unusable(format!("{name} is missing")))?;
             draft7_well_formed(value)
                 .map_err(|e| unusable(format!("{name} is not a well-formed schema: {e}")))?;
-            schema_methods(value).ok_or_else(|| {
+            schema_methods(value, sent).ok_or_else(|| {
                 unusable(format!(
                     "{name} does not list its methods in the known form"
                 ))
             })
         };
         Ok(CodexSchema {
-            requests: methods("ClientRequest.json")?,
-            client_notifications: methods("ClientNotification.json")?,
-            notifications: methods("ServerNotification.json")?,
+            requests: methods("ClientRequest.json", true)?,
+            client_notifications: methods("ClientNotification.json", true)?,
+            notifications: methods("ServerNotification.json", false)?,
             hash: tree_sha256(&dir)?,
         })
     })();

@@ -1139,6 +1139,65 @@ fn method_branches_must_use_the_known_schema_form() -> R {
     Ok(())
 }
 
+/// A schema constraint the probe does not interpret is outside the known form, so it cannot remove a method the
+/// branches list: a root `properties.method` (or any root `properties` in a file of what HoH sends), and a method
+/// listed in two branches, which `oneOf` would refuse. The recorded root `properties` of ServerNotification.json
+/// (`emittedAtMs`) stays accepted (M1T07R-32).
+#[test]
+fn an_uninterpreted_constraint_on_methods_refuses_the_schema() -> R {
+    let tmp = tempfile::tempdir()?;
+    let f = fixtures().join("codex/0.166.0");
+    type Change = fn(&mut serde_json::Value);
+    let cases: [(&str, &str, Change); 4] = [
+        ("root-method-requests", "ClientRequest.json", |v| {
+            v["properties"] = serde_json::json!({"method": {"type": "string", "enum": ["thread/start", "turn/start"]}});
+        }),
+        ("root-params-requests", "ClientRequest.json", |v| {
+            v["properties"] = serde_json::json!({"params": false});
+        }),
+        (
+            "root-method-notifications",
+            "ServerNotification.json",
+            |v| {
+                v["properties"]["method"] =
+                    serde_json::json!({"type": "string", "enum": ["error"]});
+            },
+        ),
+        ("twice-listed", "ClientRequest.json", |v| {
+            let first = v["oneOf"][0].clone();
+            if let Some(branches) = v["oneOf"].as_array_mut() {
+                branches.push(first);
+            }
+        }),
+    ];
+    for (group, file, change) in cases {
+        let schema = tmp.path().join(group);
+        std::fs::create_dir(&schema)?;
+        let copied = std::process::Command::new("cp")
+            .arg("-R")
+            .arg(f.join("app-server-schema/."))
+            .arg(&schema)
+            .status()?;
+        assert!(copied.success());
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(schema.join(file))?)?;
+        change(&mut value);
+        std::fs::write(schema.join(file), serde_json::to_vec_pretty(&value)?)?;
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n --help) cat '{f}/help.txt';;\n \
+             exec) [ \"$2\" = --help ] && cat '{f}/help-exec.txt';;\n \
+             app-server) case \"$2\" in\n  --help) cat '{f}/help-app-server.txt';;\n  generate-json-schema) [ \"$3\" = --out ] && mkdir -p \"$4\" && cp -R '{s}/.' \"$4/\";;\n  \
+             *) exit 2;;\n esac;;\n *) exit 2;;\nesac\n",
+            f = f.display(),
+            s = schema.display()
+        );
+        let (dir, _) = fake(tmp.path(), &format!("{group}-bin"), "codex", &script)?;
+        let result = probe(Agent::Codex, &env_for(&dir));
+        assert!(schema_refused(&result, file), "{group}: {result:?}");
+    }
+    Ok(())
+}
+
 /// Every command a probe runs is written down with its argv, exit code, duration and whether it timed out, in the
 /// order run (REQ-006: doctor lists them).
 #[test]
