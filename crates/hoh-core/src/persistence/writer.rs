@@ -131,6 +131,8 @@ enum Job {
     ),
     /// The writer connection's settings.
     Pragmas(oneshot::Sender<Result<Pragmas, PersistError>>),
+    /// Answered once every request queued before it is done.
+    Barrier(oneshot::Sender<Result<(), PersistError>>),
 }
 
 /// Test-only fault injection inside the writer.
@@ -161,6 +163,7 @@ impl std::fmt::Debug for Job {
             Job::Command(..) => "Command",
             Job::BeginHost(..) => "BeginHost",
             Job::Pragmas(..) => "Pragmas",
+            Job::Barrier(..) => "Barrier",
         })
     }
 }
@@ -231,6 +234,9 @@ impl Writer {
                         }
                         Job::Pragmas(reply) => {
                             let _ = reply.send(super::pragmas(&conn));
+                        }
+                        Job::Barrier(reply) => {
+                            let _ = reply.send(Ok(()));
                         }
                         Job::EnsureProject(id, repo, reply) => {
                             let _ = reply.send(ensure_project(&conn, &id, &repo));
@@ -347,6 +353,10 @@ impl Writer {
 
     pub(super) async fn pragmas(&self) -> Result<Pragmas, PersistError> {
         self.submit(Job::Pragmas).await
+    }
+
+    pub(super) async fn barrier(&self) -> Result<(), PersistError> {
+        self.submit(Job::Barrier).await
     }
 
     pub(super) async fn scratch_task(&self, ids: [String; 4]) -> Result<(), PersistError> {

@@ -1397,3 +1397,38 @@ fn a_full_disk_is_db_full_and_retryable() {
     assert!(full.retryable());
     assert_eq!(full.error_code(), Some(crate::protocol::ErrorCode::DbFull));
 }
+
+/// The barrier answers only after the writes queued before it: a slow commit queued first is done when it returns.
+#[tokio::test]
+async fn the_barrier_waits_for_the_writes_queued_before_it() -> R {
+    #[derive(Debug)]
+    struct SlowCommit;
+    impl FaultHooks for SlowCommit {
+        fn before_commit(&self) -> Result<(), PersistError> {
+            std::thread::sleep(Duration::from_millis(500));
+            Ok(())
+        }
+    }
+    let dir = tempfile::tempdir()?;
+    let path = db_in(&dir);
+    let store = Arc::new(Store::open(
+        &path,
+        Options {
+            faults: Arc::new(SlowCommit),
+            ..test_options()
+        },
+    )?);
+    seed(&path)?;
+    let writer = store.clone();
+    let command = tokio::spawn(async move { writer.submit_command(pause("k", "a", 0)).await });
+    // Let the command reach the writer first.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    store.barrier().await?;
+    assert_eq!(
+        command_rows(&store)?,
+        (1, 1, 1),
+        "the barrier came back before the queued commit"
+    );
+    command.await??;
+    Ok(())
+}

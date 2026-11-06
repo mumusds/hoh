@@ -17,8 +17,6 @@ const WRITER_QUEUE: usize = 256;
 const READERS: usize = 4;
 /// Unix socket paths longer than this do not fit `sockaddr_un`.
 const SOCKET_PATH_MAX: usize = 107;
-/// How long a stopping host waits for its connections to finish before it ends them (M2T12R-01).
-const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// What a host serves and how.
 #[derive(Clone, Debug)]
@@ -219,8 +217,16 @@ impl Host {
             stop: stopped.clone(),
         });
         let mut served = vec![
-            tokio::spawn(http::serve_tcp(tcp, shared.clone(), stopped.clone())),
-            tokio::spawn(http::serve_unix(unix, shared.clone(), stopped)),
+            tokio::spawn(http::serve(
+                http::Listener::Tcp(tcp),
+                shared.clone(),
+                stopped.clone(),
+            )),
+            tokio::spawn(http::serve(
+                http::Listener::Unix(unix),
+                shared.clone(),
+                stopped,
+            )),
         ];
         let written = write_host_json(
             &files,
@@ -236,7 +242,10 @@ impl Host {
         if let Err(e) = written {
             // Stop serving before the lock goes with the error (M2T12R-08).
             let _ = stop.send(true);
-            drain(&mut served).await;
+            for task in served.iter_mut() {
+                let _ = task.await;
+            }
+            let _ = shared.store.barrier().await;
             let _ = std::fs::remove_file(&socket);
             return Err(e);
         }
@@ -276,29 +285,18 @@ impl Host {
         })
     }
 
-    /// Stop serving (event streams end, connections get [`SHUTDOWN_GRACE`] to finish and are then ended), then
-    /// remove `host.json` and the socket; the lock and the database stay.
-    pub async fn shutdown(mut self) {
+    /// Stop (ADR-016 decision 12): no more requests, event streams end, every connection finishes or is ended after
+    /// the grace, every queued write is done; then `host.json` and the socket go, and only then the project lock.
+    /// The database stays.
+    pub async fn shutdown(self) {
         let _ = self.stop.send(true);
-        drain(&mut self.served).await;
-        let _ = std::fs::remove_file(self.files.join("host.json"));
-        let _ = std::fs::remove_file(&self.socket);
-    }
-}
-
-/// Wait for the serving tasks, at most [`SHUTDOWN_GRACE`]; then end what is left (a connection that never sent a
-/// whole request, M2T12R-01).
-async fn drain(served: &mut [tokio::task::JoinHandle<()>]) {
-    let waited = tokio::time::timeout(SHUTDOWN_GRACE, async {
-        for task in served.iter_mut() {
+        for task in self.served {
             let _ = task.await;
         }
-    })
-    .await;
-    if waited.is_err() {
-        for task in served.iter() {
-            task.abort();
-        }
+        let _ = self.shared.store.barrier().await;
+        let _ = std::fs::remove_file(self.files.join("host.json"));
+        let _ = std::fs::remove_file(&self.socket);
+        drop(self._lock);
     }
 }
 

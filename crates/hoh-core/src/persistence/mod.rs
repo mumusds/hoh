@@ -694,6 +694,12 @@ impl Store {
         self.writer.pragmas().await
     }
 
+    /// Wait until every write queued before this call has committed or rolled back: the writer takes requests in
+    /// order, one at a time (a stopping host's last step before it lets the project go, ADR-016 decision 12).
+    pub async fn barrier(&self) -> Result<(), PersistError> {
+        self.writer.barrier().await
+    }
+
     /// The highest committed event seq, updated after each commit (REQ-036: subscribers learn of an event only after
     /// its transaction committed).
     pub fn watermark(&self) -> tokio::sync::watch::Receiver<i64> {

@@ -1395,18 +1395,22 @@ async fn a_host_stops_with_subscribers_and_half_requests() -> R {
     assert!(!socket.exists());
     assert!(!dir.path().join(".hoh/host.json").exists());
     drop((tcp, unix));
-    // A connection that never sends a whole request is ended after the grace; the lock is free again.
+    // A request whose body never arrives whole: its connection closes with the stop (a handler that outlasts the
+    // grace is ended, see a_stopping_host_finishes_its_writes_before_the_lock_goes); the lock is free again.
     let host = Host::start(config(dir.path())).await?;
     assert_eq!(host.host_epoch, 2);
+    seed_runs(&host, dir.path(), &["r1".to_owned()])?;
+    let body = pause("c-half", "k-half", "r1", 0, "half");
     let mut half = tokio::net::TcpStream::connect(("127.0.0.1", host.port)).await?;
-    half.write_all(
-        format!(
-            "GET /v1/runs/r1 HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n",
-            host.port
-        )
-        .as_bytes(),
-    )
-    .await?;
+    let head = format!(
+        "POST /v1/commands HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nX-HoH-Token: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
+        host.port,
+        host.token,
+        body.len()
+    );
+    half.write_all(head.as_bytes()).await?;
+    half.write_all(b"\r\n").await?;
+    half.write_all(&body[..body.len() / 2]).await?;
     let started = Instant::now();
     tokio::time::timeout(Duration::from_secs(15), host.shutdown()).await?;
     assert!(
@@ -1415,9 +1419,14 @@ async fn a_host_stops_with_subscribers_and_half_requests() -> R {
         started.elapsed()
     );
     assert!(!dir.path().join(".hoh/host.json").exists());
+    // The stopped host's connection is gone: finishing the request gets nothing, and nothing is written (M2T12R-60).
+    let _ = half.write_all(&body[body.len() / 2..]).await;
+    let mut answer = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), half.read_to_end(&mut answer)).await?;
+    assert!(answer.is_empty(), "{}", String::from_utf8_lossy(&answer));
+    assert_eq!(scalar(dir.path(), "SELECT count(*) FROM commands")?, "0");
     let next = Host::start(config(dir.path())).await?;
     next.shutdown().await;
-    drop(half);
     Ok(())
 }
 
@@ -1711,6 +1720,118 @@ async fn malformed_requests_get_error_bodies() -> R {
     );
     assert_eq!(resumed.events()[0].1["run_id"], "r2");
     drop(resumed);
+    host.shutdown().await;
+    Ok(())
+}
+
+/// A commit slower than the grace: its connection is ended, but the host lets the project go only after the writer
+/// finished it, so no write of a stopped host can follow the next host's start (ADR-016 decision 12, M2T12R-60).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stopping_host_finishes_its_writes_before_the_lock_goes() -> R {
+    #[derive(Debug)]
+    struct SlowCommit;
+    impl FaultHooks for SlowCommit {
+        fn before_commit(&self) -> Result<(), PersistError> {
+            std::thread::sleep(Duration::from_secs(6));
+            Ok(())
+        }
+    }
+    let dir = tempfile::tempdir()?;
+    let mut slow = config(dir.path());
+    slow.store.faults = Arc::new(SlowCommit);
+    let host = Host::start(slow).await?;
+    seed_runs(&host, dir.path(), &["r1".to_owned()])?;
+    let to = To::Tcp(host.port);
+    let token = host.token.clone();
+    let command = tokio::spawn(async move {
+        send(
+            &to,
+            "POST",
+            "/v1/commands",
+            Some(&token),
+            &[],
+            &pause("c-slow", "k-slow", "r1", 0, "slow"),
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    host.shutdown().await;
+    assert_eq!(
+        scalar(dir.path(), "SELECT count(*) FROM commands")?,
+        "1",
+        "the lock went before the write was done"
+    );
+    // The commit outlasted the grace, so its connection was ended without a response; a retry replays it.
+    let answer = command.await??;
+    assert!(answer.is_none(), "{answer:?}");
+    let next = Host::start(config(dir.path())).await?;
+    assert_eq!(next.host_epoch, 2);
+    next.shutdown().await;
+    Ok(())
+}
+
+/// A start that fails after binding leaves nothing served: a port in use leaves no socket; a host.json that cannot
+/// be written stops serving and removes the socket, and the lock is free afterwards (M2T12R-08, -63).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_start_leaves_nothing_served() -> R {
+    let dir = tempfile::tempdir()?;
+    let busy = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let mut taken = config(dir.path());
+    taken.port = busy.local_addr()?.port();
+    let refused = Host::start(taken)
+        .await
+        .err()
+        .ok_or("started on a port in use")?;
+    assert!(refused.message.contains("cannot bind"), "{refused}");
+    assert!(!dir.path().join(".hoh/host.sock").exists());
+    drop(busy);
+    // host.json is a directory with something in it: it cannot be replaced.
+    std::fs::create_dir_all(dir.path().join(".hoh/host.json"))?;
+    std::fs::write(dir.path().join(".hoh/host.json/keep"), "")?;
+    let refused = Host::start(config(dir.path()))
+        .await
+        .err()
+        .ok_or("started without host.json")?;
+    assert!(refused.message.contains("host.json"), "{refused}");
+    assert!(!dir.path().join(".hoh/host.sock").exists());
+    std::fs::remove_dir_all(dir.path().join(".hoh/host.json"))?;
+    let host = Host::start(config(dir.path())).await?;
+    host.shutdown().await;
+    Ok(())
+}
+
+/// On the socket a request target naming an authority is refused; a Last-Event-ID that is not ASCII is unreadable,
+/// 409 (M2T12R-62, -63).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_socket_and_cursor_edges_are_refused() -> R {
+    let dir = tempfile::tempdir()?;
+    let host = Host::start(config(dir.path())).await?;
+    let request = format!(
+        "GET http://localhost/healthz HTTP/1.1\r\nHost: localhost\r\nX-HoH-Token: {}\r\nConnection: close\r\n\r\n",
+        host.token
+    );
+    let raw = exchange(
+        tokio::net::UnixStream::connect(&host.socket).await?,
+        request.into_bytes(),
+    )
+    .await?;
+    let reply = parse(&raw)?.ok_or("no response")?;
+    assert_eq!(reply.status, 403, "{reply:?}");
+    let mut request = format!(
+        "GET /v1/events HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nX-HoH-Token: {}\r\nConnection: close\r\nLast-Event-ID: ",
+        host.port, host.token
+    )
+    .into_bytes();
+    request.extend_from_slice(&[0xff, 0xfe]);
+    request.extend_from_slice(b"\r\n\r\n");
+    let raw = exchange(
+        tokio::net::TcpStream::connect(("127.0.0.1", host.port)).await?,
+        request,
+    )
+    .await?;
+    let reply = parse(&raw)?.ok_or("no response")?;
+    assert_eq!(reply.status, 409, "{reply:?}");
+    assert_eq!(reply.json()?["code"], "CONFLICT");
     host.shutdown().await;
     Ok(())
 }

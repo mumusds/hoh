@@ -455,6 +455,8 @@ dependencies = [
  "futures-util",
  "hoh-agents",
  "hoh-core",
+ "hyper",
+ "hyper-util",
  "ratatui",
  "rustix",
  "serde",
