@@ -4,14 +4,15 @@
 //! state compare-and-set, event appends and outbox inserts succeed together or not at all.
 
 use super::attempts::{self, AttemptJob, AttemptMove, CancelLatch};
+use super::commands::{self, CommandOutcome, HostStart, SubmitCommand};
 use super::decide::{self, Decided};
-use super::{Options, PersistError, sqlite_error};
+use super::{FaultHooks, Options, PersistError, Pragmas, sqlite_error};
 use crate::decision::{Context, Proposal};
 use crate::lifecycle::AttemptState;
 use crate::lifecycle::{self, Lifecycle};
 use crate::protocol::{RunState, TaskState};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 /// Entities with a state and a revision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,6 +120,17 @@ enum Job {
         Box<(AttemptMove, CancelLatch)>,
         oneshot::Sender<Result<AttemptState, PersistError>>,
     ),
+    Command(
+        Box<SubmitCommand>,
+        oneshot::Sender<Result<CommandOutcome, PersistError>>,
+    ),
+    /// Project id and repo path for [`commands::begin_host`].
+    BeginHost(
+        Box<(String, String)>,
+        oneshot::Sender<Result<HostStart, PersistError>>,
+    ),
+    /// The writer connection's settings.
+    Pragmas(oneshot::Sender<Result<Pragmas, PersistError>>),
 }
 
 /// Test-only fault injection inside the writer.
@@ -146,13 +158,22 @@ impl std::fmt::Debug for Job {
             Job::Decide(..) => "Decide",
             Job::Attempt(..) => "Attempt",
             Job::EndAttempt(..) => "EndAttempt",
+            Job::Command(..) => "Command",
+            Job::BeginHost(..) => "BeginHost",
+            Job::Pragmas(..) => "Pragmas",
         })
     }
 }
 
 impl Writer {
-    pub(super) fn spawn(conn: Connection, options: &Options) -> Result<Writer, PersistError> {
-        Self::start(conn, options, || {}, || {})
+    /// The writer thread; `committed` gets the highest event seq after every request, so it moves only once a
+    /// transaction that appended events has committed (REQ-036).
+    pub(super) fn spawn(
+        conn: Connection,
+        options: &Options,
+        committed: watch::Sender<i64>,
+    ) -> Result<Writer, PersistError> {
+        Self::start(conn, options, committed, || {}, || {})
     }
 
     #[cfg(test)]
@@ -160,6 +181,7 @@ impl Writer {
         conn: Connection,
         options: &Options,
         fault: Fault,
+        committed: watch::Sender<i64>,
     ) -> Result<Writer, PersistError> {
         let before = move || {
             if let Fault::Stall(d) = fault {
@@ -171,7 +193,7 @@ impl Writer {
                 std::process::abort();
             }
         };
-        Self::start(conn, options, before, after_events)
+        Self::start(conn, options, committed, before, after_events)
     }
 
     /// `before` runs before each request and `after_events` inside a commit after its events (fault injection in
@@ -179,10 +201,12 @@ impl Writer {
     fn start(
         mut conn: Connection,
         options: &Options,
+        committed: watch::Sender<i64>,
         before: impl Fn() + Send + 'static,
         after_events: impl Fn() + Send + 'static,
     ) -> Result<Writer, PersistError> {
         let (jobs, mut rx) = mpsc::channel(options.queue.max(1));
+        let faults = options.faults.clone();
         std::thread::Builder::new()
             .name("hoh-db-writer".to_owned())
             .spawn(move || {
@@ -191,7 +215,22 @@ impl Writer {
                     before();
                     match job {
                         Job::Commit(commit, reply) => {
-                            let _ = reply.send(apply(&mut conn, &commit, &after_events));
+                            let _ = reply.send(apply(
+                                &mut conn,
+                                &commit,
+                                &after_events,
+                                faults.as_ref(),
+                            ));
+                        }
+                        Job::Command(command, reply) => {
+                            let _ =
+                                reply.send(commands::submit(&mut conn, &command, faults.as_ref()));
+                        }
+                        Job::BeginHost(ids, reply) => {
+                            let _ = reply.send(commands::begin_host(&mut conn, &ids.0, &ids.1));
+                        }
+                        Job::Pragmas(reply) => {
+                            let _ = reply.send(super::pragmas(&conn));
                         }
                         Job::EnsureProject(id, repo, reply) => {
                             let _ = reply.send(ensure_project(&conn, &id, &repo));
@@ -215,6 +254,16 @@ impl Writer {
                                 &after_events,
                             ));
                         }
+                    }
+                    // Only what has committed is visible to this connection's next read.
+                    if let Ok(now) = commands::max_seq(&conn) {
+                        committed.send_if_modified(|seq| {
+                            let moved = now > *seq;
+                            if moved {
+                                *seq = now;
+                            }
+                            moved
+                        });
                     }
                 }
             })
@@ -280,6 +329,26 @@ impl Writer {
             .await
     }
 
+    pub(super) async fn command(
+        &self,
+        command: SubmitCommand,
+    ) -> Result<CommandOutcome, PersistError> {
+        self.submit(|tx| Job::Command(Box::new(command), tx)).await
+    }
+
+    pub(super) async fn begin_host(
+        &self,
+        project_id: String,
+        repo_path: String,
+    ) -> Result<HostStart, PersistError> {
+        self.submit(|tx| Job::BeginHost(Box::new((project_id, repo_path)), tx))
+            .await
+    }
+
+    pub(super) async fn pragmas(&self) -> Result<Pragmas, PersistError> {
+        self.submit(Job::Pragmas).await
+    }
+
     pub(super) async fn scratch_task(&self, ids: [String; 4]) -> Result<(), PersistError> {
         self.submit(|tx| Job::ScratchTask(Box::new(ids), tx)).await
     }
@@ -342,11 +411,13 @@ fn apply(
     conn: &mut Connection,
     commit: &Commit,
     after_events: &dyn Fn(),
+    faults: &dyn FaultHooks,
 ) -> Result<Committed, PersistError> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(sqlite_error)?;
     let done = write(&tx, commit, after_events)?;
+    faults.before_commit()?;
     tx.commit().map_err(sqlite_error)?;
     Ok(done)
 }

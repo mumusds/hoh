@@ -12,6 +12,7 @@
 #![allow(clippy::disallowed_methods)]
 
 mod attempts;
+mod commands;
 mod decide;
 mod inputs;
 pub mod location;
@@ -21,6 +22,7 @@ mod writer;
 pub use attempts::{
     AttemptFacts, AttemptMove, AttemptRow, CancelLatch, CancelReceipt, NewAttempt, Session,
 };
+pub use commands::{CommandOutcome, EventRow, HostStart, RunRow, SubmitCommand};
 pub use decide::Decided;
 pub use inputs::{InputMove, InputRow, NewInput};
 pub use writer::{Change, Commit, Committed, Entity, NewEvent, NewOutbox, StateCas};
@@ -28,6 +30,7 @@ pub use writer::{Change, Commit, Committed, Entity, NewEvent, NewOutbox, StateCa
 use crate::protocol::{ErrorCode, RejectionReason};
 use rusqlite::{Connection, OpenFlags};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Initial values of REQ-062.
@@ -40,6 +43,8 @@ pub struct Options {
     /// The second process of the WAL self-test; `None` is this executable with
     /// [`selftest::PROBE_ARG`] (the `hoh` binary).
     pub wal_probe: Option<selftest::ProbeCommand>,
+    /// Fault injection points; the product's [`NoFaults`] does nothing (CR-006).
+    pub faults: Arc<dyn FaultHooks>,
 }
 
 impl Default for Options {
@@ -48,9 +53,31 @@ impl Default for Options {
             busy_timeout: Duration::from_millis(5000),
             queue: 64,
             wal_probe: None,
+            faults: Arc::new(NoFaults),
         }
     }
 }
+
+/// Fault injection points (REQ-036, CR-006, approved by the project owner): the product's implementation,
+/// [`NoFaults`], does nothing; the implementations that make faults are test code, passed in process through
+/// [`Options::faults`]. No product entry point passes another, and no environment variable, argument or file does.
+pub trait FaultHooks: Send + Sync + std::fmt::Debug {
+    /// Before a write transaction commits: an error fails the commit with it, and the transaction rolls back.
+    fn before_commit(&self) -> Result<(), PersistError> {
+        Ok(())
+    }
+
+    /// Before each WAL self-test step: an `Err` fails that step with its text.
+    fn before_wal_step(&self, _step: selftest::Step) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// The product's fault hooks: none.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoFaults;
+
+impl FaultHooks for NoFaults {}
 
 /// Why a persistence operation failed.
 #[derive(Debug)]
@@ -104,6 +131,11 @@ pub enum PersistError {
     /// The database stayed locked for busy_timeout, or the writer queue stayed full that long (`DB_BUSY`,
     /// retryable); nothing was written.
     Busy(String),
+    /// The database's file system is full or over quota, so the transaction could not commit (`DB_FULL`,
+    /// retryable); nothing was written.
+    Full(String),
+    /// The idempotency key was accepted before with another payload (`KEY_REUSE`); nothing was written.
+    KeyReuse(String),
     /// The writer actor is no longer running.
     WriterStopped,
     /// A scratch-only write ([`Store::scratch_task`]) on a database that is not empty; nothing was written.
@@ -119,6 +151,7 @@ impl PersistError {
             PersistError::OnNetworkFs { .. } => Some(ErrorCode::DbOnNetworkFs),
             PersistError::WalUnsupported { .. } => Some(ErrorCode::DbWalUnsupported),
             PersistError::Busy(_) => Some(ErrorCode::DbBusy),
+            PersistError::Full(_) => Some(ErrorCode::DbFull),
             PersistError::RunNotFound(_) => Some(ErrorCode::RunNotFound),
             _ => None,
         }
@@ -130,13 +163,14 @@ impl PersistError {
             PersistError::StaleRevision { .. } => Some(RejectionReason::StaleRevision),
             PersistError::IllegalTransition { .. } => Some(RejectionReason::IllegalTransition),
             PersistError::StaleState { .. } => Some(RejectionReason::StaleRevision),
+            PersistError::KeyReuse(_) => Some(RejectionReason::KeyReuse),
             _ => None,
         }
     }
 
     /// Whether the same request may succeed later unchanged.
     pub fn retryable(&self) -> bool {
-        matches!(self, PersistError::Busy(_))
+        matches!(self, PersistError::Busy(_) | PersistError::Full(_))
     }
 }
 
@@ -203,6 +237,11 @@ impl std::fmt::Display for PersistError {
             PersistError::InvalidProposal(detail) => write!(f, "invalid proposal: {detail}"),
             PersistError::Unsupported(kind) => write!(f, "{kind} decisions are not applied yet"),
             PersistError::Busy(detail) => write!(f, "DB_BUSY: {detail}"),
+            PersistError::Full(detail) => write!(f, "DB_FULL: {detail}"),
+            PersistError::KeyReuse(key) => write!(
+                f,
+                "KEY_REUSE: idempotency key {key} was accepted with another payload"
+            ),
             PersistError::WriterStopped => write!(f, "the database writer is not running"),
             PersistError::NotScratch(why) => write!(f, "not a scratch database: {why}"),
             PersistError::Storage(detail) => write!(f, "storage error: {detail}"),
@@ -221,6 +260,7 @@ fn sqlite_error(e: rusqlite::Error) -> PersistError {
         Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) => {
             PersistError::Busy(e.to_string())
         }
+        Some(rusqlite::ErrorCode::DiskFull) => PersistError::Full(e.to_string()),
         _ => PersistError::Storage(e.to_string()),
     }
 }
@@ -431,6 +471,8 @@ pub struct Store {
     path: PathBuf,
     options: Options,
     writer: writer::Writer,
+    /// The highest committed event seq.
+    watermark: tokio::sync::watch::Receiver<i64>,
 }
 
 impl Store {
@@ -487,7 +529,7 @@ impl Store {
             Some(probe) => probe.clone(),
             None => selftest::ProbeCommand::current_exe().map_err(storage)?,
         };
-        selftest::wal_self_test(&dir, &probe)?;
+        selftest::run(&dir, &probe, &|step| options.faults.before_wal_step(step))?;
         let store = Self::open_checked(&path, options, migrations)?;
         location::check_device(&path, mountinfo).map_err(network(&path))?;
         Ok(store)
@@ -502,11 +544,13 @@ impl Store {
         let conn = Connection::open_with_flags(path, flags).map_err(sqlite_error)?;
         configure(&conn, &options, true)?;
         migrate(&conn, migrations)?;
-        let writer = writer::Writer::spawn(conn, &options)?;
+        let (committed, watermark) = tokio::sync::watch::channel(commands::max_seq(&conn)?);
+        let writer = writer::Writer::spawn(conn, &options, committed)?;
         Ok(Store {
             path: path.to_path_buf(),
             options,
             writer,
+            watermark,
         })
     }
 
@@ -625,6 +669,37 @@ impl Store {
             .await
     }
 
+    /// Apply a command through the host API: idempotent by its key (REQ-022, REQ-041).
+    pub async fn submit_command(
+        &self,
+        command: SubmitCommand,
+    ) -> Result<CommandOutcome, PersistError> {
+        self.writer.command(command).await
+    }
+
+    /// Start a host on this database for the project at `repo_path` (`project_id` if it is new): integrity check
+    /// and the next host epoch (REQ-041).
+    pub async fn begin_host(
+        &self,
+        project_id: &str,
+        repo_path: &str,
+    ) -> Result<HostStart, PersistError> {
+        self.writer
+            .begin_host(project_id.to_owned(), repo_path.to_owned())
+            .await
+    }
+
+    /// The writer connection's settings.
+    pub async fn writer_pragmas(&self) -> Result<Pragmas, PersistError> {
+        self.writer.pragmas().await
+    }
+
+    /// The highest committed event seq, updated after each commit (REQ-036: subscribers learn of an event only after
+    /// its transaction committed).
+    pub fn watermark(&self) -> tokio::sync::watch::Receiver<i64> {
+        self.watermark.clone()
+    }
+
     /// A new read-only connection with verified settings.
     pub fn reader(&self) -> Result<Reader, PersistError> {
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -679,6 +754,26 @@ impl Reader {
     /// The input queue row `input_id`.
     pub fn input(&self, input_id: &str) -> Result<Option<InputRow>, PersistError> {
         inputs::read_input(&self.conn, input_id)
+    }
+
+    /// The run `run_id` with the highest event seq, read together.
+    pub fn snapshot(&self, run_id: &str) -> Result<Option<(RunRow, i64)>, PersistError> {
+        commands::snapshot(&self.conn, run_id)
+    }
+
+    /// At most `limit` events after seq `after`, in order.
+    pub fn events_after(&self, after: i64, limit: usize) -> Result<Vec<EventRow>, PersistError> {
+        commands::events_after(&self.conn, after, limit)
+    }
+
+    /// The highest event seq.
+    pub fn max_seq(&self) -> Result<i64, PersistError> {
+        commands::max_seq(&self.conn)
+    }
+
+    /// Whether this connection refuses writes, as a reader must (REQ-062).
+    pub fn refuses_writes(&self) -> bool {
+        commands::refuses_writes(&self.conn)
     }
 }
 
