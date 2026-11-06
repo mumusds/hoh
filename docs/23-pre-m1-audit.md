@@ -82,7 +82,7 @@ ECC 2.2.3 是一套通用的 Agent 增强包（约 71 个 agent、314 个 skill�
 3. 第 4 档（并发正确性）要求用户先评审设计，M2 的租约、CAS、epoch fencing 全部属于这一档，会停下来等待。
 4. 全局 AGENTS.md 会进入 Codex/Claude 审查会话；它识别子代理靠 `You are a subagent`，而 HoH 的信封是 `[HOH_DELEGATED_TASK]`，审查会话可能被当成顶层任务。
 
-替代做法：项目级 SessionStart 钩子在会话恢复或压缩后注入 PROGRESS 的下一步、运行中的任务与 git 状态，委派会话（设置了 `HOH_BOOTSTRAP_PARENT`）自动跳过（`.claude/settings.json`、`scripts/dev/session-context.sh`）。
+替代做法：项目级 SessionStart 钩子在会话恢复或压缩后注入 PROGRESS 的下一步、运行中的任务与 git 状态，委派会话（设置了 `HOH_DELEGATED_TASK`，或 `HOH_BOOTSTRAP_PARENT` 不等于顶层会话的 `HOH_TOP_LEVEL_SESSION`；顶层会话自己也带 `HOH_BOOTSTRAP_PARENT`，见 docs/22）自动跳过（`.claude/settings.json`、`scripts/dev/session-context.sh`）。
 
 ## 5. 长期运行的准备
 

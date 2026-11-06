@@ -15,7 +15,7 @@ class SessionAlerts(unittest.TestCase):
         (self.root/'.hoh-dev/task-state.json').write_text(json.dumps({'tasks':{'M1-T07':{'status':'running','owner':'main-dev'},'M1-T09':{'status':'blocked'}}}))
         (self.root/'.hoh-dev/PROGRESS.md').write_text('# x\n## Next\n- freeze the candidate\n- run round 17\n## Environment facts\n- n/a\n')
         (self.root/'.hoh-dev/evidence/m1t07-r4-018').mkdir(parents=True)
-        self.env={k:v for k,v in os.environ.items() if k not in ('HOH_BOOTSTRAP_PARENT','HOH_DELEGATED_TASK')}
+        self.env={k:v for k,v in os.environ.items() if k not in ('HOH_BOOTSTRAP_PARENT','HOH_DELEGATED_TASK','HOH_TOP_LEVEL_SESSION')}
     def tearDown(self): self.tmp.cleanup()
     def hook(self,name,payload,env=None):
         return subprocess.run(['bash',str(self.root/'scripts/dev'/name)],input=payload,capture_output=True,text=True,env=env or self.env,timeout=30)
@@ -56,14 +56,28 @@ class SessionAlerts(unittest.TestCase):
         out=self.hook('session-alert.sh','not json')
         self.assertEqual(out.returncode,0);self.assertEqual(self.alerts()[0]['event'],'')
     def test_a_top_level_session_with_a_bootstrap_parent_is_a_main_session(self):
-        # SAR-01: scripts/start.sh (interactive) and agent_task.py --top-level (headless) both set HOH_BOOTSTRAP_PARENT
-        # for the top-level session; that alone does not make it delegated.
+        # SAR-01: scripts/start.sh (interactive) and agent_task.py --top-level (headless) set HOH_BOOTSTRAP_PARENT for
+        # the top-level session, and HOH_TOP_LEVEL_SESSION to the same id; that is a main session.
         for parent in ('interactive-20261106T000000Z-1','0b0d5b0e-attempt'):
-            env=dict(self.env,HOH_BOOTSTRAP_PARENT=parent)
+            env=dict(self.env,HOH_BOOTSTRAP_PARENT=parent,HOH_TOP_LEVEL_SESSION=parent)
             out=self.hook('session-alert.sh',json.dumps({'hook_event_name':'SessionEnd','reason':'other'}),env=env)
             self.assertEqual(out.returncode,0,out.stderr)
             self.assertIn('main development session context',self.hook('session-context.sh','',env=env).stdout.lower())
         self.assertEqual([a['event'] for a in self.alerts()],['SessionEnd','SessionEnd'])
+    def test_a_session_started_inside_another_is_left_alone_whatever_started_it(self):
+        # SAR-08: a session whose HOH_BOOTSTRAP_PARENT names another session is delegated, also when the bridge that
+        # started it predates HOH_DELEGATED_TASK.
+        for env in (dict(self.env,HOH_BOOTSTRAP_PARENT='attempt-2'),dict(self.env,HOH_BOOTSTRAP_PARENT='attempt-2',HOH_TOP_LEVEL_SESSION='top-1')):
+            out=self.hook('session-alert.sh',json.dumps({'hook_event_name':'StopFailure','error':'server_error'}),env=env)
+            self.assertEqual((out.returncode,out.stdout),(0,''))
+            self.assertEqual(self.hook('session-context.sh','',env=env).stdout,'')
+        self.assertEqual(self.alerts(),[])
+    def test_the_notification_does_not_need_the_record(self):
+        # SAR-10: an alert file that cannot be written still leaves the notification.
+        (self.root/'.hoh-dev/session-alerts.jsonl').mkdir()
+        out=self.hook('session-alert.sh',json.dumps({'hook_event_name':'StopFailure','error':'overloaded'}))
+        self.assertEqual(out.returncode,0)
+        self.assertIn('overloaded',json.loads(out.stdout)['terminalSequence'])
     def test_what_cannot_be_collected_does_not_lose_the_alert(self):
         # SAR-02: the event and its notification are kept whatever the recovery point's sources look like.
         (self.root/'.hoh-dev/evidence/dangling').symlink_to(self.root/'nowhere')

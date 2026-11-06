@@ -155,7 +155,7 @@ class SetupAndLedger(unittest.TestCase):
         for d in ['scripts','tools','config','contracts','examples']:shutil.copytree(ROOT/d,self.root/d,ignore=shutil.ignore_patterns('__pycache__'))
         for f in ['LAUNCH_PROMPT.md','requirements-dev.txt']:shutil.copy(ROOT/f,self.root/f)
     def shell(self,*args,env=None):
-        e={k:v for k,v in os.environ.items() if k!='HOH_BOOTSTRAP_PARENT'}|(env or {})
+        e={k:v for k,v in os.environ.items() if k not in ('HOH_BOOTSTRAP_PARENT','HOH_TOP_LEVEL_SESSION','HOH_DELEGATED_TASK')}|(env or {})
         # In the copy: a probe the scripts run (preflight's pi --version) may write into its working directory (TB-05).
         return subprocess.run(['bash',str(self.root/'scripts'/args[0]),*args[1:]],cwd=self.root,capture_output=True,text=True,timeout=30,env=e)
     def test_bootstrap_requires_yolo_ack(self):self.assertEqual(self.shell('bootstrap.sh','--dry-run').returncode,64)
@@ -171,6 +171,18 @@ class SetupAndLedger(unittest.TestCase):
         p=self.shell('start.sh','codex','--dry-run');self.assertEqual(p.returncode,0,p.stderr);self.assertIn('--dangerously-bypass',p.stdout);self.assertIn('HOH_TOP_LEVEL_BOOTSTRAP',p.stdout)
     def test_start_defaults_to_main_developer(self):
         p=self.shell('start.sh','--headless','--dry-run');self.assertEqual(p.returncode,0,p.stderr);self.assertEqual(json.loads(p.stdout)['argv'][0],'claude')
+    def test_start_names_the_top_level_session_for_the_session_hooks(self):
+        # SAR-08: the session start.sh launches is the top-level one: HOH_TOP_LEVEL_SESSION equals its
+        # HOH_BOOTSTRAP_PARENT, so the session hooks treat it as the main session.
+        fake=self.root/'bin';fake.mkdir();seen=self.root/'seen.json'
+        (fake/'claude').write_text('#!/usr/bin/env python3\nimport json,os,sys\nif sys.argv[1:]==["--help"]:print("  --dangerously-skip-permissions  bypass");sys.exit(0)\n'
+                                   f'json.dump({{k:v for k,v in os.environ.items() if k.startswith("HOH_")}},open({str(seen)!r},"w"))\n')
+        (fake/'claude').chmod(0o755)
+        p=self.shell('start.sh','claude',env={'PATH':str(fake)+os.pathsep+os.environ.get('PATH','')})
+        self.assertEqual(p.returncode,0,p.stderr)
+        hoh=json.loads(seen.read_text())
+        self.assertTrue(hoh['HOH_BOOTSTRAP_PARENT'].startswith('interactive-'),hoh)
+        self.assertEqual(hoh.get('HOH_TOP_LEVEL_SESSION'),hoh['HOH_BOOTSTRAP_PARENT'])
     def test_start_refuses_nested_top_level(self):
         p=self.shell('start.sh','--dry-run',env={'HOH_BOOTSTRAP_PARENT':'outer'});self.assertEqual(p.returncode,78)
     def test_start_pi_offline_with_verified_packages(self):

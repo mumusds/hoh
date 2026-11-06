@@ -12,9 +12,13 @@ from install_pi_plugins import verify_installed
 # Set in every native child. A nested bridge call with --top-level is refused,
 # so a delegated or already-running top-level session cannot start another commander.
 PARENT_ENV='HOH_BOOTSTRAP_PARENT'
-# Set (to the role) only in a session started for delegated work, never in a top-level one: the session hooks
-# (scripts/dev/session-context.sh, session-alert.sh) leave exactly these sessions alone (SAR-01).
+# Set (to the role) only in a session started for delegated work, never in a top-level one (SAR-01).
 DELEGATED_ENV='HOH_DELEGATED_TASK'
+# Set in the top-level session (by scripts/start.sh and --top-level) to its own HOH_BOOTSTRAP_PARENT and inherited by
+# everything below it: a session whose HOH_BOOTSTRAP_PARENT is not this id was started inside another one, whichever
+# bridge version started it. The session hooks (scripts/dev/session-context.sh, session-alert.sh) leave such sessions,
+# and those with HOH_DELEGATED_TASK, alone (SAR-08).
+TOP_LEVEL_ENV='HOH_TOP_LEVEL_SESSION'
 TOP_LEVEL_ROLES={'commander','developer'}
 REPORT_ROLES={'qa','reviewer'}
 # Session identity, IPC and per-session state that a parent agent session injects into its children
@@ -188,6 +192,7 @@ def main(argv=None)->int:
     original=a.prompt_file.read_bytes()
     if not original.strip():p.error('prompt must not be empty')
     if a.top_level and a.role not in TOP_LEVEL_ROLES:p.error('--top-level requires role commander or developer')
+    if not a.role.strip():p.error('--role must name a role')
     if a.report_out and a.role not in REPORT_ROLES:p.error('--report-out requires role qa or reviewer')
     if a.report_out and a.report_out.exists():p.error(f'report already exists: {a.report_out}; evidence is append-only')
     if os.getenv('HOH_EVIDENCE_DIR') and a.agent not in live_session_agents():
@@ -213,7 +218,8 @@ def main(argv=None)->int:
     except (RuntimeError,ValueError,subprocess.TimeoutExpired) as exc:print(str(exc),file=sys.stderr);return 78
     env=child_env(attempt_id);pi_packages=None
     env.pop(DELEGATED_ENV,None)
-    if not a.top_level:env[DELEGATED_ENV]=a.role
+    if a.top_level:env[TOP_LEVEL_ENV]=attempt_id
+    else:env[DELEGATED_ENV]=a.role
     if a.agent=='pi':
         # Pi installs missing configured packages at startup unless offline; load only verified installations (M0R3-05).
         pi_packages=verify_installed(a.cwd.resolve())

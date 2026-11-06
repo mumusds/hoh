@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # Claude Code SessionStart hook (startup|resume|compact|clear): print the facts a resumed or compacted
 # main development session needs first. Plain stdout becomes model context. Sessions tools/agent_task.py starts for
-# delegated work carry HOH_DELEGATED_TASK and get nothing, so reviewers/QA stay independent of the author's notes;
-# HOH_BOOTSTRAP_PARENT alone (also set for the top-level session by scripts/start.sh) does not make a session delegated
-# (SAR-01). Read-only apart from the seen-counter; never fails the session (exit 0 on any problem).
+# delegated work (HOH_DELEGATED_TASK, or a HOH_BOOTSTRAP_PARENT that is not the top-level session's
+# HOH_TOP_LEVEL_SESSION) get nothing, so reviewers/QA stay independent of the author's notes; HOH_BOOTSTRAP_PARENT
+# alone (also set for the top-level session by scripts/start.sh) does not make a session delegated (SAR-01, SAR-08). Read-only apart from the seen-counter; never fails the session (exit 0 on any problem).
 set -u
+# Delegated: marked so, or started inside another session (its parent is not the top-level session, SAR-08).
 [[ -z "${HOH_DELEGATED_TASK:-}" ]] || exit 0
+[[ -z "${HOH_BOOTSTRAP_PARENT:-}" || "${HOH_BOOTSTRAP_PARENT}" == "${HOH_TOP_LEVEL_SESSION:-}" ]] || exit 0
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)" || exit 0
 cd "$root" || exit 0
 echo '[hoh-session] Main development session context (scripts/dev/session-context.sh).'
