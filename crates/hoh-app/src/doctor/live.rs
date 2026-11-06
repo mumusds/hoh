@@ -88,7 +88,12 @@ fn prepare(
                 true => Some(stdout_of(launcher, &["app-server", "--help"], env)?),
                 false => None,
             };
-            let (known, requests, client_notifications) = match &app_server_help {
+            // An App Server that cannot start on stdio is not used whatever its schema says, so its schema is not asked
+            // for; codex::run then takes exec, saying why (the probe's order, M1T07R-27, -29).
+            let startable = app_server_help
+                .as_deref()
+                .filter(|help| codex::app_server_launch_missing(help).is_none());
+            let (known, requests, client_notifications) = match startable {
                 None => Default::default(),
                 Some(_) => {
                     let schema = work.join("..").join("codex-schema");

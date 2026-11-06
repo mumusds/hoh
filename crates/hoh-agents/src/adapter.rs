@@ -216,16 +216,15 @@ pub fn option_text(help: &str, flag: &str) -> Option<String> {
     text.map(|text| text.join("\n"))
 }
 
-/// Whether `word` is a whole token of `text`: found where neither the character before it nor the one after it is a
-/// letter, digit, `-` or `_` (`stream-json-v2` is not `stream-json`, `grpc` is not `rpc`, `stdio://x` is not
-/// `stdio://`; M1T07R-17, -27).
+/// Whether `word` is a whole token of `text`: tokens are separated by white space and by the punctuation that quotes
+/// or lists values (`` ` ' " , ; ( ) [ ] { } ``), and one may end a sentence with `.`. So `stream-json-v2` is not
+/// `stream-json`, `grpc` is not `rpc`, and `stdio:///socket`, `stdio://?mode=pipe` or `stdio://.invalid` are not
+/// `stdio://` (M1T07R-17, -27).
 pub fn has_word(text: &str, word: &str) -> bool {
-    let inner = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
     !word.is_empty()
-        && text.match_indices(word).any(|(at, _)| {
-            !text[..at].chars().next_back().is_some_and(inner)
-                && !text[at + word.len()..].chars().next().is_some_and(inner)
-        })
+        && text
+            .split(|c: char| c.is_whitespace() || "`'\",;()[]{}".contains(c))
+            .any(|token| token == word || token.strip_suffix('.') == Some(word))
 }
 
 /// Whether `help` lists the subcommand `name` in the command column of its `Commands:` section (the least indented
@@ -404,7 +403,8 @@ mod help_tests {
                 "{line}"
             );
         }
-        let help = "Options:\n  --mode <rpc>  Output mode: text or json\n  --output-format <stream-json>\n  --level LEVEL  One of: rpc\n";
+        // `[rpc]` and `[stream-json]` hold whole tokens: only the description-only rule keeps them out.
+        let help = "Options:\n  --mode [rpc]  Output mode: text or json\n  --output-format [stream-json]\n  --level LEVEL  One of: rpc\n";
         let value = |help: &str, flag: &str, word: &str| {
             option_text(help, flag).map(|text| has_word(&text, word))
         };
@@ -463,6 +463,25 @@ mod help_tests {
         assert!(
             !has_word("stream-json-v2", "stream-json") && has_word("(stream-json)", "stream-json")
         );
+        // A longer URI is another value (M1T07R-27, round 2); a value may end a sentence.
+        for longer in [
+            "Supported values: `stdio:///socket`",
+            "Supported values: stdio://?mode=pipe",
+            "Supported values: `stdio://.invalid`",
+        ] {
+            assert!(!has_word(longer, "stdio://"), "{longer}");
+        }
+        assert!(has_word("Supported values: unix://, stdio://.", "stdio://"));
+        assert!(has_word("Output mode: text, json or rpc.", "rpc"));
+        // Part of another token is no value: a file name, another option's syntax.
+        assert!(!has_word(
+            "Output mode: text or json (see docs/rpc.md)",
+            "rpc"
+        ));
+        assert!(!has_word(
+            "Implies --output-format=stream-json",
+            "stream-json"
+        ));
     }
 
     /// A subcommand is a name in the command column of the `Commands:` section, not a wrapped description and not a

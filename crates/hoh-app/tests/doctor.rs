@@ -840,10 +840,17 @@ fn live_drives_an_exec_only_codex_through_exec() -> R {
 /// M1R-04, M1T07R-27).
 #[test]
 fn live_drives_codex_through_exec_when_its_app_server_lacks_what_a_turn_uses() -> R {
-    for (file, method) in [
-        ("app-server-schema/ClientRequest.json", "turn/start"),
-        ("app-server-schema/ClientNotification.json", "initialized"),
-        ("help-app-server.txt", "stdio://"),
+    // (file, what is taken out of it, what takes its place; for the help, the App Server's schema command then fails,
+    // as it is never needed: M1T07R-29).
+    for (file, method, other) in [
+        ("app-server-schema/ClientRequest.json", "turn/start", ""),
+        (
+            "app-server-schema/ClientNotification.json",
+            "initialized",
+            "",
+        ),
+        ("help-app-server.txt", "stdio://", "pipe://"),
+        ("help-app-server.txt", "stdio://", "stdio:///socket"),
     ] {
         let s = Sandbox::new()?;
         let f = fixtures().join("codex/0.166.0");
@@ -860,7 +867,7 @@ fn live_drives_codex_through_exec_when_its_app_server_lacks_what_a_turn_uses() -
         );
         let text = std::fs::read_to_string(copy.join(file))?;
         let changed = match method {
-            "stdio://" => text.replace(method, "pipe://"),
+            "stdio://" => text.replace(method, other),
             _ => {
                 let quoted = format!("\"{method}\"");
                 assert_eq!(
@@ -880,18 +887,21 @@ fn live_drives_codex_through_exec_when_its_app_server_lacks_what_a_turn_uses() -
                 "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n --help) cat '{f}/help.txt';;\n \
                  exec) if [ \"$2\" = --help ]; then cat '{f}/help-exec.txt'; elif [ \"$2\" = resume ]; then printf 'Usage: codex exec resume\\n      --json\\n'; \
                  else cat > /dev/null; cat '{f}/exec/stdout.jsonl'; fi;;\n \
-                 app-server) case \"$2\" in\n  --help) cat '{c}/help-app-server.txt';;\n  generate-json-schema) [ \"$3\" = --out ] && mkdir -p \"$4\" && cp -R '{s}/.' \"$4/\";;\n  \
+                 app-server) case \"$2\" in\n  --help) cat '{c}/help-app-server.txt';;\n  generate-json-schema) {schema_command};;\n  \
                  *) exit 9;;\n esac;;\n \
                  login) echo 'Logged in using ChatGPT' >&2;;\n *) echo \"error: unrecognized subcommand '$1'\" >&2; exit 2;;\nesac\n",
                 f = f.display(),
                 c = copy.display(),
-                s = schema.display()
+                schema_command = match other {
+                    "" => format!("[ \"$3\" = --out ] && mkdir -p \"$4\" && cp -R '{}/.' \"$4/\"", schema.display()),
+                    _ => "exit 2".to_owned(),
+                }
             ),
         )?;
         let (out, _) = s.doctor_in(&[], &["--live", "--output", "json"], &[])?;
         let report: Value = serde_json::from_slice(&out.stdout)?;
         let live = &report["agents"]["codex"]["live"];
-        assert_eq!(live["state"], "SETTLED", "without {method}: {live}");
+        assert_eq!(live["state"], "SETTLED", "without {method} {other}: {live}");
         let logs = Path::new(live["logs"].as_str().ok_or("no logs")?);
         assert!(
             !logs.join("app-server.stdout.jsonl").exists(),
