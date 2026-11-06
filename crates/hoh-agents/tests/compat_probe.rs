@@ -1217,7 +1217,7 @@ fn a_method_whose_envelope_cannot_be_valid_is_absent() -> R {
             .unwrap_or_else(|| panic!("no {method} branch"))
     }
     type Change = fn(&mut serde_json::Value);
-    let cases: [(&str, &str, Change, bool); 7] = [
+    let cases: [(&str, &str, Change, bool); 11] = [
         (
             "id-false",
             "ClientRequest.json",
@@ -1268,6 +1268,39 @@ fn a_method_whose_envelope_cannot_be_valid_is_absent() -> R {
             |v| branch(v, "turn/steer")["properties"]["id"] = json!(false),
             true,
         ),
+        // The adapter numbers its requests 0, 1, 2, ...: an id schema that does not take them all refuses every
+        // request (M1T07R-36).
+        (
+            "ids-up-to-three",
+            "ClientRequest.json",
+            |v| v["definitions"]["RequestId"] = json!({"type": "integer", "enum": [0, 1, 2, 3]}),
+            false,
+        ),
+        (
+            "ids-float-enum",
+            "ClientRequest.json",
+            |v| v["definitions"]["RequestId"] = json!({"enum": [0.0]}),
+            false,
+        ),
+        // draft-07 ignores `$ref`'s siblings: both branches take the id, so oneOf refuses it (M1T07R-34).
+        (
+            "ref-siblings",
+            "ClientRequest.json",
+            |v| {
+                branch(v, "initialize")["properties"]["id"] = json!({"oneOf": [
+                {"$ref": "#/definitions/RequestId", "minimum": 1}, {"$ref": "#/definitions/RequestId"}]});
+            },
+            false,
+        ),
+        // Params stay open everywhere, the server's root `properties.params` too (M1T07R-37).
+        (
+            "root-params",
+            "ServerNotification.json",
+            |v| {
+                v["properties"]["params"] = json!({"type": "object", "required": ["x_future"]});
+            },
+            true,
+        ),
     ];
     for (group, file, change, app_server) in cases {
         let schema = tmp.path().join(group);
@@ -1298,7 +1331,7 @@ fn a_method_whose_envelope_cannot_be_valid_is_absent() -> R {
                 assert_eq!(entry.transport, Transport::AppServer, "{group}");
                 assert_eq!(
                     entry.capabilities.get("mid_turn_steer"),
-                    Some(&Some(false)),
+                    Some(&Some(group != "steer-impossible")),
                     "{group}"
                 );
                 assert_eq!(

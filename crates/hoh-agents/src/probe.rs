@@ -453,10 +453,23 @@ fn schema_methods(
     Some(methods)
 }
 
+/// The `oneOf` branch of a protocol schema file that lists `method`.
+fn branch_of<'a>(file: &'a serde_json::Value, method: &str) -> Option<&'a serde_json::Value> {
+    file["oneOf"].as_array()?.iter().find(|branch| {
+        branch["properties"]["method"]["enum"]
+            .as_array()
+            .is_some_and(|names| names.iter().any(|n| n == method))
+    })
+}
+
 /// A copy of a protocol schema file whose branches accept any `params`: the probe checks a method's envelope, not its
 /// parameters, which the compat suite verifies against recorded traffic (ADR-015 decision 2, M1T07R-33).
 fn params_open(file: &serde_json::Value) -> serde_json::Value {
     let mut open = file.clone();
+    // The root's `properties` (ServerNotification.json) and every branch's (M1T07R-37).
+    if let Some(params) = open.get_mut("properties").and_then(|p| p.get_mut("params")) {
+        *params = serde_json::Value::Bool(true);
+    }
     for branch in open["oneOf"].as_array_mut().into_iter().flatten() {
         if let Some(params) = branch["properties"].get_mut("params") {
             *params = serde_json::Value::Bool(true);
@@ -465,25 +478,150 @@ fn params_open(file: &serde_json::Value) -> serde_json::Value {
     open
 }
 
-/// How deep `$ref`s may nest while validating; deeper is invalid, so a cyclic definition cannot loop.
+/// How deep schemas may nest while validating; deeper is undecided, so a cyclic definition cannot loop.
 const REF_DEPTH: usize = 64;
 
-/// Whether `instance` is valid under `schema`, one of the keyword set [`draft7_well_formed`] accepts (the only schemas
-/// that reach here); `format`, `default`, `title`, `description` are annotations. Every keyword applies, `$ref`'s
-/// siblings too: stricter than draft-07, so what is valid here is valid under it.
+/// A validation result: what the probe cannot decide exactly is `Unknown`, and only `Yes` keeps a method, so an
+/// undecided part never turns into a decision the other way (inside `oneOf`, a wrong "no" would be a wrong "yes";
+/// M1T07R-34).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Truth {
+    Yes,
+    No,
+    Unknown,
+}
+
+impl Truth {
+    fn of(yes: bool) -> Truth {
+        if yes { Truth::Yes } else { Truth::No }
+    }
+
+    /// Every item holds: no if one is no, else undecided if one is.
+    fn all(items: impl IntoIterator<Item = Truth>) -> Truth {
+        let mut all = Truth::Yes;
+        for item in items {
+            match item {
+                Truth::No => return Truth::No,
+                Truth::Unknown => all = Truth::Unknown,
+                Truth::Yes => {}
+            }
+        }
+        all
+    }
+
+    /// Some item holds: yes if one is yes, else undecided if one is.
+    fn any(items: impl IntoIterator<Item = Truth>) -> Truth {
+        let mut any = Truth::No;
+        for item in items {
+            match item {
+                Truth::Yes => return Truth::Yes,
+                Truth::Unknown => any = Truth::Unknown,
+                Truth::No => {}
+            }
+        }
+        any
+    }
+
+    /// Exactly one item holds.
+    fn one(items: impl IntoIterator<Item = Truth>) -> Truth {
+        let (mut yes, mut unknown) = (0, 0);
+        for item in items {
+            match item {
+                Truth::Yes => yes += 1,
+                Truth::Unknown => unknown += 1,
+                Truth::No => {}
+            }
+        }
+        match (yes, unknown) {
+            (2.., _) => Truth::No,
+            (1, 0) => Truth::Yes,
+            (0, 0) => Truth::No,
+            _ => Truth::Unknown,
+        }
+    }
+}
+
+/// Two JSON numbers compared exactly (`0` equals `0.0`, `9007199254740993` is more than `9007199254740992`); `None`
+/// when they cannot be (a NaN).
+fn number_order(a: &serde_json::Number, b: &serde_json::Number) -> Option<std::cmp::Ordering> {
+    let integer = |n: &serde_json::Number| {
+        n.as_i64()
+            .map(i128::from)
+            .or_else(|| n.as_u64().map(i128::from))
+    };
+    // An integer against a float: against the float's floor, the float being more when it has a fraction.
+    let against = |i: i128, f: f64| -> Option<std::cmp::Ordering> {
+        if f.is_nan() {
+            return None;
+        }
+        let floor = f.floor();
+        if floor >= 1.7e38 {
+            return Some(std::cmp::Ordering::Less);
+        }
+        if floor <= -1.7e38 {
+            return Some(std::cmp::Ordering::Greater);
+        }
+        let floor = floor as i128;
+        Some(match i.cmp(&floor) {
+            std::cmp::Ordering::Equal if f.fract() != 0.0 => std::cmp::Ordering::Less,
+            order => order,
+        })
+    };
+    match (integer(a), integer(b)) {
+        (Some(x), Some(y)) => Some(x.cmp(&y)),
+        (Some(x), None) => against(x, b.as_f64()?),
+        (None, Some(y)) => against(y, a.as_f64()?).map(std::cmp::Ordering::reverse),
+        (None, None) => a.as_f64()?.partial_cmp(&b.as_f64()?),
+    }
+}
+
+/// JSON equality as JSON Schema means it: numbers by value, arrays and objects member by member (M1T07R-35).
+fn json_equal(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => {
+            number_order(x, y) == Some(std::cmp::Ordering::Equal)
+        }
+        (Value::Array(x), Value::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(a, b)| json_equal(a, b))
+        }
+        (Value::Object(x), Value::Object(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .all(|(k, v)| y.get(k).is_some_and(|w| json_equal(v, w)))
+        }
+        _ => a == b,
+    }
+}
+
+/// Whether `instance` is valid under `schema` by draft-07, for the keyword set [`draft7_well_formed`] accepts (the
+/// only schemas that reach here): `$ref` alone counts where it is (its siblings are ignored, as draft-07 says);
+/// `format`, `default`, `title`, `description` are annotations; nesting deeper than [`REF_DEPTH`] is `Unknown`
+/// (M1T07R-33, -34).
 fn valid(
     schema: &serde_json::Value,
     instance: &serde_json::Value,
     defs: &serde_json::Map<String, serde_json::Value>,
     depth: usize,
-) -> bool {
+) -> Truth {
     use serde_json::Value;
     let obj = match schema {
-        Value::Bool(b) => return *b,
-        Value::Object(obj) if depth <= REF_DEPTH => obj,
-        _ => return false,
+        Value::Bool(b) => return Truth::of(*b),
+        Value::Object(_) if depth > REF_DEPTH => return Truth::Unknown,
+        Value::Object(obj) => obj,
+        _ => return Truth::No,
     };
     let sub = |s: &Value, x: &Value| valid(s, x, defs, depth + 1);
+    if let Some(target) = obj.get("$ref") {
+        return match target
+            .as_str()
+            .and_then(|r| r.strip_prefix("#/definitions/"))
+            .and_then(|name| defs.get(name))
+        {
+            Some(s) => sub(s, instance),
+            None => Truth::No,
+        };
+    }
     let is_type = |name: &str| match name {
         "null" => instance.is_null(),
         "boolean" => instance.is_boolean(),
@@ -498,57 +636,118 @@ fn valid(
         "string" => instance.is_string(),
         _ => false,
     };
-    obj.iter().all(|(key, v)| match key.as_str() {
-        "type" => match v {
-            Value::String(name) => is_type(name),
-            Value::Array(names) => names.iter().filter_map(Value::as_str).any(is_type),
-            _ => false,
-        },
-        "enum" => v.as_array().is_some_and(|values| values.contains(instance)),
-        "required" => instance.as_object().is_none_or(|o| {
-            v.as_array().is_some_and(|names| {
-                names
-                    .iter()
-                    .all(|n| n.as_str().is_some_and(|n| o.contains_key(n)))
-            })
-        }),
-        "properties" => instance.as_object().is_none_or(|o| {
-            v.as_object().is_some_and(|props| {
-                props
-                    .iter()
-                    .all(|(n, s)| o.get(n).is_none_or(|x| sub(s, x)))
-            })
-        }),
-        "additionalProperties" => instance.as_object().is_none_or(|o| {
-            let declared = obj.get("properties").and_then(Value::as_object);
-            o.iter()
-                .filter(|(n, _)| !declared.is_some_and(|d| d.contains_key(*n)))
-                .all(|(_, x)| sub(v, x))
-        }),
-        "items" => instance
-            .as_array()
-            .is_none_or(|a| a.iter().all(|x| sub(v, x))),
-        "allOf" => v
-            .as_array()
-            .is_some_and(|l| l.iter().all(|s| sub(s, instance))),
-        "anyOf" => v
-            .as_array()
-            .is_some_and(|l| l.iter().any(|s| sub(s, instance))),
-        "oneOf" => v
-            .as_array()
-            .is_some_and(|l| l.iter().filter(|s| sub(s, instance)).count() == 1),
-        "$ref" => v
+    let schemas = |v: &Value| v.as_array().cloned().unwrap_or_default();
+    Truth::all(obj.iter().map(|(key, v)| {
+        match key.as_str() {
+            "type" => Truth::of(match v {
+                Value::String(name) => is_type(name),
+                Value::Array(names) => names.iter().filter_map(Value::as_str).any(is_type),
+                _ => false,
+            }),
+            "enum" => Truth::of(
+                v.as_array()
+                    .is_some_and(|values| values.iter().any(|e| json_equal(e, instance))),
+            ),
+            "required" => Truth::of(instance.as_object().is_none_or(|o| {
+                v.as_array().is_some_and(|names| {
+                    names
+                        .iter()
+                        .all(|n| n.as_str().is_some_and(|n| o.contains_key(n)))
+                })
+            })),
+            "properties" => match (instance.as_object(), v.as_object()) {
+                (None, _) => Truth::Yes,
+                (Some(_), None) => Truth::No,
+                (Some(o), Some(props)) => Truth::all(
+                    props
+                        .iter()
+                        .filter_map(|(n, s)| o.get(n).map(|x| sub(s, x))),
+                ),
+            },
+            "additionalProperties" => match instance.as_object() {
+                None => Truth::Yes,
+                Some(o) => {
+                    let declared = obj.get("properties").and_then(Value::as_object);
+                    Truth::all(
+                        o.iter()
+                            .filter(|(n, _)| !declared.is_some_and(|d| d.contains_key(*n)))
+                            .map(|(_, x)| sub(v, x)),
+                    )
+                }
+            },
+            "items" => match instance.as_array() {
+                None => Truth::Yes,
+                Some(a) => Truth::all(a.iter().map(|x| sub(v, x))),
+            },
+            "allOf" => Truth::all(schemas(v).iter().map(|s| sub(s, instance))),
+            "anyOf" => Truth::any(schemas(v).iter().map(|s| sub(s, instance))),
+            "oneOf" => Truth::one(schemas(v).iter().map(|s| sub(s, instance))),
+            "minimum" => match (instance.as_number(), v.as_number()) {
+                (None, _) => Truth::Yes,
+                (Some(x), Some(m)) => match number_order(x, m) {
+                    Some(order) => Truth::of(order != std::cmp::Ordering::Less),
+                    None => Truth::Unknown,
+                },
+                (Some(_), None) => Truth::No,
+            },
+            "minLength" => {
+                Truth::of(instance.as_str().is_none_or(|text| {
+                    v.as_u64().is_some_and(|m| text.chars().count() as u64 >= m)
+                }))
+            }
+            "format" | "default" | "title" | "description" | "$schema" | "definitions" => {
+                Truth::Yes
+            }
+            _ => Truth::No,
+        }
+    }))
+}
+
+/// Whether every request id the adapter may use (it numbers them 0, 1, 2, ...) is valid under `schema`. A sound check
+/// that refuses what it cannot show: `true`; a `$ref` to such a schema (its siblings ignored, as draft-07 says); or
+/// an object with no `enum` or `oneOf`, a `type` that admits integers, a `minimum` of at most 0, every `allOf` member
+/// and some `anyOf` member such a schema, and otherwise only keywords that do not apply to a number (M1T07R-36).
+fn takes_every_id(
+    schema: &serde_json::Value,
+    defs: &serde_json::Map<String, serde_json::Value>,
+    depth: usize,
+) -> bool {
+    use serde_json::Value;
+    let obj = match schema {
+        Value::Bool(b) => return *b,
+        Value::Object(obj) if depth <= REF_DEPTH => obj,
+        _ => return false,
+    };
+    let sub = |s: &Value| takes_every_id(s, defs, depth + 1);
+    if let Some(target) = obj.get("$ref") {
+        return target
             .as_str()
             .and_then(|r| r.strip_prefix("#/definitions/"))
             .and_then(|name| defs.get(name))
-            .is_some_and(|s| sub(s, instance)),
-        "minimum" => instance
-            .as_f64()
-            .is_none_or(|x| v.as_f64().is_some_and(|m| x >= m)),
-        "minLength" => instance
-            .as_str()
-            .is_none_or(|text| v.as_u64().is_some_and(|m| text.chars().count() as u64 >= m)),
-        "format" | "default" | "title" | "description" | "$schema" | "definitions" => true,
+            .is_some_and(sub);
+    }
+    let integers = |name: &str| matches!(name, "integer" | "number");
+    obj.iter().all(|(key, v)| match key.as_str() {
+        "type" => match v {
+            Value::String(name) => integers(name),
+            Value::Array(names) => names.iter().filter_map(Value::as_str).any(integers),
+            _ => false,
+        },
+        "minimum" => v.as_number().is_some_and(|m| {
+            number_order(m, &serde_json::Number::from(0))
+                .is_some_and(|o| o != std::cmp::Ordering::Greater)
+        }),
+        "allOf" => v.as_array().is_some_and(|l| l.iter().all(sub)),
+        "anyOf" => v.as_array().is_some_and(|l| l.iter().any(sub)),
+        "required"
+        | "properties"
+        | "additionalProperties"
+        | "items"
+        | "minLength"
+        | "format"
+        | "default"
+        | "title"
+        | "description" => true,
         _ => false,
     })
 }
@@ -606,22 +805,22 @@ pub fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<CodexSchema, Prob
             Ok::<_, ProbeError>(
                 listed
                     .into_iter()
-                    .filter(|m| valid(&open, &envelope(m), defs, 0))
+                    .filter(|m| valid(&open, &envelope(m), defs, 0) == Truth::Yes)
+                    .filter(|m| {
+                        // A request also needs an id schema that takes every id the adapter numbers (M1T07R-36).
+                        !name.starts_with("ClientRequest")
+                            || branch_of(&open, m).is_some_and(|branch| {
+                                branch["properties"]
+                                    .get("id")
+                                    .is_none_or(|id| takes_every_id(id, defs, 0))
+                            })
+                    })
                     .collect(),
             )
         };
-        // HoH's requests as a plain turn numbers them (from 0: initialize, the thread, the turn, then an interrupt or a
-        // steer); its only notification, `initialized`, has no params; the server's notifications have `method` and
-        // `params`.
-        let request = |m: &str| {
-            let id = match m {
-                "initialize" => 0,
-                "thread/start" | "thread/resume" => 1,
-                "turn/start" => 2,
-                _ => 3,
-            };
-            serde_json::json!({"id": id, "method": m, "params": {}})
-        };
+        // HoH's requests (any id will do here: whether the id schema takes every id is checked apart), its only
+        // notification `initialized` without params, and the server's notifications with `method` and `params`.
+        let request = |m: &str| serde_json::json!({"id": 0, "method": m, "params": {}});
         Ok(CodexSchema {
             requests: methods("ClientRequest.json", true, &request)?,
             client_notifications: methods(
@@ -1293,16 +1492,19 @@ mod tests {
         Ok(())
     }
 
-    /// The validator of the probe's keyword set: every keyword constrains as draft-07 says, `$ref` chains end, and
-    /// annotations do not constrain (M1T07R-33).
+    /// The validator of the probe's keyword set: every keyword constrains as draft-07 says, `$ref` ignores its
+    /// siblings, numbers compare by value, and what it cannot decide stays undecided (M1T07R-33..-35, -38).
     #[test]
     fn the_validator_applies_each_keyword() {
         use serde_json::json;
         let defs = json!({"Id": {"anyOf": [{"type": "string"}, {"type": "integer", "minimum": 0}]},
                           "Loop": {"$ref": "#/definitions/Loop"}});
         let defs = defs.as_object().cloned().unwrap_or_default();
-        let ok = |schema: serde_json::Value, instance: serde_json::Value| {
+        let truth = |schema: serde_json::Value, instance: serde_json::Value| {
             valid(&schema, &instance, &defs, 0)
+        };
+        let ok = |schema: serde_json::Value, instance: serde_json::Value| {
+            truth(schema, instance) == Truth::Yes
         };
         assert!(ok(json!(true), json!(1)) && !ok(json!(false), json!(1)));
         assert!(
@@ -1365,10 +1567,6 @@ mod tests {
             "an unknown definition"
         );
         assert!(
-            !ok(json!({"$ref": "#/definitions/Loop"}), json!(0)),
-            "a cycle ends invalid"
-        );
-        assert!(
             !ok(json!({"minLength": 2}), json!("é")) && ok(json!({"minLength": 1}), json!("é"))
         );
         assert!(ok(
@@ -1379,5 +1577,94 @@ mod tests {
             !ok(json!({"not": {}}), json!(1)),
             "an unknown keyword is not valid"
         );
+        // `$ref` ignores its siblings, so both branches take 0 and oneOf refuses it (M1T07R-34).
+        assert!(ok(
+            json!({"$ref": "#/definitions/Id", "minimum": 1}),
+            json!(0)
+        ));
+        assert_eq!(
+            truth(
+                json!({"oneOf": [{"$ref": "#/definitions/Id", "minimum": 1}, {"$ref": "#/definitions/Id"}]}),
+                json!(0)
+            ),
+            Truth::No
+        );
+        // A cycle is undecided, and so is a oneOf that hangs on it (M1T07R-34).
+        assert_eq!(
+            truth(json!({"$ref": "#/definitions/Loop"}), json!(0)),
+            Truth::Unknown
+        );
+        assert_eq!(
+            truth(
+                json!({"oneOf": [{"$ref": "#/definitions/Loop"}, {"type": "integer"}]}),
+                json!(0)
+            ),
+            Truth::Unknown
+        );
+        assert_eq!(
+            truth(
+                json!({"anyOf": [{"$ref": "#/definitions/Loop"}, {"type": "integer"}]}),
+                json!(0)
+            ),
+            Truth::Yes
+        );
+        assert_eq!(
+            truth(
+                json!({"allOf": [{"$ref": "#/definitions/Loop"}, {"type": "string"}]}),
+                json!(0)
+            ),
+            Truth::No
+        );
+        // Numbers by value (M1T07R-35, -38).
+        assert!(
+            ok(json!({"enum": [0.0]}), json!(0))
+                && ok(json!({"enum": [[1.0, {"a": 2}]]}), json!([1, {"a": 2.0}]))
+        );
+        assert!(!ok(
+            json!({"oneOf": [{"enum": [0.0]}, {"enum": [0]}]}),
+            json!(0)
+        ));
+        assert!(!ok(
+            json!({"minimum": 9007199254740993u64}),
+            json!(9007199254740992u64)
+        ));
+        assert!(ok(
+            json!({"minimum": 9007199254740993u64}),
+            json!(9007199254740993u64)
+        ));
+        assert!(!ok(json!({"minimum": 0.5}), json!(0)) && ok(json!({"minimum": 0.5}), json!(1)));
+        assert!(ok(json!({"minimum": -1}), json!(-1)) && !ok(json!({"minimum": -0.5}), json!(-1)));
+    }
+
+    /// An id schema takes every id the adapter numbers only where that can be shown (M1T07R-36).
+    #[test]
+    fn every_request_id_is_taken_only_where_that_can_be_shown() {
+        use serde_json::json;
+        let defs = json!({"RequestId": {"anyOf": [{"type": "string"}, {"format": "int64", "type": "integer"}]},
+                          "Loop": {"$ref": "#/definitions/Loop"}});
+        let defs = defs.as_object().cloned().unwrap_or_default();
+        let takes = |schema: serde_json::Value| takes_every_id(&schema, &defs, 0);
+        for yes in [
+            json!(true),
+            json!({"$ref": "#/definitions/RequestId"}),
+            json!({"type": "integer"}),
+            json!({"type": ["string", "number"], "minimum": 0}),
+            json!({"allOf": [{"type": "integer"}, {"minimum": -3}]}),
+            json!({"$ref": "#/definitions/RequestId", "minimum": 5}),
+        ] {
+            assert!(takes(yes.clone()), "{yes}");
+        }
+        for no in [
+            json!(false),
+            json!({"type": "string"}),
+            json!({"type": "integer", "minimum": 1}),
+            json!({"enum": [0, 1, 2, 3]}),
+            json!({"oneOf": [{"type": "integer"}, {"type": "string"}]}),
+            json!({"anyOf": [{"type": "string"}, {"enum": [0]}]}),
+            json!({"$ref": "#/definitions/Loop"}),
+            json!({"$ref": "#/definitions/None"}),
+        ] {
+            assert!(!takes(no.clone()), "{no}");
+        }
     }
 }
