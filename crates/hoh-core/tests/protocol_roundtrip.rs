@@ -298,7 +298,10 @@ fn integral_floats_decode_like_integers() -> R {
         ),
         (Some(1), Some(10), Some(0), Some(2), Some(20))
     );
-    assert!(schema::json_eq(&protocol::encode(&team_command)?, &team_raw));
+    assert!(schema::json_eq(
+        &protocol::encode(&team_command)?,
+        &team_raw
+    ));
     // Schema-valid but not representable: an error, never a panic or a silent truncation.
     raw["tasks"][0]["user_value"] = serde_json::json!(5);
     let mut event_raw = event["instance"].clone();
