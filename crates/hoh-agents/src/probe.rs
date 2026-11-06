@@ -317,6 +317,18 @@ thread_local! {
 #[cfg(test)]
 type Hook = Box<dyn FnMut(&str, &Path)>;
 
+/// Set by the test that sees whether the probe waits for its reading to end after the result came.
+#[cfg(test)]
+static HOLD_AFTER_RESULT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The reading's last moment, after it sent its result: held 300 ms when [`HOLD_AFTER_RESULT`] is set.
+#[cfg(test)]
+fn hold_after_result() {
+    if HOLD_AFTER_RESULT.load(std::sync::atomic::Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
 /// Released by the test that stalls the reading (see [`between`]).
 #[cfg(test)]
 static RELEASE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1160,6 +1172,8 @@ pub fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<CodexSchema, Prob
         .name("hoh-schema".to_owned())
         .spawn(move || {
             let _ = tx.send(read_and_remove(scratch, generated, &reader, Some(until)));
+            #[cfg(test)]
+            hold_after_result();
         });
     let worker = match started {
         Ok(worker) => worker,
@@ -3551,6 +3565,21 @@ mod tests {
             (count("/proc/self/fd"), count("/proc/self/task")),
             baseline,
             "file descriptors and threads as a reading in time returns"
+        );
+        // The probe returns only once its reading has ended, even when that comes a while after the result.
+        HOLD_AFTER_RESULT.store(true, std::sync::atomic::Ordering::SeqCst);
+        let started = Instant::now();
+        codex_schema(&plain, &env)?;
+        let took = started.elapsed();
+        HOLD_AFTER_RESULT.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            took >= Duration::from_millis(300),
+            "returned in {took:?}, before its reading ended"
+        );
+        assert_eq!(
+            (count("/proc/self/fd"), count("/proc/self/task")),
+            baseline,
+            "file descriptors and threads once the reading ended"
         );
         Ok(())
     }
