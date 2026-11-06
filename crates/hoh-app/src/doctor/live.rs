@@ -96,27 +96,12 @@ fn prepare(
             let (known, requests, client_notifications) = match startable {
                 None => Default::default(),
                 Some(_) => {
-                    let schema = work.join("..").join("codex-schema");
-                    let schema_arg = schema.display().to_string();
-                    stdout_of(
-                        launcher,
-                        &["app-server", "generate-json-schema", "--out", &schema_arg],
-                        env,
-                    )?;
-                    let methods =
-                        |name: &str| -> Result<std::collections::BTreeSet<String>, String> {
-                            let file: Value = std::fs::read(schema.join(name))
-                                .ok()
-                                .and_then(|b| serde_json::from_slice(&b).ok())
-                                .ok_or(format!(
-                                    "codex app-server generate-json-schema gave no {name}"
-                                ))?;
-                            Ok(codex::listed_methods(&file))
-                        };
+                    // The probe's validated reader: a schema the probe refuses is refused here too (M1T07R-31).
+                    let schema = probe::codex_schema(launcher, env).map_err(|e| e.to_string())?;
                     (
-                        methods("ServerNotification.json")?,
-                        methods("ClientRequest.json")?,
-                        methods("ClientNotification.json")?,
+                        schema.notifications,
+                        schema.requests,
+                        schema.client_notifications,
                     )
                 }
             };
