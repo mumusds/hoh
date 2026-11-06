@@ -164,7 +164,11 @@ class SetupAndLedger(unittest.TestCase):
     def test_unknown_bootstrap_option(self):self.assertEqual(self.shell('bootstrap.sh','--yolo','--made-up').returncode,64)
     def test_offline_setup_idempotent(self):
         p=self.shell('bootstrap.sh','--yolo','--skip-install');self.assertIn(p.returncode,[0,3],p.stderr)
-        prog=self.root/'.hoh-dev/PROGRESS.md';self.assertTrue(prog.exists());prog.write_text('KEEP_EXISTING_PROGRESS')
+        prog=self.root/'.hoh-dev/PROGRESS.md';self.assertTrue(prog.exists())
+        # PRC-07: the headings docs/19 asks for, `## Next` read by the SessionStart hook.
+        made=prog.read_text().splitlines()
+        for heading in ['## Current state (latest first)','## Next','## Follow-ups (deferred, with source)','## History (older checkpoints)']:self.assertIn(heading,made)
+        prog.write_text('KEEP_EXISTING_PROGRESS')
         p=self.shell('bootstrap.sh','--yolo','--skip-install');self.assertIn(p.returncode,[0,3],p.stderr);self.assertEqual(prog.read_text(),'KEEP_EXISTING_PROGRESS')
         self.assertTrue((self.root/'.hoh-dev/env.sh').is_file())
     def test_start_interactive_dry(self):
