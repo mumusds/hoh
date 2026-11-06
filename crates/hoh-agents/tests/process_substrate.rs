@@ -247,6 +247,75 @@ async fn a_descendant_that_left_the_group_cannot_hold_up_the_exit() -> R {
     Ok(())
 }
 
+/// A leader that moves itself into another process group of the session (the test's own), ignores SIGTERM and prints
+/// its pid; the group it left is empty.
+fn leaving_leader() -> Command {
+    let mut command = Command::new("python3");
+    command.arg("-c").arg(
+        "import os, signal, sys, time\n\
+         signal.signal(signal.SIGTERM, signal.SIG_IGN)\n\
+         os.setpgid(0, os.getpgid(os.getppid()))\n\
+         print(os.getpid(), flush=True)\n\
+         time.sleep(600)\n",
+    );
+    command
+}
+
+/// Kill `pid` if a failed test left it running.
+fn kill_left(pid: u32) {
+    if let Some(pid) = rustix::process::Pid::from_raw(pid as i32) {
+        let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+    }
+}
+
+#[tokio::test]
+async fn a_leader_that_left_its_group_is_killed_at_the_deadline() -> R {
+    // M1T07R-103: TERM and KILL to the group it left reach nothing; the leader itself must still be ended.
+    let config = Config {
+        deadline: Some(Duration::from_millis(300)),
+        escalation: Escalation {
+            native: None,
+            native_grace: Duration::ZERO,
+            term_grace: Duration::from_millis(200),
+            kill_grace: Duration::from_secs(2),
+        },
+        ..Config::default()
+    };
+    let mut p = Process::spawn(leaving_leader(), config)?;
+    let leader: u32 = first_line(&mut p).await?.parse()?;
+    let outcome = until_exit(&mut p, Duration::from_secs(10)).await;
+    let left = alive(leader);
+    kill_left(leader);
+    let (_, report) = outcome?;
+    assert_eq!(report.cause, Cause::DeadlineExceeded);
+    assert_eq!(report.status, Some(Termination::Signal(9)), "{report:?}");
+    assert!(!left, "leader {leader} survived the deadline");
+    Ok(())
+}
+
+#[test]
+fn shutting_down_the_runtime_kills_a_leader_that_left_its_group() -> R {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let leader = runtime.block_on(async {
+        let mut p = Process::spawn(leaving_leader(), Config::default())?;
+        let leader: u32 = first_line(&mut p).await?.parse()?;
+        // Only the runtime going away ends it.
+        std::mem::forget(p);
+        Ok::<_, Box<dyn std::error::Error>>(leader)
+    })?;
+    drop(runtime);
+    let until = Instant::now() + Duration::from_secs(5);
+    while alive(leader) && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let left = alive(leader);
+    kill_left(leader);
+    assert!(!left, "leader {leader} survived the runtime");
+    Ok(())
+}
+
 #[tokio::test]
 async fn dropping_the_process_kills_its_group() -> R {
     let config = Config {
