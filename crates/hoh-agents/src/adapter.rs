@@ -619,6 +619,11 @@ mod hash_tests {
                 maximum: old.maximum,
             },
         )?;
+        // The limit must hold, or the test proves nothing: a 128 MiB reservation fails under it (M1R-08).
+        assert!(
+            Vec::<u8>::new().try_reserve_exact(128 << 20).is_err(),
+            "the data limit is not enforced here"
+        );
         println!("hashed {}", sha256_file(Path::new(&log))?);
         Ok(())
     }
