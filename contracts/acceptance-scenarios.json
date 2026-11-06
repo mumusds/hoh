@@ -435,7 +435,7 @@
    "requirement_id": "REQ-005",
    "acceptance_id": "AC-005-05",
    "check_id": "integration",
-   "fixture": "test feature编译的host，注入点=StartRun COMMIT失败；FakeAgent",
+   "fixture": "测试目标中构建的host（注入点=StartRun COMMIT失败；产品的钩子为空操作，故障由测试的实现产生）；FakeAgent",
    "steps": [
     "启用注入点后执行detach命令",
     "读取stdout/stderr/退出码",
@@ -2031,7 +2031,7 @@
    "requirement_id": "REQ-036",
    "acceptance_id": "AC-036-02",
    "check_id": "recovery",
-   "fixture": "test feature编译的host（注入点仅测试构建存在）+FakeAgent+每轮重建的文件DB",
+   "fixture": "测试目标中构建的host（注入点为产品中的空操作钩子，自发SIGKILL由测试的实现执行）+FakeAgent+每轮重建的文件DB",
    "steps": [
     "选择注入点并启动host",
     "提交触发READY→RUNNING的命令，host在注入点自发SIGKILL",
@@ -2080,7 +2080,7 @@
    "requirement_id": "REQ-036",
    "acceptance_id": "AC-036-04",
    "check_id": "integration",
-   "fixture": "test feature编译的host+SSE测试客户端+投影计数器",
+   "fixture": "测试目标中构建的host（COMMIT失败由测试实现的钩子产生，产品的钩子为空操作）+SSE测试客户端+投影计数器",
    "steps": [
     "启用COMMIT失败注入并提交PauseRun",
     "等待5 s记录订阅者收到的事件",
@@ -2434,7 +2434,7 @@
    "requirement_id": "REQ-041",
    "acceptance_id": "AC-041-01",
    "check_id": "recovery",
-   "fixture": "test feature host（5个注入点）+写计数文件与marker的FakeAgent+每轮重建DB",
+   "fixture": "测试目标中构建的host（5个注入点，产品中为空操作钩子，故障由测试的实现产生）+写计数文件与marker的FakeAgent+每轮重建DB",
    "steps": [
     "选择注入点启动Run，host在该点自发SIGKILL并记录t0",
     "harness 1 s内重启host",
@@ -2509,7 +2509,7 @@
    "requirement_id": "REQ-041",
    "acceptance_id": "AC-041-04",
    "check_id": "integration",
-   "fixture": "test feature host（响应前断连注入）+HTTP测试客户端",
+   "fixture": "测试目标中构建的host（COMMIT后、响应前的断连由测试实现的钩子产生，产品的钩子为空操作）+HTTP测试客户端",
    "steps": [
     "启用注入并提交K+X，记录连接错误",
     "关闭注入后以K+X重试",
@@ -2578,7 +2578,7 @@
    "requirement_id": "REQ-042",
    "acceptance_id": "AC-042-02",
    "check_id": "recovery",
-   "fixture": "test feature host（可注入时钟）+FakeAgent+文件DB",
+   "fixture": "测试目标中构建的host（时钟经钩子由测试注入，产品使用系统时钟）+FakeAgent+文件DB",
    "steps": [
     "制造WAITING_EXTERNAL状态并快照预算与重试字段",
     "kill -9 host后重启",
@@ -3559,7 +3559,7 @@
    "requirement_id": "REQ-062",
    "acceptance_id": "AC-062-06",
    "check_id": "integration",
-   "fixture": "可注入故障的WAL自检测试替身（仅test feature编译）",
+   "fixture": "测试目标中构建的host（WAL自检步骤失败由测试实现的钩子产生，产品的钩子为空操作）",
    "steps": [
     "在/p4启动host并提交一条命令",
     "在/p6、/p7启动host"

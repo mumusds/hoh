@@ -1,11 +1,11 @@
 {
   "schema_version": "1.1",
   "baseline_id": "HOH-BASELINE-1.1",
-  "revision": 6,
+  "revision": 7,
   "change_policy": "Formal CR + new baseline; never lower required gates to pass",
   "previous": {
     "baseline_id": "HOH-BASELINE-1.1",
-    "lock_sha256": "c9e6ec4700b1432ce103cb30f27a6f0b45d5dc457852184a16b7817c60749476"
+    "lock_sha256": "5ad3635dab9f6a982d0fa245302395546d9e83d64e2c93932a446d0ed9c7e610"
   },
   "change_requests": [
     {
@@ -32,12 +32,17 @@
       "id": "CR-005",
       "path": "docs/cr/CR-005-run-result-schema.md",
       "sha256": "d17e8fd0e46e185921fac4491ab28a0acba797654ff5cd2949963c421a7bfdd8"
+    },
+    {
+      "id": "CR-006",
+      "path": "docs/cr/CR-006-db-full-and-test-seams.md",
+      "sha256": "0e5ca104d7744167249c765125309c401157fa7a3debb87620da27a0d91ca695"
     }
   ],
   "files": {
     "CONTRACT.md": "39e15a3ed45fc60026386c7df2522eb895cd8fef07aa45bd923ded5f3f0df8a6",
     "contracts/acceptance-observation.schema.json": "6778331658ba0d47797185f5e2d322f62020ea8747c00d2ce9f1247440c1490e",
-    "contracts/acceptance-scenarios.json": "88ae534427aa023d29ab0a27bfe1873b6a0b364b00a214f2fd29ee0c151771dc",
+    "contracts/acceptance-scenarios.json": "b273253caa0e9934359df5248e1abae85a8e3256a3c019aabb76fa4130c817dc",
     "contracts/candidate.schema.json": "5965712d9f1c16e8804f3e00dbc1e2faec0b878435ba868afd637b242bb439cb",
     "contracts/check-plan.schema.json": "d4dac3c7c3ebee4356d332541035ecf9c03d12e101acb5f7c717b1598359a86a",
     "contracts/compat-manifest.schema.json": "6b4a676fc8af07bef82c7fa2d3f911ef47791026459e88419026cad565ab8de4",
@@ -46,10 +51,10 @@
     "contracts/live-session.schema.json": "06ee125373701d6569477be0396e6e11e6b28b7f89903a020f0f241e3ce32793",
     "contracts/native-attempt.schema.json": "34fce4de57f4dcf79a9023d66f546ef75f96a0bbccd569c982e8a4c300a25220",
     "contracts/openapi.json": "3159572fd5dc18f4f32a91c754b607223a085aca2c76d5f7ce28696a0417ffd7",
-    "contracts/protocol.schema.json": "079e1625bf9041fe29397389c9f3b66e0fa7ca4f22e0fdc616eb24d8f034a199",
+    "contracts/protocol.schema.json": "08f04814a5c4c5722c52dcf2caab63bf3cfeefbcb86fdb6171cf0cffd823c7a8",
     "contracts/release-policy.json": "e54581614356ad310351994a6cdb94bfe5a170f8c9d06d852d92c3e9bbb03204",
     "contracts/release.schema.json": "c482028ebde16055ed00c4e3c2d1a86b27114fae447669c3dab17d1a5eb43ab7",
-    "contracts/requirements.json": "e41a3d15dc342c1ee36e07f46b34c59e75475e52bcfc455c17a089c33d097d35",
+    "contracts/requirements.json": "daa233ca1a4fead5ef134bf58876c377662498c43585b9c7857a5407925326a6",
     "contracts/soak-event.schema.json": "87f1f9590bf2467308e38d9fe00d5a9395f06a887187e58ee4670ce586c25c6b",
     "contracts/sql/001_initial.sql": "286f56252a4f113ff121fd57935909617a30b849628aecfb5fb1c9bae407c36b",
     "contracts/test-result.schema.json": "9bffa29e3bd9ed19c6b40de93bc15394c87d55d43f668b4e0083b5b6a1f8ed51",

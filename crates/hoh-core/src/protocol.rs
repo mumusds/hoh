@@ -130,7 +130,7 @@ schema_enum!(
 schema_enum!(
     /// `ErrorCode`: API errors, CLI stderr codes and attempt failure reasons.
     ErrorCode, "SCREAMING_SNAKE_CASE",
-    [CapabilityUnsupported, RunNotFound, DbBusy, DbOnNetworkFs, DbWalUnsupported, InvalidTeamConfig, ContextBudgetTooSmall,
+    [CapabilityUnsupported, RunNotFound, DbBusy, DbOnNetworkFs, DbWalUnsupported, DbFull, InvalidTeamConfig, ContextBudgetTooSmall,
      ProtocolFrameTooLarge, ProtocolIncomplete, DagCycle, DagMissingDependency, ScoreOutOfRange, CursorExpired]
 );
 schema_enum!(
