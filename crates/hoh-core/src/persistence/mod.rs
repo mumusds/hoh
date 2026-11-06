@@ -696,7 +696,7 @@ impl Store {
 
     /// Hand `held` to the writer thread: it is dropped only when the writer has ended, after every write is done
     /// and the connection is closed (a host's project lock, ADR-016 decision 12). The writer ends once every handle
-    /// of this store is gone.
+    /// of this store is gone. A writer that panics leaks `held` instead: it stays held until the process ends.
     pub async fn keep_until_closed(
         &self,
         held: Box<dyn std::any::Any + Send>,
@@ -704,9 +704,15 @@ impl Store {
         self.writer.keep(held).await
     }
 
-    /// Resolves once the writer thread has ended (after this store and every other handle are dropped).
+    /// Resolves once the writer thread has ended: normally after this store and every other handle are dropped
+    /// (what it kept is then dropped), or early on a panic (what it kept is then leaked, still held).
     pub fn writer_ended(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
         self.writer.ended()
+    }
+
+    /// Whether the writer still takes requests; false after a panic of its thread.
+    pub fn writer_alive(&self) -> bool {
+        self.writer.alive()
     }
 
     /// The highest committed event seq, updated after each commit (REQ-036: subscribers learn of an event only after

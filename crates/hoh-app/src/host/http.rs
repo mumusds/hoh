@@ -272,8 +272,17 @@ async fn check_request(
     next.run(request).await
 }
 
-async fn health() -> Response {
-    (StatusCode::OK, axum::Json(json!({"status": "ok"}))).into_response()
+/// 200 while the host can write; 503 once its database writer has ended (M2T12R-150).
+async fn health(State(shared): State<Arc<Shared>>) -> Response {
+    if shared.store.writer_alive() {
+        (StatusCode::OK, axum::Json(json!({"status": "ok"}))).into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(json!({"status": "the database writer stopped"})),
+        )
+            .into_response()
+    }
 }
 
 /// Read with a pooled read-only connection, off the async workers (REQ-062: reads are never held up by the writer).
@@ -353,6 +362,14 @@ async fn store_error(shared: &Arc<Shared>, run_id: &str, e: PersistError) -> Res
             "the database stayed locked for the busy timeout; nothing was written",
             true,
             current_revision(shared, run_id).await,
+        ),
+        // The writer ended (a panic): this host can write no more and stops; the next one can (M2T12R-150).
+        PersistError::WriterStopped => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "GONE",
+            "the host's database writer stopped; retry with the next host",
+            true,
+            None,
         ),
         PersistError::Full(_) => error(
             StatusCode::SERVICE_UNAVAILABLE,

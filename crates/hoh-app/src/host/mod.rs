@@ -115,9 +115,8 @@ pub struct Host {
     shared: Arc<http::Shared>,
     stop: tokio::sync::watch::Sender<bool>,
     served: Vec<tokio::task::JoinHandle<()>>,
-    files: PathBuf,
-    /// The socket this host bound (device, inode): only it is removed at the stop.
-    socket_id: Option<(u64, u64)>,
+    /// host.json and the socket, removed at the stop or when the Host is dropped.
+    host_files: HostFiles,
 }
 
 impl std::fmt::Debug for Host {
@@ -160,7 +159,7 @@ impl Host {
         })?;
         std::fs::create_dir_all(&files)
             .map_err(|e| StartError::other(format!("cannot make {}: {e}", files.display())))?;
-        let lock = take_lock(&files.join("host.lock"))?;
+        let lock = take_lock(&files)?;
         let store =
             Store::open_with_mountinfo(&files.join("state.db"), config.store.clone(), &mountinfo)
                 .map_err(StartError::store)?;
@@ -212,25 +211,35 @@ impl Host {
                 socket.display()
             )));
         }
-        // The port first: a port in use leaves no socket behind (M2T12R-08).
+        // The port and the token first: nothing that can fail comes between binding the socket and the guard that
+        // removes it (M2T12R-08, -153).
         let tcp = tokio::net::TcpListener::bind(("127.0.0.1", config.port))
             .await
             .map_err(|e| {
                 StartError::other(format!("cannot bind 127.0.0.1:{}: {e}", config.port))
             })?;
-        remove_stale_socket(&socket)?;
-        let unix = tokio::net::UnixListener::bind(&socket)
-            .map_err(|e| StartError::other(format!("cannot bind {}: {e}", socket.display())))?;
-        if let Err(e) = set_mode(&socket, 0o600) {
-            let _ = std::fs::remove_file(&socket);
-            return Err(e);
-        }
-        let socket_id = file_id(&socket);
         let port = tcp
             .local_addr()
             .map_err(|e| StartError::other(e.to_string()))?
             .port();
         let token = token()?;
+        remove_stale_socket(&socket)?;
+        let unix = tokio::net::UnixListener::bind(&socket)
+            .map_err(|e| StartError::other(format!("cannot bind {}: {e}", socket.display())))?;
+        let mut host_files = HostFiles {
+            files: files.clone(),
+            socket: socket.clone(),
+            socket_id: file_id(&socket),
+            token: token.clone(),
+            armed: true,
+        };
+        if host_files.socket_id.is_none() {
+            return Err(StartError::other(format!(
+                "cannot tell the socket {} it bound",
+                socket.display()
+            )));
+        }
+        set_mode(&socket, 0o600)?;
         let (stop, stopped) = tokio::sync::watch::channel(false);
         let shared = Arc::new(http::Shared {
             store,
@@ -265,12 +274,13 @@ impl Host {
             }),
         );
         if let Err(e) = written {
-            // Stop serving; the store (and the lock with it) goes when this returns (M2T12R-08).
+            // Stop serving; the files go with their guard and the store (and the lock with it) when this returns
+            // (M2T12R-08).
             let _ = stop.send(true);
             for task in served.iter_mut() {
                 let _ = task.await;
             }
-            remove_if_ours(&files, &socket, socket_id, &token);
+            host_files.remove();
             return Err(e);
         }
         Ok(Host {
@@ -282,9 +292,13 @@ impl Host {
             shared,
             stop,
             served,
-            files,
-            socket_id,
+            host_files,
         })
+    }
+
+    /// Whether the database writer still runs (it ends only at the stop, or on a panic, M2T12R-150).
+    pub fn writer_alive(&self) -> bool {
+        self.shared.store.writer_alive()
     }
 
     /// The settings of the writer and of every reader, and whether the readers refuse writes.
@@ -318,17 +332,14 @@ impl Host {
             shared,
             stop,
             served,
-            files,
-            socket,
-            socket_id,
-            token,
+            mut host_files,
             ..
         } = self;
         let _ = stop.send(true);
         for task in served {
             let _ = task.await;
         }
-        remove_if_ours(&files, &socket, socket_id, &token);
+        host_files.remove();
         let ended = shared.store.writer_ended();
         drop(shared);
         drop(stop);
@@ -361,8 +372,23 @@ pub async fn run(config: HostConfig) -> u8 {
             _ => std::future::pending::<()>().await,
         }
     };
-    signals.await;
+    // A writer that ended while the host was not stopping (a panic) is fatal: the host stops and the process exits
+    // non-zero, so its supervisor sees the failure and starts a new host once the process has let the project go
+    // (M2T12R-150).
+    let writer_ended = host.shared.store.writer_ended();
+    let failed = tokio::select! {
+        () = signals => false,
+        () = writer_ended => true,
+    };
     host.shutdown().await;
+    if failed {
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "hoh host: the database writer ended; the host stopped"
+        );
+        return 1;
+    }
     0
 }
 
@@ -374,50 +400,89 @@ fn file_id(path: &Path) -> Option<(u64, u64)> {
         .map(|m| (m.dev(), m.ino()))
 }
 
-/// Remove `host.json` if it is this host's (its token) and the socket if it is the one this host bound; a later
-/// host's files are never touched (M2T12R-120).
-fn remove_if_ours(files: &Path, socket: &Path, socket_id: Option<(u64, u64)>, token: &str) {
-    let host_json = files.join("host.json");
-    let ours = std::fs::read(&host_json)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-        .is_some_and(|info| info["token"].as_str() == Some(token));
-    if ours {
-        let _ = std::fs::remove_file(&host_json);
-    }
-    if socket_id.is_some() && file_id(socket) == socket_id {
-        let _ = std::fs::remove_file(socket);
+/// A host's `host.json` and socket, removed once: at the stop, on a failed start, or when the Host is dropped.
+/// `host.json` goes only if it is this host's (its token) and the socket only if it is the one this host bound (its
+/// inode); a later host's files are never touched (M2T12R-120, -153).
+struct HostFiles {
+    files: PathBuf,
+    socket: PathBuf,
+    socket_id: Option<(u64, u64)>,
+    token: String,
+    armed: bool,
+}
+
+impl HostFiles {
+    fn remove(&mut self) {
+        if !std::mem::take(&mut self.armed) {
+            return;
+        }
+        let host_json = self.files.join("host.json");
+        let ours = std::fs::read(&host_json)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .is_some_and(|info| info["token"].as_str() == Some(self.token.as_str()));
+        if ours {
+            let _ = std::fs::remove_file(&host_json);
+        }
+        if self.socket_id.is_some() && file_id(&self.socket) == self.socket_id {
+            let _ = std::fs::remove_file(&self.socket);
+        }
     }
 }
 
-/// Take `.hoh/host.lock` without waiting, with this process's pid in it; a held lock names its holder.
-fn take_lock(path: &Path) -> Result<std::fs::File, StartError> {
+impl Drop for HostFiles {
+    fn drop(&mut self) {
+        self.remove();
+    }
+}
+
+/// The project lock: an exclusive `flock` on the `.hoh` directory itself, which cannot be replaced without its
+/// database (a lock on a file in it could be deleted and taken again by a second host, M2T12R-152); `host.lock` only
+/// names the holder's pid.
+struct ProjectLock {
+    _directory: std::fs::File,
+    _pid: std::fs::File,
+}
+
+/// Take the project lock without waiting; a held lock names its holder.
+fn take_lock(files: &Path) -> Result<ProjectLock, StartError> {
     use std::io::{Read as _, Seek as _, Write as _};
-    let mut file = std::fs::OpenOptions::new()
+    let directory = std::fs::File::open(files)
+        .map_err(|e| StartError::other(format!("cannot open {}: {e}", files.display())))?;
+    let pid_path = files.join("host.lock");
+    let mut pid = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(path)
-        .map_err(|e| StartError::other(format!("cannot open {}: {e}", path.display())))?;
-    if rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_err() {
+        .open(&pid_path)
+        .map_err(|e| StartError::other(format!("cannot open {}: {e}", pid_path.display())))?;
+    if rustix::fs::flock(
+        &directory,
+        rustix::fs::FlockOperation::NonBlockingLockExclusive,
+    )
+    .is_err()
+    {
         let mut holder = String::new();
-        let _ = file.read_to_string(&mut holder);
+        let _ = pid.read_to_string(&mut holder);
         return Err(StartError {
             exit_code: 69,
             message: format!(
-                "another host holds {} (pid {})",
-                path.display(),
+                "another host holds {} (pid {}); do not remove its files while it runs",
+                files.display(),
                 holder.trim()
             ),
         });
     }
-    let written = file
+    let written = pid
         .set_len(0)
-        .and_then(|()| file.rewind())
-        .and_then(|()| file.write_all(std::process::id().to_string().as_bytes()));
-    written.map_err(|e| StartError::other(format!("cannot write {}: {e}", path.display())))?;
-    Ok(file)
+        .and_then(|()| pid.rewind())
+        .and_then(|()| pid.write_all(std::process::id().to_string().as_bytes()));
+    written.map_err(|e| StartError::other(format!("cannot write {}: {e}", pid_path.display())))?;
+    Ok(ProjectLock {
+        _directory: directory,
+        _pid: pid,
+    })
 }
 
 /// A socket left by a host that ended without cleaning up is removed (under the lock, so no host uses it); anything

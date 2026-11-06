@@ -165,8 +165,9 @@ pub(super) enum Fault {
 pub(super) struct Writer {
     jobs: mpsc::Sender<Job>,
     busy_timeout: std::time::Duration,
-    /// Becomes true when the writer thread has ended: every request done, its connection closed, what it kept
-    /// dropped.
+    /// Becomes true when the writer thread has ended normally: every request done, its connection closed, what it
+    /// kept dropped. Its sender also goes when the thread unwinds from a panic, and then what it kept is leaked
+    /// (still held) instead ([`Kept`]).
     ended: watch::Receiver<bool>,
 }
 
@@ -389,7 +390,12 @@ impl Writer {
         self.submit(|tx| Job::Keep(held, tx)).await
     }
 
-    /// Resolves once the writer thread has ended.
+    /// Whether the writer thread still takes requests.
+    pub(super) fn alive(&self) -> bool {
+        !self.jobs.is_closed()
+    }
+
+    /// Resolves once the writer thread has ended (normally, or by a panic).
     pub(super) fn ended(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
         let mut ended = self.ended.clone();
         async move {
