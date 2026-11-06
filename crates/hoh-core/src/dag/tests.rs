@@ -31,6 +31,7 @@ fn a_cycle_is_refused_and_named() {
     let error = validate(
         &plan(vec![planned("a", &["b"]), planned("b", &["a"])]),
         &none(),
+        &none(),
     )
     .expect_err("a cycle was accepted");
     assert_eq!(error.code(), Some(ErrorCode::DagCycle));
@@ -43,7 +44,8 @@ fn a_cycle_is_refused_and_named() {
 
 #[test]
 fn a_self_dependency_is_a_cycle_of_one() {
-    let error = validate(&plan(vec![planned("a", &["a"])]), &none()).expect_err("accepted");
+    let error =
+        validate(&plan(vec![planned("a", &["a"])]), &none(), &none()).expect_err("accepted");
     assert_eq!(error.details(), json!({"cycle": ["a"]}));
 }
 
@@ -56,10 +58,10 @@ fn the_cycle_named_does_not_depend_on_the_plan_order() {
         planned("a", &["c"]),
         planned("d", &["c"]),
     ];
-    let first = validate(&plan(tasks.clone()), &none()).expect_err("accepted");
+    let first = validate(&plan(tasks.clone()), &none(), &none()).expect_err("accepted");
     let mut reversed = tasks;
     reversed.reverse();
-    let second = validate(&plan(reversed), &none()).expect_err("accepted");
+    let second = validate(&plan(reversed), &none(), &none()).expect_err("accepted");
     assert_eq!(first, second);
     assert_eq!(first.details(), json!({"cycle": ["a", "c", "b"]}));
 }
@@ -70,26 +72,36 @@ fn a_missing_dependency_is_refused_unless_the_run_has_it() {
         planned("a", &[]),
         planned("b", &["a", "missing", "gone"]),
     ]);
-    let error = validate(&tasks, &none()).expect_err("accepted");
+    let error = validate(&tasks, &none(), &none()).expect_err("accepted");
     assert_eq!(error.code(), Some(ErrorCode::DagMissingDependency));
     assert_eq!(
         error.details(),
         json!({"task_id": "b", "missing": ["gone", "missing"]})
     );
     let existing: BTreeSet<String> = ["missing".to_owned(), "gone".to_owned()].into();
-    let ok = validate(&tasks, &existing).expect("refused");
+    let ok = validate(&tasks, &existing, &none()).expect("refused");
     assert_eq!(order(&ok), ["a", "b"]);
 }
 
 #[test]
 fn a_duplicate_task_id_is_refused_in_the_plan_and_against_the_run() {
-    let error =
-        validate(&plan(vec![planned("a", &[]), planned("a", &[])]), &none()).expect_err("accepted");
+    let error = validate(
+        &plan(vec![planned("a", &[]), planned("a", &[])]),
+        &none(),
+        &none(),
+    )
+    .expect_err("accepted");
     assert_eq!(error.code(), Some(ErrorCode::DagDuplicateTask));
     assert_eq!(error.details(), json!({"task_id": "a"}));
     let existing: BTreeSet<String> = ["b".to_owned()].into();
-    let error = validate(&plan(vec![planned("b", &[])]), &existing).expect_err("accepted");
+    let error = validate(&plan(vec![planned("b", &[])]), &existing, &none()).expect_err("accepted");
     assert_eq!(error.details(), json!({"task_id": "b"}));
+    // Another run's task id is taken too, but it is no dependency of this run's tasks.
+    let error = validate(&plan(vec![planned("b", &[])]), &none(), &existing).expect_err("accepted");
+    assert_eq!(error.details(), json!({"task_id": "b"}));
+    let error =
+        validate(&plan(vec![planned("c", &["b"])]), &none(), &existing).expect_err("accepted");
+    assert_eq!(error.code(), Some(ErrorCode::DagMissingDependency));
 }
 
 #[test]
@@ -104,7 +116,7 @@ fn scores_out_of_range_are_refused_with_their_field_before_decoding() {
     ] {
         let mut task = planned("a", &[]);
         task[field] = value.clone();
-        let error = validate(&plan(vec![task]), &none()).expect_err("accepted");
+        let error = validate(&plan(vec![task]), &none(), &none()).expect_err("accepted");
         assert_eq!(error.code(), Some(ErrorCode::ScoreOutOfRange), "{field}");
         assert_eq!(
             error.details(),
@@ -114,14 +126,14 @@ fn scores_out_of_range_are_refused_with_their_field_before_decoding() {
     let mut task = planned("a", &[]);
     task["user_value"] = json!(5);
     task["cost_estimate"] = json!(1);
-    assert!(validate(&plan(vec![task]), &none()).is_ok());
+    assert!(validate(&plan(vec![task]), &none(), &none()).is_ok());
 }
 
 #[test]
 fn a_plan_that_breaks_the_schema_otherwise_is_invalid_without_a_dag_code() {
     let mut task = planned("a", &[]);
     task["user_value"] = json!("high");
-    let error = validate(&plan(vec![task]), &none()).expect_err("accepted");
+    let error = validate(&plan(vec![task]), &none(), &none()).expect_err("accepted");
     assert_eq!(error.code(), None);
     assert!(matches!(error, PlanError::Invalid(_)), "{error:?}");
 }
@@ -135,11 +147,11 @@ fn the_order_is_topological_and_canonical() {
         planned("a", &[]),
         planned("e", &[]),
     ];
-    let first = validate(&plan(tasks.clone()), &none()).expect("refused");
+    let first = validate(&plan(tasks.clone()), &none(), &none()).expect("refused");
     assert_eq!(order(&first), ["a", "b", "c", "d", "e"]);
     let mut reversed = tasks;
     reversed.reverse();
-    let second = validate(&plan(reversed), &none()).expect("refused");
+    let second = validate(&plan(reversed), &none(), &none()).expect("refused");
     assert_eq!(order(&first), order(&second));
 }
 
@@ -158,7 +170,7 @@ fn a_large_chain_is_linear() {
         })
         .collect();
     let started = std::time::Instant::now();
-    let ok = validate(&plan(tasks), &none()).expect("refused");
+    let ok = validate(&plan(tasks), &none(), &none()).expect("refused");
     assert_eq!(ok.tasks.len(), n);
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
 }

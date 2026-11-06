@@ -112,15 +112,23 @@ fn check_scores(raw: &Value) -> Result<(), PlanError> {
     Ok(())
 }
 
-/// Validate `raw` (a `PlanProposal`) for a run whose tasks are `existing`.
-pub fn validate(raw: &Value, existing: &BTreeSet<String>) -> Result<Plan, PlanError> {
+/// Validate `raw` (a `PlanProposal`) for a run whose tasks are `existing`; `taken` are task ids other runs use (task
+/// ids are unique in the store, so they count as duplicates too, but are no dependencies).
+pub fn validate(
+    raw: &Value,
+    existing: &BTreeSet<String>,
+    taken: &BTreeSet<String>,
+) -> Result<Plan, PlanError> {
     check_scores(raw)?;
     let proposal: PlanProposal =
         protocol::decode(raw).map_err(|e| PlanError::Invalid(vec![e.to_string()]))?;
     let mut ids = BTreeSet::new();
     let mut duplicates = BTreeSet::new();
     for task in &proposal.tasks {
-        if !ids.insert(task.task_id.as_str()) || existing.contains(&task.task_id) {
+        if !ids.insert(task.task_id.as_str())
+            || existing.contains(&task.task_id)
+            || taken.contains(&task.task_id)
+        {
             duplicates.insert(task.task_id.as_str());
         }
     }
