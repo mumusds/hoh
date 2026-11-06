@@ -107,3 +107,9 @@ Mutation check: dropping the strip from `child_env`, keeping a variable in the N
 | ID | Severity | Summary | Disposition |
 |---|---|---|---|
 | TR-02 | low | test_record.py:554 — the `finally` read `probe.pid` before stopping the units; the probe creates the file before writing it, so against a defective recorder an empty file raised ValueError (no-op mutant 1/40, 1/8, 1/10), the units were not stopped and the error hid the kernel assertion. Present before this branch too. | Fixed: an empty pidfile counts as not yet written, and the units are stopped in an inner `finally` whatever the pidfile read does. 60 unmutated runs pass; the no-op mutant fails at the kernel assertion in 20/20 runs, never with ValueError, leaving nothing behind. |
+
+### Round 3 (focused on TR-02, fresh Claude session)
+
+- Agent: `claude` 2.1.318, model claude-opus-5-5, session `9b570a03-f98d-4f22-9983-8f610c12b58e`, 375 s; attempt record sha256 `d3f6b0d3bfcc474058c2080f9e10cd6b5f6ed6e9078853da0571f267e27ebe16`, stdout sha256 `d05230c7ca924775912185142c76de03570bd55a5e36806ca4e90adb1f88b878`.
+- Scope: `a8c7d57..8243300` and the record of rounds 1-2. The reviewer forced the empty-pidfile window (the probe waits 3 s between creating and writing its pidfile): with stop_all doing nothing the old code raised ValueError and left the scope running (2/2), the new code failed at the kernel check and left nothing (5/5); the real recorder passed 10/10; 60 unmutated runs and the test_record module passed. Round 2's EACCES result was 29/30, the one exception being the TR-02 case.
+- Verdict: **PASS**, no findings.
