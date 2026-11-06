@@ -131,7 +131,8 @@ python3 - "$ROOT" <<'STATE'
 import json,pathlib,sys,datetime
 r=pathlib.Path(sys.argv[1]);d=r/'.hoh-dev'
 if not (d/'PROGRESS.md').exists():
- (d/'PROGRESS.md').write_text('# HoH development checkpoint\n\nStage: M0\nStatus: NOT_IMPLEMENTED\nNext: run bundle checks, inspect preflight, follow contracts/development-tasks.json.\n\nNo live integration or product acceptance has been claimed.\n',encoding='utf-8')
+ # The headings docs/19 asks for; the SessionStart hook reads `## Next` (PRC-07).
+ (d/'PROGRESS.md').write_text('# HoH development checkpoint\n\nStage: M0. Status: NOT_IMPLEMENTED. No live integration or product acceptance has been claimed.\n\n## Current state (latest first)\n\n- Environment prepared by scripts/bootstrap.sh; nothing implemented yet.\n\n## Next\n\n- Run the bundle checks, inspect .hoh-dev/preflight.json, then follow `python3 tools/taskboard.py next`.\n\n## Follow-ups (deferred, with source)\n\n## History (older checkpoints)\n',encoding='utf-8')
 (d/'bootstrap-state.json').write_text(json.dumps({'prepared_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),'root':str(r),'state':'ENVIRONMENT_PREPARED_NOT_ACCEPTED'},indent=2)+'\n')
 STATE
 source "$DEV/env.sh"
