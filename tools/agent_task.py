@@ -12,6 +12,9 @@ from install_pi_plugins import verify_installed
 # Set in every native child. A nested bridge call with --top-level is refused,
 # so a delegated or already-running top-level session cannot start another commander.
 PARENT_ENV='HOH_BOOTSTRAP_PARENT'
+# Set (to the role) only in a session started for delegated work, never in a top-level one: the session hooks
+# (scripts/dev/session-context.sh, session-alert.sh) leave exactly these sessions alone (SAR-01).
+DELEGATED_ENV='HOH_DELEGATED_TASK'
 TOP_LEVEL_ROLES={'commander','developer'}
 REPORT_ROLES={'qa','reviewer'}
 # Session identity, IPC and per-session state that a parent agent session injects into its children
@@ -209,6 +212,8 @@ def main(argv=None)->int:
     try:help_output=help_text(a.agent,a.cwd);cmd=command_for(a.agent,out/'sessions',model,help_output)
     except (RuntimeError,ValueError,subprocess.TimeoutExpired) as exc:print(str(exc),file=sys.stderr);return 78
     env=child_env(attempt_id);pi_packages=None
+    env.pop(DELEGATED_ENV,None)
+    if not a.top_level:env[DELEGATED_ENV]=a.role
     if a.agent=='pi':
         # Pi installs missing configured packages at startup unless offline; load only verified installations (M0R3-05).
         pi_packages=verify_installed(a.cwd.resolve())

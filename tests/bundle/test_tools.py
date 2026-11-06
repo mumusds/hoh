@@ -195,6 +195,16 @@ class NativeBridge(unittest.TestCase):
         self.assertFalse(seen&(removed|{'AI_AGENT'}))
         self.assertTrue({'CLAUDE_CODE_USE_BEDROCK','ANTHROPIC_MODEL','CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS','HOH_BOOTSTRAP_PARENT'}<=seen)  # config and our marker stay
         self.assertTrue(removed|{'AI_AGENT'}<=set(load_json(out/'attempt.json')['env_removed']))
+    def test_only_a_delegated_session_is_marked_delegated(self):
+        # SAR-01: the session hooks skip only sessions marked HOH_DELEGATED_TASK; a top-level session (also carrying
+        # HOH_BOOTSTRAP_PARENT) is not marked, even if the shell that starts it was.
+        p,out=self.bridge();self.assertEqual(p.returncode,0,p.stderr)
+        self.assertEqual(load_json(self.root/'trace.json')['env'].count('HOH_DELEGATED_TASK'),1)
+        p=subprocess.run([sys.executable,str(ROOT/'tools/agent_task.py'),'--agent','codex','--role','commander','--top-level','--prompt-file',str(self.prompt),'--cwd',str(self.root),'--output-dir',str(self.root/'top'),'--timeout','10'],
+                         capture_output=True,text=True,env=self.env|{'FAKE_MODE':'ok','HOH_DELEGATED_TASK':'qa'},timeout=20)
+        self.assertEqual(p.returncode,0,p.stderr)
+        seen=load_json(self.root/'trace.json')['env']
+        self.assertNotIn('HOH_DELEGATED_TASK',seen);self.assertIn('HOH_BOOTSTRAP_PARENT',seen)
     def test_child_sees_parent_marker(self):
         p,out=self.bridge();self.assertEqual(p.returncode,0,p.stderr)
         self.assertEqual(load_json(out/'attempt.json')['cli_version'],'MOCK_AGENT_VERSION')
