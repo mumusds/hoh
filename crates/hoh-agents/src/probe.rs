@@ -1049,6 +1049,12 @@ pub fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<CodexSchema, Prob
         .unwrap_or(0);
     let dir = std::env::temp_dir().join(format!("hoh-probe-{}-{nanos}", std::process::id()));
     std::fs::create_dir(&dir)?;
+    // Removed within the window however the reading ends, a panic included (M1T07R-40).
+    let mut scratch = Scratch {
+        dir: dir.clone(),
+        until: until + CLEANUP_GRACE,
+        removed: None,
+    };
     let result = (|| {
         let out = dir.to_string_lossy().into_owned();
         run_ok(
@@ -1166,12 +1172,13 @@ pub fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<CodexSchema, Prob
                 false,
                 &|m: &str| serde_json::json!({"method": m, "params": {}}),
             )?,
-            hash: tree_sha256_of(&dir, &files)?,
+            hash: tree_sha256_of(&dir, &files, &checks)
+                .map_err(|e| unusable(format!("hashing the schema output: {e}")))?,
         })
     })();
     // A CLI that filled its output cannot hold the probe past the window: what is not removed by then is left, and
     // the probe's failure says where (M1T07R-40).
-    match (result, remove_within(&dir, until + CLEANUP_GRACE)) {
+    match (result, scratch.remove()) {
         (Err(ProbeError::Failed { argv, detail }), false) => Err(ProbeError::Failed {
             argv,
             detail: format!("{detail}; its output is left at {}", dir.display()),
@@ -1182,6 +1189,31 @@ pub fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<CodexSchema, Prob
 
 /// How long removing a probe's scratch directory may run past the reading window.
 const CLEANUP_GRACE: Duration = Duration::from_secs(2);
+
+/// A probe's scratch directory, removed within its window once ([`remove_within`]), at the latest when dropped.
+struct Scratch {
+    dir: PathBuf,
+    until: Instant,
+    removed: Option<bool>,
+}
+
+impl Scratch {
+    /// Remove it, once; true when it is gone.
+    fn remove(&mut self) -> bool {
+        if let Some(gone) = self.removed {
+            return gone;
+        }
+        let gone = remove_within(&self.dir, self.until);
+        self.removed = Some(gone);
+        gone
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        self.remove();
+    }
+}
 
 /// The files of a schema output directory. Every entry, directory or file, costs a step, and more than
 /// [`MAX_SCHEMA_FILES`] entries refuse the output, so the walk cannot grow with what the CLI wrote (M1T07R-40).
@@ -1505,13 +1537,18 @@ fn files_under(root: &Path) -> io::Result<Vec<PathBuf>> {
 /// sha256 over the sorted lines `<relative path> <sha256 of file>\n` of every file under `root` (the same tree hash
 /// tests/fixtures/protocol/record.py uses).
 pub fn tree_sha256(root: &Path) -> io::Result<String> {
-    tree_sha256_of(root, &files_under(root)?)
+    tree_sha256_of(root, &files_under(root)?, &Work::new(u64::MAX, None))
 }
 
-/// [`tree_sha256`] over files already listed (each under `root`).
-fn tree_sha256_of(root: &Path, files: &[PathBuf]) -> io::Result<String> {
+/// [`tree_sha256`] over files already listed (each under `root`); each file's bytes are counted in `work` before it is
+/// hashed, so hashing reads the deadline between files (M1T07R-40).
+fn tree_sha256_of(root: &Path, files: &[PathBuf], work: &Work) -> io::Result<String> {
     let mut lines = Vec::new();
     for file in files {
+        let size = std::fs::metadata(file)?.len();
+        if !work.spend(usize::try_from(size).unwrap_or(usize::MAX)) {
+            return Err(io::Error::other("not hashed within the time limit"));
+        }
         let rel = file.strip_prefix(root).map_err(io::Error::other)?;
         let rel = rel
             .components()
@@ -2300,11 +2337,35 @@ mod tests {
             schema_files(root.path(), &Work::new(u64::MAX, past))
                 .is_err_and(|e| e.contains("time limit"))
         );
+        // The hash reads the deadline between files too.
+        let files = schema_files(root.path(), &Work::new(u64::MAX, None))?;
+        assert!(tree_sha256_of(root.path(), &files, &Work::new(u64::MAX, None)).is_ok());
+        assert!(tree_sha256_of(root.path(), &files, &Work::new(u64::MAX, past)).is_err());
         std::fs::create_dir(root.path().join("one-more"))?;
         assert!(
             schema_files(root.path(), &Work::new(u64::MAX, None))
                 .is_err_and(|e| e.contains("too many"))
         );
+        Ok(())
+    }
+
+    /// A scratch directory is removed even when the reading panics (M1T07R-40).
+    #[test]
+    fn scratch_is_removed_when_the_reading_panics() -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let dir = root.path().join("scratch");
+        std::fs::create_dir_all(dir.join("v2"))?;
+        std::fs::write(dir.join("v2/a.json"), "{}")?;
+        let panicked = std::panic::catch_unwind(|| {
+            let _scratch = Scratch {
+                dir: dir.clone(),
+                until: Instant::now() + Duration::from_secs(60),
+                removed: None,
+            };
+            panic!("a reading that fails");
+        });
+        assert!(panicked.is_err());
+        assert!(!dir.exists(), "the scratch directory was left");
         Ok(())
     }
 
