@@ -4,7 +4,9 @@
 //! with a timeout, in their own process group, which is killed on timeout (the full process substrate is M1-T02).
 
 use crate::compat::{Agent, AgentEntry, Suite, SuiteStatus, Transport};
-use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid};
+use rustix::process::{
+    Pid, Signal, WaitId, WaitIdOptions, kill_process, kill_process_group, waitid,
+};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -1223,14 +1225,17 @@ pub fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<CodexSchema, Prob
 const READER_MARGIN: Duration = Duration::from_millis(500);
 
 /// The directories a schema reading holds (its scratch directory, then its quarantine), shared with the caller as
-/// they are made, so a caller that gives up names where they are when it does (M1T07R-52).
+/// they are made, so a caller that gives up names where they are when it does (M1T07R-52); `None` for one made whose
+/// copy could not be kept, so it is never taken for gone (M1T07R-82).
 #[derive(Clone, Default)]
-struct Held(std::sync::Arc<std::sync::Mutex<Vec<std::os::fd::OwnedFd>>>);
+struct Held(std::sync::Arc<std::sync::Mutex<Vec<Option<std::os::fd::OwnedFd>>>>);
 
 impl Held {
     fn add(&self, fd: std::os::fd::BorrowedFd<'_>) {
-        if let (Ok(copy), Ok(mut held)) = (fd.try_clone_to_owned(), self.0.lock()) {
-            held.push(copy);
+        let copy = fd.try_clone_to_owned().ok();
+        match self.0.lock() {
+            Ok(mut held) => held.push(copy),
+            Err(poisoned) => poisoned.into_inner().push(copy),
         }
     }
 
@@ -1240,16 +1245,34 @@ impl Held {
             Ok(held) => held,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let mut places = held.iter().filter_map(|fd| where_now(fd.as_fd()));
-        match places.next() {
-            None if held.is_empty() => format!(
+        if held.is_empty() {
+            return format!(
                 "its scratch directory under {} may be left",
                 std::env::temp_dir().display()
-            ),
+            );
+        }
+        let mut places = Vec::new();
+        let mut unread = false;
+        for fd in held.iter() {
+            match fd
+                .as_ref()
+                .map_or(Place::Unread, |fd| where_now(fd.as_fd()))
+            {
+                Place::Gone => {}
+                Place::At(path) => places.push(path.display().to_string()),
+                Place::Unread => unread = true,
+            }
+        }
+        const UNREAD: &str = "a directory whose path cannot be read";
+        match places.split_first() {
+            None if unread => format!("it may be left in {UNREAD}"),
             None => "nothing of it is left".to_owned(),
-            Some(first) => {
-                let rest: Vec<_> = places.map(|p| p.display().to_string()).collect();
-                let mut said = format!("it may be left at {}", first.display());
+            Some((first, rest)) => {
+                let mut rest = rest.to_vec();
+                if unread {
+                    rest.push(UNREAD.to_owned());
+                }
+                let mut said = format!("it may be left at {first}");
                 if !rest.is_empty() {
                     said.push_str(&format!(" (and {})", rest.join(", ")));
                 }
@@ -1259,14 +1282,24 @@ impl Held {
     }
 }
 
-/// Where the directory `fd` is now (`/proc/self/fd`), `None` once it is removed (no link left: told by its link count,
-/// not by the ` (deleted)` the kernel appends, which a directory's own name may end with, M1T07R-58).
-fn where_now(fd: std::os::fd::BorrowedFd<'_>) -> Option<PathBuf> {
+/// Where a directory held is now.
+enum Place {
+    /// Removed: no link left.
+    Gone,
+    At(PathBuf),
+    /// Still there, or not known to be gone, but its path cannot be read (longer than `PATH_MAX`, no `/proc`).
+    Unread,
+}
+
+/// Where the directory `fd` is now (`/proc/self/fd`): gone only when its link count is 0, never because the path
+/// cannot be read (M1T07R-81), nor by the ` (deleted)` the kernel appends, which a directory's own name may end with
+/// (M1T07R-58).
+fn where_now(fd: std::os::fd::BorrowedFd<'_>) -> Place {
     if rustix::fs::fstat(fd).is_ok_and(|s| s.st_nlink == 0) {
-        return None;
+        return Place::Gone;
     }
     let link = format!("/proc/self/fd/{}", std::os::fd::AsRawFd::as_raw_fd(&fd));
-    std::fs::read_link(link).ok()
+    std::fs::read_link(link).map_or(Place::Unread, Place::At)
 }
 
 /// Make the scratch directory, generate the schema into it, read it and remove it: [`codex_schema`]'s work, apart.
@@ -1341,7 +1374,10 @@ fn read_and_remove(
     if scratch.remove() {
         return result;
     }
-    let left = scratch.held.may_be_left();
+    let mut left = scratch.held.may_be_left();
+    if let Some(why) = &scratch.unstarted {
+        left = format!("{left}; {why}");
+    }
     Err(match result {
         Err(ProbeError::Failed { argv, detail }) => ProbeError::Failed {
             argv,
@@ -1502,6 +1538,8 @@ struct Scratch {
     held: Held,
     until: Instant,
     removed: Option<bool>,
+    /// Why removing did not start, when the quarantine could not be made (M1T07R-90).
+    unstarted: Option<String>,
 }
 
 impl Scratch {
@@ -1542,6 +1580,7 @@ impl Scratch {
             held,
             until,
             removed: None,
+            unstarted: None,
         })
     }
 
@@ -1559,9 +1598,9 @@ impl Scratch {
             return gone;
         }
         let work = Work::new(u64::MAX, Some(self.until)).stopped_by(&self.given_up);
-        let gone = match self.dir.file_name() {
-            Some(name) if work.spend(1) => Quarantine::new(self.temp.as_fd(), name, &self.held)
-                .is_some_and(|quarantine| {
+        let gone = work.spend(1)
+            && match Quarantine::new(self.temp.as_fd(), &self.dir, &self.held) {
+                Ok(quarantine) => {
                     remove_within(
                         &self.dir,
                         self.temp.as_fd(),
@@ -1569,9 +1608,12 @@ impl Scratch {
                         &quarantine,
                         &work,
                     ) & quarantine.remove(self.temp.as_fd())
-                }),
-            _ => false,
-        };
+                }
+                Err(e) => {
+                    self.unstarted = Some(format!("no quarantine to remove it through: {e}"));
+                    false
+                }
+            };
         self.removed = Some(gone);
         gone
     }
@@ -1585,16 +1627,18 @@ impl Drop for Scratch {
 
 /// A new directory `name` in `temp` (at `path`), made and opened as the probe's own: the directory opened must be the
 /// one just made, not one put in its place between making and opening it (M1T07R-51, -57). Linux cannot make and open a
-/// directory in one call, so what is opened is checked: this process's own, empty, and made no earlier than the call
-/// (its birth time; a directory that existed before cannot pass). On any doubt nothing is removed by name — whatever
-/// is at `name` may not be the probe's — and the error says where it may be left.
+/// directory in one call, so what is opened is checked: this process's own, empty, and born no earlier than a second
+/// before the call: a directory that existed before is refused. One a same-user process watching `temp` makes and puts
+/// in place within that second cannot be told from the probe's own; that is outside the guarantee (ADR-015 decision 2,
+/// M1T07R-57, -91): a birth time cannot close the gap, a shorter room only narrows it. On any doubt nothing is removed
+/// by name — whatever is at `name` may not be the probe's — and the error says where it may be left.
 fn make_dir(
     temp: std::os::fd::BorrowedFd<'_>,
     name: &OsStr,
     path: &Path,
 ) -> io::Result<std::os::fd::OwnedFd> {
     use rustix::fs::{Mode, OFlags};
-    // File system clocks are coarse: a second of room, never enough for a directory made before the probe ran.
+    // File system clocks are coarse (a directory's birth time may read a tick before now): a second of room.
     let since = SystemTime::now() - Duration::from_secs(1);
     rustix::fs::mkdirat(temp, name, Mode::from_raw_mode(0o700))?;
     between("made", path);
@@ -1835,14 +1879,16 @@ struct Quarantine {
 }
 
 impl Quarantine {
-    /// Made in `temp`, named after the scratch directory `of`; shared in `held` so what stays in it can be named.
-    fn new(temp: std::os::fd::BorrowedFd<'_>, of: &OsStr, held: &Held) -> Option<Quarantine> {
-        let name = unique_name(&format!("{}-q", of.to_string_lossy()));
+    /// Made in `temp` beside the scratch directory `of`, named after it; shared in `held` so what stays in it can be
+    /// named. Not made, the error says why and where what was made may be left (M1T07R-90).
+    fn new(temp: std::os::fd::BorrowedFd<'_>, of: &Path, held: &Held) -> io::Result<Quarantine> {
+        let of_name = of.file_name().unwrap_or(of.as_os_str()).to_string_lossy();
+        let name = unique_name(&format!("{of_name}-q"));
         // Its own as the scratch directory is: one put in its place is never moved into or removed (M1T07R-57).
-        let fd = make_dir(temp, OsStr::new(&name), Path::new(&name)).ok()?;
-        let made = inode(&rustix::fs::fstat(&fd).ok()?);
+        let fd = make_dir(temp, OsStr::new(&name), &of.with_file_name(&name))?;
         held.add(fd.as_fd());
-        Some(Quarantine {
+        let made = inode(&rustix::fs::fstat(&fd)?);
+        Ok(Quarantine {
             name,
             fd,
             made,
@@ -2581,12 +2627,14 @@ impl Owned {
         }
     }
 
-    /// Kill its process group and reap its leader, once; the exit status when reaped within [`REAP_WAIT`]. The
-    /// group is signalled only while the leader is not reaped, so the id is still its own. A leader that does not
+    /// Kill its process group and its leader, and reap the leader, once; the exit status when reaped within
+    /// [`REAP_WAIT`]. Both are signalled only while the leader is not reaped, so the id is still its own; the leader
+    /// is killed on its own too, as it may have moved itself into another group (M1T07R-80). A leader that does not
     /// die by then (a call SIGKILL does not end) is reaped by a thread of its own.
     fn end(&mut self) -> Option<ExitStatus> {
         let mut child = self.child.take()?;
         let _ = kill_process_group(self.pid, Signal::KILL);
+        let _ = kill_process(self.pid, Signal::KILL);
         let until = Instant::now() + REAP_WAIT;
         loop {
             match child.try_wait() {
@@ -2727,12 +2775,8 @@ mod tests {
     /// [`Scratch::remove`] does it.
     fn remove_held(dir: &Path, owned: &std::os::fd::OwnedFd, work: &Work) -> bool {
         let temp = parent_of(dir);
-        let quarantine = Quarantine::new(
-            temp.as_fd(),
-            dir.file_name().expect("a name"),
-            &Held::default(),
-        )
-        .expect("make a quarantine");
+        let quarantine =
+            Quarantine::new(temp.as_fd(), dir, &Held::default()).expect("make a quarantine");
         remove_within(dir, temp.as_fd(), owned.as_fd(), &quarantine, work)
             & quarantine.remove(temp.as_fd())
     }
@@ -3896,6 +3940,100 @@ mod tests {
         Ok(())
     }
 
+    /// A directory still there whose path cannot be read (deeper than PATH_MAX) is never said to be gone: only a link
+    /// count of 0 says that (M1T07R-81).
+    #[test]
+    fn a_directory_whose_path_cannot_be_read_is_not_said_to_be_gone()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use rustix::fs::{Mode, OFlags, mkdirat, openat, renameat};
+        let root = tempfile::tempdir()?;
+        let scratch = Scratch::at(
+            root.path().join("out"),
+            Instant::now() + Duration::from_secs(60),
+            Default::default(),
+            Held::default(),
+        )?;
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+        let top = openat(rustix::fs::CWD, root.path(), flags, Mode::empty())?;
+        let mut deep = openat(&top, ".", flags, Mode::empty())?;
+        let long = "d".repeat(250);
+        for _ in 0..20 {
+            mkdirat(&deep, long.as_str(), Mode::from_raw_mode(0o700))?;
+            deep = openat(&deep, long.as_str(), flags, Mode::empty())?;
+        }
+        renameat(&top, "out", &deep, "out")?;
+        let said = scratch.held.may_be_left();
+        renameat(&deep, "out", &top, "out")?;
+        assert_eq!(
+            said,
+            "it may be left in a directory whose path cannot be read"
+        );
+        drop(scratch);
+        assert!(!root.path().join("out").exists());
+        Ok(())
+    }
+
+    /// A quarantine replaced as it is made is never removed through: nothing of the output is removed, the directory
+    /// put in its place is left whole, and the failure says why and where the quarantine may be left (M1T07R-90).
+    #[test]
+    fn a_quarantine_replaced_as_it_is_made_is_named() -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let (other, away) = (root.path().join("other"), root.path().join("away"));
+        std::fs::create_dir(&other)?;
+        std::fs::write(other.join("keep.json"), "{}")?;
+        let scratch = Scratch::at(
+            root.path().join("out"),
+            Instant::now() + Duration::from_secs(60),
+            Default::default(),
+            Held::default(),
+        )?;
+        std::fs::write(root.path().join("out/a.json"), "{}")?;
+        let named = std::rc::Rc::new(std::cell::RefCell::new(None::<PathBuf>));
+        let (temp, seen) = (root.path().to_path_buf(), named.clone());
+        BETWEEN.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |at: &str, path: &Path| {
+                let Some(name) = path.file_name() else {
+                    return;
+                };
+                if at == "made" && name.to_string_lossy().starts_with("out-q-") {
+                    let made = temp.join(name);
+                    std::fs::rename(&made, &away).expect("move the quarantine away");
+                    std::fs::rename(&other, &made).expect("put another in its place");
+                    *seen.borrow_mut() = Some(made);
+                }
+            }));
+        });
+        let result = read_and_remove(scratch, Ok(()), &["codex".to_owned()], None);
+        BETWEEN.with(|hook| *hook.borrow_mut() = None);
+        let quarantine = named.borrow().clone().ok_or("no quarantine was made")?;
+        let Err(ProbeError::Failed { detail, .. }) = result else {
+            return Err(format!("{result:?}").into());
+        };
+        assert!(
+            detail.contains(&format!(
+                "{} was replaced as it was made",
+                quarantine.display()
+            )),
+            "{detail}"
+        );
+        assert!(
+            detail.contains(&format!(
+                "it may be left at {}",
+                root.path().join("out").display()
+            )),
+            "{detail}"
+        );
+        assert!(
+            root.path().join("out/a.json").exists(),
+            "the output was removed through another's directory"
+        );
+        assert!(
+            quarantine.join("keep.json").exists(),
+            "the directory put in its place was not left whole"
+        );
+        Ok(())
+    }
+
     /// A probe that gives up while its reading is stalled names the scratch directory where it is then, though the
     /// CLI moved it after writing (M1T07R-52).
     #[test]
@@ -4499,6 +4637,42 @@ mod tests {
                 "{n}: command {pid} left after the error"
             );
         }
+        Ok(())
+    }
+
+    /// A command whose leader moves itself into another process group of the session is still ended: the leader is
+    /// killed on its own, not only through the group it left (M1T07R-80).
+    #[test]
+    fn a_leader_that_leaves_its_group_is_ended() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempfile::tempdir()?;
+        let (pidfile, launcher) = (tmp.path().join("pid"), tmp.path().join("cli"));
+        std::fs::write(
+            &launcher,
+            format!(
+                "#!/usr/bin/env python3\nimport os, time\nos.setpgid(0, os.getpgid(os.getppid()))\n\
+                 open('{0}.new', 'w').write(str(os.getpid()))\nos.rename('{0}.new', '{0}')\ntime.sleep(30)\n",
+                pidfile.display()
+            ),
+        )?;
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))?;
+        let env = ProbeEnv {
+            path: std::env::var_os("PATH").unwrap_or_default(),
+            fixture_root: None,
+            timeout: Duration::from_secs(2),
+            log: None,
+            deadline: None,
+        };
+        let result = run_status(&launcher, &[], &env);
+        let pid = std::fs::read_to_string(&pidfile)?.trim().parse::<i32>()?;
+        let left = Path::new(&format!("/proc/{pid}")).exists();
+        if left && let Some(pid) = Pid::from_raw(pid) {
+            let _ = rustix::process::kill_process(pid, Signal::KILL);
+        }
+        assert!(
+            matches!(result, Err(ProbeError::TimedOut { .. })),
+            "{result:?}"
+        );
+        assert!(!left, "the leader {pid} outlived the probe");
         Ok(())
     }
 
