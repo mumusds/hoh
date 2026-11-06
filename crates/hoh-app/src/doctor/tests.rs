@@ -232,3 +232,47 @@ fn a_live_turn_is_verified_only_when_it_settled_with_the_token() {
         Auth::Unknown
     );
 }
+
+/// `doctor --live` drives a Pi version whose recorded traffic has `agent_settled` by that event, any other by the
+/// `get_state` check, so a Pi without the event is verified rather than left to its deadline (M1R-06).
+#[test]
+fn live_pi_relies_on_agent_settled_only_for_a_recorded_version()
+-> Result<(), Box<dyn std::error::Error>> {
+    use super::live::{Prepared, prepare};
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir()?;
+    let help = tmp.path().join("help.txt");
+    std::fs::copy(
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/protocol/pi/1.5.0/help.txt"
+        ),
+        &help,
+    )?;
+    let launcher = tmp.path().join("pi");
+    std::fs::write(&launcher, format!("#!/bin/sh\ncat '{}'\n", help.display()))?;
+    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))?;
+    let env = hoh_agents::probe::ProbeEnv {
+        path: std::env::var_os("PATH").unwrap_or_default(),
+        fixture_root: None,
+        timeout: std::time::Duration::from_secs(5),
+        log: None,
+        deadline: None,
+    };
+    for (version, settled) in [(Some("1.5.0"), true), (Some("1.6.0"), false), (None, false)] {
+        let prepared = prepare(
+            Agent::Pi,
+            &launcher,
+            tmp.path(),
+            tmp.path().join("logs"),
+            &env,
+            &BTreeMap::new(),
+            version,
+        )?;
+        let Prepared::Pi(turn) = prepared else {
+            return Err("not a pi turn".into());
+        };
+        assert_eq!(turn.launch.settled_event, settled, "{version:?}");
+    }
+    Ok(())
+}

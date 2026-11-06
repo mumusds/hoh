@@ -46,20 +46,22 @@ fn stdout_of(launcher: &Path, args: &[&str], env: &ProbeEnv) -> Result<String, S
 
 /// A live turn ready to run: everything asked of the CLI before the attempt exists, so a turn that cannot be prepared
 /// leaves no attempt behind (M1T07R-04).
-enum Prepared {
+pub(super) enum Prepared {
     Claude(claude::Turn),
     Codex(codex::Turn),
     Pi(pi::Turn),
 }
 
-/// The turn of `agent`; `capabilities` are what its probe found, for the session row (REQ-027).
-fn prepare(
+/// The turn of `agent`; `capabilities` are what its probe found, for the session row (REQ-027); `version` is the
+/// first line of its `--version` (pi relies on `agent_settled` only for a recorded version, M1R-06).
+pub(super) fn prepare(
     agent: Agent,
     launcher: &Path,
     work: &Path,
     logs: PathBuf,
     env: &ProbeEnv,
     capabilities: &hoh_agents::capabilities::Probed,
+    version: Option<&str>,
 ) -> Result<Prepared, String> {
     Ok(match agent {
         Agent::Claude => Prepared::Claude(claude::Turn {
@@ -147,7 +149,7 @@ fn prepare(
                 resume: false,
                 provider: None,
                 model: None,
-                settled_event: true,
+                settled_event: pi::emits_settled(version),
                 capabilities: capabilities.clone(),
             },
             prompt: PROMPT.to_owned(),
@@ -234,6 +236,7 @@ async fn one(
             logs.clone(),
             env,
             &item.capabilities,
+            item.version.as_deref(),
         )?;
         store
             .create_attempt(NewAttempt {
