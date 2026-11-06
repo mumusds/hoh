@@ -216,15 +216,32 @@ pub fn option_text(help: &str, flag: &str) -> Option<String> {
     text.map(|text| text.join("\n"))
 }
 
-/// Whether `word` is a whole token of `text`: tokens are separated by white space and by the punctuation that quotes
-/// or lists values (`` ` ' " , ; ( ) [ ] { } ``), and one may end a sentence with `.`. So `stream-json-v2` is not
-/// `stream-json`, `grpc` is not `rpc`, and `stdio:///socket`, `stdio://?mode=pipe` or `stdio://.invalid` are not
-/// `stdio://` (M1T07R-17, -27).
+/// Whether `word` is a value listed in `text`: a token between white space, once what only wraps or follows a value is
+/// taken off ([`listed_value`]). So `stream-json-v2` is not `stream-json`, `grpc` is not `rpc`, and a longer value
+/// (`stdio:///socket`, `stdio://.invalid`, `stdio://[::1]`, `rpc(v2)`, `--output-format=stream-json`) is not the value
+/// (M1T07R-17, -27, -30).
 pub fn has_word(text: &str, word: &str) -> bool {
     !word.is_empty()
         && text
-            .split(|c: char| c.is_whitespace() || "`'\",;()[]{}".contains(c))
-            .any(|token| token == word || token.strip_suffix('.') == Some(word))
+            .split_whitespace()
+            .any(|token| listed_value(token) == word)
+}
+
+/// A token without what only wraps or follows a whole value: openers `( [ {` before it; closers `) ] }`, list
+/// punctuation `,` `;` and a sentence's `.` after it; then one pair of quotes around it (`"x"`, `'x'`, `` `x` ``).
+/// Brackets, quotes or a `.` inside a value are part of it.
+fn listed_value(token: &str) -> &str {
+    let value = token
+        .trim_start_matches(['(', '[', '{'])
+        .trim_end_matches([')', ']', '}', ',', ';', '.']);
+    ['"', '\'', '`']
+        .into_iter()
+        .find_map(|quote| {
+            value
+                .strip_prefix(quote)
+                .and_then(|v| v.strip_suffix(quote))
+        })
+        .unwrap_or(value)
 }
 
 /// Whether `help` lists the subcommand `name` in the command column of its `Commands:` section (the least indented
@@ -482,6 +499,28 @@ mod help_tests {
             "Implies --output-format=stream-json",
             "stream-json"
         ));
+        // Brackets and quotes only wrap a whole value; inside it they are part of it (M1T07R-30).
+        for longer in [
+            "Supported values: stdio://[::1]",
+            "Supported values: stdio://(socket)",
+            "Supported values: stdio://.(invalid)",
+            "Supported values: stdio://{mem}",
+        ] {
+            assert!(!has_word(longer, "stdio://"), "{longer}");
+        }
+        assert!(!has_word("Output format: stream-json[v2]", "stream-json"));
+        assert!(!has_word("Output mode: rpc(v2)", "rpc"));
+        assert!(!has_word("Output format: \"stream-json", "stream-json"));
+        for listed in [
+            "(choices: \"text\", \"json\", \"stream-json\")",
+            "[default: stdio://]",
+            "(`stdio://`).",
+        ] {
+            assert!(
+                has_word(listed, "stream-json") || has_word(listed, "stdio://"),
+                "{listed}"
+            );
+        }
     }
 
     /// A subcommand is a name in the command column of the `Commands:` section, not a wrapped description and not a
