@@ -69,7 +69,7 @@ pub struct Step {
 
 /// How to end a process: `native` (if any) goes to the leader, SIGTERM to the group after `native_grace`, SIGKILL to
 /// the group after a further `term_grace`; after another `kill_grace` without the leader exiting the process is
-/// reported as not reaped.
+/// reported as not reaped. A leader that left its group gets SIGTERM and SIGKILL as well (M1T07R-103).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Escalation {
     pub native: Option<Signal>,
@@ -236,6 +236,8 @@ impl Process {
             Err(e) => {
                 // Without a pidfd the child cannot be supervised: end it now rather than leave it running.
                 let _ = kill_process_group(pid, RawSignal::KILL);
+                // Unreaped, its pid is still its own (M1T07R-103).
+                let _ = child.kill();
                 let _ = child.wait();
                 return Err(e.into());
             }
@@ -381,8 +383,23 @@ impl Leader {
     fn signal(&self, target: Target, signal: Signal) {
         let _ = match target {
             Target::Leader => pidfd_send_signal(&self.pidfd, signal.raw()),
-            Target::Group => kill_process_group(self.pid, signal.raw()),
+            Target::Group => {
+                let sent = kill_process_group(self.pid, signal.raw());
+                // A leader that moved itself into another group is not reached through the one it left
+                // (M1T07R-103); its pidfd still names it until it is reaped. SIGKILL goes to it in any case (a
+                // second one changes nothing), another signal only once it has left, so a leader still in its group
+                // never gets one twice.
+                if signal == Signal::Kill || self.left_group() {
+                    let _ = pidfd_send_signal(&self.pidfd, signal.raw());
+                }
+                sent
+            }
         };
+    }
+
+    /// Whether the leader is no longer in the group it was started in (its own).
+    fn left_group(&self) -> bool {
+        rustix::process::getpgid(Some(self.pid)).is_ok_and(|group| group != self.pid)
     }
 
     fn reap(&mut self) -> io::Result<()> {
@@ -400,6 +417,8 @@ impl Drop for Leader {
             return;
         }
         let _ = kill_process_group(self.pid, RawSignal::KILL);
+        // Also a leader that left its group (M1T07R-103).
+        let _ = pidfd_send_signal(&self.pidfd, RawSignal::KILL);
         let reap = WaitIdOptions::EXITED | WaitIdOptions::NOHANG;
         for _ in 0..50 {
             if let Ok(Some(_)) = waitid(WaitId::PidFd(self.pidfd.as_fd()), reap) {
