@@ -1406,7 +1406,13 @@ fn a_schema_that_branches_without_end_is_undecided_at_once() -> R {
     let tmp = tempfile::tempdir()?;
     let f = fixtures().join("codex/0.166.0");
     type Change = fn(&mut serde_json::Value);
-    let cases: [(&str, Change); 5] = [
+    let cases: [(&str, Change); 6] = [
+        // A long key over many members: the well-formedness check writes its path out only on error (round 11).
+        ("long-key", |v| {
+            let members: Vec<serde_json::Value> =
+                (0..50_000).map(|_| serde_json::json!(true)).collect();
+            v["definitions"]["x".repeat(2_000_000)] = serde_json::json!({"anyOf": members});
+        }),
         // Wide members and long enums cost a step each, cloned or scanned (M1T07R-40, round 10).
         ("wide-reused", |v| {
             let members: Vec<serde_json::Value> = (0..12_000)
@@ -1470,7 +1476,11 @@ fn a_schema_that_branches_without_end_is_undecided_at_once() -> R {
         let (dir, _) = fake(tmp.path(), &format!("{group}-bin"), "codex", &script)?;
         let started = std::time::Instant::now();
         let entry = probe(Agent::Codex, &env_for(&dir)).map_err(|e| format!("{group}: {e}"))?;
-        assert_eq!(entry.transport, Transport::Exec, "{group}");
+        let expected = match group {
+            "long-key" => Transport::AppServer,
+            _ => Transport::Exec,
+        };
+        assert_eq!(entry.transport, expected, "{group}");
         assert!(
             started.elapsed() < Duration::from_secs(10),
             "{group}: the probe took {:?}",
