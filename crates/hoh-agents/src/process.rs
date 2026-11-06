@@ -69,7 +69,8 @@ pub struct Step {
 
 /// How to end a process: `native` (if any) goes to the leader, SIGTERM to the group after `native_grace`, SIGKILL to
 /// the group after a further `term_grace`; after another `kill_grace` without the leader exiting the process is
-/// reported as not reaped. A leader that left its group gets SIGTERM and SIGKILL as well (M1T07R-103).
+/// reported as not reaped. A leader that left its group gets SIGKILL as well, through its pidfd (M1T07R-103); SIGTERM
+/// goes to the group only (FU-21).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Escalation {
     pub native: Option<Signal>,
@@ -384,27 +385,20 @@ impl Leader {
         let _ = match target {
             Target::Leader => pidfd_send_signal(&self.pidfd, signal.raw()),
             Target::Group => {
-                // A leader that moved itself into another group is not reached through the one it left
-                // (M1T07R-103); its pidfd still names it until it is reaped. Whether it left is decided before the
-                // group is signalled, so a leader that leaves in its handler for this very signal is not sent it
-                // again (FU-01): any signal but SIGKILL reaches the leader at most once, and one that leaves just
-                // between the check and the group signal misses it and gets SIGKILL after the grace. SIGKILL goes to
-                // the leader in any case (a second one changes nothing).
-                let left = self.left_group();
+                // Only the group gets any signal but SIGKILL: the kernel decides membership as it delivers, so the
+                // leader gets it at most once, and not at all once it has left its group; no snapshot of its group
+                // can decide that without a race (FU-01, FU-21). SIGKILL also goes to the leader through its pidfd,
+                // which names it until it is reaped, so a leader that left its group is still killed after the
+                // grace (M1T07R-103); a second SIGKILL changes nothing.
                 let sent = kill_process_group(self.pid, signal.raw());
                 #[cfg(test)]
                 tests::after_group_signal(self.pid);
-                if signal == Signal::Kill || left {
+                if signal == Signal::Kill {
                     let _ = pidfd_send_signal(&self.pidfd, signal.raw());
                 }
                 sent
             }
         };
-    }
-
-    /// Whether the leader is no longer in the group it was started in (its own).
-    fn left_group(&self) -> bool {
-        rustix::process::getpgid(Some(self.pid)).is_ok_and(|group| group != self.pid)
     }
 
     fn reap(&mut self) -> io::Result<()> {
@@ -745,6 +739,67 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(5));
             }
         }
+    }
+
+    /// A leader that left its group before it is signalled gets no SIGTERM, whichever group it is in when the group
+    /// is signalled (it may come back in between): only the group is sent SIGTERM, so the leader gets it at most once,
+    /// as a member; SIGKILL still reaches it through its pidfd after the grace (FU-21, M1T07R-103).
+    #[tokio::test]
+    async fn a_leader_outside_its_group_gets_sigkill_not_sigterm()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempfile::tempdir()?;
+        let count = tmp.path().join("terms");
+        let mut command = std::process::Command::new("python3");
+        command.arg("-c").arg(format!(
+            "import os, signal, time\n\
+             signal.signal(signal.SIGTERM, lambda *_: open('{count}', 'a').write('term\\n'))\n\
+             os.setpgid(0, os.getpgid(os.getppid()))\n\
+             print(os.getpid(), flush=True)\n\
+             while True:\n    time.sleep(1)\n",
+            count = count.display()
+        ));
+        let config = Config {
+            deadline: Some(Duration::from_millis(500)),
+            escalation: Escalation {
+                native: None,
+                native_grace: Duration::ZERO,
+                term_grace: Duration::from_millis(500),
+                kill_grace: Duration::from_secs(2),
+            },
+            ..Config::default()
+        };
+        let started = Instant::now();
+        let mut p = Process::spawn(command, config)?;
+        let leader = Pid::from_raw(p.pid() as i32).ok_or("a pid")?;
+        let report = tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(event) = p.next().await {
+                if let Event::Exit(report) = event {
+                    return Some(*report);
+                }
+            }
+            None
+        })
+        .await;
+        let left = Path::new(&format!("/proc/{}", leader.as_raw_pid())).exists();
+        if left {
+            let _ = rustix::process::kill_process(leader, RawSignal::KILL);
+        }
+        let report = report?.ok_or("no exit report")?;
+        let terms = std::fs::read_to_string(&count)
+            .unwrap_or_default()
+            .lines()
+            .count();
+        assert_eq!(
+            terms, 0,
+            "SIGTERM delivered {terms} times to a leader outside its group"
+        );
+        assert_eq!(report.status, Some(Termination::Signal(9)), "{report:?}");
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "killed before the grace"
+        );
+        assert!(!left, "leader survived");
+        Ok(())
     }
 
     /// A leader whose SIGTERM handler moves it out of its group gets SIGTERM once, not again through its pidfd, and
