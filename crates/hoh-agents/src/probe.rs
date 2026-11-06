@@ -1694,13 +1694,16 @@ fn made_since(fd: std::os::fd::BorrowedFd<'_>, since: SystemTime) -> Option<bool
     )
 }
 
-/// `<prefix>-<pid>-<nanoseconds>`.
+/// `<prefix>-<pid>-<nanoseconds>-<sequence>`: the sequence counts the names this process made, so names made at the
+/// same moment on several threads differ (FU-20).
 fn unique_name(prefix: &str) -> String {
+    static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("{prefix}-{}-{nanos}", std::process::id())
+    let n = MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{prefix}-{}-{nanos}-{n}", std::process::id())
 }
 
 /// How everything under the scratch directory is reached: never above where the resolution starts, never through a
@@ -3906,6 +3909,23 @@ mod tests {
             format!("it may be left at {}", dir.display())
         );
         Ok(())
+    }
+
+    /// Names made at the same moment on several threads still differ: scratch directories made by concurrent probes
+    /// in one process never collide (EEXIST seen in CI on the lifecycle test, FU-20).
+    #[test]
+    fn names_made_together_never_repeat() {
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| (0..20_000).map(|_| unique_name("x")).collect::<Vec<_>>())
+            })
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        for names in threads.into_iter().map(|t| t.join().expect("a thread")) {
+            for name in names {
+                assert!(seen.insert(name.clone()), "{name} made twice");
+            }
+        }
     }
 
     /// Generation ends with the probe's window, however long making the scratch directory took (M1T07R-54).
