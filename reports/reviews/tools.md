@@ -113,3 +113,44 @@ Mutation check: dropping the strip from `child_env`, keeping a variable in the N
 - Agent: `claude` 2.1.318, model claude-opus-5-5, session `9b570a03-f98d-4f22-9983-8f610c12b58e`, 375 s; attempt record sha256 `d3f6b0d3bfcc474058c2080f9e10cd6b5f6ed6e9078853da0571f267e27ebe16`, stdout sha256 `d05230c7ca924775912185142c76de03570bd55a5e36806ca4e90adb1f88b878`.
 - Scope: `a8c7d57..8243300` and the record of rounds 1-2. The reviewer forced the empty-pidfile window (the probe waits 3 s between creating and writing its pidfile): with stop_all doing nothing the old code raised ValueError and left the scope running (2/2), the new code failed at the kernel check and left nothing (5/5); the real recorder passed 10/10; 60 unmutated runs and the test_record module passed. Round 2's EACCES result was 29/30, the one exception being the TR-02 case.
 - Verdict: **PASS**, no findings.
+
+## Session alert hooks: API failures and session ends recorded with a recovery point (PR #21, branch `tools/session-alerts`)
+
+StopFailure and SessionEnd hooks (`scripts/dev/session-alert.sh`, logic in `session_alert.py`) write a recovery point to `.hoh-dev/session-alerts.jsonl`; `session-context.sh` shows what is new at the next start. A normal Stop has no hook. Alerts record and remind; they are not a continuation mechanism. Merged as 07b7233 (rebase; tree equal to the reviewed 7c6ac26) after green CI.
+
+Real-entry verification (Claude Code 2.1.318, record `.hoh-dev/evidence/session-alerts-entry/README.md`): a top-level session marked as `scripts/start.sh` marks it gets the SessionStart context and a SessionEnd record, a delegated one gets neither; an interactive session in a PTY against a local 529 server (throwaway config dir, fake key) records StopFailure with an OSC 9 notification, then SessionEnd. `claude -p` does not wait for StopFailure (its runner is not awaited), so headless API failures leave only SessionEnd. Found by that run and fixed: an unavailable recovery part was shown split into characters.
+
+### Round 1 (fresh Claude session)
+
+`claude` 2.1.318, session `f6057823-a76b-4f4a-b024-88519dc714a3`, 645 s; attempt record sha256 `edbcf6e77e8e0579007b3de72c7f11c501f02c041e4ebf8b2409cb0651a878f3`, stdout sha256 `ab58661a2a3c69037cb47c35fa4bd0eb9b7c8fc61d089532f3bce0d8e99c5039`. Candidate d17677d. Verdict **PASS** (2 medium, 4 low).
+
+| ID | Severity | Summary | Disposition |
+|---|---|---|---|
+| SAR-01 | medium | A top-level session started by `scripts/start.sh` carries HOH_BOOTSTRAP_PARENT and was skipped as delegated. | Fixed: delegated sessions carry HOH_DELEGATED_TASK=<role> (round 2), and the top-level session HOH_TOP_LEVEL_SESSION (round 3). |
+| SAR-02 | medium | Any failing recovery-point collector (dangling evidence link, odd task-state, non-string message, 200 KB payload in the environment) lost the record and the notification. | Fixed: payload from stdin, each part collected on its own (`unavailable: <Exception>`), notification printed before the record. |
+| SAR-03 | low | Seen-counter edge cases (more than 5 new alerts marked seen unshown; deleted/rotated file; partial line; shared counter). | Partly: an "older new alert(s) not shown" line; the rest deferred. |
+| SAR-04 | low | ASCII filter, 300-char cut and 5-alert cap untested; newest-10 cut kept the oldest. | Fixed: tests; newest 10 kept. |
+| SAR-05 | low | Background match missed interpreter spellings and `mutate*.py`. | Fixed. |
+| SAR-06 | low | `error_details` unbounded; multi-line messages in the context. | Deferred (a 1000-char cap was added, untested). |
+
+### Round 2 (focused on the fix diff, fresh Claude session)
+
+`claude` 2.1.318, session `566b7b37-1159-4903-b9a3-17a5ee48511a`, 726 s; attempt record sha256 `a4d86c86ffc7142f329be47c1ffe8147ae76d9bf0468a681e1aa96a11ad1f01f`, stdout sha256 `7288ef61013dca20c6e2bf277904e07326e9fbe37a4ece57f5fc88268389fe34`. Candidate 90afced. Verdict **FAIL** (1 high, 1 medium, 3 low). SAR-01, -02, -04, -05 confirmed resolved.
+
+| ID | Severity | Summary | Disposition |
+|---|---|---|---|
+| SAR-07 | high | The new bridge test ran `--top-level` with the caller's HOH_BOOTSTRAP_PARENT, so the bundle failed in start.sh and delegated QA sessions. | Fixed: the bridge and setup tests strip the session markers; the bundle passes with HOH_BOOTSTRAP_PARENT set. |
+| SAR-08 | medium | Hooks come from the `--cwd` checkout, the bridge from the caller's: an older bridge's reviewer was treated as a main session (this review got the context and wrote a record into the worktree, deleted by the developer). | Fixed: HOH_TOP_LEVEL_SESSION (set with HOH_BOOTSTRAP_PARENT by start.sh and `--top-level`, inherited); a session whose parent is not it is delegated whatever bridge started it. |
+| SAR-09 | low | Three 3 s collector timeouts could reach the 10 s hook limit. | Fixed: 1 s each. |
+| SAR-10 | low | Notification-before-record and the marker's value untested; an empty role accepted. | Fixed: tests; empty `--role` refused. |
+| SAR-11 | low | docs/23 still named HOH_BOOTSTRAP_PARENT as the delegation mark. | Fixed. |
+
+### Round 3 (focused on the fix diff, fresh Claude session)
+
+`claude` 2.1.318, session `322832fb-d77f-481f-b7b2-4681a42c5e72`, 533 s; attempt record sha256 `42a7823fcc3d62a44f3c206b47fb18dd3f6aa704d39c43af78a9774706d33876`, stdout sha256 `2844e0f22e56c2db6b5409f5ad25798cccac350ec559d9b68ab2aa2b2e9f1a91`. Candidate 7c6ac26. Verdict **PASS** (3 low). SAR-07..11 resolved.
+
+| ID | Severity | Summary | Disposition |
+|---|---|---|---|
+| SAR-12 | low | The newest-10 test can fail while another bundle runs on the same machine (its decoys push ours out). | Deferred (follow-up). |
+| SAR-13 | low | A claude started directly in a top-level session's shell inherits both markers and counts as main. | Deferred (follow-up). |
+| SAR-14 | low | A top-level session started before the update has no HOH_TOP_LEVEL_SESSION and counts as delegated until restarted. | Deferred (follow-up; no such session was running). |

@@ -2,7 +2,7 @@
 
 Read AGENTS.md and CONTRACT.md in this directory first. By default you are the CTO/main developer: during bootstrap (M0–M2, CR-001) you are usually the top-level main development session, and independent review is done by another session. Once the product runtime is available, you do not replace the Commander's overall decisions or Pi's independent QA.
 
-Read the specifications relevant to each task, implement with TDD, and record the candidate, self-test results and remaining issues. Built-in skills live in resources/skills/; the user does not need to install anything else. If this session is the one the user chose to start the project, you may prepare the environment first, but never spawn another top-level orchestration when one already exists (`HOH_BOOTSTRAP_PARENT` set means one exists).
+Read the specifications relevant to each task, implement with TDD, and record the candidate, self-test results and remaining issues. Built-in skills live in resources/skills/; the user does not need to install anything else. If this session is the one the user chose to start the project, you may prepare the environment first, but never spawn another top-level orchestration when one already exists (`HOH_BOOTSTRAP_PARENT` set means one exists; it does not by itself mean this session is delegated: docs/19 会话身份).
 
 When the input contains `[HOH_DELEGATED_TASK]`, act only in the role it names and finish only the delegated work, even though the root AGENTS.md describes the whole project. Reviewer/QA/Research tasks must not change code or start a development loop because of the default CTO identity.
 
@@ -24,6 +24,11 @@ Language: reply to and ask the user in Simplified Chinese; new documents under `
 - Candidate and checks: `python3 tools/candidate.py freeze --spec contracts/requirements.json --environment .hoh-dev/environment.json --test-plan tests/check-plan.json --out .hoh-dev/candidates/<id>.json`, then `python3 tools/run_check.py --check-id <check> --candidate-file … --out .hoh-dev/evidence/<id>/<check>` (fresh `--out` each run, no commits in between).
 - Independent review: `python3 tools/render_prompt.py --role reviewer --context <ctx.json> --output <prompt.md>` then `python3 tools/agent_task.py --agent codex --role reviewer --prompt-file <prompt.md>`. `--agent` is codex, claude, pi or grok. On Codex's "Selected model is at capacity" (server congestion, not quota) first retry Codex with another model (`--model gpt-6.1-sol`), then use a fresh Claude or Grok session; a second independent reviewer of another agent may run on the same candidate in parallel. Grok is a bootstrap helper, not a product agent: the bridge refuses it inside a run_check check, because `contracts/live-session.schema.json` accepts only codex, claude and pi. Under run_check add `--report-out "$HOH_EVIDENCE_DIR/independent-report.json"`.
 - Baseline change: write `docs/cr/CR-00N-*.md` → edit locked files → `python3 tools/gen_spec_views.py` → `python3 tools/baseline.py relock --cr <cr> [--amend] [--add <new contract>]` → bundle check.
+
+## Continuing, waiting and reviews (details: docs/19)
+
+- Top-level only: continue through the native goal, not an outer loop or extra continue hooks; long commands and external reviews run as Claude-managed background tasks recorded in PROGRESS (task ID, attempt, candidate, result path, collect-on). Before ending a reply: consume finished results, do runnable work, and wait only on a live managed task with a wake condition.
+- Reviews: state candidate, diff, REQ/AC, risk scope and pass condition first; fix re-reviews look at the fix diff, its call chain and regressions; one reviewer, two complementary ones for deletion/process/concurrency changes, with disjoint finding-id ranges. critical/high: fix and re-review; medium: decide by AC and observable behaviour; low: follow-up list. The same class twice in a row: stop patching, write a short design correction, verify, then implement.
 
 ## Engineering rules
 

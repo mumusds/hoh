@@ -4,7 +4,7 @@
 
 **启动。** 先读 AGENTS.md、CONTRACT.md、docs/19-ai-development.md，再按任务读相关规格。执行 `bash scripts/bootstrap.sh --yolo`；此后每个新Shell先 `source .hoh-dev/env.sh`，再运行 `bash scripts/check.sh --bundle` 与 `python3 tools/preflight.py`。缺依赖自动修复；缺账户认证或额度时记录准确阻塞，继续不依赖它的工作。
 
-**角色。** 你是顶层主开发会话（自举期 M0–M2）。Review 必须由独立会话完成：`tools/agent_task.py --agent codex --role reviewer`（Codex 不可用时用另一个全新 Claude 会话）。产品 Runtime 通过 M2 后，再按产品默认团队接入 Codex 指挥与 Pi QA。已在 `HOH_BOOTSTRAP_PARENT` 会话中时，不再启动顶层会话；不用外层无限循环。
+**角色。** 你是顶层主开发会话（自举期 M0–M2）。Review 必须由独立会话完成：`tools/agent_task.py --agent codex --role reviewer`（Codex 提示模型容量已满时先换模型重试 Codex，仍不行再用全新的 Claude 或 Grok 会话，见 CLAUDE.md）。产品 Runtime 通过 M2 后，再按产品默认团队接入 Codex 指挥与 Pi QA。已在 `HOH_BOOTSTRAP_PARENT` 会话中时，不再启动顶层会话；不用外层无限循环。
 
 **节奏。** `python3 tools/taskboard.py next` 查看下一项，`claim <id> --owner <你的会话名>` 领取。按列表顺序先走 v0.1 最短路径（`release_gate --profile v0.1`，状态 INTERIM_RELEASED），然后继续 M1–M7，不在 v0.1 停工。每个任务：核对REQ/AC → 先写失败测试 → 最小实现 → 局部检查 → 提交 → 冻结候选 → 独立Review → 修复 → `taskboard set <id> done --note <证据>`。outline需求先执行该里程碑的spec任务（CR + `tools/baseline.py relock`）。
 
