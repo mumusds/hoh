@@ -40,9 +40,11 @@ for line in new[-5:]:
     except ValueError: continue
     why=r.get('error') or r.get('reason') or '?'
     rec=r.get('recovery') or {}
+    # A part the alert hook could not collect is a string ("unavailable: ..."), not a list.
+    listed=lambda v:[v] if isinstance(v,str) else list(v or [])
     print(f"[hoh-session] ALERT {r.get('at')} {r.get('event')}: {why}" + (f" -- {r['message']}" if r.get('message') else ''))
-    print(f"[hoh-session]   then: tasks {', '.join(rec.get('tasks') or []) or 'none'}; {rec.get('branch') or '?'} at {rec.get('head') or '?'}; newest evidence {rec.get('newest_evidence') or 'none'}")
-    for b in rec.get('background') or []: print(f"[hoh-session]   was running: {b}")
+    print(f"[hoh-session]   then: tasks {', '.join(listed(rec.get('tasks'))) or 'none'}; {rec.get('branch') or '?'} at {rec.get('head') or '?'}; newest evidence {rec.get('newest_evidence') or 'none'}")
+    for b in listed(rec.get('background')): print(f"[hoh-session]   was running: {b}")
 if new: print(f"[hoh-session] {len(new)} new alert(s); check whether that background work finished before continuing.")
 open('.hoh-dev/session-alerts.seen','w').write(str(len(lines)))
 PY

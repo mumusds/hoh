@@ -82,6 +82,12 @@ class SessionAlerts(unittest.TestCase):
         self.assertEqual(got[0]['recovery']['branch'],'main')
         self.assertEqual(got[0]['recovery']['tasks'],'unavailable: AttributeError')
         self.assertEqual(got[0]['recovery']['newest_evidence'],'unavailable: FileNotFoundError')
+        # What was unavailable is shown as such at the next start, not split into characters.
+        (self.root/'.hoh-dev/task-state.json').write_text('{}')
+        (self.root/'.hoh-dev/session-alerts.jsonl').write_text(json.dumps({'event':'SessionEnd','reason':'other','recovery':{'tasks':'unavailable: OSError','background':'unavailable: OSError','branch':'main'}})+'\n')
+        shown=self.hook('session-context.sh','').stdout
+        self.assertIn('tasks unavailable: OSError;',shown);self.assertIn('was running: unavailable: OSError',shown)
+        self.assertNotIn('u, n, a',shown)
     def test_the_notification_keeps_only_printable_ascii(self):
         out=self.hook('session-alert.sh',json.dumps({'hook_event_name':'StopFailure','error':'bad\x1b]52;c;AAAA\x07\u00e9\nend'}))
         seq=json.loads(out.stdout)['terminalSequence']
