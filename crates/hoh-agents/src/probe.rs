@@ -10,6 +10,8 @@ use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::{self, Read};
+use std::os::fd::AsFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -304,7 +306,26 @@ pub struct CodexSchema {
 thread_local! {
     /// How many diagnostic paths this thread has written out (a well-formed schema writes none; M1T07R-40).
     static RENDERED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Called between the walk or the removal learning of an entry and acting on it, so a test can change the entry
+    /// there as a helper the CLI left running could (M1T07R-44).
+    static BETWEEN: std::cell::RefCell<Option<Hook>> = const { std::cell::RefCell::new(None) };
 }
+
+/// What a test runs at [`between`].
+#[cfg(test)]
+type Hook = Box<dyn FnMut(&str, &Path)>;
+
+#[cfg(test)]
+fn between(moment: &str, path: &Path) {
+    BETWEEN.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(moment, path);
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn between(_: &str, _: &Path) {}
 
 /// The longest definition name (and so `$ref` target) the probe reads: resolving a reference then costs a bounded
 /// amount, however often it is used (M1T07R-40). The recorded 0.166.0 schema's longest is 54 bytes.
@@ -316,6 +337,14 @@ const MAX_NAME: usize = 256;
 const MAX_SCHEMA_FILE: u64 = 16 * 1024 * 1024;
 const MAX_SCHEMA_TOTAL: u64 = 64 * 1024 * 1024;
 const MAX_SCHEMA_FILES: usize = 4096;
+
+/// How deep the probe walks or removes a schema output, each level holding one open directory: deeper output is
+/// refused, and left when removed (the recorded 0.166.0 output is 2 deep; M1T07R-44).
+const MAX_SCHEMA_DEPTH: usize = 64;
+
+/// The most output the probe keeps from a command, stdout and stderr each: more fails the command, read no further
+/// (the recorded helps are at most 22 KB; M1T07R-44).
+const MAX_OUTPUT: u64 = 16 * 1024 * 1024;
 
 /// The longest number token the probe reads; longer ones are refused, so reading one is bounded (M1T07R-42). The
 /// recorded 0.166.0 schema's longest is 3 characters.
@@ -1049,9 +1078,18 @@ pub fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<CodexSchema, Prob
         .unwrap_or(0);
     let dir = std::env::temp_dir().join(format!("hoh-probe-{}-{nanos}", std::process::id()));
     std::fs::create_dir(&dir)?;
+    // The directory the probe made, held open: only it is read and removed, wherever its path leads later (M1T07R-44).
+    let owned = match open_directory(rustix::fs::CWD, &dir) {
+        Ok(owned) => owned,
+        Err(e) => {
+            let _ = std::fs::remove_dir(&dir);
+            return Err(io::Error::from(e).into());
+        }
+    };
     // Removed within the window however the reading ends, a panic included (M1T07R-40).
     let mut scratch = Scratch {
         dir: dir.clone(),
+        owned,
         until: until + CLEANUP_GRACE,
         removed: None,
     };
@@ -1066,6 +1104,13 @@ pub fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<CodexSchema, Prob
             argv: argv(launcher, &["app-server", "generate-json-schema"]),
             detail,
         };
+        // Output written anywhere but the directory the probe made is not read (M1T07R-44).
+        if !names(&dir, scratch.owned.as_fd()) {
+            return Err(unusable(format!(
+                "the schema output directory {} was replaced",
+                dir.display()
+            )));
+        }
         // Reading the schema is bounded by doctor's shared deadline, or without one by the probe's own command limit
         // (M1T07R-40).
         let until = Some(until);
@@ -1073,34 +1118,22 @@ pub fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<CodexSchema, Prob
         // The checks before validation are linear in the files; only the deadline bounds them, each file's bytes
         // counted before it is parsed (M1T07R-40, -42).
         let checks = Work::new(u64::MAX, until);
-        // Bounded before anything is read, so walking, parsing and hashing are bounded too (M1T07R-40).
-        let files = schema_files(&dir, &checks).map_err(unusable)?;
-        let mut total = 0u64;
-        for file in &files {
-            let size = std::fs::metadata(file)?.len();
-            total += size;
-            if size > MAX_SCHEMA_FILE || total > MAX_SCHEMA_TOTAL {
-                return Err(unusable(format!(
-                    "the schema output is too large: {} is {size} bytes, {total} in all (at most {MAX_SCHEMA_FILE} a file, {MAX_SCHEMA_TOTAL} in all)",
-                    file.display()
-                )));
-            }
-        }
+        // Read once within the limits, so walking, parsing and hashing are bounded too (M1T07R-40, -44).
+        let files = schema_files(&dir, scratch.owned.as_fd(), &checks).map_err(unusable)?;
         let mut parsed = BTreeMap::new();
         let mut texts = BTreeMap::new();
-        for file in files.iter().cloned() {
+        for (file, bytes) in &files {
             if file.extension().is_some_and(|e| e == "json") {
-                let bytes = std::fs::read(&file)?;
                 if !checks.spend(bytes.len()) {
                     return Err(unusable(format!(
                         "{} was not read within the time limit",
                         file.display()
                     )));
                 }
-                let value = serde_json::from_slice::<serde_json::Value>(&bytes)
+                let value = serde_json::from_slice::<serde_json::Value>(bytes)
                     .map_err(|e| unusable(format!("{} is not JSON: {e}", file.display())))?;
                 parsed.insert(file.clone(), value);
-                texts.insert(file, String::from_utf8_lossy(&bytes).into_owned());
+                texts.insert(file.clone(), String::from_utf8_lossy(bytes).into_owned());
             }
         }
         // The methods a file lists in the known form whose message can be valid: `envelope` is the message for a
@@ -1176,15 +1209,27 @@ pub fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<CodexSchema, Prob
                 .map_err(|e| unusable(format!("hashing the schema output: {e}")))?,
         })
     })();
-    // A CLI that filled its output cannot hold the probe past the window: what is not removed by then is left, and
-    // the probe's failure says where (M1T07R-40).
-    match (result, scratch.remove()) {
-        (Err(ProbeError::Failed { argv, detail }), false) => Err(ProbeError::Failed {
-            argv,
-            detail: format!("{detail}; its output is left at {}", dir.display()),
-        }),
-        (result, _) => result,
+    // A CLI that filled its output cannot hold the probe past the window, nor keep it: what is not removed by then
+    // is left, and the probe fails saying where, whatever the reading came to (M1T07R-40, -45).
+    if scratch.remove() {
+        return result;
     }
+    let left = format!("its output is left at {}", dir.display());
+    let generate = || argv(launcher, &["app-server", "generate-json-schema"]);
+    Err(match result {
+        Err(ProbeError::Failed { argv, detail }) => ProbeError::Failed {
+            argv,
+            detail: format!("{detail}; {left}"),
+        },
+        Ok(_) => ProbeError::Failed {
+            argv: generate(),
+            detail: format!("the schema output could not be removed; {left}"),
+        },
+        Err(other) => ProbeError::Failed {
+            argv: generate(),
+            detail: format!("{other}; {left}"),
+        },
+    })
 }
 
 /// How long removing a probe's scratch directory may run past the reading window.
@@ -1193,6 +1238,8 @@ const CLEANUP_GRACE: Duration = Duration::from_secs(2);
 /// A probe's scratch directory, removed within its window once ([`remove_within`]), at the latest when dropped.
 struct Scratch {
     dir: PathBuf,
+    /// The directory the probe made at `dir`.
+    owned: std::os::fd::OwnedFd,
     until: Instant,
     removed: Option<bool>,
 }
@@ -1203,7 +1250,11 @@ impl Scratch {
         if let Some(gone) = self.removed {
             return gone;
         }
-        let gone = remove_within(&self.dir, self.until);
+        let gone = remove_within(
+            &self.dir,
+            self.owned.as_fd(),
+            &Work::new(u64::MAX, Some(self.until)),
+        );
         self.removed = Some(gone);
         gone
     }
@@ -1215,63 +1266,182 @@ impl Drop for Scratch {
     }
 }
 
-/// The files of a schema output directory. Every entry, directory or file, costs a step, and more than
-/// [`MAX_SCHEMA_FILES`] entries refuse the output, so the walk cannot grow with what the CLI wrote (M1T07R-40).
-fn schema_files(root: &Path, work: &Work) -> Result<Vec<PathBuf>, String> {
+/// `name` under `at` as a directory, opened without following a link or waiting (M1T07R-44).
+fn open_directory<Fd: std::os::fd::AsFd, P: rustix::path::Arg>(
+    at: Fd,
+    name: P,
+) -> rustix::io::Result<std::os::fd::OwnedFd> {
+    use rustix::fs::{Mode, OFlags};
+    let flags =
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    rustix::fs::openat(at, name, flags, Mode::empty())
+}
+
+/// Whether `path` itself, not followed, is the directory `owned` (M1T07R-44).
+fn names(path: &Path, owned: std::os::fd::BorrowedFd<'_>) -> bool {
+    use rustix::fs::{AtFlags, CWD, fstat, statat};
+    match (statat(CWD, path, AtFlags::SYMLINK_NOFOLLOW), fstat(owned)) {
+        (Ok(at), Ok(made)) => at.st_dev == made.st_dev && at.st_ino == made.st_ino,
+        _ => false,
+    }
+}
+
+/// The files of the schema output directory `owned` (at `root`) with their bytes, by path (M1T07R-40, -44). Every
+/// directory is opened
+/// relative to the one holding it and every entry is opened before it is judged, never following a link and never
+/// waiting on a FIFO, so what a helper the CLI left running changes during the walk cannot take it outside the
+/// output: links and what is neither a directory nor a regular file are skipped. Every entry costs a step; more than
+/// [`MAX_SCHEMA_FILES`] entries, or nesting deeper than [`MAX_SCHEMA_DEPTH`], refuse the output; a file is refused
+/// by its size before it is read and read no further than the limits leave, so one that grows meanwhile cannot grow
+/// the reading.
+fn schema_files(
+    root: &Path,
+    owned: std::os::fd::BorrowedFd<'_>,
+    work: &Work,
+) -> Result<Vec<(PathBuf, Vec<u8>)>, String> {
+    use rustix::fs::{Dir, Mode, OFlags, openat};
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let failed = |path: &Path, e: &dyn fmt::Display| format!("{}: {e}", path.display());
+    between("walk", root);
+    let top = Dir::read_from(owned).map_err(|e| failed(root, &e))?;
     let mut out = Vec::new();
-    let mut entries = 0usize;
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))? {
-            entries += 1;
-            if entries > MAX_SCHEMA_FILES {
+    let (mut entries, mut total) = (0usize, 0u64);
+    let mut stack = vec![(top, root.to_path_buf())];
+    while let Some((reader, at)) = stack.last_mut() {
+        let Some(entry) = reader.read() else {
+            stack.pop();
+            continue;
+        };
+        let entry = entry.map_err(|e| failed(at, &e))?;
+        let name = entry.file_name();
+        if name == c"." || name == c".." {
+            continue;
+        }
+        entries += 1;
+        if entries > MAX_SCHEMA_FILES {
+            return Err(format!(
+                "too many schema files or directories (more than {MAX_SCHEMA_FILES})"
+            ));
+        }
+        if !work.spend(1) {
+            return Err("the schema output was not read within the time limit".to_owned());
+        }
+        let path = at.join(OsStr::from_bytes(name.to_bytes()));
+        between("entry", &path);
+        // What is judged is what is read: the entry as opened, not as listed.
+        let fd = reader
+            .fd()
+            .and_then(|at| openat(at, name, flags, Mode::empty()));
+        let file = match fd {
+            Ok(fd) => std::fs::File::from(fd),
+            // A link, a socket, or an entry removed meanwhile.
+            Err(rustix::io::Errno::LOOP | rustix::io::Errno::NXIO | rustix::io::Errno::NOENT) => {
+                continue;
+            }
+            Err(e) => return Err(failed(&path, &e)),
+        };
+        let meta = file.metadata().map_err(|e| failed(&path, &e))?;
+        if meta.is_dir() {
+            if stack.len() > MAX_SCHEMA_DEPTH {
                 return Err(format!(
-                    "too many schema files or directories (more than {MAX_SCHEMA_FILES})"
+                    "the schema output is nested too deep: {} (at most {MAX_SCHEMA_DEPTH} directories)",
+                    path.display()
                 ));
             }
-            if !work.spend(1) {
+            let dir = Dir::new(std::os::fd::OwnedFd::from(file)).map_err(|e| failed(&path, &e))?;
+            stack.push((dir, path));
+        } else if meta.is_file() {
+            let room = MAX_SCHEMA_FILE.min(MAX_SCHEMA_TOTAL - total);
+            if meta.len() > room {
+                return Err(format!(
+                    "the schema output is too large: {} is {} bytes, {} in all (at most {MAX_SCHEMA_FILE} a file, {MAX_SCHEMA_TOTAL} in all)",
+                    path.display(),
+                    meta.len(),
+                    total.saturating_add(meta.len())
+                ));
+            }
+            if !work.spend(usize::try_from(meta.len()).unwrap_or(usize::MAX)) {
                 return Err("the schema output was not read within the time limit".to_owned());
             }
-            let entry = entry.map_err(|e| e.to_string())?;
-            let kind = entry.file_type().map_err(|e| e.to_string())?;
-            if kind.is_dir() {
-                stack.push(entry.path());
-            } else if kind.is_file() {
-                out.push(entry.path());
-            }
+            between("read", &path);
+            let bytes = read_bounded(file, room)
+                .map_err(|e| failed(&path, &e))?
+                .ok_or_else(|| {
+                    format!(
+                        "{} changed while it was read: more than {room} bytes",
+                        path.display()
+                    )
+                })?;
+            total += u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            out.push((path, bytes));
         }
     }
-    out.sort();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(out)
 }
 
-/// Remove `dir` and what it holds, giving up at `until`; true when it is gone.
-fn remove_within(dir: &Path, until: Instant) -> bool {
-    let mut stack = vec![(dir.to_path_buf(), false)];
-    let mut seen = 0u64;
-    while let Some((path, emptied)) = stack.pop() {
-        if emptied {
-            let _ = std::fs::remove_dir(&path);
-            continue;
+/// At most `room` bytes of `file`; `None` when it holds more, having read one byte more.
+fn read_bounded(file: impl Read, room: u64) -> io::Result<Option<Vec<u8>>> {
+    let mut bytes = Vec::new();
+    file.take(room.saturating_add(1)).read_to_end(&mut bytes)?;
+    Ok((u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= room).then_some(bytes))
+}
+
+/// Empty the directory `owned` and remove it from `dir`, every step spending from `work`; true when it is gone
+/// (M1T07R-40, -44). Every directory under it is opened relative to the one holding it without following a link and
+/// what it holds is removed relative to it, so an entry a helper the CLI left running replaces by a link is removed
+/// itself, never followed; what is nested deeper than [`MAX_SCHEMA_DEPTH`] is left. `dir` is removed only while it
+/// names `owned`; a link put in its place is removed itself, and another directory put there is left.
+fn remove_within(dir: &Path, owned: std::os::fd::BorrowedFd<'_>, work: &Work) -> bool {
+    use rustix::fs::{AtFlags, CWD, Dir, fstat, unlinkat};
+    let Ok(top) = Dir::read_from(owned) else {
+        return false;
+    };
+    // Each directory being emptied, with its path.
+    let mut stack = vec![(top, dir.to_path_buf())];
+    loop {
+        if !work.spend(1) {
+            return false;
         }
-        stack.push((path.clone(), true));
-        let Ok(entries) = std::fs::read_dir(&path) else {
+        let within = stack.len() <= MAX_SCHEMA_DEPTH;
+        let Some((reader, at)) = stack.last_mut() else {
+            break;
+        };
+        let Some(Ok(entry)) = reader.read() else {
+            // Emptied, as far as it can be: removed from the directory holding it.
+            let Some((_, path)) = stack.pop() else {
+                break;
+            };
+            if let (Some((parent, _)), Some(name)) = (stack.last(), path.file_name())
+                && let Ok(at) = parent.fd()
+            {
+                let _ = unlinkat(at, name, AtFlags::REMOVEDIR);
+            }
             continue;
         };
-        for entry in entries.flatten() {
-            seen += 1;
-            if seen.is_multiple_of(256) && Instant::now() >= until {
-                return false;
-            }
-            match entry.file_type() {
-                Ok(kind) if kind.is_dir() => stack.push((entry.path(), false)),
-                _ => {
-                    let _ = std::fs::remove_file(entry.path());
-                }
+        let name = entry.file_name();
+        if name == c"." || name == c".." {
+            continue;
+        }
+        let path = at.join(OsStr::from_bytes(name.to_bytes()));
+        between("remove", &path);
+        let Ok(at) = reader.fd() else {
+            return false;
+        };
+        match open_directory(at, name).and_then(Dir::new) {
+            Ok(child) if within => stack.push((child, path)),
+            Ok(_) => {}
+            Err(_) => {
+                let _ = unlinkat(at, name, AtFlags::empty());
             }
         }
     }
-    !dir.exists()
+    if names(dir, owned) {
+        let _ = unlinkat(CWD, dir, AtFlags::REMOVEDIR);
+    } else if std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()) {
+        let _ = unlinkat(CWD, dir, AtFlags::empty());
+    }
+    fstat(owned).is_ok_and(|made| made.st_nlink == 0) && std::fs::symlink_metadata(dir).is_err()
 }
 
 /// Claude Code: `-p --output-format stream-json`; partial messages and resume from `--help`.
@@ -1537,25 +1707,38 @@ fn files_under(root: &Path) -> io::Result<Vec<PathBuf>> {
 /// sha256 over the sorted lines `<relative path> <sha256 of file>\n` of every file under `root` (the same tree hash
 /// tests/fixtures/protocol/record.py uses).
 pub fn tree_sha256(root: &Path) -> io::Result<String> {
-    tree_sha256_of(root, &files_under(root)?, &Work::new(u64::MAX, None))
+    let mut digests = Vec::new();
+    for file in files_under(root)? {
+        let digest = file_sha256(&file)?;
+        digests.push((file, digest));
+    }
+    tree_sha256_from(root, &digests)
 }
 
-/// [`tree_sha256`] over files already listed (each under `root`); each file's bytes are counted in `work` before it is
-/// hashed, so hashing reads the deadline between files (M1T07R-40).
-fn tree_sha256_of(root: &Path, files: &[PathBuf], work: &Work) -> io::Result<String> {
-    let mut lines = Vec::new();
-    for file in files {
-        let size = std::fs::metadata(file)?.len();
-        if !work.spend(usize::try_from(size).unwrap_or(usize::MAX)) {
+/// [`tree_sha256`] over files already read (each under `root`); each file's bytes are counted in `work` before it is
+/// hashed, so hashing reads the deadline between files (M1T07R-40, -44).
+fn tree_sha256_of(root: &Path, files: &[(PathBuf, Vec<u8>)], work: &Work) -> io::Result<String> {
+    let mut digests = Vec::new();
+    for (file, bytes) in files {
+        if !work.spend(bytes.len()) {
             return Err(io::Error::other("not hashed within the time limit"));
         }
+        digests.push((file.clone(), hex(&Sha256::digest(bytes))));
+    }
+    tree_sha256_from(root, &digests)
+}
+
+/// sha256 over the sorted lines `<path relative to root> <digest>\n`.
+fn tree_sha256_from(root: &Path, digests: &[(PathBuf, String)]) -> io::Result<String> {
+    let mut lines = Vec::new();
+    for (file, digest) in digests {
         let rel = file.strip_prefix(root).map_err(io::Error::other)?;
         let rel = rel
             .components()
             .map(|c| c.as_os_str().to_string_lossy().into_owned())
             .collect::<Vec<_>>()
             .join("/");
-        lines.push(format!("{rel} {}\n", file_sha256(file)?));
+        lines.push(format!("{rel} {digest}\n"));
     }
     lines.sort();
     Ok(hex(&Sha256::digest(lines.concat().as_bytes())))
@@ -1700,21 +1883,20 @@ fn capture(
             other => break other.map_err(|e| failed(format!("cannot start: {e}")))?,
         }
     };
+    // Each output is read up to its limit; past it the reader stops, closing its end (M1T07R-44).
     let (tx, rx) = mpsc::channel();
-    if let Some(mut stdout) = child.stdout.take() {
+    if let Some(stdout) = child.stdout.take() {
         std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = tx.send(stdout.read_to_end(&mut buf).map(|_| buf));
+            let _ = tx.send(read_bounded(stdout, MAX_OUTPUT));
         });
     }
     let (etx, erx) = mpsc::channel();
-    if let Some(mut stderr) = child.stderr.take() {
+    if let Some(stderr) = child.stderr.take() {
         std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = etx.send(stderr.read_to_end(&mut buf).map(|_| buf));
+            let _ = etx.send(read_bounded(stderr, MAX_OUTPUT));
         });
     } else {
-        let _ = etx.send(Ok(Vec::new()));
+        let _ = etx.send(Ok(Some(Vec::new())));
     }
     let timed_out = || ProbeError::TimedOut {
         argv: argv(program, args),
@@ -1746,10 +1928,14 @@ fn capture(
     // same absolute end as the wait above, each waiting only for what is left of it, so the two never add up past the
     // limit; output still open then is a timeout and what comes later is not taken (M1T07R-13). The group is not
     // signalled again: it was killed before the leader was reaped, and its id may since belong to another process.
-    let read = |rx: mpsc::Receiver<io::Result<Vec<u8>>>| match rx
+    let read = |rx: mpsc::Receiver<io::Result<Option<Vec<u8>>>>| match rx
         .recv_timeout(end.saturating_duration_since(Instant::now()))
     {
-        Ok(read) => read.map_err(|e| failed(format!("reading output: {e}"))),
+        Ok(Ok(Some(bytes))) => Ok(bytes),
+        Ok(Ok(None)) => Err(failed(format!(
+            "more output than the probe reads ({MAX_OUTPUT} bytes)"
+        ))),
+        Ok(Err(e)) => Err(failed(format!("reading output: {e}"))),
         Err(mpsc::RecvTimeoutError::Timeout) => Err(timed_out()),
         Err(mpsc::RecvTimeoutError::Disconnected) => Err(failed(
             "the output reader ended without a result".to_owned(),
@@ -1767,6 +1953,21 @@ fn capture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `dir` held open, as the probe holds the scratch directory it made.
+    fn held(dir: &Path) -> std::os::fd::OwnedFd {
+        open_directory(rustix::fs::CWD, dir).expect("open the directory")
+    }
+
+    /// [`schema_files`] of `root` as the probe made it.
+    fn walk(root: &Path, work: &Work) -> Result<Vec<(PathBuf, Vec<u8>)>, String> {
+        schema_files(root, held(root).as_fd(), work)
+    }
+
+    /// [`remove_within`] of `dir` as the probe made it.
+    fn remove(dir: &Path, work: &Work) -> bool {
+        remove_within(dir, held(dir).as_fd(), work)
+    }
 
     #[test]
     fn pi_release_follows_the_launcher_layout() -> Result<(), Box<dyn std::error::Error>> {
@@ -2325,27 +2526,124 @@ mod tests {
     fn the_schema_walk_counts_entries_and_reads_the_deadline()
     -> Result<(), Box<dyn std::error::Error>> {
         let root = tempfile::tempdir()?;
+        // Empty, so only the entries cost anything.
         for n in 0..MAX_SCHEMA_FILES {
-            std::fs::write(root.path().join(format!("{n}.json")), "{}")?;
+            std::fs::write(root.path().join(format!("{n}.json")), "")?;
         }
         let past = Some(Instant::now() - Duration::from_secs(1));
         assert_eq!(
-            schema_files(root.path(), &Work::new(u64::MAX, None))?.len(),
+            walk(root.path(), &Work::new(u64::MAX, None))?.len(),
             MAX_SCHEMA_FILES
         );
         assert!(
-            schema_files(root.path(), &Work::new(u64::MAX, past))
-                .is_err_and(|e| e.contains("time limit"))
+            walk(root.path(), &Work::new(u64::MAX, past)).is_err_and(|e| e.contains("time limit"))
         );
-        // The hash reads the deadline between files too.
-        let files = schema_files(root.path(), &Work::new(u64::MAX, None))?;
-        assert!(tree_sha256_of(root.path(), &files, &Work::new(u64::MAX, None)).is_ok());
-        assert!(tree_sha256_of(root.path(), &files, &Work::new(u64::MAX, past)).is_err());
         std::fs::create_dir(root.path().join("one-more"))?;
         assert!(
-            schema_files(root.path(), &Work::new(u64::MAX, None))
-                .is_err_and(|e| e.contains("too many"))
+            walk(root.path(), &Work::new(u64::MAX, None)).is_err_and(|e| e.contains("too many"))
         );
+        // A file's bytes count before it is read, so one large file reads the deadline too.
+        let large = tempfile::tempdir()?;
+        std::fs::write(large.path().join("a.json"), vec![b' '; 8192])?;
+        assert!(walk(large.path(), &Work::new(u64::MAX, None)).is_ok());
+        assert!(
+            walk(large.path(), &Work::new(u64::MAX, past)).is_err_and(|e| e.contains("time limit"))
+        );
+        // The hash reads the deadline between files too.
+        let files = walk(large.path(), &Work::new(u64::MAX, None))?;
+        assert!(tree_sha256_of(large.path(), &files, &Work::new(u64::MAX, None)).is_ok());
+        assert!(tree_sha256_of(large.path(), &files, &Work::new(u64::MAX, past)).is_err());
+        Ok(())
+    }
+
+    /// Only the directory the probe made is emptied and removed: put back as a link to another, the link is removed
+    /// and the other keeps every file; moved away, with or without another directory put in its place, it is emptied
+    /// where it is, is not gone, and the other is left whole (M1T07R-44).
+    #[test]
+    fn only_the_directory_the_probe_made_is_removed() -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        for case in ["linked", "moved", "moved-away"] {
+            let dir = root.path().join(case);
+            let other = root.path().join(format!("{case}-other"));
+            std::fs::create_dir_all(dir.join("v2"))?;
+            std::fs::write(dir.join("v2/a.json"), "{}")?;
+            std::fs::create_dir(&other)?;
+            std::fs::write(other.join("keep.json"), "{}")?;
+            let owned = held(&dir);
+            let moved = root.path().join(format!("{case}-moved"));
+            if case == "linked" {
+                std::fs::remove_dir_all(&dir)?;
+                std::os::unix::fs::symlink(&other, &dir)?;
+            } else {
+                std::fs::rename(&dir, &moved)?;
+                if case == "moved" {
+                    std::fs::rename(&other, &dir)?;
+                }
+            }
+            assert!(!names(&dir, owned.as_fd()), "{case}");
+            let gone = remove_within(&dir, owned.as_fd(), &Work::new(u64::MAX, None));
+            if case == "linked" {
+                assert!(gone, "{case}");
+                assert!(
+                    std::fs::symlink_metadata(&dir).is_err(),
+                    "{case}: the link is left"
+                );
+                assert!(other.join("keep.json").exists(), "{case}");
+            } else {
+                assert!(!gone, "{case}");
+                let kept = if case == "moved" { &dir } else { &other };
+                assert!(kept.join("keep.json").exists(), "{case}");
+                assert_eq!(std::fs::read_dir(&moved)?.count(), 0, "{case}: not emptied");
+            }
+        }
+        Ok(())
+    }
+
+    /// A command's output is kept up to [`MAX_OUTPUT`]; more is a failure, read no further (M1T07R-44).
+    #[test]
+    fn a_command_with_more_output_than_the_limit_fails() -> Result<(), Box<dyn std::error::Error>> {
+        let env = ProbeEnv {
+            path: std::env::var_os("PATH").unwrap_or_default(),
+            fixture_root: None,
+            timeout: Duration::from_secs(30),
+            log: None,
+            deadline: None,
+        };
+        let sh = Path::new("/bin/sh");
+        let within = format!("head -c {MAX_OUTPUT} /dev/zero");
+        let beyond = format!("head -c {} /dev/zero", MAX_OUTPUT + 1);
+        assert_eq!(
+            usize::try_from(MAX_OUTPUT)?,
+            run_ok(sh, &["-c", &within], &env)?.stdout.len()
+        );
+        for keep_stderr in [false, true] {
+            let script = if keep_stderr {
+                format!("{beyond} >&2")
+            } else {
+                beyond.clone()
+            };
+            match logged(sh, &["-c", &script], &env, keep_stderr) {
+                Err(ProbeError::Failed { detail, .. }) => {
+                    assert!(detail.contains("more output"), "{detail}")
+                }
+                other => return Err(format!("{keep_stderr}: {other:?}").into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Reading a file stops one byte past what the limits leave, however much more it holds (M1T07R-44).
+    #[test]
+    fn reading_stops_past_its_room() -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(read_bounded(&b"{}"[..], 2)?, Some(b"{}".to_vec()));
+        assert_eq!(read_bounded(&b"{} "[..], 2)?, None);
+        let done = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done
+                .0
+                .send(read_bounded(std::io::repeat(b' '), 1 << 20).map(|b| b.is_none()));
+        });
+        assert!(done.1.recv_timeout(Duration::from_secs(10))??);
         Ok(())
     }
 
@@ -2358,6 +2656,7 @@ mod tests {
         std::fs::write(dir.join("v2/a.json"), "{}")?;
         let panicked = std::panic::catch_unwind(|| {
             let _scratch = Scratch {
+                owned: held(&dir),
                 dir: dir.clone(),
                 until: Instant::now() + Duration::from_secs(60),
                 removed: None,
@@ -2366,6 +2665,159 @@ mod tests {
         });
         assert!(panicked.is_err());
         assert!(!dir.exists(), "the scratch directory was left");
+        Ok(())
+    }
+
+    /// What a helper the CLI left running does to the output while it is walked or removed never takes the probe
+    /// outside it: a directory, or the output directory itself, replaced by a link to another is neither read nor
+    /// emptied (M1T07R-44).
+    #[test]
+    fn an_entry_replaced_by_a_link_is_not_followed() -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&outside)?;
+        std::fs::write(outside.join("kept.json"), "{}")?;
+        for moment in ["entry", "walk", "remove"] {
+            let dir = root.path().join(moment);
+            std::fs::create_dir_all(dir.join("v2"))?;
+            std::fs::write(dir.join("v2/a.json"), "{}")?;
+            let swapped = if moment == "walk" {
+                dir.clone()
+            } else {
+                dir.join("v2")
+            };
+            let (to, owned) = (outside.clone(), held(&dir));
+            BETWEEN.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |at: &str, path: &Path| {
+                    if at == moment && path == swapped {
+                        std::fs::remove_dir_all(path).expect("remove the directory");
+                        std::os::unix::fs::symlink(&to, path).expect("link it elsewhere");
+                    }
+                }));
+            });
+            if moment == "remove" {
+                assert!(remove_within(
+                    &dir,
+                    owned.as_fd(),
+                    &Work::new(u64::MAX, None)
+                ));
+            } else {
+                let listed = schema_files(&dir, owned.as_fd(), &Work::new(u64::MAX, None))?;
+                assert!(listed.is_empty(), "{moment}: {listed:?}");
+            }
+            BETWEEN.with(|hook| *hook.borrow_mut() = None);
+            assert!(
+                outside.join("kept.json").exists(),
+                "{moment}: removed outside"
+            );
+        }
+        Ok(())
+    }
+
+    /// A file replaced while the output is walked is judged as opened: a link to another file is not read, a FIFO is
+    /// skipped without waiting for a writer, and a file that grows past the limits once its size was taken is refused
+    /// with no more read than they allow (M1T07R-44).
+    #[test]
+    fn a_file_replaced_during_the_walk_is_judged_as_opened()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let outside = root.path().join("outside.json");
+        std::fs::write(&outside, "{}")?;
+        for (moment, change) in [("entry", "link"), ("entry", "fifo"), ("read", "grow")] {
+            let dir = root.path().join(change);
+            std::fs::create_dir(&dir)?;
+            let file = dir.join("a.json");
+            std::fs::write(&file, "{}")?;
+            let (to, done) = (outside.clone(), std::sync::mpsc::channel());
+            std::thread::spawn(move || {
+                let target = file.clone();
+                BETWEEN.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move |at: &str, path: &Path| {
+                        if at != moment || path != target {
+                            return;
+                        }
+                        match change {
+                            "link" => {
+                                std::fs::remove_file(path).expect("remove the file");
+                                std::os::unix::fs::symlink(&to, path).expect("link it elsewhere");
+                            }
+                            "fifo" => {
+                                std::fs::remove_file(path).expect("remove the file");
+                                rustix::fs::mknodat(
+                                    rustix::fs::CWD,
+                                    path,
+                                    rustix::fs::FileType::Fifo,
+                                    rustix::fs::Mode::from_raw_mode(0o600),
+                                    0,
+                                )
+                                .expect("make a FIFO");
+                            }
+                            _ => {
+                                let mut grown = std::fs::OpenOptions::new()
+                                    .append(true)
+                                    .open(path)
+                                    .expect("open");
+                                let spaces = vec![b' '; 1 << 20];
+                                for _ in 0..=MAX_SCHEMA_FILE >> 20 {
+                                    std::io::Write::write_all(&mut grown, &spaces).expect("grow");
+                                }
+                            }
+                        }
+                    }));
+                });
+                let listed = walk(&dir, &Work::new(u64::MAX, None))
+                    .map(|files| files.into_iter().map(|(path, _)| path).collect::<Vec<_>>());
+                let _ = done.0.send(listed);
+            });
+            let listed = done.1.recv_timeout(Duration::from_secs(10))?;
+            match change {
+                "grow" => assert!(
+                    listed
+                        .as_ref()
+                        .is_err_and(|e| e.contains("changed while it was read")),
+                    "{change}: {listed:?}"
+                ),
+                _ => assert_eq!(listed, Ok(Vec::new()), "{change}"),
+            }
+        }
+        Ok(())
+    }
+
+    /// Removing an output spends a step for every directory it empties, not only for every entry it lists: a flat
+    /// output of empty directories reads the deadline while they are removed (M1T07R-44).
+    #[test]
+    fn removal_is_charged_after_the_listing_too() -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        for (budget, gone) in [(400, false), (u64::MAX, true)] {
+            let dir = root.path().join(budget.to_string());
+            for n in 0..300 {
+                std::fs::create_dir_all(dir.join(n.to_string()))?;
+            }
+            assert_eq!(remove(&dir, &Work::new(budget, None)), gone, "{budget}");
+            assert_eq!(dir.exists(), !gone, "{budget}");
+        }
+        Ok(())
+    }
+
+    /// An output nested deeper than [`MAX_SCHEMA_DEPTH`] is refused, and left when removed; one exactly that deep is
+    /// read and removed (M1T07R-44).
+    #[test]
+    fn output_deeper_than_the_limit_is_refused_and_left() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let root = tempfile::tempdir()?;
+        for (depth, within) in [(MAX_SCHEMA_DEPTH, true), (MAX_SCHEMA_DEPTH + 1, false)] {
+            let dir = root.path().join(depth.to_string());
+            let bottom = (0..depth).fold(dir.clone(), |path, _| path.join("d"));
+            std::fs::create_dir_all(&bottom)?;
+            std::fs::write(bottom.join("a.json"), "{}")?;
+            let listed = walk(&dir, &Work::new(u64::MAX, None));
+            assert_eq!(listed.is_ok(), within, "{depth}: {:?}", listed.err());
+            if !within {
+                assert!(listed.is_err_and(|e| e.contains("too deep")));
+            }
+            assert_eq!(remove(&dir, &Work::new(u64::MAX, None)), within, "{depth}");
+            assert_eq!(dir.exists(), !within, "{depth}");
+        }
         Ok(())
     }
 
@@ -2381,7 +2833,11 @@ mod tests {
             for n in 0..5_000 {
                 std::fs::create_dir_all(dir.join(format!("{}/{n}", n % 7)))?;
             }
-            assert_eq!(remove_within(&dir, until), gone, "{name}");
+            assert_eq!(
+                remove(&dir, &Work::new(u64::MAX, Some(until))),
+                gone,
+                "{name}"
+            );
             assert_eq!(dir.exists(), !gone, "{name}");
         }
         Ok(())
