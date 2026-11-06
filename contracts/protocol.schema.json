@@ -960,6 +960,7 @@
         "DB_BUSY",
         "DB_ON_NETWORK_FS",
         "DB_WAL_UNSUPPORTED",
+        "DB_FULL",
         "INVALID_TEAM_CONFIG",
         "CONTEXT_BUDGET_TOO_SMALL",
         "PROTOCOL_FRAME_TOO_LARGE",

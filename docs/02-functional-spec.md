@@ -948,7 +948,7 @@ Run/Iteration/Task/Attempt/Session以独立全局ID持久化，按单源迁移�
 - VERIFYING→RUNNING（候选失败后修复/下一增量）文档未显式列出，按工程循环选择为合法。
 - INCOMPLETE是否终态未定；本选择终态仅COMPLETED/CANCELLED/FAILED，INCOMPLETE/BLOCKED/WAITING_EXTERNAL/PAUSED可经ResumeRun回到resume_state。
 - attempts 已含 config_revision 列（CR-001 SQL）；SESSION_NOT_INDEPENDENT 为确认的错误码。
-- 故障注入点只在test feature编译，生产二进制不得包含注入路径。
+- 故障注入点是产品代码中的空操作钩子（CR-006，项目所有者批准）：产品对每个钩子的实现什么也不做，制造故障的实现只在测试目标中，由测试在同一进程内传入；产品入口（main 及其调用的一切）只使用空实现，没有环境变量、命令行参数或配置文件能换掉它。产品二进制中没有能产生故障的代码；全部代码都在 AC-062-05 的受检构建中（成员不声明 Cargo 特性）。
 
 ## REQ-037 · 单写者与并行验证
 
@@ -1572,6 +1572,7 @@ M2 · P0 · 发布类 required · 目标 v1, v0.1 · 成熟度 detailed，参考
 - synchronous选FULL（初值）以覆盖VM硬重启后已ACK事务不丢；若性能目标不达需CR改NORMAL并记录风险。
 - 已修正（CR-002）：已知网络/共享文件系统直接拒绝；其余文件系统（含 virtiofs）在 host 启动时做 WAL 自检（临时库启用 WAL、写入、checkpoint、-shm 映射与加锁），失败即以 DB_WAL_UNSUPPORTED 拒绝启动——以实测代替名单猜测。
 - DB_ON_NETWORK_FS、DB_BUSY错误码名为初值；GET≤500 ms借用事件可见p95目标作为阈值。
+- DB所在文件系统写满或超出配额致写事务无法提交时返回503 code=DB_FULL、retryable=true，状态、事件与outbox不变（CR-006）。
 
 ## REQ-063 · 备份与迁移
 
