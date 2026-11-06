@@ -1548,7 +1548,8 @@ fn schema_output_beyond_its_size_limits_is_refused_before_it_is_read() -> R {
 
 /// The probe reads and removes only the scratch directory it made: a CLI that replaces its `--out` directory by a
 /// link to another is refused and the other keeps every file (M1T07R-44); output the probe cannot remove fails the
-/// probe and names where it is left, whether the reading succeeded or the command timed out (M1T07R-45).
+/// probe and names where it is left, whether the reading succeeded or the command timed out, and where it was moved
+/// to when the CLI moved it (M1T07R-45).
 #[test]
 fn schema_output_is_read_and_removed_only_where_the_probe_made_it() -> R {
     let tmp = tempfile::tempdir()?;
@@ -1557,7 +1558,7 @@ fn schema_output_is_read_and_removed_only_where_the_probe_made_it() -> R {
         // A read-only directory does not stop root from emptying it.
         return Ok(());
     }
-    for group in ["replaced", "kept", "kept-then-hangs"] {
+    for group in ["replaced", "kept", "kept-then-hangs", "moved"] {
         let elsewhere = tmp.path().join(format!("{group}-elsewhere"));
         std::fs::create_dir(&elsewhere)?;
         std::fs::write(elsewhere.join("keep.txt"), "kept")?;
@@ -1570,6 +1571,11 @@ fn schema_output_is_read_and_removed_only_where_the_probe_made_it() -> R {
             ),
             "kept" => format!(
                 "echo \"$4\" > '{o}' && cp -R '{s}/.' \"$4/\" && chmod 0555 \"$4\"",
+                o = out.display(),
+                s = f.join("app-server-schema").display()
+            ),
+            "moved" => format!(
+                "echo \"$4-moved\" > '{o}' && cp -R '{s}/.' \"$4/\" && mv \"$4\" \"$4-moved\"",
                 o = out.display(),
                 s = f.join("app-server-schema").display()
             ),
@@ -1593,19 +1599,26 @@ fn schema_output_is_read_and_removed_only_where_the_probe_made_it() -> R {
         }
         let result = probe(Agent::Codex, &env);
         // What was kept is made removable again, so the test leaves nothing behind.
-        if let Ok(kept) = std::fs::read_to_string(&out) {
-            let kept = PathBuf::from(kept.trim());
-            std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o755))?;
-            std::fs::remove_dir_all(&kept)?;
+        let kept = std::fs::read_to_string(&out).map(|kept| PathBuf::from(kept.trim()));
+        if let Ok(kept) = &kept {
+            std::fs::set_permissions(kept, std::fs::Permissions::from_mode(0o755))?;
+            std::fs::remove_dir_all(kept)?;
         }
         match result {
             Err(ProbeError::Failed { detail, .. }) => {
                 let expected = match group {
-                    "replaced" => "was replaced",
-                    "kept" => "left at",
-                    _ => "timed out",
+                    "replaced" => "was replaced".to_owned(),
+                    "kept" => "left at".to_owned(),
+                    // Where it is now, not where it was made.
+                    "moved" => format!(
+                        "left at {} (moved from",
+                        kept.as_ref()
+                            .map_err(|e| format!("{group}: {e}"))?
+                            .display()
+                    ),
+                    _ => "timed out".to_owned(),
                 };
-                assert!(detail.contains(expected), "{group}: {detail}");
+                assert!(detail.contains(&expected), "{group}: {detail}");
                 if group != "replaced" {
                     assert!(detail.contains("left at"), "{group}: {detail}");
                 }
@@ -1622,8 +1635,8 @@ fn schema_output_is_read_and_removed_only_where_the_probe_made_it() -> R {
 }
 
 /// Validation is bounded in work, not only in depth: a `RequestId` whose `anyOf` names itself twice, or a chain of
-/// definitions each naming the next twice, would take exponential time; within its budget the probe calls the ids
-/// undecided, so the requests are absent, and it ends at once (M1T07R-40).
+/// definitions each naming the next twice, would take exponential time; the probe cannot decide within its budget,
+/// so it fails (unknown), never reporting the requests absent, and it ends at once (M1T07R-40).
 #[test]
 fn a_schema_that_branches_without_end_is_undecided_at_once() -> R {
     let tmp = tempfile::tempdir()?;
@@ -1703,12 +1716,19 @@ fn a_schema_that_branches_without_end_is_undecided_at_once() -> R {
         );
         let (dir, _) = fake(tmp.path(), &format!("{group}-bin"), "codex", &script)?;
         let started = std::time::Instant::now();
-        let entry = probe(Agent::Codex, &env_for(&dir)).map_err(|e| format!("{group}: {e}"))?;
-        let expected = match group {
-            "long-key" => Transport::AppServer,
-            _ => Transport::Exec,
-        };
-        assert_eq!(entry.transport, expected, "{group}");
+        let result = probe(Agent::Codex, &env_for(&dir));
+        match (group, result) {
+            ("long-key", Ok(entry)) => assert_eq!(entry.transport, Transport::AppServer),
+            // Twenty thousand ids in each branch are past a protocol file's value limit, refused before parsing
+            // (M1T07R-50); the rest run out of the validation budget.
+            ("long-enum", Err(ProbeError::Failed { detail, .. })) => {
+                assert!(detail.contains("values"), "{group}: {detail}")
+            }
+            (_, Err(ProbeError::Failed { detail, .. })) if group != "long-key" => {
+                assert!(detail.contains("work limits"), "{group}: {detail}")
+            }
+            (_, other) => return Err(format!("{group}: {other:?}").into()),
+        }
         assert!(
             started.elapsed() < Duration::from_secs(10),
             "{group}: the probe took {:?}",

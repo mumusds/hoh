@@ -306,6 +306,8 @@ pub struct CodexSchema {
 thread_local! {
     /// How many diagnostic paths this thread has written out (a well-formed schema writes none; M1T07R-40).
     static RENDERED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many schema files this thread has parsed into values (only the three protocol files are; M1T07R-40).
+    static PARSED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Called between the walk or the removal learning of an entry and acting on it, so a test can change the entry
     /// there as a helper the CLI left running could (M1T07R-44).
     static BETWEEN: std::cell::RefCell<Option<Hook>> = const { std::cell::RefCell::new(None) };
@@ -315,8 +317,23 @@ thread_local! {
 #[cfg(test)]
 type Hook = Box<dyn FnMut(&str, &Path)>;
 
+/// Released by the test that stalls the reading (see [`between`]).
+#[cfg(test)]
+static RELEASE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 #[cfg(test)]
 fn between(moment: &str, path: &Path) {
+    // An entry named `hoh-test-stall-<moment>`, at `path` or in it, stalls the reading there, on whatever thread, as
+    // a call that does not return would, until the test releases it (M1T07R-47).
+    let marker = format!("hoh-test-stall-{moment}");
+    if path.file_name().is_some_and(|name| name == marker.as_str()) || path.join(&marker).exists() {
+        let started = Instant::now();
+        while !RELEASE.load(std::sync::atomic::Ordering::SeqCst)
+            && started.elapsed() < Duration::from_secs(120)
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
     BETWEEN.with(|hook| {
         if let Some(hook) = hook.borrow_mut().as_mut() {
             hook(moment, path);
@@ -607,10 +624,9 @@ fn branches_by_method<'a>(
     branches
 }
 
-/// A copy of a protocol schema file whose branches accept any `params`: the probe checks a method's envelope, not its
-/// parameters, which the compat suite verifies against recorded traffic (ADR-015 decision 2, M1T07R-33).
-fn params_open(file: &serde_json::Value) -> serde_json::Value {
-    let mut open = file.clone();
+/// A protocol schema file made to accept any `params` in each branch, in place: the probe checks a method's envelope,
+/// not its parameters, which the compat suite verifies against recorded traffic (ADR-015 decision 2, M1T07R-33).
+fn params_open(open: &mut serde_json::Value) {
     // The root's `properties` (ServerNotification.json) and every branch's (M1T07R-37).
     if let Some(params) = open.get_mut("properties").and_then(|p| p.get_mut("params")) {
         *params = serde_json::Value::Bool(true);
@@ -620,7 +636,34 @@ fn params_open(file: &serde_json::Value) -> serde_json::Value {
             *params = serde_json::Value::Bool(true);
         }
     }
-    open
+}
+
+/// The most values (keys included) a protocol schema file may parse into; the recorded 0.166.0 files have at most
+/// 10,609 by [`json_values`]. A parsed value costs many times its text (an object with one key is hundreds of bytes
+/// for six bytes of text), so a file within the size limits could take gigabytes; past this it is refused before it
+/// is parsed, and the three files take a few hundred megabytes at most (M1T07R-50).
+const MAX_SCHEMA_VALUES: usize = 200_000;
+
+/// An upper bound of the values a JSON text parses into, keys included: one, and one for each `{`, `[`, `,` and `:`
+/// outside strings.
+fn json_values(text: &[u8]) -> usize {
+    let (mut values, mut in_string, mut escaped) = (1usize, false, false);
+    for &byte in text {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+        } else if byte == b'"' {
+            in_string = true;
+        } else if matches!(byte, b'{' | b'[' | b',' | b':') {
+            values += 1;
+        }
+    }
+    values
 }
 
 /// How deep schemas may nest while validating; deeper is undecided, so a cyclic definition cannot loop.
@@ -629,8 +672,8 @@ const REF_DEPTH: usize = 64;
 /// How many steps one reading of the App Server schema may take in all: every schema node visited and every element it
 /// examines (members of `allOf`/`anyOf`/`oneOf`, values of `enum`, names of `required`, properties, an instance's
 /// keys) is a step. Depth alone does not bound the work of a definition naming itself twice, or of wide members and
-/// long enums reused many times; past the budget a validation is undecided, so the method is absent and the probe
-/// ends within a second (M1T07R-40). The recorded 0.166.0 schema needs about 150,000.
+/// long enums reused many times; past the budget the reading fails (unknown) within a second, never reporting the
+/// method absent (M1T07R-40). The recorded 0.166.0 schema needs about 150,000.
 const VALIDATION_BUDGET: u64 = 4_000_000;
 
 /// When reading the App Server schema must end: at doctor's shared deadline, and never later than the probe's own
@@ -645,6 +688,10 @@ fn reading_deadline(env: &ProbeEnv, now: Instant) -> Instant {
 struct Work {
     steps: std::cell::Cell<u64>,
     until: Option<Instant>,
+    /// The budget or the deadline stopped a step.
+    out: std::cell::Cell<bool>,
+    /// Set when whoever waits for this work has given up on it: every later step is refused (M1T07R-47).
+    stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Work {
@@ -652,21 +699,40 @@ impl Work {
         Work {
             steps: std::cell::Cell::new(steps),
             until,
+            out: std::cell::Cell::new(false),
+            stop: None,
         }
+    }
+
+    /// This work, refusing every step once `flag` is set.
+    fn stopped_by(mut self, flag: &std::sync::Arc<std::sync::atomic::AtomicBool>) -> Work {
+        self.stop = Some(flag.clone());
+        self
+    }
+
+    /// Whether the budget or the deadline stopped a step.
+    fn ran_out(&self) -> bool {
+        self.out.get()
     }
 
     /// Take `n` steps; false once the budget or the deadline is used up.
     fn spend(&self, n: usize) -> bool {
         let n = u64::try_from(n).unwrap_or(u64::MAX);
         let left = self.steps.get();
-        if left < n {
+        let given_up = self
+            .stop
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst));
+        if given_up || left < n {
             self.steps.set(0);
+            self.out.set(true);
             return false;
         }
         let after = left - n;
         self.steps.set(after);
         if left / 4096 != after / 4096 && self.until.is_some_and(|until| Instant::now() >= until) {
             self.steps.set(0);
+            self.out.set(true);
             return false;
         }
         true
@@ -1072,164 +1138,240 @@ pub fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<CodexSchema, Prob
     // Generating, reading and removing the schema share one window: doctor's shared deadline, or without one the
     // probe's own command limit (M1T07R-40).
     let until = reading_deadline(env, Instant::now());
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!("hoh-probe-{}-{nanos}", std::process::id()));
-    std::fs::create_dir(&dir)?;
-    // The directory the probe made, held open: only it is read and removed, wherever its path leads later (M1T07R-44).
-    let owned = match open_directory(rustix::fs::CWD, &dir) {
-        Ok(owned) => owned,
+    let generate = argv(launcher, &["app-server", "generate-json-schema"]);
+    let scratch = Scratch::new(until + CLEANUP_GRACE)?;
+    let dir = scratch.dir.clone();
+    let out = dir.to_string_lossy().into_owned();
+    let generated = run_ok(
+        launcher,
+        &["app-server", "generate-json-schema", "--out", &out],
+        env,
+    )
+    .map(|_| ());
+    // What follows works over what the CLI wrote. It runs apart and is waited for only until the window and the
+    // cleanup grace end, so no operation over the output, counted or not, blocking or not, holds the probe longer
+    // (M1T07R-40); the counted work inside ends it earlier (budgets and deadline), so it is not left running.
+    // Given up on, it does nothing more to the output past the step in progress: every step checks the flag
+    // (M1T07R-47).
+    let given_up = scratch.given_up.clone();
+    let (tx, rx) = mpsc::channel();
+    let reader = generate.clone();
+    let started = std::thread::Builder::new()
+        .name("hoh-schema".to_owned())
+        .spawn(move || {
+            let _ = tx.send(read_and_remove(scratch, generated, &reader, Some(until)));
+        });
+    let worker = match started {
+        Ok(worker) => worker,
         Err(e) => {
-            let _ = std::fs::remove_dir(&dir);
-            return Err(io::Error::from(e).into());
+            return Err(ProbeError::Failed {
+                argv: generate,
+                detail: format!("cannot read the schema output: {e}"),
+            });
         }
     };
-    // Removed within the window however the reading ends, a panic included (M1T07R-40).
-    let mut scratch = Scratch {
-        dir: dir.clone(),
-        owned,
-        until: until + CLEANUP_GRACE,
-        removed: None,
+    let wait = (until + CLEANUP_GRACE + READER_MARGIN).saturating_duration_since(Instant::now());
+    let received = rx.recv_timeout(wait).or_else(|e| {
+        given_up.store(true, std::sync::atomic::Ordering::SeqCst);
+        // A result sent as the wait ended is still taken.
+        rx.try_recv().map_err(|_| e)
+    });
+    match received {
+        Ok(result) => {
+            // Its result sent, the reading ends at once: joined, it holds nothing past the probe.
+            let _ = worker.join();
+            result
+        }
+        Err(e) => Err(ProbeError::Failed {
+            argv: generate,
+            detail: match e {
+                mpsc::RecvTimeoutError::Timeout => format!(
+                    "the schema output was not read and removed within the time limit; it may be left at {}",
+                    dir.display()
+                ),
+                mpsc::RecvTimeoutError::Disconnected => format!(
+                    "reading the schema output ended without a result; it may be left at {}",
+                    dir.display()
+                ),
+            },
+        }),
+    }
+}
+
+/// How long past the cleanup grace [`codex_schema`] waits for the reading to report.
+const READER_MARGIN: Duration = Duration::from_millis(500);
+
+/// Read the schema the CLI generated into `scratch` (if it did), then remove the output; what is not removed fails
+/// the probe, saying where it is left, whatever the reading came to (M1T07R-40, -45).
+fn read_and_remove(
+    mut scratch: Scratch,
+    generated: Result<(), ProbeError>,
+    generate: &[String],
+    until: Option<Instant>,
+) -> Result<CodexSchema, ProbeError> {
+    let unusable = |detail: String| ProbeError::Failed {
+        argv: generate.to_vec(),
+        detail,
     };
-    let result = (|| {
-        let out = dir.to_string_lossy().into_owned();
-        run_ok(
-            launcher,
-            &["app-server", "generate-json-schema", "--out", &out],
-            env,
-        )?;
-        let unusable = |detail: String| ProbeError::Failed {
-            argv: argv(launcher, &["app-server", "generate-json-schema"]),
-            detail,
-        };
+    let result = generated.and_then(|()| {
         // Output written anywhere but the directory the probe made is not read (M1T07R-44).
-        if !names(&dir, scratch.owned.as_fd()) {
+        if !scratch.holds() {
             return Err(unusable(format!(
                 "the schema output directory {} was replaced",
-                dir.display()
+                scratch.dir.display()
             )));
         }
-        // Reading the schema is bounded by doctor's shared deadline, or without one by the probe's own command limit
-        // (M1T07R-40).
-        let until = Some(until);
-        let work = Work::new(VALIDATION_BUDGET, until);
         // The checks before validation are linear in the files; only the deadline bounds them, each file's bytes
-        // counted before it is parsed (M1T07R-40, -42).
-        let checks = Work::new(u64::MAX, until);
-        // Read once within the limits, so walking, parsing and hashing are bounded too (M1T07R-40, -44).
-        let files = schema_files(&dir, scratch.owned.as_fd(), &checks).map_err(unusable)?;
-        let mut parsed = BTreeMap::new();
-        let mut texts = BTreeMap::new();
-        for (file, bytes) in &files {
-            if file.extension().is_some_and(|e| e == "json") {
-                if !checks.spend(bytes.len()) {
-                    return Err(unusable(format!(
-                        "{} was not read within the time limit",
-                        file.display()
-                    )));
-                }
-                let value = serde_json::from_slice::<serde_json::Value>(bytes)
-                    .map_err(|e| unusable(format!("{} is not JSON: {e}", file.display())))?;
-                parsed.insert(file.clone(), value);
-                texts.insert(file.clone(), String::from_utf8_lossy(bytes).into_owned());
-            }
-        }
-        // The methods a file lists in the known form whose message can be valid: `envelope` is the message for a
-        // method, checked against the file with the params left to the compat suite (M1T07R-33).
-        let methods = |name: &str, sent: bool, envelope: &dyn Fn(&str) -> serde_json::Value| {
-            let value = parsed
-                .get(&dir.join(name))
-                .ok_or_else(|| unusable(format!("{name} is missing")))?;
-            draft7_well_formed(value, &checks)
-                .map_err(|e| unusable(format!("{name} is not a well-formed schema: {e}")))?;
-            match texts
-                .get(&dir.join(name))
-                .map(|t| inexact_number(t, &checks))
-            {
-                Some(Ok(Some(number))) => {
-                    return Err(unusable(format!(
-                        "{name} has a number the probe cannot read exactly: {number}"
-                    )));
-                }
-                Some(Err(())) => {
-                    return Err(unusable(format!(
-                        "{name} was not read within the time limit"
-                    )));
-                }
-                _ => {}
-            }
-            let listed = schema_methods(value, sent, &checks)
-                .map_err(|()| unusable(format!("{name} was not read within the time limit")))?
-                .ok_or_else(|| {
-                    unusable(format!(
-                        "{name} does not list its methods in the known form"
-                    ))
-                })?;
-            let open = params_open(value);
-            let empty = serde_json::Map::new();
-            let defs = open
-                .get("definitions")
-                .and_then(serde_json::Value::as_object)
-                .unwrap_or(&empty);
-            let branches = branches_by_method(&open, &checks);
-            Ok::<_, ProbeError>(
-                listed
-                    .into_iter()
-                    .filter(|m| valid(&open, &envelope(m), defs, 0, &work) == Truth::Yes)
-                    .filter(|m| {
-                        // A request also needs an id schema that takes every id the adapter numbers (M1T07R-36).
-                        !name.starts_with("ClientRequest")
-                            || branches.get(m.as_str()).is_some_and(|branch| {
-                                branch["properties"]
-                                    .get("id")
-                                    .is_none_or(|id| takes_every_id(id, defs, 0, &work))
-                            })
-                    })
-                    .collect(),
-            )
-        };
-        // HoH's requests (any id will do here: whether the id schema takes every id is checked apart), its only
-        // notification `initialized` without params, and the server's notifications with `method` and `params`.
-        let request = |m: &str| serde_json::json!({"id": 0, "method": m, "params": {}});
-        Ok(CodexSchema {
-            requests: methods("ClientRequest.json", true, &request)?,
-            client_notifications: methods(
-                "ClientNotification.json",
-                true,
-                &|m: &str| serde_json::json!({"method": m}),
-            )?,
-            notifications: methods(
-                "ServerNotification.json",
-                false,
-                &|m: &str| serde_json::json!({"method": m, "params": {}}),
-            )?,
-            hash: tree_sha256_of(&dir, &files, &checks)
-                .map_err(|e| unusable(format!("hashing the schema output: {e}")))?,
-        })
-    })();
-    // A CLI that filled its output cannot hold the probe past the window, nor keep it: what is not removed by then
-    // is left, and the probe fails saying where, whatever the reading came to (M1T07R-40, -45).
+        // counted before it is read (M1T07R-40, -42).
+        let checks = Work::new(u64::MAX, until).stopped_by(&scratch.given_up);
+        let files = schema_files(&scratch.dir, scratch.owned.as_fd(), &checks).map_err(unusable)?;
+        read_schema(
+            &scratch.dir,
+            &files,
+            &Work::new(VALIDATION_BUDGET, until).stopped_by(&scratch.given_up),
+            &checks,
+        )
+        .map_err(unusable)
+    });
     if scratch.remove() {
         return result;
     }
-    let left = format!("its output is left at {}", dir.display());
-    let generate = || argv(launcher, &["app-server", "generate-json-schema"]);
+    let left = format!("its output is left at {}", scratch.left_at());
     Err(match result {
         Err(ProbeError::Failed { argv, detail }) => ProbeError::Failed {
             argv,
             detail: format!("{detail}; {left}"),
         },
-        Ok(_) => ProbeError::Failed {
-            argv: generate(),
-            detail: format!("the schema output could not be removed; {left}"),
-        },
-        Err(other) => ProbeError::Failed {
-            argv: generate(),
-            detail: format!("{other}; {left}"),
-        },
+        Ok(_) => unusable(format!("the schema output could not be removed; {left}")),
+        Err(other) => unusable(format!("{other}; {left}")),
     })
+}
+
+/// The three protocol schemas of a schema output (`dir`, its files read): the methods each lists in the known form
+/// whose message can be valid, and the tree hash. Every other `.json` file must parse too, and is not kept. Work the
+/// budget or the deadline cut short is a failure, never fewer methods (M1T07R-40).
+fn read_schema(
+    dir: &Path,
+    files: &[(PathBuf, Vec<u8>)],
+    work: &Work,
+    checks: &Work,
+) -> Result<CodexSchema, String> {
+    const PROTOCOL: [&str; 3] = [
+        "ClientRequest.json",
+        "ClientNotification.json",
+        "ServerNotification.json",
+    ];
+    between("parse", dir);
+    let mut parsed = BTreeMap::new();
+    for (file, bytes) in files {
+        if !file.extension().is_some_and(|e| e == "json") {
+            continue;
+        }
+        if !checks.spend(bytes.len()) {
+            return Err(format!(
+                "{} was not read within the time limit",
+                file.display()
+            ));
+        }
+        let not_json = |e: &dyn fmt::Display| format!("{} is not JSON: {e}", file.display());
+        let text = std::str::from_utf8(bytes).map_err(|e| not_json(&e))?;
+        let protocol = file
+            .strip_prefix(dir)
+            .ok()
+            .and_then(|rel| rel.to_str())
+            .filter(|rel| PROTOCOL.contains(rel));
+        match protocol {
+            Some(name) => {
+                if json_values(bytes) > MAX_SCHEMA_VALUES {
+                    return Err(format!(
+                        "{} has more than {MAX_SCHEMA_VALUES} values",
+                        file.display()
+                    ));
+                }
+                let value =
+                    serde_json::from_str::<serde_json::Value>(text).map_err(|e| not_json(&e))?;
+                #[cfg(test)]
+                PARSED.with(|n| n.set(n.get() + 1));
+                parsed.insert(name, (value, text));
+            }
+            None => {
+                serde_json::from_str::<serde::de::IgnoredAny>(text).map_err(|e| not_json(&e))?;
+            }
+        }
+    }
+    // The methods a file lists in the known form whose message can be valid: `envelope` is the message for a method,
+    // checked against the file with the params left to the compat suite (M1T07R-33).
+    // Each file's value is taken, opened in place and dropped once its methods are read, never copied.
+    let mut methods = |name: &str, sent: bool, envelope: &dyn Fn(&str) -> serde_json::Value| {
+        let (mut value, text) = parsed
+            .remove(name)
+            .ok_or_else(|| format!("{name} is missing"))?;
+        draft7_well_formed(&value, checks)
+            .map_err(|e| format!("{name} is not a well-formed schema: {e}"))?;
+        match inexact_number(text, checks) {
+            Ok(Some(number)) => {
+                return Err(format!(
+                    "{name} has a number the probe cannot read exactly: {number}"
+                ));
+            }
+            Err(()) => return Err(format!("{name} was not read within the time limit")),
+            Ok(None) => {}
+        }
+        let listed = schema_methods(&value, sent, checks)
+            .map_err(|()| format!("{name} was not read within the time limit"))?
+            .ok_or_else(|| format!("{name} does not list its methods in the known form"))?;
+        params_open(&mut value);
+        let open = value;
+        let empty = serde_json::Map::new();
+        let defs = open
+            .get("definitions")
+            .and_then(serde_json::Value::as_object)
+            .unwrap_or(&empty);
+        let branches = branches_by_method(&open, checks);
+        Ok::<_, String>(
+            listed
+                .into_iter()
+                .filter(|m| valid(&open, &envelope(m), defs, 0, work) == Truth::Yes)
+                .filter(|m| {
+                    // A request also needs an id schema that takes every id the adapter numbers (M1T07R-36).
+                    !name.starts_with("ClientRequest")
+                        || branches.get(m.as_str()).is_some_and(|branch| {
+                            branch["properties"]
+                                .get("id")
+                                .is_none_or(|id| takes_every_id(id, defs, 0, work))
+                        })
+                })
+                .collect(),
+        )
+    };
+    // HoH's requests (any id will do here: whether the id schema takes every id is checked apart), its only
+    // notification `initialized` without params, and the server's notifications with `method` and `params`.
+    let request = |m: &str| serde_json::json!({"id": 0, "method": m, "params": {}});
+    between("validate", dir);
+    let requests = methods("ClientRequest.json", true, &request)?;
+    let schema = CodexSchema {
+        requests,
+        client_notifications: methods(
+            "ClientNotification.json",
+            true,
+            &|m: &str| serde_json::json!({"method": m}),
+        )?,
+        notifications: methods(
+            "ServerNotification.json",
+            false,
+            &|m: &str| serde_json::json!({"method": m, "params": {}}),
+        )?,
+        hash: {
+            between("hash", dir);
+            tree_sha256_of(dir, files, checks)
+                .map_err(|e| format!("hashing the schema output: {e}"))?
+        },
+    };
+    // A method left out because the work ran out is unknown, not absent: the probe fails (M1T07R-40).
+    if work.ran_out() || checks.ran_out() {
+        return Err("the schema was not read within its time and work limits".to_owned());
+    }
+    Ok(schema)
 }
 
 /// How long removing a probe's scratch directory may run past the reading window.
@@ -1238,13 +1380,82 @@ const CLEANUP_GRACE: Duration = Duration::from_secs(2);
 /// A probe's scratch directory, removed within its window once ([`remove_within`]), at the latest when dropped.
 struct Scratch {
     dir: PathBuf,
+    /// The directory holding `dir`, so `dir`'s own entry is looked at without crossing into a mount (M1T07R-49).
+    parent: std::os::fd::OwnedFd,
     /// The directory the probe made at `dir`.
     owned: std::os::fd::OwnedFd,
+    /// Set when the probe stopped waiting for the reading: nothing more is done to the output (M1T07R-47).
+    given_up: std::sync::Arc<std::sync::atomic::AtomicBool>,
     until: Instant,
     removed: Option<bool>,
 }
 
 impl Scratch {
+    /// A new directory under the system's temporary directory, held open, to be removed by `until` (M1T07R-44).
+    fn new(until: Instant) -> Result<Scratch, ProbeError> {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let name = format!("hoh-probe-{}-{nanos}", std::process::id());
+        let temp = std::env::temp_dir();
+        let parent = rustix::fs::openat(
+            rustix::fs::CWD,
+            &temp,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(io::Error::from)?;
+        rustix::fs::mkdirat(
+            &parent,
+            name.as_str(),
+            rustix::fs::Mode::from_raw_mode(0o700),
+        )
+        .map_err(io::Error::from)?;
+        match open_directory(&parent, name.as_str()) {
+            Ok(owned) => Ok(Scratch {
+                dir: temp.join(name),
+                parent,
+                owned,
+                given_up: Default::default(),
+                until,
+                removed: None,
+            }),
+            Err(e) => {
+                let _ =
+                    rustix::fs::unlinkat(&parent, name.as_str(), rustix::fs::AtFlags::REMOVEDIR);
+                Err(io::Error::from(e).into())
+            }
+        }
+    }
+
+    /// Whether `dir` is still the directory the probe made.
+    fn holds(&self) -> bool {
+        self.dir
+            .file_name()
+            .is_some_and(|name| names(self.parent.as_fd(), name, self.owned.as_fd()))
+    }
+
+    /// Where what was not removed is: its path, or where it was moved, as far as the held directory tells
+    /// (M1T07R-45).
+    fn left_at(&self) -> String {
+        if self.holds() {
+            return self.dir.display().to_string();
+        }
+        let link = format!(
+            "/proc/self/fd/{}",
+            std::os::fd::AsRawFd::as_raw_fd(&self.owned)
+        );
+        match std::fs::read_link(link) {
+            Ok(now) if !now.to_string_lossy().ends_with(" (deleted)") => {
+                format!("{} (moved from {})", now.display(), self.dir.display())
+            }
+            _ => format!("{}, which the CLI replaced", self.dir.display()),
+        }
+    }
+
     /// Remove it, once; true when it is gone.
     fn remove(&mut self) -> bool {
         if let Some(gone) = self.removed {
@@ -1252,8 +1463,9 @@ impl Scratch {
         }
         let gone = remove_within(
             &self.dir,
+            self.parent.as_fd(),
             self.owned.as_fd(),
-            &Work::new(u64::MAX, Some(self.until)),
+            &Work::new(u64::MAX, Some(self.until)).stopped_by(&self.given_up),
         );
         self.removed = Some(gone);
         gone
@@ -1277,11 +1489,70 @@ fn open_directory<Fd: std::os::fd::AsFd, P: rustix::path::Arg>(
     rustix::fs::openat(at, name, flags, Mode::empty())
 }
 
-/// Whether `path` itself, not followed, is the directory `owned` (M1T07R-44).
-fn names(path: &Path, owned: std::os::fd::BorrowedFd<'_>) -> bool {
-    use rustix::fs::{AtFlags, CWD, fstat, statat};
-    match (statat(CWD, path, AtFlags::SYMLINK_NOFOLLOW), fstat(owned)) {
-        (Ok(at), Ok(made)) => at.st_dev == made.st_dev && at.st_ino == made.st_ino,
+/// `name` under `at`, opened without crossing into another file system mounted there; a mount is `EXDEV`
+/// (M1T07R-49). `openat2` with `RESOLVE_NO_XDEV` refuses before the other file system is asked anything, so one that
+/// never answers (a FUSE mount a helper put there) cannot hold the probe; where the kernel has no `openat2`, `openat`
+/// and a check that what was opened is on `at`'s device keep the probe on its own file system, and the bounded wait
+/// in [`codex_schema`] ends a call that does not return.
+fn open_beneath<P: rustix::path::Arg + Copy>(
+    at: std::os::fd::BorrowedFd<'_>,
+    name: P,
+    flags: rustix::fs::OFlags,
+) -> rustix::io::Result<std::os::fd::OwnedFd> {
+    use rustix::fs::{Mode, ResolveFlags, openat2};
+    #[cfg(test)]
+    if name.to_string_lossy() == "hoh-test-mount" {
+        return Err(rustix::io::Errno::XDEV);
+    }
+    match openat2(
+        at,
+        name,
+        flags,
+        Mode::empty(),
+        ResolveFlags::NO_XDEV | ResolveFlags::NO_MAGICLINKS,
+    ) {
+        Err(rustix::io::Errno::NOSYS | rustix::io::Errno::PERM) => open_on_device(at, name, flags),
+        other => other,
+    }
+}
+
+/// `name` under `at` by `openat`, refused (`EXDEV`) when what was opened is on another device than `at`.
+fn open_on_device<P: rustix::path::Arg>(
+    at: std::os::fd::BorrowedFd<'_>,
+    name: P,
+    flags: rustix::fs::OFlags,
+) -> rustix::io::Result<std::os::fd::OwnedFd> {
+    let fd = rustix::fs::openat(at, name, flags, rustix::fs::Mode::empty())?;
+    if rustix::fs::fstat(&fd)?.st_dev != rustix::fs::fstat(at)?.st_dev {
+        return Err(rustix::io::Errno::XDEV);
+    }
+    Ok(fd)
+}
+
+/// `name` under `parent` itself, as a path: not followed, and not crossing into a mount there (M1T07R-49).
+fn open_path(
+    parent: std::os::fd::BorrowedFd<'_>,
+    name: &OsStr,
+) -> rustix::io::Result<std::os::fd::OwnedFd> {
+    use rustix::fs::OFlags;
+    open_beneath(
+        parent,
+        name,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+    )
+}
+
+/// Whether `name` under `parent`, not followed, is the directory `owned` (M1T07R-44, -49).
+fn names(
+    parent: std::os::fd::BorrowedFd<'_>,
+    name: &OsStr,
+    owned: std::os::fd::BorrowedFd<'_>,
+) -> bool {
+    use rustix::fs::fstat;
+    match (open_path(parent, name), fstat(owned)) {
+        (Ok(at), Ok(made)) => {
+            fstat(&at).is_ok_and(|at| at.st_dev == made.st_dev && at.st_ino == made.st_ino)
+        }
         _ => false,
     }
 }
@@ -1299,7 +1570,7 @@ fn schema_files(
     owned: std::os::fd::BorrowedFd<'_>,
     work: &Work,
 ) -> Result<Vec<(PathBuf, Vec<u8>)>, String> {
-    use rustix::fs::{Dir, Mode, OFlags, openat};
+    use rustix::fs::{Dir, OFlags};
     let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
     let failed = |path: &Path, e: &dyn fmt::Display| format!("{}: {e}", path.display());
     between("walk", root);
@@ -1329,11 +1600,16 @@ fn schema_files(
         let path = at.join(OsStr::from_bytes(name.to_bytes()));
         between("entry", &path);
         // What is judged is what is read: the entry as opened, not as listed.
-        let fd = reader
-            .fd()
-            .and_then(|at| openat(at, name, flags, Mode::empty()));
+        let fd = reader.fd().and_then(|at| open_beneath(at, name, flags));
         let file = match fd {
             Ok(fd) => std::fs::File::from(fd),
+            // Another file system mounted in the output is not the CLI's output, and is not entered (M1T07R-49).
+            Err(rustix::io::Errno::XDEV) => {
+                return Err(format!(
+                    "{} is a mount point; the probe reads no other file system",
+                    path.display()
+                ));
+            }
             // A link, a socket, or an entry removed meanwhile.
             Err(rustix::io::Errno::LOOP | rustix::io::Errno::NXIO | rustix::io::Errno::NOENT) => {
                 continue;
@@ -1351,6 +1627,14 @@ fn schema_files(
             let dir = Dir::new(std::os::fd::OwnedFd::from(file)).map_err(|e| failed(&path, &e))?;
             stack.push((dir, path));
         } else if meta.is_file() {
+            // Another link can be a file outside the output: such a file is not read (M1T07R-46).
+            if std::os::unix::fs::MetadataExt::nlink(&meta) > 1 {
+                return Err(format!(
+                    "{} has {} links; a file of the output has one",
+                    path.display(),
+                    std::os::unix::fs::MetadataExt::nlink(&meta)
+                ));
+            }
             let room = MAX_SCHEMA_FILE.min(MAX_SCHEMA_TOTAL - total);
             if meta.len() > room {
                 return Err(format!(
@@ -1392,8 +1676,15 @@ fn read_bounded(file: impl Read, room: u64) -> io::Result<Option<Vec<u8>>> {
 /// what it holds is removed relative to it, so an entry a helper the CLI left running replaces by a link is removed
 /// itself, never followed; what is nested deeper than [`MAX_SCHEMA_DEPTH`] is left. `dir` is removed only while it
 /// names `owned`; a link put in its place is removed itself, and another directory put there is left.
-fn remove_within(dir: &Path, owned: std::os::fd::BorrowedFd<'_>, work: &Work) -> bool {
-    use rustix::fs::{AtFlags, CWD, Dir, fstat, unlinkat};
+fn remove_within(
+    dir: &Path,
+    parent: std::os::fd::BorrowedFd<'_>,
+    owned: std::os::fd::BorrowedFd<'_>,
+    work: &Work,
+) -> bool {
+    use rustix::fs::{AtFlags, Dir, FileType, OFlags, fstat, unlinkat};
+    let dir_flags =
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
     let Ok(top) = Dir::read_from(owned) else {
         return false;
     };
@@ -1428,20 +1719,33 @@ fn remove_within(dir: &Path, owned: std::os::fd::BorrowedFd<'_>, work: &Work) ->
         let Ok(at) = reader.fd() else {
             return false;
         };
-        match open_directory(at, name).and_then(Dir::new) {
+        match open_beneath(at, name, dir_flags).and_then(Dir::new) {
             Ok(child) if within => stack.push((child, path)),
             Ok(_) => {}
+            // A mount point is left, and nothing in it is touched (M1T07R-49).
+            Err(rustix::io::Errno::XDEV) => {}
             Err(_) => {
                 let _ = unlinkat(at, name, AtFlags::empty());
             }
         }
     }
-    if names(dir, owned) {
-        let _ = unlinkat(CWD, dir, AtFlags::REMOVEDIR);
-    } else if std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()) {
-        let _ = unlinkat(CWD, dir, AtFlags::empty());
+    let Some(name) = dir.file_name() else {
+        return false;
+    };
+    // What is at `dir` now, looked at without following it or crossing into a mount: `None` for nothing.
+    let at_dir = || match open_path(parent, name) {
+        Err(rustix::io::Errno::NOENT) => None,
+        Ok(fd) => {
+            Some(fstat(&fd).is_ok_and(|s| FileType::from_raw_mode(s.st_mode) == FileType::Symlink))
+        }
+        Err(_) => Some(false),
+    };
+    if names(parent, name, owned) {
+        let _ = unlinkat(parent, name, AtFlags::REMOVEDIR);
+    } else if at_dir() == Some(true) {
+        let _ = unlinkat(parent, name, AtFlags::empty());
     }
-    fstat(owned).is_ok_and(|made| made.st_nlink == 0) && std::fs::symlink_metadata(dir).is_err()
+    fstat(owned).is_ok_and(|made| made.st_nlink == 0) && at_dir().is_none()
 }
 
 /// Claude Code: `-p --output-format stream-json`; partial messages and resume from `--help`.
@@ -1883,71 +2187,140 @@ fn capture(
             other => break other.map_err(|e| failed(format!("cannot start: {e}")))?,
         }
     };
-    // Each output is read up to its limit; past it the reader stops, closing its end (M1T07R-44).
-    let (tx, rx) = mpsc::channel();
-    if let Some(stdout) = child.stdout.take() {
-        std::thread::spawn(move || {
-            let _ = tx.send(read_bounded(stdout, MAX_OUTPUT));
-        });
-    }
-    let (etx, erx) = mpsc::channel();
-    if let Some(stderr) = child.stderr.take() {
-        std::thread::spawn(move || {
-            let _ = etx.send(read_bounded(stderr, MAX_OUTPUT));
-        });
-    } else {
-        let _ = etx.send(Ok(Some(Vec::new())));
-    }
+    // Both outputs are read here, between looks at the command, up to their limit and the end: nothing reads them
+    // once the probe returns, so a helper that left the group and holds a pipe open keeps nothing of it (M1T07R-44,
+    // -47).
+    let mut outputs = [
+        Output::new(child.stdout.take().map(std::os::fd::OwnedFd::from))?,
+        Output::new(child.stderr.take().map(std::os::fd::OwnedFd::from))?,
+    ];
     let timed_out = || ProbeError::TimedOut {
         argv: argv(program, args),
         after: limit,
         cut_by_deadline: limit < env.timeout,
     };
-    let deadline = end;
     let pid = Pid::from_child(&child);
     let exited = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG;
+    let mut status = None;
     loop {
-        // Observe the exit without reaping: while the leader is a zombie its process group id cannot be reused.
-        if waitid(WaitId::Pid(pid), exited)
-            .map_err(io::Error::from)?
-            .is_some()
-        {
+        if status.is_some() && outputs.iter().all(|o| o.file.is_none()) {
             break;
         }
-        if Instant::now() >= deadline {
-            let _ = kill_process_group(pid, Signal::KILL);
-            let _ = child.wait();
+        let now = Instant::now();
+        if now >= end {
+            // Output still open at the end is a timeout too, and what comes later is not taken (M1T07R-13). The
+            // group is not signalled again once the leader is reaped: its id may since belong to another process.
+            if status.is_none() {
+                let _ = kill_process_group(pid, Signal::KILL);
+                let _ = child.wait();
+            }
             return Err(timed_out());
         }
-        std::thread::sleep(Duration::from_millis(10));
+        let wait = end
+            .saturating_duration_since(now)
+            .min(Duration::from_millis(10));
+        wait_for_output(&outputs, wait)?;
+        for output in &mut outputs {
+            output
+                .drain()
+                .map_err(|e| failed(format!("reading output: {e}")))?;
+        }
+        // Observe the exit without reaping: while the leader is a zombie its process group id cannot be reused.
+        if status.is_none()
+            && waitid(WaitId::Pid(pid), exited)
+                .map_err(io::Error::from)?
+                .is_some()
+        {
+            // Whatever the command left running in its group goes with it (M1T01R-03), then the leader is reaped.
+            let _ = kill_process_group(pid, Signal::KILL);
+            status = Some(child.wait()?);
+        }
     }
-    // Whatever the command left running in its group goes with it (M1T01R-03), then the leader is reaped.
-    let _ = kill_process_group(pid, Signal::KILL);
-    let status = child.wait()?;
-    // A descendant that left the group and keeps a pipe open must not stall the probe either. Both reads end at the
-    // same absolute end as the wait above, each waiting only for what is left of it, so the two never add up past the
-    // limit; output still open then is a timeout and what comes later is not taken (M1T07R-13). The group is not
-    // signalled again: it was killed before the leader was reaped, and its id may since belong to another process.
-    let read = |rx: mpsc::Receiver<io::Result<Option<Vec<u8>>>>| match rx
-        .recv_timeout(end.saturating_duration_since(Instant::now()))
-    {
-        Ok(Ok(Some(bytes))) => Ok(bytes),
-        Ok(Ok(None)) => Err(failed(format!(
-            "more output than the probe reads ({MAX_OUTPUT} bytes)"
-        ))),
-        Ok(Err(e)) => Err(failed(format!("reading output: {e}"))),
-        Err(mpsc::RecvTimeoutError::Timeout) => Err(timed_out()),
-        Err(mpsc::RecvTimeoutError::Disconnected) => Err(failed(
-            "the output reader ended without a result".to_owned(),
-        )),
+    let Some(status) = status else {
+        return Err(timed_out());
     };
-    let stdout = read(rx)?;
-    let stderr = read(erx)?;
+    if outputs.iter().any(|o| o.over) {
+        return Err(failed(format!(
+            "more output than the probe reads ({MAX_OUTPUT} bytes)"
+        )));
+    }
+    let [stdout, stderr] = outputs.map(|o| o.bytes);
     Ok(Captured {
         status,
         stdout,
         stderr,
     })
+}
+
+/// One output of a probe command, read without blocking up to [`MAX_OUTPUT`].
+struct Output {
+    /// `None` once it ended, went past the limit, or was not asked for.
+    file: Option<std::fs::File>,
+    bytes: Vec<u8>,
+    /// More than [`MAX_OUTPUT`] bytes came.
+    over: bool,
+}
+
+impl Output {
+    fn new(fd: Option<std::os::fd::OwnedFd>) -> io::Result<Output> {
+        if let Some(fd) = &fd {
+            rustix::io::ioctl_fionbio(fd, true)?;
+        }
+        Ok(Output {
+            file: fd.map(std::fs::File::from),
+            bytes: Vec::new(),
+            over: false,
+        })
+    }
+
+    /// Take what is there; at its end or past the limit it is closed.
+    fn drain(&mut self) -> io::Result<()> {
+        let Some(file) = self.file.as_mut() else {
+            return Ok(());
+        };
+        let mut buf = [0u8; 1 << 16];
+        loop {
+            match file.read(&mut buf) {
+                Ok(0) => {
+                    self.file = None;
+                    return Ok(());
+                }
+                Ok(n) => {
+                    self.bytes.extend_from_slice(&buf[..n]);
+                    if u64::try_from(self.bytes.len()).unwrap_or(u64::MAX) > MAX_OUTPUT {
+                        self.over = true;
+                        self.file = None;
+                        return Ok(());
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+/// Wait at most `wait` for output on any open one.
+fn wait_for_output(outputs: &[Output], wait: Duration) -> io::Result<()> {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    let mut fds: Vec<PollFd<'_>> = outputs
+        .iter()
+        .filter_map(|o| o.file.as_ref())
+        .map(|file| PollFd::new(file, PollFlags::IN))
+        .collect();
+    if fds.is_empty() {
+        std::thread::sleep(wait);
+        return Ok(());
+    }
+    let timeout = Timespec {
+        tv_sec: i64::try_from(wait.as_secs()).unwrap_or(i64::MAX),
+        tv_nsec: i64::from(wait.subsec_nanos()),
+    };
+    match poll(&mut fds, Some(&timeout)) {
+        Ok(_) | Err(rustix::io::Errno::INTR) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 #[cfg(test)]
@@ -1964,9 +2337,14 @@ mod tests {
         schema_files(root, held(root).as_fd(), work)
     }
 
+    /// The directory holding `dir`.
+    fn parent_of(dir: &Path) -> std::os::fd::OwnedFd {
+        open_directory(rustix::fs::CWD, dir.parent().expect("a parent")).expect("open the parent")
+    }
+
     /// [`remove_within`] of `dir` as the probe made it.
     fn remove(dir: &Path, work: &Work) -> bool {
-        remove_within(dir, held(dir).as_fd(), work)
+        remove_within(dir, parent_of(dir).as_fd(), held(dir).as_fd(), work)
     }
 
     #[test]
@@ -2386,7 +2764,8 @@ mod tests {
                 "{name}"
             );
             let value: serde_json::Value = serde_json::from_str(&text)?;
-            let open = params_open(&value);
+            let mut open = value.clone();
+            params_open(&mut open);
             let defs = open["definitions"].as_object().cloned().unwrap_or_default();
             for method in schema_methods(&value, sent, &Work::new(u64::MAX, None))
                 .map_err(|()| "out of time")?
@@ -2580,8 +2959,15 @@ mod tests {
                     std::fs::rename(&other, &dir)?;
                 }
             }
-            assert!(!names(&dir, owned.as_fd()), "{case}");
-            let gone = remove_within(&dir, owned.as_fd(), &Work::new(u64::MAX, None));
+            let parent = parent_of(&dir);
+            let name = dir.file_name().ok_or("a name")?;
+            assert!(!names(parent.as_fd(), name, owned.as_fd()), "{case}");
+            let gone = remove_within(
+                &dir,
+                parent.as_fd(),
+                owned.as_fd(),
+                &Work::new(u64::MAX, None),
+            );
             if case == "linked" {
                 assert!(gone, "{case}");
                 assert!(
@@ -2656,7 +3042,9 @@ mod tests {
         std::fs::write(dir.join("v2/a.json"), "{}")?;
         let panicked = std::panic::catch_unwind(|| {
             let _scratch = Scratch {
+                parent: parent_of(&dir),
                 owned: held(&dir),
+                given_up: Default::default(),
                 dir: dir.clone(),
                 until: Instant::now() + Duration::from_secs(60),
                 removed: None,
@@ -2687,17 +3075,21 @@ mod tests {
                 dir.join("v2")
             };
             let (to, owned) = (outside.clone(), held(&dir));
+            let swaps = std::rc::Rc::new(std::cell::Cell::new(0));
+            let counted = swaps.clone();
             BETWEEN.with(|hook| {
                 *hook.borrow_mut() = Some(Box::new(move |at: &str, path: &Path| {
                     if at == moment && path == swapped {
                         std::fs::remove_dir_all(path).expect("remove the directory");
                         std::os::unix::fs::symlink(&to, path).expect("link it elsewhere");
+                        counted.set(counted.get() + 1);
                     }
                 }));
             });
             if moment == "remove" {
                 assert!(remove_within(
                     &dir,
+                    parent_of(&dir).as_fd(),
                     owned.as_fd(),
                     &Work::new(u64::MAX, None)
                 ));
@@ -2706,11 +3098,34 @@ mod tests {
                 assert!(listed.is_empty(), "{moment}: {listed:?}");
             }
             BETWEEN.with(|hook| *hook.borrow_mut() = None);
+            // The entry was replaced where the test means it to be, once (M1T07R-48).
+            assert_eq!(swaps.get(), 1, "{moment}: replaced");
             assert!(
                 outside.join("kept.json").exists(),
                 "{moment}: removed outside"
             );
         }
+        Ok(())
+    }
+
+    /// A file with another link, which can be a file outside the output, refuses the output unread (M1T07R-46).
+    #[test]
+    fn a_file_linked_from_elsewhere_refuses_the_output() -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let outside = root.path().join("keep.txt");
+        std::fs::write(&outside, "kept")?;
+        let dir = root.path().join("out");
+        std::fs::create_dir(&dir)?;
+        std::fs::write(dir.join("a.json"), "{}")?;
+        assert!(walk(&dir, &Work::new(u64::MAX, None)).is_ok());
+        std::fs::hard_link(&outside, dir.join("borrowed.bin"))?;
+        let listed = walk(&dir, &Work::new(u64::MAX, None));
+        assert!(
+            listed
+                .as_ref()
+                .is_err_and(|e| e.contains("borrowed.bin") && e.contains("link")),
+            "{listed:?}"
+        );
         Ok(())
     }
 
@@ -2731,11 +3146,14 @@ mod tests {
             let (to, done) = (outside.clone(), std::sync::mpsc::channel());
             std::thread::spawn(move || {
                 let target = file.clone();
+                let changes = std::rc::Rc::new(std::cell::Cell::new(0));
+                let counted = changes.clone();
                 BETWEEN.with(|hook| {
                     *hook.borrow_mut() = Some(Box::new(move |at: &str, path: &Path| {
                         if at != moment || path != target {
                             return;
                         }
+                        counted.set(counted.get() + 1);
                         match change {
                             "link" => {
                                 std::fs::remove_file(path).expect("remove the file");
@@ -2767,9 +3185,11 @@ mod tests {
                 });
                 let listed = walk(&dir, &Work::new(u64::MAX, None))
                     .map(|files| files.into_iter().map(|(path, _)| path).collect::<Vec<_>>());
-                let _ = done.0.send(listed);
+                let _ = done.0.send((listed, changes.get()));
             });
-            let listed = done.1.recv_timeout(Duration::from_secs(10))?;
+            let (listed, changes) = done.1.recv_timeout(Duration::from_secs(10))?;
+            // The file was changed where the test means it to be, once (M1T07R-48).
+            assert_eq!(changes, 1, "{change}: changed");
             match change {
                 "grow" => assert!(
                     listed
@@ -2818,6 +3238,320 @@ mod tests {
             assert_eq!(remove(&dir, &Work::new(u64::MAX, None)), within, "{depth}");
             assert_eq!(dir.exists(), !within, "{depth}");
         }
+        Ok(())
+    }
+
+    /// The recorded schema read whole gives its 192 methods with only the three protocol files parsed into values;
+    /// cut short by the budget or the deadline, the reading fails instead of reporting fewer methods (M1T07R-40).
+    #[test]
+    fn a_reading_cut_short_fails_instead_of_dropping_methods()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/protocol/codex/0.166.0/app-server-schema");
+        let files = walk(&root, &Work::new(u64::MAX, None))?;
+        PARSED.with(|n| n.set(0));
+        let whole = read_schema(
+            &root,
+            &files,
+            &Work::new(VALIDATION_BUDGET, None),
+            &Work::new(u64::MAX, None),
+        )?;
+        assert_eq!(PARSED.with(std::cell::Cell::get), 3);
+        assert_eq!(
+            whole.requests.len() + whole.client_notifications.len() + whole.notifications.len(),
+            192
+        );
+        let past = Some(Instant::now() - Duration::from_secs(1));
+        for (name, work) in [
+            ("budget", Work::new(1_000, None)),
+            ("deadline", Work::new(VALIDATION_BUDGET, past)),
+        ] {
+            let cut = read_schema(&root, &files, &work, &Work::new(u64::MAX, None));
+            assert!(
+                cut.as_ref().is_err_and(|e| e.contains("work limits")),
+                "{name}: {:?}",
+                cut.map(|s| s.requests.len())
+            );
+        }
+        Ok(())
+    }
+
+    /// A protocol file that would parse into more than [`MAX_SCHEMA_VALUES`] values is refused before it is parsed;
+    /// brackets, commas and colons inside strings are not values (M1T07R-50).
+    #[test]
+    fn a_protocol_file_past_its_value_limit_is_refused_unparsed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(json_values(br#"{"a":"[,{\"}:"}"#), 3);
+        assert_eq!(json_values(b"[]"), 2);
+        let recorded = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/protocol/codex/0.166.0/app-server-schema");
+        let root = tempfile::tempdir()?;
+        for name in [
+            "ClientRequest.json",
+            "ClientNotification.json",
+            "ServerNotification.json",
+        ] {
+            std::fs::copy(recorded.join(name), root.path().join(name))?;
+        }
+        let mut requests: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.path().join("ClientRequest.json"))?)?;
+        requests["definitions"]["Pad"] = serde_json::Value::Array(
+            (0..MAX_SCHEMA_VALUES / 3)
+                .map(|_| serde_json::json!({"": 0}))
+                .collect(),
+        );
+        std::fs::write(
+            root.path().join("ClientRequest.json"),
+            serde_json::to_vec(&requests)?,
+        )?;
+        let files = walk(root.path(), &Work::new(u64::MAX, None))?;
+        PARSED.with(|n| n.set(0));
+        let read = read_schema(
+            root.path(),
+            &files,
+            &Work::new(VALIDATION_BUDGET, None),
+            &Work::new(u64::MAX, None),
+        );
+        assert!(
+            read.as_ref().is_err_and(|e| e.contains("values")),
+            "{:?}",
+            read.map(|s| s.requests.len())
+        );
+        // Only ClientNotification.json, which comes before it, was parsed.
+        assert_eq!(PARSED.with(std::cell::Cell::get), 1);
+        Ok(())
+    }
+
+    /// A mount point is not crossed: `openat2` refuses it, and so does the fallback by device (M1T07R-49). `/dev/shm`
+    /// is a mount point on Linux; `/dev/null` is on `/dev`'s own file system. Opened as paths, neither is opened.
+    #[test]
+    fn a_mount_point_is_not_crossed() -> Result<(), Box<dyn std::error::Error>> {
+        use rustix::fs::OFlags;
+        let mounts = std::fs::read_to_string("/proc/self/mountinfo")?;
+        assert!(
+            mounts
+                .lines()
+                .any(|l| l.split(' ').nth(4) == Some("/dev/shm")),
+            "/dev/shm is not a mount point here"
+        );
+        let dev = open_directory(rustix::fs::CWD, "/dev")?;
+        let flags = OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        assert_eq!(
+            open_beneath(dev.as_fd(), "shm", flags).err(),
+            Some(rustix::io::Errno::XDEV)
+        );
+        assert_eq!(
+            open_on_device(dev.as_fd(), "shm", flags).err(),
+            Some(rustix::io::Errno::XDEV)
+        );
+        assert!(open_beneath(dev.as_fd(), "null", flags).is_ok());
+        assert!(open_on_device(dev.as_fd(), "null", flags).is_ok());
+        Ok(())
+    }
+
+    /// Another file system in the output refuses it unread and is left whole when the output is removed; one mounted
+    /// over the output directory itself is not taken for it, and is left (M1T07R-49). `hoh-test-mount` stands for a
+    /// mount point ([`open_beneath`] answers `EXDEV` for it in tests).
+    #[test]
+    fn a_mount_in_or_over_the_output_is_refused_and_left() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let root = tempfile::tempdir()?;
+        let dir = root.path().join("out");
+        std::fs::create_dir_all(dir.join("v2"))?;
+        std::fs::write(dir.join("v2/a.json"), "{}")?;
+        std::fs::create_dir(dir.join("hoh-test-mount"))?;
+        std::fs::write(dir.join("hoh-test-mount/inside.json"), "{}")?;
+        let listed = walk(&dir, &Work::new(u64::MAX, None));
+        assert!(
+            listed.as_ref().is_err_and(|e| e.contains("mount point")),
+            "{listed:?}"
+        );
+        assert!(!remove(&dir, &Work::new(u64::MAX, None)));
+        assert!(dir.join("hoh-test-mount/inside.json").exists());
+        assert!(!dir.join("v2").exists());
+        let over = root.path().join("hoh-test-mount");
+        std::fs::create_dir(&over)?;
+        std::fs::write(over.join("inside.json"), "{}")?;
+        let (parent, owned) = (parent_of(&over), held(&over));
+        assert!(!names(
+            parent.as_fd(),
+            OsStr::new("hoh-test-mount"),
+            owned.as_fd()
+        ));
+        assert!(!remove_within(
+            &over,
+            parent.as_fd(),
+            owned.as_fd(),
+            &Work::new(u64::MAX, None)
+        ));
+        assert!(over.exists());
+        Ok(())
+    }
+
+    const LIFECYCLE: &str = "HOH_TEST_SCHEMA_LIFECYCLE";
+
+    /// Giving up on the schema reading and the reading's end are told apart (M1T07R-40, -47): run in a process of
+    /// its own so its threads and file descriptors can be counted.
+    #[test]
+    fn a_reading_given_up_stops_and_lets_everything_go() -> Result<(), Box<dyn std::error::Error>> {
+        let out = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "probe::tests::reading_given_up_child",
+                "--exact",
+                "--ignored",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(LIFECYCLE, "1")
+            .output()?;
+        assert!(
+            out.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(())
+    }
+
+    /// Whatever part of the reading stalls (as a call that does not return would), each probe returns within its
+    /// window, the cleanup grace and the margin; while stalled, each reading given up holds one thread and a bounded
+    /// number of file descriptors; released, it does nothing more to the output past the step in progress, and lets
+    /// every thread and file descriptor go; a second round leaves no more than the first; and a reading that ends in
+    /// time has let everything go when the probe returns.
+    #[test]
+    #[ignore = "run by a_reading_given_up_stops_and_lets_everything_go in a process of its own"]
+    fn reading_given_up_child() -> Result<(), Box<dyn std::error::Error>> {
+        if std::env::var_os(LIFECYCLE).is_none() {
+            return Ok(());
+        }
+        let count = |dir: &str| std::fs::read_dir(dir).map(|d| d.count()).unwrap_or(0);
+        let listing = |dir: &Path| -> std::collections::BTreeSet<PathBuf> {
+            let mut seen = std::collections::BTreeSet::new();
+            let mut stack = vec![dir.to_path_buf()];
+            while let Some(d) = stack.pop() {
+                for entry in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                    if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                        stack.push(entry.path());
+                    }
+                    seen.insert(entry.path());
+                }
+            }
+            seen
+        };
+        let tmp = tempfile::tempdir()?;
+        let schema = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/protocol/codex/0.166.0/app-server-schema");
+        let moments = [
+            "walk", "entry", "read", "parse", "validate", "hash", "remove",
+        ];
+        for moment in moments {
+            let launcher = tmp.path().join(format!("codex-{moment}"));
+            std::fs::write(
+                &launcher,
+                format!(
+                    "#!/bin/sh\n[ \"$1\" = app-server ] && [ \"$2\" = generate-json-schema ] && [ \"$3\" = --out ] \
+                     && cp -R '{}/.' \"$4/\" && touch \"$4/hoh-test-stall-{moment}\"\n",
+                    schema.display()
+                ),
+            )?;
+            std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))?;
+        }
+        let env = ProbeEnv {
+            path: std::env::var_os("PATH").unwrap_or_default(),
+            fixture_root: None,
+            // Room for the commands under load: the bound below is measured from this window.
+            timeout: Duration::from_secs(3),
+            log: None,
+            deadline: None,
+        };
+        let baseline = (count("/proc/self/fd"), count("/proc/self/task"));
+        for round in 0..2 {
+            RELEASE.store(false, std::sync::atomic::Ordering::SeqCst);
+            let callers: Vec<_> = moments
+                .iter()
+                .map(|moment| {
+                    let (launcher, env) = (tmp.path().join(format!("codex-{moment}")), env.clone());
+                    std::thread::spawn(move || {
+                        let started = Instant::now();
+                        let result = codex_schema(&launcher, &env);
+                        (started.elapsed(), result)
+                    })
+                })
+                .collect();
+            let mut left = Vec::new();
+            for (moment, caller) in moments.iter().zip(callers) {
+                let (took, result) = caller.join().map_err(|_| "a caller panicked")?;
+                // On time: the window, the cleanup grace, the margin, and a little for the commands.
+                assert!(
+                    took < env.timeout + CLEANUP_GRACE + READER_MARGIN + Duration::from_millis(700),
+                    "{round} {moment}: returned after {took:?}"
+                );
+                let detail = match result {
+                    Err(ProbeError::Failed { detail, .. }) => detail,
+                    other => return Err(format!("{round} {moment}: {other:?}").into()),
+                };
+                let at = detail
+                    .split("may be left at ")
+                    .nth(1)
+                    .ok_or_else(|| format!("{round} {moment}: {detail}"))?;
+                let dir = PathBuf::from(at);
+                left.push((moment, listing(&dir), dir));
+            }
+            // Stalled: one thread each, and at most the walk's directories, a file, the scratch and its parent.
+            let (fds, threads) = (count("/proc/self/fd"), count("/proc/self/task"));
+            assert!(
+                threads <= baseline.1 + moments.len(),
+                "{round}: {threads} threads"
+            );
+            assert!(
+                fds <= baseline.0 + moments.len() * (MAX_SCHEMA_DEPTH + 4),
+                "{round}: {fds} file descriptors"
+            );
+            RELEASE.store(true, std::sync::atomic::Ordering::SeqCst);
+            let released = Instant::now();
+            while count("/proc/self/task") > baseline.1
+                && released.elapsed() < Duration::from_secs(10)
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(
+                (count("/proc/self/fd"), count("/proc/self/task")),
+                baseline,
+                "{round}: file descriptors and threads after the readings ended"
+            );
+            for (moment, before, dir) in left {
+                let after = listing(&dir);
+                // Nothing came, and nothing went but the entry whose removal was in progress.
+                assert!(after.is_subset(&before), "{round} {moment}: something came");
+                let gone: Vec<_> = before.difference(&after).collect();
+                let stalled = dir.join(format!("hoh-test-stall-{moment}"));
+                assert!(
+                    gone.is_empty() || (*moment == "remove" && gone == [&stalled]),
+                    "{round} {moment}: removed after the probe returned: {gone:?}"
+                );
+                std::fs::remove_dir_all(&dir)?;
+            }
+        }
+        let plain = tmp.path().join("codex-plain");
+        std::fs::write(
+            &plain,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = app-server ] && [ \"$2\" = generate-json-schema ] && [ \"$3\" = --out ] \
+                 && cp -R '{}/.' \"$4/\"\n",
+                schema.display()
+            ),
+        )?;
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o755))?;
+        let read = codex_schema(&plain, &env)?;
+        assert_eq!(
+            read.requests.len() + read.client_notifications.len() + read.notifications.len(),
+            192
+        );
+        assert_eq!(
+            (count("/proc/self/fd"), count("/proc/self/task")),
+            baseline,
+            "file descriptors and threads as a reading in time returns"
+        );
         Ok(())
     }
 
