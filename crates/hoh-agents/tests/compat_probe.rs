@@ -1455,13 +1455,22 @@ fn a_long_definition_name_refuses_the_file_at_once() -> R {
 }
 
 /// The schema output is bounded before it is read: a file over 16 MiB, more than 64 MiB in all, or more than 4096
-/// files is refused before parsing, so parsing and hashing it are bounded too (M1T07R-40, round 13). The recorded
+/// entries (files or directories) is refused before parsing, so walking, parsing and hashing it are bounded too
+/// (M1T07R-40, rounds 13 and 14). The recorded
 /// 0.166.0 output is 321 files, 3.7 MB, the largest 750 KB.
 #[test]
 fn schema_output_beyond_its_size_limits_is_refused_before_it_is_read() -> R {
     let tmp = tempfile::tempdir()?;
     let f = fixtures().join("codex/0.166.0");
-    for group in ["big-file", "many-files"] {
+    // Directories count as entries too, whether or not doctor shares a deadline (M1T07R-40, round 14); and the
+    // total counts across files each within the file limit (M1T07R-43).
+    for (group, shared) in [
+        ("big-file", false),
+        ("many-files", false),
+        ("many-dirs", false),
+        ("many-dirs-shared", true),
+        ("big-total", false),
+    ] {
         let schema = tmp.path().join(group);
         std::fs::create_dir(&schema)?;
         let copied = std::process::Command::new("cp")
@@ -1481,11 +1490,26 @@ fn schema_output_beyond_its_size_limits_is_refused_before_it_is_read() -> R {
                     serde_json::to_vec(&value)?,
                 )?;
             }
-            _ => {
+            "many-files" => {
                 let extra = schema.join("extra");
                 std::fs::create_dir(&extra)?;
                 for n in 0..4096 {
                     std::fs::write(extra.join(format!("{n}.json")), "{}")?;
+                }
+            }
+            "big-total" => {
+                let extra = schema.join("extra");
+                std::fs::create_dir(&extra)?;
+                let text = format!("{{\"d\": \"{}\"}}", "x".repeat(14 * 1024 * 1024));
+                for n in 0..5 {
+                    std::fs::write(extra.join(format!("{n}.json")), &text)?;
+                }
+            }
+            _ => {
+                let extra = schema.join("extra");
+                std::fs::create_dir(&extra)?;
+                for n in 0..20_000 {
+                    std::fs::create_dir(extra.join(format!("{n}")))?;
                 }
             }
         }
@@ -1498,7 +1522,18 @@ fn schema_output_beyond_its_size_limits_is_refused_before_it_is_read() -> R {
             s = schema.display()
         );
         let (dir, _) = fake(tmp.path(), &format!("{group}-bin"), "codex", &script)?;
-        match probe(Agent::Codex, &env_for(&dir)) {
+        let mut env = env_for(&dir);
+        if shared {
+            env.deadline = Some(std::time::Instant::now() + Duration::from_secs(20));
+        }
+        let started = std::time::Instant::now();
+        let result = probe(Agent::Codex, &env);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{group}: {:?}",
+            started.elapsed()
+        );
+        match result {
             Err(ProbeError::Failed { detail, .. }) => {
                 assert!(
                     detail.contains("too large") || detail.contains("too many"),
