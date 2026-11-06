@@ -1198,6 +1198,120 @@ fn an_uninterpreted_constraint_on_methods_refuses_the_schema() -> R {
     Ok(())
 }
 
+/// A method counts only if the message for it can be valid: the envelope HoH sends (`id` as a plain turn numbers it,
+/// `method`, and no other field), or the server's (`method`, `params`), checked against its schema file with the
+/// params left to the compat suite. A listed method whose envelope cannot be valid is as absent as an unlisted one: the
+/// App Server is not used, or the gated capability is false (M1T07R-33).
+#[test]
+fn a_method_whose_envelope_cannot_be_valid_is_absent() -> R {
+    use serde_json::json;
+    let tmp = tempfile::tempdir()?;
+    let f = fixtures().join("codex/0.166.0");
+    fn branch<'a>(v: &'a mut serde_json::Value, method: &str) -> &'a mut serde_json::Value {
+        v["oneOf"]
+            .as_array_mut()
+            .and_then(|b| {
+                b.iter_mut()
+                    .find(|b| b["properties"]["method"]["enum"] == json!([method]))
+            })
+            .unwrap_or_else(|| panic!("no {method} branch"))
+    }
+    type Change = fn(&mut serde_json::Value);
+    let cases: [(&str, &str, Change, bool); 7] = [
+        (
+            "id-false",
+            "ClientRequest.json",
+            |v| branch(v, "initialize")["properties"]["id"] = json!(false),
+            false,
+        ),
+        (
+            "ids-strings",
+            "ClientRequest.json",
+            |v| v["definitions"]["RequestId"] = json!({"type": "string"}),
+            false,
+        ),
+        (
+            "ids-from-one",
+            "ClientRequest.json",
+            |v| v["definitions"]["RequestId"] = json!({"type": "integer", "minimum": 1}),
+            false,
+        ),
+        (
+            "required-other",
+            "ClientRequest.json",
+            |v| {
+                branch(v, "turn/start")["required"] = json!(["id", "method", "params", "session"]);
+            },
+            false,
+        ),
+        (
+            "initialized-params",
+            "ClientNotification.json",
+            |v| {
+                branch(v, "initialized")["required"] = json!(["method", "params"]);
+            },
+            false,
+        ),
+        (
+            "completed-impossible",
+            "ServerNotification.json",
+            |v| {
+                let b = branch(v, "turn/completed");
+                b["properties"]["seq"] = json!(false);
+                b["required"] = json!(["method", "params", "seq"]);
+            },
+            false,
+        ),
+        (
+            "steer-impossible",
+            "ClientRequest.json",
+            |v| branch(v, "turn/steer")["properties"]["id"] = json!(false),
+            true,
+        ),
+    ];
+    for (group, file, change, app_server) in cases {
+        let schema = tmp.path().join(group);
+        std::fs::create_dir(&schema)?;
+        let copied = std::process::Command::new("cp")
+            .arg("-R")
+            .arg(f.join("app-server-schema/."))
+            .arg(&schema)
+            .status()?;
+        assert!(copied.success());
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(schema.join(file))?)?;
+        change(&mut value);
+        std::fs::write(schema.join(file), serde_json::to_vec_pretty(&value)?)?;
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n --help) cat '{f}/help.txt';;\n \
+             exec) [ \"$2\" = --help ] && cat '{f}/help-exec.txt';;\n \
+             app-server) case \"$2\" in\n  --help) cat '{f}/help-app-server.txt';;\n  generate-json-schema) [ \"$3\" = --out ] && mkdir -p \"$4\" && cp -R '{s}/.' \"$4/\";;\n  \
+             *) exit 2;;\n esac;;\n *) exit 2;;\nesac\n",
+            f = f.display(),
+            s = schema.display()
+        );
+        let (dir, _) = fake(tmp.path(), &format!("{group}-bin"), "codex", &script)?;
+        let entry = probe(Agent::Codex, &env_for(&dir)).map_err(|e| format!("{group}: {e}"))?;
+        match app_server {
+            false => assert_eq!(entry.transport, Transport::Exec, "{group}"),
+            true => {
+                assert_eq!(entry.transport, Transport::AppServer, "{group}");
+                assert_eq!(
+                    entry.capabilities.get("mid_turn_steer"),
+                    Some(&Some(false)),
+                    "{group}"
+                );
+                assert_eq!(
+                    entry.capabilities.get("resume"),
+                    Some(&Some(true)),
+                    "{group}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Every command a probe runs is written down with its argv, exit code, duration and whether it timed out, in the
 /// order run (REQ-006: doctor lists them).
 #[test]

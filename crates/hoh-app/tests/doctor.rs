@@ -852,6 +852,12 @@ fn live_drives_codex_through_exec_when_its_app_server_lacks_what_a_turn_uses() -
         ("help-app-server.txt", "stdio://", "pipe://"),
         ("help-app-server.txt", "stdio://", "stdio:///socket"),
         ("help-app-server.txt", "stdio://", "stdio://.."),
+        // Listed, but no message for it can be valid (M1T07R-33).
+        (
+            "app-server-schema/ClientRequest.json",
+            "initialize",
+            "id-false",
+        ),
     ] {
         let s = Sandbox::new()?;
         let f = fixtures().join("codex/0.166.0");
@@ -867,8 +873,17 @@ fn live_drives_codex_through_exec_when_its_app_server_lacks_what_a_turn_uses() -
                 .success()
         );
         let text = std::fs::read_to_string(copy.join(file))?;
-        let changed = match method {
-            "stdio://" => text.replace("`stdio://`", other),
+        let changed = match (method, other) {
+            ("stdio://", _) => text.replace("`stdio://`", other),
+            (_, "id-false") => {
+                let mut value: Value = serde_json::from_str(&text)?;
+                for branch in value["oneOf"].as_array_mut().into_iter().flatten() {
+                    if branch["properties"]["method"]["enum"] == serde_json::json!([method]) {
+                        branch["properties"]["id"] = serde_json::json!(false);
+                    }
+                }
+                serde_json::to_string(&value)?
+            }
             _ => {
                 let quoted = format!("\"{method}\"");
                 assert_eq!(
@@ -893,9 +908,9 @@ fn live_drives_codex_through_exec_when_its_app_server_lacks_what_a_turn_uses() -
                  login) echo 'Logged in using ChatGPT' >&2;;\n *) echo \"error: unrecognized subcommand '$1'\" >&2; exit 2;;\nesac\n",
                 f = f.display(),
                 c = copy.display(),
-                schema_command = match other {
-                    "" => format!("[ \"$3\" = --out ] && mkdir -p \"$4\" && cp -R '{}/.' \"$4/\"", schema.display()),
-                    _ => "exit 2".to_owned(),
+                schema_command = match method {
+                    "stdio://" => "exit 2".to_owned(),
+                    _ => format!("[ \"$3\" = --out ] && mkdir -p \"$4\" && cp -R '{}/.' \"$4/\"", schema.display()),
                 }
             ),
         )?;

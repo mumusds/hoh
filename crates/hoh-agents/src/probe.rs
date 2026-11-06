@@ -453,6 +453,106 @@ fn schema_methods(
     Some(methods)
 }
 
+/// A copy of a protocol schema file whose branches accept any `params`: the probe checks a method's envelope, not its
+/// parameters, which the compat suite verifies against recorded traffic (ADR-015 decision 2, M1T07R-33).
+fn params_open(file: &serde_json::Value) -> serde_json::Value {
+    let mut open = file.clone();
+    for branch in open["oneOf"].as_array_mut().into_iter().flatten() {
+        if let Some(params) = branch["properties"].get_mut("params") {
+            *params = serde_json::Value::Bool(true);
+        }
+    }
+    open
+}
+
+/// How deep `$ref`s may nest while validating; deeper is invalid, so a cyclic definition cannot loop.
+const REF_DEPTH: usize = 64;
+
+/// Whether `instance` is valid under `schema`, one of the keyword set [`draft7_well_formed`] accepts (the only schemas
+/// that reach here); `format`, `default`, `title`, `description` are annotations. Every keyword applies, `$ref`'s
+/// siblings too: stricter than draft-07, so what is valid here is valid under it.
+fn valid(
+    schema: &serde_json::Value,
+    instance: &serde_json::Value,
+    defs: &serde_json::Map<String, serde_json::Value>,
+    depth: usize,
+) -> bool {
+    use serde_json::Value;
+    let obj = match schema {
+        Value::Bool(b) => return *b,
+        Value::Object(obj) if depth <= REF_DEPTH => obj,
+        _ => return false,
+    };
+    let sub = |s: &Value, x: &Value| valid(s, x, defs, depth + 1);
+    let is_type = |name: &str| match name {
+        "null" => instance.is_null(),
+        "boolean" => instance.is_boolean(),
+        "object" => instance.is_object(),
+        "array" => instance.is_array(),
+        "number" => instance.is_number(),
+        "integer" => {
+            instance.is_i64()
+                || instance.is_u64()
+                || instance.as_f64().is_some_and(|f| f.fract() == 0.0)
+        }
+        "string" => instance.is_string(),
+        _ => false,
+    };
+    obj.iter().all(|(key, v)| match key.as_str() {
+        "type" => match v {
+            Value::String(name) => is_type(name),
+            Value::Array(names) => names.iter().filter_map(Value::as_str).any(is_type),
+            _ => false,
+        },
+        "enum" => v.as_array().is_some_and(|values| values.contains(instance)),
+        "required" => instance.as_object().is_none_or(|o| {
+            v.as_array().is_some_and(|names| {
+                names
+                    .iter()
+                    .all(|n| n.as_str().is_some_and(|n| o.contains_key(n)))
+            })
+        }),
+        "properties" => instance.as_object().is_none_or(|o| {
+            v.as_object().is_some_and(|props| {
+                props
+                    .iter()
+                    .all(|(n, s)| o.get(n).is_none_or(|x| sub(s, x)))
+            })
+        }),
+        "additionalProperties" => instance.as_object().is_none_or(|o| {
+            let declared = obj.get("properties").and_then(Value::as_object);
+            o.iter()
+                .filter(|(n, _)| !declared.is_some_and(|d| d.contains_key(*n)))
+                .all(|(_, x)| sub(v, x))
+        }),
+        "items" => instance
+            .as_array()
+            .is_none_or(|a| a.iter().all(|x| sub(v, x))),
+        "allOf" => v
+            .as_array()
+            .is_some_and(|l| l.iter().all(|s| sub(s, instance))),
+        "anyOf" => v
+            .as_array()
+            .is_some_and(|l| l.iter().any(|s| sub(s, instance))),
+        "oneOf" => v
+            .as_array()
+            .is_some_and(|l| l.iter().filter(|s| sub(s, instance)).count() == 1),
+        "$ref" => v
+            .as_str()
+            .and_then(|r| r.strip_prefix("#/definitions/"))
+            .and_then(|name| defs.get(name))
+            .is_some_and(|s| sub(s, instance)),
+        "minimum" => instance
+            .as_f64()
+            .is_none_or(|x| v.as_f64().is_some_and(|m| x >= m)),
+        "minLength" => instance
+            .as_str()
+            .is_none_or(|text| v.as_u64().is_some_and(|m| text.chars().count() as u64 >= m)),
+        "format" | "default" | "title" | "description" | "$schema" | "definitions" => true,
+        _ => false,
+    })
+}
+
 /// `codex app-server generate-json-schema --out <dir>`: every `.json` file must parse, and `ClientRequest.json`,
 /// `ClientNotification.json` and `ServerNotification.json` must be protocol schemas whose method lists the interface
 /// and the capabilities are read from; anything else is a failure, not an empty or guessed schema (M1T01R-08, -15,
@@ -484,22 +584,56 @@ pub fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<CodexSchema, Prob
                 parsed.insert(file, value);
             }
         }
-        let methods = |name: &str, sent: bool| {
+        // The methods a file lists in the known form whose message can be valid: `envelope` is the message for a
+        // method, checked against the file with the params left to the compat suite (M1T07R-33).
+        let methods = |name: &str, sent: bool, envelope: &dyn Fn(&str) -> serde_json::Value| {
             let value = parsed
                 .get(&dir.join(name))
                 .ok_or_else(|| unusable(format!("{name} is missing")))?;
             draft7_well_formed(value)
                 .map_err(|e| unusable(format!("{name} is not a well-formed schema: {e}")))?;
-            schema_methods(value, sent).ok_or_else(|| {
+            let listed = schema_methods(value, sent).ok_or_else(|| {
                 unusable(format!(
                     "{name} does not list its methods in the known form"
                 ))
-            })
+            })?;
+            let open = params_open(value);
+            let empty = serde_json::Map::new();
+            let defs = open
+                .get("definitions")
+                .and_then(serde_json::Value::as_object)
+                .unwrap_or(&empty);
+            Ok::<_, ProbeError>(
+                listed
+                    .into_iter()
+                    .filter(|m| valid(&open, &envelope(m), defs, 0))
+                    .collect(),
+            )
+        };
+        // HoH's requests as a plain turn numbers them (from 0: initialize, the thread, the turn, then an interrupt or a
+        // steer); its only notification, `initialized`, has no params; the server's notifications have `method` and
+        // `params`.
+        let request = |m: &str| {
+            let id = match m {
+                "initialize" => 0,
+                "thread/start" | "thread/resume" => 1,
+                "turn/start" => 2,
+                _ => 3,
+            };
+            serde_json::json!({"id": id, "method": m, "params": {}})
         };
         Ok(CodexSchema {
-            requests: methods("ClientRequest.json", true)?,
-            client_notifications: methods("ClientNotification.json", true)?,
-            notifications: methods("ServerNotification.json", false)?,
+            requests: methods("ClientRequest.json", true, &request)?,
+            client_notifications: methods(
+                "ClientNotification.json",
+                true,
+                &|m: &str| serde_json::json!({"method": m}),
+            )?,
+            notifications: methods(
+                "ServerNotification.json",
+                false,
+                &|m: &str| serde_json::json!({"method": m, "params": {}}),
+            )?,
             hash: tree_sha256(&dir)?,
         })
     })();
@@ -1157,5 +1291,93 @@ mod tests {
         assert_eq!(tree_sha256(&root)?, expected);
         std::fs::remove_dir_all(&root)?;
         Ok(())
+    }
+
+    /// The validator of the probe's keyword set: every keyword constrains as draft-07 says, `$ref` chains end, and
+    /// annotations do not constrain (M1T07R-33).
+    #[test]
+    fn the_validator_applies_each_keyword() {
+        use serde_json::json;
+        let defs = json!({"Id": {"anyOf": [{"type": "string"}, {"type": "integer", "minimum": 0}]},
+                          "Loop": {"$ref": "#/definitions/Loop"}});
+        let defs = defs.as_object().cloned().unwrap_or_default();
+        let ok = |schema: serde_json::Value, instance: serde_json::Value| {
+            valid(&schema, &instance, &defs, 0)
+        };
+        assert!(ok(json!(true), json!(1)) && !ok(json!(false), json!(1)));
+        assert!(
+            ok(json!({"type": "integer"}), json!(3)) && ok(json!({"type": "integer"}), json!(3.0))
+        );
+        assert!(
+            !ok(json!({"type": "integer"}), json!(3.5))
+                && !ok(json!({"type": "integer"}), json!("3"))
+        );
+        assert!(
+            ok(json!({"type": ["null", "string"]}), json!(null))
+                && !ok(json!({"type": ["string"]}), json!(1))
+        );
+        assert!(ok(json!({"enum": ["a", 1]}), json!(1)) && !ok(json!({"enum": ["a"]}), json!("b")));
+        assert!(
+            ok(json!({"required": ["a"]}), json!({"a": 1}))
+                && !ok(json!({"required": ["a"]}), json!({"b": 1}))
+        );
+        assert!(ok(json!({"required": ["a"]}), json!("not an object")));
+        assert!(!ok(json!({"properties": {"a": false}}), json!({"a": 1})));
+        assert!(ok(json!({"properties": {"a": false}}), json!({"b": 1})));
+        assert!(!ok(
+            json!({"properties": {"a": {}}, "additionalProperties": false}),
+            json!({"a": 1, "b": 2})
+        ));
+        assert!(ok(
+            json!({"properties": {"a": {}}, "additionalProperties": false}),
+            json!({"a": 1})
+        ));
+        assert!(
+            !ok(json!({"items": {"type": "string"}}), json!(["a", 1]))
+                && ok(json!({"items": false}), json!([]))
+        );
+        assert!(!ok(
+            json!({"allOf": [{"type": "integer"}, {"minimum": 5}]}),
+            json!(4)
+        ));
+        assert!(ok(
+            json!({"anyOf": [{"type": "string"}, {"minimum": 5}]}),
+            json!(6)
+        ));
+        assert!(!ok(
+            json!({"anyOf": [{"type": "string"}, {"minimum": 5}]}),
+            json!(4)
+        ));
+        assert!(!ok(
+            json!({"oneOf": [{"type": "integer"}, {"type": "number"}]}),
+            json!(1)
+        ));
+        assert!(ok(
+            json!({"oneOf": [{"type": "integer"}, {"type": "string"}]}),
+            json!(1)
+        ));
+        assert!(
+            ok(json!({"$ref": "#/definitions/Id"}), json!(0))
+                && !ok(json!({"$ref": "#/definitions/Id"}), json!(-1))
+        );
+        assert!(
+            !ok(json!({"$ref": "#/definitions/None"}), json!(0)),
+            "an unknown definition"
+        );
+        assert!(
+            !ok(json!({"$ref": "#/definitions/Loop"}), json!(0)),
+            "a cycle ends invalid"
+        );
+        assert!(
+            !ok(json!({"minLength": 2}), json!("é")) && ok(json!({"minLength": 1}), json!("é"))
+        );
+        assert!(ok(
+            json!({"format": "int64", "default": 0, "title": "t", "description": "d"}),
+            json!("x")
+        ));
+        assert!(
+            !ok(json!({"not": {}}), json!(1)),
+            "an unknown keyword is not valid"
+        );
     }
 }
