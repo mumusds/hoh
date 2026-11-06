@@ -227,13 +227,15 @@ pub fn has_word(text: &str, word: &str) -> bool {
             .any(|token| listed_value(token) == word)
 }
 
-/// A token without what only wraps or follows a whole value: openers `( [ {` before it; closers `) ] }`, list
-/// punctuation `,` `;` and a sentence's `.` after it; then one pair of quotes around it (`"x"`, `'x'`, `` `x` ``).
-/// Brackets, quotes or a `.` inside a value are part of it.
+/// A token without what only wraps or follows a whole value: openers `( [ {` before it; one sentence-final `.`, then
+/// closers `) ] }` and list punctuation `,` `;` after it; then one pair of quotes around it (`"x"`, `'x'`, `` `x` ``).
+/// Brackets, quotes or a `.` inside a value are part of it, and so is a second `.` (`stdio://..`; M1T07R-27).
 fn listed_value(token: &str) -> &str {
-    let value = token
-        .trim_start_matches(['(', '[', '{'])
-        .trim_end_matches([')', ']', '}', ',', ';', '.']);
+    let value = token.trim_start_matches(['(', '[', '{']);
+    let value = value
+        .strip_suffix('.')
+        .unwrap_or(value)
+        .trim_end_matches([')', ']', '}', ',', ';']);
     ['"', '\'', '`']
         .into_iter()
         .find_map(|quote| {
@@ -521,6 +523,16 @@ mod help_tests {
                 "{listed}"
             );
         }
+        // One sentence-final period only: `stdio://..` is a longer value (M1T07R-27, round 4).
+        for longer in ["stdio://..", "stdio://...", "stdio://.)"] {
+            assert!(
+                !has_word(&format!("Supported values: {longer}"), "stdio://"),
+                "{longer}"
+            );
+        }
+        assert!(!has_word("Output format: stream-json..", "stream-json"));
+        assert!(!has_word("Output mode: rpc...", "rpc"));
+        assert!(has_word("Supported values: (stdio://).", "stdio://"));
     }
 
     /// A subcommand is a name in the command column of the `Commands:` section, not a wrapped description and not a

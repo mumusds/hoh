@@ -357,7 +357,11 @@ fn every_option_an_adapter_passes_is_declared_and_the_probe_refuses_exactly_what
                 && option_text(&help, option).is_some_and(|text| has_word(&text, value))
             {
                 // Only a longer value is listed: a suffix, or one in brackets (M1T07R-30).
-                for longer in [format!("{value}-gone"), format!("{value}(v2)")] {
+                for longer in [
+                    format!("{value}-gone"),
+                    format!("{value}(v2)"),
+                    format!("{value}.."),
+                ] {
                     let without = help.replace(value.as_str(), &longer);
                     let plainest = start(&without, false);
                     assert!(
@@ -696,14 +700,19 @@ fn an_app_server_that_cannot_listen_on_stdio_falls_back_to_exec_or_is_unsupporte
         std::fs::read_to_string(f.join("help-exec.txt"))?.replace("--json", "--json-lines"),
     )?;
     // Another endpoint, or a longer URI that only starts like `stdio://` (M1T07R-27).
-    for (n, other) in ["pipe://", "stdio:///socket", "stdio://(socket)"]
-        .into_iter()
-        .enumerate()
+    for (n, other) in [
+        "pipe://",
+        "stdio:///socket",
+        "stdio://(socket)",
+        "stdio://..",
+    ]
+    .into_iter()
+    .enumerate()
     {
         let app_help = tmp.path().join(format!("app-server-{n}.txt"));
         std::fs::write(
             &app_help,
-            std::fs::read_to_string(f.join("help-app-server.txt"))?.replace("stdio://", other),
+            std::fs::read_to_string(f.join("help-app-server.txt"))?.replace("`stdio://`", other),
         )?;
         for (exec_help, usable) in [(f.join("help-exec.txt"), true), (lines_help.clone(), false)] {
             let script = format!(
