@@ -118,7 +118,7 @@ Mutation check: dropping the strip from `child_env`, keeping a variable in the N
 
 StopFailure and SessionEnd hooks (`scripts/dev/session-alert.sh`, logic in `session_alert.py`) write a recovery point to `.hoh-dev/session-alerts.jsonl`; `session-context.sh` shows what is new at the next start. A normal Stop has no hook. Alerts record and remind; they are not a continuation mechanism. Merged as 07b7233 (rebase; tree equal to the reviewed 7c6ac26) after green CI.
 
-Real-entry verification (Claude Code 2.1.318, record `.hoh-dev/evidence/session-alerts-entry/README.md`): a top-level session marked as `scripts/start.sh` marks it gets the SessionStart context and a SessionEnd record, a delegated one gets neither; an interactive session in a PTY against a local 529 server (throwaway config dir, fake key) records StopFailure with an OSC 9 notification, then SessionEnd. `claude -p` does not wait for StopFailure (its runner is not awaited), so headless API failures leave only SessionEnd. Found by that run and fixed: an unavailable recovery part was shown split into characters.
+Real-entry verification (Claude Code 2.1.318, record `.hoh-dev/evidence/session-alerts-entry/README.md`). Historical, at f7dd0b4 plus the display fix, before round 3 added HOH_TOP_LEVEL_SESSION: a session carrying only HOH_BOOTSTRAP_PARENT (as `scripts/start.sh` set it then) got the SessionStart context and a SessionEnd record, a delegated one neither; an interactive session in a PTY against a local 529 server (throwaway config dir, fake key) recorded StopFailure with an OSC 9 notification, then SessionEnd; `claude -p` does not wait for StopFailure (its runner is not awaited), so headless API failures leave only SessionEnd; that run found an unavailable recovery part shown split into characters (fixed). On the merged hooks (07b7233, re-run for PR #22's review): a session whose HOH_BOOTSTRAP_PARENT equals HOH_TOP_LEVEL_SESSION (as `scripts/start.sh` sets them now) gets the context and a SessionEnd record; one whose parent is another session's id gets neither. StopFailure was not re-run (its path did not change in round 3).
 
 ### Round 1 (fresh Claude session)
 
@@ -154,3 +154,22 @@ Real-entry verification (Claude Code 2.1.318, record `.hoh-dev/evidence/session-
 | SAR-12 | low | The newest-10 test can fail while another bundle runs on the same machine (its decoys push ours out). | Deferred (follow-up). |
 | SAR-13 | low | A claude started directly in a top-level session's shell inherits both markers and counts as main. | Deferred (follow-up). |
 | SAR-14 | low | A top-level session started before the update has no HOH_TOP_LEVEL_SESSION and counts as delegated until restarted. | Deferred (follow-up; no such session was running). |
+
+## Process rules written into docs/19 (PR #22, branch `docs/process-continuity`)
+
+Owner instructions of 2026-11-06 (continuing and waiting, session identity, review convergence, helpers, layered verification, recovery) recorded in docs/19 and referenced from AGENTS.md, CLAUDE.md, RESUME_PROMPT.md and LAUNCH_PROMPT.md.
+
+### Round 1 (fresh Claude session)
+
+`claude` 2.1.318, session `6de7fff8-b97c-466a-8c03-e09a6c53a96a`, 469 s; attempt record sha256 `b1e242cfc1204038eecc6c08a86b784bba33a2499dc75a9dd33f06bc26fa54c9`, stdout sha256 `f211e80c19205f74e6e46575b2637aa27f4b65b78509fc12d52ad4d51ac5c680`. Candidate cbbab8b. Verdict **PASS** (1 medium, 7 low).
+
+| ID | Severity | Summary | Disposition |
+|---|---|---|---|
+| PRC-01 | medium | The PR #21 record presented the real-entry run (before round 3) as verification of the merged hooks, which classify its "HOH_BOOTSTRAP_PARENT only" session as delegated. | Fixed: labelled historical; re-run on the merged hooks (top-level and old-bridge child), recorded. |
+| PRC-02 | low | LAUNCH_PROMPT lost the general "Codex unavailable -> fresh Claude" fallback. | Fixed. |
+| PRC-03 | low | Waiting rules named only Claude Code mechanisms though Codex/Pi may be top-level. | Fixed: their native background mechanism, else foreground with a timeout. |
+| PRC-04 | low | "Stop has no hook" read against /goal, itself a Stop hook. | Fixed: project settings add none; /goal's own check excepted. |
+| PRC-05 | low | The historical-evidence recovery rule sat outside the sections RESUME_PROMPT names. | Fixed: moved into 恢复. |
+| PRC-06 | low | Deferrals named only the git-ignored PROGRESS.md. | Fixed: dispositions live in the tracked review record; PROGRESS points to them. |
+| PRC-07 | low | scripts/bootstrap.sh's PROGRESS template has no `## Next` heading (outside this diff). | Deferred (follow-up: template with the docs/19 headings and a bundle test). |
+| PRC-08 | low | Duplication and wording (CLAUDE.md "process", step 4 "fix findings", a garbled sentence, "状态更新"). | Fixed those four; the repeated fallback/reconciliation pointers are kept as short references. |

@@ -28,7 +28,7 @@ Language: reply to and ask the user in Simplified Chinese; new documents under `
 ## Continuing, waiting and reviews (details: docs/19)
 
 - Top-level only: continue through the native goal, not an outer loop or extra continue hooks; long commands and external reviews run as Claude-managed background tasks recorded in PROGRESS (task ID, attempt, candidate, result path, collect-on). Before ending a reply: consume finished results, do runnable work, and wait only on a live managed task with a wake condition.
-- Reviews: state candidate, diff, REQ/AC, risk scope and pass condition first; fix re-reviews look at the fix diff, its call chain and regressions; one reviewer, two complementary ones for deletion/process/concurrency changes, with disjoint finding-id ranges. critical/high: fix and re-review; medium: decide by AC and observable behaviour; low: follow-up list. The same class twice in a row: stop patching, write a short design correction, verify, then implement.
+- Reviews: state candidate, diff, REQ/AC, risk scope and pass condition first; fix re-reviews look at the fix diff, its call chain and regressions; one reviewer, two complementary ones for file deletion, process lifetime or concurrency changes, with disjoint finding-id ranges. critical/high: fix and re-review; medium: fix or defer by AC and observable behaviour; low: defer by default; deferrals go into the tracked review record. The same class twice in a row: stop patching, write a short design correction, verify, then implement.
 
 ## Engineering rules
 
@@ -46,7 +46,7 @@ Language: reply to and ask the user in Simplified Chinese; new documents under `
 1. `taskboard claim` the next task; read its REQ/AC, `checks` and `done_when`.
 2. Branch `task/<id>-<slug>` from an up-to-date `main`.
 3. Failing test → minimal implementation → local checks → small commits `<task id>: <summary> (REQ-…)`.
-4. Freeze a candidate, run the planned checks, run an independent review on the same commit, fix findings, re-review the fix diff.
+4. Freeze a candidate, run the planned checks, run an independent review on the same commit, fix or defer findings by severity (docs/19 审查收敛), re-review the fix diff.
 5. Push, open a PR, wait for CI; merge with `gh pr merge --rebase` once CI is green and the review has no critical/high finding. Then `taskboard set … done` with evidence paths and update PROGRESS.md.
 6. Continue with the next task. Do not stop at a milestone, an MVP or v0.1.
 
