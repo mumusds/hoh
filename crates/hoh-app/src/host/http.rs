@@ -60,24 +60,81 @@ fn routes(shared: Arc<Shared>, via: Via) -> Router {
         .with_state(shared)
 }
 
-pub(super) async fn serve_tcp(
-    listener: tokio::net::TcpListener,
-    shared: Arc<Shared>,
-    stop: tokio::sync::watch::Receiver<bool>,
-) {
-    let _ = axum::serve(listener, routes(shared, Via::Tcp))
-        .with_graceful_shutdown(stopped(stop))
-        .await;
+/// How long a stopping host lets its connections finish before it ends them (ADR-016 decision 12).
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long a connection may take to send a request's header.
+const HEADER_READ: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A listener the host accepts on.
+pub(super) enum Listener {
+    Tcp(tokio::net::TcpListener),
+    Unix(tokio::net::UnixListener),
 }
 
-pub(super) async fn serve_unix(
-    listener: tokio::net::UnixListener,
+trait Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Io for T {}
+
+impl Listener {
+    async fn accept(&self) -> std::io::Result<Box<dyn Io>> {
+        Ok(match self {
+            Listener::Tcp(l) => Box::new(l.accept().await?.0),
+            Listener::Unix(l) => Box::new(l.accept().await?.0),
+        })
+    }
+}
+
+/// Serve `listener` until the host stops; every connection is a task of this loop, so none outlives it: on stop each
+/// gets a graceful shutdown (it finishes the request in hand), then [`SHUTDOWN_GRACE`], then it is ended and awaited
+/// (ADR-016 decision 12, M2T12R-01, -60).
+pub(super) async fn serve(
+    listener: Listener,
     shared: Arc<Shared>,
-    stop: tokio::sync::watch::Receiver<bool>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
 ) {
-    let _ = axum::serve(listener, routes(shared, Via::Unix))
-        .with_graceful_shutdown(stopped(stop))
-        .await;
+    let via = match listener {
+        Listener::Tcp(_) => Via::Tcp,
+        Listener::Unix(_) => Via::Unix,
+    };
+    let router = routes(shared, via);
+    let mut connections = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let Ok(stream) = accepted else { continue };
+                let service = hyper_util::service::TowerToHyperService::new(router.clone());
+                let mut conn_stop = stop.clone();
+                connections.spawn(async move {
+                    let mut builder = hyper::server::conn::http1::Builder::new();
+                    builder
+                        .timer(hyper_util::rt::TokioTimer::new())
+                        .header_read_timeout(HEADER_READ);
+                    let conn = builder.serve_connection(hyper_util::rt::TokioIo::new(stream), service);
+                    tokio::pin!(conn);
+                    tokio::select! {
+                        _ = conn.as_mut() => {}
+                        _ = stopped(conn_stop.clone()) => {
+                            conn.as_mut().graceful_shutdown();
+                            let _ = conn.await;
+                        }
+                    }
+                    let _ = conn_stop.borrow_and_update();
+                });
+            }
+            // A finished connection is collected as it goes.
+            Some(_) = connections.join_next(), if !connections.is_empty() => {}
+            _ = stopped(stop.clone()) => break,
+        }
+    }
+    let _ = stop.borrow_and_update();
+    drop(listener);
+    let finished = tokio::time::timeout(SHUTDOWN_GRACE, async {
+        while connections.join_next().await.is_some() {}
+    })
+    .await;
+    if finished.is_err() {
+        connections.abort_all();
+        while connections.join_next().await.is_some() {}
+    }
 }
 
 async fn stopped(mut stop: tokio::sync::watch::Receiver<bool>) {
@@ -143,6 +200,16 @@ async fn check_request(
     request: Request,
     next: Next,
 ) -> Response {
+    // A stopping host takes nothing more (ADR-016 decision 12).
+    if *shared.stop.borrow() {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "GONE",
+            "the host is stopping; retry with the next host",
+            true,
+            None,
+        );
+    }
     let headers = request.headers();
     let origins: Vec<&HeaderValue> = headers.get_all(header::ORIGIN).iter().collect();
     // More than one Origin is refused, and so is a request target naming any authority (M2T12R-05).
@@ -518,10 +585,12 @@ async fn stream_events(
             None,
         );
     };
-    let last_id = headers
-        .get("last-event-id")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.trim().parse::<i64>());
+    // A Last-Event-ID that is not ASCII text is unreadable, not absent (M2T12R-62).
+    let last_id = headers.get("last-event-id").map(|v| {
+        v.to_str()
+            .map_err(|_| ())
+            .and_then(|v| v.trim().parse::<i64>().map_err(|_| ()))
+    });
     let after = match (query.after, last_id) {
         (_, Some(Err(_))) => {
             return error(
