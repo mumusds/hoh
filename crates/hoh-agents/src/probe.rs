@@ -481,6 +481,101 @@ fn params_open(file: &serde_json::Value) -> serde_json::Value {
 /// How deep schemas may nest while validating; deeper is undecided, so a cyclic definition cannot loop.
 const REF_DEPTH: usize = 64;
 
+/// How many schema nodes one reading of the App Server schema may visit in all: depth alone does not bound the work of
+/// a definition naming itself, or a chain of definitions naming the next, twice (exponential); past the budget a
+/// validation is undecided, so the method is absent and the probe ends within a second (M1T07R-40). The recorded
+/// 0.166.0 schema needs about 83,000: each envelope is checked against every branch of its file.
+const VALIDATION_BUDGET: u64 = 4_000_000;
+
+/// Take one step of the budget; false when it is used up.
+fn spend(budget: &std::cell::Cell<u64>) -> bool {
+    let left = budget.get();
+    budget.set(left.saturating_sub(1));
+    left > 0
+}
+
+/// The value of a JSON number token as (negative, significant digits, power of ten), without leading or trailing zero
+/// digits; every zero is (false, "", 0). `None` for what is no number token.
+fn decimal(token: &str) -> Option<(bool, String, i64)> {
+    let (negative, rest) = match token.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, token),
+    };
+    let (mantissa, exponent) = match rest.find(['e', 'E']) {
+        Some(at) => (&rest[..at], rest[at + 1..].parse::<i64>().ok()?),
+        None => (rest, 0),
+    };
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if whole.is_empty()
+        || !whole
+            .bytes()
+            .chain(fraction.bytes())
+            .all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let mut exponent = exponent.checked_sub(i64::try_from(fraction.len()).ok()?)?;
+    let digits = format!("{whole}{fraction}");
+    let mut digits = digits.trim_start_matches('0').to_owned();
+    while digits.ends_with('0') {
+        digits.pop();
+        exponent = exponent.checked_add(1)?;
+    }
+    Some(match digits.is_empty() {
+        true => (false, String::new(), 0),
+        false => (negative, digits, exponent),
+    })
+}
+
+/// Whether a JSON number token reads back as written: an integer within 64 bits, or a number whose parsed value prints
+/// (shortest, round-trip) as the same decimal. Such a number compares with an integer exactly as its decimal does, so
+/// `valid` stays exact on the probe's envelopes; `1e-400` (read as 0), `0.99999999999999999` (read as 1),
+/// `18446744073709551616` (beyond 64 bits) do not (M1T07R-39).
+fn reads_exactly(token: &str) -> bool {
+    if !token.contains(['.', 'e', 'E']) {
+        return token.parse::<i64>().is_ok() || token.parse::<u64>().is_ok();
+    }
+    match token.parse::<f64>() {
+        Ok(f) if f.is_finite() => {
+            decimal(token).is_some() && decimal(token) == decimal(&format!("{f:e}"))
+        }
+        _ => false,
+    }
+}
+
+/// The first number token of a JSON text (outside its strings) that does not read back as written ([`reads_exactly`]).
+fn inexact_number(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let (mut at, mut in_string) = (0, false);
+    while at < bytes.len() {
+        let b = bytes[at];
+        if in_string {
+            match b {
+                b'\\' => at += 1,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            at += 1;
+        } else if b == b'"' {
+            in_string = true;
+            at += 1;
+        } else if b == b'-' || b.is_ascii_digit() {
+            let end = bytes[at..]
+                .iter()
+                .position(|c| !(c.is_ascii_digit() || b"+-.eE".contains(c)))
+                .map_or(bytes.len(), |n| at + n);
+            let token = &text[at..end];
+            if !reads_exactly(token) {
+                return Some(token.to_owned());
+            }
+            at = end;
+        } else {
+            at += 1;
+        }
+    }
+    None
+}
+
 /// A validation result: what the probe cannot decide exactly is `Unknown`, and only `Yes` keeps a method, so an
 /// undecided part never turns into a decision the other way (inside `oneOf`, a wrong "no" would be a wrong "yes";
 /// M1T07R-34).
@@ -603,15 +698,19 @@ fn valid(
     instance: &serde_json::Value,
     defs: &serde_json::Map<String, serde_json::Value>,
     depth: usize,
+    budget: &std::cell::Cell<u64>,
 ) -> Truth {
     use serde_json::Value;
+    if !spend(budget) {
+        return Truth::Unknown;
+    }
     let obj = match schema {
         Value::Bool(b) => return Truth::of(*b),
         Value::Object(_) if depth > REF_DEPTH => return Truth::Unknown,
         Value::Object(obj) => obj,
         _ => return Truth::No,
     };
-    let sub = |s: &Value, x: &Value| valid(s, x, defs, depth + 1);
+    let sub = |s: &Value, x: &Value| valid(s, x, defs, depth + 1, budget);
     if let Some(target) = obj.get("$ref") {
         return match target
             .as_str()
@@ -711,14 +810,18 @@ fn takes_every_id(
     schema: &serde_json::Value,
     defs: &serde_json::Map<String, serde_json::Value>,
     depth: usize,
+    budget: &std::cell::Cell<u64>,
 ) -> bool {
     use serde_json::Value;
+    if !spend(budget) {
+        return false;
+    }
     let obj = match schema {
         Value::Bool(b) => return *b,
         Value::Object(obj) if depth <= REF_DEPTH => obj,
         _ => return false,
     };
-    let sub = |s: &Value| takes_every_id(s, defs, depth + 1);
+    let sub = |s: &Value| takes_every_id(s, defs, depth + 1, budget);
     if let Some(target) = obj.get("$ref") {
         return target
             .as_str()
@@ -776,13 +879,17 @@ pub fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<CodexSchema, Prob
             detail,
         };
         let mut parsed = BTreeMap::new();
+        let mut texts = BTreeMap::new();
         for file in files_under(&dir)? {
             if file.extension().is_some_and(|e| e == "json") {
-                let value = serde_json::from_slice::<serde_json::Value>(&std::fs::read(&file)?)
+                let bytes = std::fs::read(&file)?;
+                let value = serde_json::from_slice::<serde_json::Value>(&bytes)
                     .map_err(|e| unusable(format!("{} is not JSON: {e}", file.display())))?;
-                parsed.insert(file, value);
+                parsed.insert(file.clone(), value);
+                texts.insert(file, String::from_utf8_lossy(&bytes).into_owned());
             }
         }
+        let budget = std::cell::Cell::new(VALIDATION_BUDGET);
         // The methods a file lists in the known form whose message can be valid: `envelope` is the message for a
         // method, checked against the file with the params left to the compat suite (M1T07R-33).
         let methods = |name: &str, sent: bool, envelope: &dyn Fn(&str) -> serde_json::Value| {
@@ -791,6 +898,11 @@ pub fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<CodexSchema, Prob
                 .ok_or_else(|| unusable(format!("{name} is missing")))?;
             draft7_well_formed(value)
                 .map_err(|e| unusable(format!("{name} is not a well-formed schema: {e}")))?;
+            if let Some(number) = texts.get(&dir.join(name)).and_then(|t| inexact_number(t)) {
+                return Err(unusable(format!(
+                    "{name} has a number the probe cannot read exactly: {number}"
+                )));
+            }
             let listed = schema_methods(value, sent).ok_or_else(|| {
                 unusable(format!(
                     "{name} does not list its methods in the known form"
@@ -805,14 +917,14 @@ pub fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<CodexSchema, Prob
             Ok::<_, ProbeError>(
                 listed
                     .into_iter()
-                    .filter(|m| valid(&open, &envelope(m), defs, 0) == Truth::Yes)
+                    .filter(|m| valid(&open, &envelope(m), defs, 0, &budget) == Truth::Yes)
                     .filter(|m| {
                         // A request also needs an id schema that takes every id the adapter numbers (M1T07R-36).
                         !name.starts_with("ClientRequest")
                             || branch_of(&open, m).is_some_and(|branch| {
                                 branch["properties"]
                                     .get("id")
-                                    .is_none_or(|id| takes_every_id(id, defs, 0))
+                                    .is_none_or(|id| takes_every_id(id, defs, 0, &budget))
                             })
                     })
                     .collect(),
@@ -1501,7 +1613,13 @@ mod tests {
                           "Loop": {"$ref": "#/definitions/Loop"}});
         let defs = defs.as_object().cloned().unwrap_or_default();
         let truth = |schema: serde_json::Value, instance: serde_json::Value| {
-            valid(&schema, &instance, &defs, 0)
+            valid(
+                &schema,
+                &instance,
+                &defs,
+                0,
+                &std::cell::Cell::new(VALIDATION_BUDGET),
+            )
         };
         let ok = |schema: serde_json::Value, instance: serde_json::Value| {
             truth(schema, instance) == Truth::Yes
@@ -1643,7 +1761,9 @@ mod tests {
         let defs = json!({"RequestId": {"anyOf": [{"type": "string"}, {"format": "int64", "type": "integer"}]},
                           "Loop": {"$ref": "#/definitions/Loop"}});
         let defs = defs.as_object().cloned().unwrap_or_default();
-        let takes = |schema: serde_json::Value| takes_every_id(&schema, &defs, 0);
+        let takes = |schema: serde_json::Value| {
+            takes_every_id(&schema, &defs, 0, &std::cell::Cell::new(VALIDATION_BUDGET))
+        };
         for yes in [
             json!(true),
             json!({"$ref": "#/definitions/RequestId"}),
@@ -1666,5 +1786,91 @@ mod tests {
         ] {
             assert!(!takes(no.clone()), "{no}");
         }
+    }
+
+    /// A number reads back as written or the file is refused; strings are skipped, escaped quotes included (M1T07R-39).
+    #[test]
+    fn numbers_are_read_exactly_or_refused() {
+        for exact in [
+            "0",
+            "-0",
+            "1",
+            "-1",
+            "9007199254740993",
+            "18446744073709551615",
+            "0.7",
+            "1e3",
+            "1E+3",
+            "-2.50",
+            "1e-300",
+        ] {
+            assert!(reads_exactly(exact), "{exact}");
+        }
+        for inexact in [
+            "1e-400",
+            "-1e-400",
+            "0.99999999999999999",
+            "18446744073709551616",
+            "9007199254740993.5",
+            "1e400",
+            "9007199254740993.0",
+        ] {
+            assert!(!reads_exactly(inexact), "{inexact}");
+        }
+        assert_eq!(
+            inexact_number(r#"{"a": "1e-400", "b": "x\"1e-400", "c": [0, 0.7, -3]}"#),
+            None
+        );
+        assert_eq!(
+            inexact_number(r#"{"a": "\\", "minimum": 1e-400}"#).as_deref(),
+            Some("1e-400")
+        );
+    }
+
+    /// The recorded 0.166.0 schema is read well within the validation budget, so the budget only stops schemas that
+    /// branch without end (M1T07R-40).
+    #[test]
+    fn the_recorded_schema_needs_little_of_the_budget() -> Result<(), Box<dyn std::error::Error>> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/protocol/codex/0.166.0/app-server-schema");
+        let budget = std::cell::Cell::new(VALIDATION_BUDGET);
+        let mut kept = 0;
+        for (name, sent) in [
+            ("ClientRequest.json", true),
+            ("ClientNotification.json", true),
+            ("ServerNotification.json", false),
+        ] {
+            let text = std::fs::read_to_string(root.join(name))?;
+            assert_eq!(inexact_number(&text), None, "{name}");
+            let value: serde_json::Value = serde_json::from_str(&text)?;
+            let open = params_open(&value);
+            let defs = open["definitions"].as_object().cloned().unwrap_or_default();
+            for method in schema_methods(&value, sent).ok_or("not the known form")? {
+                let envelope = match name {
+                    "ClientRequest.json" => {
+                        serde_json::json!({"id": 0, "method": method, "params": {}})
+                    }
+                    "ClientNotification.json" => serde_json::json!({"method": method}),
+                    _ => serde_json::json!({"method": method, "params": {}}),
+                };
+                assert_eq!(
+                    valid(&open, &envelope, &defs, 0, &budget),
+                    Truth::Yes,
+                    "{name} {method}"
+                );
+                if sent && name == "ClientRequest.json" {
+                    let id = &branch_of(&open, &method).ok_or("no branch")?["properties"]["id"];
+                    assert!(takes_every_id(id, &defs, 0, &budget), "{method}");
+                }
+                kept += 1;
+            }
+        }
+        assert_eq!(kept, 192);
+        let used = VALIDATION_BUDGET - budget.get();
+        assert!(
+            used < VALIDATION_BUDGET / 20,
+            "the recorded schema used {used} steps"
+        );
+        Ok(())
     }
 }
