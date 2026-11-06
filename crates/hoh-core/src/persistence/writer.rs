@@ -395,13 +395,17 @@ impl Writer {
         !self.jobs.is_closed()
     }
 
-    /// Resolves once the writer thread has ended (normally, or by a panic).
-    pub(super) fn ended(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+    /// Resolves once the writer thread has ended: true when it finished (the word is sent after its last job), false
+    /// when it ended by a panic (the sender went without the word).
+    pub(super) fn ended(&self) -> impl std::future::Future<Output = bool> + Send + 'static {
         let mut ended = self.ended.clone();
         async move {
-            while !*ended.borrow_and_update() {
+            loop {
+                if *ended.borrow_and_update() {
+                    return true;
+                }
                 if ended.changed().await.is_err() {
-                    return;
+                    return *ended.borrow();
                 }
             }
         }

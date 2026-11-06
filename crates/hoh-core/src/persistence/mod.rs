@@ -704,13 +704,16 @@ impl Store {
         self.writer.keep(held).await
     }
 
-    /// Resolves once the writer thread has ended: normally after this store and every other handle are dropped
-    /// (what it kept is then dropped), or early on a panic (what it kept is then leaked, still held).
-    pub fn writer_ended(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+    /// Resolves once the writer thread has ended: true when it finished, after this store and every other handle were
+    /// dropped (what it kept is then dropped); false when it ended early by a panic (what it kept is then leaked,
+    /// still held).
+    pub fn writer_ended(&self) -> impl std::future::Future<Output = bool> + Send + 'static {
         self.writer.ended()
     }
 
-    /// Whether the writer still takes requests; false after a panic of its thread.
+    /// Whether the writer still takes requests; false once its thread has ended. During a panic's unwinding the
+    /// request that panicked is answered (the writer stopped) a moment before this turns false: wait for
+    /// [`Store::writer_ended`] to know.
     pub fn writer_alive(&self) -> bool {
         self.writer.alive()
     }

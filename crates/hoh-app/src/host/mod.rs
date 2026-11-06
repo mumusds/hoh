@@ -1,10 +1,11 @@
 //! The Engine host of one project (REQ-022, REQ-036, REQ-041, REQ-062; docs/adr/ADR-016.md).
 //!
-//! Start, in order: the database location is checked read-only; the project lock `.hoh/host.lock` is taken; the store
-//! is opened (the location checked again, the WAL self-test, settings, migrations); the host epoch moves on after an
-//! integrity check; the readers are checked; only then are the Unix socket `.hoh/host.sock` and the loopback port
-//! bound and `.hoh/host.json` written. Any failure before that ends the start with nothing served, and no database
-//! file is made when the location or the WAL self-test refuses.
+//! Start, in order: the database location is checked read-only; the project lock (a `flock` on the `.hoh` directory,
+//! the holder's pid in `.hoh/host.lock`) is taken and handed to the writer; the store is opened (the location checked
+//! again, the WAL self-test, settings, migrations); the host epoch moves on after an integrity check; the readers are
+//! checked; only then are the loopback port and the Unix socket `.hoh/host.sock` bound and `.hoh/host.json` written.
+//! Any failure before that ends the start with nothing served, and no database file is made when the location or the
+//! WAL self-test refuses.
 
 mod http;
 
@@ -301,6 +302,12 @@ impl Host {
         self.shared.store.writer_alive()
     }
 
+    /// Resolves once the database writer has ended: before the stop only by a panic (false), which a caller treats
+    /// as fatal the way [`run`] does (M2T12R-185).
+    pub fn writer_ended(&self) -> impl std::future::Future<Output = bool> + Send + 'static {
+        self.shared.store.writer_ended()
+    }
+
     /// The settings of the writer and of every reader, and whether the readers refuse writes.
     pub async fn diagnostics(&self) -> Result<Diagnostics, PersistError> {
         let writer = self.shared.store.writer_pragmas().await?;
@@ -325,9 +332,10 @@ impl Host {
 
     /// Stop (ADR-016 decision 12): no new connections, event streams end, every connection finishes or is ended
     /// after the grace; `host.json` and the socket go; then the store, and the writer ends after its last write and
-    /// lets the project lock go. Returns after that. The database stays. A Host dropped without this stops the same
-    /// way, without waiting.
-    pub async fn shutdown(self) {
+    /// lets the project lock go. Returns after that: true when the writer finished, false when it had ended by a panic
+    /// (the lock is then still held until the process ends). The database stays. A Host dropped without this stops
+    /// the same way, without waiting.
+    pub async fn shutdown(self) -> bool {
         let Host {
             shared,
             stop,
@@ -343,7 +351,7 @@ impl Host {
         let ended = shared.store.writer_ended();
         drop(shared);
         drop(stop);
-        ended.await;
+        ended.await
     }
 }
 
@@ -374,14 +382,14 @@ pub async fn run(config: HostConfig) -> u8 {
     };
     // A writer that ended while the host was not stopping (a panic) is fatal: the host stops and the process exits
     // non-zero, so its supervisor sees the failure and starts a new host once the process has let the project go
-    // (M2T12R-150).
-    let writer_ended = host.shared.store.writer_ended();
-    let failed = tokio::select! {
+    // (M2T12R-150). So is a panic of the writer during the stop (M2T12R-185).
+    let writer_ended = host.writer_ended();
+    let ended_first = tokio::select! {
         () = signals => false,
-        () = writer_ended => true,
+        _ = writer_ended => true,
     };
-    host.shutdown().await;
-    if failed {
+    let finished = host.shutdown().await;
+    if ended_first || !finished {
         use std::io::Write as _;
         let _ = writeln!(
             std::io::stderr(),
@@ -436,44 +444,47 @@ impl Drop for HostFiles {
     }
 }
 
-/// The project lock: an exclusive `flock` on the `.hoh` directory itself, which cannot be replaced without its
-/// database (a lock on a file in it could be deleted and taken again by a second host, M2T12R-152); `host.lock` only
-/// names the holder's pid.
+/// The project lock: an exclusive `flock` on the `.hoh` directory itself (a lock on a file in it could be deleted and
+/// taken again by a second host, M2T12R-152); `host.lock` only names the holder's pid. A database file moved into a
+/// new `.hoh` while a host runs is not covered: the host-epoch fencing of writes is (M2-T05, ADR-016 decision 1).
 struct ProjectLock {
     _directory: std::fs::File,
     _pid: std::fs::File,
 }
 
-/// Take the project lock without waiting; a held lock names its holder.
+/// Take the project lock without waiting; a held lock names its holder. The directory is locked first: a start that is
+/// refused only reads the pid file (it neither makes nor changes one), and a pid file that cannot be opened does not
+/// hide a held project; only the holder (re)writes it (M2T12R-182).
 fn take_lock(files: &Path) -> Result<ProjectLock, StartError> {
-    use std::io::{Read as _, Seek as _, Write as _};
+    use std::io::{Seek as _, Write as _};
     let directory = std::fs::File::open(files)
         .map_err(|e| StartError::other(format!("cannot open {}: {e}", files.display())))?;
     let pid_path = files.join("host.lock");
-    let mut pid = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&pid_path)
-        .map_err(|e| StartError::other(format!("cannot open {}: {e}", pid_path.display())))?;
     if rustix::fs::flock(
         &directory,
         rustix::fs::FlockOperation::NonBlockingLockExclusive,
     )
     .is_err()
     {
-        let mut holder = String::new();
-        let _ = pid.read_to_string(&mut holder);
+        let holder = std::fs::read_to_string(&pid_path)
+            .ok()
+            .map(|pid| pid.trim().to_owned())
+            .filter(|pid| !pid.is_empty())
+            .unwrap_or_else(|| "unknown".to_owned());
         return Err(StartError {
             exit_code: 69,
             message: format!(
-                "another host holds {} (pid {}); do not remove its files while it runs",
-                files.display(),
-                holder.trim()
+                "another host holds {} (pid {holder}); do not remove its files while it runs",
+                files.display()
             ),
         });
     }
+    let mut pid = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&pid_path)
+        .map_err(|e| StartError::other(format!("cannot open {}: {e}", pid_path.display())))?;
     let written = pid
         .set_len(0)
         .and_then(|()| pid.rewind())
