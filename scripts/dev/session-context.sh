@@ -24,5 +24,26 @@ if [[ -f .hoh-dev/PROGRESS.md ]]; then
   echo '[hoh-session] .hoh-dev/PROGRESS.md "Next" section:'
   awk '/^## Next/{on=1;next} /^## /{if(on)exit} on' .hoh-dev/PROGRESS.md | head -15 | sed 's/^/[hoh-session]   /'
 fi
+if [[ -f .hoh-dev/session-alerts.jsonl ]]; then
+  # What scripts/dev/session-alert.sh wrote since the last session start: why turns or sessions ended, and where
+  # the work stood (at most the five newest; .hoh-dev/session-alerts.seen counts the lines already shown).
+  python3 - <<'PY' 2>/dev/null || true
+import json
+lines=open('.hoh-dev/session-alerts.jsonl').read().splitlines()
+try: seen=int(open('.hoh-dev/session-alerts.seen').read().strip() or 0)
+except (OSError,ValueError): seen=0
+new=lines[seen:] if seen<=len(lines) else lines
+for line in new[-5:]:
+    try: r=json.loads(line)
+    except ValueError: continue
+    why=r.get('error') or r.get('reason') or '?'
+    rec=r.get('recovery') or {}
+    print(f"[hoh-session] ALERT {r.get('at')} {r.get('event')}: {why}" + (f" -- {r['message']}" if r.get('message') else ''))
+    print(f"[hoh-session]   then: tasks {', '.join(rec.get('tasks') or []) or 'none'}; {rec.get('branch') or '?'} at {rec.get('head') or '?'}; newest evidence {rec.get('newest_evidence') or 'none'}")
+    for b in rec.get('background') or []: print(f"[hoh-session]   was running: {b}")
+if new: print(f"[hoh-session] {len(new)} new alert(s); check whether that background work finished before continuing.")
+open('.hoh-dev/session-alerts.seen','w').write(str(len(lines)))
+PY
+fi
 echo '[hoh-session] Rules: read CLAUDE.md and goal.md; verify facts from files, git and evidence, not from memory or earlier "done" claims; update PROGRESS.md and the taskboard after each step.'
 exit 0
