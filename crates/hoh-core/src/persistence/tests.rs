@@ -28,11 +28,13 @@ fn store_with(path: &Path, options: Options, fault: Fault) -> Result<Store, Pers
     let conn = Connection::open(path).map_err(sqlite_error)?;
     configure(&conn, &options, true)?;
     migrate(&conn, MIGRATIONS)?;
-    let writer = Writer::spawn_with(conn, &options, fault)?;
+    let (committed, watermark) = tokio::sync::watch::channel(0);
+    let writer = Writer::spawn_with(conn, &options, fault, committed)?;
     Ok(Store {
         path: path.to_path_buf(),
         options,
         writer,
+        watermark,
     })
 }
 
@@ -1198,4 +1200,200 @@ async fn a_scratch_task_is_only_for_an_empty_database() -> R {
     })?;
     assert_eq!(counts, (1, 1, 1), "nothing written by the refused call");
     Ok(())
+}
+
+/// A PauseRun for `r1` with key `key` and payload hash `hash`.
+fn pause(key: &str, hash: &str, expected: i64) -> SubmitCommand {
+    SubmitCommand {
+        command_id: format!("c-{key}-{hash}"),
+        idempotency_key: key.to_owned(),
+        kind: "PauseRun".to_owned(),
+        run_id: "r1".to_owned(),
+        expected_revision: expected,
+        payload: json!({"reason": "test"}),
+        payload_sha256: hash.repeat(64),
+        target: RunState::PauseRequested,
+        event: event(&format!("e-{key}-{hash}")),
+        outbox: Some(message(&format!("m-{key}-{hash}"), 0)),
+    }
+}
+
+/// (commands, events, outbox) row counts.
+fn command_rows(store: &Store) -> Result<(i64, i64, i64), PersistError> {
+    store.reader()?.with(|c| {
+        c.query_row(
+            "SELECT (SELECT count(*) FROM commands), (SELECT count(*) FROM events), (SELECT count(*) FROM outbox)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+    })
+}
+
+/// The same key and payload apply once and replay the stored result byte for byte; another payload under the key is
+/// KEY_REUSE and writes nothing (REQ-022, REQ-041).
+#[tokio::test]
+async fn a_command_applies_once_per_key_and_another_payload_is_key_reuse() -> R {
+    let dir = tempfile::tempdir()?;
+    let path = db_in(&dir);
+    let store = Store::open(&path, test_options())?;
+    seed(&path)?;
+    let first = store.submit_command(pause("k", "a", 0)).await?;
+    let CommandOutcome::Accepted {
+        result_json,
+        revision,
+        ..
+    } = &first
+    else {
+        return Err(format!("{first:?}").into());
+    };
+    assert_eq!(*revision, 1);
+    let body: serde_json::Value = serde_json::from_str(result_json)?;
+    assert_eq!(
+        body,
+        json!({"command_id": "c-k-a", "run_id": "r1", "revision": 1, "status": "ACCEPTED"})
+    );
+    let again = store.submit_command(pause("k", "a", 0)).await?;
+    assert_eq!(
+        again,
+        CommandOutcome::Replayed {
+            result_json: result_json.clone()
+        }
+    );
+    let reuse = store.submit_command(pause("k", "b", 1)).await;
+    assert!(
+        matches!(&reuse, Err(PersistError::KeyReuse(key)) if key == "k"),
+        "{reuse:?}"
+    );
+    assert_eq!(
+        reuse.err().and_then(|e| e.rejection()),
+        Some(crate::protocol::RejectionReason::KeyReuse)
+    );
+    assert_eq!(command_rows(&store)?, (1, 1, 1));
+    assert_eq!(snapshot(&path)?.0, "PAUSE_REQUESTED");
+    Ok(())
+}
+
+/// A commit that fails as a full disk would is retryable DB_FULL and leaves nothing: no command, event or outbox row,
+/// the run unchanged, the watermark where it was; the same command then applies (REQ-036, CR-006).
+#[tokio::test]
+async fn a_failed_commit_is_retryable_and_leaves_nothing() -> R {
+    let dir = tempfile::tempdir()?;
+    let path = db_in(&dir);
+    let full = Arc::new(FullDisk(std::sync::atomic::AtomicBool::new(true)));
+    let options = Options {
+        faults: full.clone(),
+        ..test_options()
+    };
+    let store = Store::open(&path, options)?;
+    seed(&path)?;
+    let watermark = store.watermark();
+    let before = *watermark.borrow();
+    let failed = store.submit_command(pause("k", "a", 0)).await;
+    let error = failed.err().ok_or("the commit did not fail")?;
+    assert!(matches!(error, PersistError::Full(_)), "{error:?}");
+    assert!(error.retryable());
+    assert_eq!(error.error_code(), Some(crate::protocol::ErrorCode::DbFull));
+    assert_eq!(command_rows(&store)?, (0, 0, 0));
+    assert_eq!(snapshot(&path)?.0, "CREATED");
+    assert_eq!(*watermark.borrow(), before);
+    full.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    let applied = store.submit_command(pause("k", "a", 0)).await?;
+    assert!(
+        matches!(applied, CommandOutcome::Accepted { revision: 1, .. }),
+        "{applied:?}"
+    );
+    assert_eq!(command_rows(&store)?, (1, 1, 1));
+    Ok(())
+}
+
+/// The watermark moves to the event's seq only once its transaction has committed (REQ-036).
+#[tokio::test]
+async fn the_watermark_follows_committed_events() -> R {
+    let dir = tempfile::tempdir()?;
+    let path = db_in(&dir);
+    let store = Store::open(&path, test_options())?;
+    seed(&path)?;
+    let mut watermark = store.watermark();
+    assert_eq!(*watermark.borrow_and_update(), 0);
+    let CommandOutcome::Accepted { event_seq, .. } =
+        store.submit_command(pause("k", "a", 0)).await?
+    else {
+        return Err("not applied".into());
+    };
+    tokio::time::timeout(Duration::from_secs(5), watermark.changed()).await??;
+    assert_eq!(*watermark.borrow(), event_seq);
+    let reader = store.reader()?;
+    assert_eq!(reader.max_seq()?, event_seq);
+    let events = reader.events_after(0, 10)?;
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        (events[0].seq, events[0].kind.as_str()),
+        (event_seq, "run.state_changed")
+    );
+    let (run, seen) = reader.snapshot("r1")?.ok_or("no run")?;
+    assert_eq!(
+        (run.state.as_str(), run.revision, seen),
+        ("PAUSE_REQUESTED", 1, event_seq)
+    );
+    assert!(reader.snapshot("missing")?.is_none());
+    assert!(reader.refuses_writes());
+    Ok(())
+}
+
+/// Each host start checks the database and takes the next host epoch of its project, made on the first start
+/// (REQ-041).
+#[tokio::test]
+async fn each_host_start_takes_the_next_epoch() -> R {
+    let dir = tempfile::tempdir()?;
+    let path = db_in(&dir);
+    let store = Store::open(&path, test_options())?;
+    let first = store.begin_host("p-new", "/somewhere").await?;
+    assert_eq!(
+        first,
+        HostStart {
+            project_id: "p-new".to_owned(),
+            host_epoch: 1
+        }
+    );
+    // A later start keeps the project made first, whatever id it proposes.
+    let second = store.begin_host("p-other", "/somewhere").await?;
+    assert_eq!(
+        second,
+        HostStart {
+            project_id: "p-new".to_owned(),
+            host_epoch: 2
+        }
+    );
+    let pragmas = store.writer_pragmas().await?;
+    assert_eq!(pragmas, store.reader()?.pragmas()?);
+    Ok(())
+}
+
+/// A disk that is full while its flag is set: the test's fault hook (the product's does nothing, CR-006).
+#[derive(Debug)]
+struct FullDisk(std::sync::atomic::AtomicBool);
+
+impl FaultHooks for FullDisk {
+    fn before_commit(&self) -> Result<(), PersistError> {
+        if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+            Err(sqlite_error(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+                Some("injected".to_owned()),
+            )))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// SQLITE_FULL is DB_FULL and retryable, as the host answers it (CR-006).
+#[test]
+fn a_full_disk_is_db_full_and_retryable() {
+    let full = sqlite_error(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+        None,
+    ));
+    assert!(matches!(full, PersistError::Full(_)), "{full:?}");
+    assert!(full.retryable());
+    assert_eq!(full.error_code(), Some(crate::protocol::ErrorCode::DbFull));
 }
