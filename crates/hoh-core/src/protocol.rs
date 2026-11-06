@@ -382,20 +382,40 @@ pub struct ConfigureTeam {
 pub struct SchedulerSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weights: Option<SchedulerWeights>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::integer::option"
+    )]
     pub max_wait_rounds: Option<u32>,
 }
 
 /// The four score weights of REQ-038; each 0..=10.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SchedulerWeights {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::integer::option"
+    )]
     pub user_value: Option<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::integer::option"
+    )]
     pub unblock_value: Option<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::integer::option"
+    )]
     pub risk_reduction: Option<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::integer::option"
+    )]
     pub information_gain: Option<u8>,
 }
 
@@ -545,5 +565,6 @@ schema_def!(
     Command,
     DecisionPayload,
     PlanProposal,
-    RunResult
+    RunResult,
+    SchedulerSettings
 );
