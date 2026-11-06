@@ -70,6 +70,7 @@ fn context() -> Context {
             ),
         ]),
         budget_headroom: Some(1),
+        ..Context::default()
     }
 }
 
@@ -522,9 +523,23 @@ async fn an_applied_dispatch_leases_the_task_queues_its_message_and_fences_later
             json!("PENDING")
         ]
     );
+    // AC-035-02: the dispatch's PREPARED attempt and its lease are in the same transaction (no event of their own);
+    // T1 is not a writer task, so it holds the first reader slot.
     assert_eq!(
-        rows(&path, "SELECT count(*) FROM attempts")?,
-        [vec![json!(0)]]
+        rows(
+            &path,
+            "SELECT attempt_id, task_id, state, role_epoch FROM attempts"
+        )?,
+        [vec![
+            json!("d1/attempt"),
+            json!("T1"),
+            json!("PREPARED"),
+            json!(2)
+        ]]
+    );
+    assert_eq!(
+        rows(&path, "SELECT kind, attempt_id, epoch FROM leases")?,
+        [vec![json!("reader-1"), json!("d1/attempt"), json!(1)]]
     );
     // The next proposal decided on revision 7 is now stale, and nothing changes for it.
     let before = tables(&path)?;

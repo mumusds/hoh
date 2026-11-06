@@ -17,6 +17,7 @@ fn task(id: &str, state: TaskState) -> TaskView {
         spec_id: "s2".to_owned(),
         role: "developer".to_owned(),
         cost_estimate: 1,
+        writer: true,
         dependencies: vec![("T0".to_owned(), TaskState::Accepted)],
         requirements: caps(&["REQ-1"]),
     }
@@ -40,6 +41,7 @@ fn snapshot() -> Snapshot {
         }),
         required_capabilities: Some(caps(&["structured_events", "command_exec"])),
         budget_headroom: Some(1),
+        free_slot: Some("writer".to_owned()),
         // C1 is the run's one candidate in use; it has no passing evidence yet.
         evidence: Evidence {
             live: caps(&["C1"]),
@@ -80,8 +82,22 @@ fn a_valid_dispatch_leases_the_task_for_the_bound_epoch() {
             task_revision: 4,
             role: "developer".to_owned(),
             role_epoch: 5,
+            lease_kind: "writer".to_owned(),
         })
     );
+}
+
+#[test]
+fn a_dispatch_whose_lease_is_held_is_refused_last() {
+    // CR-007: the slot the task needs is held, so the proposal is refused and nothing moves.
+    let mut held = snapshot();
+    held.free_slot = None;
+    let rejection = validate(&dispatch_t1(), &held).expect_err("dispatched without a lease");
+    assert_eq!(rejection.reason, RejectionReason::LeaseUnavailable);
+    // Every other reason comes first: a busy slot does not hide an unreachable budget.
+    held.budget_headroom = Some(0);
+    let rejection = validate(&dispatch_t1(), &held).expect_err("dispatched over budget");
+    assert_eq!(rejection.reason, RejectionReason::BudgetNotReservable);
 }
 
 #[test]

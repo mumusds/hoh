@@ -10,6 +10,7 @@
 //! ([`CancelReceipt::AlreadyEnded`]).
 
 use super::decide::child_id;
+use super::leases;
 use super::writer::{self, Commit, Entity, NewEvent};
 use super::{PersistError, sqlite_error};
 use crate::lifecycle::{self, AttemptState, Lifecycle};
@@ -328,13 +329,19 @@ fn event(
     writer::write(tx, &commit, &|| {}).map(drop)
 }
 
-fn create(tx: &Transaction<'_>, a: &NewAttempt) -> Result<(), PersistError> {
+/// The row of a new PREPARED attempt, without an event (a dispatch decision's event records it, AC-035-02).
+pub(super) fn insert_prepared(tx: &Transaction<'_>, a: &NewAttempt) -> Result<(), PersistError> {
     tx.execute(
         "INSERT INTO attempts(attempt_id, task_id, session_id, state, role_epoch, host_epoch, config_revision, agent) \
          VALUES (?1, ?2, ?3, 'PREPARED', ?4, ?5, ?6, ?7)",
         params![a.attempt_id, a.task_id, a.session_id, a.role_epoch, a.host_epoch, a.config_revision, a.agent],
     )
     .map_err(sqlite_error)?;
+    Ok(())
+}
+
+fn create(tx: &Transaction<'_>, a: &NewAttempt) -> Result<(), PersistError> {
+    insert_prepared(tx, a)?;
     event(
         tx,
         &a.task_id,
@@ -373,6 +380,13 @@ fn move_attempt(tx: &Transaction<'_>, m: &AttemptMove) -> Result<(), PersistErro
         why: "not in the transition table".to_owned(),
     })?;
     let f = &m.facts;
+    if m.from == AttemptState::Prepared && m.to == AttemptState::Starting {
+        let at = f
+            .started_at
+            .clone()
+            .unwrap_or_else(crate::time::now_rfc3339);
+        leases::require_writer(tx, &m.attempt_id, &task_id, &at)?;
+    }
     let changed = tx
         .execute(
             "UPDATE attempts SET state = ?1, session_id = COALESCE(?2, session_id), pid = COALESCE(?3, pid), \
@@ -400,6 +414,11 @@ fn move_attempt(tx: &Transaction<'_>, m: &AttemptMove) -> Result<(), PersistErro
         .map_err(sqlite_error)?;
     if changed != 1 {
         return Err(stale(Some(state)));
+    }
+    if m.to.is_terminal() {
+        // Its leases go with it, at its end (REQ-037; the slot is free once it is both ended and expired).
+        let at = f.ended_at.clone().unwrap_or_else(crate::time::now_rfc3339);
+        leases::release_held_by(tx, &m.attempt_id, &at)?;
     }
     event(
         tx,

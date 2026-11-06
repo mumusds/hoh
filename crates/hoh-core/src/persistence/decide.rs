@@ -3,6 +3,8 @@
 //! task/run by compare-and-set and queues its dispatch together with the APPLIED row; a rejected one changes no task
 //! or run and writes exactly one `decision.rejected` event.
 
+use super::attempts::{self, NewAttempt};
+use super::leases;
 use super::writer::{self, Change, Commit, Entity, NewEvent, NewOutbox, StateCas};
 use super::{PersistError, sqlite_error};
 use crate::decision::{
@@ -104,11 +106,37 @@ pub(super) fn decide(
         ],
     )
     .map_err(sqlite_error)?;
-    let snapshot = load_snapshot(&tx, proposal, context, run)?;
+    let snapshot = load_snapshot(&tx, &project_id, proposal, context, run)?;
     let decided = match decision::validate(proposal, &snapshot) {
         Ok(Effect::Unsupported(kind)) => return Err(PersistError::Unsupported(kind)),
         Ok(effect) => {
-            let commit = applied(&project_id, proposal, &snapshot, &effect, &payload)?;
+            let lease = match &effect {
+                Effect::Dispatch {
+                    task_id,
+                    role,
+                    role_epoch,
+                    lease_kind,
+                    ..
+                } => Some(lease_task(
+                    &tx,
+                    &project_id,
+                    proposal,
+                    task_id,
+                    role,
+                    *role_epoch,
+                    lease_kind,
+                    context.now(),
+                )?),
+                _ => None,
+            };
+            let commit = applied(
+                &project_id,
+                proposal,
+                &snapshot,
+                &effect,
+                &payload,
+                lease.as_ref(),
+            )?;
             let done = writer::write(&tx, &commit, after_events)?;
             resolve(&tx, &proposal.decision_id, "APPLIED", None)?;
             Decided::Applied {
@@ -169,6 +197,7 @@ fn applied(
     snapshot: &Snapshot,
     effect: &Effect,
     payload: &Value,
+    lease: Option<&Leased>,
 ) -> Result<Commit, PersistError> {
     let run_revision = to_i64(snapshot.run.revision, "run revision")?;
     let run = |change| StateCas {
@@ -195,8 +224,19 @@ fn applied(
             task_revision,
             role,
             role_epoch,
+            ..
         } => {
+            let leased = lease.ok_or_else(|| {
+                PersistError::IntegrityViolation(format!("dispatch of {task_id} without a lease"))
+            })?;
+            let lease = json!({
+                "kind": leased.grant.kind,
+                "epoch": leased.grant.epoch,
+                "expires_at": leased.grant.expires_at,
+            });
             details["task"] = json!({"task_id": task_id, "from": "READY", "to": "LEASED"});
+            details["attempt_id"] = json!(leased.attempt_id);
+            details["lease"] = lease.clone();
             outbox.push(NewOutbox {
                 message_id: child_id(&proposal.decision_id, "dispatch"),
                 event: 0,
@@ -208,6 +248,8 @@ fn applied(
                     "decision_id": proposal.decision_id,
                     "task_id": task_id,
                     "role": role,
+                    "attempt_id": leased.attempt_id,
+                    "lease": lease,
                 }),
             });
             vec![
@@ -245,6 +287,59 @@ fn applied(
         }],
         outbox,
     })
+}
+
+/// The PREPARED attempt of a dispatch and the lease it holds.
+pub(super) struct Leased {
+    pub(super) attempt_id: String,
+    pub(super) grant: leases::Grant,
+}
+
+/// Create the PREPARED attempt of a dispatch (its row only: the decision's event records it) and grant it the lease
+/// `kind`, in the decision's transaction (AC-035-02). The attempt carries the target role's epoch, the host epoch and
+/// the run's config revision.
+#[allow(clippy::too_many_arguments)]
+fn lease_task(
+    tx: &Transaction<'_>,
+    project_id: &str,
+    proposal: &Proposal,
+    task_id: &str,
+    role: &str,
+    role_epoch: u64,
+    kind: &str,
+    now: std::time::SystemTime,
+) -> Result<Leased, PersistError> {
+    let (host_epoch, config_revision): (i64, i64) = tx
+        .query_row(
+            "SELECT p.host_epoch, r.config_revision FROM runs r JOIN projects p ON p.project_id = r.project_id \
+             WHERE r.run_id = ?1",
+            params![proposal.run_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(sqlite_error)?;
+    let agent: Option<String> = tx
+        .query_row(
+            "SELECT agent FROM role_bindings WHERE run_id = ?1 AND role = ?2",
+            params![proposal.run_id, role],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let attempt_id = child_id(&proposal.decision_id, "attempt");
+    attempts::insert_prepared(
+        tx,
+        &NewAttempt {
+            attempt_id: attempt_id.clone(),
+            task_id: task_id.to_owned(),
+            session_id: None,
+            role_epoch: to_i64(role_epoch, "role_epoch")?,
+            host_epoch,
+            config_revision,
+            agent,
+        },
+    )?;
+    let grant = leases::grant(tx, project_id, kind, &attempt_id, now)?;
+    Ok(Leased { attempt_id, grant })
 }
 
 /// The one event of a rejected proposal, with the fences and inputs the verdict read.
@@ -313,6 +408,7 @@ fn load_run(tx: &Transaction<'_>, run_id: &str) -> Result<(String, RunView), Per
 
 fn load_snapshot(
     tx: &Transaction<'_>,
+    project_id: &str,
     proposal: &Proposal,
     context: &Context,
     run: RunView,
@@ -331,6 +427,16 @@ fn load_snapshot(
         .as_ref()
         .and_then(|t| context.required_capabilities.get(&t.role))
         .cloned();
+    let free_slot = match &task {
+        Some(t) if proposal.kind() == "dispatch" => leases::free_slot(
+            tx,
+            project_id,
+            t.writer,
+            context.reader_slots(),
+            context.now(),
+        )?,
+        _ => None,
+    };
     let evidence = if proposal.needs_evidence() {
         load_evidence(tx, run_id, &run)?
     } else {
@@ -343,6 +449,7 @@ fn load_snapshot(
         target,
         required_capabilities,
         budget_headroom: context.budget_headroom,
+        free_slot,
         evidence,
     })
 }
@@ -365,15 +472,15 @@ fn load_task(
     task_id: &str,
     run_spec: Option<&str>,
 ) -> Result<Option<TaskView>, PersistError> {
-    let row: Option<(String, i64, String, String, i64)> = tx
+    let row: Option<(String, i64, String, String, i64, bool)> = tx
         .query_row(
-            "SELECT state, revision, spec_id, role, cost_estimate FROM tasks WHERE task_id = ?1 AND run_id = ?2",
+            "SELECT state, revision, spec_id, role, cost_estimate, writer FROM tasks WHERE task_id = ?1 AND run_id = ?2",
             params![task_id, run_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
         )
         .optional()
         .map_err(sqlite_error)?;
-    let Some((state, rev, spec_id, role, cost)) = row else {
+    let Some((state, rev, spec_id, role, cost, writer)) = row else {
         return Ok(None);
     };
     let mut statement = tx
@@ -408,6 +515,7 @@ fn load_task(
         role,
         cost_estimate: u32::try_from(cost)
             .map_err(|_| PersistError::IntegrityViolation(format!("cost_estimate {cost}")))?,
+        writer,
         dependencies,
         requirements,
     }))
