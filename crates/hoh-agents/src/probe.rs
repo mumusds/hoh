@@ -306,6 +306,14 @@ thread_local! {
     static RENDERED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// The longest definition name (and so `$ref` target) the probe reads: resolving a reference then costs a bounded
+/// amount, however often it is used (M1T07R-40). The recorded 0.166.0 schema's longest is 54 bytes.
+const MAX_NAME: usize = 256;
+
+/// The longest number token the probe reads; longer ones are refused, so reading one is bounded (M1T07R-42). The
+/// recorded 0.166.0 schema's longest is 3 characters.
+const MAX_NUMBER: usize = 64;
+
 /// The draft-07 `$schema` the App Server schema files declare.
 const DRAFT_07: &str = "http://json-schema.org/draft-07/schema#";
 
@@ -442,6 +450,12 @@ fn draft7_well_formed(root: &serde_json::Value, work: &Work) -> Result<(), Strin
         Some(_) => return Err("/definitions: not an object".to_owned()),
     };
     for (name, s) in defs {
+        if name.len() > MAX_NAME {
+            let start: String = name.chars().take(32).collect();
+            return Err(format!(
+                "/definitions/{start}...: a definition name longer than {MAX_NAME} bytes"
+            ));
+        }
         let mut path = vec![Step::Key("definitions"), Step::Key(name)];
         schema(s, defs, &mut path, work)?;
     }
@@ -540,6 +554,13 @@ const REF_DEPTH: usize = 64;
 /// ends within a second (M1T07R-40). The recorded 0.166.0 schema needs about 150,000.
 const VALIDATION_BUDGET: u64 = 4_000_000;
 
+/// When reading the App Server schema must end: at doctor's shared deadline, and never later than the probe's own
+/// command limit from `now`, so a probe without a shared deadline is bounded too (M1T07R-40).
+fn reading_deadline(env: &ProbeEnv, now: Instant) -> Instant {
+    let own = now + env.timeout;
+    env.deadline.map_or(own, |shared| shared.min(own))
+}
+
 /// What one reading of the App Server schema may still spend: steps ([`VALIDATION_BUDGET`]) and, if set, doctor's
 /// shared deadline, read every 4096 steps; once either is used up validation is undecided (M1T07R-40).
 struct Work {
@@ -616,6 +637,9 @@ fn decimal(token: &str) -> Option<(bool, String, i64)> {
 /// `valid` stays exact on the probe's envelopes; `1e-400` (read as 0), `0.99999999999999999` (read as 1),
 /// `18446744073709551616` (beyond 64 bits) do not (M1T07R-39).
 fn reads_exactly(token: &str) -> bool {
+    if token.len() > MAX_NUMBER {
+        return false;
+    }
     if !token.contains(['.', 'e', 'E']) {
         return token.parse::<i64>().is_ok() || token.parse::<u64>().is_ok();
     }
@@ -658,6 +682,9 @@ fn inexact_number(text: &str, work: &Work) -> Result<Option<String>, ()> {
                 .position(|c| !(c.is_ascii_digit() || b"+-.eE".contains(c)))
                 .map_or(bytes.len(), |n| at + n);
             let token = &text[at..end];
+            if !work.spend(token.len()) {
+                return Err(());
+            }
             if !reads_exactly(token) {
                 return Ok(Some(token.to_owned()));
             }
@@ -980,20 +1007,30 @@ pub fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<CodexSchema, Prob
             argv: argv(launcher, &["app-server", "generate-json-schema"]),
             detail,
         };
+        // Reading the schema is bounded by doctor's shared deadline, or without one by the probe's own command limit
+        // (M1T07R-40).
+        let until = Some(reading_deadline(env, Instant::now()));
+        let work = Work::new(VALIDATION_BUDGET, until);
+        // The checks before validation are linear in the files; only the deadline bounds them, each file's bytes
+        // counted before it is parsed (M1T07R-40, -42).
+        let checks = Work::new(u64::MAX, until);
         let mut parsed = BTreeMap::new();
         let mut texts = BTreeMap::new();
         for file in files_under(&dir)? {
             if file.extension().is_some_and(|e| e == "json") {
                 let bytes = std::fs::read(&file)?;
+                if !checks.spend(bytes.len()) {
+                    return Err(unusable(format!(
+                        "{} was not read within the time limit",
+                        file.display()
+                    )));
+                }
                 let value = serde_json::from_slice::<serde_json::Value>(&bytes)
                     .map_err(|e| unusable(format!("{} is not JSON: {e}", file.display())))?;
                 parsed.insert(file.clone(), value);
                 texts.insert(file, String::from_utf8_lossy(&bytes).into_owned());
             }
         }
-        let work = Work::new(VALIDATION_BUDGET, env.deadline);
-        // The checks before validation are linear in the files; only doctor's deadline bounds them (M1T07R-40).
-        let checks = Work::new(u64::MAX, env.deadline);
         // The methods a file lists in the known form whose message can be valid: `envelope` is the message for a
         // method, checked against the file with the params left to the compat suite (M1T07R-33).
         let methods = |name: &str, sent: bool, envelope: &dyn Fn(&str) -> serde_json::Value| {
@@ -2035,6 +2072,34 @@ mod tests {
         let text = "[".to_owned() + &"0, ".repeat(10_000) + "0]";
         assert_eq!(inexact_number(&text, &Work::new(u64::MAX, None)), Ok(None));
         assert_eq!(inexact_number(&text, &Work::new(u64::MAX, past)), Err(()));
+        // A text without numbers costs its length too.
+        let words = "[\"".to_owned() + &"a".repeat(100_000) + "\"]";
+        assert_eq!(inexact_number(&words, &Work::new(u64::MAX, None)), Ok(None));
+        assert_eq!(inexact_number(&words, &Work::new(u64::MAX, past)), Err(()));
+        // One long number costs its length, so it reaches the deadline too (M1T07R-42).
+        let long = "[1".to_owned() + &"0".repeat(100_000) + "]";
+        assert_eq!(inexact_number(&long, &Work::new(u64::MAX, past)), Err(()));
+        // Without a shared deadline the probe's own command limit bounds the reading; with one, the earlier wins.
+        let now = Instant::now();
+        let env = |deadline| ProbeEnv {
+            path: OsString::new(),
+            fixture_root: None,
+            timeout: Duration::from_secs(20),
+            log: None,
+            deadline,
+        };
+        assert_eq!(
+            reading_deadline(&env(None), now),
+            now + Duration::from_secs(20)
+        );
+        assert_eq!(
+            reading_deadline(&env(Some(now + Duration::from_secs(5))), now),
+            now + Duration::from_secs(5)
+        );
+        assert_eq!(
+            reading_deadline(&env(Some(now + Duration::from_secs(50))), now),
+            now + Duration::from_secs(20)
+        );
         // An error names its position.
         let bad = serde_json::json!({"definitions": {"D": {"anyOf": [true, {"not": {}}]}}});
         assert!(
