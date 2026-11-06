@@ -23,6 +23,8 @@ pub mod persistence;
 #[forbid(clippy::disallowed_methods)]
 pub mod protocol;
 #[forbid(clippy::disallowed_methods)]
+pub mod schedule;
+#[forbid(clippy::disallowed_methods)]
 pub mod schema;
 #[forbid(clippy::disallowed_methods)]
 pub mod time;
