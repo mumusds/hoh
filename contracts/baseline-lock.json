@@ -1,11 +1,11 @@
 {
   "schema_version": "1.1",
   "baseline_id": "HOH-BASELINE-1.1",
-  "revision": 7,
+  "revision": 8,
   "change_policy": "Formal CR + new baseline; never lower required gates to pass",
   "previous": {
     "baseline_id": "HOH-BASELINE-1.1",
-    "lock_sha256": "5ad3635dab9f6a982d0fa245302395546d9e83d64e2c93932a446d0ed9c7e610"
+    "lock_sha256": "3f85227297da050994414086f4ffa43512bb76cc662904f1df78b739a0242e64"
   },
   "change_requests": [
     {
@@ -37,6 +37,11 @@
       "id": "CR-006",
       "path": "docs/cr/CR-006-db-full-and-test-seams.md",
       "sha256": "0e5ca104d7744167249c765125309c401157fa7a3debb87620da27a0d91ca695"
+    },
+    {
+      "id": "CR-007",
+      "path": "docs/cr/CR-007-scheduler-config-and-lease-codes.md",
+      "sha256": "7307e5c667eeed80821c715d86ae7f5a6c08994f8fb5278751e149d52608da93"
     }
   ],
   "files": {
@@ -51,10 +56,10 @@
     "contracts/live-session.schema.json": "06ee125373701d6569477be0396e6e11e6b28b7f89903a020f0f241e3ce32793",
     "contracts/native-attempt.schema.json": "34fce4de57f4dcf79a9023d66f546ef75f96a0bbccd569c982e8a4c300a25220",
     "contracts/openapi.json": "3159572fd5dc18f4f32a91c754b607223a085aca2c76d5f7ce28696a0417ffd7",
-    "contracts/protocol.schema.json": "08f04814a5c4c5722c52dcf2caab63bf3cfeefbcb86fdb6171cf0cffd823c7a8",
+    "contracts/protocol.schema.json": "8e013f96f3b3f04045fdf67507a6edc88c3d421c8bcf423084a905480fabbbaf",
     "contracts/release-policy.json": "e54581614356ad310351994a6cdb94bfe5a170f8c9d06d852d92c3e9bbb03204",
     "contracts/release.schema.json": "c482028ebde16055ed00c4e3c2d1a86b27114fae447669c3dab17d1a5eb43ab7",
-    "contracts/requirements.json": "daa233ca1a4fead5ef134bf58876c377662498c43585b9c7857a5407925326a6",
+    "contracts/requirements.json": "27a73c3c8f26808ee600684ec00c3bcbc46e2f9fa46c9e7dbc7632b9a9c1b520",
     "contracts/soak-event.schema.json": "87f1f9590bf2467308e38d9fe00d5a9395f06a887187e58ee4670ce586c25c6b",
     "contracts/sql/001_initial.sql": "286f56252a4f113ff121fd57935909617a30b849628aecfb5fb1c9bae407c36b",
     "contracts/test-result.schema.json": "9bffa29e3bd9ed19c6b40de93bc15394c87d55d43f668b4e0083b5b6a1f8ed51",

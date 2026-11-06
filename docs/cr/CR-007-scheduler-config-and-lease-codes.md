@@ -1,8 +1,8 @@
 # CR-007 · 调度参数的配置与快照、租约占用与重复任务的原因码
 
 ID：CR-007
-状态：PROPOSED
-批准人：（待独立 Review 后按 CR-003 D1 预授权批准）
+状态：APPROVED
+批准人：CTO 依 CR-003 D1 预授权（独立 Review 会话 01a1b316-cc3b-7551-aad1-71571139d837；第 1 轮会话 01a1b30c-690d-7462-82b9-5b9596587160）
 日期：2026-11-06
 基线：HOH-BASELINE-1.1 revision 7 → revision 8
 
@@ -74,3 +74,6 @@ REQ-018 decisions 5、REQ-037 decisions、REQ-038 decisions 中相应补记（�
 - 第 1 轮（Codex，会话 01a1b30c-690d-7462-82b9-5b9596587160）：FAIL。D1 四条均判定满足（ConfigureTeam 扩展不需所有者批准；对任何已存在的 Run 返回 409 与 REQ-038 一致；三个新码都有必要；current_revision=null 可以接受）。
   - CR7-01（high）：新定义 SchedulerSettings 没有直接语料，bundle 的定义覆盖测试必然失败（relock 之后才会显出来）。已补七条 `def: SchedulerSettings` 的有效与无效语料。
   - CR7-02（medium）：五个新整数字段未用 `crate::integer::option`，schema 合法的 `20.0`、`1e1` 解码失败。已改用它，并在整值浮点测试中覆盖这五个字段。
+- 第 2 轮（Codex，会话 01a1b316-cc3b-7551-aad1-71571139d837）：PASS，无新发现。CR7-01、CR7-02 已解决；123 组数值输入在 Python jsonschema、产品校验器与两条 Rust 解码路径上结论一致；修复不改变 D1 四条的判定。在临时副本中批准并 relock 后完整 bundle 通过。
+- 送审提交 489c468 有一行未过 `cargo fmt --check`（protocol_roundtrip.rs 的一个断言），批准前已用 cargo fmt 修正，只改换行。
+
