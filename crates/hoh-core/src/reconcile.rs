@@ -96,6 +96,8 @@ pub struct Unfinished {
     pub task_state: TaskState,
     pub process: Process,
     pub effects: Vec<Effect>,
+    /// A lease it holds has expired: a PREPARED attempt can no longer start (a writer start needs an unexpired lease).
+    pub lease_expired: bool,
 }
 
 /// What an effect becomes.
@@ -190,7 +192,7 @@ pub fn dispose(u: &Unfinished) -> Disposition {
             task_to: (u.task_state == TaskState::Running).then_some(TaskState::Implemented),
         };
     }
-    if u.state == AttemptState::Prepared {
+    if u.state == AttemptState::Prepared && !u.lease_expired {
         return Disposition::Redeliver;
     }
     Disposition::Ended {
@@ -219,6 +221,7 @@ mod tests {
             },
             process,
             effects,
+            lease_expired: false,
         }
     }
 
@@ -362,6 +365,20 @@ mod tests {
             Disposition::Completed {
                 effects: vec![],
                 task_to: None
+            }
+        );
+    }
+
+    #[test]
+    fn a_prepared_attempt_whose_lease_expired_ends_instead_of_waiting_to_start() {
+        let mut stale = unfinished(AttemptState::Prepared, Process::NotStarted, vec![]);
+        stale.lease_expired = true;
+        assert_eq!(
+            dispose(&stale),
+            Disposition::Ended {
+                to: AttemptState::Cancelled,
+                task_to: TaskState::Ready,
+                effects: vec![]
             }
         );
     }

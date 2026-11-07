@@ -5,7 +5,7 @@
 use hoh_app::host::{Host, HostConfig};
 use hoh_core::decision::{Context, Proposal};
 use hoh_core::persistence::selftest::{PROBE_ARG, ProbeCommand};
-use hoh_core::persistence::{FaultHooks, WritePoint};
+use hoh_core::persistence::{Commit, FaultHooks, NewEvent, WritePoint};
 use hoh_core::protocol::Message;
 use serde_json::{Value, json};
 use std::os::unix::process::ExitStatusExt;
@@ -1028,5 +1028,284 @@ fn test_041_01_kill_at_each_point_of_a_dispatch_never_runs_an_effect_twice() -> 
         "test-041-01.json",
         &json!({"runs": runs, "count": runs.len()}),
     )?;
+    Ok(())
+}
+
+/// A clock the test moves (CR-006 F2: a clock swapped by test code).
+#[derive(Debug)]
+struct FakeClock(std::sync::Mutex<std::time::SystemTime>);
+
+impl hoh_core::delivery::Clock for FakeClock {
+    fn now(&self) -> std::time::SystemTime {
+        self.0.lock().map(|t| *t).unwrap_or(std::time::UNIX_EPOCH)
+    }
+}
+
+/// Starts each attempt's work as an agent that ignores SIGTERM (and passes the ignore to its children) and never
+/// ends; its native cancel is recorded, and ignored too. Every group it started is killed when it is dropped.
+#[derive(Debug)]
+struct StuckExecutor {
+    cancels: PathBuf,
+    started: std::sync::Mutex<Vec<u32>>,
+}
+
+impl hoh_app::host::Executor for StuckExecutor {
+    fn deliver(
+        &self,
+        _work: &hoh_app::host::Work,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
+        let (answer, ack) = tokio::sync::oneshot::channel();
+        let _ = answer.send(Ok(()));
+        ack
+    }
+
+    fn start(&self, _work: &hoh_app::host::Work) -> Result<hoh_app::host::Started, String> {
+        use std::os::unix::process::CommandExt as _;
+        let mut child = Command::new("sh")
+            .args(["-c", "trap '' TERM; while :; do sleep 0.05; done"])
+            .process_group(0)
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        let pid = child.id();
+        if let Ok(mut started) = self.started.lock() {
+            started.push(pid);
+        }
+        let (end, ended) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let status = child.wait();
+            let _ = end.send(hoh_app::host::Outcome {
+                success: false,
+                detail: format!("{status:?}"),
+            });
+        });
+        Ok(hoh_app::host::Started { pid, ended })
+    }
+
+    fn cancel(&self, work: &hoh_app::host::Work) {
+        use std::io::Write as _;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.cancels)
+        {
+            let _ = writeln!(file, "{}", work.attempt_id);
+        }
+    }
+}
+
+impl Drop for StuckExecutor {
+    fn drop(&mut self) {
+        for pid in self.started.lock().map(|p| p.clone()).unwrap_or_default() {
+            if let Some(pgid) = i32::try_from(pid)
+                .ok()
+                .and_then(rustix::process::Pid::from_raw)
+            {
+                let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::KILL);
+            }
+        }
+    }
+}
+
+/// AC-041-02's world: run R RUNNING with two writer tasks READY after T0, whose attempt A0 settled holding the
+/// writer lease at epoch 3 (so T1's attempt gets epoch 4, the next grant 5).
+const WRITERS: &str = "
+INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s2', :p, printf('%064d', 2), 2);
+INSERT INTO runs(run_id, project_id, spec_id, state, mode, revision, created_at) VALUES ('R', :p, 's2', 'RUNNING', 'AUTO', 7, '2026-11-07T00:00:00Z');
+INSERT INTO sessions(session_id, agent, role, agent_version, capabilities_json) VALUES
+  ('sd', 'claude', 'developer', '1', '{\"structured_events\": true, \"command_exec\": true}');
+INSERT INTO role_bindings(run_id, role, agent, session_id, role_epoch, config_revision, bound_at) VALUES
+  ('R', 'developer', 'claude', 'sd', 2, 1, '2026-11-07T00:00:00Z');
+INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate) VALUES
+  ('T0', 'R', 's2', 'ACCEPTED', 5, 'developer', 1, 1, 1), ('T1', 'R', 's2', 'READY', 1, 'developer', 1, 2, 1),
+  ('T2', 'R', 's2', 'READY', 1, 'developer', 1, 3, 1);
+INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, ended_at) VALUES
+  ('A0', 'T0', 'SETTLED', 2, 1, 1, '2026-11-07T00:00:00Z');
+INSERT INTO leases(project_id, kind, attempt_id, epoch, expires_at) VALUES (:p, 'writer', 'A0', 3, '2026-11-07T00:00:00Z');
+";
+
+/// AC-041-02: writer lease epoch 4 held by A1, whose agent's process group runs and ignores SIGTERM; the clock is
+/// moved past its expiry. The runner inspects, sends the native cancel, SIGTERM, SIGKILL, confirms the reap, and only
+/// then is epoch 5 granted, with no process of A1's group left; A1's late TaskResult is STALE_LEASE_EPOCH with the
+/// task's revision unchanged and one history event; a write of the old host epoch changes 0 rows and is an
+/// IntegrityViolation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_041_02_an_expired_lease_is_granted_again_only_after_its_holder_is_reaped() -> R {
+    let dir = tempfile::tempdir()?;
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    let (code, stderr) = serve_and_stop(&project)?;
+    assert_eq!(code, 0, "{stderr}");
+    seed(&project, WRITERS)?;
+    let start = std::time::SystemTime::now();
+    let clock = Arc::new(FakeClock(std::sync::Mutex::new(start)));
+    let executor = Arc::new(StuckExecutor {
+        cancels: dir.path().join("cancels"),
+        started: std::sync::Mutex::new(Vec::new()),
+    });
+    let mut config = config(&project);
+    config.clock = hoh_app::host::HostClock(clock.clone());
+    config.reconcile.term_grace = Duration::from_millis(300);
+    config.reconcile.kill_grace = Duration::from_secs(5);
+    let developer = ["structured_events", "command_exec"].map(str::to_owned);
+    config.runner = Some(hoh_app::host::RunnerConfig {
+        executor: executor.clone(),
+        context: Context {
+            required_capabilities: [("developer".to_owned(), developer.into_iter().collect())]
+                .into(),
+            ..Context::default()
+        },
+    });
+    let host = Host::start(config).await?;
+    let db = db(&project);
+    let scalar = |sql: &str| -> R<String> {
+        Ok(python(
+            &db,
+            "import sqlite3,sys; r=sqlite3.connect(sys.argv[1]).execute(sys.stdin.read()).fetchone(); print('' if r is None or r[0] is None else r[0])",
+            sql,
+        )?
+        .trim()
+        .to_owned())
+    };
+    let until = |sql: &str, want: &str| -> R<bool> {
+        let end = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < end {
+            if scalar(sql)? == want {
+                return Ok(true);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Ok(false)
+    };
+    // A1: T1's attempt, holding writer epoch 4, running its agent.
+    assert!(until(
+        "SELECT a.state || ':' || l.epoch FROM attempts a JOIN leases l ON l.attempt_id = a.attempt_id \
+         WHERE a.task_id = 'T1' AND l.kind = 'writer'",
+        "RUNNING:4"
+    )?);
+    let a1 = scalar("SELECT attempt_id FROM attempts WHERE task_id = 'T1'")?;
+    let pid: u32 = scalar(&format!(
+        "SELECT pid FROM attempts WHERE attempt_id = '{a1}'"
+    ))?
+    .parse()?;
+    let t1_revision = scalar("SELECT revision FROM tasks WHERE task_id = 'T1'")?;
+    if let Ok(mut now) = clock.0.lock() {
+        *now = start + Duration::from_secs(300);
+    }
+    // The next grant: epoch 5, after A1's chain.
+    assert!(until(
+        "SELECT count(*) FROM outbox WHERE json_extract(payload_json, '$.kind') = 'dispatch' \
+         AND json_extract(payload_json, '$.lease.epoch') = 5",
+        "1"
+    )?);
+    let left = hoh_agents::process::group_members(pid);
+    let read: Value = serde_json::from_str(&python(
+        &db,
+        &format!(
+            r#"
+import json, sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+steps = [[r[0], r[1]] for r in c.execute(
+    "SELECT seq, kind FROM events WHERE kind LIKE 'lease.%' AND json_extract(payload_json, '$.attempt_id') = '{a1}' ORDER BY seq")]
+grant = c.execute("SELECT event_seq, json_extract(payload_json, '$.attempt_id') FROM outbox WHERE json_extract(payload_json, '$.lease.epoch') = 5").fetchone()
+disposed = [json.loads(r[0]) for r in c.execute(
+    "SELECT payload_json FROM events WHERE kind = 'reconcile.attempt' AND json_extract(payload_json, '$.attempt_id') = '{a1}'")]
+print(json.dumps({{"steps": steps, "grant": list(grant), "disposed": disposed,
+                  "a1": c.execute("SELECT state FROM attempts WHERE attempt_id = '{a1}'").fetchone()[0]}}))
+"#
+        ),
+        "",
+    )?)?;
+    let kinds: Vec<&str> = read["steps"]
+        .as_array()
+        .ok_or("no steps")?
+        .iter()
+        .filter_map(|s| s[1].as_str())
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "lease.inspected",
+            "lease.native_cancel",
+            "lease.sigterm",
+            "lease.sigkill",
+            "lease.reaped"
+        ],
+        "{read}"
+    );
+    let last_step = read["steps"][4][0].as_i64().ok_or("no reap")?;
+    assert!(read["grant"][0].as_i64() > Some(last_step), "{read}");
+    assert_ne!(read["grant"][1], json!(a1));
+    assert!(left.is_empty(), "A1's group still has {left:?}");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("cancels"))?.trim(),
+        a1
+    );
+    assert_eq!(read["disposed"][0]["cause"], json!("lease_expired"));
+    // A1's late result: refused, the task's revision unchanged, one history event.
+    let late: hoh_core::protocol::TaskResult = serde_json::from_value(json!({
+        "schema_version": "1.0", "run_id": "R", "task_id": "T1", "attempt_id": a1, "role": "developer",
+        "role_epoch": 2, "status": "COMPLETED", "summary": "late", "candidate_id": null, "evidence": [],
+        "issues": [], "next_action": "verify"
+    }))?;
+    let outcome = host.store().accept_task_result(late).await?;
+    assert!(
+        matches!(
+            outcome,
+            hoh_core::persistence::TaskResultOutcome::Rejected {
+                reason: hoh_core::protocol::RejectionReason::StaleLeaseEpoch,
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        scalar("SELECT revision FROM tasks WHERE task_id = 'T1'")?,
+        t1_revision
+    );
+    assert_eq!(
+        scalar(&format!(
+            "SELECT count(*) FROM events WHERE kind = 'task_result.rejected' AND json_extract(payload_json, '$.attempt_id') = '{a1}'"
+        ))?,
+        "1"
+    );
+    // A newer host began on the database: the old host's next write changes nothing.
+    let newer = hoh_core::persistence::Store::open(
+        &db,
+        hoh_core::persistence::Options {
+            wal_probe: Some(probe()),
+            ..hoh_core::persistence::Options::default()
+        },
+    )?;
+    let repo = std::fs::canonicalize(&project)?;
+    newer.begin_host("unused", &repo.to_string_lossy()).await?;
+    let events = scalar("SELECT count(*) FROM events")?;
+    let refused = host
+        .store()
+        .commit(Commit {
+            events: vec![NewEvent {
+                project_id: host.project_id.clone(),
+                event_id: "old-host-write".to_owned(),
+                run_id: Some("R".to_owned()),
+                kind: "test.write".to_owned(),
+                payload: json!({}),
+            }],
+            ..Commit::default()
+        })
+        .await
+        .expect_err("fenced");
+    assert!(
+        matches!(&refused, hoh_core::persistence::PersistError::IntegrityViolation(m) if m.contains("0 rows")),
+        "{refused:?}"
+    );
+    assert_eq!(scalar("SELECT count(*) FROM events")?, events);
+    keep(
+        "test-041-02.json",
+        &json!({"a1": a1, "pid": pid, "group_left_at_grant": left, "read": read, "late_result": format!("{outcome:?}"),
+                "old_host_write": refused.to_string()}),
+    )?;
+    drop(newer);
+    host.shutdown().await;
+    drop(executor);
     Ok(())
 }

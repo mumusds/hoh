@@ -611,14 +611,16 @@ impl Store {
     /// transaction (REQ-035, docs/adr/ADR-011.md §3). A kind that is not applied yet is refused before anything is
     /// written.
     /// The project's unfinished attempts (PREPARED, STARTING, RUNNING) with their tasks, process records and
-    /// effects, for the reconcile at a host's start (REQ-041 b1, ADR-019 decision 5).
+    /// effects as of `now`, for the reconcile at a host's start and the runner's lease expiry (REQ-041 b1, ADR-019
+    /// decisions 5 and 7).
     pub async fn reconcile_scan(
         &self,
         project_id: &str,
+        now: std::time::SystemTime,
     ) -> Result<Vec<UnfinishedRow>, PersistError> {
         match self
             .writer
-            .reconcile(reconcile::ReconcileJob::Scan(project_id.to_owned()))
+            .reconcile(reconcile::ReconcileJob::Scan(project_id.to_owned(), now))
             .await?
         {
             reconcile::ReconcileDone::Scanned(rows) => Ok(rows),
@@ -643,17 +645,20 @@ impl Store {
         .await
     }
 
-    /// One attempt's disposition, with what was found of its process, in one transaction; the seq of its last event.
+    /// One attempt's disposition, with what was found of its process and why (`reconcile` at a host's start,
+    /// `lease_expired` when the runner found its lease expired), in one transaction; the seq of its last event.
     pub async fn reconcile_apply(
         &self,
         row: UnfinishedRow,
         disposition: crate::reconcile::Disposition,
         process: crate::reconcile::Process,
+        cause: &'static str,
     ) -> Result<i64, PersistError> {
         self.reconcile_event(reconcile::ReconcileJob::Apply(Box::new((
             row,
             disposition,
             process,
+            cause,
         ))))
         .await
     }
@@ -681,7 +686,7 @@ impl Store {
             .await?
         {
             runner::RunnerDone::Waiting(waiting) => Ok(waiting),
-            runner::RunnerDone::Applied(_) => Err(PersistError::IntegrityViolation(
+            _ => Err(PersistError::IntegrityViolation(
                 "a runner read answered with a write".to_owned(),
             )),
         }
@@ -747,10 +752,28 @@ impl Store {
             .await
     }
 
+    /// Renew the unexpired leases `attempts` hold, at `now` for [`LEASE_TTL`]; how many were renewed.
+    pub async fn renew_leases(
+        &self,
+        attempts: Vec<String>,
+        now: std::time::SystemTime,
+    ) -> Result<usize, PersistError> {
+        match self
+            .writer
+            .runner(runner::RunnerJob::Renew(attempts, now))
+            .await?
+        {
+            runner::RunnerDone::Renewed(n) => Ok(n),
+            _ => Err(PersistError::IntegrityViolation(
+                "a renewal answered with something else".to_owned(),
+            )),
+        }
+    }
+
     async fn runner_step(&self, job: runner::RunnerJob) -> Result<bool, PersistError> {
         match self.writer.runner(job).await? {
             runner::RunnerDone::Applied(applied) => Ok(applied),
-            runner::RunnerDone::Waiting(_) => Err(PersistError::IntegrityViolation(
+            _ => Err(PersistError::IntegrityViolation(
                 "a runner write answered with a read".to_owned(),
             )),
         }

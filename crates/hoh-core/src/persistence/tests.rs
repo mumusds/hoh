@@ -1524,3 +1524,41 @@ async fn a_store_whose_host_never_began_is_not_fenced() -> R {
         .await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn an_attempt_left_unfinished_is_disposed_of_again_with_events_of_its_own() -> R {
+    // ADR-019 decision 5: a redelivered (or unreaped) attempt is still unfinished at the next start; its second
+    // disposition must not collide with the first's event ids.
+    use crate::reconcile::{Disposition, Process};
+    let dir = tempfile::tempdir()?;
+    let path = db_in(&dir);
+    let store = Store::open(&path, test_options())?;
+    seed(&path)?;
+    Connection::open(&path)?.execute_batch(
+        "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', 'p1', printf('%064d', 1), 1);
+         INSERT INTO tasks(task_id, run_id, spec_id, state, role, created_seq) VALUES ('t1', 'r1', 's1', 'LEASED', 'developer', 1);
+         INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision) VALUES ('a1', 't1', 'PREPARED', 1, 1, 1);",
+    )?;
+    for _ in 0..2 {
+        let rows = store
+            .reconcile_scan("p1", std::time::SystemTime::now())
+            .await?;
+        assert_eq!(rows.len(), 1);
+        store
+            .reconcile_apply(
+                rows[0].clone(),
+                Disposition::Redeliver,
+                Process::NotStarted,
+                "reconcile",
+            )
+            .await?;
+    }
+    let conn = Connection::open(&path)?;
+    let n: i64 = conn.query_row(
+        "SELECT count(*) FROM events WHERE kind = 'reconcile.attempt'",
+        [],
+        |r| r.get(0),
+    )?;
+    assert_eq!(n, 2);
+    Ok(())
+}

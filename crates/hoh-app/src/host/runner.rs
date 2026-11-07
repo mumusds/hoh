@@ -12,14 +12,16 @@
 //! looked for, never done again. The product has no executor yet (agents are bound to roles with M2-T07), so the
 //! product host runs no runner.
 
-use super::{HostHooks, http::Shared};
+use super::{HostHooks, ReconcileSettings, http::Shared};
+use hoh_agents::identity::{self, StopStep};
 use hoh_core::decision::Context;
-use hoh_core::persistence::{DispatchNotice, PersistError};
-use hoh_core::reconcile::{EffectState, work_key};
-use serde_json::json;
-use std::collections::BTreeSet;
+use hoh_core::delivery::Clock;
+use hoh_core::persistence::{Commit, DispatchNotice, NewEvent, PersistError, UnfinishedRow};
+use hoh_core::reconcile::{self, Disposition, Effect, EffectState, Process, Unfinished, work_key};
+use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, watch};
 
 /// What an executor is given for one attempt.
@@ -53,6 +55,9 @@ pub trait Executor: Send + Sync + std::fmt::Debug {
     fn deliver(&self, work: &Work) -> oneshot::Receiver<Result<(), String>>;
     /// Start `work`'s process; called once its work effect is STARTED.
     fn start(&self, work: &Work) -> Result<Started, String>;
+    /// Ask `work`'s process to stop the agent's own way (its native cancel), before any signal: the first step when its
+    /// lease expired (AC-041-02).
+    fn cancel(&self, _work: &Work) {}
 }
 
 /// The runner's fault injection points (CR-006): the product's hooks do nothing. In order, for one attempt: before
@@ -78,21 +83,51 @@ pub struct RunnerConfig {
 /// How often the runner looks again when nothing woke it.
 const TICK: Duration = Duration::from_millis(200);
 
+/// How often the leases of the attempts it runs are renewed (REQ-041: every 30 s, for 120 s).
+const RENEW: Duration = Duration::from_secs(30);
+
+/// The attempts the runner runs: what each was given and how to stop its task.
+#[derive(Default)]
+struct Inflight(BTreeMap<String, (Work, Option<tokio::task::AbortHandle>)>);
+
+/// What the runner keeps between ticks.
+struct Runner {
+    shared: Arc<Shared>,
+    config: RunnerConfig,
+    clock: Arc<dyn Clock>,
+    settings: ReconcileSettings,
+    inflight: Arc<Mutex<Inflight>>,
+    attempts: tokio::task::JoinSet<()>,
+    renewed: Instant,
+    /// Lease holders whose process outlived their stop: left blocked, with one diagnostic, until the next host.
+    given_up: BTreeSet<String>,
+}
+
 /// The runner of `shared`'s project until `stop`.
 pub(super) async fn run(
     shared: Arc<Shared>,
     config: RunnerConfig,
+    clock: Arc<dyn Clock>,
+    settings: ReconcileSettings,
     mut stop: watch::Receiver<bool>,
 ) {
-    let inflight: Arc<Mutex<BTreeSet<String>>> = Arc::default();
-    let mut attempts = tokio::task::JoinSet::new();
     let mut watermark = shared.store.watermark();
+    let mut runner = Runner {
+        shared,
+        config,
+        clock,
+        settings,
+        inflight: Arc::default(),
+        attempts: tokio::task::JoinSet::new(),
+        renewed: Instant::now(),
+        given_up: BTreeSet::new(),
+    };
     loop {
         if *stop.borrow() {
             break;
         }
-        while attempts.try_join_next().is_some() {}
-        if let Err(e) = tick(&shared, &config, &inflight, &mut attempts).await {
+        while runner.attempts.try_join_next().is_some() {}
+        if let Err(e) = runner.tick().await {
             use std::io::Write as _;
             let _ = writeln!(std::io::stderr(), "hoh host: the runner: {e}");
         }
@@ -104,54 +139,249 @@ pub(super) async fn run(
     }
     // The host stops: the attempts in flight are left as they are (their processes run on); the next host's reconcile
     // settles them (pausing and cancelling them is M2-T06's).
-    attempts.abort_all();
-    while attempts.join_next().await.is_some() {}
+    runner.attempts.abort_all();
+    while runner.attempts.join_next().await.is_some() {}
 }
 
-async fn tick(
-    shared: &Arc<Shared>,
-    config: &RunnerConfig,
-    inflight: &Arc<Mutex<BTreeSet<String>>>,
-    attempts: &mut tokio::task::JoinSet<()>,
-) -> Result<(), PersistError> {
-    let store = &shared.store;
-    let waiting = store.runner_waiting(&shared.project_id).await?;
-    for run in &waiting.runs {
-        while store
-            .schedule_round(run, config.context.clone())
-            .await?
-            .dispatched
-            .is_some()
-        {}
-    }
-    for (message_id, _) in &waiting.started {
-        store.ack_notice(message_id).await?;
-    }
-    // Dispatches made by these rounds are taken on the next tick (their commit wakes the loop).
-    for notice in waiting.dispatches {
-        let fresh = inflight
-            .lock()
-            .map(|mut set| set.insert(notice.attempt_id.clone()))
-            .unwrap_or(false);
-        if !fresh {
-            continue;
+impl Runner {
+    async fn tick(&mut self) -> Result<(), PersistError> {
+        let now = self.clock.now();
+        let project_id = self.shared.project_id.clone();
+        // Expired leases first, so the rounds below can grant their slots again (ADR-019 decision 7).
+        for row in self.shared.store.reconcile_scan(&project_id, now).await? {
+            if row.lease_expired && !self.given_up.contains(&row.attempt_id) {
+                self.expire(row).await?;
+            }
         }
-        let shared = shared.clone();
-        let executor = config.executor.clone();
-        let inflight = inflight.clone();
-        attempts.spawn(async move {
+        if self.renewed.elapsed() >= RENEW {
+            let running: Vec<String> = self
+                .inflight
+                .lock()
+                .map(|f| f.0.keys().cloned().collect())
+                .unwrap_or_default();
+            self.shared.store.renew_leases(running, now).await?;
+            self.renewed = Instant::now();
+        }
+        let store = &self.shared.store;
+        let waiting = store.runner_waiting(&project_id).await?;
+        let context = Context {
+            now: Some(now),
+            ..self.config.context.clone()
+        };
+        for run in &waiting.runs {
+            while store
+                .schedule_round(run, context.clone())
+                .await?
+                .dispatched
+                .is_some()
+            {}
+        }
+        for (message_id, _) in &waiting.started {
+            store.ack_notice(message_id).await?;
+        }
+        // Dispatches made by these rounds are taken on the next tick (their commit wakes the loop).
+        for notice in waiting.dispatches {
+            let work = Work {
+                run_id: notice.run_id.clone(),
+                task_id: notice.task_id.clone(),
+                attempt_id: notice.attempt_id.clone(),
+                role: notice.role.clone(),
+                effect_key: work_key(&notice.attempt_id),
+            };
+            let fresh = self
+                .inflight
+                .lock()
+                .map(|mut f| {
+                    let fresh = !f.0.contains_key(&notice.attempt_id);
+                    if fresh {
+                        f.0.insert(notice.attempt_id.clone(), (work.clone(), None));
+                    }
+                    fresh
+                })
+                .unwrap_or(false);
+            if !fresh {
+                continue;
+            }
+            let shared = self.shared.clone();
+            let executor = self.config.executor.clone();
+            let inflight = self.inflight.clone();
             let id = notice.attempt_id.clone();
-            if let Err(e) = attempt(&shared, executor.as_ref(), shared.hooks.as_ref(), notice).await
+            let handle = self.attempts.spawn(async move {
+                let id = notice.attempt_id.clone();
+                if let Err(e) = attempt(
+                    &shared,
+                    executor.as_ref(),
+                    shared.hooks.as_ref(),
+                    work,
+                    notice,
+                )
+                .await
+                {
+                    use std::io::Write as _;
+                    let _ = writeln!(std::io::stderr(), "hoh host: attempt {id}: {e}");
+                }
+                if let Ok(mut f) = inflight.lock() {
+                    f.0.remove(&id);
+                }
+            });
+            if let Ok(mut f) = self.inflight.lock()
+                && let Some(entry) = f.0.get_mut(&id)
             {
-                use std::io::Write as _;
-                let _ = writeln!(std::io::stderr(), "hoh host: attempt {id}: {e}");
+                entry.1 = Some(handle);
             }
-            if let Ok(mut set) = inflight.lock() {
-                set.remove(&id);
-            }
-        });
+        }
+        Ok(())
     }
-    Ok(())
+
+    /// One event of a lease's expiry, committed on its own so the steps keep their order (AC-041-02).
+    async fn step(
+        &self,
+        row: &UnfinishedRow,
+        name: &str,
+        payload: Value,
+    ) -> Result<(), PersistError> {
+        self.shared
+            .store
+            .commit(Commit {
+                events: vec![NewEvent {
+                    project_id: row.project_id.clone(),
+                    event_id: hoh_core::ids::child_id(
+                        &row.attempt_id,
+                        &format!("lease-expired/{}/{name}", row.lease_epoch.unwrap_or(0)),
+                    ),
+                    run_id: Some(row.run_id.clone()),
+                    kind: format!("lease.{name}"),
+                    payload,
+                }],
+                ..Commit::default()
+            })
+            .await
+            .map(drop)
+    }
+
+    /// An attempt whose lease expired (REQ-041 b4): never judged dead by the expiry alone. Its own task here stops
+    /// first (so nothing else writes for it), then: inspect its process, its native cancel, SIGTERM to its group,
+    /// SIGKILL, the reap confirmed; then its disposition as at a reconcile, which lets the lease go only once it is
+    /// ended. A process that outlives its stop moves nothing: its lease stays held, no writer lease is granted.
+    async fn expire(&mut self, stale: UnfinishedRow) -> Result<(), PersistError> {
+        let id = stale.attempt_id.clone();
+        let work = self
+            .inflight
+            .lock()
+            .ok()
+            .and_then(|f| f.0.get(&id).cloned());
+        if let Some((_, Some(handle))) = &work {
+            handle.abort();
+        }
+        // Read it again now that nothing of this host writes for it.
+        let now = self.clock.now();
+        let Some(row) = self
+            .shared
+            .store
+            .reconcile_scan(&self.shared.project_id, now)
+            .await?
+            .into_iter()
+            .find(|r| r.attempt_id == id)
+        else {
+            return Ok(());
+        };
+        let record = (row.pid, row.boot_id.clone(), row.process_start_id.clone());
+        let found = tokio::task::spawn_blocking(move || {
+            identity::find(record.0, record.1.as_deref(), record.2.as_deref())
+        })
+        .await
+        .map_err(|e| PersistError::Storage(format!("the lease's inspection ended: {e}")))?
+        .map_err(|e| PersistError::Storage(format!("cannot look for the process of {id}: {e}")))?;
+        self.step(
+            &row,
+            "inspected",
+            json!({"attempt_id": id, "lease_epoch": row.lease_epoch, "found": match &found {
+                Ok(_) => json!("ours"), Err(gone) => json!({"gone": gone.basis()}),
+            }}),
+        )
+        .await?;
+        let native = work.as_ref().map(|(w, _)| w.clone());
+        if let Some(work) = &native {
+            self.config.executor.cancel(work);
+        }
+        self.step(
+            &row,
+            "native_cancel",
+            json!({"attempt_id": id, "sent": native.is_some()}),
+        )
+        .await?;
+        let process = match found {
+            Err(gone) => Process::Gone {
+                basis: gone.basis().to_owned(),
+            },
+            Ok(ours) => {
+                let (term, kill) = (self.settings.term_grace, self.settings.kill_grace);
+                let stopped = tokio::task::spawn_blocking(move || {
+                    // The native cancel's grace first: a process that ended by it gets no signal.
+                    let end = Instant::now() + term;
+                    while !ours.exited() && Instant::now() < end {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    if ours.exited()
+                        && hoh_agents::process::group_members(ours.identity.pid).is_empty()
+                    {
+                        identity::Stopped {
+                            steps: vec![StopStep::Reaped],
+                            reaped: true,
+                        }
+                    } else {
+                        ours.stop(term, kill)
+                    }
+                })
+                .await
+                .map_err(|e| PersistError::Storage(format!("the stop of {id} ended: {e}")))?;
+                let mut names = Vec::new();
+                for step in &stopped.steps {
+                    let name = match step {
+                        StopStep::Term => "sigterm",
+                        StopStep::Kill => "sigkill",
+                        StopStep::Reaped => "reaped",
+                    };
+                    self.step(&row, name, json!({"attempt_id": id})).await?;
+                    names.push(name.to_owned());
+                }
+                Process::Stopped {
+                    steps: names,
+                    reaped: stopped.reaped,
+                }
+            }
+        };
+        let observer = self.settings.observer.clone();
+        let effects = row
+            .effects
+            .iter()
+            .map(|e| Effect {
+                key: e.key.clone(),
+                state: e.state,
+                observation: (e.state == EffectState::Started)
+                    .then(|| observer.observe(&id, &e.key)),
+            })
+            .collect();
+        let disposition = reconcile::dispose(&Unfinished {
+            attempt_id: id.clone(),
+            state: row.state,
+            task_state: row.task_state,
+            process: process.clone(),
+            effects,
+            lease_expired: true,
+        });
+        if disposition == Disposition::Unreaped {
+            self.given_up.insert(id.clone());
+        }
+        self.shared
+            .store
+            .reconcile_apply(row, disposition, process, "lease_expired")
+            .await?;
+        if let Ok(mut f) = self.inflight.lock() {
+            f.0.remove(&id);
+        }
+        Ok(())
+    }
 }
 
 /// One attempt from its dispatch to its end.
@@ -159,17 +389,11 @@ async fn attempt(
     shared: &Shared,
     executor: &dyn Executor,
     hooks: &dyn HostHooks,
+    work: Work,
     notice: DispatchNotice,
 ) -> Result<(), PersistError> {
     let store = &shared.store;
-    let key = work_key(&notice.attempt_id);
-    let work = Work {
-        run_id: notice.run_id.clone(),
-        task_id: notice.task_id.clone(),
-        attempt_id: notice.attempt_id.clone(),
-        role: notice.role.clone(),
-        effect_key: key.clone(),
-    };
+    let key = work.effect_key.clone();
     hooks.runner(RunnerPoint::BeforeSend);
     let ack = executor.deliver(&work);
     hooks.runner(RunnerPoint::AfterSend);
