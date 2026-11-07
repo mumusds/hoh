@@ -42,6 +42,7 @@ fn snapshot() -> Snapshot {
         }),
         required_capabilities: Some(caps(&["structured_events", "command_exec"])),
         budget_headroom: Some(1),
+        budget_stop: None,
         free_slot: Some("writer".to_owned()),
         // C1 is the run's one candidate in use; it has no passing evidence yet.
         evidence: Evidence {
@@ -99,6 +100,21 @@ fn a_dispatch_whose_lease_is_held_is_refused_last() {
     held.budget_headroom = Some(0);
     let rejection = validate(&dispatch_t1(), &held).expect_err("dispatched over budget");
     assert_eq!(rejection.reason, RejectionReason::BudgetNotReservable);
+}
+
+#[test]
+fn a_run_whose_budget_stops_it_dispatches_nothing_by_decision_either() {
+    // M2T19R-01: the run's persisted budget (a stop, or a cost limit with an unknown price) refuses a Commander's
+    // dispatch as it stops the rounds.
+    let mut stopped = snapshot();
+    stopped.budget_stop = Some("deadline_at".to_owned());
+    let rejection = validate(&dispatch_t1(), &stopped).expect_err("dispatched past its budget");
+    assert_eq!(rejection.reason, RejectionReason::BudgetNotReservable);
+    assert!(
+        rejection.detail.contains("deadline_at"),
+        "{}",
+        rejection.detail
+    );
 }
 
 #[test]
