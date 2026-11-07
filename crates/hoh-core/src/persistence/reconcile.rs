@@ -297,9 +297,13 @@ fn apply(
     } = step;
     let cause = *cause;
     // An end its work recorded is when it ended: the duration accrued and its retry counted from it, not from this
-    // reconcile, which may come long after (a host down meanwhile, M2T19R-03). Without a record its end is not known
-    // and is taken as now: the duration is counted to now, the conservative side for a budget.
-    let at = &row.work_ended_at.unwrap_or(*at);
+    // reconcile, which may come long after (a host down meanwhile, M2T19R-03), but only once its work effect was
+    // COMMITTED, i.e. its group was seen empty (a leader's end with its group still running is not the work's end,
+    // M2T19R-155). Otherwise its end is not known and is taken as now: the conservative side for a budget.
+    let committed = row.effects.iter().any(|e| {
+        e.key == crate::reconcile::work_key(&row.attempt_id) && e.state == EffectState::Committed
+    });
+    let at = &row.work_ended_at.filter(|_| committed).unwrap_or(*at);
     let none: &[EffectMove] = &[];
     let (name, attempt_to, task_to, moves, unknown): (_, _, _, &[EffectMove], &[String]) =
         match disposition {

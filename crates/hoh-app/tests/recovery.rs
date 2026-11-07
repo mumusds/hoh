@@ -38,7 +38,7 @@ const CHILD_RUNNER_KILL: &str = "HOH_TEST_RECOVERY_RUNNER_KILL";
 const CHILD_FAIL_CLASS: &str = "HOH_TEST_RECOVERY_FAIL_CLASS";
 
 /// A file holding the child host's time in milliseconds since the epoch, read at each look: its clock (CR-006 F2: a
-/// clock test code injects; the product uses the system clock).
+/// clock test code injects; the product uses `MonotonicClock`, ADR-020 decision 4).
 const CHILD_CLOCK: &str = "HOH_TEST_RECOVERY_CLOCK";
 
 /// The child's exit code when it submitted its decision and was not killed.
