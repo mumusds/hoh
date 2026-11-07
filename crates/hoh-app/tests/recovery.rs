@@ -179,11 +179,18 @@ impl hoh_app::host::Executor for FakeExecutor {
     }
 }
 
-/// The executor's end of an attempt's process, as `Executor::start` requires: the leader's exit seen without reaping
-/// it (the zombie keeps its group's id), what it left in its group killed until the group is empty, then the leader
-/// reaped; `group_gone` says whether the group emptied (M2T05R-101, -202).
-fn reaping(
+/// The executor's end of an attempt's process, as `Executor::start` requires (the hoh-agents substrate's order,
+/// M2T05R-303): the leader's exit seen without reaping it, a SIGKILL to its group while the zombie holds the group's
+/// number, the leader reaped, then up to 5 s for the group to be empty (`kill(-pgid, 0)`); `group_gone` says whether
+/// it was.
+fn reaping(child: std::process::Child) -> tokio::sync::oneshot::Receiver<hoh_app::host::Outcome> {
+    reaping_after(child, Duration::ZERO)
+}
+
+/// [`reaping`] by a slow executor: `delay` between the leader's exit and the SIGKILL to its group.
+fn reaping_after(
     mut child: std::process::Child,
+    delay: Duration,
 ) -> tokio::sync::oneshot::Receiver<hoh_app::host::Outcome> {
     let (end, ended) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
@@ -197,18 +204,15 @@ fn reaping(
                 rustix::process::WaitIdOptions::EXITED | rustix::process::WaitIdOptions::NOWAIT,
             );
         }
-        let mut group_gone = false;
-        for _ in 0..500 {
-            match hoh_agents::identity::group_left(pid, pid) {
-                Ok(left) if left.is_empty() => {
-                    group_gone = true;
-                    break;
-                }
-                _ => kill_group(pid),
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        std::thread::sleep(delay);
+        kill_group(pid);
         let status = child.wait();
+        let until = Instant::now() + Duration::from_secs(5);
+        let mut group_gone = hoh_agents::identity::group_empty(pid);
+        while !group_gone && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+            group_gone = hoh_agents::identity::group_empty(pid);
+        }
         let _ = end.send(hoh_app::host::Outcome {
             success: status.as_ref().is_ok_and(std::process::ExitStatus::success),
             detail: format!("{status:?}"),
@@ -216,6 +220,20 @@ fn reaping(
         });
     });
     ended
+}
+
+/// What is in process group `pgid` now, leader included, as the evidence records it (M2T05R-360): a whole scan of
+/// /proc (whose failure is shown, never read as empty) and the kernel's look-up of the group.
+fn group_now(pgid: u32) -> Value {
+    json!({
+        "left": hoh_agents::identity::group_left(pgid, 0).map_err(|e| e.to_string()),
+        "empty": hoh_agents::identity::group_empty(pgid),
+    })
+}
+
+/// [`group_now`] of a group with nothing left in it.
+fn nothing_left() -> Value {
+    json!({"left": {"Ok": []}, "empty": true})
 }
 
 /// Looks for an attempt's work by the FakeAgent's marker.
@@ -781,7 +799,7 @@ fn an_old_hosts_live_agent_is_stopped_before_its_attempt_is_disposed_of() -> R {
     );
     assert_eq!(read["attempts"]["A2"], json!("FAILED"));
     assert_eq!(read["tasks"]["T2"], json!("READY"));
-    assert!(hoh_agents::process::group_members(pid).is_empty());
+    assert_eq!(group_now(pid), nothing_left());
     Ok(())
 }
 
@@ -1152,6 +1170,26 @@ impl hoh_app::host::Executor for StuckExecutor {
     }
 
     fn start(&self, _work: &hoh_app::host::Work) -> Result<hoh_app::host::Started, String> {
+        let (child, pid, gate) = self.spawn()?;
+        let ended = reaping(child);
+        Ok(hoh_app::host::Started { pid, gate, ended })
+    }
+
+    fn cancel(&self, work: &hoh_app::host::Work) {
+        use std::io::Write as _;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.cancels)
+        {
+            let _ = writeln!(file, "{}", work.attempt_id);
+        }
+    }
+}
+
+impl StuckExecutor {
+    /// Its agent's process at its gate.
+    fn spawn(&self) -> Result<(std::process::Child, u32, hoh_app::host::Gate), String> {
         use std::os::unix::process::CommandExt as _;
         let mut child = Command::new("sh")
             .args([
@@ -1169,19 +1207,7 @@ impl hoh_app::host::Executor for StuckExecutor {
         if let Ok(mut started) = self.started.lock() {
             started.push(pid);
         }
-        let ended = reaping(child);
-        Ok(hoh_app::host::Started { pid, gate, ended })
-    }
-
-    fn cancel(&self, work: &hoh_app::host::Work) {
-        use std::io::Write as _;
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.cancels)
-        {
-            let _ = writeln!(file, "{}", work.attempt_id);
-        }
+        Ok((child, pid, gate))
     }
 }
 
@@ -1203,7 +1229,7 @@ impl Drop for StuckExecutor {
 #[derive(Debug, Default)]
 struct GrantProbe {
     pid: std::sync::Mutex<Option<u32>>,
-    seen: std::sync::Mutex<Vec<Vec<u32>>>,
+    seen: std::sync::Mutex<Vec<Value>>,
 }
 
 impl FaultHooks for GrantProbe {
@@ -1211,7 +1237,7 @@ impl FaultHooks for GrantProbe {
         if job == "Round" && point == WritePoint::OutboxWritten {
             let pid = self.pid.lock().ok().and_then(|p| *p);
             if let (Some(pid), Ok(mut seen)) = (pid, self.seen.lock()) {
-                seen.push(hoh_agents::process::group_members(pid));
+                seen.push(group_now(pid));
             }
         }
     }
@@ -1310,7 +1336,7 @@ async fn test_041_02_an_expired_lease_is_granted_again_only_after_its_holder_is_
          AND json_extract(payload_json, '$.lease.epoch') = 5",
         "1"
     )?);
-    let left = hoh_agents::process::group_members(pid);
+    let left = group_now(pid);
     let read: Value = serde_json::from_str(&python(
         &db,
         &format!(
@@ -1348,14 +1374,14 @@ print(json.dumps({{"steps": steps, "grant": list(grant), "disposed": disposed,
     let last_step = read["steps"][4][0].as_i64().ok_or("no reap")?;
     assert!(read["grant"][0].as_i64() > Some(last_step), "{read}");
     assert_ne!(read["grant"][1], json!(a1));
-    assert!(left.is_empty(), "A1's group still has {left:?}");
+    assert_eq!(left, nothing_left(), "A1's group");
     // At the grant itself, inside its transaction: no process of A1's group left (the only dispatching round since).
     let at_grant = grant_probe
         .seen
         .lock()
         .map(|s| s.clone())
         .unwrap_or_default();
-    assert_eq!(at_grant, [Vec::<u32>::new()], "{at_grant:?}");
+    assert_eq!(at_grant, [nothing_left()], "{at_grant:?}");
     assert_eq!(
         std::fs::read_to_string(dir.path().join("cancels"))?.trim(),
         a1
@@ -1575,7 +1601,7 @@ async fn a_leaderless_group_keeps_its_slot_and_gets_no_signal() -> R {
     while hoh_agents::identity::start_id(leader)?.is_some() && Instant::now() < end {
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert!(!hoh_agents::process::group_members(leader).is_empty());
+    assert!(!hoh_agents::identity::group_empty(leader));
     seed(
         &project,
         &format!(
@@ -1635,7 +1661,7 @@ async fn a_leaderless_group_keeps_its_slot_and_gets_no_signal() -> R {
         )?,
         "uncertain/unreaped"
     );
-    assert!(!hoh_agents::process::group_members(leader).is_empty());
+    assert!(!hoh_agents::identity::group_empty(leader));
     assert_eq!(std::fs::read_to_string(&log).unwrap_or_default(), "");
     // One settle written for its expired lease over many retries.
     assert_eq!(
@@ -1793,7 +1819,7 @@ async fn a_lost_completion_is_settled_never_run_again() -> R {
         &format!("SELECT pid FROM attempts WHERE attempt_id = '{a1}'"),
     )?
     .parse()?;
-    assert!(hoh_agents::process::group_members(pid).is_empty());
+    assert_eq!(group_now(pid), nothing_left());
     assert_eq!(
         query(&db, "SELECT count(*) FROM attempts WHERE task_id = 'T1'")?,
         "1"
@@ -2142,8 +2168,7 @@ impl hoh_app::host::Executor for LeavesAMember {
                 let _ = end.send(hoh_app::host::Outcome {
                     success: status.as_ref().is_ok_and(std::process::ExitStatus::success),
                     detail: format!("{status:?}"),
-                    group_gone: hoh_agents::identity::group_left(pid, pid)
-                        .is_ok_and(|l| l.is_empty()),
+                    group_gone: hoh_agents::identity::group_empty(pid),
                 });
             });
             ended
@@ -2162,9 +2187,10 @@ impl Drop for LeavesAMember {
     }
 }
 
-/// M2T05R-101: A1's leader ends with success but leaves a member in its group that ignores SIGTERM. The runner ends
-/// that group (held by its pidfd) before A1 settles, so when T2 is granted the writer lease no process of A1's group
-/// is left (scanned inside the granting round).
+/// M2T05R-101, -357: A1's leader ends with success but leaves a member in its group that ignores SIGTERM. An executor
+/// keeping the contract (`reaping`) kills that group before it reports, so when T2 is granted the writer lease no
+/// process of A1's group is left (looked at inside the granting round). This covers the executor's contract; that
+/// the runner ends an attempt only on its report is `a_leader_whose_group_was_not_emptied_keeps_its_slot`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_finished_leader_settles_only_once_its_group_is_gone() -> R {
     let dir = tempfile::tempdir()?;
@@ -2200,10 +2226,10 @@ async fn a_finished_leader_settles_only_once_its_group_is_gone() -> R {
     let pid: u32 = query(&db, "SELECT pid FROM attempts WHERE task_id = 'T1'")?.parse()?;
     let at_grant = probe.seen.lock().map(|s| s.clone()).unwrap_or_default();
     assert!(
-        !at_grant.is_empty() && at_grant.iter().all(Vec::is_empty),
+        !at_grant.is_empty() && at_grant.iter().all(|g| *g == nothing_left()),
         "{at_grant:?}"
     );
-    assert!(hoh_agents::process::group_members(pid).is_empty());
+    assert_eq!(group_now(pid), nothing_left());
     host.shutdown().await;
     drop(executor);
     Ok(())
@@ -2369,10 +2395,23 @@ impl FaultHooks for FailNthRunnerWrite {
     }
 }
 
+/// Holds each settle at its start for `.0`, long enough for the runner to tick meanwhile (M2T05R-358).
+#[derive(Debug)]
+struct SlowSettle(Duration);
+
+impl hoh_app::host::HostHooks for SlowSettle {
+    fn runner(&self, point: hoh_app::host::RunnerPoint) {
+        if point == hoh_app::host::RunnerPoint::Settling {
+            std::thread::sleep(self.0);
+        }
+    }
+}
+
 /// M2T05R-102, -150: a write of an attempt's task fails (its receipt; its OBSERVED effect). The task's entry goes
 /// with it: the receipt's failure leaves the dispatch to be delivered again; the later one is settled at once with
 /// the process it holds (its work found by its marker): either way T1 ends IMPLEMENTED and T2 follows, no lease kept
-/// alive for a task that ended.
+/// alive for a task that ended. Its entry goes only after that settle: ticks during it do not take the attempt up
+/// again (M2T05R-260, -358).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_runner_write_that_fails_does_not_strand_its_attempt() -> R {
     for nth in [1, 3] {
@@ -2397,6 +2436,7 @@ async fn a_runner_write_that_fails_does_not_strand_its_attempt() -> R {
             Setup {
                 faults: Some(faults),
                 observer: Some(Arc::new(Markers(work.clone()))),
+                hooks: Some(Arc::new(SlowSettle(Duration::from_millis(700)))),
                 ..Setup::default()
             },
         )
@@ -2460,6 +2500,8 @@ struct Faulty {
     gate_fails: bool,
     /// Its first start hands back a pid no process has (its identity cannot be read).
     ghost: std::sync::atomic::AtomicBool,
+    /// Whether that ghost's gate was ever opened (M2T05R-352).
+    ghost_opened: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl hoh_app::host::Executor for Faulty {
@@ -2479,9 +2521,13 @@ impl hoh_app::host::Executor for Faulty {
         }
         if self.ghost.swap(false, std::sync::atomic::Ordering::SeqCst) {
             let (_never, ended) = tokio::sync::oneshot::channel();
+            let opened = self.ghost_opened.clone();
             return Ok(hoh_app::host::Started {
                 pid: 1 << 23,
-                gate: hoh_app::host::Gate::new(|| Err("no process".to_owned())),
+                gate: hoh_app::host::Gate::new(move || {
+                    opened.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Err("no process".to_owned())
+                }),
                 ended,
             });
         }
@@ -2517,8 +2563,9 @@ async fn a_failed_start_and_a_gate_that_cannot_open_never_run_the_work() -> R {
             start_fails: std::sync::atomic::AtomicBool::new(!gate_fails && !ghost),
             gate_fails,
             ghost: std::sync::atomic::AtomicBool::new(ghost),
+            ghost_opened: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
-        let host = runner_host(&project, executor, clock, None).await?;
+        let host = runner_host(&project, executor.clone(), clock, None).await?;
         let db = db(&project);
         let first = "SELECT a.state || ':' || e.state FROM attempts a JOIN effects e ON e.attempt_id = a.attempt_id \
                      WHERE a.task_id = 'T1' ORDER BY a.rowid LIMIT 1";
@@ -2546,12 +2593,19 @@ async fn a_failed_start_and_a_gate_that_cannot_open_never_run_the_work() -> R {
             "SELECT attempt_id FROM attempts WHERE task_id = 'T1' ORDER BY rowid LIMIT 1",
         )?;
         assert!(!counted.contains(&a1), "gate_fails={gate_fails}: {counted}");
+        // A process whose identity cannot be read never has its gate opened.
+        assert!(
+            !executor
+                .ghost_opened
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
         host.shutdown().await;
     }
     Ok(())
 }
 
-/// A stuck agent whose native cancel works: it ends the agent's whole group (M2T05R-259).
+/// A stuck agent whose native cancel works: it ends the agent's leader, and its executor, a slow one, kills what is
+/// left in the group 100 ms after the leader's exit (M2T05R-259, -354).
 #[derive(Debug)]
 struct Cancellable(StuckExecutor);
 
@@ -2563,20 +2617,28 @@ impl hoh_app::host::Executor for Cancellable {
         self.0.deliver(work)
     }
 
-    fn start(&self, work: &hoh_app::host::Work) -> Result<hoh_app::host::Started, String> {
-        self.0.start(work)
+    fn start(&self, _work: &hoh_app::host::Work) -> Result<hoh_app::host::Started, String> {
+        let (child, pid, gate) = self.0.spawn()?;
+        let ended = reaping_after(child, Duration::from_millis(100));
+        Ok(hoh_app::host::Started { pid, gate, ended })
     }
 
     fn cancel(&self, work: &hoh_app::host::Work) {
         self.0.cancel(work);
         for pid in self.0.started.lock().map(|p| p.clone()).unwrap_or_default() {
-            kill_group(pid);
+            if let Some(pid) = i32::try_from(pid)
+                .ok()
+                .and_then(rustix::process::Pid::from_raw)
+            {
+                let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+            }
         }
     }
 }
 
-/// M2T05R-259: a holder whose native cancel ends it within its grace gets no signal: its expiry records the
-/// inspection, the native cancel and the reap, with no SIGTERM or SIGKILL step.
+/// M2T05R-259, -354: a holder whose native cancel ends it within its grace gets no signal: its expiry records the
+/// inspection, the native cancel and the reap, with no SIGTERM or SIGKILL step, though its group empties only some
+/// time after its leader exits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_holder_ended_by_its_native_cancel_gets_no_signal() -> R {
     let dir = tempfile::tempdir()?;

@@ -2,13 +2,22 @@
 //! together with the boot it ran in (`/proc/sys/kernel/random/boot_id`) and its start time (field 22 of
 //! `/proc/<pid>/stat`, clock ticks since boot): a reused pid, or one from before a reboot, is another process and gets
 //! no signal. A process found to be ours is held by a pidfd opened before its start time is read again, so the check
-//! and every later signal name the same process.
+//! and every later signal to it name the same process.
+//!
+//! Its process group (id = its pid) is the attempt's for as long as that number stays in use (decision 8, design
+//! correction 4): the kernel frees a number only when no process uses it as a pid, process group or session id, so
+//! while the leader is unreaped it holds the number itself and after its reap the members left in its group hold it.
+//! Whether the group is empty is asked of the kernel (`kill(-pgid, 0)` gives ESRCH), never read from a scan of
+//! `/proc`, which is no atomic snapshot (M2T05R-300).
 //!
 //! This is for processes this host did not start (an old host's agents after a kill -9); [`crate::process`]
 //! supervises the ones it starts.
 
-use rustix::event::{PollFd, PollFlags, Timespec, poll};
-use rustix::process::{Pid, PidfdFlags, Signal, kill_process_group, pidfd_open, pidfd_send_signal};
+use rustix::process::{
+    Pid, PidfdFlags, Signal, kill_process_group, pidfd_open, pidfd_send_signal,
+    test_kill_process_group,
+};
+use std::cell::Cell;
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
 use std::time::{Duration, Instant};
@@ -120,7 +129,6 @@ impl Gone {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Leaderless {
     pub pgid: u32,
-    pub members: Vec<u32>,
 }
 
 /// What a record names now.
@@ -146,20 +154,30 @@ pub fn presence(pid: Option<i64>, boot: Option<&str>, start: Option<&str>) -> io
         Ok(found) => Presence::Ours(found),
         Err(Gone::NoProcess) => {
             let pgid = pid.and_then(|p| u32::try_from(p).ok()).unwrap_or(0);
-            let members = group_left(pgid, pgid)?;
-            if members.is_empty() {
+            if group_empty(pgid) {
                 Presence::Gone(Gone::NoProcess)
             } else {
-                Presence::Leaderless(Leaderless { pgid, members })
+                Presence::Leaderless(Leaderless { pgid })
             }
         }
         Err(gone) => Presence::Gone(gone),
     })
 }
 
-/// The processes in process group `pgid` other than `leader`, zombies included, from a whole scan of `/proc`. A scan
-/// that fails anywhere (an unreadable `/proc`, a stat that cannot be read for another reason than the process having
-/// gone) is an error, never an empty group (M2T05R-200).
+/// Whether no process (zombies included) is in process group `pgid`: the kernel's own look-up of the group
+/// (`kill(-pgid, 0)` gives ESRCH), not a scan (M2T05R-300). Any other answer, EPERM included, means something is
+/// still in it.
+pub fn group_empty(pgid: u32) -> bool {
+    match i32::try_from(pgid).ok().and_then(Pid::from_raw) {
+        Some(pgid) => test_kill_process_group(pgid) == Err(rustix::io::Errno::SRCH),
+        None => false,
+    }
+}
+
+/// The processes in process group `pgid` other than `leader`, zombies included, from a whole scan of `/proc`: for
+/// diagnostics and test evidence only, since a scan is no atomic snapshot ([`group_empty`] tells whether a group is
+/// empty). A scan that fails anywhere (an unreadable `/proc`, a stat that cannot be read for another reason than the
+/// process having gone) is an error, never an empty group (M2T05R-200).
 pub fn group_left(pgid: u32, leader: u32) -> io::Result<Vec<u32>> {
     group_left_in(std::path::Path::new("/proc"), pgid, leader)
 }
@@ -206,6 +224,29 @@ fn group_left_in(proc: &std::path::Path, pgid: u32, leader: u32) -> io::Result<V
 pub struct Found {
     pub identity: Identity,
     pidfd: OwnedFd,
+    /// When its group was last seen to be the attempt's ([`Group::Held`]).
+    held: Cell<Instant>,
+}
+
+/// How long a sight of a group as the attempt's lasts once its leader is reaped (ADR-019 decision 8, design
+/// correction 4): its members hold its number, but only a group watched this closely can be told not to have emptied
+/// and had its number handed out again in between.
+pub const HELD_FOR: Duration = Duration::from_millis(100);
+
+/// How often a stop looks at the group.
+const LOOK_EVERY: Duration = Duration::from_millis(10);
+
+/// What one look at a found process's group shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Group {
+    /// Still the attempt's: its leader unreaped (it holds the number itself), or its leader reaped, processes left in
+    /// it and the previous `Held` no longer than [`HELD_FOR`] ago. Only now may it be signalled.
+    Held,
+    /// Nothing is left in it: its leader was reaped and no process has its group id ([`group_empty`]).
+    Empty,
+    /// Processes are left in it but it was not watched closely enough since its leader's reap to know they are the
+    /// attempt's: no signal, and its stop is not reaped.
+    Lost,
 }
 
 /// The process a record names, if it is still there, without signalling anything (REQ-041 b3).
@@ -242,6 +283,7 @@ pub fn find(
             current: now,
         }));
     }
+    // Its start time was read while it held its pid: its group is the attempt's from here.
     Ok(Ok(Found {
         identity: Identity {
             pid,
@@ -249,37 +291,35 @@ pub fn find(
             start_id: now,
         },
         pidfd,
+        held: Cell::new(Instant::now()),
     }))
 }
 
 /// One step of a stop, for the events (AC-041-02's order).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StopStep {
+    /// SIGTERM was sent to the group.
     Term,
+    /// SIGKILL was sent to the group and its leader.
     Kill,
-    /// The leader has exited and no process is left in its group.
+    /// The leader was reaped and no process is left in its group.
     Reaped,
+    /// The group was lost track of ([`Group::Lost`]): nothing more was sent.
+    Lost,
 }
 
 /// How a stop went.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stopped {
     pub steps: Vec<StopStep>,
-    /// Whether the leader exited and its group emptied within the graces.
+    /// Whether its group was seen empty within the graces.
     pub reaped: bool,
 }
 
 impl Found {
-    /// Whether the leader has exited (its pidfd is readable).
-    pub fn exited(&self) -> bool {
-        let mut fds = [PollFd::new(&self.pidfd, PollFlags::IN)];
-        matches!(poll(&mut fds, Some(&Timespec::default())), Ok(n) if n > 0)
-    }
-
-    /// Whether its leader still holds its pid, alive or a zombie not yet reaped: only then can its group id not have
-    /// been reused, so only then may its group be signalled (M2T05R-202). A pidfd keeps the process, not its number:
-    /// once the leader is reaped the pidfd's fdinfo reads `Pid: -1` and the number may go to another process.
-    pub fn holds_group(&self) -> bool {
+    /// Whether its leader is unreaped (alive or a zombie): its pidfd's fdinfo still shows its pid, which reads -1
+    /// once it is reaped (a pidfd keeps the process, not its number).
+    fn unreaped(&self) -> bool {
         use std::os::fd::AsRawFd as _;
         std::fs::read_to_string(format!("/proc/self/fdinfo/{}", self.pidfd.as_raw_fd()))
             .ok()
@@ -290,66 +330,79 @@ impl Found {
             == Some(self.identity.pid.to_string())
     }
 
-    /// Its leader exited and a whole scan finds nothing else left in its group (a scan that fails is not "gone").
-    pub fn gone(&self) -> bool {
-        self.exited()
-            && group_left(self.identity.pid, self.identity.pid).is_ok_and(|left| left.is_empty())
+    /// Look at its group once (ADR-019 decision 8, design correction 4).
+    pub fn look(&self) -> Group {
+        let at = Instant::now();
+        if self.unreaped() {
+            self.held.set(at);
+            return Group::Held;
+        }
+        if group_empty(self.identity.pid) {
+            return Group::Empty;
+        }
+        if Instant::now().saturating_duration_since(self.held.get()) <= HELD_FOR {
+            self.held.set(at);
+            Group::Held
+        } else {
+            Group::Lost
+        }
     }
 
-    fn wait(&self, grace: Duration) -> bool {
+    /// Look at its group every 10 ms until it is not [`Group::Held`] or `grace` is over; what was seen last.
+    pub fn wait(&self, grace: Duration) -> Group {
         let end = Instant::now() + grace;
         loop {
-            if self.gone() {
-                return true;
+            let group = self.look();
+            if group != Group::Held || Instant::now() >= end {
+                return group;
             }
-            if Instant::now() >= end {
-                return false;
-            }
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(LOOK_EVERY);
         }
     }
 
-    /// End what is left of it: nothing when it is already gone, else [`Found::stop`] (no SIGTERM recorded for a
-    /// process that ended by itself, M2T05R-259).
-    pub fn settle_group(&self, term_grace: Duration, kill_grace: Duration) -> Stopped {
-        if self.gone() {
-            Stopped {
-                steps: vec![StopStep::Reaped],
-                reaped: true,
-            }
-        } else {
-            self.stop(term_grace, kill_grace)
+    /// Send `signal` to its group (and a SIGKILL to its leader through its pidfd too), only right after a look that
+    /// shows the group still the attempt's; whether the group signal went.
+    fn signal(&self, signal: Signal) -> bool {
+        if self.look() != Group::Held {
+            return false;
         }
+        let Some(pgid) = i32::try_from(self.identity.pid)
+            .ok()
+            .and_then(Pid::from_raw)
+        else {
+            return false;
+        };
+        let sent = kill_process_group(pgid, signal).is_ok();
+        if signal == Signal::KILL {
+            let _ = pidfd_send_signal(self.pidfd.as_fd(), signal);
+        }
+        sent
     }
 
-    /// SIGTERM to its group, SIGKILL to its group and leader after `term_grace`, then wait `kill_grace` for the
-    /// leader to exit and the group to empty (an orphan is reaped by its new parent). The group gets a signal only
-    /// while its leader holds its pid ([`Found::holds_group`]); a leader reaped with members left in its group leaves
-    /// them unsignalled and the stop unreaped (uncertain).
+    /// SIGTERM to its group, SIGKILL to its group and leader after `term_grace`, then up to `kill_grace` for the
+    /// group to empty (an orphan is reaped by its new parent). A group already empty gets no signal (M2T05R-259); a
+    /// step is recorded only for a signal that went (M2T05R-355); a group lost track of gets nothing more.
     pub fn stop(&self, term_grace: Duration, kill_grace: Duration) -> Stopped {
         let mut steps = Vec::new();
-        let pgid = Pid::from_raw(i32::try_from(self.identity.pid).unwrap_or(0));
-        let send = |signal: Signal| {
-            if let Some(pgid) = pgid
-                && self.holds_group()
-            {
-                let _ = kill_process_group(pgid, signal);
-            }
-            if signal == Signal::KILL {
-                let _ = pidfd_send_signal(self.pidfd.as_fd(), signal);
-            }
-        };
-        send(Signal::TERM);
-        steps.push(StopStep::Term);
-        if !self.wait(term_grace) {
-            send(Signal::KILL);
-            steps.push(StopStep::Kill);
+        if self.signal(Signal::TERM) {
+            steps.push(StopStep::Term);
         }
-        let reaped = self.wait(kill_grace);
-        if reaped {
-            steps.push(StopStep::Reaped);
+        let mut group = self.wait(term_grace);
+        if group == Group::Held {
+            if self.signal(Signal::KILL) {
+                steps.push(StopStep::Kill);
+            }
+            group = self.wait(kill_grace);
         }
-        Stopped { steps, reaped }
+        match group {
+            Group::Empty => steps.push(StopStep::Reaped),
+            Group::Lost => steps.push(StopStep::Lost),
+            Group::Held => {}
+        }
+        Stopped {
+            steps,
+            reaped: group == Group::Empty,
+        }
     }
 }
 
@@ -389,18 +442,76 @@ mod tests {
             .map_err(io::Error::other)
     }
 
+    /// Kills process group `.0` however a test ends (M2T05R-252).
+    struct Guard(u32);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if let Some(pgid) = i32::try_from(self.0).ok().and_then(Pid::from_raw) {
+                let _ = kill_process_group(pgid, Signal::KILL);
+            }
+        }
+    }
+
+    /// Wait up to 5 s for `until`.
+    fn wait_until(mut until: impl FnMut() -> bool) -> bool {
+        let end = Instant::now() + Duration::from_secs(5);
+        while !until() {
+            if Instant::now() >= end {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        true
+    }
+
+    /// Whether process `pid` ignores SIGTERM (bit 15 of its `SigIgn` mask).
+    fn ignores_term(pid: u32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/status"))
+            .ok()
+            .and_then(|status| {
+                status.lines().find_map(|l| {
+                    l.strip_prefix("SigIgn:")
+                        .and_then(|v| u64::from_str_radix(v.trim(), 16).ok())
+                })
+            })
+            .is_some_and(|mask| mask & (1 << (15 - 1)) != 0)
+    }
+
+    /// A leader leading its own session whose one member ignores SIGTERM while the leader itself does not; started
+    /// by a shell that exits at once, so the leader is reaped by another process. Its pid, once the member ignores
+    /// SIGTERM (M2T05R-353).
+    fn leader_with_a_member_ignoring_term() -> io::Result<u32> {
+        let out = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "setsid sh -c '(trap \"\" TERM; exec sleep 1000) </dev/null >/dev/null 2>&1 & wait' </dev/null >/dev/null 2>&1 & echo $!",
+            ])
+            .output()?;
+        let leader: u32 = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .map_err(io::Error::other)?;
+        let ready = wait_until(|| {
+            group_left(leader, leader)
+                .is_ok_and(|left| left.len() == 1 && left.iter().all(|&m| ignores_term(m)))
+        });
+        if !ready {
+            let _ = Guard(leader);
+            return Err(io::Error::other("its member never came to ignore SIGTERM"));
+        }
+        Ok(leader)
+    }
+
+    fn found(pid: u32) -> io::Result<Found> {
+        let me = of(pid)?.ok_or_else(|| io::Error::other("it is not running"))?;
+        find(Some(i64::from(pid)), Some(&me.boot_id), Some(&me.start_id))?
+            .map_err(|g| io::Error::other(format!("{g:?}")))
+    }
+
     #[test]
     fn a_found_orphan_that_ignores_sigterm_is_killed_with_its_group_and_reaped() -> io::Result<()> {
         let pid = orphan_ignoring_term()?;
-        // Its group is killed however the test ends (M2T05R-252).
-        struct Guard(u32);
-        impl Drop for Guard {
-            fn drop(&mut self) {
-                if let Some(pgid) = i32::try_from(self.0).ok().and_then(Pid::from_raw) {
-                    let _ = kill_process_group(pgid, Signal::KILL);
-                }
-            }
-        }
         let _guard = Guard(pid);
         let end = Instant::now() + Duration::from_secs(5);
         // Until its shell has set its trap and started its member (the member comes after the trap).
@@ -418,7 +529,7 @@ mod tests {
                 reaped: true
             }
         );
-        assert!(crate::process::group_members(pid).is_empty());
+        assert!(group_empty(pid));
         assert_eq!(start_id(pid)?.filter(|s| *s == me.start_id), None);
         Ok(())
     }
@@ -436,68 +547,110 @@ mod tests {
             .trim()
             .parse()
             .map_err(io::Error::other)?;
+        let _guard = Guard(leader);
         let end = Instant::now() + Duration::from_secs(5);
         while start_id(leader)?.is_some() && Instant::now() < end {
             std::thread::sleep(Duration::from_millis(10));
         }
         let boot = boot_id()?;
         let found = presence(Some(i64::from(leader)), Some(&boot), Some("1"))?;
-        let members = match found {
-            Presence::Leaderless(l) => l.members,
-            other => return Err(io::Error::other(format!("{other:?}"))),
-        };
-        assert!(!members.is_empty());
-        for pid in members {
-            if let Some(pid) = i32::try_from(pid).ok().and_then(Pid::from_raw) {
-                let _ = rustix::process::kill_process(pid, Signal::KILL);
-            }
-        }
+        assert!(
+            matches!(&found, Presence::Leaderless(l) if l.pgid == leader),
+            "{found:?}"
+        );
+        assert!(!group_left(leader, leader)?.is_empty());
         Ok(())
     }
 
     #[test]
-    fn a_group_whose_leader_was_reaped_gets_no_more_signals() -> io::Result<()> {
-        // M2T05R-202: the leader dies on SIGTERM and is reaped by its new parent while a member that ignores SIGTERM
-        // stays. Its pid may now be another's, so its group gets no SIGKILL: the stop is not reaped (the slot stays
-        // held) and the member lives on (killed here).
-        let out = std::process::Command::new("sh")
+    fn a_group_whose_leader_was_reaped_is_still_killed_while_it_is_watched() -> io::Result<()> {
+        // M2T05R-351: the leader dies of SIGTERM and is reaped by its new parent while its member, which ignores
+        // SIGTERM, stays in its group and so keeps its number in use: the stop, watching the group all along, still
+        // SIGKILLs it and sees the group empty.
+        let leader = leader_with_a_member_ignoring_term()?;
+        let _guard = Guard(leader);
+        let found = found(leader)?;
+        let stopped = found.stop(Duration::from_millis(500), Duration::from_secs(5));
+        assert!(!found.unreaped());
+        assert_eq!(
+            stopped,
+            Stopped {
+                steps: vec![StopStep::Term, StopStep::Kill, StopStep::Reaped],
+                reaped: true
+            }
+        );
+        assert!(group_empty(leader));
+        Ok(())
+    }
+
+    #[test]
+    fn a_group_not_watched_since_its_leader_was_reaped_gets_no_signal() -> io::Result<()> {
+        // ADR-019 decision 8, design correction 4: once the leader is reaped, a group not looked at within HELD_FOR
+        // cannot be told from one that emptied and had its number handed out again; it gets nothing and its stop is
+        // not reaped. The member lives on (killed by the guard).
+        let leader = leader_with_a_member_ignoring_term()?;
+        let _guard = Guard(leader);
+        let found = found(leader)?;
+        if let Some(pid) = i32::try_from(leader).ok().and_then(Pid::from_raw) {
+            rustix::process::kill_process(pid, Signal::TERM)?;
+        }
+        assert!(wait_until(|| !found.unreaped()));
+        std::thread::sleep(HELD_FOR + Duration::from_millis(50));
+        let stopped = found.stop(Duration::from_millis(100), Duration::from_millis(100));
+        assert_eq!(
+            stopped,
+            Stopped {
+                steps: vec![StopStep::Lost],
+                reaped: false
+            }
+        );
+        assert!(!group_empty(leader));
+        let left = group_left(leader, leader)?;
+        assert!(left.len() == 1 && ignores_term(left[0]), "{left:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_group_that_churns_is_never_seen_empty_until_it_is() -> io::Result<()> {
+        // M2T05R-300: its members relay (each starts the next, then exits), so at every instant one is in the group
+        // while no pid lasts: a scan of /proc can miss them all, the kernel's look-up of the group cannot.
+        use std::io::Write as _;
+        use std::os::unix::process::CommandExt as _;
+        let mut child = std::process::Command::new("sh")
             .args([
                 "-c",
-                "setsid sh -c '(trap \"\" TERM; exec sleep 1000) </dev/null >/dev/null 2>&1 & wait' </dev/null >/dev/null 2>&1 & echo $!",
+                "read -r go; relay() { (sleep 0.002; relay) & }; relay; exit 0",
             ])
-            .output()?;
-        let leader: u32 = String::from_utf8_lossy(&out.stdout)
-            .trim()
-            .parse()
-            .map_err(io::Error::other)?;
-        struct Guard(u32);
-        impl Drop for Guard {
-            fn drop(&mut self) {
-                if let Some(pgid) = i32::try_from(self.0).ok().and_then(Pid::from_raw) {
-                    let _ = kill_process_group(pgid, Signal::KILL);
-                }
-            }
-        }
+            .process_group(0)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        let leader = child.id();
         let _guard = Guard(leader);
-        let end = Instant::now() + Duration::from_secs(5);
-        while group_left(leader, leader).map_or(0, |l| l.len()) < 1 && Instant::now() < end {
-            std::thread::sleep(Duration::from_millis(10));
+        let found = found(leader)?;
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other("no stdin"))?
+            .write_all(b"go\n")?;
+        child.wait()?;
+        assert!(!found.unreaped());
+        let (mut looks, mut scans_empty) = (0, 0);
+        let end = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < end {
+            assert_eq!(found.look(), Group::Held);
+            looks += 1;
+            if group_left(leader, leader).is_ok_and(|left| left.is_empty()) {
+                scans_empty += 1;
+            }
+            std::thread::sleep(Duration::from_millis(1));
         }
-        let me = of(leader)?.ok_or_else(|| io::Error::other("the leader is not running"))?;
-        let found = find(
-            Some(i64::from(leader)),
-            Some(&me.boot_id),
-            Some(&me.start_id),
-        )?
-        .map_err(|g| io::Error::other(format!("{g:?}")))?;
-        // Long enough for the leader to die of SIGTERM and be reaped before the SIGKILL would go.
-        let stopped = found.stop(Duration::from_millis(500), Duration::from_millis(500));
-        assert!(!found.holds_group());
-        assert!(!stopped.reaped, "{stopped:?}");
-        assert!(
-            !group_left(leader, leader)?.is_empty(),
-            "the member was killed"
-        );
+        // How often a whole scan read it as empty meanwhile (shown, not asserted: it depends on the scheduling).
+        eprintln!("{looks} looks, all held; {scans_empty} scans read the group as empty");
+        let stopped = found.stop(Duration::from_secs(2), Duration::from_secs(5));
+        assert!(stopped.reaped, "{stopped:?}");
+        assert_eq!(found.look(), Group::Empty);
         Ok(())
     }
 
@@ -510,15 +663,15 @@ mod tests {
         std::fs::create_dir(fake.path().join("42"))?;
         std::fs::create_dir(fake.path().join("42/stat"))?;
         assert!(group_left_in(fake.path(), 7, 7).is_err());
-        std::fs::create_dir(fake.path().join("43"))?;
-        let gone = fake.path().join("44");
-        std::fs::create_dir(&gone)?;
-        std::fs::remove_dir(&gone)?;
+        // A process that ended while the scan ran (its directory without a stat) is skipped, not an error
+        // (M2T05R-356).
         let only = tempfile::tempdir()?;
+        std::fs::create_dir(only.path().join("43"))?;
         std::fs::create_dir(only.path().join("9"))?;
         std::fs::write(only.path().join("9/stat"), "9 (sh) S 1 7 7 0")?;
         std::fs::create_dir(only.path().join("7"))?;
         std::fs::write(only.path().join("7/stat"), "7 (sh) S 1 7 7 0")?;
+        std::fs::write(only.path().join("self"), "")?;
         assert_eq!(group_left_in(only.path(), 7, 7)?, [9]);
         Ok(())
     }
