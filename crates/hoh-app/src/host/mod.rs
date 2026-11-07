@@ -298,6 +298,12 @@ impl Host {
         })
     }
 
+    /// The host's store: the loops of the host write through it (the Commander's decisions, M2-T08), and so do tests
+    /// of a host built in the test target (CR-006 F3).
+    pub fn store(&self) -> &Store {
+        &self.shared.store
+    }
+
     /// Whether the database writer still runs (it ends only at the stop, or on a panic, M2T12R-150).
     pub fn writer_alive(&self) -> bool {
         self.shared.store.writer_alive()

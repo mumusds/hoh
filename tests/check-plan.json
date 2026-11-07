@@ -53,9 +53,7 @@
       "mode": "product",
       "argv": [
         "bash",
-        "scripts/product/not-implemented.sh",
-        "recovery",
-        "M2-T05"
+        "scripts/product/recovery.sh"
       ],
       "timeout_seconds": 7200,
       "artifacts": [

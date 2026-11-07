@@ -1466,3 +1466,61 @@ async fn what_the_writer_keeps_goes_after_the_last_write() -> R {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn a_write_of_a_host_whose_epoch_moved_on_changes_nothing() -> R {
+    // REQ-041 failure mode 4, ADR-019 decision 2: host A began at epoch 1, host B on the same database at 2; A's next
+    // write is an IntegrityViolation and changes 0 rows, B's goes on.
+    let dir = tempfile::tempdir()?;
+    let path = db_in(&dir);
+    let old = Store::open(&path, test_options())?;
+    seed(&path)?;
+    let first = old.begin_host("p1", "/repo").await?;
+    let new = Store::open(&path, test_options())?;
+    let second = new.begin_host("p1", "/repo").await?;
+    assert_eq!(
+        (first.host_epoch + 1, &second.project_id),
+        (second.host_epoch, &first.project_id)
+    );
+    let refused = old
+        .commit(Commit {
+            events: vec![event("old")],
+            ..Commit::default()
+        })
+        .await
+        .expect_err("fenced");
+    assert!(
+        matches!(&refused, PersistError::IntegrityViolation(m) if m.contains("0 rows")),
+        "{refused:?}"
+    );
+    new.commit(Commit {
+        events: vec![event("new")],
+        ..Commit::default()
+    })
+    .await?;
+    let conn = Connection::open(&path)?;
+    let ids: Vec<String> = conn
+        .prepare("SELECT event_id FROM events ORDER BY seq")?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    assert_eq!(ids, ["new"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_store_whose_host_never_began_is_not_fenced() -> R {
+    // ADR-019 decision 2: only a store that began a host is fenced (a scratch store, a test store).
+    let dir = tempfile::tempdir()?;
+    let path = db_in(&dir);
+    let store = Store::open(&path, test_options())?;
+    seed(&path)?;
+    let other = Store::open(&path, test_options())?;
+    other.begin_host("p1", "/repo").await?;
+    store
+        .commit(Commit {
+            events: vec![event("free")],
+            ..Commit::default()
+        })
+        .await?;
+    Ok(())
+}
