@@ -21,12 +21,14 @@ mod plan;
 mod reconcile;
 mod results;
 mod rounds;
+mod runner;
 pub use leases::{Grant, LEASE_TTL, LeaseView};
 pub use outbox::{ConsumeEffect, Consumed, OutboxRow, Settlement, backoff};
 pub use plan::Imported;
 pub use reconcile::{EffectRow, UnfinishedRow};
 pub use results::{TaskResultOutcome, VERIFIERS};
 pub use rounds::{Dispatched, RoundOutcome};
+pub use runner::{DispatchNotice, RUNNER, Waiting};
 pub mod location;
 pub mod selftest;
 mod writer;
@@ -669,6 +671,89 @@ impl Store {
             summary,
         })
         .await
+    }
+
+    /// What is waiting for the host runner in `project_id` (ADR-019 decision 8).
+    pub async fn runner_waiting(&self, project_id: &str) -> Result<Waiting, PersistError> {
+        match self
+            .writer
+            .runner(runner::RunnerJob::Waiting(project_id.to_owned()))
+            .await?
+        {
+            runner::RunnerDone::Waiting(waiting) => Ok(waiting),
+            runner::RunnerDone::Applied(_) => Err(PersistError::IntegrityViolation(
+                "a runner read answered with a write".to_owned(),
+            )),
+        }
+    }
+
+    /// The runner took `notice`: its receipt, the notice ACKED, the attempt STARTING with its work effect PREPARED;
+    /// false when it was taken already or its attempt is no longer PREPARED.
+    pub async fn runner_received(&self, notice: DispatchNotice) -> Result<bool, PersistError> {
+        self.runner_step(runner::RunnerJob::Received(Box::new(notice)))
+            .await
+    }
+
+    /// Effect `key` of `attempt_id` moves `from` -> `to` with its event; false when it is no longer `from`.
+    pub async fn runner_effect(
+        &self,
+        attempt_id: &str,
+        key: &str,
+        from: crate::reconcile::EffectState,
+        to: crate::reconcile::EffectState,
+        detail: serde_json::Value,
+    ) -> Result<bool, PersistError> {
+        self.runner_step(runner::RunnerJob::Effect {
+            attempt_id: attempt_id.to_owned(),
+            key: key.to_owned(),
+            from,
+            to,
+            detail,
+        })
+        .await
+    }
+
+    /// `attempt_id` STARTING -> RUNNING with its process facts, its task RUNNING.
+    pub async fn runner_running(
+        &self,
+        attempt_id: &str,
+        facts: AttemptFacts,
+    ) -> Result<bool, PersistError> {
+        self.runner_step(runner::RunnerJob::Running {
+            attempt_id: attempt_id.to_owned(),
+            facts: Box::new(facts),
+        })
+        .await
+    }
+
+    /// `attempt_id` RUNNING -> SETTLED (its task IMPLEMENTED) or FAILED (its task READY).
+    pub async fn runner_finished(
+        &self,
+        attempt_id: &str,
+        success: bool,
+        detail: &str,
+    ) -> Result<bool, PersistError> {
+        self.runner_step(runner::RunnerJob::Finished {
+            attempt_id: attempt_id.to_owned(),
+            success,
+            detail: detail.to_owned(),
+        })
+        .await
+    }
+
+    /// A runtime notice taken (ACKED); false when it was not PENDING.
+    pub async fn ack_notice(&self, message_id: &str) -> Result<bool, PersistError> {
+        self.runner_step(runner::RunnerJob::Ack(message_id.to_owned()))
+            .await
+    }
+
+    async fn runner_step(&self, job: runner::RunnerJob) -> Result<bool, PersistError> {
+        match self.writer.runner(job).await? {
+            runner::RunnerDone::Applied(applied) => Ok(applied),
+            runner::RunnerDone::Waiting(_) => Err(PersistError::IntegrityViolation(
+                "a runner write answered with a read".to_owned(),
+            )),
+        }
     }
 
     async fn reconcile_event(&self, job: reconcile::ReconcileJob) -> Result<i64, PersistError> {

@@ -25,6 +25,11 @@ const CHILD_DECIDE: &str = "HOH_TEST_RECOVERY_DECIDE";
 const CHILD_GRACE_MS: &str = "HOH_TEST_RECOVERY_GRACE_MS";
 /// A JSON file `{"available": {marker: ref}, "unavailable": [marker]}`: the FakeRemote the reconcile looks in.
 const CHILD_REMOTE: &str = "HOH_TEST_RECOVERY_REMOTE";
+/// A directory with the FakeAgent's counter file and markers: the child runs a runner with the FakeExecutor and looks
+/// for work effects by their markers.
+const CHILD_WORK: &str = "HOH_TEST_RECOVERY_WORK";
+/// A runner point: the child kills itself when an attempt reaches it.
+const CHILD_RUNNER_KILL: &str = "HOH_TEST_RECOVERY_RUNNER_KILL";
 /// The child's exit code when it submitted its decision and was not killed.
 const NOT_KILLED: i32 = 77;
 
@@ -113,6 +118,101 @@ impl hoh_core::reconcile::Observer for FakeRemote {
     }
 }
 
+/// The FakeAgent (AC-041-01): appends its effect key to the counter file when it starts executing, works a moment,
+/// then leaves its marker (the key, `/` as `_`) when it is done.
+const FAKE_AGENT: &str =
+    "printf '%s\\n' \"$1\" >> \"$2/counter\"; sleep 0.2; : > \"$2/markers/$3\"";
+
+fn marker_name(key: &str) -> String {
+    key.replace('/', "_")
+}
+
+/// Runs each attempt's work as a FakeAgent, the leader of its own process group (as the substrate starts agents).
+#[derive(Debug)]
+struct FakeExecutor(PathBuf);
+
+impl hoh_app::host::Executor for FakeExecutor {
+    fn deliver(
+        &self,
+        _work: &hoh_app::host::Work,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
+        let (answer, ack) = tokio::sync::oneshot::channel();
+        let _ = answer.send(Ok(()));
+        ack
+    }
+
+    fn start(&self, work: &hoh_app::host::Work) -> Result<hoh_app::host::Started, String> {
+        use std::os::unix::process::CommandExt as _;
+        let mut child = Command::new("sh")
+            .args(["-c", FAKE_AGENT, "fake-agent", &work.effect_key])
+            .arg(&self.0)
+            .arg(marker_name(&work.effect_key))
+            .process_group(0)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        let pid = child.id();
+        let (end, ended) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let status = child.wait();
+            let _ = end.send(hoh_app::host::Outcome {
+                success: status.as_ref().is_ok_and(std::process::ExitStatus::success),
+                detail: format!("{status:?}"),
+            });
+        });
+        Ok(hoh_app::host::Started { pid, ended })
+    }
+}
+
+/// Looks for an attempt's work by the FakeAgent's marker.
+#[derive(Debug)]
+struct Markers(PathBuf);
+
+impl hoh_core::reconcile::Observer for Markers {
+    fn observe(&self, _attempt_id: &str, key: &str) -> hoh_core::reconcile::Observation {
+        let marker = self.0.join("markers").join(marker_name(key));
+        if marker.exists() {
+            hoh_core::reconcile::Observation::Found {
+                external_ref: marker.to_string_lossy().into_owned(),
+            }
+        } else {
+            hoh_core::reconcile::Observation::Absent
+        }
+    }
+}
+
+/// Ends its own process with SIGKILL when an attempt reaches `0` (CR-006 F2).
+#[derive(Debug)]
+struct KillAtRunner(hoh_app::host::RunnerPoint);
+
+impl hoh_app::host::HostHooks for KillAtRunner {
+    fn runner(&self, point: hoh_app::host::RunnerPoint) {
+        if point == self.0 {
+            let _ = rustix::process::kill_process(
+                rustix::process::getpid(),
+                rustix::process::Signal::KILL,
+            );
+            loop {
+                std::thread::park();
+            }
+        }
+    }
+}
+
+fn runner_point(name: &str) -> Option<hoh_app::host::RunnerPoint> {
+    use hoh_app::host::RunnerPoint;
+    Some(match name {
+        "BeforeSend" => RunnerPoint::BeforeSend,
+        "AfterSend" => RunnerPoint::AfterSend,
+        "AfterAck" => RunnerPoint::AfterAck,
+        "AfterEffectStarted" => RunnerPoint::AfterEffectStarted,
+        "AfterEffectCommitted" => RunnerPoint::AfterEffectCommitted,
+        _ => return None,
+    })
+}
+
 fn point_named(name: &str) -> Option<WritePoint> {
     Some(match name {
         "Begun" => WritePoint::Begun,
@@ -150,6 +250,22 @@ fn recovery_host() {
     if let Some(remote) = std::env::var_os(CHILD_REMOTE) {
         config.reconcile.observer = Arc::new(FakeRemote(PathBuf::from(remote)));
     }
+    if let Some(work) = std::env::var_os(CHILD_WORK) {
+        let developer = ["structured_events", "command_exec"].map(str::to_owned);
+        config.runner = Some(hoh_app::host::RunnerConfig {
+            executor: Arc::new(FakeExecutor(PathBuf::from(&work))),
+            context: Context {
+                required_capabilities: [("developer".to_owned(), developer.into_iter().collect())]
+                    .into(),
+                ..Context::default()
+            },
+        });
+        config.reconcile.observer = Arc::new(Markers(PathBuf::from(work)));
+    }
+    let runner_kill = std::env::var(CHILD_RUNNER_KILL).ok();
+    if let Some(point) = &runner_kill {
+        config.hooks = Arc::new(KillAtRunner(runner_point(point).expect("a runner point")));
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -160,6 +276,10 @@ fn recovery_host() {
             let message: Message = serde_json::from_str(&decision).expect("a decision message");
             let proposal = Proposal::from_message(&message).expect("a proposal");
             let decided = host.store().decide(proposal, Context::default()).await;
+            if runner_kill.is_some() {
+                // The runner reaches its kill point while this waits.
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
             eprintln!("decided without being killed: {decided:?}");
             NOT_KILLED
         });
@@ -665,6 +785,248 @@ fn test_041_05_a_started_effect_is_found_or_unknown_never_done_again() -> R {
     keep(
         "test-041-05.json",
         &json!({"read": read, "forge_calls": lines}),
+    )?;
+    Ok(())
+}
+
+/// Start a host with these child variables, wait until it serves, then until `done` holds (at most `limit`), stop it
+/// with SIGTERM: its exit code, its stderr, and whether `done` held.
+fn serve_until(
+    project: &Path,
+    env: &[(&str, &std::ffi::OsStr)],
+    limit: Duration,
+    done: impl Fn() -> bool,
+) -> R<(i32, String, bool)> {
+    let mut command = child(project)?;
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    let mut guard = ChildGuard(command.spawn()?);
+    let own = u64::from(guard.0.id());
+    let end = Instant::now() + Duration::from_secs(30);
+    while announced(project) != Some(own) {
+        if let Some(status) = guard.0.try_wait()? {
+            return Err(format!("the host ended before it served: {status:?}").into());
+        }
+        if Instant::now() > end {
+            return Err("the host did not start".into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let end = Instant::now() + limit;
+    let mut held = done();
+    while !held && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(50));
+        held = done();
+    }
+    let pid = rustix::process::Pid::from_raw(i32::try_from(guard.0.id())?).ok_or("no pid")?;
+    rustix::process::kill_process(pid, rustix::process::Signal::TERM)?;
+    let (status, stderr) = wait(guard, Duration::from_secs(30))?;
+    Ok((
+        status
+            .code()
+            .ok_or_else(|| format!("ended by a signal ({status:?}): {stderr}"))?,
+        stderr,
+        held,
+    ))
+}
+
+/// AC-041-01's world: run R READY (revision 7, the Commander at epoch 3) with five tasks for the developer, none a
+/// writer (two run at a time, `execution.reader_slots`).
+const FIVE_TASKS: &str = "
+INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s2', :p, printf('%064d', 2), 2);
+INSERT INTO runs(run_id, project_id, spec_id, state, mode, revision, created_at) VALUES ('R', :p, 's2', 'READY', 'AUTO', 7, '2026-11-07T00:00:00Z');
+INSERT INTO sessions(session_id, agent, role, agent_version, capabilities_json) VALUES
+  ('sc', 'codex', 'commander', '1', '{\"structured_events\": true, \"resume\": true}'),
+  ('sd', 'claude', 'developer', '1', '{\"structured_events\": true, \"command_exec\": true}');
+INSERT INTO role_bindings(run_id, role, agent, session_id, role_epoch, config_revision, bound_at) VALUES
+  ('R', 'commander', 'codex', 'sc', 3, 1, '2026-11-07T00:00:00Z'),
+  ('R', 'developer', 'claude', 'sd', 2, 1, '2026-11-07T00:00:00Z');
+INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate) VALUES
+  ('T1', 'R', 's2', 'READY', 1, 'developer', 0, 1, 1), ('T2', 'R', 's2', 'READY', 1, 'developer', 0, 2, 1),
+  ('T3', 'R', 's2', 'READY', 1, 'developer', 0, 3, 1), ('T4', 'R', 's2', 'READY', 1, 'developer', 0, 4, 1),
+  ('T5', 'R', 's2', 'READY', 1, 'developer', 0, 5, 1);
+";
+
+/// Every task IMPLEMENTED, or left with its attempt UNKNOWN_EFFECT: the run's next stable point.
+const STABLE: &str = "SELECT count(*) FROM tasks t WHERE t.state != 'IMPLEMENTED' AND NOT EXISTS \
+                      (SELECT 1 FROM attempts a WHERE a.task_id = t.task_id AND a.state = 'UNKNOWN_EFFECT')";
+
+/// What TEST-041-01 reads after a restart.
+const READ_RUN: &str = r#"
+import json, sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+attempts = [{"id": r[0], "task": r[1], "state": r[2], "host_epoch": r[3]} for r in c.execute(
+    "SELECT attempt_id, task_id, state, host_epoch FROM attempts ORDER BY rowid")]
+reconcile = [{"seq": r[0], "kind": r[1], "at": r[2], "payload": json.loads(r[3])} for r in c.execute(
+    "SELECT seq, kind, created_at, payload_json FROM events WHERE kind LIKE 'reconcile.%' ORDER BY seq")]
+dispatches = [r[0] for r in c.execute(
+    "SELECT event_seq FROM outbox WHERE json_extract(payload_json, '$.kind') = 'dispatch' ORDER BY event_seq")]
+tasks = {r[0]: r[1] for r in c.execute("SELECT task_id, state FROM tasks")}
+print(json.dumps({"attempts": attempts, "reconcile": reconcile, "dispatches": dispatches, "tasks": tasks,
+                  "host_epoch": c.execute("SELECT max(host_epoch) FROM projects").fetchone()[0]}))
+"#;
+
+/// AC-041-01: a host killed (SIGKILL by itself) at each of five points of an attempt the runner runs (before the
+/// dispatch is sent; sent, not answered; answered, its receipt not written; its work effect STARTED, not OBSERVED; its
+/// work effect COMMITTED, its task not moved), ten times each, and restarted at once. Each run ends at its next
+/// stable point with no effect key counted twice, every attempt of the killed host SETTLED, CANCELLED or
+/// UNKNOWN_EFFECT, a task given another attempt only after its earlier one was judged never started, no new attempt
+/// for a task whose attempt is UNKNOWN_EFFECT, the reconcile completed before the restarted host's first dispatch,
+/// and the reconcile started within 30 s of the kill.
+#[test]
+fn test_041_01_kill_at_each_point_of_a_dispatch_never_runs_an_effect_twice() -> R {
+    let dir = tempfile::tempdir()?;
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    let (code, stderr) = serve_and_stop(&project)?;
+    assert_eq!(code, 0, "{stderr}");
+    seed(&project, FIVE_TASKS)?;
+    let template = dir.path().join("template");
+    copy_db(&project.join(".hoh"), &template)?;
+    let decision = start_run().to_string();
+    let points = [
+        "BeforeSend",
+        "AfterSend",
+        "AfterAck",
+        "AfterEffectStarted",
+        "AfterEffectCommitted",
+    ];
+    let mut runs = Vec::new();
+    for point in points {
+        for round in 0..10 {
+            copy_db(&template, &project.join(".hoh"))?;
+            let work = dir.path().join(format!("work-{point}-{round}"));
+            std::fs::create_dir_all(work.join("markers"))?;
+            let killed = ChildGuard(
+                child(&project)?
+                    .env(CHILD_RUNNER_KILL, point)
+                    .env(CHILD_WORK, &work)
+                    .env(CHILD_DECIDE, &decision)
+                    .spawn()?,
+            );
+            let (status, stderr) = wait(killed, Duration::from_secs(90))?;
+            let t0 = std::time::SystemTime::now();
+            assert_eq!(
+                status.signal(),
+                Some(9),
+                "{point} #{round}: not killed at its point ({status:?}): {stderr}"
+            );
+            let db = db(&project);
+            let (code, stderr, stable) = serve_until(
+                &project,
+                &[(CHILD_WORK, work.as_os_str())],
+                Duration::from_secs(60),
+                || {
+                    python(&db, &format!("import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute({STABLE:?}).fetchone()[0])"), "")
+                    .is_ok_and(|n| n.trim() == "0")
+                },
+            )?;
+            assert_eq!(code, 0, "{point} #{round}: the restarted host: {stderr}");
+            assert!(
+                stable,
+                "{point} #{round}: the run did not reach a stable point: {stderr}"
+            );
+            let read: Value = serde_json::from_str(&python(&db, READ_RUN, "")?)?;
+            let counted = std::fs::read_to_string(work.join("counter")).unwrap_or_default();
+            let mut keys: Vec<&str> = counted.lines().collect();
+            keys.sort_unstable();
+            let before = keys.len();
+            keys.dedup();
+            assert_eq!(
+                keys.len(),
+                before,
+                "{point} #{round}: an effect ran twice: {counted}"
+            );
+            // The killed host's epoch is the one before the restarted host's.
+            let killed_epoch = read["host_epoch"].as_i64().ok_or("no epoch")? - 1;
+            let attempts = read["attempts"].as_array().ok_or("no attempts")?;
+            let restart_reconcile: Vec<&Value> = read["reconcile"]
+                .as_array()
+                .ok_or("no reconcile")?
+                .iter()
+                .collect();
+            let started = restart_reconcile
+                .iter()
+                .rev()
+                .find(|e| e["kind"] == "reconcile.started")
+                .ok_or("no reconcile.started")?;
+            let completed = restart_reconcile
+                .iter()
+                .rev()
+                .find(|e| e["kind"] == "reconcile.completed")
+                .ok_or("no reconcile.completed")?;
+            let dispositions: std::collections::BTreeMap<&str, &str> = restart_reconcile
+                .iter()
+                .filter(|e| {
+                    e["kind"] == "reconcile.attempt" && e["seq"].as_i64() > started["seq"].as_i64()
+                })
+                .filter_map(|e| {
+                    Some((
+                        e["payload"]["attempt_id"].as_str()?,
+                        e["payload"]["disposition"].as_str()?,
+                    ))
+                })
+                .collect();
+            for a in attempts
+                .iter()
+                .filter(|a| a["host_epoch"].as_i64() == Some(killed_epoch))
+            {
+                let state = a["state"].as_str().unwrap_or_default();
+                assert!(
+                    ["SETTLED", "CANCELLED", "UNKNOWN_EFFECT"].contains(&state),
+                    "{point} #{round}: old attempt {a}"
+                );
+            }
+            for task in ["T1", "T2", "T3", "T4", "T5"] {
+                let of: Vec<&Value> = attempts.iter().filter(|a| a["task"] == task).collect();
+                for pair in of.windows(2) {
+                    let earlier = pair[0]["id"].as_str().unwrap_or_default();
+                    assert_ne!(
+                        pair[0]["state"], "UNKNOWN_EFFECT",
+                        "{point} #{round}: {task} got another attempt"
+                    );
+                    assert_eq!(
+                        (
+                            pair[0]["state"].as_str(),
+                            dispositions.get(earlier).copied()
+                        ),
+                        (Some("CANCELLED"), Some("ended")),
+                        "{point} #{round}: {task} got another attempt without a never-started judgement"
+                    );
+                }
+            }
+            let after: Vec<i64> = read["dispatches"]
+                .as_array()
+                .ok_or("no dispatches")?
+                .iter()
+                .filter_map(Value::as_i64)
+                .filter(|seq| Some(*seq) > started["seq"].as_i64())
+                .collect();
+            if let Some(first) = after.first() {
+                assert!(
+                    completed["seq"].as_i64() < Some(*first),
+                    "{point} #{round}: a dispatch before the reconcile completed"
+                );
+            }
+            let reconcile_at =
+                hoh_core::time::parse_rfc3339(started["at"].as_str().unwrap_or_default())
+                    .ok_or("a bad reconcile time")?;
+            let delay = reconcile_at.duration_since(t0).unwrap_or_default();
+            assert!(
+                delay <= Duration::from_secs(30),
+                "{point} #{round}: reconcile after {delay:?}"
+            );
+            runs.push(json!({
+                "point": point, "round": round, "signal": 9, "counted": counted.lines().count(),
+                "keys": keys.len(), "reconcile_after_ms": delay.as_millis(), "dispositions": dispositions,
+                "attempts": attempts, "tasks": read["tasks"],
+            }));
+        }
+    }
+    keep(
+        "test-041-01.json",
+        &json!({"runs": runs, "count": runs.len()}),
     )?;
     Ok(())
 }
