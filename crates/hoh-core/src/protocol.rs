@@ -210,6 +210,47 @@ pub struct Message {
     pub reason_code: Option<Option<RejectionReason>>,
 }
 
+impl Message {
+    /// The payload is valid for the message's kind and agrees with the envelope (ADR-018 decisions 2-3): a handoff
+    /// carries a ContextHandoff for the same run, task, recipient, epoch and specification, and a verification one
+    /// names the envelope's candidate (never with a null envelope candidate); a result carries a TaskResult of the
+    /// same run and task. The Message schema alone types the payload only as an object.
+    pub fn check_payload(&self) -> Result<(), String> {
+        let payload = Value::Object(self.payload.clone());
+        match self.kind {
+            MessageKind::Handoff => {
+                let p: ContextHandoff =
+                    decode(&payload).map_err(|e| format!("handoff package: {e}"))?;
+                let candidate = p.candidate.as_ref().map(|c| c.id.as_str());
+                let agrees = p.run_id == self.run_id
+                    && p.role == self.recipient_role
+                    && p.role_epoch == self.role_epoch
+                    && p.spec_sha256 == self.spec_sha256
+                    && p.task_id.as_deref().is_none_or(|t| t == self.task_id)
+                    && (p.handoff_kind != HandoffKind::Verification
+                        || (candidate.is_some() && candidate == self.candidate_id.as_deref()));
+                if !agrees {
+                    return Err(format!(
+                        "handoff {}: the package disagrees with its envelope (run, task, role, epoch, specification or candidate)",
+                        self.message_id
+                    ));
+                }
+            }
+            MessageKind::Result => {
+                let r: TaskResult = decode(&payload).map_err(|e| format!("result payload: {e}"))?;
+                if r.run_id != self.run_id || r.task_id != self.task_id {
+                    return Err(format!(
+                        "result {}: the payload is for another run or task",
+                        self.message_id
+                    ));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
 /// `ContextHandoff.state`: the checkpoint package of a role change; ids reference rows, never transcripts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HandoffState {

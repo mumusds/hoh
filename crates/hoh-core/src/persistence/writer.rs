@@ -710,8 +710,10 @@ pub(super) fn parse<S: Lifecycle>(name: &str) -> Result<S, PersistError> {
 
 /// An outbox operation for the writer thread.
 pub(super) enum OutboxJob {
-    Claim(std::time::SystemTime, Vec<String>, usize),
-    Settle(String, super::outbox::Settlement, i64),
+    /// Now, roles, the delivery limit.
+    Claim(std::time::SystemTime, Vec<String>, i64),
+    /// Message id, generation, settlement, the delivery limit.
+    Settle(String, i64, super::outbox::Settlement, i64),
     Consume(
         Box<(
             String,
@@ -741,12 +743,14 @@ fn run_outbox(
 ) -> Result<OutboxDone, PersistError> {
     use super::outbox;
     Ok(match job {
-        OutboxJob::Claim(now, roles, limit) => OutboxDone {
-            rows: outbox::claim(conn, now, &roles, limit)?,
+        OutboxJob::Claim(now, roles, max) => OutboxDone {
+            rows: outbox::claim_next(conn, now, &roles, max, after_events)?
+                .into_iter()
+                .collect(),
             ..OutboxDone::default()
         },
-        OutboxJob::Settle(id, settlement, max) => {
-            outbox::settle(conn, &id, &settlement, max, after_events)?;
+        OutboxJob::Settle(id, generation, settlement, max) => {
+            outbox::settle(conn, &id, generation, &settlement, max, after_events)?;
             OutboxDone::default()
         }
         OutboxJob::Consume(request) => {

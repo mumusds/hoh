@@ -636,29 +636,33 @@ impl Store {
             })
     }
 
-    /// Take up to `limit` outbox messages for `roles` due at `now` for delivery (ADR-018 decision 4).
+    /// Take the next outbox message due at `now` for one of `roles` and start its delivery; rows whose deliveries
+    /// are spent go to DEAD_LETTER on the way (ADR-018 decision 4).
     pub async fn claim_outbox(
         &self,
         now: std::time::SystemTime,
         roles: Vec<String>,
-        limit: usize,
-    ) -> Result<Vec<OutboxRow>, PersistError> {
+        max_attempts: i64,
+    ) -> Result<Option<OutboxRow>, PersistError> {
         self.writer
-            .outbox(writer::OutboxJob::Claim(now, roles, limit))
+            .outbox(writer::OutboxJob::Claim(now, roles, max_attempts))
             .await
-            .map(|done| done.rows)
+            .map(|done| done.rows.into_iter().next())
     }
 
-    /// Settle a delivery of `message_id` (ADR-018 decision 4); DEAD_LETTER with its event after `max_attempts`.
+    /// Settle delivery `generation` (the row's `attempt_count` when it was taken) of `message_id` (ADR-018 decision
+    /// 4); a failure of an earlier generation is ignored.
     pub async fn settle_outbox(
         &self,
         message_id: &str,
+        generation: i64,
         settlement: Settlement,
         max_attempts: i64,
     ) -> Result<(), PersistError> {
         self.writer
             .outbox(writer::OutboxJob::Settle(
                 message_id.to_owned(),
+                generation,
                 settlement,
                 max_attempts,
             ))

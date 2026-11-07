@@ -141,6 +141,7 @@ INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, creat
   ('D', 'R', 's2', 'RUNNING', 4, 'developer', 1, 2);
 INSERT INTO task_requirements(task_id, requirement_id, spec_id) VALUES ('D', 'REQ-022', 's2');
 INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision) VALUES ('A', 'D', 'RUNNING', 1, 1, 1);
+INSERT INTO leases(project_id, kind, attempt_id, epoch, expires_at) VALUES ('p1', 'writer', 'A', 1, '2100-01-01T00:00:00Z');
 INSERT INTO candidates(candidate_id, run_id, git_commit, git_tree, spec_sha256, environment_sha256, test_plan_sha256, source_path, state, created_at) VALUES
   ('C1', 'R', printf('%040d', 1), printf('%040d', 11), printf('%064d', 1), printf('%064d', 3), printf('%064d', 4), '/c1', 'STALE', '2026-11-07T00:00:01Z'),
   ('C2', 'R', printf('%040d', 2), printf('%040d', 12), printf('%064d', 2), printf('%064d', 3), printf('%064d', 4), '/c2', 'FROZEN', '2026-11-07T00:00:02Z');
@@ -250,6 +251,8 @@ struct FakeTransport<'a, T: Transport> {
     never: Option<&'static str>,
     dropped: Mutex<BTreeSet<String>>,
     replies: Mutex<Vec<(String, String)>>,
+    /// Every delivery: the message, its generation, and what happened (the evidence, M2T04R-57).
+    log: Mutex<Vec<Value>>,
 }
 
 impl<'a, T: Transport> FakeTransport<'a, T> {
@@ -260,6 +263,7 @@ impl<'a, T: Transport> FakeTransport<'a, T> {
             never,
             dropped: Mutex::new(BTreeSet::new()),
             replies: Mutex::new(Vec::new()),
+            log: Mutex::new(Vec::new()),
         }
     }
     fn replies_of(&self, message_id: &str) -> Vec<String> {
@@ -277,7 +281,15 @@ impl<'a, T: Transport> FakeTransport<'a, T> {
 
 impl<T: Transport> Transport for FakeTransport<'_, T> {
     async fn deliver(&self, row: &OutboxRow) -> Result<String, DeliveryError> {
+        let note = |what: &str, reply: Option<&str>| {
+            if let Ok(mut log) = self.log.lock() {
+                log.push(json!({"message_id": row.message_id, "generation": row.attempt_count, "outcome": what,
+                                "reply_kind": reply.and_then(|r| serde_json::from_str::<Value>(r).ok())
+                                    .map(|v| v["kind"].clone())}));
+            }
+        };
         if self.never == Some(row.recipient_role.as_str()) {
+            note("no answer (never delivered)", None);
             return Err(DeliveryError::Lost("no answer".to_owned()));
         }
         let reply = self.inner.deliver(row).await?;
@@ -291,8 +303,13 @@ impl<T: Transport> Transport for FakeTransport<'_, T> {
                 .map(|mut d| d.insert(row.message_id.clone()))
                 .unwrap_or(false)
         {
+            note(
+                "consumed, its ACK dropped after the receipt committed",
+                Some(&reply),
+            );
             return Err(DeliveryError::Lost("ack lost".to_owned()));
         }
+        note("answered", Some(&reply));
         Ok(reply)
     }
 }
@@ -302,16 +319,19 @@ async fn drain<C: Transport>(
     dispatcher: &Dispatcher<'_, FakeClock, C>,
     db: &Path,
     clock: &FakeClock,
-) -> R<Vec<String>> {
+) -> R<(Vec<String>, Vec<Value>)> {
     let mut retries = Vec::new();
+    let mut series = Vec::new();
     for _ in 0..20 {
         dispatcher.tick().await?;
+        series.push(json!({"at": hoh_core::time::rfc3339_utc(clock.now()),
+                           "outbox": rows(db, "SELECT message_id, state, attempt_count, next_retry_at FROM outbox ORDER BY message_id")?}));
         let next = rows(
             db,
             "SELECT min(next_retry_at) FROM outbox WHERE state IN ('PENDING', 'DELIVERING')",
         )?;
         let Some(Value::String(at)) = next.first().and_then(|r| r.first()) else {
-            return Ok(retries);
+            return Ok((retries, series));
         };
         retries.push(at.clone());
         clock.set(hoh_core::time::parse_rfc3339(at).ok_or("bad next_retry_at")?);
@@ -360,7 +380,11 @@ async fn test_022_01_duplicates_and_reordering_apply_each_message_once() -> R {
             .map(|(id, r)| json!({"message": id, "reply": serde_json::from_str::<Value>(r).unwrap_or(Value::Null)}))
             .collect();
         evidence[group] = json!({"order": order, "replies": replies, "revision": revision, "moves": moves,
-                                 "receipts": receipts});
+                                 "receipts": receipts,
+                                 "requests": [protocol::encode(&m1)?, protocol::encode(&m2)?],
+                                 "receipt_rows": rows(&db, "SELECT consumer, message_id, result_json FROM receipts ORDER BY message_id")?,
+                                 "events": rows(&db, "SELECT seq, kind, payload_json FROM events ORDER BY seq")?,
+                                 "tasks": rows(&db, "SELECT task_id, state, revision FROM tasks ORDER BY task_id")?});
         let first_of = |id: &str| {
             answers
                 .iter()
@@ -432,7 +456,7 @@ async fn test_022_03_a_lost_ack_is_deduplicated_and_an_unanswered_message_dead_l
         after_first.iter().all(|r| r[3].is_string()),
         "next_retry_at not kept: {after_first:?}"
     );
-    let retries = drain(&dispatcher, &db, &clock).await?;
+    let (retries, series) = drain(&dispatcher, &db, &clock).await?;
     let outbox = rows(
         &db,
         "SELECT message_id, state, attempt_count FROM outbox ORDER BY message_id",
@@ -440,6 +464,10 @@ async fn test_022_03_a_lost_ack_is_deduplicated_and_an_unanswered_message_dead_l
     keep(
         "test-022-03.json",
         &json!({"after_first_delivery": after_first, "retry_times": retries, "outbox": outbox,
+                "outbox_after_each_tick": series,
+                "deliveries": transport.log.lock().map(|l| l.clone()).unwrap_or_default(),
+                "tasks": rows(&db, "SELECT task_id, state, revision FROM tasks ORDER BY task_id")?,
+                "events": rows(&db, "SELECT seq, kind, payload_json FROM events ORDER BY seq")?,
                 "receipts": rows(&db, "SELECT consumer, message_id FROM receipts")?,
                 "dead_letters": rows(&db, "SELECT payload_json FROM events WHERE kind = 'outbox.dead_letter'")?}),
     )?;
@@ -481,6 +509,8 @@ async fn test_022_03_a_lost_ack_is_deduplicated_and_an_unanswered_message_dead_l
     let replies = transport.replies_of(&m);
     assert_eq!(replies.len(), 2);
     assert_eq!(replies[0], replies[1]);
+    let reply: Value = serde_json::from_str(&replies[0])?;
+    assert_eq!(reply["kind"], json!("ack"), "{reply}");
     Ok(())
 }
 
@@ -510,6 +540,7 @@ async fn test_022_04_candidate_ready_hands_the_same_candidate_to_qa_and_reviewer
     )?;
     let c2 = json!({"id": c2[0][0], "git_commit": c2[0][1], "git_tree": c2[0][2], "spec_sha256": c2[0][3],
                     "environment_sha256": c2[0][4], "test_plan_sha256": c2[0][5]});
+    let mut validation = Vec::new();
     let mut candidates = Vec::new();
     for row in &messages {
         let raw: Value = serde_json::from_str(row[1].as_str().ok_or("no payload")?)?;
@@ -517,15 +548,50 @@ async fn test_022_04_candidate_ready_hands_the_same_candidate_to_qa_and_reviewer
         let package: ContextHandoff = protocol::decode(&Value::Object(message.payload.clone()))?;
         assert_eq!(message.kind, protocol::MessageKind::Handoff);
         assert_eq!(package.spec_sha256, sha(2));
+        // The envelope carries the current fences: the role's epoch, the task's revision once VERIFYING, the spec
+        // and the candidate (M2T04R-50).
+        let epoch = if message.recipient_role == "qa" { 2 } else { 1 };
+        assert_eq!(
+            (
+                message.role_epoch,
+                package.role_epoch,
+                message.expected_revision
+            ),
+            (epoch, epoch, 6)
+        );
+        assert_eq!(message.spec_sha256, sha(2));
+        assert_eq!(message.candidate_id.as_deref(), Some("C2"));
+        assert!(message.message_id.len() <= 160);
         assert!(!package.acceptance_ids.is_empty());
         assert_eq!(package.role, message.recipient_role);
+        // No StartRun command in this world: the fixed account names the task and the candidate (M2T04R-63).
+        assert!(
+            package.goal.contains('D') && package.goal.contains("C2"),
+            "{}",
+            package.goal
+        );
+        validation.push(
+            json!({"message_id": message.message_id, "message": "valid Message",
+                               "package": "valid ContextHandoff", "errors": []}),
+        );
         candidates.push(serde_json::to_value(&package.candidate)?);
     }
     assert_eq!(candidates[0], candidates[1]);
     assert_eq!(candidates[0], c2);
+    assert_eq!(
+        rows(&db, "SELECT state, revision FROM tasks WHERE task_id = 'D'")?,
+        [[json!("VERIFYING"), json!(6)]]
+    );
+    assert_eq!(
+        one(
+            &db,
+            "SELECT state FROM candidates WHERE candidate_id = 'C2'"
+        )?,
+        json!("VERIFYING")
+    );
     keep(
         "test-022-04.json",
-        &json!({"handoffs": messages, "candidate_row": c2}),
+        &json!({"handoffs": messages, "candidate_row": c2, "schema_validation": validation}),
     )?;
     // The same result again makes no more handoffs.
     let again = store.accept_task_result(developer_result()?).await?;
@@ -551,6 +617,14 @@ async fn test_022_04_candidate_ready_hands_the_same_candidate_to_qa_and_reviewer
     assert_eq!(
         rows(&db, "SELECT DISTINCT state FROM outbox")?,
         [[json!("ACKED")]]
+    );
+    // Both consumers took their handoff (an ack, not a rejection that also settles ACKED).
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT DISTINCT json_extract(result_json, '$.kind') FROM receipts"
+        )?,
+        [[json!("ack")]]
     );
     assert_ne!(
         one(&db, "SELECT state FROM tasks WHERE task_id = 'D'")?,
@@ -663,7 +737,8 @@ async fn test_022_05_stale_epoch_spec_candidate_and_an_empty_handoff_are_refused
     keep(
         "test-022-05.json",
         &json!({"refusal_events": refusals, "receipts": rows(&db, "SELECT message_id, result_json FROM receipts")?,
-                "task_revision_and_acceptance_results": [before, after]}),
+                "task_revision_and_acceptance_results": [before, after],
+                "messages": rows(&db, "SELECT message_id, payload_json FROM outbox ORDER BY message_id")?}),
     )?;
     Ok(())
 }
@@ -767,7 +842,9 @@ async fn test_062_03_redelivery_applies_once_and_a_bad_foreign_key_rolls_back_it
         "test-062-03.json",
         &json!({"revision_before": revision, "events_before": events, "events_after_m": after_m,
                 "replies": replies, "receipts": rows(&db, "SELECT consumer, message_id FROM receipts")?,
-                "bad_write": format!("{refused:?}")}),
+                "bad_write": format!("{refused:?}"),
+                "tasks": rows(&db, "SELECT task_id, state, revision FROM tasks ORDER BY task_id")?,
+                "events": rows(&db, "SELECT seq, event_id, kind FROM events ORDER BY seq")?}),
     )?;
     Ok(())
 }
@@ -814,7 +891,8 @@ async fn a_stale_task_result_is_refused_once_and_changes_nothing() -> R {
     // The older candidate is refused too (from another attempt of the task, so nothing is a replay).
     seed(
         &db,
-        "INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision) VALUES ('A2', 'D', 'RUNNING', 1, 1, 1);",
+        "INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision) VALUES ('A2', 'D', 'RUNNING', 1, 1, 1);
+         UPDATE leases SET attempt_id = 'A2', epoch = 2 WHERE kind = 'writer';",
     )?;
     let mut old = developer_result()?;
     old.attempt_id = "A2".to_owned();
@@ -895,5 +973,484 @@ fn a_handoff_without_acceptance_criteria_is_never_queued() -> R {
         NewOutbox::hcp(0, &handoff),
         Err(PersistError::IntegrityViolation(_))
     ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_late_failure_of_an_earlier_delivery_does_not_undo_a_later_success() -> R {
+    // M2T04R-01: generation 1 is taken, given up after its backoff, and generation 2 is delivered and settled; the
+    // answer of generation 1 that comes late (a failure) must not dead-letter the message.
+    let dir = tempfile::tempdir()?;
+    let (store, db) = open(&dir)?;
+    seed(&db, WORLD)?;
+    enqueue(&store, "late", &[to_qa("L", 3, 2, &sha(2), None)?]).await?;
+    let clock = FakeClock::new();
+    let qa = vec!["qa".to_owned()];
+    let first = store
+        .claim_outbox(clock.now(), qa.clone(), 2)
+        .await?
+        .ok_or("nothing due")?;
+    clock.set(
+        hoh_core::time::parse_rfc3339(first.next_retry_at.as_deref().ok_or("no retry")?)
+            .ok_or("bad time")?,
+    );
+    let second = store
+        .claim_outbox(clock.now(), qa.clone(), 2)
+        .await?
+        .ok_or("not due again")?;
+    assert_eq!((first.attempt_count, second.attempt_count), (1, 2));
+    let local = LocalTransport::new(&store, &clock).with("qa", Touch);
+    local.deliver(&second).await.map_err(|e| format!("{e:?}"))?;
+    // The late failure first, then the success: and the other way round in a second message below.
+    store
+        .settle_outbox(
+            "L",
+            1,
+            hoh_core::persistence::Settlement::Failed("late".to_owned()),
+            2,
+        )
+        .await?;
+    store
+        .settle_outbox("L", 2, hoh_core::persistence::Settlement::Delivered, 2)
+        .await?;
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT state, attempt_count FROM outbox WHERE message_id = 'L'"
+        )?,
+        [[json!("ACKED"), json!(2)]]
+    );
+    store
+        .settle_outbox(
+            "L",
+            1,
+            hoh_core::persistence::Settlement::Failed("later still".to_owned()),
+            2,
+        )
+        .await?;
+    assert_eq!(
+        one(&db, "SELECT state FROM outbox WHERE message_id = 'L'")?,
+        json!("ACKED")
+    );
+    assert_eq!(
+        one(
+            &db,
+            "SELECT count(*) FROM events WHERE kind = 'outbox.dead_letter'"
+        )?,
+        json!(0)
+    );
+    Ok(())
+}
+
+/// A transport whose delivery of `stuck` never returns.
+struct Stuck<'a, T: Transport> {
+    inner: &'a T,
+    stuck: &'static str,
+    calls: Mutex<Vec<String>>,
+}
+
+impl<T: Transport> Transport for Stuck<'_, T> {
+    async fn deliver(&self, row: &OutboxRow) -> Result<String, DeliveryError> {
+        if let Ok(mut calls) = self.calls.lock() {
+            calls.push(row.message_id.clone());
+        }
+        if row.message_id == self.stuck {
+            std::future::pending::<()>().await;
+        }
+        self.inner.deliver(row).await
+    }
+}
+
+#[tokio::test]
+async fn deliveries_taken_and_never_settled_stop_at_the_limit_and_cost_no_other_message() -> R {
+    // M2T04R-02, -03: each tick hangs on `a` and is cancelled; `b`, behind it, must not lose deliveries it never got,
+    // and `a` must go to DEAD_LETTER once its deliveries are spent, not be taken forever.
+    let dir = tempfile::tempdir()?;
+    let (store, db) = open(&dir)?;
+    seed(&db, WORLD)?;
+    enqueue(
+        &store,
+        "ab",
+        &[
+            to_qa("a", 3, 2, &sha(2), None)?,
+            to_qa("b", 3, 2, &sha(2), None)?,
+        ],
+    )
+    .await?;
+    let clock = FakeClock::new();
+    let local = LocalTransport::new(&store, &clock).with("qa", Noop);
+    let transport = Stuck {
+        inner: &local,
+        stuck: "a",
+        calls: Mutex::new(Vec::new()),
+    };
+    let dispatcher = Dispatcher {
+        store: &store,
+        clock: &clock,
+        transport: &transport,
+        roles: local.roles(),
+        max_attempts: 3,
+        batch: 2,
+    };
+    for _ in 0..4 {
+        let _ = tokio::time::timeout(Duration::from_millis(200), dispatcher.tick()).await;
+        clock.set(clock.now() + Duration::from_secs(120));
+    }
+    let calls = transport
+        .calls
+        .lock()
+        .map(|c| c.clone())
+        .unwrap_or_default();
+    assert_eq!(
+        calls,
+        ["a", "a", "a", "b"],
+        "the transport was called {calls:?}"
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT message_id, state, attempt_count FROM outbox ORDER BY message_id"
+        )?,
+        [
+            [json!("a"), json!("DEAD_LETTER"), json!(3)],
+            [json!("b"), json!("ACKED"), json!(1)]
+        ]
+    );
+    assert_eq!(
+        one(
+            &db,
+            "SELECT count(*) FROM events WHERE kind = 'outbox.dead_letter'"
+        )?,
+        json!(1)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_notices_in_the_outbox_are_left_for_their_own_consumer() -> R {
+    // M2T04R-05: decide's and the round's dispatch notices and PauseRun's run.control are no HCP messages; the HCP
+    // dispatcher neither delivers nor dead-letters them.
+    let dir = tempfile::tempdir()?;
+    let (store, db) = open(&dir)?;
+    seed(&db, WORLD)?;
+    store
+        .commit(Commit {
+            events: vec![NewEvent {
+                project_id: "p1".to_owned(),
+                event_id: "notice".to_owned(),
+                run_id: Some("R".to_owned()),
+                kind: "test.notice".to_owned(),
+                payload: json!({}),
+            }],
+            outbox: vec![NewOutbox {
+                message_id: "T/attempt-1/dispatch".to_owned(),
+                event: 0,
+                run_id: Some("R".to_owned()),
+                recipient_role: "qa".to_owned(),
+                role_epoch: 2,
+                payload: json!({"kind": "dispatch", "task_id": "T", "role": "qa", "attempt_id": "T/attempt-1"}),
+            }],
+            ..Commit::default()
+        })
+        .await?;
+    let clock = FakeClock::new();
+    let local = LocalTransport::new(&store, &clock).with("qa", Noop);
+    let dispatcher = Dispatcher {
+        store: &store,
+        clock: &clock,
+        transport: &local,
+        roles: local.roles(),
+        max_attempts: 3,
+        batch: 10,
+    };
+    assert_eq!(
+        dispatcher.tick().await?,
+        hoh_core::delivery::Tick::default()
+    );
+    assert_eq!(
+        rows(&db, "SELECT state, attempt_count FROM outbox")?,
+        [[json!("PENDING"), json!(0)]]
+    );
+    Ok(())
+}
+
+/// A valid verification handoff to qa about T at revision 3 with C2 (the current candidate).
+fn qa_handoff(id: &str) -> R<Message> {
+    let mut m = to_qa(id, 3, 2, &sha(2), Some("C2"))?;
+    m.kind = protocol::MessageKind::Handoff;
+    let Value::Object(payload) = json!({
+        "schema_version": "1.0", "run_id": "R", "task_id": "T", "goal": "verify", "role": "qa", "role_epoch": 2,
+        "spec_sha256": sha(2),
+        "candidate": {"id": "C2", "git_commit": format!("{:040}", 2), "git_tree": format!("{:040}", 12),
+                      "spec_sha256": sha(2), "environment_sha256": sha(3), "test_plan_sha256": sha(4)},
+        "acceptance_ids": ["AC-022-04"], "references": [], "output_contract": "TaskResult", "budget_tokens": 1000,
+        "handoff_kind": "verification", "spec_revision": 2
+    }) else {
+        return Err("not an object".into());
+    };
+    m.payload = payload;
+    Ok(m)
+}
+
+#[tokio::test]
+async fn a_handoffs_package_is_fenced_in_full_and_must_agree_with_its_envelope() -> R {
+    // M2T04R-04, -56: the candidate is fenced by its whole identity and never skipped by a null envelope; the package
+    // agrees with its envelope (run, task, role, epoch, specification) and its specification revision is current.
+    let dir = tempfile::tempdir()?;
+    let (store, db) = open(&dir)?;
+    seed(&db, WORLD)?;
+    let valid = qa_handoff("h-ok")?;
+    assert!(NewOutbox::hcp(0, &valid).is_ok());
+    let mut null_envelope = qa_handoff("h-null")?;
+    null_envelope.candidate_id = None;
+    let mut other_task = qa_handoff("h-task")?;
+    other_task.payload.insert("task_id".to_owned(), json!("D"));
+    let mut other_epoch = qa_handoff("h-epoch")?;
+    other_epoch
+        .payload
+        .insert("role_epoch".to_owned(), json!(1));
+    for bad in [&null_envelope, &other_task, &other_epoch] {
+        assert!(
+            NewOutbox::hcp(0, bad).is_err(),
+            "{} was queued",
+            bad.message_id
+        );
+    }
+    let mut tree = qa_handoff("h-tree")?;
+    tree.payload["candidate"]["git_tree"] = json!(format!("{:040}", 99));
+    let mut revision = qa_handoff("h-revision")?;
+    revision
+        .payload
+        .insert("spec_revision".to_owned(), json!(1));
+    enqueue(&store, "packages", &[tree.clone(), revision.clone()]).await?;
+    // The null-envelope one got into the outbox anyway: delivered, it is invalid, not applied.
+    seed(
+        &db,
+        &format!(
+            "INSERT INTO outbox(message_id, event_seq, run_id, recipient_role, role_epoch, payload_json, state) \
+             VALUES ('h-null', (SELECT max(seq) FROM events), 'R', 'qa', 2, '{}', 'PENDING');",
+            protocol::encode(&null_envelope)?
+                .to_string()
+                .replace('\'', "''")
+        ),
+    )?;
+    let clock = FakeClock::new();
+    let local = LocalTransport::new(&store, &clock).with("qa", Touch);
+    let dispatcher = Dispatcher {
+        store: &store,
+        clock: &clock,
+        transport: &local,
+        roles: local.roles(),
+        max_attempts: 5,
+        batch: 10,
+    };
+    let tick = dispatcher.tick().await?;
+    assert_eq!(tick.invalid, ["h-null"]);
+    for (id, reason) in [
+        ("h-tree", "CANDIDATE_MISMATCH"),
+        ("h-revision", "SPEC_MISMATCH"),
+    ] {
+        let reply: Value = serde_json::from_str(
+            one(
+                &db,
+                &format!("SELECT result_json FROM receipts WHERE message_id = '{id}'"),
+            )?
+            .as_str()
+            .ok_or("no receipt")?,
+        )?;
+        assert_eq!(
+            (&reply["kind"], &reply["reason_code"]),
+            (&json!("rejected"), &json!(reason)),
+            "{id}: {reply}"
+        );
+    }
+    assert_eq!(
+        one(&db, "SELECT revision FROM tasks WHERE task_id = 'T'")?,
+        json!(3)
+    );
+    assert_eq!(
+        one(&db, "SELECT count(*) FROM events WHERE kind = 'qa.touched'")?,
+        json!(0)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_message_whose_payload_is_not_its_kinds_is_never_queued_nor_consumed() -> R {
+    // M2T04R-06: kind=result with a steer payload; the store refuses to queue it and to consume it directly.
+    let dir = tempfile::tempdir()?;
+    let (store, db) = open(&dir)?;
+    seed(&db, WORLD)?;
+    let mut result = to_qa("r-bad", 3, 2, &sha(2), None)?;
+    result.kind = protocol::MessageKind::Result;
+    assert!(NewOutbox::hcp(0, &result).is_err());
+    // Queued as a steer message, consumed directly as a result.
+    enqueue(&store, "r", &[to_qa("r-bad", 3, 2, &sha(2), None)?]).await?;
+    let refused = store
+        .consume(
+            "qa",
+            result,
+            Touch.effect(&to_qa("r-bad", 3, 2, &sha(2), None)?),
+            FakeClock::new().now(),
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(PersistError::IntegrityViolation(_))),
+        "{refused:?}"
+    );
+    assert_eq!(
+        one(&db, "SELECT revision FROM tasks WHERE task_id = 'T'")?,
+        json!(3)
+    );
+    assert_eq!(one(&db, "SELECT count(*) FROM receipts")?, json!(0));
+    Ok(())
+}
+
+/// A fresh store on WORLD plus `extra`.
+async fn world_with(extra: &str) -> R<(tempfile::TempDir, Store, PathBuf)> {
+    let dir = tempfile::tempdir()?;
+    let (store, db) = open(&dir)?;
+    seed(&db, WORLD)?;
+    if !extra.is_empty() {
+        seed(&db, extra)?;
+    }
+    Ok((dir, store, db))
+}
+
+/// Nothing of D's verification was written: no outbox row or event, D RUNNING at 4, C2 FROZEN.
+fn nothing_written(db: &Path) -> R {
+    assert_eq!(one(db, "SELECT count(*) FROM outbox")?, json!(0));
+    assert_eq!(
+        one(
+            db,
+            "SELECT count(*) FROM events WHERE kind = 'candidate_ready'"
+        )?,
+        json!(0)
+    );
+    assert_eq!(
+        rows(db, "SELECT state, revision FROM tasks WHERE task_id = 'D'")?,
+        [[json!("RUNNING"), json!(4)]]
+    );
+    assert_eq!(
+        one(db, "SELECT state FROM candidates WHERE candidate_id = 'C2'")?,
+        json!("FROZEN")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_task_result_is_taken_only_from_the_live_attempt_for_the_current_candidate() -> R {
+    // M2T04R-51..55.
+    let refused = |outcome: &TaskResultOutcome| match outcome {
+        TaskResultOutcome::Rejected { reason, .. } => Some(*reason),
+        _ => None,
+    };
+    // No reviewer bound, or no acceptance criteria: refused whole, nothing written.
+    for extra in [
+        "DELETE FROM role_bindings WHERE role = 'reviewer';",
+        "DELETE FROM task_requirements WHERE task_id = 'D';",
+    ] {
+        let (_dir, store, db) = world_with(extra).await?;
+        assert!(
+            store.accept_task_result(developer_result()?).await.is_err(),
+            "{extra}"
+        );
+        nothing_written(&db)?;
+    }
+    let c3 = "INSERT INTO candidates(candidate_id, run_id, git_commit, git_tree, spec_sha256, environment_sha256, \
+              test_plan_sha256, source_path, state, created_at) VALUES ('C3', 'R', printf('%040d', 3), \
+              printf('%040d', 13), printf('%064d', 2), printf('%064d', 3), printf('%064d', 4), '/c3', 'FROZEN', \
+              '2026-11-07T00:00:03Z');";
+    let newer_attempt = "INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision) \
+                         VALUES ('A9', 'D', 'RUNNING', 1, 1, 1); UPDATE leases SET attempt_id = 'A9', epoch = 2;";
+    // The task is not the result's role's; the candidate is no longer FROZEN; a newer candidate is current; a late
+    // result of a failed attempt, of one that ran at another epoch, of one that lost its lease.
+    let cases = [
+        ("", true, RejectionReason::IllegalTransition),
+        (
+            "UPDATE candidates SET state = 'VERIFYING' WHERE candidate_id = 'C2';",
+            false,
+            RejectionReason::CandidateMismatch,
+        ),
+        (c3, false, RejectionReason::CandidateMismatch),
+        (
+            "UPDATE attempts SET state = 'FAILED' WHERE attempt_id = 'A';",
+            false,
+            RejectionReason::StaleLeaseEpoch,
+        ),
+        (
+            "UPDATE attempts SET role_epoch = 7 WHERE attempt_id = 'A';",
+            false,
+            RejectionReason::StaleRoleEpoch,
+        ),
+        (newer_attempt, false, RejectionReason::StaleLeaseEpoch),
+    ];
+    for (extra, as_reviewer, want) in cases {
+        let (_dir, store, db) = world_with(extra).await?;
+        let mut result = developer_result()?;
+        if as_reviewer {
+            result.role = "reviewer".to_owned();
+        }
+        let outcome = store.accept_task_result(result).await?;
+        assert_eq!(
+            refused(&outcome),
+            Some(want),
+            "{extra} {as_reviewer}: {outcome:?}"
+        );
+        assert_eq!(one(&db, "SELECT count(*) FROM outbox")?, json!(0));
+        assert_eq!(
+            one(&db, "SELECT state FROM tasks WHERE task_id = 'D'")?,
+            json!("RUNNING")
+        );
+    }
+    // The same attempt's result with another payload is a reuse of its key, not a replay.
+    let (_dir, store, _db) = world_with("").await?;
+    store.accept_task_result(developer_result()?).await?;
+    let mut other = developer_result()?;
+    other.summary = "something else".to_owned();
+    assert!(matches!(
+        store.accept_task_result(other).await,
+        Err(PersistError::KeyReuse(_))
+    ));
+    // A candidate id as long as the contract allows still makes valid, bounded message ids.
+    let long = "C".repeat(150);
+    let (_dir, store, db) = world_with(&format!(
+        "INSERT INTO candidates(candidate_id, run_id, git_commit, git_tree, spec_sha256, environment_sha256, \
+         test_plan_sha256, source_path, state, created_at) VALUES ('{long}', 'R', printf('%040d', 5), \
+         printf('%040d', 15), printf('%064d', 2), printf('%064d', 3), printf('%064d', 4), '/c5', 'FROZEN', \
+         '2026-11-07T00:00:09Z');"
+    ))
+    .await?;
+    let mut result = developer_result()?;
+    result.candidate_id = Some(long);
+    let outcome = store.accept_task_result(result).await?;
+    let TaskResultOutcome::Accepted { handoffs, .. } = outcome else {
+        return Err(format!("not accepted: {outcome:?}").into());
+    };
+    assert!(handoffs.iter().all(|h| h.len() <= 160), "{handoffs:?}");
+    assert_eq!(one(&db, "SELECT count(*) FROM outbox")?, json!(2));
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_invalid_message_recorded_twice_is_one_event() -> R {
+    // M2T04R-59: recorded, then the process stops before the row is settled; recording it again is not an error.
+    let dir = tempfile::tempdir()?;
+    let (store, db) = open(&dir)?;
+    seed(&db, WORLD)?;
+    let first = store
+        .record_invalid_message("qa", "x", Some("R"), "broken")
+        .await?;
+    let again = store
+        .record_invalid_message("qa", "x", Some("R"), "broken")
+        .await?;
+    assert_eq!(first, again);
+    assert_eq!(
+        one(
+            &db,
+            "SELECT count(*) FROM events WHERE kind = 'message.invalid'"
+        )?,
+        json!(1)
+    );
     Ok(())
 }
