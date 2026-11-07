@@ -9,6 +9,8 @@
 //! WAL self-test refuses.
 
 mod http;
+mod reconcile;
+pub use reconcile::ReconcileSettings;
 
 use hoh_core::persistence::{self, Options, PersistError, Reader, Store, location};
 use std::path::{Path, PathBuf};
@@ -34,6 +36,8 @@ pub struct HostConfig {
     pub mountinfo: Option<String>,
     /// Fault injection points; the product's [`NoHostFaults`] does nothing (CR-006).
     pub hooks: Arc<dyn HostHooks>,
+    /// How the reconcile at the start stops old processes and looks for effects (ADR-019 decision 5).
+    pub reconcile: ReconcileSettings,
 }
 
 impl HostConfig {
@@ -48,6 +52,7 @@ impl HostConfig {
             },
             mountinfo: None,
             hooks: Arc::new(NoHostFaults),
+            reconcile: ReconcileSettings::default(),
         }
     }
 }
@@ -205,7 +210,15 @@ impl Host {
             }
             readers.push(reader);
         }
-        // Reconcile of leased work comes with M2-T05; nothing is leased before it.
+        // Every unfinished attempt is settled before anything is served (REQ-041 b1: no write command before it).
+        reconcile::run(
+            &store,
+            &started.project_id,
+            started.host_epoch,
+            &config.reconcile,
+        )
+        .await
+        .map_err(StartError::store)?;
         let socket = files.join("host.sock");
         if socket.as_os_str().len() > SOCKET_PATH_MAX {
             return Err(StartError::other(format!(

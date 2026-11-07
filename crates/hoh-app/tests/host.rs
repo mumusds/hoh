@@ -658,7 +658,14 @@ async fn test_022_02_same_key_replays_and_another_payload_is_key_reuse() -> R {
     assert_eq!(accepted["command_id"], "c1");
     assert_eq!(accepted["revision"], 1);
     assert_eq!(scalar(dir.path(), "SELECT count(*) FROM commands")?, "1");
-    assert_eq!(scalar(dir.path(), "SELECT count(*) FROM events")?, "1");
+    // The host's own reconcile events at its start aside (ADR-019 decision 5).
+    assert_eq!(
+        scalar(
+            dir.path(),
+            "SELECT count(*) FROM events WHERE kind NOT LIKE 'reconcile.%'"
+        )?,
+        "1"
+    );
     // PauseRun's notice to the commander is a runtime notice (ADR-016 decision 5, ADR-018 decision 4, M2T04R-251).
     assert_eq!(
         scalar(
@@ -678,7 +685,14 @@ async fn test_022_02_same_key_replays_and_another_payload_is_key_reuse() -> R {
     assert_eq!(other.status, 409, "{other:?}");
     assert_eq!(other.json()?["code"], "KEY_REUSE");
     assert_eq!(scalar(dir.path(), "SELECT count(*) FROM commands")?, "1");
-    assert_eq!(scalar(dir.path(), "SELECT count(*) FROM events")?, "1");
+    // The host's own reconcile events at its start aside (ADR-019 decision 5).
+    assert_eq!(
+        scalar(
+            dir.path(),
+            "SELECT count(*) FROM events WHERE kind NOT LIKE 'reconcile.%'"
+        )?,
+        "1"
+    );
     host.shutdown().await;
     Ok(())
 }
@@ -980,7 +994,7 @@ async fn test_062_02_queue_8_under_4000_commands_loses_nothing() -> R {
                  run={r[0]: r[1:] for r in c.execute('SELECT run_id, state, revision FROM runs')}; \
                  ev={}; [ev.setdefault(r[0], []).append(r[1]) for r in c.execute(\"SELECT json_extract(payload_json,'$.command_id'), seq FROM events\")]; \
                  ob={}; [ob.setdefault(r[0], []).append(r[1]) for r in c.execute(\"SELECT json_extract(payload_json,'$.command_id'), event_seq FROM outbox\")]; \
-                 seqs=[r[0] for r in c.execute('SELECT seq FROM events ORDER BY rowid')]; \
+                 seqs=[r[0] for r in c.execute(\"SELECT seq FROM events WHERE kind NOT LIKE 'reconcile.%' ORDER BY rowid\")]; \
                  ok=d['accepted']; no=d['retried']; \
                  print(json.dumps({'commands': len(cmd), \
                    'missing_command': sum(1 for a in ok if a['id'] not in cmd), \
@@ -1463,7 +1477,11 @@ async fn events_follow_the_openapi_contract() -> R {
         .await?;
         assert_eq!(reply.status, 202);
     }
-    let first_seq: i64 = scalar(dir.path(), "SELECT min(seq) FROM events")?.parse()?;
+    let first_seq: i64 = scalar(
+        dir.path(),
+        "SELECT min(seq) FROM events WHERE kind NOT LIKE 'reconcile.%'",
+    )?
+    .parse()?;
     // After the first event: the second is replayed, the third arrives live.
     let subscriber = Subscriber::connect(
         to.clone(),

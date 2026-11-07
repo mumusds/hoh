@@ -338,3 +338,33 @@ fn times_with_offsets_are_judged_as_instants() -> R {
     assert_eq!(state, "PREPARED");
     Ok(())
 }
+
+#[test]
+fn an_attempt_whose_effect_is_unknown_lets_its_lease_go_at_that_move() -> R {
+    // ADR-019 decision 5 (amends ADR-017 decision 4): UNKNOWN_EFFECT is entered only once the attempt's process is
+    // gone, so it holds no slot; its task gets no new attempt by itself, but another writer task may run.
+    let dir = tempfile::tempdir()?;
+    let mut conn = world(&dir)?;
+    in_tx(&mut conn, |tx| grant(tx, "p1", "writer", "a-w1", at(0)))?;
+    attempts::apply(
+        &mut conn,
+        &moving("a-w1", AttemptState::Prepared, AttemptState::Starting, 1),
+        &crate::persistence::writer::Ctx::quiet(),
+    )?;
+    attempts::apply(
+        &mut conn,
+        &moving(
+            "a-w1",
+            AttemptState::Starting,
+            AttemptState::UnknownEffect,
+            9,
+        ),
+        &crate::persistence::writer::Ctx::quiet(),
+    )?;
+    let held = in_tx(&mut conn, |tx| held(tx, "p1", at(9)))?;
+    assert_eq!(held[0].expires_at, crate::time::rfc3339_utc(at(9)));
+    assert!(!held[0].effective);
+    let next = in_tx(&mut conn, |tx| grant(tx, "p1", "writer", "a-w2", at(9)))?;
+    assert_eq!(next.epoch, 2);
+    Ok(())
+}

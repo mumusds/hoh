@@ -31,6 +31,8 @@ pub mod persistence;
 #[forbid(clippy::disallowed_methods)]
 pub mod protocol;
 #[forbid(clippy::disallowed_methods)]
+pub mod reconcile;
+#[forbid(clippy::disallowed_methods)]
 pub mod schedule;
 #[forbid(clippy::disallowed_methods)]
 pub mod schema;

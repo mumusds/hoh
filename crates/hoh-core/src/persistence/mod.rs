@@ -18,11 +18,13 @@ mod inputs;
 mod leases;
 mod outbox;
 mod plan;
+mod reconcile;
 mod results;
 mod rounds;
 pub use leases::{Grant, LEASE_TTL, LeaseView};
 pub use outbox::{ConsumeEffect, Consumed, OutboxRow, Settlement, backoff};
 pub use plan::Imported;
+pub use reconcile::{EffectRow, UnfinishedRow};
 pub use results::{TaskResultOutcome, VERIFIERS};
 pub use rounds::{Dispatched, RoundOutcome};
 pub mod location;
@@ -606,6 +608,78 @@ impl Store {
     /// Record a Commander proposal, judge it against the state it names, and apply or reject it, all in one
     /// transaction (REQ-035, docs/adr/ADR-011.md §3). A kind that is not applied yet is refused before anything is
     /// written.
+    /// The project's unfinished attempts (PREPARED, STARTING, RUNNING) with their tasks, process records and
+    /// effects, for the reconcile at a host's start (REQ-041 b1, ADR-019 decision 5).
+    pub async fn reconcile_scan(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<UnfinishedRow>, PersistError> {
+        match self
+            .writer
+            .reconcile(reconcile::ReconcileJob::Scan(project_id.to_owned()))
+            .await?
+        {
+            reconcile::ReconcileDone::Scanned(rows) => Ok(rows),
+            reconcile::ReconcileDone::Event(_) => Err(PersistError::IntegrityViolation(
+                "a scan answered with an event".to_owned(),
+            )),
+        }
+    }
+
+    /// The `reconcile.started` event of host epoch `host_epoch`; its seq.
+    pub async fn reconcile_started(
+        &self,
+        project_id: &str,
+        host_epoch: i64,
+        unfinished: usize,
+    ) -> Result<i64, PersistError> {
+        self.reconcile_event(reconcile::ReconcileJob::Started {
+            project_id: project_id.to_owned(),
+            host_epoch,
+            unfinished,
+        })
+        .await
+    }
+
+    /// One attempt's disposition, with what was found of its process, in one transaction; the seq of its last event.
+    pub async fn reconcile_apply(
+        &self,
+        row: UnfinishedRow,
+        disposition: crate::reconcile::Disposition,
+        process: crate::reconcile::Process,
+    ) -> Result<i64, PersistError> {
+        self.reconcile_event(reconcile::ReconcileJob::Apply(Box::new((
+            row,
+            disposition,
+            process,
+        ))))
+        .await
+    }
+
+    /// The `reconcile.completed` event of host epoch `host_epoch` with what was done; its seq.
+    pub async fn reconcile_completed(
+        &self,
+        project_id: &str,
+        host_epoch: i64,
+        summary: serde_json::Value,
+    ) -> Result<i64, PersistError> {
+        self.reconcile_event(reconcile::ReconcileJob::Completed {
+            project_id: project_id.to_owned(),
+            host_epoch,
+            summary,
+        })
+        .await
+    }
+
+    async fn reconcile_event(&self, job: reconcile::ReconcileJob) -> Result<i64, PersistError> {
+        match self.writer.reconcile(job).await? {
+            reconcile::ReconcileDone::Event(seq) => Ok(seq),
+            reconcile::ReconcileDone::Scanned(_) => Err(PersistError::IntegrityViolation(
+                "a reconcile write answered with rows".to_owned(),
+            )),
+        }
+    }
+
     pub async fn decide(
         &self,
         proposal: crate::decision::Proposal,

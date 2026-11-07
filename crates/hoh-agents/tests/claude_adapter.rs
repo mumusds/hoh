@@ -641,6 +641,13 @@ async fn running_pid(world: &World, id: &str) -> R<u32> {
         if let Some(a) = world.store.reader()?.attempt(id)?
             && a.state == AttemptState::Running
         {
+            // What it recorded names its live process (REQ-041 b3, ADR-019 decision 4).
+            let found = hoh_agents::identity::find(
+                a.pid,
+                a.boot_id.as_deref(),
+                a.process_start_id.as_deref(),
+            )?;
+            assert!(found.is_ok(), "{id}: {found:?}");
             return Ok(u32::try_from(a.pid.ok_or("no pid")?)?);
         }
         tokio::time::sleep(Duration::from_millis(25)).await;

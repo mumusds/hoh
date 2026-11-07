@@ -146,6 +146,10 @@ enum Job {
         Box<(String, Context)>,
         oneshot::Sender<Result<super::rounds::RoundOutcome, PersistError>>,
     ),
+    Reconcile(
+        Box<super::reconcile::ReconcileJob>,
+        oneshot::Sender<Result<super::reconcile::ReconcileDone, PersistError>>,
+    ),
     /// Something to hold until the writer ends (a host's project lock, ADR-016 decision 12).
     Keep(
         Box<dyn std::any::Any + Send>,
@@ -299,6 +303,7 @@ impl Job {
             Job::Outbox(..) => "Outbox",
             Job::Plan(..) => "Plan",
             Job::Round(..) => "Round",
+            Job::Reconcile(..) => "Reconcile",
             Job::Keep(..) => "Keep",
         }
     }
@@ -411,6 +416,9 @@ impl Writer {
                                 reply,
                                 super::rounds::round(&mut conn, &run_id, &context, &ctx),
                             );
+                        }
+                        Job::Reconcile(job, reply) => {
+                            answer(&ctx, reply, super::reconcile::run(&mut conn, *job, &ctx));
                         }
                         Job::Keep(held, reply) => {
                             kept.0.push(held);
@@ -529,6 +537,13 @@ impl Writer {
     ) -> Result<super::rounds::RoundOutcome, PersistError> {
         self.submit(|tx| Job::Round(Box::new((run_id, context)), tx))
             .await
+    }
+
+    pub(super) async fn reconcile(
+        &self,
+        job: super::reconcile::ReconcileJob,
+    ) -> Result<super::reconcile::ReconcileDone, PersistError> {
+        self.submit(|tx| Job::Reconcile(Box::new(job), tx)).await
     }
 
     pub(super) async fn end_attempt(
