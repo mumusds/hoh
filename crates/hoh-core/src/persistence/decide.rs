@@ -244,6 +244,24 @@ fn applied(
         }
         Effect::TransitionRun { from, to } => {
             details["run"] = json!({"from": from.as_str(), "to": to.as_str()});
+            if *to == RunState::Running {
+                // The host loop's word that the run's ready tasks may be dispatched, durable with the move (ADR-019
+                // decision 3): a runtime notice, never an HCP message (ADR-018 decision 4).
+                outbox.push(NewOutbox {
+                    message_id: child_id(&proposal.decision_id, "run.started"),
+                    event: 0,
+                    run_id: Some(proposal.run_id.clone()),
+                    recipient_role: "runtime".to_owned(),
+                    role_epoch: 1,
+                    payload: json!({
+                        "notice": "runtime",
+                        "kind": "run.started",
+                        "decision_id": proposal.decision_id,
+                        "run_id": proposal.run_id,
+                        "from": from.as_str(),
+                    }),
+                });
+            }
             vec![run(Change::Run(*to))]
         }
         Effect::RecordAssumption => vec![run(Change::Touch(Entity::Run))],

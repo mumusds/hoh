@@ -756,3 +756,90 @@ fn derived_ids_stay_within_the_protocol_limit_and_distinct() {
         child_id("A1", &format!("{}y", "x".repeat(159)))
     );
 }
+
+/// Every write point of every request, in order (ADR-019 decision 1).
+#[derive(Debug, Default)]
+struct Points(std::sync::Mutex<Vec<(&'static str, crate::persistence::WritePoint)>>);
+
+impl crate::persistence::FaultHooks for Points {
+    fn at(&self, job: &'static str, point: crate::persistence::WritePoint) {
+        if let Ok(mut seen) = self.0.lock() {
+            seen.push((job, point));
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_run_that_starts_running_queues_its_notice_with_its_event_through_every_point() -> R {
+    // ADR-019 decisions 1 and 3 (AC-036-02's transition): READY -> RUNNING writes the run's move, one event and one
+    // runtime notice that points at it, in one transaction that passes the five points in order.
+    use crate::persistence::WritePoint;
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join(".hoh/state.db");
+    let points = std::sync::Arc::new(Points::default());
+    let store = Store::open(
+        &path,
+        Options {
+            wal_probe: Some(selftest::test_probe(None)),
+            faults: points.clone(),
+            ..Options::default()
+        },
+    )?;
+    seed(&path, WORLD)?;
+    seed(&path, "UPDATE runs SET state = 'READY' WHERE run_id = 'R';")?;
+    let mut commander = FakeCommander {
+        sent: 0,
+        candidate: None,
+    };
+    let decided = store
+        .decide(
+            commander.decide(
+                3,
+                7,
+                json!({"kind": "transition_run", "to_state": "RUNNING"}),
+            ),
+            context(),
+        )
+        .await?;
+    assert!(matches!(decided, Decided::Applied { .. }), "{decided:?}");
+    let seen: Vec<WritePoint> = points
+        .0
+        .lock()
+        .map_err(|_| "poisoned")?
+        .iter()
+        .filter(|(job, _)| *job == "Decide")
+        .map(|(_, point)| *point)
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            WritePoint::Begun,
+            WritePoint::StateWritten,
+            WritePoint::EventsWritten,
+            WritePoint::OutboxWritten,
+            WritePoint::Committed
+        ]
+    );
+    assert_eq!(
+        rows(&path, "SELECT state, revision FROM runs WHERE run_id = 'R'")?,
+        [[json!("RUNNING"), json!(8)]]
+    );
+    assert_eq!(
+        rows(
+            &path,
+            "SELECT e.kind, o.recipient_role, o.state, json_extract(o.payload_json, '$.notice'), \
+             json_extract(o.payload_json, '$.kind'), json_extract(o.payload_json, '$.run_id') \
+             FROM outbox o JOIN events e ON e.seq = o.event_seq"
+        )?,
+        [[
+            json!("decision.applied"),
+            json!("runtime"),
+            json!("PENDING"),
+            json!("runtime"),
+            json!("run.started"),
+            json!("R")
+        ]]
+    );
+    assert_eq!(rows(&path, "SELECT count(*) FROM events")?, [[json!(1)]]);
+    Ok(())
+}
