@@ -13,7 +13,7 @@ use crate::decision::{
 };
 use crate::lifecycle::Lifecycle;
 use crate::protocol::{self, RejectionReason, RunState, TaskState};
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
@@ -54,16 +54,14 @@ pub(super) fn decide(
     conn: &mut Connection,
     proposal: &Proposal,
     context: &Context,
-    after_events: &dyn Fn(),
+    ctx: &super::writer::Ctx<'_>,
 ) -> Result<Decided, PersistError> {
     // The payload is checked against $defs.DecisionPayload again on the way in, whoever built the proposal.
     let payload = protocol::encode(&proposal.payload)
         .map_err(|e| PersistError::InvalidProposal(format!("{}: {e}", proposal.decision_id)))?;
     let role_epoch = to_i64(proposal.role_epoch, "role_epoch")?;
     let expected_revision = to_i64(proposal.expected_revision, "expected_revision")?;
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(sqlite_error)?;
+    let tx = super::writer::begin(conn, ctx)?;
     let (project_id, run) = load_run(&tx, &proposal.run_id)?;
     tx.execute(
         "INSERT INTO decisions(decision_id, run_id, role_epoch, expected_revision, payload_json, state) \
@@ -111,7 +109,7 @@ pub(super) fn decide(
                 &payload,
                 lease.as_ref(),
             )?;
-            let done = writer::write(&tx, &commit, after_events)?;
+            let done = writer::write(&tx, &commit, ctx)?;
             resolve(&tx, &proposal.decision_id, "APPLIED", None)?;
             Decided::Applied {
                 run_revision: done.revisions[0],
@@ -124,7 +122,7 @@ pub(super) fn decide(
                 events: vec![event],
                 ..Commit::default()
             };
-            let done = writer::write(&tx, &commit, after_events)?;
+            let done = writer::write(&tx, &commit, ctx)?;
             resolve(
                 &tx,
                 &proposal.decision_id,

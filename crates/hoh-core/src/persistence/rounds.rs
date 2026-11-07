@@ -12,7 +12,7 @@ use super::{PersistError, sqlite_error};
 use crate::decision::Context;
 use crate::protocol::{RunState, SchedulerSettings, TaskState};
 use crate::schedule::{self, Candidate, Eligibility, Params, Slots};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
 /// A task dispatched by a round.
@@ -51,12 +51,10 @@ pub(super) fn round(
     conn: &mut Connection,
     run_id: &str,
     context: &Context,
-    after_events: &dyn Fn(),
+    ctx: &super::writer::Ctx<'_>,
 ) -> Result<RoundOutcome, PersistError> {
     let now = context.now();
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(sqlite_error)?;
+    let tx = super::writer::begin(conn, ctx)?;
     let run: Option<(String, String, i64, Option<String>, String)> = tx
         .query_row(
             "SELECT project_id, state, revision, spec_id, config_snapshot_json FROM runs WHERE run_id = ?1",
@@ -193,7 +191,7 @@ pub(super) fn round(
             }),
         }],
     };
-    let done = writer::write(&tx, &commit, after_events)?;
+    let done = writer::write(&tx, &commit, ctx)?;
     let seq = done.event_seqs[0];
     // The waiting tasks age by one round and keep the round they first became eligible in (the selected one was reset
     // when it was leased). Bookkeeping, not a state change: no revision moves.

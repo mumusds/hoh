@@ -173,6 +173,7 @@ fn an_attempt_that_ends_lets_its_lease_go_at_its_end() -> R {
     attempts::apply(
         &mut conn,
         &moving("a-w1", AttemptState::Prepared, AttemptState::Failed, 7),
+        &crate::persistence::writer::Ctx::quiet(),
     )?;
     let held = in_tx(&mut conn, |tx| held(tx, "p1", at(7)))?;
     assert_eq!(held[0].expires_at, crate::time::rfc3339_utc(at(7)));
@@ -190,6 +191,7 @@ fn a_writer_attempt_starts_only_with_its_writer_lease() -> R {
     let refused = attempts::apply(
         &mut conn,
         &moving("a-w1", AttemptState::Prepared, AttemptState::Starting, 1),
+        &crate::persistence::writer::Ctx::quiet(),
     );
     assert!(
         matches!(refused, Err(PersistError::LeaseUnavailable(_))),
@@ -200,6 +202,7 @@ fn a_writer_attempt_starts_only_with_its_writer_lease() -> R {
     let refused = attempts::apply(
         &mut conn,
         &moving("a-w1", AttemptState::Prepared, AttemptState::Starting, 1),
+        &crate::persistence::writer::Ctx::quiet(),
     );
     assert!(
         matches!(refused, Err(PersistError::LeaseUnavailable(_))),
@@ -209,12 +212,14 @@ fn a_writer_attempt_starts_only_with_its_writer_lease() -> R {
     attempts::apply(
         &mut conn,
         &moving("a-w2", AttemptState::Prepared, AttemptState::Starting, 1),
+        &crate::persistence::writer::Ctx::quiet(),
     )?;
     end(&conn, "a-w2")?;
     in_tx(&mut conn, |tx| grant(tx, "p1", "writer", "a-w1", at(200)))?;
     let late = attempts::apply(
         &mut conn,
         &moving("a-w1", AttemptState::Prepared, AttemptState::Starting, 400),
+        &crate::persistence::writer::Ctx::quiet(),
     );
     assert!(
         matches!(late, Err(PersistError::LeaseUnavailable(_))),
@@ -224,6 +229,7 @@ fn a_writer_attempt_starts_only_with_its_writer_lease() -> R {
     attempts::apply(
         &mut conn,
         &moving("a-q1", AttemptState::Prepared, AttemptState::Starting, 1),
+        &crate::persistence::writer::Ctx::quiet(),
     )?;
     Ok(())
 }
@@ -274,6 +280,7 @@ fn times_with_offsets_are_judged_as_instants() -> R {
             AttemptState::Starting,
             &shifted(121, 5, false),
         ),
+        &crate::persistence::writer::Ctx::quiet(),
     );
     assert!(
         matches!(late, Err(PersistError::LeaseUnavailable(_))),
@@ -287,6 +294,7 @@ fn times_with_offsets_are_judged_as_instants() -> R {
             AttemptState::Failed,
             &shifted(5, 5, true),
         ),
+        &crate::persistence::writer::Ctx::quiet(),
     )?;
     let held = in_tx(&mut conn, |tx| held(tx, "p1", at(5)))?;
     assert_eq!(held[0].expires_at, crate::time::rfc3339_utc(at(5)));
@@ -299,6 +307,7 @@ fn times_with_offsets_are_judged_as_instants() -> R {
             AttemptState::Failed,
             "yesterday",
         ),
+        &crate::persistence::writer::Ctx::quiet(),
     );
     assert!(
         matches!(refused, Err(PersistError::IntegrityViolation(_))),
@@ -314,6 +323,7 @@ fn times_with_offsets_are_judged_as_instants() -> R {
         let refused = attempts::apply(
             &mut conn,
             &moving_at("a-w2", AttemptState::Prepared, to, stamp),
+            &crate::persistence::writer::Ctx::quiet(),
         );
         assert!(
             matches!(refused, Err(PersistError::IntegrityViolation(_))),

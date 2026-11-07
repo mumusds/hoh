@@ -6,7 +6,7 @@
 use super::attempts::{self, AttemptJob, AttemptMove, CancelLatch};
 use super::commands::{self, CommandOutcome, HostStart, SubmitCommand};
 use super::decide::{self, Decided};
-use super::{FaultHooks, Options, PersistError, Pragmas, sqlite_error};
+use super::{FaultHooks, Options, PersistError, Pragmas, WritePoint, sqlite_error};
 use crate::decision::{Context, Proposal};
 use crate::lifecycle::AttemptState;
 use crate::lifecycle::{self, Lifecycle};
@@ -166,6 +166,97 @@ impl Drop for Kept {
     }
 }
 
+/// What a request of the writer runs with (ADR-019 decisions 1 and 2): its name, the fault hooks and the epoch fence
+/// of the host it serves.
+pub(super) struct Ctx<'a> {
+    job: &'static str,
+    hooks: &'a dyn FaultHooks,
+    fence: Option<&'a Fence>,
+    /// Test-only: inside a commit after its events (`Fault::AbortAfterEvents`); a no-op otherwise.
+    after_events: &'a dyn Fn(),
+}
+
+#[cfg(test)]
+fn nothing() {}
+
+impl Ctx<'_> {
+    /// A request outside the writer loop in a unit test: no hooks, no fence.
+    #[cfg(test)]
+    pub(super) fn quiet() -> Ctx<'static> {
+        Ctx {
+            job: "Test",
+            hooks: &super::NoFaults,
+            fence: None,
+            after_events: &nothing,
+        }
+    }
+
+    /// The request reached `point`.
+    pub(super) fn at(&self, point: WritePoint) {
+        if point == WritePoint::EventsWritten {
+            (self.after_events)();
+        }
+        self.hooks.at(self.job, point);
+    }
+
+    /// Just before a commit: a fault hook's error fails the commit with it, and the transaction rolls back.
+    pub(super) fn before_commit(&self) -> Result<(), PersistError> {
+        self.hooks.before_commit()
+    }
+}
+
+/// The epoch of the host a writer serves (REQ-041, ADR-019 decision 2): set when that host began on the database.
+#[derive(Debug, Clone)]
+pub(super) struct Fence {
+    project_id: String,
+    host_epoch: i64,
+}
+
+/// Begin a write transaction (IMMEDIATE). Every write of the writer begins here (only `begin_host`, which moves the
+/// epoch, does not), so once its host has begun every write is fenced: it goes on only while the project is still at
+/// that host's epoch, else it changes 0 rows and fails as an IntegrityViolation (REQ-041 failure mode 4). The check
+/// runs under the write lock, so no new host can begin between it and the commit.
+pub(super) fn begin<'c>(
+    conn: &'c mut Connection,
+    ctx: &Ctx<'_>,
+) -> Result<Transaction<'c>, PersistError> {
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error)?;
+    if let Some(fence) = ctx.fence {
+        let current: Option<i64> = tx
+            .query_row(
+                "SELECT host_epoch FROM projects WHERE project_id = ?1",
+                params![fence.project_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sqlite_error)?;
+        if current != Some(fence.host_epoch) {
+            return Err(PersistError::IntegrityViolation(format!(
+                "a write of host epoch {} of project {}, which is now at {}: 0 rows changed",
+                fence.host_epoch,
+                fence.project_id,
+                current.map_or_else(|| "no epoch".to_owned(), |e| e.to_string())
+            )));
+        }
+    }
+    ctx.at(WritePoint::Begun);
+    Ok(tx)
+}
+
+/// Send a request's answer; one that succeeded passes the Committed point first (after its commit, before its answer).
+fn answer<T>(
+    ctx: &Ctx<'_>,
+    reply: oneshot::Sender<Result<T, PersistError>>,
+    result: Result<T, PersistError>,
+) {
+    if result.is_ok() {
+        ctx.at(WritePoint::Committed);
+    }
+    let _ = reply.send(result);
+}
+
 /// Test-only fault injection inside the writer.
 #[cfg(test)]
 #[derive(Debug, Clone, Copy)]
@@ -188,7 +279,14 @@ pub(super) struct Writer {
 
 impl std::fmt::Debug for Job {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
+        f.write_str(self.name())
+    }
+}
+
+impl Job {
+    /// The request's name, as the fault hooks see it ([`FaultHooks::at`]).
+    fn name(&self) -> &'static str {
+        match self {
             Job::Commit(..) => "Commit",
             Job::EnsureProject(..) => "EnsureProject",
             Job::ScratchTask(..) => "ScratchTask",
@@ -202,7 +300,7 @@ impl std::fmt::Debug for Job {
             Job::Plan(..) => "Plan",
             Job::Round(..) => "Round",
             Job::Keep(..) => "Keep",
-        })
+        }
     }
 }
 
@@ -246,7 +344,7 @@ impl Writer {
         before: impl Fn() + Send + 'static,
         after_events: impl Fn() + Send + 'static,
     ) -> Result<Writer, PersistError> {
-        let (jobs, mut rx) = mpsc::channel(options.queue.max(1));
+        let (jobs, mut rx) = mpsc::channel::<Job>(options.queue.max(1));
         // The claims handed out and not yet handed to a transport (ADR-018 decision 4).
         let writer_claims = Registry::default();
         let faults = options.faults.clone();
@@ -258,23 +356,33 @@ impl Writer {
                 let mut kept = Kept(Vec::new());
                 // However the thread ends, a panic included, no guard can hand its row over afterwards (M2T04R-402).
                 let _closer = Closer(writer_claims.clone());
+                // The epoch of the host this writer serves, once it has begun (ADR-019 decision 2).
+                let mut fence: Option<Fence> = None;
                 while let Some(job) = rx.blocking_recv() {
                     before();
+                    let ctx = Ctx {
+                        job: job.name(),
+                        hooks: faults.as_ref(),
+                        fence: fence.as_ref(),
+                        after_events: &after_events,
+                    };
                     match job {
                         Job::Commit(commit, reply) => {
-                            let _ = reply.send(apply(
-                                &mut conn,
-                                &commit,
-                                &after_events,
-                                faults.as_ref(),
-                            ));
+                            answer(&ctx, reply, apply(&mut conn, &commit, &ctx));
                         }
                         Job::Command(command, reply) => {
-                            let _ =
-                                reply.send(commands::submit(&mut conn, &command, faults.as_ref()));
+                            answer(&ctx, reply, commands::submit(&mut conn, &command, &ctx));
                         }
                         Job::BeginHost(ids, reply) => {
-                            let _ = reply.send(commands::begin_host(&mut conn, &ids.0, &ids.1));
+                            let started = commands::begin_host(&mut conn, &ids.0, &ids.1);
+                            let begun = started.as_ref().ok().map(|s| Fence {
+                                project_id: s.project_id.clone(),
+                                host_epoch: s.host_epoch,
+                            });
+                            answer(&ctx, reply, started);
+                            if begun.is_some() {
+                                fence = begun;
+                            }
                         }
                         Job::Pragmas(reply) => {
                             let _ = reply.send(super::pragmas(&conn));
@@ -282,56 +390,52 @@ impl Writer {
                         Job::Outbox(job, reply) => {
                             // A claim travels as a guard registered here: dropped before it is handed to a
                             // transport, wherever that happens, it is returned and undone (M2T04R-100, -200).
-                            let _ = reply.send(run_outbox(
-                                &mut conn,
-                                *job,
-                                &writer_claims,
-                                &after_events,
-                            ));
+                            answer(
+                                &ctx,
+                                reply,
+                                run_outbox(&mut conn, *job, &writer_claims, &ctx),
+                            );
                         }
                         Job::Plan(request, reply) => {
                             let (run_id, plan) = *request;
-                            let _ = reply.send(super::plan::import(
-                                &mut conn,
-                                &run_id,
-                                &plan,
-                                &after_events,
-                            ));
+                            answer(
+                                &ctx,
+                                reply,
+                                super::plan::import(&mut conn, &run_id, &plan, &ctx),
+                            );
                         }
                         Job::Round(request, reply) => {
                             let (run_id, context) = *request;
-                            let _ = reply.send(super::rounds::round(
-                                &mut conn,
-                                &run_id,
-                                &context,
-                                &after_events,
-                            ));
+                            answer(
+                                &ctx,
+                                reply,
+                                super::rounds::round(&mut conn, &run_id, &context, &ctx),
+                            );
                         }
                         Job::Keep(held, reply) => {
                             kept.0.push(held);
                             let _ = reply.send(Ok(()));
                         }
                         Job::EnsureProject(id, repo, reply) => {
-                            let _ = reply.send(ensure_project(&conn, &id, &repo));
+                            answer(&ctx, reply, ensure_project(&mut conn, &id, &repo, &ctx));
                         }
                         Job::ScratchTask(ids, reply) => {
-                            let _ = reply.send(scratch_task(&mut conn, &ids));
+                            answer(&ctx, reply, scratch_task(&mut conn, &ids, &ctx));
                         }
                         Job::Attempt(job, reply) => {
-                            let _ = reply.send(attempts::apply(&mut conn, &job));
+                            answer(&ctx, reply, attempts::apply(&mut conn, &job, &ctx));
                         }
                         Job::EndAttempt(request, reply) => {
                             let (change, latch) = *request;
-                            let _ = reply.send(attempts::end(&mut conn, &change, &latch));
+                            answer(&ctx, reply, attempts::end(&mut conn, &change, &latch, &ctx));
                         }
                         Job::Decide(request, reply) => {
                             let (proposal, context) = *request;
-                            let _ = reply.send(decide::decide(
-                                &mut conn,
-                                &proposal,
-                                &context,
-                                &after_events,
-                            ));
+                            answer(
+                                &ctx,
+                                reply,
+                                decide::decide(&mut conn, &proposal, &context, &ctx),
+                            );
                         }
                     }
                     // Only what has committed is visible to this connection's next read.
@@ -349,7 +453,13 @@ impl Writer {
                 // still alive: they cannot be handed over any more (M2T04R-301). Then the connection, then what was
                 // kept (a lock goes only after the last write), then the word.
                 let left = writer_claims.close_and_take_all();
-                let _ = super::outbox::unclaim_all(&mut conn, &left);
+                let close = Ctx {
+                    job: "Close",
+                    hooks: faults.as_ref(),
+                    fence: fence.as_ref(),
+                    after_events: &after_events,
+                };
+                let _ = super::outbox::unclaim_all(&mut conn, &left, &close);
                 drop(conn);
                 drop(kept);
                 let _ = end.send(true);
@@ -493,11 +603,13 @@ impl Writer {
 }
 
 /// [`super::Store::scratch_task`]: the rows, in one IMMEDIATE transaction, only where no run exists.
-fn scratch_task(conn: &mut Connection, ids: &[String; 4]) -> Result<(), PersistError> {
+fn scratch_task(
+    conn: &mut Connection,
+    ids: &[String; 4],
+    ctx: &Ctx<'_>,
+) -> Result<(), PersistError> {
     let [project_id, repo_path, run_id, task_id] = ids;
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(sqlite_error)?;
+    let tx = begin(conn, ctx)?;
     let runs: i64 = tx
         .query_row("SELECT count(*) FROM runs", [], |r| r.get(0))
         .map_err(sqlite_error)?;
@@ -532,30 +644,25 @@ fn scratch_task(conn: &mut Connection, ids: &[String; 4]) -> Result<(), PersistE
 }
 
 fn ensure_project(
-    conn: &Connection,
+    conn: &mut Connection,
     project_id: &str,
     repo_path: &str,
+    ctx: &Ctx<'_>,
 ) -> Result<(), PersistError> {
-    conn.execute(
+    let tx = begin(conn, ctx)?;
+    tx.execute(
         "INSERT INTO projects(project_id, repo_path, created_at) VALUES (?1, ?2, ?3) ON CONFLICT(project_id) DO NOTHING",
         params![project_id, repo_path, crate::time::now_rfc3339()],
     )
-    .map(drop)
-    .map_err(sqlite_error)
+    .map_err(sqlite_error)?;
+    tx.commit().map_err(sqlite_error)
 }
 
 /// One commit as one IMMEDIATE transaction; any error drops (rolls back) the transaction.
-fn apply(
-    conn: &mut Connection,
-    commit: &Commit,
-    after_events: &dyn Fn(),
-    faults: &dyn FaultHooks,
-) -> Result<Committed, PersistError> {
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(sqlite_error)?;
-    let done = write(&tx, commit, after_events)?;
-    faults.before_commit()?;
+fn apply(conn: &mut Connection, commit: &Commit, ctx: &Ctx<'_>) -> Result<Committed, PersistError> {
+    let tx = begin(conn, ctx)?;
+    let done = write(&tx, commit, ctx)?;
+    ctx.before_commit()?;
     tx.commit().map_err(sqlite_error)?;
     Ok(done)
 }
@@ -564,12 +671,13 @@ fn apply(
 pub(super) fn write(
     tx: &Transaction<'_>,
     commit: &Commit,
-    after_events: &dyn Fn(),
+    ctx: &Ctx<'_>,
 ) -> Result<Committed, PersistError> {
     let mut revisions = Vec::with_capacity(commit.cas.len());
     for cas in &commit.cas {
         revisions.push(compare_and_set(tx, cas)?);
     }
+    ctx.at(WritePoint::StateWritten);
     let now = crate::time::now_rfc3339();
     let mut event_seqs = Vec::with_capacity(commit.events.len());
     for event in &commit.events {
@@ -587,7 +695,7 @@ pub(super) fn write(
         .map_err(sqlite_error)?;
         event_seqs.push(tx.last_insert_rowid());
     }
-    after_events();
+    ctx.at(WritePoint::EventsWritten);
     for message in &commit.outbox {
         let seq = *event_seqs.get(message.event).ok_or_else(|| {
             PersistError::IntegrityViolation(format!(
@@ -611,6 +719,7 @@ pub(super) fn write(
         )
         .map_err(sqlite_error)?;
     }
+    ctx.at(WritePoint::OutboxWritten);
     Ok(Committed {
         revisions,
         event_seqs,
@@ -755,7 +864,7 @@ fn run_outbox(
     conn: &mut Connection,
     job: OutboxJob,
     claims: &Registry,
-    after_events: &dyn Fn(),
+    ctx: &Ctx<'_>,
 ) -> Result<OutboxDone, PersistError> {
     use super::outbox;
     Ok(match job {
@@ -763,7 +872,7 @@ fn run_outbox(
             // The returned claims are undone in this claim's own transaction, and messages with a live guard are not
             // claimed again; a claim that cannot run keeps the returns for the next (M2T04R-400, -450).
             let (returned, live) = claims.take_for_claim();
-            match outbox::claim_next(conn, now, &roles, max, &returned, &live, after_events) {
+            match outbox::claim_next(conn, now, &roles, max, &returned, &live, ctx) {
                 Ok(rows) => OutboxDone {
                     rows: rows.into_iter().map(|row| claims.register(row)).collect(),
                     ..OutboxDone::default()
@@ -775,25 +884,20 @@ fn run_outbox(
             }
         }
         OutboxJob::Settle(id, generation, settlement, max) => {
-            outbox::settle(conn, &id, generation, &settlement, max, after_events)?;
+            outbox::settle(conn, &id, generation, &settlement, max, ctx)?;
             OutboxDone::default()
         }
         OutboxJob::Consume(request) => {
             let (consumer, message, effect, now) = *request;
             OutboxDone {
                 consumed: Some(outbox::consume(
-                    conn,
-                    &consumer,
-                    &message,
-                    &effect,
-                    now,
-                    after_events,
+                    conn, &consumer, &message, &effect, now, ctx,
                 )?),
                 ..OutboxDone::default()
             }
         }
         OutboxJob::TaskResult(result) => OutboxDone {
-            task_result: Some(super::results::accept(conn, &result, after_events)?),
+            task_result: Some(super::results::accept(conn, &result, ctx)?),
             ..OutboxDone::default()
         },
         OutboxJob::Invalid(request) => {
@@ -805,7 +909,7 @@ fn run_outbox(
                     &id,
                     run_id.as_deref(),
                     &violations,
-                    after_events,
+                    ctx,
                 )?),
                 ..OutboxDone::default()
             }

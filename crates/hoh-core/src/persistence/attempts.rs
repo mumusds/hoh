@@ -14,7 +14,7 @@ use super::leases;
 use super::writer::{self, Commit, Entity, NewEvent};
 use super::{PersistError, sqlite_error};
 use crate::lifecycle::{self, AttemptState, Lifecycle};
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::watch;
@@ -191,16 +191,18 @@ pub(super) enum AttemptJob {
     },
 }
 
-pub(super) fn apply(conn: &mut Connection, job: &AttemptJob) -> Result<(), PersistError> {
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(sqlite_error)?;
+pub(super) fn apply(
+    conn: &mut Connection,
+    job: &AttemptJob,
+    ctx: &super::writer::Ctx<'_>,
+) -> Result<(), PersistError> {
+    let tx = super::writer::begin(conn, ctx)?;
     match job {
         AttemptJob::Session(session) => upsert_session(&tx, session)?,
-        AttemptJob::Create(attempt) => create(&tx, attempt)?,
-        AttemptJob::Move(change) => move_attempt(&tx, change)?,
-        AttemptJob::Enqueue(input) => super::inputs::enqueue(&tx, input)?,
-        AttemptJob::MoveInput(change) => super::inputs::move_input(&tx, change)?,
+        AttemptJob::Create(attempt) => create(&tx, attempt, ctx)?,
+        AttemptJob::Move(change) => move_attempt(&tx, change, ctx)?,
+        AttemptJob::Enqueue(input) => super::inputs::enqueue(&tx, input, ctx)?,
+        AttemptJob::MoveInput(change) => super::inputs::move_input(&tx, change, ctx)?,
         AttemptJob::Event {
             attempt_id,
             name,
@@ -220,6 +222,7 @@ pub(super) fn apply(conn: &mut Connection, job: &AttemptJob) -> Result<(), Persi
                 })?;
             event(
                 &tx,
+                ctx,
                 &task_id,
                 child_id(attempt_id, name),
                 kind,
@@ -235,6 +238,7 @@ pub(super) fn end(
     conn: &mut Connection,
     m: &AttemptMove,
     latch: &CancelLatch,
+    ctx: &super::writer::Ctx<'_>,
 ) -> Result<AttemptState, PersistError> {
     // UNKNOWN_EFFECT ends the turn although not the attempt: the agent is gone and what it did is for the reconciler
     // to find out (M1T04R-07).
@@ -246,9 +250,7 @@ pub(super) fn end(
         )));
     }
     // BEGIN IMMEDIATE waits for the database before the latch is taken, so a cancel is never held up by that wait.
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(sqlite_error)?;
+    let tx = super::writer::begin(conn, ctx)?;
     latch.end(|requested| {
         let mut m = m.clone();
         if requested {
@@ -256,7 +258,7 @@ pub(super) fn end(
             m.facts.failure_reason = None;
             m.facts.cancel_requested = Some(true);
         }
-        move_attempt(&tx, &m)?;
+        move_attempt(&tx, &m, ctx)?;
         if requested {
             // The move keeps stored facts it is not given; a cancelled end has no failure reason at all (M1T03R-16).
             tx.execute(
@@ -310,6 +312,7 @@ fn owner(tx: &Transaction<'_>, task_id: &str) -> Result<(String, String), Persis
 
 fn event(
     tx: &Transaction<'_>,
+    ctx: &super::writer::Ctx<'_>,
     task_id: &str,
     event_id: String,
     kind: &str,
@@ -326,7 +329,7 @@ fn event(
         }],
         ..Commit::default()
     };
-    writer::write(tx, &commit, &|| {}).map(drop)
+    writer::write(tx, &commit, ctx).map(drop)
 }
 
 /// The row of a new PREPARED attempt, without an event (a dispatch decision's event records it, AC-035-02).
@@ -340,10 +343,15 @@ pub(super) fn insert_prepared(tx: &Transaction<'_>, a: &NewAttempt) -> Result<()
     Ok(())
 }
 
-pub(super) fn create(tx: &Transaction<'_>, a: &NewAttempt) -> Result<(), PersistError> {
+pub(super) fn create(
+    tx: &Transaction<'_>,
+    a: &NewAttempt,
+    ctx: &super::writer::Ctx<'_>,
+) -> Result<(), PersistError> {
     insert_prepared(tx, a)?;
     event(
         tx,
+        ctx,
         &a.task_id,
         child_id(&a.attempt_id, "PREPARED"),
         "attempt.created",
@@ -351,7 +359,11 @@ pub(super) fn create(tx: &Transaction<'_>, a: &NewAttempt) -> Result<(), Persist
     )
 }
 
-fn move_attempt(tx: &Transaction<'_>, m: &AttemptMove) -> Result<(), PersistError> {
+fn move_attempt(
+    tx: &Transaction<'_>,
+    m: &AttemptMove,
+    ctx: &super::writer::Ctx<'_>,
+) -> Result<(), PersistError> {
     let row: Option<(String, String)> = tx
         .query_row(
             "SELECT state, task_id FROM attempts WHERE attempt_id = ?1",
@@ -419,6 +431,7 @@ fn move_attempt(tx: &Transaction<'_>, m: &AttemptMove) -> Result<(), PersistErro
     }
     event(
         tx,
+        ctx,
         &task_id,
         child_id(&m.attempt_id, m.to.as_str()),
         "attempt.moved",

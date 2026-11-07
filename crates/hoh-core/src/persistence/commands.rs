@@ -7,7 +7,7 @@
 //! a row (`accepted_at` is required): a rejected command is decided again when it is retried.
 
 use super::writer::{self, Change, Commit, NewEvent, NewOutbox, StateCas};
-use super::{FaultHooks, PersistError, sqlite_error};
+use super::{PersistError, sqlite_error};
 use crate::protocol::RunState;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
@@ -79,11 +79,9 @@ pub struct EventRow {
 pub(super) fn submit(
     conn: &mut Connection,
     command: &SubmitCommand,
-    faults: &dyn FaultHooks,
+    ctx: &super::writer::Ctx<'_>,
 ) -> Result<CommandOutcome, PersistError> {
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(sqlite_error)?;
+    let tx = super::writer::begin(conn, ctx)?;
     let stored: Option<(String, Option<String>)> = tx
         .query_row(
             "SELECT payload_sha256, result_json FROM commands WHERE idempotency_key = ?1",
@@ -127,7 +125,7 @@ pub(super) fn submit(
             events: vec![command.event.clone()],
             outbox: command.outbox.clone().into_iter().collect(),
         },
-        &|| {},
+        ctx,
     )?;
     let (revision, event_seq) = (done.revisions[0], done.event_seqs[0]);
     // The exact 202 body (openapi submitCommand); a replay returns these bytes.
@@ -154,7 +152,7 @@ pub(super) fn submit(
         ],
     )
     .map_err(sqlite_error)?;
-    faults.before_commit()?;
+    ctx.before_commit()?;
     tx.commit().map_err(sqlite_error)?;
     Ok(CommandOutcome::Accepted {
         result_json,
