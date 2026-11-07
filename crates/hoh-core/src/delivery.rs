@@ -82,20 +82,11 @@ impl<'a, C: Clock> LocalTransport<'a, C> {
     }
 }
 
-/// `value` as an HCP message: a valid Message whose payload is valid for its kind too (a handoff carries a
-/// ContextHandoff, a result a TaskResult); the Message schema alone types the payload only as an object.
-pub fn decode_message(value: &serde_json::Value) -> Result<Message, protocol::DecodeError> {
-    let message: Message = protocol::decode(value)?;
-    let payload = serde_json::Value::Object(message.payload.clone());
-    match message.kind {
-        protocol::MessageKind::Handoff => {
-            protocol::decode::<protocol::ContextHandoff>(&payload).map(drop)?
-        }
-        protocol::MessageKind::Result => {
-            protocol::decode::<protocol::TaskResult>(&payload).map(drop)?
-        }
-        _ => {}
-    }
+/// `value` as an HCP message: a valid Message whose payload is valid for its kind and agrees with its envelope
+/// ([`Message::check_payload`]).
+pub fn decode_message(value: &serde_json::Value) -> Result<Message, String> {
+    let message: Message = protocol::decode(value).map_err(|e| e.to_string())?;
+    message.check_payload()?;
     Ok(message)
 }
 
@@ -103,8 +94,7 @@ impl<C: Clock> Transport for LocalTransport<'_, C> {
     async fn deliver(&self, row: &OutboxRow) -> Result<String, DeliveryError> {
         let message: Message = match decode_message(&row.payload) {
             Ok(message) => message,
-            Err(e) => {
-                let violations = e.to_string();
+            Err(violations) => {
                 self.store
                     .record_invalid_message(
                         &row.recipient_role,
@@ -162,13 +152,18 @@ impl<C: Clock, T: Transport> std::fmt::Debug for Dispatcher<'_, C, T> {
 }
 
 impl<C: Clock, T: Transport> Dispatcher<'_, C, T> {
+    /// Up to `batch` deliveries, each taken just before it is handed to the transport (so a cancelled tick costs no
+    /// delivery that never started) and settled with its generation.
     pub async fn tick(&self) -> Result<Tick, PersistError> {
-        let rows = self
-            .store
-            .claim_outbox(self.clock.now(), self.roles.clone(), self.batch)
-            .await?;
         let mut tick = Tick::default();
-        for row in rows {
+        for _ in 0..self.batch {
+            let Some(row) = self
+                .store
+                .claim_outbox(self.clock.now(), self.roles.clone(), self.max_attempts)
+                .await?
+            else {
+                break;
+            };
             let settlement = match self.transport.deliver(&row).await {
                 Ok(_) => {
                     tick.delivered.push(row.message_id.clone());
@@ -184,7 +179,12 @@ impl<C: Clock, T: Transport> Dispatcher<'_, C, T> {
                 }
             };
             self.store
-                .settle_outbox(&row.message_id, settlement, self.max_attempts)
+                .settle_outbox(
+                    &row.message_id,
+                    row.attempt_count,
+                    settlement,
+                    self.max_attempts,
+                )
                 .await?;
         }
         Ok(tick)

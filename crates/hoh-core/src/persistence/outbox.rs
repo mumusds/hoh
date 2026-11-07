@@ -5,7 +5,7 @@ use super::attempts::{self, NewAttempt};
 use super::decide::child_id;
 use super::writer::{self, Commit, NewEvent, NewOutbox, StateCas};
 use super::{PersistError, sqlite_error};
-use crate::protocol::{self, HandoffKind, Message, MessageKind, RejectionReason};
+use crate::protocol::{self, Candidate, Message, MessageKind, RejectionReason};
 use crate::time::rfc3339_utc;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::{Value, json};
@@ -62,85 +62,121 @@ pub fn backoff(k: i64) -> Duration {
     Duration::from_secs(2_u64.pow(exponent).min(60))
 }
 
-/// Take up to `limit` messages for `roles` that are due at `now`, oldest event first; each counts one more delivery
-/// and may be taken again after its backoff if it is not settled by then.
-pub(super) fn claim(
+/// Take the next message due at `now` for one of `roles` and start its delivery (ADR-018 decision 4): only rows
+/// that hold an HCP message; one whose deliveries are spent goes to DEAD_LETTER on the way, with its event. The row
+/// returned carries this delivery's generation (its new `attempt_count`).
+pub(super) fn claim_next(
     conn: &mut Connection,
     now: SystemTime,
     roles: &[String],
-    limit: usize,
-) -> Result<Vec<OutboxRow>, PersistError> {
+    max_attempts: i64,
+    after_events: &dyn Fn(),
+) -> Result<Option<OutboxRow>, PersistError> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(sqlite_error)?;
     let stamp = rfc3339_utc(now);
-    let mut rows = {
-        let mut statement = tx
-            .prepare(
+    let roles = json!(roles).to_string();
+    loop {
+        let due: Option<(String, Option<String>, String, i64, String, i64)> = tx
+            .query_row(
                 "SELECT message_id, run_id, recipient_role, role_epoch, payload_json, attempt_count FROM outbox \
                  WHERE ((state = 'PENDING' AND (next_retry_at IS NULL OR next_retry_at <= ?1)) \
                         OR (state = 'DELIVERING' AND next_retry_at <= ?1)) \
                    AND recipient_role IN (SELECT value FROM json_each(?2)) \
-                 ORDER BY event_seq, message_id LIMIT ?3",
+                   AND json_extract(payload_json, '$.schema_version') IS NOT NULL \
+                   AND json_extract(payload_json, '$.message_id') = message_id \
+                 ORDER BY event_seq, message_id LIMIT 1",
+                params![stamp, roles],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
             )
+            .optional()
             .map_err(sqlite_error)?;
-        let found = statement
-            .query_map(
-                params![
-                    stamp,
-                    json!(roles).to_string(),
-                    i64::try_from(limit).unwrap_or(i64::MAX)
-                ],
-                |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, Option<String>>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, i64>(3)?,
-                        r.get::<_, String>(4)?,
-                        r.get::<_, i64>(5)?,
-                    ))
-                },
-            )
-            .map_err(sqlite_error)?;
-        found
-            .map(|row| {
-                let (message_id, run_id, recipient_role, role_epoch, payload, count) =
-                    row.map_err(sqlite_error)?;
-                let payload = serde_json::from_str(&payload).map_err(|e| {
-                    PersistError::IntegrityViolation(format!("outbox {message_id}: {e}"))
-                })?;
-                Ok(OutboxRow {
-                    message_id,
-                    run_id,
-                    recipient_role,
-                    role_epoch,
-                    payload,
-                    attempt_count: count,
-                    next_retry_at: None,
-                })
-            })
-            .collect::<Result<Vec<_>, PersistError>>()?
-    };
-    for row in &mut rows {
-        row.attempt_count += 1;
-        let retry = rfc3339_utc(now + backoff(row.attempt_count));
+        let Some((message_id, run_id, recipient_role, role_epoch, payload, count)) = due else {
+            tx.commit().map_err(sqlite_error)?;
+            return Ok(None);
+        };
+        if count >= max_attempts {
+            // Its deliveries were taken and never settled (a crash, a cancelled tick): spent all the same.
+            dead_letter(
+                &tx,
+                &message_id,
+                run_id,
+                &recipient_role,
+                count,
+                "no answer to its last delivery",
+                after_events,
+            )?;
+            continue;
+        }
+        let generation = count + 1;
+        let retry = rfc3339_utc(now + backoff(generation));
         tx.execute(
             "UPDATE outbox SET state = 'DELIVERING', attempt_count = ?1, next_retry_at = ?2 WHERE message_id = ?3",
-            params![row.attempt_count, retry, row.message_id],
+            params![generation, retry, message_id],
         )
         .map_err(sqlite_error)?;
-        row.next_retry_at = Some(retry);
+        let payload = serde_json::from_str(&payload)
+            .map_err(|e| PersistError::IntegrityViolation(format!("outbox {message_id}: {e}")))?;
+        tx.commit().map_err(sqlite_error)?;
+        return Ok(Some(OutboxRow {
+            message_id,
+            run_id,
+            recipient_role,
+            role_epoch,
+            payload,
+            attempt_count: generation,
+            next_retry_at: Some(retry),
+        }));
     }
-    tx.commit().map_err(sqlite_error)?;
-    Ok(rows)
 }
 
-/// Settle a delivery: ACKED, back to PENDING (its next_retry_at kept), or DEAD_LETTER with its event once
-/// `max_attempts` deliveries failed or the row holds no message. Rows are never deleted.
+/// DEAD_LETTER and its `outbox.dead_letter` event, in the caller's transaction.
+fn dead_letter(
+    tx: &Transaction<'_>,
+    message_id: &str,
+    run_id: Option<String>,
+    recipient: &str,
+    count: i64,
+    error: &str,
+    after_events: &dyn Fn(),
+) -> Result<(), PersistError> {
+    tx.execute(
+        "UPDATE outbox SET state = 'DEAD_LETTER', next_retry_at = NULL, last_error = ?1 WHERE message_id = ?2",
+        params![error, message_id],
+    )
+    .map_err(sqlite_error)?;
+    let project_id = project_of(tx, run_id.as_deref(), message_id)?;
+    writer::write(
+        tx,
+        &Commit {
+            events: vec![NewEvent {
+                project_id,
+                event_id: child_id(message_id, "dead_letter"),
+                run_id,
+                kind: "outbox.dead_letter".to_owned(),
+                payload: json!({
+                    "message_id": message_id,
+                    "recipient_role": recipient,
+                    "attempt_count": count,
+                    "last_error": error,
+                }),
+            }],
+            ..Commit::default()
+        },
+        after_events,
+    )
+    .map(drop)
+}
+
+/// Settle delivery `generation` of `message_id` (ADR-018 decision 4): an answer from any generation makes an unsettled
+/// message ACKED (its receipt is committed); a failure counts only for the current generation (a late one of an
+/// earlier delivery is ignored): PENDING again, or DEAD_LETTER with its event at the limit or when the row holds no
+/// message. Rows are never deleted.
 pub(super) fn settle(
     conn: &mut Connection,
     message_id: &str,
+    generation: i64,
     settlement: &Settlement,
     max_attempts: i64,
     after_events: &dyn Fn(),
@@ -161,55 +197,36 @@ pub(super) fn settle(
             "no outbox message {message_id}"
         )));
     };
-    if state != "DELIVERING" {
-        // Settled already (a late answer to a delivery taken again): the first settlement stands.
-        return Ok(());
-    }
-    let dead = match settlement {
-        Settlement::Delivered => {
+    let unsettled = state == "DELIVERING" || state == "PENDING";
+    let current = state == "DELIVERING" && count == generation;
+    match settlement {
+        Settlement::Delivered if unsettled => {
             tx.execute(
                 "UPDATE outbox SET state = 'ACKED', next_retry_at = NULL, last_error = NULL WHERE message_id = ?1",
                 params![message_id],
             )
             .map_err(sqlite_error)?;
-            None
         }
-        Settlement::Failed(error) if count < max_attempts => {
+        Settlement::Failed(error) if current && count < max_attempts => {
             tx.execute(
                 "UPDATE outbox SET state = 'PENDING', last_error = ?1 WHERE message_id = ?2",
                 params![error, message_id],
             )
             .map_err(sqlite_error)?;
-            None
         }
-        Settlement::Failed(error) | Settlement::Invalid(error) => Some(error),
-    };
-    if let Some(error) = dead {
-        tx.execute(
-            "UPDATE outbox SET state = 'DEAD_LETTER', next_retry_at = NULL, last_error = ?1 WHERE message_id = ?2",
-            params![error, message_id],
-        )
-        .map_err(sqlite_error)?;
-        let project_id = project_of(&tx, run_id.as_deref(), message_id)?;
-        writer::write(
-            &tx,
-            &Commit {
-                events: vec![NewEvent {
-                    project_id,
-                    event_id: child_id(message_id, "dead_letter"),
-                    run_id,
-                    kind: "outbox.dead_letter".to_owned(),
-                    payload: json!({
-                        "message_id": message_id,
-                        "recipient_role": recipient,
-                        "attempt_count": count,
-                        "last_error": error,
-                    }),
-                }],
-                ..Commit::default()
-            },
-            after_events,
-        )?;
+        Settlement::Failed(error) | Settlement::Invalid(error) if current => {
+            dead_letter(
+                &tx,
+                message_id,
+                run_id,
+                &recipient,
+                count,
+                error,
+                after_events,
+            )?;
+        }
+        // Settled already, or a late answer of an earlier delivery: the settlement that came first stands.
+        _ => {}
     }
     tx.commit().map_err(sqlite_error)?;
     Ok(())
@@ -241,7 +258,35 @@ struct Current {
     role_epoch: Option<i64>,
     task_revision: Option<i64>,
     spec_sha256: Option<String>,
+    spec_revision: Option<i64>,
     candidate_id: Option<String>,
+    /// The current candidate's full identity.
+    candidate: Option<Candidate>,
+}
+
+/// The run's current candidate (ADR-018 decision 2): the newest FROZEN or VERIFYING one. The one definition both the
+/// consume fence and the Developer's TaskResult use (M2T04R-54).
+pub(super) fn current_candidate(
+    tx: &Transaction<'_>,
+    run_id: &str,
+) -> Result<Option<Candidate>, PersistError> {
+    tx.query_row(
+        "SELECT candidate_id, git_commit, git_tree, spec_sha256, environment_sha256, test_plan_sha256 FROM candidates \
+         WHERE run_id = ?1 AND state IN ('FROZEN', 'VERIFYING') ORDER BY created_at DESC, candidate_id DESC LIMIT 1",
+        params![run_id],
+        |r| {
+            Ok(Candidate {
+                id: r.get(0)?,
+                git_commit: r.get(1)?,
+                git_tree: r.get(2)?,
+                spec_sha256: r.get(3)?,
+                environment_sha256: r.get(4)?,
+                test_plan_sha256: r.get(5)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(sqlite_error)
 }
 
 fn current(
@@ -249,15 +294,16 @@ fn current(
     message: &Message,
     consumer: &str,
 ) -> Result<Current, PersistError> {
-    let run: Option<(String, Option<String>)> = tx
+    let run: Option<(String, Option<String>, Option<i64>)> = tx
         .query_row(
-            "SELECT r.project_id, s.sha256 FROM runs r LEFT JOIN specs s ON s.spec_id = r.spec_id WHERE r.run_id = ?1",
+            "SELECT r.project_id, s.sha256, s.revision FROM runs r LEFT JOIN specs s ON s.spec_id = r.spec_id \
+             WHERE r.run_id = ?1",
             params![message.run_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()
         .map_err(sqlite_error)?;
-    let Some((project_id, spec_sha256)) = run else {
+    let Some((project_id, spec_sha256, spec_revision)) = run else {
         return Err(PersistError::RunNotFound(message.run_id.clone()));
     };
     let role_epoch = tx
@@ -276,21 +322,15 @@ fn current(
         )
         .optional()
         .map_err(sqlite_error)?;
-    let candidate_id = tx
-        .query_row(
-            "SELECT candidate_id FROM candidates WHERE run_id = ?1 AND state IN ('FROZEN', 'VERIFYING') \
-             ORDER BY created_at DESC, candidate_id DESC LIMIT 1",
-            params![message.run_id],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(sqlite_error)?;
+    let candidate = current_candidate(tx, &message.run_id)?;
     Ok(Current {
         project_id,
         role_epoch,
         task_revision,
         spec_sha256,
-        candidate_id,
+        spec_revision,
+        candidate_id: candidate.as_ref().map(|c| c.id.clone()),
+        candidate,
     })
 }
 
@@ -344,19 +384,38 @@ fn fence(message: &Message, now: &Current) -> Option<(RejectionReason, String)> 
             format!("specification {} is not the run's", message.spec_sha256),
         ));
     }
-    let package_candidate = handoff
-        .as_ref()
-        .and_then(|h| h.candidate.as_ref())
-        .map(|c| c.id.as_str());
+    if let Some(h) = &handoff
+        && now.spec_revision.and_then(|r| u64::try_from(r).ok()) != Some(h.spec_revision)
+    {
+        return Some((
+            RejectionReason::SpecMismatch,
+            format!(
+                "the package's specification revision {} is not the run's {:?}",
+                h.spec_revision, now.spec_revision
+            ),
+        ));
+    }
     if let Some(candidate) = message.candidate_id.as_deref()
-        && (now.candidate_id.as_deref() != Some(candidate)
-            || package_candidate.is_some_and(|c| c != candidate))
+        && now.candidate_id.as_deref() != Some(candidate)
     {
         return Some((
             RejectionReason::CandidateMismatch,
             format!(
                 "candidate {candidate} is not the run's current {:?}",
                 now.candidate_id
+            ),
+        ));
+    }
+    // A handoff's candidate is the current one in every field of its identity, not only by id (M2T04R-04).
+    if let Some(h) = &handoff
+        && h.candidate.is_some()
+        && h.candidate != now.candidate
+    {
+        return Some((
+            RejectionReason::CandidateMismatch,
+            format!(
+                "the package's candidate {:?} is not the run's current one",
+                h.candidate.as_ref().map(|c| &c.id)
             ),
         ));
     }
@@ -438,17 +497,11 @@ pub(super) fn consume(
             rejected,
         });
     }
-    // A handoff whose package is not a ContextHandoff is no message to act on (the transport records it as invalid;
-    // a caller that consumes directly is refused here too).
-    if message.kind == MessageKind::Handoff
-        && protocol::decode::<protocol::ContextHandoff>(&Value::Object(message.payload.clone()))
-            .is_err()
-    {
-        return Err(PersistError::IntegrityViolation(format!(
-            "handoff {} carries no valid ContextHandoff",
-            message.message_id
-        )));
-    }
+    // A message whose payload is not valid for its kind, or disagrees with its envelope, is no message to act on (the
+    // transport records it as invalid; a caller that consumes directly is refused here too, M2T04R-06).
+    message
+        .check_payload()
+        .map_err(PersistError::IntegrityViolation)?;
     let found = current(&tx, message, consumer)?;
     let (result_json, rejected) = match fence(message, &found) {
         Some((reason, detail)) => {
@@ -552,13 +605,26 @@ pub(super) fn invalid(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(sqlite_error)?;
+    // Recorded already (a crash between recording and settling): the same event, not a second one (M2T04R-59).
+    let event_id = child_id(message_id, &format!("{consumer}/invalid"));
+    let recorded: Option<i64> = tx
+        .query_row(
+            "SELECT seq FROM events WHERE event_id = ?1",
+            params![event_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    if let Some(seq) = recorded {
+        return Ok(seq);
+    }
     let project_id = project_of(&tx, run_id, message_id)?;
     let done = writer::write(
         &tx,
         &Commit {
             events: vec![NewEvent {
                 project_id,
-                event_id: child_id(message_id, &format!("{consumer}/invalid")),
+                event_id,
                 run_id: run_id.map(str::to_owned),
                 kind: "message.invalid".to_owned(),
                 payload: json!({"message_id": message_id, "consumer": consumer, "violations": violations}),
@@ -579,21 +645,9 @@ impl NewOutbox {
         let payload = protocol::encode(message).map_err(|e| {
             PersistError::IntegrityViolation(format!("message {}: {e}", message.message_id))
         })?;
-        if message.kind == MessageKind::Handoff {
-            let package: protocol::ContextHandoff =
-                protocol::decode(&Value::Object(message.payload.clone())).map_err(|e| {
-                    PersistError::IntegrityViolation(format!("handoff {}: {e}", message.message_id))
-                })?;
-            if package.role != message.recipient_role
-                || (package.handoff_kind == HandoffKind::Verification
-                    && package.acceptance_ids.is_empty())
-            {
-                return Err(PersistError::IntegrityViolation(format!(
-                    "handoff {} is not for {} or names no acceptance criteria",
-                    message.message_id, message.recipient_role
-                )));
-            }
-        }
+        message
+            .check_payload()
+            .map_err(PersistError::IntegrityViolation)?;
         Ok(NewOutbox {
             message_id: message.message_id.clone(),
             event,
@@ -604,5 +658,15 @@ impl NewOutbox {
             })?,
             payload,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_backoff_doubles_from_one_second_up_to_a_minute() {
+        // ADR-018 decision 4 (M2T04R-63).
+        let secs: Vec<u64> = (0..=9).map(|k| super::backoff(k).as_secs()).collect();
+        assert_eq!(secs, [1, 1, 2, 4, 8, 16, 32, 60, 60, 60]);
     }
 }

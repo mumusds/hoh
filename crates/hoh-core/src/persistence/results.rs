@@ -7,7 +7,7 @@ use super::decide::{child_id, load_binding};
 use super::writer::{self, Change, Commit, NewEvent, NewOutbox, StateCas};
 use super::{PersistError, sqlite_error};
 use crate::handoff::{self, Recipient, Verification};
-use crate::protocol::{Candidate, RejectionReason, TaskResult, TaskState, TaskStatus};
+use crate::protocol::{self, Candidate, RejectionReason, TaskResult, TaskState, TaskStatus};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::{Value, json};
 
@@ -54,11 +54,24 @@ pub(super) fn accept(
         .map_err(sqlite_error)?;
     let ready_id = child_id(&result.attempt_id, "result");
     let rejected_id = child_id(&result.attempt_id, "result-rejected");
-    if let Some(seq) = event_seq(&tx, &ready_id)? {
+    // The same attempt's result again: the same one replays; another one is a reuse of its key (REQ-022 b4,
+    // M2T04R-52).
+    let submitted = protocol::encode(result)
+        .map_err(|e| PersistError::IntegrityViolation(format!("task result: {e}")))?;
+    let same = |payload: &Value, id: &str| -> Result<(), PersistError> {
+        if payload.get("task_result") == Some(&submitted) {
+            Ok(())
+        } else {
+            Err(PersistError::KeyReuse(id.to_owned()))
+        }
+    };
+    if let Some((seq, payload)) = event(&tx, &ready_id)? {
+        same(&payload, &ready_id)?;
         let handoffs = queued(&tx, seq)?;
         return Ok(TaskResultOutcome::Replayed { handoffs });
     }
     if let Some((seq, payload)) = event(&tx, &rejected_id)? {
+        same(&payload, &rejected_id)?;
         let reason = serde_json::from_value(payload["reason_code"].clone())
             .map_err(|e| PersistError::IntegrityViolation(format!("{rejected_id}: {e}")))?;
         return Ok(TaskResultOutcome::Rejected {
@@ -82,15 +95,22 @@ pub(super) fn accept(
             result.task_id, result.run_id
         )));
     };
-    let attempt_task: Option<String> = tx
+    let attempt: Option<(String, String, i64, bool)> = tx
         .query_row(
-            "SELECT task_id FROM attempts WHERE attempt_id = ?1",
+            "SELECT task_id, state, role_epoch, EXISTS(SELECT 1 FROM leases l WHERE l.attempt_id = a.attempt_id) \
+             FROM attempts a WHERE attempt_id = ?1",
             params![result.attempt_id],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()
         .map_err(sqlite_error)?;
-    if attempt_task.as_deref() != Some(result.task_id.as_str()) {
+    let Some((attempt_task, attempt_state, attempt_epoch, holds_lease)) = attempt else {
+        return Err(PersistError::IntegrityViolation(format!(
+            "no attempt {}",
+            result.attempt_id
+        )));
+    };
+    if attempt_task != result.task_id {
         return Err(PersistError::IntegrityViolation(format!(
             "attempt {} is not an attempt of task {}",
             result.attempt_id, result.task_id
@@ -101,6 +121,7 @@ pub(super) fn accept(
         Some(id) => load_candidate(&tx, &result.run_id, id)?,
         None => None,
     };
+    let current = super::outbox::current_candidate(&tx, &result.run_id)?;
     let refusal = if result.role != role {
         Some((
             RejectionReason::IllegalTransition,
@@ -113,6 +134,28 @@ pub(super) fn accept(
                 "role epoch {} is not the current {:?}",
                 result.role_epoch,
                 binding.as_ref().map(|b| b.role_epoch)
+            ),
+        ))
+    } else if i64::try_from(result.role_epoch).ok() != Some(attempt_epoch) {
+        Some((
+            RejectionReason::StaleRoleEpoch,
+            format!(
+                "attempt {} ran at role epoch {attempt_epoch}, not {}",
+                result.attempt_id, result.role_epoch
+            ),
+        ))
+    } else if !matches!(attempt_state.as_str(), "RUNNING" | "SETTLED") || !holds_lease {
+        // A late result of an attempt that failed, was cancelled, or lost its lease to a newer attempt (M2T04R-53).
+        Some((
+            RejectionReason::StaleLeaseEpoch,
+            format!(
+                "attempt {} is {attempt_state}{} and is not the task's live attempt",
+                result.attempt_id,
+                if holds_lease {
+                    ""
+                } else {
+                    " without its lease"
+                }
             ),
         ))
     } else if state != "RUNNING" {
@@ -140,6 +183,14 @@ pub(super) fn accept(
                 RejectionReason::CandidateMismatch,
                 format!("candidate {} is {state}, not FROZEN", c.id),
             )),
+            Some((c, _)) if current.as_ref() != Some(c) => Some((
+                RejectionReason::CandidateMismatch,
+                format!(
+                    "candidate {} is not the run's current {:?}",
+                    c.id,
+                    current.as_ref().map(|c| &c.id)
+                ),
+            )),
             Some(_) => None,
         }
     };
@@ -158,6 +209,7 @@ pub(super) fn accept(
                         "candidate_id": result.candidate_id,
                         "reason_code": reason,
                         "detail": detail,
+                        "task_result": submitted,
                     }),
                 }],
                 ..Commit::default()
@@ -215,6 +267,13 @@ pub(super) fn accept(
             result.task_id
         ))
     })?;
+    // The store's bounded ids (Message ids are at most 160 characters; a candidate id may be as long, M2T04R-55).
+    let mut messages = messages;
+    for m in &mut messages {
+        let id = child_id(&candidate.id, &format!("verify/{}", m.recipient_role));
+        m.message_id.clone_from(&id);
+        m.idempotency_key = id;
+    }
     let outbox = messages
         .iter()
         .map(|m| NewOutbox::hcp(0, m))
@@ -241,6 +300,7 @@ pub(super) fn accept(
                     "candidate_id": candidate.id,
                     "attempt_id": result.attempt_id,
                     "handoffs": messages.iter().map(|m| m.message_id.clone()).collect::<Vec<_>>(),
+                    "task_result": submitted,
                 }),
             }],
             outbox,
@@ -264,16 +324,6 @@ pub(super) fn accept(
         event_seq: done.event_seqs[0],
         handoffs: messages.into_iter().map(|m| m.message_id).collect(),
     })
-}
-
-fn event_seq(tx: &Transaction<'_>, event_id: &str) -> Result<Option<i64>, PersistError> {
-    tx.query_row(
-        "SELECT seq FROM events WHERE event_id = ?1",
-        params![event_id],
-        |r| r.get(0),
-    )
-    .optional()
-    .map_err(sqlite_error)
 }
 
 fn event(tx: &Transaction<'_>, event_id: &str) -> Result<Option<(i64, Value)>, PersistError> {
