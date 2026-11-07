@@ -40,7 +40,9 @@ mod writer;
 pub use attempts::{
     AttemptFacts, AttemptMove, AttemptRow, CancelLatch, CancelReceipt, NewAttempt, Session,
 };
-pub use commands::{CommandOutcome, EventRow, HostStart, RunRow, SubmitCommand};
+pub use commands::{
+    CommandOutcome, EventRow, HostStart, RunRow, RunTarget, RunsPage, SubmitCommand,
+};
 pub use decide::Decided;
 pub use inputs::{InputMove, InputRow, NewInput};
 pub use writer::{Change, Claimed, Commit, Committed, Entity, NewEvent, NewOutbox, StateCas};
@@ -1265,6 +1267,17 @@ impl Reader {
     /// The run `run_id` with the highest event seq, read together.
     pub fn snapshot(&self, run_id: &str) -> Result<Option<(RunRow, i64)>, PersistError> {
         commands::snapshot(&self.conn, run_id)
+    }
+
+    /// A page of the project's runs, newest first (openapi `listRuns`; ADR-021 decision 6): the runs with their
+    /// creation time, the next page's cursor if there may be one, and the watermark.
+    pub fn list_runs(
+        &self,
+        state: Option<&str>,
+        limit: usize,
+        before: Option<i64>,
+    ) -> Result<RunsPage, PersistError> {
+        commands::list_runs(&self.conn, state, limit, before)
     }
 
     /// At most `limit` events after seq `after`, in order.

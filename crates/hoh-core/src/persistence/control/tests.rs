@@ -4,8 +4,8 @@ use crate::cancel::{Canceller, GRACES, Look, ProcessControl, Processes, Signal};
 use crate::delivery::Clock;
 use crate::lifecycle;
 use crate::persistence::{
-    AttemptRow, CommandOutcome, Finished, NewEvent, NewOutbox, Options, Store, SubmitCommand,
-    selftest,
+    AttemptRow, CommandOutcome, Finished, NewEvent, NewOutbox, Options, RunTarget, Store,
+    SubmitCommand, selftest,
 };
 use crate::protocol::RunState;
 use crate::time::parse_rfc3339;
@@ -54,7 +54,7 @@ fn cancel_run(revision: i64) -> SubmitCommand {
         expected_revision: revision,
         payload: json!({"reason": "test"}),
         payload_sha256: format!("{:064}", 9),
-        target: RunState::CancelRequested,
+        target: RunTarget::To(RunState::CancelRequested),
         event: NewEvent {
             project_id: "p1".to_owned(),
             event_id: "e-cancel".to_owned(),
@@ -282,6 +282,185 @@ async fn test_043_05_a_cancel_stays_cancelling_while_the_group_lives_after_sigki
             "SELECT count(*) FROM effects WHERE effect_key = 'A1/work' AND state = 'UNKNOWN'"
         )?,
         1
+    );
+    Ok(())
+}
+
+/// A command for R of `kind` to `target` at `revision`, its key `key`.
+fn command(kind: &str, key: &str, revision: i64, target: RunTarget) -> SubmitCommand {
+    SubmitCommand {
+        command_id: format!("c-{key}"),
+        idempotency_key: key.to_owned(),
+        kind: kind.to_owned(),
+        payload_sha256: format!("{:064}", key.len()),
+        target,
+        event: NewEvent {
+            event_id: format!("e-{key}"),
+            kind: format!("run.{}", kind.to_lowercase()),
+            ..cancel_run(revision).event
+        },
+        outbox: None,
+        ..cancel_run(revision)
+    }
+}
+
+fn run_state(path: &Path) -> R<(String, i64, Option<String>)> {
+    Ok(Connection::open(path)?.query_row(
+        "SELECT state, revision, resume_state FROM runs WHERE run_id = 'R'",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?)
+}
+
+#[tokio::test]
+async fn a_resume_records_the_runs_reconcile_before_it_works_again_and_only_from_paused() -> R {
+    // REQ-043 behaviour 2 (docs/adr/ADR-021.md decision 7): a paused run resumes to the state it was paused in, its
+    // reconcile recorded first; a run not paused does not resume.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(&format!(
+        "{WORLD}
+         UPDATE attempts SET state = 'UNKNOWN_EFFECT' WHERE attempt_id = 'A1';
+         UPDATE runs SET state = 'PAUSED', resume_state = 'RUNNING', revision = 4 WHERE run_id = 'R';"
+    ))?;
+    let early = store
+        .submit_command(command("ResumeRun", "resume-stale", 3, RunTarget::Resume))
+        .await;
+    assert!(early.is_err(), "{early:?}");
+    let resumed = store
+        .submit_command(command("ResumeRun", "resume", 4, RunTarget::Resume))
+        .await?;
+    assert!(
+        matches!(resumed, CommandOutcome::Accepted { revision: 5, .. }),
+        "{resumed:?}"
+    );
+    assert_eq!(run_state(&path)?, ("RUNNING".to_owned(), 5, None));
+    let (kinds, unknown): (String, String) = Connection::open(&path)?.query_row(
+        "SELECT group_concat(kind, ','), (SELECT json_extract(payload_json, '$.unknown_effect') FROM events \
+         WHERE kind = 'reconcile.run') FROM (SELECT kind FROM events ORDER BY seq)",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    assert_eq!(kinds, "reconcile.run,run.resumerun");
+    assert_eq!(unknown, "[\"A1\"]");
+    // RUNNING now: no resume.
+    let again = store
+        .submit_command(command("ResumeRun", "resume-again", 5, RunTarget::Resume))
+        .await;
+    assert!(
+        matches!(
+            again,
+            Err(crate::persistence::PersistError::IllegalTransition { .. })
+        ),
+        "{again:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_started_run_is_created_with_its_exact_accepted_body_and_replayed_byte_for_byte() -> R {
+    // REQ-005 behaviour 1, decision 5 (docs/adr/ADR-021.md decision 5): StartRun creates the run the host named,
+    // CREATED at revision 0, in the command's transaction, and stores the 202 body a replay returns.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(
+        "INSERT INTO projects(project_id, repo_path, created_at) VALUES ('p1', '/repo', '2026-11-07T00:00:00Z');",
+    )?;
+    let start = |key: &str, revision: i64| SubmitCommand {
+        run_id: "R-new".to_owned(),
+        event: NewEvent {
+            run_id: Some("R-new".to_owned()),
+            ..command("StartRun", key, revision, RunTarget::To(RunState::Created)).event
+        },
+        ..command(
+            "StartRun",
+            key,
+            revision,
+            RunTarget::Start {
+                mode: "AUTO".to_owned(),
+            },
+        )
+    };
+    let stale = store.submit_command(start("start-stale", 1)).await;
+    assert!(stale.is_err(), "{stale:?}");
+    let CommandOutcome::Accepted {
+        result_json,
+        revision,
+        ..
+    } = store.submit_command(start("start", 0)).await?
+    else {
+        return Err("not accepted".into());
+    };
+    assert_eq!(revision, 0);
+    let body: Value = serde_json::from_str(&result_json)?;
+    assert_eq!(
+        body,
+        json!({"command_id": "c-start", "run_id": "R-new", "revision": 0, "status": "ACCEPTED"})
+    );
+    let replay = store.submit_command(start("start", 0)).await?;
+    assert_eq!(replay, CommandOutcome::Replayed { result_json });
+    let row: (String, String, i64) = Connection::open(&path)?.query_row(
+        "SELECT state, mode, revision FROM runs WHERE run_id = 'R-new'",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    assert_eq!(row, ("CREATED".to_owned(), "AUTO".to_owned(), 0));
+    assert_eq!(count(&path, "SELECT count(*) FROM runs")?, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_cancel_wins_over_a_pause_and_a_pause_is_refused_while_cancelling_or_ended() -> R {
+    // REQ-043 behaviour 8 and failure mode 4: Cancel during PAUSE_REQUESTED is accepted; Pause during
+    // CANCEL_REQUESTED, and Pause or Cancel of a terminal run, are ILLEGAL_TRANSITION with nothing changed.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(WORLD)?;
+    let pause = |key: &str, revision: i64| {
+        command(
+            "PauseRun",
+            key,
+            revision,
+            RunTarget::To(RunState::PauseRequested),
+        )
+    };
+    store.submit_command(pause("pause", 1)).await?;
+    assert_eq!(run_state(&path)?.0, "PAUSE_REQUESTED");
+    store.submit_command(cancel_run(2)).await?;
+    assert_eq!(run_state(&path)?.0, "CANCEL_REQUESTED");
+    let refused = store.submit_command(pause("pause-2", 3)).await;
+    assert!(
+        matches!(
+            refused,
+            Err(crate::persistence::PersistError::IllegalTransition { .. })
+        ),
+        "{refused:?}"
+    );
+    Connection::open(&path)?
+        .execute_batch("UPDATE runs SET state = 'COMPLETED' WHERE run_id = 'R';")?;
+    for (kind, target) in [
+        ("PauseRun", RunState::PauseRequested),
+        ("CancelRun", RunState::CancelRequested),
+    ] {
+        let ended = store
+            .submit_command(command(
+                kind,
+                &format!("ended-{kind}"),
+                3,
+                RunTarget::To(target),
+            ))
+            .await;
+        assert!(
+            matches!(
+                ended,
+                Err(crate::persistence::PersistError::IllegalTransition { .. })
+            ),
+            "{kind}: {ended:?}"
+        );
+    }
+    assert_eq!(
+        run_state(&path)?,
+        ("COMPLETED".to_owned(), 3, Some("RUNNING".to_owned()))
     );
     Ok(())
 }

@@ -8,6 +8,7 @@
 
 use super::writer::{self, Change, Commit, NewEvent, NewOutbox, StateCas};
 use super::{PersistError, sqlite_error};
+use crate::lifecycle::Lifecycle as _;
 use crate::protocol::RunState;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
@@ -24,11 +25,23 @@ pub struct SubmitCommand {
     pub payload: serde_json::Value,
     /// sha256 (hex) of the whole command body in canonical form: what the key is compared on.
     pub payload_sha256: String,
-    /// The state the run moves to.
-    pub target: RunState,
+    /// Where the run moves.
+    pub target: RunTarget,
     /// The event appended for the move, and the outbox message for it.
     pub event: NewEvent,
     pub outbox: Option<NewOutbox>,
+}
+
+/// Where a command moves its run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunTarget {
+    /// To this state, by compare-and-set.
+    To(RunState),
+    /// Back to the state saved when it was paused (ResumeRun), after a reconcile of the run recorded first
+    /// (docs/adr/ADR-021.md decision 7).
+    Resume,
+    /// A new run, CREATED, in this mode (StartRun, decision 5): `run_id` is the id the host gave it.
+    Start { mode: String },
 }
 
 /// What a command came to.
@@ -102,35 +115,103 @@ pub(super) fn submit(
         })?;
         return Ok(CommandOutcome::Replayed { result_json });
     }
-    let exists: bool = tx
-        .query_row(
-            "SELECT 1 FROM runs WHERE run_id = ?1",
-            params![command.run_id],
-            |_| Ok(()),
-        )
-        .optional()
-        .map_err(sqlite_error)?
-        .is_some();
-    if !exists {
-        return Err(PersistError::RunNotFound(command.run_id.clone()));
-    }
-    let done = writer::write(
-        &tx,
-        &Commit {
-            cas: vec![StateCas {
-                id: command.run_id.clone(),
-                expected_revision: command.expected_revision,
-                change: Change::Run(command.target),
-            }],
-            events: vec![command.event.clone()],
-            outbox: command.outbox.clone().into_iter().collect(),
-        },
-        ctx,
-    )?;
-    let (revision, event_seq) = (done.revisions[0], done.event_seqs[0]);
+    let (revision, event_seq) = match &command.target {
+        RunTarget::Start { mode } => {
+            if command.expected_revision != 0 {
+                return Err(PersistError::StaleRevision {
+                    entity: writer::Entity::Run,
+                    id: command.run_id.clone(),
+                    expected: command.expected_revision,
+                    actual: None,
+                });
+            }
+            tx.execute(
+                "INSERT INTO runs(run_id, project_id, state, mode, revision, created_at) VALUES (?1, ?2, 'CREATED', ?3, 0, ?4)",
+                params![
+                    command.run_id,
+                    command.event.project_id,
+                    mode,
+                    crate::time::now_rfc3339()
+                ],
+            )
+            .map_err(sqlite_error)?;
+            let done = writer::write(
+                &tx,
+                &Commit {
+                    events: vec![command.event.clone()],
+                    outbox: command.outbox.clone().into_iter().collect(),
+                    ..Commit::default()
+                },
+                ctx,
+            )?;
+            (0, done.event_seqs[0])
+        }
+        target => {
+            let run: Option<(String, Option<String>, String)> = tx
+                .query_row(
+                    "SELECT state, resume_state, project_id FROM runs WHERE run_id = ?1",
+                    params![command.run_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()
+                .map_err(sqlite_error)?;
+            let Some((state, saved, project_id)) = run else {
+                return Err(PersistError::RunNotFound(command.run_id.clone()));
+            };
+            let mut events = Vec::new();
+            let to = match target {
+                RunTarget::To(to) => *to,
+                RunTarget::Resume => {
+                    let to = saved
+                        .as_deref()
+                        .map(writer::parse::<RunState>)
+                        .transpose()?
+                        .filter(|_| state == RunState::Paused.as_str());
+                    let Some(to) = to else {
+                        return Err(PersistError::IllegalTransition {
+                            entity: writer::Entity::Run,
+                            id: command.run_id.clone(),
+                            from: state,
+                            to: "resume_state".to_owned(),
+                            why: "only a paused run resumes, to the state it was paused in"
+                                .to_owned(),
+                        });
+                    };
+                    events.push(resume_reconcile(&tx, &project_id, command)?);
+                    to
+                }
+                RunTarget::Start { .. } => unreachable!("handled above"),
+            };
+            let at = events.len();
+            events.push(command.event.clone());
+            let done = writer::write(
+                &tx,
+                &Commit {
+                    cas: vec![StateCas {
+                        id: command.run_id.clone(),
+                        expected_revision: command.expected_revision,
+                        change: Change::Run(to),
+                    }],
+                    events,
+                    outbox: command
+                        .outbox
+                        .clone()
+                        .into_iter()
+                        .map(|o| NewOutbox {
+                            event: o.event + at,
+                            ..o
+                        })
+                        .collect(),
+                },
+                ctx,
+            )?;
+            (done.revisions[0], done.event_seqs[at])
+        }
+    };
+
     // A cancel marks the run's attempts not yet ended in the same transaction: each ends CANCELLED, before any other
     // disposition (REQ-043 behaviour 3, docs/adr/ADR-021.md decision 8b and 8e).
-    if command.target == RunState::CancelRequested {
+    if command.target == RunTarget::To(RunState::CancelRequested) {
         tx.execute(
             "UPDATE attempts SET cancel_requested = 1 WHERE state IN ('PREPARED', 'STARTING', 'RUNNING') \
              AND task_id IN (SELECT task_id FROM tasks WHERE run_id = ?1)",
@@ -168,6 +249,58 @@ pub(super) fn submit(
         result_json,
         revision,
         event_seq,
+    })
+}
+
+/// A resume's reconcile of its run, recorded before the run works again so that every later dispatch comes after it
+/// (REQ-043 behaviour 2, docs/adr/ADR-021.md decision 7): the run's attempts still unfinished (none, for a paused run),
+/// those whose effect is unknown, and the leases its attempts hold.
+fn resume_reconcile(
+    tx: &rusqlite::Transaction<'_>,
+    project_id: &str,
+    command: &SubmitCommand,
+) -> Result<NewEvent, PersistError> {
+    let ids = |sql: &str| -> Result<Vec<String>, PersistError> {
+        let mut statement = tx.prepare(sql).map_err(sqlite_error)?;
+        statement
+            .query_map(params![command.run_id], |r| r.get(0))
+            .map_err(sqlite_error)?
+            .collect::<Result<_, _>>()
+            .map_err(sqlite_error)
+    };
+    let unfinished = ids(
+        "SELECT a.attempt_id FROM attempts a JOIN tasks t ON t.task_id = a.task_id WHERE t.run_id = ?1 \
+         AND a.state IN ('PREPARED', 'STARTING', 'RUNNING') ORDER BY a.rowid",
+    )?;
+    let unknown = ids(
+        "SELECT a.attempt_id FROM attempts a JOIN tasks t ON t.task_id = a.task_id WHERE t.run_id = ?1 \
+         AND a.state = 'UNKNOWN_EFFECT' ORDER BY a.rowid",
+    )?;
+    let leases = ids(
+        "SELECT l.kind FROM leases l JOIN attempts a ON a.attempt_id = l.attempt_id JOIN tasks t ON t.task_id = a.task_id \
+         WHERE t.run_id = ?1 ORDER BY l.kind",
+    )?;
+    if !unfinished.is_empty() {
+        return Err(PersistError::IllegalTransition {
+            entity: writer::Entity::Run,
+            id: command.run_id.clone(),
+            from: RunState::Paused.as_str().to_owned(),
+            to: "resume_state".to_owned(),
+            why: format!("attempts of it are not finished: {}", unfinished.join(", ")),
+        });
+    }
+    Ok(NewEvent {
+        project_id: project_id.to_owned(),
+        event_id: crate::ids::child_id(&command.run_id, &format!("resume/{}", command.command_id)),
+        run_id: Some(command.run_id.clone()),
+        kind: "reconcile.run".to_owned(),
+        payload: serde_json::json!({
+            "run_id": command.run_id,
+            "command_id": command.command_id,
+            "unfinished": unfinished,
+            "unknown_effect": unknown,
+            "leases": leases,
+        }),
     })
 }
 
@@ -253,6 +386,67 @@ pub(super) fn snapshot(
         })
     })();
     // Ends the read transaction either way; nothing was written.
+    let _ = conn.execute_batch("COMMIT");
+    read
+}
+
+/// A page of runs: each with its creation time, the next page's cursor if there may be one, and the watermark.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunsPage {
+    pub runs: Vec<(RunRow, String)>,
+    pub next: Option<i64>,
+    pub watermark: i64,
+}
+
+/// A page of the project's runs, newest first (openapi `listRuns`): at most `limit` runs older than `before` (an
+/// opaque cursor: the rowid of the last run of the previous page), only in `state` if given; each with its creation
+/// time, the cursor of the next page if there may be one, and the watermark the page is consistent with.
+pub(super) fn list_runs(
+    conn: &Connection,
+    state: Option<&str>,
+    limit: usize,
+    before: Option<i64>,
+) -> Result<RunsPage, PersistError> {
+    conn.execute_batch("BEGIN").map_err(sqlite_error)?;
+    let read = (|| {
+        let mut statement = conn
+            .prepare(
+                "SELECT run_id, project_id, state, mode, revision, resume_state, blocked_reason, created_at, rowid \
+                 FROM runs WHERE (?1 IS NULL OR state = ?1) AND (?2 IS NULL OR rowid < ?2) ORDER BY rowid DESC LIMIT ?3",
+            )
+            .map_err(sqlite_error)?;
+        let rows: Vec<(RunRow, String, i64)> = statement
+            .query_map(
+                params![state, before, i64::try_from(limit).unwrap_or(i64::MAX)],
+                |r| {
+                    Ok((
+                        RunRow {
+                            run_id: r.get(0)?,
+                            project_id: r.get(1)?,
+                            state: r.get(2)?,
+                            mode: r.get(3)?,
+                            revision: r.get(4)?,
+                            resume_state: r.get(5)?,
+                            blocked_reason: r.get(6)?,
+                        },
+                        r.get(7)?,
+                        r.get(8)?,
+                    ))
+                },
+            )
+            .map_err(sqlite_error)?
+            .collect::<Result<_, _>>()
+            .map_err(sqlite_error)?;
+        let next = (rows.len() == limit)
+            .then(|| rows.last().map(|r| r.2))
+            .flatten();
+        let watermark = max_seq(conn)?;
+        Ok::<_, PersistError>(RunsPage {
+            runs: rows.into_iter().map(|(run, at, _)| (run, at)).collect(),
+            next,
+            watermark,
+        })
+    })();
     let _ = conn.execute_batch("COMMIT");
     read
 }

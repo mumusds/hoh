@@ -1212,7 +1212,7 @@ fn pause(key: &str, hash: &str, expected: i64) -> SubmitCommand {
         expected_revision: expected,
         payload: json!({"reason": "test"}),
         payload_sha256: hash.repeat(64),
-        target: RunState::PauseRequested,
+        target: RunTarget::To(RunState::PauseRequested),
         event: event(&format!("e-{key}-{hash}")),
         outbox: Some(message(&format!("m-{key}-{hash}"), 0)),
     }
