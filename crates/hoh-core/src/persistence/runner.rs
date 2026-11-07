@@ -36,7 +36,7 @@ pub struct Waiting {
     pub dispatches: Vec<DispatchNotice>,
     /// run.started notices not yet taken: (message id, run id).
     pub started: Vec<(String, String)>,
-    /// The runs that dispatch (RUNNING, VERIFYING).
+    /// The runs the runner paces and schedules (RUNNING, VERIFYING, and WAITING_EXTERNAL to be woken).
     pub runs: Vec<String>,
 }
 
@@ -58,8 +58,12 @@ pub(super) enum RunnerJob {
     },
     Finished {
         attempt_id: String,
-        success: bool,
-        detail: String,
+        ending: Box<Ending>,
+    },
+    /// One look at a run as a whole (ADR-020 decisions 4, 5 and 7).
+    Pace {
+        run_id: String,
+        context: Box<crate::decision::Context>,
     },
     Ack(String),
     /// Renew the unexpired leases these attempts hold, at `now` (REQ-041: every 30 s, for 120 s).
@@ -74,6 +78,20 @@ pub(super) enum RunnerDone {
     Applied(bool),
     /// How many leases were renewed.
     Renewed(usize),
+    Paced(super::retry::Paced),
+}
+
+/// How an attempt ended, as the runner reports it (ADR-020 decisions 1 and 3).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ending {
+    pub success: bool,
+    pub detail: String,
+    /// How it failed (unused when it succeeded).
+    pub class: crate::retry::FailureClass,
+    /// When it ended, by the runner's clock.
+    pub at: std::time::SystemTime,
+    /// A uniform 32-bit draw for the retry's jitter.
+    pub draw: u32,
 }
 
 pub(super) fn run(
@@ -94,11 +112,12 @@ pub(super) fn run(
         RunnerJob::Running { attempt_id, facts } => {
             running(conn, &attempt_id, *facts, ctx).map(RunnerDone::Applied)
         }
-        RunnerJob::Finished {
-            attempt_id,
-            success,
-            detail,
-        } => finished(conn, &attempt_id, success, &detail, ctx).map(RunnerDone::Applied),
+        RunnerJob::Finished { attempt_id, ending } => {
+            finished(conn, &attempt_id, &ending, ctx).map(RunnerDone::Applied)
+        }
+        RunnerJob::Pace { run_id, context } => {
+            super::retry::pace(conn, &run_id, &context, ctx).map(RunnerDone::Paced)
+        }
         RunnerJob::Renew(attempts, now) => {
             let tx = writer::begin(conn, ctx)?;
             let at = crate::time::rfc3339_utc(now);
@@ -169,7 +188,8 @@ fn waiting(conn: &Connection, project_id: &str) -> Result<Waiting, PersistError>
         .map_err(sqlite_error)?;
     let mut statement = conn
         .prepare(
-            "SELECT run_id FROM runs WHERE project_id = ?1 AND state IN ('RUNNING', 'VERIFYING') ORDER BY created_at, run_id",
+            "SELECT run_id FROM runs WHERE project_id = ?1 AND state IN ('RUNNING', 'VERIFYING', 'WAITING_EXTERNAL') \
+             ORDER BY created_at, run_id",
         )
         .map_err(sqlite_error)?;
     let runs = statement
@@ -397,12 +417,11 @@ fn running(
 fn finished(
     conn: &mut Connection,
     attempt_id: &str,
-    success: bool,
-    detail: &str,
+    ending: &Ending,
     ctx: &Ctx<'_>,
 ) -> Result<bool, PersistError> {
     let tx = writer::begin(conn, ctx)?;
-    let (task_id, task_state, revision, _, _) = task_of(&tx, attempt_id)?;
+    let (task_id, task_state, revision, run_id, project_id) = task_of(&tx, attempt_id)?;
     let from: String = tx
         .query_row(
             "SELECT state FROM attempts WHERE attempt_id = ?1",
@@ -412,11 +431,11 @@ fn finished(
         .map_err(sqlite_error)?;
     let from = writer::parse::<AttemptState>(&from)?;
     // A process that never started leaves its attempt STARTING: it can only fail.
-    let success = success && from == AttemptState::Running;
-    let (to, task_to) = if success {
-        (AttemptState::Settled, TaskState::Implemented)
+    let success = ending.success && from == AttemptState::Running;
+    let to = if success {
+        AttemptState::Settled
     } else {
-        (AttemptState::Failed, TaskState::Ready)
+        AttemptState::Failed
     };
     attempts::move_attempt(
         &tx,
@@ -425,32 +444,45 @@ fn finished(
             from,
             to,
             facts: AttemptFacts {
-                ended_at: Some(crate::time::now_rfc3339()),
-                failure_reason: (!success).then(|| detail.to_owned()),
+                ended_at: Some(crate::time::rfc3339_utc(ending.at)),
+                failure_reason: (!success).then(|| ending.detail.clone()),
                 ..AttemptFacts::default()
             },
         },
         ctx,
     )?;
-    let cas = if task_state == TaskState::Running
-        || (task_state == TaskState::Leased && task_to == TaskState::Ready)
-    {
-        vec![StateCas {
-            id: task_id,
-            expected_revision: revision,
-            change: Change::Task(task_to),
-        }]
+    super::retry::accrue_wall(&tx, &run_id, attempt_id, ending.at)?;
+    let mut commit = Commit::default();
+    if success {
+        if task_state == TaskState::Running {
+            commit.cas.push(StateCas {
+                id: task_id,
+                expected_revision: revision,
+                change: Change::Task(TaskState::Implemented),
+            });
+        }
     } else {
-        Vec::new()
-    };
-    writer::write(
-        &tx,
-        &Commit {
-            cas,
-            ..Commit::default()
-        },
-        ctx,
-    )?;
+        // Its task by the retry policy, in this transaction (ADR-020 decision 3).
+        let failed = super::retry::fail_task(
+            &tx,
+            &super::retry::TaskRef {
+                project_id: &project_id,
+                run_id: &run_id,
+                task_id: &task_id,
+                state: task_state,
+                revision,
+            },
+            attempt_id,
+            &super::retry::Failure {
+                class: ending.class,
+                at: ending.at,
+                draw: ending.draw,
+            },
+        )?;
+        commit.cas.extend(failed.cas);
+        commit.events.extend(failed.events);
+    }
+    writer::write(&tx, &commit, ctx)?;
     ctx.before_commit()?;
     tx.commit().map_err(sqlite_error)?;
     Ok(true)

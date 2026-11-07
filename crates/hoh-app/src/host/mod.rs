@@ -46,6 +46,9 @@ pub struct HostConfig {
     /// The time leases are renewed, expired and granted at: the system clock in the product (tests pass their own,
     /// CR-006 F2).
     pub clock: HostClock,
+    /// The seed of the retries' jitter (REQ-042, ADR-020 decision 2): `None` in the product, drawn from the system at
+    /// the start; tests fix it so their delays replay.
+    pub jitter_seed: Option<u64>,
 }
 
 /// The host's clock (a port, [`hoh_core::delivery::Clock`]).
@@ -73,6 +76,7 @@ impl HostConfig {
             reconcile: ReconcileSettings::default(),
             runner: None,
             clock: HostClock(Arc::new(hoh_core::delivery::SystemClock)),
+            jitter_seed: None,
         }
     }
 }
@@ -236,12 +240,23 @@ impl Host {
             }
             readers.push(reader);
         }
+        let jitter = Arc::new(runner::Jitter::new(match config.jitter_seed {
+            Some(seed) => seed,
+            None => {
+                let mut bytes = [0u8; 8];
+                fill_random(&mut bytes)
+                    .map_err(|e| StartError::other(format!("cannot seed the retry jitter: {e}")))?;
+                u64::from_le_bytes(bytes)
+            }
+        }));
         // Every unfinished attempt is settled before anything is served (REQ-041 b1: no write command before it).
         reconcile::run(
             &store,
             &started.project_id,
             started.host_epoch,
             &config.reconcile,
+            config.clock.0.as_ref(),
+            &jitter,
         )
         .await
         .map_err(StartError::store)?;
@@ -312,6 +327,7 @@ impl Host {
                 config.clock.0.clone(),
                 config.reconcile.clone(),
                 started.host_epoch,
+                jitter.clone(),
                 stopped,
             )));
         }

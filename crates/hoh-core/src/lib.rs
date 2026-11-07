@@ -8,6 +8,8 @@
 
 #![forbid(unsafe_code)]
 
+#[forbid(clippy::disallowed_methods)]
+pub mod budget;
 #[cfg(hoh_clippy_canary)]
 #[forbid(clippy::disallowed_methods)]
 mod clippy_canary;
@@ -32,6 +34,8 @@ pub mod persistence;
 pub mod protocol;
 #[forbid(clippy::disallowed_methods)]
 pub mod reconcile;
+#[forbid(clippy::disallowed_methods)]
+pub mod retry;
 #[forbid(clippy::disallowed_methods)]
 pub mod schedule;
 #[forbid(clippy::disallowed_methods)]

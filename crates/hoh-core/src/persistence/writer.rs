@@ -308,6 +308,8 @@ impl Job {
             Job::Plan(..) => "Plan",
             Job::Round(..) => "Round",
             Job::Reconcile(..) => "Reconcile",
+            // A run's pace is a write of its own kind (fault hooks tell it from an attempt's runner writes).
+            Job::Runner(job, _) if matches!(**job, super::runner::RunnerJob::Pace { .. }) => "Pace",
             Job::Runner(..) => "Runner",
             Job::Keep(..) => "Keep",
         }

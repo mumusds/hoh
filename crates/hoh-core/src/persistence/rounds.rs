@@ -69,6 +69,12 @@ pub(super) fn round(
     if !WORKING.contains(&writer::parse::<RunState>(&state)?) {
         return Ok(RoundOutcome::default());
     }
+    // A budget that stops the run, or a cost limit it cannot enforce, dispatches nothing more (REQ-042 behaviour 6
+    // and 7; the pace moves the run on, ADR-020 decision 7).
+    let budget = super::retry::load_budget(&tx, run_id)?;
+    if crate::budget::stop(&budget, now).is_some() || crate::budget::unenforceable(&budget) {
+        return Ok(RoundOutcome::default());
+    }
     let params = parameters(&snapshot)?;
     let mut rows = candidates(&tx, run_id, run_spec.as_deref(), context)?;
     let slots = Slots {
@@ -239,7 +245,9 @@ fn parameters(snapshot: &str) -> Result<Params, PersistError> {
     Ok(Params::from_settings(settings.as_ref()))
 }
 
-/// The run's READY tasks and the PENDING ones whose dependencies are all ACCEPTED, with the five facts (REQ-038).
+/// The run's READY tasks and the PENDING ones whose dependencies are all ACCEPTED, with the five facts (REQ-038); a
+/// task waiting for its retry is no candidate until its `next_retry_at` (REQ-042 behaviour 2; it does not age
+/// meanwhile).
 fn candidates(
     tx: &rusqlite::Transaction<'_>,
     run_id: &str,
@@ -253,34 +261,38 @@ fn candidates(
              t.first_eligible_seq, \
              (SELECT count(*) FROM task_dependencies d JOIN tasks u ON u.task_id = d.depends_on \
               WHERE d.task_id = t.task_id AND u.state <> 'ACCEPTED') \
-             FROM tasks t WHERE t.run_id = ?1 AND t.state IN ('READY', 'PENDING') ORDER BY t.created_seq, t.task_id",
+             FROM tasks t WHERE t.run_id = ?1 AND t.state IN ('READY', 'PENDING') \
+             AND (t.next_retry_at IS NULL OR t.next_retry_at <= ?2) ORDER BY t.created_seq, t.task_id",
         )
         .map_err(sqlite_error)?;
     let raw = statement
-        .query_map(params![run_id], |r| {
-            Ok((
-                (
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, i64>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, String>(4)?,
-                    r.get::<_, bool>(5)?,
-                    r.get::<_, i64>(6)?,
-                    r.get::<_, u8>(7)?,
-                ),
-                (
-                    r.get::<_, u8>(8)?,
-                    r.get::<_, u8>(9)?,
-                    r.get::<_, u8>(10)?,
-                    r.get::<_, u8>(11)?,
-                    r.get::<_, u8>(12)?,
-                    r.get::<_, u32>(13)?,
-                    r.get::<_, Option<i64>>(14)?,
-                    r.get::<_, i64>(15)?,
-                ),
-            ))
-        })
+        .query_map(
+            params![run_id, crate::time::rfc3339_utc(context.now())],
+            |r| {
+                Ok((
+                    (
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, bool>(5)?,
+                        r.get::<_, i64>(6)?,
+                        r.get::<_, u8>(7)?,
+                    ),
+                    (
+                        r.get::<_, u8>(8)?,
+                        r.get::<_, u8>(9)?,
+                        r.get::<_, u8>(10)?,
+                        r.get::<_, u8>(11)?,
+                        r.get::<_, u8>(12)?,
+                        r.get::<_, u32>(13)?,
+                        r.get::<_, Option<i64>>(14)?,
+                        r.get::<_, i64>(15)?,
+                    ),
+                ))
+            },
+        )
         .map_err(sqlite_error)?;
     let mut rows = Vec::new();
     let mut bindings = std::collections::BTreeMap::new();

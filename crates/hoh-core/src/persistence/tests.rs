@@ -1550,6 +1550,8 @@ async fn an_attempt_left_unfinished_is_disposed_of_again_with_events_of_its_own(
                 Disposition::Redeliver,
                 Process::NotStarted,
                 "reconcile",
+                std::time::SystemTime::now(),
+                0,
             )
             .await?;
     }

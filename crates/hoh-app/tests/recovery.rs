@@ -217,6 +217,7 @@ fn reaping_after(
             success: status.as_ref().is_ok_and(std::process::ExitStatus::success),
             detail: format!("{status:?}"),
             group_gone,
+            class: hoh_core::retry::FailureClass::Transient { retry_after: None },
         });
     });
     ended
@@ -2207,6 +2208,7 @@ impl hoh_app::host::Executor for LeavesAMember {
                     success: status.as_ref().is_ok_and(std::process::ExitStatus::success),
                     detail: format!("{status:?}"),
                     group_gone: hoh_agents::identity::group_empty(pid),
+                    class: hoh_core::retry::FailureClass::Transient { retry_after: None },
                 });
             });
             ended
@@ -2744,6 +2746,7 @@ impl hoh_app::host::Executor for LeaderOnlyCancel {
                 success: false,
                 detail: format!("{status:?}"),
                 group_gone: false,
+                class: hoh_core::retry::FailureClass::Transient { retry_after: None },
             });
         });
         Ok(hoh_app::host::Started { pid, gate, ended })
