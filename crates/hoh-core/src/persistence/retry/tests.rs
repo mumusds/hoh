@@ -796,7 +796,7 @@ async fn a_recorded_end_counts_only_once_its_work_was_committed() -> R {
 }
 
 /// The reconcile at `at` of A1 (T1, a writer task, RUNNING since 01:00:00 by an earlier host life's clock; its writer
-/// lease renewed then) as Ended(FAILED), with `records` seeded and T2 (a writer task) READY behind that lease: A1's
+/// lease last renewed at 01:01:00, which is no evidence of running, M2T19R-502) as Ended(FAILED), with `records` seeded and T2 (a writer task) READY behind that lease: A1's
 /// ended_at, the run's used duration, T1's next_retry_at, the reconcile event's `clock_behind_ms` and how many attempts
 /// a tick at `at` dispatches.
 async fn reconcile_a1_at(at: SystemTime, records: &str) -> R<(String, f64, String, Value, usize)> {
@@ -811,7 +811,7 @@ async fn reconcile_a1_at(at: SystemTime, records: &str) -> R<(String, f64, Strin
          INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, started_at) VALUES
            ('A1', 'T1', 'RUNNING', 1, 1, 1, '2026-11-07T01:00:00Z');
          INSERT INTO leases(project_id, kind, attempt_id, epoch, expires_at) VALUES
-           ('p1', 'writer', 'A1', 1, '2026-11-07T01:02:00Z');
+           ('p1', 'writer', 'A1', 1, '2026-11-07T01:03:00Z');
          INSERT INTO budgets(scope_kind, scope_id, kind, limit_value) VALUES ('run', 'R', 'wall_seconds', 600);
          {records}"
     ))?;
@@ -855,9 +855,10 @@ async fn reconcile_a1_at(at: SystemTime, records: &str) -> R<(String, f64, Strin
 async fn a_reconcile_after_the_wall_clock_was_set_back_charges_what_the_attempts_own_life_recorded()
 -> R {
     // M2T19R-200 by ADR-020 decision 4 (v3): stored times are UTC, so a later host life's time can be behind an
-    // earlier life's when the wall clock was set back across the restart. Nothing is moved for it: A1 ends at the
-    // reconcile's own time (00:02:00), its lease is released then (T2 runs at once, M2T19R-300) and its retry counts
-    // from then (+ Retry-After 120 s). Only the charge keeps what A1's own life recorded it ran: 5 s by its work's
+    // earlier life's when the wall clock was set back across the restart. Nothing is moved for it: with its work only
+    // OBSERVED, A1 ends at the reconcile's own time (00:02:00), its lease is released then (T2 runs at once, M2T19R-300)
+    // and its retry counts from then (+ Retry-After 120 s); with its work COMMITTED its recorded end is the earlier
+    // life's time (the residual, below). Only the charge keeps what A1's own life recorded it ran: 5 s by its work's
     // OBSERVED end, never a lease time (M2T19R-301). How far behind A1's start the reconcile was is recorded.
     let key = crate::reconcile::work_key("A1");
     let observed = format!(
@@ -892,6 +893,26 @@ async fn a_reconcile_after_the_wall_clock_was_set_back_charges_what_the_attempts
         ),
         "no record"
     );
+    // Its work COMMITTED (its group seen empty): the recorded end is its end (decision 1), so its lease is released
+    // and its retry counted at the earlier life's 01:00:05, ahead of this life's time: T2 waits for it, the residual
+    // of decision 4 (shifted by the correction). The reversal is still recorded by this reconcile's own time
+    // (M2T19R-452, -500).
+    let committed = observed.replace(
+        "VALUES ('A1/work', 'A1', 'OBSERVED')",
+        "VALUES ('A1/work', 'A1', 'COMMITTED')",
+    );
+    assert_ne!(committed, observed);
+    assert_eq!(
+        reconcile_a1_at(back, &committed).await?,
+        (
+            "2026-11-07T01:00:05Z".to_owned(),
+            5.0,
+            "2026-11-07T01:02:05Z".to_owned(),
+            json!(3_480_000),
+            0
+        ),
+        "its work committed"
+    );
     // A reconcile not behind the start charges its own time as before and records nothing.
     let (ended, used, next, behind, _) =
         reconcile_a1_at(at("2026-11-07T01:00:30Z")?, &observed).await?;
@@ -904,6 +925,67 @@ async fn a_reconcile_after_the_wall_clock_was_set_back_charges_what_the_attempts
             Value::Null
         )
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_unfinished_attempt_reserves_no_less_than_its_own_life_recorded_it_ran() -> R {
+    // M2T19R-450: A1 (T1, RUNNING since 01:00:00 by an earlier life's clock, its work OBSERVED at 01:00:50 but its group
+    // not seen empty) is left unfinished by a reconcile at 00:02:00 (the wall clock set back): it has run 50 s by its
+    // own life's record, so with 10 s allowed T2 is not dispatched, with 55 s it is (its lease's last renewal, 60 s
+    // after its start, is no evidence of running, M2T19R-502). The reconcile records how far behind A1's start it was
+    // for this disposition too.
+    use crate::reconcile::{Disposition, Process};
+    let key = crate::reconcile::work_key("A1");
+    for (limit, dispatched) in [(10, 0), (55, 1)] {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = open(&dir)?;
+        Connection::open(&path)?.execute_batch(&format!(
+            "{WORLD}
+             UPDATE tasks SET state = 'RUNNING', revision = 3 WHERE task_id = 'T1';
+             INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, created_seq, cost_estimate) VALUES
+               ('T2', 'R', 's1', 'READY', 1, 'developer', 2, 1);
+             INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, started_at) VALUES
+               ('A1', 'T1', 'RUNNING', 1, 1, 1, '2026-11-07T01:00:00Z');
+             INSERT INTO leases(project_id, kind, attempt_id, epoch, expires_at) VALUES
+               ('p1', 'reader-1', 'A1', 1, '2026-11-07T01:03:00Z');
+             INSERT INTO effects(effect_key, attempt_id, state) VALUES ('{key}', 'A1', 'OBSERVED');
+             INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+               ('p1', '{key}/effect.observed', 'R', 'effect.observed',
+                '{{\"effect_key\": \"{key}\", \"detail\": {{\"success\": false, \"detail\": \"HTTP 503\", \"class\": \"transient\", \"ended_at\": \"2026-11-07T01:00:50Z\"}}}}',
+                '2026-11-07T01:00:50Z');
+             INSERT INTO budgets(scope_kind, scope_id, kind, limit_value) VALUES ('run', 'R', 'wall_seconds', {limit});"
+        ))?;
+        let back = at("2026-11-07T00:02:00Z")?;
+        let rows = store.reconcile_scan("p1", back).await?;
+        let [row] = rows.as_slice() else {
+            return Err(format!("unfinished: {rows:?}").into());
+        };
+        store
+            .reconcile_apply(
+                row.clone(),
+                Disposition::Unreaped,
+                Process::Uncertain {
+                    basis: "leader_gone_group_not_empty".to_owned(),
+                },
+                "reconcile",
+                back,
+                0,
+            )
+            .await?;
+        assert_eq!(
+            tick(&store, back).await?.len(),
+            dispatched,
+            "{limit} s allowed"
+        );
+        let (state, behind): (String, Option<i64>) = Connection::open(&path)?.query_row(
+            "SELECT a.state, json_extract(e.payload_json, '$.clock_behind_ms') FROM attempts a, events e \
+             WHERE a.attempt_id = 'A1' AND e.kind = 'reconcile.attempt'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        assert_eq!((state.as_str(), behind), ("RUNNING", Some(3_480_000)));
+    }
     Ok(())
 }
 

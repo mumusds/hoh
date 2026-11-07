@@ -303,6 +303,7 @@ fn apply(
     let committed = row.effects.iter().any(|e| {
         e.key == crate::reconcile::work_key(&row.attempt_id) && e.state == EffectState::Committed
     });
+    let reconciled_at = *at;
     let at = &row.work_ended_at.filter(|_| committed).unwrap_or(*at);
     let none: &[EffectMove] = &[];
     let (name, attempt_to, task_to, moves, unknown): (_, _, _, &[EffectMove], &[String]) =
@@ -361,7 +362,9 @@ fn apply(
             )));
         }
     }
-    let mut behind = None;
+    // How far this reconcile's own time is behind the attempt's start, whatever its disposition: a diagnostic
+    // (ADR-020 decision 4, M2T19R-452, -500).
+    let behind = super::retry::behind_start(&tx, &row.attempt_id, reconciled_at)?;
     if let Some(to) = attempt_to {
         attempts::move_attempt(
             &tx,
@@ -376,8 +379,7 @@ fn apply(
             },
             ctx,
         )?;
-        behind =
-            super::retry::accrue_wall(&tx, &row.run_id, &row.attempt_id, *at, row.work_ended_at)?;
+        super::retry::accrue_wall(&tx, &row.run_id, &row.attempt_id, *at, row.work_ended_at)?;
     }
     // A failed attempt's task by the retry policy, with the class its work recorded (a process that ended without a
     // record failed in a way nothing classified: transient), as on the runner's own path (ADR-020 decision 3). A
