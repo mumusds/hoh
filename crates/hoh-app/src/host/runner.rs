@@ -45,6 +45,9 @@ pub struct Work {
 pub struct Outcome {
     pub success: bool,
     pub detail: String,
+    /// Whether the executor emptied the leader's process group before it reaped the leader (while the zombie held the
+    /// group's id, so nothing else could be in it): the attempt ends, and its slot goes, only if so (M2T05R-101, -202).
+    pub group_gone: bool,
 }
 
 /// A started process's start gate: until it is opened the process runs nothing of the agent; dropped unopened, the
@@ -81,6 +84,8 @@ pub trait Executor: Send + Sync + std::fmt::Debug {
     /// Hand `work` over; the answer says the executor has it (the ACK).
     fn deliver(&self, work: &Work) -> oneshot::Receiver<Result<(), String>>;
     /// Start `work`'s process held at its start gate: nothing of the agent may run before [`Started::gate`] opens.
+    /// When the leader ends, the executor first empties its process group, then reaps it, and reports both in its
+    /// [`Outcome`] (the hoh-agents substrate does so).
     fn start(&self, work: &Work) -> Result<Started, String>;
     /// Ask `work`'s process to stop the agent's own way (its native cancel), before any signal: the first step when its
     /// lease expired (AC-041-02).
@@ -97,6 +102,8 @@ pub enum RunnerPoint {
     AfterSend,
     AfterAck,
     AfterSpawn,
+    /// A settle of an attempt this host runs begins (before its task is stopped).
+    Settling,
     AfterEffectStarted,
     AfterEffectCommitted,
 }
@@ -115,15 +122,10 @@ const TICK: Duration = Duration::from_millis(200);
 /// How often the leases of the attempts it runs are renewed (REQ-041: every 30 s, for 120 s).
 const RENEW: Duration = Duration::from_secs(30);
 
-/// How long a holder whose process could not be confirmed gone is left before it is looked at again.
-const RETRY: Duration = Duration::from_secs(60);
-
-/// An attempt the runner runs: what it was given, its task, and its process held by its pidfd from its start until
-/// its group is gone (ADR-019 decision 8: the group id cannot be reused meanwhile).
+/// An attempt the runner runs: what it was given and its task.
 struct Entry {
     work: Work,
     task: Option<tokio::task::JoinHandle<()>>,
-    pin: Option<Arc<identity::Found>>,
 }
 
 /// What the attempts' tasks and the loop share.
@@ -199,7 +201,7 @@ async fn tick(
     for row in store.reconcile_scan(&project_id, now).await? {
         let waiting = held_back
             .get(&row.attempt_id)
-            .is_some_and(|(at, _)| at.elapsed() < RETRY);
+            .is_some_and(|(at, _)| at.elapsed() < common.settings.retry);
         if !row.lease_expired || waiting {
             continue;
         }
@@ -267,17 +269,20 @@ async fn tick(
             let work = work.clone();
             let id = id.clone();
             async move {
-                let result = attempt(&common, work, notice).await;
-                // However it ends, its entry goes (no lease is renewed for it any more); an error is settled at once
-                // with what it holds, or else by its lease's expiry (M2T05R-102, -150).
-                let entry = common.inflight.lock().ok().and_then(|mut f| f.remove(&id));
+                let result = attempt(&common, work.clone(), notice).await;
+                // An error is settled at once, its entry still there so no tick takes it meanwhile (M2T05R-260);
+                // however it ends, its entry then goes (no lease is renewed for it any more; a settle that failed is
+                // left to its lease's expiry, M2T05R-102, -150).
                 if let Err(e) = result {
                     use std::io::Write as _;
                     let _ = writeln!(std::io::stderr(), "hoh host: an attempt of the runner: {e}");
-                    let entry = entry.map(|e| Entry { task: None, ..e });
-                    if let Err(e) = settle(&common, &id, entry, "runner_error", None).await {
+                    let entry = Entry { work, task: None };
+                    if let Err(e) = settle(&common, &id, Some(entry), "runner_error", None).await {
                         let _ = writeln!(std::io::stderr(), "hoh host: the settle of {id}: {e}");
                     }
+                }
+                if let Ok(mut f) = common.inflight.lock() {
+                    f.remove(&id);
                 }
             }
         });
@@ -286,7 +291,6 @@ async fn tick(
             Entry {
                 work,
                 task: Some(task),
-                pin: None,
             },
         );
     }
@@ -324,35 +328,18 @@ async fn attempt(
             return Ok(());
         }
     };
-    // Its whole identity, and its pidfd held from here on; without them the gate stays shut (dropped below) and the
-    // agent never runs (M2T05R-100).
+    // Its whole identity: without it the gate stays shut (dropped below) and the agent never runs (M2T05R-100).
     let pid = started.pid;
-    let pinned = tokio::task::spawn_blocking(move || {
-        let identity = identity::of(pid).ok().flatten()?;
-        let found = identity::find(
-            Some(i64::from(identity.pid)),
-            Some(&identity.boot_id),
-            Some(&identity.start_id),
-        )
-        .ok()?
-        .ok()?;
-        Some((identity, found))
-    })
-    .await
-    .map_err(|e| PersistError::Storage(format!("the identity of {id}'s process: {e}")))?;
-    let Some((who, found)) = pinned else {
+    let who = tokio::task::spawn_blocking(move || identity::of(pid).ok().flatten())
+        .await
+        .map_err(|e| PersistError::Storage(format!("the identity of {id}'s process: {e}")))?;
+    let Some(who) = who else {
         drop(started);
         store
             .runner_finished(&id, false, "the identity of its process could not be read")
             .await?;
         return Ok(());
     };
-    let pin = Arc::new(found);
-    if let Ok(mut f) = common.inflight.lock()
-        && let Some(entry) = f.get_mut(&id)
-    {
-        entry.pin = Some(pin.clone());
-    }
     hooks.runner(RunnerPoint::AfterSpawn);
     if !store.runner_running(&id, identity::running(&who)).await? {
         // Disposed of meanwhile: the gate is dropped unopened, so the process ends without running anything.
@@ -369,9 +356,12 @@ async fn attempt(
             None,
         )
         .await?;
-        return Err(PersistError::Storage(format!(
-            "the start gate of {id}: {detail}"
-        )));
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "hoh host: the start gate of {id}: {detail}"
+        );
+        return Ok(());
     }
     hooks.runner(RunnerPoint::AfterEffectStarted);
     let Ok(outcome) = started.ended.await else {
@@ -401,14 +391,9 @@ async fn attempt(
     {
         return Ok(());
     }
-    // Its leader ended: what it left in its group goes too, before the attempt ends and its slot with it
-    // (M2T05R-101). A group that cannot be emptied keeps the attempt RUNNING and its slot held.
-    let (term, kill) = (common.settings.term_grace, common.settings.kill_grace);
-    let group = pin.clone();
-    let stopped = tokio::task::spawn_blocking(move || group.settle_group(term, kill))
-        .await
-        .map_err(|e| PersistError::Storage(format!("the group of {id}: {e}")))?;
-    if !stopped.reaped {
+    // Its leader ended: the attempt ends, and its slot with it, only if the executor emptied its group first
+    // (M2T05R-101, -202); else it stays RUNNING with its slot held, and a diagnostic says why.
+    if !outcome.group_gone {
         store
             .commit(Commit {
                 events: vec![NewEvent {
@@ -416,8 +401,8 @@ async fn attempt(
                     event_id: hoh_core::ids::child_id(&id, "runner/unreaped"),
                     run_id: Some(work.run_id.clone()),
                     kind: "runner.unreaped".to_owned(),
-                    payload: json!({"attempt_id": id, "steps": format!("{:?}", stopped.steps),
-                        "detail": "its leader ended but its process group could not be emptied; the attempt and its slot stay"}),
+                    payload: json!({"attempt_id": id, "detail":
+                        "its leader ended but its process group was not emptied; the attempt and its slot stay"}),
                 }],
                 ..Commit::default()
             })
@@ -473,8 +458,7 @@ async fn step(
 /// Settle `id`, which this host can no longer trust to end by itself: its lease expired (`lease_expired`), its
 /// executor lost its process (`executor_lost`), or its task failed (`runner_error`). Never judged ended by that alone
 /// (REQ-041 b4): its own task here is aborted and waited for first (so nothing else of this host writes for it,
-/// M2T05R-03), its row read again, its process inspected (held by its pidfd when this host started it), its native
-/// cancel sent, SIGTERM and SIGKILL to its group and the reap confirmed; then its disposition as at a reconcile,
+/// M2T05R-03), its row read again, its process inspected by its record, its native cancel sent, SIGTERM and SIGKILL to its group and the reap confirmed; then its disposition as at a reconcile,
 /// which lets its lease go only once it is ended. A process that may still run (outlived its stop, or cannot be told
 /// apart) moves nothing and keeps its slot; when that finding is `last`'s again, nothing is written again
 /// (M2T05R-157). The disposition applied, if any, with the finding.
@@ -485,9 +469,10 @@ async fn settle(
     cause: &'static str,
     last: Option<&str>,
 ) -> Result<Option<(Disposition, String)>, PersistError> {
-    let (work, task, pin) = match entry {
-        Some(Entry { work, task, pin }) => (Some(work), task, pin),
-        None => (None, None, None),
+    common.shared.hooks.runner(RunnerPoint::Settling);
+    let (work, task) = match entry {
+        Some(Entry { work, task }) => (Some(work), task),
+        None => (None, None),
     };
     if let Some(task) = task {
         task.abort();
@@ -504,9 +489,9 @@ async fn settle(
         return Ok(None);
     };
     let scanned = row.clone();
-    let seen = tokio::task::spawn_blocking(move || reconcile::inspect(&scanned, pin))
+    let seen = tokio::task::spawn_blocking(move || reconcile::inspect(&scanned))
         .await
-        .map_err(|e| PersistError::Storage(format!("the inspection of {id} ended: {e}")))??;
+        .map_err(|e| PersistError::Storage(format!("the inspection of {id} ended: {e}")))?;
     let finding = seen.json().to_string();
     if matches!(seen, reconcile::Seen::Uncertain(_)) && last == Some(finding.as_str()) {
         return Ok(Some((Disposition::Unreaped, finding)));

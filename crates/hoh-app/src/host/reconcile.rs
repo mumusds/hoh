@@ -22,6 +22,8 @@ pub struct ReconcileSettings {
     pub kill_grace: Duration,
     /// Where STARTED effects are looked for; the product's [`reconcile::NoObserver`] confirms nothing.
     pub observer: Arc<dyn Observer>,
+    /// How long the runner leaves a holder it could not confirm gone before it looks again (60 s).
+    pub retry: Duration,
 }
 
 impl Default for ReconcileSettings {
@@ -30,6 +32,7 @@ impl Default for ReconcileSettings {
             term_grace: Duration::from_secs(5),
             kill_grace: Duration::from_secs(5),
             observer: Arc::new(reconcile::NoObserver),
+            retry: Duration::from_secs(60),
         }
     }
 }
@@ -38,8 +41,6 @@ impl Default for ReconcileSettings {
 pub(super) enum Seen {
     /// PREPARED: no process was started.
     NotStarted,
-    /// Held by its pidfd since it was started (this host's runner): its group is its own.
-    Held(Arc<identity::Found>),
     /// Found by its whole recorded identity.
     Ours(identity::Found),
     /// Whether anything of it runs cannot be told: no signal, its slot kept.
@@ -53,7 +54,7 @@ impl Seen {
     pub(super) fn json(&self) -> serde_json::Value {
         match self {
             Seen::NotStarted => json!("not_started"),
-            Seen::Held(_) | Seen::Ours(_) => json!("ours"),
+            Seen::Ours(_) => json!("ours"),
             Seen::Uncertain(basis) => json!({"uncertain": basis}),
             Seen::Gone(basis) => json!({"gone": basis}),
         }
@@ -62,58 +63,46 @@ impl Seen {
     /// Whether it is a live process of the attempt (its native cancel may end it).
     pub(super) fn live(&self) -> bool {
         match self {
-            Seen::Held(found) => !found.gone(),
             Seen::Ours(found) => !found.exited(),
             _ => false,
         }
     }
 }
 
-/// Inspect `row`'s process (blocking; no signal). With `pin`, the process this host started and still holds; else
-/// its record: only a whole identity that matches is ours; a record with a pid but no boot or start time, a leader
-/// gone with members left in its group, and a RUNNING attempt with no record are uncertain (M2T05R-01, -02, -100).
-/// One mapping for the reconcile at a start and the runner's settle (M2T05R-151).
-pub(super) fn inspect(
-    row: &UnfinishedRow,
-    pin: Option<Arc<identity::Found>>,
-) -> Result<Seen, PersistError> {
+/// Inspect `row`'s process (blocking; no signal) by its record: only a whole identity that matches is ours; a record
+/// with a pid but no boot or start time, a leader gone with members left in its group (which may be another
+/// process's that reused its number), a RUNNING attempt with no record, and an inspection that fails are uncertain
+/// (M2T05R-01, -02, -100, -200). One mapping for the reconcile at a start and the runner's settle (M2T05R-151).
+pub(super) fn inspect(row: &UnfinishedRow) -> Seen {
     if row.state == AttemptState::Prepared {
-        return Ok(Seen::NotStarted);
-    }
-    if let Some(pin) = pin {
-        return Ok(Seen::Held(pin));
+        return Seen::NotStarted;
     }
     let found = identity::presence(
         row.pid,
         row.boot_id.as_deref(),
         row.process_start_id.as_deref(),
-    )
-    .map_err(|e| {
-        PersistError::Storage(format!(
-            "cannot look for the process of {}: {e}",
-            row.attempt_id
-        ))
-    })?;
-    Ok(match found {
-        Presence::Ours(found) => Seen::Ours(found),
-        Presence::Unverifiable => Seen::Uncertain("incomplete_process_record".to_owned()),
-        Presence::Leaderless(left) => Seen::Uncertain(format!(
+    );
+    match found {
+        Err(e) => Seen::Uncertain(format!("cannot_inspect: {e}")),
+        Ok(Presence::Ours(found)) => Seen::Ours(found),
+        Ok(Presence::Unverifiable) => Seen::Uncertain("incomplete_process_record".to_owned()),
+        Ok(Presence::Leaderless(left)) => Seen::Uncertain(format!(
             "leader_gone_{}_left_in_its_group",
             left.members.len()
         )),
-        Presence::Gone(Gone::NoPid) if row.state == AttemptState::Running => {
+        Ok(Presence::Gone(Gone::NoPid)) if row.state == AttemptState::Running => {
             Seen::Uncertain("running_without_a_process_record".to_owned())
         }
-        Presence::Gone(gone) => Seen::Gone(gone.basis().to_owned()),
-    })
+        Ok(Presence::Gone(gone)) => Seen::Gone(gone.basis().to_owned()),
+    }
 }
 
-/// End what `seen` found (blocking): a process of the attempt is stopped with its group and must be gone.
+/// End what `seen` found (blocking): a process of the attempt is stopped with its group and must be gone (a process
+/// that ended by itself gets no signal, M2T05R-259).
 pub(super) fn end(seen: Seen, settings: &ReconcileSettings) -> Process {
     match seen {
         Seen::NotStarted => Process::NotStarted,
-        Seen::Held(found) => stopped(&found.settle_group(settings.term_grace, settings.kill_grace)),
-        Seen::Ours(found) => stopped(&found.stop(settings.term_grace, settings.kill_grace)),
+        Seen::Ours(found) => stopped(&found.settle_group(settings.term_grace, settings.kill_grace)),
         Seen::Uncertain(basis) => Process::Uncertain { basis },
         Seen::Gone(basis) => Process::Gone { basis },
     }
@@ -121,7 +110,7 @@ pub(super) fn end(seen: Seen, settings: &ReconcileSettings) -> Process {
 
 /// What was found of `row`'s process at a host's start, and done to it (blocking).
 fn process_of(row: &UnfinishedRow, settings: &ReconcileSettings) -> Result<Process, PersistError> {
-    Ok(end(inspect(row, None)?, settings))
+    Ok(end(inspect(row), settings))
 }
 
 /// A stop as the reconcile records it.
