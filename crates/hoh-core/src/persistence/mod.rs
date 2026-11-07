@@ -635,11 +635,13 @@ impl Store {
         project_id: &str,
         host_epoch: i64,
         unfinished: usize,
+        clock_behind: std::time::Duration,
     ) -> Result<i64, PersistError> {
         self.reconcile_event(reconcile::ReconcileJob::Started {
             project_id: project_id.to_owned(),
             host_epoch,
             unfinished,
+            clock_behind_ms: u64::try_from(clock_behind.as_millis()).unwrap_or(u64::MAX),
         })
         .await
     }
@@ -1167,6 +1169,11 @@ impl Reader {
     /// How many repairs of `repair` run `run_id` was granted.
     pub fn repair_count(&self, run_id: &str, repair: &Repair) -> Result<u32, PersistError> {
         retry::repair_count(&self.conn, run_id, repair)
+    }
+
+    /// The latest time the store recorded, which a host starting on it reads no earlier than (ADR-020 decision 4).
+    pub fn latest_recorded(&self) -> Result<Option<std::time::SystemTime>, PersistError> {
+        reconcile::latest_recorded(&self.conn)
     }
 
     /// The attempt `attempt_id`, if it exists.

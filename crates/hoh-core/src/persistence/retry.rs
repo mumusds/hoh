@@ -199,37 +199,6 @@ pub(super) fn accrue_wall(
     Ok(())
 }
 
-/// The latest time an attempt's own host life recorded for it (M2T19R-200, ADR-020 decision 4): its start, the end
-/// its work recorded (`effect.observed`) and the last renewal of a lease it holds (its expiry less LEASE_TTL). One
-/// life's times agree with each other; a later life's can be behind them when the wall clock was set back across the
-/// restart, so an end or a running time a later life gives the attempt is taken no earlier than this.
-pub(super) fn recorded_until(
-    conn: &Connection,
-    attempt_id: &str,
-) -> Result<Option<SystemTime>, PersistError> {
-    let observed = child_id(&crate::reconcile::work_key(attempt_id), "effect.observed");
-    let recorded: Option<(Option<String>, Option<String>, Option<String>)> = conn
-        .query_row(
-            "SELECT a.started_at, \
-             (SELECT json_extract(e.payload_json, '$.detail.ended_at') FROM events e WHERE e.event_id = ?2), \
-             (SELECT max(l.expires_at) FROM leases l WHERE l.attempt_id = a.attempt_id) \
-             FROM attempts a WHERE a.attempt_id = ?1",
-            params![attempt_id, observed],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .optional()
-        .map_err(sqlite_error)?;
-    let Some((started, ended, expires)) = recorded else {
-        return Ok(None);
-    };
-    let parse = |t: Option<String>| t.as_deref().and_then(crate::time::parse_rfc3339);
-    let renewed = parse(expires).and_then(|t| t.checked_sub(super::LEASE_TTL));
-    Ok([parse(started), parse(ended), renewed]
-        .into_iter()
-        .flatten()
-        .max())
-}
-
 /// The run's budget at `now`: its run-scope rows and its deadline, the duration its unfinished attempts have run so
 /// far counted as reserved (M2T19R-02: a running attempt's time counts before it ends; settled into `used` when it
 /// does, so nothing is counted twice).
@@ -288,22 +257,17 @@ pub(super) fn load_budget(
     if let Some(wall) = &mut budget.wall_seconds {
         let mut statement = tx
             .prepare(
-                "SELECT a.attempt_id, a.started_at FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
-                 WHERE t.run_id = ?1 AND a.state IN ('STARTING', 'RUNNING') AND a.started_at IS NOT NULL",
+                "SELECT a.started_at FROM attempts a JOIN tasks t ON t.task_id = a.task_id WHERE t.run_id = ?1 \
+                 AND a.state IN ('STARTING', 'RUNNING') AND a.started_at IS NOT NULL",
             )
             .map_err(sqlite_error)?;
         let started = statement
-            .query_map(params![run_id], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })
-            .map_err(sqlite_error)?
-            .collect::<Result<Vec<_>, _>>()
+            .query_map(params![run_id], |r| r.get::<_, String>(0))
             .map_err(sqlite_error)?;
-        for (attempt_id, at) in started {
+        for at in started {
+            let at = at.map_err(sqlite_error)?;
             if let Some(since) = crate::time::parse_rfc3339(&at) {
-                // Not less than what its own life saw it run (an earlier life's attempt, M2T19R-200).
-                let until = recorded_until(tx, &attempt_id)?.map_or(now, |r| r.max(now));
-                wall.reserved += until.duration_since(since).map_or(0, |d| d.as_secs()) as f64;
+                wall.reserved += now.duration_since(since).map_or(0, |d| d.as_secs()) as f64;
             }
         }
     }

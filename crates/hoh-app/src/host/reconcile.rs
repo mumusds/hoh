@@ -148,10 +148,11 @@ pub(super) async fn run(
     settings: &ReconcileSettings,
     clock: &dyn hoh_core::delivery::Clock,
     jitter: &super::runner::Jitter,
+    clock_behind: std::time::Duration,
 ) -> Result<(), PersistError> {
     let rows = store.reconcile_scan(project_id, clock.now()).await?;
     store
-        .reconcile_started(project_id, host_epoch, rows.len())
+        .reconcile_started(project_id, host_epoch, rows.len(), clock_behind)
         .await?;
     let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
     for row in rows {

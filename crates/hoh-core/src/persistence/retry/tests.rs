@@ -795,124 +795,72 @@ async fn a_recorded_end_counts_only_once_its_work_was_committed() -> R {
     Ok(())
 }
 
-/// The reconcile at `at` of A1 (T1 RUNNING, started at 01:00:00 by an earlier host life) as Ended(FAILED), with
-/// `records` seeded: its ended_at, the run's used duration, T1's next_retry_at and the reconcile event's
-/// `clock_behind_ms`.
-async fn reconcile_a1_at(at: SystemTime, records: &str) -> R<(String, f64, String, Value)> {
-    use crate::reconcile::{Disposition, Process};
-    let dir = tempfile::tempdir()?;
-    let (store, path) = open(&dir)?;
-    Connection::open(&path)?.execute_batch(&format!(
-        "{WORLD}
-         UPDATE tasks SET state = 'RUNNING', revision = 3 WHERE task_id = 'T1';
-         INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, started_at) VALUES
-           ('A1', 'T1', 'RUNNING', 1, 1, 1, '2026-11-07T01:00:00Z');
-         INSERT INTO budgets(scope_kind, scope_id, kind, limit_value) VALUES ('run', 'R', 'wall_seconds', 5);
-         {records}"
-    ))?;
-    let rows = store.reconcile_scan("p1", at).await?;
-    let [row] = rows.as_slice() else {
-        return Err(format!("unfinished: {rows:?}").into());
-    };
-    store
-        .reconcile_apply(
-            row.clone(),
-            Disposition::Ended {
-                to: crate::lifecycle::AttemptState::Failed,
-                task_to: crate::protocol::TaskState::Ready,
-                effects: Vec::new(),
-            },
-            Process::Gone {
-                basis: "no_process".to_owned(),
-            },
-            "reconcile",
-            at,
-            0,
-        )
-        .await?;
-    let conn = Connection::open(&path)?;
-    let (ended, used, next): (String, f64, String) = conn.query_row(
-        "SELECT a.ended_at, b.used_value, t.next_retry_at FROM attempts a, budgets b, tasks t \
-         WHERE a.attempt_id = 'A1' AND b.kind = 'wall_seconds' AND t.task_id = 'T1'",
-        [],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-    )?;
-    let behind: String = conn.query_row(
-        "SELECT json_extract(payload_json, '$.clock_behind_ms') FROM events WHERE kind = 'reconcile.attempt'",
-        [],
-        |r| Ok(r.get::<_, Option<i64>>(0)?.map_or("null".to_owned(), |n| n.to_string())),
-    )?;
-    Ok((ended, used, next, serde_json::from_str(&behind)?))
-}
-
 #[tokio::test]
-async fn a_reconcile_after_the_wall_clock_was_set_back_ends_an_attempt_no_earlier_than_its_life_recorded()
+async fn the_latest_time_a_store_recorded_is_its_latest_commit_start_end_observed_end_or_lease_renewal()
 -> R {
-    // M2T19R-200 (ADR-020 decision 4, times across host lives): A1 ran from 01:00:00 by the earlier life's clock;
-    // the wall clock was set back before the restart, so the reconcile's time (00:02:00) is behind that. Its end is
-    // never before what its own life recorded, so the 5 s allowed are used and nothing more is dispatched; its retry
-    // counts from the reconcile's own time (00:02:00 + Retry-After 120 s), not an hour later.
-    let key = crate::reconcile::work_key("A1");
-    let observed = format!(
-        "INSERT INTO effects(effect_key, attempt_id, state) VALUES ('{key}', 'A1', 'OBSERVED');
-         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
-           ('p1', '{key}/effect.observed', 'R', 'effect.observed',
-            '{{\"effect_key\": \"{key}\", \"detail\": {{\"success\": false, \"detail\": \"HTTP 429\", \"class\": \"transient\", \"retry_after_ms\": 120000, \"ended_at\": \"2026-11-07T01:00:05Z\"}}}}',
-            '2026-11-07T01:00:05Z');"
-    );
-    let back = at("2026-11-07T00:02:00Z")?;
-    assert_eq!(
-        reconcile_a1_at(back, &observed).await?,
-        (
-            "2026-11-07T01:00:05Z".to_owned(),
-            5.0,
-            "2026-11-07T00:04:00Z".to_owned(),
-            json!(3_485_000)
-        ),
-        "its work's recorded end (OBSERVED, not COMMITTED)"
-    );
-    // Without a record of its end, the last renewal of its lease (expiry less LEASE_TTL) is what its life saw: 4 s.
-    let lease = "INSERT INTO leases(project_id, kind, attempt_id, epoch, expires_at) VALUES
-                   ('p1', 'reader-1', 'A1', 1, '2026-11-07T01:02:04Z');";
-    let (ended, used, _, behind) = reconcile_a1_at(back, lease).await?;
-    assert_eq!(
-        (ended.as_str(), used, behind),
-        ("2026-11-07T01:00:04Z", 4.0, json!(3_484_000)),
-        "its lease's last renewal"
-    );
-    // A reconcile not behind the record takes its own time as before and records nothing.
-    let (ended, used, _, behind) = reconcile_a1_at(at("2026-11-07T01:00:30Z")?, lease).await?;
-    assert_eq!(
-        (ended.as_str(), used, behind),
-        ("2026-11-07T01:00:30Z", 30.0, Value::Null)
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn an_earlier_lifes_unfinished_attempt_reserves_no_less_than_its_life_saw() -> R {
-    // M2T19R-200: T2's attempt, left unfinished by an earlier host life that renewed its lease at 01:00:50, has run
-    // for at least 50 s whatever the wall clock did since: with 40 s allowed nothing more is dispatched at 00:02:00
-    // (the clock set back), with 100 s allowed T1 is.
-    for (limit, dispatched) in [(40, 0), (100, 1)] {
+    // M2T19R-200, -300, -301 (ADR-020 decision 4): what a host starting on this store must not read earlier than:
+    // the latest of its events' commit times, its attempts' starts and ends, a work's recorded end and a lease's last
+    // renewal (its expiry less LEASE_TTL); a time it waits for (next_retry_at, an outbox retry) is no record.
+    let latest = |records: &'static str| async move {
         let dir = tempfile::tempdir()?;
         let (store, path) = open(&dir)?;
         Connection::open(&path)?.execute_batch(&format!(
             "{WORLD}
-             INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, created_seq, cost_estimate) VALUES
-               ('T2', 'R', 's1', 'RUNNING', 3, 'developer', 2, 1);
-             INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, started_at) VALUES
-               ('T2/attempt-1', 'T2', 'RUNNING', 1, 1, 1, '2026-11-07T01:00:00Z');
-             INSERT INTO leases(project_id, kind, attempt_id, epoch, expires_at) VALUES
-               ('p1', 'reader-1', 'T2/attempt-1', 1, '2026-11-07T01:02:50Z');
-             INSERT INTO budgets(scope_kind, scope_id, kind, limit_value) VALUES ('run', 'R', 'wall_seconds', {limit});"
+             UPDATE tasks SET next_retry_at = '2026-11-07T09:00:00Z', attempt_count = 1 WHERE task_id = 'T1';
+             {records}"
         ))?;
-        assert_eq!(
-            tick(&store, at("2026-11-07T00:02:00Z")?).await?.len(),
-            dispatched,
-            "{limit} s allowed"
-        );
-    }
+        let latest = store.reader()?.latest_recorded()?;
+        Ok::<_, Box<dyn std::error::Error>>(latest.map(rfc3339_utc))
+    };
+    let base = "INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, created_seq, cost_estimate) VALUES
+                  ('T2', 'R', 's1', 'RUNNING', 3, 'developer', 2, 1);";
+    assert_eq!(latest(base).await?, None, "no event, attempt or lease yet");
+    let event =
+        "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+                   ('p1', 'e1', 'R', 'run.started', '{}', '2026-11-07T01:00:00Z');";
+    assert_eq!(
+        latest(event).await?,
+        Some("2026-11-07T01:00:00Z".to_owned()),
+        "an event"
+    );
+    let attempts = "INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, created_seq, cost_estimate) VALUES
+                      ('T2', 'R', 's1', 'RUNNING', 3, 'developer', 2, 1);
+                    INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, started_at, ended_at) VALUES
+                      ('A1', 'T2', 'FAILED', 1, 1, 1, '2026-11-07T01:00:00Z', '2026-11-07T01:00:07Z'),
+                      ('A2', 'T2', 'RUNNING', 1, 1, 1, '2026-11-07T01:00:08Z', NULL);";
+    assert_eq!(
+        latest(attempts).await?,
+        Some("2026-11-07T01:00:08Z".to_owned()),
+        "a start"
+    );
+    let observed = "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+                      ('p1', 'A1/work/effect.observed', 'R', 'effect.observed',
+                       '{\"detail\": {\"success\": false, \"ended_at\": \"2026-11-07T01:00:09Z\"}}', '2026-11-07T00:59:00Z');";
+    assert_eq!(
+        latest(observed).await?,
+        Some("2026-11-07T01:00:09Z".to_owned()),
+        "a recorded end"
+    );
+    let lease = "INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, created_seq, cost_estimate) VALUES
+                   ('T2', 'R', 's1', 'RUNNING', 3, 'developer', 2, 1);
+                 INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision) VALUES
+                   ('A3', 'T2', 'PREPARED', 1, 1, 1);
+                 INSERT INTO leases(project_id, kind, attempt_id, epoch, expires_at) VALUES
+                   ('p1', 'writer', 'A3', 1, '2026-11-07T01:02:10Z');";
+    assert_eq!(
+        latest(lease).await?,
+        Some("2026-11-07T01:00:10Z".to_owned()),
+        "a lease's renewal"
+    );
+    let outbox = "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+                    ('p1', 'e2', 'R', 'run.started', '{}', '2026-11-07T00:30:00Z');
+                  INSERT INTO outbox(message_id, event_seq, run_id, recipient_role, payload_json, state, next_retry_at) VALUES
+                    ('m1', 1, 'R', 'commander', '{}', 'PENDING', '2026-11-07T08:00:00Z');";
+    assert_eq!(
+        latest(outbox).await?,
+        Some("2026-11-07T00:30:00Z".to_owned()),
+        "waits are no record"
+    );
     Ok(())
 }
 
