@@ -2204,9 +2204,10 @@ async fn a_claim_still_held_when_the_store_closes_is_undone_and_cannot_start() -
 
 #[tokio::test]
 async fn a_returned_claim_is_uncounted_even_when_an_earlier_delivery_was_acked_first() -> R {
-    // M2T04R-500: generation 1 is delivered but its answer is late; past its backoff generation 2 is claimed and
-    // returned unstarted; generation 1's answer then makes the row ACKED before the undo runs. The undo (by the next
-    // claim, or at close) must still take generation 2 back: one delivery, one count.
+    // M2T04R-500: generation 1 is delivered but its answer is late; past its backoff generation 2 is claimed. For C it
+    // is returned unstarted and then generation 1's answer makes the row ACKED before the next claim undoes it; for N
+    // the answer comes while its guard is still held, and the close undoes it (M2T04R-651). Either way generation 2 is
+    // taken back: one delivery, one count.
     let dir = tempfile::tempdir()?;
     let (store, db) = open(&dir)?;
     seed(&db, WORLD)?;
@@ -2243,28 +2244,7 @@ async fn a_returned_claim_is_uncounted_even_when_an_earlier_delivery_was_acked_f
                 .ok_or("not due again")?,
         );
     }
-    for row in &first {
-        store
-            .settle_outbox(
-                &row.message_id,
-                row.attempt_count,
-                hoh_core::persistence::Settlement::Delivered,
-                3,
-            )
-            .await?;
-    }
-    // The precondition: both rows ACKED while generation 2 is still counted.
-    assert_eq!(
-        rows(
-            &db,
-            "SELECT message_id, state, attempt_count FROM outbox WHERE message_id IN ('N', 'C') ORDER BY message_id"
-        )?,
-        [
-            [json!("C"), json!("ACKED"), json!(2)],
-            [json!("N"), json!("ACKED"), json!(2)]
-        ]
-    );
-    // Taken in message order: C, then N.
+    // Taken in message order: C, then N. C's claim is returned before the answers, N's is held through them.
     let close = held.pop().ok_or("no claim")?;
     let next = held.pop().ok_or("no claim")?;
     assert_eq!(
@@ -2275,6 +2255,27 @@ async fn a_returned_claim_is_uncounted_even_when_an_earlier_delivery_was_acked_f
         (Some("C"), Some("N"))
     );
     drop(next);
+    for row in &first {
+        store
+            .settle_outbox(
+                &row.message_id,
+                row.attempt_count,
+                hoh_core::persistence::Settlement::Delivered,
+                3,
+            )
+            .await?;
+    }
+    // The precondition: both rows ACKED while generation 2 is still counted (C's return not yet undone).
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT message_id, state, attempt_count FROM outbox WHERE message_id IN ('N', 'C') ORDER BY message_id"
+        )?,
+        [
+            [json!("C"), json!("ACKED"), json!(2)],
+            [json!("N"), json!("ACKED"), json!(2)]
+        ]
+    );
     assert!(store.claim_outbox(clock.now(), qa, 3).await?.is_none());
     assert_eq!(
         rows(
