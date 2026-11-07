@@ -20,6 +20,7 @@ fn task(id: &str, state: TaskState) -> TaskView {
         writer: true,
         dependencies: vec![("T0".to_owned(), TaskState::Accepted)],
         requirements: caps(&["REQ-1"]),
+        retry_at: None,
     }
 }
 
@@ -98,6 +99,27 @@ fn a_dispatch_whose_lease_is_held_is_refused_last() {
     held.budget_headroom = Some(0);
     let rejection = validate(&dispatch_t1(), &held).expect_err("dispatched over budget");
     assert_eq!(rejection.reason, RejectionReason::BudgetNotReservable);
+}
+
+#[test]
+fn a_task_waiting_for_its_retry_is_not_dispatched_before_it() {
+    // REQ-042 behaviour 2, CR-009: a READY task whose next_retry_at is still ahead is refused, before its lease is
+    // looked at; once due (no retry_at), it is dispatched.
+    let mut waiting = snapshot();
+    if let Some(t) = &mut waiting.task {
+        t.retry_at = Some("2026-11-07T00:02:41Z".to_owned());
+    }
+    let rejection = validate(&dispatch_t1(), &waiting).expect_err("dispatched before its retry");
+    assert_eq!(rejection.reason, RejectionReason::RetryNotDue);
+    assert!(
+        rejection.detail.contains("2026-11-07T00:02:41Z"),
+        "{}",
+        rejection.detail
+    );
+    waiting.free_slot = None;
+    let rejection = validate(&dispatch_t1(), &waiting).expect_err("dispatched without a lease");
+    assert_eq!(rejection.reason, RejectionReason::RetryNotDue);
+    assert!(validate(&dispatch_t1(), &snapshot()).is_ok());
 }
 
 #[test]

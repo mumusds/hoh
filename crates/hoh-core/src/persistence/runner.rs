@@ -60,6 +60,8 @@ pub(super) enum RunnerJob {
         attempt_id: String,
         ending: Box<Ending>,
     },
+    /// One more repair, or its refusal for a decision (ADR-020 decision 10).
+    Repair(Box<super::retry::RepairRequest>),
     /// One look at a run as a whole (ADR-020 decisions 4, 5 and 7).
     Pace {
         run_id: String,
@@ -79,6 +81,7 @@ pub(super) enum RunnerDone {
     /// How many leases were renewed.
     Renewed(usize),
     Paced(super::retry::Paced),
+    Repair(super::retry::RepairVerdict),
 }
 
 /// How an attempt ended, as the runner reports it (ADR-020 decisions 1 and 3).
@@ -114,6 +117,9 @@ pub(super) fn run(
         }
         RunnerJob::Finished { attempt_id, ending } => {
             finished(conn, &attempt_id, &ending, ctx).map(RunnerDone::Applied)
+        }
+        RunnerJob::Repair(request) => {
+            super::retry::request_repair(conn, &request, ctx).map(RunnerDone::Repair)
         }
         RunnerJob::Pace { run_id, context } => {
             super::retry::pace(conn, &run_id, &context, ctx).map(RunnerDone::Paced)

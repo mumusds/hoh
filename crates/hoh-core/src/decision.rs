@@ -181,6 +181,9 @@ pub struct TaskView {
     pub dependencies: Vec<(String, TaskState)>,
     /// The task's requirements under the run's current specification.
     pub requirements: BTreeSet<String>,
+    /// Its persisted `next_retry_at` while it is still ahead of the decision's time (REQ-042 behaviour 2); `None` when
+    /// it is due or has no retry.
+    pub retry_at: Option<String>,
 }
 
 /// The binding of the role a dispatch goes to.
@@ -434,6 +437,12 @@ fn dispatch(snapshot: &Snapshot, task_id: &str, role: &str) -> Result<Effect, Re
     }
     dependencies_accepted(task)?;
     table(task.state, TaskState::Leased)?;
+    if let Some(next) = &task.retry_at {
+        return reject(
+            RetryNotDue,
+            format!("{task_id} waits for its retry at {next}"),
+        );
+    }
     let binding = match &snapshot.target {
         Some(binding) if binding.active => binding,
         _ => {
