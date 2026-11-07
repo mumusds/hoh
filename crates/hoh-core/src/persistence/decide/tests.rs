@@ -898,6 +898,44 @@ async fn a_commander_dispatch_is_refused_once_the_runs_budget_stops_it() -> R {
 }
 
 #[tokio::test]
+async fn a_commander_dispatch_is_refused_by_the_deadline_on_the_wall_clock() -> R {
+    // M2T19R-251: the decide path judges deadline_at by the wall clock, not the timers' clock: with the timers before
+    // the deadline and the wall clock past it the dispatch is refused.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    seed(&path, WORLD)?;
+    seed(
+        &path,
+        "UPDATE runs SET deadline_at = '2026-11-07T00:01:00Z' WHERE run_id = 'R';",
+    )?;
+    let mut commander = FakeCommander {
+        sent: 0,
+        candidate: None,
+    };
+    let context = Context {
+        now: crate::time::parse_rfc3339("2026-11-07T00:00:30Z"),
+        wall: crate::time::parse_rfc3339("2026-11-07T00:05:00Z"),
+        ..context()
+    };
+    let decided = store
+        .decide(
+            commander.decide(
+                3,
+                7,
+                json!({"kind": "dispatch", "task_id": "T1", "role": "developer"}),
+            ),
+            context,
+        )
+        .await?;
+    let Decided::Rejected { reason, detail, .. } = decided else {
+        return Err(format!("dispatched: {decided:?}").into());
+    };
+    assert_eq!(reason, RejectionReason::BudgetNotReservable);
+    assert!(detail.contains("deadline_at"), "{detail}");
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_commander_dispatch_before_the_tasks_retry_is_refused() -> R {
     // REQ-042 behaviour 2, CR-009: the decide path reads the task's persisted next_retry_at; while it is ahead of
     // the decision's time the dispatch is RETRY_NOT_DUE, at it the dispatch goes.

@@ -642,3 +642,46 @@ async fn the_runner_judges_a_deadline_by_the_wall_clock() -> R {
     drop(executor);
     Ok(())
 }
+
+/// M2T19R-252: the runner's timers read the host clock's `now`, never its wall clock: Td waits for a retry an hour
+/// ahead of the timers and an hour behind the wall clock, so Rd parks (WAITING_EXTERNAL) with no attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_runner_waits_for_a_retry_by_its_timers_and_not_the_wall_clock() -> R {
+    let dir = tempfile::tempdir()?;
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    Host::start(config(&project)).await?.shutdown().await;
+    let retry = hoh_core::time::rfc3339_utc(SystemTime::now() + Duration::from_secs(3_600));
+    seed(
+        &project,
+        &format!(
+            "{COST_WORLD}
+             DELETE FROM budgets; DELETE FROM tasks WHERE task_id = 'Tc'; DELETE FROM role_bindings WHERE run_id = 'Rc';
+             DELETE FROM runs WHERE run_id = 'Rc';
+             UPDATE tasks SET attempt_count = 1, next_retry_at = '{retry}' WHERE task_id = 'Td';"
+        ),
+    )?;
+    let executor = Arc::new(Scripted {
+        script: [("Td".to_owned(), None)].into(),
+        started: Arc::new(std::sync::Mutex::new(Vec::new())),
+    });
+    let mut config = config(&project);
+    config.clock = hoh_app::host::HostClock(Arc::new(WallAhead));
+    config.runner = Some(hoh_app::host::RunnerConfig {
+        executor: executor.clone(),
+        context: context(),
+    });
+    let host = Host::start(config).await?;
+    let db = db(&project);
+    let end = Instant::now() + Duration::from_secs(20);
+    while query(&db, "SELECT state FROM runs WHERE run_id = 'Rd'")? != "WAITING_EXTERNAL" {
+        if Instant::now() > end {
+            return Err("Rd did not park".into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(query(&db, "SELECT count(*) FROM attempts")?, "0");
+    host.shutdown().await;
+    drop(executor);
+    Ok(())
+}
