@@ -1562,3 +1562,40 @@ async fn an_attempt_left_unfinished_is_disposed_of_again_with_events_of_its_own(
     assert_eq!(n, 2);
     Ok(())
 }
+
+#[tokio::test]
+async fn a_renewal_extends_only_leases_that_are_still_unexpired() -> R {
+    // REQ-041 (renewed every 30 s for 120 s), ADR-019 decision 7: an expired lease is the runner's to settle, never
+    // revived by a renewal.
+    let dir = tempfile::tempdir()?;
+    let path = db_in(&dir);
+    let store = Store::open(&path, test_options())?;
+    seed(&path)?;
+    Connection::open(&path)?.execute_batch(
+        "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', 'p1', printf('%064d', 1), 1);
+         INSERT INTO tasks(task_id, run_id, spec_id, state, role, created_seq) VALUES
+           ('t1', 'r1', 's1', 'RUNNING', 'developer', 1), ('t2', 'r1', 's1', 'RUNNING', 'developer', 2);
+         INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision) VALUES
+           ('a1', 't1', 'RUNNING', 1, 1, 1), ('a2', 't2', 'RUNNING', 1, 1, 1);
+         INSERT INTO leases(project_id, kind, attempt_id, epoch, expires_at) VALUES
+           ('p1', 'reader-1', 'a1', 1, '2026-11-07T00:02:00Z'), ('p1', 'reader-2', 'a2', 1, '2026-11-07T00:00:30Z');",
+    )?;
+    let now = crate::time::parse_rfc3339("2026-11-07T00:01:00Z").ok_or("a time")?;
+    let renewed = store
+        .renew_leases(vec!["a1".to_owned(), "a2".to_owned()], now)
+        .await?;
+    assert_eq!(renewed, 1);
+    let conn = Connection::open(&path)?;
+    let leases: Vec<(String, String)> = conn
+        .prepare("SELECT attempt_id, expires_at FROM leases ORDER BY attempt_id")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    assert_eq!(
+        leases,
+        [
+            ("a1".to_owned(), "2026-11-07T00:03:00Z".to_owned()),
+            ("a2".to_owned(), "2026-11-07T00:00:30Z".to_owned())
+        ]
+    );
+    Ok(())
+}
