@@ -566,3 +566,72 @@ async fn test_043_04_pause_and_cancel_take_effect_with_the_commander_down() -> R
     host.shutdown().await;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancel_also_ends_a_descendant_that_left_the_agents_process_group() -> R {
+    // REQ-043 decision 3 (docs/adr/ADR-021.md decision 8d), no TEST id: a group signal misses a descendant that took a
+    // session of its own (setsid); found under the leader and pinned by a pidfd, it is signalled too, and the run is
+    // CANCELLED only once it is gone.
+    let dir = tempfile::tempdir()?;
+    let escaped = dir.path().join("escaped.pid");
+    let script = format!(
+        "setsid sleep 60 & echo $! > {}; sleep 60",
+        escaped.display()
+    );
+    let agents = Arc::new(Agents::new(&[("T1", script.as_str())]));
+    let _leaders = Leaders(agents.leaders.clone());
+    let (project, host) = host(dir.path(), &agents).await?;
+    until(
+        &project,
+        "SELECT state FROM attempts WHERE task_id = 'T1'",
+        "RUNNING",
+        Duration::from_secs(10),
+    )
+    .await?;
+    let end = Instant::now() + Duration::from_secs(10);
+    let pid: u32 = loop {
+        if let Ok(text) = std::fs::read_to_string(&escaped)
+            && let Ok(pid) = text.trim().parse()
+        {
+            break pid;
+        }
+        if Instant::now() > end {
+            return Err("the descendant did not start".into());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    // It left the agent's group.
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let leader: u32 = query(&project, "SELECT pid FROM attempts WHERE task_id = 'T1'")?.parse()?;
+    let pgrp: u32 = stat
+        .rsplit_once(") ")
+        .ok_or("stat")?
+        .1
+        .split(' ')
+        .nth(2)
+        .ok_or("pgrp")?
+        .parse()?;
+    assert_ne!(pgrp, leader);
+    let (status, _) = command(&host, &control(&project, "CancelRun", "cancel")?).await?;
+    assert_eq!(status, 202);
+    until(
+        &project,
+        "SELECT state FROM runs WHERE run_id = 'R'",
+        "CANCELLED",
+        Duration::from_secs(30),
+    )
+    .await?;
+    // Gone, or at most a zombie its new parent has not reaped yet.
+    let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|s| {
+            s.rsplit_once(") ")
+                .map(|(_, rest)| rest.chars().next().unwrap_or('?'))
+        });
+    assert!(
+        matches!(state, None | Some('Z')),
+        "the escaped descendant lives: {state:?}"
+    );
+    host.shutdown().await;
+    Ok(())
+}

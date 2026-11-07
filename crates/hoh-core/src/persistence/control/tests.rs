@@ -543,3 +543,121 @@ async fn a_pause_waits_for_its_safe_point_and_withdraws_dispatches_not_yet_taken
     );
     Ok(())
 }
+
+/// Processes whose group cannot be told apart: no signal may go (ADR-019 decision 8).
+struct LostTrack;
+
+impl ProcessControl for LostTrack {
+    fn look(&mut self) -> Look {
+        Look::Lost
+    }
+    fn send(&mut self, _signal: Signal) -> bool {
+        false
+    }
+}
+
+impl Processes for LostTrack {
+    fn control(&self, _attempt: &AttemptRow) -> Option<(Box<dyn ProcessControl + Send>, bool)> {
+        Some((Box::new(LostTrack), false))
+    }
+    fn workspace(&self) -> Value {
+        json!({})
+    }
+}
+
+#[tokio::test]
+async fn a_group_lost_track_of_keeps_the_run_cancelling_and_is_recorded_once() -> R {
+    // ADR-021 decision 8c: a lost group gets no signal and the run stays CANCEL_REQUESTED; the same finding is not
+    // written again at every step.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(WORLD)?;
+    store.submit_command(cancel_run(1)).await?;
+    let clock: Arc<dyn Clock> = Arc::new(FakeClock(Mutex::new(Duration::ZERO)));
+    let wait: Arc<dyn Fn(Duration) + Send + Sync> = Arc::new(|_| {});
+    let canceller = Canceller::new(GRACES, Duration::from_secs(1));
+    for _ in 0..3 {
+        let step = canceller
+            .step(&store, "R", &LostTrack, clock.clone(), wait.clone())
+            .await?;
+        assert_eq!(step, Finished::Running(1));
+    }
+    assert_eq!(
+        count(
+            &path,
+            "SELECT count(*) FROM events WHERE kind = 'cancel.lost'"
+        )?,
+        1
+    );
+    assert_eq!(
+        count(
+            &path,
+            "SELECT count(*) FROM events WHERE kind LIKE 'cancel.sig%'"
+        )?,
+        0
+    );
+    assert_eq!(run_state(&path)?.0, "CANCEL_REQUESTED");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_cancelled_attempt_ends_cancelled_however_its_runner_or_a_reconcile_ends_it() -> R {
+    // ADR-021 decision 8e: an attempt of a cancelled run ends CANCELLED, not counted and with no retry, whether its
+    // runner saw its process fail or a later host's reconcile disposes of it.
+    use crate::reconcile::{Disposition, Process};
+    for by_reconcile in [false, true] {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = open(&dir)?;
+        Connection::open(&path)?.execute_batch(WORLD)?;
+        store.submit_command(cancel_run(1)).await?;
+        let at = parse_rfc3339("2026-11-07T00:00:05Z").ok_or("time")?;
+        if by_reconcile {
+            let rows = store.reconcile_scan("p1", at).await?;
+            let [row] = rows.as_slice() else {
+                return Err(format!("unfinished: {rows:?}").into());
+            };
+            assert!(row.cancel_requested);
+            store
+                .reconcile_apply(
+                    row.clone(),
+                    Disposition::Ended {
+                        to: crate::lifecycle::AttemptState::Failed,
+                        task_to: crate::protocol::TaskState::Ready,
+                        effects: Vec::new(),
+                    },
+                    Process::Gone {
+                        basis: "no_process".to_owned(),
+                    },
+                    "reconcile",
+                    at,
+                    0,
+                )
+                .await?;
+        } else {
+            store
+                .runner_finished(
+                    "A1",
+                    crate::persistence::Ending {
+                        success: false,
+                        detail: "exit 1".to_owned(),
+                        class: crate::retry::FailureClass::Transient { retry_after: None },
+                        at,
+                        draw: 0,
+                    },
+                )
+                .await?;
+        }
+        let row: (String, String, i64, Option<String>) = Connection::open(&path)?.query_row(
+            "SELECT a.state, t.state, t.attempt_count, t.next_retry_at FROM attempts a, tasks t \
+             WHERE a.attempt_id = 'A1' AND t.task_id = 'T1'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?;
+        assert_eq!(
+            row,
+            ("CANCELLED".to_owned(), "RUNNING".to_owned(), 0, None),
+            "by the reconcile: {by_reconcile}"
+        );
+    }
+    Ok(())
+}

@@ -535,11 +535,12 @@ async fn submit_command(
             Some("CANCEL_REQUESTED"),
             json!({"state": "CANCEL_REQUESTED", "reason": reason.reason}),
         ),
+        // No notice: nothing waits for a resume but the rounds, which follow the run's state.
         CommandBody::ResumeRun(reason) => (
             "ResumeRun",
             RunTarget::Resume,
             "run.resumed",
-            Some("RESUMED"),
+            None,
             json!({"reason": reason.reason}),
         ),
         _ => {
