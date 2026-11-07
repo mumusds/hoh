@@ -267,8 +267,9 @@ fn test_003_02_undefined_commands_and_combinations_are_usage_errors_without_side
 fn valid_commands_that_are_not_built_yet_say_so_and_exit_3() -> R {
     let env = Env::new()?;
     // Bare `hoh` is built (M1-T08): without a terminal it is a usage error, tests/tui.rs (TEST-001-03); `hoh doctor`
-    // is built (M1-T07), tests/doctor.rs (TEST-006-01/02).
-    for args in [&["-p", "x"][..], &["attach"], &["web"]] {
+    // is built (M1-T07), tests/doctor.rs (TEST-006-01/02); `hoh attach` and `hoh -p --detach` are built (M2-T06),
+    // tests/attach.rs and the test below. A foreground `hoh -p` comes with M2-T13.
+    for args in [&["-p", "x"][..], &["web"]] {
         let out = env.hoh(args)?;
         assert_eq!(
             out.status.code(),
@@ -278,6 +279,25 @@ fn valid_commands_that_are_not_built_yet_say_so_and_exit_3() -> R {
         assert!(out.stdout.is_empty(), "stdout is reserved for results");
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(stderr.contains("NOT_IMPLEMENTED"), "{args:?}: {stderr}");
+    }
+    assert!(!env.project.path().join(".hoh").exists());
+    Ok(())
+}
+
+#[test]
+fn attach_in_a_project_with_no_runs_is_a_usage_error_that_starts_and_makes_nothing() -> R {
+    // REQ-005 failure mode 2 (docs/adr/ADR-021.md decision 6): with no database there is no run; nothing is started
+    // or created for none, with or without a run id.
+    let env = Env::new()?;
+    for (args, says) in [
+        (&["attach"][..], "没有可附着的 Run"),
+        (&["attach", "r1"], "RUN_NOT_FOUND"),
+    ] {
+        let out = env.hoh(args)?;
+        assert_eq!(out.status.code(), Some(64), "{args:?}");
+        assert!(out.stdout.is_empty(), "{args:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(says), "{args:?}: {stderr}");
     }
     assert!(!env.project.path().join(".hoh").exists());
     Ok(())
@@ -306,7 +326,7 @@ fn help_does_not_skip_the_project_check_or_the_version_rule() -> R {
 #[test]
 fn the_exit_code_holds_when_stderr_cannot_be_written() -> R {
     let env = Env::new()?;
-    for (args, code) in [(&["--no-such-flag"][..], 64), (&["attach"], 3)] {
+    for (args, code) in [(&["--no-such-flag"][..], 64), (&["web"], 3)] {
         let out = Command::new(env!("CARGO_BIN_EXE_hoh"))
             .args(args)
             .current_dir(env.project.path())
