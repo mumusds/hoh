@@ -6,7 +6,7 @@ use crate::persistence::{ConsumeEffect, OutboxRow, PersistError, Settlement, Sto
 use crate::protocol::{self, Message};
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 /// Where the time comes from.
 pub trait Clock: Send + Sync {
@@ -21,13 +21,23 @@ pub trait Clock: Send + Sync {
 }
 
 /// The product host's clock (REQ-042 behaviour 2, docs/adr/ADR-020.md decision 4): the system time when it was made,
-/// moved on by the monotonic clock, so a step of the system clock while the host runs neither hastens nor delays a
-/// wait; a host started again anchors anew from the system time, so a persisted UTC time is judged afresh. Absolute
-/// deadlines follow the system clock ([`Clock::wall`]).
+/// moved on by the boot clock (CLOCK_BOOTTIME: monotonic, and counting a suspend, unlike CLOCK_MONOTONIC, so its
+/// time stays the real one across a suspend, M2T19R-100), so a step of the system clock while the host runs neither
+/// hastens nor delays a wait; a host started again anchors anew from the system time, so a persisted UTC time is
+/// judged afresh. Absolute deadlines follow the system clock ([`Clock::wall`]).
 #[derive(Debug, Clone, Copy)]
 pub struct MonotonicClock {
     anchor: SystemTime,
-    started: std::time::Instant,
+    started: Duration,
+}
+
+/// The boot clock's time since boot.
+fn boot_time() -> Duration {
+    let t = rustix::time::clock_gettime(rustix::time::ClockId::Boottime);
+    Duration::new(
+        u64::try_from(t.tv_sec).unwrap_or(0),
+        u32::try_from(t.tv_nsec).unwrap_or(0),
+    )
 }
 
 impl MonotonicClock {
@@ -39,7 +49,7 @@ impl MonotonicClock {
     pub fn anchored(anchor: SystemTime) -> MonotonicClock {
         MonotonicClock {
             anchor,
-            started: std::time::Instant::now(),
+            started: boot_time(),
         }
     }
 }
@@ -52,7 +62,7 @@ impl Default for MonotonicClock {
 
 impl Clock for MonotonicClock {
     fn now(&self) -> SystemTime {
-        self.anchor + self.started.elapsed()
+        self.anchor + boot_time().saturating_sub(self.started)
     }
 
     fn wall(&self) -> SystemTime {
@@ -242,7 +252,7 @@ impl<C: Clock, T: Transport> Dispatcher<'_, C, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, UNIX_EPOCH};
+    use std::time::UNIX_EPOCH;
 
     #[test]
     fn the_hosts_clock_moves_on_monotonically_from_its_anchor_and_not_with_the_system_time() {

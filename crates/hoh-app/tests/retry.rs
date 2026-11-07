@@ -479,14 +479,20 @@ async fn test_042_06_a_cost_limit_with_an_unknown_price_blocks_before_any_dispat
         cost("Rc")?,
         json!({"cost_usd": null, "cost_status": "unknown"})
     );
-    // Rc's final JSON result (it is BLOCKED, a state that ends a client), encoded against the schema (M2T19R-62):
-    // its cost null and unknown.
+    // A schema check of Rc's final JSON result (M2-T13 outputs it): built here from its runs row and its cost
+    // projection, encoded against the schema, the cost null and unknown (M2T19R-62, -158).
     let (cost_usd, cost_status) = reader.run_cost("Rc")?;
     let result = hoh_core::protocol::encode(&hoh_core::protocol::RunResult {
         run_id: "Rc".to_owned(),
-        state: hoh_core::protocol::RunState::Blocked,
+        state: match query(&db, "SELECT state FROM runs WHERE run_id = 'Rc'")?.as_str() {
+            "BLOCKED" => hoh_core::protocol::RunState::Blocked,
+            other => return Err(format!("Rc is {other}").into()),
+        },
         exit_code: 3,
-        blocked_reason: Some(hoh_core::protocol::BlockedReason::BudgetUnenforceable),
+        blocked_reason: hoh_core::protocol::BlockedReason::parse(&query(
+            &db,
+            "SELECT blocked_reason FROM runs WHERE run_id = 'Rc'",
+        )?),
         spec_revision: Some(1),
         accepted: 0,
         total: 0,
@@ -509,7 +515,7 @@ async fn test_042_06_a_cost_limit_with_an_unknown_price_blocks_before_any_dispat
             "runs": rows(&db, "SELECT run_id, state, blocked_reason FROM runs ORDER BY run_id")?,
             "attempts": rows(&db, "SELECT attempt_id, task_id, state, cost_usd FROM attempts ORDER BY rowid")?,
             "cost": {"Rc": cost("Rc")?, "Rd": cost("Rd")?},
-            "rc_run_result": result,
+            "rc_run_result_schema_check": result,
         }),
     )?;
     host.shutdown().await;
@@ -561,6 +567,63 @@ async fn a_round_after_the_deadline_dispatches_nothing_however_its_tick_began() 
         clock,
         std::sync::atomic::AtomicBool::new(false),
     ));
+    config.runner = Some(hoh_app::host::RunnerConfig {
+        executor: executor.clone(),
+        context: context(),
+    });
+    let host = Host::start(config).await?;
+    let db = db(&project);
+    let end = Instant::now() + Duration::from_secs(20);
+    while query(&db, "SELECT state FROM runs WHERE run_id = 'Rd'")? != "INCOMPLETE" {
+        if Instant::now() > end {
+            return Err("Rd did not end INCOMPLETE".into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(query(&db, "SELECT count(*) FROM attempts")?, "0");
+    host.shutdown().await;
+    drop(executor);
+    Ok(())
+}
+
+/// Timers at the system time, the wall clock two hours ahead of it.
+#[derive(Debug, Default)]
+struct WallAhead;
+
+impl hoh_core::delivery::Clock for WallAhead {
+    fn now(&self) -> SystemTime {
+        SystemTime::now()
+    }
+
+    fn wall(&self) -> SystemTime {
+        SystemTime::now() + Duration::from_secs(7_200)
+    }
+}
+
+/// M2T19R-151: the runner judges an absolute deadline by its clock's wall time: an hour ahead by its timers, already
+/// past by the wall, so nothing is dispatched and the run ends INCOMPLETE.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_runner_judges_a_deadline_by_the_wall_clock() -> R {
+    let dir = tempfile::tempdir()?;
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    Host::start(config(&project)).await?.shutdown().await;
+    let deadline = hoh_core::time::rfc3339_utc(SystemTime::now() + Duration::from_secs(3_600));
+    seed(
+        &project,
+        &format!(
+            "{COST_WORLD}
+             DELETE FROM budgets; DELETE FROM tasks WHERE task_id = 'Tc'; DELETE FROM role_bindings WHERE run_id = 'Rc';
+             DELETE FROM runs WHERE run_id = 'Rc';
+             UPDATE runs SET deadline_at = '{deadline}' WHERE run_id = 'Rd';"
+        ),
+    )?;
+    let executor = Arc::new(Scripted {
+        script: [("Td".to_owned(), None)].into(),
+        started: Arc::new(std::sync::Mutex::new(Vec::new())),
+    });
+    let mut config = config(&project);
+    config.clock = hoh_app::host::HostClock(Arc::new(WallAhead));
     config.runner = Some(hoh_app::host::RunnerConfig {
         executor: executor.clone(),
         context: context(),

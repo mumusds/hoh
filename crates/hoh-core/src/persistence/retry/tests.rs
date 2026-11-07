@@ -694,3 +694,103 @@ async fn a_blocked_run_is_named_by_its_first_reason_and_waits_behind_a_blocked_d
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn an_ended_attempts_time_is_counted_once() -> R {
+    // M2T19R-152: an ended attempt's time is in `used`, never reserved again: 50 of 60 s used by an attempt that
+    // started 100 s ago and ended, and another task is still dispatched.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(&format!(
+        "{WORLD}
+         INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, created_seq, cost_estimate) VALUES
+           ('T2', 'R', 's1', 'IMPLEMENTED', 3, 'developer', 2, 1);
+         INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, started_at, ended_at) VALUES
+           ('T2/attempt-1', 'T2', 'SETTLED', 1, 1, 1, '2026-11-07T00:00:00Z', '2026-11-07T00:00:50Z');
+         INSERT INTO budgets(scope_kind, scope_id, kind, limit_value, used_value) VALUES ('run', 'R', 'wall_seconds', 60, 50);"
+    ))?;
+    assert_eq!(tick(&store, at("2026-11-07T00:01:40Z")?).await?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_parked_run_left_with_nothing_to_wait_for_or_blocked_works_again() -> R {
+    // M2T19R-153: the other half of M2T19R-05: its last waiting task cancelled, nothing blocked, the parked run goes
+    // back to its state (its resume naming no due task).
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(&format!(
+        "{WORLD}
+         UPDATE tasks SET attempt_count = 1, next_retry_at = '2026-11-07T00:01:00Z' WHERE task_id = 'T1';"
+    ))?;
+    store
+        .pace_run("R", context(at("2026-11-07T00:00:10Z")?))
+        .await?;
+    assert_eq!(run_state(&path)?, "WAITING_EXTERNAL");
+    Connection::open(&path)?.execute_batch(
+        "UPDATE tasks SET state = 'CANCELLED', next_retry_at = NULL, revision = revision + 1 WHERE task_id = 'T1';",
+    )?;
+    store
+        .pace_run("R", context(at("2026-11-07T00:00:20Z")?))
+        .await?;
+    assert_eq!(run_state(&path)?, "RUNNING");
+    let due: String = Connection::open(&path)?.query_row(
+        "SELECT json_extract(payload_json, '$.due') FROM events WHERE kind = 'run.resumed'",
+        [],
+        |r| r.get(0),
+    )?;
+    assert_eq!(due, "[]");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_recorded_end_counts_only_once_its_work_was_committed() -> R {
+    // M2T19R-155: OBSERVED but not COMMITTED (its group not yet seen empty) is no end of the work: the reconcile
+    // takes its own time for the end, the duration and the retry.
+    use crate::reconcile::{Disposition, Process};
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    let key = crate::reconcile::work_key("A1");
+    Connection::open(&path)?.execute_batch(&format!(
+        "{WORLD}
+         UPDATE tasks SET state = 'RUNNING', revision = 3 WHERE task_id = 'T1';
+         INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, started_at) VALUES
+           ('A1', 'T1', 'RUNNING', 1, 1, 1, '2026-11-07T00:00:00Z');
+         INSERT INTO effects(effect_key, attempt_id, state) VALUES ('{key}', 'A1', 'OBSERVED');
+         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+           ('p1', '{key}/effect.observed', 'R', 'effect.observed',
+            '{{\"effect_key\": \"{key}\", \"detail\": {{\"success\": false, \"detail\": \"HTTP 429\", \"class\": \"transient\", \"retry_after_ms\": 120000, \"ended_at\": \"2026-11-07T00:00:05Z\"}}}}',
+            '2026-11-07T00:00:05Z');"
+    ))?;
+    let at = at("2026-11-07T00:02:00Z")?;
+    let rows = store.reconcile_scan("p1", at).await?;
+    let [row] = rows.as_slice() else {
+        return Err(format!("unfinished: {rows:?}").into());
+    };
+    store
+        .reconcile_apply(
+            row.clone(),
+            Disposition::Ended {
+                to: crate::lifecycle::AttemptState::Failed,
+                task_to: crate::protocol::TaskState::Ready,
+                effects: Vec::new(),
+            },
+            Process::Gone {
+                basis: "no_process".to_owned(),
+            },
+            "reconcile",
+            at,
+            0,
+        )
+        .await?;
+    let (ended, next): (String, String) = Connection::open(&path)?.query_row(
+        "SELECT a.ended_at, t.next_retry_at FROM attempts a, tasks t WHERE a.attempt_id = 'A1' AND t.task_id = 'T1'",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    assert_eq!(
+        (ended.as_str(), next.as_str()),
+        ("2026-11-07T00:02:00Z", "2026-11-07T00:04:00Z")
+    );
+    Ok(())
+}
