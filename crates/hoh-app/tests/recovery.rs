@@ -1838,7 +1838,8 @@ async fn a_lost_completion_is_settled_never_run_again() -> R {
     Ok(())
 }
 
-/// Fails the commit of the `0`th Commit request after it is armed (M2T05R-06: a settle cut short between its steps).
+/// Fails the commit of the `nth` plain Commit request (counted from 1) after it is armed (M2T05R-06: a settle whose
+/// steps cannot be written).
 #[derive(Debug, Default)]
 struct FailNthCommit {
     armed: std::sync::atomic::AtomicBool,
@@ -1871,74 +1872,79 @@ impl FaultHooks for FailNthCommit {
     }
 }
 
-/// M2T05R-06, -452: A1's lease expires and the commit of its settle's steps fails, so that pass leaves no record (its
-/// stop was done). The next tick settles it again with event ids of its own pass, finds its process gone and ends the
-/// chain: T2 is granted epoch 5, and the one pass recorded says what it found.
+/// M2T05R-06, -452, -552: A1's lease expires and the `nth` commit after that fails. A pass's steps are one commit, so
+/// whichever fails, one pass is recorded whole: when it is the settle's (nth 1) that pass leaves no record (its stop
+/// was done) and the next pass, with event ids of its own, finds A1's process gone; when it is a later one, the
+/// settle's pass is recorded with every step. Either way the chain ends and T2 is granted epoch 5.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_settle_cut_short_is_done_again_by_another_pass() -> R {
-    let dir = tempfile::tempdir()?;
-    let project = dir.path().join("p");
-    std::fs::create_dir_all(&project)?;
-    let (code, stderr) = serve_and_stop(&project)?;
-    assert_eq!(code, 0, "{stderr}");
-    seed(&project, WRITERS)?;
-    let clock = Arc::new(FakeClock::default());
-    let executor = Arc::new(StuckExecutor {
-        cancels: dir.path().join("cancels"),
-        started: std::sync::Mutex::new(Vec::new()),
-    });
-    let faults = Arc::new(FailNthCommit {
-        nth: 1,
-        ..FailNthCommit::default()
-    });
-    let host = runner_host(
-        &project,
-        executor.clone(),
-        clock.clone(),
-        Some(faults.clone()),
-    )
-    .await?;
-    let db = db(&project);
-    assert!(wait_for(
-        &db,
-        "SELECT state FROM attempts WHERE task_id = 'T1'",
-        "RUNNING",
-        Duration::from_secs(10)
-    )?);
-    let a1 = query(&db, "SELECT attempt_id FROM attempts WHERE task_id = 'T1'")?;
-    faults
-        .armed
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-    clock.advance(Duration::from_secs(300));
-    assert!(wait_for(
-        &db,
-        "SELECT count(*) FROM outbox WHERE json_extract(payload_json, '$.lease.epoch') = 5",
-        "1",
-        Duration::from_secs(20)
-    )?);
-    let count = |kind: &str| {
-        query(
-            &db,
-            &format!(
-                "SELECT count(*) FROM events WHERE kind = '{kind}' AND json_extract(payload_json, '$.attempt_id') = '{a1}'"
-            ),
+    for nth in 1..=3 {
+        let dir = tempfile::tempdir()?;
+        let project = dir.path().join("p");
+        std::fs::create_dir_all(&project)?;
+        let (code, stderr) = serve_and_stop(&project)?;
+        assert_eq!(code, 0, "{stderr}");
+        seed(&project, WRITERS)?;
+        let clock = Arc::new(FakeClock::default());
+        let executor = Arc::new(StuckExecutor {
+            cancels: dir.path().join("cancels"),
+            started: std::sync::Mutex::new(Vec::new()),
+        });
+        let faults = Arc::new(FailNthCommit {
+            nth,
+            ..FailNthCommit::default()
+        });
+        let host = runner_host(
+            &project,
+            executor.clone(),
+            clock.clone(),
+            Some(faults.clone()),
         )
-    };
-    // One pass recorded: the one cut short wrote nothing.
-    assert_eq!(count("lease.inspected")?, "1");
-    assert_eq!(count("lease.native_cancel")?, "1");
-    assert_eq!(count("lease.sigterm")?, "0");
-    assert_eq!(
-        query(
+        .await?;
+        let db = db(&project);
+        assert!(wait_for(
+            &db,
+            "SELECT state FROM attempts WHERE task_id = 'T1'",
+            "RUNNING",
+            Duration::from_secs(10)
+        )?);
+        let a1 = query(&db, "SELECT attempt_id FROM attempts WHERE task_id = 'T1'")?;
+        faults
+            .armed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        clock.advance(Duration::from_secs(300));
+        assert!(wait_for(
+            &db,
+            "SELECT count(*) FROM outbox WHERE json_extract(payload_json, '$.lease.epoch') = 5",
+            "1",
+            Duration::from_secs(20)
+        )?);
+        let steps = query(
             &db,
             &format!(
-                "SELECT json_extract(payload_json, '$.found.gone') FROM events WHERE kind = 'lease.inspected' AND json_extract(payload_json, '$.attempt_id') = '{a1}'"
+                "SELECT group_concat(kind, ',') FROM (SELECT kind FROM events WHERE kind LIKE 'lease.%' AND json_extract(payload_json, '$.attempt_id') = '{a1}' ORDER BY seq)"
             ),
-        )?,
-        "no_process"
-    );
-    host.shutdown().await;
-    drop(executor);
+        )?;
+        let found = query(
+            &db,
+            &format!(
+                "SELECT group_concat(json_extract(payload_json, '$.found'), ';') FROM events WHERE kind = 'lease.inspected' AND json_extract(payload_json, '$.attempt_id') = '{a1}'"
+            ),
+        )?;
+        if nth == 1 {
+            assert_eq!(steps, "lease.inspected,lease.native_cancel", "nth={nth}");
+            assert_eq!(found, r#"{"gone":"no_process"}"#, "nth={nth}");
+        } else {
+            assert_eq!(
+                steps,
+                "lease.inspected,lease.native_cancel,lease.sigterm,lease.sigkill,lease.reaped",
+                "nth={nth}"
+            );
+            assert_eq!(found, "ours", "nth={nth}");
+        }
+        host.shutdown().await;
+        drop(executor);
+    }
     Ok(())
 }
 
@@ -2054,27 +2060,34 @@ fn a_failure_committed_before_a_crash_stays_a_failure() -> R {
             old.iter().all(|a| a["state"] != "SETTLED"),
             "#{round}: {read}"
         );
-        let ended: Vec<&str> = read["reconcile"]
+        // Each attempt the reconcile ended moved by its recorded state (M2T05R-550): from RUNNING, where its work's
+        // failure was committed, to FAILED; from STARTING, where its work never started (one can be STARTING when
+        // the host is killed), to CANCELLED. Anything else, or an attempt left in another state, is a defect; the
+        // attempt killed after its failure was committed is among the first.
+        let mut failed = 0;
+        for event in read["reconcile"]
             .as_array()
             .ok_or("no reconcile")?
             .iter()
             .filter(|e| e["kind"] == "reconcile.attempt" && e["payload"]["disposition"] == "ended")
-            .filter_map(|e| e["payload"]["attempt_id"].as_str())
-            .collect();
-        // Each attempt ended by the reconcile is FAILED by its recorded failure, or CANCELLED when its work never
-        // started (one STARTING when the host was killed, as can happen alongside); the one killed after its failure
-        // was committed is FAILED.
-        let mut failed = 0;
-        for id in &ended {
-            let state = old
-                .iter()
-                .find(|a| a["id"] == *id)
-                .map(|a| a["state"].clone());
-            match state.as_ref().and_then(Value::as_str) {
-                Some("FAILED") => failed += 1,
-                Some("CANCELLED") => {}
-                other => return Err(format!("#{round}: {id} ended as {other:?}: {read}").into()),
+        {
+            let id = event["payload"]["attempt_id"]
+                .as_str()
+                .ok_or("no attempt id")?;
+            let moved = (
+                event["payload"]["attempt"]["from"].as_str(),
+                event["payload"]["attempt"]["to"].as_str(),
+            );
+            match moved {
+                (Some("RUNNING"), Some("FAILED")) => failed += 1,
+                (Some("STARTING"), Some("CANCELLED")) => {}
+                other => return Err(format!("#{round}: {id} moved {other:?}: {read}").into()),
             }
+            assert!(
+                old.iter()
+                    .any(|a| a["id"] == id && a["state"].as_str() == moved.1),
+                "#{round}: {id}: {read}"
+            );
         }
         assert!(failed >= 1, "#{round}: {read}");
         // Each task is done in a later attempt, but one left with an attempt UNKNOWN_EFFECT (killed mid-run).
