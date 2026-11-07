@@ -180,17 +180,30 @@ impl Common {
     }
 }
 
+/// What the host gives its runner besides its project and configuration.
+pub(super) struct Setup {
+    pub(super) clock: Arc<dyn Clock>,
+    pub(super) settings: ReconcileSettings,
+    pub(super) host_epoch: i64,
+    pub(super) jitter: Arc<Jitter>,
+    /// Shared with the pause and cancel loop, which stops a cancelled run's attempts first.
+    pub(super) inflight: super::control::Inflight,
+}
+
 /// The runner of `shared`'s project until `stop`.
 pub(super) async fn run(
     shared: Arc<Shared>,
     config: RunnerConfig,
-    clock: Arc<dyn Clock>,
-    settings: ReconcileSettings,
-    host_epoch: i64,
-    jitter: Arc<Jitter>,
-    inflight: super::control::Inflight,
+    setup: Setup,
     mut stop: watch::Receiver<bool>,
 ) {
+    let Setup {
+        clock,
+        settings,
+        host_epoch,
+        jitter,
+        inflight,
+    } = setup;
     let mut watermark = shared.store.watermark();
     let common = Arc::new(Common {
         shared,

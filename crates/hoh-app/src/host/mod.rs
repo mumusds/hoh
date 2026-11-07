@@ -327,11 +327,13 @@ impl Host {
             served.push(tokio::spawn(runner::run(
                 shared.clone(),
                 runner,
-                config.clock.0.clone(),
-                config.reconcile.clone(),
-                started.host_epoch,
-                jitter.clone(),
-                inflight.clone(),
+                runner::Setup {
+                    clock: config.clock.0.clone(),
+                    settings: config.reconcile.clone(),
+                    host_epoch: started.host_epoch,
+                    jitter: jitter.clone(),
+                    inflight: inflight.clone(),
+                },
                 stopped.clone(),
             )));
         }
