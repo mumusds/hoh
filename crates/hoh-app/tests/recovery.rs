@@ -34,6 +34,13 @@ const CHILD_REMOTE: &str = "HOH_TEST_RECOVERY_REMOTE";
 const CHILD_WORK: &str = "HOH_TEST_RECOVERY_WORK";
 /// A runner point: the child kills itself when an attempt reaches it.
 const CHILD_RUNNER_KILL: &str = "HOH_TEST_RECOVERY_RUNNER_KILL";
+/// The child runs a runner whose every attempt fails with this class: `auth`, or `retry_after:<seconds>` (a 429).
+const CHILD_FAIL_CLASS: &str = "HOH_TEST_RECOVERY_FAIL_CLASS";
+
+/// A file holding the child host's time in milliseconds since the epoch, read at each look: its clock (CR-006 F2: a
+/// clock test code injects; the product uses `MonotonicClock`, ADR-020 decision 4).
+const CHILD_CLOCK: &str = "HOH_TEST_RECOVERY_CLOCK";
+
 /// The child's exit code when it submitted its decision and was not killed.
 const NOT_KILLED: i32 = 77;
 
@@ -189,8 +196,17 @@ fn reaping(child: std::process::Child) -> tokio::sync::oneshot::Receiver<hoh_app
 
 /// [`reaping`] by a slow executor: `delay` between the leader's exit and the SIGKILL to its group.
 fn reaping_after(
+    child: std::process::Child,
+    delay: Duration,
+) -> tokio::sync::oneshot::Receiver<hoh_app::host::Outcome> {
+    reaping_with(child, delay, None)
+}
+
+/// [`reaping_after`], the outcome a failure of `failed`'s class when it is given.
+fn reaping_with(
     mut child: std::process::Child,
     delay: Duration,
+    failed: Option<hoh_core::retry::FailureClass>,
 ) -> tokio::sync::oneshot::Receiver<hoh_app::host::Outcome> {
     let (end, ended) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
@@ -214,12 +230,44 @@ fn reaping_after(
             group_gone = hoh_agents::identity::group_empty(pid);
         }
         let _ = end.send(hoh_app::host::Outcome {
-            success: status.as_ref().is_ok_and(std::process::ExitStatus::success),
+            success: failed.is_none()
+                && status.as_ref().is_ok_and(std::process::ExitStatus::success),
             detail: format!("{status:?}"),
             group_gone,
+            class: failed.unwrap_or(hoh_core::retry::FailureClass::Transient { retry_after: None }),
         });
     });
     ended
+}
+
+/// Runs each attempt's work as a short process at its gate whose outcome is a failure of `.0`'s class (a 429 with
+/// its Retry-After, a missing authentication).
+#[derive(Debug)]
+struct FailingExecutor(hoh_core::retry::FailureClass);
+
+impl hoh_app::host::Executor for FailingExecutor {
+    fn deliver(
+        &self,
+        _work: &hoh_app::host::Work,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
+        let (answer, ack) = tokio::sync::oneshot::channel();
+        let _ = answer.send(Ok(()));
+        ack
+    }
+
+    fn start(&self, _work: &hoh_app::host::Work) -> Result<hoh_app::host::Started, String> {
+        use std::os::unix::process::CommandExt as _;
+        let mut child = Command::new("sh")
+            .args(["-c", "read -r go; exit 3"])
+            .process_group(0)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        let pid = child.id();
+        let gate = gate(&mut child);
+        let ended = reaping_with(child, Duration::ZERO, Some(self.0));
+        Ok(hoh_app::host::Started { pid, gate, ended })
+    }
 }
 
 /// What is in process group `pgid` now, leader included, as the evidence records it (M2T05R-360): a whole scan of
@@ -333,6 +381,26 @@ fn recovery_host() {
         });
         config.reconcile.observer = Arc::new(Markers(PathBuf::from(work)));
     }
+    if let Ok(class) = std::env::var(CHILD_FAIL_CLASS) {
+        let class = match class.strip_prefix("retry_after:") {
+            Some(secs) => hoh_core::retry::FailureClass::Transient {
+                retry_after: Some(Duration::from_secs(secs.parse().expect("seconds"))),
+            },
+            None => hoh_core::retry::FailureClass::Auth,
+        };
+        let developer = ["structured_events", "command_exec"].map(str::to_owned);
+        config.runner = Some(hoh_app::host::RunnerConfig {
+            executor: Arc::new(FailingExecutor(class)),
+            context: Context {
+                required_capabilities: [("developer".to_owned(), developer.into_iter().collect())]
+                    .into(),
+                ..Context::default()
+            },
+        });
+    }
+    if let Some(clock) = std::env::var_os(CHILD_CLOCK) {
+        config.clock = hoh_app::host::HostClock(Arc::new(FileClock(PathBuf::from(clock))));
+    }
     let runner_kill = std::env::var(CHILD_RUNNER_KILL).ok();
     if let Some(point) = &runner_kill {
         config.hooks = Arc::new(KillAtRunner(runner_point(point).expect("a runner point")));
@@ -358,6 +426,49 @@ fn recovery_host() {
     }
     let code = runtime.block_on(hoh_app::host::run(config));
     std::process::exit(i32::from(code));
+}
+
+/// The time the test writes to a file (milliseconds since the epoch), the system's while the file cannot be read.
+#[derive(Debug)]
+struct FileClock(PathBuf);
+
+impl hoh_core::delivery::Clock for FileClock {
+    fn now(&self) -> std::time::SystemTime {
+        std::fs::read_to_string(&self.0)
+            .ok()
+            .and_then(|ms| ms.trim().parse::<u64>().ok())
+            .map_or_else(std::time::SystemTime::now, |ms| {
+                std::time::UNIX_EPOCH + Duration::from_millis(ms)
+            })
+    }
+}
+
+/// Set the time a [`FileClock`] reads.
+fn set_clock(file: &Path, at: std::time::SystemTime) -> R {
+    let ms = at.duration_since(std::time::UNIX_EPOCH)?.as_millis();
+    std::fs::write(file, ms.to_string())?;
+    Ok(())
+}
+
+/// Start a host child with `env` and wait until it serves (its own host.json).
+fn start_child(project: &Path, env: &[(&str, &std::ffi::OsStr)]) -> R<ChildGuard> {
+    let mut command = child(project)?;
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    let mut guard = ChildGuard(command.spawn()?);
+    let own = u64::from(guard.0.id());
+    let end = Instant::now() + Duration::from_secs(30);
+    while announced(project) != Some(own) {
+        if let Some(status) = guard.0.try_wait()? {
+            return Err(format!("the host ended before it served: {status:?}").into());
+        }
+        if Instant::now() > end {
+            return Err("the host did not start".into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Ok(guard)
 }
 
 /// A child process that is always ended and reaped, whatever the test does.
@@ -2207,6 +2318,7 @@ impl hoh_app::host::Executor for LeavesAMember {
                     success: status.as_ref().is_ok_and(std::process::ExitStatus::success),
                     detail: format!("{status:?}"),
                     group_gone: hoh_agents::identity::group_empty(pid),
+                    class: hoh_core::retry::FailureClass::Transient { retry_after: None },
                 });
             });
             ended
@@ -2744,6 +2856,7 @@ impl hoh_app::host::Executor for LeaderOnlyCancel {
                 success: false,
                 detail: format!("{status:?}"),
                 group_gone: false,
+                class: hoh_core::retry::FailureClass::Transient { retry_after: None },
             });
         });
         Ok(hoh_app::host::Started { pid, gate, ended })
@@ -2855,5 +2968,194 @@ async fn a_group_is_watched_through_its_settle_however_slow_the_writes() -> R {
     assert_eq!(group_now(pid), nothing_left());
     host.shutdown().await;
     drop(executor);
+    Ok(())
+}
+
+/// AC-042-02's world at time `t` (whole seconds): run R WAITING_EXTERNAL (to resume RUNNING), its task T1 READY after
+/// three failed attempts with its retry at t+200 s; 7 iterations and 1234 s used of the run's budget.
+fn waiting_world(t: std::time::SystemTime) -> String {
+    let at = |s: u64| hoh_core::time::rfc3339_utc(t + Duration::from_secs(s));
+    format!(
+        "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s2', :p, printf('%064d', 2), 2);
+         INSERT INTO runs(run_id, project_id, spec_id, state, mode, revision, resume_state, created_at) VALUES
+           ('R', :p, 's2', 'WAITING_EXTERNAL', 'AUTO', 9, 'RUNNING', '2026-11-07T00:00:00Z');
+         INSERT INTO sessions(session_id, agent, role, agent_version, capabilities_json) VALUES
+           ('sd', 'claude', 'developer', '1', '{{\"structured_events\": true, \"command_exec\": true}}');
+         INSERT INTO role_bindings(run_id, role, agent, session_id, role_epoch, config_revision, bound_at) VALUES
+           ('R', 'developer', 'claude', 'sd', 2, 1, '2026-11-07T00:00:00Z');
+         INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate, attempt_count,
+           next_retry_at) VALUES ('T1', 'R', 's2', 'READY', 7, 'developer', 1, 1, 1, 3, '{next}');
+         INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, ended_at, failure_reason) VALUES
+           ('T1/attempt-1', 'T1', 'FAILED', 2, 1, 1, '{e1}', 'HTTP 503'),
+           ('T1/attempt-2', 'T1', 'FAILED', 2, 1, 1, '{e2}', 'HTTP 503'),
+           ('T1/attempt-3', 'T1', 'FAILED', 2, 1, 1, '{e3}', 'HTTP 429');
+         INSERT INTO budgets(scope_kind, scope_id, kind, limit_value, used_value) VALUES
+           ('run', 'R', 'iterations', 100, 7), ('run', 'R', 'wall_seconds', 432000, 1234);",
+        next = at(200),
+        e1 = at(0),
+        e2 = at(0),
+        e3 = at(0),
+    )
+}
+
+/// AC-042-02: a WAITING_EXTERNAL run (attempt_count 3, next_retry_at t+200 s, 7 iterations used and its duration
+/// persisted) whose host is killed with SIGKILL at t+5 s and restarted at t+10 s keeps all four values; nothing is
+/// dispatched before t+200 s, and at t+200 s exactly one dispatch and one new attempt. The child's clock is a file the
+/// test writes.
+#[test]
+fn test_042_02_a_waiting_run_keeps_its_retry_and_budget_across_a_kill_9() -> R {
+    let dir = tempfile::tempdir()?;
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    let (code, stderr) = serve_and_stop(&project)?;
+    assert_eq!(code, 0, "{stderr}");
+    let t = std::time::UNIX_EPOCH
+        + Duration::from_secs(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs(),
+        );
+    seed(&project, &waiting_world(t))?;
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(work.join("markers"))?;
+    let clock = dir.path().join("clock");
+    let env: [(&str, &std::ffi::OsStr); 2] = [
+        (CHILD_WORK, work.as_os_str()),
+        (CHILD_CLOCK, clock.as_os_str()),
+    ];
+    let db = db(&project);
+    let snapshot = || -> R<Value> {
+        Ok(json!({
+            "run": query(&db, "SELECT state FROM runs WHERE run_id = 'R'")?,
+            "attempt_count": query(&db, "SELECT attempt_count FROM tasks WHERE task_id = 'T1'")?,
+            "next_retry_at": query(&db, "SELECT next_retry_at FROM tasks WHERE task_id = 'T1'")?,
+            "iterations_used": query(&db, "SELECT used_value FROM budgets WHERE scope_id = 'R' AND kind = 'iterations'")?,
+            "wall_seconds_used": query(&db, "SELECT used_value FROM budgets WHERE scope_id = 'R' AND kind = 'wall_seconds'")?,
+        }))
+    };
+    let counts = || -> R<(String, String)> {
+        Ok((
+            query(
+                &db,
+                "SELECT count(*) FROM outbox WHERE json_extract(payload_json, '$.kind') = 'dispatch'",
+            )?,
+            query(&db, "SELECT count(*) FROM attempts WHERE task_id = 'T1'")?,
+        ))
+    };
+    let mut log = Vec::new();
+    // t+5 s: the host waits; it is killed with SIGKILL.
+    set_clock(&clock, t + Duration::from_secs(5))?;
+    let host = start_child(&project, &env)?;
+    std::thread::sleep(Duration::from_millis(800));
+    let before = snapshot()?;
+    let pid = rustix::process::Pid::from_raw(i32::try_from(host.0.id())?).ok_or("no pid")?;
+    rustix::process::kill_process(pid, rustix::process::Signal::KILL)?;
+    let (status, _) = wait(host, Duration::from_secs(30))?;
+    assert_eq!(status.signal(), Some(9));
+    log.push(json!({"at": "t+5", "killed": true, "counts": counts()?}));
+    // t+10 s: restarted; every field is as it was.
+    set_clock(&clock, t + Duration::from_secs(10))?;
+    let host = start_child(&project, &env)?;
+    std::thread::sleep(Duration::from_millis(800));
+    let after = snapshot()?;
+    assert_eq!(before, after);
+    assert_eq!(after["attempt_count"], json!("3"));
+    assert_eq!(after["iterations_used"], json!("7.0"));
+    assert_eq!(after["run"], json!("WAITING_EXTERNAL"));
+    log.push(json!({"at": "t+10", "restarted": true, "counts": counts()?}));
+    // t+199 s: nothing dispatched yet.
+    set_clock(&clock, t + Duration::from_secs(199))?;
+    std::thread::sleep(Duration::from_millis(1_000));
+    assert_eq!(counts()?, ("0".to_owned(), "3".to_owned()));
+    log.push(json!({"at": "t+199", "counts": counts()?}));
+    // t+200 s: one dispatch, one new attempt.
+    set_clock(&clock, t + Duration::from_secs(200))?;
+    let end = Instant::now() + Duration::from_secs(20);
+    while counts()?.1 != "4" && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(800));
+    assert_eq!(counts()?, ("1".to_owned(), "4".to_owned()));
+    log.push(json!({"at": "t+200", "counts": counts()?}));
+    let pid = rustix::process::Pid::from_raw(i32::try_from(host.0.id())?).ok_or("no pid")?;
+    rustix::process::kill_process(pid, rustix::process::Signal::TERM)?;
+    let (status, stderr) = wait(host, Duration::from_secs(30))?;
+    assert_eq!(status.code(), Some(0), "{stderr}");
+    keep(
+        "test-042-02.json",
+        &json!({
+            "t": hoh_core::time::rfc3339_utc(t), "before_kill": before, "after_restart": after, "dispatch_log": log,
+            "events": python(&db, "import sqlite3,sys,json; c=sqlite3.connect(sys.argv[1]); print(json.dumps([list(r) for r in c.execute(sys.stdin.read())]))",
+                "SELECT seq, kind, json_extract(payload_json, '$.task_id') FROM events WHERE run_id = 'R' ORDER BY seq")?.trim(),
+        }),
+    )?;
+    Ok(())
+}
+
+/// M2T19R-51: the host is killed after its attempt's failure was recorded (OBSERVED, then COMMITTED); the host
+/// started again ends the attempt by the class and the end time that record kept, as the runner would have: a 429
+/// waits its Retry-After from the end, counted; a missing authentication blocks at once, with no retry.
+#[test]
+fn a_failure_recorded_before_a_kill_is_retried_by_its_class_after_the_restart() -> R {
+    for (class, want) in [("retry_after:120", "READY"), ("auth", "BLOCKED")] {
+        let dir = tempfile::tempdir()?;
+        let project = dir.path().join("p");
+        std::fs::create_dir_all(&project)?;
+        let (code, stderr) = serve_and_stop(&project)?;
+        assert_eq!(code, 0, "{stderr}");
+        seed(
+            &project,
+            "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s2', :p, printf('%064d', 2), 2);
+             INSERT INTO runs(run_id, project_id, spec_id, state, mode, revision, created_at) VALUES
+               ('R', :p, 's2', 'RUNNING', 'AUTO', 7, '2026-11-07T00:00:00Z');
+             INSERT INTO sessions(session_id, agent, role, agent_version, capabilities_json) VALUES
+               ('sd', 'claude', 'developer', '1', '{\"structured_events\": true, \"command_exec\": true}');
+             INSERT INTO role_bindings(run_id, role, agent, session_id, role_epoch, config_revision, bound_at) VALUES
+               ('R', 'developer', 'claude', 'sd', 2, 1, '2026-11-07T00:00:00Z');
+             INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate) VALUES
+               ('T1', 'R', 's2', 'READY', 1, 'developer', 1, 1, 1);",
+        )?;
+        let mut command = child(&project)?;
+        command
+            .env(CHILD_FAIL_CLASS, class)
+            .env(CHILD_RUNNER_KILL, "AfterEffectCommitted");
+        let (status, stderr) = wait(ChildGuard(command.spawn()?), Duration::from_secs(30))?;
+        assert_eq!(status.signal(), Some(9), "{class}: {stderr}");
+        let db = db(&project);
+        assert_eq!(
+            query(&db, "SELECT state FROM attempts WHERE task_id = 'T1'")?,
+            "RUNNING",
+            "{class}: killed after COMMITTED, before its end"
+        );
+        let (code, stderr) = serve_and_stop(&project)?;
+        assert_eq!(code, 0, "{class}: {stderr}");
+        assert_eq!(
+            query(
+                &db,
+                "SELECT state || ':' || attempt_count FROM tasks WHERE task_id = 'T1'"
+            )?,
+            format!("{want}:1"),
+            "{class}"
+        );
+        let observed = query(
+            &db,
+            "SELECT json_extract(payload_json, '$.detail.ended_at') FROM events WHERE kind = 'effect.observed'",
+        )?;
+        let ended = query(&db, "SELECT ended_at FROM attempts WHERE task_id = 'T1'")?;
+        assert_eq!(ended, observed, "{class}: ended when its work did");
+        let next = query(&db, "SELECT next_retry_at FROM tasks WHERE task_id = 'T1'")?;
+        if want == "READY" {
+            let waited = hoh_core::time::parse_rfc3339(&next)
+                .zip(hoh_core::time::parse_rfc3339(&ended))
+                .and_then(|(n, e)| n.duration_since(e).ok());
+            assert_eq!(waited, Some(Duration::from_secs(120)), "{class}");
+        } else {
+            assert_eq!(next, "", "{class}: no retry");
+            assert_eq!(
+                query(&db, "SELECT blocked_reason FROM tasks WHERE task_id = 'T1'")?,
+                "BLOCKED_AUTH"
+            );
+        }
+    }
     Ok(())
 }

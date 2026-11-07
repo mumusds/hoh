@@ -40,6 +40,21 @@ pub struct UnfinishedRow {
     pub lease_epoch: Option<i64>,
     /// The outcome its work's `effect.observed` event recorded, if any.
     pub work_outcome: Option<bool>,
+    /// How its work failed, as that event recorded it (ADR-020 decision 1), if it did.
+    pub work_class: Option<crate::retry::FailureClass>,
+    /// When its work ended, as that event recorded it (M2T19R-03).
+    pub work_ended_at: Option<std::time::SystemTime>,
+}
+
+/// One attempt's disposition as [`ReconcileJob::Apply`] carries it.
+#[derive(Debug, Clone)]
+pub(super) struct Apply {
+    pub row: UnfinishedRow,
+    pub disposition: Disposition,
+    pub process: Process,
+    pub cause: &'static str,
+    pub at: std::time::SystemTime,
+    pub draw: u32,
 }
 
 /// One step of a reconcile.
@@ -51,8 +66,9 @@ pub(super) enum ReconcileJob {
         host_epoch: i64,
         unfinished: usize,
     },
-    /// The disposition, what was found of the process, and why (`reconcile`, `lease_expired`).
-    Apply(Box<(UnfinishedRow, Disposition, Process, &'static str)>),
+    /// The disposition, what was found of the process, why (`reconcile`, `lease_expired`), when (the caller's
+    /// clock) and a jitter draw for a failure's retry.
+    Apply(Box<Apply>),
     Completed {
         project_id: String,
         host_epoch: i64,
@@ -91,10 +107,7 @@ pub(super) fn run(
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_millis())}),
         ),
-        ReconcileJob::Apply(step) => {
-            let (row, disposition, process, cause) = *step;
-            apply(conn, &row, &disposition, &process, cause, ctx)
-        }
+        ReconcileJob::Apply(step) => apply(conn, &step, ctx),
         ReconcileJob::Completed {
             project_id,
             host_epoch,
@@ -158,15 +171,25 @@ fn scan(
         let (pid, boot_id, start, lease_expired, lease_epoch) = process;
         let effects = effects_of(conn, &attempt_id)?;
         let observed = child_id(&crate::reconcile::work_key(&attempt_id), "effect.observed");
-        let work_outcome: Option<bool> = conn
+        let recorded: Option<(Option<bool>, Option<String>)> = conn
             .query_row(
-                "SELECT json_extract(payload_json, '$.detail.success') FROM events WHERE event_id = ?1",
+                "SELECT json_extract(payload_json, '$.detail.success'), json_extract(payload_json, '$.detail') \
+                 FROM events WHERE event_id = ?1",
                 params![observed],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
-            .map_err(sqlite_error)?
-            .flatten();
+            .map_err(sqlite_error)?;
+        let (work_outcome, detail) = recorded.unwrap_or((None, None));
+        let detail = detail.and_then(|d| serde_json::from_str::<Value>(&d).ok());
+        let work_class = detail
+            .as_ref()
+            .and_then(crate::retry::FailureClass::from_json);
+        let work_ended_at = detail.as_ref().and_then(|d| {
+            d.get("ended_at")?
+                .as_str()
+                .and_then(crate::time::parse_rfc3339)
+        });
         rows.push(UnfinishedRow {
             project_id: project_id.to_owned(),
             run_id,
@@ -182,6 +205,8 @@ fn scan(
             lease_expired,
             lease_epoch,
             work_outcome,
+            work_class,
+            work_ended_at,
         });
     }
     Ok(rows)
@@ -259,12 +284,26 @@ fn process_json(process: &Process) -> Value {
 /// task and its events (a diagnostic too when an effect is unknown or the process could not be reaped).
 fn apply(
     conn: &mut Connection,
-    row: &UnfinishedRow,
-    disposition: &Disposition,
-    process: &Process,
-    cause: &str,
+    step: &Apply,
     ctx: &Ctx<'_>,
 ) -> Result<ReconcileDone, PersistError> {
+    let Apply {
+        row,
+        disposition,
+        process,
+        cause,
+        at,
+        draw,
+    } = step;
+    let cause = *cause;
+    // An end its work recorded is when it ended: the duration accrued and its retry counted from it, not from this
+    // reconcile, which may come long after (a host down meanwhile, M2T19R-03), but only once its work effect was
+    // COMMITTED, i.e. its group was seen empty (a leader's end with its group still running is not the work's end,
+    // M2T19R-155). Otherwise its end is not known and is taken as now: the conservative side for a budget.
+    let committed = row.effects.iter().any(|e| {
+        e.key == crate::reconcile::work_key(&row.attempt_id) && e.state == EffectState::Committed
+    });
+    let at = &row.work_ended_at.filter(|_| committed).unwrap_or(*at);
     let none: &[EffectMove] = &[];
     let (name, attempt_to, task_to, moves, unknown): (_, _, _, &[EffectMove], &[String]) =
         match disposition {
@@ -330,12 +369,51 @@ fn apply(
                 from: row.state,
                 to,
                 facts: AttemptFacts {
-                    ended_at: Some(crate::time::now_rfc3339()),
+                    ended_at: Some(crate::time::rfc3339_utc(*at)),
                     ..AttemptFacts::default()
                 },
             },
             ctx,
         )?;
+        super::retry::accrue_wall(&tx, &row.run_id, &row.attempt_id, *at)?;
+    }
+    // A failed attempt's task by the retry policy, with the class its work recorded (a process that ended without a
+    // record failed in a way nothing classified: transient), as on the runner's own path (ADR-020 decision 3). A
+    // cancelled one (its work never started) goes back to READY as it did.
+    let mut task_moves = Vec::new();
+    let mut task_events = Vec::new();
+    let mut task_to = task_to;
+    if attempt_to == Some(AttemptState::Failed) && task_to == Some(TaskState::Ready) {
+        let failed = super::retry::fail_task(
+            &tx,
+            &super::retry::TaskRef {
+                project_id: &row.project_id,
+                run_id: &row.run_id,
+                task_id: &row.task_id,
+                state: row.task_state,
+                revision: row.task_revision,
+            },
+            &row.attempt_id,
+            &super::retry::Failure {
+                class: row
+                    .work_class
+                    .unwrap_or(crate::retry::FailureClass::Transient { retry_after: None }),
+                at: *at,
+                draw: *draw,
+            },
+        )?;
+        task_to = failed.cas.as_ref().and_then(|c| match c.change {
+            Change::Task(to) => Some(to),
+            _ => None,
+        });
+        task_moves.extend(failed.cas);
+        task_events = failed.events;
+    } else if let Some(to) = task_to {
+        task_moves.push(StateCas {
+            id: row.task_id.clone(),
+            expected_revision: row.task_revision,
+            change: Change::Task(to),
+        });
     }
     let mut events = vec![NewEvent {
         project_id: row.project_id.clone(),
@@ -376,18 +454,11 @@ fn apply(
             payload,
         });
     }
-    let cas = task_to
-        .map(|to| StateCas {
-            id: row.task_id.clone(),
-            expected_revision: row.task_revision,
-            change: Change::Task(to),
-        })
-        .into_iter()
-        .collect();
+    events.extend(task_events);
     let done = writer::write(
         &tx,
         &Commit {
-            cas,
+            cas: task_moves,
             events,
             ..Commit::default()
         },

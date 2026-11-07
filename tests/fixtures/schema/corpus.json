@@ -2526,7 +2526,18 @@
     "spec_revision": 2,
     "accepted": 18,
     "total": 25,
-    "last_event_seq": 41
+    "last_event_seq": 41,
+    "cost_usd": null,
+    "cost_status": "unknown",
+    "remaining_requirements": [
+     "REQ-001",
+     "REQ-002",
+     "REQ-003",
+     "REQ-004",
+     "REQ-005",
+     "REQ-006",
+     "REQ-007"
+    ]
    }
   },
   {
@@ -2542,7 +2553,10 @@
     "spec_revision": null,
     "accepted": 0,
     "total": 0,
-    "last_event_seq": 41
+    "last_event_seq": 41,
+    "cost_usd": null,
+    "cost_status": "unknown",
+    "remaining_requirements": []
    }
   },
   {
@@ -2557,7 +2571,18 @@
     "blocked_reason": null,
     "spec_revision": 2,
     "accepted": 18,
-    "total": 25
+    "total": 25,
+    "cost_usd": null,
+    "cost_status": "unknown",
+    "remaining_requirements": [
+     "REQ-001",
+     "REQ-002",
+     "REQ-003",
+     "REQ-004",
+     "REQ-005",
+     "REQ-006",
+     "REQ-007"
+    ]
    }
   },
   {
@@ -2574,7 +2599,18 @@
     "accepted": 18,
     "total": 25,
     "last_event_seq": 41,
-    "extra": 1
+    "extra": 1,
+    "cost_usd": null,
+    "cost_status": "unknown",
+    "remaining_requirements": [
+     "REQ-001",
+     "REQ-002",
+     "REQ-003",
+     "REQ-004",
+     "REQ-005",
+     "REQ-006",
+     "REQ-007"
+    ]
    }
   },
   {
@@ -2590,7 +2626,18 @@
     "spec_revision": 2,
     "accepted": 18,
     "total": 25,
-    "last_event_seq": 41
+    "last_event_seq": 41,
+    "cost_usd": null,
+    "cost_status": "unknown",
+    "remaining_requirements": [
+     "REQ-001",
+     "REQ-002",
+     "REQ-003",
+     "REQ-004",
+     "REQ-005",
+     "REQ-006",
+     "REQ-007"
+    ]
    }
   },
   {
@@ -2606,7 +2653,18 @@
     "spec_revision": 2,
     "accepted": 18,
     "total": 25,
-    "last_event_seq": 41
+    "last_event_seq": 41,
+    "cost_usd": null,
+    "cost_status": "unknown",
+    "remaining_requirements": [
+     "REQ-001",
+     "REQ-002",
+     "REQ-003",
+     "REQ-004",
+     "REQ-005",
+     "REQ-006",
+     "REQ-007"
+    ]
    }
   },
   {
@@ -2622,7 +2680,10 @@
     "spec_revision": null,
     "accepted": 0,
     "total": 0,
-    "last_event_seq": 41
+    "last_event_seq": 41,
+    "cost_usd": null,
+    "cost_status": "unknown",
+    "remaining_requirements": []
    }
   },
   {
@@ -2638,7 +2699,18 @@
     "spec_revision": 0,
     "accepted": 18,
     "total": 25,
-    "last_event_seq": 41
+    "last_event_seq": 41,
+    "cost_usd": null,
+    "cost_status": "unknown",
+    "remaining_requirements": [
+     "REQ-001",
+     "REQ-002",
+     "REQ-003",
+     "REQ-004",
+     "REQ-005",
+     "REQ-006",
+     "REQ-007"
+    ]
    }
   },
   {
@@ -2663,7 +2735,18 @@
      "spec_revision": 2,
      "accepted": 18,
      "total": 25,
-     "last_event_seq": 41
+     "last_event_seq": 41,
+     "cost_usd": null,
+     "cost_status": "unknown",
+     "remaining_requirements": [
+      "REQ-001",
+      "REQ-002",
+      "REQ-003",
+      "REQ-004",
+      "REQ-005",
+      "REQ-006",
+      "REQ-007"
+     ]
     }
    }
   },
@@ -2689,7 +2772,18 @@
      "spec_revision": 2,
      "accepted": 18,
      "total": 25,
-     "last_event_seq": 41
+     "last_event_seq": 41,
+     "cost_usd": null,
+     "cost_status": "unknown",
+     "remaining_requirements": [
+      "REQ-001",
+      "REQ-002",
+      "REQ-003",
+      "REQ-004",
+      "REQ-005",
+      "REQ-006",
+      "REQ-007"
+     ]
     }
    }
   },
@@ -2734,7 +2828,18 @@
      "spec_revision": 2,
      "accepted": 18,
      "total": 25,
-     "last_event_seq": 41
+     "last_event_seq": 41,
+     "cost_usd": null,
+     "cost_status": "unknown",
+     "remaining_requirements": [
+      "REQ-001",
+      "REQ-002",
+      "REQ-003",
+      "REQ-004",
+      "REQ-005",
+      "REQ-006",
+      "REQ-007"
+     ]
     }
    }
   },
@@ -2751,7 +2856,18 @@
     "spec_revision": 2,
     "accepted": 18,
     "total": 25,
-    "last_event_seq": 41
+    "last_event_seq": 41,
+    "cost_usd": null,
+    "cost_status": "unknown",
+    "remaining_requirements": [
+     "REQ-001",
+     "REQ-002",
+     "REQ-003",
+     "REQ-004",
+     "REQ-005",
+     "REQ-006",
+     "REQ-007"
+    ]
    }
   },
   {
@@ -2767,7 +2883,18 @@
     "spec_revision": 2,
     "accepted": 18,
     "total": 25,
-    "last_event_seq": 41
+    "last_event_seq": 41,
+    "cost_usd": null,
+    "cost_status": "unknown",
+    "remaining_requirements": [
+     "REQ-001",
+     "REQ-002",
+     "REQ-003",
+     "REQ-004",
+     "REQ-005",
+     "REQ-006",
+     "REQ-007"
+    ]
    }
   },
   {
@@ -2783,7 +2910,18 @@
     "spec_revision": 2,
     "accepted": 18,
     "total": 25,
-    "last_event_seq": 41
+    "last_event_seq": 41,
+    "cost_usd": null,
+    "cost_status": "unknown",
+    "remaining_requirements": [
+     "REQ-001",
+     "REQ-002",
+     "REQ-003",
+     "REQ-004",
+     "REQ-005",
+     "REQ-006",
+     "REQ-007"
+    ]
    }
   },
   {
@@ -2799,7 +2937,18 @@
     "spec_revision": 2,
     "accepted": 18,
     "total": 25,
-    "last_event_seq": 41
+    "last_event_seq": 41,
+    "cost_usd": null,
+    "cost_status": "unknown",
+    "remaining_requirements": [
+     "REQ-001",
+     "REQ-002",
+     "REQ-003",
+     "REQ-004",
+     "REQ-005",
+     "REQ-006",
+     "REQ-007"
+    ]
    }
   },
   {
@@ -2815,7 +2964,18 @@
     "spec_revision": 2,
     "accepted": 18,
     "total": 25,
-    "last_event_seq": 41
+    "last_event_seq": 41,
+    "cost_usd": null,
+    "cost_status": "unknown",
+    "remaining_requirements": [
+     "REQ-001",
+     "REQ-002",
+     "REQ-003",
+     "REQ-004",
+     "REQ-005",
+     "REQ-006",
+     "REQ-007"
+    ]
    }
   },
   {
@@ -2831,7 +2991,18 @@
     "spec_revision": 2,
     "accepted": 18,
     "total": 25,
-    "last_event_seq": 41
+    "last_event_seq": 41,
+    "cost_usd": null,
+    "cost_status": "unknown",
+    "remaining_requirements": [
+     "REQ-001",
+     "REQ-002",
+     "REQ-003",
+     "REQ-004",
+     "REQ-005",
+     "REQ-006",
+     "REQ-007"
+    ]
    }
   },
   {
@@ -2847,7 +3018,18 @@
     "spec_revision": 2,
     "accepted": 18,
     "total": 25,
-    "last_event_seq": 41
+    "last_event_seq": 41,
+    "cost_usd": null,
+    "cost_status": "unknown",
+    "remaining_requirements": [
+     "REQ-001",
+     "REQ-002",
+     "REQ-003",
+     "REQ-004",
+     "REQ-005",
+     "REQ-006",
+     "REQ-007"
+    ]
    }
   },
   {
@@ -2872,7 +3054,18 @@
      "spec_revision": 2,
      "accepted": 18,
      "total": 25,
-     "last_event_seq": 41
+     "last_event_seq": 41,
+     "cost_usd": null,
+     "cost_status": "unknown",
+     "remaining_requirements": [
+      "REQ-001",
+      "REQ-002",
+      "REQ-003",
+      "REQ-004",
+      "REQ-005",
+      "REQ-006",
+      "REQ-007"
+     ]
     }
    }
   },
@@ -2898,8 +3091,276 @@
      "spec_revision": 2,
      "accepted": 18,
      "total": 25,
-     "last_event_seq": 41
+     "last_event_seq": 41,
+     "cost_usd": null,
+     "cost_status": "unknown",
+     "remaining_requirements": [
+      "REQ-001",
+      "REQ-002",
+      "REQ-003",
+      "REQ-004",
+      "REQ-005",
+      "REQ-006",
+      "REQ-007"
+     ]
     }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "RunResult",
+   "valid": true,
+   "note": "CR-009: an unknown cost is null (REQ-042 failure mode 5)",
+   "instance": {
+    "run_id": "r1",
+    "state": "INCOMPLETE",
+    "exit_code": 4,
+    "blocked_reason": null,
+    "spec_revision": 2,
+    "accepted": 23,
+    "total": 25,
+    "last_event_seq": 41,
+    "cost_usd": null,
+    "cost_status": "unknown",
+    "remaining_requirements": [
+     "REQ-004",
+     "REQ-042"
+    ]
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "RunResult",
+   "valid": true,
+   "note": "CR-009: a known cost is a number",
+   "instance": {
+    "run_id": "r1",
+    "state": "INCOMPLETE",
+    "exit_code": 4,
+    "blocked_reason": null,
+    "spec_revision": 2,
+    "accepted": 23,
+    "total": 25,
+    "last_event_seq": 41,
+    "cost_usd": 1.25,
+    "cost_status": "known",
+    "remaining_requirements": [
+     "REQ-004",
+     "REQ-042"
+    ]
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "RunResult",
+   "valid": true,
+   "note": "CR-009: a known cost of a run without attempts is 0",
+   "instance": {
+    "run_id": "r1",
+    "state": "INCOMPLETE",
+    "exit_code": 4,
+    "blocked_reason": null,
+    "spec_revision": 2,
+    "accepted": 23,
+    "total": 25,
+    "last_event_seq": 41,
+    "cost_usd": 0.0,
+    "cost_status": "known",
+    "remaining_requirements": [
+     "REQ-004",
+     "REQ-042"
+    ]
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "RunResult",
+   "valid": false,
+   "note": "CR-009: an unknown cost is never a number (no estimate as a bill)",
+   "instance": {
+    "run_id": "r1",
+    "state": "INCOMPLETE",
+    "exit_code": 4,
+    "blocked_reason": null,
+    "spec_revision": 2,
+    "accepted": 23,
+    "total": 25,
+    "last_event_seq": 41,
+    "cost_usd": 0.5,
+    "cost_status": "unknown",
+    "remaining_requirements": [
+     "REQ-004",
+     "REQ-042"
+    ]
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "RunResult",
+   "valid": false,
+   "note": "CR-009: a known cost is never null",
+   "instance": {
+    "run_id": "r1",
+    "state": "INCOMPLETE",
+    "exit_code": 4,
+    "blocked_reason": null,
+    "spec_revision": 2,
+    "accepted": 23,
+    "total": 25,
+    "last_event_seq": 41,
+    "cost_usd": null,
+    "cost_status": "known",
+    "remaining_requirements": [
+     "REQ-004",
+     "REQ-042"
+    ]
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "RunResult",
+   "valid": false,
+   "note": "CR-009: cost_status is known or unknown",
+   "instance": {
+    "run_id": "r1",
+    "state": "INCOMPLETE",
+    "exit_code": 4,
+    "blocked_reason": null,
+    "spec_revision": 2,
+    "accepted": 23,
+    "total": 25,
+    "last_event_seq": 41,
+    "cost_usd": null,
+    "cost_status": "estimated",
+    "remaining_requirements": [
+     "REQ-004",
+     "REQ-042"
+    ]
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "RunResult",
+   "valid": false,
+   "note": "CR-009: a cost is never negative",
+   "instance": {
+    "run_id": "r1",
+    "state": "INCOMPLETE",
+    "exit_code": 4,
+    "blocked_reason": null,
+    "spec_revision": 2,
+    "accepted": 23,
+    "total": 25,
+    "last_event_seq": 41,
+    "cost_usd": -1,
+    "cost_status": "known",
+    "remaining_requirements": [
+     "REQ-004",
+     "REQ-042"
+    ]
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "RunResult",
+   "valid": false,
+   "note": "CR-009: cost_status is required",
+   "instance": {
+    "run_id": "r1",
+    "state": "INCOMPLETE",
+    "exit_code": 4,
+    "blocked_reason": null,
+    "spec_revision": 2,
+    "accepted": 23,
+    "total": 25,
+    "last_event_seq": 41,
+    "cost_usd": null,
+    "remaining_requirements": [
+     "REQ-004",
+     "REQ-042"
+    ]
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "RunResult",
+   "valid": false,
+   "note": "CR-009: cost_usd is required",
+   "instance": {
+    "run_id": "r1",
+    "state": "INCOMPLETE",
+    "exit_code": 4,
+    "blocked_reason": null,
+    "spec_revision": 2,
+    "accepted": 23,
+    "total": 25,
+    "last_event_seq": 41,
+    "cost_status": "unknown",
+    "remaining_requirements": [
+     "REQ-004",
+     "REQ-042"
+    ]
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "RunResult",
+   "valid": false,
+   "note": "CR-009: remaining_requirements is required",
+   "instance": {
+    "run_id": "r1",
+    "state": "INCOMPLETE",
+    "exit_code": 4,
+    "blocked_reason": null,
+    "spec_revision": 2,
+    "accepted": 23,
+    "total": 25,
+    "last_event_seq": 41,
+    "cost_usd": null,
+    "cost_status": "unknown"
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "RunResult",
+   "valid": false,
+   "note": "CR-009: remaining requirements are requirement ids",
+   "instance": {
+    "run_id": "r1",
+    "state": "INCOMPLETE",
+    "exit_code": 4,
+    "blocked_reason": null,
+    "spec_revision": 2,
+    "accepted": 23,
+    "total": 25,
+    "last_event_seq": 41,
+    "cost_usd": null,
+    "cost_status": "unknown",
+    "remaining_requirements": [
+     "AC-042-04"
+    ]
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "RunResult",
+   "valid": false,
+   "note": "CR-009: a remaining requirement is listed once",
+   "instance": {
+    "run_id": "r1",
+    "state": "INCOMPLETE",
+    "exit_code": 4,
+    "blocked_reason": null,
+    "spec_revision": 2,
+    "accepted": 23,
+    "total": 25,
+    "last_event_seq": 41,
+    "cost_usd": null,
+    "cost_status": "unknown",
+    "remaining_requirements": [
+     "REQ-004",
+     "REQ-004"
+    ]
    }
   }
  ]

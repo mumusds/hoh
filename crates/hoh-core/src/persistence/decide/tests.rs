@@ -843,3 +843,96 @@ async fn a_run_that_starts_running_queues_its_notice_with_its_event_through_ever
     assert_eq!(rows(&path, "SELECT count(*) FROM events")?, [[json!(1)]]);
     Ok(())
 }
+
+#[tokio::test]
+async fn a_commander_dispatch_is_refused_once_the_runs_budget_stops_it() -> R {
+    // M2T19R-01, REQ-042 behaviour 6 and 7: a deadline passed, the iterations used up, or a cost limit with an unknown
+    // price refuse the decide path's dispatch as they stop the rounds; no attempt is made.
+    for (stop, setup) in [
+        (
+            "deadline_at",
+            "UPDATE runs SET deadline_at = '2026-11-07T00:01:00Z' WHERE run_id = 'R';",
+        ),
+        (
+            "max_iterations",
+            "INSERT INTO budgets(scope_kind, scope_id, kind, limit_value, used_value) VALUES ('run', 'R', 'iterations', 2, 2);",
+        ),
+        (
+            "max_usd",
+            "INSERT INTO budgets(scope_kind, scope_id, kind, limit_value, price_known) VALUES ('run', 'R', 'usd', 5, 0);",
+        ),
+    ] {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = open(&dir)?;
+        seed(&path, WORLD)?;
+        seed(&path, setup)?;
+        let mut commander = FakeCommander {
+            sent: 0,
+            candidate: None,
+        };
+        let late = Context {
+            now: crate::time::parse_rfc3339("2026-11-07T00:05:00Z"),
+            ..context()
+        };
+        let decided = store
+            .decide(
+                commander.decide(
+                    3,
+                    7,
+                    json!({"kind": "dispatch", "task_id": "T1", "role": "developer"}),
+                ),
+                late,
+            )
+            .await?;
+        let Decided::Rejected { reason, detail, .. } = decided else {
+            return Err(format!("{stop}: dispatched: {decided:?}").into());
+        };
+        assert_eq!(reason, RejectionReason::BudgetNotReservable, "{stop}");
+        assert!(detail.contains(stop), "{stop}: {detail}");
+        let attempts: i64 =
+            Connection::open(&path)?
+                .query_row("SELECT count(*) FROM attempts", [], |r| r.get(0))?;
+        assert_eq!(attempts, 0, "{stop}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_commander_dispatch_before_the_tasks_retry_is_refused() -> R {
+    // REQ-042 behaviour 2, CR-009: the decide path reads the task's persisted next_retry_at; while it is ahead of
+    // the decision's time the dispatch is RETRY_NOT_DUE, at it the dispatch goes.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    seed(&path, WORLD)?;
+    seed(
+        &path,
+        "UPDATE tasks SET next_retry_at = '2026-11-07T00:02:00Z', attempt_count = 1 WHERE task_id = 'T1';",
+    )?;
+    let mut commander = FakeCommander {
+        sent: 0,
+        candidate: None,
+    };
+    let at = |text: &str| crate::time::parse_rfc3339(text).ok_or("not a time");
+    let dispatch = json!({"kind": "dispatch", "task_id": "T1", "role": "developer"});
+    let early = Context {
+        now: Some(at("2026-11-07T00:01:59Z")?),
+        ..context()
+    };
+    let decided = store
+        .decide(commander.decide(3, 7, dispatch.clone()), early)
+        .await?;
+    let Decided::Rejected { reason, .. } = decided else {
+        return Err(format!("dispatched before its retry: {decided:?}").into());
+    };
+    assert_eq!(reason, RejectionReason::RetryNotDue);
+    let due = Context {
+        now: Some(at("2026-11-07T00:02:00Z")?),
+        ..context()
+    };
+    let decided = store.decide(commander.decide(3, 7, dispatch), due).await?;
+    assert!(
+        matches!(decided, Decided::Applied { .. }),
+        "at its retry: {decided:?}"
+    );
+    Ok(())
+}

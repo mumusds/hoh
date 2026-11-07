@@ -18,10 +18,13 @@ use super::{HostHooks, ReconcileSettings, http::Shared, reconcile};
 use hoh_agents::identity;
 use hoh_core::decision::Context;
 use hoh_core::delivery::Clock;
-use hoh_core::persistence::{Commit, DispatchNotice, NewEvent, PersistError, UnfinishedRow};
+use hoh_core::persistence::{
+    Commit, DispatchNotice, Ending, NewEvent, PersistError, UnfinishedRow,
+};
 use hoh_core::reconcile::{
     Disposition, Effect, EffectState, Process, Unfinished, dispose, work_key,
 };
+use hoh_core::retry::{FailureClass, SplitMix64};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -50,6 +53,24 @@ pub struct Outcome {
     /// then waited until no process was left in the group (`kill(-pgid, 0)` gives ESRCH; the members hold the number
     /// meanwhile). The attempt ends, and its slot goes, only if so (M2T05R-101, -303).
     pub group_gone: bool,
+    /// How it failed, when it did (ADR-020 decision 1): a 429/503 with its Retry-After, other transient failures,
+    /// missing authentication or an incompatible CLI. Unused on success.
+    pub class: FailureClass,
+}
+
+/// The host's source of the retries' jitter draws (ADR-020 decision 2): one SplitMix64 for the reconcile and the
+/// runner, seeded once at the start.
+pub(super) struct Jitter(Mutex<SplitMix64>);
+
+impl Jitter {
+    pub(super) fn new(seed: u64) -> Jitter {
+        Jitter(Mutex::new(SplitMix64::new(seed)))
+    }
+
+    /// The next uniform 32-bit draw.
+    pub(super) fn draw(&self) -> u32 {
+        self.0.lock().map_or(0, |mut g| g.next_u32())
+    }
 }
 
 /// A started process's start gate: until it is opened the process runs nothing of the agent; dropped unopened, the
@@ -141,7 +162,22 @@ struct Common {
     host_epoch: i64,
     /// The number of the next settle pass (event ids of this host: `<cause>/<host epoch>/<pass>/…`).
     passes: AtomicU64,
+    jitter: Arc<Jitter>,
     inflight: Mutex<BTreeMap<String, Entry>>,
+}
+
+impl Common {
+    /// A failure nothing classified (a process that did not start, an identity that could not be read): transient,
+    /// at the runner's clock (ADR-020 decision 1).
+    fn failed(&self, detail: String) -> Ending {
+        Ending {
+            success: false,
+            detail,
+            class: FailureClass::Transient { retry_after: None },
+            at: self.clock.now(),
+            draw: self.jitter.draw(),
+        }
+    }
 }
 
 /// The runner of `shared`'s project until `stop`.
@@ -151,6 +187,7 @@ pub(super) async fn run(
     clock: Arc<dyn Clock>,
     settings: ReconcileSettings,
     host_epoch: i64,
+    jitter: Arc<Jitter>,
     mut stop: watch::Receiver<bool>,
 ) {
     let mut watermark = shared.store.watermark();
@@ -161,6 +198,7 @@ pub(super) async fn run(
         clock,
         host_epoch,
         passes: AtomicU64::new(0),
+        jitter,
         inflight: Mutex::new(BTreeMap::new()),
     });
     let mut renewed = Instant::now();
@@ -237,17 +275,17 @@ async fn tick(
         *renewed = Instant::now();
     }
     let waiting = store.runner_waiting(&project_id).await?;
-    let context = Context {
-        now: Some(now),
+    // The time taken afresh for each pace and each round, never one from before an awaited step (a settle, the
+    // writer's queue): a round after the deadline dispatches nothing (M2T19R-04).
+    let at = || Context {
+        now: Some(common.clock.now()),
+        wall: Some(common.clock.wall()),
         ..context.clone()
     };
     for run in &waiting.runs {
-        while store
-            .schedule_round(run, context.clone())
-            .await?
-            .dispatched
-            .is_some()
-        {}
+        // The run as a whole first: woken when a retry is due, parked, blocked or stopped (ADR-020 decisions 4, 5, 7).
+        store.pace_run(run, at()).await?;
+        while store.schedule_round(run, at()).await?.dispatched.is_some() {}
     }
     for (message_id, _) in &waiting.started {
         store.ack_notice(message_id).await?;
@@ -318,7 +356,10 @@ async fn attempt(
         return Ok(());
     }
     hooks.runner(RunnerPoint::AfterAck);
-    if !store.runner_received(notice.clone()).await? {
+    if !store
+        .runner_received(notice.clone(), common.clock.now())
+        .await?
+    {
         return Ok(());
     }
     let key = work.effect_key.clone();
@@ -327,7 +368,10 @@ async fn attempt(
         Err(detail) => {
             // Nothing ran: its work stays PREPARED, the attempt fails from STARTING and its task is READY again.
             store
-                .runner_finished(&id, false, &format!("the process did not start: {detail}"))
+                .runner_finished(
+                    &id,
+                    common.failed(format!("the process did not start: {detail}")),
+                )
                 .await?;
             return Ok(());
         }
@@ -340,7 +384,10 @@ async fn attempt(
     let Some(who) = who else {
         drop(started);
         store
-            .runner_finished(&id, false, "the identity of its process could not be read")
+            .runner_finished(
+                &id,
+                common.failed("the identity of its process could not be read".to_owned()),
+            )
             .await?;
         return Ok(());
     };
@@ -382,7 +429,19 @@ async fn attempt(
         .await?;
         return Ok(());
     };
-    let observed = json!({"success": outcome.success, "detail": outcome.detail});
+    // The class and the time it ended go with the outcome, so a host that crashes after OBSERVED retries it as it would
+    // have, from the time it ended (ADR-020 decision 1, M2T19R-03).
+    let ended = common.clock.now();
+    let mut observed = json!({
+        "success": outcome.success,
+        "detail": outcome.detail,
+        "ended_at": hoh_core::time::rfc3339_utc(ended),
+    });
+    if let (Some(observed), Value::Object(class)) =
+        (observed.as_object_mut(), outcome.class.to_json())
+    {
+        observed.extend(class);
+    }
     if !store
         .runner_effect(
             &id,
@@ -427,7 +486,16 @@ async fn attempt(
     }
     hooks.runner(RunnerPoint::AfterEffectCommitted);
     store
-        .runner_finished(&id, outcome.success, &outcome.detail)
+        .runner_finished(
+            &id,
+            Ending {
+                success: outcome.success,
+                detail: outcome.detail.clone(),
+                class: outcome.class,
+                at: ended,
+                draw: common.jitter.draw(),
+            },
+        )
         .await?;
     Ok(())
 }
@@ -572,7 +640,14 @@ async fn settle(
         work_outcome: row.work_outcome,
     });
     store
-        .reconcile_apply(row, disposition.clone(), process, cause)
+        .reconcile_apply(
+            row,
+            disposition.clone(),
+            process,
+            cause,
+            common.clock.now(),
+            common.jitter.draw(),
+        )
         .await?;
     Ok(Some((disposition, finding)))
 }

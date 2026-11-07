@@ -1,0 +1,837 @@
+//! A task's failure, waiting and blocking, and a run's pace (REQ-042; docs/adr/ADR-020.md decisions 3-7).
+//!
+//! [`fail_task`] is the one place a failed attempt's task is decided, inside the transaction that ends the attempt:
+//! its `attempt_count`, its `next_retry_at` or its blocked reason, its state and the events (every failure path uses
+//! it, ADR-020 decision 3). [`pace`] is the per-tick look at a run as a whole: a WAITING_EXTERNAL run whose retry is
+//! due works again; a working run with a cost limit it cannot enforce, a task its session cannot run, a stopped
+//! budget, nothing left but waiting, or nothing able to move on, becomes BLOCKED, INCOMPLETE or WAITING_EXTERNAL.
+
+use super::decide::{child_id, load_binding};
+use super::writer::{self, Change, Commit, Ctx, NewEvent, StateCas};
+use super::{PersistError, sqlite_error};
+use crate::budget::{self, Budget, Ledger};
+use crate::decision::Context;
+use crate::lifecycle::Lifecycle as _;
+use crate::protocol::{BlockedReason, RunState, TaskState};
+use crate::retry::{AfterFailure, FailureClass};
+use crate::time::rfc3339_utc;
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use serde_json::{Value, json};
+use std::time::SystemTime;
+
+/// A failed attempt, as its task is decided by it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Failure {
+    pub class: FailureClass,
+    /// When it failed (the injected clock; the store keeps the second).
+    pub at: SystemTime,
+    /// A uniform 32-bit draw for the jitter.
+    pub draw: u32,
+}
+
+/// The task a failure is for, as the caller read it in its transaction.
+pub(super) struct TaskRef<'a> {
+    pub project_id: &'a str,
+    pub run_id: &'a str,
+    pub task_id: &'a str,
+    pub state: TaskState,
+    pub revision: i64,
+}
+
+/// The task's move and events for the caller's commit (the columns are written already).
+pub(super) struct Failed {
+    pub cas: Option<StateCas>,
+    pub events: Vec<NewEvent>,
+}
+
+fn event(project_id: &str, run_id: &str, id: String, kind: &str, payload: Value) -> NewEvent {
+    NewEvent {
+        project_id: project_id.to_owned(),
+        event_id: id,
+        run_id: Some(run_id.to_owned()),
+        kind: kind.to_owned(),
+        payload,
+    }
+}
+
+fn millis(d: std::time::Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Decide `task` after `attempt_id` failed with `failure` (ADR-020 decisions 2 and 3): one more failure in its
+/// `attempt_count`, then READY at its `next_retry_at`, or BLOCKED for authentication, capability or a decision once
+/// its retries are used up (with a `need_decision` event). A task no longer LEASED or RUNNING is left alone.
+pub(super) fn fail_task(
+    tx: &Transaction<'_>,
+    task: &TaskRef<'_>,
+    attempt_id: &str,
+    failure: &Failure,
+) -> Result<Failed, PersistError> {
+    if !matches!(task.state, TaskState::Running | TaskState::Leased) {
+        return Ok(Failed {
+            cas: None,
+            events: Vec::new(),
+        });
+    }
+    let count: i64 = tx
+        .query_row(
+            "SELECT attempt_count FROM tasks WHERE task_id = ?1",
+            params![task.task_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    let failures = u32::try_from(count.saturating_add(1)).unwrap_or(u32::MAX);
+    let after = crate::retry::after_failure(failure.class, failures, failure.at, failure.draw);
+    let mut events = Vec::new();
+    let (to, next, reason) = match after {
+        AfterFailure::Retry {
+            next_retry_at,
+            delay,
+            bound,
+        } => {
+            let next = rfc3339_utc(next_retry_at);
+            events.push(event(
+                task.project_id,
+                task.run_id,
+                child_id(attempt_id, "retry"),
+                "task.retry_scheduled",
+                json!({
+                    "task_id": task.task_id,
+                    "attempt_id": attempt_id,
+                    "attempt_count": failures,
+                    "failure": failure.class.to_json(),
+                    "failed_at": rfc3339_utc(failure.at),
+                    "next_retry_at": next,
+                    "delay_ms": millis(delay),
+                    "bound_ms": bound.map(millis),
+                    "draw": failure.draw,
+                }),
+            ));
+            (TaskState::Ready, Some(next), None)
+        }
+        AfterFailure::Blocked(reason) => (TaskState::Blocked, None, Some(reason)),
+        AfterFailure::Exhausted => {
+            events.push(event(
+                task.project_id,
+                task.run_id,
+                child_id(attempt_id, "need_decision"),
+                "need_decision",
+                json!({
+                    "run_id": task.run_id,
+                    "task_id": task.task_id,
+                    "attempt_id": attempt_id,
+                    "reason": "retries_exhausted",
+                    "attempt_count": failures,
+                    "detail": format!(
+                        "{} failed {failures} times; {} retries are used up",
+                        task.task_id,
+                        crate::retry::MAX_RETRIES
+                    ),
+                }),
+            ));
+            (TaskState::Blocked, None, Some(BlockedReason::NeedDecision))
+        }
+    };
+    if let Some(reason) = reason {
+        events.push(event(
+            task.project_id,
+            task.run_id,
+            child_id(attempt_id, "blocked"),
+            "task.blocked",
+            json!({
+                "task_id": task.task_id,
+                "attempt_id": attempt_id,
+                "reason": reason.as_str(),
+                "attempt_count": failures,
+                "failure": failure.class.to_json(),
+            }),
+        ));
+    }
+    tx.execute(
+        "UPDATE tasks SET attempt_count = ?1, next_retry_at = ?2, blocked_reason = COALESCE(?3, blocked_reason) \
+         WHERE task_id = ?4",
+        params![
+            i64::from(failures),
+            next,
+            reason.map(|r| r.as_str()),
+            task.task_id
+        ],
+    )
+    .map_err(sqlite_error)?;
+    Ok(Failed {
+        cas: Some(StateCas {
+            id: task.task_id.to_owned(),
+            expected_revision: task.revision,
+            change: Change::Task(to),
+        }),
+        events,
+    })
+}
+
+/// Add the attempt's running time to its run's `wall_seconds` budget, if it has one (ADR-020 decision 7): the used
+/// duration changes only when an attempt ends, so a waiting run's is the same across a crash and a restart.
+pub(super) fn accrue_wall(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    attempt_id: &str,
+    ended_at: SystemTime,
+) -> Result<(), PersistError> {
+    let started: Option<String> = tx
+        .query_row(
+            "SELECT started_at FROM attempts WHERE attempt_id = ?1",
+            params![attempt_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?
+        .flatten();
+    let Some(started) = started.as_deref().and_then(crate::time::parse_rfc3339) else {
+        return Ok(());
+    };
+    let ended = crate::time::parse_rfc3339(&rfc3339_utc(ended_at)).unwrap_or(ended_at);
+    let seconds = ended.duration_since(started).map_or(0, |d| d.as_secs());
+    tx.execute(
+        "UPDATE budgets SET used_value = used_value + ?1 WHERE scope_kind = 'run' AND scope_id = ?2 \
+         AND kind = 'wall_seconds'",
+        params![seconds as f64, run_id],
+    )
+    .map_err(sqlite_error)?;
+    Ok(())
+}
+
+/// The run's budget at `now`: its run-scope rows and its deadline, the duration its unfinished attempts have run so
+/// far counted as reserved (M2T19R-02: a running attempt's time counts before it ends; settled into `used` when it
+/// does, so nothing is counted twice).
+pub(super) fn load_budget(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    now: SystemTime,
+) -> Result<Budget, PersistError> {
+    let mut budget = Budget::default();
+    let deadline: Option<String> = tx
+        .query_row(
+            "SELECT deadline_at FROM runs WHERE run_id = ?1",
+            params![run_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?
+        .flatten();
+    if let Some(text) = deadline {
+        budget.deadline_at = Some(crate::time::parse_rfc3339(&text).ok_or_else(|| {
+            PersistError::IntegrityViolation(format!("runs.deadline_at of {run_id}: {text}"))
+        })?);
+    }
+    let mut statement = tx
+        .prepare(
+            "SELECT kind, limit_value, used_value, reserved_value, price_known FROM budgets \
+             WHERE scope_kind = 'run' AND scope_id = ?1",
+        )
+        .map_err(sqlite_error)?;
+    let rows = statement
+        .query_map(params![run_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<f64>>(1)?,
+                r.get::<_, f64>(2)?,
+                r.get::<_, f64>(3)?,
+                r.get::<_, bool>(4)?,
+            ))
+        })
+        .map_err(sqlite_error)?;
+    for row in rows {
+        let (kind, limit, used, reserved, price_known) = row.map_err(sqlite_error)?;
+        let ledger = Ledger {
+            limit,
+            used,
+            reserved,
+        };
+        match kind.as_str() {
+            "iterations" => budget.iterations = Some(ledger),
+            "wall_seconds" => budget.wall_seconds = Some(ledger),
+            "usd" => budget.usd = Some((ledger, price_known)),
+            _ => {}
+        }
+    }
+    drop(statement);
+    if let Some(wall) = &mut budget.wall_seconds {
+        let mut statement = tx
+            .prepare(
+                "SELECT a.started_at FROM attempts a JOIN tasks t ON t.task_id = a.task_id WHERE t.run_id = ?1 \
+                 AND a.state IN ('STARTING', 'RUNNING') AND a.started_at IS NOT NULL",
+            )
+            .map_err(sqlite_error)?;
+        let started = statement
+            .query_map(params![run_id], |r| r.get::<_, String>(0))
+            .map_err(sqlite_error)?;
+        for at in started {
+            let at = at.map_err(sqlite_error)?;
+            if let Some(since) = crate::time::parse_rfc3339(&at) {
+                wall.reserved += now.duration_since(since).map_or(0, |d| d.as_secs()) as f64;
+            }
+        }
+    }
+    Ok(budget)
+}
+
+/// Why run `run_id`'s budget lets nothing more be dispatched at `context`'s time, if it does: a stop (the deadline by
+/// the wall clock) or a cost limit it cannot enforce; one rule for the rounds, the pace and the decide path
+/// (M2T19R-01).
+pub(super) fn budget_stop(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    context: &Context,
+) -> Result<Option<&'static str>, PersistError> {
+    let budget = load_budget(tx, run_id, context.now())?;
+    Ok(if budget::unenforceable(&budget) {
+        Some("max_usd with an unknown price")
+    } else {
+        budget::stop(&budget, context.wall()).map(budget::Stop::as_str)
+    })
+}
+
+/// BlockedReason precedence for a run (protocol.schema.json): BLOCKED_AUTH > COMMANDER_UNAVAILABLE >
+/// BUDGET_UNENFORCEABLE > BLOCKED_CAPABILITY > NEED_DECISION; the others after them.
+fn precedence(reason: BlockedReason) -> u8 {
+    match reason {
+        BlockedReason::BlockedAuth => 0,
+        BlockedReason::CommanderUnavailable => 1,
+        BlockedReason::BudgetUnenforceable => 2,
+        BlockedReason::BlockedCapability => 3,
+        BlockedReason::NeedDecision => 4,
+        _ => 5,
+    }
+}
+
+/// What a pace did to a run.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Paced {
+    /// A WAITING_EXTERNAL run whose retry came due, back in its state.
+    pub woke: bool,
+    /// The run now waits for this retry (WAITING_EXTERNAL).
+    pub waiting_until: Option<String>,
+    /// The run is now BLOCKED, for these reasons.
+    pub blocked: Vec<BlockedReason>,
+    /// The run is now INCOMPLETE, for this stop.
+    pub incomplete: Option<&'static str>,
+    /// Tasks moved to BLOCKED because their session lacks a required capability.
+    pub capability_blocked: Vec<String>,
+}
+
+struct TaskRow {
+    task_id: String,
+    state: TaskState,
+    revision: i64,
+    role: String,
+    next_retry_at: Option<String>,
+    blocked_reason: Option<String>,
+    open: i64,
+}
+
+/// What blocks the run's BLOCKED tasks, by precedence, each once.
+fn blocked_reasons(tasks: &[TaskRow]) -> Vec<BlockedReason> {
+    let mut reasons: Vec<BlockedReason> = tasks
+        .iter()
+        .filter(|t| t.state == TaskState::Blocked)
+        .filter_map(|t| t.blocked_reason.as_deref())
+        .filter_map(BlockedReason::parse)
+        .collect();
+    reasons.sort_by_key(|r| precedence(*r));
+    reasons.dedup();
+    reasons
+}
+
+/// The run's tasks not yet ACCEPTED or CANCELLED, as `run.incomplete` lists them.
+fn remaining(tasks: &[TaskRow]) -> Vec<&str> {
+    tasks
+        .iter()
+        .filter(|t| !matches!(t.state, TaskState::Accepted | TaskState::Cancelled))
+        .map(|t| t.task_id.as_str())
+        .collect()
+}
+
+/// One look at run `run_id` at `context.now()` (ADR-020 decisions 4, 5 and 7); a pace that changes nothing writes
+/// nothing.
+pub(super) fn pace(
+    conn: &mut Connection,
+    run_id: &str,
+    context: &Context,
+    ctx: &Ctx<'_>,
+) -> Result<Paced, PersistError> {
+    let now = context.now();
+    let at = rfc3339_utc(now);
+    let tx = writer::begin(conn, ctx)?;
+    let run: Option<(String, String, i64, Option<String>, String)> = tx
+        .query_row(
+            "SELECT project_id, state, revision, resume_state, blocked_reasons_json FROM runs WHERE run_id = ?1",
+            params![run_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some((project_id, state, revision, resume, blockers)) = run else {
+        return Err(PersistError::RunNotFound(run_id.to_owned()));
+    };
+    let state = writer::parse::<RunState>(&state)?;
+    let working = matches!(state, RunState::Running | RunState::Verifying);
+    if !working && state != RunState::WaitingExternal {
+        return Ok(Paced::default());
+    }
+    let mut statement = tx
+        .prepare(
+            "SELECT t.task_id, t.state, t.revision, t.role, t.next_retry_at, t.blocked_reason, \
+             (SELECT count(*) FROM task_dependencies d JOIN tasks u ON u.task_id = d.depends_on \
+              WHERE d.task_id = t.task_id AND u.state <> 'ACCEPTED') \
+             FROM tasks t WHERE t.run_id = ?1 ORDER BY t.created_seq, t.task_id",
+        )
+        .map_err(sqlite_error)?;
+    let mut tasks = Vec::new();
+    for row in statement
+        .query_map(params![run_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, i64>(6)?,
+            ))
+        })
+        .map_err(sqlite_error)?
+    {
+        let (task_id, state, revision, role, next_retry_at, blocked_reason, open) =
+            row.map_err(sqlite_error)?;
+        tasks.push(TaskRow {
+            task_id,
+            state: writer::parse::<TaskState>(&state)?,
+            revision,
+            role,
+            next_retry_at,
+            blocked_reason,
+            open,
+        });
+    }
+    drop(statement);
+    // Which tasks are due (READY, or PENDING with every dependency ACCEPTED, and no retry in the future) and which
+    // wait for a retry.
+    let due = |t: &TaskRow| {
+        (t.state == TaskState::Ready || (t.state == TaskState::Pending && t.open == 0))
+            && t.next_retry_at
+                .as_deref()
+                .is_none_or(|next| next <= at.as_str())
+    };
+    let waiting = |t: &TaskRow| {
+        t.state == TaskState::Ready
+            && t.next_retry_at
+                .as_deref()
+                .is_some_and(|next| next > at.as_str())
+    };
+    let budget = load_budget(&tx, run_id, now)?;
+    let mut paced = Paced::default();
+    let mut commit = Commit::default();
+    let run_cas = |to: RunState| StateCas {
+        id: run_id.to_owned(),
+        expected_revision: revision,
+        change: Change::Run(to),
+    };
+    let stop = budget::stop(&budget, context.wall());
+    let unfinished: i64 = tx
+        .query_row(
+            "SELECT count(*) FROM attempts a JOIN tasks t ON t.task_id = a.task_id WHERE t.run_id = ?1 \
+             AND a.state IN ('PREPARED', 'STARTING', 'RUNNING')",
+            params![run_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    if state == RunState::WaitingExternal {
+        if let Some(stop) = stop {
+            commit.cas.push(run_cas(RunState::Incomplete));
+            commit.events.push(event(
+                &project_id,
+                run_id,
+                child_id(run_id, &format!("incomplete/{revision}")),
+                "run.incomplete",
+                json!({"stop": stop.as_str(), "from": state.as_str(), "remaining": remaining(&tasks)}),
+            ));
+            paced.incomplete = Some(stop.as_str());
+        } else if tasks.iter().any(due) {
+            let to = resume
+                .as_deref()
+                .map(writer::parse::<RunState>)
+                .transpose()?
+                .unwrap_or(RunState::Running);
+            commit.cas.push(run_cas(to));
+            commit.events.push(event(
+                &project_id,
+                run_id,
+                child_id(run_id, &format!("resumed/{revision}")),
+                "run.resumed",
+                json!({"from": state.as_str(), "to": to.as_str(), "due": tasks.iter().filter(|t| due(t)).map(|t| t.task_id.as_str()).collect::<Vec<_>>()}),
+            ));
+            paced.woke = true;
+        } else if !tasks.iter().any(waiting) {
+            // Nothing waits any more (its last waiting task was blocked, or moved on): blocked by what blocks its
+            // tasks, else back to work (M2T19R-05).
+            let reasons = blocked_reasons(&tasks);
+            if reasons.is_empty() {
+                let to = resume
+                    .as_deref()
+                    .map(writer::parse::<RunState>)
+                    .transpose()?
+                    .unwrap_or(RunState::Running);
+                commit.cas.push(run_cas(to));
+                commit.events.push(event(
+                    &project_id,
+                    run_id,
+                    child_id(run_id, &format!("resumed/{revision}")),
+                    "run.resumed",
+                    json!({"from": state.as_str(), "to": to.as_str(), "due": []}),
+                ));
+                paced.woke = true;
+            } else {
+                paced.blocked = block_run(&tx, run_id, &blockers, &reasons)?;
+                commit.cas.push(run_cas(RunState::Blocked));
+                commit.events.push(event(
+                    &project_id,
+                    run_id,
+                    child_id(run_id, &format!("blocked/{revision}")),
+                    "run.blocked",
+                    json!({"reasons": paced.blocked.iter().map(|r| r.as_str()).collect::<Vec<_>>(), "detail": "nothing of the run waits any more and no task can move on"}),
+                ));
+            }
+        } else {
+            return Ok(paced);
+        }
+    } else if budget::unenforceable(&budget) {
+        // A cost limit it cannot enforce: blocked before any dispatch (CR-002, AC-042-06).
+        paced.blocked = block_run(
+            &tx,
+            run_id,
+            &blockers,
+            &[BlockedReason::BudgetUnenforceable],
+        )?;
+        commit.cas.push(run_cas(RunState::Blocked));
+        commit.events.push(event(
+            &project_id,
+            run_id,
+            child_id(run_id, &format!("blocked/{revision}")),
+            "run.blocked",
+            json!({"reasons": paced.blocked.iter().map(|r| r.as_str()).collect::<Vec<_>>(), "detail": "a cost limit is set while the price is unknown"}),
+        ));
+    } else {
+        // Tasks their session cannot run are blocked, not left out silently (AC-042-03 R2; ADR-020 decision 5).
+        for task in tasks.iter_mut().filter(|t| due(t)) {
+            let (Some(binding), Some(required)) = (
+                load_binding(&tx, run_id, &task.role)?,
+                context.required_capabilities.get(&task.role),
+            ) else {
+                continue;
+            };
+            if !binding.active || required.is_subset(&binding.capabilities) {
+                continue;
+            }
+            let missing: Vec<&String> = required.difference(&binding.capabilities).collect();
+            tx.execute(
+                "UPDATE tasks SET blocked_reason = ?1, next_retry_at = NULL WHERE task_id = ?2",
+                params![BlockedReason::BlockedCapability.as_str(), task.task_id],
+            )
+            .map_err(sqlite_error)?;
+            commit.cas.push(StateCas {
+                id: task.task_id.clone(),
+                expected_revision: task.revision,
+                change: Change::Task(TaskState::Blocked),
+            });
+            commit.events.push(event(
+                &project_id,
+                run_id,
+                child_id(&task.task_id, &format!("blocked/{}", task.revision)),
+                "task.blocked",
+                json!({"task_id": task.task_id, "reason": BlockedReason::BlockedCapability.as_str(), "missing": missing}),
+            ));
+            paced.capability_blocked.push(task.task_id.clone());
+            task.state = TaskState::Blocked;
+            task.blocked_reason = Some(BlockedReason::BlockedCapability.as_str().to_owned());
+        }
+        let in_flight = tasks.iter().any(|t| {
+            matches!(
+                t.state,
+                TaskState::Leased
+                    | TaskState::Running
+                    | TaskState::Implemented
+                    | TaskState::Verifying
+            )
+        });
+        if let Some(stop) = stop {
+            if unfinished == 0 {
+                commit.cas.push(run_cas(RunState::Incomplete));
+                commit.events.push(event(
+                    &project_id,
+                    run_id,
+                    child_id(run_id, &format!("incomplete/{revision}")),
+                    "run.incomplete",
+                    json!({"stop": stop.as_str(), "from": state.as_str(), "remaining": remaining(&tasks)}),
+                ));
+                paced.incomplete = Some(stop.as_str());
+            }
+        } else if unfinished == 0 && !in_flight && !tasks.iter().any(due) {
+            if let Some(next) = tasks
+                .iter()
+                .filter(|t| waiting(t))
+                .filter_map(|t| t.next_retry_at.clone())
+                .min()
+            {
+                commit.cas.push(run_cas(RunState::WaitingExternal));
+                commit.events.push(event(
+                    &project_id,
+                    run_id,
+                    child_id(run_id, &format!("waiting/{revision}")),
+                    "run.waiting",
+                    json!({"next_retry_at": next, "waiting": tasks.iter().filter(|t| waiting(t)).map(|t| t.task_id.as_str()).collect::<Vec<_>>()}),
+                ));
+                paced.waiting_until = Some(next);
+            } else {
+                let reasons = blocked_reasons(&tasks);
+                if !reasons.is_empty() {
+                    // Nothing of the run can move on: it is blocked by what blocks its tasks (ADR-020 decision 5).
+                    paced.blocked = block_run(&tx, run_id, &blockers, &reasons)?;
+                    commit.cas.push(run_cas(RunState::Blocked));
+                    commit.events.push(event(
+                        &project_id,
+                        run_id,
+                        child_id(run_id, &format!("blocked/{revision}")),
+                        "run.blocked",
+                        json!({"reasons": paced.blocked.iter().map(|r| r.as_str()).collect::<Vec<_>>(), "detail": "no task of the run can move on"}),
+                    ));
+                }
+            }
+        }
+    }
+    if commit.cas.is_empty() {
+        return Ok(paced);
+    }
+    writer::write(&tx, &commit, ctx)?;
+    ctx.before_commit()?;
+    tx.commit().map_err(sqlite_error)?;
+    Ok(paced)
+}
+
+/// Record `reasons` in the run's blocker set (kept with those already there) and its `blocked_reason` as the set's
+/// first by precedence; the set, ordered.
+fn block_run(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    blockers: &str,
+    reasons: &[BlockedReason],
+) -> Result<Vec<BlockedReason>, PersistError> {
+    let mut set: Vec<BlockedReason> = serde_json::from_str::<Vec<String>>(blockers)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|r| BlockedReason::parse(r))
+        .chain(reasons.iter().copied())
+        .collect();
+    set.sort_by_key(|r| precedence(*r));
+    set.dedup();
+    let json: Vec<&str> = set.iter().map(|r| r.as_str()).collect();
+    tx.execute(
+        "UPDATE runs SET blocked_reasons_json = ?1, blocked_reason = ?2 WHERE run_id = ?3",
+        params![
+            serde_json::to_string(&json).map_err(|e| PersistError::Storage(e.to_string()))?,
+            set.first().map(|r| r.as_str()),
+            run_id
+        ],
+    )
+    .map_err(sqlite_error)?;
+    Ok(set)
+}
+
+/// A repair a task asks for (REQ-042 behaviour 5, ADR-020 decision 10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Repair {
+    /// A local repair of the issue with this fingerprint.
+    Local { fingerprint: String },
+    /// A protocol-format correction of this attempt.
+    Protocol { attempt_id: String },
+}
+
+impl Repair {
+    /// The kind of the events that count it.
+    fn kind(&self) -> &'static str {
+        match self {
+            Repair::Local { .. } => "repair.local",
+            Repair::Protocol { .. } => "repair.protocol",
+        }
+    }
+
+    /// The payload field naming what it repairs, and its value.
+    fn key(&self) -> (&'static str, &str) {
+        match self {
+            Repair::Local { fingerprint } => ("fingerprint", fingerprint),
+            Repair::Protocol { attempt_id } => ("attempt_id", attempt_id),
+        }
+    }
+
+    /// The `need_decision` reason once its limit is reached.
+    fn exhausted(&self) -> &'static str {
+        match self {
+            Repair::Local { .. } => "local_repairs_exhausted",
+            Repair::Protocol { .. } => "protocol_repairs_exhausted",
+        }
+    }
+}
+
+/// A request for one more repair of `task_id`, `limit` being `max_local_repairs` or `max_protocol_repairs`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepairRequest {
+    pub run_id: String,
+    pub task_id: String,
+    pub repair: Repair,
+    pub limit: u32,
+    pub detail: String,
+}
+
+/// The answer to a [`RepairRequest`]: granted as the `count`-th, or refused with `count` already done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepairVerdict {
+    Granted { count: u32 },
+    Refused { count: u32 },
+}
+
+/// How many repairs of `repair` run `run_id` was granted: its counting events (append-only, so a restart keeps them).
+pub(super) fn repair_count(
+    conn: &Connection,
+    run_id: &str,
+    repair: &Repair,
+) -> Result<u32, PersistError> {
+    let (field, key) = repair.key();
+    let n: i64 = conn
+        .query_row(
+            &format!(
+                "SELECT count(*) FROM events WHERE run_id = ?1 AND kind = ?2 \
+                 AND json_extract(payload_json, '$.{field}') = ?3"
+            ),
+            params![run_id, repair.kind(), key],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    Ok(u32::try_from(n).unwrap_or(u32::MAX))
+}
+
+/// Grant `request` as one more counted repair, or, once its limit is reached, dispatch nothing: one `need_decision`
+/// event and the task BLOCKED for a decision (REQ-042 behaviour 5; ADR-020 decision 10).
+pub(super) fn request_repair(
+    conn: &mut Connection,
+    request: &RepairRequest,
+    ctx: &Ctx<'_>,
+) -> Result<RepairVerdict, PersistError> {
+    let tx = writer::begin(conn, ctx)?;
+    let task: Option<(String, String, i64)> = tx
+        .query_row(
+            "SELECT r.project_id, t.state, t.revision FROM tasks t JOIN runs r ON r.run_id = t.run_id \
+             WHERE t.task_id = ?1 AND t.run_id = ?2",
+            params![request.task_id, request.run_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some((project_id, state, revision)) = task else {
+        return Err(PersistError::IntegrityViolation(format!(
+            "no task {} in run {}",
+            request.task_id, request.run_id
+        )));
+    };
+    let state = writer::parse::<TaskState>(&state)?;
+    let count = repair_count(&tx, &request.run_id, &request.repair)?;
+    let (field, key) = request.repair.key();
+    let mut commit = Commit::default();
+    let verdict = if count < request.limit {
+        let n = count + 1;
+        commit.events.push(event(
+            &project_id,
+            &request.run_id,
+            child_id(&request.run_id, &format!("{}/{key}/{n}", request.repair.kind())),
+            request.repair.kind(),
+            json!({"task_id": request.task_id, field: key, "count": n, "limit": request.limit, "detail": request.detail}),
+        ));
+        RepairVerdict::Granted { count: n }
+    } else {
+        let refused: i64 = tx
+            .query_row(
+                &format!(
+                    "SELECT count(*) FROM events WHERE run_id = ?1 AND kind = 'need_decision' \
+                     AND json_extract(payload_json, '$.reason') = ?2 AND json_extract(payload_json, '$.{field}') = ?3"
+                ),
+                params![request.run_id, request.repair.exhausted(), key],
+                |r| r.get(0),
+            )
+            .map_err(sqlite_error)?;
+        commit.events.push(event(
+            &project_id,
+            &request.run_id,
+            child_id(
+                &request.run_id,
+                &format!("need_decision/{}/{key}/{}", request.repair.kind(), refused + 1),
+            ),
+            "need_decision",
+            json!({
+                "run_id": request.run_id, "task_id": request.task_id, "reason": request.repair.exhausted(), field: key,
+                "count": count, "limit": request.limit, "detail": request.detail,
+            }),
+        ));
+        if !matches!(
+            state,
+            TaskState::Blocked | TaskState::Accepted | TaskState::Cancelled
+        ) {
+            tx.execute(
+                "UPDATE tasks SET blocked_reason = ?1, next_retry_at = NULL WHERE task_id = ?2",
+                params![BlockedReason::NeedDecision.as_str(), request.task_id],
+            )
+            .map_err(sqlite_error)?;
+            commit.cas.push(StateCas {
+                id: request.task_id.clone(),
+                expected_revision: revision,
+                change: Change::Task(TaskState::Blocked),
+            });
+        }
+        RepairVerdict::Refused { count }
+    };
+    writer::write(&tx, &commit, ctx)?;
+    ctx.before_commit()?;
+    tx.commit().map_err(sqlite_error)?;
+    Ok(verdict)
+}
+
+/// The cost of run `run_id` (CR-009, ADR-020 decision 9): known only when its price is known (its run-scope usd row
+/// says so) and every attempt has a billed cost, then their sum (0 with no attempt); otherwise unknown and null,
+/// never an estimate.
+pub(super) fn run_cost(
+    conn: &Connection,
+    run_id: &str,
+) -> Result<(Option<f64>, crate::protocol::CostStatus), PersistError> {
+    use crate::protocol::CostStatus;
+    let price_known: bool = conn
+        .query_row(
+            "SELECT price_known FROM budgets WHERE scope_kind = 'run' AND scope_id = ?1 AND kind = 'usd'",
+            params![run_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?
+        .unwrap_or(false);
+    let (unbilled, total): (i64, f64) = conn
+        .query_row(
+            "SELECT count(*) FILTER (WHERE a.cost_usd IS NULL), COALESCE(sum(a.cost_usd), 0) FROM attempts a \
+             JOIN tasks t ON t.task_id = a.task_id WHERE t.run_id = ?1",
+            params![run_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(sqlite_error)?;
+    Ok(if price_known && unbilled == 0 {
+        (Some(total), CostStatus::Known)
+    } else {
+        (None, CostStatus::Unknown)
+    })
+}
+
+#[cfg(test)]
+mod tests;
