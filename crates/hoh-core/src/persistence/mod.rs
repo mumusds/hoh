@@ -28,7 +28,7 @@ pub use outbox::{ConsumeEffect, Consumed, OutboxRow, Settlement, backoff};
 pub use plan::Imported;
 pub use reconcile::{EffectRow, UnfinishedRow};
 pub use results::{TaskResultOutcome, VERIFIERS};
-pub use retry::{Failure, Paced};
+pub use retry::{Failure, Paced, Repair, RepairRequest, RepairVerdict};
 pub use rounds::{Dispatched, RoundOutcome};
 pub use runner::{DispatchNotice, Ending, RUNNER, Waiting};
 pub mod location;
@@ -750,6 +750,29 @@ impl Store {
         .await
     }
 
+    /// One more repair of a task, or, past its limit, its refusal: nothing dispatched, a `need_decision` event and the
+    /// task BLOCKED for a decision (REQ-042 behaviour 5; ADR-020 decision 10).
+    pub async fn request_repair(
+        &self,
+        request: RepairRequest,
+    ) -> Result<RepairVerdict, PersistError> {
+        match self
+            .writer
+            .runner(runner::RunnerJob::Repair(Box::new(request)))
+            .await?
+        {
+            runner::RunnerDone::Repair(verdict) => Ok(verdict),
+            _ => Err(PersistError::IntegrityViolation(
+                "a repair request answered with something else".to_owned(),
+            )),
+        }
+    }
+
+    /// How many repairs of `repair` run `run_id` was granted (the persisted count).
+    pub async fn repair_count(&self, run_id: &str, repair: &Repair) -> Result<u32, PersistError> {
+        self.reader()?.repair_count(run_id, repair)
+    }
+
     /// One look at run `run_id` as a whole at `context.now()` (ADR-020 decisions 4, 5 and 7): woken from
     /// WAITING_EXTERNAL when a retry is due; BLOCKED for a cost limit it cannot enforce, a task its session cannot run
     /// or nothing able to move on; INCOMPLETE when its budget stops it; WAITING_EXTERNAL when only retries are left.
@@ -1127,6 +1150,19 @@ impl Reader {
 
     pub fn pragmas(&self) -> Result<Pragmas, PersistError> {
         pragmas(&self.conn)
+    }
+
+    /// The cost of run `run_id` and whether it is known (CR-009: `RunResult.cost_usd`/`cost_status`).
+    pub fn run_cost(
+        &self,
+        run_id: &str,
+    ) -> Result<(Option<f64>, crate::protocol::CostStatus), PersistError> {
+        retry::run_cost(&self.conn, run_id)
+    }
+
+    /// How many repairs of `repair` run `run_id` was granted.
+    pub fn repair_count(&self, run_id: &str, repair: &Repair) -> Result<u32, PersistError> {
+        retry::repair_count(&self.conn, run_id, repair)
     }
 
     /// The attempt `attempt_id`, if it exists.

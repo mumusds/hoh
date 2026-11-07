@@ -568,3 +568,194 @@ fn block_run(
     .map_err(sqlite_error)?;
     Ok(set)
 }
+
+/// A repair a task asks for (REQ-042 behaviour 5, ADR-020 decision 10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Repair {
+    /// A local repair of the issue with this fingerprint.
+    Local { fingerprint: String },
+    /// A protocol-format correction of this attempt.
+    Protocol { attempt_id: String },
+}
+
+impl Repair {
+    /// The kind of the events that count it.
+    fn kind(&self) -> &'static str {
+        match self {
+            Repair::Local { .. } => "repair.local",
+            Repair::Protocol { .. } => "repair.protocol",
+        }
+    }
+
+    /// The payload field naming what it repairs, and its value.
+    fn key(&self) -> (&'static str, &str) {
+        match self {
+            Repair::Local { fingerprint } => ("fingerprint", fingerprint),
+            Repair::Protocol { attempt_id } => ("attempt_id", attempt_id),
+        }
+    }
+
+    /// The `need_decision` reason once its limit is reached.
+    fn exhausted(&self) -> &'static str {
+        match self {
+            Repair::Local { .. } => "local_repairs_exhausted",
+            Repair::Protocol { .. } => "protocol_repairs_exhausted",
+        }
+    }
+}
+
+/// A request for one more repair of `task_id`, `limit` being `max_local_repairs` or `max_protocol_repairs`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepairRequest {
+    pub run_id: String,
+    pub task_id: String,
+    pub repair: Repair,
+    pub limit: u32,
+    pub detail: String,
+}
+
+/// The answer to a [`RepairRequest`]: granted as the `count`-th, or refused with `count` already done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepairVerdict {
+    Granted { count: u32 },
+    Refused { count: u32 },
+}
+
+/// How many repairs of `repair` run `run_id` was granted: its counting events (append-only, so a restart keeps them).
+pub(super) fn repair_count(
+    conn: &Connection,
+    run_id: &str,
+    repair: &Repair,
+) -> Result<u32, PersistError> {
+    let (field, key) = repair.key();
+    let n: i64 = conn
+        .query_row(
+            &format!(
+                "SELECT count(*) FROM events WHERE run_id = ?1 AND kind = ?2 \
+                 AND json_extract(payload_json, '$.{field}') = ?3"
+            ),
+            params![run_id, repair.kind(), key],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    Ok(u32::try_from(n).unwrap_or(u32::MAX))
+}
+
+/// Grant `request` as one more counted repair, or, once its limit is reached, dispatch nothing: one `need_decision`
+/// event and the task BLOCKED for a decision (REQ-042 behaviour 5; ADR-020 decision 10).
+pub(super) fn request_repair(
+    conn: &mut Connection,
+    request: &RepairRequest,
+    ctx: &Ctx<'_>,
+) -> Result<RepairVerdict, PersistError> {
+    let tx = writer::begin(conn, ctx)?;
+    let task: Option<(String, String, i64)> = tx
+        .query_row(
+            "SELECT r.project_id, t.state, t.revision FROM tasks t JOIN runs r ON r.run_id = t.run_id \
+             WHERE t.task_id = ?1 AND t.run_id = ?2",
+            params![request.task_id, request.run_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some((project_id, state, revision)) = task else {
+        return Err(PersistError::IntegrityViolation(format!(
+            "no task {} in run {}",
+            request.task_id, request.run_id
+        )));
+    };
+    let state = writer::parse::<TaskState>(&state)?;
+    let count = repair_count(&tx, &request.run_id, &request.repair)?;
+    let (field, key) = request.repair.key();
+    let mut commit = Commit::default();
+    let verdict = if count < request.limit {
+        let n = count + 1;
+        commit.events.push(event(
+            &project_id,
+            &request.run_id,
+            child_id(&request.run_id, &format!("{}/{key}/{n}", request.repair.kind())),
+            request.repair.kind(),
+            json!({"task_id": request.task_id, field: key, "count": n, "limit": request.limit, "detail": request.detail}),
+        ));
+        RepairVerdict::Granted { count: n }
+    } else {
+        let refused: i64 = tx
+            .query_row(
+                &format!(
+                    "SELECT count(*) FROM events WHERE run_id = ?1 AND kind = 'need_decision' \
+                     AND json_extract(payload_json, '$.reason') = ?2 AND json_extract(payload_json, '$.{field}') = ?3"
+                ),
+                params![request.run_id, request.repair.exhausted(), key],
+                |r| r.get(0),
+            )
+            .map_err(sqlite_error)?;
+        commit.events.push(event(
+            &project_id,
+            &request.run_id,
+            child_id(
+                &request.run_id,
+                &format!("need_decision/{}/{key}/{}", request.repair.kind(), refused + 1),
+            ),
+            "need_decision",
+            json!({
+                "run_id": request.run_id, "task_id": request.task_id, "reason": request.repair.exhausted(), field: key,
+                "count": count, "limit": request.limit, "detail": request.detail,
+            }),
+        ));
+        if !matches!(
+            state,
+            TaskState::Blocked | TaskState::Accepted | TaskState::Cancelled
+        ) {
+            tx.execute(
+                "UPDATE tasks SET blocked_reason = ?1, next_retry_at = NULL WHERE task_id = ?2",
+                params![BlockedReason::NeedDecision.as_str(), request.task_id],
+            )
+            .map_err(sqlite_error)?;
+            commit.cas.push(StateCas {
+                id: request.task_id.clone(),
+                expected_revision: revision,
+                change: Change::Task(TaskState::Blocked),
+            });
+        }
+        RepairVerdict::Refused { count }
+    };
+    writer::write(&tx, &commit, ctx)?;
+    ctx.before_commit()?;
+    tx.commit().map_err(sqlite_error)?;
+    Ok(verdict)
+}
+
+/// The cost of run `run_id` (CR-009, ADR-020 decision 9): known only when its price is known (its run-scope usd row
+/// says so) and every attempt has a billed cost, then their sum (0 with no attempt); otherwise unknown and null,
+/// never an estimate.
+pub(super) fn run_cost(
+    conn: &Connection,
+    run_id: &str,
+) -> Result<(Option<f64>, crate::protocol::CostStatus), PersistError> {
+    use crate::protocol::CostStatus;
+    let price_known: bool = conn
+        .query_row(
+            "SELECT price_known FROM budgets WHERE scope_kind = 'run' AND scope_id = ?1 AND kind = 'usd'",
+            params![run_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?
+        .unwrap_or(false);
+    let (unbilled, total): (i64, f64) = conn
+        .query_row(
+            "SELECT count(*) FILTER (WHERE a.cost_usd IS NULL), COALESCE(sum(a.cost_usd), 0) FROM attempts a \
+             JOIN tasks t ON t.task_id = a.task_id WHERE t.run_id = ?1",
+            params![run_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(sqlite_error)?;
+    Ok(if price_known && unbilled == 0 {
+        (Some(total), CostStatus::Known)
+    } else {
+        (None, CostStatus::Unknown)
+    })
+}
+
+#[cfg(test)]
+mod tests;

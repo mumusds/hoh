@@ -427,7 +427,7 @@ fn load_snapshot(
     let run_id = proposal.run_id.as_str();
     let commander_epoch = load_binding(tx, run_id, COMMANDER)?.map(|b| b.role_epoch);
     let task = match proposal.task_id() {
-        Some(id) => load_task(tx, run_id, id, run.spec_id.as_deref())?,
+        Some(id) => load_task(tx, run_id, id, run.spec_id.as_deref(), context.now())?,
         None => None,
     };
     let target = match proposal.target_role() {
@@ -482,16 +482,29 @@ fn load_task(
     run_id: &str,
     task_id: &str,
     run_spec: Option<&str>,
+    now: std::time::SystemTime,
 ) -> Result<Option<TaskView>, PersistError> {
-    let row: Option<(String, i64, String, String, i64, bool)> = tx
+    #[allow(clippy::type_complexity)]
+    let row: Option<(String, i64, String, String, i64, bool, Option<String>)> = tx
         .query_row(
-            "SELECT state, revision, spec_id, role, cost_estimate, writer FROM tasks WHERE task_id = ?1 AND run_id = ?2",
+            "SELECT state, revision, spec_id, role, cost_estimate, writer, next_retry_at FROM tasks \
+             WHERE task_id = ?1 AND run_id = ?2",
             params![task_id, run_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                ))
+            },
         )
         .optional()
         .map_err(sqlite_error)?;
-    let Some((state, rev, spec_id, role, cost, writer)) = row else {
+    let Some((state, rev, spec_id, role, cost, writer, next_retry_at)) = row else {
         return Ok(None);
     };
     let mut statement = tx
@@ -529,6 +542,9 @@ fn load_task(
         writer,
         dependencies,
         requirements,
+        // Whole seconds on both sides (the store's form): ahead of `now` until its second has come.
+        retry_at: next_retry_at
+            .filter(|next| next.as_str() > crate::time::rfc3339_utc(now).as_str()),
     }))
 }
 
