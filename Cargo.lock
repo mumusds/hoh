@@ -484,6 +484,7 @@ dependencies = [
  "futures-util",
  "hoh-agents",
  "hoh-core",
+ "httparse",
  "hyper",
  "hyper-util",
  "ratatui",

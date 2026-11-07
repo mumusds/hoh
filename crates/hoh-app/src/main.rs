@@ -17,9 +17,11 @@ macro_rules! say {
 }
 
 mod cli;
+mod client;
 mod doctor;
 mod exit;
 mod help;
+mod session;
 mod tui;
 
 use cli::Invocation;
@@ -36,7 +38,53 @@ fn main() {
     {
         std::process::exit(hoh_core::persistence::selftest::probe_main());
     }
+    // Internal mode: the host a client starts (docs/adr/ADR-021.md decision 1); not a user command and in no help text.
+    if args.first().map(OsString::as_os_str) == Some("__host".as_ref()) {
+        std::process::exit(i32::from(host(&args[1..])));
+    }
     std::process::exit(i32::from(run(&args)));
+}
+
+/// `hoh __host <project>`: its own session before anything else (no terminal, so no shell's hang-up reaches it),
+/// stdin and stdout from its starter (`/dev/null`), stderr to its starter until it is ready, then to `.hoh/host.log`.
+fn host(args: &[OsString]) -> u8 {
+    let [project] = args else {
+        return usage_code();
+    };
+    let project = std::path::PathBuf::from(project);
+    if !project.is_absolute() || !project.is_dir() {
+        return usage_code();
+    }
+    if rustix::process::getsid(None).ok() != Some(rustix::process::getpid())
+        && let Err(e) = rustix::process::setsid()
+    {
+        say!(
+            "hoh host: no session of its own ({e}); a hang-up of its starter's terminal is still ignored"
+        );
+    }
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            say!("hoh host: no runtime: {e}");
+            return 1;
+        }
+    };
+    let config = hoh_app::host::HostConfig::new(&project);
+    let log = project.join(".hoh/host.log");
+    runtime.block_on(hoh_app::host::run_ready(config, move || {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&log)
+        {
+            let _ = rustix::stdio::dup2_stderr(&file);
+        }
+    }))
 }
 
 /// Exit code of a usage error.
@@ -85,6 +133,15 @@ fn workspace(project: Option<&Path>) -> u8 {
     tui::run(&dir.canonicalize().unwrap_or(dir))
 }
 
+/// The project directory: `--project`, or the current one, canonical.
+fn here(project: Option<&Path>) -> Result<std::path::PathBuf, u8> {
+    let dir = match project.map_or_else(std::env::current_dir, |p| Ok(p.to_path_buf())) {
+        Ok(dir) => dir,
+        Err(e) => return Err(refuse(&format!("无法确定当前目录：{e}"))),
+    };
+    Ok(dir.canonicalize().unwrap_or(dir))
+}
+
 fn run(args: &[OsString]) -> u8 {
     let invocation = match cli::parse(args) {
         Ok(invocation) => invocation,
@@ -100,8 +157,34 @@ fn run(args: &[OsString]) -> u8 {
         Invocation::Help { topic, .. } => return print(help::text(topic)),
         Invocation::Version => return print(&help::version()),
         Invocation::Workspace { project } => return workspace(project.as_deref()),
+        Invocation::Prompt {
+            text,
+            output,
+            detach: true,
+            project,
+            ..
+        } => {
+            if output == cli::Output::StreamJson {
+                return refuse(
+                    "--detach 只输出 run_id（text）或受理结果（json），不能与 --output stream-json 同用",
+                );
+            }
+            return match here(project.as_deref()) {
+                Ok(dir) => session::detach(&dir, &text, output),
+                Err(code) => code,
+            };
+        }
         Invocation::Prompt { .. } => "非交互运行（hoh -p）",
-        Invocation::Attach { .. } => "hoh attach",
+        Invocation::Attach {
+            run_id,
+            output,
+            project,
+        } => {
+            return match here(project.as_deref()) {
+                Ok(dir) => session::attach(&dir, run_id.as_deref(), output),
+                Err(code) => code,
+            };
+        }
         Invocation::Web { .. } => "hoh web",
         Invocation::Doctor {
             live,

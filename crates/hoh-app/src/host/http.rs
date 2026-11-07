@@ -34,6 +34,28 @@ pub(super) struct Shared {
     pub(super) hooks: Arc<dyn HostHooks>,
     /// Becomes true when the host stops: event streams end then, so the connections can finish (M2T12R-01).
     pub(super) stop: tokio::sync::watch::Receiver<bool>,
+    /// The event streams open now (docs/adr/ADR-021.md decision 6).
+    pub(super) subscribers: std::sync::atomic::AtomicUsize,
+}
+
+/// One open event stream, counted while it lives.
+struct Subscribed(Arc<Shared>);
+
+impl Subscribed {
+    fn new(shared: Arc<Shared>) -> Subscribed {
+        shared
+            .subscribers
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Subscribed(shared)
+    }
+}
+
+impl Drop for Subscribed {
+    fn drop(&mut self) {
+        self.0
+            .subscribers
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// Which listener a request came through.
@@ -825,6 +847,7 @@ async fn stream_events(
     let high = *watermark.borrow_and_update();
     let state = Stream_ {
         stop: shared.stop.clone(),
+        _subscribed: Subscribed::new(shared.clone()),
         shared,
         watermark,
         cursor: after,
@@ -841,6 +864,8 @@ async fn stream_events(
 /// Where one SSE stream stands.
 struct Stream_ {
     shared: Arc<Shared>,
+    /// Counts the stream while it is open.
+    _subscribed: Subscribed,
     /// The host's stop: the stream ends with it.
     stop: tokio::sync::watch::Receiver<bool>,
     watermark: tokio::sync::watch::Receiver<i64>,

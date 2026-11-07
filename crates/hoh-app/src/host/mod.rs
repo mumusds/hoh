@@ -53,6 +53,9 @@ pub struct HostConfig {
     pub jitter_seed: Option<u64>,
 }
 
+/// The host's TCP port unless another is configured (docs/11-deployment.md: `ssh -L 8787`).
+pub const DEFAULT_PORT: u16 = 8787;
+
 /// The host's clock (a port, [`hoh_core::delivery::Clock`]).
 #[derive(Clone)]
 pub struct HostClock(pub Arc<dyn hoh_core::delivery::Clock>);
@@ -68,7 +71,7 @@ impl HostConfig {
     pub fn new(project: &Path) -> HostConfig {
         HostConfig {
             project: project.to_path_buf(),
-            port: 8787,
+            port: DEFAULT_PORT,
             store: Options {
                 queue: WRITER_QUEUE,
                 ..Options::default()
@@ -271,11 +274,15 @@ impl Host {
         }
         // The port and the token first: nothing that can fail comes between binding the socket and the guard that
         // removes it (M2T12R-08, -153).
-        let tcp = tokio::net::TcpListener::bind(("127.0.0.1", config.port))
-            .await
-            .map_err(|e| {
-                StartError::other(format!("cannot bind 127.0.0.1:{}: {e}", config.port))
-            })?;
+        // The default port taken (another project's host, a test) is no reason to fail: a free one is taken and
+        // host.json names it; clients use the socket (docs/adr/ADR-021.md decision 3).
+        let tcp = match tokio::net::TcpListener::bind(("127.0.0.1", config.port)).await {
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && config.port == DEFAULT_PORT => {
+                tokio::net::TcpListener::bind(("127.0.0.1", 0)).await
+            }
+            bound => bound,
+        }
+        .map_err(|e| StartError::other(format!("cannot bind 127.0.0.1:{}: {e}", config.port)))?;
         let port = tcp
             .local_addr()
             .map_err(|e| StartError::other(e.to_string()))?
@@ -307,6 +314,7 @@ impl Host {
             port,
             hooks: config.hooks.clone(),
             stop: stopped.clone(),
+            subscribers: std::sync::atomic::AtomicUsize::new(0),
         });
         let mut served = vec![
             tokio::spawn(http::serve(
@@ -387,6 +395,14 @@ impl Host {
         &self.shared.store
     }
 
+    /// How many event streams are open now (docs/adr/ADR-021.md decision 6: an attach that does not pick a run
+    /// subscribes to none).
+    pub fn subscribers(&self) -> usize {
+        self.shared
+            .subscribers
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Whether the database writer still runs (it ends only at the stop, or on a panic, M2T12R-150).
     pub fn writer_alive(&self) -> bool {
         self.shared.store.writer_alive()
@@ -447,6 +463,13 @@ impl Host {
 
 /// Run the host of `project` until SIGTERM or SIGINT; the process exit code.
 pub async fn run(config: HostConfig) -> u8 {
+    run_ready(config, || {}).await
+}
+
+/// [`run`], calling `ready` once the host serves (its `host.json` written). A hang-up (SIGHUP) is logged and changes
+/// nothing: a host outlives the terminal and the shell it was started from (REQ-005 behaviour 2, docs/adr/ADR-021.md
+/// decision 1).
+pub async fn run_ready(config: HostConfig, ready: impl FnOnce()) -> u8 {
     // The stop signals are taken before the host announces itself (host.json): a SIGTERM that comes as soon as the file
     // is there stops the host as any other does, not by the default action (ADR-019 decision 10).
     use tokio::signal::unix::{SignalKind, signal};
@@ -454,6 +477,17 @@ pub async fn run(config: HostConfig) -> u8 {
         signal(SignalKind::terminate()),
         signal(SignalKind::interrupt()),
     );
+    if let Ok(mut hangups) = signal(SignalKind::hangup()) {
+        tokio::spawn(async move {
+            while hangups.recv().await.is_some() {
+                use std::io::Write as _;
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "hoh host: a hang-up (SIGHUP) changes nothing"
+                );
+            }
+        });
+    }
     let host = match Host::start(config).await {
         Ok(host) => host,
         Err(e) => {
@@ -462,6 +496,7 @@ pub async fn run(config: HostConfig) -> u8 {
             return e.exit_code;
         }
     };
+    ready();
     let signals = async {
         match stops {
             (Ok(mut term), Ok(mut int)) => {
