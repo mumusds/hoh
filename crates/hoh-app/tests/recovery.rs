@@ -77,8 +77,9 @@ impl FaultHooks for KillAt {
     }
 }
 
-/// A local fake forge (AC-041-05): pull requests by run marker (the effect key), some markers unreachable. Every call
-/// is appended to `<file>.calls` as `query <marker>` or `create <marker>`; the reconcile only ever queries.
+/// A local fake forge (AC-041-05): pull requests by run marker (the effect key), some markers unreachable. Every query
+/// is appended to `<file>.calls` as `query <marker>`. The reconcile is given only this read-only port (an `Observer` has
+/// no way to create anything), so its never creating a pull request holds by construction (M2T05R-56).
 #[derive(Debug)]
 struct FakeRemote(PathBuf);
 
@@ -125,7 +126,10 @@ impl hoh_core::reconcile::Observer for FakeRemote {
 /// The FakeAgent (AC-041-01): waits at its start gate (a line `go` on stdin; anything else, EOF included, ends it
 /// without running), then appends its effect key to the counter file when it starts executing, works a moment, and
 /// leaves its marker (the key, `/` as `_`) when it is done.
-const FAKE_AGENT: &str = "read -r go; [ \"$go\" = go ] || exit 0; printf '%s\\n' \"$1\" >> \"$2/counter\"; sleep 0.2; : > \"$2/markers/$3\"";
+/// With a `fail-once` file in its directory, each task's first run fails (exit 1) after it counted itself.
+const FAKE_AGENT: &str = "read -r go; [ \"$go\" = go ] || exit 0; printf '%s\\n' \"$1\" >> \"$2/counter\"; \
+                          if [ -e \"$2/fail-once\" ] && [ ! -e \"$2/failed-$4\" ]; then : > \"$2/failed-$4\"; exit 1; fi; \
+                          sleep 0.2; : > \"$2/markers/$3\"";
 
 /// The start gate of a child whose stdin is piped: `go` opens it; dropped unopened, the pipe closes and the child ends.
 fn gate(child: &mut std::process::Child) -> hoh_app::host::Gate {
@@ -161,6 +165,7 @@ impl hoh_app::host::Executor for FakeExecutor {
             .args(["-c", FAKE_AGENT, "fake-agent", &work.effect_key])
             .arg(&self.0)
             .arg(marker_name(&work.effect_key))
+            .arg(&work.task_id)
             .process_group(0)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
@@ -709,6 +714,8 @@ fn an_old_hosts_live_agent_is_stopped_before_its_attempt_is_disposed_of() -> R {
     );
     let out = Command::new("sh").args(["-c", &script]).output()?;
     let pid: u32 = String::from_utf8_lossy(&out.stdout).trim().parse()?;
+    // Gone whatever happens below (M2T05R-61).
+    let _guard = GroupGuard(pid);
     let end = Instant::now() + Duration::from_secs(5);
     while hoh_agents::process::group_members(pid).is_empty() && Instant::now() < end {
         std::thread::sleep(Duration::from_millis(10));
@@ -797,11 +804,11 @@ fn test_041_05_a_started_effect_is_found_or_unknown_never_done_again() -> R {
         })
         .ok_or("no diagnostic naming E2")?;
     assert_eq!(diagnostic["payload"]["code"], json!("UNKNOWN_EFFECT"));
+    // Exactly one query per STARTED effect, and nothing else (no create: the port has none).
     let calls = std::fs::read_to_string(dir.path().join("forge.json.calls"))?;
     let mut lines: Vec<&str> = calls.lines().collect();
     lines.sort_unstable();
     assert_eq!(lines, ["query pr:R/T2", "query pr:R/T3"]);
-    assert_eq!(lines.iter().filter(|l| l.starts_with("create")).count(), 0);
     keep(
         "test-041-05.json",
         &json!({"read": read, "forge_calls": lines}),
@@ -933,6 +940,7 @@ fn test_041_01_kill_at_each_point_of_a_dispatch_never_runs_an_effect_twice() -> 
                 "{point} #{round}: not killed at its point ({status:?}): {stderr}"
             );
             let db = db(&project);
+            let restart = std::time::SystemTime::now();
             let (code, stderr, stable) = serve_until(
                 &project,
                 &[(CHILD_WORK, work.as_os_str())],
@@ -966,16 +974,21 @@ fn test_041_01_kill_at_each_point_of_a_dispatch_never_runs_an_effect_twice() -> 
                 .ok_or("no reconcile")?
                 .iter()
                 .collect();
+            // The restarted host's reconcile (its epoch), not any other.
+            let epoch = read["host_epoch"].as_i64();
             let started = restart_reconcile
                 .iter()
-                .rev()
-                .find(|e| e["kind"] == "reconcile.started")
-                .ok_or("no reconcile.started")?;
+                .find(|e| {
+                    e["kind"] == "reconcile.started" && e["payload"]["host_epoch"].as_i64() == epoch
+                })
+                .ok_or("no reconcile.started of the restarted host")?;
             let completed = restart_reconcile
                 .iter()
-                .rev()
-                .find(|e| e["kind"] == "reconcile.completed")
-                .ok_or("no reconcile.completed")?;
+                .find(|e| {
+                    e["kind"] == "reconcile.completed"
+                        && e["payload"]["host_epoch"].as_i64() == epoch
+                })
+                .ok_or("no reconcile.completed of the restarted host")?;
             let dispositions: std::collections::BTreeMap<&str, &str> = restart_reconcile
                 .iter()
                 .filter(|e| {
@@ -1029,17 +1042,31 @@ fn test_041_01_kill_at_each_point_of_a_dispatch_never_runs_an_effect_twice() -> 
                     "{point} #{round}: a dispatch before the reconcile completed"
                 );
             }
-            let reconcile_at =
-                hoh_core::time::parse_rfc3339(started["at"].as_str().unwrap_or_default())
-                    .ok_or("a bad reconcile time")?;
-            let delay = reconcile_at.duration_since(t0).unwrap_or_default();
+            let ms = |t: std::time::SystemTime| {
+                t.duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+            };
+            let (killed_ms, restart_ms) = (ms(t0), ms(restart));
+            let reconcile_ms = started["payload"]["at_ms"].as_u64().ok_or("no at_ms")?;
+            assert!(
+                restart_ms - killed_ms <= 1000,
+                "{point} #{round}: restarted after {} ms",
+                restart_ms - killed_ms
+            );
+            // Not before the kill, and within 30 s of it.
+            assert!(
+                reconcile_ms >= killed_ms,
+                "{point} #{round}: reconcile before the kill"
+            );
+            let delay = Duration::from_millis(reconcile_ms - killed_ms);
             assert!(
                 delay <= Duration::from_secs(30),
                 "{point} #{round}: reconcile after {delay:?}"
             );
             runs.push(json!({
                 "point": point, "round": round, "signal": 9, "counted": counted.lines().count(),
-                "keys": keys.len(), "reconcile_after_ms": delay.as_millis(), "dispositions": dispositions,
+                "keys": keys.len(), "killed_ms": killed_ms, "restart_ms": restart_ms, "reconcile_ms": reconcile_ms,
+                "reconcile_after_ms": delay.as_millis(), "dispositions": dispositions,
                 "attempts": attempts, "tasks": read["tasks"],
             }));
         }
@@ -1131,6 +1158,25 @@ impl Drop for StuckExecutor {
     }
 }
 
+/// Records, inside each round that dispatches (its outbox written, before its commit), which processes are left in
+/// the group of the process it watches (M2T05R-51: the group scanned at the grant itself).
+#[derive(Debug, Default)]
+struct GrantProbe {
+    pid: std::sync::Mutex<Option<u32>>,
+    seen: std::sync::Mutex<Vec<Vec<u32>>>,
+}
+
+impl FaultHooks for GrantProbe {
+    fn at(&self, job: &'static str, point: WritePoint) {
+        if job == "Round" && point == WritePoint::OutboxWritten {
+            let pid = self.pid.lock().ok().and_then(|p| *p);
+            if let (Some(pid), Ok(mut seen)) = (pid, self.seen.lock()) {
+                seen.push(hoh_agents::process::group_members(pid));
+            }
+        }
+    }
+}
+
 /// AC-041-02's world: run R RUNNING with two writer tasks READY after T0, whose attempt A0 settled holding the
 /// writer lease at epoch 3 (so T1's attempt gets epoch 4, the next grant 5).
 const WRITERS: &str = "
@@ -1167,7 +1213,9 @@ async fn test_041_02_an_expired_lease_is_granted_again_only_after_its_holder_is_
         cancels: dir.path().join("cancels"),
         started: std::sync::Mutex::new(Vec::new()),
     });
+    let grant_probe = Arc::new(GrantProbe::default());
     let mut config = config(&project);
+    config.store.faults = grant_probe.clone();
     config.clock = hoh_app::host::HostClock(clock.clone());
     config.reconcile.term_grace = Duration::from_millis(300);
     config.reconcile.kill_grace = Duration::from_secs(5);
@@ -1213,6 +1261,9 @@ async fn test_041_02_an_expired_lease_is_granted_again_only_after_its_holder_is_
     ))?
     .parse()?;
     let t1_revision = scalar("SELECT revision FROM tasks WHERE task_id = 'T1'")?;
+    if let Ok(mut watched) = grant_probe.pid.lock() {
+        *watched = Some(pid);
+    }
     if let Ok(mut now) = clock.0.lock() {
         *now = start + Duration::from_secs(300);
     }
@@ -1261,6 +1312,13 @@ print(json.dumps({{"steps": steps, "grant": list(grant), "disposed": disposed,
     assert!(read["grant"][0].as_i64() > Some(last_step), "{read}");
     assert_ne!(read["grant"][1], json!(a1));
     assert!(left.is_empty(), "A1's group still has {left:?}");
+    // At the grant itself, inside its transaction: no process of A1's group left (the only dispatching round since).
+    let at_grant = grant_probe
+        .seen
+        .lock()
+        .map(|s| s.clone())
+        .unwrap_or_default();
+    assert_eq!(at_grant, [Vec::<u32>::new()], "{at_grant:?}");
     assert_eq!(
         std::fs::read_to_string(dir.path().join("cancels"))?.trim(),
         a1
@@ -1325,11 +1383,568 @@ print(json.dumps({{"steps": steps, "grant": list(grant), "disposed": disposed,
     assert_eq!(scalar("SELECT count(*) FROM events")?, events);
     keep(
         "test-041-02.json",
-        &json!({"a1": a1, "pid": pid, "group_left_at_grant": left, "read": read, "late_result": format!("{outcome:?}"),
+        &json!({"a1": a1, "pid": pid, "group_at_grant": at_grant, "group_left_after_grant": left, "read": read,
+                "late_result": format!("{outcome:?}"),
                 "old_host_write": refused.to_string()}),
     )?;
     drop(newer);
     host.shutdown().await;
     drop(executor);
+    Ok(())
+}
+
+/// The developer's required capabilities, for a runner's rounds.
+fn developer_context() -> Context {
+    let developer = ["structured_events", "command_exec"].map(str::to_owned);
+    Context {
+        required_capabilities: [("developer".to_owned(), developer.into_iter().collect())].into(),
+        ..Context::default()
+    }
+}
+
+/// A host of this process (CR-006 F3) for `project`: a runner on `executor`, the fake clock, short stop graces, and
+/// `faults` as its store's fault hooks.
+async fn runner_host(
+    project: &Path,
+    executor: Arc<dyn hoh_app::host::Executor>,
+    clock: Arc<FakeClock>,
+    faults: Option<Arc<dyn FaultHooks>>,
+) -> R<Host> {
+    let mut config = config(project);
+    config.clock = hoh_app::host::HostClock(clock);
+    config.reconcile.term_grace = Duration::from_millis(300);
+    config.reconcile.kill_grace = Duration::from_secs(5);
+    if let Some(faults) = faults {
+        config.store.faults = faults;
+    }
+    config.runner = Some(hoh_app::host::RunnerConfig {
+        executor,
+        context: developer_context(),
+    });
+    Ok(Host::start(config).await?)
+}
+
+/// The first column of the first row of `sql` ("" for none or NULL), read outside the product.
+fn query(db: &Path, sql: &str) -> R<String> {
+    Ok(python(
+        db,
+        "import sqlite3,sys; r=sqlite3.connect(sys.argv[1]).execute(sys.stdin.read()).fetchone(); print('' if r is None or r[0] is None else r[0])",
+        sql,
+    )?
+    .trim()
+    .to_owned())
+}
+
+/// Wait until `sql` reads `want`, at most `limit`.
+fn wait_for(db: &Path, sql: &str, want: &str, limit: Duration) -> R<bool> {
+    let end = Instant::now() + limit;
+    while Instant::now() < end {
+        if query(db, sql)? == want {
+            return Ok(true);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(false)
+}
+
+/// Kill whatever is left in process group `pgid` (test cleanup).
+fn kill_group(pgid: u32) {
+    if let Some(pgid) = i32::try_from(pgid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    {
+        let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::KILL);
+    }
+}
+
+/// Kills a process group when dropped, however the test ends.
+struct GroupGuard(u32);
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        kill_group(self.0);
+    }
+}
+
+/// M2T05R-02: a recorded leader that exited and left a member in its group (which logs every catchable signal). Its
+/// lease expired and another writer task waits. Neither the reconcile at the start nor the runner's expiry can tell
+/// whether the member is the attempt's: no signal, the attempt and its slot stay, no writer lease is granted, and a
+/// diagnostic says why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leaderless_group_keeps_its_slot_and_gets_no_signal() -> R {
+    let dir = tempfile::tempdir()?;
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    let (code, stderr) = serve_and_stop(&project)?;
+    assert_eq!(code, 0, "{stderr}");
+    let log = dir.path().join("signals.log");
+    let member = dir.path().join("member.sh");
+    std::fs::write(
+        &member,
+        format!(
+            "for s in TERM INT HUP; do trap \"echo $s >> {}\" $s; done\nwhile :; do sleep 0.05; done\n",
+            log.display()
+        ),
+    )?;
+    let out = Command::new("sh")
+        .args([
+            "-c",
+            &format!(
+                "setsid sh -c 'sh {} >/dev/null 2>&1 & echo $$; exit 0' </dev/null 2>/dev/null & wait",
+                member.display()
+            ),
+        ])
+        .output()?;
+    let leader: u32 = String::from_utf8_lossy(&out.stdout).trim().parse()?;
+    let _guard = GroupGuard(leader);
+    let end = Instant::now() + Duration::from_secs(5);
+    while hoh_agents::identity::start_id(leader)?.is_some() && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!hoh_agents::process::group_members(leader).is_empty());
+    seed(
+        &project,
+        &format!(
+            "{WRITERS}
+             UPDATE tasks SET state = 'RUNNING' WHERE task_id = 'T1';
+             INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, pid, boot_id,
+               process_start_id, started_at) VALUES
+               ('A1', 'T1', 'RUNNING', 2, 1, 1, {leader}, '{boot}', '1', '2026-11-07T00:00:00Z');
+             UPDATE leases SET attempt_id = 'A1', epoch = 4 WHERE kind = 'writer';",
+            boot = hoh_agents::identity::boot_id()?,
+        ),
+    )?;
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(work.join("markers"))?;
+    let clock = Arc::new(FakeClock(std::sync::Mutex::new(
+        std::time::SystemTime::now(),
+    )));
+    let host = runner_host(&project, Arc::new(FakeExecutor(work.clone())), clock, None).await?;
+    let db = db(&project);
+    // The reconcile's diagnostic, then a few runner ticks with the lease expired.
+    assert!(wait_for(
+        &db,
+        "SELECT count(*) > 0 FROM events WHERE kind = 'reconcile.diagnostic' AND json_extract(payload_json, '$.attempt_id') = 'A1'",
+        "1",
+        Duration::from_secs(10)
+    )?);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        query(&db, "SELECT state FROM attempts WHERE attempt_id = 'A1'")?,
+        "RUNNING"
+    );
+    assert_eq!(
+        query(&db, "SELECT count(*) FROM attempts WHERE task_id = 'T2'")?,
+        "0"
+    );
+    assert_eq!(
+        query(
+            &db,
+            "SELECT attempt_id || ':' || epoch FROM leases WHERE kind = 'writer'"
+        )?,
+        "A1:4"
+    );
+    // Every pass (the reconcile's, then the runner's every RETRY) found it uncertain, and none moved it.
+    assert_eq!(
+        query(
+            &db,
+            "SELECT group_concat(DISTINCT json_extract(payload_json, '$.process.found') || '/' || json_extract(payload_json, '$.disposition')) \
+             FROM events WHERE kind = 'reconcile.attempt' AND json_extract(payload_json, '$.attempt_id') = 'A1'",
+        )?,
+        "uncertain/unreaped"
+    );
+    assert!(!hoh_agents::process::group_members(leader).is_empty());
+    assert_eq!(std::fs::read_to_string(&log).unwrap_or_default(), "");
+    host.shutdown().await;
+    Ok(())
+}
+
+/// Runs each attempt's work as a gated FakeAgent whose start takes `0` before it spawns (M2T05R-03).
+#[derive(Debug)]
+struct SlowStart(Duration, FakeExecutor);
+
+impl hoh_app::host::Executor for SlowStart {
+    fn deliver(
+        &self,
+        work: &hoh_app::host::Work,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
+        self.1.deliver(work)
+    }
+
+    fn start(&self, work: &hoh_app::host::Work) -> Result<hoh_app::host::Started, String> {
+        std::thread::sleep(self.0);
+        self.1.start(work)
+    }
+}
+
+/// M2T05R-03: A1's lease expires while its start is still in progress. The settle waits for A1's task, so the process
+/// that start made never passes its gate (A1's work never runs) before T2 is granted the writer lease.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_settle_waits_for_a_start_still_in_progress() -> R {
+    let dir = tempfile::tempdir()?;
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    let (code, stderr) = serve_and_stop(&project)?;
+    assert_eq!(code, 0, "{stderr}");
+    seed(&project, WRITERS)?;
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(work.join("markers"))?;
+    let start = std::time::SystemTime::now();
+    let clock = Arc::new(FakeClock(std::sync::Mutex::new(start)));
+    let host = runner_host(
+        &project,
+        Arc::new(SlowStart(
+            Duration::from_millis(800),
+            FakeExecutor(work.clone()),
+        )),
+        clock.clone(),
+        None,
+    )
+    .await?;
+    let db = db(&project);
+    assert!(wait_for(
+        &db,
+        "SELECT state FROM attempts WHERE task_id = 'T1'",
+        "STARTING",
+        Duration::from_secs(10)
+    )?);
+    let a1 = query(&db, "SELECT attempt_id FROM attempts WHERE task_id = 'T1'")?;
+    if let Ok(mut now) = clock.0.lock() {
+        *now = start + Duration::from_secs(300);
+    }
+    assert!(wait_for(
+        &db,
+        "SELECT count(*) FROM outbox WHERE json_extract(payload_json, '$.lease.epoch') = 5",
+        "1",
+        Duration::from_secs(20)
+    )?);
+    // T2's agent runs; A1's never did.
+    assert!(wait_for(
+        &db,
+        "SELECT state FROM tasks WHERE task_id = 'T2'",
+        "IMPLEMENTED",
+        Duration::from_secs(20)
+    )?);
+    let counted = std::fs::read_to_string(work.join("counter")).unwrap_or_default();
+    assert!(!counted.contains(&a1), "{a1} ran: {counted}");
+    let state = query(
+        &db,
+        &format!("SELECT state FROM attempts WHERE attempt_id = '{a1}'"),
+    )?;
+    assert!(
+        ["UNKNOWN_EFFECT", "CANCELLED"].contains(&state.as_str()),
+        "{state}"
+    );
+    host.shutdown().await;
+    Ok(())
+}
+
+/// Starts each attempt's work as a gated agent that never ends, then loses track of it: its completion sender is
+/// dropped at once (it is still reaped here, so it leaves no zombie).
+#[derive(Debug)]
+struct Losing(StuckExecutor);
+
+impl hoh_app::host::Executor for Losing {
+    fn deliver(
+        &self,
+        work: &hoh_app::host::Work,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
+        self.0.deliver(work)
+    }
+
+    fn start(&self, work: &hoh_app::host::Work) -> Result<hoh_app::host::Started, String> {
+        let started = self.0.start(work)?;
+        let (_lost, ended) = tokio::sync::oneshot::channel();
+        Ok(hoh_app::host::Started { ended, ..started })
+    }
+}
+
+/// M2T05R-04: the executor loses A1's process. The runner does not take that as a failure to run again: it settles
+/// A1 (inspect, stop, reap) and, its work not confirmed, makes it UNKNOWN_EFFECT; T1 gets no new attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_completion_is_settled_never_run_again() -> R {
+    let dir = tempfile::tempdir()?;
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    let (code, stderr) = serve_and_stop(&project)?;
+    assert_eq!(code, 0, "{stderr}");
+    seed(&project, WRITERS)?;
+    let clock = Arc::new(FakeClock(std::sync::Mutex::new(
+        std::time::SystemTime::now(),
+    )));
+    let executor = Arc::new(Losing(StuckExecutor {
+        cancels: dir.path().join("cancels"),
+        started: std::sync::Mutex::new(Vec::new()),
+    }));
+    let host = runner_host(&project, executor.clone(), clock, None).await?;
+    let db = db(&project);
+    assert!(wait_for(
+        &db,
+        "SELECT state FROM attempts WHERE task_id = 'T1'",
+        "UNKNOWN_EFFECT",
+        Duration::from_secs(20)
+    )?);
+    let a1 = query(&db, "SELECT attempt_id FROM attempts WHERE task_id = 'T1'")?;
+    let pid: u32 = query(
+        &db,
+        &format!("SELECT pid FROM attempts WHERE attempt_id = '{a1}'"),
+    )?
+    .parse()?;
+    assert!(hoh_agents::process::group_members(pid).is_empty());
+    assert_eq!(
+        query(&db, "SELECT count(*) FROM attempts WHERE task_id = 'T1'")?,
+        "1"
+    );
+    assert_eq!(
+        query(
+            &db,
+            &format!(
+                "SELECT count(*) FROM events WHERE kind = 'runner.inspected' AND json_extract(payload_json, '$.attempt_id') = '{a1}'"
+            )
+        )?,
+        "1"
+    );
+    host.shutdown().await;
+    drop(executor);
+    Ok(())
+}
+
+/// Fails the commit of the `0`th Commit request after it is armed (M2T05R-06: a settle cut short between its steps).
+#[derive(Debug, Default)]
+struct FailNthCommit {
+    armed: std::sync::atomic::AtomicBool,
+    seen: std::sync::atomic::AtomicU32,
+    nth: u32,
+    fail: std::sync::atomic::AtomicBool,
+}
+
+impl FaultHooks for FailNthCommit {
+    fn at(&self, job: &'static str, point: WritePoint) {
+        use std::sync::atomic::Ordering;
+        if job == "Commit"
+            && point == WritePoint::OutboxWritten
+            && self.armed.load(Ordering::SeqCst)
+        {
+            let n = self.seen.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == self.nth {
+                self.fail.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    fn before_commit(&self) -> Result<(), hoh_core::persistence::PersistError> {
+        if self.fail.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Err(hoh_core::persistence::PersistError::Full(
+                "injected: a settle step cut short".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// M2T05R-06: A1's lease expires and its settle stops after its first step (the second step's commit fails). The
+/// next tick settles it again with event ids of its own pass, so the chain ends and T2 is granted epoch 5.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_settle_cut_short_is_done_again_by_another_pass() -> R {
+    let dir = tempfile::tempdir()?;
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    let (code, stderr) = serve_and_stop(&project)?;
+    assert_eq!(code, 0, "{stderr}");
+    seed(&project, WRITERS)?;
+    let start = std::time::SystemTime::now();
+    let clock = Arc::new(FakeClock(std::sync::Mutex::new(start)));
+    let executor = Arc::new(StuckExecutor {
+        cancels: dir.path().join("cancels"),
+        started: std::sync::Mutex::new(Vec::new()),
+    });
+    let faults = Arc::new(FailNthCommit {
+        nth: 2,
+        ..FailNthCommit::default()
+    });
+    let host = runner_host(
+        &project,
+        executor.clone(),
+        clock.clone(),
+        Some(faults.clone()),
+    )
+    .await?;
+    let db = db(&project);
+    assert!(wait_for(
+        &db,
+        "SELECT state FROM attempts WHERE task_id = 'T1'",
+        "RUNNING",
+        Duration::from_secs(10)
+    )?);
+    let a1 = query(&db, "SELECT attempt_id FROM attempts WHERE task_id = 'T1'")?;
+    faults
+        .armed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    if let Ok(mut now) = clock.0.lock() {
+        *now = start + Duration::from_secs(300);
+    }
+    assert!(wait_for(
+        &db,
+        "SELECT count(*) FROM outbox WHERE json_extract(payload_json, '$.lease.epoch') = 5",
+        "1",
+        Duration::from_secs(20)
+    )?);
+    let count = |kind: &str| {
+        query(
+            &db,
+            &format!(
+                "SELECT count(*) FROM events WHERE kind = '{kind}' AND json_extract(payload_json, '$.attempt_id') = '{a1}'"
+            ),
+        )
+    };
+    assert_eq!(count("lease.inspected")?, "2");
+    assert_eq!(count("lease.native_cancel")?, "1");
+    assert_eq!(count("lease.reaped")?, "1");
+    host.shutdown().await;
+    drop(executor);
+    Ok(())
+}
+
+/// Kill a host at `point` of the runner `rounds` times (the FakeAgent failing each task once when `fail_once`),
+/// restart it at once and run to the next stable point; the state read after each run (READ_RUN) and its counter.
+fn kill_and_restart(point: &str, rounds: u32, fail_once: bool) -> R<Vec<(Value, String)>> {
+    let dir = tempfile::tempdir()?;
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    let (code, stderr) = serve_and_stop(&project)?;
+    assert_eq!(code, 0, "{stderr}");
+    seed(&project, FIVE_TASKS)?;
+    let template = dir.path().join("template");
+    copy_db(&project.join(".hoh"), &template)?;
+    let decision = start_run().to_string();
+    let mut runs = Vec::new();
+    for round in 0..rounds {
+        copy_db(&template, &project.join(".hoh"))?;
+        let work = dir.path().join(format!("work-{round}"));
+        std::fs::create_dir_all(work.join("markers"))?;
+        if fail_once {
+            std::fs::write(work.join("fail-once"), "")?;
+        }
+        let killed = ChildGuard(
+            child(&project)?
+                .env(CHILD_RUNNER_KILL, point)
+                .env(CHILD_WORK, &work)
+                .env(CHILD_DECIDE, &decision)
+                .spawn()?,
+        );
+        let (status, stderr) = wait(killed, Duration::from_secs(90))?;
+        assert_eq!(
+            status.signal(),
+            Some(9),
+            "{point} #{round}: {status:?}: {stderr}"
+        );
+        let db = db(&project);
+        let (code, stderr, stable) = serve_until(
+            &project,
+            &[(CHILD_WORK, work.as_os_str())],
+            Duration::from_secs(60),
+            || {
+                python(&db, &format!("import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute({STABLE:?}).fetchone()[0])"), "")
+                    .is_ok_and(|n| n.trim() == "0")
+            },
+        )?;
+        assert_eq!(code, 0, "{point} #{round}: {stderr}");
+        assert!(stable, "{point} #{round}: no stable point: {stderr}");
+        let read: Value = serde_json::from_str(&python(&db, READ_RUN, "")?)?;
+        runs.push((
+            read,
+            std::fs::read_to_string(work.join("counter")).unwrap_or_default(),
+        ));
+    }
+    Ok(runs)
+}
+
+/// M2T05R-01, -52: a host killed after it started an agent's process (held at its start gate) but before it recorded
+/// the process's identity. The gate never opens, so the agent never runs; the restarted host ends that attempt as never
+/// executed (CANCELLED) and the task runs once in another attempt. No effect key is counted twice, and none of an
+/// attempt that never passed its gate.
+#[test]
+fn a_host_killed_between_spawn_and_identity_never_runs_the_agent() -> R {
+    for (round, (read, counted)) in kill_and_restart("AfterSpawn", 5, false)?
+        .into_iter()
+        .enumerate()
+    {
+        let killed_epoch = read["host_epoch"].as_i64().ok_or("no epoch")? - 1;
+        let cancelled: Vec<&str> = read["attempts"]
+            .as_array()
+            .ok_or("no attempts")?
+            .iter()
+            .filter(|a| a["host_epoch"].as_i64() == Some(killed_epoch) && a["state"] == "CANCELLED")
+            .filter_map(|a| a["id"].as_str())
+            .collect();
+        assert!(!cancelled.is_empty(), "#{round}: {read}");
+        for id in cancelled {
+            assert!(!counted.contains(id), "#{round}: {id} ran: {counted}");
+        }
+        let mut keys: Vec<&str> = counted.lines().collect();
+        let all = keys.len();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), all, "#{round}: {counted}");
+        assert!(
+            read["tasks"]
+                .as_object()
+                .is_some_and(|t| t.values().all(|s| s == "IMPLEMENTED")),
+            "#{round}: {read}"
+        );
+    }
+    Ok(())
+}
+
+/// M2T05R-05, -53: the work of the running attempts fails and the failure is committed; the host is killed before the
+/// attempts end. The restarted host disposes of them by the recorded outcome: FAILED, their tasks READY (not SETTLED
+/// and IMPLEMENTED); each task then runs again and is done.
+#[test]
+fn a_failure_committed_before_a_crash_stays_a_failure() -> R {
+    for (round, (read, _)) in kill_and_restart("AfterEffectCommitted", 3, true)?
+        .into_iter()
+        .enumerate()
+    {
+        let killed_epoch = read["host_epoch"].as_i64().ok_or("no epoch")? - 1;
+        let old: Vec<&Value> = read["attempts"]
+            .as_array()
+            .ok_or("no attempts")?
+            .iter()
+            .filter(|a| a["host_epoch"].as_i64() == Some(killed_epoch))
+            .collect();
+        // Every first run fails: none of the killed host's attempts may settle.
+        assert!(
+            old.iter().all(|a| a["state"] != "SETTLED"),
+            "#{round}: {read}"
+        );
+        let ended: Vec<&str> = read["reconcile"]
+            .as_array()
+            .ok_or("no reconcile")?
+            .iter()
+            .filter(|e| e["kind"] == "reconcile.attempt" && e["payload"]["disposition"] == "ended")
+            .filter_map(|e| e["payload"]["attempt_id"].as_str())
+            .collect();
+        assert!(!ended.is_empty(), "#{round}: {read}");
+        for id in &ended {
+            assert!(
+                old.iter().any(|a| a["id"] == *id && a["state"] == "FAILED"),
+                "#{round}: {id}"
+            );
+        }
+        // Each task is done in a later attempt, but one left with an attempt UNKNOWN_EFFECT (killed mid-run).
+        let unknown: Vec<&str> = read["attempts"]
+            .as_array()
+            .ok_or("no attempts")?
+            .iter()
+            .filter(|a| a["state"] == "UNKNOWN_EFFECT")
+            .filter_map(|a| a["task"].as_str())
+            .collect();
+        for (task, state) in read["tasks"].as_object().ok_or("no tasks")? {
+            assert!(
+                state == "IMPLEMENTED" || unknown.contains(&task.as_str()),
+                "#{round}: {task} {state}"
+            );
+        }
+    }
     Ok(())
 }

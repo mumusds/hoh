@@ -1329,12 +1329,12 @@ async fn test_027_02_pi_keeps_an_unregistered_record_once_and_ends_as_without_it
     Ok(())
 }
 
-/// AC-027-03 (pi): a pi whose frames after its first are one 8 MiB line with no LF, while another attempt runs the
+/// AC-027-03 at the adapter level (CR-008: the in-host test with its TEST id comes with M2-T07; pi): a pi whose frames after its first are one 8 MiB line with no LF, while another attempt runs the
 /// recorded RPC turn beside it on the same store. The reader never holds more than the limit and one read chunk; only
 /// the oversized attempt fails (PROTOCOL_FRAME_TOO_LARGE, its diagnosis with the length, the prefix sha256 and the
 /// first 4 KiB); the other settles, and the store's writer goes on (ADR-019 decision 9).
 #[tokio::test]
-async fn test_027_03_pi_an_8_mib_line_fails_only_its_own_attempt() -> R {
+async fn pi_an_8_mib_line_fails_only_its_own_attempt() -> R {
     let world = World::new()?;
     let d = world.dir.path().join("huge");
     std::fs::create_dir_all(&d)?;
@@ -1370,9 +1370,19 @@ async fn test_027_03_pi_an_8_mib_line_fails_only_its_own_attempt() -> R {
         .into_iter()
         .find(|d| d["reason"] == "PROTOCOL_FRAME_TOO_LARGE")
         .ok_or("no diagnosis")?;
-    assert!(diagnosis["length"].as_u64().is_some_and(|n| n > 1 << 20));
-    assert_eq!(diagnosis["prefix_sha256"].as_str().map(str::len), Some(64));
-    assert_eq!(diagnosis["head"].as_str().map(str::len), Some(4096));
+    // The reader filled up to the limit before it refused the line, and kept no more than one read beyond it; the
+    // diagnosis is of those bytes (M2T05R-59).
+    let length = usize::try_from(diagnosis["length"].as_u64().ok_or("no length")?)?;
+    assert!(length > 1 << 20 && length <= limit, "{length}");
+    assert!(
+        big.max_buffered.is_some_and(|n| n >= length),
+        "{:?}",
+        big.max_buffered
+    );
+    let digest = <sha2::Sha256 as sha2::Digest>::digest(vec![b'x'; length]);
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(diagnosis["prefix_sha256"], serde_json::json!(hex));
+    assert_eq!(diagnosis["head"], serde_json::json!("x".repeat(4096)));
     assert_eq!(
         (small.state, small.failure.as_deref()),
         (AttemptState::Settled, None)

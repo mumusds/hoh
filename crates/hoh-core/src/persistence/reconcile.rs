@@ -86,7 +86,10 @@ pub(super) fn run(
             &project_id,
             host_epoch,
             "reconcile.started",
-            json!({"host_epoch": host_epoch, "unfinished": unfinished}),
+            // The start to the millisecond (created_at has seconds): AC-041-01's kill-to-reconcile time.
+            json!({"host_epoch": host_epoch, "unfinished": unfinished, "at_ms": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis())}),
         ),
         ReconcileJob::Apply(step) => {
             let (row, disposition, process, cause) = *step;
