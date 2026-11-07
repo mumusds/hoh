@@ -146,10 +146,10 @@ pub(super) async fn run(
     project_id: &str,
     host_epoch: i64,
     settings: &ReconcileSettings,
+    clock: &dyn hoh_core::delivery::Clock,
+    jitter: &super::runner::Jitter,
 ) -> Result<(), PersistError> {
-    let rows = store
-        .reconcile_scan(project_id, std::time::SystemTime::now())
-        .await?;
+    let rows = store.reconcile_scan(project_id, clock.now()).await?;
     store
         .reconcile_started(project_id, host_epoch, rows.len())
         .await?;
@@ -194,7 +194,14 @@ pub(super) async fn run(
             })
             .or_default() += 1;
         store
-            .reconcile_apply(row, disposition, process, "reconcile")
+            .reconcile_apply(
+                row,
+                disposition,
+                process,
+                "reconcile",
+                clock.now(),
+                jitter.draw(),
+            )
             .await?;
     }
     store

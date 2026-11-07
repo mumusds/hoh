@@ -20,6 +20,7 @@ mod outbox;
 mod plan;
 mod reconcile;
 mod results;
+mod retry;
 mod rounds;
 mod runner;
 pub use leases::{Grant, LEASE_TTL, LeaseView};
@@ -27,8 +28,9 @@ pub use outbox::{ConsumeEffect, Consumed, OutboxRow, Settlement, backoff};
 pub use plan::Imported;
 pub use reconcile::{EffectRow, UnfinishedRow};
 pub use results::{TaskResultOutcome, VERIFIERS};
+pub use retry::{Failure, Paced};
 pub use rounds::{Dispatched, RoundOutcome};
-pub use runner::{DispatchNotice, RUNNER, Waiting};
+pub use runner::{DispatchNotice, Ending, RUNNER, Waiting};
 pub mod location;
 pub mod selftest;
 mod writer;
@@ -643,20 +645,26 @@ impl Store {
     }
 
     /// One attempt's disposition, with what was found of its process and why (`reconcile` at a host's start,
-    /// `lease_expired` when the runner found its lease expired), in one transaction; the seq of its last event.
+    /// `lease_expired` when the runner found its lease expired), at `at` by the caller's clock, in one transaction;
+    /// a failed attempt's task is decided by the retry policy with `draw` (ADR-020 decision 3). The seq of its last
+    /// event.
     pub async fn reconcile_apply(
         &self,
         row: UnfinishedRow,
         disposition: crate::reconcile::Disposition,
         process: crate::reconcile::Process,
         cause: &'static str,
+        at: std::time::SystemTime,
+        draw: u32,
     ) -> Result<i64, PersistError> {
-        self.reconcile_event(reconcile::ReconcileJob::Apply(Box::new((
+        self.reconcile_event(reconcile::ReconcileJob::Apply(Box::new(reconcile::Apply {
             row,
             disposition,
             process,
             cause,
-        ))))
+            at,
+            draw,
+        })))
         .await
     }
 
@@ -728,19 +736,41 @@ impl Store {
         .await
     }
 
-    /// `attempt_id` RUNNING -> SETTLED (its task IMPLEMENTED) or FAILED (its task READY).
+    /// `attempt_id` RUNNING -> SETTLED (its task IMPLEMENTED) or FAILED, its task then decided by the retry policy
+    /// (READY at its next_retry_at, or BLOCKED; ADR-020 decision 3).
     pub async fn runner_finished(
         &self,
         attempt_id: &str,
-        success: bool,
-        detail: &str,
+        ending: Ending,
     ) -> Result<bool, PersistError> {
         self.runner_step(runner::RunnerJob::Finished {
             attempt_id: attempt_id.to_owned(),
-            success,
-            detail: detail.to_owned(),
+            ending: Box::new(ending),
         })
         .await
+    }
+
+    /// One look at run `run_id` as a whole at `context.now()` (ADR-020 decisions 4, 5 and 7): woken from
+    /// WAITING_EXTERNAL when a retry is due; BLOCKED for a cost limit it cannot enforce, a task its session cannot run
+    /// or nothing able to move on; INCOMPLETE when its budget stops it; WAITING_EXTERNAL when only retries are left.
+    pub async fn pace_run(
+        &self,
+        run_id: &str,
+        context: crate::decision::Context,
+    ) -> Result<Paced, PersistError> {
+        match self
+            .writer
+            .runner(runner::RunnerJob::Pace {
+                run_id: run_id.to_owned(),
+                context: Box::new(context),
+            })
+            .await?
+        {
+            runner::RunnerDone::Paced(paced) => Ok(paced),
+            _ => Err(PersistError::IntegrityViolation(
+                "a pace answered with something else".to_owned(),
+            )),
+        }
     }
 
     /// A runtime notice taken (ACKED); false when it was not PENDING.
