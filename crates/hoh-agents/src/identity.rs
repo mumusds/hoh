@@ -146,7 +146,7 @@ pub fn presence(pid: Option<i64>, boot: Option<&str>, start: Option<&str>) -> io
         Ok(found) => Presence::Ours(found),
         Err(Gone::NoProcess) => {
             let pgid = pid.and_then(|p| u32::try_from(p).ok()).unwrap_or(0);
-            let members = crate::process::group_members(pgid);
+            let members = group_left(pgid, pgid)?;
             if members.is_empty() {
                 Presence::Gone(Gone::NoProcess)
             } else {
@@ -155,6 +155,50 @@ pub fn presence(pid: Option<i64>, boot: Option<&str>, start: Option<&str>) -> io
         }
         Err(gone) => Presence::Gone(gone),
     })
+}
+
+/// The processes in process group `pgid` other than `leader`, zombies included, from a whole scan of `/proc`. A scan
+/// that fails anywhere (an unreadable `/proc`, a stat that cannot be read for another reason than the process having
+/// gone) is an error, never an empty group (M2T05R-200).
+pub fn group_left(pgid: u32, leader: u32) -> io::Result<Vec<u32>> {
+    group_left_in(std::path::Path::new("/proc"), pgid, leader)
+}
+
+fn group_left_in(proc: &std::path::Path, pgid: u32, leader: u32) -> io::Result<Vec<u32>> {
+    let mut left = Vec::new();
+    for entry in std::fs::read_dir(proc)? {
+        let entry = entry?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let stat = match std::fs::read_to_string(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            // It ended while the scan ran.
+            Err(e) if e.kind() == io::ErrorKind::NotFound || e.raw_os_error() == Some(3) => {
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        // Fields after the parenthesised command name: state, ppid, pgrp.
+        let group = stat
+            .rfind(')')
+            .and_then(|at| {
+                stat[at + 1..]
+                    .split_whitespace()
+                    .nth(2)?
+                    .parse::<u32>()
+                    .ok()
+            })
+            .ok_or_else(|| io::Error::other(format!("/proc/{pid}/stat has no process group")))?;
+        if group == pgid && pid != leader {
+            left.push(pid);
+        }
+    }
+    Ok(left)
 }
 
 /// A process found to be the recorded one, held by its pidfd.
@@ -232,11 +276,30 @@ impl Found {
         matches!(poll(&mut fds, Some(&Timespec::default())), Ok(n) if n > 0)
     }
 
+    /// Whether its leader still holds its pid, alive or a zombie not yet reaped: only then can its group id not have
+    /// been reused, so only then may its group be signalled (M2T05R-202). A pidfd keeps the process, not its number:
+    /// once the leader is reaped the pidfd's fdinfo reads `Pid: -1` and the number may go to another process.
+    pub fn holds_group(&self) -> bool {
+        use std::os::fd::AsRawFd as _;
+        std::fs::read_to_string(format!("/proc/self/fdinfo/{}", self.pidfd.as_raw_fd()))
+            .ok()
+            .and_then(|info| {
+                info.lines()
+                    .find_map(|l| l.strip_prefix("Pid:").map(|v| v.trim().to_owned()))
+            })
+            == Some(self.identity.pid.to_string())
+    }
+
+    /// Its leader exited and a whole scan finds nothing else left in its group (a scan that fails is not "gone").
+    pub fn gone(&self) -> bool {
+        self.exited()
+            && group_left(self.identity.pid, self.identity.pid).is_ok_and(|left| left.is_empty())
+    }
+
     fn wait(&self, grace: Duration) -> bool {
         let end = Instant::now() + grace;
         loop {
-            let group_left = crate::process::group_members(self.identity.pid).is_empty();
-            if self.exited() && group_left {
+            if self.gone() {
                 return true;
             }
             if Instant::now() >= end {
@@ -246,14 +309,8 @@ impl Found {
         }
     }
 
-    /// Its leader exited and nothing is left in its group.
-    pub fn gone(&self) -> bool {
-        self.exited() && crate::process::group_members(self.identity.pid).is_empty()
-    }
-
-    /// End what is left of it: nothing when its leader exited and its group is empty, else [`Found::stop`]. Held by
-    /// its pidfd since it was started, its group id cannot have been reused, so whatever is in the group is its own
-    /// (ADR-019 decision 8, M2T05R-101).
+    /// End what is left of it: nothing when it is already gone, else [`Found::stop`] (no SIGTERM recorded for a
+    /// process that ended by itself, M2T05R-259).
     pub fn settle_group(&self, term_grace: Duration, kill_grace: Duration) -> Stopped {
         if self.gone() {
             Stopped {
@@ -267,14 +324,14 @@ impl Found {
 
     /// SIGTERM to its group, SIGKILL to its group and leader after `term_grace`, then wait `kill_grace` for the
     /// leader to exit and the group to empty (an orphan is reaped by its new parent). The group gets a signal only
-    /// while its leader is alive (its pidfd unreadable, so the group id is its) or members are left in it (a group id
-    /// is not reused while it has members).
+    /// while its leader holds its pid ([`Found::holds_group`]); a leader reaped with members left in its group leaves
+    /// them unsignalled and the stop unreaped (uncertain).
     pub fn stop(&self, term_grace: Duration, kill_grace: Duration) -> Stopped {
         let mut steps = Vec::new();
         let pgid = Pid::from_raw(i32::try_from(self.identity.pid).unwrap_or(0));
         let send = |signal: Signal| {
             if let Some(pgid) = pgid
-                && (!self.exited() || !crate::process::group_members(self.identity.pid).is_empty())
+                && self.holds_group()
             {
                 let _ = kill_process_group(pgid, signal);
             }
@@ -335,9 +392,19 @@ mod tests {
     #[test]
     fn a_found_orphan_that_ignores_sigterm_is_killed_with_its_group_and_reaped() -> io::Result<()> {
         let pid = orphan_ignoring_term()?;
+        // Its group is killed however the test ends (M2T05R-252).
+        struct Guard(u32);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                if let Some(pgid) = i32::try_from(self.0).ok().and_then(Pid::from_raw) {
+                    let _ = kill_process_group(pgid, Signal::KILL);
+                }
+            }
+        }
+        let _guard = Guard(pid);
         let end = Instant::now() + Duration::from_secs(5);
-        // Until its shell has made the session (the group id is its pid).
-        while crate::process::group_members(pid).is_empty() && Instant::now() < end {
+        // Until its shell has set its trap and started its member (the member comes after the trap).
+        while group_left(pid, pid).map_or(0, |l| l.len()) < 1 && Instant::now() < end {
             std::thread::sleep(Duration::from_millis(10));
         }
         let me = of(pid)?.ok_or_else(|| io::Error::other("the orphan is gone"))?;
@@ -385,6 +452,74 @@ mod tests {
                 let _ = rustix::process::kill_process(pid, Signal::KILL);
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_group_whose_leader_was_reaped_gets_no_more_signals() -> io::Result<()> {
+        // M2T05R-202: the leader dies on SIGTERM and is reaped by its new parent while a member that ignores SIGTERM
+        // stays. Its pid may now be another's, so its group gets no SIGKILL: the stop is not reaped (the slot stays
+        // held) and the member lives on (killed here).
+        let out = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "setsid sh -c '(trap \"\" TERM; exec sleep 1000) </dev/null >/dev/null 2>&1 & wait' </dev/null >/dev/null 2>&1 & echo $!",
+            ])
+            .output()?;
+        let leader: u32 = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .map_err(io::Error::other)?;
+        struct Guard(u32);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                if let Some(pgid) = i32::try_from(self.0).ok().and_then(Pid::from_raw) {
+                    let _ = kill_process_group(pgid, Signal::KILL);
+                }
+            }
+        }
+        let _guard = Guard(leader);
+        let end = Instant::now() + Duration::from_secs(5);
+        while group_left(leader, leader).map_or(0, |l| l.len()) < 1 && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let me = of(leader)?.ok_or_else(|| io::Error::other("the leader is not running"))?;
+        let found = find(
+            Some(i64::from(leader)),
+            Some(&me.boot_id),
+            Some(&me.start_id),
+        )?
+        .map_err(|g| io::Error::other(format!("{g:?}")))?;
+        // Long enough for the leader to die of SIGTERM and be reaped before the SIGKILL would go.
+        let stopped = found.stop(Duration::from_millis(500), Duration::from_millis(500));
+        assert!(!found.holds_group());
+        assert!(!stopped.reaped, "{stopped:?}");
+        assert!(
+            !group_left(leader, leader)?.is_empty(),
+            "the member was killed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_group_scan_that_fails_is_an_error_not_an_empty_group() -> io::Result<()> {
+        // M2T05R-200: an unreadable /proc, or a stat that cannot be read for another reason than the process having
+        // gone, never reads as an empty group.
+        assert!(group_left_in(std::path::Path::new("/nonexistent-proc"), 1, 1).is_err());
+        let fake = tempfile::tempdir()?;
+        std::fs::create_dir(fake.path().join("42"))?;
+        std::fs::create_dir(fake.path().join("42/stat"))?;
+        assert!(group_left_in(fake.path(), 7, 7).is_err());
+        std::fs::create_dir(fake.path().join("43"))?;
+        let gone = fake.path().join("44");
+        std::fs::create_dir(&gone)?;
+        std::fs::remove_dir(&gone)?;
+        let only = tempfile::tempdir()?;
+        std::fs::create_dir(only.path().join("9"))?;
+        std::fs::write(only.path().join("9/stat"), "9 (sh) S 1 7 7 0")?;
+        std::fs::create_dir(only.path().join("7"))?;
+        std::fs::write(only.path().join("7/stat"), "7 (sh) S 1 7 7 0")?;
+        assert_eq!(group_left_in(only.path(), 7, 7)?, [9]);
         Ok(())
     }
 

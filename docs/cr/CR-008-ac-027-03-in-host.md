@@ -1,8 +1,8 @@
 # CR-008 · AC-027-03 改归在 host 内运行适配器的任务
 
 ID：CR-008
-状态：PROPOSED
-批准人：（待独立 Review）
+状态：APPROVED
+批准人：CTO 依 CR-003 D1 预授权（独立 Review 会话 d119b028-f0f6-4e59-8451-9cc8869732db 判定 PASS；Codex 会话 01a1b4ef-a1d7-7d81-b66e-37577bc4a32e 对本 CR 单独判定四项 D1 条件 PASS）
 日期：2026-11-07
 基线：HOH-BASELINE-1.1 revision 8（不改受锁文件，不重新上锁）
 
