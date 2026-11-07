@@ -395,6 +395,9 @@ pub struct Outcome {
     pub degraded: Option<String>,
     pub pid: Option<u32>,
     pub steps: Vec<Step>,
+    /// The most stdout bytes the frame reader held at once (AC-027-03's probe; at most the frame limit and one read
+    /// chunk); `None` when no process was read.
+    pub max_buffered: Option<usize>,
 }
 
 /// Run one turn as `attempt` (created PREPARED by the caller); a cancel accepted by `cancel` cancels it, and `steers`
@@ -449,6 +452,7 @@ pub async fn run(
             degraded: None,
             pid: None,
             steps: Vec::new(),
+            max_buffered: None,
         })
     };
     // The App Server only if it starts on stdio and its schema has what this turn uses (the probe's choice too, but for
@@ -587,6 +591,7 @@ pub async fn run(
                 degraded: Some(reason),
                 pid: None,
                 steps: Vec::new(),
+                max_buffered: None,
             });
         }
     };

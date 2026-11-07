@@ -252,6 +252,9 @@ pub struct Outcome {
     pub pid: Option<u32>,
     /// The signals sent to stop the process, with their times (a cancel or the deadline).
     pub steps: Vec<Step>,
+    /// The most stdout bytes the frame reader held at once (AC-027-03's probe; at most the frame limit and one read
+    /// chunk); `None` when no process was read.
+    pub max_buffered: Option<usize>,
 }
 
 /// Run one turn as `attempt` (created PREPARED by the caller); a cancel accepted by `cancel` cancels it.
@@ -304,6 +307,7 @@ pub async fn run(
                 diagnostics: 0,
                 pid: None,
                 steps: Vec::new(),
+                max_buffered: None,
             });
         }
     };
@@ -585,6 +589,7 @@ pub async fn run(
         stderr,
         diagnostics,
         pid: Some(pid),
+        max_buffered: report.as_ref().map(|r| r.stdout.max_buffered),
         steps: report.map(|r| r.steps).unwrap_or_default(),
     })
 }
