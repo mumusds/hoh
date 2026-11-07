@@ -191,6 +191,9 @@ pub trait Processes: Send + Sync {
 #[derive(Debug)]
 pub struct Canceller {
     progress: std::sync::Mutex<std::collections::BTreeMap<String, Progress>>,
+    /// The attempts whose last pass found their group lost track of: another such pass that sent nothing is not
+    /// recorded again (one record per finding).
+    lost: std::sync::Mutex<std::collections::BTreeSet<String>>,
     pub graces: Graces,
     /// How often a pass looks at least.
     pub poll: Duration,
@@ -200,6 +203,7 @@ impl Canceller {
     pub fn new(graces: Graces, poll: Duration) -> Canceller {
         Canceller {
             progress: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            lost: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             graces,
             poll,
         }
@@ -251,6 +255,17 @@ impl Canceller {
                 } else {
                     progress.remove(&attempt.attempt_id);
                 }
+            }
+            let repeated = self.lost.lock().is_ok_and(|mut lost| {
+                if done.end == PassEnd::Lost {
+                    !lost.insert(attempt.attempt_id.clone()) && done.sent.is_empty()
+                } else {
+                    lost.remove(&attempt.attempt_id);
+                    false
+                }
+            });
+            if repeated {
+                continue;
             }
             store
                 .cancel_pass(crate::persistence::CancelPass {

@@ -159,6 +159,8 @@ enum Job {
         Box<super::control::ControlJob>,
         oneshot::Sender<Result<super::control::ControlDone, PersistError>>,
     ),
+    /// Wakes a writer waiting on its queue so it takes an urgent request first (docs/adr/ADR-021.md decision 8a).
+    Wake,
     /// Something to hold until the writer ends (a host's project lock, ADR-016 decision 12).
     Keep(
         Box<dyn std::any::Any + Send>,
@@ -280,9 +282,14 @@ pub(super) enum Fault {
     AbortAfterEvents,
 }
 
+/// The priority lane's capacity.
+const URGENT: usize = 16;
+
 #[derive(Debug, Clone)]
 pub(super) struct Writer {
     jobs: mpsc::Sender<Job>,
+    /// The priority lane: what is queued here is taken before anything of `jobs` (a cancel, REQ-043 behaviour 3).
+    urgent: mpsc::Sender<Job>,
     busy_timeout: std::time::Duration,
     /// Becomes true when the writer thread has ended normally: every request done, its connection closed, what it
     /// kept dropped. Its sender also goes when the thread unwinds from a panic, and then what it kept is leaked
@@ -317,6 +324,7 @@ impl Job {
             Job::Runner(job, _) if matches!(**job, super::runner::RunnerJob::Pace { .. }) => "Pace",
             Job::Runner(..) => "Runner",
             Job::Control(..) => "Control",
+            Job::Wake => "Wake",
             Job::Keep(..) => "Keep",
         }
     }
@@ -363,6 +371,7 @@ impl Writer {
         after_events: impl Fn() + Send + 'static,
     ) -> Result<Writer, PersistError> {
         let (jobs, mut rx) = mpsc::channel::<Job>(options.queue.max(1));
+        let (urgent, mut urgent_rx) = mpsc::channel::<Job>(URGENT);
         // The claims handed out and not yet handed to a transport (ADR-018 decision 4).
         let writer_claims = Registry::default();
         let faults = options.faults.clone();
@@ -376,7 +385,22 @@ impl Writer {
                 let _closer = Closer(writer_claims.clone());
                 // The epoch of the host this writer serves, once it has begun (ADR-019 decision 2).
                 let mut fence: Option<Fence> = None;
-                while let Some(job) = rx.blocking_recv() {
+                loop {
+                    // The priority lane first; a queued request after it (ADR-021 decision 8a). When every handle is
+                    // gone, what is left of the lane is still done.
+                    let job = match urgent_rx.try_recv() {
+                        Ok(job) => job,
+                        Err(_) => match rx.blocking_recv() {
+                            Some(job) => job,
+                            None => match urgent_rx.try_recv() {
+                                Ok(job) => job,
+                                Err(_) => break,
+                            },
+                        },
+                    };
+                    if matches!(job, Job::Wake) {
+                        continue;
+                    }
                     before();
                     let ctx = Ctx {
                         job: job.name(),
@@ -443,6 +467,8 @@ impl Writer {
                             kept.0.push(held);
                             let _ = reply.send(Ok(()));
                         }
+                        // Taken above: it only wakes the loop.
+                        Job::Wake => {}
                         Job::EnsureProject(id, repo, reply) => {
                             answer(&ctx, reply, ensure_project(&mut conn, &id, &repo, &ctx));
                         }
@@ -494,6 +520,7 @@ impl Writer {
             .map_err(|e| PersistError::Storage(format!("cannot start the writer thread: {e}")))?;
         Ok(Writer {
             jobs,
+            urgent,
             busy_timeout: options.busy_timeout,
             ended,
         })
@@ -516,6 +543,30 @@ impl Writer {
                 return Err(PersistError::WriterStopped);
             }
         }
+        rx.await.map_err(|_| PersistError::WriterStopped)?
+    }
+
+    /// [`Writer::submit`] through the priority lane: taken before anything queued (ADR-021 decision 8a). A wake goes
+    /// into the queue too, for a writer waiting on it; a full queue means the writer is busy and looks at the lane
+    /// before its next request anyway.
+    async fn submit_urgent<T>(
+        &self,
+        job: impl FnOnce(oneshot::Sender<Result<T, PersistError>>) -> Job,
+    ) -> Result<T, PersistError> {
+        let (tx, rx) = oneshot::channel();
+        match self.urgent.send_timeout(job(tx), self.busy_timeout).await {
+            Ok(()) => {}
+            Err(mpsc::error::SendTimeoutError::Timeout(_)) => {
+                return Err(PersistError::Busy(format!(
+                    "the writer's priority lane stayed full for {:?}",
+                    self.busy_timeout
+                )));
+            }
+            Err(mpsc::error::SendTimeoutError::Closed(_)) => {
+                return Err(PersistError::WriterStopped);
+            }
+        }
+        let _ = self.jobs.try_send(Job::Wake);
         rx.await.map_err(|_| PersistError::WriterStopped)?
     }
 
@@ -576,6 +627,16 @@ impl Writer {
         &self,
         job: super::control::ControlJob,
     ) -> Result<super::control::ControlDone, PersistError> {
+        // A cancel's passes and its last transaction take the priority lane too (ADR-021 decision 8a).
+        if matches!(
+            job,
+            super::control::ControlJob::CancelPass(_)
+                | super::control::ControlJob::FinishCancel { .. }
+        ) {
+            return self
+                .submit_urgent(|tx| Job::Control(Box::new(job), tx))
+                .await;
+        }
         self.submit(|tx| Job::Control(Box::new(job), tx)).await
     }
 
@@ -601,6 +662,14 @@ impl Writer {
         &self,
         command: SubmitCommand,
     ) -> Result<CommandOutcome, PersistError> {
+        // A cancel takes the priority lane (REQ-043 behaviour 3).
+        if command.target
+            == super::commands::RunTarget::To(crate::protocol::RunState::CancelRequested)
+        {
+            return self
+                .submit_urgent(|tx| Job::Command(Box::new(command), tx))
+                .await;
+        }
         self.submit(|tx| Job::Command(Box::new(command), tx)).await
     }
 

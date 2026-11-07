@@ -190,8 +190,17 @@ impl Processes for HostProcesses {
                     _ => None,
                 };
                 let has_native = native.is_some();
+                let escaped = attempt
+                    .pid
+                    .and_then(|pid| u32::try_from(pid).ok())
+                    .map(escaped)
+                    .unwrap_or_default();
                 (
-                    Box::new(FoundControl { found, native }) as Box<dyn ProcessControl + Send>,
+                    Box::new(FoundControl {
+                        found,
+                        native,
+                        escaped,
+                    }) as Box<dyn ProcessControl + Send>,
                     has_native,
                 )
             }
@@ -208,22 +217,35 @@ impl Processes for HostProcesses {
     }
 }
 
-/// A group found by its identity.
+/// A group found by its identity, with the descendants of its leader that left it.
 struct FoundControl {
     found: identity::Found,
     native: Option<(Arc<dyn Executor>, Work)>,
+    escaped: Vec<Escaped>,
 }
 
 impl ProcessControl for FoundControl {
     fn look(&mut self) -> Look {
-        match self.found.look() {
+        let group = match self.found.look() {
             identity::Group::Held => Look::Held,
             identity::Group::Empty => Look::Empty,
             identity::Group::Lost => Look::Lost,
+        };
+        // Its group empty while an escaped descendant lives: not yet (ADR-021 decision 8d).
+        match group {
+            Look::Empty if self.escaped.iter().any(Escaped::alive) => Look::Held,
+            other => other,
         }
     }
 
     fn send(&mut self, signal: Signal) -> bool {
+        let to_escaped = |sig: rustix::process::Signal, escaped: &[Escaped]| {
+            escaped
+                .iter()
+                .filter(|e| e.alive())
+                .map(|e| rustix::process::pidfd_send_signal(&e.pidfd, sig).is_ok())
+                .fold(false, |a, b| a | b)
+        };
         match signal {
             Signal::Native => match &self.native {
                 Some((executor, work)) => {
@@ -232,10 +254,90 @@ impl ProcessControl for FoundControl {
                 }
                 None => false,
             },
-            Signal::Term => self.found.terminate(),
-            Signal::Kill => self.found.kill(),
+            Signal::Term => {
+                let group = self.found.terminate();
+                to_escaped(rustix::process::Signal::TERM, &self.escaped) || group
+            }
+            Signal::Kill => {
+                let group = self.found.kill();
+                to_escaped(rustix::process::Signal::KILL, &self.escaped) || group
+            }
         }
     }
+}
+
+/// A descendant of an attempt's leader that left its process group (setsid, setpgid): a group signal misses it, so it
+/// is pinned by a pidfd, its start time checked after the open (a reused pid is never taken), and signalled through
+/// it (REQ-043 decision 3, docs/adr/ADR-021.md decision 8d). Only descendants still under the leader are found: one
+/// orphaned before the scan cannot be told apart (the residual of decision 8d).
+struct Escaped {
+    pidfd: rustix::fd::OwnedFd,
+}
+
+impl Escaped {
+    /// Whether it has not exited (its pidfd is not readable yet).
+    fn alive(&self) -> bool {
+        let mut fds = [rustix::event::PollFd::new(
+            &self.pidfd,
+            rustix::event::PollFlags::IN,
+        )];
+        let none = rustix::event::Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        !matches!(rustix::event::poll(&mut fds, Some(&none)), Ok(n) if n > 0)
+    }
+}
+
+/// A process's parent, process group and start time (`/proc/<pid>/stat` fields 4, 5 and 22).
+fn stat(pid: u32) -> Option<(u32, u32, u64)> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields: Vec<&str> = text.rsplit_once(") ")?.1.split(' ').collect();
+    Some((
+        fields.get(1)?.parse().ok()?,
+        fields.get(2)?.parse().ok()?,
+        fields.get(19)?.parse().ok()?,
+    ))
+}
+
+/// The descendants of `leader` (its process group's number) that are in another process group, pinned.
+fn escaped(leader: u32) -> Vec<Escaped> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let all: Vec<(u32, (u32, u32, u64))> = entries
+        .filter_map(Result::ok)
+        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+        .filter_map(|pid| Some((pid, stat(pid)?)))
+        .collect();
+    let mut found = Vec::new();
+    let mut parents = vec![leader];
+    while let Some(parent) = parents.pop() {
+        for (pid, (ppid, pgrp, start)) in &all {
+            if *ppid != parent || *pid == leader {
+                continue;
+            }
+            parents.push(*pid);
+            if *pgrp == leader {
+                continue;
+            }
+            let Some(raw) = i32::try_from(*pid)
+                .ok()
+                .and_then(rustix::process::Pid::from_raw)
+            else {
+                continue;
+            };
+            let Ok(pidfd) = rustix::process::pidfd_open(raw, rustix::process::PidfdFlags::empty())
+            else {
+                continue;
+            };
+            // The pidfd names the process the scan saw only if it is still that one.
+            if stat(*pid).is_some_and(|(_, _, s)| s == *start) {
+                found.push(Escaped { pidfd });
+            }
+        }
+    }
+    found
 }
 
 /// A group whose look is known without looking: gone, or lost track of.

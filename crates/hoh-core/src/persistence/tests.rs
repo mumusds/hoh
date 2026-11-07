@@ -1601,3 +1601,55 @@ async fn a_renewal_extends_only_leases_that_are_still_unexpired() -> R {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn a_cancel_overtakes_the_writes_queued_before_it() -> R {
+    // REQ-043 behaviour 3 (docs/adr/ADR-021.md decision 8a): a CancelRun goes through the writer's priority lane. With
+    // the writer busy (each request stalls) and three writes queued, the cancel is written right after the one in
+    // progress, before them.
+    let dir = tempfile::tempdir()?;
+    let path = db_in(&dir);
+    let options = Options {
+        queue: 8,
+        ..test_options()
+    };
+    let store = std::sync::Arc::new(store_with(
+        &path,
+        options,
+        Fault::Stall(Duration::from_millis(300)),
+    )?);
+    seed(&path)?;
+    let only_event = |id: &str| Commit {
+        cas: vec![],
+        events: vec![event(id)],
+        outbox: vec![],
+    };
+    let mut writes = Vec::new();
+    for id in ["first", "b", "c", "d"] {
+        let (store, commit) = (store.clone(), only_event(id));
+        writes.push(tokio::spawn(async move { store.commit(commit).await }));
+        // `first` is taken and stalls; the others queue behind it in order.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let cancel = SubmitCommand {
+        kind: "CancelRun".to_owned(),
+        target: RunTarget::To(RunState::CancelRequested),
+        event: event("cancel"),
+        ..pause("cancel", "c", 0)
+    };
+    let accepted = store.submit_command(cancel).await?;
+    assert!(
+        matches!(accepted, CommandOutcome::Accepted { .. }),
+        "{accepted:?}"
+    );
+    for write in writes {
+        write.await??;
+    }
+    let order: Vec<String> = store.reader()?.with(|c| {
+        let mut stmt = c.prepare("SELECT event_id FROM events ORDER BY seq")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        rows.collect()
+    })?;
+    assert_eq!(order, ["first", "cancel", "b", "c", "d"]);
+    Ok(())
+}
