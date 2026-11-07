@@ -23,10 +23,17 @@ pub fn now_rfc3339() -> String {
     rfc3339_utc(SystemTime::now())
 }
 
-/// The instant of an RFC 3339 `date-time` (`YYYY-MM-DDTHH:MM:SS[.frac](Z|±HH:MM)`, `T`/`Z` in either case), the
-/// fraction cut to the second; `None` for anything else or a time before 1970. Times callers give are compared only
-/// after this (M2T03R-01): as text, an offset other than `Z` would compare wrongly.
+/// The latest instant the store's fixed-width form can write: 9999-12-31T23:59:59Z.
+const LAST: u64 = 253_402_300_799;
+
+/// The instant of a contract `date-time` (exactly what [`crate::schema::is_date_time`] accepts: RFC 3339
+/// `YYYY-MM-DDTHH:MM:SS[.frac](Z|±HH:MM)`, `T`/`Z` in either case, no leap second), the fraction cut to the second;
+/// `None` for anything else, a time before 1970, or one past 9999 once in UTC (M2T03R-100, -101). Times callers give
+/// are compared only after this (M2T03R-01): as text, an offset other than `Z` would compare wrongly.
 pub fn parse_rfc3339(text: &str) -> Option<SystemTime> {
+    if !crate::schema::is_date_time(text) {
+        return None;
+    }
     let b = text.as_bytes();
     let digits = |from: usize, len: usize| -> Option<i64> {
         let part = b.get(from..from + len)?;
@@ -63,7 +70,7 @@ pub fn parse_rfc3339(text: &str) -> Option<SystemTime> {
     let days_in = usize::try_from(month - 1)
         .ok()
         .and_then(|m| month_days.get(m))?;
-    if !(1..=*days_in).contains(&day) || hour > 23 || minute > 59 || second > 60 {
+    if !(1..=*days_in).contains(&day) || hour > 23 || minute > 59 || second > 59 {
         return None;
     }
     let mut at = 19;
@@ -93,6 +100,7 @@ pub fn parse_rfc3339(text: &str) -> Option<SystemTime> {
         - offset * 60;
     u64::try_from(secs)
         .ok()
+        .filter(|s| *s <= LAST)
         .map(|s| UNIX_EPOCH + std::time::Duration::from_secs(s))
 }
 
@@ -168,8 +176,29 @@ mod tests {
             "2026-11-04T01:02:03+5:00",
             "garbage",
             "",
+            // M2T03R-101: the schema's date-time has no leap seconds (seconds 00-59).
+            "2027-01-15T08:00:60Z",
+            // M2T03R-100: past 9999-12-31T23:59:59Z once in UTC, so not in the store's fixed-width form.
+            "9999-12-31T23:59:59-23:59",
         ] {
             assert_eq!(parse_rfc3339(bad), None, "{bad}");
+        }
+        assert_eq!(
+            utc("9999-12-31T23:59:59Z").as_deref(),
+            Some("9999-12-31T23:59:59Z")
+        );
+        // The parser takes exactly the schema's date-time grammar.
+        for text in [
+            "2026-11-04T01:02:03Z",
+            "2026-11-04T01:02:03.5+01:30",
+            "2026-11-04T01:02:60Z",
+            "x",
+        ] {
+            assert_eq!(
+                parse_rfc3339(text).is_some(),
+                crate::schema::is_date_time(text),
+                "{text}"
+            );
         }
         let now = SystemTime::now();
         let whole = parse_rfc3339(&rfc3339_utc(now)).unwrap_or(UNIX_EPOCH);

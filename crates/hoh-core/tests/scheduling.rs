@@ -648,6 +648,9 @@ UPDATE tasks SET state = 'LEASED' WHERE task_id = 'T1';
 INSERT INTO runs(run_id, project_id, spec_id, state, mode, revision, blocked_reason, created_at) VALUES ('RB', 'p1', 's2', 'BLOCKED', 'AUTO', 1, 'NEED_DECISION', '2026-11-04T00:00:00Z');
 INSERT INTO role_bindings(run_id, role, agent, session_id, role_epoch, config_revision, bound_at) VALUES ('RB', 'developer', 'claude', 'sd', 1, 1, '2026-11-04T00:00:00Z');
 INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate) VALUES ('B1', 'RB', 's2', 'READY', 1, 'developer', 0, 1, 1);
+INSERT INTO runs(run_id, project_id, spec_id, state, mode, revision, created_at) VALUES ('RV', 'p1', 's2', 'VERIFYING', 'AUTO', 1, '2026-11-04T00:00:00Z');
+INSERT INTO role_bindings(run_id, role, agent, session_id, role_epoch, config_revision, bound_at) VALUES ('RV', 'developer', 'claude', 'sd', 1, 1, '2026-11-04T00:00:00Z');
+INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate) VALUES ('V1', 'RV', 's2', 'READY', 1, 'developer', 0, 1, 1);
 ";
 
 #[tokio::test]
@@ -698,6 +701,12 @@ async fn a_round_passes_over_every_ineligible_task_and_a_blocked_run_dispatches_
     assert_eq!(
         rows(&db, "SELECT state FROM tasks WHERE task_id = 'B1'")?,
         [[json!("READY")]]
+    );
+    // A run in verification still dispatches (ADR-017 decision 6, M2T03R-150).
+    let verifying = store.schedule_round("RV", context()).await?;
+    assert_eq!(
+        verifying.dispatched.map(|d| d.task_id).as_deref(),
+        Some("V1")
     );
     Ok(())
 }
@@ -751,6 +760,8 @@ async fn a_plan_names_only_the_runs_requirements_and_no_other_runs_task_ids() ->
     seed(
         &db,
         "INSERT INTO requirements(requirement_id, spec_id, title, required_release) VALUES ('REQ-038', 's2', 'DAG', 1);
+         INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', 'p1', printf('%064d', 1), 1);
+         INSERT INTO requirements(requirement_id, spec_id, title, required_release) VALUES ('REQ-001', 's1', 'old', 1);
          INSERT INTO runs(run_id, project_id, spec_id, state, mode, created_at) VALUES ('R2', 'p1', 's2', 'RUNNING', 'AUTO', '2026-11-04T00:00:00Z');
          INSERT INTO tasks(task_id, run_id, spec_id, state, role, created_seq) VALUES ('Z1', 'R2', 's2', 'READY', 'developer', 1);",
     )?;
@@ -769,6 +780,14 @@ async fn a_plan_names_only_the_runs_requirements_and_no_other_runs_task_ids() ->
     };
     assert_eq!(unknown.error_code(), None, "{error:?}");
     assert!(error.details().to_string().contains("REQ-999"), "{error:?}");
+    // A requirement of another (older) specification is as unknown to this run (M2T03R-151).
+    let older = store
+        .import_plan("R", json!({"tasks": [task("n3", &["REQ-001"])]}))
+        .await
+        .err()
+        .ok_or("imported")?;
+    assert!(matches!(older, PersistError::Plan(_)), "{older}");
+    assert_eq!(older.error_code(), None);
     let taken = store
         .import_plan("R", json!({"tasks": [task("Z1", &[])]}))
         .await

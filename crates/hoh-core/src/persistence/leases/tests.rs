@@ -304,5 +304,27 @@ fn times_with_offsets_are_judged_as_instants() -> R {
         matches!(refused, Err(PersistError::IntegrityViolation(_))),
         "{refused:?}"
     );
+    // A leap second and a time past 9999 in UTC are no date-times of the store either, on either path
+    // (M2T03R-100, -101).
+    in_tx(&mut conn, |tx| grant(tx, "p1", "writer", "a-w2", at(10)))?;
+    for (to, stamp) in [
+        (AttemptState::Starting, "9999-12-31T23:59:59-23:59"),
+        (AttemptState::Failed, "2027-01-15T08:00:60Z"),
+    ] {
+        let refused = attempts::apply(
+            &mut conn,
+            &moving_at("a-w2", AttemptState::Prepared, to, stamp),
+        );
+        assert!(
+            matches!(refused, Err(PersistError::IntegrityViolation(_))),
+            "{stamp}: {refused:?}"
+        );
+    }
+    let state: String = conn.query_row(
+        "SELECT state FROM attempts WHERE attempt_id = 'a-w2'",
+        [],
+        |r| r.get(0),
+    )?;
+    assert_eq!(state, "PREPARED");
     Ok(())
 }
