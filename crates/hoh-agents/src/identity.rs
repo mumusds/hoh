@@ -329,11 +329,13 @@ fn find_with(
     }))
 }
 
-/// Whether `pidfd_open` failing with `e` means no process has that pid: ESRCH, or EINVAL, which Linux 6.8 to 6.15 give
-/// for a number with no thread-group leader (reaped, its number held only as a process group id by the members left,
-/// or a thread's id; from 6.16 these are ESRCH too, M2T05R-553). Its group is then asked about by number.
+/// Whether `pidfd_open` (no flags, a pid above 0) failing with `e` means no process has that pid as its own: ESRCH
+/// (no such number); for a number with a task but no thread-group leader of that number, Linux 6.8 to 6.15 give EINVAL
+/// both for one held only as a process group id by the members left after its leader's reap and for a live thread's
+/// id, while 6.16 and later give ESRCH for the former and ENOENT for the latter (M2T05R-553, -600, -650). The
+/// recorded process is gone either way; its group is then asked about by number.
 fn no_process(e: rustix::io::Errno) -> bool {
-    e == rustix::io::Errno::SRCH || e == rustix::io::Errno::INVAL
+    e == rustix::io::Errno::SRCH || e == rustix::io::Errno::INVAL || e == rustix::io::Errno::NOENT
 }
 
 /// One step of a stop, for the events (AC-041-02's order).
@@ -796,11 +798,47 @@ mod tests {
 
     #[test]
     fn a_pid_with_no_process_by_either_answer_is_gone() {
-        // M2T05R-553: Linux 6.8-6.15 answer EINVAL, later ones ESRCH, for a number only a process group holds.
+        // M2T05R-553, -650: the kernels' answers for a number that is no process's own (see `no_process`).
         assert!(no_process(rustix::io::Errno::SRCH));
         assert!(no_process(rustix::io::Errno::INVAL));
+        assert!(no_process(rustix::io::Errno::NOENT));
         assert!(!no_process(rustix::io::Errno::PERM));
         assert!(!no_process(rustix::io::Errno::MFILE));
+    }
+
+    #[test]
+    fn a_pid_that_is_now_a_thread_of_another_process_is_gone() -> io::Result<()> {
+        // M2T05R-650 (REQ-041 failure mode 2): a recorded pid that is now a live thread's id (here one of this test's
+        // own) names no process of the attempt; pidfd_open refuses it (EINVAL up to 6.15, ENOENT from 6.16) and no
+        // process group has that number, so the record is Gone, not uncertain.
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            // `/proc/thread-self` links to `<pid>/task/<tid>`.
+            let tid = std::fs::read_link("/proc/thread-self")
+                .ok()
+                .and_then(|link| {
+                    link.file_name()
+                        .and_then(|n| n.to_str())
+                        .and_then(|n| n.parse::<u32>().ok())
+                });
+            let _ = tid_tx.send(tid);
+            let _ = stop_rx.recv();
+        });
+        let tid = tid_rx
+            .recv()
+            .map_err(io::Error::other)?
+            .ok_or_else(|| io::Error::other("no thread id"))?;
+        assert_ne!(tid, std::process::id());
+        let boot = boot_id()?;
+        let seen = presence(Some(i64::from(tid)), Some(&boot), Some("1"));
+        let _ = stop_tx.send(());
+        let _ = thread.join();
+        assert!(
+            matches!(&seen, Ok(Presence::Gone(Gone::NoProcess))),
+            "{seen:?}"
+        );
+        Ok(())
     }
 
     #[test]

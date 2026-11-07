@@ -1872,13 +1872,14 @@ impl FaultHooks for FailNthCommit {
     }
 }
 
-/// M2T05R-06, -452, -552: A1's lease expires and the `nth` commit after that fails. A pass's steps are one commit, so
-/// whichever fails, one pass is recorded whole: when it is the settle's (nth 1) that pass leaves no record (its stop
-/// was done) and the next pass, with event ids of its own, finds A1's process gone; when it is a later one, the
-/// settle's pass is recorded with every step. Either way the chain ends and T2 is granted epoch 5.
+/// M2T05R-06, -452, -552, -651: A1's lease expires with the fault armed for the `nth` plain commit after that. nth 1:
+/// the settle's pass's one commit fails, so that pass leaves no record (its stop was done) and the next pass, with
+/// event ids of its own, finds A1's process gone (two commits in all). nth 2: a second commit, which a pass would
+/// make only if it split its steps, so the fault never fires: the pass is recorded whole by exactly one commit.
+/// Either way the chain ends and T2 is granted epoch 5.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_settle_cut_short_is_done_again_by_another_pass() -> R {
-    for nth in 1..=3 {
+    for nth in 1..=2 {
         let dir = tempfile::tempdir()?;
         let project = dir.path().join("p");
         std::fs::create_dir_all(&project)?;
@@ -1931,10 +1932,14 @@ async fn a_settle_cut_short_is_done_again_by_another_pass() -> R {
                 "SELECT group_concat(json_extract(payload_json, '$.found'), ';') FROM events WHERE kind = 'lease.inspected' AND json_extract(payload_json, '$.attempt_id') = '{a1}'"
             ),
         )?;
+        // The plain commits made since the arming: one per pass.
+        let commits = faults.seen.load(std::sync::atomic::Ordering::SeqCst);
         if nth == 1 {
+            assert_eq!(commits, 2, "nth={nth}");
             assert_eq!(steps, "lease.inspected,lease.native_cancel", "nth={nth}");
             assert_eq!(found, r#"{"gone":"no_process"}"#, "nth={nth}");
         } else {
+            assert_eq!(commits, 1, "nth={nth}");
             assert_eq!(
                 steps,
                 "lease.inspected,lease.native_cancel,lease.sigterm,lease.sigkill,lease.reaped",
