@@ -247,8 +247,9 @@ impl Writer {
         after_events: impl Fn() + Send + 'static,
     ) -> Result<Writer, PersistError> {
         let (jobs, mut rx) = mpsc::channel(options.queue.max(1));
-        // How a claim nobody took returns itself (a weak handle: it does not keep the writer running).
-        let back = jobs.downgrade();
+        // The claims handed out and not yet handed to a transport (ADR-018 decision 4).
+        let claims = Registry::default();
+        let writer_claims = claims.clone();
         let faults = options.faults.clone();
         let (end, ended) = watch::channel(false);
         std::thread::Builder::new()
@@ -258,6 +259,8 @@ impl Writer {
                 let mut kept = Kept(Vec::new());
                 while let Some(job) = rx.blocking_recv() {
                     before();
+                    // Claims returned since the last job are undone before this one (M2T04R-300).
+                    writer_claims.undo_returned(&mut conn, false);
                     match job {
                         Job::Commit(commit, reply) => {
                             let _ = reply.send(apply(
@@ -278,16 +281,14 @@ impl Writer {
                             let _ = reply.send(super::pragmas(&conn));
                         }
                         Job::Outbox(job, reply) => {
-                            // A claim is a delivery only if its row reaches the dispatcher: one nobody waits for
-                            // is not run, and one whose answer cannot be handed over is undone (M2T04R-100).
-                            // A claim nobody waits for is not run; one that is answered travels as a guard that
-                            // returns it if it is dropped before the dispatcher hands it to the transport, wherever
-                            // that happens: here, in the channel, in the dispatcher (M2T04R-100, -200).
-                            let claim = matches!(*job, OutboxJob::Claim(..));
-                            if !(claim && reply.is_closed()) {
-                                let _ =
-                                    reply.send(run_outbox(&mut conn, *job, &back, &after_events));
-                            }
+                            // A claim travels as a guard registered here: dropped before it is handed to a
+                            // transport, wherever that happens, it is returned and undone (M2T04R-100, -200).
+                            let _ = reply.send(run_outbox(
+                                &mut conn,
+                                *job,
+                                &writer_claims,
+                                &after_events,
+                            ));
                         }
                         Job::Plan(request, reply) => {
                             let (run_id, plan) = *request;
@@ -345,7 +346,10 @@ impl Writer {
                         });
                     }
                 }
-                // The connection first, then what was kept (a lock goes only after the last write), then the word.
+                // Every claim not handed to a transport is undone before the store closes, the guards of some
+                // still alive: they cannot be handed over any more (M2T04R-301). Then the connection, then what was
+                // kept (a lock goes only after the last write), then the word.
+                writer_claims.undo_returned(&mut conn, true);
                 drop(conn);
                 drop(kept);
                 let _ = end.send(true);
@@ -725,8 +729,6 @@ pub(super) enum OutboxJob {
     Claim(std::time::SystemTime, Vec<String>, i64),
     /// Message id, generation, settlement, the delivery limit.
     Settle(String, i64, super::outbox::Settlement, i64),
-    /// A claim that never reached its transport, returned by its guard.
-    Unclaim(Box<super::outbox::OutboxRow>),
     Consume(
         Box<(
             String,
@@ -752,7 +754,7 @@ pub(super) struct OutboxDone {
 fn run_outbox(
     conn: &mut Connection,
     job: OutboxJob,
-    back: &mpsc::WeakSender<Job>,
+    claims: &Registry,
     after_events: &dyn Fn(),
 ) -> Result<OutboxDone, PersistError> {
     use super::outbox;
@@ -760,17 +762,10 @@ fn run_outbox(
         OutboxJob::Claim(now, roles, max) => OutboxDone {
             rows: outbox::claim_next(conn, now, &roles, max, after_events)?
                 .into_iter()
-                .map(|row| Claimed {
-                    row: Some(row),
-                    back: back.clone(),
-                })
+                .map(|row| claims.register(row))
                 .collect(),
             ..OutboxDone::default()
         },
-        OutboxJob::Unclaim(row) => {
-            outbox::unclaim(conn, &row)?;
-            OutboxDone::default()
-        }
         OutboxJob::Settle(id, generation, settlement, max) => {
             outbox::settle(conn, &id, generation, &settlement, max, after_events)?;
             OutboxDone::default()
@@ -810,12 +805,64 @@ fn run_outbox(
     })
 }
 
+/// The claims a writer handed out (ADR-018 decision 4): outstanding until handed to a transport, returned when their
+/// guard is dropped first. Shared by the writer thread and the guards; no channel, so a return never depends on the
+/// writer's queue or on the writer still running.
+#[derive(Debug, Clone, Default)]
+pub(super) struct Registry(std::sync::Arc<std::sync::Mutex<Claims>>);
+
+#[derive(Debug, Default)]
+struct Claims {
+    next: u64,
+    outstanding: std::collections::BTreeMap<u64, super::outbox::OutboxRow>,
+    returned: Vec<super::outbox::OutboxRow>,
+}
+
+impl Registry {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Claims> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn register(&self, row: super::outbox::OutboxRow) -> Claimed {
+        let mut claims = self.lock();
+        claims.next += 1;
+        let id = claims.next;
+        claims.outstanding.insert(id, row.clone());
+        Claimed {
+            id,
+            row: Some(row),
+            registry: self.clone(),
+        }
+    }
+
+    /// Undo the returned claims (and, when the store closes, every outstanding one); those that fail (a busy
+    /// database) wait for the next time.
+    fn undo_returned(&self, conn: &mut Connection, closing: bool) {
+        let rows = {
+            let mut claims = self.lock();
+            let mut rows = std::mem::take(&mut claims.returned);
+            if closing {
+                rows.extend(std::mem::take(&mut claims.outstanding).into_values());
+            }
+            rows
+        };
+        let failed: Vec<_> = rows
+            .into_iter()
+            .filter(|row| super::outbox::unclaim(conn, row).is_err())
+            .collect();
+        self.lock().returned.extend(failed);
+    }
+}
+
 /// An outbox row claimed for delivery (ADR-018 decision 4). The claim belongs to the store until [`Claimed::start`]
-/// hands the row to a transport: dropped before that (a tick cancelled while it waited, the answer lost with its
-/// channel), it returns itself, undone in the writer, so a delivery that never started is not counted.
+/// hands the row to a transport (from then the delivery counts); dropped before that, wherever it is (the writer's
+/// reply, an unread answer in its channel, the dispatcher), it is returned to the writer, which undoes it.
 pub struct Claimed {
+    id: u64,
     row: Option<super::outbox::OutboxRow>,
-    back: mpsc::WeakSender<Job>,
+    registry: Registry,
 }
 
 impl Claimed {
@@ -824,15 +871,19 @@ impl Claimed {
         self.row.as_ref()
     }
 
-    /// Hand the row to the transport: from here the delivery counts.
+    /// Hand the row to the transport: from here the delivery counts. `None` when the store has taken the claim back
+    /// (it closed meanwhile): nothing is to be delivered then.
     pub fn start(mut self) -> Option<super::outbox::OutboxRow> {
-        self.row.take()
+        let handed = self.registry.lock().outstanding.remove(&self.id).is_some();
+        let row = self.row.take();
+        if handed { row } else { None }
     }
 }
 
 impl std::fmt::Debug for Claimed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Claimed")
+            .field("id", &self.id)
             .field("row", &self.row)
             .finish_non_exhaustive()
     }
@@ -840,13 +891,9 @@ impl std::fmt::Debug for Claimed {
 
 impl Drop for Claimed {
     fn drop(&mut self) {
-        if let (Some(row), Some(jobs)) = (self.row.take(), self.back.upgrade()) {
-            let (reply, _) = oneshot::channel();
-            // A full queue loses the return: the row is then taken again after its backoff, with one delivery more.
-            let _ = jobs.try_send(Job::Outbox(
-                Box::new(OutboxJob::Unclaim(Box::new(row))),
-                reply,
-            ));
+        let mut claims = self.registry.lock();
+        if let Some(row) = claims.outstanding.remove(&self.id) {
+            claims.returned.push(row);
         }
     }
 }

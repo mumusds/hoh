@@ -1539,11 +1539,10 @@ async fn a_claim_whose_dispatcher_stopped_waiting_costs_no_delivery() -> R {
         let cancelled = tokio::time::timeout(Duration::from_millis(150), dispatcher.tick()).await;
         assert!(cancelled.is_err(), "the tick was not held up");
         holder.wait()?;
-        // Anything queued behind the claim returns only once the writer is past it.
-        store
-            .claim_outbox(clock.now(), Vec::new(), 3)
-            .await?
-            .and_then(hoh_core::persistence::Claimed::start);
+        // The writer undoes returned claims before each job: once a job after the cancelled claim has run, the claim is
+        // undone; two such jobs, since the cancelled claim's own return can come after the first (M2T04R-350).
+        store.claim_outbox(clock.now(), Vec::new(), 3).await?;
+        store.claim_outbox(clock.now(), Vec::new(), 3).await?;
         clock.set(clock.now() + Duration::from_secs(120));
     }
     assert_eq!(
@@ -1777,8 +1776,16 @@ async fn a_claim_answered_but_never_read_returns_itself() -> R {
         holder.wait()?;
         // Queued behind the claim: when it returns, the claim's answer is waiting, unread, in its channel.
         store.claim_outbox(clock.now(), Vec::new(), 3).await?;
+        // The precondition: the claim did run and count (M2T04R-351).
+        assert_eq!(
+            rows(
+                &db,
+                "SELECT state, attempt_count FROM outbox WHERE message_id = 'u'"
+            )?,
+            [[json!("DELIVERING"), json!(1)]]
+        );
         drop(tick);
-        // The returned claim is undone before anything queued after it.
+        // Returned claims are undone before the writer's next job.
         store.claim_outbox(clock.now(), Vec::new(), 3).await?;
         assert_eq!(
             rows(
@@ -1902,7 +1909,9 @@ async fn attempts_are_ordered_by_creation_not_by_their_ids() -> R {
 
 #[tokio::test]
 async fn the_same_result_with_an_extreme_number_replays() -> R {
-    // M2T04R-253: compared as stored text, a number that needs an exact float round trip still matches.
+    // M2T04R-253: compared as stored text, a number that needs an exact float round trip still matches. It tells a
+    // comparison of reparsed values apart only when hoh-core is built alone (`cargo test -p hoh-core`): in a workspace
+    // build hoh-agents turns on serde_json's float_roundtrip and reparsing is exact (M2T04R-352).
     let (_dir, store, _db) = world_with("").await?;
     let mut result = developer_result()?;
     // The exact f64 (a literal), not a parse of text: reparsing its stored text without an exact round trip may give
@@ -1917,5 +1926,98 @@ async fn the_same_result_with_an_extreme_number_replays() -> R {
         matches!(again, TaskResultOutcome::Replayed { .. }),
         "{again:?}"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_returned_claim_that_meets_a_busy_database_is_undone_later() -> R {
+    // M2T04R-300: the undo of a returned claim fails while another connection holds the database (past the short
+    // busy timeout); it is kept and done before a later job, not lost.
+    use std::io::BufRead as _;
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join(".hoh/state.db");
+    let store = Store::open(
+        &path,
+        Options {
+            wal_probe: Some(ProbeCommand {
+                program: std::env::current_exe().unwrap_or_default(),
+                args: [
+                    "wal_probe_helper",
+                    "--exact",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ]
+                .map(OsString::from)
+                .to_vec(),
+                env: Vec::new(),
+                answer_timeout: Duration::from_secs(10),
+            }),
+            busy_timeout: Duration::from_millis(80),
+            ..Options::default()
+        },
+    )?;
+    seed(&path, WORLD)?;
+    enqueue(&store, "b", &[to_qa("b", 3, 2, &sha(2), None)?]).await?;
+    let clock = FakeClock::new();
+    let claim = store
+        .claim_outbox(clock.now(), vec!["qa".to_owned()], 3)
+        .await?
+        .ok_or("nothing due")?;
+    let mut holder = Command::new("python3")
+        .args([
+            "-c",
+            "import sqlite3,sys,time\nc=sqlite3.connect(sys.argv[1],isolation_level=None,timeout=30)\nc.execute('BEGIN IMMEDIATE')\nprint('locked',flush=True)\ntime.sleep(0.6)\nc.execute('COMMIT')",
+        ])
+        .arg(&path)
+        .stdout(std::process::Stdio::piped())
+        .spawn()?;
+    let mut line = String::new();
+    std::io::BufReader::new(holder.stdout.take().ok_or("no stdout")?).read_line(&mut line)?;
+    drop(claim);
+    // The next job finds the database busy: the undo waits, and so does the job.
+    let _ = store.writer_pragmas().await;
+    assert_eq!(
+        rows(
+            &path,
+            "SELECT state, attempt_count FROM outbox WHERE message_id = 'b'"
+        )?,
+        [[json!("DELIVERING"), json!(1)]]
+    );
+    holder.wait()?;
+    store.writer_pragmas().await?;
+    assert_eq!(
+        rows(
+            &path,
+            "SELECT state, attempt_count FROM outbox WHERE message_id = 'b'"
+        )?,
+        [[json!("PENDING"), json!(0)]]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_claim_still_held_when_the_store_closes_is_undone_and_cannot_start() -> R {
+    // M2T04R-301: the store closes while a guard is alive; the writer undoes the claim before it lets the database go,
+    // and the guard can no longer hand the row to a transport.
+    let dir = tempfile::tempdir()?;
+    let (store, db) = open(&dir)?;
+    seed(&db, WORLD)?;
+    enqueue(&store, "s", &[to_qa("s", 3, 2, &sha(2), None)?]).await?;
+    let claim = store
+        .claim_outbox(FakeClock::new().now(), vec!["qa".to_owned()], 3)
+        .await?
+        .ok_or("nothing due")?;
+    let ended = store.writer_ended();
+    drop(store);
+    assert!(ended.await, "the writer did not finish");
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT state, attempt_count FROM outbox WHERE message_id = 's'"
+        )?,
+        [[json!("PENDING"), json!(0)]]
+    );
+    assert_eq!(claim.start(), None);
     Ok(())
 }
