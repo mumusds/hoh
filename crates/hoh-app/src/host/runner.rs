@@ -91,7 +91,8 @@ pub trait Executor: Send + Sync + std::fmt::Debug {
     /// order: group SIGKILL, reap, `group_gone`).
     fn start(&self, work: &Work) -> Result<Started, String>;
     /// Ask `work`'s process to stop the agent's own way (its native cancel), before any signal: the first step when its
-    /// lease expired (AC-041-02).
+    /// lease expired (AC-041-02). It only asks and returns at once: the settle looks at the group around it
+    /// (M2T05R-452).
     fn cancel(&self, _work: &Work) {}
 }
 
@@ -431,38 +432,25 @@ async fn attempt(
     Ok(())
 }
 
-/// One step event of a settle, committed on its own so the steps keep their order (AC-041-02); its id is this pass's
-/// own, so a pass cut short is followed by another without colliding (M2T05R-06).
-async fn step(
-    common: &Common,
-    row: &UnfinishedRow,
-    prefix: &str,
-    pass: &str,
-    name: &str,
-    payload: Value,
-) -> Result<(), PersistError> {
-    common
-        .shared
-        .store
-        .commit(Commit {
-            events: vec![NewEvent {
-                project_id: row.project_id.clone(),
-                event_id: hoh_core::ids::child_id(&row.attempt_id, &format!("{pass}/{name}")),
-                run_id: Some(row.run_id.clone()),
-                kind: format!("{prefix}.{name}"),
-                payload,
-            }],
-            ..Commit::default()
-        })
-        .await
-        .map(drop)
+/// One step event of a settle. A pass's steps are committed together, in their order (AC-041-02), after its stop
+/// (M2T05R-452): a pass whose commit fails leaves no record, and its id is the pass's own, so the next pass does not
+/// collide with it (M2T05R-06).
+fn step(row: &UnfinishedRow, prefix: &str, pass: &str, name: &str, payload: Value) -> NewEvent {
+    NewEvent {
+        project_id: row.project_id.clone(),
+        event_id: hoh_core::ids::child_id(&row.attempt_id, &format!("{pass}/{name}")),
+        run_id: Some(row.run_id.clone()),
+        kind: format!("{prefix}.{name}"),
+        payload,
+    }
 }
 
 /// Settle `id`, which this host can no longer trust to end by itself: its lease expired (`lease_expired`), its
 /// executor lost its process (`executor_lost`), or its task failed (`runner_error`). Never judged ended by that alone
 /// (REQ-041 b4): its own task here is aborted and waited for first (so nothing else of this host writes for it,
 /// M2T05R-03), its row read again, its process inspected by its record, its native cancel sent, SIGTERM and SIGKILL
-/// to its group and its group seen empty; then its disposition as at a reconcile,
+/// to its group and its group seen empty (all in one go, the step events then committed together in their order);
+/// then its disposition as at a reconcile,
 /// which lets its lease go only once it is ended. A process that may still run (outlived its stop, or cannot be told
 /// apart) moves nothing and keeps its slot; when that finding is `last`'s again, nothing is written again
 /// (M2T05R-157). The disposition applied, if any, with the finding.
@@ -492,14 +480,41 @@ async fn settle(
     else {
         return Ok(None);
     };
+    // From the inspection to the end of the stop in one go, with no write in between, so its group is looked at
+    // throughout (M2T05R-452); the steps are written after it, in their order.
     let scanned = row.clone();
-    let seen = tokio::task::spawn_blocking(move || reconcile::inspect(&scanned))
-        .await
-        .map_err(|e| PersistError::Storage(format!("the inspection of {id} ended: {e}")))?;
-    let finding = seen.json().to_string();
-    if matches!(seen, reconcile::Seen::Uncertain(_)) && last == Some(finding.as_str()) {
-        return Ok(Some((Disposition::Unreaped, finding)));
-    }
+    let settings = common.settings.clone();
+    let executor = common.executor.clone();
+    let repeated = last.map(str::to_owned);
+    let stop = tokio::task::spawn_blocking(move || {
+        let seen = reconcile::inspect(&scanned);
+        let found = seen.json();
+        let finding = found.to_string();
+        if matches!(seen, reconcile::Seen::Uncertain(_))
+            && repeated.as_deref() == Some(finding.as_str())
+        {
+            return None;
+        }
+        if let Some(work) = &work {
+            executor.cancel(work);
+        }
+        // The native cancel's grace first: a group that emptied by it gets no signal.
+        seen.grace(settings.term_grace);
+        Some((
+            found,
+            finding,
+            work.is_some(),
+            reconcile::end(seen, &settings),
+        ))
+    })
+    .await
+    .map_err(|e| PersistError::Storage(format!("the stop of {id} ended: {e}")))?;
+    let Some((found, finding, cancelled, process)) = stop else {
+        return Ok(Some((
+            Disposition::Unreaped,
+            last.unwrap_or_default().to_owned(),
+        )));
+    };
     let prefix = if cause == "lease_expired" {
         "lease"
     } else {
@@ -510,40 +525,33 @@ async fn settle(
         common.host_epoch,
         common.passes.fetch_add(1, Ordering::SeqCst)
     );
-    step(
-        common,
-        &row,
-        prefix,
-        &pass,
-        "inspected",
-        json!({"attempt_id": id, "cause": cause, "lease_epoch": row.lease_epoch, "found": seen.json()}),
-    )
-    .await?;
-    if let Some(work) = &work {
-        common.executor.cancel(work);
-    }
-    step(
-        common,
-        &row,
-        prefix,
-        &pass,
-        "native_cancel",
-        json!({"attempt_id": id, "sent": work.is_some()}),
-    )
-    .await?;
-    let settings = common.settings.clone();
-    let process = tokio::task::spawn_blocking(move || {
-        // The native cancel's grace first: a group that emptied by it gets no signal.
-        seen.grace(settings.term_grace);
-        reconcile::end(seen, &settings)
-    })
-    .await
-    .map_err(|e| PersistError::Storage(format!("the stop of {id} ended: {e}")))?;
+    let mut events = vec![
+        step(
+            &row,
+            prefix,
+            &pass,
+            "inspected",
+            json!({"attempt_id": id, "cause": cause, "lease_epoch": row.lease_epoch, "found": found}),
+        ),
+        step(
+            &row,
+            prefix,
+            &pass,
+            "native_cancel",
+            json!({"attempt_id": id, "sent": cancelled}),
+        ),
+    ];
     if let Process::Stopped { steps, .. } = &process {
         for name in steps {
-            step(common, &row, prefix, &pass, name, json!({"attempt_id": id})).await?;
+            events.push(step(&row, prefix, &pass, name, json!({"attempt_id": id})));
         }
     }
+    store
+        .commit(Commit {
+            events,
+            ..Commit::default()
+        })
+        .await?;
     let observer = common.settings.observer.clone();
     let effects = row
         .effects

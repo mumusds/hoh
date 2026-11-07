@@ -1871,8 +1871,9 @@ impl FaultHooks for FailNthCommit {
     }
 }
 
-/// M2T05R-06: A1's lease expires and its settle stops after its first step (the second step's commit fails). The
-/// next tick settles it again with event ids of its own pass, so the chain ends and T2 is granted epoch 5.
+/// M2T05R-06, -452: A1's lease expires and the commit of its settle's steps fails, so that pass leaves no record (its
+/// stop was done). The next tick settles it again with event ids of its own pass, finds its process gone and ends the
+/// chain: T2 is granted epoch 5, and the one pass recorded says what it found.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_settle_cut_short_is_done_again_by_another_pass() -> R {
     let dir = tempfile::tempdir()?;
@@ -1887,7 +1888,7 @@ async fn a_settle_cut_short_is_done_again_by_another_pass() -> R {
         started: std::sync::Mutex::new(Vec::new()),
     });
     let faults = Arc::new(FailNthCommit {
-        nth: 2,
+        nth: 1,
         ..FailNthCommit::default()
     });
     let host = runner_host(
@@ -1923,9 +1924,19 @@ async fn a_settle_cut_short_is_done_again_by_another_pass() -> R {
             ),
         )
     };
-    assert_eq!(count("lease.inspected")?, "2");
+    // One pass recorded: the one cut short wrote nothing.
+    assert_eq!(count("lease.inspected")?, "1");
     assert_eq!(count("lease.native_cancel")?, "1");
-    assert_eq!(count("lease.reaped")?, "1");
+    assert_eq!(count("lease.sigterm")?, "0");
+    assert_eq!(
+        query(
+            &db,
+            &format!(
+                "SELECT json_extract(payload_json, '$.found.gone') FROM events WHERE kind = 'lease.inspected' AND json_extract(payload_json, '$.attempt_id') = '{a1}'"
+            ),
+        )?,
+        "no_process"
+    );
     host.shutdown().await;
     drop(executor);
     Ok(())
@@ -2050,13 +2061,22 @@ fn a_failure_committed_before_a_crash_stays_a_failure() -> R {
             .filter(|e| e["kind"] == "reconcile.attempt" && e["payload"]["disposition"] == "ended")
             .filter_map(|e| e["payload"]["attempt_id"].as_str())
             .collect();
-        assert!(!ended.is_empty(), "#{round}: {read}");
+        // Each attempt ended by the reconcile is FAILED by its recorded failure, or CANCELLED when its work never
+        // started (one STARTING when the host was killed, as can happen alongside); the one killed after its failure
+        // was committed is FAILED.
+        let mut failed = 0;
         for id in &ended {
-            assert!(
-                old.iter().any(|a| a["id"] == *id && a["state"] == "FAILED"),
-                "#{round}: {id}"
-            );
+            let state = old
+                .iter()
+                .find(|a| a["id"] == *id)
+                .map(|a| a["state"].clone());
+            match state.as_ref().and_then(Value::as_str) {
+                Some("FAILED") => failed += 1,
+                Some("CANCELLED") => {}
+                other => return Err(format!("#{round}: {id} ended as {other:?}: {read}").into()),
+            }
         }
+        assert!(failed >= 1, "#{round}: {read}");
         // Each task is done in a later attempt, but one left with an attempt UNKNOWN_EFFECT (killed mid-run).
         let unknown: Vec<&str> = read["attempts"]
             .as_array()
@@ -2679,6 +2699,142 @@ async fn a_holder_ended_by_its_native_cancel_gets_no_signal() -> R {
         )?,
         "lease.inspected,lease.native_cancel,lease.reaped"
     );
+    host.shutdown().await;
+    drop(executor);
+    Ok(())
+}
+
+/// A stuck agent whose native cancel kills only its leader, and whose executor reaps that leader at once without
+/// emptying its group, so the leader is gone while a member that ignores SIGTERM is left (M2T05R-452).
+#[derive(Debug)]
+struct LeaderOnlyCancel(StuckExecutor);
+
+impl hoh_app::host::Executor for LeaderOnlyCancel {
+    fn deliver(
+        &self,
+        work: &hoh_app::host::Work,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
+        self.0.deliver(work)
+    }
+
+    fn start(&self, _work: &hoh_app::host::Work) -> Result<hoh_app::host::Started, String> {
+        let (mut child, pid, gate) = self.0.spawn()?;
+        let (end, ended) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let status = child.wait();
+            let _ = end.send(hoh_app::host::Outcome {
+                success: false,
+                detail: format!("{status:?}"),
+                group_gone: false,
+            });
+        });
+        Ok(hoh_app::host::Started { pid, gate, ended })
+    }
+
+    fn cancel(&self, work: &hoh_app::host::Work) {
+        self.0.cancel(work);
+        for pid in self.0.started.lock().map(|p| p.clone()).unwrap_or_default() {
+            if let Some(pid) = i32::try_from(pid)
+                .ok()
+                .and_then(rustix::process::Pid::from_raw)
+            {
+                let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+            }
+        }
+    }
+}
+
+/// Makes every plain commit take 200 ms once a settle has begun (longer than `HELD_FOR`).
+#[derive(Debug, Default)]
+struct SlowWritesWhileSettling(std::sync::atomic::AtomicBool);
+
+impl FaultHooks for SlowWritesWhileSettling {
+    fn at(&self, job: &'static str, point: WritePoint) {
+        if job == "Commit"
+            && point == WritePoint::Begun
+            && self.0.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+}
+
+impl hoh_app::host::HostHooks for SlowWritesWhileSettling {
+    fn runner(&self, point: hoh_app::host::RunnerPoint) {
+        if point == hoh_app::host::RunnerPoint::Settling {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+/// M2T05R-452: A1's lease expires; its native cancel kills its leader, which is reaped at once, while a member that
+/// ignores SIGTERM stays. Its group is looked at from the inspection to the end of the stop with no write in between,
+/// however slow the writes are, so it stays known as A1's: the member gets SIGTERM and SIGKILL, the group is seen
+/// empty, and A1 lets its slot go (UNKNOWN_EFFECT: its work cannot be confirmed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_group_is_watched_through_its_settle_however_slow_the_writes() -> R {
+    let dir = tempfile::tempdir()?;
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    let (code, stderr) = serve_and_stop(&project)?;
+    assert_eq!(code, 0, "{stderr}");
+    seed(&project, WRITERS)?;
+    let clock = Arc::new(FakeClock::default());
+    let executor = Arc::new(LeaderOnlyCancel(StuckExecutor {
+        cancels: dir.path().join("cancels"),
+        started: std::sync::Mutex::new(Vec::new()),
+    }));
+    let slow = Arc::new(SlowWritesWhileSettling::default());
+    let host = runner_host_with(
+        &project,
+        executor.clone(),
+        clock.clone(),
+        Setup {
+            faults: Some(slow.clone()),
+            hooks: Some(slow),
+            ..Setup::default()
+        },
+    )
+    .await?;
+    let db = db(&project);
+    assert!(wait_for(
+        &db,
+        "SELECT state FROM attempts WHERE task_id = 'T1'",
+        "RUNNING",
+        Duration::from_secs(10)
+    )?);
+    let a1 = query(&db, "SELECT attempt_id FROM attempts WHERE task_id = 'T1'")?;
+    let pid: u32 = query(
+        &db,
+        &format!("SELECT pid FROM attempts WHERE attempt_id = '{a1}'"),
+    )?
+    .parse()?;
+    clock.advance(Duration::from_secs(300));
+    assert!(
+        wait_for(
+            &db,
+            &format!("SELECT state FROM attempts WHERE attempt_id = '{a1}'"),
+            "UNKNOWN_EFFECT",
+            Duration::from_secs(30)
+        )?,
+        "{}",
+        query(
+            &db,
+            &format!(
+                "SELECT group_concat(kind, ',') FROM (SELECT kind FROM events WHERE json_extract(payload_json, '$.attempt_id') = '{a1}' ORDER BY seq)"
+            )
+        )?
+    );
+    assert_eq!(
+        query(
+            &db,
+            &format!(
+                "SELECT group_concat(kind, ',') FROM (SELECT kind FROM events WHERE kind LIKE 'lease.%' AND json_extract(payload_json, '$.attempt_id') = '{a1}' ORDER BY seq)"
+            )
+        )?,
+        "lease.inspected,lease.native_cancel,lease.sigterm,lease.sigkill,lease.reaped"
+    );
+    assert_eq!(group_now(pid), nothing_left());
     host.shutdown().await;
     drop(executor);
     Ok(())
