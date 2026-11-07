@@ -250,13 +250,6 @@ impl Host {
                 u64::from_le_bytes(bytes)
             }
         }));
-        // The clock reads no earlier than the latest time the store recorded, before it stamps anything (ADR-020
-        // decision 4, times across host lives: a wall clock set back across the restart puts no time of this life
-        // behind an earlier life's, M2T19R-200, -300, -301).
-        let latest = readers[0].latest_recorded().map_err(StartError::store)?;
-        let clock_behind = latest.map_or(std::time::Duration::ZERO, |at| {
-            config.clock.0.not_before(at)
-        });
         // Every unfinished attempt is settled before anything is served (REQ-041 b1: no write command before it).
         reconcile::run(
             &store,
@@ -265,7 +258,6 @@ impl Host {
             &config.reconcile,
             config.clock.0.as_ref(),
             &jitter,
-            clock_behind,
         )
         .await
         .map_err(StartError::store)?;
