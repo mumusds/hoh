@@ -168,18 +168,62 @@ pub(super) fn fail_task(
     })
 }
 
+/// How long an attempt that started at `started` ran by `end`, in whole seconds: never less than its own host life
+/// recorded it ran, to `recorded_end` (its work's OBSERVED end, by the same life's clock as its start), whatever a
+/// later life's `end` says (ADR-020 decision 4, M2T19R-200, -450). A lease time is no evidence of running.
+fn ran(started: SystemTime, end: SystemTime, recorded_end: Option<SystemTime>) -> u64 {
+    let to = |end: SystemTime| end.duration_since(started).map_or(0, |d| d.as_secs());
+    to(end).max(recorded_end.map_or(0, to))
+}
+
+/// The end its work's OBSERVED record holds for `attempt_id`, if any.
+fn observed_end(conn: &Connection, attempt_id: &str) -> Result<Option<SystemTime>, PersistError> {
+    let observed = child_id(&crate::reconcile::work_key(attempt_id), "effect.observed");
+    let ended: Option<String> = conn
+        .query_row(
+            "SELECT json_extract(payload_json, '$.detail.ended_at') FROM events WHERE event_id = ?1",
+            params![observed],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?
+        .flatten();
+    Ok(ended.as_deref().and_then(crate::time::parse_rfc3339))
+}
+
+/// How far `at` is behind the start of `attempt_id` (a wall clock set back across a restart), if it is: the
+/// reconcile's diagnostic (ADR-020 decision 4).
+pub(super) fn behind_start(
+    conn: &Connection,
+    attempt_id: &str,
+    at: SystemTime,
+) -> Result<Option<std::time::Duration>, PersistError> {
+    let started: Option<String> = conn
+        .query_row(
+            "SELECT started_at FROM attempts WHERE attempt_id = ?1",
+            params![attempt_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?
+        .flatten();
+    Ok(started
+        .as_deref()
+        .and_then(crate::time::parse_rfc3339)
+        .and_then(|started| started.duration_since(at).ok())
+        .filter(|d| !d.is_zero()))
+}
+
 /// Add the attempt's running time to its run's `wall_seconds` budget, if it has one (ADR-020 decision 7): the used
-/// duration changes only when an attempt ends, so a waiting run's is the same across a crash and a restart. It is
-/// never less than what the attempt's own host life recorded it ran, from its start to `recorded_end` (its work's
-/// OBSERVED end, the same life's clock), whatever a later life's `ended_at` says (ADR-020 decision 4, M2T19R-200).
-/// How far `ended_at` is before its start (a wall clock set back across a restart), if it is.
+/// duration changes only when an attempt ends, so a waiting run's is the same across a crash and a restart. The time
+/// is [`ran`], with `recorded_end` its work's OBSERVED end if the caller has one.
 pub(super) fn accrue_wall(
     tx: &Transaction<'_>,
     run_id: &str,
     attempt_id: &str,
     ended_at: SystemTime,
     recorded_end: Option<SystemTime>,
-) -> Result<Option<std::time::Duration>, PersistError> {
+) -> Result<(), PersistError> {
     let started: Option<String> = tx
         .query_row(
             "SELECT started_at FROM attempts WHERE attempt_id = ?1",
@@ -190,19 +234,17 @@ pub(super) fn accrue_wall(
         .map_err(sqlite_error)?
         .flatten();
     let Some(started) = started.as_deref().and_then(crate::time::parse_rfc3339) else {
-        return Ok(None);
+        return Ok(());
     };
     let ended = crate::time::parse_rfc3339(&rfc3339_utc(ended_at)).unwrap_or(ended_at);
-    let behind = started.duration_since(ended).ok().filter(|d| !d.is_zero());
-    let ran = |end: SystemTime| end.duration_since(started).map_or(0, |d| d.as_secs());
-    let seconds = ran(ended).max(recorded_end.map_or(0, ran));
+    let seconds = ran(started, ended, recorded_end);
     tx.execute(
         "UPDATE budgets SET used_value = used_value + ?1 WHERE scope_kind = 'run' AND scope_id = ?2 \
          AND kind = 'wall_seconds'",
         params![seconds as f64, run_id],
     )
     .map_err(sqlite_error)?;
-    Ok(behind)
+    Ok(())
 }
 
 /// The run's budget at `now`: its run-scope rows and its deadline, the duration its unfinished attempts have run so
@@ -263,17 +305,21 @@ pub(super) fn load_budget(
     if let Some(wall) = &mut budget.wall_seconds {
         let mut statement = tx
             .prepare(
-                "SELECT a.started_at FROM attempts a JOIN tasks t ON t.task_id = a.task_id WHERE t.run_id = ?1 \
-                 AND a.state IN ('STARTING', 'RUNNING') AND a.started_at IS NOT NULL",
+                "SELECT a.attempt_id, a.started_at FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+                 WHERE t.run_id = ?1 AND a.state IN ('STARTING', 'RUNNING') AND a.started_at IS NOT NULL",
             )
             .map_err(sqlite_error)?;
         let started = statement
-            .query_map(params![run_id], |r| r.get::<_, String>(0))
+            .query_map(params![run_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(sqlite_error)?
+            .collect::<Result<Vec<_>, _>>()
             .map_err(sqlite_error)?;
-        for at in started {
-            let at = at.map_err(sqlite_error)?;
+        for (attempt_id, at) in started {
             if let Some(since) = crate::time::parse_rfc3339(&at) {
-                wall.reserved += now.duration_since(since).map_or(0, |d| d.as_secs()) as f64;
+                // As its settlement will count it (M2T19R-450).
+                wall.reserved += ran(since, now, observed_end(tx, &attempt_id)?) as f64;
             }
         }
     }
