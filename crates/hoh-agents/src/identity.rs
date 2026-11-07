@@ -102,6 +102,44 @@ impl Gone {
     }
 }
 
+/// A recorded leader that is gone while processes are left in its process group (the group id is its pid and is not
+/// reused while the group has members): whether they are the attempt's descendants or a later process's that reused
+/// the pid and left its own group behind cannot be told, so they get no signal and the attempt's slot stays held
+/// (REQ-041 failure mode 5; M2T05R-02).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Leaderless {
+    pub pgid: u32,
+    pub members: Vec<u32>,
+}
+
+/// What a record names now.
+#[derive(Debug)]
+pub enum Presence {
+    /// Its process, held by its pidfd.
+    Ours(Found),
+    /// Its leader gone, members left in its group.
+    Leaderless(Leaderless),
+    /// Nothing of it is left (or never was): why.
+    Gone(Gone),
+}
+
+/// What a record names now: [`find`], and for a leader that is gone, whether its group still has members.
+pub fn presence(pid: Option<i64>, boot: Option<&str>, start: Option<&str>) -> io::Result<Presence> {
+    Ok(match find(pid, boot, start)? {
+        Ok(found) => Presence::Ours(found),
+        Err(Gone::NoProcess) => {
+            let pgid = pid.and_then(|p| u32::try_from(p).ok()).unwrap_or(0);
+            let members = crate::process::group_members(pgid);
+            if members.is_empty() {
+                Presence::Gone(Gone::NoProcess)
+            } else {
+                Presence::Leaderless(Leaderless { pgid, members })
+            }
+        }
+        Err(gone) => Presence::Gone(gone),
+    })
+}
+
 /// A process found to be the recorded one, held by its pidfd.
 #[derive(Debug)]
 pub struct Found {
@@ -279,6 +317,38 @@ mod tests {
         );
         assert!(crate::process::group_members(pid).is_empty());
         assert_eq!(start_id(pid)?.filter(|s| *s == me.start_id), None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_gone_leader_with_members_left_in_its_group_is_not_gone() -> io::Result<()> {
+        // The leader (a shell) starts a child in its group and exits; the child stays.
+        let out = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "setsid sh -c 'sleep 30 >/dev/null 2>&1 & echo $$; exit 0' </dev/null 2>/dev/null & wait",
+            ])
+            .output()?;
+        let leader: u32 = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .map_err(io::Error::other)?;
+        let end = Instant::now() + Duration::from_secs(5);
+        while start_id(leader)?.is_some() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let boot = boot_id()?;
+        let found = presence(Some(i64::from(leader)), Some(&boot), Some("1"))?;
+        let members = match found {
+            Presence::Leaderless(l) => l.members,
+            other => return Err(io::Error::other(format!("{other:?}"))),
+        };
+        assert!(!members.is_empty());
+        for pid in members {
+            if let Some(pid) = i32::try_from(pid).ok().and_then(Pid::from_raw) {
+                let _ = rustix::process::kill_process(pid, Signal::KILL);
+            }
+        }
         Ok(())
     }
 

@@ -2,6 +2,10 @@
 //! Each host runs in a process of its own (this test binary's `recovery_host` entry); the faults are made by the
 //! test's hook implementations, passed in process (CR-006 F2/F3): the product's hooks do nothing.
 
+// No SQLite outside hoh-core::persistence (AC-062-05; see clippy.toml), and no unsafe code (no FFI way around it).
+#![forbid(clippy::disallowed_methods)]
+#![forbid(unsafe_code)]
+
 use hoh_app::host::{Host, HostConfig};
 use hoh_core::decision::{Context, Proposal};
 use hoh_core::persistence::selftest::{PROBE_ARG, ProbeCommand};
@@ -118,10 +122,20 @@ impl hoh_core::reconcile::Observer for FakeRemote {
     }
 }
 
-/// The FakeAgent (AC-041-01): appends its effect key to the counter file when it starts executing, works a moment,
-/// then leaves its marker (the key, `/` as `_`) when it is done.
-const FAKE_AGENT: &str =
-    "printf '%s\\n' \"$1\" >> \"$2/counter\"; sleep 0.2; : > \"$2/markers/$3\"";
+/// The FakeAgent (AC-041-01): waits at its start gate (a line `go` on stdin; anything else, EOF included, ends it
+/// without running), then appends its effect key to the counter file when it starts executing, works a moment, and
+/// leaves its marker (the key, `/` as `_`) when it is done.
+const FAKE_AGENT: &str = "read -r go; [ \"$go\" = go ] || exit 0; printf '%s\\n' \"$1\" >> \"$2/counter\"; sleep 0.2; : > \"$2/markers/$3\"";
+
+/// The start gate of a child whose stdin is piped: `go` opens it; dropped unopened, the pipe closes and the child ends.
+fn gate(child: &mut std::process::Child) -> hoh_app::host::Gate {
+    let stdin = child.stdin.take();
+    hoh_app::host::Gate::new(move || {
+        use std::io::Write as _;
+        let mut stdin = stdin.ok_or("no stdin")?;
+        stdin.write_all(b"go\n").map_err(|e| e.to_string())
+    })
+}
 
 fn marker_name(key: &str) -> String {
     key.replace('/', "_")
@@ -148,12 +162,13 @@ impl hoh_app::host::Executor for FakeExecutor {
             .arg(&self.0)
             .arg(marker_name(&work.effect_key))
             .process_group(0)
-            .stdin(std::process::Stdio::null())
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
             .map_err(|e| e.to_string())?;
         let pid = child.id();
+        let gate = gate(&mut child);
         let (end, ended) = tokio::sync::oneshot::channel();
         std::thread::spawn(move || {
             let status = child.wait();
@@ -162,7 +177,7 @@ impl hoh_app::host::Executor for FakeExecutor {
                 detail: format!("{status:?}"),
             });
         });
-        Ok(hoh_app::host::Started { pid, ended })
+        Ok(hoh_app::host::Started { pid, gate, ended })
     }
 }
 
@@ -205,6 +220,7 @@ fn runner_point(name: &str) -> Option<hoh_app::host::RunnerPoint> {
     use hoh_app::host::RunnerPoint;
     Some(match name {
         "BeforeSend" => RunnerPoint::BeforeSend,
+        "AfterSpawn" => RunnerPoint::AfterSpawn,
         "AfterSend" => RunnerPoint::AfterSend,
         "AfterAck" => RunnerPoint::AfterAck,
         "AfterEffectStarted" => RunnerPoint::AfterEffectStarted,
@@ -741,10 +757,14 @@ fn test_041_05_a_started_effect_is_found_or_unknown_never_done_again() -> R {
         &project,
         &format!(
             "{RUNNING_WORLD}
-             INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, started_at) VALUES
-               ('AE', 'T2', 'RUNNING', 1, 1, 1, '2026-11-07T00:00:00Z'),
-               ('AE2', 'T3', 'RUNNING', 1, 1, 1, '2026-11-07T00:00:00Z');
-             INSERT INTO effects(effect_key, attempt_id, state) VALUES ('pr:R/T2', 'AE', 'STARTED'), ('pr:R/T3', 'AE2', 'STARTED');"
+             INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, pid, boot_id,
+               process_start_id, started_at) VALUES
+               ('AE', 'T2', 'RUNNING', 1, 1, 1, {gone}, '{boot}', '1', '2026-11-07T00:00:00Z'),
+               ('AE2', 'T3', 'RUNNING', 1, 1, 1, {gone}, '{boot}', '1', '2026-11-07T00:00:00Z');
+             INSERT INTO effects(effect_key, attempt_id, state) VALUES ('pr:R/T2', 'AE', 'STARTED'), ('pr:R/T3', 'AE2', 'STARTED');",
+            boot = hoh_agents::identity::boot_id()?,
+            // A pid no process has (pid_max is at most 2^22): the record of agents long gone.
+            gone = 1 << 23,
         ),
     )?;
     let remote = dir.path().join("forge.json");
@@ -1062,12 +1082,16 @@ impl hoh_app::host::Executor for StuckExecutor {
     fn start(&self, _work: &hoh_app::host::Work) -> Result<hoh_app::host::Started, String> {
         use std::os::unix::process::CommandExt as _;
         let mut child = Command::new("sh")
-            .args(["-c", "trap '' TERM; while :; do sleep 0.05; done"])
+            .args([
+                "-c",
+                "trap '' TERM; read -r go; [ \"$go\" = go ] || exit 0; while :; do sleep 0.05; done",
+            ])
             .process_group(0)
-            .stdin(std::process::Stdio::null())
+            .stdin(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| e.to_string())?;
         let pid = child.id();
+        let gate = gate(&mut child);
         if let Ok(mut started) = self.started.lock() {
             started.push(pid);
         }
@@ -1079,7 +1103,7 @@ impl hoh_app::host::Executor for StuckExecutor {
                 detail: format!("{status:?}"),
             });
         });
-        Ok(hoh_app::host::Started { pid, ended })
+        Ok(hoh_app::host::Started { pid, gate, ended })
     }
 
     fn cancel(&self, work: &hoh_app::host::Work) {

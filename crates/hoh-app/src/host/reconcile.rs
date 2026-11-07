@@ -4,7 +4,7 @@
 //! (SIGTERM, then SIGKILL to its group) and must be gone, each STARTED effect is looked for where it would show, and
 //! the attempt's disposition is written with what was found, between `reconcile.started` and `reconcile.completed`.
 
-use hoh_agents::identity::{self, StopStep};
+use hoh_agents::identity::{self, Gone, Presence, StopStep};
 use hoh_core::lifecycle::AttemptState;
 use hoh_core::persistence::{PersistError, Store, UnfinishedRow};
 use hoh_core::reconcile::{self, Disposition, Effect, EffectState, Observer, Process, Unfinished};
@@ -34,12 +34,17 @@ impl Default for ReconcileSettings {
     }
 }
 
-/// What was found of `row`'s process, and done to it (blocking: run off the async threads).
-fn process_of(row: &UnfinishedRow, settings: &ReconcileSettings) -> Result<Process, PersistError> {
+/// What was found of `row`'s process, and done to it (blocking: run off the async threads). Only a process found by
+/// its whole identity is signalled; one that cannot be told apart, or a RUNNING attempt with no process recorded,
+/// is uncertain and keeps its slot (M2T05R-01, -02).
+pub(super) fn process_of(
+    row: &UnfinishedRow,
+    settings: &ReconcileSettings,
+) -> Result<Process, PersistError> {
     if row.state == AttemptState::Prepared {
         return Ok(Process::NotStarted);
     }
-    let found = identity::find(
+    let found = identity::presence(
         row.pid,
         row.boot_id.as_deref(),
         row.process_start_id.as_deref(),
@@ -51,28 +56,36 @@ fn process_of(row: &UnfinishedRow, settings: &ReconcileSettings) -> Result<Proce
         ))
     })?;
     Ok(match found {
-        Err(gone) => Process::Gone {
+        Presence::Gone(Gone::NoPid) if row.state == AttemptState::Running => Process::Uncertain {
+            basis: "running_without_a_process_record".to_owned(),
+        },
+        Presence::Gone(gone) => Process::Gone {
             basis: gone.basis().to_owned(),
         },
-        Ok(ours) => {
-            let stopped = ours.stop(settings.term_grace, settings.kill_grace);
-            Process::Stopped {
-                steps: stopped
-                    .steps
-                    .iter()
-                    .map(|s| {
-                        match s {
-                            StopStep::Term => "sigterm",
-                            StopStep::Kill => "sigkill",
-                            StopStep::Reaped => "reaped",
-                        }
-                        .to_owned()
-                    })
-                    .collect(),
-                reaped: stopped.reaped,
-            }
-        }
+        Presence::Leaderless(left) => Process::Uncertain {
+            basis: format!("leader_gone_{}_left_in_its_group", left.members.len()),
+        },
+        Presence::Ours(ours) => stopped(&ours.stop(settings.term_grace, settings.kill_grace)),
     })
+}
+
+/// A stop as the reconcile records it.
+pub(super) fn stopped(stopped: &identity::Stopped) -> Process {
+    Process::Stopped {
+        steps: stopped
+            .steps
+            .iter()
+            .map(|s| {
+                match s {
+                    StopStep::Term => "sigterm",
+                    StopStep::Kill => "sigkill",
+                    StopStep::Reaped => "reaped",
+                }
+                .to_owned()
+            })
+            .collect(),
+        reaped: stopped.reaped,
+    }
 }
 
 /// Reconcile the project's unfinished attempts; done before the host serves anything.
@@ -117,6 +130,7 @@ pub(super) async fn run(
             process: process.clone(),
             effects,
             lease_expired: row.lease_expired,
+            work_outcome: row.work_outcome,
         });
         *counts
             .entry(match disposition {

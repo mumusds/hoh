@@ -12,7 +12,7 @@ mod http;
 mod reconcile;
 mod runner;
 pub use reconcile::ReconcileSettings;
-pub use runner::{Executor, Outcome, RunnerConfig, RunnerPoint, Started, Work};
+pub use runner::{Executor, Gate, Outcome, RunnerConfig, RunnerPoint, Started, Work};
 
 use hoh_core::persistence::{self, Options, PersistError, Reader, Store, location};
 use std::path::{Path, PathBuf};
@@ -87,6 +87,9 @@ pub trait HostHooks: Send + Sync + std::fmt::Debug {
 
     /// At `point` of an attempt the runner runs (AC-041-01: a test's implementation ends the process here).
     fn runner(&self, _point: RunnerPoint) {}
+
+    /// Just after the host announced itself (host.json written), before it returns from its start.
+    fn announced(&self) {}
 }
 
 /// The product's host hooks: none.
@@ -308,6 +311,7 @@ impl Host {
                 runner,
                 config.clock.0.clone(),
                 config.reconcile.clone(),
+                started.host_epoch,
                 stopped,
             )));
         }
@@ -332,6 +336,7 @@ impl Host {
             host_files.remove();
             return Err(e);
         }
+        config.hooks.announced();
         Ok(Host {
             project_id: started.project_id,
             host_epoch: started.host_epoch,
@@ -411,6 +416,13 @@ impl Host {
 
 /// Run the host of `project` until SIGTERM or SIGINT; the process exit code.
 pub async fn run(config: HostConfig) -> u8 {
+    // The stop signals are taken before the host announces itself (host.json): a SIGTERM that comes as soon as the file
+    // is there stops the host as any other does, not by the default action (ADR-019 decision 10).
+    use tokio::signal::unix::{SignalKind, signal};
+    let stops = (
+        signal(SignalKind::terminate()),
+        signal(SignalKind::interrupt()),
+    );
     let host = match Host::start(config).await {
         Ok(host) => host,
         Err(e) => {
@@ -420,11 +432,7 @@ pub async fn run(config: HostConfig) -> u8 {
         }
     };
     let signals = async {
-        use tokio::signal::unix::{SignalKind, signal};
-        match (
-            signal(SignalKind::terminate()),
-            signal(SignalKind::interrupt()),
-        ) {
+        match stops {
             (Ok(mut term), Ok(mut int)) => {
                 tokio::select! {
                     _ = term.recv() => {}

@@ -2,10 +2,10 @@
 //! notices, the working runs) and each step of an attempt it runs, every step one transaction:
 //!
 //! 1. received: the dispatch's receipt, its notice ACKED, the attempt STARTING and its work effect PREPARED;
-//! 2. the work effect STARTED, before the agent's process starts (write-ahead);
-//! 3. running: the attempt RUNNING with its process identity, its task RUNNING;
-//! 4. the work effect OBSERVED when the process ended, then COMMITTED;
-//! 5. finished: the attempt SETTLED (its task IMPLEMENTED) or FAILED (its task READY).
+//! 2. running: the process started and held at its start gate; the attempt RUNNING with its process identity, its
+//!    work effect STARTED (write-ahead) and its task RUNNING, before the gate opens;
+//! 3. the work effect OBSERVED with its outcome when the process ended, then COMMITTED;
+//! 4. finished: the attempt SETTLED (its task IMPLEMENTED) or FAILED (its task READY).
 
 use super::attempts::{self, AttemptFacts, AttemptMove};
 use super::writer::{self, Change, Commit, Ctx, NewEvent, StateCas};
@@ -331,6 +331,10 @@ fn effect(
     Ok(true)
 }
 
+/// The attempt's process started, held at its start gate: in one transaction the attempt RUNNING with the process's
+/// identity, its work effect STARTED (write-ahead: before the gate opens) and its task RUNNING. The runner opens the
+/// gate only after this commits, so an agent never runs unless its identity and its STARTED effect are durable
+/// (ADR-019 decision 8; M2T05R-01, -52). False when the attempt is no longer STARTING with its work PREPARED.
 fn running(
     conn: &mut Connection,
     attempt_id: &str,
@@ -338,7 +342,17 @@ fn running(
     ctx: &Ctx<'_>,
 ) -> Result<bool, PersistError> {
     let tx = writer::begin(conn, ctx)?;
-    let (task_id, task_state, revision, _, _) = task_of(&tx, attempt_id)?;
+    let (task_id, task_state, revision, run_id, project_id) = task_of(&tx, attempt_id)?;
+    let key = crate::reconcile::work_key(attempt_id);
+    let started = tx
+        .execute(
+            "UPDATE effects SET state = 'STARTED' WHERE effect_key = ?1 AND attempt_id = ?2 AND state = 'PREPARED'",
+            params![key, attempt_id],
+        )
+        .map_err(sqlite_error)?;
+    if started != 1 {
+        return Ok(false);
+    }
     attempts::move_attempt(
         &tx,
         &AttemptMove {
@@ -362,6 +376,13 @@ fn running(
         &tx,
         &Commit {
             cas,
+            events: vec![event(
+                &project_id,
+                &run_id,
+                child_id(&key, "effect.started"),
+                "effect.started",
+                json!({"effect_key": key, "attempt_id": attempt_id, "from": "PREPARED", "detail": {}}),
+            )],
             ..Commit::default()
         },
         ctx,
