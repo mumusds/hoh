@@ -277,16 +277,15 @@ pub fn find(
     boot: Option<&str>,
     start: Option<&str>,
 ) -> io::Result<Result<Found, Gone>> {
-    find_with(pid, boot, start, || {})
+    find_with(pid, boot, start, start_id)
 }
 
-/// [`find`], running `between` after its start time matched and before it is returned (a test seam for a pause
-/// there, M2T05R-401).
+/// [`find`] with the read of the start time given (a test seam for a pause inside that read, M2T05R-401, -551).
 fn find_with(
     pid: Option<i64>,
     boot: Option<&str>,
     start: Option<&str>,
-    between: impl FnOnce(),
+    read_start: impl FnOnce(u32) -> io::Result<Option<String>>,
 ) -> io::Result<Result<Found, Gone>> {
     let Some(pid) = pid.and_then(|p| u32::try_from(p).ok()).filter(|p| *p > 0) else {
         return Ok(Err(Gone::NoPid));
@@ -304,13 +303,13 @@ fn find_with(
     // The pidfd first: from here on it names one process, whatever happens to the pid.
     let pidfd = match pidfd_open(raw, PidfdFlags::empty()) {
         Ok(fd) => fd,
-        Err(rustix::io::Errno::SRCH) => return Ok(Err(Gone::NoProcess)),
+        Err(e) if no_process(e) => return Ok(Err(Gone::NoProcess)),
         Err(e) => return Err(e.into()),
     };
     // Its start time, read next, shows it holding its pid at some moment after this one: the moment its group is
     // known to be the attempt's is taken before the read, never after it (M2T05R-401).
     let seen = Instant::now();
-    let Some(now) = start_id(pid)? else {
+    let Some(now) = read_start(pid)? else {
         return Ok(Err(Gone::NoProcess));
     };
     if start != Some(now.as_str()) {
@@ -319,7 +318,6 @@ fn find_with(
             current: now,
         }));
     }
-    between();
     Ok(Ok(Found {
         identity: Identity {
             pid,
@@ -329,6 +327,13 @@ fn find_with(
         pidfd,
         held: Cell::new(seen),
     }))
+}
+
+/// Whether `pidfd_open` failing with `e` means no process has that pid: ESRCH, or EINVAL, which Linux 6.8 to 6.15 give
+/// for a number with no thread-group leader (reaped, its number held only as a process group id by the members left,
+/// or a thread's id; from 6.16 these are ESRCH too, M2T05R-553). Its group is then asked about by number.
+fn no_process(e: rustix::io::Errno) -> bool {
+    e == rustix::io::Errno::SRCH || e == rustix::io::Errno::INVAL
 }
 
 /// One step of a stop, for the events (AC-041-02's order).
@@ -761,10 +766,10 @@ mod tests {
     }
 
     #[test]
-    fn a_pause_after_the_identity_was_read_is_not_taken_for_a_fresh_look() -> io::Result<()> {
-        // M2T05R-401: the moment its group is known to be the attempt's is taken before the start time is read. Here
-        // the leader dies and is reaped right after that read, and HELD_FOR passes before the look: its member,
-        // left in the group, gets nothing.
+    fn a_pause_inside_the_identity_read_is_not_taken_for_a_fresh_look() -> io::Result<()> {
+        // M2T05R-401, -551: the moment its group is known to be the attempt's is taken before the start time is read.
+        // Here that read returns its (matching) value only after the leader has died and been reaped and HELD_FOR
+        // has passed: its member, left in the group, gets nothing.
         let leader = leader_with_a_member_ignoring_term()?;
         let _guard = Guard(leader);
         let me = of(leader)?.ok_or_else(|| io::Error::other("it is not running"))?;
@@ -772,12 +777,14 @@ mod tests {
             Some(i64::from(leader)),
             Some(&me.boot_id),
             Some(&me.start_id),
-            || {
-                if let Some(pid) = i32::try_from(leader).ok().and_then(Pid::from_raw) {
+            |pid| {
+                let read = start_id(pid);
+                if let Some(pid) = i32::try_from(pid).ok().and_then(Pid::from_raw) {
                     let _ = rustix::process::kill_process(pid, Signal::TERM);
                 }
                 wait_until(|| start_id(leader).is_ok_and(|s| s.is_none()));
                 std::thread::sleep(HELD_FOR + Duration::from_millis(50));
+                read
             },
         )?
         .map_err(|g| io::Error::other(format!("{g:?}")))?;
@@ -785,6 +792,15 @@ mod tests {
         assert_eq!(found.look(), Group::Lost);
         assert!(!group_empty(leader));
         Ok(())
+    }
+
+    #[test]
+    fn a_pid_with_no_process_by_either_answer_is_gone() {
+        // M2T05R-553: Linux 6.8-6.15 answer EINVAL, later ones ESRCH, for a number only a process group holds.
+        assert!(no_process(rustix::io::Errno::SRCH));
+        assert!(no_process(rustix::io::Errno::INVAL));
+        assert!(!no_process(rustix::io::Errno::PERM));
+        assert!(!no_process(rustix::io::Errno::MFILE));
     }
 
     #[test]
