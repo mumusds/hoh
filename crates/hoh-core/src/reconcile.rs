@@ -86,6 +86,9 @@ pub enum Process {
     Gone { basis: String },
     /// Ours and alive: stopped by these steps; `reaped` whether it and its group are gone.
     Stopped { steps: Vec<String>, reaped: bool },
+    /// Whether anything of it still runs cannot be told (its leader gone with members left in its group, or a
+    /// RUNNING attempt with no process recorded): no signal was sent, and its slot stays held (M2T05R-01, -02).
+    Uncertain { basis: String },
 }
 
 /// One unfinished attempt (PREPARED, STARTING or RUNNING) with its task.
@@ -98,6 +101,8 @@ pub struct Unfinished {
     pub effects: Vec<Effect>,
     /// A lease it holds has expired: a PREPARED attempt can no longer start (a writer start needs an unexpired lease).
     pub lease_expired: bool,
+    /// The outcome recorded when its work was observed (`effect.observed`: success or failure), if it was.
+    pub work_outcome: Option<bool>,
 }
 
 /// What an effect becomes.
@@ -145,7 +150,10 @@ pub fn work_key(attempt_id: &str) -> String {
 
 /// The disposition of `u`.
 pub fn dispose(u: &Unfinished) -> Disposition {
-    if let Process::Stopped { reaped: false, .. } = u.process {
+    if matches!(
+        u.process,
+        Process::Stopped { reaped: false, .. } | Process::Uncertain { .. }
+    ) {
         return Disposition::Unreaped;
     }
     let mut moves = Vec::new();
@@ -178,19 +186,42 @@ pub fn dispose(u: &Unfinished) -> Disposition {
             unknown,
         };
     }
+    // The attempt's own work, once committed, is disposed of by its recorded outcome (M2T05R-05, -53): done only when
+    // it succeeded and the attempt was RUNNING; a failure ends it for another attempt; anything else is not known.
     let work = work_key(&u.attempt_id);
-    let work_done = u.effects.iter().any(|e| {
-        let after = moves
-            .iter()
-            .find(|m| m.key == e.key)
-            .map_or(e.state, |m| m.to);
-        e.key == work && after == EffectState::Committed
+    let committed = u.effects.iter().find(|e| e.key == work).and_then(|e| {
+        let found = moves.iter().find(|m| m.key == e.key);
+        let after = found.map_or(e.state, |m| m.to);
+        (after == EffectState::Committed).then_some(
+            // Found where it would show: it was done.
+            if found.is_some_and(|m| m.external_ref.is_some()) {
+                Some(true)
+            } else {
+                u.work_outcome
+            },
+        )
     });
-    if work_done {
-        return Disposition::Completed {
-            effects: moves,
-            task_to: (u.task_state == TaskState::Running).then_some(TaskState::Implemented),
-        };
+    match committed {
+        Some(Some(true)) if u.state == AttemptState::Running => {
+            return Disposition::Completed {
+                effects: moves,
+                task_to: (u.task_state == TaskState::Running).then_some(TaskState::Implemented),
+            };
+        }
+        Some(Some(false)) => {
+            return Disposition::Ended {
+                to: AttemptState::Failed,
+                task_to: TaskState::Ready,
+                effects: moves,
+            };
+        }
+        Some(_) => {
+            return Disposition::UnknownEffect {
+                effects: moves,
+                unknown: vec![work],
+            };
+        }
+        None => {}
     }
     if u.state == AttemptState::Prepared && !u.lease_expired {
         return Disposition::Redeliver;
@@ -222,6 +253,7 @@ mod tests {
             process,
             effects,
             lease_expired: false,
+            work_outcome: Some(true),
         }
     }
 
@@ -380,6 +412,54 @@ mod tests {
                 task_to: TaskState::Ready,
                 effects: vec![]
             }
+        );
+    }
+
+    #[test]
+    fn committed_work_is_disposed_of_by_its_recorded_outcome() {
+        // M2T05R-05, -53: a failure recorded with the work ends the attempt for another; a STARTING attempt never
+        // settles; committed work with no recorded outcome is not known.
+        let committed = || vec![effect(&work_key("A"), EffectState::Committed, None)];
+        let mut failed = unfinished(AttemptState::Running, gone(), committed());
+        failed.work_outcome = Some(false);
+        assert_eq!(
+            dispose(&failed),
+            Disposition::Ended {
+                to: AttemptState::Failed,
+                task_to: TaskState::Ready,
+                effects: vec![]
+            }
+        );
+        let mut starting = unfinished(AttemptState::Starting, gone(), committed());
+        starting.work_outcome = Some(false);
+        assert!(matches!(
+            dispose(&starting),
+            Disposition::Ended {
+                to: AttemptState::Failed,
+                ..
+            }
+        ));
+        starting.work_outcome = Some(true);
+        assert!(matches!(
+            dispose(&starting),
+            Disposition::UnknownEffect { .. }
+        ));
+        let mut unrecorded = unfinished(AttemptState::Running, gone(), committed());
+        unrecorded.work_outcome = None;
+        assert!(matches!(
+            dispose(&unrecorded),
+            Disposition::UnknownEffect { .. }
+        ));
+    }
+
+    #[test]
+    fn an_uncertain_process_moves_nothing() {
+        let uncertain = Process::Uncertain {
+            basis: "leader_gone_1_left_in_its_group".to_owned(),
+        };
+        assert_eq!(
+            dispose(&unfinished(AttemptState::Running, uncertain, vec![])),
+            Disposition::Unreaped
         );
     }
 

@@ -28,6 +28,8 @@ const CHILD_NOFILE: &str = "HOH_TEST_HOST_NOFILE";
 /// Set for a child whose writer panics at its first commit.
 const CHILD_PANIC: &str = "HOH_TEST_HOST_PANIC";
 const CHILD_PANIC_WHEN: &str = "HOH_TEST_HOST_PANIC_WHEN";
+/// The child sends itself SIGTERM the moment its host has announced itself (host.json written).
+const CHILD_TERM_AT_ANNOUNCE: &str = "HOH_TEST_HOST_TERM_AT_ANNOUNCE";
 
 /// A commit hook that panics: the writer thread unwinds (CR-006: a fault made by test code).
 #[derive(Debug)]
@@ -589,6 +591,17 @@ impl HostHooks for DropAfterCommit {
     }
 }
 
+/// A stop signal at the instant the host announced itself (CR-006 F2: a signal the process sends itself, test code).
+#[derive(Debug)]
+struct TermAtAnnounce;
+
+impl HostHooks for TermAtAnnounce {
+    fn announced(&self) {
+        let _ =
+            rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::TERM);
+    }
+}
+
 /// The child entry of [`host_process`]: runs `hoh_app::host::run` and exits with its code.
 #[test]
 #[ignore = "run by the exit-code tests in a process of their own"]
@@ -602,6 +615,9 @@ fn host_child() {
     }
     if std::env::var_os(CHILD_PANIC).is_some() {
         config.store.faults = Arc::new(Panicking);
+    }
+    if std::env::var_os(CHILD_TERM_AT_ANNOUNCE).is_some() {
+        config.hooks = Arc::new(TermAtAnnounce);
     }
     if let Some(go) = std::env::var_os(CHILD_PANIC_WHEN) {
         config.store.faults = Arc::new(PanickingWhen(PathBuf::from(go)));
@@ -2648,5 +2664,41 @@ INSERT INTO tasks(task_id, run_id, spec_id, state, role, writer, created_seq, us
             }))?,
         )?;
     }
+    Ok(())
+}
+
+/// A SIGTERM that arrives as soon as the host has written host.json (a supervisor stopping it right after its start)
+/// stops it as any other: exit 0, host.json and the socket removed (ADR-019 decision 10; the CI run of the recovery
+/// check met this window).
+#[test]
+fn a_stop_signal_as_the_host_announces_itself_stops_it_cleanly() -> R {
+    let dir = tempfile::tempdir()?;
+    let mut child = ChildGuard::spawn(
+        Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "host_child",
+                "--ignored",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(CHILD_PROJECT, dir.path())
+            .env(CHILD_TERM_AT_ANNOUNCE, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped()),
+    )?;
+    let end = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() > end {
+            return Err("the host did not end".into());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(status.code(), Some(0), "{status:?}");
+    assert!(!dir.path().join(".hoh/host.json").exists());
+    assert!(!dir.path().join(".hoh/host.sock").exists());
     Ok(())
 }

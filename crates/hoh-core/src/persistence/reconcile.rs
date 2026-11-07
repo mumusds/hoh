@@ -9,7 +9,7 @@ use crate::ids::child_id;
 use crate::lifecycle::{AttemptState, Lifecycle};
 use crate::protocol::TaskState;
 use crate::reconcile::{Disposition, EffectMove, EffectState, Process};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
 /// One effect of an unfinished attempt.
@@ -38,6 +38,8 @@ pub struct UnfinishedRow {
     pub lease_expired: bool,
     /// The epoch of the lease it holds (the latest), if any.
     pub lease_epoch: Option<i64>,
+    /// The outcome its work's `effect.observed` event recorded, if any.
+    pub work_outcome: Option<bool>,
 }
 
 /// One step of a reconcile.
@@ -152,6 +154,16 @@ fn scan(
         let (run_id, attempt_id, task_id, state, task_state, task_revision) = ids;
         let (pid, boot_id, start, lease_expired, lease_epoch) = process;
         let effects = effects_of(conn, &attempt_id)?;
+        let observed = child_id(&crate::reconcile::work_key(&attempt_id), "effect.observed");
+        let work_outcome: Option<bool> = conn
+            .query_row(
+                "SELECT json_extract(payload_json, '$.detail.success') FROM events WHERE event_id = ?1",
+                params![observed],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sqlite_error)?
+            .flatten();
         rows.push(UnfinishedRow {
             project_id: project_id.to_owned(),
             run_id,
@@ -166,6 +178,7 @@ fn scan(
             effects,
             lease_expired,
             lease_epoch,
+            work_outcome,
         });
     }
     Ok(rows)
@@ -235,6 +248,7 @@ fn process_json(process: &Process) -> Value {
         Process::Stopped { steps, reaped } => {
             json!({"found": "ours", "steps": steps, "reaped": reaped})
         }
+        Process::Uncertain { basis } => json!({"found": "uncertain", "basis": basis, "signals": 0}),
     }
 }
 
@@ -346,7 +360,7 @@ fn apply(
         })),
         Disposition::Unreaped => Some(json!({
             "code": "PROCESS_NOT_REAPED", "attempt_id": row.attempt_id, "process": process_json(process),
-            "detail": "the old process group outlived its stop; its lease stays held and no writer lease is granted",
+            "detail": "its process group may still run (it outlived its stop, or cannot be told apart); its lease stays held and no writer lease is granted",
         })),
         _ => None,
     };
