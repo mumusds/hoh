@@ -1948,3 +1948,47 @@ fn a_failure_committed_before_a_crash_stays_a_failure() -> R {
     }
     Ok(())
 }
+
+/// M2T05R-01: a RUNNING attempt whose process was never recorded (only possible outside the gated runner) cannot be
+/// shown gone: the reconcile keeps it and its writer slot (no signal; a diagnostic) rather than let another writer in.
+#[test]
+fn a_running_attempt_with_no_process_record_keeps_its_slot() -> R {
+    let dir = tempfile::tempdir()?;
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    let (code, stderr) = serve_and_stop(&project)?;
+    assert_eq!(code, 0, "{stderr}");
+    seed(
+        &project,
+        &format!(
+            "{WRITERS}
+             UPDATE tasks SET state = 'RUNNING' WHERE task_id = 'T1';
+             INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, started_at) VALUES
+               ('A1', 'T1', 'RUNNING', 2, 1, 1, '2026-11-07T00:00:00Z');
+             UPDATE leases SET attempt_id = 'A1', epoch = 4, expires_at = '2999-01-01T00:00:00Z' WHERE kind = 'writer';"
+        ),
+    )?;
+    let (code, stderr) = serve_and_stop(&project)?;
+    assert_eq!(code, 0, "{stderr}");
+    let db = db(&project);
+    assert_eq!(
+        query(&db, "SELECT state FROM attempts WHERE attempt_id = 'A1'")?,
+        "RUNNING"
+    );
+    assert_eq!(
+        query(
+            &db,
+            "SELECT attempt_id || ':' || epoch FROM leases WHERE kind = 'writer'"
+        )?,
+        "A1:4"
+    );
+    assert_eq!(
+        query(
+            &db,
+            "SELECT json_extract(payload_json, '$.process.found') || '/' || json_extract(payload_json, '$.process.basis') \
+             FROM events WHERE kind = 'reconcile.attempt' AND json_extract(payload_json, '$.attempt_id') = 'A1'"
+        )?,
+        "uncertain/running_without_a_process_record"
+    );
+    Ok(())
+}
