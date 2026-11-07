@@ -35,7 +35,24 @@ pub enum Finished {
     NotCancelling,
 }
 
+/// What [`pause_step`] came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PauseStep {
+    /// The run is PAUSED: nothing of it starts or runs.
+    Paused,
+    /// Attempts of it still start or run: the run stays PAUSE_REQUESTED until they end (they are not interrupted).
+    Running(usize),
+    /// The run is not pausing (anymore).
+    NotPausing,
+}
+
 pub(super) enum ControlJob {
+    /// The attempts of a run that start or run.
+    Running(String),
+    PauseStep {
+        run_id: String,
+        at: SystemTime,
+    },
     CancelPass(CancelPass),
     FinishCancel {
         run_id: String,
@@ -47,6 +64,8 @@ pub(super) enum ControlJob {
 pub(super) enum ControlDone {
     Recorded(i64),
     Finished(Finished),
+    Paused(PauseStep),
+    Running(Vec<super::AttemptRow>),
 }
 
 pub(super) fn run(
@@ -55,6 +74,10 @@ pub(super) fn run(
     ctx: &Ctx<'_>,
 ) -> Result<ControlDone, PersistError> {
     match job {
+        ControlJob::Running(run_id) => running_attempts(conn, &run_id).map(ControlDone::Running),
+        ControlJob::PauseStep { run_id, at } => {
+            pause_step(conn, &run_id, at, ctx).map(ControlDone::Paused)
+        }
         ControlJob::CancelPass(pass) => record_pass(conn, &pass, ctx).map(ControlDone::Recorded),
         ControlJob::FinishCancel {
             run_id,
@@ -62,6 +85,163 @@ pub(super) fn run(
             at,
         } => finish_cancel(conn, &run_id, &workspace, at, ctx).map(ControlDone::Finished),
     }
+}
+
+/// The attempts of run `run_id` that start or run, oldest first (what a cancel must stop, ADR-021 decision 8).
+pub(super) fn running_attempts(
+    conn: &Connection,
+    run_id: &str,
+) -> Result<Vec<super::AttemptRow>, PersistError> {
+    let ids: Vec<String> = {
+        let mut statement = conn
+            .prepare(
+                "SELECT a.attempt_id FROM attempts a JOIN tasks t ON t.task_id = a.task_id WHERE t.run_id = ?1 \
+                 AND a.state IN ('STARTING', 'RUNNING') ORDER BY a.rowid",
+            )
+            .map_err(sqlite_error)?;
+        statement
+            .query_map(params![run_id], |r| r.get(0))
+            .map_err(sqlite_error)?
+            .collect::<Result<_, _>>()
+            .map_err(sqlite_error)?
+    };
+    let mut rows = Vec::with_capacity(ids.len());
+    for id in ids {
+        rows.extend(attempts::read_attempt(conn, &id)?);
+    }
+    Ok(rows)
+}
+
+/// A pausing run's step (REQ-043 behaviour 1, docs/adr/ADR-021.md decision 7): its dispatches not yet taken are
+/// withdrawn (the attempt CANCELLED, its task READY again, its notice acknowledged; not counted as a failure), and once
+/// none of its attempts starts or runs (the safe point: an attempt is never interrupted) it is PAUSED, its pause notice
+/// acknowledged.
+fn pause_step(
+    conn: &mut Connection,
+    run_id: &str,
+    at: SystemTime,
+    ctx: &Ctx<'_>,
+) -> Result<PauseStep, PersistError> {
+    let tx = writer::begin(conn, ctx)?;
+    let run: Option<(String, i64, String)> = tx
+        .query_row(
+            "SELECT state, revision, project_id FROM runs WHERE run_id = ?1",
+            params![run_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some((state, revision, project_id)) = run else {
+        return Err(PersistError::RunNotFound(run_id.to_owned()));
+    };
+    if writer::parse::<RunState>(&state)? != RunState::PauseRequested {
+        return Ok(PauseStep::NotPausing);
+    }
+    let prepared: Vec<(String, String, String, i64)> = {
+        let mut statement = tx
+            .prepare(
+                "SELECT a.attempt_id, a.task_id, t.state, t.revision FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+                 WHERE t.run_id = ?1 AND a.state = 'PREPARED' ORDER BY a.rowid",
+            )
+            .map_err(sqlite_error)?;
+        statement
+            .query_map(params![run_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .map_err(sqlite_error)?
+            .collect::<Result<_, _>>()
+            .map_err(sqlite_error)?
+    };
+    let mut cas = Vec::new();
+    let mut events = Vec::new();
+    for (attempt_id, task_id, task_state, task_revision) in prepared {
+        attempts::move_attempt(
+            &tx,
+            &AttemptMove {
+                attempt_id: attempt_id.clone(),
+                from: AttemptState::Prepared,
+                to: AttemptState::Cancelled,
+                facts: AttemptFacts {
+                    ended_at: Some(rfc3339_utc(at)),
+                    ..AttemptFacts::default()
+                },
+            },
+            ctx,
+        )?;
+        tx.execute(
+            "UPDATE outbox SET state = 'ACKED', next_retry_at = NULL WHERE state = 'PENDING' \
+             AND json_extract(payload_json, '$.notice') IS 'runtime' AND json_extract(payload_json, '$.kind') IS 'dispatch' \
+             AND json_extract(payload_json, '$.attempt_id') = ?1",
+            params![attempt_id],
+        )
+        .map_err(sqlite_error)?;
+        if writer::parse::<TaskState>(&task_state)? == TaskState::Leased {
+            cas.push(StateCas {
+                id: task_id.clone(),
+                expected_revision: task_revision,
+                change: Change::Task(TaskState::Ready),
+            });
+        }
+        events.push(NewEvent {
+            project_id: project_id.clone(),
+            event_id: child_id(&attempt_id, "pause/withdrawn"),
+            run_id: Some(run_id.to_owned()),
+            kind: "pause.withdrawn".to_owned(),
+            payload: json!({"attempt_id": attempt_id, "task_id": task_id}),
+        });
+    }
+    let running: i64 = tx
+        .query_row(
+            "SELECT count(*) FROM attempts a JOIN tasks t ON t.task_id = a.task_id WHERE t.run_id = ?1 \
+             AND a.state IN ('STARTING', 'RUNNING')",
+            params![run_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    let step = if running > 0 {
+        PauseStep::Running(usize::try_from(running).unwrap_or(usize::MAX))
+    } else {
+        cas.push(StateCas {
+            id: run_id.to_owned(),
+            expected_revision: revision,
+            change: Change::Run(RunState::Paused),
+        });
+        let number: i64 = tx
+            .query_row(
+                "SELECT count(*) FROM events WHERE run_id = ?1 AND kind = 'run.paused'",
+                params![run_id],
+                |r| r.get(0),
+            )
+            .map_err(sqlite_error)?;
+        events.push(NewEvent {
+            project_id: project_id.clone(),
+            event_id: child_id(run_id, &format!("paused/{number}")),
+            run_id: Some(run_id.to_owned()),
+            kind: "run.paused".to_owned(),
+            payload: json!({"state": "PAUSED", "at": rfc3339_utc(at)}),
+        });
+        tx.execute(
+            "UPDATE outbox SET state = 'ACKED', next_retry_at = NULL WHERE run_id = ?1 AND state = 'PENDING' \
+             AND json_extract(payload_json, '$.kind') = 'run.control' \
+             AND json_extract(payload_json, '$.control') = 'PAUSE_REQUESTED'",
+            params![run_id],
+        )
+        .map_err(sqlite_error)?;
+        PauseStep::Paused
+    };
+    if !cas.is_empty() || !events.is_empty() {
+        writer::write(
+            &tx,
+            &Commit {
+                cas,
+                events,
+                ..Commit::default()
+            },
+            ctx,
+        )?;
+        tx.commit().map_err(sqlite_error)?;
+    }
+    Ok(step)
 }
 
 /// The steps of one pass and how it ended, committed together in their order (ADR-019 decision 7); a pass that found
@@ -251,6 +431,26 @@ fn finish_cancel(
         expected_revision: revision,
         change: Change::Run(RunState::Cancelled),
     });
+    // The logs kept with the workspace record: each attempt's raw log (REQ-043 behaviour 4).
+    let logs: Vec<Value> = {
+        let mut statement = tx
+            .prepare(
+                "SELECT a.attempt_id, a.raw_log_path FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+                 WHERE t.run_id = ?1 ORDER BY a.rowid",
+            )
+            .map_err(sqlite_error)?;
+        statement
+            .query_map(params![run_id], |r| {
+                Ok(json!({"attempt_id": r.get::<_, String>(0)?, "raw_log_path": r.get::<_, Option<String>>(1)?}))
+            })
+            .map_err(sqlite_error)?
+            .collect::<Result<_, _>>()
+            .map_err(sqlite_error)?
+    };
+    let mut workspace = workspace.clone();
+    if let Some(record) = workspace.as_object_mut() {
+        record.insert("logs".to_owned(), Value::Array(logs));
+    }
     let event = |kind: &str, payload: Value| NewEvent {
         project_id: project_id.clone(),
         event_id: child_id(run_id, kind),
@@ -263,7 +463,7 @@ fn finish_cancel(
         &Commit {
             cas,
             events: vec![
-                event("cancel.workspace", workspace.clone()),
+                event("cancel.workspace", workspace),
                 event(
                     "run.cancelled",
                     json!({"state": "CANCELLED", "at": rfc3339_utc(at)}),

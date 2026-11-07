@@ -433,6 +433,17 @@ impl Found {
         sent
     }
 
+    /// SIGTERM to its group, only right after a look that shows the group still the attempt's (a cancel's step,
+    /// docs/adr/ADR-021.md decision 8c); whether it went.
+    pub fn terminate(&self) -> bool {
+        self.signal(Signal::TERM)
+    }
+
+    /// SIGKILL to its group and leader, under the same rule as [`Found::terminate`]; whether the group signal went.
+    pub fn kill(&self) -> bool {
+        self.signal(Signal::KILL)
+    }
+
     /// SIGTERM to its group, SIGKILL to its group and leader after `term_grace`, then up to `kill_grace` for the
     /// group to empty (an orphan is reaped by its new parent). A group already empty gets no signal (M2T05R-259); a
     /// step is recorded only for a signal that went (M2T05R-355); a group lost track of gets nothing more.

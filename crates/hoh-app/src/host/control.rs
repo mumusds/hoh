@@ -1,0 +1,373 @@
+//! Pause and cancel on the host (REQ-043, docs/adr/ADR-021.md decisions 7 and 8): a loop that runs whether or not
+//! the host has an executor. A pausing run is moved to PAUSED at its safe point; a cancelling run gets a task of its
+//! own that stops what this host runs for it, escalates over its attempts' process groups pass after pass, and once
+//! nothing of it runs records the workspace and cancels it. Neither touches the Commander (REQ-043 behaviour 7).
+
+use super::http::Shared;
+use super::runner::{Entry, Executor, Work};
+use hoh_agents::identity::{self, Presence};
+use hoh_core::cancel::{Canceller, GRACES, Look, ProcessControl, Processes, Signal};
+use hoh_core::delivery::Clock;
+use hoh_core::persistence::{AttemptRow, Finished, PersistError};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tokio::sync::watch;
+
+/// The attempts this host runs (the runner's, shared so a cancel can stop them first).
+pub(super) type Inflight = Arc<Mutex<BTreeMap<String, Entry>>>;
+
+/// How often the loop looks again when nothing woke it.
+const TICK: Duration = Duration::from_millis(200);
+
+/// How often a cancel pass looks at a group at least (a group seen held must be looked at again within
+/// `identity::HELD_FOR` after its leader's reap to stay signalable).
+const LOOK_EVERY: Duration = Duration::from_millis(10);
+
+/// The pause between two cancel steps of a run whose group still lives or was lost track of.
+const STEP_AGAIN: Duration = Duration::from_secs(1);
+
+/// What the loop and its cancel tasks share.
+struct Common {
+    shared: Arc<Shared>,
+    clock: Arc<dyn Clock>,
+    executor: Option<Arc<dyn Executor>>,
+    inflight: Inflight,
+    project: PathBuf,
+    canceller: Canceller,
+    cancelling: Mutex<BTreeSet<String>>,
+}
+
+/// The loop of `shared`'s project until `stop`.
+pub(super) async fn run(
+    shared: Arc<Shared>,
+    clock: Arc<dyn Clock>,
+    executor: Option<Arc<dyn Executor>>,
+    inflight: Inflight,
+    project: PathBuf,
+    mut stop: watch::Receiver<bool>,
+) {
+    let mut watermark = shared.store.watermark();
+    let common = Arc::new(Common {
+        shared,
+        clock,
+        executor,
+        inflight,
+        project,
+        canceller: Canceller::new(GRACES, LOOK_EVERY),
+        cancelling: Mutex::new(BTreeSet::new()),
+    });
+    let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    loop {
+        if *stop.borrow() {
+            break;
+        }
+        if let Err(e) = tick(&common, &mut tasks).await {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "hoh host: pause and cancel: {e}");
+        }
+        tasks.retain(|t| !t.is_finished());
+        tokio::select! {
+            _ = watermark.changed() => {}
+            () = tokio::time::sleep(TICK) => {}
+            _ = stop.changed() => break,
+        }
+    }
+    // The host stops: a cancel in progress is left to the next host (its reconcile stops the processes and its loop
+    // finishes the cancel).
+    for task in tasks {
+        task.abort();
+        let _ = task.await;
+    }
+}
+
+async fn tick(
+    common: &Arc<Common>,
+    tasks: &mut Vec<tokio::task::JoinHandle<()>>,
+) -> Result<(), PersistError> {
+    let store = &common.shared.store;
+    let waiting = store.runner_waiting(&common.shared.project_id).await?;
+    for run in &waiting.pausing {
+        store.pause_step(run, common.clock.now()).await?;
+    }
+    for run in waiting.cancelling {
+        let new = common
+            .cancelling
+            .lock()
+            .map(|mut c| c.insert(run.clone()))
+            .unwrap_or(false);
+        if new {
+            let common = common.clone();
+            tasks.push(tokio::spawn(async move {
+                cancel(&common, &run).await;
+                if let Ok(mut c) = common.cancelling.lock() {
+                    c.remove(&run);
+                }
+            }));
+        }
+    }
+    Ok(())
+}
+
+/// Cancel `run_id` until it is CANCELLED (or no longer cancelling).
+async fn cancel(common: &Arc<Common>, run_id: &str) {
+    let mut works: BTreeMap<String, Work> = BTreeMap::new();
+    loop {
+        // What this host runs for the run stops first, so the cancel alone ends its attempts (one writer, ADR-021
+        // decision 8c); a native interrupt goes to the work it was given.
+        let entries: Vec<(String, Entry)> = common
+            .inflight
+            .lock()
+            .map(|mut inflight| {
+                let ids: Vec<String> = inflight
+                    .iter()
+                    .filter(|(_, e)| e.work.run_id == run_id)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                ids.into_iter()
+                    .filter_map(|id| inflight.remove(&id).map(|e| (id, e)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (id, entry) in entries {
+            if let Some(task) = entry.task {
+                task.abort();
+                let _ = task.await;
+            }
+            works.insert(id, entry.work);
+        }
+        let step = async {
+            let processes = HostProcesses {
+                works: works.clone(),
+                executor: common.executor.clone(),
+                project: common.project.clone(),
+            };
+            common
+                .canceller
+                .step(
+                    &common.shared.store,
+                    run_id,
+                    &processes,
+                    common.clock.clone(),
+                    Arc::new(std::thread::sleep),
+                )
+                .await
+        };
+        match step.await {
+            Ok(Finished::Running(_)) => tokio::time::sleep(STEP_AGAIN).await,
+            Ok(Finished::Cancelled | Finished::NotCancelling) => return,
+            Err(e) => {
+                use std::io::Write as _;
+                let _ = writeln!(std::io::stderr(), "hoh host: the cancel of {run_id}: {e}");
+                tokio::time::sleep(STEP_AGAIN).await;
+            }
+        }
+    }
+}
+
+/// The product's processes for a cancel: an attempt's group found by its recorded identity (ADR-019 decision 4),
+/// its native interrupt through the executor that runs it, and the project's workspace.
+struct HostProcesses {
+    works: BTreeMap<String, Work>,
+    executor: Option<Arc<dyn Executor>>,
+    project: PathBuf,
+}
+
+impl Processes for HostProcesses {
+    fn control(&self, attempt: &AttemptRow) -> Option<(Box<dyn ProcessControl + Send>, bool)> {
+        let presence = identity::presence(
+            attempt.pid,
+            attempt.boot_id.as_deref(),
+            attempt.process_start_id.as_deref(),
+        );
+        Some(match presence {
+            Ok(Presence::Ours(found)) => {
+                let native = match (&self.executor, self.works.get(&attempt.attempt_id)) {
+                    (Some(executor), Some(work)) => Some((executor.clone(), work.clone())),
+                    _ => None,
+                };
+                let has_native = native.is_some();
+                (
+                    Box::new(FoundControl { found, native }) as Box<dyn ProcessControl + Send>,
+                    has_native,
+                )
+            }
+            // Nothing of it runs: no process was recorded (held at its start gate, which closed when its task
+            // stopped) or its group is empty.
+            Ok(Presence::Gone(_)) => (Box::new(Fixed(Look::Empty)), false),
+            // It cannot be told apart: no signal may go (ADR-019 decision 8); it stays cancelling.
+            _ => (Box::new(Fixed(Look::Lost)), false),
+        })
+    }
+
+    fn workspace(&self) -> Value {
+        workspace(&self.project)
+    }
+}
+
+/// A group found by its identity.
+struct FoundControl {
+    found: identity::Found,
+    native: Option<(Arc<dyn Executor>, Work)>,
+}
+
+impl ProcessControl for FoundControl {
+    fn look(&mut self) -> Look {
+        match self.found.look() {
+            identity::Group::Held => Look::Held,
+            identity::Group::Empty => Look::Empty,
+            identity::Group::Lost => Look::Lost,
+        }
+    }
+
+    fn send(&mut self, signal: Signal) -> bool {
+        match signal {
+            Signal::Native => match &self.native {
+                Some((executor, work)) => {
+                    executor.cancel(work);
+                    true
+                }
+                None => false,
+            },
+            Signal::Term => self.found.terminate(),
+            Signal::Kill => self.found.kill(),
+        }
+    }
+}
+
+/// A group whose look is known without looking: gone, or lost track of.
+struct Fixed(Look);
+
+impl ProcessControl for Fixed {
+    fn look(&mut self) -> Look {
+        self.0
+    }
+
+    fn send(&mut self, _signal: Signal) -> bool {
+        false
+    }
+}
+
+/// How long one git command of the workspace record may take.
+const GIT_LIMIT: Duration = Duration::from_secs(5);
+
+/// git's empty tree, the base of a diff in a repository with no commit yet.
+const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+/// Run git read-only in `project` (no optional lock, no fsmonitor, so it writes no index, object or ref) for at most
+/// [`GIT_LIMIT`]; its output.
+fn git(project: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    let mut child = std::process::Command::new("git")
+        .args(["--no-optional-locks", "-c", "core.fsmonitor=false"])
+        .args(args)
+        .current_dir(project)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("git {}: {e}", args.join(" ")))?;
+    let mut stdout = child.stdout.take().ok_or("git: no stdout")?;
+    let reader = std::thread::spawn(move || {
+        let mut out = Vec::new();
+        stdout.read_to_end(&mut out).map(|_| out)
+    });
+    let end = Instant::now() + GIT_LIMIT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < end => std::thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("git {}: over {GIT_LIMIT:?}", args.join(" ")));
+            }
+            Err(e) => return Err(format!("git {}: {e}", args.join(" "))),
+        }
+    };
+    let out = reader
+        .join()
+        .map_err(|_| "git: its output was lost".to_owned())?
+        .map_err(|e| format!("git {}: {e}", args.join(" ")))?;
+    if !status.success() {
+        return Err(format!("git {}: {status}", args.join(" ")));
+    }
+    Ok(out)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The workspace's record before CANCELLED (REQ-043 behaviour 4, ADR-021 decision 8g): HEAD and its tree, and the
+/// hashes of the diff against HEAD, of the untracked files' names and contents and of the status, and of all of
+/// them; read-only, nothing reset, cleaned or removed. A directory that is not a git work tree, or a git that fails,
+/// is recorded as such.
+pub(super) fn workspace(project: &Path) -> Value {
+    let text = |out: Vec<u8>| String::from_utf8_lossy(&out).trim().to_owned();
+    let head = git(project, &["rev-parse", "--verify", "HEAD"])
+        .map(text)
+        .ok();
+    let head_tree = git(project, &["rev-parse", "--verify", "HEAD^{tree}"])
+        .map(text)
+        .ok();
+    let base = head.clone().unwrap_or_else(|| EMPTY_TREE.to_owned());
+    let record = (|| -> Result<Value, String> {
+        let diff = git(
+            project,
+            &["diff", "--binary", "--no-ext-diff", "--no-textconv", &base],
+        )?;
+        let names = git(
+            project,
+            &["ls-files", "-z", "--others", "--exclude-standard"],
+        )?;
+        let mut untracked = Sha256::new();
+        for name in names.split(|b| *b == 0).filter(|n| !n.is_empty()) {
+            untracked.update(name);
+            untracked.update([0]);
+            let path = project.join(String::from_utf8_lossy(name).as_ref());
+            match std::fs::read(&path) {
+                Ok(content) => untracked.update(hex(&content).as_bytes()),
+                Err(e) => untracked.update(format!("unreadable: {e}").as_bytes()),
+            }
+            untracked.update([0]);
+        }
+        let untracked: String = untracked
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let status = git(project, &["status", "--porcelain", "-z"])?;
+        let (diff, status) = (hex(&diff), hex(&status));
+        let all = hex(format!(
+            "{}\n{}\n{diff}\n{untracked}\n{status}",
+            head.as_deref().unwrap_or(""),
+            head_tree.as_deref().unwrap_or("")
+        )
+        .as_bytes());
+        Ok(json!({
+            "head": head,
+            "head_tree": head_tree,
+            "diff_sha256": diff,
+            "untracked_sha256": untracked,
+            "status_sha256": status,
+            "workspace_sha256": all,
+        }))
+    })();
+    let mut record =
+        record.unwrap_or_else(|e| json!({"head": head, "head_tree": head_tree, "error": e}));
+    if let Some(fields) = record.as_object_mut() {
+        fields.insert(
+            "host_log".to_owned(),
+            json!(project.join(".hoh/host.log").to_string_lossy()),
+        );
+    }
+    record
+}

@@ -38,6 +38,10 @@ pub struct Waiting {
     pub started: Vec<(String, String)>,
     /// The runs the runner paces and schedules (RUNNING, VERIFYING, and WAITING_EXTERNAL to be woken).
     pub runs: Vec<String>,
+    /// The runs whose pause waits for its safe point (PAUSE_REQUESTED) and those being cancelled (CANCEL_REQUESTED),
+    /// which the host loop moves on with or without an executor (docs/adr/ADR-021.md decision 7).
+    pub pausing: Vec<String>,
+    pub cancelling: Vec<String>,
 }
 
 /// One step of the runner.
@@ -167,7 +171,8 @@ fn waiting(conn: &Connection, project_id: &str) -> Result<Waiting, PersistError>
              FROM outbox o JOIN runs r ON r.run_id = o.run_id \
              JOIN attempts a ON a.attempt_id = json_extract(o.payload_json, '$.attempt_id') \
              WHERE r.project_id = ?1 AND o.state = 'PENDING' AND json_extract(o.payload_json, '$.notice') IS 'runtime' \
-             AND json_extract(o.payload_json, '$.kind') IS 'dispatch' AND a.state = 'PREPARED' ORDER BY o.event_seq",
+             AND json_extract(o.payload_json, '$.kind') IS 'dispatch' AND a.state = 'PREPARED' \
+             AND r.state IN ('CREATED', 'DISCOVERING', 'SPECIFYING', 'READY', 'RUNNING', 'VERIFYING') ORDER BY o.event_seq",
         )
         .map_err(sqlite_error)?;
     let dispatches = statement
@@ -206,10 +211,22 @@ fn waiting(conn: &Connection, project_id: &str) -> Result<Waiting, PersistError>
         .map_err(sqlite_error)?
         .collect::<Result<_, _>>()
         .map_err(sqlite_error)?;
+    let in_state = |state: &str| -> Result<Vec<String>, PersistError> {
+        let mut statement = conn
+            .prepare("SELECT run_id FROM runs WHERE project_id = ?1 AND state = ?2 ORDER BY created_at, run_id")
+            .map_err(sqlite_error)?;
+        statement
+            .query_map(params![project_id, state], |r| r.get(0))
+            .map_err(sqlite_error)?
+            .collect::<Result<_, _>>()
+            .map_err(sqlite_error)
+    };
     Ok(Waiting {
         dispatches,
         started,
         runs,
+        pausing: in_state("PAUSE_REQUESTED")?,
+        cancelling: in_state("CANCEL_REQUESTED")?,
     })
 }
 
@@ -269,7 +286,18 @@ fn received(
         )
         .optional()
         .map_err(sqlite_error)?;
-    if taken != 1 || prepared.as_deref() != Some(AttemptState::Prepared.as_str()) {
+    // Nothing starts for a run that does not work (paused or cancelled meanwhile, docs/adr/ADR-021.md decision 7).
+    let working: bool = tx
+        .query_row(
+            "SELECT state IN ('CREATED', 'DISCOVERING', 'SPECIFYING', 'READY', 'RUNNING', 'VERIFYING') FROM runs \
+             WHERE run_id = ?1",
+            params![notice.run_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?
+        .unwrap_or(false);
+    if taken != 1 || prepared.as_deref() != Some(AttemptState::Prepared.as_str()) || !working {
         return Ok(false);
     }
     let now = crate::time::rfc3339_utc(at);
@@ -432,17 +460,20 @@ fn finished(
 ) -> Result<bool, PersistError> {
     let tx = writer::begin(conn, ctx)?;
     let (task_id, task_state, revision, run_id, project_id) = task_of(&tx, attempt_id)?;
-    let from: String = tx
+    let (from, cancelled): (String, bool) = tx
         .query_row(
-            "SELECT state FROM attempts WHERE attempt_id = ?1",
+            "SELECT state, cancel_requested FROM attempts WHERE attempt_id = ?1",
             params![attempt_id],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .map_err(sqlite_error)?;
     let from = writer::parse::<AttemptState>(&from)?;
-    // A process that never started leaves its attempt STARTING: it can only fail.
-    let success = ending.success && from == AttemptState::Running;
-    let to = if success {
+    // A process that never started leaves its attempt STARTING: it can only fail. A cancel takes precedence over how
+    // the work ended: CANCELLED, not counted, no retry; the run's cancel moves its task (ADR-021 decision 8e).
+    let success = ending.success && from == AttemptState::Running && !cancelled;
+    let to = if cancelled {
+        AttemptState::Cancelled
+    } else if success {
         AttemptState::Settled
     } else {
         AttemptState::Failed
@@ -471,7 +502,7 @@ fn finished(
                 change: Change::Task(TaskState::Implemented),
             });
         }
-    } else {
+    } else if !cancelled {
         // Its task by the retry policy, in this transaction (ADR-020 decision 3).
         let failed = super::retry::fail_task(
             &tx,

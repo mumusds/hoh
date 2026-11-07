@@ -148,9 +148,9 @@ const TICK: Duration = Duration::from_millis(200);
 const RENEW: Duration = Duration::from_secs(30);
 
 /// An attempt the runner runs: what it was given and its task.
-struct Entry {
-    work: Work,
-    task: Option<tokio::task::JoinHandle<()>>,
+pub(super) struct Entry {
+    pub(super) work: Work,
+    pub(super) task: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// What the attempts' tasks and the loop share.
@@ -163,7 +163,7 @@ struct Common {
     /// The number of the next settle pass (event ids of this host: `<cause>/<host epoch>/<pass>/…`).
     passes: AtomicU64,
     jitter: Arc<Jitter>,
-    inflight: Mutex<BTreeMap<String, Entry>>,
+    inflight: super::control::Inflight,
 }
 
 impl Common {
@@ -188,6 +188,7 @@ pub(super) async fn run(
     settings: ReconcileSettings,
     host_epoch: i64,
     jitter: Arc<Jitter>,
+    inflight: super::control::Inflight,
     mut stop: watch::Receiver<bool>,
 ) {
     let mut watermark = shared.store.watermark();
@@ -199,7 +200,7 @@ pub(super) async fn run(
         host_epoch,
         passes: AtomicU64::new(0),
         jitter,
-        inflight: Mutex::new(BTreeMap::new()),
+        inflight,
     });
     let mut renewed = Instant::now();
     let mut held_back: BTreeMap<String, (Instant, String)> = BTreeMap::new();
@@ -218,7 +219,7 @@ pub(super) async fn run(
         }
     }
     // The host stops: the attempts in flight are left as they are (their processes run on); the next host's reconcile
-    // settles them (pausing and cancelling them is M2-T06's).
+    // settles them.
     let tasks: Vec<_> = common
         .inflight
         .lock()
@@ -244,7 +245,8 @@ async fn tick(
         let waiting = held_back
             .get(&row.attempt_id)
             .is_some_and(|(at, _)| at.elapsed() < common.settings.retry);
-        if !row.lease_expired || waiting {
+        // An attempt being cancelled is the cancel's to end (docs/adr/ADR-021.md decision 8c).
+        if !row.lease_expired || waiting || row.cancel_requested {
             continue;
         }
         let id = row.attempt_id.clone();

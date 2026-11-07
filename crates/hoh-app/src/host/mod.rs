@@ -8,6 +8,7 @@
 //! Any failure before that ends the start with nothing served, and no database file is made when the location or the
 //! WAL self-test refuses.
 
+mod control;
 mod http;
 mod reconcile;
 mod runner;
@@ -321,6 +322,7 @@ impl Host {
         ];
         // The runner after the reconcile (every dispatch it makes or takes comes after reconcile.completed), stopped
         // with the listeners and before the store closes (ADR-019 decision 8).
+        let inflight: control::Inflight = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
         if let Some(runner) = config.runner.clone() {
             served.push(tokio::spawn(runner::run(
                 shared.clone(),
@@ -329,9 +331,19 @@ impl Host {
                 config.reconcile.clone(),
                 started.host_epoch,
                 jitter.clone(),
-                stopped,
+                inflight.clone(),
+                stopped.clone(),
             )));
         }
+        // Pause and cancel move on with or without an executor (docs/adr/ADR-021.md decision 7).
+        served.push(tokio::spawn(control::run(
+            shared.clone(),
+            config.clock.0.clone(),
+            config.runner.as_ref().map(|r| r.executor.clone()),
+            inflight,
+            repo.clone(),
+            stopped,
+        )));
         let written = write_host_json(
             &files,
             &serde_json::json!({

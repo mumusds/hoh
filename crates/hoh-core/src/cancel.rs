@@ -211,13 +211,12 @@ impl Canceller {
     pub async fn step(
         &self,
         store: &crate::persistence::Store,
-        reader: &crate::persistence::Reader,
         run_id: &str,
         processes: &dyn Processes,
         clock: std::sync::Arc<dyn Clock>,
         wait: std::sync::Arc<dyn Fn(Duration) + Send + Sync>,
     ) -> Result<crate::persistence::Finished, crate::persistence::PersistError> {
-        for attempt in reader.running_attempts(run_id)? {
+        for attempt in store.running_attempts(run_id).await? {
             let Some((mut control, native)) = processes.control(&attempt) else {
                 continue;
             };
@@ -262,7 +261,7 @@ impl Canceller {
                 })
                 .await?;
         }
-        if !reader.running_attempts(run_id)?.is_empty() {
+        if !store.running_attempts(run_id).await?.is_empty() {
             return Ok(crate::persistence::Finished::Running(1));
         }
         store
