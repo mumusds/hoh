@@ -18,17 +18,28 @@ pub trait Clock: Send + Sync {
     fn wall(&self) -> SystemTime {
         self.now()
     }
+
+    /// Never read earlier than `at` from now on, the latest time the host's store recorded (ADR-020 decision 4,
+    /// times across host lives); how far it moved. A clock that follows the system time moves; a test's clock, which
+    /// reads what the test says, does not.
+    fn not_before(&self, _at: SystemTime) -> Duration {
+        Duration::ZERO
+    }
 }
 
 /// The product host's clock (REQ-042 behaviour 2, docs/adr/ADR-020.md decision 4): the system time when it was made,
 /// moved on by the boot clock (CLOCK_BOOTTIME: monotonic, and counting a suspend, unlike CLOCK_MONOTONIC, so its
 /// time stays the real one across a suspend, M2T19R-100), so a step of the system clock while the host runs neither
-/// hastens nor delays a wait; a host started again anchors anew from the system time, so a persisted UTC time is
-/// judged afresh. Absolute deadlines follow the system clock ([`Clock::wall`]).
-#[derive(Debug, Clone, Copy)]
+/// hastens nor delays a wait; a host started again anchors anew from the system time, but never earlier than the
+/// latest time its store recorded ([`Clock::not_before`], M2T19R-200, -300, -301), so a persisted UTC time is judged
+/// afresh and a wall clock set back across the restart puts no time of this life behind an earlier life's. Absolute
+/// deadlines follow the system clock ([`Clock::wall`]).
+#[derive(Debug)]
 pub struct MonotonicClock {
     anchor: SystemTime,
     started: Duration,
+    /// How far [`Clock::not_before`] moved it, in nanoseconds.
+    lead: std::sync::atomic::AtomicU64,
 }
 
 /// The boot clock's time since boot.
@@ -50,6 +61,7 @@ impl MonotonicClock {
         MonotonicClock {
             anchor,
             started: boot_time(),
+            lead: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -62,7 +74,18 @@ impl Default for MonotonicClock {
 
 impl Clock for MonotonicClock {
     fn now(&self) -> SystemTime {
-        self.anchor + boot_time().saturating_sub(self.started)
+        let lead = Duration::from_nanos(self.lead.load(std::sync::atomic::Ordering::Acquire));
+        self.anchor + boot_time().saturating_sub(self.started) + lead
+    }
+
+    fn not_before(&self, at: SystemTime) -> Duration {
+        let Ok(behind) = at.duration_since(self.now()) else {
+            return Duration::ZERO;
+        };
+        let nanos = u64::try_from(behind.as_nanos()).unwrap_or(u64::MAX);
+        self.lead
+            .fetch_add(nanos, std::sync::atomic::Ordering::AcqRel);
+        behind
     }
 
     fn wall(&self) -> SystemTime {
@@ -272,6 +295,40 @@ mod tests {
         assert!(
             second >= first + Duration::from_millis(20),
             "{first:?} {second:?}"
+        );
+        let wall = clock.wall().duration_since(UNIX_EPOCH).expect("now");
+        assert!(wall > Duration::from_secs(1_700_000_000), "{wall:?}");
+    }
+
+    #[test]
+    fn the_hosts_clock_told_a_later_recorded_time_reads_no_earlier_than_it() {
+        // M2T19R-200, -300, -301 (ADR-020 decision 4, times across host lives): a host started after the wall clock
+        // was set back is told the latest time its store recorded and moves its time up to it, once; an earlier time
+        // changes nothing; the wall clock for deadlines stays the system's.
+        let clock = MonotonicClock::anchored(UNIX_EPOCH);
+        let record = UNIX_EPOCH + Duration::from_secs(3_600);
+        let lead = clock.not_before(record);
+        assert!(
+            lead > Duration::from_secs(3_599) && lead <= Duration::from_secs(3_600),
+            "{lead:?}"
+        );
+        let now = clock
+            .now()
+            .duration_since(UNIX_EPOCH)
+            .expect("after its anchor");
+        assert!(
+            now >= Duration::from_secs(3_600) && now < Duration::from_secs(3_601),
+            "{now:?}"
+        );
+        assert_eq!(clock.not_before(UNIX_EPOCH), Duration::ZERO);
+        assert_eq!(clock.not_before(record), Duration::ZERO);
+        let later = clock
+            .now()
+            .duration_since(UNIX_EPOCH)
+            .expect("after its anchor");
+        assert!(
+            later >= now && later < Duration::from_secs(3_601),
+            "{later:?}"
         );
         let wall = clock.wall().duration_since(UNIX_EPOCH).expect("now");
         assert!(wall > Duration::from_secs(1_700_000_000), "{wall:?}");

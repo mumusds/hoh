@@ -685,3 +685,105 @@ async fn the_runner_waits_for_a_retry_by_its_timers_and_not_the_wall_clock() -> 
     drop(executor);
     Ok(())
 }
+
+/// M2T19R-200, -300, -301 (ADR-020 decision 4, times across host lives): the store recorded times an hour ahead of
+/// the system clock, as an earlier host life left them under a wall clock set back since. The product clock moves up
+/// to the record before the reconcile, which records by how much: A1 (its work OBSERVED at +1 h 5 s, its process gone)
+/// ends no earlier than that, so its 5 s are charged; its writer lease is released at once, so T2 runs; T2's attempt
+/// starts no earlier than the record; T1's retry counts 120 s from A1's end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_started_after_the_wall_clock_was_set_back_keeps_its_time_ahead_of_the_record() -> R
+{
+    let dir = tempfile::tempdir()?;
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    Host::start(config(&project)).await?.shutdown().await;
+    let ahead = SystemTime::now() + Duration::from_secs(3_600);
+    let t = |by: u64| hoh_core::time::rfc3339_utc(ahead + Duration::from_secs(by));
+    let (t0, t5, t120, t125) = (t(0), t(5), t(120), t(125));
+    // A process record that is gone: a child that ran and was reaped, on this boot.
+    let mut gone = Command::new("true").spawn()?;
+    let pid = gone.id();
+    gone.wait()?;
+    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+    let boot = boot.trim();
+    let key = hoh_core::reconcile::work_key("A1");
+    seed(
+        &project,
+        &format!(
+            "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', :p, printf('%064d', 1), 1);
+             INSERT INTO runs(run_id, project_id, spec_id, state, mode, revision, created_at) VALUES
+               ('R', :p, 's1', 'RUNNING', 'AUTO', 1, '{t0}');
+             INSERT INTO sessions(session_id, agent, role, agent_version, capabilities_json) VALUES
+               ('sd', 'claude', 'developer', '1', '{{\"structured_events\": true, \"command_exec\": true}}');
+             INSERT INTO role_bindings(run_id, role, agent, session_id, role_epoch, config_revision, bound_at) VALUES
+               ('R', 'developer', 'claude', 'sd', 1, 1, '{t0}');
+             INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate) VALUES
+               ('T1', 'R', 's1', 'RUNNING', 3, 'developer', 1, 1, 1),
+               ('T2', 'R', 's1', 'READY', 1, 'developer', 1, 2, 1);
+             INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, boot_id, pid,
+                                  process_start_id, started_at) VALUES
+               ('A1', 'T1', 'RUNNING', 1, 1, 1, '{boot}', {pid}, '1', '{t0}');
+             INSERT INTO leases(project_id, kind, attempt_id, epoch, expires_at) VALUES (:p, 'writer', 'A1', 1, '{t120}');
+             INSERT INTO effects(effect_key, attempt_id, state) VALUES ('{key}', 'A1', 'OBSERVED');
+             INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+               (:p, '{key}/effect.observed', 'R', 'effect.observed',
+                '{{\"effect_key\": \"{key}\", \"detail\": {{\"success\": false, \"detail\": \"HTTP 429\", \"class\": \"transient\", \"retry_after_ms\": 120000, \"ended_at\": \"{t5}\"}}}}',
+                '{t5}');
+             INSERT INTO budgets(scope_kind, scope_id, kind, limit_value) VALUES ('run', 'R', 'wall_seconds', 600);"
+        ),
+    )?;
+    let executor = Arc::new(Scripted {
+        script: [("T2".to_owned(), None)].into(),
+        started: Arc::new(std::sync::Mutex::new(Vec::new())),
+    });
+    let mut config = config(&project);
+    config.runner = Some(hoh_app::host::RunnerConfig {
+        executor: executor.clone(),
+        context: context(),
+    });
+    let host = Host::start(config).await?;
+    let db = db(&project);
+    let end = Instant::now() + Duration::from_secs(20);
+    while query(
+        &db,
+        "SELECT count(*) FROM attempts a JOIN tasks t ON t.task_id = a.task_id WHERE t.task_id = 'T2' AND a.state = 'SETTLED'",
+    )? != "1"
+    {
+        if Instant::now() > end {
+            return Err(format!("T2 did not run: {}", rows(&db, "SELECT * FROM attempts")?).into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    host.shutdown().await;
+    drop(executor);
+    let behind: u64 = query(
+        &db,
+        "SELECT json_extract(payload_json, '$.clock_behind_ms') FROM events WHERE kind = 'reconcile.started' \
+         ORDER BY seq DESC LIMIT 1",
+    )?
+    .parse()?;
+    assert!(
+        (3_590_000..=3_610_000).contains(&behind),
+        "clock_behind_ms {behind}"
+    );
+    let a1 = query(&db, "SELECT ended_at FROM attempts WHERE attempt_id = 'A1'")?;
+    assert!(a1 >= t5, "A1 ended at {a1}, before its recorded end {t5}");
+    let t2 = query(
+        &db,
+        "SELECT a.started_at FROM attempts a WHERE a.task_id = 'T2'",
+    )?;
+    assert!(
+        t2 >= t5,
+        "T2's attempt started at {t2}, behind the record {t5}"
+    );
+    let next = query(&db, "SELECT next_retry_at FROM tasks WHERE task_id = 'T1'")?;
+    assert!(next >= t125, "T1's retry at {next}");
+    let used: f64 = query(
+        &db,
+        "SELECT used_value FROM budgets WHERE kind = 'wall_seconds'",
+    )?
+    .parse()?;
+    assert!((5.0..60.0).contains(&used), "used {used} s");
+    Ok(())
+}
