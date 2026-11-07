@@ -131,6 +131,11 @@ enum Job {
     ),
     /// The writer connection's settings.
     Pragmas(oneshot::Sender<Result<Pragmas, PersistError>>),
+    /// An outbox operation ([`super::outbox`]).
+    Outbox(
+        Box<OutboxJob>,
+        oneshot::Sender<Result<OutboxDone, PersistError>>,
+    ),
     /// A run id and a plan for [`super::plan::import`].
     Plan(
         Box<(String, serde_json::Value)>,
@@ -193,6 +198,7 @@ impl std::fmt::Debug for Job {
             Job::Command(..) => "Command",
             Job::BeginHost(..) => "BeginHost",
             Job::Pragmas(..) => "Pragmas",
+            Job::Outbox(..) => "Outbox",
             Job::Plan(..) => "Plan",
             Job::Round(..) => "Round",
             Job::Keep(..) => "Keep",
@@ -268,6 +274,9 @@ impl Writer {
                         }
                         Job::Pragmas(reply) => {
                             let _ = reply.send(super::pragmas(&conn));
+                        }
+                        Job::Outbox(job, reply) => {
+                            let _ = reply.send(run_outbox(&mut conn, *job, &after_events));
                         }
                         Job::Plan(request, reply) => {
                             let (run_id, plan) = *request;
@@ -373,6 +382,10 @@ impl Writer {
 
     pub(super) async fn attempt(&self, job: AttemptJob) -> Result<(), PersistError> {
         self.submit(|tx| Job::Attempt(Box::new(job), tx)).await
+    }
+
+    pub(super) async fn outbox(&self, job: OutboxJob) -> Result<OutboxDone, PersistError> {
+        self.submit(|tx| Job::Outbox(Box::new(job), tx)).await
     }
 
     pub(super) async fn import_plan(
@@ -692,5 +705,81 @@ pub(super) fn parse<S: Lifecycle>(name: &str) -> Result<S, PersistError> {
             "unknown {} state {name:?} in the database",
             S::MACHINE
         ))
+    })
+}
+
+/// An outbox operation for the writer thread.
+pub(super) enum OutboxJob {
+    Claim(std::time::SystemTime, Vec<String>, usize),
+    Settle(String, super::outbox::Settlement, i64),
+    Consume(
+        Box<(
+            String,
+            crate::protocol::Message,
+            super::outbox::ConsumeEffect,
+            std::time::SystemTime,
+        )>,
+    ),
+    /// Consumer, message id, run id, violations.
+    Invalid(Box<(String, String, Option<String>, String)>),
+    TaskResult(Box<crate::protocol::TaskResult>),
+}
+
+/// What an outbox operation gives back.
+#[derive(Debug, Default)]
+pub(super) struct OutboxDone {
+    pub(super) rows: Vec<super::outbox::OutboxRow>,
+    pub(super) consumed: Option<super::outbox::Consumed>,
+    pub(super) event_seq: Option<i64>,
+    pub(super) task_result: Option<super::results::TaskResultOutcome>,
+}
+
+fn run_outbox(
+    conn: &mut Connection,
+    job: OutboxJob,
+    after_events: &dyn Fn(),
+) -> Result<OutboxDone, PersistError> {
+    use super::outbox;
+    Ok(match job {
+        OutboxJob::Claim(now, roles, limit) => OutboxDone {
+            rows: outbox::claim(conn, now, &roles, limit)?,
+            ..OutboxDone::default()
+        },
+        OutboxJob::Settle(id, settlement, max) => {
+            outbox::settle(conn, &id, &settlement, max, after_events)?;
+            OutboxDone::default()
+        }
+        OutboxJob::Consume(request) => {
+            let (consumer, message, effect, now) = *request;
+            OutboxDone {
+                consumed: Some(outbox::consume(
+                    conn,
+                    &consumer,
+                    &message,
+                    &effect,
+                    now,
+                    after_events,
+                )?),
+                ..OutboxDone::default()
+            }
+        }
+        OutboxJob::TaskResult(result) => OutboxDone {
+            task_result: Some(super::results::accept(conn, &result, after_events)?),
+            ..OutboxDone::default()
+        },
+        OutboxJob::Invalid(request) => {
+            let (consumer, id, run_id, violations) = *request;
+            OutboxDone {
+                event_seq: Some(outbox::invalid(
+                    conn,
+                    &consumer,
+                    &id,
+                    run_id.as_deref(),
+                    &violations,
+                    after_events,
+                )?),
+                ..OutboxDone::default()
+            }
+        }
     })
 }
