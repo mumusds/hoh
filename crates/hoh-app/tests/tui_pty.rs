@@ -486,3 +486,259 @@ fn a_test_that_fails_early_leaves_no_hoh_behind() -> R {
     );
     Ok(())
 }
+
+/// TEST-043-03's world: run R RUNNING with writer task T1, a developer bound with its capabilities.
+const ATTACH_WORLD: &str = "
+INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', :p, printf('%064d', 1), 1);
+INSERT INTO runs(run_id, project_id, spec_id, state, mode, revision, created_at) VALUES
+  ('R', :p, 's1', 'RUNNING', 'AUTO', 1, '2026-11-07T00:00:00Z');
+INSERT INTO sessions(session_id, agent, role, agent_version, capabilities_json) VALUES
+  ('sd', 'claude', 'developer', '1', '{\"structured_events\": true, \"command_exec\": true}');
+INSERT INTO role_bindings(run_id, role, agent, session_id, role_epoch, config_revision, bound_at) VALUES
+  ('R', 'developer', 'claude', 'sd', 1, 1, '2026-11-07T00:00:00Z');
+INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate) VALUES
+  ('T1', 'R', 's1', 'READY', 1, 'developer', 1, 1, 1);
+";
+
+fn sqlite(db: &Path, script: &str, input: &str) -> R<String> {
+    use std::io::Write as _;
+    let mut child = std::process::Command::new("python3")
+        .args(["-c", script])
+        .arg(db)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .ok_or("no stdin")?
+        .write_all(input.as_bytes())?;
+    let out = child.wait_with_output()?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).into_owned().into());
+    }
+    Ok(String::from_utf8(out.stdout)?.trim().to_owned())
+}
+
+/// A FakeAgent that works 60 s: the leader of its own process group, held at its start gate; its leader is reaped
+/// and its group SIGKILLed when it ends, as the substrate does.
+#[derive(Debug)]
+struct Sixty;
+
+impl hoh_app::host::Executor for Sixty {
+    fn deliver(
+        &self,
+        _work: &hoh_app::host::Work,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
+        let (answer, ack) = tokio::sync::oneshot::channel();
+        let _ = answer.send(Ok(()));
+        ack
+    }
+
+    fn start(&self, _work: &hoh_app::host::Work) -> Result<hoh_app::host::Started, String> {
+        use std::os::unix::process::CommandExt as _;
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "read -r go; [ \"$go\" = go ] || exit 0; sleep 60"])
+            .process_group(0)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        let pid = child.id();
+        let stdin = child.stdin.take();
+        let gate = hoh_app::host::Gate::new(move || {
+            use std::io::Write as _;
+            stdin
+                .ok_or("no stdin")?
+                .write_all(b"go\n")
+                .map_err(|e| e.to_string())
+        });
+        let (end, ended) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let status = child.wait();
+            let _ = end.send(hoh_app::host::Outcome {
+                success: status.as_ref().is_ok_and(std::process::ExitStatus::success),
+                detail: format!("{status:?}"),
+                group_gone: hoh_agents::identity::group_empty(pid),
+                class: hoh_core::retry::FailureClass::Transient { retry_after: None },
+            });
+        });
+        Ok(hoh_app::host::Started { pid, gate, ended })
+    }
+}
+
+/// Whether process `pid` is alive (signal 0).
+fn alive(pid: u32) -> bool {
+    i32::try_from(pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+        .is_some_and(|p| rustix::process::test_kill_process(p).is_ok())
+}
+
+/// `hoh attach R` in a PTY, once the Workspace bound to R is drawn.
+fn open_attach(project: &Path, home: &Path) -> R<Session> {
+    let pty = Pty::new(30, 100)?;
+    let baseline = pty.stty()?;
+    let child = spawn_in(&pty, project, home, &["attach", "R"], &[])?;
+    pty.wait_for("run R", 0, WAIT)?;
+    pty.wait_for("host 已连接", 0, WAIT)?;
+    Ok(Session {
+        child,
+        pty,
+        baseline,
+    })
+}
+
+#[test]
+fn test_043_03_the_tui_leaves_on_sighup_sigterm_and_detach_with_the_host_and_agent_alive_and_the_run_unchanged()
+-> R {
+    // AC-043-03: hoh's TUI attached to run R in a PTY while its FakeAgent works 60 s; the host and Agent pids recorded.
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let (project, home) = (dir.path().join("p"), dir.path().join("home"));
+    std::fs::create_dir_all(&project)?;
+    std::fs::create_dir_all(&home)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    let config = || {
+        let mut config = hoh_app::host::HostConfig::new(&project);
+        config.port = 0;
+        config.store.wal_probe = Some(hoh_core::persistence::selftest::ProbeCommand {
+            program: env!("CARGO_BIN_EXE_hoh").into(),
+            args: vec![hoh_core::persistence::selftest::PROBE_ARG.into()],
+            env: Vec::new(),
+            answer_timeout: WAIT,
+        });
+        config
+    };
+    let first = runtime.block_on(hoh_app::host::Host::start(config()))?;
+    runtime.block_on(first.shutdown());
+    let db = project.join(".hoh/state.db");
+    sqlite(
+        &db,
+        "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); p=c.execute('SELECT project_id FROM projects').fetchone()[0]; \
+         c.executescript(sys.stdin.read().replace(':p', repr(p))); c.commit()",
+        ATTACH_WORLD,
+    )?;
+    let query = |sql: &str| {
+        sqlite(
+            &db,
+            "import sqlite3,sys; r=sqlite3.connect(sys.argv[1]).execute(sys.stdin.read()).fetchone(); print('' if r is None or r[0] is None else r[0])",
+            sql,
+        )
+    };
+    let mut with_runner = config();
+    with_runner.runner = Some(hoh_app::host::RunnerConfig {
+        executor: std::sync::Arc::new(Sixty),
+        context: hoh_core::decision::Context {
+            required_capabilities: [(
+                "developer".to_owned(),
+                ["structured_events", "command_exec"]
+                    .map(str::to_owned)
+                    .into_iter()
+                    .collect(),
+            )]
+            .into(),
+            ..hoh_core::decision::Context::default()
+        },
+    });
+    let host = runtime.block_on(hoh_app::host::Host::start(with_runner))?;
+    let end = std::time::Instant::now() + WAIT;
+    while query("SELECT state FROM attempts WHERE task_id = 'T1'")? != "RUNNING" {
+        if std::time::Instant::now() > end {
+            return Err("T1 did not run".into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let agent: u32 = query("SELECT pid FROM attempts WHERE task_id = 'T1'")?.parse()?;
+    let host_pid = std::process::id();
+    let run = || query("SELECT state || ' ' || revision FROM runs WHERE run_id = 'R'");
+    let before = run()?;
+    let unchanged = |step: &str| -> R {
+        assert!(
+            alive(host_pid) && alive(agent),
+            "{step}: the host or the Agent is gone"
+        );
+        assert_eq!(run()?, before, "{step}: the run moved");
+        Ok(())
+    };
+    // SIGHUP: the TUI leaves.
+    let s = open_attach(&project, &home)?;
+    signal(&s.child, Signal::HUP)?;
+    assert_eq!(s.ended()?, Some(129));
+    unchanged("SIGHUP")?;
+    // SIGTERM: it leaves with the terminal restored (the alternate screen left, the attributes back: icanon, echo).
+    let s = open_attach(&project, &home)?;
+    signal(&s.child, Signal::TERM)?;
+    assert_eq!(s.ended()?, Some(143));
+    unchanged("SIGTERM")?;
+    // Ctrl+C on the idle top level: only the choice of detach, pause and cancel, and the TUI stays until 脱离.
+    let mut s = open_attach(&project, &home)?;
+    let from = s.pty.output().len();
+    s.pty.send(b"\x03")?;
+    for choice in ["脱离", "暂停", "取消任务"] {
+        s.pty.wait_for(choice, from, WAIT)?;
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(s.child.0.try_wait()?.is_none(), "the TUI left at Ctrl+C");
+    s.pty.send(b"\r")?;
+    assert_eq!(s.ended()?, Some(0));
+    unchanged("detach")?;
+    runtime.block_on(host.shutdown());
+    if let Some(pgid) = i32::try_from(agent)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    {
+        let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::KILL);
+    }
+    Ok(())
+}
+
+#[test]
+fn a_host_started_by_a_detach_in_a_terminal_outlives_its_hang_up() -> R {
+    // CR-010 decision 2 (REQ-005 behaviour 2): supplementary detach evidence, no TEST id (AC-005-01 is M2-T13's).
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let (project, home) = (dir.path().join("p"), dir.path().join("home"));
+    std::fs::create_dir_all(&project)?;
+    std::fs::create_dir_all(&home)?;
+    let mut pty = Pty::new(30, 100)?;
+    let mut client = spawn_in(
+        &pty,
+        &project,
+        &home,
+        &["-p", "x", "--detach", "--output", "json"],
+        &[],
+    )?;
+    assert_eq!(exit_within(&mut client, WAIT)?.code(), Some(0));
+    let host: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(project.join(".hoh/host.json"))?)?;
+    let pid = u32::try_from(host["pid"].as_u64().ok_or("no pid")?)?;
+    pty.hang_up()?;
+    drop(pty);
+    std::thread::sleep(Duration::from_millis(500));
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let fields: Vec<&str> = stat
+        .rsplit_once(") ")
+        .ok_or("no stat")?
+        .1
+        .split(' ')
+        .collect();
+    let (session, tty): (u32, i64) = (fields[3].parse()?, fields[4].parse()?);
+    assert!(alive(pid), "the host is gone after the hang-up");
+    assert_eq!((session, tty), (pid, 0), "its own session, no terminal");
+    if let Some(p) = i32::try_from(pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    {
+        rustix::process::kill_process(p, rustix::process::Signal::TERM)?;
+    }
+    let end = std::time::Instant::now() + WAIT;
+    while alive(pid) && std::time::Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!alive(pid), "the host did not stop on SIGTERM");
+    Ok(())
+}

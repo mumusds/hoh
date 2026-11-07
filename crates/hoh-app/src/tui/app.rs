@@ -1,6 +1,7 @@
-//! The Workspace shell's state, keys and screen (ADR-014). M1 has no host, so the top bar says so, Enter only records
-//! the line in the project's history (and says it was not sent), and the Ctrl+C choice offers only "脱离": with no run
-//! there is nothing to pause or cancel.
+//! The Workspace shell's state, keys and screen (ADR-014). Bare `hoh` has no host yet (M2-T13), so the top bar says
+//! so, Enter only records the line in the project's history (and says it was not sent), and the Ctrl+C choice offers
+//! only "脱离": with no run there is nothing to pause or cancel. `hoh attach` binds it to a run (docs/adr/ADR-021.md
+//! decision 10): the run and its events are shown, and the Ctrl+C choice also offers "暂停" and "取消任务".
 
 use super::editor::Editor;
 use super::history::History;
@@ -11,15 +12,33 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
-/// How the user leaves the shell.
+/// What the user chose in the Ctrl+C choice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Exit {
-    /// Close the client; accepted runs go on (none in M1).
+    /// Close the client; accepted runs go on, nothing is sent.
     Detach,
+    /// Pause the attached run (PauseRun) and stay.
+    Pause,
+    /// Cancel the attached run (CancelRun) and stay.
+    Cancel,
 }
 
-/// The Ctrl+C choice. "暂停" and "取消任务" join it once there can be a current run (M2-T13).
+/// The Ctrl+C choice with no run attached.
 const CHOICES: &[(&str, Exit)] = &[("脱离", Exit::Detach)];
+
+/// The Ctrl+C choice of a client attached to a run (REQ-043 behaviour 6).
+const RUN_CHOICES: &[(&str, Exit)] = &[
+    ("脱离", Exit::Detach),
+    ("暂停", Exit::Pause),
+    ("取消任务", Exit::Cancel),
+];
+
+/// The run a client is attached to.
+#[derive(Debug)]
+struct Attached {
+    run_id: String,
+    label: String,
+}
 
 /// The built-in default mode; the configured `default_mode` is read once the config parser exists (M2-T07).
 const DEFAULT_MODE: &str = "AUTO";
@@ -44,6 +63,7 @@ pub struct App {
     /// The Ctrl+C choice is open, with this item selected.
     menu: Option<usize>,
     messages: Vec<String>,
+    run: Option<Attached>,
 }
 
 impl App {
@@ -58,6 +78,36 @@ impl App {
             search: None,
             menu: None,
             messages,
+            run: None,
+        }
+    }
+
+    /// Bind the shell to run `run_id`, shown as `label`.
+    pub fn attach(&mut self, run_id: &str, label: &str) {
+        self.run = Some(Attached {
+            run_id: run_id.to_owned(),
+            label: label.to_owned(),
+        });
+        self.messages.clear();
+    }
+
+    /// The attached run's label changed.
+    pub fn relabel(&mut self, label: &str) {
+        if let Some(run) = self.run.as_mut() {
+            run.label = label.to_owned();
+        }
+    }
+
+    /// A line in the message area (an event of the run, a command's answer).
+    pub fn say(&mut self, line: String) {
+        self.messages.push(line);
+    }
+
+    fn choices(&self) -> &'static [(&'static str, Exit)] {
+        if self.run.is_some() {
+            RUN_CHOICES
+        } else {
+            CHOICES
         }
     }
 
@@ -70,10 +120,14 @@ impl App {
     pub fn key(&mut self, key: KeyEvent) -> Option<Exit> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if let Some(selected) = self.menu {
+            let choices = self.choices();
             match key.code {
-                KeyCode::Enter => return CHOICES.get(selected).map(|(_, exit)| *exit),
+                KeyCode::Enter => {
+                    self.menu = None;
+                    return choices.get(selected).map(|(_, exit)| *exit);
+                }
                 KeyCode::Up => self.menu = Some(selected.saturating_sub(1)),
-                KeyCode::Down => self.menu = Some((selected + 1).min(CHOICES.len() - 1)),
+                KeyCode::Down => self.menu = Some((selected + 1).min(choices.len() - 1)),
                 KeyCode::Esc => self.menu = None,
                 KeyCode::Char('c') if ctrl => self.menu = None,
                 _ => {}
@@ -195,7 +249,11 @@ impl App {
             self.messages.push(format!("输入历史未能保存：{e}"));
         }
         self.messages.push(format!("你：{text}"));
-        self.messages.push("host 离线，未发送。".to_owned());
+        self.messages.push(if self.run.is_some() {
+            "输入尚未接入（M2-T13），未发送。".to_owned()
+        } else {
+            "host 离线，未发送。".to_owned()
+        });
     }
 
     fn older(&mut self) {
@@ -238,10 +296,16 @@ impl App {
         .areas(frame.area());
         let bar = Style::new().add_modifier(Modifier::REVERSED);
         frame.render_widget(
-            Paragraph::new(format!(
-                " HoH │ {} │ 模式 {} │ run 无 │ baseline 未知 │ host 离线 ",
-                self.project, self.mode
-            ))
+            Paragraph::new(match &self.run {
+                Some(run) => format!(
+                    " HoH │ {} │ 模式 {} │ run {} {} │ baseline 未知 │ host 已连接 ",
+                    self.project, self.mode, run.run_id, run.label
+                ),
+                None => format!(
+                    " HoH │ {} │ 模式 {} │ run 无 │ baseline 未知 │ host 离线 ",
+                    self.project, self.mode
+                ),
+            })
             .style(bar),
             top,
         );
@@ -277,8 +341,13 @@ impl App {
                 }
             ),
             None => format!(
-                " {} │ host 离线 │ Enter 记录 · ↑↓ 历史 · Ctrl+R 搜索 · Ctrl+C 清空/退出",
-                self.mode
+                " {} │ {} │ Enter 记录 · ↑↓ 历史 · Ctrl+R 搜索 · Ctrl+C 清空/退出",
+                self.mode,
+                if self.run.is_some() {
+                    "host 已连接"
+                } else {
+                    "host 离线"
+                }
             ),
         };
         frame.render_widget(Paragraph::new(line).style(bar), status);
@@ -294,14 +363,15 @@ impl App {
     }
 
     fn draw_menu(&self, frame: &mut Frame, body: Rect, selected: usize) {
-        let height = u16::try_from(CHOICES.len()).unwrap_or(1).saturating_add(2);
+        let choices = self.choices();
+        let height = u16::try_from(choices.len()).unwrap_or(1).saturating_add(2);
         let area = Rect {
             x: body.x + body.width.saturating_sub(24) / 2,
             y: body.y + body.height.saturating_sub(height) / 2,
             width: body.width.min(24),
             height: body.height.min(height),
         };
-        let items: Vec<Line> = CHOICES
+        let items: Vec<Line> = choices
             .iter()
             .enumerate()
             .map(|(i, (label, _))| {

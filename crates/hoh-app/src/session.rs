@@ -175,6 +175,16 @@ pub fn attach(project: &Path, run_id: Option<&str>, output: Output) -> u8 {
         }
     };
     let run_id = run["run_id"].as_str().unwrap_or_default().to_owned();
+    // A terminal on both sides and text: the Workspace bound to the run (ADR-021 decision 10).
+    {
+        use std::io::IsTerminal as _;
+        if output == Output::Text
+            && std::io::stdin().is_terminal()
+            && std::io::stdout().is_terminal()
+        {
+            return crate::tui::attach(project, host, &run);
+        }
+    }
     if output == Output::Json {
         let mut snapshot = run.clone();
         snapshot["label"] = run["projection"]["label"].clone();

@@ -55,8 +55,74 @@ fn signal_code(signal: usize) -> u8 {
     }
 }
 
+/// A run the shell is attached to (docs/adr/ADR-021.md decision 10): its host, its id, and its events as a reader
+/// thread receives them over the host's socket.
+pub struct Link {
+    host: crate::client::HostInfo,
+    project: std::path::PathBuf,
+    run_id: String,
+    events: std::sync::mpsc::Receiver<serde_json::Value>,
+    /// Ends the reader thread (it looks between reads, at least every 200 ms).
+    stop: Arc<AtomicBool>,
+}
+
+impl Drop for Link {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+}
+
+/// `hoh attach` with a terminal: the shell bound to `run` (getRun's answer) of `host`; the exit code. Leaving, by the
+/// choice or a signal, only closes this client (REQ-043 behaviour 6).
+pub fn attach(project: &Path, host: crate::client::HostInfo, run: &serde_json::Value) -> u8 {
+    let run_id = run["run_id"].as_str().unwrap_or_default().to_owned();
+    let label = run["projection"]["label"]
+        .as_str()
+        .or(run["state"].as_str())
+        .unwrap_or_default()
+        .to_owned();
+    let (send, events) = std::sync::mpsc::channel();
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let (host, run_id, stop) = (host.clone(), run_id.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut last = 0i64;
+            while !stop.load(Ordering::SeqCst) {
+                let Ok(mut stream) = crate::client::Events::open(&host, &run_id, last) else {
+                    std::thread::sleep(Duration::from_millis(500));
+                    continue;
+                };
+                while !stop.load(Ordering::SeqCst) {
+                    match stream.next() {
+                        Ok(Some(event)) => {
+                            last = event["seq"].as_i64().unwrap_or(last).max(last);
+                            if send.send(event).is_err() {
+                                return;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(_) => break,
+                    }
+                }
+            }
+        });
+    }
+    let link = Link {
+        host,
+        project: project.to_path_buf(),
+        run_id,
+        events,
+        stop,
+    };
+    run_with(project, Some((link, label)))
+}
+
 /// Run the shell for the project at `project`; the exit code.
 pub fn run(project: &Path) -> u8 {
+    run_with(project, None)
+}
+
+fn run_with(project: &Path, link: Option<(Link, String)>) -> u8 {
     let signal = Arc::new(AtomicUsize::new(0));
     for sig in [SIGTERM, SIGHUP, SIGINT] {
         let value = usize::try_from(sig).unwrap_or(usize::MAX);
@@ -75,9 +141,14 @@ pub fn run(project: &Path) -> u8 {
         |n| n.to_string_lossy().into_owned(),
     );
     let mut app = App::new(name, History::load(project));
+    let link = link.map(|(link, label)| {
+        app.attach(&link.run_id, &label);
+        link
+    });
     terminal::restore_on_panic();
     let (guard, entered) = terminal::enter();
-    let end = entered.and_then(|()| event_loop(&mut app, &signal, &resized));
+    let end = entered.and_then(|()| event_loop(&mut app, &signal, &resized, link.as_ref()));
+    drop(link);
     terminal::debug_restore_gate();
     let restored = guard.finish();
     // Loaded after the restore: a signal that came while restoring decides too (M1T08R-06).
@@ -109,7 +180,7 @@ fn outcome(
     }
     match end {
         Ok(End::Signal(_)) => (signal_code(signal), not_restored),
-        Ok(End::Left(Exit::Detach)) => match not_restored {
+        Ok(End::Left(Exit::Detach | Exit::Pause | Exit::Cancel)) => match not_restored {
             None => (0, None),
             Some(m) => (code(ClientEvent::TerminalIo), Some(m)),
         },
@@ -123,7 +194,69 @@ fn outcome(
     }
 }
 
-fn event_loop(app: &mut App, signal: &AtomicUsize, resized: &AtomicBool) -> std::io::Result<End> {
+/// The attached run's events received so far, shown; a run event also refreshes its label.
+fn take_events(app: &mut App, link: &Link) -> bool {
+    let mut any = false;
+    while let Ok(event) = link.events.try_recv() {
+        let kind = event["kind"].as_str().unwrap_or_default().to_owned();
+        app.say(format!("#{} {kind}", event["seq"].as_i64().unwrap_or(0)));
+        if kind.starts_with("run.")
+            && let Ok(reply) = crate::client::call(
+                &link.host,
+                "GET",
+                &format!("/v1/runs/{}", link.run_id),
+                None,
+            )
+            && reply.status == 200
+        {
+            let run = reply.json();
+            if let Some(label) = run["projection"]["label"].as_str() {
+                app.relabel(label);
+            }
+        }
+        any = true;
+    }
+    any
+}
+
+/// Send PauseRun or CancelRun for the attached run at its current revision (once more on a stale one); what to
+/// say about it.
+fn control(link: &Link, kind: &str) -> String {
+    let mut said = String::new();
+    for _ in 0..2 {
+        let revision = match crate::client::call(
+            &link.host,
+            "GET",
+            &format!("/v1/runs/{}", link.run_id),
+            None,
+        ) {
+            Ok(reply) if reply.status == 200 => reply.json()["revision"].as_i64().unwrap_or(0),
+            Ok(reply) => return format!("{kind} 未发送：host 答 {}", reply.status),
+            Err(e) => return format!("{kind} 未发送：{e}"),
+        };
+        let command = serde_json::json!({
+            "expected_revision": revision,
+            "kind": kind,
+            "run_id": link.run_id,
+            "payload": {"reason": "TUI"},
+        });
+        match crate::client::submit(&link.project, &link.host, command) {
+            Ok(_) => return format!("{kind} 已受理"),
+            Err(failure) if failure.code == "STALE_REVISION" => {
+                said = format!("{kind} 未受理：{}：{}", failure.code, failure.message);
+            }
+            Err(failure) => return format!("{kind} 未受理：{}：{}", failure.code, failure.message),
+        }
+    }
+    said
+}
+
+fn event_loop(
+    app: &mut App,
+    signal: &AtomicUsize,
+    resized: &AtomicBool,
+    link: Option<&Link>,
+) -> std::io::Result<End> {
     let mut terminal = Terminal::new(CrosstermBackend::new(terminal::Output::new()?))?;
     let stdin = std::io::stdin();
     let mut decoder = input::Decoder::default();
@@ -133,6 +266,11 @@ fn event_loop(app: &mut App, signal: &AtomicUsize, resized: &AtomicBool) -> std:
         let sig = signal.load(Ordering::SeqCst);
         if sig != 0 {
             return Ok(End::Signal(sig));
+        }
+        if let Some(link) = link
+            && take_events(app, link)
+        {
+            dirty = true;
         }
         if resized.swap(false, Ordering::SeqCst) {
             dirty = true;
@@ -169,14 +307,27 @@ fn event_loop(app: &mut App, signal: &AtomicUsize, resized: &AtomicBool) -> std:
             Wait::Idle => true,
             Wait::Interrupted => continue,
         };
-        if let Some(end) = handle(
+        match handle(
             app,
             &mut decoder,
             idle,
             || signal.load(Ordering::SeqCst),
             &mut dirty,
         ) {
-            return Ok(end);
+            // Pause and cancel are sent and the shell stays (REQ-043 behaviour 6, ADR-021 decision 10).
+            Some(End::Left(exit @ (Exit::Pause | Exit::Cancel))) => {
+                if let Some(link) = link {
+                    let kind = if exit == Exit::Pause {
+                        "PauseRun"
+                    } else {
+                        "CancelRun"
+                    };
+                    app.say(control(link, kind));
+                }
+                dirty = true;
+            }
+            Some(end) => return Ok(end),
+            None => {}
         }
     }
 }
