@@ -7,7 +7,7 @@ use super::writer::{self, Commit, NewEvent, NewOutbox, StateCas};
 use super::{PersistError, sqlite_error};
 use crate::protocol::{self, Candidate, Message, MessageKind, RejectionReason};
 use crate::time::rfc3339_utc;
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 use std::time::{Duration, SystemTime};
 
@@ -75,11 +75,9 @@ pub(super) fn claim_next(
     max_attempts: i64,
     returned: &[OutboxRow],
     live: &std::collections::BTreeSet<String>,
-    after_events: &dyn Fn(),
+    ctx: &super::writer::Ctx<'_>,
 ) -> Result<Option<OutboxRow>, PersistError> {
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(sqlite_error)?;
+    let tx = super::writer::begin(conn, ctx)?;
     // First the claims returned without reaching a transport: undone here, so none is claimed again (and counted)
     // before its undo (M2T04R-400, -450).
     for row in returned {
@@ -116,7 +114,7 @@ pub(super) fn claim_next(
                 &recipient_role,
                 count,
                 "no answer to its last delivery",
-                after_events,
+                ctx,
             )?;
             continue;
         }
@@ -159,13 +157,15 @@ fn undo(tx: &Transaction<'_>, row: &OutboxRow) -> Result<(), PersistError> {
 }
 
 /// Undo `rows` in one transaction (the store closes, M2T04R-301).
-pub(super) fn unclaim_all(conn: &mut Connection, rows: &[OutboxRow]) -> Result<(), PersistError> {
+pub(super) fn unclaim_all(
+    conn: &mut Connection,
+    rows: &[OutboxRow],
+    ctx: &super::writer::Ctx<'_>,
+) -> Result<(), PersistError> {
     if rows.is_empty() {
         return Ok(());
     }
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(sqlite_error)?;
+    let tx = super::writer::begin(conn, ctx)?;
     for row in rows {
         undo(&tx, row)?;
     }
@@ -180,7 +180,7 @@ fn dead_letter(
     recipient: &str,
     count: i64,
     error: &str,
-    after_events: &dyn Fn(),
+    ctx: &super::writer::Ctx<'_>,
 ) -> Result<(), PersistError> {
     tx.execute(
         "UPDATE outbox SET state = 'DEAD_LETTER', next_retry_at = NULL, last_error = ?1 WHERE message_id = ?2",
@@ -205,7 +205,7 @@ fn dead_letter(
             }],
             ..Commit::default()
         },
-        after_events,
+        ctx,
     )
     .map(drop)
 }
@@ -220,11 +220,9 @@ pub(super) fn settle(
     generation: i64,
     settlement: &Settlement,
     max_attempts: i64,
-    after_events: &dyn Fn(),
+    ctx: &super::writer::Ctx<'_>,
 ) -> Result<(), PersistError> {
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(sqlite_error)?;
+    let tx = super::writer::begin(conn, ctx)?;
     let row: Option<(i64, String, Option<String>, String)> = tx
         .query_row(
             "SELECT attempt_count, state, run_id, recipient_role FROM outbox WHERE message_id = ?1",
@@ -269,7 +267,7 @@ pub(super) fn settle(
                     }],
                     ..Commit::default()
                 },
-                after_events,
+                ctx,
             )?;
         }
         Settlement::Failed(error) if current && count < max_attempts => {
@@ -280,15 +278,7 @@ pub(super) fn settle(
             .map_err(sqlite_error)?;
         }
         Settlement::Failed(error) | Settlement::Invalid(error) if current => {
-            dead_letter(
-                &tx,
-                message_id,
-                run_id,
-                &recipient,
-                count,
-                error,
-                after_events,
-            )?;
+            dead_letter(&tx, message_id, run_id, &recipient, count, error, ctx)?;
         }
         // Settled already, or a late answer of an earlier delivery: the settlement that came first stands.
         _ => {}
@@ -538,11 +528,9 @@ pub(super) fn consume(
     message: &Message,
     effect: &ConsumeEffect,
     now: SystemTime,
-    after_events: &dyn Fn(),
+    ctx: &super::writer::Ctx<'_>,
 ) -> Result<Consumed, PersistError> {
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(sqlite_error)?;
+    let tx = super::writer::begin(conn, ctx)?;
     let stored: Option<String> = tx
         .query_row(
             "SELECT result_json FROM receipts WHERE consumer = ?1 AND message_id = ?2",
@@ -605,7 +593,7 @@ pub(super) fn consume(
                     }],
                     ..Commit::default()
                 },
-                after_events,
+                ctx,
             )?;
             (result_json, Some(reason))
         }
@@ -625,10 +613,10 @@ pub(super) fn consume(
                     events,
                     outbox: Vec::new(),
                 },
-                after_events,
+                ctx,
             )?;
             for attempt in &effect.attempts {
-                attempts::create(&tx, attempt)?;
+                attempts::create(&tx, attempt, ctx)?;
             }
             let revision: Option<i64> = tx
                 .query_row(
@@ -669,11 +657,9 @@ pub(super) fn invalid(
     message_id: &str,
     run_id: Option<&str>,
     violations: &str,
-    after_events: &dyn Fn(),
+    ctx: &super::writer::Ctx<'_>,
 ) -> Result<i64, PersistError> {
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(sqlite_error)?;
+    let tx = super::writer::begin(conn, ctx)?;
     // Recorded already (a crash between recording and settling): the same event, not a second one (M2T04R-59).
     let event_id = child_id(message_id, &format!("{consumer}/invalid"));
     let recorded: Option<i64> = tx
@@ -700,7 +686,7 @@ pub(super) fn invalid(
             }],
             ..Commit::default()
         },
-        after_events,
+        ctx,
     )?;
     tx.commit().map_err(sqlite_error)?;
     Ok(done.event_seqs[0])

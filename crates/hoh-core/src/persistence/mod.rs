@@ -81,6 +81,22 @@ pub trait FaultHooks: Send + Sync + std::fmt::Debug {
     fn before_wal_step(&self, _step: selftest::Step) -> Result<(), String> {
         Ok(())
     }
+
+    /// At `point` of a request of the writer named `job` ("Decide", "Commit", …; ADR-019 decision 1): a test's hook
+    /// may end the process here (AC-036-02).
+    fn at(&self, _job: &'static str, _point: WritePoint) {}
+}
+
+/// A point of a write request (REQ-036, ADR-019 decision 1), in order: the transaction began (its host fence
+/// checked), its state changes are written, its events, its outbox messages; then it committed and its answer is
+/// not yet sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WritePoint {
+    Begun,
+    StateWritten,
+    EventsWritten,
+    OutboxWritten,
+    Committed,
 }
 
 /// The product's fault hooks: none.

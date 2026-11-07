@@ -43,6 +43,7 @@ pub struct InputRow {
 
 fn event(
     tx: &Transaction<'_>,
+    ctx: &super::writer::Ctx<'_>,
     run_id: &str,
     event_id: String,
     kind: &str,
@@ -67,10 +68,14 @@ fn event(
         }],
         ..Commit::default()
     };
-    writer::write(tx, &commit, &|| {}).map(drop)
+    writer::write(tx, &commit, ctx).map(drop)
 }
 
-pub(super) fn enqueue(tx: &Transaction<'_>, i: &NewInput) -> Result<(), PersistError> {
+pub(super) fn enqueue(
+    tx: &Transaction<'_>,
+    i: &NewInput,
+    ctx: &super::writer::Ctx<'_>,
+) -> Result<(), PersistError> {
     tx.execute(
         "INSERT INTO input_queue(input_id, run_id, kind, target_role, state, payload_json) \
          VALUES (?1, ?2, ?3, ?4, 'QUEUED', ?5)",
@@ -85,6 +90,7 @@ pub(super) fn enqueue(tx: &Transaction<'_>, i: &NewInput) -> Result<(), PersistE
     .map_err(sqlite_error)?;
     event(
         tx,
+        ctx,
         &i.run_id,
         child_id(&i.input_id, InputState::Queued.as_str()),
         "input.queued",
@@ -92,7 +98,11 @@ pub(super) fn enqueue(tx: &Transaction<'_>, i: &NewInput) -> Result<(), PersistE
     )
 }
 
-pub(super) fn move_input(tx: &Transaction<'_>, m: &InputMove) -> Result<(), PersistError> {
+pub(super) fn move_input(
+    tx: &Transaction<'_>,
+    m: &InputMove,
+    ctx: &super::writer::Ctx<'_>,
+) -> Result<(), PersistError> {
     let row: Option<(String, String)> = tx
         .query_row(
             "SELECT state, run_id FROM input_queue WHERE input_id = ?1",
@@ -127,6 +137,7 @@ pub(super) fn move_input(tx: &Transaction<'_>, m: &InputMove) -> Result<(), Pers
     .map_err(sqlite_error)?;
     event(
         tx,
+        ctx,
         &run_id,
         child_id(&m.input_id, m.to.as_str()),
         "input.moved",

@@ -8,7 +8,7 @@ use super::writer::{self, Change, Commit, NewEvent, NewOutbox, StateCas};
 use super::{PersistError, sqlite_error};
 use crate::handoff::{self, Recipient, Verification};
 use crate::protocol::{self, Candidate, RejectionReason, TaskResult, TaskState, TaskStatus};
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 
 /// The roles a candidate is handed to (REQ-037: QA and Review verify the same candidate in parallel).
@@ -42,16 +42,14 @@ struct Run {
 pub(super) fn accept(
     conn: &mut Connection,
     result: &TaskResult,
-    after_events: &dyn Fn(),
+    ctx: &super::writer::Ctx<'_>,
 ) -> Result<TaskResultOutcome, PersistError> {
     if result.status != TaskStatus::Completed {
         return Err(PersistError::Unsupported(
             "a TaskResult that is not COMPLETED",
         ));
     }
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(sqlite_error)?;
+    let tx = super::writer::begin(conn, ctx)?;
     let ready_id = child_id(&result.attempt_id, "result");
     let rejected_id = child_id(&result.attempt_id, "result-rejected");
     // The same attempt's result again: the same one replays; another one is a reuse of its key (REQ-022 b4,
@@ -219,7 +217,7 @@ pub(super) fn accept(
                 }],
                 ..Commit::default()
             },
-            after_events,
+            ctx,
         )?;
         tx.commit().map_err(sqlite_error)?;
         return Ok(TaskResultOutcome::Rejected {
@@ -303,7 +301,7 @@ pub(super) fn accept(
             }],
             outbox,
         },
-        after_events,
+        ctx,
     )?;
     let moved = tx
         .execute(

@@ -6,7 +6,7 @@ use super::writer::{self, Change, Commit, Entity, NewEvent, StateCas};
 use super::{PersistError, sqlite_error};
 use crate::dag;
 use crate::schedule::DEFAULT_COST;
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -24,11 +24,9 @@ pub(super) fn import(
     conn: &mut Connection,
     run_id: &str,
     raw: &Value,
-    after_events: &dyn Fn(),
+    ctx: &super::writer::Ctx<'_>,
 ) -> Result<Imported, PersistError> {
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(sqlite_error)?;
+    let tx = super::writer::begin(conn, ctx)?;
     let run: Option<(String, Option<String>, i64)> = tx
         .query_row(
             "SELECT project_id, spec_id, revision FROM runs WHERE run_id = ?1",
@@ -194,7 +192,7 @@ pub(super) fn import(
         }],
         outbox: Vec::new(),
     };
-    let done = writer::write(&tx, &commit, after_events)?;
+    let done = writer::write(&tx, &commit, ctx)?;
     tx.commit().map_err(sqlite_error)?;
     Ok(Imported {
         task_ids,
