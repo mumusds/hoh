@@ -10,7 +10,9 @@
 
 mod http;
 mod reconcile;
+mod runner;
 pub use reconcile::ReconcileSettings;
+pub use runner::{Executor, Outcome, RunnerConfig, RunnerPoint, Started, Work};
 
 use hoh_core::persistence::{self, Options, PersistError, Reader, Store, location};
 use std::path::{Path, PathBuf};
@@ -38,6 +40,9 @@ pub struct HostConfig {
     pub hooks: Arc<dyn HostHooks>,
     /// How the reconcile at the start stops old processes and looks for effects (ADR-019 decision 5).
     pub reconcile: ReconcileSettings,
+    /// The runner, where dispatched work runs; `None` (the product until agents are bound to roles, M2-T07): no
+    /// runner, nothing is dispatched by the host (ADR-019 decision 8).
+    pub runner: Option<RunnerConfig>,
 }
 
 impl HostConfig {
@@ -53,6 +58,7 @@ impl HostConfig {
             mountinfo: None,
             hooks: Arc::new(NoHostFaults),
             reconcile: ReconcileSettings::default(),
+            runner: None,
         }
     }
 }
@@ -64,6 +70,9 @@ pub trait HostHooks: Send + Sync + std::fmt::Debug {
     /// After a command committed, before its response is sent (AC-041-04: a test's implementation drops the
     /// connection here).
     fn after_commit(&self) {}
+
+    /// At `point` of an attempt the runner runs (AC-041-01: a test's implementation ends the process here).
+    fn runner(&self, _point: RunnerPoint) {}
 }
 
 /// The product's host hooks: none.
@@ -274,9 +283,14 @@ impl Host {
             tokio::spawn(http::serve(
                 http::Listener::Unix(unix),
                 shared.clone(),
-                stopped,
+                stopped.clone(),
             )),
         ];
+        // The runner after the reconcile (every dispatch it makes or takes comes after reconcile.completed), stopped
+        // with the listeners and before the store closes (ADR-019 decision 8).
+        if let Some(runner) = config.runner.clone() {
+            served.push(tokio::spawn(runner::run(shared.clone(), runner, stopped)));
+        }
         let written = write_host_json(
             &files,
             &serde_json::json!({
