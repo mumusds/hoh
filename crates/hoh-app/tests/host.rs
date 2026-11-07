@@ -659,6 +659,14 @@ async fn test_022_02_same_key_replays_and_another_payload_is_key_reuse() -> R {
     assert_eq!(accepted["revision"], 1);
     assert_eq!(scalar(dir.path(), "SELECT count(*) FROM commands")?, "1");
     assert_eq!(scalar(dir.path(), "SELECT count(*) FROM events")?, "1");
+    // PauseRun's notice to the commander is a runtime notice (ADR-016 decision 5, ADR-018 decision 4, M2T04R-251).
+    assert_eq!(
+        scalar(
+            dir.path(),
+            "SELECT json_extract(payload_json, '$.notice') FROM outbox"
+        )?,
+        "runtime"
+    );
     let other = call(
         &to,
         "POST",

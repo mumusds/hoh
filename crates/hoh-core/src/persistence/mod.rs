@@ -35,7 +35,7 @@ pub use attempts::{
 pub use commands::{CommandOutcome, EventRow, HostStart, RunRow, SubmitCommand};
 pub use decide::Decided;
 pub use inputs::{InputMove, InputRow, NewInput};
-pub use writer::{Change, Commit, Committed, Entity, NewEvent, NewOutbox, StateCas};
+pub use writer::{Change, Claimed, Commit, Committed, Entity, NewEvent, NewOutbox, StateCas};
 
 use crate::protocol::{ErrorCode, RejectionReason};
 use rusqlite::{Connection, OpenFlags};
@@ -643,7 +643,7 @@ impl Store {
         now: std::time::SystemTime,
         roles: Vec<String>,
         max_attempts: i64,
-    ) -> Result<Option<OutboxRow>, PersistError> {
+    ) -> Result<Option<Claimed>, PersistError> {
         self.writer
             .outbox(writer::OutboxJob::Claim(now, roles, max_attempts))
             .await

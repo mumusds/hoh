@@ -201,6 +201,14 @@ async fn test_035_02_an_applied_dispatch_leases_the_writer_in_its_one_transactio
     assert_eq!(count(&db, "outbox")?, outbox + 1);
     let outbox_seq = rows(&db, "SELECT event_seq FROM outbox")?;
     assert_eq!(outbox_seq, [[json!(event_seqs[0])]]);
+    // A runtime notice, so the HCP dispatcher leaves it to the attempt starter (ADR-018 decision 4, M2T04R-251).
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT json_extract(payload_json, '$.notice') FROM outbox"
+        )?,
+        [[json!("runtime")]]
+    );
     // The same proposal again (a second decision, the same payload and expected revision) names a revision that
     // moved: refused, nothing changes.
     let replay = proposal("d1-again", 7, dispatch("T1"))?;
@@ -591,6 +599,14 @@ async fn a_round_ranks_with_the_snapshot_weights_and_the_tasks_left_wait() -> R 
     )?;
     let round = store.schedule_round("R", context()).await?;
     let dispatched = round.dispatched.ok_or("nothing dispatched")?;
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT json_extract(payload_json, '$.notice') FROM outbox"
+        )?,
+        [[json!("runtime")]],
+        "the round's dispatch is a runtime notice (M2T04R-251)"
+    );
     assert_eq!(dispatched.task_id, "T2", "{:?}", dispatched.score);
     assert_eq!(round.waited, ["T1"]);
     let seq = round.event_seq.ok_or("no event")?;

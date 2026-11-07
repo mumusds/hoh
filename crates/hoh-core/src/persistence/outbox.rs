@@ -63,8 +63,9 @@ pub fn backoff(k: i64) -> Duration {
 }
 
 /// Take the next message due at `now` for one of `roles` and start its delivery (ADR-018 decision 4): every row but
-/// the runtime notices (`"notice": "runtime"`: decide's and the round's dispatch, PauseRun's run.control), so a row that
-/// should hold an HCP message and does not is validated and recorded, never skipped (M2T04R-101); one whose deliveries are spent goes to DEAD_LETTER on the way, with its event. The row
+/// the runtime notices (exactly `"notice": "runtime"`: decide's and the round's dispatch, PauseRun's run.control), so a
+/// row that should hold an HCP message and does not, whatever else it carries, is validated and recorded, never skipped
+/// (M2T04R-101, -201); one whose deliveries are spent goes to DEAD_LETTER on the way, with its event. The row
 /// returned carries this delivery's generation (its new `attempt_count`).
 pub(super) fn claim_next(
     conn: &mut Connection,
@@ -85,7 +86,7 @@ pub(super) fn claim_next(
                  WHERE ((state = 'PENDING' AND (next_retry_at IS NULL OR next_retry_at <= ?1)) \
                         OR (state = 'DELIVERING' AND next_retry_at <= ?1)) \
                    AND recipient_role IN (SELECT value FROM json_each(?2)) \
-                   AND json_extract(payload_json, '$.notice') IS NULL \
+                   AND json_extract(payload_json, '$.notice') IS NOT 'runtime' \
                  ORDER BY event_seq, message_id LIMIT 1",
                 params![stamp, roles],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
