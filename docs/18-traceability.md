@@ -30,7 +30,7 @@
 |REQ-024|Codex 原生接口|M1|required|v1|detailed|AC-024-01（TEST-024-01·integration·M1-T04）<br>AC-024-02（TEST-024-02·integration·M1-T04）<br>AC-024-03（TEST-024-03·integration·M1-T04）<br>AC-024-04（TEST-024-04·adapter-live·M1-T04）|M1-T04, M1-T09, M7-T04|
 |REQ-025|Claude 原生接口|M1|required|v1, v0.1|detailed|AC-025-01（TEST-025-01·integration·M1-T03）<br>AC-025-02（TEST-025-02·integration·M1-T03）<br>AC-025-03（TEST-025-03·integration·M1-T03）<br>AC-025-04（TEST-025-04·adapter-live·M1-T03）|M1-T03, M1-T09, M2-T11, V01-T01, V01-T02, M7-T04|
 |REQ-026|Pi 原生接口|M1|required|v1|detailed|AC-026-01（TEST-026-01·integration·M1-T05）<br>AC-026-02（TEST-026-02·integration·M1-T05）<br>AC-026-03（TEST-026-03·integration·M1-T05）<br>AC-026-04（TEST-026-04·adapter-live·M1-T05）|M1-T05, M1-T09, M7-T04|
-|REQ-027|协议版本与能力|M1|required|v1, v0.1|detailed|AC-027-01（TEST-027-01·integration·M1-T01）<br>AC-027-02（TEST-027-02·integration·M1-T07）<br>AC-027-03（TEST-027-03·integration·M2-T05）<br>AC-027-04（TEST-027-04·integration·M2-T15）|M1-T01, M1-T07, M1-T09, M2-T05, M2-T15, M2-T11, V01-T01, V01-T02, M7-T04|
+|REQ-027|协议版本与能力|M1|required|v1, v0.1|detailed|AC-027-01（TEST-027-01·integration·M1-T01）<br>AC-027-02（TEST-027-02·integration·M1-T07）<br>AC-027-03（TEST-027-03·integration·M2-T07）<br>AC-027-04（TEST-027-04·integration·M2-T15）|M1-T01, M1-T07, M1-T09, M2-T07, M2-T15, M2-T11, V01-T01, V01-T02, M7-T04|
 |REQ-028|项目发现|M3|required|v1|outline|AC-028-01（TEST-028-01·integration·M3-T02）|M3-T01, M3-T02, M3-T05, M7-T04|
 |REQ-029|内置模板|M3|required|v1|outline|AC-029-01（TEST-029-01·unit·M3-T03）|M3-T01, M3-T03, M3-T05, M7-T04|
 |REQ-030|规格收敛|M3|required|v1|outline|AC-030-01（TEST-030-01·integration·M3-T02）|M3-T01, M3-T02, M3-T05, M7-T04|

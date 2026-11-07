@@ -607,9 +607,6 @@ impl Store {
         self.writer.commit(commit).await
     }
 
-    /// Record a Commander proposal, judge it against the state it names, and apply or reject it, all in one
-    /// transaction (REQ-035, docs/adr/ADR-011.md §3). A kind that is not applied yet is refused before anything is
-    /// written.
     /// The project's unfinished attempts (PREPARED, STARTING, RUNNING) with their tasks, process records and
     /// effects as of `now`, for the reconcile at a host's start and the runner's lease expiry (REQ-041 b1, ADR-019
     /// decisions 5 and 7).
@@ -788,6 +785,9 @@ impl Store {
         }
     }
 
+    /// Record a Commander proposal, judge it against the state it names, and apply or reject it, all in one
+    /// transaction (REQ-035, docs/adr/ADR-011.md §3). A kind that is not applied yet is refused before anything is
+    /// written.
     pub async fn decide(
         &self,
         proposal: crate::decision::Proposal,

@@ -409,12 +409,10 @@
     "M2-T12"
    ],
    "requirements": [
-    "REQ-027",
     "REQ-036",
     "REQ-041"
    ],
    "acceptance": [
-    "AC-027-03",
     "AC-036-02",
     "AC-041-01",
     "AC-041-02",
@@ -424,7 +422,7 @@
    "checks": [
     "recovery"
    ],
-   "done_when": "AC-036-02、AC-041-01/02/03/05 通过；recovery 检查脚本落地并产出 test-results.jsonl；AC-027-03（超大帧只让该 attempt FAILED，host 与并行 attempt 继续）通过。"
+   "done_when": "AC-036-02、AC-041-01/02/03/05 通过；recovery 检查脚本落地并产出 test-results.jsonl。（CR-008：AC-027-03 改归 M2-T07；三个适配器的超大帧隔离以不带 TEST id 的适配器层测试作补充证据。）"
   },
   {
    "id": "M2-T19",
@@ -509,12 +507,22 @@
     "M2-T02",
     "M2-T12",
     "M2-T03",
-    "M2-T04"
+    "M2-T04",
+    "M2-T05"
    ],
    "requirements": [
-    "REQ-018"
+    "REQ-018",
+    "REQ-027"
    ],
-   "done_when": "REQ-018 全部 AC 通过；未知配置键被拒绝；hoh.example.toml 与内置默认等价。"
+   "done_when": "REQ-018 全部 AC 与 AC-027-03 通过；未知配置键被拒绝；hoh.example.toml 与内置默认等价；（CR-008）执行循环经角色绑定以产品执行器运行三个适配器，适配器进程经启动门启动（ADR-019 决定 8），TEST-027-03 在 host 内重测：超大帧 attempt FAILED，同 host 并行 attempt SETTLED，host 进程未退出。",
+   "acceptance": [
+    "AC-018-01",
+    "AC-018-02",
+    "AC-018-03",
+    "AC-018-04",
+    "AC-018-05",
+    "AC-027-03"
+   ]
   },
   {
    "id": "M2-T17",

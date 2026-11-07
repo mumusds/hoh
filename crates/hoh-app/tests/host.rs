@@ -1269,10 +1269,43 @@ fn the_product_hooks_do_nothing() {
     }
     let answered = std::panic::catch_unwind(|| NoHostFaults.after_commit());
     assert!(answered.is_ok());
-    // What a product configuration carries.
+    // The points of M2-T05 (ADR-019 decisions 1, 8, 10): every one returns and does nothing (M2T05R-58).
+    use hoh_app::host::RunnerPoint;
+    use hoh_core::persistence::WritePoint;
+    let points = std::panic::catch_unwind(|| {
+        for point in [
+            WritePoint::Begun,
+            WritePoint::StateWritten,
+            WritePoint::EventsWritten,
+            WritePoint::OutboxWritten,
+            WritePoint::Committed,
+        ] {
+            NoFaults.at("Commit", point);
+        }
+        for point in [
+            RunnerPoint::BeforeSend,
+            RunnerPoint::AfterSend,
+            RunnerPoint::AfterAck,
+            RunnerPoint::AfterSpawn,
+            RunnerPoint::AfterEffectStarted,
+            RunnerPoint::AfterEffectCommitted,
+        ] {
+            NoHostFaults.runner(point);
+        }
+        NoHostFaults.announced();
+    });
+    assert!(points.is_ok());
+    // What a product configuration carries: no runner (no executor before M2-T07), the observer that confirms
+    // nothing, the system clock.
     let config = HostConfig::new(Path::new("/project"));
     assert_eq!(format!("{:?}", config.hooks), "NoHostFaults");
     assert_eq!(format!("{:?}", config.store.faults), "NoFaults");
+    assert!(config.runner.is_none());
+    assert_eq!(format!("{:?}", config.reconcile.observer), "NoObserver");
+    let now = std::time::SystemTime::now();
+    let clock = config.clock.0.now();
+    assert!(clock.duration_since(now).unwrap_or_default() < Duration::from_secs(5));
+    assert!(now.duration_since(clock).unwrap_or_default() < Duration::from_secs(5));
 }
 
 /// The openapi schema at `pointer` (a response body), with its references made local: protocol `$defs` and the
