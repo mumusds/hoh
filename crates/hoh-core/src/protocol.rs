@@ -121,11 +121,33 @@ schema_enum!(
     [NeedDecision, BlockedAuth, BlockedCapability, CommanderUnavailable, BudgetUnenforceable, AgentUnavailable, ModelUnavailable,
      CompatUnverified]
 );
+
+impl BlockedReason {
+    /// The name the database and the contracts use.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BlockedReason::NeedDecision => "NEED_DECISION",
+            BlockedReason::BlockedAuth => "BLOCKED_AUTH",
+            BlockedReason::BlockedCapability => "BLOCKED_CAPABILITY",
+            BlockedReason::CommanderUnavailable => "COMMANDER_UNAVAILABLE",
+            BlockedReason::BudgetUnenforceable => "BUDGET_UNENFORCEABLE",
+            BlockedReason::AgentUnavailable => "AGENT_UNAVAILABLE",
+            BlockedReason::ModelUnavailable => "MODEL_UNAVAILABLE",
+            BlockedReason::CompatUnverified => "COMPAT_UNVERIFIED",
+        }
+    }
+
+    /// The reason named `name`, if it is one.
+    pub fn parse(name: &str) -> Option<BlockedReason> {
+        Self::ALL.iter().copied().find(|r| r.as_str() == name)
+    }
+}
 schema_enum!(
     /// `RejectionReason`: decisions.reason_code and rejected messages.
     RejectionReason, "SCREAMING_SNAKE_CASE",
     [StaleRoleEpoch, StaleRevision, StaleLeaseEpoch, SpecMismatch, CandidateMismatch, IllegalTransition, DependencyNotAccepted,
-     BudgetNotReservable, RoleCapabilityMissing, EvidenceGateUnmet, SessionNotIndependent, KeyReuse, LeaseUnavailable]
+     BudgetNotReservable, RoleCapabilityMissing, EvidenceGateUnmet, SessionNotIndependent, KeyReuse, LeaseUnavailable,
+     RetryNotDue]
 );
 schema_enum!(
     /// `ErrorCode`: API errors, CLI stderr codes and attempt failure reasons.
@@ -318,8 +340,10 @@ pub struct TaskResult {
 }
 
 /// `RunResult`: the result object of `--output json` and the payload of the final `run.result` event of
-/// `--output stream-json` (REQ-004). `accepted`/`total` count the requirements of the current specification revision.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `--output stream-json` (REQ-004). `accepted`/`total` count the requirements of the current specification revision;
+/// `remaining_requirements` names the ones not accepted; the cost is known only with a known price and a billed cost
+/// for every attempt (CR-009).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunResult {
     pub run_id: String,
     pub state: RunState,
@@ -334,6 +358,17 @@ pub struct RunResult {
     pub total: u64,
     #[serde(deserialize_with = "crate::integer::deserialize")]
     pub last_event_seq: u64,
+    pub cost_usd: Option<f64>,
+    pub cost_status: CostStatus,
+    pub remaining_requirements: Vec<String>,
+}
+
+/// `RunResult.cost_status` (CR-009): `known` only with a known price and a billed cost for every attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CostStatus {
+    Known,
+    Unknown,
 }
 
 impl RunResult {
@@ -609,3 +644,20 @@ schema_def!(
     RunResult,
     SchedulerSettings
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_blocked_reason_names_itself_as_its_serde_form_does() {
+        for &reason in BlockedReason::ALL {
+            assert_eq!(
+                serde_json::to_value(reason).ok(),
+                Some(serde_json::json!(reason.as_str()))
+            );
+            assert_eq!(BlockedReason::parse(reason.as_str()), Some(reason));
+        }
+        assert_eq!(BlockedReason::parse("need_decision"), None);
+    }
+}

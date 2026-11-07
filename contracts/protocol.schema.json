@@ -950,7 +950,7 @@
       ]
     },
     "RejectionReason": {
-      "description": "decisions.reason_code and Message kind=rejected payload.reason_code (CR-003).",
+      "description": "decisions.reason_code and Message kind=rejected payload.reason_code (CR-003). RETRY_NOT_DUE (CR-009): the task waits for its persisted next_retry_at (REQ-042).",
       "enum": [
         "STALE_ROLE_EPOCH",
         "STALE_REVISION",
@@ -964,7 +964,8 @@
         "EVIDENCE_GATE_UNMET",
         "SESSION_NOT_INDEPENDENT",
         "KEY_REUSE",
-        "LEASE_UNAVAILABLE"
+        "LEASE_UNAVAILABLE",
+        "RETRY_NOT_DUE"
       ]
     },
     "ErrorCode": {
@@ -1326,7 +1327,7 @@
       }
     },
     "RunResult": {
-      "description": "The result of a run that a foreground client waited for, in a state that ends the client (REQ-004, CR-005): the object of `--output json` and the payload of the final persisted `run.result` event of `--output stream-json`. exit_code is that state's code in REQ-004's table. A client that stops waiting (SIGINT 130, SIGTERM 143) or cannot start (host unavailable 69, configuration 78) writes no RunResult (json stdout stays empty). blocked_reason is set exactly when the run is BLOCKED. accepted/total count the requirements of the current specification revision (accepted under it / in it).",
+      "description": "The result of a run that a foreground client waited for, in a state that ends the client (REQ-004, CR-005): the object of `--output json` and the payload of the final persisted `run.result` event of `--output stream-json`. exit_code is that state's code in REQ-004's table. A client that stops waiting (SIGINT 130, SIGTERM 143) or cannot start (host unavailable 69, configuration 78) writes no RunResult (json stdout stays empty). blocked_reason is set exactly when the run is BLOCKED. accepted/total count the requirements of the current specification revision (accepted under it / in it). cost_usd/cost_status (CR-009): the run's cost is known only when the price of its models is known (its run-scope usd budget row has price_known=1) and every attempt of the run has a billed cost (cost_usd their sum, 0 with no attempt); otherwise, an unknown price included, cost_status is unknown and cost_usd null, never an estimate (REQ-042 behaviour 7, failure mode 5). remaining_requirements (CR-009): the ids of the current specification revision's requirements not accepted under it, each once, in ascending order; its length is total − accepted; empty when spec_revision is null (REQ-042 failure mode 3, AC-042-04).",
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -1337,7 +1338,10 @@
         "spec_revision",
         "accepted",
         "total",
-        "last_event_seq"
+        "last_event_seq",
+        "cost_usd",
+        "cost_status",
+        "remaining_requirements"
       ],
       "properties": {
         "run_id": {
@@ -1393,6 +1397,27 @@
         "last_event_seq": {
           "type": "integer",
           "minimum": 0
+        },
+        "cost_usd": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "cost_status": {
+          "enum": [
+            "known",
+            "unknown"
+          ]
+        },
+        "remaining_requirements": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^REQ-[0-9]{3}$"
+          }
         }
       },
       "allOf": [
@@ -1532,6 +1557,29 @@
             "properties": {
               "blocked_reason": {
                 "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "cost_status": {
+                "const": "unknown"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "cost_usd": {
+                "type": "null"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "cost_usd": {
+                "type": "number"
               }
             }
           }
