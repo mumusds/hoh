@@ -771,3 +771,129 @@ async fn test_062_03_redelivery_applies_once_and_a_bad_foreign_key_rolls_back_it
     )?;
     Ok(())
 }
+
+#[tokio::test]
+async fn a_stale_task_result_is_refused_once_and_changes_nothing() -> R {
+    let dir = tempfile::tempdir()?;
+    let (store, db) = open(&dir)?;
+    seed(&db, WORLD)?;
+    let mut stale = developer_result()?;
+    stale.role_epoch = 9;
+    for _ in 0..2 {
+        let outcome = store.accept_task_result(stale.clone()).await?;
+        assert!(
+            matches!(
+                outcome,
+                TaskResultOutcome::Rejected {
+                    reason: RejectionReason::StaleRoleEpoch,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+    }
+    assert_eq!(
+        one(&db, "SELECT state FROM tasks WHERE task_id = 'D'")?,
+        json!("RUNNING")
+    );
+    assert_eq!(
+        one(
+            &db,
+            "SELECT state FROM candidates WHERE candidate_id = 'C2'"
+        )?,
+        json!("FROZEN")
+    );
+    assert_eq!(one(&db, "SELECT count(*) FROM outbox")?, json!(0));
+    assert_eq!(
+        one(
+            &db,
+            "SELECT count(*) FROM events WHERE kind = 'task_result.rejected'"
+        )?,
+        json!(1)
+    );
+    // The older candidate is refused too (from another attempt of the task, so nothing is a replay).
+    seed(
+        &db,
+        "INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision) VALUES ('A2', 'D', 'RUNNING', 1, 1, 1);",
+    )?;
+    let mut old = developer_result()?;
+    old.attempt_id = "A2".to_owned();
+    old.candidate_id = Some("C1".to_owned());
+    let outcome = store.accept_task_result(old).await?;
+    assert!(
+        matches!(
+            outcome,
+            TaskResultOutcome::Rejected {
+                reason: RejectionReason::SpecMismatch,
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(one(&db, "SELECT count(*) FROM outbox")?, json!(0));
+    Ok(())
+}
+
+#[tokio::test]
+async fn only_due_messages_of_served_roles_are_taken_and_settled_ones_never_again() -> R {
+    let dir = tempfile::tempdir()?;
+    let (store, db) = open(&dir)?;
+    seed(&db, WORLD)?;
+    let mut other = to_qa("r1", 3, 1, &sha(2), None)?;
+    other.recipient_role = "researcher".to_owned();
+    enqueue(&store, "two", &[to_qa("q1", 3, 2, &sha(2), None)?, other]).await?;
+    let clock = FakeClock::new();
+    let local = LocalTransport::new(&store, &clock).with("qa", Touch);
+    let dispatcher = Dispatcher {
+        store: &store,
+        clock: &clock,
+        transport: &local,
+        roles: local.roles(),
+        max_attempts: 5,
+        batch: 10,
+    };
+    let tick = dispatcher.tick().await?;
+    assert_eq!(tick.delivered, ["q1"]);
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT message_id, state, attempt_count FROM outbox ORDER BY message_id"
+        )?,
+        [
+            [json!("q1"), json!("ACKED"), json!(1)],
+            [json!("r1"), json!("PENDING"), json!(0)]
+        ]
+    );
+    clock.set(clock.now() + Duration::from_secs(3600));
+    assert_eq!(
+        dispatcher.tick().await?,
+        hoh_core::delivery::Tick::default()
+    );
+    Ok(())
+}
+
+#[test]
+fn a_handoff_without_acceptance_criteria_is_never_queued() -> R {
+    let mut handoff = to_qa("h", 3, 2, &sha(2), Some("C2"))?;
+    handoff.kind = protocol::MessageKind::Handoff;
+    let package = json!({
+        "schema_version": "1.0", "run_id": "R", "task_id": "T", "goal": "verify", "role": "qa", "role_epoch": 2,
+        "spec_sha256": sha(2),
+        "candidate": {"id": "C2", "git_commit": format!("{:040}", 2), "git_tree": format!("{:040}", 12),
+                      "spec_sha256": sha(2), "environment_sha256": sha(3), "test_plan_sha256": sha(4)},
+        "acceptance_ids": ["AC-022-04"], "references": [], "output_contract": "TaskResult", "budget_tokens": 1000,
+        "handoff_kind": "verification", "spec_revision": 2
+    });
+    let Value::Object(mut payload) = package else {
+        return Err("not an object".into());
+    };
+    handoff.payload = payload.clone();
+    assert!(NewOutbox::hcp(0, &handoff).is_ok());
+    payload.insert("acceptance_ids".to_owned(), json!([]));
+    handoff.payload = payload;
+    assert!(matches!(
+        NewOutbox::hcp(0, &handoff),
+        Err(PersistError::IntegrityViolation(_))
+    ));
+    Ok(())
+}
