@@ -16,10 +16,14 @@ mod commands;
 mod decide;
 mod inputs;
 mod leases;
+mod outbox;
 mod plan;
+mod results;
 mod rounds;
 pub use leases::{Grant, LEASE_TTL, LeaseView};
+pub use outbox::{ConsumeEffect, Consumed, OutboxRow, Settlement, backoff};
 pub use plan::Imported;
+pub use results::{TaskResultOutcome, VERIFIERS};
 pub use rounds::{Dispatched, RoundOutcome};
 pub mod location;
 pub mod selftest;
@@ -615,6 +619,95 @@ impl Store {
         context: crate::decision::Context,
     ) -> Result<RoundOutcome, PersistError> {
         self.writer.schedule_round(run_id.to_owned(), context).await
+    }
+
+    /// Take in the Developer's TaskResult (ADR-018 decision 5): `candidate_ready` and one verification handoff each
+    /// for qa and reviewer, or one rejection event; the same result again replays.
+    pub async fn accept_task_result(
+        &self,
+        result: crate::protocol::TaskResult,
+    ) -> Result<TaskResultOutcome, PersistError> {
+        self.writer
+            .outbox(writer::OutboxJob::TaskResult(Box::new(result)))
+            .await
+            .and_then(|done| {
+                done.task_result
+                    .ok_or_else(|| PersistError::Storage("no outcome".to_owned()))
+            })
+    }
+
+    /// Take up to `limit` outbox messages for `roles` due at `now` for delivery (ADR-018 decision 4).
+    pub async fn claim_outbox(
+        &self,
+        now: std::time::SystemTime,
+        roles: Vec<String>,
+        limit: usize,
+    ) -> Result<Vec<OutboxRow>, PersistError> {
+        self.writer
+            .outbox(writer::OutboxJob::Claim(now, roles, limit))
+            .await
+            .map(|done| done.rows)
+    }
+
+    /// Settle a delivery of `message_id` (ADR-018 decision 4); DEAD_LETTER with its event after `max_attempts`.
+    pub async fn settle_outbox(
+        &self,
+        message_id: &str,
+        settlement: Settlement,
+        max_attempts: i64,
+    ) -> Result<(), PersistError> {
+        self.writer
+            .outbox(writer::OutboxJob::Settle(
+                message_id.to_owned(),
+                settlement,
+                max_attempts,
+            ))
+            .await
+            .map(drop)
+    }
+
+    /// Consume `message` as `consumer` once behind its fences, with `effect` if it passes (ADR-018 decisions 1-2).
+    pub async fn consume(
+        &self,
+        consumer: &str,
+        message: crate::protocol::Message,
+        effect: ConsumeEffect,
+        now: std::time::SystemTime,
+    ) -> Result<Consumed, PersistError> {
+        self.writer
+            .outbox(writer::OutboxJob::Consume(Box::new((
+                consumer.to_owned(),
+                message,
+                effect,
+                now,
+            ))))
+            .await
+            .and_then(|done| {
+                done.consumed
+                    .ok_or_else(|| PersistError::Storage("no answer".to_owned()))
+            })
+    }
+
+    /// Record that `consumer` got `message_id`, which is no valid message (ADR-018 decision 3); the event's seq.
+    pub async fn record_invalid_message(
+        &self,
+        consumer: &str,
+        message_id: &str,
+        run_id: Option<&str>,
+        violations: &str,
+    ) -> Result<i64, PersistError> {
+        self.writer
+            .outbox(writer::OutboxJob::Invalid(Box::new((
+                consumer.to_owned(),
+                message_id.to_owned(),
+                run_id.map(str::to_owned),
+                violations.to_owned(),
+            ))))
+            .await
+            .and_then(|done| {
+                done.event_seq
+                    .ok_or_else(|| PersistError::Storage("no event".to_owned()))
+            })
     }
 
     /// Record a native session, or update the row of a resumed one (never a second row for it).

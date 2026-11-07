@@ -340,7 +340,7 @@ pub(super) fn insert_prepared(tx: &Transaction<'_>, a: &NewAttempt) -> Result<()
     Ok(())
 }
 
-fn create(tx: &Transaction<'_>, a: &NewAttempt) -> Result<(), PersistError> {
+pub(super) fn create(tx: &Transaction<'_>, a: &NewAttempt) -> Result<(), PersistError> {
     insert_prepared(tx, a)?;
     event(
         tx,
