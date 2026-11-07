@@ -71,7 +71,8 @@ pub fn verification(v: &Verification, to: &[Recipient]) -> Option<Vec<Message>> 
             let Ok(Value::Object(payload)) = serde_json::to_value(&package) else {
                 return None;
             };
-            let id = format!("{}/verify/{}", v.candidate.id, r.role);
+            // Bounded however long the candidate id is (M2T04R-55, -153).
+            let id = crate::ids::child_id(&v.candidate.id, &format!("verify/{}", r.role));
             Some(Message {
                 schema_version: "1.0".to_owned(),
                 message_id: id.clone(),

@@ -276,7 +276,19 @@ impl Writer {
                             let _ = reply.send(super::pragmas(&conn));
                         }
                         Job::Outbox(job, reply) => {
-                            let _ = reply.send(run_outbox(&mut conn, *job, &after_events));
+                            // A claim is a delivery only if its row reaches the dispatcher: one nobody waits for
+                            // is not run, and one whose answer cannot be handed over is undone (M2T04R-100).
+                            let claim = matches!(*job, OutboxJob::Claim(..));
+                            if !(claim && reply.is_closed()) {
+                                let outcome = run_outbox(&mut conn, *job, &after_events);
+                                if let Err(Ok(done)) = reply.send(outcome)
+                                    && claim
+                                {
+                                    for row in &done.rows {
+                                        let _ = super::outbox::unclaim(&mut conn, row);
+                                    }
+                                }
+                            }
                         }
                         Job::Plan(request, reply) => {
                             let (run_id, plan) = *request;

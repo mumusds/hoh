@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::decision::{Context, Proposal};
+use crate::ids::MAX_ID;
 use crate::persistence::{Options, Store, selftest};
 use crate::protocol::Message;
 use rusqlite::Connection;

@@ -33,38 +33,9 @@ pub enum Decided {
     },
 }
 
-/// Protocol ids are at most 160 characters.
-const MAX_ID: usize = 160;
-
-/// Longest suffix kept as is in a derived id; longer ones are shortened like a long parent.
-const MAX_SUFFIX: usize = 64;
-
-/// `text` if it fits in `max` bytes (`max` > 17), else its first bytes tagged with its FNV-1a hash in exactly `max`.
-fn shorten(text: &str, max: usize) -> String {
-    if text.len() <= max {
-        return text.to_owned();
-    }
-    let hash = text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
-        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
-    });
-    // Room for "~" and the 16 hex digits.
-    let mut cut = max.saturating_sub(17);
-    while !text.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    format!("{}~{hash:016x}", &text[..cut])
-}
-
-/// An id derived from `parent` and `suffix` that stays within [`MAX_ID`] for any input: a long suffix (callers pass
-/// event names) or a long parent is shortened and tagged with its FNV-1a hash; were two ever to collide, the UNIQUE
-/// constraint would fail the transaction rather than merge rows.
+/// See [`crate::ids::child_id`].
 pub(super) fn child_id(parent: &str, suffix: &str) -> String {
-    let id = format!("{parent}/{suffix}");
-    if id.len() <= MAX_ID {
-        return id;
-    }
-    let suffix = shorten(suffix, MAX_SUFFIX);
-    format!("{}/{suffix}", shorten(parent, MAX_ID - 1 - suffix.len()))
+    crate::ids::child_id(parent, suffix)
 }
 
 pub(super) fn to_i64(value: u64, field: &str) -> Result<i64, PersistError> {
@@ -247,6 +218,7 @@ fn applied(
                 recipient_role: role.clone(),
                 role_epoch: to_i64(*role_epoch, "role_epoch")?,
                 payload: json!({
+                    "notice": "runtime",
                     "kind": "dispatch",
                     "decision_id": proposal.decision_id,
                     "task_id": task_id,

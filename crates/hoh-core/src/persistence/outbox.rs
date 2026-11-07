@@ -62,8 +62,9 @@ pub fn backoff(k: i64) -> Duration {
     Duration::from_secs(2_u64.pow(exponent).min(60))
 }
 
-/// Take the next message due at `now` for one of `roles` and start its delivery (ADR-018 decision 4): only rows
-/// that hold an HCP message; one whose deliveries are spent goes to DEAD_LETTER on the way, with its event. The row
+/// Take the next message due at `now` for one of `roles` and start its delivery (ADR-018 decision 4): every row but
+/// the runtime notices (`"notice": "runtime"`: decide's and the round's dispatch, PauseRun's run.control), so a row that
+/// should hold an HCP message and does not is validated and recorded, never skipped (M2T04R-101); one whose deliveries are spent goes to DEAD_LETTER on the way, with its event. The row
 /// returned carries this delivery's generation (its new `attempt_count`).
 pub(super) fn claim_next(
     conn: &mut Connection,
@@ -84,8 +85,7 @@ pub(super) fn claim_next(
                  WHERE ((state = 'PENDING' AND (next_retry_at IS NULL OR next_retry_at <= ?1)) \
                         OR (state = 'DELIVERING' AND next_retry_at <= ?1)) \
                    AND recipient_role IN (SELECT value FROM json_each(?2)) \
-                   AND json_extract(payload_json, '$.schema_version') IS NOT NULL \
-                   AND json_extract(payload_json, '$.message_id') = message_id \
+                   AND json_extract(payload_json, '$.notice') IS NULL \
                  ORDER BY event_seq, message_id LIMIT 1",
                 params![stamp, roles],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
@@ -129,6 +129,18 @@ pub(super) fn claim_next(
             next_retry_at: Some(retry),
         }));
     }
+}
+
+/// Undo the claim of `row` (its dispatcher stopped waiting before the row reached it, M2T04R-100): due again at once,
+/// with the delivery it never had not counted. Only while the row is still at that generation and DELIVERING.
+pub(super) fn unclaim(conn: &mut Connection, row: &OutboxRow) -> Result<(), PersistError> {
+    conn.execute(
+        "UPDATE outbox SET state = 'PENDING', attempt_count = attempt_count - 1, next_retry_at = NULL \
+         WHERE message_id = ?1 AND state = 'DELIVERING' AND attempt_count = ?2",
+        params![row.message_id, row.attempt_count],
+    )
+    .map_err(sqlite_error)?;
+    Ok(())
 }
 
 /// DEAD_LETTER and its `outbox.dead_letter` event, in the caller's transaction.
@@ -206,6 +218,30 @@ pub(super) fn settle(
                 params![message_id],
             )
             .map_err(sqlite_error)?;
+        }
+        // A late answer to a message dead-lettered meanwhile: it was delivered after all (its receipt is committed), so
+        // ACKED, with an event beside the dead letter's (M2T04R-103).
+        Settlement::Delivered if state == "DEAD_LETTER" => {
+            tx.execute(
+                "UPDATE outbox SET state = 'ACKED', next_retry_at = NULL WHERE message_id = ?1",
+                params![message_id],
+            )
+            .map_err(sqlite_error)?;
+            let project_id = project_of(&tx, run_id.as_deref(), message_id)?;
+            writer::write(
+                &tx,
+                &Commit {
+                    events: vec![NewEvent {
+                        project_id,
+                        event_id: child_id(message_id, &format!("delivered-late/{generation}")),
+                        run_id,
+                        kind: "outbox.delivered_late".to_owned(),
+                        payload: json!({"message_id": message_id, "generation": generation, "attempt_count": count}),
+                    }],
+                    ..Commit::default()
+                },
+                after_events,
+            )?;
         }
         Settlement::Failed(error) if current && count < max_attempts => {
             tx.execute(
@@ -499,6 +535,10 @@ pub(super) fn consume(
     }
     // A message whose payload is not valid for its kind, or disagrees with its envelope, is no message to act on (the
     // transport records it as invalid; a caller that consumes directly is refused here too, M2T04R-06).
+    // The whole envelope is a valid Message too: a caller may hand over one it built itself (M2T04R-102).
+    protocol::encode(message).map_err(|e| {
+        PersistError::IntegrityViolation(format!("message {}: {e}", message.message_id))
+    })?;
     message
         .check_payload()
         .map_err(PersistError::IntegrityViolation)?;
