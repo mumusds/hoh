@@ -279,6 +279,37 @@ async fn test_043_05_a_cancel_stays_cancelling_while_the_group_lives_after_sigki
     Ok(())
 }
 
+#[tokio::test]
+async fn a_cancel_is_not_finished_while_an_attempt_still_runs_however_it_is_asked() -> R {
+    // The final transaction runs only once nothing runs (docs/adr/ADR-021.md decision 8f): a FinishCancel that
+    // finds A1 still RUNNING, whoever read the attempts before it, changes nothing and answers Running.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(WORLD)?;
+    store.submit_command(cancel_run(1)).await?;
+    let before = count(&path, "SELECT count(*) FROM events")?;
+    let finished = store
+        .finish_cancel("R", json!({"workspace_sha256": "fake"}), SystemTime::now())
+        .await?;
+    assert_eq!(finished, Finished::Running(1));
+    let states: (String, String, String) = Connection::open(&path)?.query_row(
+        "SELECT r.state, a.state, t.state FROM runs r, attempts a, tasks t \
+         WHERE r.run_id = 'R' AND a.attempt_id = 'A1' AND t.task_id = 'T2'",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    assert_eq!(
+        states,
+        (
+            "CANCEL_REQUESTED".to_owned(),
+            "RUNNING".to_owned(),
+            "READY".to_owned()
+        )
+    );
+    assert_eq!(count(&path, "SELECT count(*) FROM events")?, before);
+    Ok(())
+}
+
 /// A command for R of `kind` to `target` at `revision`, its key `key`.
 fn command(kind: &str, key: &str, revision: i64, target: RunTarget) -> SubmitCommand {
     SubmitCommand {

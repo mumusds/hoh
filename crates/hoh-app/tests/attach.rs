@@ -11,12 +11,64 @@ use hoh_core::persistence::selftest::{PROBE_ARG, ProbeCommand};
 use hoh_core::persistence::{FaultHooks, PersistError};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 type R<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 const HOH: &str = env!("CARGO_BIN_EXE_hoh");
+
+/// How long one `hoh` command of these tests may take: a host start is at most 10 s (ADR-021 decision 2).
+const LIMIT: Duration = Duration::from_secs(30);
+
+/// `child`'s output once it ends; past `limit` it is killed and this is an error, so a command that never ends (an
+/// attach that follows a run it should not have picked) fails its test instead of hanging it.
+fn finish(mut child: Child, limit: Duration) -> R<Output> {
+    fn drain(
+        pipe: Option<impl std::io::Read + Send + 'static>,
+    ) -> std::sync::mpsc::Receiver<Vec<u8>> {
+        let (sent, got) = std::sync::mpsc::channel();
+        if let Some(mut pipe) = pipe {
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                let _ = pipe.read_to_end(&mut bytes);
+                let _ = sent.send(bytes);
+            });
+        } else {
+            let _ = sent.send(Vec::new());
+        }
+        got
+    }
+    let (stdout, stderr) = (drain(child.stdout.take()), drain(child.stderr.take()));
+    let end = Instant::now() + limit;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() > end {
+            let _ = child.kill();
+            let _ = child.wait();
+            let stderr = stderr
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap_or_default();
+            return Err(format!(
+                "still running after {limit:?}; stderr: {}",
+                String::from_utf8_lossy(&stderr)
+            )
+            .into());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let pipe = |got: std::sync::mpsc::Receiver<Vec<u8>>| {
+        got.recv_timeout(Duration::from_secs(5))
+            .map_err(|_| "a pipe stayed open after the command ended")
+    };
+    Ok(Output {
+        status,
+        stdout: pipe(stdout)?,
+        stderr: pipe(stderr)?,
+    })
+}
 
 fn probe() -> ProbeCommand {
     ProbeCommand {
@@ -64,7 +116,12 @@ impl Env {
     }
 
     fn hoh(&self, args: &[&str]) -> R<Output> {
-        Ok(self.command(args).output()?)
+        let child = self
+            .command(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        finish(child, LIMIT)
     }
 }
 
@@ -294,7 +351,7 @@ fn test_005_02_concurrent_attaches_start_exactly_one_host_and_see_the_same_event
         {
             let _ = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
         }
-        let out = client.wait_with_output()?;
+        let out = finish(client, LIMIT)?;
         assert_eq!(
             out.status.code(),
             Some(143),
@@ -341,14 +398,16 @@ async fn test_005_03_an_attach_without_a_tty_lists_two_runs_and_an_unknown_id_is
     )?;
     let runs = query(&env.project(), "SELECT count(*) FROM runs")?;
     let project = env.project();
-    let attach = tokio::task::spawn_blocking(move || {
-        Command::new(HOH)
+    let attach = tokio::task::spawn_blocking(move || -> Result<Output, String> {
+        let child = Command::new(HOH)
             .arg("attach")
             .current_dir(&project)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output()
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        finish(child, LIMIT).map_err(|e| e.to_string())
     });
     // Sampled while it runs: it subscribes to nothing.
     let mut subscribed = 0;
@@ -394,12 +453,16 @@ async fn test_005_05_a_startrun_whose_commit_fails_prints_nothing_and_leaves_no_
     config.store.faults = std::sync::Arc::new(FullDisk);
     let host = Host::start(config).await?;
     let project = env.project();
-    let out = tokio::task::spawn_blocking(move || {
-        Command::new(HOH)
+    let out = tokio::task::spawn_blocking(move || -> Result<Output, String> {
+        let child = Command::new(HOH)
             .args(["-p", "目标", "--detach", "--output", "json"])
             .current_dir(&project)
             .stdin(Stdio::null())
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        finish(child, LIMIT).map_err(|e| e.to_string())
     })
     .await??;
     assert_ne!(out.status.code(), Some(0));
