@@ -843,3 +843,43 @@ async fn a_run_that_starts_running_queues_its_notice_with_its_event_through_ever
     assert_eq!(rows(&path, "SELECT count(*) FROM events")?, [[json!(1)]]);
     Ok(())
 }
+
+#[tokio::test]
+async fn a_commander_dispatch_before_the_tasks_retry_is_refused() -> R {
+    // REQ-042 behaviour 2, CR-009: the decide path reads the task's persisted next_retry_at; while it is ahead of
+    // the decision's time the dispatch is RETRY_NOT_DUE, at it the dispatch goes.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    seed(&path, WORLD)?;
+    seed(
+        &path,
+        "UPDATE tasks SET next_retry_at = '2026-11-07T00:02:00Z', attempt_count = 1 WHERE task_id = 'T1';",
+    )?;
+    let mut commander = FakeCommander {
+        sent: 0,
+        candidate: None,
+    };
+    let at = |text: &str| crate::time::parse_rfc3339(text).ok_or("not a time");
+    let dispatch = json!({"kind": "dispatch", "task_id": "T1", "role": "developer"});
+    let early = Context {
+        now: Some(at("2026-11-07T00:01:59Z")?),
+        ..context()
+    };
+    let decided = store
+        .decide(commander.decide(3, 7, dispatch.clone()), early)
+        .await?;
+    let Decided::Rejected { reason, .. } = decided else {
+        return Err(format!("dispatched before its retry: {decided:?}").into());
+    };
+    assert_eq!(reason, RejectionReason::RetryNotDue);
+    let due = Context {
+        now: Some(at("2026-11-07T00:02:00Z")?),
+        ..context()
+    };
+    let decided = store.decide(commander.decide(3, 7, dispatch), due).await?;
+    assert!(
+        matches!(decided, Decided::Applied { .. }),
+        "at its retry: {decided:?}"
+    );
+    Ok(())
+}
