@@ -52,20 +52,12 @@ fn fnv1a64(sequence: &[String]) -> u64 {
     hash
 }
 
-/// Each round's pick (id, tier, age bonus, score) to HOH_EVIDENCE_DIR, when a check runs the test.
-fn keep_rounds(name: &str, picks: &[Ranked]) {
+/// Each round's board and pick to HOH_EVIDENCE_DIR, when a check runs the test.
+fn keep_rounds(name: &str, trace: &[serde_json::Value]) {
     if let Some(dir) = std::env::var_os("HOH_EVIDENCE_DIR") {
-        let rounds: Vec<serde_json::Value> = picks
-            .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                serde_json::json!({"round": i + 1, "task_id": p.task_id, "sublayer": p.tier.label(),
-                                   "age_bonus": p.age_bonus, "score": p.score.value()})
-            })
-            .collect();
         let _ = std::fs::write(
             std::path::Path::new(&dir).join(name),
-            serde_json::to_vec_pretty(&rounds).unwrap_or_default(),
+            serde_json::to_vec_pretty(trace).unwrap_or_default(),
         );
     }
 }
@@ -130,6 +122,8 @@ struct Rounds {
     board: Vec<Candidate>,
     next_seq: i64,
     round_seq: i64,
+    /// Per round: every task on the board as the round saw it, and the pick (the evidence, M2T03R-153).
+    trace: Vec<serde_json::Value>,
 }
 
 impl Rounds {
@@ -139,6 +133,7 @@ impl Rounds {
             board: vec![first],
             next_seq,
             round_seq: 0,
+            trace: Vec::new(),
         }
     }
 
@@ -152,8 +147,21 @@ impl Rounds {
         for c in &mut self.board {
             c.first_eligible_seq.get_or_insert(self.round_seq);
         }
+        let seen: Vec<serde_json::Value> = rank(params, &self.board)
+            .iter()
+            .zip(std::iter::repeat(&self.board))
+            .map(|(r, board)| {
+                let waited = board
+                    .iter()
+                    .find(|c| c.task_id == r.task_id)
+                    .map_or(0, |c| c.wait_rounds);
+                serde_json::json!({"task_id": r.task_id, "wait_rounds": waited, "age_bonus": r.age_bonus,
+                                   "sublayer": r.tier.label(), "score": r.score.value()})
+            })
+            .collect();
         let round = round(params, &self.board, FREE);
         let selected = round.selected.unwrap_or_else(|| panic!("nothing selected"));
+        self.trace.push(serde_json::json!({"round": self.round_seq, "selected": selected.task_id, "board": seen}));
         for &i in &round.waited {
             self.board[i].wait_rounds += 1;
         }
@@ -178,7 +186,7 @@ fn test_038_04_age_bonus_lets_h_win_round_5_and_never_exceeds_10() {
         }
         picks.push(rounds.run(&params));
     }
-    keep_rounds("test-038-04-rounds.json", &picks);
+    keep_rounds("test-038-04-rounds.json", &rounds.trace);
     let names: Vec<&str> = picks.iter().map(|p| p.task_id.as_str()).collect();
     assert!(names[..4].iter().all(|n| n.starts_with("l-")), "{names:?}");
     let h = &picks[4];
@@ -203,7 +211,7 @@ fn test_038_06_aged_sublayer_selects_h_in_round_21() {
             longest_wait = longest_wait.max(c.wait_rounds);
         }
     }
-    keep_rounds("test-038-06-rounds.json", &picks);
+    keep_rounds("test-038-06-rounds.json", &rounds.trace);
     assert!(
         picks[..20].iter().all(|p| p.task_id.starts_with("l-")),
         "{:?}",

@@ -189,16 +189,18 @@ fn a_cycle_reached_from_outside_starts_at_its_own_smallest_id() {
 }
 
 #[test]
-fn a_long_chain_into_a_cycle_is_named_in_linear_time() {
+fn a_long_chain_into_a_cycle_is_named_without_a_quadratic_walk() {
     // M2T03R-54: the walk to the cycle is long; naming it must not be quadratic in its length.
-    let n = 20_000;
+    // Long enough that a quadratic walk stands out on any machine (M2T03R-152): it took about four times the
+    // acyclic baseline at 20 000 tasks, and the ratio grows with the length.
+    let n = 50_000;
     let mut tasks: Vec<Value> = (0..n)
         .map(|i| {
             let dep = format!("t{:05}", i + 1);
             planned(&format!("t{i:05}"), &[dep.as_str()])
         })
         .collect();
-    tasks.push(planned(&format!("t{n:05}"), &["t19999"]));
+    tasks.push(planned(&format!("t{n:05}"), &["t49999"]));
     let acyclic: Vec<Value> = (0..=n)
         .map(|i| {
             let deps: Vec<String> = if i == n {
@@ -216,9 +218,8 @@ fn a_long_chain_into_a_cycle_is_named_in_linear_time() {
     let started = std::time::Instant::now();
     let error = validate(&plan(tasks), &none(), &none()).expect_err("accepted");
     let elapsed = started.elapsed();
-    assert_eq!(error.details(), json!({"cycle": ["t19999", "t20000"]}));
-    // Compared with an acyclic chain of the same length on the same machine: the quadratic walk took over five times
-    // as long (measured by the reviewer), a linear one about as long.
+    assert_eq!(error.details(), json!({"cycle": ["t49999", "t50000"]}));
+    // Compared with an acyclic chain of the same length on the same machine: a linear walk takes about as long.
     assert!(
         elapsed < baseline * 3 + std::time::Duration::from_millis(50),
         "{elapsed:?} against {baseline:?}"
