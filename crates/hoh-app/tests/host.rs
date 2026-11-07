@@ -187,11 +187,18 @@ fn seed_runs(host: &Host, project: &Path, ids: &[String]) -> R {
     seed_runs_in(project, &host.project_id, ids)
 }
 
-/// CREATED runs `ids` in project `project_id`.
+/// CREATED runs `ids` in project `project_id`, each at work: one task with an attempt running, so a pause waits for
+/// its safe point and the host's loop leaves the run PAUSE_REQUESTED (docs/adr/ADR-021.md decision 7).
 fn seed_runs_in(project: &Path, project_id: &str, ids: &[String]) -> R {
     let script = "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); p=sys.stdin.readline().strip(); \
+                  ids=[l.strip() for l in sys.stdin if l.strip()]; \
+                  c.execute(\"INSERT OR IGNORE INTO specs(spec_id, project_id, sha256, revision) VALUES ('s-seed', ?, printf('%064d', 7), 1)\", (p,)); \
                   c.executemany(\"INSERT INTO runs(run_id, project_id, state, mode, created_at) VALUES (?, ?, 'CREATED', 'AUTO', '2026-11-06T00:00:00Z')\", \
-                  [(l.strip(), p) for l in sys.stdin if l.strip()]); c.commit(); c.close()";
+                  [(i, p) for i in ids]); \
+                  c.executemany(\"INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, created_seq, cost_estimate) VALUES (?, ?, 's-seed', 'RUNNING', 1, 'developer', 1, 1)\", \
+                  [(i + '/t', i) for i in ids]); \
+                  c.executemany(\"INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, started_at) VALUES (?, ?, 'RUNNING', 1, 1, 1, '2026-11-06T00:00:00Z')\", \
+                  [(i + '/a', i + '/t') for i in ids]); c.commit(); c.close()";
     let mut input = format!("{project_id}\n");
     for id in ids {
         input.push_str(id);

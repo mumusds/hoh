@@ -182,14 +182,7 @@ async fn test_043_05_a_cancel_stays_cancelling_while_the_group_lives_after_sigki
     let mut samples = Vec::new();
     loop {
         let step = canceller
-            .step(
-                &store,
-                &reader,
-                "R",
-                &processes,
-                clock.clone(),
-                wait.clone(),
-            )
+            .step(&store, "R", &processes, clock.clone(), wait.clone())
             .await?;
         match step {
             Finished::Running(_) => {
@@ -461,6 +454,92 @@ async fn a_cancel_wins_over_a_pause_and_a_pause_is_refused_while_cancelling_or_e
     assert_eq!(
         run_state(&path)?,
         ("COMPLETED".to_owned(), 3, Some("RUNNING".to_owned()))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_pause_waits_for_its_safe_point_and_withdraws_dispatches_not_yet_taken() -> R {
+    // REQ-043 behaviour 1, failure mode 3 (docs/adr/ADR-021.md decision 7): A1 runs on, uninterrupted, and holds the
+    // pause; T2's dispatch not yet taken is withdrawn (not counted); once A1 ended the run is PAUSED.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(&format!(
+        "{WORLD}
+         UPDATE tasks SET state = 'LEASED', revision = 2 WHERE task_id = 'T2';
+         INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision) VALUES
+           ('A2', 'T2', 'PREPARED', 1, 1, 1);
+         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+           ('p1', 'A2/dispatch', 'R', 'task.dispatched', '{{}}', '2026-11-07T00:00:00Z');
+         INSERT INTO outbox(message_id, event_seq, run_id, recipient_role, payload_json, state) VALUES
+           ('m-A2', (SELECT seq FROM events WHERE event_id = 'A2/dispatch'), 'R', 'developer',
+            '{{\"notice\": \"runtime\", \"kind\": \"dispatch\", \"attempt_id\": \"A2\", \"task_id\": \"T2\"}}', 'PENDING');"
+    ))?;
+    store
+        .submit_command(SubmitCommand {
+            outbox: Some(NewOutbox {
+                payload: json!({"notice": "runtime", "kind": "run.control", "control": "PAUSE_REQUESTED", "run_id": "R"}),
+                ..cancel_run(1).outbox.ok_or("no outbox")?
+            }),
+            ..command("PauseRun", "pause", 1, RunTarget::To(RunState::PauseRequested))
+        })
+        .await?;
+    let at = parse_rfc3339("2026-11-07T00:00:10Z").ok_or("time")?;
+    assert_eq!(
+        store.pause_step("R", at).await?,
+        crate::persistence::PauseStep::Running(1)
+    );
+    let after: (String, String, String, String, String) = Connection::open(&path)?.query_row(
+        "SELECT r.state, a1.state, a2.state, t2.state, o.state FROM runs r, attempts a1, attempts a2, tasks t2, outbox o \
+         WHERE r.run_id = 'R' AND a1.attempt_id = 'A1' AND a2.attempt_id = 'A2' AND t2.task_id = 'T2' \
+         AND o.message_id = 'm-A2'",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+    )?;
+    assert_eq!(
+        after,
+        (
+            "PAUSE_REQUESTED".to_owned(),
+            "RUNNING".to_owned(),
+            "CANCELLED".to_owned(),
+            "READY".to_owned(),
+            "ACKED".to_owned()
+        )
+    );
+    assert_eq!(
+        count(
+            &path,
+            "SELECT attempt_count FROM tasks WHERE task_id = 'T2'"
+        )?,
+        0
+    );
+    Connection::open(&path)?
+        .execute_batch("UPDATE attempts SET state = 'SETTLED', ended_at = '2026-11-07T00:00:12Z' WHERE attempt_id = 'A1';")?;
+    assert_eq!(
+        store.pause_step("R", at).await?,
+        crate::persistence::PauseStep::Paused
+    );
+    assert_eq!(
+        run_state(&path)?,
+        ("PAUSED".to_owned(), 3, Some("RUNNING".to_owned()))
+    );
+    assert_eq!(
+        count(
+            &path,
+            "SELECT count(*) FROM events WHERE kind = 'run.paused'"
+        )?,
+        1
+    );
+    assert_eq!(
+        count(
+            &path,
+            "SELECT count(*) FROM outbox WHERE state = 'PENDING' AND json_extract(payload_json, '$.kind') = 'run.control'"
+        )?,
+        0
+    );
+    assert_eq!(
+        store.pause_step("R", at).await?,
+        crate::persistence::PauseStep::NotPausing
     );
     Ok(())
 }

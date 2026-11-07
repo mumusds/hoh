@@ -24,7 +24,7 @@ mod results;
 mod retry;
 mod rounds;
 mod runner;
-pub use control::{CancelPass, Finished};
+pub use control::{CancelPass, Finished, PauseStep};
 pub use leases::{Grant, LEASE_TTL, LeaseView};
 pub use outbox::{ConsumeEffect, Consumed, OutboxRow, Settlement, backoff};
 pub use plan::Imported;
@@ -837,6 +837,43 @@ impl Store {
         }
     }
 
+    /// The attempts of run `run_id` that start or run, read in the writer's order (a cancel's step, ADR-021
+    /// decision 8).
+    pub async fn running_attempts(&self, run_id: &str) -> Result<Vec<AttemptRow>, PersistError> {
+        match self
+            .writer
+            .control(control::ControlJob::Running(run_id.to_owned()))
+            .await?
+        {
+            control::ControlDone::Running(rows) => Ok(rows),
+            _ => Err(PersistError::IntegrityViolation(
+                "a read of running attempts answered otherwise".to_owned(),
+            )),
+        }
+    }
+
+    /// A pausing run's step (REQ-043 behaviour 1, docs/adr/ADR-021.md decision 7): its dispatches not yet taken are
+    /// withdrawn, and it is PAUSED once none of its attempts starts or runs.
+    pub async fn pause_step(
+        &self,
+        run_id: &str,
+        at: std::time::SystemTime,
+    ) -> Result<PauseStep, PersistError> {
+        match self
+            .writer
+            .control(control::ControlJob::PauseStep {
+                run_id: run_id.to_owned(),
+                at,
+            })
+            .await?
+        {
+            control::ControlDone::Paused(step) => Ok(step),
+            _ => Err(PersistError::IntegrityViolation(
+                "a pause step answered otherwise".to_owned(),
+            )),
+        }
+    }
+
     /// Record one cancel pass over an attempt's processes (REQ-043, docs/adr/ADR-021.md decision 8c): its steps and
     /// how it ended, together; a pass that found the group empty ends the attempt CANCELLED.
     pub async fn cancel_pass(&self, pass: CancelPass) -> Result<i64, PersistError> {
@@ -846,8 +883,8 @@ impl Store {
             .await?
         {
             control::ControlDone::Recorded(seq) => Ok(seq),
-            control::ControlDone::Finished(_) => Err(PersistError::IntegrityViolation(
-                "a cancel pass answered as a finish".to_owned(),
+            _ => Err(PersistError::IntegrityViolation(
+                "a cancel pass answered otherwise".to_owned(),
             )),
         }
     }
@@ -870,8 +907,8 @@ impl Store {
             .await?
         {
             control::ControlDone::Finished(finished) => Ok(finished),
-            control::ControlDone::Recorded(_) => Err(PersistError::IntegrityViolation(
-                "a cancel finish answered as a pass".to_owned(),
+            _ => Err(PersistError::IntegrityViolation(
+                "a cancel finish answered otherwise".to_owned(),
             )),
         }
     }
@@ -1219,25 +1256,7 @@ impl Reader {
 
     /// The attempts of run `run_id` that start or run, oldest first (what a cancel must stop, ADR-021 decision 8).
     pub fn running_attempts(&self, run_id: &str) -> Result<Vec<AttemptRow>, PersistError> {
-        let ids: Vec<String> = {
-            let mut statement = self
-                .conn
-                .prepare(
-                    "SELECT a.attempt_id FROM attempts a JOIN tasks t ON t.task_id = a.task_id WHERE t.run_id = ?1 \
-                     AND a.state IN ('STARTING', 'RUNNING') ORDER BY a.rowid",
-                )
-                .map_err(sqlite_error)?;
-            statement
-                .query_map(rusqlite::params![run_id], |r| r.get(0))
-                .map_err(sqlite_error)?
-                .collect::<Result<_, _>>()
-                .map_err(sqlite_error)?
-        };
-        let mut rows = Vec::with_capacity(ids.len());
-        for id in ids {
-            rows.extend(attempts::read_attempt(&self.conn, &id)?);
-        }
-        Ok(rows)
+        control::running_attempts(&self.conn, run_id)
     }
 
     /// The session `session_id`, if it exists.
