@@ -138,8 +138,11 @@ impl Proposal {
 pub struct Context {
     pub required_capabilities: BTreeMap<String, BTreeSet<String>>,
     pub budget_headroom: Option<u32>,
-    /// The time leases are judged and granted at (`None`: the system clock).
+    /// The time leases are judged and granted and retries come due at (`None`: the system clock).
     pub now: Option<std::time::SystemTime>,
+    /// The wall-clock time absolute deadlines are judged at (`None`: `now`, else the system clock; ADR-020
+    /// decision 4).
+    pub wall: Option<std::time::SystemTime>,
     /// `execution.reader_slots` (REQ-037; `None`: the initial value 2).
     pub reader_slots: Option<u32>,
 }
@@ -150,6 +153,12 @@ impl Context {
 
     pub fn now(&self) -> std::time::SystemTime {
         self.now.unwrap_or_else(std::time::SystemTime::now)
+    }
+
+    pub fn wall(&self) -> std::time::SystemTime {
+        self.wall
+            .or(self.now)
+            .unwrap_or_else(std::time::SystemTime::now)
     }
 
     pub fn reader_slots(&self) -> u32 {
@@ -261,6 +270,9 @@ pub struct Snapshot {
     /// The capabilities the contract of the named task's role requires; `None` when no contract names the role.
     pub required_capabilities: Option<BTreeSet<String>>,
     pub budget_headroom: Option<u32>,
+    /// For a dispatch, why the run's persisted budget lets nothing more be dispatched (a stop, or a cost limit with
+    /// an unknown price), if it does (REQ-042 behaviour 6 and 7; M2T19R-01).
+    pub budget_stop: Option<String>,
     /// For a dispatch, the free slot the named task needs (`writer` or `reader-k`); `None` when it is held (CR-007).
     pub free_slot: Option<String>,
     pub evidence: Evidence,
@@ -473,6 +485,12 @@ fn dispatch(snapshot: &Snapshot, task_id: &str, role: &str) -> Result<Effect, Re
                 missing.join(", "),
                 task.role
             ),
+        );
+    }
+    if let Some(stop) = &snapshot.budget_stop {
+        return reject(
+            BudgetNotReservable,
+            format!("the run's budget dispatches nothing more: {stop}"),
         );
     }
     if let Some(headroom) = snapshot.budget_headroom

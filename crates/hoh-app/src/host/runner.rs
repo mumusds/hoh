@@ -275,19 +275,17 @@ async fn tick(
         *renewed = Instant::now();
     }
     let waiting = store.runner_waiting(&project_id).await?;
-    let context = Context {
-        now: Some(now),
+    // The time taken afresh for each pace and each round, never one from before an awaited step (a settle, the
+    // writer's queue): a round after the deadline dispatches nothing (M2T19R-04).
+    let at = || Context {
+        now: Some(common.clock.now()),
+        wall: Some(common.clock.wall()),
         ..context.clone()
     };
     for run in &waiting.runs {
         // The run as a whole first: woken when a retry is due, parked, blocked or stopped (ADR-020 decisions 4, 5, 7).
-        store.pace_run(run, context.clone()).await?;
-        while store
-            .schedule_round(run, context.clone())
-            .await?
-            .dispatched
-            .is_some()
-        {}
+        store.pace_run(run, at()).await?;
+        while store.schedule_round(run, at()).await?.dispatched.is_some() {}
     }
     for (message_id, _) in &waiting.started {
         store.ack_notice(message_id).await?;
@@ -358,7 +356,10 @@ async fn attempt(
         return Ok(());
     }
     hooks.runner(RunnerPoint::AfterAck);
-    if !store.runner_received(notice.clone()).await? {
+    if !store
+        .runner_received(notice.clone(), common.clock.now())
+        .await?
+    {
         return Ok(());
     }
     let key = work.effect_key.clone();
@@ -428,9 +429,14 @@ async fn attempt(
         .await?;
         return Ok(());
     };
-    // The class goes with the outcome, so a host that crashes after OBSERVED retries it as it would have (ADR-020
-    // decision 1).
-    let mut observed = json!({"success": outcome.success, "detail": outcome.detail});
+    // The class and the time it ended go with the outcome, so a host that crashes after OBSERVED retries it as it would
+    // have, from the time it ended (ADR-020 decision 1, M2T19R-03).
+    let ended = common.clock.now();
+    let mut observed = json!({
+        "success": outcome.success,
+        "detail": outcome.detail,
+        "ended_at": hoh_core::time::rfc3339_utc(ended),
+    });
     if let (Some(observed), Value::Object(class)) =
         (observed.as_object_mut(), outcome.class.to_json())
     {
@@ -486,7 +492,7 @@ async fn attempt(
                 success: outcome.success,
                 detail: outcome.detail.clone(),
                 class: outcome.class,
-                at: common.clock.now(),
+                at: ended,
                 draw: common.jitter.draw(),
             },
         )

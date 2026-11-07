@@ -199,8 +199,14 @@ pub(super) fn accrue_wall(
     Ok(())
 }
 
-/// The run's budget: its run-scope rows and its deadline.
-pub(super) fn load_budget(tx: &Transaction<'_>, run_id: &str) -> Result<Budget, PersistError> {
+/// The run's budget at `now`: its run-scope rows and its deadline, the duration its unfinished attempts have run so
+/// far counted as reserved (M2T19R-02: a running attempt's time counts before it ends; settled into `used` when it
+/// does, so nothing is counted twice).
+pub(super) fn load_budget(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    now: SystemTime,
+) -> Result<Budget, PersistError> {
     let mut budget = Budget::default();
     let deadline: Option<String> = tx
         .query_row(
@@ -247,7 +253,41 @@ pub(super) fn load_budget(tx: &Transaction<'_>, run_id: &str) -> Result<Budget, 
             _ => {}
         }
     }
+    drop(statement);
+    if let Some(wall) = &mut budget.wall_seconds {
+        let mut statement = tx
+            .prepare(
+                "SELECT a.started_at FROM attempts a JOIN tasks t ON t.task_id = a.task_id WHERE t.run_id = ?1 \
+                 AND a.state IN ('STARTING', 'RUNNING') AND a.started_at IS NOT NULL",
+            )
+            .map_err(sqlite_error)?;
+        let started = statement
+            .query_map(params![run_id], |r| r.get::<_, String>(0))
+            .map_err(sqlite_error)?;
+        for at in started {
+            let at = at.map_err(sqlite_error)?;
+            if let Some(since) = crate::time::parse_rfc3339(&at) {
+                wall.reserved += now.duration_since(since).map_or(0, |d| d.as_secs()) as f64;
+            }
+        }
+    }
     Ok(budget)
+}
+
+/// Why run `run_id`'s budget lets nothing more be dispatched at `context`'s time, if it does: a stop (the deadline by
+/// the wall clock) or a cost limit it cannot enforce; one rule for the rounds, the pace and the decide path
+/// (M2T19R-01).
+pub(super) fn budget_stop(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    context: &Context,
+) -> Result<Option<&'static str>, PersistError> {
+    let budget = load_budget(tx, run_id, context.now())?;
+    Ok(if budget::unenforceable(&budget) {
+        Some("max_usd with an unknown price")
+    } else {
+        budget::stop(&budget, context.wall()).map(budget::Stop::as_str)
+    })
 }
 
 /// BlockedReason precedence for a run (protocol.schema.json): BLOCKED_AUTH > COMMANDER_UNAVAILABLE >
@@ -286,6 +326,19 @@ struct TaskRow {
     next_retry_at: Option<String>,
     blocked_reason: Option<String>,
     open: i64,
+}
+
+/// What blocks the run's BLOCKED tasks, by precedence, each once.
+fn blocked_reasons(tasks: &[TaskRow]) -> Vec<BlockedReason> {
+    let mut reasons: Vec<BlockedReason> = tasks
+        .iter()
+        .filter(|t| t.state == TaskState::Blocked)
+        .filter_map(|t| t.blocked_reason.as_deref())
+        .filter_map(BlockedReason::parse)
+        .collect();
+    reasons.sort_by_key(|r| precedence(*r));
+    reasons.dedup();
+    reasons
 }
 
 /// The run's tasks not yet ACCEPTED or CANCELLED, as `run.incomplete` lists them.
@@ -374,7 +427,7 @@ pub(super) fn pace(
                 .as_deref()
                 .is_some_and(|next| next > at.as_str())
     };
-    let budget = load_budget(&tx, run_id)?;
+    let budget = load_budget(&tx, run_id, now)?;
     let mut paced = Paced::default();
     let mut commit = Commit::default();
     let run_cas = |to: RunState| StateCas {
@@ -382,7 +435,7 @@ pub(super) fn pace(
         expected_revision: revision,
         change: Change::Run(to),
     };
-    let stop = budget::stop(&budget, now);
+    let stop = budget::stop(&budget, context.wall());
     let unfinished: i64 = tx
         .query_row(
             "SELECT count(*) FROM attempts a JOIN tasks t ON t.task_id = a.task_id WHERE t.run_id = ?1 \
@@ -417,6 +470,36 @@ pub(super) fn pace(
                 json!({"from": state.as_str(), "to": to.as_str(), "due": tasks.iter().filter(|t| due(t)).map(|t| t.task_id.as_str()).collect::<Vec<_>>()}),
             ));
             paced.woke = true;
+        } else if !tasks.iter().any(waiting) {
+            // Nothing waits any more (its last waiting task was blocked, or moved on): blocked by what blocks its
+            // tasks, else back to work (M2T19R-05).
+            let reasons = blocked_reasons(&tasks);
+            if reasons.is_empty() {
+                let to = resume
+                    .as_deref()
+                    .map(writer::parse::<RunState>)
+                    .transpose()?
+                    .unwrap_or(RunState::Running);
+                commit.cas.push(run_cas(to));
+                commit.events.push(event(
+                    &project_id,
+                    run_id,
+                    child_id(run_id, &format!("resumed/{revision}")),
+                    "run.resumed",
+                    json!({"from": state.as_str(), "to": to.as_str(), "due": []}),
+                ));
+                paced.woke = true;
+            } else {
+                paced.blocked = block_run(&tx, run_id, &blockers, &reasons)?;
+                commit.cas.push(run_cas(RunState::Blocked));
+                commit.events.push(event(
+                    &project_id,
+                    run_id,
+                    child_id(run_id, &format!("blocked/{revision}")),
+                    "run.blocked",
+                    json!({"reasons": paced.blocked.iter().map(|r| r.as_str()).collect::<Vec<_>>(), "detail": "nothing of the run waits any more and no task can move on"}),
+                ));
+            }
         } else {
             return Ok(paced);
         }
@@ -508,14 +591,7 @@ pub(super) fn pace(
                 ));
                 paced.waiting_until = Some(next);
             } else {
-                let mut reasons: Vec<BlockedReason> = tasks
-                    .iter()
-                    .filter(|t| t.state == TaskState::Blocked)
-                    .filter_map(|t| t.blocked_reason.as_deref())
-                    .filter_map(BlockedReason::parse)
-                    .collect();
-                reasons.sort_by_key(|r| precedence(*r));
-                reasons.dedup();
+                let reasons = blocked_reasons(&tasks);
                 if !reasons.is_empty() {
                     // Nothing of the run can move on: it is blocked by what blocks its tasks (ADR-020 decision 5).
                     paced.blocked = block_run(&tx, run_id, &blockers, &reasons)?;

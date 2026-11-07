@@ -699,8 +699,12 @@ impl Store {
 
     /// The runner took `notice`: its receipt, the notice ACKED, the attempt STARTING with its work effect PREPARED;
     /// false when it was taken already or its attempt is no longer PREPARED.
-    pub async fn runner_received(&self, notice: DispatchNotice) -> Result<bool, PersistError> {
-        self.runner_step(runner::RunnerJob::Received(Box::new(notice)))
+    pub async fn runner_received(
+        &self,
+        notice: DispatchNotice,
+        at: std::time::SystemTime,
+    ) -> Result<bool, PersistError> {
+        self.runner_step(runner::RunnerJob::Received(Box::new(notice), at))
             .await
     }
 

@@ -43,8 +43,9 @@ pub struct HostConfig {
     /// The runner, where dispatched work runs; `None` (the product until agents are bound to roles, M2-T07): no
     /// runner, nothing is dispatched by the host (ADR-019 decision 8).
     pub runner: Option<RunnerConfig>,
-    /// The time leases are renewed, expired and granted at: the system clock in the product (tests pass their own,
-    /// CR-006 F2).
+    /// The time leases are renewed, expired and granted and retries come due at: in the product the system time at
+    /// the start moved on monotonically, its wall clock for absolute deadlines (ADR-020 decision 4); tests pass their
+    /// own (CR-006 F2).
     pub clock: HostClock,
     /// The seed of the retries' jitter (REQ-042, ADR-020 decision 2): `None` in the product, drawn from the system at
     /// the start; tests fix it so their delays replay.
@@ -75,7 +76,7 @@ impl HostConfig {
             hooks: Arc::new(NoHostFaults),
             reconcile: ReconcileSettings::default(),
             runner: None,
-            clock: HostClock(Arc::new(hoh_core::delivery::SystemClock)),
+            clock: HostClock(Arc::new(hoh_core::delivery::MonotonicClock::new())),
             jitter_seed: None,
         }
     }

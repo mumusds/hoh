@@ -71,8 +71,7 @@ pub(super) fn round(
     }
     // A budget that stops the run, or a cost limit it cannot enforce, dispatches nothing more (REQ-042 behaviour 6
     // and 7; the pace moves the run on, ADR-020 decision 7).
-    let budget = super::retry::load_budget(&tx, run_id)?;
-    if crate::budget::stop(&budget, now).is_some() || crate::budget::unenforceable(&budget) {
+    if super::retry::budget_stop(&tx, run_id, context)?.is_some() {
         return Ok(RoundOutcome::default());
     }
     let params = parameters(&snapshot)?;

@@ -34,6 +34,9 @@ const CHILD_REMOTE: &str = "HOH_TEST_RECOVERY_REMOTE";
 const CHILD_WORK: &str = "HOH_TEST_RECOVERY_WORK";
 /// A runner point: the child kills itself when an attempt reaches it.
 const CHILD_RUNNER_KILL: &str = "HOH_TEST_RECOVERY_RUNNER_KILL";
+/// The child runs a runner whose every attempt fails with this class: `auth`, or `retry_after:<seconds>` (a 429).
+const CHILD_FAIL_CLASS: &str = "HOH_TEST_RECOVERY_FAIL_CLASS";
+
 /// A file holding the child host's time in milliseconds since the epoch, read at each look: its clock (CR-006 F2: a
 /// clock test code injects; the product uses the system clock).
 const CHILD_CLOCK: &str = "HOH_TEST_RECOVERY_CLOCK";
@@ -193,8 +196,17 @@ fn reaping(child: std::process::Child) -> tokio::sync::oneshot::Receiver<hoh_app
 
 /// [`reaping`] by a slow executor: `delay` between the leader's exit and the SIGKILL to its group.
 fn reaping_after(
+    child: std::process::Child,
+    delay: Duration,
+) -> tokio::sync::oneshot::Receiver<hoh_app::host::Outcome> {
+    reaping_with(child, delay, None)
+}
+
+/// [`reaping_after`], the outcome a failure of `failed`'s class when it is given.
+fn reaping_with(
     mut child: std::process::Child,
     delay: Duration,
+    failed: Option<hoh_core::retry::FailureClass>,
 ) -> tokio::sync::oneshot::Receiver<hoh_app::host::Outcome> {
     let (end, ended) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
@@ -218,13 +230,44 @@ fn reaping_after(
             group_gone = hoh_agents::identity::group_empty(pid);
         }
         let _ = end.send(hoh_app::host::Outcome {
-            success: status.as_ref().is_ok_and(std::process::ExitStatus::success),
+            success: failed.is_none()
+                && status.as_ref().is_ok_and(std::process::ExitStatus::success),
             detail: format!("{status:?}"),
             group_gone,
-            class: hoh_core::retry::FailureClass::Transient { retry_after: None },
+            class: failed.unwrap_or(hoh_core::retry::FailureClass::Transient { retry_after: None }),
         });
     });
     ended
+}
+
+/// Runs each attempt's work as a short process at its gate whose outcome is a failure of `.0`'s class (a 429 with
+/// its Retry-After, a missing authentication).
+#[derive(Debug)]
+struct FailingExecutor(hoh_core::retry::FailureClass);
+
+impl hoh_app::host::Executor for FailingExecutor {
+    fn deliver(
+        &self,
+        _work: &hoh_app::host::Work,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
+        let (answer, ack) = tokio::sync::oneshot::channel();
+        let _ = answer.send(Ok(()));
+        ack
+    }
+
+    fn start(&self, _work: &hoh_app::host::Work) -> Result<hoh_app::host::Started, String> {
+        use std::os::unix::process::CommandExt as _;
+        let mut child = Command::new("sh")
+            .args(["-c", "read -r go; exit 3"])
+            .process_group(0)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        let pid = child.id();
+        let gate = gate(&mut child);
+        let ended = reaping_with(child, Duration::ZERO, Some(self.0));
+        Ok(hoh_app::host::Started { pid, gate, ended })
+    }
 }
 
 /// What is in process group `pgid` now, leader included, as the evidence records it (M2T05R-360): a whole scan of
@@ -337,6 +380,23 @@ fn recovery_host() {
             },
         });
         config.reconcile.observer = Arc::new(Markers(PathBuf::from(work)));
+    }
+    if let Ok(class) = std::env::var(CHILD_FAIL_CLASS) {
+        let class = match class.strip_prefix("retry_after:") {
+            Some(secs) => hoh_core::retry::FailureClass::Transient {
+                retry_after: Some(Duration::from_secs(secs.parse().expect("seconds"))),
+            },
+            None => hoh_core::retry::FailureClass::Auth,
+        };
+        let developer = ["structured_events", "command_exec"].map(str::to_owned);
+        config.runner = Some(hoh_app::host::RunnerConfig {
+            executor: Arc::new(FailingExecutor(class)),
+            context: Context {
+                required_capabilities: [("developer".to_owned(), developer.into_iter().collect())]
+                    .into(),
+                ..Context::default()
+            },
+        });
     }
     if let Some(clock) = std::env::var_os(CHILD_CLOCK) {
         config.clock = hoh_app::host::HostClock(Arc::new(FileClock(PathBuf::from(clock))));
@@ -3029,5 +3089,73 @@ fn test_042_02_a_waiting_run_keeps_its_retry_and_budget_across_a_kill_9() -> R {
                 "SELECT seq, kind, json_extract(payload_json, '$.task_id') FROM events WHERE run_id = 'R' ORDER BY seq")?.trim(),
         }),
     )?;
+    Ok(())
+}
+
+/// M2T19R-51: the host is killed after its attempt's failure was recorded (OBSERVED, then COMMITTED); the host
+/// started again ends the attempt by the class and the end time that record kept, as the runner would have: a 429
+/// waits its Retry-After from the end, counted; a missing authentication blocks at once, with no retry.
+#[test]
+fn a_failure_recorded_before_a_kill_is_retried_by_its_class_after_the_restart() -> R {
+    for (class, want) in [("retry_after:120", "READY"), ("auth", "BLOCKED")] {
+        let dir = tempfile::tempdir()?;
+        let project = dir.path().join("p");
+        std::fs::create_dir_all(&project)?;
+        let (code, stderr) = serve_and_stop(&project)?;
+        assert_eq!(code, 0, "{stderr}");
+        seed(
+            &project,
+            "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s2', :p, printf('%064d', 2), 2);
+             INSERT INTO runs(run_id, project_id, spec_id, state, mode, revision, created_at) VALUES
+               ('R', :p, 's2', 'RUNNING', 'AUTO', 7, '2026-11-07T00:00:00Z');
+             INSERT INTO sessions(session_id, agent, role, agent_version, capabilities_json) VALUES
+               ('sd', 'claude', 'developer', '1', '{\"structured_events\": true, \"command_exec\": true}');
+             INSERT INTO role_bindings(run_id, role, agent, session_id, role_epoch, config_revision, bound_at) VALUES
+               ('R', 'developer', 'claude', 'sd', 2, 1, '2026-11-07T00:00:00Z');
+             INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate) VALUES
+               ('T1', 'R', 's2', 'READY', 1, 'developer', 1, 1, 1);",
+        )?;
+        let mut command = child(&project)?;
+        command
+            .env(CHILD_FAIL_CLASS, class)
+            .env(CHILD_RUNNER_KILL, "AfterEffectCommitted");
+        let (status, stderr) = wait(ChildGuard(command.spawn()?), Duration::from_secs(30))?;
+        assert_eq!(status.signal(), Some(9), "{class}: {stderr}");
+        let db = db(&project);
+        assert_eq!(
+            query(&db, "SELECT state FROM attempts WHERE task_id = 'T1'")?,
+            "RUNNING",
+            "{class}: killed after COMMITTED, before its end"
+        );
+        let (code, stderr) = serve_and_stop(&project)?;
+        assert_eq!(code, 0, "{class}: {stderr}");
+        assert_eq!(
+            query(
+                &db,
+                "SELECT state || ':' || attempt_count FROM tasks WHERE task_id = 'T1'"
+            )?,
+            format!("{want}:1"),
+            "{class}"
+        );
+        let observed = query(
+            &db,
+            "SELECT json_extract(payload_json, '$.detail.ended_at') FROM events WHERE kind = 'effect.observed'",
+        )?;
+        let ended = query(&db, "SELECT ended_at FROM attempts WHERE task_id = 'T1'")?;
+        assert_eq!(ended, observed, "{class}: ended when its work did");
+        let next = query(&db, "SELECT next_retry_at FROM tasks WHERE task_id = 'T1'")?;
+        if want == "READY" {
+            let waited = hoh_core::time::parse_rfc3339(&next)
+                .zip(hoh_core::time::parse_rfc3339(&ended))
+                .and_then(|(n, e)| n.duration_since(e).ok());
+            assert_eq!(waited, Some(Duration::from_secs(120)), "{class}");
+        } else {
+            assert_eq!(next, "", "{class}: no retry");
+            assert_eq!(
+                query(&db, "SELECT blocked_reason FROM tasks WHERE task_id = 'T1'")?,
+                "BLOCKED_AUTH"
+            );
+        }
+    }
     Ok(())
 }

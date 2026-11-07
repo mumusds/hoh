@@ -42,6 +42,8 @@ pub struct UnfinishedRow {
     pub work_outcome: Option<bool>,
     /// How its work failed, as that event recorded it (ADR-020 decision 1), if it did.
     pub work_class: Option<crate::retry::FailureClass>,
+    /// When its work ended, as that event recorded it (M2T19R-03).
+    pub work_ended_at: Option<std::time::SystemTime>,
 }
 
 /// One attempt's disposition as [`ReconcileJob::Apply`] carries it.
@@ -179,9 +181,15 @@ fn scan(
             .optional()
             .map_err(sqlite_error)?;
         let (work_outcome, detail) = recorded.unwrap_or((None, None));
+        let detail = detail.and_then(|d| serde_json::from_str::<Value>(&d).ok());
         let work_class = detail
-            .and_then(|d| serde_json::from_str::<Value>(&d).ok())
-            .and_then(|d| crate::retry::FailureClass::from_json(&d));
+            .as_ref()
+            .and_then(crate::retry::FailureClass::from_json);
+        let work_ended_at = detail.as_ref().and_then(|d| {
+            d.get("ended_at")?
+                .as_str()
+                .and_then(crate::time::parse_rfc3339)
+        });
         rows.push(UnfinishedRow {
             project_id: project_id.to_owned(),
             run_id,
@@ -198,6 +206,7 @@ fn scan(
             lease_epoch,
             work_outcome,
             work_class,
+            work_ended_at,
         });
     }
     Ok(rows)
@@ -287,6 +296,10 @@ fn apply(
         draw,
     } = step;
     let cause = *cause;
+    // An end its work recorded is when it ended: the duration accrued and its retry counted from it, not from this
+    // reconcile, which may come long after (a host down meanwhile, M2T19R-03). Without a record its end is not known
+    // and is taken as now: the duration is counted to now, the conservative side for a budget.
+    let at = &row.work_ended_at.unwrap_or(*at);
     let none: &[EffectMove] = &[];
     let (name, attempt_to, task_to, moves, unknown): (_, _, _, &[EffectMove], &[String]) =
         match disposition {

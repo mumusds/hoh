@@ -448,6 +448,12 @@ fn load_snapshot(
         )?,
         _ => None,
     };
+    let budget_stop = match &task {
+        Some(_) if proposal.kind() == "dispatch" => {
+            super::retry::budget_stop(tx, run_id, context)?.map(str::to_owned)
+        }
+        _ => None,
+    };
     let evidence = if proposal.needs_evidence() {
         load_evidence(tx, run_id, &run)?
     } else {
@@ -460,6 +466,7 @@ fn load_snapshot(
         target,
         required_capabilities,
         budget_headroom: context.budget_headroom,
+        budget_stop,
         free_slot,
         evidence,
     })

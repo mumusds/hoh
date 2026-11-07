@@ -74,6 +74,12 @@ async fn tick(store: &Store, now: SystemTime) -> R<Vec<String>> {
     Ok(dispatched)
 }
 
+/// `at` in milliseconds since the epoch, as the FakeClock log records it (M2T19R-61).
+fn millis_of(at: SystemTime) -> u128 {
+    at.duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis())
+}
+
 fn keep(name: &str, value: &Value) -> R {
     if let Some(dir) = std::env::var_os("HOH_EVIDENCE_DIR") {
         std::fs::write(
@@ -105,7 +111,9 @@ async fn test_042_01_failures_wait_for_their_retry_after_or_jitter_and_only_then
     let mut log = Vec::new();
     let mut snapshots = Vec::new();
     let mut dispatched = tick(&store, clock).await?;
-    log.push(json!({"at": rfc3339_utc(clock), "dispatched": dispatched, "run": run_state(&path)?}));
+    log.push(
+        json!({"at_ms": millis_of(clock), "dispatched": dispatched, "run": run_state(&path)?}),
+    );
     for (n, (status, class)) in script.iter().enumerate() {
         let [attempt] = dispatched.as_slice() else {
             return Err(format!("failure {n}: dispatched {dispatched:?}").into());
@@ -118,7 +126,7 @@ async fn test_042_01_failures_wait_for_their_retry_after_or_jitter_and_only_then
             .into_iter()
             .find(|d| d.attempt_id == attempt)
             .ok_or("no dispatch notice")?;
-        assert!(store.runner_received(notice).await?);
+        assert!(store.runner_received(notice, clock).await?);
         // It fails a second and a bit after its dispatch (the store keeps the second).
         let failed_at = clock + Duration::from_millis(1_300);
         let draw = rng.next_u32();
@@ -176,12 +184,21 @@ async fn test_042_01_failures_wait_for_their_retry_after_or_jitter_and_only_then
                 let none = tick(&store, clock).await?;
                 assert!(none.is_empty(), "failure {n}: dispatched 1 ms early");
                 assert_eq!(run_state(&path)?, "WAITING_EXTERNAL", "failure {n}");
-                log.push(json!({"at_ms_before": rfc3339_utc(next_at), "dispatched": none, "run": run_state(&path)?}));
+                log.push(json!({"at_ms": millis_of(clock), "before_next_retry_at": rfc3339_utc(next_at), "dispatched": none, "run": run_state(&path)?}));
             }
         }
         clock = next_at.max(clock);
         dispatched = tick(&store, clock).await?;
         assert_eq!(dispatched.len(), 1, "failure {n}: at next_retry_at");
+        if next_at > failed_at {
+            // Woken for its due task (the resume names it).
+            let due: String = Connection::open(&path)?.query_row(
+                "SELECT json_extract(payload_json, '$.due') FROM events WHERE kind = 'run.resumed' ORDER BY seq DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(due, "[\"T1\"]", "failure {n}");
+        }
         assert_eq!(run_state(&path)?, "RUNNING", "failure {n}");
         log.push(
             json!({"at": rfc3339_utc(clock), "dispatched": dispatched, "run": run_state(&path)?}),
@@ -278,6 +295,16 @@ async fn test_042_05_repairs_past_their_limits_are_refused_for_a_decision_across
     )?;
     assert_eq!((decisions, dispatches, attempts), (2, 0, 0));
     assert_ne!(task, "ACCEPTED");
+    // Refused for a decision: the task is BLOCKED for one (ADR-020 decision 10, M2T19R-56).
+    let reason: String = Connection::open(&path)?.query_row(
+        "SELECT blocked_reason FROM tasks WHERE task_id = 'T1'",
+        [],
+        |r| r.get(0),
+    )?;
+    assert_eq!(
+        (task.as_str(), reason.as_str()),
+        ("BLOCKED", "NEED_DECISION")
+    );
     // Still refused after another restart: the counts do not reset.
     drop(store);
     let (store, _) = open(&dir)?;
@@ -336,8 +363,8 @@ async fn a_runs_cost_is_known_only_with_a_known_price_and_a_billed_cost_for_ever
 #[tokio::test]
 async fn a_failure_recorded_before_a_crash_is_retried_by_its_recorded_class() -> R {
     // ADR-020 decision 1 and 3: a host killed after its attempt's 429 was recorded (OBSERVED, then COMMITTED) leaves
-    // it RUNNING; the reconcile ends it FAILED and its task waits the recorded Retry-After, counted, as the runner's
-    // own path would have.
+    // it RUNNING; the reconcile, long after, ends it FAILED at the time its work ended (M2T19R-03): its task waits the
+    // recorded Retry-After from then, counted, and only the 5 s it ran join the used duration (M2T19R-55).
     use crate::reconcile::{Disposition, Process};
     let dir = tempfile::tempdir()?;
     let (store, path) = open(&dir)?;
@@ -348,12 +375,13 @@ async fn a_failure_recorded_before_a_crash_is_retried_by_its_recorded_class() ->
          INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, started_at) VALUES
            ('A1', 'T1', 'RUNNING', 1, 1, 1, '2026-11-07T00:00:00Z');
          INSERT INTO effects(effect_key, attempt_id, state) VALUES ('{key}', 'A1', 'COMMITTED');
+         INSERT INTO budgets(scope_kind, scope_id, kind, limit_value) VALUES ('run', 'R', 'wall_seconds', 3600);
          INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
            ('p1', '{key}/effect.observed', 'R', 'effect.observed',
-            '{{\"effect_key\": \"{key}\", \"detail\": {{\"success\": false, \"detail\": \"HTTP 429\", \"class\": \"transient\", \"retry_after_ms\": 120000}}}}',
+            '{{\"effect_key\": \"{key}\", \"detail\": {{\"success\": false, \"detail\": \"HTTP 429\", \"class\": \"transient\", \"retry_after_ms\": 120000, \"ended_at\": \"2026-11-07T00:00:05Z\"}}}}',
             '2026-11-07T00:00:05Z');"
     ))?;
-    let at = at("2026-11-07T00:00:10Z")?;
+    let at = at("2026-11-07T00:02:00Z")?;
     let rows = store.reconcile_scan("p1", at).await?;
     let [row] = rows.as_slice() else {
         return Err(format!("unfinished: {rows:?}").into());
@@ -387,8 +415,14 @@ async fn a_failure_recorded_before_a_crash_is_retried_by_its_recorded_class() ->
     )?;
     assert_eq!(
         (state.as_str(), count, next.as_str()),
-        ("READY", 3, "2026-11-07T00:02:10Z")
+        ("READY", 3, "2026-11-07T00:02:05Z")
     );
+    let (ended, used): (String, f64) = Connection::open(&path)?.query_row(
+        "SELECT a.ended_at, b.used_value FROM attempts a, budgets b WHERE a.attempt_id = 'A1' AND b.kind = 'wall_seconds'",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    assert_eq!((ended.as_str(), used), ("2026-11-07T00:00:05Z", 5.0));
     Ok(())
 }
 
@@ -413,11 +447,8 @@ async fn an_attempts_running_time_is_added_to_its_runs_used_duration_when_it_end
         .into_iter()
         .find(|d| d.attempt_id == attempt)
         .ok_or("no notice")?;
-    assert!(store.runner_received(notice).await?);
-    Connection::open(&path)?.execute(
-        "UPDATE attempts SET started_at = '2026-11-07T00:00:00Z' WHERE attempt_id = ?1",
-        [&attempt],
-    )?;
+    // Its start is taken by the runner's clock (M2T19R-53).
+    assert!(store.runner_received(notice, start).await?);
     store
         .runner_finished(
             &attempt,
@@ -510,6 +541,156 @@ async fn a_task_waiting_for_its_retry_is_skipped_by_the_rounds_of_a_run_still_at
     assert_eq!(
         tick(&store, at("2026-11-07T00:01:00Z")?).await?,
         ["T1/attempt-1"]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_running_attempts_time_counts_against_the_duration_before_it_ends() -> R {
+    // M2T19R-02: with 60 s allowed and an attempt running for 120 s, nothing more is dispatched although nothing has
+    // ended yet; the used duration is settled only when it ends.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(&format!(
+        "{WORLD}
+         INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, created_seq, cost_estimate) VALUES
+           ('T2', 'R', 's1', 'RUNNING', 3, 'developer', 2, 1);
+         INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, started_at) VALUES
+           ('T2/attempt-1', 'T2', 'RUNNING', 1, 1, 1, '2026-11-07T00:00:00Z');
+         INSERT INTO budgets(scope_kind, scope_id, kind, limit_value) VALUES ('run', 'R', 'wall_seconds', 60);"
+    ))?;
+    assert_eq!(
+        tick(&store, at("2026-11-07T00:00:30Z")?).await?.len(),
+        1,
+        "within the duration"
+    );
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(&format!(
+        "{WORLD}
+         INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, created_seq, cost_estimate) VALUES
+           ('T2', 'R', 's1', 'RUNNING', 3, 'developer', 2, 1);
+         INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, started_at) VALUES
+           ('T2/attempt-1', 'T2', 'RUNNING', 1, 1, 1, '2026-11-07T00:00:00Z');
+         INSERT INTO budgets(scope_kind, scope_id, kind, limit_value) VALUES ('run', 'R', 'wall_seconds', 60);"
+    ))?;
+    assert!(
+        tick(&store, at("2026-11-07T00:02:00Z")?).await?.is_empty(),
+        "dispatched past the duration"
+    );
+    assert_eq!(
+        run_state(&path)?,
+        "RUNNING",
+        "INCOMPLETE only once nothing runs"
+    );
+    let used: f64 = Connection::open(&path)?.query_row(
+        "SELECT used_value FROM budgets WHERE kind = 'wall_seconds'",
+        [],
+        |r| r.get(0),
+    )?;
+    assert_eq!(used, 0.0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_parked_run_whose_last_waiting_task_is_blocked_is_blocked() -> R {
+    // M2T19R-05: WAITING_EXTERNAL for T1's retry; T1's fourth local repair is refused, so it is BLOCKED for a decision
+    // and nothing waits any more: the run is BLOCKED (NEED_DECISION), not left waiting for ever.
+    use crate::persistence::{Repair, RepairRequest};
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(&format!(
+        "{WORLD}
+         UPDATE tasks SET attempt_count = 1, next_retry_at = '2026-11-07T00:01:00Z' WHERE task_id = 'T1';"
+    ))?;
+    store
+        .pace_run("R", context(at("2026-11-07T00:00:10Z")?))
+        .await?;
+    assert_eq!(run_state(&path)?, "WAITING_EXTERNAL");
+    let request = || RepairRequest {
+        run_id: "R".to_owned(),
+        task_id: "T1".to_owned(),
+        repair: Repair::Local {
+            fingerprint: "F".to_owned(),
+        },
+        limit: 0,
+        detail: "refused".to_owned(),
+    };
+    store.request_repair(request()).await?;
+    store
+        .pace_run("R", context(at("2026-11-07T00:00:20Z")?))
+        .await?;
+    let (state, reason): (String, String) = Connection::open(&path)?.query_row(
+        "SELECT state, blocked_reason FROM runs WHERE run_id = 'R'",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    assert_eq!(
+        (state.as_str(), reason.as_str()),
+        ("BLOCKED", "NEED_DECISION")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_wait_past_the_deadline_ends_incomplete_at_the_deadline() -> R {
+    // REQ-042 failure mode 4, ADR-020 decision 8 (M2T19R-52): a Retry-After past deadline_at is not waited out: the
+    // run waits until the deadline, then is INCOMPLETE with its tasks listed, nothing dispatched.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(&format!(
+        "{WORLD}
+         UPDATE tasks SET attempt_count = 1, next_retry_at = '2026-11-07T00:10:00Z' WHERE task_id = 'T1';
+         UPDATE runs SET state = 'WAITING_EXTERNAL', resume_state = 'RUNNING', deadline_at = '2026-11-07T00:05:00Z'
+           WHERE run_id = 'R';"
+    ))?;
+    assert!(tick(&store, at("2026-11-07T00:04:59Z")?).await?.is_empty());
+    assert_eq!(run_state(&path)?, "WAITING_EXTERNAL");
+    assert!(tick(&store, at("2026-11-07T00:05:00Z")?).await?.is_empty());
+    assert_eq!(run_state(&path)?, "INCOMPLETE");
+    let (stop, remaining): (String, String) = Connection::open(&path)?.query_row(
+        "SELECT json_extract(payload_json, '$.stop'), json_extract(payload_json, '$.remaining') FROM events \
+         WHERE kind = 'run.incomplete'",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    assert_eq!(
+        (stop.as_str(), remaining.as_str()),
+        ("deadline_at", "[\"T1\"]")
+    );
+    assert_eq!(count(&path, "SELECT count(*) FROM attempts")?, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_blocked_run_is_named_by_its_first_reason_and_waits_behind_a_blocked_dependency() -> R {
+    // The run's blocked_reason follows BlockedReason's precedence (M2T19R-54), and a PENDING task behind a BLOCKED
+    // dependency cannot move the run on (M2T19R-63).
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(&format!(
+        "{WORLD}
+         UPDATE tasks SET state = 'BLOCKED', blocked_reason = 'NEED_DECISION' WHERE task_id = 'T1';
+         INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, created_seq, cost_estimate, blocked_reason) VALUES
+           ('T2', 'R', 's1', 'BLOCKED', 1, 'developer', 2, 1, 'BLOCKED_AUTH'),
+           ('T3', 'R', 's1', 'PENDING', 1, 'developer', 3, 1, NULL);
+         INSERT INTO task_dependencies(task_id, depends_on) VALUES ('T3', 'T1');"
+    ))?;
+    store
+        .pace_run("R", context(at("2026-11-07T00:00:10Z")?))
+        .await?;
+    let (state, reason, set): (String, String, String) = Connection::open(&path)?.query_row(
+        "SELECT state, blocked_reason, blocked_reasons_json FROM runs WHERE run_id = 'R'",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    assert_eq!(
+        (state.as_str(), reason.as_str(), set.as_str()),
+        (
+            "BLOCKED",
+            "BLOCKED_AUTH",
+            "[\"BLOCKED_AUTH\",\"NEED_DECISION\"]"
+        )
     );
     Ok(())
 }

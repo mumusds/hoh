@@ -126,7 +126,8 @@ impl hoh_core::delivery::Clock for FakeClock {
 #[derive(Debug)]
 struct Scripted {
     script: BTreeMap<String, Option<FailureClass>>,
-    started: std::sync::Mutex<Vec<u32>>,
+    /// The groups it started and has not seen empty (only those are killed when it is dropped, M2T19R-60).
+    started: Arc<std::sync::Mutex<Vec<u32>>>,
 }
 
 impl hoh_app::host::Executor for Scripted {
@@ -162,6 +163,7 @@ impl hoh_app::host::Executor for Scripted {
                 .map_err(|e| e.to_string())
         });
         let (end, ended) = tokio::sync::oneshot::channel();
+        let started = self.started.clone();
         std::thread::spawn(move || {
             // The executor's contract: the group SIGKILLed while the leader is an unreaped zombie, the leader reaped,
             // then the group seen empty.
@@ -181,6 +183,9 @@ impl hoh_app::host::Executor for Scripted {
             while !group_gone && Instant::now() < until {
                 std::thread::sleep(Duration::from_millis(10));
                 group_gone = hoh_agents::identity::group_empty(pid);
+            }
+            if group_gone && let Ok(mut started) = started.lock() {
+                started.retain(|&p| p != pid);
             }
             let _ = end.send(hoh_app::host::Outcome {
                 success: failure.is_none()
@@ -328,7 +333,7 @@ async fn test_042_03_auth_and_capability_block_at_once_and_nine_503s_end_in_a_de
             ),
         ]
         .into(),
-        started: std::sync::Mutex::new(Vec::new()),
+        started: Arc::new(std::sync::Mutex::new(Vec::new())),
     });
     let clock = Arc::new(FakeClock::default());
     let host = host_with(&project, BLOCKING_WORLD, executor.clone(), clock.clone()).await?;
@@ -427,7 +432,7 @@ async fn test_042_06_a_cost_limit_with_an_unknown_price_blocks_before_any_dispat
     let project = dir.path().join("p");
     let executor = Arc::new(Scripted {
         script: [("Td".to_owned(), None)].into(),
-        started: std::sync::Mutex::new(Vec::new()),
+        started: Arc::new(std::sync::Mutex::new(Vec::new())),
     });
     let clock = Arc::new(FakeClock::default());
     let host = host_with(&project, COST_WORLD, executor.clone(), clock).await?;
@@ -474,6 +479,26 @@ async fn test_042_06_a_cost_limit_with_an_unknown_price_blocks_before_any_dispat
         cost("Rc")?,
         json!({"cost_usd": null, "cost_status": "unknown"})
     );
+    // Rc's final JSON result (it is BLOCKED, a state that ends a client), encoded against the schema (M2T19R-62):
+    // its cost null and unknown.
+    let (cost_usd, cost_status) = reader.run_cost("Rc")?;
+    let result = hoh_core::protocol::encode(&hoh_core::protocol::RunResult {
+        run_id: "Rc".to_owned(),
+        state: hoh_core::protocol::RunState::Blocked,
+        exit_code: 3,
+        blocked_reason: Some(hoh_core::protocol::BlockedReason::BudgetUnenforceable),
+        spec_revision: Some(1),
+        accepted: 0,
+        total: 0,
+        last_event_seq: query(&db, "SELECT max(seq) FROM events")?.parse()?,
+        cost_usd,
+        cost_status,
+        remaining_requirements: Vec::new(),
+    })?;
+    assert_eq!(
+        (&result["cost_usd"], &result["cost_status"]),
+        (&json!(null), &json!("unknown"))
+    );
     assert_eq!(
         query(&db, "SELECT count(*) FROM runs WHERE state = 'COMPLETED'")?,
         "0"
@@ -484,8 +509,72 @@ async fn test_042_06_a_cost_limit_with_an_unknown_price_blocks_before_any_dispat
             "runs": rows(&db, "SELECT run_id, state, blocked_reason FROM runs ORDER BY run_id")?,
             "attempts": rows(&db, "SELECT attempt_id, task_id, state, cost_usd FROM attempts ORDER BY rowid")?,
             "cost": {"Rc": cost("Rc")?, "Rd": cost("Rd")?},
+            "rc_run_result": result,
         }),
     )?;
+    host.shutdown().await;
+    drop(executor);
+    Ok(())
+}
+
+/// Moves its clock two minutes on when the first pace begins, once.
+#[derive(Debug)]
+struct AdvanceAtPace(Arc<FakeClock>, std::sync::atomic::AtomicBool);
+
+impl hoh_core::persistence::FaultHooks for AdvanceAtPace {
+    fn at(&self, job: &'static str, point: hoh_core::persistence::WritePoint) {
+        if job == "Pace"
+            && point == hoh_core::persistence::WritePoint::Begun
+            && !self.1.swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.0.advance(Duration::from_secs(120));
+        }
+    }
+}
+
+/// M2T19R-04: the run's deadline is a minute ahead when its tick begins; the clock passes it while the pace runs.
+/// The round after it takes the time afresh: nothing is dispatched, and the run ends INCOMPLETE.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_round_after_the_deadline_dispatches_nothing_however_its_tick_began() -> R {
+    let dir = tempfile::tempdir()?;
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    Host::start(config(&project)).await?.shutdown().await;
+    let deadline = hoh_core::time::rfc3339_utc(SystemTime::now() + Duration::from_secs(60));
+    seed(
+        &project,
+        &format!(
+            "{COST_WORLD}
+             DELETE FROM budgets; DELETE FROM tasks WHERE task_id = 'Tc'; DELETE FROM role_bindings WHERE run_id = 'Rc';
+             DELETE FROM runs WHERE run_id = 'Rc';
+             UPDATE runs SET deadline_at = '{deadline}' WHERE run_id = 'Rd';"
+        ),
+    )?;
+    let clock = Arc::new(FakeClock::default());
+    let executor = Arc::new(Scripted {
+        script: [("Td".to_owned(), None)].into(),
+        started: Arc::new(std::sync::Mutex::new(Vec::new())),
+    });
+    let mut config = config(&project);
+    config.clock = hoh_app::host::HostClock(clock.clone());
+    config.store.faults = Arc::new(AdvanceAtPace(
+        clock,
+        std::sync::atomic::AtomicBool::new(false),
+    ));
+    config.runner = Some(hoh_app::host::RunnerConfig {
+        executor: executor.clone(),
+        context: context(),
+    });
+    let host = Host::start(config).await?;
+    let db = db(&project);
+    let end = Instant::now() + Duration::from_secs(20);
+    while query(&db, "SELECT state FROM runs WHERE run_id = 'Rd'")? != "INCOMPLETE" {
+        if Instant::now() > end {
+            return Err("Rd did not end INCOMPLETE".into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(query(&db, "SELECT count(*) FROM attempts")?, "0");
     host.shutdown().await;
     drop(executor);
     Ok(())

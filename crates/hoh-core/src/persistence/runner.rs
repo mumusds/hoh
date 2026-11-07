@@ -44,7 +44,8 @@ pub struct Waiting {
 #[derive(Debug, Clone)]
 pub(super) enum RunnerJob {
     Waiting(String),
-    Received(Box<DispatchNotice>),
+    /// A dispatch taken at this time (the runner's clock: its attempt's start, M2T19R-53).
+    Received(Box<DispatchNotice>, std::time::SystemTime),
     Effect {
         attempt_id: String,
         key: String,
@@ -104,7 +105,9 @@ pub(super) fn run(
 ) -> Result<RunnerDone, PersistError> {
     match job {
         RunnerJob::Waiting(project_id) => waiting(conn, &project_id).map(RunnerDone::Waiting),
-        RunnerJob::Received(notice) => received(conn, &notice, ctx).map(RunnerDone::Applied),
+        RunnerJob::Received(notice, at) => {
+            received(conn, &notice, at, ctx).map(RunnerDone::Applied)
+        }
         RunnerJob::Effect {
             attempt_id,
             key,
@@ -248,6 +251,7 @@ fn event(project_id: &str, run_id: &str, id: String, kind: &str, payload: Value)
 fn received(
     conn: &mut Connection,
     notice: &DispatchNotice,
+    at: std::time::SystemTime,
     ctx: &Ctx<'_>,
 ) -> Result<bool, PersistError> {
     let tx = writer::begin(conn, ctx)?;
@@ -268,7 +272,7 @@ fn received(
     if taken != 1 || prepared.as_deref() != Some(AttemptState::Prepared.as_str()) {
         return Ok(false);
     }
-    let now = crate::time::now_rfc3339();
+    let now = crate::time::rfc3339_utc(at);
     tx.execute(
         "INSERT INTO receipts(consumer, message_id, applied_at, result_json) VALUES (?1, ?2, ?3, ?4)",
         params![
