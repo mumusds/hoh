@@ -128,6 +128,16 @@ pub(super) fn submit(
         ctx,
     )?;
     let (revision, event_seq) = (done.revisions[0], done.event_seqs[0]);
+    // A cancel marks the run's attempts not yet ended in the same transaction: each ends CANCELLED, before any other
+    // disposition (REQ-043 behaviour 3, docs/adr/ADR-021.md decision 8b and 8e).
+    if command.target == RunState::CancelRequested {
+        tx.execute(
+            "UPDATE attempts SET cancel_requested = 1 WHERE state IN ('PREPARED', 'STARTING', 'RUNNING') \
+             AND task_id IN (SELECT task_id FROM tasks WHERE run_id = ?1)",
+            params![command.run_id],
+        )
+        .map_err(sqlite_error)?;
+    }
     // The exact 202 body (openapi submitCommand); a replay returns these bytes.
     let result_json = serde_json::json!({
         "command_id": command.command_id,
