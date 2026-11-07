@@ -303,7 +303,7 @@ fn apply(
     let committed = row.effects.iter().any(|e| {
         e.key == crate::reconcile::work_key(&row.attempt_id) && e.state == EffectState::Committed
     });
-    let at = &row.work_ended_at.filter(|_| committed).unwrap_or(*at);
+    let recorded_end = row.work_ended_at.filter(|_| committed);
     let none: &[EffectMove] = &[];
     let (name, attempt_to, task_to, moves, unknown): (_, _, _, &[EffectMove], &[String]) =
         match disposition {
@@ -330,6 +330,17 @@ fn apply(
             ),
         };
     let tx = writer::begin(conn, ctx)?;
+    // An end taken from this reconcile's time is never before what the attempt's own host life recorded for it,
+    // which a later life's time can be when the wall clock was set back across the restart (M2T19R-200, ADR-020
+    // decision 4). Its retry counts from its end or this reconcile's own time, whichever is earlier, so an earlier
+    // life's lead adds no wait. How far behind the record this reconcile's time is goes into its event.
+    let recorded = super::retry::recorded_until(&tx, &row.attempt_id)?;
+    let ended = recorded_end.unwrap_or_else(|| recorded.map_or(*at, |r| r.max(*at)));
+    let retry_from = ended.min(*at);
+    let behind_ms = recorded
+        .and_then(|r| r.duration_since(*at).ok())
+        .filter(|d| !d.is_zero())
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
     // An attempt left unfinished (redelivered, unreaped) is disposed of again later: each pass its own event ids.
     let pass: i64 = tx
         .query_row(
@@ -369,13 +380,13 @@ fn apply(
                 from: row.state,
                 to,
                 facts: AttemptFacts {
-                    ended_at: Some(crate::time::rfc3339_utc(*at)),
+                    ended_at: Some(crate::time::rfc3339_utc(ended)),
                     ..AttemptFacts::default()
                 },
             },
             ctx,
         )?;
-        super::retry::accrue_wall(&tx, &row.run_id, &row.attempt_id, *at)?;
+        super::retry::accrue_wall(&tx, &row.run_id, &row.attempt_id, ended)?;
     }
     // A failed attempt's task by the retry policy, with the class its work recorded (a process that ended without a
     // record failed in a way nothing classified: transient), as on the runner's own path (ADR-020 decision 3). A
@@ -398,7 +409,7 @@ fn apply(
                 class: row
                     .work_class
                     .unwrap_or(crate::retry::FailureClass::Transient { retry_after: None }),
-                at: *at,
+                at: retry_from,
                 draw: *draw,
             },
         )?;
@@ -429,6 +440,7 @@ fn apply(
             "task": {"from": row.task_state.as_str(), "to": task_to.map(|s| s.as_str())},
             "process": process_json(process),
             "recorded": {"pid": row.pid, "boot_id": row.boot_id, "process_start_id": row.process_start_id},
+            "clock_behind_ms": behind_ms,
             "effects": moves.iter().map(|m| json!({
                 "effect_key": m.key, "from": m.from.as_str(), "to": m.to.as_str(), "external_ref": m.external_ref,
             })).collect::<Vec<_>>(),

@@ -1296,7 +1296,7 @@ fn the_product_hooks_do_nothing() {
     });
     assert!(points.is_ok());
     // What a product configuration carries: no runner (no executor before M2-T07), the observer that confirms
-    // nothing, the system clock.
+    // nothing, the MonotonicClock (anchored at the system time).
     let config = HostConfig::new(Path::new("/project"));
     assert_eq!(format!("{:?}", config.hooks), "NoHostFaults");
     assert_eq!(format!("{:?}", config.store.faults), "NoFaults");
