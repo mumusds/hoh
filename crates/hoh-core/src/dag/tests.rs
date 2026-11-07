@@ -174,3 +174,53 @@ fn a_large_chain_is_linear() {
     assert_eq!(ok.tasks.len(), n);
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
 }
+
+#[test]
+fn a_cycle_reached_from_outside_starts_at_its_own_smallest_id() {
+    // M2T03R-54: from the smallest task left (a, not on the cycle) the walk reaches z -> b -> z; the cycle named is
+    // [b, z], rotated to its smallest id.
+    let tasks = vec![
+        planned("a", &["z"]),
+        planned("z", &["b"]),
+        planned("b", &["z"]),
+    ];
+    let error = validate(&plan(tasks), &none(), &none()).expect_err("accepted");
+    assert_eq!(error.details(), json!({"cycle": ["b", "z"]}));
+}
+
+#[test]
+fn a_long_chain_into_a_cycle_is_named_in_linear_time() {
+    // M2T03R-54: the walk to the cycle is long; naming it must not be quadratic in its length.
+    let n = 20_000;
+    let mut tasks: Vec<Value> = (0..n)
+        .map(|i| {
+            let dep = format!("t{:05}", i + 1);
+            planned(&format!("t{i:05}"), &[dep.as_str()])
+        })
+        .collect();
+    tasks.push(planned(&format!("t{n:05}"), &["t19999"]));
+    let acyclic: Vec<Value> = (0..=n)
+        .map(|i| {
+            let deps: Vec<String> = if i == n {
+                Vec::new()
+            } else {
+                vec![format!("t{:05}", i + 1)]
+            };
+            let deps: Vec<&str> = deps.iter().map(String::as_str).collect();
+            planned(&format!("t{i:05}"), &deps)
+        })
+        .collect();
+    let started = std::time::Instant::now();
+    validate(&plan(acyclic), &none(), &none()).expect("refused");
+    let baseline = started.elapsed();
+    let started = std::time::Instant::now();
+    let error = validate(&plan(tasks), &none(), &none()).expect_err("accepted");
+    let elapsed = started.elapsed();
+    assert_eq!(error.details(), json!({"cycle": ["t19999", "t20000"]}));
+    // Compared with an acyclic chain of the same length on the same machine: the quadratic walk took over five times
+    // as long (measured by the reviewer), a linear one about as long.
+    assert!(
+        elapsed < baseline * 3 + std::time::Duration::from_millis(50),
+        "{elapsed:?} against {baseline:?}"
+    );
+}

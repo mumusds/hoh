@@ -203,11 +203,15 @@ fn kahn<'a>(deps: &BTreeMap<&'a str, BTreeSet<&'a str>>) -> Result<Vec<&'a str>,
     if waiting.is_empty() {
         return Ok(order);
     }
-    // Every task left has a dependency left: from the smallest, follow the smallest one until a task repeats.
+    // Every task left has a dependency left: from the smallest, follow the smallest one until a task repeats; the
+    // tasks from its first visit on are a cycle, named from its smallest id (M2T03R-54: positions are looked up, so
+    // the walk is linear in its length).
     let left: BTreeSet<&str> = waiting.keys().copied().collect();
     let mut path: Vec<&str> = Vec::new();
+    let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
     let mut at = left.first().copied().unwrap_or_default();
-    while !path.contains(&at) {
+    while !seen.contains_key(at) {
+        seen.insert(at, path.len());
         path.push(at);
         at = deps
             .get(at)
@@ -215,9 +219,17 @@ fn kahn<'a>(deps: &BTreeMap<&'a str, BTreeSet<&'a str>>) -> Result<Vec<&'a str>,
             .copied()
             .unwrap_or(at);
     }
-    let start = path.iter().position(|id| *id == at).unwrap_or(0);
+    let mut cycle: Vec<&str> = path[seen.get(at).copied().unwrap_or(0)..].to_vec();
+    if let Some(smallest) = cycle
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, id)| **id)
+        .map(|(i, _)| i)
+    {
+        cycle.rotate_left(smallest);
+    }
     Err(PlanError::Cycle {
-        cycle: path[start..].iter().map(|id| (*id).to_owned()).collect(),
+        cycle: cycle.iter().map(|id| (*id).to_owned()).collect(),
     })
 }
 

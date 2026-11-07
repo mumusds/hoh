@@ -227,3 +227,82 @@ fn a_writer_attempt_starts_only_with_its_writer_lease() -> R {
     )?;
     Ok(())
 }
+
+fn moving_at(attempt: &str, from: AttemptState, to: AttemptState, stamp: &str) -> AttemptJob {
+    let mut facts = AttemptFacts::default();
+    if to == AttemptState::Starting {
+        facts.started_at = Some(stamp.to_owned());
+    } else {
+        facts.ended_at = Some(stamp.to_owned());
+    }
+    AttemptJob::Move(AttemptMove {
+        attempt_id: attempt.to_owned(),
+        from,
+        to,
+        facts,
+    })
+}
+
+/// The instant `secs` written as local time `hours` east (or west) of UTC.
+fn shifted(secs: u64, hours: u64, east: bool) -> String {
+    let offset = Duration::from_secs(hours * 3600);
+    let local = if east {
+        at(secs) + offset
+    } else {
+        at(secs) - offset
+    };
+    let text = crate::time::rfc3339_utc(local);
+    format!(
+        "{}{}{hours:02}:00",
+        &text[..19],
+        if east { '+' } else { '-' }
+    )
+}
+
+#[test]
+fn times_with_offsets_are_judged_as_instants() -> R {
+    // M2T03R-01: granted at 0 s, so the lease expires at 120 s; 121 s written with a -05:00 offset is past it, and an
+    // end written with +05:00 frees the slot at that instant.
+    let dir = tempfile::tempdir()?;
+    let mut conn = world(&dir)?;
+    in_tx(&mut conn, |tx| grant(tx, "p1", "writer", "a-w1", at(0)))?;
+    let late = attempts::apply(
+        &mut conn,
+        &moving_at(
+            "a-w1",
+            AttemptState::Prepared,
+            AttemptState::Starting,
+            &shifted(121, 5, false),
+        ),
+    );
+    assert!(
+        matches!(late, Err(PersistError::LeaseUnavailable(_))),
+        "{late:?}"
+    );
+    attempts::apply(
+        &mut conn,
+        &moving_at(
+            "a-w1",
+            AttemptState::Prepared,
+            AttemptState::Failed,
+            &shifted(5, 5, true),
+        ),
+    )?;
+    let held = in_tx(&mut conn, |tx| held(tx, "p1", at(5)))?;
+    assert_eq!(held[0].expires_at, crate::time::rfc3339_utc(at(5)));
+    // Not a date-time at all: refused, nothing written.
+    let refused = attempts::apply(
+        &mut conn,
+        &moving_at(
+            "a-w2",
+            AttemptState::Prepared,
+            AttemptState::Failed,
+            "yesterday",
+        ),
+    );
+    assert!(
+        matches!(refused, Err(PersistError::IntegrityViolation(_))),
+        "{refused:?}"
+    );
+    Ok(())
+}
