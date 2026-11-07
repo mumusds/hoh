@@ -154,6 +154,11 @@ enum Job {
         Box<super::runner::RunnerJob>,
         oneshot::Sender<Result<super::runner::RunnerDone, PersistError>>,
     ),
+    /// A pause or cancel write ([`super::control`]).
+    Control(
+        Box<super::control::ControlJob>,
+        oneshot::Sender<Result<super::control::ControlDone, PersistError>>,
+    ),
     /// Something to hold until the writer ends (a host's project lock, ADR-016 decision 12).
     Keep(
         Box<dyn std::any::Any + Send>,
@@ -311,6 +316,7 @@ impl Job {
             // A run's pace is a write of its own kind (fault hooks tell it from an attempt's runner writes).
             Job::Runner(job, _) if matches!(**job, super::runner::RunnerJob::Pace { .. }) => "Pace",
             Job::Runner(..) => "Runner",
+            Job::Control(..) => "Control",
             Job::Keep(..) => "Keep",
         }
     }
@@ -429,6 +435,9 @@ impl Writer {
                         }
                         Job::Runner(job, reply) => {
                             answer(&ctx, reply, super::runner::run(&mut conn, *job, &ctx));
+                        }
+                        Job::Control(job, reply) => {
+                            answer(&ctx, reply, super::control::run(&mut conn, *job, &ctx));
                         }
                         Job::Keep(held, reply) => {
                             kept.0.push(held);
@@ -561,6 +570,13 @@ impl Writer {
         job: super::reconcile::ReconcileJob,
     ) -> Result<super::reconcile::ReconcileDone, PersistError> {
         self.submit(|tx| Job::Reconcile(Box::new(job), tx)).await
+    }
+
+    pub(super) async fn control(
+        &self,
+        job: super::control::ControlJob,
+    ) -> Result<super::control::ControlDone, PersistError> {
+        self.submit(|tx| Job::Control(Box::new(job), tx)).await
     }
 
     pub(super) async fn end_attempt(

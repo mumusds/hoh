@@ -118,6 +118,15 @@ pub fn is_working(state: RunState) -> bool {
     WORKING.contains(&state)
 }
 
+/// How a client shows a run's state: CANCEL_REQUESTED as CANCELLING (REQ-043 behaviour 3, docs/03-ux.md), every
+/// other state by its name (docs/adr/ADR-021.md decision 8h).
+pub fn label(state: RunState) -> &'static str {
+    match state {
+        RunState::CancelRequested => "CANCELLING",
+        other => other.as_str(),
+    }
+}
+
 /// Check a run move and return `runs.resume_state` after it (ADR-011 §1): leaving a working state for a suspended
 /// one saves the state left; moving between suspended states keeps it; resuming must return to it and clears it; a
 /// terminal state keeps none.

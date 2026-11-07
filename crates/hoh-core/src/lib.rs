@@ -10,6 +10,8 @@
 
 #[forbid(clippy::disallowed_methods)]
 pub mod budget;
+#[forbid(clippy::disallowed_methods)]
+pub mod cancel;
 #[cfg(hoh_clippy_canary)]
 #[forbid(clippy::disallowed_methods)]
 mod clippy_canary;

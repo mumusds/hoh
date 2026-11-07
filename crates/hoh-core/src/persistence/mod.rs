@@ -13,6 +13,7 @@
 
 mod attempts;
 mod commands;
+mod control;
 mod decide;
 mod inputs;
 mod leases;
@@ -23,6 +24,7 @@ mod results;
 mod retry;
 mod rounds;
 mod runner;
+pub use control::{CancelPass, Finished};
 pub use leases::{Grant, LEASE_TTL, LeaseView};
 pub use outbox::{ConsumeEffect, Consumed, OutboxRow, Settlement, backoff};
 pub use plan::Imported;
@@ -833,6 +835,45 @@ impl Store {
         }
     }
 
+    /// Record one cancel pass over an attempt's processes (REQ-043, docs/adr/ADR-021.md decision 8c): its steps and
+    /// how it ended, together; a pass that found the group empty ends the attempt CANCELLED.
+    pub async fn cancel_pass(&self, pass: CancelPass) -> Result<i64, PersistError> {
+        match self
+            .writer
+            .control(control::ControlJob::CancelPass(pass))
+            .await?
+        {
+            control::ControlDone::Recorded(seq) => Ok(seq),
+            control::ControlDone::Finished(_) => Err(PersistError::IntegrityViolation(
+                "a cancel pass answered as a finish".to_owned(),
+            )),
+        }
+    }
+
+    /// The run's last cancel transaction once none of its attempts starts or runs (ADR-021 decision 8f), with its
+    /// workspace record.
+    pub async fn finish_cancel(
+        &self,
+        run_id: &str,
+        workspace: serde_json::Value,
+        at: std::time::SystemTime,
+    ) -> Result<Finished, PersistError> {
+        match self
+            .writer
+            .control(control::ControlJob::FinishCancel {
+                run_id: run_id.to_owned(),
+                workspace,
+                at,
+            })
+            .await?
+        {
+            control::ControlDone::Finished(finished) => Ok(finished),
+            control::ControlDone::Recorded(_) => Err(PersistError::IntegrityViolation(
+                "a cancel finish answered as a pass".to_owned(),
+            )),
+        }
+    }
+
     async fn reconcile_event(&self, job: reconcile::ReconcileJob) -> Result<i64, PersistError> {
         match self.writer.reconcile(job).await? {
             reconcile::ReconcileDone::Event(seq) => Ok(seq),
@@ -1172,6 +1213,29 @@ impl Reader {
     /// The attempt `attempt_id`, if it exists.
     pub fn attempt(&self, attempt_id: &str) -> Result<Option<AttemptRow>, PersistError> {
         attempts::read_attempt(&self.conn, attempt_id)
+    }
+
+    /// The attempts of run `run_id` that start or run, oldest first (what a cancel must stop, ADR-021 decision 8).
+    pub fn running_attempts(&self, run_id: &str) -> Result<Vec<AttemptRow>, PersistError> {
+        let ids: Vec<String> = {
+            let mut statement = self
+                .conn
+                .prepare(
+                    "SELECT a.attempt_id FROM attempts a JOIN tasks t ON t.task_id = a.task_id WHERE t.run_id = ?1 \
+                     AND a.state IN ('STARTING', 'RUNNING') ORDER BY a.rowid",
+                )
+                .map_err(sqlite_error)?;
+            statement
+                .query_map(rusqlite::params![run_id], |r| r.get(0))
+                .map_err(sqlite_error)?
+                .collect::<Result<_, _>>()
+                .map_err(sqlite_error)?
+        };
+        let mut rows = Vec::with_capacity(ids.len());
+        for id in ids {
+            rows.extend(attempts::read_attempt(&self.conn, &id)?);
+        }
+        Ok(rows)
     }
 
     /// The session `session_id`, if it exists.
