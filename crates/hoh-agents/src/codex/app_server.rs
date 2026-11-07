@@ -444,10 +444,7 @@ impl State<'_> {
                         self.attempt,
                         Starting,
                         Running,
-                        AttemptFacts {
-                            pid: Some(i64::from(self.pid)),
-                            ..AttemptFacts::default()
-                        },
+                        crate::identity::running(self.pid),
                     )
                     .await?;
                     self.running = true;

@@ -132,6 +132,9 @@ pub struct NewAttempt {
 pub struct AttemptFacts {
     pub session_id: Option<String>,
     pub pid: Option<i64>,
+    /// The boot the process runs in and its start time (with `pid`, what names it; REQ-041 b3, ADR-019 decision 4).
+    pub boot_id: Option<String>,
+    pub process_start_id: Option<String>,
     pub started_at: Option<String>,
     pub ended_at: Option<String>,
     pub raw_log_path: Option<String>,
@@ -162,6 +165,8 @@ pub struct AttemptRow {
     pub host_epoch: i64,
     pub config_revision: i64,
     pub pid: Option<i64>,
+    pub boot_id: Option<String>,
+    pub process_start_id: Option<String>,
     pub started_at: Option<String>,
     pub ended_at: Option<String>,
     pub raw_log_path: Option<String>,
@@ -359,7 +364,7 @@ pub(super) fn create(
     )
 }
 
-fn move_attempt(
+pub(super) fn move_attempt(
     tx: &Transaction<'_>,
     m: &AttemptMove,
     ctx: &super::writer::Ctx<'_>,
@@ -402,7 +407,8 @@ fn move_attempt(
              started_at = COALESCE(?4, started_at), ended_at = COALESCE(?5, ended_at), \
              raw_log_path = COALESCE(?6, raw_log_path), resolved_model = COALESCE(?7, resolved_model), \
              failure_reason = COALESCE(?8, failure_reason), cancel_requested = COALESCE(?9, cancel_requested), \
-             usage_json = COALESCE(?10, usage_json), cost_usd = COALESCE(?11, cost_usd) \
+             usage_json = COALESCE(?10, usage_json), cost_usd = COALESCE(?11, cost_usd), \
+             boot_id = COALESCE(?14, boot_id), process_start_id = COALESCE(?15, process_start_id) \
              WHERE attempt_id = ?12 AND state = ?13",
             params![
                 m.to.as_str(),
@@ -417,15 +423,18 @@ fn move_attempt(
                 f.usage.as_ref().map(Value::to_string),
                 f.cost_usd,
                 m.attempt_id,
-                m.from.as_str()
+                m.from.as_str(),
+                f.boot_id,
+                f.process_start_id
             ],
         )
         .map_err(sqlite_error)?;
     if changed != 1 {
         return Err(stale(Some(state)));
     }
-    if m.to.is_terminal() {
-        // Its leases go with it, at its end (REQ-037; the slot is free once it is both ended and expired).
+    if m.to.is_terminal() || m.to == AttemptState::UnknownEffect {
+        // Its leases go with it, at its end (REQ-037; the slot is free once it is both ended and expired). UNKNOWN_EFFECT
+        // is entered once its process is gone, so it ends the holding too (ADR-019 decision 5).
         let at = instant(&m.attempt_id, "ended_at", f.ended_at.as_deref())?;
         leases::release_held_by(tx, &m.attempt_id, &at)?;
     }
@@ -480,18 +489,20 @@ pub(super) fn read_attempt(
             Option<String>,
             Option<f64>,
         ),
+        (Option<String>, Option<String>),
     );
     let raw: Option<Raw> = conn
         .query_row(
             "SELECT attempt_id, task_id, session_id, state, role_epoch, host_epoch, config_revision, pid, started_at, \
-             ended_at, raw_log_path, agent, resolved_model, failure_reason, cancel_requested, usage_json, cost_usd \
-             FROM attempts WHERE attempt_id = ?1",
+             ended_at, raw_log_path, agent, resolved_model, failure_reason, cancel_requested, usage_json, cost_usd, \
+             boot_id, process_start_id FROM attempts WHERE attempt_id = ?1",
             params![attempt_id],
             |r| {
                 Ok((
                     (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?),
                     (r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?),
                     (r.get(12)?, r.get(13)?, r.get(14)?, r.get(15)?, r.get(16)?),
+                    (r.get(17)?, r.get(18)?),
                 ))
             },
         )
@@ -501,6 +512,7 @@ pub(super) fn read_attempt(
         (id, task, session, state, role_epoch, host_epoch, config_revision),
         (pid, started, ended, log, agent),
         (model, failure, cancel, usage, cost),
+        (boot_id, process_start_id),
     )) = raw
     else {
         return Ok(None);
@@ -514,6 +526,8 @@ pub(super) fn read_attempt(
         host_epoch,
         config_revision,
         pid,
+        boot_id,
+        process_start_id,
         started_at: started,
         ended_at: ended,
         raw_log_path: log,

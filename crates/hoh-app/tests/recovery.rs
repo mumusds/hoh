@@ -21,6 +21,10 @@ const CHILD_PROJECT: &str = "HOH_TEST_RECOVERY_PROJECT";
 const CHILD_KILL: &str = "HOH_TEST_RECOVERY_KILL";
 /// A decision Message (JSON) the child submits once its host has started.
 const CHILD_DECIDE: &str = "HOH_TEST_RECOVERY_DECIDE";
+/// The reconcile's stop graces in milliseconds (SIGTERM to SIGKILL, SIGKILL to gone).
+const CHILD_GRACE_MS: &str = "HOH_TEST_RECOVERY_GRACE_MS";
+/// A JSON file `{"available": {marker: ref}, "unavailable": [marker]}`: the FakeRemote the reconcile looks in.
+const CHILD_REMOTE: &str = "HOH_TEST_RECOVERY_REMOTE";
 /// The child's exit code when it submitted its decision and was not killed.
 const NOT_KILLED: i32 = 77;
 
@@ -64,6 +68,51 @@ impl FaultHooks for KillAt {
     }
 }
 
+/// A local fake forge (AC-041-05): pull requests by run marker (the effect key), some markers unreachable. Every call
+/// is appended to `<file>.calls` as `query <marker>` or `create <marker>`; the reconcile only ever queries.
+#[derive(Debug)]
+struct FakeRemote(PathBuf);
+
+impl FakeRemote {
+    fn log(&self, line: &str) {
+        use std::io::Write as _;
+        let mut calls = self.0.clone().into_os_string();
+        calls.push(".calls");
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(calls)
+        {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+}
+
+impl hoh_core::reconcile::Observer for FakeRemote {
+    fn observe(&self, _attempt_id: &str, marker: &str) -> hoh_core::reconcile::Observation {
+        use hoh_core::reconcile::Observation;
+        self.log(&format!("query {marker}"));
+        let remote: Value = std::fs::read_to_string(&self.0)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        if remote["unavailable"]
+            .as_array()
+            .is_some_and(|m| m.iter().any(|x| x == marker))
+        {
+            return Observation::Unavailable {
+                detail: "the forge did not answer".to_owned(),
+            };
+        }
+        match remote["available"][marker].as_str() {
+            Some(pr) => Observation::Found {
+                external_ref: pr.to_owned(),
+            },
+            None => Observation::Absent,
+        }
+    }
+}
+
 fn point_named(name: &str) -> Option<WritePoint> {
     Some(match name {
         "Begun" => WritePoint::Begun,
@@ -90,6 +139,16 @@ fn recovery_host() {
             job: job.to_owned(),
             point: point_named(point).expect("a write point"),
         });
+    }
+    if let Some(ms) = std::env::var(CHILD_GRACE_MS)
+        .ok()
+        .and_then(|ms| ms.parse::<u64>().ok())
+    {
+        config.reconcile.term_grace = Duration::from_millis(ms);
+        config.reconcile.kill_grace = Duration::from_millis(ms.max(2000));
+    }
+    if let Some(remote) = std::env::var_os(CHILD_REMOTE) {
+        config.reconcile.observer = Arc::new(FakeRemote(PathBuf::from(remote)));
     }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -166,7 +225,16 @@ fn announced(project: &Path) -> Option<u64> {
 /// Start a host (no faults, no command), wait until it serves (its own host.json, not one a killed host left), stop
 /// it with SIGTERM: its exit code and stderr.
 fn serve_and_stop(project: &Path) -> R<(i32, String)> {
-    let mut guard = ChildGuard(child(project)?.spawn()?);
+    serve_and_stop_with(project, &[])
+}
+
+/// [`serve_and_stop`] with these child variables.
+fn serve_and_stop_with(project: &Path, env: &[(&str, &std::ffi::OsStr)]) -> R<(i32, String)> {
+    let mut command = child(project)?;
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    let mut guard = ChildGuard(command.spawn()?);
     let own = u64::from(guard.0.id());
     let end = Instant::now() + Duration::from_secs(30);
     while announced(project) != Some(own) {
@@ -369,6 +437,234 @@ fn test_036_02_a_transition_killed_at_any_point_is_all_or_nothing() -> R {
     keep(
         "test-036-02.json",
         &json!({"runs": runs, "count": runs.len()}),
+    )?;
+    Ok(())
+}
+
+/// A helper process unrelated to any attempt that records every catchable signal it gets, one line each, in `log`.
+fn signal_counter(log: &Path) -> R<ChildGuard> {
+    let script = format!(
+        "for s in TERM INT HUP USR1 USR2 QUIT; do trap \"echo $s >> '{}'\" $s; done; while :; do sleep 0.05; done",
+        log.display()
+    );
+    Ok(ChildGuard(
+        Command::new("sh")
+            .args(["-c", &script])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?,
+    ))
+}
+
+/// What reconcile events and attempts AC-041-03 and AC-041-05 read.
+const READ_RECONCILE: &str = r#"
+import json, sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+attempts = {r[0]: r[1] for r in c.execute("SELECT attempt_id, state FROM attempts")}
+events = [{"seq": r[0], "kind": r[1], "payload": json.loads(r[2])} for r in c.execute(
+    "SELECT seq, kind, payload_json FROM events WHERE kind LIKE 'reconcile.%' ORDER BY seq")]
+effects = {r[0]: {"state": r[1], "external_ref": r[2]} for r in c.execute(
+    "SELECT effect_key, state, external_ref FROM effects")}
+tasks = {r[0]: r[1] for r in c.execute("SELECT task_id, state FROM tasks")}
+print(json.dumps({"attempts": attempts, "events": events, "effects": effects, "tasks": tasks}))
+"#;
+
+/// AC-036-02's world with run R RUNNING and two running tasks.
+const RUNNING_WORLD: &str = "
+INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s2', :p, printf('%064d', 2), 2);
+INSERT INTO runs(run_id, project_id, spec_id, state, mode, revision, created_at) VALUES ('R', :p, 's2', 'RUNNING', 'AUTO', 7, '2026-11-07T00:00:00Z');
+INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate) VALUES
+  ('T2', 'R', 's2', 'RUNNING', 3, 'developer', 0, 1, 1), ('T3', 'R', 's2', 'RUNNING', 3, 'developer', 0, 2, 1);
+";
+
+/// AC-041-03: attempt A2 records the pid of a live, unrelated process with this boot but another start time, A3 the
+/// same pid with its start time but another boot. The restarted host's reconcile finds neither is ours, sends no
+/// signal (the helper lives and logged none), records the basis in the reconcile events, and ends both (not RUNNING).
+#[test]
+fn test_041_03_a_reused_pid_or_another_boot_is_not_signalled() -> R {
+    let dir = tempfile::tempdir()?;
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    let (code, stderr) = serve_and_stop(&project)?;
+    assert_eq!(code, 0, "{stderr}");
+    let log = dir.path().join("signals.log");
+    let helper = signal_counter(&log)?;
+    let pid = helper.0.id();
+    let me = hoh_agents::identity::of(pid)?.ok_or("the helper is not running")?;
+    seed(
+        &project,
+        &format!(
+            "{RUNNING_WORLD}
+             INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, pid, boot_id,
+               process_start_id, started_at) VALUES
+               ('A2', 'T2', 'RUNNING', 1, 1, 1, {pid}, '{boot}', '{wrong_start}', '2026-11-07T00:00:00Z'),
+               ('A3', 'T3', 'RUNNING', 1, 1, 1, {pid}, '{other_boot}', '{start}', '2026-11-07T00:00:00Z');",
+            boot = me.boot_id,
+            wrong_start = me.start_id.clone() + "1",
+            other_boot = "00000000-0000-0000-0000-000000000000",
+            start = me.start_id,
+        ),
+    )?;
+    let (code, stderr) = serve_and_stop(&project)?;
+    assert_eq!(code, 0, "the restarted host: {stderr}");
+    let read: Value = serde_json::from_str(&python(&db(&project), READ_RECONCILE, "")?)?;
+    // The helper lives on, the same process, and got no signal.
+    assert_eq!(
+        hoh_agents::identity::start_id(pid)?.as_deref(),
+        Some(me.start_id.as_str())
+    );
+    assert_eq!(std::fs::read_to_string(&log).unwrap_or_default(), "");
+    for (attempt, basis) in [("A2", "start_time_differs"), ("A3", "boot_id_differs")] {
+        let state = read["attempts"][attempt].as_str().unwrap_or_default();
+        assert!(
+            ["SETTLED", "FAILED", "UNKNOWN_EFFECT"].contains(&state),
+            "{attempt}: {state}"
+        );
+        let event = read["events"]
+            .as_array()
+            .and_then(|events| {
+                events.iter().find(|e| {
+                    e["kind"] == "reconcile.attempt" && e["payload"]["attempt_id"] == attempt
+                })
+            })
+            .ok_or("no reconcile event")?;
+        assert_eq!(
+            (
+                &event["payload"]["process"]["found"],
+                &event["payload"]["process"]["basis"],
+                &event["payload"]["process"]["signals"]
+            ),
+            (&json!("gone"), &json!(basis), &json!(0)),
+            "{attempt}: {event}"
+        );
+    }
+    let kinds: Vec<&str> = read["events"]
+        .as_array()
+        .ok_or("no events")?
+        .iter()
+        .filter_map(|e| e["kind"].as_str())
+        .collect();
+    assert_eq!(kinds.first(), Some(&"reconcile.started"));
+    assert_eq!(kinds.last(), Some(&"reconcile.completed"));
+    keep(
+        "test-041-03.json",
+        &json!({"helper": {"pid": pid, "boot_id": me.boot_id, "start_id": me.start_id, "signals": 0}, "read": read}),
+    )?;
+    drop(helper);
+    Ok(())
+}
+
+/// An old host's agent still running when the new host starts (its record names it: pid, boot and start time): the
+/// reconcile stops it (SIGTERM to its group, which it ignores, then SIGKILL) before it disposes of the attempt.
+#[test]
+fn an_old_hosts_live_agent_is_stopped_before_its_attempt_is_disposed_of() -> R {
+    let dir = tempfile::tempdir()?;
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    let (code, stderr) = serve_and_stop(&project)?;
+    assert_eq!(code, 0, "{stderr}");
+    let log = dir.path().join("signals.log");
+    // An orphan leading its own group, as an old host's agent is after a kill -9 (the substrate starts each agent as
+    // a group leader; its parent is gone, so another process reaps it).
+    let script = format!(
+        "setsid sh -c 'trap \"echo TERM >> {}\" TERM; while :; do sleep 0.05; done' </dev/null >/dev/null 2>&1 & echo $!",
+        log.display()
+    );
+    let out = Command::new("sh").args(["-c", &script]).output()?;
+    let pid: u32 = String::from_utf8_lossy(&out.stdout).trim().parse()?;
+    let end = Instant::now() + Duration::from_secs(5);
+    while hoh_agents::process::group_members(pid).is_empty() && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let me = hoh_agents::identity::of(pid)?.ok_or("the agent is not running")?;
+    seed(
+        &project,
+        &format!(
+            "{RUNNING_WORLD}
+             INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, pid, boot_id,
+               process_start_id, started_at) VALUES
+               ('A2', 'T2', 'RUNNING', 1, 1, 1, {pid}, '{boot}', '{start}', '2026-11-07T00:00:00Z');",
+            boot = me.boot_id,
+            start = me.start_id,
+        ),
+    )?;
+    let (code, stderr) = serve_and_stop_with(&project, &[(CHILD_GRACE_MS, "300".as_ref())])?;
+    assert_eq!(code, 0, "the restarted host: {stderr}");
+    let read: Value = serde_json::from_str(&python(&db(&project), READ_RECONCILE, "")?)?;
+    assert_eq!(std::fs::read_to_string(&log)?.trim(), "TERM");
+    let event = read["events"]
+        .as_array()
+        .and_then(|events| events.iter().find(|e| e["kind"] == "reconcile.attempt"))
+        .ok_or("no reconcile event")?;
+    assert_eq!(
+        event["payload"]["process"],
+        json!({"found": "ours", "steps": ["sigterm", "sigkill", "reaped"], "reaped": true})
+    );
+    assert_eq!(read["attempts"]["A2"], json!("FAILED"));
+    assert_eq!(read["tasks"]["T2"], json!("READY"));
+    assert!(hoh_agents::process::group_members(pid).is_empty());
+    Ok(())
+}
+
+/// AC-041-05: effect E (a pull request) STARTED and the FakeRemote already has one with its marker; E2 STARTED and
+/// the FakeRemote cannot be asked. The reconcile commits E with the existing PR as its external ref, makes E2
+/// UNKNOWN and its attempt UNKNOWN_EFFECT with a diagnostic naming E2, and never creates anything.
+#[test]
+fn test_041_05_a_started_effect_is_found_or_unknown_never_done_again() -> R {
+    let dir = tempfile::tempdir()?;
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    let (code, stderr) = serve_and_stop(&project)?;
+    assert_eq!(code, 0, "{stderr}");
+    seed(
+        &project,
+        &format!(
+            "{RUNNING_WORLD}
+             INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, started_at) VALUES
+               ('AE', 'T2', 'RUNNING', 1, 1, 1, '2026-11-07T00:00:00Z'),
+               ('AE2', 'T3', 'RUNNING', 1, 1, 1, '2026-11-07T00:00:00Z');
+             INSERT INTO effects(effect_key, attempt_id, state) VALUES ('pr:R/T2', 'AE', 'STARTED'), ('pr:R/T3', 'AE2', 'STARTED');"
+        ),
+    )?;
+    let remote = dir.path().join("forge.json");
+    std::fs::write(
+        &remote,
+        json!({"available": {"pr:R/T2": "https://forge.invalid/pr/17"}, "unavailable": ["pr:R/T3"]}).to_string(),
+    )?;
+    let (code, stderr) = serve_and_stop_with(&project, &[(CHILD_REMOTE, remote.as_os_str())])?;
+    assert_eq!(code, 0, "the restarted host: {stderr}");
+    let read: Value = serde_json::from_str(&python(&db(&project), READ_RECONCILE, "")?)?;
+    let e = &read["effects"]["pr:R/T2"];
+    assert!(
+        ["OBSERVED", "COMMITTED"].contains(&e["state"].as_str().unwrap_or_default()),
+        "{e}"
+    );
+    assert_eq!(e["external_ref"], json!("https://forge.invalid/pr/17"));
+    assert_eq!(read["effects"]["pr:R/T3"]["state"], json!("UNKNOWN"));
+    assert_eq!(read["attempts"]["AE2"], json!("UNKNOWN_EFFECT"));
+    // No new attempt for its task, which stays where it was.
+    assert_eq!(read["tasks"]["T3"], json!("RUNNING"));
+    let diagnostic = read["events"]
+        .as_array()
+        .and_then(|events| {
+            events.iter().find(|e| {
+                e["kind"] == "reconcile.diagnostic"
+                    && e["payload"]["effect_keys"]
+                        .as_array()
+                        .is_some_and(|k| k.iter().any(|x| x == "pr:R/T3"))
+            })
+        })
+        .ok_or("no diagnostic naming E2")?;
+    assert_eq!(diagnostic["payload"]["code"], json!("UNKNOWN_EFFECT"));
+    let calls = std::fs::read_to_string(dir.path().join("forge.json.calls"))?;
+    let mut lines: Vec<&str> = calls.lines().collect();
+    lines.sort_unstable();
+    assert_eq!(lines, ["query pr:R/T2", "query pr:R/T3"]);
+    assert_eq!(lines.iter().filter(|l| l.starts_with("create")).count(), 0);
+    keep(
+        "test-041-05.json",
+        &json!({"read": read, "forge_calls": lines}),
     )?;
     Ok(())
 }

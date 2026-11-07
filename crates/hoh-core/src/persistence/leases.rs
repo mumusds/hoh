@@ -2,7 +2,8 @@
 //! `reader-1`…), kept for good. Each grant adds 1 to the slot's epoch through a compare-and-set on the epoch it read,
 //! so epochs rise strictly and a holder fenced out by a newer grant can tell (STALE_LEASE_EPOCH).
 //!
-//! A lease is held while it is unexpired or while its holder attempt has not ended (SETTLED, FAILED or CANCELLED):
+//! A lease is held while it is unexpired or while its holder attempt has not ended (SETTLED, FAILED, CANCELLED, or
+//! UNKNOWN_EFFECT, entered only once its process is gone; ADR-019 decision 5):
 //! expiry alone never frees a slot, because the old process may still run (REQ-037 b7: confirm the previous holder
 //! ended or was fenced before a new grant; the reap sequence is M2-T05's). Releasing is ending the holder and
 //! expiring the lease in the same transaction. Every function runs inside the caller's transaction.
@@ -34,8 +35,9 @@ pub struct LeaseView {
     pub effective: bool,
 }
 
-/// The holder's attempt states that end it.
-const ENDED: &str = "('SETTLED','FAILED','CANCELLED')";
+/// The holder's attempt states that end it: UNKNOWN_EFFECT too, whose process is gone (what is unknown is an effect,
+/// not a writer still running; ADR-019 decision 5 amends ADR-017 decision 4).
+const ENDED: &str = "('SETTLED','FAILED','CANCELLED','UNKNOWN_EFFECT')";
 
 struct Row {
     attempt_id: String,
