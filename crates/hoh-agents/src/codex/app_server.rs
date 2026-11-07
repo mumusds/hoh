@@ -876,6 +876,7 @@ pub(super) async fn run(
         unknown_events: s.counters.get("unknown").copied().unwrap_or(0),
         degraded: None,
         pid: Some(s.pid),
+        max_buffered: report.as_ref().map(|r| r.stdout.max_buffered),
         steps: report.map(|r| r.steps).unwrap_or_default(),
     })))
 }

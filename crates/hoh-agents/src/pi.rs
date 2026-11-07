@@ -249,6 +249,9 @@ pub struct Outcome {
     pub stderr_sha256: String,
     pub pid: Option<u32>,
     pub steps: Vec<Step>,
+    /// The most stdout bytes the frame reader held at once (AC-027-03's probe; at most the frame limit and one read
+    /// chunk); `None` when no process was read.
+    pub max_buffered: Option<usize>,
 }
 
 /// What a command of ours was.
@@ -311,6 +314,7 @@ pub async fn run(
         stderr_sha256: String::new(),
         pid: None,
         steps: Vec::new(),
+        max_buffered: None,
     };
     // Nothing starts without its capability, in a directory that would block pi, or to resume a session that has no
     // file at all.
@@ -935,6 +939,7 @@ pub async fn run(
         stdout,
         stderr,
         pid: Some(pid),
+        max_buffered: report.as_ref().map(|r| r.stdout.max_buffered),
         steps: report.map(|r| r.steps).unwrap_or_default(),
     })
 }

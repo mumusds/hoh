@@ -1328,3 +1328,55 @@ async fn test_027_02_pi_keeps_an_unregistered_record_once_and_ends_as_without_it
     );
     Ok(())
 }
+
+/// AC-027-03 (pi): a pi whose frames after its first are one 8 MiB line with no LF, while another attempt runs the
+/// recorded RPC turn beside it on the same store. The reader never holds more than the limit and one read chunk; only
+/// the oversized attempt fails (PROTOCOL_FRAME_TOO_LARGE, its diagnosis with the length, the prefix sha256 and the
+/// first 4 KiB); the other settles, and the store's writer goes on (ADR-019 decision 9).
+#[tokio::test]
+async fn test_027_03_pi_an_8_mib_line_fails_only_its_own_attempt() -> R {
+    let world = World::new()?;
+    let d = world.dir.path().join("huge");
+    std::fs::create_dir_all(&d)?;
+    let huge = d.join("pi");
+    std::fs::write(
+        &huge,
+        "#!/bin/bash\nprintf '%s\\n' '{\"type\":\"agent_start\"}'\nhead -c 8388608 /dev/zero | tr '\\0' x\n\
+         while true; do sleep 0.1; done\n",
+    )?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&huge, std::fs::Permissions::from_mode(0o755))?;
+    let normal = world.fake("normal", &Case::load("rpc-prompt")?)?;
+    let oversized = world.attempt("A1").await?;
+    let beside = world.attempt("A2").await?;
+    let big = world.turn(&huge, "logs/huge")?;
+    let small = world.turn(&normal, "logs/normal")?;
+    let (big, small) = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(run(&world, &oversized, &big), run(&world, &beside, &small))
+    })
+    .await?;
+    let (big, small) = (big?, small?);
+    let limit = 1_048_576 + 65_536;
+    assert!(
+        big.max_buffered.is_some_and(|n| n <= limit),
+        "{:?}",
+        big.max_buffered
+    );
+    assert_eq!(
+        (big.state, big.failure.as_deref()),
+        (AttemptState::Failed, Some("PROTOCOL_FRAME_TOO_LARGE"))
+    );
+    let diagnosis = events(&world, "adapter.diagnostic")?
+        .into_iter()
+        .find(|d| d["reason"] == "PROTOCOL_FRAME_TOO_LARGE")
+        .ok_or("no diagnosis")?;
+    assert!(diagnosis["length"].as_u64().is_some_and(|n| n > 1 << 20));
+    assert_eq!(diagnosis["prefix_sha256"].as_str().map(str::len), Some(64));
+    assert_eq!(diagnosis["head"].as_str().map(str::len), Some(4096));
+    assert_eq!(
+        (small.state, small.failure.as_deref()),
+        (AttemptState::Settled, None)
+    );
+    assert!(world.store.writer_alive());
+    Ok(())
+}

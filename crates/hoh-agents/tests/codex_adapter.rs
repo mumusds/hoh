@@ -2055,3 +2055,56 @@ async fn a_frame_too_large_fails_the_turn_with_its_diagnosis() -> R {
     assert_eq!(exec_diagnosis["head"].as_str().map(str::len), Some(4 << 10));
     Ok(())
 }
+
+/// AC-027-03 (codex): an exec turn writes its normal frames, then one 8 MiB line with no LF, while another attempt
+/// runs a normal App Server turn beside it on the same store. The reader never holds more than the limit and one read
+/// chunk; only the oversized attempt fails (PROTOCOL_FRAME_TOO_LARGE, its diagnosis with the length, the prefix
+/// sha256 and the first 4 KiB); the other settles, and the store's writer goes on (ADR-019 decision 9).
+#[tokio::test]
+async fn test_027_03_codex_an_8_mib_line_fails_only_its_own_attempt() -> R {
+    let world = World::new()?;
+    let huge = world.fake("huge", None, "exec", false)?;
+    std::fs::write(
+        huge.parent().ok_or("no dir")?.join("exec.9999"),
+        "x".repeat(8 << 20),
+    )?;
+    let normal = world.fake(
+        "normal",
+        Some(&Case::load("app-server-turn")?),
+        "exec",
+        false,
+    )?;
+    let oversized = world.attempt("A1").await?;
+    let beside = world.attempt("A2").await?;
+    let mut big = world.turn(&huge, "logs/huge")?;
+    big.launch.app_server_help = None;
+    let small = world.turn(&normal, "logs/normal")?;
+    let (big, small) = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(run(&world, &oversized, &big), run(&world, &beside, &small))
+    })
+    .await?;
+    let (big, small) = (big?, small?);
+    let limit = 1_048_576 + 65_536;
+    assert!(
+        big.max_buffered.is_some_and(|n| n <= limit),
+        "{:?}",
+        big.max_buffered
+    );
+    assert_eq!(
+        (big.state, big.failure.as_deref()),
+        (AttemptState::Failed, Some("PROTOCOL_FRAME_TOO_LARGE"))
+    );
+    let diagnosis = events(&world, "adapter.diagnostic")?
+        .into_iter()
+        .find(|d| d["reason"] == "PROTOCOL_FRAME_TOO_LARGE")
+        .ok_or("no diagnosis")?;
+    assert!(diagnosis["length"].as_u64().is_some_and(|n| n > 1 << 20));
+    assert_eq!(diagnosis["prefix_sha256"].as_str().map(str::len), Some(64));
+    assert_eq!(diagnosis["head"].as_str().map(str::len), Some(4096));
+    assert_eq!(
+        (small.state, small.failure.as_deref()),
+        (AttemptState::Settled, None)
+    );
+    assert!(world.store.writer_alive());
+    Ok(())
+}

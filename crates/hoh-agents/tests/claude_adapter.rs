@@ -1079,3 +1079,62 @@ async fn test_027_02_claude_keeps_an_unregistered_record_once_and_ends_as_withou
     );
     Ok(())
 }
+
+/// AC-027-03 (claude): after its normal frames a turn writes one 8 MiB line with no LF while another attempt runs a
+/// normal turn beside it on the same store. The reader never holds more than the limit and one read chunk; only the
+/// oversized attempt fails (PROTOCOL_FRAME_TOO_LARGE, its diagnosis with the length, the prefix sha256 and the first
+/// 4 KiB); the other settles, and the store's writer goes on (the process that runs both, ADR-019 decision 9).
+#[tokio::test]
+async fn test_027_03_claude_an_8_mib_line_fails_only_its_own_attempt() -> R {
+    let world = World::new()?;
+    let huge = world.script(
+        "huge",
+        &format!(
+            "cat > /dev/null\necho '{INIT}'\nhead -c 8388608 /dev/zero | tr '\\0' a\nwhile true; do sleep 0.1; done"
+        ),
+    )?;
+    let normal = world.fake("normal", &fixture("tool-success")?, b"", 0)?;
+    let oversized = world.attempt_in("claude", "A1", "S1", "2.1.318").await?;
+    let beside = world.attempt_in("claude", "A2", "S2", "2.1.318").await?;
+    let mut big = world.turn(&huge, "logs/huge")?;
+    big.escalation = quick();
+    big.deadline = None;
+    let small = world.turn(&normal, "logs/normal")?;
+    let (big, small) = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(world.run(&oversized, &big), world.run(&beside, &small))
+    })
+    .await?;
+    let (big, small) = (big?, small?);
+    let limit = 1_048_576 + 65_536;
+    assert!(
+        big.max_buffered.is_some_and(|n| n <= limit),
+        "{:?}",
+        big.max_buffered
+    );
+    assert_eq!(
+        (big.state, big.failure.as_deref()),
+        (AttemptState::Failed, Some("PROTOCOL_FRAME_TOO_LARGE"))
+    );
+    let diagnosis = world
+        .store
+        .reader()?
+        .events("R")?
+        .into_iter()
+        .find(|(k, p)| k == "adapter.diagnostic" && p["reason"] == "PROTOCOL_FRAME_TOO_LARGE")
+        .map(|(_, p)| p)
+        .ok_or("no diagnosis")?;
+    assert!(diagnosis["length"].as_u64().is_some_and(|n| n > 1 << 20));
+    assert_eq!(diagnosis["prefix_sha256"].as_str().map(str::len), Some(64));
+    assert_eq!(diagnosis["head"].as_str().map(str::len), Some(4096));
+    assert_eq!(
+        (small.state, small.failure.as_deref()),
+        (AttemptState::Settled, None)
+    );
+    let rows = world.store.reader()?;
+    assert_eq!(
+        rows.attempt("A2")?.map(|a| a.state),
+        Some(AttemptState::Settled)
+    );
+    assert!(world.store.writer_alive());
+    Ok(())
+}
