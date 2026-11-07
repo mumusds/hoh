@@ -14,9 +14,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use futures_util::stream::{self, Stream};
 use hoh_core::persistence::{
-    CommandOutcome, EventRow, NewEvent, NewOutbox, PersistError, Reader, Store, SubmitCommand,
+    CommandOutcome, EventRow, NewEvent, NewOutbox, PersistError, Reader, RunTarget, Store,
+    SubmitCommand,
 };
-use hoh_core::protocol::{self, Command, CommandBody, CommandKind, RunState};
+use hoh_core::protocol::{self, Command, CommandBody, RunState};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::convert::Infallible;
@@ -48,6 +49,7 @@ const PAGE: usize = 500;
 fn routes(shared: Arc<Shared>, via: Via) -> Router {
     Router::new()
         .route("/v1/commands", post(submit_command))
+        .route("/v1/runs", get(list_runs))
         .route("/v1/runs/{run_id}", get(get_run))
         .route("/v1/events", get(stream_events))
         .route("/healthz", get(health))
@@ -439,8 +441,8 @@ async fn store_error(shared: &Arc<Shared>, run_id: &str, e: PersistError) -> Res
     }
 }
 
-/// `POST /v1/commands` (openapi `submitCommand`). PauseRun is applied; the other kinds come with their tasks and are
-/// refused as not yet supported, with nothing written.
+/// `POST /v1/commands` (openapi `submitCommand`). StartRun, PauseRun, ResumeRun and CancelRun are applied (ADR-021);
+/// the other kinds come with their tasks and are refused as not yet supported, with nothing written.
 async fn submit_command(
     State(shared): State<Arc<Shared>>,
     body: Result<axum::body::Bytes, axum::extract::rejection::BytesRejection>,
@@ -483,25 +485,73 @@ async fn submit_command(
     {
         return configure_scheduler(&shared, command.run_id.as_deref()).await;
     }
-    let (CommandBody::PauseRun(reason), Some(run_id)) = (&command.body, &command.run_id) else {
-        let kind = command.kind();
-        return if kind == CommandKind::PauseRun {
-            error(
-                StatusCode::BAD_REQUEST,
-                "BAD_REQUEST",
-                "PauseRun needs a run_id",
-                false,
+    // The control commands (docs/adr/ADR-021.md decisions 5, 7, 8): their kind, where the run moves, the event's kind
+    // and payload, and the runtime notice for the host loop (ADR-016 decision 5, ADR-018 decision 4).
+    let kind = command.kind();
+    let (name, target, event_kind, control, details) = match &command.body {
+        CommandBody::StartRun(start) => {
+            let mode = json!(start.mode).as_str().unwrap_or("AUTO").to_owned();
+            (
+                "StartRun",
+                RunTarget::Start { mode: mode.clone() },
+                "run.created",
                 None,
+                json!({"goal": start.goal, "mode": mode, "interactive": start.interactive}),
             )
-        } else {
-            error(
+        }
+        CommandBody::PauseRun(reason) => (
+            "PauseRun",
+            RunTarget::To(RunState::PauseRequested),
+            "run.pause_requested",
+            Some("PAUSE_REQUESTED"),
+            json!({"state": "PAUSE_REQUESTED", "reason": reason.reason}),
+        ),
+        CommandBody::CancelRun(reason) => (
+            "CancelRun",
+            RunTarget::To(RunState::CancelRequested),
+            "run.cancel_requested",
+            Some("CANCEL_REQUESTED"),
+            json!({"state": "CANCEL_REQUESTED", "reason": reason.reason}),
+        ),
+        CommandBody::ResumeRun(reason) => (
+            "ResumeRun",
+            RunTarget::Resume,
+            "run.resumed",
+            Some("RESUMED"),
+            json!({"reason": reason.reason}),
+        ),
+        _ => {
+            return error(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "CAPABILITY_UNSUPPORTED",
                 format!("{kind:?} is not supported by this host yet"),
                 false,
                 None,
-            )
-        };
+            );
+        }
+    };
+    // A new run's id is the host's (CR-003); every other control command names its run.
+    let run_id = match (&command.body, &command.run_id) {
+        (CommandBody::StartRun(_), None) => super::new_id(),
+        (CommandBody::StartRun(_), Some(_)) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "BAD_REQUEST",
+                "StartRun names no run_id: the host gives the new run its id",
+                false,
+                None,
+            );
+        }
+        (_, Some(run_id)) => run_id.clone(),
+        (_, None) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "BAD_REQUEST",
+                format!("{name} needs a run_id"),
+                false,
+                None,
+            );
+        }
     };
     let Ok(expected_revision) = i64::try_from(command.expected_revision) else {
         return error(
@@ -520,27 +570,27 @@ async fn submit_command(
         .map(|b| format!("{b:02x}"))
         .collect();
     let event_id = super::new_id();
+    let mut payload = json!({"command_id": command.command_id});
+    if let (Some(all), Some(more)) = (payload.as_object_mut(), details.as_object()) {
+        all.extend(more.clone());
+    }
     let submit = SubmitCommand {
         command_id: command.command_id.clone(),
         idempotency_key: command.idempotency_key.clone(),
-        kind: "PauseRun".to_owned(),
+        kind: name.to_owned(),
         run_id: run_id.clone(),
         expected_revision,
         payload: value.get("payload").cloned().unwrap_or_else(|| json!({})),
         payload_sha256,
-        target: RunState::PauseRequested,
+        target,
         event: NewEvent {
             project_id: shared.project_id.clone(),
             event_id: event_id.clone(),
             run_id: Some(run_id.clone()),
-            kind: "run.pause_requested".to_owned(),
-            payload: json!({
-                "command_id": command.command_id,
-                "state": "PAUSE_REQUESTED",
-                "reason": reason.reason,
-            }),
+            kind: event_kind.to_owned(),
+            payload,
         },
-        outbox: Some(NewOutbox {
+        outbox: control.map(|control| NewOutbox {
             message_id: super::new_id(),
             event: 0,
             run_id: Some(run_id.clone()),
@@ -549,14 +599,15 @@ async fn submit_command(
             payload: json!({
                 "notice": "runtime",
                 "kind": "run.control",
-                "control": "PAUSE_REQUESTED",
+                "control": control,
                 "run_id": run_id,
                 "command_id": command.command_id,
                 "event_id": event_id,
-                "reason": reason.reason,
+                "reason": details.get("reason"),
             }),
         }),
     };
+    let run_id = &run_id;
     match shared.store.submit_command(submit).await {
         Ok(CommandOutcome::Accepted { result_json, .. }) => {
             shared.hooks.after_commit();
@@ -578,6 +629,69 @@ fn accepted(result_json: String, replayed: bool) -> Response {
     response
         .body(Body::from(result_json))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+#[derive(serde::Deserialize)]
+struct RunsQuery {
+    limit: Option<usize>,
+    cursor: Option<String>,
+    state: Option<String>,
+}
+
+/// `GET /v1/runs` (openapi `listRuns`; docs/adr/ADR-021.md decision 6): a page of the project's runs, newest first,
+/// each with its label; `cursor` is opaque. A query that cannot be read names no page: 404, within openapi's codes.
+async fn list_runs(
+    State(shared): State<Arc<Shared>>,
+    query: Result<Query<RunsQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    let unreadable = || {
+        error(
+            StatusCode::NOT_FOUND,
+            "BAD_REQUEST",
+            "limit must be 1 to 500, cursor one this host gave, state text",
+            false,
+            None,
+        )
+    };
+    let Ok(Query(query)) = query else {
+        return unreadable();
+    };
+    let limit = query.limit.unwrap_or(100);
+    let before = match query.cursor.as_deref().map(str::parse::<i64>) {
+        None => None,
+        Some(Ok(before)) if before > 0 => Some(before),
+        Some(_) => return unreadable(),
+    };
+    if !(1..=500).contains(&limit) {
+        return unreadable();
+    }
+    let state = query.state;
+    match read(&shared, move |reader| reader.list_runs(state.as_deref(), limit, before)).await {
+        Ok(hoh_core::persistence::RunsPage {
+            runs,
+            next,
+            watermark,
+        }) => (
+            StatusCode::OK,
+            axum::Json(json!({
+                "items": runs.iter().map(|(run, created_at)| json!({
+                    "run_id": run.run_id,
+                    "state": run.state,
+                    "label": serde_json::from_value::<RunState>(json!(run.state))
+                        .map_or_else(|_| run.state.clone(), |s| hoh_core::lifecycle::label(s).to_owned()),
+                    "mode": run.mode,
+                    "revision": run.revision,
+                    "resume_state": run.resume_state,
+                    "blocked_reason": run.blocked_reason,
+                    "created_at": created_at,
+                })).collect::<Vec<_>>(),
+                "next_cursor": next.map(|n| n.to_string()),
+                "watermark": watermark,
+            })),
+        )
+            .into_response(),
+        Err(e) => store_error(&shared, "", e).await,
+    }
 }
 
 /// `GET /v1/runs/{run_id}` (openapi `getRun`): the run with the watermark it was read at.
@@ -608,6 +722,9 @@ async fn get_run(
                     "mode": run.mode,
                     "resume_state": run.resume_state,
                     "blocked_reason": run.blocked_reason,
+                    // CANCEL_REQUESTED is shown as CANCELLING (REQ-043 behaviour 3, ADR-021 decision 8h).
+                    "label": serde_json::from_value::<RunState>(json!(run.state))
+                        .map_or_else(|_| run.state.clone(), |s| hoh_core::lifecycle::label(s).to_owned()),
                 },
             })),
         )

@@ -1379,11 +1379,20 @@ async fn commands_and_runs_follow_the_openapi_contract() -> R {
         (pause("c3", "k3", "missing", 0, "none"), 409, "RUN_NOT_FOUND"),
         (
             json!({"schema_version": "1.0", "command_id": "c4", "idempotency_key": "k4", "expected_revision": 1,
-                   "kind": "ResumeRun", "run_id": "r1", "payload": {"reason": "later"}})
+                   "kind": "SetMode", "run_id": "r1", "payload": {"mode": "PLAN"}})
             .to_string()
             .into_bytes(),
             422,
             "CAPABILITY_UNSUPPORTED",
+        ),
+        // A run not paused does not resume (ADR-021 decision 7).
+        (
+            json!({"schema_version": "1.0", "command_id": "c6", "idempotency_key": "k6", "expected_revision": 1,
+                   "kind": "ResumeRun", "run_id": "r1", "payload": {"reason": "later"}})
+            .to_string()
+            .into_bytes(),
+            409,
+            "ILLEGAL_TRANSITION",
         ),
     ] {
         let reply = call(&to, "POST", "/v1/commands", &host.token, &request).await?;
