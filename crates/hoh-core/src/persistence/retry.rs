@@ -169,13 +169,17 @@ pub(super) fn fail_task(
 }
 
 /// Add the attempt's running time to its run's `wall_seconds` budget, if it has one (ADR-020 decision 7): the used
-/// duration changes only when an attempt ends, so a waiting run's is the same across a crash and a restart.
+/// duration changes only when an attempt ends, so a waiting run's is the same across a crash and a restart. It is
+/// never less than what the attempt's own host life recorded it ran, from its start to `recorded_end` (its work's
+/// OBSERVED end, the same life's clock), whatever a later life's `ended_at` says (ADR-020 decision 4, M2T19R-200).
+/// How far `ended_at` is before its start (a wall clock set back across a restart), if it is.
 pub(super) fn accrue_wall(
     tx: &Transaction<'_>,
     run_id: &str,
     attempt_id: &str,
     ended_at: SystemTime,
-) -> Result<(), PersistError> {
+    recorded_end: Option<SystemTime>,
+) -> Result<Option<std::time::Duration>, PersistError> {
     let started: Option<String> = tx
         .query_row(
             "SELECT started_at FROM attempts WHERE attempt_id = ?1",
@@ -186,17 +190,19 @@ pub(super) fn accrue_wall(
         .map_err(sqlite_error)?
         .flatten();
     let Some(started) = started.as_deref().and_then(crate::time::parse_rfc3339) else {
-        return Ok(());
+        return Ok(None);
     };
     let ended = crate::time::parse_rfc3339(&rfc3339_utc(ended_at)).unwrap_or(ended_at);
-    let seconds = ended.duration_since(started).map_or(0, |d| d.as_secs());
+    let behind = started.duration_since(ended).ok().filter(|d| !d.is_zero());
+    let ran = |end: SystemTime| end.duration_since(started).map_or(0, |d| d.as_secs());
+    let seconds = ran(ended).max(recorded_end.map_or(0, ran));
     tx.execute(
         "UPDATE budgets SET used_value = used_value + ?1 WHERE scope_kind = 'run' AND scope_id = ?2 \
          AND kind = 'wall_seconds'",
         params![seconds as f64, run_id],
     )
     .map_err(sqlite_error)?;
-    Ok(())
+    Ok(behind)
 }
 
 /// The run's budget at `now`: its run-scope rows and its deadline, the duration its unfinished attempts have run so

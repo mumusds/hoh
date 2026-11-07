@@ -461,7 +461,7 @@ fn finished(
         },
         ctx,
     )?;
-    super::retry::accrue_wall(&tx, &run_id, attempt_id, ending.at)?;
+    super::retry::accrue_wall(&tx, &run_id, attempt_id, ending.at, None)?;
     let mut commit = Commit::default();
     if success {
         if task_state == TaskState::Running {
