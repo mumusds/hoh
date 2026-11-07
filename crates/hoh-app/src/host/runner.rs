@@ -45,8 +45,10 @@ pub struct Work {
 pub struct Outcome {
     pub success: bool,
     pub detail: String,
-    /// Whether the executor emptied the leader's process group before it reaped the leader (while the zombie held the
-    /// group's id, so nothing else could be in it): the attempt ends, and its slot goes, only if so (M2T05R-101, -202).
+    /// Whether the executor saw the leader's process group empty: it sent the group a SIGKILL while the leader was an
+    /// unreaped zombie (which holds the group's number, so the signal reaches only this group), reaped the leader,
+    /// then waited until no process was left in the group (`kill(-pgid, 0)` gives ESRCH; the members hold the number
+    /// meanwhile). The attempt ends, and its slot goes, only if so (M2T05R-101, -303).
     pub group_gone: bool,
 }
 
@@ -84,8 +86,9 @@ pub trait Executor: Send + Sync + std::fmt::Debug {
     /// Hand `work` over; the answer says the executor has it (the ACK).
     fn deliver(&self, work: &Work) -> oneshot::Receiver<Result<(), String>>;
     /// Start `work`'s process held at its start gate: nothing of the agent may run before [`Started::gate`] opens.
-    /// When the leader ends, the executor first empties its process group, then reaps it, and reports both in its
-    /// [`Outcome`] (the hoh-agents substrate does so).
+    /// When the leader ends, the executor SIGKILLs its process group while the leader is an unreaped zombie, reaps
+    /// it, waits for the group to be empty and reports that in [`Outcome::group_gone`] (the hoh-agents substrate's
+    /// order: group SIGKILL, reap, `group_gone`).
     fn start(&self, work: &Work) -> Result<Started, String>;
     /// Ask `work`'s process to stop the agent's own way (its native cancel), before any signal: the first step when its
     /// lease expired (AC-041-02).
@@ -458,7 +461,8 @@ async fn step(
 /// Settle `id`, which this host can no longer trust to end by itself: its lease expired (`lease_expired`), its
 /// executor lost its process (`executor_lost`), or its task failed (`runner_error`). Never judged ended by that alone
 /// (REQ-041 b4): its own task here is aborted and waited for first (so nothing else of this host writes for it,
-/// M2T05R-03), its row read again, its process inspected by its record, its native cancel sent, SIGTERM and SIGKILL to its group and the reap confirmed; then its disposition as at a reconcile,
+/// M2T05R-03), its row read again, its process inspected by its record, its native cancel sent, SIGTERM and SIGKILL
+/// to its group and its group seen empty; then its disposition as at a reconcile,
 /// which lets its lease go only once it is ended. A process that may still run (outlived its stop, or cannot be told
 /// apart) moves nothing and keeps its slot; when that finding is `last`'s again, nothing is written again
 /// (M2T05R-157). The disposition applied, if any, with the finding.
@@ -529,11 +533,8 @@ async fn settle(
     .await?;
     let settings = common.settings.clone();
     let process = tokio::task::spawn_blocking(move || {
-        // The native cancel's grace first: a process that ended by it gets no signal.
-        let end = Instant::now() + settings.term_grace;
-        while seen.live() && Instant::now() < end {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        // The native cancel's grace first: a group that emptied by it gets no signal.
+        seen.grace(settings.term_grace);
         reconcile::end(seen, &settings)
     })
     .await
