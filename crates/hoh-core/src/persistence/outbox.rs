@@ -142,12 +142,16 @@ pub(super) fn claim_next(
     }
 }
 
-/// Undo the claim of `row`, which never reached a transport: due again at once, the delivery it never had not counted.
-/// Only while the row is still at that generation and DELIVERING (never a newer claim or a delivery that started).
+/// Undo the claim of `row`, which never reached a transport: the delivery it never had is not counted, and a row still
+/// DELIVERING is due again at once. Until its undo nothing settles that generation and nothing claims the row again, so
+/// the row is still at that generation and either DELIVERING or ACKED by a late answer of an earlier delivery, whose
+/// state stands (M2T04R-500; ADR-018 decision 4).
 fn undo(tx: &Transaction<'_>, row: &OutboxRow) -> Result<(), PersistError> {
     tx.execute(
-        "UPDATE outbox SET state = 'PENDING', attempt_count = attempt_count - 1, next_retry_at = NULL \
-         WHERE message_id = ?1 AND state = 'DELIVERING' AND attempt_count = ?2",
+        "UPDATE outbox SET attempt_count = attempt_count - 1, \
+                state = CASE state WHEN 'DELIVERING' THEN 'PENDING' ELSE state END, \
+                next_retry_at = NULL \
+         WHERE message_id = ?1 AND state IN ('DELIVERING', 'ACKED') AND attempt_count = ?2",
         params![row.message_id, row.attempt_count],
     )
     .map_err(sqlite_error)?;
