@@ -451,7 +451,7 @@ pub async fn run(
         attempt,
         Starting,
         Running,
-        crate::identity::running(pid),
+        crate::identity::running_pid(pid),
     )
     .await?;
     let (lines, mut queue) = mpsc::unbounded_channel::<Vec<u8>>();

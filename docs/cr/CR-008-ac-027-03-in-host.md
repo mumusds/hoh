@@ -22,6 +22,7 @@ CR-004 F2 当时把它分给 M2-T05，理由是它需要"host 与并行 attempt"
      - acceptance 列为 AC-018-01..05 加上 AC-027-03（TEST-027-03 的 `integration` 检查仍归 M0-T03 所有，一个检查只有一个所有者）；
      - done_when 加上：执行循环经角色绑定，用产品执行器运行三个适配器，适配器进程经启动门启动（ADR-019 决定 8 的设计修正）；TEST-027-03 在 host 内重测。
 2. M2-T05 已有的三个适配器层测试保留，作为补充证据：两个回合与 store 在同一进程，超大帧只让本 attempt 失败。它们改名，不再带 TEST id，因此 TEST-027-03 只能由 M2-T07 在 host 内的测试满足，发布门禁不会把适配器层的 PASS 当作 AC-027-03 的证据。
+3. 还写着"host 级 AC-027-03 归 M2-T05"的两处一并改为 M2-T07：M1-T07 的 done_when，以及 `crates/hoh-agents/tests/codex_adapter.rs` 中的注释（第二轮审查 M2T05R-155）。
 
 ## 影响
 

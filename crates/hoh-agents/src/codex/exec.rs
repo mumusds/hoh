@@ -65,7 +65,7 @@ pub(super) async fn run(
         attempt,
         Starting,
         Running,
-        crate::identity::running(pid),
+        crate::identity::running_pid(pid),
     )
     .await?;
     let input = process.take_stdin();

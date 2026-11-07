@@ -389,7 +389,7 @@ pub async fn run(
         attempt,
         Starting,
         Running,
-        crate::identity::running(pid),
+        crate::identity::running_pid(pid),
     )
     .await?;
     // The prompt is written while the output and the cancel are watched; the pipe closes when it is written.

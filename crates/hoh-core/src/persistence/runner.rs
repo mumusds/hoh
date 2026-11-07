@@ -288,6 +288,7 @@ fn received(
         },
         ctx,
     )?;
+    ctx.before_commit()?;
     tx.commit().map_err(sqlite_error)?;
     Ok(true)
 }
@@ -327,6 +328,7 @@ fn effect(
         },
         ctx,
     )?;
+    ctx.before_commit()?;
     tx.commit().map_err(sqlite_error)?;
     Ok(true)
 }
@@ -387,6 +389,7 @@ fn running(
         },
         ctx,
     )?;
+    ctx.before_commit()?;
     tx.commit().map_err(sqlite_error)?;
     Ok(true)
 }
@@ -448,6 +451,7 @@ fn finished(
         },
         ctx,
     )?;
+    ctx.before_commit()?;
     tx.commit().map_err(sqlite_error)?;
     Ok(true)
 }

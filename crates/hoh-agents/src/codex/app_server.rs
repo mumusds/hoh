@@ -444,7 +444,7 @@ impl State<'_> {
                         self.attempt,
                         Starting,
                         Running,
-                        crate::identity::running(self.pid),
+                        crate::identity::running_pid(self.pid),
                     )
                     .await?;
                     self.running = true;
