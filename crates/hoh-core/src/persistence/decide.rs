@@ -352,6 +352,13 @@ pub(super) fn lease_task(
         &request.attempt_id,
         request.now,
     )?;
+    // Leased, it waits no more: if it comes back to READY (a retry), it ages from the start again and is stamped
+    // by the round it is next eligible in (M2T03R-53). Bookkeeping, not a state change.
+    tx.execute(
+        "UPDATE tasks SET wait_rounds = 0, first_eligible_seq = NULL WHERE task_id = ?1",
+        params![request.task_id],
+    )
+    .map_err(sqlite_error)?;
     Ok(Leased {
         attempt_id: request.attempt_id.clone(),
         grant,

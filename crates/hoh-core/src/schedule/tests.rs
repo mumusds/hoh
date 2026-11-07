@@ -41,6 +41,35 @@ fn shuffled<T: Clone>(items: &[T], seed: u64) -> Vec<T> {
     out
 }
 
+/// FNV-1a (64 bit) of the dispatch sequence, one id per line: the same in all four orders of a case (the evidence
+/// records it per case, M2T03R-56).
+fn fnv1a64(sequence: &[String]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in sequence.join("\n").bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Each round's pick (id, tier, age bonus, score) to HOH_EVIDENCE_DIR, when a check runs the test.
+fn keep_rounds(name: &str, picks: &[Ranked]) {
+    if let Some(dir) = std::env::var_os("HOH_EVIDENCE_DIR") {
+        let rounds: Vec<serde_json::Value> = picks
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                serde_json::json!({"round": i + 1, "task_id": p.task_id, "sublayer": p.tier.label(),
+                                   "age_bonus": p.age_bonus, "score": p.score.value()})
+            })
+            .collect();
+        let _ = std::fs::write(
+            std::path::Path::new(&dir).join(name),
+            serde_json::to_vec_pretty(&rounds).unwrap_or_default(),
+        );
+    }
+}
+
 fn ids(ranked: &[Ranked]) -> Vec<&str> {
     ranked.iter().map(|r| r.task_id.as_str()).collect()
 }
@@ -149,6 +178,7 @@ fn test_038_04_age_bonus_lets_h_win_round_5_and_never_exceeds_10() {
         }
         picks.push(rounds.run(&params));
     }
+    keep_rounds("test-038-04-rounds.json", &picks);
     let names: Vec<&str> = picks.iter().map(|p| p.task_id.as_str()).collect();
     assert!(names[..4].iter().all(|n| n.starts_with("l-")), "{names:?}");
     let h = &picks[4];
@@ -173,6 +203,7 @@ fn test_038_06_aged_sublayer_selects_h_in_round_21() {
             longest_wait = longest_wait.max(c.wait_rounds);
         }
     }
+    keep_rounds("test-038-06-rounds.json", &picks);
     assert!(
         picks[..20].iter().all(|p| p.task_id.starts_with("l-")),
         "{:?}",
@@ -389,9 +420,10 @@ impl World {
         }
     }
 
-    /// Select until nothing is eligible, the tasks given in `order`; a selected task counts as accepted. Each pick is
-    /// checked against the world itself (not against the scheduler's own facts). The dispatch sequence and the number
-    /// of picks that broke an eligibility condition.
+    /// Select until nothing is eligible, the tasks given in `order`; a selected task counts as accepted. Every task
+    /// not accepted is on the board from the start, its dependency fact kept from the world, so the scheduler itself
+    /// must pass over unmet dependencies (M2T03R-51). Each pick is checked against the world itself (not against the
+    /// scheduler's own facts). The dispatch sequence and the number of picks that broke an eligibility condition.
     fn dispatch(&self, params: &Params, order: &[usize]) -> (Vec<String>, usize) {
         let n = self.tasks.len();
         let mut accepted: Vec<bool> = self
@@ -402,20 +434,20 @@ impl World {
         let mut open: Vec<usize> = (0..n)
             .map(|i| self.deps[i].iter().filter(|d| !accepted[**d]).count())
             .collect();
-        // The board as two parallel vectors: world index and candidate (the scheduler reads the candidates as is).
-        let position: Vec<usize> = {
-            let mut at = vec![0; n];
-            for (p, &i) in order.iter().enumerate() {
-                at[i] = p;
-            }
-            at
-        };
-        let mut index: Vec<usize> = order
+        // The board as two parallel vectors (world index, candidate) and where each world task sits on it.
+        let mut index: Vec<usize> = order.iter().copied().filter(|i| !accepted[*i]).collect();
+        let mut board: Vec<Candidate> = index
             .iter()
-            .copied()
-            .filter(|i| !accepted[*i] && open[*i] == 0)
+            .map(|&i| {
+                let mut c = self.candidate(i);
+                c.eligibility.dependencies_accepted = open[i] == 0;
+                c
+            })
             .collect();
-        let mut board: Vec<Candidate> = index.iter().map(|&i| self.candidate(i)).collect();
+        let mut slot: Vec<Option<usize>> = vec![None; n];
+        for (p, &i) in index.iter().enumerate() {
+            slot[i] = Some(p);
+        }
         let mut sequence = Vec::new();
         let mut violations = 0;
         let mut round_seq = 0_i64;
@@ -439,6 +471,10 @@ impl World {
                 .unwrap_or(usize::MAX);
             board.swap_remove(at);
             let chosen = index.swap_remove(at);
+            slot[chosen] = None;
+            if let Some(&moved) = index.get(at) {
+                slot[moved] = Some(at);
+            }
             let t = &self.tasks[chosen];
             let fits = self.deps[chosen].iter().all(|d| accepted[*d])
                 && !accepted[chosen]
@@ -448,18 +484,13 @@ impl World {
             }
             sequence.push(selected.task_id);
             accepted[chosen] = true;
-            let mut newly: Vec<usize> = Vec::new();
             for &d in &self.dependents[chosen] {
                 open[d] -= 1;
-                if open[d] == 0 && !accepted[d] {
-                    newly.push(d);
+                if open[d] == 0
+                    && let Some(p) = slot[d]
+                {
+                    board[p].eligibility.dependencies_accepted = true;
                 }
-            }
-            // They join in the given order's sense: by their position in `order`.
-            newly.sort_by_key(|d| position[*d]);
-            for d in newly {
-                index.push(d);
-                board.push(self.candidate(d));
             }
         }
         (sequence, violations)
@@ -483,7 +514,7 @@ fn test_038_02_random_dags_dispatch_identically_in_any_order() {
     // Mostly sizes across 10..=999, about one in twenty exactly 1000.
     let size = prop_oneof![19 => 10usize..=999, 1 => Just(1000usize)];
     let worlds = size.prop_flat_map(|n| proptest::collection::vec(gen_task(), n));
-    let log: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
+    let log: Mutex<Vec<(usize, usize, usize, u64)>> = Mutex::new(Vec::new());
     let params = Params::default();
     let result = runner.run(&worlds, |tasks| {
         let world = World::new(tasks);
@@ -502,7 +533,7 @@ fn test_038_02_random_dags_dispatch_identically_in_any_order() {
             );
         }
         if let Ok(mut log) = log.lock() {
-            log.push((n, first.len(), violations));
+            log.push((n, first.len(), violations, fnv1a64(&first)));
         }
         Ok(())
     });
@@ -510,15 +541,16 @@ fn test_038_02_random_dags_dispatch_identically_in_any_order() {
     let log = log.into_inner().unwrap_or_default();
     assert_eq!(log.len(), 1000);
     assert!(
-        log.iter().any(|(n, _, _)| *n == 1000),
+        log.iter().any(|(n, ..)| *n == 1000),
         "no case of 1000 tasks"
     );
-    assert!(log.iter().all(|(n, _, _)| (10..=1000).contains(n)));
+    assert!(log.iter().all(|(n, ..)| (10..=1000).contains(n)));
     if let Some(dir) = std::env::var_os("HOH_EVIDENCE_DIR") {
         let cases: Vec<serde_json::Value> = log
             .iter()
-            .map(|(n, picks, violations)| {
-                serde_json::json!({"tasks": n, "dispatched": picks, "violations": violations})
+            .map(|(n, picks, violations, hash)| {
+                serde_json::json!({"tasks": n, "dispatched": picks, "violations": violations,
+                                   "sequence_fnv1a64": format!("{hash:016x}")})
             })
             .collect();
         let doc = serde_json::json!({
@@ -533,4 +565,35 @@ fn test_038_02_random_dags_dispatch_identically_in_any_order() {
             serde_json::to_vec_pretty(&doc).unwrap_or_default(),
         );
     }
+}
+
+#[test]
+fn aged_tasks_are_served_first_eligible_first_whatever_their_scores() {
+    // M2T03R-52: the order of first eligibility is the reverse of both score and created_seq.
+    let params = Params::default();
+    let aged = |id: &str, seq: i64, user_value: u8, first: i64| {
+        let mut t = task(id, 2, seq);
+        t.user_value = user_value;
+        t.wait_rounds = params.max_wait_rounds;
+        t.first_eligible_seq = Some(first);
+        t
+    };
+    let set = vec![
+        aged("x-early-seq-high-score", 1, 5, 30),
+        aged("y", 2, 3, 20),
+        aged("z-late-seq-low-score", 3, 0, 10),
+    ];
+    for seed in 0..5 {
+        let ranked = rank(&params, &shuffled(&set, seed));
+        assert_eq!(
+            ids(&ranked),
+            ["z-late-seq-low-score", "y", "x-early-seq-high-score"]
+        );
+        assert!(ranked.iter().all(|r| r.tier == Tier::Aged));
+    }
+    let one = round(&params, &set, FREE);
+    assert_eq!(
+        one.selected.map(|s| s.task_id),
+        Some("z-late-seq-low-score".to_owned())
+    );
 }

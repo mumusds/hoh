@@ -77,6 +77,36 @@ pub(super) fn import(
     };
     let existing: BTreeSet<String> = states.keys().cloned().collect();
     let plan = dag::validate(raw, &existing, &taken).map_err(PersistError::Plan)?;
+    // A requirement the run's specification does not have makes the plan invalid (M2T03R-55): a bad request, not a
+    // constraint failure of the insert.
+    let known: BTreeSet<String> = {
+        let mut statement = tx
+            .prepare("SELECT requirement_id FROM requirements WHERE spec_id = ?1")
+            .map_err(sqlite_error)?;
+        let rows = statement
+            .query_map(params![spec_id], |r| r.get(0))
+            .map_err(sqlite_error)?;
+        rows.collect::<Result<_, _>>().map_err(sqlite_error)?
+    };
+    let spec = spec_id.as_str();
+    let unknown: Vec<String> = plan
+        .tasks
+        .iter()
+        .flat_map(|t| {
+            t.requirement_ids
+                .iter()
+                .filter(|r| !known.contains(*r))
+                .map(move |r| {
+                    format!(
+                        "task {}: requirement {r} is not in specification {spec}",
+                        t.task_id
+                    )
+                })
+        })
+        .collect();
+    if !unknown.is_empty() {
+        return Err(PersistError::Plan(dag::PlanError::Invalid(unknown)));
+    }
     let base: i64 = tx
         .query_row(
             "SELECT COALESCE(MAX(created_seq), 0) FROM tasks WHERE run_id = ?1",

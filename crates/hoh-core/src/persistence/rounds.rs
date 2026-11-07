@@ -194,8 +194,8 @@ pub(super) fn round(
     };
     let done = writer::write(&tx, &commit, after_events)?;
     let seq = done.event_seqs[0];
-    // The waiting tasks age by one round and keep the round they first became eligible in; the selected one starts
-    // over. Bookkeeping, not a state change: no revision moves.
+    // The waiting tasks age by one round and keep the round they first became eligible in (the selected one was reset
+    // when it was leased). Bookkeeping, not a state change: no revision moves.
     for id in &waited {
         tx.execute(
             "UPDATE tasks SET wait_rounds = wait_rounds + 1, first_eligible_seq = COALESCE(first_eligible_seq, ?1) \
@@ -204,11 +204,6 @@ pub(super) fn round(
         )
         .map_err(sqlite_error)?;
     }
-    tx.execute(
-        "UPDATE tasks SET wait_rounds = 0, first_eligible_seq = COALESCE(first_eligible_seq, ?1) WHERE task_id = ?2",
-        params![seq, selected.task_id],
-    )
-    .map_err(sqlite_error)?;
     tx.commit().map_err(sqlite_error)?;
     Ok(RoundOutcome {
         dispatched: Some(Dispatched {
@@ -228,13 +223,20 @@ pub(super) fn round(
 fn parameters(snapshot: &str) -> Result<Params, PersistError> {
     let snapshot: Value = serde_json::from_str(snapshot)
         .map_err(|e| PersistError::IntegrityViolation(format!("config snapshot: {e}")))?;
-    let settings =
-        match snapshot.get("scheduler") {
-            None | Some(Value::Null) => None,
-            Some(value) => Some(crate::protocol::decode::<SchedulerSettings>(value).map_err(
-                |e| PersistError::IntegrityViolation(format!("config snapshot scheduler: {e}")),
-            )?),
-        };
+    // An empty object leaves everything to the defaults, as a missing key does (CR-007 S2, M2T03R-58).
+    let mut scheduler = snapshot.get("scheduler").cloned().unwrap_or(Value::Null);
+    if let Some(members) = scheduler.as_object_mut() {
+        members.retain(|_, v| !matches!(v, Value::Object(o) if o.is_empty()) && !v.is_null());
+    }
+    let settings = match &scheduler {
+        Value::Null => None,
+        Value::Object(members) if members.is_empty() => None,
+        value => Some(
+            crate::protocol::decode::<SchedulerSettings>(value).map_err(|e| {
+                PersistError::IntegrityViolation(format!("config snapshot scheduler: {e}"))
+            })?,
+        ),
+    };
     Ok(Params::from_settings(settings.as_ref()))
 }
 
@@ -252,7 +254,7 @@ fn candidates(
              t.first_eligible_seq, \
              (SELECT count(*) FROM task_dependencies d JOIN tasks u ON u.task_id = d.depends_on \
               WHERE d.task_id = t.task_id AND u.state <> 'ACCEPTED') \
-             FROM tasks t WHERE t.run_id = ?1 AND t.state IN ('READY', 'PENDING')",
+             FROM tasks t WHERE t.run_id = ?1 AND t.state IN ('READY', 'PENDING') ORDER BY t.created_seq, t.task_id",
         )
         .map_err(sqlite_error)?;
     let raw = statement

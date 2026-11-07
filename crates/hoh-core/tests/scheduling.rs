@@ -234,9 +234,21 @@ async fn a_second_writer_dispatch_while_the_lease_is_held_is_refused_and_t2_stay
     let dir = tempfile::tempdir()?;
     let (store, db) = open(&dir)?;
     seed(&db, WORLD)?;
+    seed(
+        &db,
+        "UPDATE tasks SET wait_rounds = 5, first_eligible_seq = 3 WHERE task_id = 'T1';",
+    )?;
     store
         .decide(proposal("d1", 7, dispatch("T1"))?, context())
         .await?;
+    // A dispatch ends the task's waiting too (M2T03R-53): it ages from the start if it comes back to READY.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT wait_rounds, first_eligible_seq FROM tasks WHERE task_id = 'T1'"
+        )?,
+        [[json!(0), json!(null)]]
+    );
     let before = rows(
         &db,
         "SELECT task_id, state, revision FROM tasks ORDER BY task_id",
@@ -589,7 +601,7 @@ async fn a_round_ranks_with_the_snapshot_weights_and_the_tasks_left_wait() -> R 
         )?,
         [
             [json!("T1"), json!("READY"), json!(1), json!(seq)],
-            [json!("T2"), json!("LEASED"), json!(0), json!(seq)]
+            [json!("T2"), json!("LEASED"), json!(0), json!(null)]
         ]
     );
     let event: Value = serde_json::from_str(
@@ -610,6 +622,169 @@ async fn a_round_ranks_with_the_snapshot_weights_and_the_tasks_left_wait() -> R 
         rows(&db, "SELECT wait_rounds FROM tasks WHERE task_id = 'T1'")?,
         [[json!(1)]],
         "a round that selects nothing writes nothing"
+    );
+    Ok(())
+}
+
+/// A run with one task of each kind a round must pass over (M2T03R-50): its only eligible task is P2, promoted from
+/// PENDING; a BLOCKED run dispatches nothing at all.
+const GATES: &str = "
+INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', 'p1', printf('%064d', 1), 1);
+INSERT INTO sessions(session_id, agent, role, agent_version, capabilities_json) VALUES
+  ('sq', 'pi', 'qa', '1', '{\"structured_events\": true, \"command_exec\": true}');
+INSERT INTO role_bindings(run_id, role, agent, session_id, role_epoch, config_revision, state, blocked_reason, bound_at) VALUES
+  ('R', 'qa', 'pi', 'sq', 1, 1, 'BLOCKED', 'BLOCKED_AUTH', '2026-11-04T00:00:00Z');
+UPDATE tasks SET state = 'RUNNING', revision = 3 WHERE task_id = 'T2';
+INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, user_value, cost_estimate) VALUES
+  ('P1', 'R', 's2', 'PENDING', 1, 'developer', 0, 10, 5, 1),
+  ('P2', 'R', 's2', 'PENDING', 1, 'developer', 0, 11, 0, 1),
+  ('D1', 'R', 's2', 'READY', 1, 'developer', 0, 12, 5, 1),
+  ('S1', 'R', 's1', 'READY', 1, 'developer', 0, 13, 5, 1),
+  ('C5', 'R', 's2', 'READY', 1, 'developer', 0, 14, 5, 5),
+  ('Q1', 'R', 's2', 'READY', 1, 'qa', 0, 15, 5, 1);
+INSERT INTO task_dependencies(task_id, depends_on) VALUES ('P1', 'T2'), ('P2', 'T0'), ('D1', 'T2');
+DELETE FROM task_dependencies WHERE task_id = 'T1';
+UPDATE tasks SET state = 'LEASED' WHERE task_id = 'T1';
+INSERT INTO runs(run_id, project_id, spec_id, state, mode, revision, blocked_reason, created_at) VALUES ('RB', 'p1', 's2', 'BLOCKED', 'AUTO', 1, 'NEED_DECISION', '2026-11-04T00:00:00Z');
+INSERT INTO role_bindings(run_id, role, agent, session_id, role_epoch, config_revision, bound_at) VALUES ('RB', 'developer', 'claude', 'sd', 1, 1, '2026-11-04T00:00:00Z');
+INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate) VALUES ('B1', 'RB', 's2', 'READY', 1, 'developer', 0, 1, 1);
+";
+
+#[tokio::test]
+async fn a_round_passes_over_every_ineligible_task_and_a_blocked_run_dispatches_nothing() -> R {
+    let dir = tempfile::tempdir()?;
+    let (store, db) = open(&dir)?;
+    seed(&db, WORLD)?;
+    seed(&db, GATES)?;
+    let mut ctx = context();
+    ctx.required_capabilities.insert(
+        "qa".to_owned(),
+        ["structured_events".to_owned(), "command_exec".to_owned()].into(),
+    );
+    // C5 costs 5 against a headroom of 2; D1 waits for T2 (RUNNING); S1 is on the old specification; Q1's role is
+    // bound BLOCKED; P1 waits for T2; P2's dependency T0 is ACCEPTED, so it is promoted and is the only choice even
+    // though it scores lowest.
+    ctx.budget_headroom = Some(2);
+    let before = rows(
+        &db,
+        "SELECT task_id, state, revision FROM tasks ORDER BY task_id",
+    )?;
+    let round = store.schedule_round("R", ctx.clone()).await?;
+    let dispatched = round.dispatched.ok_or("nothing dispatched")?;
+    assert_eq!(dispatched.task_id, "P2");
+    assert_eq!(round.promoted, ["P2"]);
+    assert!(round.waited.is_empty(), "{:?}", round.waited);
+    let after = rows(
+        &db,
+        "SELECT task_id, state, revision FROM tasks ORDER BY task_id",
+    )?;
+    for (was, now) in before.iter().zip(&after) {
+        if was[0] == json!("P2") {
+            // PENDING -> READY -> LEASED.
+            assert_eq!(now[1..], [json!("LEASED"), json!(3)]);
+        } else {
+            assert_eq!(was, now, "a task the round passed over changed");
+        }
+    }
+    // Nothing else can be chosen now: the next round writes nothing.
+    let events = count(&db, "events")?;
+    let next = store.schedule_round("R", ctx.clone()).await?;
+    assert_eq!(next, hoh_core::persistence::RoundOutcome::default());
+    assert_eq!(count(&db, "events")?, events);
+    // A BLOCKED run dispatches nothing, though B1 is eligible otherwise.
+    let blocked = store.schedule_round("RB", ctx).await?;
+    assert_eq!(blocked, hoh_core::persistence::RoundOutcome::default());
+    assert_eq!(count(&db, "events")?, events);
+    assert_eq!(
+        rows(&db, "SELECT state FROM tasks WHERE task_id = 'B1'")?,
+        [[json!("READY")]]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_empty_scheduler_snapshot_reads_as_the_defaults() -> R {
+    // M2T03R-58: `{}` for the scheduler or its weights is the defaults, as a missing key is; the run still dispatches.
+    let dir = tempfile::tempdir()?;
+    let (store, db) = open(&dir)?;
+    seed(&db, WORLD)?;
+    for snapshot in [
+        r#"{"scheduler": {}}"#,
+        r#"{"scheduler": {"weights": {}, "max_wait_rounds": 20}}"#,
+    ] {
+        seed(
+            &db,
+            &format!("UPDATE runs SET config_snapshot_json = '{snapshot}' WHERE run_id = 'R';"),
+        )?;
+        let round = store.schedule_round("R", context()).await?;
+        let dispatched = round.dispatched.ok_or("nothing dispatched")?;
+        let seq = round.event_seq.ok_or("no event")?;
+        let payload = rows(
+            &db,
+            &format!("SELECT payload_json FROM events WHERE seq = {seq}"),
+        )?;
+        let event: Value = serde_json::from_str(payload[0][0].as_str().ok_or("no payload")?)?;
+        assert_eq!(
+            event["weights"],
+            json!({"user_value": 4, "unblock_value": 3, "risk_reduction": 3, "information_gain": 2})
+        );
+        // Let the next one have the writer slot again.
+        store
+            .move_attempt(hoh_core::persistence::AttemptMove {
+                attempt_id: dispatched.attempt_id,
+                from: hoh_core::lifecycle::AttemptState::Prepared,
+                to: hoh_core::lifecycle::AttemptState::Cancelled,
+                facts: hoh_core::persistence::AttemptFacts::default(),
+            })
+            .await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_plan_names_only_the_runs_requirements_and_no_other_runs_task_ids() -> R {
+    // M2T03R-55: an unknown requirement is a plan error (a bad request), not a constraint failure; another run's task
+    // id is a duplicate; a valid plan's requirements are rows under the run's specification.
+    let dir = tempfile::tempdir()?;
+    let (store, db) = open(&dir)?;
+    seed(&db, WORLD)?;
+    seed(
+        &db,
+        "INSERT INTO requirements(requirement_id, spec_id, title, required_release) VALUES ('REQ-038', 's2', 'DAG', 1);
+         INSERT INTO runs(run_id, project_id, spec_id, state, mode, created_at) VALUES ('R2', 'p1', 's2', 'RUNNING', 'AUTO', '2026-11-04T00:00:00Z');
+         INSERT INTO tasks(task_id, run_id, spec_id, state, role, created_seq) VALUES ('Z1', 'R2', 's2', 'READY', 'developer', 1);",
+    )?;
+    let task = |id: &str, requirements: &[&str]| {
+        json!({"task_id": id, "title": id, "role": "developer", "writer": false, "depends_on": [],
+               "requirement_ids": requirements})
+    };
+    let before = count(&db, "tasks")?;
+    let unknown = store
+        .import_plan("R", json!({"tasks": [task("n1", &["REQ-999"])]}))
+        .await
+        .err()
+        .ok_or("imported")?;
+    let PersistError::Plan(error) = &unknown else {
+        return Err(format!("not a plan error: {unknown}").into());
+    };
+    assert_eq!(unknown.error_code(), None, "{error:?}");
+    assert!(error.details().to_string().contains("REQ-999"), "{error:?}");
+    let taken = store
+        .import_plan("R", json!({"tasks": [task("Z1", &[])]}))
+        .await
+        .err()
+        .ok_or("imported")?;
+    assert_eq!(taken.error_code(), Some(ErrorCode::DagDuplicateTask));
+    assert_eq!(count(&db, "tasks")?, before);
+    store
+        .import_plan("R", json!({"tasks": [task("n2", &["REQ-038"])]}))
+        .await?;
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT task_id, requirement_id, spec_id FROM task_requirements"
+        )?,
+        [[json!("n2"), json!("REQ-038"), json!("s2")]]
     );
     Ok(())
 }

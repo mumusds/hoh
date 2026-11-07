@@ -381,10 +381,7 @@ fn move_attempt(tx: &Transaction<'_>, m: &AttemptMove) -> Result<(), PersistErro
     })?;
     let f = &m.facts;
     if m.from == AttemptState::Prepared && m.to == AttemptState::Starting {
-        let at = f
-            .started_at
-            .clone()
-            .unwrap_or_else(crate::time::now_rfc3339);
+        let at = instant(&m.attempt_id, "started_at", f.started_at.as_deref())?;
         leases::require_writer(tx, &m.attempt_id, &task_id, &at)?;
     }
     let changed = tx
@@ -417,7 +414,7 @@ fn move_attempt(tx: &Transaction<'_>, m: &AttemptMove) -> Result<(), PersistErro
     }
     if m.to.is_terminal() {
         // Its leases go with it, at its end (REQ-037; the slot is free once it is both ended and expired).
-        let at = f.ended_at.clone().unwrap_or_else(crate::time::now_rfc3339);
+        let at = instant(&m.attempt_id, "ended_at", f.ended_at.as_deref())?;
         leases::release_held_by(tx, &m.attempt_id, &at)?;
     }
     event(
@@ -433,6 +430,21 @@ fn move_attempt(tx: &Transaction<'_>, m: &AttemptMove) -> Result<(), PersistErro
             "failure_reason": f.failure_reason,
         }),
     )
+}
+
+/// A time a caller gave, as the store's UTC form (leases compare them as text, so an offset or a fraction must not
+/// reach them, M2T03R-01); the current time when none is given.
+fn instant(attempt_id: &str, field: &str, given: Option<&str>) -> Result<String, PersistError> {
+    match given {
+        None => Ok(crate::time::now_rfc3339()),
+        Some(text) => crate::time::parse_rfc3339(text)
+            .map(crate::time::rfc3339_utc)
+            .ok_or_else(|| {
+                PersistError::IntegrityViolation(format!(
+                    "attempt {attempt_id}: {field} {text:?} is not an RFC 3339 date-time"
+                ))
+            }),
+    }
 }
 
 pub(super) fn read_attempt(
