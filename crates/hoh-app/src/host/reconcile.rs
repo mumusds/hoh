@@ -82,7 +82,9 @@ pub(super) async fn run(
     host_epoch: i64,
     settings: &ReconcileSettings,
 ) -> Result<(), PersistError> {
-    let rows = store.reconcile_scan(project_id).await?;
+    let rows = store
+        .reconcile_scan(project_id, std::time::SystemTime::now())
+        .await?;
     store
         .reconcile_started(project_id, host_epoch, rows.len())
         .await?;
@@ -114,6 +116,7 @@ pub(super) async fn run(
             task_state: row.task_state,
             process: process.clone(),
             effects,
+            lease_expired: row.lease_expired,
         });
         *counts
             .entry(match disposition {
@@ -124,7 +127,9 @@ pub(super) async fn run(
                 Disposition::UnknownEffect { .. } => "unknown_effect",
             })
             .or_default() += 1;
-        store.reconcile_apply(row, disposition, process).await?;
+        store
+            .reconcile_apply(row, disposition, process, "reconcile")
+            .await?;
     }
     store
         .reconcile_completed(project_id, host_epoch, json!(counts))

@@ -34,18 +34,23 @@ pub struct UnfinishedRow {
     pub boot_id: Option<String>,
     pub process_start_id: Option<String>,
     pub effects: Vec<EffectRow>,
+    /// A lease it holds expired at the time of the scan.
+    pub lease_expired: bool,
+    /// The epoch of the lease it holds (the latest), if any.
+    pub lease_epoch: Option<i64>,
 }
 
 /// One step of a reconcile.
 #[derive(Debug, Clone)]
 pub(super) enum ReconcileJob {
-    Scan(String),
+    Scan(String, std::time::SystemTime),
     Started {
         project_id: String,
         host_epoch: i64,
         unfinished: usize,
     },
-    Apply(Box<(UnfinishedRow, Disposition, Process)>),
+    /// The disposition, what was found of the process, and why (`reconcile`, `lease_expired`).
+    Apply(Box<(UnfinishedRow, Disposition, Process, &'static str)>),
     Completed {
         project_id: String,
         host_epoch: i64,
@@ -66,7 +71,9 @@ pub(super) fn run(
     ctx: &Ctx<'_>,
 ) -> Result<ReconcileDone, PersistError> {
     match job {
-        ReconcileJob::Scan(project_id) => scan(conn, &project_id).map(ReconcileDone::Scanned),
+        ReconcileJob::Scan(project_id, now) => {
+            scan(conn, &project_id, now).map(ReconcileDone::Scanned)
+        }
         ReconcileJob::Started {
             project_id,
             host_epoch,
@@ -80,8 +87,8 @@ pub(super) fn run(
             json!({"host_epoch": host_epoch, "unfinished": unfinished}),
         ),
         ReconcileJob::Apply(step) => {
-            let (row, disposition, process) = *step;
-            apply(conn, &row, &disposition, &process, ctx)
+            let (row, disposition, process, cause) = *step;
+            apply(conn, &row, &disposition, &process, cause, ctx)
         }
         ReconcileJob::Completed {
             project_id,
@@ -98,21 +105,33 @@ pub(super) fn run(
     }
 }
 
-/// The project's unfinished attempts in the order they were made.
-fn scan(conn: &Connection, project_id: &str) -> Result<Vec<UnfinishedRow>, PersistError> {
+/// The project's unfinished attempts in the order they were made, as of `now`.
+fn scan(
+    conn: &Connection,
+    project_id: &str,
+    now: std::time::SystemTime,
+) -> Result<Vec<UnfinishedRow>, PersistError> {
     type Raw = (
         (String, String, String, String, String, i64),
-        (Option<i64>, Option<String>, Option<String>),
+        (
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            bool,
+            Option<i64>,
+        ),
     );
     let mut statement = conn
         .prepare(
             "SELECT r.run_id, a.attempt_id, a.task_id, a.state, t.state, t.revision, a.pid, a.boot_id, \
-             a.process_start_id FROM attempts a JOIN tasks t ON t.task_id = a.task_id JOIN runs r ON r.run_id = t.run_id \
+             a.process_start_id, EXISTS(SELECT 1 FROM leases l WHERE l.attempt_id = a.attempt_id AND l.expires_at <= ?2), \
+             (SELECT max(l.epoch) FROM leases l WHERE l.attempt_id = a.attempt_id) \
+             FROM attempts a JOIN tasks t ON t.task_id = a.task_id JOIN runs r ON r.run_id = t.run_id \
              WHERE r.project_id = ?1 AND a.state IN ('PREPARED', 'STARTING', 'RUNNING') ORDER BY a.rowid",
         )
         .map_err(sqlite_error)?;
     let raws: Vec<Raw> = statement
-        .query_map(params![project_id], |r| {
+        .query_map(params![project_id, crate::time::rfc3339_utc(now)], |r| {
             Ok((
                 (
                     r.get(0)?,
@@ -122,16 +141,16 @@ fn scan(conn: &Connection, project_id: &str) -> Result<Vec<UnfinishedRow>, Persi
                     r.get(4)?,
                     r.get(5)?,
                 ),
-                (r.get(6)?, r.get(7)?, r.get(8)?),
+                (r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?),
             ))
         })
         .map_err(sqlite_error)?
         .collect::<Result<_, _>>()
         .map_err(sqlite_error)?;
     let mut rows = Vec::with_capacity(raws.len());
-    for ((run_id, attempt_id, task_id, state, task_state, task_revision), (pid, boot_id, start)) in
-        raws
-    {
+    for (ids, process) in raws {
+        let (run_id, attempt_id, task_id, state, task_state, task_revision) = ids;
+        let (pid, boot_id, start, lease_expired, lease_epoch) = process;
         let effects = effects_of(conn, &attempt_id)?;
         rows.push(UnfinishedRow {
             project_id: project_id.to_owned(),
@@ -145,6 +164,8 @@ fn scan(conn: &Connection, project_id: &str) -> Result<Vec<UnfinishedRow>, Persi
             boot_id,
             process_start_id: start,
             effects,
+            lease_expired,
+            lease_epoch,
         });
     }
     Ok(rows)
@@ -224,6 +245,7 @@ fn apply(
     row: &UnfinishedRow,
     disposition: &Disposition,
     process: &Process,
+    cause: &str,
     ctx: &Ctx<'_>,
 ) -> Result<ReconcileDone, PersistError> {
     let none: &[EffectMove] = &[];
@@ -252,6 +274,14 @@ fn apply(
             ),
         };
     let tx = writer::begin(conn, ctx)?;
+    // An attempt left unfinished (redelivered, unreaped) is disposed of again later: each pass its own event ids.
+    let pass: i64 = tx
+        .query_row(
+            "SELECT count(*) FROM events WHERE kind = 'reconcile.attempt' AND json_extract(payload_json, '$.attempt_id') = ?1",
+            params![row.attempt_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
     for m in moves {
         let changed = tx
             .execute(
@@ -292,12 +322,13 @@ fn apply(
     }
     let mut events = vec![NewEvent {
         project_id: row.project_id.clone(),
-        event_id: child_id(&row.attempt_id, "reconcile"),
+        event_id: child_id(&row.attempt_id, &format!("{cause}/{pass}/attempt")),
         run_id: Some(row.run_id.clone()),
         kind: "reconcile.attempt".to_owned(),
         payload: json!({
             "attempt_id": row.attempt_id,
             "task_id": row.task_id,
+            "cause": cause,
             "disposition": name,
             "attempt": {"from": row.state.as_str(), "to": attempt_to.map(|s| s.as_str())},
             "task": {"from": row.task_state.as_str(), "to": task_to.map(|s| s.as_str())},
@@ -322,7 +353,7 @@ fn apply(
     if let Some(payload) = diagnostic {
         events.push(NewEvent {
             project_id: row.project_id.clone(),
-            event_id: child_id(&row.attempt_id, "reconcile/diagnostic"),
+            event_id: child_id(&row.attempt_id, &format!("{cause}/{pass}/diagnostic")),
             run_id: Some(row.run_id.clone()),
             kind: "reconcile.diagnostic".to_owned(),
             payload,

@@ -43,6 +43,19 @@ pub struct HostConfig {
     /// The runner, where dispatched work runs; `None` (the product until agents are bound to roles, M2-T07): no
     /// runner, nothing is dispatched by the host (ADR-019 decision 8).
     pub runner: Option<RunnerConfig>,
+    /// The time leases are renewed, expired and granted at: the system clock in the product (tests pass their own,
+    /// CR-006 F2).
+    pub clock: HostClock,
+}
+
+/// The host's clock (a port, [`hoh_core::delivery::Clock`]).
+#[derive(Clone)]
+pub struct HostClock(pub Arc<dyn hoh_core::delivery::Clock>);
+
+impl std::fmt::Debug for HostClock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HostClock")
+    }
 }
 
 impl HostConfig {
@@ -59,6 +72,7 @@ impl HostConfig {
             hooks: Arc::new(NoHostFaults),
             reconcile: ReconcileSettings::default(),
             runner: None,
+            clock: HostClock(Arc::new(hoh_core::delivery::SystemClock)),
         }
     }
 }
@@ -289,7 +303,13 @@ impl Host {
         // The runner after the reconcile (every dispatch it makes or takes comes after reconcile.completed), stopped
         // with the listeners and before the store closes (ADR-019 decision 8).
         if let Some(runner) = config.runner.clone() {
-            served.push(tokio::spawn(runner::run(shared.clone(), runner, stopped)));
+            served.push(tokio::spawn(runner::run(
+                shared.clone(),
+                runner,
+                config.clock.0.clone(),
+                config.reconcile.clone(),
+                stopped,
+            )));
         }
         let written = write_host_json(
             &files,

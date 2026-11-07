@@ -62,6 +62,8 @@ pub(super) enum RunnerJob {
         detail: String,
     },
     Ack(String),
+    /// Renew the unexpired leases these attempts hold, at `now` (REQ-041: every 30 s, for 120 s).
+    Renew(Vec<String>, std::time::SystemTime),
 }
 
 /// What a step gave.
@@ -70,6 +72,8 @@ pub(super) enum RunnerDone {
     Waiting(Waiting),
     /// Whether the step applied (a dispatch already taken or an attempt no longer PREPARED is not).
     Applied(bool),
+    /// How many leases were renewed.
+    Renewed(usize),
 }
 
 pub(super) fn run(
@@ -95,6 +99,23 @@ pub(super) fn run(
             success,
             detail,
         } => finished(conn, &attempt_id, success, &detail, ctx).map(RunnerDone::Applied),
+        RunnerJob::Renew(attempts, now) => {
+            let tx = writer::begin(conn, ctx)?;
+            let at = crate::time::rfc3339_utc(now);
+            let until = crate::time::rfc3339_utc(now + super::LEASE_TTL);
+            let mut renewed = 0;
+            for attempt_id in &attempts {
+                // Only a lease still unexpired: an expired one is the runner's to settle, never to revive.
+                renewed += tx
+                    .execute(
+                        "UPDATE leases SET expires_at = ?1 WHERE attempt_id = ?2 AND expires_at > ?3",
+                        params![until, attempt_id, at],
+                    )
+                    .map_err(sqlite_error)?;
+            }
+            tx.commit().map_err(sqlite_error)?;
+            Ok(RunnerDone::Renewed(renewed))
+        }
         RunnerJob::Ack(message_id) => {
             let tx = writer::begin(conn, ctx)?;
             let changed = tx
