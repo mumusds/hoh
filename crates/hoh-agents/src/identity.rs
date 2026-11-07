@@ -244,9 +244,31 @@ pub enum Group {
     Held,
     /// Nothing is left in it: its leader was reaped and no process has its group id ([`group_empty`]).
     Empty,
-    /// Processes are left in it but it was not watched closely enough since its leader's reap to know they are the
-    /// attempt's: no signal, and its stop is not reaped.
+    /// Whether it is still the attempt's cannot be told: its leader's state could not be read (M2T05R-400), or
+    /// processes are left in it but it was not watched closely enough since its leader's reap to know they are the
+    /// attempt's. No signal, and its stop is not reaped.
     Lost,
+}
+
+/// What a pidfd's fdinfo `Pid:` field (`None`: unreadable or missing) says of leader `pid`.
+fn leader_shown(shown: Option<&str>, pid: u32) -> Leader {
+    match shown {
+        Some(shown) if shown == pid.to_string() => Leader::Unreaped,
+        Some("-1") => Leader::Reaped,
+        _ => Leader::Unknown,
+    }
+}
+
+/// What its pidfd's fdinfo says of a found leader (-1 once it is reaped: seen on Linux 7.0, and pinned on every
+/// kernel the tests run on by `a_zombie_leader_holds_its_group_until_it_is_reaped`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Leader {
+    /// Alive or a zombie: it holds its pid, so its group's number is in use.
+    Unreaped,
+    /// Reaped.
+    Reaped,
+    /// Not readable, or not one of those (another pid namespace's view, a missing field): nothing is told by it.
+    Unknown,
 }
 
 /// The process a record names, if it is still there, without signalling anything (REQ-041 b3).
@@ -254,6 +276,17 @@ pub fn find(
     pid: Option<i64>,
     boot: Option<&str>,
     start: Option<&str>,
+) -> io::Result<Result<Found, Gone>> {
+    find_with(pid, boot, start, || {})
+}
+
+/// [`find`], running `between` after its start time matched and before it is returned (a test seam for a pause
+/// there, M2T05R-401).
+fn find_with(
+    pid: Option<i64>,
+    boot: Option<&str>,
+    start: Option<&str>,
+    between: impl FnOnce(),
 ) -> io::Result<Result<Found, Gone>> {
     let Some(pid) = pid.and_then(|p| u32::try_from(p).ok()).filter(|p| *p > 0) else {
         return Ok(Err(Gone::NoPid));
@@ -274,6 +307,9 @@ pub fn find(
         Err(rustix::io::Errno::SRCH) => return Ok(Err(Gone::NoProcess)),
         Err(e) => return Err(e.into()),
     };
+    // Its start time, read next, shows it holding its pid at some moment after this one: the moment its group is
+    // known to be the attempt's is taken before the read, never after it (M2T05R-401).
+    let seen = Instant::now();
     let Some(now) = start_id(pid)? else {
         return Ok(Err(Gone::NoProcess));
     };
@@ -283,7 +319,7 @@ pub fn find(
             current: now,
         }));
     }
-    // Its start time was read while it held its pid: its group is the attempt's from here.
+    between();
     Ok(Ok(Found {
         identity: Identity {
             pid,
@@ -291,7 +327,7 @@ pub fn find(
             start_id: now,
         },
         pidfd,
-        held: Cell::new(Instant::now()),
+        held: Cell::new(seen),
     }))
 }
 
@@ -317,34 +353,45 @@ pub struct Stopped {
 }
 
 impl Found {
-    /// Whether its leader is unreaped (alive or a zombie): its pidfd's fdinfo still shows its pid, which reads -1
-    /// once it is reaped (a pidfd keeps the process, not its number).
-    fn unreaped(&self) -> bool {
+    /// Its leader's state by its pidfd's fdinfo: its pid while it is unreaped, -1 once it is reaped (a pidfd keeps
+    /// the process, not its number). A read that fails or shows anything else tells nothing (M2T05R-400).
+    fn leader(&self) -> Leader {
         use std::os::fd::AsRawFd as _;
-        std::fs::read_to_string(format!("/proc/self/fdinfo/{}", self.pidfd.as_raw_fd()))
-            .ok()
-            .and_then(|info| {
-                info.lines()
-                    .find_map(|l| l.strip_prefix("Pid:").map(|v| v.trim().to_owned()))
-            })
-            == Some(self.identity.pid.to_string())
+        let shown =
+            std::fs::read_to_string(format!("/proc/self/fdinfo/{}", self.pidfd.as_raw_fd()))
+                .ok()
+                .and_then(|info| {
+                    info.lines()
+                        .find_map(|l| l.strip_prefix("Pid:").map(|v| v.trim().to_owned()))
+                });
+        leader_shown(shown.as_deref(), self.identity.pid)
     }
 
-    /// Look at its group once (ADR-019 decision 8, design correction 4).
+    /// Whether its leader is unreaped (alive or a zombie).
+    #[cfg(test)]
+    fn unreaped(&self) -> bool {
+        self.leader() == Leader::Unreaped
+    }
+
+    /// Look at its group once (ADR-019 decision 8, design corrections 4 and 5). Empty only when its leader is known
+    /// reaped and nothing is left in its group; the moment kept for the next look is taken before this one's reads.
     pub fn look(&self) -> Group {
         let at = Instant::now();
-        if self.unreaped() {
-            self.held.set(at);
-            return Group::Held;
-        }
-        if group_empty(self.identity.pid) {
-            return Group::Empty;
-        }
-        if Instant::now().saturating_duration_since(self.held.get()) <= HELD_FOR {
-            self.held.set(at);
-            Group::Held
-        } else {
-            Group::Lost
+        match self.leader() {
+            Leader::Unreaped => {
+                self.held.set(at);
+                Group::Held
+            }
+            Leader::Unknown => Group::Lost,
+            Leader::Reaped if group_empty(self.identity.pid) => Group::Empty,
+            Leader::Reaped => {
+                if Instant::now().saturating_duration_since(self.held.get()) <= HELD_FOR {
+                    self.held.set(at);
+                    Group::Held
+                } else {
+                    Group::Lost
+                }
+            }
         }
     }
 
@@ -651,6 +698,136 @@ mod tests {
         let stopped = found.stop(Duration::from_secs(2), Duration::from_secs(5));
         assert!(stopped.reaped, "{stopped:?}");
         assert_eq!(found.look(), Group::Empty);
+        Ok(())
+    }
+
+    #[test]
+    fn a_leader_whose_state_cannot_be_read_is_not_taken_for_reaped() {
+        // M2T05R-400: only its own pid (unreaped) and -1 (reaped) tell anything; an unreadable fdinfo, a missing
+        // field, another namespace's 0 or any other number leave the group lost track of, never empty.
+        assert_eq!(leader_shown(Some("42"), 42), Leader::Unreaped);
+        assert_eq!(leader_shown(Some("-1"), 42), Leader::Reaped);
+        for shown in [None, Some("0"), Some("43"), Some(""), Some("-2")] {
+            assert_eq!(leader_shown(shown, 42), Leader::Unknown, "{shown:?}");
+        }
+        // A look whose fdinfo tells nothing (here no pidfd at all, so no Pid: field) for a group that is empty.
+        let found = Found {
+            identity: Identity {
+                pid: 1 << 23,
+                boot_id: String::new(),
+                start_id: String::new(),
+            },
+            pidfd: OwnedFd::from(std::fs::File::open("/dev/null").expect("/dev/null")),
+            held: Cell::new(Instant::now()),
+        };
+        assert!(group_empty(found.identity.pid));
+        assert_eq!(found.look(), Group::Lost);
+        assert_eq!(
+            found.stop(Duration::from_millis(10), Duration::from_millis(10)),
+            Stopped {
+                steps: vec![StopStep::Lost],
+                reaped: false
+            }
+        );
+    }
+
+    #[test]
+    fn a_zombie_leader_holds_its_group_until_it_is_reaped() -> io::Result<()> {
+        // M2T05R-451: the first leg of Held. A leader that exited but is not reaped holds its number, however long
+        // ago it was last looked at; once reaped, with nothing left in its group, the group is empty. This pins the
+        // fdinfo reading on whatever kernel runs the tests.
+        assert_eq!(HELD_FOR, Duration::from_millis(100));
+        use std::os::unix::process::CommandExt as _;
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "read -r go; exit 0"])
+            .process_group(0)
+            .stdin(std::process::Stdio::piped())
+            .spawn()?;
+        let leader = child.id();
+        let _guard = Guard(leader);
+        let found = found(leader)?;
+        drop(child.stdin.take());
+        assert!(wait_until(|| found.leader() == Leader::Unreaped
+            && std::fs::read_to_string(format!("/proc/{leader}/stat"))
+                .is_ok_and(|stat| stat.rsplit(')').next().is_some_and(
+                    |rest| rest.trim_start().starts_with('Z')
+                ))));
+        std::thread::sleep(HELD_FOR + Duration::from_millis(50));
+        assert_eq!(found.look(), Group::Held);
+        child.wait()?;
+        assert_eq!(found.leader(), Leader::Reaped);
+        assert_eq!(found.look(), Group::Empty);
+        Ok(())
+    }
+
+    #[test]
+    fn a_pause_after_the_identity_was_read_is_not_taken_for_a_fresh_look() -> io::Result<()> {
+        // M2T05R-401: the moment its group is known to be the attempt's is taken before the start time is read. Here
+        // the leader dies and is reaped right after that read, and HELD_FOR passes before the look: its member,
+        // left in the group, gets nothing.
+        let leader = leader_with_a_member_ignoring_term()?;
+        let _guard = Guard(leader);
+        let me = of(leader)?.ok_or_else(|| io::Error::other("it is not running"))?;
+        let found = find_with(
+            Some(i64::from(leader)),
+            Some(&me.boot_id),
+            Some(&me.start_id),
+            || {
+                if let Some(pid) = i32::try_from(leader).ok().and_then(Pid::from_raw) {
+                    let _ = rustix::process::kill_process(pid, Signal::TERM);
+                }
+                wait_until(|| start_id(leader).is_ok_and(|s| s.is_none()));
+                std::thread::sleep(HELD_FOR + Duration::from_millis(50));
+            },
+        )?
+        .map_err(|g| io::Error::other(format!("{g:?}")))?;
+        assert_eq!(found.leader(), Leader::Reaped);
+        assert_eq!(found.look(), Group::Lost);
+        assert!(!group_empty(leader));
+        Ok(())
+    }
+
+    #[test]
+    fn a_churning_group_whose_leader_is_gone_is_never_read_as_gone() -> io::Result<()> {
+        // M2T05R-450: the reconcile's view of a record whose leader is gone (no pidfd of it): its relaying members
+        // keep the group, so every inspection is Leaderless (no signal, slot kept), never Gone.
+        use std::io::Write as _;
+        use std::os::unix::process::CommandExt as _;
+        let mut child = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "read -r go; relay() { (sleep 0.002; relay) & }; relay; exit 0",
+            ])
+            .process_group(0)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        let leader = child.id();
+        let _guard = Guard(leader);
+        let me = of(leader)?.ok_or_else(|| io::Error::other("it is not running"))?;
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other("no stdin"))?
+            .write_all(b"go\n")?;
+        child.wait()?;
+        let mut looks = 0;
+        let end = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < end {
+            let seen = presence(
+                Some(i64::from(leader)),
+                Some(&me.boot_id),
+                Some(&me.start_id),
+            )?;
+            assert!(
+                matches!(&seen, Presence::Leaderless(l) if l.pgid == leader),
+                "after {looks}: {seen:?}"
+            );
+            looks += 1;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(looks > 100);
         Ok(())
     }
 
