@@ -989,6 +989,7 @@ async fn a_late_failure_of_an_earlier_delivery_does_not_undo_a_later_success() -
     let first = store
         .claim_outbox(clock.now(), qa.clone(), 2)
         .await?
+        .and_then(hoh_core::persistence::Claimed::start)
         .ok_or("nothing due")?;
     clock.set(
         hoh_core::time::parse_rfc3339(first.next_retry_at.as_deref().ok_or("no retry")?)
@@ -997,6 +998,7 @@ async fn a_late_failure_of_an_earlier_delivery_does_not_undo_a_later_success() -
     let second = store
         .claim_outbox(clock.now(), qa.clone(), 2)
         .await?
+        .and_then(hoh_core::persistence::Claimed::start)
         .ok_or("not due again")?;
     assert_eq!((first.attempt_count, second.attempt_count), (1, 2));
     let local = LocalTransport::new(&store, &clock).with("qa", Touch);
@@ -1538,7 +1540,10 @@ async fn a_claim_whose_dispatcher_stopped_waiting_costs_no_delivery() -> R {
         assert!(cancelled.is_err(), "the tick was not held up");
         holder.wait()?;
         // Anything queued behind the claim returns only once the writer is past it.
-        store.claim_outbox(clock.now(), Vec::new(), 3).await?;
+        store
+            .claim_outbox(clock.now(), Vec::new(), 3)
+            .await?
+            .and_then(hoh_core::persistence::Claimed::start);
         clock.set(clock.now() + Duration::from_secs(120));
     }
     assert_eq!(
@@ -1598,6 +1603,7 @@ async fn a_late_answer_to_a_dead_lettered_message_makes_it_acked() -> R {
     let first = store
         .claim_outbox(clock.now(), qa.clone(), 2)
         .await?
+        .and_then(hoh_core::persistence::Claimed::start)
         .ok_or("nothing due")?;
     LocalTransport::new(&store, &clock)
         .with("qa", Touch)
@@ -1608,6 +1614,7 @@ async fn a_late_answer_to_a_dead_lettered_message_makes_it_acked() -> R {
     let second = store
         .claim_outbox(clock.now(), qa, 2)
         .await?
+        .and_then(hoh_core::persistence::Claimed::start)
         .ok_or("not due again")?;
     store
         .settle_outbox(
@@ -1726,5 +1733,189 @@ async fn the_remaining_refusals_of_results_and_packages_write_nothing() -> R {
     }
     assert_eq!(one(&db2, "SELECT count(*) FROM receipts")?, json!(0));
     assert_eq!(one(&db, "SELECT count(*) FROM outbox")?, json!(0));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_claim_answered_but_never_read_returns_itself() -> R {
+    // M2T04R-200: the writer has sent the claim's answer; the tick is dropped before it reads it. The answer dies with
+    // its channel, and the claim with it.
+    use std::io::BufRead as _;
+    use std::task::{Context, Waker};
+    let dir = tempfile::tempdir()?;
+    let (store, db) = open(&dir)?;
+    seed(&db, WORLD)?;
+    enqueue(&store, "u", &[to_qa("u", 3, 2, &sha(2), None)?]).await?;
+    let clock = FakeClock::new();
+    let local = LocalTransport::new(&store, &clock).with("qa", Noop);
+    let dispatcher = Dispatcher {
+        store: &store,
+        clock: &clock,
+        transport: &local,
+        roles: local.roles(),
+        max_attempts: 3,
+        batch: 1,
+    };
+    for _ in 0..3 {
+        let mut holder = Command::new("python3")
+            .args([
+                "-c",
+                "import sqlite3,sys,time\nc=sqlite3.connect(sys.argv[1],isolation_level=None,timeout=30)\nc.execute('BEGIN IMMEDIATE')\nprint('locked',flush=True)\ntime.sleep(0.4)\nc.execute('COMMIT')",
+            ])
+            .arg(&db)
+            .stdout(std::process::Stdio::piped())
+            .spawn()?;
+        let mut line = String::new();
+        std::io::BufReader::new(holder.stdout.take().ok_or("no stdout")?).read_line(&mut line)?;
+        // Boxed, so that dropping it drops the future (a pinned local would live to the end of the loop body).
+        let mut tick = Box::pin(dispatcher.tick());
+        assert!(
+            tick.as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        holder.wait()?;
+        // Queued behind the claim: when it returns, the claim's answer is waiting, unread, in its channel.
+        store.claim_outbox(clock.now(), Vec::new(), 3).await?;
+        drop(tick);
+        // The returned claim is undone before anything queued after it.
+        store.claim_outbox(clock.now(), Vec::new(), 3).await?;
+        assert_eq!(
+            rows(
+                &db,
+                "SELECT state, attempt_count FROM outbox WHERE message_id = 'u'"
+            )?,
+            [[json!("PENDING"), json!(0)]]
+        );
+        clock.set(clock.now() + Duration::from_secs(120));
+    }
+    dispatcher.tick().await?;
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT state, attempt_count FROM outbox WHERE message_id = 'u'"
+        )?,
+        [[json!("ACKED"), json!(1)]]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn only_the_runtime_mark_keeps_a_row_from_its_check() -> R {
+    // M2T04R-201: notice false, 1 or another string is no runtime notice.
+    let dir = tempfile::tempdir()?;
+    let (store, db) = open(&dir)?;
+    seed(&db, WORLD)?;
+    let mut sql = String::from(
+        "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES ('p1', 'e', 'R', 'x', '{}', 'now');\n",
+    );
+    for (id, mark) in [
+        ("n-false", json!(false)),
+        ("n-one", json!(1)),
+        ("n-other", json!("other")),
+    ] {
+        let mut payload = protocol::encode(&to_qa(id, 3, 2, &sha(2), None)?)?;
+        payload["notice"] = mark;
+        sql.push_str(&format!(
+            "INSERT INTO outbox(message_id, event_seq, run_id, recipient_role, role_epoch, payload_json, state) \
+             VALUES ('{id}', (SELECT max(seq) FROM events), 'R', 'qa', 2, '{}', 'PENDING');\n",
+            payload.to_string().replace('\'', "''")
+        ));
+    }
+    seed(&db, &sql)?;
+    let clock = FakeClock::new();
+    let local = LocalTransport::new(&store, &clock).with("qa", Touch);
+    let dispatcher = Dispatcher {
+        store: &store,
+        clock: &clock,
+        transport: &local,
+        roles: local.roles(),
+        max_attempts: 5,
+        batch: 10,
+    };
+    let tick = dispatcher.tick().await?;
+    assert_eq!(tick.invalid, ["n-false", "n-one", "n-other"]);
+    assert_eq!(
+        one(
+            &db,
+            "SELECT count(*) FROM events WHERE kind = 'message.invalid'"
+        )?,
+        json!(3)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_package_that_disagrees_with_its_envelope_is_refused_when_consumed_directly() -> R {
+    // M2T04R-250: queued as valid messages (so the receipt's foreign key holds), consumed as variants that disagree.
+    let dir = tempfile::tempdir()?;
+    let (store, db) = open(&dir)?;
+    seed(&db, WORLD)?;
+    let ids = ["d-run", "d-role", "d-spec"];
+    let valid = ids.iter().map(|id| qa_handoff(id)).collect::<R<Vec<_>>>()?;
+    enqueue(&store, "d", &valid).await?;
+    for (mut bad, (key, value)) in valid.into_iter().zip([
+        ("run_id", json!("R2")),
+        ("role", json!("reviewer")),
+        ("spec_sha256", json!(sha(1))),
+    ]) {
+        bad.payload.insert(key.to_owned(), value);
+        let refused = store
+            .consume(
+                "qa",
+                bad.clone(),
+                Touch.effect(&bad),
+                FakeClock::new().now(),
+            )
+            .await;
+        assert!(
+            matches!(&refused, Err(PersistError::IntegrityViolation(e)) if e.contains("disagrees")),
+            "{key}: {refused:?}"
+        );
+    }
+    assert_eq!(
+        one(&db, "SELECT revision FROM tasks WHERE task_id = 'T'")?,
+        json!(3)
+    );
+    assert_eq!(one(&db, "SELECT count(*) FROM receipts")?, json!(0));
+    Ok(())
+}
+
+#[tokio::test]
+async fn attempts_are_ordered_by_creation_not_by_their_ids() -> R {
+    // M2T04R-252: D/attempt-10 is newer than D/attempt-9 although it sorts before it as text.
+    let (_dir, store, db) = world_with(
+        "INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision) VALUES ('D/attempt-9', 'D', 'FAILED', 1, 1, 1);
+         INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision) VALUES ('D/attempt-10', 'D', 'RUNNING', 1, 1, 1);",
+    )
+    .await?;
+    let mut result = developer_result()?;
+    result.attempt_id = "D/attempt-10".to_owned();
+    let outcome = store.accept_task_result(result).await?;
+    assert!(
+        matches!(outcome, TaskResultOutcome::Accepted { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(one(&db, "SELECT count(*) FROM outbox")?, json!(2));
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_same_result_with_an_extreme_number_replays() -> R {
+    // M2T04R-253: compared as stored text, a number that needs an exact float round trip still matches.
+    let (_dir, store, _db) = world_with("").await?;
+    let mut result = developer_result()?;
+    // The exact f64 (a literal), not a parse of text: reparsing its stored text without an exact round trip may give
+    // a neighbour, which a comparison of reparsed values would take for another result.
+    let Value::Object(issue) = json!({"weight": 1.234_567_890_123_456_7e-300_f64}) else {
+        return Err("not an object".into());
+    };
+    result.issues = vec![issue];
+    store.accept_task_result(result.clone()).await?;
+    let again = store.accept_task_result(result).await?;
+    assert!(
+        matches!(again, TaskResultOutcome::Replayed { .. }),
+        "{again:?}"
+    );
     Ok(())
 }

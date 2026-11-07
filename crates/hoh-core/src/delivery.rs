@@ -161,6 +161,7 @@ impl<C: Clock, T: Transport> Dispatcher<'_, C, T> {
                 .store
                 .claim_outbox(self.clock.now(), self.roles.clone(), self.max_attempts)
                 .await?
+                .and_then(crate::persistence::Claimed::start)
             else {
                 break;
             };
