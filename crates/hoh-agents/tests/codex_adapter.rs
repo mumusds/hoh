@@ -2003,7 +2003,7 @@ async fn a_frame_too_large_during_a_refused_handshake_fails_the_attempt() -> R {
 
 /// A frame longer than the 1 MiB limit, on app-server or on exec, fails the turn as PROTOCOL_FRAME_TOO_LARGE with its
 /// diagnosis (length, prefix sha256, first 4 KiB); nothing more is read as frames and codex's group is stopped
-/// (M1-T07 done_when; the host-level AC-027-03 is M2-T05's).
+/// (M1-T07 done_when; the host-level AC-027-03 is M2-T07's (CR-008)).
 #[tokio::test]
 async fn a_frame_too_large_fails_the_turn_with_its_diagnosis() -> R {
     let world = World::new()?;

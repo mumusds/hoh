@@ -59,15 +59,26 @@ pub fn of(pid: u32) -> io::Result<Option<Identity>> {
     }))
 }
 
-/// The facts of an attempt's move to RUNNING for its process `pid`: the pid with the boot and start time that name it
-/// (REQ-041 b3). A start time that cannot be read is left out: the reconcile then treats the pid as another process's.
-pub fn running(pid: u32) -> hoh_core::persistence::AttemptFacts {
-    let identity = of(pid).ok().flatten();
+/// The facts of an attempt's move to RUNNING for its process: the whole identity that names it (REQ-041 b3). Only a
+/// complete identity is recorded; one that cannot be read leaves the process at its gate (M2T05R-100).
+pub fn running(identity: &Identity) -> hoh_core::persistence::AttemptFacts {
     hoh_core::persistence::AttemptFacts {
-        pid: Some(i64::from(pid)),
-        boot_id: identity.as_ref().map(|i| i.boot_id.clone()),
-        process_start_id: identity.map(|i| i.start_id),
+        pid: Some(i64::from(identity.pid)),
+        boot_id: Some(identity.boot_id.clone()),
+        process_start_id: Some(identity.start_id.clone()),
         ..hoh_core::persistence::AttemptFacts::default()
+    }
+}
+
+/// The facts of a move to RUNNING by an adapter that starts its process itself (no start gate before M2-T07): the pid
+/// and, when it can be read, the rest of its identity; a record left incomplete is uncertain to every reconcile.
+pub fn running_pid(pid: u32) -> hoh_core::persistence::AttemptFacts {
+    match of(pid).ok().flatten() {
+        Some(identity) => running(&identity),
+        None => hoh_core::persistence::AttemptFacts {
+            pid: Some(i64::from(pid)),
+            ..hoh_core::persistence::AttemptFacts::default()
+        },
     }
 }
 
@@ -119,12 +130,18 @@ pub enum Presence {
     Ours(Found),
     /// Its leader gone, members left in its group.
     Leaderless(Leaderless),
+    /// A pid recorded without the boot or the start time that would tell it apart: nothing can be confirmed
+    /// (M2T05R-100).
+    Unverifiable,
     /// Nothing of it is left (or never was): why.
     Gone(Gone),
 }
 
 /// What a record names now: [`find`], and for a leader that is gone, whether its group still has members.
 pub fn presence(pid: Option<i64>, boot: Option<&str>, start: Option<&str>) -> io::Result<Presence> {
+    if pid.is_some() && (boot.is_none() || start.is_none()) {
+        return Ok(Presence::Unverifiable);
+    }
     Ok(match find(pid, boot, start)? {
         Ok(found) => Presence::Ours(found),
         Err(Gone::NoProcess) => {
@@ -229,6 +246,25 @@ impl Found {
         }
     }
 
+    /// Its leader exited and nothing is left in its group.
+    pub fn gone(&self) -> bool {
+        self.exited() && crate::process::group_members(self.identity.pid).is_empty()
+    }
+
+    /// End what is left of it: nothing when its leader exited and its group is empty, else [`Found::stop`]. Held by
+    /// its pidfd since it was started, its group id cannot have been reused, so whatever is in the group is its own
+    /// (ADR-019 decision 8, M2T05R-101).
+    pub fn settle_group(&self, term_grace: Duration, kill_grace: Duration) -> Stopped {
+        if self.gone() {
+            Stopped {
+                steps: vec![StopStep::Reaped],
+                reaped: true,
+            }
+        } else {
+            self.stop(term_grace, kill_grace)
+        }
+    }
+
     /// SIGTERM to its group, SIGKILL to its group and leader after `term_grace`, then wait `kill_grace` for the
     /// leader to exit and the group to empty (an orphan is reaped by its new parent). The group gets a signal only
     /// while its leader is alive (its pidfd unreadable, so the group id is its) or members are left in it (a group id
@@ -287,7 +323,7 @@ mod tests {
         let out = std::process::Command::new("sh")
             .args([
                 "-c",
-                "setsid sh -c 'trap \"\" TERM; while :; do sleep 0.05; done' </dev/null >/dev/null 2>&1 & echo $!",
+                "setsid sh -c 'trap \"\" TERM; sleep 1000 & while :; do sleep 0.05; done' </dev/null >/dev/null 2>&1 & echo $!",
             ])
             .output()?;
         String::from_utf8_lossy(&out.stdout)

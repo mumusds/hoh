@@ -1078,13 +1078,23 @@ fn test_041_01_kill_at_each_point_of_a_dispatch_never_runs_an_effect_twice() -> 
     Ok(())
 }
 
-/// A clock the test moves (CR-006 F2: a clock swapped by test code).
-#[derive(Debug)]
-struct FakeClock(std::sync::Mutex<std::time::SystemTime>);
+/// A clock the test moves forward (CR-006 F2: a clock swapped by test code): the system time plus a jump the test
+/// adds, so it never runs behind the system time an attempt's end is recorded at.
+#[derive(Debug, Default)]
+struct FakeClock(std::sync::Mutex<Duration>);
+
+impl FakeClock {
+    /// Jump `by` ahead.
+    fn advance(&self, by: Duration) {
+        if let Ok(mut ahead) = self.0.lock() {
+            *ahead += by;
+        }
+    }
+}
 
 impl hoh_core::delivery::Clock for FakeClock {
     fn now(&self) -> std::time::SystemTime {
-        self.0.lock().map(|t| *t).unwrap_or(std::time::UNIX_EPOCH)
+        std::time::SystemTime::now() + self.0.lock().map(|d| *d).unwrap_or_default()
     }
 }
 
@@ -1111,7 +1121,9 @@ impl hoh_app::host::Executor for StuckExecutor {
         let mut child = Command::new("sh")
             .args([
                 "-c",
-                "trap '' TERM; read -r go; [ \"$go\" = go ] || exit 0; while :; do sleep 0.05; done",
+                // A member that lives on in its group and ignores SIGTERM too (M2T05R-152): only a SIGKILL to the
+                // whole group ends it.
+                "trap '' TERM; read -r go; [ \"$go\" = go ] || exit 0; sleep 1000 & while :; do sleep 0.05; done",
             ])
             .process_group(0)
             .stdin(std::process::Stdio::piped())
@@ -1207,8 +1219,7 @@ async fn test_041_02_an_expired_lease_is_granted_again_only_after_its_holder_is_
     let (code, stderr) = serve_and_stop(&project)?;
     assert_eq!(code, 0, "{stderr}");
     seed(&project, WRITERS)?;
-    let start = std::time::SystemTime::now();
-    let clock = Arc::new(FakeClock(std::sync::Mutex::new(start)));
+    let clock = Arc::new(FakeClock::default());
     let executor = Arc::new(StuckExecutor {
         cancels: dir.path().join("cancels"),
         started: std::sync::Mutex::new(Vec::new()),
@@ -1264,9 +1275,7 @@ async fn test_041_02_an_expired_lease_is_granted_again_only_after_its_holder_is_
     if let Ok(mut watched) = grant_probe.pid.lock() {
         *watched = Some(pid);
     }
-    if let Ok(mut now) = clock.0.lock() {
-        *now = start + Duration::from_secs(300);
-    }
+    clock.advance(Duration::from_secs(300));
     // The next grant: epoch 5, after A1's chain.
     assert!(until(
         "SELECT count(*) FROM outbox WHERE json_extract(payload_json, '$.kind') = 'dispatch' \
@@ -1410,7 +1419,21 @@ async fn runner_host(
     clock: Arc<FakeClock>,
     faults: Option<Arc<dyn FaultHooks>>,
 ) -> R<Host> {
+    runner_host_observing(project, executor, clock, faults, None).await
+}
+
+/// [`runner_host`] whose effects are looked for by `observer` (else the product's, which confirms nothing).
+async fn runner_host_observing(
+    project: &Path,
+    executor: Arc<dyn hoh_app::host::Executor>,
+    clock: Arc<FakeClock>,
+    faults: Option<Arc<dyn FaultHooks>>,
+    observer: Option<Arc<dyn hoh_core::reconcile::Observer>>,
+) -> R<Host> {
     let mut config = config(project);
+    if let Some(observer) = observer {
+        config.reconcile.observer = observer;
+    }
     config.clock = hoh_app::host::HostClock(clock);
     config.reconcile.term_grace = Duration::from_millis(300);
     config.reconcile.kill_grace = Duration::from_secs(5);
@@ -1516,9 +1539,7 @@ async fn a_leaderless_group_keeps_its_slot_and_gets_no_signal() -> R {
     )?;
     let work = dir.path().join("work");
     std::fs::create_dir_all(work.join("markers"))?;
-    let clock = Arc::new(FakeClock(std::sync::Mutex::new(
-        std::time::SystemTime::now(),
-    )));
+    let clock = Arc::new(FakeClock::default());
     let host = runner_host(&project, Arc::new(FakeExecutor(work.clone())), clock, None).await?;
     let db = db(&project);
     // The reconcile's diagnostic, then a few runner ticks with the lease expired.
@@ -1559,9 +1580,10 @@ async fn a_leaderless_group_keeps_its_slot_and_gets_no_signal() -> R {
     Ok(())
 }
 
-/// Runs each attempt's work as a gated FakeAgent whose start takes `0` before it spawns (M2T05R-03).
+/// Runs each attempt's work as a gated FakeAgent whose start does not return before the file `0` exists (M2T05R-03,
+/// -153: a latch the test opens, not a fixed time).
 #[derive(Debug)]
-struct SlowStart(Duration, FakeExecutor);
+struct SlowStart(PathBuf, FakeExecutor);
 
 impl hoh_app::host::Executor for SlowStart {
     fn deliver(
@@ -1572,7 +1594,10 @@ impl hoh_app::host::Executor for SlowStart {
     }
 
     fn start(&self, work: &hoh_app::host::Work) -> Result<hoh_app::host::Started, String> {
-        std::thread::sleep(self.0);
+        let end = Instant::now() + Duration::from_secs(30);
+        while !self.0.exists() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         self.1.start(work)
     }
 }
@@ -1589,14 +1614,11 @@ async fn a_settle_waits_for_a_start_still_in_progress() -> R {
     seed(&project, WRITERS)?;
     let work = dir.path().join("work");
     std::fs::create_dir_all(work.join("markers"))?;
-    let start = std::time::SystemTime::now();
-    let clock = Arc::new(FakeClock(std::sync::Mutex::new(start)));
+    let latch = dir.path().join("latch");
+    let clock = Arc::new(FakeClock::default());
     let host = runner_host(
         &project,
-        Arc::new(SlowStart(
-            Duration::from_millis(800),
-            FakeExecutor(work.clone()),
-        )),
+        Arc::new(SlowStart(latch.clone(), FakeExecutor(work.clone()))),
         clock.clone(),
         None,
     )
@@ -1609,9 +1631,10 @@ async fn a_settle_waits_for_a_start_still_in_progress() -> R {
         Duration::from_secs(10)
     )?);
     let a1 = query(&db, "SELECT attempt_id FROM attempts WHERE task_id = 'T1'")?;
-    if let Ok(mut now) = clock.0.lock() {
-        *now = start + Duration::from_secs(300);
-    }
+    clock.advance(Duration::from_secs(300));
+    // Ticks go on and A1's settle begins while its start is held; then the start goes on.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    std::fs::write(&latch, "")?;
     assert!(wait_for(
         &db,
         "SELECT count(*) FROM outbox WHERE json_extract(payload_json, '$.lease.epoch') = 5",
@@ -1669,9 +1692,7 @@ async fn a_lost_completion_is_settled_never_run_again() -> R {
     let (code, stderr) = serve_and_stop(&project)?;
     assert_eq!(code, 0, "{stderr}");
     seed(&project, WRITERS)?;
-    let clock = Arc::new(FakeClock(std::sync::Mutex::new(
-        std::time::SystemTime::now(),
-    )));
+    let clock = Arc::new(FakeClock::default());
     let executor = Arc::new(Losing(StuckExecutor {
         cancels: dir.path().join("cancels"),
         started: std::sync::Mutex::new(Vec::new()),
@@ -1752,8 +1773,7 @@ async fn a_settle_cut_short_is_done_again_by_another_pass() -> R {
     let (code, stderr) = serve_and_stop(&project)?;
     assert_eq!(code, 0, "{stderr}");
     seed(&project, WRITERS)?;
-    let start = std::time::SystemTime::now();
-    let clock = Arc::new(FakeClock(std::sync::Mutex::new(start)));
+    let clock = Arc::new(FakeClock::default());
     let executor = Arc::new(StuckExecutor {
         cancels: dir.path().join("cancels"),
         started: std::sync::Mutex::new(Vec::new()),
@@ -1780,9 +1800,7 @@ async fn a_settle_cut_short_is_done_again_by_another_pass() -> R {
     faults
         .armed
         .store(true, std::sync::atomic::Ordering::SeqCst);
-    if let Ok(mut now) = clock.0.lock() {
-        *now = start + Duration::from_secs(300);
-    }
+    clock.advance(Duration::from_secs(300));
     assert!(wait_for(
         &db,
         "SELECT count(*) FROM outbox WHERE json_extract(payload_json, '$.lease.epoch') = 5",
@@ -1990,5 +2008,364 @@ fn a_running_attempt_with_no_process_record_keeps_its_slot() -> R {
         )?,
         "uncertain/running_without_a_process_record"
     );
+    Ok(())
+}
+
+/// Runs each attempt's work as a gated agent whose leader leaves a member in its group that ignores SIGTERM and lives
+/// on, then ends at once with success (M2T05R-101).
+#[derive(Debug)]
+struct LeavesAMember(FakeExecutor);
+
+impl hoh_app::host::Executor for LeavesAMember {
+    fn deliver(
+        &self,
+        work: &hoh_app::host::Work,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
+        self.0.deliver(work)
+    }
+
+    fn start(&self, _work: &hoh_app::host::Work) -> Result<hoh_app::host::Started, String> {
+        use std::os::unix::process::CommandExt as _;
+        let mut child = Command::new("sh")
+            .args([
+                "-c",
+                "read -r go; [ \"$go\" = go ] || exit 0; sh -c 'trap \"\" TERM; exec sleep 1000' </dev/null >/dev/null 2>&1 & exit 0",
+            ])
+            .process_group(0)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        let pid = child.id();
+        let gate = gate(&mut child);
+        let (end, ended) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let status = child.wait();
+            let _ = end.send(hoh_app::host::Outcome {
+                success: status.as_ref().is_ok_and(std::process::ExitStatus::success),
+                detail: format!("{status:?}"),
+            });
+        });
+        Ok(hoh_app::host::Started { pid, gate, ended })
+    }
+}
+
+/// M2T05R-101: A1's leader ends with success but leaves a member in its group that ignores SIGTERM. The runner ends
+/// that group (held by its pidfd) before A1 settles, so when T2 is granted the writer lease no process of A1's group
+/// is left (scanned inside the granting round).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_finished_leader_settles_only_once_its_group_is_gone() -> R {
+    let dir = tempfile::tempdir()?;
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    let (code, stderr) = serve_and_stop(&project)?;
+    assert_eq!(code, 0, "{stderr}");
+    seed(&project, WRITERS)?;
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(work.join("markers"))?;
+    let clock = Arc::new(FakeClock::default());
+    let probe = Arc::new(GrantProbe::default());
+    let host = runner_host(
+        &project,
+        Arc::new(LeavesAMember(FakeExecutor(work))),
+        clock,
+        Some(probe.clone()),
+    )
+    .await?;
+    let db = db(&project);
+    assert!(wait_for(
+        &db,
+        "SELECT count(*) FROM attempts WHERE task_id = 'T1' AND pid IS NOT NULL",
+        "1",
+        Duration::from_secs(10)
+    )?);
+    let pid: u32 = query(&db, "SELECT pid FROM attempts WHERE task_id = 'T1'")?.parse()?;
+    if let Ok(mut watched) = probe.pid.lock() {
+        *watched = Some(pid);
+    }
+    let _guard = GroupGuard(pid);
+    assert!(wait_for(
+        &db,
+        "SELECT state FROM attempts WHERE task_id = 'T1'",
+        "SETTLED",
+        Duration::from_secs(20)
+    )?);
+    assert!(wait_for(
+        &db,
+        "SELECT count(*) FROM attempts WHERE task_id = 'T2'",
+        "1",
+        Duration::from_secs(10)
+    )?);
+    let at_grant = probe.seen.lock().map(|s| s.clone()).unwrap_or_default();
+    assert!(
+        !at_grant.is_empty() && at_grant.iter().all(Vec::is_empty),
+        "{at_grant:?}"
+    );
+    assert!(hoh_agents::process::group_members(pid).is_empty());
+    host.shutdown().await;
+    Ok(())
+}
+
+/// M2T05R-100, -151: holders the runner cannot confirm gone keep their slot past their lease: one recorded with the
+/// pid of a live process but no boot or start time, one RUNNING with no process record. Neither is signalled, and the
+/// writer task waiting behind them is not granted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_runner_keeps_the_slot_of_a_holder_it_cannot_confirm_gone() -> R {
+    for partial in [true, false] {
+        let dir = tempfile::tempdir()?;
+        let project = dir.path().join("p");
+        std::fs::create_dir_all(&project)?;
+        let (code, stderr) = serve_and_stop(&project)?;
+        assert_eq!(code, 0, "{stderr}");
+        let log = dir.path().join("signals.log");
+        let script = format!(
+            "for s in TERM INT HUP; do trap \"echo $s >> '{}'\" $s; done; while :; do sleep 0.05; done",
+            log.display()
+        );
+        let live = ChildGuard({
+            use std::os::unix::process::CommandExt as _;
+            Command::new("sh")
+                .args(["-c", &script])
+                .process_group(0)
+                .stdin(std::process::Stdio::null())
+                .spawn()?
+        });
+        let pid = if partial {
+            live.0.id().to_string()
+        } else {
+            "NULL".to_owned()
+        };
+        seed(
+            &project,
+            &format!(
+                "{WRITERS}
+                 UPDATE tasks SET state = 'RUNNING' WHERE task_id = 'T1';
+                 INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, pid, started_at)
+                   VALUES ('A1', 'T1', 'RUNNING', 2, 1, 1, {pid}, '2026-11-07T00:00:00Z');
+                 UPDATE leases SET attempt_id = 'A1', epoch = 4 WHERE kind = 'writer';"
+            ),
+        )?;
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(work.join("markers"))?;
+        let clock = Arc::new(FakeClock::default());
+        let host = runner_host(&project, Arc::new(FakeExecutor(work)), clock, None).await?;
+        let db = db(&project);
+        assert!(wait_for(
+            &db,
+            "SELECT count(*) > 0 FROM events WHERE kind = 'reconcile.attempt' AND json_extract(payload_json, '$.cause') = 'lease_expired'",
+            "1",
+            Duration::from_secs(10)
+        )?);
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let basis = if partial {
+            "incomplete_process_record"
+        } else {
+            "running_without_a_process_record"
+        };
+        assert_eq!(
+            query(
+                &db,
+                "SELECT group_concat(DISTINCT json_extract(payload_json, '$.cause') || ':' || json_extract(payload_json, '$.process.basis') || ':' || json_extract(payload_json, '$.disposition')) \
+                 FROM events WHERE kind = 'reconcile.attempt' AND json_extract(payload_json, '$.attempt_id') = 'A1' ORDER BY seq"
+            )?
+            .split(',')
+            .collect::<std::collections::BTreeSet<_>>(),
+            [format!("reconcile:{basis}:unreaped"), format!("lease_expired:{basis}:unreaped")]
+                .iter()
+                .map(String::as_str)
+                .collect(),
+            "partial={partial}"
+        );
+        assert_eq!(
+            query(&db, "SELECT state FROM attempts WHERE attempt_id = 'A1'")?,
+            "RUNNING"
+        );
+        assert_eq!(
+            query(&db, "SELECT count(*) FROM attempts WHERE task_id = 'T2'")?,
+            "0"
+        );
+        assert_eq!(std::fs::read_to_string(&log).unwrap_or_default(), "");
+        host.shutdown().await;
+        drop(live);
+    }
+    Ok(())
+}
+
+/// Fails the commit of the `nth` write of the runner (counted at each Runner request's Begun point) once armed.
+#[derive(Debug)]
+struct FailNthRunnerWrite {
+    nth: u32,
+    seen: std::sync::atomic::AtomicU32,
+    fail: std::sync::atomic::AtomicBool,
+}
+
+impl FaultHooks for FailNthRunnerWrite {
+    fn at(&self, job: &'static str, point: WritePoint) {
+        use std::sync::atomic::Ordering;
+        if job == "Runner"
+            && point == WritePoint::Begun
+            && self.seen.fetch_add(1, Ordering::SeqCst) + 1 == self.nth
+        {
+            self.fail.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn before_commit(&self) -> Result<(), hoh_core::persistence::PersistError> {
+        if self.fail.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Err(hoh_core::persistence::PersistError::Full(
+                "injected: a runner write failed".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// M2T05R-102, -150: a write of an attempt's task fails (its receipt; its OBSERVED effect). The task's entry goes
+/// with it: the receipt's failure leaves the dispatch to be delivered again; the later one is settled at once with
+/// the process it holds (its work found by its marker): either way T1 ends IMPLEMENTED and T2 follows, no lease kept
+/// alive for a task that ended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_runner_write_that_fails_does_not_strand_its_attempt() -> R {
+    for nth in [1, 3] {
+        let dir = tempfile::tempdir()?;
+        let project = dir.path().join("p");
+        std::fs::create_dir_all(&project)?;
+        let (code, stderr) = serve_and_stop(&project)?;
+        assert_eq!(code, 0, "{stderr}");
+        seed(&project, WRITERS)?;
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(work.join("markers"))?;
+        let clock = Arc::new(FakeClock::default());
+        let faults = Arc::new(FailNthRunnerWrite {
+            nth,
+            seen: std::sync::atomic::AtomicU32::new(0),
+            fail: std::sync::atomic::AtomicBool::new(false),
+        });
+        let host = runner_host_observing(
+            &project,
+            Arc::new(FakeExecutor(work.clone())),
+            clock,
+            Some(faults),
+            Some(Arc::new(Markers(work.clone()))),
+        )
+        .await?;
+        let db = db(&project);
+        assert!(
+            wait_for(
+                &db,
+                "SELECT group_concat(state ORDER BY task_id) FROM tasks WHERE task_id IN ('T1', 'T2')",
+                "IMPLEMENTED,IMPLEMENTED",
+                Duration::from_secs(20)
+            )?,
+            "nth={nth}: {}",
+            query(
+                &db,
+                "SELECT group_concat(task_id || ':' || state) FROM tasks"
+            )?
+        );
+        if nth == 3 {
+            assert_eq!(
+                query(
+                    &db,
+                    "SELECT json_extract(payload_json, '$.disposition') FROM events WHERE kind = 'reconcile.attempt' AND json_extract(payload_json, '$.cause') = 'runner_error'"
+                )?,
+                "completed"
+            );
+        }
+        let counted = std::fs::read_to_string(work.join("counter")).unwrap_or_default();
+        let mut keys: Vec<&str> = counted.lines().collect();
+        let all = keys.len();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), all, "nth={nth}: {counted}");
+        host.shutdown().await;
+    }
+    Ok(())
+}
+
+/// Fails its first start, or hands back a gate that cannot open (closing it as it fails); otherwise a FakeExecutor.
+#[derive(Debug)]
+struct Faulty {
+    inner: FakeExecutor,
+    start_fails: std::sync::atomic::AtomicBool,
+    gate_fails: bool,
+}
+
+impl hoh_app::host::Executor for Faulty {
+    fn deliver(
+        &self,
+        work: &hoh_app::host::Work,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
+        self.inner.deliver(work)
+    }
+
+    fn start(&self, work: &hoh_app::host::Work) -> Result<hoh_app::host::Started, String> {
+        if self
+            .start_fails
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err("injected: no process".to_owned());
+        }
+        let started = self.inner.start(work)?;
+        if self.gate_fails {
+            let real = started.gate;
+            let gate = hoh_app::host::Gate::new(move || {
+                drop(real);
+                Err("injected: the gate does not open".to_owned())
+            });
+            return Ok(hoh_app::host::Started { gate, ..started });
+        }
+        Ok(started)
+    }
+}
+
+/// M2T05R-156: a start that fails ends its attempt FAILED from STARTING with its work never started, and its task
+/// runs again; a gate that cannot open is settled (its process never ran: UNKNOWN_EFFECT, as nothing confirms it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_start_and_a_gate_that_cannot_open_never_run_the_work() -> R {
+    for gate_fails in [false, true] {
+        let dir = tempfile::tempdir()?;
+        let project = dir.path().join("p");
+        std::fs::create_dir_all(&project)?;
+        let (code, stderr) = serve_and_stop(&project)?;
+        assert_eq!(code, 0, "{stderr}");
+        seed(&project, WRITERS)?;
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(work.join("markers"))?;
+        let clock = Arc::new(FakeClock::default());
+        let executor = Arc::new(Faulty {
+            inner: FakeExecutor(work.clone()),
+            start_fails: std::sync::atomic::AtomicBool::new(!gate_fails),
+            gate_fails,
+        });
+        let host = runner_host(&project, executor, clock, None).await?;
+        let db = db(&project);
+        let first = "SELECT a.state || ':' || e.state FROM attempts a JOIN effects e ON e.attempt_id = a.attempt_id \
+                     WHERE a.task_id = 'T1' ORDER BY a.rowid LIMIT 1";
+        let want = if gate_fails {
+            "UNKNOWN_EFFECT:UNKNOWN"
+        } else {
+            "FAILED:PREPARED"
+        };
+        assert!(
+            wait_for(&db, first, want, Duration::from_secs(20))?,
+            "{}",
+            query(&db, first)?
+        );
+        if !gate_fails {
+            assert!(wait_for(
+                &db,
+                "SELECT state FROM tasks WHERE task_id = 'T1'",
+                "IMPLEMENTED",
+                Duration::from_secs(20)
+            )?);
+        }
+        let counted = std::fs::read_to_string(work.join("counter")).unwrap_or_default();
+        let a1 = query(
+            &db,
+            "SELECT attempt_id FROM attempts WHERE task_id = 'T1' ORDER BY rowid LIMIT 1",
+        )?;
+        assert!(!counted.contains(&a1), "gate_fails={gate_fails}: {counted}");
+        host.shutdown().await;
+    }
     Ok(())
 }
