@@ -547,6 +547,7 @@ async fn submit_command(
             recipient_role: "commander".to_owned(),
             role_epoch: 1,
             payload: json!({
+                "notice": "runtime",
                 "kind": "run.control",
                 "control": "PAUSE_REQUESTED",
                 "run_id": run_id,

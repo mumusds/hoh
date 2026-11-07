@@ -20,6 +20,8 @@ pub mod delivery;
 #[forbid(clippy::disallowed_methods)]
 pub mod handoff;
 #[forbid(clippy::disallowed_methods)]
+pub mod ids;
+#[forbid(clippy::disallowed_methods)]
 pub mod integer;
 #[forbid(clippy::disallowed_methods)]
 pub mod lifecycle;

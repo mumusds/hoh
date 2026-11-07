@@ -58,8 +58,10 @@ pub(super) fn accept(
     // M2T04R-52).
     let submitted = protocol::encode(result)
         .map_err(|e| PersistError::IntegrityViolation(format!("task result: {e}")))?;
+    // Compared as stored text, not reparsed numbers (M2T04R-152).
+    let submitted = submitted.to_string();
     let same = |payload: &Value, id: &str| -> Result<(), PersistError> {
-        if payload.get("task_result") == Some(&submitted) {
+        if payload.get("task_result_json").and_then(Value::as_str) == Some(submitted.as_str()) {
             Ok(())
         } else {
             Err(PersistError::KeyReuse(id.to_owned()))
@@ -97,14 +99,15 @@ pub(super) fn accept(
     };
     let attempt: Option<(String, String, i64, bool)> = tx
         .query_row(
-            "SELECT task_id, state, role_epoch, EXISTS(SELECT 1 FROM leases l WHERE l.attempt_id = a.attempt_id) \
+            "SELECT task_id, state, role_epoch, \
+             NOT EXISTS(SELECT 1 FROM attempts b WHERE b.task_id = a.task_id AND b.rowid > a.rowid) \
              FROM attempts a WHERE attempt_id = ?1",
             params![result.attempt_id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()
         .map_err(sqlite_error)?;
-    let Some((attempt_task, attempt_state, attempt_epoch, holds_lease)) = attempt else {
+    let Some((attempt_task, attempt_state, attempt_epoch, latest)) = attempt else {
         return Err(PersistError::IntegrityViolation(format!(
             "no attempt {}",
             result.attempt_id
@@ -144,17 +147,19 @@ pub(super) fn accept(
                 result.attempt_id, result.role_epoch
             ),
         ))
-    } else if !matches!(attempt_state.as_str(), "RUNNING" | "SETTLED") || !holds_lease {
-        // A late result of an attempt that failed, was cancelled, or lost its lease to a newer attempt (M2T04R-53).
+    } else if !matches!(attempt_state.as_str(), "RUNNING" | "SETTLED") || !latest {
+        // A late result of an attempt that failed, was cancelled, or was followed by a newer attempt of the same task
+        // (M2T04R-53). Not the lease row: that is the project's slot, which other tasks take after this one settles
+        // (M2T04R-150).
         Some((
             RejectionReason::StaleLeaseEpoch,
             format!(
                 "attempt {} is {attempt_state}{} and is not the task's live attempt",
                 result.attempt_id,
-                if holds_lease {
+                if latest {
                     ""
                 } else {
-                    " without its lease"
+                    ", followed by a newer attempt,"
                 }
             ),
         ))
@@ -209,7 +214,7 @@ pub(super) fn accept(
                         "candidate_id": result.candidate_id,
                         "reason_code": reason,
                         "detail": detail,
-                        "task_result": submitted,
+                        "task_result_json": submitted,
                     }),
                 }],
                 ..Commit::default()
@@ -267,13 +272,6 @@ pub(super) fn accept(
             result.task_id
         ))
     })?;
-    // The store's bounded ids (Message ids are at most 160 characters; a candidate id may be as long, M2T04R-55).
-    let mut messages = messages;
-    for m in &mut messages {
-        let id = child_id(&candidate.id, &format!("verify/{}", m.recipient_role));
-        m.message_id.clone_from(&id);
-        m.idempotency_key = id;
-    }
     let outbox = messages
         .iter()
         .map(|m| NewOutbox::hcp(0, m))
@@ -300,7 +298,7 @@ pub(super) fn accept(
                     "candidate_id": candidate.id,
                     "attempt_id": result.attempt_id,
                     "handoffs": messages.iter().map(|m| m.message_id.clone()).collect::<Vec<_>>(),
-                    "task_result": submitted,
+                    "task_result_json": submitted,
                 }),
             }],
             outbox,

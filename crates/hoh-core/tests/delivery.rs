@@ -1148,7 +1148,7 @@ async fn runtime_notices_in_the_outbox_are_left_for_their_own_consumer() -> R {
                 run_id: Some("R".to_owned()),
                 recipient_role: "qa".to_owned(),
                 role_epoch: 2,
-                payload: json!({"kind": "dispatch", "task_id": "T", "role": "qa", "attempt_id": "T/attempt-1"}),
+                payload: json!({"notice": "runtime", "kind": "dispatch", "task_id": "T", "role": "qa", "attempt_id": "T/attempt-1"}),
             }],
             ..Commit::default()
         })
@@ -1452,5 +1452,279 @@ async fn an_invalid_message_recorded_twice_is_one_event() -> R {
         )?,
         json!(1)
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_row_that_should_hold_a_message_and_does_not_is_recorded_not_skipped() -> R {
+    // M2T04R-101: only rows marked as runtime notices are left alone; one missing schema_version is invalid.
+    let dir = tempfile::tempdir()?;
+    let (store, db) = open(&dir)?;
+    seed(&db, WORLD)?;
+    let mut broken = protocol::encode(&to_qa("no-version", 3, 2, &sha(2), None)?)?;
+    if let Some(o) = broken.as_object_mut() {
+        o.remove("schema_version");
+    }
+    seed(
+        &db,
+        &format!(
+            "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES ('p1', 'e', 'R', 'x', '{{}}', 'now');
+             INSERT INTO outbox(message_id, event_seq, run_id, recipient_role, role_epoch, payload_json, state) \
+             VALUES ('no-version', (SELECT max(seq) FROM events), 'R', 'qa', 2, '{}', 'PENDING');",
+            broken.to_string().replace('\'', "''")
+        ),
+    )?;
+    let clock = FakeClock::new();
+    let local = LocalTransport::new(&store, &clock).with("qa", Touch);
+    let dispatcher = Dispatcher {
+        store: &store,
+        clock: &clock,
+        transport: &local,
+        roles: local.roles(),
+        max_attempts: 5,
+        batch: 10,
+    };
+    assert_eq!(dispatcher.tick().await?.invalid, ["no-version"]);
+    assert_eq!(
+        one(
+            &db,
+            "SELECT state FROM outbox WHERE message_id = 'no-version'"
+        )?,
+        json!("DEAD_LETTER")
+    );
+    assert_eq!(
+        one(
+            &db,
+            "SELECT count(*) FROM events WHERE kind = 'message.invalid'"
+        )?,
+        json!(1)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_claim_whose_dispatcher_stopped_waiting_costs_no_delivery() -> R {
+    // M2T04R-100: the writer is held up by another connection's lock; each tick is cancelled while it waits for its
+    // claim. No delivery reached the transport, so none is counted, and the message is delivered once afterwards.
+    use std::io::BufRead as _;
+    let dir = tempfile::tempdir()?;
+    let (store, db) = open(&dir)?;
+    seed(&db, WORLD)?;
+    enqueue(&store, "c", &[to_qa("c", 3, 2, &sha(2), None)?]).await?;
+    let clock = FakeClock::new();
+    let local = LocalTransport::new(&store, &clock).with("qa", Noop);
+    let transport = FakeTransport::new(&local, None, None);
+    let dispatcher = Dispatcher {
+        store: &store,
+        clock: &clock,
+        transport: &transport,
+        roles: local.roles(),
+        max_attempts: 3,
+        batch: 1,
+    };
+    for _ in 0..3 {
+        let mut holder = Command::new("python3")
+            .args([
+                "-c",
+                "import sqlite3,sys,time\nc=sqlite3.connect(sys.argv[1],isolation_level=None,timeout=30)\nc.execute('BEGIN IMMEDIATE')\nprint('locked',flush=True)\ntime.sleep(0.6)\nc.execute('COMMIT')",
+            ])
+            .arg(&db)
+            .stdout(std::process::Stdio::piped())
+            .spawn()?;
+        let mut line = String::new();
+        std::io::BufReader::new(holder.stdout.take().ok_or("no stdout")?).read_line(&mut line)?;
+        assert_eq!(line.trim(), "locked");
+        let cancelled = tokio::time::timeout(Duration::from_millis(150), dispatcher.tick()).await;
+        assert!(cancelled.is_err(), "the tick was not held up");
+        holder.wait()?;
+        // Anything queued behind the claim returns only once the writer is past it.
+        store.claim_outbox(clock.now(), Vec::new(), 3).await?;
+        clock.set(clock.now() + Duration::from_secs(120));
+    }
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT state, attempt_count FROM outbox WHERE message_id = 'c'"
+        )?,
+        [[json!("PENDING"), json!(0)]]
+    );
+    dispatcher.tick().await?;
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT state, attempt_count FROM outbox WHERE message_id = 'c'"
+        )?,
+        [[json!("ACKED"), json!(1)]]
+    );
+    assert_eq!(transport.replies_of("c").len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_message_consumed_directly_must_be_a_valid_message_as_a_whole() -> R {
+    // M2T04R-102: the envelope too, not only the payload.
+    let dir = tempfile::tempdir()?;
+    let (store, db) = open(&dir)?;
+    seed(&db, WORLD)?;
+    let m = to_qa("v", 3, 2, &sha(2), None)?;
+    enqueue(&store, "v", std::slice::from_ref(&m)).await?;
+    let mut bad = m.clone();
+    bad.schema_version = "9.9".to_owned();
+    let refused = store
+        .consume("qa", bad, Touch.effect(&m), FakeClock::new().now())
+        .await;
+    assert!(
+        matches!(refused, Err(PersistError::IntegrityViolation(_))),
+        "{refused:?}"
+    );
+    assert_eq!(
+        one(&db, "SELECT revision FROM tasks WHERE task_id = 'T'")?,
+        json!(3)
+    );
+    assert_eq!(one(&db, "SELECT count(*) FROM receipts")?, json!(0));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_late_answer_to_a_dead_lettered_message_makes_it_acked() -> R {
+    // M2T04R-103: generation 1 is consumed but its answer is late; generation 2 fails at the limit (DEAD_LETTER); then
+    // generation 1's answer arrives: the receipt proves the delivery.
+    let dir = tempfile::tempdir()?;
+    let (store, db) = open(&dir)?;
+    seed(&db, WORLD)?;
+    enqueue(&store, "late", &[to_qa("D2", 3, 2, &sha(2), None)?]).await?;
+    let clock = FakeClock::new();
+    let qa = vec!["qa".to_owned()];
+    let first = store
+        .claim_outbox(clock.now(), qa.clone(), 2)
+        .await?
+        .ok_or("nothing due")?;
+    LocalTransport::new(&store, &clock)
+        .with("qa", Touch)
+        .deliver(&first)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    clock.set(clock.now() + Duration::from_secs(60));
+    let second = store
+        .claim_outbox(clock.now(), qa, 2)
+        .await?
+        .ok_or("not due again")?;
+    store
+        .settle_outbox(
+            "D2",
+            second.attempt_count,
+            hoh_core::persistence::Settlement::Failed("lost".to_owned()),
+            2,
+        )
+        .await?;
+    assert_eq!(
+        one(&db, "SELECT state FROM outbox WHERE message_id = 'D2'")?,
+        json!("DEAD_LETTER")
+    );
+    store
+        .settle_outbox(
+            "D2",
+            first.attempt_count,
+            hoh_core::persistence::Settlement::Delivered,
+            2,
+        )
+        .await?;
+    assert_eq!(
+        one(&db, "SELECT state FROM outbox WHERE message_id = 'D2'")?,
+        json!("ACKED")
+    );
+    assert_eq!(
+        one(
+            &db,
+            "SELECT count(*) FROM events WHERE kind = 'outbox.delivered_late'"
+        )?,
+        json!(1)
+    );
+    assert_eq!(
+        one(&db, "SELECT count(*) FROM receipts WHERE message_id = 'D2'")?,
+        json!(1)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_settled_attempt_is_live_even_after_its_slot_went_to_another_task() -> R {
+    // M2T04R-150: the lease row is the project's slot; another task's attempt holding it now does not supersede A.
+    let (_dir, store, db) = world_with(
+        "INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq) VALUES ('O', 'R', 's2', 'LEASED', 1, 'developer', 1, 3);
+         INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision) VALUES ('AO', 'O', 'PREPARED', 1, 1, 1);
+         UPDATE attempts SET state = 'SETTLED' WHERE attempt_id = 'A';
+         UPDATE leases SET attempt_id = 'AO', epoch = 2;",
+    )
+    .await?;
+    let outcome = store.accept_task_result(developer_result()?).await?;
+    assert!(
+        matches!(outcome, TaskResultOutcome::Accepted { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(one(&db, "SELECT count(*) FROM outbox")?, json!(2));
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_remaining_refusals_of_results_and_packages_write_nothing() -> R {
+    // M2T04R-151.
+    // A refused result again with another payload is a reuse of its key.
+    let (_dir, store, db) = world_with("").await?;
+    let mut stale = developer_result()?;
+    stale.role_epoch = 9;
+    store.accept_task_result(stale.clone()).await?;
+    stale.summary = "other".to_owned();
+    assert!(matches!(
+        store.accept_task_result(stale).await,
+        Err(PersistError::KeyReuse(_))
+    ));
+    // The task is not RUNNING.
+    let (_dir, store, db2) =
+        world_with("UPDATE tasks SET state = 'LEASED' WHERE task_id = 'D';").await?;
+    let outcome = store.accept_task_result(developer_result()?).await?;
+    assert!(
+        matches!(
+            outcome,
+            TaskResultOutcome::Rejected {
+                reason: RejectionReason::IllegalTransition,
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(one(&db2, "SELECT count(*) FROM outbox")?, json!(0));
+    // Packages that disagree with their envelope in run, role or specification; a result for another task.
+    let mut run = qa_handoff("p-run")?;
+    run.payload.insert("run_id".to_owned(), json!("R2"));
+    let mut role = qa_handoff("p-role")?;
+    role.payload.insert("role".to_owned(), json!("reviewer"));
+    let mut spec = qa_handoff("p-spec")?;
+    spec.payload.insert("spec_sha256".to_owned(), json!(sha(1)));
+    let mut result = to_qa("p-result", 3, 2, &sha(2), None)?;
+    result.kind = protocol::MessageKind::Result;
+    let mut other = serde_json::to_value(developer_result()?)?;
+    other["task_id"] = json!("T-other");
+    let Value::Object(payload) = other else {
+        return Err("not an object".into());
+    };
+    result.payload = payload;
+    for bad in [&run, &role, &spec, &result] {
+        assert!(
+            NewOutbox::hcp(0, bad).is_err(),
+            "{} was queued",
+            bad.message_id
+        );
+        let refused = store
+            .consume("qa", bad.clone(), Touch.effect(bad), FakeClock::new().now())
+            .await;
+        assert!(
+            matches!(refused, Err(PersistError::IntegrityViolation(_))),
+            "{}: {refused:?}",
+            bad.message_id
+        );
+    }
+    assert_eq!(one(&db2, "SELECT count(*) FROM receipts")?, json!(0));
+    assert_eq!(one(&db, "SELECT count(*) FROM outbox")?, json!(0));
     Ok(())
 }

@@ -184,6 +184,7 @@ pub(super) fn round(
             recipient_role: task.role.clone(),
             role_epoch: decide::to_i64(binding.role_epoch, "role_epoch")?,
             payload: json!({
+                "notice": "runtime",
                 "kind": "dispatch",
                 "task_id": selected.task_id,
                 "role": task.role,
