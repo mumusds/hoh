@@ -1539,9 +1539,8 @@ async fn a_claim_whose_dispatcher_stopped_waiting_costs_no_delivery() -> R {
         let cancelled = tokio::time::timeout(Duration::from_millis(150), dispatcher.tick()).await;
         assert!(cancelled.is_err(), "the tick was not held up");
         holder.wait()?;
-        // The writer undoes returned claims before each job: once a job after the cancelled claim has run, the claim is
-        // undone; two such jobs, since the cancelled claim's own return can come after the first (M2T04R-350).
-        store.claim_outbox(clock.now(), Vec::new(), 3).await?;
+        // The cancelled claim was returned when its answer could not be handed over; the next claim undoes it in its own
+        // transaction (M2T04R-350, -453).
         store.claim_outbox(clock.now(), Vec::new(), 3).await?;
         clock.set(clock.now() + Duration::from_secs(120));
     }
@@ -1929,12 +1928,8 @@ async fn the_same_result_with_an_extreme_number_replays() -> R {
     Ok(())
 }
 
-#[tokio::test]
-async fn a_returned_claim_that_meets_a_busy_database_is_undone_later() -> R {
-    // M2T04R-300: the undo of a returned claim fails while another connection holds the database (past the short
-    // busy timeout); it is kept and done before a later job, not lost.
-    use std::io::BufRead as _;
-    let dir = tempfile::tempdir()?;
+/// A store whose writer gives up on a busy database after `busy`.
+fn open_busy(dir: &tempfile::TempDir, busy: Duration) -> R<(Store, PathBuf)> {
     let path = dir.path().join(".hoh/state.db");
     let store = Store::open(
         &path,
@@ -1953,46 +1948,251 @@ async fn a_returned_claim_that_meets_a_busy_database_is_undone_later() -> R {
                 env: Vec::new(),
                 answer_timeout: Duration::from_secs(10),
             }),
-            busy_timeout: Duration::from_millis(80),
+            busy_timeout: busy,
             ..Options::default()
         },
     )?;
-    seed(&path, WORLD)?;
+    Ok((store, path))
+}
+
+/// Another connection holding the database until [`Holder::release`] (no sleep: it waits for a line, M2T04R-454).
+struct Holder(std::process::Child);
+
+impl Holder {
+    fn hold(db: &Path) -> R<Holder> {
+        use std::io::BufRead as _;
+        let mut child = Command::new("python3")
+            .args([
+                "-c",
+                "import sqlite3,sys\nc=sqlite3.connect(sys.argv[1],isolation_level=None,timeout=30)\nc.execute('BEGIN IMMEDIATE')\nprint('locked',flush=True)\nsys.stdin.readline()\nc.execute('COMMIT')",
+            ])
+            .arg(db)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()?;
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().ok_or("no stdout")?).read_line(&mut line)?;
+        assert_eq!(line.trim(), "locked");
+        Ok(Holder(child))
+    }
+
+    fn release(mut self) -> R {
+        use std::io::Write as _;
+        self.0.stdin.take().ok_or("no stdin")?.write_all(b"\n")?;
+        self.0.wait()?;
+        Ok(())
+    }
+}
+
+impl Drop for Holder {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[tokio::test]
+async fn a_returned_claim_that_meets_a_busy_database_is_undone_by_a_later_claim() -> R {
+    // M2T04R-300, -400, -450: the claim that should undo a returned claim cannot run while another connection holds
+    // the database; the return is kept, and no claim of that row happens before its undo, even once it is due again.
+    let dir = tempfile::tempdir()?;
+    let (store, db) = open_busy(&dir, Duration::from_millis(80))?;
+    seed(&db, WORLD)?;
     enqueue(&store, "b", &[to_qa("b", 3, 2, &sha(2), None)?]).await?;
     let clock = FakeClock::new();
+    let qa = vec!["qa".to_owned()];
     let claim = store
-        .claim_outbox(clock.now(), vec!["qa".to_owned()], 3)
+        .claim_outbox(clock.now(), qa.clone(), 3)
         .await?
         .ok_or("nothing due")?;
-    let mut holder = Command::new("python3")
-        .args([
-            "-c",
-            "import sqlite3,sys,time\nc=sqlite3.connect(sys.argv[1],isolation_level=None,timeout=30)\nc.execute('BEGIN IMMEDIATE')\nprint('locked',flush=True)\ntime.sleep(0.6)\nc.execute('COMMIT')",
-        ])
-        .arg(&path)
-        .stdout(std::process::Stdio::piped())
-        .spawn()?;
-    let mut line = String::new();
-    std::io::BufReader::new(holder.stdout.take().ok_or("no stdout")?).read_line(&mut line)?;
     drop(claim);
-    // The next job finds the database busy: the undo waits, and so does the job.
-    let _ = store.writer_pragmas().await;
+    let holder = Holder::hold(&db)?;
+    assert!(matches!(
+        store.claim_outbox(clock.now(), qa.clone(), 3).await,
+        Err(PersistError::Busy(_))
+    ));
     assert_eq!(
         rows(
-            &path,
+            &db,
             "SELECT state, attempt_count FROM outbox WHERE message_id = 'b'"
         )?,
         [[json!("DELIVERING"), json!(1)]]
     );
-    holder.wait()?;
-    store.writer_pragmas().await?;
+    holder.release()?;
+    // Past its backoff: the next claim undoes it first, then claims it as its first delivery.
+    clock.set(clock.now() + Duration::from_secs(120));
+    let again = store
+        .claim_outbox(clock.now(), qa, 3)
+        .await?
+        .and_then(hoh_core::persistence::Claimed::start)
+        .ok_or("not claimed again")?;
+    assert_eq!(again.attempt_count, 1);
+    let local = LocalTransport::new(&store, &clock).with("qa", Noop);
+    local.deliver(&again).await.map_err(|e| format!("{e:?}"))?;
+    store
+        .settle_outbox(
+            "b",
+            again.attempt_count,
+            hoh_core::persistence::Settlement::Delivered,
+            3,
+        )
+        .await?;
     assert_eq!(
         rows(
-            &path,
+            &db,
             "SELECT state, attempt_count FROM outbox WHERE message_id = 'b'"
         )?,
-        [[json!("PENDING"), json!(0)]]
+        [[json!("ACKED"), json!(1)]]
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_returned_claim_does_not_make_other_writes_wait_longer_for_a_busy_database() -> R {
+    // M2T04R-401, -451: with a return waiting, a command still gets DB_BUSY after one busy timeout, not after two.
+    let dir = tempfile::tempdir()?;
+    let (store, db) = open_busy(&dir, Duration::from_millis(300))?;
+    seed(&db, WORLD)?;
+    enqueue(&store, "w", &[to_qa("w", 3, 2, &sha(2), None)?]).await?;
+    let claim = store
+        .claim_outbox(FakeClock::new().now(), vec!["qa".to_owned()], 3)
+        .await?
+        .ok_or("nothing due")?;
+    drop(claim);
+    let holder = Holder::hold(&db)?;
+    let write = tokio::spawn({
+        let started = std::time::Instant::now();
+        let commit = Commit {
+            events: vec![NewEvent {
+                project_id: "p1".to_owned(),
+                event_id: "w/event".to_owned(),
+                run_id: Some("R".to_owned()),
+                kind: "test.write".to_owned(),
+                payload: json!({}),
+            }],
+            ..Commit::default()
+        };
+        let store = std::sync::Arc::new(store);
+        let writer = store.clone();
+        async move { (writer.commit(commit).await, started.elapsed(), store) }
+    });
+    // Released after one and a half busy timeouts: a write that also waited for the undo would succeed after it.
+    tokio::time::sleep(Duration::from_millis(450)).await;
+    holder.release()?;
+    let (result, took, _store) = write.await?;
+    assert!(
+        matches!(result, Err(PersistError::Busy(_))),
+        "{result:?} after {took:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn claims_left_unread_across_their_backoff_do_not_stack() -> R {
+    // M2T04R-400: three ticks each take the claim and are never polled again while the clock passes the backoff;
+    // a message with a live guard is not claimed again, so one delivery at most is pending, and none counts.
+    use std::task::{Context, Waker};
+    let dir = tempfile::tempdir()?;
+    let (store, db) = open(&dir)?;
+    seed(&db, WORLD)?;
+    enqueue(&store, "k", &[to_qa("k", 3, 2, &sha(2), None)?]).await?;
+    let clock = FakeClock::new();
+    let local = LocalTransport::new(&store, &clock).with("qa", Noop);
+    let transport = FakeTransport::new(&local, None, None);
+    let dispatcher = Dispatcher {
+        store: &store,
+        clock: &clock,
+        transport: &transport,
+        roles: local.roles(),
+        max_attempts: 3,
+        batch: 1,
+    };
+    let mut ticks = Vec::new();
+    for _ in 0..3 {
+        let mut tick = Box::pin(dispatcher.tick());
+        let _ = tick.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+        // Let the claim be answered, unread.
+        store.writer_pragmas().await?;
+        ticks.push(tick);
+        clock.set(clock.now() + Duration::from_secs(120));
+    }
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT state, attempt_count FROM outbox WHERE message_id = 'k'"
+        )?,
+        [[json!("DELIVERING"), json!(1)]]
+    );
+    drop(ticks);
+    dispatcher.tick().await?;
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT state, attempt_count FROM outbox WHERE message_id = 'k'"
+        )?,
+        [[json!("ACKED"), json!(1)]]
+    );
+    assert_eq!(transport.replies_of("k").len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_claim_held_when_the_writer_panics_cannot_start() -> R {
+    // M2T04R-402: the writer ends by a panic (a test fault in a commit); a guard alive then hands nothing over.
+    #[derive(Debug)]
+    struct Panicking;
+    impl hoh_core::persistence::FaultHooks for Panicking {
+        fn before_commit(&self) -> Result<(), PersistError> {
+            std::panic::resume_unwind(Box::new("writer panic"));
+        }
+    }
+    let dir = tempfile::tempdir()?;
+    let (store, db) = open(&dir)?;
+    seed(&db, WORLD)?;
+    enqueue(&store, "p", &[to_qa("p", 3, 2, &sha(2), None)?]).await?;
+    drop(store);
+    let path = dir.path().join(".hoh/state.db");
+    let store = Store::open(
+        &path,
+        Options {
+            wal_probe: Some(ProbeCommand {
+                program: std::env::current_exe().unwrap_or_default(),
+                args: [
+                    "wal_probe_helper",
+                    "--exact",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ]
+                .map(OsString::from)
+                .to_vec(),
+                env: Vec::new(),
+                answer_timeout: Duration::from_secs(10),
+            }),
+            faults: std::sync::Arc::new(Panicking),
+            ..Options::default()
+        },
+    )?;
+    let claim = store
+        .claim_outbox(FakeClock::new().now(), vec!["qa".to_owned()], 3)
+        .await?
+        .ok_or("nothing due")?;
+    let ended = store.writer_ended();
+    let _ = store
+        .commit(Commit {
+            events: vec![NewEvent {
+                project_id: "p1".to_owned(),
+                event_id: "boom".to_owned(),
+                run_id: Some("R".to_owned()),
+                kind: "test.boom".to_owned(),
+                payload: json!({}),
+            }],
+            ..Commit::default()
+        })
+        .await;
+    assert!(!ended.await, "the writer did not panic");
+    assert_eq!(claim.start(), None);
+    let _ = db;
     Ok(())
 }
 

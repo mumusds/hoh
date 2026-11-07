@@ -67,18 +67,27 @@ pub fn backoff(k: i64) -> Duration {
 /// row that should hold an HCP message and does not, whatever else it carries, is validated and recorded, never skipped
 /// (M2T04R-101, -201); one whose deliveries are spent goes to DEAD_LETTER on the way, with its event. The row
 /// returned carries this delivery's generation (its new `attempt_count`).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn claim_next(
     conn: &mut Connection,
     now: SystemTime,
     roles: &[String],
     max_attempts: i64,
+    returned: &[OutboxRow],
+    live: &std::collections::BTreeSet<String>,
     after_events: &dyn Fn(),
 ) -> Result<Option<OutboxRow>, PersistError> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(sqlite_error)?;
+    // First the claims returned without reaching a transport: undone here, so none is claimed again (and counted)
+    // before its undo (M2T04R-400, -450).
+    for row in returned {
+        undo(&tx, row)?;
+    }
     let stamp = rfc3339_utc(now);
     let roles = json!(roles).to_string();
+    let live = json!(live).to_string();
     loop {
         let due: Option<(String, Option<String>, String, i64, String, i64)> = tx
             .query_row(
@@ -87,8 +96,9 @@ pub(super) fn claim_next(
                         OR (state = 'DELIVERING' AND next_retry_at <= ?1)) \
                    AND recipient_role IN (SELECT value FROM json_each(?2)) \
                    AND json_extract(payload_json, '$.notice') IS NOT 'runtime' \
+                   AND message_id NOT IN (SELECT value FROM json_each(?3)) \
                  ORDER BY event_seq, message_id LIMIT 1",
-                params![stamp, roles],
+                params![stamp, roles, live],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
             )
             .optional()
@@ -132,16 +142,30 @@ pub(super) fn claim_next(
     }
 }
 
-/// Undo the claim of `row` (its dispatcher stopped waiting before the row reached it, M2T04R-100): due again at once,
-/// with the delivery it never had not counted. Only while the row is still at that generation and DELIVERING.
-pub(super) fn unclaim(conn: &mut Connection, row: &OutboxRow) -> Result<(), PersistError> {
-    conn.execute(
+/// Undo the claim of `row`, which never reached a transport: due again at once, the delivery it never had not counted.
+/// Only while the row is still at that generation and DELIVERING (never a newer claim or a delivery that started).
+fn undo(tx: &Transaction<'_>, row: &OutboxRow) -> Result<(), PersistError> {
+    tx.execute(
         "UPDATE outbox SET state = 'PENDING', attempt_count = attempt_count - 1, next_retry_at = NULL \
          WHERE message_id = ?1 AND state = 'DELIVERING' AND attempt_count = ?2",
         params![row.message_id, row.attempt_count],
     )
     .map_err(sqlite_error)?;
     Ok(())
+}
+
+/// Undo `rows` in one transaction (the store closes, M2T04R-301).
+pub(super) fn unclaim_all(conn: &mut Connection, rows: &[OutboxRow]) -> Result<(), PersistError> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error)?;
+    for row in rows {
+        undo(&tx, row)?;
+    }
+    tx.commit().map_err(sqlite_error)
 }
 
 /// DEAD_LETTER and its `outbox.dead_letter` event, in the caller's transaction.
