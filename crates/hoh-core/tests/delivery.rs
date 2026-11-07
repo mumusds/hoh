@@ -34,6 +34,11 @@ fn wal_probe_helper() {
 }
 
 fn open(dir: &tempfile::TempDir) -> R<(Store, PathBuf)> {
+    open_with(dir, Options::default())
+}
+
+/// The store of `dir` with `options` and this binary as its WAL probe.
+fn open_with(dir: &tempfile::TempDir, options: Options) -> R<(Store, PathBuf)> {
     let path = dir.path().join(".hoh/state.db");
     let probe = ProbeCommand {
         program: std::env::current_exe().unwrap_or_default(),
@@ -53,7 +58,7 @@ fn open(dir: &tempfile::TempDir) -> R<(Store, PathBuf)> {
         &path,
         Options {
             wal_probe: Some(probe),
-            ..Options::default()
+            ..options
         },
     )?;
     Ok((store, path))
@@ -1784,7 +1789,7 @@ async fn a_claim_answered_but_never_read_returns_itself() -> R {
             [[json!("DELIVERING"), json!(1)]]
         );
         drop(tick);
-        // Returned claims are undone before the writer's next job.
+        // The next claim undoes the returned claim in its own transaction.
         store.claim_outbox(clock.now(), Vec::new(), 3).await?;
         assert_eq!(
             rows(
@@ -1930,29 +1935,13 @@ async fn the_same_result_with_an_extreme_number_replays() -> R {
 
 /// A store whose writer gives up on a busy database after `busy`.
 fn open_busy(dir: &tempfile::TempDir, busy: Duration) -> R<(Store, PathBuf)> {
-    let path = dir.path().join(".hoh/state.db");
-    let store = Store::open(
-        &path,
+    open_with(
+        dir,
         Options {
-            wal_probe: Some(ProbeCommand {
-                program: std::env::current_exe().unwrap_or_default(),
-                args: [
-                    "wal_probe_helper",
-                    "--exact",
-                    "--ignored",
-                    "--nocapture",
-                    "--test-threads=1",
-                ]
-                .map(OsString::from)
-                .to_vec(),
-                env: Vec::new(),
-                answer_timeout: Duration::from_secs(10),
-            }),
             busy_timeout: busy,
             ..Options::default()
         },
-    )?;
-    Ok((store, path))
+    )
 }
 
 /// Another connection holding the database until [`Holder::release`] (no sleep: it waits for a line, M2T04R-454).
@@ -2116,6 +2105,13 @@ async fn claims_left_unread_across_their_backoff_do_not_stack() -> R {
         ticks.push(tick);
         clock.set(clock.now() + Duration::from_secs(120));
     }
+    // The precondition: the second and third claims did run, and took nothing (M2T04R-553).
+    for tick in &mut ticks[1..] {
+        assert!(matches!(
+            tick.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+            std::task::Poll::Ready(Ok(ref t)) if *t == hoh_core::delivery::Tick::default()
+        ));
+    }
     assert_eq!(
         rows(
             &db,
@@ -2151,24 +2147,9 @@ async fn a_claim_held_when_the_writer_panics_cannot_start() -> R {
     seed(&db, WORLD)?;
     enqueue(&store, "p", &[to_qa("p", 3, 2, &sha(2), None)?]).await?;
     drop(store);
-    let path = dir.path().join(".hoh/state.db");
-    let store = Store::open(
-        &path,
+    let (store, _) = open_with(
+        &dir,
         Options {
-            wal_probe: Some(ProbeCommand {
-                program: std::env::current_exe().unwrap_or_default(),
-                args: [
-                    "wal_probe_helper",
-                    "--exact",
-                    "--ignored",
-                    "--nocapture",
-                    "--test-threads=1",
-                ]
-                .map(OsString::from)
-                .to_vec(),
-                env: Vec::new(),
-                answer_timeout: Duration::from_secs(10),
-            }),
             faults: std::sync::Arc::new(Panicking),
             ..Options::default()
         },
@@ -2192,7 +2173,6 @@ async fn a_claim_held_when_the_writer_panics_cannot_start() -> R {
         .await;
     assert!(!ended.await, "the writer did not panic");
     assert_eq!(claim.start(), None);
-    let _ = db;
     Ok(())
 }
 
@@ -2219,5 +2199,107 @@ async fn a_claim_still_held_when_the_store_closes_is_undone_and_cannot_start() -
         [[json!("PENDING"), json!(0)]]
     );
     assert_eq!(claim.start(), None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_returned_claim_is_uncounted_even_when_an_earlier_delivery_was_acked_first() -> R {
+    // M2T04R-500: generation 1 is delivered but its answer is late; past its backoff generation 2 is claimed and
+    // returned unstarted; generation 1's answer then makes the row ACKED before the undo runs. The undo (by the next
+    // claim, or at close) must still take generation 2 back: one delivery, one count.
+    let dir = tempfile::tempdir()?;
+    let (store, db) = open(&dir)?;
+    seed(&db, WORLD)?;
+    enqueue(
+        &store,
+        "acked",
+        &[
+            to_qa("N", 3, 2, &sha(2), None)?,
+            to_qa("C", 3, 2, &sha(2), None)?,
+        ],
+    )
+    .await?;
+    let clock = FakeClock::new();
+    let qa = vec!["qa".to_owned()];
+    let local = LocalTransport::new(&store, &clock).with("qa", Noop);
+    let mut first = Vec::new();
+    for _ in 0..2 {
+        let row = store
+            .claim_outbox(clock.now(), qa.clone(), 3)
+            .await?
+            .and_then(hoh_core::persistence::Claimed::start)
+            .ok_or("nothing due")?;
+        local.deliver(&row).await.map_err(|e| format!("{e:?}"))?;
+        first.push(row);
+    }
+    drop(local);
+    clock.set(clock.now() + Duration::from_secs(60));
+    let mut held = Vec::new();
+    for _ in 0..2 {
+        held.push(
+            store
+                .claim_outbox(clock.now(), qa.clone(), 3)
+                .await?
+                .ok_or("not due again")?,
+        );
+    }
+    for row in &first {
+        store
+            .settle_outbox(
+                &row.message_id,
+                row.attempt_count,
+                hoh_core::persistence::Settlement::Delivered,
+                3,
+            )
+            .await?;
+    }
+    // The precondition: both rows ACKED while generation 2 is still counted.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT message_id, state, attempt_count FROM outbox WHERE message_id IN ('N', 'C') ORDER BY message_id"
+        )?,
+        [
+            [json!("C"), json!("ACKED"), json!(2)],
+            [json!("N"), json!("ACKED"), json!(2)]
+        ]
+    );
+    // Taken in message order: C, then N.
+    let close = held.pop().ok_or("no claim")?;
+    let next = held.pop().ok_or("no claim")?;
+    assert_eq!(
+        (
+            next.row().map(|r| r.message_id.as_str()),
+            close.row().map(|r| r.message_id.as_str())
+        ),
+        (Some("C"), Some("N"))
+    );
+    drop(next);
+    assert!(store.claim_outbox(clock.now(), qa, 3).await?.is_none());
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT state, attempt_count FROM outbox WHERE message_id = 'C'"
+        )?,
+        [[json!("ACKED"), json!(1)]]
+    );
+    let ended = store.writer_ended();
+    drop(store);
+    assert!(ended.await, "the writer did not finish");
+    assert_eq!(close.start(), None);
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT state, attempt_count FROM outbox WHERE message_id = 'N'"
+        )?,
+        [[json!("ACKED"), json!(1)]]
+    );
+    assert_eq!(
+        one(
+            &db,
+            "SELECT count(*) FROM receipts WHERE message_id IN ('N', 'C')"
+        )?,
+        json!(2)
+    );
     Ok(())
 }
