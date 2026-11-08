@@ -38,17 +38,23 @@ pub fn boot_id() -> io::Result<String> {
         .to_owned())
 }
 
+/// The fields of a `/proc/<pid>/stat` after its parenthesised command name, from field 3 (state) on. The command name
+/// is any bytes but NUL (not necessarily UTF-8, and it may hold `)`), so the file is read as bytes and only what follows
+/// its last `)` is taken, which is ASCII (M2T06R-500).
+pub fn after_command_name(stat: &[u8]) -> Option<&str> {
+    let at = stat.iter().rposition(|&b| b == b')')?;
+    std::str::from_utf8(&stat[at + 1..]).ok()
+}
+
 /// The start time of process `pid`, `None` when there is no such process.
 pub fn start_id(pid: u32) -> io::Result<Option<String>> {
-    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+    let stat = match std::fs::read(format!("/proc/{pid}/stat")) {
         Ok(stat) => stat,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
     // After the parenthesised command name the fields start at field 3 (state); the start time is field 22.
-    let rest = stat
-        .rfind(')')
-        .map(|at| &stat[at + 1..])
+    let rest = after_command_name(&stat)
         .ok_or_else(|| io::Error::other(format!("/proc/{pid}/stat has no command name")))?;
     rest.split_whitespace()
         .nth(19)
@@ -193,7 +199,7 @@ fn group_left_in(proc: &std::path::Path, pgid: u32, leader: u32) -> io::Result<V
         else {
             continue;
         };
-        let stat = match std::fs::read_to_string(entry.path().join("stat")) {
+        let stat = match std::fs::read(entry.path().join("stat")) {
             Ok(stat) => stat,
             // It ended while the scan ran.
             Err(e) if e.kind() == io::ErrorKind::NotFound || e.raw_os_error() == Some(3) => {
@@ -202,15 +208,8 @@ fn group_left_in(proc: &std::path::Path, pgid: u32, leader: u32) -> io::Result<V
             Err(e) => return Err(e),
         };
         // Fields after the parenthesised command name: state, ppid, pgrp.
-        let group = stat
-            .rfind(')')
-            .and_then(|at| {
-                stat[at + 1..]
-                    .split_whitespace()
-                    .nth(2)?
-                    .parse::<u32>()
-                    .ok()
-            })
+        let group = after_command_name(&stat)
+            .and_then(|rest| rest.split_whitespace().nth(2)?.parse::<u32>().ok())
             .ok_or_else(|| io::Error::other(format!("/proc/{pid}/stat has no process group")))?;
         if group == pgid && pid != leader {
             left.push(pid);
@@ -489,6 +488,39 @@ mod tests {
         let other_boot = find(pid, Some("another-boot"), Some(&me.start_id))?;
         assert_eq!(other_boot.err().map(|g| g.basis()), Some("boot_id_differs"));
         assert_eq!(find(None, None, None)?.err(), Some(Gone::NoPid));
+        Ok(())
+    }
+
+    #[test]
+    fn a_process_whose_command_name_is_not_utf8_has_an_identity_and_a_group() -> io::Result<()> {
+        // M2T06R-500: a command name is any bytes but NUL; reading /proc/<pid>/stat as text failed on one that is not
+        // UTF-8, and the cancel took the failure for a group it could not inspect.
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::process::CommandExt as _;
+        let dir = tempfile::tempdir()?;
+        let link = dir.path().join(std::ffi::OsStr::from_bytes(b"w\xffr"));
+        // dash, not sleep: this platform's sleep is a multi-call program that picks its tool by its name.
+        std::os::unix::fs::symlink("/usr/bin/dash", &link)?;
+        let mut child = std::process::Command::new(&link)
+            .args(["-c", "read -r x"])
+            .stdin(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()?;
+        let pid = child.id();
+        let seen = (
+            std::fs::read(format!("/proc/{pid}/comm"))?,
+            of(pid),
+            group_left(pid, 0),
+            crate::process::group_members(pid),
+        );
+        drop(child.stdin.take());
+        child.wait()?;
+        let (comm, me, left, members) = seen;
+        assert_eq!(comm, b"w\xffr\n", "the precondition: its name is not UTF-8");
+        let me = me?.ok_or_else(|| io::Error::other("no identity"))?;
+        assert_eq!(me.pid, pid);
+        assert_eq!(left?, vec![pid]);
+        assert_eq!(members, vec![pid]);
         Ok(())
     }
 

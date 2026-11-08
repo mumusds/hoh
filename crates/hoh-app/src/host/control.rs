@@ -10,6 +10,7 @@ use super::runner::{Entry, Executor, Work};
 use hoh_agents::identity::{self, Presence};
 use hoh_core::cancel::{Canceller, GRACES, Look, ProcessControl, Processes, Signal};
 use hoh_core::delivery::Clock;
+use hoh_core::lifecycle::AttemptState;
 use hoh_core::persistence::{AttemptRow, Finished, PersistError};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -227,9 +228,9 @@ impl Processes for HostProcesses {
             .trackings
             .get(&attempt.attempt_id)
             .and_then(Tracking::cgroup);
-        let control = |group: Option<identity::Found>, leader: bool, orphans: Option<u32>| {
+        let control = |group: Watch| {
             if let Ok(mut outside) = outside.lock() {
-                if leader {
+                if matches!(group, Watch::Found(_)) {
                     outside.set_leader(attempt.pid, attempt.process_start_id.as_deref());
                 } else {
                     outside.set_leader(None, None);
@@ -240,21 +241,30 @@ impl Processes for HostProcesses {
                 native: native.clone(),
                 outside: outside.clone(),
                 cgroup: cgroup.clone(),
-                orphans,
             }
         };
+        // The recorded pid, which is the group's number while anything of the group is left.
+        let number = attempt.pid.and_then(|p| u32::try_from(p).ok());
         Some(match presence {
-            Ok(Presence::Ours(found)) => (Box::new(control(Some(found), true, None)), has_native),
-            // Its group is gone (or no process was recorded: held at its start gate, which closed when its task
-            // stopped); what of it left the group is still looked for.
-            Ok(Presence::Gone(_)) => (Box::new(control(None, false, None)), false),
-            // Its group cannot be told apart: no signal may go to it (ADR-019 decision 8). With a cgroup, its members
-            // are stopped by their membership, and a leaderless group must be seen gone too (decision 8d v6,
-            // M2T06R-401); without one it stays cancelling.
-            Ok(Presence::Leaderless(left)) if cgroup.is_some() => {
-                (Box::new(control(None, false, Some(left.pgid))), false)
+            Ok(Presence::Ours(found)) => (Box::new(control(Watch::Found(found))), has_native),
+            // Running with no process recorded: nothing can be looked at (as the reconcile, M2T05R-100).
+            Ok(Presence::Gone(identity::Gone::NoPid)) if attempt.state == AttemptState::Running => {
+                (Box::new(Fixed(Look::Lost)), false)
             }
-            _ if cgroup.is_some() => (Box::new(control(None, false, None)), false),
+            // Its group is gone (or no process was recorded: held at its start gate, which closed when its task
+            // stopped): the finding proves it; what of it left the group is still looked for.
+            Ok(Presence::Gone(_)) => (Box::new(control(Watch::Gone)), false),
+            // Its group cannot be told apart, or its leader not inspected or confirmed: no signal may go to the group
+            // (ADR-019 decision 8). With a cgroup, its members are stopped by their membership, and the group must be
+            // seen gone by its number (decision 8d v6, M2T06R-401; v7, M2T06R-500: never taken for gone); without one
+            // it stays cancelling.
+            Ok(Presence::Leaderless(left)) if cgroup.is_some() => {
+                (Box::new(control(Watch::Number(left.pgid))), false)
+            }
+            _ if cgroup.is_some() => match number {
+                Some(pgid) => (Box::new(control(Watch::Number(pgid))), false),
+                None => (Box::new(Fixed(Look::Lost)), false),
+            },
             _ => (Box::new(Fixed(Look::Lost)), false),
         })
     }
@@ -282,16 +292,27 @@ fn look_at(group: Look, outside: &mut Outside) -> Look {
 /// The processes outside each attempt's group of a cancel, kept for the whole cancel, across its passes.
 type Pins = Arc<Mutex<BTreeMap<String, Arc<Mutex<Outside>>>>>;
 
-/// An attempt's group found by its identity (or gone) and its processes outside it (decision 8d): the group counts as
-/// empty only with the termination proof (no pinned one alive, two complete scans in a row that found none).
+/// How an attempt's process group is known to be empty (decision 8d v7, M2T06R-500): every way is an observation, none
+/// a default.
+enum Watch {
+    /// Found by its leader's identity: its own look, and it gets the ladder's signals.
+    Found(identity::Found),
+    /// The identity's finding proves it gone (no pid recorded and never running, the leader gone and the group empty,
+    /// another boot, a reused pid).
+    Gone,
+    /// Not to be signalled (its leader gone, not inspected or not confirmed): empty only when the kernel says no process
+    /// has that group number (`kill(-pgid, 0)` gives ESRCH).
+    Number(u32),
+}
+
+/// An attempt's group and its processes outside it (decision 8d): the group counts as empty only with the termination
+/// proof (no pinned one alive, two complete scans in a row that found none).
 struct AttemptControl {
-    group: Option<identity::Found>,
+    group: Watch,
     native: Option<(Arc<dyn Executor>, Work)>,
     outside: Arc<Mutex<Outside>>,
     /// Its cgroup, when it has one: the proof is then the cgroup's and the marker scan's together (decision 8d v6).
     cgroup: Option<AttemptGroup>,
-    /// A group left without its leader, not signalled: it must be seen gone too.
-    orphans: Option<u32>,
 }
 
 /// Whether process group `pgid` still has a member (`kill(-pgid, 0)`, which sends nothing).
@@ -304,19 +325,22 @@ fn group_lives(pgid: u32) -> bool {
 
 impl ProcessControl for AttemptControl {
     fn look(&mut self) -> Look {
-        let group = match self.group.as_ref().map(identity::Found::look) {
-            Some(identity::Group::Held) => Look::Held,
-            Some(identity::Group::Lost) => return Look::Lost,
-            Some(identity::Group::Empty) | None => Look::Empty,
+        let group = match &self.group {
+            Watch::Found(found) => match found.look() {
+                identity::Group::Held => Look::Held,
+                identity::Group::Lost => return Look::Lost,
+                identity::Group::Empty => Look::Empty,
+            },
+            Watch::Gone => Look::Empty,
+            Watch::Number(pgid) if group_lives(*pgid) => Look::Held,
+            Watch::Number(_) => Look::Empty,
         };
         let Ok(mut outside) = self.outside.lock() else {
             return Look::Held;
         };
         if let Some(cgroup) = &self.cgroup {
-            // The cgroup empty, a leaderless group gone, and then the marker scan's proof (decision 8d v6).
-            let emptied = group == Look::Empty
-                && cgroup.proof() == Proof::Done
-                && !self.orphans.is_some_and(group_lives);
+            // The group empty, the cgroup empty, and then the marker scan's proof (decision 8d v6, v7).
+            let emptied = group == Look::Empty && cgroup.proof() == Proof::Done;
             if !emptied {
                 return look_at(Look::Held, &mut outside);
             }
@@ -344,11 +368,17 @@ impl ProcessControl for AttemptControl {
             }
             Signal::Term => (
                 rustix::process::Signal::TERM,
-                self.group.as_ref().is_some_and(identity::Found::terminate),
+                match &self.group {
+                    Watch::Found(found) => found.terminate(),
+                    Watch::Gone | Watch::Number(_) => false,
+                },
             ),
             Signal::Kill => (
                 rustix::process::Signal::KILL,
-                self.group.as_ref().is_some_and(identity::Found::kill),
+                match &self.group {
+                    Watch::Found(found) => found.kill(),
+                    Watch::Gone | Watch::Number(_) => false,
+                },
             ),
         };
         let in_cgroup = match &self.cgroup {
@@ -652,13 +682,12 @@ mod tests {
         std::fs::write(&events, b"populated 1\n")?;
         let root = tree(&[(100, "PATH=/bin")])?;
         let mut control = AttemptControl {
-            group: None,
+            group: Watch::Gone,
             native: None,
             outside: Arc::new(Mutex::new(
                 Outside::new("p/A1").with_root(Some(root.path().to_owned())),
             )),
             cgroup: Some(AttemptGroup::at(cgroup.path())),
-            orphans: None,
         };
         assert_eq!(control.look(), Look::Held, "populated");
         std::fs::set_permissions(&events, std::fs::Permissions::from_mode(0o000))?;
@@ -702,6 +731,8 @@ mod tests {
     fn a_cancel_keeps_an_attempts_outside_processes_across_its_passes() -> R {
         // M2T06R-257, -352: each pass asks for the attempt's control anew and gets the same pins, signal and count:
         // the first pass's look at its gone group is one quiet scan, the second pass's look the second, which proves it.
+        // The attempt is STARTING with no process recorded (held at its gate, which closed): a group proved gone
+        // (decision 8d v7; RUNNING with no process recorded proves nothing, the next test).
         let processes = HostProcesses {
             works: BTreeMap::new(),
             executor: None,
@@ -714,7 +745,7 @@ mod tests {
             attempt_id: "A1".to_owned(),
             task_id: "T1".to_owned(),
             session_id: None,
-            state: hoh_core::lifecycle::AttemptState::Running,
+            state: hoh_core::lifecycle::AttemptState::Starting,
             role_epoch: 1,
             host_epoch: 1,
             config_revision: 1,
@@ -739,6 +770,89 @@ mod tests {
             Look::Empty,
             "the second pass counts on the first one's scan"
         );
+        Ok(())
+    }
+
+    /// An attempt row of a cancel: RUNNING as given, with `pid` and no other identity.
+    fn running_row(pid: Option<i64>) -> AttemptRow {
+        AttemptRow {
+            attempt_id: "A1".to_owned(),
+            task_id: "T1".to_owned(),
+            session_id: None,
+            state: AttemptState::Running,
+            role_epoch: 1,
+            host_epoch: 1,
+            config_revision: 1,
+            pid,
+            boot_id: None,
+            process_start_id: None,
+            started_at: None,
+            ended_at: None,
+            raw_log_path: None,
+            agent: None,
+            resolved_model: None,
+            failure_reason: None,
+            cancel_requested: true,
+            usage: None,
+            cost_usd: None,
+        }
+    }
+
+    #[test]
+    fn a_running_attempt_with_no_process_recorded_is_never_taken_for_gone() -> R {
+        // M2T06R-500 (decision 8d v7): RUNNING with no pid recorded proves nothing of its group (the reconcile holds it
+        // as uncertain too): the cancel's look is Lost, with or without a cgroup, however often it looks.
+        let cgroup = tempfile::tempdir()?;
+        std::fs::write(cgroup.path().join("cgroup.events"), b"populated 0\n")?;
+        for trackings in [
+            BTreeMap::new(),
+            BTreeMap::from([("A1".to_owned(), Tracking::Cgroup(cgroup.path().to_owned()))]),
+        ] {
+            let processes = HostProcesses {
+                works: BTreeMap::new(),
+                executor: None,
+                project: PathBuf::from("/nonexistent"),
+                project_id: format!("no-pid-{}", std::process::id()),
+                pins: Arc::default(),
+                trackings,
+            };
+            for _ in 0..3 {
+                let (mut control, _) = processes.control(&running_row(None)).ok_or("no control")?;
+                assert_eq!(control.look(), Look::Lost);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_group_watched_by_its_number_is_empty_only_once_the_kernel_says_so() -> R {
+        // M2T06R-500 (decision 8d v7): a group that may not be signalled is watched by its number. While a process has
+        // that group number the look holds, however empty the cgroup and quiet the scans; once none has, the proof
+        // goes on (two quiet scans).
+        use std::os::unix::process::CommandExt as _;
+        let cgroup = tempfile::tempdir()?;
+        std::fs::write(cgroup.path().join("cgroup.events"), b"populated 0\n")?;
+        let root = tree(&[(100, "PATH=/bin")])?;
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "read -r x"])
+            .stdin(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()?;
+        let pgid = child.id();
+        let mut control = AttemptControl {
+            group: Watch::Number(pgid),
+            native: None,
+            outside: Arc::new(Mutex::new(
+                Outside::new("p/A1").with_root(Some(root.path().to_owned())),
+            )),
+            cgroup: Some(AttemptGroup::at(cgroup.path())),
+        };
+        let living: Vec<Look> = (0..3).map(|_| control.look()).collect();
+        drop(child.stdin.take());
+        child.wait()?;
+        assert_eq!(living, vec![Look::Held; 3], "its group lives");
+        assert_eq!(control.look(), Look::Held, "one quiet scan");
+        assert_eq!(control.look(), Look::Empty);
         Ok(())
     }
 

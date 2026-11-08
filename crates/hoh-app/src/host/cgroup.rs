@@ -89,29 +89,60 @@ impl AttemptGroup {
         }
     }
 
-    /// SIGTERM to each process in it, each pinned by a pidfd and checked to be in this cgroup still (a pid that ended
-    /// and was reused is never signalled); whether any got it.
+    /// It and every cgroup below it, parents first: `populated` and `cgroup.kill` cover the whole subtree, and so must
+    /// SIGTERM (decision 8d v7, M2T06R-501). A directory that cannot be read is skipped (its members still get
+    /// `cgroup.kill`, and `populated` still counts them).
+    fn subtree(&self) -> Vec<PathBuf> {
+        let mut found = vec![self.path.clone()];
+        let mut at = 0;
+        while at < found.len() {
+            if let Ok(entries) = std::fs::read_dir(&found[at]) {
+                found.extend(
+                    entries
+                        .filter_map(Result::ok)
+                        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                        .map(|e| e.path()),
+                );
+            }
+            at += 1;
+        }
+        found
+    }
+
+    /// SIGTERM to each process in it or in a cgroup below it, each pinned by a pidfd and checked to be in this subtree
+    /// still (a pid that ended and was reused is never signalled); whether any got it.
     pub(super) fn terminate(&self) -> bool {
-        let Ok(procs) = std::fs::read_to_string(self.path.join("cgroup.procs")) else {
-            return false;
-        };
+        use std::os::unix::ffi::OsStrExt as _;
         let wanted = self.relative();
+        let wanted = wanted.as_os_str().as_bytes();
         let mut sent = false;
-        for pid in procs.lines().filter_map(|l| l.trim().parse::<i32>().ok()) {
-            let Some(raw) = rustix::process::Pid::from_raw(pid) else {
+        for cgroup in self.subtree() {
+            let Ok(procs) = std::fs::read_to_string(cgroup.join("cgroup.procs")) else {
                 continue;
             };
-            let Ok(pidfd) = rustix::process::pidfd_open(raw, rustix::process::PidfdFlags::empty())
-            else {
-                continue;
-            };
-            let here = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).is_ok_and(|c| {
-                c.lines()
-                    .any(|l| l.strip_prefix("0::").map(str::trim) == Some(wanted.as_str()))
-            });
-            if here {
-                sent |= rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::TERM)
-                    .is_ok();
+            for pid in procs.lines().filter_map(|l| l.trim().parse::<i32>().ok()) {
+                let Some(raw) = rustix::process::Pid::from_raw(pid) else {
+                    continue;
+                };
+                let Ok(pidfd) =
+                    rustix::process::pidfd_open(raw, rustix::process::PidfdFlags::empty())
+                else {
+                    continue;
+                };
+                // Its cgroup as bytes (a cgroup's name need not be UTF-8): this one or one below it.
+                let here = std::fs::read(format!("/proc/{pid}/cgroup")).is_ok_and(|c| {
+                    c.split(|&b| b == b'\n').any(|l| {
+                        l.strip_prefix(b"0::").is_some_and(|at| {
+                            at == wanted
+                                || at.strip_prefix(wanted).is_some_and(|r| r.starts_with(b"/"))
+                        })
+                    })
+                });
+                if here {
+                    sent |=
+                        rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::TERM)
+                            .is_ok();
+                }
             }
         }
         sent
@@ -122,15 +153,17 @@ impl AttemptGroup {
         std::fs::write(self.path.join("cgroup.kill"), "1").is_ok()
     }
 
-    /// Remove it once it is empty (a leftover empty directory is harmless).
+    /// Remove it once it is empty, the cgroups below it first (a leftover empty directory is harmless).
     pub(super) fn remove(&self) {
-        let _ = std::fs::remove_dir(&self.path);
+        for cgroup in self.subtree().iter().rev() {
+            let _ = std::fs::remove_dir(cgroup);
+        }
     }
 
     /// Its path as `/proc/<pid>/cgroup` names it.
-    fn relative(&self) -> String {
+    fn relative(&self) -> PathBuf {
         let rel = self.path.strip_prefix(MOUNT).unwrap_or(&self.path);
-        format!("/{}", rel.display())
+        Path::new("/").join(rel)
     }
 
     /// Where the proof stands: none left (Done), some left (Pending), or not readable (Incomplete).
