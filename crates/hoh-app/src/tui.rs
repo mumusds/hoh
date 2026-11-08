@@ -56,9 +56,11 @@ fn signal_code(signal: usize) -> u8 {
 }
 
 /// A run the shell is attached to (docs/adr/ADR-021.md decision 10): its host, its id, and its events as a reader
-/// thread receives them over the host's socket.
+/// thread receives them over the host's socket. The host is the one found last: a host started again (another token)
+/// is found again by the reader and by the commands, which go on after the last event and with the same key
+/// (M2T06R-04).
 pub struct Link {
-    host: crate::client::HostInfo,
+    host: Arc<std::sync::Mutex<crate::client::HostInfo>>,
     project: std::path::PathBuf,
     run_id: String,
     events: std::sync::mpsc::Receiver<serde_json::Value>,
@@ -72,6 +74,42 @@ impl Drop for Link {
     }
 }
 
+impl Link {
+    fn host(&self) -> crate::client::HostInfo {
+        current(&self.host)
+    }
+
+    /// GET `path` from the run's host; once more from the host found again when it does not answer or no longer
+    /// knows the token.
+    fn get(&self, path: &str) -> Result<crate::client::Reply, String> {
+        match crate::client::call(&self.host(), "GET", path, None) {
+            Ok(reply) if reply.status != 403 => return Ok(reply),
+            _ => {}
+        }
+        let found =
+            again(&self.project, &self.host).map_err(|f| format!("{}: {}", f.code, f.message))?;
+        crate::client::call(&found, "GET", path, None).map_err(|e| e.to_string())
+    }
+}
+
+fn current(host: &std::sync::Mutex<crate::client::HostInfo>) -> crate::client::HostInfo {
+    host.lock()
+        .map_or_else(|p| p.into_inner().clone(), |h| h.clone())
+}
+
+/// The project's host found (or started) again, kept for the link.
+fn again(
+    project: &Path,
+    host: &std::sync::Mutex<crate::client::HostInfo>,
+) -> Result<crate::client::HostInfo, crate::client::Failure> {
+    let found = crate::client::ensure(project)?;
+    match host.lock() {
+        Ok(mut h) => *h = found.clone(),
+        Err(p) => *p.into_inner() = found.clone(),
+    }
+    Ok(found)
+}
+
 /// `hoh attach` with a terminal: the shell bound to `run` (getRun's answer) of `host`; the exit code. Leaving, by the
 /// choice or a signal, only closes this client (REQ-043 behaviour 6).
 pub fn attach(project: &Path, host: crate::client::HostInfo, run: &serde_json::Value) -> u8 {
@@ -83,13 +121,18 @@ pub fn attach(project: &Path, host: crate::client::HostInfo, run: &serde_json::V
         .to_owned();
     let (send, events) = std::sync::mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
+    let host = Arc::new(std::sync::Mutex::new(host));
     {
         let (host, run_id, stop) = (host.clone(), run_id.clone(), stop.clone());
+        let project = project.to_path_buf();
         std::thread::spawn(move || {
             let mut last = 0i64;
             while !stop.load(Ordering::SeqCst) {
-                let Ok(mut stream) = crate::client::Events::open(&host, &run_id, last) else {
+                let Ok(mut stream) = crate::client::Events::open(&current(&host), &run_id, last)
+                else {
+                    // The host went or was started again: found again, the stream goes on after `last`.
                     std::thread::sleep(Duration::from_millis(500));
+                    let _ = again(&project, &host);
                     continue;
                 };
                 while !stop.load(Ordering::SeqCst) {
@@ -201,12 +244,7 @@ fn take_events(app: &mut App, link: &Link) -> bool {
         let kind = event["kind"].as_str().unwrap_or_default().to_owned();
         app.say(format!("#{} {kind}", event["seq"].as_i64().unwrap_or(0)));
         if kind.starts_with("run.")
-            && let Ok(reply) = crate::client::call(
-                &link.host,
-                "GET",
-                &format!("/v1/runs/{}", link.run_id),
-                None,
-            )
+            && let Ok(reply) = link.get(&format!("/v1/runs/{}", link.run_id))
             && reply.status == 200
         {
             let run = reply.json();
@@ -224,12 +262,7 @@ fn take_events(app: &mut App, link: &Link) -> bool {
 fn control(link: &Link, kind: &str) -> String {
     let mut said = String::new();
     for _ in 0..2 {
-        let revision = match crate::client::call(
-            &link.host,
-            "GET",
-            &format!("/v1/runs/{}", link.run_id),
-            None,
-        ) {
+        let revision = match link.get(&format!("/v1/runs/{}", link.run_id)) {
             Ok(reply) if reply.status == 200 => reply.json()["revision"].as_i64().unwrap_or(0),
             Ok(reply) => return format!("{kind} 未发送：host 答 {}", reply.status),
             Err(e) => return format!("{kind} 未发送：{e}"),
@@ -240,7 +273,7 @@ fn control(link: &Link, kind: &str) -> String {
             "run_id": link.run_id,
             "payload": {"reason": "TUI"},
         });
-        match crate::client::submit(&link.project, &link.host, command) {
+        match crate::client::submit(&link.project, &link.host(), command) {
             Ok(_) => return format!("{kind} 已受理"),
             Err(failure) if failure.code == "STALE_REVISION" => {
                 said = format!("{kind} 未受理：{}：{}", failure.code, failure.message);

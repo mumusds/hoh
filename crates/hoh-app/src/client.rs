@@ -307,8 +307,9 @@ pub fn new_id() -> String {
     )
 }
 
-/// Submit a command (its body with a fresh id and key) and retry the very same bytes while the host is unreachable
-/// or answers a retryable 503, within 10 s (ADR-021 decision 4): the accepted body, or why not.
+/// Submit a command (its body with a fresh id and key) and retry the very same bytes while the host is unreachable,
+/// answers a retryable 503 or no longer knows the token (a host started again), within 10 s (ADR-021 decision 4): the
+/// accepted body, or why not.
 pub fn submit(project: &Path, host: &HostInfo, mut command: Value) -> Result<Value, Failure> {
     let id = new_id();
     command["command_id"] = json!(id);
@@ -327,6 +328,17 @@ pub fn submit(project: &Path, host: &HostInfo, mut command: Value) -> Result<Val
                     error["message"].as_str().unwrap_or("refused"),
                     if reply.status == 503 { 69 } else { 1 },
                 );
+                // A host started again meanwhile does not know the token this client read: the very same bytes go to
+                // the one that answers now (M2T06R-04).
+                if reply.status == 403 {
+                    match running(project) {
+                        Some(again) if again != host && Instant::now() < end => {
+                            host = again;
+                            continue;
+                        }
+                        _ => return Err(failure),
+                    }
+                }
                 if !(reply.status == 503 && error["retryable"] == json!(true)) {
                     return Err(failure);
                 }
@@ -409,5 +421,81 @@ impl Events {
                 Err(e) => return Err(e),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hoh_core::persistence::selftest::ProbeCommand;
+
+    type R<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    /// Set for the probe process of the hosts these tests start.
+    const PROBE_ENV: &str = "HOH_CLIENT_TESTS_PROBE";
+
+    /// The WAL self-test's probe process of the hosts these tests start; does nothing unless started by them.
+    #[test]
+    #[ignore = "helper process of the WAL self-test of the hosts these tests start"]
+    fn probe_helper() {
+        if std::env::var_os(PROBE_ENV).is_some() {
+            std::process::exit(hoh_core::persistence::selftest::probe_main());
+        }
+    }
+
+    fn config(project: &Path) -> R<hoh_app::host::HostConfig> {
+        let mut config = hoh_app::host::HostConfig::new(project);
+        config.port = 0;
+        config.store.wal_probe = Some(ProbeCommand {
+            program: std::env::current_exe()?,
+            args: [
+                "client::tests::probe_helper",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ]
+            .map(std::ffi::OsString::from)
+            .to_vec(),
+            env: vec![(PROBE_ENV.into(), "1".into())],
+            answer_timeout: Duration::from_secs(10),
+        });
+        Ok(config)
+    }
+
+    #[test]
+    fn a_command_given_a_host_started_again_since_goes_to_the_new_one() -> R {
+        // M2T06R-04: the client read a host's token, that host stopped normally and another started (another token);
+        // the command is accepted by the new host.
+        let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+        let project = dir.path().join("p");
+        std::fs::create_dir_all(&project)?;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()?;
+        let first = runtime.block_on(hoh_app::host::Host::start(config(&project)?))?;
+        let stale = running(&project).ok_or("no host")?;
+        runtime.block_on(first.shutdown());
+        let second = runtime.block_on(hoh_app::host::Host::start(config(&project)?))?;
+        let now = running(&project).ok_or("no second host")?;
+        assert_ne!(now.token, stale.token);
+        let accepted = submit(
+            &project,
+            &stale,
+            json!({
+                "expected_revision": 0,
+                "kind": "StartRun",
+                "run_id": null,
+                "payload": {"goal": "x", "mode": "AUTO", "interactive": false},
+            }),
+        )
+        .map_err(|f| format!("{}: {}", f.code, f.message))?;
+        assert_eq!(accepted["status"], "ACCEPTED");
+        let run_id = accepted["run_id"].as_str().ok_or("no run_id")?;
+        let run = call(&now, "GET", &format!("/v1/runs/{run_id}"), None)?;
+        assert_eq!(run.status, 200);
+        runtime.block_on(second.shutdown());
+        Ok(())
     }
 }
