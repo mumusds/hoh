@@ -183,7 +183,7 @@ pub trait Processes: Send + Sync {
         &self,
         attempt: &crate::persistence::AttemptRow,
     ) -> Option<(Box<dyn ProcessControl + Send>, bool)>;
-    /// The workspace's record, taken before the run is CANCELLED (ADR-021 decision 8g).
+    /// The workspace's record, taken before the run is CANCELLED (ADR-021 decision 8g); called on a blocking thread.
     fn workspace(&self) -> serde_json::Value;
 }
 
@@ -216,7 +216,7 @@ impl Canceller {
         &self,
         store: &crate::persistence::Store,
         run_id: &str,
-        processes: &dyn Processes,
+        processes: std::sync::Arc<dyn Processes>,
         clock: std::sync::Arc<dyn Clock>,
         wait: std::sync::Arc<dyn Fn(Duration) + Send + Sync>,
     ) -> Result<crate::persistence::Finished, crate::persistence::PersistError> {
@@ -279,9 +279,15 @@ impl Canceller {
         if !store.running_attempts(run_id).await?.is_empty() {
             return Ok(crate::persistence::Finished::Running(1));
         }
-        store
-            .finish_cancel(run_id, processes.workspace(), clock.now())
+        // The record reads git and files: off the async workers (M2T06R-06).
+        let workspace = tokio::task::spawn_blocking(move || processes.workspace())
             .await
+            .map_err(|e| {
+                crate::persistence::PersistError::IntegrityViolation(format!(
+                    "the workspace record failed: {e}"
+                ))
+            })?;
+        store.finish_cancel(run_id, workspace, clock.now()).await
     }
 }
 

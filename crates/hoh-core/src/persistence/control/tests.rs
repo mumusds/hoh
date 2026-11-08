@@ -173,16 +173,16 @@ async fn test_043_05_a_cancel_stays_cancelling_while_the_group_lives_after_sigki
         }
     });
     let state = Arc::new(Mutex::new((None, Vec::new())));
-    let processes = Fake {
+    let processes: Arc<dyn Processes> = Arc::new(Fake {
         clock: clock.clone(),
         state: state.clone(),
-    };
+    });
     let reader = store.reader()?;
     let canceller = Canceller::new(GRACES, Duration::from_secs(1));
     let mut samples = Vec::new();
     loop {
         let step = canceller
-            .step(&store, "R", &processes, clock.clone(), wait.clone())
+            .step(&store, "R", processes.clone(), clock.clone(), wait.clone())
             .await?;
         match step {
             Finished::Running(_) => {
@@ -609,7 +609,13 @@ async fn a_group_lost_track_of_keeps_the_run_cancelling_and_is_recorded_once() -
     let canceller = Canceller::new(GRACES, Duration::from_secs(1));
     for _ in 0..3 {
         let step = canceller
-            .step(&store, "R", &LostTrack, clock.clone(), wait.clone())
+            .step(
+                &store,
+                "R",
+                Arc::new(LostTrack),
+                clock.clone(),
+                wait.clone(),
+            )
             .await?;
         assert_eq!(step, Finished::Running(1));
     }
@@ -690,5 +696,50 @@ async fn a_cancelled_attempt_ends_cancelled_however_its_runner_or_a_reconcile_en
             "by the reconcile: {by_reconcile}"
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_cancel_committed_between_a_reconciles_scan_and_its_apply_still_takes_precedence() -> R {
+    // M2T06R-02: the scan saw A1 not cancelled, the CancelRun commits, then the apply (a settle ending it FAILED):
+    // the apply reads the cancel in its own transaction, so A1 ends CANCELLED, not counted, with no retry.
+    use crate::reconcile::{Disposition, Process};
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(WORLD)?;
+    let at = parse_rfc3339("2026-11-07T00:00:05Z").ok_or("time")?;
+    let rows = store.reconcile_scan("p1", at).await?;
+    let [row] = rows.as_slice() else {
+        return Err(format!("unfinished: {rows:?}").into());
+    };
+    assert!(!row.cancel_requested);
+    assert!(matches!(
+        store.submit_command(cancel_run(1)).await?,
+        CommandOutcome::Accepted { .. }
+    ));
+    store
+        .reconcile_apply(
+            row.clone(),
+            Disposition::Ended {
+                to: crate::lifecycle::AttemptState::Failed,
+                task_to: crate::protocol::TaskState::Ready,
+                effects: Vec::new(),
+            },
+            Process::Gone {
+                basis: "no_process".to_owned(),
+            },
+            "lease_expired",
+            at,
+            0,
+        )
+        .await?;
+    let row: (String, String, i64, Option<String>) = Connection::open(&path)?.query_row(
+        "SELECT a.state, t.state, t.attempt_count, t.next_retry_at FROM attempts a, tasks t \
+         WHERE a.attempt_id = 'A1' AND t.task_id = 'T1'",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )?;
+    assert_eq!(row, ("CANCELLED".to_owned(), "RUNNING".to_owned(), 0, None));
+    assert_eq!(count(&path, "SELECT count(*) FROM attempts")?, 1);
     Ok(())
 }

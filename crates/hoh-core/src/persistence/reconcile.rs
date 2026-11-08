@@ -340,15 +340,23 @@ fn apply(
                 unknown.as_slice(),
             ),
         };
+    let tx = writer::begin(conn, ctx)?;
     // A cancel takes precedence over how the attempt ended: CANCELLED, not counted, no retry; the run's cancel moves
-    // its task (docs/adr/ADR-021.md decision 8e).
+    // its task (docs/adr/ADR-021.md decision 8e). Read in this transaction, not from the scan: a CancelRun committed
+    // between the scan and this apply counts (M2T06R-02).
+    let cancel_requested: bool = tx
+        .query_row(
+            "SELECT cancel_requested FROM attempts WHERE attempt_id = ?1",
+            params![row.attempt_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
     let (attempt_to, task_to) = match attempt_to {
-        Some(AttemptState::Failed | AttemptState::Settled) if row.cancel_requested => {
+        Some(AttemptState::Failed | AttemptState::Settled) if cancel_requested => {
             (Some(AttemptState::Cancelled), None)
         }
         other => (other, task_to),
     };
-    let tx = writer::begin(conn, ctx)?;
     // An attempt left unfinished (redelivered, unreaped) is disposed of again later: each pass its own event ids.
     let pass: i64 = tx
         .query_row(
