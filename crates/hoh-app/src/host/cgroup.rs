@@ -647,8 +647,10 @@ mod tests {
             Proof::Incomplete,
             "not the recorded directory"
         );
-        // Its parent replaced: the cgroup absent below a parent that is not the recorded one.
-        std::fs::remove_dir_all(&parent)?;
+        // Its parent replaced: the cgroup absent below a parent that is not the recorded one. The old parent is kept
+        // (moved away) so the new one cannot get its inode number back, as a file system other than cgroupfs may
+        // give a freed number again (seen in CI); cgroupfs does not reuse its 64-bit node ids within a boot.
+        std::fs::rename(&parent, root.path().join("old-parent"))?;
         std::fs::create_dir(&parent)?;
         assert_eq!(group.proof(), Proof::Incomplete, "not the recorded parent");
         // No record of what it was: an absence proves nothing.
