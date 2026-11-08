@@ -693,7 +693,7 @@ mod tests {
             outside: Arc::new(Mutex::new(
                 Outside::new("p/A1").with_root(Some(root.path().to_owned())),
             )),
-            cgroup: Some(AttemptGroup::at(cgroup.path())),
+            cgroup: Some(AttemptGroup::witnessed(cgroup.path(), cgroup.path())?),
         };
         assert_eq!(control.look(), Look::Held, "populated");
         std::fs::set_permissions(&events, std::fs::Permissions::from_mode(0o000))?;
@@ -851,7 +851,13 @@ mod tests {
         std::fs::write(cgroup.path().join("cgroup.events"), b"populated 0\n")?;
         for trackings in [
             BTreeMap::new(),
-            BTreeMap::from([("A1".to_owned(), Tracking::Cgroup(cgroup.path().to_owned()))]),
+            BTreeMap::from([(
+                "A1".to_owned(),
+                Tracking::Cgroup {
+                    path: cgroup.path().to_owned(),
+                    witness: None,
+                },
+            )]),
         ] {
             let processes = HostProcesses {
                 works: BTreeMap::new(),
@@ -935,7 +941,7 @@ mod tests {
             outside: Arc::new(Mutex::new(
                 Outside::new("p/A1").with_root(Some(root.path().to_owned())),
             )),
-            cgroup: Some(AttemptGroup::at(cgroup.path())),
+            cgroup: Some(AttemptGroup::witnessed(cgroup.path(), cgroup.path())?),
         };
         let held: Vec<Look> = (0..3).map(|_| watched.look()).collect();
         drop(child.stdin.take());
@@ -966,7 +972,7 @@ mod tests {
             outside: Arc::new(Mutex::new(
                 Outside::new("p/A1").with_root(Some(root.path().to_owned())),
             )),
-            cgroup: Some(AttemptGroup::at(cgroup.path())),
+            cgroup: Some(AttemptGroup::witnessed(cgroup.path(), cgroup.path())?),
         };
         let living: Vec<Look> = (0..3).map(|_| control.look()).collect();
         drop(child.stdin.take());

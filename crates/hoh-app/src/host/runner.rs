@@ -421,7 +421,7 @@ async fn attempt(
     let (who, tracking) = tokio::task::spawn_blocking(move || {
         let tracking = match cgroups {
             Some(delegated) => match AttemptGroup::adopt(&delegated.attempt(&marker), pid) {
-                Ok(group) => Tracking::Cgroup(group.path().to_owned()),
+                Ok(group) => Tracking::of_group(&group),
                 Err(e) => Tracking::Proc(format!("its cgroup could not be made or joined: {e}")),
             },
             None => Tracking::Proc("the host has no delegated cgroup".to_owned()),

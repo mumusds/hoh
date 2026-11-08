@@ -67,22 +67,86 @@ impl Delegated {
     }
 }
 
+/// What an attempt's cgroup was when it was made, so a later look knows it sees that cgroup and not whatever is at its
+/// path (a mount over it, another cgroup namespace's view, a directory made there later): the boot it was made in and
+/// the device and inode of each directory from the mount's root down to it (decision 8d v7, M2T06R-900).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Witness {
+    boot: String,
+    chain: Vec<(u64, u64)>,
+}
+
+impl Witness {
+    /// Of the directory `path` at or below `root`, now.
+    fn of(root: &Path, path: &Path) -> std::io::Result<Witness> {
+        use std::os::unix::fs::MetadataExt as _;
+        let rel = path.strip_prefix(root).map_err(std::io::Error::other)?;
+        let mut at = root.to_path_buf();
+        let meta = std::fs::symlink_metadata(&at)?;
+        let mut chain = vec![(meta.dev(), meta.ino())];
+        for part in rel.components() {
+            at.push(part);
+            let meta = std::fs::symlink_metadata(&at)?;
+            chain.push((meta.dev(), meta.ino()));
+        }
+        Ok(Witness {
+            boot: hoh_agents::identity::boot_id()?,
+            chain,
+        })
+    }
+}
+
 /// One attempt's cgroup.
 #[derive(Debug, Clone)]
 pub(super) struct AttemptGroup {
     path: PathBuf,
+    /// Where its witness's chain starts: the cgroup mount (a test's own directory in tests).
+    root: PathBuf,
+    witness: Option<Witness>,
+}
+
+/// Flags to open a directory of a recorded chain: never through a symbolic link.
+fn directory() -> rustix::fs::OFlags {
+    use rustix::fs::OFlags;
+    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
 }
 
 impl AttemptGroup {
-    /// The cgroup at `path` (made by this host or an earlier one).
+    /// The cgroup at `path` with no record of what it was: nothing it shows proves anything (M2T06R-900).
+    #[cfg(test)]
     pub(super) fn at(path: &Path) -> AttemptGroup {
         AttemptGroup {
             path: path.to_owned(),
+            root: PathBuf::from(MOUNT),
+            witness: None,
         }
+    }
+
+    /// The cgroup at `path`, below `root`, as it is now (the root is the cgroup mount, but a test's own directory in
+    /// tests).
+    pub(super) fn witnessed(root: &Path, path: &Path) -> std::io::Result<AttemptGroup> {
+        Ok(AttemptGroup {
+            path: path.to_owned(),
+            root: root.to_owned(),
+            witness: Some(Witness::of(root, path)?),
+        })
     }
 
     pub(super) fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Its witness, as its tracking records it.
+    pub(super) fn witness(&self) -> Option<&Witness> {
+        self.witness.as_ref()
+    }
+
+    /// As if it had been made in another boot (tests).
+    #[cfg(test)]
+    fn another_boot(&mut self) {
+        if let Some(w) = self.witness.as_mut() {
+            w.boot = "another-boot".to_owned();
+        }
     }
 
     /// Make the cgroup at `path` and move `pid` (the leader, held at its start gate) into it.
@@ -92,21 +156,105 @@ impl AttemptGroup {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e),
         }
-        std::fs::write(path.join("cgroup.procs"), pid.to_string())?;
-        Ok(AttemptGroup::at(path))
+        let group = AttemptGroup::witnessed(Path::new(MOUNT), path)?;
+        group.write("cgroup.procs", &pid.to_string())?;
+        Ok(group)
     }
 
-    /// Whether any process is in it: `Ok(false)` once it is empty or gone; an error when that cannot be read.
-    pub(super) fn populated(&self) -> Result<bool, String> {
-        match std::fs::read_to_string(self.path.join("cgroup.events")) {
-            Ok(events) => events
-                .lines()
-                .find_map(|line| line.strip_prefix("populated "))
-                .map(|v| v.trim() == "1")
-                .ok_or_else(|| format!("{}: no populated line", self.path.display())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(format!("{}: {e}", self.path.display())),
+    /// Its directory, opened only through the directories its witness recorded, each checked by its device and inode:
+    /// `Some` when it is there; `None` when one of them is absent from its checked parent (a cgroup can be removed
+    /// only when empty, and whatever was below it with it); an error when anything else is found, or there is no
+    /// witness (M2T06R-900).
+    fn open_checked(&self) -> Result<Option<rustix::fd::OwnedFd>, String> {
+        let witness = self
+            .witness
+            .as_ref()
+            .ok_or_else(|| format!("{}: no record of what it was", self.path.display()))?;
+        let parts: Vec<&std::ffi::OsStr> = self
+            .path
+            .strip_prefix(&self.root)
+            .map_err(|e| format!("{}: {e}", self.path.display()))?
+            .components()
+            .map(|c| c.as_os_str())
+            .collect();
+        if parts.len() + 1 != witness.chain.len() {
+            return Err(format!(
+                "{}: its record does not fit its path",
+                self.path.display()
+            ));
         }
+        let checked = |fd: &rustix::fd::OwnedFd, at: usize| -> Result<(), String> {
+            let stat =
+                rustix::fs::fstat(fd).map_err(|e| format!("{}: {e}", self.path.display()))?;
+            if (stat.st_dev, stat.st_ino) == witness.chain[at] {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{}: a directory on its way is not the one recorded",
+                    self.path.display()
+                ))
+            }
+        };
+        let mut dir = rustix::fs::open(&self.root, directory(), rustix::fs::Mode::empty())
+            .map_err(|e| format!("{}: {e}", self.root.display()))?;
+        checked(&dir, 0)?;
+        for (i, part) in parts.iter().enumerate() {
+            match rustix::fs::openat(&dir, *part, directory(), rustix::fs::Mode::empty()) {
+                Ok(next) => {
+                    checked(&next, i + 1)?;
+                    dir = next;
+                }
+                Err(rustix::io::Errno::NOENT) => return Ok(None),
+                Err(e) => return Err(format!("{}: {e}", self.path.display())),
+            }
+        }
+        Ok(Some(dir))
+    }
+
+    /// Write `text` to its file `name`, through its checked directory, never creating it.
+    fn write(&self, name: &str, text: &str) -> std::io::Result<()> {
+        use std::io::Write as _;
+        let dir = self
+            .open_checked()
+            .map_err(std::io::Error::other)?
+            .ok_or_else(|| std::io::Error::other("it is gone"))?;
+        let fd = rustix::fs::openat(
+            &dir,
+            name,
+            rustix::fs::OFlags::WRONLY | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )?;
+        std::fs::File::from(fd).write_all(text.as_bytes())
+    }
+
+    /// Whether any process is in it: `Ok(false)` once it is empty, removed, or of another boot; an error when that
+    /// cannot be told, its events read only through its checked directory (M2T06R-900).
+    pub(super) fn populated(&self) -> Result<bool, String> {
+        use std::io::Read as _;
+        if let Some(witness) = &self.witness
+            && hoh_agents::identity::boot_id().is_ok_and(|now| now != witness.boot)
+        {
+            return Ok(false);
+        }
+        let Some(dir) = self.open_checked()? else {
+            return Ok(false);
+        };
+        let fd = rustix::fs::openat(
+            &dir,
+            "cgroup.events",
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(|e| format!("{}: cgroup.events: {e}", self.path.display()))?;
+        let mut events = String::new();
+        std::fs::File::from(fd)
+            .read_to_string(&mut events)
+            .map_err(|e| format!("{}: cgroup.events: {e}", self.path.display()))?;
+        events
+            .lines()
+            .find_map(|line| line.strip_prefix("populated "))
+            .map(|v| v.trim() == "1")
+            .ok_or_else(|| format!("{}: no populated line", self.path.display()))
     }
 
     /// It and every cgroup below it, parents first: `populated` and `cgroup.kill` cover the whole subtree, and so must
@@ -168,9 +316,10 @@ impl AttemptGroup {
         sent
     }
 
-    /// SIGKILL to every process in it at once, by the kernel (`cgroup.kill`); whether it was asked.
+    /// SIGKILL to every process in it at once, by the kernel (`cgroup.kill`, through its checked directory); whether it
+    /// was asked.
     pub(super) fn kill(&self) -> bool {
-        std::fs::write(self.path.join("cgroup.kill"), "1").is_ok()
+        self.write("cgroup.kill", "1").is_ok()
     }
 
     /// Remove it once it is empty, the cgroups below it first (a leftover empty directory is harmless).
@@ -258,7 +407,12 @@ fn recorded_form(path: &Path) -> bool {
 /// the /proc scan alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Tracking {
-    Cgroup(PathBuf),
+    /// Its cgroup, and what it was when it was made (`None` when its record has none: nothing it shows proves
+    /// anything).
+    Cgroup {
+        path: PathBuf,
+        witness: Option<Witness>,
+    },
     /// Why there is no cgroup.
     Proc(String),
 }
@@ -267,8 +421,10 @@ impl Tracking {
     /// As recorded in its `attempt.tracking` event.
     pub(super) fn json(&self, attempt_id: &str) -> serde_json::Value {
         match self {
-            Tracking::Cgroup(path) => serde_json::json!({
+            Tracking::Cgroup { path, witness } => serde_json::json!({
                 "attempt_id": attempt_id, "tracking": "cgroup", "cgroup": path.to_string_lossy(),
+                "boot_id": witness.as_ref().map(|w| w.boot.clone()),
+                "inodes": witness.as_ref().map(|w| w.chain.iter().map(|(d, i)| [*d, *i]).collect::<Vec<_>>()),
             }),
             Tracking::Proc(reason) => serde_json::json!({
                 "attempt_id": attempt_id, "tracking": "proc", "reason": reason,
@@ -285,7 +441,10 @@ impl Tracking {
                 .filter(|p| recorded_form(Path::new(p)))
                 .map_or_else(
                     || Tracking::Proc("no cgroup path recorded".to_owned()),
-                    |p| Tracking::Cgroup(PathBuf::from(p)),
+                    |p| Tracking::Cgroup {
+                        path: PathBuf::from(p),
+                        witness: witness_of(e),
+                    },
                 ),
             Some(e) => Tracking::Proc(e["reason"].as_str().unwrap_or("recorded").to_owned()),
             None => Tracking::Proc("no tracking recorded".to_owned()),
@@ -295,10 +454,33 @@ impl Tracking {
     /// Its cgroup, if it has one.
     pub(super) fn cgroup(&self) -> Option<AttemptGroup> {
         match self {
-            Tracking::Cgroup(path) => Some(AttemptGroup::at(path)),
+            Tracking::Cgroup { path, witness } => Some(AttemptGroup {
+                path: path.clone(),
+                root: PathBuf::from(MOUNT),
+                witness: witness.clone(),
+            }),
             Tracking::Proc(_) => None,
         }
     }
+
+    /// The tracking of a cgroup just made.
+    pub(super) fn of_group(group: &AttemptGroup) -> Tracking {
+        Tracking::Cgroup {
+            path: group.path().to_owned(),
+            witness: group.witness().cloned(),
+        }
+    }
+}
+
+/// The witness an `attempt.tracking` event records, if a whole one.
+fn witness_of(event: &serde_json::Value) -> Option<Witness> {
+    let boot = event["boot_id"].as_str()?.to_owned();
+    let chain = event["inodes"]
+        .as_array()?
+        .iter()
+        .map(|pair| Some((pair.get(0)?.as_u64()?, pair.get(1)?.as_u64()?)))
+        .collect::<Option<Vec<_>>>()?;
+    (!chain.is_empty()).then_some(Witness { boot, chain })
 }
 
 #[cfg(test)]
@@ -317,7 +499,7 @@ mod tests {
         let deepest = at.join("a").join("b").join("c");
         std::fs::create_dir_all(&deepest)?;
         std::fs::create_dir_all(at.join("d"))?;
-        let group = AttemptGroup::at(&at);
+        let group = AttemptGroup::witnessed(root.path(), &at)?;
         let mut found = group.subtree();
         assert_eq!(found.first(), Some(&at), "the cgroup itself first");
         found.sort();
@@ -355,7 +537,7 @@ mod tests {
     fn a_cgroup_still_populated_after_its_kill_proves_nothing() -> R {
         // M2T06R-451: SIGKILL asked of the kernel, the grace waited, still populated: Pending, no reaped step, kept.
         let dir = fake(1)?;
-        let group = AttemptGroup::at(dir.path());
+        let group = AttemptGroup::witnessed(dir.path(), dir.path())?;
         let (steps, proof) = group.stop(Duration::from_millis(30), Duration::from_millis(30));
         assert_eq!(
             (steps, proof),
@@ -377,7 +559,7 @@ mod tests {
             dir.path().join("cgroup.events"),
             std::fs::Permissions::from_mode(0o000),
         )?;
-        let group = AttemptGroup::at(dir.path());
+        let group = AttemptGroup::witnessed(dir.path(), dir.path())?;
         assert_eq!(group.proof(), Proof::Incomplete);
         let (steps, proof) = group.stop(Duration::from_millis(30), Duration::from_millis(30));
         std::fs::set_permissions(
@@ -392,16 +574,84 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_cgroup_is_proved_at_once_and_a_gone_one_too() -> R {
+    fn an_empty_cgroup_is_proved_at_once_and_a_removed_one_too() -> R {
         let dir = fake(0)?;
         assert_eq!(
-            AttemptGroup::at(dir.path()).stop(Duration::ZERO, Duration::ZERO),
+            AttemptGroup::witnessed(dir.path(), dir.path())?.stop(Duration::ZERO, Duration::ZERO),
             (Vec::new(), Proof::Done)
         );
+        // M2T06R-900: removed means absent from its verified parent.
+        let root = tempfile::tempdir()?;
+        let at = root.path().join("attempt-0123456789abcdef");
+        std::fs::create_dir(&at)?;
+        let group = AttemptGroup::witnessed(root.path(), &at)?;
+        std::fs::remove_dir(&at)?;
+        assert_eq!(group.proof(), Proof::Done);
+        Ok(())
+    }
+
+    #[test]
+    fn a_cgroup_is_judged_only_through_the_directories_it_was_recorded_in() -> R {
+        // M2T06R-900 (decision 8d v7): what is at a recorded path is not taken for the recorded cgroup. A directory
+        // put in its place (a mount over it, another view, one made there later) proves nothing even with a
+        // `populated 0` of its own; nor does an absence below a parent that is not the recorded one; nor a path with
+        // no record of what it was.
+        let root = tempfile::tempdir()?;
+        let parent = root.path().join("host.scope");
+        let at = parent.join("attempt-0123456789abcdef");
+        std::fs::create_dir_all(&at)?;
+        std::fs::write(at.join("cgroup.events"), b"populated 1\n")?;
+        let group = AttemptGroup::witnessed(root.path(), &at)?;
         assert_eq!(
-            AttemptGroup::at(&dir.path().join("gone")).proof(),
-            Proof::Done
+            group.proof(),
+            Proof::Pending,
+            "the recorded cgroup, populated"
         );
+        // Another directory in its place, saying it is empty.
+        std::fs::rename(&at, root.path().join("moved"))?;
+        std::fs::create_dir(&at)?;
+        std::fs::write(at.join("cgroup.events"), b"populated 0\n")?;
+        assert_eq!(
+            group.proof(),
+            Proof::Incomplete,
+            "not the recorded directory"
+        );
+        // Its parent replaced: the cgroup absent below a parent that is not the recorded one.
+        std::fs::remove_dir_all(&parent)?;
+        std::fs::create_dir(&parent)?;
+        assert_eq!(group.proof(), Proof::Incomplete, "not the recorded parent");
+        // No record of what it was: an absence proves nothing.
+        assert_eq!(
+            AttemptGroup::at(&at.join("gone")).proof(),
+            Proof::Incomplete
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_cgroups_tracking_records_what_it_was_and_a_later_host_reads_it_back() -> R {
+        // M2T06R-900: the attempt.tracking event carries the witness, so a host after a restart judges the same way.
+        let root = tempfile::tempdir()?;
+        let at = root.path().join("attempt-0123456789abcdef");
+        std::fs::create_dir(&at)?;
+        let group = AttemptGroup::witnessed(root.path(), &at)?;
+        let tracking = Tracking::of_group(&group);
+        let event = tracking.json("p/A1");
+        assert_eq!(event["inodes"].as_array().map(Vec::len), Some(2), "{event}");
+        assert_eq!(witness_of(&event).as_ref(), group.witness());
+        Ok(())
+    }
+
+    #[test]
+    fn a_cgroup_of_another_boot_is_gone() -> R {
+        // M2T06R-900: whatever is at its path now, nothing of a cgroup made before this boot is left.
+        let root = tempfile::tempdir()?;
+        let at = root.path().join("attempt-0123456789abcdef");
+        std::fs::create_dir(&at)?;
+        std::fs::write(at.join("cgroup.events"), b"populated 1\n")?;
+        let mut group = AttemptGroup::witnessed(root.path(), &at)?;
+        group.another_boot();
+        assert_eq!(group.proof(), Proof::Done);
         Ok(())
     }
 
@@ -412,7 +662,10 @@ mod tests {
         let good = "/sys/fs/cgroup/user.slice/x.scope/attempt-0123456789abcdef";
         assert_eq!(
             Tracking::of(Some(&event(good))),
-            Tracking::Cgroup(PathBuf::from(good))
+            Tracking::Cgroup {
+                path: PathBuf::from(good),
+                witness: None
+            }
         );
         for bad in [
             "/tmp/attempt-0123456789abcdef",
