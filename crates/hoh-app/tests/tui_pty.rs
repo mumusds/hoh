@@ -751,6 +751,8 @@ fn a_host_started_by_a_detach_in_a_terminal_outlives_its_hang_up() -> R {
     let (project, home) = (dir.path().join("p"), dir.path().join("home"));
     std::fs::create_dir_all(&project)?;
     std::fs::create_dir_all(&home)?;
+    // The host the detach starts is stopped however the test ends, found by its command line (M2T06R-257).
+    let _daemons = Daemons(project.clone());
     let mut pty = Pty::new(30, 100)?;
     let mut client = spawn_in(
         &pty,
@@ -763,7 +765,6 @@ fn a_host_started_by_a_detach_in_a_terminal_outlives_its_hang_up() -> R {
     let host: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(project.join(".hoh/host.json"))?)?;
     let pid = u32::try_from(host["pid"].as_u64().ok_or("no pid")?)?;
-    let _daemons = Daemons(project.clone());
     pty.hang_up()?;
     drop(pty);
     std::thread::sleep(Duration::from_millis(500));

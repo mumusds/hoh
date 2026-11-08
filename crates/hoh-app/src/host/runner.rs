@@ -510,8 +510,9 @@ async fn attempt(
     // termination proof (docs/adr/ADR-021.md decision 8d v3, M2T06R-100); else it stays RUNNING like an unreaped group.
     let marker = work.marker();
     let (term, kill) = (common.settings.term_grace, common.settings.kill_grace);
+    let root = common.shared.hooks.proc_root();
     let (steps, proof) =
-        tokio::task::spawn_blocking(move || Outside::new(&marker).stop(term, kill))
+        tokio::task::spawn_blocking(move || Outside::new(&marker).with_root(root).stop(term, kill))
             .await
             .map_err(|e| {
                 PersistError::Storage(format!("the stop outside the group of {id} ended: {e}"))

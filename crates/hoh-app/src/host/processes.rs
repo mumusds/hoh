@@ -96,6 +96,58 @@ fn processes(root: &Path) -> (Vec<Proc>, bool) {
     (all, complete)
 }
 
+/// The pid most recently allocated in this pid namespace (`<root>/sys/kernel/ns_last_pid`).
+fn last_pid(root: &Path) -> Option<u32> {
+    std::fs::read_to_string(root.join("sys/kernel/ns_last_pid"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// How many pids a scan looks at one by one at most for one span of allocations: more (a wrap of the pid space, a fork
+/// storm) leaves the scan incomplete.
+const SWEEP_SPAN: u32 = 65_536;
+
+/// How many spans a scan sweeps before it gives up (allocations that never stop while it looks).
+const SWEEPS: usize = 64;
+
+/// The pids allocated after `from` up to `to`, in allocation order (cyclic below `pid_max`), if not too many.
+fn allocated(root: &Path, from: u32, to: u32) -> Option<Vec<u32>> {
+    if to > from {
+        return (to - from <= SWEEP_SPAN).then(|| (from + 1..=to).collect());
+    }
+    let max: u32 = std::fs::read_to_string(root.join("sys/kernel/pid_max"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    let span = max.checked_sub(from)?.saturating_add(to);
+    (span <= SWEEP_SPAN).then(|| (from + 1..max).chain(1..=to).collect())
+}
+
+/// `pid` as a process (its thread group's leader) if it is one: a pid allocated during a scan may name a thread.
+fn stat_process(root: &Path, pid: u32) -> Stat {
+    let status = match std::fs::read(root.join(pid.to_string()).join("status")) {
+        Ok(status) => status,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(3) => {
+            return Stat::Gone;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return Stat::Gone,
+        Err(_) => return Stat::Unreadable,
+    };
+    let tgid = status
+        .split(|b| *b == b'\n')
+        .find_map(|line| line.strip_prefix(b"Tgid:"))
+        .and_then(|v| std::str::from_utf8(v).ok()?.trim().parse::<u32>().ok());
+    match tgid {
+        Some(tgid) if tgid == pid => stat(root, pid),
+        // A thread: its process is listed or swept on its own.
+        Some(_) => Stat::Gone,
+        None => Stat::Unreadable,
+    }
+}
+
 /// Whether `pid`'s environment has `marker` (`NAME=value`) as one of its entries: `None` when that cannot be told (a
 /// read that failed other than for another user's process or a process gone).
 fn marked(root: &Path, pid: u32, marker: &[u8]) -> Option<bool> {
@@ -176,6 +228,9 @@ pub(super) struct Outside {
     scanned: Option<Instant>,
     /// Where processes are listed: `/proc` (a test gives a tree of its own).
     root: PathBuf,
+    /// Runs between a scan's listing and its first reads of environments (a test makes a process fork and exit there).
+    #[cfg(test)]
+    after_listing: Option<Box<dyn FnMut() + Send>>,
 }
 
 impl Outside {
@@ -188,7 +243,22 @@ impl Outside {
             quiet: 0,
             scanned: None,
             root: PathBuf::from("/proc"),
+            #[cfg(test)]
+            after_listing: None,
         }
+    }
+
+    /// Where processes are listed instead of `/proc` (a test's fault hook gives a tree of its own).
+    pub(super) fn with_root(mut self, root: Option<PathBuf>) -> Outside {
+        if let Some(root) = root {
+            self.root = root;
+        }
+        self
+    }
+
+    /// The group was seen alive: the scans that count for the proof start again after it (M2T06R-252).
+    pub(super) fn group_alive(&mut self) {
+        self.quiet = 0;
     }
 
     /// Its leader as recorded (`attempts.pid` and `process_start_id`), pinned for the parent chain if it is still that
@@ -210,7 +280,58 @@ impl Outside {
     /// Look for them now: pin the new ones (sending them the strongest signal so far) and say where the proof stands.
     pub(super) fn scan(&mut self) -> Proof {
         self.scanned = Some(Instant::now());
-        let (processes, mut complete) = processes(&self.root);
+        // The listing, then every pid allocated since it began, each batch's environments read before the next look
+        // at the allocations, until none was allocated meanwhile (decision 8d v4, M2T06R-200): a marked process alive
+        // at the end was either looked at here or forked by a marked process looked at here.
+        let Some(mut last) = last_pid(&self.root) else {
+            self.quiet = 0;
+            return Proof::Incomplete;
+        };
+        let (mut processes, mut complete) = processes(&self.root);
+        #[cfg(test)]
+        if let Some(hook) = self.after_listing.as_mut() {
+            hook();
+        }
+        let mut seen: BTreeSet<u32> = processes.iter().map(|p| p.pid).collect();
+        let mut by_marker: BTreeSet<u32> = BTreeSet::new();
+        let mut batch: Vec<u32> = processes.iter().map(|p| p.pid).collect();
+        let mut settled = false;
+        for _ in 0..=SWEEPS {
+            for pid in batch.drain(..) {
+                match marked(&self.root, pid, &self.marker) {
+                    Some(true) => {
+                        by_marker.insert(pid);
+                    }
+                    Some(false) => {}
+                    None => complete = false,
+                }
+            }
+            let Some(now) = last_pid(&self.root) else {
+                break;
+            };
+            if now == last {
+                settled = true;
+                break;
+            }
+            let Some(pids) = allocated(&self.root, last, now) else {
+                break;
+            };
+            for pid in pids {
+                if !seen.insert(pid) {
+                    continue;
+                }
+                match stat_process(&self.root, pid) {
+                    Stat::Read(process) => {
+                        batch.push(pid);
+                        processes.push(process);
+                    }
+                    Stat::Gone => {}
+                    Stat::Unreadable => complete = false,
+                }
+            }
+            last = now;
+        }
+        complete = complete && settled;
         let mut found: BTreeSet<u32> = BTreeSet::new();
         let mut parents: Vec<u32> = self
             .leader
@@ -224,14 +345,6 @@ impl Outside {
                 if found.insert(process.pid) {
                     parents.push(process.pid);
                 }
-            }
-        }
-        let mut by_marker = Vec::new();
-        for process in processes.iter().filter(|p| !found.contains(&p.pid)) {
-            match marked(&self.root, process.pid, &self.marker) {
-                Some(true) => by_marker.push(process.pid),
-                Some(false) => {}
-                None => complete = false,
             }
         }
         found.extend(by_marker);
@@ -301,6 +414,8 @@ impl Outside {
         term_grace: Duration,
         kill_grace: Duration,
     ) -> (Vec<String>, Proof) {
+        // Only scans made after the group was stopped count for the proof (M2T06R-252).
+        self.group_alive();
         let mut steps = Vec::new();
         let mut proof = self.scan();
         for (signal, name, grace) in [
@@ -393,6 +508,124 @@ mod tests {
     }
 
     #[test]
+    fn a_marked_process_that_forks_and_exits_during_a_scan_leaves_its_child_found()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // M2T06R-200 (decision 8d v4): between the scan's listing and its reads of environments, the marked process
+        // forks a child and exits, reaped. The child was not listed and its parent's environment is gone; the sweep of
+        // the pids allocated meanwhile finds the child by its marker.
+        use std::io::BufRead as _;
+        use std::os::unix::process::CommandExt as _;
+        let marker = format!("test-{}/A2", std::process::id());
+        let mut hopper = std::process::Command::new("python3")
+            .args([
+                "-c",
+                "import os, signal, time\n\
+                 def hop(*_):\n    if os.fork() == 0:\n        time.sleep(30)\n        os._exit(0)\n    os._exit(0)\n\
+                 signal.signal(signal.SIGUSR1, hop)\nprint('ready', flush=True)\ntime.sleep(30)\n",
+            ])
+            .env(ATTEMPT_ENV, &marker)
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()?;
+        let pid = hopper.id();
+        let mut ready = String::new();
+        std::io::BufReader::new(hopper.stdout.take().ok_or("no stdout")?).read_line(&mut ready)?;
+        let child_of_hopper = std::sync::Arc::new(std::sync::Mutex::new(None::<u32>));
+        let seen = child_of_hopper.clone();
+        let mut outside = Outside::new(&marker);
+        outside.after_listing = Some(Box::new(move || {
+            if let Some(p) = i32::try_from(pid)
+                .ok()
+                .and_then(rustix::process::Pid::from_raw)
+            {
+                let _ = rustix::process::kill_process(p, rustix::process::Signal::USR1);
+            }
+            let _ = hopper.wait();
+            // Its child, found without the scan: in the hopper's group, which outlives it.
+            let end = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < end {
+                let (all, _) = processes(Path::new("/proc"));
+                let found = all.iter().find(|p| {
+                    p.pid != pid
+                        && std::fs::read(format!("/proc/{}/stat", p.pid))
+                            .is_ok_and(|s| parse_group(&s) == Some(pid))
+                });
+                if let Some(child) = found {
+                    if let Ok(mut c) = seen.lock() {
+                        *c = Some(child.pid);
+                    }
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }));
+        let proof = outside.scan();
+        let pinned: Vec<u32> = outside.pins.iter().map(|p| p.pid).collect();
+        if let Some(group) = i32::try_from(pid)
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+        {
+            let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+        }
+        let child = child_of_hopper
+            .lock()
+            .map(|c| *c)
+            .unwrap_or(None)
+            .ok_or("no child")?;
+        assert_eq!(pinned, [child], "the child forked during the scan");
+        assert_eq!(proof, Proof::Pending);
+        Ok(())
+    }
+
+    /// A process's group (`stat` field 5).
+    fn parse_group(stat: &[u8]) -> Option<u32> {
+        let end = stat.windows(2).rposition(|w| w == b") ")?;
+        let fields: Vec<&[u8]> = stat.get(end + 2..)?.split(|b| *b == b' ').collect();
+        std::str::from_utf8(fields.get(2)?).ok()?.parse().ok()
+    }
+
+    #[test]
+    fn a_marked_process_that_cannot_be_pinned_makes_the_scan_incomplete()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // M2T06R-251: a marked process is listed but its pidfd cannot be opened (it is no real process here) while its
+        // stat still reads: nothing is concluded.
+        let root = tempfile::tempdir()?;
+        std::fs::create_dir_all(root.path().join("sys/kernel"))?;
+        std::fs::write(root.path().join("sys/kernel/ns_last_pid"), b"1000\n")?;
+        let dir = root.path().join("4000000");
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(
+            dir.join("stat"),
+            b"4000000 (x) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 9 0",
+        )?;
+        std::fs::write(dir.join("environ"), format!("{ATTEMPT_ENV}=p/A1\0"))?;
+        let mut outside = Outside::new("p/A1").with_root(Some(root.path().to_owned()));
+        assert_eq!(outside.scan(), Proof::Incomplete);
+        assert_eq!(outside.scan(), Proof::Incomplete);
+        Ok(())
+    }
+
+    #[test]
+    fn a_stop_counts_only_its_own_scans_for_the_proof() -> Result<(), Box<dyn std::error::Error>> {
+        // M2T06R-252: a scan before the group's stop found nothing; the stop still needs two scans of its own.
+        let root = tempfile::tempdir()?;
+        std::fs::create_dir_all(root.path().join("sys/kernel"))?;
+        std::fs::write(root.path().join("sys/kernel/ns_last_pid"), b"1000\n")?;
+        let scans = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = scans.clone();
+        let mut outside = Outside::new("p/A1").with_root(Some(root.path().to_owned()));
+        outside.after_listing = Some(Box::new(move || {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        assert_eq!(outside.scan(), Proof::Pending);
+        scans.store(0, std::sync::atomic::Ordering::SeqCst);
+        let (steps, proof) = outside.stop(Duration::from_secs(5), Duration::from_secs(5));
+        assert_eq!((steps, proof), (Vec::<String>::new(), Proof::Done));
+        assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[test]
     fn a_scan_that_could_not_read_a_process_proves_nothing()
     -> Result<(), Box<dyn std::error::Error>> {
         // M2T06R-101 (decision 8d v3): a /proc tree with a process whose stat cannot be understood; however often it is
@@ -403,6 +636,8 @@ mod tests {
             std::fs::write(root.path().join(pid).join("stat"), stat)?;
             std::fs::write(root.path().join(pid).join("environ"), b"PATH=/bin\0")
         };
+        std::fs::create_dir_all(root.path().join("sys/kernel"))?;
+        std::fs::write(root.path().join("sys/kernel/ns_last_pid"), b"101\n")?;
         write(
             "100",
             b"100 (sh) S 1 100 100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 500 0",

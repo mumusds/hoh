@@ -238,6 +238,21 @@ impl Processes for HostProcesses {
     }
 }
 
+/// A look at an attempt with its group seen `group` (Held or Empty): while the group lives the processes outside it are
+/// kept up with (every [`super::processes::RESCAN`]) and no scan counts for the proof; once it is empty every look
+/// scans, and only the termination proof makes it Empty (decision 8d, M2T06R-252, -253).
+fn look_at(group: Look, outside: &mut Outside) -> Look {
+    if group == Look::Held {
+        let _ = outside.keep_up();
+        outside.group_alive();
+        return Look::Held;
+    }
+    match outside.scan() {
+        Proof::Done => Look::Empty,
+        Proof::Pending | Proof::Incomplete => Look::Held,
+    }
+}
+
 /// The processes outside each attempt's group of a cancel, kept for the whole cancel, across its passes.
 type Pins = Arc<Mutex<BTreeMap<String, Arc<Mutex<Outside>>>>>;
 
@@ -259,14 +274,7 @@ impl ProcessControl for AttemptControl {
         let Ok(mut outside) = self.outside.lock() else {
             return Look::Held;
         };
-        if group == Look::Held {
-            let _ = outside.keep_up();
-            return Look::Held;
-        }
-        match outside.scan() {
-            Proof::Done => Look::Empty,
-            Proof::Pending | Proof::Incomplete => Look::Held,
-        }
+        look_at(group, &mut outside)
     }
 
     fn send(&mut self, signal: Signal) -> bool {
@@ -536,6 +544,98 @@ mod tests {
         } else {
             Err(format!("git {args:?}: {status}").into())
         }
+    }
+
+    /// A /proc tree of a test's own: `processes` as (pid, environment), none of them real.
+    fn tree(processes: &[(u32, &str)]) -> R<tempfile::TempDir> {
+        let root = tempfile::tempdir()?;
+        std::fs::create_dir_all(root.path().join("sys/kernel"))?;
+        std::fs::write(root.path().join("sys/kernel/ns_last_pid"), b"1000\n")?;
+        for (pid, env) in processes {
+            add(root.path(), *pid, env)?;
+        }
+        Ok(root)
+    }
+
+    fn add(root: &Path, pid: u32, env: &str) -> R {
+        let dir = root.join(pid.to_string());
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(
+            dir.join("stat"),
+            format!("{pid} (x) S 1 {pid} {pid} 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 77 0"),
+        )?;
+        std::fs::write(dir.join("environ"), format!("{env}\0"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn only_scans_after_the_group_emptied_count_for_the_proof() -> R {
+        // M2T06R-252: looks while the group lives keep up with the processes outside it but count nothing; the first
+        // look at the empty group is one scan of the two the proof needs.
+        let root = tree(&[(100, "PATH=/bin")])?;
+        let mut outside = Outside::new("p/A1").with_root(Some(root.path().to_owned()));
+        assert_eq!(look_at(Look::Held, &mut outside), Look::Held);
+        assert_eq!(look_at(Look::Held, &mut outside), Look::Held);
+        assert_eq!(look_at(Look::Empty, &mut outside), Look::Held);
+        assert_eq!(look_at(Look::Empty, &mut outside), Look::Empty);
+        Ok(())
+    }
+
+    #[test]
+    fn a_look_at_an_empty_group_scans_however_recent_the_last_scan() -> R {
+        // M2T06R-253: right after a scan, a marked process appears; the next look at the empty group scans again (no
+        // 100 ms wait) and holds (it cannot be pinned in this tree, so the scan is incomplete).
+        let root = tree(&[(100, "PATH=/bin")])?;
+        let mut outside = Outside::new("p/A1").with_root(Some(root.path().to_owned()));
+        assert_eq!(look_at(Look::Empty, &mut outside), Look::Held);
+        add(
+            root.path(),
+            101,
+            &format!("{}=p/A1", super::super::processes::ATTEMPT_ENV),
+        )?;
+        assert_eq!(look_at(Look::Empty, &mut outside), Look::Held);
+        assert_eq!(look_at(Look::Empty, &mut outside), Look::Held);
+        Ok(())
+    }
+
+    #[test]
+    fn a_cancel_keeps_an_attempts_outside_processes_across_its_passes() -> R {
+        // M2T06R-257: each pass asks for the attempt's control anew; it gets the same pins, signal and count.
+        let processes = HostProcesses {
+            works: BTreeMap::new(),
+            executor: None,
+            project: PathBuf::from("/nonexistent"),
+            project_id: "p".to_owned(),
+            pins: Arc::default(),
+        };
+        let row = AttemptRow {
+            attempt_id: "A1".to_owned(),
+            task_id: "T1".to_owned(),
+            session_id: None,
+            state: hoh_core::lifecycle::AttemptState::Running,
+            role_epoch: 1,
+            host_epoch: 1,
+            config_revision: 1,
+            pid: None,
+            boot_id: None,
+            process_start_id: None,
+            started_at: None,
+            ended_at: None,
+            raw_log_path: None,
+            agent: None,
+            resolved_model: None,
+            failure_reason: None,
+            cancel_requested: true,
+            usage: None,
+            cost_usd: None,
+        };
+        let held = |p: &HostProcesses| p.pins.lock().map(|m| m.get("A1").cloned()).unwrap_or(None);
+        let _first = processes.control(&row);
+        let one = held(&processes).ok_or("no pins after the first pass")?;
+        let _second = processes.control(&row);
+        let two = held(&processes).ok_or("no pins after the second pass")?;
+        assert!(Arc::ptr_eq(&one, &two));
+        Ok(())
     }
 
     /// A deadline no test reaches.

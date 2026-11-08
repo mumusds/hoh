@@ -762,6 +762,23 @@ fn orphan_writer(file: &Path) -> R<String> {
     Ok(format!("(setsid {} &)", writer(file)?))
 }
 
+/// The writer ignoring SIGTERM (only the SIGKILL step ends it, a grace later), orphaned in a session of its own: an
+/// attempt that ended before it was gone is seen while it still writes (M2T06R-250).
+fn stubborn_orphan_writer(file: &Path) -> R<String> {
+    Ok(format!("(trap '' TERM; setsid {} &)", writer(file)?))
+}
+
+/// The runner's /proc for the termination proof replaced by a tree with a process it cannot read (CR-006: a test's
+/// fault hook): no proof can be had.
+#[derive(Debug)]
+struct UnreadableProc(PathBuf);
+
+impl hoh_app::host::HostHooks for UnreadableProc {
+    fn proc_root(&self) -> Option<PathBuf> {
+        Some(self.0.clone())
+    }
+}
+
 /// Cancel R with T1 running `script` and check that the run is CANCELLED only once nothing of T1's attempt lives
 /// and that `file` no longer grows then; the project's directory.
 async fn cancel_with_a_writer_outside(dir: &Path, script: &str, file: &Path) -> R<PathBuf> {
@@ -974,7 +991,7 @@ async fn an_attempt_whose_agent_ended_settles_only_once_its_processes_outside_th
     // empties its group. The runner stops the writer before it ends the attempt and gives up its slot.
     let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
     let file = dir.path().join("written.txt");
-    let script = format!("{}; sleep 0.3; exit 0", orphan_writer(&file)?);
+    let script = format!("{}; sleep 0.3; exit 0", stubborn_orphan_writer(&file)?);
     let agents = Arc::new(Agents::new(&[("T1", script.as_str())]));
     let _leaders = Leaders(agents.leaders.clone());
     let (project, host) = host(dir.path(), &agents).await?;
@@ -988,12 +1005,13 @@ async fn an_attempt_whose_agent_ended_settles_only_once_its_processes_outside_th
     )
     .await?;
     nothing_of_it_left(&marker, &file).await?;
+    // The writer ignored SIGTERM: it was gone only at the SIGKILL step, and the attempt settled after that.
     assert_eq!(
         query(
             &project,
-            "SELECT json_extract(payload_json, '$.steps[0]') FROM events WHERE kind = 'runner.outside'"
+            "SELECT json_extract(payload_json, '$.steps') FROM events WHERE kind = 'runner.outside'"
         )?,
-        "outside_sigterm"
+        r#"["outside_sigterm","outside_sigkill","outside_reaped"]"#
     );
     host.shutdown().await;
     Ok(())
@@ -1006,7 +1024,10 @@ async fn an_expired_lease_is_given_up_only_once_its_holders_processes_outside_th
     // past the lease. The settle stops the group and then the writer; T2 gets the lease only after.
     let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
     let file = dir.path().join("written.txt");
-    let script = format!("{}; while :; do sleep 0.1; done", orphan_writer(&file)?);
+    let script = format!(
+        "{}; while :; do sleep 0.1; done",
+        stubborn_orphan_writer(&file)?
+    );
     let agents = Arc::new(Agents::new(&[("T1", script.as_str())]));
     let _leaders = Leaders(agents.leaders.clone());
     let project = dir.path().join("p");
@@ -1042,9 +1063,9 @@ async fn an_expired_lease_is_given_up_only_once_its_holders_processes_outside_th
     assert_eq!(
         seq(
             &project,
-            "SELECT count(*) FROM events WHERE kind = 'lease.outside_sigterm'"
+            "SELECT count(*) FROM events WHERE kind IN ('lease.outside_sigterm', 'lease.outside_sigkill')"
         )?,
-        1
+        2
     );
     host.shutdown().await;
     Ok(())
@@ -1057,7 +1078,10 @@ async fn a_hosts_start_reconcile_ends_an_attempt_only_once_its_processes_outside
     // host's start reconcile stops the group and the writer before it ends T1's attempt.
     let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
     let file = dir.path().join("written.txt");
-    let script = format!("{}; while :; do sleep 0.1; done", orphan_writer(&file)?);
+    let script = format!(
+        "{}; while :; do sleep 0.1; done",
+        stubborn_orphan_writer(&file)?
+    );
     let agents = Arc::new(Agents::new(&[("T1", script.as_str())]));
     let _leaders = Leaders(agents.leaders.clone());
     let (project, first) = host(dir.path(), &agents).await?;
@@ -1100,7 +1124,134 @@ async fn a_hosts_start_reconcile_ends_an_attempt_only_once_its_processes_outside
         "RUNNING"
     );
     nothing_of_it_left(&marker, &file).await?;
+    assert_eq!(
+        query(
+            &project,
+            "SELECT json_extract(payload_json, '$.process.steps') FROM events WHERE kind = 'reconcile.attempt' \
+             AND json_extract(payload_json, '$.attempt_id') = 'T1/attempt-1' ORDER BY seq DESC LIMIT 1"
+        )?,
+        r#"["sigterm","reaped","outside_sigterm","outside_sigkill","outside_reaped"]"#
+    );
     second.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hosts_start_reconcile_pins_through_the_leader_a_descendant_without_the_marker_before_it_stops_the_group()
+-> R {
+    // M2T06R-251 (decision 8d, path 4): T1's leader starts a writer with an emptied environment in a session of its own,
+    // ignoring SIGTERM. The next host's start reconcile pins it through the living leader before it stops the group;
+    // after the group's stop it is an unmarked orphan that only that pin ties to the attempt.
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let file = dir.path().join("written.txt");
+    let pid_file = dir.path().join("w.pid");
+    let script = format!(
+        "(trap '' TERM; exec env -i /usr/bin/setsid {}) & echo $! > {}; while :; do sleep 0.1; done",
+        writer(&file)?,
+        pid_file.display()
+    );
+    let guard = KillPidFile(pid_file.clone());
+    let agents = Arc::new(Agents::new(&[("T1", script.as_str())]));
+    let _leaders = Leaders(agents.leaders.clone());
+    let (project, first) = host(dir.path(), &agents).await?;
+    until(
+        &project,
+        "SELECT state FROM attempts WHERE task_id = 'T1'",
+        "RUNNING",
+        Duration::from_secs(10),
+    )
+    .await?;
+    let end = Instant::now() + Duration::from_secs(10);
+    while std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0) == 0 {
+        if Instant::now() > end {
+            return Err("the writer did not start".into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    first.shutdown().await;
+    let reconciled = seq(
+        &project,
+        "SELECT count(*) FROM events WHERE kind = 'reconcile.completed'",
+    )?;
+    let second = start_when_free(config(&project)).await?;
+    until(
+        &project,
+        "SELECT count(*) FROM events WHERE kind = 'reconcile.completed'",
+        &(reconciled + 1).to_string(),
+        Duration::from_secs(40),
+    )
+    .await?;
+    let size = || std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
+    let before = size();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(size(), before, "the workspace is still written");
+    let pid: u32 = std::fs::read_to_string(&pid_file)?.trim().parse()?;
+    let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|s| {
+            s.rsplit_once(") ")
+                .map(|(_, rest)| rest.chars().next().unwrap_or('?'))
+        });
+    assert!(
+        matches!(state, None | Some('Z')),
+        "the writer lives: {state:?}"
+    );
+    drop(guard);
+    second.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attempt_whose_agent_ended_stays_with_its_slot_when_its_termination_cannot_be_proved()
+-> R {
+    // M2T06R-251 (decision 8d, path 2): the agent exits 0 and its group is emptied, but the runner's /proc (a test's
+    // tree) has a process it cannot read: no proof, so the attempt stays RUNNING with its slot and says why.
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let fake = dir.path().join("proc");
+    std::fs::create_dir_all(fake.join("sys/kernel"))?;
+    std::fs::write(fake.join("sys/kernel/ns_last_pid"), b"10\n")?;
+    std::fs::create_dir_all(fake.join("7"))?;
+    std::fs::write(fake.join("7/stat"), b"garbage")?;
+    let agents = Arc::new(Agents::new(&[("T1", "exit 0")]));
+    let _leaders = Leaders(agents.leaders.clone());
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    Host::start(config(&project)).await?.shutdown().await;
+    seed(&project, WORLD)?;
+    let mut config = config(&project);
+    config.hooks = Arc::new(UnreadableProc(fake));
+    config.runner = Some(hoh_app::host::RunnerConfig {
+        executor: agents.clone(),
+        context: context(),
+    });
+    let host = start_when_free(config).await?;
+    until(
+        &project,
+        "SELECT count(*) FROM events WHERE kind = 'runner.unreaped'",
+        "1",
+        Duration::from_secs(30),
+    )
+    .await?;
+    assert_eq!(
+        query(&project, "SELECT state FROM attempts WHERE task_id = 'T1'")?,
+        "RUNNING"
+    );
+    assert_eq!(
+        query(
+            &project,
+            "SELECT json_extract(payload_json, '$.steps') FROM events WHERE kind = 'runner.unreaped'"
+        )?,
+        r#"["outside_unreadable"]"#
+    );
+    assert_eq!(
+        query(
+            &project,
+            "SELECT count(*) FROM attempts WHERE task_id = 'T2'"
+        )?,
+        "0",
+        "the slot was not given up"
+    );
+    host.shutdown().await;
     Ok(())
 }
 

@@ -246,6 +246,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn without_the_proof_the_process_is_recorded_unreaped() {
+        // M2T06R-251 (decision 8d): the group's record, then what was done outside it; no proof, no end.
+        let stopped = |reaped| Process::Stopped {
+            steps: vec!["sigterm".to_owned(), "reaped".to_owned()],
+            reaped,
+        };
+        let outside = vec!["outside_sigterm".to_owned()];
+        assert_eq!(
+            with_outside(stopped(true), Vec::new(), Proof::Done),
+            stopped(true)
+        );
+        for proof in [Proof::Pending, Proof::Incomplete] {
+            assert_eq!(
+                with_outside(stopped(true), outside.clone(), proof),
+                Process::Stopped {
+                    steps: vec![
+                        "sigterm".to_owned(),
+                        "reaped".to_owned(),
+                        "outside_sigterm".to_owned()
+                    ],
+                    reaped: false
+                }
+            );
+            let gone = Process::Gone {
+                basis: "no_process".to_owned(),
+            };
+            assert_eq!(
+                with_outside(gone, outside.clone(), proof),
+                Process::Stopped {
+                    steps: outside.clone(),
+                    reaped: false
+                }
+            );
+        }
+        let gone = Process::Gone {
+            basis: "no_process".to_owned(),
+        };
+        assert_eq!(with_outside(gone.clone(), Vec::new(), Proof::Done), gone);
+        assert_eq!(
+            with_outside(Process::NotStarted, outside.clone(), Proof::Done),
+            Process::Stopped {
+                steps: outside,
+                reaped: true
+            }
+        );
+    }
+
+    #[test]
     fn an_inspection_that_fails_or_finds_members_without_their_leader_is_uncertain() {
         // M2T05R-356: the mapping the callers rely on; a leaderless group's finding carries no count (M2T05R-350).
         let failed = seen(
