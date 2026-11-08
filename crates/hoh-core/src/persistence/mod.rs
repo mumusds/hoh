@@ -1299,6 +1299,16 @@ impl Reader {
         commands::list_runs(&self.conn, state, limit, before)
     }
 
+    /// The payload of the latest event of `kind` about attempt `attempt_id`, if any (an attempt's tracking, ADR-021
+    /// decision 8d).
+    pub fn attempt_event(
+        &self,
+        kind: &str,
+        attempt_id: &str,
+    ) -> Result<Option<serde_json::Value>, PersistError> {
+        commands::attempt_event(&self.conn, kind, attempt_id)
+    }
+
     /// At most `limit` events after seq `after`, in order.
     pub fn events_after(&self, after: i64, limit: usize) -> Result<Vec<EventRow>, PersistError> {
         commands::events_after(&self.conn, after, limit)

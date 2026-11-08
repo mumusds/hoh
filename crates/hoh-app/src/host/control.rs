@@ -3,6 +3,7 @@
 //! own that stops what this host runs for it, escalates over its attempts' process groups pass after pass, and once
 //! nothing of it runs records the workspace and cancels it. Neither touches the Commander (REQ-043 behaviour 7).
 
+use super::cgroup::{AttemptGroup, Tracking};
 use super::http::Shared;
 use super::processes::{Outside, Proof};
 use super::runner::{Entry, Executor, Work};
@@ -143,12 +144,23 @@ async fn cancel(common: &Arc<Common>, run_id: &str) {
             works.insert(id, entry.work);
         }
         let step = async {
+            // How each attempt still running is tracked, as its start recorded.
+            let mut trackings = BTreeMap::new();
+            for attempt in common.shared.store.running_attempts(run_id).await? {
+                let id = attempt.attempt_id.clone();
+                let event = super::http::read(&common.shared, move |reader| {
+                    reader.attempt_event("attempt.tracking", &id)
+                })
+                .await?;
+                trackings.insert(attempt.attempt_id, Tracking::of(event.as_ref()));
+            }
             let processes: Arc<dyn Processes> = Arc::new(HostProcesses {
                 works: works.clone(),
                 executor: common.executor.clone(),
                 project: common.project.clone(),
                 project_id: common.shared.project_id.clone(),
                 pins: pins.clone(),
+                trackings,
             });
             common
                 .canceller
@@ -182,6 +194,8 @@ struct HostProcesses {
     project: PathBuf,
     project_id: String,
     pins: Pins,
+    /// How each running attempt is tracked, as its start recorded (decision 8d v5).
+    trackings: BTreeMap<String, Tracking>,
 }
 
 impl Processes for HostProcesses {
@@ -209,6 +223,10 @@ impl Processes for HostProcesses {
                 })
                 .clone()
         };
+        let cgroup = self
+            .trackings
+            .get(&attempt.attempt_id)
+            .and_then(Tracking::cgroup);
         let control = |group: Option<identity::Found>, leader: bool| {
             if let Ok(mut outside) = outside.lock() {
                 if leader {
@@ -221,6 +239,7 @@ impl Processes for HostProcesses {
                 group,
                 native: native.clone(),
                 outside: outside.clone(),
+                cgroup: cgroup.clone(),
             }
         };
         Some(match presence {
@@ -262,6 +281,8 @@ struct AttemptControl {
     group: Option<identity::Found>,
     native: Option<(Arc<dyn Executor>, Work)>,
     outside: Arc<Mutex<Outside>>,
+    /// Its cgroup, when it has one: then the proof is the cgroup's, and the /proc scan is not used.
+    cgroup: Option<AttemptGroup>,
 }
 
 impl ProcessControl for AttemptControl {
@@ -271,6 +292,15 @@ impl ProcessControl for AttemptControl {
             Some(identity::Group::Lost) => return Look::Lost,
             Some(identity::Group::Empty) | None => Look::Empty,
         };
+        if let Some(cgroup) = &self.cgroup {
+            return match (group, cgroup.proof()) {
+                (Look::Empty, Proof::Done) => {
+                    cgroup.remove();
+                    Look::Empty
+                }
+                _ => Look::Held,
+            };
+        }
         let Ok(mut outside) = self.outside.lock() else {
             return Look::Held;
         };
@@ -297,7 +327,12 @@ impl ProcessControl for AttemptControl {
                 self.group.as_ref().is_some_and(identity::Found::kill),
             ),
         };
-        let outside = self.outside.lock().is_ok_and(|mut o| o.signal(sig));
+        let outside = match &self.cgroup {
+            // SIGTERM to each member; SIGKILL to all of them at once, by the kernel.
+            Some(cgroup) if sig == rustix::process::Signal::KILL => cgroup.kill(),
+            Some(cgroup) => cgroup.terminate(),
+            None => self.outside.lock().is_ok_and(|mut o| o.signal(sig)),
+        };
         outside || group
     }
 }
@@ -582,6 +617,17 @@ mod tests {
     }
 
     #[test]
+    fn the_scan_of_a_look_at_a_living_group_never_counts() -> R {
+        // M2T06R-353: a single look while the group lives scans (none before) and must not count; the one look at the
+        // empty group after it is the first scan of the two.
+        let root = tree(&[(100, "PATH=/bin")])?;
+        let mut outside = Outside::new("p/A1").with_root(Some(root.path().to_owned()));
+        assert_eq!(look_at(Look::Held, &mut outside), Look::Held);
+        assert_eq!(look_at(Look::Empty, &mut outside), Look::Held);
+        Ok(())
+    }
+
+    #[test]
     fn a_look_at_an_empty_group_scans_however_recent_the_last_scan() -> R {
         // M2T06R-253: right after a scan, a marked process appears; the next look at the empty group scans again (no
         // 100 ms wait) and holds (it cannot be pinned in this tree, so the scan is incomplete).
@@ -600,13 +646,15 @@ mod tests {
 
     #[test]
     fn a_cancel_keeps_an_attempts_outside_processes_across_its_passes() -> R {
-        // M2T06R-257: each pass asks for the attempt's control anew; it gets the same pins, signal and count.
+        // M2T06R-257, -352: each pass asks for the attempt's control anew and gets the same pins, signal and count:
+        // the first pass's look at its gone group is one quiet scan, the second pass's look the second, which proves it.
         let processes = HostProcesses {
             works: BTreeMap::new(),
             executor: None,
             project: PathBuf::from("/nonexistent"),
-            project_id: "p".to_owned(),
+            project_id: format!("across-passes-{}", std::process::id()),
             pins: Arc::default(),
+            trackings: BTreeMap::new(),
         };
         let row = AttemptRow {
             attempt_id: "A1".to_owned(),
@@ -629,12 +677,14 @@ mod tests {
             usage: None,
             cost_usd: None,
         };
-        let held = |p: &HostProcesses| p.pins.lock().map(|m| m.get("A1").cloned()).unwrap_or(None);
-        let _first = processes.control(&row);
-        let one = held(&processes).ok_or("no pins after the first pass")?;
-        let _second = processes.control(&row);
-        let two = held(&processes).ok_or("no pins after the second pass")?;
-        assert!(Arc::ptr_eq(&one, &two));
+        let (mut first, _) = processes.control(&row).ok_or("no control")?;
+        assert_eq!(first.look(), Look::Held, "one quiet scan proves nothing");
+        let (mut second, _) = processes.control(&row).ok_or("no control")?;
+        assert_eq!(
+            second.look(),
+            Look::Empty,
+            "the second pass counts on the first one's scan"
+        );
         Ok(())
     }
 

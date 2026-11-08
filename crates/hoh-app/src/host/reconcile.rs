@@ -5,6 +5,7 @@
 //! would show, and
 //! the attempt's disposition is written with what was found, between `reconcile.started` and `reconcile.completed`.
 
+use super::cgroup::Tracking;
 use super::processes::{Outside, Proof};
 use hoh_agents::identity::{self, Gone, Presence, StopStep};
 use hoh_core::lifecycle::AttemptState;
@@ -110,21 +111,33 @@ fn seen(state: AttemptState, found: std::io::Result<Presence>) -> Seen {
 /// are stopped the same way, the group stopped, gone or never started, and the attempt can end only with the
 /// termination proof (docs/adr/ADR-021.md decision 8d v3, M2T06R-100): else it is `Stopped { reaped: false }`, which
 /// leaves it and its slot.
-pub(super) fn end(seen: Seen, row: &UnfinishedRow, settings: &ReconcileSettings) -> Process {
+pub(super) fn end(
+    seen: Seen,
+    row: &UnfinishedRow,
+    tracking: &Tracking,
+    settings: &ReconcileSettings,
+) -> Process {
+    let cgroup = tracking.cgroup();
     let mut outside = Outside::new(&super::runner::marker(&row.project_id, &row.attempt_id));
     let group = match seen {
         // Nothing may be signalled: it stays as it is.
         Seen::Uncertain(basis) => return Process::Uncertain { basis },
         Seen::NotStarted => Process::NotStarted,
         Seen::Ours(found) => {
-            // Its descendants are pinned while its leader still ties them to it, then the group is stopped.
-            outside.set_leader(row.pid, row.process_start_id.as_deref());
-            let _ = outside.scan();
+            // Without a cgroup, its descendants are pinned while its leader still ties them to it; then the group is
+            // stopped.
+            if cgroup.is_none() {
+                outside.set_leader(row.pid, row.process_start_id.as_deref());
+                let _ = outside.scan();
+            }
             stopped(&found.stop(settings.term_grace, settings.kill_grace))
         }
         Seen::Gone(basis) => Process::Gone { basis },
     };
-    let (steps, proof) = outside.stop(settings.term_grace, settings.kill_grace);
+    let (steps, proof) = match cgroup {
+        Some(cgroup) => cgroup.stop(settings.term_grace, settings.kill_grace),
+        None => outside.stop(settings.term_grace, settings.kill_grace),
+    };
     with_outside(group, steps, proof)
 }
 
@@ -147,8 +160,12 @@ fn with_outside(group: Process, outside: Vec<String>, proof: Proof) -> Process {
 }
 
 /// What was found of `row`'s process at a host's start, and done to it (blocking).
-fn process_of(row: &UnfinishedRow, settings: &ReconcileSettings) -> Result<Process, PersistError> {
-    Ok(end(inspect(row), row, settings))
+fn process_of(
+    row: &UnfinishedRow,
+    tracking: &Tracking,
+    settings: &ReconcileSettings,
+) -> Result<Process, PersistError> {
+    Ok(end(inspect(row), row, tracking, settings))
 }
 
 /// A stop as the reconcile records it.
@@ -185,12 +202,30 @@ pub(super) async fn run(
         .reconcile_started(project_id, host_epoch, rows.len())
         .await?;
     let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
+    // How each was tracked: a cgroup an earlier host made is found again by the path its start recorded
+    // (docs/adr/ADR-021.md decision 8d v5).
+    let reader = store.reader()?;
+    let ids: Vec<String> = rows.iter().map(|r| r.attempt_id.clone()).collect();
+    let trackings: BTreeMap<String, Tracking> = tokio::task::spawn_blocking(move || {
+        ids.into_iter()
+            .map(|id| {
+                let event = reader.attempt_event("attempt.tracking", &id)?;
+                Ok((id, Tracking::of(event.as_ref())))
+            })
+            .collect::<Result<_, PersistError>>()
+    })
+    .await
+    .map_err(|e| PersistError::Storage(format!("the reconcile's look-up ended: {e}")))??;
     for row in rows {
         let (process, effects) = {
             let row = row.clone();
             let settings = settings.clone();
+            let tracking = trackings
+                .get(&row.attempt_id)
+                .cloned()
+                .unwrap_or_else(|| Tracking::of(None));
             tokio::task::spawn_blocking(move || -> Result<_, PersistError> {
-                let process = process_of(&row, &settings)?;
+                let process = process_of(&row, &tracking, &settings)?;
                 let effects: Vec<Effect> = row
                     .effects
                     .iter()

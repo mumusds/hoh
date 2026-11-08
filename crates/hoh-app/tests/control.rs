@@ -1290,3 +1290,383 @@ async fn a_cancel_ends_what_a_pinned_process_without_the_marker_starts_after_the
     drop(guard);
     Ok(())
 }
+
+/// Set in a test process started inside a delegated scope.
+const IN_SCOPE: &str = "HOH_TEST_IN_DELEGATED_SCOPE";
+
+/// Run this binary's ignored test `name` inside a delegated scope of the user's systemd manager
+/// (`systemd-run --user --scope -p Delegate=yes`), where an in-process host tracks its attempts by cgroups of their own
+/// (docs/adr/ADR-021.md decision 8d v5, CR-011). It must have run and passed.
+fn in_delegated_scope(name: &str) -> R {
+    let exe = std::env::current_exe()?;
+    let out = Command::new("systemd-run")
+        .args([
+            "--user",
+            "--scope",
+            "-p",
+            "Delegate=yes",
+            "--quiet",
+            "--collect",
+            "--expand-environment=no",
+            "--",
+        ])
+        .arg(&exe)
+        .args([
+            name,
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(IN_SCOPE, "1")
+        .output()?;
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    if !out.status.success() || !stdout.contains("1 passed") {
+        return Err(format!(
+            "{name} in a delegated scope: {}\n{stdout}\n{stderr}",
+            out.status
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// An orphaned writer without the marker (an emptied environment) that ignores SIGTERM, its pid in `pid_file`: the
+/// /proc scan cannot find it once its parent subshell is gone; only its cgroup holds it.
+fn hidden_writer(file: &Path, pid_file: &Path) -> R<String> {
+    Ok(format!(
+        "(trap '' TERM; env -i /usr/bin/setsid {} & echo $! > {})",
+        writer(file)?,
+        pid_file.display()
+    ))
+}
+
+/// Whether the process `pid_file` names is gone (or a zombie not reaped yet).
+fn gone(pid_file: &Path) -> R<bool> {
+    let pid: u32 = std::fs::read_to_string(pid_file)?.trim().parse()?;
+    let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|s| {
+            s.rsplit_once(") ")
+                .map(|(_, rest)| rest.chars().next().unwrap_or('?'))
+        });
+    Ok(matches!(state, None | Some('Z')))
+}
+
+/// Its attempt's tracking as its start recorded it, and the cgroup's path.
+fn tracking(project: &Path) -> R<(String, String)> {
+    Ok((
+        query(
+            project,
+            "SELECT json_extract(payload_json, '$.tracking') FROM events WHERE kind = 'attempt.tracking' \
+             AND json_extract(payload_json, '$.attempt_id') = 'T1/attempt-1'",
+        )?,
+        query(
+            project,
+            "SELECT json_extract(payload_json, '$.cgroup') FROM events WHERE kind = 'attempt.tracking' \
+             AND json_extract(payload_json, '$.attempt_id') = 'T1/attempt-1'",
+        )?,
+    ))
+}
+
+#[test]
+fn in_a_delegated_cgroup_a_cancel_ends_a_hidden_writer_by_the_attempts_cgroup() -> R {
+    in_delegated_scope("cgroup_cancel_inside")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs inside a delegated scope, started by in_a_delegated_cgroup_a_cancel_ends_a_hidden_writer_by_the_attempts_cgroup"]
+async fn cgroup_cancel_inside() -> R {
+    // CR-011 (decision 8d v5, path 1): T1's agent leaves an orphaned writer with no marker that ignores SIGTERM. The
+    // attempt's cgroup holds it: SIGTERM goes to its members, SIGKILL to all at once (cgroup.kill), and the run is
+    // CANCELLED only once the cgroup is empty.
+    if std::env::var_os(IN_SCOPE).is_none() {
+        return Ok(());
+    }
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let (file, pid_file) = (dir.path().join("written.txt"), dir.path().join("w.pid"));
+    let script = format!(
+        "{}; while :; do sleep 0.1; done",
+        hidden_writer(&file, &pid_file)?
+    );
+    let _guard = KillPidFile(pid_file.clone());
+    let agents = Arc::new(Agents::new(&[("T1", script.as_str())]));
+    let _leaders = Leaders(agents.leaders.clone());
+    let (project, host) = host(dir.path(), &agents).await?;
+    until(
+        &project,
+        "SELECT state FROM attempts WHERE task_id = 'T1'",
+        "RUNNING",
+        Duration::from_secs(10),
+    )
+    .await?;
+    let (mode, cgroup) = tracking(&project)?;
+    assert_eq!(mode, "cgroup", "{cgroup}");
+    let end = Instant::now() + Duration::from_secs(10);
+    while !pid_file.exists() {
+        if Instant::now() > end {
+            return Err("the writer did not start".into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let asked = Instant::now();
+    let (status, _) = command(&host, &control(&project, "CancelRun", "cancel")?).await?;
+    assert_eq!(status, 202);
+    until(
+        &project,
+        "SELECT state FROM runs WHERE run_id = 'R'",
+        "CANCELLED",
+        Duration::from_secs(40),
+    )
+    .await?;
+    assert!(
+        asked.elapsed() <= Duration::from_secs(20),
+        "{:?}",
+        asked.elapsed()
+    );
+    assert!(gone(&pid_file)?, "the hidden writer lives on");
+    assert!(
+        !Path::new(&cgroup).exists(),
+        "the attempt's cgroup was removed once empty"
+    );
+    host.shutdown().await;
+    Ok(())
+}
+
+#[test]
+fn in_a_delegated_cgroup_an_attempt_whose_agent_ended_settles_once_its_cgroup_is_empty() -> R {
+    in_delegated_scope("cgroup_runner_end_inside")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs inside a delegated scope, started by in_a_delegated_cgroup_an_attempt_whose_agent_ended_settles_once_its_cgroup_is_empty"]
+async fn cgroup_runner_end_inside() -> R {
+    // CR-011 (decision 8d v5, path 2): T1's agent leaves the hidden writer and exits 0; the runner stops what is left in
+    // the attempt's cgroup (SIGTERM, ignored; cgroup.kill) before the attempt settles.
+    if std::env::var_os(IN_SCOPE).is_none() {
+        return Ok(());
+    }
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let (file, pid_file) = (dir.path().join("written.txt"), dir.path().join("w.pid"));
+    let script = format!("{}; sleep 0.3; exit 0", hidden_writer(&file, &pid_file)?);
+    let _guard = KillPidFile(pid_file.clone());
+    let agents = Arc::new(Agents::new(&[("T1", script.as_str())]));
+    let _leaders = Leaders(agents.leaders.clone());
+    let (project, host) = host(dir.path(), &agents).await?;
+    until(
+        &project,
+        "SELECT state FROM attempts WHERE task_id = 'T1'",
+        "SETTLED",
+        Duration::from_secs(20),
+    )
+    .await?;
+    assert!(
+        gone(&pid_file)?,
+        "the attempt settled while its hidden writer lived"
+    );
+    assert_eq!(tracking(&project)?.0, "cgroup");
+    assert_eq!(
+        query(
+            &project,
+            "SELECT json_extract(payload_json, '$.steps') FROM events WHERE kind = 'runner.outside'"
+        )?,
+        r#"["cgroup_sigterm","cgroup_kill","cgroup_reaped"]"#
+    );
+    host.shutdown().await;
+    Ok(())
+}
+
+#[test]
+fn in_a_delegated_cgroup_an_expired_lease_is_given_up_once_its_holders_cgroup_is_empty() -> R {
+    in_delegated_scope("cgroup_settle_inside")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs inside a delegated scope, started by in_a_delegated_cgroup_an_expired_lease_is_given_up_once_its_holders_cgroup_is_empty"]
+async fn cgroup_settle_inside() -> R {
+    // CR-011 (decision 8d v5, path 3): T1 holds the writer lease and its agent left the hidden writer; the clock moves
+    // past the lease. The settle stops the group and then the attempt's cgroup; T2 gets the lease only after.
+    if std::env::var_os(IN_SCOPE).is_none() {
+        return Ok(());
+    }
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let (file, pid_file) = (dir.path().join("written.txt"), dir.path().join("w.pid"));
+    let script = format!(
+        "{}; while :; do sleep 0.1; done",
+        hidden_writer(&file, &pid_file)?
+    );
+    let _guard = KillPidFile(pid_file.clone());
+    let agents = Arc::new(Agents::new(&[("T1", script.as_str())]));
+    let _leaders = Leaders(agents.leaders.clone());
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    Host::start(config(&project)).await?.shutdown().await;
+    seed(&project, WORLD)?;
+    let clock = Arc::new(FakeClock::default());
+    let mut config = config(&project);
+    config.clock = hoh_app::host::HostClock(clock.clone());
+    config.runner = Some(hoh_app::host::RunnerConfig {
+        executor: agents.clone(),
+        context: context(),
+    });
+    let host = start_when_free(config).await?;
+    until(
+        &project,
+        "SELECT state FROM attempts WHERE task_id = 'T1'",
+        "RUNNING",
+        Duration::from_secs(10),
+    )
+    .await?;
+    let end = Instant::now() + Duration::from_secs(10);
+    while !pid_file.exists() {
+        if Instant::now() > end {
+            return Err("the writer did not start".into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    clock.advance(Duration::from_secs(300));
+    until(
+        &project,
+        "SELECT count(*) FROM attempts WHERE task_id = 'T2'",
+        "1",
+        Duration::from_secs(40),
+    )
+    .await?;
+    assert!(
+        gone(&pid_file)?,
+        "T2 got the lease while T1's hidden writer lived"
+    );
+    assert_eq!(tracking(&project)?.0, "cgroup");
+    assert_eq!(
+        seq(
+            &project,
+            "SELECT count(*) FROM events WHERE kind IN ('lease.cgroup_sigterm', 'lease.cgroup_kill')"
+        )?,
+        2
+    );
+    host.shutdown().await;
+    Ok(())
+}
+
+#[test]
+fn in_a_delegated_cgroup_a_hosts_start_reconcile_ends_an_attempt_once_its_cgroup_is_empty() -> R {
+    in_delegated_scope("cgroup_start_reconcile_inside")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs inside a delegated scope, started by in_a_delegated_cgroup_a_hosts_start_reconcile_ends_an_attempt_once_its_cgroup_is_empty"]
+async fn cgroup_start_reconcile_inside() -> R {
+    // CR-011 (decision 8d v5, path 4): the host stops with T1 running and its hidden writer; the next host finds T1's
+    // cgroup by the path its start recorded and stops it before it ends the attempt.
+    if std::env::var_os(IN_SCOPE).is_none() {
+        return Ok(());
+    }
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let (file, pid_file) = (dir.path().join("written.txt"), dir.path().join("w.pid"));
+    let script = format!(
+        "{}; while :; do sleep 0.1; done",
+        hidden_writer(&file, &pid_file)?
+    );
+    let _guard = KillPidFile(pid_file.clone());
+    let agents = Arc::new(Agents::new(&[("T1", script.as_str())]));
+    let _leaders = Leaders(agents.leaders.clone());
+    let (project, first) = host(dir.path(), &agents).await?;
+    until(
+        &project,
+        "SELECT state FROM attempts WHERE task_id = 'T1'",
+        "RUNNING",
+        Duration::from_secs(10),
+    )
+    .await?;
+    let end = Instant::now() + Duration::from_secs(10);
+    while !pid_file.exists() {
+        if Instant::now() > end {
+            return Err("the writer did not start".into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    first.shutdown().await;
+    let reconciled = seq(
+        &project,
+        "SELECT count(*) FROM events WHERE kind = 'reconcile.completed'",
+    )?;
+    let second = start_when_free(config(&project)).await?;
+    until(
+        &project,
+        "SELECT count(*) FROM events WHERE kind = 'reconcile.completed'",
+        &(reconciled + 1).to_string(),
+        Duration::from_secs(40),
+    )
+    .await?;
+    assert_ne!(
+        query(&project, "SELECT state FROM attempts WHERE task_id = 'T1'")?,
+        "RUNNING"
+    );
+    assert!(
+        gone(&pid_file)?,
+        "the attempt ended while its hidden writer lived"
+    );
+    assert_eq!(
+        query(
+            &project,
+            "SELECT json_extract(payload_json, '$.process.steps') FROM events WHERE kind = 'reconcile.attempt' \
+             AND json_extract(payload_json, '$.attempt_id') = 'T1/attempt-1' ORDER BY seq DESC LIMIT 1"
+        )?,
+        r#"["sigterm","reaped","cgroup_sigterm","cgroup_kill","cgroup_reaped"]"#
+    );
+    second.shutdown().await;
+    Ok(())
+}
+
+/// Whether this process's own cgroup is delegated to it (a cgroup can be made below it), as a host decides.
+fn own_cgroup_delegated() -> bool {
+    let Some(path) = std::fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .and_then(|t| {
+            t.lines()
+                .find_map(|l| l.strip_prefix("0::").map(str::to_owned))
+        })
+    else {
+        return false;
+    };
+    let probe = Path::new("/sys/fs/cgroup")
+        .join(path.trim().trim_start_matches('/'))
+        .join(format!("hoh-test-probe-{}", std::process::id()));
+    std::fs::create_dir(&probe).is_ok() && std::fs::remove_dir(&probe).is_ok()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_attempt_records_how_its_processes_are_tracked_and_why_it_is_degraded() -> R {
+    // CR-011 (decision 8d v5): an attempt records its tracking before its gate opens; outside a delegated cgroup (this
+    // test run from a login session or CI) it is the degraded proc scan, with why; inside one, its cgroup.
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let agents = Arc::new(Agents::new(&[("T1", "sleep 60")]));
+    let _leaders = Leaders(agents.leaders.clone());
+    let (project, host) = host(dir.path(), &agents).await?;
+    until(
+        &project,
+        "SELECT state FROM attempts WHERE task_id = 'T1'",
+        "RUNNING",
+        Duration::from_secs(10),
+    )
+    .await?;
+    let (mode, cgroup) = tracking(&project)?;
+    if own_cgroup_delegated() {
+        assert_eq!(mode, "cgroup");
+        assert!(Path::new(&cgroup).exists(), "{cgroup}");
+    } else {
+        assert_eq!(mode, "proc");
+        assert_eq!(
+            query(
+                &project,
+                "SELECT json_extract(payload_json, '$.reason') FROM events WHERE kind = 'attempt.tracking'"
+            )?,
+            "the host has no delegated cgroup"
+        );
+    }
+    host.shutdown().await;
+    Ok(())
+}
