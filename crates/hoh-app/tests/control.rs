@@ -114,6 +114,24 @@ async fn command(host: &Host, body: &Value) -> R<(u16, Value)> {
     Ok((status, serde_json::from_str(body)?))
 }
 
+/// GET `path` of the host over its TCP port; the status and the JSON body.
+async fn get(host: &Host, path: &str) -> R<(u16, Value)> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\nX-HoH-Token: {token}\r\n\r\n",
+        port = host.port,
+        token = host.token,
+    );
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", host.port)).await?;
+    stream.write_all(request.as_bytes()).await?;
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await?;
+    let text = String::from_utf8(raw)?;
+    let (head, body) = text.split_once("\r\n\r\n").ok_or("no response head")?;
+    let status: u16 = head.split(' ').nth(1).ok_or("no status")?.parse()?;
+    Ok((status, serde_json::from_str(body)?))
+}
+
 /// A control command for run R at its current revision.
 fn control(project: &Path, kind: &str, key: &str) -> R<Value> {
     let revision: i64 = query(project, "SELECT revision FROM runs WHERE run_id = 'R'")?.parse()?;
@@ -208,6 +226,7 @@ impl hoh_app::host::Executor for Agents {
                 &format!("read -r go; [ \"$go\" = go ] || exit 0; {script}"),
             ])
             .process_group(0)
+            .env(hoh_app::host::ATTEMPT_ENV, work.marker())
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -316,7 +335,7 @@ fn seq(project: &Path, sql: &str) -> R<i64> {
 async fn test_043_01_a_pause_waits_for_t1_to_end_dispatches_nothing_and_a_resume_reconciles_before_t2()
 -> R {
     // AC-043-01: T1 runs 8 s; PauseRun at 2 s, ResumeRun at 12 s.
-    let dir = tempfile::tempdir()?;
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
     let agents = Arc::new(Agents::new(&[
         ("T1", "sleep 8"),
         ("T2", "sleep 30"),
@@ -369,8 +388,12 @@ async fn test_043_01_a_pause_waits_for_t1_to_end_dispatches_nothing_and_a_resume
         0,
         "no signal went"
     );
+    // Nor its native interrupt (M2T06R-50: these agents ignore one, so only the record shows it).
+    let interrupted = || agents.native.lock().map(|n| n.clone()).unwrap_or_default();
+    assert_eq!(interrupted(), Vec::<String>::new(), "T1 was interrupted");
     tokio::time::sleep(Duration::from_secs(12).saturating_sub(started.elapsed())).await;
     assert_eq!(dispatched()?, "1", "no dispatch from 2 s to 12 s");
+    assert_eq!(interrupted(), Vec::<String>::new(), "T1 was interrupted");
     let (status, _) = command(&host, &control(&project, "ResumeRun", "resume")?).await?;
     assert_eq!(status, 202);
     until(
@@ -427,7 +450,7 @@ fn git(project: &Path, args: &[&str]) -> R<String> {
 async fn test_043_02_a_cancel_escalates_records_the_workspace_and_only_then_is_cancelled() -> R {
     // AC-043-02: the agent's child and grandchild share its group and one of them ignores SIGTERM; the workspace has an
     // uncommitted change and an untracked file.
-    let dir = tempfile::tempdir()?;
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
     let agents = Arc::new(Agents::new(&[("T1", STUBBORN)]));
     let _leaders = Leaders(agents.leaders.clone());
     let project = dir.path().join("p");
@@ -459,6 +482,25 @@ async fn test_043_02_a_cancel_escalates_records_the_workspace_and_only_then_is_c
     assert_eq!(
         query(&project, "SELECT state FROM runs WHERE run_id = 'R'")?,
         "CANCEL_REQUESTED"
+    );
+    // Shown as CANCELLING by getRun and listRuns (REQ-043 behaviour 3, M2T06R-59).
+    let (status, run) = get(&host, "/v1/runs/R").await?;
+    assert_eq!(
+        (
+            status,
+            run["state"].as_str(),
+            run["projection"]["label"].as_str()
+        ),
+        (200, Some("CANCEL_REQUESTED"), Some("CANCELLING"))
+    );
+    let (status, page) = get(&host, "/v1/runs").await?;
+    assert_eq!(
+        (
+            status,
+            page["items"][0]["run_id"].as_str(),
+            page["items"][0]["label"].as_str()
+        ),
+        (200, Some("R"), Some("CANCELLING"))
     );
     until(
         &project,
@@ -533,7 +575,7 @@ async fn test_043_02_a_cancel_escalates_records_the_workspace_and_only_then_is_c
 async fn test_043_04_pause_and_cancel_take_effect_with_the_commander_down() -> R {
     // AC-043-04: the Commander fails at its start; a pause and then a cancel are accepted and reach PAUSED and
     // CANCELLED, and the Commander is never called.
-    let dir = tempfile::tempdir()?;
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
     let agents = Arc::new(Agents::new(&[("T1", "sleep 3")]));
     let _leaders = Leaders(agents.leaders.clone());
     let (project, host) = host(dir.path(), &agents).await?;
@@ -572,7 +614,7 @@ async fn a_cancel_also_ends_a_descendant_that_left_the_agents_process_group() ->
     // REQ-043 decision 3 (docs/adr/ADR-021.md decision 8d), no TEST id: a group signal misses a descendant that took a
     // session of its own (setsid); found under the leader and pinned by a pidfd, it is signalled too, and the run is
     // CANCELLED only once it is gone.
-    let dir = tempfile::tempdir()?;
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
     let escaped = dir.path().join("escaped.pid");
     let script = format!(
         "setsid sleep 60 & echo $! > {}; sleep 60",
@@ -612,6 +654,11 @@ async fn a_cancel_also_ends_a_descendant_that_left_the_agents_process_group() ->
         .ok_or("pgrp")?
         .parse()?;
     assert_ne!(pgrp, leader);
+    // It is stopped however the test ends (M2T06R-62).
+    let _marked = Marked(query(
+        &project,
+        "SELECT p.project_id || '/' || a.attempt_id FROM projects p, attempts a WHERE a.task_id = 'T1'",
+    )?);
     let (status, _) = command(&host, &control(&project, "CancelRun", "cancel")?).await?;
     assert_eq!(status, 202);
     until(
@@ -634,4 +681,128 @@ async fn a_cancel_also_ends_a_descendant_that_left_the_agents_process_group() ->
     );
     host.shutdown().await;
     Ok(())
+}
+
+/// The live processes (not zombies) whose environment carries the marker `attempt` (`<project id>/<attempt id>`).
+fn marked(attempt: &str) -> Vec<u32> {
+    let marker = format!("{}={attempt}", hoh_app::host::ATTEMPT_ENV).into_bytes();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| {
+            std::fs::read(format!("/proc/{pid}/environ"))
+                .is_ok_and(|env| env.split(|b| *b == 0).any(|e| e == marker.as_slice()))
+                && std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| {
+                    s.rsplit_once(") ")
+                        .is_some_and(|(_, r)| !r.starts_with('Z'))
+                })
+        })
+        .collect()
+}
+
+/// SIGKILLs every live process of an attempt's marker when dropped, however the test ends.
+struct Marked(String);
+
+impl Drop for Marked {
+    fn drop(&mut self) {
+        for pid in marked(&self.0) {
+            if let Some(pid) = i32::try_from(pid)
+                .ok()
+                .and_then(rustix::process::Pid::from_raw)
+            {
+                let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+            }
+        }
+    }
+}
+
+/// A writer that appends to `file` every 50 ms for at most 30 s, in a session of its own, orphaned at once (its
+/// parent subshell exits): nothing but its environment ties it to the attempt.
+fn orphan_writer(file: &Path) -> String {
+    format!(
+        "(setsid sh -c 'for i in $(seq 1 600); do echo x >> {}; sleep 0.05; done' &)",
+        file.display()
+    )
+}
+
+/// Cancel R with T1 running `script` and check that the run is CANCELLED only once nothing of T1's attempt lives
+/// and that `file` no longer grows then.
+async fn cancel_with_a_writer_outside(dir: &Path, script: &str, file: &Path) -> R {
+    let agents = Arc::new(Agents::new(&[("T1", script)]));
+    let _leaders = Leaders(agents.leaders.clone());
+    let (project, host) = host(dir, &agents).await?;
+    until(
+        &project,
+        "SELECT state FROM attempts WHERE task_id = 'T1'",
+        "RUNNING",
+        Duration::from_secs(10),
+    )
+    .await?;
+    let attempt = query(
+        &project,
+        "SELECT p.project_id || '/' || a.attempt_id FROM projects p, attempts a WHERE a.task_id = 'T1'",
+    )?;
+    let _marked = Marked(attempt.clone());
+    // A process of another project's attempt of the same id (that project's id unique to this test): not this
+    // cancel's.
+    let (project_id, attempt_id) = attempt.split_once('/').ok_or("marker")?;
+    let other = format!("{project_id}-other/{attempt_id}");
+    let _bystander = Marked(other.clone());
+    let mut bystander = Command::new("sleep")
+        .arg("30")
+        .env(hoh_app::host::ATTEMPT_ENV, &other)
+        .spawn()?;
+    let (status, _) = command(&host, &control(&project, "CancelRun", "cancel")?).await?;
+    assert_eq!(status, 202);
+    until(
+        &project,
+        "SELECT state FROM runs WHERE run_id = 'R'",
+        "CANCELLED",
+        Duration::from_secs(40),
+    )
+    .await?;
+    assert_eq!(
+        marked(&attempt),
+        Vec::<u32>::new(),
+        "a process of the attempt lives on"
+    );
+    let size = || std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
+    let before = size();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(size(), before, "the workspace is still written");
+    assert!(
+        bystander.try_wait()?.is_none(),
+        "another project's process was signalled"
+    );
+    let _ = bystander.kill();
+    let _ = bystander.wait();
+    host.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancel_ends_a_writer_the_leader_started_and_orphaned_after_the_cancel_began() -> R {
+    // M2T06R-01 (REQ-043 behaviours 4, 5, decision 3; docs/adr/ADR-021.md decision 8d): on SIGTERM the leader starts a
+    // writer in a session of its own whose parent exits at once, then waits for SIGKILL. The writer is found by the
+    // attempt's marker, signalled, and the run is CANCELLED only after it is gone.
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let file = dir.path().join("written.txt");
+    let script = format!(
+        "trap \"{}\" TERM; while :; do sleep 0.1; done",
+        orphan_writer(&file).replace('"', "\\\"")
+    );
+    cancel_with_a_writer_outside(dir.path(), &script, &file).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancel_ends_a_writer_orphaned_before_the_cancel() -> R {
+    // M2T06R-01 (docs/adr/ADR-021.md decision 8d): the writer was orphaned in a session of its own long before the
+    // cancel, so no parent chain leads to it; its marker does.
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let file = dir.path().join("written.txt");
+    let script = format!("{}; while :; do sleep 0.1; done", orphan_writer(&file));
+    cancel_with_a_writer_outside(dir.path(), &script, &file).await
 }

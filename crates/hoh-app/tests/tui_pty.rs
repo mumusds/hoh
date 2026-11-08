@@ -536,11 +536,12 @@ impl hoh_app::host::Executor for Sixty {
         ack
     }
 
-    fn start(&self, _work: &hoh_app::host::Work) -> Result<hoh_app::host::Started, String> {
+    fn start(&self, work: &hoh_app::host::Work) -> Result<hoh_app::host::Started, String> {
         use std::os::unix::process::CommandExt as _;
         let mut child = std::process::Command::new("sh")
             .args(["-c", "read -r go; [ \"$go\" = go ] || exit 0; sleep 60"])
             .process_group(0)
+            .env(hoh_app::host::ATTEMPT_ENV, work.marker())
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -697,6 +698,27 @@ fn test_043_03_the_tui_leaves_on_sighup_sigterm_and_detach_with_the_host_and_age
     Ok(())
 }
 
+/// SIGKILLs the product host `pid` of a project when dropped, if it still runs (checked by its command line), however
+/// the test ends (M2T06R-62).
+struct HostGuard(u32, std::path::PathBuf);
+
+impl Drop for HostGuard {
+    fn drop(&mut self) {
+        let wanted = format!(
+            "{}\0__host\0{}\0",
+            env!("CARGO_BIN_EXE_hoh"),
+            self.1.display()
+        );
+        if std::fs::read(format!("/proc/{}/cmdline", self.0)).is_ok_and(|c| c == wanted.as_bytes())
+            && let Some(pid) = i32::try_from(self.0)
+                .ok()
+                .and_then(rustix::process::Pid::from_raw)
+        {
+            let _ = rustix::process::kill_process(pid, Signal::KILL);
+        }
+    }
+}
+
 #[test]
 fn a_host_started_by_a_detach_in_a_terminal_outlives_its_hang_up() -> R {
     // CR-010 decision 2 (REQ-005 behaviour 2): supplementary detach evidence, no TEST id (AC-005-01 is M2-T13's).
@@ -716,6 +738,7 @@ fn a_host_started_by_a_detach_in_a_terminal_outlives_its_hang_up() -> R {
     let host: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(project.join(".hoh/host.json"))?)?;
     let pid = u32::try_from(host["pid"].as_u64().ok_or("no pid")?)?;
+    let _host = HostGuard(pid, project.clone());
     pty.hang_up()?;
     drop(pty);
     std::thread::sleep(Duration::from_millis(500));
@@ -761,6 +784,88 @@ fn post_command(project: &Path, body: &str) -> R<String> {
     let mut reply = String::new();
     stream.read_to_string(&mut reply)?;
     Ok(reply.lines().next().unwrap_or_default().to_owned())
+}
+
+/// An in-process host's configuration for `project`: an OS-chosen port, the product binary as the WAL probe.
+fn in_process(project: &Path) -> hoh_app::host::HostConfig {
+    let mut config = hoh_app::host::HostConfig::new(project);
+    config.port = 0;
+    config.store.wal_probe = Some(hoh_core::persistence::selftest::ProbeCommand {
+        program: env!("CARGO_BIN_EXE_hoh").into(),
+        args: vec![hoh_core::persistence::selftest::PROBE_ARG.into()],
+        env: Vec::new(),
+        answer_timeout: WAIT,
+    });
+    config
+}
+
+fn scalar(project: &Path, sql: &str) -> R<String> {
+    sqlite(
+        &project.join(".hoh/state.db"),
+        "import sqlite3,sys; r=sqlite3.connect(sys.argv[1]).execute(sys.stdin.read()).fetchone(); print('' if r is None or r[0] is None else r[0])",
+        sql,
+    )
+}
+
+/// Ctrl+C, then the choice `down` places below 脱离, then Enter; waits for `said`.
+fn choose(s: &mut Session, down: usize, said: &str) -> R {
+    let from = s.pty.output().len();
+    s.pty.send(b"\x03")?;
+    s.pty.wait_for("取消任务", from, WAIT)?;
+    for _ in 0..down {
+        s.pty.send(b"\x1b[B")?;
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    s.pty.send(b"\r")?;
+    s.pty.wait_for(said, from, Duration::from_secs(20))?;
+    Ok(())
+}
+
+#[test]
+fn the_tuis_pause_and_cancel_choices_send_their_own_commands_and_it_stays_attached() -> R {
+    // M2T06R-55 (ADR-021 decision 10): R RUNNING with nothing running. 暂停 sends PauseRun (R reaches PAUSED), then
+    // 取消任务 sends CancelRun (R reaches CANCELLED); the TUI stays attached through both and shows the run's events.
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let (project, home) = (dir.path().join("p"), dir.path().join("home"));
+    std::fs::create_dir_all(&project)?;
+    std::fs::create_dir_all(&home)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    let host = runtime.block_on(hoh_app::host::Host::start(in_process(&project)))?;
+    sqlite(
+        &project.join(".hoh/state.db"),
+        "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); p=c.execute('SELECT project_id FROM projects').fetchone()[0]; \
+         c.executescript(sys.stdin.read().replace(':p', repr(p))); c.commit()",
+        "INSERT INTO runs(run_id, project_id, state, mode, revision, created_at) VALUES
+           ('R', :p, 'RUNNING', 'AUTO', 1, '2026-11-07T00:00:00Z');",
+    )?;
+    let mut s = open_attach(&project, &home)?;
+    choose(&mut s, 1, "PauseRun 已受理")?;
+    s.pty.wait_for("run.paused", 0, Duration::from_secs(20))?;
+    assert_eq!(
+        scalar(&project, "SELECT state FROM runs WHERE run_id = 'R'")?,
+        "PAUSED"
+    );
+    choose(&mut s, 2, "CancelRun 已受理")?;
+    s.pty
+        .wait_for("run.cancelled", 0, Duration::from_secs(20))?;
+    assert_eq!(
+        scalar(&project, "SELECT state FROM runs WHERE run_id = 'R'")?,
+        "CANCELLED"
+    );
+    assert_eq!(
+        scalar(
+            &project,
+            "SELECT group_concat(kind, ' ') FROM (SELECT kind FROM commands ORDER BY rowid)"
+        )?,
+        "PauseRun CancelRun"
+    );
+    assert!(s.child.0.try_wait()?.is_none(), "the TUI left");
+    assert_eq!(s.detach()?, Some(0));
+    runtime.block_on(host.shutdown());
+    Ok(())
 }
 
 #[test]
