@@ -12,6 +12,7 @@ use hoh_core::persistence::{AttemptRow, Finished, PersistError};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -140,17 +141,17 @@ async fn cancel(common: &Arc<Common>, run_id: &str) {
             works.insert(id, entry.work);
         }
         let step = async {
-            let processes = HostProcesses {
+            let processes: Arc<dyn Processes> = Arc::new(HostProcesses {
                 works: works.clone(),
                 executor: common.executor.clone(),
                 project: common.project.clone(),
-            };
+            });
             common
                 .canceller
                 .step(
                     &common.shared.store,
                     run_id,
-                    &processes,
+                    processes,
                     common.clock.clone(),
                     Arc::new(std::thread::sleep),
                 )
@@ -408,6 +409,65 @@ fn hex(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// One untracked path's part of the workspace record, read without following a link and without waiting on anything
+/// that is not a regular file (M2T06R-06): a regular file is its content's hash, a symbolic link its target's, anything
+/// else (a FIFO, a socket, a device, a directory) its type, never opened. The file is opened without following a link
+/// and without blocking, and read only if it is still a regular file then.
+fn untracked_entry(path: &Path) -> String {
+    use rustix::fs::{FileType, Mode, OFlags};
+    use std::io::Read as _;
+    let kind = |t: FileType| match t {
+        FileType::Fifo => "fifo",
+        FileType::Socket => "socket",
+        FileType::CharacterDevice => "char_device",
+        FileType::BlockDevice => "block_device",
+        FileType::Directory => "directory",
+        FileType::Symlink => "symlink",
+        _ => "other",
+    };
+    let file_type = match rustix::fs::lstat(path) {
+        Ok(stat) => FileType::from_raw_mode(stat.st_mode),
+        Err(e) => return format!("unreadable: {e}"),
+    };
+    match file_type {
+        FileType::Symlink => {
+            return match std::fs::read_link(path) {
+                Ok(target) => format!("symlink:{}", hex(target.as_os_str().as_bytes())),
+                Err(e) => format!("unreadable: {e}"),
+            };
+        }
+        FileType::RegularFile => {}
+        other => return format!("type:{}", kind(other)),
+    }
+    let flags =
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC;
+    let fd = match rustix::fs::open(path, flags, Mode::empty()) {
+        Ok(fd) => fd,
+        Err(e) => return format!("unreadable: {e}"),
+    };
+    match rustix::fs::fstat(&fd) {
+        Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile => {}
+        Ok(stat) => return format!("type:{}", kind(FileType::from_raw_mode(stat.st_mode))),
+        Err(e) => return format!("unreadable: {e}"),
+    }
+    let mut file = std::fs::File::from(fd);
+    let mut content = Sha256::new();
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => content.update(&buffer[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return format!("unreadable: {e}"),
+        }
+    }
+    content
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 /// The workspace's record before CANCELLED (REQ-043 behaviour 4, ADR-021 decision 8g): HEAD and its tree, and the
 /// hashes of the diff against HEAD, of the untracked files' names and contents and of the status, and of all of
 /// them; read-only, nothing reset, cleaned or removed. A directory that is not a git work tree, or a git that fails,
@@ -434,11 +494,8 @@ pub(super) fn workspace(project: &Path) -> Value {
         for name in names.split(|b| *b == 0).filter(|n| !n.is_empty()) {
             untracked.update(name);
             untracked.update([0]);
-            let path = project.join(String::from_utf8_lossy(name).as_ref());
-            match std::fs::read(&path) {
-                Ok(content) => untracked.update(hex(&content).as_bytes()),
-                Err(e) => untracked.update(format!("unreadable: {e}").as_bytes()),
-            }
+            let path = project.join(std::ffi::OsStr::from_bytes(name));
+            untracked.update(untracked_entry(&path).as_bytes());
             untracked.update([0]);
         }
         let untracked: String = untracked
@@ -472,4 +529,71 @@ pub(super) fn workspace(project: &Path) -> Value {
         );
     }
     record
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type R<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    fn git_in(dir: &Path, args: &[&str]) -> R {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("git {args:?}: {status}").into())
+        }
+    }
+
+    #[test]
+    fn the_workspace_record_never_waits_on_a_fifo_and_records_a_link_by_its_target() -> R {
+        // M2T06R-06: an untracked FIFO with no writer, and an untracked link to it; before, the record opened the
+        // link's target and waited there for a writer.
+        let dir = tempfile::tempdir()?;
+        let project = dir.path();
+        git_in(project, &["init", "-q"])?;
+        std::fs::write(project.join("plain.txt"), b"content")?;
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            project.join("pipe"),
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o600),
+            0,
+        )?;
+        std::os::unix::fs::symlink(project.join("pipe"), project.join("link"))?;
+        assert_eq!(untracked_entry(&project.join("pipe")), "type:fifo");
+        let to_pipe = untracked_entry(&project.join("link"));
+        assert_eq!(
+            to_pipe,
+            format!(
+                "symlink:{}",
+                hex(project.join("pipe").as_os_str().as_bytes())
+            )
+        );
+        assert_eq!(untracked_entry(&project.join("plain.txt")), hex(b"content"));
+        let (sent, got) = std::sync::mpsc::channel();
+        let at = project.to_owned();
+        std::thread::spawn(move || {
+            let _ = sent.send(workspace(&at));
+        });
+        let record = got.recv_timeout(Duration::from_secs(20))?;
+        assert!(record.get("error").is_none(), "{record}");
+        assert!(record["untracked_sha256"].is_string(), "{record}");
+        // A link to another target is another record.
+        std::fs::remove_file(project.join("link"))?;
+        std::os::unix::fs::symlink(project.join("plain.txt"), project.join("link"))?;
+        assert_ne!(untracked_entry(&project.join("link")), to_pipe);
+        assert_ne!(
+            workspace(project)["untracked_sha256"],
+            record["untracked_sha256"]
+        );
+        Ok(())
+    }
 }
