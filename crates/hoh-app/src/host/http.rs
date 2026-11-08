@@ -39,7 +39,7 @@ pub(super) struct Shared {
     /// Every event stream opened so far (M2T06R-57: a brief subscription shows here, not in the gauge).
     pub(super) opened: std::sync::atomic::AtomicUsize,
     /// The host's own cgroup if it is delegated: attempts are then tracked by cgroups of their own
-    /// (docs/adr/ADR-021.md decision 8d v5).
+    /// (docs/adr/ADR-021.md decision 8d v5 to v7).
     pub(super) cgroups: Option<super::cgroup::Delegated>,
 }
 

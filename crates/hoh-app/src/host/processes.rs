@@ -486,6 +486,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn two_proofs_together_are_done_only_when_both_are() {
+        // M2T06R-550 (decision 8d v6): the cgroup's proof and the marker scan's, on paths 2-4.
+        use Proof::*;
+        for (a, b, both_) in [
+            (Done, Done, Done),
+            (Done, Pending, Pending),
+            (Pending, Done, Pending),
+            (Pending, Pending, Pending),
+            (Done, Incomplete, Incomplete),
+            (Incomplete, Done, Incomplete),
+            (Pending, Incomplete, Incomplete),
+            (Incomplete, Pending, Incomplete),
+        ] {
+            assert_eq!(both(a, b), both_, "{a:?} and {b:?}");
+        }
+    }
+
+    #[test]
     fn a_stat_is_read_as_bytes_up_to_the_last_parenthesis() {
         // M2T06R-101: a name that is not UTF-8, and one with ") " in it.
         let mut line =

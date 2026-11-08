@@ -330,11 +330,13 @@ fn examine(project: &Path, live: bool) -> Report {
                     "进程跟踪降级：运行中的 host {why}；它按 /proc 尽力跟踪 Attempt 的组外进程（tracking: proc，对蓄意躲避的进程不成立，CR-011）"
                 ));
             }
-            json!({"state": "running", "process_tracking": mode, "process_tracking_detail": why})
+            json!({"state": "running",
+                "detail": format!("运行中的 host（pid {}）", record["pid"].as_u64().unwrap_or_default()),
+                "process_tracking": mode, "process_tracking_detail": why})
         }
-        None => match crate::client::delegated_scope() {
+        None => match crate::client::delegated_scope(&env) {
             Ok(_) => json!({"process_tracking": "unverified",
-                "process_tracking_detail": "没有运行中的 host；用户级 systemd 管理器可达且有 systemd-run，下次启动的 host 预计在受委托的 cgroup 中运行（未经验证）"}),
+                "process_tracking_detail": "没有运行中的 host；用户级 systemd 管理器可达、用户已开启 linger、有 systemd-run，下次启动的 host 预计在受委托的 cgroup 中运行（未经验证）"}),
             Err(why) => {
                 warnings.push(format!(
                     "进程跟踪将降级：{why}；下次启动的 host 将按 /proc 尽力跟踪 Attempt 的组外进程（tracking: proc，对蓄意躲避的进程不成立，CR-011）"

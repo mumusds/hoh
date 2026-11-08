@@ -412,8 +412,9 @@ async fn attempt(
         }
     };
     // Its whole identity: without it the gate stays shut (dropped below) and the agent never runs (M2T05R-100). Its
-    // cgroup too, while it is held at the gate (nothing of the agent runs yet): everything it starts stays in it
-    // (docs/adr/ADR-021.md decision 8d v5, CR-011); without a delegated cgroup it is tracked by the /proc scan.
+    // cgroup too, while it is held at the gate (nothing of the agent runs yet): what it starts stays in it unless it
+    // moves itself out, which the marker scan covers (docs/adr/ADR-021.md decision 8d v5 to v7, CR-011, CR-012);
+    // without a delegated cgroup it is tracked by the /proc scan.
     let pid = started.pid;
     let cgroups = common.shared.cgroups.clone();
     let marker = work.marker();

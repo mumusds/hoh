@@ -587,7 +587,30 @@ async fn doctor_reports_how_the_running_host_tracks_attempts_not_what_a_start_wo
                 .any(|w| w.as_str().is_some_and(|w| w.contains("tracking: proc")))
         });
         assert!(warned, "{}", report["summary"]);
+        // M2T06R-557: the host's own finding, not a guess at how it was started.
+        assert!(
+            record["process_tracking_reason"].as_str().is_some_and(
+                |why| !why.is_empty() && !why.contains("not started through systemd-run")
+            ),
+            "{record}"
+        );
     }
+    // M2T06R-555: the running host's detail, and the limits' two kinds.
+    assert!(
+        reported["detail"]
+            .as_str()
+            .is_some_and(|d| !d.contains("没有运行中的 host")),
+        "{reported}"
+    );
+    let limits = reported["process_tracking_limits"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        limits.contains("早已运行的服务")
+            && limits.contains("迁出 cgroup")
+            && limits.contains("隐藏标记"),
+        "{limits}"
+    );
     // The text form says the same: the running host, its tracking and the limits (CR-012).
     let mut command = env.command(&["doctor"]);
     if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
@@ -606,7 +629,10 @@ async fn doctor_reports_how_the_running_host_tracks_attempts_not_what_a_start_wo
         text.contains(&format!("host    运行中，进程跟踪 {mode}")),
         "{text}"
     );
-    assert!(text.contains("CR-012"), "{text}");
+    assert!(
+        text.contains("CR-012") && text.contains("早已运行的服务") && text.contains("隐藏标记"),
+        "{text}"
+    );
     host.shutdown().await;
     Ok(())
 }
@@ -779,6 +805,116 @@ fn a_host_is_not_started_in_the_users_manager_when_the_user_does_not_linger() ->
     Ok(())
 }
 
+/// Whether the user's systemd manager answers here and the user lingers (decision 2's conditions before systemd-run).
+fn manager_and_linger() -> bool {
+    let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") else {
+        return false;
+    };
+    let user = std::env::var("USER").unwrap_or_default();
+    !user.is_empty()
+        && Path::new(&runtime).join("systemd/private").exists()
+        && Path::new("/var/lib/systemd/linger").join(&user).is_file()
+}
+
+/// A directory with a stand-in `systemd-run` that never answers `--version` (it sleeps 45 s), first on PATH.
+fn hanging_systemd_run(env: &Env) -> R<std::ffi::OsString> {
+    let bin = env.dir.path().join("bin");
+    std::fs::create_dir_all(&bin)?;
+    let fake = bin.join("systemd-run");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\n[ \"$1\" = --version ] && exec sleep 45\nexit 1\n",
+    )?;
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(std::env::join_paths(std::iter::once(bin).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))?)
+}
+
+#[test]
+fn doctor_bounds_the_systemd_run_version_probe_and_lists_it() -> R {
+    // M2T06R-553 (REQ-006 behaviour 6, ADR-015 decisions 4 and 5): with no host, doctor's check before a start asks
+    // `systemd-run --version`; one that never answers is ended at its limit, doctor ends in time, and the command is in
+    // its probes.
+    if !manager_and_linger() {
+        return Ok(());
+    }
+    let env = Env::new()?;
+    let path = hanging_systemd_run(&env)?;
+    let started = Instant::now();
+    let out = finish(
+        with_manager(&env, &["doctor", "--output", "json"], &path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?,
+        Duration::from_secs(60),
+    )?;
+    let took = started.elapsed();
+    let report: Value = serde_json::from_slice(&out.stdout)?;
+    assert!(took < Duration::from_secs(23), "doctor took {took:?}");
+    let listed = report["probes"].as_array().is_some_and(|p| {
+        p.iter().any(|run| {
+            run["argv"].as_array().is_some_and(|a| {
+                a.len() == 2
+                    && a[0].as_str().is_some_and(|c| c.ends_with("/systemd-run"))
+                    && a[1] == "--version"
+            })
+        })
+    });
+    assert!(listed, "{}", report["probes"]);
+    assert_eq!(
+        report["runtime"]["host"]["process_tracking"], "proc",
+        "{}",
+        report["runtime"]["host"]
+    );
+    Ok(())
+}
+
+#[test]
+fn a_host_start_does_not_wait_on_a_systemd_run_that_does_not_answer() -> R {
+    // M2T06R-553 (decision 2): the client's `systemd-run --version` is bounded; one that never answers gives a direct
+    // start, recorded with why, within the detach's time.
+    if !manager_and_linger() {
+        return Ok(());
+    }
+    let env = Env::new()?;
+    let _daemons = Daemons(env.project());
+    let path = hanging_systemd_run(&env)?;
+    let started = Instant::now();
+    let out = finish(
+        with_manager(&env, &["-p", "x", "--detach", "--output", "json"], &path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?,
+        LIMIT,
+    )?;
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "{:?}",
+        started.elapsed()
+    );
+    let record: Value = serde_json::from_str(&std::fs::read_to_string(
+        env.project().join(".hoh/host.json"),
+    )?)?;
+    assert_eq!(record["process_tracking"], "proc", "{record}");
+    assert!(
+        record["process_tracking_reason"]
+            .as_str()
+            .is_some_and(|why| why.contains("systemd-run --version")),
+        "{record}"
+    );
+    Ok(())
+}
+
 #[test]
 fn doctor_without_a_host_reports_what_a_start_would_have_and_warns_when_it_would_degrade() -> R {
     // M2T06R-454 (CR-011): no host runs. Without the user's manager the next host would be degraded: proc, with a
@@ -822,6 +958,14 @@ fn doctor_without_a_host_reports_what_a_start_would_have_and_warns_when_it_would
         ))?;
         assert_eq!(
             report["runtime"]["host"]["process_tracking"], "unverified",
+            "{}",
+            report["runtime"]["host"]
+        );
+        // M2T06R-555: the check names every condition it found, linger included.
+        assert!(
+            report["runtime"]["host"]["process_tracking_detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("linger")),
             "{}",
             report["runtime"]["host"]
         );

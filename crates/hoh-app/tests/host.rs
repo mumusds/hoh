@@ -1792,17 +1792,30 @@ async fn a_host_leaves_its_files_and_holds_the_project() -> R {
     assert_eq!(mode(&files.join("host.json"))?, 0o600);
     assert_eq!(mode(&host.socket)?, 0o600);
     let info: Value = serde_json::from_str(&std::fs::read_to_string(files.join("host.json"))?)?;
-    // How its attempts are tracked, as this process's cgroup allows (docs/adr/ADR-021.md decision 8d, M2T06R-402).
-    let (tracking, reason) = if own_cgroup_delegated() {
-        (
-            "cgroup",
-            "its own cgroup is delegated: each attempt gets a cgroup of its own",
-        )
+    // How its attempts are tracked, as this process's cgroup allows, and why (docs/adr/ADR-021.md decision 8d,
+    // M2T06R-402; the host's own finding, M2T06R-557).
+    let reason = if own_cgroup_delegated() {
+        "its own cgroup is delegated: each attempt gets a cgroup of its own".to_owned()
     } else {
-        (
-            "proc",
-            "its own cgroup is not delegated (not started through systemd-run or a unit with Delegate=yes)",
-        )
+        let cgroup = std::fs::read_to_string("/proc/self/cgroup")?;
+        let own = cgroup
+            .lines()
+            .find_map(|l| l.strip_prefix("0::"))
+            .ok_or("no cgroup v2 line")?;
+        let found = info["process_tracking_reason"].as_str().unwrap_or_default();
+        let wanted = format!(
+            "its own cgroup {} is not delegated to it (no cgroup can be made below it: ",
+            Path::new("/sys/fs/cgroup")
+                .join(own.trim().trim_start_matches('/'))
+                .display()
+        );
+        assert!(found.starts_with(&wanted), "{found}");
+        found.to_owned()
+    };
+    let tracking = if own_cgroup_delegated() {
+        "cgroup"
+    } else {
+        "proc"
     };
     assert_eq!(
         info,
