@@ -309,6 +309,37 @@ mod tests {
     type R<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
     /// A cgroup of a test's own (a directory with the files a cgroup has), `populated` as given, no members.
+    #[test]
+    fn a_cgroups_subtree_is_every_cgroup_below_it_and_goes_bottom_up() -> R {
+        // M2T06R-651 (decision 8d v7): SIGTERM goes to every cgroup below the attempt's, however deep, and a proved
+        // cgroup is removed with all of them, the deepest first.
+        let root = tempfile::tempdir()?;
+        let at = root.path().join("attempt-0123456789abcdef");
+        let deepest = at.join("a").join("b").join("c");
+        std::fs::create_dir_all(&deepest)?;
+        std::fs::create_dir_all(at.join("d"))?;
+        let group = AttemptGroup::at(&at);
+        let mut found = group.subtree();
+        assert_eq!(found.first(), Some(&at), "the cgroup itself first");
+        found.sort();
+        let mut wanted = vec![
+            at.clone(),
+            at.join("a"),
+            at.join("a").join("b"),
+            deepest.clone(),
+            at.join("d"),
+        ];
+        wanted.sort();
+        assert_eq!(found, wanted);
+        group.remove();
+        assert!(
+            !at.exists(),
+            "left: {:?}",
+            std::fs::read_dir(root.path())?.count()
+        );
+        Ok(())
+    }
+
     fn fake(populated: u8) -> R<tempfile::TempDir> {
         let dir = tempfile::tempdir()?;
         std::fs::write(

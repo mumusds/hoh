@@ -840,6 +840,8 @@ fn doctor_bounds_the_systemd_run_version_probe_and_lists_it() -> R {
     // `systemd-run --version`; one that never answers is ended at its limit, doctor ends in time, and the command is in
     // its probes.
     if !manager_and_linger() {
+        // Visible, not a silent pass (M2T06R-656).
+        eprintln!("SKIP: no user systemd manager or no linger here");
         return Ok(());
     }
     let env = Env::new()?;
@@ -855,6 +857,18 @@ fn doctor_bounds_the_systemd_run_version_probe_and_lists_it() -> R {
     let took = started.elapsed();
     let report: Value = serde_json::from_slice(&out.stdout)?;
     assert!(took < Duration::from_secs(23), "doctor took {took:?}");
+    // At most its own limit (2 s), ended there (M2T06R-652).
+    let bounded = report["probes"].as_array().is_some_and(|p| {
+        p.iter().any(|run| {
+            run["argv"].as_array().is_some_and(|a| {
+                a.first()
+                    .and_then(Value::as_str)
+                    .is_some_and(|c| c.ends_with("/systemd-run"))
+            }) && run["timed_out"] == true
+                && run["duration_ms"].as_u64().is_some_and(|ms| ms <= 2_500)
+        })
+    });
+    assert!(bounded, "{}", report["probes"]);
     let listed = report["probes"].as_array().is_some_and(|p| {
         p.iter().any(|run| {
             run["argv"].as_array().is_some_and(|a| {
@@ -878,6 +892,8 @@ fn a_host_start_does_not_wait_on_a_systemd_run_that_does_not_answer() -> R {
     // M2T06R-553 (decision 2): the client's `systemd-run --version` is bounded; one that never answers gives a direct
     // start, recorded with why, within the detach's time.
     if !manager_and_linger() {
+        // Visible, not a silent pass (M2T06R-656).
+        eprintln!("SKIP: no user systemd manager or no linger here");
         return Ok(());
     }
     let env = Env::new()?;
