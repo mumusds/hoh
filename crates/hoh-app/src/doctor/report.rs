@@ -238,7 +238,25 @@ pub fn text(report: &Report) -> String {
             .map(|d| format!("（{d}）"))
             .unwrap_or_default()
     ));
-    out.push_str("host    未运行（M1 还没有 host）\n");
+    // The project's host and how its attempts' processes are tracked, with the proof's limits (ADR-021 decision 8d,
+    // CR-012).
+    let host = &r.host;
+    out.push_str(&format!(
+        "host    {}，进程跟踪 {}{}\n",
+        if host["state"] == "running" {
+            "运行中"
+        } else {
+            "未运行"
+        },
+        host["process_tracking"].as_str().unwrap_or("unknown"),
+        host["process_tracking_detail"]
+            .as_str()
+            .map(|d| format!("（{d}）"))
+            .unwrap_or_default()
+    ));
+    if let Some(limits) = host["process_tracking_limits"].as_str() {
+        out.push_str(&format!("        {limits}\n"));
+    }
     let s = &report.summary;
     if s.blocking.is_empty() {
         out.push_str("结论：没有阻断项");
