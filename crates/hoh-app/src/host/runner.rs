@@ -429,18 +429,6 @@ async fn attempt(
     })
     .await
     .map_err(|e| PersistError::Storage(format!("the identity of {id}'s process: {e}")))?;
-    store
-        .commit(Commit {
-            events: vec![NewEvent {
-                project_id: common.shared.project_id.clone(),
-                event_id: hoh_core::ids::child_id(&id, "tracking"),
-                run_id: Some(work.run_id.clone()),
-                kind: "attempt.tracking".to_owned(),
-                payload: tracking.json(&id),
-            }],
-            ..Commit::default()
-        })
-        .await?;
     let Some(who) = who else {
         drop(started);
         store
@@ -452,7 +440,11 @@ async fn attempt(
         return Ok(());
     };
     hooks.runner(RunnerPoint::AfterSpawn);
-    if !store.runner_running(&id, identity::running(&who)).await? {
+    // Its tracking is recorded with its identity, in the same commit.
+    if !store
+        .runner_running(&id, identity::running(&who), tracking.json(&id))
+        .await?
+    {
         // Disposed of meanwhile: the gate is dropped unopened, so the process ends without running anything.
         return Ok(());
     }

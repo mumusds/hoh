@@ -736,10 +736,12 @@ impl Store {
         &self,
         attempt_id: &str,
         facts: AttemptFacts,
+        tracking: serde_json::Value,
     ) -> Result<bool, PersistError> {
         self.runner_step(runner::RunnerJob::Running {
             attempt_id: attempt_id.to_owned(),
             facts: Box::new(facts),
+            tracking,
         })
         .await
     }

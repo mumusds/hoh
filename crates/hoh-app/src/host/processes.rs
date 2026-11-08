@@ -241,6 +241,9 @@ pub(super) struct Outside {
     /// Runs between a scan's listing and its first reads of environments (a test makes a process fork and exit there).
     #[cfg(test)]
     after_listing: Option<Box<dyn FnMut() + Send>>,
+    /// Runs after a scan found the attempt's processes and before it pins them (a test makes one go there).
+    #[cfg(test)]
+    after_finding: Option<Box<dyn FnMut() + Send>>,
 }
 
 impl Outside {
@@ -255,6 +258,8 @@ impl Outside {
             root: PathBuf::from("/proc"),
             #[cfg(test)]
             after_listing: None,
+            #[cfg(test)]
+            after_finding: None,
         }
     }
 
@@ -358,6 +363,10 @@ impl Outside {
             }
         }
         found.extend(by_marker);
+        #[cfg(test)]
+        if let Some(hook) = self.after_finding.as_mut() {
+            hook();
+        }
         for process in processes.iter().filter(|p| found.contains(&p.pid)) {
             if self
                 .leader
@@ -664,6 +673,36 @@ mod tests {
             assert_eq!(outside.scan(), Proof::Incomplete, "{pid_max}");
             assert_eq!(outside.scan(), Proof::Incomplete, "{pid_max}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_scan_that_found_a_process_of_the_attempt_is_not_quiet_even_if_it_is_gone_by_its_end()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // M2T06R-300 (degraded proc mode): a marked process is found, then gone before it can be pinned (it may have
+        // forked after the last look at the allocations); that scan does not count, so the next one is only the first.
+        let root = tempfile::tempdir()?;
+        std::fs::create_dir_all(root.path().join("sys/kernel"))?;
+        std::fs::write(root.path().join("sys/kernel/ns_last_pid"), b"1000\n")?;
+        let dir = root.path().join("4000000");
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(
+            dir.join("stat"),
+            b"4000000 (x) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 9 0",
+        )?;
+        std::fs::write(dir.join("environ"), format!("{ATTEMPT_ENV}=p/A1\0"))?;
+        let mut outside = Outside::new("p/A1").with_root(Some(root.path().to_owned()));
+        let gone = dir.clone();
+        outside.after_finding = Some(Box::new(move || {
+            let _ = std::fs::remove_dir_all(&gone);
+        }));
+        assert_eq!(outside.scan(), Proof::Pending);
+        assert_eq!(
+            outside.scan(),
+            Proof::Pending,
+            "the scan that found it counted as quiet"
+        );
+        assert_eq!(outside.scan(), Proof::Done);
         Ok(())
     }
 

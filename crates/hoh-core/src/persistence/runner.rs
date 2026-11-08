@@ -60,6 +60,8 @@ pub(super) enum RunnerJob {
     Running {
         attempt_id: String,
         facts: Box<AttemptFacts>,
+        /// How its processes are tracked (`attempt.tracking`, docs/adr/ADR-021.md decision 8d v5), recorded with it.
+        tracking: serde_json::Value,
     },
     Finished {
         attempt_id: String,
@@ -119,9 +121,11 @@ pub(super) fn run(
             to,
             detail,
         } => effect(conn, &attempt_id, &key, from, to, detail, ctx).map(RunnerDone::Applied),
-        RunnerJob::Running { attempt_id, facts } => {
-            running(conn, &attempt_id, *facts, ctx).map(RunnerDone::Applied)
-        }
+        RunnerJob::Running {
+            attempt_id,
+            facts,
+            tracking,
+        } => running(conn, &attempt_id, *facts, tracking, ctx).map(RunnerDone::Applied),
         RunnerJob::Finished { attempt_id, ending } => {
             finished(conn, &attempt_id, &ending, ctx).map(RunnerDone::Applied)
         }
@@ -399,6 +403,7 @@ fn running(
     conn: &mut Connection,
     attempt_id: &str,
     facts: AttemptFacts,
+    tracking: serde_json::Value,
     ctx: &Ctx<'_>,
 ) -> Result<bool, PersistError> {
     let tx = writer::begin(conn, ctx)?;
@@ -436,13 +441,22 @@ fn running(
         &tx,
         &Commit {
             cas,
-            events: vec![event(
-                &project_id,
-                &run_id,
-                child_id(&key, "effect.started"),
-                "effect.started",
-                json!({"effect_key": key, "attempt_id": attempt_id, "from": "PREPARED", "detail": {}}),
-            )],
+            events: vec![
+                event(
+                    &project_id,
+                    &run_id,
+                    child_id(&key, "effect.started"),
+                    "effect.started",
+                    json!({"effect_key": key, "attempt_id": attempt_id, "from": "PREPARED", "detail": {}}),
+                ),
+                event(
+                    &project_id,
+                    &run_id,
+                    child_id(attempt_id, "tracking"),
+                    "attempt.tracking",
+                    tracking,
+                ),
+            ],
             ..Commit::default()
         },
         ctx,
