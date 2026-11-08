@@ -574,6 +574,13 @@ async fn doctor_reports_how_the_running_host_tracks_attempts_not_what_a_start_wo
         reported["process_tracking"], record["process_tracking"],
         "{reported}"
     );
+    // CR-012: the stated limits of the termination proof, in every mode.
+    assert!(
+        reported["process_tracking_limits"]
+            .as_str()
+            .is_some_and(|l| l.contains("CR-012")),
+        "{reported}"
+    );
     if record["process_tracking"] == "proc" {
         let warned = report["summary"]["warnings"].as_array().is_some_and(|w| {
             w.iter()
@@ -581,6 +588,25 @@ async fn doctor_reports_how_the_running_host_tracks_attempts_not_what_a_start_wo
         });
         assert!(warned, "{}", report["summary"]);
     }
+    // The text form says the same: the running host, its tracking and the limits (CR-012).
+    let mut command = env.command(&["doctor"]);
+    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
+        command.env("XDG_RUNTIME_DIR", runtime);
+    }
+    let out = finish(
+        command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?,
+        Duration::from_secs(60),
+    )?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mode = record["process_tracking"].as_str().ok_or("no tracking")?;
+    assert!(
+        text.contains(&format!("host    运行中，进程跟踪 {mode}")),
+        "{text}"
+    );
+    assert!(text.contains("CR-012"), "{text}");
     host.shutdown().await;
     Ok(())
 }
@@ -685,6 +711,13 @@ fn a_host_whose_scope_is_refused_is_started_directly_and_records_the_proc_scan()
         env.project().join(".hoh/host.json"),
     )?)?;
     assert_eq!(record["process_tracking"], "proc", "{record}");
+    // CR12-03: the host records why it was started directly.
+    assert!(
+        record["process_tracking_reason"]
+            .as_str()
+            .is_some_and(|why| why.contains("systemd-run did not start it")),
+        "{record}"
+    );
     Ok(())
 }
 
@@ -715,9 +748,15 @@ fn a_host_is_not_started_in_the_users_manager_when_the_user_does_not_linger() ->
         env.project().join(".hoh/host.json"),
     )?)?;
     assert_eq!(record["process_tracking"], "proc", "{record}");
-    drop(_daemons);
+    assert!(
+        record["process_tracking_reason"]
+            .as_str()
+            .is_some_and(|why| why.contains("does not linger")),
+        "{record}"
+    );
+    // CR12-03: doctor, run while that host runs (as the user this test runs as, whose check before a start may well
+    // pass), reports the running host's own reason.
     let mut doctor = with_manager(&env, &["doctor", "--output", "json"], &path);
-    doctor.env("USER", "hoh-test-no-such-user");
     let out = finish(
         doctor
             .stdout(Stdio::piped())
@@ -726,11 +765,17 @@ fn a_host_is_not_started_in_the_users_manager_when_the_user_does_not_linger() ->
         Duration::from_secs(60),
     )?;
     let report: Value = serde_json::from_slice(&out.stdout)?;
+    assert_eq!(
+        report["runtime"]["host"]["state"], "running",
+        "{}",
+        report["runtime"]["host"]
+    );
     let said = report["summary"]["warnings"].as_array().is_some_and(|w| {
         w.iter()
             .any(|w| w.as_str().is_some_and(|w| w.contains("does not linger")))
     });
     assert!(said, "{}", report["summary"]);
+    drop(_daemons);
     Ok(())
 }
 
@@ -754,6 +799,13 @@ fn doctor_without_a_host_reports_what_a_start_would_have_and_warns_when_it_would
     let report = doctor(&mut bare)?;
     assert_eq!(
         report["runtime"]["host"]["process_tracking"], "proc",
+        "{}",
+        report["runtime"]["host"]
+    );
+    assert!(
+        report["runtime"]["host"]["process_tracking_limits"]
+            .as_str()
+            .is_some_and(|l| l.contains("CR-012")),
         "{}",
         report["runtime"]["host"]
     );

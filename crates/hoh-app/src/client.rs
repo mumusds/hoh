@@ -359,20 +359,30 @@ pub fn delegated_scope() -> Result<Scope, String> {
 /// manager when there is one, so its attempts are tracked by cgroups of their own; directly otherwise, or when the
 /// scope cannot be had (decision 2).
 fn start(project: &Path, end: Instant) -> Result<HostInfo, Failure> {
-    if let Ok(scope) = delegated_scope() {
-        match launch(project, end, Some(&scope)) {
+    let why = match delegated_scope() {
+        Ok(scope) => match launch(project, end, Some(&scope), None) {
             Err(failure) if failure.exit != 78 && Instant::now() < end => {
                 // The scope was refused (or the host ended for another reason): once more, directly.
-                return launch(project, end, None);
+                format!(
+                    "systemd-run did not start it in a delegated scope ({})",
+                    failure.message
+                )
             }
             other => return other,
-        }
-    }
-    launch(project, end, None)
+        },
+        Err(why) => why,
+    };
+    launch(project, end, None, Some(&why))
 }
 
-/// Start `hoh __host <project>`, in `scope` if given, and wait until it is ready, until `end`.
-fn launch(project: &Path, end: Instant, scope: Option<&Scope>) -> Result<HostInfo, Failure> {
+/// Start `hoh __host <project>`, in `scope` if given, and wait until it is ready, until `end`. A host started
+/// directly is told why (`unscoped`), which it records for `hoh doctor` (CR-012, CR12-03).
+fn launch(
+    project: &Path,
+    end: Instant,
+    scope: Option<&Scope>,
+    unscoped: Option<&str>,
+) -> Result<HostInfo, Failure> {
     let program = std::env::current_exe()
         .map_err(|e| Failure::unreachable(format!("cannot find the hoh program: {e}")))?;
     let mut command = match scope {
@@ -394,6 +404,10 @@ fn launch(project: &Path, end: Instant, scope: Option<&Scope>) -> Result<HostInf
             command
         }
         None => std::process::Command::new(&program),
+    };
+    match unscoped {
+        Some(why) => command.env(hoh_app::host::UNSCOPED_ENV, why),
+        None => command.env_remove(hoh_app::host::UNSCOPED_ENV),
     };
     let mut child = command
         .arg("__host")

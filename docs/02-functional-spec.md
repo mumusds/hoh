@@ -1226,7 +1226,7 @@ pause持久后立即阻止新派发并在安全点进入PAUSED；cancel经优先
 
 - native interrupt grace 10 s、SIGTERM grace 5 s及17 s总上限为初值；docs只要求短grace与有界SIGKILL。
 - 安全点未精确定义；本选择为当前Attempt到达SETTLED/FAILED/CANCELLED，Pause不设超时也不中断。
-- 以setsid脱离进程组的后代不受pgid信号覆盖。host运行在受委托的cgroup v2中时（systemd --user的unit带Delegate=yes，或客户端经systemd-run --user --scope -p Delegate=yes拉起host），每个Attempt的进程在其启动门打开前移入它专属的子cgroup，以cgroup.kill停止、以populated 0证明终结；没有受委托的cgroup时，退回按/proc父子链与继承的环境标记查找的尽力方案，并把该Attempt明确记为降级（tracking: proc），由hoh doctor报告；该方案对蓄意躲避的进程不成立（CR-011）。
+- 以setsid脱离进程组的后代不受pgid信号覆盖。host运行在受委托的cgroup v2中时（systemd --user的unit带Delegate=yes，或客户端在用户已开启linger时经systemd-run --user --scope -p Delegate=yes拉起host），每个Attempt的进程在其启动门打开前移入它专属的子cgroup，以cgroup.kill停止。终结的证明须同时满足：进程组为空；该cgroup为populated 0；按/proc父链与继承的环境标记找到并以pidfd固定的该Attempt进程都已结束；进程组为空之后，连续两次完整扫描都没有找到进程组与cgroup之外的该Attempt进程（不完整的扫描、找到过进程的扫描都不计入）。找到的进程同样收到停止信号。没有受委托的cgroup时，退回按/proc父子链与继承的环境标记查找的尽力方案（没有cgroup一项，其余条件相同），把该Attempt明确记为降级（tracking: proc），由hoh doctor报告；该方案对蓄意躲避的进程不成立。无法得到证明时，不结束Attempt，不释放写者租约。余项（项目所有者2026-11-08接受）：Attempt的进程与用户同一uid，没有特权时无法封住。既迁出cgroup、又脱离进程组并让标记不可见的进程，以及交给Attempt之外早已运行的同用户服务（systemd --user、HoH之外启动的tmux server、cron、ssh localhost等）的工作，都无法归属，可能在Attempt结束、写者租约释放后继续写；hoh doctor写明这一界限（CR-011、CR-012）。
 
 ## REQ-044 · 可恢复版本
 

@@ -25,6 +25,12 @@ const TIMEOUT: Duration = Duration::from_secs(20);
 /// The project's plugin set (REQ-048..050).
 const PLUGINS: &str = include_str!("../../../config/plugins.json");
 
+/// The stated limits of an attempt's termination proof, in every mode (REQ-043 decision 3, CR-012; the owner accepted
+/// them on 2026-11-08).
+const TRACKING_LIMITS: &str = "终结证明只覆盖 Attempt 自己的进程：它的 cgroup（受委托时）、进程组和继承的环境标记。\
+同一用户的进程把工作交给 Attempt 之外早已运行的服务（systemd --user、HoH 之外启动的 tmux server、cron、ssh localhost），\
+或迁出 cgroup、脱离进程组并隐藏标记时，无法归属，可能在 Attempt 结束、写者租约释放后继续写（REQ-043 决定 3，CR-012）";
+
 /// The compat manifest of the project, if there is a readable one (ADR-015 decision 2); a warning otherwise.
 fn manifest(project: &Path) -> (Option<CompatManifest>, Option<String>) {
     let path = project.join(".hoh/compat-manifest.json");
@@ -337,7 +343,8 @@ fn examine(project: &Path, live: bool) -> Report {
             }
         },
     };
-    let mut host = json!({"state": "not_running", "detail": "M1 还没有 host"});
+    let mut host = json!({"state": "not_running", "detail": "没有运行中的 host",
+        "process_tracking_limits": TRACKING_LIMITS});
     if let (Some(host), Some(tracking)) = (host.as_object_mut(), tracking.as_object()) {
         host.extend(tracking.clone());
     }

@@ -18,6 +18,10 @@ pub use processes::ATTEMPT_ENV;
 pub use reconcile::ReconcileSettings;
 pub use runner::{Executor, Gate, Outcome, RunnerConfig, RunnerPoint, Started, Work};
 
+/// Set by the client on a host it starts directly, not in a delegated scope: why (docs/adr/ADR-021.md decision 2). The
+/// host records it in host.json, so `hoh doctor` reports a running host's actual reason (CR-012, CR12-03).
+pub const UNSCOPED_ENV: &str = "HOH_HOST_UNSCOPED";
+
 use hoh_core::persistence::{self, Options, PersistError, Reader, Store, location};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -388,9 +392,16 @@ impl Host {
                 // M2T06R-402): `hoh doctor` reports this, not a guess.
                 "process_tracking": if shared.cgroups.is_some() { "cgroup" } else { "proc" },
                 "process_tracking_reason": if shared.cgroups.is_some() {
-                    "its own cgroup is delegated: each attempt gets a cgroup of its own"
+                    "its own cgroup is delegated: each attempt gets a cgroup of its own".to_owned()
                 } else {
-                    "its own cgroup is not delegated (not started through systemd-run or a unit with Delegate=yes)"
+                    match std::env::var(UNSCOPED_ENV) {
+                        Ok(why) if !why.is_empty() => format!(
+                            "its own cgroup is not delegated: the client started it directly because {why}"
+                        ),
+                        _ => "its own cgroup is not delegated (not started through systemd-run or a unit with \
+                              Delegate=yes)"
+                            .to_owned(),
+                    }
                 },
             }),
         );
