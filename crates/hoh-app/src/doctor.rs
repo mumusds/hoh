@@ -302,16 +302,40 @@ fn examine(project: &Path, live: bool) -> Report {
             Err(why) => warnings.push(format!("live 检查没有完成：{why}")),
         }
     }
-    // How a host started now would track its attempts' processes (docs/adr/ADR-021.md decision 8d v5, CR-011).
-    let tracking = match crate::client::delegated_scope() {
-        Ok(_) => json!({"process_tracking": "cgroup",
-            "process_tracking_detail": "host 经 systemd-run 在受委托的 cgroup 中运行，每个 Attempt 的进程以其 cgroup 证明终结"}),
-        Err(why) => {
-            warnings.push(format!(
-                "进程跟踪降级：{why}；host 将按 /proc 尽力跟踪 Attempt 的组外进程（tracking: proc，对蓄意躲避的进程不成立，CR-011）"
-            ));
-            json!({"process_tracking": "proc", "process_tracking_detail": why})
+    // How the project's host tracks its attempts' processes (docs/adr/ADR-021.md decision 8d, CR-011): a running
+    // host's own record; with none running, what the check before a start finds, not verified (M2T06R-402).
+    let running = crate::client::running(project).and_then(|_| {
+        std::fs::read_to_string(project.join(".hoh/host.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+    });
+    let tracking = match running {
+        Some(record) => {
+            let mode = record["process_tracking"]
+                .as_str()
+                .unwrap_or("unknown")
+                .to_owned();
+            let why = record["process_tracking_reason"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            if mode != "cgroup" {
+                warnings.push(format!(
+                    "进程跟踪降级：运行中的 host {why}；它按 /proc 尽力跟踪 Attempt 的组外进程（tracking: proc，对蓄意躲避的进程不成立，CR-011）"
+                ));
+            }
+            json!({"state": "running", "process_tracking": mode, "process_tracking_detail": why})
         }
+        None => match crate::client::delegated_scope() {
+            Ok(_) => json!({"process_tracking": "unverified",
+                "process_tracking_detail": "没有运行中的 host；用户级 systemd 管理器可达且有 systemd-run，下次启动的 host 预计在受委托的 cgroup 中运行（未经验证）"}),
+            Err(why) => {
+                warnings.push(format!(
+                    "进程跟踪将降级：{why}；下次启动的 host 将按 /proc 尽力跟踪 Attempt 的组外进程（tracking: proc，对蓄意躲避的进程不成立，CR-011）"
+                ));
+                json!({"process_tracking": "proc", "process_tracking_detail": why})
+            }
+        },
     };
     let mut host = json!({"state": "not_running", "detail": "M1 还没有 host"});
     if let (Some(host), Some(tracking)) = (host.as_object_mut(), tracking.as_object()) {

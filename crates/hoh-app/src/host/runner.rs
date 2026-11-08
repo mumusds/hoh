@@ -530,9 +530,18 @@ async fn attempt(
     let (term, kill) = (common.settings.term_grace, common.settings.kill_grace);
     let root = common.shared.hooks.proc_root();
     let group = tracking.cgroup();
-    let (steps, proof) = tokio::task::spawn_blocking(move || match group {
-        Some(group) => group.stop(term, kill),
-        None => Outside::new(&marker).with_root(root).stop(term, kill),
+    let (steps, proof) = tokio::task::spawn_blocking(move || {
+        let mut outside = Outside::new(&marker).with_root(root);
+        match group {
+            // The cgroup, then what may have left it with its marker (decision 8d v6, M2T06R-400).
+            Some(group) => {
+                let (mut steps, in_cgroup) = group.stop(term, kill);
+                let (left, outside) = outside.stop(term, kill);
+                steps.extend(left);
+                (steps, super::processes::both(in_cgroup, outside))
+            }
+            None => outside.stop(term, kill),
+        }
     })
     .await
     .map_err(|e| PersistError::Storage(format!("the stop outside the group of {id} ended: {e}")))?;

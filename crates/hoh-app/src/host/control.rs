@@ -227,7 +227,7 @@ impl Processes for HostProcesses {
             .trackings
             .get(&attempt.attempt_id)
             .and_then(Tracking::cgroup);
-        let control = |group: Option<identity::Found>, leader: bool| {
+        let control = |group: Option<identity::Found>, leader: bool, orphans: Option<u32>| {
             if let Ok(mut outside) = outside.lock() {
                 if leader {
                     outside.set_leader(attempt.pid, attempt.process_start_id.as_deref());
@@ -240,14 +240,21 @@ impl Processes for HostProcesses {
                 native: native.clone(),
                 outside: outside.clone(),
                 cgroup: cgroup.clone(),
+                orphans,
             }
         };
         Some(match presence {
-            Ok(Presence::Ours(found)) => (Box::new(control(Some(found), true)), has_native),
+            Ok(Presence::Ours(found)) => (Box::new(control(Some(found), true, None)), has_native),
             // Its group is gone (or no process was recorded: held at its start gate, which closed when its task
             // stopped); what of it left the group is still looked for.
-            Ok(Presence::Gone(_)) => (Box::new(control(None, false)), false),
-            // It cannot be told apart: no signal may go (ADR-019 decision 8); it stays cancelling.
+            Ok(Presence::Gone(_)) => (Box::new(control(None, false, None)), false),
+            // Its group cannot be told apart: no signal may go to it (ADR-019 decision 8). With a cgroup, its members
+            // are stopped by their membership, and a leaderless group must be seen gone too (decision 8d v6,
+            // M2T06R-401); without one it stays cancelling.
+            Ok(Presence::Leaderless(left)) if cgroup.is_some() => {
+                (Box::new(control(None, false, Some(left.pgid))), false)
+            }
+            _ if cgroup.is_some() => (Box::new(control(None, false, None)), false),
             _ => (Box::new(Fixed(Look::Lost)), false),
         })
     }
@@ -281,8 +288,18 @@ struct AttemptControl {
     group: Option<identity::Found>,
     native: Option<(Arc<dyn Executor>, Work)>,
     outside: Arc<Mutex<Outside>>,
-    /// Its cgroup, when it has one: then the proof is the cgroup's, and the /proc scan is not used.
+    /// Its cgroup, when it has one: the proof is then the cgroup's and the marker scan's together (decision 8d v6).
     cgroup: Option<AttemptGroup>,
+    /// A group left without its leader, not signalled: it must be seen gone too.
+    orphans: Option<u32>,
+}
+
+/// Whether process group `pgid` still has a member (`kill(-pgid, 0)`, which sends nothing).
+fn group_lives(pgid: u32) -> bool {
+    i32::try_from(pgid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+        .is_some_and(|pgid| rustix::process::test_kill_process_group(pgid).is_ok())
 }
 
 impl ProcessControl for AttemptControl {
@@ -292,18 +309,25 @@ impl ProcessControl for AttemptControl {
             Some(identity::Group::Lost) => return Look::Lost,
             Some(identity::Group::Empty) | None => Look::Empty,
         };
-        if let Some(cgroup) = &self.cgroup {
-            return match (group, cgroup.proof()) {
-                (Look::Empty, Proof::Done) => {
-                    cgroup.remove();
-                    Look::Empty
-                }
-                _ => Look::Held,
-            };
-        }
         let Ok(mut outside) = self.outside.lock() else {
             return Look::Held;
         };
+        if let Some(cgroup) = &self.cgroup {
+            // The cgroup empty, a leaderless group gone, and then the marker scan's proof (decision 8d v6).
+            let emptied = group == Look::Empty
+                && cgroup.proof() == Proof::Done
+                && !self.orphans.is_some_and(group_lives);
+            if !emptied {
+                return look_at(Look::Held, &mut outside);
+            }
+            return match look_at(Look::Empty, &mut outside) {
+                Look::Empty => {
+                    cgroup.remove();
+                    Look::Empty
+                }
+                other => other,
+            };
+        }
         look_at(group, &mut outside)
     }
 
@@ -327,13 +351,15 @@ impl ProcessControl for AttemptControl {
                 self.group.as_ref().is_some_and(identity::Found::kill),
             ),
         };
-        let outside = match &self.cgroup {
+        let in_cgroup = match &self.cgroup {
             // SIGTERM to each member; SIGKILL to all of them at once, by the kernel.
             Some(cgroup) if sig == rustix::process::Signal::KILL => cgroup.kill(),
             Some(cgroup) => cgroup.terminate(),
-            None => self.outside.lock().is_ok_and(|mut o| o.signal(sig)),
+            None => false,
         };
-        outside || group
+        // And what the marker scan pinned (outside the cgroup, if it has one).
+        let outside = self.outside.lock().is_ok_and(|mut o| o.signal(sig));
+        in_cgroup || outside || group
     }
 }
 

@@ -374,6 +374,14 @@ impl Host {
                 "port": port,
                 "socket": socket,
                 "token": token,
+                // How its attempts' processes are tracked, as decided at its start (docs/adr/ADR-021.md decision 8d,
+                // M2T06R-402): `hoh doctor` reports this, not a guess.
+                "process_tracking": if shared.cgroups.is_some() { "cgroup" } else { "proc" },
+                "process_tracking_reason": if shared.cgroups.is_some() {
+                    "its own cgroup is delegated: each attempt gets a cgroup of its own"
+                } else {
+                    "its own cgroup is not delegated (not started through systemd-run or a unit with Delegate=yes)"
+                },
             }),
         );
         if let Err(e) = written {

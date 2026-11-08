@@ -211,6 +211,15 @@ impl Pinned {
     }
 }
 
+/// Two proofs together: done only when both are; incomplete when either is.
+pub(super) fn both(a: Proof, b: Proof) -> Proof {
+    match (a, b) {
+        (Proof::Done, Proof::Done) => Proof::Done,
+        (Proof::Incomplete, _) | (_, Proof::Incomplete) => Proof::Incomplete,
+        _ => Proof::Pending,
+    }
+}
+
 /// Where the proof stands after a look.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Proof {

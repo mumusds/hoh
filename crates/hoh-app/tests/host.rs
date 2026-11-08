@@ -1762,6 +1762,23 @@ fn a_host_process_ends_on_sigterm_with_a_subscriber() -> R {
     Ok(())
 }
 
+/// Whether this process's own cgroup is delegated to it (a cgroup can be made below it), as a host decides.
+fn own_cgroup_delegated() -> bool {
+    let Some(path) = std::fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .and_then(|t| {
+            t.lines()
+                .find_map(|l| l.strip_prefix("0::").map(str::to_owned))
+        })
+    else {
+        return false;
+    };
+    let probe = Path::new("/sys/fs/cgroup")
+        .join(path.trim().trim_start_matches('/'))
+        .join(format!("hoh-test-probe-{}", std::process::id()));
+    std::fs::create_dir(&probe).is_ok() && std::fs::remove_dir(&probe).is_ok()
+}
+
 /// What a running host leaves for its clients (ADR-016 decision 1): host.json readable by the owner only, written
 /// whole, naming the pid, project, epoch, port, socket and token; the socket also 0600; a second host in the project
 /// exits 69 naming the holder (M2T12R-04).
@@ -1775,10 +1792,23 @@ async fn a_host_leaves_its_files_and_holds_the_project() -> R {
     assert_eq!(mode(&files.join("host.json"))?, 0o600);
     assert_eq!(mode(&host.socket)?, 0o600);
     let info: Value = serde_json::from_str(&std::fs::read_to_string(files.join("host.json"))?)?;
+    // How its attempts are tracked, as this process's cgroup allows (docs/adr/ADR-021.md decision 8d, M2T06R-402).
+    let (tracking, reason) = if own_cgroup_delegated() {
+        (
+            "cgroup",
+            "its own cgroup is delegated: each attempt gets a cgroup of its own",
+        )
+    } else {
+        (
+            "proc",
+            "its own cgroup is not delegated (not started through systemd-run or a unit with Delegate=yes)",
+        )
+    };
     assert_eq!(
         info,
         json!({"pid": std::process::id(), "project_id": host.project_id, "host_epoch": host.host_epoch,
-               "port": host.port, "socket": host.socket, "token": host.token})
+               "port": host.port, "socket": host.socket, "token": host.token,
+               "process_tracking": tracking, "process_tracking_reason": reason})
     );
     assert_eq!(host.token.len(), 64);
     let leftovers: Vec<String> = std::fs::read_dir(&files)?
