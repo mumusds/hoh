@@ -109,7 +109,7 @@ fn seen(state: AttemptState, found: std::io::Result<Presence>) -> Seen {
 /// End what `seen` found of `row`'s processes (blocking): a process of the attempt is stopped with its group and its
 /// group must be seen empty (a group already empty gets no signal, M2T05R-259); then its processes outside the group
 /// are stopped the same way, the group stopped, gone or never started, and the attempt can end only with the
-/// termination proof (docs/adr/ADR-021.md decision 8d v3, M2T06R-100): else it is `Stopped { reaped: false }`, which
+/// termination proof (docs/adr/ADR-021.md decision 8d, M2T06R-100): else it is `Stopped { reaped: false }`, which
 /// leaves it and its slot.
 pub(super) fn end(
     seen: Seen,

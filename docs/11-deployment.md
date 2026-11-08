@@ -28,7 +28,7 @@ Cargo workspace 已在 M0-T02 建立；build 检查（`scripts/product/build.sh`
 
 ## 后台运行
 
-正式host与TUI分进程，通过Unix socket和锁文件发现。TUI关闭/SSH断开只是detach。systemd --user负责host异常重启，Restart=on-failure +有界StartLimit；ExecStart只用已安装受支持隐藏daemon入口。用户logout后持续运行需linger，脚本只在明确启用时配置（本开发 VM 已由 `scripts/dev/test-infra.sh` 经项目所有者授权启用）。
+正式host与TUI分进程，通过Unix socket和锁文件发现。TUI关闭/SSH断开只是detach。systemd --user负责host异常重启，Restart=on-failure +有界StartLimit；ExecStart只用已安装受支持隐藏daemon入口。unit 带 `Delegate=yes`：host 在受委托的 cgroup 中运行，每个 Attempt 以其专属子 cgroup 证明终结（CR-011）。客户端直接拉起 host 时，只在用户级 systemd 管理器可达且已开启 linger 时经 `systemd-run --user --scope -p Delegate=yes` 拉起；否则直接拉起，Attempt 的跟踪降级为 /proc 尽力方式并被记录，由 `hoh doctor` 报告（ADR-021 决定 2、8d）。用户logout后持续运行需linger，脚本只在明确启用时配置（本开发 VM 已由 `scripts/dev/test-infra.sh` 经项目所有者授权启用）。
 
 自举开发可选 `scripts/start.sh codex --headless`，只是一个原生Agent调用，不宣称它本身拥有完整HoH持续恢复。原生Agent达到限制退出后记录checkpoint；使用RESUME_PROMPT继续，不用无限“继续”循环掩盖退出。
 

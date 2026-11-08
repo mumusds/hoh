@@ -33,7 +33,23 @@ fn config(project: &Path) -> HostConfig {
     config.port = 0;
     config.store.wal_probe = Some(probe());
     config.jitter_seed = Some(0x0043_0001);
+    // The /proc mode's tests stay in it whatever cgroup they run in; the cgroup mode's run in a delegated scope
+    // (M2T06R-452).
+    if std::env::var_os(IN_SCOPE).is_none() {
+        config.hooks = Arc::new(ProcOnly);
+    }
     config
+}
+
+/// A host that does not use a delegated cgroup even if it is in one (CR-006: a test's hook): its attempts are tracked by
+/// the /proc scan.
+#[derive(Debug)]
+struct ProcOnly;
+
+impl hoh_app::host::HostHooks for ProcOnly {
+    fn cgroups_allowed(&self) -> bool {
+        false
+    }
 }
 
 /// Start a host in a project another host of this process just let go. A process that spawns children (a parallel
@@ -776,6 +792,10 @@ struct UnreadableProc(PathBuf);
 impl hoh_app::host::HostHooks for UnreadableProc {
     fn proc_root(&self) -> Option<PathBuf> {
         Some(self.0.clone())
+    }
+
+    fn cgroups_allowed(&self) -> bool {
+        false
     }
 }
 
@@ -1621,23 +1641,6 @@ async fn cgroup_start_reconcile_inside() -> R {
     Ok(())
 }
 
-/// Whether this process's own cgroup is delegated to it (a cgroup can be made below it), as a host decides.
-fn own_cgroup_delegated() -> bool {
-    let Some(path) = std::fs::read_to_string("/proc/self/cgroup")
-        .ok()
-        .and_then(|t| {
-            t.lines()
-                .find_map(|l| l.strip_prefix("0::").map(str::to_owned))
-        })
-    else {
-        return false;
-    };
-    let probe = Path::new("/sys/fs/cgroup")
-        .join(path.trim().trim_start_matches('/'))
-        .join(format!("hoh-test-probe-{}", std::process::id()));
-    std::fs::create_dir(&probe).is_ok() && std::fs::remove_dir(&probe).is_ok()
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn each_attempt_records_how_its_processes_are_tracked_and_why_it_is_degraded() -> R {
     // CR-011 (decision 8d v5): an attempt records its tracking before its gate opens; outside a delegated cgroup (this
@@ -1653,20 +1656,16 @@ async fn each_attempt_records_how_its_processes_are_tracked_and_why_it_is_degrad
         Duration::from_secs(10),
     )
     .await?;
-    let (mode, cgroup) = tracking(&project)?;
-    if own_cgroup_delegated() {
-        assert_eq!(mode, "cgroup");
-        assert!(Path::new(&cgroup).exists(), "{cgroup}");
-    } else {
-        assert_eq!(mode, "proc");
-        assert_eq!(
-            query(
-                &project,
-                "SELECT json_extract(payload_json, '$.reason') FROM events WHERE kind = 'attempt.tracking'"
-            )?,
-            "the host has no delegated cgroup"
-        );
-    }
+    // Outside a delegated scope, or kept out of its cgroup (M2T06R-452): the degraded proc scan, with why.
+    let (mode, _) = tracking(&project)?;
+    assert_eq!(mode, "proc");
+    assert_eq!(
+        query(
+            &project,
+            "SELECT json_extract(payload_json, '$.reason') FROM events WHERE kind = 'attempt.tracking'"
+        )?,
+        "the host has no delegated cgroup"
+    );
     host.shutdown().await;
     Ok(())
 }
@@ -1808,7 +1807,7 @@ async fn cgroup_moved_out_runner_end_inside() -> R {
 /// Starts each task's script as the leader of its own process group and, when the leader ends, reaps it without
 /// emptying its group: a member it left behind keeps the group without its leader.
 #[derive(Debug)]
-struct LeavesItsGroup(Arc<Mutex<Vec<u32>>>);
+struct LeavesItsGroup(Arc<Mutex<Vec<u32>>>, &'static str);
 
 impl hoh_app::host::Executor for LeavesItsGroup {
     fn deliver(
@@ -1825,7 +1824,10 @@ impl hoh_app::host::Executor for LeavesItsGroup {
         let mut child = Command::new("sh")
             .args([
                 "-c",
-                "read -r go; [ \"$go\" = go ] || exit 0; sleep 60 & exit 0",
+                &format!(
+                    "read -r go; [ \"$go\" = go ] || exit 0; {} & exit 0",
+                    self.1
+                ),
             ])
             .process_group(0)
             .env(hoh_app::host::ATTEMPT_ENV, work.marker())
@@ -1883,7 +1885,7 @@ async fn cgroup_leaderless_cancel_inside() -> R {
     seed(&project, WORLD)?;
     let mut config = config(&project);
     config.runner = Some(hoh_app::host::RunnerConfig {
-        executor: Arc::new(LeavesItsGroup(leaders.clone())),
+        executor: Arc::new(LeavesItsGroup(leaders.clone(), "sleep 60")),
         context: context(),
     });
     let host = start_when_free(config).await?;
@@ -1917,6 +1919,117 @@ async fn cgroup_leaderless_cancel_inside() -> R {
     )
     .await?;
     assert!(!group_lives(), "the group's member lives on");
+    host.shutdown().await;
+    Ok(())
+}
+
+#[test]
+fn in_a_delegated_cgroup_a_host_told_not_to_use_it_tracks_by_the_proc_scan() -> R {
+    in_delegated_scope("cgroup_refused_inside")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs inside a delegated scope, started by in_a_delegated_cgroup_a_host_told_not_to_use_it_tracks_by_the_proc_scan"]
+async fn cgroup_refused_inside() -> R {
+    // M2T06R-452: in a delegated scope, a host whose hooks refuse cgroups (the proc mode's tests) records the proc scan.
+    if std::env::var_os(IN_SCOPE).is_none() {
+        return Ok(());
+    }
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let agents = Arc::new(Agents::new(&[("T1", "sleep 60")]));
+    let _leaders = Leaders(agents.leaders.clone());
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    Host::start(config(&project)).await?.shutdown().await;
+    seed(&project, WORLD)?;
+    let mut config = config(&project);
+    config.hooks = Arc::new(ProcOnly);
+    config.runner = Some(hoh_app::host::RunnerConfig {
+        executor: agents.clone(),
+        context: context(),
+    });
+    let host = start_when_free(config).await?;
+    until(
+        &project,
+        "SELECT state FROM attempts WHERE task_id = 'T1'",
+        "RUNNING",
+        Duration::from_secs(10),
+    )
+    .await?;
+    assert_eq!(tracking(&project)?.0, "proc");
+    host.shutdown().await;
+    Ok(())
+}
+
+#[test]
+fn in_a_delegated_cgroup_a_group_left_without_its_leader_and_out_of_the_cgroup_keeps_the_run_cancelling()
+-> R {
+    in_delegated_scope("cgroup_leaderless_outside_inside")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs inside a delegated scope, started by in_a_delegated_cgroup_a_group_left_without_its_leader_and_out_of_the_cgroup_keeps_the_run_cancelling"]
+async fn cgroup_leaderless_outside_inside() -> R {
+    // M2T06R-401 (decision 8d v6): the leader is reaped and its member moved itself out of the attempt's cgroup with an
+    // emptied environment, staying in the leader's group. The cgroup is empty and the marker scan finds nothing, but the
+    // group without its leader still lives and may not be signalled: the run stays cancelling.
+    if std::env::var_os(IN_SCOPE).is_none() {
+        return Ok(());
+    }
+    let base = own_cgroup()?;
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let leaders = Arc::new(Mutex::new(Vec::new()));
+    let _leaders = Leaders(leaders.clone());
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    Host::start(config(&project)).await?.shutdown().await;
+    seed(&project, WORLD)?;
+    let member: &'static str = Box::leak(
+        format!(
+            "sh -c 'echo $$ > {}/cgroup.procs && exec env -i /bin/sleep 60'",
+            base.display()
+        )
+        .into_boxed_str(),
+    );
+    let mut config = config(&project);
+    config.runner = Some(hoh_app::host::RunnerConfig {
+        executor: Arc::new(LeavesItsGroup(leaders.clone(), member)),
+        context: context(),
+    });
+    let host = start_when_free(config).await?;
+    until(
+        &project,
+        "SELECT count(*) FROM events WHERE kind = 'runner.unreaped'",
+        "1",
+        Duration::from_secs(20),
+    )
+    .await?;
+    let leader: u32 = query(&project, "SELECT pid FROM attempts WHERE task_id = 'T1'")?.parse()?;
+    let group = i32::try_from(leader)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+        .ok_or("no group")?;
+    assert!(
+        rustix::process::test_kill_process_group(group).is_ok(),
+        "the precondition: a group without its leader"
+    );
+    let (status, _) = command(&host, &control(&project, "CancelRun", "cancel")?).await?;
+    assert_eq!(status, 202);
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let state = query(&project, "SELECT state FROM runs WHERE run_id = 'R'")?;
+    // Stop the member by hand (the test's own), then let the cancel finish.
+    let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+    assert_eq!(
+        state, "CANCEL_REQUESTED",
+        "cancelled while its leaderless group lived"
+    );
+    until(
+        &project,
+        "SELECT state FROM runs WHERE run_id = 'R'",
+        "CANCELLED",
+        Duration::from_secs(30),
+    )
+    .await?;
     host.shutdown().await;
     Ok(())
 }

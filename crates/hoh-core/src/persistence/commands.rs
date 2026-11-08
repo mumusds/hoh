@@ -451,7 +451,6 @@ pub(super) fn list_runs(
     read
 }
 
-/// At most `limit` events with seq above `after`, in seq order.
 /// The payload of the latest event of `kind` about attempt `attempt_id` (its payload's `attempt_id`), if any.
 pub(super) fn attempt_event(
     conn: &Connection,
@@ -473,6 +472,7 @@ pub(super) fn attempt_event(
     .transpose()
 }
 
+/// At most `limit` events with seq above `after`, in seq order.
 pub(super) fn events_after(
     conn: &Connection,
     after: i64,

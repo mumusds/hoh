@@ -525,7 +525,7 @@ async fn attempt(
         return Ok(());
     }
     // Its group is empty: its processes outside the group are stopped too, and it ends, its slot with it, only with the
-    // termination proof (docs/adr/ADR-021.md decision 8d v3, M2T06R-100); else it stays RUNNING like an unreaped group.
+    // termination proof (docs/adr/ADR-021.md decision 8d, M2T06R-100); else it stays RUNNING like an unreaped group.
     let marker = work.marker();
     let (term, kill) = (common.settings.term_grace, common.settings.kill_grace);
     let root = common.shared.hooks.proc_root();

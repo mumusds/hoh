@@ -585,6 +585,198 @@ async fn doctor_reports_how_the_running_host_tracks_attempts_not_what_a_start_wo
     Ok(())
 }
 
+/// Whether a host the client starts here can run in a delegated scope (decision 2): the user's systemd manager answers,
+/// the user lingers and `systemd-run` is on PATH.
+fn scope_available() -> bool {
+    let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") else {
+        return false;
+    };
+    let user = std::env::var("USER").unwrap_or_default();
+    Path::new(&runtime).join("systemd/private").exists()
+        && Path::new("/var/lib/systemd/linger").join(&user).exists()
+        && std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .any(|d| d.join("systemd-run").is_file())
+}
+
+/// `env`'s `hoh` with the user's systemd manager reachable (XDG_RUNTIME_DIR, USER), PATH as given.
+fn with_manager(env: &Env, args: &[&str], path: &std::ffi::OsStr) -> Command {
+    let mut command = env.command(args);
+    for name in ["XDG_RUNTIME_DIR", "USER"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    command.env("PATH", path);
+    command
+}
+
+#[test]
+fn a_host_the_client_starts_runs_in_a_delegated_scope_when_it_can_and_records_it() -> R {
+    // M2T06R-454 (docs/adr/ADR-021.md decision 2, CR-011): `hoh -p --detach` starts the host through systemd-run when
+    // the user's manager answers and the user lingers; the host is then in a scope of its own, delegated, and records
+    // cgroup tracking. Where that cannot be had it is started directly and records the proc scan.
+    let env = Env::new()?;
+    let _daemons = Daemons(env.project());
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let out = finish(
+        with_manager(&env, &["-p", "x", "--detach", "--output", "json"], &path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?,
+        LIMIT,
+    )?;
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let record: Value = serde_json::from_str(&std::fs::read_to_string(
+        env.project().join(".hoh/host.json"),
+    )?)?;
+    let pid = record["pid"].as_u64().ok_or("no pid")?;
+    let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))?;
+    if scope_available() {
+        assert_eq!(record["process_tracking"], "cgroup", "{record}");
+        assert!(
+            cgroup.contains("/run-") && cgroup.trim_end().ends_with(".scope"),
+            "{cgroup}"
+        );
+    } else {
+        assert_eq!(record["process_tracking"], "proc", "{record}");
+    }
+    Ok(())
+}
+
+#[test]
+fn a_host_whose_scope_is_refused_is_started_directly_and_records_the_proc_scan() -> R {
+    // M2T06R-454 (decision 2): systemd-run fails (here a stand-in that knows only --version); the client starts the
+    // host directly, which records the degraded tracking; the detach still succeeds.
+    let env = Env::new()?;
+    let _daemons = Daemons(env.project());
+    let bin = env.dir.path().join("bin");
+    std::fs::create_dir_all(&bin)?;
+    let fake = bin.join("systemd-run");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\n[ \"$1\" = --version ] && echo 'systemd 259 (stand-in)' && exit 0\nexit 1\n",
+    )?;
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))?;
+    }
+    let path = std::env::join_paths(std::iter::once(bin.clone()).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))?;
+    let out = finish(
+        with_manager(&env, &["-p", "x", "--detach", "--output", "json"], &path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?,
+        LIMIT,
+    )?;
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let record: Value = serde_json::from_str(&std::fs::read_to_string(
+        env.project().join(".hoh/host.json"),
+    )?)?;
+    assert_eq!(record["process_tracking"], "proc", "{record}");
+    Ok(())
+}
+
+#[test]
+fn a_host_is_not_started_in_the_users_manager_when_the_user_does_not_linger() -> R {
+    // M2T06R-453 (decision 2): without linger the user's manager, and a host in one of its scopes, would stop after the
+    // last session. Here a user name with no linger record: the host is started directly and records the proc scan;
+    // doctor says why.
+    let env = Env::new()?;
+    let _daemons = Daemons(env.project());
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut command = with_manager(&env, &["-p", "x", "--detach", "--output", "json"], &path);
+    command.env("USER", "hoh-test-no-such-user");
+    let out = finish(
+        command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?,
+        LIMIT,
+    )?;
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let record: Value = serde_json::from_str(&std::fs::read_to_string(
+        env.project().join(".hoh/host.json"),
+    )?)?;
+    assert_eq!(record["process_tracking"], "proc", "{record}");
+    drop(_daemons);
+    let mut doctor = with_manager(&env, &["doctor", "--output", "json"], &path);
+    doctor.env("USER", "hoh-test-no-such-user");
+    let out = finish(
+        doctor
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?,
+        Duration::from_secs(60),
+    )?;
+    let report: Value = serde_json::from_slice(&out.stdout)?;
+    let said = report["summary"]["warnings"].as_array().is_some_and(|w| {
+        w.iter()
+            .any(|w| w.as_str().is_some_and(|w| w.contains("does not linger")))
+    });
+    assert!(said, "{}", report["summary"]);
+    Ok(())
+}
+
+#[test]
+fn doctor_without_a_host_reports_what_a_start_would_have_and_warns_when_it_would_degrade() -> R {
+    // M2T06R-454 (CR-011): no host runs. Without the user's manager the next host would be degraded: proc, with a
+    // warning; with it (and lingering), cgroup is expected but not verified.
+    let env = Env::new()?;
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let doctor = |command: &mut Command| -> R<Value> {
+        let out = finish(
+            command
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?,
+            Duration::from_secs(60),
+        )?;
+        Ok(serde_json::from_slice(&out.stdout)?)
+    };
+    let mut bare = env.command(&["doctor", "--output", "json"]);
+    let report = doctor(&mut bare)?;
+    assert_eq!(
+        report["runtime"]["host"]["process_tracking"], "proc",
+        "{}",
+        report["runtime"]["host"]
+    );
+    let warned = report["summary"]["warnings"].as_array().is_some_and(|w| {
+        w.iter()
+            .any(|w| w.as_str().is_some_and(|w| w.contains("tracking: proc")))
+    });
+    assert!(warned, "{}", report["summary"]);
+    if scope_available() {
+        let report = doctor(&mut with_manager(
+            &env,
+            &["doctor", "--output", "json"],
+            &path,
+        ))?;
+        assert_eq!(
+            report["runtime"]["host"]["process_tracking"], "unverified",
+            "{}",
+            report["runtime"]["host"]
+        );
+    }
+    Ok(())
+}
+
 /// A StartRun's commit that fails (CR-006 F3: the test's fault hook; the product's does nothing).
 #[derive(Debug)]
 struct FullDisk;
