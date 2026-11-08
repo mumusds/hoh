@@ -311,7 +311,7 @@ type Pins = Arc<Mutex<BTreeMap<String, Arc<Mutex<Outside>>>>>;
 enum Watch {
     /// Found by its leader's identity: its own look, and it gets the ladder's signals.
     Found(identity::Found),
-    /// The identity's finding proves it gone (no pid recorded and never running, the leader gone and the group empty,
+    /// The identity's finding proves it gone (no pid recorded and never running, the leader gone and its number free,
     /// another boot, a reused pid).
     Gone,
     /// Not to be signalled (its leader gone, not inspected or not confirmed): empty only when the kernel says no process
@@ -844,7 +844,8 @@ mod tests {
             })
             .ok_or("no group of another user to look at")?;
         assert!(group_lives(other), "group {other}");
-        // Each half on its own (M2T06R-850): its group refuses the signal (EPERM) and its pid is a process's.
+        // The group half on its own (M2T06R-850): its group refuses the signal (EPERM), so the number is in use (the
+        // pid half is pinned by identity's a_number_used_only_as_another_users_pid_is_not_free, M2T06R-951).
         assert!(!identity::group_empty(other), "group {other}");
         assert!(!identity::number_free(other), "number {other}");
         Ok(())
