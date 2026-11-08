@@ -14,6 +14,7 @@
 //! effect is looked for, never done again. The product has no executor yet (agents are bound to roles with M2-T07),
 //! so the product host runs no runner.
 
+use super::processes::{Outside, Proof};
 use super::{HostHooks, ReconcileSettings, http::Shared, reconcile};
 use hoh_agents::identity;
 use hoh_core::decision::Context;
@@ -505,6 +506,45 @@ async fn attempt(
             .await?;
         return Ok(());
     }
+    // Its group is empty: its processes outside the group are stopped too, and it ends, its slot with it, only with the
+    // termination proof (docs/adr/ADR-021.md decision 8d v3, M2T06R-100); else it stays RUNNING like an unreaped group.
+    let marker = work.marker();
+    let (term, kill) = (common.settings.term_grace, common.settings.kill_grace);
+    let (steps, proof) =
+        tokio::task::spawn_blocking(move || Outside::new(&marker).stop(term, kill))
+            .await
+            .map_err(|e| {
+                PersistError::Storage(format!("the stop outside the group of {id} ended: {e}"))
+            })?;
+    if !steps.is_empty() || proof != Proof::Done {
+        let (name, detail) = if proof == Proof::Done {
+            (
+                "runner/outside",
+                "processes of it outside its group were stopped",
+            )
+        } else {
+            (
+                "runner/unreaped",
+                "its group was emptied but processes of it outside the group live on or could not be read; the \
+                 attempt and its slot stay",
+            )
+        };
+        store
+            .commit(Commit {
+                events: vec![NewEvent {
+                    project_id: common.shared.project_id.clone(),
+                    event_id: hoh_core::ids::child_id(&id, name),
+                    run_id: Some(work.run_id.clone()),
+                    kind: name.replace('/', "."),
+                    payload: json!({"attempt_id": id, "steps": steps, "detail": detail}),
+                }],
+                ..Commit::default()
+            })
+            .await?;
+        if proof != Proof::Done {
+            return Ok(());
+        }
+    }
     if !store
         .runner_effect(
             &id,
@@ -605,7 +645,7 @@ async fn settle(
             found,
             finding,
             work.is_some(),
-            reconcile::end(seen, &settings),
+            reconcile::end(seen, &scanned, &settings),
         ))
     })
     .await

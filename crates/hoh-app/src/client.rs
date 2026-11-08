@@ -470,11 +470,11 @@ impl Events {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use hoh_core::persistence::selftest::ProbeCommand;
 
-    type R<T = ()> = Result<T, Box<dyn std::error::Error>>;
+    pub(crate) type R<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
     /// Set for the probe process of the hosts these tests start.
     const PROBE_ENV: &str = "HOH_CLIENT_TESTS_PROBE";
@@ -488,7 +488,8 @@ mod tests {
         }
     }
 
-    fn config(project: &Path) -> R<hoh_app::host::HostConfig> {
+    /// An in-process host's configuration for `project` (the WAL probe is this test binary's helper).
+    pub(crate) fn config(project: &Path) -> R<hoh_app::host::HostConfig> {
         let mut config = hoh_app::host::HostConfig::new(project);
         config.port = 0;
         config.store.wal_probe = Some(ProbeCommand {

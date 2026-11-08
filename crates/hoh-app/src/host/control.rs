@@ -4,6 +4,7 @@
 //! nothing of it runs records the workspace and cancels it. Neither touches the Commander (REQ-043 behaviour 7).
 
 use super::http::Shared;
+use super::processes::{Outside, Proof};
 use super::runner::{Entry, Executor, Work};
 use hoh_agents::identity::{self, Presence};
 use hoh_core::cancel::{Canceller, GRACES, Look, ProcessControl, Processes, Signal};
@@ -195,29 +196,38 @@ impl Processes for HostProcesses {
             _ => None,
         };
         let has_native = native.is_some();
-        let control = |group: Option<identity::Found>, leader: Option<u32>| AttemptControl {
-            group,
-            leader,
-            native: native.clone(),
-            attempt_id: attempt.attempt_id.clone(),
-            marker: format!(
-                "{ATTEMPT_ENV}={}",
-                super::runner::marker(&self.project_id, &attempt.attempt_id)
-            )
-            .into_bytes(),
-            pins: self.pins.clone(),
-            scanned: None,
-            sent: None,
-            quiet: 0,
+        let outside = {
+            let Ok(mut pins) = self.pins.lock() else {
+                return Some((Box::new(Fixed(Look::Lost)), false));
+            };
+            pins.entry(attempt.attempt_id.clone())
+                .or_insert_with(|| {
+                    Arc::new(Mutex::new(Outside::new(&super::runner::marker(
+                        &self.project_id,
+                        &attempt.attempt_id,
+                    ))))
+                })
+                .clone()
+        };
+        let control = |group: Option<identity::Found>, leader: bool| {
+            if let Ok(mut outside) = outside.lock() {
+                if leader {
+                    outside.set_leader(attempt.pid, attempt.process_start_id.as_deref());
+                } else {
+                    outside.set_leader(None, None);
+                }
+            }
+            AttemptControl {
+                group,
+                native: native.clone(),
+                outside: outside.clone(),
+            }
         };
         Some(match presence {
-            Ok(Presence::Ours(found)) => {
-                let leader = attempt.pid.and_then(|pid| u32::try_from(pid).ok());
-                (Box::new(control(Some(found), leader)), has_native)
-            }
+            Ok(Presence::Ours(found)) => (Box::new(control(Some(found), true)), has_native),
             // Its group is gone (or no process was recorded: held at its start gate, which closed when its task
             // stopped); what of it left the group is still looked for.
-            Ok(Presence::Gone(_)) => (Box::new(control(None, None)), false),
+            Ok(Presence::Gone(_)) => (Box::new(control(None, false)), false),
             // It cannot be told apart: no signal may go (ADR-019 decision 8); it stays cancelling.
             _ => (Box::new(Fixed(Look::Lost)), false),
         })
@@ -228,98 +238,15 @@ impl Processes for HostProcesses {
     }
 }
 
-/// The environment variable an executor starts an attempt's leader with, its value [`Work::marker`] (the project's id
-/// and the attempt's). Every descendant inherits it, so a cancel finds the attempt's processes wherever they went: another group, another session, another
-/// parent (docs/adr/ADR-021.md decision 8d).
-pub const ATTEMPT_ENV: &str = "HOH_ATTEMPT_ID";
+/// The processes outside each attempt's group of a cancel, kept for the whole cancel, across its passes.
+type Pins = Arc<Mutex<BTreeMap<String, Arc<Mutex<Outside>>>>>;
 
-/// How often a pass looks for the attempt's processes outside its group while the group lives.
-const RESCAN: Duration = Duration::from_millis(100);
-
-/// The processes of each attempt of a cancel found outside its group, pinned: kept for the whole cancel, across its
-/// passes.
-type Pins = Arc<Mutex<BTreeMap<String, Vec<Pinned>>>>;
-
-/// An attempt's group found by its identity (or gone), and its processes found outside it (decision 8d): a group
-/// signal misses a descendant that left the group (setsid, setpgid), so each is pinned by a pidfd, its start time
-/// checked after the open (a reused pid is never taken), and signalled through it. They are found by the /proc parent
-/// chain from the leader and from every pinned one (REQ-043 decision 3), and by the attempt's [`ATTEMPT_ENV`] in their
-/// environment, whatever their parent now is (an orphan too). The group counts as empty only once no pinned one lives
-/// and two scans in a row found no other.
+/// An attempt's group found by its identity (or gone) and its processes outside it (decision 8d): the group counts as
+/// empty only with the termination proof (no pinned one alive, two complete scans in a row that found none).
 struct AttemptControl {
     group: Option<identity::Found>,
-    leader: Option<u32>,
     native: Option<(Arc<dyn Executor>, Work)>,
-    attempt_id: String,
-    /// `ATTEMPT_ENV=<marker>` as it appears in an environment.
-    marker: Vec<u8>,
-    pins: Pins,
-    /// When this pass last looked for them.
-    scanned: Option<Instant>,
-    /// The strongest signal this pass sent: a process found later gets it at once.
-    sent: Option<rustix::process::Signal>,
-    /// Scans in a row that found nothing alive with the group empty.
-    quiet: u8,
-}
-
-impl AttemptControl {
-    /// Look for the attempt's processes outside its group, pin the new ones and send them this pass's strongest
-    /// signal so far; whether any pinned one lives.
-    fn scan(&mut self) -> bool {
-        self.scanned = Some(Instant::now());
-        let Ok(mut pins) = self.pins.lock() else {
-            return true;
-        };
-        let pinned = pins.entry(self.attempt_id.clone()).or_default();
-        let processes = processes();
-        let mut found: BTreeSet<u32> = BTreeSet::new();
-        let mut parents: Vec<u32> = self
-            .leader
-            .into_iter()
-            .chain(pinned.iter().filter(|p| p.alive()).map(|p| p.pid))
-            .collect();
-        while let Some(parent) = parents.pop() {
-            for process in processes.iter().filter(|p| p.ppid == parent) {
-                if found.insert(process.pid) {
-                    parents.push(process.pid);
-                }
-            }
-        }
-        let marked: Vec<u32> = processes
-            .iter()
-            .filter(|p| !found.contains(&p.pid) && marked(p.pid, &self.marker))
-            .map(|p| p.pid)
-            .collect();
-        found.extend(marked);
-        for process in processes.iter().filter(|p| found.contains(&p.pid)) {
-            if Some(process.pid) == self.leader
-                || pinned
-                    .iter()
-                    .any(|q| q.pid == process.pid && q.start == process.start)
-            {
-                continue;
-            }
-            if let Some(pin) = Pinned::open(process.pid, process.start) {
-                if let Some(signal) = self.sent {
-                    let _ = rustix::process::pidfd_send_signal(&pin.pidfd, signal);
-                }
-                pinned.push(pin);
-            }
-        }
-        pinned.retain(Pinned::alive);
-        !pinned.is_empty()
-    }
-
-    fn to_pinned(&self, signal: rustix::process::Signal) -> bool {
-        self.pins.lock().is_ok_and(|pins| {
-            pins.get(&self.attempt_id)
-                .into_iter()
-                .flatten()
-                .filter(|p| p.alive())
-                .map(|p| rustix::process::pidfd_send_signal(&p.pidfd, signal).is_ok())
-                .fold(false, |a, b| a | b)
-        })
-    }
+    outside: Arc<Mutex<Outside>>,
 }
 
 impl ProcessControl for AttemptControl {
@@ -329,25 +256,16 @@ impl ProcessControl for AttemptControl {
             Some(identity::Group::Lost) => return Look::Lost,
             Some(identity::Group::Empty) | None => Look::Empty,
         };
-        let due = group == Look::Empty || self.scanned.is_none_or(|at| at.elapsed() >= RESCAN);
-        let living = if due {
-            self.scan()
-        } else {
-            self.pins.lock().map_or(true, |pins| {
-                pins.get(&self.attempt_id)
-                    .is_some_and(|p| p.iter().any(Pinned::alive))
-            })
+        let Ok(mut outside) = self.outside.lock() else {
+            return Look::Held;
         };
-        if group == Look::Held || living {
-            self.quiet = 0;
+        if group == Look::Held {
+            let _ = outside.keep_up();
             return Look::Held;
         }
-        // Two scans in a row (a look apart) found nothing: one just forked may not show its environment yet.
-        self.quiet += 1;
-        if self.quiet >= 2 {
-            Look::Empty
-        } else {
-            Look::Held
+        match outside.scan() {
+            Proof::Done => Look::Empty,
+            Proof::Pending | Proof::Incomplete => Look::Held,
         }
     }
 
@@ -371,80 +289,9 @@ impl ProcessControl for AttemptControl {
                 self.group.as_ref().is_some_and(identity::Found::kill),
             ),
         };
-        if self.sent != Some(rustix::process::Signal::KILL) {
-            self.sent = Some(sig);
-        }
-        self.to_pinned(sig) || group
+        let outside = self.outside.lock().is_ok_and(|mut o| o.signal(sig));
+        outside || group
     }
-}
-
-/// A process of an attempt outside its group, pinned by a pidfd.
-struct Pinned {
-    pid: u32,
-    start: u64,
-    pidfd: rustix::fd::OwnedFd,
-}
-
-impl Pinned {
-    /// `pid` pinned if it is still the process that started at `start` once its pidfd is open.
-    fn open(pid: u32, start: u64) -> Option<Pinned> {
-        let raw = i32::try_from(pid)
-            .ok()
-            .and_then(rustix::process::Pid::from_raw)?;
-        let pidfd = rustix::process::pidfd_open(raw, rustix::process::PidfdFlags::empty()).ok()?;
-        stat(pid)
-            .is_some_and(|s| s.start == start)
-            .then_some(Pinned { pid, start, pidfd })
-    }
-
-    /// Whether it has not exited (its pidfd is not readable yet).
-    fn alive(&self) -> bool {
-        let mut fds = [rustix::event::PollFd::new(
-            &self.pidfd,
-            rustix::event::PollFlags::IN,
-        )];
-        let none = rustix::event::Timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        !matches!(rustix::event::poll(&mut fds, Some(&none)), Ok(n) if n > 0)
-    }
-}
-
-/// A process as `/proc/<pid>/stat` shows it: its parent and its start time (fields 4 and 22).
-struct Proc {
-    pid: u32,
-    ppid: u32,
-    start: u64,
-}
-
-fn stat(pid: u32) -> Option<Proc> {
-    let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let fields: Vec<&str> = text.rsplit_once(") ")?.1.split(' ').collect();
-    Some(Proc {
-        pid,
-        ppid: fields.get(1)?.parse().ok()?,
-        start: fields.get(19)?.parse().ok()?,
-    })
-}
-
-/// Every process /proc shows.
-fn processes() -> Vec<Proc> {
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return Vec::new();
-    };
-    entries
-        .filter_map(Result::ok)
-        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
-        .filter_map(stat)
-        .collect()
-}
-
-/// Whether `pid`'s environment has `marker` (`NAME=value`) as one of its entries; a process of another user cannot be
-/// read and has not.
-fn marked(pid: u32, marker: &[u8]) -> bool {
-    std::fs::read(format!("/proc/{pid}/environ"))
-        .is_ok_and(|env| env.split(|b| *b == 0).any(|entry| entry == marker))
 }
 
 /// A group whose look is known without looking: gone, or lost track of.
@@ -518,8 +365,15 @@ fn hex(bytes: &[u8]) -> String {
 /// One untracked path's part of the workspace record, read without following a link and without waiting on anything
 /// that is not a regular file (M2T06R-06): a regular file is its content's hash, a symbolic link its target's, anything
 /// else (a FIFO, a socket, a device, a directory) its type, never opened. The file is opened without following a link
-/// and without blocking, and read only if it is still a regular file then.
-fn untracked_entry(path: &Path) -> String {
+/// and without blocking, and read only if it is still a regular file then. A file not read to its end by `deadline` is
+/// its size and modification time instead (M2T06R-102); the flag says whether its content was hashed.
+fn untracked_entry(path: &Path, deadline: Instant) -> (String, bool) {
+    let entry = untracked_content(path, deadline);
+    let hashed = !entry.starts_with("unhashed:");
+    (entry, hashed)
+}
+
+fn untracked_content(path: &Path, deadline: Instant) -> String {
     use rustix::fs::{FileType, Mode, OFlags};
     use std::io::Read as _;
     let kind = |t: FileType| match t {
@@ -556,10 +410,22 @@ fn untracked_entry(path: &Path) -> String {
         Ok(stat) => return format!("type:{}", kind(FileType::from_raw_mode(stat.st_mode))),
         Err(e) => return format!("unreadable: {e}"),
     }
+    let unhashed = |stat: &rustix::fs::Stat| {
+        format!(
+            "unhashed:{}:{}.{}",
+            stat.st_size, stat.st_mtime, stat.st_mtime_nsec
+        )
+    };
+    let Ok(meta) = rustix::fs::fstat(&fd) else {
+        return "unreadable: fstat".to_owned();
+    };
     let mut file = std::fs::File::from(fd);
     let mut content = Sha256::new();
     let mut buffer = vec![0u8; 64 * 1024];
     loop {
+        if Instant::now() >= deadline {
+            return unhashed(&meta);
+        }
         match file.read(&mut buffer) {
             Ok(0) => break,
             Ok(n) => content.update(&buffer[..n]),
@@ -577,8 +443,17 @@ fn untracked_entry(path: &Path) -> String {
 /// The workspace's record before CANCELLED (REQ-043 behaviour 4, ADR-021 decision 8g): HEAD and its tree, and the
 /// hashes of the diff against HEAD, of the untracked files' names and contents and of the status, and of all of
 /// them; read-only, nothing reset, cleaned or removed. A directory that is not a git work tree, or a git that fails,
-/// is recorded as such.
+/// is recorded as such. The untracked files' contents are hashed within [`UNTRACKED_BUDGET`]: the ones left are
+/// recorded by size and modification time, and `untracked_unhashed` counts them.
 pub(super) fn workspace(project: &Path) -> Value {
+    workspace_within(project, UNTRACKED_BUDGET)
+}
+
+/// How long the workspace record may spend on the untracked files' contents (a huge or sparse file must not hold the
+/// cancel back, M2T06R-102).
+const UNTRACKED_BUDGET: Duration = Duration::from_secs(5);
+
+fn workspace_within(project: &Path, budget: Duration) -> Value {
     let text = |out: Vec<u8>| String::from_utf8_lossy(&out).trim().to_owned();
     let head = git(project, &["rev-parse", "--verify", "HEAD"])
         .map(text)
@@ -597,11 +472,15 @@ pub(super) fn workspace(project: &Path) -> Value {
             &["ls-files", "-z", "--others", "--exclude-standard"],
         )?;
         let mut untracked = Sha256::new();
+        let deadline = Instant::now() + budget;
+        let mut unhashed = 0usize;
         for name in names.split(|b| *b == 0).filter(|n| !n.is_empty()) {
             untracked.update(name);
             untracked.update([0]);
             let path = project.join(std::ffi::OsStr::from_bytes(name));
-            untracked.update(untracked_entry(&path).as_bytes());
+            let (entry, hashed) = untracked_entry(&path, deadline);
+            unhashed += usize::from(!hashed);
+            untracked.update(entry.as_bytes());
             untracked.update([0]);
         }
         let untracked: String = untracked
@@ -622,6 +501,7 @@ pub(super) fn workspace(project: &Path) -> Value {
             "head_tree": head_tree,
             "diff_sha256": diff,
             "untracked_sha256": untracked,
+            "untracked_unhashed": unhashed,
             "status_sha256": status,
             "workspace_sha256": all,
         }))
@@ -658,6 +538,44 @@ mod tests {
         }
     }
 
+    /// A deadline no test reaches.
+    fn far() -> Instant {
+        Instant::now() + Duration::from_secs(3600)
+    }
+
+    #[test]
+    fn a_huge_untracked_file_is_recorded_by_its_size_once_the_budget_is_spent() -> R {
+        // M2T06R-102: a 4 GiB sparse untracked file and a small file; with a 300 ms budget the record is made within
+        // a few seconds (hashing it all takes far longer in a debug build), the huge file by its size and modification time, and the count says one was not hashed.
+        let dir = tempfile::tempdir()?;
+        let project = dir.path();
+        git_in(project, &["init", "-q"])?;
+        // Listed before the huge one (git lists by name), so hashed within the budget; any file after it is not.
+        std::fs::write(project.join("a-small.txt"), b"small")?;
+        std::fs::File::create(project.join("huge.bin"))?.set_len(4 << 30)?;
+        let started = Instant::now();
+        let record = workspace_within(project, Duration::from_millis(300));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(record.get("error").is_none(), "{record}");
+        assert_eq!(record["untracked_unhashed"], 1, "{record}");
+        let (entry, hashed) = untracked_entry(&project.join("huge.bin"), Instant::now());
+        assert!(!hashed);
+        assert!(
+            entry.starts_with(&format!("unhashed:{}:", 4u64 << 30)),
+            "{entry}"
+        );
+        std::fs::remove_file(project.join("huge.bin"))?;
+        assert_eq!(
+            workspace_within(project, Duration::from_secs(60))["untracked_unhashed"],
+            0
+        );
+        Ok(())
+    }
+
     #[test]
     fn the_workspace_record_never_waits_on_a_fifo_and_records_a_link_by_its_target() -> R {
         // M2T06R-06: an untracked FIFO with no writer, and an untracked link to it; before, the record opened the
@@ -674,8 +592,8 @@ mod tests {
             0,
         )?;
         std::os::unix::fs::symlink(project.join("pipe"), project.join("link"))?;
-        assert_eq!(untracked_entry(&project.join("pipe")), "type:fifo");
-        let to_pipe = untracked_entry(&project.join("link"));
+        assert_eq!(untracked_entry(&project.join("pipe"), far()).0, "type:fifo");
+        let to_pipe = untracked_entry(&project.join("link"), far()).0;
         assert_eq!(
             to_pipe,
             format!(
@@ -683,7 +601,10 @@ mod tests {
                 hex(project.join("pipe").as_os_str().as_bytes())
             )
         );
-        assert_eq!(untracked_entry(&project.join("plain.txt")), hex(b"content"));
+        assert_eq!(
+            untracked_entry(&project.join("plain.txt"), far()).0,
+            hex(b"content")
+        );
         let (sent, got) = std::sync::mpsc::channel();
         let at = project.to_owned();
         std::thread::spawn(move || {
@@ -695,7 +616,7 @@ mod tests {
         // A link to another target is another record.
         std::fs::remove_file(project.join("link"))?;
         std::os::unix::fs::symlink(project.join("plain.txt"), project.join("link"))?;
-        assert_ne!(untracked_entry(&project.join("link")), to_pipe);
+        assert_ne!(untracked_entry(&project.join("link"), far()).0, to_pipe);
         assert_ne!(
             workspace(project)["untracked_sha256"],
             record["untracked_sha256"]

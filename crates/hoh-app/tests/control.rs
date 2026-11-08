@@ -722,6 +722,10 @@ impl Drop for Marked {
 /// A writer that appends to `file` every 50 ms for 120 s by the clock (longer than any wait of these tests, so only a
 /// signal ends it in time) and starts no process of its own (a signal to a child must not hasten its end).
 fn writer(file: &Path) -> R<String> {
+    // The file exists before the writer: one stopped before its first write leaves it empty (M2T06R-150).
+    if !file.exists() {
+        std::fs::write(file, b"")?;
+    }
     let script = file.with_extension("py");
     std::fs::write(
         &script,
@@ -899,4 +903,222 @@ impl Drop for KillPidFile {
             let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
         }
     }
+}
+
+/// A clock the test moves ahead.
+#[derive(Debug, Default)]
+struct FakeClock(Mutex<Duration>);
+
+impl FakeClock {
+    fn advance(&self, by: Duration) {
+        if let Ok(mut ahead) = self.0.lock() {
+            *ahead += by;
+        }
+    }
+}
+
+impl hoh_core::delivery::Clock for FakeClock {
+    fn now(&self) -> std::time::SystemTime {
+        std::time::SystemTime::now() + self.0.lock().map(|d| *d).unwrap_or_default()
+    }
+}
+
+/// The marker of T1's attempt (its first) in `project`, as the product makes it.
+fn t1_marker(project: &Path) -> R<String> {
+    Ok(hoh_app::host::Work {
+        project_id: query(project, "SELECT project_id FROM projects")?,
+        run_id: "R".to_owned(),
+        task_id: "T1".to_owned(),
+        attempt_id: "T1/attempt-1".to_owned(),
+        role: "developer".to_owned(),
+        effect_key: String::new(),
+    }
+    .marker())
+}
+
+/// None of `marker`'s processes lives and `file` no longer grows.
+async fn nothing_of_it_left(marker: &str, file: &Path) -> R {
+    assert_eq!(
+        marked(marker),
+        Vec::<u32>::new(),
+        "a process of the attempt lives on"
+    );
+    let size = || std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
+    let before = size();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(size(), before, "the workspace is still written");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attempt_whose_agent_ended_settles_only_once_its_processes_outside_the_group_are_gone()
+-> R {
+    // M2T06R-100 (docs/adr/ADR-021.md decision 8d v3, path 2): T1's agent orphans a writer and exits 0; the executor
+    // empties its group. The runner stops the writer before it ends the attempt and gives up its slot.
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let file = dir.path().join("written.txt");
+    let script = format!("{}; sleep 0.3; exit 0", orphan_writer(&file)?);
+    let agents = Arc::new(Agents::new(&[("T1", script.as_str())]));
+    let _leaders = Leaders(agents.leaders.clone());
+    let (project, host) = host(dir.path(), &agents).await?;
+    let marker = t1_marker(&project)?;
+    let _marked = Marked(marker.clone());
+    until(
+        &project,
+        "SELECT state FROM attempts WHERE task_id = 'T1'",
+        "SETTLED",
+        Duration::from_secs(20),
+    )
+    .await?;
+    nothing_of_it_left(&marker, &file).await?;
+    assert_eq!(
+        query(
+            &project,
+            "SELECT json_extract(payload_json, '$.steps[0]') FROM events WHERE kind = 'runner.outside'"
+        )?,
+        "outside_sigterm"
+    );
+    host.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_expired_lease_is_given_up_only_once_its_holders_processes_outside_the_group_are_gone()
+-> R {
+    // M2T06R-100 (decision 8d v3, path 3): T1 holds the writer lease and its agent orphaned a writer; the clock moves
+    // past the lease. The settle stops the group and then the writer; T2 gets the lease only after.
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let file = dir.path().join("written.txt");
+    let script = format!("{}; while :; do sleep 0.1; done", orphan_writer(&file)?);
+    let agents = Arc::new(Agents::new(&[("T1", script.as_str())]));
+    let _leaders = Leaders(agents.leaders.clone());
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    Host::start(config(&project)).await?.shutdown().await;
+    seed(&project, WORLD)?;
+    let clock = Arc::new(FakeClock::default());
+    let mut config = config(&project);
+    config.clock = hoh_app::host::HostClock(clock.clone());
+    config.runner = Some(hoh_app::host::RunnerConfig {
+        executor: agents.clone(),
+        context: context(),
+    });
+    let host = Host::start(config).await?;
+    let marker = t1_marker(&project)?;
+    let _marked = Marked(marker.clone());
+    until(
+        &project,
+        "SELECT state FROM attempts WHERE task_id = 'T1'",
+        "RUNNING",
+        Duration::from_secs(10),
+    )
+    .await?;
+    clock.advance(Duration::from_secs(300));
+    until(
+        &project,
+        "SELECT count(*) FROM attempts WHERE task_id = 'T2'",
+        "1",
+        Duration::from_secs(40),
+    )
+    .await?;
+    nothing_of_it_left(&marker, &file).await?;
+    assert_eq!(
+        seq(
+            &project,
+            "SELECT count(*) FROM events WHERE kind = 'lease.outside_sigterm'"
+        )?,
+        1
+    );
+    host.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hosts_start_reconcile_ends_an_attempt_only_once_its_processes_outside_the_group_are_gone()
+-> R {
+    // M2T06R-100 (decision 8d v3, path 4): the host stops with T1 running and a writer its agent orphaned; the next
+    // host's start reconcile stops the group and the writer before it ends T1's attempt.
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let file = dir.path().join("written.txt");
+    let script = format!("{}; while :; do sleep 0.1; done", orphan_writer(&file)?);
+    let agents = Arc::new(Agents::new(&[("T1", script.as_str())]));
+    let _leaders = Leaders(agents.leaders.clone());
+    let (project, first) = host(dir.path(), &agents).await?;
+    let marker = t1_marker(&project)?;
+    let _marked = Marked(marker.clone());
+    until(
+        &project,
+        "SELECT state FROM attempts WHERE task_id = 'T1'",
+        "RUNNING",
+        Duration::from_secs(10),
+    )
+    .await?;
+    let end = Instant::now() + Duration::from_secs(10);
+    while marked(&marker).len() < 2 {
+        if Instant::now() > end {
+            return Err("the writer did not start".into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    first.shutdown().await;
+    assert!(
+        marked(&marker).len() >= 2,
+        "the leader and the writer outlive their host"
+    );
+    // The next host, with no executor: its start reconcile alone.
+    let reconciled = seq(
+        &project,
+        "SELECT count(*) FROM events WHERE kind = 'reconcile.completed'",
+    )?;
+    let second = Host::start(config(&project)).await?;
+    until(
+        &project,
+        "SELECT count(*) FROM events WHERE kind = 'reconcile.completed'",
+        &(reconciled + 1).to_string(),
+        Duration::from_secs(40),
+    )
+    .await?;
+    assert_ne!(
+        query(&project, "SELECT state FROM attempts WHERE task_id = 'T1'")?,
+        "RUNNING"
+    );
+    nothing_of_it_left(&marker, &file).await?;
+    second.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancel_ends_a_writer_the_leader_released_on_sigterm_just_before_it_exited() -> R {
+    // M2T06R-152 (docs/adr/ADR-021.md decision 8d v3): on SIGTERM the leader orphans a writer and exits 20 ms later,
+    // so its group is empty at once; the writer is found by the scans made at every look once the group is empty.
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let file = dir.path().join("written.txt");
+    let script = format!(
+        "trap \"{}; sleep 0.02; exit 0\" TERM; while :; do sleep 0.1; done",
+        orphan_writer(&file)?.replace('"', "\\\"")
+    );
+    cancel_with_a_writer_outside(dir.path(), &script, &file)
+        .await
+        .map(drop)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancel_ends_what_a_pinned_process_without_the_marker_starts_after_the_leader_died() -> R
+{
+    // M2T06R-152 (decision 8d v3): the leader starts W with an emptied environment in a session of its own; W ignores
+    // SIGTERM. The leader dies at SIGTERM (10 s); 1.5 s later W starts the writer C, which ignores SIGTERM too. Only
+    // the parent chain from W, pinned while the leader lived, finds C; both end at SIGKILL (15 s).
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let file = dir.path().join("written.txt");
+    let pid_file = dir.path().join("w.pid");
+    let script = format!(
+        "env -i /usr/bin/setsid /bin/sh -c 'trap \"\" TERM; /bin/sleep 11.5; {} & wait' & echo $! > {}; \
+         while :; do sleep 0.1; done",
+        writer(&file)?,
+        pid_file.display()
+    );
+    let guard = KillPidFile(pid_file.clone());
+    cancel_with_a_writer_outside(dir.path(), &script, &file).await?;
+    drop(guard);
+    Ok(())
 }
