@@ -1670,3 +1670,253 @@ async fn each_attempt_records_how_its_processes_are_tracked_and_why_it_is_degrad
     host.shutdown().await;
     Ok(())
 }
+
+/// This process's own cgroup directory (the delegated scope's, inside one).
+fn own_cgroup() -> R<PathBuf> {
+    let text = std::fs::read_to_string("/proc/self/cgroup")?;
+    let path = text
+        .lines()
+        .find_map(|l| l.strip_prefix("0::"))
+        .ok_or("no cgroup v2 line")?;
+    Ok(Path::new("/sys/fs/cgroup").join(path.trim().trim_start_matches('/')))
+}
+
+/// A writer that ignores SIGTERM, orphaned in a session of its own, which first moves itself out of the attempt's cgroup
+/// into `base` (the delegated scope's own) by writing its pid there: a same-user process can; it keeps its marker.
+fn migrating_writer(file: &Path, pid_file: &Path, base: &Path) -> R<String> {
+    Ok(format!(
+        "(trap '' TERM; setsid sh -c 'echo $$ > {}/cgroup.procs && exec {}' & echo $! > {})",
+        base.display(),
+        writer(file)?,
+        pid_file.display()
+    ))
+}
+
+/// Wait until the writer `pid_file` names runs in `base`, out of the attempt's cgroup.
+async fn moved_out(pid_file: &Path, base: &Path) -> R {
+    let wanted = format!("0::/{}", base.strip_prefix("/sys/fs/cgroup")?.display());
+    let end = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(pid) = std::fs::read_to_string(pid_file).map(|t| t.trim().to_owned())
+            && std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+                .is_ok_and(|c| c.trim() == wanted)
+        {
+            return Ok(());
+        }
+        if Instant::now() > end {
+            return Err("the writer did not move out of the attempt's cgroup".into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[test]
+fn in_a_delegated_cgroup_a_cancel_ends_a_process_that_moved_out_of_the_attempts_cgroup() -> R {
+    in_delegated_scope("cgroup_moved_out_cancel_inside")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs inside a delegated scope, started by in_a_delegated_cgroup_a_cancel_ends_a_process_that_moved_out_of_the_attempts_cgroup"]
+async fn cgroup_moved_out_cancel_inside() -> R {
+    // M2T06R-400 (decision 8d v6): T1's agent leaves a writer that moved itself out of the attempt's cgroup, keeping its
+    // marker. The cgroup is empty soon; the marker scan, part of the proof, finds the writer: it gets the ladder's
+    // signals (SIGTERM ignored, SIGKILL) and the run is CANCELLED only once it is gone.
+    if std::env::var_os(IN_SCOPE).is_none() {
+        return Ok(());
+    }
+    let base = own_cgroup()?;
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let (file, pid_file) = (dir.path().join("written.txt"), dir.path().join("w.pid"));
+    let script = format!(
+        "{}; while :; do sleep 0.1; done",
+        migrating_writer(&file, &pid_file, &base)?
+    );
+    let _guard = KillPidFile(pid_file.clone());
+    let agents = Arc::new(Agents::new(&[("T1", script.as_str())]));
+    let _leaders = Leaders(agents.leaders.clone());
+    let (project, host) = host(dir.path(), &agents).await?;
+    until(
+        &project,
+        "SELECT state FROM attempts WHERE task_id = 'T1'",
+        "RUNNING",
+        Duration::from_secs(10),
+    )
+    .await?;
+    assert_eq!(tracking(&project)?.0, "cgroup");
+    moved_out(&pid_file, &base).await?;
+    let (status, _) = command(&host, &control(&project, "CancelRun", "cancel")?).await?;
+    assert_eq!(status, 202);
+    until(
+        &project,
+        "SELECT state FROM runs WHERE run_id = 'R'",
+        "CANCELLED",
+        Duration::from_secs(40),
+    )
+    .await?;
+    assert!(gone(&pid_file)?, "the writer that left the cgroup lives on");
+    host.shutdown().await;
+    Ok(())
+}
+
+#[test]
+fn in_a_delegated_cgroup_an_attempt_whose_agent_ended_settles_only_once_a_process_that_moved_out_is_gone()
+-> R {
+    in_delegated_scope("cgroup_moved_out_runner_end_inside")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs inside a delegated scope, started by in_a_delegated_cgroup_an_attempt_whose_agent_ended_settles_only_once_a_process_that_moved_out_is_gone"]
+async fn cgroup_moved_out_runner_end_inside() -> R {
+    // M2T06R-400 (decision 8d v6, path 2): the agent leaves the writer that moved out of its cgroup and exits 0; the
+    // runner's proof includes the marker scan, which stops the writer before the attempt settles.
+    if std::env::var_os(IN_SCOPE).is_none() {
+        return Ok(());
+    }
+    let base = own_cgroup()?;
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let (file, pid_file) = (dir.path().join("written.txt"), dir.path().join("w.pid"));
+    let script = format!(
+        "{}; sleep 1; exit 0",
+        migrating_writer(&file, &pid_file, &base)?
+    );
+    let _guard = KillPidFile(pid_file.clone());
+    let agents = Arc::new(Agents::new(&[("T1", script.as_str())]));
+    let _leaders = Leaders(agents.leaders.clone());
+    let (project, host) = host(dir.path(), &agents).await?;
+    until(
+        &project,
+        "SELECT state FROM attempts WHERE task_id = 'T1'",
+        "SETTLED",
+        Duration::from_secs(30),
+    )
+    .await?;
+    assert!(
+        gone(&pid_file)?,
+        "the attempt settled while the writer that left its cgroup lived"
+    );
+    assert_eq!(
+        query(
+            &project,
+            "SELECT json_extract(payload_json, '$.steps') FROM events WHERE kind = 'runner.outside'"
+        )?,
+        r#"["outside_sigterm","outside_sigkill","outside_reaped"]"#
+    );
+    host.shutdown().await;
+    Ok(())
+}
+
+/// Starts each task's script as the leader of its own process group and, when the leader ends, reaps it without
+/// emptying its group: a member it left behind keeps the group without its leader.
+#[derive(Debug)]
+struct LeavesItsGroup(Arc<Mutex<Vec<u32>>>);
+
+impl hoh_app::host::Executor for LeavesItsGroup {
+    fn deliver(
+        &self,
+        _work: &hoh_app::host::Work,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
+        let (answer, ack) = tokio::sync::oneshot::channel();
+        let _ = answer.send(Ok(()));
+        ack
+    }
+
+    fn start(&self, work: &hoh_app::host::Work) -> Result<hoh_app::host::Started, String> {
+        use std::os::unix::process::CommandExt as _;
+        let mut child = Command::new("sh")
+            .args([
+                "-c",
+                "read -r go; [ \"$go\" = go ] || exit 0; sleep 60 & exit 0",
+            ])
+            .process_group(0)
+            .env(hoh_app::host::ATTEMPT_ENV, work.marker())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        let pid = child.id();
+        if let Ok(mut leaders) = self.0.lock() {
+            leaders.push(pid);
+        }
+        let stdin = child.stdin.take();
+        let gate = hoh_app::host::Gate::new(move || {
+            use std::io::Write as _;
+            stdin
+                .ok_or("no stdin")?
+                .write_all(b"go\n")
+                .map_err(|e| e.to_string())
+        });
+        let (end, ended) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let status = child.wait();
+            let _ = end.send(hoh_app::host::Outcome {
+                success: status.as_ref().is_ok_and(std::process::ExitStatus::success),
+                detail: format!("{status:?}"),
+                group_gone: false,
+                class: hoh_core::retry::FailureClass::Transient { retry_after: None },
+            });
+        });
+        Ok(hoh_app::host::Started { pid, gate, ended })
+    }
+}
+
+#[test]
+fn in_a_delegated_cgroup_a_cancel_stops_a_group_left_without_its_leader_through_the_cgroup() -> R {
+    in_delegated_scope("cgroup_leaderless_cancel_inside")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs inside a delegated scope, started by in_a_delegated_cgroup_a_cancel_stops_a_group_left_without_its_leader_through_the_cgroup"]
+async fn cgroup_leaderless_cancel_inside() -> R {
+    // M2T06R-401 (decision 8d v6): T1's leader ends and is reaped, its member lives on in its group (no signal may go to
+    // a group without its leader, ADR-019 decision 8). The attempt's cgroup holds the member by membership: the cancel
+    // stops it through the cgroup, sees the group gone, and the run is CANCELLED.
+    if std::env::var_os(IN_SCOPE).is_none() {
+        return Ok(());
+    }
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let leaders = Arc::new(Mutex::new(Vec::new()));
+    let _leaders = Leaders(leaders.clone());
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    Host::start(config(&project)).await?.shutdown().await;
+    seed(&project, WORLD)?;
+    let mut config = config(&project);
+    config.runner = Some(hoh_app::host::RunnerConfig {
+        executor: Arc::new(LeavesItsGroup(leaders.clone())),
+        context: context(),
+    });
+    let host = start_when_free(config).await?;
+    // The leader ended with its group not emptied: the attempt and its slot stay.
+    until(
+        &project,
+        "SELECT count(*) FROM events WHERE kind = 'runner.unreaped'",
+        "1",
+        Duration::from_secs(20),
+    )
+    .await?;
+    assert_eq!(tracking(&project)?.0, "cgroup");
+    let leader: u32 = query(&project, "SELECT pid FROM attempts WHERE task_id = 'T1'")?.parse()?;
+    let group_lives = || {
+        i32::try_from(leader)
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+            .is_some_and(|g| rustix::process::test_kill_process_group(g).is_ok())
+    };
+    assert!(
+        group_lives(),
+        "the precondition: a group without its leader"
+    );
+    let (status, _) = command(&host, &control(&project, "CancelRun", "cancel")?).await?;
+    assert_eq!(status, 202);
+    until(
+        &project,
+        "SELECT state FROM runs WHERE run_id = 'R'",
+        "CANCELLED",
+        Duration::from_secs(30),
+    )
+    .await?;
+    assert!(!group_lives(), "the group's member lives on");
+    host.shutdown().await;
+    Ok(())
+}

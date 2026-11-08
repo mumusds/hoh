@@ -545,6 +545,46 @@ async fn an_attach_to_an_id_that_names_no_run_is_run_not_found_whatever_its_char
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn doctor_reports_how_the_running_host_tracks_attempts_not_what_a_start_would_try() -> R {
+    // M2T06R-402 (docs/adr/ADR-021.md decision 8d, CR-011): a host runs in this process's cgroup, which is not
+    // delegated here (a test run from a login session or CI); the user's systemd manager may well answer, so a check
+    // before a start would expect a cgroup, but doctor reports the running host's own record: proc, with a warning.
+    let env = Env::new()?;
+    let _daemons = Daemons(env.project());
+    let host = Host::start(config(&env.project())).await?;
+    let record: Value = serde_json::from_str(&std::fs::read_to_string(
+        env.project().join(".hoh/host.json"),
+    )?)?;
+    let mut command = env.command(&["doctor", "--output", "json"]);
+    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
+        command.env("XDG_RUNTIME_DIR", runtime);
+    }
+    let out = finish(
+        command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?,
+        Duration::from_secs(60),
+    )?;
+    let report: Value = serde_json::from_slice(&out.stdout)?;
+    let reported = &report["runtime"]["host"];
+    assert_eq!(reported["state"], "running", "{reported}");
+    assert_eq!(
+        reported["process_tracking"], record["process_tracking"],
+        "{reported}"
+    );
+    if record["process_tracking"] == "proc" {
+        let warned = report["summary"]["warnings"].as_array().is_some_and(|w| {
+            w.iter()
+                .any(|w| w.as_str().is_some_and(|w| w.contains("tracking: proc")))
+        });
+        assert!(warned, "{}", report["summary"]);
+    }
+    host.shutdown().await;
+    Ok(())
+}
+
 /// A StartRun's commit that fails (CR-006 F3: the test's fault hook; the product's does nothing).
 #[derive(Debug)]
 struct FullDisk;

@@ -6,7 +6,7 @@
 //! the attempt's disposition is written with what was found, between `reconcile.started` and `reconcile.completed`.
 
 use super::cgroup::Tracking;
-use super::processes::{Outside, Proof};
+use super::processes::{Outside, Proof, both};
 use hoh_agents::identity::{self, Gone, Presence, StopStep};
 use hoh_core::lifecycle::AttemptState;
 use hoh_core::persistence::{PersistError, Store, UnfinishedRow};
@@ -119,24 +119,41 @@ pub(super) fn end(
 ) -> Process {
     let cgroup = tracking.cgroup();
     let mut outside = Outside::new(&super::runner::marker(&row.project_id, &row.attempt_id));
+    let (term, kill) = (settings.term_grace, settings.kill_grace);
     let group = match seen {
-        // Nothing may be signalled: it stays as it is.
-        Seen::Uncertain(basis) => return Process::Uncertain { basis },
+        // Its group cannot be told apart: no signal may go to it (ADR-019 decision 8). Its cgroup, by membership, is
+        // stopped all the same, and its group looked at again (decision 8d v6, M2T06R-401).
+        Seen::Uncertain(basis) => {
+            let Some(cgroup) = cgroup else {
+                return Process::Uncertain { basis };
+            };
+            let (mut steps, in_cgroup) = cgroup.stop(term, kill);
+            let (left, outside) = outside.stop(term, kill);
+            steps.extend(left);
+            let emptied = matches!(inspect(row), Seen::Gone(_) | Seen::NotStarted);
+            return Process::Stopped {
+                steps,
+                reaped: emptied && both(in_cgroup, outside) == Proof::Done,
+            };
+        }
         Seen::NotStarted => Process::NotStarted,
         Seen::Ours(found) => {
-            // Without a cgroup, its descendants are pinned while its leader still ties them to it; then the group is
-            // stopped.
-            if cgroup.is_none() {
-                outside.set_leader(row.pid, row.process_start_id.as_deref());
-                let _ = outside.scan();
-            }
-            stopped(&found.stop(settings.term_grace, settings.kill_grace))
+            // Its descendants are pinned while its leader still ties them to it; then the group is stopped.
+            outside.set_leader(row.pid, row.process_start_id.as_deref());
+            let _ = outside.scan();
+            stopped(&found.stop(term, kill))
         }
         Seen::Gone(basis) => Process::Gone { basis },
     };
     let (steps, proof) = match cgroup {
-        Some(cgroup) => cgroup.stop(settings.term_grace, settings.kill_grace),
-        None => outside.stop(settings.term_grace, settings.kill_grace),
+        // The cgroup, then what may have left it with its marker (decision 8d v6, M2T06R-400).
+        Some(cgroup) => {
+            let (mut steps, in_cgroup) = cgroup.stop(term, kill);
+            let (left, outside) = outside.stop(term, kill);
+            steps.extend(left);
+            (steps, both(in_cgroup, outside))
+        }
+        None => outside.stop(term, kill),
     };
     with_outside(group, steps, proof)
 }
