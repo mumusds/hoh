@@ -244,7 +244,8 @@ fn take_events(app: &mut App, link: &Link) -> bool {
         let kind = event["kind"].as_str().unwrap_or_default().to_owned();
         app.say(format!("#{} {kind}", event["seq"].as_i64().unwrap_or(0)));
         if kind.starts_with("run.")
-            && let Ok(reply) = link.get(&format!("/v1/runs/{}", link.run_id))
+            && let Ok(reply) =
+                link.get(&format!("/v1/runs/{}", crate::client::encode(&link.run_id)))
             && reply.status == 200
         {
             let run = reply.json();
@@ -262,7 +263,8 @@ fn take_events(app: &mut App, link: &Link) -> bool {
 fn control(link: &Link, kind: &str) -> String {
     let mut said = String::new();
     for _ in 0..2 {
-        let revision = match link.get(&format!("/v1/runs/{}", link.run_id)) {
+        let revision = match link.get(&format!("/v1/runs/{}", crate::client::encode(&link.run_id)))
+        {
             Ok(reply) if reply.status == 200 => reply.json()["revision"].as_i64().unwrap_or(0),
             Ok(reply) => return format!("{kind} 未发送：host 答 {}", reply.status),
             Err(e) => return format!("{kind} 未发送：{e}"),

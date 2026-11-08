@@ -116,6 +116,7 @@ async fn tick(
 /// Cancel `run_id` until it is CANCELLED (or no longer cancelling).
 async fn cancel(common: &Arc<Common>, run_id: &str) {
     let mut works: BTreeMap<String, Work> = BTreeMap::new();
+    let pins: Pins = Arc::default();
     loop {
         // What this host runs for the run stops first, so the cancel alone ends its attempts (one writer, ADR-021
         // decision 8c); a native interrupt goes to the work it was given.
@@ -145,6 +146,8 @@ async fn cancel(common: &Arc<Common>, run_id: &str) {
                 works: works.clone(),
                 executor: common.executor.clone(),
                 project: common.project.clone(),
+                project_id: common.shared.project_id.clone(),
+                pins: pins.clone(),
             });
             common
                 .canceller
@@ -169,12 +172,15 @@ async fn cancel(common: &Arc<Common>, run_id: &str) {
     }
 }
 
-/// The product's processes for a cancel: an attempt's group found by its recorded identity (ADR-019 decision 4),
-/// its native interrupt through the executor that runs it, and the project's workspace.
+/// The product's processes for a cancel: an attempt's group found by its recorded identity (ADR-019 decision 4) and
+/// the processes of the attempt found outside it, its native interrupt through the executor that runs it, and the
+/// project's workspace.
 struct HostProcesses {
     works: BTreeMap<String, Work>,
     executor: Option<Arc<dyn Executor>>,
     project: PathBuf,
+    project_id: String,
+    pins: Pins,
 }
 
 impl Processes for HostProcesses {
@@ -184,30 +190,34 @@ impl Processes for HostProcesses {
             attempt.boot_id.as_deref(),
             attempt.process_start_id.as_deref(),
         );
+        let native = match (&self.executor, self.works.get(&attempt.attempt_id)) {
+            (Some(executor), Some(work)) => Some((executor.clone(), work.clone())),
+            _ => None,
+        };
+        let has_native = native.is_some();
+        let control = |group: Option<identity::Found>, leader: Option<u32>| AttemptControl {
+            group,
+            leader,
+            native: native.clone(),
+            attempt_id: attempt.attempt_id.clone(),
+            marker: format!(
+                "{ATTEMPT_ENV}={}",
+                super::runner::marker(&self.project_id, &attempt.attempt_id)
+            )
+            .into_bytes(),
+            pins: self.pins.clone(),
+            scanned: None,
+            sent: None,
+            quiet: 0,
+        };
         Some(match presence {
             Ok(Presence::Ours(found)) => {
-                let native = match (&self.executor, self.works.get(&attempt.attempt_id)) {
-                    (Some(executor), Some(work)) => Some((executor.clone(), work.clone())),
-                    _ => None,
-                };
-                let has_native = native.is_some();
-                let escaped = attempt
-                    .pid
-                    .and_then(|pid| u32::try_from(pid).ok())
-                    .map(escaped)
-                    .unwrap_or_default();
-                (
-                    Box::new(FoundControl {
-                        found,
-                        native,
-                        escaped,
-                    }) as Box<dyn ProcessControl + Send>,
-                    has_native,
-                )
+                let leader = attempt.pid.and_then(|pid| u32::try_from(pid).ok());
+                (Box::new(control(Some(found), leader)), has_native)
             }
-            // Nothing of it runs: no process was recorded (held at its start gate, which closed when its task
-            // stopped) or its group is empty.
-            Ok(Presence::Gone(_)) => (Box::new(Fixed(Look::Empty)), false),
+            // Its group is gone (or no process was recorded: held at its start gate, which closed when its task
+            // stopped); what of it left the group is still looked for.
+            Ok(Presence::Gone(_)) => (Box::new(control(None, None)), false),
             // It cannot be told apart: no signal may go (ADR-019 decision 8); it stays cancelling.
             _ => (Box::new(Fixed(Look::Lost)), false),
         })
@@ -218,64 +228,175 @@ impl Processes for HostProcesses {
     }
 }
 
-/// A group found by its identity, with the descendants of its leader that left it.
-struct FoundControl {
-    found: identity::Found,
+/// The environment variable an executor starts an attempt's leader with, its value [`Work::marker`] (the project's id
+/// and the attempt's). Every descendant inherits it, so a cancel finds the attempt's processes wherever they went: another group, another session, another
+/// parent (docs/adr/ADR-021.md decision 8d).
+pub const ATTEMPT_ENV: &str = "HOH_ATTEMPT_ID";
+
+/// How often a pass looks for the attempt's processes outside its group while the group lives.
+const RESCAN: Duration = Duration::from_millis(100);
+
+/// The processes of each attempt of a cancel found outside its group, pinned: kept for the whole cancel, across its
+/// passes.
+type Pins = Arc<Mutex<BTreeMap<String, Vec<Pinned>>>>;
+
+/// An attempt's group found by its identity (or gone), and its processes found outside it (decision 8d): a group
+/// signal misses a descendant that left the group (setsid, setpgid), so each is pinned by a pidfd, its start time
+/// checked after the open (a reused pid is never taken), and signalled through it. They are found by the /proc parent
+/// chain from the leader and from every pinned one (REQ-043 decision 3), and by the attempt's [`ATTEMPT_ENV`] in their
+/// environment, whatever their parent now is (an orphan too). The group counts as empty only once no pinned one lives
+/// and two scans in a row found no other.
+struct AttemptControl {
+    group: Option<identity::Found>,
+    leader: Option<u32>,
     native: Option<(Arc<dyn Executor>, Work)>,
-    escaped: Vec<Escaped>,
+    attempt_id: String,
+    /// `ATTEMPT_ENV=<marker>` as it appears in an environment.
+    marker: Vec<u8>,
+    pins: Pins,
+    /// When this pass last looked for them.
+    scanned: Option<Instant>,
+    /// The strongest signal this pass sent: a process found later gets it at once.
+    sent: Option<rustix::process::Signal>,
+    /// Scans in a row that found nothing alive with the group empty.
+    quiet: u8,
 }
 
-impl ProcessControl for FoundControl {
-    fn look(&mut self) -> Look {
-        let group = match self.found.look() {
-            identity::Group::Held => Look::Held,
-            identity::Group::Empty => Look::Empty,
-            identity::Group::Lost => Look::Lost,
+impl AttemptControl {
+    /// Look for the attempt's processes outside its group, pin the new ones and send them this pass's strongest
+    /// signal so far; whether any pinned one lives.
+    fn scan(&mut self) -> bool {
+        self.scanned = Some(Instant::now());
+        let Ok(mut pins) = self.pins.lock() else {
+            return true;
         };
-        // Its group empty while an escaped descendant lives: not yet (ADR-021 decision 8d).
-        match group {
-            Look::Empty if self.escaped.iter().any(Escaped::alive) => Look::Held,
-            other => other,
+        let pinned = pins.entry(self.attempt_id.clone()).or_default();
+        let processes = processes();
+        let mut found: BTreeSet<u32> = BTreeSet::new();
+        let mut parents: Vec<u32> = self
+            .leader
+            .into_iter()
+            .chain(pinned.iter().filter(|p| p.alive()).map(|p| p.pid))
+            .collect();
+        while let Some(parent) = parents.pop() {
+            for process in processes.iter().filter(|p| p.ppid == parent) {
+                if found.insert(process.pid) {
+                    parents.push(process.pid);
+                }
+            }
+        }
+        let marked: Vec<u32> = processes
+            .iter()
+            .filter(|p| !found.contains(&p.pid) && marked(p.pid, &self.marker))
+            .map(|p| p.pid)
+            .collect();
+        found.extend(marked);
+        for process in processes.iter().filter(|p| found.contains(&p.pid)) {
+            if Some(process.pid) == self.leader
+                || pinned
+                    .iter()
+                    .any(|q| q.pid == process.pid && q.start == process.start)
+            {
+                continue;
+            }
+            if let Some(pin) = Pinned::open(process.pid, process.start) {
+                if let Some(signal) = self.sent {
+                    let _ = rustix::process::pidfd_send_signal(&pin.pidfd, signal);
+                }
+                pinned.push(pin);
+            }
+        }
+        pinned.retain(Pinned::alive);
+        !pinned.is_empty()
+    }
+
+    fn to_pinned(&self, signal: rustix::process::Signal) -> bool {
+        self.pins.lock().is_ok_and(|pins| {
+            pins.get(&self.attempt_id)
+                .into_iter()
+                .flatten()
+                .filter(|p| p.alive())
+                .map(|p| rustix::process::pidfd_send_signal(&p.pidfd, signal).is_ok())
+                .fold(false, |a, b| a | b)
+        })
+    }
+}
+
+impl ProcessControl for AttemptControl {
+    fn look(&mut self) -> Look {
+        let group = match self.group.as_ref().map(identity::Found::look) {
+            Some(identity::Group::Held) => Look::Held,
+            Some(identity::Group::Lost) => return Look::Lost,
+            Some(identity::Group::Empty) | None => Look::Empty,
+        };
+        let due = group == Look::Empty || self.scanned.is_none_or(|at| at.elapsed() >= RESCAN);
+        let living = if due {
+            self.scan()
+        } else {
+            self.pins.lock().map_or(true, |pins| {
+                pins.get(&self.attempt_id)
+                    .is_some_and(|p| p.iter().any(Pinned::alive))
+            })
+        };
+        if group == Look::Held || living {
+            self.quiet = 0;
+            return Look::Held;
+        }
+        // Two scans in a row (a look apart) found nothing: one just forked may not show its environment yet.
+        self.quiet += 1;
+        if self.quiet >= 2 {
+            Look::Empty
+        } else {
+            Look::Held
         }
     }
 
     fn send(&mut self, signal: Signal) -> bool {
-        let to_escaped = |sig: rustix::process::Signal, escaped: &[Escaped]| {
-            escaped
-                .iter()
-                .filter(|e| e.alive())
-                .map(|e| rustix::process::pidfd_send_signal(&e.pidfd, sig).is_ok())
-                .fold(false, |a, b| a | b)
+        let (sig, group) = match signal {
+            Signal::Native => {
+                return match &self.native {
+                    Some((executor, work)) => {
+                        executor.cancel(work);
+                        true
+                    }
+                    None => false,
+                };
+            }
+            Signal::Term => (
+                rustix::process::Signal::TERM,
+                self.group.as_ref().is_some_and(identity::Found::terminate),
+            ),
+            Signal::Kill => (
+                rustix::process::Signal::KILL,
+                self.group.as_ref().is_some_and(identity::Found::kill),
+            ),
         };
-        match signal {
-            Signal::Native => match &self.native {
-                Some((executor, work)) => {
-                    executor.cancel(work);
-                    true
-                }
-                None => false,
-            },
-            Signal::Term => {
-                let group = self.found.terminate();
-                to_escaped(rustix::process::Signal::TERM, &self.escaped) || group
-            }
-            Signal::Kill => {
-                let group = self.found.kill();
-                to_escaped(rustix::process::Signal::KILL, &self.escaped) || group
-            }
+        if self.sent != Some(rustix::process::Signal::KILL) {
+            self.sent = Some(sig);
         }
+        self.to_pinned(sig) || group
     }
 }
 
-/// A descendant of an attempt's leader that left its process group (setsid, setpgid): a group signal misses it, so it
-/// is pinned by a pidfd, its start time checked after the open (a reused pid is never taken), and signalled through
-/// it (REQ-043 decision 3, docs/adr/ADR-021.md decision 8d). Only descendants still under the leader are found: one
-/// orphaned before the scan cannot be told apart (the residual of decision 8d).
-struct Escaped {
+/// A process of an attempt outside its group, pinned by a pidfd.
+struct Pinned {
+    pid: u32,
+    start: u64,
     pidfd: rustix::fd::OwnedFd,
 }
 
-impl Escaped {
+impl Pinned {
+    /// `pid` pinned if it is still the process that started at `start` once its pidfd is open.
+    fn open(pid: u32, start: u64) -> Option<Pinned> {
+        let raw = i32::try_from(pid)
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)?;
+        let pidfd = rustix::process::pidfd_open(raw, rustix::process::PidfdFlags::empty()).ok()?;
+        stat(pid)
+            .is_some_and(|s| s.start == start)
+            .then_some(Pinned { pid, start, pidfd })
+    }
+
     /// Whether it has not exited (its pidfd is not readable yet).
     fn alive(&self) -> bool {
         let mut fds = [rustix::event::PollFd::new(
@@ -290,55 +411,40 @@ impl Escaped {
     }
 }
 
-/// A process's parent, process group and start time (`/proc/<pid>/stat` fields 4, 5 and 22).
-fn stat(pid: u32) -> Option<(u32, u32, u64)> {
-    let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let fields: Vec<&str> = text.rsplit_once(") ")?.1.split(' ').collect();
-    Some((
-        fields.get(1)?.parse().ok()?,
-        fields.get(2)?.parse().ok()?,
-        fields.get(19)?.parse().ok()?,
-    ))
+/// A process as `/proc/<pid>/stat` shows it: its parent and its start time (fields 4 and 22).
+struct Proc {
+    pid: u32,
+    ppid: u32,
+    start: u64,
 }
 
-/// The descendants of `leader` (its process group's number) that are in another process group, pinned.
-fn escaped(leader: u32) -> Vec<Escaped> {
+fn stat(pid: u32) -> Option<Proc> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields: Vec<&str> = text.rsplit_once(") ")?.1.split(' ').collect();
+    Some(Proc {
+        pid,
+        ppid: fields.get(1)?.parse().ok()?,
+        start: fields.get(19)?.parse().ok()?,
+    })
+}
+
+/// Every process /proc shows.
+fn processes() -> Vec<Proc> {
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return Vec::new();
     };
-    let all: Vec<(u32, (u32, u32, u64))> = entries
+    entries
         .filter_map(Result::ok)
         .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
-        .filter_map(|pid| Some((pid, stat(pid)?)))
-        .collect();
-    let mut found = Vec::new();
-    let mut parents = vec![leader];
-    while let Some(parent) = parents.pop() {
-        for (pid, (ppid, pgrp, start)) in &all {
-            if *ppid != parent || *pid == leader {
-                continue;
-            }
-            parents.push(*pid);
-            if *pgrp == leader {
-                continue;
-            }
-            let Some(raw) = i32::try_from(*pid)
-                .ok()
-                .and_then(rustix::process::Pid::from_raw)
-            else {
-                continue;
-            };
-            let Ok(pidfd) = rustix::process::pidfd_open(raw, rustix::process::PidfdFlags::empty())
-            else {
-                continue;
-            };
-            // The pidfd names the process the scan saw only if it is still that one.
-            if stat(*pid).is_some_and(|(_, _, s)| s == *start) {
-                found.push(Escaped { pidfd });
-            }
-        }
-    }
-    found
+        .filter_map(stat)
+        .collect()
+}
+
+/// Whether `pid`'s environment has `marker` (`NAME=value`) as one of its entries; a process of another user cannot be
+/// read and has not.
+fn marked(pid: u32, marker: &[u8]) -> bool {
+    std::fs::read(format!("/proc/{pid}/environ"))
+        .is_ok_and(|env| env.split(|b| *b == 0).any(|entry| entry == marker))
 }
 
 /// A group whose look is known without looking: gone, or lost track of.

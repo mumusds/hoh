@@ -156,6 +156,19 @@ fn chunk(reader: &mut BufReader<UnixStream>) -> std::io::Result<Vec<u8>> {
     Ok(data)
 }
 
+/// `text` as one path segment or query value: every byte but the unreserved ones percent-encoded (RFC 3986), so a
+/// run id the user typed names that run and nothing else (M2T06R-54).
+pub fn encode(text: &str) -> String {
+    text.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                char::from(b).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
 /// One request and its whole response.
 pub fn call(
     host: &HostInfo,
@@ -241,6 +254,35 @@ pub fn ensure(project: &Path) -> Result<HostInfo, Failure> {
     started
 }
 
+/// The code of a refusal whose body names none, by its status: one of openapi Error's codes (M2T06R-61).
+fn status_code(status: u16) -> &'static str {
+    match status {
+        400 => "BAD_REQUEST",
+        403 => "FORBIDDEN",
+        404 => "NOT_FOUND",
+        409 => "CONFLICT",
+        422 => "UNPROCESSABLE",
+        _ => "GONE",
+    }
+}
+
+/// The code a host's refused start names in its last line (its location or its database), else GONE.
+fn refused_code(line: &str) -> &'static str {
+    const CODES: [&str; 4] = [
+        "DB_ON_NETWORK_FS",
+        "DB_WAL_UNSUPPORTED",
+        "DB_FULL",
+        "DB_BUSY",
+    ];
+    CODES
+        .into_iter()
+        .find(|code| {
+            line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .any(|w| w == *code)
+        })
+        .unwrap_or("GONE")
+}
+
 /// Start `project`'s host (`hoh __host <project>`) and wait until it is ready, until `end`.
 fn start(project: &Path, end: Instant) -> Result<HostInfo, Failure> {
     let program = std::env::current_exe()
@@ -276,8 +318,9 @@ fn start(project: &Path, end: Instant) -> Result<HostInfo, Failure> {
             return match status.code() {
                 // Another host holds the project: it is the one, if it answers.
                 Some(69) => running(project).ok_or_else(|| Failure::unreachable(line)),
-                // Its location or database refused (DB_ON_NETWORK_FS, DB_WAL_UNSUPPORTED): its line says which.
-                Some(78) => Err(Failure::new("GONE", line, 78)),
+                // Its location or database refused (DB_ON_NETWORK_FS, DB_WAL_UNSUPPORTED): its line says which
+                // (M2T06R-60).
+                Some(78) => Err(Failure::new(refused_code(&line), line, 78)),
                 _ => Err(Failure::unreachable(line)),
             };
         }
@@ -324,7 +367,9 @@ pub fn submit(project: &Path, host: &HostInfo, mut command: Value) -> Result<Val
             Ok(reply) => {
                 let error = reply.json();
                 let failure = Failure::new(
-                    error["code"].as_str().unwrap_or("INTERNAL"),
+                    error["code"]
+                        .as_str()
+                        .unwrap_or_else(|| status_code(reply.status)),
                     error["message"].as_str().unwrap_or("refused"),
                     if reply.status == 503 { 69 } else { 1 },
                 );
@@ -367,7 +412,7 @@ impl Events {
     pub fn open(host: &HostInfo, run_id: &str, after: i64) -> std::io::Result<Events> {
         let mut stream = connect(host, Duration::from_secs(1))?;
         stream.set_read_timeout(Some(Duration::from_millis(200)))?;
-        let path = format!("/v1/events?run_id={run_id}&after={after}");
+        let path = format!("/v1/events?run_id={}&after={after}", encode(run_id));
         stream.write_all(&request(host, "GET", &path, None, None))?;
         stream.set_read_timeout(Some(WAIT))?;
         let mut reader = BufReader::new(stream);
@@ -461,6 +506,105 @@ mod tests {
             answer_timeout: Duration::from_secs(10),
         });
         Ok(config)
+    }
+
+    /// A reader over a socket whose other end has had `bytes` written and is then closed (or kept open with
+    /// `keep`), so a read past them ends (or times out).
+    fn fed(bytes: &[u8], keep: bool) -> R<(BufReader<UnixStream>, Option<UnixStream>)> {
+        let (ours, mut theirs) = UnixStream::pair()?;
+        theirs.write_all(bytes)?;
+        ours.set_read_timeout(Some(Duration::from_millis(50)))?;
+        Ok((BufReader::new(ours), keep.then_some(theirs)))
+    }
+
+    #[test]
+    fn a_response_head_gives_its_status_and_how_its_body_is_framed() -> R {
+        // ADR-021 decision 4: httparse reads the head; chunked or a Content-Length, the head over at the blank line.
+        let (mut r, _) = fed(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nrest",
+            false,
+        )?;
+        assert_eq!(head(&mut r)?, (200, true, None));
+        let mut rest = String::new();
+        r.read_to_string(&mut rest)?;
+        assert_eq!(rest, "rest", "the body is left unread");
+        let (mut r, _) = fed(
+            b"HTTP/1.1 404 Not Found\r\ncontent-length: 12\r\n\r\n",
+            false,
+        )?;
+        assert_eq!(head(&mut r)?, (404, false, Some(12)));
+        let (mut r, _) = fed(b"HTTP/1.1 200 OK\r\n", false)?;
+        assert_eq!(
+            head(&mut r).map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::UnexpectedEof)
+        );
+        let (mut r, _) = fed(b"not http at all\r\n\r\n", false)?;
+        assert!(head(&mut r).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_chunked_body_is_read_chunk_by_chunk_to_its_empty_end() -> R {
+        let (mut r, _) = fed(b"5\r\nhello\r\n3;x=1\r\nabc\r\n0\r\n\r\n", false)?;
+        assert_eq!(chunk(&mut r)?, b"hello");
+        assert_eq!(chunk(&mut r)?, b"abc", "a chunk extension is ignored");
+        assert_eq!(chunk(&mut r)?, b"");
+        let (mut r, _) = fed(b"zz\r\nhello\r\n", false)?;
+        assert!(chunk(&mut r).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn the_event_stream_gives_each_events_data_and_nothing_for_a_comment() -> R {
+        // An event split over two chunks, a keep-alive comment, an event whose data spans two lines; then nothing for
+        // a while (None), then the stream's end (an error, so the caller resubscribes after its last seq).
+        let frames: &[&[u8]] = &[
+            b"id: 3\ndata: {\"seq\":",
+            b"3}\n\n",
+            b": keep-alive\n\n",
+            b"id: 4\ndata: {\"seq\":\ndata: 4}\n\n",
+        ];
+        let mut body = Vec::new();
+        for frame in frames {
+            body.extend_from_slice(format!("{:x}\r\n", frame.len()).as_bytes());
+            body.extend_from_slice(frame);
+            body.extend_from_slice(b"\r\n");
+        }
+        let (reader, theirs) = fed(&body, true)?;
+        let mut events = Events {
+            reader,
+            pending: Vec::new(),
+        };
+        assert_eq!(events.next()?, Some(json!({"seq": 3})));
+        assert_eq!(events.next()?, Some(json!({"seq": 4})));
+        assert_eq!(events.next()?, None, "nothing new yet");
+        let mut theirs = theirs.ok_or("no writer")?;
+        theirs.write_all(b"0\r\n\r\n")?;
+        assert_eq!(
+            events.next().map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::UnexpectedEof)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_refusal_is_named_by_a_code_of_the_contract() {
+        // M2T06R-60, -61: a refused start by the code its line names; a body with no code by its status.
+        assert_eq!(
+            refused_code("hoh host: DB_WAL_UNSUPPORTED: the probe saw no lock"),
+            "DB_WAL_UNSUPPORTED"
+        );
+        assert_eq!(refused_code("hoh host: the schema is too new"), "GONE");
+        assert_eq!(status_code(404), "NOT_FOUND");
+        assert_eq!(status_code(500), "GONE");
+    }
+
+    #[test]
+    fn a_path_segment_keeps_only_unreserved_bytes() {
+        assert_eq!(encode("R-1_a.b~"), "R-1_a.b~");
+        assert_eq!(encode("R1?x"), "R1%3Fx");
+        assert_eq!(encode("a b/c#%"), "a%20b%2Fc%23%25");
+        assert_eq!(encode("é"), "%C3%A9");
     }
 
     #[test]

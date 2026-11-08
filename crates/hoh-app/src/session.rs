@@ -88,7 +88,12 @@ fn signals() -> Arc<AtomicUsize> {
 
 /// The run `run_id` names, or why not.
 fn run_of(host: &HostInfo, run_id: &str) -> Result<Value, u8> {
-    match client::call(host, "GET", &format!("/v1/runs/{run_id}"), None) {
+    match client::call(
+        host,
+        "GET",
+        &format!("/v1/runs/{}", client::encode(run_id)),
+        None,
+    ) {
         Ok(reply) if reply.status == 200 => Ok(reply.json()),
         Ok(reply) if reply.status == 404 => {
             say!("hoh: RUN_NOT_FOUND: 没有 Run {run_id}");

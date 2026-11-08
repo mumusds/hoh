@@ -36,6 +36,8 @@ pub(super) struct Shared {
     pub(super) stop: tokio::sync::watch::Receiver<bool>,
     /// The event streams open now (docs/adr/ADR-021.md decision 6).
     pub(super) subscribers: std::sync::atomic::AtomicUsize,
+    /// Every event stream opened so far (M2T06R-57: a brief subscription shows here, not in the gauge).
+    pub(super) opened: std::sync::atomic::AtomicUsize,
 }
 
 /// One open event stream, counted while it lives.
@@ -45,6 +47,9 @@ impl Subscribed {
     fn new(shared: Arc<Shared>) -> Subscribed {
         shared
             .subscribers
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        shared
+            .opened
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Subscribed(shared)
     }

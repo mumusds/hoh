@@ -12,6 +12,7 @@ mod control;
 mod http;
 mod reconcile;
 mod runner;
+pub use control::ATTEMPT_ENV;
 pub use reconcile::ReconcileSettings;
 pub use runner::{Executor, Gate, Outcome, RunnerConfig, RunnerPoint, Started, Work};
 
@@ -315,6 +316,7 @@ impl Host {
             hooks: config.hooks.clone(),
             stop: stopped.clone(),
             subscribers: std::sync::atomic::AtomicUsize::new(0),
+            opened: std::sync::atomic::AtomicUsize::new(0),
         });
         let mut served = vec![
             tokio::spawn(http::serve(
@@ -401,6 +403,11 @@ impl Host {
         self.shared
             .subscribers
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many event streams were opened since the host started.
+    pub fn streams_opened(&self) -> usize {
+        self.shared.opened.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Whether the database writer still runs (it ends only at the stop, or on a panic, M2T12R-150).

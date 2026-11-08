@@ -35,12 +35,27 @@ use tokio::sync::{oneshot, watch};
 /// What an executor is given for one attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Work {
+    /// The project's id (unique: made once, at its first host's start).
+    pub project_id: String,
     pub run_id: String,
     pub task_id: String,
     pub attempt_id: String,
     pub role: String,
     /// The key of the attempt's own work effect: the run marker its process leaves (ADR-019 decision 6).
     pub effect_key: String,
+}
+
+impl Work {
+    /// The value of [`super::ATTEMPT_ENV`] for this attempt: its project's id and its own, so no other project's
+    /// attempt of the same id shares it.
+    pub fn marker(&self) -> String {
+        marker(&self.project_id, &self.attempt_id)
+    }
+}
+
+/// The marker of attempt `attempt_id` of project `project_id` (see [`Work::marker`]).
+pub(super) fn marker(project_id: &str, attempt_id: &str) -> String {
+    format!("{project_id}/{attempt_id}")
 }
 
 /// How an attempt's process ended.
@@ -107,6 +122,8 @@ pub trait Executor: Send + Sync + std::fmt::Debug {
     /// Hand `work` over; the answer says the executor has it (the ACK).
     fn deliver(&self, work: &Work) -> oneshot::Receiver<Result<(), String>>;
     /// Start `work`'s process held at its start gate: nothing of the agent may run before [`Started::gate`] opens.
+    /// The leader's environment has [`super::ATTEMPT_ENV`] set to [`Work::marker`], which its descendants inherit: a
+    /// cancel finds by it the attempt's processes that left its group (docs/adr/ADR-021.md decision 8d).
     /// When the leader ends, the executor SIGKILLs its process group while the leader is an unreaped zombie, reaps
     /// it, waits for the group to be empty and reports that in [`Outcome::group_gone`] (the hoh-agents substrate's
     /// order: group SIGKILL, reap, `group_gone`).
@@ -309,6 +326,7 @@ async fn tick(
     for notice in waiting.dispatches {
         let id = notice.attempt_id.clone();
         let work = Work {
+            project_id: common.shared.project_id.clone(),
             run_id: notice.run_id.clone(),
             task_id: notice.task_id.clone(),
             attempt_id: id.clone(),

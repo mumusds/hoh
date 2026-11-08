@@ -365,6 +365,10 @@ fn test_005_02_concurrent_attaches_start_exactly_one_host_and_see_the_same_event
         sequences.push(seqs);
     }
     assert!(!sequences[0].is_empty());
+    // Each in strictly increasing order: no event twice, none out of order (M2T06R-52).
+    for seqs in &sequences {
+        assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{seqs:?}");
+    }
     assert!(
         sequences.iter().all(|s| s == &sequences[0]),
         "{sequences:?}"
@@ -389,6 +393,8 @@ async fn test_005_03_an_attach_without_a_tty_lists_two_runs_and_an_unknown_id_is
 {
     // AC-005-03: a host with two runs not ended; stdin and stdout are pipes.
     let env = Env::new()?;
+    // A product host this test's commands would start is stopped however the test ends (M2T06R-62).
+    let _daemons = Daemons(env.project());
     let host = Host::start(config(&env.project())).await?;
     execute(
         &env.project(),
@@ -397,6 +403,7 @@ async fn test_005_03_an_attach_without_a_tty_lists_two_runs_and_an_unknown_id_is
            ('R2', :p, 'PAUSED', 'AUTO', '2026-11-07T00:00:01Z');",
     )?;
     let runs = query(&env.project(), "SELECT count(*) FROM runs")?;
+    let opened = host.streams_opened();
     let project = env.project();
     let attach = tokio::task::spawn_blocking(move || -> Result<Output, String> {
         let child = Command::new(HOH)
@@ -421,6 +428,8 @@ async fn test_005_03_an_attach_without_a_tty_lists_two_runs_and_an_unknown_id_is
     assert!(stderr.contains("R1") && stderr.contains("R2"), "{stderr}");
     assert!(first.stdout.is_empty());
     assert_eq!((subscribed, host.subscribers()), (0, 0));
+    // Not even briefly (M2T06R-57).
+    assert_eq!(host.streams_opened(), opened);
     let second = env.hoh(&["attach", "run-does-not-exist"])?;
     assert_ne!(second.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&second.stderr).contains("RUN_NOT_FOUND"));
@@ -438,6 +447,8 @@ async fn an_attach_to_a_run_that_ended_shows_every_event_of_it_before_it_exits()
     // M2T06R-03 (REQ-005 behaviour 3): R ended CANCELLED before the attach, its events between another run's. The
     // follow replays all of R's events, in order, and exits with the cancel's code only after R's ending event.
     let env = Env::new()?;
+    // A product host this test's commands would start is stopped however the test ends (M2T06R-62).
+    let _daemons = Daemons(env.project());
     let host = Host::start(config(&env.project())).await?;
     execute(
         &env.project(),
@@ -481,6 +492,8 @@ async fn an_attach_without_a_run_id_looks_at_every_page_of_runs() -> R {
     // M2T06R-05 (REQ-005 failure mode 3): 501 runs, only the oldest and the newest not ended, a page holding 500. The
     // two are listed on stderr and none is picked.
     let env = Env::new()?;
+    // A product host this test's commands would start is stopped however the test ends (M2T06R-62).
+    let _daemons = Daemons(env.project());
     let host = Host::start(config(&env.project())).await?;
     execute(
         &env.project(),
@@ -507,6 +520,31 @@ async fn an_attach_without_a_run_id_looks_at_every_page_of_runs() -> R {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attach_to_an_id_that_names_no_run_is_run_not_found_whatever_its_characters() -> R {
+    // M2T06R-54 (REQ-005 failure mode 2): R1 exists; ids that are R1 with URL syntax after it, or have a space, name no
+    // run: RUN_NOT_FOUND, 64, nothing printed on stdout.
+    let env = Env::new()?;
+    let _daemons = Daemons(env.project());
+    let host = Host::start(config(&env.project())).await?;
+    execute(
+        &env.project(),
+        "INSERT INTO runs(run_id, project_id, state, mode, created_at) VALUES
+           ('R1', :p, 'PAUSED', 'AUTO', '2026-11-07T00:00:00Z');",
+    )?;
+    for id in ["R1?x", "R1#x", "R1/..", "no such", "R1%3F"] {
+        let out = env.hoh(&["attach", id, "--output", "json"])?;
+        assert_eq!(out.status.code(), Some(64), "{id:?}");
+        assert!(out.stdout.is_empty(), "{id:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("RUN_NOT_FOUND"), "{id:?}: {stderr}");
+    }
+    let out = env.hoh(&["attach", "R1", "--output", "json"])?;
+    assert_eq!(out.status.code(), Some(0));
+    host.shutdown().await;
+    Ok(())
+}
+
 /// A StartRun's commit that fails (CR-006 F3: the test's fault hook; the product's does nothing).
 #[derive(Debug)]
 struct FullDisk;
@@ -525,6 +563,8 @@ async fn test_005_05_a_startrun_whose_commit_fails_prints_nothing_and_leaves_no_
     let env = Env::new()?;
     let mut config = config(&env.project());
     config.store.faults = std::sync::Arc::new(FullDisk);
+    // A product host this test's commands would start is stopped however the test ends (M2T06R-62).
+    let _daemons = Daemons(env.project());
     let host = Host::start(config).await?;
     let project = env.project();
     let out = tokio::task::spawn_blocking(move || -> Result<Output, String> {
