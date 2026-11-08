@@ -433,6 +433,80 @@ async fn test_005_03_an_attach_without_a_tty_lists_two_runs_and_an_unknown_id_is
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attach_to_a_run_that_ended_shows_every_event_of_it_before_it_exits() -> R {
+    // M2T06R-03 (REQ-005 behaviour 3): R ended CANCELLED before the attach, its events between another run's. The
+    // follow replays all of R's events, in order, and exits with the cancel's code only after R's ending event.
+    let env = Env::new()?;
+    let host = Host::start(config(&env.project())).await?;
+    execute(
+        &env.project(),
+        "INSERT INTO runs(run_id, project_id, state, mode, created_at) VALUES
+           ('R', :p, 'CANCELLED', 'AUTO', '2026-11-07T00:00:00Z'),
+           ('Q', :p, 'RUNNING', 'AUTO', '2026-11-07T00:00:01Z');
+         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+           (:p, 'e1', 'R', 'run.created', '{}', '2026-11-07T00:00:00Z'),
+           (:p, 'e2', 'Q', 'run.created', '{}', '2026-11-07T00:00:01Z'),
+           (:p, 'e3', 'R', 'run.cancel_requested', '{}', '2026-11-07T00:00:02Z'),
+           (:p, 'e4', 'R', 'cancel.reaped', '{}', '2026-11-07T00:00:03Z'),
+           (:p, 'e5', 'Q', 'run.paused', '{}', '2026-11-07T00:00:04Z'),
+           (:p, 'e6', 'R', 'cancel.workspace', '{}', '2026-11-07T00:00:05Z'),
+           (:p, 'e7', 'R', 'run.cancelled', '{}', '2026-11-07T00:00:06Z');",
+    )?;
+    let want: Vec<i64> = query(
+        &env.project(),
+        "SELECT group_concat(seq, ' ') FROM (SELECT seq FROM events WHERE run_id = 'R' ORDER BY seq)",
+    )?
+    .split(' ')
+    .map(str::parse)
+    .collect::<Result<_, _>>()?;
+    let out = env.hoh(&["attach", "R", "--output", "stream-json"])?;
+    assert_eq!(
+        out.status.code(),
+        Some(5),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let seen: Vec<i64> = String::from_utf8(out.stdout)?
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).map(|e| e["seq"].as_i64().unwrap_or(-1)))
+        .collect::<Result<_, _>>()?;
+    assert_eq!(seen, want);
+    host.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attach_without_a_run_id_looks_at_every_page_of_runs() -> R {
+    // M2T06R-05 (REQ-005 failure mode 3): 501 runs, only the oldest and the newest not ended, a page holding 500. The
+    // two are listed on stderr and none is picked.
+    let env = Env::new()?;
+    let host = Host::start(config(&env.project())).await?;
+    execute(
+        &env.project(),
+        "INSERT INTO runs(run_id, project_id, state, mode, created_at) VALUES
+           ('R0', :p, 'PAUSED', 'AUTO', '2026-11-07T00:00:00Z');
+         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 499)
+         INSERT INTO runs(run_id, project_id, state, mode, created_at)
+           SELECT 'R' || i, :p, 'COMPLETED', 'AUTO', '2026-11-07T00:00:01Z' FROM n;
+         INSERT INTO runs(run_id, project_id, state, mode, created_at) VALUES
+           ('R500', :p, 'PAUSED', 'AUTO', '2026-11-07T00:00:02Z');",
+    )?;
+    assert_eq!(query(&env.project(), "SELECT count(*) FROM runs")?, "501");
+    let out = env.hoh(&["attach", "--output", "json"])?;
+    assert_eq!(out.status.code(), Some(64));
+    assert!(out.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let listed: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.starts_with("  R"))
+        .map(str::trim)
+        .collect();
+    assert_eq!(listed, ["R500  PAUSED", "R0  PAUSED"], "{stderr}");
+    host.shutdown().await;
+    Ok(())
+}
+
 /// A StartRun's commit that fails (CR-006 F3: the test's fault hook; the product's does nothing).
 #[derive(Debug)]
 struct FullDisk;
