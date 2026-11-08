@@ -415,6 +415,20 @@ pub(super) enum Tracking {
     },
     /// Why there is no cgroup.
     Proc(String),
+    /// Recorded by a host that saw another world (other pid, mount, cgroup or user namespaces): nothing this host sees of
+    /// the attempt's processes, cgroup or records is theirs, so nothing is proved (M2T06R-900); why.
+    Foreign(String),
+}
+
+/// The namespaces this process sees the system through (`/proc/self/ns/{pid,mnt,cgroup,user}`), as recorded with each
+/// attempt's tracking: a later host that sees another world proves nothing of it (decision 8d v7, M2T06R-900).
+pub(super) fn world() -> Option<serde_json::Value> {
+    let mut seen = serde_json::Map::new();
+    for name in ["pid", "mnt", "cgroup", "user"] {
+        let link = std::fs::read_link(format!("/proc/self/ns/{name}")).ok()?;
+        seen.insert(name.to_owned(), serde_json::json!(link.to_string_lossy()));
+    }
+    Some(serde_json::Value::Object(seen))
 }
 
 impl Tracking {
@@ -425,9 +439,13 @@ impl Tracking {
                 "attempt_id": attempt_id, "tracking": "cgroup", "cgroup": path.to_string_lossy(),
                 "boot_id": witness.as_ref().map(|w| w.boot.clone()),
                 "inodes": witness.as_ref().map(|w| w.chain.iter().map(|(d, i)| [*d, *i]).collect::<Vec<_>>()),
+                "world": world(),
             }),
             Tracking::Proc(reason) => serde_json::json!({
-                "attempt_id": attempt_id, "tracking": "proc", "reason": reason,
+                "attempt_id": attempt_id, "tracking": "proc", "reason": reason, "world": world(),
+            }),
+            Tracking::Foreign(why) => serde_json::json!({
+                "attempt_id": attempt_id, "tracking": "foreign", "reason": why,
             }),
         }
     }
@@ -435,6 +453,19 @@ impl Tracking {
     /// From its `attempt.tracking` event: none recorded (an attempt of an earlier host version, or one whose start
     /// recorded none) is tracked by the /proc scan.
     pub(super) fn of(event: Option<&serde_json::Value>) -> Tracking {
+        Tracking::seen_from(event, world())
+    }
+
+    /// [`Tracking::of`] by a host that sees `now`: a record made in another world is foreign.
+    fn seen_from(event: Option<&serde_json::Value>, now: Option<serde_json::Value>) -> Tracking {
+        if let Some(recorded) = event.map(|e| &e["world"]).filter(|w| !w.is_null())
+            && now.as_ref() != Some(recorded)
+        {
+            return Tracking::Foreign(format!(
+                "recorded seeing {recorded}, this host sees {}",
+                now.unwrap_or(serde_json::Value::Null)
+            ));
+        }
         match event {
             Some(e) if e["tracking"] == "cgroup" => e["cgroup"]
                 .as_str()
@@ -459,7 +490,7 @@ impl Tracking {
                 root: PathBuf::from(MOUNT),
                 witness: witness.clone(),
             }),
-            Tracking::Proc(_) => None,
+            Tracking::Proc(_) | Tracking::Foreign(_) => None,
         }
     }
 
@@ -640,6 +671,35 @@ mod tests {
         assert_eq!(event["inodes"].as_array().map(Vec::len), Some(2), "{event}");
         assert_eq!(witness_of(&event).as_ref(), group.witness());
         Ok(())
+    }
+
+    #[test]
+    fn a_record_made_in_another_world_is_foreign() {
+        // M2T06R-900 (decision 8d v7): a host started in other namespaces (a new mount namespace over /proc or the
+        // cgroup mount, another pid namespace) sees another world; what it sees proves nothing of an attempt recorded
+        // in this one. A record without a world (none is written so) is read as before.
+        let now = world();
+        assert!(now.is_some(), "this process's namespaces");
+        let recorded = Tracking::Proc("p".to_owned()).json("p/A1");
+        assert_eq!(
+            Tracking::seen_from(Some(&recorded), now.clone()),
+            Tracking::Proc("p".to_owned())
+        );
+        let elsewhere = serde_json::json!({"pid": "pid:[1]", "mnt": "mnt:[1]", "cgroup": "cgroup:[1]", "user": "user:[1]"});
+        assert!(matches!(
+            Tracking::seen_from(Some(&recorded), Some(elsewhere)),
+            Tracking::Foreign(_)
+        ));
+        assert!(matches!(
+            Tracking::seen_from(Some(&recorded), None),
+            Tracking::Foreign(_)
+        ));
+        let mut legacy = recorded.clone();
+        legacy["world"] = serde_json::Value::Null;
+        assert_eq!(
+            Tracking::seen_from(Some(&legacy), None),
+            Tracking::Proc("p".to_owned())
+        );
     }
 
     #[test]

@@ -131,6 +131,12 @@ pub(super) fn end(
     tracking: &Tracking,
     settings: &ReconcileSettings,
 ) -> Process {
+    // Recorded by a host that saw another world: nothing seen here is the attempt's (M2T06R-900).
+    if let Tracking::Foreign(why) = tracking {
+        return Process::Uncertain {
+            basis: format!("recorded_in_another_world: {why}"),
+        };
+    }
     let cgroup = tracking.cgroup();
     let mut outside = Outside::new(&super::runner::marker(&row.project_id, &row.attempt_id));
     let (term, kill) = (settings.term_grace, settings.kill_grace);
@@ -440,6 +446,41 @@ mod tests {
             Seen::Uncertain(_)
         ));
         Ok(())
+    }
+
+    #[test]
+    fn an_attempt_recorded_in_another_world_is_never_ended() {
+        // M2T06R-900: whatever this host finds of it (here nothing: a record whose pid names no process), an attempt
+        // recorded by a host that saw other namespaces stays uncertain.
+        let row = UnfinishedRow {
+            project_id: "p".to_owned(),
+            run_id: "R".to_owned(),
+            attempt_id: "A1".to_owned(),
+            task_id: "T1".to_owned(),
+            state: AttemptState::Running,
+            task_state: hoh_core::protocol::TaskState::Running,
+            task_revision: 1,
+            pid: None,
+            boot_id: None,
+            process_start_id: None,
+            effects: Vec::new(),
+            lease_expired: true,
+            lease_epoch: Some(1),
+            work_outcome: None,
+            work_class: None,
+            work_ended_at: None,
+            cancel_requested: false,
+        };
+        let process = end(
+            Seen::Gone("no_process".to_owned()),
+            &row,
+            &Tracking::Foreign("elsewhere".to_owned()),
+            &ReconcileSettings::default(),
+        );
+        assert!(
+            matches!(&process, Process::Uncertain { basis } if basis.starts_with("recorded_in_another_world")),
+            "{process:?}"
+        );
     }
 
     #[test]
