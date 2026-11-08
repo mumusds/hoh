@@ -76,7 +76,9 @@ impl Seen {
 /// Inspect `row`'s process (blocking; no signal) by its record: only a whole identity that matches is ours; a record
 /// with a pid but no boot or start time, a leader gone with members left in its group (which may be another
 /// process's that reused its number), a RUNNING attempt with no record, and an inspection that fails are uncertain
-/// (M2T05R-01, -02, -100, -200). One mapping for the reconcile at a start and the runner's settle (M2T05R-151).
+/// (M2T05R-01, -02, -100, -200), except that an unconfirmed record whose number no process uses, as pid or as group,
+/// is gone (decision 8d v7, M2T06R-600, -700). One mapping for the reconcile at a start and the runner's settle
+/// (M2T05R-151).
 pub(super) fn inspect(row: &UnfinishedRow) -> Seen {
     if row.state == AttemptState::Prepared {
         return Seen::NotStarted;

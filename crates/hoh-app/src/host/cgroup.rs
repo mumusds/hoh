@@ -308,7 +308,6 @@ mod tests {
 
     type R<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
-    /// A cgroup of a test's own (a directory with the files a cgroup has), `populated` as given, no members.
     #[test]
     fn a_cgroups_subtree_is_every_cgroup_below_it_and_goes_bottom_up() -> R {
         // M2T06R-651 (decision 8d v7): SIGTERM goes to every cgroup below the attempt's, however deep, and a proved
@@ -340,6 +339,7 @@ mod tests {
         Ok(())
     }
 
+    /// A cgroup of a test's own (a directory with the files a cgroup has), `populated` as given, no members.
     fn fake(populated: u8) -> R<tempfile::TempDir> {
         let dir = tempfile::tempdir()?;
         std::fs::write(

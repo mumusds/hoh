@@ -257,7 +257,7 @@ impl Processes for HostProcesses {
             // Its group cannot be told apart, or its leader not inspected or confirmed: no signal may go to the group
             // (ADR-019 decision 8). With a cgroup, its members are stopped by their membership, and the group must be
             // seen gone by its number (decision 8d v6, M2T06R-401; v7, M2T06R-500: never taken for gone); without one
-            // it stays cancelling.
+            // it stays cancelling while its number is in use, as pid or as group (below, M2T06R-600, -700).
             Ok(Presence::Leaderless(left)) if cgroup.is_some() => {
                 (Box::new(control(Watch::Number(left.pgid))), false)
             }
