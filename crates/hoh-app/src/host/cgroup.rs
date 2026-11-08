@@ -1,7 +1,9 @@
-//! Attempts' cgroups, the termination proof when the host runs in a delegated cgroup v2 (docs/adr/ADR-021.md decision
-//! 8d v5, CR-011): each attempt's leader is moved into a cgroup of its own before its start gate opens, so everything
-//! it starts stays there whatever it does (fork, setsid, threads, its environment); `cgroup.kill` ends them all at
-//! once and `populated 0` in `cgroup.events` proves none is left.
+//! Attempts' cgroups, part of the termination proof when the host runs in a delegated cgroup v2 (docs/adr/ADR-021.md
+//! decision 8d v7, CR-011, CR-012): each attempt's leader is moved into a cgroup of its own before its start gate opens,
+//! so what it starts stays there through fork, setsid, threads and changes of its environment, though a same-user
+//! process can move itself out (M2T06R-400); `cgroup.kill` ends the subtree's members at once and `populated 0` in
+//! `cgroup.events` proves none is left in it. The proof also needs the process group empty and the marker scan's
+//! proof for what left (control.rs, reconcile.rs, runner.rs).
 
 use super::processes::Proof;
 use sha2::{Digest, Sha256};
@@ -22,17 +24,35 @@ pub(super) struct Delegated {
 
 impl Delegated {
     /// The cgroup this process is in, if it is delegated to it: cgroup v2 (`0::<path>`), and a cgroup can be made
-    /// below it and removed again.
-    pub(super) fn detect() -> Option<Delegated> {
-        let text = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-        let path = text.lines().find_map(|line| line.strip_prefix("0::"))?;
+    /// below it and removed again; else why not (host.json records it, M2T06R-557).
+    pub(super) fn detect() -> Result<Delegated, String> {
+        let text = std::fs::read_to_string("/proc/self/cgroup")
+            .map_err(|e| format!("/proc/self/cgroup cannot be read: {e}"))?;
+        let path = text
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .ok_or("it is in no cgroup v2 hierarchy")?;
         let base = Path::new(MOUNT).join(path.trim().trim_start_matches('/'));
         let probe = base.join(format!("hoh-probe-{}", std::process::id()));
-        std::fs::create_dir(&probe).ok()?;
+        std::fs::create_dir(&probe).map_err(|e| {
+            format!(
+                "its own cgroup {} is not delegated to it (no cgroup can be made below it: {e})",
+                base.display()
+            )
+        })?;
         // cgroup.kill (Linux 5.14): without it a member that ignores SIGTERM could not be stopped (M2T06R-457).
         let kills = probe.join("cgroup.kill").exists();
-        std::fs::remove_dir(&probe).ok()?;
-        kills.then_some(Delegated { base })
+        std::fs::remove_dir(&probe).map_err(|e| {
+            format!(
+                "its probe cgroup {} cannot be removed: {e}",
+                probe.display()
+            )
+        })?;
+        if kills {
+            Ok(Delegated { base })
+        } else {
+            Err("its cgroups have no cgroup.kill (Linux 5.14 or later is needed)".to_owned())
+        }
     }
 
     /// The cgroup of the attempt with `marker` (`<project id>/<attempt id>`): a name of hex digits, unique per
@@ -234,7 +254,8 @@ fn recorded_form(path: &Path) -> bool {
             .is_some_and(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
-/// How an attempt's processes are tracked (decision 8d v5): by its cgroup, or (degraded) by the /proc scan.
+/// How an attempt's processes are tracked (decision 8d v5 to v7): by its cgroup with the marker scan, or (degraded) by
+/// the /proc scan alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Tracking {
     Cgroup(PathBuf),

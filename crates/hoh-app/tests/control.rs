@@ -2246,3 +2246,289 @@ async fn cgroup_nested_member_inside() -> R {
     host.shutdown().await;
     Ok(())
 }
+
+#[test]
+fn in_a_delegated_cgroup_an_expired_lease_is_given_up_only_once_a_process_that_moved_out_is_gone()
+-> R {
+    in_delegated_scope("cgroup_moved_out_settle_inside")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs inside a delegated scope, started by in_a_delegated_cgroup_an_expired_lease_is_given_up_only_once_a_process_that_moved_out_is_gone"]
+async fn cgroup_moved_out_settle_inside() -> R {
+    // M2T06R-550 (decision 8d v6, path 3): T1 holds the writer lease and its agent left a writer that moved itself out
+    // of the attempt's cgroup, keeping its marker; the clock moves past the lease. The settle's proof includes the
+    // marker scan: the writer gets SIGTERM (ignored) and SIGKILL, and T2 gets the lease only after it is gone.
+    if std::env::var_os(IN_SCOPE).is_none() {
+        return Ok(());
+    }
+    let base = own_cgroup()?;
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let (file, pid_file) = (dir.path().join("written.txt"), dir.path().join("w.pid"));
+    let script = format!(
+        "{}; while :; do sleep 0.1; done",
+        migrating_writer(&file, &pid_file, &base)?
+    );
+    let _guard = KillPidFile(pid_file.clone());
+    let agents = Arc::new(Agents::new(&[("T1", script.as_str())]));
+    let _leaders = Leaders(agents.leaders.clone());
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    Host::start(config(&project)).await?.shutdown().await;
+    seed(&project, WORLD)?;
+    let clock = Arc::new(FakeClock::default());
+    let mut config = config(&project);
+    config.clock = hoh_app::host::HostClock(clock.clone());
+    config.runner = Some(hoh_app::host::RunnerConfig {
+        executor: agents.clone(),
+        context: context(),
+    });
+    let host = start_when_free(config).await?;
+    until(
+        &project,
+        "SELECT state FROM attempts WHERE task_id = 'T1'",
+        "RUNNING",
+        Duration::from_secs(10),
+    )
+    .await?;
+    assert_eq!(tracking(&project)?.0, "cgroup");
+    moved_out(&pid_file, &base).await?;
+    clock.advance(Duration::from_secs(300));
+    until(
+        &project,
+        "SELECT count(*) FROM attempts WHERE task_id = 'T2'",
+        "1",
+        Duration::from_secs(40),
+    )
+    .await?;
+    assert!(
+        gone(&pid_file)?,
+        "T2 got the lease while the writer that left T1's cgroup lived"
+    );
+    assert_eq!(
+        seq(
+            &project,
+            "SELECT count(*) FROM events WHERE kind IN ('lease.outside_sigterm', 'lease.outside_sigkill')"
+        )?,
+        2
+    );
+    host.shutdown().await;
+    Ok(())
+}
+
+#[test]
+fn in_a_delegated_cgroup_a_hosts_start_reconcile_ends_an_attempt_only_once_a_process_that_moved_out_is_gone()
+-> R {
+    in_delegated_scope("cgroup_moved_out_start_reconcile_inside")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs inside a delegated scope, started by in_a_delegated_cgroup_a_hosts_start_reconcile_ends_an_attempt_only_once_a_process_that_moved_out_is_gone"]
+async fn cgroup_moved_out_start_reconcile_inside() -> R {
+    // M2T06R-550 (decision 8d v6, path 4): the host stops with T1 running and its writer that moved itself out of the
+    // attempt's cgroup, keeping its marker. The next host's reconcile empties the cgroup and, by the marker scan, stops
+    // the writer before it ends the attempt.
+    if std::env::var_os(IN_SCOPE).is_none() {
+        return Ok(());
+    }
+    let base = own_cgroup()?;
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let (file, pid_file) = (dir.path().join("written.txt"), dir.path().join("w.pid"));
+    let script = format!(
+        "{}; while :; do sleep 0.1; done",
+        migrating_writer(&file, &pid_file, &base)?
+    );
+    let _guard = KillPidFile(pid_file.clone());
+    let agents = Arc::new(Agents::new(&[("T1", script.as_str())]));
+    let _leaders = Leaders(agents.leaders.clone());
+    let (project, first) = host(dir.path(), &agents).await?;
+    until(
+        &project,
+        "SELECT state FROM attempts WHERE task_id = 'T1'",
+        "RUNNING",
+        Duration::from_secs(10),
+    )
+    .await?;
+    assert_eq!(tracking(&project)?.0, "cgroup");
+    moved_out(&pid_file, &base).await?;
+    first.shutdown().await;
+    let reconciled = seq(
+        &project,
+        "SELECT count(*) FROM events WHERE kind = 'reconcile.completed'",
+    )?;
+    let second = start_when_free(config(&project)).await?;
+    until(
+        &project,
+        "SELECT count(*) FROM events WHERE kind = 'reconcile.completed'",
+        &(reconciled + 1).to_string(),
+        Duration::from_secs(40),
+    )
+    .await?;
+    assert_ne!(
+        query(&project, "SELECT state FROM attempts WHERE task_id = 'T1'")?,
+        "RUNNING"
+    );
+    assert!(
+        gone(&pid_file)?,
+        "the attempt ended while the writer that left its cgroup lived"
+    );
+    let steps = query(
+        &project,
+        "SELECT json_extract(payload_json, '$.process.steps') FROM events WHERE kind = 'reconcile.attempt' \
+         AND json_extract(payload_json, '$.attempt_id') = 'T1/attempt-1' ORDER BY seq DESC LIMIT 1",
+    )?;
+    assert!(
+        steps.contains("outside_sigterm") && steps.contains("outside_sigkill"),
+        "{steps}"
+    );
+    second.shutdown().await;
+    Ok(())
+}
+
+#[test]
+fn in_a_delegated_cgroup_a_hosts_start_reconcile_stops_a_group_left_without_its_leader_through_the_cgroup()
+-> R {
+    in_delegated_scope("cgroup_leaderless_start_reconcile_inside")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs inside a delegated scope, started by in_a_delegated_cgroup_a_hosts_start_reconcile_stops_a_group_left_without_its_leader_through_the_cgroup"]
+async fn cgroup_leaderless_start_reconcile_inside() -> R {
+    // M2T06R-551 (decision 8d v6, M2T06R-401, path 4): T1's leader ended and was reaped, its member lives on in its group
+    // and in the attempt's cgroup; the host stops. The next host's reconcile cannot tell the group apart (no signal
+    // to it) but stops the cgroup by membership, looks at the group again, sees it gone and ends the attempt.
+    if std::env::var_os(IN_SCOPE).is_none() {
+        return Ok(());
+    }
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let leaders = Arc::new(Mutex::new(Vec::new()));
+    let _leaders = Leaders(leaders.clone());
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    Host::start(config(&project)).await?.shutdown().await;
+    seed(&project, WORLD)?;
+    let mut with_runner = config(&project);
+    with_runner.runner = Some(hoh_app::host::RunnerConfig {
+        executor: Arc::new(LeavesItsGroup(leaders.clone(), "sleep 60")),
+        context: context(),
+    });
+    let first = start_when_free(with_runner).await?;
+    until(
+        &project,
+        "SELECT count(*) FROM events WHERE kind = 'runner.unreaped'",
+        "1",
+        Duration::from_secs(20),
+    )
+    .await?;
+    assert_eq!(tracking(&project)?.0, "cgroup");
+    let leader: u32 = query(&project, "SELECT pid FROM attempts WHERE task_id = 'T1'")?.parse()?;
+    first.shutdown().await;
+    let group = i32::try_from(leader)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+        .ok_or("no group")?;
+    assert!(
+        rustix::process::test_kill_process_group(group).is_ok(),
+        "the precondition: a group without its leader"
+    );
+    let reconciled = seq(
+        &project,
+        "SELECT count(*) FROM events WHERE kind = 'reconcile.completed'",
+    )?;
+    let second = start_when_free(config(&project)).await?;
+    until(
+        &project,
+        "SELECT count(*) FROM events WHERE kind = 'reconcile.completed'",
+        &(reconciled + 1).to_string(),
+        Duration::from_secs(40),
+    )
+    .await?;
+    assert_ne!(
+        query(&project, "SELECT state FROM attempts WHERE task_id = 'T1'")?,
+        "RUNNING",
+        "the attempt was left though its cgroup and group were stopped"
+    );
+    assert!(
+        rustix::process::test_kill_process_group(group).is_err(),
+        "the group's member lives on"
+    );
+    second.shutdown().await;
+    Ok(())
+}
+
+#[test]
+fn in_a_delegated_cgroup_a_hosts_start_reconcile_keeps_an_attempt_whose_leaderless_group_lives_out_of_the_cgroup()
+-> R {
+    in_delegated_scope("cgroup_leaderless_outside_start_reconcile_inside")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs inside a delegated scope, started by in_a_delegated_cgroup_a_hosts_start_reconcile_keeps_an_attempt_whose_leaderless_group_lives_out_of_the_cgroup"]
+async fn cgroup_leaderless_outside_start_reconcile_inside() -> R {
+    // M2T06R-551 (decision 8d v6, path 4): T1's leader was reaped and its member moved itself out of the attempt's
+    // cgroup with an emptied environment, staying in the leader's group; the host stops. The next host's reconcile
+    // finds the cgroup empty and the marker scan quiet, but the group without its leader still lives: the attempt and
+    // its slot stay (it ended, and the lease would go, when the group was not looked at again).
+    if std::env::var_os(IN_SCOPE).is_none() {
+        return Ok(());
+    }
+    let base = own_cgroup()?;
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let leaders = Arc::new(Mutex::new(Vec::new()));
+    let _leaders = Leaders(leaders.clone());
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    Host::start(config(&project)).await?.shutdown().await;
+    seed(&project, WORLD)?;
+    let member: &'static str = Box::leak(
+        format!(
+            "sh -c 'echo $$ > {}/cgroup.procs && exec env -i /bin/sleep 60'",
+            base.display()
+        )
+        .into_boxed_str(),
+    );
+    let mut with_runner = config(&project);
+    with_runner.runner = Some(hoh_app::host::RunnerConfig {
+        executor: Arc::new(LeavesItsGroup(leaders.clone(), member)),
+        context: context(),
+    });
+    let first = start_when_free(with_runner).await?;
+    until(
+        &project,
+        "SELECT count(*) FROM events WHERE kind = 'runner.unreaped'",
+        "1",
+        Duration::from_secs(20),
+    )
+    .await?;
+    let leader: u32 = query(&project, "SELECT pid FROM attempts WHERE task_id = 'T1'")?.parse()?;
+    first.shutdown().await;
+    let group = i32::try_from(leader)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+        .ok_or("no group")?;
+    assert!(
+        rustix::process::test_kill_process_group(group).is_ok(),
+        "the precondition: a group without its leader"
+    );
+    let reconciled = seq(
+        &project,
+        "SELECT count(*) FROM events WHERE kind = 'reconcile.completed'",
+    )?;
+    let second = start_when_free(config(&project)).await?;
+    until(
+        &project,
+        "SELECT count(*) FROM events WHERE kind = 'reconcile.completed'",
+        &(reconciled + 1).to_string(),
+        Duration::from_secs(40),
+    )
+    .await?;
+    let state = query(&project, "SELECT state FROM attempts WHERE task_id = 'T1'")?;
+    // Stop the member by hand (the test's own).
+    let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+    assert_eq!(
+        state, "RUNNING",
+        "the attempt ended while its leaderless group lived"
+    );
+    second.shutdown().await;
+    Ok(())
+}

@@ -220,7 +220,7 @@ pub(super) async fn run(
         .await?;
     let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
     // How each was tracked: a cgroup an earlier host made is found again by the path its start recorded
-    // (docs/adr/ADR-021.md decision 8d v5).
+    // (docs/adr/ADR-021.md decision 8d v5 to v7).
     let reader = store.reader()?;
     let ids: Vec<String> = rows.iter().map(|r| r.attempt_id.clone()).collect();
     let trackings: BTreeMap<String, Tracking> = tokio::task::spawn_blocking(move || {

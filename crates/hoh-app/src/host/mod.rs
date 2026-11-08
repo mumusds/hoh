@@ -325,6 +325,12 @@ impl Host {
         }
         set_mode(&socket, 0o600)?;
         let (stop, stopped) = tokio::sync::watch::channel(false);
+        // Whether its attempts get cgroups of their own, or why not (decision 8d, M2T06R-557).
+        let delegated = if config.hooks.cgroups_allowed() {
+            cgroup::Delegated::detect()
+        } else {
+            Err("its hooks do not allow cgroups (a test's hook, CR-006)".to_owned())
+        };
         let shared = Arc::new(http::Shared {
             store,
             readers: Mutex::new(readers),
@@ -335,11 +341,7 @@ impl Host {
             stop: stopped.clone(),
             subscribers: std::sync::atomic::AtomicUsize::new(0),
             opened: std::sync::atomic::AtomicUsize::new(0),
-            cgroups: if config.hooks.cgroups_allowed() {
-                cgroup::Delegated::detect()
-            } else {
-                None
-            },
+            cgroups: delegated.as_ref().ok().cloned(),
         });
         let mut served = vec![
             tokio::spawn(http::serve(
@@ -391,17 +393,13 @@ impl Host {
                 // How its attempts' processes are tracked, as decided at its start (docs/adr/ADR-021.md decision 8d,
                 // M2T06R-402): `hoh doctor` reports this, not a guess.
                 "process_tracking": if shared.cgroups.is_some() { "cgroup" } else { "proc" },
-                "process_tracking_reason": if shared.cgroups.is_some() {
-                    "its own cgroup is delegated: each attempt gets a cgroup of its own".to_owned()
-                } else {
-                    match std::env::var(UNSCOPED_ENV) {
-                        Ok(why) if !why.is_empty() => format!(
-                            "its own cgroup is not delegated: the client started it directly because {why}"
-                        ),
-                        _ => "its own cgroup is not delegated (not started through systemd-run or a unit with \
-                              Delegate=yes)"
-                            .to_owned(),
-                    }
+                "process_tracking_reason": match (&delegated, std::env::var(UNSCOPED_ENV)) {
+                    (Ok(_), _) => "its own cgroup is delegated: each attempt gets a cgroup of its own".to_owned(),
+                    (Err(_), Ok(why)) if !why.is_empty() => format!(
+                        "its own cgroup is not delegated: the client started it directly because {why}"
+                    ),
+                    // Its own finding (M2T06R-557): a scope or unit that did not delegate, an old kernel, a test's hook.
+                    (Err(why), _) => why.clone(),
                 },
             }),
         );

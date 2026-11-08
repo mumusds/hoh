@@ -195,7 +195,7 @@ struct HostProcesses {
     project: PathBuf,
     project_id: String,
     pins: Pins,
-    /// How each running attempt is tracked, as its start recorded (decision 8d v5).
+    /// How each running attempt is tracked, as its start recorded (decision 8d v5 to v7).
     trackings: BTreeMap<String, Tracking>,
 }
 
@@ -315,12 +315,10 @@ struct AttemptControl {
     cgroup: Option<AttemptGroup>,
 }
 
-/// Whether process group `pgid` still has a member (`kill(-pgid, 0)`, which sends nothing).
+/// Whether process group `pgid` still has a member: anything but ESRCH from `kill(-pgid, 0)` (which sends nothing),
+/// EPERM included, means one is there (M2T06R-558, as [`identity::group_empty`]).
 fn group_lives(pgid: u32) -> bool {
-    i32::try_from(pgid)
-        .ok()
-        .and_then(rustix::process::Pid::from_raw)
-        .is_some_and(|pgid| rustix::process::test_kill_process_group(pgid).is_ok())
+    !identity::group_empty(pgid)
 }
 
 impl ProcessControl for AttemptControl {
@@ -796,6 +794,42 @@ mod tests {
             usage: None,
             cost_usd: None,
         }
+    }
+
+    #[test]
+    fn a_group_this_user_may_not_signal_lives() -> R {
+        // M2T06R-558 (decision 8d v7): kill(-pgid, 0) refused (EPERM: a member with other credentials) means a member
+        // is there; only ESRCH means none. A group led by a process of another user (root's daemons) stands in for it.
+        let mine = rustix::process::getuid().as_raw();
+        let other = std::fs::read_dir("/proc")?
+            .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u32>().ok())
+            .filter(|&pid| pid > 1)
+            .find(|&pid| {
+                let leads = std::fs::read(format!("/proc/{pid}/stat"))
+                    .ok()
+                    .and_then(|stat| {
+                        identity::after_command_name(&stat)?
+                            .split_whitespace()
+                            .nth(2)?
+                            .parse::<u32>()
+                            .ok()
+                    })
+                    == Some(pid);
+                let owner = std::fs::read_to_string(format!("/proc/{pid}/status"))
+                    .ok()
+                    .and_then(|s| {
+                        s.lines()
+                            .find_map(|l| l.strip_prefix("Uid:"))?
+                            .split_whitespace()
+                            .next()?
+                            .parse::<u32>()
+                            .ok()
+                    });
+                leads && owner.is_some_and(|uid| uid != mine)
+            })
+            .ok_or("no group of another user to look at")?;
+        assert!(group_lives(other), "group {other}");
+        Ok(())
     }
 
     #[test]

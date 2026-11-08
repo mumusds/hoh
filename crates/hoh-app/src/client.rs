@@ -291,9 +291,22 @@ pub struct Scope {
     no_expansion: bool,
 }
 
-/// The user this process runs as, by name (`$USER`, else `/etc/passwd` by uid).
+/// Whether `name` can name a user's file: not empty, no `/`, not `.` or `..` (M2T06R-556).
+fn plain_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains('/') && name != "." && name != ".."
+}
+
+/// Whether user `name` lingers by the records in `dir` (`/var/lib/systemd/linger`): a file named after it.
+fn lingers_in(dir: &Path, name: &str) -> bool {
+    plain_name(name) && dir.join(name).is_file()
+}
+
+/// The user this process runs as, by name (`$USER` when it is a plain name, else `/etc/passwd` by uid).
 fn user_name() -> Option<String> {
-    if let Some(name) = std::env::var_os("USER").and_then(|n| n.into_string().ok()) {
+    if let Some(name) = std::env::var_os("USER")
+        .and_then(|n| n.into_string().ok())
+        .filter(|n| plain_name(n))
+    {
         return Some(name);
     }
     let uid = rustix::process::getuid().as_raw().to_string();
@@ -311,7 +324,11 @@ fn user_name() -> Option<String> {
 /// (else that manager, and a host in one of its scopes, stops soon after the user's last session ends, which would end
 /// accepted work at an SSH disconnect, REQ-005 behaviour 2; M2T06R-453) and `systemd-run` is on PATH. How, or why not
 /// (then attempts are tracked by the /proc scan, degraded).
-pub fn delegated_scope() -> Result<Scope, String> {
+/// How long `systemd-run --version` may take (M2T06R-553): it runs in a process group of its own, through the probe
+/// runner, which ends the group at this limit or at `env`'s deadline, whichever comes first.
+const SCOPE_PROBE_LIMIT: Duration = Duration::from_secs(2);
+
+pub fn delegated_scope(env: &hoh_agents::probe::ProbeEnv) -> Result<Scope, String> {
     if !Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
         return Err("cgroup v2 is not mounted at /sys/fs/cgroup".to_owned());
     }
@@ -324,31 +341,37 @@ pub fn delegated_scope() -> Result<Scope, String> {
         );
     }
     let name = user_name().ok_or_else(|| "this user's name is not known".to_owned())?;
-    if !Path::new("/var/lib/systemd/linger").join(&name).exists() {
+    if !lingers_in(Path::new("/var/lib/systemd/linger"), &name) {
         return Err(format!(
             "user {name} does not linger: a host in the user's systemd manager would stop after the last session \
              (enable it with `loginctl enable-linger {name}`)"
         ));
     }
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    let systemd_run = std::env::split_paths(&path)
+    let systemd_run = std::env::split_paths(&env.path)
         .map(|dir| dir.join("systemd-run"))
         .find(|candidate| candidate.is_file())
         .ok_or_else(|| "systemd-run is not on PATH".to_owned())?;
-    // `systemd-run --version` says `systemd <n> (...)` (M2T06R-455).
-    let version = std::process::Command::new(&systemd_run)
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
+    // `systemd-run --version` says `systemd <n> (...)` (M2T06R-455); bounded, and in doctor's probes (M2T06R-553).
+    let bounded = hoh_agents::probe::ProbeEnv {
+        timeout: env.timeout.min(SCOPE_PROBE_LIMIT),
+        ..env.clone()
+    };
+    let version = hoh_agents::probe::run_status(&systemd_run, &["--version"], &bounded)
         .ok()
+        .filter(|out| out.status.success())
         .and_then(|out| {
             String::from_utf8_lossy(&out.stdout)
                 .split_whitespace()
                 .nth(1)
                 .and_then(|v| v.parse::<u32>().ok())
         })
-        .ok_or_else(|| format!("{} --version could not be read", systemd_run.display()))?;
+        .ok_or_else(|| {
+            format!(
+                "systemd-run --version gave no version within {} s ({})",
+                bounded.timeout.as_secs(),
+                systemd_run.display()
+            )
+        })?;
     Ok(Scope {
         systemd_run,
         no_expansion: version >= 254,
@@ -359,7 +382,14 @@ pub fn delegated_scope() -> Result<Scope, String> {
 /// manager when there is one, so its attempts are tracked by cgroups of their own; directly otherwise, or when the
 /// scope cannot be had (decision 2).
 fn start(project: &Path, end: Instant) -> Result<HostInfo, Failure> {
-    let why = match delegated_scope() {
+    let env = hoh_agents::probe::ProbeEnv {
+        path: std::env::var_os("PATH").unwrap_or_default(),
+        fixture_root: None,
+        timeout: SCOPE_PROBE_LIMIT,
+        log: None,
+        deadline: Some(end),
+    };
+    let why = match delegated_scope(&env) {
         Ok(scope) => match launch(project, end, Some(&scope), None) {
             Err(failure) if failure.exit != 78 && Instant::now() < end => {
                 // The scope was refused (or the host ended for another reason): once more, directly.
@@ -597,6 +627,20 @@ pub(crate) mod tests {
     use hoh_core::persistence::selftest::ProbeCommand;
 
     pub(crate) type R<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    #[test]
+    fn only_a_plain_user_name_with_a_linger_file_lingers() -> R {
+        // M2T06R-556: an empty name (or `.`, `..`, one with `/`) named the linger directory itself, which exists, so
+        // a user who does not linger got a host in a scope of a manager that stops after the last session.
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("ai"), b"")?;
+        std::fs::create_dir(dir.path().join("dir"))?;
+        assert!(lingers_in(dir.path(), "ai"));
+        for name in ["", ".", "..", "ai/", "../ai", "dir", "nobody"] {
+            assert!(!lingers_in(dir.path(), name), "{name:?}");
+        }
+        Ok(())
+    }
 
     /// Set for the probe process of the hosts these tests start.
     const PROBE_ENV: &str = "HOH_CLIENT_TESTS_PROBE";
