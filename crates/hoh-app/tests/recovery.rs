@@ -2516,6 +2516,81 @@ async fn the_runner_keeps_the_slot_of_a_holder_it_cannot_confirm_gone() -> R {
     Ok(())
 }
 
+/// M2T06R-600 (docs/adr/ADR-021.md decision 8d v7): a holder recorded with a pid but no boot or start time keeps its
+/// slot while its group number is in use (as above), and gives it up once no process has that number: the settle's
+/// repeated finding does not stop it from looking again, and the writer task behind it is granted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_runner_frees_the_slot_of_an_unconfirmed_holder_once_its_group_is_gone() -> R {
+    let dir = tempfile::tempdir()?;
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    let (code, stderr) = serve_and_stop(&project)?;
+    assert_eq!(code, 0, "{stderr}");
+    let live = ChildGuard({
+        use std::os::unix::process::CommandExt as _;
+        Command::new("sh")
+            .args(["-c", "while :; do sleep 0.05; done"])
+            .process_group(0)
+            .stdin(std::process::Stdio::null())
+            .spawn()?
+    });
+    seed(
+        &project,
+        &format!(
+            "{WRITERS}
+             UPDATE tasks SET state = 'RUNNING' WHERE task_id = 'T1';
+             INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, pid, started_at)
+               VALUES ('A1', 'T1', 'RUNNING', 2, 1, 1, {}, '2026-11-07T00:00:00Z');
+             UPDATE leases SET attempt_id = 'A1', epoch = 4 WHERE kind = 'writer';",
+            live.0.id()
+        ),
+    )?;
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(work.join("markers"))?;
+    let clock = Arc::new(FakeClock::default());
+    // Looked at again every 200 ms; an unchanged finding is not written again (M2T05R-157).
+    let host = runner_host_with(
+        &project,
+        Arc::new(FakeExecutor(work)),
+        clock,
+        Setup {
+            retry: Some(Duration::from_millis(200)),
+            ..Setup::default()
+        },
+    )
+    .await?;
+    let db = db(&project);
+    assert!(wait_for(
+        &db,
+        "SELECT count(*) > 0 FROM events WHERE kind = 'reconcile.attempt' AND json_extract(payload_json, '$.cause') = 'lease_expired'",
+        "1",
+        Duration::from_secs(10)
+    )?);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        query(&db, "SELECT state FROM attempts WHERE attempt_id = 'A1'")?,
+        "RUNNING",
+        "the precondition: held while its group lives"
+    );
+    drop(live);
+    assert!(
+        wait_for(
+            &db,
+            "SELECT count(*) FROM attempts WHERE task_id = 'T2'",
+            "1",
+            Duration::from_secs(15)
+        )?,
+        "the slot stayed held after the holder's group was gone: A1 {}",
+        query(&db, "SELECT state FROM attempts WHERE attempt_id = 'A1'")?
+    );
+    assert_ne!(
+        query(&db, "SELECT state FROM attempts WHERE attempt_id = 'A1'")?,
+        "RUNNING"
+    );
+    host.shutdown().await;
+    Ok(())
+}
+
 /// Fails the commit of the `nth` write of the runner (counted at each Runner request's Begun point) once armed.
 #[derive(Debug)]
 struct FailNthRunnerWrite {

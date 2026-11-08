@@ -83,6 +83,7 @@ pub(super) fn inspect(row: &UnfinishedRow) -> Seen {
     }
     seen(
         row.state,
+        row.pid.and_then(|p| u32::try_from(p).ok()),
         identity::presence(
             row.pid,
             row.boot_id.as_deref(),
@@ -91,13 +92,23 @@ pub(super) fn inspect(row: &UnfinishedRow) -> Seen {
     )
 }
 
-/// What a presence (or the failure to tell it) of a STARTING or RUNNING attempt's record means. A finding is the
-/// same text whenever the same is found, so a retry tells a repeated finding (M2T05R-157, -350).
-fn seen(state: AttemptState, found: std::io::Result<Presence>) -> Seen {
+/// What a presence (or the failure to tell it) of a STARTING or RUNNING attempt's record, its group number `number`
+/// (its recorded pid), means. A finding is the same text whenever the same is found, so a retry tells a repeated
+/// finding (M2T05R-157, -350). A record that cannot confirm its process gets no signal (ADR-019 decision 8), but once
+/// the kernel says no process has its group number nothing of that group can come back: it is gone, and the proof goes
+/// on with the rest (decision 8d v7, M2T06R-600; a changed finding, so a settle looks again).
+fn seen(state: AttemptState, number: Option<u32>, found: std::io::Result<Presence>) -> Seen {
+    let unconfirmed = |basis: &str, finding: String| match number {
+        Some(pgid) if identity::group_empty(pgid) => Seen::Gone(format!("{basis}_group_empty")),
+        _ => Seen::Uncertain(finding),
+    };
     match found {
-        Err(e) => Seen::Uncertain(format!("cannot_inspect: {e}")),
+        Err(e) => unconfirmed("cannot_inspect", format!("cannot_inspect: {e}")),
         Ok(Presence::Ours(found)) => Seen::Ours(found),
-        Ok(Presence::Unverifiable) => Seen::Uncertain("incomplete_process_record".to_owned()),
+        Ok(Presence::Unverifiable) => unconfirmed(
+            "incomplete_process_record",
+            "incomplete_process_record".to_owned(),
+        ),
         Ok(Presence::Leaderless(_)) => Seen::Uncertain("leader_gone_group_not_empty".to_owned()),
         Ok(Presence::Gone(Gone::NoPid)) if state == AttemptState::Running => {
             Seen::Uncertain("running_without_a_process_record".to_owned())
@@ -345,17 +356,25 @@ mod tests {
         );
     }
 
+    /// A group number that is in use: this test process's own group.
+    fn living() -> Option<u32> {
+        Some(rustix::process::getpgrp().as_raw_pid().unsigned_abs())
+    }
+
     #[test]
     fn an_inspection_that_fails_or_finds_members_without_their_leader_is_uncertain() {
         // M2T05R-356: the mapping the callers rely on; a leaderless group's finding carries no count (M2T05R-350).
+        // Each record's group number is in use (M2T06R-600: the next test).
         let failed = seen(
             AttemptState::Running,
+            living(),
             Err(std::io::Error::other("no /proc")),
         );
         assert!(matches!(&failed, Seen::Uncertain(b) if b.starts_with("cannot_inspect")));
         for state in [AttemptState::Starting, AttemptState::Running] {
             let left = seen(
                 state,
+                living(),
                 Ok(Presence::Leaderless(identity::Leaderless { pgid: 7 })),
             );
             assert_eq!(
@@ -364,16 +383,58 @@ mod tests {
             );
         }
         assert_eq!(
-            seen(AttemptState::Running, Ok(Presence::Gone(Gone::NoPid))).json(),
+            seen(AttemptState::Running, None, Ok(Presence::Gone(Gone::NoPid))).json(),
             json!({"uncertain": "running_without_a_process_record"})
         );
         assert_eq!(
-            seen(AttemptState::Starting, Ok(Presence::Gone(Gone::NoPid))).json(),
+            seen(
+                AttemptState::Starting,
+                None,
+                Ok(Presence::Gone(Gone::NoPid))
+            )
+            .json(),
             json!({"gone": "no_pid"})
         );
         assert_eq!(
-            seen(AttemptState::Running, Ok(Presence::Unverifiable)).json(),
+            seen(AttemptState::Running, living(), Ok(Presence::Unverifiable)).json(),
             json!({"uncertain": "incomplete_process_record"})
         );
+    }
+
+    #[test]
+    fn an_unconfirmed_record_whose_group_number_is_free_is_gone()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // M2T06R-600 (decision 8d v7): a record that cannot confirm its process (no start time, or an inspection that
+        // failed) is uncertain while its group number is in use, and gone once the kernel says no process has it
+        // (kill(-pgid, 0) gives ESRCH): nothing of that group can come back, so the proof goes on with the rest. With
+        // no number recorded nothing changes.
+        use std::os::unix::process::CommandExt as _;
+        let mut child = std::process::Command::new("true")
+            .process_group(0)
+            .spawn()?;
+        let freed = Some(child.id());
+        child.wait()?;
+        assert_eq!(
+            seen(AttemptState::Running, freed, Ok(Presence::Unverifiable)).json(),
+            json!({"gone": "incomplete_process_record_group_empty"})
+        );
+        assert_eq!(
+            seen(
+                AttemptState::Running,
+                freed,
+                Err(std::io::Error::other("no /proc"))
+            )
+            .json(),
+            json!({"gone": "cannot_inspect_group_empty"})
+        );
+        assert!(matches!(
+            seen(
+                AttemptState::Running,
+                None,
+                Err(std::io::Error::other("no /proc"))
+            ),
+            Seen::Uncertain(_)
+        ));
+        Ok(())
     }
 }

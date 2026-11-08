@@ -265,7 +265,14 @@ impl Processes for HostProcesses {
                 Some(pgid) => (Box::new(control(Watch::Number(pgid))), false),
                 None => (Box::new(Fixed(Look::Lost)), false),
             },
-            _ => (Box::new(Fixed(Look::Lost)), false),
+            // Without a cgroup: Lost while its group number is in use; once no process has it, the rest of the proof
+            // (decision 8d v7, M2T06R-600).
+            _ => match number {
+                Some(pgid) if identity::group_empty(pgid) => {
+                    (Box::new(control(Watch::Number(pgid))), false)
+                }
+                _ => (Box::new(Fixed(Look::Lost)), false),
+            },
         })
     }
 
@@ -855,6 +862,41 @@ mod tests {
                 assert_eq!(control.look(), Look::Lost);
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn an_unconfirmed_leader_without_a_cgroup_is_lost_while_its_group_lives_and_proved_once_it_is_gone()
+    -> R {
+        // M2T06R-600 (decision 8d v7): a record without a start time names a process that cannot be confirmed: no
+        // signal to its group. Without a cgroup its cancel is Lost while its group number is in use; once no process
+        // has it the proof goes on (two quiet scans), instead of Lost for ever.
+        use std::os::unix::process::CommandExt as _;
+        let processes = HostProcesses {
+            works: BTreeMap::new(),
+            executor: None,
+            project: PathBuf::from("/nonexistent"),
+            project_id: format!("unconfirmed-{}", std::process::id()),
+            pins: Arc::default(),
+            trackings: BTreeMap::new(),
+        };
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "read -r x"])
+            .stdin(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()?;
+        let row = running_row(Some(i64::from(child.id())));
+        let living: Vec<Look> = (0..2)
+            .map(|_| processes.control(&row).map(|(mut c, _)| c.look()))
+            .collect::<Option<_>>()
+            .ok_or("no control")?;
+        drop(child.stdin.take());
+        child.wait()?;
+        assert_eq!(living, vec![Look::Lost; 2], "its group lives");
+        let (mut first, _) = processes.control(&row).ok_or("no control")?;
+        assert_eq!(first.look(), Look::Held, "one quiet scan");
+        let (mut second, _) = processes.control(&row).ok_or("no control")?;
+        assert_eq!(second.look(), Look::Empty);
         Ok(())
     }
 
