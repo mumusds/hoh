@@ -101,6 +101,12 @@ pub trait HostHooks: Send + Sync + std::fmt::Debug {
 
     /// Just after the host announced itself (host.json written), before it returns from its start.
     fn announced(&self) {}
+
+    /// Where the runner lists processes for the termination proof of an attempt whose agent ended, instead of `/proc`
+    /// (a test's tree makes the proof fail, M2T06R-251).
+    fn proc_root(&self) -> Option<std::path::PathBuf> {
+        None
+    }
 }
 
 /// The product's host hooks: none.

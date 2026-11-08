@@ -135,6 +135,8 @@ pub fn pass(
     poll: Duration,
 ) -> Pass {
     let mut sent = Vec::new();
+    // A SIGKILL step taken in this pass, whether or not it reached a process.
+    let mut killed = false;
     loop {
         let look = control.look();
         let now = clock.now();
@@ -153,7 +155,7 @@ pub fn pass(
                     progress,
                 };
             }
-            Next::Send(Signal::Kill) if sent.iter().any(|(s, _)| *s == Signal::Kill) => {
+            Next::Send(Signal::Kill) if killed => {
                 return Pass {
                     sent,
                     end: PassEnd::Unreaped,
@@ -163,10 +165,17 @@ pub fn pass(
             Next::Send(signal) => {
                 if control.send(signal) {
                     sent.push((signal, now));
-                    match signal {
-                        Signal::Native => progress.native_at = Some(now),
-                        Signal::Term => progress.term_at = Some(now),
-                        Signal::Kill => progress.kill_at = Some(now),
+                }
+                // A step counts for the ladder's times even when it reached nothing (its group empty, nothing pinned,
+                // a scan incomplete): the pass then waits its grace and ends Unreaped at the second SIGKILL instead of
+                // trying again at once (docs/adr/ADR-021.md decision 8d, M2T06R-201). Only what reached a process is
+                // recorded as sent.
+                match signal {
+                    Signal::Native => progress.native_at = Some(now),
+                    Signal::Term => progress.term_at = Some(now),
+                    Signal::Kill => {
+                        progress.kill_at = Some(now);
+                        killed = true;
                     }
                 }
             }
@@ -399,6 +408,54 @@ mod tests {
         );
     }
 
+    /// Looks held for ever and takes no signal (its group empty, nothing pinned, a scan that stays incomplete); counts
+    /// its looks and fails the test past a budget rather than spin.
+    struct Unreachable<'a> {
+        clock: &'a FakeClock,
+        looks: usize,
+    }
+
+    impl ProcessControl for Unreachable<'_> {
+        fn look(&mut self) -> Look {
+            self.looks += 1;
+            assert!(
+                self.looks < 10_000,
+                "the pass looks again and again at {} s",
+                self.clock.secs()
+            );
+            Look::Held
+        }
+        fn send(&mut self, _signal: Signal) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn a_pass_whose_signals_reach_nothing_still_keeps_its_graces_and_ends_unreaped() {
+        // M2T06R-201: every step reaches nothing; the pass waits each grace (native 10 s, SIGTERM 5 s, SIGKILL 5 s) and
+        // ends Unreaped at the second SIGKILL with nothing recorded as sent, after a bounded number of looks.
+        let clock = FakeClock::default();
+        let mut control = Unreachable {
+            clock: &clock,
+            looks: 0,
+        };
+        let mut wait = |d: Duration| clock.advance(d);
+        let done = pass(
+            &mut control,
+            &clock,
+            &mut wait,
+            &GRACES,
+            true,
+            Progress::default(),
+            Duration::from_secs(1),
+        );
+        assert_eq!(done.end, PassEnd::Unreaped);
+        assert!(done.sent.is_empty(), "{:?}", done.sent);
+        assert_eq!(clock.secs(), 20);
+        assert_eq!(done.progress.kill_at, Some(at(15)));
+        assert!(control.looks <= 30, "{} looks", control.looks);
+    }
+
     #[test]
     fn a_group_that_outlives_sigkill_keeps_the_cancel_going_pass_after_pass_until_it_is_empty() {
         // REQ-043 failure mode 2: a group still alive after SIGKILL is no cancel; each pass ends a grace after its
@@ -476,7 +533,10 @@ mod tests {
     }
 
     #[test]
-    fn a_signal_that_could_not_be_sent_is_not_recorded_and_is_decided_again() {
+    fn a_signal_that_reached_nothing_is_not_recorded_but_keeps_the_ladders_time() {
+        // A step refused (its group found empty at the signal) is not recorded as sent, and it counts for the ladder's
+        // times (M2T06R-201: it is not tried again at once): native at 0 refused, the grace waited, SIGTERM at 10
+        // refused, then the group is seen empty.
         struct Refusing(u32);
         impl ProcessControl for Refusing {
             fn look(&mut self) -> Look {
@@ -500,7 +560,15 @@ mod tests {
         );
         assert_eq!(
             (ended.end, ended.sent, ended.progress),
-            (PassEnd::Empty, Vec::new(), Progress::default())
+            (
+                PassEnd::Empty,
+                Vec::new(),
+                Progress {
+                    native_at: Some(at(0)),
+                    term_at: Some(at(10)),
+                    kill_at: None
+                }
+            )
         );
     }
 }
