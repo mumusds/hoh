@@ -308,7 +308,7 @@ enum Watch {
     /// another boot, a reused pid).
     Gone,
     /// Not to be signalled (its leader gone, not inspected or not confirmed): empty only when the kernel says no process
-    /// has that group number (`kill(-pgid, 0)` gives ESRCH).
+    /// uses that number, as its pid or as its group ([`identity::number_free`], M2T06R-700, -800).
     Number(u32),
 }
 
@@ -837,6 +837,9 @@ mod tests {
             })
             .ok_or("no group of another user to look at")?;
         assert!(group_lives(other), "group {other}");
+        // Each half on its own (M2T06R-850): its group refuses the signal (EPERM) and its pid is a process's.
+        assert!(!identity::group_empty(other), "group {other}");
+        assert!(!identity::number_free(other), "number {other}");
         Ok(())
     }
 
