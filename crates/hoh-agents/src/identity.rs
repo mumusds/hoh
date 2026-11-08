@@ -910,6 +910,50 @@ mod tests {
     }
 
     #[test]
+    fn a_number_used_only_as_another_users_pid_is_not_free() -> io::Result<()> {
+        // M2T06R-850: the pid half of number_free on its own: a process of another user that leads no group (a kernel
+        // thread, or a daemon in its parent's group) has its pid in use while no group has that number.
+        let mine = rustix::process::getuid().as_raw();
+        let other = std::fs::read_dir("/proc")?
+            .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u32>().ok())
+            .filter(|&pid| pid > 1)
+            .find(|&pid| {
+                let group = std::fs::read(format!("/proc/{pid}/stat"))
+                    .ok()
+                    .and_then(|stat| {
+                        after_command_name(&stat)?
+                            .split_whitespace()
+                            .nth(2)?
+                            .parse::<u32>()
+                            .ok()
+                    });
+                let owner = std::fs::read_to_string(format!("/proc/{pid}/status"))
+                    .ok()
+                    .and_then(|s| {
+                        s.lines()
+                            .find_map(|l| l.strip_prefix("Uid:"))?
+                            .split_whitespace()
+                            .next()?
+                            .parse::<u32>()
+                            .ok()
+                    });
+                group.is_some_and(|g| g != pid)
+                    && owner.is_some_and(|uid| uid != mine)
+                    && group_empty(pid)
+            });
+        let Some(other) = other else {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "SKIP: no other user's process outside a group of its pid"
+            );
+            return Ok(());
+        };
+        assert!(!number_free(other), "{other}");
+        Ok(())
+    }
+
+    #[test]
     fn a_live_process_whose_proc_entry_cannot_be_seen_is_not_gone() -> io::Result<()> {
         // M2T06R-800: /proc can hide a live process (hidepid, a mount over it); only the kernel's answer for the
         // pid tells it is gone. The pidfd held a live process when its start time could not be read: an error (the

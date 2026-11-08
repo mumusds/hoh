@@ -408,8 +408,9 @@ mod tests {
     fn an_unconfirmed_record_whose_group_number_is_free_is_gone()
     -> Result<(), Box<dyn std::error::Error>> {
         // M2T06R-600 (decision 8d v7): a record that cannot confirm its process (no start time, or an inspection that
-        // failed) is uncertain while its group number is in use, and gone once the kernel says no process has it
-        // (kill(-pgid, 0) gives ESRCH): nothing of that group can come back, so the proof goes on with the rest. With
+        // failed) is uncertain while its number is in use, and gone once the kernel says no process uses it as its
+        // pid or as its group (identity::number_free, -700, -800): nothing of that group can come back, so the proof
+        // goes on with the rest. With
         // no number recorded nothing changes.
         use std::os::unix::process::CommandExt as _;
         let mut child = std::process::Command::new("true")
