@@ -741,15 +741,30 @@ async fn cancel_with_a_writer_outside(dir: &Path, script: &str, file: &Path) -> 
         Duration::from_secs(10),
     )
     .await?;
-    let attempt = query(
-        &project,
-        "SELECT p.project_id || '/' || a.attempt_id FROM projects p, attempts a WHERE a.task_id = 'T1'",
-    )?;
+    // This attempt's marker, and another project's attempt of the same id (that project's id unique to this test),
+    // both as the product makes them: the bystander is not this cancel's.
+    let marker = |project_id: String| {
+        hoh_app::host::Work {
+            project_id,
+            run_id: "R".to_owned(),
+            task_id: "T1".to_owned(),
+            attempt_id: "T1/attempt-1".to_owned(),
+            role: "developer".to_owned(),
+            effect_key: String::new(),
+        }
+        .marker()
+    };
+    assert_eq!(
+        query(
+            &project,
+            "SELECT attempt_id FROM attempts WHERE task_id = 'T1'"
+        )?,
+        "T1/attempt-1"
+    );
+    let project_id = query(&project, "SELECT project_id FROM projects")?;
+    let attempt = marker(project_id.clone());
+    let other = marker(format!("{project_id}-other"));
     let _marked = Marked(attempt.clone());
-    // A process of another project's attempt of the same id (that project's id unique to this test): not this
-    // cancel's.
-    let (project_id, attempt_id) = attempt.split_once('/').ok_or("marker")?;
-    let other = format!("{project_id}-other/{attempt_id}");
     let _bystander = Marked(other.clone());
     let mut bystander = Command::new("sleep")
         .arg("30")
@@ -805,4 +820,51 @@ async fn a_cancel_ends_a_writer_orphaned_before_the_cancel() -> R {
     let file = dir.path().join("written.txt");
     let script = format!("{}; while :; do sleep 0.1; done", orphan_writer(&file));
     cancel_with_a_writer_outside(dir.path(), &script, &file).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancel_ends_a_descendant_without_the_marker_that_left_the_group_while_the_leader_lived()
+-> R {
+    // M2T06R-01 (docs/adr/ADR-021.md decision 8d): 2 s into the cancel the leader starts a writer with an emptied
+    // environment in a session of its own, then dies at SIGTERM. Only the parent chain, rescanned while the group
+    // lives, ties the writer to the attempt before it is orphaned.
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let file = dir.path().join("written.txt");
+    let writer = dir.path().join("writer.pid");
+    let script = format!(
+        "sleep 2; env -i /usr/bin/setsid /bin/sh -c 'for i in $(/usr/bin/seq 1 600); do echo x >> {}; /bin/sleep 0.05; done' & \
+         echo $! > {}; while :; do sleep 0.1; done",
+        file.display(),
+        writer.display()
+    );
+    let guard = KillPidFile(writer.clone());
+    cancel_with_a_writer_outside(dir.path(), &script, &file).await?;
+    let pid: u32 = std::fs::read_to_string(&writer)?.trim().parse()?;
+    let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|s| {
+            s.rsplit_once(") ")
+                .map(|(_, rest)| rest.chars().next().unwrap_or('?'))
+        });
+    assert!(
+        matches!(state, None | Some('Z')),
+        "the writer lives: {state:?}"
+    );
+    drop(guard);
+    Ok(())
+}
+
+/// SIGKILLs the process whose pid a file names when dropped, however the test ends.
+struct KillPidFile(PathBuf);
+
+impl Drop for KillPidFile {
+    fn drop(&mut self) {
+        if let Some(pid) = std::fs::read_to_string(&self.0)
+            .ok()
+            .and_then(|t| t.trim().parse::<i32>().ok())
+            .and_then(rustix::process::Pid::from_raw)
+        {
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+        }
+    }
 }
