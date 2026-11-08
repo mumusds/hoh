@@ -742,3 +742,99 @@ fn a_host_started_by_a_detach_in_a_terminal_outlives_its_hang_up() -> R {
     assert!(!alive(pid), "the host did not stop on SIGTERM");
     Ok(())
 }
+
+/// POST `body` to the commands of the project's host named by its `host.json`; the response's status line.
+fn post_command(project: &Path, body: &str) -> R<String> {
+    use std::io::{Read as _, Write as _};
+    let info: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(project.join(".hoh/host.json"))?)?;
+    let mut stream =
+        std::os::unix::net::UnixStream::connect(info["socket"].as_str().ok_or("no socket")?)?;
+    stream.set_read_timeout(Some(WAIT))?;
+    write!(
+        stream,
+        "POST /v1/commands HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nX-HoH-Token: {}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        info["token"].as_str().ok_or("no token")?,
+        body.len()
+    )?;
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply)?;
+    Ok(reply.lines().next().unwrap_or_default().to_owned())
+}
+
+#[test]
+fn an_attached_tui_goes_on_with_its_run_through_a_host_started_again() -> R {
+    // M2T06R-04 (REQ-005 behaviour 3, ADR-021 decisions 4 and 10): the TUI attached to R (PAUSED), its host stopped
+    // normally and another started (another token). The TUI shows the run's next event, received from the new host,
+    // and its pause is accepted there.
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let (project, home) = (dir.path().join("p"), dir.path().join("home"));
+    std::fs::create_dir_all(&project)?;
+    std::fs::create_dir_all(&home)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    let config = || {
+        let mut config = hoh_app::host::HostConfig::new(&project);
+        config.port = 0;
+        config.store.wal_probe = Some(hoh_core::persistence::selftest::ProbeCommand {
+            program: env!("CARGO_BIN_EXE_hoh").into(),
+            args: vec![hoh_core::persistence::selftest::PROBE_ARG.into()],
+            env: Vec::new(),
+            answer_timeout: WAIT,
+        });
+        config
+    };
+    let first = runtime.block_on(hoh_app::host::Host::start(config()))?;
+    sqlite(
+        &project.join(".hoh/state.db"),
+        "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); p=c.execute('SELECT project_id FROM projects').fetchone()[0]; \
+         c.executescript(sys.stdin.read().replace(':p', repr(p))); c.commit()",
+        "INSERT INTO runs(run_id, project_id, state, mode, revision, resume_state, created_at) VALUES
+           ('R', :p, 'PAUSED', 'AUTO', 1, 'CREATED', '2026-11-07T00:00:00Z');",
+    )?;
+    let token = |p: &Path| -> R<String> {
+        let info: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(p.join(".hoh/host.json"))?)?;
+        Ok(info["token"].as_str().ok_or("no token")?.to_owned())
+    };
+    let before = token(&project)?;
+    let mut s = open_attach(&project, &home)?;
+    runtime.block_on(first.shutdown());
+    let second = runtime.block_on(hoh_app::host::Host::start(config()))?;
+    assert_ne!(
+        token(&project)?,
+        before,
+        "the new host has a token of its own"
+    );
+    let from = s.pty.output().len();
+    let resumed = post_command(
+        &project,
+        r#"{"schema_version":"1.0","command_id":"00000000-0000-4000-8000-000000000001","idempotency_key":"k-resume","kind":"ResumeRun","run_id":"R","expected_revision":1,"payload":{"reason":"test"}}"#,
+    )?;
+    assert!(resumed.contains(" 202 "), "{resumed}");
+    s.pty
+        .wait_for("run.resumed", from, Duration::from_secs(20))?;
+    // Ctrl+C, the second choice (暂停), Enter: sent to the new host.
+    let from = s.pty.output().len();
+    s.pty.send(b"\x03")?;
+    s.pty.wait_for("暂停", from, WAIT)?;
+    s.pty.send(b"\x1b[B")?;
+    std::thread::sleep(Duration::from_millis(100));
+    s.pty.send(b"\r")?;
+    s.pty
+        .wait_for("PauseRun 已受理", from, Duration::from_secs(20))?;
+    assert_eq!(
+        sqlite(
+            &project.join(".hoh/state.db"),
+            "import sqlite3,sys; r=sqlite3.connect(sys.argv[1]).execute(sys.stdin.read()).fetchone(); print(r[0])",
+            "SELECT count(*) FROM commands WHERE kind = 'PauseRun'",
+        )?,
+        "1"
+    );
+    assert_eq!(s.detach()?, Some(0));
+    runtime.block_on(second.shutdown());
+    Ok(())
+}
