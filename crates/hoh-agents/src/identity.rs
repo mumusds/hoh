@@ -160,7 +160,8 @@ pub fn presence(pid: Option<i64>, boot: Option<&str>, start: Option<&str>) -> io
         Ok(found) => Presence::Ours(found),
         Err(Gone::NoProcess) => {
             let pgid = pid.and_then(|p| u32::try_from(p).ok()).unwrap_or(0);
-            if group_empty(pgid) {
+            // The number unused as pid and as group, by the kernel's answers (M2T06R-700, -800).
+            if number_free(pgid) {
                 Presence::Gone(Gone::NoProcess)
             } else {
                 Presence::Leaderless(Leaderless { pgid })
@@ -180,13 +181,15 @@ pub fn group_empty(pgid: u32) -> bool {
     }
 }
 
-/// Whether no process uses `n` at all, neither as its pid nor as its process group (`kill(n, 0)` and `kill(-n, 0)`
-/// both give ESRCH). Only then can no process of a group numbered `n` come back: while a process `n` lives, in
-/// whatever group, it can make group `n` again (`setpgid(0, 0)`), so an empty group alone proves nothing
-/// (docs/adr/ADR-021.md decision 8d v7, M2T06R-700). Any other answer, EPERM included, means the number is in use.
+/// Whether no process uses `n` at all, neither as its pid nor as its process group: `pidfd_open(n)` finds no process
+/// of that number ([`no_process`]; a thread's id is no process's, and a thread cannot make a group of its id) and
+/// `kill(-n, 0)` gives ESRCH. Only then can no process of a group numbered `n` come back: while a process `n` lives,
+/// or is a zombie, in whatever group, it can make group `n` again (`setpgid(0, 0)`), so an empty group alone proves
+/// nothing (docs/adr/ADR-021.md decision 8d v7, M2T06R-700). The kernel's answers only, never /proc's view, which
+/// can hide a live process (M2T06R-800). Any other answer means the number is in use.
 pub fn number_free(n: u32) -> bool {
     let pid_gone = match i32::try_from(n).ok().and_then(Pid::from_raw) {
-        Some(pid) => rustix::process::test_kill_process(pid) == Err(rustix::io::Errno::SRCH),
+        Some(pid) => matches!(pidfd_open(pid, PidfdFlags::empty()), Err(e) if no_process(e)),
         None => false,
     };
     pid_gone && group_empty(n)
@@ -262,6 +265,18 @@ pub enum Group {
 }
 
 /// What a pidfd's fdinfo `Pid:` field (`None`: unreadable or missing) says of leader `pid`.
+/// What `pidfd`'s fdinfo says of its process `pid` (this process's own /proc, never hidden from it).
+fn pidfd_leader(pidfd: &OwnedFd, pid: u32) -> Leader {
+    use std::os::fd::AsRawFd as _;
+    let shown = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", pidfd.as_raw_fd()))
+        .ok()
+        .and_then(|info| {
+            info.lines()
+                .find_map(|l| l.strip_prefix("Pid:").map(|v| v.trim().to_owned()))
+        });
+    leader_shown(shown.as_deref(), pid)
+}
+
 fn leader_shown(shown: Option<&str>, pid: u32) -> Leader {
     match shown {
         Some(shown) if shown == pid.to_string() => Leader::Unreaped,
@@ -321,7 +336,14 @@ fn find_with(
     // known to be the attempt's is taken before the read, never after it (M2T05R-401).
     let seen = Instant::now();
     let Some(now) = read_start(pid)? else {
-        return Ok(Err(Gone::NoProcess));
+        // No /proc entry is no proof: /proc can hide a live process (hidepid, a mount over it). Only the kernel's
+        // answer through the pidfd tells it is gone (reaped); alive or a zombie, it cannot be confirmed (M2T06R-800).
+        return match pidfd_leader(&pidfd, pid) {
+            Leader::Reaped => Ok(Err(Gone::NoProcess)),
+            Leader::Unreaped | Leader::Unknown => Err(io::Error::other(format!(
+                "process {pid} is not known to be gone but /proc/{pid}/stat cannot be read"
+            ))),
+        };
     };
     if start != Some(now.as_str()) {
         return Ok(Err(Gone::OtherStart {
@@ -374,15 +396,7 @@ impl Found {
     /// Its leader's state by its pidfd's fdinfo: its pid while it is unreaped, -1 once it is reaped (a pidfd keeps
     /// the process, not its number). A read that fails or shows anything else tells nothing (M2T05R-400).
     fn leader(&self) -> Leader {
-        use std::os::fd::AsRawFd as _;
-        let shown =
-            std::fs::read_to_string(format!("/proc/self/fdinfo/{}", self.pidfd.as_raw_fd()))
-                .ok()
-                .and_then(|info| {
-                    info.lines()
-                        .find_map(|l| l.strip_prefix("Pid:").map(|v| v.trim().to_owned()))
-                });
-        leader_shown(shown.as_deref(), self.identity.pid)
+        pidfd_leader(&self.pidfd, self.identity.pid)
     }
 
     /// Whether its leader is unreaped (alive or a zombie).
@@ -892,6 +906,43 @@ mod tests {
         assert_eq!(found.leader(), Leader::Reaped);
         assert_eq!(found.look(), Group::Lost);
         assert!(!group_empty(leader));
+        Ok(())
+    }
+
+    #[test]
+    fn a_live_process_whose_proc_entry_cannot_be_seen_is_not_gone() -> io::Result<()> {
+        // M2T06R-800: /proc can hide a live process (hidepid, a mount over it); only the kernel's answer for the
+        // pid tells it is gone. The pidfd held a live process when its start time could not be read: an error (the
+        // record cannot be confirmed), never NoProcess. Once the pidfd's process is reaped, NoProcess.
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "read -r x"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()?;
+        let pid = child.id();
+        let me = of(pid)?.ok_or_else(|| io::Error::other("it is not running"))?;
+        let hidden = find_with(
+            Some(i64::from(pid)),
+            Some(&me.boot_id),
+            Some(&me.start_id),
+            |_| Ok(None),
+        );
+        let mut stdin = child.stdin.take();
+        let ended = find_with(
+            Some(i64::from(pid)),
+            Some(&me.boot_id),
+            Some(&me.start_id),
+            |_| {
+                drop(stdin.take());
+                let _ = child.wait();
+                Ok(None)
+            },
+        );
+        assert!(
+            hidden.is_err(),
+            "{:?}",
+            hidden.map(|f| f.map(|f| f.identity))
+        );
+        assert_eq!(ended?.err(), Some(Gone::NoProcess));
         Ok(())
     }
 
