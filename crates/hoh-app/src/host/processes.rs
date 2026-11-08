@@ -498,6 +498,7 @@ mod tests {
             (Incomplete, Done, Incomplete),
             (Pending, Incomplete, Incomplete),
             (Incomplete, Pending, Incomplete),
+            (Incomplete, Incomplete, Incomplete),
         ] {
             assert_eq!(both(a, b), both_, "{a:?} and {b:?}");
         }

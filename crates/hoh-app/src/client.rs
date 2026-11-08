@@ -319,15 +319,15 @@ fn user_name() -> Option<String> {
         })
 }
 
+/// How long `systemd-run --version` may take (M2T06R-553): it runs in a process group of its own, through the probe
+/// runner, which ends the group at this limit or at `env`'s deadline, whichever comes first.
+const SCOPE_PROBE_LIMIT: Duration = Duration::from_secs(2);
+
 /// Whether a host started now can run in a delegated cgroup v2 (docs/adr/ADR-021.md decisions 2 and 8d, CR-011):
 /// cgroup v2 is mounted, the user's systemd manager answers on `$XDG_RUNTIME_DIR/systemd/private`, the user lingers
 /// (else that manager, and a host in one of its scopes, stops soon after the user's last session ends, which would end
 /// accepted work at an SSH disconnect, REQ-005 behaviour 2; M2T06R-453) and `systemd-run` is on PATH. How, or why not
 /// (then attempts are tracked by the /proc scan, degraded).
-/// How long `systemd-run --version` may take (M2T06R-553): it runs in a process group of its own, through the probe
-/// runner, which ends the group at this limit or at `env`'s deadline, whichever comes first.
-const SCOPE_PROBE_LIMIT: Duration = Duration::from_secs(2);
-
 pub fn delegated_scope(env: &hoh_agents::probe::ProbeEnv) -> Result<Scope, String> {
     if !Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
         return Err("cgroup v2 is not mounted at /sys/fs/cgroup".to_owned());
@@ -635,8 +635,10 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir()?;
         std::fs::write(dir.path().join("ai"), b"")?;
         std::fs::create_dir(dir.path().join("dir"))?;
+        // A path that names an existing file through a directory is still no user name (M2T06R-653).
+        std::fs::write(dir.path().join("dir").join("ai"), b"")?;
         assert!(lingers_in(dir.path(), "ai"));
-        for name in ["", ".", "..", "ai/", "../ai", "dir", "nobody"] {
+        for name in ["", ".", "..", "ai/", "dir/ai", "./ai", "dir", "nobody"] {
             assert!(!lingers_in(dir.path(), name), "{name:?}");
         }
         Ok(())

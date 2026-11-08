@@ -492,6 +492,20 @@ mod tests {
     }
 
     #[test]
+    fn the_fields_after_a_command_name_start_after_its_last_parenthesis() {
+        // M2T06R-650: a command name may hold ") " and bytes that are not UTF-8; the fields are what follows its last
+        // `)` (with the first one, the start time would be read from the wrong field: another process, never ours).
+        let stat = b"42 (x) a b\xff) S 7 42 42 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 12345 0";
+        let rest = after_command_name(stat).map(str::split_whitespace);
+        assert_eq!(rest.and_then(|mut f| f.nth(19)), Some("12345"));
+        assert_eq!(
+            after_command_name(stat).and_then(|r| r.split_whitespace().nth(2)),
+            Some("42")
+        );
+        assert_eq!(after_command_name(b"44 no name"), None);
+    }
+
+    #[test]
     fn a_process_whose_command_name_is_not_utf8_has_an_identity_and_a_group() -> io::Result<()> {
         // M2T06R-500: a command name is any bytes but NUL; reading /proc/<pid>/stat as text failed on one that is not
         // UTF-8, and the cancel took the failure for a group it could not inspect.
