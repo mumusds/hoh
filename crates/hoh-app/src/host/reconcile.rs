@@ -95,11 +95,12 @@ pub(super) fn inspect(row: &UnfinishedRow) -> Seen {
 /// What a presence (or the failure to tell it) of a STARTING or RUNNING attempt's record, its group number `number`
 /// (its recorded pid), means. A finding is the same text whenever the same is found, so a retry tells a repeated
 /// finding (M2T05R-157, -350). A record that cannot confirm its process gets no signal (ADR-019 decision 8), but once
-/// the kernel says no process has its group number nothing of that group can come back: it is gone, and the proof goes
-/// on with the rest (decision 8d v7, M2T06R-600; a changed finding, so a settle looks again).
+/// the kernel says no process uses its number, neither as its pid nor as its group, nothing of that group can come
+/// back: it is gone, and the proof goes on with the rest (decision 8d v7, M2T06R-600; a changed finding, so a settle
+/// looks again). An empty group alone is not enough: process `n`, alive in another group, can make it again (-700).
 fn seen(state: AttemptState, number: Option<u32>, found: std::io::Result<Presence>) -> Seen {
     let unconfirmed = |basis: &str, finding: String| match number {
-        Some(pgid) if identity::group_empty(pgid) => Seen::Gone(format!("{basis}_group_empty")),
+        Some(pgid) if identity::number_free(pgid) => Seen::Gone(format!("{basis}_group_empty")),
         _ => Seen::Uncertain(finding),
     };
     match found {
@@ -435,6 +436,41 @@ mod tests {
             ),
             Seen::Uncertain(_)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn an_unconfirmed_record_whose_process_lives_in_another_group_stays_uncertain()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // M2T06R-700: the recorded process lives on in another group, so its own group number is empty, but it can
+        // make that group again at any time: uncertain, never gone, until no process has the number as pid or group.
+        use std::os::unix::process::CommandExt as _;
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "read -r x"])
+            .stdin(std::process::Stdio::piped())
+            .process_group(rustix::process::getpgrp().as_raw_pid())
+            .spawn()?;
+        let n = Some(child.id());
+        let found = (
+            seen(AttemptState::Running, n, Ok(Presence::Unverifiable)),
+            seen(
+                AttemptState::Running,
+                n,
+                Err(std::io::Error::other("no /proc")),
+            ),
+        );
+        drop(child.stdin.take());
+        child.wait()?;
+        assert!(
+            matches!(found.0, Seen::Uncertain(_)),
+            "{:?}",
+            found.0.json()
+        );
+        assert!(
+            matches!(found.1, Seen::Uncertain(_)),
+            "{:?}",
+            found.1.json()
+        );
         Ok(())
     }
 }

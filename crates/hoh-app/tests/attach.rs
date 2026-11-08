@@ -840,8 +840,13 @@ fn doctor_bounds_the_systemd_run_version_probe_and_lists_it() -> R {
     // `systemd-run --version`; one that never answers is ended at its limit, doctor ends in time, and the command is in
     // its probes.
     if !manager_and_linger() {
-        // Visible, not a silent pass (M2T06R-656).
-        eprintln!("SKIP: no user systemd manager or no linger here");
+        // Visible, not a silent pass (M2T06R-656): straight to the stderr of the test process, which libtest's capture
+        // of `eprintln!` would hide in a passing test's output (M2T06R-701).
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "SKIP: no user systemd manager or no linger here"
+        );
         return Ok(());
     }
     let env = Env::new()?;
@@ -892,8 +897,13 @@ fn a_host_start_does_not_wait_on_a_systemd_run_that_does_not_answer() -> R {
     // M2T06R-553 (decision 2): the client's `systemd-run --version` is bounded; one that never answers gives a direct
     // start, recorded with why, within the detach's time.
     if !manager_and_linger() {
-        // Visible, not a silent pass (M2T06R-656).
-        eprintln!("SKIP: no user systemd manager or no linger here");
+        // Visible, not a silent pass (M2T06R-656): straight to the stderr of the test process, which libtest's capture
+        // of `eprintln!` would hide in a passing test's output (M2T06R-701).
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "SKIP: no user systemd manager or no linger here"
+        );
         return Ok(());
     }
     let env = Env::new()?;

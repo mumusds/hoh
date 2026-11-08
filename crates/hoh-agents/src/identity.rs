@@ -180,6 +180,18 @@ pub fn group_empty(pgid: u32) -> bool {
     }
 }
 
+/// Whether no process uses `n` at all, neither as its pid nor as its process group (`kill(n, 0)` and `kill(-n, 0)`
+/// both give ESRCH). Only then can no process of a group numbered `n` come back: while a process `n` lives, in
+/// whatever group, it can make group `n` again (`setpgid(0, 0)`), so an empty group alone proves nothing
+/// (docs/adr/ADR-021.md decision 8d v7, M2T06R-700). Any other answer, EPERM included, means the number is in use.
+pub fn number_free(n: u32) -> bool {
+    let pid_gone = match i32::try_from(n).ok().and_then(Pid::from_raw) {
+        Some(pid) => rustix::process::test_kill_process(pid) == Err(rustix::io::Errno::SRCH),
+        None => false,
+    };
+    pid_gone && group_empty(n)
+}
+
 /// The processes in process group `pgid` other than `leader`, zombies included, from a whole scan of `/proc`: for
 /// diagnostics and test evidence only, since a scan is no atomic snapshot ([`group_empty`] tells whether a group is
 /// empty). A scan that fails anywhere (an unreadable `/proc`, a stat that cannot be read for another reason than the
@@ -488,6 +500,30 @@ mod tests {
         let other_boot = find(pid, Some("another-boot"), Some(&me.start_id))?;
         assert_eq!(other_boot.err().map(|g| g.basis()), Some("boot_id_differs"));
         assert_eq!(find(None, None, None)?.err(), Some(Gone::NoPid));
+        Ok(())
+    }
+
+    #[test]
+    fn a_number_is_free_only_when_no_process_has_it_as_its_pid_or_its_group() -> io::Result<()> {
+        // M2T06R-700: a live process N that moved into another group leaves group N empty, yet it can make group N
+        // again (setpgid(0, 0)) at any time: the number is free only when neither a pid nor a group uses it.
+        use std::os::unix::process::CommandExt as _;
+        let mine = rustix::process::getpgrp();
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "read -r x"])
+            .stdin(std::process::Stdio::piped())
+            .process_group(mine.as_raw_pid())
+            .spawn()?;
+        let n = child.id();
+        let alive = (group_empty(n), number_free(n));
+        drop(child.stdin.take());
+        child.wait()?;
+        assert_eq!(alive, (true, false), "its group is empty, its pid is not");
+        assert!(number_free(n), "both free once it is reaped");
+        assert!(
+            !number_free(mine.as_raw_pid().unsigned_abs()),
+            "this test's own group"
+        );
         Ok(())
     }
 
