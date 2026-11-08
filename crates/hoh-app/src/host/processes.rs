@@ -153,16 +153,26 @@ fn stat_process(root: &Path, pid: u32) -> Stat {
 fn marked(root: &Path, pid: u32, marker: &[u8]) -> Option<bool> {
     match std::fs::read(root.join(pid.to_string()).join("environ")) {
         Ok(env) => Some(env.split(|b| *b == 0).any(|entry| entry == marker)),
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-            ) || e.raw_os_error() == Some(3) =>
-        {
+        // Its main thread may have exited while other threads still run: theirs are read (M2T06R-301).
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            Some(marked_threads(root, pid, marker))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(3) => {
             Some(false)
         }
         Err(_) => None,
     }
+}
+
+/// Whether a thread of `pid` that can be read has `marker` in its environment.
+fn marked_threads(root: &Path, pid: u32, marker: &[u8]) -> bool {
+    let Ok(tasks) = std::fs::read_dir(root.join(pid.to_string()).join("task")) else {
+        return false;
+    };
+    tasks.filter_map(Result::ok).any(|task| {
+        std::fs::read(task.path().join("environ"))
+            .is_ok_and(|env| env.split(|b| *b == 0).any(|entry| entry == marker))
+    })
 }
 
 /// A process of an attempt outside its group, pinned by a pidfd.
@@ -375,6 +385,12 @@ impl Outside {
         if !complete {
             self.quiet = 0;
             return Proof::Incomplete;
+        }
+        // A scan that found any process of the attempt is not quiet, even if it is gone by now: it may have forked
+        // after the last look at the allocations (M2T06R-300, -350).
+        if !found.is_empty() {
+            self.quiet = 0;
+            return Proof::Pending;
         }
         if !self.pins.is_empty() {
             self.quiet = 0;
@@ -626,6 +642,32 @@ mod tests {
     }
 
     #[test]
+    fn a_sweep_that_does_not_settle_leaves_the_scan_incomplete()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // M2T06R-351 (decision 8d step 3): between the listing and the sweep the allocations jump past the span limit,
+        // or wrap around with too many pids; either way the scan proves nothing.
+        for (jump, pid_max) in [(70_000_u64, 4_194_304_u64), (99_050, 100_000)] {
+            let root = tempfile::tempdir()?;
+            std::fs::create_dir_all(root.path().join("sys/kernel"))?;
+            std::fs::write(root.path().join("sys/kernel/ns_last_pid"), b"1000\n")?;
+            std::fs::write(root.path().join("sys/kernel/pid_max"), pid_max.to_string())?;
+            let last = root.path().join("sys/kernel/ns_last_pid");
+            let mut outside = Outside::new("p/A1").with_root(Some(root.path().to_owned()));
+            // Each scan, `jump` pids are allocated after the first look (the second case wraps below pid_max).
+            outside.after_listing = Some(Box::new(move || {
+                let now: u64 = std::fs::read_to_string(&last)
+                    .ok()
+                    .and_then(|t| t.trim().parse().ok())
+                    .unwrap_or(1000);
+                let _ = std::fs::write(&last, ((now + jump) % pid_max).to_string());
+            }));
+            assert_eq!(outside.scan(), Proof::Incomplete, "{pid_max}");
+            assert_eq!(outside.scan(), Proof::Incomplete, "{pid_max}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn a_scan_that_could_not_read_a_process_proves_nothing()
     -> Result<(), Box<dyn std::error::Error>> {
         // M2T06R-101 (decision 8d v3): a /proc tree with a process whose stat cannot be understood; however often it is
@@ -660,14 +702,15 @@ mod tests {
         // M2T06R-101: a script named with a byte 0xff (its process is named after it); before, its stat could not be
         // read as text and the scan skipped it.
         use std::os::unix::ffi::OsStrExt as _;
-        use std::os::unix::fs::PermissionsExt as _;
         use std::os::unix::process::CommandExt as _;
+        // A link to /bin/sh named w\xffr (the process is named after the path it was started by); no file is written and
+        // then executed, so a parallel test's fork cannot make it busy (M2T06R-354).
         let dir = tempfile::tempdir()?;
         let path = dir.path().join(std::ffi::OsStr::from_bytes(b"w\xffr"));
-        std::fs::write(&path, "#!/bin/sh\nwhile :; do sleep 1; done\n")?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+        std::os::unix::fs::symlink("/bin/sh", &path)?;
         let marker = format!("test-{}/A1", std::process::id());
         let mut child = std::process::Command::new(&path)
+            .args(["-c", "while :; do sleep 1; done"])
             .env(ATTEMPT_ENV, &marker)
             .process_group(0)
             .spawn()?;

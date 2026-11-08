@@ -283,11 +283,69 @@ fn refused_code(line: &str) -> &'static str {
         .unwrap_or("GONE")
 }
 
-/// Start `project`'s host (`hoh __host <project>`) and wait until it is ready, until `end`.
+/// Whether a host started now can run in a delegated cgroup v2 (docs/adr/ADR-021.md decisions 2 and 8d v5,
+/// CR-011): cgroup v2 is mounted, the user's systemd manager answers on `$XDG_RUNTIME_DIR/systemd/private` and
+/// `systemd-run` is on PATH. Its `systemd-run`, or why not (then attempts are tracked by the /proc scan, degraded).
+pub fn delegated_scope() -> Result<std::path::PathBuf, String> {
+    if !Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
+        return Err("cgroup v2 is not mounted at /sys/fs/cgroup".to_owned());
+    }
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+        .ok_or_else(|| "XDG_RUNTIME_DIR is not set: no user systemd manager to ask".to_owned())?;
+    if !Path::new(&runtime).join("systemd/private").exists() {
+        return Err(
+            "the user's systemd manager does not answer ($XDG_RUNTIME_DIR/systemd/private)"
+                .to_owned(),
+        );
+    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path)
+        .map(|dir| dir.join("systemd-run"))
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| "systemd-run is not on PATH".to_owned())
+}
+
+/// Start `project`'s host and wait until it is ready, until `end`: in a delegated scope of the user's systemd
+/// manager when there is one, so its attempts are tracked by cgroups of their own; directly otherwise, or when the
+/// scope cannot be had (decision 2).
 fn start(project: &Path, end: Instant) -> Result<HostInfo, Failure> {
+    if let Ok(systemd_run) = delegated_scope() {
+        match launch(project, end, Some(&systemd_run)) {
+            Err(failure) if failure.exit != 78 && Instant::now() < end => {
+                // The scope was refused (or the host ended for another reason): once more, directly.
+                return launch(project, end, None);
+            }
+            other => return other,
+        }
+    }
+    launch(project, end, None)
+}
+
+/// Start `hoh __host <project>`, through `systemd_run` if given, and wait until it is ready, until `end`.
+fn launch(project: &Path, end: Instant, systemd_run: Option<&Path>) -> Result<HostInfo, Failure> {
     let program = std::env::current_exe()
         .map_err(|e| Failure::unreachable(format!("cannot find the hoh program: {e}")))?;
-    let mut child = std::process::Command::new(program)
+    let mut command = match systemd_run {
+        // `--scope` runs the command itself (the pid stays the child's); `$` in the path is not expanded.
+        Some(systemd_run) => {
+            let mut command = std::process::Command::new(systemd_run);
+            command
+                .args([
+                    "--user",
+                    "--scope",
+                    "-p",
+                    "Delegate=yes",
+                    "--quiet",
+                    "--collect",
+                    "--expand-environment=no",
+                    "--",
+                ])
+                .arg(&program);
+            command
+        }
+        None => std::process::Command::new(&program),
+    };
+    let mut child = command
         .arg("__host")
         .arg(project)
         .current_dir(project)

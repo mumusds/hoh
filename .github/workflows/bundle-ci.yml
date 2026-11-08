@@ -44,6 +44,15 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       # TEST-006-02 traces hoh doctor's opens with strace (REQ-006: credential files are never opened).
       - run: sudo apt-get update -q && sudo apt-get install -y -q strace
+      # The cgroup tracking tests (CR-011, ADR-021 decision 8d v5) run in a delegated scope of the user's systemd
+      # manager (systemd-run --user): lingering starts one for the runner user.
+      - name: user systemd manager
+        run: |
+          sudo loginctl enable-linger "$USER"
+          runtime="/run/user/$(id -u)"
+          for _ in $(seq 1 100); do [ -S "$runtime/systemd/private" ] && break; sleep 0.1; done
+          [ -S "$runtime/systemd/private" ]
+          echo "XDG_RUNTIME_DIR=$runtime" >> "$GITHUB_ENV"
       - run: cargo test --workspace --locked
       # Dependency policy and RustSec advisories (deny.toml); pinned like scripts/dev/test-infra.sh.
       - run: cargo install --locked cargo-deny@0.20.2

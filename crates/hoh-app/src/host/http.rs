@@ -38,6 +38,9 @@ pub(super) struct Shared {
     pub(super) subscribers: std::sync::atomic::AtomicUsize,
     /// Every event stream opened so far (M2T06R-57: a brief subscription shows here, not in the gauge).
     pub(super) opened: std::sync::atomic::AtomicUsize,
+    /// The host's own cgroup if it is delegated: attempts are then tracked by cgroups of their own
+    /// (docs/adr/ADR-021.md decision 8d v5).
+    pub(super) cgroups: Option<super::cgroup::Delegated>,
 }
 
 /// One open event stream, counted while it lives.
@@ -315,7 +318,7 @@ async fn health(State(shared): State<Arc<Shared>>) -> Response {
 }
 
 /// Read with a pooled read-only connection, off the async workers (REQ-062: reads are never held up by the writer).
-async fn read<T: Send + 'static>(
+pub(super) async fn read<T: Send + 'static>(
     shared: &Arc<Shared>,
     query: impl FnOnce(&Reader) -> Result<T, PersistError> + Send + 'static,
 ) -> Result<T, PersistError> {

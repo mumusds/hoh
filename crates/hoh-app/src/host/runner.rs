@@ -14,6 +14,7 @@
 //! effect is looked for, never done again. The product has no executor yet (agents are bound to roles with M2-T07),
 //! so the product host runs no runner.
 
+use super::cgroup::{AttemptGroup, Tracking};
 use super::processes::{Outside, Proof};
 use super::{HostHooks, ReconcileSettings, http::Shared, reconcile};
 use hoh_agents::identity;
@@ -410,11 +411,36 @@ async fn attempt(
             return Ok(());
         }
     };
-    // Its whole identity: without it the gate stays shut (dropped below) and the agent never runs (M2T05R-100).
+    // Its whole identity: without it the gate stays shut (dropped below) and the agent never runs (M2T05R-100). Its
+    // cgroup too, while it is held at the gate (nothing of the agent runs yet): everything it starts stays in it
+    // (docs/adr/ADR-021.md decision 8d v5, CR-011); without a delegated cgroup it is tracked by the /proc scan.
     let pid = started.pid;
-    let who = tokio::task::spawn_blocking(move || identity::of(pid).ok().flatten())
-        .await
-        .map_err(|e| PersistError::Storage(format!("the identity of {id}'s process: {e}")))?;
+    let cgroups = common.shared.cgroups.clone();
+    let marker = work.marker();
+    let (who, tracking) = tokio::task::spawn_blocking(move || {
+        let tracking = match cgroups {
+            Some(delegated) => match AttemptGroup::adopt(&delegated.attempt(&marker), pid) {
+                Ok(group) => Tracking::Cgroup(group.path().to_owned()),
+                Err(e) => Tracking::Proc(format!("its cgroup could not be made or joined: {e}")),
+            },
+            None => Tracking::Proc("the host has no delegated cgroup".to_owned()),
+        };
+        (identity::of(pid).ok().flatten(), tracking)
+    })
+    .await
+    .map_err(|e| PersistError::Storage(format!("the identity of {id}'s process: {e}")))?;
+    store
+        .commit(Commit {
+            events: vec![NewEvent {
+                project_id: common.shared.project_id.clone(),
+                event_id: hoh_core::ids::child_id(&id, "tracking"),
+                run_id: Some(work.run_id.clone()),
+                kind: "attempt.tracking".to_owned(),
+                payload: tracking.json(&id),
+            }],
+            ..Commit::default()
+        })
+        .await?;
     let Some(who) = who else {
         drop(started);
         store
@@ -511,12 +537,13 @@ async fn attempt(
     let marker = work.marker();
     let (term, kill) = (common.settings.term_grace, common.settings.kill_grace);
     let root = common.shared.hooks.proc_root();
-    let (steps, proof) =
-        tokio::task::spawn_blocking(move || Outside::new(&marker).with_root(root).stop(term, kill))
-            .await
-            .map_err(|e| {
-                PersistError::Storage(format!("the stop outside the group of {id} ended: {e}"))
-            })?;
+    let group = tracking.cgroup();
+    let (steps, proof) = tokio::task::spawn_blocking(move || match group {
+        Some(group) => group.stop(term, kill),
+        None => Outside::new(&marker).with_root(root).stop(term, kill),
+    })
+    .await
+    .map_err(|e| PersistError::Storage(format!("the stop outside the group of {id} ended: {e}")))?;
     if !steps.is_empty() || proof != Proof::Done {
         let (name, detail) = if proof == Proof::Done {
             (
@@ -626,6 +653,14 @@ async fn settle(
     // throughout (M2T05R-452); the steps are written after it, in their order.
     let scanned = row.clone();
     let settings = common.settings.clone();
+    let attempt = id.to_owned();
+    let tracking = Tracking::of(
+        super::http::read(&common.shared, move |reader| {
+            reader.attempt_event("attempt.tracking", &attempt)
+        })
+        .await?
+        .as_ref(),
+    );
     let executor = common.executor.clone();
     let repeated = last.map(str::to_owned);
     let stop = tokio::task::spawn_blocking(move || {
@@ -646,7 +681,7 @@ async fn settle(
             found,
             finding,
             work.is_some(),
-            reconcile::end(seen, &scanned, &settings),
+            reconcile::end(seen, &scanned, &tracking, &settings),
         ))
     })
     .await

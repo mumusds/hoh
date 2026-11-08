@@ -452,6 +452,27 @@ pub(super) fn list_runs(
 }
 
 /// At most `limit` events with seq above `after`, in seq order.
+/// The payload of the latest event of `kind` about attempt `attempt_id` (its payload's `attempt_id`), if any.
+pub(super) fn attempt_event(
+    conn: &Connection,
+    kind: &str,
+    attempt_id: &str,
+) -> Result<Option<serde_json::Value>, PersistError> {
+    let text: Option<String> = conn
+        .query_row(
+            "SELECT payload_json FROM events WHERE kind = ?1 AND json_extract(payload_json, '$.attempt_id') = ?2 \
+             ORDER BY seq DESC LIMIT 1",
+            params![kind, attempt_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    text.map(|t| {
+        serde_json::from_str(&t).map_err(|e| PersistError::IntegrityViolation(e.to_string()))
+    })
+    .transpose()
+}
+
 pub(super) fn events_after(
     conn: &Connection,
     after: i64,

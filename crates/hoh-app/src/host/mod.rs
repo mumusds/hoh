@@ -8,6 +8,7 @@
 //! Any failure before that ends the start with nothing served, and no database file is made when the location or the
 //! WAL self-test refuses.
 
+mod cgroup;
 mod control;
 mod http;
 mod processes;
@@ -324,6 +325,7 @@ impl Host {
             stop: stopped.clone(),
             subscribers: std::sync::atomic::AtomicUsize::new(0),
             opened: std::sync::atomic::AtomicUsize::new(0),
+            cgroups: cgroup::Delegated::detect(),
         });
         let mut served = vec![
             tokio::spawn(http::serve(

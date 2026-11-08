@@ -302,12 +302,27 @@ fn examine(project: &Path, live: bool) -> Report {
             Err(why) => warnings.push(format!("live 检查没有完成：{why}")),
         }
     }
+    // How a host started now would track its attempts' processes (docs/adr/ADR-021.md decision 8d v5, CR-011).
+    let tracking = match crate::client::delegated_scope() {
+        Ok(_) => json!({"process_tracking": "cgroup",
+            "process_tracking_detail": "host 经 systemd-run 在受委托的 cgroup 中运行，每个 Attempt 的进程以其 cgroup 证明终结"}),
+        Err(why) => {
+            warnings.push(format!(
+                "进程跟踪降级：{why}；host 将按 /proc 尽力跟踪 Attempt 的组外进程（tracking: proc，对蓄意躲避的进程不成立，CR-011）"
+            ));
+            json!({"process_tracking": "proc", "process_tracking_detail": why})
+        }
+    };
+    let mut host = json!({"state": "not_running", "detail": "M1 还没有 host"});
+    if let (Some(host), Some(tracking)) = (host.as_object_mut(), tracking.as_object()) {
+        host.extend(tracking.clone());
+    }
     let runtime = Runtime {
         git,
         node,
         pi_plugins,
         project_hoh: hoh_dir(project),
-        host: json!({"state": "not_running", "detail": "M1 还没有 host"}),
+        host,
     };
     let summary = summary(&agents, &runtime, warnings);
     let probes = log.lock().map(|runs| runs.clone()).unwrap_or_default();
