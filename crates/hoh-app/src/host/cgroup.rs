@@ -105,6 +105,17 @@ pub(super) struct AttemptGroup {
     witness: Option<Witness>,
 }
 
+/// What a directory on a witnessed cgroup's way is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Seen {
+    /// The one recorded.
+    Recorded,
+    /// Another of the same file system: the recorded one was removed.
+    Replaced,
+    /// Of another file system (a mount over the path): nothing is told.
+    Other,
+}
+
 /// Flags to open a directory of a recorded chain: never through a symbolic link.
 fn directory() -> rustix::fs::OFlags {
     use rustix::fs::OFlags;
@@ -183,27 +194,43 @@ impl AttemptGroup {
                 self.path.display()
             ));
         }
-        let checked = |fd: &rustix::fd::OwnedFd, at: usize| -> Result<(), String> {
+        // The recorded directory itself, another directory of the same file system in its place, or something else.
+        let seen = |fd: &rustix::fd::OwnedFd, at: usize| -> Result<Seen, String> {
             let stat =
                 rustix::fs::fstat(fd).map_err(|e| format!("{}: {e}", self.path.display()))?;
-            if (stat.st_dev, stat.st_ino) == witness.chain[at] {
-                Ok(())
+            let (dev, ino) = witness.chain[at];
+            Ok(if (stat.st_dev, stat.st_ino) == (dev, ino) {
+                Seen::Recorded
+            } else if stat.st_dev == dev {
+                Seen::Replaced
             } else {
-                Err(format!(
-                    "{}: a directory on its way is not the one recorded",
-                    self.path.display()
-                ))
-            }
+                Seen::Other
+            })
+        };
+        let other = || {
+            format!(
+                "{}: a directory on its way is on another file system than the one recorded",
+                self.path.display()
+            )
         };
         let mut dir = rustix::fs::open(&self.root, directory(), rustix::fs::Mode::empty())
             .map_err(|e| format!("{}: {e}", self.root.display()))?;
-        checked(&dir, 0)?;
+        if seen(&dir, 0)? != Seen::Recorded {
+            return Err(format!(
+                "{}: not the cgroup mount recorded",
+                self.root.display()
+            ));
+        }
         for (i, part) in parts.iter().enumerate() {
             match rustix::fs::openat(&dir, *part, directory(), rustix::fs::Mode::empty()) {
-                Ok(next) => {
-                    checked(&next, i + 1)?;
-                    dir = next;
-                }
+                Ok(next) => match seen(&next, i + 1)? {
+                    Seen::Recorded => dir = next,
+                    // Another cgroup of the same hierarchy at its path: the recorded one was removed, which a
+                    // cgroup can be only when nothing is in it or below it (cgroupfs never gives an inode number
+                    // twice in a boot, and cgroup v2 has no rename): gone (M2T06R-1001). Its successor is not it.
+                    Seen::Replaced => return Ok(None),
+                    Seen::Other => return Err(other()),
+                },
                 Err(rustix::io::Errno::NOENT) => return Ok(None),
                 Err(e) => return Err(format!("{}: {e}", self.path.display())),
             }
@@ -277,17 +304,61 @@ impl AttemptGroup {
         found
     }
 
+    /// Its checked directory and every directory below it, opened one from another (never through a path that may
+    /// name another cgroup by then).
+    fn checked_subtree(&self) -> Vec<rustix::fd::OwnedFd> {
+        let Ok(Some(top)) = self.open_checked() else {
+            return Vec::new();
+        };
+        let mut found = vec![top];
+        let mut at = 0;
+        while at < found.len() {
+            let names: Vec<std::ffi::CString> = rustix::fs::Dir::read_from(&found[at])
+                .map(|dir| {
+                    dir.filter_map(Result::ok)
+                        .filter(|e| e.file_type() == rustix::fs::FileType::Directory)
+                        .map(|e| e.file_name().to_owned())
+                        .filter(|n| n.as_bytes() != b"." && n.as_bytes() != b"..")
+                        .collect()
+                })
+                .unwrap_or_default();
+            for name in names {
+                if let Ok(below) = rustix::fs::openat(
+                    &found[at],
+                    name.as_c_str(),
+                    directory(),
+                    rustix::fs::Mode::empty(),
+                ) {
+                    found.push(below);
+                }
+            }
+            at += 1;
+        }
+        found
+    }
+
     /// SIGTERM to each process in it or in a cgroup below it, each pinned by a pidfd and checked to be in this subtree
-    /// still (a pid that ended and was reused is never signalled); whether any got it.
+    /// still (a pid that ended and was reused is never signalled); whether any got it. Only the recorded cgroup, read
+    /// through its checked directories: a cgroup made later at its path holds another's processes (M2T06R-1000).
     pub(super) fn terminate(&self) -> bool {
+        use std::io::Read as _;
         use std::os::unix::ffi::OsStrExt as _;
         let wanted = self.relative();
         let wanted = wanted.as_os_str().as_bytes();
         let mut sent = false;
-        for cgroup in self.subtree() {
-            let Ok(procs) = std::fs::read_to_string(cgroup.join("cgroup.procs")) else {
+        for cgroup in self.checked_subtree() {
+            let Ok(fd) = rustix::fs::openat(
+                &cgroup,
+                "cgroup.procs",
+                rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            ) else {
                 continue;
             };
+            let mut procs = String::new();
+            if std::fs::File::from(fd).read_to_string(&mut procs).is_err() {
+                continue;
+            }
             for pid in procs.lines().filter_map(|l| l.trim().parse::<i32>().ok()) {
                 let Some(raw) = rustix::process::Pid::from_raw(pid) else {
                     continue;
@@ -623,10 +694,11 @@ mod tests {
 
     #[test]
     fn a_cgroup_is_judged_only_through_the_directories_it_was_recorded_in() -> R {
-        // M2T06R-900 (decision 8d v7): what is at a recorded path is not taken for the recorded cgroup. A directory
-        // put in its place (a mount over it, another view, one made there later) proves nothing even with a
-        // `populated 0` of its own; nor does an absence below a parent that is not the recorded one; nor a path with
-        // no record of what it was.
+        // M2T06R-900, -1001 (decision 8d v7): what is at a recorded path is not taken for the recorded cgroup.
+        // Another directory of the same file system in its place, or in its parent's, means the recorded one was
+        // removed (a cgroup goes only when empty; cgroupfs gives no inode number twice in a boot): gone, and the
+        // successor is not read (here it says populated 1). A directory of another file system (a mount over the
+        // path) tells nothing; nor does a path with no record of what it was.
         let root = tempfile::tempdir()?;
         let parent = root.path().join("host.scope");
         let at = parent.join("attempt-0123456789abcdef");
@@ -638,21 +710,26 @@ mod tests {
             Proof::Pending,
             "the recorded cgroup, populated"
         );
-        // Another directory in its place, saying it is empty.
+        // On another file system: the recorded device is not the one found.
+        let mut elsewhere = group.clone();
+        if let Some(w) = elsewhere.witness.as_mut()
+            && let Some(last) = w.chain.last_mut()
+        {
+            last.0 ^= 1;
+        }
+        assert_eq!(elsewhere.proof(), Proof::Incomplete, "another file system");
+        // Another directory in its place, populated: the recorded one is gone, its successor not read. The old one
+        // is kept (moved away) so the new one cannot get its inode number back, as a file system other than cgroupfs
+        // may give a freed number again (seen in CI).
         std::fs::rename(&at, root.path().join("moved"))?;
         std::fs::create_dir(&at)?;
-        std::fs::write(at.join("cgroup.events"), b"populated 0\n")?;
-        assert_eq!(
-            group.proof(),
-            Proof::Incomplete,
-            "not the recorded directory"
-        );
-        // Its parent replaced: the cgroup absent below a parent that is not the recorded one. The old parent is kept
-        // (moved away) so the new one cannot get its inode number back, as a file system other than cgroupfs may
-        // give a freed number again (seen in CI); cgroupfs does not reuse its 64-bit node ids within a boot.
+        std::fs::write(at.join("cgroup.events"), b"populated 1\n")?;
+        assert_eq!(group.proof(), Proof::Done, "replaced at its path");
+        // Its parent replaced, a populated successor below it: gone too.
         std::fs::rename(&parent, root.path().join("old-parent"))?;
-        std::fs::create_dir(&parent)?;
-        assert_eq!(group.proof(), Proof::Incomplete, "not the recorded parent");
+        std::fs::create_dir_all(&at)?;
+        std::fs::write(at.join("cgroup.events"), b"populated 1\n")?;
+        assert_eq!(group.proof(), Proof::Done, "its parent replaced");
         // No record of what it was: an absence proves nothing.
         assert_eq!(
             AttemptGroup::at(&at.join("gone")).proof(),
@@ -702,6 +779,93 @@ mod tests {
             Tracking::seen_from(Some(&legacy), None),
             Tracking::Proc("p".to_owned())
         );
+    }
+
+    /// Set in this test binary when it runs inside a delegated scope.
+    const IN_SCOPE: &str = "HOH_LIB_TEST_IN_DELEGATED_SCOPE";
+
+    /// Run this binary's ignored test `name` inside a delegated scope of the user's systemd manager; it must pass.
+    fn in_delegated_scope(name: &str) -> R {
+        let out = std::process::Command::new("systemd-run")
+            .args([
+                "--user",
+                "--scope",
+                "-p",
+                "Delegate=yes",
+                "--quiet",
+                "--collect",
+                "--expand-environment=no",
+                "--",
+            ])
+            .arg(std::env::current_exe()?)
+            .args([
+                name,
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(IN_SCOPE, "1")
+            .output()?;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if !out.status.success() || !stdout.contains("1 passed") {
+            return Err(format!(
+                "{name} in a delegated scope: {}\n{stdout}\n{}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_cgroup_made_again_where_an_attempts_was_is_not_the_attempts() -> R {
+        in_delegated_scope("host::cgroup::tests::replaced_cgroup_inside")
+    }
+
+    #[test]
+    #[ignore = "runs inside a delegated scope, started by a_cgroup_made_again_where_an_attempts_was_is_not_the_attempts"]
+    fn replaced_cgroup_inside() -> R {
+        // M2T06R-1000, -1001 on real cgroups: an attempt's cgroup, recorded, then removed and made again at its path
+        // with another process in it. That process gets no SIGTERM (it is not the attempt's), and the recorded cgroup
+        // is proved gone; so it is when its parent was removed and made again too.
+        use std::os::unix::process::CommandExt as _;
+        if std::env::var_os(IN_SCOPE).is_none() {
+            return Ok(());
+        }
+        let delegated = Delegated::detect()?;
+        let scope = delegated
+            .base
+            .join(format!("hoh-replaced-{}", std::process::id()));
+        let at = scope.join("attempt-0123456789abcdef");
+        std::fs::create_dir_all(&at)?;
+        let group = AttemptGroup::witnessed(Path::new(MOUNT), &at)?;
+        std::fs::remove_dir(&at)?;
+        std::fs::create_dir(&at)?;
+        let mut other = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()?;
+        std::fs::write(at.join("cgroup.procs"), other.id().to_string())?;
+        let signalled = group.terminate();
+        let lived = other.try_wait()?.is_none();
+        let replaced = group.proof();
+        let _ = other.kill();
+        let _ = other.wait();
+        std::fs::remove_dir(&at)?;
+        std::fs::remove_dir(&scope)?;
+        std::fs::create_dir_all(&at)?;
+        let parent_replaced = group.proof();
+        std::fs::remove_dir(&at)?;
+        std::fs::remove_dir(&scope)?;
+        assert!(
+            !signalled && lived,
+            "a process of the cgroup made later got SIGTERM"
+        );
+        assert_eq!(replaced, Proof::Done, "replaced at its path");
+        assert_eq!(parent_replaced, Proof::Done, "its parent replaced");
+        Ok(())
     }
 
     #[test]
