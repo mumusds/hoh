@@ -719,19 +719,31 @@ impl Drop for Marked {
     }
 }
 
-/// A writer that appends to `file` every 50 ms for at most 120 s (longer than any wait of these tests, so only a
-/// signal ends it in time), in a session of its own, orphaned at once (its parent subshell exits): nothing but its
-/// environment ties it to the attempt.
-fn orphan_writer(file: &Path) -> String {
-    format!(
-        "(setsid sh -c 'for i in $(seq 1 2400); do echo x >> {}; sleep 0.05; done' &)",
+/// A writer that appends to `file` every 50 ms for 120 s by the clock (longer than any wait of these tests, so only a
+/// signal ends it in time) and starts no process of its own (a signal to a child must not hasten its end).
+fn writer(file: &Path) -> R<String> {
+    let script = file.with_extension("py");
+    std::fs::write(
+        &script,
+        "import sys, time\nend = time.monotonic() + 120\nwhile time.monotonic() < end:\n    \
+         with open(sys.argv[1], 'a') as f:\n        f.write('x\\n')\n    time.sleep(0.05)\n",
+    )?;
+    Ok(format!(
+        "/usr/bin/python3 {} {}",
+        script.display(),
         file.display()
-    )
+    ))
+}
+
+/// The writer in a session of its own, orphaned at once (its parent subshell exits): nothing but its environment ties
+/// it to the attempt.
+fn orphan_writer(file: &Path) -> R<String> {
+    Ok(format!("(setsid {} &)", writer(file)?))
 }
 
 /// Cancel R with T1 running `script` and check that the run is CANCELLED only once nothing of T1's attempt lives
-/// and that `file` no longer grows then.
-async fn cancel_with_a_writer_outside(dir: &Path, script: &str, file: &Path) -> R {
+/// and that `file` no longer grows then; the project's directory.
+async fn cancel_with_a_writer_outside(dir: &Path, script: &str, file: &Path) -> R<PathBuf> {
     let agents = Arc::new(Agents::new(&[("T1", script)]));
     let _leaders = Leaders(agents.leaders.clone());
     let (project, host) = host(dir, &agents).await?;
@@ -800,7 +812,7 @@ async fn cancel_with_a_writer_outside(dir: &Path, script: &str, file: &Path) -> 
     let _ = bystander.kill();
     let _ = bystander.wait();
     host.shutdown().await;
-    Ok(())
+    Ok(project)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -812,9 +824,23 @@ async fn a_cancel_ends_a_writer_the_leader_started_and_orphaned_after_the_cancel
     let file = dir.path().join("written.txt");
     let script = format!(
         "trap \"{}\" TERM; while :; do sleep 0.1; done",
-        orphan_writer(&file).replace('"', "\\\"")
+        orphan_writer(&file)?.replace('"', "\\\"")
     );
-    cancel_with_a_writer_outside(dir.path(), &script, &file).await
+    let project = cancel_with_a_writer_outside(dir.path(), &script, &file).await?;
+    // Found after the SIGTERM step, it was sent that signal at once, not left for the SIGKILL step 5 s later: its last
+    // write is within 2 s of the step.
+    let term: u64 = query(
+        &project,
+        "SELECT json_extract(payload_json, '$.at_ms') FROM events WHERE kind = 'cancel.sigterm'",
+    )?
+    .parse()?;
+    let last = std::fs::metadata(&file)?
+        .modified()?
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis();
+    let after = u64::try_from(last)?.saturating_sub(term);
+    assert!(after < 2000, "the writer wrote {after} ms after SIGTERM");
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -823,8 +849,10 @@ async fn a_cancel_ends_a_writer_orphaned_before_the_cancel() -> R {
     // cancel, so no parent chain leads to it; its marker does.
     let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
     let file = dir.path().join("written.txt");
-    let script = format!("{}; while :; do sleep 0.1; done", orphan_writer(&file));
-    cancel_with_a_writer_outside(dir.path(), &script, &file).await
+    let script = format!("{}; while :; do sleep 0.1; done", orphan_writer(&file)?);
+    cancel_with_a_writer_outside(dir.path(), &script, &file)
+        .await
+        .map(drop)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -835,16 +863,15 @@ async fn a_cancel_ends_a_descendant_without_the_marker_that_left_the_group_while
     // lives, ties the writer to the attempt before it is orphaned.
     let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
     let file = dir.path().join("written.txt");
-    let writer = dir.path().join("writer.pid");
+    let pid_file = dir.path().join("writer.pid");
     let script = format!(
-        "sleep 2; env -i /usr/bin/setsid /bin/sh -c 'for i in $(/usr/bin/seq 1 2400); do echo x >> {}; /bin/sleep 0.05; done' & \
-         echo $! > {}; while :; do sleep 0.1; done",
-        file.display(),
-        writer.display()
+        "sleep 2; env -i /usr/bin/setsid {} & echo $! > {}; while :; do sleep 0.1; done",
+        writer(&file)?,
+        pid_file.display()
     );
-    let guard = KillPidFile(writer.clone());
+    let guard = KillPidFile(pid_file.clone());
     cancel_with_a_writer_outside(dir.path(), &script, &file).await?;
-    let pid: u32 = std::fs::read_to_string(&writer)?.trim().parse()?;
+    let pid: u32 = std::fs::read_to_string(&pid_file)?.trim().parse()?;
     let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
         .ok()
         .and_then(|s| {
