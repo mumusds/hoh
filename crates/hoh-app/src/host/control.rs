@@ -268,7 +268,7 @@ impl Processes for HostProcesses {
             // Without a cgroup: Lost while its group number is in use; once no process has it, the rest of the proof
             // (decision 8d v7, M2T06R-600).
             _ => match number {
-                Some(pgid) if identity::group_empty(pgid) => {
+                Some(pgid) if identity::number_free(pgid) => {
                     (Box::new(control(Watch::Number(pgid))), false)
                 }
                 _ => (Box::new(Fixed(Look::Lost)), false),
@@ -322,10 +322,11 @@ struct AttemptControl {
     cgroup: Option<AttemptGroup>,
 }
 
-/// Whether process group `pgid` still has a member: anything but ESRCH from `kill(-pgid, 0)` (which sends nothing),
-/// EPERM included, means one is there (M2T06R-558, as [`identity::group_empty`]).
+/// Whether group number `pgid` may still have a member, now or later: a process in that group, or process `pgid`
+/// itself, alive in any group, which can make it again (M2T06R-700). Anything but ESRCH, EPERM included, means in use
+/// (M2T06R-558, [`identity::number_free`]).
 fn group_lives(pgid: u32) -> bool {
-    !identity::group_empty(pgid)
+    !identity::number_free(pgid)
 }
 
 impl ProcessControl for AttemptControl {
@@ -897,6 +898,47 @@ mod tests {
         assert_eq!(first.look(), Look::Held, "one quiet scan");
         let (mut second, _) = processes.control(&row).ok_or("no control")?;
         assert_eq!(second.look(), Look::Empty);
+        Ok(())
+    }
+
+    #[test]
+    fn a_number_whose_process_lives_in_another_group_is_not_free() -> R {
+        // M2T06R-700: an unconfirmed leader alive in another group leaves its group number empty but can make it again:
+        // without a cgroup the cancel stays Lost, and a group watched by that number holds.
+        use std::os::unix::process::CommandExt as _;
+        let cgroup = tempfile::tempdir()?;
+        std::fs::write(cgroup.path().join("cgroup.events"), b"populated 0\n")?;
+        let root = tree(&[(100, "PATH=/bin")])?;
+        let processes = HostProcesses {
+            works: BTreeMap::new(),
+            executor: None,
+            project: PathBuf::from("/nonexistent"),
+            project_id: format!("elsewhere-{}", std::process::id()),
+            pins: Arc::default(),
+            trackings: BTreeMap::new(),
+        };
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "read -r x"])
+            .stdin(std::process::Stdio::piped())
+            .process_group(rustix::process::getpgrp().as_raw_pid())
+            .spawn()?;
+        let n = child.id();
+        let lost = processes
+            .control(&running_row(Some(i64::from(n))))
+            .map(|(mut c, _)| c.look());
+        let mut watched = AttemptControl {
+            group: Watch::Number(n),
+            native: None,
+            outside: Arc::new(Mutex::new(
+                Outside::new("p/A1").with_root(Some(root.path().to_owned())),
+            )),
+            cgroup: Some(AttemptGroup::at(cgroup.path())),
+        };
+        let held: Vec<Look> = (0..3).map(|_| watched.look()).collect();
+        drop(child.stdin.take());
+        child.wait()?;
+        assert_eq!(lost, Some(Look::Lost));
+        assert_eq!(held, vec![Look::Held; 3]);
         Ok(())
     }
 
