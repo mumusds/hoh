@@ -201,6 +201,13 @@ struct HostProcesses {
 
 impl Processes for HostProcesses {
     fn control(&self, attempt: &AttemptRow) -> Option<(Box<dyn ProcessControl + Send>, bool)> {
+        // Recorded by a host that saw another world: no signal, no proof (M2T06R-900).
+        if matches!(
+            self.trackings.get(&attempt.attempt_id),
+            Some(Tracking::Foreign(_))
+        ) {
+            return Some((Box::new(Fixed(Look::Lost)), false));
+        }
         let presence = identity::presence(
             attempt.pid,
             attempt.boot_id.as_deref(),
@@ -840,6 +847,30 @@ mod tests {
         // Each half on its own (M2T06R-850): its group refuses the signal (EPERM) and its pid is a process's.
         assert!(!identity::group_empty(other), "group {other}");
         assert!(!identity::number_free(other), "number {other}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_cancel_proves_nothing_of_an_attempt_recorded_in_another_world() -> R {
+        // M2T06R-900: no signal and no proof for an attempt whose tracking a host in other namespaces recorded, even
+        // when its group looks gone from here.
+        let processes = HostProcesses {
+            works: BTreeMap::new(),
+            executor: None,
+            project: PathBuf::from("/nonexistent"),
+            project_id: format!("foreign-{}", std::process::id()),
+            pins: Arc::default(),
+            trackings: BTreeMap::from([(
+                "A1".to_owned(),
+                Tracking::Foreign("elsewhere".to_owned()),
+            )]),
+        };
+        let mut row = running_row(None);
+        row.state = AttemptState::Starting;
+        for _ in 0..3 {
+            let (mut control, _) = processes.control(&row).ok_or("no control")?;
+            assert_eq!(control.look(), Look::Lost);
+        }
         Ok(())
     }
 
