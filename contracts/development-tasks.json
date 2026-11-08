@@ -493,7 +493,7 @@
    "checks": [
     "deployment"
    ],
-   "done_when": "AC-005-04、AC-005-06 通过；systemd --user unit（Restart=on-failure、有界 StartLimit）随安装脚本落地；deployment 检查脚本落地（tests/check-plan.json 不再指向 not-implemented.sh）并产出 test-results.jsonl。"
+   "done_when": "AC-005-04、AC-005-06 通过；systemd --user unit（Restart=on-failure、有界 StartLimit、Delegate=yes，CR-011：host 在受委托的 cgroup 中运行，Attempt 以其 cgroup 证明终结）随安装脚本落地；deployment 检查脚本落地（tests/check-plan.json 不再指向 not-implemented.sh）并产出 test-results.jsonl。"
   },
   {
    "id": "M2-T07",

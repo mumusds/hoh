@@ -643,6 +643,34 @@ mod tests {
     }
 
     #[test]
+    fn a_cancels_look_with_a_cgroup_not_proved_empty_holds() -> R {
+        // M2T06R-451 (decision 8d v6): the group gone, the attempt's cgroup populated or unreadable: Held; once it is
+        // empty, the marker scan's two scans are still needed before Empty.
+        use std::os::unix::fs::PermissionsExt as _;
+        let cgroup = tempfile::tempdir()?;
+        let events = cgroup.path().join("cgroup.events");
+        std::fs::write(&events, b"populated 1\n")?;
+        let root = tree(&[(100, "PATH=/bin")])?;
+        let mut control = AttemptControl {
+            group: None,
+            native: None,
+            outside: Arc::new(Mutex::new(
+                Outside::new("p/A1").with_root(Some(root.path().to_owned())),
+            )),
+            cgroup: Some(AttemptGroup::at(cgroup.path())),
+            orphans: None,
+        };
+        assert_eq!(control.look(), Look::Held, "populated");
+        std::fs::set_permissions(&events, std::fs::Permissions::from_mode(0o000))?;
+        assert_eq!(control.look(), Look::Held, "unreadable");
+        std::fs::set_permissions(&events, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::write(&events, b"populated 0\n")?;
+        assert_eq!(control.look(), Look::Held, "one quiet marker scan");
+        assert_eq!(control.look(), Look::Empty);
+        Ok(())
+    }
+
+    #[test]
     fn the_scan_of_a_look_at_a_living_group_never_counts() -> R {
         // M2T06R-353: a single look while the group lives scans (none before) and must not count; the one look at the
         // empty group after it is the first scan of the two.

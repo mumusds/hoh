@@ -108,6 +108,12 @@ pub trait HostHooks: Send + Sync + std::fmt::Debug {
     fn proc_root(&self) -> Option<std::path::PathBuf> {
         None
     }
+
+    /// Whether the host may use a delegated cgroup it is in (a test of the /proc mode says no, so it does not change
+    /// mode with the cgroup it happens to run in, M2T06R-452).
+    fn cgroups_allowed(&self) -> bool {
+        true
+    }
 }
 
 /// The product's host hooks: none.
@@ -325,7 +331,11 @@ impl Host {
             stop: stopped.clone(),
             subscribers: std::sync::atomic::AtomicUsize::new(0),
             opened: std::sync::atomic::AtomicUsize::new(0),
-            cgroups: cgroup::Delegated::detect(),
+            cgroups: if config.hooks.cgroups_allowed() {
+                cgroup::Delegated::detect()
+            } else {
+                None
+            },
         });
         let mut served = vec![
             tokio::spawn(http::serve(

@@ -1,7 +1,7 @@
-//! An attempt's processes outside its process group and the proof that none is left (docs/adr/ADR-021.md decision 8d,
-//! version 3): every path that ends an attempt or releases its writer lease (the cancel, the executor's report of its
-//! leader's end, the settle of an expired lease or a lost executor, a host's start reconcile) first proves its group
-//! empty and none of these alive.
+//! An attempt's processes outside its process group, found by the /proc scan (docs/adr/ADR-021.md decision 8d): the
+//! degraded tracking when the host has no delegated cgroup, and the marker scan that is part of the proof with one.
+//! Every path that ends an attempt or releases its writer lease (the cancel, the executor's report of its leader's
+//! end, the settle of an expired lease or a lost executor, a host's start reconcile) first proves none of them alive.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -716,9 +716,35 @@ mod tests {
     }
 
     #[test]
+    fn a_process_whose_environment_cannot_be_read_is_read_by_its_threads()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // M2T06R-456 (M2T06R-301 in the degraded proc mode): its main thread exited, so its environ is refused; a
+        // thread still running has the marker.
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir()?;
+        let dir = root.path().join("500");
+        std::fs::create_dir_all(dir.join("task/501"))?;
+        std::fs::write(dir.join("environ"), b"")?;
+        std::fs::set_permissions(dir.join("environ"), std::fs::Permissions::from_mode(0o000))?;
+        std::fs::write(
+            dir.join("task/501/environ"),
+            format!("{ATTEMPT_ENV}=p/A1\0"),
+        )?;
+        let marker = format!("{ATTEMPT_ENV}=p/A1").into_bytes();
+        let found = marked(root.path(), 500, &marker);
+        std::fs::set_permissions(dir.join("environ"), std::fs::Permissions::from_mode(0o600))?;
+        assert_eq!(found, Some(true));
+        assert_eq!(
+            marked(root.path(), 500, b"HOH_ATTEMPT_ID=other/A9"),
+            Some(false)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn a_scan_that_could_not_read_a_process_proves_nothing()
     -> Result<(), Box<dyn std::error::Error>> {
-        // M2T06R-101 (decision 8d v3): a /proc tree with a process whose stat cannot be understood; however often it is
+        // M2T06R-101 (decision 8d): a /proc tree with a process whose stat cannot be understood; however often it is
         // scanned, nothing is concluded (no Done), and once that process is gone two scans prove it.
         let root = tempfile::tempdir()?;
         let write = |pid: &str, stat: &[u8]| -> std::io::Result<()> {

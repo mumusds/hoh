@@ -283,10 +283,35 @@ fn refused_code(line: &str) -> &'static str {
         .unwrap_or("GONE")
 }
 
-/// Whether a host started now can run in a delegated cgroup v2 (docs/adr/ADR-021.md decisions 2 and 8d v5,
-/// CR-011): cgroup v2 is mounted, the user's systemd manager answers on `$XDG_RUNTIME_DIR/systemd/private` and
-/// `systemd-run` is on PATH. Its `systemd-run`, or why not (then attempts are tracked by the /proc scan, degraded).
-pub fn delegated_scope() -> Result<std::path::PathBuf, String> {
+/// How a host can be started in a delegated scope of the user's systemd manager.
+#[derive(Debug, Clone)]
+pub struct Scope {
+    systemd_run: std::path::PathBuf,
+    /// `--expand-environment=no` (systemd 254 and later; older ones do not expand a scope's command).
+    no_expansion: bool,
+}
+
+/// The user this process runs as, by name (`$USER`, else `/etc/passwd` by uid).
+fn user_name() -> Option<String> {
+    if let Some(name) = std::env::var_os("USER").and_then(|n| n.into_string().ok()) {
+        return Some(name);
+    }
+    let uid = rustix::process::getuid().as_raw().to_string();
+    std::fs::read_to_string("/etc/passwd")
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            let fields: Vec<&str> = line.split(':').collect();
+            (fields.get(2) == Some(&uid.as_str())).then(|| fields[0].to_owned())
+        })
+}
+
+/// Whether a host started now can run in a delegated cgroup v2 (docs/adr/ADR-021.md decisions 2 and 8d, CR-011):
+/// cgroup v2 is mounted, the user's systemd manager answers on `$XDG_RUNTIME_DIR/systemd/private`, the user lingers
+/// (else that manager, and a host in one of its scopes, stops soon after the user's last session ends, which would end
+/// accepted work at an SSH disconnect, REQ-005 behaviour 2; M2T06R-453) and `systemd-run` is on PATH. How, or why not
+/// (then attempts are tracked by the /proc scan, degraded).
+pub fn delegated_scope() -> Result<Scope, String> {
     if !Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
         return Err("cgroup v2 is not mounted at /sys/fs/cgroup".to_owned());
     }
@@ -298,19 +323,44 @@ pub fn delegated_scope() -> Result<std::path::PathBuf, String> {
                 .to_owned(),
         );
     }
+    let name = user_name().ok_or_else(|| "this user's name is not known".to_owned())?;
+    if !Path::new("/var/lib/systemd/linger").join(&name).exists() {
+        return Err(format!(
+            "user {name} does not linger: a host in the user's systemd manager would stop after the last session \
+             (enable it with `loginctl enable-linger {name}`)"
+        ));
+    }
     let path = std::env::var_os("PATH").unwrap_or_default();
-    std::env::split_paths(&path)
+    let systemd_run = std::env::split_paths(&path)
         .map(|dir| dir.join("systemd-run"))
         .find(|candidate| candidate.is_file())
-        .ok_or_else(|| "systemd-run is not on PATH".to_owned())
+        .ok_or_else(|| "systemd-run is not on PATH".to_owned())?;
+    // `systemd-run --version` says `systemd <n> (...)` (M2T06R-455).
+    let version = std::process::Command::new(&systemd_run)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .and_then(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .split_whitespace()
+                .nth(1)
+                .and_then(|v| v.parse::<u32>().ok())
+        })
+        .ok_or_else(|| format!("{} --version could not be read", systemd_run.display()))?;
+    Ok(Scope {
+        systemd_run,
+        no_expansion: version >= 254,
+    })
 }
 
 /// Start `project`'s host and wait until it is ready, until `end`: in a delegated scope of the user's systemd
 /// manager when there is one, so its attempts are tracked by cgroups of their own; directly otherwise, or when the
 /// scope cannot be had (decision 2).
 fn start(project: &Path, end: Instant) -> Result<HostInfo, Failure> {
-    if let Ok(systemd_run) = delegated_scope() {
-        match launch(project, end, Some(&systemd_run)) {
+    if let Ok(scope) = delegated_scope() {
+        match launch(project, end, Some(&scope)) {
             Err(failure) if failure.exit != 78 && Instant::now() < end => {
                 // The scope was refused (or the host ended for another reason): once more, directly.
                 return launch(project, end, None);
@@ -321,26 +371,26 @@ fn start(project: &Path, end: Instant) -> Result<HostInfo, Failure> {
     launch(project, end, None)
 }
 
-/// Start `hoh __host <project>`, through `systemd_run` if given, and wait until it is ready, until `end`.
-fn launch(project: &Path, end: Instant, systemd_run: Option<&Path>) -> Result<HostInfo, Failure> {
+/// Start `hoh __host <project>`, in `scope` if given, and wait until it is ready, until `end`.
+fn launch(project: &Path, end: Instant, scope: Option<&Scope>) -> Result<HostInfo, Failure> {
     let program = std::env::current_exe()
         .map_err(|e| Failure::unreachable(format!("cannot find the hoh program: {e}")))?;
-    let mut command = match systemd_run {
+    let mut command = match scope {
         // `--scope` runs the command itself (the pid stays the child's); `$` in the path is not expanded.
-        Some(systemd_run) => {
-            let mut command = std::process::Command::new(systemd_run);
-            command
-                .args([
-                    "--user",
-                    "--scope",
-                    "-p",
-                    "Delegate=yes",
-                    "--quiet",
-                    "--collect",
-                    "--expand-environment=no",
-                    "--",
-                ])
-                .arg(&program);
+        Some(scope) => {
+            let mut command = std::process::Command::new(&scope.systemd_run);
+            command.args([
+                "--user",
+                "--scope",
+                "-p",
+                "Delegate=yes",
+                "--quiet",
+                "--collect",
+            ]);
+            if scope.no_expansion {
+                command.arg("--expand-environment=no");
+            }
+            command.arg("--").arg(&program);
             command
         }
         None => std::process::Command::new(&program),

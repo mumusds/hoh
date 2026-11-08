@@ -29,8 +29,10 @@ impl Delegated {
         let base = Path::new(MOUNT).join(path.trim().trim_start_matches('/'));
         let probe = base.join(format!("hoh-probe-{}", std::process::id()));
         std::fs::create_dir(&probe).ok()?;
+        // cgroup.kill (Linux 5.14): without it a member that ignores SIGTERM could not be stopped (M2T06R-457).
+        let kills = probe.join("cgroup.kill").exists();
         std::fs::remove_dir(&probe).ok()?;
-        Some(Delegated { base })
+        kills.then_some(Delegated { base })
     }
 
     /// The cgroup of the attempt with `marker` (`<project id>/<attempt id>`): a name of hex digits, unique per
@@ -184,6 +186,21 @@ impl AttemptGroup {
     }
 }
 
+/// Whether a recorded path has the form this host gives an attempt's cgroup: below the cgroup v2 mount, named
+/// `attempt-<16 hex digits>` (a record that is not is not trusted with a kill, M2T06R-458).
+fn recorded_form(path: &Path) -> bool {
+    path.starts_with(MOUNT)
+        && path.is_absolute()
+        && !path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        && path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_prefix("attempt-"))
+            .is_some_and(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 /// How an attempt's processes are tracked (decision 8d v5): by its cgroup, or (degraded) by the /proc scan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Tracking {
@@ -209,10 +226,13 @@ impl Tracking {
     /// recorded none) is tracked by the /proc scan.
     pub(super) fn of(event: Option<&serde_json::Value>) -> Tracking {
         match event {
-            Some(e) if e["tracking"] == "cgroup" => e["cgroup"].as_str().map_or_else(
-                || Tracking::Proc("no cgroup path recorded".to_owned()),
-                |p| Tracking::Cgroup(PathBuf::from(p)),
-            ),
+            Some(e) if e["tracking"] == "cgroup" => e["cgroup"]
+                .as_str()
+                .filter(|p| recorded_form(Path::new(p)))
+                .map_or_else(
+                    || Tracking::Proc("no cgroup path recorded".to_owned()),
+                    |p| Tracking::Cgroup(PathBuf::from(p)),
+                ),
             Some(e) => Tracking::Proc(e["reason"].as_str().unwrap_or("recorded").to_owned()),
             None => Tracking::Proc("no tracking recorded".to_owned()),
         }
@@ -223,6 +243,103 @@ impl Tracking {
         match self {
             Tracking::Cgroup(path) => Some(AttemptGroup::at(path)),
             Tracking::Proc(_) => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    type R<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    /// A cgroup of a test's own (a directory with the files a cgroup has), `populated` as given, no members.
+    fn fake(populated: u8) -> R<tempfile::TempDir> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(
+            dir.path().join("cgroup.events"),
+            format!("populated {populated}\nfrozen 0\n"),
+        )?;
+        std::fs::write(dir.path().join("cgroup.procs"), b"")?;
+        std::fs::write(dir.path().join("cgroup.kill"), b"")?;
+        Ok(dir)
+    }
+
+    #[test]
+    fn a_cgroup_still_populated_after_its_kill_proves_nothing() -> R {
+        // M2T06R-451: SIGKILL asked of the kernel, the grace waited, still populated: Pending, no reaped step, kept.
+        let dir = fake(1)?;
+        let group = AttemptGroup::at(dir.path());
+        let (steps, proof) = group.stop(Duration::from_millis(30), Duration::from_millis(30));
+        assert_eq!(
+            (steps, proof),
+            (vec!["cgroup_kill".to_owned()], Proof::Pending)
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("cgroup.kill"))?,
+            "1"
+        );
+        assert!(dir.path().exists());
+        Ok(())
+    }
+
+    #[test]
+    fn a_cgroup_whose_events_cannot_be_read_proves_nothing() -> R {
+        // M2T06R-451: cgroup.events unreadable: Incomplete, said so among the steps.
+        let dir = fake(0)?;
+        std::fs::set_permissions(
+            dir.path().join("cgroup.events"),
+            std::fs::Permissions::from_mode(0o000),
+        )?;
+        let group = AttemptGroup::at(dir.path());
+        assert_eq!(group.proof(), Proof::Incomplete);
+        let (steps, proof) = group.stop(Duration::from_millis(30), Duration::from_millis(30));
+        std::fs::set_permissions(
+            dir.path().join("cgroup.events"),
+            std::fs::Permissions::from_mode(0o600),
+        )?;
+        assert_eq!(
+            (steps, proof),
+            (vec!["cgroup_unreadable".to_owned()], Proof::Incomplete)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_empty_cgroup_is_proved_at_once_and_a_gone_one_too() -> R {
+        let dir = fake(0)?;
+        assert_eq!(
+            AttemptGroup::at(dir.path()).stop(Duration::ZERO, Duration::ZERO),
+            (Vec::new(), Proof::Done)
+        );
+        assert_eq!(
+            AttemptGroup::at(&dir.path().join("gone")).proof(),
+            Proof::Done
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn only_a_recorded_path_of_the_hosts_form_is_trusted() {
+        // M2T06R-458: below the cgroup mount, named attempt-<16 hex>; anything else is tracked by the /proc scan.
+        let event = |path: &str| serde_json::json!({"tracking": "cgroup", "cgroup": path});
+        let good = "/sys/fs/cgroup/user.slice/x.scope/attempt-0123456789abcdef";
+        assert_eq!(
+            Tracking::of(Some(&event(good))),
+            Tracking::Cgroup(PathBuf::from(good))
+        );
+        for bad in [
+            "/tmp/attempt-0123456789abcdef",
+            "/sys/fs/cgroup/user.slice/x.scope",
+            "/sys/fs/cgroup/../etc/attempt-0123456789abcdef",
+            "/sys/fs/cgroup/x/attempt-0123456789abcdeg",
+            "sys/fs/cgroup/x/attempt-0123456789abcdef",
+        ] {
+            assert!(
+                matches!(Tracking::of(Some(&event(bad))), Tracking::Proc(_)),
+                "{bad}"
+            );
         }
     }
 }
