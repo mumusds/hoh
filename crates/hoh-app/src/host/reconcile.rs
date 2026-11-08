@@ -5,6 +5,7 @@
 //! would show, and
 //! the attempt's disposition is written with what was found, between `reconcile.started` and `reconcile.completed`.
 
+use super::processes::{Outside, Proof};
 use hoh_agents::identity::{self, Gone, Presence, StopStep};
 use hoh_core::lifecycle::AttemptState;
 use hoh_core::persistence::{PersistError, Store, UnfinishedRow};
@@ -104,20 +105,50 @@ fn seen(state: AttemptState, found: std::io::Result<Presence>) -> Seen {
     }
 }
 
-/// End what `seen` found (blocking): a process of the attempt is stopped with its group and its group must be seen
-/// empty (a group already empty gets no signal, M2T05R-259).
-pub(super) fn end(seen: Seen, settings: &ReconcileSettings) -> Process {
-    match seen {
+/// End what `seen` found of `row`'s processes (blocking): a process of the attempt is stopped with its group and its
+/// group must be seen empty (a group already empty gets no signal, M2T05R-259); then its processes outside the group
+/// are stopped the same way, the group stopped, gone or never started, and the attempt can end only with the
+/// termination proof (docs/adr/ADR-021.md decision 8d v3, M2T06R-100): else it is `Stopped { reaped: false }`, which
+/// leaves it and its slot.
+pub(super) fn end(seen: Seen, row: &UnfinishedRow, settings: &ReconcileSettings) -> Process {
+    let mut outside = Outside::new(&super::runner::marker(&row.project_id, &row.attempt_id));
+    let group = match seen {
+        // Nothing may be signalled: it stays as it is.
+        Seen::Uncertain(basis) => return Process::Uncertain { basis },
         Seen::NotStarted => Process::NotStarted,
-        Seen::Ours(found) => stopped(&found.stop(settings.term_grace, settings.kill_grace)),
-        Seen::Uncertain(basis) => Process::Uncertain { basis },
+        Seen::Ours(found) => {
+            // Its descendants are pinned while its leader still ties them to it, then the group is stopped.
+            outside.set_leader(row.pid, row.process_start_id.as_deref());
+            let _ = outside.scan();
+            stopped(&found.stop(settings.term_grace, settings.kill_grace))
+        }
         Seen::Gone(basis) => Process::Gone { basis },
+    };
+    let (steps, proof) = outside.stop(settings.term_grace, settings.kill_grace);
+    with_outside(group, steps, proof)
+}
+
+/// The process as recorded once its processes outside the group were stopped: unchanged when there were none.
+fn with_outside(group: Process, outside: Vec<String>, proof: Proof) -> Process {
+    match group {
+        group if proof == Proof::Done && outside.is_empty() => group,
+        Process::Stopped { mut steps, reaped } => {
+            steps.extend(outside);
+            Process::Stopped {
+                steps,
+                reaped: reaped && proof == Proof::Done,
+            }
+        }
+        _ => Process::Stopped {
+            steps: outside,
+            reaped: proof == Proof::Done,
+        },
     }
 }
 
 /// What was found of `row`'s process at a host's start, and done to it (blocking).
 fn process_of(row: &UnfinishedRow, settings: &ReconcileSettings) -> Result<Process, PersistError> {
-    Ok(end(inspect(row), settings))
+    Ok(end(inspect(row), row, settings))
 }
 
 /// A stop as the reconcile records it.

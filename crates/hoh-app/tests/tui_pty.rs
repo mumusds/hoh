@@ -698,23 +698,48 @@ fn test_043_03_the_tui_leaves_on_sighup_sigterm_and_detach_with_the_host_and_age
     Ok(())
 }
 
-/// SIGKILLs the product host `pid` of a project when dropped, if it still runs (checked by its command line), however
-/// the test ends (M2T06R-62).
-struct HostGuard(u32, std::path::PathBuf);
+/// The `hoh __host <project>` processes of `project`, by their command lines.
+fn hosts_of(project: &Path) -> Vec<u32> {
+    let wanted = format!(
+        "{}\0__host\0{}\0",
+        env!("CARGO_BIN_EXE_hoh"),
+        project.display()
+    );
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| {
+            std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| c == wanted.as_bytes())
+        })
+        .collect()
+}
 
-impl Drop for HostGuard {
+/// Stops the hosts the product started for a project when dropped, however the test ends (docs/adr/ADR-021.md
+/// decision 11, M2T06R-62, -154): each found by its command line, SIGTERM, then SIGKILL after 10 s.
+struct Daemons(std::path::PathBuf);
+
+impl Drop for Daemons {
     fn drop(&mut self) {
-        let wanted = format!(
-            "{}\0__host\0{}\0",
-            env!("CARGO_BIN_EXE_hoh"),
-            self.1.display()
-        );
-        if std::fs::read(format!("/proc/{}/cmdline", self.0)).is_ok_and(|c| c == wanted.as_bytes())
-            && let Some(pid) = i32::try_from(self.0)
+        let signal = |pid: u32, signal: Signal| {
+            if let Some(pid) = i32::try_from(pid)
                 .ok()
                 .and_then(rustix::process::Pid::from_raw)
-        {
-            let _ = rustix::process::kill_process(pid, Signal::KILL);
+            {
+                let _ = rustix::process::kill_process(pid, signal);
+            }
+        };
+        for pid in hosts_of(&self.0) {
+            signal(pid, Signal::TERM);
+        }
+        let end = std::time::Instant::now() + Duration::from_secs(10);
+        while !hosts_of(&self.0).is_empty() && std::time::Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        for pid in hosts_of(&self.0) {
+            signal(pid, Signal::KILL);
         }
     }
 }
@@ -738,7 +763,7 @@ fn a_host_started_by_a_detach_in_a_terminal_outlives_its_hang_up() -> R {
     let host: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(project.join(".hoh/host.json"))?)?;
     let pid = u32::try_from(host["pid"].as_u64().ok_or("no pid")?)?;
-    let _host = HostGuard(pid, project.clone());
+    let _daemons = Daemons(project.clone());
     pty.hang_up()?;
     drop(pty);
     std::thread::sleep(Duration::from_millis(500));
@@ -833,6 +858,8 @@ fn the_tuis_pause_and_cancel_choices_send_their_own_commands_and_it_stays_attach
         .worker_threads(2)
         .enable_all()
         .build()?;
+    // The TUI starts a product host if it finds none: stopped however the test ends.
+    let _daemons = Daemons(project.clone());
     let host = runtime.block_on(hoh_app::host::Host::start(in_process(&project)))?;
     sqlite(
         &project.join(".hoh/state.db"),
@@ -892,6 +919,8 @@ fn an_attached_tui_goes_on_with_its_run_through_a_host_started_again() -> R {
         });
         config
     };
+    // The TUI starts a product host if it finds none (its host stopped): stopped however the test ends.
+    let _daemons = Daemons(project.clone());
     let first = runtime.block_on(hoh_app::host::Host::start(config()))?;
     sqlite(
         &project.join(".hoh/state.db"),

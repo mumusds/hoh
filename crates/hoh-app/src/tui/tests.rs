@@ -753,3 +753,44 @@ fn the_prompt_and_the_text_are_drawn_apart() {
         "the prompt's space"
     );
 }
+
+#[test]
+fn a_links_get_answered_403_goes_once_more_to_the_host_found_again() -> crate::client::tests::R {
+    // M2T06R-155 (docs/adr/ADR-021.md decision 10): the link holds a host that stopped, and another started (another
+    // token) before the reader noticed. A GET is answered by the new host, and the link keeps it.
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    let first = runtime.block_on(hoh_app::host::Host::start(crate::client::tests::config(
+        &project,
+    )?))?;
+    let stale = crate::client::running(&project).ok_or("no host")?;
+    runtime.block_on(first.shutdown());
+    let second = runtime.block_on(hoh_app::host::Host::start(crate::client::tests::config(
+        &project,
+    )?))?;
+    let (_events_in, events) = std::sync::mpsc::channel();
+    let link = super::Link {
+        host: Arc::new(Mutex::new(stale.clone())),
+        project: project.clone(),
+        run_id: "R".to_owned(),
+        events,
+        stop: Arc::new(AtomicBool::new(false)),
+    };
+    let reply = link.get("/v1/runs")?;
+    assert_eq!(reply.status, 200);
+    assert_ne!(
+        link.host().token,
+        stale.token,
+        "the link keeps the host found again"
+    );
+    drop(link);
+    runtime.block_on(second.shutdown());
+    Ok(())
+}

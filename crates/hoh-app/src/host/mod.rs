@@ -10,9 +10,10 @@
 
 mod control;
 mod http;
+mod processes;
 mod reconcile;
 mod runner;
-pub use control::ATTEMPT_ENV;
+pub use processes::ATTEMPT_ENV;
 pub use reconcile::ReconcileSettings;
 pub use runner::{Executor, Gate, Outcome, RunnerConfig, RunnerPoint, Started, Work};
 
