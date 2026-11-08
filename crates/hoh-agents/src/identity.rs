@@ -507,8 +507,14 @@ mod tests {
             .process_group(0)
             .spawn()?;
         let pid = child.id();
+        // The kernel names it after its exec only after the spawn has returned (seen in CI): wait for the name.
+        let comm = format!("/proc/{pid}/comm");
+        let end = Instant::now() + Duration::from_secs(5);
+        while std::fs::read(&comm)? != b"w\xffr\n" && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let seen = (
-            std::fs::read(format!("/proc/{pid}/comm"))?,
+            std::fs::read(&comm)?,
             of(pid),
             group_left(pid, 0),
             crate::process::group_members(pid),
