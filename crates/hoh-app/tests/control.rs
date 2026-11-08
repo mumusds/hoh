@@ -719,11 +719,12 @@ impl Drop for Marked {
     }
 }
 
-/// A writer that appends to `file` every 50 ms for at most 30 s, in a session of its own, orphaned at once (its
-/// parent subshell exits): nothing but its environment ties it to the attempt.
+/// A writer that appends to `file` every 50 ms for at most 120 s (longer than any wait of these tests, so only a
+/// signal ends it in time), in a session of its own, orphaned at once (its parent subshell exits): nothing but its
+/// environment ties it to the attempt.
 fn orphan_writer(file: &Path) -> String {
     format!(
-        "(setsid sh -c 'for i in $(seq 1 600); do echo x >> {}; sleep 0.05; done' &)",
+        "(setsid sh -c 'for i in $(seq 1 2400); do echo x >> {}; sleep 0.05; done' &)",
         file.display()
     )
 }
@@ -770,6 +771,7 @@ async fn cancel_with_a_writer_outside(dir: &Path, script: &str, file: &Path) -> 
         .arg("30")
         .env(hoh_app::host::ATTEMPT_ENV, &other)
         .spawn()?;
+    let asked = Instant::now();
     let (status, _) = command(&host, &control(&project, "CancelRun", "cancel")?).await?;
     assert_eq!(status, 202);
     until(
@@ -779,6 +781,9 @@ async fn cancel_with_a_writer_outside(dir: &Path, script: &str, file: &Path) -> 
         Duration::from_secs(40),
     )
     .await?;
+    // Signalled with the group's steps (SIGTERM at 10 s, SIGKILL at 15 s), not left to end by itself.
+    let took = asked.elapsed();
+    assert!(took <= Duration::from_secs(20), "{took:?}");
     assert_eq!(
         marked(&attempt),
         Vec::<u32>::new(),
@@ -832,7 +837,7 @@ async fn a_cancel_ends_a_descendant_without_the_marker_that_left_the_group_while
     let file = dir.path().join("written.txt");
     let writer = dir.path().join("writer.pid");
     let script = format!(
-        "sleep 2; env -i /usr/bin/setsid /bin/sh -c 'for i in $(/usr/bin/seq 1 600); do echo x >> {}; /bin/sleep 0.05; done' & \
+        "sleep 2; env -i /usr/bin/setsid /bin/sh -c 'for i in $(/usr/bin/seq 1 2400); do echo x >> {}; /bin/sleep 0.05; done' & \
          echo $! > {}; while :; do sleep 0.1; done",
         file.display(),
         writer.display()
