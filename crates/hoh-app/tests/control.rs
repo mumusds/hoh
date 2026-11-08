@@ -36,6 +36,23 @@ fn config(project: &Path) -> HostConfig {
     config
 }
 
+/// Start a host in a project another host of this process just let go. A process that spawns children (a parallel
+/// test's agents, or the WAL self-test's probe) shares every open file with each child until it execs, so a lock just
+/// released can still be held for that instant: a refusal (69) is tried again for a moment (as tests/host.rs does).
+async fn start_when_free(
+    config: hoh_app::host::HostConfig,
+) -> Result<hoh_app::host::Host, hoh_app::host::StartError> {
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match hoh_app::host::Host::start(config.clone()).await {
+            Err(e) if e.exit_code == 69 && std::time::Instant::now() < end => {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            other => return other,
+        }
+    }
+}
+
 fn python(db: &Path, script: &str, stdin: &str) -> R<String> {
     use std::io::Write as _;
     let mut child = Command::new("python3")
@@ -322,7 +339,7 @@ async fn host(dir: &Path, agents: &Arc<Agents>) -> R<(PathBuf, Host)> {
         executor: agents.clone(),
         context: context(),
     });
-    Ok((project.clone(), Host::start(config).await?))
+    Ok((project.clone(), start_when_free(config).await?))
 }
 
 fn seq(project: &Path, sql: &str) -> R<i64> {
@@ -1003,7 +1020,7 @@ async fn an_expired_lease_is_given_up_only_once_its_holders_processes_outside_th
         executor: agents.clone(),
         context: context(),
     });
-    let host = Host::start(config).await?;
+    let host = start_when_free(config).await?;
     let marker = t1_marker(&project)?;
     let _marked = Marked(marker.clone());
     until(
@@ -1070,7 +1087,7 @@ async fn a_hosts_start_reconcile_ends_an_attempt_only_once_its_processes_outside
         &project,
         "SELECT count(*) FROM events WHERE kind = 'reconcile.completed'",
     )?;
-    let second = Host::start(config(&project)).await?;
+    let second = start_when_free(config(&project)).await?;
     until(
         &project,
         "SELECT count(*) FROM events WHERE kind = 'reconcile.completed'",

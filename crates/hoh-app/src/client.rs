@@ -488,6 +488,23 @@ pub(crate) mod tests {
         }
     }
 
+    /// Start a host in a project another host of this process just let go. A process that spawns children (a parallel
+    /// test's agents, or the WAL self-test's probe) shares every open file with each child until it execs, so a lock just
+    /// released can still be held for that instant: a refusal (69) is tried again for a moment (as tests/host.rs does).
+    pub(crate) async fn start_when_free(
+        config: hoh_app::host::HostConfig,
+    ) -> Result<hoh_app::host::Host, hoh_app::host::StartError> {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match hoh_app::host::Host::start(config.clone()).await {
+                Err(e) if e.exit_code == 69 && std::time::Instant::now() < end => {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                other => return other,
+            }
+        }
+    }
+
     /// An in-process host's configuration for `project` (the WAL probe is this test binary's helper).
     pub(crate) fn config(project: &Path) -> R<hoh_app::host::HostConfig> {
         let mut config = hoh_app::host::HostConfig::new(project);
@@ -622,7 +639,7 @@ pub(crate) mod tests {
         let first = runtime.block_on(hoh_app::host::Host::start(config(&project)?))?;
         let stale = running(&project).ok_or("no host")?;
         runtime.block_on(first.shutdown());
-        let second = runtime.block_on(hoh_app::host::Host::start(config(&project)?))?;
+        let second = runtime.block_on(start_when_free(config(&project)?))?;
         let now = running(&project).ok_or("no second host")?;
         assert_ne!(now.token, stale.token);
         let accepted = submit(
