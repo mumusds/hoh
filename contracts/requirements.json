@@ -2291,7 +2291,7 @@
    "decisions": [
     "native interrupt grace 10 s、SIGTERM grace 5 s及17 s总上限为初值；docs只要求短grace与有界SIGKILL。",
     "安全点未精确定义；本选择为当前Attempt到达SETTLED/FAILED/CANCELLED，Pause不设超时也不中断。",
-    "以setsid脱离进程组的后代不受pgid信号覆盖；本选择额外按/proc父子链终止该Attempt后代，需实现时确认可行。"
+    "以setsid脱离进程组的后代不受pgid信号覆盖。host运行在受委托的cgroup v2中时（systemd --user的unit带Delegate=yes，或客户端经systemd-run --user --scope -p Delegate=yes拉起host），每个Attempt的进程在其启动门打开前移入它专属的子cgroup，以cgroup.kill停止、以populated 0证明终结；没有受委托的cgroup时，退回按/proc父子链与继承的环境标记查找的尽力方案，并把该Attempt明确记为降级（tracking: proc），由hoh doctor报告；该方案对蓄意躲避的进程不成立（CR-011）。"
    ]
   },
   {
