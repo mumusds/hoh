@@ -46,7 +46,8 @@ pub fn after_command_name(stat: &[u8]) -> Option<&str> {
     std::str::from_utf8(&stat[at + 1..]).ok()
 }
 
-/// The start time of process `pid`, `None` when there is no such process.
+/// The start time of process `pid`, `None` when /proc has no entry for it (which alone proves nothing: /proc can hide
+/// a live process, M2T06R-800).
 pub fn start_id(pid: u32) -> io::Result<Option<String>> {
     let stat = match std::fs::read(format!("/proc/{pid}/stat")) {
         Ok(stat) => stat,
@@ -62,7 +63,7 @@ pub fn start_id(pid: u32) -> io::Result<Option<String>> {
         .ok_or_else(|| io::Error::other(format!("/proc/{pid}/stat has no start time")))
 }
 
-/// The identity of process `pid` now, `None` when there is no such process.
+/// The identity of process `pid` now, `None` when /proc has no entry for it (see [`start_id`]).
 pub fn of(pid: u32) -> io::Result<Option<Identity>> {
     let Some(start_id) = start_id(pid)? else {
         return Ok(None);
@@ -142,7 +143,7 @@ pub struct Leaderless {
 pub enum Presence {
     /// Its process, held by its pidfd.
     Ours(Found),
-    /// Its leader gone, members left in its group.
+    /// Its leader gone, its number still in use (members left in its group, or the number taken as a pid since).
     Leaderless(Leaderless),
     /// A pid recorded without the boot or the start time that would tell it apart: nothing can be confirmed
     /// (M2T05R-100).
@@ -151,7 +152,8 @@ pub enum Presence {
     Gone(Gone),
 }
 
-/// What a record names now: [`find`], and for a leader that is gone, whether its group still has members.
+/// What a record names now: [`find`], and for a leader that is gone, whether its number is free ([`number_free`]: no
+/// process uses it as its pid or as its group, by the kernel's answers, M2T06R-700, -800).
 pub fn presence(pid: Option<i64>, boot: Option<&str>, start: Option<&str>) -> io::Result<Presence> {
     if pid.is_some() && (boot.is_none() || start.is_none()) {
         return Ok(Presence::Unverifiable);
@@ -264,7 +266,18 @@ pub enum Group {
     Lost,
 }
 
-/// What a pidfd's fdinfo `Pid:` field (`None`: unreadable or missing) says of leader `pid`.
+/// What a process `pid` whose pidfd opened but whose start time cannot be read is: gone only when its pidfd says it was
+/// reaped; alive, a zombie, or nothing told (an fdinfo that cannot be read, another pid namespace's view), it cannot be
+/// confirmed (M2T06R-800, -951).
+fn unread_start(leader: Leader, pid: u32) -> io::Result<Gone> {
+    match leader {
+        Leader::Reaped => Ok(Gone::NoProcess),
+        Leader::Unreaped | Leader::Unknown => Err(io::Error::other(format!(
+            "process {pid} is not known to be gone but /proc/{pid}/stat cannot be read"
+        ))),
+    }
+}
+
 /// What `pidfd`'s fdinfo says of its process `pid` (this process's own /proc, never hidden from it).
 fn pidfd_leader(pidfd: &OwnedFd, pid: u32) -> Leader {
     use std::os::fd::AsRawFd as _;
@@ -277,6 +290,7 @@ fn pidfd_leader(pidfd: &OwnedFd, pid: u32) -> Leader {
     leader_shown(shown.as_deref(), pid)
 }
 
+/// What a pidfd's fdinfo `Pid:` field (`None`: unreadable or missing) says of leader `pid`.
 fn leader_shown(shown: Option<&str>, pid: u32) -> Leader {
     match shown {
         Some(shown) if shown == pid.to_string() => Leader::Unreaped,
@@ -338,12 +352,7 @@ fn find_with(
     let Some(now) = read_start(pid)? else {
         // No /proc entry is no proof: /proc can hide a live process (hidepid, a mount over it). Only the kernel's
         // answer through the pidfd tells it is gone (reaped); alive or a zombie, it cannot be confirmed (M2T06R-800).
-        return match pidfd_leader(&pidfd, pid) {
-            Leader::Reaped => Ok(Err(Gone::NoProcess)),
-            Leader::Unreaped | Leader::Unknown => Err(io::Error::other(format!(
-                "process {pid} is not known to be gone but /proc/{pid}/stat cannot be read"
-            ))),
-        };
+        return unread_start(pidfd_leader(&pidfd, pid), pid).map(Err);
     };
     if start != Some(now.as_str()) {
         return Ok(Err(Gone::OtherStart {
@@ -951,6 +960,14 @@ mod tests {
         };
         assert!(!number_free(other), "{other}");
         Ok(())
+    }
+
+    #[test]
+    fn a_start_time_that_cannot_be_read_is_gone_only_when_the_pidfd_says_reaped() {
+        // M2T06R-951: the mapping on its own: a pidfd whose fdinfo cannot be read (Unknown) proves nothing.
+        assert_eq!(unread_start(Leader::Reaped, 7).ok(), Some(Gone::NoProcess));
+        assert!(unread_start(Leader::Unreaped, 7).is_err());
+        assert!(unread_start(Leader::Unknown, 7).is_err());
     }
 
     #[test]
