@@ -772,9 +772,9 @@ fn a_links_get_answered_403_goes_once_more_to_the_host_found_again() -> crate::c
     )?))?;
     let stale = crate::client::running(&project).ok_or("no host")?;
     runtime.block_on(first.shutdown());
-    let second = runtime.block_on(hoh_app::host::Host::start(crate::client::tests::config(
-        &project,
-    )?))?;
+    let second = runtime.block_on(crate::client::tests::start_when_free(
+        crate::client::tests::config(&project)?,
+    ))?;
     let (_events_in, events) = std::sync::mpsc::channel();
     let link = super::Link {
         host: Arc::new(Mutex::new(stale.clone())),

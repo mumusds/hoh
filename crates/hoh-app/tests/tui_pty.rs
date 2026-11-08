@@ -646,7 +646,7 @@ fn test_043_03_the_tui_leaves_on_sighup_sigterm_and_detach_with_the_host_and_age
             ..hoh_core::decision::Context::default()
         },
     });
-    let host = runtime.block_on(hoh_app::host::Host::start(with_runner))?;
+    let host = runtime.block_on(start_when_free(with_runner))?;
     let end = std::time::Instant::now() + WAIT;
     while query("SELECT state FROM attempts WHERE task_id = 'T1'")? != "RUNNING" {
         if std::time::Instant::now() > end {
@@ -811,6 +811,23 @@ fn post_command(project: &Path, body: &str) -> R<String> {
     Ok(reply.lines().next().unwrap_or_default().to_owned())
 }
 
+/// Start a host in a project another host of this process just let go. A process that spawns children (a parallel
+/// test's agents, or the WAL self-test's probe) shares every open file with each child until it execs, so a lock just
+/// released can still be held for that instant: a refusal (69) is tried again for a moment (as tests/host.rs does).
+async fn start_when_free(
+    config: hoh_app::host::HostConfig,
+) -> Result<hoh_app::host::Host, hoh_app::host::StartError> {
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match hoh_app::host::Host::start(config.clone()).await {
+            Err(e) if e.exit_code == 69 && std::time::Instant::now() < end => {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            other => return other,
+        }
+    }
+}
+
 /// An in-process host's configuration for `project`: an OS-chosen port, the product binary as the WAL probe.
 fn in_process(project: &Path) -> hoh_app::host::HostConfig {
     let mut config = hoh_app::host::HostConfig::new(project);
@@ -937,7 +954,7 @@ fn an_attached_tui_goes_on_with_its_run_through_a_host_started_again() -> R {
     let before = token(&project)?;
     let mut s = open_attach(&project, &home)?;
     runtime.block_on(first.shutdown());
-    let second = runtime.block_on(hoh_app::host::Host::start(config()))?;
+    let second = runtime.block_on(start_when_free(config()))?;
     assert_ne!(
         token(&project)?,
         before,
