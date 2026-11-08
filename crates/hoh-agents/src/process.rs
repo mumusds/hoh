@@ -334,11 +334,14 @@ pub fn group_members(pgid: u32) -> Vec<u32> {
         .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u32>().ok())
         .filter(|pid| {
             // Fields after the parenthesised command name: state, ppid, pgrp.
-            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            std::fs::read(format!("/proc/{pid}/stat"))
                 .ok()
                 .and_then(|stat| {
-                    let rest = &stat[stat.rfind(')')? + 1..];
-                    rest.split_whitespace().nth(2)?.parse::<u32>().ok()
+                    crate::identity::after_command_name(&stat)?
+                        .split_whitespace()
+                        .nth(2)?
+                        .parse::<u32>()
+                        .ok()
                 })
                 == Some(pgid)
         })

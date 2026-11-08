@@ -2033,3 +2033,216 @@ async fn cgroup_leaderless_outside_inside() -> R {
     host.shutdown().await;
     Ok(())
 }
+
+#[test]
+fn in_a_delegated_cgroup_a_cancel_ends_a_leader_whose_command_name_is_not_utf8() -> R {
+    in_delegated_scope("cgroup_non_utf8_leader_inside")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs inside a delegated scope, started by in_a_delegated_cgroup_a_cancel_ends_a_leader_whose_command_name_is_not_utf8"]
+async fn cgroup_non_utf8_leader_inside() -> R {
+    // M2T06R-500 (decision 8d v7): T1's leader moves itself out of the attempt's cgroup, empties its environment and
+    // runs under a command name that is not UTF-8, staying in its own group. Its identity is read all the same, so the
+    // cancel stops its group: the run is CANCELLED only once the leader is gone (it was CANCELLED, and the writer lease
+    // released, with the leader alive).
+    use std::os::unix::ffi::OsStrExt as _;
+    if std::env::var_os(IN_SCOPE).is_none() {
+        return Ok(());
+    }
+    let base = own_cgroup()?;
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let link = dir.path().join(std::ffi::OsStr::from_bytes(b"w\xffr"));
+    // dash, not sleep: this platform's sleep is a multi-call program that picks its tool by its name.
+    std::os::unix::fs::symlink("/usr/bin/dash", &link)?;
+    let script = format!(
+        "echo $$ > {}/cgroup.procs && exec env -i \"$(printf '{}/w\\377r')\" -c 'while :; do /bin/sleep 1; done'",
+        base.display(),
+        dir.path().display()
+    );
+    let agents = Arc::new(Agents::new(&[("T1", script.as_str())]));
+    let _leaders = Leaders(agents.leaders.clone());
+    let (project, host) = host(dir.path(), &agents).await?;
+    until(
+        &project,
+        "SELECT state FROM attempts WHERE task_id = 'T1'",
+        "RUNNING",
+        Duration::from_secs(10),
+    )
+    .await?;
+    assert_eq!(tracking(&project)?.0, "cgroup");
+    let leader: u32 = query(&project, "SELECT pid FROM attempts WHERE task_id = 'T1'")?.parse()?;
+    // The precondition: the leader runs under that name, its group alive.
+    let end = Instant::now() + Duration::from_secs(10);
+    while std::fs::read(format!("/proc/{leader}/comm"))? != b"w\xffr\n" {
+        if Instant::now() > end {
+            return Err("the leader did not take its name".into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let group = i32::try_from(leader)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+        .ok_or("no group")?;
+    let (status, _) = command(&host, &control(&project, "CancelRun", "cancel")?).await?;
+    assert_eq!(status, 202);
+    until(
+        &project,
+        "SELECT state FROM runs WHERE run_id = 'R'",
+        "CANCELLED",
+        Duration::from_secs(30),
+    )
+    .await?;
+    assert!(
+        rustix::process::test_kill_process_group(group).is_err(),
+        "CANCELLED while the leader's group lived"
+    );
+    host.shutdown().await;
+    Ok(())
+}
+
+#[test]
+fn in_a_delegated_cgroup_a_leader_whose_record_cannot_confirm_it_keeps_the_run_cancelling_while_its_group_lives()
+-> R {
+    in_delegated_scope("cgroup_unverifiable_leader_inside")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs inside a delegated scope, started by in_a_delegated_cgroup_a_leader_whose_record_cannot_confirm_it_keeps_the_run_cancelling_while_its_group_lives"]
+async fn cgroup_unverifiable_leader_inside() -> R {
+    // M2T06R-500 (decision 8d v7): T1's leader moved itself out of the attempt's cgroup with an emptied environment and
+    // lives on in its own group; its record lacks the start time (an incomplete record: nothing can confirm the process
+    // is the attempt's, so it gets no signal, ADR-019 decision 8). The cgroup is empty and the marker scan finds
+    // nothing, but the group, checked by the recorded pid, still lives: the run stays cancelling (an inspection that
+    // could not confirm the leader counted as an empty group, and the run was CANCELLED).
+    if std::env::var_os(IN_SCOPE).is_none() {
+        return Ok(());
+    }
+    let base = own_cgroup()?;
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let script = format!(
+        "echo $$ > {}/cgroup.procs && exec env -i /bin/sleep 60",
+        base.display()
+    );
+    let agents = Arc::new(Agents::new(&[("T1", script.as_str())]));
+    let _leaders = Leaders(agents.leaders.clone());
+    let (project, first) = host(dir.path(), &agents).await?;
+    until(
+        &project,
+        "SELECT state FROM attempts WHERE task_id = 'T1'",
+        "RUNNING",
+        Duration::from_secs(10),
+    )
+    .await?;
+    assert_eq!(tracking(&project)?.0, "cgroup");
+    let leader: u32 = query(&project, "SELECT pid FROM attempts WHERE task_id = 'T1'")?.parse()?;
+    first.shutdown().await;
+    seed(
+        &project,
+        "UPDATE attempts SET process_start_id = NULL WHERE task_id = 'T1';",
+    )?;
+    let host = start_when_free(config(&project)).await?;
+    let group = i32::try_from(leader)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+        .ok_or("no group")?;
+    assert!(
+        rustix::process::test_kill_process_group(group).is_ok(),
+        "the precondition: the leader's group lives"
+    );
+    let (status, _) = command(&host, &control(&project, "CancelRun", "cancel")?).await?;
+    assert_eq!(status, 202);
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let state = query(&project, "SELECT state FROM runs WHERE run_id = 'R'")?;
+    // Stop the leader by hand (the test's own), then let the cancel finish.
+    let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+    assert_eq!(
+        state, "CANCEL_REQUESTED",
+        "cancelled while the leader's group lived"
+    );
+    until(
+        &project,
+        "SELECT state FROM runs WHERE run_id = 'R'",
+        "CANCELLED",
+        Duration::from_secs(30),
+    )
+    .await?;
+    host.shutdown().await;
+    Ok(())
+}
+
+#[test]
+fn in_a_delegated_cgroup_a_cancels_sigterm_reaches_a_member_of_a_nested_cgroup() -> R {
+    in_delegated_scope("cgroup_nested_member_inside")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs inside a delegated scope, started by in_a_delegated_cgroup_a_cancels_sigterm_reaches_a_member_of_a_nested_cgroup"]
+async fn cgroup_nested_member_inside() -> R {
+    // M2T06R-501 (decision 8d v7): an orphaned member of T1, in a session of its own with an emptied environment, moves
+    // itself into a cgroup nested in the attempt's and ends at SIGTERM, recording it. The cancel's SIGTERM step
+    // reaches it (it went to the attempt cgroup's direct members only, so the member met cgroup.kill), and the nested
+    // cgroup is removed with the attempt's once both are proved empty.
+    if std::env::var_os(IN_SCOPE).is_none() {
+        return Ok(());
+    }
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let (term, pid_file) = (dir.path().join("term.txt"), dir.path().join("m.pid"));
+    let member = dir.path().join("member.sh");
+    // Read by sh, not executed: nothing is written and then executed (M2T06R-354).
+    std::fs::write(
+        &member,
+        format!(
+            "trap 'echo term > {}; exit 0' TERM\n\
+             cg=/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)\n\
+             mkdir \"$cg/nested\" && echo $$ > \"$cg/nested/cgroup.procs\" && echo $$ > {}\n\
+             while :; do sleep 0.1; done\n",
+            term.display(),
+            pid_file.display()
+        ),
+    )?;
+    let script = format!(
+        "(env -i PATH=/usr/bin:/bin /usr/bin/setsid /bin/sh {} &); while :; do sleep 0.1; done",
+        member.display()
+    );
+    let _guard = KillPidFile(pid_file.clone());
+    let agents = Arc::new(Agents::new(&[("T1", script.as_str())]));
+    let _leaders = Leaders(agents.leaders.clone());
+    let (project, host) = host(dir.path(), &agents).await?;
+    until(
+        &project,
+        "SELECT state FROM attempts WHERE task_id = 'T1'",
+        "RUNNING",
+        Duration::from_secs(10),
+    )
+    .await?;
+    let (mode, path) = tracking(&project)?;
+    assert_eq!(mode, "cgroup");
+    let end = Instant::now() + Duration::from_secs(10);
+    while !pid_file.exists() {
+        if Instant::now() > end {
+            return Err("the member did not move into its nested cgroup".into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let (status, _) = command(&host, &control(&project, "CancelRun", "cancel")?).await?;
+    assert_eq!(status, 202);
+    until(
+        &project,
+        "SELECT state FROM runs WHERE run_id = 'R'",
+        "CANCELLED",
+        Duration::from_secs(30),
+    )
+    .await?;
+    assert_eq!(
+        std::fs::read_to_string(&term).unwrap_or_default().trim(),
+        "term",
+        "the nested member got no SIGTERM"
+    );
+    assert!(
+        !Path::new(&path).exists(),
+        "the attempt's cgroup was left with its nested one"
+    );
+    host.shutdown().await;
+    Ok(())
+}
