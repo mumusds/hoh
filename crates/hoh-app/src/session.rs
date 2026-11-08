@@ -20,6 +20,20 @@ fn ended(state: &str) -> Option<u8> {
     }
 }
 
+/// The state a run's event of `kind` ends it in: the last of its events (`run.<state>`, ADR-021 decision 8f).
+fn ending(kind: &str) -> Option<&'static str> {
+    match kind {
+        "run.completed" => Some("COMPLETED"),
+        "run.failed" => Some("FAILED"),
+        "run.cancelled" => Some("CANCELLED"),
+        _ => None,
+    }
+}
+
+/// How long a follow of a run that ended waits with nothing new before it ends without the run's ending event (a run
+/// ended by a path that records none): long after any replay of its events.
+const QUIET: std::time::Duration = std::time::Duration::from_secs(5);
+
 fn fail(failure: &Failure) -> u8 {
     say!("hoh: {}: {}", failure.code, failure.message);
     failure.exit
@@ -120,29 +134,41 @@ pub fn attach(project: &Path, run_id: Option<&str>, output: Output) -> u8 {
             Err(code) => return code,
         },
         None => {
-            let page = match client::call(&host, "GET", "/v1/runs?limit=500", None) {
-                Ok(reply) if reply.status == 200 => reply.json(),
-                Ok(reply) => {
-                    return fail(&Failure::unreachable(format!(
-                        "the host answered {}",
-                        reply.status
-                    )));
-                }
-                Err(e) => {
-                    return fail(&Failure::unreachable(format!(
-                        "the host did not answer: {e}"
-                    )));
-                }
-            };
-            let open: Vec<&Value> = page["items"]
-                .as_array()
-                .map(|items| {
-                    items
-                        .iter()
+            // Every page: one run not ended on a later page makes two (M2T06R-05).
+            let mut open: Vec<Value> = Vec::new();
+            let mut cursor: Option<String> = None;
+            loop {
+                let path = match &cursor {
+                    Some(cursor) => format!("/v1/runs?limit=500&cursor={cursor}"),
+                    None => "/v1/runs?limit=500".to_owned(),
+                };
+                let page = match client::call(&host, "GET", &path, None) {
+                    Ok(reply) if reply.status == 200 => reply.json(),
+                    Ok(reply) => {
+                        return fail(&Failure::unreachable(format!(
+                            "the host answered {}",
+                            reply.status
+                        )));
+                    }
+                    Err(e) => {
+                        return fail(&Failure::unreachable(format!(
+                            "the host did not answer: {e}"
+                        )));
+                    }
+                };
+                open.extend(
+                    page["items"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
                         .filter(|r| ended(r["state"].as_str().unwrap_or_default()).is_none())
-                        .collect()
-                })
-                .unwrap_or_default();
+                        .cloned(),
+                );
+                match page["next_cursor"].as_str() {
+                    Some(next) if Some(next) != cursor.as_deref() => cursor = Some(next.to_owned()),
+                    _ => break,
+                }
+            }
             match open.as_slice() {
                 [one] => match run_of(&host, one["run_id"].as_str().unwrap_or_default()) {
                     Ok(run) => run,
@@ -197,7 +223,8 @@ pub fn attach(project: &Path, run_id: Option<&str>, output: Output) -> u8 {
 
 /// Follow `run_id`'s events from the first, then live, until the run ends or a signal comes (which only unsubscribes:
 /// no command, no signal to any agent). stream-json: one event per line on stdout; text: one line per event on
-/// stderr, the run's end on stdout.
+/// stderr, the run's end on stdout. The follow ends with the run's ending event, so every event before it is shown
+/// first, also for a run that had ended before the attach (M2T06R-03).
 fn follow(
     project: &Path,
     mut host: HostInfo,
@@ -208,6 +235,7 @@ fn follow(
     let mut last = 0i64;
     let mut stream: Option<client::Events> = None;
     let mut checked = std::time::Instant::now();
+    let mut quiet_since = std::time::Instant::now();
     loop {
         let signal = got.load(Ordering::SeqCst);
         if signal != 0 {
@@ -230,6 +258,7 @@ fn follow(
         };
         match events.next() {
             Ok(Some(event)) => {
+                quiet_since = std::time::Instant::now();
                 last = event["seq"].as_i64().unwrap_or(last).max(last);
                 let kind = event["kind"].as_str().unwrap_or_default().to_owned();
                 if output == Output::StreamJson {
@@ -237,23 +266,20 @@ fn follow(
                 } else {
                     say!("#{last} {kind}");
                 }
-                if kind.starts_with("run.") {
-                    let state = run_of(&host, run_id)
-                        .ok()
-                        .and_then(|r| r["state"].as_str().map(str::to_owned))
-                        .unwrap_or_default();
-                    if let Some(code) = ended(&state) {
-                        if output == Output::Text {
-                            print(&format!("{run_id} {state}\n"));
-                        }
-                        return code;
+                if let Some(state) = ending(&kind)
+                    && let Some(code) = ended(state)
+                {
+                    if output == Output::Text {
+                        print(&format!("{run_id} {state}\n"));
                     }
+                    return code;
                 }
             }
             Ok(None) => {
-                // Nothing new for a while: a run that had already ended when attached (or ended with no run event)
-                // ends the attach once its events are shown.
-                if checked.elapsed() >= std::time::Duration::from_secs(1) {
+                // Nothing new for long: a run that ended without its ending event ends the attach too.
+                if quiet_since.elapsed() >= QUIET
+                    && checked.elapsed() >= std::time::Duration::from_secs(1)
+                {
                     checked = std::time::Instant::now();
                     let state = run_of(&host, run_id)
                         .ok()
