@@ -513,6 +513,16 @@ pub async fn run(
     })
 }
 
+/// The capabilities a session of this launch has (docs/adr/ADR-022.md decision 9), as [`run`] records them: events and
+/// resume (no steer, no dialog, no token usage); or why no turn can start.
+pub fn session_capabilities(launch: &Launch) -> Result<Value, Blocked> {
+    args(launch)?;
+    Ok(crate::capabilities::of_session(
+        &launch.capabilities,
+        &[("structured_events", true), ("resume", true)],
+    ))
+}
+
 /// Start one turn in the runner's mode (docs/adr/ADR-022.md decisions 12 to 14): checked as [`run`] checks it, then
 /// through `gate`, held until [`Held::open`] is sent; no attempt state moves, nothing written to the store, the
 /// facts come back. A cancel is Pi's `abort` only (stdin closed before the prompt is sent); the host's ladder does
