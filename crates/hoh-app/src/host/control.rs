@@ -397,7 +397,7 @@ impl ProcessControl for AttemptControl {
         let in_cgroup = match &self.cgroup {
             // SIGTERM to each member; SIGKILL to all of them at once, by the kernel.
             Some(cgroup) if sig == rustix::process::Signal::KILL => cgroup.kill(),
-            Some(cgroup) => cgroup.terminate(),
+            Some(cgroup) => cgroup.terminate().sent,
             None => false,
         };
         // And what the marker scan pinned (outside the cgroup, if it has one).
