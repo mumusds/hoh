@@ -97,8 +97,8 @@ impl ProbeStop {
 
     /// `spawn` run unless stopped, in a slot registered for the stop before it: `None` when stopped. The spawn runs
     /// outside the stop's lock, so a stop never waits for an exec (M2T07R-450); a caller that finds the stop once this
-    /// returns ends what it started. `at` is where a test holds the starter once the child is in its slot (see
-    /// [`between`]).
+    /// returns ends what it started. `at` is where a test holds the starter once its spawn returned and once the child
+    /// is in its slot (see [`between`]).
     fn start(
         &self,
         at: &Path,
@@ -114,6 +114,7 @@ impl ProbeStop {
             commands.push(std::sync::Arc::downgrade(&slot));
         }
         Some(spawn().map(|child| {
+            between("spawned", at);
             let started = Started::new(slot, child, Some(self));
             between("placed", at);
             started
@@ -3066,7 +3067,7 @@ mod tests {
         // M2T07R-450, -500, -554 (docs/adr/ADR-022.md decision 10 v5): a start held inside its spawn (as an exec that
         // hangs holds it) does not hold up the stop; when its spawn returns after the stop, its starter, putting the
         // child in its slot, finds the stop and kills it there, before it goes on (here held once it started).
-        stop_during_a_spawn_then_hold_the_starter_at("started")
+        stop_while_the_starter_is_held_at("spawning", "started")
     }
 
     #[test]
@@ -3075,28 +3076,38 @@ mod tests {
         // M2T07R-600 (docs/adr/ADR-022.md decision 10 v5): the starter puts the child in its slot and looks at the stop
         // in one hold of the slot's lock, so once the child is in its slot it is dead though its starter is held right
         // there and never runs again (a starter that looked after letting the slot go left it alive while held).
-        stop_during_a_spawn_then_hold_the_starter_at("placed")
+        stop_while_the_starter_is_held_at("spawning", "placed")
     }
 
-    /// A stop while a start is held inside its spawn; the spawn then goes on and its starter is held at `moment`, where
+    #[test]
+    fn a_command_whose_spawn_returned_before_a_stop_is_dead_once_put_in_its_slot()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // M2T07R-651 (docs/adr/ADR-022.md decision 10 v5): the stop comes after the spawn returned and before the child
+        // is in its slot, so it finds the slot empty; the starter looks at the stop only once the child is in its slot,
+        // so it finds it and kills it there (a starter that looked before the put found no stop and left it alive).
+        stop_while_the_starter_is_held_at("spawned", "placed")
+    }
+
+    /// A stop while a start is held at `stopped_at`; the start then goes on and its starter is held at `moment`, where
     /// its command must already be dead.
-    fn stop_during_a_spawn_then_hold_the_starter_at(
+    fn stop_while_the_starter_is_held_at(
+        stopped_at: &str,
         moment: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let tmp = tempfile::tempdir()?;
         let bin = tmp.path().join("bin");
         std::fs::create_dir(&bin)?;
-        // Named for its moment (at most 15 bytes, the kernel's command name), so the tests do not see each other's.
-        let name = format!("hohstop{moment}");
+        // Named for its moments (at most 15 bytes, the kernel's command name), so the tests do not see each other's.
+        let name = format!("hs{stopped_at}{}", moment.get(..3).unwrap_or(moment));
         let launcher = bin.join(&name);
         std::fs::write(&launcher, "#!/bin/sh\nwhile :; do sleep 0.1; done\n")?;
         std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))?;
-        let (spawning, started) = (
-            bin.join("hoh-test-stall-spawning"),
+        let (stop_stall, hold_stall) = (
+            bin.join(format!("hoh-test-stall-{stopped_at}")),
             bin.join(format!("hoh-test-stall-{moment}")),
         );
-        std::fs::write(&spawning, "")?;
-        std::fs::write(&started, "")?;
+        std::fs::write(&stop_stall, "")?;
+        std::fs::write(&hold_stall, "")?;
         let stop = ProbeStop::default();
         let env = ProbeEnv {
             path: "/usr/bin:/bin".into(),
@@ -3107,15 +3118,15 @@ mod tests {
             cancel: Some(stop.clone()),
         };
         let probing = std::thread::spawn(move || run(&launcher, &["--version"], &env).map(|_| ()));
-        let inside = wait_until(Duration::from_secs(10), || held_open(&spawning));
+        let inside = wait_until(Duration::from_secs(10), || held_open(&stop_stall));
         let stopper = {
             let stop = stop.clone();
             std::thread::spawn(move || stop.stop())
         };
         let stopped_at_once = wait_until(Duration::from_secs(2), || stopper.is_finished());
-        // The spawn goes on; its starter is then held at `moment`.
-        std::fs::remove_file(&spawning)?;
-        let past_its_slot = wait_until(Duration::from_secs(10), || held_open(&started));
+        // The start goes on; its starter is then held at `moment`.
+        std::fs::remove_file(&stop_stall)?;
+        let past_its_slot = wait_until(Duration::from_secs(10), || held_open(&hold_stall));
         let found = children_named(&name);
         let killed = wait_until(Duration::from_secs(2), || {
             children_named(&name).iter().all(|(_, state)| *state == 'Z')
@@ -3125,11 +3136,14 @@ mod tests {
                 .args(["-KILL", &pid.to_string()])
                 .status();
         }
-        std::fs::remove_file(&started)?;
+        std::fs::remove_file(&hold_stall)?;
         let _ = stopper.join();
         let result = probing.join().map_err(|_| "the probe panicked")?;
-        assert!(inside, "the probe never got inside its spawn");
-        assert!(stopped_at_once, "the stop waited for the spawn");
+        assert!(inside, "the probe never got to {stopped_at}");
+        assert!(
+            stopped_at_once,
+            "the stop waited for the start held at {stopped_at}"
+        );
         assert!(past_its_slot, "the starter never got to {moment}");
         assert_eq!(found.len(), 1, "the command started: {found:?}");
         assert!(
@@ -3145,9 +3159,9 @@ mod tests {
 
     #[test]
     fn a_stopped_probe_does_not_even_try_to_start_a_command() {
-        // M2T07R-400 (docs/adr/ADR-022.md decision 10 v4): once stopped, the start does not run the spawn at all (the
-        // check and the start are one step under the stop's lock), whatever a command started and killed at once
-        // would have left behind.
+        // M2T07R-400, -652 (docs/adr/ADR-022.md decision 10 v5): once stopped, the start does not run the spawn at all
+        // (the check and the slot's registration are one step under the stop's lock; the spawn comes after, outside
+        // it), whatever a command started and killed at once would have left behind.
         let stop = ProbeStop::default();
         let mut tried = false;
         let before = stop.start(Path::new("/"), || Err(io::Error::other("not started")));
