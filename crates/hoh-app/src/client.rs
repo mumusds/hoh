@@ -592,11 +592,39 @@ fn supervised(
         Ok(out) => Some(String::from_utf8_lossy(&out.stderr).trim().to_owned()),
         // Not refused: the start job runs on in the manager, which may first be stopping what the previous host left
         // (up to TimeoutStopSec, 15 s) after a crash; the host comes up when it is done (M2T14R-52).
+        // Not finished is not a refusal; whether the manager has the start is asked of it, not assumed (M2T14R-102).
         Err(hoh_agents::probe::ProbeError::TimedOut { .. }) => {
+            let asked = hoh_agents::probe::ProbeEnv {
+                timeout: Duration::from_secs(1),
+                deadline: None,
+                ..env.clone()
+            };
+            let state = hoh_agents::probe::run_status(
+                &unit.systemctl,
+                &["--user", "show", "-p", "Job,ActiveState", &unit.name],
+                &asked,
+            )
+            .map(|out| hoh_app::unit::show(&String::from_utf8_lossy(&out.stdout)))
+            .unwrap_or_default();
+            let job = state.get("Job").map(String::as_str).unwrap_or_default();
+            let active = state
+                .get("ActiveState")
+                .map(String::as_str)
+                .unwrap_or_default();
+            let found = if !job.is_empty()
+                || matches!(active, "activating" | "deactivating" | "reloading")
+            {
+                format!(
+                    "the start goes on in the user's systemd manager (Job={job}, ActiveState={active}; after a crash \
+                     systemd first stops what the previous host left, up to 15 s): run hoh again shortly"
+                )
+            } else {
+                format!(
+                    "the user's systemd manager shows no start of it (Job={job}, ActiveState={active}): run hoh again"
+                )
+            };
             return Err(Failure::unreachable(format!(
-                "{} did not finish starting within {} s (after a crash systemd first stops what the previous host \
-                 left, up to 15 s); the start goes on in the user's systemd manager: run hoh again shortly, or see \
-                 systemctl --user status {}",
+                "{} did not finish starting within {} s; {found}, or see systemctl --user status {}",
                 unit.name,
                 WAIT.as_secs(),
                 unit.name

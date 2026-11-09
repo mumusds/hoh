@@ -78,6 +78,15 @@ lingers() { [[ -f "/var/lib/systemd/linger/$user" ]]; }
 # Whether ~/.local/bin/hoh is this installation's link.
 ours() { [[ -L "$bin_link" && "$(readlink -- "$bin_link")" == "$current/bin/hoh" ]]; }
 
+# Fail with 78 when `$2` (named `$1`) holds one of the characters that follow: the unit cannot name it as written.
+refuse_chars() {
+  local what=$1 path=$2 c
+  shift 2
+  for c in "$@"; do
+    [[ "$path" != *"$c"* ]] || fail 78 "$what has $c, which the systemd unit cannot take as written: $path"
+  done
+}
+
 # Point the symbolic link `$2` at `$1`, replacing it at once (a new link renamed over it) unless it already does.
 link() {
   local target=$1 at=$2
@@ -93,6 +102,13 @@ install() {
   if [[ -e "$bin_link" || -L "$bin_link" ]] && ! ours; then
     fail 1 "$bin_link exists and is not this installation's link to $current/bin/hoh: nothing changed"
   fi
+  # Before anything is written: EnvironmentFile= takes a glob, ExecStart= no program path with quotes or a backslash
+  # (docs/adr/ADR-023.md design corrections 1 and 2, M2T14R-101).
+  local real_root
+  real_root="$(readlink -m -- "$root")"
+  refuse_chars "the installation's root" "$root" '*' '?' '[' '"' '\' "'"
+  refuse_chars "the installation's root" "$real_root" '*' '?' '[' '"' '\' "'"
+  refuse_chars "HOME" "$HOME" '"' '\' "'"
   if (($#)) && ! manager; then
     fail 69 "no user systemd manager answers (\$XDG_RUNTIME_DIR/systemd/private): cannot enable a project's host unit"
   fi
@@ -185,9 +201,24 @@ remove() {
       fi
     done
     systemctl --user reset-failed 'hoh-host@*.service' 2>/dev/null || true
+  else
+    # No manager to disable an enabled instance with: it would be left naming a removed template (M2T14R-151).
+    for file in "$config/systemd/user/"*.wants/hoh-host@*.service; do
+      [[ -e "$file" || -L "$file" ]] || continue
+      say "$(basename -- "$file") is enabled, and no user systemd manager answers to disable it"
+      failed=1
+    done
+  fi
+  # The installation's own lock, exclusive (design correction 2, M2T14R-100): every run of an installed hoh holds it
+  # shared for its life, so it is had only once none runs, and while it is held none can start; what follows is
+  # removed under it.
+  local held=1
+  if [[ -d "$root" ]]; then
+    exec 9>>"$root/.lock"
+    flock -n -x 9 || held=0
   fi
   # Nothing is removed while a process still runs this installation's binaries: a host its unit did not run, an
-  # agent's start gate, an instance that did not stop (M2T14R-03).
+  # agent's start gate, an instance that did not stop (M2T14R-03); the scan names them.
   local real proc exe running=0
   real="$(readlink -f -- "$root" 2>/dev/null || printf '%s' "$root")"
   for proc in /proc/[0-9]*; do
@@ -197,19 +228,34 @@ remove() {
       running=1
     fi
   done
-  if ((failed || running)); then
+  if ((!held)); then
+    say "this installation's lock is held: one of its programs still runs"
+  fi
+  if ((failed || running || !held)); then
     fail 69 "nothing was removed: stop what is named above, then run install.sh --uninstall again"
   fi
-  rm -f -- "$template"
+  # Each removal is said as it happened (M2T14R-150).
+  if [[ -e "$template" ]]; then
+    rm -f -- "$template"
+    printf 'removed %s\n' "$template"
+  fi
   if manager; then systemctl --user daemon-reload || say "systemctl --user daemon-reload failed"; fi
   [[ -z "$runtime" ]] || rm -f -- "$runtime"/hoh-host@*.stderr
-  if ours; then rm -f -- "$bin_link"; fi
-  rm -rf -- "$hosts" "$root/versions"
-  rm -f -- "$root/current" "$root"/current.tmp.*
-  if [[ -e "$root" ]] && ! rmdir -- "$root" 2>/dev/null; then
-    say "kept $root: it holds files this installer did not write"
+  if ours; then
+    rm -f -- "$bin_link"
+    printf 'removed %s\n' "$bin_link"
+  elif [[ -e "$bin_link" || -L "$bin_link" ]]; then
+    say "kept $bin_link: it is not this installation's link"
   fi
-  printf 'removed %s, %s and %s\n' "$root" "$template" "$bin_link"
+  if [[ -e "$root" ]]; then
+    rm -rf -- "$hosts" "$root/versions"
+    rm -f -- "$root/current" "$root"/current.tmp.* "$root/.lock"
+    if rmdir -- "$root" 2>/dev/null; then
+      printf 'removed %s\n' "$root"
+    else
+      say "kept $root: it holds files this installer did not write (its versions, instance files and links removed)"
+    fi
+  fi
 }
 
 main "$@"

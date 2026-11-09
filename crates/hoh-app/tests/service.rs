@@ -937,6 +937,7 @@ fn a_start_still_running_at_the_clients_deadline_is_reported_as_such_and_goes_on
     let stderr = String::from_utf8(out.stderr)?;
     assert!(stderr.contains("did not finish starting"), "{stderr}");
     assert!(!stderr.contains(" failed (Result="), "{stderr}");
+    assert!(stderr.contains("the start goes on"), "{stderr}");
     // The start went on in the manager: the host is up once it is done.
     ready_under_the_unit(&mut manager, &unit, &project)?;
     Ok(())
@@ -1014,5 +1015,119 @@ fn the_uninstall_removes_nothing_while_an_instance_stopped_but_is_still_enabled(
     let out = manager.install(&bundle, &["--uninstall"])?;
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     assert!(!wants.exists() && !wants.is_symlink());
+    Ok(())
+}
+
+#[test]
+fn a_start_that_never_reached_the_manager_is_not_said_to_go_on() -> R {
+    // M2T14R-102: systemctl still waiting at the deadline proves nothing; a stand-in that holds `start` 12 s before
+    // the real one: the client asks the manager, which has no job, and says so.
+    let (manager, project) = installed(true)?;
+    let unit = unit_of(&project);
+    installed::script(
+        &manager.bin().join("systemctl"),
+        "#!/bin/sh\ncase \" $* \" in *\" start \"*) sleep 12;; esac\nexec /usr/bin/systemctl \"$@\"\n",
+    )?;
+    let started = std::time::Instant::now();
+    let out = hoh_in(
+        &manager,
+        &project,
+        None,
+        &["-p", "x", "--detach", "--output", "json"],
+    )?;
+    assert!(
+        started.elapsed() < Duration::from_secs(12),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(out.status.code(), Some(69), "{}", text(&out));
+    let stderr = String::from_utf8(out.stderr)?;
+    assert!(stderr.contains("shows no start"), "{stderr}");
+    assert!(!stderr.contains("goes on"), "{stderr}");
+    std::fs::remove_file(manager.bin().join("systemctl"))?;
+    assert_eq!(manager.property(&unit, "ActiveState")?, "inactive");
+    Ok(())
+}
+
+/// The processes of this user whose binary is under `root`, with what they run.
+fn running_under(root: &Path) -> R<Vec<String>> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().parse::<u32>().is_err() {
+            continue;
+        }
+        if let Ok(exe) = std::fs::read_link(entry.path().join("exe"))
+            && exe.starts_with(root)
+        {
+            out.push(format!(
+                "{} {}",
+                entry.file_name().to_string_lossy(),
+                exe.display()
+            ));
+        }
+    }
+    Ok(out)
+}
+
+#[test]
+fn nothing_of_the_installation_starts_while_the_uninstall_removes_it() -> R {
+    // M2T14R-100 (ADR-023 design correction 2): the uninstall paused before its first removal (a stand-in rm waits);
+    // a client's start through the unit and a host started directly both end at once (69, being uninstalled), and once
+    // the uninstall is done nothing runs a removed binary.
+    let (mut manager, project) = installed(true)?;
+    let paused = manager.root().join("rm-paused");
+    let go = manager.root().join("rm-go");
+    installed::script(
+        &manager.bin().join("rm"),
+        &format!(
+            "#!/bin/sh\nif [ ! -e {p} ]; then : > {p}; i=0; while [ ! -e {g} ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done; fi\nexec /usr/bin/rm \"$@\"\n",
+            p = paused.display(),
+            g = go.display()
+        ),
+    )?;
+    let bundle = manager.root().join("bundle/hoh");
+    let uninstall = manager
+        .command("bash")
+        .arg(bundle.join("install.sh"))
+        .arg("--uninstall")
+        .current_dir(manager.root())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    manager.wait_until("the uninstall to pause", Duration::from_secs(30), |_| {
+        Ok(paused.exists())
+    })?;
+    let out = hoh_in(
+        &manager,
+        &project,
+        None,
+        &["-p", "x", "--detach", "--output", "json"],
+    )?;
+    let client = text(&out);
+    let installed_hoh = manager.data().join("hoh/current/bin/hoh");
+    let direct = manager
+        .command(&installed_hoh)
+        .arg("__host")
+        .arg(&project)
+        .current_dir(&project)
+        .stdin(std::process::Stdio::null())
+        .output()?;
+    std::fs::write(&go, "")?;
+    let done = uninstall.wait_with_output()?;
+    assert_eq!(done.status.code(), Some(0), "{}", text(&done));
+    assert_ne!(out.status.code(), Some(0), "{client}");
+    assert!(client.contains("being uninstalled"), "{client}");
+    assert_eq!(direct.status.code(), Some(69), "{}", text(&direct));
+    assert!(
+        text(&direct).contains("being uninstalled"),
+        "{}",
+        text(&direct)
+    );
+    assert_eq!(
+        running_under(&manager.data().join("hoh"))?,
+        Vec::<String>::new()
+    );
+    assert!(!manager.data().join("hoh").exists());
     Ok(())
 }

@@ -347,7 +347,8 @@ fn an_install_lays_out_a_version_a_current_link_the_command_and_the_template() -
         std::fs::read_to_string(&template)?,
         hoh_app::unit::template(&install.home(), &install.data().join("hoh"))?
     );
-    // Nothing else in the home: the command, the installation and the template (with their directories).
+    // Nothing else in the home: the command, the installation (with its lock, which every run of it holds, ADR-023
+    // design correction 2) and the template (with their directories).
     let paths: Vec<PathBuf> = tree(&install.home())?
         .into_iter()
         .filter(|(_, e)| e.kind != 'd')
@@ -358,6 +359,7 @@ fn an_install_lays_out_a_version_a_current_link_the_command_and_the_template() -
         paths,
         [
             PathBuf::from(".local/bin/hoh"),
+            PathBuf::from(".local/share/hoh/.lock"),
             PathBuf::from(".local/share/hoh/current"),
             PathBuf::from(".local/share/systemd/user/hoh-host@.service"),
         ]
@@ -558,5 +560,101 @@ fn lingering_is_asked_for_only_with_linger() -> R {
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     assert_eq!(std::fs::read_to_string(&calls)?, "enable-linger tester\n");
     assert!(!install.sudo_called());
+    Ok(())
+}
+
+#[test]
+fn a_root_the_unit_cannot_name_is_refused_before_anything_is_written() -> R {
+    // M2T14R-101: EnvironmentFile= takes a glob, so a data directory with `[` (or `*`, `?`) cannot hold the instance
+    // files the unit names; the install says so (78) and writes nothing.
+    let install = Install::new()?;
+    let data = install.home().join("data[1]");
+    let script = install.root.path().join("bundle/hoh/install.sh");
+    let out = Command::new("bash")
+        .arg(script)
+        .current_dir(install.root.path())
+        .env_clear()
+        .env("HOME", install.home())
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_RUNTIME_DIR", install.root.path().join("r"))
+        .env("USER", "tester")
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", install.stubs().display()),
+        )
+        .output()?;
+    assert_eq!(out.status.code(), Some(78), "{}", text(&out));
+    assert!(String::from_utf8(out.stderr)?.contains("["));
+    assert_eq!(std::fs::read_dir(install.home())?.count(), 0);
+    Ok(())
+}
+
+#[test]
+fn the_uninstall_says_what_it_removed_and_keeps_a_root_holding_other_files() -> R {
+    // M2T14R-150: each removal is said as it happened; a file the installer did not write keeps the root, said so.
+    let install = Install::new()?;
+    let out = install.run("bundle", &[])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let root = install.data().join("hoh");
+    std::fs::write(root.join("notes.txt"), "mine")?;
+    let out = install.run("bundle", &["--uninstall"])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(std::fs::read_to_string(root.join("notes.txt"))?, "mine");
+    for gone in ["versions", "current", "hosts", ".lock"] {
+        assert!(
+            !root.join(gone).exists() && !root.join(gone).is_symlink(),
+            "{gone} left"
+        );
+    }
+    let stdout = String::from_utf8(out.stdout.clone())?;
+    let stderr = String::from_utf8(out.stderr.clone())?;
+    let template = install.data().join("systemd/user/hoh-host@.service");
+    let link = install.home().join(".local/bin/hoh");
+    assert!(
+        stdout.contains(&format!("removed {}\n", template.display())),
+        "{}",
+        text(&out)
+    );
+    assert!(
+        stdout.contains(&format!("removed {}\n", link.display())),
+        "{}",
+        text(&out)
+    );
+    assert!(
+        !stdout.contains(&format!("removed {}\n", root.display())),
+        "{}",
+        text(&out)
+    );
+    assert!(
+        stderr.contains(&format!("kept {}", root.display())),
+        "{}",
+        text(&out)
+    );
+    Ok(())
+}
+
+#[test]
+fn an_enabled_instance_with_no_user_manager_to_disable_it_keeps_the_uninstall_from_removing_anything()
+-> R {
+    // M2T14R-151: with no manager answering, an enabled instance cannot be disabled; removing the template would leave
+    // it naming nothing, so the uninstall removes nothing (69).
+    let install = Install::new()?;
+    let out = install.run("bundle", &[])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let wants = install
+        .home()
+        .join(".config/systemd/user/default.target.wants");
+    std::fs::create_dir_all(&wants)?;
+    let template = install.data().join("systemd/user/hoh-host@.service");
+    std::os::unix::fs::symlink(&template, wants.join("hoh-host@0123456789abcdef.service"))?;
+    let before = tree(&install.home())?;
+    let out = install.run("bundle", &["--uninstall"])?;
+    assert_eq!(out.status.code(), Some(69), "{}", text(&out));
+    assert!(
+        String::from_utf8(out.stderr.clone())?.contains("is enabled"),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(tree(&install.home())?, before);
     Ok(())
 }
