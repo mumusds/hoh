@@ -33,7 +33,7 @@ pub use reconcile::{EffectRow, UnfinishedRow};
 pub use results::{TaskResultOutcome, VERIFIERS};
 pub use retry::{Failure, Paced, Repair, RepairRequest, RepairVerdict};
 pub use rounds::{Dispatched, RoundOutcome};
-pub use runner::{DispatchNotice, Ending, RUNNER, Waiting};
+pub use runner::{DispatchNotice, Ending, Observed, RUNNER, Waiting};
 pub use team::{TeamChange, TeamConfig, TeamMember, TeamView};
 pub mod location;
 pub mod selftest;

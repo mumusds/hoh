@@ -107,6 +107,21 @@ pub struct Ending {
     pub at: std::time::SystemTime,
     /// A uniform 32-bit draw for the retry's jitter.
     pub draw: u32,
+    /// What the agent's turn showed beyond its verdict, recorded with its end.
+    pub observed: Observed,
+}
+
+/// What an agent's turn showed beyond its verdict (docs/adr/ADR-022.md decision 12): written in the commit of its end,
+/// so a full writer queue cannot lose it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Observed {
+    /// The model the agent ran (REQ-018: recorded after the attempt).
+    pub resolved_model: Option<String>,
+    pub usage: Option<serde_json::Value>,
+    /// The agent's own session id, for the session row (resumed by later turns).
+    pub native_session: Option<String>,
+    /// The attempt's events, in order: (key, kind, payload); each event's id is the attempt's id and its key.
+    pub events: Vec<(String, String, serde_json::Value)>,
 }
 
 pub(super) fn run(
@@ -524,13 +539,32 @@ fn finished(
             facts: AttemptFacts {
                 ended_at: Some(crate::time::rfc3339_utc(ending.at)),
                 failure_reason: (!success).then(|| ending.detail.clone()),
+                resolved_model: ending.observed.resolved_model.clone(),
+                usage: ending.observed.usage.clone(),
                 ..AttemptFacts::default()
             },
         },
         ctx,
     )?;
     super::retry::accrue_wall(&tx, &run_id, attempt_id, ending.at, None)?;
+    // The agent's own session id on the attempt's session row (its later turns resume it).
+    if let Some(native) = &ending.observed.native_session {
+        tx.execute(
+            "UPDATE sessions SET native_id = ?2 WHERE session_id = (SELECT session_id FROM attempts WHERE attempt_id = ?1)",
+            params![attempt_id, native],
+        )
+        .map_err(sqlite_error)?;
+    }
     let mut commit = Commit::default();
+    for (key, kind, payload) in &ending.observed.events {
+        commit.events.push(NewEvent {
+            project_id: project_id.clone(),
+            event_id: crate::ids::child_id(attempt_id, key),
+            run_id: Some(run_id.clone()),
+            kind: kind.clone(),
+            payload: payload.clone(),
+        });
+    }
     if success {
         if task_state == TaskState::Running {
             commit.cas.push(StateCas {

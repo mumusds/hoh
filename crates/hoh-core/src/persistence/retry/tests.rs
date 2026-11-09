@@ -140,6 +140,7 @@ async fn test_042_01_failures_wait_for_their_retry_after_or_jitter_and_only_then
                         class: *class,
                         at: failed_at,
                         draw,
+                        observed: Default::default(),
                     },
                 )
                 .await?
@@ -427,6 +428,88 @@ async fn a_failure_recorded_before_a_crash_is_retried_by_its_recorded_class() ->
 }
 
 #[tokio::test]
+async fn an_ending_records_what_the_agents_turn_showed() -> R {
+    // docs/adr/ADR-022.md decision 12: the resolved model, the usage, the agent's own session id and the turn's events
+    // are written in the commit of the attempt's end.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(WORLD)?;
+    let start = at("2026-11-07T00:00:00Z")?;
+    let [attempt] = tick(&store, start)
+        .await?
+        .try_into()
+        .map_err(|d| format!("{d:?}"))?;
+    let notice = store
+        .runner_waiting("p1")
+        .await?
+        .dispatches
+        .into_iter()
+        .find(|d| d.attempt_id == attempt)
+        .ok_or("no notice")?;
+    assert!(store.runner_received(notice, start).await?);
+    let session: Option<String> = Connection::open(&path)?.query_row(
+        "SELECT session_id FROM attempts WHERE attempt_id = ?1",
+        [&attempt],
+        |r| r.get(0),
+    )?;
+    let session = session.ok_or("the attempt has no session")?;
+    store
+        .runner_finished(
+            &attempt,
+            Ending {
+                success: false,
+                detail: "PROTOCOL_FRAME_TOO_LARGE".to_owned(),
+                class: FailureClass::Transient { retry_after: None },
+                at: start + Duration::from_secs(3),
+                draw: 0,
+                observed: crate::persistence::Observed {
+                    resolved_model: Some("m-test".to_owned()),
+                    usage: Some(json!({"input_tokens": 3})),
+                    native_session: Some("native-1".to_owned()),
+                    events: vec![(
+                        "frame-too-large".to_owned(),
+                        "adapter.diagnostic".to_owned(),
+                        json!({"attempt_id": attempt, "reason": "PROTOCOL_FRAME_TOO_LARGE", "length": 8}),
+                    )],
+                },
+            },
+        )
+        .await?;
+    let conn = Connection::open(&path)?;
+    let (model, usage, failure): (String, String, String) = conn.query_row(
+        "SELECT resolved_model, usage_json, failure_reason FROM attempts WHERE attempt_id = ?1",
+        [&attempt],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    assert_eq!(
+        (
+            model.as_str(),
+            serde_json::from_str::<Value>(&usage)?,
+            failure.as_str()
+        ),
+        (
+            "m-test",
+            json!({"input_tokens": 3}),
+            "PROTOCOL_FRAME_TOO_LARGE"
+        )
+    );
+    let native: String = conn.query_row(
+        "SELECT native_id FROM sessions WHERE session_id = ?1",
+        [&session],
+        |r| r.get(0),
+    )?;
+    assert_eq!(native, "native-1");
+    let (event_id, payload): (String, String) = conn.query_row(
+        "SELECT event_id, payload_json FROM events WHERE kind = 'adapter.diagnostic'",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    assert_eq!(event_id, format!("{attempt}/frame-too-large"));
+    assert_eq!(serde_json::from_str::<Value>(&payload)?["length"], 8);
+    Ok(())
+}
+
+#[tokio::test]
 async fn an_attempts_running_time_is_added_to_its_runs_used_duration_when_it_ends() -> R {
     // ADR-020 decision 7: the used duration moves only when an attempt ends.
     let dir = tempfile::tempdir()?;
@@ -458,6 +541,7 @@ async fn an_attempts_running_time_is_added_to_its_runs_used_duration_when_it_end
                 class: FailureClass::Transient { retry_after: None },
                 at: start + Duration::from_millis(95_400),
                 draw: 0,
+                observed: Default::default(),
             },
         )
         .await?;

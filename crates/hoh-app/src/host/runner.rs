@@ -73,6 +73,8 @@ pub struct Outcome {
     /// How it failed, when it did (ADR-020 decision 1): a 429/503 with its Retry-After, other transient failures,
     /// missing authentication or an incompatible CLI. Unused on success.
     pub class: FailureClass,
+    /// What the agent's turn showed beyond its verdict (docs/adr/ADR-022.md decision 12); test executors give none.
+    pub observed: hoh_core::persistence::Observed,
 }
 
 /// The host's source of the retries' jitter draws (ADR-020 decision 2): one SplitMix64 for the reconcile and the
@@ -201,6 +203,7 @@ impl Common {
             class: FailureClass::Transient { retry_after: None },
             at: self.clock.now(),
             draw: self.jitter.draw(),
+            observed: hoh_core::persistence::Observed::default(),
         }
     }
 }
@@ -608,6 +611,7 @@ async fn attempt(
                 class: outcome.class,
                 at: ended,
                 draw: common.jitter.draw(),
+                observed: outcome.observed.clone(),
             },
         )
         .await?;
