@@ -549,6 +549,50 @@ fn a_prompt_override_must_be_a_readable_file_inside_the_project() -> R {
 }
 
 #[test]
+fn a_prompt_override_reaching_outside_the_project_or_unreadable_is_refused() -> R {
+    // M2T07R-101, -153 (ADR-022 decision 11): the file a prompt names must be inside the project once every symbolic
+    // link on its way is followed, a `..` is refused even when its file exists (inside the project too), and a file that
+    // cannot be read is refused; a link that stays inside the project, and a project reached through a link, are fine.
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+    let outer = tempfile::tempdir()?;
+    let project = outer.path().join("project");
+    let prompts = project.join(".hoh/prompts");
+    std::fs::create_dir_all(&prompts)?;
+    std::fs::write(outer.path().join("outside.md"), "Outside.")?;
+    std::fs::write(prompts.join("auditor.md"), "Audit.")?;
+    symlink(outer.path().join("outside.md"), prompts.join("escape.md"))?;
+    symlink(outer.path(), project.join(".hoh/out"))?;
+    symlink("auditor.md", prompts.join("alias.md"))?;
+    let key = "team.auditor.prompt";
+    for prompt in [
+        "../outside.md",
+        ".hoh/prompts/../prompts/auditor.md",
+        ".hoh/prompts/../../../outside.md",
+        ".hoh/prompts/escape.md",
+        ".hoh/out/outside.md",
+    ] {
+        let error = check_prompt(&project, key, prompt)
+            .err()
+            .ok_or(format!("{prompt} accepted"))?;
+        assert_eq!(error.key.as_deref(), Some(key), "{prompt}: {error}");
+    }
+    let locked = prompts.join("locked.md");
+    std::fs::write(&locked, "Locked.")?;
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))?;
+    // A privileged user reads it anyway: nothing to refuse then.
+    if std::fs::File::open(&locked).is_err() {
+        let error = check_prompt(&project, key, ".hoh/prompts/locked.md")
+            .err()
+            .ok_or("an unreadable file accepted")?;
+        assert_eq!(error.key.as_deref(), Some(key), "{error}");
+    }
+    check_prompt(&project, key, ".hoh/prompts/alias.md")?;
+    symlink(&project, outer.path().join("via"))?;
+    check_prompt(&outer.path().join("via"), key, ".hoh/prompts/auditor.md")?;
+    Ok(())
+}
+
+#[test]
 fn a_fallback_to_the_roles_own_agent_is_refused() {
     // M2T07R-60: falling back to the agent the role already has is no fallback.
     for (body, key) in [
