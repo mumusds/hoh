@@ -1390,3 +1390,95 @@ async fn pi_an_8_mib_line_fails_only_its_own_attempt() -> R {
     assert!(world.store.writer_alive());
     Ok(())
 }
+
+/// A start gate for the tests (the product's is `hoh __gate`): one line from stdin, read a byte at a time; `go` execs
+/// the agent's argv in its place, anything else exits 0 (docs/adr/ADR-022.md decision 13).
+fn gate(world: &World) -> R<pi::GateCommand> {
+    let script = world.dir.path().join("gate.py");
+    std::fs::write(
+        &script,
+        "import os, sys\nline = b''\nwhile True:\n    b = os.read(0, 1)\n    if not b or b == b'\\n':\n        break\n    line += b\n\
+         if line != b'go':\n    sys.exit(0)\nos.execvp(sys.argv[1], sys.argv[1:])\n",
+    )?;
+    Ok(pi::GateCommand {
+        program: "python3".into(),
+        args: vec![script.into()],
+        env: vec![("HOH_ATTEMPT_ID".into(), "p/A1".into())],
+    })
+}
+
+#[tokio::test]
+async fn pi_runner_mode_runs_the_turn_after_its_gate_without_store_writes() -> R {
+    // docs/adr/ADR-022.md decisions 12 to 14: held at its gate nothing runs; opened, the recorded RPC turn settles
+    // with its session and model as facts, and the store is not written.
+    let world = World::new()?;
+    let fake = world.fake("held", &Case::load("rpc-prompt")?)?;
+    let attempt = world.attempt_in("pi", "A1", "S1", "1.5.0").await?;
+    let turn = world.turn(&fake, "logs/held")?;
+    let events = count(&world, "SELECT count(*) FROM events")?;
+    let held = pi::start(&attempt, &turn, &gate(&world)?)?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(argvs(&fake)?.is_empty(), "pi ran before its gate opened");
+    held.open.send(()).map_err(|()| "gate closed")?;
+    let facts = tokio::time::timeout(Duration::from_secs(30), held.ended).await??;
+    assert_eq!(facts.state, AttemptState::Settled, "{facts:?}");
+    assert_eq!(
+        facts.native_session.as_deref(),
+        Some(turn.launch.session_id.as_str())
+    );
+    assert!(facts.resolved_model.is_some(), "{facts:?}");
+    assert!(facts.group_reaped);
+    assert_eq!(argvs(&fake)?.len(), 1);
+    assert_eq!(
+        count(&world, "SELECT count(*) FROM events")?,
+        events,
+        "the store was written"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn pi_runner_mode_cancel_is_an_abort_only() -> R {
+    // ADR-022 decision 14: the host's ladder is authoritative; the adapter sends Pi's abort and nothing more, even
+    // when Pi ignores it past the turn's own graces.
+    let world = World::new()?;
+    let mut case = Case::load("rpc-abort")?.with_state()?;
+    let start = case.position("agent_start")?;
+    // It reads the abort (so it is logged), then answers nothing and never exits by itself.
+    case.frames.truncate(start + 1);
+    case.frames
+        .push(json!({"hoh_wait": {"command": "abort", "count": 1}}));
+    case.frames
+        .push(json!({"hoh_hold": "/nonexistent/hoh-never"}));
+    let fake = world.fake("deaf", &case)?;
+    let attempt = world.attempt_in("pi", "A1", "S1", "1.5.0").await?;
+    let mut turn = world.turn(&fake, "logs/deaf")?;
+    turn.escalation = Escalation {
+        native_grace: Duration::from_millis(300),
+        term_grace: Duration::from_millis(300),
+        ..turn.escalation
+    };
+    let held = pi::start(&attempt, &turn, &gate(&world)?)?;
+    held.open.send(()).map_err(|()| "gate closed")?;
+    let end = std::time::Instant::now() + Duration::from_secs(10);
+    while !received(&fake)?.iter().any(|r| r["type"] == "prompt") {
+        assert!(std::time::Instant::now() < end, "no prompt");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    held.cancel.notify_one();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let aborts = received(&fake)?
+        .iter()
+        .filter(|r| r["type"] == "abort")
+        .count();
+    let alive = !held.ended.is_finished();
+    let _ = rustix::process::kill_process_group(
+        rustix::process::Pid::from_raw(held.pid as i32).ok_or("pid")?,
+        rustix::process::Signal::KILL,
+    );
+    let facts = tokio::time::timeout(Duration::from_secs(20), held.ended).await??;
+    assert_eq!(aborts, 1, "{facts:?}");
+    assert!(alive, "the adapter ended the turn itself");
+    Ok(())
+}
