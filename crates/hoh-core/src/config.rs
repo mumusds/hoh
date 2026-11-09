@@ -563,11 +563,20 @@ impl Reader<'_> {
                             "expected an array of agent names",
                         ));
                     };
-                    role.fallback = items
-                        .iter()
-                        .enumerate()
-                        .map(|(i, item)| self.agent(&format!("{key_path}[{i}]"), item))
-                        .collect::<Result<_, _>>()?;
+                    let mut fallback = Vec::new();
+                    for (i, item) in items.iter().enumerate() {
+                        let item_path = format!("{key_path}[{i}]");
+                        let agent = self.agent(&item_path, item)?;
+                        if fallback.contains(&agent) {
+                            return Err(self.error(
+                                &item_path,
+                                item.span().start,
+                                format!("\"{}\" is already in the list", agent.as_str()),
+                            ));
+                        }
+                        fallback.push(agent);
+                    }
+                    role.fallback = fallback;
                 }
                 "prompt" => {
                     let prompt = self.string(&key_path, value)?;
