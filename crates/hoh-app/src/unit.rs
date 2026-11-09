@@ -249,5 +249,18 @@ pub fn runs(exec_start: &str, program: &Path) -> bool {
     ))
 }
 
+/// The host's unit a process runs as, by its `/proc/self/cgroup` (`text`): the cgroup v2 line's last segment when it
+/// is an instance of the template, else `None`.
+pub fn supervisor_of(text: &str) -> Option<String> {
+    let path = text.lines().find_map(|line| line.strip_prefix("0::"))?;
+    let name = path.rsplit('/').next()?;
+    let instance = name.strip_prefix("hoh-host@")?.strip_suffix(".service")?;
+    (instance.len() == 16
+        && instance
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+    .then(|| name.to_owned())
+}
+
 #[cfg(test)]
 mod tests;

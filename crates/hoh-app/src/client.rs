@@ -12,6 +12,8 @@ pub const WAIT: Duration = Duration::from_secs(10);
 
 /// How often it looks again meanwhile.
 const POLL: Duration = Duration::from_millis(20);
+/// How often a client starting a host as its unit asks the manager whether the unit ended.
+const LOOK: Duration = Duration::from_millis(200);
 
 /// What a client needs of a running host (its `host.json`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -386,9 +388,90 @@ pub fn delegated_scope(env: &hoh_agents::probe::ProbeEnv) -> Result<Scope, Strin
     })
 }
 
-/// Start `project`'s host and wait until it is ready, until `end`: in a delegated scope of the user's systemd
-/// manager when there is one, so its attempts are tracked by cgroups of their own; directly otherwise, or when the
-/// scope cannot be had (decision 2).
+/// How the installed hoh starts a project's host as its systemd unit (docs/adr/ADR-023.md decision 6).
+#[derive(Debug, Clone)]
+pub struct Unit {
+    systemctl: PathBuf,
+    /// `hoh-host@<instance>.service`.
+    pub name: String,
+    /// The instance's environment file, where the manager reads it.
+    file: PathBuf,
+    /// What it is to hold: the project and this client's PATH.
+    text: String,
+}
+
+/// `$HOME/.local/bin/hoh`, the installed command.
+fn installed_command() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| Path::new(&home).join(".local/bin/hoh"))
+}
+
+/// Whether `project`'s host can be started as its unit (decision 6), asking the manager nothing that changes it:
+/// cgroup v2, a lingering user manager, `systemctl` on PATH, this process the installed hoh, the instance loaded with
+/// the installed hoh's ExecStart and an environment file of its own, and the project and PATH such that systemd takes
+/// them. How, or why not.
+pub fn unit_for(project: &Path, env: &hoh_agents::probe::ProbeEnv) -> Result<Unit, String> {
+    if !Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
+        return Err("cgroup v2 is not mounted at /sys/fs/cgroup".to_owned());
+    }
+    manager_that_lingers()?;
+    let systemctl = std::env::split_paths(&env.path)
+        .map(|dir| dir.join("systemctl"))
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| "systemctl is not on PATH".to_owned())?;
+    let command = installed_command().ok_or_else(|| "HOME is not set".to_owned())?;
+    let this = std::env::current_exe().and_then(std::fs::canonicalize);
+    if this.is_err() || this.ok() != std::fs::canonicalize(&command).ok() {
+        return Err(format!(
+            "this is not the installed hoh ({}), so its unit would run another",
+            command.display()
+        ));
+    }
+    let name = hoh_app::unit::unit_name(&hoh_app::unit::instance(project));
+    let bounded = hoh_agents::probe::ProbeEnv {
+        timeout: env.timeout.min(SCOPE_PROBE_LIMIT),
+        ..env.clone()
+    };
+    let shown = hoh_agents::probe::run_status(
+        &systemctl,
+        &[
+            "--user",
+            "show",
+            "-p",
+            "LoadState,ExecStart,EnvironmentFiles",
+            &name,
+        ],
+        &bounded,
+    )
+    .map_err(|e| format!("systemctl --user show {name}: {e}"))?;
+    let shown = hoh_app::unit::show(&String::from_utf8_lossy(&shown.stdout));
+    let get = |key: &str| shown.get(key).map(String::as_str).unwrap_or_default();
+    if get("LoadState") != "loaded" {
+        return Err(format!(
+            "the user's systemd manager does not load {name} (LoadState={})",
+            get("LoadState")
+        ));
+    }
+    if !hoh_app::unit::runs(get("ExecStart"), &command) {
+        return Err(format!(
+            "{name} does not run {} __host (a drop-in changed it?)",
+            command.display()
+        ));
+    }
+    let file = hoh_app::unit::environment_file(get("EnvironmentFiles"))
+        .ok_or_else(|| format!("{name} names no environment file of its own"))?;
+    let text = hoh_app::unit::environment(project, &env.path).map_err(|e| e.to_string())?;
+    Ok(Unit {
+        systemctl,
+        name,
+        file,
+        text,
+    })
+}
+
+/// Start `project`'s host and wait until it is ready, until `end`: as its systemd unit when this is the installed hoh
+/// and the unit is there (docs/adr/ADR-023.md decision 6), so systemd restarts it after a crash; else in a delegated
+/// scope of the user's systemd manager when there is one, so its attempts are tracked by cgroups of their own; directly
+/// otherwise, or when the scope cannot be had (ADR-021 decision 2). A host not started as its unit is told why.
 fn start(project: &Path, end: Instant) -> Result<HostInfo, Failure> {
     let env = hoh_agents::probe::ProbeEnv {
         path: std::env::var_os("PATH").unwrap_or_default(),
@@ -398,8 +481,16 @@ fn start(project: &Path, end: Instant) -> Result<HostInfo, Failure> {
         deadline: Some(end),
         cancel: None,
     };
+    let unsupervised = match unit_for(project, &env) {
+        // Under the project's lock, with no host running: the file the manager reads before it starts the host.
+        Ok(unit) => match hoh_app::unit::write_environment(&unit.file, project, &unit.text) {
+            Ok(()) => return supervised(project, end, &unit, &env),
+            Err(e) => format!("its unit's environment file was not written ({e})"),
+        },
+        Err(why) => why,
+    };
     let why = match delegated_scope(&env) {
-        Ok(scope) => match launch(project, end, Some(&scope), None) {
+        Ok(scope) => match launch(project, end, Some(&scope), None, &unsupervised) {
             Err(failure) if failure.exit != 78 && Instant::now() < end => {
                 // The scope was refused (or the host ended for another reason): once more, directly.
                 format!(
@@ -411,16 +502,140 @@ fn start(project: &Path, end: Instant) -> Result<HostInfo, Failure> {
         },
         Err(why) => why,
     };
-    launch(project, end, None, Some(&why))
+    launch(project, end, None, Some(&why), &unsupervised)
+}
+
+/// What a host that ended before it was ready means (`code`, its exit; `line`, the last it said): another host holds
+/// the project (69), which is then the one if it answers; its location or database refused (78), the code its line
+/// names (M2T06R-60); else the host is unreachable, with its line.
+fn ended_before_ready(
+    project: &Path,
+    code: Option<i32>,
+    line: String,
+) -> Result<HostInfo, Failure> {
+    match code {
+        Some(69) => running(project).ok_or_else(|| Failure::unreachable(line)),
+        Some(78) => Err(Failure::new(refused_code(&line), line, 78)),
+        _ => Err(Failure::unreachable(line)),
+    }
+}
+
+/// The last line with text in `file` after its first `from` bytes.
+fn last_line_after(file: &Path, from: u64) -> Option<String> {
+    let bytes = std::fs::read(file).ok()?;
+    let after = bytes.get(usize::try_from(from).ok()?..)?;
+    String::from_utf8_lossy(after)
+        .lines()
+        .rfind(|line| !line.trim().is_empty())
+        .map(str::to_owned)
+}
+
+/// Start `project`'s host as `unit` and wait until it is ready, until `end` (decision 6): ready when host.json names
+/// the unit's main process and it answers. A start systemd refuses (its start limit hit, an environment file it cannot
+/// read) ends the client with 69, not another way round the limit; a host that ends before it is ready, with the unit
+/// not restarting it, is judged by its exit and the last line it wrote to `$XDG_RUNTIME_DIR/hoh-host@<h>.stderr`;
+/// one the unit restarts is followed until `end`.
+fn supervised(
+    project: &Path,
+    end: Instant,
+    unit: &Unit,
+    env: &hoh_agents::probe::ProbeEnv,
+) -> Result<HostInfo, Failure> {
+    let stderr = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(|runtime| {
+            Path::new(&runtime).join(format!("{}.stderr", unit.name.trim_end_matches(".service")))
+        })
+        .unwrap_or_default();
+    let from = std::fs::metadata(&stderr).map_or(0, |m| m.len());
+    let left = || end.saturating_duration_since(Instant::now());
+    let systemctl = |args: &[&str]| {
+        let bounded = hoh_agents::probe::ProbeEnv {
+            timeout: left()
+                .min(SCOPE_PROBE_LIMIT)
+                .max(Duration::from_millis(100)),
+            ..env.clone()
+        };
+        let mut argv = vec!["--user"];
+        argv.extend_from_slice(args);
+        hoh_agents::probe::run_status(&unit.systemctl, &argv, &bounded)
+    };
+    let show = |props: &str| {
+        systemctl(&["show", "-p", props, &unit.name])
+            .map(|out| hoh_app::unit::show(&String::from_utf8_lossy(&out.stdout)))
+            .unwrap_or_default()
+    };
+    let started = hoh_agents::probe::run_status(
+        &unit.systemctl,
+        &["--user", "start", &unit.name],
+        &hoh_agents::probe::ProbeEnv {
+            timeout: left().max(Duration::from_millis(100)),
+            ..env.clone()
+        },
+    );
+    let refused = match started {
+        Ok(out) if out.status.success() => None,
+        Ok(out) => Some(String::from_utf8_lossy(&out.stderr).trim().to_owned()),
+        Err(e) => Some(e.to_string()),
+    };
+    if let Some(said) = refused {
+        let result = show("Result").remove("Result").unwrap_or_default();
+        let host = last_line_after(&stderr, from)
+            .map(|line| format!("; the host said: {line}"))
+            .unwrap_or_default();
+        return Err(Failure::unreachable(format!(
+            "systemctl --user start {} failed (Result={result}): {said}{host}; see systemctl --user status {}",
+            unit.name, unit.name
+        )));
+    }
+    let mut looked = Instant::now();
+    loop {
+        if let Some(host) = host_json(project).filter(healthy)
+            && show("MainPID")
+                .get("MainPID")
+                .and_then(|pid| pid.parse::<u32>().ok())
+                == Some(host.pid)
+        {
+            return Ok(host);
+        }
+        if looked.elapsed() >= LOOK {
+            looked = Instant::now();
+            let state = show("ActiveState,ExecMainStatus");
+            let active = state
+                .get("ActiveState")
+                .map(String::as_str)
+                .unwrap_or_default();
+            // "activating" covers the wait before an automatic restart: the restarted host is followed.
+            if matches!(active, "failed" | "inactive") {
+                let code = state
+                    .get("ExecMainStatus")
+                    .and_then(|c| c.parse::<i32>().ok());
+                let line = last_line_after(&stderr, from)
+                    .unwrap_or_else(|| format!("{} ended ({active})", unit.name));
+                return ended_before_ready(project, code, line);
+            }
+        }
+        if Instant::now() >= end {
+            let said = last_line_after(&stderr, from)
+                .map(|line| format!(": {line}"))
+                .unwrap_or_default();
+            return Err(Failure::unreachable(format!(
+                "the host {} started did not become ready in 10 s{said}; see systemctl --user status {}",
+                unit.name, unit.name
+            )));
+        }
+        std::thread::sleep(POLL);
+    }
 }
 
 /// Start `hoh __host <project>`, in `scope` if given, and wait until it is ready, until `end`. A host started
-/// directly is told why (`unscoped`), which it records for `hoh doctor` (CR-012, CR12-03).
+/// directly is told why (`unscoped`), which it records for `hoh doctor` (CR-012, CR12-03), and so is one not started as
+/// its unit (`unsupervised`, ADR-023 decision 7).
 fn launch(
     project: &Path,
     end: Instant,
     scope: Option<&Scope>,
     unscoped: Option<&str>,
+    unsupervised: &str,
 ) -> Result<HostInfo, Failure> {
     let program = std::env::current_exe()
         .map_err(|e| Failure::unreachable(format!("cannot find the hoh program: {e}")))?;
@@ -448,6 +663,7 @@ fn launch(
         Some(why) => command.env(hoh_app::host::UNSCOPED_ENV, why),
         None => command.env_remove(hoh_app::host::UNSCOPED_ENV),
     };
+    command.env(hoh_app::host::UNSUPERVISED_ENV, unsupervised);
     let mut child = command
         .arg("__host")
         .arg(project)
@@ -476,14 +692,7 @@ fn launch(
         if let Ok(Some(status)) = child.try_wait() {
             let text = said.join().unwrap_or_default();
             let line = text.lines().last().unwrap_or("the host ended").to_owned();
-            return match status.code() {
-                // Another host holds the project: it is the one, if it answers.
-                Some(69) => running(project).ok_or_else(|| Failure::unreachable(line)),
-                // Its location or database refused (DB_ON_NETWORK_FS, DB_WAL_UNSUPPORTED): its line says which
-                // (M2T06R-60).
-                Some(78) => Err(Failure::new(refused_code(&line), line, 78)),
-                _ => Err(Failure::unreachable(line)),
-            };
+            return ended_before_ready(project, status.code(), line);
         }
         if Instant::now() >= end {
             return Err(Failure::unreachable(
