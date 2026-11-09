@@ -770,12 +770,14 @@ mod tests {
     #[tokio::test]
     async fn a_leader_signal_is_sent_once_and_starts_no_escalation()
     -> Result<(), Box<dyn std::error::Error>> {
+        // The handlers write with os.write: a print in a handler can re-enter the buffered writer that print('ready')
+        // is still flushing when SIGINT comes (RuntimeError: reentrant call), seen under load.
         let mut command = Command::new("python3");
         command.arg("-c").arg(
-            "import signal, sys, time\n\
-             def interrupted(*_):\n    print('interrupted', flush=True)\n\
+            "import os, signal, sys, time\n\
+             def interrupted(*_):\n    os.write(1, b'interrupted\\n')\n\
              signal.signal(signal.SIGINT, interrupted)\n\
-             signal.signal(signal.SIGTERM, lambda *_: (print('terminated', flush=True), sys.exit(0)))\n\
+             signal.signal(signal.SIGTERM, lambda *_: (os.write(1, b'terminated\\n'), sys.exit(0)))\n\
              print('ready', flush=True)\n\
              time.sleep(1.5)\n\
              print('done', flush=True)\n",

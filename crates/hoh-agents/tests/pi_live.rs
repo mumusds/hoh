@@ -56,6 +56,7 @@ async fn pi_live_turns_resume_and_cancel() -> R {
             timeout: Duration::from_secs(120),
             log: None,
             deadline: None,
+            cancel: None,
         },
     )?;
     let version = entry

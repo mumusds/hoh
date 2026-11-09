@@ -52,8 +52,8 @@ pub struct Waiting {
     /// The project's current team: each role and the built-in role whose contract it follows (its own, a custom role's
     /// `builtin:<role>`, or none), for the capabilities it needs (decision 10).
     pub roles: Vec<(String, Option<String>)>,
-    /// The agents the project's current team names: the registry looks at them before the checkpoints, which hold back
-    /// a change to one found unavailable (decision 8, third version; decision 10).
+    /// The agents the runner needs looked at: the project's current team's and those of the bindings in runs not ended
+    /// (decision 8, third version; decision 10).
     pub agents: std::collections::BTreeSet<String>,
 }
 
@@ -123,6 +123,9 @@ pub struct Ending {
     pub draw: u32,
     /// What the agent's turn showed beyond its verdict, recorded with its end.
     pub observed: Observed,
+    /// The turn ended after starting an effect whose outcome it never reported: the attempt ends UNKNOWN_EFFECT, its
+    /// task untouched and nothing run again (ADR-019 decision 5, docs/adr/ADR-022.md decision 12, M2T07R-200).
+    pub unknown_effect: bool,
 }
 
 /// What an agent's turn showed beyond its verdict (docs/adr/ADR-022.md decision 12): written in the commit of its end,
@@ -152,6 +155,17 @@ pub struct PromptRecord {
     pub path: String,
     pub content_sha256: String,
     pub sent_sha256: String,
+}
+
+impl PromptRecord {
+    /// Its `prompt_revisions` id: the contract's layer, role, path and content, so two files of the same content are
+    /// two sources (M2T07R-205).
+    pub fn revision_id(&self) -> String {
+        format!(
+            "{}/{}/{}/{}",
+            self.layer, self.role, self.content_sha256, self.path
+        )
+    }
 }
 
 pub(super) fn run(
@@ -577,8 +591,13 @@ fn finished(
     // A process that never started leaves its attempt STARTING: it can only fail. A cancel takes precedence over how
     // the work ended: CANCELLED, not counted, no retry; the run's cancel moves its task (ADR-021 decision 8e).
     let success = ending.success && from == AttemptState::Running && !cancelled;
+    // A turn that started an effect it never reported: what it did is unknown, so nothing runs it again and its task
+    // stays (ADR-019 decision 5, M2T07R-200). Only a RUNNING attempt can have started one.
+    let unknown = ending.unknown_effect && from == AttemptState::Running && !cancelled;
     let to = if cancelled {
         AttemptState::Cancelled
+    } else if unknown {
+        AttemptState::UnknownEffect
     } else if success {
         AttemptState::Settled
     } else {
@@ -604,7 +623,7 @@ fn finished(
     super::retry::accrue_wall(&tx, &run_id, attempt_id, ending.at, None)?;
     // The prompt's source and what was sent (decision 11).
     if let Some(prompt) = &ending.observed.prompt {
-        let revision = format!("{}/{}/{}", prompt.layer, prompt.role, prompt.content_sha256);
+        let revision = prompt.revision_id();
         tx.execute(
             "INSERT OR IGNORE INTO prompt_revisions(revision_id, layer, role, content_sha256, path, created_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -642,7 +661,31 @@ fn finished(
             payload: payload.clone(),
         });
     }
-    if success {
+    if unknown {
+        // The effects it left STARTED, named for whoever settles them (as a reconcile's diagnostic does).
+        let started: Vec<String> = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT effect_key FROM effects WHERE attempt_id = ?1 AND state = 'STARTED' ORDER BY effect_key",
+                )
+                .map_err(sqlite_error)?;
+            statement
+                .query_map(params![attempt_id], |r| r.get(0))
+                .map_err(sqlite_error)?
+                .collect::<Result<_, _>>()
+                .map_err(sqlite_error)?
+        };
+        commit.events.push(NewEvent {
+            project_id: project_id.clone(),
+            event_id: crate::ids::child_id(attempt_id, "runner/unknown-effect"),
+            run_id: Some(run_id.clone()),
+            kind: "runner.diagnostic".to_owned(),
+            payload: serde_json::json!({
+                "code": "UNKNOWN_EFFECT", "attempt_id": attempt_id, "effect_keys": started,
+                "detail": ending.detail,
+            }),
+        });
+    } else if success {
         if task_state == TaskState::Running {
             commit.cas.push(StateCas {
                 id: task_id,

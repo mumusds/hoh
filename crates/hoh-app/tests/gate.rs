@@ -75,3 +75,38 @@ fn a_gate_without_a_program_is_a_usage_error() -> R {
     assert_eq!(code, Some(64));
     Ok(())
 }
+
+#[test]
+fn an_opened_gate_gives_the_agent_default_signals_whatever_it_inherited() -> R {
+    // M2T07R-203 (ADR-022 decision 13): started by a parent that ignores SIGINT, SIGTERM and SIGHUP and blocks SIGUSR1
+    // (as a shell's background job or nohup leaves them), the agent still starts with no signal ignored or blocked, so
+    // its native cancel (SIGINT) and the host's SIGTERM reach it.
+    let script = "import signal, subprocess, sys\n\
+                  for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):\n    signal.signal(s, signal.SIG_IGN)\n\
+                  signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR1})\n\
+                  out = subprocess.run([sys.argv[1], '__gate', 'cat', '/proc/self/status'], input=b'go\\n',\n\
+                                       capture_output=True, restore_signals=False).stdout.decode()\n\
+                  print('\\n'.join(l for l in out.splitlines() if l.startswith(('SigIgn', 'SigBlk'))))\n";
+    let out = Command::new("python3")
+        .args(["-c", script, env!("CARGO_BIN_EXE_hoh")])
+        .output()?;
+    assert!(out.status.success(), "{out:?}");
+    let status = String::from_utf8(out.stdout)?;
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .map(|v| v.trim().to_owned())
+    };
+    assert_eq!(
+        field("SigIgn:").as_deref(),
+        Some("0000000000000000"),
+        "{status}"
+    );
+    assert_eq!(
+        field("SigBlk:").as_deref(),
+        Some("0000000000000000"),
+        "{status}"
+    );
+    Ok(())
+}

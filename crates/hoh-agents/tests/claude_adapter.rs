@@ -1241,6 +1241,26 @@ async fn claude_runner_mode_runs_nothing_before_its_gate_and_reports_facts_witho
 }
 
 #[tokio::test]
+async fn claude_runner_mode_keeps_the_agents_own_cost_estimate_in_the_usage() -> R {
+    // docs/adr/ADR-022.md decision 14 (M2T07R-256): the cost Claude reports is its own estimate, kept in the usage as
+    // reported_cost_usd, never the run's cost (ADR-020).
+    let world = World::new()?;
+    let result = r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"sid-1","usage":{"input_tokens":3},"total_cost_usd":0.25}"#;
+    let program = recording(&world, "costed", &format!("{INIT}\n{result}"))?;
+    let turn = world.turn(&program, "logs-costed")?;
+    let attempt = world.attempt("A1").await?;
+    let held = claude::start(&attempt, &turn, &gate(&world, "p/A1")?)?;
+    held.open.send(()).map_err(|()| "gate closed")?;
+    let facts = tokio::time::timeout(Duration::from_secs(20), held.ended).await??;
+    assert_eq!(facts.state, AttemptState::Settled, "{facts:?}");
+    assert_eq!(
+        facts.usage,
+        Some(serde_json::json!({"input_tokens": 3, "reported_cost_usd": 0.25}))
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn claude_runner_mode_gate_dropped_unopened_never_runs_the_agent() -> R {
     // ADR-019 decision 8, ADR-022 decision 13: a gate that is never opened ends, and the agent never runs.
     let world = World::new()?;

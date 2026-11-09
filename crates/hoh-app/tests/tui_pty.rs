@@ -568,6 +568,7 @@ impl hoh_app::host::Executor for Sixty {
                 group_gone: hoh_agents::identity::group_empty(pid),
                 class: hoh_core::retry::FailureClass::Transient { retry_after: None },
                 observed: Default::default(),
+                unknown_effect: false,
             });
         });
         Ok(hoh_app::host::Started { pid, gate, ended })

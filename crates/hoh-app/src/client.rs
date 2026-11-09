@@ -388,6 +388,7 @@ fn start(project: &Path, end: Instant) -> Result<HostInfo, Failure> {
         timeout: SCOPE_PROBE_LIMIT,
         log: None,
         deadline: Some(end),
+        cancel: None,
     };
     let why = match delegated_scope(&env) {
         Ok(scope) => match launch(project, end, Some(&scope), None) {
