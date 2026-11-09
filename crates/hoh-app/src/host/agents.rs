@@ -45,7 +45,8 @@ pub struct Registry {
     /// The agents the runner needs looked at (its team's, its unbound bindings'): [`Registry::refresh`] looks at them,
     /// off the runner's tick, so no probe holds up a tick or the host's stop.
     wanted: Mutex<BTreeSet<Agent>>,
-    /// The host's stop: every probe command running is killed and none starts (decision 10 v5, M2T07R-202, -300, -450).
+    /// The host's stop: every probe command running is killed and none starts (decision 10 v6, M2T07R-202, -300, -450,
+    /// -700).
     stopping: probe::ProbeStop,
 }
 
@@ -61,8 +62,9 @@ impl Registry {
     }
 
     /// The host stops: every probe command in its slot is killed (its group and its leader) before this returns, one
-    /// still being spawned by its starter as it puts it in its slot, and none starts; it never waits for a spawn
-    /// (decision 10 v5, M2T07R-300, -450, -500).
+    /// still being spawned by its starter as it puts it in its slot, and none starts; it never waits on a probing
+    /// thread: a lock one of them holds past the probe's STOP_WAIT (200 ms) is left to its holder, which kills its
+    /// command itself (decision 10 v6, M2T07R-300, -450, -500, -700).
     pub fn stop(&self) {
         self.stopping.stop();
     }
