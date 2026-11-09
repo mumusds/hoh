@@ -24,12 +24,14 @@ fn text(out: &Output) -> String {
     )
 }
 
-/// A manager with this build installed in its home from a staged bundle; `projects` enabled.
-fn installed(projects: &[&Path]) -> R<Manager> {
+/// A manager with this build installed in its home from a staged bundle, and a Git project under the manager's root
+/// (so its teardown ends whatever a test left running for it), enabled when `enable`.
+fn installed(enable: bool) -> R<(Manager, PathBuf)> {
     let manager = Manager::start()?;
+    let project = project(manager.root())?;
     let bundle = installed::stage_bundle(&manager.root().join("bundle"), b"")?;
     let mut args = Vec::new();
-    for project in projects {
+    if enable {
         args.push("--project");
         args.push(project.to_str().ok_or("path")?);
     }
@@ -37,7 +39,7 @@ fn installed(projects: &[&Path]) -> R<Manager> {
     if out.status.code() != Some(0) {
         return Err(format!("install.sh {args:?}: {}", text(&out)).into());
     }
-    Ok(manager)
+    Ok((manager, project))
 }
 
 /// A Git project with one commit at `<root>/p` (made before the install, which needs it to exist).
@@ -118,7 +120,7 @@ fn the_private_manager_runs_in_a_scope_of_its_own_and_leaves_nothing_behind() ->
 
 #[test]
 fn the_installed_template_loads_with_the_settings_of_req_005() -> R {
-    let manager = installed(&[])?;
+    let (manager, _) = installed(false)?;
     let unit = unit_of(Path::new("/nowhere"));
     let shown = manager.show(
         &unit,
@@ -157,9 +159,7 @@ fn the_installed_template_loads_with_the_settings_of_req_005() -> R {
 
 #[test]
 fn an_install_with_a_project_enables_its_instance_and_writes_its_file() -> R {
-    let root = tempfile::tempdir()?;
-    let project = project(root.path())?;
-    let manager = installed(&[&project])?;
+    let (manager, project) = installed(true)?;
     let unit = unit_of(&project);
     let enabled = manager.systemctl(&["is-enabled", &unit])?;
     assert_eq!(String::from_utf8(enabled.stdout)?.trim(), "enabled");
@@ -190,9 +190,7 @@ fn an_install_with_a_project_enables_its_instance_and_writes_its_file() -> R {
 
 #[test]
 fn a_host_its_unit_starts_runs_in_the_units_delegated_cgroup_and_is_restarted_after_a_kill() -> R {
-    let root = tempfile::tempdir()?;
-    let project = project(root.path())?;
-    let mut manager = installed(&[&project])?;
+    let (mut manager, project) = installed(true)?;
     let unit = unit_of(&project);
     let out = manager.systemctl(&["start", &unit])?;
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
@@ -253,9 +251,7 @@ fn not_restarted(manager: &mut Manager, unit: &str, code: &str) -> R {
 
 #[test]
 fn a_host_that_finds_its_project_held_by_another_exits_69_and_is_not_restarted() -> R {
-    let root = tempfile::tempdir()?;
-    let project = project(root.path())?;
-    let mut manager = installed(&[&project])?;
+    let (mut manager, project) = installed(true)?;
     let unit = unit_of(&project);
     // Another host, not the unit's, holds the project (REQ-005 failure mode 4).
     let mut other = manager
@@ -284,9 +280,7 @@ fn a_host_that_finds_its_project_held_by_another_exits_69_and_is_not_restarted()
 
 #[test]
 fn a_host_whose_project_is_gone_exits_64_and_is_not_restarted() -> R {
-    let root = tempfile::tempdir()?;
-    let project = project(root.path())?;
-    let mut manager = installed(&[&project])?;
+    let (mut manager, project) = installed(true)?;
     let unit = unit_of(&project);
     std::fs::remove_dir_all(&project)?;
     not_restarted(&mut manager, &unit, "64")
@@ -294,9 +288,7 @@ fn a_host_whose_project_is_gone_exits_64_and_is_not_restarted() -> R {
 
 #[test]
 fn the_uninstall_stops_and_disables_a_running_instance_and_keeps_its_project() -> R {
-    let root = tempfile::tempdir()?;
-    let project = project(root.path())?;
-    let mut manager = installed(&[&project])?;
+    let (mut manager, project) = installed(true)?;
     let unit = unit_of(&project);
     let out = manager.systemctl(&["start", &unit])?;
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
@@ -370,9 +362,7 @@ fn hosts_of(project: &Path) -> R<Vec<u32>> {
 #[test]
 fn the_installed_client_starts_its_host_through_the_unit() -> R {
     // ADR-023 decision 6: the installed hoh starts the host as its unit, so systemd restarts it after a crash.
-    let root = tempfile::tempdir()?;
-    let project = project(root.path())?;
-    let manager = installed(&[&project])?;
+    let (manager, project) = installed(true)?;
     let unit = unit_of(&project);
     let out = hoh_in(
         &manager,
@@ -402,9 +392,7 @@ fn the_installed_client_starts_its_host_through_the_unit() -> R {
 
 #[test]
 fn concurrent_attaches_through_the_unit_start_one_host_once() -> R {
-    let root = tempfile::tempdir()?;
-    let project = project(root.path())?;
-    let mut manager = installed(&[&project])?;
+    let (mut manager, project) = installed(true)?;
     let unit = unit_of(&project);
     let out = hoh_in(
         &manager,
@@ -451,9 +439,7 @@ fn concurrent_attaches_through_the_unit_start_one_host_once() -> R {
 
 #[test]
 fn a_hoh_that_is_not_the_installed_one_starts_its_host_as_before_and_says_why() -> R {
-    let root = tempfile::tempdir()?;
-    let project = project(root.path())?;
-    let manager = installed(&[&project])?;
+    let (manager, project) = installed(true)?;
     let unit = unit_of(&project);
     let out = hoh_in(
         &manager,
@@ -489,9 +475,7 @@ fn a_hoh_that_is_not_the_installed_one_starts_its_host_as_before_and_says_why() 
 fn a_unit_at_its_start_limit_fails_the_client_with_69_and_nothing_else_starts_a_host() -> R {
     // ADR-023 decision 6: the start limit is a brake on a crash loop; the client does not go round it. A `.hoh` that
     // is a file makes every host fail before it is ready; a drop-in shortens the loop (2 starts, 0.1 s apart).
-    let root = tempfile::tempdir()?;
-    let project = project(root.path())?;
-    let mut manager = installed(&[&project])?;
+    let (mut manager, project) = installed(true)?;
     let unit = unit_of(&project);
     std::fs::write(project.join(".hoh"), "not a directory")?;
     let dropin = manager
@@ -549,9 +533,7 @@ fn a_unit_at_its_start_limit_fails_the_client_with_69_and_nothing_else_starts_a_
 fn a_host_that_keeps_failing_under_its_unit_fails_the_client_with_its_last_line() -> R {
     // A `.hoh` that is a file: every host the unit starts fails before it is ready; the unit restarts it; the client
     // follows until its deadline and then says what the host said.
-    let root = tempfile::tempdir()?;
-    let project = project(root.path())?;
-    let manager = installed(&[&project])?;
+    let (manager, project) = installed(true)?;
     std::fs::write(project.join(".hoh"), "not a directory")?;
     let out = hoh_in(
         &manager,
@@ -578,9 +560,7 @@ fn a_host_that_keeps_failing_under_its_unit_fails_the_client_with_its_last_line(
 fn a_host_that_fails_under_its_unit_with_no_restart_coming_fails_the_client_at_once() -> R {
     // ADR-023 decision 6: the unit failed and nothing will restart it (here a drop-in says Restart=no): the client
     // judges the host's end then, by its exit and its last line, not at its deadline.
-    let root = tempfile::tempdir()?;
-    let project = project(root.path())?;
-    let manager = installed(&[&project])?;
+    let (manager, project) = installed(true)?;
     std::fs::write(project.join(".hoh"), "not a directory")?;
     let dropin = manager
         .home()
@@ -610,5 +590,52 @@ fn a_host_that_fails_under_its_unit_with_no_restart_coming_fails_the_client_at_o
     let stderr = String::from_utf8(out.stderr)?;
     assert!(stderr.contains(last), "client: {stderr}\nhost: {said}");
     assert!(!stderr.contains("did not become ready"), "{stderr}");
+    Ok(())
+}
+
+#[test]
+fn the_client_writes_its_project_and_path_for_the_unit_also_when_no_instance_was_enabled() -> R {
+    // ADR-023 decisions 2 and 6: installed without --project, so no file names the project; the client writes the
+    // instance's file (the project, its own PATH) before it starts the unit, and the host gets exactly those.
+    let (manager, project) = installed(false)?;
+    let unit = unit_of(&project);
+    let extra = manager.root().join("extra bin");
+    std::fs::create_dir(&extra)?;
+    let path = format!(
+        "{}:{}:{}:/usr/bin:/bin",
+        extra.display(),
+        manager.bin().display(),
+        manager.home().join(".local/bin").display()
+    );
+    let out = manager
+        .command(manager.home().join(".local/bin/hoh"))
+        .env("PATH", &path)
+        .args(["-p", "x", "--detach", "--output", "json"])
+        .current_dir(&project)
+        .stdin(std::process::Stdio::null())
+        .output()?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let main: u32 = manager.property(&unit, "MainPID")?.parse()?;
+    assert_ne!(main, 0);
+    let environ = std::fs::read(format!("/proc/{main}/environ"))?;
+    let vars: Vec<&[u8]> = environ.split(|b| *b == 0).collect();
+    let var = |name: &str| {
+        vars.iter()
+            .find_map(|v| v.strip_prefix(format!("{name}=").as_bytes()))
+            .map(|v| String::from_utf8_lossy(v).into_owned())
+    };
+    assert_eq!(var("PATH").as_deref(), Some(path.as_str()));
+    assert_eq!(var("HOH_PROJECT").as_deref(), project.to_str());
+    let file = manager.state().join(format!(
+        "hoh/hosts/{}.env",
+        hoh_app::unit::instance(&project)
+    ));
+    assert_eq!(
+        hoh_app::unit::project_of(&std::fs::read_to_string(file)?),
+        Some(project.clone())
+    );
+    // Started, not enabled: the install enabled nothing.
+    let enabled = manager.systemctl(&["is-enabled", &unit])?;
+    assert_ne!(String::from_utf8(enabled.stdout)?.trim(), "enabled");
     Ok(())
 }
