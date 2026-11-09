@@ -1332,14 +1332,16 @@ impl StuckExecutor {
     fn spawn(&self) -> Result<(std::process::Child, u32, hoh_app::host::Gate), String> {
         use std::os::unix::process::CommandExt as _;
         // A member that lives on in its group and ignores SIGTERM too (M2T05R-152): only a SIGKILL to the whole group
-        // ends it. The leader outlives SIGTERM as well, writing down when each came (M2T07R-254).
+        // ends it. The leader outlives SIGTERM as well and marks the first one by a write of its own, a builtin: a
+        // `date` it forked there could still be running at the SIGKILL that follows the term grace (300 ms), leaving
+        // the file made and empty (seen in CI, reproduced with a slow date); its time is the file's mtime (M2T07R-254).
         let terms = self.cancels.with_extension("term");
         let mut child = Command::new("sh")
             .args([
                 "-c",
                 &format!(
                     "trap '' TERM; read -r go; [ \"$go\" = go ] || exit 0; sleep 1000 & \
-                     trap 'date +%s%N >> {}' TERM; while :; do sleep 0.05; done",
+                     trap 'echo term >> {}; trap \"\" TERM' TERM; while :; do sleep 0.05; done",
                     terms.display()
                 ),
             ])
@@ -1470,7 +1472,7 @@ async fn a_settle_whose_native_cancel_reached_no_turn_waits_only_the_sigterm_gra
             .trim()
             .parse()?)
     };
-    let gap = first("cancels.term")?.saturating_sub(first("cancels.at")?);
+    let gap = term_at(&dir.path().join("cancels.term"))?.saturating_sub(first("cancels.at")?);
     host.shutdown().await;
     drop(executor);
     assert_eq!(sent, "0", "the step says a native cancel was sent");
@@ -1619,7 +1621,7 @@ print(json.dumps({{"steps": steps, "grant": list(grant), "disposed": disposed,
             .trim()
             .parse()?)
     };
-    let gap = first("cancels.term")?.saturating_sub(first("cancels.at")?);
+    let gap = term_at(&dir.path().join("cancels.term"))?.saturating_sub(first("cancels.at")?);
     assert!(
         gap >= 1_400_000_000,
         "SIGTERM {gap} ns after the native cancel"
@@ -3837,4 +3839,12 @@ fn test_005_04_a_host_killed_under_its_unit_is_restarted_by_systemd_and_reconcil
     seen.insert("manager_log".into(), json!(manager.log()));
     keep("TEST-005-04.json", &Value::Object(seen))?;
     outcome
+}
+
+/// When the stuck agent marked its first SIGTERM: its file's modification time, in ns since the epoch.
+fn term_at(file: &Path) -> R<u128> {
+    let modified = std::fs::metadata(file)
+        .map_err(|e| format!("no SIGTERM marked ({}): {e}", file.display()))?
+        .modified()?;
+    Ok(modified.duration_since(std::time::UNIX_EPOCH)?.as_nanos())
 }
