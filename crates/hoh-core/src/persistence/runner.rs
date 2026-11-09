@@ -28,6 +28,8 @@ pub struct DispatchNotice {
     pub task_id: String,
     pub attempt_id: String,
     pub role: String,
+    /// What the attempt runs as (docs/adr/ADR-022.md decisions 9 to 12).
+    pub assignment: super::team::Assignment,
 }
 
 /// What is waiting for the runner in a project.
@@ -131,6 +133,20 @@ pub struct Observed {
     pub native_session: Option<String>,
     /// The attempt's events, in order: (key, kind, payload); each event's id is the attempt's id and its key.
     pub events: Vec<(String, String, serde_json::Value)>,
+    /// The prompt it was sent (docs/adr/ADR-022.md decision 11).
+    pub prompt: Option<PromptRecord>,
+}
+
+/// Where a turn's prompt came from and what was sent (decision 11, AC-018-05): a `prompt_revisions` row (the role
+/// contract's layer, path and content sha256) and the attempt's `prompt_sha256` of the bytes sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptRecord {
+    /// `builtin` or `project`.
+    pub layer: String,
+    pub role: String,
+    pub path: String,
+    pub content_sha256: String,
+    pub sent_sha256: String,
 }
 
 pub(super) fn run(
@@ -225,11 +241,26 @@ fn waiting(conn: &Connection, project_id: &str) -> Result<Waiting, PersistError>
                 task_id: r.get(2)?,
                 attempt_id: r.get(3)?,
                 role: r.get(4)?,
+                assignment: super::team::Assignment::default(),
             })
         })
         .map_err(sqlite_error)?
-        .collect::<Result<_, _>>()
+        .collect::<Result<Vec<_>, _>>()
         .map_err(sqlite_error)?;
+    let dispatches = dispatches
+        .into_iter()
+        .map(|mut notice| {
+            notice.assignment = super::team::assignment(
+                conn,
+                project_id,
+                &notice.run_id,
+                &notice.task_id,
+                &notice.attempt_id,
+                &notice.role,
+            )?;
+            Ok(notice)
+        })
+        .collect::<Result<Vec<_>, PersistError>>()?;
     let mut statement = conn
         .prepare(
             "SELECT o.message_id, o.run_id FROM outbox o JOIN runs r ON r.run_id = o.run_id \
@@ -564,6 +595,28 @@ fn finished(
         ctx,
     )?;
     super::retry::accrue_wall(&tx, &run_id, attempt_id, ending.at, None)?;
+    // The prompt's source and what was sent (decision 11).
+    if let Some(prompt) = &ending.observed.prompt {
+        let revision = format!("{}/{}/{}", prompt.layer, prompt.role, prompt.content_sha256);
+        tx.execute(
+            "INSERT OR IGNORE INTO prompt_revisions(revision_id, layer, role, content_sha256, path, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                revision,
+                prompt.layer,
+                prompt.role,
+                prompt.content_sha256,
+                prompt.path,
+                crate::time::rfc3339_utc(ending.at)
+            ],
+        )
+        .map_err(sqlite_error)?;
+        tx.execute(
+            "UPDATE attempts SET prompt_revision = ?2, prompt_sha256 = ?3 WHERE attempt_id = ?1",
+            params![attempt_id, revision, prompt.sent_sha256],
+        )
+        .map_err(sqlite_error)?;
+    }
     // The agent's own session id on the attempt's session row (its later turns resume it).
     if let Some(native) = &ending.observed.native_session {
         tx.execute(
