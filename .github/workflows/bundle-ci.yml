@@ -57,3 +57,19 @@ jobs:
       # Dependency policy and RustSec advisories (deny.toml); pinned like scripts/dev/test-infra.sh.
       - run: cargo install --locked cargo-deny@0.20.2
       - run: cargo deny --locked check
+  deployment:
+    # TEST-005-06 (M2-T14, docs/adr/ADR-023.md decision 13): the release bundle built from this commit, installed into a
+    # temporary HOME under a private user manager in a delegated scope of the runner user's manager.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - run: rustup toolchain install  # installs the channel and components from rust-toolchain.toml
+      - name: user systemd manager
+        run: |
+          sudo loginctl enable-linger "$USER"
+          runtime="/run/user/$(id -u)"
+          for _ in $(seq 1 100); do [ -S "$runtime/systemd/private" ] && break; sleep 0.1; done
+          [ -S "$runtime/systemd/private" ]
+          echo "XDG_RUNTIME_DIR=$runtime" >> "$GITHUB_ENV"
+      - run: bash scripts/product/deployment.sh
