@@ -991,3 +991,76 @@ async fn an_attempt_records_its_bindings_revision_while_the_run_is_behind() -> R
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn the_binder_binds_a_session_per_role_and_epoch_or_blocks_an_unavailable_agent() -> R {
+    // docs/adr/ADR-022.md decision 9: the bindings waiting for a session are listed (a removed role is not); a grant
+    // writes the session (one per run, role and epoch) and binds it; an unavailable agent blocks the binding, and a
+    // later grant makes it active again.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    store
+        .submit_command(start("R1", Config::default().budget))
+        .await?;
+    store
+        .submit_command(team_change("drop", 0, json!({"researcher": null})))
+        .await?;
+    store.team_checkpoint("R1", Default::default()).await?;
+    let waiting = store.runner_waiting("p1").await?.unbound;
+    let roles: Vec<&str> = waiting.iter().map(|u| u.role.as_str()).collect();
+    assert_eq!(roles, ["commander", "cto", "developer", "qa", "reviewer"]);
+    let developer = waiting
+        .iter()
+        .find(|u| u.role == "developer")
+        .ok_or("no developer")?
+        .clone();
+    let grant = |epoch: i64| crate::persistence::SessionGrant {
+        run_id: "R1".to_owned(),
+        role: "developer".to_owned(),
+        role_epoch: epoch,
+        agent: "claude".to_owned(),
+        agent_version: "2.1.318 (Claude Code)".to_owned(),
+        capabilities: json!({"structured_events": true, "resume": true}),
+    };
+    assert!(
+        !store.bind_session(grant(2)).await?,
+        "another epoch is not granted"
+    );
+    assert!(
+        store
+            .block_binding(developer.clone(), "claude is not on PATH".to_owned())
+            .await?
+    );
+    assert_eq!(
+        binding(&path, "developer")?[4..6],
+        [json!("BLOCKED"), json!("AGENT_UNAVAILABLE")]
+    );
+    assert!(store.bind_session(grant(1)).await?);
+    let session = crate::persistence::session_id("R1", "developer", 1);
+    assert_eq!(
+        binding(&path, "developer")?[4..7],
+        [json!("ACTIVE"), Value::Null, json!(session)]
+    );
+    assert_eq!(
+        values(
+            &path,
+            &format!(
+                "SELECT agent, role, agent_version FROM sessions WHERE session_id = '{session}'"
+            )
+        )?,
+        vec![vec![
+            json!("claude"),
+            json!("developer"),
+            json!("2.1.318 (Claude Code)")
+        ]]
+    );
+    assert!(!store.bind_session(grant(1)).await?, "bound once");
+    assert_eq!(
+        rows::<i64>(
+            &path,
+            "SELECT count(*) FROM events WHERE kind IN ('team.session_bound', 'team.binding_blocked')"
+        )?,
+        vec![vec![2]]
+    );
+    Ok(())
+}

@@ -34,7 +34,7 @@ pub use results::{TaskResultOutcome, VERIFIERS};
 pub use retry::{Failure, Paced, Repair, RepairRequest, RepairVerdict};
 pub use rounds::{Dispatched, RoundOutcome};
 pub use runner::{DispatchNotice, Ending, Observed, RUNNER, Waiting};
-pub use team::{TeamChange, TeamConfig, TeamMember, TeamView};
+pub use team::{SessionGrant, TeamChange, TeamConfig, TeamMember, TeamView, Unbound, session_id};
 pub mod location;
 pub mod selftest;
 mod writer;
@@ -836,6 +836,22 @@ impl Store {
             unavailable,
         ))
         .await
+    }
+
+    /// Grant the session of a binding (docs/adr/ADR-022.md decision 9); whether the binding was still the one granted.
+    pub async fn bind_session(&self, grant: SessionGrant) -> Result<bool, PersistError> {
+        self.runner_step(runner::RunnerJob::BindSession(Box::new(grant)))
+            .await
+    }
+
+    /// Block a binding whose agent is unavailable (decision 9), saying why; whether it was still waiting.
+    pub async fn block_binding(
+        &self,
+        unbound: Unbound,
+        detail: String,
+    ) -> Result<bool, PersistError> {
+        self.runner_step(runner::RunnerJob::BlockBinding(Box::new(unbound), detail))
+            .await
     }
 
     /// A runtime notice taken (ACKED); false when it was not PENDING.
