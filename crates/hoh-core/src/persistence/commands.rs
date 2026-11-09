@@ -169,6 +169,10 @@ pub(super) fn submit(
                 if found.is_none() {
                     return Err(PersistError::RunNotFound(command.run_id.clone()));
                 }
+                // A run keeps its snapshot's scheduler (CR-007 S3): refused after the key was looked up (M2T07R-05).
+                if change.scheduler.is_some() {
+                    return Err(PersistError::RunConfigFrozen(command.run_id.clone()));
+                }
             }
             let made = super::team::configure(&tx, command, change)?;
             let revision = made.revision;

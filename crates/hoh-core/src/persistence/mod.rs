@@ -161,6 +161,9 @@ pub enum PersistError {
     },
     /// The run does not exist (`RUN_NOT_FOUND`); nothing was written.
     RunNotFound(String),
+    /// A scheduler change for a run that exists: a run keeps the parameters of its snapshot (`RUN_CONFIG_FROZEN`,
+    /// CR-007); nothing was written.
+    RunConfigFrozen(String),
     /// A team change the configuration's rules refuse (`INVALID_TEAM_CONFIG`, REQ-018): the key path, why, and the
     /// team revision that stays current; nothing was written.
     InvalidTeamConfig {
@@ -208,6 +211,7 @@ impl PersistError {
             PersistError::Full(_) => Some(ErrorCode::DbFull),
             PersistError::RunNotFound(_) => Some(ErrorCode::RunNotFound),
             PersistError::InvalidTeamConfig { .. } => Some(ErrorCode::InvalidTeamConfig),
+            PersistError::RunConfigFrozen(_) => Some(ErrorCode::RunConfigFrozen),
             PersistError::Plan(plan) => plan.code(),
             _ => None,
         }
@@ -295,6 +299,7 @@ impl std::fmt::Display for PersistError {
             PersistError::InvalidTeamConfig {
                 key_path, message, ..
             } => write!(f, "INVALID_TEAM_CONFIG: {key_path}: {message}"),
+            PersistError::RunConfigFrozen(id) => write!(f, "RUN_CONFIG_FROZEN: {id}"),
             PersistError::InvalidProposal(detail) => write!(f, "invalid proposal: {detail}"),
             PersistError::Unsupported(kind) => write!(f, "{kind} decisions are not applied yet"),
             PersistError::Busy(detail) => write!(f, "DB_BUSY: {detail}"),
@@ -821,9 +826,16 @@ impl Store {
 
     /// Run `run_id`'s team checkpoint: the roles the project's current revision changes and that have no live attempt
     /// take their new binding (docs/adr/ADR-022.md decision 8); whether anything changed.
-    pub async fn team_checkpoint(&self, run_id: &str) -> Result<bool, PersistError> {
-        self.runner_step(runner::RunnerJob::Checkpoint(run_id.to_owned()))
-            .await
+    pub async fn team_checkpoint(
+        &self,
+        run_id: &str,
+        unavailable: std::collections::BTreeSet<String>,
+    ) -> Result<bool, PersistError> {
+        self.runner_step(runner::RunnerJob::Checkpoint(
+            run_id.to_owned(),
+            unavailable,
+        ))
+        .await
     }
 
     /// A runtime notice taken (ACKED); false when it was not PENDING.

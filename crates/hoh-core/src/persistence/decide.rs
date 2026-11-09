@@ -565,16 +565,16 @@ pub(super) fn load_binding(
     run_id: &str,
     role: &str,
 ) -> Result<Option<BindingView>, PersistError> {
-    let row: Option<(i64, String, Option<String>)> = tx
+    let row: Option<(i64, String, Option<String>, Option<String>)> = tx
         .query_row(
-            "SELECT b.role_epoch, b.state, s.capabilities_json FROM role_bindings b \
+            "SELECT b.role_epoch, b.state, s.capabilities_json, b.session_id FROM role_bindings b \
              LEFT JOIN sessions s ON s.session_id = b.session_id WHERE b.run_id = ?1 AND b.role = ?2",
             params![run_id, role],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()
         .map_err(sqlite_error)?;
-    let Some((epoch, state, capabilities)) = row else {
+    let Some((epoch, state, capabilities, session)) = row else {
         return Ok(None);
     };
     // Probed capabilities are an object of booleans (REQ-024); anything else counts as none.
@@ -582,11 +582,12 @@ pub(super) fn load_binding(
         .and_then(|json| serde_json::from_str::<Value>(&json).ok())
         .map(|v| crate::decision::granted_capabilities(&v))
         .unwrap_or_default();
-    // A role whose change waits for its checkpoint is not dispatched (docs/adr/ADR-022.md decision 8).
+    // A role whose change waits for its checkpoint, or that has no session yet, is not dispatched, and its tasks are not
+    // judged by capabilities it does not have yet (docs/adr/ADR-022.md decision 8, M2T07R-50).
     let pending = super::team::pending(tx, run_id, role)?;
     Ok(Some(BindingView {
         role_epoch: revision(epoch)?,
-        active: state == "ACTIVE" && !pending,
+        active: state == "ACTIVE" && !pending && session.is_some(),
         capabilities,
     }))
 }

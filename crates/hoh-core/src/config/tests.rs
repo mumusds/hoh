@@ -57,6 +57,23 @@ fn test_018_01_no_config_and_the_example_give_the_same_effective_config() -> R {
     assert_eq!(a.budget.max_protocol_repairs, 2);
     assert_eq!(a.budget.max_usd, None, "no USD default");
     assert_eq!(a, Config::default());
+    // The scenario's observations (TEST-018-01): both effective configurations and the example's sha256 (M2T07R-56).
+    if let Some(dir) = std::env::var_os("HOH_EVIDENCE_DIR") {
+        let out = std::process::Command::new("sha256sum")
+            .arg(copied.path().join(FILE))
+            .output()?;
+        let sha = String::from_utf8(out.stdout)?
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        std::fs::write(
+            Path::new(&dir).join("test-018-01.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "no_config": a, "example": b, "example_sha256": sha,
+            }))?,
+        )?;
+    }
     Ok(())
 }
 
@@ -488,5 +505,71 @@ fn a_team_patch_is_checked_by_the_files_rules_with_key_paths_under_bindings() {
     assert!(
         optional.is_ok(),
         "cto and researcher are not required: {optional:?}"
+    );
+}
+
+#[test]
+fn a_prompt_override_must_be_a_readable_file_inside_the_project() -> R {
+    // M2T07R-53 (REQ-018 decision 5, ADR-022 decision 11): a prompt override names a readable regular file inside the
+    // project, or a built-in role contract; anything else is refused with its key path.
+    let dir = tempfile::tempdir()?;
+    std::fs::create_dir_all(dir.path().join(".hoh/prompts"))?;
+    let with_prompt = |prompt: &str| -> R {
+        std::fs::write(
+            dir.path().join(FILE),
+            format!(
+                "config_version = \"1.0\"\n[team.auditor]\nagent = \"pi\"\nprompt = \"{prompt}\"\n"
+            ),
+        )?;
+        Ok(())
+    };
+    for prompt in [
+        ".hoh/prompts/auditor.md",
+        "/etc/hostname",
+        "../outside.md",
+        ".hoh/prompts",
+    ] {
+        with_prompt(prompt)?;
+        let error = load(dir.path()).err().ok_or(format!("{prompt} accepted"))?;
+        assert_eq!(
+            error.key.as_deref(),
+            Some("team.auditor.prompt"),
+            "{prompt}: {error}"
+        );
+    }
+    std::fs::write(dir.path().join(".hoh/prompts/auditor.md"), "Audit.")?;
+    with_prompt(".hoh/prompts/auditor.md")?;
+    assert_eq!(
+        load(dir.path())?.team["auditor"].prompt.as_deref(),
+        Some(".hoh/prompts/auditor.md")
+    );
+    with_prompt("builtin:qa")?;
+    assert!(load(dir.path()).is_ok());
+    Ok(())
+}
+
+#[test]
+fn a_fallback_to_the_roles_own_agent_is_refused() {
+    // M2T07R-60: falling back to the agent the role already has is no fallback.
+    for (body, key) in [
+        (
+            "[team.qa]\nfallback = [\"claude\", \"pi\"]",
+            "team.qa.fallback[1]",
+        ),
+        (
+            "[team.qa]\nagent = \"codex\"\nfallback = [\"codex\"]",
+            "team.qa.fallback[0]",
+        ),
+    ] {
+        assert_eq!(refused(&with(body)).key.as_deref(), Some(key), "{body}");
+    }
+    let error = patch_team(
+        &Config::default().team,
+        &serde_json::json!({"qa": {"fallback": ["pi"]}}),
+    )
+    .err();
+    assert_eq!(
+        error.and_then(|e| e.key).as_deref(),
+        Some("bindings.qa.fallback[0]")
     );
 }

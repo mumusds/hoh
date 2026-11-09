@@ -135,6 +135,9 @@ pub(super) fn start_run(
 pub struct TeamChange {
     pub bindings: Option<serde_json::Value>,
     pub scheduler: Option<SchedulerSettings>,
+    /// The project's root, against which the prompt override files the bindings name are checked
+    /// (docs/adr/ADR-022.md decision 11); none: not checked.
+    pub root: Option<std::path::PathBuf>,
 }
 
 /// In the command's transaction: the team revision `command` makes over the current one (decisions 3 and 4): stale
@@ -165,6 +168,19 @@ pub(super) fn configure(
         })?,
         None => config.team,
     };
+    // The prompt files this change names, checked once its key and revision were (M2T07R-53).
+    if let (Some(root), Some(serde_json::Value::Object(roles))) = (&change.root, &change.bindings) {
+        for (name, keys) in roles {
+            if let Some(prompt) = keys.get("prompt").and_then(serde_json::Value::as_str) {
+                crate::config::check_prompt(root, &format!("bindings.{name}.prompt"), prompt)
+                    .map_err(|e| PersistError::InvalidTeamConfig {
+                        key_path: e.key.unwrap_or_default(),
+                        message: e.message,
+                        current_revision: current,
+                    })?;
+            }
+        }
+    }
     let mut scheduler = config.scheduler;
     if let Some(change) = &change.scheduler {
         if let Some(rounds) = change.max_wait_rounds {
@@ -269,15 +285,13 @@ struct Bound {
     model: Option<String>,
     role_epoch: i64,
     config_revision: i64,
-    state: String,
-    blocked_reason: Option<String>,
     session_id: Option<String>,
 }
 
 fn bound(conn: &Connection, run_id: &str, role: Option<&str>) -> Result<Vec<Bound>, PersistError> {
     let mut statement = conn
         .prepare(
-            "SELECT role, agent, model, role_epoch, config_revision, state, blocked_reason, session_id \
+            "SELECT role, agent, model, role_epoch, config_revision, session_id \
              FROM role_bindings WHERE run_id = ?1 AND (?2 IS NULL OR role = ?2)",
         )
         .map_err(sqlite_error)?;
@@ -289,9 +303,7 @@ fn bound(conn: &Connection, run_id: &str, role: Option<&str>) -> Result<Vec<Boun
                 model: r.get(2)?,
                 role_epoch: r.get(3)?,
                 config_revision: r.get(4)?,
-                state: r.get(5)?,
-                blocked_reason: r.get(6)?,
-                session_id: r.get(7)?,
+                session_id: r.get(5)?,
             })
         })
         .map_err(sqlite_error)?
@@ -299,29 +311,47 @@ fn bound(conn: &Connection, run_id: &str, role: Option<&str>) -> Result<Vec<Boun
         .map_err(sqlite_error)
 }
 
-/// Whether revision `wanted`'s team changes `binding` (decision 8): its role removed, added back, or bound otherwise
-/// than the revision the binding was made at (agent, model, fallback, prompt or session independence).
+/// A role as the revision its binding was made at configured it.
+enum Before {
+    Configured(Role),
+    /// That revision has no such role: it was removed at it.
+    Absent,
+    /// That revision is not recorded (a binding written by hand): only its agent and model are known.
+    Unrecorded,
+}
+
+fn before(conn: &Connection, project_id: &str, binding: &Bound) -> Result<Before, PersistError> {
+    Ok(
+        match at_revision(conn, project_id, binding.config_revision)? {
+            Some(config) => match config.team.get(&binding.role) {
+                Some(role) => Before::Configured(role.clone()),
+                None => Before::Absent,
+            },
+            None => Before::Unrecorded,
+        },
+    )
+}
+
+/// Whether revision `wanted`'s team changes `binding` (decision 8, second version): only the two configurations are
+/// compared, the role in the revision the binding was made at and in `wanted` (agent, model, fallback, prompt, session
+/// independence, and whether it is there at all); the binding's availability (BLOCKED_AUTH, AGENT_UNAVAILABLE) is
+/// never read as configuration (M2T07R-01, -51).
 fn changes(
     conn: &Connection,
     project_id: &str,
     binding: &Bound,
     wanted: &TeamConfig,
 ) -> Result<bool, PersistError> {
-    let removed = binding.state == "BLOCKED" && binding.blocked_reason.as_deref() == Some(REMOVED);
-    let Some(role) = wanted.team.get(&binding.role) else {
-        return Ok(!removed);
-    };
-    if binding.state != "ACTIVE" {
-        return Ok(true);
-    }
-    Ok(
-        match at_revision(conn, project_id, binding.config_revision)?
-            .and_then(|config| config.team.get(&binding.role).cloned())
-        {
-            Some(before) => &before != role,
-            None => binding.agent != role.agent.as_str() || binding.model != role.model,
-        },
-    )
+    let target = wanted.team.get(&binding.role);
+    Ok(match (before(conn, project_id, binding)?, target) {
+        (Before::Configured(was), Some(now)) => &was != now,
+        (Before::Configured(_), None) | (Before::Absent, Some(_)) => true,
+        (Before::Absent, None) => false,
+        (Before::Unrecorded, Some(now)) => {
+            binding.agent != now.agent.as_str() || binding.model != now.model
+        }
+        (Before::Unrecorded, None) => true,
+    })
 }
 
 /// Why a role a revision removed is BLOCKED (`$defs.BlockedReason`).
@@ -353,13 +383,17 @@ pub(super) fn pending(conn: &Connection, run_id: &str, role: &str) -> Result<boo
     changes(conn, &project_id, &binding, &wanted)
 }
 
-/// Run `run_id`'s checkpoint (decision 8), in one transaction: each role the project's current revision changes and
-/// that has no attempt PREPARED, STARTING or RUNNING takes its new binding at epoch+1 (no session yet; a removed role
-/// BLOCKED, a new role bound at epoch 1), with a team.binding_applied event; a role it does not change moves to the
-/// revision as it is; once every role is there, so is the run. Whether anything changed.
+/// Run `run_id`'s checkpoint (decision 8, second version), in one transaction. A role the project's current revision
+/// does not change moves to it as it is, live attempt or not. A changed role with an attempt PREPARED, STARTING or
+/// RUNNING waits; one with none takes its new binding at epoch+1 with no session yet (a removed role BLOCKED, a new role
+/// bound at epoch 1) and a team.binding_applied event, unless its new agent is among `unavailable` (the registry's,
+/// probed outside the writer): then the old binding and epoch stay and one team.binding_refused event is written for
+/// the role and revision (REQ-019 decision 2). Once every role is at the revision, so is the run. Whether anything
+/// changed.
 pub(super) fn checkpoint(
     conn: &mut Connection,
     run_id: &str,
+    unavailable: &std::collections::BTreeSet<String>,
     ctx: &super::writer::Ctx<'_>,
 ) -> Result<bool, PersistError> {
     let tx = super::writer::begin(conn, ctx)?;
@@ -407,12 +441,8 @@ pub(super) fn checkpoint(
         }
     };
     for binding in bindings.iter().filter(|b| b.config_revision < revision) {
-        if live.contains(&binding.role) {
-            behind = true;
-            continue;
-        }
-        changed = true;
         if !changes(&tx, &project_id, binding, &wanted)? {
+            changed = true;
             tx.execute(
                 "UPDATE role_bindings SET config_revision = ?3 WHERE run_id = ?1 AND role = ?2",
                 params![run_id, binding.role, revision],
@@ -420,6 +450,41 @@ pub(super) fn checkpoint(
             .map_err(sqlite_error)?;
             continue;
         }
+        if live.contains(&binding.role) {
+            behind = true;
+            continue;
+        }
+        if let Some(role) = wanted.team.get(&binding.role)
+            && unavailable.contains(role.agent.as_str())
+        {
+            behind = true;
+            let event_id =
+                crate::ids::child_id(run_id, &format!("team-refused/{}/{revision}", binding.role));
+            let written: Option<i64> = tx
+                .query_row(
+                    "SELECT 1 FROM events WHERE event_id = ?1",
+                    params![event_id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(sqlite_error)?;
+            if written.is_none() {
+                changed = true;
+                events.push(super::writer::NewEvent {
+                    project_id: project_id.clone(),
+                    event_id,
+                    run_id: Some(run_id.to_owned()),
+                    kind: "team.binding_refused".to_owned(),
+                    payload: serde_json::json!({
+                        "run_id": run_id, "role": binding.role, "config_revision": revision,
+                        "agent": role.agent.as_str(), "reason": "AGENT_UNAVAILABLE",
+                        "kept": {"agent": binding.agent, "model": binding.model, "role_epoch": binding.role_epoch},
+                    }),
+                });
+            }
+            continue;
+        }
+        changed = true;
         let epoch = binding.role_epoch + 1;
         let from = serde_json::json!({
             "agent": binding.agent, "model": binding.model, "role_epoch": binding.role_epoch,
@@ -511,6 +576,9 @@ pub struct TeamMember {
     /// What the project's current revision changes for this role, applied at its next checkpoint (decision 8):
     /// `{"agent", "model", "config_revision"}`, `agent` null when the role is removed.
     pub pending: Option<serde_json::Value>,
+    /// The role was removed from the team (its row stays, BLOCKED, so an old epoch stays fenced): not an availability
+    /// block.
+    pub removed: bool,
 }
 
 /// A run's team: the project's current team revision and the run's roles, in the role order.
@@ -574,26 +642,26 @@ pub(super) fn view(
                 state: r.get(6)?,
                 blocked_reason: r.get(7)?,
                 pending: None,
+                removed: false,
             })
         })
         .map_err(sqlite_error)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(sqlite_error)?;
     for member in &mut members {
-        if member.config_revision >= team_revision {
-            continue;
-        }
-        let wanted = config.team.get(&member.role);
         let binding = Bound {
             role: member.role.clone(),
             agent: member.agent.clone().unwrap_or_default(),
             model: member.model.clone(),
             role_epoch: member.role_epoch,
             config_revision: member.config_revision,
-            state: member.state.clone(),
-            blocked_reason: member.blocked_reason.clone(),
             session_id: member.session_id.clone(),
         };
+        member.removed = matches!(before(conn, project_id, &binding)?, Before::Absent);
+        if member.config_revision >= team_revision {
+            continue;
+        }
+        let wanted = config.team.get(&member.role);
         if changes(conn, project_id, &binding, &config)? {
             member.pending = Some(serde_json::json!({
                 "agent": wanted.map(|role| role.agent.as_str()),
@@ -613,6 +681,7 @@ pub(super) fn view(
                 session_id: None,
                 state: "UNBOUND".to_owned(),
                 blocked_reason: None,
+                removed: false,
                 pending: Some(serde_json::json!({
                     "agent": role.agent.as_str(),
                     "model": role.model,

@@ -199,7 +199,8 @@ pub struct TaskView {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BindingView {
     pub role_epoch: u64,
-    /// `role_bindings.state` is ACTIVE.
+    /// `role_bindings.state` is ACTIVE, a session is bound to it, and no team change waits for its checkpoint
+    /// (docs/adr/ADR-022.md decision 8): only then is the role dispatched.
     pub active: bool,
     /// The probed capabilities of the bound session (`sessions.capabilities_json` keys that are true).
     pub capabilities: BTreeSet<String>,
