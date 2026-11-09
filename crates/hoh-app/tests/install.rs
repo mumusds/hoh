@@ -6,13 +6,13 @@
 #![forbid(clippy::disallowed_methods)]
 #![forbid(unsafe_code)]
 
-use sha2::{Digest as _, Sha256};
+mod installed;
+
+use installed::{R, script, sha256, stage_bundle};
 use std::collections::BTreeMap;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-
-type R<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 /// `hoh <args>` with only `vars` in its environment, in `dir`.
 fn hoh(args: &[&str], vars: &[(&str, &Path)], dir: &Path) -> R<Output> {
@@ -168,48 +168,6 @@ fn tree(dir: &Path) -> R<BTreeMap<PathBuf, Entry>> {
     Ok(out)
 }
 
-/// Make the executable `path` from `sources` (files, concatenated) by `cat` in a process of its own, never through a
-/// file this process opens for writing: such a file is inherited by whatever child another test thread forks meanwhile,
-/// and executing it fails with ETXTBSY until that child has exec'd.
-fn executable(path: &Path, sources: &[&Path]) -> R {
-    let status = Command::new("sh")
-        .args([
-            "-c",
-            "out=$1; shift; cat \"$@\" > \"$out\" && chmod 755 \"$out\"",
-            "sh",
-        ])
-        .arg(path)
-        .args(sources)
-        .status()?;
-    if !status.success() {
-        return Err(format!("cannot make {}", path.display()).into());
-    }
-    Ok(())
-}
-
-/// A script at `path` with `body`, made by [`executable`] from a file that is never executed.
-fn script(path: &Path, body: &str) -> R {
-    let mut part = path.as_os_str().to_owned();
-    part.push(".part");
-    let part = PathBuf::from(part);
-    std::fs::write(&part, body)?;
-    executable(path, &[&part])?;
-    std::fs::remove_file(part)?;
-    Ok(())
-}
-
-fn sha256(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
-
-/// The repository's root.
-fn repository() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
 /// A home to install into and a bundle to install from, laid out as `scripts/product/bundle.sh` lays it out (this
 /// build's binary, the repository's install.sh), with a `sudo` that only records that it was called.
 struct Install {
@@ -250,24 +208,7 @@ impl Install {
     /// Stage a bundle at `name/hoh`, its binary this build's with `extra` bytes after it (still runnable; another
     /// version by its digest).
     fn bundle(&self, name: &str, extra: &[u8]) -> R<PathBuf> {
-        let at = self.root.path().join(name).join("hoh");
-        std::fs::create_dir_all(at.join("bin"))?;
-        std::fs::create_dir_all(at.join("resources"))?;
-        let tail = self.root.path().join(format!("{name}.tail"));
-        std::fs::write(&tail, extra)?;
-        executable(
-            &at.join("bin/hoh"),
-            &[Path::new(env!("CARGO_BIN_EXE_hoh")), &tail],
-        )?;
-        executable(
-            &at.join("install.sh"),
-            &[&repository().join("scripts/install.sh")],
-        )?;
-        for file in ["LICENSE", "THIRD_PARTY_NOTICES.md"] {
-            std::fs::copy(repository().join(file), at.join(file))?;
-        }
-        std::fs::write(at.join("resources/README.md"), "resources\n")?;
-        Ok(at)
+        stage_bundle(&self.root.path().join(name), extra)
     }
 
     /// `<bundle>/install.sh <args>` as this user, in a clean environment with no user manager to ask.
