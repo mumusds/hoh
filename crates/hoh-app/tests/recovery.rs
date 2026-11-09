@@ -1307,6 +1307,18 @@ impl hoh_app::host::Executor for StuckExecutor {
         {
             let _ = writeln!(file, "{}", work.attempt_id);
         }
+        // When, for the graces between the steps (M2T07R-254).
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.cancels.with_extension("at"))
+        {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default();
+            let _ = writeln!(file, "{now}");
+        }
     }
 }
 
@@ -1314,12 +1326,17 @@ impl StuckExecutor {
     /// Its agent's process at its gate.
     fn spawn(&self) -> Result<(std::process::Child, u32, hoh_app::host::Gate), String> {
         use std::os::unix::process::CommandExt as _;
+        // A member that lives on in its group and ignores SIGTERM too (M2T05R-152): only a SIGKILL to the whole group
+        // ends it. The leader outlives SIGTERM as well, writing down when each came (M2T07R-254).
+        let terms = self.cancels.with_extension("term");
         let mut child = Command::new("sh")
             .args([
                 "-c",
-                // A member that lives on in its group and ignores SIGTERM too (M2T05R-152): only a SIGKILL to the
-                // whole group ends it.
-                "trap '' TERM; read -r go; [ \"$go\" = go ] || exit 0; sleep 1000 & while :; do sleep 0.05; done",
+                &format!(
+                    "trap '' TERM; read -r go; [ \"$go\" = go ] || exit 0; sleep 1000 & \
+                     trap 'date +%s%N >> {}' TERM; while :; do sleep 0.05; done",
+                    terms.display()
+                ),
             ])
             .process_group(0)
             .stdin(std::process::Stdio::piped())
@@ -1405,7 +1422,8 @@ async fn test_041_02_an_expired_lease_is_granted_again_only_after_its_holder_is_
     let mut config = config(&project);
     config.store.faults = grant_probe.clone();
     config.clock = hoh_app::host::HostClock(clock.clone());
-    config.reconcile.native_grace = Duration::from_millis(300);
+    // The native cancel's grace is the configured one, not SIGTERM's (M2T07R-254).
+    config.reconcile.native_grace = Duration::from_millis(1500);
     config.reconcile.term_grace = Duration::from_millis(300);
     config.reconcile.kill_grace = Duration::from_secs(5);
     let developer = ["structured_events", "command_exec"].map(str::to_owned);
@@ -1509,6 +1527,20 @@ print(json.dumps({{"steps": steps, "grant": list(grant), "disposed": disposed,
     assert_eq!(
         std::fs::read_to_string(dir.path().join("cancels"))?.trim(),
         a1
+    );
+    // SIGTERM came no sooner than the native cancel's grace after it.
+    let first = |file: &str| -> R<u128> {
+        Ok(std::fs::read_to_string(dir.path().join(file))?
+            .lines()
+            .next()
+            .ok_or(format!("nothing in {file}"))?
+            .trim()
+            .parse()?)
+    };
+    let gap = first("cancels.term")?.saturating_sub(first("cancels.at")?);
+    assert!(
+        gap >= 1_400_000_000,
+        "SIGTERM {gap} ns after the native cancel"
     );
     assert_eq!(read["disposed"][0]["cause"], json!("lease_expired"));
     // A1's late result: refused, the task's revision unchanged, one history event.
