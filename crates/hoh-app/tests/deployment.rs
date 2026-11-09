@@ -247,9 +247,7 @@ fn test_005_06_the_release_bundle_installs_runs_a_detached_run_and_uninstalls_wi
         manager
             .home()
             .join(format!(".config/systemd/user/default.target.wants/{unit}")),
-        manager
-            .state()
-            .join(format!("hoh/hosts/{}.env", instance(&project))),
+        hoh_app::unit::instance_file(&manager.data().join("hoh"), &instance(&project)),
     ] {
         assert!(
             !gone.exists() && !gone.is_symlink(),

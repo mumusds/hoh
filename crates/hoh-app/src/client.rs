@@ -420,13 +420,20 @@ pub fn unit_for(project: &Path, env: &hoh_agents::probe::ProbeEnv) -> Result<Uni
         .ok_or_else(|| "systemctl is not on PATH".to_owned())?;
     let command = installed_command().ok_or_else(|| "HOME is not set".to_owned())?;
     let this = std::env::current_exe().and_then(std::fs::canonicalize);
-    if this.is_err() || this.ok() != std::fs::canonicalize(&command).ok() {
+    if this.is_err() || this.as_ref().ok() != std::fs::canonicalize(&command).ok().as_ref() {
         return Err(format!(
             "this is not the installed hoh ({}), so its unit would run another",
             command.display()
         ));
     }
-    let name = hoh_app::unit::unit_name(&hoh_app::unit::instance(project));
+    // The instance's file is the installation's, found from where this binary is (ADR-023 design correction 1).
+    let root = this
+        .ok()
+        .and_then(|exe| hoh_app::unit::installation_root(&exe))
+        .ok_or_else(|| format!("{} is not in an installation's version", command.display()))?;
+    let instance = hoh_app::unit::instance(project);
+    let file = hoh_app::unit::instance_file(&root, &instance);
+    let name = hoh_app::unit::unit_name(&instance);
     let bounded = hoh_agents::probe::ProbeEnv {
         timeout: env.timeout.min(SCOPE_PROBE_LIMIT),
         ..env.clone()
@@ -443,7 +450,9 @@ pub fn unit_for(project: &Path, env: &hoh_agents::probe::ProbeEnv) -> Result<Uni
         &bounded,
     )
     .map_err(|e| format!("systemctl --user show {name}: {e}"))?;
-    let shown = hoh_app::unit::show(&String::from_utf8_lossy(&shown.stdout));
+    let text = String::from_utf8_lossy(&shown.stdout).into_owned();
+    let listed = hoh_app::unit::lists_environment_file(&text, &file);
+    let shown = hoh_app::unit::show(&text);
     let get = |key: &str| shown.get(key).map(String::as_str).unwrap_or_default();
     if get("LoadState") != "loaded" {
         return Err(format!(
@@ -457,8 +466,14 @@ pub fn unit_for(project: &Path, env: &hoh_agents::probe::ProbeEnv) -> Result<Uni
             command.display()
         ));
     }
-    let file = hoh_app::unit::environment_file(get("EnvironmentFiles"))
-        .ok_or_else(|| format!("{name} names no environment file of its own"))?;
+    // Only the installation's own file is ever written; a drop-in may add others (read too) or replace it (then the
+    // unit is not used, M2T14R-02).
+    if !listed {
+        return Err(format!(
+            "{name} does not read {} (a drop-in replaced its EnvironmentFile=?)",
+            file.display()
+        ));
+    }
     let text = hoh_app::unit::environment(project, &env.path).map_err(|e| e.to_string())?;
     Ok(Unit {
         systemctl,
@@ -575,6 +590,18 @@ fn supervised(
     let refused = match started {
         Ok(out) if out.status.success() => None,
         Ok(out) => Some(String::from_utf8_lossy(&out.stderr).trim().to_owned()),
+        // Not refused: the start job runs on in the manager, which may first be stopping what the previous host left
+        // (up to TimeoutStopSec, 15 s) after a crash; the host comes up when it is done (M2T14R-52).
+        Err(hoh_agents::probe::ProbeError::TimedOut { .. }) => {
+            return Err(Failure::unreachable(format!(
+                "{} did not finish starting within {} s (after a crash systemd first stops what the previous host \
+                 left, up to 15 s); the start goes on in the user's systemd manager: run hoh again shortly, or see \
+                 systemctl --user status {}",
+                unit.name,
+                WAIT.as_secs(),
+                unit.name
+            )));
+        }
         Err(e) => Some(e.to_string()),
     };
     if let Some(said) = refused {

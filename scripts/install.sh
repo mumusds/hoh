@@ -8,11 +8,13 @@
 #       that project (the user must linger, else the host would stop with the last session); --linger asks logind for
 #       it. Nothing is enabled without --project.
 #   install.sh --uninstall
-#       Stop and disable every hoh-host@ instance, remove the template, the instances' files, ~/.local/bin/hoh and
-#       $XDG_DATA_HOME/hoh. Projects' .hoh/, drop-ins, ~/.config/hoh and lingering are left as they are.
+#       Stop and disable every hoh-host@ instance; once none runs and no process runs this installation's binaries,
+#       remove the template, ~/.local/bin/hoh and what it wrote in $XDG_DATA_HOME/hoh (versions, current, the
+#       instances' files). Projects' .hoh/, drop-ins, ~/.config/hoh and lingering are left as they are.
 #
 # Exit codes: 0 done; 1 ~/.local/bin/hoh is not this installation's; 64 usage; 69 the user's systemd manager cannot do
-# what was asked; 77 run as root; 78 a home or project systemd cannot use.
+# what was asked, or something still runs this installation (nothing removed); 77 run as root; 78 a home or project
+# systemd cannot use.
 set -Eeuo pipefail
 
 say() { printf 'install.sh: %s\n' "$*" >&2; }
@@ -57,7 +59,6 @@ main() {
   fi
   [[ "${HOME:-}" == /* ]] || fail 78 "HOME is not an absolute path"
   data="$(xdg "${XDG_DATA_HOME:-}" "$HOME/.local/share")"
-  state="$(xdg "${XDG_STATE_HOME:-}" "$HOME/.local/state")"
   config="$(xdg "${XDG_CONFIG_HOME:-}" "$HOME/.config")"
   runtime="${XDG_RUNTIME_DIR:-}"
   root="$data/hoh"
@@ -152,18 +153,15 @@ install() {
 }
 
 remove() {
-  local hosts="$state/hoh/hosts" shown file
-  if [[ ! -e "$root" && ! -e "$template" && ! -e "$hosts" ]] && ! ours; then
+  local hosts="$root/hosts" file unit active failed=0
+  if [[ ! -e "$root" && ! -e "$template" ]] && ! ours; then
     printf 'not installed\n'
     return 0
   fi
+  # Only what this installer wrote is removed, all of it under its own root or at its fixed places; never a path
+  # taken from the manager's configuration (docs/adr/ADR-023.md design correction 1, M2T14R-01).
   if manager; then
-    # Where the manager reads the instances' files (decision 2), while it still knows the template.
-    shown="$(systemctl --user show -p EnvironmentFiles hoh-host@x.service 2>/dev/null || true)"
-    file="$(sed -n 's/^EnvironmentFiles=\(\/.*\) (ignore_errors=no)$/\1/p' <<<"$shown")"
-    [[ -z "$file" ]] || hosts="$(dirname -- "$file")"
     local -A instances=()
-    local unit
     for file in "$hosts"/*.env "$config/systemd/user/"*.wants/hoh-host@*.service; do
       [[ -e "$file" || -L "$file" ]] || continue
       unit="$(basename -- "$file")"
@@ -175,27 +173,43 @@ remove() {
       [[ "$unit" != hoh-host@*.service ]] || instances["$unit"]=1
     done < <(systemctl --user list-units --all --plain --no-legend 'hoh-host@*.service' 2>/dev/null || true)
     for unit in "${!instances[@]}"; do
-      systemctl --user disable --now --quiet "$unit" || say "could not stop and disable $unit"
-      printf 'stopped and disabled %s\n' "$unit"
+      active=""
+      if systemctl --user disable --now --quiet "$unit"; then
+        active="$(systemctl --user show -p ActiveState --value "$unit" 2>/dev/null || true)"
+      fi
+      if [[ "$active" == inactive || "$active" == failed ]]; then
+        printf 'stopped and disabled %s\n' "$unit"
+      else
+        say "could not stop and disable $unit (ActiveState=${active:-unknown})"
+        failed=1
+      fi
     done
     systemctl --user reset-failed 'hoh-host@*.service' 2>/dev/null || true
   fi
-  rm -f -- "$template"
-  if manager; then systemctl --user daemon-reload || say "systemctl --user daemon-reload failed"; fi
-  rm -rf -- "$hosts"
-  rmdir -- "$(dirname -- "$hosts")" 2>/dev/null || true
-  [[ -z "$runtime" ]] || rm -f -- "$runtime"/hoh-host@*.stderr
-  if ours; then rm -f -- "$bin_link"; fi
-  rm -rf -- "$root"
-  printf 'removed %s, %s and %s\n' "$root" "$template" "$bin_link"
-  # A host not started by its unit is not stopped here; it is named so its user can.
-  local proc args
+  # Nothing is removed while a process still runs this installation's binaries: a host its unit did not run, an
+  # agent's start gate, an instance that did not stop (M2T14R-03).
+  local real proc exe running=0
+  real="$(readlink -f -- "$root" 2>/dev/null || printf '%s' "$root")"
   for proc in /proc/[0-9]*; do
-    args="$(tr '\0' ' ' <"$proc/cmdline" 2>/dev/null || true)"
-    if [[ "$args" == *"/hoh __host "* && "$(stat -c %u "$proc" 2>/dev/null)" == "$(id -u)" ]]; then
-      say "note: a host not run by its unit is still running (pid ${proc#/proc/}): $args"
+    exe="$(readlink -- "$proc/exe" 2>/dev/null || true)"
+    if [[ "$exe" == "$real"/* || "$exe" == "$root"/* ]]; then
+      say "still running from $root: pid ${proc#/proc/}: $(tr '\0' ' ' <"$proc/cmdline" 2>/dev/null || true)"
+      running=1
     fi
   done
+  if ((failed || running)); then
+    fail 69 "nothing was removed: stop what is named above, then run install.sh --uninstall again"
+  fi
+  rm -f -- "$template"
+  if manager; then systemctl --user daemon-reload || say "systemctl --user daemon-reload failed"; fi
+  [[ -z "$runtime" ]] || rm -f -- "$runtime"/hoh-host@*.stderr
+  if ours; then rm -f -- "$bin_link"; fi
+  rm -rf -- "$hosts" "$root/versions"
+  rm -f -- "$root/current" "$root"/current.tmp.*
+  if [[ -e "$root" ]] && ! rmdir -- "$root" 2>/dev/null; then
+    say "kept $root: it holds files this installer did not write"
+  fi
+  printf 'removed %s, %s and %s\n' "$root" "$template" "$bin_link"
 }
 
 main "$@"

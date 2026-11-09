@@ -40,11 +40,28 @@ fn print(text: &str) -> u8 {
     }
 }
 
+/// The root of the installation this binary is in (ADR-023 design correction 1), or why it is not an installed hoh.
+fn root() -> Result<PathBuf, String> {
+    let exe = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .map_err(|e| format!("cannot find this program: {e}"))?;
+    unit::installation_root(&exe).ok_or_else(|| {
+        format!(
+            "{} is not an installed hoh (<root>/versions/<version>/bin/hoh)",
+            exe.display()
+        )
+    })
+}
+
 fn template() -> u8 {
     let Some(home) = std::env::var_os("HOME") else {
         return fail(ClientEvent::Config, "HOME is not set");
     };
-    match unit::template(Path::new(&home)) {
+    let root = match root() {
+        Ok(root) => root,
+        Err(why) => return fail(ClientEvent::Config, why),
+    };
+    match unit::template(Path::new(&home), &root) {
         Ok(text) => print(&text),
         Err(why) => fail(ClientEvent::Config, why),
     }
@@ -101,13 +118,21 @@ fn enable(given: &Path) -> u8 {
         return fail(ClientEvent::HostUnavailable, "systemctl is not on PATH");
     };
     let name = unit::unit_name(&unit::instance(&project));
-    // Where the manager reads the instance's environment file (`%S` is its own XDG_STATE_HOME, not necessarily ours).
-    let shown = match systemctl(
+    // The instance's file is this installation's (design correction 1): the manager must read it; HoH writes no other.
+    let root = match root() {
+        Ok(root) => root,
+        Err(why) => return fail(ClientEvent::Config, why),
+    };
+    let file = unit::instance_file(&root, &unit::instance(&project));
+    let (shown, listed) = match systemctl(
         &systemctl_program,
         &["show", "-p", "LoadState,EnvironmentFiles", &name],
         &path,
     ) {
-        Ok(shown) => unit::show(&shown),
+        Ok(text) => (
+            unit::show(&text),
+            unit::lists_environment_file(&text, &file),
+        ),
         Err(why) => return fail(ClientEvent::HostUnavailable, why),
     };
     let load = shown.get("LoadState").map(String::as_str).unwrap_or("");
@@ -121,15 +146,15 @@ fn enable(given: &Path) -> u8 {
             ),
         );
     }
-    let Some(file) = shown
-        .get("EnvironmentFiles")
-        .and_then(|value| unit::environment_file(value))
-    else {
+    if !listed {
         return fail(
             ClientEvent::HostUnavailable,
-            format!("{name} names no environment file of its own (a drop-in changed it?)"),
+            format!(
+                "{name} does not read {} (a drop-in replaced its EnvironmentFile=?): nothing written",
+                file.display()
+            ),
         );
-    };
+    }
     let text = match unit::environment(&project, &path) {
         Ok(text) => text,
         Err(why) => return fail(ClientEvent::Config, why),

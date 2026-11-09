@@ -3684,29 +3684,51 @@ fn test_005_04_a_host_killed_under_its_unit_is_restarted_by_systemd_and_reconcil
             rustix::process::Pid::from_raw(old_pid).ok_or("pid")?,
             rustix::process::Signal::KILL,
         )?;
-        // systemd restarts it (not a client: its start would come before the restart).
+        // systemd restarts it (not a client: its start would come before the restart). The first write command goes
+        // to the restarted host as soon as it lets any client in (M2T14R-57): its listeners open only after its
+        // reconcile (host/mod.rs), and this records that order as a client sees it.
         let end = Instant::now() + Duration::from_secs(60);
-        let (new_pid, info) = loop {
-            let now = manager.show(&unit, "MainPID,NRestarts,ActiveState")?;
-            let pid: i32 = now.get("MainPID").and_then(|p| p.parse().ok()).unwrap_or(0);
+        let (info, accepted) = loop {
             let info = std::fs::read_to_string(project.join(".hoh/host.json"))
                 .ok()
-                .and_then(|t| serde_json::from_str::<Value>(&t).ok());
-            if pid != 0
-                && pid != old_pid
-                && now.get("ActiveState").map(String::as_str) == Some("active")
-                && let Some(info) = info.filter(|i| i["pid"].as_i64() == Some(i64::from(pid)))
-                && http(&info, "GET", "/healthz", None).is_ok_and(|(s, _)| s == 200)
-            {
-                break (pid, info);
+                .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+                .filter(|i| i["pid"].as_i64().is_some_and(|p| p != i64::from(old_pid)));
+            if let Some(info) = info {
+                let revision = query(
+                    &db(&project),
+                    &format!("SELECT revision FROM runs WHERE run_id = '{run_id}'"),
+                )?;
+                let cancel = json!({
+                    "schema_version": "1.0", "command_id": "c-cancel-after-restart",
+                    "idempotency_key": "cancel-after-restart", "expected_revision": revision.parse::<i64>()?,
+                    "kind": "CancelRun", "run_id": run_id, "payload": {"reason": "TEST-005-04"},
+                });
+                if let Ok((202, accepted)) =
+                    http(&info, "POST", "/v1/commands", Some(&cancel.to_string()))
+                {
+                    break (info, accepted);
+                }
             }
             if Instant::now() > end {
-                return Err(format!("not restarted: {now:?}\n{}", manager.log()).into());
+                return Err(format!("no write accepted after the kill\n{}", manager.log()).into());
             }
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(10));
         };
+        seen.insert("cancel".into(), json!(accepted));
+        let new_pid = i32::try_from(info["pid"].as_i64().ok_or("pid")?)?;
+        // That host is the unit's, restarted by systemd.
         let after = manager.show(&unit, "MainPID,NRestarts,ActiveState,ExecMainStatus")?;
-        // `hoh attach R`, then the first write command after the restart.
+        assert_eq!(
+            after.get("MainPID").map(String::as_str),
+            Some(new_pid.to_string().as_str()),
+            "{after:?}"
+        );
+        assert_eq!(
+            after.get("ActiveState").map(String::as_str),
+            Some("active"),
+            "{after:?}"
+        );
+        // `hoh attach R`.
         let out = hoh(&["attach", &run_id, "--output", "json"])?;
         seen.insert("attach".into(), json!({"exit": out.status.code(),
             "stdout": String::from_utf8_lossy(&out.stdout), "stderr": String::from_utf8_lossy(&out.stderr)}));
@@ -3716,17 +3738,6 @@ fn test_005_04_a_host_killed_under_its_unit_is_restarted_by_systemd_and_reconcil
             "{}",
             String::from_utf8_lossy(&out.stderr)
         );
-        let revision = query(
-            &db(&project),
-            &format!("SELECT revision FROM runs WHERE run_id = '{run_id}'"),
-        )?;
-        let cancel = json!({
-            "schema_version": "1.0", "command_id": "c-cancel-after-restart", "idempotency_key": "cancel-after-restart",
-            "expected_revision": revision.parse::<i64>()?, "kind": "CancelRun", "run_id": run_id,
-            "payload": {"reason": "TEST-005-04"},
-        });
-        let (status, accepted) = http(&info, "POST", "/v1/commands", Some(&cancel.to_string()))?;
-        assert_eq!(status, 202, "{accepted}");
         let db_after = export(&project)?;
         seen.insert(
             "after".into(),
