@@ -658,3 +658,28 @@ fn an_enabled_instance_with_no_user_manager_to_disable_it_keeps_the_uninstall_fr
     assert_eq!(tree(&install.home())?, before);
     Ok(())
 }
+
+#[test]
+fn the_uninstall_keeps_a_command_that_is_no_longer_its_link_and_says_so() -> R {
+    // M2T14R-150: a ~/.local/bin/hoh the user replaced after the install is not removed, nor said to be.
+    let install = Install::new()?;
+    let out = install.run("bundle", &[])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let link = install.home().join(".local/bin/hoh");
+    std::fs::remove_file(&link)?;
+    std::fs::write(&link, "#!/bin/sh\necho mine\n")?;
+    let out = install.run("bundle", &["--uninstall"])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(std::fs::read_to_string(&link)?, "#!/bin/sh\necho mine\n");
+    assert!(
+        !String::from_utf8(out.stdout.clone())?.contains(&format!("removed {}", link.display())),
+        "{}",
+        text(&out)
+    );
+    assert!(
+        String::from_utf8(out.stderr.clone())?.contains(&format!("kept {}", link.display())),
+        "{}",
+        text(&out)
+    );
+    Ok(())
+}
