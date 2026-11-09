@@ -140,7 +140,10 @@ impl hoh_app::host::Executor for Scripted {
         ack
     }
 
-    fn start(&self, work: &hoh_app::host::Work) -> Result<hoh_app::host::Started, String> {
+    fn start(
+        &self,
+        work: &hoh_app::host::Work,
+    ) -> Result<hoh_app::host::Started, hoh_app::host::Refusal> {
         use std::os::unix::process::CommandExt as _;
         let failure = self.script.get(&work.task_id).copied().flatten();
         let code = if failure.is_some() { "3" } else { "0" };

@@ -13,11 +13,12 @@ mod cgroup;
 mod control;
 mod http;
 mod processes;
+pub mod product;
 mod reconcile;
 mod runner;
 pub use processes::ATTEMPT_ENV;
 pub use reconcile::ReconcileSettings;
-pub use runner::{Executor, Gate, Outcome, RunnerConfig, RunnerPoint, Started, Work};
+pub use runner::{Executor, Gate, Outcome, Refusal, RunnerConfig, RunnerPoint, Started, Work};
 
 /// Set by the client on a host it starts directly, not in a delegated scope: why (docs/adr/ADR-021.md decision 2). The
 /// host records it in host.json, so `hoh doctor` reports a running host's actual reason (CR-012, CR12-03).
@@ -59,7 +60,8 @@ pub struct HostConfig {
     /// The seed of the retries' jitter (REQ-042, ADR-020 decision 2): `None` in the product, drawn from the system at
     /// the start; tests fix it so their delays replay.
     pub jitter_seed: Option<u64>,
-    /// The effective configuration (docs/adr/ADR-022.md decision 1): what new runs get as their budget.
+    /// The effective configuration at the start (docs/adr/ADR-022.md decisions 1 and 6): its process settings are
+    /// this host's ([`HostConfig::product`]); a new run reads the file again for its team, budget and scheduler.
     pub config: hoh_core::config::Config,
 }
 
@@ -94,6 +96,42 @@ impl HostConfig {
             jitter_seed: None,
             config: hoh_core::config::Config::default(),
         }
+    }
+
+    /// The product's host for `project` with its effective configuration `config` (docs/adr/ADR-022.md decision 17):
+    /// its runner runs the roles' agents with the product executor, found on `path` and started through the gate
+    /// `gate` (`hoh` itself); the configuration's process settings apply (the writer queue, the cancel graces, the
+    /// reader slots, the port).
+    pub fn product(
+        project: &Path,
+        config: hoh_core::config::Config,
+        gate: std::path::PathBuf,
+        path: std::ffi::OsString,
+    ) -> HostConfig {
+        let mut host = HostConfig::new(project);
+        let execution = &config.execution;
+        let graces = (
+            std::time::Duration::from_secs(u64::from(execution.cancel_native_grace_seconds)),
+            std::time::Duration::from_secs(u64::from(execution.cancel_term_grace_seconds)),
+        );
+        host.port = config.web.port;
+        host.store.queue =
+            usize::try_from(config.persistence.writer_queue_capacity).unwrap_or(WRITER_QUEUE);
+        host.reconcile.term_grace = graces.1;
+        host.runner = Some(RunnerConfig {
+            executor: Arc::new(product::ProductExecutor::new(
+                Arc::new(agents::Registry::new(path)),
+                project.to_path_buf(),
+                gate,
+                graces,
+            )),
+            context: hoh_core::decision::Context {
+                reader_slots: Some(execution.reader_slots),
+                ..hoh_core::decision::Context::default()
+            },
+        });
+        host.config = config;
+        host
     }
 }
 
@@ -346,9 +384,16 @@ impl Host {
             subscribers: std::sync::atomic::AtomicUsize::new(0),
             opened: std::sync::atomic::AtomicUsize::new(0),
             cgroups: delegated.as_ref().ok().cloned(),
-            budget: config.config.budget.clone(),
             root: config.project.clone(),
         });
+        // The project's configuration file as a team revision, once at the start (docs/adr/ADR-022.md decision 6).
+        if let Err(e) = http::sync_config(&shared).await {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "hoh host: the project's configuration is invalid, its team is not used: {e}"
+            );
+        }
         let mut served = vec![
             tokio::spawn(http::serve(
                 http::Listener::Tcp(tcp),

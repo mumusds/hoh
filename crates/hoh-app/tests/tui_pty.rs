@@ -536,7 +536,10 @@ impl hoh_app::host::Executor for Sixty {
         ack
     }
 
-    fn start(&self, work: &hoh_app::host::Work) -> Result<hoh_app::host::Started, String> {
+    fn start(
+        &self,
+        work: &hoh_app::host::Work,
+    ) -> Result<hoh_app::host::Started, hoh_app::host::Refusal> {
         use std::os::unix::process::CommandExt as _;
         let mut child = std::process::Command::new("sh")
             .args(["-c", "read -r go; [ \"$go\" = go ] || exit 0; sleep 60"])

@@ -9,7 +9,8 @@ requests go out as soon as everything before them has. When every frame is out t
 (or exits at once with --exit-when-done, a stream cut short). A frame {"hoh_sleep": SECONDS} is not sent: the fake
 pauses there; {"hoh_wait": {"method": M, "count": N}} is not sent either: the fake waits there until the client
 has sent N requests of method M; {"hoh_close_stdin": true} closes the fake's stdin (it sends what follows, then
-exits); {"hoh_batch": [FRAME, ...]} sends those frames in one write. In LOGDIR it keeps received.jsonl (every client line),
+exits); {"hoh_batch": [FRAME, ...]} sends those frames in one write; {"hoh_raw": {"byte": B, "count": N}} writes N
+bytes B with no LF (a line that never ends, AC-027-03). In LOGDIR it keeps received.jsonl (every client line),
 sent.jsonl (the exact bytes sent) and trace.jsonl (both directions in order).
 """
 import json
@@ -75,6 +76,16 @@ def main() -> int:
                 if received_methods.count(want['method']) < want['count']:
                     return
                 frames.pop(0)
+                continue
+            if 'hoh_raw' in frame:  # not a frame: bytes with no LF, written in 64 KiB pieces
+                raw = frame['hoh_raw']
+                frames.pop(0)
+                left = int(raw['count'])
+                while left > 0:
+                    piece = min(left, 1 << 16)
+                    out.write(raw['byte'].encode() * piece)
+                    out.flush()
+                    left -= piece
                 continue
             if 'hoh_batch' in frame:  # these frames in one write; its responses must be answerable now
                 batch = frame['hoh_batch']

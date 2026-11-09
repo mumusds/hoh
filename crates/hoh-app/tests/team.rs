@@ -7,6 +7,7 @@
 use hoh_app::host::{Host, HostConfig};
 use hoh_core::persistence::selftest::{PROBE_ARG, ProbeCommand};
 use serde_json::{Value, json};
+use sha2::Sha256;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -579,8 +580,11 @@ impl hoh_app::host::Executor for Idle {
         tokio::sync::oneshot::channel().1
     }
 
-    fn start(&self, _work: &hoh_app::host::Work) -> Result<hoh_app::host::Started, String> {
-        Err("no work is expected".to_owned())
+    fn start(
+        &self,
+        _work: &hoh_app::host::Work,
+    ) -> Result<hoh_app::host::Started, hoh_app::host::Refusal> {
+        Err("no work is expected".to_owned().into())
     }
 }
 
@@ -965,8 +969,11 @@ impl hoh_app::host::Executor for Registered {
         tokio::sync::oneshot::channel().1
     }
 
-    fn start(&self, _work: &hoh_app::host::Work) -> Result<hoh_app::host::Started, String> {
-        Err("no work is expected".to_owned())
+    fn start(
+        &self,
+        _work: &hoh_app::host::Work,
+    ) -> Result<hoh_app::host::Started, hoh_app::host::Refusal> {
+        Err("no work is expected".to_owned().into())
     }
 }
 
@@ -1041,6 +1048,167 @@ async fn the_runner_binds_each_role_to_a_session_of_its_available_agent_or_block
         )?,
         "AGENT_UNAVAILABLE"
     );
+    host.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_configuration_file_becomes_a_team_revision_at_the_hosts_start_and_at_each_start_run() -> R
+{
+    // ADR-022 decision 6 (REQ-018 behaviour 4): the file is read at the host's start and at each StartRun; when it
+    // differs from the latest revision made from it (by its sha256), its whole team becomes the next revision, with the
+    // file as its source; unchanged, nothing is written, and a change made through the API since stands; a new run's
+    // budget is the file's; without a file, the built-in defaults.
+    let dir = tempfile::tempdir()?;
+    std::fs::create_dir_all(dir.path().join(".hoh"))?;
+    let file = dir.path().join(".hoh/config.toml");
+    std::fs::write(
+        &file,
+        "config_version = \"1.0\"\n[team.developer]\nagent = \"claude\"\nmodel = \"m-file\"\n\
+         [team.auditor]\nagent = \"pi\"\nprompt = \"builtin:qa\"\n",
+    )?;
+    let host = start_when_free(config(dir.path())).await?;
+    let source = |revision: i64| {
+        query(
+            dir.path(),
+            &format!(
+                "SELECT json_extract(config_json, '$.source.kind') || '/' || \
+                 coalesce(json_extract(config_json, '$.source.sha256'), '') FROM team_revisions WHERE revision = {revision}"
+            ),
+        )
+    };
+    let sha = |text: &str| {
+        let digest = <Sha256 as sha2::Digest>::digest(text.as_bytes());
+        digest
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
+    let first = std::fs::read_to_string(&file)?;
+    assert_eq!(source(1)?, format!("file/{}", sha(&first)));
+    let run = started(&host, "s1").await?;
+    assert_eq!(
+        query(
+            dir.path(),
+            &format!("SELECT agent FROM role_bindings WHERE run_id = '{run}' AND role = 'auditor'")
+        )?,
+        "pi"
+    );
+    let model = |run: &str| {
+        query(
+            dir.path(),
+            &format!(
+                "SELECT model FROM role_bindings WHERE run_id = '{run}' AND role = 'developer'"
+            ),
+        )
+    };
+    assert_eq!(model(&run)?, "m-file");
+    assert_eq!(
+        query(dir.path(), "SELECT max(revision) FROM team_revisions")?,
+        "1"
+    );
+    // A change through the API stands while the file is unchanged.
+    let (status, body) = exchange(
+        &host,
+        "POST",
+        "/v1/commands",
+        Some(&configure(
+            "api",
+            None,
+            1,
+            json!({"bindings": {"developer": {"model": "m-api"}}, "apply_at": "checkpoint"}),
+        )),
+    )
+    .await?;
+    assert_eq!(status, 202, "{body}");
+    let run = started(&host, "s2").await?;
+    assert_eq!(model(&run)?, "m-api");
+    // The file changes: the next StartRun makes it the next revision.
+    std::fs::write(
+        &file,
+        "config_version = \"1.0\"\n[team.developer]\nagent = \"claude\"\nmodel = \"m-2\"\n[budget]\nmax_iterations = 7\n",
+    )?;
+    let run = started(&host, "s3").await?;
+    assert_eq!(model(&run)?, "m-2");
+    // The file's team replaces the team: the auditor it no longer has is not bound.
+    assert_eq!(
+        query(
+            dir.path(),
+            &format!(
+                "SELECT count(*) FROM role_bindings WHERE run_id = '{run}' AND role = 'auditor'"
+            )
+        )?,
+        "0"
+    );
+    // A new run's budget is the file's at its start too.
+    assert_eq!(
+        query(
+            dir.path(),
+            &format!(
+                "SELECT CAST(limit_value AS INTEGER) FROM budgets WHERE scope_id = '{run}' AND kind = 'iterations'"
+            )
+        )?,
+        "7"
+    );
+    assert_eq!(
+        source(3)?,
+        format!("file/{}", sha(&std::fs::read_to_string(&file)?))
+    );
+    // Removed: the built-in defaults.
+    std::fs::remove_file(&file)?;
+    let run = started(&host, "s4").await?;
+    assert_eq!(model(&run)?, "");
+    assert_eq!(source(4)?, "builtin/");
+    host.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_invalid_configuration_file_refuses_new_runs_and_keeps_the_revision() -> R {
+    // REQ-018 failure mode 5 (ADR-022 decision 6): the host starts and serves; StartRun is 400 INVALID_TEAM_CONFIG with
+    // the file's path, the key path, line and column; a config.invalid event is written once for that file; the team
+    // revision stays; no run is made.
+    let dir = tempfile::tempdir()?;
+    std::fs::create_dir_all(dir.path().join(".hoh"))?;
+    std::fs::write(
+        dir.path().join(".hoh/config.toml"),
+        "config_version = \"1.0\"\n[team.qa]\nmodle = \"x\"\n",
+    )?;
+    let host = start_when_free(config(dir.path())).await?;
+    for key in ["s1", "s2"] {
+        let (status, body) = exchange(&host, "POST", "/v1/commands", Some(&start_run(key))).await?;
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (400, Some("INVALID_TEAM_CONFIG")),
+            "{body}"
+        );
+        assert_eq!(body["details"]["key_path"], "team.qa.modle", "{body}");
+        assert_eq!(body["details"]["line"], 3, "{body}");
+        assert_eq!(body["details"]["column"], 1, "{body}");
+        assert!(
+            body["details"]["path"]
+                .as_str()
+                .is_some_and(|p| p.ends_with(".hoh/config.toml")),
+            "{body}"
+        );
+    }
+    assert_eq!(query(dir.path(), "SELECT count(*) FROM runs")?, "0");
+    assert_eq!(
+        query(
+            dir.path(),
+            "SELECT count(*) FROM events WHERE kind = 'config.invalid'"
+        )?,
+        "1"
+    );
+    assert_eq!(
+        query(
+            dir.path(),
+            "SELECT coalesce(max(revision), 0) FROM team_revisions"
+        )?,
+        "0"
+    );
+    let (status, _) = exchange(&host, "GET", "/v1/runs", None).await?;
+    assert_eq!(status, 200);
     host.shutdown().await;
     Ok(())
 }

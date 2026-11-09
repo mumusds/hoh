@@ -26,6 +26,60 @@ pub const BUILTIN_ROLES: [&str; 6] = [
     "reviewer",
 ];
 
+/// The built-in role contract of `role` (resources/prompts/<role>.md, built into the binary), if it is a built-in role.
+pub fn builtin_contract(role: &str) -> Option<&'static str> {
+    Some(match role {
+        "commander" => include_str!("../../../resources/prompts/commander.md"),
+        "cto" => include_str!("../../../resources/prompts/cto.md"),
+        "developer" => include_str!("../../../resources/prompts/developer.md"),
+        "qa" => include_str!("../../../resources/prompts/qa.md"),
+        "researcher" => include_str!("../../../resources/prompts/researcher.md"),
+        "reviewer" => include_str!("../../../resources/prompts/reviewer.md"),
+        _ => return None,
+    })
+}
+
+/// A role contract as a turn is sent it (docs/adr/ADR-022.md decision 11): its layer (`builtin` or `project`), its path
+/// and its text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Contract {
+    pub layer: &'static str,
+    pub path: String,
+    pub text: String,
+}
+
+/// The contract a turn of `role` follows in the project at `root`, the role's `prompt` as configured: none is the
+/// role's own built-in contract, `builtin:<role>` another built-in one, else the override file, resolved as the
+/// configuration checked it ([`prompt_file`]) and read now; or why it is not available (never another contract in its
+/// place).
+pub fn contract(root: &Path, role: &str, prompt: Option<&str>) -> Result<Contract, String> {
+    let builtin = |name: &str| {
+        builtin_contract(name)
+            .map(|text| Contract {
+                layer: "builtin",
+                path: format!("resources/prompts/{name}.md"),
+                text: text.to_owned(),
+            })
+            .ok_or_else(|| format!("{name} has no built-in role contract"))
+    };
+    match prompt {
+        None => builtin(role),
+        Some(prompt) => match prompt.strip_prefix(BUILTIN_PROMPT) {
+            Some(name) => builtin(name),
+            None => {
+                let file = prompt_file(root, prompt)?;
+                let text = std::fs::read_to_string(&file)
+                    .map_err(|e| format!("\"{prompt}\" cannot be read: {e}"))?;
+                Ok(Contract {
+                    layer: "project",
+                    path: prompt.to_owned(),
+                    text,
+                })
+            }
+        },
+    }
+}
+
 /// The roles a team may not lose (REQ-018 failure mode 3).
 pub const REQUIRED_ROLES: [&str; 4] = ["commander", "developer", "qa", "reviewer"];
 
@@ -266,6 +320,11 @@ impl std::error::Error for ConfigError {}
 /// The effective configuration of the project at `root`: its `.hoh/config.toml` over the defaults, or the defaults
 /// when there is none.
 pub fn load(root: &Path) -> Result<Config, ConfigError> {
+    load_file(root).map(|(config, _)| config)
+}
+
+/// [`load`], with the file's text as it was read (none without a file): what the configuration came from.
+pub fn load_file(root: &Path) -> Result<(Config, Option<String>), ConfigError> {
     let file = root.join(FILE);
     let failed = |message: String| ConfigError {
         file: Some(file.clone()),
@@ -276,7 +335,7 @@ pub fn load(root: &Path) -> Result<Config, ConfigError> {
     };
     let meta = match std::fs::metadata(&file) {
         Ok(meta) => meta,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Config::default(), None)),
         Err(e) => return Err(failed(e.to_string())),
     };
     if !meta.is_file() {
@@ -295,7 +354,7 @@ pub fn load(root: &Path) -> Result<Config, ConfigError> {
             })?;
         }
     }
-    Ok(config)
+    Ok((config, Some(text)))
 }
 
 /// The effective configuration `text` gives over the defaults.

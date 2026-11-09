@@ -262,6 +262,7 @@ fn team_change(key: &str, expected: i64, bindings: Value) -> SubmitCommand {
             bindings: Some(bindings),
             scheduler: None,
             root: None,
+            file: None,
         }),
         event: NewEvent {
             project_id: "p1".to_owned(),
@@ -325,7 +326,9 @@ async fn a_changed_role_is_rebound_at_its_checkpoint_with_the_next_epoch() -> R 
             json!({"developer": {"agent": "codex", "model": "m-test"}}),
         ))
         .await?;
-    store.team_checkpoint("R1", Default::default()).await?;
+    store
+        .team_checkpoint("R1", crate::persistence::Availability::default())
+        .await?;
     let bindings = |path: &PathBuf| {
         values(
             path,
@@ -362,7 +365,9 @@ async fn a_changed_role_is_rebound_at_its_checkpoint_with_the_next_epoch() -> R 
     let applied = "SELECT count(*) FROM events WHERE kind = 'team.binding_applied'";
     assert_eq!(rows::<i64>(&path, applied)?, vec![vec![0]]);
     a0_ends(&path)?;
-    store.team_checkpoint("R1", Default::default()).await?;
+    store
+        .team_checkpoint("R1", crate::persistence::Availability::default())
+        .await?;
     let developer = bindings(&path)?
         .into_iter()
         .find(|row| row[0] == "developer")
@@ -399,7 +404,9 @@ async fn a_changed_role_is_rebound_at_its_checkpoint_with_the_next_epoch() -> R 
         vec![vec![1]]
     );
     let events = rows::<i64>(&path, "SELECT count(*) FROM events")?;
-    store.team_checkpoint("R1", Default::default()).await?;
+    store
+        .team_checkpoint("R1", crate::persistence::Availability::default())
+        .await?;
     assert_eq!(rows::<i64>(&path, "SELECT count(*) FROM events")?, events);
     Ok(())
 }
@@ -431,7 +438,9 @@ async fn a_role_waiting_for_its_checkpoint_is_not_dispatched_and_its_next_attemp
     let round = store.schedule_round("R1", context.clone()).await?;
     assert!(round.dispatched.is_none(), "{round:?}");
     a0_ends(&path)?;
-    store.team_checkpoint("R1", Default::default()).await?;
+    store
+        .team_checkpoint("R1", crate::persistence::Availability::default())
+        .await?;
     exec(
         &path,
         "INSERT INTO sessions(session_id, agent, role, agent_version, capabilities_json) VALUES
@@ -470,7 +479,9 @@ async fn a_removed_role_is_blocked_at_a_new_epoch_and_one_added_again_does_not_r
     store
         .submit_command(team_change("add", 0, added.clone()))
         .await?;
-    store.team_checkpoint("R1", Default::default()).await?;
+    store
+        .team_checkpoint("R1", crate::persistence::Availability::default())
+        .await?;
     assert_eq!(
         auditor()?,
         vec![vec![
@@ -484,7 +495,9 @@ async fn a_removed_role_is_blocked_at_a_new_epoch_and_one_added_again_does_not_r
     store
         .submit_command(team_change("remove", 1, json!({"auditor": null})))
         .await?;
-    store.team_checkpoint("R1", Default::default()).await?;
+    store
+        .team_checkpoint("R1", crate::persistence::Availability::default())
+        .await?;
     assert_eq!(
         auditor()?,
         vec![vec![
@@ -520,7 +533,9 @@ async fn a_removed_role_is_blocked_at_a_new_epoch_and_one_added_again_does_not_r
     store
         .submit_command(team_change("other", 2, json!({"cto": {"model": "m-cto"}})))
         .await?;
-    store.team_checkpoint("R1", Default::default()).await?;
+    store
+        .team_checkpoint("R1", crate::persistence::Availability::default())
+        .await?;
     assert_eq!(
         auditor()?,
         vec![vec![
@@ -539,7 +554,9 @@ async fn a_removed_role_is_blocked_at_a_new_epoch_and_one_added_again_does_not_r
         ]
     );
     store.submit_command(team_change("again", 3, added)).await?;
-    store.team_checkpoint("R1", Default::default()).await?;
+    store
+        .team_checkpoint("R1", crate::persistence::Availability::default())
+        .await?;
     assert_eq!(
         auditor()?,
         vec![vec![
@@ -609,7 +626,9 @@ async fn a_role_blocked_for_its_availability_is_not_a_changed_role() -> R {
     store
         .submit_command(team_change("cto", 0, json!({"cto": {"model": "m-cto"}})))
         .await?;
-    store.team_checkpoint("R1", Default::default()).await?;
+    store
+        .team_checkpoint("R1", crate::persistence::Availability::default())
+        .await?;
     assert_eq!(
         binding(&path, "qa")?,
         [
@@ -626,7 +645,9 @@ async fn a_role_blocked_for_its_availability_is_not_a_changed_role() -> R {
     store
         .submit_command(team_change("drop", 1, json!({"researcher": null})))
         .await?;
-    store.team_checkpoint("R1", Default::default()).await?;
+    store
+        .team_checkpoint("R1", crate::persistence::Availability::default())
+        .await?;
     assert_eq!(binding(&path, "researcher")?[2..4], [json!(2), json!(2)]);
     assert_eq!(applied(&path)?, 2, "the removal is an event");
     Ok(())
@@ -642,7 +663,9 @@ async fn an_unchanged_role_moves_to_the_revision_while_its_attempt_runs() -> R {
     store
         .submit_command(team_change("cto", 0, json!({"cto": {"model": "m-cto"}})))
         .await?;
-    store.team_checkpoint("R1", Default::default()).await?;
+    store
+        .team_checkpoint("R1", crate::persistence::Availability::default())
+        .await?;
     assert_eq!(binding(&path, "developer")?[2..4], [json!(1), json!(1)]);
     assert_eq!(
         rows::<i64>(
@@ -689,7 +712,9 @@ async fn a_change_waits_for_a_prepared_or_starting_attempt_too() -> R {
                 json!({"developer": {"agent": "codex"}}),
             ))
             .await?;
-        store.team_checkpoint("R1", Default::default()).await?;
+        store
+            .team_checkpoint("R1", crate::persistence::Availability::default())
+            .await?;
         assert_eq!(
             binding(&path, "developer")?[0..3],
             [json!("claude"), Value::Null, json!(1)],
@@ -714,7 +739,9 @@ async fn a_change_of_the_prompt_alone_is_a_new_epoch() -> R {
             json!({"developer": {"prompt": "builtin:cto"}, "qa": {"fallback": ["claude"]}}),
         ))
         .await?;
-    store.team_checkpoint("R1", Default::default()).await?;
+    store
+        .team_checkpoint("R1", crate::persistence::Availability::default())
+        .await?;
     assert_eq!(binding(&path, "developer")?[2], json!(2));
     assert_eq!(binding(&path, "qa")?[2], json!(2));
     assert_eq!(binding(&path, "cto")?[2], json!(1));
@@ -758,7 +785,9 @@ async fn a_change_to_an_unavailable_agent_keeps_the_old_binding_until_the_agent_
         )?,
         vec![vec![0]]
     );
-    store.team_checkpoint("R1", Default::default()).await?;
+    store
+        .team_checkpoint("R1", crate::persistence::Availability::default())
+        .await?;
     assert_eq!(
         binding(&path, "developer")?[0..4],
         [json!("codex"), Value::Null, json!(2), json!(1)]
@@ -832,8 +861,12 @@ async fn a_refused_change_leaves_the_old_binding_working_until_its_agent_is_ther
         "INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate) VALUES
            ('T2', 'R1', 's1', 'READY', 1, 'developer', 0, 3, 1);",
     )?;
-    store.team_checkpoint("R1", Default::default()).await?;
-    store.team_checkpoint("R1", Default::default()).await?;
+    store
+        .team_checkpoint("R1", crate::persistence::Availability::default())
+        .await?;
+    store
+        .team_checkpoint("R1", crate::persistence::Availability::default())
+        .await?;
     assert_eq!(
         binding(&path, "developer")?[0..4],
         [json!("claude"), Value::Null, json!(1), json!(0)]
@@ -849,7 +882,9 @@ async fn a_refused_change_leaves_the_old_binding_working_until_its_agent_is_ther
         "UPDATE attempts SET state = 'SETTLED', ended_at = '2026-11-09T00:02:00Z' WHERE task_id = 'T1';
          UPDATE tasks SET state = 'IMPLEMENTED' WHERE task_id = 'T1';",
     )?;
-    store.team_checkpoint("R1", Default::default()).await?;
+    store
+        .team_checkpoint("R1", crate::persistence::Availability::default())
+        .await?;
     assert_eq!(
         binding(&path, "developer")?[0..4],
         [json!("codex"), Value::Null, json!(2), json!(1)]
@@ -864,6 +899,52 @@ async fn a_refused_change_leaves_the_old_binding_working_until_its_agent_is_ther
             vec!["team.binding_pending".to_owned()],
             vec!["team.binding_applied".to_owned()]
         ]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_change_to_an_agent_not_looked_at_yet_waits_without_a_verdict() -> R {
+    // ADR-022 decisions 8 and 10: the registry looks at agents in its own task; until it has looked at the change's new
+    // agent the change waits, held, with no event; then it is judged.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    store
+        .submit_command(start("R1", Config::default().budget))
+        .await?;
+    store
+        .submit_command(team_change(
+            "dev",
+            0,
+            json!({"developer": {"agent": "codex"}}),
+        ))
+        .await?;
+    let unknown = crate::persistence::Availability {
+        unavailable: Default::default(),
+        unknown: ["codex".to_owned()].into(),
+    };
+    store.team_checkpoint("R1", unknown).await?;
+    assert_eq!(
+        binding(&path, "developer")?[0..4],
+        [json!("claude"), Value::Null, json!(1), json!(0)]
+    );
+    assert_eq!(
+        rows::<i64>(
+            &path,
+            "SELECT count(*) FROM events WHERE kind LIKE 'team.binding_%'"
+        )?,
+        vec![vec![0]]
+    );
+    assert_eq!(
+        shown_developer(&path)?,
+        json!(["claude", 1, {"agent": "codex", "model": null, "config_revision": 1, "refused": null}])
+    );
+    store
+        .team_checkpoint("R1", crate::persistence::Availability::default())
+        .await?;
+    assert_eq!(
+        binding(&path, "developer")?[0..4],
+        [json!("codex"), Value::Null, json!(2), json!(1)]
     );
     Ok(())
 }
@@ -924,7 +1005,9 @@ async fn a_role_with_no_session_yet_has_its_tasks_wait_not_blocked() -> R {
         ))
         .await?;
     a0_ends(&path)?;
-    store.team_checkpoint("R1", Default::default()).await?;
+    store
+        .team_checkpoint("R1", crate::persistence::Availability::default())
+        .await?;
     assert_eq!(binding(&path, "developer")?[6], Value::Null);
     store.pace_run("R1", context.clone()).await?;
     let round = store.schedule_round("R1", context).await?;
@@ -961,7 +1044,9 @@ async fn an_attempt_records_its_bindings_revision_while_the_run_is_behind() -> R
             json!({"developer": {"agent": "codex"}}),
         ))
         .await?;
-    store.team_checkpoint("R1", Default::default()).await?;
+    store
+        .team_checkpoint("R1", crate::persistence::Availability::default())
+        .await?;
     assert_eq!(
         rows::<i64>(
             &path,
@@ -1005,7 +1090,9 @@ async fn the_binder_binds_a_session_per_role_and_epoch_or_blocks_an_unavailable_
     store
         .submit_command(team_change("drop", 0, json!({"researcher": null})))
         .await?;
-    store.team_checkpoint("R1", Default::default()).await?;
+    store
+        .team_checkpoint("R1", crate::persistence::Availability::default())
+        .await?;
     let waiting = store.runner_waiting("p1").await?.unbound;
     let roles: Vec<&str> = waiting.iter().map(|u| u.role.as_str()).collect();
     assert_eq!(roles, ["commander", "cto", "developer", "qa", "reviewer"]);

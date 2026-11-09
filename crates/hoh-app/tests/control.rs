@@ -242,11 +242,14 @@ impl hoh_app::host::Executor for Agents {
         ack
     }
 
-    fn start(&self, work: &hoh_app::host::Work) -> Result<hoh_app::host::Started, String> {
+    fn start(
+        &self,
+        work: &hoh_app::host::Work,
+    ) -> Result<hoh_app::host::Started, hoh_app::host::Refusal> {
         use std::os::unix::process::CommandExt as _;
         if work.role == "commander" {
             self.commander.fetch_add(1, Ordering::SeqCst);
-            return Err("the Commander is down".to_owned());
+            return Err("the Commander is down".to_owned().into());
         }
         let script = self
             .scripts
@@ -1822,7 +1825,10 @@ impl hoh_app::host::Executor for LeavesItsGroup {
         ack
     }
 
-    fn start(&self, work: &hoh_app::host::Work) -> Result<hoh_app::host::Started, String> {
+    fn start(
+        &self,
+        work: &hoh_app::host::Work,
+    ) -> Result<hoh_app::host::Started, hoh_app::host::Refusal> {
         use std::os::unix::process::CommandExt as _;
         let mut child = Command::new("sh")
             .args([
