@@ -478,26 +478,29 @@ async fn an_ending_records_what_the_agents_turn_showed() -> R {
                         "adapter.diagnostic".to_owned(),
                         json!({"attempt_id": attempt, "reason": "PROTOCOL_FRAME_TOO_LARGE", "length": 8}),
                     )],
+                    raw_log_path: Some("/logs/a".to_owned()),
                 },
             },
         )
         .await?;
     let conn = Connection::open(&path)?;
-    let (model, usage, failure): (String, String, String) = conn.query_row(
-        "SELECT resolved_model, usage_json, failure_reason FROM attempts WHERE attempt_id = ?1",
+    let (model, usage, failure, logs): (String, String, String, String) = conn.query_row(
+        "SELECT resolved_model, usage_json, failure_reason, raw_log_path FROM attempts WHERE attempt_id = ?1",
         [&attempt],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
     )?;
     assert_eq!(
         (
             model.as_str(),
             serde_json::from_str::<Value>(&usage)?,
-            failure.as_str()
+            failure.as_str(),
+            logs.as_str()
         ),
         (
             "m-test",
             json!({"input_tokens": 3}),
-            "PROTOCOL_FRAME_TOO_LARGE"
+            "PROTOCOL_FRAME_TOO_LARGE",
+            "/logs/a"
         )
     );
     let native: String = conn.query_row(

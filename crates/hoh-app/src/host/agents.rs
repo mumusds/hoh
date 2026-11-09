@@ -42,6 +42,9 @@ struct Seen {
 pub struct Registry {
     path: OsString,
     seen: Mutex<BTreeMap<Agent, Seen>>,
+    /// The agents the runner needs looked at (its team's, its unbound bindings'): [`Registry::refresh`] looks at them,
+    /// off the runner's tick, so no probe holds up a tick or the host's stop.
+    wanted: Mutex<BTreeSet<Agent>>,
 }
 
 impl Registry {
@@ -50,7 +53,46 @@ impl Registry {
         Registry {
             path,
             seen: Mutex::new(BTreeMap::new()),
+            wanted: Mutex::new(BTreeSet::new()),
         }
+    }
+
+    /// The agents named `names` are the ones to look at from now on (names that are not agents are left out).
+    pub fn want<'a>(&self, names: impl IntoIterator<Item = &'a String>) {
+        let agents: BTreeSet<Agent> = names.into_iter().filter_map(|n| Agent::named(n)).collect();
+        if let Ok(mut wanted) = self.wanted.lock() {
+            *wanted = agents;
+        }
+    }
+
+    /// Look at every wanted agent now (blocking: probed again only when its files changed).
+    pub fn refresh(&self) {
+        let wanted: Vec<Agent> = self
+            .wanted
+            .lock()
+            .map(|w| w.iter().copied().collect())
+            .unwrap_or_default();
+        for agent in wanted {
+            let _ = self.look(agent);
+        }
+    }
+
+    /// What was last seen of the agents named `names`, without looking (decision 8): those found unavailable (a name
+    /// that is no agent among them), and those not looked at yet.
+    pub fn availability(&self, names: &BTreeSet<String>) -> hoh_core::persistence::Availability {
+        let mut known = hoh_core::persistence::Availability::default();
+        for name in names {
+            match Agent::named(name).map(|agent| self.seen(agent)) {
+                None | Some(Some(Err(_))) => {
+                    known.unavailable.insert(name.clone());
+                }
+                Some(None) => {
+                    known.unknown.insert(name.clone());
+                }
+                Some(Some(Ok(_))) => {}
+            }
+        }
+        known
     }
 
     fn env(&self) -> ProbeEnv {
@@ -108,17 +150,12 @@ impl Registry {
         outcome
     }
 
-    /// The agents whose last look found them unavailable (decision 8: a change to one waits).
-    pub fn unavailable(&self) -> BTreeSet<String> {
+    /// `agent` as it was last looked at, without looking again; `None` if it never was.
+    pub fn seen(&self, agent: Agent) -> Option<Result<Ready, String>> {
         self.seen
             .lock()
-            .map(|seen| {
-                seen.iter()
-                    .filter(|(_, s)| s.outcome.is_err())
-                    .map(|(agent, _)| agent.as_str().to_owned())
-                    .collect()
-            })
-            .unwrap_or_default()
+            .ok()
+            .and_then(|seen| seen.get(&agent).map(|s| s.outcome.clone()))
     }
 }
 
@@ -150,28 +187,61 @@ pub fn required(contract: Option<&str>) -> BTreeSet<String> {
     needs
 }
 
+/// What a turn of an agent is given besides what its registry entry says (decisions 11, 12 and 15).
+#[derive(Debug, Clone)]
+pub(super) struct Spec {
+    /// The project: the agent's working directory.
+    pub cwd: PathBuf,
+    pub model: Option<String>,
+    /// The agent's own session to continue (Claude's session, Codex's thread, Pi's session id).
+    pub resume: Option<String>,
+    pub prompt: String,
+    /// The turn's raw logs.
+    pub logs: PathBuf,
+    /// Pi's session directory and, for a new session, the id HoH gives it (kept for every turn of the session).
+    pub pi_session: (PathBuf, String),
+    /// Codex's App Server is not to be used: it degraded on this implementation (decision 15).
+    pub exec_only: bool,
+    /// How long a native cancel and then SIGTERM may take before the adapter's next step (execution's
+    /// cancel_native_grace_seconds and cancel_term_grace_seconds).
+    pub graces: (Duration, Duration),
+}
+
+/// A turn of one of the agents, ready to start.
+#[derive(Debug)]
+pub(super) enum Prepared {
+    Claude(hoh_agents::claude::Turn),
+    Codex(hoh_agents::codex::Turn),
+    Pi(hoh_agents::pi::Turn),
+}
+
 impl Ready {
-    /// What a session of this agent has (decision 9), for a turn in `cwd` under the YOLO profile; or why no turn of it
-    /// can start.
-    pub fn session_capabilities(
-        &self,
-        agent: Agent,
-        cwd: &Path,
-    ) -> Result<serde_json::Value, String> {
-        match (agent, &self.facts) {
+    /// A turn of `agent` as `spec` says, under the YOLO profile; or why this agent's facts are not its own.
+    pub(super) fn turn(&self, agent: Agent, spec: Spec) -> Result<Prepared, String> {
+        let graced = |mut escalation: hoh_agents::process::Escalation| {
+            escalation.native_grace = spec.graces.0;
+            escalation.term_grace = spec.graces.1;
+            escalation
+        };
+        Ok(match (agent, &self.facts) {
             (Agent::Claude, launch::Facts::Claude { help }) => {
-                hoh_agents::claude::session_capabilities(&hoh_agents::claude::Launch {
-                    program: self.launcher.clone(),
-                    help: help.clone(),
-                    cwd: cwd.to_path_buf(),
-                    yolo: true,
-                    partial: false,
-                    resume: None,
-                    model: None,
-                    root: rustix::process::geteuid().is_root(),
-                    capabilities: self.capabilities.clone(),
+                Prepared::Claude(hoh_agents::claude::Turn {
+                    launch: hoh_agents::claude::Launch {
+                        program: self.launcher.clone(),
+                        help: help.clone(),
+                        cwd: spec.cwd.clone(),
+                        yolo: true,
+                        partial: false,
+                        resume: spec.resume.clone(),
+                        model: spec.model.clone(),
+                        root: rustix::process::geteuid().is_root(),
+                        capabilities: self.capabilities.clone(),
+                    },
+                    prompt: spec.prompt.clone().into_bytes(),
+                    logs: spec.logs.clone(),
+                    escalation: graced(hoh_agents::claude::Turn::default_escalation()),
+                    deadline: None,
                 })
-                .map_err(|e| e.0)
             }
             (
                 Agent::Codex,
@@ -183,54 +253,94 @@ impl Ready {
                     requests,
                     client_notifications,
                 },
-            ) => hoh_agents::codex::session_capabilities(&hoh_agents::codex::Turn {
+            ) => Prepared::Codex(hoh_agents::codex::Turn {
                 launch: hoh_agents::codex::Launch {
                     program: self.launcher.clone(),
-                    app_server_help: app_server_help.clone(),
+                    app_server_help: app_server_help.clone().filter(|_| !spec.exec_only),
                     exec_help: exec_help.clone(),
                     exec_resume_help: exec_resume_help.clone(),
-                    cwd: cwd.to_path_buf(),
+                    cwd: spec.cwd.clone(),
                     yolo: true,
-                    resume: None,
-                    model: None,
+                    resume: spec.resume.clone(),
+                    model: spec.model.clone(),
                     known: known.clone(),
                     requests: requests.clone(),
                     client_notifications: client_notifications.clone(),
                     capabilities: self.capabilities.clone(),
                 },
-                prompt: String::new(),
-                logs: cwd.to_path_buf(),
-                escalation: hoh_agents::codex::Turn::default_escalation(),
+                prompt: spec.prompt.clone(),
+                logs: spec.logs.clone(),
+                escalation: graced(hoh_agents::codex::Turn::default_escalation()),
                 handshake_timeout: Duration::from_secs(60),
                 deadline: None,
-            })
-            .map_err(|e| e.0),
-            (Agent::Pi, launch::Facts::Pi { help }) => {
-                hoh_agents::pi::session_capabilities(&hoh_agents::pi::Launch {
+            }),
+            (Agent::Pi, launch::Facts::Pi { help }) => Prepared::Pi(hoh_agents::pi::Turn {
+                launch: hoh_agents::pi::Launch {
                     program: self.launcher.clone(),
                     help: help.clone(),
-                    cwd: cwd.to_path_buf(),
-                    session_dir: cwd.join(".hoh/pi-sessions"),
-                    session_id: String::new(),
-                    resume: false,
+                    cwd: spec.cwd.clone(),
+                    session_dir: spec.pi_session.0.clone(),
+                    session_id: spec
+                        .resume
+                        .clone()
+                        .unwrap_or_else(|| spec.pi_session.1.clone()),
+                    resume: spec.resume.is_some(),
                     provider: None,
-                    model: None,
+                    model: spec.model.clone(),
                     settled_event: hoh_agents::pi::emits_settled(Some(&self.version)),
                     capabilities: self.capabilities.clone(),
-                })
-                .map_err(|e| e.0)
+                },
+                prompt: spec.prompt.clone(),
+                input_id: None,
+                logs: spec.logs.clone(),
+                escalation: graced(hoh_agents::pi::Turn::default_escalation()),
+                deadline: None,
+                clock: Arc::new(hoh_agents::clock::SystemClock),
+                events: None,
+            }),
+            _ => {
+                return Err(format!(
+                    "{}'s launch facts are another agent's",
+                    agent.as_str()
+                ));
             }
-            _ => Err(format!(
-                "{}'s launch facts are another agent's",
-                agent.as_str()
-            )),
+        })
+    }
+
+    /// What a session of this agent has (decision 9), for a turn in `cwd` under the YOLO profile; or why no turn of it
+    /// can start.
+    pub fn session_capabilities(
+        &self,
+        agent: Agent,
+        cwd: &Path,
+    ) -> Result<serde_json::Value, String> {
+        let spec = Spec {
+            cwd: cwd.to_path_buf(),
+            model: None,
+            resume: None,
+            prompt: String::new(),
+            logs: cwd.to_path_buf(),
+            pi_session: (cwd.join(".hoh/sessions"), String::new()),
+            exec_only: false,
+            graces: (Duration::from_secs(10), Duration::from_secs(5)),
+        };
+        match self.turn(agent, spec)? {
+            Prepared::Claude(turn) => {
+                hoh_agents::claude::session_capabilities(&turn.launch).map_err(|e| e.0)
+            }
+            Prepared::Codex(turn) => {
+                hoh_agents::codex::session_capabilities(&turn).map_err(|e| e.0)
+            }
+            Prepared::Pi(turn) => {
+                hoh_agents::pi::session_capabilities(&turn.launch).map_err(|e| e.0)
+            }
         }
     }
 }
 
-/// The binder (decision 9): each binding waiting for its session gets one if its agent is available now (its version
-/// and the capabilities a turn will have), else is blocked (AGENT_UNAVAILABLE) with why. Probing runs off the async
-/// workers, never in a writer job.
+/// The binder (decision 9): each binding waiting for its session gets one if its agent is available (its version and
+/// the capabilities a turn will have), is blocked (AGENT_UNAVAILABLE) with why if not, or waits while its agent was not
+/// looked at yet. It reads what the registry last saw: no probe runs in a tick or a writer job.
 pub(super) async fn bind(
     store: &Store,
     registry: &Arc<Registry>,
@@ -241,10 +351,9 @@ pub(super) async fn bind(
         let Some(agent) = Agent::named(&waiting.agent) else {
             continue;
         };
-        let looking = registry.clone();
-        let looked = tokio::task::spawn_blocking(move || looking.look(agent))
-            .await
-            .unwrap_or_else(|e| Err(format!("the probe did not finish: {e}")));
+        let Some(looked) = registry.seen(agent) else {
+            continue;
+        };
         let granted = looked.and_then(|ready| {
             let capabilities = ready.session_capabilities(agent, cwd)?;
             Ok((ready.version, capabilities))

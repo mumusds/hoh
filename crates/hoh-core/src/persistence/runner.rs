@@ -52,6 +52,9 @@ pub struct Waiting {
     /// The project's current team: each role and the built-in role whose contract it follows (its own, a custom role's
     /// `builtin:<role>`, or none), for the capabilities it needs (decision 10).
     pub roles: Vec<(String, Option<String>)>,
+    /// The agents the project's current team names: the registry looks at them before the checkpoints, which hold back
+    /// a change to one found unavailable (decision 8, third version; decision 10).
+    pub agents: std::collections::BTreeSet<String>,
 }
 
 /// One step of the runner.
@@ -90,7 +93,7 @@ pub(super) enum RunnerJob {
     /// A binding the binder blocks because its agent is unavailable, and why.
     BlockBinding(Box<super::team::Unbound>, String),
     /// A run's team checkpoint (docs/adr/ADR-022.md decision 8), with the agents the registry found unavailable.
-    Checkpoint(String, std::collections::BTreeSet<String>),
+    Checkpoint(String, super::team::Availability),
     /// Renew the unexpired leases these attempts hold, at `now` (REQ-041: every 30 s, for 120 s).
     Renew(Vec<String>, std::time::SystemTime),
 }
@@ -135,6 +138,8 @@ pub struct Observed {
     pub events: Vec<(String, String, serde_json::Value)>,
     /// The prompt it was sent (docs/adr/ADR-022.md decision 11).
     pub prompt: Option<PromptRecord>,
+    /// The directory of its raw logs.
+    pub raw_log_path: Option<String>,
 }
 
 /// Where a turn's prompt came from and what was sent (decision 11, AC-018-05): a `prompt_revisions` row (the role
@@ -183,8 +188,8 @@ pub(super) fn run(
         RunnerJob::BlockBinding(unbound, detail) => {
             super::team::block_binding(conn, &unbound, &detail, ctx).map(RunnerDone::Applied)
         }
-        RunnerJob::Checkpoint(run_id, unavailable) => {
-            super::team::checkpoint(conn, &run_id, &unavailable, ctx).map(RunnerDone::Applied)
+        RunnerJob::Checkpoint(run_id, availability) => {
+            super::team::checkpoint(conn, &run_id, &availability, ctx).map(RunnerDone::Applied)
         }
         RunnerJob::Pace { run_id, context } => {
             super::retry::pace(conn, &run_id, &context, ctx).map(RunnerDone::Paced)
@@ -317,6 +322,7 @@ fn waiting(conn: &Connection, project_id: &str) -> Result<Waiting, PersistError>
         },
         unbound: super::team::unbound(conn, project_id)?,
         roles: super::team::roles(conn, project_id)?,
+        agents: super::team::agents(conn, project_id)?,
     })
 }
 
@@ -589,6 +595,7 @@ fn finished(
                 failure_reason: (!success).then(|| ending.detail.clone()),
                 resolved_model: ending.observed.resolved_model.clone(),
                 usage: ending.observed.usage.clone(),
+                raw_log_path: ending.observed.raw_log_path.clone(),
                 ..AttemptFacts::default()
             },
         },

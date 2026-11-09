@@ -166,7 +166,10 @@ impl hoh_app::host::Executor for FakeExecutor {
         ack
     }
 
-    fn start(&self, work: &hoh_app::host::Work) -> Result<hoh_app::host::Started, String> {
+    fn start(
+        &self,
+        work: &hoh_app::host::Work,
+    ) -> Result<hoh_app::host::Started, hoh_app::host::Refusal> {
         use std::os::unix::process::CommandExt as _;
         let mut child = Command::new("sh")
             .args(["-c", FAKE_AGENT, "fake-agent", &work.effect_key])
@@ -256,7 +259,10 @@ impl hoh_app::host::Executor for FailingExecutor {
         ack
     }
 
-    fn start(&self, _work: &hoh_app::host::Work) -> Result<hoh_app::host::Started, String> {
+    fn start(
+        &self,
+        _work: &hoh_app::host::Work,
+    ) -> Result<hoh_app::host::Started, hoh_app::host::Refusal> {
         use std::os::unix::process::CommandExt as _;
         let mut child = Command::new("sh")
             .args(["-c", "read -r go; exit 3"])
@@ -1281,7 +1287,10 @@ impl hoh_app::host::Executor for StuckExecutor {
         ack
     }
 
-    fn start(&self, _work: &hoh_app::host::Work) -> Result<hoh_app::host::Started, String> {
+    fn start(
+        &self,
+        _work: &hoh_app::host::Work,
+    ) -> Result<hoh_app::host::Started, hoh_app::host::Refusal> {
         let (child, pid, gate) = self.spawn()?;
         let ended = reaping(child);
         Ok(hoh_app::host::Started { pid, gate, ended })
@@ -1800,7 +1809,10 @@ impl hoh_app::host::Executor for SlowStart {
         self.1.deliver(work)
     }
 
-    fn start(&self, work: &hoh_app::host::Work) -> Result<hoh_app::host::Started, String> {
+    fn start(
+        &self,
+        work: &hoh_app::host::Work,
+    ) -> Result<hoh_app::host::Started, hoh_app::host::Refusal> {
         let end = Instant::now() + Duration::from_secs(30);
         while !self.0.exists() && Instant::now() < end {
             std::thread::sleep(Duration::from_millis(10));
@@ -1895,7 +1907,10 @@ impl hoh_app::host::Executor for Losing {
         self.0.deliver(work)
     }
 
-    fn start(&self, work: &hoh_app::host::Work) -> Result<hoh_app::host::Started, String> {
+    fn start(
+        &self,
+        work: &hoh_app::host::Work,
+    ) -> Result<hoh_app::host::Started, hoh_app::host::Refusal> {
         let started = self.0.start(work)?;
         let (_lost, ended) = tokio::sync::oneshot::channel();
         Ok(hoh_app::host::Started { ended, ..started })
@@ -2289,7 +2304,10 @@ impl hoh_app::host::Executor for LeavesAMember {
         self.inner.deliver(work)
     }
 
-    fn start(&self, _work: &hoh_app::host::Work) -> Result<hoh_app::host::Started, String> {
+    fn start(
+        &self,
+        _work: &hoh_app::host::Work,
+    ) -> Result<hoh_app::host::Started, hoh_app::host::Refusal> {
         use std::os::unix::process::CommandExt as _;
         let mut child = Command::new("sh")
             .args([
@@ -2809,12 +2827,15 @@ impl hoh_app::host::Executor for Faulty {
         self.inner.deliver(work)
     }
 
-    fn start(&self, work: &hoh_app::host::Work) -> Result<hoh_app::host::Started, String> {
+    fn start(
+        &self,
+        work: &hoh_app::host::Work,
+    ) -> Result<hoh_app::host::Started, hoh_app::host::Refusal> {
         if self
             .start_fails
             .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
-            return Err("injected: no process".to_owned());
+            return Err("injected: no process".to_owned().into());
         }
         if self.ghost.swap(false, std::sync::atomic::Ordering::SeqCst) {
             let (_never, ended) = tokio::sync::oneshot::channel();
@@ -2914,7 +2935,10 @@ impl hoh_app::host::Executor for Cancellable {
         self.0.deliver(work)
     }
 
-    fn start(&self, _work: &hoh_app::host::Work) -> Result<hoh_app::host::Started, String> {
+    fn start(
+        &self,
+        _work: &hoh_app::host::Work,
+    ) -> Result<hoh_app::host::Started, hoh_app::host::Refusal> {
         let (child, pid, gate) = self.0.spawn()?;
         let ended = reaping_after(child, Duration::from_millis(100));
         Ok(hoh_app::host::Started { pid, gate, ended })
@@ -2994,7 +3018,10 @@ impl hoh_app::host::Executor for LeaderOnlyCancel {
         self.0.deliver(work)
     }
 
-    fn start(&self, _work: &hoh_app::host::Work) -> Result<hoh_app::host::Started, String> {
+    fn start(
+        &self,
+        _work: &hoh_app::host::Work,
+    ) -> Result<hoh_app::host::Started, hoh_app::host::Refusal> {
         let (mut child, pid, gate) = self.0.spawn()?;
         let (end, ended) = tokio::sync::oneshot::channel();
         std::thread::spawn(move || {

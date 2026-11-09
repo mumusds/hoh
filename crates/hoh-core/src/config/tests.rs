@@ -617,3 +617,42 @@ fn a_fallback_to_the_roles_own_agent_is_refused() {
         Some("bindings.qa.fallback[0]")
     );
 }
+
+#[test]
+fn a_turns_contract_is_the_built_in_one_or_its_override_file_never_another_in_its_place() -> R {
+    // ADR-022 decision 11: no prompt is the role's own built-in contract, `builtin:<role>` another's, a file the
+    // override read as the configuration checked it; a file gone or out of the project is an error, never a fallback.
+    let dir = tempfile::tempdir()?;
+    std::fs::create_dir_all(dir.path().join(".hoh/prompts"))?;
+    let own = contract(dir.path(), "developer", None)?;
+    assert_eq!(
+        (own.layer, own.path.as_str()),
+        ("builtin", "resources/prompts/developer.md")
+    );
+    assert_eq!(own.text, builtin_contract("developer").ok_or("none")?);
+    let borrowed = contract(dir.path(), "auditor", Some("builtin:qa"))?;
+    assert_eq!(borrowed.path, "resources/prompts/qa.md");
+    assert!(contract(dir.path(), "auditor", None).is_err());
+    assert!(contract(dir.path(), "auditor", Some("builtin:nobody")).is_err());
+    assert!(contract(dir.path(), "auditor", Some(".hoh/prompts/auditor.md")).is_err());
+    std::fs::write(dir.path().join(".hoh/prompts/auditor.md"), "Audit.")?;
+    let file = contract(dir.path(), "auditor", Some(".hoh/prompts/auditor.md"))?;
+    assert_eq!(
+        (file.layer, file.path.as_str(), file.text.as_str()),
+        ("project", ".hoh/prompts/auditor.md", "Audit.")
+    );
+    let outside = tempfile::tempdir()?;
+    std::fs::write(outside.path().join("o.md"), "Outside.")?;
+    std::os::unix::fs::symlink(
+        outside.path().join("o.md"),
+        dir.path().join(".hoh/prompts/o.md"),
+    )?;
+    assert!(contract(dir.path(), "auditor", Some(".hoh/prompts/o.md")).is_err());
+    for role in BUILTIN_ROLES {
+        assert!(
+            builtin_contract(role).is_some_and(|t| !t.trim().is_empty()),
+            "{role}"
+        );
+    }
+    Ok(())
+}

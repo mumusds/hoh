@@ -35,7 +35,8 @@ pub use retry::{Failure, Paced, Repair, RepairRequest, RepairVerdict};
 pub use rounds::{Dispatched, RoundOutcome};
 pub use runner::{DispatchNotice, Ending, Observed, PromptRecord, RUNNER, Waiting};
 pub use team::{
-    Assignment, SessionGrant, TeamChange, TeamConfig, TeamMember, TeamView, Unbound, session_id,
+    Assignment, Availability, FileTeam, SessionGrant, TeamChange, TeamConfig, TeamMember, TeamView,
+    Unbound, session_id,
 };
 pub mod location;
 pub mod selftest;
@@ -831,11 +832,11 @@ impl Store {
     pub async fn team_checkpoint(
         &self,
         run_id: &str,
-        unavailable: std::collections::BTreeSet<String>,
+        availability: impl Into<Availability>,
     ) -> Result<bool, PersistError> {
         self.runner_step(runner::RunnerJob::Checkpoint(
             run_id.to_owned(),
-            unavailable,
+            availability.into(),
         ))
         .await
     }
@@ -1343,6 +1344,27 @@ impl Reader {
     /// The project's current team revision (0 before any team transaction, docs/adr/ADR-022.md decision 3).
     pub fn team_revision(&self, project_id: &str) -> Result<i64, PersistError> {
         team::revision(&self.conn, project_id)
+    }
+
+    /// Whether project `project_id` has the event `event_id`.
+    pub fn event_exists(&self, project_id: &str, event_id: &str) -> Result<bool, PersistError> {
+        self.conn
+            .query_row(
+                "SELECT count(*) FROM events WHERE project_id = ?1 AND event_id = ?2",
+                rusqlite::params![project_id, event_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n > 0)
+            .map_err(sqlite_error)
+    }
+
+    /// The source of the project's latest team revision made from its configuration file or the built-in defaults
+    /// (docs/adr/ADR-022.md decision 6), none before any.
+    pub fn team_file_source(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<serde_json::Value>, PersistError> {
+        team::file_source(&self.conn, project_id)
     }
 
     /// The run `run_id`, its team (docs/adr/ADR-022.md decision 18) and the highest event seq, read together.
