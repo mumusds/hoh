@@ -100,6 +100,8 @@ impl ProbeStop {
                 let _ = kill_process_group(pid, Signal::KILL);
                 let _ = kill_process(pid, Signal::KILL);
             }
+            // Where a test holds the stop once it tried a slot (by its thread's hook, see [`between`]).
+            between("slot-tried", Path::new(""));
         }
     }
 
@@ -3103,21 +3105,62 @@ mod tests {
             .collect())
     }
 
-    /// This process's children: pid, name and state letter (a child gone while listed is left out).
+    /// This process's children: pid, name and state letter (a child gone while listed is left out); a listing of
+    /// /proc that fails, at its opening or on the way, is an error (M2T07R-1000).
     fn children() -> io::Result<Vec<(u32, String, char)>> {
         let me = std::process::id().to_string();
-        Ok(std::fs::read_dir("/proc")?
-            .flatten()
-            .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
-            .filter_map(|pid| {
-                let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-                let (head, rest) = stat.rsplit_once(')')?;
-                let (_, name) = head.split_once('(')?;
-                let mut fields = rest.split_whitespace();
-                let state = fields.next()?.chars().next()?;
-                (fields.next()? == me).then(|| (pid, name.to_owned(), state))
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir("/proc")? {
+            let Some(pid) = entry?
+                .file_name()
+                .to_str()
+                .and_then(|n| n.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if let Some((name, state, parent)) = stat_of(pid)?
+                && parent == me
+            {
+                found.push((pid, name, state));
+            }
+        }
+        Ok(found)
+    }
+
+    /// Process `pid`'s name, state letter and parent, `None` when it is gone (reaped, or never there).
+    fn stat_of(pid: u32) -> io::Result<Option<(String, char, String)>> {
+        let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat,
+            Err(e)
+                if e.kind() == io::ErrorKind::NotFound
+                    || e.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error()) =>
+            {
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+        let parsed = stat.rsplit_once(')').and_then(|(head, rest)| {
+            let (_, name) = head.split_once('(')?;
+            let mut fields = rest.split_whitespace();
+            let state = fields.next()?.chars().next()?;
+            Some((name.to_owned(), state, fields.next()?.to_owned()))
+        });
+        parsed
+            .map(Some)
+            .ok_or_else(|| io::Error::other(format!("/proc/{pid}/stat unreadable: {stat}")))
+    }
+
+    /// Whether every command of `seen` (children named `comm` seen before) is dead: gone, its number now another's,
+    /// or a zombie. Each is looked at by its own number, so a listing that fails or misses one is never taken for
+    /// its death; a look that fails is "not dead" (M2T07R-1000).
+    fn dead(seen: &[(u32, char)], comm: &str) -> bool {
+        let me = std::process::id().to_string();
+        !seen.is_empty()
+            && seen.iter().all(|(pid, _)| match stat_of(*pid) {
+                Ok(None) => true,
+                Ok(Some((name, state, parent))) => name != comm || parent != me || state == 'Z',
+                Err(_) => false,
             })
-            .collect())
     }
 
     /// This process's children named `comm`, once one is seen (within 5 s), so a single look that misses it is not
@@ -3138,11 +3181,6 @@ mod tests {
                 _ => std::thread::sleep(Duration::from_millis(10)),
             }
         }
-    }
-
-    /// Whether every child named `comm` is dead (a zombie, its leader not reaped yet), once one was seen.
-    fn all_dead(comm: &str) -> bool {
-        children_named(comm).is_ok_and(|found| found.iter().all(|(_, state)| *state == 'Z'))
     }
 
     /// Kill what a test left of its commands named `comm`.
@@ -3233,7 +3271,9 @@ mod tests {
         std::fs::remove_file(&stop_stall)?;
         let past_its_slot = wait_until(Duration::from_secs(10), || held_open(&hold_stall));
         let found = children_seen(&name);
-        let killed = found.is_ok() && wait_until(Duration::from_secs(2), || all_dead(&name));
+        let killed = found
+            .as_ref()
+            .is_ok_and(|found| wait_until(Duration::from_secs(2), || dead(found, &name)));
         kill_children_named(&name);
         std::fs::remove_file(&hold_stall)?;
         let _ = stopper.join();
@@ -3400,27 +3440,21 @@ mod tests {
     #[test]
     fn a_put_after_the_stop_passed_its_empty_slot_finds_the_flag_the_stop_set_first()
     -> Result<(), Box<dyn std::error::Error>> {
-        // M2T07R-950 (docs/adr/ADR-022.md decision 10 v6): the stop sets its flag before it tries any slot. Start B is
-        // held once its spawn returned (its slot registered and empty), start A inside its slot's lock after B in the
-        // table: the stop passes B's empty slot and waits on A's lock; B, let go then, finds the flag in its put and
-        // kills its command, dead once B let its slot's lock go (a stop that set its flag only after the slots left it
-        // alive).
+        // M2T07R-950, -1001 (docs/adr/ADR-022.md decision 10 v6): the stop sets its flag before it tries any slot. A
+        // start is held once its spawn returned (its slot registered and empty); the stop is held by its thread's hook
+        // once it tried that slot, so it has passed it and has not ended; the start, let go then, finds the flag in its
+        // put and kills its command, dead once it let its slot's lock go (a stop that set its flag only after the
+        // slots left it alive). The order is held by the two stalls, not by timing.
         let tmp = tempfile::tempdir()?;
-        let launcher = |dir: &str, name: &str| -> Result<PathBuf, Box<dyn std::error::Error>> {
-            let bin = tmp.path().join(dir);
-            std::fs::create_dir(&bin)?;
-            let launcher = bin.join(name);
-            std::fs::write(&launcher, "#!/bin/sh\nwhile :; do sleep 0.1; done\n")?;
-            std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))?;
-            Ok(launcher)
-        };
-        let (b, a) = (launcher("b", "hslflagb")?, launcher("a", "hslflaga")?);
-        let b_spawned = tmp.path().join("b/hoh-test-stall-spawned");
-        let b_placed = tmp.path().join("b/hoh-test-stall-placed");
-        let a_putting = tmp.path().join("a/hoh-test-stall-putting");
-        for stall in [&b_spawned, &b_placed, &a_putting] {
-            std::fs::write(stall, "")?;
-        }
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir(&bin)?;
+        let launcher = bin.join("hslflag");
+        std::fs::write(&launcher, "#!/bin/sh\nwhile :; do sleep 0.1; done\n")?;
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))?;
+        let spawned = bin.join("hoh-test-stall-spawned");
+        let placed = bin.join("hoh-test-stall-placed");
+        std::fs::write(&spawned, "")?;
+        std::fs::write(&placed, "")?;
         let stop = ProbeStop::default();
         let env = ProbeEnv {
             path: "/usr/bin:/bin".into(),
@@ -3430,46 +3464,48 @@ mod tests {
             deadline: None,
             cancel: Some(stop.clone()),
         };
-        let probe = |launcher: PathBuf| {
-            let env = env.clone();
-            std::thread::spawn(move || run(&launcher, &["--version"], &env).map(|_| ()))
-        };
-        let second = probe(b);
-        let b_held = wait_until(Duration::from_secs(10), || held_open(&b_spawned));
-        let first = probe(a);
-        let a_held = wait_until(Duration::from_secs(10), || held_open(&a_putting));
-        let stopper = std::thread::spawn(move || stop.stop());
-        // The stop has passed B's empty slot and waits on A's lock, well within STOP_WAIT.
-        std::thread::sleep(Duration::from_millis(50));
-        std::fs::remove_file(&b_spawned)?;
-        let b_placed_held = wait_until(Duration::from_secs(10), || held_open(&b_placed));
-        let found = children_seen("hslflagb");
-        let dead = found.is_ok() && wait_until(Duration::from_secs(2), || all_dead("hslflagb"));
-        std::fs::remove_file(&b_placed)?;
-        std::fs::remove_file(&a_putting)?;
+        let probing = std::thread::spawn(move || run(&launcher, &["--version"], &env).map(|_| ()));
+        let start_held = wait_until(Duration::from_secs(10), || held_open(&spawned));
+        let (tried, at_slot) = std::sync::mpsc::channel();
+        let (go, gone_on) = std::sync::mpsc::channel::<()>();
+        let stopper = std::thread::spawn(move || {
+            BETWEEN.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |moment, _| {
+                    if moment == "slot-tried" {
+                        let _ = tried.send(());
+                        let _ = gone_on.recv_timeout(Duration::from_secs(30));
+                    }
+                }));
+            });
+            stop.stop();
+        });
+        let stop_held = at_slot.recv_timeout(Duration::from_secs(10)).is_ok();
+        let stop_not_ended = !stopper.is_finished();
+        std::fs::remove_file(&spawned)?;
+        let put_held = wait_until(Duration::from_secs(10), || held_open(&placed));
+        let found = children_seen("hslflag");
+        let dead_there = found
+            .as_ref()
+            .is_ok_and(|found| wait_until(Duration::from_secs(2), || dead(found, "hslflag")));
+        drop(go);
+        std::fs::remove_file(&placed)?;
         let _ = stopper.join();
-        let (first, second) = (
-            first.join().map_err(|_| "a probe panicked")?,
-            second.join().map_err(|_| "a probe panicked")?,
-        );
-        for name in ["hslflagb", "hslflaga"] {
-            kill_children_named(name);
-        }
+        let result = probing.join().map_err(|_| "the probe panicked")?;
+        kill_children_named("hslflag");
+        assert!(start_held && put_held, "the probe never got to its stalls");
         assert!(
-            b_held && a_held && b_placed_held,
-            "the probes never got to their stalls"
+            stop_held && stop_not_ended,
+            "the stop was not held once it tried the slot"
         );
-        assert_eq!(found?.len(), 1, "B's command");
+        assert_eq!(found?.len(), 1, "the command");
         assert!(
-            dead,
-            "B's command lives at placed: its put found no flag though the stop had passed its slot"
+            dead_there,
+            "the command lives at placed: its put found no flag though the stop had passed its slot"
         );
-        for result in [first, second] {
-            assert!(
-                matches!(&result, Err(ProbeError::Failed { detail, .. }) if detail == STOPPING),
-                "{result:?}"
-            );
-        }
+        assert!(
+            matches!(&result, Err(ProbeError::Failed { detail, .. }) if detail == STOPPING),
+            "{result:?}"
+        );
         Ok(())
     }
 
@@ -3521,7 +3557,9 @@ mod tests {
         }
         let stopped = wait_until(Duration::from_secs(2), || stopper.is_finished());
         let found = children_seen(&held_name);
-        let killed = found.is_ok() && wait_until(Duration::from_secs(2), || all_dead(&held_name));
+        let killed = found
+            .as_ref()
+            .is_ok_and(|found| wait_until(Duration::from_secs(2), || dead(found, &held_name)));
         if let_go.is_none() {
             std::fs::remove_file(&other_stall)?;
         }
@@ -3601,8 +3639,8 @@ mod tests {
         let held_again = then.as_ref().map(|then| {
             let there = wait_until(Duration::from_secs(10), || held_open(then));
             let dead_there = there
-                && children_seen(&name).is_ok()
-                && wait_until(Duration::from_secs(2), || all_dead(&name));
+                && children_seen(&name)
+                    .is_ok_and(|found| wait_until(Duration::from_secs(2), || dead(&found, &name)));
             let _ = std::fs::remove_file(then);
             (there, dead_there)
         });
@@ -3610,7 +3648,10 @@ mod tests {
         let result = probing.join().map_err(|_| "the probe panicked")?;
         let dead = match held_again {
             Some((_, dead_there)) => dead_there,
-            None => wait_until(Duration::from_secs(2), || all_dead(&name)),
+            None => seen
+                .as_ref()
+                .and_then(|seen| seen.as_ref().ok())
+                .is_some_and(|found| wait_until(Duration::from_secs(2), || dead(found, &name))),
         };
         kill_children_named(&name);
         if let Some(seen) = seen {
