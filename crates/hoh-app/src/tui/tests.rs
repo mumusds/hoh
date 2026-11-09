@@ -1,6 +1,6 @@
 //! The TUI shell's editor, history, keys and screen (ADR-014), without a terminal.
 
-use super::app::{App, Exit};
+use super::app::{App, Exit, mode_of};
 use super::editor::Editor;
 use super::history::History;
 use ratatui::Terminal;
@@ -793,4 +793,32 @@ fn a_links_get_answered_403_goes_once_more_to_the_host_found_again() -> crate::c
     drop(link);
     runtime.block_on(second.shutdown());
     Ok(())
+}
+
+#[test]
+fn the_top_bar_shows_the_projects_configured_mode() {
+    // M2T07R-355 (ADR-014, docs/adr/ADR-022.md decision 6): the mode on the top bar is the project's configured
+    // default_mode; with no configuration file, or an invalid one, it is the built-in AUTO.
+    let dir = tempfile::tempdir().expect("tempdir");
+    assert_eq!(mode_of(dir.path()), "AUTO");
+    std::fs::create_dir_all(dir.path().join(".hoh")).expect("mkdir");
+    let file = dir.path().join(".hoh/config.toml");
+    std::fs::write(
+        &file,
+        "config_version = \"1.0\"\n[project]\ndefault_mode = \"PLAN\"\n",
+    )
+    .expect("write");
+    assert_eq!(mode_of(dir.path()), "PLAN");
+    let app = App::open(dir.path());
+    assert!(
+        screen(&app, 100, 30)[0].contains("模式 PLAN"),
+        "{:?}",
+        screen(&app, 100, 30)[0]
+    );
+    std::fs::write(
+        &file,
+        "config_version = \"1.0\"\n[project]\ndefault_mode = \"plan\"\n",
+    )
+    .expect("write");
+    assert_eq!(mode_of(dir.path()), "AUTO");
 }

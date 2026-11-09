@@ -808,8 +808,9 @@ async fn settle(
         if let Some(work) = &work {
             executor.cancel(work);
         }
-        // The native cancel's grace first: a group that emptied by it gets no signal (M2T07R-254).
-        seen.grace(settings.native_grace);
+        // The native cancel's grace first, when one was sent: a group that emptied by it gets no signal (M2T07R-254,
+        // -353).
+        seen.grace(settings.first_wait(work.is_some()));
         Some((
             found,
             finding,

@@ -48,9 +48,95 @@ pub struct ProbeEnv {
     /// A limit shared by every command: each gets the smaller of `timeout` and the time left before it, so commands
     /// run one after another end together by then (doctor's total limit, REQ-006).
     pub deadline: Option<Instant>,
-    /// Set when whoever probes stops (the host's stop): a command running ends at once, its group killed and its
-    /// leader reaped, and no other starts (docs/adr/ADR-022.md decision 10, M2T07R-202).
-    pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// How whoever probes stops (the host's stop): every command a probe started is killed by the stop itself, and no
+    /// other starts (docs/adr/ADR-022.md decision 10, M2T07R-202, -300).
+    pub cancel: Option<ProbeStop>,
+}
+
+/// The stop of whoever probes (docs/adr/ADR-022.md decision 10 v4, M2T07R-300): [`ProbeStop::stop`] kills every
+/// command a probe started and has not reaped yet, its process group and its leader, before it returns, however late
+/// the thread that started it runs; once stopped, no command starts (the check, the start and the registration are one
+/// step under its lock). The thread that started a command still reaps it, taking it out of the registration first.
+#[derive(Debug, Clone, Default)]
+pub struct ProbeStop(std::sync::Arc<Stopping>);
+
+#[derive(Debug, Default)]
+struct Stopping {
+    /// Set under `commands`' lock; read without it.
+    stopped: std::sync::atomic::AtomicBool,
+    /// The commands started, each held until it is reaped.
+    commands: std::sync::Mutex<Vec<std::sync::Weak<std::sync::Mutex<Option<std::process::Child>>>>>,
+}
+
+impl ProbeStop {
+    /// Stop: kill every command started and not reaped (its group and its leader), and start none from now on.
+    pub fn stop(&self) {
+        let mut commands = locked(&self.0.commands);
+        self.0
+            .stopped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        for command in commands.drain(..).filter_map(|c| c.upgrade()) {
+            // Its leader not reaped (whoever reaps it takes it out first), the number is still its own.
+            if let Some(child) = locked(&command).as_ref() {
+                let pid = Pid::from_child(child);
+                let _ = kill_process_group(pid, Signal::KILL);
+                let _ = kill_process(pid, Signal::KILL);
+            }
+        }
+    }
+
+    /// Whether [`ProbeStop::stop`] was called.
+    pub fn is_stopped(&self) -> bool {
+        self.0.stopped.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// `spawn` run unless stopped, what it started registered for the stop: `None` when stopped.
+    fn start(
+        &self,
+        spawn: impl FnOnce() -> io::Result<std::process::Child>,
+    ) -> Option<io::Result<Started>> {
+        let mut commands = locked(&self.0.commands);
+        if self.is_stopped() {
+            return None;
+        }
+        commands.retain(|c| c.strong_count() > 0);
+        Some(spawn().map(|child| {
+            let started = Started::new(child);
+            commands.push(std::sync::Arc::downgrade(&started.slot));
+            started
+        }))
+    }
+}
+
+/// A started command's child, until whoever reaps it takes it out (a stop signals it only while it is there).
+type Slot = std::sync::Arc<std::sync::Mutex<Option<std::process::Child>>>;
+
+/// A command just started: its child in its slot, its pid and its outputs.
+struct Started {
+    slot: Slot,
+    pid: Pid,
+    stdout: Option<std::process::ChildStdout>,
+    stderr: Option<std::process::ChildStderr>,
+}
+
+impl Started {
+    fn new(mut child: std::process::Child) -> Started {
+        let pid = Pid::from_child(&child);
+        let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
+        Started {
+            slot: std::sync::Arc::new(std::sync::Mutex::new(Some(child))),
+            pid,
+            stdout,
+            stderr,
+        }
+    }
+}
+
+/// `mutex` locked, whatever a panic left in it.
+fn locked<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// One command a probe ran.
@@ -1204,6 +1290,17 @@ pub fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<CodexSchema, Prob
             Ok(result) => break Ok(result),
             Err(mpsc::RecvTimeoutError::Timeout) if !left.is_zero() && !cancelled(env) => {}
             Err(e) => {
+                // Stopped, the reading still gets its cleanup grace to remove its output, as one at its time limit
+                // does, and is given up only after it; its command the stop killed already (docs/adr/ADR-022.md
+                // decision 10 v4, M2T07R-300).
+                if matches!(e, mpsc::RecvTimeoutError::Timeout) && cancelled(env) {
+                    let grace = (Instant::now() + CLEANUP_GRACE + READER_MARGIN).min(given_up_at);
+                    if let Ok(result) =
+                        rx.recv_timeout(grace.saturating_duration_since(Instant::now()))
+                    {
+                        break Ok(result);
+                    }
+                }
                 given_up.store(true, std::sync::atomic::Ordering::SeqCst);
                 // A result sent as the wait ended is still taken.
                 break rx.try_recv().map_err(|_| e);
@@ -1237,9 +1334,7 @@ const STOPPING: &str = "cancelled: whoever probes is stopping";
 
 /// Whether whoever probes with `env` stops.
 fn cancelled(env: &ProbeEnv) -> bool {
-    env.cancel
-        .as_ref()
-        .is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst))
+    env.cancel.as_ref().is_some_and(ProbeStop::is_stopped)
 }
 
 /// How long past the cleanup grace [`codex_schema`] waits for the reading to report.
@@ -2510,9 +2605,6 @@ fn capture(
         argv: argv(program, args),
         detail,
     };
-    if cancelled(env) {
-        return Err(failed(STOPPING.to_owned()));
-    }
     // The limit is known before anything starts: past the shared deadline nothing is run (M1T07R-08).
     let limit = env.deadline.map_or(env.timeout, |shared| {
         env.timeout
@@ -2542,10 +2634,16 @@ fn capture(
     // ETXTBSY is transient: a process forked elsewhere still holds a just-written executable open for writing until
     // it execs (a known Linux race when files are written and executed concurrently). Retry a few times.
     // Retry a few times, but never past the end: then the command is not started.
+    // Started and registered for the stop in one step: none starts once whoever probes stopped (M2T07R-300).
+    let start = || match &env.cancel {
+        Some(stop) => stop.start(spawn),
+        None => Some(spawn().map(Started::new)),
+    };
     let mut attempt = 0;
-    let mut child = loop {
-        match spawn() {
-            Err(e) if e.kind() == io::ErrorKind::ExecutableFileBusy && attempt < 20 => {
+    let started = loop {
+        match start() {
+            None => return Err(failed(STOPPING.to_owned())),
+            Some(Err(e)) if e.kind() == io::ErrorKind::ExecutableFileBusy && attempt < 20 => {
                 attempt += 1;
                 let left = end.saturating_duration_since(Instant::now());
                 if left.is_zero() {
@@ -2560,12 +2658,16 @@ fn capture(
                     });
                 }
             }
-            other => break other.map_err(|e| failed(format!("cannot start: {e}")))?,
+            Some(other) => break other.map_err(|e| failed(format!("cannot start: {e}")))?,
         }
     };
-    let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
     // From here on every exit, an error or a panic included, ends the command (M1T07R-53).
-    let mut owned = Owned::new(child);
+    let (stdout, stderr) = (started.stdout, started.stderr);
+    let mut owned = Owned {
+        slot: started.slot,
+        pid: started.pid,
+    };
+    between("started", program.parent().unwrap_or(program));
     // Both outputs are read here, between looks at the command, up to their limit and the end: nothing reads them
     // once the probe returns, so a helper that left the group and holds a pipe open keeps nothing of it (M1T07R-44,
     // -47).
@@ -2621,6 +2723,10 @@ fn capture(
     let Some(status) = status else {
         return Err(timed_out());
     };
+    // Ended while whoever probes stops: by the stop's kill, or at least not a reading kept (M2T07R-300).
+    if cancelled(env) {
+        return Err(failed(STOPPING.to_owned()));
+    }
     if outputs.iter().any(|o| o.over) {
         return Err(failed(format!(
             "more output than the probe reads ({MAX_OUTPUT} bytes)"
@@ -2640,28 +2746,25 @@ const REAP_WAIT: Duration = Duration::from_secs(1);
 /// A command the probe started, owned from the moment it started: ended ([`Owned::end`]) when dropped, so no exit
 /// of [`capture`] leaves it running (M1T07R-53).
 struct Owned {
-    /// `None` once ended.
-    child: Option<std::process::Child>,
+    /// Its child, `None` once ended; a stop signals it while it is there (M2T07R-300).
+    slot: Slot,
     pid: Pid,
 }
 
 impl Owned {
-    fn new(child: std::process::Child) -> Owned {
-        let pid = Pid::from_child(&child);
-        Owned {
-            child: Some(child),
-            pid,
-        }
-    }
-
     /// Kill its process group and its leader, and reap the leader, once; the exit status when reaped within
     /// [`REAP_WAIT`]. Both are signalled only while the leader is not reaped, so the id is still its own; the leader
     /// is killed on its own too, as it may have moved itself into another group (M1T07R-80). A leader that does not
     /// die by then (a call SIGKILL does not end) is reaped by a thread of its own.
     fn end(&mut self) -> Option<ExitStatus> {
-        let mut child = self.child.take()?;
-        let _ = kill_process_group(self.pid, Signal::KILL);
-        let _ = kill_process(self.pid, Signal::KILL);
+        // Taken out and signalled under the slot's lock: a stop never signals a number once it may be reaped.
+        let mut child = {
+            let mut held = locked(&self.slot);
+            let child = held.take()?;
+            let _ = kill_process_group(self.pid, Signal::KILL);
+            let _ = kill_process(self.pid, Signal::KILL);
+            child
+        };
         let until = Instant::now() + REAP_WAIT;
         loop {
             match child.try_wait() {
@@ -2808,6 +2911,144 @@ mod tests {
             Quarantine::new(temp.as_fd(), dir, &Held::default()).expect("make a quarantine");
         remove_within(dir, temp.as_fd(), owned.as_fd(), &quarantine, work)
             & quarantine.remove(temp.as_fd())
+    }
+
+    /// Whether process `pid` has ended (gone, or a zombie not reaped yet).
+    fn ended(pid: &str) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
+            stat.rsplit_once(')')
+                .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
+        })
+    }
+
+    #[test]
+    fn a_stop_kills_the_commands_a_stalled_probe_started_and_starts_none()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // M2T07R-300 (docs/adr/ADR-022.md decision 10 v4): the stop itself kills every command a probe started, its
+        // group included, however late the thread that started it runs (here stalled just after the start); once
+        // stopped, no command starts.
+        let tmp = tempfile::tempdir()?;
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir(&bin)?;
+        let (leader, member) = (tmp.path().join("leader"), tmp.path().join("member"));
+        let launcher = bin.join("codex");
+        std::fs::write(
+            &launcher,
+            format!(
+                "#!/bin/sh\nsleep 60 &\necho $! > '{member}'\necho $$ > '{leader}'\nwait\n",
+                member = member.display(),
+                leader = leader.display()
+            ),
+        )?;
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))?;
+        let stall = bin.join("hoh-test-stall-started");
+        std::fs::write(&stall, "")?;
+        let stop = ProbeStop::default();
+        let env = ProbeEnv {
+            path: format!("{}:/usr/bin:/bin", bin.display()).into(),
+            fixture_root: None,
+            timeout: Duration::from_secs(30),
+            log: None,
+            deadline: None,
+            cancel: Some(stop.clone()),
+        };
+        let probing = {
+            let (launcher, env) = (launcher.clone(), env.clone());
+            std::thread::spawn(move || run(&launcher, &["--version"], &env).map(|_| ()))
+        };
+        let until = Instant::now() + Duration::from_secs(10);
+        while !(leader.exists() && member.exists()) {
+            assert!(Instant::now() < until, "the command never ran");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let pids = [
+            std::fs::read_to_string(&leader)?.trim().to_owned(),
+            std::fs::read_to_string(&member)?.trim().to_owned(),
+        ];
+        stop.stop();
+        // The probe's thread is still stalled: the stop alone ended both.
+        let until = Instant::now() + Duration::from_secs(2);
+        while !pids.iter().all(|p| ended(p)) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let alive: Vec<&String> = pids.iter().filter(|p| !ended(p)).collect();
+        for pid in &alive {
+            let _ = Command::new("kill").args(["-KILL", pid.as_str()]).status();
+        }
+        std::fs::remove_file(&stall)?;
+        let result = probing.join().map_err(|_| "the probe panicked")?;
+        assert!(alive.is_empty(), "alive after the stop: {alive:?}");
+        assert!(result.is_err(), "{result:?}");
+        // Stopped, nothing starts.
+        let ran = tmp.path().join("ran");
+        std::fs::write(&launcher, format!("#!/bin/sh\ntouch '{}'\n", ran.display()))?;
+        let refused = run(&launcher, &["--version"], &env);
+        assert!(
+            matches!(&refused, Err(ProbeError::Failed { detail, .. }) if detail == STOPPING),
+            "{refused:?}"
+        );
+        assert!(!ran.exists(), "a command started after the stop");
+        Ok(())
+    }
+
+    #[test]
+    fn a_stopped_schema_reading_ends_with_its_output_removed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // M2T07R-300 (docs/adr/ADR-022.md decision 10 v4): stopped while the schema is generated, the reader is given
+        // its cleanup grace: the probe returns its reading's own end (the stop), its output removed, not a reading
+        // given up with its directory left behind.
+        let tmp = tempfile::tempdir()?;
+        let (pid, out) = (tmp.path().join("pid"), tmp.path().join("out"));
+        let launcher = tmp.path().join("codex");
+        // Its output holds an entry that stalls the removal until the test removes it: the reading ends a while
+        // after the stop, within the cleanup grace.
+        std::fs::write(
+            &launcher,
+            format!(
+                "#!/bin/sh\n[ \"$2\" = generate-json-schema ] || exit 2\necho \"$4\" > '{out}'\n\
+                 touch \"$4/hoh-test-stall-remove\"\necho $$ > '{pid}'\nexec sleep 30\n",
+                out = out.display(),
+                pid = pid.display()
+            ),
+        )?;
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))?;
+        let stop = ProbeStop::default();
+        let env = ProbeEnv {
+            path: "/usr/bin:/bin".into(),
+            fixture_root: None,
+            timeout: Duration::from_secs(30),
+            log: None,
+            deadline: None,
+            cancel: Some(stop.clone()),
+        };
+        let reading = std::thread::spawn(move || codex_schema(&launcher, &env).map(|_| ()));
+        let until = Instant::now() + Duration::from_secs(10);
+        while !pid.exists() {
+            assert!(Instant::now() < until, "the schema was never generated");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = PathBuf::from(std::fs::read_to_string(&out)?.trim_end());
+        let stopping = Instant::now();
+        stop.stop();
+        std::thread::sleep(Duration::from_millis(300));
+        std::fs::remove_file(output.join("hoh-test-stall-remove"))?;
+        let result = reading.join().map_err(|_| "the reading panicked")?;
+        assert!(
+            stopping.elapsed() < CLEANUP_GRACE + READER_MARGIN,
+            "{:?}",
+            stopping.elapsed()
+        );
+        assert!(
+            !output.exists(),
+            "its output is left at {}",
+            output.display()
+        );
+        assert!(
+            matches!(&result, Err(ProbeError::Failed { detail, .. })
+                if detail.contains(STOPPING) && !detail.contains("may be left") && !detail.contains("time limit")),
+            "{result:?}"
+        );
+        Ok(())
     }
 
     #[test]

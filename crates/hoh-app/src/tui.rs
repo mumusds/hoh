@@ -14,7 +14,6 @@ mod tests;
 
 use crate::exit::{ClientEvent, Ending, exit_code};
 use app::{App, Exit};
-use history::History;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{Event, KeyEventKind};
@@ -179,11 +178,7 @@ fn run_with(project: &Path, link: Option<(Link, String)>) -> u8 {
         say!("hoh：无法登记信号处理：{e}");
         return code(ClientEvent::TerminalIo);
     }
-    let name = project.file_name().map_or_else(
-        || project.display().to_string(),
-        |n| n.to_string_lossy().into_owned(),
-    );
-    let mut app = App::new(name, History::load(project));
+    let mut app = App::open(project);
     let link = link.map(|(link, label)| {
         app.attach(&link.run_id, &label);
         link
