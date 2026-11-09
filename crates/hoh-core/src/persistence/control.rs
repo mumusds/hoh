@@ -314,11 +314,7 @@ fn record_pass(
             ctx,
         )?;
         // Its work, started and never observed, is not known to have happened or not (ADR-021 decision 8e).
-        tx.execute(
-            "UPDATE effects SET state = 'UNKNOWN' WHERE attempt_id = ?1 AND state = 'STARTED'",
-            params![pass.attempt_id],
-        )
-        .map_err(sqlite_error)?;
+        attempts::effects_unknown(&tx, &pass.attempt_id)?;
         super::retry::accrue_wall(&tx, &run_id, &pass.attempt_id, pass.at, None)?;
     }
     let done = writer::write(

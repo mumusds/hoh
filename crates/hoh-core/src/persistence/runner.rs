@@ -590,10 +590,15 @@ fn finished(
     let from = writer::parse::<AttemptState>(&from)?;
     // A process that never started leaves its attempt STARTING: it can only fail. A cancel takes precedence over how
     // the work ended: CANCELLED, not counted, no retry; the run's cancel moves its task (ADR-021 decision 8e).
-    let success = ending.success && from == AttemptState::Running && !cancelled;
-    // A turn that started an effect it never reported: what it did is unknown, so nothing runs it again and its task
-    // stays (ADR-019 decision 5, M2T07R-200). Only a RUNNING attempt can have started one.
-    let unknown = ending.unknown_effect && from == AttemptState::Running && !cancelled;
+    // Its effects still STARTED: none was observed (the runner observes and commits the work it saw end first).
+    let started = super::attempts::started_effects(&tx, attempt_id)?;
+    // A turn that started an effect it never reported, or an effect left STARTED at all: what it did is unknown, so
+    // nothing runs it again and its task stays, by the rule a reconcile applies too (ADR-019 decision 5; ADR-022
+    // decision 12 v3, M2T07R-200, -451). Only a RUNNING attempt can have started one.
+    let unknown = (ending.unknown_effect || !started.is_empty())
+        && from == AttemptState::Running
+        && !cancelled;
+    let success = ending.success && from == AttemptState::Running && !cancelled && !unknown;
     let to = if cancelled {
         AttemptState::Cancelled
     } else if unknown {
@@ -661,31 +666,12 @@ fn finished(
             payload: payload.clone(),
         });
     }
-    // The effects it left STARTED: named for whoever settles them (as a reconcile's diagnostic does) when its effect is
-    // unknown; UNKNOWN when it was cancelled, as the cancel's own pass and a reconcile record them (ADR-021 decision 8e,
-    // M2T07R-301).
-    let started: Vec<String> = if unknown || cancelled {
-        let mut statement = tx
-            .prepare(
-                "SELECT effect_key FROM effects WHERE attempt_id = ?1 AND state = 'STARTED' ORDER BY effect_key",
-            )
-            .map_err(sqlite_error)?;
-        statement
-            .query_map(params![attempt_id], |r| r.get(0))
-            .map_err(sqlite_error)?
-            .collect::<Result<_, _>>()
-            .map_err(sqlite_error)?
-    } else {
-        Vec::new()
-    };
-    if cancelled {
-        tx.execute(
-            "UPDATE effects SET state = 'UNKNOWN' WHERE attempt_id = ?1 AND state = 'STARTED'",
-            params![attempt_id],
-        )
-        .map_err(sqlite_error)?;
+    // The effects it left STARTED are UNKNOWN, in its ending's transaction, and named for whoever settles them, as the
+    // cancel's own pass and a reconcile record them (ADR-021 decision 8e; ADR-022 decision 12 v3, M2T07R-301, -451).
+    if unknown || cancelled {
+        super::attempts::effects_unknown(&tx, attempt_id)?;
     }
-    if unknown || !started.is_empty() {
+    if !started.is_empty() && (unknown || cancelled) {
         commit.events.push(NewEvent {
             project_id: project_id.clone(),
             event_id: crate::ids::child_id(attempt_id, "runner/unknown-effect"),

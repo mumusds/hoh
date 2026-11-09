@@ -1277,6 +1277,8 @@ impl hoh_core::delivery::Clock for FakeClock {
 struct StuckExecutor {
     cancels: PathBuf,
     started: std::sync::Mutex<Vec<u32>>,
+    /// Whether it holds the turns it started, so a native cancel reaches them (an executor that lost one does not).
+    holds: bool,
 }
 
 impl hoh_app::host::Executor for StuckExecutor {
@@ -1298,7 +1300,7 @@ impl hoh_app::host::Executor for StuckExecutor {
         Ok(hoh_app::host::Started { pid, gate, ended })
     }
 
-    fn cancel(&self, work: &hoh_app::host::Work) {
+    fn cancel(&self, work: &hoh_app::host::Work) -> bool {
         use std::io::Write as _;
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
@@ -1319,6 +1321,7 @@ impl hoh_app::host::Executor for StuckExecutor {
                 .unwrap_or_default();
             let _ = writeln!(file, "{now}");
         }
+        self.holds
     }
 }
 
@@ -1406,6 +1409,82 @@ INSERT INTO leases(project_id, kind, attempt_id, epoch, expires_at) VALUES (:p, 
 /// task's revision unchanged and one history event; a write of the old host epoch changes 0 rows and is an
 /// IntegrityViolation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_settle_whose_native_cancel_reached_no_turn_waits_only_the_sigterm_grace() -> R {
+    // M2T07R-453 (docs/adr/ADR-022.md decision 17): an expired lease whose executor no longer holds the turn (its
+    // native cancel reaches nothing) is settled with SIGTERM after the SIGTERM grace, not the longer native one, and
+    // its step says no native cancel was sent.
+    let dir = tempfile::tempdir()?;
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    let (code, stderr) = serve_and_stop(&project)?;
+    assert_eq!(code, 0, "{stderr}");
+    seed(&project, WRITERS)?;
+    let clock = Arc::new(FakeClock::default());
+    let executor = Arc::new(StuckExecutor {
+        cancels: dir.path().join("cancels"),
+        started: std::sync::Mutex::new(Vec::new()),
+        holds: false,
+    });
+    let mut config = config(&project);
+    config.clock = hoh_app::host::HostClock(clock.clone());
+    config.reconcile.native_grace = Duration::from_millis(1500);
+    config.reconcile.term_grace = Duration::from_millis(300);
+    config.reconcile.kill_grace = Duration::from_secs(5);
+    let developer = ["structured_events", "command_exec"].map(str::to_owned);
+    config.runner = Some(hoh_app::host::RunnerConfig {
+        executor: executor.clone(),
+        context: Context {
+            required_capabilities: [("developer".to_owned(), developer.into_iter().collect())]
+                .into(),
+            ..Context::default()
+        },
+    });
+    let host = Host::start(config).await?;
+    let db = db(&project);
+    assert!(wait_for(
+        &db,
+        "SELECT a.state || ':' || l.epoch FROM attempts a JOIN leases l ON l.attempt_id = a.attempt_id \
+         WHERE a.task_id = 'T1' AND l.kind = 'writer'",
+        "RUNNING:4",
+        Duration::from_secs(30)
+    )?);
+    let a1 = query(&db, "SELECT attempt_id FROM attempts WHERE task_id = 'T1'")?;
+    clock.advance(Duration::from_secs(300));
+    assert!(wait_for(
+        &db,
+        &format!(
+            "SELECT count(*) FROM events WHERE kind = 'lease.reaped' AND json_extract(payload_json, '$.attempt_id') = '{a1}'"
+        ),
+        "1",
+        Duration::from_secs(30)
+    )?);
+    let sent = query(
+        &db,
+        &format!(
+            "SELECT json_extract(payload_json, '$.sent') FROM events WHERE kind = 'lease.native_cancel' \
+             AND json_extract(payload_json, '$.attempt_id') = '{a1}'"
+        ),
+    )?;
+    let first = |file: &str| -> R<u128> {
+        Ok(std::fs::read_to_string(dir.path().join(file))?
+            .lines()
+            .next()
+            .ok_or(format!("nothing in {file}"))?
+            .trim()
+            .parse()?)
+    };
+    let gap = first("cancels.term")?.saturating_sub(first("cancels.at")?);
+    host.shutdown().await;
+    drop(executor);
+    assert_eq!(sent, "0", "the step says a native cancel was sent");
+    assert!(
+        gap < 1_200_000_000,
+        "SIGTERM {gap} ns after a native cancel that reached nothing"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_041_02_an_expired_lease_is_granted_again_only_after_its_holder_is_reaped() -> R {
     let dir = tempfile::tempdir()?;
     let project = dir.path().join("p");
@@ -1417,6 +1496,7 @@ async fn test_041_02_an_expired_lease_is_granted_again_only_after_its_holder_is_
     let executor = Arc::new(StuckExecutor {
         cancels: dir.path().join("cancels"),
         started: std::sync::Mutex::new(Vec::new()),
+        holds: true,
     });
     let grant_probe = Arc::new(GrantProbe::default());
     let mut config = config(&project);
@@ -1967,6 +2047,7 @@ async fn a_lost_completion_is_settled_never_run_again() -> R {
     let executor = Arc::new(Losing(StuckExecutor {
         cancels: dir.path().join("cancels"),
         started: std::sync::Mutex::new(Vec::new()),
+        holds: true,
     }));
     let host = runner_host(&project, executor.clone(), clock, None).await?;
     let db = db(&project);
@@ -2053,6 +2134,7 @@ async fn a_settle_cut_short_is_done_again_by_another_pass() -> R {
         let executor = Arc::new(StuckExecutor {
             cancels: dir.path().join("cancels"),
             started: std::sync::Mutex::new(Vec::new()),
+            holds: true,
         });
         let faults = Arc::new(FailNthCommit {
             nth,
@@ -2981,8 +3063,8 @@ impl hoh_app::host::Executor for Cancellable {
         Ok(hoh_app::host::Started { pid, gate, ended })
     }
 
-    fn cancel(&self, work: &hoh_app::host::Work) {
-        self.0.cancel(work);
+    fn cancel(&self, work: &hoh_app::host::Work) -> bool {
+        let held = self.0.cancel(work);
         for pid in self.0.started.lock().map(|p| p.clone()).unwrap_or_default() {
             if let Some(pid) = i32::try_from(pid)
                 .ok()
@@ -2991,6 +3073,7 @@ impl hoh_app::host::Executor for Cancellable {
                 let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
             }
         }
+        held
     }
 }
 
@@ -3009,6 +3092,7 @@ async fn a_holder_ended_by_its_native_cancel_gets_no_signal() -> R {
     let executor = Arc::new(Cancellable(StuckExecutor {
         cancels: dir.path().join("cancels"),
         started: std::sync::Mutex::new(Vec::new()),
+        holds: true,
     }));
     let host = runner_host(&project, executor.clone(), clock.clone(), None).await?;
     let db = db(&project);
@@ -3075,8 +3159,8 @@ impl hoh_app::host::Executor for LeaderOnlyCancel {
         Ok(hoh_app::host::Started { pid, gate, ended })
     }
 
-    fn cancel(&self, work: &hoh_app::host::Work) {
-        self.0.cancel(work);
+    fn cancel(&self, work: &hoh_app::host::Work) -> bool {
+        let held = self.0.cancel(work);
         for pid in self.0.started.lock().map(|p| p.clone()).unwrap_or_default() {
             if let Some(pid) = i32::try_from(pid)
                 .ok()
@@ -3085,6 +3169,7 @@ impl hoh_app::host::Executor for LeaderOnlyCancel {
                 let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
             }
         }
+        held
     }
 }
 
@@ -3127,6 +3212,7 @@ async fn a_group_is_watched_through_its_settle_however_slow_the_writes() -> R {
     let executor = Arc::new(LeaderOnlyCancel(StuckExecutor {
         cancels: dir.path().join("cancels"),
         started: std::sync::Mutex::new(Vec::new()),
+        holds: true,
     }));
     let slow = Arc::new(SlowWritesWhileSettling::default());
     let host = runner_host_with(

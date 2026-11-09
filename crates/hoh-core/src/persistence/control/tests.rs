@@ -851,3 +851,130 @@ async fn a_cancelled_attempt_whose_effect_is_unknown_ends_the_same_however_it_en
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn an_unknown_effect_ends_the_same_by_its_runner_or_a_reconcile() -> R {
+    // M2T07R-451 (docs/adr/ADR-022.md decision 12 v3, AC-041-05): with no cancel, A1 ends with its work effect started
+    // and never reported, by its runner or by a later host's reconcile: either way A1 is UNKNOWN_EFFECT, its effect
+    // UNKNOWN and named in a diagnostic, its task untouched, nothing counted or retried.
+    use crate::reconcile::{Disposition, EffectMove, Process};
+    use crate::retry::FailureClass;
+    for by_reconcile in [false, true] {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = open(&dir)?;
+        Connection::open(&path)?.execute_batch(WORLD)?;
+        let at = parse_rfc3339("2026-11-07T00:00:05Z").ok_or("time")?;
+        let diagnostic_kind = if by_reconcile {
+            let rows = store.reconcile_scan("p1", at).await?;
+            let [row] = rows.as_slice() else {
+                return Err(format!("unfinished: {rows:?}").into());
+            };
+            store
+                .reconcile_apply(
+                    row.clone(),
+                    Disposition::UnknownEffect {
+                        effects: vec![EffectMove {
+                            key: "A1/work".to_owned(),
+                            from: crate::reconcile::EffectState::Started,
+                            to: crate::reconcile::EffectState::Unknown,
+                            external_ref: None,
+                        }],
+                        unknown: vec!["A1/work".to_owned()],
+                    },
+                    Process::Gone {
+                        basis: "no_process".to_owned(),
+                    },
+                    "reconcile",
+                    at,
+                    0,
+                )
+                .await?;
+            "reconcile.diagnostic"
+        } else {
+            store
+                .runner_finished(
+                    "A1",
+                    crate::persistence::Ending {
+                        success: false,
+                        detail: "PROTOCOL_INCOMPLETE".to_owned(),
+                        class: FailureClass::Transient { retry_after: None },
+                        at,
+                        draw: 0,
+                        observed: Default::default(),
+                        unknown_effect: true,
+                    },
+                )
+                .await?;
+            "runner.diagnostic"
+        };
+        let conn = Connection::open(&path)?;
+        let row: (String, String, String, i64, Option<String>) = conn.query_row(
+            "SELECT a.state, e.state, t.state, t.attempt_count, t.next_retry_at FROM attempts a, effects e, tasks t \
+             WHERE a.attempt_id = 'A1' AND e.effect_key = 'A1/work' AND t.task_id = 'T1'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )?;
+        assert_eq!(
+            row,
+            (
+                "UNKNOWN_EFFECT".to_owned(),
+                "UNKNOWN".to_owned(),
+                "RUNNING".to_owned(),
+                0,
+                None
+            ),
+            "by the reconcile: {by_reconcile}"
+        );
+        let keys: String = conn.query_row(
+            "SELECT json_extract(payload_json, '$.effect_keys') FROM events WHERE kind = ?1 \
+             AND json_extract(payload_json, '$.code') = 'UNKNOWN_EFFECT' AND json_extract(payload_json, '$.attempt_id') = 'A1'",
+            [diagnostic_kind],
+            |r| r.get(0),
+        )?;
+        assert_eq!(keys, r#"["A1/work"]"#, "by the reconcile: {by_reconcile}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_runners_end_that_leaves_an_effect_started_is_an_unknown_effect_however_it_is_reported()
+-> R {
+    // M2T07R-451 (docs/adr/ADR-022.md decision 12 v3): the store reads the effects, not only the executor's word: an
+    // end reported as a plain failure with A1's work effect still STARTED (never observed) is UNKNOWN_EFFECT, its
+    // effect UNKNOWN, nothing counted or retried, as a reconcile would end it.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(WORLD)?;
+    let at = parse_rfc3339("2026-11-07T00:00:05Z").ok_or("time")?;
+    store
+        .runner_finished(
+            "A1",
+            crate::persistence::Ending {
+                success: false,
+                detail: "exit 1".to_owned(),
+                class: crate::retry::FailureClass::Transient { retry_after: None },
+                at,
+                draw: 0,
+                observed: Default::default(),
+                unknown_effect: false,
+            },
+        )
+        .await?;
+    let row: (String, String, String, i64, Option<String>) = Connection::open(&path)?.query_row(
+        "SELECT a.state, e.state, t.state, t.attempt_count, t.next_retry_at FROM attempts a, effects e, tasks t \
+         WHERE a.attempt_id = 'A1' AND e.effect_key = 'A1/work' AND t.task_id = 'T1'",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+    )?;
+    assert_eq!(
+        row,
+        (
+            "UNKNOWN_EFFECT".to_owned(),
+            "UNKNOWN".to_owned(),
+            "RUNNING".to_owned(),
+            0,
+            None
+        )
+    );
+    Ok(())
+}

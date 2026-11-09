@@ -53,10 +53,12 @@ pub struct ProbeEnv {
     pub cancel: Option<ProbeStop>,
 }
 
-/// The stop of whoever probes (docs/adr/ADR-022.md decision 10 v4, M2T07R-300): [`ProbeStop::stop`] kills every
+/// The stop of whoever probes (docs/adr/ADR-022.md decision 10 v5, M2T07R-300, -450): [`ProbeStop::stop`] kills every
 /// command a probe started and has not reaped yet, its process group and its leader, before it returns, however late
-/// the thread that started it runs; once stopped, no command starts (the check, the start and the registration are one
-/// step under its lock). The thread that started a command still reaps it, taking it out of the registration first.
+/// the thread that started it runs, and never waits for a start: a start registers its slot under the stop's lock
+/// (none once stopped) and spawns outside it; once spawned, its starter puts the child in its slot and then looks at
+/// the stop, so the stop or the starter kills it, whichever comes second. The thread that started a command still
+/// reaps it, taking it out of its slot first.
 #[derive(Debug, Clone, Default)]
 pub struct ProbeStop(std::sync::Arc<Stopping>);
 
@@ -90,21 +92,23 @@ impl ProbeStop {
         self.0.stopped.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// `spawn` run unless stopped, what it started registered for the stop: `None` when stopped.
+    /// `spawn` run unless stopped, in a slot registered for the stop before it: `None` when stopped. The spawn runs
+    /// outside the stop's lock, so a stop never waits for an exec (M2T07R-450); a caller that finds the stop once this
+    /// returns ends what it started.
     fn start(
         &self,
         spawn: impl FnOnce() -> io::Result<std::process::Child>,
     ) -> Option<io::Result<Started>> {
-        let mut commands = locked(&self.0.commands);
-        if self.is_stopped() {
-            return None;
+        let slot: Slot = std::sync::Arc::default();
+        {
+            let mut commands = locked(&self.0.commands);
+            if self.is_stopped() {
+                return None;
+            }
+            commands.retain(|c| c.strong_count() > 0);
+            commands.push(std::sync::Arc::downgrade(&slot));
         }
-        commands.retain(|c| c.strong_count() > 0);
-        Some(spawn().map(|child| {
-            let started = Started::new(child);
-            commands.push(std::sync::Arc::downgrade(&started.slot));
-            started
-        }))
+        Some(spawn().map(|child| Started::new(slot, child)))
     }
 }
 
@@ -120,11 +124,13 @@ struct Started {
 }
 
 impl Started {
-    fn new(mut child: std::process::Child) -> Started {
+    /// `child` put in `slot`, where a stop finds it from now on.
+    fn new(slot: Slot, mut child: std::process::Child) -> Started {
         let pid = Pid::from_child(&child);
         let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
+        *locked(&slot) = Some(child);
         Started {
-            slot: std::sync::Arc::new(std::sync::Mutex::new(Some(child))),
+            slot,
             pid,
             stdout,
             stderr,
@@ -2618,6 +2624,7 @@ fn capture(
     // One absolute end for the retries below and the wait after the start (M1T07R-11).
     let end = Instant::now() + limit;
     let spawn = || {
+        between("spawning", program.parent().unwrap_or(program));
         Command::new(program)
             .args(args)
             .env("PATH", &env.path)
@@ -2634,10 +2641,10 @@ fn capture(
     // ETXTBSY is transient: a process forked elsewhere still holds a just-written executable open for writing until
     // it execs (a known Linux race when files are written and executed concurrently). Retry a few times.
     // Retry a few times, but never past the end: then the command is not started.
-    // Started and registered for the stop in one step: none starts once whoever probes stopped (M2T07R-300).
+    // Registered for the stop before it starts: none starts once whoever probes stopped (M2T07R-300, -450).
     let start = || match &env.cancel {
         Some(stop) => stop.start(spawn),
-        None => Some(spawn().map(Started::new)),
+        None => Some(spawn().map(|child| Started::new(Slot::default(), child))),
     };
     let mut attempt = 0;
     let started = loop {
@@ -2693,6 +2700,8 @@ fn capture(
             owned.end();
             return Err(timed_out());
         }
+        // Whoever probes stopped: ended here, its starter, as well as by the stop, so a command that started while the
+        // stop found its slot empty, or whose escaped child holds its output, ends at once (decision 10 v5).
         if cancelled(env) {
             owned.end();
             return Err(failed(STOPPING.to_owned()));
@@ -2988,6 +2997,143 @@ mod tests {
             "{refused:?}"
         );
         assert!(!ran.exists(), "a command started after the stop");
+        Ok(())
+    }
+
+    #[test]
+    fn a_stop_does_not_wait_for_a_start_in_progress_and_its_command_is_killed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // M2T07R-450 (docs/adr/ADR-022.md decision 10 v5): a start held inside its spawn (as an exec that hangs holds
+        // it) does not hold up the stop; once the spawn returns, its starter finds the stop and kills what it started.
+        let tmp = tempfile::tempdir()?;
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir(&bin)?;
+        let pid = tmp.path().join("pid");
+        let launcher = bin.join("codex");
+        std::fs::write(
+            &launcher,
+            format!("#!/bin/sh\necho $$ > '{}'\nexec sleep 60\n", pid.display()),
+        )?;
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))?;
+        let stall = bin.join("hoh-test-stall-spawning");
+        std::fs::write(&stall, "")?;
+        let stop = ProbeStop::default();
+        let env = ProbeEnv {
+            path: "/usr/bin:/bin".into(),
+            fixture_root: None,
+            timeout: Duration::from_secs(30),
+            log: None,
+            deadline: None,
+            cancel: Some(stop.clone()),
+        };
+        let probing = std::thread::spawn(move || run(&launcher, &["--version"], &env).map(|_| ()));
+        // The start is inside its spawn, held there.
+        std::thread::sleep(Duration::from_millis(300));
+        let stopper = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let at = Instant::now();
+                stop.stop();
+                at.elapsed()
+            })
+        };
+        let until = Instant::now() + Duration::from_secs(2);
+        while !stopper.is_finished() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let stopped_at_once = stopper.is_finished();
+        std::fs::remove_file(&stall)?;
+        let took = stopper.join().map_err(|_| "the stop panicked")?;
+        let result = probing.join().map_err(|_| "the probe panicked")?;
+        let leader = std::fs::read_to_string(&pid)
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        let left = !leader.is_empty() && !ended(&leader);
+        if left {
+            let _ = Command::new("kill")
+                .args(["-KILL", leader.as_str()])
+                .status();
+        }
+        assert!(stopped_at_once, "the stop waited for the spawn ({took:?})");
+        assert!(!left, "the command started during the stop outlived it");
+        assert!(
+            matches!(&result, Err(ProbeError::Failed { detail, .. }) if detail == STOPPING),
+            "{result:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_stopped_probe_does_not_even_try_to_start_a_command() {
+        // M2T07R-400 (docs/adr/ADR-022.md decision 10 v4): once stopped, the start does not run the spawn at all (the
+        // check and the start are one step under the stop's lock), whatever a command started and killed at once
+        // would have left behind.
+        let stop = ProbeStop::default();
+        let mut tried = false;
+        let before = stop.start(|| Err(io::Error::other("not started")));
+        assert!(
+            matches!(before, Some(Err(_))),
+            "before the stop the spawn runs"
+        );
+        stop.stop();
+        let after = stop.start(|| {
+            tried = true;
+            Err(io::Error::other("not started"))
+        });
+        assert!(after.is_none());
+        assert!(!tried, "a stopped probe ran its spawn");
+    }
+
+    #[test]
+    fn a_stopped_probe_ends_at_once_though_an_escaped_child_holds_its_output()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // M2T07R-202, -300 (docs/adr/ADR-022.md decision 10 v4): the stop kills the command's group, but a child that
+        // left it (setsid) keeps the output open; the probe still ends at once, not at its time limit.
+        let tmp = tempfile::tempdir()?;
+        let (pid, escaped) = (tmp.path().join("pid"), tmp.path().join("escaped"));
+        let launcher = tmp.path().join("codex");
+        std::fs::write(
+            &launcher,
+            format!(
+                "#!/bin/sh\nsetsid sh -c 'echo $$ > \"$1\"; exec sleep 60' sh '{escaped}' &\n\
+                 while [ ! -s '{escaped}' ]; do sleep 0.01; done\necho $$ > '{pid}'\nexec sleep 60\n",
+                escaped = escaped.display(),
+                pid = pid.display()
+            ),
+        )?;
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))?;
+        let stop = ProbeStop::default();
+        let env = ProbeEnv {
+            path: "/usr/bin:/bin".into(),
+            fixture_root: None,
+            timeout: Duration::from_secs(30),
+            log: None,
+            deadline: None,
+            cancel: Some(stop.clone()),
+        };
+        let probing = std::thread::spawn(move || run(&launcher, &["--version"], &env).map(|_| ()));
+        let until = Instant::now() + Duration::from_secs(10);
+        while !pid.exists() {
+            assert!(Instant::now() < until, "the command never ran");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let stopping = Instant::now();
+        stop.stop();
+        let result = probing.join().map_err(|_| "the probe panicked")?;
+        let took = stopping.elapsed();
+        let child = std::fs::read_to_string(&escaped)?.trim().to_owned();
+        let _ = Command::new("kill")
+            .args(["-KILL", child.as_str()])
+            .status();
+        assert!(
+            took < Duration::from_secs(2),
+            "the stopped probe took {took:?}"
+        );
+        assert!(
+            matches!(&result, Err(ProbeError::Failed { detail, .. }) if detail == STOPPING),
+            "{result:?}"
+        );
         Ok(())
     }
 
