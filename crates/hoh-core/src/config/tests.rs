@@ -228,6 +228,10 @@ fn an_invalid_value_is_refused_with_its_key_path() {
             "[team.developer]\nfallback = \"claude\"",
             "team.developer.fallback",
         ),
+        (
+            "[team.developer]\nfallback = [\"pi\", \"pi\"]",
+            "team.developer.fallback[1]",
+        ),
         ("[team.developer]\nmodel = 3", "team.developer.model"),
         (
             "[team.reviewer]\nindependent_session = false",
