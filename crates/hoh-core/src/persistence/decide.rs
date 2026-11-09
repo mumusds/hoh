@@ -299,8 +299,8 @@ pub(super) struct LeaseRequest<'a> {
 }
 
 /// Create the PREPARED attempt of a dispatch (its row only: the dispatch's event records it) and grant it the lease,
-/// in the caller's transaction (AC-035-02). The attempt carries the role's epoch, the host epoch and the run's config
-/// revision.
+/// in the caller's transaction (AC-035-02). The attempt carries the role's epoch, the host epoch, and its binding's
+/// agent, session and configuration revision (the run's revision when the role has no binding).
 pub(super) fn lease_task(
     tx: &Transaction<'_>,
     request: &LeaseRequest<'_>,
@@ -313,20 +313,25 @@ pub(super) fn lease_task(
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .map_err(sqlite_error)?;
-    let agent: Option<String> = tx
+    // The binding's agent, session and configuration revision (docs/adr/ADR-022.md decisions 8 and 9).
+    let binding: Option<(String, Option<String>, i64)> = tx
         .query_row(
-            "SELECT agent FROM role_bindings WHERE run_id = ?1 AND role = ?2",
+            "SELECT agent, session_id, config_revision FROM role_bindings WHERE run_id = ?1 AND role = ?2",
             params![request.run_id, request.role],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()
         .map_err(sqlite_error)?;
+    let (agent, session_id, config_revision) = match binding {
+        Some((agent, session, revision)) => (Some(agent), session, revision),
+        None => (None, None, config_revision),
+    };
     attempts::insert_prepared(
         tx,
         &NewAttempt {
             attempt_id: request.attempt_id.clone(),
             task_id: request.task_id.to_owned(),
-            session_id: None,
+            session_id,
             role_epoch: to_i64(request.role_epoch, "role_epoch")?,
             host_epoch,
             config_revision,
@@ -577,9 +582,11 @@ pub(super) fn load_binding(
         .and_then(|json| serde_json::from_str::<Value>(&json).ok())
         .map(|v| crate::decision::granted_capabilities(&v))
         .unwrap_or_default();
+    // A role whose change waits for its checkpoint is not dispatched (docs/adr/ADR-022.md decision 8).
+    let pending = super::team::pending(tx, run_id, role)?;
     Ok(Some(BindingView {
         role_epoch: revision(epoch)?,
-        active: state == "ACTIVE",
+        active: state == "ACTIVE" && !pending,
         capabilities,
     }))
 }

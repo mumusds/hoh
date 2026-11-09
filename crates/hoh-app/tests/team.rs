@@ -531,3 +531,86 @@ async fn a_team_change_with_an_unknown_key_or_a_bad_role_name_is_refused_with_it
     host.shutdown().await;
     Ok(())
 }
+
+/// An executor that is never given work (no task exists): only the runner's ticks run.
+#[derive(Debug)]
+struct Idle;
+
+impl hoh_app::host::Executor for Idle {
+    fn deliver(
+        &self,
+        _work: &hoh_app::host::Work,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
+        tokio::sync::oneshot::channel().1
+    }
+
+    fn start(&self, _work: &hoh_app::host::Work) -> Result<hoh_app::host::Started, String> {
+        Err("no work is expected".to_owned())
+    }
+}
+
+/// Run `sql` on the project's database.
+fn exec(project: &Path, sql: &str) -> R {
+    let out = Command::new("python3")
+        .args([
+            "-c",
+            "import sqlite3,sys; c=sqlite3.connect(sys.argv[1], timeout=10); c.executescript(sys.argv[2]); c.commit()",
+        ])
+        .arg(db(project))
+        .arg(sql)
+        .output()?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).into_owned().into());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_hosts_runner_applies_a_team_change_at_the_roles_checkpoint() -> R {
+    // ADR-022 decision 8: each tick of the runner applies the checkpoint of a working run before its pace and rounds:
+    // a change to a role with no live attempt is bound at the next epoch.
+    let dir = tempfile::tempdir()?;
+    let mut config = config(dir.path());
+    config.runner = Some(hoh_app::host::RunnerConfig {
+        executor: std::sync::Arc::new(Idle),
+        context: hoh_core::decision::Context::default(),
+    });
+    let host = start_when_free(config).await?;
+    let run_id = started(&host, "s1").await?;
+    let (status, body) = exchange(
+        &host,
+        "POST",
+        "/v1/commands",
+        Some(&configure(
+            "dev",
+            None,
+            0,
+            json!({"bindings": {"developer": {"agent": "codex"}}, "apply_at": "checkpoint"}),
+        )),
+    )
+    .await?;
+    assert_eq!(status, 202, "{body}");
+    exec(
+        dir.path(),
+        &format!(
+            "INSERT INTO specs(spec_id, project_id, sha256, revision) SELECT 's1', project_id, printf('%064d', 1), 1 \
+             FROM projects; UPDATE runs SET state = 'RUNNING', spec_id = 's1', revision = revision + 1 \
+             WHERE run_id = '{run_id}';"
+        ),
+    )?;
+    let binding = format!(
+        "SELECT agent || '/' || role_epoch || '/' || config_revision FROM role_bindings \
+         WHERE run_id = '{run_id}' AND role = 'developer'"
+    );
+    let end = std::time::Instant::now() + Duration::from_secs(10);
+    while query(dir.path(), &binding)? != "codex/2/1" {
+        assert!(
+            std::time::Instant::now() < end,
+            "not applied: {}",
+            query(dir.path(), &binding)?
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    host.shutdown().await;
+    Ok(())
+}

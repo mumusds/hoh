@@ -247,3 +247,277 @@ async fn a_refused_start_writes_no_team_revision_and_no_binding() -> R {
     }
     Ok(())
 }
+
+/// The project's ConfigureTeam at team revision `expected` with `bindings`.
+fn team_change(key: &str, expected: i64, bindings: Value) -> SubmitCommand {
+    SubmitCommand {
+        command_id: format!("c-{key}"),
+        idempotency_key: format!("k-{key}"),
+        kind: "ConfigureTeam".to_owned(),
+        run_id: String::new(),
+        expected_revision: expected,
+        payload: json!({"bindings": bindings, "apply_at": "checkpoint"}),
+        payload_sha256: format!("{:064}", key.len() + 100),
+        target: RunTarget::Team(crate::persistence::TeamChange {
+            bindings: Some(bindings),
+            scheduler: None,
+        }),
+        event: NewEvent {
+            project_id: "p1".to_owned(),
+            event_id: format!("e-{key}"),
+            run_id: None,
+            kind: "team.configured".to_owned(),
+            payload: json!({"revision": expected + 1}),
+        },
+        outbox: None,
+    }
+}
+
+fn exec(path: &PathBuf, sql: &str) -> R {
+    Connection::open(path)?.execute_batch(sql)?;
+    Ok(())
+}
+
+/// R1 started (team revision 0), RUNNING on spec s1, with developer task T0 RUNNING (attempt A0 RUNNING) and T1 READY,
+/// both readers; the developer bound to session sd.
+async fn working(store: &Store, path: &PathBuf) -> R {
+    store
+        .submit_command(start("R1", Config::default().budget))
+        .await?;
+    exec(
+        path,
+        "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', 'p1', printf('%064d', 1), 1);
+         UPDATE runs SET state = 'RUNNING', spec_id = 's1' WHERE run_id = 'R1';
+         INSERT INTO sessions(session_id, agent, role, agent_version, capabilities_json) VALUES
+           ('sd', 'claude', 'developer', '1', '{\"structured_events\": true}');
+         UPDATE role_bindings SET session_id = 'sd' WHERE run_id = 'R1' AND role = 'developer';
+         INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate) VALUES
+           ('T0', 'R1', 's1', 'RUNNING', 2, 'developer', 0, 1, 1),
+           ('T1', 'R1', 's1', 'READY', 1, 'developer', 0, 2, 1);
+         INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, agent, started_at)
+           VALUES ('A0', 'T0', 'RUNNING', 1, 1, 0, 'claude', '2026-11-09T00:00:00Z');",
+    )
+}
+
+/// A0 ends and T0 with it.
+fn a0_ends(path: &PathBuf) -> R {
+    exec(
+        path,
+        "UPDATE attempts SET state = 'SETTLED', ended_at = '2026-11-09T00:01:00Z' WHERE attempt_id = 'A0';
+         UPDATE tasks SET state = 'IMPLEMENTED', revision = 3 WHERE task_id = 'T0';",
+    )
+}
+
+#[tokio::test]
+async fn a_changed_role_is_rebound_at_its_checkpoint_with_the_next_epoch() -> R {
+    // ADR-022 decision 8 (REQ-018 behaviour 5): a change waits while the role has an attempt PREPARED, STARTING or
+    // RUNNING; the roles it does not change move to the new revision at once; once the role's attempt ended, its
+    // binding becomes the new one at epoch+1 with no session yet, one team.binding_applied event; then the run is at
+    // the revision. A second checkpoint changes nothing.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    working(&store, &path).await?;
+    store
+        .submit_command(team_change(
+            "dev",
+            0,
+            json!({"developer": {"agent": "codex", "model": "m-test"}}),
+        ))
+        .await?;
+    store.team_checkpoint("R1").await?;
+    let bindings = |path: &PathBuf| {
+        values(
+            path,
+            "SELECT role, agent, model, role_epoch, config_revision, session_id FROM role_bindings \
+             WHERE run_id = 'R1' ORDER BY role",
+        )
+    };
+    let waiting = bindings(&path)?;
+    let developer = waiting
+        .iter()
+        .find(|row| row[0] == "developer")
+        .ok_or("no developer")?;
+    assert_eq!(
+        developer[1..],
+        [
+            json!("claude"),
+            Value::Null,
+            json!(1),
+            json!(0),
+            json!("sd")
+        ],
+        "A0 still runs"
+    );
+    for row in waiting.iter().filter(|row| row[0] != "developer") {
+        assert_eq!((&row[3], &row[4]), (&json!(1), &json!(1)), "{row:?}");
+    }
+    assert_eq!(
+        rows::<i64>(
+            &path,
+            "SELECT config_revision FROM runs WHERE run_id = 'R1'"
+        )?,
+        vec![vec![0]]
+    );
+    let applied = "SELECT count(*) FROM events WHERE kind = 'team.binding_applied'";
+    assert_eq!(rows::<i64>(&path, applied)?, vec![vec![0]]);
+    a0_ends(&path)?;
+    store.team_checkpoint("R1").await?;
+    let developer = bindings(&path)?
+        .into_iter()
+        .find(|row| row[0] == "developer")
+        .ok_or("no developer")?;
+    assert_eq!(
+        developer[1..],
+        [
+            json!("codex"),
+            json!("m-test"),
+            json!(2),
+            json!(1),
+            Value::Null
+        ]
+    );
+    let event: Value = serde_json::from_str(
+        &rows::<String>(
+            &path,
+            "SELECT payload_json FROM events WHERE kind = 'team.binding_applied'",
+        )?[0][0],
+    )?;
+    assert_eq!(
+        event,
+        json!({
+            "run_id": "R1", "role": "developer", "config_revision": 1,
+            "from": {"agent": "claude", "model": null, "role_epoch": 1, "session_id": "sd"},
+            "to": {"agent": "codex", "model": "m-test", "role_epoch": 2},
+        })
+    );
+    assert_eq!(
+        rows::<i64>(
+            &path,
+            "SELECT config_revision FROM runs WHERE run_id = 'R1'"
+        )?,
+        vec![vec![1]]
+    );
+    let events = rows::<i64>(&path, "SELECT count(*) FROM events")?;
+    store.team_checkpoint("R1").await?;
+    assert_eq!(rows::<i64>(&path, "SELECT count(*) FROM events")?, events);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_role_waiting_for_its_checkpoint_is_not_dispatched_and_its_next_attempt_has_the_new_binding()
+-> R {
+    // ADR-022 decisions 8 and 9: while the developer's change waits for A0 to end, no developer task is leased under
+    // the old binding; after the checkpoint (and a session for the new epoch) the next attempt carries the binding's
+    // epoch, revision, agent and session.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    working(&store, &path).await?;
+    let context = crate::decision::Context {
+        required_capabilities: [(
+            "developer".to_owned(),
+            ["structured_events".to_owned()].into(),
+        )]
+        .into(),
+        ..crate::decision::Context::default()
+    };
+    store
+        .submit_command(team_change(
+            "dev",
+            0,
+            json!({"developer": {"model": "m-2"}}),
+        ))
+        .await?;
+    let round = store.schedule_round("R1", context.clone()).await?;
+    assert!(round.dispatched.is_none(), "{round:?}");
+    a0_ends(&path)?;
+    store.team_checkpoint("R1").await?;
+    exec(
+        &path,
+        "INSERT INTO sessions(session_id, agent, role, agent_version, capabilities_json) VALUES
+           ('sd2', 'claude', 'developer', '1', '{\"structured_events\": true}');
+         UPDATE role_bindings SET session_id = 'sd2' WHERE run_id = 'R1' AND role = 'developer';",
+    )?;
+    let round = store.schedule_round("R1", context).await?;
+    assert!(round.dispatched.is_some(), "{round:?}");
+    assert_eq!(
+        values(
+            &path,
+            "SELECT agent, role_epoch, config_revision, session_id FROM attempts WHERE task_id = 'T1'"
+        )?,
+        vec![vec![json!("claude"), json!(2), json!(1), json!("sd2")]]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_removed_role_is_blocked_at_a_new_epoch_and_one_added_again_does_not_restart_at_1() -> R {
+    // ADR-022 decision 8: a role the revision adds is bound at its checkpoint; one it removes keeps its row, BLOCKED
+    // (AGENT_UNAVAILABLE) at epoch+1, so a holder of an old epoch stays fenced when the role comes back.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    store
+        .submit_command(start("R1", Config::default().budget))
+        .await?;
+    let auditor = || {
+        values(
+            &path,
+            "SELECT agent, role_epoch, config_revision, state, blocked_reason FROM role_bindings \
+             WHERE run_id = 'R1' AND role = 'auditor'",
+        )
+    };
+    let added = json!({"auditor": {"agent": "pi", "prompt": "builtin:qa"}});
+    store
+        .submit_command(team_change("add", 0, added.clone()))
+        .await?;
+    store.team_checkpoint("R1").await?;
+    assert_eq!(
+        auditor()?,
+        vec![vec![
+            json!("pi"),
+            json!(1),
+            json!(1),
+            json!("ACTIVE"),
+            Value::Null
+        ]]
+    );
+    store
+        .submit_command(team_change("remove", 1, json!({"auditor": null})))
+        .await?;
+    store.team_checkpoint("R1").await?;
+    assert_eq!(
+        auditor()?,
+        vec![vec![
+            json!("pi"),
+            json!(2),
+            json!(2),
+            json!("BLOCKED"),
+            json!("AGENT_UNAVAILABLE")
+        ]]
+    );
+    store.submit_command(team_change("again", 2, added)).await?;
+    store.team_checkpoint("R1").await?;
+    assert_eq!(
+        auditor()?,
+        vec![vec![
+            json!("pi"),
+            json!(3),
+            json!(3),
+            json!("ACTIVE"),
+            Value::Null
+        ]]
+    );
+    let kinds = rows::<String>(
+        &path,
+        "SELECT json_extract(payload_json, '$.role') || ':' || coalesce(json_extract(payload_json, '$.to.role_epoch'), 'removed') \
+         FROM events WHERE kind = 'team.binding_applied' ORDER BY seq",
+    )?;
+    assert_eq!(
+        kinds,
+        vec![
+            vec!["auditor:1".to_owned()],
+            vec!["auditor:removed".to_owned()],
+            vec!["auditor:3".to_owned()]
+        ]
+    );
+    Ok(())
+}

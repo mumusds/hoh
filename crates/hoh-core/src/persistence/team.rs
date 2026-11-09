@@ -222,6 +222,280 @@ pub(super) fn record(
     Ok(())
 }
 
+/// The project's latest applied revision and its configuration, read only.
+fn latest(conn: &Connection, project_id: &str) -> Result<Option<(i64, TeamConfig)>, PersistError> {
+    let row: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT revision, config_json FROM team_revisions WHERE project_id = ?1 AND state = 'APPLIED' \
+             ORDER BY revision DESC LIMIT 1",
+            params![project_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    row.map(|(revision, json)| Ok((revision, parsed(project_id, revision, &json)?)))
+        .transpose()
+}
+
+/// The configuration of revision `revision`, if it is recorded.
+fn at_revision(
+    conn: &Connection,
+    project_id: &str,
+    revision: i64,
+) -> Result<Option<TeamConfig>, PersistError> {
+    let json: Option<String> = conn
+        .query_row(
+            "SELECT config_json FROM team_revisions WHERE project_id = ?1 AND revision = ?2",
+            params![project_id, revision],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    json.map(|json| parsed(project_id, revision, &json))
+        .transpose()
+}
+
+fn parsed(project_id: &str, revision: i64, json: &str) -> Result<TeamConfig, PersistError> {
+    serde_json::from_str(json).map_err(|e| {
+        PersistError::IntegrityViolation(format!("team revision {revision} of {project_id}: {e}"))
+    })
+}
+
+/// A run's binding of one role.
+#[derive(Debug, Clone)]
+struct Bound {
+    role: String,
+    agent: String,
+    model: Option<String>,
+    role_epoch: i64,
+    config_revision: i64,
+    state: String,
+    blocked_reason: Option<String>,
+    session_id: Option<String>,
+}
+
+fn bound(conn: &Connection, run_id: &str, role: Option<&str>) -> Result<Vec<Bound>, PersistError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT role, agent, model, role_epoch, config_revision, state, blocked_reason, session_id \
+             FROM role_bindings WHERE run_id = ?1 AND (?2 IS NULL OR role = ?2)",
+        )
+        .map_err(sqlite_error)?;
+    statement
+        .query_map(params![run_id, role], |r| {
+            Ok(Bound {
+                role: r.get(0)?,
+                agent: r.get(1)?,
+                model: r.get(2)?,
+                role_epoch: r.get(3)?,
+                config_revision: r.get(4)?,
+                state: r.get(5)?,
+                blocked_reason: r.get(6)?,
+                session_id: r.get(7)?,
+            })
+        })
+        .map_err(sqlite_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sqlite_error)
+}
+
+/// Whether revision `wanted`'s team changes `binding` (decision 8): its role removed, added back, or bound otherwise
+/// than the revision the binding was made at (agent, model, fallback, prompt or session independence).
+fn changes(
+    conn: &Connection,
+    project_id: &str,
+    binding: &Bound,
+    wanted: &TeamConfig,
+) -> Result<bool, PersistError> {
+    let removed = binding.state == "BLOCKED" && binding.blocked_reason.as_deref() == Some(REMOVED);
+    let Some(role) = wanted.team.get(&binding.role) else {
+        return Ok(!removed);
+    };
+    if binding.state != "ACTIVE" {
+        return Ok(true);
+    }
+    Ok(
+        match at_revision(conn, project_id, binding.config_revision)?
+            .and_then(|config| config.team.get(&binding.role).cloned())
+        {
+            Some(before) => &before != role,
+            None => binding.agent != role.agent.as_str() || binding.model != role.model,
+        },
+    )
+}
+
+/// Why a role a revision removed is BLOCKED (`$defs.BlockedReason`).
+const REMOVED: &str = "AGENT_UNAVAILABLE";
+
+/// Whether run `run_id`'s binding of `role` waits for its checkpoint (decision 8): the project's current revision
+/// changes it. Such a role is not dispatched, so no attempt is leased under the binding being replaced.
+pub(super) fn pending(conn: &Connection, run_id: &str, role: &str) -> Result<bool, PersistError> {
+    let project_id: Option<String> = conn
+        .query_row(
+            "SELECT project_id FROM runs WHERE run_id = ?1",
+            params![run_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some(project_id) = project_id else {
+        return Ok(false);
+    };
+    let Some(binding) = bound(conn, run_id, Some(role))?.pop() else {
+        return Ok(false);
+    };
+    let Some((revision, wanted)) = latest(conn, &project_id)? else {
+        return Ok(false);
+    };
+    if binding.config_revision >= revision {
+        return Ok(false);
+    }
+    changes(conn, &project_id, &binding, &wanted)
+}
+
+/// Run `run_id`'s checkpoint (decision 8), in one transaction: each role the project's current revision changes and
+/// that has no attempt PREPARED, STARTING or RUNNING takes its new binding at epoch+1 (no session yet; a removed role
+/// BLOCKED, a new role bound at epoch 1), with a team.binding_applied event; a role it does not change moves to the
+/// revision as it is; once every role is there, so is the run. Whether anything changed.
+pub(super) fn checkpoint(
+    conn: &mut Connection,
+    run_id: &str,
+    ctx: &super::writer::Ctx<'_>,
+) -> Result<bool, PersistError> {
+    let tx = super::writer::begin(conn, ctx)?;
+    let run: Option<(String, i64)> = tx
+        .query_row(
+            "SELECT project_id, config_revision FROM runs WHERE run_id = ?1",
+            params![run_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some((project_id, run_revision)) = run else {
+        return Ok(false);
+    };
+    let Some((revision, wanted)) = latest(&tx, &project_id)? else {
+        return Ok(false);
+    };
+    let live: std::collections::BTreeSet<String> = {
+        let mut statement = tx
+            .prepare(
+                "SELECT DISTINCT t.role FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+                 WHERE t.run_id = ?1 AND a.state IN ('PREPARED', 'STARTING', 'RUNNING')",
+            )
+            .map_err(sqlite_error)?;
+        statement
+            .query_map(params![run_id], |r| r.get(0))
+            .map_err(sqlite_error)?
+            .collect::<Result<_, _>>()
+            .map_err(sqlite_error)?
+    };
+    let now = crate::time::now_rfc3339();
+    let bindings = bound(&tx, run_id, None)?;
+    let mut events = Vec::new();
+    let mut changed = false;
+    let mut behind = false;
+    let applied = |role: &str, epoch: i64, from: serde_json::Value, to: serde_json::Value| {
+        super::writer::NewEvent {
+            project_id: project_id.clone(),
+            event_id: crate::ids::child_id(run_id, &format!("team/{role}/{epoch}")),
+            run_id: Some(run_id.to_owned()),
+            kind: "team.binding_applied".to_owned(),
+            payload: serde_json::json!({
+                "run_id": run_id, "role": role, "config_revision": revision, "from": from, "to": to,
+            }),
+        }
+    };
+    for binding in bindings.iter().filter(|b| b.config_revision < revision) {
+        if live.contains(&binding.role) {
+            behind = true;
+            continue;
+        }
+        changed = true;
+        if !changes(&tx, &project_id, binding, &wanted)? {
+            tx.execute(
+                "UPDATE role_bindings SET config_revision = ?3 WHERE run_id = ?1 AND role = ?2",
+                params![run_id, binding.role, revision],
+            )
+            .map_err(sqlite_error)?;
+            continue;
+        }
+        let epoch = binding.role_epoch + 1;
+        let from = serde_json::json!({
+            "agent": binding.agent, "model": binding.model, "role_epoch": binding.role_epoch,
+            "session_id": binding.session_id,
+        });
+        let to = match wanted.team.get(&binding.role) {
+            Some(role) => {
+                tx.execute(
+                    "UPDATE role_bindings SET agent = ?3, model = ?4, role_epoch = ?5, config_revision = ?6, \
+                     session_id = NULL, state = 'ACTIVE', blocked_reason = NULL, missing_json = '[]', bound_at = ?7 \
+                     WHERE run_id = ?1 AND role = ?2",
+                    params![
+                        run_id,
+                        binding.role,
+                        role.agent.as_str(),
+                        role.model,
+                        epoch,
+                        revision,
+                        now
+                    ],
+                )
+                .map_err(sqlite_error)?;
+                serde_json::json!({"agent": role.agent.as_str(), "model": role.model, "role_epoch": epoch})
+            }
+            None => {
+                tx.execute(
+                    "UPDATE role_bindings SET role_epoch = ?3, config_revision = ?4, session_id = NULL, \
+                     state = 'BLOCKED', blocked_reason = ?5, bound_at = ?6 WHERE run_id = ?1 AND role = ?2",
+                    params![run_id, binding.role, epoch, revision, REMOVED, now],
+                )
+                .map_err(sqlite_error)?;
+                serde_json::Value::Null
+            }
+        };
+        events.push(applied(&binding.role, epoch, from, to));
+    }
+    for (name, role) in &wanted.team {
+        if bindings.iter().any(|b| &b.role == name) {
+            continue;
+        }
+        changed = true;
+        tx.execute(
+            "INSERT INTO role_bindings(run_id, role, agent, model, role_epoch, config_revision, state, bound_at) \
+             VALUES (?1, ?2, ?3, ?4, 1, ?5, 'ACTIVE', ?6)",
+            params![run_id, name, role.agent.as_str(), role.model, revision, now],
+        )
+        .map_err(sqlite_error)?;
+        let to =
+            serde_json::json!({"agent": role.agent.as_str(), "model": role.model, "role_epoch": 1});
+        events.push(applied(name, 1, serde_json::Value::Null, to));
+    }
+    if !behind && run_revision < revision {
+        changed = true;
+        tx.execute(
+            "UPDATE runs SET config_revision = ?2 WHERE run_id = ?1",
+            params![run_id, revision],
+        )
+        .map_err(sqlite_error)?;
+    }
+    if !changed {
+        // Nothing to write: the transaction ends without a commit.
+        return Ok(false);
+    }
+    super::writer::write(
+        &tx,
+        &super::writer::Commit {
+            events,
+            ..super::writer::Commit::default()
+        },
+        ctx,
+    )?;
+    ctx.before_commit()?;
+    tx.commit().map_err(sqlite_error)?;
+    Ok(true)
+}
+
 /// One role of a run's team, as the snapshot and the team page show it (decision 18).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TeamMember {
@@ -310,13 +584,17 @@ pub(super) fn view(
             continue;
         }
         let wanted = config.team.get(&member.role);
-        let changed = match wanted {
-            Some(role) => {
-                member.agent.as_deref() != Some(role.agent.as_str()) || member.model != role.model
-            }
-            None => member.state != "BLOCKED",
+        let binding = Bound {
+            role: member.role.clone(),
+            agent: member.agent.clone().unwrap_or_default(),
+            model: member.model.clone(),
+            role_epoch: member.role_epoch,
+            config_revision: member.config_revision,
+            state: member.state.clone(),
+            blocked_reason: member.blocked_reason.clone(),
+            session_id: member.session_id.clone(),
         };
-        if changed {
+        if changes(conn, project_id, &binding, &config)? {
             member.pending = Some(serde_json::json!({
                 "agent": wanted.map(|role| role.agent.as_str()),
                 "model": wanted.and_then(|role| role.model.clone()),
