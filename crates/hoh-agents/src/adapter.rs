@@ -20,6 +20,143 @@ pub struct AttemptRef {
     pub agent_version: String,
 }
 
+/// The start gate of a turn in the runner's mode (docs/adr/ADR-022.md decision 13): `program` with `args`, then the
+/// agent's own program and argv. It reads one line from stdin and, if the line is `go`, execs the agent in its place
+/// (same pid, group, environment and cgroup); otherwise it exits and the agent never runs. `env` is added to the
+/// agent's environment (its attempt's marker).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateCommand {
+    pub program: std::path::PathBuf,
+    pub args: Vec<std::ffi::OsString>,
+    pub env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+}
+
+/// One thing a turn recorded for its attempt: an event (key, kind, payload, as the direct mode writes them), or the
+/// agent's own session id.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Recorded {
+    Event {
+        key: String,
+        kind: String,
+        payload: serde_json::Value,
+    },
+    NativeSession(String),
+}
+
+/// What a turn in the runner's mode showed (docs/adr/ADR-022.md decisions 12 and 14): its verdict and what the runner
+/// records. The adapter moved no attempt state and wrote nothing to the store.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Facts {
+    /// The adapter's verdict: SETTLED, FAILED, or CANCELLED after a native cancel.
+    pub state: AttemptState,
+    /// The failure's code (a reason code, or the agent's own result subtype), unless it settled.
+    pub failure: Option<String>,
+    pub native_session: Option<String>,
+    pub resolved_model: Option<String>,
+    pub usage: Option<serde_json::Value>,
+    /// The directory of the turn's raw logs.
+    pub raw_log_path: String,
+    /// The most stdout bytes the frame reader held at once (AC-027-03).
+    pub max_buffered: Option<usize>,
+    /// Whether the leader was reaped and its process group then seen empty.
+    pub group_reaped: bool,
+    /// What the turn recorded, in order.
+    pub recorded: Vec<Recorded>,
+}
+
+/// A turn in the runner's mode, started and held at its gate.
+#[derive(Debug)]
+pub struct Held {
+    /// The gate's pid: the agent's once the gate execs it, the leader of its own process group.
+    pub pid: u32,
+    /// Sent: the gate opens and the turn's input follows. Dropped unsent: the gate reads the end of its input and the
+    /// agent never runs.
+    pub open: tokio::sync::oneshot::Sender<()>,
+    /// A native cancel (the agent's own way to stop a turn); the host's ladder sends SIGTERM and SIGKILL.
+    pub cancel: std::sync::Arc<tokio::sync::Notify>,
+    /// The turn's facts once it ended.
+    pub ended: tokio::task::JoinHandle<Facts>,
+}
+
+/// Why a turn in the runner's mode did not start: its code (`BLOCKED_CAPABILITY`, `LOGS`, `SPAWN`) and detail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refused {
+    pub code: String,
+    pub detail: String,
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.detail)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// Where a turn records what it sees: the store, at once (the direct mode), or a list the runner records.
+pub(crate) enum Recorder<'a> {
+    Store {
+        store: &'a Store,
+        attempt: &'a AttemptRef,
+        agent: &'static str,
+        capabilities: &'a serde_json::Value,
+    },
+    Collect(Vec<Recorded>),
+}
+
+impl Recorder<'_> {
+    pub(crate) async fn event(
+        &mut self,
+        key: &str,
+        kind: &str,
+        payload: serde_json::Value,
+    ) -> Result<(), PersistError> {
+        match self {
+            Recorder::Store { store, attempt, .. } => {
+                store
+                    .attempt_event(&attempt.attempt_id, key, kind, payload)
+                    .await
+            }
+            Recorder::Collect(recorded) => {
+                recorded.push(Recorded::Event {
+                    key: key.to_owned(),
+                    kind: kind.to_owned(),
+                    payload,
+                });
+                Ok(())
+            }
+        }
+    }
+
+    /// The agent named its own session: the session row records it (or the runner does).
+    pub(crate) async fn native_session(&mut self, native: &str) -> Result<(), PersistError> {
+        match self {
+            Recorder::Store {
+                store,
+                attempt,
+                agent,
+                capabilities,
+            } => {
+                store
+                    .upsert_session(hoh_core::persistence::Session {
+                        session_id: attempt.session_id.clone(),
+                        agent: (*agent).to_owned(),
+                        role: attempt.role.clone(),
+                        native_id: Some(native.to_owned()),
+                        native_path: None,
+                        agent_version: attempt.agent_version.clone(),
+                        capabilities: (*capabilities).clone(),
+                    })
+                    .await
+            }
+            Recorder::Collect(recorded) => {
+                recorded.push(Recorded::NativeSession(native.to_owned()));
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Why a turn could not be recorded or run.
 #[derive(Debug)]
 pub enum AdapterError {

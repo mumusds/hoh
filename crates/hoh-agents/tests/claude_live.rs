@@ -125,6 +125,7 @@ async fn claude_live_turns_resume_and_cancel() -> R {
             yolo: true,
             partial: false,
             resume,
+            model: None,
             root: rustix::process::getuid().is_root(),
             capabilities: entry.capabilities.clone(),
         },
