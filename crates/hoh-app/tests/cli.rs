@@ -154,6 +154,13 @@ fn test_003_01_help_and_version_show_exactly_the_command_surface() -> R {
                         .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())),
                 "version line {first:?}"
             );
+            // ADR-023 decision 8: the build's commit, or `unknown` (a test build is given none).
+            let second = stdout.lines().nth(1).unwrap_or_default();
+            assert!(
+                second == "commit unknown" || second.starts_with("commit "),
+                "commit line {second:?}"
+            );
+            assert_eq!(stdout.lines().count(), 3, "{stdout}");
         } else {
             helps.push(stdout);
         }

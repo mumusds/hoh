@@ -78,14 +78,26 @@ pub fn text(topic: Topic) -> &'static str {
     }
 }
 
-/// `hoh --version`; the first line is `hoh <semver>`.
+/// `hoh --version`: `hoh <semver>`, the commit it was built from (ADR-023 decision 8), the crates' versions.
 pub fn version() -> String {
     format!(
-        "hoh {}\ncore {}, agents {}\n",
+        "hoh {}\ncommit {}\ncore {}, agents {}\n",
         env!("CARGO_PKG_VERSION"),
+        commit(option_env!("HOH_BUILD_COMMIT")),
         hoh_core::VERSION,
         hoh_agents::VERSION
     )
+}
+
+/// The build's commit as `scripts/product/build-commit.sh` gives it (40 lowercase hex digits, `-dirty` when tracked
+/// files differed from it), else `unknown`: a build without it, or with anything else, names no commit.
+fn commit(given: Option<&str>) -> &str {
+    given
+        .filter(|c| {
+            let sha = c.strip_suffix("-dirty").unwrap_or(c);
+            sha.len() == 40 && sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        })
+        .unwrap_or("unknown")
 }
 
 /// The one-line synopsis printed after a usage error.
@@ -128,6 +140,38 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_version_names_the_commit_it_was_built_from_or_unknown() {
+        // ADR-023 decision 8: AC-005-06 wants the candidate's commit in `hoh --version`.
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(commit(Some(sha)), sha);
+        let dirty = format!("{sha}-dirty");
+        assert_eq!(commit(Some(&dirty)), dirty);
+        let upper = sha.to_uppercase();
+        let long = format!("{sha}0");
+        let two = format!("{sha}\ncommit {sha}");
+        for given in [
+            None,
+            Some(""),
+            Some("unknown"),
+            Some(&sha[..39]),
+            Some(&long),
+            Some(&upper),
+            Some(&two),
+            Some("0123456789abcdef0123456789abcdef01234567-clean"),
+        ] {
+            assert_eq!(commit(given), "unknown", "{given:?}");
+        }
+        let v = version();
+        let lines: Vec<&str> = v.lines().collect();
+        assert_eq!(lines.len(), 3, "{v}");
+        assert_eq!(
+            lines[1],
+            format!("commit {}", commit(option_env!("HOH_BUILD_COMMIT")))
+        );
+        assert!(lines[2].starts_with("core "), "{v}");
     }
 
     #[test]

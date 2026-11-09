@@ -2,6 +2,8 @@
 # Check "build": release build of everything that exists so far.
 set -Eeuo pipefail
 cd "$(dirname -- "${BASH_SOURCE[0]}")/../.."
+# shellcheck source=scripts/product/build-commit.sh
+source scripts/product/build-commit.sh
 cargo build --workspace --release --locked
 if [[ -f web/package.json ]]; then
   npm ci --prefix web
