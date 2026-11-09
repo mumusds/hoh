@@ -15,6 +15,7 @@ pub mod compat;
 pub mod frame;
 pub mod identity;
 pub mod known;
+pub mod launch;
 pub mod pi;
 pub mod probe;
 pub mod process;

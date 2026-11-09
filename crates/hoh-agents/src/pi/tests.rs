@@ -262,3 +262,21 @@ fn only_a_recorded_version_is_trusted_to_send_agent_settled() {
         assert!(!emits_settled(other), "{other:?}");
     }
 }
+
+#[test]
+fn a_sessions_capabilities_are_events_and_resume() {
+    // docs/adr/ADR-022.md decision 9, as run() records them.
+    let mut l = launch();
+    l.capabilities = [
+        ("structured_events", Some(true)),
+        ("resume", Some(true)),
+        ("mid_turn_steer", Some(true)),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v))
+    .collect();
+    let caps = session_capabilities(&l).expect("capabilities");
+    assert_eq!(caps["structured_events"], true);
+    assert_eq!(caps["resume"], true);
+    assert_ne!(caps["mid_turn_steer"], true, "pi takes no steer here");
+}

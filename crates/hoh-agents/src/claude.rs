@@ -145,6 +145,12 @@ pub fn argv(launch: &Launch) -> Result<Argv, Blocked> {
     })
 }
 
+/// The capabilities a session of this launch has (its row's, docs/adr/ADR-022.md decision 9): what [`argv`] gives, or
+/// why no turn can start.
+pub fn session_capabilities(launch: &Launch) -> Result<Value, Blocked> {
+    argv(launch).map(|argv| argv.capabilities)
+}
+
 /// A turn to run.
 #[derive(Debug, Clone)]
 pub struct Turn {

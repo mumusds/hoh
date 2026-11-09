@@ -239,3 +239,16 @@ fn a_chosen_model_is_passed_only_where_the_help_offers_it() {
     l.model = None;
     assert!(!argv(&l).expect("argv").args.iter().any(|x| x == "--model"));
 }
+
+#[test]
+fn a_sessions_capabilities_are_those_its_argv_gives() {
+    // docs/adr/ADR-022.md decision 9: the binder records what a turn of this launch would have.
+    let l = launch();
+    assert_eq!(
+        session_capabilities(&l),
+        Ok(argv(&l).expect("argv").capabilities)
+    );
+    let mut blocked = launch();
+    blocked.help = HELP.replace("stream-json", "text, json");
+    assert!(session_capabilities(&blocked).is_err());
+}
