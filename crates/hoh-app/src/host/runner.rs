@@ -186,6 +186,12 @@ struct Common {
 }
 
 impl Common {
+    /// The agents found unavailable, whose bindings a checkpoint does not apply (docs/adr/ADR-022.md decision 8; the
+    /// registry comes with the product executor: none yet).
+    fn unavailable(&self) -> std::collections::BTreeSet<String> {
+        std::collections::BTreeSet::new()
+    }
+
     /// A failure nothing classified (a process that did not start, an identity that could not be read): transient,
     /// at the runner's clock (ADR-020 decision 1).
     fn failed(&self, detail: String) -> Ending {
@@ -316,9 +322,12 @@ async fn tick(
         wall: Some(common.clock.wall()),
         ..context.clone()
     };
+    // The team changes whose checkpoint has come, in every run not ended that is behind the project's revision
+    // (docs/adr/ADR-022.md decision 8), before any pace or round.
+    for run in &waiting.team_behind {
+        store.team_checkpoint(run, common.unavailable()).await?;
+    }
     for run in &waiting.runs {
-        // Its roles' team changes whose checkpoint has come (docs/adr/ADR-022.md decision 8), before any round.
-        store.team_checkpoint(run).await?;
         // The run as a whole first: woken when a retry is due, parked, blocked or stopped (ADR-020 decisions 4, 5, 7).
         store.pace_run(run, at()).await?;
         while store.schedule_round(run, at()).await?.dispatched.is_some() {}

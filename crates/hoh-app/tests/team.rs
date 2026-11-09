@@ -174,13 +174,29 @@ async fn started(host: &Host, key: &str) -> R<String> {
 
 #[tokio::test]
 async fn test_018_04_refused_team_changes_keep_the_revision_and_every_role_epoch() -> R {
-    // AC-018-04: with team revision r, five ConfigureTeams are refused: an unknown agent, removing qa, a shared
-    // reviewer session and apply_at=now with 400 and the key path, a stale expected_revision with 409 and
-    // current_revision=r; afterwards the revision is still r, no role epoch moved and no binding was applied.
+    // AC-018-04: a running project at team revision r (a host with its runner, so checkpoints happen); five
+    // ConfigureTeams are refused: an unknown agent, removing qa, a shared reviewer session and apply_at=now with 400
+    // and the key path, a stale expected_revision with 409 and current_revision=r; after them, and after the runner's
+    // ticks, the snapshot's team and revision are the same, no role epoch moved and no binding was applied
+    // (M2T07R-56).
     let dir = tempfile::tempdir()?;
-    let host = start_when_free(config(dir.path())).await?;
+    let mut config = config(dir.path());
+    config.runner = Some(hoh_app::host::RunnerConfig {
+        executor: std::sync::Arc::new(Idle),
+        context: hoh_core::decision::Context::default(),
+    });
+    let host = start_when_free(config).await?;
     let run_id = started(&host, "s1").await?;
-    // r = 1: one accepted change first, so that r-1 is still a revision.
+    exec(
+        dir.path(),
+        &format!(
+            "INSERT INTO specs(spec_id, project_id, sha256, revision) SELECT 's1', project_id, printf('%064d', 1), 1 \
+             FROM projects; UPDATE runs SET state = 'RUNNING', spec_id = 's1', revision = revision + 1 \
+             WHERE run_id = '{run_id}';"
+        ),
+    )?;
+    let checkpoint = |bindings: Value| json!({"bindings": bindings, "apply_at": "checkpoint"});
+    // r = 1, applied to the run by its checkpoint, so that r-1 is still a revision.
     let (status, body) = exchange(
         &host,
         "POST",
@@ -189,7 +205,7 @@ async fn test_018_04_refused_team_changes_keep_the_revision_and_every_role_epoch
             "ok",
             None,
             0,
-            json!({"bindings": {"cto": {"model": "m-cto"}}, "apply_at": "checkpoint"}),
+            checkpoint(json!({"cto": {"model": "m-cto"}})),
         )),
     )
     .await?;
@@ -199,16 +215,28 @@ async fn test_018_04_refused_team_changes_keep_the_revision_and_every_role_epoch
         "{body}"
     );
     let r = 1;
-    let epochs = || {
+    let applied_count = || {
         query(
             dir.path(),
-            &format!(
-                "SELECT group_concat(role || ':' || role_epoch, ',') FROM role_bindings WHERE run_id = '{run_id}'"
-            ),
+            "SELECT count(*) FROM events WHERE kind = 'team.binding_applied'",
         )
     };
-    let before = epochs()?;
-    let checkpoint = |bindings: Value| json!({"bindings": bindings, "apply_at": "checkpoint"});
+    let end = std::time::Instant::now() + Duration::from_secs(10);
+    while query(
+        dir.path(),
+        &format!("SELECT config_revision FROM runs WHERE run_id = '{run_id}'"),
+    )? != "1"
+    {
+        assert!(
+            std::time::Instant::now() < end,
+            "the run never reached revision 1"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let applied = applied_count()?;
+    let run_path = format!("/v1/runs/{run_id}");
+    let (_, before) = exchange(&host, "GET", &run_path, None).await?;
+    let mut exchanges = Vec::new();
     for (key, run, expected, payload, key_path) in [
         (
             "agent",
@@ -239,13 +267,8 @@ async fn test_018_04_refused_team_changes_keep_the_revision_and_every_role_epoch
             "apply_at",
         ),
     ] {
-        let (status, body) = exchange(
-            &host,
-            "POST",
-            "/v1/commands",
-            Some(&configure(key, run, expected, payload)),
-        )
-        .await?;
+        let request = configure(key, run, expected, payload);
+        let (status, body) = exchange(&host, "POST", "/v1/commands", Some(&request)).await?;
         assert_eq!(status, 400, "{key}: {body}");
         assert_eq!(body["code"], "INVALID_TEAM_CONFIG", "{key}: {body}");
         assert_eq!(body["details"]["key_path"], key_path, "{key}: {body}");
@@ -255,19 +278,15 @@ async fn test_018_04_refused_team_changes_keep_the_revision_and_every_role_epoch
             body["message"].as_str().is_some_and(|m| !m.is_empty()),
             "{key}: {body}"
         );
+        exchanges.push(json!({"request": request, "status": status, "response": body}));
     }
-    let (status, body) = exchange(
-        &host,
-        "POST",
-        "/v1/commands",
-        Some(&configure(
-            "stale",
-            None,
-            r - 1,
-            checkpoint(json!({"developer": {"agent": "codex"}})),
-        )),
-    )
-    .await?;
+    let stale = configure(
+        "stale",
+        None,
+        r - 1,
+        checkpoint(json!({"developer": {"agent": "codex"}})),
+    );
+    let (status, body) = exchange(&host, "POST", "/v1/commands", Some(&stale)).await?;
     assert_eq!(status, 409, "{body}");
     assert_eq!(body["code"], "STALE_REVISION", "{body}");
     assert_eq!(body["current_revision"], r, "{body}");
@@ -276,6 +295,12 @@ async fn test_018_04_refused_team_changes_keep_the_revision_and_every_role_epoch
         body["message"].as_str().is_some_and(|m| !m.is_empty()),
         "{body}"
     );
+    exchanges.push(json!({"request": stale, "status": status, "response": body}));
+    // Several ticks of the runner (200 ms each) after the five commands.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let (_, after) = exchange(&host, "GET", &run_path, None).await?;
+    assert_eq!(after["projection"]["team"], before["projection"]["team"]);
+    assert_eq!(after["projection"]["team_revision"], r);
     assert_eq!(
         query(
             dir.path(),
@@ -283,14 +308,7 @@ async fn test_018_04_refused_team_changes_keep_the_revision_and_every_role_epoch
         )?,
         format!("{r}/{}", r + 1)
     );
-    assert_eq!(epochs()?, before);
-    assert_eq!(
-        query(
-            dir.path(),
-            "SELECT count(*) FROM events WHERE kind = 'team.binding_applied'"
-        )?,
-        "0"
-    );
+    assert_eq!(applied_count()?, applied, "a binding was applied");
     assert_eq!(
         query(
             dir.path(),
@@ -299,7 +317,24 @@ async fn test_018_04_refused_team_changes_keep_the_revision_and_every_role_epoch
         "1",
         "a refused command is not recorded"
     );
+    keep(
+        "test-018-04.json",
+        &json!({"exchanges": exchanges, "snapshot_before": before, "snapshot_after": after,
+                "team_revisions": query(dir.path(), "SELECT json_group_array(json_object('revision', revision, 'state', state)) FROM team_revisions")?,
+                "binding_applied_events": applied}),
+    )?;
     host.shutdown().await;
+    Ok(())
+}
+
+/// The evidence a check keeps (HOH_EVIDENCE_DIR, set by run_check).
+fn keep(name: &str, value: &Value) -> R {
+    if let Some(dir) = std::env::var_os("HOH_EVIDENCE_DIR") {
+        std::fs::write(
+            Path::new(&dir).join(name),
+            serde_json::to_vec_pretty(value)?,
+        )?;
+    }
     Ok(())
 }
 
@@ -567,8 +602,8 @@ fn exec(project: &Path, sql: &str) -> R {
 
 #[tokio::test]
 async fn a_hosts_runner_applies_a_team_change_at_the_roles_checkpoint() -> R {
-    // ADR-022 decision 8: each tick of the runner applies the checkpoint of a working run before its pace and rounds:
-    // a change to a role with no live attempt is bound at the next epoch.
+    // ADR-022 decision 8: each tick of the runner applies the checkpoint of every run not ended that is behind the
+    // project's revision, before any pace or round: a change to a role with no live attempt is bound at the next epoch.
     let dir = tempfile::tempdir()?;
     let mut config = config(dir.path());
     config.runner = Some(hoh_app::host::RunnerConfig {
@@ -590,14 +625,8 @@ async fn a_hosts_runner_applies_a_team_change_at_the_roles_checkpoint() -> R {
     )
     .await?;
     assert_eq!(status, 202, "{body}");
-    exec(
-        dir.path(),
-        &format!(
-            "INSERT INTO specs(spec_id, project_id, sha256, revision) SELECT 's1', project_id, printf('%064d', 1), 1 \
-             FROM projects; UPDATE runs SET state = 'RUNNING', spec_id = 's1', revision = revision + 1 \
-             WHERE run_id = '{run_id}';"
-        ),
-    )?;
+    // The run is still CREATED: a run not ended that is behind the revision is checkpointed whatever its state
+    // (M2T07R-02, -54).
     let binding = format!(
         "SELECT agent || '/' || role_epoch || '/' || config_revision FROM role_bindings \
          WHERE run_id = '{run_id}' AND role = 'developer'"
@@ -611,6 +640,163 @@ async fn a_hosts_runner_applies_a_team_change_at_the_roles_checkpoint() -> R {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    host.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_reused_key_is_key_reuse_before_any_frozen_scheduler_and_its_revision_is_the_teams() -> R
+{
+    // M2T07R-04, -05 (ADR-022 decision 5): the key is looked up first; a team command's current_revision is the team
+    // revision, with or without a run.
+    let dir = tempfile::tempdir()?;
+    let host = start_when_free(config(dir.path())).await?;
+    let run_id = started(&host, "s1").await?;
+    let checkpoint = |bindings: Value| json!({"bindings": bindings, "apply_at": "checkpoint"});
+    let first = configure("k1", None, 0, checkpoint(json!({"cto": {"model": "a"}})));
+    assert_eq!(
+        exchange(&host, "POST", "/v1/commands", Some(&first))
+            .await?
+            .0,
+        202
+    );
+    let with_run = configure(
+        "k2",
+        Some(&run_id),
+        1,
+        checkpoint(json!({"cto": {"model": "b"}})),
+    );
+    assert_eq!(
+        exchange(&host, "POST", "/v1/commands", Some(&with_run))
+            .await?
+            .0,
+        202
+    );
+    for (mut reused, what) in [(first, "no run"), (with_run, "a run")] {
+        reused["payload"]["scheduler"] = json!({"max_wait_rounds": 5});
+        let (status, body) = exchange(&host, "POST", "/v1/commands", Some(&reused)).await?;
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (409, Some("KEY_REUSE")),
+            "{what}: {body}"
+        );
+        assert_eq!(body["current_revision"], 2, "{what}: {body}");
+    }
+    host.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_team_page_follows_limit_and_cursor() -> R {
+    // M2T07R-06, -57 (openapi listTeam): pages of `limit` roles in the role order, the next one after `cursor`;
+    // a limit or cursor it cannot read is 404 as for GET /v1/runs.
+    let dir = tempfile::tempdir()?;
+    let host = start_when_free(config(dir.path())).await?;
+    let run_id = started(&host, "s1").await?;
+    let mut roles = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let path = match &cursor {
+            None => format!("/v1/runs/{run_id}/team?limit=4"),
+            Some(c) => format!("/v1/runs/{run_id}/team?limit=4&cursor={c}"),
+        };
+        let (status, page) = exchange(&host, "GET", &path, None).await?;
+        assert_eq!(status, 200, "{page}");
+        let items = page["items"].as_array().ok_or("no items")?;
+        assert!(items.len() <= 4);
+        roles.extend(
+            items
+                .iter()
+                .filter_map(|m| m["role"].as_str().map(str::to_owned)),
+        );
+        match page["next_cursor"].as_str() {
+            Some(next) => cursor = Some(next.to_owned()),
+            None => break,
+        }
+    }
+    assert_eq!(
+        roles,
+        DEFAULT_TEAM.map(|(role, _)| role.to_owned()).to_vec()
+    );
+    for query in ["limit=0", "limit=501", "limit=x", "cursor=nobody"] {
+        let (status, _) = exchange(
+            &host,
+            "GET",
+            &format!("/v1/runs/{run_id}/team?{query}"),
+            None,
+        )
+        .await?;
+        assert_eq!(status, 404, "{query}");
+    }
+    host.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_team_change_is_checked_against_the_project_and_its_envelope_stays_a_bad_request() -> R {
+    // M2T07R-53: a prompt override file must exist inside the project; M2T07R-55 (4): a run that does not exist is
+    // RUN_NOT_FOUND with nothing written; M2T07R-58: a violation outside the payload is BAD_REQUEST.
+    let dir = tempfile::tempdir()?;
+    let host = start_when_free(config(dir.path())).await?;
+    let auditor = |prompt: &str| json!({"bindings": {"auditor": {"agent": "pi", "prompt": prompt}}, "apply_at": "checkpoint"});
+    let (status, body) = exchange(
+        &host,
+        "POST",
+        "/v1/commands",
+        Some(&configure(
+            "missing",
+            None,
+            0,
+            auditor(".hoh/prompts/auditor.md"),
+        )),
+    )
+    .await?;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["details"]["key_path"], "bindings.auditor.prompt");
+    let (status, body) = exchange(
+        &host,
+        "POST",
+        "/v1/commands",
+        Some(&configure(
+            "nowhere",
+            Some("no-such-run"),
+            0,
+            auditor("builtin:qa"),
+        )),
+    )
+    .await?;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (409, Some("RUN_NOT_FOUND")),
+        "{body}"
+    );
+    let mut envelope = configure("env", None, 0, auditor("builtin:qa"));
+    envelope["expected_revision"] = json!(-1);
+    let (status, body) = exchange(&host, "POST", "/v1/commands", Some(&envelope)).await?;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (400, Some("BAD_REQUEST")),
+        "{body}"
+    );
+    assert_eq!(
+        query(dir.path(), "SELECT count(*) FROM team_revisions")?,
+        "0"
+    );
+    std::fs::create_dir_all(dir.path().join(".hoh/prompts"))?;
+    std::fs::write(dir.path().join(".hoh/prompts/auditor.md"), "Audit.")?;
+    let (status, body) = exchange(
+        &host,
+        "POST",
+        "/v1/commands",
+        Some(&configure(
+            "present",
+            None,
+            0,
+            auditor(".hoh/prompts/auditor.md"),
+        )),
+    )
+    .await?;
+    assert_eq!(status, 202, "{body}");
     host.shutdown().await;
     Ok(())
 }

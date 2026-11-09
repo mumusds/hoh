@@ -346,6 +346,7 @@ impl Host {
             opened: std::sync::atomic::AtomicUsize::new(0),
             cgroups: delegated.as_ref().ok().cloned(),
             budget: config.config.budget.clone(),
+            root: config.project.clone(),
         });
         let mut served = vec![
             tokio::spawn(http::serve(

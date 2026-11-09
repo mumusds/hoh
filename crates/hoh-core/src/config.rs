@@ -283,10 +283,19 @@ pub fn load(root: &Path) -> Result<Config, ConfigError> {
         return Err(failed("not a regular file".to_owned()));
     }
     let text = std::fs::read_to_string(&file).map_err(|e| failed(e.to_string()))?;
-    parse(&text).map_err(|mut error| {
+    let config = parse(&text).map_err(|mut error| {
         error.file = Some(file.clone());
         error
-    })
+    })?;
+    for (name, role) in &config.team {
+        if let Some(prompt) = &role.prompt {
+            check_prompt(root, &format!("team.{name}.prompt"), prompt).map_err(|mut error| {
+                error.file = Some(file.clone());
+                error
+            })?;
+        }
+    }
+    Ok(config)
 }
 
 /// The effective configuration `text` gives over the defaults.
@@ -775,6 +784,14 @@ impl Reader<'_> {
                 "a custom role needs a prompt override file or a built-in role contract (\"builtin:<role>\")",
             ));
         }
+        // A fallback to the role's own agent is no fallback (M2T07R-60).
+        if let Some(at) = role.fallback.iter().position(|a| *a == agent) {
+            return Err(self.error(
+                &format!("{path}.fallback[{at}]"),
+                at_of(table, "fallback"),
+                format!("\"{}\" is the role's own agent", agent.as_str()),
+            ));
+        }
         role.agent = agent;
         team.insert(name.to_owned(), role);
         Ok(())
@@ -944,6 +961,50 @@ impl Reader<'_> {
         number
             .filter(|n| n.is_finite() && *n > 0.0)
             .ok_or_else(|| self.error(path, value.at, "expected a number above 0"))
+    }
+}
+
+/// Where key `key` of `table` starts, if it is there and from a file.
+fn at_of(table: &[Entry], key: &str) -> Option<usize> {
+    table
+        .iter()
+        .find(|(name, _, _)| name == key)
+        .and_then(|(_, _, value)| value.at)
+}
+
+/// Check a role's `prompt` against the project at `root` (docs/adr/ADR-022.md decision 11, M2T07R-53): a built-in role
+/// contract, or a relative path inside the project to a readable regular file. `key` is its key path for the error.
+pub fn check_prompt(root: &Path, key: &str, prompt: &str) -> Result<(), ConfigError> {
+    if prompt.starts_with(BUILTIN_PROMPT) {
+        return Ok(());
+    }
+    let refused = |message: String| ConfigError {
+        file: None,
+        key: Some(key.to_owned()),
+        line: None,
+        column: None,
+        message,
+    };
+    let path = Path::new(prompt);
+    if path.is_absolute()
+        || path.components().any(|c| {
+            !matches!(
+                c,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err(refused(format!(
+            "\"{prompt}\" is not a path inside the project (relative, without ..)"
+        )));
+    }
+    let full = root.join(path);
+    match std::fs::metadata(&full) {
+        Ok(meta) if meta.is_file() => std::fs::File::open(&full)
+            .map(drop)
+            .map_err(|e| refused(format!("\"{prompt}\" cannot be read: {e}"))),
+        Ok(_) => Err(refused(format!("\"{prompt}\" is not a regular file"))),
+        Err(e) => Err(refused(format!("\"{prompt}\": {e}"))),
     }
 }
 

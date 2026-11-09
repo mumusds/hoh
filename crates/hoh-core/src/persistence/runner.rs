@@ -42,6 +42,9 @@ pub struct Waiting {
     /// which the host loop moves on with or without an executor (docs/adr/ADR-021.md decision 7).
     pub pausing: Vec<String>,
     pub cancelling: Vec<String>,
+    /// The runs, not ended, behind the project's current team revision: their checkpoint comes first
+    /// (docs/adr/ADR-022.md decision 8).
+    pub team_behind: Vec<String>,
 }
 
 /// One step of the runner.
@@ -75,8 +78,8 @@ pub(super) enum RunnerJob {
         context: Box<crate::decision::Context>,
     },
     Ack(String),
-    /// A run's team checkpoint (docs/adr/ADR-022.md decision 8).
-    Checkpoint(String),
+    /// A run's team checkpoint (docs/adr/ADR-022.md decision 8), with the agents the registry found unavailable.
+    Checkpoint(String, std::collections::BTreeSet<String>),
     /// Renew the unexpired leases these attempts hold, at `now` (REQ-041: every 30 s, for 120 s).
     Renew(Vec<String>, std::time::SystemTime),
 }
@@ -134,8 +137,8 @@ pub(super) fn run(
         RunnerJob::Repair(request) => {
             super::retry::request_repair(conn, &request, ctx).map(RunnerDone::Repair)
         }
-        RunnerJob::Checkpoint(run_id) => {
-            super::team::checkpoint(conn, &run_id, ctx).map(RunnerDone::Applied)
+        RunnerJob::Checkpoint(run_id, unavailable) => {
+            super::team::checkpoint(conn, &run_id, &unavailable, ctx).map(RunnerDone::Applied)
         }
         RunnerJob::Pace { run_id, context } => {
             super::retry::pace(conn, &run_id, &context, ctx).map(RunnerDone::Paced)
@@ -236,6 +239,21 @@ fn waiting(conn: &Connection, project_id: &str) -> Result<Waiting, PersistError>
         runs,
         pausing: in_state("PAUSE_REQUESTED")?,
         cancelling: in_state("CANCEL_REQUESTED")?,
+        team_behind: {
+            let mut statement = conn
+                .prepare(
+                    "SELECT run_id FROM runs WHERE project_id = ?1 \
+                     AND state NOT IN ('CANCELLED', 'COMPLETED', 'FAILED', 'INCOMPLETE') AND config_revision < \
+                     (SELECT coalesce(max(revision), 0) FROM team_revisions WHERE project_id = ?1 AND state = 'APPLIED') \
+                     ORDER BY created_at, run_id",
+                )
+                .map_err(sqlite_error)?;
+            statement
+                .query_map(params![project_id], |r| r.get(0))
+                .map_err(sqlite_error)?
+                .collect::<Result<_, _>>()
+                .map_err(sqlite_error)?
+        },
     })
 }
 
