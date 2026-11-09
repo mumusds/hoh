@@ -224,10 +224,18 @@ fn group_left_in(proc: &std::path::Path, pgid: u32, leader: u32) -> io::Result<V
             }
             Err(e) => return Err(e),
         };
-        // Fields after the parenthesised command name: state, ppid, pgrp.
+        // Fields after the parenthesised command name: state, ppid, pgrp. What was read goes into the error, escaped
+        // and bounded: such a failure was seen and not reproduced (M2T07R-1100).
         let group = after_command_name(&stat)
             .and_then(|rest| rest.split_whitespace().nth(2)?.parse::<u32>().ok())
-            .ok_or_else(|| io::Error::other(format!("/proc/{pid}/stat has no process group")))?;
+            .ok_or_else(|| {
+                io::Error::other(format!(
+                    "{} has no process group (read {} bytes: {:?})",
+                    entry.path().join("stat").display(),
+                    stat.len(),
+                    String::from_utf8_lossy(&stat[..stat.len().min(512)])
+                ))
+            })?;
         if group == pgid && pid != leader {
             left.push(pid);
         }
@@ -1115,6 +1123,36 @@ mod tests {
         std::fs::write(only.path().join("7/stat"), "7 (sh) S 1 7 7 0")?;
         std::fs::write(only.path().join("self"), "")?;
         assert_eq!(group_left_in(only.path(), 7, 7)?, [9]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_stat_that_cannot_be_read_as_one_is_an_error_naming_what_was_read() -> io::Result<()> {
+        // M2T07R-1100: an unparsable stat stays an error (M2T05R-200), and the error carries the bytes read, escaped
+        // and bounded, so a failure seen once tells its cause.
+        for stat in [
+            &b""[..],
+            b"12 (sh",
+            b"12 (sh) S 1",
+            b"12 (x) \xff\xfe 1 7 7",
+        ] {
+            let fake = tempfile::tempdir()?;
+            std::fs::create_dir(fake.path().join("12"))?;
+            std::fs::write(fake.path().join("12/stat"), stat)?;
+            let error =
+                group_left_in(fake.path(), 7, 7).expect_err("an unparsable stat is an error");
+            let text = error.to_string();
+            assert!(text.contains("/12/stat has no process group"), "{text}");
+            let shown = format!("{:?}", String::from_utf8_lossy(stat));
+            assert!(text.contains(&shown), "{text} lacks {shown}");
+        }
+        let fake = tempfile::tempdir()?;
+        std::fs::create_dir(fake.path().join("12"))?;
+        std::fs::write(fake.path().join("12/stat"), "x".repeat(10_000))?;
+        let text = group_left_in(fake.path(), 7, 7)
+            .expect_err("unparsable")
+            .to_string();
+        assert!(text.len() < 1_000, "bounded: {} bytes", text.len());
         Ok(())
     }
 
