@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 
 type R<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
+mod installed;
+
 const CHILD_PROJECT: &str = "HOH_TEST_RECOVERY_PROJECT";
 /// `<job>:<point>`: the child kills itself when its writer reaches that point of such a request.
 const CHILD_KILL: &str = "HOH_TEST_RECOVERY_KILL";
@@ -3457,4 +3459,371 @@ fn a_failure_recorded_before_a_kill_is_retried_by_its_class_after_the_restart() 
         }
     }
     Ok(())
+}
+
+/// HTTP over the host's socket with its token, as a client sends it; the status and the body.
+fn http(info: &Value, method: &str, path: &str, body: Option<&str>) -> R<(u16, String)> {
+    use std::io::{Read as _, Write as _};
+    let mut stream =
+        std::os::unix::net::UnixStream::connect(info["socket"].as_str().ok_or("no socket")?)?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let mut request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nX-HoH-Token: {}\r\n",
+        info["token"].as_str().ok_or("no token")?
+    );
+    if let Some(body) = body {
+        request.push_str(&format!(
+            "Content-Type: application/json\r\nContent-Length: {}\r\n",
+            body.len()
+        ));
+    }
+    request.push_str("\r\n");
+    request.push_str(body.unwrap_or_default());
+    stream.write_all(request.as_bytes())?;
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply)?;
+    let status = reply
+        .split_whitespace()
+        .nth(1)
+        .ok_or("no status")?
+        .parse()?;
+    Ok((
+        status,
+        reply
+            .split_once("\r\n\r\n")
+            .map(|(_, b)| b.to_owned())
+            .unwrap_or_default(),
+    ))
+}
+
+/// The attempts, the effects and the events of `db`, for the record and for failure messages.
+const EXPORT: &str = r#"
+import json, sqlite3, sys
+c = sqlite3.connect("file:" + sys.argv[1] + "?mode=ro", uri=True)
+rows = lambda sql: [dict(zip([d[0] for d in q.description], r)) for q in [c.execute(sql)] for r in q.fetchall()]
+print(json.dumps({
+    "projects": rows("SELECT project_id, host_epoch FROM projects"),
+    "runs": rows("SELECT run_id, state, revision FROM runs"),
+    "tasks": rows("SELECT task_id, state, role FROM tasks"),
+    "attempts": rows("SELECT rowid, attempt_id, task_id, state, host_epoch, pid, started_at, ended_at, failure_reason FROM attempts ORDER BY rowid"),
+    "effects": rows("SELECT effect_key, attempt_id, state FROM effects ORDER BY rowid"),
+    "events": [dict(e, payload=json.loads(e["payload_json"])) for e in rows("SELECT seq, kind, run_id, created_at, payload_json FROM events ORDER BY seq")],
+}))
+"#;
+
+fn export(project: &Path) -> R<Value> {
+    Ok(serde_json::from_str(&python(&db(project), EXPORT, "")?)?)
+}
+
+/// The fake claude for TEST-005-04 (2.1.318 by its recorded probe answers): a turn of T1 writes its completion
+/// marker and replays the recorded `success` turn; a turn of T2 replays its first frame and then waits for a file
+/// that never appears.
+fn unit_claude(bin: &Path) -> R {
+    let protocol = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/protocol");
+    std::fs::create_dir_all(bin.join("claude.d"))?;
+    installed::script(
+        &bin.join("claude"),
+        &format!(
+            "#!/bin/bash\nf='{protocol}/claude/2.1.318'; d='{bin}/claude.d'\n\
+             case \"$1\" in --version) echo '2.1.318 (Claude Code)'; exit 0;; --help) cat \"$f/help.txt\"; exit 0;; esac\n\
+             cat > \"$d/stdin.$$\"\n\
+             case \"$HOH_ATTEMPT_ID\" in\n\
+              *T2/attempt*) echo $$ > \"$d/t2.pid\"; head -n 1 \"$f/success/stdout.jsonl\"; while [ ! -e \"$d/never\" ]; do sleep 0.1; done;;\n\
+             esac\n\
+             echo \"$HOH_ATTEMPT_ID\" >> \"$d/completed\"\n\
+             cat \"$f/success/stdout.jsonl\"\n",
+            bin = bin.display()
+        ),
+    )
+}
+
+#[test]
+fn test_005_04_a_host_killed_under_its_unit_is_restarted_by_systemd_and_reconciles_before_any_write()
+-> R {
+    // AC-005-04 (docs/adr/ADR-023.md decision 12): the installed hoh, its host run by its systemd user unit (a private
+    // user manager in a delegated scope, `installed`); R with T1 SETTLED, its effect COMMITTED, and T2 RUNNING; no
+    // client attached. kill -9 of the host's main process, then `hoh attach R`.
+    let manager = installed::Manager::start()?;
+    let root = manager.root().to_path_buf();
+    let mut seen = serde_json::Map::new();
+    let outcome = (|| -> R {
+        let project = root.join("p");
+        std::fs::create_dir(&project)?;
+        let git = manager
+            .command("git")
+            .args(["init", "-q"])
+            .current_dir(&project)
+            .output()?;
+        assert!(git.status.success());
+        let project = std::fs::canonicalize(project)?;
+        let bundle = installed::stage_bundle(&root.join("bundle"), b"")?;
+        let out = manager.install(&bundle, &["--project", project.to_str().ok_or("path")?])?;
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // The host's PATH (the client writes its own into the unit's file): the fake agent and the tools it and the
+        // client use, nothing else, so no agent installed on this machine is found.
+        unit_claude(&manager.bin())?;
+        let tools = root.join("tools");
+        std::fs::create_dir(&tools)?;
+        for tool in ["cat", "head", "sleep", "python3", "systemctl"] {
+            let found = ["/usr/bin", "/bin"]
+                .iter()
+                .map(|d| Path::new(d).join(tool))
+                .find(|p| p.exists())
+                .ok_or(format!("no {tool}"))?;
+            std::os::unix::fs::symlink(found, tools.join(tool))?;
+        }
+        let path = format!(
+            "{}:{}:{}",
+            manager.bin().display(),
+            tools.display(),
+            manager.home().join(".local/bin").display()
+        );
+        let hoh = |args: &[&str]| {
+            manager
+                .command(manager.home().join(".local/bin/hoh"))
+                .env("PATH", &path)
+                .args(args)
+                .current_dir(&project)
+                .stdin(std::process::Stdio::null())
+                .output()
+        };
+        let out = hoh(&["-p", "x", "--detach", "--output", "json"])?;
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let run_id = serde_json::from_slice::<Value>(&out.stdout)?["run_id"]
+            .as_str()
+            .ok_or("no run_id")?
+            .to_owned();
+        let unit = hoh_app::unit::unit_name(&hoh_app::unit::instance(&project));
+        // T1 and T2 READY for the developer (claude by default), on a spec, the run RUNNING.
+        python(
+            &db(&project),
+            "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.executescript(sys.stdin.read()); c.commit()",
+            &format!(
+                "INSERT OR IGNORE INTO specs(spec_id, project_id, sha256, revision) \
+                 SELECT 's1', project_id, printf('%064d', 1), 1 FROM runs WHERE run_id = '{run_id}';
+                 UPDATE runs SET state = 'RUNNING', spec_id = 's1' WHERE run_id = '{run_id}';
+                 INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate) \
+                 VALUES ('T1', '{run_id}', 's1', 'READY', 1, 'developer', 0, 1, 1), \
+                        ('T2', '{run_id}', 's1', 'READY', 1, 'developer', 0, 2, 1);"
+            ),
+        )?;
+        let marker = manager.bin().join("claude.d/completed");
+        let mut waited = Ok(());
+        let end = Instant::now() + Duration::from_secs(60);
+        loop {
+            let t1 = query(
+                &db(&project),
+                "SELECT state FROM attempts WHERE task_id = 'T1'",
+            )?;
+            let effect = query(
+                &db(&project),
+                "SELECT group_concat(e.state) FROM effects e JOIN attempts a USING(attempt_id) WHERE a.task_id = 'T1'",
+            )?;
+            let t2 = query(
+                &db(&project),
+                "SELECT state FROM attempts WHERE task_id = 'T2'",
+            )?;
+            if t1 == "SETTLED"
+                && effect.split(',').any(|e| e == "COMMITTED")
+                && t2 == "RUNNING"
+                && marker.exists()
+                && manager.bin().join("claude.d/t2.pid").exists()
+            {
+                break;
+            }
+            if Instant::now() > end {
+                waited = Err(format!("T1 {t1:?} ({effect:?}), T2 {t2:?}"));
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if let Err(why) = waited {
+            return Err(format!("{why}: {}", export(&project)?).into());
+        }
+        let info: Value =
+            serde_json::from_str(&std::fs::read_to_string(project.join(".hoh/host.json"))?)?;
+        // CR-011 under the unit: attempts tracked by cgroups of their own.
+        assert_eq!(info["process_tracking"], "cgroup", "{info}");
+        assert_eq!(info["supervisor"], unit.as_str(), "{info}");
+        let before = manager.show(&unit, "MainPID,NRestarts")?;
+        let old_pid: i32 = before.get("MainPID").ok_or("MainPID")?.parse()?;
+        let restarts: u32 = before.get("NRestarts").ok_or("NRestarts")?.parse()?;
+        assert_eq!(Some(i64::from(old_pid)), info["pid"].as_i64(), "{info}");
+        let epoch = info["host_epoch"].as_i64().ok_or("host_epoch")?;
+        let t1_attempts = query(
+            &db(&project),
+            "SELECT count(*) FROM attempts WHERE task_id = 'T1'",
+        )?;
+        let t2_before: i64 = query(
+            &db(&project),
+            "SELECT count(*) FROM attempts WHERE task_id = 'T2'",
+        )?
+        .parse()?;
+        let old_t2 = query(
+            &db(&project),
+            "SELECT attempt_id FROM attempts WHERE task_id = 'T2'",
+        )?;
+        seen.insert(
+            "before".into(),
+            json!({"show": before, "host": info, "db": export(&project)?}),
+        );
+
+        // kill -9 of the host's main process.
+        let t0 = std::time::SystemTime::now();
+        rustix::process::kill_process(
+            rustix::process::Pid::from_raw(old_pid).ok_or("pid")?,
+            rustix::process::Signal::KILL,
+        )?;
+        // systemd restarts it (not a client: its start would come before the restart).
+        let end = Instant::now() + Duration::from_secs(60);
+        let (new_pid, info) = loop {
+            let now = manager.show(&unit, "MainPID,NRestarts,ActiveState")?;
+            let pid: i32 = now.get("MainPID").and_then(|p| p.parse().ok()).unwrap_or(0);
+            let info = std::fs::read_to_string(project.join(".hoh/host.json"))
+                .ok()
+                .and_then(|t| serde_json::from_str::<Value>(&t).ok());
+            if pid != 0
+                && pid != old_pid
+                && now.get("ActiveState").map(String::as_str) == Some("active")
+                && let Some(info) = info.filter(|i| i["pid"].as_i64() == Some(i64::from(pid)))
+                && http(&info, "GET", "/healthz", None).is_ok_and(|(s, _)| s == 200)
+            {
+                break (pid, info);
+            }
+            if Instant::now() > end {
+                return Err(format!("not restarted: {now:?}\n{}", manager.log()).into());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let after = manager.show(&unit, "MainPID,NRestarts,ActiveState,ExecMainStatus")?;
+        // `hoh attach R`, then the first write command after the restart.
+        let out = hoh(&["attach", &run_id, "--output", "json"])?;
+        seen.insert("attach".into(), json!({"exit": out.status.code(),
+            "stdout": String::from_utf8_lossy(&out.stdout), "stderr": String::from_utf8_lossy(&out.stderr)}));
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let revision = query(
+            &db(&project),
+            &format!("SELECT revision FROM runs WHERE run_id = '{run_id}'"),
+        )?;
+        let cancel = json!({
+            "schema_version": "1.0", "command_id": "c-cancel-after-restart", "idempotency_key": "cancel-after-restart",
+            "expected_revision": revision.parse::<i64>()?, "kind": "CancelRun", "run_id": run_id,
+            "payload": {"reason": "TEST-005-04"},
+        });
+        let (status, accepted) = http(&info, "POST", "/v1/commands", Some(&cancel.to_string()))?;
+        assert_eq!(status, 202, "{accepted}");
+        let db_after = export(&project)?;
+        seen.insert(
+            "after".into(),
+            json!({"show": after, "host": info, "t0_unix_ms":
+            t0.duration_since(std::time::UNIX_EPOCH)?.as_millis(), "db": db_after.clone()}),
+        );
+
+        // systemd restarted it: NRestarts + 1, another pid; host_epoch + 1.
+        assert_eq!(
+            after.get("NRestarts").map(String::as_str),
+            Some((restarts + 1).to_string().as_str()),
+            "{after:?}"
+        );
+        assert_ne!(new_pid, old_pid);
+        assert_eq!(info["host_epoch"].as_i64(), Some(epoch + 1), "{info}");
+        let events = db_after["events"].as_array().ok_or("events")?;
+        let of =
+            |kind: &str| -> Vec<&Value> { events.iter().filter(|e| e["kind"] == kind).collect() };
+        let started = of("reconcile.started")
+            .into_iter()
+            .find(|e| e["payload"]["host_epoch"].as_i64() == Some(epoch + 1))
+            .ok_or("no reconcile.started of the restarted host")?;
+        let completed = of("reconcile.completed")
+            .into_iter()
+            .find(|e| e["payload"]["host_epoch"].as_i64() == Some(epoch + 1))
+            .ok_or("no reconcile.completed of the restarted host")?;
+        let cancelled = of("run.cancel_requested")
+            .into_iter()
+            .last()
+            .ok_or("no run.cancel_requested")?;
+        // The reconcile completed before any write command was accepted.
+        assert!(
+            completed["seq"].as_i64() < cancelled["seq"].as_i64(),
+            "{completed} {cancelled}"
+        );
+        // T1 gets no new attempt; T2 another one only after the reconcile judged its old one not run.
+        assert_eq!(
+            query(
+                &db(&project),
+                "SELECT count(*) FROM attempts WHERE task_id = 'T1'"
+            )?,
+            t1_attempts
+        );
+        let t2_after: i64 = query(
+            &db(&project),
+            "SELECT count(*) FROM attempts WHERE task_id = 'T2'",
+        )?
+        .parse()?;
+        assert!(t2_after <= t2_before + 1, "T2: {t2_before} -> {t2_after}");
+        let judged = of("reconcile.attempt")
+            .into_iter()
+            .find(|e| e["payload"]["attempt_id"].as_str() == Some(old_t2.as_str()))
+            .ok_or("no reconcile.attempt for T2's attempt")?;
+        if t2_after > t2_before {
+            let created = of("attempt.created")
+                .into_iter()
+                .filter(|e| {
+                    e["payload"]["attempt_id"].as_str() != Some(old_t2.as_str())
+                        && e["payload"]["task_id"] == "T2"
+                })
+                .map(|e| e["seq"].as_i64())
+                .min()
+                .ok_or("T2's new attempt has no attempt.created")?;
+            assert!(created > judged["seq"].as_i64(), "{judged}");
+            assert_eq!(
+                judged["payload"]["process"]["found"], "not_started",
+                "{judged}"
+            );
+        }
+        // From the kill to the reconcile's start (its own time in ms): at most 30 s.
+        let at = std::time::UNIX_EPOCH
+            + Duration::from_millis(started["payload"]["at_ms"].as_u64().ok_or("at_ms")?);
+        let delay = at.duration_since(t0).unwrap_or_default();
+        seen.insert("kill_to_reconcile_ms".into(), json!(delay.as_millis()));
+        assert!(delay <= Duration::from_secs(30), "{delay:?}");
+        // The old T2 ended by its cgroup: tracked by one, and judged with its processes gone or stopped.
+        let tracking = of("attempt.tracking")
+            .into_iter()
+            .find(|e| e["payload"]["attempt_id"].as_str() == Some(old_t2.as_str()))
+            .ok_or("no attempt.tracking for T2's attempt")?;
+        seen.insert("t2".into(), json!({"tracking": tracking, "judged": judged}));
+        assert!(
+            tracking["payload"]["cgroup"]
+                .as_str()
+                .is_some_and(|c| c.contains(&format!("/{unit}/attempt-"))),
+            "{tracking}"
+        );
+        // Gone, or found and stopped and reaped: with a cgroup, either needs its cgroup proved empty (ADR-021 8d).
+        let process = &judged["payload"]["process"];
+        assert!(
+            process["found"] == "gone" || (process["found"] == "ours" && process["reaped"] == true),
+            "{judged}"
+        );
+        assert_eq!(started["payload"]["unfinished"], 1, "{started}");
+        Ok(())
+    })();
+    seen.insert("manager_log".into(), json!(manager.log()));
+    keep("TEST-005-04.json", &Value::Object(seen))?;
+    outcome
 }
