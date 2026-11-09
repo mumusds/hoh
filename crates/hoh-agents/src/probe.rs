@@ -3264,6 +3264,28 @@ mod tests {
         // M2T07R-700 (docs/adr/ADR-022.md decision 10 v6): the stop tries a lock until STOP_WAIT, so a starter that
         // holds the commands' table a few steps while it registers does not make the stop leave every command to its
         // probe: a probe held once its command started (here, as a thread that is not run) has it killed by the stop.
+        stop_with_a_probe_held_and_another_start_held_at(
+            "registering",
+            Some(Duration::from_millis(20)),
+        )
+    }
+
+    #[test]
+    fn a_start_held_in_its_spawn_does_not_keep_the_stop_from_the_commands_already_started()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // M2T07R-450 (docs/adr/ADR-022.md decision 10 v6): the spawn is outside the commands' table's lock, so a start
+        // held inside its spawn (as an exec that hangs holds it) leaves the table to the stop, which kills a held probe's
+        // command at once (a spawn under the table's lock had the stop leave every command once STOP_WAIT passed).
+        stop_with_a_probe_held_and_another_start_held_at("spawning", None)
+    }
+
+    /// A probe held once its command started (`started`, as a thread that is not run) and another start held at
+    /// `moment`, let go after `let_go` into the stop or not before the end: the stop must return within 2 s and kill
+    /// the held probe's command while that probe is still held; both probes end STOPPING.
+    fn stop_with_a_probe_held_and_another_start_held_at(
+        moment: &str,
+        let_go: Option<Duration>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let tmp = tempfile::tempdir()?;
         let launcher = |dir: &str, name: &str| -> Result<PathBuf, Box<dyn std::error::Error>> {
             let bin = tmp.path().join(dir);
@@ -3273,11 +3295,14 @@ mod tests {
             std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))?;
             Ok(launcher)
         };
-        let (held, registering) = (launcher("a", "hslheldone")?, launcher("b", "hslregistrar")?);
+        // Named for the other start's moment (at most 15 bytes), so the tests do not see each other's.
+        let short = moment.get(..4).unwrap_or(moment);
+        let (held_name, other_name) = (format!("hslheld{short}"), format!("hslother{short}"));
+        let (held, other) = (launcher("a", &held_name)?, launcher("b", &other_name)?);
         let held_stall = tmp.path().join("a/hoh-test-stall-started");
-        let table_stall = tmp.path().join("b/hoh-test-stall-registering");
+        let other_stall = tmp.path().join(format!("b/hoh-test-stall-{moment}"));
         std::fs::write(&held_stall, "")?;
-        std::fs::write(&table_stall, "")?;
+        std::fs::write(&other_stall, "")?;
         let stop = ProbeStop::default();
         let env = ProbeEnv {
             path: "/usr/bin:/bin".into(),
@@ -3293,26 +3318,30 @@ mod tests {
         };
         let first = probe(held);
         let first_held = wait_until(Duration::from_secs(10), || held_open(&held_stall));
-        let second = probe(registering);
-        let table_held = wait_until(Duration::from_secs(10), || held_open(&table_stall));
+        let second = probe(other);
+        let other_held = wait_until(Duration::from_secs(10), || held_open(&other_stall));
         let stopper = std::thread::spawn(move || stop.stop());
-        // The registration goes on a few steps into the stop, well within STOP_WAIT.
-        std::thread::sleep(Duration::from_millis(20));
-        std::fs::remove_file(&table_stall)?;
+        if let Some(after) = let_go {
+            std::thread::sleep(after);
+            std::fs::remove_file(&other_stall)?;
+        }
         let stopped = wait_until(Duration::from_secs(2), || stopper.is_finished());
-        let found = children_named("hslheldone");
+        let found = children_named(&held_name);
         let killed = wait_until(Duration::from_secs(2), || {
-            children_named("hslheldone")
+            children_named(&held_name)
                 .iter()
                 .all(|(_, state)| *state == 'Z')
         });
+        if let_go.is_none() {
+            std::fs::remove_file(&other_stall)?;
+        }
         std::fs::remove_file(&held_stall)?;
         let _ = stopper.join();
         let (first, second) = (
             first.join().map_err(|_| "a probe panicked")?,
             second.join().map_err(|_| "a probe panicked")?,
         );
-        for name in ["hslheldone", "hslregistrar"] {
+        for name in [&held_name, &other_name] {
             for (pid, _) in children_named(name) {
                 let _ = Command::new("kill")
                     .args(["-KILL", &pid.to_string()])
@@ -3320,14 +3349,14 @@ mod tests {
             }
         }
         assert!(
-            first_held && table_held,
+            first_held && other_held,
             "the probes never got to their stalls"
         );
         assert!(stopped, "the stop waited past STOP_WAIT");
         assert_eq!(found.len(), 1, "the held probe's command: {found:?}");
         assert!(
             killed,
-            "the stop left the command of a probe it could have killed once the table was let go"
+            "the stop left the command of a probe it could have killed (the other start held at {moment})"
         );
         for result in [first, second] {
             assert!(
