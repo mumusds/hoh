@@ -123,6 +123,13 @@ pub struct Started {
 
 /// Where the runner's work runs (a port: the agents of the roles come with M2-T07; tests pass their own).
 pub trait Executor: Send + Sync + std::fmt::Debug {
+    /// The product's agent registry, when this executor runs the product's agents: the runner then binds sessions,
+    /// holds back changes to unavailable agents and asks of each role what its contract needs (docs/adr/ADR-022.md
+    /// decisions 8 to 10). Test executors have none.
+    fn registry(&self) -> Option<Arc<super::agents::Registry>> {
+        None
+    }
+
     /// Hand `work` over; the answer says the executor has it (the ACK).
     fn deliver(&self, work: &Work) -> oneshot::Receiver<Result<(), String>>;
     /// Start `work`'s process held at its start gate: nothing of the agent may run before [`Started::gate`] opens.
@@ -191,7 +198,10 @@ impl Common {
     /// The agents found unavailable, whose bindings a checkpoint does not apply (docs/adr/ADR-022.md decision 8; the
     /// registry comes with the product executor: none yet).
     fn unavailable(&self) -> std::collections::BTreeSet<String> {
-        std::collections::BTreeSet::new()
+        self.executor
+            .registry()
+            .map(|registry| registry.unavailable())
+            .unwrap_or_default()
     }
 
     /// A failure nothing classified (a process that did not start, an identity that could not be read): transient,
@@ -318,18 +328,36 @@ async fn tick(
         *renewed = Instant::now();
     }
     let waiting = store.runner_waiting(&project_id).await?;
-    // The time taken afresh for each pace and each round, never one from before an awaited step (a settle, the
-    // writer's queue): a round after the deadline dispatches nothing (M2T19R-04).
-    let at = || Context {
-        now: Some(common.clock.now()),
-        wall: Some(common.clock.wall()),
-        ..context.clone()
-    };
     // The team changes whose checkpoint has come, in every run not ended that is behind the project's revision
     // (docs/adr/ADR-022.md decision 8), before any pace or round.
     for run in &waiting.team_behind {
         store.team_checkpoint(run, common.unavailable()).await?;
     }
+    // The product's agents: sessions for the bindings waiting for one, and what each role of the team needs
+    // (docs/adr/ADR-022.md decisions 9 and 10).
+    let registry = common.executor.registry();
+    let mut context = context.clone();
+    if let Some(registry) = &registry {
+        super::agents::bind(
+            store,
+            registry,
+            waiting.unbound.clone(),
+            &common.shared.root,
+        )
+        .await?;
+        context.required_capabilities = waiting
+            .roles
+            .iter()
+            .map(|(role, contract)| (role.clone(), super::agents::required(contract.as_deref())))
+            .collect();
+    }
+    // The time taken afresh for each pace and each round, never one from before an awaited step (a settle, the
+    // writer's queue): a round after the deadline dispatches nothing (M2T19R-04); with the team's capabilities.
+    let at = || Context {
+        now: Some(common.clock.now()),
+        wall: Some(common.clock.wall()),
+        ..context.clone()
+    };
     for run in &waiting.runs {
         // The run as a whole first: woken when a retry is due, parked, blocked or stopped (ADR-020 decisions 4, 5, 7).
         store.pace_run(run, at()).await?;

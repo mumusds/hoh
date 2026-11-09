@@ -948,3 +948,99 @@ async fn a_payload_missing_a_member_or_of_another_type_is_an_invalid_team_config
     host.shutdown().await;
     Ok(())
 }
+
+/// An executor that is never given work but has the product's registry: the runner binds sessions with it.
+#[derive(Debug)]
+struct Registered(std::sync::Arc<hoh_app::host::agents::Registry>);
+
+impl hoh_app::host::Executor for Registered {
+    fn registry(&self) -> Option<std::sync::Arc<hoh_app::host::agents::Registry>> {
+        Some(self.0.clone())
+    }
+
+    fn deliver(
+        &self,
+        _work: &hoh_app::host::Work,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
+        tokio::sync::oneshot::channel().1
+    }
+
+    fn start(&self, _work: &hoh_app::host::Work) -> Result<hoh_app::host::Started, String> {
+        Err("no work is expected".to_owned())
+    }
+}
+
+#[tokio::test]
+async fn the_runner_binds_each_role_to_a_session_of_its_available_agent_or_blocks_it() -> R {
+    // docs/adr/ADR-022.md decision 9: with only claude on the host's PATH, the claude roles of a new run get a session
+    // per role at epoch 1 (the agent's version and capabilities recorded), the others are blocked AGENT_UNAVAILABLE.
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir()?;
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin)?;
+    let help = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/protocol/claude/2.1.318/help.txt"
+    );
+    std::fs::write(
+        bin.join("claude"),
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n --version) echo '2.1.318 (Claude Code)';;\n --help) cat '{help}';;\n *) exit 2;;\nesac\n"
+        ),
+    )?;
+    std::fs::set_permissions(bin.join("claude"), std::fs::Permissions::from_mode(0o755))?;
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    let mut config = config(&project);
+    let registry = std::sync::Arc::new(hoh_app::host::agents::Registry::new(
+        format!("{}:/usr/bin:/bin", bin.display()).into(),
+    ));
+    config.runner = Some(hoh_app::host::RunnerConfig {
+        executor: std::sync::Arc::new(Registered(registry)),
+        context: hoh_core::decision::Context::default(),
+    });
+    let host = start_when_free(config).await?;
+    let run_id = started(&host, "s1").await?;
+    let states = format!(
+        "SELECT group_concat(role || ':' || state || ':' || coalesce(session_id, '-'), ',') FROM \
+         (SELECT * FROM role_bindings WHERE run_id = '{run_id}' ORDER BY role)"
+    );
+    let end = std::time::Instant::now() + Duration::from_secs(20);
+    let settled = |s: &str| !s.contains(":ACTIVE:-");
+    let mut seen = query(&project, &states)?;
+    while !settled(&seen) {
+        assert!(std::time::Instant::now() < end, "not bound: {seen}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        seen = query(&project, &states)?;
+    }
+    let session = |role: &str| format!("{run_id}/session/{role}/1");
+    assert_eq!(
+        seen,
+        format!(
+            "commander:BLOCKED:-,cto:ACTIVE:{},developer:ACTIVE:{},qa:BLOCKED:-,researcher:BLOCKED:-,reviewer:BLOCKED:-",
+            session("cto"),
+            session("developer")
+        )
+    );
+    assert_eq!(
+        query(
+            &project,
+            &format!(
+                "SELECT agent_version || '/' || json_extract(capabilities_json, '$.structured_events') FROM sessions WHERE session_id = '{}'",
+                session("developer")
+            )
+        )?,
+        "2.1.318 (Claude Code)/1"
+    );
+    assert_eq!(
+        query(
+            &project,
+            &format!(
+                "SELECT blocked_reason FROM role_bindings WHERE run_id = '{run_id}' AND role = 'qa'"
+            )
+        )?,
+        "AGENT_UNAVAILABLE"
+    );
+    host.shutdown().await;
+    Ok(())
+}

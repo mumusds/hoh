@@ -45,6 +45,11 @@ pub struct Waiting {
     /// The runs, not ended, behind the project's current team revision: their checkpoint comes first
     /// (docs/adr/ADR-022.md decision 8).
     pub team_behind: Vec<String>,
+    /// The bindings the binder looks at (decision 9).
+    pub unbound: Vec<super::team::Unbound>,
+    /// The project's current team: each role and the built-in role whose contract it follows (its own, a custom role's
+    /// `builtin:<role>`, or none), for the capabilities it needs (decision 10).
+    pub roles: Vec<(String, Option<String>)>,
 }
 
 /// One step of the runner.
@@ -78,6 +83,10 @@ pub(super) enum RunnerJob {
         context: Box<crate::decision::Context>,
     },
     Ack(String),
+    /// A session the binder grants (docs/adr/ADR-022.md decision 9).
+    BindSession(Box<super::team::SessionGrant>),
+    /// A binding the binder blocks because its agent is unavailable, and why.
+    BlockBinding(Box<super::team::Unbound>, String),
     /// A run's team checkpoint (docs/adr/ADR-022.md decision 8), with the agents the registry found unavailable.
     Checkpoint(String, std::collections::BTreeSet<String>),
     /// Renew the unexpired leases these attempts hold, at `now` (REQ-041: every 30 s, for 120 s).
@@ -151,6 +160,12 @@ pub(super) fn run(
         }
         RunnerJob::Repair(request) => {
             super::retry::request_repair(conn, &request, ctx).map(RunnerDone::Repair)
+        }
+        RunnerJob::BindSession(grant) => {
+            super::team::bind_session(conn, &grant, ctx).map(RunnerDone::Applied)
+        }
+        RunnerJob::BlockBinding(unbound, detail) => {
+            super::team::block_binding(conn, &unbound, &detail, ctx).map(RunnerDone::Applied)
         }
         RunnerJob::Checkpoint(run_id, unavailable) => {
             super::team::checkpoint(conn, &run_id, &unavailable, ctx).map(RunnerDone::Applied)
@@ -269,6 +284,8 @@ fn waiting(conn: &Connection, project_id: &str) -> Result<Waiting, PersistError>
                 .collect::<Result<_, _>>()
                 .map_err(sqlite_error)?
         },
+        unbound: super::team::unbound(conn, project_id)?,
+        roles: super::team::roles(conn, project_id)?,
     })
 }
 

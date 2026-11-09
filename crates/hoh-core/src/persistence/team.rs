@@ -354,8 +354,9 @@ fn changes(
     })
 }
 
-/// Why a role a revision removed is BLOCKED (`$defs.BlockedReason`).
-const REMOVED: &str = "AGENT_UNAVAILABLE";
+/// Why a removed role, or a role whose agent is unavailable, is BLOCKED (`$defs.BlockedReason` has no other code for a
+/// removed role; which one it is comes from the configuration, never from this code, decision 8).
+const AGENT_UNAVAILABLE: &str = "AGENT_UNAVAILABLE";
 
 /// The event kinds of a checkpoint's verdict on a changed role (decision 8, third version): the change is refused (its
 /// new agent unavailable: the old binding works on), or pending again (the agent is there: the role is held until its
@@ -549,7 +550,7 @@ pub(super) fn checkpoint(
                 tx.execute(
                     "UPDATE role_bindings SET role_epoch = ?3, config_revision = ?4, session_id = NULL, \
                      state = 'BLOCKED', blocked_reason = ?5, bound_at = ?6 WHERE run_id = ?1 AND role = ?2",
-                    params![run_id, binding.role, epoch, revision, REMOVED, now],
+                    params![run_id, binding.role, epoch, revision, AGENT_UNAVAILABLE, now],
                 )
                 .map_err(sqlite_error)?;
                 serde_json::Value::Null
@@ -588,6 +589,220 @@ pub(super) fn checkpoint(
         &tx,
         &super::writer::Commit {
             events,
+            ..super::writer::Commit::default()
+        },
+        ctx,
+    )?;
+    ctx.before_commit()?;
+    tx.commit().map_err(sqlite_error)?;
+    Ok(true)
+}
+
+/// A binding that needs its agent looked at by the binder (decision 9): ACTIVE with no session yet, or BLOCKED because
+/// its agent was unavailable (not a removed role).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unbound {
+    pub run_id: String,
+    pub role: String,
+    pub role_epoch: i64,
+    pub agent: String,
+}
+
+/// A session the binder grants: for run `run_id`'s `role` at `role_epoch`, with its agent's version and the
+/// capabilities a turn of it will have (decision 9).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionGrant {
+    pub run_id: String,
+    pub role: String,
+    pub role_epoch: i64,
+    pub agent: String,
+    pub agent_version: String,
+    pub capabilities: serde_json::Value,
+}
+
+/// The id of the session of `role` at `role_epoch` in run `run_id`: one per run, role and epoch.
+pub fn session_id(run_id: &str, role: &str, role_epoch: i64) -> String {
+    crate::ids::child_id(run_id, &format!("session/{role}/{role_epoch}"))
+}
+
+/// The project's current team: each role and the built-in role contract it follows.
+pub(super) fn roles(
+    conn: &Connection,
+    project_id: &str,
+) -> Result<Vec<(String, Option<String>)>, PersistError> {
+    let team = latest(conn, project_id)?
+        .map(|(_, config)| config.team)
+        .unwrap_or_else(|| TeamConfig::builtin().team);
+    Ok(team
+        .into_iter()
+        .map(|(name, role)| {
+            let contract = if crate::config::BUILTIN_ROLES.contains(&name.as_str()) {
+                Some(name.clone())
+            } else {
+                role.prompt
+                    .as_deref()
+                    .and_then(|p| p.strip_prefix(crate::config::BUILTIN_PROMPT))
+                    .map(str::to_owned)
+            };
+            (name, contract)
+        })
+        .collect())
+}
+
+/// The project's bindings the binder looks at, in runs not ended.
+pub(super) fn unbound(conn: &Connection, project_id: &str) -> Result<Vec<Unbound>, PersistError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT b.run_id, b.role, b.role_epoch, b.agent, b.config_revision, b.session_id FROM role_bindings b \
+             JOIN runs r ON r.run_id = b.run_id WHERE r.project_id = ?1 \
+             AND r.state NOT IN ('CANCELLED', 'COMPLETED', 'FAILED', 'INCOMPLETE') \
+             AND ((b.state = 'ACTIVE' AND b.session_id IS NULL) OR (b.state = 'BLOCKED' AND b.blocked_reason = ?2)) \
+             ORDER BY r.created_at, b.run_id, b.role",
+        )
+        .map_err(sqlite_error)?;
+    let rows: Vec<(String, String, i64, String, i64, Option<String>)> = statement
+        .query_map(params![project_id, AGENT_UNAVAILABLE], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        })
+        .map_err(sqlite_error)?
+        .collect::<Result<_, _>>()
+        .map_err(sqlite_error)?;
+    let mut found = Vec::new();
+    for (run_id, role, role_epoch, agent, config_revision, session_id) in rows {
+        let binding = Bound {
+            role: role.clone(),
+            agent: agent.clone(),
+            model: None,
+            role_epoch,
+            config_revision,
+            session_id,
+        };
+        // A removed role stays BLOCKED: it is not the binder's.
+        if matches!(before(conn, project_id, &binding)?, Before::Absent) {
+            continue;
+        }
+        found.push(Unbound {
+            run_id,
+            role,
+            role_epoch,
+            agent,
+        });
+    }
+    Ok(found)
+}
+
+/// In one transaction: the session of `grant`, and the binding at its epoch bound to it (ACTIVE again if its agent was
+/// unavailable before), with a team.session_bound event; whether the binding was still the one granted.
+pub(super) fn bind_session(
+    conn: &mut Connection,
+    grant: &SessionGrant,
+    ctx: &super::writer::Ctx<'_>,
+) -> Result<bool, PersistError> {
+    let tx = super::writer::begin(conn, ctx)?;
+    let id = session_id(&grant.run_id, &grant.role, grant.role_epoch);
+    tx.execute(
+        "INSERT OR IGNORE INTO sessions(session_id, agent, role, agent_version, capabilities_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            id,
+            grant.agent,
+            grant.role,
+            grant.agent_version,
+            grant.capabilities.to_string()
+        ],
+    )
+    .map_err(sqlite_error)?;
+    let bound = tx
+        .execute(
+            "UPDATE role_bindings SET session_id = ?1, state = 'ACTIVE', blocked_reason = NULL, missing_json = '[]' \
+             WHERE run_id = ?2 AND role = ?3 AND role_epoch = ?4 AND agent = ?5 \
+             AND ((state = 'ACTIVE' AND session_id IS NULL) OR (state = 'BLOCKED' AND blocked_reason = ?6))",
+            params![id, grant.run_id, grant.role, grant.role_epoch, grant.agent, AGENT_UNAVAILABLE],
+        )
+        .map_err(sqlite_error)?;
+    if bound == 0 {
+        return Ok(false);
+    }
+    let project_id: String = tx
+        .query_row(
+            "SELECT project_id FROM runs WHERE run_id = ?1",
+            params![grant.run_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    super::writer::write(
+        &tx,
+        &super::writer::Commit {
+            events: vec![super::writer::NewEvent {
+                project_id,
+                event_id: crate::ids::child_id(&id, "bound"),
+                run_id: Some(grant.run_id.clone()),
+                kind: "team.session_bound".to_owned(),
+                payload: serde_json::json!({
+                    "run_id": grant.run_id, "role": grant.role, "role_epoch": grant.role_epoch,
+                    "session_id": id, "agent": grant.agent, "agent_version": grant.agent_version,
+                }),
+            }],
+            ..super::writer::Commit::default()
+        },
+        ctx,
+    )?;
+    ctx.before_commit()?;
+    tx.commit().map_err(sqlite_error)?;
+    Ok(true)
+}
+
+/// In one transaction: run `run_id`'s binding of `role` at `role_epoch`, still waiting for a session, BLOCKED because
+/// its agent is unavailable (`$defs.BlockedReason` AGENT_UNAVAILABLE, the agent in missing_json), with a
+/// team.binding_blocked event; whether it was still waiting.
+pub(super) fn block_binding(
+    conn: &mut Connection,
+    unbound: &Unbound,
+    detail: &str,
+    ctx: &super::writer::Ctx<'_>,
+) -> Result<bool, PersistError> {
+    let tx = super::writer::begin(conn, ctx)?;
+    let blocked = tx
+        .execute(
+            "UPDATE role_bindings SET state = 'BLOCKED', blocked_reason = ?5, missing_json = json_array(?4) \
+             WHERE run_id = ?1 AND role = ?2 AND role_epoch = ?3 AND agent = ?4 AND state = 'ACTIVE' \
+             AND session_id IS NULL",
+            params![unbound.run_id, unbound.role, unbound.role_epoch, unbound.agent, AGENT_UNAVAILABLE],
+        )
+        .map_err(sqlite_error)?;
+    if blocked == 0 {
+        return Ok(false);
+    }
+    let project_id: String = tx
+        .query_row(
+            "SELECT project_id FROM runs WHERE run_id = ?1",
+            params![unbound.run_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    super::writer::write(
+        &tx,
+        &super::writer::Commit {
+            events: vec![super::writer::NewEvent {
+                project_id,
+                event_id: crate::ids::child_id(
+                    &unbound.run_id,
+                    &format!("blocked/{}/{}", unbound.role, unbound.role_epoch),
+                ),
+                run_id: Some(unbound.run_id.clone()),
+                kind: "team.binding_blocked".to_owned(),
+                payload: serde_json::json!({
+                    "run_id": unbound.run_id, "role": unbound.role, "role_epoch": unbound.role_epoch,
+                    "agent": unbound.agent, "reason": AGENT_UNAVAILABLE, "detail": detail,
+                }),
+            }],
             ..super::writer::Commit::default()
         },
         ctx,

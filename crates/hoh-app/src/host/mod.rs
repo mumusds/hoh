@@ -8,6 +8,7 @@
 //! Any failure before that ends the start with nothing served, and no database file is made when the location or the
 //! WAL self-test refuses.
 
+pub mod agents;
 mod cgroup;
 mod control;
 mod http;
