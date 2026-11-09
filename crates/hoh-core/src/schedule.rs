@@ -15,7 +15,7 @@ pub const AGE_BONUS_CAP: u32 = 10;
 pub const DEFAULT_COST: u8 = 3;
 
 /// The four score weights of REQ-038.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct Weights {
     pub user_value: u32,
     pub unblock_value: u32,
@@ -24,7 +24,7 @@ pub struct Weights {
 }
 
 /// The scheduling parameters of one run (CR-007: the run config snapshot's `scheduler`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct Params {
     pub weights: Weights,
     /// Eligible rounds without selection after which a task of layer 1 or 2 enters the aged sub-layer.

@@ -6,25 +6,8 @@ use hoh_core::nullable;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// The native agents HoH drives.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Agent {
-    Codex,
-    Claude,
-    Pi,
-}
-
-impl Agent {
-    /// The executable name looked up on PATH.
-    pub fn command(self) -> &'static str {
-        match self {
-            Self::Codex => "codex",
-            Self::Claude => "claude",
-            Self::Pi => "pi",
-        }
-    }
-}
+/// The native agents HoH drives (the product configuration's, REQ-018).
+pub use hoh_core::config::Agent;
 
 /// The native transport an adapter uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
