@@ -33,8 +33,10 @@ pub use reconcile::{EffectRow, UnfinishedRow};
 pub use results::{TaskResultOutcome, VERIFIERS};
 pub use retry::{Failure, Paced, Repair, RepairRequest, RepairVerdict};
 pub use rounds::{Dispatched, RoundOutcome};
-pub use runner::{DispatchNotice, Ending, Observed, RUNNER, Waiting};
-pub use team::{SessionGrant, TeamChange, TeamConfig, TeamMember, TeamView, Unbound, session_id};
+pub use runner::{DispatchNotice, Ending, Observed, PromptRecord, RUNNER, Waiting};
+pub use team::{
+    Assignment, SessionGrant, TeamChange, TeamConfig, TeamMember, TeamView, Unbound, session_id,
+};
 pub mod location;
 pub mod selftest;
 mod writer;

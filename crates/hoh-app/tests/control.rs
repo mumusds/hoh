@@ -823,6 +823,7 @@ async fn cancel_with_a_writer_outside(dir: &Path, script: &str, file: &Path) -> 
             attempt_id: "T1/attempt-1".to_owned(),
             role: "developer".to_owned(),
             effect_key: String::new(),
+            assignment: Default::default(),
         }
         .marker()
     };
@@ -987,6 +988,7 @@ fn t1_marker(project: &Path) -> R<String> {
         attempt_id: "T1/attempt-1".to_owned(),
         role: "developer".to_owned(),
         effect_key: String::new(),
+        assignment: Default::default(),
     }
     .marker())
 }

@@ -45,6 +45,9 @@ pub struct Work {
     pub role: String,
     /// The key of the attempt's own work effect: the run marker its process leaves (ADR-019 decision 6).
     pub effect_key: String,
+    /// What it runs as: its binding's agent, model and session, the role's prompt, the run's goal and the task's title
+    /// (docs/adr/ADR-022.md decisions 9 to 12; test executors need none of it).
+    pub assignment: hoh_core::persistence::Assignment,
 }
 
 impl Work {
@@ -376,6 +379,7 @@ async fn tick(
             attempt_id: id.clone(),
             role: notice.role.clone(),
             effect_key: work_key(&id),
+            assignment: notice.assignment.clone(),
         };
         let Ok(mut inflight) = common.inflight.lock() else {
             continue;
