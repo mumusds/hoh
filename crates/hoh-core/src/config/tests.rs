@@ -398,3 +398,95 @@ fn a_config_that_is_not_a_regular_file_is_refused() -> R {
     assert_eq!(error.file.as_deref(), Some(dir.path().join(FILE).as_path()));
     Ok(())
 }
+
+#[test]
+fn a_team_patch_merges_keys_removes_roles_and_resets_keys_to_their_defaults() -> R {
+    // ADR-022 decision 4: ConfigureTeam's bindings are an RFC 7396 merge patch over the team.
+    let base = Config::default().team;
+    let team = patch_team(
+        &base,
+        &serde_json::json!({
+            "developer": {"agent": "codex", "model": "m-test", "fallback": ["claude"]},
+            "cto": null,
+            "auditor": {"agent": "pi", "prompt": "builtin:qa"},
+        }),
+    )?;
+    assert_eq!(team["developer"].agent, Agent::Codex);
+    assert_eq!(team["developer"].model.as_deref(), Some("m-test"));
+    assert_eq!(team["developer"].fallback, vec![Agent::Claude]);
+    assert!(!team.contains_key("cto"), "removed");
+    assert_eq!(team["auditor"].prompt.as_deref(), Some("builtin:qa"));
+    assert_eq!(team["qa"], base["qa"], "untouched");
+    let reset = patch_team(
+        &team,
+        &serde_json::json!({"developer": {"agent": null, "model": null, "fallback": null}}),
+    )?;
+    assert_eq!(
+        reset["developer"], base["developer"],
+        "reset to the default"
+    );
+    assert!(reset["reviewer"].independent_session);
+    let reset = patch_team(
+        &base,
+        &serde_json::json!({"reviewer": {"independent_session": null}}),
+    )?;
+    assert!(
+        reset["reviewer"].independent_session,
+        "the reviewer's default"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_team_patch_is_checked_by_the_files_rules_with_key_paths_under_bindings() {
+    // REQ-018 failure modes 1 and 3, decisions 3 to 5.
+    let base = Config::default().team;
+    for (patch, key) in [
+        (
+            serde_json::json!({"qa": {"agent": "unknown"}}),
+            "bindings.qa.agent",
+        ),
+        (serde_json::json!({"qa": null}), "bindings.qa"),
+        (serde_json::json!({"commander": null}), "bindings.commander"),
+        (
+            serde_json::json!({"reviewer": {"independent_session": false}}),
+            "bindings.reviewer.independent_session",
+        ),
+        (
+            serde_json::json!({"qa": {"modle": "x"}}),
+            "bindings.qa.modle",
+        ),
+        (serde_json::json!({"qa": "pi"}), "bindings.qa"),
+        (
+            serde_json::json!({"auditor": {"agent": "pi"}}),
+            "bindings.auditor.prompt",
+        ),
+        (
+            serde_json::json!({"auditor": {"prompt": "a.md"}}),
+            "bindings.auditor.agent",
+        ),
+        (
+            serde_json::json!({"Bad": {"agent": "pi", "prompt": "a.md"}}),
+            "bindings.Bad",
+        ),
+        (
+            serde_json::json!({"qa": {"fallback": ["pi", "pi"]}}),
+            "bindings.qa.fallback[1]",
+        ),
+        (serde_json::json!({"qa": {"model": 1}}), "bindings.qa.model"),
+        (serde_json::json!(["qa"]), "bindings"),
+    ] {
+        match patch_team(&base, &patch) {
+            Ok(team) => panic!("{patch} accepted: {team:?}"),
+            Err(error) => {
+                assert_eq!(error.key.as_deref(), Some(key), "{patch}: {error}");
+                assert_eq!((error.line, error.column), (None, None), "{patch}");
+            }
+        }
+    }
+    let optional = patch_team(&base, &serde_json::json!({"cto": null, "researcher": null}));
+    assert!(
+        optional.is_ok(),
+        "cto and researcher are not required: {optional:?}"
+    );
+}

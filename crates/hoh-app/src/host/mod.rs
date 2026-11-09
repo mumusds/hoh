@@ -58,6 +58,8 @@ pub struct HostConfig {
     /// The seed of the retries' jitter (REQ-042, ADR-020 decision 2): `None` in the product, drawn from the system at
     /// the start; tests fix it so their delays replay.
     pub jitter_seed: Option<u64>,
+    /// The effective configuration (docs/adr/ADR-022.md decision 1): what new runs get as their budget.
+    pub config: hoh_core::config::Config,
 }
 
 /// The host's TCP port unless another is configured (docs/11-deployment.md: `ssh -L 8787`).
@@ -89,6 +91,7 @@ impl HostConfig {
             runner: None,
             clock: HostClock(Arc::new(hoh_core::delivery::MonotonicClock::new())),
             jitter_seed: None,
+            config: hoh_core::config::Config::default(),
         }
     }
 }
@@ -342,6 +345,7 @@ impl Host {
             subscribers: std::sync::atomic::AtomicUsize::new(0),
             opened: std::sync::atomic::AtomicUsize::new(0),
             cgroups: delegated.as_ref().ok().cloned(),
+            budget: config.config.budget.clone(),
         });
         let mut served = vec![
             tokio::spawn(http::serve(

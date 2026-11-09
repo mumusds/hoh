@@ -23,6 +23,9 @@ pub enum Entity {
     Attempt,
     /// An `input_queue` row, moved with `InputMove` (no revision column either).
     Input,
+    /// A project's team revisions (ConfigureTeam, docs/adr/ADR-022.md decision 3): compared, never moved by a
+    /// compare-and-set.
+    Team,
 }
 
 impl Entity {
@@ -32,6 +35,7 @@ impl Entity {
             Entity::Task => ("tasks", "task_id"),
             Entity::Attempt => ("attempts", "attempt_id"),
             Entity::Input => ("input_queue", "input_id"),
+            Entity::Team => ("team_revisions", "project_id"),
         }
     }
 }

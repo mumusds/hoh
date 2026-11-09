@@ -2691,7 +2691,8 @@ INSERT INTO tasks(task_id, run_id, spec_id, state, role, writer, created_seq, us
         commands
     );
     assert_eq!(scalar(dir.path(), "SELECT count(*) FROM events")?, events);
-    // A run that does not exist is 409 RUN_NOT_FOUND; bindings alone are not served yet (M2-T07): 422.
+    // A run that does not exist is 409 RUN_NOT_FOUND; a binding that is not a role's keys is refused with its key path
+    // and nothing written (REQ-018, docs/adr/ADR-022.md decision 5).
     let mut missing: Value = serde_json::from_slice(&request)?;
     missing["run_id"] = json!("nope");
     let reply = call(
@@ -2708,6 +2709,8 @@ INSERT INTO tasks(task_id, run_id, spec_id, state, role, writer, created_seq, us
     );
     let mut bindings: Value = serde_json::from_slice(&request)?;
     bindings["payload"] = json!({"bindings": {"qa": "pi"}, "apply_at": "checkpoint"});
+    // A team change's expected_revision is the team's (ADR-022 decision 3): none was written yet, so 0.
+    bindings["expected_revision"] = json!(0);
     let reply = call(
         &To::Tcp(host.port),
         "POST",
@@ -2716,7 +2719,21 @@ INSERT INTO tasks(task_id, run_id, spec_id, state, role, writer, created_seq, us
         &serde_json::to_vec(&bindings)?,
     )
     .await?;
-    assert_eq!(reply.status, 422, "{reply:?}");
+    let refused = reply.json()?;
+    assert_eq!(
+        (
+            reply.status,
+            refused["code"].clone(),
+            refused["details"]["key_path"].clone()
+        ),
+        (400, json!("INVALID_TEAM_CONFIG"), json!("bindings.qa")),
+        "{refused}"
+    );
+    assert_eq!(
+        scalar(dir.path(), "SELECT count(*) FROM commands")?,
+        commands
+    );
+    assert_eq!(scalar(dir.path(), "SELECT count(*) FROM events")?, events);
     host.shutdown().await;
     // One round on the same database scores T1 with the snapshot's weights: (4*2 + 3*1 + 3*1 + 2*1) / 2 = 8.
     let store = hoh_core::persistence::Store::open(&db(dir.path()), config(dir.path()).store)?;

@@ -24,6 +24,7 @@ mod results;
 mod retry;
 mod rounds;
 mod runner;
+mod team;
 pub use control::{CancelPass, Finished, PauseStep};
 pub use leases::{Grant, LEASE_TTL, LeaseView};
 pub use outbox::{ConsumeEffect, Consumed, OutboxRow, Settlement, backoff};
@@ -33,6 +34,7 @@ pub use results::{TaskResultOutcome, VERIFIERS};
 pub use retry::{Failure, Paced, Repair, RepairRequest, RepairVerdict};
 pub use rounds::{Dispatched, RoundOutcome};
 pub use runner::{DispatchNotice, Ending, RUNNER, Waiting};
+pub use team::{TeamChange, TeamConfig, TeamMember, TeamView};
 pub mod location;
 pub mod selftest;
 mod writer;
@@ -159,6 +161,13 @@ pub enum PersistError {
     },
     /// The run does not exist (`RUN_NOT_FOUND`); nothing was written.
     RunNotFound(String),
+    /// A team change the configuration's rules refuse (`INVALID_TEAM_CONFIG`, REQ-018): the key path, why, and the
+    /// team revision that stays current; nothing was written.
+    InvalidTeamConfig {
+        key_path: String,
+        message: String,
+        current_revision: i64,
+    },
     /// A proposal that cannot be recorded (its payload violates `$defs.DecisionPayload`, or a number is out of
     /// range); nothing was written.
     InvalidProposal(String),
@@ -198,6 +207,7 @@ impl PersistError {
             PersistError::Busy(_) => Some(ErrorCode::DbBusy),
             PersistError::Full(_) => Some(ErrorCode::DbFull),
             PersistError::RunNotFound(_) => Some(ErrorCode::RunNotFound),
+            PersistError::InvalidTeamConfig { .. } => Some(ErrorCode::InvalidTeamConfig),
             PersistError::Plan(plan) => plan.code(),
             _ => None,
         }
@@ -282,6 +292,9 @@ impl std::fmt::Display for PersistError {
                 "{entity:?} {id} expected state {expected}, found {actual:?}"
             ),
             PersistError::RunNotFound(id) => write!(f, "RUN_NOT_FOUND: {id}"),
+            PersistError::InvalidTeamConfig {
+                key_path, message, ..
+            } => write!(f, "INVALID_TEAM_CONFIG: {key_path}: {message}"),
             PersistError::InvalidProposal(detail) => write!(f, "invalid proposal: {detail}"),
             PersistError::Unsupported(kind) => write!(f, "{kind} decisions are not applied yet"),
             PersistError::Busy(detail) => write!(f, "DB_BUSY: {detail}"),
@@ -1288,6 +1301,16 @@ impl Reader {
     /// The run `run_id` with the highest event seq, read together.
     pub fn snapshot(&self, run_id: &str) -> Result<Option<(RunRow, i64)>, PersistError> {
         commands::snapshot(&self.conn, run_id)
+    }
+
+    /// The project's current team revision (0 before any team transaction, docs/adr/ADR-022.md decision 3).
+    pub fn team_revision(&self, project_id: &str) -> Result<i64, PersistError> {
+        team::revision(&self.conn, project_id)
+    }
+
+    /// The run `run_id`, its team (docs/adr/ADR-022.md decision 18) and the highest event seq, read together.
+    pub fn run_view(&self, run_id: &str) -> Result<Option<(RunRow, TeamView, i64)>, PersistError> {
+        commands::run_view(&self.conn, run_id)
     }
 
     /// A page of the project's runs, newest first (openapi `listRuns`; ADR-021 decision 6): the runs with their
