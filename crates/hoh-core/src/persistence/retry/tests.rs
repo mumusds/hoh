@@ -466,6 +466,13 @@ async fn an_ending_records_what_the_agents_turn_showed() -> R {
                     resolved_model: Some("m-test".to_owned()),
                     usage: Some(json!({"input_tokens": 3})),
                     native_session: Some("native-1".to_owned()),
+                    prompt: Some(crate::persistence::PromptRecord {
+                        layer: "project".to_owned(),
+                        role: "developer".to_owned(),
+                        path: ".hoh/prompts/developer.md".to_owned(),
+                        content_sha256: format!("{:064}", 7),
+                        sent_sha256: format!("{:064}", 8),
+                    }),
                     events: vec![(
                         "frame-too-large".to_owned(),
                         "adapter.diagnostic".to_owned(),
@@ -505,6 +512,21 @@ async fn an_ending_records_what_the_agents_turn_showed() -> R {
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     assert_eq!(event_id, format!("{attempt}/frame-too-large"));
+    let (revision, sent): (String, String) = conn.query_row(
+        "SELECT prompt_revision, prompt_sha256 FROM attempts WHERE attempt_id = ?1",
+        [&attempt],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    assert_eq!(sent, format!("{:064}", 8));
+    let (layer, path, content): (String, String, String) = conn.query_row(
+        "SELECT layer, path, content_sha256 FROM prompt_revisions WHERE revision_id = ?1",
+        [&revision],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    assert_eq!(
+        (layer.as_str(), path.as_str(), content),
+        ("project", ".hoh/prompts/developer.md", format!("{:064}", 7))
+    );
     assert_eq!(serde_json::from_str::<Value>(&payload)?["length"], 8);
     Ok(())
 }

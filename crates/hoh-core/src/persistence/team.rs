@@ -620,6 +620,70 @@ pub struct SessionGrant {
     pub capabilities: serde_json::Value,
 }
 
+/// What a dispatched attempt runs as (docs/adr/ADR-022.md decisions 9, 11 and 12): its agent, model and session as
+/// its binding gave them, the role's prompt in the revision it was bound at, and the run's goal and the task's title
+/// for the prompt's header.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Assignment {
+    pub agent: Option<String>,
+    pub model: Option<String>,
+    pub role_epoch: i64,
+    pub config_revision: i64,
+    pub session_id: Option<String>,
+    /// The agent's own session id, to resume.
+    pub native_session: Option<String>,
+    pub agent_version: Option<String>,
+    /// A prompt override file (relative to the project) or `builtin:<role>`; none: the role's own built-in contract.
+    pub prompt: Option<String>,
+    pub goal: Option<String>,
+    pub title: Option<String>,
+}
+
+/// The assignment of attempt `attempt_id` of task `task_id` in run `run_id` (project `project_id`), `role`.
+pub(super) fn assignment(
+    conn: &Connection,
+    project_id: &str,
+    run_id: &str,
+    task_id: &str,
+    attempt_id: &str,
+    role: &str,
+) -> Result<Assignment, PersistError> {
+    let row: Option<Assignment> = conn
+        .query_row(
+            "SELECT a.agent, b.model, a.role_epoch, a.config_revision, a.session_id, s.native_id, s.agent_version, \
+             (SELECT json_extract(e.payload_json, '$.goal') FROM events e WHERE e.run_id = ?2 AND e.kind = 'run.created' \
+              ORDER BY e.seq LIMIT 1), \
+             (SELECT json_extract(j.value, '$.title') FROM events e, json_each(json_extract(e.payload_json, '$.tasks')) j \
+              WHERE e.run_id = ?2 AND e.kind = 'plan.imported' AND json_extract(j.value, '$.task_id') = ?3 \
+              ORDER BY e.seq DESC LIMIT 1) \
+             FROM attempts a LEFT JOIN sessions s ON s.session_id = a.session_id \
+             LEFT JOIN role_bindings b ON b.run_id = ?2 AND b.role = ?4 WHERE a.attempt_id = ?1",
+            params![attempt_id, run_id, task_id, role],
+            |r| {
+                Ok(Assignment {
+                    agent: r.get(0)?,
+                    model: r.get(1)?,
+                    role_epoch: r.get(2)?,
+                    config_revision: r.get(3)?,
+                    session_id: r.get(4)?,
+                    native_session: r.get(5)?,
+                    agent_version: r.get(6)?,
+                    prompt: None,
+                    goal: r.get(7)?,
+                    title: r.get(8)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some(mut assignment) = row else {
+        return Ok(Assignment::default());
+    };
+    assignment.prompt = at_revision(conn, project_id, assignment.config_revision)?
+        .and_then(|config| config.team.get(role).and_then(|r| r.prompt.clone()));
+    Ok(assignment)
+}
+
 /// The id of the session of `role` at `role_epoch` in run `run_id`: one per run, role and epoch.
 pub fn session_id(run_id: &str, role: &str, role_epoch: i64) -> String {
     crate::ids::child_id(run_id, &format!("session/{role}/{role_epoch}"))
