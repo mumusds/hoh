@@ -323,6 +323,7 @@ fn reaping(
             detail: format!("{status:?}"),
             group_gone,
             class: hoh_core::retry::FailureClass::Transient { retry_after: None },
+            observed: Default::default(),
         });
     });
     ended
@@ -1856,6 +1857,7 @@ impl hoh_app::host::Executor for LeavesItsGroup {
                 detail: format!("{status:?}"),
                 group_gone: false,
                 class: hoh_core::retry::FailureClass::Transient { retry_after: None },
+                observed: Default::default(),
             });
         });
         Ok(hoh_app::host::Started { pid, gate, ended })
