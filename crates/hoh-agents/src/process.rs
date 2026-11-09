@@ -191,6 +191,8 @@ pub struct Control {
     /// A single slot: the first plan is latched at once and later ones are dropped, so requests never queue
     /// (M1T02R-03) and a request made before the supervisor sees the exit still decides the cause (M1T02R-01).
     slot: std::sync::Arc<watch::Sender<Option<Escalation>>>,
+    /// Single signals to the leader, with no escalation after them (docs/adr/ADR-022.md decision 14).
+    leader: mpsc::UnboundedSender<Signal>,
 }
 
 impl Control {
@@ -205,6 +207,12 @@ impl Control {
             }
             first
         });
+    }
+
+    /// Send `signal` to the leader once, through its pidfd, recorded among the steps; nothing follows it (the
+    /// caller's own ladder decides what does). Ignored once the leader is gone or an escalation runs.
+    pub fn signal_leader(&self, signal: Signal) {
+        let _ = self.leader.send(signal);
     }
 }
 
@@ -260,6 +268,7 @@ impl Process {
 
         let (events_tx, events) = mpsc::channel(config.queue.max(1));
         let (cancel_tx, cancel_rx) = watch::channel(None);
+        let (leader_tx, leader_rx) = mpsc::unbounded_channel();
         let (abandon_tx, abandon) = watch::channel(false);
         let out = tokio::spawn(read_stdout(
             FrameReader::new(
@@ -286,6 +295,7 @@ impl Process {
             started: tokio::time::Instant::now(),
             events: events_tx,
             cancel: cancel_rx,
+            leader_signals: leader_rx,
             abandon: abandon_tx,
             out,
             err,
@@ -296,6 +306,7 @@ impl Process {
             events,
             control: Control {
                 slot: std::sync::Arc::new(cancel_tx),
+                leader: leader_tx,
             },
         })
     }
@@ -322,6 +333,11 @@ impl Process {
     /// See [`Control::cancel`].
     pub fn cancel(&self, plan: Escalation) {
         self.control.cancel(plan);
+    }
+
+    /// Send `signal` to the leader once, with no escalation after it (see [`Control::signal_leader`]).
+    pub fn signal_leader(&self, signal: Signal) {
+        self.control.signal_leader(signal);
     }
 }
 
@@ -439,6 +455,7 @@ struct Supervisor {
     started: tokio::time::Instant,
     events: mpsc::Sender<Event>,
     cancel: watch::Receiver<Option<Escalation>>,
+    leader_signals: mpsc::UnboundedReceiver<Signal>,
     abandon: watch::Sender<bool>,
     out: tokio::task::JoinHandle<StreamReport>,
     err: tokio::task::JoinHandle<(StreamReport, Vec<u8>)>,
@@ -518,6 +535,10 @@ async fn supervise(mut s: Supervisor) {
                 Some((s.config.escalation, Cause::DeadlineExceeded))
             }
             _ = s.events.closed(), if idle => Some((s.config.escalation, Cause::Abandoned)),
+            Some(signal) = s.leader_signals.recv(), if idle => {
+                send(&s.leader, &mut steps, Target::Leader, signal);
+                None
+            }
             _ = tokio::time::sleep_until(due), if !idle => {
                 if let Some(e) = escalating.as_mut() && !e.advance(&s.leader, &mut steps) {
                     break None;
@@ -742,6 +763,61 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(5));
             }
         }
+    }
+
+    /// docs/adr/ADR-022.md decision 14: in the runner's mode the host's ladder decides SIGTERM and SIGKILL; an
+    /// adapter's native cancel is one signal to the leader, recorded, with no escalation after it.
+    #[tokio::test]
+    async fn a_leader_signal_is_sent_once_and_starts_no_escalation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut command = Command::new("python3");
+        command.arg("-c").arg(
+            "import signal, sys, time\n\
+             def interrupted(*_):\n    print('interrupted', flush=True)\n\
+             signal.signal(signal.SIGINT, interrupted)\n\
+             signal.signal(signal.SIGTERM, lambda *_: (print('terminated', flush=True), sys.exit(0)))\n\
+             print('ready', flush=True)\n\
+             time.sleep(1.5)\n\
+             print('done', flush=True)\n",
+        );
+        let mut p = Process::spawn(
+            command,
+            Config {
+                escalation: Escalation {
+                    native: None,
+                    native_grace: Duration::ZERO,
+                    term_grace: Duration::from_millis(100),
+                    kill_grace: Duration::from_millis(100),
+                },
+                ..Config::default()
+            },
+        )?;
+        let mut lines = Vec::new();
+        let report = tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(event) = p.next().await {
+                match event {
+                    Event::Frame(Frame::Line(line)) => {
+                        let line = String::from_utf8_lossy(&line).trim().to_owned();
+                        if line == "ready" {
+                            p.signal_leader(Signal::Interrupt);
+                        }
+                        lines.push(line);
+                    }
+                    Event::Exit(report) => return Some(*report),
+                    Event::Frame(_) => {}
+                }
+            }
+            None
+        })
+        .await?
+        .ok_or("no exit report")?;
+        assert_eq!(lines, ["ready", "interrupted", "done"], "{report:?}");
+        assert_eq!(report.cause, Cause::Exited, "{report:?}");
+        assert_eq!(report.status, Some(Termination::Code(0)), "{report:?}");
+        let sent: Vec<(Target, Signal)> =
+            report.steps.iter().map(|s| (s.target, s.signal)).collect();
+        assert_eq!(sent, [(Target::Leader, Signal::Interrupt)]);
+        Ok(())
     }
 
     /// Only the group is sent SIGTERM, so the leader gets it at most once, as a member when the group is signalled:

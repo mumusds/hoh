@@ -91,6 +91,7 @@ impl Fakes for World {
                 yolo: true,
                 partial: false,
                 resume: None,
+                model: None,
                 root: false,
                 // What `probe()` finds for the recorded 2.1.318 help.
                 capabilities: probed(&[
@@ -1146,5 +1147,151 @@ async fn claude_an_8_mib_line_fails_only_its_own_attempt() -> R {
         Some(AttemptState::Settled)
     );
     assert!(world.store.writer_alive());
+    Ok(())
+}
+
+/// The number `sql` counts in the world's store (Python's sqlite3, test code).
+fn count(world: &World, sql: &str) -> R<i64> {
+    let out = std::process::Command::new("python3")
+        .args([
+            "-c",
+            "import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute(sys.argv[2]).fetchone()[0])",
+        ])
+        .arg(world.dir.path().join(".hoh/state.db"))
+        .arg(sql)
+        .output()?;
+    Ok(String::from_utf8(out.stdout)?.trim().parse()?)
+}
+
+/// A start gate for the tests (the product's is `hoh __gate`): one line from stdin, read a byte at a time; `go` execs
+/// the agent's argv in its place, anything else exits 0 (docs/adr/ADR-022.md decision 13).
+fn gate(world: &World, marker: &str) -> R<claude::GateCommand> {
+    let script = world.dir.path().join("gate.py");
+    std::fs::write(
+        &script,
+        "import os, sys\nline = b''\nwhile True:\n    b = os.read(0, 1)\n    if not b or b == b'\\n':\n        break\n    line += b\n\
+         if line != b'go':\n    sys.exit(0)\nos.execvp(sys.argv[1], sys.argv[1:])\n",
+    )?;
+    Ok(claude::GateCommand {
+        program: "python3".into(),
+        args: vec![script.into()],
+        env: vec![("HOH_ATTEMPT_ID".into(), marker.into())],
+    })
+}
+
+/// A fake `claude` that records its argv, its stdin and its marker, then prints `stdout`.
+fn recording(world: &World, name: &str, stdout: &str) -> R<PathBuf> {
+    let d = world.dir.path().join(name);
+    world.script(
+        name,
+        &format!(
+            "d='{}'\nprintf '%s\\n' \"$@\" > \"$d/argv\"\nprintf '%s' \"$HOH_ATTEMPT_ID\" > \"$d/marker\"\n\
+             cat > \"$d/stdin\"\nprintf '%s\\n' '{}'\n",
+            d.display(),
+            stdout.replace('\'', "'\\''")
+        ),
+    )
+}
+
+#[tokio::test]
+async fn claude_runner_mode_runs_nothing_before_its_gate_and_reports_facts_without_store_writes()
+-> R {
+    // docs/adr/ADR-022.md decisions 12 to 14: started held at its gate, nothing of the agent runs; opened, the agent
+    // gets its argv, the marker and the prompt (not the gate's line); its facts come back, the store untouched.
+    let world = World::new()?;
+    let program = recording(&world, "held", &format!("{INIT}\n{SUCCESS}"))?;
+    let mut turn = world.turn(&program, "logs-held")?;
+    turn.deadline = Some(Duration::from_millis(1));
+    let events = count(&world, "SELECT count(*) FROM events")?;
+    let held = claude::start(&turn, &gate(&world, "p/A1")?)?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let d = world.dir.path().join("held");
+    assert!(
+        !d.join("argv").exists(),
+        "the agent ran before its gate opened"
+    );
+    held.open.send(()).map_err(|()| "gate closed")?;
+    let facts = tokio::time::timeout(Duration::from_secs(20), held.ended).await??;
+    assert_eq!(facts.state, AttemptState::Settled, "{facts:?}");
+    assert_eq!(facts.failure, None);
+    assert_eq!(facts.native_session.as_deref(), Some("sid-1"));
+    assert_eq!(facts.resolved_model.as_deref(), Some("m"));
+    assert!(facts.group_reaped, "{facts:?}");
+    assert_eq!(
+        facts.raw_log_path,
+        world.dir.path().join("logs-held").to_string_lossy()
+    );
+    assert!(
+        facts
+            .recorded
+            .contains(&claude::Recorded::NativeSession("sid-1".to_owned()))
+    );
+    assert_eq!(std::fs::read(d.join("stdin"))?, turn.prompt);
+    assert_eq!(std::fs::read_to_string(d.join("marker"))?, "p/A1");
+    assert!(
+        std::fs::read_to_string(d.join("argv"))?.starts_with("-p\n--output-format\nstream-json\n")
+    );
+    assert_eq!(
+        count(&world, "SELECT count(*) FROM events")?,
+        events,
+        "the store was written"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn claude_runner_mode_gate_dropped_unopened_never_runs_the_agent() -> R {
+    // ADR-019 decision 8, ADR-022 decision 13: a gate that is never opened ends, and the agent never runs.
+    let world = World::new()?;
+    let program = recording(&world, "dropped", SUCCESS)?;
+    let turn = world.turn(&program, "logs-dropped")?;
+    let held = claude::start(&turn, &gate(&world, "p/A1")?)?;
+    drop(held.open);
+    let facts = tokio::time::timeout(Duration::from_secs(20), held.ended).await??;
+    assert_eq!(facts.state, AttemptState::Failed);
+    assert_eq!(facts.failure.as_deref(), Some("GATE_CLOSED"));
+    assert!(
+        !world.dir.path().join("dropped/argv").exists(),
+        "the agent ran"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn claude_runner_mode_cancel_is_one_sigint_and_nothing_after_it() -> R {
+    // ADR-022 decision 14: the host's ladder is authoritative; the adapter's cancel is Claude's native one, SIGINT to
+    // the leader, with no SIGTERM or SIGKILL of its own after it.
+    let world = World::new()?;
+    let d = world.dir.path().join("stubborn");
+    let program = world.script(
+        "stubborn",
+        &format!(
+            "d='{}'\ntrap 'echo int >> \"$d/signals\"' INT\ntrap 'echo term >> \"$d/signals\"; exit 0' TERM\n\
+             cat > /dev/null\necho ready > \"$d/ready\"\nfor i in $(seq 100); do sleep 0.1; done\n",
+            d.display()
+        ),
+    )?;
+    let mut turn = world.turn(&program, "logs-stubborn")?;
+    turn.escalation = quick();
+    let held = claude::start(&turn, &gate(&world, "p/A1")?)?;
+    held.open.send(()).map_err(|()| "gate closed")?;
+    let end = Instant::now() + Duration::from_secs(10);
+    while !d.join("ready").exists() {
+        assert!(Instant::now() < end, "the agent did not start");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    held.cancel.notify_one();
+    // Longer than the turn's own graces (1 s and 1 s): nothing but the SIGINT came.
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+    let signals = std::fs::read_to_string(d.join("signals")).unwrap_or_default();
+    let alive = !held.ended.is_finished();
+    let _ = rustix::process::kill_process_group(
+        rustix::process::Pid::from_raw(held.pid as i32).ok_or("pid")?,
+        rustix::process::Signal::KILL,
+    );
+    let facts = tokio::time::timeout(Duration::from_secs(20), held.ended).await??;
+    assert_eq!(signals, "int\n", "{facts:?}");
+    assert!(alive, "the adapter ended the turn itself");
+    assert_ne!(facts.state, AttemptState::Settled);
     Ok(())
 }

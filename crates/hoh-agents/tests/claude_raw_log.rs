@@ -47,6 +47,7 @@ async fn a_raw_log_that_cannot_be_written_whole_fails_the_turn() -> R {
             yolo: true,
             partial: false,
             resume: None,
+            model: None,
             root: false,
             capabilities: Default::default(),
         },

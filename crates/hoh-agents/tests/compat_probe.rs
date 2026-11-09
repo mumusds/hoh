@@ -259,6 +259,7 @@ fn every_option_an_adapter_passes_is_declared_and_the_probe_refuses_exactly_what
             yolo: full,
             partial: full,
             resume: full.then(|| "hoh-id".to_owned()),
+            model: None,
             root: false,
             capabilities: Default::default(),
         })

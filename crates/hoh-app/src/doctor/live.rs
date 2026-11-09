@@ -72,6 +72,7 @@ pub(super) fn prepare(
                 yolo: false,
                 partial: false,
                 resume: None,
+                model: None,
                 root: rustix::process::geteuid().is_root(),
                 capabilities: capabilities.clone(),
             },
