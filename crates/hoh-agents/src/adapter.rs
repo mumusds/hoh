@@ -146,6 +146,49 @@ impl std::fmt::Display for Refused {
 
 impl std::error::Error for Refused {}
 
+/// Where a turn's writes go: the store in the direct mode; in the runner's, a list of what it saw (input moves are
+/// the runner's then, and refused).
+pub(crate) struct Sink<'a> {
+    pub(crate) store: Option<&'a Store>,
+    pub(crate) recorded: Vec<Recorded>,
+}
+
+impl Sink<'_> {
+    pub(crate) async fn attempt_event(
+        &mut self,
+        attempt_id: &str,
+        key: &str,
+        kind: &str,
+        payload: serde_json::Value,
+    ) -> Result<(), PersistError> {
+        match self.store {
+            Some(store) => store.attempt_event(attempt_id, key, kind, payload).await,
+            None => {
+                self.recorded.push(Recorded::Event {
+                    key: key.to_owned(),
+                    kind: kind.to_owned(),
+                    payload,
+                });
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) async fn soft_move(
+        &mut self,
+        attempt_id: &str,
+        input_id: &str,
+        from: InputState,
+        to: InputState,
+        reason: Option<String>,
+    ) -> Result<bool, PersistError> {
+        match self.store {
+            Some(store) => soft_move(store, attempt_id, input_id, from, to, reason).await,
+            None => Ok(false),
+        }
+    }
+}
+
 /// Where a turn's cancel comes from: the attempt's latch (the direct mode: the adapter stops the turn as its plan
 /// says), or the runner's native cancel (the adapter does only the agent's own cancel; the host's ladder does the
 /// rest, docs/adr/ADR-022.md decision 14).

@@ -24,7 +24,10 @@
 //! to the process group. A stream that ends before Pi settled is FAILED (PROTOCOL_INCOMPLETE), or UNKNOWN_EFFECT once
 //! a tool had started. Every end is committed through the attempt's cancel latch.
 
-use crate::adapter::{AdapterError, AttemptRef, finish, now, offers, sha256_file, soft_move, step};
+use crate::adapter::{
+    AdapterError, AttemptRef, Sink, Stop, finish, now, offers, sha256_file, step,
+};
+pub use crate::adapter::{Facts, GateCommand, Held, Recorded, Refused};
 use crate::clock::{Clock, Timer};
 use crate::frame::Frame;
 use crate::known;
@@ -454,7 +457,201 @@ pub async fn run(
         crate::identity::running_pid(pid),
     )
     .await?;
+    let mut sink = Sink {
+        store: Some(store),
+        recorded: Vec::new(),
+    };
+    let driven = drive(
+        &mut sink,
+        attempt,
+        turn,
+        &mut process,
+        Stop::Latch(cancel),
+        None,
+        &noted,
+    )
+    .await?;
+    let state = finish(
+        store,
+        attempt,
+        Running,
+        driven.state,
+        AttemptFacts {
+            ended_at: now(),
+            resolved_model: driven.model.clone(),
+            failure_reason: driven.failure.clone(),
+            cancel_requested: Some(driven.cancelled),
+            ..AttemptFacts::default()
+        },
+        cancel,
+    )
+    .await?;
+    Ok(Outcome {
+        failure: if state == Cancelled {
+            None
+        } else {
+            driven.failure
+        },
+        state,
+        args,
+        native_session: driven.native_session,
+        native_path: launch.session_dir.clone(),
+        model: driven.model,
+        disposition: driven.disposition,
+        settled_by: driven.settled,
+        reply: driven.reply,
+        parse_errors: driven.parse_errors,
+        state_queries: driven.state_queries,
+        exit: driven.report.as_ref().and_then(|r| r.status),
+        stdout_sha256: sha256_file(&stdout)?,
+        stderr_sha256: sha256_file(&stderr)?,
+        stdout,
+        stderr,
+        pid: Some(pid),
+        max_buffered: driven.report.as_ref().map(|r| r.stdout.max_buffered),
+        steps: driven.report.map(|r| r.steps).unwrap_or_default(),
+    })
+}
+
+/// Start one turn in the runner's mode (docs/adr/ADR-022.md decisions 12 to 14): checked as [`run`] checks it, then
+/// through `gate`, held until [`Held::open`] is sent; no attempt state moves, nothing written to the store, the
+/// facts come back. A cancel is Pi's `abort` only (stdin closed before the prompt is sent); the host's ladder does
+/// the rest. No deadline.
+pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<Held, Refused> {
+    let launch = &turn.launch;
+    let refused = |code: &str, detail: String| Refused {
+        code: code.to_owned(),
+        detail,
+    };
+    let noted = session_files(&launch.session_dir);
+    let args = match (args(launch), &noted) {
+        (Err(Blocked(detail)), _) => return Err(refused("BLOCKED_CAPABILITY", detail)),
+        (Ok(_), Err(entry)) => {
+            return Err(refused(
+                "SESSION_DIR_UNSAFE",
+                format!("{entry} is not a regular file: pi would block opening it"),
+            ));
+        }
+        (Ok(_), Ok(files)) if launch.resume && files.is_empty() => {
+            return Err(refused(
+                "SESSION_NOT_FOUND",
+                format!(
+                    "no session file in {} to resume {}",
+                    launch.session_dir.display(),
+                    launch.session_id
+                ),
+            ));
+        }
+        (Ok(args), _) => args,
+    };
+    let noted = noted.unwrap_or_default();
+    for dir in [&turn.logs, &launch.session_dir] {
+        std::fs::create_dir_all(dir).map_err(|e| refused("LOGS", e.to_string()))?;
+    }
+    let (stdout, stderr) = (turn.logs.join("stdout.jsonl"), turn.logs.join("stderr.log"));
+    let mut command = Command::new(&gate.program);
+    command
+        .args(&gate.args)
+        .arg(&launch.program)
+        .args(&args)
+        .envs(gate.env.iter().map(|(k, v)| (k, v)))
+        .current_dir(&launch.cwd);
+    let config = Config {
+        escalation: Escalation {
+            native: None,
+            native_grace: Duration::ZERO,
+            ..turn.escalation
+        },
+        deadline: None,
+        stdout_copy: Some(stdout),
+        stderr_copy: Some(stderr),
+        ..Config::default()
+    };
+    let mut process =
+        Process::spawn(command, config).map_err(|e| refused("SPAWN", e.to_string()))?;
+    let pid = process.pid();
+    let (open, opened) = tokio::sync::oneshot::channel::<()>();
+    let cancel = Arc::new(tokio::sync::Notify::new());
+    let native = cancel.clone();
+    let (attempt, turn) = (attempt.clone(), turn.clone());
+    let raw_log_path = turn.logs.to_string_lossy().into_owned();
+    let ended = tokio::spawn(async move {
+        if opened.await.is_err() {
+            let report = crate::adapter::close_gate(&mut process).await;
+            return Facts::gate_closed(raw_log_path, report.as_ref());
+        }
+        let mut sink = Sink {
+            store: None,
+            recorded: Vec::new(),
+        };
+        let driven = drive(
+            &mut sink,
+            &attempt,
+            &turn,
+            &mut process,
+            Stop::Native(&native),
+            Some(b"go\n".to_vec()),
+            &noted,
+        )
+        .await;
+        match driven {
+            Ok(driven) => Facts {
+                state: driven.state,
+                failure: driven.failure,
+                native_session: driven.native_session,
+                resolved_model: driven.model,
+                usage: None,
+                raw_log_path,
+                max_buffered: driven.report.as_ref().map(|r| r.stdout.max_buffered),
+                group_reaped: driven.report.as_ref().is_some_and(|r| r.group_reaped),
+                recorded: sink.recorded,
+                degraded: None,
+            },
+            Err(_) => Facts::incomplete(raw_log_path, sink.recorded),
+        }
+    });
+    Ok(Held {
+        pid,
+        open,
+        cancel,
+        ended,
+    })
+}
+
+/// What a Pi turn showed, and the adapter's verdict.
+struct Driven {
+    state: AttemptState,
+    failure: Option<String>,
+    cancelled: bool,
+    native_session: Option<String>,
+    model: Option<String>,
+    disposition: Option<String>,
+    settled: Option<SettledBy>,
+    reply: Option<String>,
+    parse_errors: usize,
+    state_queries: usize,
+    report: Option<crate::process::ExitReport>,
+}
+
+/// Drive one Pi turn on `process` until it ended: the session query, the prompt, its records, dialogs answered
+/// headless, a cancel from `stop` (an abort; in the direct mode then SIGTERM and SIGKILL after their graces).
+/// `preamble` is written first (the runner's mode: the gate's `go`).
+async fn drive(
+    sink: &mut Sink<'_>,
+    attempt: &AttemptRef,
+    turn: &Turn,
+    process: &mut Process,
+    stop: Stop<'_>,
+    preamble: Option<Vec<u8>>,
+    noted: &[SessionFile],
+) -> Result<Driven, AdapterError> {
+    let launch = &turn.launch;
+    let id = &attempt.attempt_id;
     let (lines, mut queue) = mpsc::unbounded_channel::<Vec<u8>>();
+    // The runner's mode: the gate's line goes first.
+    if let Some(preamble) = preamble {
+        let _ = lines.send(preamble);
+    }
     let input = process.take_stdin();
     let mut writer = tokio::spawn(async move {
         let mut input = input.ok_or_else(|| std::io::Error::other("no stdin pipe"))?;
@@ -480,7 +677,8 @@ pub async fn run(
     let state_id = command_id("state");
     pending.insert(state_id.clone(), Pending::Session);
     send(&lines, json!({"id": state_id, "type": "get_state"}));
-    let mut cancelled = cancel.is_requested();
+    let mut cancelled = stop.requested_now();
+    let native_only = stop.is_native();
     let (mut deadline, mut too_large, mut tool_started, mut aborted) = (false, false, false, false);
     let (mut failure, mut settled, mut disposition) =
         (None::<String>, None::<SettledBy>, None::<String>);
@@ -523,10 +721,15 @@ pub async fn run(
                 pending.insert(abort_id.clone(), Pending::Abort);
                 send(&lines, json!({"id": abort_id, "type": "abort"}));
                 abort_sent = true;
-                abort_timer = Some(turn.clock.sleep(turn.escalation.native_grace));
+                // The runner's mode: the abort only; the host's ladder ends the process (ADR-022 decision 14).
+                if !native_only {
+                    abort_timer = Some(turn.clock.sleep(turn.escalation.native_grace));
+                }
+            } else if native_only {
+                lines = None;
             } else if !stopped {
                 lines = None;
-                hard_stop(&process);
+                hard_stop(process);
                 stopped = true;
             }
         };
@@ -537,15 +740,9 @@ pub async fn run(
                 && input_at == InputState::Queued
                 && let Some(i) = &input
             {
-                if soft_move(
-                    store,
-                    id,
-                    i,
-                    InputState::Queued,
-                    InputState::Delivered,
-                    None,
-                )
-                .await?
+                if sink
+                    .soft_move(id, i, InputState::Queued, InputState::Delivered, None)
+                    .await?
                 {
                     input_at = InputState::Delivered;
                 } else {
@@ -556,15 +753,9 @@ pub async fn run(
                 && input_at == InputState::Delivered
                 && let Some(i) = &input
             {
-                if soft_move(
-                    store,
-                    id,
-                    i,
-                    InputState::Delivered,
-                    InputState::Applied,
-                    None,
-                )
-                .await?
+                if sink
+                    .soft_move(id, i, InputState::Delivered, InputState::Applied, None)
+                    .await?
                 {
                     input_at = InputState::Applied;
                 } else {
@@ -591,7 +782,7 @@ pub async fn run(
     let report = loop {
         let event = tokio::select! {
             biased;
-            () = cancel.requested(), if !cancelled => {
+            () = stop.requested(), if !cancelled => {
                 cancelled = true;
                 abort!();
                 continue;
@@ -605,13 +796,13 @@ pub async fn run(
             () = fire(&mut abort_timer), if abort_timer.is_some() && !stopped => {
                 abort_timer = None;
                 lines = None;
-                hard_stop(&process);
+                hard_stop(process);
                 stopped = true;
                 continue;
             }
             () = async { if let Some(t) = exit_timer.as_mut() { t.await } }, if exit_timer.is_some() && !stopped => {
                 exit_timer = None;
-                hard_stop(&process);
+                hard_stop(process);
                 stopped = true;
                 continue;
             }
@@ -624,12 +815,12 @@ pub async fn run(
                 };
                 // Pi can no longer be told anything: stop it; the stream's end decides the outcome.
                 if let Some(e) = failed.filter(|_| lines.is_some()) {
-                    store
+                    sink
                         .attempt_event(id, "stdin-failed", "adapter.diagnostic",
                                        json!({"attempt_id": id, "reason": "stdin failed", "error": e}))
                         .await?;
                     lines = None;
-                    hard_stop(&process);
+                    hard_stop(process);
                     stopped = true;
                 }
                 continue;
@@ -641,9 +832,9 @@ pub async fn run(
             Some(Event::Frame(Frame::TooLarge(refused))) => {
                 too_large = true;
                 lines = None;
-                hard_stop(&process);
+                hard_stop(process);
                 stopped = true;
-                store
+                sink
                     .attempt_event(
                         id,
                         "frame-too-large",
@@ -663,7 +854,7 @@ pub async fn run(
             .filter(Value::is_object)
         else {
             parse_errors += 1;
-            store
+            sink
                 .attempt_event(
                     id,
                     &format!("diagnostic-{parse_errors}"),
@@ -680,14 +871,13 @@ pub async fn run(
         let key = known::pi_key(&record);
         if !known::is_known(known::pi(), key.as_deref()) {
             unknown_records += 1;
-            store
-                .attempt_event(
-                    id,
-                    &format!("unknown-{unknown_records}"),
-                    "adapter.unknown_event",
-                    known::unknown_event(id, key.as_deref(), &bytes, &record),
-                )
-                .await?;
+            sink.attempt_event(
+                id,
+                &format!("unknown-{unknown_records}"),
+                "adapter.unknown_event",
+                known::unknown_event(id, key.as_deref(), &bytes, &record),
+            )
+            .await?;
         }
         match record["type"].as_str().unwrap_or_default() {
             "response" => {
@@ -707,7 +897,7 @@ pub async fn run(
                             || other_file
                         {
                             failure = Some("SESSION_MISMATCH".to_owned());
-                            store
+                            sink
                                 .attempt_event(id, "session-mismatch", "adapter.diagnostic",
                                                json!({"attempt_id": id, "reason": "SESSION_MISMATCH",
                                                       "asked": launch.session_id, "got": native_session,
@@ -742,25 +932,24 @@ pub async fn run(
                     Some(Pending::Prompt) => {
                         let reason = error_class(&error);
                         failure = Some(reason.to_owned());
-                        store
-                            .attempt_event(
-                                id,
-                                "prompt-refused",
-                                "adapter.prompt_refused",
-                                json!({"attempt_id": id, "reason": reason, "error": error}),
-                            )
-                            .await?;
+                        sink.attempt_event(
+                            id,
+                            "prompt-refused",
+                            "adapter.prompt_refused",
+                            json!({"attempt_id": id, "reason": reason, "error": error}),
+                        )
+                        .await?;
                         if input_at == InputState::Queued
                             && let Some(i) = input.take()
-                            && soft_move(
-                                store,
-                                id,
-                                &i,
-                                InputState::Queued,
-                                InputState::Rejected,
-                                Some(error),
-                            )
-                            .await?
+                            && sink
+                                .soft_move(
+                                    id,
+                                    &i,
+                                    InputState::Queued,
+                                    InputState::Rejected,
+                                    Some(error),
+                                )
+                                .await?
                         {
                             input_at = InputState::Rejected;
                         }
@@ -791,14 +980,13 @@ pub async fn run(
             }
             "agent_start" => {
                 agent_starts += 1;
-                store
-                    .attempt_event(
-                        id,
-                        &format!("agent-start-{agent_starts}"),
-                        "adapter.agent_start",
-                        json!({"attempt_id": id}),
-                    )
-                    .await?;
+                sink.attempt_event(
+                    id,
+                    &format!("agent-start-{agent_starts}"),
+                    "adapter.agent_start",
+                    json!({"attempt_id": id}),
+                )
+                .await?;
                 begun = true;
                 sync_input!();
             }
@@ -841,25 +1029,23 @@ pub async fn run(
                         &lines,
                         json!({"type": "extension_ui_response", "id": record["id"], "cancelled": true}),
                     );
-                    store
-                        .attempt_event(
-                            id,
-                            &format!("ui-request-{dialogs}"),
-                            "adapter.ui_request",
-                            json!({"attempt_id": id, "method": method, "request": record,
+                    sink.attempt_event(
+                        id,
+                        &format!("ui-request-{dialogs}"),
+                        "adapter.ui_request",
+                        json!({"attempt_id": id, "method": method, "request": record,
                                               "decision": "cancelled"}),
-                        )
-                        .await?;
+                    )
+                    .await?;
                 } else {
                     data += 1;
-                    store
-                        .attempt_event(
-                            id,
-                            &format!("ui-data-{data}"),
-                            "adapter.ui_data",
-                            json!({"attempt_id": id, "method": method, "request": record}),
-                        )
-                        .await?;
+                    sink.attempt_event(
+                        id,
+                        &format!("ui-data-{data}"),
+                        "adapter.ui_data",
+                        json!({"attempt_id": id, "method": method, "request": record}),
+                    )
+                    .await?;
                 }
             }
             _ => {}
@@ -873,16 +1059,15 @@ pub async fn run(
         r.stdout.error.is_some() || r.stderr.error.is_some() || !r.stdout.eof || !r.stderr.eof
     });
     if logs_incomplete && let Some(r) = &report {
-        store
-            .attempt_event(
-                id,
-                "raw-log-incomplete",
-                "adapter.diagnostic",
-                json!({"attempt_id": id, "reason": "RAW_LOG_INCOMPLETE",
+        sink.attempt_event(
+            id,
+            "raw-log-incomplete",
+            "adapter.diagnostic",
+            json!({"attempt_id": id, "reason": "RAW_LOG_INCOMPLETE",
                        "stdout": {"eof": r.stdout.eof, "error": r.stdout.error},
                        "stderr": {"eof": r.stderr.eof, "error": r.stderr.error}}),
-            )
-            .await?;
+        )
+        .await?;
     }
     let provider_class = provider_error.as_deref().map(error_class);
     let (state, failure) = verdict(&Ending {
@@ -897,50 +1082,26 @@ pub async fn run(
         provider_error: provider_class,
     });
     if let (Some(class), Some(message)) = (provider_class, &provider_error) {
-        store
-            .attempt_event(
-                id,
-                "provider-failed",
-                "adapter.turn_failed",
-                json!({"attempt_id": id, "reason": class, "errorMessage": message}),
-            )
-            .await?;
+        sink.attempt_event(
+            id,
+            "provider-failed",
+            "adapter.turn_failed",
+            json!({"attempt_id": id, "reason": class, "errorMessage": message}),
+        )
+        .await?;
     }
-    let state = finish(
-        store,
-        attempt,
-        Running,
+    Ok(Driven {
         state,
-        AttemptFacts {
-            ended_at: now(),
-            resolved_model: model.clone(),
-            failure_reason: failure.clone(),
-            cancel_requested: Some(cancelled),
-            ..AttemptFacts::default()
-        },
-        cancel,
-    )
-    .await?;
-    Ok(Outcome {
-        failure: if state == Cancelled { None } else { failure },
-        state,
-        args,
+        failure,
+        cancelled,
         native_session,
-        native_path: launch.session_dir.clone(),
         model,
         disposition,
-        settled_by: settled,
+        settled,
         reply,
         parse_errors,
         state_queries,
-        exit: report.as_ref().and_then(|r| r.status),
-        stdout_sha256: sha256_file(&stdout)?,
-        stderr_sha256: sha256_file(&stderr)?,
-        stdout,
-        stderr,
-        pid: Some(pid),
-        max_buffered: report.as_ref().map(|r| r.stdout.max_buffered),
-        steps: report.map(|r| r.steps).unwrap_or_default(),
+        report,
     })
 }
 
