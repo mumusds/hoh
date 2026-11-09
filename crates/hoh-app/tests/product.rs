@@ -128,7 +128,9 @@ impl World {
         )
     }
 
-    /// A fake `codex` 0.166.0: the probe's answers (helps, App Server schema) from the recording; `app-server`
+    /// A fake `codex` 0.166.0: the probe's answers (helps, App Server schema) from the recording (while
+    /// `codex.d/hang-schema` exists, generating the schema waits 120 s, its pid in `codex.d/schema-pid` and its child's
+    /// in `codex.d/schema-member`); `app-server`
     /// replays the recorded `app-server-turn`, its model given as `model`; for an attempt whose marker names HUGE, the
     /// frames before `turn/completed` and then 8 MiB with no LF; for one whose marker names UNKNOWN, an effect (a line
     /// in `codex.d/effects`), the frames up to a started command, and its end.
@@ -191,7 +193,8 @@ impl World {
                    cat \"$f/exec/stdout.jsonl\"; exit 0;;\n\
                   app-server) case \"$2\" in\n\
                     --help) cat \"$f/help-app-server.txt\"; exit 0;;\n\
-                    generate-json-schema) [ \"$3\" = --out ] && mkdir -p \"$4\" && cp -R \"$f/app-server-schema/.\" \"$4/\"; exit 0;;\n\
+                    generate-json-schema) [ -e \"$d/hang-schema\" ] && {{ sleep 120 & echo $! > \"$d/schema-member\"; echo $$ > \"$d/schema-pid\"; wait; }}\n\
+                     [ \"$3\" = --out ] && mkdir -p \"$4\" && cp -R \"$f/app-server-schema/.\" \"$4/\"; exit 0;;\n\
                    esac\n\
                    echo $$ > \"$d/pid.$$\"; printf '%s\\n' \"$@\" > \"$d/argv.$$\"\n\
                    case \"$HOH_ATTEMPT_ID\" in\n\
@@ -1184,6 +1187,185 @@ async fn a_hosts_stop_ends_the_probe_it_has_running() -> R {
     assert!(!alive, "the probe's command {pid} outlived the host");
     assert!(took < Duration::from_secs(10), "the stop took {took:?}");
     let _ = project;
+    Ok(())
+}
+
+#[test]
+fn the_configured_cancel_graces_reach_every_step_of_the_products_host() {
+    // M2T07R-350 (docs/adr/ADR-022.md decision 17): the product's host takes execution's cancel graces for CancelRun's
+    // ladder and for a lease-expiry settle, not only for the adapters' own escalation.
+    let mut effective = hoh_core::config::Config::default();
+    effective.execution.cancel_native_grace_seconds = 3;
+    effective.execution.cancel_term_grace_seconds = 4;
+    let config = HostConfig::product(Path::new("/p"), effective, "hoh".into(), "".into());
+    let (native, term) = (Duration::from_secs(3), Duration::from_secs(4));
+    assert_eq!(
+        (config.reconcile.native_grace, config.reconcile.term_grace),
+        (native, term)
+    );
+    assert_eq!((config.cancel.native, config.cancel.term), (native, term));
+}
+
+/// Whether process `pid` has ended (gone, or a zombie not reaped yet).
+fn process_ended(pid: &str) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
+        stat.rsplit_once(')')
+            .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
+    })
+}
+
+/// The id of `pid`'s thread named `name`, if it has one.
+fn thread_named(pid: u32, name: &str) -> Option<i32> {
+    std::fs::read_dir(format!("/proc/{pid}/task"))
+        .ok()?
+        .filter_map(Result::ok)
+        .find(|task| {
+            std::fs::read_to_string(task.path().join("comm"))
+                .is_ok_and(|comm| comm.trim_end() == name)
+        })
+        .and_then(|task| task.file_name().to_str()?.parse().ok())
+}
+
+#[test]
+fn a_hosts_stop_kills_the_schema_command_however_late_its_reader_runs() -> R {
+    // M2T07R-300 (docs/adr/ADR-022.md decision 10 v4): the product's `hoh __host` stops (SIGTERM) while its registry
+    // probes Codex, the schema command running and the thread that reads it held by ptrace, so that it cannot run
+    // before the host exits: the stop itself killed the command and its group, so nothing the host started outlives it.
+    use nix::sys::{ptrace, signal, wait};
+    use nix::unistd::Pid;
+    let world = World::new()?;
+    world.codex("m-test")?;
+    let d = world.bin().join("codex.d");
+    std::fs::write(d.join("hang-schema"), "")?;
+    let (home, tmp) = (world.dir.path().join("home"), world.dir.path().join("tmp"));
+    std::fs::create_dir_all(&home)?;
+    std::fs::create_dir_all(&tmp)?;
+    let path = format!(
+        "{}:{}",
+        world.bin().display(),
+        world.dir.path().join("tools").display()
+    );
+    let mut host = Command::new(env!("CARGO_BIN_EXE_hoh"))
+        .arg("__host")
+        .arg(world.project())
+        .env_clear()
+        .env("PATH", &path)
+        .env("HOME", &home)
+        .env("TMPDIR", &tmp)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    let host_pid = host.id();
+    let pids = [d.join("schema-pid"), d.join("schema-member")];
+    let mut traced = None;
+    let outcome = (|| -> R<(i32, std::time::Duration)> {
+        let info = world.project().join(".hoh/host.json");
+        let end = Instant::now() + Duration::from_secs(30);
+        let info: Value = loop {
+            if let Ok(text) = std::fs::read_to_string(&info)
+                && let Ok(info) = serde_json::from_str::<Value>(&text)
+            {
+                break info;
+            }
+            if Instant::now() > end {
+                return Err("the host never announced itself".into());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let port = info["port"].as_u64().ok_or("no port")?;
+        let token = info["token"].as_str().ok_or("no token")?;
+        let body = json!({
+            "schema_version": "1.0", "command_id": "c-s1", "idempotency_key": "s1",
+            "expected_revision": 0, "kind": "StartRun", "run_id": null,
+            "payload": {"goal": "Ship the parser", "mode": "AUTO", "interactive": false},
+        })
+        .to_string();
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", u16::try_from(port)?))?;
+        use std::io::{Read as _, Write as _};
+        write!(
+            stream,
+            "POST /v1/commands HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\nX-HoH-Token: {token}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )?;
+        let mut answer = String::new();
+        stream.read_to_string(&mut answer)?;
+        if !answer.starts_with("HTTP/1.1 202") {
+            return Err(format!("StartRun: {answer}").into());
+        }
+        while !pids.iter().all(|p| p.exists()) {
+            if Instant::now() > end {
+                return Err("the schema was never generated".into());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let reader = thread_named(host_pid, "hoh-schema").ok_or("no schema reader thread")?;
+        let tid = Pid::from_raw(reader);
+        ptrace::seize(tid, ptrace::Options::empty())?;
+        traced = Some(tid);
+        ptrace::interrupt(tid)?;
+        wait::waitpid(tid, Some(wait::WaitPidFlag::__WALL))?;
+        let stopping = Instant::now();
+        signal::kill(
+            Pid::from_raw(i32::try_from(host_pid)?),
+            signal::Signal::SIGTERM,
+        )?;
+        // The held thread dies with its process; its tracer (this test) reaps it, then the host itself is reaped.
+        let end = Instant::now() + Duration::from_secs(20);
+        loop {
+            match wait::waitpid(
+                tid,
+                Some(wait::WaitPidFlag::__WALL | wait::WaitPidFlag::WNOHANG),
+            ) {
+                Ok(wait::WaitStatus::Exited(..) | wait::WaitStatus::Signaled(..)) | Err(_) => break,
+                Ok(_) => {}
+            }
+            if Instant::now() > end {
+                return Err("the host did not exit".into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        traced = None;
+        let status = loop {
+            if let Some(status) = host.try_wait()? {
+                break status;
+            }
+            if Instant::now() > end {
+                return Err("the host was not reaped".into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        Ok((status.code().unwrap_or(-1), stopping.elapsed()))
+    })();
+    if let Some(tid) = traced {
+        let _ = ptrace::detach(tid, None);
+    }
+    if !matches!(host.try_wait(), Ok(Some(_))) {
+        let _ = host.kill();
+        let _ = host.wait();
+    }
+    let recorded: Vec<String> = pids
+        .iter()
+        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .map(|p| p.trim().to_owned())
+        .collect();
+    let until = Instant::now() + Duration::from_secs(2);
+    while !recorded.iter().all(|p| process_ended(p)) && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let alive: Vec<&String> = recorded.iter().filter(|p| !process_ended(p)).collect();
+    for pid in &alive {
+        let _ = Command::new("kill").args(["-KILL", pid.as_str()]).status();
+    }
+    let (code, took) = outcome?;
+    assert_eq!(recorded.len(), 2, "{recorded:?}");
+    assert!(
+        alive.is_empty(),
+        "the schema command outlived the host: {alive:?}"
+    );
+    assert_eq!(code, 0, "the host's exit");
+    assert!(took < Duration::from_secs(15), "the stop took {took:?}");
     Ok(())
 }
 
