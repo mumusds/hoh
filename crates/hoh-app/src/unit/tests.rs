@@ -117,6 +117,15 @@ fn a_home_systemd_cannot_run_a_program_in_gives_no_template() {
             );
         }
     }
+    // EnvironmentFile= takes a glob: a root with one of its characters names other files (M2T14R-101).
+    for root in ["/data[1]/hoh", "/data*/hoh", "/data?/hoh"] {
+        assert!(
+            template(Path::new("/home/u"), Path::new(root)).is_err(),
+            "root {root:?} was accepted"
+        );
+    }
+    // The home is in ExecStart= only, which takes no glob.
+    assert!(template(Path::new("/home/u[1]"), Path::new("/data/hoh")).is_ok());
     let not_utf8 = Path::new(OsStr::from_bytes(b"/home/a\xffb"));
     assert!(template(not_utf8, Path::new("/data/hoh")).is_err());
     assert!(template(Path::new("/home/u"), not_utf8).is_err());
@@ -323,4 +332,37 @@ fn a_process_is_supervised_by_the_hosts_unit_only_when_its_cgroup_is_one() {
     ] {
         assert_eq!(supervisor_of(text), None, "{text:?}");
     }
+}
+
+#[test]
+fn an_installed_binary_holds_its_installation_shared_and_none_while_it_is_being_removed()
+-> Result<(), Box<dyn std::error::Error>> {
+    // ADR-023 design correction 2 (M2T14R-100): every run of an installed hoh holds R/.lock shared for its life; the
+    // uninstall's exclusive hold keeps any new one from starting.
+    let root = tempfile::tempdir()?;
+    let r = root.path().join("hoh");
+    std::fs::create_dir_all(r.join("versions/v/bin"))?;
+    let exe = r.join("versions/v/bin/hoh");
+    // Not installed: nothing to hold.
+    assert!(hold_installation(Path::new("/h/target/debug/hoh"))?.is_none());
+    let first = hold_installation(&exe)?.ok_or("held")?;
+    let second = hold_installation(&exe)?.ok_or("held")?;
+    // The uninstall's exclusive lock cannot be had while they are held...
+    let lock = std::fs::File::open(r.join(".lock"))?;
+    assert!(
+        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_err()
+    );
+    drop((first, second));
+    // ... and once it is had, no run can hold the installation.
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
+    let refused = hold_installation(&exe).expect_err("being removed");
+    assert!(
+        refused.to_string().contains("being uninstalled"),
+        "{refused}"
+    );
+    drop(lock);
+    // An installation whose root is gone is being removed too.
+    std::fs::remove_dir_all(&r)?;
+    assert!(hold_installation(&exe).is_err());
+    Ok(())
 }
