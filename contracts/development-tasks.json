@@ -481,7 +481,8 @@
    "writer": true,
    "title": "安装与部署：安装/卸载脚本、systemd --user unit 与崩溃重启、deployment 检查脚本",
    "depends_on": [
-    "M2-T06"
+    "M2-T06",
+    "M2-T07"
    ],
    "requirements": [
     "REQ-005"
