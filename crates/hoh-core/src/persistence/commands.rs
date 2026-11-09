@@ -33,15 +33,23 @@ pub struct SubmitCommand {
 }
 
 /// Where a command moves its run.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum RunTarget {
     /// To this state, by compare-and-set.
     To(RunState),
     /// Back to the state saved when it was paused (ResumeRun), after a reconcile of the run recorded first
     /// (docs/adr/ADR-021.md decision 7).
     Resume,
-    /// A new run, CREATED, in this mode (StartRun, decision 5): `run_id` is the id the host gave it.
-    Start { mode: String },
+    /// A new run, CREATED, in this mode (StartRun, decision 5): `run_id` is the id the host gave it. It binds the
+    /// project's current team and gets `budget` (docs/adr/ADR-022.md decision 7).
+    Start {
+        mode: String,
+        budget: crate::config::Budget,
+    },
+    /// The project's team (ConfigureTeam, docs/adr/ADR-022.md decisions 3 and 4): revision r+1 over the current r,
+    /// applied at once; `expected_revision` is the team revision. An empty `run_id` is the project's command (null in
+    /// the request); a run id names a run that must exist.
+    Team(super::team::TeamChange),
 }
 
 /// What a command came to.
@@ -115,8 +123,9 @@ pub(super) fn submit(
         })?;
         return Ok(CommandOutcome::Replayed { result_json });
     }
+    let mut team_revision = None;
     let (revision, event_seq) = match &command.target {
-        RunTarget::Start { mode } => {
+        RunTarget::Start { mode, budget } => {
             if command.expected_revision != 0 {
                 return Err(PersistError::StaleRevision {
                     entity: writer::Entity::Run,
@@ -135,6 +144,7 @@ pub(super) fn submit(
                 ],
             )
             .map_err(sqlite_error)?;
+            super::team::start_run(&tx, &command.run_id, &command.event.project_id, budget)?;
             let done = writer::write(
                 &tx,
                 &Commit {
@@ -145,6 +155,34 @@ pub(super) fn submit(
                 ctx,
             )?;
             (0, done.event_seqs[0])
+        }
+        RunTarget::Team(change) => {
+            if !command.run_id.is_empty() {
+                let found: Option<i64> = tx
+                    .query_row(
+                        "SELECT 1 FROM runs WHERE run_id = ?1",
+                        params![command.run_id],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(sqlite_error)?;
+                if found.is_none() {
+                    return Err(PersistError::RunNotFound(command.run_id.clone()));
+                }
+            }
+            let made = super::team::configure(&tx, command, change)?;
+            let revision = made.revision;
+            team_revision = Some(made);
+            let done = writer::write(
+                &tx,
+                &Commit {
+                    events: vec![command.event.clone()],
+                    outbox: command.outbox.clone().into_iter().collect(),
+                    ..Commit::default()
+                },
+                ctx,
+            )?;
+            (revision, done.event_seqs[0])
         }
         target => {
             let run: Option<(String, Option<String>, String)> = tx
@@ -180,7 +218,7 @@ pub(super) fn submit(
                     events.push(resume_reconcile(&tx, &project_id, command)?);
                     to
                 }
-                RunTarget::Start { .. } => unreachable!("handled above"),
+                RunTarget::Start { .. } | RunTarget::Team(_) => unreachable!("handled above"),
             };
             let at = events.len();
             events.push(command.event.clone());
@@ -220,9 +258,11 @@ pub(super) fn submit(
         .map_err(sqlite_error)?;
     }
     // The exact 202 body (openapi submitCommand); a replay returns these bytes.
+    // A project's command (ConfigureTeam with a null run_id) names no run.
+    let run_id = (!command.run_id.is_empty()).then_some(&command.run_id);
     let result_json = serde_json::json!({
         "command_id": command.command_id,
-        "run_id": command.run_id,
+        "run_id": run_id,
         "revision": revision,
         "status": "ACCEPTED",
     })
@@ -232,7 +272,7 @@ pub(super) fn submit(
          expected_revision, result_json, accepted_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             command.command_id,
-            command.run_id,
+            run_id,
             command.idempotency_key,
             command.kind,
             command.payload.to_string(),
@@ -243,6 +283,9 @@ pub(super) fn submit(
         ],
     )
     .map_err(sqlite_error)?;
+    if let Some(made) = &team_revision {
+        super::team::record(&tx, &command.event.project_id, &command.command_id, made)?;
+    }
     ctx.before_commit()?;
     tx.commit().map_err(sqlite_error)?;
     Ok(CommandOutcome::Accepted {
@@ -360,7 +403,15 @@ pub(super) fn snapshot(
     run_id: &str,
 ) -> Result<Option<(RunRow, i64)>, PersistError> {
     conn.execute_batch("BEGIN").map_err(sqlite_error)?;
-    let read = (|| {
+    let read = snapshot_rows(conn, run_id);
+    // Ends the read transaction either way; nothing was written.
+    let _ = conn.execute_batch("COMMIT");
+    read
+}
+
+/// The run `run_id` and the highest event seq, inside the caller's read transaction.
+fn snapshot_rows(conn: &Connection, run_id: &str) -> Result<Option<(RunRow, i64)>, PersistError> {
+    {
         let run = conn
             .query_row(
                 "SELECT run_id, project_id, state, mode, revision, resume_state, blocked_reason FROM runs \
@@ -384,6 +435,21 @@ pub(super) fn snapshot(
             Some(run) => Some((run, max_seq(conn)?)),
             None => None,
         })
+    }
+}
+
+/// The run `run_id`, its team and the highest event seq, read in one read transaction.
+pub(super) fn run_view(
+    conn: &Connection,
+    run_id: &str,
+) -> Result<Option<(RunRow, super::team::TeamView, i64)>, PersistError> {
+    conn.execute_batch("BEGIN").map_err(sqlite_error)?;
+    let read = (|| {
+        let Some((run, _)) = snapshot_rows(conn, run_id)? else {
+            return Ok(None);
+        };
+        let team = super::team::view(conn, run_id, &run.project_id)?;
+        Ok::<_, PersistError>(Some((run, team, max_seq(conn)?)))
     })();
     // Ends the read transaction either way; nothing was written.
     let _ = conn.execute_batch("COMMIT");
