@@ -586,6 +586,28 @@ pub async fn run(
     exec::run(store, attempt, turn, args, reason, cancel, &mut steers).await
 }
 
+/// The capabilities a session of this turn's launch has (docs/adr/ADR-022.md decision 9): those of the transport
+/// [`start`] would take (the App Server when it serves the turn, else exec), as [`run`] records them; or why no turn can
+/// start.
+pub fn session_capabilities(turn: &Turn) -> Result<Value, Blocked> {
+    let app_server = app_server_unusable(turn).is_none()
+        && turn
+            .launch
+            .app_server_help
+            .as_deref()
+            .is_some_and(|help| app_server_args(help).is_ok());
+    if !app_server {
+        exec_args(&turn.launch)?;
+    }
+    let attempt = AttemptRef {
+        attempt_id: String::new(),
+        session_id: String::new(),
+        role: String::new(),
+        agent_version: String::new(),
+    };
+    Ok(session(&attempt, turn, app_server, None).capabilities)
+}
+
 /// Why the App Server cannot serve `turn` though its help is there, or `None`.
 fn app_server_unusable(turn: &Turn) -> Option<String> {
     turn.launch.app_server_help.as_deref().and_then(|help| {

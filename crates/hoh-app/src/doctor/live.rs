@@ -9,7 +9,7 @@ use hoh_agents::adapter::AttemptRef;
 use hoh_agents::clock::SystemClock;
 use hoh_agents::compat::Agent;
 use hoh_agents::probe::{self, ProbeEnv};
-use hoh_agents::{claude, codex, pi};
+use hoh_agents::{claude, codex, launch, pi};
 use hoh_core::lifecycle::AttemptState;
 use hoh_core::persistence::{CancelLatch, NewAttempt, Options, Store};
 use serde_json::{Value, json};
@@ -29,19 +29,6 @@ struct Ended {
     failure: Option<String>,
     native_session: Option<String>,
     reply: Option<String>,
-}
-
-fn stdout_of(launcher: &Path, args: &[&str], env: &ProbeEnv) -> Result<String, String> {
-    let out = probe::run_status(launcher, args, env).map_err(|e| e.to_string())?;
-    if !out.status.success() {
-        return Err(format!(
-            "{} {} exited with {}",
-            launcher.display(),
-            args.join(" "),
-            out.status
-        ));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// A live turn ready to run: everything asked of the CLI before the attempt exists, so a turn that cannot be prepared
@@ -67,7 +54,7 @@ pub(super) fn prepare(
         Agent::Claude => Prepared::Claude(claude::Turn {
             launch: claude::Launch {
                 program: launcher.to_path_buf(),
-                help: stdout_of(launcher, &["--help"], env)?,
+                help: launch::stdout_of(launcher, &["--help"], env)?,
                 cwd: work.to_path_buf(),
                 yolo: false,
                 partial: false,
@@ -82,39 +69,16 @@ pub(super) fn prepare(
             deadline: Some(DEADLINE),
         }),
         Agent::Codex => {
-            // The transports `codex --help` lists, read as the probe reads them (M1R-03); app-server's schema names the
-            // methods of both directions, and codex::run uses it only if they have everything a turn uses, as the probe
-            // decides (M1T07R-15, M1R-04).
-            let top = stdout_of(launcher, &["--help"], env)?;
-            let listed = |name: &str| hoh_agents::adapter::lists_command(&top, name);
-            let app_server_help = match listed("app-server") {
-                true => Some(stdout_of(launcher, &["app-server", "--help"], env)?),
-                false => None,
-            };
-            // An App Server that cannot start on stdio is not used whatever its schema says, so its schema is not asked
-            // for; codex::run then takes exec, saying why (the probe's order, M1T07R-27, -29).
-            let startable = app_server_help
-                .as_deref()
-                .filter(|help| codex::app_server_launch_missing(help).is_none());
-            let (known, requests, client_notifications) = match startable {
-                None => Default::default(),
-                Some(_) => {
-                    // The probe's validated reader: a schema the probe refuses is refused here too (M1T07R-31).
-                    let schema = probe::codex_schema(launcher, env).map_err(|e| e.to_string())?;
-                    (
-                        schema.notifications,
-                        schema.requests,
-                        schema.client_notifications,
-                    )
-                }
-            };
-            // Without an exec subcommand the exec fallback has no help, so it cannot start (codex::exec_args).
-            let (exec_help, exec_resume_help) = match listed("exec") {
-                true => (
-                    stdout_of(launcher, &["exec", "--help"], env)?,
-                    stdout_of(launcher, &["exec", "resume", "--help"], env).ok(),
-                ),
-                false => (String::new(), None),
+            let launch::Facts::Codex {
+                app_server_help,
+                exec_help,
+                exec_resume_help,
+                known,
+                requests,
+                client_notifications,
+            } = launch::read(agent, launcher, env)?
+            else {
+                return Err("codex's launch facts are not codex's".to_owned());
             };
             Prepared::Codex(codex::Turn {
                 launch: codex::Launch {
@@ -141,7 +105,7 @@ pub(super) fn prepare(
         Agent::Pi => Prepared::Pi(pi::Turn {
             launch: pi::Launch {
                 program: launcher.to_path_buf(),
-                help: stdout_of(launcher, &["--help"], env)?,
+                help: launch::stdout_of(launcher, &["--help"], env)?,
                 cwd: work.to_path_buf(),
                 session_dir: work.join("..").join("pi-sessions"),
                 session_id: std::fs::read_to_string("/proc/sys/kernel/random/uuid")
@@ -229,7 +193,7 @@ async fn one(
         // (M1T07R-10), and past the preparation limit it is not started.
         let git = probe::find_on_path("git", &env.path).ok_or("git is not installed")?;
         let work_arg = work.display().to_string();
-        stdout_of(&git, &["-C", &work_arg, "init", "-q"], env)?;
+        launch::stdout_of(&git, &["-C", &work_arg, "init", "-q"], env)?;
         let prepared = prepare(
             agent,
             &launcher,

@@ -260,3 +260,50 @@ fn the_turn_status_decides_and_a_cancel_wins() {
         failed("thread/start: no")
     );
 }
+
+#[test]
+fn a_sessions_capabilities_are_those_of_the_transport_a_turn_would_take() {
+    // docs/adr/ADR-022.md decision 9: the binder records what a turn of this launch would have; with a schema that does
+    // not serve a turn the App Server is not used and the session's capabilities are exec's.
+    let attempt = AttemptRef {
+        attempt_id: String::new(),
+        session_id: String::new(),
+        role: String::new(),
+        agent_version: String::new(),
+    };
+    let turn = |launch: Launch| Turn {
+        launch,
+        prompt: String::new(),
+        logs: PathBuf::from("/tmp"),
+        escalation: Turn::default_escalation(),
+        handshake_timeout: Duration::from_secs(1),
+        deadline: None,
+    };
+    let exec_only = turn(launch());
+    assert_eq!(
+        session_capabilities(&exec_only),
+        Ok(session(&attempt, &exec_only, false, None).capabilities)
+    );
+    let mut served = launch();
+    served.requests = APP_SERVER_REQUESTS
+        .iter()
+        .map(|m| (*m).to_owned())
+        .collect();
+    served.client_notifications = APP_SERVER_CLIENT_NOTIFICATIONS
+        .iter()
+        .map(|m| (*m).to_owned())
+        .collect();
+    served.known = APP_SERVER_NOTIFICATIONS
+        .iter()
+        .map(|m| (*m).to_owned())
+        .collect();
+    let served = turn(served);
+    assert_eq!(
+        session_capabilities(&served),
+        Ok(session(&attempt, &served, true, None).capabilities)
+    );
+    let mut nothing = launch();
+    nothing.app_server_help = None;
+    nothing.exec_help = String::new();
+    assert!(session_capabilities(&turn(nothing)).is_err());
+}
