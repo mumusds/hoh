@@ -3009,14 +3009,6 @@ mod tests {
             & quarantine.remove(temp.as_fd())
     }
 
-    /// Whether process `pid` has ended (gone, or a zombie not reaped yet).
-    fn ended(pid: &str) -> bool {
-        std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
-            stat.rsplit_once(')')
-                .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
-        })
-    }
-
     #[test]
     fn a_stop_kills_the_commands_a_stalled_probe_started_and_starts_none()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -3057,19 +3049,22 @@ mod tests {
             assert!(Instant::now() < until, "the command never ran");
             std::thread::sleep(Duration::from_millis(10));
         }
-        let pids = [
-            std::fs::read_to_string(&leader)?.trim().to_owned(),
-            std::fs::read_to_string(&member)?.trim().to_owned(),
+        let pids: [u32; 2] = [
+            std::fs::read_to_string(&leader)?.trim().parse()?,
+            std::fs::read_to_string(&member)?.trim().parse()?,
         ];
         stop.stop();
-        // The probe's thread is still stalled: the stop alone ended both.
+        // The probe's thread is still stalled: the stop alone ended both (each looked at by its number, a look that
+        // fails is not an end, M2T07R-1050).
         let until = Instant::now() + Duration::from_secs(2);
-        while !pids.iter().all(|p| ended(p)) && Instant::now() < until {
+        while !pids.iter().all(|p| ended(*p)) && Instant::now() < until {
             std::thread::sleep(Duration::from_millis(10));
         }
-        let alive: Vec<&String> = pids.iter().filter(|p| !ended(p)).collect();
+        let alive: Vec<u32> = pids.iter().copied().filter(|p| !ended(*p)).collect();
         for pid in &alive {
-            let _ = Command::new("kill").args(["-KILL", pid.as_str()]).status();
+            let _ = Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status();
         }
         std::fs::remove_file(&stall)?;
         let result = probing.join().map_err(|_| "the probe panicked")?;
@@ -3095,41 +3090,15 @@ mod tests {
         })
     }
 
-    /// This process's children named `comm`, with their state letter; /proc that cannot be listed is an error, not
-    /// "none" (M2T07R-900).
-    fn children_named(comm: &str) -> io::Result<Vec<(u32, char)>> {
-        Ok(children()?
-            .into_iter()
-            .filter(|(_, name, _)| name == comm)
-            .map(|(pid, _, state)| (pid, state))
-            .collect())
-    }
+    // How the probe tests look at processes (docs/adr/ADR-022.md decision 10 v6, the verification method; the design
+    // correction of round 12, M2T07R-900, -1000, -1050, -1051): a listing of /proc only proves that a process is
+    // there: a listing that fails is an error, an entry that cannot be read is left out, names are compared as bytes;
+    // whether a process has ended is decided by its own number only: gone, its number now another's (or its parent
+    // not the one expected), or a zombie; a look that fails never counts as ended.
 
-    /// This process's children: pid, name and state letter (a child gone while listed is left out); a listing of
-    /// /proc that fails, at its opening or on the way, is an error (M2T07R-1000).
-    fn children() -> io::Result<Vec<(u32, String, char)>> {
-        let me = std::process::id().to_string();
-        let mut found = Vec::new();
-        for entry in std::fs::read_dir("/proc")? {
-            let Some(pid) = entry?
-                .file_name()
-                .to_str()
-                .and_then(|n| n.parse::<u32>().ok())
-            else {
-                continue;
-            };
-            if let Some((name, state, parent)) = stat_of(pid)?
-                && parent == me
-            {
-                found.push((pid, name, state));
-            }
-        }
-        Ok(found)
-    }
-
-    /// Process `pid`'s name, state letter and parent, `None` when it is gone (reaped, or never there).
-    fn stat_of(pid: u32) -> io::Result<Option<(String, char, String)>> {
-        let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+    /// Process `pid`'s name (bytes), state letter and parent, `None` once it is gone (reaped, or never there).
+    fn stat_of(pid: u32) -> io::Result<Option<(Vec<u8>, u8, u32)>> {
+        let stat = match std::fs::read(format!("/proc/{pid}/stat")) {
             Ok(stat) => stat,
             Err(e)
                 if e.kind() == io::ErrorKind::NotFound
@@ -3139,26 +3108,84 @@ mod tests {
             }
             Err(e) => return Err(e),
         };
-        let parsed = stat.rsplit_once(')').and_then(|(head, rest)| {
-            let (_, name) = head.split_once('(')?;
+        let open = stat.iter().position(|b| *b == b'(');
+        let close = stat.iter().rposition(|b| *b == b')');
+        let parsed = open.zip(close).and_then(|(open, close)| {
+            let name = stat.get(open + 1..close)?.to_vec();
+            let rest = std::str::from_utf8(stat.get(close + 1..)?).ok()?;
             let mut fields = rest.split_whitespace();
-            let state = fields.next()?.chars().next()?;
-            Some((name.to_owned(), state, fields.next()?.to_owned()))
+            let state = *fields.next()?.as_bytes().first()?;
+            Some((name, state, fields.next()?.parse().ok()?))
         });
-        parsed
-            .map(Some)
-            .ok_or_else(|| io::Error::other(format!("/proc/{pid}/stat unreadable: {stat}")))
+        parsed.map(Some).ok_or_else(|| {
+            io::Error::other(format!(
+                "/proc/{pid}/stat unreadable: {}",
+                String::from_utf8_lossy(&stat)
+            ))
+        })
+    }
+
+    /// This process's children: pid, name and state letter. A listing that fails, at its opening or on the way, is
+    /// an error (M2T07R-1000); an entry that cannot be read is left out, as it proves nothing (M2T07R-1051).
+    fn children() -> io::Result<Vec<(u32, Vec<u8>, u8)>> {
+        let me = std::process::id();
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir("/proc")? {
+            let Some(pid) = entry?
+                .file_name()
+                .to_str()
+                .and_then(|n| n.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if let Ok(Some((name, state, parent))) = stat_of(pid)
+                && parent == me
+            {
+                found.push((pid, name, state));
+            }
+        }
+        Ok(found)
+    }
+
+    /// This process's children named `comm`, with their state letter.
+    fn children_named(comm: &str) -> io::Result<Vec<(u32, char)>> {
+        Ok(children()?
+            .into_iter()
+            .filter(|(_, name, _)| name.as_slice() == comm.as_bytes())
+            .map(|(pid, _, state)| (pid, char::from(state)))
+            .collect())
+    }
+
+    /// Whether process `pid` has ended: gone, or a zombie; a look that fails is "not ended" (M2T07R-1050).
+    fn ended(pid: u32) -> bool {
+        match stat_of(pid) {
+            Ok(None) => true,
+            Ok(Some((_, state, _))) => state == b'Z',
+            Err(_) => false,
+        }
+    }
+
+    /// Whether process `pid` is gone, not even a zombie: no entry left, or its number now another's (its parent no
+    /// longer this process); a look that fails is "not gone" (M2T07R-1050).
+    fn gone(pid: u32) -> bool {
+        match stat_of(pid) {
+            Ok(None) => true,
+            Ok(Some((_, _, parent))) => parent != std::process::id(),
+            Err(_) => false,
+        }
     }
 
     /// Whether every command of `seen` (children named `comm` seen before) is dead: gone, its number now another's,
     /// or a zombie. Each is looked at by its own number, so a listing that fails or misses one is never taken for
     /// its death; a look that fails is "not dead" (M2T07R-1000).
     fn dead(seen: &[(u32, char)], comm: &str) -> bool {
-        let me = std::process::id().to_string();
+        let me = std::process::id();
         !seen.is_empty()
             && seen.iter().all(|(pid, _)| match stat_of(*pid) {
                 Ok(None) => true,
-                Ok(Some((name, state, parent))) => name != comm || parent != me || state == 'Z',
+                Ok(Some((name, state, parent))) => {
+                    name.as_slice() != comm.as_bytes() || parent != me || state == b'Z'
+                }
                 Err(_) => false,
             })
     }
@@ -3173,9 +3200,19 @@ mod tests {
             match seen {
                 Ok(found) if !found.is_empty() => return Ok(found),
                 _ if Instant::now() > until => {
+                    let all = children().map(|all| {
+                        all.into_iter()
+                            .map(|(pid, name, state)| {
+                                (
+                                    pid,
+                                    String::from_utf8_lossy(&name).into_owned(),
+                                    char::from(state),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    });
                     return Err(format!(
-                        "no child named {comm} ({seen:?}); this process's children: {:?}",
-                        children()
+                        "no child named {comm} ({seen:?}); this process's children: {all:?}"
                     ));
                 }
                 _ => std::thread::sleep(Duration::from_millis(10)),
@@ -3278,16 +3315,35 @@ mod tests {
         std::fs::remove_file(&hold_stall)?;
         let _ = stopper.join();
         let result = probing.join().map_err(|_| "the probe panicked")?;
-        assert!(inside, "the probe never got to {stopped_at}");
+        // Every failure below says what the probe returned and which children this process had, so a rare one can be
+        // told apart (M2T07R-900: one parallel run found no command at placed, cause unproven).
+        let seen =
+            |what: &str| format!("{what}; the probe: {result:?}; children: {:?}", children());
+        assert!(
+            inside,
+            "{}",
+            seen(&format!("the probe never got to {stopped_at}"))
+        );
         assert!(
             stopped_at_once,
-            "the stop waited for the start held at {stopped_at}"
+            "{}",
+            seen(&format!(
+                "the stop waited for the start held at {stopped_at}"
+            ))
         );
-        assert!(past_its_slot, "the starter never got to {moment}");
-        assert_eq!(found?.len(), 1, "the command started");
+        assert!(
+            past_its_slot,
+            "{}",
+            seen(&format!("the starter never got to {moment}"))
+        );
+        let found = found.map_err(|e| seen(&e))?;
+        assert_eq!(found.len(), 1, "{}", seen("the command started"));
         assert!(
             killed,
-            "the command started during the stop lives while its starter is held at {moment}"
+            "{}",
+            seen(&format!(
+                "the command started during the stop lives while its starter is held at {moment}"
+            ))
         );
         assert!(
             matches!(&result, Err(ProbeError::Failed { detail, .. }) if detail == STOPPING),
@@ -5775,12 +5831,10 @@ mod tests {
                 "{n}: returned after {:?}",
                 started.elapsed()
             );
-            let pid = std::fs::read_to_string(&pidfile)?.trim().parse::<i32>()?;
-            // Neither running nor a zombie: no /proc entry is left for it.
-            assert!(
-                !Path::new(&format!("/proc/{pid}")).exists(),
-                "{n}: command {pid} left after the error"
-            );
+            let pid = std::fs::read_to_string(&pidfile)?.trim().parse::<u32>()?;
+            // Neither running nor a zombie: no /proc entry is left for it (a look that fails is not "gone",
+            // M2T07R-1050).
+            assert!(gone(pid), "{n}: command {pid} left after the error");
         }
         Ok(())
     }
@@ -5809,9 +5863,10 @@ mod tests {
             cancel: None,
         };
         let result = run_status(&launcher, &[], &env);
-        let pid = std::fs::read_to_string(&pidfile)?.trim().parse::<i32>()?;
-        let left = Path::new(&format!("/proc/{pid}")).exists();
-        if left && let Some(pid) = Pid::from_raw(pid) {
+        let pid = std::fs::read_to_string(&pidfile)?.trim().parse::<u32>()?;
+        // A look that fails is not "gone" (M2T07R-1050).
+        let left = !gone(pid);
+        if left && let Some(pid) = i32::try_from(pid).ok().and_then(Pid::from_raw) {
             let _ = rustix::process::kill_process(pid, Signal::KILL);
         }
         assert!(
