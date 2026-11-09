@@ -2118,3 +2118,123 @@ async fn codex_an_8_mib_line_fails_only_its_own_attempt() -> R {
     assert!(world.store.writer_alive());
     Ok(())
 }
+
+/// A start gate for the tests (the product's is `hoh __gate`): one line from stdin, read a byte at a time; `go` execs
+/// the agent's argv in its place, anything else exits 0 (docs/adr/ADR-022.md decision 13).
+fn gate(world: &World) -> R<codex::GateCommand> {
+    let script = world.dir.path().join("gate.py");
+    std::fs::write(
+        &script,
+        "import os, sys\nline = b''\nwhile True:\n    b = os.read(0, 1)\n    if not b or b == b'\\n':\n        break\n    line += b\n\
+         if line != b'go':\n    sys.exit(0)\nos.execvp(sys.argv[1], sys.argv[1:])\n",
+    )?;
+    Ok(codex::GateCommand {
+        program: "python3".into(),
+        args: vec![script.into()],
+        env: vec![("HOH_ATTEMPT_ID".into(), "p/A1".into())],
+    })
+}
+
+#[tokio::test]
+async fn codex_runner_mode_runs_the_app_server_turn_after_its_gate_without_store_writes() -> R {
+    // docs/adr/ADR-022.md decisions 12 to 15: held at its gate nothing runs; opened, the recorded App Server turn
+    // settles with its thread, model and events as facts, and the store is not written.
+    let world = World::new()?;
+    let case = Case::load("app-server-turn")?;
+    let fake = world.fake("held", Some(&case), "exec", false)?;
+    let attempt = world.attempt("A1").await?;
+    let turn = world.turn(&fake, "logs/held")?;
+    let events = count(&world, "SELECT count(*) FROM events")?;
+    let held = codex::start(&attempt, &turn, &gate(&world)?)?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(argvs(&fake)?.is_empty(), "codex ran before its gate opened");
+    held.open.send(()).map_err(|()| "gate closed")?;
+    let facts = tokio::time::timeout(Duration::from_secs(30), held.ended).await??;
+    assert_eq!(facts.state, AttemptState::Settled, "{facts:?}");
+    assert_eq!(facts.degraded, None);
+    let thread = facts.native_session.clone().ok_or("no thread")?;
+    assert!(
+        facts
+            .recorded
+            .contains(&codex::Recorded::NativeSession(thread))
+    );
+    assert!(facts.resolved_model.is_some(), "{facts:?}");
+    assert!(facts.group_reaped);
+    assert_eq!(argvs(&fake)?.len(), 1, "one process: the App Server");
+    assert_eq!(
+        count(&world, "SELECT count(*) FROM events")?,
+        events,
+        "the store was written"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn codex_runner_mode_ends_a_refused_handshake_for_exec_next_and_starts_no_second_process() -> R
+{
+    // ADR-022 decision 15 (REQ-024 failure mode 4): initialize "method not found" ends the turn FAILED
+    // (CAPABILITY_UNSUPPORTED) with the reason recorded for the next attempt, which uses exec; no exec process is
+    // started within this attempt, outside its gate.
+    let world = World::new()?;
+    let mut not_found = Case {
+        frames: Vec::new(),
+        requests: BTreeMap::new(),
+    };
+    not_found.requests.insert(0, "initialize".to_owned());
+    not_found.frames.push(
+        json!({"id": 0, "error": {"code": -32601, "message": "Method not found: initialize"}}),
+    );
+    let fake = world.fake("refused", Some(&not_found), "exec", false)?;
+    let attempt = world.attempt("A1").await?;
+    let turn = world.turn(&fake, "logs/refused")?;
+    let held = codex::start(&attempt, &turn, &gate(&world)?)?;
+    held.open.send(()).map_err(|()| "gate closed")?;
+    let facts = tokio::time::timeout(Duration::from_secs(30), held.ended).await??;
+    assert_eq!(
+        (facts.state, facts.failure.as_deref()),
+        (AttemptState::Failed, Some("CAPABILITY_UNSUPPORTED"))
+    );
+    assert!(
+        facts
+            .degraded
+            .as_deref()
+            .is_some_and(|r| r.contains("method not found")),
+        "{facts:?}"
+    );
+    assert!(
+        facts.recorded.iter().any(
+            |r| matches!(r, codex::Recorded::Event { kind, .. } if kind == "adapter.degraded")
+        )
+    );
+    let ran = argvs(&fake)?;
+    assert_eq!(ran.len(), 1, "{ran:?}");
+    assert_eq!(ran[0].first().map(String::as_str), Some("app-server"));
+    // The next attempt, its App Server help withheld by the runner's registry, runs exec.
+    let mut next = world.turn(&fake, "logs/next")?;
+    next.launch.app_server_help = None;
+    let held = codex::start(&world.attempt("A2").await?, &next, &gate(&world)?)?;
+    held.open.send(()).map_err(|()| "gate closed")?;
+    let facts = tokio::time::timeout(Duration::from_secs(30), held.ended).await??;
+    assert_eq!(facts.state, AttemptState::Settled, "{facts:?}");
+    assert!(
+        argvs(&fake)?
+            .iter()
+            .any(|a| a.first().map(String::as_str) == Some("exec"))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn codex_runner_mode_gate_dropped_unopened_runs_nothing() -> R {
+    // ADR-019 decision 8, ADR-022 decision 13.
+    let world = World::new()?;
+    let case = Case::load("app-server-turn")?;
+    let fake = world.fake("dropped", Some(&case), "exec", false)?;
+    let turn = world.turn(&fake, "logs/dropped")?;
+    let held = codex::start(&world.attempt("A1").await?, &turn, &gate(&world)?)?;
+    drop(held.open);
+    let facts = tokio::time::timeout(Duration::from_secs(30), held.ended).await??;
+    assert_eq!(facts.failure.as_deref(), Some("GATE_CLOSED"));
+    assert!(argvs(&fake)?.is_empty(), "codex ran");
+    Ok(())
+}

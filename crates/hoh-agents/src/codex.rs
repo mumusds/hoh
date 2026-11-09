@@ -23,7 +23,10 @@
 //! (BLOCKED_CAPABILITY). exec's turn.completed (with exit code 0) SETTLES; turn.failed fails, BLOCKED_AUTH when it or
 //! an earlier `error` event says `unexpected status 401` (CR-003).
 
-use crate::adapter::{AdapterError, AttemptRef, finish, now, offers, sha256_file, step};
+use crate::adapter::{
+    AdapterError, AttemptRef, Recorder, Stop, finish, now, offers, sha256_file, step,
+};
+pub use crate::adapter::{Facts, GateCommand, Held, Recorded, Refused};
 use crate::process::{Escalation, Signal, Step, Termination};
 use hoh_core::lifecycle::AttemptState;
 use hoh_core::persistence::{AttemptFacts, CancelLatch, Session, Store};
@@ -457,22 +460,7 @@ pub async fn run(
     };
     // The App Server only if it starts on stdio and its schema has what this turn uses (the probe's choice too, but for
     // the resume this turn may need; M1T07R-15, -27, -28); without one, exec must be possible before anything starts.
-    let unusable = turn.launch.app_server_help.as_deref().and_then(|help| {
-        app_server_launch_missing(help)
-            .or_else(|| {
-                app_server_interface_missing(
-                    &turn.launch.requests,
-                    &turn.launch.client_notifications,
-                    &turn.launch.known,
-                )
-            })
-            .or_else(|| {
-                (turn.launch.resume.is_some() && !turn.launch.requests.contains(RESUME_REQUEST))
-                    .then(|| {
-                        format!("the App Server schema has no {RESUME_REQUEST} to resume with")
-                    })
-            })
-    });
+    let unusable = app_server_unusable(turn);
     let app_server_help = turn
         .launch
         .app_server_help
@@ -596,6 +584,167 @@ pub async fn run(
         }
     };
     exec::run(store, attempt, turn, args, reason, cancel, &mut steers).await
+}
+
+/// Why the App Server cannot serve `turn` though its help is there, or `None`.
+fn app_server_unusable(turn: &Turn) -> Option<String> {
+    turn.launch.app_server_help.as_deref().and_then(|help| {
+        app_server_launch_missing(help)
+            .or_else(|| {
+                app_server_interface_missing(
+                    &turn.launch.requests,
+                    &turn.launch.client_notifications,
+                    &turn.launch.known,
+                )
+            })
+            .or_else(|| {
+                (turn.launch.resume.is_some() && !turn.launch.requests.contains(RESUME_REQUEST))
+                    .then(|| {
+                        format!("the App Server schema has no {RESUME_REQUEST} to resume with")
+                    })
+            })
+    })
+}
+
+/// Start one turn in the runner's mode (docs/adr/ADR-022.md decisions 12 to 15). Its transport is fixed before
+/// anything starts: the App Server when its help and schema serve this turn, else exec (the runner's registry passes
+/// no App Server help once one failed). It runs through `gate`, held until [`Held::open`] is sent; it moves no attempt
+/// state and writes nothing to the store, its facts come back. A cancel is native only: turn/interrupt on the App
+/// Server (stdin closed before a turn is active), SIGINT on exec; the host's ladder does the rest. No deadline. An App
+/// Server whose initialize is refused as unknown or not answered ends the turn FAILED (CAPABILITY_UNSUPPORTED), the
+/// reason in [`Facts::degraded`]: no second process is started within the attempt.
+pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<Held, Refused> {
+    let blocked = |detail: String| Refused {
+        code: "BLOCKED_CAPABILITY".to_owned(),
+        detail,
+    };
+    let unusable = app_server_unusable(turn);
+    let app_server = match turn
+        .launch
+        .app_server_help
+        .as_deref()
+        .filter(|_| unusable.is_none())
+    {
+        Some(help) => app_server_args(help).ok(),
+        None => None,
+    };
+    let (args, config) = match &app_server {
+        Some(args) => (args.clone(), app_server::config(turn)),
+        None => (
+            exec_args(&turn.launch).map_err(|Blocked(detail)| blocked(detail))?,
+            crate::process::Config {
+                deadline: None,
+                ..exec::config(turn)
+            },
+        ),
+    };
+    std::fs::create_dir_all(&turn.logs).map_err(|e| Refused {
+        code: "LOGS".to_owned(),
+        detail: e.to_string(),
+    })?;
+    let mut command = std::process::Command::new(&gate.program);
+    command
+        .args(&gate.args)
+        .arg(&turn.launch.program)
+        .args(&args)
+        .envs(gate.env.iter().map(|(k, v)| (k, v)))
+        .current_dir(&turn.launch.cwd);
+    let mut process = crate::process::Process::spawn(command, config).map_err(|e| Refused {
+        code: "SPAWN".to_owned(),
+        detail: e.to_string(),
+    })?;
+    let pid = process.pid();
+    let (open, opened) = oneshot::channel::<()>();
+    let cancel = std::sync::Arc::new(tokio::sync::Notify::new());
+    let native = cancel.clone();
+    let (attempt, turn) = (attempt.clone(), turn.clone());
+    let raw_log_path = turn.logs.to_string_lossy().into_owned();
+    let ended = tokio::spawn(async move {
+        if opened.await.is_err() {
+            let report = crate::adapter::close_gate(&mut process).await;
+            return Facts::gate_closed(raw_log_path, report.as_ref());
+        }
+        // No steering in the runner's mode yet: the channel is closed.
+        let (_, mut steers) = mpsc::channel::<Steer>(1);
+        if app_server.is_some() {
+            let mut held = Vec::new();
+            let drove = app_server::drive(
+                None,
+                &attempt,
+                &turn,
+                &mut process,
+                Stop::Native(&native),
+                &mut steers,
+                &mut held,
+                Some(b"go\n".to_vec()),
+            )
+            .await;
+            return match drove {
+                Ok(app_server::Drove::Ended(driven)) => Facts {
+                    state: driven.state,
+                    failure: driven.failure,
+                    native_session: driven.thread_id,
+                    resolved_model: driven.model,
+                    usage: driven.usage,
+                    raw_log_path,
+                    max_buffered: driven.report.as_ref().map(|r| r.stdout.max_buffered),
+                    group_reaped: driven.report.as_ref().is_some_and(|r| r.group_reaped),
+                    recorded: driven.recorded,
+                    degraded: None,
+                },
+                Ok(app_server::Drove::Degrade(reason, report)) => Facts {
+                    failure: Some("CAPABILITY_UNSUPPORTED".to_owned()),
+                    recorded: vec![Recorded::Event {
+                        key: "degraded".to_owned(),
+                        kind: "adapter.degraded".to_owned(),
+                        payload: json!({"attempt_id": attempt.attempt_id, "reason": reason, "mode": "exec",
+                                            "next_attempt": true}),
+                    }],
+                    degraded: Some(reason),
+                    ..Facts::gate_closed(raw_log_path, report.as_ref())
+                },
+                Err(_) => Facts::incomplete(raw_log_path, Vec::new()),
+            };
+        }
+        let mut input = b"go\n".to_vec();
+        input.extend_from_slice(turn.prompt.as_bytes());
+        let mut recorder = Recorder::Collect(Vec::new());
+        let driven = exec::drive(
+            &mut recorder,
+            &attempt,
+            &turn,
+            &mut process,
+            input,
+            Stop::Native(&native),
+            &mut steers,
+        )
+        .await;
+        let recorded = match recorder {
+            Recorder::Collect(recorded) => recorded,
+            Recorder::Store { .. } => Vec::new(),
+        };
+        match driven {
+            Ok(driven) => Facts {
+                state: driven.state,
+                failure: driven.failure,
+                native_session: driven.thread_id,
+                resolved_model: None,
+                usage: driven.usage,
+                raw_log_path,
+                max_buffered: driven.report.as_ref().map(|r| r.stdout.max_buffered),
+                group_reaped: driven.report.as_ref().is_some_and(|r| r.group_reaped),
+                recorded,
+                degraded: None,
+            },
+            Err(_) => Facts::incomplete(raw_log_path, recorded),
+        }
+    });
+    Ok(Held {
+        pid,
+        open,
+        cancel,
+        ended,
+    })
 }
 
 /// The session row of a turn: the probed capabilities, only those this adapter implements on the transport the turn

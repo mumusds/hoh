@@ -62,6 +62,59 @@ pub struct Facts {
     pub group_reaped: bool,
     /// What the turn recorded, in order.
     pub recorded: Vec<Recorded>,
+    /// Why the agent's preferred transport could not serve this turn (Codex's App Server, decision 15): the next
+    /// attempt is to use the other.
+    pub degraded: Option<String>,
+}
+
+impl Facts {
+    /// A turn whose gate was dropped unopened: the agent never ran.
+    pub(crate) fn gate_closed(
+        raw_log_path: String,
+        report: Option<&crate::process::ExitReport>,
+    ) -> Facts {
+        Facts {
+            state: AttemptState::Failed,
+            failure: Some("GATE_CLOSED".to_owned()),
+            native_session: None,
+            resolved_model: None,
+            usage: None,
+            raw_log_path,
+            max_buffered: report.map(|r| r.stdout.max_buffered),
+            group_reaped: report.is_some_and(|r| r.group_reaped),
+            recorded: Vec::new(),
+            degraded: None,
+        }
+    }
+
+    /// A turn whose drive failed before it had a verdict.
+    pub(crate) fn incomplete(raw_log_path: String, recorded: Vec<Recorded>) -> Facts {
+        Facts {
+            state: AttemptState::Failed,
+            failure: Some("PROTOCOL_INCOMPLETE".to_owned()),
+            native_session: None,
+            resolved_model: None,
+            usage: None,
+            raw_log_path,
+            max_buffered: None,
+            group_reaped: false,
+            recorded,
+            degraded: None,
+        }
+    }
+}
+
+/// Close a held gate's input unopened and wait for its process to end; its exit report.
+pub(crate) async fn close_gate(
+    process: &mut crate::process::Process,
+) -> Option<crate::process::ExitReport> {
+    drop(process.take_stdin());
+    while let Some(event) = process.next().await {
+        if let crate::process::Event::Exit(report) = event {
+            return Some(*report);
+        }
+    }
+    None
 }
 
 /// A turn in the runner's mode, started and held at its gate.
@@ -92,6 +145,34 @@ impl std::fmt::Display for Refused {
 }
 
 impl std::error::Error for Refused {}
+
+/// Where a turn's cancel comes from: the attempt's latch (the direct mode: the adapter stops the turn as its plan
+/// says), or the runner's native cancel (the adapter does only the agent's own cancel; the host's ladder does the
+/// rest, docs/adr/ADR-022.md decision 14).
+pub(crate) enum Stop<'a> {
+    Latch(&'a CancelLatch),
+    Native(&'a tokio::sync::Notify),
+}
+
+impl Stop<'_> {
+    pub(crate) fn requested_now(&self) -> bool {
+        match self {
+            Stop::Latch(latch) => latch.is_requested(),
+            Stop::Native(_) => false,
+        }
+    }
+
+    pub(crate) async fn requested(&self) {
+        match self {
+            Stop::Latch(latch) => latch.requested().await,
+            Stop::Native(notify) => notify.notified().await,
+        }
+    }
+
+    pub(crate) fn is_native(&self) -> bool {
+        matches!(self, Stop::Native(_))
+    }
+}
 
 /// Where a turn records what it sees: the store, at once (the direct mode), or a list the runner records.
 pub(crate) enum Recorder<'a> {
