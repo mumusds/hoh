@@ -62,19 +62,51 @@ fn text_of<'a>(what: &str, path: &'a Path) -> Result<&'a str, Unusable> {
     Ok(text)
 }
 
-/// The template for the hoh installed in `home` (`<home>/.local/bin/hoh`), or why it cannot run from there.
+/// `path` as a unit file takes it in ExecStart= (in double quotes) and EnvironmentFile= (the rest of the line), `%`
+/// doubled, or why not: [`text_of`]'s rules, and no `"`, `\\` or `'` (systemd runs no program whose path has one,
+/// however escaped).
+fn unit_path(what: &str, path: &Path) -> Result<String, Unusable> {
+    let text = text_of(what, path)?;
+    if let Some(c) = text.chars().find(|c| matches!(c, '"' | '\\' | '\'')) {
+        return Err(Unusable(format!(
+            "{what} has {c:?}: systemd runs no program whose path has it ({text:?})"
+        )));
+    }
+    Ok(text.replace('%', "%%"))
+}
+
+/// The root of the installation whose binary is `exe` (canonical): `<root>/versions/<version>/bin/hoh`; `None` for a
+/// binary anywhere else (a build, a test's), which is not an installed hoh (ADR-023 design correction 1).
+pub fn installation_root(exe: &Path) -> Option<PathBuf> {
+    let bin = exe.parent()?;
+    let version = bin.parent()?;
+    let versions = version.parent()?;
+    let root = versions.parent()?;
+    (exe.is_absolute()
+        && exe.file_name()? == "hoh"
+        && bin.file_name()? == "bin"
+        && version.file_name().is_some()
+        && versions.file_name()? == "versions"
+        && root.file_name().is_some())
+    .then(|| root.to_path_buf())
+}
+
+/// The environment file of `instance` in the installation at `root`: the only one HoH writes for it.
+pub fn instance_file(root: &Path, instance: &str) -> PathBuf {
+    root.join("hosts").join(format!("{instance}.env"))
+}
+
+/// The template for the hoh installed in `home` (`<home>/.local/bin/hoh`) from the installation at `root`, or why
+/// it cannot run from there.
 ///
 /// The program is written whole in double quotes with `%` doubled (a specifier otherwise); `$` is not expanded in a
 /// program's path. systemd refuses a program whose path has `"`, `\` or `'` however escaped, so such a home gets no
 /// template (verified under a private manager, ADR-023 decision 1).
-pub fn template(home: &Path) -> Result<String, Unusable> {
-    let home = text_of("the home directory", home)?;
-    if let Some(c) = home.chars().find(|c| matches!(c, '"' | '\\' | '\'')) {
-        return Err(Unusable(format!(
-            "the home directory has {c:?}: systemd runs no program whose path has it ({home:?})"
-        )));
-    }
-    let program = format!("{home}/.local/bin/hoh").replace('%', "%%");
+pub fn template(home: &Path, root: &Path) -> Result<String, Unusable> {
+    let home = unit_path("the home directory", home)?;
+    let root = unit_path("the installation's root", root)?;
+    let program = format!("{home}/.local/bin/hoh");
+    let file = format!("{root}/hosts/%i.env");
     Ok(format!(
         "# Written by the HoH installer at each install, removed by `install.sh --uninstall`.\n\
          # Local changes belong in drop-ins: systemctl --user edit hoh-host@.service\n\
@@ -85,7 +117,7 @@ pub fn template(home: &Path) -> Result<String, Unusable> {
          \n\
          [Service]\n\
          Type=exec\n\
-         EnvironmentFile=%S/hoh/hosts/%i.env\n\
+         EnvironmentFile={file}\n\
          ExecStart=\"{program}\" __host ${{HOH_PROJECT}}\n\
          Restart=on-failure\n\
          RestartSec=5\n\
@@ -233,11 +265,11 @@ pub fn show(text: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// The one environment file an `EnvironmentFiles=` property names, read without ignoring errors (so a missing file
-/// fails the start); `None` for anything else.
-pub fn environment_file(value: &str) -> Option<PathBuf> {
-    let path = value.strip_suffix(" (ignore_errors=no)")?;
-    Some(PathBuf::from(path)).filter(|p| p.is_absolute())
+/// Whether `systemctl show -p EnvironmentFiles` output (`text`, one line per file: a drop-in may add files or reset
+/// them) names `file`, read without ignoring errors (so a missing file fails the start).
+pub fn lists_environment_file(text: &str, file: &Path) -> bool {
+    let wanted = format!("EnvironmentFiles={} (ignore_errors=no)", file.display());
+    text.lines().any(|line| line == wanted)
 }
 
 /// Whether an `ExecStart=` property runs `program`'s host: its path exactly `program` and its arguments the

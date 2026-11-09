@@ -30,7 +30,7 @@ fn section<'a>(text: &'a str, name: &str) -> Vec<(&'a str, &'a str)> {
 #[test]
 fn the_template_restarts_on_failure_within_its_limit_in_a_delegated_cgroup() {
     // REQ-005 behaviour 6 and decision 4, CR-011, ADR-023 decision 1.
-    let text = template(Path::new("/home/u")).unwrap();
+    let text = template(Path::new("/home/u"), Path::new("/home/u/.local/share/hoh")).unwrap();
     assert_eq!(
         section(&text, "Unit"),
         [
@@ -43,7 +43,7 @@ fn the_template_restarts_on_failure_within_its_limit_in_a_delegated_cgroup() {
         section(&text, "Service"),
         [
             ("Type", "exec"),
-            ("EnvironmentFile", "%S/hoh/hosts/%i.env"),
+            ("EnvironmentFile", "/home/u/.local/share/hoh/hosts/%i.env"),
             (
                 "ExecStart",
                 "\"/home/u/.local/bin/hoh\" __host ${HOH_PROJECT}"
@@ -72,16 +72,24 @@ fn the_template_restarts_on_failure_within_its_limit_in_a_delegated_cgroup() {
 #[test]
 fn a_percent_in_home_is_doubled_and_a_dollar_or_a_space_kept_as_it_is() {
     // Verified under a private manager (ADR-023 decision 1): `%` is a specifier, `$` in the program is not expanded.
-    let text = template(Path::new("/home/a%b$c d~中")).unwrap();
-    let exec = section(&text, "Service")
-        .into_iter()
-        .find(|(k, _)| *k == "ExecStart")
-        .unwrap()
-        .1;
+    let text = template(
+        Path::new("/home/a%b$c d~中"),
+        Path::new("/data/x%y$z w/hoh"),
+    )
+    .unwrap();
+    let get = |key: &str| {
+        section(&text, "Service")
+            .into_iter()
+            .find(|(k, _)| *k == key)
+            .unwrap()
+            .1
+    };
     assert_eq!(
-        exec,
+        get("ExecStart"),
         "\"/home/a%%b$c d~中/.local/bin/hoh\" __host ${HOH_PROJECT}"
     );
+    // EnvironmentFile= takes the rest of the line as its path, specifiers expanded (verified: space, %% and $).
+    assert_eq!(get("EnvironmentFile"), "/data/x%%y$z w/hoh/hosts/%i.env");
 }
 
 #[test]
@@ -97,10 +105,21 @@ fn a_home_systemd_cannot_run_a_program_in_gives_no_template() {
         "home/relative",
         "",
     ] {
-        assert!(template(Path::new(home)).is_err(), "{home:?} was accepted");
+        assert!(
+            template(Path::new(home), Path::new("/data/hoh")).is_err(),
+            "{home:?} was accepted"
+        );
+        // The same rules for the installation's root (it is in EnvironmentFile=, and under it the program).
+        if !home.is_empty() {
+            assert!(
+                template(Path::new("/home/u"), Path::new(home)).is_err(),
+                "root {home:?} was accepted"
+            );
+        }
     }
     let not_utf8 = Path::new(OsStr::from_bytes(b"/home/a\xffb"));
-    assert!(template(not_utf8).is_err());
+    assert!(template(not_utf8, Path::new("/data/hoh")).is_err());
+    assert!(template(Path::new("/home/u"), not_utf8).is_err());
 }
 
 #[test]
@@ -165,22 +184,64 @@ fn show_output_is_split_at_the_first_equals_sign() {
 }
 
 #[test]
-fn the_environment_file_is_the_one_systemd_names_and_reads_without_ignoring_errors() {
-    assert_eq!(
-        environment_file("/s/hoh/hosts/60ad706fe5335804.env (ignore_errors=no)"),
-        Some(PathBuf::from("/s/hoh/hosts/60ad706fe5335804.env"))
-    );
-    assert_eq!(
-        environment_file("/s/a b/x.env (ignore_errors=no)"),
-        Some(PathBuf::from("/s/a b/x.env"))
-    );
-    for value in [
-        "",
-        "/s/x.env (ignore_errors=yes)",
-        "relative.env (ignore_errors=no)",
-        "/s/x.env",
+fn the_unit_must_list_this_installations_file_among_all_it_reads() {
+    // ADR-023 design correction 1: a drop-in may add files (one line each) or reset them; only a listing that names
+    // this installation's own file, read without ignoring errors, lets HoH use the unit; HoH writes no other.
+    let ours = Path::new("/d/hoh/hosts/60ad706fe5335804.env");
+    for (text, listed) in [
+        (
+            "EnvironmentFiles=/d/hoh/hosts/60ad706fe5335804.env (ignore_errors=no)\n",
+            true,
+        ),
+        (
+            "LoadState=loaded\nEnvironmentFiles=/d/hoh/hosts/60ad706fe5335804.env (ignore_errors=no)\n\
+             EnvironmentFiles=/h/.config/agent.env (ignore_errors=no)\n",
+            true,
+        ),
+        (
+            "EnvironmentFiles=/h/.config/agent.env (ignore_errors=no)\n\
+             EnvironmentFiles=/d/hoh/hosts/60ad706fe5335804.env (ignore_errors=no)\n",
+            true,
+        ),
+        (
+            "EnvironmentFiles=/h/.config/agent.env (ignore_errors=no)\n",
+            false,
+        ),
+        (
+            "EnvironmentFiles=/d/hoh/hosts/60ad706fe5335804.env (ignore_errors=yes)\n",
+            false,
+        ),
+        (
+            "EnvironmentFiles=/d/hoh/hosts/60ad706fe5335804.env.x (ignore_errors=no)\n",
+            false,
+        ),
+        ("", false),
     ] {
-        assert_eq!(environment_file(value), None, "{value:?}");
+        assert_eq!(lists_environment_file(text, ours), listed, "{text:?}");
+    }
+    assert_eq!(
+        instance_file(Path::new("/d/hoh"), "60ad706fe5335804"),
+        Path::new("/d/hoh/hosts/60ad706fe5335804.env")
+    );
+}
+
+#[test]
+fn the_installation_root_is_found_only_from_a_binary_in_one_of_its_versions() {
+    assert_eq!(
+        installation_root(Path::new(
+            "/h/.local/share/hoh/versions/0.0.0-3dbeab56c855/bin/hoh"
+        )),
+        Some(PathBuf::from("/h/.local/share/hoh"))
+    );
+    for exe in [
+        "/h/target/debug/hoh",
+        "/h/.local/share/hoh/current/bin/hoh",
+        "/h/.local/share/hoh/versions/bin/hoh",
+        "/versions/v/bin/hoh",
+        "/h/.local/share/hoh/versions/v/sbin/hoh",
+        "hoh/versions/v/bin/hoh",
+    ] {
+        assert_eq!(installation_root(Path::new(exe)), None, "{exe}");
     }
 }
 

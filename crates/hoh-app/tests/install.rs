@@ -1,6 +1,6 @@
 //! Installing HoH (REQ-005, docs/adr/ADR-023.md): the binary's `__unit` entry and the installer's file layer, in a
 //! temporary HOME with no user manager reachable (an empty XDG_RUNTIME_DIR). The unit's behaviour under systemd is
-//! tested under a private user manager (`systemd.rs`), and the whole release bundle by TEST-005-06 (`deployment.rs`).
+//! tested under a private user manager (`service.rs`), and the whole release bundle by TEST-005-06 (`deployment.rs`).
 
 // No SQLite outside hoh-core::persistence (AC-062-05; see clippy.toml), and no unsafe code (no FFI way around it).
 #![forbid(clippy::disallowed_methods)]
@@ -58,31 +58,62 @@ fn the_unit_entry_refuses_a_wrong_command_line_with_64_and_is_in_no_help() -> R 
 }
 
 #[test]
-fn the_unit_entry_prints_the_template_for_its_home_or_refuses_one_systemd_cannot_use() -> R {
+fn the_unit_entry_gives_a_template_only_as_an_installed_binary_for_a_home_systemd_can_use() -> R {
+    // ADR-023 design correction 1: the template names the installation's own instance files, found from where the
+    // binary is; a binary not in an installation's version (a build's) gives none.
     let root = tempfile::tempdir()?;
-    let home = root.path().join("a home %1");
-    std::fs::create_dir(&home)?;
-    let out = hoh(&["__unit", "template"], &[("HOME", &home)], root.path())?;
+    let out = hoh(
+        &["__unit", "template"],
+        &[("HOME", root.path())],
+        root.path(),
+    )?;
     assert_eq!(
         out.status.code(),
-        Some(0),
+        Some(78),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let text = String::from_utf8(out.stdout)?;
-    assert_eq!(text, hoh_app::unit::template(&home)?);
-    let exec = format!(
-        "ExecStart=\"{}/a home %%1/.local/bin/hoh\" __host ${{HOH_PROJECT}}",
-        root.path().display()
+    assert!(String::from_utf8(out.stderr)?.contains("not an installed hoh"));
+    let install = Install::new()?;
+    let out = install.run("bundle", &[])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let installed = install.data().join("hoh/current/bin/hoh");
+    let out = hoh_at(
+        &installed,
+        &["__unit", "template"],
+        &[("HOME", &install.home())],
+    )?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let printed = String::from_utf8(out.stdout)?;
+    assert_eq!(
+        printed,
+        hoh_app::unit::template(&install.home(), &install.data().join("hoh"))?
     );
-    assert!(text.lines().any(|line| line == exec), "{text}");
-    let quoted = root.path().join("a\"b");
-    let out = hoh(&["__unit", "template"], &[("HOME", &quoted)], root.path())?;
+    assert!(
+        printed.lines().any(|l| l
+            == format!(
+                "EnvironmentFile={}/hoh/hosts/%i.env",
+                install.data().display()
+            )),
+        "{printed}"
+    );
+    let quoted = install.root.path().join("a\"b");
+    let out = hoh_at(&installed, &["__unit", "template"], &[("HOME", &quoted)])?;
     assert_eq!(out.status.code(), Some(78));
     assert!(out.stdout.is_empty());
-    let out = hoh(&["__unit", "template"], &[], root.path())?;
+    let out = hoh_at(&installed, &["__unit", "template"], &[])?;
     assert_eq!(out.status.code(), Some(78), "HOME unset");
     Ok(())
+}
+
+/// `program <args>` with only `vars` and a plain PATH.
+fn hoh_at(program: &Path, args: &[&str], vars: &[(&str, &Path)]) -> R<Output> {
+    let mut command = Command::new(program);
+    command.args(args).env_clear().env("PATH", "/usr/bin:/bin");
+    for (key, value) in vars {
+        command.env(key, value);
+    }
+    Ok(command.output()?)
 }
 
 #[test]
@@ -314,7 +345,7 @@ fn an_install_lays_out_a_version_a_current_link_the_command_and_the_template() -
     let template = install.data().join("systemd/user/hoh-host@.service");
     assert_eq!(
         std::fs::read_to_string(&template)?,
-        hoh_app::unit::template(&install.home())?
+        hoh_app::unit::template(&install.home(), &install.data().join("hoh"))?
     );
     // Nothing else in the home: the command, the installation and the template (with their directories).
     let paths: Vec<PathBuf> = tree(&install.home())?
@@ -508,5 +539,24 @@ fn enabling_a_project_with_no_user_manager_or_a_wrong_command_line_writes_nothin
         assert_eq!(std::fs::read_dir(install.home())?.count(), 0, "{args:?}");
     }
     assert_eq!(std::fs::read_dir(&project)?.count(), 0);
+    Ok(())
+}
+
+#[test]
+fn lingering_is_asked_for_only_with_linger() -> R {
+    // REQ-005 behaviour 6 (M2T14R-55): logind is asked only when the user said --linger, once, for this user.
+    let install = Install::new()?;
+    let calls = install.root.path().join("loginctl-called");
+    script(
+        &install.stubs().join("loginctl"),
+        &format!("#!/bin/sh\necho \"$@\" >> {}\nexit 0\n", calls.display()),
+    )?;
+    let out = install.run("bundle", &[])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(!calls.exists(), "loginctl called without --linger");
+    let out = install.run("bundle", &["--linger"])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(std::fs::read_to_string(&calls)?, "enable-linger tester\n");
+    assert!(!install.sudo_called());
     Ok(())
 }

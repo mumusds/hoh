@@ -139,12 +139,15 @@ fn the_installed_template_loads_with_the_settings_of_req_005() -> R {
         "{}",
         get("ExecStart")
     );
+    // The instance's file is the installation's (ADR-023 design correction 1), and the manager reads exactly it.
+    let files = manager.systemctl(&["show", "-p", "EnvironmentFiles", &unit])?;
     assert_eq!(
-        hoh_app::unit::environment_file(get("EnvironmentFiles")),
-        Some(manager.state().join(format!(
-            "hoh/hosts/{}.env",
+        String::from_utf8(files.stdout)?,
+        format!(
+            "EnvironmentFiles={}/hoh/hosts/{}.env (ignore_errors=no)\n",
+            manager.data().display(),
             hoh_app::unit::instance(Path::new("/nowhere"))
-        )))
+        )
     );
     assert_eq!(get("Restart"), "on-failure");
     assert_eq!(get("RestartUSec"), "5s");
@@ -163,10 +166,10 @@ fn an_install_with_a_project_enables_its_instance_and_writes_its_file() -> R {
     let unit = unit_of(&project);
     let enabled = manager.systemctl(&["is-enabled", &unit])?;
     assert_eq!(String::from_utf8(enabled.stdout)?.trim(), "enabled");
-    let file = manager.state().join(format!(
-        "hoh/hosts/{}.env",
-        hoh_app::unit::instance(&project)
-    ));
+    let file = hoh_app::unit::instance_file(
+        &manager.data().join("hoh"),
+        &hoh_app::unit::instance(&project),
+    );
     assert_eq!(
         std::fs::metadata(&file)?.permissions().mode() & 0o777,
         0o600
@@ -293,6 +296,9 @@ fn the_uninstall_stops_and_disables_a_running_instance_and_keeps_its_project() -
     let out = manager.systemctl(&["start", &unit])?;
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     let pid = ready_under_the_unit(&mut manager, &unit, &project)?;
+    // ADR-023 decision 11's supplementary check: the database's rows and every file but the host's own runtime files.
+    let rows = dump(&project)?;
+    let files = kept(&project)?;
     let bundle = manager.root().join("bundle/hoh");
     let out = manager.install(&bundle, &["--uninstall"])?;
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
@@ -312,7 +318,7 @@ fn the_uninstall_stops_and_disables_a_running_instance_and_keeps_its_project() -
         manager.home().join(".local/bin/hoh"),
         manager.data().join("hoh"),
         manager.data().join("systemd/user/hoh-host@.service"),
-        manager.state().join("hoh/hosts"),
+        manager.data().join("hoh/hosts"),
         manager
             .home()
             .join(format!(".config/systemd/user/default.target.wants/{unit}")),
@@ -323,9 +329,52 @@ fn the_uninstall_stops_and_disables_a_running_instance_and_keeps_its_project() -
             gone.display()
         );
     }
-    // The project's data stays (AC-005-06).
-    assert!(project.join(".hoh/state.db").is_file());
+    // The project's data stays (AC-005-06): the same rows, the same files (the host's stop removes only its own).
+    assert_eq!(dump(&project)?, rows);
+    assert_eq!(kept(&project)?, files);
     Ok(())
+}
+
+/// The SHA-256 of `project`'s database's rows (Python's iterdump, read-only), whatever its WAL holds.
+fn dump(project: &Path) -> R<String> {
+    let out = std::process::Command::new("python3")
+        .args([
+            "-c",
+            "import hashlib,sqlite3,sys; c=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro', uri=True); \
+             print(hashlib.sha256('\\n'.join(c.iterdump()).encode()).hexdigest())",
+        ])
+        .arg(project.join(".hoh/state.db"))
+        .output()?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).into_owned().into());
+    }
+    Ok(String::from_utf8(out.stdout)?.trim().to_owned())
+}
+
+/// Every file under `project`'s .hoh/ but the database (compared by [`dump`]) and the host's own runtime files, with
+/// its size and digest.
+fn kept(project: &Path) -> R<Vec<(String, u64, String)>> {
+    let dir = project.join(".hoh");
+    let mut out = Vec::new();
+    let mut todo = vec![dir.clone()];
+    while let Some(at) = todo.pop() {
+        for item in std::fs::read_dir(&at)? {
+            let path = item?.path();
+            let name = path.strip_prefix(&dir)?.display().to_string();
+            if name.starts_with("state.db") || name.starts_with("host.") {
+                continue;
+            }
+            let meta = std::fs::symlink_metadata(&path)?;
+            if meta.is_dir() {
+                todo.push(path);
+                out.push((name, 0, String::new()));
+            } else if meta.is_file() {
+                out.push((name, meta.len(), installed::sha256(&std::fs::read(&path)?)));
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
 }
 
 /// `hoh <args>` as the user runs it in `project`: the installed command, or `program` when given.
@@ -626,10 +675,10 @@ fn the_client_writes_its_project_and_path_for_the_unit_also_when_no_instance_was
     };
     assert_eq!(var("PATH").as_deref(), Some(path.as_str()));
     assert_eq!(var("HOH_PROJECT").as_deref(), project.to_str());
-    let file = manager.state().join(format!(
-        "hoh/hosts/{}.env",
-        hoh_app::unit::instance(&project)
-    ));
+    let file = hoh_app::unit::instance_file(
+        &manager.data().join("hoh"),
+        &hoh_app::unit::instance(&project),
+    );
     assert_eq!(
         hoh_app::unit::project_of(&std::fs::read_to_string(file)?),
         Some(project.clone())
@@ -637,5 +686,300 @@ fn the_client_writes_its_project_and_path_for_the_unit_also_when_no_instance_was
     // Started, not enabled: the install enabled nothing.
     let enabled = manager.systemctl(&["is-enabled", &unit])?;
     assert_ne!(String::from_utf8(enabled.stdout)?.trim(), "enabled");
+    Ok(())
+}
+
+/// A drop-in for the template with `body`, read by the manager.
+fn dropin(manager: &Manager, name: &str, body: &str) -> R {
+    let dir = manager
+        .home()
+        .join(".config/systemd/user/hoh-host@.service.d");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join(name), body)?;
+    let out = manager.systemctl(&["daemon-reload"])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    Ok(())
+}
+
+/// The environment of process `pid`, as NAME=value strings.
+fn environ(pid: u32) -> R<Vec<String>> {
+    Ok(std::fs::read(format!("/proc/{pid}/environ"))?
+        .split(|b| *b == 0)
+        .map(|v| String::from_utf8_lossy(v).into_owned())
+        .collect())
+}
+
+#[test]
+fn a_file_a_drop_in_adds_is_read_by_the_host_and_never_written_by_hoh() -> R {
+    // M2T14R-02: a user's drop-in adds an environment file (credentials, a proxy); the client writes only the
+    // installation's own file, the host gets both.
+    let (manager, project) = installed(false)?;
+    let unit = unit_of(&project);
+    let user = manager.home().join(".config/agent.env");
+    std::fs::write(&user, "AGENT_SENTINEL=preserve-me\n")?;
+    dropin(
+        &manager,
+        "agent.conf",
+        &format!("[Service]\nEnvironmentFile={}\n", user.display()),
+    )?;
+    let out = hoh_in(
+        &manager,
+        &project,
+        None,
+        &["-p", "x", "--detach", "--output", "json"],
+    )?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(
+        std::fs::read_to_string(&user)?,
+        "AGENT_SENTINEL=preserve-me\n"
+    );
+    let main: u32 = manager.property(&unit, "MainPID")?.parse()?;
+    let vars = environ(main)?;
+    assert!(
+        vars.iter().any(|v| v == "AGENT_SENTINEL=preserve-me"),
+        "{vars:?}"
+    );
+    assert!(
+        vars.iter()
+            .any(|v| v == &format!("HOH_PROJECT={}", project.display())),
+        "{vars:?}"
+    );
+    assert_eq!(
+        host_json(&project).ok_or("host.json")?["supervisor"],
+        unit.as_str()
+    );
+    Ok(())
+}
+
+#[test]
+fn a_drop_in_that_replaces_the_installations_file_keeps_hoh_from_the_unit_and_from_writing_it() -> R
+{
+    // M2T14R-02: with the installation's file replaced by the user's, `__unit enable` refuses and the client starts
+    // its host another way, saying why; the user's file is never written.
+    let (manager, project) = installed(false)?;
+    let unit = unit_of(&project);
+    let user = manager.home().join(".config/agent.env");
+    std::fs::write(&user, "AGENT_SENTINEL=preserve-me\n")?;
+    dropin(
+        &manager,
+        "agent.conf",
+        &format!(
+            "[Service]\nEnvironmentFile=\nEnvironmentFile={}\n",
+            user.display()
+        ),
+    )?;
+    let bundle = manager.root().join("bundle/hoh");
+    let out = manager.install(&bundle, &["--project", project.to_str().ok_or("path")?])?;
+    assert_eq!(out.status.code(), Some(69), "{}", text(&out));
+    assert!(String::from_utf8(out.stderr)?.contains("does not read"));
+    let out = hoh_in(
+        &manager,
+        &project,
+        None,
+        &["-p", "x", "--detach", "--output", "json"],
+    )?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let info = host_json(&project).ok_or("host.json")?;
+    assert!(info["supervisor"].is_null(), "{info}");
+    assert!(
+        info["supervision_reason"]
+            .as_str()
+            .is_some_and(|why| why.contains("does not read")),
+        "{info}"
+    );
+    assert_eq!(manager.property(&unit, "ActiveState")?, "inactive");
+    assert_eq!(
+        std::fs::read_to_string(&user)?,
+        "AGENT_SENTINEL=preserve-me\n"
+    );
+    assert!(!manager.data().join("hoh/hosts").exists());
+    Ok(())
+}
+
+#[test]
+fn the_uninstall_removes_nothing_a_drop_in_points_at() -> R {
+    // M2T14R-01: a drop-in points the instance's environment file into the project's .hoh/; the uninstall removes only
+    // what the installer wrote, never a directory taken from the manager's configuration.
+    let (manager, project) = installed(true)?;
+    let hoh = project.join(".hoh");
+    std::fs::create_dir_all(&hoh)?;
+    std::fs::write(hoh.join("state.db"), "sentinel")?;
+    std::fs::write(hoh.join("host.env"), "HOH_PROJECT=/elsewhere\n")?;
+    dropin(
+        &manager,
+        "elsewhere.conf",
+        &format!(
+            "[Service]\nEnvironmentFile=\nEnvironmentFile={}/host.env\n",
+            hoh.display()
+        ),
+    )?;
+    let bundle = manager.root().join("bundle/hoh");
+    let out = manager.install(&bundle, &["--uninstall"])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(std::fs::read_to_string(hoh.join("state.db"))?, "sentinel");
+    assert_eq!(
+        std::fs::read_to_string(hoh.join("host.env"))?,
+        "HOH_PROJECT=/elsewhere\n"
+    );
+    assert!(!manager.data().join("hoh").exists());
+    assert!(!manager.home().join(".local/bin/hoh").exists());
+    Ok(())
+}
+
+#[test]
+fn the_uninstall_removes_nothing_while_an_instance_did_not_stop_or_a_host_runs_the_installation()
+-> R {
+    // M2T14R-03: a disable that fails (a stand-in systemctl refuses it), then a host started directly from the
+    // installed binary: each time the uninstall ends with 69 and removes nothing; once nothing runs, it completes.
+    let (mut manager, project) = installed(true)?;
+    let unit = unit_of(&project);
+    let out = manager.systemctl(&["start", &unit])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let pid = ready_under_the_unit(&mut manager, &unit, &project)?;
+    let bundle = manager.root().join("bundle/hoh");
+    let installed_paths = [
+        manager.home().join(".local/bin/hoh"),
+        manager.data().join("hoh/current"),
+        manager.data().join("systemd/user/hoh-host@.service"),
+        hoh_app::unit::instance_file(
+            &manager.data().join("hoh"),
+            &hoh_app::unit::instance(&project),
+        ),
+    ];
+    let stand_in = manager.bin().join("systemctl");
+    installed::script(
+        &stand_in,
+        "#!/bin/sh\ncase \" $* \" in *\" disable \"*) echo 'refused' >&2; exit 1;; esac\nexec /usr/bin/systemctl \"$@\"\n",
+    )?;
+    let out = manager.install(&bundle, &["--uninstall"])?;
+    assert_eq!(out.status.code(), Some(69), "{}", text(&out));
+    assert!(
+        !String::from_utf8(out.stdout.clone())?.contains("stopped and disabled"),
+        "{}",
+        text(&out)
+    );
+    for path in &installed_paths {
+        assert!(path.exists(), "{} removed", path.display());
+    }
+    assert_eq!(manager.property(&unit, "MainPID")?, pid.to_string());
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe"))?;
+    assert!(
+        !exe.to_string_lossy().ends_with(" (deleted)"),
+        "{}",
+        exe.display()
+    );
+    std::fs::remove_file(&stand_in)?;
+    // Stopped now, but a host started directly from the installation runs.
+    let out = manager.systemctl(&["stop", &unit])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let mut direct = manager
+        .command(manager.data().join("hoh/current/bin/hoh"))
+        .arg("__host")
+        .arg(&project)
+        .current_dir(&project)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    let direct_pid = direct.id();
+    manager.wait_until("the direct host", Duration::from_secs(30), |_| {
+        Ok(host_json(&project).and_then(|h| h["pid"].as_u64()) == Some(u64::from(direct_pid)))
+    })?;
+    let out = manager.install(&bundle, &["--uninstall"])?;
+    assert_eq!(out.status.code(), Some(69), "{}", text(&out));
+    assert!(
+        String::from_utf8(out.stderr.clone())?.contains(&format!("pid {direct_pid}")),
+        "{}",
+        text(&out)
+    );
+    for path in &installed_paths[..3] {
+        assert!(path.exists(), "{} removed", path.display());
+    }
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(i32::try_from(direct_pid)?).ok_or("pid")?,
+        rustix::process::Signal::TERM,
+    )?;
+    let _ = direct.wait();
+    let out = manager.install(&bundle, &["--uninstall"])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    for path in &installed_paths {
+        assert!(
+            !path.exists() && !path.is_symlink(),
+            "{} left",
+            path.display()
+        );
+    }
+    assert!(project.join(".hoh/state.db").is_file());
+    Ok(())
+}
+
+#[test]
+fn a_start_still_running_at_the_clients_deadline_is_reported_as_such_and_goes_on() -> R {
+    // M2T14R-52: after a crash the manager first stops what the previous host left (up to TimeoutStopSec, 15 s); a
+    // start that has not finished by the client's 10 s is not a refusal. Here a drop-in makes the start take 12 s.
+    let (mut manager, project) = installed(true)?;
+    let unit = unit_of(&project);
+    dropin(
+        &manager,
+        "slow.conf",
+        "[Service]\nExecStartPre=/bin/sleep 12\n",
+    )?;
+    let started = std::time::Instant::now();
+    let out = hoh_in(
+        &manager,
+        &project,
+        None,
+        &["-p", "x", "--detach", "--output", "json"],
+    )?;
+    let took = started.elapsed();
+    assert_eq!(out.status.code(), Some(69), "{}", text(&out));
+    assert!(took < Duration::from_secs(12), "{took:?}");
+    let stderr = String::from_utf8(out.stderr)?;
+    assert!(stderr.contains("did not finish starting"), "{stderr}");
+    assert!(!stderr.contains(" failed (Result="), "{stderr}");
+    // The start went on in the manager: the host is up once it is done.
+    ready_under_the_unit(&mut manager, &unit, &project)?;
+    Ok(())
+}
+
+#[test]
+fn a_host_its_unit_ends_with_a_refusal_ends_the_client_with_78_and_the_hosts_line() -> R {
+    // M2T14R-53 (ADR-023 decision 6, M2T06R-60): a host that refuses its database (here newer than it knows: 78, not
+    // restarted) ends the client with 78 and its line, as a host started directly does; a client that judged the
+    // unit's end without its exit status would say 69.
+    let (mut manager, project) = installed(true)?;
+    let unit = unit_of(&project);
+    let out = manager.systemctl(&["start", &unit])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    ready_under_the_unit(&mut manager, &unit, &project)?;
+    let out = manager.systemctl(&["stop", &unit])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let set = std::process::Command::new("python3")
+        .args([
+            "-c",
+            "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute('PRAGMA user_version = 999'); c.commit()",
+        ])
+        .arg(project.join(".hoh/state.db"))
+        .status()?;
+    assert!(set.success());
+    let out = hoh_in(
+        &manager,
+        &project,
+        None,
+        &["-p", "x", "--detach", "--output", "json"],
+    )?;
+    assert_eq!(out.status.code(), Some(78), "{}", text(&out));
+    let said = std::fs::read_to_string(manager.runtime().join(format!(
+        "hoh-host@{}.stderr",
+        hoh_app::unit::instance(&project)
+    )))?;
+    let last = said
+        .lines()
+        .rfind(|l| !l.trim().is_empty())
+        .ok_or("the host said nothing")?;
+    let stderr = String::from_utf8(out.stderr)?;
+    assert!(stderr.contains(last), "client: {stderr}\nhost: {said}");
+    assert_eq!(manager.property(&unit, "ExecMainStatus")?, "78");
+    assert_eq!(manager.property(&unit, "NRestarts")?, "0");
     Ok(())
 }
