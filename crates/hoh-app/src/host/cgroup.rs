@@ -703,8 +703,8 @@ mod tests {
 
     #[test]
     fn a_cgroups_subtree_is_every_cgroup_below_it_and_goes_bottom_up() -> R {
-        // M2T06R-651 (decision 8d v7): SIGTERM goes to every cgroup below the attempt's, however deep, and a proved
-        // cgroup is removed with all of them, the deepest first.
+        // M2T06R-651 (decision 8d v7): the walk SIGTERM and the removal share reaches every cgroup below the attempt's,
+        // however deep, and a proved cgroup is removed with all of them, the deepest first.
         let root = tempfile::tempdir()?;
         let at = root.path().join("attempt-0123456789abcdef");
         let deepest = at.join("a").join("b").join("c");
@@ -836,6 +836,54 @@ mod tests {
             },
             "members not read"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_process_listed_by_a_cgroup_but_not_in_it_gets_no_sigterm() -> R {
+        // M2T06R-1152: a member is signalled only when its own /proc/<pid>/cgroup puts it in the subtree (a pid that
+        // ended and was reused is not the member it was): a live process listed here, but in another cgroup, lives.
+        use std::os::unix::process::CommandExt as _;
+        let root = tempfile::tempdir()?;
+        let at = root.path().join("attempt-0123456789abcdef");
+        std::fs::create_dir_all(&at)?;
+        let mut other = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()?;
+        std::fs::write(at.join("cgroup.procs"), format!("{}\n", other.id()))?;
+        let group = AttemptGroup::witnessed(root.path(), &at)?;
+        let termed = group.terminate();
+        std::thread::sleep(Duration::from_millis(100));
+        let lived = other.try_wait()?.is_none();
+        let _ = other.kill();
+        let _ = other.wait();
+        assert_eq!(
+            termed,
+            Termed {
+                sent: false,
+                whole: true
+            }
+        );
+        assert!(lived, "a process of another cgroup got SIGTERM");
+        Ok(())
+    }
+
+    #[test]
+    fn a_mount_root_other_than_the_recorded_one_proves_nothing() -> R {
+        // M2T06R-1152: the mount root is checked like every directory on the way: another directory of the same file
+        // system there is not the recorded mount, and proves nothing (only below the root does a successor prove a
+        // removal).
+        let root = tempfile::tempdir()?;
+        let at = root.path().join("attempt-0123456789abcdef");
+        std::fs::create_dir_all(&at)?;
+        std::fs::write(at.join("cgroup.events"), b"populated 0\n")?;
+        let mut group = AttemptGroup::witnessed(root.path(), &at)?;
+        assert_eq!(group.proof(), Proof::Done, "as recorded");
+        if let Some(witness) = group.witness.as_mut() {
+            witness.chain[0].1 += 1;
+        }
+        assert_eq!(group.proof(), Proof::Incomplete);
         Ok(())
     }
 
