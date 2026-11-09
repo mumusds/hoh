@@ -660,6 +660,16 @@ async fn test_018_03_each_role_has_its_own_session_and_an_agents_exit_changes_no
         )
         .await?;
         let pid = query(&project, "SELECT pid FROM attempts WHERE attempt_id = 'T-dev/attempt-1'")?;
+        // The pid is recorded once the turn started, before the fake's first lines ran: it is killed only once it
+        // wrote what it was started with (its env, with the attempt's marker, comes before its stdin).
+        let wrote = world.bin().join(format!("claude.d/stdin.{pid}"));
+        let end = Instant::now() + limit;
+        while !wrote.exists() {
+            if Instant::now() > end {
+                return Err(format!("the developer's turn never wrote {}", wrote.display()).into());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         let killed = Command::new("kill").args(["-KILL", &pid]).status()?;
         assert!(killed.success(), "kill {pid}");
         until(
