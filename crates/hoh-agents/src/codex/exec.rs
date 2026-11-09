@@ -5,7 +5,7 @@ use super::{
     Ending, Mode, Outcome, Steer, SteerReceipt, Turn, failure_of, hard_stop, hashes,
     interrupt_first, is_text_item, verdict,
 };
-use crate::adapter::{AdapterError, AttemptRef, finish, now, step};
+use crate::adapter::{AdapterError, AttemptRef, Recorder, Stop, finish, now, step};
 use crate::frame::Frame;
 use crate::known;
 use crate::process::{Cause, Config, Event, Process};
@@ -15,6 +15,26 @@ use serde_json::{Value, json};
 use std::process::Command;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
+
+/// The raw log files of an exec turn.
+pub(super) fn logs(turn: &Turn) -> (std::path::PathBuf, std::path::PathBuf) {
+    (
+        turn.logs.join("exec.stdout.jsonl"),
+        turn.logs.join("exec.stderr.log"),
+    )
+}
+
+/// The process settings of an exec turn: interrupt first, the turn's deadline.
+pub(super) fn config(turn: &Turn) -> Config {
+    let (stdout, stderr) = logs(turn);
+    Config {
+        escalation: interrupt_first(turn.escalation),
+        deadline: turn.deadline,
+        stdout_copy: Some(stdout),
+        stderr_copy: Some(stderr),
+        ..Config::default()
+    }
+}
 
 pub(super) async fn run(
     store: &Store,
@@ -26,21 +46,10 @@ pub(super) async fn run(
     steers: &mut mpsc::Receiver<Steer>,
 ) -> Result<Outcome, AdapterError> {
     use AttemptState::*;
-    let id = &attempt.attempt_id;
-    let (stdout, stderr) = (
-        turn.logs.join("exec.stdout.jsonl"),
-        turn.logs.join("exec.stderr.log"),
-    );
+    let (stdout, stderr) = logs(turn);
     let mut command = Command::new(&turn.launch.program);
     command.args(&args).current_dir(&turn.launch.cwd);
-    let config = Config {
-        escalation: interrupt_first(turn.escalation),
-        deadline: turn.deadline,
-        stdout_copy: Some(stdout.clone()),
-        stderr_copy: Some(stderr.clone()),
-        ..Config::default()
-    };
-    let mut process = match Process::spawn(command, config) {
+    let mut process = match Process::spawn(command, config(turn)) {
         Ok(p) => p,
         Err(e) => {
             finish(
@@ -68,16 +77,112 @@ pub(super) async fn run(
         crate::identity::running_pid(pid),
     )
     .await?;
-    let input = process.take_stdin();
+    let capabilities = super::session(attempt, turn, false, None).capabilities;
+    let mut recorder = Recorder::Store {
+        store,
+        attempt,
+        agent: "codex",
+        capabilities: &capabilities,
+    };
+    let driven = drive(
+        &mut recorder,
+        attempt,
+        turn,
+        &mut process,
+        turn.prompt.as_bytes().to_vec(),
+        Stop::Latch(cancel),
+        steers,
+    )
+    .await?;
+    let state = finish(
+        store,
+        attempt,
+        Running,
+        driven.state,
+        AttemptFacts {
+            ended_at: now(),
+            failure_reason: driven.failure.clone(),
+            cancel_requested: Some(driven.cancelled),
+            usage: driven.usage.clone(),
+            ..AttemptFacts::default()
+        },
+        cancel,
+    )
+    .await?;
+    let (stdout_sha256, stderr_sha256) = hashes(&stdout, &stderr)?;
+    let exit = driven.report.as_ref().and_then(|r| r.status);
+    Ok(Outcome {
+        failure: if state == Cancelled {
+            None
+        } else {
+            driven.failure
+        },
+        state,
+        mode: Mode::Exec,
+        args,
+        native_session: driven.thread_id,
+        turn_id: None,
+        model: None,
+        status: driven.status,
+        reply: driven.reply,
+        exit,
+        stdout,
+        stderr,
+        stdout_sha256,
+        stderr_sha256,
+        items: driven.items,
+        unknown_events: driven.unknown,
+        degraded: Some(degraded),
+        pid: Some(pid),
+        max_buffered: driven.report.as_ref().map(|r| r.stdout.max_buffered),
+        steps: driven.report.map(|r| r.steps).unwrap_or_default(),
+    })
+}
+
+/// What an exec turn showed, and the adapter's verdict.
+pub(super) struct Driven {
+    pub(super) state: AttemptState,
+    pub(super) failure: Option<String>,
+    pub(super) cancelled: bool,
+    pub(super) thread_id: Option<String>,
+    pub(super) usage: Option<Value>,
+    pub(super) status: Option<String>,
+    pub(super) reply: Option<String>,
+    pub(super) items: usize,
+    pub(super) unknown: usize,
+    pub(super) report: Option<crate::process::ExitReport>,
+}
+
+/// Write `input` and read one exec turn's output until its process ended, recording what it shows; a cancel from
+/// `stop` interrupts it (the direct mode then escalates as the turn's plan says; the runner's sends SIGINT only).
+pub(super) async fn drive(
+    recorder: &mut Recorder<'_>,
+    attempt: &AttemptRef,
+    turn: &Turn,
+    process: &mut Process,
+    input: Vec<u8>,
+    stop: Stop<'_>,
+    steers: &mut mpsc::Receiver<Steer>,
+) -> Result<Driven, AdapterError> {
+    use AttemptState::*;
+    let id = &attempt.attempt_id;
+    let cancel_now = |process: &Process| {
+        if stop.is_native() {
+            process.signal_leader(crate::process::Signal::Interrupt);
+        } else {
+            process.cancel(interrupt_first(turn.escalation));
+        }
+    };
+    let pipe = process.take_stdin();
     let mut feed = std::pin::pin!(async {
-        let mut input = input.ok_or_else(|| std::io::Error::other("no stdin pipe"))?;
-        input.write_all(turn.prompt.as_bytes()).await?;
-        input.shutdown().await
+        let mut pipe = pipe.ok_or_else(|| std::io::Error::other("no stdin pipe"))?;
+        pipe.write_all(&input).await?;
+        pipe.shutdown().await
     });
     let mut fed: Option<std::io::Result<()>> = None;
-    let mut cancelled = cancel.is_requested();
+    let mut cancelled = stop.requested_now();
     if cancelled {
-        process.cancel(interrupt_first(turn.escalation));
+        cancel_now(process);
     }
     let (mut thread_id, mut usage) = (None::<String>, None::<Value>);
     let (mut status, mut error, mut reply) = (None::<String>, None::<Value>, None::<String>);
@@ -87,9 +192,9 @@ pub(super) async fn run(
     let report = loop {
         let event = tokio::select! {
             biased;
-            () = cancel.requested(), if !cancelled => {
+            () = stop.requested(), if !cancelled => {
                 cancelled = true;
-                process.cancel(interrupt_first(turn.escalation));
+                cancel_now(process);
                 continue;
             }
             written = &mut feed, if fed.is_none() => {
@@ -111,9 +216,8 @@ pub(super) async fn run(
             Some(Event::Frame(Frame::TooLarge(refused))) => {
                 too_large = true;
                 process.cancel(hard_stop(turn.escalation));
-                store
-                    .attempt_event(
-                        id,
+                recorder
+                    .event(
                         "exec-frame-too-large",
                         "adapter.diagnostic",
                         json!({"attempt_id": id, "reason": "PROTOCOL_FRAME_TOO_LARGE",
@@ -131,9 +235,8 @@ pub(super) async fn run(
             .filter(Value::is_object)
         else {
             diagnostics += 1;
-            store
-                .attempt_event(
-                    id,
+            recorder
+                .event(
                     &format!("exec-diagnostic-{diagnostics}"),
                     "adapter.diagnostic",
                     json!({"attempt_id": id, "reason": "stdout line is not a JSON object", "bytes": line.len(),
@@ -146,17 +249,16 @@ pub(super) async fn run(
         match kind {
             "thread.started" => {
                 thread_id = frame["thread_id"].as_str().map(str::to_owned);
-                store
-                    .upsert_session(super::session(attempt, turn, false, thread_id.clone()))
-                    .await?;
+                if let Some(thread) = &thread_id {
+                    recorder.native_session(thread).await?;
+                }
             }
             "item.started" | "item.completed" => {
                 items += 1;
                 let item = &frame["item"];
                 let item_type = item["type"].as_str().unwrap_or_default();
-                store
-                    .attempt_event(
-                        id,
+                recorder
+                    .event(
                         &format!("exec-item-{items}"),
                         "adapter.item",
                         json!({"attempt_id": id, "method": kind, "threadId": thread_id, "turnId": null,
@@ -182,9 +284,8 @@ pub(super) async fn run(
                 errors += 1;
                 let message = frame["message"].as_str().unwrap_or_default();
                 auth_hint |= message.contains("unexpected status 401");
-                store
-                    .attempt_event(
-                        id,
+                recorder
+                    .event(
                         &format!("exec-error-{errors}"),
                         "adapter.error",
                         json!({"attempt_id": id, "error": {"message": message}}),
@@ -195,9 +296,8 @@ pub(super) async fn run(
             _ if known::codex_exec().contains(kind) => {}
             _ => {
                 unknown += 1;
-                store
-                    .attempt_event(
-                        id,
+                recorder
+                    .event(
                         &format!("exec-unknown-{unknown}"),
                         "adapter.unknown_event",
                         json!({"attempt_id": id, "method": kind, "key": kind,
@@ -211,9 +311,8 @@ pub(super) async fn run(
         r.stdout.error.is_some() || r.stderr.error.is_some() || !r.stdout.eof || !r.stderr.eof
     });
     if logs_incomplete && let Some(r) = &report {
-        store
-            .attempt_event(
-                id,
+        recorder
+            .event(
                 "exec-raw-log-incomplete",
                 "adapter.diagnostic",
                 json!({"attempt_id": id, "reason": "RAW_LOG_INCOMPLETE",
@@ -246,9 +345,8 @@ pub(super) async fn run(
     };
     if status.as_deref() == Some("failed") {
         let reason = failure_of(error.as_ref(), auth_hint);
-        store
-            .attempt_event(
-                id,
+        recorder
+            .event(
                 "exec-turn-failed",
                 "adapter.turn_failed",
                 json!({"attempt_id": id, "status": status, "error": error,
@@ -257,42 +355,16 @@ pub(super) async fn run(
             )
             .await?;
     }
-    let state = finish(
-        store,
-        attempt,
-        Running,
+    Ok(Driven {
         state,
-        AttemptFacts {
-            ended_at: now(),
-            failure_reason: failure.clone(),
-            cancel_requested: Some(cancelled),
-            usage,
-            ..AttemptFacts::default()
-        },
-        cancel,
-    )
-    .await?;
-    let (stdout_sha256, stderr_sha256) = hashes(&stdout, &stderr)?;
-    Ok(Outcome {
-        failure: if state == Cancelled { None } else { failure },
-        state,
-        mode: Mode::Exec,
-        args,
-        native_session: thread_id,
-        turn_id: None,
-        model: None,
+        failure,
+        cancelled,
+        thread_id,
+        usage,
         status,
         reply,
-        exit,
-        stdout,
-        stderr,
-        stdout_sha256,
-        stderr_sha256,
         items,
-        unknown_events: unknown,
-        degraded: Some(degraded),
-        pid: Some(pid),
-        max_buffered: report.as_ref().map(|r| r.stdout.max_buffered),
-        steps: report.map(|r| r.steps).unwrap_or_default(),
+        unknown,
+        report,
     })
 }

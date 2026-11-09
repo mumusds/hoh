@@ -18,7 +18,7 @@
 //! stdout and the cancel are driven together, so a child that never reads its prompt cannot hold up a cancel.
 
 pub use crate::adapter::{AdapterError, AttemptRef, Facts, GateCommand, Held, Recorded, Refused};
-use crate::adapter::{Recorder, finish, now, offers, sha256_file, step};
+use crate::adapter::{Recorder, Stop, finish, now, offers, sha256_file, step};
 use crate::frame::Frame;
 use crate::known;
 use crate::process::{Cause, Config, Escalation, Event, Process, Signal, Step, Termination};
@@ -402,6 +402,7 @@ pub async fn run(
     };
     let driven = drive(
         &mut recorder,
+        &attempt.attempt_id,
         &mut process,
         turn.prompt.clone(),
         turn.escalation,
@@ -463,7 +464,7 @@ fn config(turn: &Turn, stdout: &std::path::Path, stderr: &std::path::Path) -> Co
 /// [`Held::open`] is sent, then the prompt on stdin; no attempt state moves and nothing is written to the store, the
 /// facts come back for the runner to record. A cancel is native only (SIGINT): the host's ladder decides SIGTERM and
 /// SIGKILL. No deadline: the runner's lease bounds the turn.
-pub fn start(turn: &Turn, gate: &GateCommand) -> Result<Held, Refused> {
+pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<Held, Refused> {
     let argv = argv(&turn.launch).map_err(|Blocked(detail)| Refused {
         code: "BLOCKED_CAPABILITY".to_owned(),
         detail,
@@ -495,22 +496,21 @@ pub fn start(turn: &Turn, gate: &GateCommand) -> Result<Held, Refused> {
     let prompt = turn.prompt.clone();
     let escalation = turn.escalation;
     let raw_log_path = turn.logs.to_string_lossy().into_owned();
+    let attempt_id = attempt.attempt_id.clone();
     let ended = tokio::spawn(async move {
-        let mut recorder = Recorder::Collect(Vec::new());
         // Nothing reaches the gate before it is opened; unopened, its input ends and the agent never runs.
-        let input = match opened.await {
-            Ok(()) => {
-                let mut input = b"go\n".to_vec();
-                input.extend_from_slice(&prompt);
-                Some(input)
-            }
-            Err(_) => None,
-        };
-        let opened = input.is_some();
+        if opened.await.is_err() {
+            let report = crate::adapter::close_gate(&mut process).await;
+            return Facts::gate_closed(raw_log_path, report.as_ref());
+        }
+        let mut input = b"go\n".to_vec();
+        input.extend_from_slice(&prompt);
+        let mut recorder = Recorder::Collect(Vec::new());
         let driven = drive(
             &mut recorder,
+            &attempt_id,
             &mut process,
-            input.unwrap_or_default(),
+            input,
             escalation,
             Stop::Native(&native),
         )
@@ -520,23 +520,9 @@ pub fn start(turn: &Turn, gate: &GateCommand) -> Result<Held, Refused> {
             Recorder::Store { .. } => Vec::new(),
         };
         let Ok(driven) = driven else {
-            return Facts {
-                state: AttemptState::Failed,
-                failure: Some("PROTOCOL_INCOMPLETE".to_owned()),
-                native_session: None,
-                resolved_model: None,
-                usage: None,
-                raw_log_path,
-                max_buffered: None,
-                group_reaped: false,
-                recorded,
-            };
+            return Facts::incomplete(raw_log_path, recorded);
         };
-        let (state, failure) = if opened {
-            driven.verdict()
-        } else {
-            (AttemptState::Failed, Some("GATE_CLOSED".to_owned()))
-        };
+        let (state, failure) = driven.verdict();
         Facts {
             state,
             failure,
@@ -547,6 +533,7 @@ pub fn start(turn: &Turn, gate: &GateCommand) -> Result<Held, Refused> {
             max_buffered: driven.report.as_ref().map(|r| r.stdout.max_buffered),
             group_reaped: driven.report.as_ref().is_some_and(|r| r.group_reaped),
             recorded,
+            degraded: None,
         }
     });
     Ok(Held {
@@ -557,33 +544,12 @@ pub fn start(turn: &Turn, gate: &GateCommand) -> Result<Held, Refused> {
     })
 }
 
-/// How a turn's cancel comes and what it does: the attempt's latch, escalating with the turn's plan (the direct
-/// mode), or a native cancel only (the runner's mode).
-enum Stop<'a> {
-    Latch(&'a CancelLatch),
-    Native(&'a tokio::sync::Notify),
-}
-
-impl Stop<'_> {
-    fn requested_now(&self) -> bool {
-        match self {
-            Stop::Latch(latch) => latch.is_requested(),
-            Stop::Native(_) => false,
-        }
-    }
-
-    async fn requested(&self) {
-        match self {
-            Stop::Latch(latch) => latch.requested().await,
-            Stop::Native(notify) => notify.notified().await,
-        }
-    }
-
-    fn act(&self, process: &Process, escalation: Escalation) {
-        match self {
-            Stop::Latch(_) => process.cancel(escalation),
-            Stop::Native(_) => process.signal_leader(Signal::Interrupt),
-        }
+/// What a cancel does to a Claude turn: the turn's plan in the direct mode, one SIGINT in the runner's.
+fn act(stop: &Stop<'_>, process: &Process, escalation: Escalation) {
+    if stop.is_native() {
+        process.signal_leader(Signal::Interrupt);
+    } else {
+        process.cancel(escalation);
     }
 }
 
@@ -625,6 +591,7 @@ impl Driven {
 /// is acted on as it comes.
 async fn drive(
     recorder: &mut Recorder<'_>,
+    attempt_id: &str,
     process: &mut Process,
     input: Vec<u8>,
     escalation: Escalation,
@@ -653,7 +620,7 @@ async fn drive(
     let mut results = 0;
     let mut unknown_records = 0;
     if driven.cancelled {
-        stop.act(process, escalation);
+        act(&stop, process, escalation);
     }
     driven.report = loop {
         // A cancel is seen before output that is ready at the same time.
@@ -661,7 +628,7 @@ async fn drive(
             biased;
             () = stop.requested(), if !driven.cancelled => {
                 driven.cancelled = true;
-                stop.act(process, escalation);
+                act(&stop, process, escalation);
                 continue;
             }
             written = &mut feed, if driven.fed.is_none() => {
@@ -711,15 +678,11 @@ async fn drive(
         let key = known::claude_key(&frame);
         if !known::is_known(known::claude(), key.as_deref()) {
             unknown_records += 1;
-            let attempt_id = match recorder {
-                Recorder::Store { attempt, .. } => attempt.attempt_id.clone(),
-                Recorder::Collect(_) => String::new(),
-            };
             recorder
                 .event(
                     &format!("unknown-{unknown_records}"),
                     "adapter.unknown_event",
-                    known::unknown_event(&attempt_id, key.as_deref(), &line, &frame),
+                    known::unknown_event(attempt_id, key.as_deref(), &line, &frame),
                 )
                 .await?;
         }
