@@ -138,6 +138,18 @@ pub struct TeamChange {
     /// The project's root, against which the prompt override files the bindings name are checked
     /// (docs/adr/ADR-022.md decision 11); none: not checked.
     pub root: Option<std::path::PathBuf>,
+    /// The project's configuration file as a whole (decision 6): its team and scheduler replace the current ones.
+    pub file: Option<FileTeam>,
+}
+
+/// The team and scheduler settings of the project's configuration file, or the built-in defaults when there is none
+/// (decision 6), already checked by the loader; `source` is `{"kind": "file", "path", "sha256"}` or
+/// `{"kind": "builtin"}`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileTeam {
+    pub team: BTreeMap<String, Role>,
+    pub scheduler: Params,
+    pub source: serde_json::Value,
 }
 
 /// In the command's transaction: the team revision `command` makes over the current one (decisions 3 and 4): stale
@@ -156,6 +168,18 @@ pub(super) fn configure(
             id: project_id.clone(),
             expected: command.expected_revision,
             actual: Some(current),
+        });
+    }
+    if let Some(file) = &change.file {
+        let next = TeamConfig {
+            team: file.team.clone(),
+            scheduler: settings(&file.scheduler),
+            source: file.source.clone(),
+        };
+        return Ok(NewRevision {
+            revision: current + 1,
+            config_json: serde_json::to_string(&next)
+                .map_err(|e| PersistError::IntegrityViolation(format!("team revision: {e}")))?,
         });
     }
     let team = match &change.bindings {
@@ -251,6 +275,32 @@ fn latest(conn: &Connection, project_id: &str) -> Result<Option<(i64, TeamConfig
         .map_err(sqlite_error)?;
     row.map(|(revision, json)| Ok((revision, parsed(project_id, revision, &json)?)))
         .transpose()
+}
+
+/// The source of the project's latest revision made from its configuration file or the built-in defaults (decision 6);
+/// none before any revision.
+pub(super) fn file_source(
+    conn: &Connection,
+    project_id: &str,
+) -> Result<Option<serde_json::Value>, PersistError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT revision, config_json FROM team_revisions WHERE project_id = ?1 AND state = 'APPLIED' \
+             ORDER BY revision DESC",
+        )
+        .map_err(sqlite_error)?;
+    let rows: Vec<(i64, String)> = statement
+        .query_map(params![project_id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(sqlite_error)?
+        .collect::<Result<_, _>>()
+        .map_err(sqlite_error)?;
+    for (revision, json) in rows {
+        let source = parsed(project_id, revision, &json)?.source;
+        if matches!(source["kind"].as_str(), Some("file" | "builtin")) {
+            return Ok(Some(source));
+        }
+    }
+    Ok(None)
 }
 
 /// The configuration of revision `revision`, if it is recorded.
@@ -410,10 +460,28 @@ pub(super) fn pending(conn: &Connection, run_id: &str, role: &str) -> Result<boo
     Ok(!verdicts(conn, run_id, role, revision)?.1)
 }
 
+/// What the host's registry knows of the agents, for a checkpoint (decisions 8 and 10): the agents found unavailable,
+/// and those not looked at yet. A host without a registry knows of none: every agent is taken as available.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Availability {
+    pub unavailable: std::collections::BTreeSet<String>,
+    pub unknown: std::collections::BTreeSet<String>,
+}
+
+impl From<std::collections::BTreeSet<String>> for Availability {
+    fn from(unavailable: std::collections::BTreeSet<String>) -> Availability {
+        Availability {
+            unavailable,
+            unknown: std::collections::BTreeSet::new(),
+        }
+    }
+}
+
 /// Run `run_id`'s checkpoint (decision 8, third version), in one transaction. A role the project's current revision
-/// does not change moves to it as it is, live attempt or not. A changed role whose new agent is among `unavailable` (the
-/// registry's, probed outside the writer) is refused: the old binding and epoch stay and keep being dispatched (REQ-019
-/// decision 2, M2T07R-150). Otherwise a changed role with an attempt PREPARED, STARTING or RUNNING waits, held from
+/// does not change moves to it as it is, live attempt or not. A changed role whose new agent was not looked at yet
+/// waits, held, with no verdict. A changed role whose new agent is unavailable (the registry's, probed outside the
+/// writer) is refused: the old binding and epoch stay and keep being dispatched (REQ-019 decision 2, M2T07R-150).
+/// Otherwise a changed role with an attempt PREPARED, STARTING or RUNNING waits, held from
 /// dispatch; one with none takes its new binding at epoch+1 with no session yet (a removed role BLOCKED, a new role
 /// bound at epoch 1) and a team.binding_applied event. A refused change is judged again at every checkpoint: each turn
 /// of the verdict (refused, or pending again once its agent is there) is one event. Once every role is at the
@@ -421,7 +489,7 @@ pub(super) fn pending(conn: &Connection, run_id: &str, role: &str) -> Result<boo
 pub(super) fn checkpoint(
     conn: &mut Connection,
     run_id: &str,
-    unavailable: &std::collections::BTreeSet<String>,
+    availability: &Availability,
     ctx: &super::writer::Ctx<'_>,
 ) -> Result<bool, PersistError> {
     let tx = super::writer::begin(conn, ctx)?;
@@ -490,8 +558,12 @@ pub(super) fn checkpoint(
             payload,
         };
         let target = wanted.team.get(&binding.role);
+        if target.is_some_and(|role| availability.unknown.contains(role.agent.as_str())) {
+            behind = true;
+            continue;
+        }
         if let Some(role) = target
-            && unavailable.contains(role.agent.as_str())
+            && availability.unavailable.contains(role.agent.as_str())
         {
             behind = true;
             if !refused {
@@ -710,6 +782,20 @@ pub(super) fn roles(
             };
             (name, contract)
         })
+        .collect())
+}
+
+/// The agents the project's current team names (its roles' agents).
+pub(super) fn agents(
+    conn: &Connection,
+    project_id: &str,
+) -> Result<std::collections::BTreeSet<String>, PersistError> {
+    let team = latest(conn, project_id)?
+        .map(|(_, config)| config.team)
+        .unwrap_or_else(|| TeamConfig::builtin().team);
+    Ok(team
+        .values()
+        .map(|role| role.agent.as_str().to_owned())
         .collect())
 }
 

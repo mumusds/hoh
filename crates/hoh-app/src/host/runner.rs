@@ -124,6 +124,27 @@ pub struct Started {
     pub ended: oneshot::Receiver<Outcome>,
 }
 
+/// Why an executor started no process for a work (docs/adr/ADR-022.md decision 12): the attempt's failure reason (a
+/// reason code for the product's, such as PROMPT_UNAVAILABLE or BLOCKED_CAPABILITY), how it failed, and what was found,
+/// kept in an `attempt.start_refused` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    pub reason: String,
+    pub class: FailureClass,
+    pub detail: Option<String>,
+}
+
+/// A refusal nothing classified (a test executor's text): transient.
+impl From<String> for Refusal {
+    fn from(detail: String) -> Refusal {
+        Refusal {
+            reason: format!("the process did not start: {detail}"),
+            class: FailureClass::Transient { retry_after: None },
+            detail: None,
+        }
+    }
+}
+
 /// Where the runner's work runs (a port: the agents of the roles come with M2-T07; tests pass their own).
 pub trait Executor: Send + Sync + std::fmt::Debug {
     /// The product's agent registry, when this executor runs the product's agents: the runner then binds sessions,
@@ -141,7 +162,7 @@ pub trait Executor: Send + Sync + std::fmt::Debug {
     /// When the leader ends, the executor SIGKILLs its process group while the leader is an unreaped zombie, reaps
     /// it, waits for the group to be empty and reports that in [`Outcome::group_gone`] (the hoh-agents substrate's
     /// order: group SIGKILL, reap, `group_gone`).
-    fn start(&self, work: &Work) -> Result<Started, String>;
+    fn start(&self, work: &Work) -> Result<Started, Refusal>;
     /// Ask `work`'s process to stop the agent's own way (its native cancel), before any signal: the first step when its
     /// lease expired (AC-041-02). It only asks and returns at once: the settle looks at the group around it
     /// (M2T05R-452).
@@ -198,15 +219,6 @@ struct Common {
 }
 
 impl Common {
-    /// The agents found unavailable, whose bindings a checkpoint does not apply (docs/adr/ADR-022.md decision 8; the
-    /// registry comes with the product executor: none yet).
-    fn unavailable(&self) -> std::collections::BTreeSet<String> {
-        self.executor
-            .registry()
-            .map(|registry| registry.unavailable())
-            .unwrap_or_default()
-    }
-
     /// A failure nothing classified (a process that did not start, an identity that could not be read): transient,
     /// at the runner's clock (ADR-020 decision 1).
     fn failed(&self, detail: String) -> Ending {
@@ -256,6 +268,10 @@ pub(super) async fn run(
         jitter,
         inflight,
     });
+    let watch = config
+        .executor
+        .registry()
+        .map(|registry| tokio::spawn(registry_watch(registry, stop.clone())));
     let mut renewed = Instant::now();
     let mut held_back: BTreeMap<String, (Instant, String)> = BTreeMap::new();
     loop {
@@ -272,6 +288,10 @@ pub(super) async fn run(
             _ = stop.changed() => break,
         }
     }
+    if let Some(watch) = watch {
+        watch.abort();
+        let _ = watch.await;
+    }
     // The host stops: the attempts in flight are left as they are (their processes run on); the next host's reconcile
     // settles them.
     let tasks: Vec<_> = common
@@ -282,6 +302,23 @@ pub(super) async fn run(
     for task in tasks {
         task.abort();
         let _ = task.await;
+    }
+}
+
+/// The registry's own loop (docs/adr/ADR-022.md decision 10): every tick it looks at the agents the runner wants, off
+/// the async workers; a probe may take its while, but neither a tick nor the host's stop waits for it.
+async fn registry_watch(registry: Arc<super::agents::Registry>, mut stop: watch::Receiver<bool>) {
+    loop {
+        let looking = registry.clone();
+        let refresh = tokio::task::spawn_blocking(move || looking.refresh());
+        tokio::select! {
+            _ = refresh => {}
+            _ = stop.changed() => break,
+        }
+        tokio::select! {
+            () = tokio::time::sleep(TICK) => {}
+            _ = stop.changed() => break,
+        }
     }
 }
 
@@ -331,14 +368,29 @@ async fn tick(
         *renewed = Instant::now();
     }
     let waiting = store.runner_waiting(&project_id).await?;
-    // The team changes whose checkpoint has come, in every run not ended that is behind the project's revision
-    // (docs/adr/ADR-022.md decision 8), before any pace or round.
-    for run in &waiting.team_behind {
-        store.team_checkpoint(run, common.unavailable()).await?;
-    }
-    // The product's agents: sessions for the bindings waiting for one, and what each role of the team needs
-    // (docs/adr/ADR-022.md decisions 9 and 10).
+    // The product's agents as the registry last saw them: it looks at the ones the team and the unbound bindings name
+    // in its own task (registry_watch), so no probe holds up a tick (docs/adr/ADR-022.md decision 10).
     let registry = common.executor.registry();
+    let availability = match &registry {
+        Some(registry) => {
+            let named: std::collections::BTreeSet<String> = waiting
+                .agents
+                .iter()
+                .cloned()
+                .chain(waiting.unbound.iter().map(|u| u.agent.clone()))
+                .collect();
+            registry.want(&named);
+            registry.availability(&waiting.agents)
+        }
+        None => hoh_core::persistence::Availability::default(),
+    };
+    // The team changes whose checkpoint has come, in every run not ended that is behind the project's revision
+    // (decision 8), before any pace or round: a change to an agent unavailable is refused, one to an agent not looked
+    // at yet waits.
+    for run in &waiting.team_behind {
+        store.team_checkpoint(run, availability.clone()).await?;
+    }
+    // Sessions for the bindings waiting for one, and what each role of the team needs (decisions 9 and 10).
     let mut context = context.clone();
     if let Some(registry) = &registry {
         super::agents::bind(
@@ -446,14 +498,19 @@ async fn attempt(
     let key = work.effect_key.clone();
     let started = match common.executor.start(&work) {
         Ok(started) => started,
-        Err(detail) => {
-            // Nothing ran: its work stays PREPARED, the attempt fails from STARTING and its task is READY again.
-            store
-                .runner_finished(
-                    &id,
-                    common.failed(format!("the process did not start: {detail}")),
-                )
-                .await?;
+        Err(refusal) => {
+            // Nothing ran: its work stays PREPARED, the attempt fails from STARTING by the refusal's class (its task
+            // READY again for a transient one).
+            let mut ending = common.failed(refusal.reason.clone());
+            ending.class = refusal.class;
+            if let Some(detail) = refusal.detail {
+                ending.observed.events.push((
+                    "start-refused".to_owned(),
+                    "attempt.start_refused".to_owned(),
+                    serde_json::json!({"attempt_id": id, "reason": refusal.reason, "detail": detail}),
+                ));
+            }
+            store.runner_finished(&id, ending).await?;
             return Ok(());
         }
     };

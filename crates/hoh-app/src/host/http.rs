@@ -14,8 +14,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use futures_util::stream::{self, Stream};
 use hoh_core::persistence::{
-    CommandOutcome, EventRow, NewEvent, NewOutbox, PersistError, Reader, RunTarget, Store,
-    SubmitCommand, TeamChange,
+    CommandOutcome, EventRow, FileTeam, NewEvent, NewOutbox, PersistError, Reader, RunTarget,
+    Store, SubmitCommand, TeamChange,
 };
 use hoh_core::protocol::{self, Command, CommandBody, RunState};
 use serde_json::{Value, json};
@@ -41,8 +41,6 @@ pub(super) struct Shared {
     /// The host's own cgroup if it is delegated: attempts are then tracked by cgroups of their own
     /// (docs/adr/ADR-021.md decision 8d v5 to v7).
     pub(super) cgroups: Option<super::cgroup::Delegated>,
-    /// The budget a new run gets (docs/adr/ADR-022.md decision 7).
-    pub(super) budget: hoh_core::config::Budget,
     /// The project's root (prompt override files are checked against it, docs/adr/ADR-022.md decision 11).
     pub(super) root: std::path::PathBuf,
 }
@@ -382,6 +380,147 @@ async fn team_revision(shared: &Arc<Shared>) -> Option<i64> {
         .ok()
 }
 
+/// The project's configuration file as a team revision (docs/adr/ADR-022.md decision 6), read at the host's start and at
+/// each StartRun: when the file (or, without one, the built-in defaults) differs from the latest revision made from it,
+/// its whole team becomes the next revision, through the same store path as a ConfigureTeam, its command
+/// `config-file/<sha256>/<base revision>`. An invalid file changes nothing: one `config.invalid` event per file content,
+/// and the error for StartRun to refuse with (REQ-018 failure mode 5).
+pub(super) async fn sync_config(
+    shared: &Arc<Shared>,
+) -> Result<hoh_core::config::Config, hoh_core::config::ConfigError> {
+    let root = shared.root.clone();
+    let loaded = tokio::task::spawn_blocking(move || hoh_core::config::load_file(&root))
+        .await
+        .unwrap_or_else(|e| {
+            Err(hoh_core::config::ConfigError {
+                file: None,
+                key: None,
+                line: None,
+                column: None,
+                message: format!("the file could not be read: {e}"),
+            })
+        });
+    let sha = |text: &[u8]| -> String {
+        Sha256::digest(text)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    };
+    let (config, text) = match loaded {
+        Ok(found) => found,
+        Err(error) => {
+            let content =
+                std::fs::read(shared.root.join(hoh_core::config::FILE)).unwrap_or_default();
+            let event_id = format!("config-invalid/{}", sha(&content));
+            let project = shared.project_id.clone();
+            let seen = {
+                let id = event_id.clone();
+                read(shared, move |reader| reader.event_exists(&project, &id))
+                    .await
+                    .unwrap_or(false)
+            };
+            if !seen {
+                let commit = hoh_core::persistence::Commit {
+                    events: vec![NewEvent {
+                        project_id: shared.project_id.clone(),
+                        event_id,
+                        run_id: None,
+                        kind: "config.invalid".to_owned(),
+                        payload: json!({
+                            "path": error.file.as_ref().map(|f| f.display().to_string()),
+                            "key_path": error.key, "line": error.line, "column": error.column,
+                            "message": error.message,
+                        }),
+                    }],
+                    ..hoh_core::persistence::Commit::default()
+                };
+                if let Err(e) = shared.store.commit(commit).await {
+                    log(&format!("config.invalid could not be recorded: {e}"));
+                }
+            }
+            return Err(error);
+        }
+    };
+    let source = match &text {
+        Some(text) => {
+            json!({"kind": "file", "path": hoh_core::config::FILE, "sha256": sha(text.as_bytes())})
+        }
+        None => json!({"kind": "builtin"}),
+    };
+    // Another host life, or a StartRun at the same time, may have made it already: the command is then a replay.
+    for _ in 0..3 {
+        let project = shared.project_id.clone();
+        let latest = read(shared, move |reader| {
+            Ok((
+                reader.team_file_source(&project)?,
+                reader.team_revision(&project)?,
+            ))
+        })
+        .await;
+        let Ok((made, base)) = latest else {
+            break;
+        };
+        if made.as_ref().unwrap_or(&json!({"kind": "builtin"})) == &source {
+            break;
+        }
+        let tag = source["sha256"].as_str().unwrap_or("builtin").to_owned();
+        let command_id = format!("config-file/{tag}/{base}");
+        let payload = json!({"source": source});
+        let submit = SubmitCommand {
+            command_id: command_id.clone(),
+            idempotency_key: command_id.clone(),
+            kind: "ConfigureTeam".to_owned(),
+            run_id: String::new(),
+            expected_revision: base,
+            payload: payload.clone(),
+            payload_sha256: sha(payload.to_string().as_bytes()),
+            target: RunTarget::Team(TeamChange {
+                bindings: None,
+                scheduler: None,
+                root: None,
+                file: Some(FileTeam {
+                    team: config.team.clone(),
+                    scheduler: config.scheduler,
+                    source: source.clone(),
+                }),
+            }),
+            event: NewEvent {
+                project_id: shared.project_id.clone(),
+                event_id: command_id.clone(),
+                run_id: None,
+                kind: "team.configured".to_owned(),
+                payload: json!({"command_id": command_id, "revision": base + 1, "source": source}),
+            },
+            outbox: None,
+        };
+        match shared.store.submit_command(submit).await {
+            Err(PersistError::StaleRevision { .. }) => continue,
+            Err(e) => {
+                log(&format!("the configuration file could not be applied: {e}"));
+                break;
+            }
+            Ok(_) => break,
+        }
+    }
+    Ok(config)
+}
+
+/// A StartRun refused for the project's invalid configuration file (REQ-018 failure mode 5): 400 INVALID_TEAM_CONFIG
+/// with the file's path, the key path, line and column, and the team's revision.
+async fn config_refused(shared: &Arc<Shared>, e: &hoh_core::config::ConfigError) -> Response {
+    let body = json!({
+        "code": "INVALID_TEAM_CONFIG",
+        "message": e.message,
+        "retryable": false,
+        "current_revision": team_revision(shared).await,
+        "details": {
+            "path": e.file.as_ref().map(|f| f.display().to_string()),
+            "key_path": e.key, "line": e.line, "column": e.column,
+        },
+    });
+    (StatusCode::BAD_REQUEST, axum::Json(body)).into_response()
+}
+
 /// The revision of `run_id` now, for a conflict's `current_revision`.
 async fn current_revision(shared: &Arc<Shared>, run_id: &str) -> Option<i64> {
     let run_id = run_id.to_owned();
@@ -557,6 +696,15 @@ async fn submit_command(
             );
         }
     };
+    // A new run takes the project's configuration file as it is now: an invalid one refuses it, the last revision
+    // staying (docs/adr/ADR-022.md decision 6, REQ-018 failure mode 5).
+    let mut effective = None;
+    if matches!(command.body, CommandBody::StartRun(_)) {
+        match sync_config(&shared).await {
+            Ok(config) => effective = Some(config),
+            Err(e) => return config_refused(&shared, &e).await,
+        }
+    }
     // The control commands (docs/adr/ADR-021.md decisions 5, 7, 8): their kind, where the run moves, the event's kind
     // and payload, and the runtime notice for the host loop (ADR-016 decision 5, ADR-018 decision 4).
     let kind = command.kind();
@@ -567,7 +715,10 @@ async fn submit_command(
                 "StartRun",
                 RunTarget::Start {
                     mode: mode.clone(),
-                    budget: shared.budget.clone(),
+                    budget: effective.map_or_else(
+                        || hoh_core::config::Config::default().budget,
+                        |config| config.budget,
+                    ),
                 },
                 "run.created",
                 None,
@@ -595,6 +746,7 @@ async fn submit_command(
                 bindings: team.bindings.clone().map(Value::Object),
                 scheduler: team.scheduler.clone(),
                 root: Some(shared.root.clone()),
+                file: None,
             }),
             "team.configured",
             None,

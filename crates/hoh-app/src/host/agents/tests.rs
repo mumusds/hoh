@@ -34,7 +34,8 @@ fn runs(dir: &Path) -> usize {
 #[test]
 fn an_agent_is_probed_once_until_its_files_change_and_a_missing_one_is_unavailable() -> R {
     // docs/adr/ADR-022.md decision 10: the registry probes lazily and caches by the launcher's and implementation's
-    // identity; an agent not on PATH is unavailable.
+    // identity; an agent not on PATH, or not an agent, is unavailable; what was seen is read without looking again,
+    // an agent never looked at is unknown until the wanted ones are refreshed.
     let dir = tempfile::tempdir()?;
     fake_claude(dir.path(), "first")?;
     let registry = Registry::new(format!("{}:/usr/bin:/bin", dir.path().display()).into());
@@ -51,8 +52,32 @@ fn an_agent_is_probed_once_until_its_files_change_and_a_missing_one_is_unavailab
         runs(dir.path()) > probed,
         "a changed launcher was not probed again"
     );
+    let after = runs(dir.path());
     assert!(registry.look(Agent::Codex).is_err());
-    assert_eq!(registry.unavailable(), ["codex".to_owned()].into());
+    assert!(matches!(registry.seen(Agent::Codex), Some(Err(_))));
+    assert_eq!(registry.seen(Agent::Pi), None);
+    let named: BTreeSet<String> = [
+        "claude".to_owned(),
+        "codex".to_owned(),
+        "gpt".to_owned(),
+        "pi".to_owned(),
+    ]
+    .into();
+    let known = registry.availability(&named);
+    assert_eq!(
+        known.unavailable,
+        ["codex".to_owned(), "gpt".to_owned()].into()
+    );
+    assert_eq!(known.unknown, ["pi".to_owned()].into());
+    registry.want(&named);
+    registry.refresh();
+    assert_eq!(runs(dir.path()), after, "looked at unchanged, probed again");
+    let known = registry.availability(&named);
+    assert_eq!(
+        known.unavailable,
+        ["codex".to_owned(), "gpt".to_owned(), "pi".to_owned()].into()
+    );
+    assert!(known.unknown.is_empty());
     let capabilities = ready.session_capabilities(Agent::Claude, dir.path())?;
     assert_eq!(capabilities["structured_events"], true);
     Ok(())

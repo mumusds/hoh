@@ -77,9 +77,20 @@ fn host(args: &[OsString]) -> u8 {
             return 1;
         }
     };
-    let config = hoh_app::host::HostConfig::new(&project);
+    // The product's host: its runner runs the roles' agents found on its PATH, started through this binary's start gate
+    // (docs/adr/ADR-022.md decision 17).
+    let effective = match hoh_core::config::load(&project) {
+        Ok(effective) => effective,
+        Err(e) => {
+            say!("hoh host: the project's configuration is not used: {e}");
+            hoh_core::config::Config::default()
+        }
+    };
+    let gate = std::env::current_exe().unwrap_or_else(|_| "hoh".into());
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let config = hoh_app::host::HostConfig::product(&project, effective, gate, path);
     let log = project.join(".hoh/host.log");
-    runtime.block_on(hoh_app::host::run_ready(config, move || {
+    let code = runtime.block_on(hoh_app::host::run_ready(config, move || {
         use std::os::unix::fs::OpenOptionsExt as _;
         if let Ok(file) = std::fs::OpenOptions::new()
             .create(true)
@@ -89,7 +100,11 @@ fn host(args: &[OsString]) -> u8 {
         {
             let _ = rustix::stdio::dup2_stderr(&file);
         }
-    }))
+    }));
+    // A probe of an agent may still run on a blocking thread (it ends by its own timeout): the host does not wait for
+    // it once it stopped (docs/adr/ADR-022.md decision 10).
+    runtime.shutdown_timeout(std::time::Duration::from_millis(200));
+    code
 }
 
 /// Exit code of a usage error.
