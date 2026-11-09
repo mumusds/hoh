@@ -681,6 +681,7 @@ async fn a_cancelled_attempt_ends_cancelled_however_its_runner_or_a_reconcile_en
                         class: crate::retry::FailureClass::Transient { retry_after: None },
                         at,
                         draw: 0,
+                        observed: Default::default(),
                     },
                 )
                 .await?;

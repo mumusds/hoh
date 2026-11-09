@@ -197,6 +197,7 @@ impl hoh_app::host::Executor for Scripted {
                 },
                 group_gone,
                 class: failure.unwrap_or(FailureClass::Transient { retry_after: None }),
+                observed: Default::default(),
             });
         });
         Ok(hoh_app::host::Started { pid, gate, ended })
