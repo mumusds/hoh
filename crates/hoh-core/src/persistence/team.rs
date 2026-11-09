@@ -460,19 +460,33 @@ pub(super) fn pending(conn: &Connection, run_id: &str, role: &str) -> Result<boo
     Ok(!verdicts(conn, run_id, role, revision)?.1)
 }
 
-/// What the host's registry knows of the agents, for a checkpoint (decisions 8 and 10): the agents found unavailable,
-/// and those not looked at yet. A host without a registry knows of none: every agent is taken as available.
+/// What the host's registry knows of the agents, for a checkpoint (decisions 8 and 10): the agents it found available,
+/// and those it found unavailable with why; an agent in neither was not looked at yet (whatever the checkpoint's own
+/// read of the team names, M2T07R-255). A host without a registry (`available` none) takes every agent not found
+/// unavailable as available.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Availability {
-    pub unavailable: std::collections::BTreeSet<String>,
-    pub unknown: std::collections::BTreeSet<String>,
+    pub available: Option<std::collections::BTreeSet<String>>,
+    pub unavailable: BTreeMap<String, String>,
+}
+
+impl Availability {
+    /// Whether `agent` was not looked at yet.
+    pub fn unknown(&self, agent: &str) -> bool {
+        self.available.as_ref().is_some_and(|a| !a.contains(agent))
+            && !self.unavailable.contains_key(agent)
+    }
 }
 
 impl From<std::collections::BTreeSet<String>> for Availability {
+    /// `unavailable` found so with no reason given, every other agent available.
     fn from(unavailable: std::collections::BTreeSet<String>) -> Availability {
         Availability {
-            unavailable,
-            unknown: std::collections::BTreeSet::new(),
+            available: None,
+            unavailable: unavailable
+                .into_iter()
+                .map(|agent| (agent, "unavailable".to_owned()))
+                .collect(),
         }
     }
 }
@@ -558,12 +572,12 @@ pub(super) fn checkpoint(
             payload,
         };
         let target = wanted.team.get(&binding.role);
-        if target.is_some_and(|role| availability.unknown.contains(role.agent.as_str())) {
+        if target.is_some_and(|role| availability.unknown(role.agent.as_str())) {
             behind = true;
             continue;
         }
         if let Some(role) = target
-            && availability.unavailable.contains(role.agent.as_str())
+            && let Some(why) = availability.unavailable.get(role.agent.as_str())
         {
             behind = true;
             if !refused {
@@ -572,7 +586,7 @@ pub(super) fn checkpoint(
                     REFUSED,
                     serde_json::json!({
                         "run_id": run_id, "role": binding.role, "config_revision": revision,
-                        "agent": role.agent.as_str(), "reason": "AGENT_UNAVAILABLE",
+                        "agent": role.agent.as_str(), "reason": "AGENT_UNAVAILABLE", "detail": why,
                         "kept": {"agent": binding.agent, "model": binding.model, "role_epoch": binding.role_epoch},
                     }),
                 ));
@@ -702,7 +716,8 @@ pub struct Assignment {
     pub role_epoch: i64,
     pub config_revision: i64,
     pub session_id: Option<String>,
-    /// The agent's own session id, to resume.
+    /// The agent's own session id, to resume; none when the session's capabilities say it cannot be resumed (decision
+    /// 9, M2T07R-257): its next turn starts a new one of its own.
     pub native_session: Option<String>,
     pub agent_version: Option<String>,
     /// A prompt override file (relative to the project) or `builtin:<role>`; none: the role's own built-in contract.
@@ -722,7 +737,8 @@ pub(super) fn assignment(
 ) -> Result<Assignment, PersistError> {
     let row: Option<Assignment> = conn
         .query_row(
-            "SELECT a.agent, b.model, a.role_epoch, a.config_revision, a.session_id, s.native_id, s.agent_version, \
+            "SELECT a.agent, b.model, a.role_epoch, a.config_revision, a.session_id, \
+             CASE WHEN json_extract(s.capabilities_json, '$.resume') = 1 THEN s.native_id END, s.agent_version, \
              (SELECT json_extract(e.payload_json, '$.goal') FROM events e WHERE e.run_id = ?2 AND e.kind = 'run.created' \
               ORDER BY e.seq LIMIT 1), \
              (SELECT json_extract(j.value, '$.title') FROM events e, json_each(json_extract(e.payload_json, '$.tasks')) j \
@@ -785,7 +801,8 @@ pub(super) fn roles(
         .collect())
 }
 
-/// The agents the project's current team names (its roles' agents).
+/// The agents the runner needs looked at (decision 10): the project's current team's, and those of every binding in a
+/// run not ended, so an agent kept by a refused change or bound before a restart is looked at too (M2T07R-250).
 pub(super) fn agents(
     conn: &Connection,
     project_id: &str,
@@ -793,10 +810,23 @@ pub(super) fn agents(
     let team = latest(conn, project_id)?
         .map(|(_, config)| config.team)
         .unwrap_or_else(|| TeamConfig::builtin().team);
-    Ok(team
+    let mut agents: std::collections::BTreeSet<String> = team
         .values()
         .map(|role| role.agent.as_str().to_owned())
-        .collect())
+        .collect();
+    let mut statement = conn
+        .prepare(
+            "SELECT DISTINCT b.agent FROM role_bindings b JOIN runs r ON r.run_id = b.run_id WHERE r.project_id = ?1 \
+             AND r.state NOT IN ('CANCELLED', 'COMPLETED', 'FAILED', 'INCOMPLETE')",
+        )
+        .map_err(sqlite_error)?;
+    for agent in statement
+        .query_map(params![project_id], |r| r.get::<_, String>(0))
+        .map_err(sqlite_error)?
+    {
+        agents.insert(agent.map_err(sqlite_error)?);
+    }
+    Ok(agents)
 }
 
 /// The project's bindings the binder looks at, in runs not ended.

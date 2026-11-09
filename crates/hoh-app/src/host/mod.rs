@@ -60,6 +60,9 @@ pub struct HostConfig {
     /// The seed of the retries' jitter (REQ-042, ADR-020 decision 2): `None` in the product, drawn from the system at
     /// the start; tests fix it so their delays replay.
     pub jitter_seed: Option<u64>,
+    /// The cancel ladder's graces (REQ-043 decision 1: the native cancel's and SIGTERM's are
+    /// `execution.cancel_native_grace_seconds` and `cancel_term_grace_seconds`, M2T07R-254).
+    pub cancel: hoh_core::cancel::Graces,
     /// The effective configuration at the start (docs/adr/ADR-022.md decisions 1 and 6): its process settings are
     /// this host's ([`HostConfig::product`]); a new run reads the file again for its team, budget and scheduler.
     pub config: hoh_core::config::Config,
@@ -94,6 +97,7 @@ impl HostConfig {
             runner: None,
             clock: HostClock(Arc::new(hoh_core::delivery::MonotonicClock::new())),
             jitter_seed: None,
+            cancel: hoh_core::cancel::GRACES,
             config: hoh_core::config::Config::default(),
         }
     }
@@ -117,7 +121,13 @@ impl HostConfig {
         host.port = config.web.port;
         host.store.queue =
             usize::try_from(config.persistence.writer_queue_capacity).unwrap_or(WRITER_QUEUE);
+        host.reconcile.native_grace = graces.0;
         host.reconcile.term_grace = graces.1;
+        host.cancel = hoh_core::cancel::Graces {
+            native: graces.0,
+            term: graces.1,
+            ..hoh_core::cancel::GRACES
+        };
         host.runner = Some(RunnerConfig {
             executor: Arc::new(product::ProductExecutor::new(
                 Arc::new(agents::Registry::new(path)),
@@ -430,6 +440,7 @@ impl Host {
             config.runner.as_ref().map(|r| r.executor.clone()),
             inflight,
             repo.clone(),
+            config.cancel,
             stopped,
         )));
         let written = write_host_json(

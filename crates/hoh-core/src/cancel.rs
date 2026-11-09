@@ -48,7 +48,8 @@ pub struct Graces {
     pub kill_every: Duration,
 }
 
-/// REQ-043 decision 1 (initial values, configurable once M2-T07 reads `cancel_*_grace_seconds`).
+/// REQ-043 decision 1's initial values (the host's come from `execution.cancel_*_grace_seconds`, docs/adr/ADR-022.md
+/// decision 17).
 pub const GRACES: Graces = Graces {
     native: Duration::from_secs(10),
     term: Duration::from_secs(5),

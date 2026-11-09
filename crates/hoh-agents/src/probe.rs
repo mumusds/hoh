@@ -48,6 +48,9 @@ pub struct ProbeEnv {
     /// A limit shared by every command: each gets the smaller of `timeout` and the time left before it, so commands
     /// run one after another end together by then (doctor's total limit, REQ-006).
     pub deadline: Option<Instant>,
+    /// Set when whoever probes stops (the host's stop): a command running ends at once, its group killed and its
+    /// leader reaped, and no other starts (docs/adr/ADR-022.md decision 10, M2T07R-202).
+    pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// One command a probe ran.
@@ -1193,12 +1196,20 @@ pub fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<CodexSchema, Prob
             });
         }
     };
-    let wait = (until + CLEANUP_GRACE + READER_MARGIN).saturating_duration_since(Instant::now());
-    let received = rx.recv_timeout(wait).or_else(|e| {
-        given_up.store(true, std::sync::atomic::Ordering::SeqCst);
-        // A result sent as the wait ended is still taken.
-        rx.try_recv().map_err(|_| e)
-    });
+    // Waited for in slices, so a stop of whoever probes is seen within one (M2T07R-202).
+    let given_up_at = until + CLEANUP_GRACE + READER_MARGIN;
+    let received = loop {
+        let left = given_up_at.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left.min(Duration::from_millis(50))) {
+            Ok(result) => break Ok(result),
+            Err(mpsc::RecvTimeoutError::Timeout) if !left.is_zero() && !cancelled(env) => {}
+            Err(e) => {
+                given_up.store(true, std::sync::atomic::Ordering::SeqCst);
+                // A result sent as the wait ended is still taken.
+                break rx.try_recv().map_err(|_| e);
+            }
+        }
+    };
     match received {
         Ok(result) => {
             // Its result sent, the work ends at once: joined, it holds nothing past the probe.
@@ -1219,6 +1230,16 @@ pub fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<CodexSchema, Prob
             ),
         }),
     }
+}
+
+/// Why a probe command was ended or not started: whoever probes stops.
+const STOPPING: &str = "cancelled: whoever probes is stopping";
+
+/// Whether whoever probes with `env` stops.
+fn cancelled(env: &ProbeEnv) -> bool {
+    env.cancel
+        .as_ref()
+        .is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst))
 }
 
 /// How long past the cleanup grace [`codex_schema`] waits for the reading to report.
@@ -2489,6 +2510,9 @@ fn capture(
         argv: argv(program, args),
         detail,
     };
+    if cancelled(env) {
+        return Err(failed(STOPPING.to_owned()));
+    }
     // The limit is known before anything starts: past the shared deadline nothing is run (M1T07R-08).
     let limit = env.deadline.map_or(env.timeout, |shared| {
         env.timeout
@@ -2566,6 +2590,10 @@ fn capture(
             // Output still open at the end is a timeout too, and what comes later is not taken (M1T07R-13).
             owned.end();
             return Err(timed_out());
+        }
+        if cancelled(env) {
+            owned.end();
+            return Err(failed(STOPPING.to_owned()));
         }
         let wait = end
             .saturating_duration_since(now)
@@ -3284,6 +3312,7 @@ mod tests {
             timeout: Duration::from_secs(20),
             log: None,
             deadline,
+            cancel: None,
         };
         assert_eq!(
             reading_deadline(&env(None), now),
@@ -3427,6 +3456,7 @@ mod tests {
             timeout: Duration::from_secs(30),
             log: None,
             deadline: None,
+            cancel: None,
         };
         let sh = Path::new("/bin/sh");
         let within = format!("head -c {MAX_OUTPUT} /dev/zero");
@@ -3935,6 +3965,7 @@ mod tests {
             timeout: Duration::from_millis(1500),
             log: None,
             deadline: None,
+            cancel: None,
         };
         let started = Instant::now();
         let release = std::thread::spawn(move || {
@@ -4159,6 +4190,7 @@ mod tests {
             timeout: Duration::from_millis(500),
             log: None,
             deadline: None,
+            cancel: None,
         };
         let caller = std::thread::spawn(move || codex_schema(&launcher, &env));
         let until = Instant::now() + Duration::from_secs(10);
@@ -4533,6 +4565,7 @@ mod tests {
             timeout: Duration::from_secs(3),
             log: None,
             deadline: None,
+            cancel: None,
         };
         let baseline = (count("/proc/self/fd"), count("/proc/self/task"));
         for round in 0..2 {
@@ -4622,13 +4655,23 @@ mod tests {
             ),
         )?;
         std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o755))?;
+        // A joined thread's task is released by the kernel just after the join returns (the join wakes on the thread's
+        // tid futex, cleared before its task leaves /proc/self/task): a joined reader is let go within this bound, not
+        // at the very instant (it showed as a running `hoh-schema` task under load).
+        let threads_settled = || {
+            let until = Instant::now() + Duration::from_secs(1);
+            while count("/proc/self/task") > baseline.1 && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            (count("/proc/self/fd"), count("/proc/self/task"))
+        };
         let read = codex_schema(&plain, &env)?;
         assert_eq!(
             read.requests.len() + read.client_notifications.len() + read.notifications.len(),
             192
         );
         assert_eq!(
-            (count("/proc/self/fd"), count("/proc/self/task")),
+            threads_settled(),
             baseline,
             "file descriptors and threads as a reading in time returns"
         );
@@ -4643,7 +4686,7 @@ mod tests {
             "returned in {took:?}, before its reading ended"
         );
         assert_eq!(
-            (count("/proc/self/fd"), count("/proc/self/task")),
+            threads_settled(),
             baseline,
             "file descriptors and threads once the reading ended"
         );
@@ -4710,6 +4753,7 @@ mod tests {
             timeout: Duration::from_secs(5),
             log: None,
             deadline: None,
+            cancel: None,
         };
         for n in 0..3 {
             let pidfile = tmp.path().join(format!("pid-{n}"));
@@ -4766,6 +4810,7 @@ mod tests {
             timeout: Duration::from_secs(2),
             log: None,
             deadline: None,
+            cancel: None,
         };
         let result = run_status(&launcher, &[], &env);
         let pid = std::fs::read_to_string(&pidfile)?.trim().parse::<i32>()?;

@@ -47,6 +47,20 @@ impl World {
         let dir = tempfile::tempdir()?;
         std::fs::create_dir_all(dir.path().join("project"))?;
         std::fs::create_dir_all(dir.path().join("bin"))?;
+        // The tools the fakes use, and nothing else from the system's PATH: an agent installed there is never found
+        // (M2T07R-259).
+        let tools = dir.path().join("tools");
+        std::fs::create_dir_all(&tools)?;
+        for tool in [
+            "cat", "cp", "date", "env", "head", "mkdir", "python3", "seq", "sleep", "timeout", "tr",
+        ] {
+            let found = ["/usr/bin", "/bin"]
+                .iter()
+                .map(|d| Path::new(d).join(tool))
+                .find(|p| p.exists())
+                .ok_or(format!("no {tool}"))?;
+            std::os::unix::fs::symlink(found, tools.join(tool))?;
+        }
         Ok(World { dir })
     }
 
@@ -61,10 +75,19 @@ impl World {
     /// The product's host of the project, its agents found only among the fakes (never an agent installed on this
     /// machine).
     fn config(&self) -> HostConfig {
-        let path = format!("{}:/usr/bin:/bin", self.bin().display());
+        self.config_of(hoh_core::config::Config::default())
+    }
+
+    /// The product's host as [`World::config`], with the effective configuration `effective`.
+    fn config_of(&self, effective: hoh_core::config::Config) -> HostConfig {
+        let path = format!(
+            "{}:{}",
+            self.bin().display(),
+            self.dir.path().join("tools").display()
+        );
         let mut config = HostConfig::product(
             &self.project(),
-            hoh_core::config::Config::default(),
+            effective,
             env!("CARGO_BIN_EXE_hoh").into(),
             path.into(),
         );
@@ -81,9 +104,9 @@ impl World {
         Ok(())
     }
 
-    /// A fake `claude` 2.1.318: the probe's answers from the recording; a turn reads its prompt, then replays the
-    /// recorded `success` turn (once `hold` exists, if given), or, for an attempt whose marker names HUGE, its first
-    /// frame and then 8 MiB with no LF.
+    /// A fake `claude` 2.1.318: the probe's answers from the recording (`--version` 3 s late while `claude.d/slow`
+    /// exists, 120 s with its pid in `claude.d/probe-pid` while `claude.d/hang` does); a turn reads its prompt, then replays the recorded `success` turn (once `hold` exists, if given), or, for
+    /// an attempt whose marker names HUGE, its first frame and then 8 MiB with no LF.
     fn claude(&self, hold: Option<&Path>) -> R {
         let wait = hold.map_or(String::new(), |h| {
             format!("while [ ! -e '{}' ]; do sleep 0.05; done\n", h.display())
@@ -92,10 +115,13 @@ impl World {
             "claude",
             &format!(
                 "f='{PROTOCOL}/claude/2.1.318'; d='{bin}/claude.d'\n\
-                 case \"$1\" in --version) echo '2.1.318 (Claude Code)'; exit 0;; --help) cat \"$f/help.txt\"; exit 0;; esac\n\
+                 case \"$1\" in --version) [ -e \"$d/hang\" ] && {{ echo $$ > \"$d/probe-pid\"; sleep 120; }}; [ -e \"$d/slow\" ] && sleep 3; echo '2.1.318 (Claude Code)'; exit 0;; --help) cat \"$f/help.txt\"; exit 0;; esac\n\
                  echo $$ > \"$d/pid.$$\"; printf '%s\\n' \"$@\" > \"$d/argv.$$\"; env > \"$d/env.$$\"; cat > \"$d/stdin.$$\"\n\
                  case \"$HOH_ATTEMPT_ID\" in\n\
                   *HUGE*) head -n 1 \"$f/success/stdout.jsonl\"; head -c {HUGE} /dev/zero | tr '\\0' x; sleep 20; exit 0;;\n\
+                  *CANCEL*) trap 'echo \"INT $(date +%s%N)\" >> \"$d/signals\"' INT\n\
+                   trap 'echo \"TERM $(date +%s%N)\" >> \"$d/signals\"; exit 143' TERM\n\
+                   head -n 1 \"$f/success/stdout.jsonl\"; for i in $(seq 1 600); do sleep 0.05; done; exit 0;;\n\
                  esac\n{wait}cat \"$f/success/stdout.jsonl\"\n",
                 bin = self.bin().display()
             ),
@@ -103,8 +129,9 @@ impl World {
     }
 
     /// A fake `codex` 0.166.0: the probe's answers (helps, App Server schema) from the recording; `app-server`
-    /// replays the recorded `app-server-turn`, its model given as `model`, or, for an attempt whose marker names HUGE,
-    /// the frames before `turn/completed` and then 8 MiB with no LF.
+    /// replays the recorded `app-server-turn`, its model given as `model`; for an attempt whose marker names HUGE, the
+    /// frames before `turn/completed` and then 8 MiB with no LF; for one whose marker names UNKNOWN, an effect (a line
+    /// in `codex.d/effects`), the frames up to a started command, and its end.
     fn codex(&self, model: &str) -> R {
         let d = self.bin().join("codex.d");
         std::fs::create_dir_all(&d)?;
@@ -132,6 +159,24 @@ impl World {
         let mut huge = frames[..end].to_vec();
         huge.push(json!({"hoh_raw": {"byte": "x", "count": HUGE}}));
         std::fs::write(d.join("huge.jsonl"), lines(&huge))?;
+        // A turn that starts a command and ends before reporting it: what it did is unknown (M2T07R-200).
+        let started = frames
+            .iter()
+            .position(|f| {
+                f["method"] == "item/started" && f["params"]["item"]["type"] == "agentMessage"
+            })
+            .ok_or("no agentMessage item/started")?;
+        let mut unknown = frames[..started].to_vec();
+        let mut command = frames[started].clone();
+        command["params"]["item"] = json!({"type": "commandExecution", "id": "cmd-1", "command": "touch effect",
+            "status": "inProgress"});
+        unknown.push(command);
+        std::fs::write(d.join("unknown.jsonl"), lines(&unknown))?;
+        // An App Server that does not know initialize: the turn degrades to exec (decision 15).
+        std::fs::write(
+            d.join("degrade.jsonl"),
+            lines(&[json!({"id": 0, "error": {"code": -32601, "message": "Method not found"}})]),
+        )?;
         std::fs::write(d.join("requests.json"), Value::Object(requests).to_string())?;
         self.script(
             "codex",
@@ -140,14 +185,22 @@ impl World {
                  case \"$1\" in\n\
                   --version) echo 'codex-cli 0.166.0'; exit 0;;\n\
                   --help) cat \"$f/help.txt\"; exit 0;;\n\
-                  exec) [ \"$2\" = --help ] && {{ cat \"$f/help-exec.txt\"; exit 0; }}; exit 2;;\n\
+                  exec) [ \"$2\" = --help ] && {{ cat \"$f/help-exec.txt\"; exit 0; }}\n\
+                   [ \"$2\" = resume ] && exit 2\n\
+                   echo $$ > \"$d/pid.$$\"; printf '%s\\n' \"$@\" > \"$d/exec-argv.$$\"; cat > /dev/null\n\
+                   cat \"$f/exec/stdout.jsonl\"; exit 0;;\n\
                   app-server) case \"$2\" in\n\
                     --help) cat \"$f/help-app-server.txt\"; exit 0;;\n\
                     generate-json-schema) [ \"$3\" = --out ] && mkdir -p \"$4\" && cp -R \"$f/app-server-schema/.\" \"$4/\"; exit 0;;\n\
                    esac\n\
                    echo $$ > \"$d/pid.$$\"; printf '%s\\n' \"$@\" > \"$d/argv.$$\"\n\
-                   case \"$HOH_ATTEMPT_ID\" in *HUGE*) frames=\"$d/huge.jsonl\";; *) frames=\"$d/frames.jsonl\";; esac\n\
-                   exec timeout 60 python3 '{APP_SERVER}' \"$frames\" \"$d/requests.json\" \"$d/log.$$\";;\n\
+                   case \"$HOH_ATTEMPT_ID\" in\n\
+                    *HUGE*) frames=\"$d/huge.jsonl\"; opt=;;\n\
+                    *UNKNOWN*) frames=\"$d/unknown.jsonl\"; opt=--exit-when-done; echo \"$HOH_ATTEMPT_ID\" >> \"$d/effects\";;\n\
+                    *DEGRADE*) frames=\"$d/degrade.jsonl\"; opt=;;\n\
+                    *) frames=\"$d/frames.jsonl\"; opt=;;\n\
+                   esac\n\
+                   exec timeout 60 python3 '{APP_SERVER}' \"$frames\" \"$d/requests.json\" \"$d/log.$$\" $opt;;\n\
                  esac\nexit 2\n",
                 d = d.display()
             ),
@@ -498,7 +551,8 @@ async fn test_018_02_a_team_change_waits_for_the_running_attempt_and_the_next_on
         )
         .await?;
         assert_eq!(accepted["status"], "ACCEPTED", "{accepted}");
-        // A few ticks with A1 running: nothing changes for it.
+        // A few ticks with A1 running: nothing changes for it, and the run shows the change pending, its developer still
+        // claude at epoch 1 (M2T07R-253).
         tokio::time::sleep(Duration::from_millis(600)).await;
         let a1_running = attempt_row(&project, "T1/attempt-1")?;
         assert_eq!(
@@ -508,6 +562,23 @@ async fn test_018_02_a_team_change_waits_for_the_running_attempt_and_the_next_on
                 &a1_running["state"]
             ),
             (&json!("claude"), &json!(1), &json!("RUNNING"))
+        );
+        let (status, snapshot) = exchange(&host, "GET", &format!("/v1/runs/{run_id}"), None).await?;
+        assert_eq!(status, 200, "{snapshot}");
+        let developer = snapshot["projection"]["team"]
+            .as_array()
+            .and_then(|team| team.iter().find(|m| m["role"] == "developer"))
+            .cloned()
+            .ok_or(format!("no developer: {snapshot}"))?;
+        assert_eq!(
+            (&developer["agent"], &developer["role_epoch"]),
+            (&json!("claude"), &json!(1)),
+            "{developer}"
+        );
+        assert_eq!(
+            (&developer["pending"]["agent"], &developer["pending"]["model"]),
+            (&json!("codex"), &json!("m-test")),
+            "{developer}"
         );
         std::fs::write(&hold, "")?;
         until(&project, &ended("T1/attempt-1"), "SETTLED/", limit).await?;
@@ -539,9 +610,19 @@ async fn test_018_02_a_team_change_waits_for_the_running_attempt_and_the_next_on
             .map(|m| m["params"]["model"].clone())
             .collect();
         assert_eq!(asked, [json!("m-test")]);
+        // The new binding took effect after A1 ended, not while it ran.
+        let seq = |event_id: &str| -> R<i64> {
+            Ok(query(&project, &format!("SELECT seq FROM events WHERE event_id = '{event_id}'"))?.parse()?)
+        };
+        let (a1_ended, applied) = (
+            seq("T1/attempt-1/SETTLED")?,
+            seq(&format!("{run_id}/team/developer/2"))?,
+        );
+        assert!(applied > a1_ended, "applied at {applied}, A1 ended at {a1_ended}");
         keep(
             "test-018-02",
-            &json!({"team_revision_before": r, "accepted": accepted, "a1": a1, "a2": a2}),
+            &json!({"team_revision_before": r, "accepted": accepted, "while_a1_ran": developer, "a1": a1,
+                    "a1_ended_seq": a1_ended, "binding_applied_seq": applied, "a2": a2}),
         )?;
         R::Ok(())
     }
@@ -554,11 +635,12 @@ async fn test_018_02_a_team_change_waits_for_the_running_attempt_and_the_next_on
 #[tokio::test]
 async fn test_018_03_each_role_has_its_own_session_and_an_agents_exit_changes_nothing() -> R {
     // AC-018-03: cto and developer both bound to claude; a cto task and a developer task each run in their role's own
-    // session (sessions.role cto and developer); the developer's agent process has ended; a third task, the
-    // developer's, runs in the same session as its first, resumed; the team revision and the cto's session are
-    // unchanged.
+    // session (sessions.role cto and developer); the developer's agent process is killed while its turn runs (M2T07R-259);
+    // the developer's task runs again and a third task, the developer's, runs in the same session as its first,
+    // resumed; the team revision and the cto's session are unchanged.
     let world = World::new()?;
-    world.claude(None)?;
+    let hold = world.dir.path().join("release");
+    world.claude(Some(&hold))?;
     let host = start_when_free(world.config()).await?;
     let project = world.project();
     let outcome = async {
@@ -566,10 +648,30 @@ async fn test_018_03_each_role_has_its_own_session_and_an_agents_exit_changes_no
         let revision = query(&project, "SELECT coalesce(max(revision), 0) FROM team_revisions")?;
         ready(&project, &run_id, &[("T-cto", "cto"), ("T-dev", "developer")])?;
         let limit = Duration::from_secs(60);
+        until(
+            &project,
+            "SELECT count(*) FROM attempts WHERE attempt_id IN ('T-cto/attempt-1', 'T-dev/attempt-1') \
+             AND state = 'RUNNING' AND pid IS NOT NULL",
+            "2",
+            limit,
+        )
+        .await?;
+        let pid = query(&project, "SELECT pid FROM attempts WHERE attempt_id = 'T-dev/attempt-1'")?;
+        let killed = Command::new("kill").args(["-KILL", &pid]).status()?;
+        assert!(killed.success(), "kill {pid}");
+        until(
+            &project,
+            "SELECT state FROM attempts WHERE attempt_id = 'T-dev/attempt-1'",
+            "FAILED",
+            limit,
+        )
+        .await?;
+        std::fs::write(&hold, "")?;
         until(&project, &ended("T-cto/attempt-1"), "SETTLED/", limit).await?;
-        until(&project, &ended("T-dev/attempt-1"), "SETTLED/", limit).await?;
+        until(&project, &ended("T-dev/attempt-2"), "SETTLED/", limit).await?;
         let cto = attempt_row(&project, "T-cto/attempt-1")?;
         let dev = attempt_row(&project, "T-dev/attempt-1")?;
+        assert_eq!(attempt_row(&project, "T-dev/attempt-2")?["session_id"], dev["session_id"]);
         assert_ne!(cto["session_id"], dev["session_id"]);
         let role_of = |session: &Value| {
             query(
@@ -592,9 +694,8 @@ async fn test_018_03_each_role_has_its_own_session_and_an_agents_exit_changes_no
             )?,
             "0"
         );
-        // The developer's agent process is gone.
-        let pid = query(&project, "SELECT pid FROM attempts WHERE attempt_id = 'T-dev/attempt-1'")?;
-        assert!(!pid.is_empty() && !Path::new(&format!("/proc/{pid}")).exists(), "{pid}");
+        // The developer's killed agent process is gone.
+        assert!(!Path::new(&format!("/proc/{pid}")).exists(), "{pid}");
         ready(&project, &run_id, &[("T-dev2", "developer")])?;
         until(&project, &ended("T-dev2/attempt-1"), "SETTLED/", limit).await?;
         let dev2 = attempt_row(&project, "T-dev2/attempt-1")?;
@@ -636,8 +737,13 @@ async fn test_018_03_each_role_has_its_own_session_and_an_agents_exit_changes_no
                     .find_map(|l| l.strip_prefix("HOH_ATTEMPT_ID=").map(str::to_owned))
             })
             .collect();
-        assert_eq!(markers.len(), 3, "{markers:?}");
-        for attempt in ["T-cto/attempt-1", "T-dev/attempt-1", "T-dev2/attempt-1"] {
+        assert_eq!(markers.len(), 4, "{markers:?}");
+        for attempt in [
+            "T-cto/attempt-1",
+            "T-dev/attempt-1",
+            "T-dev/attempt-2",
+            "T-dev2/attempt-1",
+        ] {
             assert!(
                 markers.iter().any(|m| m.ends_with(&format!("/{attempt}"))),
                 "{attempt}: {markers:?}"
@@ -760,6 +866,12 @@ async fn a_change_to_an_agent_not_installed_is_refused_until_it_is_and_the_old_b
             limit,
         )
         .await?;
+        // Refused with why (REQ-019 failure mode 3, M2T07R-260).
+        let detail = query(
+            &project,
+            "SELECT json_extract(payload_json, '$.detail') FROM events WHERE kind = 'team.binding_refused'",
+        )?;
+        assert!(detail.contains("PATH"), "{detail}");
         ready(&project, &run_id, &[("T1", "developer")])?;
         until(&project, &ended("T1/attempt-1"), "SETTLED/", limit).await?;
         assert_eq!(
@@ -853,6 +965,290 @@ async fn a_turn_that_cannot_start_fails_by_its_refusals_reason_and_class() -> R 
             )?,
             "BLOCKED/BLOCKED_CAPABILITY"
         );
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    world.stop_fakes()?;
+    outcome
+}
+
+#[tokio::test]
+async fn a_turn_that_ends_after_starting_a_command_ends_unknown_effect_and_is_not_run_again() -> R {
+    // M2T07R-200 (ADR-019 decision 5, ADR-022 decision 12): codex starts a command and its turn ends with no report of
+    // it: the attempt ends UNKNOWN_EFFECT, its task stays, no attempt runs it again (the effect happened once), and a
+    // diagnostic names its effects.
+    let world = World::new()?;
+    world.codex("gpt-6-astra")?;
+    let host = start_when_free(world.config()).await?;
+    let project = world.project();
+    let outcome = async {
+        configure(&host, "dev", 0, json!({"developer": {"agent": "codex"}})).await?;
+        let run_id = started(&host, "s1").await?;
+        ready(&project, &run_id, &[("T-UNKNOWN", "developer")])?;
+        until(
+            &project,
+            "SELECT state FROM attempts WHERE attempt_id = 'T-UNKNOWN/attempt-1'",
+            "UNKNOWN_EFFECT",
+            Duration::from_secs(30),
+        )
+        .await?;
+        // Ticks go by: nothing runs it again.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(
+            query(
+                &project,
+                "SELECT count(*) FROM attempts WHERE task_id = 'T-UNKNOWN'"
+            )?,
+            "1"
+        );
+        assert_eq!(
+            std::fs::read_to_string(world.bin().join("codex.d/effects"))?
+                .lines()
+                .count(),
+            1,
+            "the effect happened once"
+        );
+        assert_eq!(
+            query(
+                &project,
+                "SELECT state FROM tasks WHERE task_id = 'T-UNKNOWN'"
+            )?,
+            "RUNNING"
+        );
+        let diagnostic: Value = serde_json::from_str(&query(
+            &project,
+            "SELECT payload_json FROM events WHERE kind = 'runner.diagnostic' \
+             AND json_extract(payload_json, '$.attempt_id') = 'T-UNKNOWN/attempt-1'",
+        )?)?;
+        assert_eq!(diagnostic["code"], "UNKNOWN_EFFECT", "{diagnostic}");
+        assert!(
+            diagnostic["effect_keys"]
+                .as_array()
+                .is_some_and(|k| !k.is_empty()),
+            "{diagnostic}"
+        );
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    world.stop_fakes()?;
+    outcome
+}
+
+#[tokio::test]
+async fn an_app_server_that_cannot_start_a_turn_degrades_that_codex_to_exec() -> R {
+    // M2T07R-201 (REQ-024 failure mode 4, ADR-022 decision 15): the App Server answers initialize with "method not
+    // found": the attempt fails CAPABILITY_UNSUPPORTED with one adapter.degraded event and its facts recorded; the
+    // task's next attempt runs on exec and settles.
+    let world = World::new()?;
+    world.codex("gpt-6-astra")?;
+    let host = start_when_free(world.config()).await?;
+    let project = world.project();
+    let outcome = async {
+        configure(&host, "dev", 0, json!({"developer": {"agent": "codex"}})).await?;
+        let run_id = started(&host, "s1").await?;
+        ready(&project, &run_id, &[("T-DEGRADE", "developer")])?;
+        let limit = Duration::from_secs(60);
+        until(
+            &project,
+            &ended("T-DEGRADE/attempt-1"),
+            "FAILED/CAPABILITY_UNSUPPORTED",
+            limit,
+        )
+        .await?;
+        assert_eq!(
+            query(
+                &project,
+                "SELECT count(*) FROM events WHERE kind = 'adapter.degraded' \
+                 AND event_id = 'T-DEGRADE/attempt-1/degraded'"
+            )?,
+            "1"
+        );
+        assert!(
+            !query(
+                &project,
+                "SELECT raw_log_path FROM attempts WHERE attempt_id = 'T-DEGRADE/attempt-1'"
+            )?
+            .is_empty(),
+            "the failed attempt's facts were recorded"
+        );
+        until(&project, &ended("T-DEGRADE/attempt-2"), "SETTLED/", limit).await?;
+        let exec_turns = std::fs::read_dir(world.bin().join("codex.d"))?
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("exec-argv."))
+            .count();
+        assert_eq!(exec_turns, 1, "the second attempt ran on exec");
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    world.stop_fakes()?;
+    outcome
+}
+
+#[tokio::test]
+async fn a_task_dispatched_before_the_first_look_at_its_agent_waits_for_it() -> R {
+    // M2T07R-250 (ADR-022 decisions 10 and 12): after a restart a binding already has its session, so its task is
+    // dispatched before the new host's registry has looked at its agent (a slow probe here): the executor takes the work
+    // once the agent was looked at, and the attempt settles; none fails for an agent not looked at yet.
+    let world = World::new()?;
+    world.claude(None)?;
+    let project = world.project();
+    let host = start_when_free(world.config()).await?;
+    let run_id = match async {
+        let run_id = started(&host, "s1").await?;
+        until(
+            &project,
+            &format!(
+                "SELECT count(*) FROM role_bindings WHERE run_id = '{run_id}' AND role = 'developer' \
+                 AND session_id IS NOT NULL"
+            ),
+            "1",
+            Duration::from_secs(30),
+        )
+        .await?;
+        R::Ok(run_id)
+    }
+    .await
+    {
+        Ok(run_id) => run_id,
+        Err(e) => {
+            host.shutdown().await;
+            return Err(e);
+        }
+    };
+    host.shutdown().await;
+    std::fs::write(world.bin().join("claude.d/slow"), "")?;
+    // A task waits for the next host, whose first look at claude takes 3 s.
+    ready(&project, &run_id, &[("T-AFTER", "developer")])?;
+    let host = start_when_free(world.config()).await?;
+    let outcome = async {
+        until(
+            &project,
+            &ended("T-AFTER/attempt-1"),
+            "SETTLED/",
+            Duration::from_secs(60),
+        )
+        .await?;
+        assert_eq!(
+            query(
+                &project,
+                "SELECT count(*) FROM attempts WHERE task_id = 'T-AFTER'"
+            )?,
+            "1"
+        );
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    world.stop_fakes()?;
+    outcome
+}
+
+#[tokio::test]
+async fn a_hosts_stop_ends_the_probe_it_has_running() -> R {
+    // M2T07R-202 (ADR-022 decision 10): a probe command that hangs is ended when the host stops (its group killed, its
+    // leader reaped), and the stop does not wait for its own timeout: nothing the registry started outlives the host.
+    let world = World::new()?;
+    world.claude(None)?;
+    std::fs::write(world.bin().join("claude.d/hang"), "")?;
+    let host = start_when_free(world.config()).await?;
+    let project = world.project();
+    let pid_file = world.bin().join("claude.d/probe-pid");
+    let outcome = async {
+        started(&host, "s1").await?;
+        let end = Instant::now() + Duration::from_secs(30);
+        while !pid_file.exists() {
+            if Instant::now() > end {
+                return Err("the probe never ran".into());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        R::Ok(())
+    }
+    .await;
+    let stopping = Instant::now();
+    host.shutdown().await;
+    let took = stopping.elapsed();
+    outcome?;
+    let pid = std::fs::read_to_string(&pid_file)?.trim().to_owned();
+    let alive = Path::new(&format!("/proc/{pid}")).exists()
+        && !std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .unwrap_or_default()
+            .contains(") Z ");
+    world.stop_fakes()?;
+    if alive {
+        let _ = Command::new("kill").args(["-KILL", &pid]).status();
+    }
+    assert!(!alive, "the probe's command {pid} outlived the host");
+    assert!(took < Duration::from_secs(10), "the stop took {took:?}");
+    let _ = project;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_cancelled_run_stops_its_agent_by_its_native_cancel_then_sigterm_after_the_configured_grace()
+-> R {
+    // M2T07R-254, -258 (REQ-043, ADR-022 decisions 12, 14 and 17): CancelRun reaches the product executor's turn: its
+    // native cancel first (SIGINT for claude), then, after execution.cancel_native_grace_seconds (1 s here, not the
+    // default 10 s), SIGTERM; the run ends CANCELLED.
+    let world = World::new()?;
+    world.claude(None)?;
+    let mut effective = hoh_core::config::Config::default();
+    effective.execution.cancel_native_grace_seconds = 1;
+    effective.execution.cancel_term_grace_seconds = 1;
+    let host = start_when_free(world.config_of(effective)).await?;
+    let project = world.project();
+    let signals = world.bin().join("claude.d/signals");
+    let outcome = async {
+        let run_id = started(&host, "s1").await?;
+        ready(&project, &run_id, &[("T-CANCEL", "developer")])?;
+        until(
+            &project,
+            "SELECT state FROM attempts WHERE attempt_id = 'T-CANCEL/attempt-1'",
+            "RUNNING",
+            Duration::from_secs(30),
+        )
+        .await?;
+        let revision = query(
+            &project,
+            &format!("SELECT revision FROM runs WHERE run_id = '{run_id}'"),
+        )?;
+        let body = json!({
+            "schema_version": "1.0", "command_id": "c-cancel", "idempotency_key": "cancel",
+            "expected_revision": revision.parse::<i64>()?, "kind": "CancelRun", "run_id": run_id,
+            "payload": {"reason": "stop"},
+        });
+        let (status, accepted) = exchange(&host, "POST", "/v1/commands", Some(&body)).await?;
+        assert_eq!(status, 202, "{accepted}");
+        until(
+            &project,
+            &format!("SELECT state FROM runs WHERE run_id = '{run_id}'"),
+            "CANCELLED",
+            Duration::from_secs(30),
+        )
+        .await?;
+        let seen = std::fs::read_to_string(&signals)?;
+        let steps: Vec<(&str, u128)> = seen
+            .lines()
+            .filter_map(|l| l.split_once(' '))
+            .filter_map(|(name, at)| at.parse().ok().map(|at| (name, at)))
+            .collect();
+        assert_eq!(
+            steps.iter().map(|s| s.0).collect::<Vec<_>>(),
+            ["INT", "TERM"],
+            "{seen}"
+        );
+        let gap = Duration::from_nanos(u64::try_from(steps[1].1 - steps[0].1)?);
+        assert!(
+            gap >= Duration::from_millis(900) && gap < Duration::from_secs(8),
+            "SIGTERM {gap:?} after the native cancel"
+        );
+        keep(
+            "cancel-native-then-term",
+            &json!({"signals": seen, "gap_ms": gap.as_millis()}),
+        )?;
         R::Ok(())
     }
     .await;

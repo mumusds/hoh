@@ -8,7 +8,7 @@ use super::http::Shared;
 use super::processes::{Outside, Proof};
 use super::runner::{Entry, Executor, Work};
 use hoh_agents::identity::{self, Presence};
-use hoh_core::cancel::{Canceller, GRACES, Look, ProcessControl, Processes, Signal};
+use hoh_core::cancel::{Canceller, Look, ProcessControl, Processes, Signal};
 use hoh_core::delivery::Clock;
 use hoh_core::lifecycle::AttemptState;
 use hoh_core::persistence::{AttemptRow, Finished, PersistError};
@@ -52,6 +52,7 @@ pub(super) async fn run(
     executor: Option<Arc<dyn Executor>>,
     inflight: Inflight,
     project: PathBuf,
+    graces: hoh_core::cancel::Graces,
     mut stop: watch::Receiver<bool>,
 ) {
     let mut watermark = shared.store.watermark();
@@ -61,7 +62,7 @@ pub(super) async fn run(
         executor,
         inflight,
         project,
-        canceller: Canceller::new(GRACES, LOOK_EVERY),
+        canceller: Canceller::new(graces, LOOK_EVERY),
         cancelling: Mutex::new(BTreeSet::new()),
     });
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();

@@ -1697,6 +1697,7 @@ for line in sys.stdin:
         timeout: Duration::from_secs(10),
         log: None,
         deadline: None,
+        cancel: None,
     };
     let entry = probe(Agent::Codex, &env)?;
     for absent in ["resume", "mid_turn_steer", "token_usage"] {

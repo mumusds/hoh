@@ -239,6 +239,7 @@ fn reaping_with(
             group_gone,
             class: failed.unwrap_or(hoh_core::retry::FailureClass::Transient { retry_after: None }),
             observed: Default::default(),
+            unknown_effect: false,
         });
     });
     ended
@@ -370,6 +371,7 @@ fn recovery_host() {
         .ok()
         .and_then(|ms| ms.parse::<u64>().ok())
     {
+        config.reconcile.native_grace = Duration::from_millis(ms);
         config.reconcile.term_grace = Duration::from_millis(ms);
         config.reconcile.kill_grace = Duration::from_millis(ms.max(2000));
     }
@@ -1403,6 +1405,7 @@ async fn test_041_02_an_expired_lease_is_granted_again_only_after_its_holder_is_
     let mut config = config(&project);
     config.store.faults = grant_probe.clone();
     config.clock = hoh_app::host::HostClock(clock.clone());
+    config.reconcile.native_grace = Duration::from_millis(300);
     config.reconcile.term_grace = Duration::from_millis(300);
     config.reconcile.kill_grace = Duration::from_secs(5);
     let developer = ["structured_events", "command_exec"].map(str::to_owned);
@@ -1633,6 +1636,7 @@ async fn runner_host_with(
         config.hooks = hooks;
     }
     config.clock = hoh_app::host::HostClock(clock);
+    config.reconcile.native_grace = Duration::from_millis(300);
     config.reconcile.term_grace = Duration::from_millis(300);
     config.reconcile.kill_grace = Duration::from_secs(5);
     if let Some(faults) = setup.faults {
@@ -2339,6 +2343,7 @@ impl hoh_app::host::Executor for LeavesAMember {
                     group_gone: hoh_agents::identity::group_empty(pid),
                     class: hoh_core::retry::FailureClass::Transient { retry_after: None },
                     observed: Default::default(),
+                    unknown_effect: false,
                 });
             });
             ended
@@ -3032,6 +3037,7 @@ impl hoh_app::host::Executor for LeaderOnlyCancel {
                 group_gone: false,
                 class: hoh_core::retry::FailureClass::Transient { retry_after: None },
                 observed: Default::default(),
+                unknown_effect: false,
             });
         });
         Ok(hoh_app::host::Started { pid, gate, ended })

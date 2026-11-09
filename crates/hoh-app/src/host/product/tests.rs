@@ -78,8 +78,7 @@ fn a_pi_session_id_is_uuid_shaped_and_the_same_for_its_hoh_session() {
 #[test]
 fn a_turns_facts_become_its_outcome_with_the_prompt_it_was_sent() {
     // Decision 12: the verdict, the failure code as the reason and its class, the group's end, and what the turn showed
-    // (events in order, the agent's own session, model, usage, the raw logs, the prompt record); a degraded App Server
-    // is an event too.
+    // (events in order, the agent's own session, model, usage, the raw logs, the prompt record).
     let prompt = PromptRecord {
         layer: "builtin".to_owned(),
         role: "developer".to_owned(),
@@ -115,7 +114,8 @@ fn a_turns_facts_become_its_outcome_with_the_prompt_it_was_sent() {
     assert_eq!(o.observed.resolved_model.as_deref(), Some("m"));
     assert_eq!(o.observed.raw_log_path.as_deref(), Some("/logs"));
     assert_eq!(o.observed.prompt, Some(prompt));
+    // A degraded App Server's event is the adapter's own, recorded once (M2T07R-201).
     let kinds: Vec<&str> = o.observed.events.iter().map(|e| e.1.as_str()).collect();
-    assert_eq!(kinds, ["adapter.diagnostic", "adapter.degraded"]);
+    assert_eq!(kinds, ["adapter.diagnostic"]);
     assert_eq!(o.observed.events[0].2["reader_max_buffered"], 10);
 }

@@ -682,6 +682,7 @@ async fn a_cancelled_attempt_ends_cancelled_however_its_runner_or_a_reconcile_en
                         at,
                         draw: 0,
                         observed: Default::default(),
+                        unknown_effect: false,
                     },
                 )
                 .await?;

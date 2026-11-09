@@ -80,6 +80,7 @@ async fn claude_live_turns_resume_and_cancel() -> R {
             timeout: Duration::from_secs(120),
             log: None,
             deadline: None,
+            cancel: None,
         },
     )?;
     if PathBuf::from(&entry.launcher_path).canonicalize()? != program {

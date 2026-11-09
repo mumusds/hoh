@@ -101,9 +101,9 @@ fn host(args: &[OsString]) -> u8 {
             let _ = rustix::stdio::dup2_stderr(&file);
         }
     }));
-    // A probe of an agent may still run on a blocking thread (it ends by its own timeout): the host does not wait for
-    // it once it stopped (docs/adr/ADR-022.md decision 10).
-    runtime.shutdown_timeout(std::time::Duration::from_millis(200));
+    // The runner ended its registry's probe before it stopped (docs/adr/ADR-022.md decision 10); whatever blocking work
+    // is left gets a bound, not a wait without end.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(2));
     code
 }
 
