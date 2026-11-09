@@ -48,19 +48,20 @@ pub struct ProbeEnv {
     /// A limit shared by every command: each gets the smaller of `timeout` and the time left before it, so commands
     /// run one after another end together by then (doctor's total limit, REQ-006).
     pub deadline: Option<Instant>,
-    /// How whoever probes stops (the host's stop): every command a probe started is killed, by the stop or by its starter
-    /// as it puts the command in its slot, and no other starts; the window before that is stated in docs/adr/ADR-022.md
-    /// decision 10 v5 (M2T07R-202, -300, -450, -500, -600).
+    /// How whoever probes stops (the host's stop): every command a probe started is killed, by the stop or by the
+    /// thread that started or ends it, and no other starts; the stop never waits on a probing thread; what a thread
+    /// that is not run leaves alive is stated in docs/adr/ADR-022.md decision 10 v6 (M2T07R-202, -300, -450, -500,
+    /// -600, -700).
     pub cancel: Option<ProbeStop>,
 }
 
-/// The stop of whoever probes (docs/adr/ADR-022.md decision 10 v5, M2T07R-300, -450, -500, -600):
-/// [`ProbeStop::stop`] kills every command already in its slot and not reaped, its process group and its leader,
-/// before it returns, and never waits for a start: a start registers an empty slot under the stop's lock (none once
-/// stopped) and spawns outside it; once spawned, its starter puts the child in its slot and looks at the stop in one
-/// hold of the slot's lock, so the stop or the starter kills it, whichever comes second. Until its starter lets go of
-/// that lock, its pid is known to its starter alone (the residual of decision 10 v5). The starter still reaps it,
-/// taking it out of its slot first.
+/// The stop of whoever probes (docs/adr/ADR-022.md decision 10 v6, M2T07R-300, -450, -500, -600, -700):
+/// [`ProbeStop::stop`] sets its flag, then kills every command in its slot and not reaped, its process group and its
+/// leader, before it returns, and never waits on a probing thread: it tries each lock until [`STOP_WAIT`] and leaves
+/// one still held to its holder, which kills the command itself. A start registers an empty slot under the table's
+/// lock (none once stopped) and spawns outside it; once spawned, its starter puts the child in its slot and looks at
+/// the stop in one hold of the slot's lock, killing it when stopped. Until then its pid is known to its starter alone
+/// (the residual of decision 10 v6). The starter still reaps it, taking it out of its slot first.
 #[derive(Debug, Clone, Default)]
 pub struct ProbeStop(std::sync::Arc<Stopping>);
 
@@ -73,16 +74,25 @@ struct Stopping {
 }
 
 impl ProbeStop {
-    /// Stop: kill every command in its slot and not reaped (its group and its leader), and start none from now on; a
-    /// command still being spawned is killed by its starter as it puts it in its slot.
+    /// Stop: start none from now on, and kill every command in its slot and not reaped (its group and its leader),
+    /// never waiting on a probing thread: a lock one of them holds past [`STOP_WAIT`] is left, its holder kills the
+    /// command itself (decision 10 v6, M2T07R-700). A command still being spawned is killed by its starter as it puts
+    /// it in its slot.
     pub fn stop(&self) {
-        let mut commands = locked(&self.0.commands);
+        let until = Instant::now() + STOP_WAIT;
+        // The flag first, whatever lock below the stop does not get: a starter looks at it in its put, a probe at each
+        // pass of its wait.
         self.0
             .stopped
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        let Some(mut commands) = tried(&self.0.commands, until) else {
+            return;
+        };
         for command in commands.drain(..).filter_map(|c| c.upgrade()) {
             // Its leader not reaped (whoever reaps it takes it out first), the number is still its own.
-            if let Some(child) = locked(&command).as_ref() {
+            if let Some(held) = tried(&command, until)
+                && let Some(child) = held.as_ref()
+            {
                 let pid = Pid::from_child(child);
                 let _ = kill_process_group(pid, Signal::KILL);
                 let _ = kill_process(pid, Signal::KILL);
@@ -97,8 +107,8 @@ impl ProbeStop {
 
     /// `spawn` run unless stopped, in a slot registered for the stop before it: `None` when stopped. The spawn runs
     /// outside the stop's lock, so a stop never waits for an exec (M2T07R-450); a caller that finds the stop once this
-    /// returns ends what it started. `at` is where a test holds the starter once its spawn returned and once the child
-    /// is in its slot (see [`between`]).
+    /// returns ends what it started. `at` is where a test holds the starter while it registers, once its spawn
+    /// returned, while it puts the child in its slot and once it let the slot's lock go (see [`between`]).
     fn start(
         &self,
         at: &Path,
@@ -112,18 +122,51 @@ impl ProbeStop {
             }
             commands.retain(|c| c.strong_count() > 0);
             commands.push(std::sync::Arc::downgrade(&slot));
+            between("registering", at);
         }
         Some(spawn().map(|child| {
             between("spawned", at);
-            let started = Started::new(slot, child, Some(self));
-            between("placed", at);
-            started
+            Started::new(slot, child, Some(self), at)
         }))
     }
 }
 
 /// A started command's child, until whoever reaps it takes it out (a stop signals it only while it is there).
 type Slot = std::sync::Arc<std::sync::Mutex<Option<std::process::Child>>>;
+
+/// How long a stop tries, in all, the locks a probing thread may hold, before it leaves their commands to their
+/// threads (decision 10 v6, M2T07R-700): a lock is held for a few steps, so only a thread that is not run holds it
+/// that long.
+const STOP_WAIT: Duration = Duration::from_millis(200);
+
+/// `mutex` locked, whatever a panic left in it, if it comes free before `until`: tried every millisecond, never
+/// waited on (decision 10 v6).
+fn tried<T>(mutex: &std::sync::Mutex<T>, until: Instant) -> Option<std::sync::MutexGuard<'_, T>> {
+    loop {
+        match mutex.try_lock() {
+            Ok(guard) => return Some(guard),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => return Some(poisoned.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) if Instant::now() < until => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        }
+    }
+}
+
+/// The put's hold of a slot's lock. Let go, it lets a test hold the starter right after (`placed`, see [`between`]),
+/// so whatever a starter did once it let the lock go comes after that moment (M2T07R-751).
+struct PutHold<'a> {
+    guard: Option<std::sync::MutexGuard<'a, Option<std::process::Child>>>,
+    at: &'a Path,
+}
+
+impl Drop for PutHold<'_> {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        between("placed", self.at);
+    }
+}
 
 /// A command just started: its child in its slot, its pid and its outputs.
 struct Started {
@@ -136,18 +179,29 @@ struct Started {
 impl Started {
     /// `child` put in `slot`, where a stop finds it from now on; with `stop`, the starter's half of the handoff: the
     /// child put in its slot and the stop looked at in one hold of the slot's lock, killed there when stopped. The stop
-    /// sets its flag first and takes each slot's lock after, so one of the two kills it whichever comes second, and
-    /// once the lock is let go nothing waits on the starter running again (decision 10 v5, M2T07R-500, -600).
-    fn new(slot: Slot, mut child: std::process::Child, stop: Option<&ProbeStop>) -> Started {
+    /// sets its flag before it tries any lock, so a stop that finds the slot empty or cannot get its lock is seen here,
+    /// and a stop that gets the lock once it is let go finds the child (decision 10 v6, M2T07R-500, -600, -700).
+    fn new(
+        slot: Slot,
+        mut child: std::process::Child,
+        stop: Option<&ProbeStop>,
+        at: &Path,
+    ) -> Started {
         let pid = Pid::from_child(&child);
         let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
-        let mut held = locked(&slot);
-        *held = Some(child);
+        let mut guard = locked(&slot);
+        *guard = Some(child);
+        let hold = PutHold {
+            guard: Some(guard),
+            at,
+        };
+        between("putting", at);
         if stop.is_some_and(ProbeStop::is_stopped) {
             let _ = kill_process_group(pid, Signal::KILL);
             let _ = kill_process(pid, Signal::KILL);
         }
-        drop(held);
+        // Let go only now, after the look (M2T07R-751).
+        drop(hold);
         Started {
             slot,
             pid,
@@ -2642,8 +2696,10 @@ fn capture(
     }
     // One absolute end for the retries below and the wait after the start (M1T07R-11).
     let end = Instant::now() + limit;
+    // Where a test holds the probe (see [`between`]).
+    let at = program.parent().unwrap_or(program);
     let spawn = || {
-        between("spawning", program.parent().unwrap_or(program));
+        between("spawning", at);
         Command::new(program)
             .args(args)
             .env("PATH", &env.path)
@@ -2662,8 +2718,8 @@ fn capture(
     // Retry a few times, but never past the end: then the command is not started.
     // Registered for the stop before it starts: none starts once whoever probes stopped (M2T07R-300, -450).
     let start = || match &env.cancel {
-        Some(stop) => stop.start(program.parent().unwrap_or(program), spawn),
-        None => Some(spawn().map(|child| Started::new(Slot::default(), child, None))),
+        Some(stop) => stop.start(at, spawn),
+        None => Some(spawn().map(|child| Started::new(Slot::default(), child, None, at))),
     };
     let mut attempt = 0;
     let started = loop {
@@ -2692,8 +2748,9 @@ fn capture(
     let mut owned = Owned {
         slot: started.slot,
         pid: started.pid,
+        at: at.to_path_buf(),
     };
-    between("started", program.parent().unwrap_or(program));
+    between("started", at);
     // Both outputs are read here, between looks at the command, up to their limit and the end: nothing reads them
     // once the probe returns, so a helper that left the group and holds a pipe open keeps nothing of it (M1T07R-44,
     // -47).
@@ -2720,7 +2777,7 @@ fn capture(
             return Err(timed_out());
         }
         // Whoever probes stopped: ended here, its starter, as well as by the stop, so a command that started while the
-        // stop found its slot empty, or whose escaped child holds its output, ends at once (decision 10 v5).
+        // stop found its slot empty or held, or whose escaped child holds its output, ends at once (decision 10 v6).
         if cancelled(env) {
             owned.end();
             return Err(failed(STOPPING.to_owned()));
@@ -2777,6 +2834,8 @@ struct Owned {
     /// Its child, `None` once ended; a stop signals it while it is there (M2T07R-300).
     slot: Slot,
     pid: Pid,
+    /// Where a test holds its end (see [`between`]).
+    at: PathBuf,
 }
 
 impl Owned {
@@ -2789,6 +2848,7 @@ impl Owned {
         let mut child = {
             let mut held = locked(&self.slot);
             let child = held.take()?;
+            between("ending", &self.at);
             let _ = kill_process_group(self.pid, Signal::KILL);
             let _ = kill_process(self.pid, Signal::KILL);
             child
@@ -3155,6 +3215,184 @@ mod tests {
             "{result:?}"
         );
         Ok(())
+    }
+
+    #[test]
+    fn a_stop_does_not_wait_for_a_starter_held_while_it_registers_its_command()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // M2T07R-700 (docs/adr/ADR-022.md decision 10 v6): the stop only tries the lock of the commands' table, so a
+        // starter held while it holds it does not hold up the stop; the starter, once it goes on, kills its command as
+        // it puts it in its slot.
+        let (result, _) = stop_while_a_lock_is_held_at("registering", Duration::from_secs(30))?;
+        assert!(
+            matches!(&result, Err(ProbeError::Failed { detail, .. }) if detail == STOPPING),
+            "{result:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_stop_does_not_wait_for_a_starter_held_while_it_puts_its_child_in_its_slot()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // M2T07R-700 (docs/adr/ADR-022.md decision 10 v6): the stop only tries a slot's lock, so a starter held inside
+        // it does not hold up the stop; the starter looks at the stop before it lets the lock go and kills its command.
+        let (result, _) = stop_while_a_lock_is_held_at("putting", Duration::from_secs(30))?;
+        assert!(
+            matches!(&result, Err(ProbeError::Failed { detail, .. }) if detail == STOPPING),
+            "{result:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_stop_does_not_wait_for_a_probe_held_while_it_ends_its_command()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // M2T07R-700 (docs/adr/ADR-022.md decision 10 v6): a probe ending its command (here at its time limit) holds
+        // the slot's lock from taking the child out to signalling it; held there (as a delayed kill holds it), it does
+        // not hold up the stop, and it kills the command when it goes on.
+        let (result, _) = stop_while_a_lock_is_held_at("ending", Duration::from_millis(300))?;
+        assert!(
+            matches!(&result, Err(ProbeError::TimedOut { .. })),
+            "{result:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_stop_waits_a_little_for_a_lock_held_a_few_steps_and_kills_the_commands_it_then_finds()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // M2T07R-700 (docs/adr/ADR-022.md decision 10 v6): the stop tries a lock until STOP_WAIT, so a starter that
+        // holds the commands' table a few steps while it registers does not make the stop leave every command to its
+        // probe: a probe held once its command started (here, as a thread that is not run) has it killed by the stop.
+        let tmp = tempfile::tempdir()?;
+        let launcher = |dir: &str, name: &str| -> Result<PathBuf, Box<dyn std::error::Error>> {
+            let bin = tmp.path().join(dir);
+            std::fs::create_dir(&bin)?;
+            let launcher = bin.join(name);
+            std::fs::write(&launcher, "#!/bin/sh\nwhile :; do sleep 0.1; done\n")?;
+            std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))?;
+            Ok(launcher)
+        };
+        let (held, registering) = (launcher("a", "hslheldone")?, launcher("b", "hslregistrar")?);
+        let held_stall = tmp.path().join("a/hoh-test-stall-started");
+        let table_stall = tmp.path().join("b/hoh-test-stall-registering");
+        std::fs::write(&held_stall, "")?;
+        std::fs::write(&table_stall, "")?;
+        let stop = ProbeStop::default();
+        let env = ProbeEnv {
+            path: "/usr/bin:/bin".into(),
+            fixture_root: None,
+            timeout: Duration::from_secs(30),
+            log: None,
+            deadline: None,
+            cancel: Some(stop.clone()),
+        };
+        let probe = |launcher: PathBuf| {
+            let env = env.clone();
+            std::thread::spawn(move || run(&launcher, &["--version"], &env).map(|_| ()))
+        };
+        let first = probe(held);
+        let first_held = wait_until(Duration::from_secs(10), || held_open(&held_stall));
+        let second = probe(registering);
+        let table_held = wait_until(Duration::from_secs(10), || held_open(&table_stall));
+        let stopper = std::thread::spawn(move || stop.stop());
+        // The registration goes on a few steps into the stop, well within STOP_WAIT.
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::remove_file(&table_stall)?;
+        let stopped = wait_until(Duration::from_secs(2), || stopper.is_finished());
+        let found = children_named("hslheldone");
+        let killed = wait_until(Duration::from_secs(2), || {
+            children_named("hslheldone")
+                .iter()
+                .all(|(_, state)| *state == 'Z')
+        });
+        std::fs::remove_file(&held_stall)?;
+        let _ = stopper.join();
+        let (first, second) = (
+            first.join().map_err(|_| "a probe panicked")?,
+            second.join().map_err(|_| "a probe panicked")?,
+        );
+        for name in ["hslheldone", "hslregistrar"] {
+            for (pid, _) in children_named(name) {
+                let _ = Command::new("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .status();
+            }
+        }
+        assert!(
+            first_held && table_held,
+            "the probes never got to their stalls"
+        );
+        assert!(stopped, "the stop waited past STOP_WAIT");
+        assert_eq!(found.len(), 1, "the held probe's command: {found:?}");
+        assert!(
+            killed,
+            "the stop left the command of a probe it could have killed once the table was let go"
+        );
+        for result in [first, second] {
+            assert!(
+                matches!(&result, Err(ProbeError::Failed { detail, .. }) if detail == STOPPING),
+                "{result:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A probe of a command that runs until killed, held at `moment` inside a lock the stop also takes until the stop
+    /// returned (or 2 s): the stop must return within a second, and once the probe went on and returned, no process of
+    /// the command may be left alive. The probe's result and the stop's time.
+    fn stop_while_a_lock_is_held_at(
+        moment: &str,
+        timeout: Duration,
+    ) -> Result<(Result<(), ProbeError>, Duration), Box<dyn std::error::Error>> {
+        let tmp = tempfile::tempdir()?;
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir(&bin)?;
+        // Named for its moment (at most 15 bytes, the kernel's command name), so the tests do not see each other's.
+        let name = format!("hsl{}", moment.get(..7).unwrap_or(moment));
+        let launcher = bin.join(&name);
+        std::fs::write(&launcher, "#!/bin/sh\nwhile :; do sleep 0.1; done\n")?;
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))?;
+        let stall = bin.join(format!("hoh-test-stall-{moment}"));
+        std::fs::write(&stall, "")?;
+        let stop = ProbeStop::default();
+        let env = ProbeEnv {
+            path: "/usr/bin:/bin".into(),
+            fixture_root: None,
+            timeout,
+            log: None,
+            deadline: None,
+            cancel: Some(stop.clone()),
+        };
+        let probing = std::thread::spawn(move || run(&launcher, &["--version"], &env).map(|_| ()));
+        let held = wait_until(Duration::from_secs(10), || held_open(&stall));
+        let stopper = std::thread::spawn(move || {
+            let begun = Instant::now();
+            stop.stop();
+            begun.elapsed()
+        });
+        let stopped = wait_until(Duration::from_secs(2), || stopper.is_finished());
+        std::fs::remove_file(&stall)?;
+        let took = stopper.join().map_err(|_| "the stop panicked")?;
+        let result = probing.join().map_err(|_| "the probe panicked")?;
+        let dead = wait_until(Duration::from_secs(2), || {
+            children_named(&name).iter().all(|(_, state)| *state == 'Z')
+        });
+        for (pid, _) in children_named(&name) {
+            let _ = Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status();
+        }
+        assert!(held, "the probe never got to {moment}");
+        assert!(
+            stopped && took < Duration::from_secs(1),
+            "the stop waited for a probe held at {moment}: {took:?}"
+        );
+        assert!(
+            dead,
+            "the command lives on after a probe held at {moment} went on"
+        );
+        Ok((result, took))
     }
 
     #[test]
