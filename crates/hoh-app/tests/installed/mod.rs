@@ -347,9 +347,49 @@ impl Manager {
     }
 }
 
+impl Manager {
+    /// Kill every process of this user whose command line names this manager's root, until none is left (at most
+    /// 5 s): a host a test started directly for a project under the root, or one its unit left, whatever became of the
+    /// test. Test code: nothing else of the user's names a /tmp/hohsd.* directory.
+    fn kill_strays(&self) {
+        use std::os::unix::fs::MetadataExt as _;
+        let root = self.root.as_os_str().as_encoded_bytes().to_vec();
+        let uid = rustix::process::getuid().as_raw();
+        let me = std::process::id();
+        let end = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut found = false;
+            for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+                let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+                    continue;
+                };
+                if pid == me || entry.metadata().map(|m| m.uid()).ok() != Some(uid) {
+                    continue;
+                }
+                let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
+                    continue;
+                };
+                if cmdline.windows(root.len()).any(|w| w == root.as_slice())
+                    && let Some(pid) = i32::try_from(pid)
+                        .ok()
+                        .and_then(rustix::process::Pid::from_raw)
+                {
+                    found = true;
+                    let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+                }
+            }
+            if !found || Instant::now() >= end {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
 impl Drop for Manager {
-    /// Let the manager stop its units and end; if it does not within its wait, kill its scope's cgroup (delegated to
-    /// this user); then remove the root, whose `r/systemd/inaccessible/*` the manager made unreadable.
+    /// Let the manager stop its units and end (at most its wait); then kill whatever is left in its scope's cgroup
+    /// (delegated to this user), whether the manager ended or not, and every process naming its root; then remove the
+    /// root, whose `r/systemd/inaccessible/*` the manager made unreadable.
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
             let _ = self.systemctl(&["exit"]);
@@ -357,14 +397,13 @@ impl Drop for Manager {
             while matches!(child.try_wait(), Ok(None)) && Instant::now() < end {
                 std::thread::sleep(Duration::from_millis(50));
             }
-            if matches!(child.try_wait(), Ok(None)) {
-                if !self.cgroup.as_os_str().is_empty() {
-                    let _ = std::fs::write(self.cgroup.join("cgroup.kill"), "1");
-                }
-                let _ = child.kill();
-                let _ = child.wait();
+            if !self.cgroup.as_os_str().is_empty() {
+                let _ = std::fs::write(self.cgroup.join("cgroup.kill"), "1");
             }
+            let _ = child.kill();
+            let _ = child.wait();
         }
+        self.kill_strays();
         let _ = Command::new("chmod")
             .args(["-R", "u+rwX"])
             .arg(&self.root)
