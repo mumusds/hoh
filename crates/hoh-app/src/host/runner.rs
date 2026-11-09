@@ -300,8 +300,9 @@ pub(super) async fn run(
             _ = stop.changed() => break,
         }
     }
-    // The registry's probe running ends with its command's group killed and its leader reaped, so nothing it started
-    // outlives the host (M2T07R-202); its loop is waited for, within a bound.
+    // The registry's probes are stopped: their commands are killed by the stop or by their own looks at it, so none
+    // outlives the host but what a probing thread that is not run leaves (docs/adr/ADR-022.md decision 10 v6,
+    // M2T07R-202, -853); its loop is waited for, within a bound.
     if let Some(registry) = &registry {
         registry.stop();
     }
