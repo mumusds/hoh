@@ -372,11 +372,9 @@ impl ProcessControl for AttemptControl {
     fn send(&mut self, signal: Signal) -> bool {
         let (sig, group) = match signal {
             Signal::Native => {
+                // Sent only when it reached a turn the executor still holds (decision 17, M2T07R-501).
                 return match &self.native {
-                    Some((executor, work)) => {
-                        executor.cancel(work);
-                        true
-                    }
+                    Some((executor, work)) => executor.cancel(work),
                     None => false,
                 };
             }
@@ -671,6 +669,51 @@ mod tests {
         )?;
         std::fs::write(dir.join("environ"), format!("{env}\0"))?;
         Ok(())
+    }
+
+    /// An executor whose native cancel answers `reached`.
+    #[derive(Debug)]
+    struct Answers(bool);
+
+    impl Executor for Answers {
+        fn deliver(&self, _work: &Work) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
+            tokio::sync::oneshot::channel().1
+        }
+
+        fn start(
+            &self,
+            _work: &Work,
+        ) -> Result<super::super::runner::Started, super::super::runner::Refusal> {
+            Err("not started".to_owned().into())
+        }
+
+        fn cancel(&self, _work: &Work) -> bool {
+            self.0
+        }
+    }
+
+    #[test]
+    fn a_cancels_native_step_counts_as_sent_only_when_it_reached_a_turn() {
+        // M2T07R-501, -551 (docs/adr/ADR-022.md decision 17, ADR-021 decision 8c): CancelRun's native step is recorded
+        // as sent only when the executor's cancel reached a turn it still holds.
+        let work = Work {
+            project_id: "p1".to_owned(),
+            run_id: "R".to_owned(),
+            task_id: "T1".to_owned(),
+            attempt_id: "A1".to_owned(),
+            role: "developer".to_owned(),
+            effect_key: "A1/work".to_owned(),
+            assignment: hoh_core::persistence::Assignment::default(),
+        };
+        for reached in [true, false] {
+            let mut control = AttemptControl {
+                group: Watch::Gone,
+                native: Some((Arc::new(Answers(reached)), work.clone())),
+                outside: Arc::new(Mutex::new(Outside::new("p1/A1"))),
+                cgroup: None,
+            };
+            assert_eq!(control.send(Signal::Native), reached, "reached: {reached}");
+        }
     }
 
     #[test]

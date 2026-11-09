@@ -313,8 +313,22 @@ fn record_pass(
             },
             ctx,
         )?;
-        // Its work, started and never observed, is not known to have happened or not (ADR-021 decision 8e).
+        // Its work, started and never observed, is not known to have happened or not (ADR-021 decision 8e), named as
+        // the runner's end and a reconcile name it (docs/adr/ADR-022.md decision 12 v3, M2T07R-552).
+        let unknown = attempts::started_effects(&tx, &pass.attempt_id)?;
         attempts::effects_unknown(&tx, &pass.attempt_id)?;
+        if !unknown.is_empty() {
+            events.push(NewEvent {
+                project_id: project_id.clone(),
+                event_id: child_id(&pass.attempt_id, &format!("cancel/{number}/diagnostic")),
+                run_id: Some(run_id.clone()),
+                kind: "cancel.diagnostic".to_owned(),
+                payload: json!({
+                    "code": "UNKNOWN_EFFECT", "attempt_id": pass.attempt_id, "effect_keys": unknown,
+                    "detail": "cancelled with effects started and never observed: what they did is not known",
+                }),
+            });
+        }
         super::retry::accrue_wall(&tx, &run_id, &pass.attempt_id, pass.at, None)?;
     }
     let done = writer::write(
