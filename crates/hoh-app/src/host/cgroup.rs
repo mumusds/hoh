@@ -122,6 +122,91 @@ fn directory() -> rustix::fs::OFlags {
     OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
 }
 
+/// A witnessed cgroup's directory, opened through the recorded chain, and the checked directory above it.
+struct Checked {
+    above: Option<rustix::fd::OwnedFd>,
+    dir: rustix::fd::OwnedFd,
+}
+
+/// What a SIGTERM to a cgroup's subtree did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Termed {
+    /// Some member got it.
+    pub(super) sent: bool,
+    /// Every cgroup of the subtree was read: none was skipped for a reason other than its removal.
+    pub(super) whole: bool,
+}
+
+/// The directory below `top` that `names` lead to, opened one from another (never through a path that may name
+/// another cgroup by then), at most two of them open at once.
+fn open_below(
+    top: &rustix::fd::OwnedFd,
+    names: &[std::ffi::CString],
+) -> rustix::io::Result<rustix::fd::OwnedFd> {
+    let mut dir = rustix::fs::openat(top, ".", directory(), rustix::fs::Mode::empty())?;
+    for name in names {
+        dir = rustix::fs::openat(
+            &dir,
+            name.as_c_str(),
+            directory(),
+            rustix::fs::Mode::empty(),
+        )?;
+    }
+    Ok(dir)
+}
+
+/// `top` and every directory below it, however deep, parents first, each given to `visit` open, with the names that
+/// lead to it from `top` (none for `top`): `populated` and `cgroup.kill` cover the whole subtree, and so must SIGTERM
+/// (decision 8d v7, M2T06R-501, -651). Each is opened again from `top` by its names, so only a few descriptors are
+/// open at once however large or deep the subtree (M2T06R-1101). Whether every one was read: false when one could
+/// not be opened or listed for a reason other than its removal (a cgroup goes only once empty, with all below it).
+fn walk(
+    top: &rustix::fd::OwnedFd,
+    mut visit: impl FnMut(&[std::ffi::CString], &rustix::fd::OwnedFd),
+) -> bool {
+    let mut queue = std::collections::VecDeque::from([Vec::new()]);
+    let mut whole = true;
+    while let Some(names) = queue.pop_front() {
+        let dir = match open_below(top, &names) {
+            Ok(dir) => dir,
+            Err(rustix::io::Errno::NOENT) => continue,
+            Err(_) => {
+                whole = false;
+                continue;
+            }
+        };
+        visit(&names, &dir);
+        let entries = match rustix::fs::Dir::read_from(&dir) {
+            Ok(entries) => entries,
+            Err(rustix::io::Errno::NOENT) => continue,
+            Err(_) => {
+                whole = false;
+                continue;
+            }
+        };
+        for entry in entries {
+            match entry {
+                Ok(entry) => {
+                    let name = entry.file_name();
+                    if entry.file_type() == rustix::fs::FileType::Directory
+                        && name.to_bytes() != b"."
+                        && name.to_bytes() != b".."
+                    {
+                        let mut below = names.clone();
+                        below.push(name.to_owned());
+                        queue.push_back(below);
+                    }
+                }
+                Err(_) => {
+                    whole = false;
+                    break;
+                }
+            }
+        }
+    }
+    whole
+}
+
 impl AttemptGroup {
     /// The cgroup at `path` with no record of what it was: nothing it shows proves anything (M2T06R-900).
     #[cfg(test)]
@@ -177,6 +262,11 @@ impl AttemptGroup {
     /// only when empty, and whatever was below it with it); an error when anything else is found, or there is no
     /// witness (M2T06R-900).
     fn open_checked(&self) -> Result<Option<rustix::fd::OwnedFd>, String> {
+        Ok(self.checked()?.map(|checked| checked.dir))
+    }
+
+    /// As `open_checked`, with the checked directory above it (none when it is the mount itself).
+    fn checked(&self) -> Result<Option<Checked>, String> {
         let witness = self
             .witness
             .as_ref()
@@ -221,10 +311,11 @@ impl AttemptGroup {
                 self.root.display()
             ));
         }
+        let mut above = None;
         for (i, part) in parts.iter().enumerate() {
             match rustix::fs::openat(&dir, *part, directory(), rustix::fs::Mode::empty()) {
                 Ok(next) => match seen(&next, i + 1)? {
-                    Seen::Recorded => dir = next,
+                    Seen::Recorded => above = Some(std::mem::replace(&mut dir, next)),
                     // Another cgroup of the same hierarchy at its path: the recorded one was removed, which a
                     // cgroup can be only when nothing is in it or below it (cgroupfs never gives an inode number
                     // twice in a boot, and cgroup v2 has no rename): gone (M2T06R-1001). Its successor is not it.
@@ -235,7 +326,14 @@ impl AttemptGroup {
                 Err(e) => return Err(format!("{}: {e}", self.path.display())),
             }
         }
-        Ok(Some(dir))
+        Ok(Some(Checked { above, dir }))
+    }
+
+    /// Whether its record is of another boot (its cgroup is then gone, whatever is at its path).
+    fn of_another_boot(&self) -> bool {
+        self.witness.as_ref().is_some_and(|witness| {
+            hoh_agents::identity::boot_id().is_ok_and(|now| now != witness.boot)
+        })
     }
 
     /// Write `text` to its file `name`, through its checked directory, never creating it.
@@ -258,9 +356,7 @@ impl AttemptGroup {
     /// cannot be told, its events read only through its checked directory (M2T06R-900).
     pub(super) fn populated(&self) -> Result<bool, String> {
         use std::io::Read as _;
-        if let Some(witness) = &self.witness
-            && hoh_agents::identity::boot_id().is_ok_and(|now| now != witness.boot)
-        {
+        if self.of_another_boot() {
             return Ok(false);
         }
         let Some(dir) = self.open_checked()? else {
@@ -284,80 +380,51 @@ impl AttemptGroup {
             .ok_or_else(|| format!("{}: no populated line", self.path.display()))
     }
 
-    /// It and every cgroup below it, parents first: `populated` and `cgroup.kill` cover the whole subtree, and so must
-    /// SIGTERM (decision 8d v7, M2T06R-501). A directory that cannot be read is skipped (its members still get
-    /// `cgroup.kill`, and `populated` still counts them).
-    fn subtree(&self) -> Vec<PathBuf> {
-        let mut found = vec![self.path.clone()];
-        let mut at = 0;
-        while at < found.len() {
-            if let Ok(entries) = std::fs::read_dir(&found[at]) {
-                found.extend(
-                    entries
-                        .filter_map(Result::ok)
-                        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-                        .map(|e| e.path()),
-                );
-            }
-            at += 1;
-        }
-        found
-    }
-
-    /// Its checked directory and every directory below it, opened one from another (never through a path that may
-    /// name another cgroup by then).
-    fn checked_subtree(&self) -> Vec<rustix::fd::OwnedFd> {
-        let Ok(Some(top)) = self.open_checked() else {
-            return Vec::new();
-        };
-        let mut found = vec![top];
-        let mut at = 0;
-        while at < found.len() {
-            let names: Vec<std::ffi::CString> = rustix::fs::Dir::read_from(&found[at])
-                .map(|dir| {
-                    dir.filter_map(Result::ok)
-                        .filter(|e| e.file_type() == rustix::fs::FileType::Directory)
-                        .map(|e| e.file_name().to_owned())
-                        .filter(|n| n.as_bytes() != b"." && n.as_bytes() != b"..")
-                        .collect()
-                })
-                .unwrap_or_default();
-            for name in names {
-                if let Ok(below) = rustix::fs::openat(
-                    &found[at],
-                    name.as_c_str(),
-                    directory(),
-                    rustix::fs::Mode::empty(),
-                ) {
-                    found.push(below);
-                }
-            }
-            at += 1;
-        }
-        found
-    }
-
     /// SIGTERM to each process in it or in a cgroup below it, each pinned by a pidfd and checked to be in this subtree
-    /// still (a pid that ended and was reused is never signalled); whether any got it. Only the recorded cgroup, read
-    /// through its checked directories: a cgroup made later at its path holds another's processes (M2T06R-1000).
-    pub(super) fn terminate(&self) -> bool {
+    /// still (a pid that ended and was reused is never signalled). Only the recorded cgroup, read through its checked
+    /// directories: a cgroup made later at its path holds another's processes (M2T06R-1000). The subtree is walked
+    /// with few descriptors open however large it is, its own members first (M2T06R-1101).
+    pub(super) fn terminate(&self) -> Termed {
         use std::io::Read as _;
         use std::os::unix::ffi::OsStrExt as _;
+        let top = match self.open_checked() {
+            Ok(Some(top)) => top,
+            Ok(None) => {
+                return Termed {
+                    sent: false,
+                    whole: true,
+                };
+            }
+            Err(_) => {
+                return Termed {
+                    sent: false,
+                    whole: false,
+                };
+            }
+        };
         let wanted = self.relative();
         let wanted = wanted.as_os_str().as_bytes();
         let mut sent = false;
-        for cgroup in self.checked_subtree() {
-            let Ok(fd) = rustix::fs::openat(
-                &cgroup,
+        let mut unread = false;
+        let walked = walk(&top, |_, cgroup| {
+            let fd = match rustix::fs::openat(
+                cgroup,
                 "cgroup.procs",
                 rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC,
                 rustix::fs::Mode::empty(),
-            ) else {
-                continue;
+            ) {
+                Ok(fd) => fd,
+                // Removed since it was opened: it was empty.
+                Err(rustix::io::Errno::NOENT) => return,
+                Err(_) => {
+                    unread = true;
+                    return;
+                }
             };
             let mut procs = String::new();
             if std::fs::File::from(fd).read_to_string(&mut procs).is_err() {
-                continue;
+                unread = true;
+                return;
             }
             for pid in procs.lines().filter_map(|l| l.trim().parse::<i32>().ok()) {
                 let Some(raw) = rustix::process::Pid::from_raw(pid) else {
@@ -383,8 +450,11 @@ impl AttemptGroup {
                             .is_ok();
                 }
             }
+        });
+        Termed {
+            sent,
+            whole: walked && !unread,
         }
-        sent
     }
 
     /// SIGKILL to every process in it at once, by the kernel (`cgroup.kill`, through its checked directory); whether it
@@ -393,10 +463,45 @@ impl AttemptGroup {
         self.write("cgroup.kill", "1").is_ok()
     }
 
-    /// Remove it once it is empty, the cgroups below it first (a leftover empty directory is harmless).
+    /// Remove it, proved empty, with the cgroups below it, the deepest first: each by its name in the directory above
+    /// it, opened from its checked directory, and itself by its name in its checked parent once that still holds the
+    /// recorded one. Nothing when it is gone (removed, a successor at its path, or of another boot): what is at its
+    /// path is not its (M2T06R-1100). A leftover empty directory is harmless.
     pub(super) fn remove(&self) {
-        for cgroup in self.subtree().iter().rev() {
-            let _ = std::fs::remove_dir(cgroup);
+        if self.of_another_boot() {
+            return;
+        }
+        let Ok(Some(Checked {
+            above: Some(above),
+            dir,
+        })) = self.checked()
+        else {
+            return;
+        };
+        let mut below = Vec::new();
+        walk(&dir, |names, _| {
+            if !names.is_empty() {
+                below.push(names.to_vec());
+            }
+        });
+        // Parents are walked before their children: backwards, each goes before the one above it.
+        for names in below.iter().rev() {
+            if let Some((name, path)) = names.split_last()
+                && let Ok(parent) = open_below(&dir, path)
+            {
+                let _ =
+                    rustix::fs::unlinkat(&parent, name.as_c_str(), rustix::fs::AtFlags::REMOVEDIR);
+            }
+        }
+        let (Some(name), Some(witness)) = (self.path.file_name(), self.witness.as_ref()) else {
+            return;
+        };
+        let recorded = witness.chain.last().copied();
+        let there = rustix::fs::statat(&above, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+            .ok()
+            .map(|stat| (stat.st_dev, stat.st_ino));
+        if there.is_some() && there == recorded {
+            let _ = rustix::fs::unlinkat(&above, name, rustix::fs::AtFlags::REMOVEDIR);
         }
     }
 
@@ -422,8 +527,12 @@ impl AttemptGroup {
         let mut steps = Vec::new();
         let mut proof = self.proof();
         if proof == Proof::Pending {
-            if self.terminate() {
+            let termed = self.terminate();
+            if termed.sent {
                 steps.push("cgroup_sigterm".to_owned());
+            }
+            if !termed.whole {
+                steps.push("cgroup_sigterm_incomplete".to_owned());
             }
             proof = self.wait(term_grace);
         }
@@ -602,7 +711,21 @@ mod tests {
         std::fs::create_dir_all(&deepest)?;
         std::fs::create_dir_all(at.join("d"))?;
         let group = AttemptGroup::witnessed(root.path(), &at)?;
-        let mut found = group.subtree();
+        let top = group.open_checked()?.ok_or("not there")?;
+        let mut found = Vec::new();
+        let whole = walk(&top, |names, _| {
+            use std::os::unix::ffi::OsStrExt as _;
+            found.push(
+                at.join(
+                    names
+                        .iter()
+                        .map(|n| std::ffi::OsStr::from_bytes(n.as_bytes()))
+                        .collect::<PathBuf>(),
+                ),
+            );
+        });
+        drop(top);
+        assert!(whole);
         assert_eq!(found.first(), Some(&at), "the cgroup itself first");
         found.sort();
         let mut wanted = vec![
@@ -624,9 +747,102 @@ mod tests {
     }
 
     #[test]
+    fn a_removal_touches_nothing_but_the_recorded_cgroup() -> R {
+        // M2T06R-1100: a cgroup proved gone is not removed by path: neither a successor made at its path (an empty
+        // cgroup someone prepared below it included), nor what is at its path in another boot.
+        let root = tempfile::tempdir()?;
+        let at = root.path().join("attempt-0123456789abcdef");
+        std::fs::create_dir_all(&at)?;
+        let group = AttemptGroup::witnessed(root.path(), &at)?;
+        // The recorded one kept aside, so its inode number cannot come back to the successor.
+        std::fs::rename(&at, root.path().join("removed"))?;
+        std::fs::create_dir_all(at.join("prepared"))?;
+        assert_eq!(group.proof(), Proof::Done, "a successor at its path");
+        group.remove();
+        assert!(
+            at.join("prepared").is_dir(),
+            "the successor's cgroup removed"
+        );
+        let other = root.path().join("attempt-fedcba9876543210");
+        std::fs::create_dir_all(other.join("below"))?;
+        let mut group = AttemptGroup::witnessed(root.path(), &other)?;
+        group.another_boot();
+        group.remove();
+        assert!(other.join("below").is_dir(), "removed in another boot");
+        Ok(())
+    }
+
+    #[test]
+    fn a_sigterm_walk_that_cannot_read_a_cgroup_of_the_subtree_says_so() -> R {
+        // M2T06R-1101: a cgroup of the subtree that cannot be opened, or whose members cannot be read, for a reason
+        // other than its removal makes the SIGTERM step incomplete, recorded among the settle's steps; `cgroup.kill`
+        // follows as before.
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir()?;
+        let at = root.path().join("attempt-0123456789abcdef");
+        std::fs::create_dir_all(at.join("shut"))?;
+        std::fs::create_dir_all(at.join("open"))?;
+        std::fs::write(at.join("cgroup.events"), b"populated 1\n")?;
+        std::fs::write(at.join("cgroup.kill"), b"")?;
+        for dir in [&at, &at.join("open"), &at.join("shut")] {
+            std::fs::write(dir.join("cgroup.procs"), b"")?;
+        }
+        let group = AttemptGroup::witnessed(root.path(), &at)?;
+        let whole = group.terminate();
+        std::fs::set_permissions(at.join("shut"), std::fs::Permissions::from_mode(0o000))?;
+        let shut = group.terminate();
+        let stopped = group.stop(Duration::ZERO, Duration::ZERO);
+        std::fs::set_permissions(at.join("shut"), std::fs::Permissions::from_mode(0o755))?;
+        std::fs::set_permissions(
+            at.join("open").join("cgroup.procs"),
+            std::fs::Permissions::from_mode(0o000),
+        )?;
+        let unread = group.terminate();
+        std::fs::set_permissions(
+            at.join("open").join("cgroup.procs"),
+            std::fs::Permissions::from_mode(0o644),
+        )?;
+        assert_eq!(
+            whole,
+            Termed {
+                sent: false,
+                whole: true
+            },
+            "all read"
+        );
+        assert_eq!(
+            shut,
+            Termed {
+                sent: false,
+                whole: false
+            },
+            "a cgroup not opened"
+        );
+        assert_eq!(
+            stopped,
+            (
+                vec![
+                    "cgroup_sigterm_incomplete".to_owned(),
+                    "cgroup_kill".to_owned()
+                ],
+                Proof::Pending
+            )
+        );
+        assert_eq!(
+            unread,
+            Termed {
+                sent: false,
+                whole: false
+            },
+            "members not read"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn a_cgroups_checked_subtree_is_every_directory_below_it_however_deep() -> R {
         // SIGTERM reads the subtree through the checked directory since M2T06R-1000; it must still reach every cgroup
-        // below the attempt's, however deep (M2T06R-651), the cgroup itself first.
+        // below the attempt's, however deep (M2T06R-651), the cgroup itself first, each opened from it (M2T06R-1101).
         use std::os::unix::fs::MetadataExt as _;
         let root = tempfile::tempdir()?;
         let at = root.path().join("attempt-0123456789abcdef");
@@ -638,11 +854,13 @@ mod tests {
             let meta = std::fs::symlink_metadata(p)?;
             Ok((meta.dev(), meta.ino()))
         };
-        let mut found = group
-            .checked_subtree()
-            .iter()
-            .map(|fd| rustix::fs::fstat(fd).map(|s| (s.st_dev, s.st_ino)))
-            .collect::<Result<Vec<_>, _>>()?;
+        let top = group.open_checked()?.ok_or("not there")?;
+        let mut found = Vec::new();
+        let whole = walk(&top, |_, dir| {
+            found.push(rustix::fs::fstat(dir).map(|s| (s.st_dev, s.st_ino)));
+        });
+        assert!(whole);
+        let mut found = found.into_iter().collect::<Result<Vec<_>, _>>()?;
         assert_eq!(found.first(), Some(&id(&at)?), "the cgroup itself first");
         found.sort();
         let mut wanted = vec![
@@ -882,11 +1100,15 @@ mod tests {
             .process_group(0)
             .spawn()?;
         std::fs::write(at.join("cgroup.procs"), other.id().to_string())?;
-        let signalled = group.terminate();
+        std::fs::create_dir(at.join("prepared"))?;
+        let signalled = group.terminate().sent;
         let lived = other.try_wait()?.is_none();
         let replaced = group.proof();
+        let stopped = group.stop(Duration::ZERO, Duration::ZERO);
+        let prepared = at.join("prepared").is_dir();
         let _ = other.kill();
         let _ = other.wait();
+        let _ = std::fs::remove_dir(at.join("prepared"));
         std::fs::remove_dir(&at)?;
         std::fs::remove_dir(&scope)?;
         std::fs::create_dir_all(&at)?;
@@ -898,8 +1120,86 @@ mod tests {
             "a process of the cgroup made later got SIGTERM"
         );
         assert_eq!(replaced, Proof::Done, "replaced at its path");
+        assert_eq!(stopped, (Vec::new(), Proof::Done), "stopped as gone");
+        assert!(
+            prepared,
+            "an empty cgroup of the successor removed (M2T06R-1100)"
+        );
         assert_eq!(parent_replaced, Proof::Done, "its parent replaced");
         Ok(())
+    }
+
+    #[test]
+    fn a_wide_and_deep_cgroup_gets_its_sigterm_with_few_descriptors() -> R {
+        in_delegated_scope("host::cgroup::tests::wide_cgroup_inside")
+    }
+
+    #[test]
+    #[ignore = "runs inside a delegated scope, started by a_wide_and_deep_cgroup_gets_its_sigterm_with_few_descriptors"]
+    fn wide_cgroup_inside() -> R {
+        // M2T06R-1101 on real cgroups: an attempt's cgroup with a member at its top and many cgroups below it, wide and
+        // deep, stopped with 64 descriptors to spare: the member gets SIGTERM (no descriptor held per cgroup of the
+        // subtree), and the proved cgroup is removed whole.
+        use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+        if std::env::var_os(IN_SCOPE).is_none() {
+            return Ok(());
+        }
+        let delegated = Delegated::detect()?;
+        let scope = delegated
+            .base
+            .join(format!("hoh-wide-{}", std::process::id()));
+        let at = scope.join("attempt-0123456789abcdef");
+        std::fs::create_dir_all(&at)?;
+        for i in 0..100 {
+            std::fs::create_dir(at.join(format!("w{i}")))?;
+        }
+        let mut deep = at.clone();
+        for _ in 0..70 {
+            deep.push("d");
+        }
+        std::fs::create_dir_all(&deep)?;
+        let group = AttemptGroup::witnessed(Path::new(MOUNT), &at)?;
+        let mut member = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()?;
+        std::fs::write(at.join("cgroup.procs"), member.id().to_string())?;
+        let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+        rustix::process::setrlimit(
+            rustix::process::Resource::Nofile,
+            rustix::process::Rlimit {
+                current: Some(64),
+                maximum: limit.maximum,
+            },
+        )?;
+        let stopped = group.stop(Duration::from_secs(5), Duration::from_secs(5));
+        rustix::process::setrlimit(rustix::process::Resource::Nofile, limit)?;
+        let _ = member.kill();
+        let status = member.wait()?;
+        let left = at.exists();
+        remove_tree(&scope);
+        assert_eq!(
+            stopped,
+            (
+                vec!["cgroup_sigterm".to_owned(), "cgroup_reaped".to_owned()],
+                Proof::Done
+            )
+        );
+        assert_eq!(status.signal(), Some(15), "ended by SIGTERM");
+        assert!(!left, "the proved cgroup was left");
+        Ok(())
+    }
+
+    /// Remove a test's directory tree of cgroups, the deepest first (whatever a failed test left).
+    fn remove_tree(dir: &Path) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.filter_map(Result::ok) {
+                if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    remove_tree(&entry.path());
+                }
+            }
+        }
+        let _ = std::fs::remove_dir(dir);
     }
 
     #[test]
