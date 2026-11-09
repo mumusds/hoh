@@ -724,11 +724,19 @@ fn paused_uninstall(install: &Install) -> R<(std::process::Child, PathBuf)> {
 /// `hoh --version` from the installed command under strace, its first `syscall` held 4 s at entry; the strace and
 /// the pid of hoh once it runs.
 fn held_at(install: &Install, syscall: &str) -> R<(std::process::Child, u32)> {
+    held_for(install, syscall, 4)
+}
+
+/// [`held_at`], held `seconds`.
+fn held_for(install: &Install, syscall: &str, seconds: u32) -> R<(std::process::Child, u32)> {
     let strace = Command::new("strace")
         .args(["-f", "-qq", "-o", "/dev/null", "-e"])
         .arg(format!("trace={syscall}"))
         .arg("-e")
-        .arg(format!("inject={syscall}:delay_enter=4000000:when=1"))
+        .arg(format!(
+            "inject={syscall}:delay_enter={}:when=1",
+            seconds * 1_000_000
+        ))
         .arg(install.home().join(".local/bin/hoh"))
         .arg("--version")
         .env_clear()
@@ -835,5 +843,60 @@ fn a_run_between_its_exec_and_its_lock_keeps_the_uninstall_from_removing_anythin
     assert_eq!(run.status.code(), Some(0), "{}", text(&run));
     let out = install.run("bundle", &["--uninstall"])?;
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    Ok(())
+}
+
+/// Install, pause an uninstall before its first removal, start `hoh --version` held at its first `syscall` (8 s),
+/// let it reach that point (`ready`), then let the uninstall finish and install the same bundle again: the held run,
+/// let go now, finds an installation at the same paths, but not the one it was started from.
+fn held_across_a_reinstall(syscall: &str, ready: fn(&Install, u32) -> R) -> R<Output> {
+    let install = Install::new()?;
+    let out = install.run("bundle", &[])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let (uninstall, go) = paused_uninstall(&install)?;
+    let (strace, pid) = held_for(&install, syscall, 8)?;
+    ready(&install, pid)?;
+    std::fs::write(&go, "")?;
+    let done = uninstall.wait_with_output()?;
+    assert_eq!(done.status.code(), Some(0), "{}", text(&done));
+    let again = install.run("bundle", &[])?;
+    assert_eq!(again.status.code(), Some(0), "{}", text(&again));
+    Ok(strace.wait_with_output()?)
+}
+
+#[test]
+fn a_run_holding_a_removed_lock_does_not_run_on_after_a_reinstall() -> R {
+    // ADR-023 design correction 3: the run opened the lock the uninstall then removed; the same bundle is installed
+    // again (a new lock and a binary at the same paths) before its flock goes on: the lock it holds is not the
+    // installation's (red without the inode check: it ran on).
+    let run = held_across_a_reinstall("flock", |install, pid| {
+        let lock = install.data().join("hoh/.lock");
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !std::fs::read_dir(format!("/proc/{pid}/fd"))?
+            .flatten()
+            .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|t| t == lock))
+        {
+            if std::time::Instant::now() > end {
+                return Err("hoh never opened the lock".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Ok(())
+    })?;
+    assert_eq!(run.status.code(), Some(69), "{}", text(&run));
+    assert!(String::from_utf8(run.stderr)?.contains("being uninstalled"));
+    Ok(())
+}
+
+#[test]
+fn a_run_of_a_removed_binary_does_not_run_on_after_a_reinstall() -> R {
+    // Design correction 3: the run's binary was removed (a binary at the same path again after the reinstall) before
+    // it read its own path: it reads " (deleted)" and is refused (red without that check: it ran on).
+    let run = held_across_a_reinstall("readlink", |_, _| {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        Ok(())
+    })?;
+    assert_eq!(run.status.code(), Some(69), "{}", text(&run));
+    assert!(String::from_utf8(run.stderr)?.contains("being uninstalled"));
     Ok(())
 }
