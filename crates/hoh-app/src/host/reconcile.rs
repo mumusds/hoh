@@ -32,6 +32,18 @@ pub struct ReconcileSettings {
     pub retry: Duration,
 }
 
+impl ReconcileSettings {
+    /// How long a settle waits before its SIGTERM: the native cancel's grace when it sent one, else the SIGTERM grace
+    /// as before there was a native cancel (docs/adr/ADR-022.md decision 17, M2T07R-353).
+    pub(super) fn first_wait(&self, native_cancel_sent: bool) -> Duration {
+        if native_cancel_sent {
+            self.native_grace
+        } else {
+            self.term_grace
+        }
+    }
+}
+
 impl Default for ReconcileSettings {
     fn default() -> Self {
         ReconcileSettings {
@@ -319,6 +331,19 @@ pub(super) async fn run(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_settle_waits_the_native_grace_only_after_a_native_cancel() {
+        // M2T07R-353 (docs/adr/ADR-022.md decision 17): with no native cancel sent (no turn of the attempt held), a
+        // settle waits the SIGTERM grace, not the longer native one.
+        let settings = super::ReconcileSettings {
+            native_grace: super::Duration::from_secs(10),
+            term_grace: super::Duration::from_secs(5),
+            ..super::ReconcileSettings::default()
+        };
+        assert_eq!(settings.first_wait(true), super::Duration::from_secs(10));
+        assert_eq!(settings.first_wait(false), super::Duration::from_secs(5));
+    }
+
     use super::*;
 
     #[test]

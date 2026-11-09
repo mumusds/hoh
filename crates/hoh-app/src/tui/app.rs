@@ -40,8 +40,15 @@ struct Attached {
     label: String,
 }
 
-/// The built-in default mode; the configured `default_mode` is read once the config parser exists (M2-T07).
+/// The built-in default mode (REQ-001; docs/adr/ADR-022.md decision 6).
 const DEFAULT_MODE: &str = "AUTO";
+
+/// The mode the top bar shows for `project`: its configuration's `default_mode`, or the built-in one when it has no
+/// configuration file or an invalid one (ADR-014; docs/adr/ADR-022.md decision 6, M2T07R-355).
+pub fn mode_of(project: &std::path::Path) -> String {
+    hoh_core::config::load(project)
+        .map_or_else(|_| DEFAULT_MODE.to_owned(), |c| c.project.default_mode)
+}
 
 #[derive(Debug)]
 struct Search {
@@ -54,7 +61,7 @@ struct Search {
 #[derive(Debug)]
 pub struct App {
     project: String,
-    mode: &'static str,
+    mode: String,
     editor: Editor,
     history: History,
     /// The history entry shown by Up/Down, with the draft from before browsing.
@@ -71,7 +78,7 @@ impl App {
         let messages = history.notice().map(str::to_owned).into_iter().collect();
         App {
             project,
-            mode: DEFAULT_MODE,
+            mode: DEFAULT_MODE.to_owned(),
             editor: Editor::default(),
             history,
             browsing: None,
@@ -80,6 +87,17 @@ impl App {
             messages,
             run: None,
         }
+    }
+
+    /// The shell of `project`: its name, its input history and its configured mode (see [`mode_of`]).
+    pub fn open(project: &std::path::Path) -> App {
+        let name = project.file_name().map_or_else(
+            || project.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        let mut app = App::new(name, History::load(project));
+        app.mode = mode_of(project);
+        app
     }
 
     /// Bind the shell to run `run_id`, shown as `label`.

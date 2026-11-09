@@ -45,8 +45,8 @@ pub struct Registry {
     /// The agents the runner needs looked at (its team's, its unbound bindings'): [`Registry::refresh`] looks at them,
     /// off the runner's tick, so no probe holds up a tick or the host's stop.
     wanted: Mutex<BTreeSet<Agent>>,
-    /// Set when the host stops: a probe running ends at once and none starts (M2T07R-202).
-    stopping: Arc<std::sync::atomic::AtomicBool>,
+    /// The host's stop: it kills every probe command running and none starts (decision 10 v4, M2T07R-202, -300).
+    stopping: probe::ProbeStop,
 }
 
 impl Registry {
@@ -56,14 +56,14 @@ impl Registry {
             path,
             seen: Mutex::new(BTreeMap::new()),
             wanted: Mutex::new(BTreeSet::new()),
-            stopping: Arc::default(),
+            stopping: probe::ProbeStop::default(),
         }
     }
 
-    /// The host stops: the probe running ends (its command's group killed, its leader reaped) and none starts.
+    /// The host stops: every probe command running is killed (its group and its leader) before this returns, however
+    /// late the thread that started it runs, and none starts (decision 10 v4, M2T07R-300).
     pub fn stop(&self) {
-        self.stopping
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.stopping.stop();
     }
 
     /// The agents named `names` are the ones to look at from now on (names that are not agents are left out).
@@ -155,6 +155,11 @@ impl Registry {
             Ok(found) => found,
             Err(why) => (Stamp::new(), Err(why)),
         };
+        // A look the host's stop ended says nothing of the agent: not recorded, so it stays as last seen (or not looked
+        // at), and no dispatch takes the stop for the agent being unavailable (M2T07R-352).
+        if self.stopping.is_stopped() {
+            return outcome;
+        }
         if let Ok(mut seen) = self.seen.lock() {
             seen.insert(
                 agent,

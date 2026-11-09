@@ -343,7 +343,8 @@ fn apply(
     let tx = writer::begin(conn, ctx)?;
     // A cancel takes precedence over how the attempt ended: CANCELLED, not counted, no retry; the run's cancel moves
     // its task (docs/adr/ADR-021.md decision 8e). Read in this transaction, not from the scan: a CancelRun committed
-    // between the scan and this apply counts (M2T06R-02).
+    // between the scan and this apply counts (M2T06R-02). An unknown effect too: the attempt CANCELLED, its effects
+    // UNKNOWN as the disposition moves them, its task the cancel's (M2T07R-301).
     let cancel_requested: bool = tx
         .query_row(
             "SELECT cancel_requested FROM attempts WHERE attempt_id = ?1",
@@ -352,7 +353,9 @@ fn apply(
         )
         .map_err(sqlite_error)?;
     let (attempt_to, task_to) = match attempt_to {
-        Some(AttemptState::Failed | AttemptState::Settled) if cancel_requested => {
+        Some(AttemptState::Failed | AttemptState::Settled | AttemptState::UnknownEffect)
+            if cancel_requested =>
+        {
             (Some(AttemptState::Cancelled), None)
         }
         other => (other, task_to),

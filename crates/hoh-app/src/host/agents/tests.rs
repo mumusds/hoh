@@ -104,3 +104,43 @@ fn a_roles_needs_follow_its_contract() {
     );
     assert_eq!(required(None), set(&["structured_events"]));
 }
+
+#[test]
+fn a_look_the_hosts_stop_ends_says_nothing_of_its_agent() -> R {
+    // M2T07R-352 (docs/adr/ADR-022.md decision 10): a probe the stop ended is not a finding about the agent: the agent
+    // stays not looked at (neither available nor unavailable), so no dispatch takes the host's stop for it.
+    let dir = tempfile::tempdir()?;
+    let script = dir.path().join("claude");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho $$ > '{pid}'\nexec sleep 30\n",
+            pid = dir.path().join("pid").display()
+        ),
+    )?;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+    let registry = Arc::new(Registry::new(
+        format!("{}:/usr/bin:/bin", dir.path().display()).into(),
+    ));
+    let looking = registry.clone();
+    let look = std::thread::spawn(move || looking.look(Agent::Claude));
+    let end = std::time::Instant::now() + Duration::from_secs(20);
+    while !dir.path().join("pid").exists() {
+        assert!(std::time::Instant::now() < end, "the probe never ran");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    registry.stop();
+    let looked = look.join().map_err(|_| "the look panicked")?;
+    assert!(looked.is_err(), "{looked:?}");
+    assert_eq!(registry.seen(Agent::Claude), None);
+    let known = registry.availability();
+    assert!(
+        !known.unavailable.contains_key("claude")
+            && !known
+                .available
+                .as_ref()
+                .is_some_and(|a| a.contains("claude")),
+        "{known:?}"
+    );
+    Ok(())
+}
