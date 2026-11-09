@@ -683,3 +683,157 @@ fn the_uninstall_keeps_a_command_that_is_no_longer_its_link_and_says_so() -> R {
     );
     Ok(())
 }
+
+/// The uninstall started in the background, paused before its first removal by a stand-in `rm` until `go` exists.
+fn paused_uninstall(install: &Install) -> R<(std::process::Child, PathBuf)> {
+    let paused = install.root.path().join("rm-paused");
+    let go = install.root.path().join("rm-go");
+    script(
+        &install.stubs().join("rm"),
+        &format!(
+            "#!/bin/sh\nif [ ! -e {p} ]; then : > {p}; i=0; while [ ! -e {g} ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done; fi\nexec /usr/bin/rm \"$@\"\n",
+            p = paused.display(),
+            g = go.display()
+        ),
+    )?;
+    let child = Command::new("bash")
+        .arg(install.root.path().join("bundle/hoh/install.sh"))
+        .arg("--uninstall")
+        .current_dir(install.root.path())
+        .env_clear()
+        .env("HOME", install.home())
+        .env("XDG_RUNTIME_DIR", install.root.path().join("r"))
+        .env("USER", "tester")
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", install.stubs().display()),
+        )
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !paused.exists() {
+        if std::time::Instant::now() > end {
+            return Err("the uninstall did not pause".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    Ok((child, go))
+}
+
+/// `hoh --version` from the installed command under strace, its first `syscall` held 4 s at entry; the strace and
+/// the pid of hoh once it runs.
+fn held_at(install: &Install, syscall: &str) -> R<(std::process::Child, u32)> {
+    let strace = Command::new("strace")
+        .args(["-f", "-qq", "-o", "/dev/null", "-e"])
+        .arg(format!("trace={syscall}"))
+        .arg("-e")
+        .arg(format!("inject={syscall}:delay_enter=4000000:when=1"))
+        .arg(install.home().join(".local/bin/hoh"))
+        .arg("--version")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("precondition: strace ({e})"))?;
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let children = std::fs::read_to_string(format!(
+            "/proc/{}/task/{}/children",
+            strace.id(),
+            strace.id()
+        ))
+        .unwrap_or_default();
+        // strace may first fork a helper of its own (to probe ptrace): hoh is the child running a binary of the
+        // installation.
+        let root = install.data().join("hoh");
+        if let Some(pid) = children
+            .split_whitespace()
+            .filter_map(|p| p.parse::<u32>().ok())
+            .find(|p| {
+                std::fs::read_link(format!("/proc/{p}/exe")).is_ok_and(|exe| exe.starts_with(&root))
+            })
+        {
+            return Ok((strace, pid));
+        }
+        if std::time::Instant::now() > end {
+            return Err("strace started nothing".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn a_run_that_gets_its_lock_only_after_the_uninstall_removed_it_does_not_run_on() -> R {
+    // ADR-023 design correction 3 (round 3): a run that opened the lock while the uninstall removed the installation
+    // and got its shared lock only after the uninstall ended (flock held 4 s by strace) holds an old file: refused.
+    let install = Install::new()?;
+    let out = install.run("bundle", &[])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let (uninstall, go) = paused_uninstall(&install)?;
+    let (strace, pid) = held_at(&install, "flock")?;
+    let lock = install.data().join("hoh/.lock");
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !std::fs::read_dir(format!("/proc/{pid}/fd"))?
+        .flatten()
+        .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|t| t == lock))
+    {
+        if std::time::Instant::now() > end {
+            return Err("hoh never opened the lock".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    std::fs::write(&go, "")?;
+    let done = uninstall.wait_with_output()?;
+    assert_eq!(done.status.code(), Some(0), "{}", text(&done));
+    let run = strace.wait_with_output()?;
+    assert_eq!(run.status.code(), Some(69), "{}", text(&run));
+    assert!(String::from_utf8(run.stderr)?.contains("being uninstalled"));
+    Ok(())
+}
+
+#[test]
+fn a_run_whose_binary_the_uninstall_removed_before_it_looked_does_not_run_on() -> R {
+    // Design correction 3 (round 3): a run held before it reads its own path (readlink of /proc/self/exe, 4 s) while
+    // the uninstall removes its binary reads " (deleted)": refused, not taken for a binary outside an installation.
+    let install = Install::new()?;
+    let out = install.run("bundle", &[])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let (uninstall, go) = paused_uninstall(&install)?;
+    let (strace, _pid) = held_at(&install, "readlink")?;
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    std::fs::write(&go, "")?;
+    let done = uninstall.wait_with_output()?;
+    assert_eq!(done.status.code(), Some(0), "{}", text(&done));
+    let run = strace.wait_with_output()?;
+    assert_eq!(run.status.code(), Some(69), "{}", text(&run));
+    assert!(String::from_utf8(run.stderr)?.contains("being uninstalled"));
+    Ok(())
+}
+
+#[test]
+fn a_run_between_its_exec_and_its_lock_keeps_the_uninstall_from_removing_anything() -> R {
+    // M2T14R-252: a run of the installed binary held (4 s, strace) before it reads its own path, so before its lock:
+    // the uninstall gets the lock but finds the run by its binary and removes nothing (69); the scan is a defence of
+    // its own, not only a report.
+    let install = Install::new()?;
+    let out = install.run("bundle", &[])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let (strace, pid) = held_at(&install, "readlink")?;
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let out = install.run("bundle", &["--uninstall"])?;
+    assert_eq!(out.status.code(), Some(69), "{}", text(&out));
+    assert!(
+        String::from_utf8(out.stderr.clone())?.contains(&format!("pid {pid}")),
+        "{}",
+        text(&out)
+    );
+    assert!(install.home().join(".local/bin/hoh").exists());
+    assert!(install.data().join("hoh/current/bin/hoh").exists());
+    let run = strace.wait_with_output()?;
+    assert_eq!(run.status.code(), Some(0), "{}", text(&run));
+    let out = install.run("bundle", &["--uninstall"])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    Ok(())
+}

@@ -599,29 +599,40 @@ fn supervised(
                 deadline: None,
                 ..env.clone()
             };
-            let state = hoh_agents::probe::run_status(
+            // Only the manager's answer is reported (ADR-023 design correction 4, M2T14R-251): none (a failure, a
+            // limit, a non-zero exit, no ActiveState line) is said as none, not read as "no start".
+            let answer = hoh_agents::probe::run_status(
                 &unit.systemctl,
                 &["--user", "show", "-p", "Job,ActiveState", &unit.name],
                 &asked,
             )
+            .ok()
+            .filter(|out| out.status.success())
             .map(|out| hoh_app::unit::show(&String::from_utf8_lossy(&out.stdout)))
-            .unwrap_or_default();
-            let job = state.get("Job").map(String::as_str).unwrap_or_default();
-            let active = state
-                .get("ActiveState")
-                .map(String::as_str)
-                .unwrap_or_default();
-            let found = if !job.is_empty()
-                || matches!(active, "activating" | "deactivating" | "reloading")
-            {
-                format!(
-                    "the start goes on in the user's systemd manager (Job={job}, ActiveState={active}; after a crash \
-                     systemd first stops what the previous host left, up to 15 s): run hoh again shortly"
-                )
-            } else {
-                format!(
-                    "the user's systemd manager shows no start of it (Job={job}, ActiveState={active}): run hoh again"
-                )
+            .filter(|state| state.contains_key("ActiveState"));
+            let found = match answer {
+                Some(state) => {
+                    let job = state.get("Job").map(String::as_str).unwrap_or_default();
+                    let active = state
+                        .get("ActiveState")
+                        .map(String::as_str)
+                        .unwrap_or_default();
+                    if !job.is_empty()
+                        || matches!(active, "activating" | "deactivating" | "reloading")
+                    {
+                        format!(
+                            "the start goes on in the user's systemd manager (Job={job}, ActiveState={active}; after a \
+                             crash systemd first stops what the previous host left, up to 15 s): run hoh again shortly"
+                        )
+                    } else {
+                        format!(
+                            "the user's systemd manager shows no start of it (Job={job}, ActiveState={active}): run \
+                             hoh again"
+                        )
+                    }
+                }
+                None => "the user's systemd manager did not answer whether the start goes on: run hoh again shortly"
+                    .to_owned(),
             };
             return Err(Failure::unreachable(format!(
                 "{} did not finish starting within {} s; {found}, or see systemctl --user status {}",

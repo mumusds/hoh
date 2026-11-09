@@ -91,14 +91,18 @@ pub fn installation_root(exe: &Path) -> Option<PathBuf> {
     .then(|| root.to_path_buf())
 }
 
-/// Hold the installation of the binary at `exe` (canonical) shared, for as long as the returned file is open: every
-/// run of an installed hoh does, before anything else, and the uninstall takes it exclusive before it removes anything
-/// (ADR-023 design correction 2, M2T14R-100). `None` for a binary not in an installation; an error when the
-/// installation is being removed (its lock held exclusive, or its root gone). The file is close-on-exec: the agents a
-/// host starts do not hold it.
+/// Hold the installation of the binary at `exe` (as `std::env::current_exe` reads it, " (deleted)" included) shared,
+/// for as long as the returned file is open: every run of an installed hoh does, before anything else, and the
+/// uninstall takes it exclusive before it removes anything (ADR-023 design corrections 2 and 3, M2T14R-100). `None`
+/// for a binary not in an installation; an error when the installation is being removed: its lock held exclusive,
+/// its lock file or root gone (the installer makes the file; it is never made here), a lock got on a file no longer
+/// the one at its path (the uninstall removed it meanwhile), or this binary removed. The file is close-on-exec: the
+/// agents a host starts do not hold it.
 pub fn hold_installation(exe: &Path) -> Result<Option<std::fs::File>, Unusable> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let Some(root) = installation_root(exe) else {
+    let removed = exe.to_str().and_then(|p| p.strip_suffix(" (deleted)"));
+    let named = removed.map_or_else(|| exe.to_path_buf(), PathBuf::from);
+    let canonical = std::fs::canonicalize(&named).ok();
+    let Some(root) = installation_root(canonical.as_deref().unwrap_or(&named)) else {
         return Ok(None);
     };
     let being_removed = |why: String| {
@@ -107,17 +111,45 @@ pub fn hold_installation(exe: &Path) -> Result<Option<std::fs::File>, Unusable> 
             root.display()
         ))
     };
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(root.join(".lock"))
-        .map_err(|e| being_removed(format!("cannot open its lock: {e}")))?;
+    if removed.is_some() || canonical.is_none() {
+        return Err(being_removed(format!("{} was removed", named.display())));
+    }
+    let path = root.join(".lock");
+    // Read-only: a shared flock needs no more (a 0400 lock is fine). Gone: the uninstall removed it, or is removing
+    // the installation; any other failure is said as it is, not as an uninstall (M2T14R-250).
+    let file = std::fs::File::open(&path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            being_removed(format!("its lock {} is gone", path.display()))
+        } else {
+            Unusable(format!(
+                "cannot open the installation's lock {}: {e}",
+                path.display()
+            ))
+        }
+    })?;
     rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockShared)
         .map_err(|e| being_removed(format!("its lock is held ({e})")))?;
+    if !still_linked(&file, &path) {
+        return Err(being_removed(
+            "its lock was removed before it was held".to_owned(),
+        ));
+    }
+    if canonical.as_deref().is_some_and(|exe| !exe.exists()) {
+        return Err(being_removed(format!("{} was removed", named.display())));
+    }
     Ok(Some(file))
+}
+
+/// Whether `file` is still the file at `path` (same device and inode, and linked): a lock got on a file the uninstall
+/// removed or replaced meanwhile holds nothing.
+pub fn still_linked(file: &std::fs::File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    match (file.metadata(), std::fs::metadata(path)) {
+        (Ok(held), Ok(named)) => {
+            held.nlink() > 0 && held.dev() == named.dev() && held.ino() == named.ino()
+        }
+        _ => false,
+    }
 }
 
 /// The environment file of `instance` in the installation at `root`: the only one HoH writes for it.

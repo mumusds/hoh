@@ -119,6 +119,8 @@ install() {
   # A version directory is named by its binary and never changed once there: a host running from it, and the agents
   # it starts through its start gate, keep using it until they restart.
   mkdir -p -- "$root/versions"
+  # The installation's lock, which every run of it holds shared; made here, never by a run (design correction 3).
+  [[ -e "$root/.lock" ]] || : >"$root/.lock"
   if [[ ! -d "$root/versions/$name" ]]; then
     local tmp="$root/versions/.tmp.$$" entry
     rm -rf -- "$tmp"

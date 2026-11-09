@@ -35,19 +35,17 @@ fn main() {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     // An installed hoh holds its installation for its whole run, whatever it was asked; none runs while it is being
     // uninstalled (docs/adr/ADR-023.md design correction 2). Kept open until the process ends.
-    let _installation = match std::env::current_exe()
-        .and_then(std::fs::canonicalize)
-        .map(|exe| hoh_app::unit::hold_installation(&exe))
-    {
-        Ok(Err(why)) => {
-            say!("hoh: {why}");
-            std::process::exit(i32::from(
-                exit::exit_code(Ending::Client(ClientEvent::HostUnavailable)).unwrap_or(69),
-            ));
-        }
-        Ok(Ok(held)) => held,
-        Err(_) => None,
-    };
+    let _installation =
+        match std::env::current_exe().map(|exe| hoh_app::unit::hold_installation(&exe)) {
+            Ok(Err(why)) => {
+                say!("hoh: {why}");
+                std::process::exit(i32::from(
+                    exit::exit_code(Ending::Client(ClientEvent::HostUnavailable)).unwrap_or(69),
+                ));
+            }
+            Ok(Ok(held)) => held,
+            Err(_) => None,
+        };
     // Internal mode: the second process of the WAL self-test (REQ-062); not a user command and in no help text.
     if args.first().map(OsString::as_os_str)
         == Some(hoh_core::persistence::selftest::PROBE_ARG.as_ref())

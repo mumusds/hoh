@@ -1073,8 +1073,9 @@ fn running_under(root: &Path) -> R<Vec<String>> {
 #[test]
 fn nothing_of_the_installation_starts_while_the_uninstall_removes_it() -> R {
     // M2T14R-100 (ADR-023 design correction 2): the uninstall paused before its first removal (a stand-in rm waits);
-    // a client's start through the unit and a host started directly both end at once (69, being uninstalled), and once
-    // the uninstall is done nothing runs a removed binary.
+    // the installed client (it holds the installation itself, so it ends before it reaches the unit), a host its unit
+    // starts and a host started directly all end at once (69, being uninstalled), and once the uninstall is done nothing
+    // runs a removed binary.
     let (mut manager, project) = installed(true)?;
     let paused = manager.root().join("rm-paused");
     let go = manager.root().join("rm-go");
@@ -1113,6 +1114,29 @@ fn nothing_of_the_installation_starts_while_the_uninstall_removes_it() -> R {
         .current_dir(&project)
         .stdin(std::process::Stdio::null())
         .output()?;
+    // A host its unit starts meanwhile (as a user's own `systemctl start` would): it ends 69, said in its stderr file,
+    // and is not restarted (M2T14R-253; the client above ends on its own hold of the lock before reaching the unit).
+    let unit = unit_of(&project);
+    let _ = manager.systemctl(&["start", &unit])?;
+    manager.wait_until("the unit's host to end", Duration::from_secs(20), |m| {
+        Ok(m.property(&unit, "ActiveState")? == "failed")
+    })?;
+    let shown = manager.show(&unit, "ExecMainStatus,NRestarts")?;
+    assert_eq!(
+        shown.get("ExecMainStatus").map(String::as_str),
+        Some("69"),
+        "{shown:?}"
+    );
+    assert_eq!(
+        shown.get("NRestarts").map(String::as_str),
+        Some("0"),
+        "{shown:?}"
+    );
+    let said = std::fs::read_to_string(manager.runtime().join(format!(
+        "hoh-host@{}.stderr",
+        hoh_app::unit::instance(&project)
+    )))?;
+    assert!(said.contains("being uninstalled"), "{said}");
     std::fs::write(&go, "")?;
     let done = uninstall.wait_with_output()?;
     assert_eq!(done.status.code(), Some(0), "{}", text(&done));
@@ -1129,5 +1153,78 @@ fn nothing_of_the_installation_starts_while_the_uninstall_removes_it() -> R {
         Vec::<String>::new()
     );
     assert!(!manager.data().join("hoh").exists());
+    Ok(())
+}
+
+#[test]
+fn a_manager_that_does_not_answer_after_the_deadline_is_not_read_as_no_start() -> R {
+    // M2T14R-251 (ADR-023 design correction 4): the start takes 14 s (a drop-in) and the manager's answer to the
+    // client's question after its deadline takes 3 s (a stand-in systemctl): the client says the manager did not answer.
+    let (manager, project) = installed(true)?;
+    dropin(
+        &manager,
+        "slow.conf",
+        "[Service]\nExecStartPre=/bin/sleep 14\n",
+    )?;
+    installed::script(
+        &manager.bin().join("systemctl"),
+        "#!/bin/sh\ncase \" $* \" in *\" Job,ActiveState \"*) sleep 3;; esac\nexec /usr/bin/systemctl \"$@\"\n",
+    )?;
+    let out = hoh_in(
+        &manager,
+        &project,
+        None,
+        &["-p", "x", "--detach", "--output", "json"],
+    )?;
+    assert_eq!(out.status.code(), Some(69), "{}", text(&out));
+    let stderr = String::from_utf8(out.stderr)?;
+    assert!(stderr.contains("did not answer"), "{stderr}");
+    assert!(!stderr.contains("shows no start"), "{stderr}");
+    Ok(())
+}
+
+#[test]
+fn a_host_its_unit_starts_that_finds_the_project_held_makes_the_client_use_the_holder() -> R {
+    // M2T14R-152 (the way M2T14R-255 shows): a stand-in systemctl starts the project's host directly and waits for it
+    // before the real start; the unit's host finds the project held and ends 69 (not restarted), and the client, told
+    // so by its exit status, uses the host that holds it.
+    let (mut manager, project) = installed(true)?;
+    let unit = unit_of(&project);
+    let installed_hoh = manager.home().join(".local/bin/hoh");
+    installed::script(
+        &manager.bin().join("systemctl"),
+        &format!(
+            "#!/bin/sh\ncase \" $* \" in *\" start \"*)\n  (cd {p} && exec {h} __host {p} </dev/null >/dev/null 2>&1) &\n  i=0; while [ ! -s {p}/.hoh/host.json ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i+1)); done;;\nesac\nexec /usr/bin/systemctl \"$@\"\n",
+            p = project.display(),
+            h = installed_hoh.display()
+        ),
+    )?;
+    let out = hoh_in(
+        &manager,
+        &project,
+        None,
+        &["-p", "x", "--detach", "--output", "json"],
+    )?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    manager.wait_until("the unit's host to end", Duration::from_secs(20), |m| {
+        Ok(m.property(&unit, "ActiveState")? == "failed")
+    })?;
+    let shown = manager.show(&unit, "ExecMainStatus,NRestarts")?;
+    assert_eq!(
+        shown.get("ExecMainStatus").map(String::as_str),
+        Some("69"),
+        "{shown:?}"
+    );
+    assert_eq!(
+        shown.get("NRestarts").map(String::as_str),
+        Some("0"),
+        "{shown:?}"
+    );
+    let info = host_json(&project).ok_or("host.json")?;
+    assert!(
+        info["supervisor"].is_null(),
+        "the holder, not the unit's: {info}"
+    );
+    assert_eq!(hosts_of(&project)?.len(), 1);
     Ok(())
 }
