@@ -78,6 +78,10 @@ pub struct Outcome {
     pub class: FailureClass,
     /// What the agent's turn showed beyond its verdict (docs/adr/ADR-022.md decision 12); test executors give none.
     pub observed: hoh_core::persistence::Observed,
+    /// The turn's verdict was UNKNOWN_EFFECT (it ended after starting an effect whose outcome it never reported): the
+    /// attempt ends UNKNOWN_EFFECT, its task untouched and nothing run again, as a reconcile ends one (ADR-019 decision
+    /// 5, M2T07R-200); its work effect is left STARTED, never recorded as a result.
+    pub unknown_effect: bool,
 }
 
 /// The host's source of the retries' jitter draws (ADR-020 decision 2): one SplitMix64 for the reconcile and the
@@ -196,6 +200,10 @@ pub struct RunnerConfig {
 /// How often the runner looks again when nothing woke it.
 const TICK: Duration = Duration::from_millis(200);
 
+/// How long the host's stop waits for a probe running to end: its command's polling (10 ms) and its leader's reaping
+/// (1 s at most).
+const PROBE_STOP: Duration = Duration::from_secs(5);
+
 /// How often the leases of the attempts it runs are renewed (REQ-041: every 30 s, for 120 s).
 const RENEW: Duration = Duration::from_secs(30);
 
@@ -229,6 +237,7 @@ impl Common {
             at: self.clock.now(),
             draw: self.jitter.draw(),
             observed: hoh_core::persistence::Observed::default(),
+            unknown_effect: false,
         }
     }
 }
@@ -268,9 +277,9 @@ pub(super) async fn run(
         jitter,
         inflight,
     });
-    let watch = config
-        .executor
-        .registry()
+    let registry = config.executor.registry();
+    let watch = registry
+        .clone()
         .map(|registry| tokio::spawn(registry_watch(registry, stop.clone())));
     let mut renewed = Instant::now();
     let mut held_back: BTreeMap<String, (Instant, String)> = BTreeMap::new();
@@ -288,9 +297,15 @@ pub(super) async fn run(
             _ = stop.changed() => break,
         }
     }
-    if let Some(watch) = watch {
+    // The registry's probe running ends with its command's group killed and its leader reaped, so nothing it started
+    // outlives the host (M2T07R-202); its loop is waited for, within a bound.
+    if let Some(registry) = &registry {
+        registry.stop();
+    }
+    if let Some(mut watch) = watch
+        && tokio::time::timeout(PROBE_STOP, &mut watch).await.is_err()
+    {
         watch.abort();
-        let _ = watch.await;
     }
     // The host stops: the attempts in flight are left as they are (their processes run on); the next host's reconcile
     // settles them.
@@ -310,10 +325,10 @@ pub(super) async fn run(
 async fn registry_watch(registry: Arc<super::agents::Registry>, mut stop: watch::Receiver<bool>) {
     loop {
         let looking = registry.clone();
-        let refresh = tokio::task::spawn_blocking(move || looking.refresh());
-        tokio::select! {
-            _ = refresh => {}
-            _ = stop.changed() => break,
+        // Not left behind on a stop: the registry's stop ends the probe, and the host waits for it (M2T07R-202).
+        let _ = tokio::task::spawn_blocking(move || looking.refresh()).await;
+        if *stop.borrow() {
+            break;
         }
         tokio::select! {
             () = tokio::time::sleep(TICK) => {}
@@ -380,7 +395,7 @@ async fn tick(
                 .chain(waiting.unbound.iter().map(|u| u.agent.clone()))
                 .collect();
             registry.want(&named);
-            registry.availability(&waiting.agents)
+            registry.availability()
         }
         None => hoh_core::persistence::Availability::default(),
     };
@@ -588,6 +603,7 @@ async fn attempt(
     // The class and the time it ended go with the outcome, so a host that crashes after OBSERVED retries it as it would
     // have, from the time it ended (ADR-020 decision 1, M2T19R-03).
     let ended = common.clock.now();
+    let unknown = outcome.unknown_effect;
     let mut observed = json!({
         "success": outcome.success,
         "detail": outcome.detail,
@@ -598,15 +614,18 @@ async fn attempt(
     {
         observed.extend(class);
     }
-    if !store
-        .runner_effect(
-            &id,
-            &key,
-            EffectState::Started,
-            EffectState::Observed,
-            observed,
-        )
-        .await?
+    // An unknown effect has no result to record: its work effect stays STARTED, so a crash from here on settles it
+    // UNKNOWN_EFFECT too.
+    if !unknown
+        && !store
+            .runner_effect(
+                &id,
+                &key,
+                EffectState::Started,
+                EffectState::Observed,
+                observed,
+            )
+            .await?
     {
         return Ok(());
     }
@@ -678,15 +697,16 @@ async fn attempt(
             return Ok(());
         }
     }
-    if !store
-        .runner_effect(
-            &id,
-            &key,
-            EffectState::Observed,
-            EffectState::Committed,
-            json!({}),
-        )
-        .await?
+    if !unknown
+        && !store
+            .runner_effect(
+                &id,
+                &key,
+                EffectState::Observed,
+                EffectState::Committed,
+                json!({}),
+            )
+            .await?
     {
         return Ok(());
     }
@@ -701,6 +721,7 @@ async fn attempt(
                 at: ended,
                 draw: common.jitter.draw(),
                 observed: outcome.observed.clone(),
+                unknown_effect: unknown,
             },
         )
         .await?;
@@ -787,8 +808,8 @@ async fn settle(
         if let Some(work) = &work {
             executor.cancel(work);
         }
-        // The native cancel's grace first: a group that emptied by it gets no signal.
-        seen.grace(settings.term_grace);
+        // The native cancel's grace first: a group that emptied by it gets no signal (M2T07R-254).
+        seen.grace(settings.native_grace);
         Some((
             found,
             finding,

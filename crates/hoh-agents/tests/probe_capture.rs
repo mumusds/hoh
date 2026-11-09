@@ -26,6 +26,7 @@ fn an_escaped_helper_holding_the_output_leaves_nothing_in_the_probe()
         timeout: Duration::from_millis(300),
         log: None,
         deadline: None,
+        cancel: None,
     };
     // The helper inherits stdout and stderr and outlives the command in a session of its own.
     let script = format!(

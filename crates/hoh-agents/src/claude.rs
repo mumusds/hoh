@@ -529,12 +529,21 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
             return Facts::incomplete(raw_log_path, recorded);
         };
         let (state, failure) = driven.verdict();
+        // Claude's own cost estimate goes with the usage, never as the run's cost (ADR-020, M2T07R-256).
+        let usage = match (driven.usage, driven.cost) {
+            (Some(Value::Object(mut usage)), Some(cost)) => {
+                usage.insert("reported_cost_usd".to_owned(), json!(cost));
+                Some(Value::Object(usage))
+            }
+            (None, Some(cost)) => Some(json!({"reported_cost_usd": cost})),
+            (usage, _) => usage,
+        };
         Facts {
             state,
             failure,
             native_session: driven.native_session,
             resolved_model: driven.model,
-            usage: driven.usage,
+            usage,
             raw_log_path,
             max_buffered: driven.report.as_ref().map(|r| r.stdout.max_buffered),
             group_reaped: driven.report.as_ref().is_some_and(|r| r.group_reaped),

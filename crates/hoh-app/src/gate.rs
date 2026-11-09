@@ -3,9 +3,10 @@
 //! runs (ADR-019 decision 8, ADR-021 decision 8d), with no shell (REQ-024, REQ-025 behaviour 1).
 //!
 //! It reads stdin one byte at a time up to a line feed, so nothing after the line is consumed. If the line is `go`, it
-//! execs the program in its own place: the same pid, process group, environment (the attempt's marker) and cgroup;
-//! std's exec clears the signal mask and gives SIGPIPE its default action, so the agent starts with no signal
-//! ignored or blocked. At the end of its input, or for any other line, it exits 0 and the agent never runs.
+//! execs the program in its own place: the same pid, process group, environment (the attempt's marker) and cgroup,
+//! with every signal back to its default action and none blocked, whatever the gate inherited (a parent that ignores
+//! SIGINT, as a shell's background job does, would otherwise make the agent deaf to its native cancel, M2T07R-203).
+//! At the end of its input, or for any other line, it exits 0 and the agent never runs.
 
 use std::ffi::OsString;
 use std::os::unix::process::CommandExt as _;
@@ -35,6 +36,7 @@ pub fn main(args: &[OsString]) -> i32 {
     if line != b"go" {
         return 0;
     }
+    defaults();
     let error = std::process::Command::new(program).args(rest).exec();
     use std::io::Write as _;
     let _ = writeln!(
@@ -43,4 +45,21 @@ pub fn main(args: &[OsString]) -> i32 {
         program.to_string_lossy()
     );
     127
+}
+
+/// Every standard signal back to its default action in the program the gate execs, and none blocked: an action set
+/// now (a caught signal) is reset by exec, an ignored one would be kept. SIGKILL and SIGSTOP have no other action;
+/// SIGILL, SIGFPE and SIGSEGV are left as inherited (no handler may be set for them through signal-hook, and nothing
+/// that starts the host ignores them). A signal that comes in the instant between is taken by its flag.
+fn defaults() {
+    for signal in 1..32 {
+        if signal_hook::consts::FORBIDDEN.contains(&signal) {
+            continue;
+        }
+        let _ = signal_hook::flag::register(
+            signal,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+    }
+    let _ = nix::sys::signal::SigSet::empty().thread_set_mask();
 }

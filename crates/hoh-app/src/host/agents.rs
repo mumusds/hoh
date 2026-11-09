@@ -45,6 +45,8 @@ pub struct Registry {
     /// The agents the runner needs looked at (its team's, its unbound bindings'): [`Registry::refresh`] looks at them,
     /// off the runner's tick, so no probe holds up a tick or the host's stop.
     wanted: Mutex<BTreeSet<Agent>>,
+    /// Set when the host stops: a probe running ends at once and none starts (M2T07R-202).
+    stopping: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Registry {
@@ -54,7 +56,14 @@ impl Registry {
             path,
             seen: Mutex::new(BTreeMap::new()),
             wanted: Mutex::new(BTreeSet::new()),
+            stopping: Arc::default(),
         }
+    }
+
+    /// The host stops: the probe running ends (its command's group killed, its leader reaped) and none starts.
+    pub fn stop(&self) {
+        self.stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// The agents named `names` are the ones to look at from now on (names that are not agents are left out).
@@ -77,19 +86,26 @@ impl Registry {
         }
     }
 
-    /// What was last seen of the agents named `names`, without looking (decision 8): those found unavailable (a name
-    /// that is no agent among them), and those not looked at yet.
-    pub fn availability(&self, names: &BTreeSet<String>) -> hoh_core::persistence::Availability {
-        let mut known = hoh_core::persistence::Availability::default();
-        for name in names {
-            match Agent::named(name).map(|agent| self.seen(agent)) {
-                None | Some(Some(Err(_))) => {
-                    known.unavailable.insert(name.clone());
+    /// What was last seen of every agent, without looking (decision 8): those found available, those found unavailable
+    /// with why; any other was not looked at yet.
+    pub fn availability(&self) -> hoh_core::persistence::Availability {
+        let mut known = hoh_core::persistence::Availability {
+            available: Some(BTreeSet::new()),
+            unavailable: BTreeMap::new(),
+        };
+        if let Ok(seen) = self.seen.lock() {
+            for (agent, seen) in seen.iter() {
+                let name = agent.as_str().to_owned();
+                match &seen.outcome {
+                    Ok(_) => {
+                        if let Some(available) = known.available.as_mut() {
+                            available.insert(name);
+                        }
+                    }
+                    Err(why) => {
+                        known.unavailable.insert(name, why.clone());
+                    }
                 }
-                Some(None) => {
-                    known.unknown.insert(name.clone());
-                }
-                Some(Some(Ok(_))) => {}
             }
         }
         known
@@ -102,6 +118,7 @@ impl Registry {
             timeout: PROBE_TIMEOUT,
             log: None,
             deadline: None,
+            cancel: Some(self.stopping.clone()),
         }
     }
 

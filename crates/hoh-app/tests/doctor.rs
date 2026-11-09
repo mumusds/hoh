@@ -213,6 +213,7 @@ impl Sandbox {
             timeout: Duration::from_secs(30),
             log: None,
             deadline: None,
+            cancel: None,
         };
         let mut entries = BTreeMap::new();
         for agent in agents {

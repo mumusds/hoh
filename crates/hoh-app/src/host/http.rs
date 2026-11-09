@@ -387,7 +387,7 @@ async fn team_revision(shared: &Arc<Shared>) -> Option<i64> {
 /// and the error for StartRun to refuse with (REQ-018 failure mode 5).
 pub(super) async fn sync_config(
     shared: &Arc<Shared>,
-) -> Result<hoh_core::config::Config, hoh_core::config::ConfigError> {
+) -> Result<hoh_core::config::Config, Unsynced> {
     let root = shared.root.clone();
     let loaded = tokio::task::spawn_blocking(move || hoh_core::config::load_file(&root))
         .await
@@ -438,7 +438,7 @@ pub(super) async fn sync_config(
                     log(&format!("config.invalid could not be recorded: {e}"));
                 }
             }
-            return Err(error);
+            return Err(Unsynced::Invalid(error));
         }
     };
     let source = match &text {
@@ -447,7 +447,8 @@ pub(super) async fn sync_config(
         }
         None => json!({"kind": "builtin"}),
     };
-    // Another host life, or a StartRun at the same time, may have made it already: the command is then a replay.
+    // Another host life, or a StartRun at the same time, may have made it already: the command is then a replay. A
+    // file that could not be applied is not taken as applied (M2T07R-204).
     for _ in 0..3 {
         let project = shared.project_id.clone();
         let latest = read(shared, move |reader| {
@@ -457,11 +458,9 @@ pub(super) async fn sync_config(
             ))
         })
         .await;
-        let Ok((made, base)) = latest else {
-            break;
-        };
+        let (made, base) = latest.map_err(Unsynced::Store)?;
         if made.as_ref().unwrap_or(&json!({"kind": "builtin"})) == &source {
-            break;
+            return Ok(config);
         }
         let tag = source["sha256"].as_str().unwrap_or("builtin").to_owned();
         let command_id = format!("config-file/{tag}/{base}");
@@ -495,14 +494,32 @@ pub(super) async fn sync_config(
         };
         match shared.store.submit_command(submit).await {
             Err(PersistError::StaleRevision { .. }) => continue,
-            Err(e) => {
-                log(&format!("the configuration file could not be applied: {e}"));
-                break;
-            }
-            Ok(_) => break,
+            Err(e) => return Err(Unsynced::Store(e)),
+            Ok(_) => return Ok(config),
         }
     }
-    Ok(config)
+    Err(Unsynced::Moving)
+}
+
+/// Why the project's configuration file was not made the current team revision (decision 6).
+#[derive(Debug)]
+pub(super) enum Unsynced {
+    /// The file is invalid (REQ-018 failure mode 5): StartRun is refused with where.
+    Invalid(hoh_core::config::ConfigError),
+    /// Its revision could not be read or written.
+    Store(PersistError),
+    /// The team changed under it at each of its tries.
+    Moving,
+}
+
+impl std::fmt::Display for Unsynced {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Unsynced::Invalid(e) => write!(f, "{e}"),
+            Unsynced::Store(e) => write!(f, "its revision could not be written: {e}"),
+            Unsynced::Moving => f.write_str("the team changed at each try to apply it"),
+        }
+    }
 }
 
 /// A StartRun refused for the project's invalid configuration file (REQ-018 failure mode 5): 400 INVALID_TEAM_CONFIG
@@ -702,7 +719,18 @@ async fn submit_command(
     if matches!(command.body, CommandBody::StartRun(_)) {
         match sync_config(&shared).await {
             Ok(config) => effective = Some(config),
-            Err(e) => return config_refused(&shared, &e).await,
+            Err(Unsynced::Invalid(e)) => return config_refused(&shared, &e).await,
+            // As any store failure of a command: nothing was started.
+            Err(Unsynced::Store(e)) => return store_error(&shared, "", e).await,
+            Err(Unsynced::Moving) => {
+                return error(
+                    StatusCode::CONFLICT,
+                    "STALE_REVISION",
+                    "the team changed while the project's configuration file was applied; retry",
+                    true,
+                    team_revision(&shared).await,
+                );
+            }
         }
     }
     // The control commands (docs/adr/ADR-021.md decisions 5, 7, 8): their kind, where the run moves, the event's kind

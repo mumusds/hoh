@@ -63,21 +63,22 @@ fn an_agent_is_probed_once_until_its_files_change_and_a_missing_one_is_unavailab
         "pi".to_owned(),
     ]
     .into();
-    let known = registry.availability(&named);
+    let known = registry.availability();
+    assert_eq!(known.available, Some(["claude".to_owned()].into()));
     assert_eq!(
-        known.unavailable,
-        ["codex".to_owned(), "gpt".to_owned()].into()
+        known.unavailable.keys().cloned().collect::<Vec<_>>(),
+        ["codex".to_owned()]
     );
-    assert_eq!(known.unknown, ["pi".to_owned()].into());
+    assert!(known.unknown("pi"), "pi was not looked at yet");
     registry.want(&named);
     registry.refresh();
     assert_eq!(runs(dir.path()), after, "looked at unchanged, probed again");
-    let known = registry.availability(&named);
-    assert_eq!(
-        known.unavailable,
-        ["codex".to_owned(), "gpt".to_owned(), "pi".to_owned()].into()
+    let known = registry.availability();
+    assert!(
+        known.unavailable.contains_key("pi") && !known.unknown("pi"),
+        "{known:?}"
     );
-    assert!(known.unknown.is_empty());
+    assert!(known.unavailable["codex"].contains("PATH"), "{known:?}");
     let capabilities = ready.session_capabilities(Agent::Claude, dir.path())?;
     assert_eq!(capabilities["structured_events"], true);
     Ok(())

@@ -19,7 +19,10 @@ use std::time::Duration;
 /// How the reconcile stops an old host's process and where it looks for effects.
 #[derive(Clone, Debug)]
 pub struct ReconcileSettings {
-    /// After SIGTERM to the group, how long before SIGKILL (docs/13: 5 s).
+    /// After the native cancel of an attempt this host runs, how long before SIGTERM (REQ-043 decision 1: 10 s;
+    /// `execution.cancel_native_grace_seconds`).
+    pub native_grace: Duration,
+    /// After SIGTERM to the group, how long before SIGKILL (docs/13: 5 s; `execution.cancel_term_grace_seconds`).
     pub term_grace: Duration,
     /// After SIGKILL, how long for its group to empty.
     pub kill_grace: Duration,
@@ -32,6 +35,7 @@ pub struct ReconcileSettings {
 impl Default for ReconcileSettings {
     fn default() -> Self {
         ReconcileSettings {
+            native_grace: Duration::from_secs(10),
             term_grace: Duration::from_secs(5),
             kill_grace: Duration::from_secs(5),
             observer: Arc::new(reconcile::NoObserver),

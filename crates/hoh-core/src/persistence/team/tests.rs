@@ -919,9 +919,11 @@ async fn a_change_to_an_agent_not_looked_at_yet_waits_without_a_verdict() -> R {
             json!({"developer": {"agent": "codex"}}),
         ))
         .await?;
+    // The registry has looked at claude only: codex, which the change names, is not known yet (M2T07R-255: whatever
+    // the team read before the checkpoint named).
     let unknown = crate::persistence::Availability {
+        available: Some(["claude".to_owned()].into()),
         unavailable: Default::default(),
-        unknown: ["codex".to_owned()].into(),
     };
     store.team_checkpoint("R1", unknown).await?;
     assert_eq!(
@@ -1149,5 +1151,74 @@ async fn the_binder_binds_a_session_per_role_and_epoch_or_blocks_an_unavailable_
         )?,
         vec![vec![2]]
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_dispatch_resumes_the_agents_own_session_only_where_the_session_can_be_resumed() -> R {
+    // M2T07R-257 (ADR-022 decision 9): the agent's own session id goes with a dispatch only when the session's
+    // capabilities have resume; otherwise the turn starts a session of its own.
+    for (capabilities, resumed) in [
+        (
+            r#"{"structured_events": true, "resume": true}"#,
+            Some("n-1"),
+        ),
+        (r#"{"structured_events": true, "resume": false}"#, None),
+        (r#"{"structured_events": true}"#, None),
+    ] {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = open(&dir)?;
+        working(&store, &path).await?;
+        a0_ends(&path)?;
+        exec(
+            &path,
+            &format!(
+                "UPDATE sessions SET native_id = 'n-1', capabilities_json = '{capabilities}' WHERE session_id = 'sd';"
+            ),
+        )?;
+        let context = crate::decision::Context {
+            required_capabilities: [(
+                "developer".to_owned(),
+                ["structured_events".to_owned()].into(),
+            )]
+            .into(),
+            ..crate::decision::Context::default()
+        };
+        let round = store.schedule_round("R1", context).await?;
+        assert!(round.dispatched.is_some(), "{round:?}");
+        let notice = store
+            .runner_waiting("p1")
+            .await?
+            .dispatches
+            .into_iter()
+            .find(|d| d.task_id == "T1")
+            .ok_or("no notice")?;
+        assert_eq!(
+            notice.assignment.native_session.as_deref(),
+            resumed,
+            "{capabilities}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_agents_to_look_at_include_every_bindings_not_only_the_teams() -> R {
+    // M2T07R-250 (ADR-022 decision 10): an agent no role of the current team names, but a binding of a run not ended
+    // still holds (a change not applied yet, or refused), is looked at too.
+    let dir = tempfile::tempdir()?;
+    let (store, _path) = open(&dir)?;
+    store
+        .submit_command(start("R1", Config::default().budget))
+        .await?;
+    store
+        .submit_command(team_change(
+            "away",
+            0,
+            json!({"cto": {"agent": "pi"}, "developer": {"agent": "codex"}}),
+        ))
+        .await?;
+    let waiting = store.runner_waiting("p1").await?;
+    assert!(waiting.agents.contains("claude"), "{:?}", waiting.agents);
     Ok(())
 }

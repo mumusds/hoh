@@ -57,6 +57,7 @@ fn env_for(dir: &Path) -> ProbeEnv {
         timeout: Duration::from_secs(30),
         log: None,
         deadline: None,
+        cancel: None,
     }
 }
 
@@ -852,6 +853,7 @@ fn probe_fails_cleanly_when_the_cli_is_missing() -> R {
         timeout: Duration::from_secs(5),
         log: None,
         deadline: None,
+        cancel: None,
     };
     assert!(probe(Agent::Pi, &env).is_err());
     Ok(())
@@ -867,6 +869,7 @@ fn probe_is_bounded_by_its_timeout() -> R {
         timeout: Duration::from_millis(500),
         log: None,
         deadline: None,
+        cancel: None,
     };
     let started = std::time::Instant::now();
     assert!(probe(Agent::Claude, &env).is_err());

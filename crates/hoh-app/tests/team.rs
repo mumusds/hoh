@@ -1167,9 +1167,16 @@ async fn a_configuration_file_becomes_a_team_revision_at_the_hosts_start_and_at_
 async fn an_invalid_configuration_file_refuses_new_runs_and_keeps_the_revision() -> R {
     // REQ-018 failure mode 5 (ADR-022 decision 6): the host starts and serves; StartRun is 400 INVALID_TEAM_CONFIG with
     // the file's path, the key path, line and column; a config.invalid event is written once for that file; the team
-    // revision stays; no run is made.
+    // revision made from the file before it became invalid stays, not the built-in defaults (M2T07R-259); no run is
+    // made.
     let dir = tempfile::tempdir()?;
     std::fs::create_dir_all(dir.path().join(".hoh"))?;
+    std::fs::write(
+        dir.path().join(".hoh/config.toml"),
+        "config_version = \"1.0\"\n[team.developer]\nagent = \"claude\"\nmodel = \"m-ok\"\n",
+    )?;
+    let host = start_when_free(config(dir.path())).await?;
+    host.shutdown().await;
     std::fs::write(
         dir.path().join(".hoh/config.toml"),
         "config_version = \"1.0\"\n[team.qa]\nmodle = \"x\"\n",
@@ -1205,10 +1212,58 @@ async fn an_invalid_configuration_file_refuses_new_runs_and_keeps_the_revision()
             dir.path(),
             "SELECT coalesce(max(revision), 0) FROM team_revisions"
         )?,
-        "0"
+        "1"
+    );
+    assert_eq!(
+        query(
+            dir.path(),
+            "SELECT json_extract(config_json, '$.team.developer.model') FROM team_revisions WHERE revision = 1"
+        )?,
+        "m-ok"
     );
     let (status, _) = exchange(&host, "GET", "/v1/runs", None).await?;
     assert_eq!(status, 200);
+    host.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_start_run_whose_configuration_file_cannot_be_applied_is_refused_not_started_on_the_old_team()
+-> R {
+    // M2T07R-204 (ADR-022 decision 6): when the file's revision cannot be written, StartRun does not go on with the
+    // previous team: it is refused as the store's failure is, and makes no run; once the file is applied, a run starts
+    // on it.
+    let dir = tempfile::tempdir()?;
+    std::fs::create_dir_all(dir.path().join(".hoh"))?;
+    let file = dir.path().join(".hoh/config.toml");
+    std::fs::write(
+        &file,
+        "config_version = \"1.0\"\n[team.developer]\nagent = \"claude\"\n",
+    )?;
+    let host = start_when_free(config(dir.path())).await?;
+    exec(
+        dir.path(),
+        "CREATE TRIGGER refuse_revisions BEFORE INSERT ON team_revisions BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+    )?;
+    std::fs::write(
+        &file,
+        "config_version = \"1.0\"\n[team.developer]\nagent = \"codex\"\n",
+    )?;
+    let (status, body) = exchange(&host, "POST", "/v1/commands", Some(&start_run("s1"))).await?;
+    assert_ne!(status, 202, "{body}");
+    assert!(body["code"].is_string(), "{body}");
+    assert_eq!(query(dir.path(), "SELECT count(*) FROM runs")?, "0");
+    exec(dir.path(), "DROP TRIGGER refuse_revisions;")?;
+    let run = started(&host, "s2").await?;
+    assert_eq!(
+        query(
+            dir.path(),
+            &format!(
+                "SELECT agent FROM role_bindings WHERE run_id = '{run}' AND role = 'developer'"
+            )
+        )?,
+        "codex"
+    );
     host.shutdown().await;
     Ok(())
 }

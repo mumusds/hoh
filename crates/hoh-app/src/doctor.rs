@@ -255,6 +255,7 @@ fn examine(project: &Path, live: bool) -> Report {
         log: Some(log.clone()),
         // One limit for all commands, also those run one after another (M1T07R-02).
         deadline: Some(Instant::now() + TIMEOUT),
+        cancel: None,
     };
     let (manifest, warning) = manifest(project);
     let mut warnings: Vec<String> = warning.into_iter().collect();

@@ -50,6 +50,9 @@ impl ProductExecutor {
     }
 }
 
+/// How long a delivery waits for the registry's first look at its agent (its probe's commands each have 20 s).
+const DELIVER_WAIT: Duration = Duration::from_secs(60);
+
 /// Lower-case hex of the sha256 of `bytes`.
 fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
@@ -144,13 +147,6 @@ fn outcome(facts: Facts, prompt: PromptRecord) -> Outcome {
             Recorded::NativeSession(id) => native_session = native_session.or(Some(id)),
         }
     }
-    if let Some(reason) = &facts.degraded {
-        events.push((
-            "degraded".to_owned(),
-            "adapter.degraded".to_owned(),
-            serde_json::json!({"reason": reason, "next": "exec"}),
-        ));
-    }
     let detail = match facts.state {
         AttemptState::Settled => "SETTLED".to_owned(),
         AttemptState::Cancelled => facts
@@ -172,6 +168,7 @@ fn outcome(facts: Facts, prompt: PromptRecord) -> Outcome {
             prompt: Some(prompt),
             raw_log_path: Some(facts.raw_log_path),
         },
+        unknown_effect: facts.state == AttemptState::UnknownEffect,
     }
 }
 
@@ -271,10 +268,30 @@ impl Executor for ProductExecutor {
         Some(self.registry.clone())
     }
 
-    /// Taken at once: everything a turn needs is read when it starts.
-    fn deliver(&self, _work: &Work) -> oneshot::Receiver<Result<(), String>> {
+    /// Taken once the registry has looked at the work's agent (at once, but for a binding made before this host's
+    /// first look, as after a restart): a turn is never failed for an agent not looked at yet (M2T07R-250). Not taken
+    /// by then, the runner hands it again.
+    fn deliver(&self, work: &Work) -> oneshot::Receiver<Result<(), String>> {
         let (tx, rx) = oneshot::channel();
-        let _ = tx.send(Ok(()));
+        let agent = work.assignment.agent.as_deref().and_then(Agent::named);
+        match agent {
+            Some(agent) if self.registry.seen(agent).is_none() => {
+                let registry = self.registry.clone();
+                tokio::spawn(async move {
+                    let until = std::time::Instant::now() + DELIVER_WAIT;
+                    while registry.seen(agent).is_none() && std::time::Instant::now() < until {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    let _ = tx.send(match registry.seen(agent) {
+                        Some(_) => Ok(()),
+                        None => Err(format!("{} was not looked at yet", agent.as_str())),
+                    });
+                });
+            }
+            _ => {
+                let _ = tx.send(Ok(()));
+            }
+        }
         rx
     }
 

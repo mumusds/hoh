@@ -141,6 +141,7 @@ async fn test_042_01_failures_wait_for_their_retry_after_or_jitter_and_only_then
                         at: failed_at,
                         draw,
                         observed: Default::default(),
+                        unknown_effect: false,
                     },
                 )
                 .await?
@@ -480,6 +481,7 @@ async fn an_ending_records_what_the_agents_turn_showed() -> R {
                     )],
                     raw_log_path: Some("/logs/a".to_owned()),
                 },
+                unknown_effect: false,
             },
         )
         .await?;
@@ -567,6 +569,7 @@ async fn an_attempts_running_time_is_added_to_its_runs_used_duration_when_it_end
                 at: start + Duration::from_millis(95_400),
                 draw: 0,
                 observed: Default::default(),
+                unknown_effect: false,
             },
         )
         .await?;
@@ -1124,4 +1127,121 @@ async fn a_round_judges_the_deadline_by_the_wall_clock() -> R {
         );
     }
     Ok(())
+}
+
+#[tokio::test]
+async fn an_unknown_effect_ends_the_attempt_and_runs_nothing_again() -> R {
+    // M2T07R-200 (ADR-019 decision 5, docs/adr/ADR-022.md decision 12): a turn that ended after starting an effect it
+    // never reported ends its attempt UNKNOWN_EFFECT: the task stays as it was, no retry is scheduled, its lease goes,
+    // and a diagnostic names the effects left STARTED; what the turn showed is recorded all the same.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(WORLD)?;
+    let start = at("2026-11-07T00:00:00Z")?;
+    let [attempt] = tick(&store, start)
+        .await?
+        .try_into()
+        .map_err(|d| format!("{d:?}"))?;
+    let notice = store
+        .runner_waiting("p1")
+        .await?
+        .dispatches
+        .into_iter()
+        .find(|d| d.attempt_id == attempt)
+        .ok_or("no notice")?;
+    assert!(store.runner_received(notice, start).await?);
+    assert!(
+        store
+            .runner_running(
+                &attempt,
+                crate::persistence::AttemptFacts {
+                    pid: Some(4242),
+                    ..Default::default()
+                },
+                json!({"kind": "proc"}),
+            )
+            .await?
+    );
+    let task_before: (String, i64) = Connection::open(&path)?.query_row(
+        "SELECT t.state, t.revision FROM tasks t JOIN attempts a ON a.task_id = t.task_id WHERE a.attempt_id = ?1",
+        [&attempt],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let started: Vec<String> = {
+        let conn = Connection::open(&path)?;
+        let mut s = conn.prepare(
+            "SELECT effect_key FROM effects WHERE attempt_id = ?1 AND state = 'STARTED' ORDER BY effect_key",
+        )?;
+        s.query_map([&attempt], |r| r.get(0))?
+            .collect::<Result<_, _>>()?
+    };
+    assert!(!started.is_empty(), "the work effect is STARTED");
+    store
+        .runner_finished(
+            &attempt,
+            Ending {
+                success: false,
+                detail: "PROTOCOL_INCOMPLETE".to_owned(),
+                class: FailureClass::Transient { retry_after: None },
+                at: start + Duration::from_secs(3),
+                draw: 0,
+                observed: crate::persistence::Observed {
+                    resolved_model: Some("m-test".to_owned()),
+                    ..Default::default()
+                },
+                unknown_effect: true,
+            },
+        )
+        .await?;
+    let conn = Connection::open(&path)?;
+    let (state, model, failure): (String, String, String) = conn.query_row(
+        "SELECT state, resolved_model, failure_reason FROM attempts WHERE attempt_id = ?1",
+        [&attempt],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    assert_eq!(
+        (state.as_str(), model.as_str(), failure.as_str()),
+        ("UNKNOWN_EFFECT", "m-test", "PROTOCOL_INCOMPLETE")
+    );
+    let task_after: (String, i64) = conn.query_row(
+        "SELECT t.state, t.revision FROM tasks t JOIN attempts a ON a.task_id = t.task_id WHERE a.attempt_id = ?1",
+        [&attempt],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    assert_eq!(task_after, task_before, "the task stays as it was");
+    let retries: i64 = conn.query_row(
+        "SELECT count(*) FROM events WHERE kind IN ('task.retry_scheduled', 'task.blocked')",
+        [],
+        |r| r.get(0),
+    )?;
+    assert_eq!(retries, 0, "nothing is run again");
+    let diagnostic: String = conn.query_row(
+        "SELECT payload_json FROM events WHERE kind = 'runner.diagnostic' AND json_extract(payload_json, '$.attempt_id') = ?1",
+        [&attempt],
+        |r| r.get(0),
+    )?;
+    let diagnostic: Value = serde_json::from_str(&diagnostic)?;
+    assert_eq!(diagnostic["code"], "UNKNOWN_EFFECT", "{diagnostic}");
+    assert_eq!(diagnostic["effect_keys"], json!(started), "{diagnostic}");
+    Ok(())
+}
+
+#[test]
+fn two_prompt_files_of_the_same_content_are_two_sources() {
+    // M2T07R-205 (ADR-022 decision 11): the prompt revision names its file too.
+    let record = |path: &str| crate::persistence::PromptRecord {
+        layer: "project".to_owned(),
+        role: "developer".to_owned(),
+        path: path.to_owned(),
+        content_sha256: "c".repeat(64),
+        sent_sha256: "s".repeat(64),
+    };
+    assert_ne!(
+        record(".hoh/prompts/a.md").revision_id(),
+        record(".hoh/prompts/b.md").revision_id()
+    );
+    assert_eq!(
+        record(".hoh/prompts/a.md").revision_id(),
+        record(".hoh/prompts/a.md").revision_id()
+    );
 }
