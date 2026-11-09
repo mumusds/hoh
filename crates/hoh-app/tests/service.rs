@@ -335,3 +335,241 @@ fn the_uninstall_stops_and_disables_a_running_instance_and_keeps_its_project() -
     assert!(project.join(".hoh/state.db").is_file());
     Ok(())
 }
+
+/// `hoh <args>` as the user runs it in `project`: the installed command, or `program` when given.
+fn hoh_in(manager: &Manager, project: &Path, program: Option<&Path>, args: &[&str]) -> R<Output> {
+    let installed = manager.home().join(".local/bin/hoh");
+    Ok(manager
+        .command(program.unwrap_or(&installed))
+        .args(args)
+        .current_dir(project)
+        .stdin(std::process::Stdio::null())
+        .output()?)
+}
+
+/// The `hoh __host` processes of this user whose project is `project`.
+fn hosts_of(project: &Path) -> R<Vec<u32>> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir("/proc")? {
+        let Ok(pid) = entry?.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        let args: Vec<&[u8]> = cmdline.split(|b| *b == 0).collect();
+        if args.get(1) == Some(&&b"__host"[..])
+            && args.get(2) == Some(&project.as_os_str().as_encoded_bytes())
+        {
+            out.push(pid);
+        }
+    }
+    Ok(out)
+}
+
+#[test]
+fn the_installed_client_starts_its_host_through_the_unit() -> R {
+    // ADR-023 decision 6: the installed hoh starts the host as its unit, so systemd restarts it after a crash.
+    let root = tempfile::tempdir()?;
+    let project = project(root.path())?;
+    let manager = installed(&[&project])?;
+    let unit = unit_of(&project);
+    let out = hoh_in(
+        &manager,
+        &project,
+        None,
+        &["-p", "x", "--detach", "--output", "json"],
+    )?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let run: serde_json::Value = serde_json::from_slice(&out.stdout)?;
+    assert!(run["run_id"].is_string(), "{run}");
+    let main: u64 = manager.property(&unit, "MainPID")?.parse()?;
+    let info = host_json(&project).ok_or("host.json")?;
+    assert_eq!(info["pid"].as_u64(), Some(main), "{info}");
+    assert_eq!(info["supervisor"], unit.as_str(), "{info}");
+    assert_eq!(info["process_tracking"], "cgroup", "{info}");
+    assert_eq!(hosts_of(&project)?, [u32::try_from(main)?]);
+    // It runs where a host started directly runs: in its project (decision 7).
+    assert_eq!(std::fs::read_link(format!("/proc/{main}/cwd"))?, project);
+    // hoh doctor reports it (decision 7).
+    let out = hoh_in(&manager, &project, None, &["doctor", "--output", "json"])?;
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout)?;
+    let host = &report["runtime"]["host"];
+    assert_eq!(host["state"], "running", "{host}");
+    assert_eq!(host["supervisor"], unit.as_str(), "{host}");
+    Ok(())
+}
+
+#[test]
+fn concurrent_attaches_through_the_unit_start_one_host_once() -> R {
+    let root = tempfile::tempdir()?;
+    let project = project(root.path())?;
+    let mut manager = installed(&[&project])?;
+    let unit = unit_of(&project);
+    let out = hoh_in(
+        &manager,
+        &project,
+        None,
+        &["-p", "x", "--detach", "--output", "json"],
+    )?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let run: serde_json::Value = serde_json::from_slice(&out.stdout)?;
+    let run_id = run["run_id"].as_str().ok_or("run_id")?.to_owned();
+    let epoch = host_json(&project).ok_or("host.json")?["host_epoch"]
+        .as_i64()
+        .ok_or("host_epoch")?;
+    let out = manager.systemctl(&["stop", &unit])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    manager.wait_until("the host to stop", Duration::from_secs(20), |_| {
+        Ok(hosts_of(&project)?.is_empty())
+    })?;
+    let installed = manager.home().join(".local/bin/hoh");
+    let clients: Vec<_> = (0..3)
+        .map(|_| {
+            manager
+                .command(&installed)
+                .args(["attach", &run_id, "--output", "json"])
+                .current_dir(&project)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+        })
+        .collect::<Result<_, _>>()?;
+    for client in clients {
+        let out = client.wait_with_output()?;
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    }
+    let main: u64 = manager.property(&unit, "MainPID")?.parse()?;
+    let info = host_json(&project).ok_or("host.json")?;
+    assert_eq!(info["pid"].as_u64(), Some(main), "{info}");
+    assert_eq!(info["host_epoch"].as_i64(), Some(epoch + 1), "{info}");
+    assert_eq!(hosts_of(&project)?, [u32::try_from(main)?]);
+    assert_eq!(manager.property(&unit, "NRestarts")?, "0");
+    Ok(())
+}
+
+#[test]
+fn a_hoh_that_is_not_the_installed_one_starts_its_host_as_before_and_says_why() -> R {
+    let root = tempfile::tempdir()?;
+    let project = project(root.path())?;
+    let manager = installed(&[&project])?;
+    let unit = unit_of(&project);
+    let out = hoh_in(
+        &manager,
+        &project,
+        Some(Path::new(env!("CARGO_BIN_EXE_hoh"))),
+        &["-p", "x", "--detach", "--output", "json"],
+    )?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let info = host_json(&project).ok_or("host.json")?;
+    assert!(info["supervisor"].is_null(), "{info}");
+    assert!(
+        info["supervision_reason"]
+            .as_str()
+            .is_some_and(|why| why.contains("not the installed hoh")),
+        "{info}"
+    );
+    assert_eq!(manager.property(&unit, "ActiveState")?, "inactive");
+    let pids = hosts_of(&project)?;
+    assert_eq!(pids.len(), 1, "{pids:?}");
+    for pid in pids {
+        let _ = rustix::process::kill_process(
+            rustix::process::Pid::from_raw(i32::try_from(pid)?).ok_or("pid")?,
+            rustix::process::Signal::TERM,
+        );
+    }
+    let mut manager = manager;
+    manager.wait_until("the direct host to stop", Duration::from_secs(20), |_| {
+        Ok(hosts_of(&project)?.is_empty())
+    })
+}
+
+#[test]
+fn a_unit_at_its_start_limit_fails_the_client_with_69_and_nothing_else_starts_a_host() -> R {
+    // ADR-023 decision 6: the start limit is a brake on a crash loop; the client does not go round it. A `.hoh` that
+    // is a file makes every host fail before it is ready; a drop-in shortens the loop (2 starts, 0.1 s apart).
+    let root = tempfile::tempdir()?;
+    let project = project(root.path())?;
+    let mut manager = installed(&[&project])?;
+    let unit = unit_of(&project);
+    std::fs::write(project.join(".hoh"), "not a directory")?;
+    let dropin = manager
+        .home()
+        .join(".config/systemd/user/hoh-host@.service.d");
+    std::fs::create_dir_all(&dropin)?;
+    std::fs::write(
+        dropin.join("limit.conf"),
+        "[Unit]\nStartLimitBurst=2\n[Service]\nRestartSec=100ms\n",
+    )?;
+    let out = manager.systemctl(&["daemon-reload"])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let _ = manager.systemctl(&["start", &unit])?;
+    // The loop ends at the limit with the unit failed (its Result the last exit's: systemd 259 says exit-code).
+    manager.wait_until(
+        "the restart loop to stop at the start limit",
+        Duration::from_secs(30),
+        |m| {
+            let shown = m.show(&unit, "ActiveState,NRestarts")?;
+            Ok(
+                shown.get("ActiveState").map(String::as_str) == Some("failed")
+                    && shown.get("NRestarts").and_then(|n| n.parse::<u32>().ok()) >= Some(1),
+            )
+        },
+    )?;
+    let said = manager.runtime().join(format!(
+        "hoh-host@{}.stderr",
+        hoh_app::unit::instance(&project)
+    ));
+    let before = std::fs::read_to_string(&said)?;
+    let out = hoh_in(
+        &manager,
+        &project,
+        None,
+        &["-p", "x", "--detach", "--output", "json"],
+    )?;
+    assert_eq!(out.status.code(), Some(69), "{}", text(&out));
+    assert!(out.stdout.is_empty(), "{}", text(&out));
+    let stderr = String::from_utf8(out.stderr)?;
+    assert!(
+        stderr.contains(&format!("systemctl --user status {unit}")),
+        "{stderr}"
+    );
+    // systemd refused the start: no host ran (none wrote its stderr), and none was started another way.
+    assert_eq!(std::fs::read_to_string(&said)?, before, "{stderr}");
+    assert!(
+        hosts_of(&project)?.is_empty(),
+        "a host was started some other way"
+    );
+    assert!(project.join(".hoh").is_file());
+    Ok(())
+}
+
+#[test]
+fn a_host_that_keeps_failing_under_its_unit_fails_the_client_with_its_last_line() -> R {
+    // A `.hoh` that is a file: every host the unit starts fails before it is ready; the unit restarts it; the client
+    // follows until its deadline and then says what the host said.
+    let root = tempfile::tempdir()?;
+    let project = project(root.path())?;
+    let manager = installed(&[&project])?;
+    std::fs::write(project.join(".hoh"), "not a directory")?;
+    let out = hoh_in(
+        &manager,
+        &project,
+        None,
+        &["-p", "x", "--detach", "--output", "json"],
+    )?;
+    assert_ne!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(out.stdout.is_empty(), "{}", text(&out));
+    let said = std::fs::read_to_string(manager.runtime().join(format!(
+        "hoh-host@{}.stderr",
+        hoh_app::unit::instance(&project)
+    )))?;
+    let last = said
+        .lines()
+        .rfind(|l| !l.trim().is_empty())
+        .ok_or("the host said nothing")?;
+    let stderr = String::from_utf8(out.stderr)?;
+    assert!(stderr.contains(last), "client: {stderr}\nhost: {said}");
+    Ok(())
+}

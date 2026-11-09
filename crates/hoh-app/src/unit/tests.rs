@@ -240,3 +240,26 @@ fn the_environment_file_is_written_private_and_whole_and_never_over_another_proj
     assert_eq!(std::fs::read_dir(hosts)?.count(), 1);
     Ok(())
 }
+
+#[test]
+fn a_process_is_supervised_by_the_hosts_unit_only_when_its_cgroup_is_one() {
+    // ADR-023 decision 7: /proc/self/cgroup's last segment names the unit.
+    let unit = "hoh-host@60ad706fe5335804.service";
+    assert_eq!(
+        supervisor_of(&format!(
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/{unit}\n"
+        )),
+        Some(unit.to_owned())
+    );
+    for text in [
+        "",
+        "0::/user.slice/user-1000.slice/user@1000.service/app.slice/hoh-host@60ad706fe5335804.service/attempt-1\n",
+        "0::/user.slice/user-1000.slice/user@1000.service/app.slice/run-u12.scope\n",
+        "0::/hoh-host@60AD706FE5335804.service\n",
+        "0::/hoh-host@60ad706fe533580.service\n",
+        "0::/hoh-host@.service\n",
+        "1:name=systemd:/hoh-host@60ad706fe5335804.service\n",
+    ] {
+        assert_eq!(supervisor_of(text), None, "{text:?}");
+    }
+}

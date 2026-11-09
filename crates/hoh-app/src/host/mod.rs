@@ -24,6 +24,10 @@ pub use runner::{Executor, Gate, Outcome, Refusal, RunnerConfig, RunnerPoint, St
 /// host records it in host.json, so `hoh doctor` reports a running host's actual reason (CR-012, CR12-03).
 pub const UNSCOPED_ENV: &str = "HOH_HOST_UNSCOPED";
 
+/// Set by the client on a host it starts other than as its systemd unit: why (docs/adr/ADR-023.md decisions 6 and 7).
+/// The host records it in host.json; without it, a host not run as its unit says so.
+pub const UNSUPERVISED_ENV: &str = "HOH_HOST_UNSUPERVISED";
+
 use hoh_core::persistence::{self, Options, PersistError, Reader, Store, location};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -447,6 +451,9 @@ impl Host {
             config.cancel,
             stopped,
         )));
+        let supervisor = std::fs::read_to_string("/proc/self/cgroup")
+            .ok()
+            .and_then(|text| crate::unit::supervisor_of(&text));
         let written = write_host_json(
             &files,
             &serde_json::json!({
@@ -466,6 +473,13 @@ impl Host {
                     ),
                     // Its own finding (M2T06R-557): a scope or unit that did not delegate, an old kernel, a test's hook.
                     (Err(why), _) => why.clone(),
+                },
+                // Whether systemd restarts it after a crash (docs/adr/ADR-023.md decision 7): its unit, or why not.
+                "supervisor": supervisor,
+                "supervision_reason": match (&supervisor, std::env::var(UNSUPERVISED_ENV)) {
+                    (Some(_), _) => None,
+                    (None, Ok(why)) if !why.is_empty() => Some(why),
+                    (None, _) => Some("not started by its systemd unit".to_owned()),
                 },
             }),
         );

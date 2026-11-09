@@ -66,6 +66,11 @@ fn host(args: &[OsString]) -> u8 {
     if !project.is_absolute() || !project.is_dir() {
         return usage_code();
     }
+    // Where a host a client starts runs, so one its unit starts (in HOME by default) runs there too (ADR-023 decision 7).
+    if let Err(e) = std::env::set_current_dir(&project) {
+        say!("hoh host: cannot enter {}: {e}", project.display());
+        return usage_code();
+    }
     if rustix::process::getsid(None).ok() != Some(rustix::process::getpid())
         && let Err(e) = rustix::process::setsid()
     {

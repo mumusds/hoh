@@ -318,6 +318,7 @@ fn examine(project: &Path, live: bool) -> Report {
             .ok()
             .and_then(|t| serde_json::from_str::<Value>(&t).ok())
     });
+    let running_record = running.is_some();
     let tracking = match running {
         Some(record) => {
             let mode = record["process_tracking"]
@@ -333,9 +334,23 @@ fn examine(project: &Path, live: bool) -> Report {
                     "进程跟踪降级：运行中的 host {why}；它按 /proc 尽力跟踪 Attempt 的组外进程（tracking: proc，对蓄意躲避的进程不成立，CR-011）"
                 ));
             }
+            // Whether systemd restarts it after a crash (docs/adr/ADR-023.md decision 7): its own record.
+            let supervision = match record["supervisor"].as_str() {
+                Some(unit) => format!("由 systemd 用户 unit {unit} 托管，崩溃后由 systemd 重启"),
+                None => {
+                    let why = record["supervision_reason"]
+                        .as_str()
+                        .unwrap_or("not started by its systemd unit");
+                    warnings.push(format!(
+                        "运行中的 host 不由其 systemd unit 托管（{why}）：它崩溃后不会自动重启，下次 hoh 调用时才再拉起"
+                    ));
+                    why.to_owned()
+                }
+            };
             json!({"state": "running",
                 "detail": format!("运行中的 host（pid {}）", record["pid"].as_u64().unwrap_or_default()),
-                "process_tracking": mode, "process_tracking_detail": why})
+                "process_tracking": mode, "process_tracking_detail": why,
+                "supervisor": record["supervisor"], "supervision_detail": supervision})
         }
         None => match crate::client::delegated_scope(&env) {
             Ok(_) => json!({"process_tracking": "unverified",
@@ -347,6 +362,28 @@ fn examine(project: &Path, live: bool) -> Report {
                 json!({"process_tracking": "proc", "process_tracking_detail": why})
             }
         },
+    };
+    // With no host running, whether the next one would be started as its unit (decision 6's checks, not verified).
+    let tracking = match (tracking, running_record) {
+        (mut tracking, false) => {
+            let supervision = match crate::client::unit_for(project, &env) {
+                Ok(unit) => json!({"supervisor": unit.name,
+                    "supervision_detail": "没有运行中的 host；已安装的 hoh 将以其 systemd 用户 unit 拉起 host，崩溃后由 systemd 重启（未经验证）"}),
+                Err(why) => {
+                    warnings.push(format!(
+                        "下次拉起的 host 将不由其 systemd unit 托管（{why}）：它崩溃后不会自动重启，下次 hoh 调用时才再拉起"
+                    ));
+                    json!({"supervisor": null, "supervision_detail": why})
+                }
+            };
+            if let (Some(tracking), Some(supervision)) =
+                (tracking.as_object_mut(), supervision.as_object())
+            {
+                tracking.extend(supervision.clone());
+            }
+            tracking
+        }
+        (tracking, true) => tracking,
     };
     let mut host = json!({"state": "not_running", "detail": "没有运行中的 host",
         "process_tracking_limits": TRACKING_LIMITS});

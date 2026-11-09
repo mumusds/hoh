@@ -1821,7 +1821,9 @@ async fn a_host_leaves_its_files_and_holds_the_project() -> R {
         info,
         json!({"pid": std::process::id(), "project_id": host.project_id, "host_epoch": host.host_epoch,
                "port": host.port, "socket": host.socket, "token": host.token,
-               "process_tracking": tracking, "process_tracking_reason": reason})
+               "process_tracking": tracking, "process_tracking_reason": reason,
+               // Not run as its systemd unit (docs/adr/ADR-023.md decision 7), and no client said why.
+               "supervisor": null, "supervision_reason": "not started by its systemd unit"})
     );
     assert_eq!(host.token.len(), 64);
     let leftovers: Vec<String> = std::fs::read_dir(&files)?
