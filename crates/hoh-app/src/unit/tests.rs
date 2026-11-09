@@ -337,14 +337,31 @@ fn a_process_is_supervised_by_the_hosts_unit_only_when_its_cgroup_is_one() {
 #[test]
 fn an_installed_binary_holds_its_installation_shared_and_none_while_it_is_being_removed()
 -> Result<(), Box<dyn std::error::Error>> {
-    // ADR-023 design correction 2 (M2T14R-100): every run of an installed hoh holds R/.lock shared for its life; the
-    // uninstall's exclusive hold keeps any new one from starting.
+    // ADR-023 design corrections 2 and 3 (M2T14R-100): every run of an installed hoh holds R/.lock shared for its life;
+    // the uninstall's exclusive hold keeps any new one from starting, and one that got its lock only after the
+    // uninstall removed the file (an old inode) or runs a removed binary does not run on.
     let root = tempfile::tempdir()?;
     let r = root.path().join("hoh");
     std::fs::create_dir_all(r.join("versions/v/bin"))?;
     let exe = r.join("versions/v/bin/hoh");
+    std::fs::write(&exe, "")?;
     // Not installed: nothing to hold.
     assert!(hold_installation(Path::new("/h/target/debug/hoh"))?.is_none());
+    assert!(hold_installation(Path::new("/h/target/debug/hoh (deleted)"))?.is_none());
+    // The installer makes the lock; with none, the installation is being removed.
+    let missing = hold_installation(&exe).expect_err("no lock file");
+    assert!(
+        missing.to_string().contains("being uninstalled"),
+        "{missing}"
+    );
+    std::fs::write(r.join(".lock"), "")?;
+    // Read-only is enough for a shared lock: a lock the user made 0400 is held as well (M2T14R-250).
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(r.join(".lock"), std::fs::Permissions::from_mode(0o400))?;
+        drop(hold_installation(&exe)?.ok_or("held read-only")?);
+        std::fs::set_permissions(r.join(".lock"), std::fs::Permissions::from_mode(0o600))?;
+    }
     let first = hold_installation(&exe)?.ok_or("held")?;
     let second = hold_installation(&exe)?.ok_or("held")?;
     // The uninstall's exclusive lock cannot be had while they are held...
@@ -361,8 +378,27 @@ fn an_installed_binary_holds_its_installation_shared_and_none_while_it_is_being_
         "{refused}"
     );
     drop(lock);
+    // A binary removed under its run (its path read with " (deleted)") is refused.
+    let deleted = PathBuf::from(format!("{} (deleted)", exe.display()));
+    assert!(hold_installation(&deleted).is_err());
     // An installation whose root is gone is being removed too.
     std::fs::remove_dir_all(&r)?;
     assert!(hold_installation(&exe).is_err());
+    Ok(())
+}
+
+#[test]
+fn a_lock_is_the_installations_only_while_its_file_is_still_the_one_at_its_path()
+-> Result<(), Box<dyn std::error::Error>> {
+    // Design correction 3: a lock got on a file the uninstall has since removed (or replaced) holds nothing.
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join(".lock");
+    std::fs::write(&path, "")?;
+    let file = std::fs::File::open(&path)?;
+    assert!(still_linked(&file, &path));
+    std::fs::remove_file(&path)?;
+    assert!(!still_linked(&file, &path));
+    std::fs::write(&path, "")?;
+    assert!(!still_linked(&file, &path), "another file at its path");
     Ok(())
 }
