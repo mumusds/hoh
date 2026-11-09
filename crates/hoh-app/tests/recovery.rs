@@ -2591,6 +2591,76 @@ async fn the_runner_frees_the_slot_of_an_unconfirmed_holder_once_its_group_is_go
     Ok(())
 }
 
+/// M2T06R-1054 (docs/adr/ADR-021.md decision 8d v7): a holder whose tracking a host in other namespaces recorded proves
+/// nothing here and keeps its slot; its settle is one finding, written once, not at every retry, whatever its record
+/// names here (here a pid no process has: gone, were the record this world's).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_holder_recorded_in_another_world_keeps_its_slot_and_its_settle_is_written_once() -> R {
+    let dir = tempfile::tempdir()?;
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    let (code, stderr) = serve_and_stop(&project)?;
+    assert_eq!(code, 0, "{stderr}");
+    let gone = {
+        let mut child = Command::new("true").spawn()?;
+        let pid = child.id();
+        child.wait()?;
+        pid
+    };
+    seed(
+        &project,
+        &format!(
+            "{WRITERS}
+             UPDATE tasks SET state = 'RUNNING' WHERE task_id = 'T1';
+             INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, pid, boot_id,
+               process_start_id, started_at)
+               VALUES ('A1', 'T1', 'RUNNING', 2, 1, 1, {gone}, '{boot}', '1', '2026-11-07T00:00:00Z');
+             UPDATE leases SET attempt_id = 'A1', epoch = 4 WHERE kind = 'writer';
+             INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES (:p, 'A1/tracking',
+               'R', 'attempt.tracking', '{{\"attempt_id\": \"A1\", \"tracking\": \"proc\", \"reason\": \"r\",
+               \"world\": {{\"pid\": \"pid:[1]\", \"mnt\": \"mnt:[1]\", \"cgroup\": \"cgroup:[1]\",
+               \"user\": \"user:[1]\"}}}}', '2026-11-07T00:00:00Z');",
+            boot = hoh_agents::identity::boot_id()?,
+        ),
+    )?;
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(work.join("markers"))?;
+    let clock = Arc::new(FakeClock::default());
+    let host = runner_host_with(
+        &project,
+        Arc::new(FakeExecutor(work)),
+        clock,
+        Setup {
+            retry: Some(Duration::from_millis(200)),
+            ..Setup::default()
+        },
+    )
+    .await?;
+    let db = db(&project);
+    assert!(wait_for(
+        &db,
+        "SELECT count(*) > 0 FROM events WHERE kind = 'reconcile.attempt' AND json_extract(payload_json, '$.cause') = 'lease_expired'",
+        "1",
+        Duration::from_secs(10)
+    )?);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let settles = query(
+        &db,
+        "SELECT count(*) FROM events WHERE kind = 'reconcile.attempt' AND json_extract(payload_json, '$.cause') = 'lease_expired'",
+    )?;
+    assert_eq!(
+        query(&db, "SELECT state FROM attempts WHERE attempt_id = 'A1'")?,
+        "RUNNING"
+    );
+    assert_eq!(
+        query(&db, "SELECT count(*) FROM attempts WHERE task_id = 'T2'")?,
+        "0"
+    );
+    assert_eq!(settles, "1", "a settle written at every retry");
+    host.shutdown().await;
+    Ok(())
+}
+
 /// Fails the commit of the `nth` write of the runner (counted at each Runner request's Begun point) once armed.
 #[derive(Debug)]
 struct FailNthRunnerWrite {

@@ -30,7 +30,7 @@ Workspace看统一进展与Commander决策；Team按需分屏；选中Agent进�
 
 ## 退出与恢复
 
-关闭窗口/断开SSH不取消任务；明确选择cancel才终止工作。取消或Attempt结束时，HoH确认Attempt的进程都已结束，才结束Attempt、释放写者租约：host在受委托的cgroup中运行时用Attempt专属的cgroup，否则按/proc尽力查找（降级，`hoh doctor`会提示，例如用户没有开启linger）。这一保证只覆盖Attempt自己的进程：Agent以同一用户把工作交给早已运行的服务（systemd --user、HoH之外启动的tmux server、cron、ssh localhost），或有意迁出cgroup、脱离进程组并隐藏标记时，这部分工作无法归属，可能在Attempt结束后继续写（REQ-043决定3，CR-012）。暂停表示待安全点停止新派发，界面显示PAUSE_REQUESTED直至PAUSED。`/resume`打开历史选择器；非交互通过--resume指定run_id，不能无人值守随意选最近run。
+关闭窗口/断开SSH不取消任务；明确选择cancel才终止工作。取消或Attempt结束时，HoH确认Attempt的进程都已结束，才结束Attempt、释放写者租约：host在受委托的cgroup中运行时用Attempt专属的cgroup，否则按/proc尽力查找（降级，`hoh doctor`会提示，例如用户没有开启linger）。这一保证只覆盖Attempt自己的进程：Agent以同一用户把工作交给早已运行的服务（systemd --user、HoH之外启动的tmux server、cron、ssh localhost），或有意迁出cgroup、脱离进程组并隐藏标记、躲开尽力的扫描时，或同用户进程篡改host本身（改写它的数据库与文件、在自己持有特权的命名空间里重新启动它并伪造进程视图）时，这部分工作无法归属，可能在Attempt结束后继续写（REQ-043决定3，CR-012、CR-013）。暂停表示待安全点停止新派发，界面显示PAUSE_REQUESTED直至PAUSED。`/resume`打开历史选择器；非交互通过--resume指定run_id，不能无人值守随意选最近run。
 
 ## 异常解释
 

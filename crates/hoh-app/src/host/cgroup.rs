@@ -869,6 +869,63 @@ mod tests {
     }
 
     #[test]
+    fn a_directory_on_the_way_that_cannot_be_opened_proves_nothing() -> R {
+        // M2T06R-1052: only an absence (or a successor) in a checked parent proves removal; a parent this host cannot
+        // open (a same-user process may chmod a delegated cgroup) tells nothing.
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir()?;
+        let parent = root.path().join("host.scope");
+        let at = parent.join("attempt-0123456789abcdef");
+        std::fs::create_dir_all(&at)?;
+        std::fs::write(at.join("cgroup.events"), b"populated 1\n")?;
+        let group = AttemptGroup::witnessed(root.path(), &at)?;
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000))?;
+        let shut = group.proof();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755))?;
+        assert_eq!(shut, Proof::Incomplete);
+        Ok(())
+    }
+
+    #[test]
+    fn a_witness_is_read_back_whole_and_checked_from_the_mount_on() -> R {
+        // M2T06R-1053: the record's own boot is what counts (another boot: gone, whatever is at its path), the mount's
+        // root is checked like every other directory, and each of the four namespaces counts.
+        let mut event = Tracking::Cgroup {
+            path: PathBuf::from("/sys/fs/cgroup/x.scope/attempt-0123456789abcdef"),
+            witness: Some(Witness {
+                boot: hoh_agents::identity::boot_id()?,
+                chain: vec![(1, 2), (1, 3), (1, 4)],
+            }),
+        }
+        .json("p/A1");
+        let read = |event: &serde_json::Value| Tracking::seen_from(Some(event), world());
+        assert_eq!(
+            read(&event).cgroup().map(|g| g.proof()),
+            Some(Proof::Incomplete),
+            "this boot, the recorded mount root is not the one found"
+        );
+        event["boot_id"] = serde_json::json!("another-boot");
+        assert_eq!(
+            read(&event).cgroup().map(|g| g.proof()),
+            Some(Proof::Done),
+            "the record's own boot is another"
+        );
+        let now = world().ok_or("no world")?;
+        for name in ["pid", "mnt", "cgroup", "user"] {
+            assert!(now.get(name).is_some(), "{name}");
+            let mut other = now.clone();
+            other[name] = serde_json::json!(format!("{name}:[1]"));
+            let mut recorded = event.clone();
+            recorded["world"] = other;
+            assert!(
+                matches!(read(&recorded), Tracking::Foreign(_)),
+                "{name} alone"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn a_cgroup_of_another_boot_is_gone() -> R {
         // M2T06R-900: whatever is at its path now, nothing of a cgroup made before this boot is left.
         let root = tempfile::tempdir()?;

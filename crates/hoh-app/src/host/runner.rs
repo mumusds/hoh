@@ -666,7 +666,13 @@ async fn settle(
     let executor = common.executor.clone();
     let repeated = last.map(str::to_owned);
     let stop = tokio::task::spawn_blocking(move || {
-        let seen = reconcile::inspect(&scanned);
+        // A record of another world is one finding, whatever it names here: written once, not at every retry
+        // (M2T06R-1054); the end keeps it uncertain.
+        let seen = if matches!(tracking, Tracking::Foreign(_)) {
+            reconcile::Seen::Uncertain("recorded_in_another_world".to_owned())
+        } else {
+            reconcile::inspect(&scanned)
+        };
         let found = seen.json();
         let finding = found.to_string();
         if matches!(seen, reconcile::Seen::Uncertain(_))

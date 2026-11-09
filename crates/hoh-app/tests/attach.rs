@@ -608,7 +608,9 @@ async fn doctor_reports_how_the_running_host_tracks_attempts_not_what_a_start_wo
     assert!(
         limits.contains("早已运行的服务")
             && limits.contains("迁出 cgroup")
-            && limits.contains("隐藏标记"),
+            && limits.contains("隐藏标记")
+            && limits.contains("篡改 host 本身")
+            && limits.contains("CR-013"),
         "{limits}"
     );
     // The text form says the same: the running host, its tracking and the limits (CR-012).
@@ -630,7 +632,11 @@ async fn doctor_reports_how_the_running_host_tracks_attempts_not_what_a_start_wo
         "{text}"
     );
     assert!(
-        text.contains("CR-012") && text.contains("早已运行的服务") && text.contains("隐藏标记"),
+        text.contains("CR-012")
+            && text.contains("早已运行的服务")
+            && text.contains("隐藏标记")
+            && text.contains("篡改 host 本身")
+            && text.contains("CR-013"),
         "{text}"
     );
     host.shutdown().await;
