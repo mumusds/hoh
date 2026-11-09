@@ -623,6 +623,40 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn a_cgroups_checked_subtree_is_every_directory_below_it_however_deep() -> R {
+        // SIGTERM reads the subtree through the checked directory since M2T06R-1000; it must still reach every cgroup
+        // below the attempt's, however deep (M2T06R-651), the cgroup itself first.
+        use std::os::unix::fs::MetadataExt as _;
+        let root = tempfile::tempdir()?;
+        let at = root.path().join("attempt-0123456789abcdef");
+        let deepest = at.join("a").join("b").join("c");
+        std::fs::create_dir_all(&deepest)?;
+        std::fs::create_dir_all(at.join("d"))?;
+        let group = AttemptGroup::witnessed(root.path(), &at)?;
+        let id = |p: &Path| -> std::io::Result<(u64, u64)> {
+            let meta = std::fs::symlink_metadata(p)?;
+            Ok((meta.dev(), meta.ino()))
+        };
+        let mut found = group
+            .checked_subtree()
+            .iter()
+            .map(|fd| rustix::fs::fstat(fd).map(|s| (s.st_dev, s.st_ino)))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(found.first(), Some(&id(&at)?), "the cgroup itself first");
+        found.sort();
+        let mut wanted = vec![
+            id(&at)?,
+            id(&at.join("a"))?,
+            id(&at.join("a").join("b"))?,
+            id(&deepest)?,
+            id(&at.join("d"))?,
+        ];
+        wanted.sort();
+        assert_eq!(found, wanted);
+        Ok(())
+    }
+
     /// A cgroup of a test's own (a directory with the files a cgroup has), `populated` as given, no members.
     fn fake(populated: u8) -> R<tempfile::TempDir> {
         let dir = tempfile::tempdir()?;
