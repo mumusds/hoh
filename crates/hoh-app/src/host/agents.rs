@@ -63,8 +63,9 @@ impl Registry {
 
     /// The host stops: every probe command in its slot is killed (its group and its leader) before this returns, one
     /// still being spawned by its starter as it puts it in its slot, and none starts; it never waits on a probing
-    /// thread: a lock one of them holds past the probe's STOP_WAIT (200 ms) is left to its holder, which kills its
-    /// command itself (decision 10 v6, M2T07R-300, -450, -500, -700).
+    /// thread: a lock still held when the probe's STOP_WAIT (200 ms) has passed is left, with its commands, to the
+    /// probes' own looks at the stop (`probe::ProbeStop`); what a probing thread that is not run leaves alive is the
+    /// residual of decision 10 v6 (M2T07R-300, -450, -500, -700, -853).
     pub fn stop(&self) {
         self.stopping.stop();
     }
