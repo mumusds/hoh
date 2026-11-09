@@ -114,9 +114,7 @@
       "mode": "product",
       "argv": [
         "bash",
-        "scripts/product/not-implemented.sh",
-        "deployment",
-        "M2-T14"
+        "scripts/product/deployment.sh"
       ],
       "timeout_seconds": 3600,
       "artifacts": [
