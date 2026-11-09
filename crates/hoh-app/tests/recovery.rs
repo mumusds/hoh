@@ -1403,11 +1403,6 @@ INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_
 INSERT INTO leases(project_id, kind, attempt_id, epoch, expires_at) VALUES (:p, 'writer', 'A0', 3, '2026-11-07T00:00:00Z');
 ";
 
-/// AC-041-02: writer lease epoch 4 held by A1, whose agent's process group runs and ignores SIGTERM; the clock is
-/// moved past its expiry. The runner inspects, sends the native cancel, SIGTERM, SIGKILL, confirms the reap, and only
-/// then is epoch 5 granted, with no process of A1's group left; A1's late TaskResult is STALE_LEASE_EPOCH with the
-/// task's revision unchanged and one history event; a write of the old host epoch changes 0 rows and is an
-/// IntegrityViolation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_settle_whose_native_cancel_reached_no_turn_waits_only_the_sigterm_grace() -> R {
     // M2T07R-453 (docs/adr/ADR-022.md decision 17): an expired lease whose executor no longer holds the turn (its
@@ -1484,6 +1479,11 @@ async fn a_settle_whose_native_cancel_reached_no_turn_waits_only_the_sigterm_gra
     Ok(())
 }
 
+/// AC-041-02: writer lease epoch 4 held by A1, whose agent's process group runs and ignores SIGTERM; the clock is
+/// moved past its expiry. The runner inspects, sends the native cancel, SIGTERM, SIGKILL, confirms the reap, and only
+/// then is epoch 5 granted, with no process of A1's group left; A1's late TaskResult is STALE_LEASE_EPOCH with the
+/// task's revision unchanged and one history event; a write of the old host epoch changes 0 rows and is an
+/// IntegrityViolation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_041_02_an_expired_lease_is_granted_again_only_after_its_holder_is_reaped() -> R {
     let dir = tempfile::tempdir()?;
