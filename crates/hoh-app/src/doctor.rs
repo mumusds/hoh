@@ -29,7 +29,9 @@ const PLUGINS: &str = include_str!("../../../config/plugins.json");
 /// them on 2026-11-08).
 const TRACKING_LIMITS: &str = "终结证明只覆盖 Attempt 自己的进程：它的 cgroup（受委托时）、进程组和继承的环境标记。\
 同一用户的进程把工作交给 Attempt 之外早已运行的服务（systemd --user、HoH 之外启动的 tmux server、cron、ssh localhost），\
-或迁出 cgroup、脱离进程组并隐藏标记时，无法归属，可能在 Attempt 结束、写者租约释放后继续写（REQ-043 决定 3，CR-012）";
+或迁出 cgroup、脱离进程组后隐藏标记或躲开尽力的 /proc 扫描，或篡改 host 本身（改写它的数据库与文件，\
+在自己持有 CAP_SYS_ADMIN 的命名空间里重新启动它并伪造 /proc 与 cgroup 的视图）时，无法归属，\
+可能在 Attempt 结束、写者租约释放后继续写（REQ-043 决定 3，CR-012、CR-013）";
 
 /// The compat manifest of the project, if there is a readable one (ADR-015 decision 2); a warning otherwise.
 fn manifest(project: &Path) -> (Option<CompatManifest>, Option<String>) {

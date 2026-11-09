@@ -1,11 +1,11 @@
 {
   "schema_version": "1.1",
   "baseline_id": "HOH-BASELINE-1.1",
-  "revision": 11,
+  "revision": 12,
   "change_policy": "Formal CR + new baseline; never lower required gates to pass",
   "previous": {
     "baseline_id": "HOH-BASELINE-1.1",
-    "lock_sha256": "37debb56de3705de1b5c35973538f3a0d11641488620b8309349ede6287737cf"
+    "lock_sha256": "5b992cba807b9382da854045e3713b70fe3ad0910204c20003e7808e1ed49c39"
   },
   "change_requests": [
     {
@@ -57,6 +57,11 @@
       "id": "CR-012",
       "path": "docs/cr/CR-012-cgroup-proof-limits.md",
       "sha256": "108d28249e531a48e12489555883dac13f8e8e84da07c3f170ade17287d9c0e8"
+    },
+    {
+      "id": "CR-013",
+      "path": "docs/cr/CR-013-tampering-with-the-host.md",
+      "sha256": "4335540dda79286a966d775c955aab53904fa16b4b676694a941489359aec46e"
     }
   ],
   "files": {
@@ -74,7 +79,7 @@
     "contracts/protocol.schema.json": "c7893bf013dba5e995b55dc0bee80b77398a5883c2d4bff7c1065eae5f3735ab",
     "contracts/release-policy.json": "e54581614356ad310351994a6cdb94bfe5a170f8c9d06d852d92c3e9bbb03204",
     "contracts/release.schema.json": "c482028ebde16055ed00c4e3c2d1a86b27114fae447669c3dab17d1a5eb43ab7",
-    "contracts/requirements.json": "ff2ea3c1b0cde25f52c51fc3837b6d37d68b6c3ee3c74e090113eb6480ecee60",
+    "contracts/requirements.json": "2bab92157d5779d4956f533c4f92e4d83c2071a98295c6b5899ddb5644f94c87",
     "contracts/soak-event.schema.json": "87f1f9590bf2467308e38d9fe00d5a9395f06a887187e58ee4670ce586c25c6b",
     "contracts/sql/001_initial.sql": "286f56252a4f113ff121fd57935909617a30b849628aecfb5fb1c9bae407c36b",
     "contracts/test-result.schema.json": "9bffa29e3bd9ed19c6b40de93bc15394c87d55d43f668b4e0083b5b6a1f8ed51",
