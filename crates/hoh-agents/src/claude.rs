@@ -17,8 +17,8 @@
 //! prints after. Stopping sends SIGINT, then SIGTERM and SIGKILL to the process group with graces between. Stdin,
 //! stdout and the cancel are driven together, so a child that never reads its prompt cannot hold up a cancel.
 
-pub use crate::adapter::{AdapterError, AttemptRef};
-use crate::adapter::{finish, now, offers, sha256_file, step};
+pub use crate::adapter::{AdapterError, AttemptRef, Facts, GateCommand, Held, Recorded, Refused};
+use crate::adapter::{Recorder, finish, now, offers, sha256_file, step};
 use crate::frame::Frame;
 use crate::known;
 use crate::process::{Cause, Config, Escalation, Event, Process, Signal, Step, Termination};
@@ -49,6 +49,8 @@ pub struct Launch {
     pub partial: bool,
     /// Claude's session id to continue.
     pub resume: Option<String>,
+    /// The model to run (`--model`, which the help must offer); `None`: Claude's own default.
+    pub model: Option<String>,
     /// Whether this process runs as root (Claude refuses the bypass as root).
     pub root: bool,
     /// What the probe found for this claude (its compat manifest entry); the session row records them, never more
@@ -119,6 +121,13 @@ pub fn argv(launch: &Launch) -> Result<Argv, Blocked> {
         }
         args.push("--resume".to_owned());
         args.push(id.clone());
+    }
+    if let Some(model) = &launch.model {
+        if !offers(&launch.help, "--model") {
+            return Err(Blocked("claude --help offers no --model".to_owned()));
+        }
+        args.push("--model".to_owned());
+        args.push(model.clone());
     }
     Ok(Argv {
         args,
@@ -357,14 +366,7 @@ pub async fn run(
     command
         .args(argv.args.iter().map(OsString::from))
         .current_dir(&turn.launch.cwd);
-    let config = Config {
-        escalation: turn.escalation,
-        deadline: turn.deadline,
-        stdout_copy: Some(stdout.clone()),
-        stderr_copy: Some(stderr.clone()),
-        ..Config::default()
-    };
-    let mut process = match Process::spawn(command, config) {
+    let mut process = match Process::spawn(command, config(turn, &stdout, &stderr)) {
         Ok(p) => p,
         Err(e) => {
             finish(
@@ -392,39 +394,278 @@ pub async fn run(
         crate::identity::running_pid(pid),
     )
     .await?;
-    // The prompt is written while the output and the cancel are watched; the pipe closes when it is written.
-    let input = process.take_stdin();
-    let mut feed = std::pin::pin!(async {
-        let mut input = input.ok_or_else(|| std::io::Error::other("no stdin pipe"))?;
-        input.write_all(&turn.prompt).await?;
-        input.shutdown().await
-    });
-    let mut fed: Option<std::io::Result<()>> = None;
-    let mut native_session = None;
-    let mut model = None;
-    let mut result: Option<ResultFrame> = None;
-    let mut results = 0;
-    let mut usage = None;
-    let mut cost = None;
-    let mut diagnostics = 0;
-    let mut unknown_records = 0;
-    let mut too_large = false;
-    let mut auth_failed = false;
-    let mut cancelled = cancel.is_requested();
-    if cancelled {
-        process.cancel(turn.escalation);
+    let mut recorder = Recorder::Store {
+        store,
+        attempt,
+        agent: "claude",
+        capabilities: &argv.capabilities,
+    };
+    let driven = drive(
+        &mut recorder,
+        &mut process,
+        turn.prompt.clone(),
+        turn.escalation,
+        Stop::Latch(cancel),
+    )
+    .await?;
+    // A cancel accepted from here on still wins: the store commits the end through the latch (M1T03R-03, M1T03R-10).
+    let (state, failure) = driven.verdict();
+    let state = finish(
+        store,
+        attempt,
+        Running,
+        state,
+        AttemptFacts {
+            ended_at: now(),
+            resolved_model: driven.model.clone(),
+            failure_reason: failure.clone(),
+            cancel_requested: Some(driven.cancelled),
+            usage: driven.usage.clone(),
+            cost_usd: driven.cost,
+            ..AttemptFacts::default()
+        },
+        cancel,
+    )
+    .await?;
+    let failure = if state == Cancelled { None } else { failure };
+    let exit = driven.report.as_ref().and_then(|r| r.status);
+    Ok(Outcome {
+        state,
+        failure,
+        args: argv.args,
+        native_session: driven.native_session,
+        model: driven.model,
+        result: driven.result,
+        exit,
+        stdout_sha256: sha256_file(&stdout)?,
+        stderr_sha256: sha256_file(&stderr)?,
+        stdout,
+        stderr,
+        diagnostics: driven.diagnostics,
+        pid: Some(pid),
+        max_buffered: driven.report.as_ref().map(|r| r.stdout.max_buffered),
+        steps: driven.report.map(|r| r.steps).unwrap_or_default(),
+    })
+}
+
+/// The process settings of `turn`: its escalation, its deadline and its raw logs.
+fn config(turn: &Turn, stdout: &std::path::Path, stderr: &std::path::Path) -> Config {
+    Config {
+        escalation: turn.escalation,
+        deadline: turn.deadline,
+        stdout_copy: Some(stdout.to_path_buf()),
+        stderr_copy: Some(stderr.to_path_buf()),
+        ..Config::default()
     }
-    let report = loop {
+}
+
+/// Start one turn in the runner's mode (docs/adr/ADR-022.md decisions 12 to 14): through `gate`, held there until
+/// [`Held::open`] is sent, then the prompt on stdin; no attempt state moves and nothing is written to the store, the
+/// facts come back for the runner to record. A cancel is native only (SIGINT): the host's ladder decides SIGTERM and
+/// SIGKILL. No deadline: the runner's lease bounds the turn.
+pub fn start(turn: &Turn, gate: &GateCommand) -> Result<Held, Refused> {
+    let argv = argv(&turn.launch).map_err(|Blocked(detail)| Refused {
+        code: "BLOCKED_CAPABILITY".to_owned(),
+        detail,
+    })?;
+    std::fs::create_dir_all(&turn.logs).map_err(|e| Refused {
+        code: "LOGS".to_owned(),
+        detail: e.to_string(),
+    })?;
+    let (stdout, stderr) = (turn.logs.join("stdout.jsonl"), turn.logs.join("stderr.log"));
+    let mut command = Command::new(&gate.program);
+    command
+        .args(&gate.args)
+        .arg(&turn.launch.program)
+        .args(argv.args.iter().map(OsString::from))
+        .envs(gate.env.iter().map(|(k, v)| (k, v)))
+        .current_dir(&turn.launch.cwd);
+    let config = Config {
+        deadline: None,
+        ..config(turn, &stdout, &stderr)
+    };
+    let mut process = Process::spawn(command, config).map_err(|e| Refused {
+        code: "SPAWN".to_owned(),
+        detail: e.to_string(),
+    })?;
+    let pid = process.pid();
+    let (open, opened) = tokio::sync::oneshot::channel::<()>();
+    let cancel = std::sync::Arc::new(tokio::sync::Notify::new());
+    let native = cancel.clone();
+    let prompt = turn.prompt.clone();
+    let escalation = turn.escalation;
+    let raw_log_path = turn.logs.to_string_lossy().into_owned();
+    let ended = tokio::spawn(async move {
+        let mut recorder = Recorder::Collect(Vec::new());
+        // Nothing reaches the gate before it is opened; unopened, its input ends and the agent never runs.
+        let input = match opened.await {
+            Ok(()) => {
+                let mut input = b"go\n".to_vec();
+                input.extend_from_slice(&prompt);
+                Some(input)
+            }
+            Err(_) => None,
+        };
+        let opened = input.is_some();
+        let driven = drive(
+            &mut recorder,
+            &mut process,
+            input.unwrap_or_default(),
+            escalation,
+            Stop::Native(&native),
+        )
+        .await;
+        let recorded = match recorder {
+            Recorder::Collect(recorded) => recorded,
+            Recorder::Store { .. } => Vec::new(),
+        };
+        let Ok(driven) = driven else {
+            return Facts {
+                state: AttemptState::Failed,
+                failure: Some("PROTOCOL_INCOMPLETE".to_owned()),
+                native_session: None,
+                resolved_model: None,
+                usage: None,
+                raw_log_path,
+                max_buffered: None,
+                group_reaped: false,
+                recorded,
+            };
+        };
+        let (state, failure) = if opened {
+            driven.verdict()
+        } else {
+            (AttemptState::Failed, Some("GATE_CLOSED".to_owned()))
+        };
+        Facts {
+            state,
+            failure,
+            native_session: driven.native_session,
+            resolved_model: driven.model,
+            usage: driven.usage,
+            raw_log_path,
+            max_buffered: driven.report.as_ref().map(|r| r.stdout.max_buffered),
+            group_reaped: driven.report.as_ref().is_some_and(|r| r.group_reaped),
+            recorded,
+        }
+    });
+    Ok(Held {
+        pid,
+        open,
+        cancel,
+        ended,
+    })
+}
+
+/// How a turn's cancel comes and what it does: the attempt's latch, escalating with the turn's plan (the direct
+/// mode), or a native cancel only (the runner's mode).
+enum Stop<'a> {
+    Latch(&'a CancelLatch),
+    Native(&'a tokio::sync::Notify),
+}
+
+impl Stop<'_> {
+    fn requested_now(&self) -> bool {
+        match self {
+            Stop::Latch(latch) => latch.is_requested(),
+            Stop::Native(_) => false,
+        }
+    }
+
+    async fn requested(&self) {
+        match self {
+            Stop::Latch(latch) => latch.requested().await,
+            Stop::Native(notify) => notify.notified().await,
+        }
+    }
+
+    fn act(&self, process: &Process, escalation: Escalation) {
+        match self {
+            Stop::Latch(_) => process.cancel(escalation),
+            Stop::Native(_) => process.signal_leader(Signal::Interrupt),
+        }
+    }
+}
+
+/// What a turn's output and end showed.
+struct Driven {
+    native_session: Option<String>,
+    model: Option<String>,
+    result: Option<ResultFrame>,
+    usage: Option<Value>,
+    cost: Option<f64>,
+    diagnostics: usize,
+    too_large: bool,
+    auth_failed: bool,
+    cancelled: bool,
+    fed: Option<std::io::Result<()>>,
+    report: Option<crate::process::ExitReport>,
+}
+
+impl Driven {
+    fn verdict(&self) -> (AttemptState, Option<String>) {
+        let report = self.report.as_ref();
+        let logs_incomplete = report.is_none_or(|r| {
+            r.stdout.error.is_some() || r.stderr.error.is_some() || !r.stdout.eof || !r.stderr.eof
+        });
+        verdict(&Ending {
+            cancelled: self.cancelled,
+            too_large: self.too_large,
+            deadline: report.is_some_and(|r| r.cause == Cause::DeadlineExceeded),
+            logs_incomplete,
+            prompt_undelivered: !matches!(self.fed, Some(Ok(()))),
+            auth_failed: self.auth_failed,
+            result: self.result.as_ref(),
+            exit: report.and_then(|r| r.status),
+        })
+    }
+}
+
+/// Write `input` and read the turn's output until its process ended, recording what it shows; a cancel from `stop`
+/// is acted on as it comes.
+async fn drive(
+    recorder: &mut Recorder<'_>,
+    process: &mut Process,
+    input: Vec<u8>,
+    escalation: Escalation,
+    stop: Stop<'_>,
+) -> Result<Driven, AdapterError> {
+    // The input is written while the output and the cancel are watched; the pipe closes when it is written.
+    let pipe = process.take_stdin();
+    let mut feed = std::pin::pin!(async {
+        let mut pipe = pipe.ok_or_else(|| std::io::Error::other("no stdin pipe"))?;
+        pipe.write_all(&input).await?;
+        pipe.shutdown().await
+    });
+    let mut driven = Driven {
+        native_session: None,
+        model: None,
+        result: None,
+        usage: None,
+        cost: None,
+        diagnostics: 0,
+        too_large: false,
+        auth_failed: false,
+        cancelled: stop.requested_now(),
+        fed: None,
+        report: None,
+    };
+    let mut results = 0;
+    let mut unknown_records = 0;
+    if driven.cancelled {
+        stop.act(process, escalation);
+    }
+    driven.report = loop {
         // A cancel is seen before output that is ready at the same time.
         let event = tokio::select! {
             biased;
-            () = cancel.requested(), if !cancelled => {
-                cancelled = true;
-                process.cancel(turn.escalation);
+            () = stop.requested(), if !driven.cancelled => {
+                driven.cancelled = true;
+                stop.act(process, escalation);
                 continue;
             }
-            written = &mut feed, if fed.is_none() => {
-                fed = Some(written);
+            written = &mut feed, if driven.fed.is_none() => {
+                driven.fed = Some(written);
                 continue;
             }
             event = process.next() => event,
@@ -433,11 +674,10 @@ pub async fn run(
             Some(Event::Frame(Frame::Line(bytes) | Frame::Partial(bytes))) => bytes,
             Some(Event::Frame(Frame::TooLarge(refused))) => {
                 // Nothing more is framed: end the process rather than wait for it.
-                too_large = true;
-                process.cancel(turn.escalation);
-                store
-                    .attempt_event(
-                        &attempt.attempt_id,
+                driven.too_large = true;
+                process.cancel(escalation);
+                recorder
+                    .event(
                         "frame-too-large",
                         "adapter.diagnostic",
                         json!({
@@ -454,11 +694,10 @@ pub async fn run(
             None => break None,
         };
         let Ok(frame) = serde_json::from_slice::<Value>(&line) else {
-            diagnostics += 1;
-            store
-                .attempt_event(
-                    &attempt.attempt_id,
-                    &format!("diagnostic-{diagnostics}"),
+            driven.diagnostics += 1;
+            recorder
+                .event(
+                    &format!("diagnostic-{}", driven.diagnostics),
                     "adapter.diagnostic",
                     json!({
                         "reason": "stdout line is not JSON",
@@ -472,67 +711,61 @@ pub async fn run(
         let key = known::claude_key(&frame);
         if !known::is_known(known::claude(), key.as_deref()) {
             unknown_records += 1;
-            store
-                .attempt_event(
-                    &attempt.attempt_id,
+            let attempt_id = match recorder {
+                Recorder::Store { attempt, .. } => attempt.attempt_id.clone(),
+                Recorder::Collect(_) => String::new(),
+            };
+            recorder
+                .event(
                     &format!("unknown-{unknown_records}"),
                     "adapter.unknown_event",
-                    known::unknown_event(&attempt.attempt_id, key.as_deref(), &line, &frame),
+                    known::unknown_event(&attempt_id, key.as_deref(), &line, &frame),
                 )
                 .await?;
         }
         match frame["type"].as_str() {
             Some("system") if frame["subtype"] == "init" => {
-                native_session = frame["session_id"].as_str().map(str::to_owned);
-                model = frame["model"].as_str().map(str::to_owned);
-                store
-                    .upsert_session(Session {
-                        session_id: attempt.session_id.clone(),
-                        agent: "claude".to_owned(),
-                        role: attempt.role.clone(),
-                        native_id: native_session.clone(),
-                        native_path: None,
-                        agent_version: attempt.agent_version.clone(),
-                        capabilities: argv.capabilities.clone(),
-                    })
-                    .await?;
+                driven.native_session = frame["session_id"].as_str().map(str::to_owned);
+                driven.model = frame["model"].as_str().map(str::to_owned);
+                if let Some(native) = &driven.native_session {
+                    recorder.native_session(native).await?;
+                }
             }
-            Some("assistant") if frame["error"] == "authentication_failed" => auth_failed = true,
+            Some("assistant") if frame["error"] == "authentication_failed" => {
+                driven.auth_failed = true;
+            }
             Some("result") => {
                 let frame_result = ResultFrame {
                     subtype: frame["subtype"].as_str().map(str::to_owned),
                     is_error: frame["is_error"].as_bool(),
                     text: frame["result"].as_str().map(str::to_owned),
                 };
-                usage = frame.get("usage").filter(|u| u.is_object()).cloned();
-                cost = frame["total_cost_usd"].as_f64();
+                driven.usage = frame.get("usage").filter(|u| u.is_object()).cloned();
+                driven.cost = frame["total_cost_usd"].as_f64();
                 results += 1;
                 // Kept whatever the end: after a cancel it is only a diagnostic (CR-003).
-                store
-                    .attempt_event(
-                        &attempt.attempt_id,
+                recorder
+                    .event(
                         &format!("result-{results}"),
                         "adapter.result",
                         json!({
                             "subtype": frame_result.subtype,
                             "is_error": frame_result.is_error,
                             "terminal_reason": frame["terminal_reason"],
-                            "after_cancel": cancelled,
+                            "after_cancel": driven.cancelled,
                         }),
                     )
                     .await?;
-                result = Some(frame_result);
+                driven.result = Some(frame_result);
             }
             _ => {}
         }
     };
-    let logs_incomplete = report.as_ref().is_none_or(|r| {
-        r.stdout.error.is_some() || r.stderr.error.is_some() || !r.stdout.eof || !r.stderr.eof
-    });
-    if logs_incomplete && let Some(r) = &report {
-        store
-            .attempt_event(
-                &attempt.attempt_id,
+    if let Some(r) = &driven.report
+        && (r.stdout.error.is_some() || r.stderr.error.is_some() || !r.stdout.eof || !r.stderr.eof)
+    {
+        recorder
+            .event(
                 "raw-log-incomplete",
                 "adapter.diagnostic",
                 json!({
@@ -543,55 +776,7 @@ pub async fn run(
             )
             .await?;
     }
-    let exit = report.as_ref().and_then(|r| r.status);
-    // A cancel accepted from here on still wins: the store commits the end through the latch (M1T03R-03, M1T03R-10).
-    let (state, failure) = verdict(&Ending {
-        cancelled,
-        too_large,
-        deadline: report
-            .as_ref()
-            .is_some_and(|r| r.cause == Cause::DeadlineExceeded),
-        logs_incomplete,
-        prompt_undelivered: !matches!(fed, Some(Ok(()))),
-        auth_failed,
-        result: result.as_ref(),
-        exit,
-    });
-    let state = finish(
-        store,
-        attempt,
-        Running,
-        state,
-        AttemptFacts {
-            ended_at: now(),
-            resolved_model: model.clone(),
-            failure_reason: failure.clone(),
-            cancel_requested: Some(cancelled),
-            usage,
-            cost_usd: cost,
-            ..AttemptFacts::default()
-        },
-        cancel,
-    )
-    .await?;
-    let failure = if state == Cancelled { None } else { failure };
-    Ok(Outcome {
-        state,
-        failure,
-        args: argv.args,
-        native_session,
-        model,
-        result,
-        exit,
-        stdout_sha256: sha256_file(&stdout)?,
-        stderr_sha256: sha256_file(&stderr)?,
-        stdout,
-        stderr,
-        diagnostics,
-        pid: Some(pid),
-        max_buffered: report.as_ref().map(|r| r.stdout.max_buffered),
-        steps: report.map(|r| r.steps).unwrap_or_default(),
-    })
+    Ok(driven)
 }
 
 #[cfg(test)]

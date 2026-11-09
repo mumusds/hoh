@@ -12,6 +12,7 @@ fn launch() -> Launch {
         yolo: true,
         partial: false,
         resume: None,
+        model: None,
         root: false,
         // What the probe finds for HELP.
         capabilities: [
@@ -220,4 +221,21 @@ fn only_a_clean_success_settles_and_a_cancel_always_wins() {
             (AttemptState::Cancelled, None)
         );
     }
+}
+
+#[test]
+fn a_chosen_model_is_passed_only_where_the_help_offers_it() {
+    // docs/adr/ADR-022.md decision 14 (REQ-018: a binding's model): `--model` from the help, never assumed.
+    let mut l = launch();
+    l.help = format!("{HELP}  --model <model>\n");
+    l.model = Some("m-test".to_owned());
+    let args = argv(&l).expect("argv").args;
+    assert_eq!(args[args.len() - 2..], ["--model", "m-test"]);
+    l.help = HELP.to_owned();
+    assert_eq!(
+        argv(&l).expect_err("blocked"),
+        Blocked("claude --help offers no --model".to_owned())
+    );
+    l.model = None;
+    assert!(!argv(&l).expect("argv").args.iter().any(|x| x == "--model"));
 }
