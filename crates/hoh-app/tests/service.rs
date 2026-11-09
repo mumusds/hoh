@@ -573,3 +573,42 @@ fn a_host_that_keeps_failing_under_its_unit_fails_the_client_with_its_last_line(
     assert!(stderr.contains(last), "client: {stderr}\nhost: {said}");
     Ok(())
 }
+
+#[test]
+fn a_host_that_fails_under_its_unit_with_no_restart_coming_fails_the_client_at_once() -> R {
+    // ADR-023 decision 6: the unit failed and nothing will restart it (here a drop-in says Restart=no): the client
+    // judges the host's end then, by its exit and its last line, not at its deadline.
+    let root = tempfile::tempdir()?;
+    let project = project(root.path())?;
+    let manager = installed(&[&project])?;
+    std::fs::write(project.join(".hoh"), "not a directory")?;
+    let dropin = manager
+        .home()
+        .join(".config/systemd/user/hoh-host@.service.d");
+    std::fs::create_dir_all(&dropin)?;
+    std::fs::write(dropin.join("once.conf"), "[Service]\nRestart=no\n")?;
+    let out = manager.systemctl(&["daemon-reload"])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let started = std::time::Instant::now();
+    let out = hoh_in(
+        &manager,
+        &project,
+        None,
+        &["-p", "x", "--detach", "--output", "json"],
+    )?;
+    let took = started.elapsed();
+    assert_eq!(out.status.code(), Some(69), "{}", text(&out));
+    assert!(took < Duration::from_secs(5), "{took:?}: {}", text(&out));
+    let said = std::fs::read_to_string(manager.runtime().join(format!(
+        "hoh-host@{}.stderr",
+        hoh_app::unit::instance(&project)
+    )))?;
+    let last = said
+        .lines()
+        .rfind(|l| !l.trim().is_empty())
+        .ok_or("the host said nothing")?;
+    let stderr = String::from_utf8(out.stderr)?;
+    assert!(stderr.contains(last), "client: {stderr}\nhost: {said}");
+    assert!(!stderr.contains("did not become ready"), "{stderr}");
+    Ok(())
+}
