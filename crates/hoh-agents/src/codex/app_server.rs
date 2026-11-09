@@ -15,7 +15,7 @@ use super::{
     Ending, METHOD_NOT_FOUND, Mode, Outcome, Steer, SteerReceipt, Turn, app_server_args,
     failure_of, hard_stop, hashes, is_text_item, verdict,
 };
-use crate::adapter::{AdapterError, AttemptRef, finish, now, soft_move, step};
+use crate::adapter::{AdapterError, AttemptRef, Recorded, Stop, finish, now, soft_move, step};
 use crate::frame::Frame;
 use crate::known;
 use crate::process::{Config, Event, Process};
@@ -131,7 +131,12 @@ struct SentSteer {
 
 /// Everything one App Server turn knows.
 struct State<'a> {
-    store: &'a Store,
+    /// The store in the direct mode; none in the runner's, which records what the turn saw (docs/adr/ADR-022.md
+    /// decision 12).
+    store: Option<&'a Store>,
+    recorded: std::sync::Mutex<Vec<Recorded>>,
+    /// A cancel only interrupts the turn: the host's ladder ends the process (the runner's mode, decision 14).
+    native_only: bool,
     attempt: &'a AttemptRef,
     turn: &'a Turn,
     conn: Conn,
@@ -175,9 +180,23 @@ impl State<'_> {
 
     async fn event(&self, name: &str, kind: &str, mut payload: Value) -> Result<(), PersistError> {
         payload["attempt_id"] = json!(self.attempt.attempt_id);
-        self.store
-            .attempt_event(&self.attempt.attempt_id, name, kind, payload)
-            .await
+        match self.store {
+            Some(store) => {
+                store
+                    .attempt_event(&self.attempt.attempt_id, name, kind, payload)
+                    .await
+            }
+            None => {
+                if let Ok(mut recorded) = self.recorded.lock() {
+                    recorded.push(Recorded::Event {
+                        key: name.to_owned(),
+                        kind: kind.to_owned(),
+                        payload,
+                    });
+                }
+                Ok(())
+            }
+        }
     }
 
     async fn diagnostic(&mut self, payload: Value) -> Result<(), PersistError> {
@@ -198,6 +217,20 @@ impl State<'_> {
     /// Stop the turn: interrupt the active turn and give it the native grace; before a turn is active, end the
     /// process.
     fn begin_stop(&mut self, process: &Process) {
+        if self.native_only {
+            // Only the agent's own cancel: interrupt an active turn, or close stdin before one is; nothing more.
+            if self.phase == Phase::Active && self.conn.open() && !self.interrupted {
+                if let (Some(t), Some(u)) = (&self.thread_id, &self.turn_id) {
+                    let params = json!({"threadId": t, "turnId": u});
+                    self.conn
+                        .request("turn/interrupt", params, Pending::Interrupt);
+                }
+            } else {
+                self.conn.close();
+            }
+            self.interrupted = true;
+            return;
+        }
         if self.phase == Phase::Active && self.conn.open() && !self.interrupted {
             if let (Some(t), Some(u)) = (&self.thread_id, &self.turn_id) {
                 let params = json!({"threadId": t, "turnId": u});
@@ -241,8 +274,11 @@ impl State<'_> {
     }
 
     async fn apply(&self, input_id: String) -> Result<(), PersistError> {
+        let Some(store) = self.store else {
+            return Ok(());
+        };
         soft_move(
-            self.store,
+            store,
             &self.attempt.attempt_id,
             &input_id,
             InputState::Delivered,
@@ -439,14 +475,17 @@ impl State<'_> {
                 }
                 None => {
                     self.conn.send(&json!({"method": "initialized"}));
-                    step(
-                        self.store,
-                        self.attempt,
-                        Starting,
-                        Running,
-                        crate::identity::running_pid(self.pid),
-                    )
-                    .await?;
+                    // In the runner's mode the runner recorded RUNNING before the gate opened.
+                    if let Some(store) = self.store {
+                        step(
+                            store,
+                            self.attempt,
+                            Starting,
+                            Running,
+                            crate::identity::running_pid(self.pid),
+                        )
+                        .await?;
+                    }
                     self.running = true;
                     self.phase = Phase::Thread;
                     let launch = &self.turn.launch;
@@ -482,14 +521,24 @@ impl State<'_> {
                     let result = &frame["result"];
                     self.thread_id = result["thread"]["id"].as_str().map(str::to_owned);
                     self.model = result["model"].as_str().map(str::to_owned);
-                    self.store
-                        .upsert_session(super::session(
-                            self.attempt,
-                            self.turn,
-                            true,
-                            self.thread_id.clone(),
-                        ))
-                        .await?;
+                    match (self.store, &self.thread_id) {
+                        (Some(store), _) => {
+                            store
+                                .upsert_session(super::session(
+                                    self.attempt,
+                                    self.turn,
+                                    true,
+                                    self.thread_id.clone(),
+                                ))
+                                .await?;
+                        }
+                        (None, Some(thread)) => {
+                            if let Ok(mut recorded) = self.recorded.lock() {
+                                recorded.push(Recorded::NativeSession(thread.clone()));
+                            }
+                        }
+                        (None, None) => {}
+                    }
                     self.phase = Phase::TurnStart;
                     let params = json!({"threadId": self.thread_id,
                                         "input": [{"type": "text", "text": self.turn.prompt}]});
@@ -529,27 +578,31 @@ impl State<'_> {
                     // A refused steer gives up the item matched to it.
                     self.sent.retain(|x| x.input_id != s.input_id);
                     // Someone else may have moved the input on; that is recorded, not fatal (M1T05R-01).
-                    soft_move(
-                        self.store,
-                        &self.attempt.attempt_id,
-                        &s.input_id,
-                        InputState::Queued,
-                        InputState::Rejected,
-                        Some(message.clone()),
-                    )
-                    .await?;
+                    if let Some(store) = self.store {
+                        soft_move(
+                            store,
+                            &self.attempt.attempt_id,
+                            &s.input_id,
+                            InputState::Queued,
+                            InputState::Rejected,
+                            Some(message.clone()),
+                        )
+                        .await?;
+                    }
                     let _ = s.reply.send(SteerReceipt::Rejected { reason: message });
                 }
                 None => {
-                    soft_move(
-                        self.store,
-                        &self.attempt.attempt_id,
-                        &s.input_id,
-                        InputState::Queued,
-                        InputState::Delivered,
-                        None,
-                    )
-                    .await?;
+                    if let Some(store) = self.store {
+                        soft_move(
+                            store,
+                            &self.attempt.attempt_id,
+                            &s.input_id,
+                            InputState::Queued,
+                            InputState::Delivered,
+                            None,
+                        )
+                        .await?;
+                    }
                     let took = frame["result"]["turnId"]
                         .as_str()
                         .map(str::to_owned)
@@ -572,6 +625,26 @@ impl State<'_> {
     }
 }
 
+/// The raw log files of an App Server turn.
+pub(super) fn logs(turn: &Turn) -> (std::path::PathBuf, std::path::PathBuf) {
+    (
+        turn.logs.join("app-server.stdout.jsonl"),
+        turn.logs.join("app-server.stderr.log"),
+    )
+}
+
+/// The process settings of an App Server turn: its own ends stop hard, no deadline (the turn's is watched here).
+pub(super) fn config(turn: &Turn) -> Config {
+    let (stdout, stderr) = logs(turn);
+    Config {
+        escalation: hard_stop(turn.escalation),
+        deadline: None,
+        stdout_copy: Some(stdout),
+        stderr_copy: Some(stderr),
+        ..Config::default()
+    }
+}
+
 pub(super) async fn run(
     store: &Store,
     attempt: &AttemptRef,
@@ -582,24 +655,14 @@ pub(super) async fn run(
     held: &mut Vec<Steer>,
 ) -> Result<End, AdapterError> {
     use AttemptState::*;
-    let (stdout, stderr) = (
-        turn.logs.join("app-server.stdout.jsonl"),
-        turn.logs.join("app-server.stderr.log"),
-    );
+    let (stdout, stderr) = logs(turn);
     let args = match app_server_args(help) {
         Ok(args) => args,
         Err(super::Blocked(why)) => return Ok(End::Degrade(why)),
     };
     let mut command = Command::new(&turn.launch.program);
     command.args(&args).current_dir(&turn.launch.cwd);
-    let config = Config {
-        escalation: hard_stop(turn.escalation),
-        deadline: None,
-        stdout_copy: Some(stdout.clone()),
-        stderr_copy: Some(stderr.clone()),
-        ..Config::default()
-    };
-    let mut process = match Process::spawn(command, config) {
+    let mut process = match Process::spawn(command, config(turn)) {
         Ok(p) => p,
         Err(e) => {
             finish(
@@ -618,7 +681,113 @@ pub(super) async fn run(
             return Err(e.into());
         }
     };
+    let drove = match drive(
+        Some(store),
+        attempt,
+        turn,
+        &mut process,
+        Stop::Latch(cancel),
+        steers,
+        held,
+        None,
+    )
+    .await?
+    {
+        Drove::Degrade(reason, _) => return Ok(End::Degrade(reason)),
+        Drove::Ended(drove) => *drove,
+    };
+    let state = finish(
+        store,
+        attempt,
+        if drove.running { Running } else { Starting },
+        drove.state,
+        AttemptFacts {
+            ended_at: now(),
+            resolved_model: drove.model.clone(),
+            failure_reason: drove.failure.clone(),
+            cancel_requested: Some(drove.cancelled),
+            usage: drove.usage.clone(),
+            ..AttemptFacts::default()
+        },
+        cancel,
+    )
+    .await?;
+    let (stdout_sha256, stderr_sha256) = hashes(&stdout, &stderr)?;
+    let exit = drove.report.as_ref().and_then(|r| r.status);
+    Ok(End::Ended(Box::new(Outcome {
+        failure: if state == Cancelled {
+            None
+        } else {
+            drove.failure
+        },
+        state,
+        mode: Mode::AppServer,
+        args,
+        native_session: drove.thread_id,
+        turn_id: drove.turn_id,
+        model: drove.model,
+        status: drove.status,
+        reply: drove.reply,
+        exit,
+        stdout,
+        stderr,
+        stdout_sha256,
+        stderr_sha256,
+        items: drove.items,
+        unknown_events: drove.unknown_events,
+        degraded: None,
+        pid: Some(drove.pid),
+        max_buffered: drove.report.as_ref().map(|r| r.stdout.max_buffered),
+        steps: drove.report.map(|r| r.steps).unwrap_or_default(),
+    })))
+}
+
+/// How an App Server turn's drive ended: moved to exec (the handshake refused, before anything ranked above it), or
+/// over with its verdict.
+pub(super) enum Drove {
+    /// The reason, and how the process ended.
+    Degrade(String, Option<crate::process::ExitReport>),
+    Ended(Box<Driven>),
+}
+
+/// What an App Server turn showed, and the adapter's verdict.
+pub(super) struct Driven {
+    pub(super) state: AttemptState,
+    pub(super) failure: Option<String>,
+    pub(super) running: bool,
+    pub(super) cancelled: bool,
+    pub(super) thread_id: Option<String>,
+    pub(super) turn_id: Option<String>,
+    pub(super) model: Option<String>,
+    pub(super) usage: Option<Value>,
+    pub(super) status: Option<String>,
+    pub(super) reply: Option<String>,
+    pub(super) items: usize,
+    pub(super) unknown_events: usize,
+    pub(super) pid: u32,
+    pub(super) report: Option<crate::process::ExitReport>,
+    /// What the turn saw, in the runner's mode (the direct mode wrote it to the store).
+    pub(super) recorded: Vec<Recorded>,
+}
+
+/// Drive one App Server turn on `process` until it ended: the handshake, the thread, the turn, its notifications and
+/// requests, a cancel from `stop`. `preamble` is written first (the runner's mode: the gate's `go`). With no store
+/// (the runner's mode) nothing is written and the turn's events come back with it.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn drive(
+    store: Option<&Store>,
+    attempt: &AttemptRef,
+    turn: &Turn,
+    process: &mut Process,
+    stop: Stop<'_>,
+    steers: &mut mpsc::Receiver<Steer>,
+    held: &mut Vec<Steer>,
+    preamble: Option<Vec<u8>>,
+) -> Result<Drove, AdapterError> {
     let (lines, mut queue) = mpsc::unbounded_channel::<Vec<u8>>();
+    if let Some(preamble) = preamble {
+        let _ = lines.send(preamble);
+    }
     let input = process.take_stdin();
     let mut writer = tokio::spawn(async move {
         let mut input = input.ok_or_else(|| std::io::Error::other("no stdin pipe"))?;
@@ -629,6 +798,8 @@ pub(super) async fn run(
     });
     let mut s = State {
         store,
+        recorded: std::sync::Mutex::new(Vec::new()),
+        native_only: stop.is_native(),
         attempt,
         turn,
         conn: Conn {
@@ -646,7 +817,7 @@ pub(super) async fn run(
         status: None,
         error: None,
         reply: None,
-        cancelled: cancel.is_requested(),
+        cancelled: stop.requested_now(),
         deadline: false,
         too_large: false,
         tool_started: false,
@@ -670,19 +841,19 @@ pub(super) async fn run(
     let deadline_at = turn.deadline.map(|d| Instant::now() + d);
     let (mut steers_open, mut written) = (true, false);
     if s.cancelled {
-        s.begin_stop(&process);
+        s.begin_stop(process);
     }
     let report = loop {
         let event = tokio::select! {
             biased;
-            () = cancel.requested(), if !s.cancelled => {
+            () = stop.requested(), if !s.cancelled => {
                 s.cancelled = true;
-                s.begin_stop(&process);
+                s.begin_stop(process);
                 continue;
             }
             _ = tokio::time::sleep_until(at(deadline_at)), if deadline_at.is_some() && !s.deadline => {
                 s.deadline = true;
-                s.begin_stop(&process);
+                s.begin_stop(process);
                 continue;
             }
             _ = tokio::time::sleep_until(handshake_until),
@@ -692,7 +863,7 @@ pub(super) async fn run(
                 continue;
             }
             _ = tokio::time::sleep_until(at(s.stop_at)), if s.stop_at.is_some() && !s.stopped => {
-                s.hard_stop(&process);
+                s.hard_stop(process);
                 continue;
             }
             result = &mut writer, if !written => {
@@ -707,7 +878,7 @@ pub(super) async fn run(
                 // the outcome, so a tool that had started still makes it UNKNOWN_EFFECT.
                 if let Some(e) = failed.filter(|_| s.conn.open()) {
                     s.diagnostic(json!({"reason": "stdin failed", "error": e})).await?;
-                    s.hard_stop(&process);
+                    s.hard_stop(process);
                 }
                 continue;
             }
@@ -728,7 +899,7 @@ pub(super) async fn run(
             Some(Event::Frame(Frame::Line(bytes) | Frame::Partial(bytes))) => bytes,
             Some(Event::Frame(Frame::TooLarge(refused))) => {
                 s.too_large = true;
-                s.hard_stop(&process);
+                s.hard_stop(process);
                 s.event(
                     "frame-too-large",
                     "adapter.diagnostic",
@@ -753,7 +924,7 @@ pub(super) async fn run(
         match (frame["method"].as_str(), frame.get("id").cloned()) {
             (Some(method), Some(id)) => s.on_request(method, id, &frame, &line).await?,
             (Some(method), None) => s.on_notification(method, &frame, &line).await?,
-            (None, _) => s.on_response(&process, held, &frame).await?,
+            (None, _) => s.on_response(process, held, &frame).await?,
         }
     };
     s.conn.close();
@@ -777,7 +948,7 @@ pub(super) async fn run(
         .clone()
         .filter(|_| !s.cancelled && !s.too_large && !s.deadline && !logs_incomplete)
     {
-        return Ok(End::Degrade(reason));
+        return Ok(Drove::Degrade(reason, report));
     }
     for st in held.drain(..) {
         let _ = st.reply.send(SteerReceipt::NotNow);
@@ -840,43 +1011,26 @@ pub(super) async fn run(
         )
         .await?;
     }
-    let state = finish(
-        store,
-        attempt,
-        if s.running { Running } else { Starting },
+    let recorded = s
+        .recorded
+        .lock()
+        .map(|mut r| std::mem::take(&mut *r))
+        .unwrap_or_default();
+    Ok(Drove::Ended(Box::new(Driven {
         state,
-        AttemptFacts {
-            ended_at: now(),
-            resolved_model: s.model.clone(),
-            failure_reason: failure.clone(),
-            cancel_requested: Some(s.cancelled),
-            usage: s.usage.clone(),
-            ..AttemptFacts::default()
-        },
-        cancel,
-    )
-    .await?;
-    let (stdout_sha256, stderr_sha256) = hashes(&stdout, &stderr)?;
-    Ok(End::Ended(Box::new(Outcome {
-        failure: if state == Cancelled { None } else { failure },
-        state,
-        mode: Mode::AppServer,
-        args,
-        native_session: s.thread_id,
-        turn_id: s.turn_id,
-        model: s.model,
-        status: s.status,
-        reply: s.reply,
-        exit,
-        stdout,
-        stderr,
-        stdout_sha256,
-        stderr_sha256,
+        failure,
+        running: s.running,
+        cancelled: s.cancelled,
         items: s.counters.get("item").copied().unwrap_or(0),
         unknown_events: s.counters.get("unknown").copied().unwrap_or(0),
-        degraded: None,
-        pid: Some(s.pid),
-        max_buffered: report.as_ref().map(|r| r.stdout.max_buffered),
-        steps: report.map(|r| r.steps).unwrap_or_default(),
+        thread_id: s.thread_id,
+        turn_id: s.turn_id,
+        model: s.model,
+        usage: s.usage,
+        status: s.status,
+        reply: s.reply,
+        pid: s.pid,
+        report,
+        recorded,
     })))
 }

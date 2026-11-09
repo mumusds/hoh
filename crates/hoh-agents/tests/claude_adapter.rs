@@ -1202,8 +1202,9 @@ async fn claude_runner_mode_runs_nothing_before_its_gate_and_reports_facts_witho
     let program = recording(&world, "held", &format!("{INIT}\n{SUCCESS}"))?;
     let mut turn = world.turn(&program, "logs-held")?;
     turn.deadline = Some(Duration::from_millis(1));
+    let attempt = world.attempt("A1").await?;
     let events = count(&world, "SELECT count(*) FROM events")?;
-    let held = claude::start(&turn, &gate(&world, "p/A1")?)?;
+    let held = claude::start(&attempt, &turn, &gate(&world, "p/A1")?)?;
     tokio::time::sleep(Duration::from_millis(500)).await;
     let d = world.dir.path().join("held");
     assert!(
@@ -1245,7 +1246,7 @@ async fn claude_runner_mode_gate_dropped_unopened_never_runs_the_agent() -> R {
     let world = World::new()?;
     let program = recording(&world, "dropped", SUCCESS)?;
     let turn = world.turn(&program, "logs-dropped")?;
-    let held = claude::start(&turn, &gate(&world, "p/A1")?)?;
+    let held = claude::start(&world.attempt("A1").await?, &turn, &gate(&world, "p/A1")?)?;
     drop(held.open);
     let facts = tokio::time::timeout(Duration::from_secs(20), held.ended).await??;
     assert_eq!(facts.state, AttemptState::Failed);
@@ -1273,7 +1274,7 @@ async fn claude_runner_mode_cancel_is_one_sigint_and_nothing_after_it() -> R {
     )?;
     let mut turn = world.turn(&program, "logs-stubborn")?;
     turn.escalation = quick();
-    let held = claude::start(&turn, &gate(&world, "p/A1")?)?;
+    let held = claude::start(&world.attempt("A1").await?, &turn, &gate(&world, "p/A1")?)?;
     held.open.send(()).map_err(|()| "gate closed")?;
     let end = Instant::now() + Duration::from_secs(10);
     while !d.join("ready").exists() {
