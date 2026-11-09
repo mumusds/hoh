@@ -21,6 +21,7 @@ mod client;
 mod doctor;
 mod exit;
 mod help;
+mod installer;
 mod session;
 mod tui;
 
@@ -42,6 +43,11 @@ fn main() {
     // in no help text.
     if args.first().map(OsString::as_os_str) == Some("__gate".as_ref()) {
         std::process::exit(hoh_app::gate::main(&args[1..]));
+    }
+    // Internal mode: what the installer asks of the binary (docs/adr/ADR-023.md decision 5); not a user command and in
+    // no help text.
+    if args.first().map(OsString::as_os_str) == Some("__unit".as_ref()) {
+        std::process::exit(i32::from(installer::main(&args[1..])));
     }
     // Internal mode: the host a client starts (docs/adr/ADR-021.md decision 1); not a user command and in no help text.
     if args.first().map(OsString::as_os_str) == Some("__host".as_ref()) {

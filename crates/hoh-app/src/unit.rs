@@ -1,0 +1,253 @@
+//! The systemd user unit of a project's host (docs/adr/ADR-023.md decisions 1, 2 and 5): the instance a project
+//! gets, the template the installer writes, the per-instance environment file that names the project, and the reading
+//! of `systemctl show`. The installer (`hoh __unit`), the client and `hoh doctor` use this module and nothing else for
+//! these.
+
+use sha2::{Digest as _, Sha256};
+use std::collections::BTreeMap;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
+
+/// The template's file name; an instance is `hoh-host@<instance>.service`.
+pub const TEMPLATE: &str = "hoh-host@.service";
+
+/// Why a path cannot be used in the unit or its environment file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unusable(pub String);
+
+impl std::fmt::Display for Unusable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unusable {}
+
+/// The instance of the project at `canonical` (its canonical path): the first 16 hex digits of the SHA-256 of its
+/// bytes, as an attempt's cgroup is named.
+pub fn instance(canonical: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt as _;
+    Sha256::digest(canonical.as_os_str().as_bytes())
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The unit of `instance`.
+pub fn unit_name(instance: &str) -> String {
+    format!("hoh-host@{instance}.service")
+}
+
+/// Whether systemd takes `c` in a unit or an environment file: no control character (systemd refuses them in a
+/// command line), no byte order mark and no Unicode noncharacter (it refuses those in an environment file).
+fn plain(c: char) -> bool {
+    let n = u32::from(c);
+    !c.is_control() && c != '\u{feff}' && !(0xfdd0..=0xfdef).contains(&n) && n & 0xfffe != 0xfffe
+}
+
+/// `path` as text systemd takes, or why not: UTF-8, absolute, and every character plain.
+fn text_of<'a>(what: &str, path: &'a Path) -> Result<&'a str, Unusable> {
+    let text = path
+        .to_str()
+        .ok_or_else(|| Unusable(format!("{what} is not UTF-8: {}", path.display())))?;
+    if !path.is_absolute() {
+        return Err(Unusable(format!("{what} is not absolute: {text:?}")));
+    }
+    if let Some(c) = text.chars().find(|c| !plain(*c)) {
+        return Err(Unusable(format!(
+            "{what} has {c:?}, which systemd does not take: {text:?}"
+        )));
+    }
+    Ok(text)
+}
+
+/// The template for the hoh installed in `home` (`<home>/.local/bin/hoh`), or why it cannot run from there.
+///
+/// The program is written whole in double quotes with `%` doubled (a specifier otherwise); `$` is not expanded in a
+/// program's path. systemd refuses a program whose path has `"`, `\` or `'` however escaped, so such a home gets no
+/// template (verified under a private manager, ADR-023 decision 1).
+pub fn template(home: &Path) -> Result<String, Unusable> {
+    let home = text_of("the home directory", home)?;
+    if let Some(c) = home.chars().find(|c| matches!(c, '"' | '\\' | '\'')) {
+        return Err(Unusable(format!(
+            "the home directory has {c:?}: systemd runs no program whose path has it ({home:?})"
+        )));
+    }
+    let program = format!("{home}/.local/bin/hoh").replace('%', "%%");
+    Ok(format!(
+        "# Written by the HoH installer at each install, removed by `install.sh --uninstall`.\n\
+         # Local changes belong in drop-ins: systemctl --user edit hoh-host@.service\n\
+         [Unit]\n\
+         Description=HoH host (project %i)\n\
+         StartLimitIntervalSec=300\n\
+         StartLimitBurst=5\n\
+         \n\
+         [Service]\n\
+         Type=exec\n\
+         EnvironmentFile=%S/hoh/hosts/%i.env\n\
+         ExecStart=\"{program}\" __host ${{HOH_PROJECT}}\n\
+         Restart=on-failure\n\
+         RestartSec=5\n\
+         RestartPreventExitStatus=64 69 78\n\
+         Delegate=yes\n\
+         KillMode=control-group\n\
+         TimeoutStopSec=15\n\
+         StandardInput=null\n\
+         StandardOutput=null\n\
+         StandardError=append:%t/hoh-host@%i.stderr\n\
+         \n\
+         [Install]\n\
+         WantedBy=default.target\n"
+    ))
+}
+
+/// `value` in double quotes as systemd.exec(5) reads an environment file: `\`, `"`, `` ` `` and `$` escaped.
+fn quoted(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        if matches!(c, '\\' | '"' | '`' | '$') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
+/// The environment file of `project`'s instance: the project for `${HOH_PROJECT}` and the PATH its host finds the
+/// agents on (ADR-023 decision 2), or why they cannot be written so that systemd reads them back unchanged.
+pub fn environment(project: &Path, path: &OsStr) -> Result<String, Unusable> {
+    let project = text_of("the project's path", project)?;
+    let path = path
+        .to_str()
+        .ok_or_else(|| Unusable("PATH is not UTF-8".to_owned()))?;
+    if let Some(c) = path.chars().find(|c| !plain(*c)) {
+        return Err(Unusable(format!(
+            "PATH has {c:?}, which systemd does not take"
+        )));
+    }
+    Ok(format!(
+        "HOH_PROJECT={}\nPATH={}\n",
+        quoted(project),
+        quoted(path)
+    ))
+}
+
+/// The project an environment file this module wrote names; `None` for anything else.
+pub fn project_of(text: &str) -> Option<PathBuf> {
+    let value = text
+        .lines()
+        .find_map(|line| line.strip_prefix("HOH_PROJECT=\""))?
+        .strip_suffix('"')?;
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some(e @ ('\\' | '"' | '`' | '$')) => out.push(e),
+                _ => return None,
+            },
+            '"' => return None,
+            c => out.push(c),
+        }
+    }
+    Some(PathBuf::from(out))
+}
+
+/// Why an environment file was not written.
+#[derive(Debug)]
+pub enum WriteError {
+    /// It names this other project, whose instance is the same (a hash collision): nothing is overwritten.
+    Collision(PathBuf),
+    Io(String),
+}
+
+impl std::fmt::Display for WriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WriteError::Collision(other) => write!(
+                f,
+                "its instance is already that of {} (the same hash): not overwritten",
+                other.display()
+            ),
+            WriteError::Io(e) => f.write_str(e),
+        }
+    }
+}
+
+impl std::error::Error for WriteError {}
+
+/// Write `text`, the environment file of `project`, at `file` (in a directory only this user can enter, readable only
+/// by this user), whole: a new file renamed over the old one, since systemd reads it again before each restart. A
+/// file that names another project is left as it is.
+pub fn write_environment(file: &Path, project: &Path, text: &str) -> Result<(), WriteError> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+    let io = |what: &str, at: &Path, e: std::io::Error| {
+        WriteError::Io(format!("cannot {what} {}: {e}", at.display()))
+    };
+    let dir = file
+        .parent()
+        .ok_or_else(|| WriteError::Io(format!("{} has no directory", file.display())))?;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .map_err(|e| io("create", dir, e))?;
+    match std::fs::read_to_string(file) {
+        Ok(old) => {
+            if let Some(other) = project_of(&old).filter(|p| p != project) {
+                return Err(WriteError::Collision(other));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        // Not text (so not ours) is replaced like any damaged file; another failure is reported.
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {}
+        Err(e) => return Err(io("read", file, e)),
+    }
+    let mut name = file.as_os_str().to_owned();
+    name.push(format!(".tmp.{}", std::process::id()));
+    let temporary = PathBuf::from(name);
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&temporary)
+        .and_then(|mut f| f.write_all(text.as_bytes()).and_then(|()| f.sync_all()))
+        .and_then(|()| std::fs::rename(&temporary, file));
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(io("write", file, e));
+    }
+    Ok(())
+}
+
+/// `systemctl show` output as properties, each line split at its first `=`.
+pub fn show(text: &str) -> BTreeMap<String, String> {
+    text.lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect()
+}
+
+/// The one environment file an `EnvironmentFiles=` property names, read without ignoring errors (so a missing file
+/// fails the start); `None` for anything else.
+pub fn environment_file(value: &str) -> Option<PathBuf> {
+    let path = value.strip_suffix(" (ignore_errors=no)")?;
+    Some(PathBuf::from(path)).filter(|p| p.is_absolute())
+}
+
+/// Whether an `ExecStart=` property runs `program`'s host: its path exactly `program` and its arguments the
+/// template's. Compared as a prefix, not split into fields, since a path may hold ` ; `.
+pub fn runs(exec_start: &str, program: &Path) -> bool {
+    let program = program.display();
+    exec_start.starts_with(&format!(
+        "{{ path={program} ; argv[]={program} __host ${{HOH_PROJECT}} ; "
+    ))
+}
+
+#[cfg(test)]
+mod tests;

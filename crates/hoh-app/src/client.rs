@@ -319,19 +319,10 @@ fn user_name() -> Option<String> {
         })
 }
 
-/// How long `systemd-run --version` may take (M2T06R-553): it runs in a process group of its own, through the probe
-/// runner, which ends the group at this limit or at `env`'s deadline, whichever comes first.
-const SCOPE_PROBE_LIMIT: Duration = Duration::from_secs(2);
-
-/// Whether a host started now can run in a delegated cgroup v2 (docs/adr/ADR-021.md decisions 2 and 8d, CR-011):
-/// cgroup v2 is mounted, the user's systemd manager answers on `$XDG_RUNTIME_DIR/systemd/private`, the user lingers
-/// (else that manager, and a host in one of its scopes, stops soon after the user's last session ends, which would end
-/// accepted work at an SSH disconnect, REQ-005 behaviour 2; M2T06R-453) and `systemd-run` is on PATH. How, or why not
-/// (then attempts are tracked by the /proc scan, degraded).
-pub fn delegated_scope(env: &hoh_agents::probe::ProbeEnv) -> Result<Scope, String> {
-    if !Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
-        return Err("cgroup v2 is not mounted at /sys/fs/cgroup".to_owned());
-    }
+/// Whether the user's systemd manager can keep a host running after the user's last session: it answers on
+/// `$XDG_RUNTIME_DIR/systemd/private` and the user lingers (else it stops soon after the last session ends, and a host
+/// it runs with it, which would end accepted work at an SSH disconnect, REQ-005 behaviour 2; M2T06R-453). Why not.
+pub(crate) fn manager_that_lingers() -> Result<(), String> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .ok_or_else(|| "XDG_RUNTIME_DIR is not set: no user systemd manager to ask".to_owned())?;
     if !Path::new(&runtime).join("systemd/private").exists() {
@@ -347,6 +338,23 @@ pub fn delegated_scope(env: &hoh_agents::probe::ProbeEnv) -> Result<Scope, Strin
              (enable it with `loginctl enable-linger {name}`)"
         ));
     }
+    Ok(())
+}
+
+/// How long `systemd-run --version` may take (M2T06R-553): it runs in a process group of its own, through the probe
+/// runner, which ends the group at this limit or at `env`'s deadline, whichever comes first.
+const SCOPE_PROBE_LIMIT: Duration = Duration::from_secs(2);
+
+/// Whether a host started now can run in a delegated cgroup v2 (docs/adr/ADR-021.md decisions 2 and 8d, CR-011):
+/// cgroup v2 is mounted, the user's systemd manager answers on `$XDG_RUNTIME_DIR/systemd/private`, the user lingers
+/// (else that manager, and a host in one of its scopes, stops soon after the user's last session ends, which would end
+/// accepted work at an SSH disconnect, REQ-005 behaviour 2; M2T06R-453) and `systemd-run` is on PATH. How, or why not
+/// (then attempts are tracked by the /proc scan, degraded).
+pub fn delegated_scope(env: &hoh_agents::probe::ProbeEnv) -> Result<Scope, String> {
+    if !Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
+        return Err("cgroup v2 is not mounted at /sys/fs/cgroup".to_owned());
+    }
+    manager_that_lingers()?;
     let systemd_run = std::env::split_paths(&env.path)
         .map(|dir| dir.join("systemd-run"))
         .find(|candidate| candidate.is_file())
