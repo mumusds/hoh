@@ -983,3 +983,36 @@ fn a_host_its_unit_ends_with_a_refusal_ends_the_client_with_78_and_the_hosts_lin
     assert_eq!(manager.property(&unit, "NRestarts")?, "0");
     Ok(())
 }
+
+#[test]
+fn the_uninstall_removes_nothing_while_an_instance_stopped_but_is_still_enabled() -> R {
+    // M2T14R-03: a disable that stops the instance but leaves it enabled (a stand-in systemctl stops it and fails):
+    // nothing runs, yet the uninstall removes nothing (69), so no enabled instance is left naming a removed template.
+    let (manager, project) = installed(true)?;
+    let unit = unit_of(&project);
+    let wants = manager
+        .home()
+        .join(format!(".config/systemd/user/default.target.wants/{unit}"));
+    assert!(wants.is_symlink());
+    let stand_in = manager.bin().join("systemctl");
+    installed::script(
+        &stand_in,
+        "#!/bin/sh\ncase \" $* \" in *\" disable \"*) for u; do :; done; /usr/bin/systemctl --user stop \"$u\"; echo 'refused' >&2; exit 1;; esac\nexec /usr/bin/systemctl \"$@\"\n",
+    )?;
+    let bundle = manager.root().join("bundle/hoh");
+    let out = manager.install(&bundle, &["--uninstall"])?;
+    assert_eq!(out.status.code(), Some(69), "{}", text(&out));
+    assert!(wants.is_symlink(), "still enabled");
+    for path in [
+        manager.home().join(".local/bin/hoh"),
+        manager.data().join("hoh/current"),
+        manager.data().join("systemd/user/hoh-host@.service"),
+    ] {
+        assert!(path.exists(), "{} removed", path.display());
+    }
+    std::fs::remove_file(&stand_in)?;
+    let out = manager.install(&bundle, &["--uninstall"])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(!wants.exists() && !wants.is_symlink());
+    Ok(())
+}
