@@ -119,3 +119,30 @@ fn a_turns_facts_become_its_outcome_with_the_prompt_it_was_sent() {
     assert_eq!(kinds, ["adapter.diagnostic"]);
     assert_eq!(o.observed.events[0].2["reader_max_buffered"], 10);
 }
+
+#[test]
+fn a_native_cancel_says_whether_it_reached_a_turn_the_executor_holds() {
+    // M2T07R-453 (docs/adr/ADR-022.md decision 17): the cancel reaches only a turn still held: one the executor holds
+    // (its notifier registered) is asked and the answer is true; once the turn ended (or for work it never started)
+    // nothing is asked and the answer is false, so the settle waits the SIGTERM grace and records no native cancel.
+    let executor = ProductExecutor::new(
+        Arc::new(Registry::new(std::ffi::OsString::new())),
+        PathBuf::from("/nonexistent"),
+        PathBuf::from("hoh"),
+        (Duration::from_secs(10), Duration::from_secs(5)),
+    );
+    let work = work(None);
+    assert!(
+        !executor.cancel(&work),
+        "no turn held, yet the cancel was sent"
+    );
+    let notify = Arc::new(tokio::sync::Notify::new());
+    if let Ok(mut cancels) = executor.cancels.lock() {
+        cancels.insert(work.attempt_id.clone(), notify.clone());
+    }
+    assert!(executor.cancel(&work));
+    if let Ok(mut cancels) = executor.cancels.lock() {
+        cancels.remove(&work.attempt_id);
+    }
+    assert!(!executor.cancel(&work));
+}
