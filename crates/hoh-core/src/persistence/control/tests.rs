@@ -978,3 +978,37 @@ async fn a_runners_end_that_leaves_an_effect_started_is_an_unknown_effect_howeve
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn a_cancels_pass_that_ends_an_attempt_names_the_effects_it_left_unknown() -> R {
+    // M2T07R-552 (docs/adr/ADR-022.md decision 12 v3): the cancel's own pass ends A1 CANCELLED with its work effect,
+    // started and never observed, UNKNOWN, and names it in a diagnostic, as the runner's end and a reconcile do.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(WORLD)?;
+    store.submit_command(cancel_run(1)).await?;
+    let at = parse_rfc3339("2026-11-07T00:00:05Z").ok_or("time")?;
+    store
+        .cancel_pass(super::CancelPass {
+            attempt_id: "A1".to_owned(),
+            sent: Vec::new(),
+            end: crate::cancel::PassEnd::Empty,
+            at,
+        })
+        .await?;
+    let conn = Connection::open(&path)?;
+    let row: (String, String) = conn.query_row(
+        "SELECT a.state, e.state FROM attempts a, effects e WHERE a.attempt_id = 'A1' AND e.effect_key = 'A1/work'",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    assert_eq!(row, ("CANCELLED".to_owned(), "UNKNOWN".to_owned()));
+    let keys: String = conn.query_row(
+        "SELECT json_extract(payload_json, '$.effect_keys') FROM events WHERE kind = 'cancel.diagnostic' \
+         AND json_extract(payload_json, '$.code') = 'UNKNOWN_EFFECT' AND json_extract(payload_json, '$.attempt_id') = 'A1'",
+        [],
+        |r| r.get(0),
+    )?;
+    assert_eq!(keys, r#"["A1/work"]"#);
+    Ok(())
+}

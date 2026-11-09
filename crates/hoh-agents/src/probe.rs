@@ -48,17 +48,18 @@ pub struct ProbeEnv {
     /// A limit shared by every command: each gets the smaller of `timeout` and the time left before it, so commands
     /// run one after another end together by then (doctor's total limit, REQ-006).
     pub deadline: Option<Instant>,
-    /// How whoever probes stops (the host's stop): every command a probe started is killed by the stop itself, and no
-    /// other starts (docs/adr/ADR-022.md decision 10, M2T07R-202, -300).
+    /// How whoever probes stops (the host's stop): every command a probe started is killed, by the stop or by its starter
+    /// as it puts the command in its slot, and no other starts; the window before that is stated in docs/adr/ADR-022.md
+    /// decision 10 v5 (M2T07R-202, -300, -450, -500).
     pub cancel: Option<ProbeStop>,
 }
 
-/// The stop of whoever probes (docs/adr/ADR-022.md decision 10 v5, M2T07R-300, -450): [`ProbeStop::stop`] kills every
-/// command a probe started and has not reaped yet, its process group and its leader, before it returns, however late
-/// the thread that started it runs, and never waits for a start: a start registers its slot under the stop's lock
-/// (none once stopped) and spawns outside it; once spawned, its starter puts the child in its slot and then looks at
-/// the stop, so the stop or the starter kills it, whichever comes second. The thread that started a command still
-/// reaps it, taking it out of its slot first.
+/// The stop of whoever probes (docs/adr/ADR-022.md decision 10 v5, M2T07R-300, -450, -500): [`ProbeStop::stop`] kills
+/// every command already in its slot and not reaped, its process group and its leader, before it returns, and never
+/// waits for a start: a start registers an empty slot under the stop's lock (none once stopped) and spawns outside it;
+/// once spawned, its starter puts the child in its slot and looks at the stop under the slot's lock, so the stop or the
+/// starter kills it, whichever comes second. Until the child is in its slot, its pid is known to its starter alone (the
+/// residual of decision 10 v5). The starter still reaps it, taking it out of its slot first.
 #[derive(Debug, Clone, Default)]
 pub struct ProbeStop(std::sync::Arc<Stopping>);
 
@@ -71,7 +72,8 @@ struct Stopping {
 }
 
 impl ProbeStop {
-    /// Stop: kill every command started and not reaped (its group and its leader), and start none from now on.
+    /// Stop: kill every command in its slot and not reaped (its group and its leader), and start none from now on; a
+    /// command still being spawned is killed by its starter as it puts it in its slot.
     pub fn stop(&self) {
         let mut commands = locked(&self.0.commands);
         self.0
@@ -108,7 +110,19 @@ impl ProbeStop {
             commands.retain(|c| c.strong_count() > 0);
             commands.push(std::sync::Arc::downgrade(&slot));
         }
-        Some(spawn().map(|child| Started::new(slot, child)))
+        Some(spawn().map(|child| {
+            let started = Started::new(slot, child);
+            // The starter's half: the child put in its slot, then the stop looked at, under the slot's lock; the stop
+            // sets its flag first and looks at the slot after, so one of the two kills it whichever comes second
+            // (decision 10 v5, M2T07R-500).
+            let held = locked(&started.slot);
+            if held.is_some() && self.is_stopped() {
+                let _ = kill_process_group(started.pid, Signal::KILL);
+                let _ = kill_process(started.pid, Signal::KILL);
+            }
+            drop(held);
+            started
+        }))
     }
 }
 
@@ -3000,23 +3014,66 @@ mod tests {
         Ok(())
     }
 
+    /// Whether this process holds `path` open (a stall in [`between`] holds its entry open while it waits).
+    fn held_open(path: &Path) -> bool {
+        std::fs::read_dir("/proc/self/fd").is_ok_and(|fds| {
+            fds.flatten()
+                .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|target| target == path))
+        })
+    }
+
+    /// This process's children named `comm`, with their state letter.
+    fn children_named(comm: &str) -> Vec<(u32, char)> {
+        let me = std::process::id().to_string();
+        std::fs::read_dir("/proc")
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+                    .filter_map(|pid| {
+                        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+                        let (head, rest) = stat.rsplit_once(')')?;
+                        let mut fields = rest.split_whitespace();
+                        let state = fields.next()?.chars().next()?;
+                        let parent = fields.next()?;
+                        (head.ends_with(&format!("({comm}")) && parent == me)
+                            .then_some((pid, state))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Until `done` holds, at most `limit`.
+    fn wait_until(limit: Duration, done: impl Fn() -> bool) -> bool {
+        let until = Instant::now() + limit;
+        while !done() {
+            if Instant::now() > until {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        true
+    }
+
     #[test]
     fn a_stop_does_not_wait_for_a_start_in_progress_and_its_command_is_killed()
     -> Result<(), Box<dyn std::error::Error>> {
-        // M2T07R-450 (docs/adr/ADR-022.md decision 10 v5): a start held inside its spawn (as an exec that hangs holds
-        // it) does not hold up the stop; once the spawn returns, its starter finds the stop and kills what it started.
+        // M2T07R-450, -500, -554 (docs/adr/ADR-022.md decision 10 v5): a start held inside its spawn (as an exec that
+        // hangs holds it) does not hold up the stop; when its spawn returns after the stop, its starter, putting the
+        // child in its slot, finds the stop and kills it there, before it goes on (here held just after).
         let tmp = tempfile::tempdir()?;
         let bin = tmp.path().join("bin");
         std::fs::create_dir(&bin)?;
-        let pid = tmp.path().join("pid");
-        let launcher = bin.join("codex");
-        std::fs::write(
-            &launcher,
-            format!("#!/bin/sh\necho $$ > '{}'\nexec sleep 60\n", pid.display()),
-        )?;
+        let launcher = bin.join("hohstopprobe");
+        std::fs::write(&launcher, "#!/bin/sh\nwhile :; do sleep 0.1; done\n")?;
         std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))?;
-        let stall = bin.join("hoh-test-stall-spawning");
-        std::fs::write(&stall, "")?;
+        let (spawning, started) = (
+            bin.join("hoh-test-stall-spawning"),
+            bin.join("hoh-test-stall-started"),
+        );
+        std::fs::write(&spawning, "")?;
+        std::fs::write(&started, "")?;
         let stop = ProbeStop::default();
         let env = ProbeEnv {
             path: "/usr/bin:/bin".into(),
@@ -3027,36 +3084,37 @@ mod tests {
             cancel: Some(stop.clone()),
         };
         let probing = std::thread::spawn(move || run(&launcher, &["--version"], &env).map(|_| ()));
-        // The start is inside its spawn, held there.
-        std::thread::sleep(Duration::from_millis(300));
+        let inside = wait_until(Duration::from_secs(10), || held_open(&spawning));
         let stopper = {
             let stop = stop.clone();
-            std::thread::spawn(move || {
-                let at = Instant::now();
-                stop.stop();
-                at.elapsed()
-            })
+            std::thread::spawn(move || stop.stop())
         };
-        let until = Instant::now() + Duration::from_secs(2);
-        while !stopper.is_finished() && Instant::now() < until {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let stopped_at_once = stopper.is_finished();
-        std::fs::remove_file(&stall)?;
-        let took = stopper.join().map_err(|_| "the stop panicked")?;
-        let result = probing.join().map_err(|_| "the probe panicked")?;
-        let leader = std::fs::read_to_string(&pid)
-            .unwrap_or_default()
-            .trim()
-            .to_owned();
-        let left = !leader.is_empty() && !ended(&leader);
-        if left {
+        let stopped_at_once = wait_until(Duration::from_secs(2), || stopper.is_finished());
+        // The spawn goes on; its starter is then held right after putting the child in its slot.
+        std::fs::remove_file(&spawning)?;
+        let past_its_slot = wait_until(Duration::from_secs(10), || held_open(&started));
+        let found = children_named("hohstopprobe");
+        let killed = wait_until(Duration::from_secs(2), || {
+            children_named("hohstopprobe")
+                .iter()
+                .all(|(_, state)| *state == 'Z')
+        });
+        for (pid, _) in children_named("hohstopprobe") {
             let _ = Command::new("kill")
-                .args(["-KILL", leader.as_str()])
+                .args(["-KILL", &pid.to_string()])
                 .status();
         }
-        assert!(stopped_at_once, "the stop waited for the spawn ({took:?})");
-        assert!(!left, "the command started during the stop outlived it");
+        std::fs::remove_file(&started)?;
+        let _ = stopper.join();
+        let result = probing.join().map_err(|_| "the probe panicked")?;
+        assert!(inside, "the probe never got inside its spawn");
+        assert!(stopped_at_once, "the stop waited for the spawn");
+        assert!(past_its_slot, "the starter never got past its slot");
+        assert_eq!(found.len(), 1, "the command started: {found:?}");
+        assert!(
+            killed,
+            "the command started during the stop lives while its starter is held"
+        );
         assert!(
             matches!(&result, Err(ProbeError::Failed { detail, .. }) if detail == STOPPING),
             "{result:?}"

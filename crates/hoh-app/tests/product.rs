@@ -977,6 +977,53 @@ async fn a_turn_that_cannot_start_fails_by_its_refusals_reason_and_class() -> R 
 }
 
 #[tokio::test]
+async fn once_a_turn_ended_the_executor_no_longer_holds_it_and_a_cancel_reaches_nothing() -> R {
+    // M2T07R-553 (docs/adr/ADR-022.md decision 17): a turn's end releases the executor's hold on it, so a later native
+    // cancel of its attempt (a settle's, a CancelRun's) answers that it reached nothing.
+    let world = World::new()?;
+    world.claude(None)?;
+    let config = world.config();
+    let executor = config
+        .runner
+        .as_ref()
+        .ok_or("the product's host has a runner")?
+        .executor
+        .clone();
+    let host = start_when_free(config).await?;
+    let project = world.project();
+    let outcome = async {
+        let run_id = started(&host, "s1").await?;
+        ready(&project, &run_id, &[("T-END", "developer")])?;
+        until(
+            &project,
+            "SELECT state FROM attempts WHERE attempt_id = 'T-END/attempt-1'",
+            "SETTLED",
+            Duration::from_secs(30),
+        )
+        .await?;
+        let work = hoh_app::host::Work {
+            project_id: host.project_id.clone(),
+            run_id,
+            task_id: "T-END".to_owned(),
+            attempt_id: "T-END/attempt-1".to_owned(),
+            role: "developer".to_owned(),
+            effect_key: String::new(),
+            assignment: hoh_core::persistence::Assignment::default(),
+        };
+        let end = Instant::now() + Duration::from_secs(5);
+        while executor.cancel(&work) && Instant::now() < end {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        R::Ok(executor.cancel(&work))
+    }
+    .await;
+    host.shutdown().await;
+    world.stop_fakes()?;
+    assert!(!outcome?, "the ended turn is still held");
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_turn_that_ends_after_starting_a_command_ends_unknown_effect_and_is_not_run_again() -> R {
     // M2T07R-200 (ADR-019 decision 5, ADR-022 decision 12): codex starts a command and its turn ends with no report of
     // it: the attempt ends UNKNOWN_EFFECT, its task stays, no attempt runs it again (the effect happened once), and a
