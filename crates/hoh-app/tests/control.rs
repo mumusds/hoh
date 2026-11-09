@@ -287,11 +287,12 @@ impl hoh_app::host::Executor for Agents {
         })
     }
 
-    fn cancel(&self, work: &hoh_app::host::Work) {
+    fn cancel(&self, work: &hoh_app::host::Work) -> bool {
         // The agent's native interrupt: these agents ignore it.
         if let Ok(mut native) = self.native.lock() {
             native.push(work.attempt_id.clone());
         }
+        true
     }
 }
 

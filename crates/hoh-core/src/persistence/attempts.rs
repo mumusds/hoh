@@ -610,3 +610,29 @@ pub(super) fn read_events(
 
 #[cfg(test)]
 mod tests;
+
+/// The keys of `attempt_id`'s effects still STARTED (never observed), in order.
+pub(super) fn started_effects(
+    tx: &Connection,
+    attempt_id: &str,
+) -> Result<Vec<String>, PersistError> {
+    let mut statement = tx
+        .prepare("SELECT effect_key FROM effects WHERE attempt_id = ?1 AND state = 'STARTED' ORDER BY effect_key")
+        .map_err(sqlite_error)?;
+    statement
+        .query_map(params![attempt_id], |r| r.get(0))
+        .map_err(sqlite_error)?
+        .collect::<Result<_, _>>()
+        .map_err(sqlite_error)
+}
+
+/// `attempt_id` ends with its effects still STARTED unobserved: they are UNKNOWN, by the one rule its runner's end, its
+/// cancel's pass and a reconcile apply (ADR-021 decision 8e; docs/adr/ADR-022.md decision 12 v3, M2T07R-451).
+pub(super) fn effects_unknown(tx: &Connection, attempt_id: &str) -> Result<(), PersistError> {
+    tx.execute(
+        "UPDATE effects SET state = 'UNKNOWN' WHERE attempt_id = ?1 AND state = 'STARTED'",
+        params![attempt_id],
+    )
+    .map(|_| ())
+    .map_err(sqlite_error)
+}

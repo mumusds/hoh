@@ -360,15 +360,16 @@ impl Executor for ProductExecutor {
         })
     }
 
-    fn cancel(&self, work: &Work) {
-        if let Some(cancel) = self
+    fn cancel(&self, work: &Work) -> bool {
+        let held = self
             .cancels
             .lock()
             .ok()
-            .and_then(|c| c.get(&work.attempt_id).cloned())
-        {
+            .and_then(|c| c.get(&work.attempt_id).cloned());
+        if let Some(cancel) = &held {
             cancel.notify_one();
         }
+        held.is_some()
     }
 }
 
