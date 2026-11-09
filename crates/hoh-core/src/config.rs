@@ -978,13 +978,24 @@ pub fn check_prompt(root: &Path, key: &str, prompt: &str) -> Result<(), ConfigEr
     if prompt.starts_with(BUILTIN_PROMPT) {
         return Ok(());
     }
-    let refused = |message: String| ConfigError {
-        file: None,
-        key: Some(key.to_owned()),
-        line: None,
-        column: None,
-        message,
-    };
+    prompt_file(root, prompt)
+        .and_then(|path| {
+            std::fs::File::open(&path)
+                .map(drop)
+                .map_err(|e| format!("\"{prompt}\" cannot be read: {e}"))
+        })
+        .map_err(|message| ConfigError {
+            file: None,
+            key: Some(key.to_owned()),
+            line: None,
+            column: None,
+            message,
+        })
+}
+
+/// The regular file an override `prompt` names in the project at `root`, every symbolic link on its way followed: a
+/// relative path without `..` whose file is inside the project once both are resolved (M2T07R-101), or why not.
+pub fn prompt_file(root: &Path, prompt: &str) -> Result<std::path::PathBuf, String> {
     let path = Path::new(prompt);
     if path.is_absolute()
         || path.components().any(|c| {
@@ -994,17 +1005,23 @@ pub fn check_prompt(root: &Path, key: &str, prompt: &str) -> Result<(), ConfigEr
             )
         })
     {
-        return Err(refused(format!(
+        return Err(format!(
             "\"{prompt}\" is not a path inside the project (relative, without ..)"
-        )));
+        ));
     }
-    let full = root.join(path);
+    let root = std::fs::canonicalize(root)
+        .map_err(|e| format!("the project {} cannot be resolved: {e}", root.display()))?;
+    let full = std::fs::canonicalize(root.join(path)).map_err(|e| format!("\"{prompt}\": {e}"))?;
+    if !full.starts_with(&root) {
+        return Err(format!(
+            "\"{prompt}\" leads outside the project (to {})",
+            full.display()
+        ));
+    }
     match std::fs::metadata(&full) {
-        Ok(meta) if meta.is_file() => std::fs::File::open(&full)
-            .map(drop)
-            .map_err(|e| refused(format!("\"{prompt}\" cannot be read: {e}"))),
-        Ok(_) => Err(refused(format!("\"{prompt}\" is not a regular file"))),
-        Err(e) => Err(refused(format!("\"{prompt}\": {e}"))),
+        Ok(meta) if meta.is_file() => Ok(full),
+        Ok(_) => Err(format!("\"{prompt}\" is not a regular file")),
+        Err(e) => Err(format!("\"{prompt}\": {e}")),
     }
 }
 
