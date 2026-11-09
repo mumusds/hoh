@@ -68,7 +68,7 @@ impl Agent {
 }
 
 /// One role's binding: data, not a process (REQ-018).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Role {
     pub agent: Agent,
     /// `None`: the agent's own default model (the attempt records the resolved one).
@@ -304,10 +304,95 @@ pub fn parse(text: &str) -> Result<Config, ConfigError> {
             message: e.message().trim().to_owned(),
         }
     })?;
-    let reader = Reader { text };
+    let top = from_toml_table(table.get_ref());
+    let reader = Reader { text: Some(text) };
     let mut config = Config::default();
-    reader.read(table.get_ref(), &mut config)?;
+    reader.read(&top, &mut config)?;
     Ok(config)
+}
+
+/// The team `base` becomes with ConfigureTeam's `bindings`: an RFC 7396 merge patch over the team as JSON (`role:
+/// null` removes the role, `key: null` gives the key its default), checked whole by the file's rules, with key paths
+/// under `bindings` (docs/adr/ADR-022.md decisions 2 and 4).
+pub fn patch_team(
+    base: &BTreeMap<String, Role>,
+    bindings: &serde_json::Value,
+) -> Result<BTreeMap<String, Role>, ConfigError> {
+    let reader = Reader { text: None };
+    let serde_json::Value::Object(patch) = bindings else {
+        return Err(reader.error("bindings", None, "expected an object of roles"));
+    };
+    let mut merged: BTreeMap<String, serde_json::Map<String, serde_json::Value>> = base
+        .iter()
+        .map(|(name, role)| (name.clone(), role_json(role)))
+        .collect();
+    for (name, change) in patch {
+        match change {
+            serde_json::Value::Null => {
+                merged.remove(name);
+            }
+            serde_json::Value::Object(keys) => {
+                let role = merged.entry(name.clone()).or_default();
+                for (key, value) in keys {
+                    if value.is_null() {
+                        role.remove(key);
+                    } else {
+                        role.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+            _ => {
+                return Err(reader.error(
+                    &format!("bindings.{name}"),
+                    None,
+                    "expected an object of the role's keys, or null to remove the role",
+                ));
+            }
+        }
+    }
+    let mut team = Config::default().team;
+    for (name, keys) in &merged {
+        let table: Vec<Entry> = keys
+            .iter()
+            .map(|(key, value)| (key.clone(), None, from_json(value)))
+            .collect();
+        reader.role(name, &format!("bindings.{name}"), None, &table, &mut team)?;
+    }
+    team.retain(|name, _| merged.contains_key(name));
+    if let Some(missing) = REQUIRED_ROLES
+        .iter()
+        .find(|role| !team.contains_key(**role))
+    {
+        return Err(reader.error(
+            &format!("bindings.{missing}"),
+            None,
+            "a required role cannot be removed (commander, developer, qa and reviewer)",
+        ));
+    }
+    Ok(team)
+}
+
+/// A role as the merge patch sees it: its keys, an unset model or prompt and an empty fallback left out.
+fn role_json(role: &Role) -> serde_json::Map<String, serde_json::Value> {
+    let mut keys = serde_json::Map::new();
+    keys.insert("agent".to_owned(), role.agent.as_str().into());
+    if let Some(model) = &role.model {
+        keys.insert("model".to_owned(), model.clone().into());
+    }
+    if !role.fallback.is_empty() {
+        keys.insert(
+            "fallback".to_owned(),
+            role.fallback.iter().map(|a| a.as_str()).collect(),
+        );
+    }
+    if let Some(prompt) = &role.prompt {
+        keys.insert("prompt".to_owned(), prompt.clone().into());
+    }
+    keys.insert(
+        "independent_session".to_owned(),
+        role.independent_session.into(),
+    );
+    keys
 }
 
 /// The 1-based line and column (in characters) of byte `at` of `text`.
@@ -318,30 +403,108 @@ fn place(text: &str, at: usize) -> (usize, usize) {
     (line, before[start..].chars().count() + 1)
 }
 
-type Value<'i> = Spanned<DeValue<'i>>;
+/// A configuration value, and where it starts in the file when it came from one (a ConfigureTeam's has no place).
+#[derive(Debug, Clone)]
+struct Node {
+    at: Option<usize>,
+    item: Item,
+}
+
+#[derive(Debug, Clone)]
+enum Item {
+    Str(String),
+    /// `None`: an integer out of the 64-bit range.
+    Int(Option<i64>),
+    Float(f64),
+    Bool(bool),
+    Datetime(String),
+    Array(Vec<Node>),
+    Table(Vec<Entry>),
+}
+
+/// A table's key, where the key starts, and its value.
+type Entry = (String, Option<usize>, Node);
+
+fn from_toml(value: &Spanned<DeValue<'_>>) -> Node {
+    let item = match value.get_ref() {
+        DeValue::String(s) => Item::Str(s.to_string()),
+        DeValue::Integer(i) => Item::Int(i64::from_str_radix(i.as_str(), i.radix()).ok()),
+        DeValue::Float(f) => Item::Float(f.as_str().parse().unwrap_or(f64::NAN)),
+        DeValue::Boolean(b) => Item::Bool(*b),
+        DeValue::Datetime(d) => Item::Datetime(d.to_string()),
+        DeValue::Array(items) => Item::Array(items.iter().map(from_toml).collect()),
+        DeValue::Table(table) => Item::Table(from_toml_table(table)),
+    };
+    Node {
+        at: Some(value.span().start),
+        item,
+    }
+}
+
+fn from_toml_table(table: &DeTable<'_>) -> Vec<Entry> {
+    table
+        .iter()
+        .map(|(key, value)| {
+            (
+                key.get_ref().to_string(),
+                Some(key.span().start),
+                from_toml(value),
+            )
+        })
+        .collect()
+}
+
+/// A JSON value as a configuration value (a null is a key left out: the merge patch removed them).
+fn from_json(value: &serde_json::Value) -> Node {
+    let item = match value {
+        serde_json::Value::String(s) => Item::Str(s.clone()),
+        serde_json::Value::Number(n) => match n.as_i64() {
+            Some(i) => Item::Int(Some(i)),
+            None if n.is_u64() => Item::Int(None),
+            None => Item::Float(n.as_f64().unwrap_or(f64::NAN)),
+        },
+        serde_json::Value::Bool(b) => Item::Bool(*b),
+        serde_json::Value::Array(items) => Item::Array(items.iter().map(from_json).collect()),
+        serde_json::Value::Object(map) => Item::Table(
+            map.iter()
+                .filter(|(_, v)| !v.is_null())
+                .map(|(k, v)| (k.clone(), None, from_json(v)))
+                .collect(),
+        ),
+        serde_json::Value::Null => Item::Table(Vec::new()),
+    };
+    Node { at: None, item }
+}
 
 struct Reader<'t> {
-    text: &'t str,
+    /// The file's text, for lines and columns.
+    text: Option<&'t str>,
 }
 
 impl Reader<'_> {
-    fn error(&self, key: &str, at: usize, message: impl Into<String>) -> ConfigError {
-        let (line, column) = place(self.text, at);
+    fn error(&self, key: &str, at: Option<usize>, message: impl Into<String>) -> ConfigError {
+        let (line, column) = match (self.text, at) {
+            (Some(text), Some(at)) => {
+                let (line, column) = place(text, at);
+                (Some(line), Some(column))
+            }
+            _ => (None, None),
+        };
         ConfigError {
             file: None,
             key: Some(key.to_owned()),
-            line: Some(line),
-            column: Some(column),
+            line,
+            column,
             message: message.into(),
         }
     }
 
-    fn unknown(&self, key: &str, at: usize) -> ConfigError {
+    fn unknown(&self, key: &str, at: Option<usize>) -> ConfigError {
         self.error(key, at, "unknown key (REQ-018: unknown keys are refused)")
     }
 
-    fn read(&self, top: &DeTable<'_>, config: &mut Config) -> Result<(), ConfigError> {
-        match top.get("config_version") {
+    fn read(&self, top: &[Entry], config: &mut Config) -> Result<(), ConfigError> {
+        match top.iter().find(|(key, _, _)| key == "config_version") {
             None => {
                 return Err(ConfigError {
                     file: None,
@@ -351,12 +514,12 @@ impl Reader<'_> {
                     message: format!("missing; this release reads config_version = \"{VERSION}\""),
                 });
             }
-            Some(value) => {
+            Some((_, _, value)) => {
                 let version = self.string("config_version", value)?;
                 if version != VERSION {
                     return Err(self.error(
                         "config_version",
-                        value.span().start,
+                        value.at,
                         format!(
                             "\"{version}\" is not read by this release (it reads \"{VERSION}\")"
                         ),
@@ -364,15 +527,14 @@ impl Reader<'_> {
                 }
             }
         }
-        for (key, value) in top {
-            let name = &**key.get_ref();
-            match name {
+        for (name, at, value) in top {
+            match name.as_str() {
                 "config_version" => {}
                 "project" => self.project(self.table(name, value)?, &mut config.project)?,
                 "execution" => self.execution(self.table(name, value)?, &mut config.execution)?,
                 "delivery" => {
-                    for (key, value) in self.table(name, value)? {
-                        match &**key.get_ref() {
+                    for (key, at, value) in self.table(name, value)? {
+                        match key.as_str() {
                             "max_delivery_attempts" => {
                                 config.delivery.max_delivery_attempts = self.count(
                                     "delivery.max_delivery_attempts",
@@ -381,17 +543,13 @@ impl Reader<'_> {
                                     u32::MAX,
                                 )?;
                             }
-                            other => {
-                                return Err(
-                                    self.unknown(&format!("delivery.{other}"), key.span().start)
-                                );
-                            }
+                            other => return Err(self.unknown(&format!("delivery.{other}"), *at)),
                         }
                     }
                 }
                 "persistence" => {
-                    for (key, value) in self.table(name, value)? {
-                        match &**key.get_ref() {
+                    for (key, at, value) in self.table(name, value)? {
+                        match key.as_str() {
                             "writer_queue_capacity" => {
                                 config.persistence.writer_queue_capacity = self.count(
                                     "persistence.writer_queue_capacity",
@@ -401,25 +559,22 @@ impl Reader<'_> {
                                 )?;
                             }
                             other => {
-                                return Err(
-                                    self.unknown(&format!("persistence.{other}"), key.span().start)
-                                );
+                                return Err(self.unknown(&format!("persistence.{other}"), *at));
                             }
                         }
                     }
                 }
                 "scheduler" => self.scheduler(self.table(name, value)?, &mut config.scheduler)?,
                 "team" => {
-                    for (key, value) in self.table(name, value)? {
-                        let role = &**key.get_ref();
+                    for (role, at, value) in self.table(name, value)? {
                         let path = format!("team.{role}");
                         let table = self.table(&path, value)?;
-                        self.role(role, &path, key.span().start, table, &mut config.team)?;
+                        self.role(role, &path, *at, table, &mut config.team)?;
                     }
                 }
                 "supervision" => {
-                    for (key, value) in self.table(name, value)? {
-                        match &**key.get_ref() {
+                    for (key, at, value) in self.table(name, value)? {
+                        match key.as_str() {
                             "policy" => {
                                 config.supervision.policy = self.one_of(
                                     "supervision.policy",
@@ -428,9 +583,7 @@ impl Reader<'_> {
                                 )?;
                             }
                             other => {
-                                return Err(
-                                    self.unknown(&format!("supervision.{other}"), key.span().start)
-                                );
+                                return Err(self.unknown(&format!("supervision.{other}"), *at));
                             }
                         }
                     }
@@ -438,15 +591,15 @@ impl Reader<'_> {
                 "budget" => self.budget(self.table(name, value)?, &mut config.budget)?,
                 "ui" => self.ui(self.table(name, value)?, &mut config.ui)?,
                 "web" => self.web(self.table(name, value)?, &mut config.web)?,
-                other => return Err(self.unknown(other, key.span().start)),
+                other => return Err(self.unknown(other, *at)),
             }
         }
         Ok(())
     }
 
-    fn project(&self, table: &DeTable<'_>, project: &mut Project) -> Result<(), ConfigError> {
-        for (key, value) in table {
-            match &**key.get_ref() {
+    fn project(&self, table: &[Entry], project: &mut Project) -> Result<(), ConfigError> {
+        for (key, at, value) in table {
+            match key.as_str() {
                 "default_mode" => {
                     project.default_mode =
                         self.one_of("project.default_mode", value, &["PLAN", "BUILD", "AUTO"])?;
@@ -459,17 +612,16 @@ impl Reader<'_> {
                         &["lite", "standard", "full"],
                     )?;
                 }
-                other => return Err(self.unknown(&format!("project.{other}"), key.span().start)),
+                other => return Err(self.unknown(&format!("project.{other}"), *at)),
             }
         }
         Ok(())
     }
 
-    fn execution(&self, table: &DeTable<'_>, execution: &mut Execution) -> Result<(), ConfigError> {
-        for (key, value) in table {
-            let name = &**key.get_ref();
+    fn execution(&self, table: &[Entry], execution: &mut Execution) -> Result<(), ConfigError> {
+        for (name, at, value) in table {
             let path = format!("execution.{name}");
-            match name {
+            match name.as_str() {
                 // The one execution profile HoH has (CONTRACT: YOLO inside the VM).
                 "profile" => execution.profile = self.one_of(&path, value, &["yolo-vm"])?,
                 // At most one code writer per repository (REQ-037).
@@ -485,15 +637,15 @@ impl Reader<'_> {
                 "cancel_term_grace_seconds" => {
                     execution.cancel_term_grace_seconds = self.count(&path, value, 1, u32::MAX)?;
                 }
-                _ => return Err(self.unknown(&path, key.span().start)),
+                _ => return Err(self.unknown(&path, *at)),
             }
         }
         Ok(())
     }
 
-    fn scheduler(&self, table: &DeTable<'_>, params: &mut Params) -> Result<(), ConfigError> {
-        for (key, value) in table {
-            match &**key.get_ref() {
+    fn scheduler(&self, table: &[Entry], params: &mut Params) -> Result<(), ConfigError> {
+        for (key, at, value) in table {
+            match key.as_str() {
                 // contracts/protocol.schema.json SchedulerSettings: 1..=1000, each weight 0..=10.
                 "max_wait_rounds" => {
                     params.max_wait_rounds =
@@ -506,20 +658,19 @@ impl Reader<'_> {
                         risk_reduction,
                         information_gain,
                     } = &mut params.weights;
-                    for (key, value) in self.table("scheduler.weights", value)? {
-                        let name = &**key.get_ref();
+                    for (name, at, value) in self.table("scheduler.weights", value)? {
                         let path = format!("scheduler.weights.{name}");
-                        let slot = match name {
+                        let slot = match name.as_str() {
                             "user_value" => &mut *user_value,
                             "unblock_value" => &mut *unblock_value,
                             "risk_reduction" => &mut *risk_reduction,
                             "information_gain" => &mut *information_gain,
-                            _ => return Err(self.unknown(&path, key.span().start)),
+                            _ => return Err(self.unknown(&path, *at)),
                         };
                         *slot = self.count(&path, value, 0, 10)?;
                     }
                 }
-                other => return Err(self.unknown(&format!("scheduler.{other}"), key.span().start)),
+                other => return Err(self.unknown(&format!("scheduler.{other}"), *at)),
             }
         }
         Ok(())
@@ -529,8 +680,8 @@ impl Reader<'_> {
         &self,
         name: &str,
         path: &str,
-        at: usize,
-        table: &DeTable<'_>,
+        at: Option<usize>,
+        table: &[Entry],
         team: &mut BTreeMap<String, Role>,
     ) -> Result<(), ConfigError> {
         let builtin = BUILTIN_ROLES.contains(&name);
@@ -541,25 +692,30 @@ impl Reader<'_> {
                 "a custom role's name is a lower-case letter, then up to 63 lower-case letters, digits or '_'",
             ));
         }
-        let mut agent = team.get(name).map(|role| role.agent);
-        let mut role = team
+        // A built-in role's keys left out keep its default; a custom role starts from nothing.
+        let defaults = Config::default().team;
+        let mut agent = defaults.get(name).map(|role| role.agent);
+        let mut role = defaults
             .get(name)
             .cloned()
             .unwrap_or_else(|| Role::of(Agent::Codex));
-        for (key, value) in table {
-            let key_name = &**key.get_ref();
+        if let Some(current) = team.get(name) {
+            agent = Some(current.agent);
+            role = current.clone();
+        }
+        for (key_name, key_at, value) in table {
             let key_path = format!("{path}.{key_name}");
-            match key_name {
+            match key_name.as_str() {
                 "agent" => agent = Some(self.agent(&key_path, value)?),
                 "model" => {
                     let model = self.string(&key_path, value)?;
                     role.model = (!model.is_empty()).then_some(model);
                 }
                 "fallback" => {
-                    let DeValue::Array(items) = value.get_ref() else {
+                    let Item::Array(items) = &value.item else {
                         return Err(self.error(
                             &key_path,
-                            value.span().start,
+                            value.at,
                             "expected an array of agent names",
                         ));
                     };
@@ -570,7 +726,7 @@ impl Reader<'_> {
                         if fallback.contains(&agent) {
                             return Err(self.error(
                                 &item_path,
-                                item.span().start,
+                                item.at,
                                 format!("\"{}\" is already in the list", agent.as_str()),
                             ));
                         }
@@ -581,14 +737,14 @@ impl Reader<'_> {
                 "prompt" => {
                     let prompt = self.string(&key_path, value)?;
                     if prompt.is_empty() {
-                        return Err(self.error(&key_path, value.span().start, "an empty path"));
+                        return Err(self.error(&key_path, value.at, "an empty path"));
                     }
                     if let Some(contract) = prompt.strip_prefix(BUILTIN_PROMPT)
                         && !BUILTIN_ROLES.contains(&contract)
                     {
                         return Err(self.error(
                             &key_path,
-                            value.span().start,
+                            value.at,
                             format!("no built-in role contract named \"{contract}\""),
                         ));
                     }
@@ -600,13 +756,13 @@ impl Reader<'_> {
                     if name == "reviewer" && !independent {
                         return Err(self.error(
                             &key_path,
-                            value.span().start,
+                            value.at,
                             "the reviewer's session is always independent (CONTRACT 7)",
                         ));
                     }
                     role.independent_session = independent;
                 }
-                _ => return Err(self.unknown(&key_path, key.span().start)),
+                _ => return Err(self.unknown(&key_path, *key_at)),
             }
         }
         let Some(agent) = agent else {
@@ -624,69 +780,65 @@ impl Reader<'_> {
         Ok(())
     }
 
-    fn budget(&self, table: &DeTable<'_>, budget: &mut Budget) -> Result<(), ConfigError> {
-        for (key, value) in table {
-            let name = &**key.get_ref();
+    fn budget(&self, table: &[Entry], budget: &mut Budget) -> Result<(), ConfigError> {
+        for (name, at, value) in table {
             let path = format!("budget.{name}");
-            match name {
+            match name.as_str() {
                 "max_duration_hours" => budget.max_duration_hours = self.positive(&path, value)?,
                 "max_iterations" => {
                     budget.max_iterations = self.count(&path, value, 1, u32::MAX)?
                 }
                 "max_local_repairs" => {
-                    budget.max_local_repairs = self.count(&path, value, 0, u32::MAX)?
+                    budget.max_local_repairs = self.count(&path, value, 0, u32::MAX)?;
                 }
                 "max_protocol_repairs" => {
                     budget.max_protocol_repairs = self.count(&path, value, 0, u32::MAX)?;
                 }
                 "max_usd" => budget.max_usd = Some(self.positive(&path, value)?),
                 "deadline_at" => {
-                    let text = match value.get_ref() {
-                        DeValue::String(s) => s.to_string(),
-                        DeValue::Datetime(d) => d.to_string(),
+                    let text = match &value.item {
+                        Item::Str(s) | Item::Datetime(s) => s.clone(),
                         _ => {
                             return Err(self.error(
                                 &path,
-                                value.span().start,
+                                value.at,
                                 "expected an RFC 3339 date-time",
                             ));
                         }
                     };
-                    let Some(at) = crate::time::parse_rfc3339(&text) else {
+                    let Some(instant) = crate::time::parse_rfc3339(&text) else {
                         return Err(self.error(
                             &path,
-                            value.span().start,
+                            value.at,
                             format!("\"{text}\" is not an RFC 3339 date-time"),
                         ));
                     };
-                    budget.deadline_at = Some(crate::time::rfc3339_utc(at));
+                    budget.deadline_at = Some(crate::time::rfc3339_utc(instant));
                 }
-                _ => return Err(self.unknown(&path, key.span().start)),
+                _ => return Err(self.unknown(&path, *at)),
             }
         }
         Ok(())
     }
 
-    fn ui(&self, table: &DeTable<'_>, ui: &mut Ui) -> Result<(), ConfigError> {
-        for (key, value) in table {
-            let name = &**key.get_ref();
+    fn ui(&self, table: &[Entry], ui: &mut Ui) -> Result<(), ConfigError> {
+        for (name, at, value) in table {
             let path = format!("ui.{name}");
-            match name {
+            match name.as_str() {
                 // CONTRACT 8: Workspace by default, Team and Focus optional.
                 "view" => ui.view = self.one_of(&path, value, &["workspace", "team", "focus"])?,
                 "statusline" => ui.statusline = self.one_of(&path, value, &["standard"])?,
                 "mouse" => ui.mouse = self.boolean(&path, value)?,
-                _ => return Err(self.unknown(&path, key.span().start)),
+                _ => return Err(self.unknown(&path, *at)),
             }
         }
         Ok(())
     }
 
-    fn web(&self, table: &DeTable<'_>, web: &mut Web) -> Result<(), ConfigError> {
-        for (key, value) in table {
-            let name = &**key.get_ref();
+    fn web(&self, table: &[Entry], web: &mut Web) -> Result<(), ConfigError> {
+        for (name, at, value) in table {
             let path = format!("web.{name}");
-            match name {
+            match name.as_str() {
                 "host" => {
                     let host = self.string(&path, value)?;
                     let loopback = host == "localhost"
@@ -696,8 +848,10 @@ impl Reader<'_> {
                     if !loopback {
                         return Err(self.error(
                             &path,
-                            value.span().start,
-                            format!("\"{host}\" is not a loopback address (remote use goes through ssh -L)"),
+                            value.at,
+                            format!(
+                                "\"{host}\" is not a loopback address (remote use goes through ssh -L)"
+                            ),
                         ));
                     }
                     web.host = host;
@@ -706,79 +860,69 @@ impl Reader<'_> {
                     web.port = u16::try_from(self.count(&path, value, 1, u32::from(u16::MAX))?)
                         .unwrap_or(u16::MAX);
                 }
-                _ => return Err(self.unknown(&path, key.span().start)),
+                _ => return Err(self.unknown(&path, *at)),
             }
         }
         Ok(())
     }
 
-    fn table<'a, 'i>(
-        &self,
-        path: &str,
-        value: &'a Value<'i>,
-    ) -> Result<&'a DeTable<'i>, ConfigError> {
-        match value.get_ref() {
-            DeValue::Table(table) => Ok(table),
-            _ => Err(self.error(path, value.span().start, "expected a table")),
+    fn table<'n>(&self, path: &str, value: &'n Node) -> Result<&'n [Entry], ConfigError> {
+        match &value.item {
+            Item::Table(table) => Ok(table),
+            _ => Err(self.error(path, value.at, "expected a table")),
         }
     }
 
-    fn string(&self, path: &str, value: &Value<'_>) -> Result<String, ConfigError> {
-        match value.get_ref() {
-            DeValue::String(s) => Ok(s.to_string()),
-            _ => Err(self.error(path, value.span().start, "expected a string")),
+    fn string(&self, path: &str, value: &Node) -> Result<String, ConfigError> {
+        match &value.item {
+            Item::Str(s) => Ok(s.clone()),
+            _ => Err(self.error(path, value.at, "expected a string")),
         }
     }
 
-    fn one_of(
-        &self,
-        path: &str,
-        value: &Value<'_>,
-        allowed: &[&str],
-    ) -> Result<String, ConfigError> {
+    fn one_of(&self, path: &str, value: &Node, allowed: &[&str]) -> Result<String, ConfigError> {
         let text = self.string(path, value)?;
         if allowed.contains(&text.as_str()) {
             Ok(text)
         } else {
             Err(self.error(
                 path,
-                value.span().start,
+                value.at,
                 format!("\"{text}\" is not one of {}", allowed.join(", ")),
             ))
         }
     }
 
-    fn agent(&self, path: &str, value: &Value<'_>) -> Result<Agent, ConfigError> {
+    fn agent(&self, path: &str, value: &Node) -> Result<Agent, ConfigError> {
         let name = self.string(path, value)?;
         Agent::named(&name).ok_or_else(|| {
             self.error(
                 path,
-                value.span().start,
+                value.at,
                 format!("\"{name}\" is not a registered agent (codex, claude, pi)"),
             )
         })
     }
 
-    fn boolean(&self, path: &str, value: &Value<'_>) -> Result<bool, ConfigError> {
-        match value.get_ref() {
-            DeValue::Boolean(b) => Ok(*b),
-            _ => Err(self.error(path, value.span().start, "expected true or false")),
+    fn boolean(&self, path: &str, value: &Node) -> Result<bool, ConfigError> {
+        match &value.item {
+            Item::Bool(b) => Ok(*b),
+            _ => Err(self.error(path, value.at, "expected true or false")),
         }
     }
 
     /// An integer within `min..=max`.
-    fn count(&self, path: &str, value: &Value<'_>, min: u32, max: u32) -> Result<u32, ConfigError> {
-        let DeValue::Integer(integer) = value.get_ref() else {
-            return Err(self.error(path, value.span().start, "expected an integer"));
+    fn count(&self, path: &str, value: &Node, min: u32, max: u32) -> Result<u32, ConfigError> {
+        let Item::Int(integer) = &value.item else {
+            return Err(self.error(path, value.at, "expected an integer"));
         };
-        i64::from_str_radix(integer.as_str(), integer.radix())
-            .ok()
+        integer
             .and_then(|n| u32::try_from(n).ok())
             .filter(|n| (min..=max).contains(n))
             .ok_or_else(|| {
                 self.error(
                     path,
-                    value.span().start,
+                    value.at,
                     if max == u32::MAX {
                         format!("expected an integer of at least {min}")
                     } else if min == max {
@@ -791,17 +935,15 @@ impl Reader<'_> {
     }
 
     /// A number above zero, integer or float.
-    fn positive(&self, path: &str, value: &Value<'_>) -> Result<f64, ConfigError> {
-        let number = match value.get_ref() {
-            DeValue::Integer(integer) => i64::from_str_radix(integer.as_str(), integer.radix())
-                .ok()
-                .map(|n| n as f64),
-            DeValue::Float(float) => float.as_str().parse::<f64>().ok(),
+    fn positive(&self, path: &str, value: &Node) -> Result<f64, ConfigError> {
+        let number = match &value.item {
+            Item::Int(Some(n)) => Some(*n as f64),
+            Item::Float(f) => Some(*f),
             _ => None,
         };
         number
             .filter(|n| n.is_finite() && *n > 0.0)
-            .ok_or_else(|| self.error(path, value.span().start, "expected a number above 0"))
+            .ok_or_else(|| self.error(path, value.at, "expected a number above 0"))
     }
 }
 
