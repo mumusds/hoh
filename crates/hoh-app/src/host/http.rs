@@ -43,6 +43,8 @@ pub(super) struct Shared {
     pub(super) cgroups: Option<super::cgroup::Delegated>,
     /// The budget a new run gets (docs/adr/ADR-022.md decision 7).
     pub(super) budget: hoh_core::config::Budget,
+    /// The project's root (prompt override files are checked against it, docs/adr/ADR-022.md decision 11).
+    pub(super) root: std::path::PathBuf,
 }
 
 /// One open event stream, counted while it lives.
@@ -216,7 +218,7 @@ fn error(
 
 /// A refused team change (REQ-018, ADR-022 decision 5): 400 INVALID_TEAM_CONFIG with the key path and the team
 /// revision that stays current.
-fn team_refused(key_path: &str, message: &str, current_revision: i64) -> Response {
+fn team_refused(key_path: &str, message: &str, current_revision: Option<i64>) -> Response {
     let body = json!({
         "code": "INVALID_TEAM_CONFIG",
         "message": message,
@@ -355,34 +357,12 @@ pub(super) async fn read<T: Send + 'static>(
     .map_err(|e| PersistError::Storage(format!("a read did not finish: {e}")))?
 }
 
-/// A ConfigureTeam that changes scheduler parameters for a run (CR-007): a run's snapshot never changes, so for an
-/// existing run it is 409 RUN_CONFIG_FROZEN with nothing written (the change applies to runs started later, through
-/// the project's ConfigureTeam: `run_id` null, ADR-022 decision 4).
-async fn configure_scheduler(shared: &Arc<Shared>, run_id: &str) -> Response {
-    let run_id = run_id.to_owned();
-    let wanted = run_id.clone();
-    match read(shared, move |reader| reader.snapshot(&wanted)).await {
-        Ok(Some(_)) => {
-            let body = json!({
-                "code": "RUN_CONFIG_FROZEN",
-                "message": format!(
-                    "run {run_id} keeps the scheduler parameters of its snapshot; a change applies to runs started later"
-                ),
-                "retryable": false,
-                "current_revision": null,
-                "details": {"key_path": "scheduler"},
-            });
-            (StatusCode::CONFLICT, axum::Json(body)).into_response()
-        }
-        Ok(None) => error(
-            StatusCode::CONFLICT,
-            "RUN_NOT_FOUND",
-            format!("run {run_id} does not exist"),
-            false,
-            None,
-        ),
-        Err(e) => store_error(shared, &run_id, e).await,
-    }
+/// The project's team revision now, for a team command's `current_revision`; none when it cannot be read.
+async fn team_revision(shared: &Arc<Shared>) -> Option<i64> {
+    let project = shared.project_id.clone();
+    read(shared, move |reader| reader.team_revision(&project))
+        .await
+        .ok()
 }
 
 /// The revision of `run_id` now, for a conflict's `current_revision`.
@@ -434,7 +414,19 @@ async fn store_error(shared: &Arc<Shared>, run_id: &str, e: PersistError) -> Res
             key_path,
             message,
             current_revision,
-        } => team_refused(&key_path, &message, current_revision),
+        } => team_refused(&key_path, &message, Some(current_revision)),
+        PersistError::RunConfigFrozen(run_id) => {
+            let body = json!({
+                "code": "RUN_CONFIG_FROZEN",
+                "message": format!(
+                    "run {run_id} keeps the scheduler parameters of its snapshot; a change applies to runs started later"
+                ),
+                "retryable": false,
+                "current_revision": null,
+                "details": {"key_path": "scheduler"},
+            });
+            (StatusCode::CONFLICT, axum::Json(body)).into_response()
+        }
         PersistError::IllegalTransition { from, to, why, .. } => error(
             StatusCode::CONFLICT,
             "ILLEGAL_TRANSITION",
@@ -525,26 +517,27 @@ async fn submit_command(
         Ok(command) => command,
         // A team change that does not match the contract (apply_at other than checkpoint, a bindings member of
         // another type): 400 INVALID_TEAM_CONFIG with the key path (REQ-018 failure mode 4, ADR-022 decision 5).
-        Err(protocol::DecodeError::Schema(violations)) if value["kind"] == "ConfigureTeam" => {
-            let key_path = violations
+        // Only a violation inside the payload is the team's; the envelope's stays BAD_REQUEST (M2T07R-58).
+        Err(protocol::DecodeError::Schema(violations))
+            if value["kind"] == "ConfigureTeam"
+                && violations
+                    .iter()
+                    .any(|v| v.instance_path.starts_with("/payload/")) =>
+        {
+            let first = violations
                 .iter()
-                .find_map(|v| v.instance_path.strip_prefix("/payload/"))
-                .or_else(|| {
-                    violations
-                        .first()
-                        .map(|v| v.instance_path.trim_start_matches('/'))
-                })
-                .unwrap_or("")
-                .replace('/', ".");
-            let message = violations.first().map_or_else(
-                || "does not match the contract".to_owned(),
-                |v| v.message.clone(),
+                .find(|v| v.instance_path.starts_with("/payload/"));
+            let (key_path, message) = first.map_or_else(
+                || (String::new(), String::new()),
+                |v| {
+                    (
+                        v.instance_path["/payload/".len()..].replace('/', "."),
+                        v.message.clone(),
+                    )
+                },
             );
-            let project = shared.project_id.clone();
-            let revision = read(&shared, move |reader| reader.team_revision(&project))
-                .await
-                .ok();
-            return team_refused(&key_path, &message, revision.unwrap_or(0));
+            let revision = team_revision(&shared).await;
+            return team_refused(&key_path, &message, revision);
         }
         Err(e) => {
             return error(
@@ -556,12 +549,6 @@ async fn submit_command(
             );
         }
     };
-    if let CommandBody::ConfigureTeam(team) = &command.body
-        && team.scheduler.is_some()
-        && let Some(run_id) = command.run_id.as_deref()
-    {
-        return configure_scheduler(&shared, run_id).await;
-    }
     // The control commands (docs/adr/ADR-021.md decisions 5, 7, 8): their kind, where the run moves, the event's kind
     // and payload, and the runtime notice for the host loop (ADR-016 decision 5, ADR-018 decision 4).
     let kind = command.kind();
@@ -599,6 +586,7 @@ async fn submit_command(
             RunTarget::Team(TeamChange {
                 bindings: team.bindings.clone().map(Value::Object),
                 scheduler: team.scheduler.clone(),
+                root: Some(shared.root.clone()),
             }),
             "team.configured",
             None,
@@ -712,6 +700,14 @@ async fn submit_command(
             accepted(result_json, false)
         }
         Ok(CommandOutcome::Replayed { result_json }) => accepted(result_json, true),
+        // A team command's revision is the team's (M2T07R-04).
+        Err(PersistError::KeyReuse(key)) if name == "ConfigureTeam" => error(
+            StatusCode::CONFLICT,
+            "KEY_REUSE",
+            format!("idempotency key {key} was accepted with another payload"),
+            false,
+            team_revision(&shared).await,
+        ),
         Err(e) => store_error(&shared, run_id, e).await,
     }
 }
@@ -792,12 +788,36 @@ async fn list_runs(
     }
 }
 
-/// `GET /v1/runs/{run_id}/team` (openapi `listTeam`): the run's role bindings as one page, in the role order, with
-/// the watermark they were read at (docs/adr/ADR-022.md decision 18). A team is small: one page always holds it.
+#[derive(serde::Deserialize)]
+struct TeamQuery {
+    limit: Option<usize>,
+    cursor: Option<String>,
+}
+
+/// `GET /v1/runs/{run_id}/team` (openapi `listTeam`): a page of the run's role bindings in the role order, with the
+/// watermark they were read at (docs/adr/ADR-022.md decision 18): at most `limit` (1 to 500, 100 by default) after
+/// the role named by `cursor`; a query that cannot be read names no page, 404 as for `GET /v1/runs` (M2T07R-06).
 async fn list_team(
     State(shared): State<Arc<Shared>>,
     run_id: Result<UrlPath<String>, axum::extract::rejection::PathRejection>,
+    query: Result<Query<TeamQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
+    let unreadable = || {
+        error(
+            StatusCode::NOT_FOUND,
+            "BAD_REQUEST",
+            "limit must be 1 to 500, cursor a role of this team",
+            false,
+            None,
+        )
+    };
+    let Ok(Query(query)) = query else {
+        return unreadable();
+    };
+    let limit = query.limit.unwrap_or(100);
+    if !(1..=500).contains(&limit) {
+        return unreadable();
+    }
     let Ok(UrlPath(run_id)) = run_id else {
         return error(
             StatusCode::NOT_FOUND,
@@ -809,15 +829,28 @@ async fn list_team(
     };
     let wanted = run_id.clone();
     match read(&shared, move |reader| reader.run_view(&wanted)).await {
-        Ok(Some((_, team, watermark))) => (
-            StatusCode::OK,
-            axum::Json(json!({
-                "items": team.members,
-                "next_cursor": null,
-                "watermark": watermark,
-            })),
-        )
-            .into_response(),
+        Ok(Some((_, team, watermark))) => {
+            let from = match &query.cursor {
+                None => 0,
+                Some(cursor) => match team.members.iter().position(|m| &m.role == cursor) {
+                    Some(at) => at + 1,
+                    None => return unreadable(),
+                },
+            };
+            let page: Vec<_> = team.members.iter().skip(from).take(limit).collect();
+            let next = (from + page.len() < team.members.len())
+                .then(|| page.last().map(|m| m.role.clone()))
+                .flatten();
+            (
+                StatusCode::OK,
+                axum::Json(json!({
+                    "items": page,
+                    "next_cursor": next,
+                    "watermark": watermark,
+                })),
+            )
+                .into_response()
+        }
         Ok(None) => error(
             StatusCode::NOT_FOUND,
             "RUN_NOT_FOUND",

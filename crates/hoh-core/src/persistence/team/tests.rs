@@ -261,6 +261,7 @@ fn team_change(key: &str, expected: i64, bindings: Value) -> SubmitCommand {
         target: RunTarget::Team(crate::persistence::TeamChange {
             bindings: Some(bindings),
             scheduler: None,
+            root: None,
         }),
         event: NewEvent {
             project_id: "p1".to_owned(),
@@ -324,7 +325,7 @@ async fn a_changed_role_is_rebound_at_its_checkpoint_with_the_next_epoch() -> R 
             json!({"developer": {"agent": "codex", "model": "m-test"}}),
         ))
         .await?;
-    store.team_checkpoint("R1").await?;
+    store.team_checkpoint("R1", Default::default()).await?;
     let bindings = |path: &PathBuf| {
         values(
             path,
@@ -361,7 +362,7 @@ async fn a_changed_role_is_rebound_at_its_checkpoint_with_the_next_epoch() -> R 
     let applied = "SELECT count(*) FROM events WHERE kind = 'team.binding_applied'";
     assert_eq!(rows::<i64>(&path, applied)?, vec![vec![0]]);
     a0_ends(&path)?;
-    store.team_checkpoint("R1").await?;
+    store.team_checkpoint("R1", Default::default()).await?;
     let developer = bindings(&path)?
         .into_iter()
         .find(|row| row[0] == "developer")
@@ -398,7 +399,7 @@ async fn a_changed_role_is_rebound_at_its_checkpoint_with_the_next_epoch() -> R 
         vec![vec![1]]
     );
     let events = rows::<i64>(&path, "SELECT count(*) FROM events")?;
-    store.team_checkpoint("R1").await?;
+    store.team_checkpoint("R1", Default::default()).await?;
     assert_eq!(rows::<i64>(&path, "SELECT count(*) FROM events")?, events);
     Ok(())
 }
@@ -430,7 +431,7 @@ async fn a_role_waiting_for_its_checkpoint_is_not_dispatched_and_its_next_attemp
     let round = store.schedule_round("R1", context.clone()).await?;
     assert!(round.dispatched.is_none(), "{round:?}");
     a0_ends(&path)?;
-    store.team_checkpoint("R1").await?;
+    store.team_checkpoint("R1", Default::default()).await?;
     exec(
         &path,
         "INSERT INTO sessions(session_id, agent, role, agent_version, capabilities_json) VALUES
@@ -469,7 +470,7 @@ async fn a_removed_role_is_blocked_at_a_new_epoch_and_one_added_again_does_not_r
     store
         .submit_command(team_change("add", 0, added.clone()))
         .await?;
-    store.team_checkpoint("R1").await?;
+    store.team_checkpoint("R1", Default::default()).await?;
     assert_eq!(
         auditor()?,
         vec![vec![
@@ -483,7 +484,7 @@ async fn a_removed_role_is_blocked_at_a_new_epoch_and_one_added_again_does_not_r
     store
         .submit_command(team_change("remove", 1, json!({"auditor": null})))
         .await?;
-    store.team_checkpoint("R1").await?;
+    store.team_checkpoint("R1", Default::default()).await?;
     assert_eq!(
         auditor()?,
         vec![vec![
@@ -495,7 +496,7 @@ async fn a_removed_role_is_blocked_at_a_new_epoch_and_one_added_again_does_not_r
         ]]
     );
     store.submit_command(team_change("again", 2, added)).await?;
-    store.team_checkpoint("R1").await?;
+    store.team_checkpoint("R1", Default::default()).await?;
     assert_eq!(
         auditor()?,
         vec![vec![
@@ -518,6 +519,296 @@ async fn a_removed_role_is_blocked_at_a_new_epoch_and_one_added_again_does_not_r
             vec!["auditor:removed".to_owned()],
             vec!["auditor:3".to_owned()]
         ]
+    );
+    Ok(())
+}
+
+/// R1's binding of `role`: agent, model, role_epoch, config_revision, state, blocked_reason, session_id.
+fn binding(path: &PathBuf, role: &str) -> R<Vec<Value>> {
+    Ok(values(
+        path,
+        &format!(
+            "SELECT agent, model, role_epoch, config_revision, state, blocked_reason, session_id FROM role_bindings \
+             WHERE run_id = 'R1' AND role = '{role}'"
+        ),
+    )?
+    .pop()
+    .ok_or("no binding")?)
+}
+
+fn applied(path: &PathBuf) -> R<i64> {
+    Ok(rows::<i64>(
+        path,
+        "SELECT count(*) FROM events WHERE kind = 'team.binding_applied'",
+    )?[0][0])
+}
+
+#[tokio::test]
+async fn a_role_blocked_for_its_availability_is_not_a_changed_role() -> R {
+    // M2T07R-01, -51 (decision 8, second version): a revision that changes another role leaves a role blocked for its
+    // availability as it is (state, reason, epoch, session) and moves it to the revision; removing such a role is a
+    // change: epoch+1 and an event.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    store
+        .submit_command(start("R1", Config::default().budget))
+        .await?;
+    exec(
+        &path,
+        "INSERT INTO sessions(session_id, agent, role, agent_version, capabilities_json) VALUES
+           ('sq', 'pi', 'qa', '1', '{}');
+         UPDATE role_bindings SET state = 'BLOCKED', blocked_reason = 'BLOCKED_AUTH', session_id = 'sq'
+           WHERE run_id = 'R1' AND role = 'qa';
+         UPDATE role_bindings SET state = 'BLOCKED', blocked_reason = 'AGENT_UNAVAILABLE'
+           WHERE run_id = 'R1' AND role = 'researcher';",
+    )?;
+    store
+        .submit_command(team_change("cto", 0, json!({"cto": {"model": "m-cto"}})))
+        .await?;
+    store.team_checkpoint("R1", Default::default()).await?;
+    assert_eq!(
+        binding(&path, "qa")?,
+        [
+            json!("pi"),
+            Value::Null,
+            json!(1),
+            json!(1),
+            json!("BLOCKED"),
+            json!("BLOCKED_AUTH"),
+            json!("sq")
+        ]
+    );
+    assert_eq!(applied(&path)?, 1, "only the cto");
+    store
+        .submit_command(team_change("drop", 1, json!({"researcher": null})))
+        .await?;
+    store.team_checkpoint("R1", Default::default()).await?;
+    assert_eq!(binding(&path, "researcher")?[2..4], [json!(2), json!(2)]);
+    assert_eq!(applied(&path)?, 2, "the removal is an event");
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_unchanged_role_moves_to_the_revision_while_its_attempt_runs() -> R {
+    // M2T07R-03: a role the revision does not change is not held back by its live attempt; its next attempt records
+    // the new revision, and the run follows once the changed roles are there too.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    working(&store, &path).await?;
+    store
+        .submit_command(team_change("cto", 0, json!({"cto": {"model": "m-cto"}})))
+        .await?;
+    store.team_checkpoint("R1", Default::default()).await?;
+    assert_eq!(binding(&path, "developer")?[2..4], [json!(1), json!(1)]);
+    assert_eq!(
+        rows::<i64>(
+            &path,
+            "SELECT config_revision FROM runs WHERE run_id = 'R1'"
+        )?,
+        vec![vec![1]]
+    );
+    let context = crate::decision::Context {
+        required_capabilities: [(
+            "developer".to_owned(),
+            ["structured_events".to_owned()].into(),
+        )]
+        .into(),
+        ..crate::decision::Context::default()
+    };
+    let round = store.schedule_round("R1", context).await?;
+    assert!(round.dispatched.is_some(), "{round:?}");
+    assert_eq!(
+        rows::<i64>(
+            &path,
+            "SELECT config_revision FROM attempts WHERE task_id = 'T1'"
+        )?,
+        vec![vec![1]]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_change_waits_for_a_prepared_or_starting_attempt_too() -> R {
+    // M2T07R-55 (1): the checkpoint is a role with no attempt PREPARED, STARTING or RUNNING.
+    for state in ["PREPARED", "STARTING"] {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = open(&dir)?;
+        working(&store, &path).await?;
+        exec(
+            &path,
+            &format!("UPDATE attempts SET state = '{state}' WHERE attempt_id = 'A0';"),
+        )?;
+        store
+            .submit_command(team_change(
+                "dev",
+                0,
+                json!({"developer": {"agent": "codex"}}),
+            ))
+            .await?;
+        store.team_checkpoint("R1", Default::default()).await?;
+        assert_eq!(
+            binding(&path, "developer")?[0..3],
+            [json!("claude"), Value::Null, json!(1)],
+            "{state}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_change_of_the_prompt_alone_is_a_new_epoch() -> R {
+    // M2T07R-55 (2): fallback, prompt and session independence are part of a role's configuration.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    store
+        .submit_command(start("R1", Config::default().budget))
+        .await?;
+    store
+        .submit_command(team_change(
+            "prompt",
+            0,
+            json!({"developer": {"prompt": "builtin:cto"}, "qa": {"fallback": ["claude"]}}),
+        ))
+        .await?;
+    store.team_checkpoint("R1", Default::default()).await?;
+    assert_eq!(binding(&path, "developer")?[2], json!(2));
+    assert_eq!(binding(&path, "qa")?[2], json!(2));
+    assert_eq!(binding(&path, "cto")?[2], json!(1));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_change_to_an_unavailable_agent_keeps_the_old_binding_until_the_agent_is_there() -> R {
+    // M2T07R-52 (REQ-019 decision 2, failure mode 3): with its new agent unavailable the role keeps its binding and
+    // epoch, one team.binding_refused is written for the role and revision, and it waits; once the agent is available it
+    // is applied.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    store
+        .submit_command(start("R1", Config::default().budget))
+        .await?;
+    store
+        .submit_command(team_change(
+            "dev",
+            0,
+            json!({"developer": {"agent": "codex"}}),
+        ))
+        .await?;
+    let codex: std::collections::BTreeSet<String> = ["codex".to_owned()].into();
+    store.team_checkpoint("R1", codex.clone()).await?;
+    store.team_checkpoint("R1", codex).await?;
+    assert_eq!(
+        binding(&path, "developer")?[0..4],
+        [json!("claude"), Value::Null, json!(1), json!(0)]
+    );
+    let refused = values(
+        &path,
+        "SELECT json_extract(payload_json, '$.role'), json_extract(payload_json, '$.agent') FROM events \
+         WHERE kind = 'team.binding_refused'",
+    )?;
+    assert_eq!(refused, vec![vec![json!("developer"), json!("codex")]]);
+    assert_eq!(
+        rows::<i64>(
+            &path,
+            "SELECT config_revision FROM runs WHERE run_id = 'R1'"
+        )?,
+        vec![vec![0]]
+    );
+    store.team_checkpoint("R1", Default::default()).await?;
+    assert_eq!(
+        binding(&path, "developer")?[0..4],
+        [json!("codex"), Value::Null, json!(2), json!(1)]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_role_with_no_session_yet_has_its_tasks_wait_not_blocked() -> R {
+    // M2T07R-50: right after its checkpoint a role has no session (the binder gives it one); the pace that follows does
+    // not judge its tasks by capabilities it does not have yet, and no round dispatches them.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    working(&store, &path).await?;
+    let context = crate::decision::Context {
+        required_capabilities: [(
+            "developer".to_owned(),
+            ["structured_events".to_owned()].into(),
+        )]
+        .into(),
+        ..crate::decision::Context::default()
+    };
+    store
+        .submit_command(team_change(
+            "dev",
+            0,
+            json!({"developer": {"model": "m-2"}}),
+        ))
+        .await?;
+    a0_ends(&path)?;
+    store.team_checkpoint("R1", Default::default()).await?;
+    assert_eq!(binding(&path, "developer")?[6], Value::Null);
+    store.pace_run("R1", context.clone()).await?;
+    let round = store.schedule_round("R1", context).await?;
+    assert!(round.dispatched.is_none(), "{round:?}");
+    assert_eq!(
+        values(
+            &path,
+            "SELECT state, blocked_reason FROM tasks WHERE task_id = 'T1'"
+        )?,
+        vec![vec![json!("READY"), Value::Null]]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_attempt_records_its_bindings_revision_while_the_run_is_behind() -> R {
+    // M2T07R-55 (3), REQ-018 behaviour 6: while the developer's change waits for A0, the run stays at revision 0; the
+    // cto, unchanged, is at revision 1, and its next attempt records 1, its binding's, not the run's.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    working(&store, &path).await?;
+    exec(
+        &path,
+        "INSERT INTO sessions(session_id, agent, role, agent_version, capabilities_json) VALUES
+           ('sc', 'claude', 'cto', '1', '{\"structured_events\": true}');
+         UPDATE role_bindings SET session_id = 'sc' WHERE run_id = 'R1' AND role = 'cto';
+         INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate) VALUES
+           ('T9', 'R1', 's1', 'READY', 1, 'cto', 0, 9, 1);",
+    )?;
+    store
+        .submit_command(team_change(
+            "dev",
+            0,
+            json!({"developer": {"agent": "codex"}}),
+        ))
+        .await?;
+    store.team_checkpoint("R1", Default::default()).await?;
+    assert_eq!(
+        rows::<i64>(
+            &path,
+            "SELECT config_revision FROM runs WHERE run_id = 'R1'"
+        )?,
+        vec![vec![0]]
+    );
+    let context = crate::decision::Context {
+        required_capabilities: [
+            ("cto".to_owned(), ["structured_events".to_owned()].into()),
+            (
+                "developer".to_owned(),
+                ["structured_events".to_owned()].into(),
+            ),
+        ]
+        .into(),
+        ..crate::decision::Context::default()
+    };
+    let round = store.schedule_round("R1", context).await?;
+    assert!(round.dispatched.is_some(), "{round:?}");
+    assert_eq!(
+        values(
+            &path,
+            "SELECT task_id, config_revision FROM attempts WHERE task_id IN ('T1', 'T9')"
+        )?,
+        vec![vec![json!("T9"), json!(1)]]
     );
     Ok(())
 }
