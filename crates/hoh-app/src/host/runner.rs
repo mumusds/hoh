@@ -169,8 +169,11 @@ pub trait Executor: Send + Sync + std::fmt::Debug {
     fn start(&self, work: &Work) -> Result<Started, Refusal>;
     /// Ask `work`'s process to stop the agent's own way (its native cancel), before any signal: the first step when its
     /// lease expired (AC-041-02). It only asks and returns at once: the settle looks at the group around it
-    /// (M2T05R-452).
-    fn cancel(&self, _work: &Work) {}
+    /// (M2T05R-452). Whether it asked a turn it still holds: only then does the settle wait the native grace, and its
+    /// step says the cancel was sent (docs/adr/ADR-022.md decision 17, M2T07R-453).
+    fn cancel(&self, _work: &Work) -> bool {
+        false
+    }
 }
 
 /// The runner's fault injection points (CR-006): the product's hooks do nothing. In order, for one attempt: before
@@ -805,16 +808,14 @@ async fn settle(
         {
             return None;
         }
-        if let Some(work) = &work {
-            executor.cancel(work);
-        }
-        // The native cancel's grace first, when one was sent: a group that emptied by it gets no signal (M2T07R-254,
-        // -353).
-        seen.grace(settings.first_wait(work.is_some()));
+        let sent = work.as_ref().is_some_and(|work| executor.cancel(work));
+        // The native cancel's grace first, when one reached a turn: a group that emptied by it gets no signal
+        // (M2T07R-254, -353, -453).
+        seen.grace(settings.first_wait(sent));
         Some((
             found,
             finding,
-            work.is_some(),
+            sent,
             reconcile::end(seen, &scanned, &tracking, &settings),
         ))
     })

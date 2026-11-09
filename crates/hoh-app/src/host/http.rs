@@ -462,6 +462,7 @@ pub(super) async fn sync_config(
         if made.as_ref().unwrap_or(&json!({"kind": "builtin"})) == &source {
             return Ok(config);
         }
+        shared.hooks.before_file_revision();
         let tag = source["sha256"].as_str().unwrap_or("builtin").to_owned();
         let command_id = format!("config-file/{tag}/{base}");
         let payload = json!({"source": source});

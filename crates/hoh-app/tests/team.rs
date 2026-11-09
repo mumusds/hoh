@@ -1227,6 +1227,67 @@ async fn an_invalid_configuration_file_refuses_new_runs_and_keeps_the_revision()
     Ok(())
 }
 
+/// Moves the team on, once armed, each time the host is about to submit the configuration file's revision: every try
+/// is overtaken.
+#[derive(Debug)]
+struct MovesTheTeamOn {
+    project: PathBuf,
+    armed: std::sync::atomic::AtomicBool,
+    moved: std::sync::atomic::AtomicUsize,
+}
+
+impl hoh_app::host::HostHooks for MovesTheTeamOn {
+    fn before_file_revision(&self) {
+        if self.armed.load(std::sync::atomic::Ordering::SeqCst) {
+            self.moved.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = exec(
+                &self.project,
+                "INSERT INTO team_revisions(project_id, revision, config_json, state, created_at) \
+                 SELECT project_id, revision + 1, config_json, 'APPLIED', created_at FROM team_revisions \
+                 ORDER BY revision DESC LIMIT 1;",
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_start_run_whose_configuration_file_is_overtaken_every_time_is_refused_as_stale() -> R {
+    // M2T07R-351, -454 (docs/adr/ADR-022.md decision 6): when the team moves on before each of the three tries to make
+    // the file's revision current, StartRun is refused 409 STALE_REVISION (retryable) and makes no run; it is not
+    // taken as applied.
+    let dir = tempfile::tempdir()?;
+    std::fs::create_dir_all(dir.path().join(".hoh"))?;
+    let file = dir.path().join(".hoh/config.toml");
+    std::fs::write(
+        &file,
+        "config_version = \"1.0\"\n[team.developer]\nagent = \"claude\"\n",
+    )?;
+    let hooks = std::sync::Arc::new(MovesTheTeamOn {
+        project: dir.path().to_path_buf(),
+        armed: std::sync::atomic::AtomicBool::new(false),
+        moved: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let mut host_config = config(dir.path());
+    host_config.hooks = hooks.clone();
+    let host = start_when_free(host_config).await?;
+    std::fs::write(
+        &file,
+        "config_version = \"1.0\"\n[team.developer]\nagent = \"codex\"\n",
+    )?;
+    hooks.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (status, body) = exchange(&host, "POST", "/v1/commands", Some(&start_run("s1"))).await?;
+    hooks
+        .armed
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["code"], json!("STALE_REVISION"), "{body}");
+    assert_eq!(body["retryable"], json!(true), "{body}");
+    assert_eq!(hooks.moved.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert_eq!(query(dir.path(), "SELECT count(*) FROM runs")?, "0");
+    host.shutdown().await;
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_start_run_whose_configuration_file_cannot_be_applied_is_refused_not_started_on_the_old_team()
 -> R {
