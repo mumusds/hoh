@@ -38,6 +38,11 @@ fn main() {
     {
         std::process::exit(hoh_core::persistence::selftest::probe_main());
     }
+    // Internal mode: the start gate an agent is started through (docs/adr/ADR-022.md decision 13); not a user command and
+    // in no help text.
+    if args.first().map(OsString::as_os_str) == Some("__gate".as_ref()) {
+        std::process::exit(hoh_app::gate::main(&args[1..]));
+    }
     // Internal mode: the host a client starts (docs/adr/ADR-021.md decision 1); not a user command and in no help text.
     if args.first().map(OsString::as_os_str) == Some("__host".as_ref()) {
         std::process::exit(i32::from(host(&args[1..])));
