@@ -389,7 +389,7 @@ async fn an_accepted_team_change_is_the_next_revision_pending_in_running_runs_an
     assert_eq!(developer["role_epoch"], 1);
     assert_eq!(
         developer["pending"],
-        json!({"agent": "codex", "model": "m-test", "config_revision": 1})
+        json!({"agent": "codex", "model": "m-test", "config_revision": 1, "refused": null})
     );
     let auditor = member("auditor").ok_or("no auditor")?;
     assert_eq!(auditor["state"], "UNBOUND", "{auditor}");
@@ -645,6 +645,83 @@ async fn a_hosts_runner_applies_a_team_change_at_the_roles_checkpoint() -> R {
 }
 
 #[tokio::test]
+async fn a_hosts_runner_leaves_an_ended_run_at_its_revision() -> R {
+    // M2T07R-154 (ADR-022 decision 8): only runs not ended are checkpointed; an ended run keeps its bindings and writes
+    // no event, while a run not ended at the same ticks takes the change.
+    let dir = tempfile::tempdir()?;
+    let mut config = config(dir.path());
+    config.runner = Some(hoh_app::host::RunnerConfig {
+        executor: std::sync::Arc::new(Idle),
+        context: hoh_core::decision::Context::default(),
+    });
+    let host = start_when_free(config).await?;
+    let mut ended = Vec::new();
+    for (key, state) in [
+        ("c", "COMPLETED"),
+        ("x", "CANCELLED"),
+        ("f", "FAILED"),
+        ("i", "INCOMPLETE"),
+    ] {
+        let run_id = started(&host, key).await?;
+        exec(
+            dir.path(),
+            &format!("UPDATE runs SET state = '{state}' WHERE run_id = '{run_id}';"),
+        )?;
+        ended.push(run_id);
+    }
+    let open = started(&host, "open").await?;
+    let (status, body) = exchange(
+        &host,
+        "POST",
+        "/v1/commands",
+        Some(&configure(
+            "dev",
+            None,
+            0,
+            json!({"bindings": {"developer": {"agent": "codex"}}, "apply_at": "checkpoint"}),
+        )),
+    )
+    .await?;
+    assert_eq!(status, 202, "{body}");
+    let binding = |run_id: &str| {
+        format!(
+            "SELECT agent || '/' || role_epoch || '/' || config_revision FROM role_bindings \
+             WHERE run_id = '{run_id}' AND role = 'developer'"
+        )
+    };
+    let end = std::time::Instant::now() + Duration::from_secs(10);
+    while query(dir.path(), &binding(&open))? != "codex/2/1" {
+        assert!(
+            std::time::Instant::now() < end,
+            "the open run is not checkpointed"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // A few more ticks.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    for run_id in &ended {
+        assert_eq!(
+            query(dir.path(), &binding(run_id))?,
+            "claude/1/0",
+            "{run_id}"
+        );
+        assert_eq!(
+            query(
+                dir.path(),
+                &format!(
+                    "SELECT config_revision || '/' || (SELECT count(*) FROM events WHERE run_id = '{run_id}' \
+                     AND kind LIKE 'team.%') FROM runs WHERE run_id = '{run_id}'"
+                )
+            )?,
+            "0/0",
+            "{run_id}"
+        );
+    }
+    host.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_reused_key_is_key_reuse_before_any_frozen_scheduler_and_its_revision_is_the_teams() -> R
 {
     // M2T07R-04, -05 (ADR-022 decision 5): the key is looked up first; a team command's current_revision is the team
@@ -783,6 +860,27 @@ async fn a_team_change_is_checked_against_the_project_and_its_envelope_stays_a_b
         "0"
     );
     std::fs::create_dir_all(dir.path().join(".hoh/prompts"))?;
+    // M2T07R-101: a link that leads outside the project is refused, though its file exists.
+    let outside = tempfile::tempdir()?;
+    std::fs::write(outside.path().join("outside.md"), "Outside.")?;
+    std::os::unix::fs::symlink(
+        outside.path().join("outside.md"),
+        dir.path().join(".hoh/prompts/escape.md"),
+    )?;
+    let (status, body) = exchange(
+        &host,
+        "POST",
+        "/v1/commands",
+        Some(&configure(
+            "escape",
+            None,
+            0,
+            auditor(".hoh/prompts/escape.md"),
+        )),
+    )
+    .await?;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["details"]["key_path"], "bindings.auditor.prompt");
     std::fs::write(dir.path().join(".hoh/prompts/auditor.md"), "Audit.")?;
     let (status, body) = exchange(
         &host,
@@ -797,6 +895,56 @@ async fn a_team_change_is_checked_against_the_project_and_its_envelope_stays_a_b
     )
     .await?;
     assert_eq!(status, 202, "{body}");
+    host.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_payload_missing_a_member_or_of_another_type_is_an_invalid_team_config() -> R {
+    // M2T07R-100, -151 (ADR-022 decision 5): a violation of the payload itself is the team's too, not only one inside
+    // it: 400 INVALID_TEAM_CONFIG with the team's revision, the missing member's name as its key path, else `payload`.
+    let dir = tempfile::tempdir()?;
+    let host = start_when_free(config(dir.path())).await?;
+    let first = configure(
+        "first",
+        None,
+        0,
+        json!({"bindings": {"cto": {"model": "a"}}, "apply_at": "checkpoint"}),
+    );
+    assert_eq!(
+        exchange(&host, "POST", "/v1/commands", Some(&first))
+            .await?
+            .0,
+        202
+    );
+    for (key, payload, key_path) in [
+        (
+            "no-apply-at",
+            json!({"bindings": {"developer": {"model": "x"}}}),
+            "apply_at",
+        ),
+        ("nothing", json!({"apply_at": "checkpoint"}), "payload"),
+        ("array", json!([]), "payload"),
+    ] {
+        let (status, body) = exchange(
+            &host,
+            "POST",
+            "/v1/commands",
+            Some(&configure(key, None, 1, payload)),
+        )
+        .await?;
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (400, Some("INVALID_TEAM_CONFIG")),
+            "{key}: {body}"
+        );
+        assert_eq!(body["details"]["key_path"], key_path, "{key}: {body}");
+        assert_eq!(body["current_revision"], 1, "{key}: {body}");
+    }
+    assert_eq!(
+        query(dir.path(), "SELECT max(revision) FROM team_revisions")?,
+        "1"
+    );
     host.shutdown().await;
     Ok(())
 }

@@ -495,14 +495,57 @@ async fn a_removed_role_is_blocked_at_a_new_epoch_and_one_added_again_does_not_r
             json!("AGENT_UNAVAILABLE")
         ]]
     );
-    store.submit_command(team_change("again", 2, added)).await?;
+    // M2T07R-152: a removed role is not a change of the revisions that follow, and the view tells it from a role
+    // blocked for its availability.
+    exec(
+        &path,
+        "UPDATE role_bindings SET state = 'BLOCKED', blocked_reason = 'AGENT_UNAVAILABLE' \
+         WHERE run_id = 'R1' AND role = 'developer'",
+    )?;
+    let removed = || -> R<Vec<(String, bool)>> {
+        Ok(super::view(&Connection::open(&path)?, "R1", "p1")?
+            .members
+            .into_iter()
+            .filter(|m| m.state == "BLOCKED")
+            .map(|m| (m.role, m.removed))
+            .collect())
+    };
+    assert_eq!(
+        removed()?,
+        vec![
+            ("developer".to_owned(), false),
+            ("auditor".to_owned(), true)
+        ]
+    );
+    store
+        .submit_command(team_change("other", 2, json!({"cto": {"model": "m-cto"}})))
+        .await?;
+    store.team_checkpoint("R1", Default::default()).await?;
+    assert_eq!(
+        auditor()?,
+        vec![vec![
+            json!("pi"),
+            json!(2),
+            json!(3),
+            json!("BLOCKED"),
+            json!("AGENT_UNAVAILABLE")
+        ]]
+    );
+    assert_eq!(
+        removed()?,
+        vec![
+            ("developer".to_owned(), false),
+            ("auditor".to_owned(), true)
+        ]
+    );
+    store.submit_command(team_change("again", 3, added)).await?;
     store.team_checkpoint("R1", Default::default()).await?;
     assert_eq!(
         auditor()?,
         vec![vec![
             json!("pi"),
             json!(3),
-            json!(3),
+            json!(4),
             json!("ACTIVE"),
             Value::Null
         ]]
@@ -517,6 +560,7 @@ async fn a_removed_role_is_blocked_at_a_new_epoch_and_one_added_again_does_not_r
         vec![
             vec!["auditor:1".to_owned()],
             vec!["auditor:removed".to_owned()],
+            vec!["cto:2".to_owned()],
             vec!["auditor:3".to_owned()]
         ]
     );
@@ -718,6 +762,141 @@ async fn a_change_to_an_unavailable_agent_keeps_the_old_binding_until_the_agent_
     assert_eq!(
         binding(&path, "developer")?[0..4],
         [json!("codex"), Value::Null, json!(2), json!(1)]
+    );
+    Ok(())
+}
+
+/// The developer of R1 as the team view shows it: its agent, epoch and what is pending for it.
+fn shown_developer(path: &PathBuf) -> R<Value> {
+    let view = super::view(&Connection::open(path)?, "R1", "p1")?;
+    let member = view
+        .members
+        .into_iter()
+        .find(|m| m.role == "developer")
+        .ok_or("no developer")?;
+    Ok(json!([member.agent, member.role_epoch, member.pending]))
+}
+
+#[tokio::test]
+async fn a_refused_change_leaves_the_old_binding_working_until_its_agent_is_there() -> R {
+    // M2T07R-150 (REQ-019 decision 2 and failure mode 3, ADR-022 decision 8 third version): while the change's new agent
+    // is unavailable the change is refused and the old binding, its epoch and session go on being dispatched, the role
+    // never vacant; once the agent is there the role is held again until its next checkpoint, where the change is
+    // applied. Each turn of the verdict is one event, however many checkpoints see it.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    working(&store, &path).await?;
+    let context = crate::decision::Context {
+        required_capabilities: [(
+            "developer".to_owned(),
+            ["structured_events".to_owned()].into(),
+        )]
+        .into(),
+        ..crate::decision::Context::default()
+    };
+    store
+        .submit_command(team_change(
+            "dev",
+            0,
+            json!({"developer": {"agent": "codex"}}),
+        ))
+        .await?;
+    let codex: std::collections::BTreeSet<String> = ["codex".to_owned()].into();
+    let refused = json!(["claude", 1, {"agent": "codex", "model": null, "config_revision": 1, "refused": "AGENT_UNAVAILABLE"}]);
+    // Refused while A0 runs too: the old binding is not held back for a change that cannot be applied.
+    store.team_checkpoint("R1", codex.clone()).await?;
+    assert_eq!(shown_developer(&path)?, refused);
+    a0_ends(&path)?;
+    store.team_checkpoint("R1", codex.clone()).await?;
+    assert_eq!(
+        binding(&path, "developer")?[0..4],
+        [json!("claude"), Value::Null, json!(1), json!(0)]
+    );
+    assert_eq!(
+        shown_developer(&path)?,
+        json!(["claude", 1, {"agent": "codex", "model": null, "config_revision": 1, "refused": "AGENT_UNAVAILABLE"}])
+    );
+    store.pace_run("R1", context.clone()).await?;
+    let round = store.schedule_round("R1", context.clone()).await?;
+    assert!(round.dispatched.is_some(), "{round:?}");
+    assert_eq!(
+        values(
+            &path,
+            "SELECT agent, role_epoch, session_id, config_revision FROM attempts WHERE task_id = 'T1'"
+        )?,
+        vec![vec![json!("claude"), json!(1), json!("sd"), json!(0)]]
+    );
+    // The agent is there while T1's attempt is live: the role is held, T2 waits.
+    exec(
+        &path,
+        "INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate) VALUES
+           ('T2', 'R1', 's1', 'READY', 1, 'developer', 0, 3, 1);",
+    )?;
+    store.team_checkpoint("R1", Default::default()).await?;
+    store.team_checkpoint("R1", Default::default()).await?;
+    assert_eq!(
+        binding(&path, "developer")?[0..4],
+        [json!("claude"), Value::Null, json!(1), json!(0)]
+    );
+    assert_eq!(
+        shown_developer(&path)?,
+        json!(["claude", 1, {"agent": "codex", "model": null, "config_revision": 1, "refused": null}])
+    );
+    let round = store.schedule_round("R1", context.clone()).await?;
+    assert!(round.dispatched.is_none(), "{round:?}");
+    exec(
+        &path,
+        "UPDATE attempts SET state = 'SETTLED', ended_at = '2026-11-09T00:02:00Z' WHERE task_id = 'T1';
+         UPDATE tasks SET state = 'IMPLEMENTED' WHERE task_id = 'T1';",
+    )?;
+    store.team_checkpoint("R1", Default::default()).await?;
+    assert_eq!(
+        binding(&path, "developer")?[0..4],
+        [json!("codex"), Value::Null, json!(2), json!(1)]
+    );
+    assert_eq!(
+        rows::<String>(
+            &path,
+            "SELECT kind FROM events WHERE kind LIKE 'team.binding_%' ORDER BY seq"
+        )?,
+        vec![
+            vec!["team.binding_refused".to_owned()],
+            vec!["team.binding_pending".to_owned()],
+            vec!["team.binding_applied".to_owned()]
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_refusal_holds_for_its_revision_only() -> R {
+    // M2T07R-150 (ADR-022 decision 8 third version): a later revision is judged afresh, whatever the earlier one's
+    // verdict: pending until its own checkpoint, then applied if its agent is there.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    store
+        .submit_command(start("R1", Config::default().budget))
+        .await?;
+    store
+        .submit_command(team_change(
+            "dev",
+            0,
+            json!({"developer": {"agent": "codex"}}),
+        ))
+        .await?;
+    let codex: std::collections::BTreeSet<String> = ["codex".to_owned()].into();
+    store.team_checkpoint("R1", codex.clone()).await?;
+    store
+        .submit_command(team_change("pi", 1, json!({"developer": {"agent": "pi"}})))
+        .await?;
+    assert_eq!(
+        shown_developer(&path)?,
+        json!(["claude", 1, {"agent": "pi", "model": null, "config_revision": 2, "refused": null}])
+    );
+    store.team_checkpoint("R1", codex).await?;
+    assert_eq!(
+        binding(&path, "developer")?[0..4],
+        [json!("pi"), Value::Null, json!(2), json!(2)]
     );
     Ok(())
 }

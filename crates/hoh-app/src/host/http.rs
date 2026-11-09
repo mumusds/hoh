@@ -229,6 +229,23 @@ fn team_refused(key_path: &str, message: &str, current_revision: Option<i64>) ->
     (StatusCode::BAD_REQUEST, axum::Json(body)).into_response()
 }
 
+/// The key path of a ConfigureTeam's schema violation that is the team's (ADR-022 decision 5): one inside the payload
+/// is its path there; one of the payload itself is the name of the member it misses, else `payload` (M2T07R-100).
+fn team_key_path(violation: &hoh_core::schema::Violation) -> Option<String> {
+    if let Some(inside) = violation.instance_path.strip_prefix("/payload/") {
+        return Some(inside.replace('/', "."));
+    }
+    if violation.instance_path != "/payload" {
+        return None;
+    }
+    let missing = violation
+        .schema_path
+        .ends_with("/required")
+        .then(|| violation.message.strip_prefix("missing required property "))
+        .flatten();
+    Some(missing.unwrap_or("payload").to_owned())
+}
+
 /// Anything else: an Error body too (M2T12R-03).
 async fn no_route() -> Response {
     error(
@@ -516,26 +533,17 @@ async fn submit_command(
     let command: Command = match protocol::decode(&value) {
         Ok(command) => command,
         // A team change that does not match the contract (apply_at other than checkpoint, a bindings member of
-        // another type): 400 INVALID_TEAM_CONFIG with the key path (REQ-018 failure mode 4, ADR-022 decision 5).
-        // Only a violation inside the payload is the team's; the envelope's stays BAD_REQUEST (M2T07R-58).
+        // another type, a payload missing apply_at): 400 INVALID_TEAM_CONFIG with the key path (REQ-018 failure mode 4,
+        // ADR-022 decision 5). A violation of the payload or inside it is the team's; the envelope's stays BAD_REQUEST
+        // (M2T07R-58, -100).
         Err(protocol::DecodeError::Schema(violations))
             if value["kind"] == "ConfigureTeam"
-                && violations
-                    .iter()
-                    .any(|v| v.instance_path.starts_with("/payload/")) =>
+                && violations.iter().any(|v| team_key_path(v).is_some()) =>
         {
-            let first = violations
+            let (key_path, message) = violations
                 .iter()
-                .find(|v| v.instance_path.starts_with("/payload/"));
-            let (key_path, message) = first.map_or_else(
-                || (String::new(), String::new()),
-                |v| {
-                    (
-                        v.instance_path["/payload/".len()..].replace('/', "."),
-                        v.message.clone(),
-                    )
-                },
-            );
+                .find_map(|v| team_key_path(v).map(|key_path| (key_path, v.message.clone())))
+                .unwrap_or_default();
             let revision = team_revision(&shared).await;
             return team_refused(&key_path, &message, revision);
         }

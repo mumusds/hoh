@@ -357,8 +357,34 @@ fn changes(
 /// Why a role a revision removed is BLOCKED (`$defs.BlockedReason`).
 const REMOVED: &str = "AGENT_UNAVAILABLE";
 
+/// The event kinds of a checkpoint's verdict on a changed role (decision 8, third version): the change is refused (its
+/// new agent unavailable: the old binding works on), or pending again (the agent is there: the role is held until its
+/// checkpoint).
+const REFUSED: &str = "team.binding_refused";
+const PENDING_AGAIN: &str = "team.binding_pending";
+
+/// How many verdicts the checkpoints wrote on run `run_id`'s change of `role` at `revision`, and whether the last one
+/// refuses it.
+fn verdicts(
+    conn: &Connection,
+    run_id: &str,
+    role: &str,
+    revision: i64,
+) -> Result<(i64, bool), PersistError> {
+    conn.query_row(
+        "SELECT count(*), coalesce(max(CASE WHEN kind = ?4 THEN seq END), 0) > \
+         coalesce(max(CASE WHEN kind = ?5 THEN seq END), 0) FROM events \
+         WHERE run_id = ?1 AND kind IN (?4, ?5) AND json_extract(payload_json, '$.role') = ?2 \
+         AND json_extract(payload_json, '$.config_revision') = ?3",
+        params![run_id, role, revision, REFUSED, PENDING_AGAIN],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .map_err(sqlite_error)
+}
+
 /// Whether run `run_id`'s binding of `role` waits for its checkpoint (decision 8): the project's current revision
-/// changes it. Such a role is not dispatched, so no attempt is leased under the binding being replaced.
+/// changes it and that change is not refused. Such a role is not dispatched, so no attempt is leased under the binding
+/// being replaced; a refused change leaves the old binding working, so the role is never vacant (M2T07R-150).
 pub(super) fn pending(conn: &Connection, run_id: &str, role: &str) -> Result<bool, PersistError> {
     let project_id: Option<String> = conn
         .query_row(
@@ -377,19 +403,20 @@ pub(super) fn pending(conn: &Connection, run_id: &str, role: &str) -> Result<boo
     let Some((revision, wanted)) = latest(conn, &project_id)? else {
         return Ok(false);
     };
-    if binding.config_revision >= revision {
+    if binding.config_revision >= revision || !changes(conn, &project_id, &binding, &wanted)? {
         return Ok(false);
     }
-    changes(conn, &project_id, &binding, &wanted)
+    Ok(!verdicts(conn, run_id, role, revision)?.1)
 }
 
-/// Run `run_id`'s checkpoint (decision 8, second version), in one transaction. A role the project's current revision
-/// does not change moves to it as it is, live attempt or not. A changed role with an attempt PREPARED, STARTING or
-/// RUNNING waits; one with none takes its new binding at epoch+1 with no session yet (a removed role BLOCKED, a new role
-/// bound at epoch 1) and a team.binding_applied event, unless its new agent is among `unavailable` (the registry's,
-/// probed outside the writer): then the old binding and epoch stay and one team.binding_refused event is written for
-/// the role and revision (REQ-019 decision 2). Once every role is at the revision, so is the run. Whether anything
-/// changed.
+/// Run `run_id`'s checkpoint (decision 8, third version), in one transaction. A role the project's current revision
+/// does not change moves to it as it is, live attempt or not. A changed role whose new agent is among `unavailable` (the
+/// registry's, probed outside the writer) is refused: the old binding and epoch stay and keep being dispatched (REQ-019
+/// decision 2, M2T07R-150). Otherwise a changed role with an attempt PREPARED, STARTING or RUNNING waits, held from
+/// dispatch; one with none takes its new binding at epoch+1 with no session yet (a removed role BLOCKED, a new role
+/// bound at epoch 1) and a team.binding_applied event. A refused change is judged again at every checkpoint: each turn
+/// of the verdict (refused, or pending again once its agent is there) is one event. Once every role is at the
+/// revision, so is the run. Whether anything changed.
 pub(super) fn checkpoint(
     conn: &mut Connection,
     run_id: &str,
@@ -450,37 +477,46 @@ pub(super) fn checkpoint(
             .map_err(sqlite_error)?;
             continue;
         }
-        if live.contains(&binding.role) {
-            behind = true;
-            continue;
-        }
-        if let Some(role) = wanted.team.get(&binding.role)
+        let (written, refused) = verdicts(&tx, run_id, &binding.role, revision)?;
+        let verdict = |kind: &str, payload: serde_json::Value| super::writer::NewEvent {
+            project_id: project_id.clone(),
+            event_id: crate::ids::child_id(
+                run_id,
+                &format!("team-verdict/{}/{revision}/{}", binding.role, written + 1),
+            ),
+            run_id: Some(run_id.to_owned()),
+            kind: kind.to_owned(),
+            payload,
+        };
+        let target = wanted.team.get(&binding.role);
+        if let Some(role) = target
             && unavailable.contains(role.agent.as_str())
         {
             behind = true;
-            let event_id =
-                crate::ids::child_id(run_id, &format!("team-refused/{}/{revision}", binding.role));
-            let written: Option<i64> = tx
-                .query_row(
-                    "SELECT 1 FROM events WHERE event_id = ?1",
-                    params![event_id],
-                    |r| r.get(0),
-                )
-                .optional()
-                .map_err(sqlite_error)?;
-            if written.is_none() {
+            if !refused {
                 changed = true;
-                events.push(super::writer::NewEvent {
-                    project_id: project_id.clone(),
-                    event_id,
-                    run_id: Some(run_id.to_owned()),
-                    kind: "team.binding_refused".to_owned(),
-                    payload: serde_json::json!({
+                events.push(verdict(
+                    REFUSED,
+                    serde_json::json!({
                         "run_id": run_id, "role": binding.role, "config_revision": revision,
                         "agent": role.agent.as_str(), "reason": "AGENT_UNAVAILABLE",
                         "kept": {"agent": binding.agent, "model": binding.model, "role_epoch": binding.role_epoch},
                     }),
-                });
+                ));
+            }
+            continue;
+        }
+        if live.contains(&binding.role) {
+            behind = true;
+            if refused {
+                changed = true;
+                events.push(verdict(
+                    PENDING_AGAIN,
+                    serde_json::json!({
+                        "run_id": run_id, "role": binding.role, "config_revision": revision,
+                        "agent": target.map(|role| role.agent.as_str()),
+                    }),
+                ));
             }
             continue;
         }
@@ -574,7 +610,8 @@ pub struct TeamMember {
     pub state: String,
     pub blocked_reason: Option<String>,
     /// What the project's current revision changes for this role, applied at its next checkpoint (decision 8):
-    /// `{"agent", "model", "config_revision"}`, `agent` null when the role is removed.
+    /// `{"agent", "model", "config_revision", "refused"}`, `agent` null when the role is removed, `refused` the reason
+    /// while the change is refused (the old binding works on), else null.
     pub pending: Option<serde_json::Value>,
     /// The role was removed from the team (its row stays, BLOCKED, so an old epoch stays fenced): not an availability
     /// block.
@@ -663,10 +700,12 @@ pub(super) fn view(
         }
         let wanted = config.team.get(&member.role);
         if changes(conn, project_id, &binding, &config)? {
+            let refused = verdicts(conn, run_id, &member.role, team_revision)?.1;
             member.pending = Some(serde_json::json!({
                 "agent": wanted.map(|role| role.agent.as_str()),
                 "model": wanted.and_then(|role| role.model.clone()),
                 "config_revision": team_revision,
+                "refused": refused.then_some("AGENT_UNAVAILABLE"),
             }));
         }
     }
@@ -686,6 +725,7 @@ pub(super) fn view(
                     "agent": role.agent.as_str(),
                     "model": role.model,
                     "config_revision": team_revision,
+                    "refused": null,
                 })),
             });
         }
