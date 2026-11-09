@@ -317,6 +317,8 @@ async fn tick(
         ..context.clone()
     };
     for run in &waiting.runs {
+        // Its roles' team changes whose checkpoint has come (docs/adr/ADR-022.md decision 8), before any round.
+        store.team_checkpoint(run).await?;
         // The run as a whole first: woken when a retry is due, parked, blocked or stopped (ADR-020 decisions 4, 5, 7).
         store.pace_run(run, at()).await?;
         while store.schedule_round(run, at()).await?.dispatched.is_some() {}

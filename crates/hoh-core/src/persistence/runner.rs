@@ -75,6 +75,8 @@ pub(super) enum RunnerJob {
         context: Box<crate::decision::Context>,
     },
     Ack(String),
+    /// A run's team checkpoint (docs/adr/ADR-022.md decision 8).
+    Checkpoint(String),
     /// Renew the unexpired leases these attempts hold, at `now` (REQ-041: every 30 s, for 120 s).
     Renew(Vec<String>, std::time::SystemTime),
 }
@@ -131,6 +133,9 @@ pub(super) fn run(
         }
         RunnerJob::Repair(request) => {
             super::retry::request_repair(conn, &request, ctx).map(RunnerDone::Repair)
+        }
+        RunnerJob::Checkpoint(run_id) => {
+            super::team::checkpoint(conn, &run_id, ctx).map(RunnerDone::Applied)
         }
         RunnerJob::Pace { run_id, context } => {
             super::retry::pace(conn, &run_id, &context, ctx).map(RunnerDone::Paced)

@@ -819,6 +819,13 @@ impl Store {
         }
     }
 
+    /// Run `run_id`'s team checkpoint: the roles the project's current revision changes and that have no live attempt
+    /// take their new binding (docs/adr/ADR-022.md decision 8); whether anything changed.
+    pub async fn team_checkpoint(&self, run_id: &str) -> Result<bool, PersistError> {
+        self.runner_step(runner::RunnerJob::Checkpoint(run_id.to_owned()))
+            .await
+    }
+
     /// A runtime notice taken (ACKED); false when it was not PENDING.
     pub async fn ack_notice(&self, message_id: &str) -> Result<bool, PersistError> {
         self.runner_step(runner::RunnerJob::Ack(message_id.to_owned()))
