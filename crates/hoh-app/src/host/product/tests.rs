@@ -61,6 +61,58 @@ fn a_sessions_first_turn_is_sent_its_handover_package_after_the_contract_and_bef
 }
 
 #[test]
+fn a_first_input_found_in_place_is_taken_only_once_its_directory_is_synced()
+-> Result<(), Box<dyn std::error::Error>> {
+    // M2T17R-102: the link is made and the directory's sync fails, so the keep fails; the notice given again finds the
+    // same input in place, and is taken only once the directory's sync done on that call succeeds.
+    let project = tempfile::tempdir()?;
+    let mut start = SessionStart {
+        message_id: "R/session-start/developer/2".to_owned(),
+        run_id: "R".to_owned(),
+        role: "developer".to_owned(),
+        role_epoch: 2,
+        package: hoh_core::handoff::role_change(&hoh_core::handoff::RoleChange {
+            role: "developer".to_owned(),
+            run_id: "R".to_owned(),
+            goal: "g".to_owned(),
+            role_epoch: 2,
+            spec_sha256: format!("{:064}", 1),
+            spec_revision: 1,
+            candidate: None,
+            state: hoh_core::protocol::HandoffState {
+                applied_decision_ids: Vec::new(),
+                open_issue_ids: Vec::new(),
+                unacked_message_ids: Vec::new(),
+                queued_input_ids: Vec::new(),
+            },
+        }),
+        current_epoch: 2,
+        session_id: Some("R/session/developer/2".to_owned()),
+        agent: "codex".to_owned(),
+    };
+    let syncs = std::cell::Cell::new(0);
+    let failing = |_: &Path| -> std::io::Result<()> {
+        syncs.set(syncs.get() + 1);
+        Err(std::io::Error::other("EIO"))
+    };
+    assert!(keep_first_input_with(project.path(), &start, &failing).is_err());
+    assert!(first_input_path(project.path(), "R/session/developer/2").exists());
+    assert!(
+        keep_first_input_with(project.path(), &start, &failing).is_err(),
+        "taken although its directory is not synced"
+    );
+    let synced = |_: &Path| -> std::io::Result<()> {
+        syncs.set(syncs.get() + 1);
+        Ok(())
+    };
+    keep_first_input_with(project.path(), &start, &synced)?;
+    assert_eq!(syncs.get(), 3, "a sync on every call");
+    start.message_id = "R/another".to_owned();
+    assert!(keep_first_input_with(project.path(), &start, &synced).is_err());
+    Ok(())
+}
+
+#[test]
 fn a_kept_first_input_is_read_for_its_session_and_none_is_none()
 -> Result<(), Box<dyn std::error::Error>> {
     // Decision 4: the package kept for a session is its first turn's; a session given none (bound at its run's start)
