@@ -1098,6 +1098,61 @@ fn a_link_where_the_user_unit_directory_is_a_link_keeps_the_uninstall_from_remov
 }
 
 #[test]
+fn a_link_in_a_wants_directory_that_is_a_link_keeps_the_uninstall_from_removing_anything() -> R {
+    // Design correction 12 (M2T14R-950): default.target.wants itself a link to another directory; the link enabling
+    // the instance there is read (systemd follows such a directory), and with no manager it refuses.
+    an_uninstall_with_no_manager_refuses(
+        |root, template| {
+            let real = root.join("elsewhere-wants");
+            std::fs::create_dir_all(&real)?;
+            std::os::unix::fs::symlink(template, real.join("hoh-host@0123456789abcdef.service"))?;
+            let user = root.join("h/.config/systemd/user");
+            std::fs::create_dir_all(&user)?;
+            std::os::unix::fs::symlink(&real, user.join("default.target.wants"))?;
+            Ok(vec![])
+        },
+        "hoh-host@0123456789abcdef.service is enabled, and no user systemd manager answers to disable it",
+    )
+    .map(drop)
+}
+
+#[test]
+fn a_unit_directory_that_cannot_be_read_keeps_the_uninstall_from_removing_anything() -> R {
+    // Design correction 12: ~/.config/systemd/user itself unreadable (its parent searchable) cannot be listed; what
+    // cannot be listed may enable an instance: 69, nothing removed.
+    let stderr = an_uninstall_with_no_manager_refuses(
+        |root, template| {
+            let user = root.join("h/.config/systemd/user");
+            let wants = user.join("default.target.wants");
+            std::fs::create_dir_all(&wants)?;
+            std::os::unix::fs::symlink(template, wants.join("hoh-host@0123456789abcdef.service"))?;
+            std::fs::set_permissions(&user, std::fs::Permissions::from_mode(0o000))?;
+            Ok(vec![user])
+        },
+        "cannot list",
+    )?;
+    assert!(stderr.contains("could not be told"), "{stderr}");
+    Ok(())
+}
+
+#[test]
+fn a_template_that_cannot_be_told_keeps_the_uninstall_from_removing_anything() -> R {
+    // Design correction 12: what the uninstall removes is told before anything is; a template whose directory cannot
+    // be searched (~/.local/share/systemd mode 000) cannot be told: 69, nothing removed (else the template would be
+    // left, naming the removed installation, and the rest removed).
+    let stderr = an_uninstall_with_no_manager_refuses(
+        |root, _template| {
+            let systemd = root.join("h/.local/share/systemd");
+            std::fs::set_permissions(&systemd, std::fs::Permissions::from_mode(0o000))?;
+            Ok(vec![systemd])
+        },
+        "cannot tell whether",
+    )?;
+    assert!(stderr.contains("could not be told"), "{stderr}");
+    Ok(())
+}
+
+#[test]
 fn a_runtime_link_with_no_manager_keeps_the_uninstall_from_removing_anything() -> R {
     // Design correction 11 (M2T14R-803): a link in $XDG_RUNTIME_DIR/systemd/user (`enable --runtime`) enables the
     // instance as well; with no manager to disable it, it refuses.
