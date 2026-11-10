@@ -13,10 +13,11 @@
 #       instances' files). Projects' .hoh/, drop-ins, ~/.config/hoh and lingering are left as they are, and so is
 #       the installers' own lock $XDG_DATA_HOME/hoh.lock (an empty file, kept so that its lock is never on a removed one).
 #
-# Exit codes: 0 done; 1 ~/.local/bin/hoh is not this installation's; 64 usage; 69 the user's systemd manager cannot do
-# what was asked, something still runs this installation or its lock cannot be told (nothing removed), another
-# install.sh of it holds the installer's lock, or the installed binary does not run; 77 run as root; 78 a home or
-# project systemd cannot use.
+# Exit codes: 0 done; 1 ~/.local/bin/hoh is not this installation's; 64 usage, or a bundle without a runnable bin/hoh
+# that names its version; 69 the user's systemd manager cannot do what was asked, something still runs this
+# installation or its lock cannot be opened, locked or told (nothing removed), another install.sh of it holds the
+# installer's lock, that lock cannot be made, opened or locked, or the installed binary does not run; 77 run as root;
+# 78 a home or project systemd cannot use. An uninstall that finds nothing installed says so, writes nothing, exits 0.
 set -Eeuo pipefail
 
 say() { printf 'install.sh: %s\n' "$*" >&2; }
@@ -70,13 +71,17 @@ main() {
   override="$config/systemd/user/hoh-host@.service"
   user="${USER:-$(id -un)}"
   if ((uninstall)); then
-    # Nothing installed has no installer's lock either (its directory is the data directory).
-    [[ ! -d "$data" ]] || hold_operation
+    # Only an uninstall that finds nothing changes nothing; any other holds the installers' lock, and looks again
+    # under it, before it acts (design correction 8, M2T14R-500): none acts outside the turns installers take.
+    if ! installed; then
+      printf 'not installed\n'
+      return 0
+    fi
+    hold_operation
     remove
   else
     check_paths
     refusals "${projects[@]}"
-    mkdir -p -- "$data"
     hold_operation
     install "${projects[@]}"
   fi
@@ -87,21 +92,35 @@ main() {
 # another's half-done work. A file beside the installation's root that no uninstall removes (its lock is never on a
 # file that is gone), opened read-write (as an NFS client needs for an exclusive lock), which no run of hoh locks.
 hold_operation() {
-  local lock="$data/hoh.lock" said rc=0
+  local lock="$data/hoh.lock" said
+  said="$(mkdir -p -- "$data" 2>&1)" || fail 69 "cannot make $data for the installer's lock: $said"
   if ! { command exec 8<>"$lock"; } 2>/dev/null; then
     fail 69 "cannot open the installer's lock $lock"
   fi
   # Waiting 60 s on another holder is told from a lock that cannot be had at all (M2T14R-401).
-  said="$(flock -E 75 -w 60 -x 8 2>&1)" || rc=$?
-  case "$rc" in
+  take_lock -w 60 -x 8
+  case "$lock_rc" in
     0) ;;
     75) fail 69 "$lock stayed locked for 60 s (another install.sh of this installation runs): try again when it ends" ;;
-    *) fail 69 "cannot lock $lock (flock exit $rc: ${said:-no message})" ;;
+    *) fail 69 "cannot lock $lock (flock exit $lock_rc: ${lock_said:-no message})" ;;
   esac
 }
 
-# What refuses an install before it writes anything, even its lock (exit 1 or 69).
+# Lock with `flock "$@"` (its descriptor last). lock_rc is 0 when got, 75 when another holds it (flock's code for a
+# conflict, asked for with -E 75), anything else a failure to lock at all, with flock's own message in lock_said: a
+# failure is never said as another's hold (design correction 8; M2T14R-401, -453, -501).
+take_lock() {
+  lock_rc=0
+  lock_said="$(flock -E 75 "$@" 2>&1)" || lock_rc=$?
+}
+
+# Whether anything of this installation is there: its root, its template or its command link.
+installed() { [[ -e "$root" || -L "$root" || -e "$template" ]] || ours; }
+
+# What refuses an install before it writes anything, even its lock (exit 1, 64 or 69; design correction 8).
 refusals() {
+  src="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+  [[ -x "$src/bin/hoh" ]] || fail 64 "$src/bin/hoh is missing: run the install.sh of a release bundle"
   if [[ -e "$bin_link" || -L "$bin_link" ]] && ! ours; then
     fail 1 "$bin_link exists and is not this installation's link to $current/bin/hoh: nothing changed"
   fi
@@ -146,9 +165,7 @@ link() {
 }
 
 install() {
-  local src name semver sha changed=0
-  src="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-  [[ -x "$src/bin/hoh" ]] || fail 64 "$src/bin/hoh is missing: run the install.sh of a release bundle"
+  local name semver sha changed=0
   # An installed hoh (this script may be one's copy) runs only with its installation's lock: one missing from an
   # existing installation is made again before any of its binaries runs (M2T14R-352).
   [[ ! -d "$root" || -e "$root/.lock" ]] || : >"$root/.lock"
@@ -215,7 +232,7 @@ install() {
 
 remove() {
   local hosts="$root/hosts" file unit active failed=0
-  if [[ ! -e "$root" && ! -e "$template" ]] && ! ours; then
+  if ! installed; then
     printf 'not installed\n'
     return 0
   fi
@@ -262,10 +279,18 @@ remove() {
     # Read-write when it can be (an NFS client needs it for an exclusive lock, M2T14R-451), else read-only (a 0400 lock
     # is fine locally, M2T14R-351); a failed open is said, not taken for a running program (M2T14R-453).
     if { command exec 9<>"$root/.lock"; } 2>/dev/null || { command exec 9<"$root/.lock"; } 2>/dev/null; then
-      if ! flock -n -x 9; then
-        held=0
-        run_holds=1
-      fi
+      take_lock -n -x 9
+      case "$lock_rc" in
+        0) ;;
+        75)
+          held=0
+          run_holds=1
+          ;;
+        *)
+          say "cannot lock this installation's lock $root/.lock (flock exit $lock_rc: ${lock_said:-no message})"
+          held=0
+          ;;
+      esac
     else
       say "cannot open this installation's lock $root/.lock"
       held=0
