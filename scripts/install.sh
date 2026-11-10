@@ -15,7 +15,8 @@
 #
 # Exit codes: 0 done; 1 ~/.local/bin/hoh is not this installation's; 64 usage, or a bundle whose bin/hoh is missing,
 # does not run or names no version; 69 the user's systemd manager cannot do what was asked, something still runs this
-# installation or its lock cannot be opened, locked or told (nothing removed), another install.sh of it holds the
+# installation, its lock cannot be opened, locked or told, or what the removal rests on cannot be told (nothing removed:
+# design correction 11), another install.sh of it holds the
 # installer's lock, that lock cannot be made, opened or locked, or the installed binary does not run; 77 run as root;
 # 78 a home, root or project systemd cannot use; 74 a command failed that the installer has no word of its own for
 # (it is named, with its exit code and line). Refusals write nothing of the installation (those that run the bundle's
@@ -41,6 +42,17 @@ unexpected() {
   exit 74
 }
 trap 'unexpected "$?" "$LINENO" "$BASH_COMMAND"' ERR
+
+# End after hoh refused or failed: with its code when it is one of install.sh's own (64, 69, 78), else with `$1`, its
+# code named; never a code install.sh gives another meaning (design correction 11, M2T14R-851).
+refused_by() {
+  local otherwise=$1 rc=$2
+  shift 2
+  case "$rc" in
+    64 | 69 | 78) fail "$rc" "$*" ;;
+    *) fail "$otherwise" "$* (exit $rc)" ;;
+  esac
+}
 usage() {
   sed -n '5,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
   exit "${1:-64}"
@@ -71,7 +83,9 @@ main() {
     shift
   done
   if ((uninstall)) && ((linger || ${#projects[@]})); then usage; fi
-  if [[ "$(id -u)" == 0 ]]; then
+  local uid
+  uid="$(id -u)" || fail 69 "cannot tell which user runs this (id -u failed)"
+  if [[ "$uid" == 0 ]]; then
     fail 77 "refusing to run as root: HoH is installed for one user, in that user's home"
   fi
   [[ "${HOME:-}" == /* ]] || fail 78 "HOME is not an absolute path"
@@ -129,16 +143,31 @@ take_lock() {
 }
 
 # Whether anything of this installation is there: its root, its template or its command link (the installer never
-# makes the root a link: a dangling one is no installation, M2T14R-654).
-installed() { [[ -e "$root" || -e "$template" ]] || ours; }
+# makes the root a link: a dangling one is no installation, M2T14R-654). A command link that cannot be read may be
+# this installation's: it counts as there, and the uninstall then refuses under the lock (design correction 11).
+installed() {
+  [[ ! -e "$root" && ! -e "$template" ]] || return 0
+  local rc=0
+  link_state || rc=$?
+  ((rc != 1))
+}
 
 # What refuses an install before it writes anything, even its lock (exit 1, 64 or 69; design correction 8).
 refusals() {
-  src="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+  local self="${BASH_SOURCE[0]}" rc=0
+  [[ "$self" == */* ]] && self="${self%/*}" || self=.
+  src="$(cd -- "$self" && pwd -P)"
   [[ -x "$src/bin/hoh" ]] || fail 64 "$src/bin/hoh is missing: run the install.sh of a release bundle"
-  if [[ -e "$bin_link" || -L "$bin_link" ]] && ! ours; then
+  link_state || rc=$?
+  if ((rc == 2)); then
+    fail 69 "nothing changed: $bin_link cannot be read, so whose it is cannot be told"
+  elif ((rc == 1)) && [[ -e "$bin_link" || -L "$bin_link" ]]; then
     fail 1 "$bin_link exists and is not this installation's link to $current/bin/hoh: nothing changed"
   fi
+  local project
+  for project in "$@"; do
+    [[ -d "$project" ]] || fail 64 "--project $project is not a directory: nothing changed"
+  done
   if (($#)) && ! manager; then
     fail 69 "no user systemd manager answers (\$XDG_RUNTIME_DIR/systemd/private): cannot enable a project's host unit"
   fi
@@ -165,8 +194,18 @@ manager() { [[ -n "$runtime" && -S "$runtime/systemd/private" ]]; }
 
 lingers() { [[ -f "/var/lib/systemd/linger/$user" ]]; }
 
-# Whether ~/.local/bin/hoh is this installation's link.
-ours() { [[ -L "$bin_link" && "$(readlink -- "$bin_link")" == "$current/bin/hoh" ]]; }
+# Whose ~/.local/bin/hoh is: 0 this installation's link, 1 not (absent, not a link, or a link elsewhere), 2 cannot be
+# told (a link that cannot be read, said). What cannot be read is never taken for another's (design correction 11,
+# M2T14R-804).
+link_state() {
+  [[ -L "$bin_link" ]] || return 1
+  local target
+  if ! target="$(readlink -- "$bin_link")"; then
+    say "cannot read the link $bin_link"
+    return 2
+  fi
+  [[ "$target" == "$current/bin/hoh" ]]
+}
 
 # Fail with 78 when `$2` (named `$1`) holds one of the characters that follow: the unit cannot name it as written.
 refuse_chars() {
@@ -198,7 +237,7 @@ install() {
   [[ "$semver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail 64 "$src/bin/hoh --version does not name a version: $asked"
   real_root="$(readlink -m -- "$root" 2>&1)" || fail 78 "the installation's root $root cannot be resolved: $real_root"
   "$src/bin/hoh" __unit check "$HOME" "$root" "$real_root" ||
-    fail "$?" "nothing of the installation was written: the systemd unit cannot take this home or root (said above)"
+    refused_by 64 "$?" "nothing of the installation was written: $src/bin/hoh __unit check refused this home or root, or failed (said above)"
   sha="$(sha256sum -- "$src/bin/hoh" | cut -c1-12)"
   name="$semver-$sha"
   # A version directory is named by its binary and never changed once there: a host running from it, and the agents
@@ -221,10 +260,11 @@ install() {
   # The template, from the installed binary for this home; written (a new file renamed over it) only when it differs,
   # so an install of the same bundle touches nothing.
   local text old
-  text="$("$current/bin/hoh" __unit template && printf x)" || exit $?
+  text="$("$current/bin/hoh" __unit template && printf x)" ||
+    refused_by 69 "$?" "the installed $current/bin/hoh __unit template refused or does not run (said above); the installed files are kept"
   old="$({ [[ ! -f "$template" ]] || cat -- "$template"; } && printf x)"
   if [[ "$text" != "$old" ]]; then
-    mkdir -p -- "$(dirname -- "$template")"
+    mkdir -p -- "${template%/*}"
     printf '%s' "${text%x}" >"$template.tmp.$$"
     mv -T -- "$template.tmp.$$" "$template"
     changed=1
@@ -249,12 +289,15 @@ install() {
   local project
   for project in "$@"; do
     "$current/bin/hoh" __unit enable "$project" ||
-      fail "$?" "$project's instance was not enabled (said above); the installed files are kept"
+      refused_by 69 "$?" "$project's instance was not enabled (said above); the installed files are kept"
   done
   # The installed command must run: a failure here is the install's, not hidden by the message (M2T14R-301).
+  # Its words are made here, with no command whose failure printf would hide (design correction 11, M2T14R-805).
   local shown
+  local -a lines=()
   shown="$("$current/bin/hoh" --version)" || fail 69 "the installed $current/bin/hoh does not run"
-  printf 'installed %s in %s\n' "$(head -2 <<<"$shown" | tr '\n' ' ')" "$root/versions/$name"
+  mapfile -t lines <<<"$shown"
+  printf 'installed %s %s in %s\n' "${lines[0]-}" "${lines[1]-}" "$root/versions/$name"
   printf 'command: %s\n' "$bin_link"
   if lingers; then
     printf 'linger: yes\n'
@@ -263,80 +306,125 @@ install() {
   fi
 }
 
-# Every link in the user's unit configuration that names an instance, in any directory (.wants, .requires, or another
-# an [Install] setting makes): what enables an instance on disk (design correction 10, M2T14R-700).
-enablement_links() {
-  [[ -d "$config/systemd/user" ]] || return 0
-  find "$config/systemd/user" -mindepth 2 -type l -name 'hoh-host@?*.service' -print0
+# The names of the links that enable an instance on disk, in the user's unit configuration and, for this boot, its
+# runtime directory, in any directory there (.wants, .requires, or another an [Install] setting makes), following a
+# directory that is a link (design corrections 10 and 11; M2T14R-700, -802, -803). Into `enabling`; 1 when a directory
+# cannot be listed (said): what cannot be listed may enable an instance (M2T14R-801).
+enabling_links() {
+  local dir link
+  local -a found=()
+  enabling=()
+  for dir in "$config/systemd/user" ${runtime:+"$runtime/systemd/user"}; do
+    [[ -e "$dir" ]] || continue
+    mapfile -d '' -t found < <(find -L "$dir" -mindepth 2 -name 'hoh-host@?*.service' -print0)
+    if ! wait "$!"; then
+      say "cannot list $dir, where a link may enable an instance"
+      return 1
+    fi
+    for link in "${found[@]}"; do
+      enabling+=("${link##*/}")
+    done
+  done
 }
 
-# The installation's instances, one per line: those with a file under the root, those a link enables, those the
-# manager has loaded.
+# The installation's instances, into `instances`: those with a file under the root, those a link enables, those the
+# manager has loaded; 1 when one of these cannot be listed (said).
 instance_units() {
-  local file unit
+  local file unit listed
   local -A seen=()
+  instances=()
+  if [[ -e "$hosts" && ! (-d "$hosts" && -r "$hosts" && -x "$hosts") ]]; then
+    say "cannot list $hosts, the instances' files"
+    return 1
+  fi
   for file in "$hosts"/*.env; do
     [[ -e "$file" ]] || continue
-    unit="$(basename -- "$file")"
+    unit="${file##*/}"
     seen["hoh-host@${unit%.env}.service"]=1
   done
-  while IFS= read -r -d '' file; do
-    seen["$(basename -- "$file")"]=1
-  done < <(enablement_links)
+  enabling_links || return 1
+  for unit in "${enabling[@]}"; do
+    seen["$unit"]=1
+  done
+  if ! listed="$(systemctl --user list-units --all --plain --no-legend 'hoh-host@*.service')"; then
+    say "the user's systemd manager did not list its hoh-host@ instances"
+    return 1
+  fi
   while read -r unit _; do
     [[ "$unit" != hoh-host@*.service ]] || seen["$unit"]=1
-  done < <(systemctl --user list-units --all --plain --no-legend 'hoh-host@*.service' 2>/dev/null || true)
-  [[ ${#seen[@]} == 0 ]] || printf '%s\n' "${!seen[@]}"
+  done <<<"$listed"
+  instances=("${!seen[@]}")
+}
+
+# The manager's word on whether `unit` is enabled, into `enabled`: 0 enabled, 1 not (a state that enables nothing), 2
+# no word to tell by (no answer, or one that is neither; design correction 11, M2T14R-800).
+enablement_of() {
+  enabled="$(systemctl --user is-enabled "$1" 2>/dev/null)" || true
+  case "$enabled" in
+    enabled | enabled-runtime) return 0 ;;
+    disabled | static | indirect | generated | transient | masked | masked-runtime | not-found) return 1 ;;
+    *) return 2 ;;
+  esac
 }
 
 # Stop and disable the installation's instances, each checked with the manager: inactive or failed, and not enabled by
-# whatever link (`is-enabled`, design corrections 1, 9 and 10); 1 when one is left. `first` stops and disables each;
-# `final`, under both locks, acts on one still enabled, which a run enabled again after the first pass. With no
-# manager to ask or disable with, an instance a link still enables refuses the uninstall (M2T14R-151, -700).
+# whatever link (`is-enabled`, design corrections 1, 9, 10 and 11); 1 when one is left, 2 when they cannot be listed
+# (said). `first`
+# stops and disables each; `final`, under both locks, acts on any the manager does not say is not enabled, which a run
+# enabled again after the first pass. With no manager to ask or disable with, an instance a link enables refuses the
+# uninstall (M2T14R-151, -700), and so does a directory that cannot be listed.
 settle_instances() {
-  local pass=$1 unit active enabled link left=0
+  local pass=$1 unit active enabled state left=0
   if ! manager; then
-    while IFS= read -r -d '' link; do
-      say "$(basename -- "$link") is enabled, and no user systemd manager answers to disable it"
+    enabling_links || return 2
+    for unit in "${enabling[@]}"; do
+      say "$unit is enabled, and no user systemd manager answers to disable it"
       left=1
-    done < <(enablement_links)
+    done
     return "$left"
   fi
-  while read -r unit; do
-    [[ -n "$unit" ]] || continue
+  instance_units || return 2
+  for unit in "${instances[@]}"; do
     if [[ "$pass" == final ]]; then
-      enabled="$(systemctl --user is-enabled "$unit" 2>/dev/null || true)"
-      [[ "$enabled" == enabled* ]] || continue
+      state=0
+      enablement_of "$unit" || state=$?
+      ((state != 1)) || continue
     fi
-    active="" enabled=""
+    active="" state=2
     if systemctl --user disable --now --quiet "$unit"; then
-      active="$(systemctl --user show -p ActiveState --value "$unit" 2>/dev/null || true)"
-      enabled="$(systemctl --user is-enabled "$unit" 2>/dev/null || true)"
+      active="$(systemctl --user show -p ActiveState --value "$unit" 2>/dev/null)" || active=""
+      state=0
+      enablement_of "$unit" || state=$?
     fi
-    if [[ ("$active" == inactive || "$active" == failed) && -n "$enabled" && "$enabled" != enabled* ]]; then
+    if [[ "$active" == inactive || "$active" == failed ]] && ((state == 1)); then
       if [[ "$pass" == first ]]; then
         printf 'stopped and disabled %s\n' "$unit"
       else
         printf 'disabled %s: it was enabled again while the uninstall ran\n' "$unit"
       fi
     else
-      say "could not stop and disable $unit (ActiveState=${active:-unknown}, is-enabled ${enabled:-unknown})"
+      say "could not stop and disable $unit (ActiveState=${active:-unknown}, is-enabled ${enabled:-no answer})"
       left=1
     fi
-  done < <(instance_units)
+  done
   [[ "$pass" != first ]] || systemctl --user reset-failed 'hoh-host@*.service' 2>/dev/null || true
   return "$left"
 }
 
 remove() {
-  local hosts="$root/hosts" failed=0
+  local hosts="$root/hosts" failed=0 unsure=0 link=0 settled=0
   if ! installed; then
     printf 'not installed\n'
     return 0
   fi
+  # Whose the command link is, told once under the lock; one that cannot be read refuses (M2T14R-804).
+  link_state || link=$?
+  ((link != 2)) || unsure=1
   # Only what this installer wrote is removed, all of it under its own root or at its fixed places; never a path
   # taken from the manager's configuration (docs/adr/ADR-023.md design correction 1, M2T14R-01).
-  settle_instances first || failed=1
+  settle_instances first || settled=$?
+  ((settled != 1)) || failed=1
+  ((settled != 2)) || unsure=1
   # The installation's own lock, exclusive (design correction 2, M2T14R-100): every run of an installed hoh holds it
   # shared for its life, so it is had only once none runs, and while it is held none can start; what follows is
   # removed under it.
@@ -398,12 +486,19 @@ remove() {
   # Under both locks no run can start, so none can enable an instance any more: one enabled again since the first
   # pass (an `__unit enable` that ended before the run lock was had) is disabled now, and what is seen now stays so
   # (design correction 9, M2T14R-600).
-  if ((held && !running && !failed)); then
-    settle_instances final || failed=1
+  if ((held && !running && !failed && !unsure)); then
+    settled=0
+    settle_instances final || settled=$?
+    ((settled != 1)) || failed=1
+    ((settled != 2)) || unsure=1
   fi
-  # The closing word follows the cause: something runs or stays enabled, or only the lock was not had (M2T14R-652).
+  # The closing word follows the cause: something runs or stays enabled, something could not be told (design correction
+  # 11), or only the lock was not had (M2T14R-652).
   if ((failed || running || run_holds)); then
     fail 69 "nothing was removed: stop what is named above, then run install.sh --uninstall again"
+  fi
+  if ((unsure)); then
+    fail 69 "nothing was removed: what is said above could not be told; run install.sh --uninstall again once it can be"
   fi
   if ((!held)); then
     fail 69 "nothing was removed: this installation's lock could not be had or told (said above); run install.sh --uninstall again once it can be"
@@ -415,7 +510,7 @@ remove() {
   fi
   if manager; then systemctl --user daemon-reload || say "systemctl --user daemon-reload failed"; fi
   [[ -z "$runtime" ]] || rm -f -- "$runtime"/hoh-host@*.stderr
-  if ours; then
+  if ((link == 0)); then
     rm -f -- "$bin_link"
     printf 'removed %s\n' "$bin_link"
   elif [[ -e "$bin_link" || -L "$bin_link" ]]; then
