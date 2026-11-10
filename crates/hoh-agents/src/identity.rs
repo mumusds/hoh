@@ -224,10 +224,14 @@ fn group_left_in(proc: &std::path::Path, pgid: u32, leader: u32) -> io::Result<V
             }
             Err(e) => return Err(e),
         };
-        // Fields after the parenthesised command name: state, ppid, pgrp. What was read goes into the error, escaped
-        // and bounded: such a failure was seen and not reproduced (M2T07R-1100).
+        // Fields after the parenthesised command name: state, ppid, pgrp, a pid_t. The kernel prints -1 for a process
+        // being released (do_task_stat keeps its initial -1 when lock_task_sighand fails, and __exit_signal took the
+        // process out of its group before it cleared its signal handlers) and 0 for a group outside this pid
+        // namespace: neither is group `pgid` (M2T07R-1100, seen as "X 0 -1 -1"). Anything else that is no pid_t
+        // the kernel prints is an error, carrying what was read, escaped and bounded.
         let group = after_command_name(&stat)
-            .and_then(|rest| rest.split_whitespace().nth(2)?.parse::<u32>().ok())
+            .and_then(|rest| rest.split_whitespace().nth(2)?.parse::<i32>().ok())
+            .filter(|&group| group >= -1)
             .ok_or_else(|| {
                 io::Error::other(format!(
                     "{} has no process group (read {} bytes: {:?})",
@@ -236,7 +240,7 @@ fn group_left_in(proc: &std::path::Path, pgid: u32, leader: u32) -> io::Result<V
                     String::from_utf8_lossy(&stat[..stat.len().min(512)])
                 ))
             })?;
-        if group == pgid && pid != leader {
+        if i64::from(group) == i64::from(pgid) && pid != leader {
             left.push(pid);
         }
     }
@@ -1153,6 +1157,34 @@ mod tests {
             .expect_err("unparsable")
             .to_string();
         assert!(text.len() < 1_000, "bounded: {} bytes", text.len());
+        Ok(())
+    }
+
+    #[test]
+    fn a_process_already_released_is_in_no_group() -> io::Result<()> {
+        // M2T07R-1100's cause: a process being released (state X, its signal handlers gone) shows pgrp -1, the
+        // kernel's value for a task whose group it has already left; a group outside this pid namespace shows 0.
+        // Neither is in the group scanned, and neither is an error. Seen: "306724 (sleep) X 0 -1 -1 ...".
+        let fake = tempfile::tempdir()?;
+        for (pid, stat) in [
+            ("306724", "306724 (sleep) X 0 -1 -1 0 -1 4210764 0 0"),
+            ("13", "13 (sh) Z 1 0 0 0"),
+            ("9", "9 (sh) S 1 7 7 0"),
+        ] {
+            std::fs::create_dir(fake.path().join(pid))?;
+            std::fs::write(fake.path().join(pid).join("stat"), stat)?;
+        }
+        assert_eq!(group_left_in(fake.path(), 7, 7)?, [9]);
+        // Only the kernel's values are taken: a group below -1, or one past a pid_t, stays an error (M2T05R-200).
+        for stat in ["14 (sh) S 1 -2 -2 0", "14 (sh) S 1 4294967303 7 0"] {
+            let fake = tempfile::tempdir()?;
+            std::fs::create_dir(fake.path().join("14"))?;
+            std::fs::write(fake.path().join("14/stat"), stat)?;
+            let text = group_left_in(fake.path(), 7, 7)
+                .expect_err(stat)
+                .to_string();
+            assert!(text.contains("/14/stat has no process group"), "{text}");
+        }
         Ok(())
     }
 
