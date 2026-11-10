@@ -2,6 +2,10 @@
 //! rejected for its epoch (TEST-019-01) and the new Commander's dispatches of work already running or accepted are
 //! rejected by the state checks, nothing run twice (TEST-019-03).
 
+// No SQLite outside hoh-core::persistence (AC-062-05; see clippy.toml), and no unsafe code (no FFI way around it).
+#![forbid(clippy::disallowed_methods)]
+#![forbid(unsafe_code)]
+
 use hoh_core::config::Config;
 use hoh_core::decision::{Context, Proposal};
 use hoh_core::persistence::selftest::{self, ProbeCommand};
