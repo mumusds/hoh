@@ -631,21 +631,28 @@ fn a_home_the_unit_cannot_name_is_refused_before_any_installation_file_is_writte
 
 #[test]
 fn a_root_that_cannot_be_resolved_is_refused_with_78_before_anything_is_written() -> R {
-    // M2T14R-753 (design correction 10): an installation root that is a link to itself cannot be resolved, so the unit
-    // cannot name it: 78 with the reason, nothing written; before, `readlink -m` failing ended the install with 1 (the
-    // code of a foreign command link) and no word.
+    // M2T14R-753 (design correction 10): an installation root that is a link to itself, or to nothing, cannot be
+    // resolved, so the unit cannot name it: 78 with the reason, nothing written, whether or not this coreutils'
+    // `readlink -m` fails on a loop (it does here, not on ubuntu-24.04). Before, `readlink -m` failing ended the
+    // install with 1 (the code of a foreign command link) and no word.
     let install = Install::new()?;
     std::fs::create_dir_all(install.data())?;
-    std::os::unix::fs::symlink("hoh", install.data().join("hoh"))?;
-    let before = tree(&install.home())?;
-    let out = install.run("bundle", &[])?;
-    assert_eq!(out.status.code(), Some(78), "{}", text(&out));
-    assert!(
-        String::from_utf8(out.stderr.clone())?.contains("cannot be resolved"),
-        "{}",
-        text(&out)
-    );
-    assert_eq!(tree(&install.home())?, before);
+    for target in ["hoh", "nowhere"] {
+        let root = install.data().join("hoh");
+        if root.is_symlink() {
+            std::fs::remove_file(&root)?;
+        }
+        std::os::unix::fs::symlink(target, &root)?;
+        let before = tree(&install.home())?;
+        let out = install.run("bundle", &[])?;
+        assert_eq!(out.status.code(), Some(78), "{target}: {}", text(&out));
+        assert!(
+            String::from_utf8(out.stderr.clone())?.contains("cannot be resolved"),
+            "{target}: {}",
+            text(&out)
+        );
+        assert_eq!(tree(&install.home())?, before, "{target}");
+    }
     Ok(())
 }
 
@@ -973,6 +980,25 @@ fn a_manager_that_fails_during_the_install_is_said_and_ends_it_with_69() -> R {
         assert!(stderr.contains("exit 23"), "{stderr}");
         assert!(stderr.contains("manager-error"), "{stderr}");
     }
+    Ok(())
+}
+
+#[test]
+fn an_unexpected_failure_inside_a_command_substitution_is_said_once_with_its_own_code() -> R {
+    // Design correction 10: the ERR trap speaks only in the installer's own shell. A command failing inside a command
+    // substitution the installer does not handle (a stand-in sha256sum) ends that subshell with its own code, and the
+    // installer then says the assignment failed with that code, once, and ends with 74.
+    let install = Install::new()?;
+    script(
+        &install.stubs().join("sha256sum"),
+        "#!/bin/sh\necho 'sha256sum: read error' >&2\nexit 1\n",
+    )?;
+    let out = install.run("bundle", &[])?;
+    assert_eq!(out.status.code(), Some(74), "{}", text(&out));
+    let stderr = String::from_utf8(out.stderr.clone())?;
+    assert_eq!(stderr.matches("failed unexpectedly").count(), 1, "{stderr}");
+    assert!(stderr.contains("sha256sum"), "{stderr}");
+    assert!(stderr.contains("failed unexpectedly (exit 1,"), "{stderr}");
     Ok(())
 }
 
