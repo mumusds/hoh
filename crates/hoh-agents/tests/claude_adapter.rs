@@ -1285,11 +1285,29 @@ async fn claude_runner_mode_cancel_is_one_sigint_and_nothing_after_it() -> R {
     // the leader, with no SIGTERM or SIGKILL of its own after it.
     let world = World::new()?;
     let d = world.dir.path().join("stubborn");
+    // The stand-in blocks SIGINT and SIGTERM before it says it is ready and takes them with sigtimedwait, writing each
+    // with its sender: a blocked signal stays pending, so none can be lost in a gap of a shell's own handling (the
+    // bash stand-in this replaces lost one in CI, run 42775489697; ADR-022 decision 10, convention v2).
     let program = world.script(
         "stubborn",
         &format!(
-            "d='{}'\ntrap 'echo int >> \"$d/signals\"' INT\ntrap 'echo term >> \"$d/signals\"; exit 0' TERM\n\
-             cat > /dev/null\necho ready > \"$d/ready\"\nfor i in $(seq 100); do sleep 0.1; done\n",
+            "exec python3 -c '\
+import os, signal, sys, time
+d = sys.argv[1]
+signal.pthread_sigmask(signal.SIG_BLOCK, {{signal.SIGINT, signal.SIGTERM}})
+sys.stdin.read()
+open(os.path.join(d, \"ready\"), \"w\").write(\"ready\\n\")
+end = time.monotonic() + 10
+while end > time.monotonic():
+    info = signal.sigtimedwait({{signal.SIGINT, signal.SIGTERM}}, end - time.monotonic())
+    if info is None:
+        break
+    name = \"int\" if info.si_signo == signal.SIGINT else \"term\"
+    with open(os.path.join(d, \"signals\"), \"a\") as f:
+        f.write(name + \" \" + str(info.si_pid) + \"\\n\")
+    if info.si_signo == signal.SIGTERM:
+        sys.exit(0)
+' '{}'",
             d.display()
         ),
     )?;
@@ -1303,16 +1321,35 @@ async fn claude_runner_mode_cancel_is_one_sigint_and_nothing_after_it() -> R {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     held.cancel.notify_one();
-    // Longer than the turn's own graces (1 s and 1 s): nothing but the SIGINT came.
-    tokio::time::sleep(Duration::from_millis(3000)).await;
-    let signals = std::fs::read_to_string(d.join("signals")).unwrap_or_default();
+    let cancelled = Instant::now();
+    // The SIGINT's record, awaited within a bound (convention v2): how soon it comes is not the subject.
+    let signals = d.join("signals");
+    let end = Instant::now() + Duration::from_secs(10);
+    while std::fs::read_to_string(&signals).map_or(true, |s| s.is_empty()) {
+        if Instant::now() > end {
+            let status =
+                std::fs::read_to_string(format!("/proc/{}/status", held.pid)).unwrap_or_default();
+            return Err(format!(
+                "no signal recorded 10 s after the cancel; the agent's status:\n{status}"
+            )
+            .into());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Longer than the turn's own graces (1 s and 1 s) from the cancel: nothing but the SIGINT came.
+    tokio::time::sleep_until((cancelled + Duration::from_millis(3000)).into()).await;
+    let signals = std::fs::read_to_string(&signals)?;
     let alive = !held.ended.is_finished();
     let _ = rustix::process::kill_process_group(
         rustix::process::Pid::from_raw(held.pid as i32).ok_or("pid")?,
         rustix::process::Signal::KILL,
     );
     let facts = tokio::time::timeout(Duration::from_secs(20), held.ended).await??;
-    assert_eq!(signals, "int\n", "{facts:?}");
+    assert_eq!(
+        signals,
+        format!("int {}\n", std::process::id()),
+        "{facts:?}"
+    );
     assert!(alive, "the adapter ended the turn itself");
     assert_ne!(facts.state, AttemptState::Settled);
     Ok(())
