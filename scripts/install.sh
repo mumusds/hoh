@@ -16,12 +16,12 @@
 # Exit codes: 0 done; 1 ~/.local/bin/hoh is not this installation's; 64 usage, or a bundle whose bin/hoh is missing,
 # does not run or names no version; 69 the user's systemd manager cannot do what was asked, something still runs this
 # installation, its lock cannot be opened, locked or told, or what the removal rests on cannot be told (nothing removed:
-# design corrections 11 to 14), an uninstall's daemon-reload fails once the template is removed (the rest removed and
+# design corrections 11 to 17), an uninstall's daemon-reload fails once the template is removed (the rest removed and
 # each removal said, design correction 14), ~/.local/bin/hoh cannot be read or told, `id -u` fails, another install.sh
 # of it holds the installer's lock, that lock cannot be made, opened or locked, or the installed binary does not run; 77
 # run as root; 78 a home, root or project systemd cannot use; 74 the emptied root cannot be removed (said with rmdir's
-# words, the rest removed), or a command failed that the installer has no word of its own for (it is named, with its
-# exit code and line). Refusals write nothing of the installation (those that run the
+# words, the rest removed; so too when the reload failed as well), or a command failed that the installer has no word of
+# its own for (it is named, with its exit code and line). Refusals write nothing of the installation (those that run the
 # bundle's binary leave the installers' lock file, and a run lock just remade). An uninstall that finds nothing
 # installed says so and writes nothing.
 set -Eeuo pipefail
@@ -528,7 +528,9 @@ settle_instances() {
       stopped_of "$unit" || stopped=$?
       ((state != 1 || stopped != 0)) || continue
       # What is said is what was seen (M2T14R-1352).
-      if ((state == 0)); then
+      if ((state == 0 && stopped == 1)); then
+        again=both
+      elif ((state == 0)); then
         again=enabled
       elif ((stopped == 1)); then
         again=started
@@ -547,6 +549,8 @@ settle_instances() {
     if ((disabled && stopped == 0 && state == 1)); then
       if [[ "$pass" == first ]]; then
         printf 'stopped and disabled %s\n' "$unit"
+      elif [[ "$again" == both ]]; then
+        printf 'disabled and stopped %s: it was enabled and started again while the uninstall ran\n' "$unit"
       elif [[ "$again" == enabled ]]; then
         printf 'disabled %s: it was enabled again while the uninstall ran\n' "$unit"
       elif [[ "$again" == started ]]; then
@@ -571,16 +575,20 @@ settle_instances() {
   return 0
 }
 
-# Whether the kernel's reason a program's path could not be read (`readlink -v` in the C locale, its last words) makes
-# the process nothing the scan has to tell (design correction 16; M2T14R-1201, -1350, -1351): "No such file or
-# directory", it has no address space (gone, a zombie, one exiting, a kernel thread), so it runs no program; "Permission
-# denied" or "Operation not permitted", the kernel denies this user a look (another user's, under /proc's hidepid too;
-# one made undumpable; one with credentials beyond a plain process of this user, such as the user's own systemd
-# manager), which no run of this installation is, its binary carrying no capability. The run lock covers any run once
-# it holds it. Any other reason cannot be told.
+# Whether the kernel's reason a program's path could not be read (`readlink -v`, read in English, its last words)
+# makes the process nothing the scan has to tell (design corrections 16 and 17; M2T14R-1201, -1350, -1351, -1451,
+# -1454). "No such file or directory": the task has no address space, or its thread-group leader has (the process is
+# gone, a zombie, exiting, or a group whose main thread ended while others run, which a run of this installation never
+# is: it ends with its main thread); "No such process": it was reaped while being looked at; "Permission denied" or
+# "Operation not permitted": the kernel denies this user a look (another user's, under /proc's hidepid too; one made
+# undumpable; one with other credentials, such as the user's own systemd manager with its capability, or a run started
+# under another group). A run the scan so cannot see refuses for itself once it takes the run lock, which the uninstall
+# holds; the scan only covers a run between its exec and that lock. Any other reason cannot be told.
 nothing_to_tell() {
   case "$1" in
-    *": No such file or directory" | *": Permission denied" | *": Operation not permitted") return 0 ;;
+    *": No such file or directory" | *": No such process" | *": Permission denied" | *": Operation not permitted")
+      return 0
+      ;;
   esac
   return 1
 }
@@ -681,8 +689,9 @@ remove() {
     real="$root"
   fi
   for proc in /proc/[0-9]*; do
-    # Its program's path, or the kernel's reason it cannot be read (one look, its words in the C locale).
-    if exe="$(LC_ALL=C readlink -v -- "$proc/exe" 2>&1)"; then
+    # Its program's path, or the kernel's reason it cannot be read (one look, its words in English: uutils chooses its
+    # language by LANG, not LC_ALL, and gettext by LANGUAGE; design correction 17, M2T14R-1450).
+    if exe="$(env -u LANGUAGE LANG=C LC_ALL=C readlink -v -- "$proc/exe" 2>&1)"; then
       if [[ "$exe" == "$real"/* || "$exe" == "$root"/* ]]; then
         say "still running from $root: pid ${proc#/proc/}: $(tr '\0' ' ' <"$proc/cmdline" 2>/dev/null || true)"
         running=1
