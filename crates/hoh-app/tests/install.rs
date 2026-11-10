@@ -864,7 +864,8 @@ fn the_uninstall_says_what_it_removed_and_keeps_a_root_holding_other_files() -> 
 fn an_enabled_instance_with_no_user_manager_to_disable_it_keeps_the_uninstall_from_removing_anything()
 -> R {
     // M2T14R-151: with no manager answering, an enabled instance cannot be disabled; removing the template would leave
-    // it naming nothing, so the uninstall removes nothing (69).
+    // it naming nothing, so the uninstall removes nothing (69). Its reason is the first pass's, not the final pass's
+    // "enabled again" (design correction 9), which would refuse it too.
     let install = Install::new()?;
     let out = install.run("bundle", &[])?;
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
@@ -877,11 +878,14 @@ fn an_enabled_instance_with_no_user_manager_to_disable_it_keeps_the_uninstall_fr
     let before = tree(&install.home())?;
     let out = install.run("bundle", &["--uninstall"])?;
     assert_eq!(out.status.code(), Some(69), "{}", text(&out));
+    let stderr = String::from_utf8(out.stderr.clone())?;
     assert!(
-        String::from_utf8(out.stderr.clone())?.contains("is enabled"),
-        "{}",
-        text(&out)
+        stderr.contains(
+            "hoh-host@0123456789abcdef.service is enabled, and no user systemd manager answers to disable it"
+        ),
+        "{stderr}"
     );
+    assert!(!stderr.contains("enabled again"), "{stderr}");
     assert_eq!(tree(&install.home())?, before);
     Ok(())
 }
