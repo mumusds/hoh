@@ -352,6 +352,15 @@ impl Drop for Leaders {
 
 /// A project with a host database (made by a first start) and the world seeded; the host started with `agents`.
 async fn host(dir: &Path, agents: &Arc<Agents>) -> R<(PathBuf, Host)> {
+    host_with(dir, agents, None).await
+}
+
+/// [`host`] whose clock is `clock` (the product's when none).
+async fn host_with(
+    dir: &Path,
+    agents: &Arc<Agents>,
+    clock: Option<Arc<TestClock>>,
+) -> R<(PathBuf, Host)> {
     let project = dir.join("p");
     std::fs::create_dir_all(&project)?;
     Host::start(config(&project)).await?.shutdown().await;
@@ -361,7 +370,37 @@ async fn host(dir: &Path, agents: &Arc<Agents>) -> R<(PathBuf, Host)> {
         executor: agents.clone(),
         context: context(),
     });
+    if let Some(clock) = clock {
+        config.clock = hoh_app::host::HostClock(clock);
+    }
     Ok((project.clone(), start_when_free(config).await?))
+}
+
+/// A host clock the test moves (CR-006 F2: a clock test code injects; the product uses the system's): the cancel's
+/// steps (its native interrupt at once, SIGTERM a grace later, SIGKILL another later) are taken when this clock passes
+/// them, so a test can have its scenario established before the step that could end it (ADR-022 decision 10, v2;
+/// CIR-602). It stands still between moves.
+#[derive(Debug)]
+struct TestClock(std::sync::Mutex<std::time::SystemTime>);
+
+impl TestClock {
+    fn new() -> TestClock {
+        TestClock(std::sync::Mutex::new(std::time::SystemTime::now()))
+    }
+
+    fn advance(&self, by: Duration) {
+        if let Ok(mut now) = self.0.lock() {
+            *now += by;
+        }
+    }
+}
+
+impl hoh_core::delivery::Clock for TestClock {
+    fn now(&self) -> std::time::SystemTime {
+        self.0
+            .lock()
+            .map_or_else(|_| std::time::SystemTime::now(), |now| *now)
+    }
 }
 
 fn seq(project: &Path, sql: &str) -> R<i64> {
@@ -761,11 +800,13 @@ impl Drop for Marked {
     }
 }
 
-/// A writer for `file`: `/usr/bin/python3 <script> <file> <mark>`. It first writes `established <pid> <sid>` to its
-/// mark ([`established_mark`]), one write, and only then unblocks SIGTERM, which every process of its creation holds
-/// blocked when the leader stand-in ([`leader`]) started it: the product's SIGTERM, sent before or after, ends it only
-/// once its evidence is written (ADR-022 decision 10, v2: the evidence of a scenario comes from the scenario itself,
-/// at a point the product under test cannot pre-empt; CIR-500). Then it appends to `file` every 50 ms for 120 s by the
+/// A writer for `file`: `/usr/bin/python3 <script> <file> <mark>`. It first writes `established <pid> <sid> <ms>
+/// <handled|ignored>` to its mark ([`established_mark`]), one write, and only then unblocks SIGTERM, which the
+/// processes of its creation hold blocked when the leader stand-in ([`leader`]) made it (W's writer inherits SIGTERM
+/// ignored instead, as do the writers the shell helpers below start with `trap ''`): the product's SIGTERM,
+/// sent before or after, reaches it only once its evidence is written. Unless it inherited SIGTERM ignored, it records
+/// the SIGTERM it gets (`term <ms>`, by the wall clock, as `<ms>` above) and exits: when and whether the product
+/// signalled it is its own record, not a file's time (CIR-601). Then it appends to `file` every 50 ms for 120 s by the
 /// clock (longer than any wait of these tests, so only a signal ends it in time) and starts no process of its own (a
 /// signal to a child must not hasten its end). No quote, no `$`: it is put inside other scripts' quotes.
 fn writer(file: &Path) -> R<String> {
@@ -776,11 +817,25 @@ fn writer(file: &Path) -> R<String> {
     let script = file.with_extension("py");
     std::fs::write(
         &script,
-        "import os, signal, sys, time\n\
-         with open(sys.argv[2], 'a') as f:\n    f.write('established %d %d\\n' % (os.getpid(), os.getsid(0)))\n\
-         signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})\n\
-         end = time.monotonic() + 120\nwhile time.monotonic() < end:\n    \
-         with open(sys.argv[1], 'a') as f:\n        f.write('x\\n')\n    time.sleep(0.05)\n",
+        r#"import os, signal, sys, time
+target, mark = sys.argv[1:3]
+ignored = signal.getsignal(signal.SIGTERM) == signal.SIG_IGN
+def on_term(*_):
+    with open(mark, 'a') as f:
+        f.write('term %d\n' % int(time.time() * 1000))
+    os._exit(0)
+if not ignored:
+    signal.signal(signal.SIGTERM, on_term)
+with open(mark, 'a') as f:
+    f.write('established %d %d %d %s\n' % (os.getpid(), os.getsid(0), int(time.time() * 1000),
+                                          'ignored' if ignored else 'handled'))
+signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
+end = time.monotonic() + 120
+while time.monotonic() < end:
+    with open(target, 'a') as f:
+        f.write('x\n')
+    time.sleep(0.05)
+"#,
     )?;
     Ok(format!(
         "/usr/bin/python3 {} {} {}",
@@ -836,9 +891,20 @@ fn leader(file: &Path, what: Leader, pid_file: Option<&Path>) -> R<String> {
         r#"import os, shlex, signal, sys, time
 what, ready, go, pid_file = sys.argv[1:5]
 writer = shlex.split(sys.argv[5])
+marker = sys.argv[6]
 signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+# A scenario whose processes have no marker: the leader drops its own first (an exec, the same process, the blocked
+# SIGTERM kept), so nothing it creates carries the marker for any instant, even before its own exec (CIR-600).
+if what in ('StartsUnmarkedOnGo', 'StartsPinnedW') and marker in os.environ:
+    env = {k: v for k, v in os.environ.items() if k != marker}
+    os.execve(sys.executable, [sys.executable] + sys.argv, env)
+def established():
+    mark = writer[-1]
+    while not (os.path.exists(mark) and 'established' in open(mark).read()):
+        time.sleep(0.02)
 # Every process of a creation is forked here and execs nothing but the writer (or W): the blocked SIGTERM is never
-# reset on the way, whatever the PATH holds (a shell resets it: dash does).
+# reset on the way, whatever the PATH holds (dash gives its foreground commands an empty mask: evidence
+# ci-reliability-r7-dash).
 def orphan():
     pid = os.fork()
     if pid == 0:
@@ -875,6 +941,9 @@ if what in ('OrphansOnTermThenWaits', 'OrphansOnTermThenExits'):
     signal.sigwait({signal.SIGTERM})
     orphan()
     if what == 'OrphansOnTermThenExits':
+        # Gone once the writer is: never before it, or the executor's group kill at the leader's end could end a
+        # creation not yet out of the group (CIR-602).
+        established()
         time.sleep(0.02)
         sys.exit(0)
     forever()
@@ -886,16 +955,19 @@ if what == 'StartsUnmarkedOnGo':
         os.setsid()
         os.execve(writer[0], writer, {})
     open(pid_file, 'w').write(str(pid))
+    # It dies at SIGTERM only once its writer is out of the group and established (CIR-602).
+    established()
 signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
 forever()
 "#,
     )?;
     Ok(format!(
-        "exec /usr/bin/python3 {} {what:?} {} {} {} '{writer}'",
+        "exec /usr/bin/python3 {} {what:?} {} {} {} '{writer}' {}",
         script.display(),
         ready_mark(file).display(),
         go_mark(file).display(),
         pid_file.map_or_else(|| "-".to_owned(), |p| p.display().to_string()),
+        hoh_app::host::ATTEMPT_ENV,
     ))
 }
 
@@ -926,20 +998,66 @@ impl hoh_app::host::HostHooks for UnreadableProc {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Created {
     BeforeTheCancel,
-    DuringTheCancel,
+    /// Told to go once the cancel is accepted, and established before the SIGTERM step (the leader lives until it).
+    OnceTheCancelIsAccepted,
+    /// Made at the SIGTERM step or after it (by the leader's trap, or once the leader is gone).
+    AtOrAfterTheSigterm,
 }
 
-/// Cancel R with T1 running `script` and check that the run is CANCELLED only once nothing of T1's attempt lives
-/// and that `file` no longer grows then; the project's directory. `script` marks its writer's creation ([`created`]).
+/// How long a scenario's processes overlap a living group before the SIGTERM step: the product finds a process that
+/// left the group by a scan of the group's parent chains, made every 100 ms while the group lives (RESCAN, host
+/// processes.rs; ADR-021 decision 8d), so what exists by then was looked at ten times. A bound of the product's scan
+/// period, stated, not a sleep measured against the cancel's steps (those come by the clock: CIR-650).
+const SCANS: Duration = Duration::from_secs(1);
+
+/// The lines of `file`'s writer record ([`established_mark`]): each kind with its numbers.
+fn records(file: &Path) -> Vec<(String, Vec<u64>)> {
+    std::fs::read_to_string(established_mark(file))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let mut words = l.split(' ');
+            let kind = words.next()?.to_owned();
+            Some((kind, words.filter_map(|w| w.parse().ok()).collect()))
+        })
+        .collect()
+}
+
+/// Wait (by the wall clock, at most 30 s) until `file`'s writer record has a `kind` line; else fail with `what`.
+async fn recorded(file: &Path, kind: &str, what: &str) -> R {
+    let end = Instant::now() + Duration::from_secs(30);
+    while !records(file).iter().any(|(k, _)| k == kind) {
+        if Instant::now() > end {
+            return Err(format!("{what}: {:?}", records(file)).into());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Ok(())
+}
+
+/// What a writer's own record says ([`writer`]): when it was established and, if it handles SIGTERM, when it got it
+/// (wall-clock milliseconds).
+#[derive(Debug, Clone, Copy)]
+struct WriterRecord {
+    established: u64,
+    term: Option<u64>,
+}
+
+/// Cancel R with T1 running `script` (a [`leader`] stand-in for `file`'s writer, which leaves its own record) and check that the run is CANCELLED
+/// only once nothing of T1's attempt lives, that the writer was established in a session of its own and, if it handles
+/// SIGTERM, got it before the SIGKILL step, and that `file` no longer grows then; the writer's record. The cancel's
+/// steps come by a [`TestClock`]: SIGTERM is taken, then the scenario is awaited (by the wall clock, the product held
+/// before its next step), then SIGKILL: no slow start can be pre-empted by a step (CIR-602).
 async fn cancel_with_a_writer_outside(
     dir: &Path,
     script: &str,
     file: &Path,
     when: Created,
-) -> R<PathBuf> {
+) -> R<WriterRecord> {
     let agents = Arc::new(Agents::new(&[("T1", script)]));
     let _leaders = Leaders(agents.leaders.clone());
-    let (project, host) = host(dir, &agents).await?;
+    let clock = Arc::new(TestClock::new());
+    let (project, host) = host_with(dir, &agents, Some(clock.clone())).await?;
     until(
         &project,
         "SELECT state FROM attempts WHERE task_id = 'T1'",
@@ -994,11 +1112,64 @@ async fn cancel_with_a_writer_outside(
         )
         .await;
     }
-    let asked = Instant::now();
     let (status, _) = command(&host, &control(&project, "CancelRun", "cancel")?).await?;
     assert_eq!(status, 202);
     // The scenarios that start their writer once the cancel is accepted are told so.
     std::fs::write(go_mark(file), b"")?;
+    let record = || records(file);
+    // The native interrupt is the pass's first step, taken at the clock's time (the executor records it); then the
+    // SIGTERM step, the clock past its grace. (A pass's events are written when it ends, so the steps are seen here
+    // by what they reach: the executor's record, and the scenario's own evidence below.)
+    let end = Instant::now() + Duration::from_secs(30);
+    while !agents
+        .native
+        .lock()
+        .is_ok_and(|n| n.iter().any(|a| a == "T1/attempt-1"))
+    {
+        assert!(Instant::now() < end, "the native interrupt was never sent");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    if when == Created::OnceTheCancelIsAccepted {
+        recorded(
+            file,
+            "established",
+            "the writer was not established before the SIGTERM step",
+        )
+        .await?;
+    }
+    tokio::time::sleep(SCANS).await;
+    clock.advance(hoh_core::cancel::GRACES.native + Duration::from_millis(100));
+    // The scenario established (the product holds its SIGKILL step meanwhile): the writer in a session other than the
+    // test's (its own evidence, written before the product could end it): a leader that missed its trap, a cancel that
+    // skipped the step starting it, or a writer that never started (a setsid that failed, CIR-500) leaves none, where
+    // it would otherwise pass with nothing to find (CIR-252).
+    recorded(file, "established", "the writer was never established").await?;
+    let established = record()
+        .into_iter()
+        .find(|(k, _)| k == "established")
+        .ok_or("no established record")?;
+    let own = rustix::process::getsid(None)?
+        .as_raw_nonzero()
+        .get()
+        .unsigned_abs();
+    let (sid, at) = (established.1.get(1).copied(), established.1.get(2).copied());
+    assert!(
+        sid.is_some_and(|s| u64::from(own) != s),
+        "the writer was not established in a session of its own: {:?}",
+        record()
+    );
+    let handled = std::fs::read_to_string(established_mark(file))?.contains(" handled");
+    // A writer that handles SIGTERM gets it from the product before the SIGKILL step (it is found and signalled with
+    // the strongest signal sent so far): its own record of it.
+    if handled {
+        recorded(file, "term", "the writer was never sent SIGTERM").await?;
+    }
+    let term = record()
+        .into_iter()
+        .find(|(k, _)| k == "term")
+        .and_then(|(_, v)| v.first().copied());
+    // The SIGKILL step, then the run CANCELLED once nothing of the attempt lives.
+    clock.advance(hoh_core::cancel::GRACES.term + Duration::from_millis(100));
     until(
         &project,
         "SELECT state FROM runs WHERE run_id = 'R'",
@@ -1006,31 +1177,10 @@ async fn cancel_with_a_writer_outside(
         Duration::from_secs(40),
     )
     .await?;
-    // Signalled with the group's steps (SIGTERM at 10 s, SIGKILL at 15 s), not left to end by itself.
-    let took = asked.elapsed();
-    assert!(took <= Duration::from_secs(20), "{took:?}");
     assert_eq!(
         marked(&attempt)?,
         Vec::<u32>::new(),
         "a process of the attempt lives on"
-    );
-    // The writer was established in a session other than the leader's (its own evidence, written before the product
-    // could end it): a leader that missed its trap, a cancel that skipped the step starting it, or a writer that never
-    // started (a setsid that failed, CIR-500) leaves none and fails here, where it would otherwise pass with nothing
-    // to find (CIR-252).
-    let evidence = std::fs::read_to_string(established_mark(file)).unwrap_or_default();
-    let sessions: Vec<u32> = evidence
-        .lines()
-        .filter_map(|l| l.strip_prefix("established "))
-        .filter_map(|l| l.split(' ').nth(1)?.parse().ok())
-        .collect();
-    let own = rustix::process::getsid(None)?
-        .as_raw_nonzero()
-        .get()
-        .unsigned_abs();
-    assert!(
-        !sessions.is_empty() && sessions.iter().all(|s| *s != own),
-        "the writer was never established in a session of its own: {evidence:?}"
     );
     let size = || -> R<u64> { Ok(std::fs::metadata(file)?.len()) };
     let before = size()?;
@@ -1043,7 +1193,10 @@ async fn cancel_with_a_writer_outside(
     let _ = bystander.kill();
     let _ = bystander.wait();
     host.shutdown().await;
-    Ok(project)
+    Ok(WriterRecord {
+        established: at.ok_or("no time in the established record")?,
+        term,
+    })
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1054,21 +1207,18 @@ async fn a_cancel_ends_a_writer_the_leader_started_and_orphaned_after_the_cancel
     let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
     let file = dir.path().join("written.txt");
     let script = leader(&file, Leader::OrphansOnTermThenWaits, None)?;
-    let project =
-        cancel_with_a_writer_outside(dir.path(), &script, &file, Created::DuringTheCancel).await?;
-    // Found after the SIGTERM step, it was sent that signal at once, not left for the SIGKILL step 5 s later: its last
-    // write is within 2 s of the step.
-    let term: u64 = query(
-        &project,
-        "SELECT json_extract(payload_json, '$.at_ms') FROM events WHERE kind = 'cancel.sigterm'",
-    )?
-    .parse()?;
-    let last = std::fs::metadata(&file)?
-        .modified()?
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_millis();
-    let after = u64::try_from(last)?.saturating_sub(term);
-    assert!(after < 2000, "the writer wrote {after} ms after SIGTERM");
+    let record =
+        cancel_with_a_writer_outside(dir.path(), &script, &file, Created::AtOrAfterTheSigterm)
+            .await?;
+    // Found after the SIGTERM step, it was sent that signal at once (the strongest sent so far), not left for SIGKILL:
+    // its own record of the SIGTERM within 2 s of its being established, however long its creation took (its record,
+    // not a file's time: CIR-601).
+    let term = record.term.ok_or("the writer was never sent SIGTERM")?;
+    let after = term.saturating_sub(record.established);
+    assert!(
+        after < 2000,
+        "the writer got SIGTERM {after} ms after it was established"
+    );
     Ok(())
 }
 
@@ -1095,7 +1245,8 @@ async fn a_cancel_ends_a_descendant_without_the_marker_that_left_the_group_while
     let pid_file = dir.path().join("writer.pid");
     let script = leader(&file, Leader::StartsUnmarkedOnGo, Some(&pid_file))?;
     let guard = KillPidFile(pid_file.clone());
-    cancel_with_a_writer_outside(dir.path(), &script, &file, Created::DuringTheCancel).await?;
+    cancel_with_a_writer_outside(dir.path(), &script, &file, Created::OnceTheCancelIsAccepted)
+        .await?;
     assert!(gone(&pid_file)?, "the writer lives");
     drop(guard);
     Ok(())
@@ -1430,7 +1581,7 @@ async fn a_cancel_ends_a_writer_the_leader_released_on_sigterm_just_before_it_ex
     let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
     let file = dir.path().join("written.txt");
     let script = leader(&file, Leader::OrphansOnTermThenExits, None)?;
-    cancel_with_a_writer_outside(dir.path(), &script, &file, Created::DuringTheCancel)
+    cancel_with_a_writer_outside(dir.path(), &script, &file, Created::AtOrAfterTheSigterm)
         .await
         .map(drop)
 }
@@ -1447,7 +1598,7 @@ async fn a_cancel_ends_what_a_pinned_process_without_the_marker_starts_after_the
     let pid_file = dir.path().join("w.pid");
     let script = leader(&file, Leader::StartsPinnedW, Some(&pid_file))?;
     let guard = KillPidFile(pid_file.clone());
-    cancel_with_a_writer_outside(dir.path(), &script, &file, Created::DuringTheCancel).await?;
+    cancel_with_a_writer_outside(dir.path(), &script, &file, Created::AtOrAfterTheSigterm).await?;
     drop(guard);
     Ok(())
 }
