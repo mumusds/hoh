@@ -663,6 +663,9 @@ fn a_binary_that_fails_with_a_code_of_its_own_ends_the_install_with_the_installe
         ("exit 0", "exit 101", 69, "(exit 101)"),
         ("exit 0", "exit 1", 69, "(exit 1)"),
         ("exit 78", "exit 0", 78, "refused this home or root"),
+        // Its own codes kept, with no code named (M2T14R-954).
+        ("exit 69", "exit 0", 69, "refused this home or root"),
+        ("exit 0", "exit 64", 64, "__unit template refused"),
     ] {
         std::fs::remove_file(&binary)?;
         script(
@@ -680,6 +683,11 @@ fn a_binary_that_fails_with_a_code_of_its_own_ends_the_install_with_the_installe
         );
         let stderr = String::from_utf8(out.stderr.clone())?;
         assert!(stderr.contains(said), "{check} {template}: {stderr}");
+        assert_eq!(
+            stderr.contains("(exit "),
+            said.starts_with("(exit"),
+            "{check} {template}: {stderr}"
+        );
     }
     Ok(())
 }
@@ -1040,21 +1048,30 @@ fn an_instance_a_requires_link_enables_with_no_user_manager_keeps_the_uninstall_
 
 /// An installed home with no manager to ask, its instance `hoh-host@0123456789abcdef.service` enabled by a link that
 /// `place` makes (given the home and the template); the uninstall must refuse (69), say `said`, remove nothing.
+/// `place` gives the directories it made unreadable, which get their permissions back before the temporary root is
+/// removed, whatever ends the test; the root is then gone (M2T14R-904).
 fn an_uninstall_with_no_manager_refuses(
-    place: impl Fn(&Path, &Path) -> R,
+    place: impl Fn(&Path, &Path) -> R<Vec<PathBuf>>,
     said: &str,
 ) -> R<String> {
     let install = Install::new()?;
-    let out = install.run("bundle", &[])?;
-    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
-    let template = install.data().join("systemd/user/hoh-host@.service");
-    place(install.root.path(), &template)?;
-    let out = install.run("bundle", &["--uninstall"])?;
-    assert_eq!(out.status.code(), Some(69), "{}", text(&out));
-    let stderr = String::from_utf8(out.stderr.clone())?;
-    assert!(stderr.contains(said), "{stderr}");
-    assert!(install.data().join("hoh/current/bin/hoh").exists());
-    assert!(template.exists());
+    let top = install.root.path().to_path_buf();
+    let stderr = {
+        let out = install.run("bundle", &[])?;
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+        let template = install.data().join("systemd/user/hoh-host@.service");
+        let _restore = installed::Restore(place(install.root.path(), &template)?);
+        let out = install.run("bundle", &["--uninstall"])?;
+        assert_eq!(out.status.code(), Some(69), "{}", text(&out));
+        let stderr = String::from_utf8(out.stderr.clone())?;
+        assert!(stderr.contains(said), "{stderr}");
+        drop(_restore);
+        assert!(install.data().join("hoh/current/bin/hoh").exists());
+        assert!(template.exists());
+        stderr
+    };
+    drop(install);
+    assert!(!top.exists(), "{} left", top.display());
     Ok(stderr)
 }
 
@@ -1073,7 +1090,7 @@ fn a_link_where_the_user_unit_directory_is_a_link_keeps_the_uninstall_from_remov
             )?;
             std::fs::create_dir_all(root.join("h/.config/systemd"))?;
             std::os::unix::fs::symlink(&real, root.join("h/.config/systemd/user"))?;
-            Ok(())
+            Ok(vec![])
         },
         "hoh-host@0123456789abcdef.service is enabled, and no user systemd manager answers to disable it",
     )
@@ -1089,7 +1106,7 @@ fn a_runtime_link_with_no_manager_keeps_the_uninstall_from_removing_anything() -
             let wants = root.join("r/systemd/user/default.target.wants");
             std::fs::create_dir_all(&wants)?;
             std::os::unix::fs::symlink(template, wants.join("hoh-host@0123456789abcdef.service"))?;
-            Ok(())
+            Ok(vec![])
         },
         "hoh-host@0123456789abcdef.service is enabled, and no user systemd manager answers to disable it",
     )
@@ -1100,9 +1117,7 @@ fn a_runtime_link_with_no_manager_keeps_the_uninstall_from_removing_anything() -
 fn a_unit_directory_that_cannot_be_listed_keeps_the_uninstall_from_removing_anything() -> R {
     // Design correction 11 (M2T14R-801): what cannot be listed may enable an instance: a .requires directory this user
     // cannot read refuses the uninstall (69, nothing removed), it is not taken for one with no link in it.
-    use std::os::unix::fs::PermissionsExt as _;
-    let locked = std::cell::RefCell::new(None);
-    let result = an_uninstall_with_no_manager_refuses(
+    let stderr = an_uninstall_with_no_manager_refuses(
         |root, template| {
             let requires = root.join("h/.config/systemd/user/default.target.requires");
             std::fs::create_dir_all(&requires)?;
@@ -1111,18 +1126,106 @@ fn a_unit_directory_that_cannot_be_listed_keeps_the_uninstall_from_removing_anyt
                 requires.join("hoh-host@0123456789abcdef.service"),
             )?;
             std::fs::set_permissions(&requires, std::fs::Permissions::from_mode(0o000))?;
-            *locked.borrow_mut() = Some(requires);
-            Ok(())
+            Ok(vec![requires])
         },
         "cannot list",
-    );
-    if let Some(dir) = locked.borrow().as_ref() {
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))?;
-    }
+    )?;
     // What cannot be told is said so; nothing is named to stop (design correction 11).
-    let stderr = result?;
     assert!(stderr.contains("could not be told"), "{stderr}");
     assert!(!stderr.contains("stop what is named above"), "{stderr}");
+    Ok(())
+}
+
+#[test]
+fn a_unit_directory_under_one_that_cannot_be_searched_keeps_the_uninstall_from_removing_anything()
+-> R {
+    // Design correction 12 (M2T14R-902): a unit directory whose parent cannot be searched is neither there nor not
+    // there; it cannot be told, so the uninstall refuses (69, nothing removed), and says so.
+    let stderr = an_uninstall_with_no_manager_refuses(
+        |root, template| {
+            let wants = root.join("h/.config/systemd/user/default.target.wants");
+            std::fs::create_dir_all(&wants)?;
+            std::os::unix::fs::symlink(template, wants.join("hoh-host@0123456789abcdef.service"))?;
+            let systemd = root.join("h/.config/systemd");
+            std::fs::set_permissions(&systemd, std::fs::Permissions::from_mode(0o000))?;
+            Ok(vec![systemd])
+        },
+        "cannot tell",
+    )?;
+    assert!(stderr.contains("could not be told"), "{stderr}");
+    Ok(())
+}
+
+#[test]
+fn a_command_link_in_a_directory_that_cannot_be_searched_is_not_taken_for_anothers() -> R {
+    // Design correction 12 (M2T14R-903): ~/.local/bin that cannot be searched hides whether ~/.local/bin/hoh is this
+    // installation's link: the uninstall and the install refuse (69), nothing removed; before, the uninstall removed
+    // everything but the link.
+    let install = Install::new()?;
+    let top = install.root.path().to_path_buf();
+    {
+        let out = install.run("bundle", &[])?;
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+        let bin = install.home().join(".local/bin");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o000))?;
+        let _restore = installed::Restore(vec![bin]);
+        for args in [&["--uninstall"][..], &[]] {
+            let out = install.run("bundle", args)?;
+            assert_eq!(out.status.code(), Some(69), "{args:?}: {}", text(&out));
+            let stderr = String::from_utf8(out.stderr.clone())?;
+            assert!(stderr.contains("cannot tell"), "{args:?}: {stderr}");
+            assert!(install.data().join("hoh/current/bin/hoh").exists());
+        }
+    }
+    assert!(install.home().join(".local/bin/hoh").is_symlink());
+    drop(install);
+    assert!(!top.exists(), "{} left", top.display());
+    Ok(())
+}
+
+#[test]
+fn links_that_are_not_hohs_in_the_unit_directories_do_not_stop_the_uninstall() -> R {
+    // M2T14R-950 (design correction 12): the enabling links are read where systemd reads them, one level down, by name,
+    // no link's target looked at: a link to itself and a link to nothing, neither HoH's, at the top and in a .wants
+    // directory, keep nothing from being removed (before, `find -L` failed on them: 69, "cannot list").
+    let install = Install::new()?;
+    let out = install.run("bundle", &[])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let user = install.home().join(".config/systemd/user");
+    let wants = user.join("default.target.wants");
+    std::fs::create_dir_all(&wants)?;
+    for at in [&user, &wants] {
+        std::os::unix::fs::symlink("stale.service", at.join("stale.service"))?;
+        std::os::unix::fs::symlink("/nowhere", at.join("gone.service"))?;
+    }
+    let out = install.run("bundle", &["--uninstall"])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(!install.data().join("hoh").exists());
+    assert!(
+        wants.join("stale.service").is_symlink(),
+        "the user's link removed"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_root_that_cannot_be_resolved_for_the_scan_keeps_the_uninstall_from_removing_anything() -> R {
+    // M2T14R-951: the /proc scan names programs by the root's resolved path; `readlink -f` failing (a stand-in) cannot
+    // tell where they would run from: 69, nothing removed (before, the root's own path was used and the scan could miss
+    // a program run through a link).
+    let install = Install::new()?;
+    let out = install.run("bundle", &[])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    script(
+        &install.stubs().join("readlink"),
+        "#!/bin/sh\ncase \"$1\" in -f) echo 'readlink: failing' >&2; exit 1;; esac\nexec /usr/bin/readlink \"$@\"\n",
+    )?;
+    let out = install.run("bundle", &["--uninstall"])?;
+    assert_eq!(out.status.code(), Some(69), "{}", text(&out));
+    let stderr = String::from_utf8(out.stderr.clone())?;
+    assert!(stderr.contains("cannot resolve"), "{stderr}");
+    assert!(stderr.contains("could not be told"), "{stderr}");
+    assert!(install.data().join("hoh/current/bin/hoh").exists());
     Ok(())
 }
 

@@ -118,6 +118,19 @@ pub fn real_units(pattern: &str) -> R<Vec<String>> {
 
 /// A private `systemd --user` in a scope of its own, under a short temporary root (a socket path has 107 bytes):
 /// `h/` the HOME with its XDG directories, `r/` the runtime directory, `bin/` the test's stand-ins.
+/// Directories a test made unreadable, given back their permissions (0755) when it is dropped, whatever ended the test:
+/// declared after what owns their temporary root, so it is dropped first and the root can then be removed (M2T14R-904).
+pub struct Restore(pub Vec<PathBuf>);
+
+impl Drop for Restore {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt as _;
+        for path in &self.0 {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+}
+
 pub struct Manager {
     root: PathBuf,
     /// The transient scope of the user's manager it runs in.

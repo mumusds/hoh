@@ -1115,6 +1115,7 @@ fn instances_that_cannot_be_listed_keep_the_uninstall_from_removing_anything() -
     let (manager, _project) = installed(true)?;
     let bundle = manager.root().join("bundle/hoh");
     let hosts = manager.data().join("hoh/hosts");
+    let _restore = installed::Restore(vec![hosts.clone()]);
     let systemctl = manager.bin().join("systemctl");
     for (what, said) in [("hosts", "cannot list"), ("list-units", "did not list")] {
         if what == "hosts" {
@@ -1149,6 +1150,87 @@ fn instances_that_cannot_be_listed_keep_the_uninstall_from_removing_anything() -
     Ok(())
 }
 
+#[test]
+fn an_enablement_answer_its_exit_code_belies_keeps_the_uninstall_from_removing_anything() -> R {
+    // Design correction 12 (M2T14R-900): an `is-enabled` answer is taken only when its exit code is the one that state
+    // gives: "disabled" with exit 23 (a stand-in, once the uninstall holds the run lock) cannot be told, so 69 and
+    // nothing removed (before: taken for not enabled, 0, the link left naming the removed template).
+    enabled_again_in_the_window(&Window {
+        links: "default.target.wants",
+        final_is_enabled_lies: true,
+        ..Window::default()
+    })
+}
+
+#[test]
+fn a_masked_instance_keeps_the_uninstall_from_removing_anything() -> R {
+    // Design correction 12 (M2T14R-901): "masked" hides whether the instance's own links are gone (a disable leaves
+    // the wants link of a masked instance): it cannot be told; 69, nothing removed, the user's mask kept; once unmasked
+    // the uninstall completes.
+    let (manager, project) = installed(true)?;
+    let unit = unit_of(&project);
+    let out = manager.systemctl(&["mask", &unit])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let bundle = manager.root().join("bundle/hoh");
+    let out = manager.install(&bundle, &["--uninstall"])?;
+    assert_eq!(out.status.code(), Some(69), "{}", text(&out));
+    let stderr = String::from_utf8(out.stderr.clone())?;
+    assert!(stderr.contains("masked"), "{stderr}");
+    assert!(manager.data().join("hoh/current/bin/hoh").exists());
+    let out = manager.systemctl(&["unmask", &unit])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let out = manager.install(&bundle, &["--uninstall"])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let wants = manager
+        .home()
+        .join(format!(".config/systemd/user/default.target.wants/{unit}"));
+    assert!(
+        !wants.exists() && !wants.is_symlink(),
+        "{} left",
+        wants.display()
+    );
+    Ok(())
+}
+
+#[test]
+fn each_instance_the_uninstall_cannot_disable_is_said_with_its_own_answer() -> R {
+    // M2T14R-953: two instances, every disable after the first failing (a stand-in): each one left is said with what
+    // the manager answered for it ("no answer", none asked), never the answer for the instance before it.
+    let (manager, project) = installed(true)?;
+    let second = manager.root().join("q");
+    std::fs::create_dir_all(&second)?;
+    let out = manager
+        .command(manager.home().join(".local/bin/hoh"))
+        .arg("__unit")
+        .arg("enable")
+        .arg(&second)
+        .output()?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let count = manager.root().join("disables");
+    installed::script(
+        &manager.bin().join("systemctl"),
+        &format!(
+            "#!/bin/sh\ncase \" $* \" in *\" disable \"*) echo x >> {c}; if [ \"$(wc -l < {c})\" -gt 1 ]; then echo refused >&2; exit 1; fi;; esac\nexec /usr/bin/systemctl \"$@\"\n",
+            c = count.display()
+        ),
+    )?;
+    let bundle = manager.root().join("bundle/hoh");
+    let out = manager.install(&bundle, &["--uninstall"])?;
+    std::fs::remove_file(manager.bin().join("systemctl"))?;
+    assert_eq!(out.status.code(), Some(69), "{}", text(&out));
+    let stderr = String::from_utf8(out.stderr.clone())?;
+    let left: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("could not stop and disable"))
+        .collect();
+    assert_eq!(left.len(), 1, "{stderr}");
+    assert!(left[0].contains("is-enabled no answer"), "{stderr}");
+    let _ = project;
+    let out = manager.install(&bundle, &["--uninstall"])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    Ok(())
+}
+
 #[derive(Default)]
 struct Window<'a> {
     /// A drop-in's [Install] section for the template, if any.
@@ -1161,6 +1243,8 @@ struct Window<'a> {
     final_disable_does_nothing: bool,
     /// Once the uninstall holds the run lock, `systemctl --user is-enabled` answers nothing and exits 23.
     final_is_enabled_says_nothing: bool,
+    /// Once the uninstall holds the run lock, `systemctl --user is-enabled` answers "disabled" and exits 23.
+    final_is_enabled_lies: bool,
 }
 
 /// The project's instance enabled (its link in `window.links`), the uninstall held after its first pass and before
@@ -1198,10 +1282,14 @@ fn enabled_again_in_the_window(window: &Window) -> R {
         ),
     )?;
     let systemctl = manager.bin().join("systemctl");
-    let refused = window.final_disable_does_nothing || window.final_is_enabled_says_nothing;
+    let refused = window.final_disable_does_nothing
+        || window.final_is_enabled_says_nothing
+        || window.final_is_enabled_lies;
     if refused {
         let verb = if window.final_disable_does_nothing {
             ("disable", "exit 0")
+        } else if window.final_is_enabled_lies {
+            ("is-enabled", "echo disabled; exit 23")
         } else {
             ("is-enabled", "exit 23")
         };
@@ -1247,12 +1335,21 @@ fn enabled_again_in_the_window(window: &Window) -> R {
     assert!(again, "__unit enable did not enable it again");
     if refused {
         assert_eq!(out.status.code(), Some(69), "{}", text(&out));
-        assert!(
-            String::from_utf8(out.stderr.clone())?
-                .contains(&format!("could not stop and disable {unit}")),
-            "{}",
-            text(&out)
-        );
+        let stderr = String::from_utf8(out.stderr.clone())?;
+        if window.final_disable_does_nothing {
+            // The manager says it is still enabled: something to stop.
+            assert!(
+                stderr.contains(&format!("could not stop and disable {unit}")),
+                "{stderr}"
+            );
+        } else {
+            // The manager's answer cannot be taken: cannot tell, and nothing named to stop (M2T14R-952).
+            assert!(
+                stderr.contains(&format!("cannot tell whether {unit} is still enabled")),
+                "{stderr}"
+            );
+            assert!(!stderr.contains("stop what is named above"), "{stderr}");
+        }
         // A disable that did nothing leaves the link; one whose result the manager cannot tell may have removed it.
         assert!(
             !window.final_disable_does_nothing || link.is_symlink(),
