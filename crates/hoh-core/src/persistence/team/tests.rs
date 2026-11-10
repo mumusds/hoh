@@ -1626,3 +1626,55 @@ async fn a_change_to_an_agent_missing_its_auth_is_refused_blocked_auth_until_it_
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn a_control_notice_to_the_commander_carries_its_epoch_after_a_handover() -> R {
+    // ADR-024 decision 6: a run control's notice to the commander (PauseRun's run.control) is addressed to the
+    // commander's binding as it is in the command's own transaction, epoch 2 after the handover, whatever epoch the
+    // caller wrote (the host wrote 1).
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    working(&store, &path).await?;
+    store
+        .submit_command(team_change("pi", 0, json!({"commander": {"agent": "pi"}})))
+        .await?;
+    store
+        .team_checkpoint("R1", crate::persistence::Availability::default())
+        .await?;
+    let revision: i64 = rows::<i64>(&path, "SELECT revision FROM runs WHERE run_id = 'R1'")?[0][0];
+    store
+        .submit_command(SubmitCommand {
+            command_id: "c-pause".to_owned(),
+            idempotency_key: "k-pause".to_owned(),
+            kind: "PauseRun".to_owned(),
+            run_id: "R1".to_owned(),
+            expected_revision: revision,
+            payload: json!({}),
+            payload_sha256: format!("{:064}", 9),
+            target: RunTarget::To(crate::protocol::RunState::PauseRequested),
+            event: NewEvent {
+                project_id: "p1".to_owned(),
+                event_id: "e-pause".to_owned(),
+                run_id: Some("R1".to_owned()),
+                kind: "run.pause_requested".to_owned(),
+                payload: json!({"to": "PAUSE_REQUESTED"}),
+            },
+            outbox: Some(crate::persistence::NewOutbox {
+                message_id: "m-pause".to_owned(),
+                event: 0,
+                run_id: Some("R1".to_owned()),
+                recipient_role: "commander".to_owned(),
+                role_epoch: 1,
+                payload: json!({"notice": "runtime", "kind": "run.control", "control": "pause"}),
+            }),
+        })
+        .await?;
+    assert_eq!(
+        rows::<i64>(
+            &path,
+            "SELECT role_epoch FROM outbox WHERE message_id = 'm-pause'"
+        )?,
+        [[2]]
+    );
+    Ok(())
+}
