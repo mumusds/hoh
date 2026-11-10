@@ -48,21 +48,45 @@ pub(super) fn first_input_pending(
     .map_err(sqlite_error)
 }
 
-/// Whether HoH session `session_id` owes its first input and has an attempt in flight (decision 4, M2T17R-201): its
-/// session.start was delivered to it, no turn of it was answered by the agent yet (no native session recorded), and
-/// one of its attempts is PREPARED, STARTING or RUNNING. Its role is then dispatched nothing more, so the first input
-/// goes to one turn at a time until the agent has answered one.
-pub(super) fn first_input_in_flight(
+/// Whether run `run_id`'s `role` at `role_epoch`, in its session `session_id`, owes its first input (decision 4,
+/// M2T17R-200, -300): the session.start of that epoch was delivered to that session, and no attempt of the session has
+/// SETTLED (the first turn that completes began with the package, every turn does while it is owed). The notice is
+/// looked up by its id, so a session never handed over costs one lookup.
+pub(super) fn first_input_owed(
     conn: &Connection,
+    run_id: &str,
+    role: &str,
+    role_epoch: i64,
     session_id: &str,
 ) -> Result<bool, PersistError> {
     conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sessions s WHERE s.session_id = ?1 AND s.native_id IS NULL \
-         AND EXISTS(SELECT 1 FROM outbox o JOIN receipts r ON r.message_id = o.message_id WHERE o.state = 'ACKED' \
-          AND json_extract(o.payload_json, '$.kind') = 'session.start' \
-          AND json_extract(r.result_json, '$.session_id') = s.session_id) \
-         AND EXISTS(SELECT 1 FROM attempts a WHERE a.session_id = s.session_id \
-          AND a.state IN ('PREPARED', 'STARTING', 'RUNNING')))",
+        "SELECT EXISTS(SELECT 1 FROM outbox o JOIN receipts r ON r.message_id = o.message_id \
+          WHERE o.message_id = ?1 AND o.state = 'ACKED' AND json_extract(r.result_json, '$.session_id') = ?2) \
+         AND NOT EXISTS(SELECT 1 FROM attempts p WHERE p.session_id = ?2 AND p.state = 'SETTLED')",
+        params![
+            crate::ids::child_id(run_id, &format!("session-start/{role}/{role_epoch}")),
+            session_id
+        ],
+        |r| r.get(0),
+    )
+    .map_err(sqlite_error)
+}
+
+/// Whether the session owes its first input (see [`first_input_owed`]) and has an attempt in flight (decision 4,
+/// M2T17R-201): one PREPARED, STARTING or RUNNING. Its role is then dispatched nothing more, so the first input goes to
+/// one turn at a time until one turn completed.
+pub(super) fn first_input_in_flight(
+    conn: &Connection,
+    run_id: &str,
+    role: &str,
+    role_epoch: i64,
+    session_id: &str,
+) -> Result<bool, PersistError> {
+    if !first_input_owed(conn, run_id, role, role_epoch, session_id)? {
+        return Ok(false);
+    }
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM attempts WHERE session_id = ?1 AND state IN ('PREPARED', 'STARTING', 'RUNNING'))",
         params![session_id],
         |r| r.get(0),
     )

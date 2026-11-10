@@ -796,8 +796,9 @@ pub struct Assignment {
     pub goal: Option<String>,
     pub title: Option<String>,
     /// This attempt's turn starts from its session's first input: the session was given one (its session.start
-    /// delivered to it) and no turn of it was answered by the agent yet (no native session recorded), so a turn that
-    /// never reached the agent leaves it owed (docs/adr/ADR-024.md decision 4, M2T17R-151, -152, -200).
+    /// delivered to it) and no turn of it completed yet (no attempt of it SETTLED), so a turn that never reached the
+    /// agent, or failed, leaves it owed; a native session id is no proof (docs/adr/ADR-024.md decision 4, M2T17R-151,
+    /// -152, -200, -300).
     pub first_input: bool,
 }
 
@@ -818,11 +819,7 @@ pub(super) fn assignment(
               ORDER BY e.seq LIMIT 1), \
              (SELECT json_extract(j.value, '$.title') FROM events e, json_each(json_extract(e.payload_json, '$.tasks')) j \
               WHERE e.run_id = ?2 AND e.kind = 'plan.imported' AND json_extract(j.value, '$.task_id') = ?3 \
-              ORDER BY e.seq DESC LIMIT 1), \
-             EXISTS(SELECT 1 FROM outbox o JOIN receipts r ON r.message_id = o.message_id WHERE o.state = 'ACKED' \
-              AND json_extract(o.payload_json, '$.kind') = 'session.start' \
-              AND json_extract(r.result_json, '$.session_id') = a.session_id) \
-             AND s.native_id IS NULL \
+              ORDER BY e.seq DESC LIMIT 1) \
              FROM attempts a LEFT JOIN sessions s ON s.session_id = a.session_id \
              LEFT JOIN role_bindings b ON b.run_id = ?2 AND b.role = ?4 WHERE a.attempt_id = ?1",
             params![attempt_id, run_id, task_id, role],
@@ -838,7 +835,7 @@ pub(super) fn assignment(
                     prompt: None,
                     goal: r.get(7)?,
                     title: r.get(8)?,
-                    first_input: r.get(9)?,
+                    first_input: false,
                 })
             },
         )
@@ -849,6 +846,10 @@ pub(super) fn assignment(
     };
     assignment.prompt = at_revision(conn, project_id, assignment.config_revision)?
         .and_then(|config| config.team.get(role).and_then(|r| r.prompt.clone()));
+    if let Some(session) = &assignment.session_id {
+        assignment.first_input =
+            super::handover::first_input_owed(conn, run_id, role, assignment.role_epoch, session)?;
+    }
     Ok(assignment)
 }
 

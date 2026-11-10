@@ -189,6 +189,38 @@ impl World {
             "status": "inProgress"});
         unknown.push(command);
         std::fs::write(d.join("unknown.jsonl"), lines(&unknown))?;
+        // A first start cut short once the thread is started, before any turn (M2T17R-300): the agent has given its
+        // session id, no input reached it.
+        let thread_start = requests
+            .iter()
+            .find(|(_, method)| method.as_str() == Some("thread/start"))
+            .and_then(|(id, _)| id.parse::<i64>().ok())
+            .ok_or("no thread/start request")?;
+        let answered = frames
+            .iter()
+            .position(|f| f["id"].as_i64() == Some(thread_start) && f.get("result").is_some())
+            .ok_or("no thread/start answer")?;
+        std::fs::write(d.join("incomplete.jsonl"), lines(&frames[..=answered]))?;
+        // Its retry resumes the thread the cut-short start opened: the recorded resume.
+        let resume = format!("{PROTOCOL}/codex/0.166.0/app-server-resume");
+        let resumed: Vec<Value> = std::fs::read_to_string(format!("{resume}/stdout.jsonl"))?
+            .lines()
+            .map(|l| serde_json::from_str(&l.replace("gpt-6-astra", model)))
+            .collect::<Result<_, _>>()?;
+        std::fs::write(d.join("resume.jsonl"), lines(&resumed))?;
+        let mut resume_requests = serde_json::Map::new();
+        for line in std::fs::read_to_string(format!("{resume}/stdin.txt"))?.lines() {
+            let Ok(m) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            if let (Some(id), Some(method)) = (m["id"].as_i64(), m["method"].as_str()) {
+                resume_requests.insert(id.to_string(), json!(method));
+            }
+        }
+        std::fs::write(
+            d.join("resume-requests.json"),
+            Value::Object(resume_requests).to_string(),
+        )?;
         // An App Server that does not know initialize: the turn degrades to exec (decision 15).
         std::fs::write(
             d.join("degrade.jsonl"),
@@ -216,9 +248,11 @@ impl World {
                     *HUGE*) frames=\"$d/huge.jsonl\"; opt=;;\n\
                     *UNKNOWN*) frames=\"$d/unknown.jsonl\"; opt=--exit-when-done; echo \"$HOH_ATTEMPT_ID\" >> \"$d/effects\";;\n\
                     *DEGRADE*) frames=\"$d/degrade.jsonl\"; opt=;;\n\
+                    *INCOMPLETE/attempt-1) frames=\"$d/incomplete.jsonl\"; opt=--exit-when-done;;\n\
+                    *INCOMPLETE/attempt-2) frames=\"$d/resume.jsonl\"; opt=; requests=\"$d/resume-requests.json\";;\n\
                     *) frames=\"$d/frames.jsonl\"; opt=;;\n\
                    esac\n\
-                   exec timeout 60 python3 '{APP_SERVER}' \"$frames\" \"$d/requests.json\" \"$d/log.$$\" $opt;;\n\
+                   exec timeout 60 python3 '{APP_SERVER}' \"$frames\" \"${{requests:-$d/requests.json}}\" \"$d/log.$$\" $opt;;\n\
                  esac\nexit 2\n",
                 d = d.display()
             ),
@@ -242,6 +276,17 @@ impl World {
             }
         }
         std::fs::write(d.join("commands.json"), Value::Object(commands).to_string())?;
+        // A first start that ends once get_state answered, before any prompt (M2T17R-300, -350): pi has given its
+        // session id, no input reached it.
+        let first = std::fs::read_to_string(format!("{case}/stdout.jsonl"))?
+            .lines()
+            .next()
+            .ok_or("no get_state answer")?
+            .to_owned();
+        std::fs::write(
+            d.join("refused.jsonl"),
+            format!("{first}\n{}\n", json!({"hoh_exit": 1})),
+        )?;
         self.script(
             "pi",
             &format!(
@@ -250,6 +295,7 @@ impl World {
                  echo $$ > \"$d/pid.$$\"; printf '%s\\n' \"$@\" > \"$d/argv.$$\"\n\
                  case \"$HOH_ATTEMPT_ID\" in\n\
                   *HUGE*) printf '%s\\n' '{{\"type\":\"agent_start\"}}'; head -c {HUGE} /dev/zero | tr '\\0' x; sleep 20; exit 0;;\n\
+                  *REFUSED/attempt-1) exec timeout 60 python3 '{PI_RPC}' \"$d/refused.jsonl\" \"$d/commands.json\" \"$d/log.$$\" -- \"$@\";;\n\
                  esac\n\
                  exec timeout 60 python3 '{PI_RPC}' \"$d/frames.jsonl\" \"$d/commands.json\" \"$d/log.$$\" -- \"$@\"\n",
                 d = d.display()
@@ -1855,7 +1901,7 @@ async fn a_new_holders_later_turns_in_its_session_carry_no_package() -> R {
     // docs/adr/ADR-024.md decision 4 (M2T17R-151, -152): the developer changes from claude to pi; the first turn of
     // its new session carries the package, the session's next turn, once pi answered the first, does not (the store
     // says the first input is given; a session that cannot resume is covered by
-    // a_first_input_stays_owed_until_the_agent_answered_a_turn_of_its_session).
+    // a_first_input_stays_owed_until_a_turn_of_its_session_completed).
     let world = World::new()?;
     world.claude(None)?;
     world.codex("m-test")?;
@@ -1904,6 +1950,122 @@ async fn a_new_holders_later_turns_in_its_session_carry_no_package() -> R {
         };
         assert!(turn("T-dev")?.contains("```json"), "the first turn has no package");
         assert!(!turn("T-dev2")?.contains("```json"), "a later turn carries the package");
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    world.stop_fakes()?;
+    outcome
+}
+
+#[tokio::test]
+async fn a_first_turn_cut_short_after_the_agent_gave_its_session_id_leaves_the_package_owed() -> R {
+    // M2T17R-300 (docs/adr/ADR-024.md decision 4): the new developer's (codex) first attempt is cut short after the App
+    // Server answered thread/start with its thread id, before any turn: no input reached the agent, so its retry, the
+    // first turn codex gets (resuming that thread), starts from the package.
+    let world = World::new()?;
+    world.claude(None)?;
+    world.codex("m-test")?;
+    world.pi()?;
+    let host = start_when_free(world.config()).await?;
+    let project = world.project();
+    let outcome = async {
+        let run_id = started(&host, "s1").await?;
+        let limit = Duration::from_secs(60);
+        ready(&project, &run_id, &[])?;
+        let developer = format!(
+            "SELECT agent || '/' || role_epoch || '/' || coalesce(session_id, '-') FROM role_bindings \
+             WHERE run_id = '{run_id}' AND role = 'developer'"
+        );
+        until(&project, &developer, &format!("claude/1/{run_id}/session/developer/1"), limit).await?;
+        let revision: i64 =
+            query(&project, "SELECT coalesce(max(revision), 0) FROM team_revisions")?.parse()?;
+        configure(&host, "to-codex", revision, json!({"developer": {"agent": "codex"}})).await?;
+        until(
+            &project,
+            &format!("SELECT state FROM outbox WHERE message_id = '{run_id}/session-start/developer/2'"),
+            "ACKED",
+            limit,
+        )
+        .await?;
+        ready(&project, &run_id, &[("T-INCOMPLETE", "developer")])?;
+        until(
+            &project,
+            "SELECT state FROM attempts WHERE attempt_id = 'T-INCOMPLETE/attempt-1' AND state IN ('FAILED', 'UNKNOWN_EFFECT')",
+            "FAILED",
+            limit,
+        )
+        .await?;
+        until(&project, &ended("T-INCOMPLETE/attempt-2"), "SETTLED/", limit).await?;
+        let sent: Vec<String> = std::fs::read_dir(world.bin().join("codex.d"))?
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("log."))
+            .filter_map(|e| std::fs::read_to_string(e.path().join("received.jsonl")).ok())
+            .flat_map(|log| log.lines().map(str::to_owned).collect::<Vec<_>>())
+            .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
+            .filter(|m| m["method"] == "turn/start")
+            .filter_map(|m| m["params"]["input"][0]["text"].as_str().map(str::to_owned))
+            .collect();
+        assert_eq!(sent.len(), 1, "only the retry's turn was sent: {sent:?}");
+        assert!(sent[0].contains("```json"), "the first turn codex got has no package: {}", sent[0]);
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    world.stop_fakes()?;
+    outcome
+}
+
+#[tokio::test]
+async fn a_first_pi_start_that_ends_before_its_prompt_leaves_the_package_owed() -> R {
+    // M2T17R-300, -350 (docs/adr/ADR-024.md decision 4): the new developer's (pi) first process answers get_state, which
+    // gives its session id, and ends before any prompt; no input reached pi, so its retry's prompt, the first pi takes,
+    // starts from the package.
+    let world = World::new()?;
+    world.claude(None)?;
+    world.codex("m-test")?;
+    world.pi()?;
+    let host = start_when_free(world.config()).await?;
+    let project = world.project();
+    let outcome = async {
+        let run_id = started(&host, "s1").await?;
+        let limit = Duration::from_secs(60);
+        ready(&project, &run_id, &[])?;
+        let developer = format!(
+            "SELECT agent || '/' || role_epoch || '/' || coalesce(session_id, '-') FROM role_bindings \
+             WHERE run_id = '{run_id}' AND role = 'developer'"
+        );
+        until(&project, &developer, &format!("claude/1/{run_id}/session/developer/1"), limit).await?;
+        let revision: i64 =
+            query(&project, "SELECT coalesce(max(revision), 0) FROM team_revisions")?.parse()?;
+        configure(&host, "to-pi", revision, json!({"developer": {"agent": "pi"}})).await?;
+        until(
+            &project,
+            &format!("SELECT state FROM outbox WHERE message_id = '{run_id}/session-start/developer/2'"),
+            "ACKED",
+            limit,
+        )
+        .await?;
+        ready(&project, &run_id, &[("T-REFUSED", "developer")])?;
+        until(
+            &project,
+            "SELECT state FROM attempts WHERE attempt_id = 'T-REFUSED/attempt-1' AND state IN ('FAILED', 'UNKNOWN_EFFECT')",
+            "FAILED",
+            limit,
+        )
+        .await?;
+        until(&project, &ended("T-REFUSED/attempt-2"), "SETTLED/", limit).await?;
+        let prompts: Vec<String> = std::fs::read_dir(world.bin().join("pi.d"))?
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("log."))
+            .filter_map(|e| std::fs::read_to_string(e.path().join("received.jsonl")).ok())
+            .flat_map(|log| log.lines().map(str::to_owned).collect::<Vec<_>>())
+            .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
+            .filter(|c| c["type"] == "prompt")
+            .filter_map(|c| c["message"].as_str().map(str::to_owned))
+            .collect();
+        assert_eq!(prompts.len(), 1, "only the retry's prompt was taken: {prompts:?}");
+        assert!(prompts[0].contains("```json"), "the first prompt pi took has no package: {}", prompts[0]);
         R::Ok(())
     }
     .await;
