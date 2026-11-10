@@ -43,6 +43,16 @@ const CHILD_FAIL_CLASS: &str = "HOH_TEST_RECOVERY_FAIL_CLASS";
 /// clock test code injects; the product uses `MonotonicClock`, ADR-020 decision 4).
 const CHILD_CLOCK: &str = "HOH_TEST_RECOVERY_CLOCK";
 
+/// A directory of fake agent CLIs: the child runs a runner whose executor has the product's registry over that PATH
+/// alone (its binder grants sessions) and records each first input it is given (docs/adr/ADR-024.md decision 4).
+const CHILD_AGENTS: &str = "HOH_TEST_RECOVERY_AGENTS";
+/// The child kills itself at the commit of the checkpoint that handed the commander over (its session.start notice
+/// written), before the binder can give the new Commander its session (AC-019-05).
+const CHILD_KILL_AT_HANDOVER: &str = "HOH_TEST_RECOVERY_KILL_AT_HANDOVER";
+/// A file: once its host serves, the child sends the old Codex Commander's three epoch-1 messages (two decisions, a
+/// steer) and writes what each got, one line each.
+const CHILD_OLD_COMMANDER: &str = "HOH_TEST_RECOVERY_OLD_COMMANDER";
+
 /// The child's exit code when it submitted its decision and was not killed.
 const NOT_KILLED: i32 = 77;
 
@@ -353,6 +363,114 @@ fn point_named(name: &str) -> Option<WritePoint> {
     })
 }
 
+/// SIGKILL at the commit of a checkpoint once the database holds a session.start notice: the commander's handover
+/// committed, nothing after it run (AC-019-05). Other checkpoints (an empty one commits nothing, an agent not looked at
+/// yet holds the change) pass.
+#[derive(Debug)]
+struct KillAtHandover(PathBuf);
+
+impl FaultHooks for KillAtHandover {
+    fn at(&self, job: &'static str, point: WritePoint) {
+        if job != "Checkpoint" || point != WritePoint::Committed {
+            return;
+        }
+        let notices = query(
+            &self.0,
+            "SELECT count(*) FROM outbox WHERE json_extract(payload_json, '$.kind') = 'session.start'",
+        );
+        if notices.is_ok_and(|n| n != "0") {
+            let _ = rustix::process::kill_process(
+                rustix::process::getpid(),
+                rustix::process::Signal::KILL,
+            );
+            loop {
+                std::thread::park();
+            }
+        }
+    }
+}
+
+/// An executor with the product's registry and no work (no task is dispatched): it records each first input it is
+/// given, one line `<message id> <session id>` in its file, and takes it.
+#[derive(Debug)]
+struct Handovers {
+    registry: Arc<hoh_app::host::agents::Registry>,
+    log: PathBuf,
+}
+
+impl hoh_app::host::Executor for Handovers {
+    fn registry(&self) -> Option<Arc<hoh_app::host::agents::Registry>> {
+        Some(self.registry.clone())
+    }
+
+    fn deliver(
+        &self,
+        _work: &hoh_app::host::Work,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
+        tokio::sync::oneshot::channel().1
+    }
+
+    fn start(
+        &self,
+        _work: &hoh_app::host::Work,
+    ) -> Result<hoh_app::host::Started, hoh_app::host::Refusal> {
+        Err("no work is expected".to_owned().into())
+    }
+
+    fn open_session(
+        &self,
+        start: &hoh_core::persistence::SessionStart,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
+        use std::io::Write as _;
+        let (sent, answer) = tokio::sync::oneshot::channel();
+        let line = format!(
+            "{} {}\n",
+            start.message_id,
+            start.session_id.as_deref().unwrap_or("-")
+        );
+        let kept = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.log)
+            .and_then(|mut f| f.write_all(line.as_bytes()))
+            .map_err(|e| e.to_string());
+        let _ = sent.send(kept);
+        answer
+    }
+}
+
+/// The old Codex Commander's messages after the handover (AC-019-05): two decisions and a steer, all at epoch 1.
+fn old_commander_messages() -> R<Vec<Message>> {
+    let message = |id: &str, kind: &str, recipient: &str, payload: Value| -> R<Message> {
+        Ok(serde_json::from_value(json!({
+            "schema_version": "1.0", "message_id": id, "run_id": "R", "task_id": "T", "attempt_id": "-",
+            "sender_role": "commander", "recipient_role": recipient, "role_epoch": 1, "correlation_id": "c",
+            "causation_id": null, "idempotency_key": format!("k-{id}"), "expected_revision": 1,
+            "spec_sha256": sha(1), "candidate_id": null, "kind": kind, "payload": payload
+        }))?)
+    };
+    Ok(vec![
+        message(
+            "old-dispatch",
+            "decision",
+            "runtime",
+            json!({"kind": "dispatch", "task_id": "T", "role": "developer"}),
+        )?,
+        message(
+            "old-transition",
+            "decision",
+            "runtime",
+            json!({"kind": "transition_task", "task_id": "T", "to_state": "READY"}),
+        )?,
+        message(
+            "old-steer",
+            "steer",
+            "developer",
+            json!({"text": "rebase first"}),
+        )?,
+    ])
+}
+
 /// The child entry: a host built in the test target. With [`CHILD_DECIDE`] it starts, submits the decision and is
 /// expected to die at its kill point; without, it runs as `hoh_app::host::run` until SIGTERM.
 #[test]
@@ -409,6 +527,19 @@ fn recovery_host() {
             },
         });
     }
+    if let Some(bin) = std::env::var_os(CHILD_AGENTS) {
+        let registry = Arc::new(hoh_app::host::agents::Registry::new(bin.clone()));
+        config.runner = Some(hoh_app::host::RunnerConfig {
+            executor: Arc::new(Handovers {
+                registry,
+                log: PathBuf::from(&bin).join("first-inputs.log"),
+            }),
+            context: Context::default(),
+        });
+    }
+    if std::env::var_os(CHILD_KILL_AT_HANDOVER).is_some() {
+        config.store.faults = Arc::new(KillAtHandover(db(Path::new(&project))));
+    }
     if let Some(clock) = std::env::var_os(CHILD_CLOCK) {
         config.clock = hoh_app::host::HostClock(Arc::new(FileClock(PathBuf::from(clock))));
     }
@@ -434,6 +565,43 @@ fn recovery_host() {
             NOT_KILLED
         });
         std::process::exit(code);
+    }
+    if let Some(file) = std::env::var_os(CHILD_OLD_COMMANDER) {
+        runtime.block_on(async {
+            use std::io::Write as _;
+            let host = Host::start(config).await.expect("the host starts");
+            let mut lines = String::new();
+            for message in old_commander_messages().expect("the old Commander's messages") {
+                let got = if message.kind == hoh_core::protocol::MessageKind::Decision {
+                    let proposal = Proposal::from_message(&message).expect("a proposal");
+                    match host.store().decide(proposal, Context::default()).await {
+                        Ok(hoh_core::persistence::Decided::Rejected { reason, .. }) => {
+                            format!(
+                                "rejected {}",
+                                serde_json::to_value(reason).unwrap_or_default()
+                            )
+                        }
+                        other => format!("not rejected {other:?}"),
+                    }
+                } else {
+                    match host.store().commander_message(&message).await {
+                        Ok(hoh_core::persistence::Fenced::Rejected { reason, .. }) => {
+                            format!(
+                                "rejected {}",
+                                serde_json::to_value(reason).unwrap_or_default()
+                            )
+                        }
+                        other => format!("not rejected {other:?}"),
+                    }
+                };
+                lines.push_str(&format!("{} {got}\n", message.message_id));
+            }
+            let mut out = std::fs::File::create(&file).expect("the outcome file");
+            out.write_all(lines.as_bytes()).expect("written");
+            // The host serves on until the test stops it.
+            tokio::time::sleep(Duration::from_secs(120)).await;
+        });
+        std::process::exit(0);
     }
     let code = runtime.block_on(hoh_app::host::run(config));
     std::process::exit(i32::from(code));
@@ -3914,4 +4082,149 @@ fn term_at(file: &Path) -> R<u128> {
         .map_err(|e| format!("no SIGTERM marked ({}): {e}", file.display()))?
         .modified()?;
     Ok(modified.duration_since(std::time::UNIX_EPOCH)?.as_nanos())
+}
+
+#[test]
+fn test_019_05_a_host_killed_after_the_handover_commit_keeps_epoch_2_and_starts_one_session() -> R {
+    // AC-019-05 (docs/adr/ADR-024.md decisions 2, 4, 6 and 8): a FakeAgent team (a fake pi on the runner's PATH, no
+    // codex or claude); the commander's change from codex to pi commits its handover and the host is killed -9 before
+    // the new Commander's session is started. The next host serves (its start reconcile done) within 30 s; the
+    // commander stays pi at epoch 2; exactly one pi commander session is bound and its first input given once; the
+    // old Codex's three epoch-1 messages (two decisions, a steer) are all rejected STALE_ROLE_EPOCH, and nothing is
+    // dispatched.
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir()?;
+    let project = dir.path().join("project");
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&project)?;
+    std::fs::create_dir_all(&bin)?;
+    let help = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/protocol/pi/1.5.0/help.txt"
+    );
+    std::fs::write(
+        bin.join("pi"),
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n --version) echo '1.5.0';;\n --help) /bin/cat '{help}';;\n *) exit 2;;\nesac\n"
+        ),
+    )?;
+    std::fs::set_permissions(bin.join("pi"), std::fs::Permissions::from_mode(0o755))?;
+    let agents = bin.as_os_str();
+    let first = start_child(
+        &project,
+        &[
+            (CHILD_AGENTS, agents),
+            (CHILD_KILL_AT_HANDOVER, std::ffi::OsStr::new("1")),
+        ],
+    )?;
+    seed(
+        &project,
+        "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', :p, printf('%064d', 1), 1);
+         INSERT INTO runs(run_id, project_id, spec_id, state, mode, revision, created_at) VALUES
+           ('R', :p, 's1', 'RUNNING', 'AUTO', 1, '2026-11-10T00:00:00Z');
+         INSERT INTO role_bindings(run_id, role, agent, role_epoch, config_revision, bound_at) VALUES
+           ('R', 'commander', 'codex', 1, 0, '2026-11-10T00:00:00Z'),
+           ('R', 'developer', 'claude', 1, 0, '2026-11-10T00:00:00Z'),
+           ('R', 'qa', 'pi', 1, 0, '2026-11-10T00:00:00Z'),
+           ('R', 'reviewer', 'codex', 1, 0, '2026-11-10T00:00:00Z');
+         INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate) VALUES
+           ('T', 'R', 's1', 'ACCEPTED', 1, 'developer', 0, 1, 1);",
+    )?;
+    let info: Value =
+        serde_json::from_str(&std::fs::read_to_string(project.join(".hoh/host.json"))?)?;
+    let change = json!({
+        "schema_version": "1.0", "command_id": "c-pi", "idempotency_key": "k-pi", "expected_revision": 0,
+        "kind": "ConfigureTeam", "run_id": null,
+        "payload": {"bindings": {"commander": {"agent": "pi"}}, "apply_at": "checkpoint"},
+    });
+    let (status, body) = http(&info, "POST", "/v1/commands", Some(&change.to_string()))?;
+    assert_eq!(status, 202, "{body}");
+    let (status, _) = wait(first, Duration::from_secs(60))?;
+    assert_eq!(status.signal(), Some(9), "killed at the handover's commit");
+    let commander = "SELECT agent || '/' || role_epoch || '/' || coalesce(session_id, '-') FROM role_bindings \
+                     WHERE run_id = 'R' AND role = 'commander'";
+    let notice =
+        "SELECT state FROM outbox WHERE json_extract(payload_json, '$.kind') = 'session.start'";
+    assert_eq!(
+        query(&db(&project), commander)?,
+        "pi/2/-",
+        "committed, no session yet"
+    );
+    assert_eq!(query(&db(&project), notice)?, "PENDING");
+    let log = bin.join("first-inputs.log");
+    assert!(!log.exists(), "no first input before the crash");
+    // The next host, then the old Codex's messages once it serves.
+    let outcomes = dir.path().join("old-commander.txt");
+    let restarted = Instant::now();
+    let second = start_child(
+        &project,
+        &[
+            (CHILD_AGENTS, agents),
+            (CHILD_OLD_COMMANDER, outcomes.as_os_str()),
+        ],
+    )?;
+    let served = restarted.elapsed();
+    assert!(
+        served <= Duration::from_secs(30),
+        "reconciled and serving after {served:?}"
+    );
+    let end = Instant::now() + Duration::from_secs(30);
+    let delivered = |project: &Path| -> R<bool> {
+        Ok(
+            query(&db(project), commander)? == "pi/2/R/session/commander/2"
+                && query(&db(project), notice)? == "ACKED"
+                && outcomes.exists(),
+        )
+    };
+    while !delivered(&project)? {
+        assert!(
+            Instant::now() < end,
+            "{} / {}",
+            query(&db(&project), commander)?,
+            query(&db(&project), notice)?
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        query(
+            &db(&project),
+            "SELECT count(*) FROM sessions WHERE role = 'commander' AND agent = 'pi'"
+        )?,
+        "1"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&log)?.lines().count(),
+        1,
+        "one first input"
+    );
+    let got = std::fs::read_to_string(&outcomes)?;
+    assert_eq!(
+        got,
+        "old-dispatch rejected \"STALE_ROLE_EPOCH\"\nold-transition rejected \"STALE_ROLE_EPOCH\"\n\
+         old-steer rejected \"STALE_ROLE_EPOCH\"\n"
+    );
+    assert_eq!(
+        query(
+            &db(&project),
+            "SELECT group_concat(state || ':' || reason_code, ',') FROM (SELECT * FROM decisions \
+             WHERE decision_id IN ('old-dispatch', 'old-transition', 'old-steer') ORDER BY decision_id)"
+        )?,
+        "REJECTED:STALE_ROLE_EPOCH,REJECTED:STALE_ROLE_EPOCH,REJECTED:STALE_ROLE_EPOCH"
+    );
+    assert_eq!(
+        query(
+            &db(&project),
+            "SELECT (SELECT count(*) FROM attempts) || '/' || (SELECT count(*) FROM outbox \
+             WHERE json_extract(payload_json, '$.kind') = 'dispatch') || '/' || \
+             (SELECT state || revision FROM tasks WHERE task_id = 'T')"
+        )?,
+        "0/0/ACCEPTED1",
+        "nothing dispatched, T unchanged"
+    );
+    assert_eq!(
+        query(&db(&project), commander)?,
+        "pi/2/R/session/commander/2"
+    );
+    drop(second);
+    Ok(())
 }
