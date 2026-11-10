@@ -789,13 +789,60 @@ async fn an_unanswered_interrupt_escalates_to_the_group_after_the_native_grace()
 /// The deadline interrupts the turn like a cancel, and the turn fails as DEADLINE_EXCEEDED.
 #[tokio::test]
 async fn a_deadline_interrupts_the_turn_and_fails_it() -> R {
+    // The deadline counts from the drive's start: an active turn is interrupted (turn/interrupt, status
+    // "interrupted"); one not active yet is stopped hard (no turn/interrupt, no status). Which comes first is not the
+    // test's to choose (a slow runner took 500 ms to make the turn active: CI run 42783826001), so each run asserts the
+    // path its order took, and the deadline doubles until the interrupt has been seen, at most four times (ADR-022
+    // decision 10, convention v2: look again within a bound, never take one order for granted).
     let world = World::new()?;
-    let fake = world.fake(
-        "slow",
-        Some(&Case::load("app-server-interrupt")?),
-        "exec",
-        false,
-    )?;
+    let case = Case::load("app-server-interrupt")?;
+    let mut interrupted = false;
+    for (i, millis) in [500, 1_000, 2_000, 4_000].into_iter().enumerate() {
+        let id = format!("A{}", i + 1);
+        let fake = world.fake(&format!("slow-{i}"), Some(&case), "exec", false)?;
+        let attempt = world.attempt(&id).await?;
+        let mut turn = world.turn(&fake, &format!("logs/{id}"))?;
+        turn.deadline = Some(Duration::from_millis(millis));
+        let outcome = run(&world, &attempt, &turn).await?;
+        assert_eq!(
+            (outcome.state, outcome.failure.as_deref()),
+            (AttemptState::Failed, Some("DEADLINE_EXCEEDED")),
+            "{millis} ms"
+        );
+        let sent = received(&fake)?
+            .iter()
+            .any(|m| m["method"] == "turn/interrupt");
+        match outcome.status.as_deref() {
+            Some("interrupted") => assert!(sent, "{millis} ms: interrupted without turn/interrupt"),
+            None => assert!(!sent, "{millis} ms: stopped hard after a turn/interrupt"),
+            other => return Err(format!("{millis} ms: status {other:?}").into()),
+        }
+        let row = world.store.reader()?.attempt(&id)?.ok_or("no attempt")?;
+        assert_eq!(
+            (row.state, row.cancel_requested),
+            (AttemptState::Failed, false),
+            "{millis} ms"
+        );
+        if sent {
+            interrupted = true;
+            break;
+        }
+    }
+    assert!(
+        interrupted,
+        "the turn was never active before its deadline, up to 4 s"
+    );
+    Ok(())
+}
+
+/// The other order, made certain: the fake pauses 1 s before its first frame, past the 500 ms deadline, so no turn is
+/// active when it comes and the stop is hard (no turn/interrupt, no status), still DEADLINE_EXCEEDED.
+#[tokio::test]
+async fn a_deadline_before_the_turn_is_active_stops_it_hard() -> R {
+    let world = World::new()?;
+    let mut case = Case::load("app-server-interrupt")?;
+    case.frames.insert(0, json!({"hoh_sleep": 1.0}));
+    let fake = world.fake("late", Some(&case), "exec", false)?;
     let attempt = world.attempt("A1").await?;
     let mut turn = world.turn(&fake, "logs/A1")?;
     turn.deadline = Some(Duration::from_millis(500));
@@ -804,16 +851,11 @@ async fn a_deadline_interrupts_the_turn_and_fails_it() -> R {
         (outcome.state, outcome.failure.as_deref()),
         (AttemptState::Failed, Some("DEADLINE_EXCEEDED"))
     );
-    assert_eq!(outcome.status.as_deref(), Some("interrupted"));
+    assert_eq!(outcome.status, None);
     assert!(
-        received(&fake)?
+        !received(&fake)?
             .iter()
             .any(|m| m["method"] == "turn/interrupt")
-    );
-    let row = world.store.reader()?.attempt("A1")?.ok_or("no attempt")?;
-    assert_eq!(
-        (row.state, row.cancel_requested),
-        (AttemptState::Failed, false)
     );
     Ok(())
 }
