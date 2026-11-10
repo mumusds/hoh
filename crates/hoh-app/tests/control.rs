@@ -911,9 +911,9 @@ async fn cancel_with_a_writer_outside(
         Vec::<u32>::new(),
         "a process of the attempt lives on"
     );
-    // The writer was created (its creator's mark, written once the writer existed): a leader that missed its trap or
-    // a cancel that skipped the step starting it would leave nothing to find, and pass (CIR-252). Not the writer's own
-    // mark or write: a scan may end it before it does anything (CIR-353, -400).
+    // The writer's creation was begun (the mark its creator writes right after forking the process that creates it): a
+    // leader that missed its trap or a cancel that skipped the step starting it would leave nothing to find, and pass
+    // (CIR-252). Not the writer's own mark or write: a scan may end it before it does anything (CIR-353, -400).
     assert!(
         created_mark(file).exists(),
         "the writer was never created: nothing was there to find"
