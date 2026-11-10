@@ -537,6 +537,7 @@ pub(super) fn checkpoint(
     let now = crate::time::now_rfc3339();
     let bindings = bound(&tx, run_id, None)?;
     let mut events = Vec::new();
+    let mut outbox = Vec::new();
     let mut changed = false;
     let mut behind = false;
     let applied = |role: &str, epoch: i64, from: serde_json::Value, to: serde_json::Value| {
@@ -593,6 +594,36 @@ pub(super) fn checkpoint(
             }
             continue;
         }
+        // A commander change hands over a package naming the run's spec: with none, it is refused and the old
+        // binding works on until the run has one (ADR-024 decision 10).
+        let handover_spec = match target {
+            Some(_) if binding.role == super::handover::COMMANDER => {
+                match super::handover::spec(&tx, run_id)? {
+                    Some(spec) => Some(spec),
+                    None => {
+                        behind = true;
+                        if !refused {
+                            changed = true;
+                            events.push(verdict(
+                                REFUSED,
+                                serde_json::json!({
+                                    "run_id": run_id, "role": binding.role, "config_revision": revision,
+                                    "agent": target.map(|role| role.agent.as_str()),
+                                    "reason": super::handover::NO_SPEC,
+                                    "detail": "the run has no specification yet",
+                                    "kept": {
+                                        "agent": binding.agent, "model": binding.model,
+                                        "role_epoch": binding.role_epoch,
+                                    },
+                                }),
+                            ));
+                        }
+                        continue;
+                    }
+                }
+            }
+            _ => None,
+        };
         if live.contains(&binding.role) {
             behind = true;
             if refused {
@@ -642,7 +673,14 @@ pub(super) fn checkpoint(
                 serde_json::Value::Null
             }
         };
-        events.push(applied(&binding.role, epoch, from, to));
+        events.push(applied(&binding.role, epoch, from.clone(), to.clone()));
+        if let Some(spec) = handover_spec {
+            let (event, mut notice) =
+                super::handover::prepare(&tx, &project_id, run_id, epoch, spec, &from, &to)?;
+            events.push(event);
+            notice.event = events.len() - 1;
+            outbox.push(notice);
+        }
     }
     for (name, role) in &wanted.team {
         if bindings.iter().any(|b| &b.role == name) {
@@ -675,6 +713,7 @@ pub(super) fn checkpoint(
         &tx,
         &super::writer::Commit {
             events,
+            outbox,
             ..super::writer::Commit::default()
         },
         ctx,

@@ -415,14 +415,12 @@ fn acceptance(
     rows.collect::<Result<_, _>>().map_err(sqlite_error)
 }
 
-/// The run's goal (its StartRun command), or a fixed account of what is verified.
-fn goal(
-    tx: &Transaction<'_>,
+/// The run's goal as its StartRun command gave it, if it gave one that is not blank.
+pub(super) fn started_goal(
+    conn: &Connection,
     run_id: &str,
-    task_id: &str,
-    candidate: &str,
-) -> Result<String, PersistError> {
-    let started: Option<Option<String>> = tx
+) -> Result<Option<String>, PersistError> {
+    let started: Option<Option<String>> = conn
         .query_row(
             "SELECT json_extract(payload_json, '$.goal') FROM commands WHERE run_id = ?1 AND kind = 'StartRun' \
              ORDER BY accepted_at LIMIT 1",
@@ -431,8 +429,16 @@ fn goal(
         )
         .optional()
         .map_err(sqlite_error)?;
-    Ok(started
-        .flatten()
-        .filter(|g| !g.trim().is_empty())
+    Ok(started.flatten().filter(|g| !g.trim().is_empty()))
+}
+
+/// The run's goal (its StartRun command), or a fixed account of what is verified.
+fn goal(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    task_id: &str,
+    candidate: &str,
+) -> Result<String, PersistError> {
+    Ok(started_goal(tx, run_id)?
         .unwrap_or_else(|| format!("验证任务 {task_id} 的候选 {candidate} 是否满足其验收标准")))
 }
