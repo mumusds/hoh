@@ -368,6 +368,13 @@ fn an_installed_binary_holds_its_installation_shared_and_none_while_it_is_being_
     assert!(
         rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_err()
     );
+    // Let go explicitly (LOCK_UN acts on the open file description, so any copy is let go too): a child another test
+    // thread forks meanwhile holds a copy of each descriptor until it execs, and a drop alone does not release the lock
+    // then (CI run 42804759906; ADR-022 decision 10, convention v2). The copies kept here stand in for such a child.
+    let copies = (first.try_clone()?, second.try_clone()?);
+    for held in [&first, &second] {
+        rustix::fs::flock(held, rustix::fs::FlockOperation::Unlock)?;
+    }
     drop((first, second));
     // ... and once it is had, no run can hold the installation.
     rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
@@ -376,6 +383,8 @@ fn an_installed_binary_holds_its_installation_shared_and_none_while_it_is_being_
         refused.to_string().contains("being uninstalled"),
         "{refused}"
     );
+    let copy = lock.try_clone()?;
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::Unlock)?;
     drop(lock);
     // A run whose image is not the binary at its path (removed, then installed again there) is refused (-350).
     let other = root.path().join("another image");
@@ -388,6 +397,7 @@ fn an_installed_binary_holds_its_installation_shared_and_none_while_it_is_being_
     // A binary removed under its run (its path read with " (deleted)") is refused.
     let deleted = PathBuf::from(format!("{} (deleted)", exe.display()));
     assert!(hold(&deleted).is_err());
+    drop((copies, copy));
     // An installation whose root is gone is being removed.
     std::fs::remove_dir_all(&r)?;
     let gone = hold(&exe).expect_err("gone");

@@ -821,9 +821,14 @@ fn an_uninstall_whose_run_lock_another_holds_says_a_program_still_runs() -> R {
     );
     assert!(stderr.contains("stop what is named above"), "{stderr}");
     assert!(install.data().join("hoh/current/bin/hoh").exists());
+    // Let go explicitly: a drop alone leaves the lock with any child another test thread forked meanwhile, until it
+    // execs (ADR-022 decision 10, convention v2); the copy kept stands in for one.
+    let copy = lock.try_clone()?;
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::Unlock)?;
     drop(lock);
     let out = install.run("bundle", &["--uninstall"])?;
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    drop(copy);
     Ok(())
 }
 
