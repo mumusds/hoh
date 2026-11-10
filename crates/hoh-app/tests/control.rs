@@ -655,8 +655,11 @@ async fn a_cancel_also_ends_a_descendant_that_left_the_agents_process_group() ->
     // CANCELLED only once it is gone.
     let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
     let escaped = dir.path().join("escaped.pid");
+    // The descendant writes its own number once it is in its session of its own: `$!` is known before the child has
+    // called setsid(), so a test reading its group then could see the leader's (ADR-022 decision 10, convention v2;
+    // CI run 42779925036). setsid(1) does not fork here (the child leads no group) and exec keeps the number.
     let script = format!(
-        "setsid sleep 60 & echo $! > {}; sleep 60",
+        "setsid sh -c 'echo $$ > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; exec sleep 60' _ {} & sleep 60",
         escaped.display()
     );
     let agents = Arc::new(Agents::new(&[("T1", script.as_str())]));
@@ -681,18 +684,17 @@ async fn a_cancel_also_ends_a_descendant_that_left_the_agents_process_group() ->
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
-    // It left the agent's group.
+    // It left the agent's group and session; its start time names it for the end's check.
+    let start = hoh_agents::identity::start_id(pid)?.ok_or("the descendant is gone already")?;
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
     let leader: u32 = query(&project, "SELECT pid FROM attempts WHERE task_id = 'T1'")?.parse()?;
-    let pgrp: u32 = stat
-        .rsplit_once(") ")
-        .ok_or("stat")?
-        .1
-        .split(' ')
-        .nth(2)
-        .ok_or("pgrp")?
-        .parse()?;
+    let fields: Vec<&str> = stat.rsplit_once(") ").ok_or("stat")?.1.split(' ').collect();
+    let (pgrp, session): (u32, u32) = (
+        fields.get(2).ok_or("pgrp")?.parse()?,
+        fields.get(3).ok_or("session")?.parse()?,
+    );
     assert_ne!(pgrp, leader);
+    assert_ne!(session, leader);
     // It is stopped however the test ends (M2T06R-62).
     let _marked = Marked(query(
         &project,
@@ -707,39 +709,40 @@ async fn a_cancel_also_ends_a_descendant_that_left_the_agents_process_group() ->
         Duration::from_secs(30),
     )
     .await?;
-    // Gone, or at most a zombie its new parent has not reaped yet.
-    let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .ok()
-        .and_then(|s| {
-            s.rsplit_once(") ")
-                .map(|(_, rest)| rest.chars().next().unwrap_or('?'))
-        });
-    assert!(
-        matches!(state, None | Some('Z')),
-        "the escaped descendant lives: {state:?}"
-    );
+    // Gone, or at most a zombie (or one being reaped) its new parent has not reaped yet; a look that cannot tell fails.
+    assert!(ended(pid, Some(&start))?, "the escaped descendant lives");
     host.shutdown().await;
     Ok(())
 }
 
-/// The live processes (not zombies) whose environment carries the marker `attempt` (`<project id>/<attempt id>`).
-fn marked(attempt: &str) -> Vec<u32> {
+/// Whether process `pid` has ended, by `identity::ended` (ADR-022 decision 10, convention v2): a look that cannot tell
+/// is an error, never "ended" (M2T07R-1203).
+fn ended(pid: u32, start: Option<&str>) -> R<bool> {
+    Ok(hoh_agents::identity::ended(pid, start)?)
+}
+
+/// The processes whose environment carries the marker `attempt` (`<project id>/<attempt id>`) and that have not ended
+/// (zombies and tasks being reaped left out). The listing of /proc failing is an error, never "none" (M2T07R-1150's
+/// class); an entry whose environment cannot be read is left out (another user's, or gone); one whose end cannot be
+/// told is counted as living, so that "nothing left" fails rather than passes.
+fn marked(attempt: &str) -> R<Vec<u32>> {
     let marker = format!("{}={attempt}", hoh_app::host::ATTEMPT_ENV).into_bytes();
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return Vec::new();
-    };
-    entries
-        .filter_map(Result::ok)
-        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
-        .filter(|pid| {
-            std::fs::read(format!("/proc/{pid}/environ"))
-                .is_ok_and(|env| env.split(|b| *b == 0).any(|e| e == marker.as_slice()))
-                && std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| {
-                    s.rsplit_once(") ")
-                        .is_some_and(|(_, r)| !r.starts_with('Z'))
-                })
-        })
-        .collect()
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir("/proc")? {
+        let Some(pid) = entry?
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let carries = std::fs::read(format!("/proc/{pid}/environ"))
+            .is_ok_and(|env| env.split(|b| *b == 0).any(|e| e == marker.as_slice()));
+        if carries && !hoh_agents::identity::ended(pid, None).unwrap_or(false) {
+            found.push(pid);
+        }
+    }
+    Ok(found)
 }
 
 /// SIGKILLs every live process of an attempt's marker when dropped, however the test ends.
@@ -747,7 +750,7 @@ struct Marked(String);
 
 impl Drop for Marked {
     fn drop(&mut self) {
-        for pid in marked(&self.0) {
+        for pid in marked(&self.0).unwrap_or_default() {
             if let Some(pid) = i32::try_from(pid)
                 .ok()
                 .and_then(rustix::process::Pid::from_raw)
@@ -862,7 +865,7 @@ async fn cancel_with_a_writer_outside(dir: &Path, script: &str, file: &Path) -> 
     let took = asked.elapsed();
     assert!(took <= Duration::from_secs(20), "{took:?}");
     assert_eq!(
-        marked(&attempt),
+        marked(&attempt)?,
         Vec::<u32>::new(),
         "a process of the attempt lives on"
     );
@@ -936,17 +939,7 @@ async fn a_cancel_ends_a_descendant_without_the_marker_that_left_the_group_while
     );
     let guard = KillPidFile(pid_file.clone());
     cancel_with_a_writer_outside(dir.path(), &script, &file).await?;
-    let pid: u32 = std::fs::read_to_string(&pid_file)?.trim().parse()?;
-    let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .ok()
-        .and_then(|s| {
-            s.rsplit_once(") ")
-                .map(|(_, rest)| rest.chars().next().unwrap_or('?'))
-        });
-    assert!(
-        matches!(state, None | Some('Z')),
-        "the writer lives: {state:?}"
-    );
+    assert!(gone(&pid_file)?, "the writer lives");
     drop(guard);
     Ok(())
 }
@@ -1001,7 +994,7 @@ fn t1_marker(project: &Path) -> R<String> {
 /// None of `marker`'s processes lives and `file` no longer grows.
 async fn nothing_of_it_left(marker: &str, file: &Path) -> R {
     assert_eq!(
-        marked(marker),
+        marked(marker)?,
         Vec::<u32>::new(),
         "a process of the attempt lives on"
     );
@@ -1123,7 +1116,7 @@ async fn a_hosts_start_reconcile_ends_an_attempt_only_once_its_processes_outside
     )
     .await?;
     let end = Instant::now() + Duration::from_secs(10);
-    while marked(&marker).len() < 2 {
+    while marked(&marker)?.len() < 2 {
         if Instant::now() > end {
             return Err("the writer did not start".into());
         }
@@ -1131,7 +1124,7 @@ async fn a_hosts_start_reconcile_ends_an_attempt_only_once_its_processes_outside
     }
     first.shutdown().await;
     assert!(
-        marked(&marker).len() >= 2,
+        marked(&marker)?.len() >= 2,
         "the leader and the writer outlive their host"
     );
     // The next host, with no executor: its start reconcile alone.
@@ -1213,17 +1206,7 @@ async fn a_hosts_start_reconcile_pins_through_the_leader_a_descendant_without_th
     let before = size();
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(size(), before, "the workspace is still written");
-    let pid: u32 = std::fs::read_to_string(&pid_file)?.trim().parse()?;
-    let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .ok()
-        .and_then(|s| {
-            s.rsplit_once(") ")
-                .map(|(_, rest)| rest.chars().next().unwrap_or('?'))
-        });
-    assert!(
-        matches!(state, None | Some('Z')),
-        "the writer lives: {state:?}"
-    );
+    assert!(gone(&pid_file)?, "the writer lives");
     drop(guard);
     second.shutdown().await;
     Ok(())
@@ -1372,16 +1355,12 @@ fn hidden_writer(file: &Path, pid_file: &Path) -> R<String> {
     ))
 }
 
-/// Whether the process `pid_file` names is gone (or a zombie not reaped yet).
+/// Whether the process `pid_file` names has ended (gone, a zombie, or being reaped), by `identity::ended`; a look that
+/// cannot tell is an error (M2T07R-1203). Its start time is not known here: a number taken again reads as living, which
+/// can only fail a test, never pass it.
 fn gone(pid_file: &Path) -> R<bool> {
     let pid: u32 = std::fs::read_to_string(pid_file)?.trim().parse()?;
-    let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .ok()
-        .and_then(|s| {
-            s.rsplit_once(") ")
-                .map(|(_, rest)| rest.chars().next().unwrap_or('?'))
-        });
-    Ok(matches!(state, None | Some('Z')))
+    ended(pid, None)
 }
 
 /// Its attempt's tracking as its start recorded it, and the cgroup's path.
