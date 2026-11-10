@@ -77,8 +77,19 @@ pub fn first_input_path(project: &Path, session_id: &str) -> PathBuf {
 /// which fails if anything is there already, so the place only ever holds a whole input and only one, and the
 /// directory synced so the link outlives a power loss before the notice is settled (M2T17R-55). The same input there
 /// already (a notice given again after a crash) is taken; another one is refused. A staged file a crash left for this
-/// notice is removed first: the notice is given again until it is settled, so none outlives its settle.
+/// notice is removed first: the notice is given again until it is settled, so none outlives its settle. Taken means
+/// the directory was synced on this call too, whether the link was made now or found (M2T17R-102: a sync that failed
+/// before the answer was lost is done again before the notice can be settled).
 fn keep_first_input(project: &Path, start: &SessionStart) -> Result<(), String> {
+    keep_first_input_with(project, start, &|dir| std::fs::File::open(dir)?.sync_all())
+}
+
+/// [`keep_first_input`] with `sync_dir` syncing the directory.
+fn keep_first_input_with(
+    project: &Path,
+    start: &SessionStart,
+    sync_dir: &dyn Fn(&Path) -> std::io::Result<()>,
+) -> Result<(), String> {
     use std::io::Write as _;
     let session = start
         .session_id
@@ -106,19 +117,19 @@ fn keep_first_input(project: &Path, start: &SessionStart) -> Result<(), String> 
         let mut file = std::fs::File::create(&staged)?;
         file.write_all(&body)?;
         file.sync_all()?;
-        std::fs::hard_link(&staged, &path)?;
-        std::fs::File::open(dir)?.sync_all()
+        std::fs::hard_link(&staged, &path)
     })();
     let _ = std::fs::remove_file(&staged);
     match written {
-        Ok(()) => Ok(()),
+        Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => match std::fs::read(&path) {
-            Ok(there) if there == body => Ok(()),
-            Ok(_) => Err(format!("{} holds another first input", path.display())),
-            Err(e) => Err(format!("{}: {e}", path.display())),
+            Ok(there) if there == body => {}
+            Ok(_) => return Err(format!("{} holds another first input", path.display())),
+            Err(e) => return Err(format!("{}: {e}", path.display())),
         },
-        Err(e) => Err(format!("{}: {e}", path.display())),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
     }
+    sync_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))
 }
 
 /// The id HoH gives a new Pi session for HoH session `session_id` (ADR-013 decision 1): a UUID-shaped digest of it, the
