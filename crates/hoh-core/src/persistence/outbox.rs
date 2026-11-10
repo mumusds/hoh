@@ -361,10 +361,18 @@ fn current(
     let Some((project_id, spec_sha256, spec_revision)) = run else {
         return Err(PersistError::RunNotFound(message.run_id.clone()));
     };
+    // The epoch a message is fenced by is its consumer's, but for the Commander's own messages, which carry the
+    // Commander's epoch: an old Commander's steer queued before a handover is fenced here, in the transaction of its
+    // effect, not only when it entered (REQ-019 behaviour 3; docs/adr/ADR-024.md decision 6, M2T17R-02).
+    let fenced_role = if message.sender_role == super::handover::COMMANDER {
+        super::handover::COMMANDER
+    } else {
+        consumer
+    };
     let role_epoch = tx
         .query_row(
             "SELECT role_epoch FROM role_bindings WHERE run_id = ?1 AND role = ?2",
-            params![message.run_id, consumer],
+            params![message.run_id, fenced_role],
             |r| r.get(0),
         )
         .optional()
@@ -562,6 +570,13 @@ pub(super) fn consume(
     let found = current(&tx, message, consumer)?;
     let (result_json, rejected) = match fence(message, &found) {
         Some((reason, detail)) => {
+            // An old Commander's message goes into history as its decisions do (REQ-019 behaviour 3): once, whether
+            // its fence at entry or this one saw it first.
+            if reason == RejectionReason::StaleRoleEpoch
+                && message.sender_role == super::handover::COMMANDER
+            {
+                stale_commander_message(&tx, message)?;
+            }
             let result_json = reply(
                 message,
                 consumer,
@@ -647,6 +662,27 @@ pub(super) fn consume(
         replayed: false,
         rejected,
     })
+}
+
+/// An old Commander's `message` as a decisions row REJECTED STALE_ROLE_EPOCH, its payload the message, unless one is
+/// recorded already (its fence at entry, or an earlier delivery).
+fn stale_commander_message(tx: &Transaction<'_>, message: &Message) -> Result<(), PersistError> {
+    let epoch = i64::try_from(message.role_epoch).map_err(|_| {
+        PersistError::IntegrityViolation(format!("role epoch of {}", message.message_id))
+    })?;
+    let revision = i64::try_from(message.expected_revision).map_err(|_| {
+        PersistError::IntegrityViolation(format!("expected revision of {}", message.message_id))
+    })?;
+    let recorded = protocol::encode(message).map_err(|e| {
+        PersistError::IntegrityViolation(format!("message {}: {e}", message.message_id))
+    })?;
+    tx.execute(
+        "INSERT OR IGNORE INTO decisions(decision_id, run_id, role_epoch, expected_revision, reason_code, payload_json, \
+         state) VALUES (?1, ?2, ?3, ?4, 'STALE_ROLE_EPOCH', ?5, 'REJECTED')",
+        params![message.message_id, message.run_id, epoch, revision, recorded.to_string()],
+    )
+    .map_err(sqlite_error)?;
+    Ok(())
 }
 
 /// Record that `consumer` got something that is not a valid message (REQ-022 b1: refused and recorded, never

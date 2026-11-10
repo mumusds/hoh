@@ -10,7 +10,8 @@ use hoh_core::config::Config;
 use hoh_core::decision::{Context, Proposal};
 use hoh_core::persistence::selftest::{self, ProbeCommand};
 use hoh_core::persistence::{
-    Availability, Decided, Fenced, NewEvent, Options, RunTarget, Store, SubmitCommand, TeamChange,
+    Availability, Commit, ConsumeEffect, Decided, Fenced, NewEvent, NewOutbox, Options, RunTarget,
+    Store, SubmitCommand, TeamChange,
 };
 use hoh_core::protocol::Message;
 use serde_json::{Value, json};
@@ -385,6 +386,108 @@ async fn an_old_commanders_steer_is_rejected_by_its_own_epoch_and_changes_nothin
             .commander_message(&commander_message("not-mine", 2, "developer", "decision")?)
             .await
             .is_err()
+    );
+    Ok(())
+}
+
+/// Queue `message` for its recipient, as a router would once the Commander's fence let it pass.
+async fn queue(store: &Store, message: &Message) -> R {
+    store
+        .commit(Commit {
+            events: vec![NewEvent {
+                project_id: "p1".to_owned(),
+                event_id: format!("queued/{}", message.message_id),
+                run_id: Some("R".to_owned()),
+                kind: "message.queued".to_owned(),
+                payload: json!({"message_id": message.message_id}),
+            }],
+            outbox: vec![NewOutbox::hcp(0, message)?],
+            ..Commit::default()
+        })
+        .await?;
+    Ok(())
+}
+
+/// The effect a consumer commits with `message` once its fences pass: one event of its own.
+fn applied(message: &Message) -> ConsumeEffect {
+    ConsumeEffect {
+        events: vec![NewEvent {
+            project_id: "p1".to_owned(),
+            event_id: format!("effect/{}", message.message_id),
+            run_id: Some("R".to_owned()),
+            kind: "steer.taken".to_owned(),
+            payload: json!({"message_id": message.message_id}),
+        }],
+        ..ConsumeEffect::default()
+    }
+}
+
+#[tokio::test]
+async fn an_old_commanders_steer_queued_before_the_handover_is_rejected_when_consumed_after_it() -> R
+{
+    // REQ-019 behaviour 3 (docs/adr/ADR-024.md decision 6, M2T17R-02): the old Codex's steer to the developer passed
+    // the Commander's fence at epoch 1 and was queued; the handover makes the commander pi at epoch 2, the developer
+    // stays at epoch 1. Consumed after the handover, the steer is fenced by its sender's epoch in the consume's own
+    // transaction: rejected STALE_ROLE_EPOCH, its effect never committed, a decisions row REJECTED STALE_ROLE_EPOCH.
+    // The new Commander's steer (epoch 2, the developer still at 1) is fenced by the commander's epoch too, and taken.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    world(&store, &path).await?;
+    let old = commander_message("old-steer", 1, "developer", "steer")?;
+    assert!(matches!(
+        store.commander_message(&old).await?,
+        Fenced::Current
+    ));
+    queue(&store, &old).await?;
+    hand_over(&store, &path).await?;
+    let now = std::time::SystemTime::now();
+    let consumed = store
+        .consume("developer", old.clone(), applied(&old), now)
+        .await?;
+    assert_eq!(
+        consumed.rejected.map(serde_json::to_value).transpose()?,
+        Some(json!("STALE_ROLE_EPOCH")),
+        "{}",
+        consumed.result_json
+    );
+    assert_eq!(
+        one(
+            &path,
+            "SELECT count(*) FROM events WHERE kind = 'steer.taken'"
+        )?,
+        "0",
+        "its effect never committed"
+    );
+    assert_eq!(
+        one(
+            &path,
+            "SELECT state || '/' || reason_code || '/' || role_epoch FROM decisions WHERE decision_id = 'old-steer'"
+        )?,
+        "REJECTED/STALE_ROLE_EPOCH/1"
+    );
+    assert_eq!(
+        one(
+            &path,
+            "SELECT state || revision FROM tasks WHERE task_id = 'T'"
+        )?,
+        "RUNNING5"
+    );
+    let new = commander_message("new-steer", 2, "developer", "steer")?;
+    assert!(matches!(
+        store.commander_message(&new).await?,
+        Fenced::Current
+    ));
+    queue(&store, &new).await?;
+    let consumed = store
+        .consume("developer", new.clone(), applied(&new), now)
+        .await?;
+    assert_eq!(consumed.rejected, None, "{}", consumed.result_json);
+    assert_eq!(
+        one(
+            &path,
+            "SELECT count(*) FROM events WHERE kind = 'steer.taken'"
+        )?,
+        "1"
     );
     Ok(())
 }
