@@ -16,6 +16,9 @@ use std::time::Duration;
 /// How long one probe command may take.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// How often a wanted agent's login is looked at again (its status command, docs/adr/ADR-024.md decision 7).
+const AUTH_EVERY: Duration = Duration::from_secs(30);
+
 /// An agent found and probed: what starting its turns needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ready {
@@ -45,6 +48,8 @@ pub struct Registry {
     /// The agents the runner needs looked at (its team's, its unbound bindings'): [`Registry::refresh`] looks at them,
     /// off the runner's tick, so no probe holds up a tick or the host's stop.
     wanted: Mutex<BTreeSet<Agent>>,
+    /// Each agent's login as last looked at, and when: `Some(what to do)` when its status says it is not logged in.
+    logins: Mutex<BTreeMap<Agent, (std::time::Instant, Option<String>)>>,
     /// The host's stop: every probe command running is killed and none starts (decision 10 v6, M2T07R-202, -300, -450,
     /// -700).
     stopping: probe::ProbeStop,
@@ -57,6 +62,7 @@ impl Registry {
             path,
             seen: Mutex::new(BTreeMap::new()),
             wanted: Mutex::new(BTreeSet::new()),
+            logins: Mutex::new(BTreeMap::new()),
             stopping: probe::ProbeStop::default(),
         }
     }
@@ -90,22 +96,55 @@ impl Registry {
         }
     }
 
+    /// Look at `agent`'s login (installed: `ready`) unless it was looked at within [`AUTH_EVERY`]: its status command,
+    /// under the host's stop like every probe command (decision 7). A look the stop ended says nothing.
+    fn look_at_login(&self, agent: Agent, ready: &Ready) {
+        let recent = self
+            .logins
+            .lock()
+            .ok()
+            .and_then(|l| l.get(&agent).map(|(at, _)| at.elapsed() < AUTH_EVERY))
+            .unwrap_or(false);
+        if recent {
+            return;
+        }
+        let missing = hoh_agents::login::missing(agent, &ready.launcher, &self.env());
+        if self.stopping.is_stopped() {
+            return;
+        }
+        if let Ok(mut logins) = self.logins.lock() {
+            logins.insert(agent, (std::time::Instant::now(), missing));
+        }
+    }
+
     /// What was last seen of every agent, without looking (decision 8): those found available, those found unavailable
     /// with why; any other was not looked at yet.
     pub fn availability(&self) -> hoh_core::persistence::Availability {
         let mut known = hoh_core::persistence::Availability {
             available: Some(BTreeSet::new()),
             unavailable: BTreeMap::new(),
+            auth_missing: BTreeMap::new(),
         };
+        // An agent counts as available only once its login was looked at too: before that, a change to it waits as
+        // for an agent not looked at yet, so it never takes effect ahead of the login check (decision 7).
+        let logins = self.logins.lock().map(|l| l.clone()).unwrap_or_default();
+        for (agent, (_, missing)) in &logins {
+            if let Some(why) = missing {
+                known
+                    .auth_missing
+                    .insert(agent.as_str().to_owned(), why.clone());
+            }
+        }
         if let Ok(seen) = self.seen.lock() {
             for (agent, seen) in seen.iter() {
                 let name = agent.as_str().to_owned();
                 match &seen.outcome {
-                    Ok(_) => {
+                    Ok(_) if logins.contains_key(agent) => {
                         if let Some(available) = known.available.as_mut() {
                             available.insert(name);
                         }
                     }
+                    Ok(_) => {}
                     Err(why) => {
                         known.unavailable.insert(name, why.clone());
                     }
@@ -163,6 +202,14 @@ impl Registry {
         // at), and no dispatch takes the stop for the agent being unavailable (M2T07R-352).
         if self.stopping.is_stopped() {
             return outcome;
+        }
+        // Its login too, once it is usable (decision 7): looked at before the agent is recorded, so an agent seen
+        // usable always has its login looked at.
+        if let Ok(ready) = &outcome {
+            self.look_at_login(agent, ready);
+            if self.stopping.is_stopped() {
+                return outcome;
+            }
         }
         if let Ok(mut seen) = self.seen.lock() {
             seen.insert(

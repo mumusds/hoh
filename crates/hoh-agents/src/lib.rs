@@ -16,6 +16,7 @@ pub mod frame;
 pub mod identity;
 pub mod known;
 pub mod launch;
+pub mod login;
 pub mod pi;
 pub mod probe;
 pub mod process;

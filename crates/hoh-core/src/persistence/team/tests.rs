@@ -924,6 +924,7 @@ async fn a_change_to_an_agent_not_looked_at_yet_waits_without_a_verdict() -> R {
     let unknown = crate::persistence::Availability {
         available: Some(["claude".to_owned()].into()),
         unavailable: Default::default(),
+        auth_missing: Default::default(),
     };
     store.team_checkpoint("R1", unknown).await?;
     assert_eq!(
@@ -1581,6 +1582,47 @@ async fn a_session_start_goes_once_to_its_epochs_session_and_a_superseded_one_ne
     assert_eq!(
         serde_json::from_str::<Value>(superseded[0][2].as_str().ok_or("result")?)?["rejected"],
         json!("STALE_ROLE_EPOCH")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_change_to_an_agent_missing_its_auth_is_refused_blocked_auth_until_it_has_it() -> R {
+    // REQ-019 failure mode 3 (ADR-024 decision 7): the registry found the commander's new agent installed but not
+    // logged in; the change is refused (team.binding_refused, reason BLOCKED_AUTH, the old binding and epoch kept and
+    // working); once the agent has its auth the change applies at epoch 2 with its handover.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    working(&store, &path).await?;
+    store
+        .submit_command(team_change("pi", 0, json!({"commander": {"agent": "pi"}})))
+        .await?;
+    let logged_out = crate::persistence::Availability {
+        auth_missing: [("pi".to_owned(), "run `pi auth login`".to_owned())].into(),
+        ..crate::persistence::Availability::default()
+    };
+    for _ in 0..2 {
+        store.team_checkpoint("R1", logged_out.clone()).await?;
+        assert_eq!(
+            binding(&path, "commander")?[..3],
+            [json!("codex"), Value::Null, json!(1)]
+        );
+    }
+    assert_eq!(
+        rows::<String>(
+            &path,
+            "SELECT json_extract(payload_json, '$.reason') || '/' || json_extract(payload_json, '$.detail') \
+             FROM events WHERE kind = 'team.binding_refused'"
+        )?,
+        [["BLOCKED_AUTH/run `pi auth login`".to_owned()]],
+        "one refusal, its reason and what to do"
+    );
+    store
+        .team_checkpoint("R1", crate::persistence::Availability::default())
+        .await?;
+    assert_eq!(
+        binding(&path, "commander")?[..3],
+        [json!("pi"), Value::Null, json!(2)]
     );
     Ok(())
 }
