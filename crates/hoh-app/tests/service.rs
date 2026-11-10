@@ -1019,6 +1019,70 @@ fn the_uninstall_removes_nothing_while_an_instance_stopped_but_is_still_enabled(
 }
 
 #[test]
+fn an_instance_enabled_again_before_the_uninstalls_run_lock_is_disabled_before_anything_is_removed()
+-> R {
+    // Design correction 9 (M2T14R-600): the uninstall disables the instances, then takes the run lock exclusive. Held
+    // in between (a stand-in flock), an installed `hoh __unit enable` run enables the instance again and ends; its
+    // enablement outlives it. Under both locks the uninstall looks at the instances once more and disables it: it ends
+    // 0, the instance disabled and no wants link left. Before, the link to the removed template stayed.
+    let (manager, project) = installed(true)?;
+    let unit = unit_of(&project);
+    let wants = manager
+        .home()
+        .join(format!(".config/systemd/user/default.target.wants/{unit}"));
+    assert!(wants.is_symlink());
+    let paused = manager.root().join("flock-paused");
+    let go = manager.root().join("flock-go");
+    installed::script(
+        &manager.bin().join("flock"),
+        &format!(
+            "#!/bin/sh\ncase \" $* \" in *\" 9 \"*) if [ ! -e {p} ]; then : > {p}; i=0; while [ ! -e {g} ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done; fi;; esac\nexec /usr/bin/flock \"$@\"\n",
+            p = paused.display(),
+            g = go.display()
+        ),
+    )?;
+    let bundle = manager.root().join("bundle/hoh");
+    let uninstalling = manager
+        .command("bash")
+        .arg(bundle.join("install.sh"))
+        .arg("--uninstall")
+        .current_dir(manager.root())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let end = std::time::Instant::now() + Duration::from_secs(30);
+    while !paused.exists() {
+        if std::time::Instant::now() > end {
+            return Err("the uninstall did not pause".into());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let first = !wants.exists() && !wants.is_symlink();
+    let enabled = manager
+        .command(manager.home().join(".local/bin/hoh"))
+        .arg("__unit")
+        .arg("enable")
+        .arg(&project)
+        .output()?;
+    let again = wants.is_symlink();
+    std::fs::write(&go, "")?;
+    let out = uninstalling.wait_with_output()?;
+    assert!(first, "the first pass left it enabled: {}", text(&out));
+    assert_eq!(enabled.status.code(), Some(0), "{}", text(&enabled));
+    assert!(again, "__unit enable did not enable it again");
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(
+        !wants.exists() && !wants.is_symlink(),
+        "{} left: {}",
+        wants.display(),
+        text(&out)
+    );
+    let state = manager.systemctl(&["is-enabled", &unit])?;
+    assert!(!state.status.success(), "{}", text(&state));
+    Ok(())
+}
+
+#[test]
 fn a_start_that_never_reached_the_manager_is_not_said_to_go_on() -> R {
     // M2T14R-102: systemctl still waiting at the deadline proves nothing; a stand-in that holds `start` 12 s before
     // the real one: the client asks the manager, which has no job, and says so.

@@ -13,11 +13,12 @@
 #       instances' files). Projects' .hoh/, drop-ins, ~/.config/hoh and lingering are left as they are, and so is
 #       the installers' own lock $XDG_DATA_HOME/hoh.lock (an empty file, kept so that its lock is never on a removed one).
 #
-# Exit codes: 0 done; 1 ~/.local/bin/hoh is not this installation's; 64 usage, or a bundle without a runnable bin/hoh
-# that names its version; 69 the user's systemd manager cannot do what was asked, something still runs this
+# Exit codes: 0 done; 1 ~/.local/bin/hoh is not this installation's; 64 usage, or a bundle whose bin/hoh is missing,
+# does not run or names no version; 69 the user's systemd manager cannot do what was asked, something still runs this
 # installation or its lock cannot be opened, locked or told (nothing removed), another install.sh of it holds the
 # installer's lock, that lock cannot be made, opened or locked, or the installed binary does not run; 77 run as root;
-# 78 a home or project systemd cannot use. An uninstall that finds nothing installed says so, writes nothing, exits 0.
+# 78 a home, root or project systemd cannot use. Refusals write nothing of the installation (those that run the
+# bundle's binary leave the installers' lock file). An uninstall that finds nothing installed says so, writes nothing.
 set -Eeuo pipefail
 
 say() { printf 'install.sh: %s\n' "$*" >&2; }
@@ -87,8 +88,8 @@ main() {
   fi
 }
 
-# The installer's own lock (docs/adr/ADR-023.md design corrections 5 and 7): every install and uninstall holds
-# $XDG_DATA_HOME/hoh.lock exclusive for its whole run, so installers of one installation take turns and none sees
+# The installer's own lock (docs/adr/ADR-023.md design corrections 5, 7 and 8): every install, and every uninstall
+# that finds something to act on, holds $XDG_DATA_HOME/hoh.lock exclusive for the rest of its run, so installers of one installation take turns and none sees
 # another's half-done work. A file beside the installation's root that no uninstall removes (its lock is never on a
 # file that is gone), opened read-write (as an NFS client needs for an exclusive lock), which no run of hoh locks.
 hold_operation() {
@@ -114,8 +115,9 @@ take_lock() {
   lock_said="$(flock -E 75 "$@" 2>&1)" || lock_rc=$?
 }
 
-# Whether anything of this installation is there: its root, its template or its command link.
-installed() { [[ -e "$root" || -L "$root" || -e "$template" ]] || ours; }
+# Whether anything of this installation is there: its root, its template or its command link (the installer never
+# makes the root a link: a dangling one is no installation, M2T14R-654).
+installed() { [[ -e "$root" || -e "$template" ]] || ours; }
 
 # What refuses an install before it writes anything, even its lock (exit 1, 64 or 69; design correction 8).
 refusals() {
@@ -165,12 +167,19 @@ link() {
 }
 
 install() {
-  local name semver sha changed=0
+  local name semver sha real_root asked changed=0
   # An installed hoh (this script may be one's copy) runs only with its installation's lock: one missing from an
   # existing installation is made again before any of its binaries runs (M2T14R-352).
   [[ ! -d "$root" || -e "$root/.lock" ]] || : >"$root/.lock"
-  semver="$("$src/bin/hoh" --version | sed -n '1s/^hoh //p')"
-  [[ "$semver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail 64 "$src/bin/hoh --version does not name a version"
+  # The bundle's binary, asked on its own: any failure, or no version named, refuses the bundle (design correction 9,
+  # M2T14R-602). Then whether the unit can name this home and root, by the template's own rule, before anything of
+  # the installation is written (M2T14R-601): both leave only the installers' lock file.
+  asked="$("$src/bin/hoh" --version 2>&1)" || fail 64 "$src/bin/hoh does not run (--version: exit $?): $asked"
+  semver="$(sed -n '1s/^hoh //p' <<<"$asked")"
+  [[ "$semver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail 64 "$src/bin/hoh --version does not name a version: $asked"
+  real_root="$(readlink -m -- "$root")"
+  "$src/bin/hoh" __unit check "$HOME" "$root" "$real_root" ||
+    fail "$?" "nothing of the installation was written: the systemd unit cannot take this home or root (said above)"
   sha="$(sha256sum -- "$src/bin/hoh" | cut -c1-12)"
   name="$semver-$sha"
   # A version directory is named by its binary and never changed once there: a host running from it, and the agents
@@ -228,6 +237,23 @@ install() {
   else
     printf 'linger: no (a host unit would stop with your last session; install.sh --linger asks for it)\n'
   fi
+}
+
+# Disable every instance enabled again while the uninstall ran (its link in a .wants directory of the user's
+# configuration) and check its link is gone; 1 when one is left (design correction 9, M2T14R-600).
+disable_enabled_again() {
+  local file unit left=0
+  for file in "$config/systemd/user/"*.wants/hoh-host@*.service; do
+    [[ -e "$file" || -L "$file" ]] || continue
+    unit="$(basename -- "$file")"
+    if manager && systemctl --user disable --quiet "$unit" && [[ ! -e "$file" && ! -L "$file" ]]; then
+      printf 'disabled %s: it was enabled again while the uninstall ran\n' "$unit"
+    else
+      say "$unit was enabled again while the uninstall ran and is still enabled"
+      left=1
+    fi
+  done
+  return "$left"
 }
 
 remove() {
@@ -329,8 +355,18 @@ remove() {
   if ((run_holds)); then
     say "this installation's lock is held: one of its programs still runs"
   fi
-  if ((failed || running || !held)); then
+  # Under both locks no run can start, so none can enable an instance any more: one enabled again since the first
+  # pass (an `__unit enable` that ended before the run lock was had) is disabled now, and what is seen now stays so
+  # (design correction 9, M2T14R-600).
+  if ((held && !running && !failed)); then
+    disable_enabled_again || failed=1
+  fi
+  # The closing word follows the cause: something runs or stays enabled, or only the lock was not had (M2T14R-652).
+  if ((failed || running || run_holds)); then
     fail 69 "nothing was removed: stop what is named above, then run install.sh --uninstall again"
+  fi
+  if ((!held)); then
+    fail 69 "nothing was removed: this installation's lock could not be had or told (said above); run install.sh --uninstall again once it can be"
   fi
   # Each removal is said as it happened (M2T14R-150).
   if [[ -e "$template" ]]; then

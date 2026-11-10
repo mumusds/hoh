@@ -553,6 +553,154 @@ fn a_bundle_without_its_binary_is_refused_before_anything_is_written() -> R {
 }
 
 #[test]
+fn a_home_the_unit_cannot_name_is_refused_before_any_installation_file_is_written() -> R {
+    // Design correction 9 (M2T14R-601, -650): one rule for what a unit can name, the template generator's, applied by
+    // the bundle's binary (`__unit check`) after the installers' lock and before anything of the installation is
+    // written: a HOME that is not UTF-8 or has a control character, U+FEFF or a noncharacter is refused (78), leaving
+    // only the installers' lock file. Before, the install wrote its version, `current` and the command link, then
+    // failed at the template.
+    use std::os::unix::ffi::OsStrExt as _;
+    let install = Install::new()?;
+    let names: Vec<&[u8]> = vec![
+        b"h\tt",
+        b"h\nn",
+        b"h\x7f",
+        "h\u{85}".as_bytes(),
+        "h\u{feff}".as_bytes(),
+        "h\u{fdd0}".as_bytes(),
+        "h\u{fffe}".as_bytes(),
+        b"h\xff",
+    ];
+    for name in names {
+        let home = install.root.path().join(std::ffi::OsStr::from_bytes(name));
+        std::fs::create_dir(&home)?;
+        let out = Command::new("bash")
+            .arg(install.root.path().join("bundle/hoh/install.sh"))
+            .current_dir(install.root.path())
+            .env_clear()
+            .env("HOME", &home)
+            .env("XDG_RUNTIME_DIR", install.root.path().join("r"))
+            .env("USER", "tester")
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", install.stubs().display()),
+            )
+            .output()?;
+        assert_eq!(out.status.code(), Some(78), "{name:?}: {}", text(&out));
+        let written: Vec<PathBuf> = tree(&home)?
+            .into_iter()
+            .filter(|(_, e)| e.kind != 'd')
+            .map(|(p, _)| p)
+            .collect();
+        assert_eq!(
+            written,
+            [PathBuf::from(".local/share/hoh.lock")],
+            "{name:?}: {}",
+            text(&out)
+        );
+    }
+    // The root the installed binary will name is its canonical path: a plain XDG_DATA_HOME that is a link to a
+    // directory with a TAB is refused the same way (the lock file is written through the link, nothing else).
+    let target = install.root.path().join("d\tx");
+    std::fs::create_dir(&target)?;
+    let data = install.root.path().join("data");
+    std::os::unix::fs::symlink(&target, &data)?;
+    let out = Command::new("bash")
+        .arg(install.root.path().join("bundle/hoh/install.sh"))
+        .current_dir(install.root.path())
+        .env_clear()
+        .env("HOME", install.home())
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_RUNTIME_DIR", install.root.path().join("r"))
+        .env("USER", "tester")
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", install.stubs().display()),
+        )
+        .output()?;
+    assert_eq!(out.status.code(), Some(78), "{}", text(&out));
+    let written: Vec<PathBuf> = tree(&target)?
+        .into_iter()
+        .filter(|(_, e)| e.kind != 'd')
+        .map(|(p, _)| p)
+        .collect();
+    assert_eq!(written, [PathBuf::from("hoh.lock")], "{}", text(&out));
+    assert!(!install.home().join(".local/bin/hoh").is_symlink());
+    Ok(())
+}
+
+#[test]
+fn a_bundle_whose_binary_does_not_run_is_refused_with_64_and_its_exit_code() -> R {
+    // Design correction 9 (M2T14R-602, -651): the bundle's binary is asked its version on its own; any failure, or no
+    // version named, is 64 with what it said, leaving only the installers' lock file. Before, a failing binary ended
+    // the install with its own code and no word.
+    let install = Install::new()?;
+    let binary = install.root.path().join("bundle/hoh/bin/hoh");
+    for (code, said) in [
+        ("3", "exit 3"),
+        ("126", "exit 126"),
+        ("0", "does not name a version"),
+    ] {
+        std::fs::remove_file(&binary)?;
+        script(
+            &binary,
+            &format!("#!/bin/sh\necho no-version\nexit {code}\n"),
+        )?;
+        let out = install.run("bundle", &[])?;
+        assert_eq!(out.status.code(), Some(64), "{code}: {}", text(&out));
+        let stderr = String::from_utf8(out.stderr.clone())?;
+        assert!(stderr.contains(said), "{code}: {stderr}");
+        let written: Vec<PathBuf> = tree(&install.home())?
+            .into_iter()
+            .filter(|(_, e)| e.kind != 'd')
+            .map(|(p, _)| p)
+            .collect();
+        assert_eq!(written, [PathBuf::from(".local/share/hoh.lock")], "{code}");
+    }
+    Ok(())
+}
+
+#[test]
+fn an_uninstall_whose_run_lock_another_holds_says_a_program_still_runs() -> R {
+    // M2T14R-653: the run lock held shared by a process the /proc scan does not name (its program is not under the
+    // root: this test's own) is the conflict: 69, the lock said held, and the user told to stop what runs; nothing is
+    // removed, and the uninstall completes once the lock is let go.
+    let install = Install::new()?;
+    let out = install.run("bundle", &[])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let lock = std::fs::File::open(install.data().join("hoh/.lock"))?;
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockShared)?;
+    let out = install.run("bundle", &["--uninstall"])?;
+    assert_eq!(out.status.code(), Some(69), "{}", text(&out));
+    let stderr = String::from_utf8(out.stderr.clone())?;
+    assert!(
+        stderr.contains("this installation's lock is held: one of its programs still runs"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("stop what is named above"), "{stderr}");
+    assert!(install.data().join("hoh/current/bin/hoh").exists());
+    drop(lock);
+    let out = install.run("bundle", &["--uninstall"])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    Ok(())
+}
+
+#[test]
+fn an_uninstall_with_a_dangling_root_link_says_not_installed_and_writes_nothing() -> R {
+    // M2T14R-654: the installer never makes the root a link; a dangling one is no installation: `not installed`, 0,
+    // nothing written (before, the uninstall took the lock, wrote hoh.lock and said nothing).
+    let install = Install::new()?;
+    std::fs::create_dir_all(install.data())?;
+    std::os::unix::fs::symlink(install.root.path().join("gone"), install.data().join("hoh"))?;
+    let before = tree(&install.home())?;
+    let out = install.run("bundle", &["--uninstall"])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(String::from_utf8(out.stdout.clone())?, "not installed\n");
+    assert_eq!(tree(&install.home())?, before);
+    Ok(())
+}
+
+#[test]
 fn an_uninstall_with_no_data_directory_takes_turns_with_a_first_install() -> R {
     // Design correction 8 (M2T14R-500): an uninstall that will act holds the installers' lock even when the data
     // directory does not exist yet. With a dangling link of this installation's as the only thing there, the uninstall
@@ -1162,6 +1310,7 @@ fn an_uninstall_whose_lock_changed_while_it_took_it_removes_nothing() -> R {
     let stderr = String::from_utf8(out.stderr.clone())?;
     assert!(stderr.contains("lock changed"), "{stderr}");
     assert!(!stderr.contains("still runs"), "{stderr}");
+    assert!(!stderr.contains("stop what is named above"), "{stderr}");
     assert!(install.data().join("hoh/current/bin/hoh").exists());
     std::fs::remove_file(install.stubs().join("flock"))?;
     let out = install.run("bundle", &["--uninstall"])?;
@@ -1233,6 +1382,7 @@ fn an_uninstall_that_cannot_tell_its_lock_removes_nothing() -> R {
     let stderr = String::from_utf8(out.stderr.clone())?;
     assert!(stderr.contains("cannot tell"), "{stderr}");
     assert!(!stderr.contains("still runs"), "{stderr}");
+    assert!(!stderr.contains("stop what is named above"), "{stderr}");
     assert!(install.data().join("hoh/current/bin/hoh").exists());
     assert!(install.home().join(".local/bin/hoh").is_symlink());
     std::fs::remove_file(install.stubs().join("stat"))?;
@@ -1333,6 +1483,7 @@ fn an_uninstall_whose_lock_cannot_be_had_says_so_and_not_that_a_program_runs() -
     assert!(stderr.contains("cannot lock"), "{stderr}");
     assert!(stderr.contains("Input/output error"), "{stderr}");
     assert!(!stderr.contains("still runs"), "{stderr}");
+    assert!(!stderr.contains("stop what is named above"), "{stderr}");
     assert!(install.data().join("hoh/current/bin/hoh").exists());
     std::fs::remove_file(install.stubs().join("flock"))?;
     let out = install.run("bundle", &["--uninstall"])?;
@@ -1377,6 +1528,7 @@ fn an_uninstall_that_cannot_open_the_installations_lock_says_so() -> R {
         "{stderr}"
     );
     assert!(!stderr.contains("still runs"), "{stderr}");
+    assert!(!stderr.contains("stop what is named above"), "{stderr}");
     assert!(install.data().join("hoh/current/bin/hoh").exists());
     Ok(())
 }
