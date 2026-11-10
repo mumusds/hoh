@@ -381,25 +381,56 @@ async fn host_with(
 /// them, so a test can have its scenario established before the step that could end it (ADR-022 decision 10, v2;
 /// CIR-602). It stands still between moves.
 #[derive(Debug)]
-struct TestClock(std::sync::Mutex<std::time::SystemTime>);
+struct TestClock(std::sync::Mutex<(std::time::SystemTime, Option<Instant>)>);
 
 impl TestClock {
     fn new() -> TestClock {
-        TestClock(std::sync::Mutex::new(std::time::SystemTime::now()))
+        TestClock(std::sync::Mutex::new((std::time::SystemTime::now(), None)))
     }
 
     fn advance(&self, by: Duration) {
         if let Ok(mut now) = self.0.lock() {
-            *now += by;
+            now.0 += by;
+        }
+    }
+
+    /// From now on it runs, an hour ahead: every step still to come is due at once and the passes end, however the
+    /// test leaves (a failure included: CIR-703).
+    fn release(&self) {
+        if let Ok(mut now) = self.0.lock()
+            && now.1.is_none()
+        {
+            now.0 += Duration::from_secs(3600);
+            now.1 = Some(Instant::now());
         }
     }
 }
 
 impl hoh_core::delivery::Clock for TestClock {
     fn now(&self) -> std::time::SystemTime {
-        self.0
-            .lock()
-            .map_or_else(|_| std::time::SystemTime::now(), |now| *now)
+        self.0.lock().map_or_else(
+            |_| std::time::SystemTime::now(),
+            |now| now.0 + now.1.map_or(Duration::ZERO, |at| at.elapsed()),
+        )
+    }
+}
+
+/// Releases its clock when dropped, whatever ends the test.
+struct Released(Arc<TestClock>);
+
+impl Drop for Released {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+/// A child of the test killed and reaped when dropped (its own unreaped child: no number is signalled).
+struct Killed(std::process::Child);
+
+impl Drop for Killed {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
 }
 
@@ -826,9 +857,10 @@ def on_term(*_):
     os._exit(0)
 if not ignored:
     signal.signal(signal.SIGTERM, on_term)
+start = open('/proc/self/stat').read().rsplit(') ', 1)[1].split()[19]
 with open(mark, 'a') as f:
-    f.write('established %d %d %d %s\n' % (os.getpid(), os.getsid(0), int(time.time() * 1000),
-                                          'ignored' if ignored else 'handled'))
+    f.write('established %d %d %d %s %s\n' % (os.getpid(), os.getsid(0), int(time.time() * 1000),
+                                             'ignored' if ignored else 'handled', start))
 signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
 end = time.monotonic() + 120
 while time.monotonic() < end:
@@ -859,15 +891,50 @@ fn go_mark(file: &Path) -> PathBuf {
     file.with_extension("go")
 }
 
+/// The test's spawner for `file`'s writer: started by the test, outside the attempt and without its marker, it waits
+/// for the leader's request (the attempt's marker, written at its SIGTERM), then makes the writer in a session of its
+/// own with that marker as its whole environment, SIGTERM blocked until the writer's evidence is written. No parent
+/// chain leads from the attempt to that writer: only the marker scan can find it (CIR-701).
+fn spawner(file: &Path) -> R<Killed> {
+    let script = file.with_extension("spawner.py");
+    std::fs::write(
+        &script,
+        r#"import os, signal, sys, time
+request, marker = sys.argv[1:3]
+writer = sys.argv[3:]
+signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+while not os.path.exists(request):
+    time.sleep(0.01)
+value = open(request).read()
+pid = os.fork()
+if pid == 0:
+    os.setsid()
+    os.execve(writer[0], writer, {marker: value})
+os.waitpid(pid, 0)
+"#,
+    )?;
+    let request = PathBuf::from(format!("{}.spawn", go_mark(file).display()));
+    Ok(Killed(
+        Command::new("/usr/bin/python3")
+            .arg(&script)
+            .arg(&request)
+            .arg(hoh_app::host::ATTEMPT_ENV)
+            .args(writer(file)?.split(' '))
+            .spawn()?,
+    ))
+}
+
 /// What the leader stand-in does with the writer (each one's scenario is its test's).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Leader {
     /// Orphans the writer in a session of its own at once (forked by a child that leads a new session and exits at
     /// once), then dies at SIGTERM.
     OrphansAtOnce,
-    /// At SIGTERM orphans the writer, then waits for SIGKILL (its SIGTERM held blocked).
+    /// At SIGTERM has the test's spawner make the writer (the attempt's marker its only tie), then waits for SIGKILL
+    /// (its SIGTERM held blocked).
     OrphansOnTermThenWaits,
-    /// At SIGTERM orphans the writer, then exits 20 ms later, so its group is empty at once.
+    /// At SIGTERM has the test's spawner make the writer, then exits once the writer is established (20 ms after), so
+    /// its group is empty while the writer lives.
     OrphansOnTermThenExits,
     /// Once told to go (the cancel accepted), starts the writer with an emptied environment in a session of its own as
     /// its own child (its pid in the pid file), then dies at SIGTERM: only the parent chain ties it to the attempt.
@@ -898,10 +965,12 @@ signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
 if what in ('StartsUnmarkedOnGo', 'StartsPinnedW') and marker in os.environ:
     env = {k: v for k, v in os.environ.items() if k != marker}
     os.execve(sys.executable, [sys.executable] + sys.argv, env)
-def established():
+def recorded(kind):
     mark = writer[-1]
-    while not (os.path.exists(mark) and 'established' in open(mark).read()):
+    while not (os.path.exists(mark) and any(l.startswith(kind + ' ') for l in open(mark))):
         time.sleep(0.02)
+def established():
+    recorded('established')
 # Every process of a creation is forked here and execs nothing but the writer (or W): the blocked SIGTERM is never
 # reset on the way, whatever the PATH holds (dash gives its foreground commands an empty mask: evidence
 # ci-reliability-r7-dash).
@@ -924,6 +993,8 @@ if what == 'StartsPinnedW':
     w_script = ("import os, signal, sys\n"
                 "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
                 "signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})\n"
+                "start = open('/proc/self/stat').read().rsplit(') ', 1)[1].split()[19]\n"
+                "open(sys.argv[-1], 'a').write('w %d %d %s\\n' % (os.getpid(), os.getsid(0), start))\n"
                 "os.read(int(sys.argv[1]), 1)\n"
                 "c = os.fork()\n"
                 "if c == 0:\n"
@@ -936,10 +1007,16 @@ if what == 'StartsPinnedW':
         os.execve(sys.executable, [sys.executable, '-c', w_script, str(r)] + writer, {})
     os.close(r)
     open(pid_file, 'w').write(str(pid))
+    # W's own record, after its setsid and its SIGTERM ignored: only then may the leader be ended (CIR-702).
+    recorded('w')
 open(ready, 'w').close()
 if what in ('OrphansOnTermThenWaits', 'OrphansOnTermThenExits'):
     signal.sigwait({signal.SIGTERM})
-    orphan()
+    # The writer comes from the test's spawner, outside the attempt (no parent chain to it ever): the leader hands it
+    # the attempt's marker, the writer's only tie to the attempt, so only the marker scan finds it (CIR-701).
+    with open(go + '.spawn.tmp', 'w') as f:
+        f.write(os.environ[marker])
+    os.rename(go + '.spawn.tmp', go + '.spawn')
     if what == 'OrphansOnTermThenExits':
         # Gone once the writer is: never before it, or the executor's group kill at the leader's end could end a
         # creation not yet out of the group (CIR-602).
@@ -1047,7 +1124,8 @@ struct WriterRecord {
 /// only once nothing of T1's attempt lives, that the writer was established in a session of its own and, if it handles
 /// SIGTERM, got it before the SIGKILL step, and that `file` no longer grows then; the writer's record. The cancel's
 /// steps come by a [`TestClock`]: SIGTERM is taken, then the scenario is awaited (by the wall clock, the product held
-/// before its next step), then SIGKILL: no slow start can be pre-empted by a step (CIR-602).
+/// before its next step), then SIGKILL: no creation is pre-empted by a step (CIR-602; each creating step leaves the
+/// group and its evidence before the step that could end it: CIR-702, -751).
 async fn cancel_with_a_writer_outside(
     dir: &Path,
     script: &str,
@@ -1057,6 +1135,8 @@ async fn cancel_with_a_writer_outside(
     let agents = Arc::new(Agents::new(&[("T1", script)]));
     let _leaders = Leaders(agents.leaders.clone());
     let clock = Arc::new(TestClock::new());
+    let _released = Released(clock.clone());
+    let _spawner = spawner(file)?;
     let (project, host) = host_with(dir, &agents, Some(clock.clone())).await?;
     until(
         &project,
@@ -1091,10 +1171,13 @@ async fn cancel_with_a_writer_outside(
     let other = marker(format!("{project_id}-other"));
     let _marked = Marked(attempt.clone());
     let _bystander = Marked(other.clone());
-    let mut bystander = Command::new("sleep")
-        .arg("30")
-        .env(hoh_app::host::ATTEMPT_ENV, &other)
-        .spawn()?;
+    // Lives longer than any bound of this test (CIR-704), and is ended by the test however it leaves.
+    let mut bystander = Killed(
+        Command::new("sleep")
+            .arg("600")
+            .env(hoh_app::host::ATTEMPT_ENV, &other)
+            .spawn()?,
+    );
     // The leader's SIGTERM is blocked before the cancel can send it (its ready mark); a writer the test's premise has
     // before the cancel has written its evidence.
     let ready = |mark: PathBuf, what: &'static str| async move {
@@ -1182,16 +1265,32 @@ async fn cancel_with_a_writer_outside(
         Vec::<u32>::new(),
         "a process of the attempt lives on"
     );
+    // The writer, and W where there is one, have ended, by their own records' identities (pid and start time): the
+    // writers without the marker are not among the marked, and a file that stopped growing is no proof of an end, so a
+    // product that never found one or ended its proof early fails here (CIR-700).
+    let text = std::fs::read_to_string(established_mark(file))?;
+    for line in text.lines() {
+        let words: Vec<&str> = line.split(' ').collect();
+        let (pid, start) = match words.as_slice() {
+            ["established", pid, _, _, _, start] | ["w", pid, _, start] => {
+                (pid.parse::<u32>()?, *start)
+            }
+            _ => continue,
+        };
+        assert!(
+            ended(pid, Some(start))?,
+            "{} lives on after the cancel: {text:?}",
+            words[0]
+        );
+    }
     let size = || -> R<u64> { Ok(std::fs::metadata(file)?.len()) };
     let before = size()?;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(size()?, before, "the workspace is still written");
     assert!(
-        bystander.try_wait()?.is_none(),
+        bystander.0.try_wait()?.is_none(),
         "another project's process was signalled"
     );
-    let _ = bystander.kill();
-    let _ = bystander.wait();
     host.shutdown().await;
     Ok(WriterRecord {
         established: at.ok_or("no time in the established record")?,
@@ -1576,8 +1675,10 @@ async fn an_attempt_whose_agent_ended_stays_with_its_slot_when_its_termination_c
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cancel_ends_a_writer_the_leader_released_on_sigterm_just_before_it_exited() -> R {
-    // M2T06R-152 (docs/adr/ADR-021.md decision 8d v3): on SIGTERM the leader orphans a writer and exits 20 ms later,
-    // so its group is empty at once; the writer is found by the scans made at every look once the group is empty.
+    // M2T06R-152 (docs/adr/ADR-021.md decision 8d v3): on SIGTERM the leader has a writer made outside the attempt
+    // (the marker its only tie) and exits once the writer is established, so its group is empty while the writer
+    // lives; the writer is found by the marker scans, made while the group lives and at every look once it is empty
+    // (that the scans go on once the group is empty is the unit test M2T06R-253's to show for certain).
     let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
     let file = dir.path().join("written.txt");
     let script = leader(&file, Leader::OrphansOnTermThenExits, None)?;
@@ -1590,9 +1691,9 @@ async fn a_cancel_ends_a_writer_the_leader_released_on_sigterm_just_before_it_ex
 async fn a_cancel_ends_what_a_pinned_process_without_the_marker_starts_after_the_leader_died() -> R
 {
     // M2T06R-152 (decision 8d v3): the leader starts W with an emptied environment in a session of its own; W ignores
-    // SIGTERM. The leader dies at SIGTERM (10 s); once it is gone (W's pipe from it at its end, not 1.5 s by the
-    // clock: CIR-501) W starts the writer C, which ignores SIGTERM too. Only the parent chain from W, pinned while the
-    // leader lived, finds C; both end at SIGKILL (15 s).
+    // SIGTERM. The leader dies at the SIGTERM step; once it is gone (W's pipe from it at its end: CIR-501) W starts
+    // the writer C, which ignores SIGTERM too. Only the parent chain from W, pinned while the leader lived, finds C;
+    // both end at the SIGKILL step (the steps come by the test's clock).
     let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
     let file = dir.path().join("written.txt");
     let pid_file = dir.path().join("w.pid");
