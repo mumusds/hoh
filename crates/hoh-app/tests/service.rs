@@ -1024,13 +1024,111 @@ fn an_instance_enabled_again_before_the_uninstalls_run_lock_is_disabled_before_a
     // Design correction 9 (M2T14R-600): the uninstall disables the instances, then takes the run lock exclusive. Held
     // in between (a stand-in flock), an installed `hoh __unit enable` run enables the instance again and ends; its
     // enablement outlives it. Under both locks the uninstall looks at the instances once more and disables it: it ends
-    // 0, the instance disabled and no wants link left. Before, the link to the removed template stayed.
+    // 0, the instance disabled and no link left. Before, the link to the removed template stayed.
+    enabled_again_in_the_window(&Window {
+        links: "default.target.wants",
+        ..Window::default()
+    })
+}
+
+#[test]
+fn an_instance_a_drop_in_has_required_by_a_target_enabled_again_is_disabled_too() -> R {
+    // Design correction 10 (M2T14R-700): enablement is what the manager says (`is-enabled`), whichever [Install]
+    // setting made it: a drop-in that has the instance required by default.target makes `__unit enable` write a
+    // .requires link, which the final pass (looking at .wants links only) left naming the removed template.
+    enabled_again_in_the_window(&Window {
+        install: Some("[Install]\nWantedBy=\nRequiredBy=default.target\n"),
+        links: "default.target.requires",
+        ..Window::default()
+    })
+}
+
+#[test]
+fn an_instance_enabled_again_where_the_shell_does_not_look_is_disabled_too() -> R {
+    // Design correction 10 (M2T14R-750): the uninstall's shell has another XDG_CONFIG_HOME than the manager; the
+    // instances are named from the installation's own files and asked of the manager, so the link the manager wrote in
+    // its own configuration is gone too (before, the final pass looked only in the shell's).
+    enabled_again_in_the_window(&Window {
+        links: "default.target.wants",
+        shell_config: true,
+        ..Window::default()
+    })
+}
+
+#[test]
+fn an_instance_the_final_pass_cannot_disable_keeps_the_uninstall_from_removing_anything() -> R {
+    // Design correction 10 (M2T14R-751): in the final pass a disable that answers 0 and leaves the instance enabled (a
+    // stand-in systemctl, once the uninstall holds the run lock) is caught by `is-enabled`: 69, nothing removed; the
+    // uninstall completes once the instance can be disabled.
+    enabled_again_in_the_window(&Window {
+        links: "default.target.wants",
+        final_disable_does_nothing: true,
+        ..Window::default()
+    })
+}
+
+#[test]
+fn an_instance_still_enabled_after_its_disable_keeps_the_uninstall_from_removing_anything() -> R {
+    // Design correction 10: an instance is checked with the manager's own word after its disable. Enabled also for
+    // this boot (`enable --runtime`, links under the runtime directory, which a plain disable leaves), it is still
+    // `enabled-runtime`: the uninstall removes nothing (69) and says so, and completes once that enablement is gone.
     let (manager, project) = installed(true)?;
     let unit = unit_of(&project);
-    let wants = manager
+    let out = manager.systemctl(&["enable", "--runtime", &unit])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let bundle = manager.root().join("bundle/hoh");
+    let out = manager.install(&bundle, &["--uninstall"])?;
+    assert_eq!(out.status.code(), Some(69), "{}", text(&out));
+    let stderr = String::from_utf8(out.stderr.clone())?;
+    assert!(
+        stderr.contains(&format!("could not stop and disable {unit}"))
+            && stderr.contains("enabled-runtime"),
+        "{stderr}"
+    );
+    assert!(manager.data().join("hoh/current/bin/hoh").exists());
+    let out = manager.systemctl(&["disable", "--runtime", &unit])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let out = manager.install(&bundle, &["--uninstall"])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    Ok(())
+}
+
+#[derive(Default)]
+struct Window<'a> {
+    /// A drop-in's [Install] section for the template, if any.
+    install: Option<&'a str>,
+    /// The directory of the user's configuration the instance's enablement link is in.
+    links: &'a str,
+    /// The uninstall runs with an XDG_CONFIG_HOME of its own, not the manager's.
+    shell_config: bool,
+    /// Once the uninstall holds the run lock, `systemctl --user disable` answers 0 and does nothing.
+    final_disable_does_nothing: bool,
+}
+
+/// The project's instance enabled (its link in `window.links`), the uninstall held after its first pass and before
+/// the run lock (a stand-in flock), the instance enabled again by an installed `hoh __unit enable` that ends there.
+/// The uninstall must end 0 with the instance not enabled and no link left, the user's drop-in kept; or, when its
+/// final disable does nothing, 69 with nothing removed, and 0 once run again with the real systemctl.
+fn enabled_again_in_the_window(window: &Window) -> R {
+    let (manager, project) = installed(true)?;
+    let unit = unit_of(&project);
+    let enable = |manager: &Manager| -> R<Output> {
+        Ok(manager
+            .command(manager.home().join(".local/bin/hoh"))
+            .arg("__unit")
+            .arg("enable")
+            .arg(&project)
+            .output()?)
+    };
+    if let Some(section) = window.install {
+        dropin(&manager, "install.conf", section)?;
+        let out = enable(&manager)?;
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    }
+    let link = manager
         .home()
-        .join(format!(".config/systemd/user/default.target.wants/{unit}"));
-    assert!(wants.is_symlink());
+        .join(format!(".config/systemd/user/{}/{unit}", window.links));
+    assert!(link.is_symlink(), "{} not made", link.display());
     let paused = manager.root().join("flock-paused");
     let go = manager.root().join("flock-go");
     installed::script(
@@ -1041,12 +1139,28 @@ fn an_instance_enabled_again_before_the_uninstalls_run_lock_is_disabled_before_a
             g = go.display()
         ),
     )?;
+    let systemctl = manager.bin().join("systemctl");
+    if window.final_disable_does_nothing {
+        installed::script(
+            &systemctl,
+            &format!(
+                "#!/bin/sh\ncase \" $* \" in *\" disable \"*) if [ -e {g} ]; then exit 0; fi;; esac\nexec /usr/bin/systemctl \"$@\"\n",
+                g = go.display()
+            ),
+        )?;
+    }
     let bundle = manager.root().join("bundle/hoh");
-    let uninstalling = manager
-        .command("bash")
+    let mut command = manager.command("bash");
+    command
         .arg(bundle.join("install.sh"))
         .arg("--uninstall")
-        .current_dir(manager.root())
+        .current_dir(manager.root());
+    if window.shell_config {
+        let elsewhere = manager.root().join("shell-config");
+        std::fs::create_dir_all(&elsewhere)?;
+        command.env("XDG_CONFIG_HOME", elsewhere);
+    }
+    let uninstalling = command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()?;
@@ -1057,28 +1171,48 @@ fn an_instance_enabled_again_before_the_uninstalls_run_lock_is_disabled_before_a
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    let first = !wants.exists() && !wants.is_symlink();
-    let enabled = manager
-        .command(manager.home().join(".local/bin/hoh"))
-        .arg("__unit")
-        .arg("enable")
-        .arg(&project)
-        .output()?;
-    let again = wants.is_symlink();
+    let first = !link.exists() && !link.is_symlink();
+    let enabled = enable(&manager)?;
+    let again = link.is_symlink();
     std::fs::write(&go, "")?;
     let out = uninstalling.wait_with_output()?;
     assert!(first, "the first pass left it enabled: {}", text(&out));
     assert_eq!(enabled.status.code(), Some(0), "{}", text(&enabled));
     assert!(again, "__unit enable did not enable it again");
-    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    if window.final_disable_does_nothing {
+        assert_eq!(out.status.code(), Some(69), "{}", text(&out));
+        assert!(
+            String::from_utf8(out.stderr.clone())?
+                .contains(&format!("could not stop and disable {unit}")),
+            "{}",
+            text(&out)
+        );
+        assert!(link.is_symlink(), "{} gone", link.display());
+        assert!(manager.data().join("hoh/current/bin/hoh").exists());
+        std::fs::remove_file(&systemctl)?;
+        std::fs::remove_file(manager.bin().join("flock"))?;
+        let out = manager.install(&bundle, &["--uninstall"])?;
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    } else {
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    }
     assert!(
-        !wants.exists() && !wants.is_symlink(),
+        !link.exists() && !link.is_symlink(),
         "{} left: {}",
-        wants.display(),
+        link.display(),
         text(&out)
     );
     let state = manager.systemctl(&["is-enabled", &unit])?;
     assert!(!state.status.success(), "{}", text(&state));
+    if window.install.is_some() {
+        assert!(
+            manager
+                .home()
+                .join(".config/systemd/user/hoh-host@.service.d/install.conf")
+                .exists(),
+            "the user's drop-in was removed"
+        );
+    }
     Ok(())
 }
 
