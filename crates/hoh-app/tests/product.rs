@@ -1561,7 +1561,8 @@ async fn a_cancelled_run_stops_its_agent_by_its_native_cancel_then_sigterm_after
 async fn test_019_02_the_new_commanders_first_input_is_the_checkpoint_package() -> R {
     // AC-019-02 (docs/adr/ADR-024.md decisions 1, 2 and 4): run R has goal G, spec revision 3, two APPLIED decisions,
     // an OPEN and a REOPENED issue, one QUEUED input and candidate C, and its old Commander's raw log holds a unique
-    // sentinel. The commander changes from codex to pi; once applied, the first input the product keeps for the new
+    // sentinel, as do an event and the payloads of an APPLIED decision, the QUEUED input and the unacked message the
+    // package names by id (M2T17R-58: their contents, as the log's, must not reach it). The commander changes from codex to pi; once applied, the first input the product keeps for the new
     // Commander's session is a ContextHandoff valid against protocol.schema.json with goal G, revision 3's digest and
     // candidate C, whose id lists are the database's; the sentinel appears in it 0 times.
     let world = World::new()?;
@@ -1599,8 +1600,11 @@ async fn test_019_02_the_new_commanders_first_input_is_the_checkpoint_package() 
                  UPDATE runs SET spec_id = 's3' WHERE run_id = '{run_id}';
                  UPDATE sessions SET native_path = '{raw}' WHERE session_id = '{old_session}';
                  INSERT INTO decisions(decision_id, run_id, role_epoch, expected_revision, payload_json, state) VALUES
-                   ('D1', '{run_id}', 1, 1, '{{}}', 'APPLIED'), ('D2', '{run_id}', 1, 1, '{{}}', 'APPLIED'),
-                   ('D3', '{run_id}', 1, 1, '{{}}', 'REJECTED');
+                   ('D1', '{run_id}', 1, 1, '{{\"note\": \"{sentinel}\"}}', 'APPLIED'),
+                   ('D2', '{run_id}', 1, 1, '{{}}', 'APPLIED'), ('D3', '{run_id}', 1, 1, '{{}}', 'REJECTED');
+                 INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
+                   SELECT project_id, 'e-sentinel', '{run_id}', 'commander.said', '{{\"text\": \"{sentinel}\"}}',
+                   '2026-11-10T00:00:00Z' FROM runs WHERE run_id = '{run_id}';
                  INSERT INTO candidates(candidate_id, run_id, git_commit, git_tree, spec_sha256, environment_sha256,
                    test_plan_sha256, source_path, state, created_at) VALUES
                    ('C', '{run_id}', printf('%040d', 1), printf('%040d', 2), printf('%064d', 3), printf('%064d', 4),
@@ -1609,10 +1613,11 @@ async fn test_019_02_the_new_commanders_first_input_is_the_checkpoint_package() 
                    ('I1', '{run_id}', 'f1', 'high', 'OPEN', 'd'), ('I2', '{run_id}', 'f2', 'low', 'REOPENED', 'd'),
                    ('I3', '{run_id}', 'f3', 'low', 'RESOLVED', 'd');
                  INSERT INTO input_queue(input_id, run_id, kind, target_role, state, payload_json) VALUES
-                   ('Q1', '{run_id}', 'STEER', 'developer', 'QUEUED', '{{}}'),
+                   ('Q1', '{run_id}', 'STEER', 'developer', 'QUEUED', '{{\"text\": \"{sentinel}\"}}'),
                    ('Q2', '{run_id}', 'ASK', NULL, 'DELIVERED', '{{}}');
                  INSERT INTO outbox(message_id, event_seq, run_id, recipient_role, payload_json, state) VALUES
-                   ('M1', (SELECT min(seq) FROM events), '{run_id}', 'developer', '{{}}', 'PENDING'),
+                   ('M1', (SELECT min(seq) FROM events), '{run_id}', 'developer', '{{\"text\": \"{sentinel}\"}}',
+                    'PENDING'),
                    ('M2', (SELECT min(seq) FROM events), '{run_id}', 'qa', '{{}}', 'ACKED');",
                 raw = raw.display()
             ),
