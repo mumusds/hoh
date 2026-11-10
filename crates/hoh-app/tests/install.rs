@@ -10,6 +10,7 @@ mod installed;
 
 use installed::{R, script, sha256, stage_bundle};
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -244,8 +245,22 @@ impl Install {
 
     /// `<bundle>/install.sh <args>` as this user, in a clean environment with no user manager to ask.
     fn run(&self, bundle: &str, args: &[&str]) -> R<Output> {
-        let script = self.root.path().join(bundle).join("hoh/install.sh");
-        Ok(Command::new("bash")
+        self.run_with(bundle, args, &[])
+    }
+
+    /// As [`Install::run`], with `env` set over the clean environment.
+    fn run_with(&self, bundle: &str, args: &[&str], env: &[(&str, &OsStr)]) -> R<Output> {
+        self.run_script(
+            &self.root.path().join(bundle).join("hoh/install.sh"),
+            args,
+            env,
+        )
+    }
+
+    /// `script <args>` as [`Install::run_with`] runs a bundle's install.sh.
+    fn run_script(&self, script: &Path, args: &[&str], env: &[(&str, &OsStr)]) -> R<Output> {
+        let mut command = Command::new("bash");
+        command
             .arg(script)
             .args(args)
             .current_dir(self.root.path())
@@ -253,8 +268,11 @@ impl Install {
             .env("HOME", self.home())
             .env("XDG_RUNTIME_DIR", self.root.path().join("r"))
             .env("USER", "tester")
-            .env("PATH", format!("{}:/usr/bin:/bin", self.stubs().display()))
-            .output()?)
+            .env("PATH", format!("{}:/usr/bin:/bin", self.stubs().display()));
+        for (name, value) in env {
+            command.env(name, value);
+        }
+        Ok(command.output()?)
     }
 
     fn sudo_called(&self) -> bool {
@@ -1324,6 +1342,285 @@ fn a_link_on_the_way_that_cannot_be_read_keeps_the_uninstall_from_removing_anyth
     let out = install.run("bundle", &["--uninstall"])?;
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     assert!(!install.data().join("hoh").exists());
+    Ok(())
+}
+
+/// `path` with a newline after it.
+fn with_newline(path: &Path) -> PathBuf {
+    let mut path = path.as_os_str().to_owned();
+    path.push("\n");
+    PathBuf::from(path)
+}
+
+#[test]
+fn a_config_home_whose_path_ends_with_a_newline_is_scanned_as_it_is() -> R {
+    // M2T14R-1100 (design correction 14): XDG_CONFIG_HOME an absolute path ending with a newline, a link enabling an
+    // instance in its systemd/user/default.target.wants: with no manager the uninstall refuses (69), nothing removed.
+    // Before, a command substitution dropped the newline, the uninstall scanned another directory and exited 0.
+    let install = Install::new()?;
+    let out = install.run("bundle", &[])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let config = with_newline(&install.root.path().join("conf"));
+    let wants = config.join("systemd/user/default.target.wants");
+    std::fs::create_dir_all(&wants)?;
+    std::os::unix::fs::symlink(
+        install.data().join("systemd/user/hoh-host@.service"),
+        wants.join("hoh-host@0123456789abcdef.service"),
+    )?;
+    let out = install.run_with(
+        "bundle",
+        &["--uninstall"],
+        &[("XDG_CONFIG_HOME", config.as_os_str())],
+    )?;
+    assert_eq!(out.status.code(), Some(69), "{}", text(&out));
+    let stderr = String::from_utf8(out.stderr.clone())?;
+    assert!(
+        stderr.contains(
+            "hoh-host@0123456789abcdef.service is enabled, and no user systemd manager answers"
+        ),
+        "{stderr}"
+    );
+    assert!(install.data().join("hoh/current/bin/hoh").exists());
+    Ok(())
+}
+
+#[test]
+fn a_root_whose_path_ends_with_a_newline_is_refused_as_it_is() -> R {
+    // M2T14R-1100 (design correction 14): a root whose path, or whose resolved path, ends with a newline (XDG_DATA_HOME
+    // so named; the root a link to a directory so named) is one the unit cannot take: 78, nothing of the installation
+    // written (the installers' lock file only, as for every refusal by the bundle's binary). Before, the newline was
+    // dropped: the install wrote into another directory, or checked another path, and exited 0.
+    let install = Install::new()?;
+    let data = with_newline(&install.root.path().join("data"));
+    std::fs::create_dir_all(&data)?;
+    let out = install.run_with("bundle", &[], &[("XDG_DATA_HOME", data.as_os_str())])?;
+    assert_eq!(out.status.code(), Some(78), "{}", text(&out));
+    assert!(!install.root.path().join("data").exists());
+    let written: Vec<_> = std::fs::read_dir(&data)?
+        .map(|e| e.map(|e| e.file_name()))
+        .collect::<Result<_, _>>()?;
+    assert_eq!(written, ["hoh.lock"], "{}", text(&out));
+    let real = with_newline(&install.root.path().join("real"));
+    std::fs::create_dir_all(&real)?;
+    std::fs::create_dir_all(install.data())?;
+    std::os::unix::fs::symlink(&real, install.data().join("hoh"))?;
+    let out = install.run("bundle", &[])?;
+    assert_eq!(out.status.code(), Some(78), "{}", text(&out));
+    // The root is there, so its missing run lock is remade before any binary runs (install step 3): that alone.
+    let written: Vec<_> = std::fs::read_dir(&real)?
+        .map(|e| e.map(|e| e.file_name()))
+        .collect::<Result<_, _>>()?;
+    assert_eq!(written, [".lock"], "{}", text(&out));
+    Ok(())
+}
+
+#[test]
+fn a_command_link_whose_target_ends_with_a_newline_is_not_this_installations() -> R {
+    // M2T14R-1101 (design correction 14): ~/.local/bin/hoh a link to this installation's current/bin/hoh with a newline
+    // after it is another's: the install refuses (1, nothing written), and an uninstall keeps it. Before, a command
+    // substitution dropped the newline: the install took it for its own (0) and the uninstall removed it.
+    let install = Install::new()?;
+    let bin = install.home().join(".local/bin");
+    std::fs::create_dir_all(&bin)?;
+    let target = with_newline(&install.data().join("hoh/current/bin/hoh"));
+    std::os::unix::fs::symlink(&target, bin.join("hoh"))?;
+    let out = install.run("bundle", &[])?;
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(!install.data().join("hoh").exists());
+    std::fs::remove_file(bin.join("hoh"))?;
+    let out = install.run("bundle", &[])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    std::fs::remove_file(bin.join("hoh"))?;
+    std::os::unix::fs::symlink(&target, bin.join("hoh"))?;
+    let out = install.run("bundle", &["--uninstall"])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(!install.data().join("hoh").exists());
+    assert!(bin.join("hoh").is_symlink(), "another's link removed");
+    let stderr = String::from_utf8(out.stderr.clone())?;
+    assert!(
+        stderr.contains("it is not this installation's link"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_bundle_whose_directory_ends_with_a_newline_installs_from_it() -> R {
+    // Design correction 14: the bundle's own directory is taken byte for byte too (before, `pwd -P` in a command
+    // substitution lost its trailing newline, and the install said the bundle's bin/hoh was missing: 64).
+    let install = Install::new()?;
+    let dir = with_newline(&install.root.path().join("bundle/hoh"));
+    std::fs::rename(install.root.path().join("bundle/hoh"), &dir)?;
+    let out = install.run_script(&dir.join("install.sh"), &[], &[])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(install.data().join("hoh/current/bin/hoh").exists());
+    Ok(())
+}
+
+#[test]
+fn a_reload_that_fails_after_the_removal_ends_the_uninstall_with_69() -> R {
+    // M2T14R-1102 (design correction 14): the manager's daemon-reload failing once the template is removed (a
+    // stand-in exiting 23) leaves the removed template loaded in the manager: the uninstall still removes the rest,
+    // says each removal and the failed reload with what the manager said, and ends with 69 (before: 0), never saying
+    // that nothing was removed.
+    let install = Install::new()?;
+    let out = install.run("bundle", &[])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    std::fs::create_dir_all(install.root.path().join("r/systemd"))?;
+    let _socket =
+        std::os::unix::net::UnixListener::bind(install.root.path().join("r/systemd/private"))?;
+    script(
+        &install.stubs().join("systemctl"),
+        "#!/bin/sh\ncase \" $* \" in *\" daemon-reload \"*) echo manager-error >&2; exit 23;; esac\nexit 0\n",
+    )?;
+    let out = install.run("bundle", &["--uninstall"])?;
+    assert_eq!(out.status.code(), Some(69), "{}", text(&out));
+    let template = install.data().join("systemd/user/hoh-host@.service");
+    let stdout = String::from_utf8(out.stdout.clone())?;
+    assert!(
+        stdout.contains(&format!("removed {}", template.display())),
+        "{stdout}"
+    );
+    assert!(!install.data().join("hoh").exists() && !template.exists());
+    assert!(!install.home().join(".local/bin/hoh").is_symlink());
+    let stderr = String::from_utf8(out.stderr.clone())?;
+    assert!(
+        stderr.contains("systemctl --user daemon-reload"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("exit 23") && stderr.contains("manager-error"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("nothing was removed"), "{stderr}");
+    Ok(())
+}
+
+#[test]
+fn a_unit_directory_or_instance_directory_that_is_a_file_holds_nothing_to_refuse_for() -> R {
+    // M2T14R-1103 (design correction 14): ~/.config/systemd/user a readable regular file is no directory: no link
+    // enabling an instance can be in it, so with no manager the uninstall completes (before: 69, "cannot list"). The
+    // same for the instances' files: R/hosts a regular file holds none (a stand-in manager that lists nothing).
+    let install = Install::new()?;
+    let out = install.run("bundle", &[])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let systemd = install.home().join(".config/systemd");
+    std::fs::create_dir_all(&systemd)?;
+    std::fs::write(systemd.join("user"), "not a directory\n")?;
+    let out = install.run("bundle", &["--uninstall"])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(!install.data().join("hoh").exists());
+    let out = install.run("bundle", &[])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let hosts = install.data().join("hoh/hosts");
+    if hosts.is_dir() {
+        std::fs::remove_dir_all(&hosts)?;
+    }
+    std::fs::write(&hosts, "not a directory\n")?;
+    std::fs::create_dir_all(install.root.path().join("r/systemd"))?;
+    let _socket =
+        std::os::unix::net::UnixListener::bind(install.root.path().join("r/systemd/private"))?;
+    script(&install.stubs().join("systemctl"), "#!/bin/sh\nexit 0\n")?;
+    let out = install.run("bundle", &["--uninstall"])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(!install.data().join("hoh").exists());
+    Ok(())
+}
+
+#[test]
+#[ignore = "a program of the installation: copied into its version and run by a test there"]
+fn a_program_of_the_installation() {
+    std::thread::sleep(std::time::Duration::from_secs(120));
+}
+
+/// A process ended when this is dropped, however the test ends.
+struct Running(std::process::Child);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn a_program_run_through_a_linked_data_directory_keeps_the_uninstall_from_removing_anything() -> R {
+    // M2T14R-1150 (design correction 14): ~/.local/share a link to another directory, and a program of the installation
+    // running (this test binary copied into its version, run through `current`) when the root's directory is removed by
+    // hand. /proc names the program by its physical path, under the root's resolved path: the scan resolves the root
+    // though it is not there, finds the program, and the uninstall removes nothing (69). Before, a root that was not
+    // there was looked for by its own path only: the template and the command link were removed, exit 0.
+    let install = Install::new()?;
+    let real = install.root.path().join("datareal");
+    std::fs::create_dir_all(&real)?;
+    std::fs::create_dir_all(install.home().join(".local"))?;
+    std::os::unix::fs::symlink(&real, install.data())?;
+    let out = install.run("bundle", &[])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let program = install.data().join("hoh/current/bin/program");
+    std::fs::copy(std::env::current_exe()?, &program)?;
+    let running = Running(
+        Command::new(&program)
+            .args(["--exact", "a_program_of_the_installation", "--ignored"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?,
+    );
+    let pid = running.0.id();
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !std::fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|exe| exe.starts_with(&real)) {
+        if std::time::Instant::now() > end {
+            return Err("the program did not start".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    std::fs::remove_dir_all(real.join("hoh"))?;
+    let out = install.run("bundle", &["--uninstall"])?;
+    assert_eq!(out.status.code(), Some(69), "{}", text(&out));
+    let stderr = String::from_utf8(out.stderr.clone())?;
+    assert!(stderr.contains(&format!("pid {pid}")), "{stderr}");
+    assert!(
+        install
+            .data()
+            .join("systemd/user/hoh-host@.service")
+            .exists()
+    );
+    assert!(install.home().join(".local/bin/hoh").is_symlink());
+    drop(running);
+    Ok(())
+}
+
+#[test]
+fn a_way_longer_than_the_kernel_follows_cannot_be_told() -> R {
+    // M2T14R-1151 (design correction 14): ~/.config/systemd/user a link whose way has more than 40 links in all (a
+    // chain of 39, then a link to a chain of 2), with a link enabling an instance at its end. The kernel's look at the
+    // path fails (ELOOP), while each link the installer reads resolves on a fresh look; bash cannot tell that from a
+    // change meanwhile, so it cannot be told: with no manager the uninstall refuses (69), nothing removed. Taken for
+    // there, its directory would read as none and be skipped.
+    let stderr = an_uninstall_with_no_manager_refuses(
+        |root, template| {
+            let chain = root.join("chain");
+            let wants = chain.join("real/default.target.wants");
+            std::fs::create_dir_all(&wants)?;
+            std::os::unix::fs::symlink(template, wants.join("hoh-host@0123456789abcdef.service"))?;
+            std::os::unix::fs::symlink(chain.join("real"), chain.join("e2"))?;
+            std::os::unix::fs::symlink(chain.join("e2"), chain.join("e1"))?;
+            std::fs::create_dir_all(chain.join("dir"))?;
+            std::os::unix::fs::symlink(chain.join("e1"), chain.join("dir/u"))?;
+            std::os::unix::fs::symlink(chain.join("dir"), chain.join("c39"))?;
+            for n in (1..39).rev() {
+                std::os::unix::fs::symlink(
+                    chain.join(format!("c{}", n + 1)),
+                    chain.join(format!("c{n}")),
+                )?;
+            }
+            std::fs::create_dir_all(root.join("h/.config/systemd"))?;
+            std::os::unix::fs::symlink(chain.join("c1/u"), root.join("h/.config/systemd/user"))?;
+            Ok(vec![])
+        },
+        ".config/systemd/user is there, where a link may enable an instance",
+    )?;
+    assert!(stderr.contains("could not be told"), "{stderr}");
     Ok(())
 }
 
