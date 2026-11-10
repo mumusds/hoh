@@ -99,6 +99,11 @@ pub fn installation_root(exe: &Path) -> Option<PathBuf> {
 /// the one at its path (the uninstall removed it meanwhile), or this binary removed. The file is close-on-exec: the
 /// agents a host starts do not hold it.
 pub fn hold_installation(exe: &Path) -> Result<Option<std::fs::File>, Unusable> {
+    hold_installation_as(exe, Path::new("/proc/self/exe"))
+}
+
+/// [`hold_installation`] for a run whose running image is the file `image` names (`/proc/self/exe` for this process).
+pub fn hold_installation_as(exe: &Path, image: &Path) -> Result<Option<std::fs::File>, Unusable> {
     let removed = exe.to_str().and_then(|p| p.strip_suffix(" (deleted)"));
     let named = removed.map_or_else(|| exe.to_path_buf(), PathBuf::from);
     let canonical = std::fs::canonicalize(&named).ok();
@@ -111,20 +116,26 @@ pub fn hold_installation(exe: &Path) -> Result<Option<std::fs::File>, Unusable> 
             root.display()
         ))
     };
-    if removed.is_some() || canonical.is_none() {
+    let Some(canonical) = canonical.filter(|_| removed.is_none()) else {
         return Err(being_removed(format!("{} was removed", named.display())));
-    }
+    };
     let path = root.join(".lock");
-    // Read-only: a shared flock needs no more (a 0400 lock is fine). Gone: the uninstall removed it, or is removing
-    // the installation; any other failure is said as it is, not as an uninstall (M2T14R-250).
+    // Read-only: a shared flock needs no more (a 0400 lock is fine). Gone with the binary: the uninstall is removing
+    // the installation; gone with the binary still there: the lock alone is missing (M2T14R-352); any other failure is
+    // said as it is (M2T14R-250).
     let file = std::fs::File::open(&path).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            being_removed(format!("its lock {} is gone", path.display()))
-        } else {
+        if e.kind() != std::io::ErrorKind::NotFound {
             Unusable(format!(
                 "cannot open the installation's lock {}: {e}",
                 path.display()
             ))
+        } else if canonical.exists() {
+            Unusable(format!(
+                "the installation's lock {} is missing: run install.sh from the release bundle again",
+                path.display()
+            ))
+        } else {
+            being_removed(format!("its lock {} is gone", path.display()))
         }
     })?;
     rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockShared)
@@ -134,10 +145,27 @@ pub fn hold_installation(exe: &Path) -> Result<Option<std::fs::File>, Unusable> 
             "its lock was removed before it was held".to_owned(),
         ));
     }
-    if canonical.as_deref().is_some_and(|exe| !exe.exists()) {
-        return Err(being_removed(format!("{} was removed", named.display())));
+    // The running image decides, not a path read earlier (design correction 6, M2T14R-350): it must still be the file
+    // at its canonical path, linked; a binary removed (and maybe installed again at the same path) is not.
+    if !same_file(image, &canonical) {
+        return Err(being_removed(format!(
+            "the binary this run started from ({}) was removed or replaced",
+            canonical.display()
+        )));
     }
     Ok(Some(file))
+}
+
+/// Whether the file `image` names (following it, as `/proc/self/exe` is followed to the running image) is linked and
+/// is the file at `path`.
+fn same_file(image: &Path, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    match (std::fs::metadata(image), std::fs::metadata(path)) {
+        (Ok(run), Ok(named)) => {
+            run.nlink() > 0 && run.dev() == named.dev() && run.ino() == named.ino()
+        }
+        _ => false,
+    }
 }
 
 /// Whether `file` is still the file at `path` (same device and inode, and linked): a lock got on a file the uninstall
