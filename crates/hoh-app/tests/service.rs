@@ -1231,6 +1231,72 @@ fn each_instance_the_uninstall_cannot_disable_is_said_with_its_own_answer() -> R
     Ok(())
 }
 
+#[test]
+fn an_instance_started_in_the_window_is_stopped_under_both_locks() -> R {
+    // M2T14R-1200 (design correction 15): the uninstall held after its first pass and before the run lock (a stand-in
+    // flock); meanwhile the installed client starts the project's instance (not enabled), whose start a drop-in makes
+    // take 45 s, and gives up at its 10 s deadline (69, the start going on) with the start job left in the manager.
+    // Under both locks the final pass finds it not enabled but not stopped, stops it, sees it inactive with no job, and
+    // only then removes. Before, an instance not enabled was skipped: the uninstall ended 0 with the start going on.
+    let (manager, project) = installed(false)?;
+    let unit = unit_of(&project);
+    dropin(
+        &manager,
+        "slow.conf",
+        "[Service]\nExecStartPre=/bin/sleep 45\n",
+    )?;
+    let paused = manager.root().join("flock-paused");
+    let go = manager.root().join("flock-go");
+    installed::script(
+        &manager.bin().join("flock"),
+        &format!(
+            "#!/bin/sh\ncase \" $* \" in *\" 9 \"*) if [ ! -e {p} ]; then : > {p}; i=0; while [ ! -e {g} ] && [ $i -lt 1200 ]; do sleep 0.05; i=$((i+1)); done; fi;; esac\nexec /usr/bin/flock \"$@\"\n",
+            p = paused.display(),
+            g = go.display()
+        ),
+    )?;
+    let bundle = manager.root().join("bundle/hoh");
+    let uninstalling = manager
+        .command("bash")
+        .arg(bundle.join("install.sh"))
+        .arg("--uninstall")
+        .current_dir(manager.root())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let end = std::time::Instant::now() + Duration::from_secs(30);
+    while !paused.exists() {
+        if std::time::Instant::now() > end {
+            return Err("the uninstall did not pause".into());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let client = hoh_in(
+        &manager,
+        &project,
+        None,
+        &["-p", "x", "--detach", "--output", "json"],
+    )?;
+    assert_eq!(client.status.code(), Some(69), "{}", text(&client));
+    assert_eq!(manager.property(&unit, "ActiveState")?, "activating");
+    std::fs::write(&go, "")?;
+    let out = uninstalling.wait_with_output()?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let stdout = String::from_utf8(out.stdout.clone())?;
+    assert!(
+        stdout.contains(&format!(
+            "stopped {unit}: it was started again while the uninstall ran"
+        )),
+        "{}",
+        text(&out)
+    );
+    let active = manager.property(&unit, "ActiveState")?;
+    assert!(active == "inactive" || active == "failed", "{active}");
+    assert_eq!(manager.property(&unit, "Job")?, "");
+    assert!(!manager.data().join("hoh").exists());
+    Ok(())
+}
+
 #[derive(Default)]
 struct Window<'a> {
     /// A drop-in's [Install] section for the template, if any.
