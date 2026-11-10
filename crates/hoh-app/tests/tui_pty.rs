@@ -97,14 +97,18 @@ fn the_workspace_opens_offline_and_writes_nothing_until_enter() -> R {
     let mut s = open(project.path(), home.path(), &[])?;
     s.pty.send("草稿 draft".as_bytes())?;
     s.pty.wait_for("草稿draft", 0, WAIT)?;
-    // Ctrl+C clears the editor first; the second opens the choice.
+    // Ctrl+C clears the editor first; the second opens the choice. Keys are taken in order, so once a marker typed
+    // after it is drawn, whatever the Ctrl+C drew is in the output (convention v2: an absence read after the event
+    // that would make it, not after a fixed sleep; CIR-253).
     let from = s.pty.output().len();
     s.pty.send(b"\x03")?;
-    std::thread::sleep(Duration::from_millis(300));
+    s.pty.send(b"QZQ")?;
+    s.pty.wait_for("QZQ", from, WAIT)?;
     assert!(
         !pty::squash(&s.pty.output()[from..]).contains("脱离"),
         "the first Ctrl+C must only clear a non-empty editor"
     );
+    s.pty.send(b"\x03")?; // clears the marker
     assert_eq!(s.detach()?, Some(0));
     assert!(tree(project.path())? == before, "the project changed");
     Ok(())
@@ -125,9 +129,12 @@ fn submitted_input_is_kept_and_found_again_in_the_next_session() -> R {
     s.pty.send(b"\x12")?;
     s.pty.send(b"hel")?;
     s.pty.wait_for("hello", from, WAIT)?;
-    // Enter ends the search with the match in the editor; it sends nothing.
+    // Enter ends the search with the match in the editor; it sends nothing. Keys are taken in order, so once a marker
+    // typed after it is drawn, whatever Enter drew is in the output (CIR-253).
+    let entered = s.pty.output().len();
     s.pty.send(b"\r")?;
-    std::thread::sleep(Duration::from_millis(300));
+    s.pty.send(b"QZQ")?;
+    s.pty.wait_for("QZQ", entered, WAIT)?;
     assert!(!pty::squash(&s.pty.output()[from..]).contains("未发送"));
     assert_eq!(std::fs::read_to_string(&history)?, "{\"text\":\"hello\"}\n");
     s.pty.send(b"\x03")?; // clears the editor
@@ -579,8 +586,9 @@ impl hoh_app::host::Executor for Sixty {
 
 /// Whether process `pid`, started at `start`, is alive: not ended as a whole by identity::ended. A zombie, which signal
 /// 0 still reaches, is not alive, nor is a number taken again since (ADR-022 decision 10, v2; CIR-150's class).
-fn alive(pid: u32, start: &str) -> bool {
-    matches!(hoh_agents::identity::ended(pid, Some(start)), Ok(false))
+fn alive(pid: u32, start: &str) -> R<bool> {
+    // A look that fails is an error, never "alive" nor "gone" (CIR-202, -250).
+    Ok(!hoh_agents::identity::ended(pid, Some(start))?)
 }
 
 /// `hoh attach R` in a PTY, once the Workspace bound to R is drawn.
@@ -667,7 +675,7 @@ fn test_043_03_the_tui_leaves_on_sighup_sigterm_and_detach_with_the_host_and_age
     let before = run()?;
     let unchanged = |step: &str| -> R {
         assert!(
-            alive(host_pid, &host_start) && alive(agent, &agent_start),
+            alive(host_pid, &host_start)? && alive(agent, &agent_start)?,
             "{step}: the host or the Agent is gone"
         );
         assert_eq!(run()?, before, "{step}: the run moved");
@@ -777,15 +785,18 @@ fn a_host_started_by_a_detach_in_a_terminal_outlives_its_hang_up() -> R {
         .split(' ')
         .collect();
     let (session, tty): (u32, i64) = (fields[3].parse()?, fields[4].parse()?);
-    assert!(alive(pid, &start), "the host is gone after the hang-up");
+    assert!(alive(pid, &start)?, "the host is gone after the hang-up");
     assert_eq!((session, tty), (pid, 0), "its own session, no terminal");
-    // To the host of its start time only (CIR-103's rule).
-    hoh_agents::identity::signal_if_same(pid, &start, rustix::process::Signal::TERM)?;
+    // To the host of its start time only (CIR-103's rule), and sent (CIR-250).
+    assert!(
+        hoh_agents::identity::signal_if_same(pid, &start, rustix::process::Signal::TERM)?,
+        "the host was gone before its SIGTERM"
+    );
     let end = std::time::Instant::now() + WAIT;
-    while alive(pid, &start) && std::time::Instant::now() < end {
+    while alive(pid, &start)? && std::time::Instant::now() < end {
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert!(!alive(pid, &start), "the host did not stop on SIGTERM");
+    assert!(!alive(pid, &start)?, "the host did not stop on SIGTERM");
     Ok(())
 }
 

@@ -869,10 +869,17 @@ async fn cancel_with_a_writer_outside(dir: &Path, script: &str, file: &Path) -> 
         Vec::<u32>::new(),
         "a process of the attempt lives on"
     );
-    let size = || std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
-    let before = size();
+    // The writer ran (its file was made empty before it; it writes for 3.5 s or more before the SIGKILL step): a leader
+    // that missed its trap, a writer that never started or a cancel that skipped the step starting it would leave
+    // nothing to find, and pass (CIR-252).
+    let size = || -> R<u64> { Ok(std::fs::metadata(file)?.len()) };
+    let before = size()?;
+    assert!(
+        before > 0,
+        "the writer never wrote: nothing was there to find"
+    );
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(size(), before, "the workspace is still written");
+    assert_eq!(size()?, before, "the workspace is still written");
     assert!(
         bystander.try_wait()?.is_none(),
         "another project's process was signalled"

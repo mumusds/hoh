@@ -845,8 +845,10 @@ mod tests {
         })
         .await;
         // The supervisor reaps the leader before it reports, so its number can be another's by now: the process is
-        // looked at and killed through the pidfd held since the spawn.
-        let left = !crate::identity::exited(&held).unwrap_or(false);
+        // looked at through the pidfd held since the spawn, reaped by its fdinfo (a zombie left unreaped is left, as
+        // the earlier !reaped(pid) had it; CIR-201), and killed through it.
+        let left =
+            !crate::identity::reaped_held(&held, leader.as_raw_pid() as u32).unwrap_or(false);
         if left {
             let _ = pidfd_send_signal(held.as_fd(), RawSignal::KILL);
         }
@@ -914,8 +916,10 @@ mod tests {
         .await;
         *AFTER_GROUP_SIGNAL.lock().map_err(|_| "hook")? = None;
         // The supervisor reaps the leader before it reports, so its number can be another's by now: the process is
-        // looked at and killed through the pidfd held since the spawn.
-        let left = !crate::identity::exited(&held).unwrap_or(false);
+        // looked at through the pidfd held since the spawn, reaped by its fdinfo (a zombie left unreaped is left, as
+        // the earlier !reaped(pid) had it; CIR-201), and killed through it.
+        let left =
+            !crate::identity::reaped_held(&held, leader.as_raw_pid() as u32).unwrap_or(false);
         if left {
             let _ = pidfd_send_signal(held.as_fd(), RawSignal::KILL);
         }

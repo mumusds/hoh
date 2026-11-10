@@ -23,7 +23,7 @@ use hoh_agents::compat::Agent;
 use hoh_agents::probe::{self, ProbeEnv};
 use hoh_core::lifecycle::AttemptState;
 use hoh_core::persistence::CancelLatch;
-use live::{TOKEN, clear_by, hex, left_after, stat_of, tool_sleeps, write_verdict};
+use live::{TOKEN, clear_by, hex, left_after, tool_sleeps, write_verdict};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -236,7 +236,7 @@ async fn codex_live_turn_and_cancel() -> R {
         let alive: Vec<u32> = tools
             .iter()
             .map(|(pid, _)| *pid)
-            .filter(|pid| matches!(stat_of(*pid), Ok(Some((state, _, _))) if state != 'Z' && state != 'X'))
+            .filter(|pid| matches!(hoh_agents::identity::ended(*pid, None), Ok(false)))
             .collect();
         let at = Instant::now();
         let receipt = cancel.request();
