@@ -107,7 +107,12 @@ pub fn child_ended(pid: u32) -> io::Result<bool> {
     let options = rustix::process::WaitIdOptions::EXITED
         | rustix::process::WaitIdOptions::NOHANG
         | rustix::process::WaitIdOptions::NOWAIT;
-    Ok(rustix::process::waitid(rustix::process::WaitId::Pid(raw), options)?.is_some())
+    // Only an end counts: a tracer of the child can be told of a ptrace stop too (CLD_TRAPPED) without asking for
+    // stops (CIR-300).
+    Ok(
+        rustix::process::waitid(rustix::process::WaitId::Pid(raw), options)?
+            .is_some_and(|status| status.exited() || status.killed() || status.dumped()),
+    )
 }
 
 /// Whether the process `pidfd` holds (opened while it was `pid`'s, unreaped) has been reaped: its fdinfo shows no pid

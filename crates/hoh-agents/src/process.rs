@@ -871,7 +871,9 @@ mod tests {
     }
 
     /// A leader whose SIGTERM handler moves it out of its group gets SIGTERM once, not again through its pidfd, and
-    /// is still killed after the grace (FU-01).
+    /// is still killed after the grace (FU-01). The stop is started once the leader says its handler is set (its pid
+    /// line), not by a deadline running from the spawn, which a slow start would outrun (ADR-022 decision 10, v2;
+    /// CIR-301).
     #[tokio::test]
     async fn a_leader_leaving_its_group_on_sigterm_gets_it_once()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -889,22 +891,22 @@ mod tests {
             count = count.display(),
             marker = marker.display()
         ));
-        let config = Config {
-            deadline: Some(Duration::from_millis(300)),
-            escalation: Escalation {
-                native: None,
-                native_grace: Duration::ZERO,
-                term_grace: Duration::from_millis(500),
-                kill_grace: Duration::from_secs(2),
-            },
-            ..Config::default()
-        };
-        let mut p = Process::spawn(command, config)?;
+        let mut p = Process::spawn(command, Config::default())?;
         let leader = Pid::from_raw(p.pid() as i32).ok_or("a pid")?;
         // Held while the leader is still unreaped (it runs until it is stopped): the cleanup below signals the process
         // and never a number the supervisor's reap has freed (CIR-103, -152).
         let held = pidfd_open(leader, PidfdFlags::empty())?;
         *AFTER_GROUP_SIGNAL.lock().map_err(|_| "hook")? = Some((leader, marker.clone()));
+        match tokio::time::timeout(Duration::from_secs(10), p.next()).await? {
+            Some(Event::Frame(_)) => {}
+            other => return Err(format!("expected the leader's pid, got {other:?}").into()),
+        }
+        p.cancel(Escalation {
+            native: None,
+            native_grace: Duration::ZERO,
+            term_grace: Duration::from_millis(500),
+            kill_grace: Duration::from_secs(2),
+        });
         let report = tokio::time::timeout(Duration::from_secs(10), async {
             while let Some(event) = p.next().await {
                 if let Event::Exit(report) = event {
