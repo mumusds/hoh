@@ -442,8 +442,15 @@ async fn tick(
     }
     // The new holders' first inputs (docs/adr/ADR-024.md decision 4): a notice its binding has passed is superseded,
     // never delivered; one of the binding's own epoch goes to its session once the binder granted it, and is settled
-    // when the executor has it (at least once: a crash before the settle gives it again).
-    for start in &waiting.session_starts {
+    // when the executor has it (at least once: a crash before the settle gives it again). Seen as the bindings are
+    // after this tick's checkpoints and binder, the only writers of a run's bindings once it is started: a notice
+    // taken from the look before them could be one a checkpoint just passed (M2T17R-01).
+    let session_starts = if waiting.team_behind.is_empty() && waiting.unbound.is_empty() {
+        waiting.session_starts.clone()
+    } else {
+        store.runner_waiting(&project_id).await?.session_starts
+    };
+    for start in &session_starts {
         if start.current_epoch > start.role_epoch {
             store.supersede_session_start(&start.message_id).await?;
             continue;
