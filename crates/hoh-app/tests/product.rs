@@ -1556,3 +1556,142 @@ async fn a_cancelled_run_stops_its_agent_by_its_native_cancel_then_sigterm_after
     world.stop_fakes()?;
     outcome
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_019_02_the_new_commanders_first_input_is_the_checkpoint_package() -> R {
+    // AC-019-02 (docs/adr/ADR-024.md decisions 1, 2 and 4): run R has goal G, spec revision 3, two APPLIED decisions,
+    // an OPEN and a REOPENED issue, one QUEUED input and candidate C, and its old Commander's raw log holds a unique
+    // sentinel. The commander changes from codex to pi; once applied, the first input the product keeps for the new
+    // Commander's session is a ContextHandoff valid against protocol.schema.json with goal G, revision 3's digest and
+    // candidate C, whose id lists are the database's; the sentinel appears in it 0 times.
+    let world = World::new()?;
+    world.claude(None)?;
+    world.codex("m-test")?;
+    world.pi()?;
+    let host = start_when_free(world.config()).await?;
+    let project = world.project();
+    let outcome = async {
+        let run_id = started(&host, "s1").await?;
+        let limit = Duration::from_secs(60);
+        let commander = format!(
+            "SELECT agent || '/' || role_epoch || '/' || coalesce(session_id, '-') FROM role_bindings \
+             WHERE run_id = '{run_id}' AND role = 'commander'"
+        );
+        let old_session = format!("{run_id}/session/commander/1");
+        until(&project, &commander, &format!("codex/1/{old_session}"), limit).await?;
+        // No runtime notice left for the runner (run.started taken), so the outbox holds only what the fixture adds.
+        until(
+            &project,
+            "SELECT count(*) FROM outbox WHERE state <> 'ACKED' AND json_extract(payload_json, '$.notice') = 'runtime'",
+            "0",
+            limit,
+        )
+        .await?;
+        let sentinel = "SENTINEL-019-02-7f3a9c";
+        let raw = project.join(".hoh/sessions/old-commander-raw.jsonl");
+        std::fs::create_dir_all(raw.parent().ok_or("no dir")?)?;
+        std::fs::write(&raw, format!("{{\"type\":\"message\",\"text\":\"{sentinel}\"}}\n"))?;
+        exec(
+            &project,
+            &format!(
+                "INSERT INTO specs(spec_id, project_id, sha256, revision) \
+                   SELECT 's3', project_id, printf('%064d', 3), 3 FROM runs WHERE run_id = '{run_id}';
+                 UPDATE runs SET spec_id = 's3' WHERE run_id = '{run_id}';
+                 UPDATE sessions SET native_path = '{raw}' WHERE session_id = '{old_session}';
+                 INSERT INTO decisions(decision_id, run_id, role_epoch, expected_revision, payload_json, state) VALUES
+                   ('D1', '{run_id}', 1, 1, '{{}}', 'APPLIED'), ('D2', '{run_id}', 1, 1, '{{}}', 'APPLIED'),
+                   ('D3', '{run_id}', 1, 1, '{{}}', 'REJECTED');
+                 INSERT INTO candidates(candidate_id, run_id, git_commit, git_tree, spec_sha256, environment_sha256,
+                   test_plan_sha256, source_path, state, created_at) VALUES
+                   ('C', '{run_id}', printf('%040d', 1), printf('%040d', 2), printf('%064d', 3), printf('%064d', 4),
+                    printf('%064d', 5), '/repo', 'FROZEN', '2026-11-10T00:00:00Z');
+                 INSERT INTO issues(issue_id, run_id, fingerprint, severity, state, description) VALUES
+                   ('I1', '{run_id}', 'f1', 'high', 'OPEN', 'd'), ('I2', '{run_id}', 'f2', 'low', 'REOPENED', 'd'),
+                   ('I3', '{run_id}', 'f3', 'low', 'RESOLVED', 'd');
+                 INSERT INTO input_queue(input_id, run_id, kind, target_role, state, payload_json) VALUES
+                   ('Q1', '{run_id}', 'STEER', 'developer', 'QUEUED', '{{}}'),
+                   ('Q2', '{run_id}', 'ASK', NULL, 'DELIVERED', '{{}}');
+                 INSERT INTO outbox(message_id, event_seq, run_id, recipient_role, payload_json, state) VALUES
+                   ('M1', (SELECT min(seq) FROM events), '{run_id}', 'developer', '{{}}', 'PENDING'),
+                   ('M2', (SELECT min(seq) FROM events), '{run_id}', 'qa', '{{}}', 'ACKED');",
+                raw = raw.display()
+            ),
+        )?;
+        let revision: i64 =
+            query(&project, "SELECT coalesce(max(revision), 0) FROM team_revisions")?.parse()?;
+        configure(&host, "to-pi", revision, json!({"commander": {"agent": "pi"}})).await?;
+        let new_session = format!("{run_id}/session/commander/2");
+        until(&project, &commander, &format!("pi/2/{new_session}"), limit).await?;
+        let kept = hoh_app::host::product::first_input_path(&project, &new_session);
+        let end = Instant::now() + limit;
+        while !kept.exists() {
+            assert!(Instant::now() < end, "no first input at {}", kept.display());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let text = std::fs::read_to_string(&kept)?;
+        assert_eq!(text.matches(sentinel).count(), 0, "the old session's text: {text}");
+        let input: Value = serde_json::from_str(&text)?;
+        let package: hoh_core::protocol::ContextHandoff =
+            hoh_core::protocol::decode(&input["package"])?;
+        assert_eq!(package.goal, "Ship the parser");
+        assert_eq!(
+            (package.spec_revision, package.spec_sha256.as_str()),
+            (3, format!("{:064}", 3).as_str())
+        );
+        assert_eq!(package.candidate.map(|c| c.id).as_deref(), Some("C"));
+        assert_eq!((package.role.as_str(), package.role_epoch), ("commander", 2));
+        let ids = |sql: String| -> R<Vec<String>> {
+            let joined = query(&project, &format!("SELECT coalesce(group_concat(id, ','), '') FROM ({sql} ORDER BY 1)"))?;
+            Ok(joined.split(',').filter(|s| !s.is_empty()).map(str::to_owned).collect())
+        };
+        let state = package.state.ok_or("no state")?;
+        assert_eq!(
+            state.applied_decision_ids,
+            ids(format!("SELECT decision_id AS id FROM decisions WHERE run_id = '{run_id}' AND state = 'APPLIED'"))?
+        );
+        assert_eq!(
+            state.open_issue_ids,
+            ids(format!(
+                "SELECT issue_id AS id FROM issues WHERE run_id = '{run_id}' AND state IN ('OPEN', 'REOPENED')"
+            ))?
+        );
+        assert_eq!(
+            state.queued_input_ids,
+            ids(format!("SELECT input_id AS id FROM input_queue WHERE run_id = '{run_id}' AND state = 'QUEUED'"))?
+        );
+        assert_eq!(
+            state.unacked_message_ids,
+            ids(format!(
+                "SELECT message_id AS id FROM outbox WHERE run_id = '{run_id}' AND state <> 'ACKED' \
+                 AND message_id <> '{}'",
+                input["message_id"].as_str().ok_or("no message id")?
+            ))?
+        );
+        assert_eq!(
+            (
+                state.applied_decision_ids.len(),
+                state.open_issue_ids.len(),
+                state.queued_input_ids.len(),
+                state.unacked_message_ids
+            ),
+            (2, 2, 1, vec!["M1".to_owned()]),
+            "the fixture's own"
+        );
+        // The notice settled once the product kept it.
+        until(
+            &project,
+            &format!(
+                "SELECT o.state || '/' || (SELECT count(*) FROM events WHERE kind = 'handoff.delivered') FROM outbox o \
+                 WHERE o.message_id = '{}'",
+                input["message_id"].as_str().ok_or("no message id")?
+            ),
+            "ACKED/1",
+            limit,
+        )
+        .await
+    }
+    .await;
+    host.shutdown().await;
+    world.stop_fakes()?;
+    outcome
+}
