@@ -1694,6 +1694,125 @@ fn a_program_whose_path_cannot_be_read_keeps_the_uninstall_from_removing_anythin
 }
 
 #[test]
+fn a_process_the_kernel_says_runs_no_program_or_may_not_be_looked_at_does_not_refuse() -> R {
+    // Design correction 16 (M2T14R-1350, -1351): a process whose program's path cannot be read is judged by the
+    // kernel's own reason. "No such file or directory" (it has no address space: exiting, a zombie, a kernel thread,
+    // or gone) and "Operation not permitted" (another user's under /proc's hidepid=1) are, like "Permission denied",
+    // nothing the scan has to tell: a stand-in readlink gives each for an unrelated live process, and the uninstall
+    // completes. Before, the first refused (69) unless the process was already Z or X, and so did the second.
+    for reason in ["No such file or directory", "Operation not permitted"] {
+        let install = Install::new()?;
+        let out = install.run("bundle", &[])?;
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+        let other = Running(
+            Command::new("/bin/sh")
+                .args(["-c", "exec sleep 60"])
+                .stdout(std::process::Stdio::null())
+                .spawn()?,
+        );
+        let pid = other.0.id();
+        script(
+            &install.stubs().join("readlink"),
+            &format!(
+                "#!/bin/sh\ncase \"$*\" in *\"/proc/{pid}/exe\") echo \"readlink: /proc/{pid}/exe: {reason}\" >&2; exit 1;; esac\nexec /usr/bin/readlink \"$@\"\n"
+            ),
+        )?;
+        let out = install.run("bundle", &["--uninstall"])?;
+        assert_eq!(out.status.code(), Some(0), "{reason}: {}", text(&out));
+        assert!(!install.data().join("hoh").exists());
+        drop(other);
+    }
+    Ok(())
+}
+
+#[test]
+fn a_root_holding_only_a_dot_file_is_kept_and_said() -> R {
+    // M2T14R-1354 (design correction 15 item 2): an entry whose name begins with a dot keeps the root: it is kept and
+    // said, exit 0 (not taken for an rmdir that failed).
+    let install = Install::new()?;
+    let out = install.run("bundle", &[])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    std::fs::write(install.data().join("hoh/.mine"), "")?;
+    let out = install.run("bundle", &["--uninstall"])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let stderr = String::from_utf8(out.stderr.clone())?;
+    assert!(
+        stderr.contains("it holds files this installer did not write"),
+        "{stderr}"
+    );
+    assert!(install.data().join("hoh/.mine").exists());
+    Ok(())
+}
+
+#[test]
+fn a_reload_and_a_root_that_both_fail_are_both_said_and_end_with_74() -> R {
+    // M2T14R-1354 (design corrections 14 and 15): daemon-reload failing (a stand-in) and the emptied root not
+    // removable (the data directory 0555): the rest is removed, both failures are said, and the uninstall ends with 74.
+    let install = Install::new()?;
+    let top = install.root.path().to_path_buf();
+    {
+        let out = install.run("bundle", &[])?;
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+        std::fs::create_dir_all(install.root.path().join("r/systemd"))?;
+        let _socket =
+            std::os::unix::net::UnixListener::bind(install.root.path().join("r/systemd/private"))?;
+        script(
+            &install.stubs().join("systemctl"),
+            "#!/bin/sh\ncase \" $* \" in *\" daemon-reload \"*) echo manager-error >&2; exit 23;; esac\nexit 0\n",
+        )?;
+        let data = install.data();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o555))?;
+        let _restore = installed::Restore(vec![data.clone()]);
+        let out = install.run("bundle", &["--uninstall"])?;
+        assert_eq!(out.status.code(), Some(74), "{}", text(&out));
+        let stderr = String::from_utf8(out.stderr.clone())?;
+        assert!(
+            stderr.contains("daemon-reload failed (exit 23): manager-error"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("cannot remove {}", data.join("hoh").display())),
+            "{stderr}"
+        );
+    }
+    drop(install);
+    assert!(!top.exists(), "{} left", top.display());
+    Ok(())
+}
+
+#[test]
+fn a_final_pass_says_only_what_it_saw() -> R {
+    // M2T14R-1352 (design correction 16): the final pass finds an instance not enabled but gets no answer about its
+    // state (a stand-in manager whose second `show` fails); it stops and disables it and says that its state could not
+    // be told, not that it was started again (nothing showed that).
+    let install = Install::new()?;
+    let out = install.run("bundle", &[])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    std::fs::create_dir_all(install.data().join("hoh/hosts"))?;
+    std::fs::write(install.data().join("hoh/hosts/abc.env"), "")?;
+    std::fs::create_dir_all(install.root.path().join("r/systemd"))?;
+    let _socket =
+        std::os::unix::net::UnixListener::bind(install.root.path().join("r/systemd/private"))?;
+    let count = install.root.path().join("shows");
+    script(
+        &install.stubs().join("systemctl"),
+        &format!(
+            "#!/bin/sh\ncase \" $* \" in *\" is-enabled \"*) echo disabled; exit 1;; *\" show \"*) n=$(cat {c} 2>/dev/null || echo 0); echo $((n+1)) > {c}; [ \"$n\" = 1 ] && exit 1; printf 'ActiveState=inactive\\nJob=\\n';; esac\nexit 0\n",
+            c = count.display()
+        ),
+    )?;
+    let out = install.run("bundle", &["--uninstall"])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let stdout = String::from_utf8(out.stdout.clone())?;
+    assert!(
+        stdout.contains("stopped and disabled hoh-host@abc.service: its state could not be told while the uninstall ran"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("started again"), "{stdout}");
+    Ok(())
+}
+
+#[test]
 fn a_zombie_of_this_user_does_not_keep_the_uninstall_from_completing() -> R {
     // Design correction 15: a process that has ended but is not yet reaped (a zombie: here a child of this test) has no
     // program path to read, and runs nothing: it is no reason to refuse.

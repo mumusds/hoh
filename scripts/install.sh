@@ -518,7 +518,7 @@ settle_instances() {
   fi
   instance_units || return 2
   for unit in "${instances[@]}"; do
-    again=started
+    again=""
     if [[ "$pass" == final ]]; then
       # Settled already (not enabled, stopped, no job) is left as it is. A run since the first pass may have enabled
       # it again, or started it: its start job goes on after the run ends (design correction 15, M2T14R-1200).
@@ -527,7 +527,14 @@ settle_instances() {
       stopped=0
       stopped_of "$unit" || stopped=$?
       ((state != 1 || stopped != 0)) || continue
-      ((state == 1)) || again=enabled
+      # What is said is what was seen (M2T14R-1352).
+      if ((state == 0)); then
+        again=enabled
+      elif ((stopped == 1)); then
+        again=started
+      else
+        again=untold
+      fi
     fi
     active="" job="" enabled="" state=2 stopped=2 disabled=0
     if systemctl --user disable --now --quiet "$unit"; then
@@ -542,8 +549,10 @@ settle_instances() {
         printf 'stopped and disabled %s\n' "$unit"
       elif [[ "$again" == enabled ]]; then
         printf 'disabled %s: it was enabled again while the uninstall ran\n' "$unit"
-      else
+      elif [[ "$again" == started ]]; then
         printf 'stopped %s: it was started again while the uninstall ran\n' "$unit"
+      else
+        printf 'stopped and disabled %s: its state could not be told while the uninstall ran\n' "$unit"
       fi
     elif ((disabled && stopped == 0 && state == 2)); then
       say "cannot tell whether $unit is still enabled after its disable (is-enabled ${enabled:-no answer})"
@@ -562,24 +571,16 @@ settle_instances() {
   return 0
 }
 
-# Whether a process whose program's path cannot be read is beyond what the scan has to tell: gone; one the kernel denies
-# this user a look at (`Permission denied`, the kernel's reason in the C locale: another user's, one made undumpable, or
-# one with credentials beyond a plain process of this user, such as the user's own systemd manager with its capability;
-# no run of this installation is one, its binary carrying none); or ended and not yet reaped (state Z or X, running
-# nothing). The run lock covers any run once it holds it. Any other process cannot be told (design correction 15,
-# M2T14R-1201).
-beyond_the_scan() {
-  local proc=$1 why stat
-  [[ -e "$proc" ]] || return 0
-  if ! why="$(LC_ALL=C readlink -v -- "$proc/exe" 2>&1 >/dev/null)" && [[ "$why" == *": Permission denied" ]]; then
-    return 0
-  fi
-  if ! stat="$(cat -- "$proc/stat" 2>/dev/null)"; then
-    [[ -e "$proc" ]] && return 1
-    return 0
-  fi
-  case "${stat##*) }" in
-    Z* | X*) return 0 ;;
+# Whether the kernel's reason a program's path could not be read (`readlink -v` in the C locale, its last words) makes
+# the process nothing the scan has to tell (design correction 16; M2T14R-1201, -1350, -1351): "No such file or
+# directory", it has no address space (gone, a zombie, one exiting, a kernel thread), so it runs no program; "Permission
+# denied" or "Operation not permitted", the kernel denies this user a look (another user's, under /proc's hidepid too;
+# one made undumpable; one with credentials beyond a plain process of this user, such as the user's own systemd
+# manager), which no run of this installation is, its binary carrying no capability. The run lock covers any run once
+# it holds it. Any other reason cannot be told.
+nothing_to_tell() {
+  case "$1" in
+    *": No such file or directory" | *": Permission denied" | *": Operation not permitted") return 0 ;;
   esac
   return 1
 }
@@ -665,10 +666,10 @@ remove() {
   # there (`readlink -m`: a program run through a link to a directory removed since still shows the path the link
   # names, M2T14R-1150, -1251). One that cannot be resolved is looked for by its own path when it is not there (a link
   # to nothing, M2T14R-1052; nothing under it is removed), and cannot be told when it is (M2T14R-951; design
-  # corrections 13 to 15). A link on the way removed by hand while a program ran takes with it the only path to that
-  # program: what the uninstall then removes (the template, the command link) is nothing a running program uses. A program's path that cannot be
-  # read below is a process that ended, or another user's, which the scan cannot see (that one, once it holds the run
-  # lock, refuses the uninstall above).
+  # corrections 13 to 15). A link on the way removed or pointed elsewhere, or a directory on the way moved, while a
+  # program ran takes with it the only path to that program: what the uninstall then removes by the paths that are
+  # there is nothing that program uses. A program's path that cannot be read is judged by the kernel's reason
+  # (`nothing_to_tell`, design correction 16).
   there "$root" || root_there=$?
   if real="$(readlink -m -- "$root" && printf x)"; then
     real="${real%$'\n'x}"
@@ -680,13 +681,14 @@ remove() {
     real="$root"
   fi
   for proc in /proc/[0-9]*; do
-    if exe="$(readlink -- "$proc/exe" 2>/dev/null)"; then
+    # Its program's path, or the kernel's reason it cannot be read (one look, its words in the C locale).
+    if exe="$(LC_ALL=C readlink -v -- "$proc/exe" 2>&1)"; then
       if [[ "$exe" == "$real"/* || "$exe" == "$root"/* ]]; then
         say "still running from $root: pid ${proc#/proc/}: $(tr '\0' ' ' <"$proc/cmdline" 2>/dev/null || true)"
         running=1
       fi
-    elif ! beyond_the_scan "$proc"; then
-      say "cannot tell what process ${proc#/proc/} runs: its program's path cannot be read"
+    elif ! nothing_to_tell "$exe"; then
+      say "cannot tell what process ${proc#/proc/} runs: its program's path cannot be read (${exe:-no reason given})"
       unsure=1
     fi
   done
