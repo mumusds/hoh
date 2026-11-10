@@ -1724,6 +1724,71 @@ fn a_zombie_of_this_user_does_not_keep_the_uninstall_from_completing() -> R {
 }
 
 #[test]
+fn an_instance_the_manager_says_still_runs_or_has_a_job_is_not_stopped() -> R {
+    // Design correction 15 (M2T14R-1200): after a successful disable, an instance is stopped only when the manager says
+    // inactive or failed with no job pending. A stand-in manager answers, once, "inactive" with a start job pending
+    // (queued, not yet running), and once "active" with none: either is one that did not stop (69, said with its
+    // state), nothing removed.
+    for (state, job, said) in [
+        ("inactive", "7", "ActiveState=inactive, job 7 pending"),
+        ("active", "", "ActiveState=active, is-enabled"),
+    ] {
+        let install = Install::new()?;
+        let out = install.run("bundle", &[])?;
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+        std::fs::create_dir_all(install.data().join("hoh/hosts"))?;
+        std::fs::write(install.data().join("hoh/hosts/abc.env"), "")?;
+        std::fs::create_dir_all(install.root.path().join("r/systemd"))?;
+        let _socket =
+            std::os::unix::net::UnixListener::bind(install.root.path().join("r/systemd/private"))?;
+        script(
+            &install.stubs().join("systemctl"),
+            &format!(
+                "#!/bin/sh\ncase \" $* \" in *\" is-enabled \"*) echo disabled; exit 1;; *\" show \"*) printf 'Job=%s\\nActiveState=%s\\n' '{job}' '{state}';; esac\nexit 0\n"
+            ),
+        )?;
+        let out = install.run("bundle", &["--uninstall"])?;
+        assert_eq!(out.status.code(), Some(69), "{state}: {}", text(&out));
+        let stderr = String::from_utf8(out.stderr.clone())?;
+        assert!(
+            stderr.contains(&format!(
+                "could not stop and disable hoh-host@abc.service ({said}"
+            )),
+            "{stderr}"
+        );
+        assert!(install.data().join("hoh/current/bin/hoh").exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn a_root_that_is_not_there_and_cannot_be_resolved_is_looked_for_by_its_own_path() -> R {
+    // Design corrections 14 and 15 (M2T14R-1052): the root a link to nothing and `readlink -m` failing for it (a
+    // stand-in): nothing of it is there, so it is looked for by its own path, not taken for one that cannot be told;
+    // the template and the command link are removed, exit 0.
+    let install = Install::new()?;
+    let out = install.run("bundle", &[])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let root = install.data().join("hoh");
+    std::fs::remove_dir_all(&root)?;
+    std::os::unix::fs::symlink(install.root.path().join("nowhere/at/all/hoh"), &root)?;
+    script(
+        &install.stubs().join("readlink"),
+        "#!/bin/sh\ncase \"$1\" in -m) echo 'readlink: failing' >&2; exit 1;; esac\nexec /usr/bin/readlink \"$@\"\n",
+    )?;
+    let out = install.run("bundle", &["--uninstall"])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(
+        !install
+            .data()
+            .join("systemd/user/hoh-host@.service")
+            .exists()
+    );
+    assert!(!install.home().join(".local/bin/hoh").is_symlink());
+    Ok(())
+}
+
+#[test]
 fn a_root_that_cannot_be_removed_ends_the_uninstall_with_74_saying_why() -> R {
     // M2T14R-1202 (design correction 15): the data directory not writable (0555; the installers' lock file in it
     // still is), so the emptied root cannot be removed: the rest is removed and said, then the failure with rmdir's own

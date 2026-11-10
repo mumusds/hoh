@@ -562,15 +562,15 @@ settle_instances() {
   return 0
 }
 
-# Whether a process whose program's path cannot be read is beyond what the scan has to tell: gone; not this user's (its
-# /proc directory another's: another user's, or one made undumpable); one the kernel denies this user a look at
-# (`Permission denied`, the kernel's reason in the C locale: credentials or a state beyond a plain process of this user,
-# such as the user's own systemd manager with its capability, which no run of this installation has, its binary
-# carrying none); or ended and not yet reaped (state Z or X, running nothing). The run lock covers any run once it holds
-# it. Any other process of this user cannot be told (design correction 15, M2T14R-1201).
+# Whether a process whose program's path cannot be read is beyond what the scan has to tell: gone; one the kernel denies
+# this user a look at (`Permission denied`, the kernel's reason in the C locale: another user's, one made undumpable, or
+# one with credentials beyond a plain process of this user, such as the user's own systemd manager with its capability;
+# no run of this installation is one, its binary carrying none); or ended and not yet reaped (state Z or X, running
+# nothing). The run lock covers any run once it holds it. Any other process cannot be told (design correction 15,
+# M2T14R-1201).
 beyond_the_scan() {
   local proc=$1 why stat
-  [[ -e "$proc" && -O "$proc" ]] || return 0
+  [[ -e "$proc" ]] || return 0
   if ! why="$(LC_ALL=C readlink -v -- "$proc/exe" 2>&1 >/dev/null)" && [[ "$why" == *": Permission denied" ]]; then
     return 0
   fi
