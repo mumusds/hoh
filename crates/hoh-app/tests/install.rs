@@ -1687,6 +1687,8 @@ fn a_program_whose_path_cannot_be_read_keeps_the_uninstall_from_removing_anythin
         stderr.contains(&format!("cannot tell what process {pid} runs")),
         "{stderr}"
     );
+    // The reason is said with its own words (M2T14R-1453).
+    assert!(stderr.contains("readlink: failing"), "{stderr}");
     assert!(stderr.contains("could not be told"), "{stderr}");
     assert!(install.data().join("hoh/current/bin/hoh").exists());
     drop(running);
@@ -1700,7 +1702,11 @@ fn a_process_the_kernel_says_runs_no_program_or_may_not_be_looked_at_does_not_re
     // or gone) and "Operation not permitted" (another user's under /proc's hidepid=1) are, like "Permission denied",
     // nothing the scan has to tell: a stand-in readlink gives each for an unrelated live process, and the uninstall
     // completes. Before, the first refused (69) unless the process was already Z or X, and so did the second.
-    for reason in ["No such file or directory", "Operation not permitted"] {
+    for reason in [
+        "No such file or directory",
+        "Operation not permitted",
+        "No such process",
+    ] {
         let install = Install::new()?;
         let out = install.run("bundle", &[])?;
         assert_eq!(out.status.code(), Some(0), "{}", text(&out));
@@ -1722,6 +1728,61 @@ fn a_process_the_kernel_says_runs_no_program_or_may_not_be_looked_at_does_not_re
         assert!(!install.data().join("hoh").exists());
         drop(other);
     }
+    Ok(())
+}
+
+#[test]
+fn an_uninstall_in_another_language_reads_the_kernels_reasons_in_english() -> R {
+    // M2T14R-1450 (design correction 17): the scan reads the kernel's reasons in English whatever the user's language:
+    // uutils chooses its messages by LANG (not LC_ALL), so the scan's readlink runs with LANG=C and LC_ALL=C and
+    // without LANGUAGE. Run with LANG, LANGUAGE and LC_MESSAGES set to French, the uninstall completes (this user's
+    // own systemd manager answers "Permission denied", in English).
+    let install = Install::new()?;
+    let out = install.run("bundle", &[])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let out = install.run_with(
+        "bundle",
+        &["--uninstall"],
+        &[
+            ("LANG", OsStr::new("fr_FR.UTF-8")),
+            ("LANGUAGE", OsStr::new("fr")),
+            ("LC_MESSAGES", OsStr::new("fr_FR.UTF-8")),
+        ],
+    )?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(!install.data().join("hoh").exists());
+    Ok(())
+}
+
+#[test]
+fn a_final_pass_that_saw_both_says_both() -> R {
+    // M2T14R-1452 (design correction 17): the final pass finds an instance enabled again and running (a stand-in
+    // manager: the second is-enabled answers "enabled", the second show "active"); it says both, not only that it was
+    // enabled again.
+    let install = Install::new()?;
+    let out = install.run("bundle", &[])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    std::fs::create_dir_all(install.data().join("hoh/hosts"))?;
+    std::fs::write(install.data().join("hoh/hosts/abc.env"), "")?;
+    std::fs::create_dir_all(install.root.path().join("r/systemd"))?;
+    let _socket =
+        std::os::unix::net::UnixListener::bind(install.root.path().join("r/systemd/private"))?;
+    let counts = install.root.path().join("counts");
+    std::fs::create_dir_all(&counts)?;
+    script(
+        &install.stubs().join("systemctl"),
+        &format!(
+            "#!/bin/sh\nnext() {{ n=$(cat {c}/$1 2>/dev/null || echo 0); echo $((n+1)) > {c}/$1; echo $n; }}\ncase \" $* \" in\n*\" is-enabled \"*) if [ \"$(next enabled)\" = 1 ]; then echo enabled; exit 0; fi; echo disabled; exit 1;;\n*\" show \"*) if [ \"$(next show)\" = 1 ]; then printf 'ActiveState=active\\nJob=\\n'; else printf 'ActiveState=inactive\\nJob=\\n'; fi;;\nesac\nexit 0\n",
+            c = counts.display()
+        ),
+    )?;
+    let out = install.run("bundle", &["--uninstall"])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let stdout = String::from_utf8(out.stdout.clone())?;
+    assert!(
+        stdout.contains("disabled and stopped hoh-host@abc.service: it was enabled and started again while the uninstall ran"),
+        "{stdout}"
+    );
     Ok(())
 }
 
