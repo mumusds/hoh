@@ -16,8 +16,8 @@
 # Exit codes: 0 done; 1 ~/.local/bin/hoh is not this installation's; 64 usage, or a bundle whose bin/hoh is missing,
 # does not run or names no version; 69 the user's systemd manager cannot do what was asked, something still runs this
 # installation, its lock cannot be opened, locked or told, or what the removal rests on cannot be told (nothing removed:
-# design correction 11), another install.sh of it holds the
-# installer's lock, that lock cannot be made, opened or locked, or the installed binary does not run; 77 run as root;
+# design corrections 11 and 12), ~/.local/bin/hoh cannot be read or told, `id -u` fails, another install.sh of it holds
+# the installer's lock, that lock cannot be made, opened or locked, or the installed binary does not run; 77 run as root;
 # 78 a home, root or project systemd cannot use; 74 a command failed that the installer has no word of its own for
 # (it is named, with its exit code and line). Refusals write nothing of the installation (those that run the bundle's
 # binary leave the installers' lock file, and a run lock just remade). An uninstall that finds nothing installed says
@@ -142,12 +142,38 @@ take_lock() {
   lock_said="$(flock -E 75 "$@" 2>&1)" || lock_rc=$?
 }
 
+# Whether `$1` is there, links followed: 0 there, 1 not there (a link to nothing included: it was seen), 2 cannot
+# tell. A test that answers "no" also when it cannot look (a directory on the way that cannot be searched) is not
+# taken for "not there": a path is not there only when the nearest ancestor that is there can be searched, or is no
+# directory (design correction 12; M2T14R-902, -903).
+there() {
+  local up=$1
+  [[ ! -e "$up" ]] || return 0
+  [[ ! -L "$up" ]] || return 1
+  while [[ "$up" == */?* ]]; do
+    up="${up%/*}"
+    [[ -n "$up" ]] || up=/
+    if [[ -e "$up" || -L "$up" ]]; then
+      if [[ -d "$up" && ! -x "$up" ]]; then
+        return 2
+      fi
+      return 1
+    fi
+  done
+  return 1
+}
+
 # Whether anything of this installation is there: its root, its template or its command link (the installer never
 # makes the root a link: a dangling one is no installation, M2T14R-654). A command link that cannot be read may be
 # this installation's: it counts as there, and the uninstall then refuses under the lock (design correction 11).
 installed() {
-  [[ ! -e "$root" && ! -e "$template" ]] || return 0
-  local rc=0
+  local path rc
+  for path in "$root" "$template"; do
+    rc=0
+    there "$path" || rc=$?
+    ((rc == 1)) || return 0
+  done
+  rc=0
   link_state || rc=$?
   ((rc != 1))
 }
@@ -198,8 +224,14 @@ lingers() { [[ -f "/var/lib/systemd/linger/$user" ]]; }
 # told (a link that cannot be read, said). What cannot be read is never taken for another's (design correction 11,
 # M2T14R-804).
 link_state() {
+  local target rc=0
+  there "$bin_link" || rc=$?
+  if ((rc == 2)); then
+    say "cannot tell whether $bin_link is there: a directory on its way cannot be searched"
+    return 2
+  fi
+  # Not there, or there as no link, is not this installation's; a link, even to nothing, is read.
   [[ -L "$bin_link" ]] || return 1
-  local target
   if ! target="$(readlink -- "$bin_link")"; then
     say "cannot read the link $bin_link"
     return 2
@@ -307,22 +339,35 @@ install() {
 }
 
 # The names of the links that enable an instance on disk, in the user's unit configuration and, for this boot, its
-# runtime directory, in any directory there (.wants, .requires, or another an [Install] setting makes), following a
-# directory that is a link (design corrections 10 and 11; M2T14R-700, -802, -803). Into `enabling`; 1 when a directory
-# cannot be listed (said): what cannot be listed may enable an instance (M2T14R-801).
+# runtime directory: the entries named hoh-host@<…>.service in each directory one level down (.wants, .requires, or
+# another an [Install] setting makes), which is where systemd reads them, directories that are links followed and no
+# link's target looked at (design corrections 10 to 12; M2T14R-700, -802, -803, -950). Into `enabling`; 1 when a
+# directory there cannot be read or searched (said): what cannot be listed may enable an instance (M2T14R-801).
 enabling_links() {
-  local dir link
-  local -a found=()
+  local dir sub link rc
   enabling=()
   for dir in "$config/systemd/user" ${runtime:+"$runtime/systemd/user"}; do
-    [[ -e "$dir" ]] || continue
-    mapfile -d '' -t found < <(find -L "$dir" -mindepth 2 -name 'hoh-host@?*.service' -print0)
-    if ! wait "$!"; then
+    rc=0
+    there "$dir" || rc=$?
+    ((rc != 1)) || continue
+    if ((rc == 2)); then
+      say "cannot tell whether $dir is there, where a link may enable an instance"
+      return 1
+    fi
+    if ! [[ -d "$dir" && -r "$dir" && -x "$dir" ]]; then
       say "cannot list $dir, where a link may enable an instance"
       return 1
     fi
-    for link in "${found[@]}"; do
-      enabling+=("${link##*/}")
+    for sub in "$dir"/*; do
+      [[ -d "$sub" ]] || continue
+      if ! [[ -r "$sub" && -x "$sub" ]]; then
+        say "cannot list $sub, where a link may enable an instance"
+        return 1
+      fi
+      for link in "$sub"/hoh-host@?*.service; do
+        [[ -e "$link" || -L "$link" ]] || continue
+        enabling+=("${link##*/}")
+      done
     done
   done
 }
@@ -330,10 +375,12 @@ enabling_links() {
 # The installation's instances, into `instances`: those with a file under the root, those a link enables, those the
 # manager has loaded; 1 when one of these cannot be listed (said).
 instance_units() {
-  local file unit listed
+  local file unit listed rc
   local -A seen=()
   instances=()
-  if [[ -e "$hosts" && ! (-d "$hosts" && -r "$hosts" && -x "$hosts") ]]; then
+  rc=0
+  there "$hosts" || rc=$?
+  if ((rc == 2)) || { ((rc == 0)) && ! [[ -d "$hosts" && -r "$hosts" && -x "$hosts" ]]; }; then
     say "cannot list $hosts, the instances' files"
     return 1
   fi
@@ -359,22 +406,25 @@ instance_units() {
 # The manager's word on whether `unit` is enabled, into `enabled`: 0 enabled, 1 not (a state that enables nothing), 2
 # no word to tell by (no answer, or one that is neither; design correction 11, M2T14R-800).
 enablement_of() {
-  enabled="$(systemctl --user is-enabled "$1" 2>/dev/null)" || true
-  case "$enabled" in
-    enabled | enabled-runtime) return 0 ;;
-    disabled | static | indirect | generated | transient | masked | masked-runtime | not-found) return 1 ;;
+  local rc=0
+  enabled="$(systemctl --user is-enabled "$1" 2>/dev/null)" || rc=$?
+  # An answer is taken only with the exit code that state gives (M2T14R-900). "masked" is not "not enabled": a masked
+  # instance's own links may still be there, unseen (M2T14R-901).
+  case "$enabled:$rc" in
+    enabled:0 | enabled-runtime:0) return 0 ;;
+    disabled:1 | static:0 | indirect:0 | generated:0 | transient:0 | not-found:4) return 1 ;;
     *) return 2 ;;
   esac
 }
 
 # Stop and disable the installation's instances, each checked with the manager: inactive or failed, and not enabled by
-# whatever link (`is-enabled`, design corrections 1, 9, 10 and 11); 1 when one is left, 2 when they cannot be listed
-# (said). `first`
+# whatever link (`is-enabled`, design corrections 1, 9, 10 and 11); 1 when one is left, else 2 when they cannot be
+# listed or one's state cannot be told after its disable (said; M2T14R-952). `first`
 # stops and disables each; `final`, under both locks, acts on any the manager does not say is not enabled, which a run
 # enabled again after the first pass. With no manager to ask or disable with, an instance a link enables refuses the
 # uninstall (M2T14R-151, -700), and so does a directory that cannot be listed.
 settle_instances() {
-  local pass=$1 unit active enabled state left=0
+  local pass=$1 unit active enabled state left=0 untold=0
   if ! manager; then
     enabling_links || return 2
     for unit in "${enabling[@]}"; do
@@ -390,7 +440,7 @@ settle_instances() {
       enablement_of "$unit" || state=$?
       ((state != 1)) || continue
     fi
-    active="" state=2
+    active="" enabled="" state=2
     if systemctl --user disable --now --quiet "$unit"; then
       active="$(systemctl --user show -p ActiveState --value "$unit" 2>/dev/null)" || active=""
       state=0
@@ -402,13 +452,18 @@ settle_instances() {
       else
         printf 'disabled %s: it was enabled again while the uninstall ran\n' "$unit"
       fi
+    elif [[ "$active" == inactive || "$active" == failed ]] && ((state == 2)); then
+      say "cannot tell whether $unit is still enabled after its disable (is-enabled ${enabled:-no answer})"
+      untold=1
     else
       say "could not stop and disable $unit (ActiveState=${active:-unknown}, is-enabled ${enabled:-no answer})"
       left=1
     fi
   done
   [[ "$pass" != first ]] || systemctl --user reset-failed 'hoh-host@*.service' 2>/dev/null || true
-  return "$left"
+  ((left)) && return 1
+  ((untold)) && return 2
+  return 0
 }
 
 remove() {
@@ -428,8 +483,13 @@ remove() {
   # The installation's own lock, exclusive (design correction 2, M2T14R-100): every run of an installed hoh holds it
   # shared for its life, so it is had only once none runs, and while it is held none can start; what follows is
   # removed under it.
-  local held=1 run_holds=0
-  if [[ -e "$root/.lock" ]]; then
+  local held=1 run_holds=0 lock_there=0
+  there "$root/.lock" || lock_there=$?
+  if ((lock_there == 2)); then
+    say "cannot tell whether this installation's lock $root/.lock is there"
+    unsure=1
+  fi
+  if ((lock_there == 0)); then
     # Read-write when it can be (an NFS client needs it for an exclusive lock, M2T14R-451), else read-only (a 0400 lock
     # is fine locally, M2T14R-351); a failed open is said, not taken for a running program (M2T14R-453).
     if { command exec 9<>"$root/.lock"; } 2>/dev/null || { command exec 9<"$root/.lock"; } 2>/dev/null; then
@@ -472,7 +532,14 @@ remove() {
   # Nothing is removed while a process still runs this installation's binaries: a host its unit did not run, an
   # agent's start gate, an instance that did not stop (M2T14R-03); the scan names them.
   local real proc exe running=0
-  real="$(readlink -f -- "$root" 2>/dev/null || printf '%s' "$root")"
+  # The root as /proc names the programs' paths; one that cannot be resolved cannot be scanned for (M2T14R-951). A
+  # program's path that cannot be read below is a process that ended, or another user's, which the scan cannot see
+  # (that one, once it holds the run lock, refuses the uninstall above).
+  if ! real="$(readlink -f -- "$root")"; then
+    say "cannot resolve $root to look for programs that run from it"
+    unsure=1
+    real="$root"
+  fi
   for proc in /proc/[0-9]*; do
     exe="$(readlink -- "$proc/exe" 2>/dev/null || true)"
     if [[ "$exe" == "$real"/* || "$exe" == "$root"/* ]]; then
@@ -494,6 +561,14 @@ remove() {
   fi
   # The closing word follows the cause: something runs or stays enabled, something could not be told (design correction
   # 11), or only the lock was not had (M2T14R-652).
+  # What is removed is told before anything is (design correction 12): a template or root that cannot be told refuses.
+  local template_there=0 root_there=0
+  there "$template" || template_there=$?
+  there "$root" || root_there=$?
+  if ((template_there == 2 || root_there == 2)); then
+    say "cannot tell whether $template or $root is there"
+    unsure=1
+  fi
   if ((failed || running || run_holds)); then
     fail 69 "nothing was removed: stop what is named above, then run install.sh --uninstall again"
   fi
@@ -504,7 +579,7 @@ remove() {
     fail 69 "nothing was removed: this installation's lock could not be had or told (said above); run install.sh --uninstall again once it can be"
   fi
   # Each removal is said as it happened (M2T14R-150).
-  if [[ -e "$template" ]]; then
+  if ((template_there == 0)); then
     rm -f -- "$template"
     printf 'removed %s\n' "$template"
   fi
@@ -516,7 +591,7 @@ remove() {
   elif [[ -e "$bin_link" || -L "$bin_link" ]]; then
     say "kept $bin_link: it is not this installation's link"
   fi
-  if [[ -e "$root" ]]; then
+  if ((root_there == 0)); then
     rm -rf -- "$hosts" "$root/versions"
     rm -f -- "$root/current" "$root"/current.tmp.* "$root/.lock"
     if rmdir -- "$root" 2>/dev/null; then
