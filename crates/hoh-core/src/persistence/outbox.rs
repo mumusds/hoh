@@ -440,7 +440,7 @@ fn fence(message: &Message, now: &Current) -> Option<(RejectionReason, String)> 
     if now.spec_sha256.as_deref() != Some(message.spec_sha256.as_str())
         || handoff
             .as_ref()
-            .is_some_and(|h| h.spec_sha256 != message.spec_sha256)
+            .is_some_and(|h| h.spec_sha256.as_deref() != Some(message.spec_sha256.as_str()))
     {
         return Some((
             RejectionReason::SpecMismatch,
@@ -448,12 +448,12 @@ fn fence(message: &Message, now: &Current) -> Option<(RejectionReason, String)> 
         ));
     }
     if let Some(h) = &handoff
-        && now.spec_revision.and_then(|r| u64::try_from(r).ok()) != Some(h.spec_revision)
+        && now.spec_revision.and_then(|r| u64::try_from(r).ok()) != h.spec_revision
     {
         return Some((
             RejectionReason::SpecMismatch,
             format!(
-                "the package's specification revision {} is not the run's {:?}",
+                "the package's specification revision {:?} is not the run's {:?}",
                 h.spec_revision, now.spec_revision
             ),
         ));

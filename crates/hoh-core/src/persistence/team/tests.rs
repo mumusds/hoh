@@ -301,8 +301,7 @@ async fn working(store: &Store, path: &PathBuf) -> R {
     )
 }
 
-/// Run R1 on spec s1: a binding change hands its role over with a package naming the run's spec, and a run with
-/// none has every change refused NO_SPEC (docs/adr/ADR-024.md decisions 1 and 10).
+/// Run R1 on spec s1: a binding change's package then names the run's spec (with none it says so with nulls, CR-014).
 fn on_a_spec(path: &PathBuf) -> R {
     exec(
         path,
@@ -490,7 +489,6 @@ async fn a_removed_role_is_blocked_at_a_new_epoch_and_one_added_again_does_not_r
     store
         .submit_command(start("R1", Config::default().budget))
         .await?;
-    on_a_spec(&path)?;
     let auditor = || {
         values(
             &path,
@@ -637,7 +635,6 @@ async fn a_role_blocked_for_its_availability_is_not_a_changed_role() -> R {
     store
         .submit_command(start("R1", Config::default().budget))
         .await?;
-    on_a_spec(&path)?;
     exec(
         &path,
         "INSERT INTO sessions(session_id, agent, role, agent_version, capabilities_json) VALUES
@@ -756,7 +753,6 @@ async fn a_change_of_the_prompt_alone_is_a_new_epoch() -> R {
     store
         .submit_command(start("R1", Config::default().budget))
         .await?;
-    on_a_spec(&path)?;
     store
         .submit_command(team_change(
             "prompt",
@@ -783,7 +779,6 @@ async fn a_change_to_an_unavailable_agent_keeps_the_old_binding_until_the_agent_
     store
         .submit_command(start("R1", Config::default().budget))
         .await?;
-    on_a_spec(&path)?;
     store
         .submit_command(team_change(
             "dev",
@@ -938,7 +933,6 @@ async fn a_change_to_an_agent_not_looked_at_yet_waits_without_a_verdict() -> R {
     store
         .submit_command(start("R1", Config::default().budget))
         .await?;
-    on_a_spec(&path)?;
     store
         .submit_command(team_change(
             "dev",
@@ -988,7 +982,6 @@ async fn a_refusal_holds_for_its_revision_only() -> R {
     store
         .submit_command(start("R1", Config::default().budget))
         .await?;
-    on_a_spec(&path)?;
     store
         .submit_command(team_change(
             "dev",
@@ -1391,7 +1384,7 @@ async fn a_commander_change_writes_binding_package_and_session_start_in_one_tran
             package.spec_revision,
             package.spec_sha256.clone()
         ),
-        ("g", 1, format!("{:064}", 1))
+        ("g", Some(1), Some(format!("{:064}", 1)))
     );
     assert_eq!(package.candidate.map(|c| c.id).as_deref(), Some("C1"));
     let ids = |sql: &str| -> R<Vec<String>> {
@@ -1428,54 +1421,79 @@ async fn a_commander_change_writes_binding_package_and_session_start_in_one_tran
 }
 
 #[tokio::test]
-async fn a_commander_change_of_a_run_without_a_spec_is_refused_until_the_run_has_one() -> R {
-    // ADR-024 decision 10: a role-change package names the run's spec, so a run with none keeps its commander (binding
-    // and epoch) with one team.binding_refused, reason NO_SPEC, and no notice; later checkpoints add nothing while it
-    // stays so; once the run has a spec the change applies with its package.
+async fn a_change_of_any_role_in_a_run_without_a_spec_applies_with_a_package_saying_so() -> R {
+    // CR-014 (REQ-018 behaviour 5, REQ-019 behaviours 2 and 4; M2T17R-100): a run with no specification yet has the
+    // commander's and the developer's changes applied at their checkpoint like any other, nothing refused; each new
+    // holder's package is valid with its digest and revision null; once the run has a spec, the next change's package
+    // names it.
     let dir = tempfile::tempdir()?;
     let (store, path) = open(&dir)?;
     store
         .submit_command(start("R1", Config::default().budget))
         .await?;
     store
-        .submit_command(team_change("pi", 0, json!({"commander": {"agent": "pi"}})))
+        .submit_command(team_change(
+            "both",
+            0,
+            json!({"commander": {"agent": "pi"}, "developer": {"agent": "codex"}}),
+        ))
         .await?;
-    let notices = |path: &PathBuf| -> R<i64> {
-        Ok(rows::<i64>(
-            path,
-            "SELECT count(*) FROM outbox WHERE json_extract(payload_json, '$.kind') = 'session.start'",
-        )?[0][0])
-    };
-    for _ in 0..2 {
-        store
-            .team_checkpoint("R1", crate::persistence::Availability::default())
-            .await?;
-        assert_eq!(
-            binding(&path, "commander")?[..3],
-            [json!("codex"), Value::Null, json!(1)]
-        );
-        assert_eq!(
-            rows::<String>(
-                &path,
-                "SELECT json_extract(payload_json, '$.reason') FROM events WHERE kind = 'team.binding_refused'"
-            )?,
-            [["NO_SPEC".to_owned()]]
-        );
-        assert_eq!(notices(&path)?, 0);
-    }
-    exec(
-        &path,
-        "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', 'p1', printf('%064d', 7), 1);
-         UPDATE runs SET spec_id = 's1' WHERE run_id = 'R1';",
-    )?;
     store
         .team_checkpoint("R1", crate::persistence::Availability::default())
         .await?;
+    for (role, agent) in [("commander", "pi"), ("developer", "codex")] {
+        assert_eq!(
+            binding(&path, role)?[..3],
+            [json!(agent), Value::Null, json!(2)],
+            "{role}"
+        );
+    }
     assert_eq!(
-        binding(&path, "commander")?[..3],
-        [json!("pi"), Value::Null, json!(2)]
+        rows::<i64>(
+            &path,
+            "SELECT count(*) FROM events WHERE kind = 'team.binding_refused'"
+        )?,
+        [[0]]
     );
-    assert_eq!(notices(&path)?, 1);
+    let packages = |path: &PathBuf| -> R<Vec<crate::protocol::ContextHandoff>> {
+        rows::<String>(
+            path,
+            "SELECT json_extract(payload_json, '$.package') FROM outbox \
+             WHERE json_extract(payload_json, '$.kind') = 'session.start' ORDER BY recipient_role, role_epoch",
+        )?
+        .into_iter()
+        .flatten()
+        .map(|p| Ok(crate::protocol::decode(&serde_json::from_str::<Value>(&p)?)?))
+        .collect()
+    };
+    let first = packages(&path)?;
+    assert_eq!(
+        first
+            .iter()
+            .map(|p| (p.role.as_str(), p.spec_sha256.as_deref(), p.spec_revision))
+            .collect::<Vec<_>>(),
+        [("commander", None, None), ("developer", None, None)]
+    );
+    on_a_spec(&path)?;
+    store
+        .submit_command(team_change(
+            "dev2",
+            1,
+            json!({"developer": {"agent": "pi"}}),
+        ))
+        .await?;
+    store
+        .team_checkpoint("R1", crate::persistence::Availability::default())
+        .await?;
+    let later = packages(&path)?;
+    let developer3 = later
+        .iter()
+        .find(|p| p.role == "developer" && p.role_epoch == 3)
+        .ok_or("no developer package at epoch 3")?;
+    assert_eq!(
+        (developer3.spec_sha256.as_deref(), developer3.spec_revision),
+        (Some(format!("{:064}", 1).as_str()), Some(1))
+    );
     Ok(())
 }
 
@@ -1731,7 +1749,7 @@ async fn every_roles_change_to_a_new_holder_hands_the_role_over_with_its_package
             package.goal.as_str(),
             package.spec_revision
         ),
-        ("developer", 2, "TaskResult", "g", 1)
+        ("developer", 2, "TaskResult", "g", Some(1))
     );
     let starts = store.runner_waiting("p1").await?.session_starts;
     assert_eq!(
@@ -1886,59 +1904,6 @@ async fn a_first_input_the_executor_did_not_take_is_recorded_once_and_shown_pend
             .session_start_undelivered(&start.message_id, "late")
             .await?,
         "settled: nothing to record"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn a_change_of_any_role_in_a_run_without_a_spec_is_refused_until_the_run_has_one() -> R {
-    // docs/adr/ADR-024.md decision 10 for every role (M2T17R-03): with no spec no package can be made, so the
-    // developer's change is refused NO_SPEC as the commander's is, the old binding working on; once the run has a spec
-    // it applies with its package.
-    let dir = tempfile::tempdir()?;
-    let (store, path) = open(&dir)?;
-    store
-        .submit_command(start("R1", Config::default().budget))
-        .await?;
-    store
-        .submit_command(team_change(
-            "dev",
-            0,
-            json!({"developer": {"agent": "codex"}}),
-        ))
-        .await?;
-    for _ in 0..2 {
-        store
-            .team_checkpoint("R1", crate::persistence::Availability::default())
-            .await?;
-        assert_eq!(
-            binding(&path, "developer")?[..3],
-            [json!("claude"), Value::Null, json!(1)]
-        );
-    }
-    assert_eq!(
-        rows::<String>(
-            &path,
-            "SELECT json_extract(payload_json, '$.role') || '/' || json_extract(payload_json, '$.reason') FROM events \
-             WHERE kind = 'team.binding_refused'"
-        )?,
-        [["developer/NO_SPEC".to_owned()]]
-    );
-    on_a_spec(&path)?;
-    store
-        .team_checkpoint("R1", crate::persistence::Availability::default())
-        .await?;
-    assert_eq!(
-        binding(&path, "developer")?[..3],
-        [json!("codex"), Value::Null, json!(2)]
-    );
-    assert_eq!(
-        rows::<i64>(
-            &path,
-            "SELECT count(*) FROM outbox WHERE json_extract(payload_json, '$.kind') = 'session.start' \
-             AND recipient_role = 'developer' AND role_epoch = 2"
-        )?,
-        [[1]]
     );
     Ok(())
 }

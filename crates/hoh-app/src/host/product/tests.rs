@@ -77,8 +77,7 @@ fn a_first_input_found_in_place_is_taken_only_once_its_directory_is_synced()
             run_id: "R".to_owned(),
             goal: "g".to_owned(),
             role_epoch: 2,
-            spec_sha256: format!("{:064}", 1),
-            spec_revision: 1,
+            spec: Some((format!("{:064}", 1), 1)),
             candidate: None,
             state: hoh_core::protocol::HandoffState {
                 applied_decision_ids: Vec::new(),
@@ -258,8 +257,7 @@ fn a_first_input_is_kept_once_whole_and_another_is_refused()
         run_id: "R".to_owned(),
         goal: "g".to_owned(),
         role_epoch: 2,
-        spec_sha256: format!("{:064}", 1),
-        spec_revision: 1,
+        spec: Some((format!("{:064}", 1), 1)),
         candidate: None,
         state: hoh_core::protocol::HandoffState {
             applied_decision_ids: vec!["D1".to_owned()],

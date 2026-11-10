@@ -552,7 +552,7 @@ async fn test_022_04_candidate_ready_hands_the_same_candidate_to_qa_and_reviewer
         let message: Message = protocol::decode(&raw)?;
         let package: ContextHandoff = protocol::decode(&Value::Object(message.payload.clone()))?;
         assert_eq!(message.kind, protocol::MessageKind::Handoff);
-        assert_eq!(package.spec_sha256, sha(2));
+        assert_eq!(package.spec_sha256, Some(sha(2)));
         // The envelope carries the current fences: the role's epoch, the task's revision once VERIFYING, the spec
         // and the candidate (M2T04R-50).
         let epoch = if message.recipient_role == "qa" { 2 } else { 1 };

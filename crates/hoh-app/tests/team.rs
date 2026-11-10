@@ -604,18 +604,6 @@ fn exec(project: &Path, sql: &str) -> R {
     Ok(())
 }
 
-/// Run `run_id` on a spec of its own: a binding change hands its role over with a package naming the run's spec, and
-/// a run with none (StartRun writes none yet) has every change refused NO_SPEC (docs/adr/ADR-024.md decisions 1, 10).
-fn on_a_spec(project: &Path, run_id: &str) -> R {
-    exec(
-        project,
-        &format!(
-            "INSERT INTO specs(spec_id, project_id, sha256, revision) SELECT 'spec-{run_id}', project_id, \
-             printf('%064d', 1), 1 FROM projects; UPDATE runs SET spec_id = 'spec-{run_id}' WHERE run_id = '{run_id}';"
-        ),
-    )
-}
-
 #[tokio::test]
 async fn a_hosts_runner_applies_a_team_change_at_the_roles_checkpoint() -> R {
     // ADR-022 decision 8: each tick of the runner applies the checkpoint of every run not ended that is behind the
@@ -628,7 +616,6 @@ async fn a_hosts_runner_applies_a_team_change_at_the_roles_checkpoint() -> R {
     });
     let host = start_when_free(config).await?;
     let run_id = started(&host, "s1").await?;
-    on_a_spec(dir.path(), &run_id)?;
     let (status, body) = exchange(
         &host,
         "POST",
@@ -687,7 +674,6 @@ async fn a_hosts_runner_leaves_an_ended_run_at_its_revision() -> R {
         ended.push(run_id);
     }
     let open = started(&host, "open").await?;
-    on_a_spec(dir.path(), &open)?;
     let (status, body) = exchange(
         &host,
         "POST",

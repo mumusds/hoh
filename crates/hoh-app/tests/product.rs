@@ -1640,8 +1640,8 @@ async fn test_019_02_the_new_commanders_first_input_is_the_checkpoint_package() 
             hoh_core::protocol::decode(&input["package"])?;
         assert_eq!(package.goal, "Ship the parser");
         assert_eq!(
-            (package.spec_revision, package.spec_sha256.as_str()),
-            (3, format!("{:064}", 3).as_str())
+            (package.spec_revision, package.spec_sha256.as_deref()),
+            (Some(3), Some(format!("{:064}", 3).as_str()))
         );
         assert_eq!(package.candidate.map(|c| c.id).as_deref(), Some("C"));
         assert_eq!((package.role.as_str(), package.role_epoch), ("commander", 2));
