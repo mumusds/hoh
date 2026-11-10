@@ -1156,10 +1156,9 @@ fn nothing_of_the_installation_starts_while_the_uninstall_removes_it() -> R {
     Ok(())
 }
 
-#[test]
-fn a_manager_that_does_not_answer_after_the_deadline_is_not_read_as_no_start() -> R {
-    // M2T14R-251 (ADR-023 design correction 4): the start takes 14 s (a drop-in) and the manager's answer to the
-    // client's question after its deadline takes 3 s (a stand-in systemctl): the client says the manager did not answer.
+/// The client after its deadline, the start taking 14 s (a drop-in) and the manager's answer to its question given
+/// as `answer` (a stand-in systemctl's shell, for that question only): what the client says.
+fn after_the_deadline(answer: &str) -> R<String> {
     let (manager, project) = installed(true)?;
     dropin(
         &manager,
@@ -1168,7 +1167,9 @@ fn a_manager_that_does_not_answer_after_the_deadline_is_not_read_as_no_start() -
     )?;
     installed::script(
         &manager.bin().join("systemctl"),
-        "#!/bin/sh\ncase \" $* \" in *\" Job,ActiveState \"*) sleep 3;; esac\nexec /usr/bin/systemctl \"$@\"\n",
+        &format!(
+            "#!/bin/sh\ncase \" $* \" in *\" Job,ActiveState \"*) {answer};; esac\nexec /usr/bin/systemctl \"$@\"\n"
+        ),
     )?;
     let out = hoh_in(
         &manager,
@@ -1177,9 +1178,18 @@ fn a_manager_that_does_not_answer_after_the_deadline_is_not_read_as_no_start() -
         &["-p", "x", "--detach", "--output", "json"],
     )?;
     assert_eq!(out.status.code(), Some(69), "{}", text(&out));
-    let stderr = String::from_utf8(out.stderr)?;
-    assert!(stderr.contains("did not answer"), "{stderr}");
-    assert!(!stderr.contains("shows no start"), "{stderr}");
+    Ok(String::from_utf8(out.stderr)?)
+}
+
+#[test]
+fn a_manager_that_does_not_answer_after_the_deadline_is_not_read_as_no_start() -> R {
+    // M2T14R-251, -353 (ADR-023 design correction 4): no answer is said as none, however it fails: too late (3 s), a
+    // non-zero exit, or an answer without its ActiveState line.
+    for answer in ["sleep 3", "exit 1", "echo Job=; exit 0"] {
+        let said = after_the_deadline(answer)?;
+        assert!(said.contains("did not answer"), "{answer}: {said}");
+        assert!(!said.contains("shows no start"), "{answer}: {said}");
+    }
     Ok(())
 }
 

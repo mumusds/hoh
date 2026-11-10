@@ -67,7 +67,33 @@ main() {
   template="$data/systemd/user/hoh-host@.service"
   override="$config/systemd/user/hoh-host@.service"
   user="${USER:-$(id -un)}"
-  if ((uninstall)); then remove; else install "${projects[@]}"; fi
+  if ((uninstall)); then
+    hold_operation
+    remove
+  else
+    check_paths
+    hold_operation
+    install "${projects[@]}"
+  fi
+}
+
+# The installer's own lock (docs/adr/ADR-023.md design correction 5, M2T14R-300, -301): every install and uninstall
+# holds this home exclusive for its whole run, so they take turns, and none sees another's half-done work. A
+# directory that is never removed: its lock is never on a file that is gone. A run of hoh never takes it.
+hold_operation() {
+  [[ -d "$HOME" ]] || fail 78 "HOME ($HOME) is not a directory"
+  exec 8<"$HOME"
+  flock -w 60 -x 8 || fail 69 "another install.sh (install or uninstall) for $HOME still runs: try again when it ends"
+}
+
+# Before anything is written: EnvironmentFile= takes a glob, ExecStart= no program path with quotes or a backslash
+# (design corrections 1 and 2, M2T14R-101).
+check_paths() {
+  local real_root
+  real_root="$(readlink -m -- "$root")"
+  refuse_chars "the installation's root" "$root" '*' '?' '[' '"' '\' "'"
+  refuse_chars "the installation's root" "$real_root" '*' '?' '[' '"' '\' "'"
+  refuse_chars "HOME" "$HOME" '"' '\' "'"
 }
 
 # Whether the user's systemd manager answers.
@@ -102,16 +128,12 @@ install() {
   if [[ -e "$bin_link" || -L "$bin_link" ]] && ! ours; then
     fail 1 "$bin_link exists and is not this installation's link to $current/bin/hoh: nothing changed"
   fi
-  # Before anything is written: EnvironmentFile= takes a glob, ExecStart= no program path with quotes or a backslash
-  # (docs/adr/ADR-023.md design corrections 1 and 2, M2T14R-101).
-  local real_root
-  real_root="$(readlink -m -- "$root")"
-  refuse_chars "the installation's root" "$root" '*' '?' '[' '"' '\' "'"
-  refuse_chars "the installation's root" "$real_root" '*' '?' '[' '"' '\' "'"
-  refuse_chars "HOME" "$HOME" '"' '\' "'"
   if (($#)) && ! manager; then
     fail 69 "no user systemd manager answers (\$XDG_RUNTIME_DIR/systemd/private): cannot enable a project's host unit"
   fi
+  # An installed hoh (this script may be one's copy) runs only with its installation's lock: one missing from an
+  # existing installation is made again before any of its binaries runs (M2T14R-352).
+  [[ ! -d "$root" || -e "$root/.lock" ]] || : >"$root/.lock"
   semver="$("$src/bin/hoh" --version | sed -n '1s/^hoh //p')"
   [[ "$semver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail 64 "$src/bin/hoh --version does not name a version"
   sha="$(sha256sum -- "$src/bin/hoh" | cut -c1-12)"
@@ -161,7 +183,10 @@ install() {
   for project in "$@"; do
     "$current/bin/hoh" __unit enable "$project"
   done
-  printf 'installed %s in %s\n' "$("$current/bin/hoh" --version | head -2 | tr '\n' ' ')" "$root/versions/$name"
+  # The installed command must run: a failure here is the install's, not hidden by the message (M2T14R-301).
+  local shown
+  shown="$("$current/bin/hoh" --version)" || fail 69 "the installed $current/bin/hoh does not run"
+  printf 'installed %s in %s\n' "$(head -2 <<<"$shown" | tr '\n' ' ')" "$root/versions/$name"
   printf 'command: %s\n' "$bin_link"
   if lingers; then
     printf 'linger: yes\n'
@@ -215,10 +240,26 @@ remove() {
   # shared for its life, so it is had only once none runs, and while it is held none can start; what follows is
   # removed under it.
   local held=1
-  if [[ -d "$root" ]]; then
-    exec 9>>"$root/.lock"
-    flock -n -x 9 || held=0
+  if [[ -e "$root/.lock" ]]; then
+    # Read-only, as a run opens it (a 0400 lock is fine; M2T14R-351); checked first, since a failed exec redirection
+    # would end this script.
+    if [[ -r "$root/.lock" ]]; then
+      exec 9<"$root/.lock"
+      flock -n -x 9 || held=0
+    else
+      say "cannot read this installation's lock $root/.lock"
+      held=0
+    fi
+    # The lock held must be the file at its path (the run's check, design correction 3, and the uninstall's own,
+    # correction 5): one replaced or removed meanwhile holds nothing.
+    if ((held)) && { [[ "$(stat -L -c '%d:%i' /dev/fd/9)" != "$(stat -c '%d:%i' "$root/.lock" 2>/dev/null)" ]] ||
+      [[ "$(stat -L -c '%h' /dev/fd/9)" == 0 ]]; }; then
+      say "this installation's lock changed while it was being taken"
+      held=0
+    fi
   fi
+  # With no lock file no run can hold the installation (each refuses to run without it); the scan below still finds
+  # one between its exec and its lock.
   # Nothing is removed while a process still runs this installation's binaries: a host its unit did not run, an
   # agent's start gate, an instance that did not stop (M2T14R-03); the scan names them.
   local real proc exe running=0

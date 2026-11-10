@@ -337,33 +337,32 @@ fn a_process_is_supervised_by_the_hosts_unit_only_when_its_cgroup_is_one() {
 #[test]
 fn an_installed_binary_holds_its_installation_shared_and_none_while_it_is_being_removed()
 -> Result<(), Box<dyn std::error::Error>> {
-    // ADR-023 design corrections 2 and 3 (M2T14R-100): every run of an installed hoh holds R/.lock shared for its life;
-    // the uninstall's exclusive hold keeps any new one from starting, and one that got its lock only after the
-    // uninstall removed the file (an old inode) or runs a removed binary does not run on.
+    // ADR-023 design corrections 2, 3 and 6 (M2T14R-100, -250, -350): every run of an installed hoh holds R/.lock
+    // shared for its life; the uninstall's exclusive hold keeps any new one from starting, and one that got its lock
+    // only after the uninstall removed the file (an old inode), or whose running image is not the binary at its path,
+    // does not run on.
     let root = tempfile::tempdir()?;
     let r = root.path().join("hoh");
     std::fs::create_dir_all(r.join("versions/v/bin"))?;
     let exe = r.join("versions/v/bin/hoh");
     std::fs::write(&exe, "")?;
+    let hold = |path: &Path| hold_installation_as(path, &exe);
     // Not installed: nothing to hold.
-    assert!(hold_installation(Path::new("/h/target/debug/hoh"))?.is_none());
-    assert!(hold_installation(Path::new("/h/target/debug/hoh (deleted)"))?.is_none());
-    // The installer makes the lock; with none, the installation is being removed.
-    let missing = hold_installation(&exe).expect_err("no lock file");
-    assert!(
-        missing.to_string().contains("being uninstalled"),
-        "{missing}"
-    );
+    assert!(hold(Path::new("/h/target/debug/hoh"))?.is_none());
+    assert!(hold(Path::new("/h/target/debug/hoh (deleted)"))?.is_none());
+    // The installer makes the lock; without it, with the binary there, the lock alone is said missing (M2T14R-352).
+    let missing = hold(&exe).expect_err("no lock file");
+    assert!(missing.to_string().contains("is missing"), "{missing}");
     std::fs::write(r.join(".lock"), "")?;
     // Read-only is enough for a shared lock: a lock the user made 0400 is held as well (M2T14R-250).
     {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(r.join(".lock"), std::fs::Permissions::from_mode(0o400))?;
-        drop(hold_installation(&exe)?.ok_or("held read-only")?);
+        drop(hold(&exe)?.ok_or("held read-only")?);
         std::fs::set_permissions(r.join(".lock"), std::fs::Permissions::from_mode(0o600))?;
     }
-    let first = hold_installation(&exe)?.ok_or("held")?;
-    let second = hold_installation(&exe)?.ok_or("held")?;
+    let first = hold(&exe)?.ok_or("held")?;
+    let second = hold(&exe)?.ok_or("held")?;
     // The uninstall's exclusive lock cannot be had while they are held...
     let lock = std::fs::File::open(r.join(".lock"))?;
     assert!(
@@ -372,18 +371,27 @@ fn an_installed_binary_holds_its_installation_shared_and_none_while_it_is_being_
     drop((first, second));
     // ... and once it is had, no run can hold the installation.
     rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
-    let refused = hold_installation(&exe).expect_err("being removed");
+    let refused = hold(&exe).expect_err("being removed");
     assert!(
         refused.to_string().contains("being uninstalled"),
         "{refused}"
     );
     drop(lock);
+    // A run whose image is not the binary at its path (removed, then installed again there) is refused (-350).
+    let other = root.path().join("another image");
+    std::fs::write(&other, "")?;
+    let replaced = hold_installation_as(&exe, &other).expect_err("another image");
+    assert!(
+        replaced.to_string().contains("removed or replaced"),
+        "{replaced}"
+    );
     // A binary removed under its run (its path read with " (deleted)") is refused.
     let deleted = PathBuf::from(format!("{} (deleted)", exe.display()));
-    assert!(hold_installation(&deleted).is_err());
-    // An installation whose root is gone is being removed too.
+    assert!(hold(&deleted).is_err());
+    // An installation whose root is gone is being removed.
     std::fs::remove_dir_all(&r)?;
-    assert!(hold_installation(&exe).is_err());
+    let gone = hold(&exe).expect_err("gone");
+    assert!(gone.to_string().contains("being uninstalled"), "{gone}");
     Ok(())
 }
 
