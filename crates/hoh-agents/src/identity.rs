@@ -634,20 +634,14 @@ mod tests {
         while std::fs::read(&comm)? != b"w\xffr\n" && Instant::now() < end {
             std::thread::sleep(Duration::from_millis(5));
         }
-        let seen = (
-            std::fs::read(&comm)?,
-            of(pid),
-            group_left(pid, 0),
-            crate::process::group_members(pid),
-        );
+        let seen = (std::fs::read(&comm)?, of(pid), group_left(pid, 0));
         drop(child.stdin.take());
         child.wait()?;
-        let (comm, me, left, members) = seen;
+        let (comm, me, left) = seen;
         assert_eq!(comm, b"w\xffr\n", "the precondition: its name is not UTF-8");
         let me = me?.ok_or_else(|| io::Error::other("no identity"))?;
         assert_eq!(me.pid, pid);
         assert_eq!(left?, vec![pid]);
-        assert_eq!(members, vec![pid]);
         Ok(())
     }
 

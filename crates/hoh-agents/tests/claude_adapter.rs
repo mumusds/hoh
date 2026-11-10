@@ -9,7 +9,8 @@ mod common;
 
 use common::{R, World, probed};
 use hoh_agents::claude::{self, AttemptRef, Launch, Outcome, PARTIAL_FLAG, Turn, YOLO_FLAG};
-use hoh_agents::process::{Escalation, Signal, Target, group_members};
+use hoh_agents::identity::{group_empty, group_left};
+use hoh_agents::process::{Escalation, Signal, Target};
 use hoh_core::lifecycle::AttemptState;
 use hoh_core::persistence::{CancelLatch, CancelReceipt};
 use serde_json::json;
@@ -542,7 +543,7 @@ async fn cancel_and_sample(
     let at = Instant::now();
     assert_eq!(cancel.request(), CancelReceipt::Accepted);
     tokio::time::sleep_until((at + mark - Duration::from_millis(100)).into()).await;
-    let left = group_members(pid);
+    let left = group_left(pid, 0)?;
     let ended = at.elapsed();
     if ended > mark {
         return Err(format!("the scan ended {ended:?} after the cancel").into());
@@ -618,7 +619,7 @@ async fn the_three_second_sample_catches_a_slow_stop() -> R {
     let (outcome, (_, pid, left)) = (outcome?, sample?);
     assert!(!left.is_empty(), "the group was gone before its kill");
     assert_eq!(outcome.state, AttemptState::Cancelled);
-    assert!(group_members(pid).is_empty());
+    assert!(group_empty(pid));
     Ok(())
 }
 
@@ -803,7 +804,7 @@ async fn a_frame_too_large_ends_the_turn() -> R {
             false
         )
     );
-    assert!(group_members(outcome.pid.ok_or("no pid")?).is_empty());
+    assert!(group_empty(outcome.pid.ok_or("no pid")?));
     let diagnosis = world
         .store
         .reader()?

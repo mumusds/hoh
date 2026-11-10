@@ -6,12 +6,11 @@
 #![forbid(unsafe_code)]
 
 use hoh_agents::frame::{Frame, HEAD_BYTES};
+use hoh_agents::identity::group_empty;
 use hoh_agents::process::{
     Cause, Config, Escalation, Event, ExitReport, Process, Signal, Target, Termination,
-    group_members,
 };
 use sha2::{Digest, Sha256};
-use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -24,8 +23,9 @@ fn sh(script: &str) -> Command {
 }
 
 fn alive(pid: u32) -> bool {
-    // A zombie still has a /proc entry; only a reaped process is gone.
-    Path::new(&format!("/proc/{pid}")).exists()
+    // A zombie still has a /proc entry; only a reaped process is gone. A look that fails for another reason counts as
+    // alive, so that an assertion of its end fails rather than passes (ADR-022 decision 10, convention v2).
+    !matches!(std::fs::symlink_metadata(format!("/proc/{pid}")), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
 }
 
 /// Read events until the exit report, with an overall bound.
@@ -66,11 +66,11 @@ async fn orphans_left_in_the_group_are_killed_when_the_leader_exits() -> R {
     assert_eq!(report.status, Some(Termination::Code(3)));
     assert_eq!(report.cause, Cause::Exited);
     assert!(report.steps.is_empty(), "{:?}", report.steps);
-    assert_eq!(report.orphans, 1);
+    assert_eq!(report.orphans, Some(1));
     assert!(report.group_reaped);
     assert!(report.stdout.eof);
     assert!(!alive(grandchild), "grandchild {grandchild} survived");
-    assert!(group_members(pgid).is_empty());
+    assert!(group_empty(pgid));
     Ok(())
 }
 
@@ -108,7 +108,7 @@ async fn a_child_ignoring_int_and_term_is_killed_after_the_graces() -> R {
     assert_eq!(report.cause, Cause::Cancelled);
     assert!(report.group_reaped);
     assert!(!alive(grandchild), "grandchild {grandchild} survived");
-    assert!(group_members(pgid).is_empty());
+    assert!(group_empty(pgid));
     Ok(())
 }
 
@@ -332,7 +332,7 @@ async fn dropping_the_process_kills_its_group() -> R {
     let grandchild: u32 = first_line(&mut p).await?.parse()?;
     drop(p);
     let until = Instant::now() + Duration::from_secs(5);
-    while (alive(grandchild) || !group_members(pgid).is_empty()) && Instant::now() < until {
+    while (alive(grandchild) || !group_empty(pgid)) && Instant::now() < until {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(!alive(grandchild), "grandchild {grandchild} survived");

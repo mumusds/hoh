@@ -745,8 +745,8 @@ pub(super) async fn run(
 /// How an App Server turn's drive ended: moved to exec (the handshake refused, before anything ranked above it), or
 /// over with its verdict.
 pub(super) enum Drove {
-    /// The reason, and how the process ended.
-    Degrade(String, Option<crate::process::ExitReport>),
+    /// The reason, and how the process ended (boxed: an exit report is large, clippy::large_enum_variant).
+    Degrade(String, Option<Box<crate::process::ExitReport>>),
     Ended(Box<Driven>),
 }
 
@@ -948,7 +948,7 @@ pub(super) async fn drive(
         .clone()
         .filter(|_| !s.cancelled && !s.too_large && !s.deadline && !logs_incomplete)
     {
-        return Ok(Drove::Degrade(reason, report));
+        return Ok(Drove::Degrade(reason, report.map(Box::new)));
     }
     for st in held.drain(..) {
         let _ = st.reply.send(SteerReceipt::NotNow);

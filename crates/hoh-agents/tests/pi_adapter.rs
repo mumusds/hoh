@@ -11,8 +11,9 @@ mod common;
 use common::{R, World, probed};
 use hoh_agents::adapter::AttemptRef;
 use hoh_agents::clock::{Clock, SystemClock, Timer};
+use hoh_agents::identity::group_empty;
 use hoh_agents::pi::{self, Launch, Outcome, SettledBy, Turn};
-use hoh_agents::process::{Escalation, group_members};
+use hoh_agents::process::Escalation;
 use hoh_core::lifecycle::{AttemptState, InputState};
 use hoh_core::persistence::{CancelLatch, CancelReceipt, NewInput};
 use serde_json::{Value, json};
@@ -747,10 +748,7 @@ async fn a_cancel_aborts_and_an_ignored_abort_stops_the_group() -> R {
             received(&fake)?.iter().any(|m| m["type"] == "abort"),
             "{name}"
         );
-        assert!(
-            group_members(outcome.pid.ok_or("no pid")?).is_empty(),
-            "{name}"
-        );
+        assert!(group_empty(outcome.pid.ok_or("no pid")?), "{name}");
         if !answered {
             assert!(!outcome.steps.is_empty(), "the group was stopped");
         }
