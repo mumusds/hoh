@@ -1093,6 +1093,62 @@ fn an_instance_still_enabled_after_its_disable_keeps_the_uninstall_from_removing
     Ok(())
 }
 
+#[test]
+fn an_instance_whose_enablement_the_manager_does_not_answer_keeps_the_uninstall_from_removing_anything()
+-> R {
+    // Design correction 11 (M2T14R-800): an enablement the manager gives no answer for is not "not enabled": with the
+    // instance enabled again in the window and `is-enabled` answering nothing (a stand-in, once the uninstall holds the
+    // run lock), the final pass cannot tell; 69, nothing removed (before: 0, the link left naming the removed template).
+    enabled_again_in_the_window(&Window {
+        links: "default.target.wants",
+        final_is_enabled_says_nothing: true,
+        ..Window::default()
+    })
+}
+
+#[test]
+fn instances_that_cannot_be_listed_keep_the_uninstall_from_removing_anything() -> R {
+    // Design correction 11: the instances are listed from the root's files and the manager's units; either listing
+    // failing (R/hosts unreadable; `list-units` failing, a stand-in) is "cannot tell": 69, nothing removed, not a word
+    // to stop anything; the uninstall completes once both can be listed.
+    use std::os::unix::fs::PermissionsExt as _;
+    let (manager, _project) = installed(true)?;
+    let bundle = manager.root().join("bundle/hoh");
+    let hosts = manager.data().join("hoh/hosts");
+    let systemctl = manager.bin().join("systemctl");
+    for (what, said) in [("hosts", "cannot list"), ("list-units", "did not list")] {
+        if what == "hosts" {
+            std::fs::set_permissions(&hosts, std::fs::Permissions::from_mode(0o000))?;
+        } else {
+            installed::script(
+                &systemctl,
+                "#!/bin/sh\ncase \" $* \" in *\" list-units \"*) echo 'Failed to list units' >&2; exit 1;; esac\nexec /usr/bin/systemctl \"$@\"\n",
+            )?;
+        }
+        let out = manager.install(&bundle, &["--uninstall"])?;
+        if what == "hosts" {
+            std::fs::set_permissions(&hosts, std::fs::Permissions::from_mode(0o755))?;
+        } else {
+            std::fs::remove_file(&systemctl)?;
+        }
+        assert_eq!(out.status.code(), Some(69), "{what}: {}", text(&out));
+        let stderr = String::from_utf8(out.stderr.clone())?;
+        assert!(stderr.contains(said), "{what}: {stderr}");
+        assert!(stderr.contains("could not be told"), "{what}: {stderr}");
+        assert!(
+            !stderr.contains("stop what is named above"),
+            "{what}: {stderr}"
+        );
+        assert!(
+            manager.data().join("hoh/current/bin/hoh").exists(),
+            "{what}"
+        );
+    }
+    let out = manager.install(&bundle, &["--uninstall"])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    Ok(())
+}
+
 #[derive(Default)]
 struct Window<'a> {
     /// A drop-in's [Install] section for the template, if any.
@@ -1103,6 +1159,8 @@ struct Window<'a> {
     shell_config: bool,
     /// Once the uninstall holds the run lock, `systemctl --user disable` answers 0 and does nothing.
     final_disable_does_nothing: bool,
+    /// Once the uninstall holds the run lock, `systemctl --user is-enabled` answers nothing and exits 23.
+    final_is_enabled_says_nothing: bool,
 }
 
 /// The project's instance enabled (its link in `window.links`), the uninstall held after its first pass and before
@@ -1140,11 +1198,19 @@ fn enabled_again_in_the_window(window: &Window) -> R {
         ),
     )?;
     let systemctl = manager.bin().join("systemctl");
-    if window.final_disable_does_nothing {
+    let refused = window.final_disable_does_nothing || window.final_is_enabled_says_nothing;
+    if refused {
+        let verb = if window.final_disable_does_nothing {
+            ("disable", "exit 0")
+        } else {
+            ("is-enabled", "exit 23")
+        };
         installed::script(
             &systemctl,
             &format!(
-                "#!/bin/sh\ncase \" $* \" in *\" disable \"*) if [ -e {g} ]; then exit 0; fi;; esac\nexec /usr/bin/systemctl \"$@\"\n",
+                "#!/bin/sh\ncase \" $* \" in *\" {v} \"*) if [ -e {g} ]; then {e}; fi;; esac\nexec /usr/bin/systemctl \"$@\"\n",
+                v = verb.0,
+                e = verb.1,
                 g = go.display()
             ),
         )?;
@@ -1179,7 +1245,7 @@ fn enabled_again_in_the_window(window: &Window) -> R {
     assert!(first, "the first pass left it enabled: {}", text(&out));
     assert_eq!(enabled.status.code(), Some(0), "{}", text(&enabled));
     assert!(again, "__unit enable did not enable it again");
-    if window.final_disable_does_nothing {
+    if refused {
         assert_eq!(out.status.code(), Some(69), "{}", text(&out));
         assert!(
             String::from_utf8(out.stderr.clone())?
@@ -1187,8 +1253,19 @@ fn enabled_again_in_the_window(window: &Window) -> R {
             "{}",
             text(&out)
         );
-        assert!(link.is_symlink(), "{} gone", link.display());
+        // A disable that did nothing leaves the link; one whose result the manager cannot tell may have removed it.
+        assert!(
+            !window.final_disable_does_nothing || link.is_symlink(),
+            "{} gone",
+            link.display()
+        );
         assert!(manager.data().join("hoh/current/bin/hoh").exists());
+        assert!(
+            manager
+                .data()
+                .join("systemd/user/hoh-host@.service")
+                .exists()
+        );
         std::fs::remove_file(&systemctl)?;
         std::fs::remove_file(manager.bin().join("flock"))?;
         let out = manager.install(&bundle, &["--uninstall"])?;

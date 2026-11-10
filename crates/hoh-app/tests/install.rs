@@ -446,6 +446,28 @@ fn a_command_that_is_not_this_installations_is_never_replaced() -> R {
 }
 
 #[test]
+fn a_user_that_cannot_be_told_is_refused_before_anything_is_written() -> R {
+    // Design correction 11: `id -u` failing (a stand-in) cannot tell whether root runs this: 69, nothing written;
+    // before, its empty answer was taken for another user's.
+    let install = Install::new()?;
+    script(
+        &install.stubs().join("id"),
+        "#!/bin/sh\necho 'id: failing' >&2\nexit 1\n",
+    )?;
+    for args in [&[][..], &["--uninstall"]] {
+        let out = install.run("bundle", args)?;
+        assert_eq!(out.status.code(), Some(69), "{args:?}: {}", text(&out));
+        assert!(
+            String::from_utf8(out.stderr.clone())?.contains("cannot tell which user"),
+            "{args:?}: {}",
+            text(&out)
+        );
+        assert_eq!(std::fs::read_dir(install.home())?.count(), 0, "{args:?}");
+    }
+    Ok(())
+}
+
+#[test]
 fn root_is_refused_before_anything_is_written() -> R {
     let install = Install::new()?;
     script(
@@ -630,6 +652,57 @@ fn a_home_the_unit_cannot_name_is_refused_before_any_installation_file_is_writte
 }
 
 #[test]
+fn a_binary_that_fails_with_a_code_of_its_own_ends_the_install_with_the_installers() -> R {
+    // Design correction 11 (M2T14R-851): hoh refusing or failing with a code install.sh gives no meaning to (a stand-in
+    // binary: 101, a panic's; 1, a foreign command link's) ends the install with the step's own code, the binary's
+    // named: 64 for the bundle's check, 69 for the installed binary's template; 78 is passed on as it is.
+    let install = Install::new()?;
+    let binary = install.root.path().join("bundle/hoh/bin/hoh");
+    for (check, template, code, said) in [
+        ("exit 101", "exit 0", 64, "(exit 101)"),
+        ("exit 0", "exit 101", 69, "(exit 101)"),
+        ("exit 0", "exit 1", 69, "(exit 1)"),
+        ("exit 78", "exit 0", 78, "refused this home or root"),
+    ] {
+        std::fs::remove_file(&binary)?;
+        script(
+            &binary,
+            &format!(
+                "#!/bin/sh\ncase \"$1 $2\" in\n'--version '*) printf 'hoh 0.0.0\\ncommit test\\n';;\n'__unit check') {check};;\n'__unit template') echo panicked >&2; {template};;\nesac\n"
+            ),
+        )?;
+        let out = install.run("bundle", &[])?;
+        assert_eq!(
+            out.status.code(),
+            Some(code),
+            "{check} {template}: {}",
+            text(&out)
+        );
+        let stderr = String::from_utf8(out.stderr.clone())?;
+        assert!(stderr.contains(said), "{check} {template}: {stderr}");
+    }
+    Ok(())
+}
+
+#[test]
+fn a_project_that_is_not_a_directory_is_refused_before_anything_is_written() -> R {
+    // M2T14R-853: --project naming no directory needs no program to tell: refused (64) with the reason before
+    // anything is written; before, the whole installation was written and `__unit enable` refused it afterwards.
+    let install = Install::new()?;
+    let before = tree(&install.home())?;
+    let missing = install.root.path().join("no-such-project");
+    let out = install.run("bundle", &["--project", missing.to_str().ok_or("path")?])?;
+    assert_eq!(out.status.code(), Some(64), "{}", text(&out));
+    assert!(
+        String::from_utf8(out.stderr.clone())?.contains("is not a directory"),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(tree(&install.home())?, before);
+    Ok(())
+}
+
+#[test]
 fn a_root_that_cannot_be_resolved_is_refused_with_78_before_anything_is_written() -> R {
     // M2T14R-753 (design correction 10): an installation root that is a link to itself, or to nothing, cannot be
     // resolved, so the unit cannot name it: 78 with the reason, nothing written, whether or not this coreutils'
@@ -653,6 +726,22 @@ fn a_root_that_cannot_be_resolved_is_refused_with_78_before_anything_is_written(
         );
         assert_eq!(tree(&install.home())?, before, "{target}");
     }
+    // `readlink -m` failing on a root that is no link (a stand-in) reaches the same refusal on any coreutils
+    // (M2T14R-854: GNU's answers 0 on a loop, so the cases above reach it through the link check there).
+    std::fs::remove_file(install.data().join("hoh"))?;
+    script(
+        &install.stubs().join("readlink"),
+        "#!/bin/sh\ncase \"$1\" in -m) echo 'readlink: failing' >&2; exit 1;; esac\nexec /usr/bin/readlink \"$@\"\n",
+    )?;
+    let before = tree(&install.home())?;
+    let out = install.run("bundle", &[])?;
+    assert_eq!(out.status.code(), Some(78), "{}", text(&out));
+    assert!(
+        String::from_utf8(out.stderr.clone())?.contains("cannot be resolved: readlink: failing"),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(tree(&install.home())?, before);
     Ok(())
 }
 
@@ -946,6 +1035,144 @@ fn an_instance_a_requires_link_enables_with_no_user_manager_keeps_the_uninstall_
         "{stderr}"
     );
     assert_eq!(tree(&install.home())?, before);
+    Ok(())
+}
+
+/// An installed home with no manager to ask, its instance `hoh-host@0123456789abcdef.service` enabled by a link that
+/// `place` makes (given the home and the template); the uninstall must refuse (69), say `said`, remove nothing.
+fn an_uninstall_with_no_manager_refuses(
+    place: impl Fn(&Path, &Path) -> R,
+    said: &str,
+) -> R<String> {
+    let install = Install::new()?;
+    let out = install.run("bundle", &[])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let template = install.data().join("systemd/user/hoh-host@.service");
+    place(install.root.path(), &template)?;
+    let out = install.run("bundle", &["--uninstall"])?;
+    assert_eq!(out.status.code(), Some(69), "{}", text(&out));
+    let stderr = String::from_utf8(out.stderr.clone())?;
+    assert!(stderr.contains(said), "{stderr}");
+    assert!(install.data().join("hoh/current/bin/hoh").exists());
+    assert!(template.exists());
+    Ok(stderr)
+}
+
+#[test]
+fn a_link_where_the_user_unit_directory_is_a_link_keeps_the_uninstall_from_removing_anything() -> R
+{
+    // Design correction 11 (M2T14R-802): ~/.config/systemd/user is a link to another directory; the link enabling the
+    // instance there is found (find follows the directory) and refuses as before correction 10.
+    an_uninstall_with_no_manager_refuses(
+        |root, template| {
+            let real = root.join("elsewhere");
+            std::fs::create_dir_all(real.join("default.target.wants"))?;
+            std::os::unix::fs::symlink(
+                template,
+                real.join("default.target.wants/hoh-host@0123456789abcdef.service"),
+            )?;
+            std::fs::create_dir_all(root.join("h/.config/systemd"))?;
+            std::os::unix::fs::symlink(&real, root.join("h/.config/systemd/user"))?;
+            Ok(())
+        },
+        "hoh-host@0123456789abcdef.service is enabled, and no user systemd manager answers to disable it",
+    )
+    .map(drop)
+}
+
+#[test]
+fn a_runtime_link_with_no_manager_keeps_the_uninstall_from_removing_anything() -> R {
+    // Design correction 11 (M2T14R-803): a link in $XDG_RUNTIME_DIR/systemd/user (`enable --runtime`) enables the
+    // instance as well; with no manager to disable it, it refuses.
+    an_uninstall_with_no_manager_refuses(
+        |root, template| {
+            let wants = root.join("r/systemd/user/default.target.wants");
+            std::fs::create_dir_all(&wants)?;
+            std::os::unix::fs::symlink(template, wants.join("hoh-host@0123456789abcdef.service"))?;
+            Ok(())
+        },
+        "hoh-host@0123456789abcdef.service is enabled, and no user systemd manager answers to disable it",
+    )
+    .map(drop)
+}
+
+#[test]
+fn a_unit_directory_that_cannot_be_listed_keeps_the_uninstall_from_removing_anything() -> R {
+    // Design correction 11 (M2T14R-801): what cannot be listed may enable an instance: a .requires directory this user
+    // cannot read refuses the uninstall (69, nothing removed), it is not taken for one with no link in it.
+    use std::os::unix::fs::PermissionsExt as _;
+    let locked = std::cell::RefCell::new(None);
+    let result = an_uninstall_with_no_manager_refuses(
+        |root, template| {
+            let requires = root.join("h/.config/systemd/user/default.target.requires");
+            std::fs::create_dir_all(&requires)?;
+            std::os::unix::fs::symlink(
+                template,
+                requires.join("hoh-host@0123456789abcdef.service"),
+            )?;
+            std::fs::set_permissions(&requires, std::fs::Permissions::from_mode(0o000))?;
+            *locked.borrow_mut() = Some(requires);
+            Ok(())
+        },
+        "cannot list",
+    );
+    if let Some(dir) = locked.borrow().as_ref() {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))?;
+    }
+    // What cannot be told is said so; nothing is named to stop (design correction 11).
+    let stderr = result?;
+    assert!(stderr.contains("could not be told"), "{stderr}");
+    assert!(!stderr.contains("stop what is named above"), "{stderr}");
+    Ok(())
+}
+
+#[test]
+fn a_command_link_that_cannot_be_read_is_not_taken_for_anothers() -> R {
+    // Design correction 11 (M2T14R-804): ~/.local/bin/hoh that cannot be read (a stand-in readlink failing for it
+    // alone) is neither this installation's nor another's: the uninstall removes nothing (69, "cannot read"), and the
+    // install refuses too; before, the uninstall removed everything but the link and called it another's.
+    let install = Install::new()?;
+    let out = install.run("bundle", &[])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    script(
+        &install.stubs().join("readlink"),
+        "#!/bin/sh\nfor last; do :; done\ncase \"$1 $last\" in --\\ */.local/bin/hoh) echo 'readlink: Input/output error' >&2; exit 23;; esac\nexec /usr/bin/readlink \"$@\"\n",
+    )?;
+    for args in [&["--uninstall"][..], &[]] {
+        let out = install.run("bundle", args)?;
+        assert_eq!(out.status.code(), Some(69), "{args:?}: {}", text(&out));
+        let stderr = String::from_utf8(out.stderr.clone())?;
+        assert!(stderr.contains("cannot read"), "{args:?}: {stderr}");
+        assert!(
+            !stderr.contains("not this installation's link"),
+            "{args:?}: {stderr}"
+        );
+        assert!(
+            !stderr.contains("stop what is named above"),
+            "{args:?}: {stderr}"
+        );
+        assert!(install.data().join("hoh/current/bin/hoh").exists());
+        assert!(install.home().join(".local/bin/hoh").is_symlink());
+    }
+    Ok(())
+}
+
+#[test]
+fn the_install_says_its_version_with_no_command_that_could_fail_in_its_words() -> R {
+    // Design correction 11 (M2T14R-805): the closing words are made in the installer's own shell (no head or tr in a
+    // command substitution whose failure printf would hide): with a head and a tr that fail, the install still names
+    // the version it installed.
+    let install = Install::new()?;
+    for tool in ["head", "tr"] {
+        script(
+            &install.stubs().join(tool),
+            "#!/bin/sh\necho 'failing' >&2\nexit 23\n",
+        )?;
+    }
+    let out = install.run("bundle", &[])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let stdout = String::from_utf8(out.stdout.clone())?;
+    assert!(stdout.contains("installed hoh 0."), "{stdout}");
     Ok(())
 }
 
