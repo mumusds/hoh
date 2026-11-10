@@ -820,6 +820,9 @@ mod tests {
         ));
         let mut p = Process::spawn(command, Config::default())?;
         let leader = Pid::from_raw(p.pid() as i32).ok_or("a pid")?;
+        // Held while the leader is still unreaped (it runs until it is stopped): the cleanup below signals the process
+        // and never a number the supervisor's reap has freed (CIR-103, -152).
+        let held = pidfd_open(leader, PidfdFlags::empty())?;
         // Out of its group once it says its pid; only then is it ended (FU-32).
         match tokio::time::timeout(Duration::from_secs(10), p.next()).await? {
             Some(Event::Frame(_)) => {}
@@ -841,10 +844,11 @@ mod tests {
             None
         })
         .await;
-        // The test's own child, not reaped by anyone else, so its number is its own: killed unless known reaped.
-        let left = !crate::identity::reaped(leader.as_raw_pid() as u32).unwrap_or(false);
+        // The supervisor reaps the leader before it reports, so its number can be another's by now: the process is
+        // looked at and killed through the pidfd held since the spawn.
+        let left = !crate::identity::exited(&held).unwrap_or(false);
         if left {
-            let _ = rustix::process::kill_process(leader, RawSignal::KILL);
+            let _ = pidfd_send_signal(held.as_fd(), RawSignal::KILL);
         }
         let report = report?.ok_or("no exit report")?;
         let terms = std::fs::read_to_string(&count)
@@ -895,6 +899,9 @@ mod tests {
         };
         let mut p = Process::spawn(command, config)?;
         let leader = Pid::from_raw(p.pid() as i32).ok_or("a pid")?;
+        // Held while the leader is still unreaped (it runs until it is stopped): the cleanup below signals the process
+        // and never a number the supervisor's reap has freed (CIR-103, -152).
+        let held = pidfd_open(leader, PidfdFlags::empty())?;
         *AFTER_GROUP_SIGNAL.lock().map_err(|_| "hook")? = Some((leader, marker.clone()));
         let report = tokio::time::timeout(Duration::from_secs(10), async {
             while let Some(event) = p.next().await {
@@ -906,10 +913,11 @@ mod tests {
         })
         .await;
         *AFTER_GROUP_SIGNAL.lock().map_err(|_| "hook")? = None;
-        // The test's own child, not reaped by anyone else, so its number is its own: killed unless known reaped.
-        let left = !crate::identity::reaped(leader.as_raw_pid() as u32).unwrap_or(false);
+        // The supervisor reaps the leader before it reports, so its number can be another's by now: the process is
+        // looked at and killed through the pidfd held since the spawn.
+        let left = !crate::identity::exited(&held).unwrap_or(false);
         if left {
-            let _ = rustix::process::kill_process(leader, RawSignal::KILL);
+            let _ = pidfd_send_signal(held.as_fd(), RawSignal::KILL);
         }
         let report = report?.ok_or("no exit report")?;
         let terms = std::fs::read_to_string(&count)

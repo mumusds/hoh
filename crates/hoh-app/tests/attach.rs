@@ -10,7 +10,6 @@ use hoh_app::host::{Host, HostConfig};
 use hoh_core::persistence::selftest::{PROBE_ARG, ProbeCommand};
 use hoh_core::persistence::{FaultHooks, PersistError};
 use serde_json::Value;
-use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -126,81 +125,13 @@ impl Env {
     }
 }
 
-/// The `hoh __host <project>` processes of `project`, by their command lines.
+/// The `hoh __host <project>` processes of `project`, by their command lines; a copy a process forked and that has not
+/// exec'd yet is none, and a failed listing is an error (`identity::running_with`; ADR-022 decision 10, v2).
 fn hosts_of(project: &Path) -> R<Vec<u32>> {
-    with_command_line(format!("{HOH}\0__host\0{}\0", project.display()).as_bytes())
-}
-
-/// The processes whose command line is `wanted`, less the copies one of them forked and that have not exec'd yet:
-/// such a copy shows its parent's command line, and its parent is one of them.
-///
-/// A listing of /proc that fails is an error, not "none" (docs/adr/ADR-022.md decision 10, v2; CIR-004). A process
-/// whose command line cannot be read has gone (or is another user's), so it is none of this test's; one whose stat
-/// cannot be read once its command line matched is an error unless it has gone.
-fn with_command_line(wanted: &[u8]) -> R<Vec<u32>> {
-    let gone = |e: &std::io::Error| {
-        e.kind() == std::io::ErrorKind::NotFound
-            || e.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error())
-    };
-    let mut found = Vec::new();
-    for entry in std::fs::read_dir("/proc")? {
-        let Some(pid) = entry?
-            .file_name()
-            .to_str()
-            .and_then(|n| n.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        if !std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| c == wanted) {
-            continue;
-        }
-        let stat = match std::fs::read(format!("/proc/{pid}/stat")) {
-            Ok(stat) => stat,
-            Err(e) if gone(&e) => continue,
-            Err(e) => return Err(e.into()),
-        };
-        let parent = hoh_agents::identity::after_command_name(&stat)
-            .and_then(|fields| fields.split_whitespace().nth(1))
-            .and_then(|ppid| ppid.parse::<u32>().ok())
-            .ok_or_else(|| format!("process {pid}: a stat without a parent"))?;
-        found.push((pid, parent));
-    }
-    let pids: std::collections::BTreeSet<u32> = found.iter().map(|(pid, _)| *pid).collect();
-    Ok(found
-        .into_iter()
-        .filter(|(_, parent)| !pids.contains(parent))
-        .map(|(pid, _)| pid)
-        .collect())
-}
-
-/// A copy a process forks shows its command line until it execs (a host forks one for the WAL probe and for git): it
-/// is not a second process of that command line (two "hosts" at once in a local run of test_005_02, 2026-11-10).
-#[test]
-fn a_copy_forked_before_its_exec_is_no_second_process_of_its_command_line() -> R {
-    let dir = tempfile::tempdir()?;
-    let ready = dir.path().join("ready");
-    let script = "import os, sys, time\nif os.fork() == 0:\n    open(sys.argv[1], 'w').close()\ntime.sleep(30)\n";
-    let ready_arg = ready.to_str().ok_or("a path that is not UTF-8")?;
-    let mut parent = Command::new("python3")
-        .args(["-c", script, ready_arg])
-        .process_group(0)
-        .spawn()?;
-    // The child says it is there (its own event) before the scan.
-    let end = Instant::now() + Duration::from_secs(10);
-    while !ready.exists() && Instant::now() < end {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let found = with_command_line(format!("python3\0-c\0{script}\0{ready_arg}\0").as_bytes());
-    if let Some(group) = i32::try_from(parent.id())
-        .ok()
-        .and_then(rustix::process::Pid::from_raw)
-    {
-        let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
-    }
-    let _ = parent.wait();
-    assert!(ready.exists(), "the child never said it was there");
-    assert_eq!(found?, vec![parent.id()]);
-    Ok(())
+    let wanted = format!("{HOH}\0__host\0{}\0", project.display());
+    Ok(hoh_agents::identity::running_with(|c| {
+        c == wanted.as_bytes()
+    })?)
 }
 
 /// Stops the hosts the product started for a project when dropped, however the test ends: each checked by its

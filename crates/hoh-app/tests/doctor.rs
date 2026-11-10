@@ -284,12 +284,14 @@ impl Sandbox {
 }
 
 impl Sandbox {
-    /// The process groups the stand-ins started in that the kernel still finds a process in (zombies included), each
-    /// looked up until it is empty or 10 s have passed in all: a member SIGKILLed with its group is reaped by its new
-    /// parent, so its group empties a moment after doctor ends (docs/adr/ADR-022.md decision 10, v2: a group is empty
-    /// only by the kernel's look-up, never by a scan; CIR-004). No record at all is an error. A number reused since
-    /// can only fail the test, never pass it.
-    fn groups_left(&self) -> R<Vec<u32>> {
+    /// What is left of the process groups the stand-ins started in, once doctor has ended: empty when the kernel finds
+    /// no process in any of them (docs/adr/ADR-022.md decision 10, v2: a group is empty only by the kernel's look-up;
+    /// CIR-004). A member a scan finds that has not ended (`identity::ended`) is left at once, without waiting: a scan
+    /// proves presence, and a command doctor left running that would end by itself must not pass by outwaiting it
+    /// (CIR-153). Only a group whose members found are all ended (zombies its reaper has not reaped yet) is looked at
+    /// again, until 10 s have passed in all. No record at all is an error. A number reused since can only fail the
+    /// test, never pass it.
+    fn groups_left(&self) -> R<Vec<String>> {
         let recorded = std::fs::read_to_string(self.groups.path().join("started"))?;
         let mut groups = std::collections::BTreeSet::new();
         for line in recorded.lines() {
@@ -303,13 +305,22 @@ impl Sandbox {
         }
         let until = Instant::now() + Duration::from_secs(10);
         loop {
-            let left: Vec<u32> = groups
-                .iter()
-                .copied()
-                .filter(|g| !hoh_agents::identity::group_empty(*g))
-                .collect();
-            if left.is_empty() || Instant::now() >= until {
-                return Ok(left);
+            let mut reaping = Vec::new();
+            for group in &groups {
+                if hoh_agents::identity::group_empty(*group) {
+                    continue;
+                }
+                let running: Vec<u32> = hoh_agents::identity::group_left(*group, 0)?
+                    .into_iter()
+                    .filter(|m| !matches!(hoh_agents::identity::ended(*m, None), Ok(true)))
+                    .collect();
+                if !running.is_empty() {
+                    return Ok(vec![format!("group {group}: {running:?} running")]);
+                }
+                reaping.push(format!("group {group}: not emptied within 10 s"));
+            }
+            if reaping.is_empty() || Instant::now() >= until {
+                return Ok(reaping);
             }
             std::thread::sleep(Duration::from_millis(20));
         }

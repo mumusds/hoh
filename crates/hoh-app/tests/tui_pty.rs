@@ -577,12 +577,10 @@ impl hoh_app::host::Executor for Sixty {
     }
 }
 
-/// Whether process `pid` is alive (signal 0).
-fn alive(pid: u32) -> bool {
-    i32::try_from(pid)
-        .ok()
-        .and_then(rustix::process::Pid::from_raw)
-        .is_some_and(|p| rustix::process::test_kill_process(p).is_ok())
+/// Whether process `pid`, started at `start`, is alive: not ended as a whole by identity::ended. A zombie, which signal
+/// 0 still reaches, is not alive, nor is a number taken again since (ADR-022 decision 10, v2; CIR-150's class).
+fn alive(pid: u32, start: &str) -> bool {
+    matches!(hoh_agents::identity::ended(pid, Some(start)), Ok(false))
 }
 
 /// `hoh attach R` in a PTY, once the Workspace bound to R is drawn.
@@ -662,12 +660,14 @@ fn test_043_03_the_tui_leaves_on_sighup_sigterm_and_detach_with_the_host_and_age
         std::thread::sleep(Duration::from_millis(50));
     }
     let agent: u32 = query("SELECT pid FROM attempts WHERE task_id = 'T1'")?.parse()?;
+    let agent_start = hoh_agents::identity::start_id(agent)?.ok_or("the Agent is gone")?;
     let host_pid = std::process::id();
+    let host_start = hoh_agents::identity::start_id(host_pid)?.ok_or("no start time")?;
     let run = || query("SELECT state || ' ' || revision FROM runs WHERE run_id = 'R'");
     let before = run()?;
     let unchanged = |step: &str| -> R {
         assert!(
-            alive(host_pid) && alive(agent),
+            alive(host_pid, &host_start) && alive(agent, &agent_start),
             "{step}: the host or the Agent is gone"
         );
         assert_eq!(run()?, before, "{step}: the run moved");
@@ -705,28 +705,15 @@ fn test_043_03_the_tui_leaves_on_sighup_sigterm_and_detach_with_the_host_and_age
     Ok(())
 }
 
-/// The `hoh __host <project>` processes of `project`, by their command lines.
-/// A listing of /proc that fails is an error, not "no host" (docs/adr/ADR-022.md decision 10, v2; CIR-004).
+/// The `hoh __host <project>` processes of `project`, by their command lines (`identity::running_with`: a failed
+/// listing is an error, a copy forked and not exec'd is none; ADR-022 decision 10, v2).
 fn hosts_of(project: &Path) -> std::io::Result<Vec<u32>> {
     let wanted = format!(
         "{}\0__host\0{}\0",
         env!("CARGO_BIN_EXE_hoh"),
         project.display()
     );
-    let mut hosts = Vec::new();
-    for entry in std::fs::read_dir("/proc")? {
-        let Some(pid) = entry?
-            .file_name()
-            .to_str()
-            .and_then(|n| n.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        if std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| c == wanted.as_bytes()) {
-            hosts.push(pid);
-        }
-    }
-    Ok(hosts)
+    hoh_agents::identity::running_with(|c| c == wanted.as_bytes())
 }
 
 /// Stops the hosts the product started for a project when dropped, however the test ends (docs/adr/ADR-021.md
@@ -778,6 +765,7 @@ fn a_host_started_by_a_detach_in_a_terminal_outlives_its_hang_up() -> R {
     let host: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(project.join(".hoh/host.json"))?)?;
     let pid = u32::try_from(host["pid"].as_u64().ok_or("no pid")?)?;
+    let start = hoh_agents::identity::start_id(pid)?.ok_or("the host is gone")?;
     pty.hang_up()?;
     drop(pty);
     std::thread::sleep(Duration::from_millis(500));
@@ -789,19 +777,15 @@ fn a_host_started_by_a_detach_in_a_terminal_outlives_its_hang_up() -> R {
         .split(' ')
         .collect();
     let (session, tty): (u32, i64) = (fields[3].parse()?, fields[4].parse()?);
-    assert!(alive(pid), "the host is gone after the hang-up");
+    assert!(alive(pid, &start), "the host is gone after the hang-up");
     assert_eq!((session, tty), (pid, 0), "its own session, no terminal");
-    if let Some(p) = i32::try_from(pid)
-        .ok()
-        .and_then(rustix::process::Pid::from_raw)
-    {
-        rustix::process::kill_process(p, rustix::process::Signal::TERM)?;
-    }
+    // To the host of its start time only (CIR-103's rule).
+    hoh_agents::identity::signal_if_same(pid, &start, rustix::process::Signal::TERM)?;
     let end = std::time::Instant::now() + WAIT;
-    while alive(pid) && std::time::Instant::now() < end {
+    while alive(pid, &start) && std::time::Instant::now() < end {
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert!(!alive(pid), "the host did not stop on SIGTERM");
+    assert!(!alive(pid, &start), "the host did not stop on SIGTERM");
     Ok(())
 }
 

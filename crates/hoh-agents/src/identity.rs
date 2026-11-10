@@ -63,50 +63,97 @@ pub fn start_id(pid: u32) -> io::Result<Option<String>> {
         .ok_or_else(|| io::Error::other(format!("/proc/{pid}/stat has no start time")))
 }
 
-/// Whether process `pid` has ended (ADR-022 decision 10, the convention for observing processes in tests, version
-/// 2): its stat gone (ENOENT, or ESRCH while being reaped), its state X, its state Z with no other thread of its group
-/// running (CIR-002), or, when `start` is given, a start time other than `start` (its number now another process's). A
-/// stat read in any other state is a live process. Any other failed read, or a stat without the fields read, is an
-/// error, never "ended" (M2T07R-1151, -1203).
+/// Whether process `pid` has ended as a whole (ADR-022 decision 10, the convention for observing processes in tests,
+/// version 2 as revised after review round 2): no process has the number (`pidfd_open` gives no process); or, when
+/// `start` is given, the start time read once the pidfd is held is another (the recorded process is gone, its number
+/// another's, whatever that one's state: CIR-101); or the pidfd is readable, which the kernel makes it only once the
+/// thread group's leader has exited and no other thread of it is left (`pidfd_poll`, `thread_group_exited`). A stat's
+/// state letter is never read for it: Z or X tells of the task read, which can be a leader gone before its threads
+/// (CIR-002) or, while another thread execs, the old leader being released (CIR-100). Any other failed look is an
+/// error, never "ended" (M2T07R-1151).
 pub fn ended(pid: u32, start: Option<&str>) -> io::Result<bool> {
-    ended_in(std::path::Path::new("/proc"), pid, start)
+    let raw = i32::try_from(pid)
+        .ok()
+        .and_then(Pid::from_raw)
+        .ok_or_else(|| io::Error::other(format!("{pid} is no process id")))?;
+    let pidfd = match pidfd_open(raw, PidfdFlags::empty()) {
+        Ok(pidfd) => pidfd,
+        Err(e) if no_process(e) => return Ok(true),
+        Err(e) => return Err(e.into()),
+    };
+    // Read once the pidfd is held: the same start time then names the process the pidfd holds (a number goes to
+    // another process only once its holder is reaped, and a start time is never one's twice).
+    if let Some(start) = start
+        && start_differs_in(std::path::Path::new("/proc"), pid, start)?
+    {
+        return Ok(true);
+    }
+    exited(&pidfd)
 }
 
-fn ended_in(proc: &std::path::Path, pid: u32, start: Option<&str>) -> io::Result<bool> {
+/// Whether the process `pidfd` holds has ended as a whole: the pidfd is readable once its thread group's leader has
+/// exited and no other thread is left (a zombie counts as ended; see [`ended`]).
+pub fn exited(pidfd: &OwnedFd) -> io::Result<bool> {
+    let mut fds = [rustix::event::PollFd::new(
+        pidfd,
+        rustix::event::PollFlags::IN,
+    )];
+    let now = rustix::event::Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    Ok(rustix::event::poll(&mut fds, Some(&now))? > 0)
+}
+
+/// Whether the process with number `pid` under the /proc at `proc` has a start time other than `start`, or none (its
+/// stat gone: ENOENT, or ESRCH while it is being reaped). A stat that cannot be read for another reason, or read
+/// without its start time, is an error. Read as bytes; only the fields after the command name are taken.
+fn start_differs_in(proc: &std::path::Path, pid: u32, start: &str) -> io::Result<bool> {
     let path = proc.join(pid.to_string()).join("stat");
     let stat = match std::fs::read(&path) {
         Ok(stat) => stat,
-        Err(e) if e.kind() == io::ErrorKind::NotFound || e.raw_os_error() == Some(3) => {
+        Err(e)
+            if e.kind() == io::ErrorKind::NotFound
+                || e.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error()) =>
+        {
             return Ok(true);
         }
         Err(e) => return Err(e),
     };
-    let unreadable = || {
-        io::Error::other(format!(
-            "{} cannot be read as a stat: {:?}",
-            path.display(),
-            String::from_utf8_lossy(&stat[..stat.len().min(512)])
-        ))
-    };
     // Fields after the parenthesised command name: field 3 (state) on; the start time is field 22.
-    let rest = after_command_name(&stat).ok_or_else(unreadable)?;
-    let state = rest.split_whitespace().next().ok_or_else(unreadable)?;
-    // X: released. Z: the task read has exited; the process has only if no other thread of its group runs on (a main
-    // thread that called pthread_exit leaves a Z leader with live threads; num_threads, field 20, counts them; CIR-002).
-    if state == "X" {
-        return Ok(true);
+    let now = after_command_name(&stat)
+        .and_then(|rest| rest.split_whitespace().nth(19))
+        .ok_or_else(|| {
+            io::Error::other(format!(
+                "{} cannot be read as a stat: {:?}",
+                path.display(),
+                String::from_utf8_lossy(&stat[..stat.len().min(512)])
+            ))
+        })?;
+    Ok(now != start)
+}
+
+/// Send `signal` to process `pid` only while it is still the one started at `start` (for tests): the pidfd is opened
+/// first and the start time read after it, so the signal goes to the process checked and never to a number taken
+/// again since (ADR-022 decision 10, v2; CIR-103, -152). Whether it was sent; a process gone, or another's number, gets
+/// nothing.
+pub fn signal_if_same(pid: u32, start: &str, signal: Signal) -> io::Result<bool> {
+    let raw = i32::try_from(pid)
+        .ok()
+        .and_then(Pid::from_raw)
+        .ok_or_else(|| io::Error::other(format!("{pid} is no process id")))?;
+    let pidfd = match pidfd_open(raw, PidfdFlags::empty()) {
+        Ok(pidfd) => pidfd,
+        Err(e) if no_process(e) => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    if start_differs_in(std::path::Path::new("/proc"), pid, start)? {
+        return Ok(false);
     }
-    if state == "Z" {
-        let threads: u32 = rest
-            .split_whitespace()
-            .nth(17)
-            .and_then(|n| n.parse().ok())
-            .ok_or_else(unreadable)?;
-        return Ok(threads <= 1);
-    }
-    match start {
-        Some(start) => Ok(rest.split_whitespace().nth(19).ok_or_else(unreadable)? != start),
-        None => Ok(false),
+    match pidfd_send_signal(pidfd.as_fd(), signal) {
+        Ok(()) => Ok(true),
+        Err(rustix::io::Errno::SRCH) => Ok(false),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -119,6 +166,47 @@ pub fn reaped(pid: u32) -> io::Result<bool> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(true),
         Err(e) => Err(e),
     }
+}
+
+/// The processes whose command line `matches`, less any copy forked and not yet exec'd: such a copy shows the command
+/// line of the process it was forked from until it execs (a host forks one to start git or its WAL probe), and is no
+/// second process of it. The kernel tells it: `PF_FORKNOEXEC` (0x40) in its stat's flags (field 9), set at fork and
+/// cleared by exec; a child that has exec'd the same command line is a second process and is counted (ADR-022
+/// decision 10, v2; CIR-102, -154). The flags are read before the command line, so a copy that execs between the two
+/// reads is left out, never taken for what it was forked from. For test evidence: a listing of /proc that fails is an
+/// error, never "none"; a process that has gone, or whose command line cannot be read (another user's), is left out;
+/// a stat that cannot be read for another reason, or read without its flags, is an error.
+pub fn running_with(matches: impl Fn(&[u8]) -> bool) -> io::Result<Vec<u32>> {
+    const PF_FORKNOEXEC: u32 = 0x40;
+    let gone = |e: &io::Error| {
+        e.kind() == io::ErrorKind::NotFound
+            || e.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error())
+    };
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir("/proc")? {
+        let Some(pid) = entry?
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let stat = match std::fs::read(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat,
+            Err(e) if gone(&e) => continue,
+            Err(e) => return Err(e),
+        };
+        let flags: u32 = after_command_name(&stat)
+            .and_then(|fields| fields.split_whitespace().nth(6))
+            .and_then(|flags| flags.parse().ok())
+            .ok_or_else(|| io::Error::other(format!("/proc/{pid}/stat has no flags")))?;
+        if flags & PF_FORKNOEXEC == 0
+            && std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| matches(&c))
+        {
+            found.push(pid);
+        }
+    }
+    Ok(found)
 }
 
 /// The identity of process `pid` now, `None` when /proc has no entry for it (see [`start_id`]).
@@ -1213,73 +1301,246 @@ mod tests {
     }
 
     #[test]
-    fn a_process_has_ended_only_when_its_stat_says_so() -> io::Result<()> {
-        // ADR-022 decision 10, convention v2: gone, Z or X, or another start time for its number is ended; any other
-        // state is alive; any other failed read is an error, never ended (M2T07R-1151, -1203).
+    fn a_start_time_is_read_as_bytes_and_a_failed_read_is_an_error() -> io::Result<()> {
+        // ADR-022 decision 10, v2: the start time names the process; a stat gone is no process of that start; any
+        // other failed read, or a stat read without its fields, is an error, never "another process" (M2T07R-1151).
         let fake = tempfile::tempdir()?;
         let stat = |pid: &str, state: &str, start: &str| {
             format!(
                 "{pid} (a b) c) {state} 1 {pid} {pid} 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 {start} 0 0"
             )
         };
-        for (pid, state) in [
-            ("10", "Z"),
-            ("11", "X"),
-            ("12", "S"),
-            ("13", "R"),
-            ("14", "D"),
-            ("15", "t"),
-        ] {
+        for (pid, state) in [("10", "Z"), ("11", "X"), ("12", "S")] {
             std::fs::create_dir(fake.path().join(pid))?;
             std::fs::write(fake.path().join(pid).join("stat"), stat(pid, state, "500"))?;
         }
-        let ended = |pid: u32, start: Option<&str>| ended_in(fake.path(), pid, start);
-        assert!(ended(9, None)?, "gone");
-        assert!(ended(10, None)? && ended(11, None)?, "Z and X");
-        for pid in 12..=15 {
-            assert!(!ended(pid, None)?, "{pid} alive");
-            assert!(!ended(pid, Some("500"))?, "{pid} the same process");
-            assert!(
-                ended(pid, Some("400"))?,
-                "{pid} its number another process's"
-            );
+        let differs = |pid: u32, start: &str| start_differs_in(fake.path(), pid, start);
+        assert!(differs(9, "500")?, "gone");
+        for pid in 10..=12 {
+            // Whatever the state: the state letter decides nothing (CIR-100, -101).
+            assert!(!differs(pid, "500")?, "{pid} the same process");
+            assert!(differs(pid, "400")?, "{pid} its number another process's");
         }
-        // A Z leader whose thread group still has another thread (its main thread called pthread_exit) runs on:
-        // only a zombie with no other thread is an ended process (CIR-002). num_threads is field 20.
-        let threads = |pid: &str, state: &str, n: &str| {
-            format!(
-                "{pid} (t) {state} 1 {pid} {pid} 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 {n} 0 500 0 0"
-            )
-        };
-        for (pid, state, n) in [
-            ("20", "Z", "2"),
-            ("21", "Z", "1"),
-            ("22", "Z", "0"),
-            ("23", "X", "0"),
-        ] {
-            std::fs::create_dir(fake.path().join(pid))?;
-            std::fs::write(fake.path().join(pid).join("stat"), threads(pid, state, n))?;
-        }
-        assert!(
-            !ended(20, None)?,
-            "a zombie leader with a thread still running"
-        );
-        assert!(ended(21, None)? && ended(22, None)? && ended(23, None)?);
-        std::fs::create_dir(fake.path().join("24"))?;
-        std::fs::write(fake.path().join("24/stat"), "24 (t) Z 1 24 24 0")?;
-        assert!(
-            ended(24, None).is_err(),
-            "a zombie's stat without its thread count"
-        );
-        // A stat that cannot be read for another reason, or read without its fields, is an error.
         std::fs::create_dir_all(fake.path().join("16/stat"))?;
-        assert!(ended(16, None).is_err(), "a stat that is a directory");
+        assert!(differs(16, "500").is_err(), "a stat that is a directory");
         std::fs::create_dir(fake.path().join("17"))?;
         std::fs::write(fake.path().join("17/stat"), "17 (sh")?;
-        assert!(ended(17, None).is_err(), "no command name");
+        assert!(differs(17, "500").is_err(), "no command name");
         std::fs::create_dir(fake.path().join("18"))?;
         std::fs::write(fake.path().join("18/stat"), "18 (sh) S 1")?;
-        assert!(ended(18, Some("500")).is_err(), "no start time");
+        assert!(differs(18, "500").is_err(), "no start time");
+        Ok(())
+    }
+
+    /// Wait (at most 10 s) until `until` holds.
+    fn within(mut until: impl FnMut() -> io::Result<bool>, what: &str) -> io::Result<()> {
+        let end = Instant::now() + Duration::from_secs(10);
+        while !until()? {
+            if Instant::now() >= end {
+                return Err(io::Error::other(format!("not {what} within 10 s")));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_leader_gone_before_its_threads_is_a_live_process_whose_identity_still_counts()
+    -> io::Result<()> {
+        // ADR-022 decision 10, v2 (CIR-002, -101): the main thread calls pthread_exit while a worker runs on, so the
+        // leader shows Z with the process alive until the worker ends; a start time other than its own still says the
+        // recorded process is gone, whatever the state.
+        let dir = tempfile::tempdir()?;
+        let (beat, go) = (dir.path().join("beat"), dir.path().join("go"));
+        let mut child = std::process::Command::new("python3")
+            .args([
+                "-c",
+                "import ctypes, os, sys, threading, time\n\
+                 def work():\n    open(sys.argv[1], 'w').close()\n    end = time.monotonic() + 30\n    \
+                 while not os.path.exists(sys.argv[2]) and time.monotonic() < end:\n        time.sleep(0.01)\n\
+                 threading.Thread(target=work).start()\nctypes.CDLL(None).pthread_exit(None)\n",
+            ])
+            .arg(&beat)
+            .arg(&go)
+            .spawn()?;
+        let pid = child.id();
+        let start = start_id(pid)?.ok_or_else(|| io::Error::other("no start time"))?;
+        let state = || -> io::Result<String> {
+            let stat = std::fs::read(format!("/proc/{pid}/stat"))?;
+            Ok(after_command_name(&stat)
+                .and_then(|f| f.split_whitespace().next())
+                .unwrap_or_default()
+                .to_owned())
+        };
+        let looked = (|| {
+            within(|| Ok(beat.exists()), "working")?;
+            within(|| Ok(state()? == "Z"), "a zombie leader")?;
+            assert!(!ended(pid, Some(&start))?, "a Z leader whose worker runs");
+            assert!(!ended(pid, None)?, "a Z leader whose worker runs");
+            assert!(
+                ended(pid, Some("0"))?,
+                "another start time: the recorded process is gone"
+            );
+            std::fs::write(&go, "")?;
+            within(|| ended(pid, Some(&start)), "ended once its worker ended")
+        })();
+        let _ = child.kill();
+        child.wait()?;
+        looked
+    }
+
+    #[test]
+    fn a_process_whose_thread_execs_is_never_read_as_ended() -> io::Result<()> {
+        // ADR-022 decision 10, v2 (CIR-100): a thread other than the main one execs, 200 times, the kernel's de_thread
+        // giving it the leader's number and start time while a stat read can meet the old leader being released (a
+        // Z with 0 threads was seen so in a C stand-in, the process running on); once with the main thread gone by
+        // pthread_exit, once with it asleep and killed by the exec. Until the last image says it is the last, no
+        // look says ended.
+        let dir = tempfile::tempdir()?;
+        let script = dir.path().join("again.py");
+        std::fs::write(
+            &script,
+            "import ctypes, os, sys, threading, time\n\
+             n, last, mode = int(sys.argv[1]), sys.argv[2], sys.argv[3]\n\
+             if n >= 200:\n    open(last, 'w').close()\n    sys.exit(0)\n\
+             def again():\n    os.execv(sys.executable, [sys.executable, sys.argv[0], str(n + 1), last, mode])\n\
+             threading.Thread(target=again).start()\n\
+             if mode == 'exit':\n    ctypes.CDLL(None).pthread_exit(None)\ntime.sleep(30)\n",
+        )?;
+        for mode in ["exit", "sleep"] {
+            let last = dir.path().join(format!("last-{mode}"));
+            let mut child = std::process::Command::new("python3")
+                .arg(&script)
+                .arg("0")
+                .arg(&last)
+                .arg(mode)
+                .spawn()?;
+            let pid = child.id();
+            let start = start_id(pid)?.ok_or_else(|| io::Error::other("no start time"))?;
+            let (mut looks, mut early) = (0u32, 0u32);
+            let end = Instant::now() + Duration::from_secs(60);
+            let watched = (|| {
+                while child.try_wait()?.is_none() && Instant::now() < end {
+                    looks += 1;
+                    // The marker is read after the look: an end seen before the last image made it is a wrong end.
+                    if ended(pid, Some(&start))? && !last.exists() {
+                        early += 1;
+                    }
+                }
+                Ok::<(), io::Error>(())
+            })();
+            let _ = child.kill();
+            let status = child.wait()?;
+            watched?;
+            assert!(
+                last.exists(),
+                "{mode}: the last image never ran: {status:?}"
+            );
+            assert_eq!(early, 0, "{mode}: ended before the end, in {looks} looks");
+        }
+        Ok(())
+    }
+
+    /// The processes running `python3 <script> <ready>`, once the child it forks (and, when `exec`, that child exec'd as
+    /// the same command line) has written its pid to `ready`, its own event: what [`running_with`] finds, the
+    /// parent's pid and the child's.
+    fn scanned(dir: &std::path::Path, exec: bool) -> io::Result<(Vec<u32>, u32, u32)> {
+        use std::os::unix::process::CommandExt as _;
+        let script = dir.join("fork.py");
+        std::fs::write(
+            &script,
+            "import os, sys, time\n\
+             if os.environ.pop('HOH_CHILD', None):\n    open(sys.argv[1], 'w').write(str(os.getpid()))\n    \
+             time.sleep(30)\n    sys.exit(0)\n\
+             if os.fork() == 0:\n    \
+             if os.environ.get('HOH_EXEC'):\n        os.environ['HOH_CHILD'] = '1'\n        \
+             os.execv(sys.executable, ['python3'] + sys.argv)\n    \
+             open(sys.argv[1], 'w').write(str(os.getpid()))\n    time.sleep(30)\n    os._exit(0)\n\
+             time.sleep(30)\n",
+        )?;
+        let ready = dir.join(if exec { "exec-ready" } else { "fork-ready" });
+        let mut parent = std::process::Command::new("python3");
+        parent
+            .arg(&script)
+            .arg(&ready)
+            .env_remove("HOH_CHILD")
+            .process_group(0);
+        if exec {
+            parent.env("HOH_EXEC", "1");
+        } else {
+            parent.env_remove("HOH_EXEC");
+        }
+        let mut parent = parent.spawn()?;
+        let wanted = [
+            b"python3\0".as_slice(),
+            script.as_os_str().as_encoded_bytes(),
+            b"\0",
+            ready.as_os_str().as_encoded_bytes(),
+            b"\0",
+        ]
+        .concat();
+        let looked = (|| {
+            within(
+                || Ok(std::fs::read_to_string(&ready).is_ok_and(|r| !r.is_empty())),
+                "a child ready",
+            )?;
+            let child: u32 = std::fs::read_to_string(&ready)?
+                .parse()
+                .map_err(|_| io::Error::other("no child pid"))?;
+            Ok::<_, io::Error>((running_with(|c| c == wanted.as_slice())?, child))
+        })();
+        if let Some(group) = i32::try_from(parent.id()).ok().and_then(Pid::from_raw) {
+            let _ = kill_process_group(group, Signal::KILL);
+        }
+        parent.wait()?;
+        let (found, child) = looked?;
+        Ok((found, parent.id(), child))
+    }
+
+    #[test]
+    fn a_copy_forked_before_its_exec_is_no_second_process_of_its_command_line() -> io::Result<()> {
+        // Two "hosts" were seen at once in a local run of test_005_02: a host's copy forked to start a command shows
+        // the host's command line until it execs (ADR-022 decision 10, v2).
+        let dir = tempfile::tempdir()?;
+        let (found, parent, _) = scanned(dir.path(), false)?;
+        assert_eq!(found, [parent]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_child_execd_as_the_same_command_line_is_a_second_process() -> io::Result<()> {
+        // CIR-102: whose parent is a match proves nothing; only the kernel's PF_FORKNOEXEC tells a copy not exec'd.
+        let dir = tempfile::tempdir()?;
+        let (mut found, parent, child) = scanned(dir.path(), true)?;
+        found.sort_unstable();
+        let mut want = [parent, child];
+        want.sort_unstable();
+        assert_eq!(found, want);
+        Ok(())
+    }
+
+    #[test]
+    fn a_kill_reaches_only_the_process_of_its_start_time() -> io::Result<()> {
+        // ADR-022 decision 10, v2 (CIR-103, -152): another start time for the number gets no signal; its own does.
+        let mut child = std::process::Command::new("sleep").arg("60").spawn()?;
+        let pid = child.id();
+        let start = start_id(pid)?.ok_or_else(|| io::Error::other("no start time"))?;
+        let looked = (|| {
+            assert!(
+                !signal_if_same(pid, "0", Signal::KILL)?,
+                "another start time"
+            );
+            assert!(!ended(pid, Some(&start))?, "still running");
+            assert!(
+                signal_if_same(pid, &start, Signal::KILL)?,
+                "its own start time"
+            );
+            within(|| ended(pid, Some(&start)), "killed")
+        })();
+        let _ = child.kill();
+        child.wait()?;
+        looked?;
+        assert!(!signal_if_same(pid, &start, Signal::KILL)?, "reaped");
         Ok(())
     }
 

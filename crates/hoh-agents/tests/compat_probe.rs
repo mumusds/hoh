@@ -886,6 +886,7 @@ fn probe_leaves_no_descendant_behind() -> R {
     // M1T01R-03: a probe command that starts a background child must not leave it running.
     let tmp = tempfile::tempdir()?;
     let pidfile = tmp.path().join("bg.pid");
+    let statfile = tmp.path().join("bg.stat");
     let help = tmp.path().join("help.txt");
     // A help the claude adapter can drive (M1T07R-14); this test is about the background child.
     std::fs::write(
@@ -893,25 +894,31 @@ fn probe_leaves_no_descendant_behind() -> R {
         "  -p, --print\n  --verbose\n  --output-format <format>  stream-json\n  --resume\n",
     )?;
     let script = format!(
-        "#!/bin/sh\ncase \"$1\" in\n --version) sleep 60 >/dev/null 2>&1 & echo $! > '{}'; echo '2.0.0 (Claude Code)';;\n --help) cat '{}';;\nesac\n",
+        "#!/bin/sh\ncase \"$1\" in\n --version) sleep 60 >/dev/null 2>&1 & read -r s < /proc/$!/stat; printf '%s\\n' \"$s\" > '{}'; echo $! > '{}'; echo '2.0.0 (Claude Code)';;\n --help) cat '{}';;\nesac\n",
+        statfile.display(),
         pidfile.display(),
         help.display()
     );
     let (dir, _) = fake(tmp.path(), "bg", "claude", &script)?;
     probe(Agent::Claude, &env_for(&dir))?;
     let pid: u32 = std::fs::read_to_string(&pidfile)?.trim().parse()?;
+    // Its start time, read by the fake while the child ran (with builtins), names it: a number taken again since is
+    // neither read as it nor killed (CIR-103, -152).
+    let stat = std::fs::read(&statfile)?;
+    let start = hoh_agents::identity::after_command_name(&stat)
+        .and_then(|fields| fields.split_whitespace().nth(19))
+        .ok_or("the background child's stat has no start time")?
+        .to_owned();
     // Ended by identity::ended, looked at again within a bound: a read that fails is an error, never "ended" (any read
     // or UTF-8 failure was taken for an end; CIR-003).
     let end = std::time::Instant::now() + Duration::from_secs(5);
-    let mut ended = hoh_agents::identity::ended(pid, None)?;
+    let mut ended = hoh_agents::identity::ended(pid, Some(&start))?;
     while !ended && std::time::Instant::now() < end {
         std::thread::sleep(Duration::from_millis(20));
-        ended = hoh_agents::identity::ended(pid, None)?;
+        ended = hoh_agents::identity::ended(pid, Some(&start))?;
     }
     if !ended {
-        let _ = std::process::Command::new("kill")
-            .args(["-9", &pid.to_string()])
-            .status();
+        let _ = hoh_agents::identity::signal_if_same(pid, &start, rustix::process::Signal::KILL);
     }
     assert!(ended, "background child {pid} outlived the probe");
     Ok(())
