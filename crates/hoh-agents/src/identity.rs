@@ -63,6 +63,42 @@ pub fn start_id(pid: u32) -> io::Result<Option<String>> {
         .ok_or_else(|| io::Error::other(format!("/proc/{pid}/stat has no start time")))
 }
 
+/// Whether process `pid` has ended (ADR-022 decision 10, the convention for observing processes in tests, version
+/// 2): its stat gone (ENOENT, or ESRCH while being reaped), its state Z or X, or, when `start` is given, a start time
+/// other than `start` (its number now another process's). A stat read in any other state is a live process. Any
+/// other failed read, or a stat without the fields read, is an error, never "ended" (M2T07R-1151, -1203).
+pub fn ended(pid: u32, start: Option<&str>) -> io::Result<bool> {
+    ended_in(std::path::Path::new("/proc"), pid, start)
+}
+
+fn ended_in(proc: &std::path::Path, pid: u32, start: Option<&str>) -> io::Result<bool> {
+    let path = proc.join(pid.to_string()).join("stat");
+    let stat = match std::fs::read(&path) {
+        Ok(stat) => stat,
+        Err(e) if e.kind() == io::ErrorKind::NotFound || e.raw_os_error() == Some(3) => {
+            return Ok(true);
+        }
+        Err(e) => return Err(e),
+    };
+    let unreadable = || {
+        io::Error::other(format!(
+            "{} cannot be read as a stat: {:?}",
+            path.display(),
+            String::from_utf8_lossy(&stat[..stat.len().min(512)])
+        ))
+    };
+    // Fields after the parenthesised command name: field 3 (state) on; the start time is field 22.
+    let rest = after_command_name(&stat).ok_or_else(unreadable)?;
+    let state = rest.split_whitespace().next().ok_or_else(unreadable)?;
+    if state == "Z" || state == "X" {
+        return Ok(true);
+    }
+    match start {
+        Some(start) => Ok(rest.split_whitespace().nth(19).ok_or_else(unreadable)? != start),
+        None => Ok(false),
+    }
+}
+
 /// The identity of process `pid` now, `None` when /proc has no entry for it (see [`start_id`]).
 pub fn of(pid: u32) -> io::Result<Option<Identity>> {
     let Some(start_id) = start_id(pid)? else {
@@ -1161,6 +1197,69 @@ mod tests {
     }
 
     #[test]
+    fn a_process_has_ended_only_when_its_stat_says_so() -> io::Result<()> {
+        // ADR-022 decision 10, convention v2: gone, Z or X, or another start time for its number is ended; any other
+        // state is alive; any other failed read is an error, never ended (M2T07R-1151, -1203).
+        let fake = tempfile::tempdir()?;
+        let stat = |pid: &str, state: &str, start: &str| {
+            format!(
+                "{pid} (a b) c) {state} 1 {pid} {pid} 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 {start} 0 0"
+            )
+        };
+        for (pid, state) in [
+            ("10", "Z"),
+            ("11", "X"),
+            ("12", "S"),
+            ("13", "R"),
+            ("14", "D"),
+            ("15", "t"),
+        ] {
+            std::fs::create_dir(fake.path().join(pid))?;
+            std::fs::write(fake.path().join(pid).join("stat"), stat(pid, state, "500"))?;
+        }
+        let ended = |pid: u32, start: Option<&str>| ended_in(fake.path(), pid, start);
+        assert!(ended(9, None)?, "gone");
+        assert!(ended(10, None)? && ended(11, None)?, "Z and X");
+        for pid in 12..=15 {
+            assert!(!ended(pid, None)?, "{pid} alive");
+            assert!(!ended(pid, Some("500"))?, "{pid} the same process");
+            assert!(
+                ended(pid, Some("400"))?,
+                "{pid} its number another process's"
+            );
+        }
+        // A stat that cannot be read for another reason, or read without its fields, is an error.
+        std::fs::create_dir_all(fake.path().join("16/stat"))?;
+        assert!(ended(16, None).is_err(), "a stat that is a directory");
+        std::fs::create_dir(fake.path().join("17"))?;
+        std::fs::write(fake.path().join("17/stat"), "17 (sh")?;
+        assert!(ended(17, None).is_err(), "no command name");
+        std::fs::create_dir(fake.path().join("18"))?;
+        std::fs::write(fake.path().join("18/stat"), "18 (sh) S 1")?;
+        assert!(ended(18, Some("500")).is_err(), "no start time");
+        Ok(())
+    }
+
+    #[test]
+    fn a_child_is_alive_until_it_is_reaped_or_a_zombie() -> io::Result<()> {
+        // The same through the real /proc: a sleeping child is alive with its own start time; once it ends it is a
+        // zombie, and once reaped it is gone.
+        let mut child = std::process::Command::new("sleep").arg("60").spawn()?;
+        let pid = child.id();
+        let start = start_id(pid)?.ok_or_else(|| io::Error::other("no start time"))?;
+        assert!(!ended(pid, Some(&start))?);
+        child.kill()?;
+        let end = Instant::now() + Duration::from_secs(10);
+        while !ended(pid, Some(&start))? {
+            assert!(Instant::now() < end, "never a zombie");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        child.wait()?;
+        assert!(ended(pid, Some(&start))?);
+        Ok(())
+    }
+
+    #[test]
     fn a_process_already_released_is_in_no_group() -> io::Result<()> {
         // M2T07R-1100's cause: a process being released (state X, its signal handlers gone) shows pgrp -1, the
         // kernel's value for a task whose group it has already left; a group outside this pid namespace shows 0.
@@ -1170,11 +1269,17 @@ mod tests {
             ("306724", "306724 (sleep) X 0 -1 -1 0 -1 4210764 0 0"),
             ("13", "13 (sh) Z 1 0 0 0"),
             ("9", "9 (sh) S 1 7 7 0"),
+            // The rule is the value, not the state (M2T07R-1200): the kernel reads the state before it takes the lock,
+            // so a task being reaped can show Z with -1, and an X task before __exit_signal still shows its group.
+            ("15", "15 (sh) Z 1 -1 -1 0"),
+            ("16", "16 (sleep) X 1 7 7 0"),
         ] {
             std::fs::create_dir(fake.path().join(pid))?;
             std::fs::write(fake.path().join(pid).join("stat"), stat)?;
         }
-        assert_eq!(group_left_in(fake.path(), 7, 7)?, [9]);
+        let mut left = group_left_in(fake.path(), 7, 7)?;
+        left.sort_unstable();
+        assert_eq!(left, [9, 16]);
         // Only the kernel's values are taken: a group below -1, or one past a pid_t, stays an error (M2T05R-200).
         for stat in ["14 (sh) S 1 -2 -2 0", "14 (sh) S 1 4294967303 7 0"] {
             let fake = tempfile::tempdir()?;
