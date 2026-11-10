@@ -1336,6 +1336,15 @@ while end > time.monotonic():
     let mut turn = world.turn(&program, "logs-stubborn")?;
     turn.escalation = quick();
     let held = claude::start(&world.attempt("A1").await?, &turn, &gate(&world, "p/A1")?)?;
+    // Opened while the stand-in (one process) waits at its gate, so unreaped: the cleanups below signal that
+    // process, never a number the adapter's reap may have freed (CIR-302, -402).
+    let leader = rustix::process::pidfd_open(
+        rustix::process::Pid::from_raw(held.pid as i32).ok_or("pid")?,
+        rustix::process::PidfdFlags::empty(),
+    )?;
+    let kill = || {
+        let _ = rustix::process::pidfd_send_signal(&leader, rustix::process::Signal::KILL);
+    };
     held.open.send(()).map_err(|()| "gate closed")?;
     let end = Instant::now() + Duration::from_secs(10);
     while !d.join("ready").exists() {
@@ -1352,12 +1361,7 @@ while end > time.monotonic():
         if Instant::now() > end {
             let status =
                 std::fs::read_to_string(format!("/proc/{}/status", held.pid)).unwrap_or_default();
-            // Only while the turn has not ended: its leader is then unreaped and its group number its own (CIR-302).
-            if !held.ended.is_finished()
-                && let Some(group) = rustix::process::Pid::from_raw(held.pid as i32)
-            {
-                let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
-            }
+            kill();
             return Err(format!(
                 "no signal recorded 3 s after the cancel; the agent's status:\n{status}"
             )
@@ -1369,13 +1373,7 @@ while end > time.monotonic():
     tokio::time::sleep_until((cancelled + Duration::from_millis(3000)).into()).await;
     let signals = std::fs::read_to_string(&signals)?;
     let alive = !held.ended.is_finished();
-    // Its group killed only while the turn has not ended (its leader unreaped, the number its own; CIR-302).
-    if alive {
-        let _ = rustix::process::kill_process_group(
-            rustix::process::Pid::from_raw(held.pid as i32).ok_or("pid")?,
-            rustix::process::Signal::KILL,
-        );
-    }
+    kill();
     let facts = tokio::time::timeout(Duration::from_secs(20), held.ended).await??;
     assert_eq!(
         signals,

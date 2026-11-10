@@ -1625,6 +1625,8 @@ mod tests {
         let pid = child.id();
         let raw = Pid::from_raw(i32::try_from(pid).map_err(io::Error::other)?)
             .ok_or_else(|| io::Error::other("no pid"))?;
+        // Every look is taken and kept before the child is killed and reaped; the assertions come after, so none of
+        // them leaves the traced child behind (CIR-401).
         let looked = (|| {
             let stops = rustix::process::WaitIdOptions::STOPPED
                 | rustix::process::WaitIdOptions::EXITED
@@ -1639,20 +1641,20 @@ mod tests {
                 "stopped",
             )?;
             let status = status.ok_or_else(|| io::Error::other("no status"))?;
-            assert!(
-                status.trapped(),
-                "the child never stopped for its tracer: exited {}, killed {}",
-                status.exited(),
-                status.killed()
-            );
-            assert!(!child_ended(pid)?, "a ptrace stop read as an end");
-            Ok::<(), io::Error>(())
+            let stopped = (status.trapped(), status.exited(), status.killed());
+            Ok::<_, io::Error>((stopped, child_ended(pid)?))
         })();
         let _ = child.kill();
         let ended_once_killed = within(|| child_ended(pid), "ended once killed");
-        child.wait()?;
-        looked?;
-        ended_once_killed
+        let reaped = within(|| Ok(child.try_wait()?.is_some()), "reaped");
+        let ((trapped, exited, killed), ended_while_stopped) = looked?;
+        assert!(
+            trapped,
+            "the child never stopped for its tracer: exited {exited}, killed {killed}"
+        );
+        assert!(!ended_while_stopped, "a ptrace stop read as an end");
+        ended_once_killed?;
+        reaped
     }
 
     #[test]
