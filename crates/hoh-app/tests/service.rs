@@ -1184,8 +1184,12 @@ fn after_the_deadline(answer: &str) -> R<String> {
 #[test]
 fn a_manager_that_does_not_answer_after_the_deadline_is_not_read_as_no_start() -> R {
     // M2T14R-251, -353 (ADR-023 design correction 4): no answer is said as none, however it fails: too late (3 s), a
-    // non-zero exit, or an answer without its ActiveState line.
-    for answer in ["sleep 3", "exit 1", "echo Job=; exit 0"] {
+    // non-zero exit (here after printing what would read as no start), or an answer without its ActiveState line.
+    for answer in [
+        "sleep 3",
+        "echo Job=; echo ActiveState=inactive; exit 1",
+        "echo Job=; exit 0",
+    ] {
         let said = after_the_deadline(answer)?;
         assert!(said.contains("did not answer"), "{answer}: {said}");
         assert!(!said.contains("shows no start"), "{answer}: {said}");
