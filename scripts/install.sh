@@ -10,11 +10,13 @@
 #   install.sh --uninstall
 #       Stop and disable every hoh-host@ instance; once none runs and no process runs this installation's binaries,
 #       remove the template, ~/.local/bin/hoh and what it wrote in $XDG_DATA_HOME/hoh (versions, current, the
-#       instances' files). Projects' .hoh/, drop-ins, ~/.config/hoh and lingering are left as they are.
+#       instances' files). Projects' .hoh/, drop-ins, ~/.config/hoh and lingering are left as they are, and so is
+#       the installers' own lock $XDG_DATA_HOME/hoh.lock (an empty file, kept so that its lock is never on a removed one).
 #
 # Exit codes: 0 done; 1 ~/.local/bin/hoh is not this installation's; 64 usage; 69 the user's systemd manager cannot do
-# what was asked, or something still runs this installation (nothing removed); 77 run as root; 78 a home or project
-# systemd cannot use.
+# what was asked, something still runs this installation or its lock cannot be told (nothing removed), another
+# install.sh of it holds the installer's lock, or the installed binary does not run; 77 run as root; 78 a home or
+# project systemd cannot use.
 set -Eeuo pipefail
 
 say() { printf 'install.sh: %s\n' "$*" >&2; }
@@ -25,7 +27,7 @@ fail() {
   exit "$code"
 }
 usage() {
-  sed -n '5,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
+  sed -n '5,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
   exit "${1:-64}"
 }
 
@@ -68,22 +70,44 @@ main() {
   override="$config/systemd/user/hoh-host@.service"
   user="${USER:-$(id -un)}"
   if ((uninstall)); then
-    hold_operation
+    # Nothing installed has no installer's lock either (its directory is the data directory).
+    [[ ! -d "$data" ]] || hold_operation
     remove
   else
     check_paths
+    refusals "${projects[@]}"
+    mkdir -p -- "$data"
     hold_operation
     install "${projects[@]}"
   fi
 }
 
-# The installer's own lock (docs/adr/ADR-023.md design correction 5, M2T14R-300, -301): every install and uninstall
-# holds this home exclusive for its whole run, so they take turns, and none sees another's half-done work. A
-# directory that is never removed: its lock is never on a file that is gone. A run of hoh never takes it.
+# The installer's own lock (docs/adr/ADR-023.md design corrections 5 and 7): every install and uninstall holds
+# $XDG_DATA_HOME/hoh.lock exclusive for its whole run, so installers of one installation take turns and none sees
+# another's half-done work. A file beside the installation's root that no uninstall removes (its lock is never on a
+# file that is gone), opened read-write (as an NFS client needs for an exclusive lock), which no run of hoh locks.
 hold_operation() {
-  [[ -d "$HOME" ]] || fail 78 "HOME ($HOME) is not a directory"
-  exec 8<"$HOME"
-  flock -w 60 -x 8 || fail 69 "another install.sh (install or uninstall) for $HOME still runs: try again when it ends"
+  local lock="$data/hoh.lock" said rc=0
+  if ! { command exec 8<>"$lock"; } 2>/dev/null; then
+    fail 69 "cannot open the installer's lock $lock"
+  fi
+  # Waiting 60 s on another holder is told from a lock that cannot be had at all (M2T14R-401).
+  said="$(flock -E 75 -w 60 -x 8 2>&1)" || rc=$?
+  case "$rc" in
+    0) ;;
+    75) fail 69 "$lock stayed locked for 60 s (another install.sh of this installation runs): try again when it ends" ;;
+    *) fail 69 "cannot lock $lock (flock exit $rc: ${said:-no message})" ;;
+  esac
+}
+
+# What refuses an install before it writes anything, even its lock (exit 1 or 69).
+refusals() {
+  if [[ -e "$bin_link" || -L "$bin_link" ]] && ! ours; then
+    fail 1 "$bin_link exists and is not this installation's link to $current/bin/hoh: nothing changed"
+  fi
+  if (($#)) && ! manager; then
+    fail 69 "no user systemd manager answers (\$XDG_RUNTIME_DIR/systemd/private): cannot enable a project's host unit"
+  fi
 }
 
 # Before anything is written: EnvironmentFile= takes a glob, ExecStart= no program path with quotes or a backslash
@@ -125,12 +149,6 @@ install() {
   local src name semver sha changed=0
   src="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
   [[ -x "$src/bin/hoh" ]] || fail 64 "$src/bin/hoh is missing: run the install.sh of a release bundle"
-  if [[ -e "$bin_link" || -L "$bin_link" ]] && ! ours; then
-    fail 1 "$bin_link exists and is not this installation's link to $current/bin/hoh: nothing changed"
-  fi
-  if (($#)) && ! manager; then
-    fail 69 "no user systemd manager answers (\$XDG_RUNTIME_DIR/systemd/private): cannot enable a project's host unit"
-  fi
   # An installed hoh (this script may be one's copy) runs only with its installation's lock: one missing from an
   # existing installation is made again before any of its binaries runs (M2T14R-352).
   [[ ! -d "$root" || -e "$root/.lock" ]] || : >"$root/.lock"
@@ -239,23 +257,35 @@ remove() {
   # The installation's own lock, exclusive (design correction 2, M2T14R-100): every run of an installed hoh holds it
   # shared for its life, so it is had only once none runs, and while it is held none can start; what follows is
   # removed under it.
-  local held=1
+  local held=1 run_holds=0
   if [[ -e "$root/.lock" ]]; then
-    # Read-only, as a run opens it (a 0400 lock is fine; M2T14R-351); checked first, since a failed exec redirection
-    # would end this script.
-    if [[ -r "$root/.lock" ]]; then
-      exec 9<"$root/.lock"
-      flock -n -x 9 || held=0
+    # Read-write when it can be (an NFS client needs it for an exclusive lock, M2T14R-451), else read-only (a 0400 lock
+    # is fine locally, M2T14R-351); a failed open is said, not taken for a running program (M2T14R-453).
+    if { command exec 9<>"$root/.lock"; } 2>/dev/null || { command exec 9<"$root/.lock"; } 2>/dev/null; then
+      if ! flock -n -x 9; then
+        held=0
+        run_holds=1
+      fi
     else
-      say "cannot read this installation's lock $root/.lock"
+      say "cannot open this installation's lock $root/.lock"
       held=0
     fi
     # The lock held must be the file at its path (the run's check, design correction 3, and the uninstall's own,
-    # correction 5): one replaced or removed meanwhile holds nothing.
-    if ((held)) && { [[ "$(stat -L -c '%d:%i' /dev/fd/9)" != "$(stat -c '%d:%i' "$root/.lock" 2>/dev/null)" ]] ||
-      [[ "$(stat -L -c '%h' /dev/fd/9)" == 0 ]]; }; then
-      say "this installation's lock changed while it was being taken"
-      held=0
+    # correction 5): one replaced or removed meanwhile holds nothing, and one that cannot be told holds nothing either
+    # (each look checked, M2T14R-400).
+    if ((held)); then
+      local held_id held_links named_id
+      if held_id="$(stat -L -c '%d:%i' /dev/fd/9)" && held_links="$(stat -L -c '%h' /dev/fd/9)" &&
+        named_id="$(stat -c '%d:%i' "$root/.lock")" && [[ "$held_id" =~ ^[0-9]+:[0-9]+$ ]] &&
+        [[ "$named_id" =~ ^[0-9]+:[0-9]+$ ]] && [[ "$held_links" =~ ^[0-9]+$ ]]; then
+        if [[ "$held_id" != "$named_id" || "$held_links" == 0 ]]; then
+          say "this installation's lock changed while it was being taken"
+          held=0
+        fi
+      else
+        say "cannot tell whether the lock held is this installation's $root/.lock"
+        held=0
+      fi
     fi
   fi
   # With no lock file no run can hold the installation (each refuses to run without it); the scan below still finds
@@ -271,7 +301,7 @@ remove() {
       running=1
     fi
   done
-  if ((!held)); then
+  if ((run_holds)); then
     say "this installation's lock is held: one of its programs still runs"
   fi
   if ((failed || running || !held)); then
