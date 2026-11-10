@@ -1352,7 +1352,10 @@ while end > time.monotonic():
         if Instant::now() > end {
             let status =
                 std::fs::read_to_string(format!("/proc/{}/status", held.pid)).unwrap_or_default();
-            if let Some(group) = rustix::process::Pid::from_raw(held.pid as i32) {
+            // Only while the turn has not ended: its leader is then unreaped and its group number its own (CIR-302).
+            if !held.ended.is_finished()
+                && let Some(group) = rustix::process::Pid::from_raw(held.pid as i32)
+            {
                 let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
             }
             return Err(format!(
@@ -1366,10 +1369,13 @@ while end > time.monotonic():
     tokio::time::sleep_until((cancelled + Duration::from_millis(3000)).into()).await;
     let signals = std::fs::read_to_string(&signals)?;
     let alive = !held.ended.is_finished();
-    let _ = rustix::process::kill_process_group(
-        rustix::process::Pid::from_raw(held.pid as i32).ok_or("pid")?,
-        rustix::process::Signal::KILL,
-    );
+    // Its group killed only while the turn has not ended (its leader unreaped, the number its own; CIR-302).
+    if alive {
+        let _ = rustix::process::kill_process_group(
+            rustix::process::Pid::from_raw(held.pid as i32).ok_or("pid")?,
+            rustix::process::Signal::KILL,
+        );
+    }
     let facts = tokio::time::timeout(Duration::from_secs(20), held.ended).await??;
     assert_eq!(
         signals,

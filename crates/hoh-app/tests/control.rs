@@ -2079,10 +2079,6 @@ async fn cgroup_non_utf8_leader_inside() -> R {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let group = i32::try_from(leader)
-        .ok()
-        .and_then(rustix::process::Pid::from_raw)
-        .ok_or("no group")?;
     let (status, _) = command(&host, &control(&project, "CancelRun", "cancel")?).await?;
     assert_eq!(status, 202);
     until(
@@ -2092,8 +2088,9 @@ async fn cgroup_non_utf8_leader_inside() -> R {
         Duration::from_secs(30),
     )
     .await?;
+    // Empty only by the kernel's ESRCH (identity::group_empty), not by any failed look, EPERM included (CIR-303).
     assert!(
-        rustix::process::test_kill_process_group(group).is_err(),
+        hoh_agents::identity::group_empty(leader),
         "CANCELLED while the leader's group lived"
     );
     host.shutdown().await;
@@ -2448,7 +2445,7 @@ async fn cgroup_leaderless_start_reconcile_inside() -> R {
         "the attempt was left though its cgroup and group were stopped"
     );
     assert!(
-        rustix::process::test_kill_process_group(group).is_err(),
+        hoh_agents::identity::group_empty(leader),
         "the group's member lives on"
     );
     second.shutdown().await;
