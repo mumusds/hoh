@@ -1179,14 +1179,15 @@ fn an_uninstall_that_cannot_tell_its_lock_removes_nothing() -> R {
 fn an_installers_lock_that_cannot_be_had_is_told_from_one_held_by_another() -> R {
     // M2T14R-401 (ADR-023 design correction 7): the installers' lock $XDG_DATA_HOME/hoh.lock: a failure to lock at all
     // (a stand-in flock: EBADF) is said as it is, at once; a wait that ended at its limit (the stand-in's conflict
-    // code) says the lock stayed held. Neither writes anything but the lock file itself.
+    // code) says the lock stayed held; neither says the other. Neither writes anything but the lock file itself.
     let install = Install::new()?;
-    for (code, said) in [
+    for (code, said, not_said) in [
         (
             "echo 'flock: 8: Bad file descriptor' >&2; exit 65",
             "cannot lock",
+            "stayed locked",
         ),
-        ("exit 75", "stayed locked"),
+        ("exit 75", "stayed locked", "cannot lock"),
     ] {
         script(
             &install.stubs().join("flock"),
@@ -1203,6 +1204,7 @@ fn an_installers_lock_that_cannot_be_had_is_told_from_one_held_by_another() -> R
         assert_eq!(out.status.code(), Some(69), "{code}: {}", text(&out));
         let stderr = String::from_utf8(out.stderr.clone())?;
         assert!(stderr.contains(said), "{code}: {stderr}");
+        assert!(!stderr.contains(not_said), "{code}: {stderr}");
         let written: Vec<PathBuf> = tree(&install.home())?
             .into_iter()
             .filter(|(_, e)| e.kind != 'd')
