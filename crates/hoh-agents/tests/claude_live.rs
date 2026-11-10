@@ -256,7 +256,7 @@ async fn claude_live_turns_resume_and_cancel() -> R {
         let alive: Vec<u32> = tools
             .iter()
             .map(|(pid, _)| *pid)
-            .filter(|pid| matches!(stat_of(*pid), Ok(Some((state, _, _))) if state != 'Z' && state != 'X'))
+            .filter(|pid| matches!(hoh_agents::identity::ended(*pid, None), Ok(false)))
             .collect();
         let at = Instant::now();
         let receipt = cancel.request();

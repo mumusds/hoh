@@ -848,10 +848,10 @@ fn test_041_03_a_reused_pid_or_another_boot_is_not_signalled() -> R {
     let (code, stderr) = serve_and_stop(&project)?;
     assert_eq!(code, 0, "the restarted host: {stderr}");
     let read: Value = serde_json::from_str(&python(&db(&project), READ_RECONCILE, "")?)?;
-    // The helper lives on, the same process, and got no signal: alive by identity::ended with its start time, as a
-    // zombie of the same start time would be a helper killed by SIGKILL, which no trap records (CIR-150).
+    // The helper lives on, the same process, and got no signal: alive by the parent's own view of its child (a
+    // zombie of the same start time would be a helper killed by SIGKILL, which no trap records; CIR-150, -200).
     assert!(
-        !hoh_agents::identity::ended(pid, Some(&me.start_id))?,
+        !hoh_agents::identity::child_ended(pid)?,
         "the helper was killed"
     );
     assert_eq!(std::fs::read_to_string(&log).unwrap_or_default(), "");
@@ -2658,10 +2658,8 @@ async fn the_runner_keeps_the_slot_of_a_holder_it_cannot_confirm_gone() -> R {
                 .stdin(std::process::Stdio::null())
                 .spawn()?
         });
-        // Its traps set before the host starts, and its start time for the end's look (CIR-150, -151).
+        // Its traps set before the host starts (CIR-151).
         trapped_at(&ready)?;
-        let live_start =
-            hoh_agents::identity::start_id(live.0.id())?.ok_or("live is not running")?;
         let pid = if partial {
             live.0.id().to_string()
         } else {
@@ -2717,8 +2715,9 @@ async fn the_runner_keeps_the_slot_of_a_holder_it_cannot_confirm_gone() -> R {
             "0"
         );
         assert_eq!(std::fs::read_to_string(&log).unwrap_or_default(), "");
+        // This process's own child: the parent's view (CIR-200).
         assert!(
-            !hoh_agents::identity::ended(live.0.id(), Some(&live_start))?,
+            !hoh_agents::identity::child_ended(live.0.id())?,
             "partial={partial}: live was killed"
         );
         host.shutdown().await;

@@ -288,9 +288,10 @@ impl Sandbox {
     /// no process in any of them (docs/adr/ADR-022.md decision 10, v2: a group is empty only by the kernel's look-up;
     /// CIR-004). A member a scan finds that has not ended (`identity::ended`) is left at once, without waiting: a scan
     /// proves presence, and a command doctor left running that would end by itself must not pass by outwaiting it
-    /// (CIR-153). Only a group whose members found are all ended (zombies its reaper has not reaped yet) is looked at
-    /// again, until 10 s have passed in all. No record at all is an error. A number reused since can only fail the
-    /// test, never pass it.
+    /// (CIR-153). Only a group whose members found are all ended (zombies its reaper has not reaped yet) or dying (a
+    /// SIGKILL pending, or already in exit: [`dying`]; the probe SIGKILLs a group and waits for its leader only, CIR-255)
+    /// is looked at again, until 10 s have passed in all. No record at all is an error. A number reused since can only
+    /// fail the test, never pass it.
     fn groups_left(&self) -> R<Vec<String>> {
         let recorded = std::fs::read_to_string(self.groups.path().join("started"))?;
         let mut groups = std::collections::BTreeSet::new();
@@ -313,6 +314,7 @@ impl Sandbox {
                 let running: Vec<u32> = hoh_agents::identity::group_left(*group, 0)?
                     .into_iter()
                     .filter(|m| !matches!(hoh_agents::identity::ended(*m, None), Ok(true)))
+                    .filter(|m| !matches!(dying(*m), Ok(true)))
                     .collect();
                 if !running.is_empty() {
                     return Ok(vec![format!("group {group}: {running:?} running")]);
@@ -325,6 +327,30 @@ impl Sandbox {
             std::thread::sleep(Duration::from_millis(20));
         }
     }
+}
+
+/// Whether process `pid` is on its way out though not ended yet: a SIGKILL pending for it (its thread's or its group's,
+/// `/proc/<pid>/status` SigPnd and ShdPnd, signal 9's bit) or its exit begun (`PF_EXITING`, 0x4, in its stat's flags).
+/// A look that fails is an error, so the caller counts it as running.
+fn dying(pid: u32) -> R<bool> {
+    const SIGKILL_BIT: u64 = 1 << 8;
+    const PF_EXITING: u32 = 0x4;
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status"))?;
+    for line in status.lines() {
+        if let Some(mask) = line
+            .strip_prefix("SigPnd:")
+            .or_else(|| line.strip_prefix("ShdPnd:"))
+            && u64::from_str_radix(mask.trim(), 16)? & SIGKILL_BIT != 0
+        {
+            return Ok(true);
+        }
+    }
+    let stat = std::fs::read(format!("/proc/{pid}/stat"))?;
+    let flags: u32 = hoh_agents::identity::after_command_name(&stat)
+        .and_then(|fields| fields.split_whitespace().nth(6))
+        .and_then(|flags| flags.parse().ok())
+        .ok_or_else(|| format!("/proc/{pid}/stat has no flags"))?;
+    Ok(flags & PF_EXITING != 0)
 }
 
 /// An installed CLI its adapter cannot start is incompatible and blocks (exit 3), for every agent and not only codex

@@ -63,14 +63,17 @@ pub fn start_id(pid: u32) -> io::Result<Option<String>> {
         .ok_or_else(|| io::Error::other(format!("/proc/{pid}/stat has no start time")))
 }
 
-/// Whether process `pid` has ended as a whole (ADR-022 decision 10, the convention for observing processes in tests,
-/// version 2 as revised after review round 2): no process has the number (`pidfd_open` gives no process); or, when
-/// `start` is given, the start time read once the pidfd is held is another (the recorded process is gone, its number
-/// another's, whatever that one's state: CIR-101); or the pidfd is readable, which the kernel makes it only once the
-/// thread group's leader has exited and no other thread of it is left (`pidfd_poll`, `thread_group_exited`). A stat's
-/// state letter is never read for it: Z or X tells of the task read, which can be a leader gone before its threads
-/// (CIR-002) or, while another thread execs, the old leader being released (CIR-100). Any other failed look is an
-/// error, never "ended" (M2T07R-1151).
+/// Whether process `pid`, not a child of this process, has ended as a whole (ADR-022 decision 10, the convention for
+/// observing processes in tests, version 2 as revised after review round 3): no process has the number (`pidfd_open`
+/// gives no process); or, when `start` is given, the start time read once the pidfd is held is another (the recorded
+/// process is gone, its number another's, whatever that one's state: CIR-101); or the pidfd is readable, which the
+/// kernel makes it once the thread group's leader has exited and no other thread of it is left (`pidfd_poll`). A
+/// stat's state letter is never read for it: Z or X tells of the task read, which can be a leader gone before its
+/// threads (CIR-002) or the old leader being released (CIR-100). Exact for a process that execs, if at all, from its
+/// main thread; while a thread other than the main one execs, the kernel's lockless pidfd_poll can still meet the old
+/// leader and read as ended (CIR-200: 9 early answers in about 350 million polls, .hoh-dev/evidence/
+/// ci-reliability-r3-kernel/), and no unprivileged lookup closes that window. For a child of this process the parent's
+/// own view is exact: [`child_ended`]. Any other failed look is an error, never "ended" (M2T07R-1151).
 pub fn ended(pid: u32, start: Option<&str>) -> io::Result<bool> {
     let raw = i32::try_from(pid)
         .ok()
@@ -89,6 +92,35 @@ pub fn ended(pid: u32, start: Option<&str>) -> io::Result<bool> {
         return Ok(true);
     }
     exited(&pidfd)
+}
+
+/// Whether `pid`, a child of this process not yet reaped, has ended as a whole: the parent's own view
+/// (`waitid(P_PID, WEXITED | WNOHANG | WNOWAIT)`, which leaves it unreaped). The kernel reports a child's exit to its
+/// parent under the tasklist lock and only once its thread group is empty, so a thread's exec never reads as an end
+/// (0 early answers in about 94 million looks while 350 million pidfd polls gave 9; CIR-200). A child already reaped,
+/// or a process that is no child of this one, is an error (ECHILD), never "ended".
+pub fn child_ended(pid: u32) -> io::Result<bool> {
+    let raw = i32::try_from(pid)
+        .ok()
+        .and_then(Pid::from_raw)
+        .ok_or_else(|| io::Error::other(format!("{pid} is no process id")))?;
+    let options = rustix::process::WaitIdOptions::EXITED
+        | rustix::process::WaitIdOptions::NOHANG
+        | rustix::process::WaitIdOptions::NOWAIT;
+    Ok(rustix::process::waitid(rustix::process::WaitId::Pid(raw), options)?.is_some())
+}
+
+/// Whether the process `pidfd` holds (opened while it was `pid`'s, unreaped) has been reaped: its fdinfo shows no pid
+/// any more. Pinned to that process, so a number taken again since reads as reaped all the same, never as alive; an
+/// fdinfo that cannot be read or tells nothing is an error (CIR-201).
+pub fn reaped_held(pidfd: &OwnedFd, pid: u32) -> io::Result<bool> {
+    match pidfd_leader(pidfd, pid) {
+        Leader::Reaped => Ok(true),
+        Leader::Unreaped => Ok(false),
+        Leader::Unknown => Err(io::Error::other(format!(
+            "the pidfd of process {pid} tells nothing of it"
+        ))),
+    }
 }
 
 /// Whether the process `pidfd` holds has ended as a whole: the pidfd is readable once its thread group's leader has
@@ -1390,12 +1422,11 @@ mod tests {
     }
 
     #[test]
-    fn a_process_whose_thread_execs_is_never_read_as_ended() -> io::Result<()> {
-        // ADR-022 decision 10, v2 (CIR-100): a thread other than the main one execs, 200 times, the kernel's de_thread
-        // giving it the leader's number and start time while a stat read can meet the old leader being released (a
-        // Z with 0 threads was seen so in a C stand-in, the process running on); once with the main thread gone by
-        // pthread_exit, once with it asleep and killed by the exec. Until the last image says it is the last, no
-        // look says ended.
+    fn a_child_whose_thread_execs_is_never_read_as_ended_by_its_parent() -> io::Result<()> {
+        // ADR-022 decision 10, v2 (CIR-100, -200): a thread other than the main one execs, 200 times, the kernel's
+        // de_thread giving it the leader's number and start time while a lockless look can meet the old leader being
+        // released; once with the main thread gone by pthread_exit, once with it asleep and killed by the exec. Until
+        // the last image says it is the last, the parent's view (child_ended) never says ended.
         let dir = tempfile::tempdir()?;
         let script = dir.path().join("again.py");
         std::fs::write(
@@ -1416,14 +1447,13 @@ mod tests {
                 .arg(mode)
                 .spawn()?;
             let pid = child.id();
-            let start = start_id(pid)?.ok_or_else(|| io::Error::other("no start time"))?;
             let (mut looks, mut early) = (0u32, 0u32);
             let end = Instant::now() + Duration::from_secs(60);
             let watched = (|| {
                 while child.try_wait()?.is_none() && Instant::now() < end {
                     looks += 1;
                     // The marker is read after the look: an end seen before the last image made it is a wrong end.
-                    if ended(pid, Some(&start))? && !last.exists() {
+                    if child_ended(pid)? && !last.exists() {
                         early += 1;
                     }
                 }
@@ -1541,6 +1571,34 @@ mod tests {
         child.wait()?;
         looked?;
         assert!(!signal_if_same(pid, &start, Signal::KILL)?, "reaped");
+        Ok(())
+    }
+
+    #[test]
+    fn a_parent_sees_its_child_end_and_a_held_pidfd_its_reap() -> io::Result<()> {
+        // CIR-200, -201: alive, the child is neither ended nor reaped; killed, it is ended (a zombie) but not reaped;
+        // waited for, it is reaped through the pidfd held, and no child any more (ECHILD, an error).
+        let mut child = std::process::Command::new("sleep").arg("60").spawn()?;
+        let pid = child.id();
+        let raw = Pid::from_raw(i32::try_from(pid).map_err(io::Error::other)?)
+            .ok_or_else(|| io::Error::other("no pid"))?;
+        let held = pidfd_open(raw, PidfdFlags::empty())?;
+        let looked = (|| {
+            assert!(!child_ended(pid)?);
+            assert!(!reaped_held(&held, pid)?);
+            pidfd_send_signal(held.as_fd(), Signal::KILL)?;
+            within(|| child_ended(pid), "ended")?;
+            assert!(!reaped_held(&held, pid)?, "a zombie is not reaped");
+            Ok::<(), io::Error>(())
+        })();
+        let _ = child.kill();
+        child.wait()?;
+        looked?;
+        assert!(reaped_held(&held, pid)?);
+        assert!(
+            child_ended(pid).is_err(),
+            "no child of this process any more"
+        );
         Ok(())
     }
 
