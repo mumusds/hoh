@@ -1791,9 +1791,9 @@ async fn a_new_developers_first_turn_starts_from_its_handover_package() -> R {
 
 #[tokio::test]
 async fn a_new_holders_first_turn_without_its_kept_input_fails_first_input_unavailable() -> R {
-    // docs/adr/ADR-024.md decision 4 (M2T17R-151, -152): the developer's session got its first input, then the kept
-    // file is gone; its first turn is not started without its package: the attempt fails FIRST_INPUT_UNAVAILABLE and
-    // the agent is sent nothing.
+    // docs/adr/ADR-024.md decision 4 (M2T17R-151, -152, -251): the developer's session got its first input, then the
+    // kept file is unreadable, then gone: its first turn is not started without its package (FIRST_INPUT_UNAVAILABLE,
+    // nothing sent); once the input is back, the retry's turn starts from it.
     let world = World::new()?;
     world.claude(None)?;
     world.codex("m-test")?;
@@ -1820,23 +1820,28 @@ async fn a_new_holders_first_turn_without_its_kept_input_fails_first_input_unava
             limit,
         )
         .await?;
-        std::fs::remove_file(hoh_app::host::product::first_input_path(&project, &session))?;
+        let kept = hoh_app::host::product::first_input_path(&project, &session);
+        let whole = std::fs::read(&kept)?;
+        // Unreadable, then gone: each attempt of the first turn fails FIRST_INPUT_UNAVAILABLE and sends nothing; the
+        // input back, the retry starts from it (M2T17R-251; the first input owed until the agent answered, -200).
+        std::fs::write(&kept, b"{")?;
         ready(&project, &run_id, &[("T-dev", "developer")])?;
-        until(
-            &project,
-            &ended("T-dev/attempt-1"),
-            "FAILED/FIRST_INPUT_UNAVAILABLE",
-            limit,
-        )
-        .await?;
-        let turns = std::fs::read_dir(world.bin().join("codex.d"))?
+        until(&project, &ended("T-dev/attempt-1"), "FAILED/FIRST_INPUT_UNAVAILABLE", limit).await?;
+        std::fs::remove_file(&kept)?;
+        until(&project, &ended("T-dev/attempt-2"), "FAILED/FIRST_INPUT_UNAVAILABLE", limit).await?;
+        std::fs::write(&kept, &whole)?;
+        until(&project, &ended("T-dev/attempt-3"), "SETTLED/", limit).await?;
+        let sent: Vec<String> = std::fs::read_dir(world.bin().join("codex.d"))?
             .flatten()
             .filter(|e| e.file_name().to_string_lossy().starts_with("log."))
             .filter_map(|e| std::fs::read_to_string(e.path().join("received.jsonl")).ok())
             .flat_map(|log| log.lines().map(str::to_owned).collect::<Vec<_>>())
-            .filter(|line| line.contains("turn/start"))
-            .count();
-        assert_eq!(turns, 0, "a turn started without its package");
+            .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
+            .filter(|m| m["method"] == "turn/start")
+            .filter_map(|m| m["params"]["input"][0]["text"].as_str().map(str::to_owned))
+            .collect();
+        assert_eq!(sent.len(), 1, "only the third attempt's turn was sent: {sent:?}");
+        assert!(sent[0].contains("```json"), "the retry's turn has no package: {}", sent[0]);
         R::Ok(())
     }
     .await;
@@ -1848,8 +1853,9 @@ async fn a_new_holders_first_turn_without_its_kept_input_fails_first_input_unava
 #[tokio::test]
 async fn a_new_holders_later_turns_in_its_session_carry_no_package() -> R {
     // docs/adr/ADR-024.md decision 4 (M2T17R-151, -152): the developer changes from claude to pi; the first turn of
-    // its new session carries the package, the session's next turn does not, whether or not the agent resumes a
-    // native session (the store, not the native session, says which turn is the first).
+    // its new session carries the package, the session's next turn, once pi answered the first, does not (the store
+    // says the first input is given; a session that cannot resume is covered by
+    // a_first_input_stays_owed_until_the_agent_answered_a_turn_of_its_session).
     let world = World::new()?;
     world.claude(None)?;
     world.codex("m-test")?;

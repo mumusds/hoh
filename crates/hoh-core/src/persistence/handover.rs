@@ -48,6 +48,27 @@ pub(super) fn first_input_pending(
     .map_err(sqlite_error)
 }
 
+/// Whether HoH session `session_id` owes its first input and has an attempt in flight (decision 4, M2T17R-201): its
+/// session.start was delivered to it, no turn of it was answered by the agent yet (no native session recorded), and
+/// one of its attempts is PREPARED, STARTING or RUNNING. Its role is then dispatched nothing more, so the first input
+/// goes to one turn at a time until the agent has answered one.
+pub(super) fn first_input_in_flight(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<bool, PersistError> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sessions s WHERE s.session_id = ?1 AND s.native_id IS NULL \
+         AND EXISTS(SELECT 1 FROM outbox o JOIN receipts r ON r.message_id = o.message_id WHERE o.state = 'ACKED' \
+          AND json_extract(o.payload_json, '$.kind') = 'session.start' \
+          AND json_extract(r.result_json, '$.session_id') = s.session_id) \
+         AND EXISTS(SELECT 1 FROM attempts a WHERE a.session_id = s.session_id \
+          AND a.state IN ('PREPARED', 'STARTING', 'RUNNING')))",
+        params![session_id],
+        |r| r.get(0),
+    )
+    .map_err(sqlite_error)
+}
+
 /// The ids `sql` (one `?1`, the run) reads.
 fn ids(conn: &Connection, run_id: &str, sql: &str) -> Result<Vec<String>, PersistError> {
     let mut statement = conn.prepare(sql).map_err(sqlite_error)?;

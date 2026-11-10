@@ -585,8 +585,13 @@ pub(super) fn load_binding(
     // A role whose change waits for its checkpoint, or that has no session yet, is not dispatched, and its tasks are not
     // judged by capabilities it does not have yet (docs/adr/ADR-022.md decision 8, M2T07R-50); nor is a new holder whose
     // first input, its handover package, is not delivered yet (docs/adr/ADR-024.md decision 4, M2T17R-03).
+    // Nor, while the session owes its first input, a second attempt of it (M2T17R-201).
     let pending = super::team::pending(tx, run_id, role)?
-        || super::handover::first_input_pending(tx, run_id, role, epoch)?;
+        || super::handover::first_input_pending(tx, run_id, role, epoch)?
+        || match session.as_deref() {
+            Some(session) => super::handover::first_input_in_flight(tx, session)?,
+            None => false,
+        };
     Ok(Some(BindingView {
         role_epoch: revision(epoch)?,
         active: state == "ACTIVE" && !pending && session.is_some(),
