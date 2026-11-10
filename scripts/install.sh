@@ -148,8 +148,13 @@ refusals() {
 # (design corrections 1 and 2, M2T14R-101).
 check_paths() {
   local real_root
-  # A root that cannot be resolved (a link to itself) cannot be named either (M2T14R-753).
+  # A root that cannot be resolved (a link to itself, or to nothing) cannot be named either (M2T14R-753). Whether
+  # `readlink -m` fails on a loop depends on the coreutils version, so a root that is a link and not a directory is
+  # refused on its own.
   real_root="$(readlink -m -- "$root" 2>&1)" || fail 78 "the installation's root $root cannot be resolved: $real_root"
+  if [[ -L "$root" && ! -d "$root" ]]; then
+    fail 78 "the installation's root $root cannot be resolved: it is a link to itself or to nothing"
+  fi
   refuse_chars "the installation's root" "$root" '*' '?' '[' '"' '\' "'"
   refuse_chars "the installation's root" "$real_root" '*' '?' '[' '"' '\' "'"
   refuse_chars "HOME" "$HOME" '"' '\' "'"
