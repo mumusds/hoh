@@ -1335,14 +1335,18 @@ impl StuckExecutor {
         // ends it. The leader outlives SIGTERM as well and marks the first one by a write of its own, a builtin: a
         // `date` it forked there could still be running at the SIGKILL that follows the term grace (300 ms), leaving
         // the file made and empty (seen in CI, reproduced with a slow date); its time is the file's mtime (M2T07R-254).
+        // Once its trap is set it says so in `<cancels>.ready`, a builtin's write too: a SIGTERM before it is ignored
+        // and marks nothing, so a test that reads the mark sends none before (`trapped`; convention v2).
         let terms = self.cancels.with_extension("term");
+        let ready = self.cancels.with_extension("ready");
         let mut child = Command::new("sh")
             .args([
                 "-c",
                 &format!(
                     "trap '' TERM; read -r go; [ \"$go\" = go ] || exit 0; sleep 1000 & \
-                     trap 'echo term >> {}; trap \"\" TERM' TERM; while :; do sleep 0.05; done",
-                    terms.display()
+                     trap 'echo term >> {}; trap \"\" TERM' TERM; echo $$ >> {}; while :; do sleep 0.05; done",
+                    terms.display(),
+                    ready.display()
                 ),
             ])
             .process_group(0)
@@ -1355,6 +1359,21 @@ impl StuckExecutor {
             started.push(pid);
         }
         Ok((child, pid, gate))
+    }
+}
+
+impl StuckExecutor {
+    /// Wait (at most 30 s) until an agent it started has set its SIGTERM trap.
+    fn trapped(&self) -> R {
+        let ready = self.cancels.with_extension("ready");
+        let end = Instant::now() + Duration::from_secs(30);
+        while !std::fs::read_to_string(&ready).is_ok_and(|r| r.ends_with('\n')) {
+            if Instant::now() > end {
+                return Err("the agent never set its SIGTERM trap".into());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Ok(())
     }
 }
 
@@ -1448,6 +1467,8 @@ async fn a_settle_whose_native_cancel_reached_no_turn_waits_only_the_sigterm_gra
         Duration::from_secs(30)
     )?);
     let a1 = query(&db, "SELECT attempt_id FROM attempts WHERE task_id = 'T1'")?;
+    // The reaper's SIGTERM only once the agent marks it (convention v2).
+    executor.trapped()?;
     clock.advance(Duration::from_secs(300));
     assert!(wait_for(
         &db,
@@ -1555,6 +1576,7 @@ async fn test_041_02_an_expired_lease_is_granted_again_only_after_its_holder_is_
     if let Ok(mut watched) = grant_probe.pid.lock() {
         *watched = Some(pid);
     }
+    executor.trapped()?;
     clock.advance(Duration::from_secs(300));
     // The next grant: epoch 5, after A1's chain.
     assert!(until(

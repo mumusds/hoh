@@ -49,6 +49,9 @@ struct Sandbox {
     tmp: tempfile::TempDir,
     /// Printed by every status command (a key-like string the doctor must never show).
     canary: Option<String>,
+    /// Where every shell stand-in records the process group it runs in as it starts (`started`), outside the
+    /// directories a test watches for writes (CIR-004).
+    groups: tempfile::TempDir,
 }
 
 impl Sandbox {
@@ -59,6 +62,7 @@ impl Sandbox {
             bin: tempfile::tempdir()?,
             tmp: tempfile::tempdir()?,
             canary: None,
+            groups: tempfile::tempdir()?,
         };
         s.write(
             "git",
@@ -78,8 +82,18 @@ impl Sandbox {
         Ok(s)
     }
 
+    /// Write a stand-in. A shell one records its process group first, read from its own stat with shell built-ins
+    /// in a subshell (its `$$` is the script's): each command doctor starts leads a group of its own, and what it
+    /// leaves running is found by that group, whatever its command lines say (CIR-004).
     fn write(&self, name: &str, script: &str) -> R {
         let path = self.bin.path().join(name);
+        let script = match script.strip_prefix("#!/bin/sh\n") {
+            Some(body) => format!(
+                "#!/bin/sh\n( read -r s < /proc/$$/stat; set -- ${{s##*\") \"}}; echo \"$3\" >> '{}' )\n{body}",
+                self.groups.path().join("started").display()
+            ),
+            None => script.to_owned(),
+        };
         std::fs::write(&path, script)?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
         Ok(())
@@ -269,23 +283,37 @@ impl Sandbox {
     }
 }
 
-/// Every process whose command line mentions `dir`.
-fn processes_mentioning(dir: &Path) -> Vec<String> {
-    let needle = dir.display().to_string();
-    std::fs::read_dir("/proc")
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .chars()
-                .all(|c| c.is_ascii_digit())
-        })
-        .filter_map(|e| std::fs::read(e.path().join("cmdline")).ok())
-        .map(|c| String::from_utf8_lossy(&c).replace('\0', " "))
-        .filter(|c| c.contains(&needle))
-        .collect()
+impl Sandbox {
+    /// The process groups the stand-ins started in that the kernel still finds a process in (zombies included), each
+    /// looked up until it is empty or 10 s have passed in all: a member SIGKILLed with its group is reaped by its new
+    /// parent, so its group empties a moment after doctor ends (docs/adr/ADR-022.md decision 10, v2: a group is empty
+    /// only by the kernel's look-up, never by a scan; CIR-004). No record at all is an error. A number reused since
+    /// can only fail the test, never pass it.
+    fn groups_left(&self) -> R<Vec<u32>> {
+        let recorded = std::fs::read_to_string(self.groups.path().join("started"))?;
+        let mut groups = std::collections::BTreeSet::new();
+        for line in recorded.lines() {
+            groups.insert(
+                line.parse::<u32>()
+                    .map_err(|e| format!("a recorded group {line:?}: {e}"))?,
+            );
+        }
+        if groups.is_empty() {
+            return Err("no stand-in recorded its group".into());
+        }
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            let left: Vec<u32> = groups
+                .iter()
+                .copied()
+                .filter(|g| !hoh_agents::identity::group_empty(*g))
+                .collect();
+            if left.is_empty() || Instant::now() >= until {
+                return Ok(left);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 }
 
 /// An installed CLI its adapter cannot start is incompatible and blocks (exit 3), for every agent and not only codex
@@ -514,7 +542,7 @@ fn test_006_01_the_five_rows_of_installed_protocol_and_auth() -> R {
                         .is_some_and(|u| u.iter().any(|v| v == "codex"))
                 );
                 assert!(took <= Duration::from_secs(25), "doctor took {took:?}");
-                let left = processes_mentioning(s.bin.path());
+                let left = s.groups_left()?;
                 assert!(
                     left.is_empty(),
                     "the hung status command's group is still there: {left:?}"
@@ -702,9 +730,10 @@ fn slow_and_hung_commands_share_one_limit_and_stay_unknown() -> R {
         "{node}"
     );
     assert_eq!(out.status.code(), Some(0), "{}", report["summary"]);
+    let left = s.groups_left()?;
     assert!(
-        processes_mentioning(s.bin.path()).is_empty(),
-        "a hung command is still there"
+        left.is_empty(),
+        "a hung command's group is still there: {left:?}"
     );
     Ok(())
 }
@@ -1109,9 +1138,10 @@ fn a_hung_git_init_does_not_hold_up_live() -> R {
         live["stored"].is_null(),
         "no attempt for a turn that could not be prepared: {live}"
     );
+    let left = s.groups_left()?;
     assert!(
-        processes_mentioning(s.bin.path()).is_empty(),
-        "a hung git init is still there"
+        left.is_empty(),
+        "a hung git init's group is still there: {left:?}"
     );
     let ran: Vec<String> = report["probes"]
         .as_array()

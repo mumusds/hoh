@@ -28,6 +28,22 @@ const PI_RPC: &str = concat!(
 /// A line of 8 MiB with no LF (AC-027-03).
 const HUGE: usize = 8 << 20;
 
+/// The CANCEL turn: SIGINT and SIGTERM blocked before `claude.d/cancel-ready` is made and taken with sigtimedwait, each
+/// written to `claude.d/signals` with the nanosecond it came; a blocked signal stays pending, so none is lost in a
+/// gap of a shell's own handling (the bash trap this replaces is the stand-in whose SIGINT was not recorded in CI run
+/// 42775489697, cause unproven; ADR-022 decision 10, convention v2). It prints the recorded turn's first frame, exits
+/// 143 on SIGTERM and 0 after 30 s.
+const CANCEL_STAND_IN: &str = "import os, signal, sys, time
+d = sys.argv[1]
+wanted = [signal.SIGINT, signal.SIGTERM]
+signal.pthread_sigmask(signal.SIG_BLOCK, wanted)
+sys.stdout.write(open(sys.argv[2]).readline())
+sys.stdout.flush()
+open(os.path.join(d, \"cancel-ready\"), \"w\").close()
+end = time.monotonic() + 30
+for info in iter(lambda: signal.sigtimedwait(wanted, max(0.0, end - time.monotonic())), None): f = open(os.path.join(d, \"signals\"), \"a\"); f.write((\"INT\" if info.si_signo == signal.SIGINT else \"TERM\") + \" \" + str(time.time_ns()) + chr(10)); f.close(); info.si_signo == signal.SIGTERM and sys.exit(143)
+";
+
 fn probe() -> ProbeCommand {
     ProbeCommand {
         program: env!("CARGO_BIN_EXE_hoh").into(),
@@ -106,7 +122,8 @@ impl World {
 
     /// A fake `claude` 2.1.318: the probe's answers from the recording (`--version` 3 s late while `claude.d/slow`
     /// exists, 120 s with its pid in `claude.d/probe-pid` while `claude.d/hang` does); a turn reads its prompt, then replays the recorded `success` turn (once `hold` exists, if given), or, for
-    /// an attempt whose marker names HUGE, its first frame and then 8 MiB with no LF.
+    /// an attempt whose marker names HUGE, its first frame and then 8 MiB with no LF, or, for one whose marker names
+    /// CANCEL, [`CANCEL_STAND_IN`].
     fn claude(&self, hold: Option<&Path>) -> R {
         let wait = hold.map_or(String::new(), |h| {
             format!("while [ ! -e '{}' ]; do sleep 0.05; done\n", h.display())
@@ -119,9 +136,7 @@ impl World {
                  echo $$ > \"$d/pid.$$\"; printf '%s\\n' \"$@\" > \"$d/argv.$$\"; env > \"$d/env.$$\"; cat > \"$d/stdin.$$\"\n\
                  case \"$HOH_ATTEMPT_ID\" in\n\
                   *HUGE*) head -n 1 \"$f/success/stdout.jsonl\"; head -c {HUGE} /dev/zero | tr '\\0' x; sleep 20; exit 0;;\n\
-                  *CANCEL*) trap 'echo \"INT $(date +%s%N)\" >> \"$d/signals\"' INT\n\
-                   trap 'echo \"TERM $(date +%s%N)\" >> \"$d/signals\"; exit 143' TERM\n\
-                   head -n 1 \"$f/success/stdout.jsonl\"; for i in $(seq 1 600); do sleep 0.05; done; exit 0;;\n\
+                  *CANCEL*) exec python3 -c '{CANCEL_STAND_IN}' \"$d\" \"$f/success/stdout.jsonl\";;\n\
                  esac\n{wait}cat \"$f/success/stdout.jsonl\"\n",
                 bin = self.bin().display()
             ),
@@ -242,8 +257,11 @@ impl World {
         )
     }
 
-    /// Every fake turn process gone: the ones still there are killed (nothing a test started outlives it).
+    /// Every fake turn process gone: the ones still there are killed (nothing a test started outlives it). A number is
+    /// killed only while its command line names this world's fakes (each fake's does, the ones that exec too), so a
+    /// number another process took since is never killed (CIR-056's class).
     fn stop_fakes(&self) -> R {
+        let bin = self.bin().display().to_string();
         for name in ["claude", "codex", "pi"] {
             let d = self.bin().join(format!("{name}.d"));
             let Ok(entries) = std::fs::read_dir(&d) else {
@@ -252,7 +270,8 @@ impl World {
             for entry in entries.flatten() {
                 let file = entry.file_name().to_string_lossy().into_owned();
                 if let Some(pid) = file.strip_prefix("pid.")
-                    && Path::new(&format!("/proc/{pid}")).exists()
+                    && std::fs::read(format!("/proc/{pid}/cmdline"))
+                        .is_ok_and(|c| String::from_utf8_lossy(&c).contains(&bin))
                 {
                     let _ = Command::new("kill").args(["-KILL", pid]).status();
                 }
@@ -708,7 +727,7 @@ async fn test_018_03_each_role_has_its_own_session_and_an_agents_exit_changes_no
             "0"
         );
         // The developer's killed agent process is gone.
-        assert!(!Path::new(&format!("/proc/{pid}")).exists(), "{pid}");
+        assert!(hoh_agents::identity::reaped(pid.parse()?)?, "{pid}");
         ready(&project, &run_id, &[("T-dev2", "developer")])?;
         until(&project, &ended("T-dev2/attempt-1"), "SETTLED/", limit).await?;
         let dev2 = attempt_row(&project, "T-dev2/attempt-1")?;
@@ -1219,27 +1238,37 @@ async fn a_hosts_stop_ends_the_probe_it_has_running() -> R {
     let outcome = async {
         started(&host, "s1").await?;
         let end = Instant::now() + Duration::from_secs(30);
-        while !pid_file.exists() {
+        // Its number and start time while it hangs, so that the end's look and kill are of this process alone and
+        // never of one that took its number since (CIR-056; convention v2).
+        let pid: u32 = loop {
+            if let Ok(pid) = std::fs::read_to_string(&pid_file)
+                .unwrap_or_default()
+                .trim()
+                .parse()
+            {
+                break pid;
+            }
             if Instant::now() > end {
                 return Err("the probe never ran".into());
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        R::Ok(())
+        };
+        let start = hoh_agents::identity::start_id(pid)?
+            .ok_or_else(|| format!("the probe's command {pid} ended before the stop"))?;
+        R::Ok((pid, start))
     }
     .await;
     let stopping = Instant::now();
     host.shutdown().await;
     let took = stopping.elapsed();
-    outcome?;
-    let pid = std::fs::read_to_string(&pid_file)?.trim().to_owned();
-    let alive = Path::new(&format!("/proc/{pid}")).exists()
-        && !std::fs::read_to_string(format!("/proc/{pid}/stat"))
-            .unwrap_or_default()
-            .contains(") Z ");
+    let (pid, start) = outcome?;
+    // Ended by identity::ended: a look that cannot tell fails the test (convention v2; CIR-051).
+    let alive = !hoh_agents::identity::ended(pid, Some(&start))?;
     world.stop_fakes()?;
     if alive {
-        let _ = Command::new("kill").args(["-KILL", &pid]).status();
+        let _ = Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .status();
     }
     assert!(!alive, "the probe's command {pid} outlived the host");
     assert!(took < Duration::from_secs(10), "the stop took {took:?}");
@@ -1307,7 +1336,7 @@ fn a_hosts_stop_kills_the_schema_command_however_late_its_reader_runs() -> R {
         .spawn()?;
     let host_pid = host.id();
     let pids = [d.join("schema-pid"), d.join("schema-member")];
-    let mut started: Vec<(u32, Option<String>)> = Vec::new();
+    let mut started: Vec<(u32, String)> = Vec::new();
     let mut traced = None;
     let outcome = (|| -> R<(i32, std::time::Duration)> {
         let info = world.project().join(".hoh/host.json");
@@ -1362,7 +1391,11 @@ fn a_hosts_stop_kills_the_schema_command_however_late_its_reader_runs() -> R {
                 }
                 std::thread::sleep(Duration::from_millis(20));
             };
-            started.push((pid, hoh_agents::identity::start_id(pid)?));
+            // One gone already (it should hang 120 s) fails the test: without its start time a number taken again
+            // would be read as it and killed (CIR-056).
+            let start = hoh_agents::identity::start_id(pid)?
+                .ok_or_else(|| format!("schema command {pid} ended before the stop"))?;
+            started.push((pid, start));
         }
         let reader = thread_named(host_pid, "hoh-schema").ok_or("no schema reader thread")?;
         let tid = Pid::from_raw(reader);
@@ -1411,10 +1444,10 @@ fn a_hosts_stop_kills_the_schema_command_however_late_its_reader_runs() -> R {
     }
     // Each command's end by identity::ended with its start time: a look that cannot tell is said, never taken for an
     // end, and only a process seen to be the same one is killed.
-    let look = |started: &[(u32, Option<String>)]| {
+    let look = |started: &[(u32, String)]| {
         let (mut alive, mut untold) = (Vec::new(), Vec::new());
         for (pid, start) in started {
-            match hoh_agents::identity::ended(*pid, start.as_deref()) {
+            match hoh_agents::identity::ended(*pid, Some(start)) {
                 Ok(true) => {}
                 Ok(false) => alive.push(*pid),
                 Err(e) => untold.push(format!("{pid}: {e}")),
@@ -1472,6 +1505,15 @@ async fn a_cancelled_run_stops_its_agent_by_its_native_cancel_then_sigterm_after
             Duration::from_secs(30),
         )
         .await?;
+        // The cancel only once the stand-in says it takes signals (its own event; convention v2).
+        let ready = world.bin().join("claude.d/cancel-ready");
+        let end = Instant::now() + Duration::from_secs(30);
+        while !ready.exists() {
+            if Instant::now() > end {
+                return Err("the agent never said it takes signals".into());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         let revision = query(
             &project,
             &format!("SELECT revision FROM runs WHERE run_id = '{run_id}'"),

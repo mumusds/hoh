@@ -1119,12 +1119,21 @@ async fn taken_and_never_settled(hold: bool) -> R {
         batch: 2,
     };
     for round in 1..=3 {
-        tokio::select! {
-            ended = dispatcher.tick() => {
-                return Err(format!("round {round}: the tick ended without hanging on `a`: {ended:?}").into());
+        // The tick is cancelled only once it is known to hang on `a`; the bound only turns a tick stuck before it into
+        // a failure (CIR-005).
+        let hung_on_a = async {
+            tokio::select! {
+                ended = dispatcher.tick() => {
+                    Err(format!("round {round}: the tick ended without hanging on `a`: {ended:?}"))
+                }
+                Some(()) = hung.recv() => Ok(()),
             }
-            Some(()) = hung.recv() => {}
-        }
+        };
+        tokio::time::timeout(Duration::from_secs(60), hung_on_a)
+            .await
+            .map_err(|_| {
+                format!("round {round}: the tick neither ended nor reached `a` within 60 s")
+            })??;
         clock.set(clock.now() + Duration::from_secs(120));
     }
     let held = if hold {
@@ -1558,6 +1567,10 @@ async fn a_row_that_should_hold_a_message_and_does_not_is_recorded_not_skipped()
 async fn a_claim_whose_dispatcher_stopped_waiting_costs_no_delivery() -> R {
     // M2T04R-100: the writer is held up by another connection's lock; each tick is cancelled while it waits for its
     // claim. No delivery reached the transport, so none is counted, and the message is delivered once afterwards.
+    // The lock is let go only after the cancel (a line on the holder's stdin), so a slow runner cannot let the tick
+    // through first. The 150 ms before the cancel are the one guess left (the product has no "waiting for the lock"
+    // event): a tick cancelled before its claim reached the writer does not test that case, so such a run can miss a
+    // defect there but never fails falsely (docs/adr/ADR-022.md decision 10, v2, its scope and exception).
     use std::io::BufRead as _;
     let dir = tempfile::tempdir()?;
     let (store, db) = open(&dir)?;
@@ -1578,17 +1591,24 @@ async fn a_claim_whose_dispatcher_stopped_waiting_costs_no_delivery() -> R {
         let mut holder = Command::new("python3")
             .args([
                 "-c",
-                "import sqlite3,sys,time\nc=sqlite3.connect(sys.argv[1],isolation_level=None,timeout=30)\nc.execute('BEGIN IMMEDIATE')\nprint('locked',flush=True)\ntime.sleep(0.6)\nc.execute('COMMIT')",
+                "import sqlite3,sys\nc=sqlite3.connect(sys.argv[1],isolation_level=None,timeout=30)\nc.execute('BEGIN IMMEDIATE')\nprint('locked',flush=True)\nsys.stdin.readline()\nc.execute('COMMIT')",
             ])
             .arg(&db)
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn()?;
+        let mut release = holder.stdin.take().ok_or("no stdin")?;
         let mut line = String::new();
         std::io::BufReader::new(holder.stdout.take().ok_or("no stdout")?).read_line(&mut line)?;
         assert_eq!(line.trim(), "locked");
         let cancelled = tokio::time::timeout(Duration::from_millis(150), dispatcher.tick()).await;
+        {
+            use std::io::Write as _;
+            writeln!(release, "go")?;
+        }
+        drop(release);
+        assert!(holder.wait()?.success(), "the holder failed");
         assert!(cancelled.is_err(), "the tick was not held up");
-        holder.wait()?;
         // The cancelled claim was returned when its answer could not be handed over; the next claim undoes it in its own
         // transaction (M2T04R-350, -453).
         store.claim_outbox(clock.now(), Vec::new(), 3).await?;

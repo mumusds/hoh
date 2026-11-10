@@ -625,14 +625,18 @@ mod tests {
         std::fs::create_dir(&work)?;
         assert!(wal_self_test(&work, &probe).is_err());
         let pid: u32 = std::fs::read_to_string(&pidfile)?.trim().parse()?;
+        // Reaped only when /proc has no entry for it; any other failed look is an error, never "reaped" (ADR-022
+        // decision 10, convention v2; this crate cannot use hoh_agents::identity::reaped).
+        let reaped = || match std::fs::symlink_metadata(format!("/proc/{pid}")) {
+            Ok(_) => Ok(false),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(e) => Err(e),
+        };
         let until = std::time::Instant::now() + Duration::from_secs(5);
-        while Path::new(&format!("/proc/{pid}")).exists() && std::time::Instant::now() < until {
+        while !reaped()? && std::time::Instant::now() < until {
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(
-            !Path::new(&format!("/proc/{pid}")).exists(),
-            "the probe's child {pid} survived"
-        );
+        assert!(reaped()?, "the probe's child {pid} survived");
         Ok(())
     }
 

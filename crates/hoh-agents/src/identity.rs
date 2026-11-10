@@ -64,9 +64,10 @@ pub fn start_id(pid: u32) -> io::Result<Option<String>> {
 }
 
 /// Whether process `pid` has ended (ADR-022 decision 10, the convention for observing processes in tests, version
-/// 2): its stat gone (ENOENT, or ESRCH while being reaped), its state Z or X, or, when `start` is given, a start time
-/// other than `start` (its number now another process's). A stat read in any other state is a live process. Any
-/// other failed read, or a stat without the fields read, is an error, never "ended" (M2T07R-1151, -1203).
+/// 2): its stat gone (ENOENT, or ESRCH while being reaped), its state X, its state Z with no other thread of its group
+/// running (CIR-002), or, when `start` is given, a start time other than `start` (its number now another process's). A
+/// stat read in any other state is a live process. Any other failed read, or a stat without the fields read, is an
+/// error, never "ended" (M2T07R-1151, -1203).
 pub fn ended(pid: u32, start: Option<&str>) -> io::Result<bool> {
     ended_in(std::path::Path::new("/proc"), pid, start)
 }
@@ -90,12 +91,33 @@ fn ended_in(proc: &std::path::Path, pid: u32, start: Option<&str>) -> io::Result
     // Fields after the parenthesised command name: field 3 (state) on; the start time is field 22.
     let rest = after_command_name(&stat).ok_or_else(unreadable)?;
     let state = rest.split_whitespace().next().ok_or_else(unreadable)?;
-    if state == "Z" || state == "X" {
+    // X: released. Z: the task read has exited; the process has only if no other thread of its group runs on (a main
+    // thread that called pthread_exit leaves a Z leader with live threads; num_threads, field 20, counts them; CIR-002).
+    if state == "X" {
         return Ok(true);
+    }
+    if state == "Z" {
+        let threads: u32 = rest
+            .split_whitespace()
+            .nth(17)
+            .and_then(|n| n.parse().ok())
+            .ok_or_else(unreadable)?;
+        return Ok(threads <= 1);
     }
     match start {
         Some(start) => Ok(rest.split_whitespace().nth(19).ok_or_else(unreadable)? != start),
         None => Ok(false),
+    }
+}
+
+/// Whether process `pid` is reaped: /proc has no entry for it (a zombie still has one). A look that fails for any
+/// other reason than the entry's absence is an error, never "reaped" (ADR-022 decision 10, convention v2; CIR-003). A
+/// number taken again reads as not reaped, which can only fail a test, never pass it.
+pub fn reaped(pid: u32) -> io::Result<bool> {
+    match std::fs::symlink_metadata(format!("/proc/{pid}")) {
+        Ok(_) => Ok(false),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(e) => Err(e),
     }
 }
 
@@ -1222,6 +1244,33 @@ mod tests {
                 "{pid} its number another process's"
             );
         }
+        // A Z leader whose thread group still has another thread (its main thread called pthread_exit) runs on:
+        // only a zombie with no other thread is an ended process (CIR-002). num_threads is field 20.
+        let threads = |pid: &str, state: &str, n: &str| {
+            format!(
+                "{pid} (t) {state} 1 {pid} {pid} 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 {n} 0 500 0 0"
+            )
+        };
+        for (pid, state, n) in [
+            ("20", "Z", "2"),
+            ("21", "Z", "1"),
+            ("22", "Z", "0"),
+            ("23", "X", "0"),
+        ] {
+            std::fs::create_dir(fake.path().join(pid))?;
+            std::fs::write(fake.path().join(pid).join("stat"), threads(pid, state, n))?;
+        }
+        assert!(
+            !ended(20, None)?,
+            "a zombie leader with a thread still running"
+        );
+        assert!(ended(21, None)? && ended(22, None)? && ended(23, None)?);
+        std::fs::create_dir(fake.path().join("24"))?;
+        std::fs::write(fake.path().join("24/stat"), "24 (t) Z 1 24 24 0")?;
+        assert!(
+            ended(24, None).is_err(),
+            "a zombie's stat without its thread count"
+        );
         // A stat that cannot be read for another reason, or read without its fields, is an error.
         std::fs::create_dir_all(fake.path().join("16/stat"))?;
         assert!(ended(16, None).is_err(), "a stat that is a directory");
@@ -1250,6 +1299,26 @@ mod tests {
         }
         child.wait()?;
         assert!(ended(pid, Some(&start))?);
+        Ok(())
+    }
+
+    #[test]
+    fn a_process_is_reaped_only_when_proc_has_no_entry_for_it() -> io::Result<()> {
+        // ADR-022 decision 10, convention v2: alive or a zombie, its entry is there; reaped, it is not. A zombie is
+        // awaited by the child's own state (ended), never by a sleep.
+        let mut child = std::process::Command::new("sleep").arg("60").spawn()?;
+        let pid = child.id();
+        let start = start_id(pid)?.ok_or_else(|| io::Error::other("no start time"))?;
+        assert!(!reaped(pid)?);
+        child.kill()?;
+        let end = Instant::now() + Duration::from_secs(10);
+        while !ended(pid, Some(&start))? {
+            assert!(Instant::now() < end, "never a zombie");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!reaped(pid)?, "a zombie is not reaped");
+        child.wait()?;
+        assert!(reaped(pid)?);
         Ok(())
     }
 

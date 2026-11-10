@@ -393,8 +393,11 @@ async fn the_observer_needs_descent_counts_zombies_and_keeps_its_deadline() -> R
     .await;
     assert!(zombie.is_some(), "never a zombie");
     assert_eq!(left_of(&[(pid, group)])?, [pid]);
-    // The pid itself counts, not only its group (no group has this id: it is above any pid_max).
-    assert_eq!(left_of(&[(pid, 4_000_000_000)])?, [pid]);
+    // The pid itself counts, not only its group: here a group the kernel finds empty (another child's, reaped).
+    let mut other = Command::new("true").process_group(0).spawn()?;
+    let empty_group = other.id();
+    other.wait()?;
+    assert_eq!(left_of(&[(pid, empty_group)])?, [pid]);
     child.wait()?;
     assert!(left_of(&[(pid, group)])?.is_empty());
     // Cleared only if seen clear by the bound; a check that clears later is too late.
