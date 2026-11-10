@@ -131,11 +131,38 @@ fn pi_session_id(session_id: &str) -> String {
     )
 }
 
-/// The text a turn is sent: the role's contract, then the task's header (decision 11).
-fn prompt_text(contract: &str, work: &Work) -> String {
+/// The first input kept for HoH session `session_id` (docs/adr/ADR-024.md decision 4): its notice's package; none
+/// for a session given none (a binding from its run's start). A kept input that cannot be read is an error.
+fn first_input(project: &Path, session_id: &str) -> Result<Option<serde_json::Value>, String> {
+    let path = first_input_path(project, session_id);
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
+            .map_err(|e| format!("{}: {e}", path.display()))
+            .and_then(|kept| {
+                kept.get("package")
+                    .cloned()
+                    .map(Some)
+                    .ok_or_else(|| format!("{}: no package", path.display()))
+            }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+/// The text a turn is sent: the role's contract, then, in a new holder's first turn, its handover package whole
+/// (ADR-024 decision 4), then the task's header (decision 11).
+fn prompt_text(contract: &str, package: Option<&serde_json::Value>, work: &Work) -> String {
     let a = &work.assignment;
+    let package = package
+        .map(|p| {
+            format!(
+                "\n\n---\n# 交接包（本会话的首个输入，ADR-024）\n\n```json\n{}\n```",
+                serde_json::to_string_pretty(p).unwrap_or_else(|_| p.to_string())
+            )
+        })
+        .unwrap_or_default();
     format!(
-        "{contract}\n\n---\n# 本次任务\n\n- Run 目标：{goal}\n- 任务：{task}{title}\n- 职位：{role}\n",
+        "{contract}{package}\n\n---\n# 本次任务\n\n- Run 目标：{goal}\n- 任务：{task}{title}\n- 职位：{role}\n",
         contract = contract.trim_end(),
         goal = a.goal.as_deref().unwrap_or("（未给出）"),
         task = work.task_id,
@@ -275,7 +302,18 @@ impl ProductExecutor {
                 why,
             )
         })?;
-        let text = prompt_text(&contract.text, work);
+        // A new holder's first turn (no native session to resume yet) starts from its handover package (REQ-019 b4).
+        let package = match (&a.native_session, a.session_id.as_deref()) {
+            (None, Some(session)) => first_input(&self.project, session).map_err(|why| {
+                refused(
+                    "FIRST_INPUT_UNAVAILABLE",
+                    FailureClass::Transient { retry_after: None },
+                    why,
+                )
+            })?,
+            _ => None,
+        };
+        let text = prompt_text(&contract.text, package.as_ref(), work);
         let record = PromptRecord {
             layer: contract.layer.to_owned(),
             role: work.role.clone(),

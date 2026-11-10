@@ -301,6 +301,16 @@ async fn working(store: &Store, path: &PathBuf) -> R {
     )
 }
 
+/// Run R1 on spec s1: a binding change hands its role over with a package naming the run's spec, and a run with
+/// none has every change refused NO_SPEC (docs/adr/ADR-024.md decisions 1 and 10).
+fn on_a_spec(path: &PathBuf) -> R {
+    exec(
+        path,
+        "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', 'p1', printf('%064d', 1), 1);
+         UPDATE runs SET spec_id = 's1' WHERE run_id = 'R1';",
+    )
+}
+
 /// A0 ends and T0 with it.
 fn a0_ends(path: &PathBuf) -> R {
     exec(
@@ -447,6 +457,18 @@ async fn a_role_waiting_for_its_checkpoint_is_not_dispatched_and_its_next_attemp
            ('sd2', 'claude', 'developer', '1', '{\"structured_events\": true}');
          UPDATE role_bindings SET session_id = 'sd2' WHERE run_id = 'R1' AND role = 'developer';",
     )?;
+    // The new holder has its first input first (ADR-024 decision 4): its session start delivered to sd2.
+    let start = store
+        .runner_waiting("p1")
+        .await?
+        .session_starts
+        .pop()
+        .ok_or("no session start")?;
+    assert!(
+        store
+            .deliver_session_start(&start.message_id, "sd2")
+            .await?
+    );
     let round = store.schedule_round("R1", context).await?;
     assert!(round.dispatched.is_some(), "{round:?}");
     assert_eq!(
@@ -468,6 +490,7 @@ async fn a_removed_role_is_blocked_at_a_new_epoch_and_one_added_again_does_not_r
     store
         .submit_command(start("R1", Config::default().budget))
         .await?;
+    on_a_spec(&path)?;
     let auditor = || {
         values(
             &path,
@@ -614,6 +637,7 @@ async fn a_role_blocked_for_its_availability_is_not_a_changed_role() -> R {
     store
         .submit_command(start("R1", Config::default().budget))
         .await?;
+    on_a_spec(&path)?;
     exec(
         &path,
         "INSERT INTO sessions(session_id, agent, role, agent_version, capabilities_json) VALUES
@@ -732,6 +756,7 @@ async fn a_change_of_the_prompt_alone_is_a_new_epoch() -> R {
     store
         .submit_command(start("R1", Config::default().budget))
         .await?;
+    on_a_spec(&path)?;
     store
         .submit_command(team_change(
             "prompt",
@@ -758,6 +783,7 @@ async fn a_change_to_an_unavailable_agent_keeps_the_old_binding_until_the_agent_
     store
         .submit_command(start("R1", Config::default().budget))
         .await?;
+    on_a_spec(&path)?;
     store
         .submit_command(team_change(
             "dev",
@@ -912,6 +938,7 @@ async fn a_change_to_an_agent_not_looked_at_yet_waits_without_a_verdict() -> R {
     store
         .submit_command(start("R1", Config::default().budget))
         .await?;
+    on_a_spec(&path)?;
     store
         .submit_command(team_change(
             "dev",
@@ -961,6 +988,7 @@ async fn a_refusal_holds_for_its_revision_only() -> R {
     store
         .submit_command(start("R1", Config::default().budget))
         .await?;
+    on_a_spec(&path)?;
     store
         .submit_command(team_change(
             "dev",
@@ -1648,6 +1676,183 @@ async fn a_change_to_an_agent_missing_its_auth_is_refused_blocked_auth_until_it_
     assert_eq!(
         binding(&path, "commander")?[..3],
         [json!("pi"), Value::Null, json!(2)]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn every_roles_change_to_a_new_holder_hands_the_role_over_with_its_package() -> R {
+    // REQ-019 b2, b4 (docs/adr/ADR-024.md decision 1, M2T17R-03): not only the commander's: the developer's change
+    // from claude to codex applies once A0 ended with, in its transaction, the binding at epoch 2, a handoff.prepared
+    // event and one session.start notice to the developer at epoch 2 whose package is the developer's (its role, epoch
+    // and output contract, the run's goal and spec), which the runner sees as the developer's session start.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    working(&store, &path).await?;
+    store
+        .submit_command(team_change(
+            "dev",
+            0,
+            json!({"developer": {"agent": "codex"}}),
+        ))
+        .await?;
+    a0_ends(&path)?;
+    store
+        .team_checkpoint("R1", crate::persistence::Availability::default())
+        .await?;
+    assert_eq!(
+        binding(&path, "developer")?[..3],
+        [json!("codex"), Value::Null, json!(2)]
+    );
+    let prepared = values(
+        &path,
+        "SELECT seq, json_extract(payload_json, '$.role'), json_extract(payload_json, '$.role_epoch') FROM events \
+         WHERE kind = 'handoff.prepared'",
+    )?;
+    assert_eq!(prepared.len(), 1, "{prepared:?}");
+    assert_eq!(prepared[0][1..], [json!("developer"), json!(2)]);
+    let notices = values(
+        &path,
+        "SELECT event_seq, recipient_role, role_epoch, payload_json FROM outbox \
+         WHERE json_extract(payload_json, '$.kind') = 'session.start'",
+    )?;
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_eq!(
+        notices[0][..3],
+        [prepared[0][0].clone(), json!("developer"), json!(2)]
+    );
+    let payload: Value = serde_json::from_str(notices[0][3].as_str().ok_or("payload")?)?;
+    let package: crate::protocol::ContextHandoff = crate::protocol::decode(&payload["package"])?;
+    assert_eq!(
+        (
+            package.role.as_str(),
+            package.role_epoch,
+            package.output_contract.as_str(),
+            package.goal.as_str(),
+            package.spec_revision
+        ),
+        ("developer", 2, "TaskResult", "g", 1)
+    );
+    let starts = store.runner_waiting("p1").await?.session_starts;
+    assert_eq!(
+        starts
+            .iter()
+            .map(|s| (s.role.as_str(), s.role_epoch, s.agent.as_str()))
+            .collect::<Vec<_>>(),
+        [("developer", 2, "codex")]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_new_holder_is_dispatched_nothing_before_it_has_its_first_input() -> R {
+    // REQ-019 b4 (docs/adr/ADR-024.md decision 4, M2T17R-03): the developer's new holder (codex at epoch 2) has its
+    // session, but its session.start notice is not delivered yet: the round dispatches nothing to it, so no task reaches
+    // it before its package; once the executor took the package, the developer's READY task is dispatched.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    working(&store, &path).await?;
+    let context = crate::decision::Context {
+        required_capabilities: [(
+            "developer".to_owned(),
+            ["structured_events".to_owned()].into(),
+        )]
+        .into(),
+        ..crate::decision::Context::default()
+    };
+    store
+        .submit_command(team_change(
+            "dev",
+            0,
+            json!({"developer": {"agent": "codex"}}),
+        ))
+        .await?;
+    a0_ends(&path)?;
+    store
+        .team_checkpoint("R1", crate::persistence::Availability::default())
+        .await?;
+    store
+        .bind_session(crate::persistence::SessionGrant {
+            run_id: "R1".to_owned(),
+            role: "developer".to_owned(),
+            role_epoch: 2,
+            agent: "codex".to_owned(),
+            agent_version: "1".to_owned(),
+            capabilities: json!({"structured_events": true}),
+        })
+        .await?;
+    store.pace_run("R1", context.clone()).await?;
+    let round = store.schedule_round("R1", context.clone()).await?;
+    assert!(
+        round.dispatched.is_none(),
+        "dispatched before its first input: {round:?}"
+    );
+    let start = store
+        .runner_waiting("p1")
+        .await?
+        .session_starts
+        .pop()
+        .ok_or("no session start")?;
+    let session = start.session_id.clone().ok_or("no session")?;
+    assert!(
+        store
+            .deliver_session_start(&start.message_id, &session)
+            .await?
+    );
+    let round = store.schedule_round("R1", context).await?;
+    assert!(round.dispatched.is_some(), "{round:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_change_of_any_role_in_a_run_without_a_spec_is_refused_until_the_run_has_one() -> R {
+    // docs/adr/ADR-024.md decision 10 for every role (M2T17R-03): with no spec no package can be made, so the
+    // developer's change is refused NO_SPEC as the commander's is, the old binding working on; once the run has a spec
+    // it applies with its package.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    store
+        .submit_command(start("R1", Config::default().budget))
+        .await?;
+    store
+        .submit_command(team_change(
+            "dev",
+            0,
+            json!({"developer": {"agent": "codex"}}),
+        ))
+        .await?;
+    for _ in 0..2 {
+        store
+            .team_checkpoint("R1", crate::persistence::Availability::default())
+            .await?;
+        assert_eq!(
+            binding(&path, "developer")?[..3],
+            [json!("claude"), Value::Null, json!(1)]
+        );
+    }
+    assert_eq!(
+        rows::<String>(
+            &path,
+            "SELECT json_extract(payload_json, '$.role') || '/' || json_extract(payload_json, '$.reason') FROM events \
+             WHERE kind = 'team.binding_refused'"
+        )?,
+        [["developer/NO_SPEC".to_owned()]]
+    );
+    on_a_spec(&path)?;
+    store
+        .team_checkpoint("R1", crate::persistence::Availability::default())
+        .await?;
+    assert_eq!(
+        binding(&path, "developer")?[..3],
+        [json!("codex"), Value::Null, json!(2)]
+    );
+    assert_eq!(
+        rows::<i64>(
+            &path,
+            "SELECT count(*) FROM outbox WHERE json_extract(payload_json, '$.kind') = 'session.start' \
+             AND recipient_role = 'developer' AND role_epoch = 2"
+        )?,
+        [[1]]
     );
     Ok(())
 }

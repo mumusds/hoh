@@ -29,11 +29,57 @@ fn work(prompt: Option<&str>) -> Work {
 #[test]
 fn a_turn_is_sent_its_roles_contract_then_the_tasks_header() {
     // ADR-022 decision 11: the contract, then the run's goal, the task's id and title, and the role.
-    let text = prompt_text("Contract.\n\n", &work(None));
+    let text = prompt_text("Contract.\n\n", None, &work(None));
     assert!(text.starts_with("Contract.\n\n---\n"), "{text}");
     for part in ["Ship it", "T1 Write the parser", "developer"] {
         assert!(text.contains(part), "{part}: {text}");
     }
+    assert!(!text.contains("交接包"), "{text}");
+}
+
+#[test]
+fn a_sessions_first_turn_is_sent_its_handover_package_after_the_contract_and_before_the_task()
+-> Result<(), Box<dyn std::error::Error>> {
+    // REQ-019 b4 (docs/adr/ADR-024.md decision 4, M2T17R-03): a new holder's first turn has its kept package, whole,
+    // between its role's contract and the task's header.
+    let package =
+        serde_json::json!({"handoff_kind": "role_change", "role": "developer", "run_id": "R9"});
+    let text = prompt_text("Contract.\n\n", Some(&package), &work(None));
+    let (contract, package_at, task) = (
+        text.find("Contract.").ok_or("no contract")?,
+        text.find("\"run_id\": \"R9\"").ok_or("no package")?,
+        text.find("# 本次任务").ok_or("no task")?,
+    );
+    assert!(contract < package_at && package_at < task, "{text}");
+    let block = text
+        .split("```json\n")
+        .nth(1)
+        .and_then(|rest| rest.split("\n```").next())
+        .ok_or("no package block")?;
+    assert_eq!(serde_json::from_str::<serde_json::Value>(block)?, package);
+    Ok(())
+}
+
+#[test]
+fn a_kept_first_input_is_read_for_its_session_and_none_is_none()
+-> Result<(), Box<dyn std::error::Error>> {
+    // Decision 4: the package kept for a session is its first turn's; a session given none (bound at its run's start)
+    // has none; a kept input that is no JSON is an error, not taken as none.
+    let dir = tempfile::tempdir()?;
+    assert_eq!(first_input(dir.path(), "R/session/developer/2")?, None);
+    let path = first_input_path(dir.path(), "R/session/developer/2");
+    std::fs::create_dir_all(path.parent().ok_or("no parent")?)?;
+    std::fs::write(
+        &path,
+        br#"{"message_id": "m", "session_id": "R/session/developer/2", "package": {"role": "developer"}}"#,
+    )?;
+    assert_eq!(
+        first_input(dir.path(), "R/session/developer/2")?,
+        Some(serde_json::json!({"role": "developer"}))
+    );
+    std::fs::write(&path, b"{")?;
+    assert!(first_input(dir.path(), "R/session/developer/2").is_err());
+    Ok(())
 }
 
 #[test]
@@ -155,6 +201,7 @@ fn a_first_input_is_kept_once_whole_and_another_is_refused()
     // file is left.
     let project = tempfile::tempdir()?;
     let package = hoh_core::handoff::role_change(&hoh_core::handoff::RoleChange {
+        role: "commander".to_owned(),
         run_id: "R".to_owned(),
         goal: "g".to_owned(),
         role_epoch: 2,
