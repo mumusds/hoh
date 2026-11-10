@@ -1653,6 +1653,65 @@ async fn a_change_to_an_agent_missing_its_auth_is_refused_blocked_auth_until_it_
 }
 
 #[tokio::test]
+async fn a_refused_change_is_recorded_again_when_its_reason_changes_and_only_then() -> R {
+    // M2T17R-51 (REQ-019 failure mode 3): the commander's new agent is first not installed (AGENT_UNAVAILABLE), then
+    // installed and not logged in (BLOCKED_AUTH): each new reason, or a new detail, is a refusal of its own, so the
+    // record says what to do now; the same refusal at a later checkpoint writes nothing.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    working(&store, &path).await?;
+    store
+        .submit_command(team_change("pi", 0, json!({"commander": {"agent": "pi"}})))
+        .await?;
+    let missing = crate::persistence::Availability {
+        unavailable: [("pi".to_owned(), "not found on PATH".to_owned())].into(),
+        ..crate::persistence::Availability::default()
+    };
+    let logged_out = |hint: &str| crate::persistence::Availability {
+        auth_missing: [("pi".to_owned(), hint.to_owned())].into(),
+        ..crate::persistence::Availability::default()
+    };
+    for availability in [
+        missing.clone(),
+        missing,
+        logged_out("run `pi auth login`"),
+        logged_out("run `pi auth login`"),
+        logged_out("run `pi auth login --provider p`"),
+    ] {
+        store.team_checkpoint("R1", availability).await?;
+        assert_eq!(
+            binding(&path, "commander")?[..3],
+            [json!("codex"), Value::Null, json!(1)]
+        );
+    }
+    assert_eq!(
+        rows::<String>(
+            &path,
+            "SELECT json_extract(payload_json, '$.reason') || '/' || json_extract(payload_json, '$.detail') \
+             FROM events WHERE kind = 'team.binding_refused' ORDER BY seq"
+        )?,
+        [
+            ["AGENT_UNAVAILABLE/not found on PATH".to_owned()],
+            ["BLOCKED_AUTH/run `pi auth login`".to_owned()],
+            ["BLOCKED_AUTH/run `pi auth login --provider p`".to_owned()],
+        ],
+        "one refusal per reason or detail seen, in order"
+    );
+    // The team page says why as the last refusal does, not AGENT_UNAVAILABLE whatever the reason.
+    let view = super::view(&Connection::open(&path)?, "R1", "p1")?;
+    let commander = view
+        .members
+        .into_iter()
+        .find(|m| m.role == "commander")
+        .ok_or("no commander")?;
+    assert_eq!(
+        commander.pending.ok_or("not pending")?["refused"],
+        json!("BLOCKED_AUTH")
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_control_notice_to_the_commander_carries_its_epoch_after_a_handover() -> R {
     // ADR-024 decision 6: a run control's notice to the commander (PauseRun's run.control) is addressed to the
     // commander's binding as it is in the command's own transaction, epoch 2 after the handover, whatever epoch the

@@ -410,6 +410,8 @@ const AGENT_UNAVAILABLE: &str = "AGENT_UNAVAILABLE";
 
 /// Why a change to an agent not logged in is refused (`$defs.BlockedReason`).
 const BLOCKED_AUTH: &str = "BLOCKED_AUTH";
+/// What a refusal for a run without a specification says (docs/adr/ADR-024.md decision 10).
+const NO_SPEC_DETAIL: &str = "the run has no specification yet";
 
 /// The event kinds of a checkpoint's verdict on a changed role (decision 8, third version): the change is refused (its
 /// new agent unavailable: the old binding works on), or pending again (the agent is there: the role is held until its
@@ -424,16 +426,32 @@ fn verdicts(
     run_id: &str,
     role: &str,
     revision: i64,
-) -> Result<(i64, bool), PersistError> {
-    conn.query_row(
-        "SELECT count(*), coalesce(max(CASE WHEN kind = ?4 THEN seq END), 0) > \
-         coalesce(max(CASE WHEN kind = ?5 THEN seq END), 0) FROM events \
-         WHERE run_id = ?1 AND kind IN (?4, ?5) AND json_extract(payload_json, '$.role') = ?2 \
-         AND json_extract(payload_json, '$.config_revision') = ?3",
-        params![run_id, role, revision, REFUSED, PENDING_AGAIN],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )
-    .map_err(sqlite_error)
+) -> Result<(i64, Option<(String, String)>), PersistError> {
+    let filter = "run_id = ?1 AND kind IN (?4, ?5) AND json_extract(payload_json, '$.role') = ?2 \
+                  AND json_extract(payload_json, '$.config_revision') = ?3";
+    let written: i64 = conn
+        .query_row(
+            &format!("SELECT count(*) FROM events WHERE {filter}"),
+            params![run_id, role, revision, REFUSED, PENDING_AGAIN],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    // The last verdict, when it is a refusal: its reason and detail (a new one is written when they change).
+    let last: Option<(String, Option<String>, Option<String>)> = conn
+        .query_row(
+            &format!(
+                "SELECT kind, json_extract(payload_json, '$.reason'), json_extract(payload_json, '$.detail') \
+                 FROM events WHERE {filter} ORDER BY seq DESC LIMIT 1"
+            ),
+            params![run_id, role, revision, REFUSED, PENDING_AGAIN],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let refused = last
+        .filter(|(kind, _, _)| kind == REFUSED)
+        .map(|(_, reason, detail)| (reason.unwrap_or_default(), detail.unwrap_or_default()));
+    Ok((written, refused))
 }
 
 /// Whether run `run_id`'s binding of `role` waits for its checkpoint (decision 8): the project's current revision
@@ -460,7 +478,7 @@ pub(super) fn pending(conn: &Connection, run_id: &str, role: &str) -> Result<boo
     if binding.config_revision >= revision || !changes(conn, &project_id, &binding, &wanted)? {
         return Ok(false);
     }
-    Ok(!verdicts(conn, run_id, role, revision)?.1)
+    Ok(verdicts(conn, run_id, role, revision)?.1.is_none())
 }
 
 /// What the host's registry knows of the agents, for a checkpoint (decisions 8 and 10): the agents it found available,
@@ -584,11 +602,16 @@ pub(super) fn checkpoint(
             behind = true;
             continue;
         }
+        // A refusal is written when the change was not refused yet, or for another reason or detail than its last
+        // (M2T17R-51: not installed, then not logged in, says what to do now).
+        let new_refusal = |reason: &str, detail: &str| {
+            refused.as_ref() != Some(&(reason.to_owned(), detail.to_owned()))
+        };
         if let Some(role) = target
             && let Some(why) = availability.unavailable.get(role.agent.as_str())
         {
             behind = true;
-            if !refused {
+            if new_refusal("AGENT_UNAVAILABLE", why) {
                 changed = true;
                 events.push(verdict(
                     REFUSED,
@@ -607,7 +630,7 @@ pub(super) fn checkpoint(
             && let Some(why) = availability.auth_missing.get(role.agent.as_str())
         {
             behind = true;
-            if !refused {
+            if new_refusal(BLOCKED_AUTH, why) {
                 changed = true;
                 events.push(verdict(
                     REFUSED,
@@ -628,7 +651,7 @@ pub(super) fn checkpoint(
                     Some(spec) => Some(spec),
                     None => {
                         behind = true;
-                        if !refused {
+                        if new_refusal(super::handover::NO_SPEC, NO_SPEC_DETAIL) {
                             changed = true;
                             events.push(verdict(
                                 REFUSED,
@@ -636,7 +659,7 @@ pub(super) fn checkpoint(
                                     "run_id": run_id, "role": binding.role, "config_revision": revision,
                                     "agent": target.map(|role| role.agent.as_str()),
                                     "reason": super::handover::NO_SPEC,
-                                    "detail": "the run has no specification yet",
+                                    "detail": NO_SPEC_DETAIL,
                                     "kept": {
                                         "agent": binding.agent, "model": binding.model,
                                         "role_epoch": binding.role_epoch,
@@ -652,7 +675,7 @@ pub(super) fn checkpoint(
         };
         if live.contains(&binding.role) {
             behind = true;
-            if refused {
+            if refused.is_some() {
                 changed = true;
                 events.push(verdict(
                     PENDING_AGAIN,
@@ -1165,7 +1188,8 @@ pub(super) fn view(
                 "agent": wanted.map(|role| role.agent.as_str()),
                 "model": wanted.and_then(|role| role.model.clone()),
                 "config_revision": team_revision,
-                "refused": refused.then_some("AGENT_UNAVAILABLE"),
+                // Why it is refused, as its last refusal said (not always AGENT_UNAVAILABLE: M2T17R-51).
+                "refused": refused.map(|(reason, _)| reason),
             }));
         }
     }
