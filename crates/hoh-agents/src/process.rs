@@ -169,8 +169,9 @@ pub struct ExitReport {
     pub status: Option<Termination>,
     pub cause: Cause,
     pub steps: Vec<Step>,
-    /// Group members other than the leader found when the leader exited; they were killed.
-    pub orphans: usize,
+    /// Group members other than the leader found when the leader exited (they were killed); `None` when the scan of
+    /// /proc failed, which proves nothing (ADR-022 decision 10, convention v2; M2T07R-1150).
+    pub orphans: Option<usize>,
     /// The leader was reaped and no member of its process group was left within the reap grace.
     pub group_reaped: bool,
     pub stdout: StreamReport,
@@ -339,29 +340,6 @@ impl Process {
     pub fn signal_leader(&self, signal: Signal) {
         self.control.signal_leader(signal);
     }
-}
-
-/// The processes in process group `pgid` (zombies included), from `/proc`.
-pub fn group_members(pgid: u32) -> Vec<u32> {
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return Vec::new();
-    };
-    entries
-        .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u32>().ok())
-        .filter(|pid| {
-            // Fields after the parenthesised command name: state, ppid, pgrp.
-            std::fs::read(format!("/proc/{pid}/stat"))
-                .ok()
-                .and_then(|stat| {
-                    crate::identity::after_command_name(&stat)?
-                        .split_whitespace()
-                        .nth(2)?
-                        .parse::<u32>()
-                        .ok()
-                })
-                == Some(pgid)
-        })
-        .collect()
 }
 
 /// The group leader, reaped only through its pidfd.
@@ -553,11 +531,13 @@ async fn supervise(mut s: Supervisor) {
     };
 
     let pid = s.leader.pid.as_raw_pid() as u32;
-    let mut orphans = 0;
+    let mut orphans = None;
     let mut group_reaped = false;
     if status.is_some() {
         // The leader is an unreaped zombie, so its group id still names only its own group.
-        orphans = group_members(pid).into_iter().filter(|&p| p != pid).count();
+        orphans = crate::identity::group_left(pid, pid)
+            .ok()
+            .map(|left| left.len());
         s.leader.signal(Target::Group, Signal::Kill);
         if s.leader.reap().is_ok() {
             group_reaped = group_gone(s.leader.pid, s.config.reap_grace).await;

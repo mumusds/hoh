@@ -723,7 +723,7 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
                                             "next_attempt": true}),
                     }],
                     degraded: Some(reason),
-                    ..Facts::gate_closed(raw_log_path, report.as_ref())
+                    ..Facts::gate_closed(raw_log_path, report.as_deref())
                 },
                 Err(_) => Facts::incomplete(raw_log_path, Vec::new()),
             };

@@ -21,10 +21,9 @@ use hoh_agents::clock::SystemClock;
 use hoh_agents::compat::Agent;
 use hoh_agents::pi::{self, Launch, Outcome, Turn};
 use hoh_agents::probe::{self, ProbeEnv};
-use hoh_agents::process::group_members;
 use hoh_core::lifecycle::AttemptState;
 use hoh_core::persistence::CancelLatch;
-use live::{TOKEN, clear_by, hex, left_of, processes_in, stat_of, tool_sleeps, write_verdict};
+use live::{TOKEN, clear_by, hex, left_after, stat_of, tool_sleeps, write_verdict};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::process::Command;
@@ -237,7 +236,7 @@ async fn pi_live_turns_resume_and_cancel() -> R {
         let alive: Vec<u32> = tools
             .iter()
             .map(|(pid, _)| *pid)
-            .filter(|pid| stat_of(*pid).is_some_and(|(state, _, _)| state != 'Z'))
+            .filter(|pid| matches!(stat_of(*pid), Ok(Some((state, _, _))) if state != 'Z' && state != 'X'))
             .collect();
         let at = Instant::now();
         let receipt = cancel.request();
@@ -247,12 +246,11 @@ async fn pi_live_turns_resume_and_cancel() -> R {
     let third = third?;
     let took = at.elapsed();
     let leader = third.pid.unwrap_or_default();
-    let mut left = Vec::new();
+    // A look that fails is said, and never taken for cleared (ADR-022 decision 10, convention v2; M2T07R-1150).
+    let mut left: Result<Vec<u32>, String> = Ok(Vec::new());
     let cleared = clear_by(at, Duration::from_secs(16), || {
-        left = group_members(leader);
-        left.extend(left_of(&tools));
-        left.extend(processes_in(&repo));
-        left.is_empty()
+        left = left_after(leader, &tools, &repo).map_err(|e| e.to_string());
+        left.as_ref().is_ok_and(Vec::is_empty)
     })
     .await;
     if alive.is_empty() {
@@ -293,7 +291,7 @@ async fn pi_live_turns_resume_and_cancel() -> R {
                   "args": second.args},
         "turn3": {"pi_pid": third.pid, "tool_processes": tools.iter().map(|(p, g)| json!({"pid": p, "pgid": g})).collect::<Vec<_>>(),
                   "alive_at_cancel": alive, "cancel_receipt": format!("{receipt:?}"), "cancel_to_end_ms": took.as_millis(),
-                  "cleared_after_ms": cleared.map(|d| d.as_millis()), "left": left},
+                  "cleared_after_ms": cleared.map(|d| d.as_millis()), "left": left.as_ref().map_or_else(|e| json!({"cannot_tell": e}), |l| json!(l))},
     });
     if problems.is_empty() {
         write_verdict(

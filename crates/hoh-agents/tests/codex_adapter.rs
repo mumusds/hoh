@@ -11,7 +11,8 @@ mod common;
 use common::{R, World, probed};
 use hoh_agents::adapter::AttemptRef;
 use hoh_agents::codex::{self, Launch, Mode, Outcome, Steer, SteerReceipt, Turn};
-use hoh_agents::process::{Escalation, group_members};
+use hoh_agents::identity::group_empty;
+use hoh_agents::process::Escalation;
 use hoh_core::lifecycle::{AttemptState, InputState};
 use hoh_core::persistence::{CancelLatch, CancelReceipt, NewInput};
 use serde_json::{Value, json};
@@ -373,7 +374,7 @@ async fn test_024_01_a_recorded_turn_settles_in_handshake_order_with_one_unknown
     let unknowns = events(&world, "adapter.unknown_event")?;
     assert_eq!(unknowns.len(), 1);
     assert_eq!(unknowns[0]["frame"], unknown);
-    assert!(group_members(outcome.pid.ok_or("no pid")?).is_empty());
+    assert!(group_empty(outcome.pid.ok_or("no pid")?));
     Ok(())
 }
 
@@ -410,7 +411,7 @@ async fn test_024_02_interrupt_unauthorized_eof_and_resume() -> R {
     );
     sent_only_its_interface(&fake, &turn.launch)?;
     assert_eq!(a.status.as_deref(), Some("interrupted"));
-    assert!(group_members(a.pid.ok_or("no pid")?).is_empty());
+    assert!(group_empty(a.pid.ok_or("no pid")?));
     let row = world.store.reader()?.attempt("A1")?.ok_or("no A1")?;
     assert_eq!(
         (row.state, row.cancel_requested),
@@ -450,7 +451,7 @@ async fn test_024_02_interrupt_unauthorized_eof_and_resume() -> R {
     assert_eq!(failed.len(), 1);
     assert_eq!(failed[0]["blocked_reason"], "BLOCKED_AUTH");
     assert_eq!(failed[0]["retry"], "none");
-    assert!(group_members(b.pid.ok_or("no pid")?).is_empty());
+    assert!(group_empty(b.pid.ok_or("no pid")?));
 
     // (c) The stream ends mid-turn: never SETTLED.
     let mut case = Case::load("app-server-turn")?;
@@ -465,7 +466,7 @@ async fn test_024_02_interrupt_unauthorized_eof_and_resume() -> R {
         c.state,
         c.failure
     );
-    assert!(group_members(c.pid.ok_or("no pid")?).is_empty());
+    assert!(group_empty(c.pid.ok_or("no pid")?));
 
     // resume: a new process for (a)'s session sends thread/resume with (a)'s thread, not thread/start.
     let mut case = Case::load("app-server-resume")?;
@@ -781,7 +782,7 @@ async fn an_unanswered_interrupt_escalates_to_the_group_after_the_native_grace()
         took <= turn.escalation.native_grace + turn.escalation.term_grace + Duration::from_secs(3),
         "{took:?}"
     );
-    assert!(group_members(outcome.pid.ok_or("no pid")?).is_empty());
+    assert!(group_empty(outcome.pid.ok_or("no pid")?));
     Ok(())
 }
 
@@ -2029,7 +2030,7 @@ async fn a_frame_too_large_fails_the_turn_with_its_diagnosis() -> R {
     assert_eq!(diagnosis["prefix_sha256"].as_str().map(str::len), Some(64));
     assert_eq!(diagnosis["head"].as_str().map(str::len), Some(4 << 10));
     assert!(
-        group_members(outcome.pid.ok_or("no pid")?).is_empty(),
+        group_empty(outcome.pid.ok_or("no pid")?),
         "codex's group is stopped"
     );
 

@@ -22,11 +22,10 @@ use common::{R, World};
 use hoh_agents::claude::{self, Launch, Outcome, Turn};
 use hoh_agents::compat::Agent;
 use hoh_agents::probe::{self, ProbeEnv};
-use hoh_agents::process::group_members;
 use hoh_core::lifecycle::AttemptState;
 use hoh_core::persistence::CancelLatch;
 use live::{
-    TOKEN, clear_by, descends_from, hex, left_of, processes_in, stat_of, tool_sleeps, write_verdict,
+    TOKEN, clear_by, descends_from, hex, left_after, left_of, stat_of, tool_sleeps, write_verdict,
 };
 use serde_json::json;
 use std::path::PathBuf;
@@ -257,7 +256,7 @@ async fn claude_live_turns_resume_and_cancel() -> R {
         let alive: Vec<u32> = tools
             .iter()
             .map(|(pid, _)| *pid)
-            .filter(|pid| stat_of(*pid).is_some_and(|(state, _, _)| state != 'Z'))
+            .filter(|pid| matches!(stat_of(*pid), Ok(Some((state, _, _))) if state != 'Z' && state != 'X'))
             .collect();
         let at = Instant::now();
         let receipt = cancel.request();
@@ -269,12 +268,11 @@ async fn claude_live_turns_resume_and_cancel() -> R {
     let claude_pid = third.pid.unwrap_or_default();
     // Everything is gone within 16 s of the cancel: claude's group, the tool's process and group (zombies included),
     // and any process working in the repository.
-    let mut left = Vec::new();
+    // A look that fails is said, and never taken for cleared (ADR-022 decision 10, convention v2; M2T07R-1150).
+    let mut left: Result<Vec<u32>, String> = Ok(Vec::new());
     let cleared = clear_by(at, Duration::from_secs(16), || {
-        left = group_members(claude_pid);
-        left.extend(left_of(&tools));
-        left.extend(processes_in(&repo));
-        left.is_empty()
+        left = left_after(claude_pid, &tools, &repo).map_err(|e| e.to_string());
+        left.as_ref().is_ok_and(Vec::is_empty)
     })
     .await;
     let observations = json!({
@@ -285,7 +283,7 @@ async fn claude_live_turns_resume_and_cancel() -> R {
             "cancel_receipt": format!("{receipt:?}"),
             "cancel_to_end_ms": took.as_millis(),
             "cleared_after_ms": cleared.map(|d| d.as_millis()),
-            "left": left,
+            "left": left.as_ref().map_or_else(|e| json!({"cannot_tell": e}), |l| json!(l)),
         }
     });
     if alive.is_empty() {
@@ -382,7 +380,7 @@ async fn the_observer_needs_descent_counts_zombies_and_keeps_its_deadline() -> R
     let pid = child.id();
     assert!(descends_from(pid, me));
     assert!(!descends_from(1, me));
-    let group = stat_of(pid).ok_or("no stat")?.2;
+    let group = stat_of(pid)?.ok_or("no stat")?.2;
     assert_eq!(group, pid);
     // Killed but not reaped, it is a zombie: still left.
     rustix::process::kill_process(
@@ -390,15 +388,15 @@ async fn the_observer_needs_descent_counts_zombies_and_keeps_its_deadline() -> R
         rustix::process::Signal::KILL,
     )?;
     let zombie = clear_by(Instant::now(), Duration::from_secs(5), || {
-        stat_of(pid).is_some_and(|(state, _, _)| state == 'Z')
+        matches!(stat_of(pid), Ok(Some(('Z', _, _))))
     })
     .await;
     assert!(zombie.is_some(), "never a zombie");
-    assert_eq!(left_of(&[(pid, group)]), [pid]);
+    assert_eq!(left_of(&[(pid, group)])?, [pid]);
     // The pid itself counts, not only its group (no group has this id: it is above any pid_max).
-    assert_eq!(left_of(&[(pid, 4_000_000_000)]), [pid]);
+    assert_eq!(left_of(&[(pid, 4_000_000_000)])?, [pid]);
     child.wait()?;
-    assert!(left_of(&[(pid, group)]).is_empty());
+    assert!(left_of(&[(pid, group)])?.is_empty());
     // Cleared only if seen clear by the bound; a check that clears later is too late.
     let at = Instant::now();
     assert_eq!(
