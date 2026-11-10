@@ -6,7 +6,7 @@ use hoh_core::config::Config;
 use hoh_core::decision::{Context, Proposal};
 use hoh_core::persistence::selftest::{self, ProbeCommand};
 use hoh_core::persistence::{
-    Availability, Decided, NewEvent, Options, RunTarget, Store, SubmitCommand, TeamChange,
+    Availability, Decided, Fenced, NewEvent, Options, RunTarget, Store, SubmitCommand, TeamChange,
 };
 use hoh_core::protocol::Message;
 use serde_json::{Value, json};
@@ -311,6 +311,76 @@ async fn test_019_03_the_new_commanders_dispatches_of_running_or_accepted_tasks_
     assert_eq!(
         one(&path, "SELECT state FROM tasks WHERE task_id = 'T2'")?,
         "ACCEPTED"
+    );
+    Ok(())
+}
+
+/// A message of the Commander at `epoch` to `recipient`, of `kind` (not a decision).
+fn commander_message(id: &str, epoch: u64, recipient: &str, kind: &str) -> R<Message> {
+    Ok(serde_json::from_value(json!({
+        "schema_version": "1.0", "message_id": id, "run_id": "R", "task_id": "T", "attempt_id": "A",
+        "sender_role": "commander", "recipient_role": recipient, "role_epoch": epoch, "correlation_id": "c",
+        "causation_id": null, "idempotency_key": format!("k-{id}"), "expected_revision": 5,
+        "spec_sha256": format!("{:064}", 1), "candidate_id": null, "kind": kind,
+        "payload": {"text": "stop and rebase"}
+    }))?)
+}
+
+#[tokio::test]
+async fn an_old_commanders_steer_is_rejected_by_its_own_epoch_and_changes_nothing() -> R {
+    // REQ-019 behaviour 3 (docs/adr/ADR-024.md decision 6): a Commander's steer or message passes the sender's fence
+    // when it enters, as a decision does in decide: after the handover the old Codex's steer to the developer (epoch
+    // 1) is only history, a decisions row REJECTED STALE_ROLE_EPOCH with its decision.rejected event; no task or run
+    // changes, no outbox row. The new Commander's (epoch 2) passes the fence with nothing written.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    world(&store, &path).await?;
+    hand_over(&store, &path).await?;
+    let before = |path: &Path| -> R<String> {
+        one(
+            path,
+            "SELECT (SELECT count(*) FROM outbox) || '/' || (SELECT group_concat(task_id || revision) FROM tasks) \
+             || '/' || (SELECT revision FROM runs WHERE run_id = 'R')",
+        )
+    };
+    let unchanged = before(&path)?;
+    let old = commander_message("old-steer", 1, "developer", "steer")?;
+    match store.commander_message(&old).await? {
+        Fenced::Rejected { reason, .. } => {
+            assert_eq!(serde_json::to_value(reason)?, json!("STALE_ROLE_EPOCH"));
+        }
+        Fenced::Current => return Err("the old Commander's steer passed".into()),
+    }
+    assert_eq!(
+        one(
+            &path,
+            "SELECT state || '/' || reason_code || '/' || role_epoch FROM decisions WHERE decision_id = 'old-steer'"
+        )?,
+        "REJECTED/STALE_ROLE_EPOCH/1"
+    );
+    assert_eq!(
+        one(
+            &path,
+            "SELECT count(*) FROM events WHERE kind = 'decision.rejected' \
+             AND json_extract(payload_json, '$.decision_id') = 'old-steer'"
+        )?,
+        "1"
+    );
+    assert_eq!(before(&path)?, unchanged);
+    let decisions = one(&path, "SELECT count(*) FROM decisions")?;
+    let new = commander_message("new-steer", 2, "developer", "steer")?;
+    assert!(matches!(
+        store.commander_message(&new).await?,
+        Fenced::Current
+    ));
+    assert_eq!(one(&path, "SELECT count(*) FROM decisions")?, decisions);
+    assert_eq!(before(&path)?, unchanged);
+    // Only the Commander's own messages pass this fence; a decision goes through decide.
+    assert!(
+        store
+            .commander_message(&commander_message("not-mine", 2, "developer", "decision")?)
+            .await
+            .is_err()
     );
     Ok(())
 }

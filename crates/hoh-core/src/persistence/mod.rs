@@ -50,7 +50,7 @@ pub use attempts::{
 pub use commands::{
     CommandOutcome, EventRow, HostStart, RunRow, RunTarget, RunsPage, SubmitCommand,
 };
-pub use decide::Decided;
+pub use decide::{Decided, Fenced};
 pub use inputs::{InputMove, InputRow, NewInput};
 pub use writer::{Change, Claimed, Commit, Committed, Entity, NewEvent, NewOutbox, StateCas};
 
@@ -1010,6 +1010,16 @@ impl Store {
             return Err(PersistError::Unsupported(proposal.kind()));
         }
         self.writer.decide(proposal, context).await
+    }
+
+    /// Pass a Commander's steer, query or other message (not a decision) through its sender's fence when it enters
+    /// (docs/adr/ADR-024.md decision 6): one of an epoch the commander's binding has passed is only history, a decision
+    /// REJECTED STALE_ROLE_EPOCH; one of the current epoch passes with nothing written.
+    pub async fn commander_message(
+        &self,
+        message: &crate::protocol::Message,
+    ) -> Result<Fenced, PersistError> {
+        self.writer.fence(message.clone()).await
     }
 
     /// Validate a plan (`$defs.PlanProposal`) for `run_id` and import it whole, or refuse it with nothing written
