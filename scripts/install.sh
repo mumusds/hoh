@@ -142,22 +142,50 @@ take_lock() {
   lock_said="$(flock -E 75 "$@" 2>&1)" || lock_rc=$?
 }
 
-# Whether `$1` is there, links followed: 0 there, 1 not there (a link to nothing included: it was seen), 2 cannot
-# tell. A test that answers "no" also when it cannot look (a directory on the way that cannot be searched) is not
-# taken for "not there": a path is not there only when the nearest ancestor that is there can be searched, or is no
-# directory (design correction 12; M2T14R-902, -903).
+# Whether `$1` is there, links followed: 0 there, 1 not there, 2 cannot tell. "Not there" is said only from a sight
+# (design corrections 12 and 13; M2T14R-902, -903, -1000, -1050): a name a searchable directory does not hold,
+# something on the way that is no directory, or more links than the kernel follows (40: none, systemd included, can
+# reach through them). Bash's tests answer "no" also when they cannot look, so a link they cannot follow is followed
+# here, one at a time: its target read and asked the same (a link to nothing is not there, it was seen). `$2` is the
+# number of links followed so far.
 there() {
-  local up=$1
-  [[ ! -e "$up" ]] || return 0
-  [[ ! -L "$up" ]] || return 1
+  local path=$1 hops=${2:-0} target dir
+  [[ ! -e "$path" ]] || return 0
+  [[ -L "$path" ]] || {
+    way "$path" "$hops"
+    return
+  }
+  ((hops < 40)) || return 1
+  target="$(readlink -- "$path" && printf x)" || return 2
+  target="${target%$'\n'x}"
+  if [[ "$target" != /* ]]; then
+    dir=.
+    [[ "$path" != */* ]] || dir="${path%/*}"
+    target="${dir:-/}/$target"
+  fi
+  there "$target" $((hops + 1))
+}
+
+# For `$1`, seen neither as there nor as a link: 1 when the nearest part of its way that is there is a searchable
+# directory or no directory, 2 when it is a directory that cannot be searched. A link on the way that cannot be followed
+# is followed by `there`: what it reaches decides (`$2` links followed so far).
+way() {
+  local up=$1 hops=$2 rc
   while [[ "$up" == */?* ]]; do
     up="${up%/*}"
     [[ -n "$up" ]] || up=/
-    if [[ -e "$up" || -L "$up" ]]; then
+    if [[ -e "$up" ]]; then
       if [[ -d "$up" && ! -x "$up" ]]; then
         return 2
       fi
       return 1
+    fi
+    if [[ -L "$up" ]]; then
+      rc=0
+      there "$up" "$hops" || rc=$?
+      # There now, when it was not a moment ago: what is under it cannot be told from this look.
+      ((rc != 0)) || return 2
+      return "$rc"
     fi
   done
   return 1
@@ -227,7 +255,7 @@ link_state() {
   local target rc=0
   there "$bin_link" || rc=$?
   if ((rc == 2)); then
-    say "cannot tell whether $bin_link is there: a directory on its way cannot be searched"
+    say "cannot tell whether $bin_link is there: a directory on its way, or on the way of what it links to, cannot be searched"
     return 2
   fi
   # Not there, or there as no link, is not this installation's; a link, even to nothing, is read.
@@ -339,10 +367,12 @@ install() {
 }
 
 # The names of the links that enable an instance on disk, in the user's unit configuration and, for this boot, its
-# runtime directory: the entries named hoh-host@<…>.service in each directory one level down (.wants, .requires, or
-# another an [Install] setting makes), which is where systemd reads them, directories that are links followed and no
-# link's target looked at (design corrections 10 to 12; M2T14R-700, -802, -803, -950). Into `enabling`; 1 when a
-# directory there cannot be read or searched (said): what cannot be listed may enable an instance (M2T14R-801).
+# runtime directory: the entries named hoh-host@<…>.service in each .wants, .requires or .upholds directory one level
+# down, the only ones WantedBy=, RequiredBy= and UpheldBy= make links in (systemd.unit(5)), names that begin with a dot
+# included (a unit's may); another unit's .d drop-ins hold none (M2T14R-1001). Directories that are links are followed,
+# no link's target in them looked at (design corrections 10 to 13; M2T14R-700, -802, -803, -950). Into `enabling`; 1
+# when a directory there cannot be read or searched, or whether one is a directory cannot be told (said): what cannot
+# be listed may enable an instance (M2T14R-801, -1000).
 enabling_links() {
   local dir sub link rc
   enabling=()
@@ -358,8 +388,18 @@ enabling_links() {
       say "cannot list $dir, where a link may enable an instance"
       return 1
     fi
-    for sub in "$dir"/*; do
-      [[ -d "$sub" ]] || continue
+    for sub in "$dir"/{,.}*.{wants,requires,upholds}; do
+      # A pattern that matched nothing stays as it is, and is no entry.
+      [[ -e "$sub" || -L "$sub" ]] || continue
+      if ! [[ -d "$sub" ]]; then
+        rc=0
+        there "$sub" || rc=$?
+        if ((rc == 2)); then
+          say "cannot tell whether $sub is a directory, where a link may enable an instance"
+          return 1
+        fi
+        continue
+      fi
       if ! [[ -r "$sub" && -x "$sub" ]]; then
         say "cannot list $sub, where a link may enable an instance"
         return 1
@@ -424,7 +464,7 @@ enablement_of() {
 # enabled again after the first pass. With no manager to ask or disable with, an instance a link enables refuses the
 # uninstall (M2T14R-151, -700), and so does a directory that cannot be listed.
 settle_instances() {
-  local pass=$1 unit active enabled state left=0 untold=0
+  local pass=$1 unit active enabled state stopped disabled left=0 untold=0
   if ! manager; then
     enabling_links || return 2
     for unit in "${enabling[@]}"; do
@@ -440,20 +480,30 @@ settle_instances() {
       enablement_of "$unit" || state=$?
       ((state != 1)) || continue
     fi
-    active="" enabled="" state=2
+    active="" enabled="" state=2 disabled=0
     if systemctl --user disable --now --quiet "$unit"; then
+      disabled=1
       active="$(systemctl --user show -p ActiveState --value "$unit" 2>/dev/null)" || active=""
       state=0
       enablement_of "$unit" || state=$?
     fi
-    if [[ "$active" == inactive || "$active" == failed ]] && ((state == 1)); then
+    # Stopped, three ways: 0 inactive or failed, 1 a state that runs, 2 no answer (design correction 13, M2T14R-1051).
+    case "$active" in
+      inactive | failed) stopped=0 ;;
+      "") stopped=2 ;;
+      *) stopped=1 ;;
+    esac
+    if ((disabled && stopped == 0 && state == 1)); then
       if [[ "$pass" == first ]]; then
         printf 'stopped and disabled %s\n' "$unit"
       else
         printf 'disabled %s: it was enabled again while the uninstall ran\n' "$unit"
       fi
-    elif [[ "$active" == inactive || "$active" == failed ]] && ((state == 2)); then
+    elif ((disabled && stopped == 0 && state == 2)); then
       say "cannot tell whether $unit is still enabled after its disable (is-enabled ${enabled:-no answer})"
+      untold=1
+    elif ((disabled && stopped == 2 && state != 0)); then
+      say "cannot tell whether $unit stopped after its disable (ActiveState: no answer, is-enabled ${enabled:-no answer})"
       untold=1
     else
       say "could not stop and disable $unit (ActiveState=${active:-unknown}, is-enabled ${enabled:-no answer})"
@@ -531,11 +581,16 @@ remove() {
   # one between its exec and its lock.
   # Nothing is removed while a process still runs this installation's binaries: a host its unit did not run, an
   # agent's start gate, an instance that did not stop (M2T14R-03); the scan names them.
-  local real proc exe running=0
-  # The root as /proc names the programs' paths; one that cannot be resolved cannot be scanned for (M2T14R-951). A
-  # program's path that cannot be read below is a process that ended, or another user's, which the scan cannot see
-  # (that one, once it holds the run lock, refuses the uninstall above).
-  if ! real="$(readlink -f -- "$root")"; then
+  local real proc exe running=0 root_there=0
+  # The root as /proc names the programs' paths; one that is there and cannot be resolved cannot be scanned for
+  # (M2T14R-951). A root that is not there (a link to nothing) has nothing to resolve: a program run from it before it
+  # went still shows its own path, looked for as it is, and nothing under it is removed (design correction 13,
+  # M2T14R-1052). A program's path that cannot be read below is a process that ended, or another user's, which the
+  # scan cannot see (that one, once it holds the run lock, refuses the uninstall above).
+  there "$root" || root_there=$?
+  if ((root_there == 1)); then
+    real="$root"
+  elif ! real="$(readlink -f -- "$root")"; then
     say "cannot resolve $root to look for programs that run from it"
     unsure=1
     real="$root"
@@ -562,9 +617,8 @@ remove() {
   # The closing word follows the cause: something runs or stays enabled, something could not be told (design correction
   # 11), or only the lock was not had (M2T14R-652).
   # What is removed is told before anything is (design correction 12): a template or root that cannot be told refuses.
-  local template_there=0 root_there=0
+  local template_there=0
   there "$template" || template_there=$?
-  there "$root" || root_there=$?
   if ((template_there == 2 || root_there == 2)); then
     say "cannot tell whether $template or $root is there"
     unsure=1
