@@ -1805,6 +1805,92 @@ async fn a_new_holder_is_dispatched_nothing_before_it_has_its_first_input() -> R
 }
 
 #[tokio::test]
+async fn a_first_input_the_executor_did_not_take_is_recorded_once_and_shown_pending() -> R {
+    // M2T17R-150 (docs/adr/ADR-024.md decision 4): while the new developer's first input is not delivered, the team page
+    // shows the role waiting for it; the executor's failure to take it is recorded once, as handoff.undelivered with
+    // what it said, however many ticks it fails; once delivered, nothing is pending and nothing more is recorded.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    working(&store, &path).await?;
+    store
+        .submit_command(team_change(
+            "dev",
+            0,
+            json!({"developer": {"agent": "codex"}}),
+        ))
+        .await?;
+    a0_ends(&path)?;
+    store
+        .team_checkpoint("R1", crate::persistence::Availability::default())
+        .await?;
+    let shown = |path: &PathBuf| -> R<bool> {
+        let view = super::view(&Connection::open(path)?, "R1", "p1")?;
+        Ok(view
+            .members
+            .iter()
+            .find(|m| m.role == "developer")
+            .ok_or("no developer")?
+            .first_input_pending)
+    };
+    assert!(shown(&path)?, "waiting for its first input");
+    let start = store
+        .runner_waiting("p1")
+        .await?
+        .session_starts
+        .pop()
+        .ok_or("no session start")?;
+    assert!(
+        store
+            .session_start_undelivered(&start.message_id, "no hard links here")
+            .await?
+    );
+    assert!(
+        !store
+            .session_start_undelivered(&start.message_id, "still none")
+            .await?,
+        "once"
+    );
+    assert_eq!(
+        rows::<String>(
+            &path,
+            "SELECT json_extract(payload_json, '$.role') || '/' || json_extract(payload_json, '$.detail') FROM events \
+             WHERE kind = 'handoff.undelivered'"
+        )?,
+        [["developer/no hard links here".to_owned()]]
+    );
+    store
+        .bind_session(crate::persistence::SessionGrant {
+            run_id: "R1".to_owned(),
+            role: "developer".to_owned(),
+            role_epoch: 2,
+            agent: "codex".to_owned(),
+            agent_version: "1".to_owned(),
+            capabilities: json!({}),
+        })
+        .await?;
+    let session = store
+        .runner_waiting("p1")
+        .await?
+        .session_starts
+        .pop()
+        .and_then(|s| s.session_id)
+        .ok_or("no session")?;
+    assert!(
+        store
+            .deliver_session_start(&start.message_id, &session)
+            .await?
+    );
+    assert!(!shown(&path)?, "delivered");
+    assert!(
+        !store
+            .session_start_undelivered(&start.message_id, "late")
+            .await?,
+        "settled: nothing to record"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_change_of_any_role_in_a_run_without_a_spec_is_refused_until_the_run_has_one() -> R {
     // docs/adr/ADR-024.md decision 10 for every role (M2T17R-03): with no spec no package can be made, so the
     // developer's change is refused NO_SPEC as the commander's is, the old binding working on; once the run has a spec

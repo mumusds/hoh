@@ -448,7 +448,7 @@ async fn tick(
     let session_starts = if waiting.team_behind.is_empty() && waiting.unbound.is_empty() {
         waiting.session_starts.clone()
     } else {
-        store.runner_waiting(&project_id).await?.session_starts
+        store.session_starts(&project_id).await?
     };
     for start in &session_starts {
         if start.current_epoch > start.role_epoch {
@@ -470,6 +470,10 @@ async fn tick(
             Ok(Err(_)) => "the executor dropped the request".to_owned(),
             Err(_) => format!("no answer within {OPEN_SESSION:?}"),
         };
+        // Seen in the run's events, once, not only on stderr: the role waits for its first input (M2T17R-150).
+        store
+            .session_start_undelivered(&start.message_id, &failure)
+            .await?;
         if common
             .undelivered
             .lock()

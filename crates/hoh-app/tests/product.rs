@@ -1788,3 +1788,120 @@ async fn a_new_developers_first_turn_starts_from_its_handover_package() -> R {
     world.stop_fakes()?;
     outcome
 }
+
+#[tokio::test]
+async fn a_new_holders_first_turn_without_its_kept_input_fails_first_input_unavailable() -> R {
+    // docs/adr/ADR-024.md decision 4 (M2T17R-151, -152): the developer's session got its first input, then the kept
+    // file is gone; its first turn is not started without its package: the attempt fails FIRST_INPUT_UNAVAILABLE and
+    // the agent is sent nothing.
+    let world = World::new()?;
+    world.claude(None)?;
+    world.codex("m-test")?;
+    world.pi()?;
+    let host = start_when_free(world.config()).await?;
+    let project = world.project();
+    let outcome = async {
+        let run_id = started(&host, "s1").await?;
+        let limit = Duration::from_secs(60);
+        ready(&project, &run_id, &[])?;
+        let developer = format!(
+            "SELECT agent || '/' || role_epoch || '/' || coalesce(session_id, '-') FROM role_bindings \
+             WHERE run_id = '{run_id}' AND role = 'developer'"
+        );
+        until(&project, &developer, &format!("claude/1/{run_id}/session/developer/1"), limit).await?;
+        let revision: i64 =
+            query(&project, "SELECT coalesce(max(revision), 0) FROM team_revisions")?.parse()?;
+        configure(&host, "to-codex", revision, json!({"developer": {"agent": "codex"}})).await?;
+        let session = format!("{run_id}/session/developer/2");
+        until(
+            &project,
+            &format!("SELECT state FROM outbox WHERE message_id = '{run_id}/session-start/developer/2'"),
+            "ACKED",
+            limit,
+        )
+        .await?;
+        std::fs::remove_file(hoh_app::host::product::first_input_path(&project, &session))?;
+        ready(&project, &run_id, &[("T-dev", "developer")])?;
+        until(
+            &project,
+            &ended("T-dev/attempt-1"),
+            "FAILED/FIRST_INPUT_UNAVAILABLE",
+            limit,
+        )
+        .await?;
+        let turns = std::fs::read_dir(world.bin().join("codex.d"))?
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("log."))
+            .filter_map(|e| std::fs::read_to_string(e.path().join("received.jsonl")).ok())
+            .flat_map(|log| log.lines().map(str::to_owned).collect::<Vec<_>>())
+            .filter(|line| line.contains("turn/start"))
+            .count();
+        assert_eq!(turns, 0, "a turn started without its package");
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    world.stop_fakes()?;
+    outcome
+}
+
+#[tokio::test]
+async fn a_new_holders_later_turns_in_its_session_carry_no_package() -> R {
+    // docs/adr/ADR-024.md decision 4 (M2T17R-151, -152): the developer changes from claude to pi; the first turn of
+    // its new session carries the package, the session's next turn does not, whether or not the agent resumes a
+    // native session (the store, not the native session, says which turn is the first).
+    let world = World::new()?;
+    world.claude(None)?;
+    world.codex("m-test")?;
+    world.pi()?;
+    let host = start_when_free(world.config()).await?;
+    let project = world.project();
+    let outcome = async {
+        let run_id = started(&host, "s1").await?;
+        let limit = Duration::from_secs(60);
+        ready(&project, &run_id, &[])?;
+        let developer = format!(
+            "SELECT agent || '/' || role_epoch || '/' || coalesce(session_id, '-') FROM role_bindings \
+             WHERE run_id = '{run_id}' AND role = 'developer'"
+        );
+        until(&project, &developer, &format!("claude/1/{run_id}/session/developer/1"), limit).await?;
+        let revision: i64 =
+            query(&project, "SELECT coalesce(max(revision), 0) FROM team_revisions")?.parse()?;
+        configure(&host, "to-pi", revision, json!({"developer": {"agent": "pi"}})).await?;
+        until(
+            &project,
+            &format!("SELECT state FROM outbox WHERE message_id = '{run_id}/session-start/developer/2'"),
+            "ACKED",
+            limit,
+        )
+        .await?;
+        for task in ["T-dev", "T-dev2"] {
+            ready(&project, &run_id, &[(task, "developer")])?;
+            until(&project, &ended(&format!("{task}/attempt-1")), "SETTLED/", limit).await?;
+        }
+        let prompts: Vec<String> = std::fs::read_dir(world.bin().join("pi.d"))?
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("log."))
+            .filter_map(|e| std::fs::read_to_string(e.path().join("received.jsonl")).ok())
+            .flat_map(|log| log.lines().map(str::to_owned).collect::<Vec<_>>())
+            .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
+            .filter(|c| c["type"] == "prompt")
+            .filter_map(|c| c["message"].as_str().map(str::to_owned))
+            .collect();
+        assert_eq!(prompts.len(), 2, "{prompts:?}");
+        let turn = |task: &str| {
+            prompts
+                .iter()
+                .find(|p| p.contains(&format!("任务：{task}\n")))
+                .cloned()
+                .ok_or(format!("no turn of {task}: {prompts:?}"))
+        };
+        assert!(turn("T-dev")?.contains("```json"), "the first turn has no package");
+        assert!(!turn("T-dev2")?.contains("```json"), "a later turn carries the package");
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    world.stop_fakes()?;
+    outcome
+}

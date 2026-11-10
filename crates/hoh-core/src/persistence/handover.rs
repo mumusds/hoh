@@ -213,6 +213,61 @@ pub(super) fn waiting(
         .collect()
 }
 
+/// Record that the executor did not take session.start notice `message_id` (decision 4, M2T17R-150): one
+/// handoff.undelivered event with `detail`, while the notice is PENDING and only the first time, so the role's wait for
+/// its first input is seen, not only said once on stderr. Whether it was written now.
+pub(super) fn undelivered(
+    conn: &mut Connection,
+    message_id: &str,
+    detail: &str,
+    ctx: &super::writer::Ctx<'_>,
+) -> Result<bool, PersistError> {
+    let tx = super::writer::begin(conn, ctx)?;
+    let row: Option<(String, String, i64, String)> = tx
+        .query_row(
+            "SELECT o.run_id, json_extract(o.payload_json, '$.role'), o.role_epoch, r.project_id FROM outbox o \
+             JOIN runs r ON r.run_id = o.run_id WHERE o.message_id = ?1 AND o.state = 'PENDING' \
+             AND json_extract(o.payload_json, '$.kind') IS 'session.start'",
+            params![message_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some((run_id, role, epoch, project_id)) = row else {
+        return Ok(false);
+    };
+    let event_id = crate::ids::child_id(message_id, "handoff.undelivered");
+    let seen: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE event_id = ?1)",
+            params![event_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    if seen {
+        return Ok(false);
+    }
+    super::writer::write(
+        &tx,
+        &super::writer::Commit {
+            events: vec![super::writer::NewEvent {
+                project_id,
+                event_id,
+                run_id: Some(run_id.clone()),
+                kind: "handoff.undelivered".to_owned(),
+                payload: json!({
+                    "run_id": run_id, "role": role, "role_epoch": epoch, "message_id": message_id, "detail": detail,
+                }),
+            }],
+            ..super::writer::Commit::default()
+        },
+        ctx,
+    )?;
+    ctx.before_commit()?;
+    tx.commit().map_err(sqlite_error)?;
+    Ok(true)
+}
+
 /// Settle session.start notice `message_id` (decision 4), in one transaction: `Some(session)` once the executor took
 /// its package for that session, which must be its binding's at the notice's own epoch (receipt, ACKED,
 /// handoff.delivered); `None` when the binding has passed the notice's epoch, so it is never delivered (a rejected

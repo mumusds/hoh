@@ -63,6 +63,9 @@ pub struct Waiting {
 #[derive(Debug, Clone)]
 pub(super) enum RunnerJob {
     Waiting(String),
+    /// Only the session.start notices waiting in a project (docs/adr/ADR-024.md decision 4), its runner's second look
+    /// after a checkpoint or the binder (M2T17R-156).
+    SessionStarts(String),
     /// A dispatch taken at this time (the runner's clock: its attempt's start, M2T19R-53).
     Received(Box<DispatchNotice>, std::time::SystemTime),
     Effect {
@@ -92,6 +95,8 @@ pub(super) enum RunnerJob {
     Ack(String),
     /// A session.start notice settled (docs/adr/ADR-024.md decision 4): delivered to this session, or superseded.
     SessionStart(String, Option<String>),
+    /// A session.start notice the executor did not take, with what it said (decision 4, M2T17R-150).
+    SessionStartUndelivered(String, String),
     /// A session the binder grants (docs/adr/ADR-022.md decision 9).
     BindSession(Box<super::team::SessionGrant>),
     /// A binding the binder blocks because its agent is unavailable, and why.
@@ -106,6 +111,7 @@ pub(super) enum RunnerJob {
 #[derive(Debug)]
 pub(super) enum RunnerDone {
     Waiting(Waiting),
+    SessionStarts(Vec<super::handover::SessionStart>),
     /// Whether the step applied (a dispatch already taken or an attempt no longer PREPARED is not).
     Applied(bool),
     /// How many leases were renewed.
@@ -179,6 +185,9 @@ pub(super) fn run(
 ) -> Result<RunnerDone, PersistError> {
     match job {
         RunnerJob::Waiting(project_id) => waiting(conn, &project_id).map(RunnerDone::Waiting),
+        RunnerJob::SessionStarts(project_id) => {
+            super::handover::waiting(conn, &project_id).map(RunnerDone::SessionStarts)
+        }
         RunnerJob::Received(notice, at) => {
             received(conn, &notice, at, ctx).map(RunnerDone::Applied)
         }
@@ -203,6 +212,9 @@ pub(super) fn run(
         RunnerJob::SessionStart(message_id, delivered_to) => {
             super::handover::settle(conn, &message_id, delivered_to.as_deref(), ctx)
                 .map(RunnerDone::Applied)
+        }
+        RunnerJob::SessionStartUndelivered(message_id, detail) => {
+            super::handover::undelivered(conn, &message_id, &detail, ctx).map(RunnerDone::Applied)
         }
         RunnerJob::BindSession(grant) => {
             super::team::bind_session(conn, &grant, ctx).map(RunnerDone::Applied)
