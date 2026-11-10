@@ -1,6 +1,8 @@
 //! `hoh __unit`: what the installer asks of the binary (docs/adr/ADR-023.md decision 5). `template` prints the unit
-//! template for this user's home; `enable <project>` writes the environment file of the project's instance where the
-//! user's systemd manager reads it, and enables the instance. Not a user command and in no help text.
+//! template for this user's home; `check <home> <root>...` says whether the unit can name that home's command and
+//! each root, by the template's own rule (design correction 9); `enable <project>` writes the environment file of the
+//! project's instance where the user's systemd manager reads it, and enables the instance. Not a user command and in
+//! no help text.
 
 use crate::exit::{ClientEvent, Ending, exit_code};
 use hoh_app::unit;
@@ -15,9 +17,10 @@ pub fn main(args: &[OsString]) -> u8 {
     match args {
         [what] if what == "template" => template(),
         [what, project] if what == "enable" => enable(Path::new(project)),
+        [what, home, roots @ ..] if what == "check" && !roots.is_empty() => check(home, roots),
         _ => fail(
             ClientEvent::Usage,
-            "usage: hoh __unit template | hoh __unit enable <project directory>",
+            "usage: hoh __unit template | hoh __unit check <home> <root>... | hoh __unit enable <project directory>",
         ),
     }
 }
@@ -65,6 +68,18 @@ fn template() -> u8 {
         Ok(text) => print(&text),
         Err(why) => fail(ClientEvent::Config, why),
     }
+}
+
+/// Whether the template can be made for `home` with each of `roots` (design correction 9, M2T14R-601): the one rule
+/// for what the unit can name, asked by the installer before it writes anything of the installation; 78 and why when
+/// it cannot.
+fn check(home: &OsStr, roots: &[OsString]) -> u8 {
+    for root in roots {
+        if let Err(why) = unit::template(Path::new(home), Path::new(root)) {
+            return fail(ClientEvent::Config, why);
+        }
+    }
+    0
 }
 
 /// `name` in a directory of `path`.
