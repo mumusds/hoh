@@ -167,6 +167,145 @@
    "schema": "protocol",
    "def": "ContextHandoff",
    "valid": true,
+   "note": "role change while the run has no specification (CR-014)",
+   "instance": {
+    "schema_version": "1.0",
+    "run_id": "r1",
+    "task_id": null,
+    "goal": "verify",
+    "role": "qa",
+    "role_epoch": 2,
+    "spec_sha256": null,
+    "candidate": null,
+    "acceptance_ids": [],
+    "references": [
+     {
+      "path": "reports/x.json",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+     }
+    ],
+    "output_contract": "TaskResult",
+    "budget_tokens": 1000,
+    "handoff_kind": "role_change",
+    "spec_revision": null,
+    "state": {
+     "applied_decision_ids": [
+      "d1"
+     ],
+     "open_issue_ids": [],
+     "unacked_message_ids": [],
+     "queued_input_ids": [
+      "i1"
+     ]
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "ContextHandoff",
+   "valid": false,
+   "note": "role change with only its digest null (CR-014)",
+   "instance": {
+    "schema_version": "1.0",
+    "run_id": "r1",
+    "task_id": null,
+    "goal": "verify",
+    "role": "qa",
+    "role_epoch": 2,
+    "spec_sha256": null,
+    "candidate": null,
+    "acceptance_ids": [],
+    "references": [
+     {
+      "path": "reports/x.json",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+     }
+    ],
+    "output_contract": "TaskResult",
+    "budget_tokens": 1000,
+    "handoff_kind": "role_change",
+    "spec_revision": 1,
+    "state": {
+     "applied_decision_ids": [
+      "d1"
+     ],
+     "open_issue_ids": [],
+     "unacked_message_ids": [],
+     "queued_input_ids": [
+      "i1"
+     ]
+    }
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "ContextHandoff",
+   "valid": false,
+   "note": "task handoff without a specification (CR-014)",
+   "instance": {
+    "schema_version": "1.0",
+    "run_id": "r1",
+    "task_id": "t1",
+    "goal": "verify",
+    "role": "qa",
+    "role_epoch": 2,
+    "spec_sha256": null,
+    "candidate": null,
+    "acceptance_ids": [
+     "AC-001-01"
+    ],
+    "references": [
+     {
+      "path": "reports/x.json",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+     }
+    ],
+    "output_contract": "TaskResult",
+    "budget_tokens": 1000,
+    "handoff_kind": "task",
+    "spec_revision": null
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "ContextHandoff",
+   "valid": false,
+   "note": "verification handoff without a specification (CR-014)",
+   "instance": {
+    "schema_version": "1.0",
+    "run_id": "r1",
+    "task_id": "t1",
+    "goal": "verify",
+    "role": "qa",
+    "role_epoch": 2,
+    "spec_sha256": null,
+    "candidate": {
+     "id": "C1",
+     "git_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+     "git_tree": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+     "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "environment_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "test_plan_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "acceptance_ids": [
+     "AC-001-01"
+    ],
+    "references": [
+     {
+      "path": "reports/x.json",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+     }
+    ],
+    "output_contract": "TaskResult",
+    "budget_tokens": 1000,
+    "handoff_kind": "verification",
+    "spec_revision": null
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "ContextHandoff",
+   "valid": true,
    "note": "task handoff without candidate",
    "instance": {
     "schema_version": "1.0",
