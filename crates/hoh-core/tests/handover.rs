@@ -472,6 +472,17 @@ async fn an_old_commanders_steer_queued_before_the_handover_is_rejected_when_con
         )?,
         "RUNNING5"
     );
+    // Recorded by the consume's fence, the steer given to the Commander's fence again gets one rejection event.
+    let rejected = "SELECT count(*) FROM events WHERE kind = 'decision.rejected' \
+                    AND json_extract(payload_json, '$.decision_id') = 'old-steer'";
+    let Fenced::Rejected { event_seq, .. } = store.commander_message(&old).await? else {
+        return Err("the old steer passed the Commander's fence".into());
+    };
+    assert!(matches!(
+        store.commander_message(&old).await?,
+        Fenced::Rejected { event_seq: again, .. } if again == event_seq
+    ));
+    assert_eq!(one(&path, rejected)?, "1");
     let new = commander_message("new-steer", 2, "developer", "steer")?;
     assert!(matches!(
         store.commander_message(&new).await?,
@@ -489,5 +500,50 @@ async fn an_old_commanders_steer_queued_before_the_handover_is_rejected_when_con
         )?,
         "1"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_old_commanders_message_given_again_gets_its_recorded_rejection_and_another_under_its_id_is_key_reuse()
+-> R {
+    // M2T17R-05: a delivery repeated (a lost answer, a retry) is no integrity error: the same stale message gets the
+    // rejection recorded the first time, event included, and nothing more is written; another message under its id
+    // is a reused key.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    world(&store, &path).await?;
+    hand_over(&store, &path).await?;
+    let old = commander_message("old-steer", 1, "developer", "steer")?;
+    let Fenced::Rejected { event_seq, .. } = store.commander_message(&old).await? else {
+        return Err("the old Commander's steer passed".into());
+    };
+    let written = |path: &Path| -> R<String> {
+        one(
+            path,
+            "SELECT (SELECT count(*) FROM decisions) || '/' || (SELECT count(*) FROM events)",
+        )
+    };
+    let before = written(&path)?;
+    match store.commander_message(&old).await? {
+        Fenced::Rejected {
+            reason,
+            event_seq: again,
+            ..
+        } => {
+            assert_eq!(serde_json::to_value(reason)?, json!("STALE_ROLE_EPOCH"));
+            assert_eq!(again, event_seq, "the recorded rejection");
+        }
+        Fenced::Current => return Err("the replay passed".into()),
+    }
+    assert_eq!(written(&path)?, before, "nothing more written");
+    let mut other = old.clone();
+    other
+        .payload
+        .insert("text".to_owned(), json!("something else"));
+    match store.commander_message(&other).await {
+        Err(hoh_core::persistence::PersistError::KeyReuse(_)) => {}
+        got => return Err(format!("not a reused key: {got:?}").into()),
+    }
+    assert_eq!(written(&path)?, before);
     Ok(())
 }

@@ -673,7 +673,8 @@ fn stale_commander_message(tx: &Transaction<'_>, message: &Message) -> Result<()
     let revision = i64::try_from(message.expected_revision).map_err(|_| {
         PersistError::IntegrityViolation(format!("expected revision of {}", message.message_id))
     })?;
-    let recorded = protocol::encode(message).map_err(|e| {
+    // The message as the Commander's fence records it, so a later fence of the same message finds it the same.
+    let recorded = serde_json::to_value(message).map_err(|e| {
         PersistError::IntegrityViolation(format!("message {}: {e}", message.message_id))
     })?;
     tx.execute(

@@ -707,19 +707,58 @@ pub(super) fn commander_message(
     );
     let recorded = serde_json::to_value(message)
         .map_err(|e| PersistError::InvalidProposal(format!("{}: {e}", message.message_id)))?;
-    tx.execute(
-        "INSERT INTO decisions(decision_id, run_id, role_epoch, expected_revision, reason_code, payload_json, state) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'REJECTED')",
-        params![
-            message.message_id,
-            message.run_id,
-            role_epoch,
-            expected_revision,
-            reason_name(reason),
-            recorded.to_string()
-        ],
-    )
-    .map_err(sqlite_error)?;
+    // Given again (a lost answer, a retry): the rejection recorded is the answer, and nothing more is written; another
+    // message under its id is a reused key (M2T17R-05). Its row may come from consume's fence, which records no
+    // decision.rejected event: that event is written once, here.
+    let existing: Option<String> = tx
+        .query_row(
+            "SELECT payload_json FROM decisions WHERE decision_id = ?1",
+            params![message.message_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    if let Some(payload) = &existing {
+        if serde_json::from_str::<Value>(payload).ok().as_ref() != Some(&recorded) {
+            return Err(PersistError::KeyReuse(format!(
+                "{}: another message was recorded under this id",
+                message.message_id
+            )));
+        }
+        let event: Option<(i64, String)> = tx
+            .query_row(
+                "SELECT seq, payload_json FROM events WHERE event_id = ?1",
+                params![child_id(&message.message_id, "rejected")],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(sqlite_error)?;
+        if let Some((event_seq, payload)) = event {
+            let detail = serde_json::from_str::<Value>(&payload)
+                .ok()
+                .and_then(|v| v.get("detail").and_then(Value::as_str).map(str::to_owned))
+                .unwrap_or_default();
+            return Ok(Fenced::Rejected {
+                reason,
+                detail,
+                event_seq,
+            });
+        }
+    } else {
+        tx.execute(
+            "INSERT INTO decisions(decision_id, run_id, role_epoch, expected_revision, reason_code, payload_json, \
+             state) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'REJECTED')",
+            params![
+                message.message_id,
+                message.run_id,
+                role_epoch,
+                expected_revision,
+                reason_name(reason),
+                recorded.to_string()
+            ],
+        )
+        .map_err(sqlite_error)?;
+    }
     let done = writer::write(
         &tx,
         &Commit {
