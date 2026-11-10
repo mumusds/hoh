@@ -1446,3 +1446,83 @@ async fn test_019_04_two_concurrent_team_changes_one_202_one_409_one_epoch_step(
     host.shutdown().await;
     Ok(())
 }
+
+#[tokio::test]
+async fn a_change_to_a_logged_out_agent_is_refused_blocked_auth_and_the_old_binding_works_on() -> R
+{
+    // REQ-019 failure mode 3 (docs/adr/ADR-024.md decision 7): claude is installed but its status command says it is
+    // not logged in; a run on a spec, its commander codex at epoch 1. The commander's change to claude is refused at
+    // its checkpoint (team.binding_refused, reason BLOCKED_AUTH, what to do in its detail): the commander keeps codex
+    // and epoch 1, ticks later as well, with one refusal.
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir()?;
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin)?;
+    let help = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/protocol/claude/2.1.318/help.txt"
+    );
+    std::fs::write(
+        bin.join("claude"),
+        format!(
+            "#!/bin/sh\ncase \"$1 $2\" in\n --version*) echo '2.1.318 (Claude Code)';;\n --help*) /bin/cat '{help}';;\n \
+             'auth status') echo '{{\"loggedIn\": false}}'; exit 1;;\n *) exit 2;;\nesac\n"
+        ),
+    )?;
+    std::fs::set_permissions(bin.join("claude"), std::fs::Permissions::from_mode(0o755))?;
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    let mut config = config(&project);
+    let registry = std::sync::Arc::new(hoh_app::host::agents::Registry::new(
+        bin.as_os_str().to_owned(),
+    ));
+    config.runner = Some(hoh_app::host::RunnerConfig {
+        executor: std::sync::Arc::new(Registered(registry)),
+        context: hoh_core::decision::Context::default(),
+    });
+    let host = start_when_free(config).await?;
+    let run_id = started(&host, "s1").await?;
+    exec(
+        &project,
+        &format!(
+            "INSERT INTO specs(spec_id, project_id, sha256, revision) SELECT 's1', project_id, printf('%064d', 1), 1 \
+             FROM projects; UPDATE runs SET state = 'RUNNING', spec_id = 's1' WHERE run_id = '{run_id}';"
+        ),
+    )?;
+    let (status, body) = exchange(
+        &host,
+        "POST",
+        "/v1/commands",
+        Some(&configure(
+            "to-claude",
+            None,
+            0,
+            json!({"bindings": {"commander": {"agent": "claude"}}, "apply_at": "checkpoint"}),
+        )),
+    )
+    .await?;
+    assert_eq!(status, 202, "{body}");
+    let refused = "SELECT coalesce(group_concat(json_extract(payload_json, '$.reason') || '|' || \
+                   json_extract(payload_json, '$.detail'), ','), '') FROM events WHERE kind = 'team.binding_refused'";
+    let end = std::time::Instant::now() + Duration::from_secs(20);
+    while query(&project, refused)?.is_empty() {
+        assert!(std::time::Instant::now() < end, "never refused");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        query(&project, refused)?,
+        "BLOCKED_AUTH|运行 claude auth login 登录"
+    );
+    assert_eq!(
+        query(
+            &project,
+            &format!(
+                "SELECT agent || '/' || role_epoch FROM role_bindings WHERE run_id = '{run_id}' AND role = 'commander'"
+            )
+        )?,
+        "codex/1"
+    );
+    host.shutdown().await;
+    Ok(())
+}

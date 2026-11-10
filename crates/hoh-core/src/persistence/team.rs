@@ -408,6 +408,9 @@ fn changes(
 /// removed role; which one it is comes from the configuration, never from this code, decision 8).
 const AGENT_UNAVAILABLE: &str = "AGENT_UNAVAILABLE";
 
+/// Why a change to an agent not logged in is refused (`$defs.BlockedReason`).
+const BLOCKED_AUTH: &str = "BLOCKED_AUTH";
+
 /// The event kinds of a checkpoint's verdict on a changed role (decision 8, third version): the change is refused (its
 /// new agent unavailable: the old binding works on), or pending again (the agent is there: the role is held until its
 /// checkpoint).
@@ -468,6 +471,9 @@ pub(super) fn pending(conn: &Connection, run_id: &str, role: &str) -> Result<boo
 pub struct Availability {
     pub available: Option<std::collections::BTreeSet<String>>,
     pub unavailable: BTreeMap<String, String>,
+    /// Agents found installed and usable but not logged in (their auth status says so), with what to do: a change to
+    /// one is refused, BLOCKED_AUTH (REQ-019 failure mode 3; docs/adr/ADR-024.md decision 7).
+    pub auth_missing: BTreeMap<String, String>,
 }
 
 impl Availability {
@@ -487,6 +493,7 @@ impl From<std::collections::BTreeSet<String>> for Availability {
                 .into_iter()
                 .map(|agent| (agent, "unavailable".to_owned()))
                 .collect(),
+            auth_missing: BTreeMap::new(),
         }
     }
 }
@@ -588,6 +595,25 @@ pub(super) fn checkpoint(
                     serde_json::json!({
                         "run_id": run_id, "role": binding.role, "config_revision": revision,
                         "agent": role.agent.as_str(), "reason": "AGENT_UNAVAILABLE", "detail": why,
+                        "kept": {"agent": binding.agent, "model": binding.model, "role_epoch": binding.role_epoch},
+                    }),
+                ));
+            }
+            continue;
+        }
+        // An agent not logged in cannot take the role: refused, the old binding working on, until its auth is there
+        // (REQ-019 failure mode 3; ADR-024 decision 7).
+        if let Some(role) = target
+            && let Some(why) = availability.auth_missing.get(role.agent.as_str())
+        {
+            behind = true;
+            if !refused {
+                changed = true;
+                events.push(verdict(
+                    REFUSED,
+                    serde_json::json!({
+                        "run_id": run_id, "role": binding.role, "config_revision": revision,
+                        "agent": role.agent.as_str(), "reason": BLOCKED_AUTH, "detail": why,
                         "kept": {"agent": binding.agent, "model": binding.model, "role_epoch": binding.role_epoch},
                     }),
                 ));

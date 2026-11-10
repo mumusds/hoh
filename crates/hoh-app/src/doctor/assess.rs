@@ -3,9 +3,10 @@
 
 use super::report::{AgentItem, Auth, Protocol};
 use hoh_agents::compat::{Agent, AgentEntry, CompatManifest, SuiteStatus, Transport};
+use hoh_agents::login::{self, Login};
 use hoh_agents::probe::{self, Captured, ProbeEnv, ProbeError};
-use serde_json::Value;
-use std::path::{Path, PathBuf};
+
+use std::path::Path;
 
 /// What installing the CLI takes.
 fn install(agent: Agent) -> &'static str {
@@ -15,18 +16,6 @@ fn install(agent: Agent) -> &'static str {
             "安装 Claude Code 后重试：下载 https://claude.ai/install.sh 并运行 bash install.sh stable"
         }
         Agent::Pi => "安装 pi 后重试：npm install -g @earendil-works/pi-coding-agent@1.5.0",
-    }
-}
-
-/// What logging in takes (doctor never logs in itself).
-fn login(agent: Agent, provider: Option<&str>) -> String {
-    match agent {
-        Agent::Codex => "运行 codex login 登录".to_owned(),
-        Agent::Claude => "运行 claude auth login 登录".to_owned(),
-        Agent::Pi => format!(
-            "为 pi 的 provider {} 配置凭证（pi 中使用 /login，或设置该 provider 的 API key），再用 pi auth check 确认",
-            provider.unwrap_or("（未设置默认 provider）")
-        ),
     }
 }
 
@@ -67,76 +56,12 @@ pub fn protocol(
     (Protocol::Compatible, None)
 }
 
-/// A JSON object in a status command's output: all of it, or from the first line that starts with `{`.
-fn json_object(stdout: &[u8]) -> Option<Value> {
-    let text = String::from_utf8_lossy(stdout);
-    let whole = serde_json::from_str::<Value>(text.trim())
-        .ok()
-        .filter(Value::is_object);
-    whole.or_else(|| {
-        let start = text
-            .match_indices('\n')
-            .map(|(i, _)| i + 1)
-            .chain(std::iter::once(0))
-            .filter(|i| text[*i..].starts_with('{'))
-            .min()?;
-        serde_json::from_str::<Value>(text[start..].trim())
-            .ok()
-            .filter(Value::is_object)
-    })
-}
-
 /// The conclusion of a native status command (ADR-015 decision 3); `None` when it says nothing clear.
 pub fn conclusion(agent: Agent, out: &Captured) -> Option<Auth> {
-    match agent {
-        Agent::Codex => {
-            let text = format!(
-                "{}\n{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            );
-            if text.contains("Not logged in") {
-                Some(Auth::Missing)
-            } else if out.status.success()
-                && text
-                    .lines()
-                    .any(|l| l.trim_start().starts_with("Logged in"))
-            {
-                Some(Auth::NotVerified)
-            } else {
-                None
-            }
-        }
-        // A positive answer counts only from a command that succeeded; "not logged in" comes with a failing exit
-        // (M1T07R-12).
-        Agent::Claude => match json_object(&out.stdout)?.get("loggedIn")?.as_bool()? {
-            true if out.status.success() => Some(Auth::NotVerified),
-            true => None,
-            false => Some(Auth::Missing),
-        },
-        Agent::Pi => {
-            let answer = json_object(&out.stdout)?;
-            match (answer["status"].as_str()?, answer["reason"].as_str()) {
-                ("ready", _) if out.status.success() => Some(Auth::NotVerified),
-                ("not_ready", Some("credentials_not_configured")) => Some(Auth::Missing),
-                _ => None,
-            }
-        }
-    }
-}
-
-/// pi's default provider, from its settings (not its credentials): `$PI_CODING_AGENT_DIR/settings.json`, else
-/// `~/.pi/agent/settings.json`.
-pub fn pi_provider() -> Option<String> {
-    let dir = std::env::var_os("PI_CODING_AGENT_DIR")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".pi/agent")))?;
-    let settings: Value =
-        serde_json::from_slice(&std::fs::read(dir.join("settings.json")).ok()?).ok()?;
-    settings["defaultProvider"]
-        .as_str()
-        .filter(|p| !p.is_empty())
-        .map(str::to_owned)
+    login::conclusion(agent, out).map(|found| match found {
+        Login::LoggedIn => Auth::NotVerified,
+        Login::Missing => Auth::Missing,
+    })
 }
 
 /// Why `what` gave no answer, if it timed out or was not started: its own limit, the time left of doctor's total limit,
@@ -157,31 +82,18 @@ pub fn unfinished(what: &str, e: &ProbeError) -> Option<String> {
 }
 
 /// Run the agent's status command; the conclusion and, if it is not clear, why.
-fn auth(agent: Agent, launcher: &Path, env: &ProbeEnv) -> (Auth, Option<String>) {
-    let provider = (agent == Agent::Pi).then(pi_provider).flatten();
-    let args: Vec<&str> = match agent {
-        Agent::Codex => vec!["login", "status"],
-        Agent::Claude => vec!["auth", "status", "--json"],
-        Agent::Pi => match provider.as_deref() {
-            Some(p) => vec!["auth", "check", "--provider", p, "--json", "--no-refresh"],
-            None => {
-                return (
-                    Auth::Unknown,
-                    Some("pi 没有默认 provider，无法在不调用模型的情况下检查；运行 pi auth check --provider <provider> 或 hoh doctor --live".to_owned()),
-                );
-            }
-        },
-    };
-    match probe::run_status(launcher, &args, env) {
-        Ok(out) => match conclusion(agent, &out) {
-            Some(Auth::Missing) => (Auth::Missing, Some(login(agent, provider.as_deref()))),
+pub(super) fn auth(agent: Agent, launcher: &Path, env: &ProbeEnv) -> (Auth, Option<String>) {
+    match login::status(agent, launcher, env) {
+        Ok((out, provider)) => match conclusion(agent, &out) {
+            Some(Auth::Missing) => (Auth::Missing, Some(login::hint(agent, provider.as_deref()))),
             Some(found) => (found, None),
             None => (
                 Auth::Unknown,
                 Some("状态命令的输出无法判断登录状态".to_owned()),
             ),
         },
-        Err(e) => (
+        Err(None) => (Auth::Unknown, Some(login::NO_PI_PROVIDER.to_owned())),
+        Err(Some(e)) => (
             Auth::Unknown,
             Some(unfinished("状态命令", &e).unwrap_or_else(|| "状态命令无法运行".to_owned())),
         ),
