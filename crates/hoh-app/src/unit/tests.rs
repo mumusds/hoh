@@ -410,3 +410,22 @@ fn a_lock_is_the_installations_only_while_its_file_is_still_the_one_at_its_path(
     assert!(!still_linked(&file, &path), "another file at its path");
     Ok(())
 }
+
+#[test]
+fn a_run_says_its_lock_held_only_when_it_is_held_and_any_other_failure_as_it_is() {
+    // Design correction 8 (M2T14R-501's class, in the run): only EWOULDBLOCK is the uninstall's exclusive lock; any
+    // other failure to lock is said as a failure, not as an uninstall.
+    let root = Path::new("/d/hoh");
+    let path = root.join(".lock");
+    let held = lock_refusal(rustix::io::Errno::WOULDBLOCK, root, &path).to_string();
+    assert!(held.contains("being uninstalled"), "{held}");
+    for e in [rustix::io::Errno::IO, rustix::io::Errno::NOLCK] {
+        let said = lock_refusal(e, root, &path).to_string();
+        assert!(
+            said.contains("cannot lock the installation's lock /d/hoh/.lock"),
+            "{said}"
+        );
+        assert!(said.contains(&e.to_string()), "{said}");
+        assert!(!said.contains("being uninstalled"), "{said}");
+    }
+}

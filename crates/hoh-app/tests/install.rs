@@ -523,12 +523,82 @@ fn the_uninstall_removes_what_the_install_wrote_and_nothing_else() -> R {
 
 #[test]
 fn uninstalling_what_is_not_installed_does_nothing() -> R {
+    // Design correction 8 (M2T14R-550): in a usual home, its data directory there, an uninstall that finds nothing
+    // installed writes nothing, not even the installers' lock.
     let install = Install::new()?;
+    std::fs::create_dir_all(install.data())?;
     let before = tree(&install.home())?;
     let out = install.run("bundle", &["--uninstall"])?;
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     assert_eq!(String::from_utf8(out.stdout)?, "not installed\n");
     assert_eq!(tree(&install.home())?, before);
+    Ok(())
+}
+
+#[test]
+fn a_bundle_without_its_binary_is_refused_before_anything_is_written() -> R {
+    // Design correction 8 (M2T14R-550): the bundle's missing binary is one of the refusals before the installers' lock.
+    let install = Install::new()?;
+    std::fs::remove_file(install.root.path().join("bundle/hoh/bin/hoh"))?;
+    let before = tree(&install.home())?;
+    let out = install.run("bundle", &[])?;
+    assert_eq!(out.status.code(), Some(64), "{}", text(&out));
+    assert!(
+        String::from_utf8(out.stderr.clone())?.contains("bin/hoh is missing"),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(tree(&install.home())?, before);
+    Ok(())
+}
+
+#[test]
+fn an_uninstall_with_no_data_directory_takes_turns_with_a_first_install() -> R {
+    // Design correction 8 (M2T14R-500): an uninstall that will act holds the installers' lock even when the data
+    // directory does not exist yet. With a dangling link of this installation's as the only thing there, the uninstall
+    // is held at its first removal (a stand-in rm); an install started then waits for it, and is whole once both have
+    // ended. Before, the uninstall had no lock: the install ran to its end at once, and the uninstall then removed it.
+    let install = Install::new()?;
+    let link = install.home().join(".local/bin/hoh");
+    std::fs::create_dir_all(link.parent().ok_or("no parent")?)?;
+    std::os::unix::fs::symlink(install.data().join("hoh/current/bin/hoh"), &link)?;
+    assert!(!install.data().exists());
+    let (uninstalling, go) = paused_uninstall(&install)?;
+    let mut installing = Command::new("bash")
+        .arg(install.root.path().join("bundle/hoh/install.sh"))
+        .current_dir(install.root.path())
+        .env_clear()
+        .env("HOME", install.home())
+        .env("XDG_RUNTIME_DIR", install.root.path().join("r"))
+        .env("USER", "tester")
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", install.stubs().display()),
+        )
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let waited = installing.try_wait()?.is_none();
+    std::fs::write(&go, "")?;
+    let removed = uninstalling.wait_with_output()?;
+    let installed = installing.wait_with_output()?;
+    assert!(
+        waited,
+        "the install did not wait for the uninstall\n{}\n{}",
+        text(&removed),
+        text(&installed)
+    );
+    assert_eq!(removed.status.code(), Some(0), "{}", text(&removed));
+    assert_eq!(installed.status.code(), Some(0), "{}", text(&installed));
+    let version = Command::new(&link).arg("--version").output()?;
+    assert_eq!(
+        version.status.code(),
+        Some(0),
+        "the install is not whole: {}\n{}",
+        text(&version),
+        text(&removed)
+    );
     Ok(())
 }
 
@@ -1089,11 +1159,9 @@ fn an_uninstall_whose_lock_changed_while_it_took_it_removes_nothing() -> R {
     )?;
     let out = install.run("bundle", &["--uninstall"])?;
     assert_eq!(out.status.code(), Some(69), "{}", text(&out));
-    assert!(
-        String::from_utf8(out.stderr.clone())?.contains("lock changed"),
-        "{}",
-        text(&out)
-    );
+    let stderr = String::from_utf8(out.stderr.clone())?;
+    assert!(stderr.contains("lock changed"), "{stderr}");
+    assert!(!stderr.contains("still runs"), "{stderr}");
     assert!(install.data().join("hoh/current/bin/hoh").exists());
     std::fs::remove_file(install.stubs().join("flock"))?;
     let out = install.run("bundle", &["--uninstall"])?;
@@ -1162,11 +1230,9 @@ fn an_uninstall_that_cannot_tell_its_lock_removes_nothing() -> R {
     )?;
     let out = install.run("bundle", &["--uninstall"])?;
     assert_eq!(out.status.code(), Some(69), "{}", text(&out));
-    assert!(
-        String::from_utf8(out.stderr.clone())?.contains("cannot tell"),
-        "{}",
-        text(&out)
-    );
+    let stderr = String::from_utf8(out.stderr.clone())?;
+    assert!(stderr.contains("cannot tell"), "{stderr}");
+    assert!(!stderr.contains("still runs"), "{stderr}");
     assert!(install.data().join("hoh/current/bin/hoh").exists());
     assert!(install.home().join(".local/bin/hoh").is_symlink());
     std::fs::remove_file(install.stubs().join("stat"))?;
@@ -1177,7 +1243,7 @@ fn an_uninstall_that_cannot_tell_its_lock_removes_nothing() -> R {
 
 #[test]
 fn an_installers_lock_that_cannot_be_had_is_told_from_one_held_by_another() -> R {
-    // M2T14R-401 (ADR-023 design correction 7): the installers' lock $XDG_DATA_HOME/hoh.lock: a failure to lock at all
+    // M2T14R-401 (ADR-023 design corrections 7 and 8): the installers' lock $XDG_DATA_HOME/hoh.lock: a failure to lock at all
     // (a stand-in flock: EBADF) is said as it is, at once; a wait that ended at its limit (the stand-in's conflict
     // code) says the lock stayed held; neither says the other. Neither writes anything but the lock file itself.
     let install = Install::new()?;
@@ -1187,7 +1253,11 @@ fn an_installers_lock_that_cannot_be_had_is_told_from_one_held_by_another() -> R
             "cannot lock",
             "stayed locked",
         ),
-        ("exit 75", "stayed locked", "cannot lock"),
+        (
+            "case \" $* \" in *\" -E 75 \"*) exit 75;; *) exit 1;; esac",
+            "stayed locked",
+            "cannot lock",
+        ),
     ] {
         script(
             &install.stubs().join("flock"),
@@ -1243,6 +1313,48 @@ fn an_install_whose_installed_binary_does_not_run_fails() -> R {
         "{}",
         text(&out)
     );
+    Ok(())
+}
+
+#[test]
+fn an_uninstall_whose_lock_cannot_be_had_says_so_and_not_that_a_program_runs() -> R {
+    // Design correction 8 (M2T14R-501, -551): the run lock's flock failing other than by a conflict (a stand-in: EIO,
+    // exit 74) is said as it is, with flock's message: nothing is removed (69), and no program is said to run.
+    let install = Install::new()?;
+    let out = install.run("bundle", &[])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    script(
+        &install.stubs().join("flock"),
+        "#!/bin/sh\ncase \" $* \" in *\" 9 \"*) echo 'flock: 9: Input/output error' >&2; exit 74;; esac\nexec /usr/bin/flock \"$@\"\n",
+    )?;
+    let out = install.run("bundle", &["--uninstall"])?;
+    assert_eq!(out.status.code(), Some(69), "{}", text(&out));
+    let stderr = String::from_utf8(out.stderr.clone())?;
+    assert!(stderr.contains("cannot lock"), "{stderr}");
+    assert!(stderr.contains("Input/output error"), "{stderr}");
+    assert!(!stderr.contains("still runs"), "{stderr}");
+    assert!(install.data().join("hoh/current/bin/hoh").exists());
+    std::fs::remove_file(install.stubs().join("flock"))?;
+    let out = install.run("bundle", &["--uninstall"])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    Ok(())
+}
+
+#[test]
+fn an_installers_lock_that_cannot_be_opened_is_said_so() -> R {
+    // M2T14R-452, -552: the installers' lock this user cannot open (a directory in its place): 69 and the reason, not
+    // bash's own message and exit 1; nothing else is written.
+    let install = Install::new()?;
+    std::fs::create_dir_all(install.data().join("hoh.lock"))?;
+    let before = tree(&install.home())?;
+    let out = install.run("bundle", &[])?;
+    assert_eq!(out.status.code(), Some(69), "{}", text(&out));
+    assert!(
+        String::from_utf8(out.stderr.clone())?.contains("cannot open the installer's lock"),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(tree(&install.home())?, before);
     Ok(())
 }
 

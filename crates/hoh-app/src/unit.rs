@@ -139,7 +139,7 @@ pub fn hold_installation_as(exe: &Path, image: &Path) -> Result<Option<std::fs::
         }
     })?;
     rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockShared)
-        .map_err(|e| being_removed(format!("its lock is held ({e})")))?;
+        .map_err(|e| lock_refusal(e, &root, &path))?;
     if !still_linked(&file, &path) {
         return Err(being_removed(
             "its lock was removed before it was held".to_owned(),
@@ -154,6 +154,22 @@ pub fn hold_installation_as(exe: &Path, image: &Path) -> Result<Option<std::fs::
         )));
     }
     Ok(Some(file))
+}
+
+/// Why a run cannot take the lock `path` of the installation at `root` shared: held exclusive (EWOULDBLOCK) is the
+/// uninstall's; any other failure is said as a failure to lock, never as an uninstall (design correction 8).
+pub(crate) fn lock_refusal(e: rustix::io::Errno, root: &Path, path: &Path) -> Unusable {
+    if e == rustix::io::Errno::WOULDBLOCK {
+        Unusable(format!(
+            "this installation ({}) is being uninstalled: its lock is held ({e})",
+            root.display()
+        ))
+    } else {
+        Unusable(format!(
+            "cannot lock the installation's lock {}: {e}",
+            path.display()
+        ))
+    }
 }
 
 /// Whether the file `image` names (following it, as `/proc/self/exe` is followed to the running image) is linked and
