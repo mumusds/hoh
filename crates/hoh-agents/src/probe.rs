@@ -3094,10 +3094,16 @@ mod tests {
     // correction of round 12, M2T07R-900, -1000, -1050, -1051): a listing of /proc only proves that a process is
     // there: a listing that fails is an error, an entry that cannot be read is left out, names are compared as bytes;
     // whether a process has ended is decided by its own number only: gone, its number now another's (or its parent
-    // not the one expected), or a zombie; a look that fails never counts as ended.
+    // not the one expected), or over (being released, or a zombie with no other thread: ADR-022 decision 10, v2); a
+    // look that fails never counts as ended.
 
-    /// Process `pid`'s name (bytes), state letter and parent, `None` once it is gone (reaped, or never there).
-    fn stat_of(pid: u32) -> io::Result<Option<(Vec<u8>, u8, u32)>> {
+    /// A process's name (bytes), state letter, parent and whether it is over.
+    type Stat = (Vec<u8>, u8, u32, bool);
+
+    /// Process `pid`'s name (bytes), state letter, parent and whether it is over (state X, or Z with at most one
+    /// thread: a zombie leader whose other threads run is no ended process, CIR-002), `None` once it is gone (reaped,
+    /// or never there).
+    fn stat_of(pid: u32) -> io::Result<Option<Stat>> {
         let stat = match std::fs::read(format!("/proc/{pid}/stat")) {
             Ok(stat) => stat,
             Err(e)
@@ -3113,9 +3119,11 @@ mod tests {
         let parsed = open.zip(close).and_then(|(open, close)| {
             let name = stat.get(open + 1..close)?.to_vec();
             let rest = std::str::from_utf8(stat.get(close + 1..)?).ok()?;
-            let mut fields = rest.split_whitespace();
-            let state = *fields.next()?.as_bytes().first()?;
-            Some((name, state, fields.next()?.parse().ok()?))
+            let fields: Vec<&str> = rest.split_whitespace().collect();
+            let state = *fields.first()?.as_bytes().first()?;
+            let threads: u32 = fields.get(17)?.parse().ok()?;
+            let over = state == b'X' || (state == b'Z' && threads <= 1);
+            Some((name, state, fields.get(1)?.parse().ok()?, over))
         });
         parsed.map(Some).ok_or_else(|| {
             io::Error::other(format!(
@@ -3138,7 +3146,7 @@ mod tests {
             else {
                 continue;
             };
-            if let Ok(Some((name, state, parent))) = stat_of(pid)
+            if let Ok(Some((name, state, parent, _))) = stat_of(pid)
                 && parent == me
             {
                 found.push((pid, name, state));
@@ -3156,11 +3164,11 @@ mod tests {
             .collect())
     }
 
-    /// Whether process `pid` has ended: gone, or a zombie; a look that fails is "not ended" (M2T07R-1050).
+    /// Whether process `pid` has ended: gone, or over; a look that fails is "not ended" (M2T07R-1050).
     fn ended(pid: u32) -> bool {
         match stat_of(pid) {
             Ok(None) => true,
-            Ok(Some((_, state, _))) => state == b'Z',
+            Ok(Some((_, _, _, over))) => over,
             Err(_) => false,
         }
     }
@@ -3170,21 +3178,21 @@ mod tests {
     fn gone(pid: u32) -> bool {
         match stat_of(pid) {
             Ok(None) => true,
-            Ok(Some((_, _, parent))) => parent != std::process::id(),
+            Ok(Some((_, _, parent, _))) => parent != std::process::id(),
             Err(_) => false,
         }
     }
 
     /// Whether every command of `seen` (children named `comm` seen before) is dead: gone, its number now another's,
-    /// or a zombie. Each is looked at by its own number, so a listing that fails or misses one is never taken for
+    /// or over. Each is looked at by its own number, so a listing that fails or misses one is never taken for
     /// its death; a look that fails is "not dead" (M2T07R-1000).
     fn dead(seen: &[(u32, char)], comm: &str) -> bool {
         let me = std::process::id();
         !seen.is_empty()
             && seen.iter().all(|(pid, _)| match stat_of(*pid) {
                 Ok(None) => true,
-                Ok(Some((name, state, parent))) => {
-                    name.as_slice() != comm.as_bytes() || parent != me || state == b'Z'
+                Ok(Some((name, _, parent, over))) => {
+                    name.as_slice() != comm.as_bytes() || parent != me || over
                 }
                 Err(_) => false,
             })

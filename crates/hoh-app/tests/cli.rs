@@ -80,22 +80,22 @@ fn tree_hash(tree: &[(PathBuf, Vec<u8>)]) -> String {
 fn hoh_processes(home: &Path) -> R<BTreeSet<u32>> {
     let binary = std::fs::canonicalize(env!("CARGO_BIN_EXE_hoh"))?;
     let marker = [b"HOME=".as_slice(), home.as_os_str().as_encoded_bytes()].concat();
-    Ok(std::fs::read_dir("/proc")
-        .map(|entries| {
-            entries
-                .filter_map(|e| {
-                    let e = e.ok()?;
-                    let pid: u32 = e.file_name().to_str()?.parse().ok()?;
-                    let ours = std::fs::read_link(e.path().join("exe")).ok()? == binary
-                        && std::fs::read(e.path().join("environ"))
-                            .ok()?
-                            .split(|b| *b == 0)
-                            .any(|v| v == marker);
-                    ours.then_some(pid)
-                })
-                .collect()
-        })
-        .unwrap_or_default())
+    // A listing of /proc that fails is an error, not "none" (docs/adr/ADR-022.md decision 10, v2; CIR-004). A process
+    // whose executable or environment cannot be read has gone or is another user's, so it is none of this test's.
+    let mut found = BTreeSet::new();
+    for entry in std::fs::read_dir("/proc")? {
+        let e = entry?;
+        let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
+            continue;
+        };
+        let ours = std::fs::read_link(e.path().join("exe")).is_ok_and(|exe| exe == binary)
+            && std::fs::read(e.path().join("environ"))
+                .is_ok_and(|environ| environ.split(|b| *b == 0).any(|v| v == marker));
+        if ours {
+            found.insert(pid);
+        }
+    }
+    Ok(found)
 }
 
 /// The first word of each entry line of the section titled `title` in a help text.

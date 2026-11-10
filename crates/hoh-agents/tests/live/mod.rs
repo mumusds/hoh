@@ -3,7 +3,7 @@
 //! the verdict file scripts/product/adapter-live.sh reads.
 
 use super::common::R;
-use hoh_agents::identity::{after_command_name, group_left};
+use hoh_agents::identity::{after_command_name, group_empty, group_left};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -110,12 +110,25 @@ pub fn tool_sleeps(dir: &Path, agent: u32) -> Vec<(u32, u32)> {
         .collect()
 }
 
-/// Processes of `tools` (pid, group) still there, zombies included: each group by the error-keeping scan, each pid by
-/// its stat; a look that fails is an error, never "gone" (ADR-022 decision 10, convention v2; M2T07R-1150).
+/// What is left of group `pgid`: nothing when the kernel finds no member (zombies count: identity::group_empty);
+/// otherwise its members by a scan, for the message only, or the group's own number when the scan, not atomic, finds
+/// none or fails (ADR-022 decision 10, convention v2: a group is empty only by the kernel's look-up; CIR-001).
+fn group_still(pgid: u32) -> Vec<u32> {
+    if group_empty(pgid) {
+        return Vec::new();
+    }
+    match group_left(pgid, 0) {
+        Ok(members) if !members.is_empty() => members,
+        _ => vec![pgid],
+    }
+}
+
+/// Processes of `tools` (pid, group) still there, zombies included: each group by the kernel's look-up, each pid by
+/// its stat (a look that fails is an error, never "gone"; M2T07R-1150).
 pub fn left_of(tools: &[(u32, u32)]) -> R<Vec<u32>> {
     let mut left = Vec::new();
     for (pid, pgid) in tools {
-        left.extend(group_left(*pgid, 0)?);
+        left.extend(group_still(*pgid));
         if stat_of(*pid)?.is_some() {
             left.push(*pid);
         }
@@ -125,11 +138,11 @@ pub fn left_of(tools: &[(u32, u32)]) -> R<Vec<u32>> {
     Ok(left)
 }
 
-/// What is left of a cancelled turn: the agent's group (`leader`'s, zombies included), its tools' processes and
-/// groups, and any process working in `repo`. A look that fails is an error, so a turn is never taken for cleared on a
-/// failed look.
+/// What is left of a cancelled turn: the agent's group (`leader`'s, by the kernel), its tools' processes and groups,
+/// and any process working in `repo`. A look that fails is an error, so a turn is never taken for cleared on a failed
+/// look.
 pub fn left_after(leader: u32, tools: &[(u32, u32)], repo: &Path) -> R<Vec<u32>> {
-    let mut left = group_left(leader, 0)?;
+    let mut left = group_still(leader);
     left.extend(left_of(tools)?);
     left.extend(processes_in(repo)?);
     Ok(left)

@@ -307,10 +307,7 @@ fn the_uninstall_stops_and_disables_a_running_instance_and_keeps_its_project() -
         "{}",
         text(&out)
     );
-    assert!(
-        !Path::new(&format!("/proc/{pid}")).exists(),
-        "the host still runs"
-    );
+    assert!(hoh_agents::identity::reaped(pid)?, "the host still runs");
     assert_eq!(manager.property(&unit, "LoadState")?, "not-found");
     let enabled = manager.systemctl(&["is-enabled", &unit])?;
     assert!(!enabled.status.success(), "{}", text(&enabled));

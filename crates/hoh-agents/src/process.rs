@@ -725,7 +725,6 @@ async fn drain_stderr(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     /// Set by a test: after a group signal to this leader, wait until this file exists (the leader's handler ran).
     static AFTER_GROUP_SIGNAL: std::sync::Mutex<Option<(Pid, PathBuf)>> =
@@ -842,7 +841,8 @@ mod tests {
             None
         })
         .await;
-        let left = Path::new(&format!("/proc/{}", leader.as_raw_pid())).exists();
+        // The test's own child, not reaped by anyone else, so its number is its own: killed unless known reaped.
+        let left = !crate::identity::reaped(leader.as_raw_pid() as u32).unwrap_or(false);
         if left {
             let _ = rustix::process::kill_process(leader, RawSignal::KILL);
         }
@@ -906,7 +906,8 @@ mod tests {
         })
         .await;
         *AFTER_GROUP_SIGNAL.lock().map_err(|_| "hook")? = None;
-        let left = Path::new(&format!("/proc/{}", leader.as_raw_pid())).exists();
+        // The test's own child, not reaped by anyone else, so its number is its own: killed unless known reaped.
+        let left = !crate::identity::reaped(leader.as_raw_pid() as u32).unwrap_or(false);
         if left {
             let _ = rustix::process::kill_process(leader, RawSignal::KILL);
         }

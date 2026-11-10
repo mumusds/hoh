@@ -354,13 +354,18 @@ fn an_installed_binary_holds_its_installation_shared_and_none_while_it_is_being_
     let missing = hold(&exe).expect_err("no lock file");
     assert!(missing.to_string().contains("is missing"), "{missing}");
     std::fs::write(r.join(".lock"), "")?;
-    // Read-only is enough for a shared lock: a lock the user made 0400 is held as well (M2T14R-250).
-    {
+    // Read-only is enough for a shared lock: a lock the user made 0400 is held as well (M2T14R-250). It is let go
+    // explicitly too, as below, and its copy stands in for a forked child's (CIR-050).
+    let read_only_copy = {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(r.join(".lock"), std::fs::Permissions::from_mode(0o400))?;
-        drop(hold(&exe)?.ok_or("held read-only")?);
+        let read_only = hold(&exe)?.ok_or("held read-only")?;
+        let copy = read_only.try_clone()?;
+        rustix::fs::flock(&read_only, rustix::fs::FlockOperation::Unlock)?;
+        drop(read_only);
         std::fs::set_permissions(r.join(".lock"), std::fs::Permissions::from_mode(0o600))?;
-    }
+        copy
+    };
     let first = hold(&exe)?.ok_or("held")?;
     let second = hold(&exe)?.ok_or("held")?;
     // The uninstall's exclusive lock cannot be had while they are held...
@@ -397,7 +402,7 @@ fn an_installed_binary_holds_its_installation_shared_and_none_while_it_is_being_
     // A binary removed under its run (its path read with " (deleted)") is refused.
     let deleted = PathBuf::from(format!("{} (deleted)", exe.display()));
     assert!(hold(&deleted).is_err());
-    drop((copies, copy));
+    drop((copies, copy, read_only_copy));
     // An installation whose root is gone is being removed.
     std::fs::remove_dir_all(&r)?;
     let gone = hold(&exe).expect_err("gone");

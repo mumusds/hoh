@@ -128,7 +128,7 @@ fn test_001_03_without_a_terminal_bare_hoh_is_a_usage_error() -> R {
     assert_eq!(rows(&project)?, rows_before, "store rows");
     assert!(tree(&project)? == tree_before, "the project changed");
     assert_eq!(
-        processes_in(&project),
+        processes_in(&project)?,
         Vec::<u32>::new(),
         "processes in the project"
     );

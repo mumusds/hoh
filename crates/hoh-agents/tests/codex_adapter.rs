@@ -857,6 +857,12 @@ async fn a_deadline_before_the_turn_is_active_stops_it_hard() -> R {
             .iter()
             .any(|m| m["method"] == "turn/interrupt")
     );
+    // The hard stop's row, on this order every run (CIR-057).
+    let row = world.store.reader()?.attempt("A1")?.ok_or("no attempt")?;
+    assert_eq!(
+        (row.state, row.cancel_requested),
+        (AttemptState::Failed, false)
+    );
     Ok(())
 }
 

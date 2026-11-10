@@ -481,7 +481,7 @@ fn a_test_that_fails_early_leaves_no_hoh_behind() -> R {
     );
     drop(s);
     assert!(
-        !Path::new(&format!("/proc/{pid}")).exists(),
+        hoh_agents::identity::reaped(pid)?,
         "hoh {pid} is still there"
     );
     Ok(())
@@ -704,22 +704,27 @@ fn test_043_03_the_tui_leaves_on_sighup_sigterm_and_detach_with_the_host_and_age
 }
 
 /// The `hoh __host <project>` processes of `project`, by their command lines.
-fn hosts_of(project: &Path) -> Vec<u32> {
+/// A listing of /proc that fails is an error, not "no host" (docs/adr/ADR-022.md decision 10, v2; CIR-004).
+fn hosts_of(project: &Path) -> std::io::Result<Vec<u32>> {
     let wanted = format!(
         "{}\0__host\0{}\0",
         env!("CARGO_BIN_EXE_hoh"),
         project.display()
     );
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return Vec::new();
-    };
-    entries
-        .filter_map(Result::ok)
-        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
-        .filter(|pid| {
-            std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| c == wanted.as_bytes())
-        })
-        .collect()
+    let mut hosts = Vec::new();
+    for entry in std::fs::read_dir("/proc")? {
+        let Some(pid) = entry?
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| c == wanted.as_bytes()) {
+            hosts.push(pid);
+        }
+    }
+    Ok(hosts)
 }
 
 /// Stops the hosts the product started for a project when dropped, however the test ends (docs/adr/ADR-021.md
@@ -736,14 +741,15 @@ impl Drop for Daemons {
                 let _ = rustix::process::kill_process(pid, signal);
             }
         };
-        for pid in hosts_of(&self.0) {
+        // Cleanup only: a failed listing stops nothing and asserts nothing.
+        for pid in hosts_of(&self.0).unwrap_or_default() {
             signal(pid, Signal::TERM);
         }
         let end = std::time::Instant::now() + Duration::from_secs(10);
-        while !hosts_of(&self.0).is_empty() && std::time::Instant::now() < end {
+        while hosts_of(&self.0).is_ok_and(|h| !h.is_empty()) && std::time::Instant::now() < end {
             std::thread::sleep(Duration::from_millis(50));
         }
-        for pid in hosts_of(&self.0) {
+        for pid in hosts_of(&self.0).unwrap_or_default() {
             signal(pid, Signal::KILL);
         }
     }

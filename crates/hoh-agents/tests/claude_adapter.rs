@@ -514,59 +514,81 @@ async fn every_line_that_is_not_json_is_its_own_diagnostic_event() -> R {
 }
 
 /// A fake `claude` that ignores SIGINT and SIGTERM (logging them), leaves a grandchild in its group, prints its init
-/// frame and waits; its signal log.
-fn stubborn(world: &World) -> R<(PathBuf, PathBuf)> {
+/// frame, says it is ready and waits; its signal log and its ready file. The grandchild starts before the signals are
+/// blocked, so a SIGTERM to the group ends it; the leader takes them with sigtimedwait, so none is lost in a gap of a
+/// shell's own handling, and logs each by a write of its own (the bash traps this replaces forked a `date` there;
+/// ADR-022 decision 10, convention v2).
+fn stubborn(world: &World) -> R<(PathBuf, PathBuf, PathBuf)> {
     let d = world.dir.path().join("stubborn");
     std::fs::create_dir_all(&d)?;
-    let log = d.join("signals.log");
+    let (log, ready) = (d.join("signals.log"), d.join("ready"));
     let script = world.script(
         "stubborn",
         &format!(
-            "log='{}'\ntrap 'echo INT $(date +%s.%N) >> \"$log\"' INT\ntrap 'echo TERM $(date +%s.%N) >> \"$log\"' TERM\n\
-             sleep 600 &\necho '{INIT}'\nwhile true; do sleep 0.1; done",
-            log.display()
+            "exec python3 -c '\
+import signal, subprocess, sys
+log, ready = sys.argv[1], sys.argv[2]
+subprocess.Popen([\"sleep\", \"600\"])
+wanted = [signal.SIGINT, signal.SIGTERM]
+signal.pthread_sigmask(signal.SIG_BLOCK, wanted)
+print(sys.argv[3], flush=True)
+open(ready, \"w\").close()
+for info in iter(lambda: signal.sigtimedwait(wanted, 600), None): f = open(log, \"a\"); f.write((\"INT\" if info.si_signo == signal.SIGINT else \"TERM\") + chr(10)); f.close()
+' '{}' '{}' '{INIT}'",
+            log.display(),
+            ready.display()
         ),
     )?;
-    Ok((script, log))
+    Ok((script, log, ready))
 }
 
-/// Cancel attempt `id` 300 ms after it runs; the cancel time, the pid, and the group members by `mark` after the
-/// cancel: the scan starts 100 ms before the mark and must end by it, so it never sees a later state (M1T03R-15).
+/// Cancel attempt `id` once its agent says it is ready (`ready`, its own event: convention v2); the cancel time, the pid, whether its group is empty by `mark` after the
+/// cancel (the kernel's look-up, zombies counted: ADR-022 decision 10, convention v2; CIR-001, -052) and, for the
+/// message only, a scan of its members: both start 100 ms before the mark and must end by it, so they never see a
+/// later state (M1T03R-15).
 async fn cancel_and_sample(
     world: &World,
     id: &str,
     cancel: &CancelLatch,
     mark: Duration,
-) -> R<(Instant, u32, Vec<u32>)> {
+    ready: &Path,
+) -> R<(Instant, u32, bool, Result<Vec<u32>, String>)> {
     let pid = running_pid(world, id).await?;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let end = Instant::now() + Duration::from_secs(10);
+    while !ready.exists() {
+        if Instant::now() > end {
+            return Err("the agent never said it was ready".into());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     let at = Instant::now();
     assert_eq!(cancel.request(), CancelReceipt::Accepted);
     tokio::time::sleep_until((at + mark - Duration::from_millis(100)).into()).await;
-    let left = group_left(pid, 0)?;
+    let empty = group_empty(pid);
+    let left = group_left(pid, 0).map_err(|e| e.to_string());
     let ended = at.elapsed();
     if ended > mark {
-        return Err(format!("the scan ended {ended:?} after the cancel").into());
+        return Err(format!("the look ended {ended:?} after the cancel").into());
     }
-    Ok((at, pid, left))
+    Ok((at, pid, empty, left))
 }
 
 #[tokio::test]
 async fn test_025_03_cancel_escalates_to_the_group_and_ends_cancelled() -> R {
     let world = World::new()?;
-    let (script, log) = stubborn(&world)?;
+    let (script, log, ready) = stubborn(&world)?;
     let attempt = world.attempt("A1").await?;
     let mut turn = world.turn(&script, "logs/A1")?;
     turn.escalation = quick();
     let cancel = CancelLatch::new();
     let running = claude::run(&world.store, &attempt, &turn, &cancel);
     // The group is sampled by 3 s after the cancel (AC-025-03), zombies included.
-    let sample = cancel_and_sample(&world, "A1", &cancel, Duration::from_secs(3));
+    let sample = cancel_and_sample(&world, "A1", &cancel, Duration::from_secs(3), &ready);
     let (outcome, sample) = tokio::join!(running, sample);
-    let (outcome, (at, pid, left)) = (outcome?, sample?);
+    let (outcome, (at, pid, empty, left)) = (outcome?, sample?);
     assert!(
-        left.is_empty(),
-        "the group still has {left:?} 3 s after the cancel"
+        empty,
+        "the group is not empty 3 s after the cancel: {left:?}"
     );
     assert!(at.elapsed() >= Duration::from_millis(2900));
     assert_eq!(outcome.state, AttemptState::Cancelled);
@@ -604,7 +626,7 @@ async fn test_025_03_cancel_escalates_to_the_group_and_ends_cancelled() -> R {
 #[tokio::test]
 async fn the_three_second_sample_catches_a_slow_stop() -> R {
     let world = World::new()?;
-    let (script, _) = stubborn(&world)?;
+    let (script, _, ready) = stubborn(&world)?;
     let attempt = world.attempt("A1").await?;
     let mut turn = world.turn(&script, "logs/A1")?;
     turn.escalation = Escalation {
@@ -614,10 +636,10 @@ async fn the_three_second_sample_catches_a_slow_stop() -> R {
     };
     let cancel = CancelLatch::new();
     let running = claude::run(&world.store, &attempt, &turn, &cancel);
-    let sample = cancel_and_sample(&world, "A1", &cancel, Duration::from_secs(3));
+    let sample = cancel_and_sample(&world, "A1", &cancel, Duration::from_secs(3), &ready);
     let (outcome, sample) = tokio::join!(running, sample);
-    let (outcome, (_, pid, left)) = (outcome?, sample?);
-    assert!(!left.is_empty(), "the group was gone before its kill");
+    let (outcome, (_, pid, empty, left)) = (outcome?, sample?);
+    assert!(!empty, "the group was gone before its kill: {left:?}");
     assert_eq!(outcome.state, AttemptState::Cancelled);
     assert!(group_empty(pid));
     Ok(())
@@ -744,7 +766,7 @@ async fn a_cancel_queued_with_the_exit_still_cancels() -> R {
         // Hold the database while the fake speaks and exits; the adapter blocks on the init frame's write.
         let mut holder = hold_store(&world, &go, Duration::from_millis(1500))?;
         for _ in 0..200 {
-            if !Path::new(&format!("/proc/{pid}")).exists() {
+            if hoh_agents::identity::reaped(pid)? {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1297,7 +1319,7 @@ d = sys.argv[1]
 signal.pthread_sigmask(signal.SIG_BLOCK, {{signal.SIGINT, signal.SIGTERM}})
 sys.stdin.read()
 open(os.path.join(d, \"ready\"), \"w\").write(\"ready\\n\")
-end = time.monotonic() + 10
+end = time.monotonic() + 30
 while end > time.monotonic():
     info = signal.sigtimedwait({{signal.SIGINT, signal.SIGTERM}}, end - time.monotonic())
     if info is None:
@@ -1322,15 +1344,19 @@ while end > time.monotonic():
     }
     held.cancel.notify_one();
     let cancelled = Instant::now();
-    // The SIGINT's record, awaited within a bound (convention v2): how soon it comes is not the subject.
+    // The SIGINT's record, awaited until 3 s after the cancel, the bound the test always had (CIR-053); the
+    // stand-in waits 30 s for it, so a missing signal finds it still there to show its status.
     let signals = d.join("signals");
-    let end = Instant::now() + Duration::from_secs(10);
+    let end = cancelled + Duration::from_secs(3);
     while std::fs::read_to_string(&signals).map_or(true, |s| s.is_empty()) {
         if Instant::now() > end {
             let status =
                 std::fs::read_to_string(format!("/proc/{}/status", held.pid)).unwrap_or_default();
+            if let Some(group) = rustix::process::Pid::from_raw(held.pid as i32) {
+                let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+            }
             return Err(format!(
-                "no signal recorded 10 s after the cancel; the agent's status:\n{status}"
+                "no signal recorded 3 s after the cancel; the agent's status:\n{status}"
             )
             .into());
         }

@@ -398,19 +398,27 @@ pub fn signal(Hoh(child): &Hoh, signal: rustix::process::Signal) -> R {
 }
 
 /// Processes other than this one whose working directory is `dir` or below it.
-pub fn processes_in(dir: &Path) -> Vec<u32> {
+///
+/// A listing of /proc that fails is an error, not "none" (docs/adr/ADR-022.md decision 10, v2; CIR-004). A process
+/// whose working directory cannot be read has gone or is another user's, so it is none of this test's.
+pub fn processes_in(dir: &Path) -> R<Vec<u32>> {
     let me = std::process::id();
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
-        .filter(|pid| *pid != me)
-        .filter(|pid| {
-            std::fs::read_link(format!("/proc/{pid}/cwd")).is_ok_and(|cwd| cwd.starts_with(dir))
-        })
-        .collect()
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir("/proc")? {
+        let Some(pid) = entry?
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid != me
+            && std::fs::read_link(format!("/proc/{pid}/cwd")).is_ok_and(|cwd| cwd.starts_with(dir))
+        {
+            found.push(pid);
+        }
+    }
+    Ok(found)
 }
 
 /// Every path under `dir` with its contents, sorted: equal before and after means nothing was written.

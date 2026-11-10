@@ -899,23 +899,21 @@ fn probe_leaves_no_descendant_behind() -> R {
     );
     let (dir, _) = fake(tmp.path(), "bg", "claude", &script)?;
     probe(Agent::Claude, &env_for(&dir))?;
-    let pid = std::fs::read_to_string(&pidfile)?.trim().to_owned();
-    std::thread::sleep(Duration::from_millis(200));
-    let alive = std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .map(|s| {
-            !s.rsplit(')')
-                .next()
-                .unwrap_or_default()
-                .trim_start()
-                .starts_with('Z')
-        })
-        .unwrap_or(false);
-    if alive {
+    let pid: u32 = std::fs::read_to_string(&pidfile)?.trim().parse()?;
+    // Ended by identity::ended, looked at again within a bound: a read that fails is an error, never "ended" (any read
+    // or UTF-8 failure was taken for an end; CIR-003).
+    let end = std::time::Instant::now() + Duration::from_secs(5);
+    let mut ended = hoh_agents::identity::ended(pid, None)?;
+    while !ended && std::time::Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(20));
+        ended = hoh_agents::identity::ended(pid, None)?;
+    }
+    if !ended {
         let _ = std::process::Command::new("kill")
-            .args(["-9", &pid])
+            .args(["-9", &pid.to_string()])
             .status();
     }
-    assert!(!alive, "background child {pid} outlived the probe");
+    assert!(ended, "background child {pid} outlived the probe");
     Ok(())
 }
 
@@ -1837,10 +1835,14 @@ fn a_status_command_is_captured_on_both_streams_and_bounded() -> R {
         "{:?}",
         started.elapsed()
     );
-    let child = std::fs::read_to_string(&pidfile)?.trim().to_owned();
-    std::thread::sleep(Duration::from_millis(200));
+    let child: u32 = std::fs::read_to_string(&pidfile)?.trim().parse()?;
+    // Looked at again within a bound, not once after a fixed sleep; reaped only by /proc's answer (convention v2).
+    let end = std::time::Instant::now() + Duration::from_secs(5);
+    while !hoh_agents::identity::reaped(child)? && std::time::Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(20));
+    }
     assert!(
-        !Path::new(&format!("/proc/{child}")).exists(),
+        hoh_agents::identity::reaped(child)?,
         "the hung command's child {child} is still there"
     );
     let runs = log.lock().map_err(|_| "poisoned")?.clone();
