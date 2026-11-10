@@ -671,6 +671,35 @@ pub enum Fenced {
     },
 }
 
+/// Whether a Commander's `message` is in history already under its id (a decisions row one of its fences wrote): the
+/// same message is (a replay); another message under its id is a reused key, whichever fence sees it (M2T17R-101).
+pub(super) fn recorded_commander_message(
+    tx: &Connection,
+    message: &Message,
+) -> Result<bool, PersistError> {
+    let payload: Option<String> = tx
+        .query_row(
+            "SELECT payload_json FROM decisions WHERE decision_id = ?1",
+            params![message.message_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some(payload) = payload else {
+        return Ok(false);
+    };
+    let recorded = serde_json::to_value(message)
+        .map_err(|e| PersistError::InvalidProposal(format!("{}: {e}", message.message_id)))?;
+    if serde_json::from_str::<Value>(&payload).ok().as_ref() == Some(&recorded) {
+        Ok(true)
+    } else {
+        Err(PersistError::KeyReuse(format!(
+            "{}: another message was recorded under this id",
+            message.message_id
+        )))
+    }
+}
+
 /// The sender's fence of a Commander's steer, query or other message (REQ-019 behaviour 3; ADR-024 decision 6): the
 /// one its every output passes when it enters, as a decision does in [`decide`]. A message whose role_epoch (the
 /// sender's: every message the Commander sends carries its own epoch) is not the commander binding's now is recorded
@@ -699,6 +728,8 @@ pub(super) fn commander_message(
         )
         .optional()
         .map_err(sqlite_error)?;
+    // Another message under the id of one recorded is a reused key, at the current epoch too (M2T17R-05, -101).
+    let existing = recorded_commander_message(&tx, message)?;
     if current == Some(role_epoch) {
         return Ok(Fenced::Current);
     }
@@ -709,24 +740,9 @@ pub(super) fn commander_message(
     );
     let recorded = serde_json::to_value(message)
         .map_err(|e| PersistError::InvalidProposal(format!("{}: {e}", message.message_id)))?;
-    // Given again (a lost answer, a retry): the rejection recorded is the answer, and nothing more is written; another
-    // message under its id is a reused key (M2T17R-05). Its row may come from consume's fence, which records no
-    // decision.rejected event: that event is written once, here.
-    let existing: Option<String> = tx
-        .query_row(
-            "SELECT payload_json FROM decisions WHERE decision_id = ?1",
-            params![message.message_id],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(sqlite_error)?;
-    if let Some(payload) = &existing {
-        if serde_json::from_str::<Value>(payload).ok().as_ref() != Some(&recorded) {
-            return Err(PersistError::KeyReuse(format!(
-                "{}: another message was recorded under this id",
-                message.message_id
-            )));
-        }
+    // Given again (a lost answer, a retry): the rejection recorded is the answer, and nothing more is written. Its row
+    // may come from consume's fence, which records no decision.rejected event: that event is written once, here.
+    if existing {
         let event: Option<(i64, String)> = tx
             .query_row(
                 "SELECT seq, payload_json FROM events WHERE event_id = ?1",

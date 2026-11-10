@@ -612,3 +612,67 @@ async fn an_old_commanders_message_given_again_gets_its_recorded_rejection_and_a
     assert_eq!(written(&path)?, before);
     Ok(())
 }
+
+#[tokio::test]
+async fn another_message_under_a_rejected_messages_id_is_key_reuse_at_either_fence() -> R {
+    // M2T17R-101: the old Commander's message "x" is rejected at epoch 1; a different message under the same id at
+    // the current epoch is a reused key at the Commander's fence, and, queued past it, at the consume's: its effect is
+    // never committed and the history keeps the first message. A different stale message under an id the Commander's
+    // fence recorded is a reused key at the consume's fence too.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    world(&store, &path).await?;
+    hand_over(&store, &path).await?;
+    let old = commander_message("x", 1, "developer", "steer")?;
+    assert!(matches!(
+        store.commander_message(&old).await?,
+        Fenced::Rejected { .. }
+    ));
+    let mut other = commander_message("x", 2, "developer", "steer")?;
+    other.payload.insert("text".to_owned(), json!("another"));
+    match store.commander_message(&other).await {
+        Err(hoh_core::persistence::PersistError::KeyReuse(_)) => {}
+        got => return Err(format!("the Commander's fence: not a reused key: {got:?}").into()),
+    }
+    queue(&store, &other).await?;
+    let now = std::time::SystemTime::now();
+    match store
+        .consume("developer", other.clone(), applied(&other), now)
+        .await
+    {
+        Err(hoh_core::persistence::PersistError::KeyReuse(_)) => {}
+        got => return Err(format!("the consume's fence: not a reused key: {got:?}").into()),
+    }
+    assert_eq!(
+        one(
+            &path,
+            "SELECT count(*) FROM events WHERE kind = 'steer.taken'"
+        )?,
+        "0"
+    );
+    assert_eq!(
+        one(
+            &path,
+            "SELECT json_extract(payload_json, '$.payload.text') FROM decisions WHERE decision_id = 'x'"
+        )?,
+        "stop and rebase"
+    );
+    // Recorded by the Commander's fence first, then another stale message under that id consumed for the first time:
+    // the consume's fence does not keep the first one's history silently, it is a reused key.
+    let z = commander_message("z", 1, "developer", "steer")?;
+    assert!(matches!(
+        store.commander_message(&z).await?,
+        Fenced::Rejected { .. }
+    ));
+    let mut z2 = z.clone();
+    z2.payload.insert("text".to_owned(), json!("changed"));
+    queue(&store, &z2).await?;
+    match store
+        .consume("developer", z2.clone(), applied(&z2), now)
+        .await
+    {
+        Err(hoh_core::persistence::PersistError::KeyReuse(_)) => {}
+        got => return Err(format!("the consume's history: not a reused key: {got:?}").into()),
+    }
+    Ok(())
+}

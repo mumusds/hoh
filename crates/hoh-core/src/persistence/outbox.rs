@@ -567,6 +567,11 @@ pub(super) fn consume(
     message
         .check_payload()
         .map_err(PersistError::IntegrityViolation)?;
+    // A Commander's message under the id of another one in history is a reused key, not a message to act on or to
+    // record over (M2T17R-101).
+    if message.sender_role == super::handover::COMMANDER {
+        super::decide::recorded_commander_message(&tx, message)?;
+    }
     let found = current(&tx, message, consumer)?;
     let (result_json, rejected) = match fence(message, &found) {
         Some((reason, detail)) => {
@@ -677,6 +682,7 @@ fn stale_commander_message(tx: &Transaction<'_>, message: &Message) -> Result<()
     let recorded = serde_json::to_value(message).map_err(|e| {
         PersistError::IntegrityViolation(format!("message {}: {e}", message.message_id))
     })?;
+    // Once: the same message's row, its fence at entry's, stays (another message under its id was refused before).
     tx.execute(
         "INSERT OR IGNORE INTO decisions(decision_id, run_id, role_epoch, expected_revision, reason_code, payload_json, \
          state) VALUES (?1, ?2, ?3, ?4, 'STALE_ROLE_EPOCH', ?5, 'REJECTED')",
