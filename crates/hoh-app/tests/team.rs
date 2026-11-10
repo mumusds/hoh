@@ -1526,3 +1526,212 @@ async fn a_change_to_a_logged_out_agent_is_refused_blocked_auth_and_the_old_bind
     host.shutdown().await;
     Ok(())
 }
+
+/// An executor with the product's registry and no work that holds back each first input while its hold file is
+/// there: every offer is one line of its log, `<message id> <session id> <the commander's epoch in the database at the
+/// offer> <held|took>`, so an offer of a notice its binding has already passed is seen as it is made.
+#[derive(Debug)]
+struct HeldFirstInputs {
+    registry: std::sync::Arc<hoh_app::host::agents::Registry>,
+    project: PathBuf,
+    run_id: std::sync::Mutex<String>,
+    hold: PathBuf,
+    log: PathBuf,
+}
+
+impl hoh_app::host::Executor for HeldFirstInputs {
+    fn registry(&self) -> Option<std::sync::Arc<hoh_app::host::agents::Registry>> {
+        Some(self.registry.clone())
+    }
+
+    fn deliver(
+        &self,
+        _work: &hoh_app::host::Work,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
+        tokio::sync::oneshot::channel().1
+    }
+
+    fn start(
+        &self,
+        _work: &hoh_app::host::Work,
+    ) -> Result<hoh_app::host::Started, hoh_app::host::Refusal> {
+        Err("no work is expected".to_owned().into())
+    }
+
+    fn open_session(
+        &self,
+        start: &hoh_core::persistence::SessionStart,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
+        use std::io::Write as _;
+        let (sent, answer) = tokio::sync::oneshot::channel();
+        let run_id = self.run_id.lock().map(|r| r.clone()).unwrap_or_default();
+        let epoch = query(
+            &self.project,
+            &format!("SELECT role_epoch FROM role_bindings WHERE run_id = '{run_id}' AND role = 'commander'"),
+        )
+        .unwrap_or_else(|e| format!("unread:{e}"));
+        let held = self.hold.exists();
+        let line = format!(
+            "{} {} {epoch} {}\n",
+            start.message_id,
+            start.session_id.as_deref().unwrap_or("-"),
+            if held { "held" } else { "took" }
+        );
+        let logged = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.log)
+            .and_then(|mut f| f.write_all(line.as_bytes()))
+            .map_err(|e| e.to_string());
+        let _ = sent.send(if held {
+            Err("held by the test".to_owned())
+        } else {
+            logged
+        });
+        answer
+    }
+}
+
+#[tokio::test]
+async fn a_session_start_passed_by_the_checkpoint_of_the_same_tick_is_never_offered() -> R {
+    // docs/adr/ADR-024.md decision 4 (M2T17R-01): the commander goes codex -> pi (epoch 2, its session bound, its first
+    // input held back by the executor) -> claude. The tick whose checkpoint applies the second change must not offer
+    // the epoch-2 notice to the executor, which a look at the waiting notices taken before that checkpoint would do;
+    // the notice is superseded, and the epoch-3 one is the only first input taken.
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir()?;
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin)?;
+    let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/protocol");
+    std::fs::write(
+        bin.join("pi"),
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n --version) echo '1.5.0';;\n --help) /bin/cat '{fixtures}/pi/1.5.0/help.txt';;\n \
+             *) exit 2;;\nesac\n"
+        ),
+    )?;
+    std::fs::write(
+        bin.join("claude"),
+        format!(
+            "#!/bin/sh\ncase \"$1 $2\" in\n --version*) echo '2.1.318 (Claude Code)';;\n --help*) /bin/cat \
+             '{fixtures}/claude/2.1.318/help.txt';;\n 'auth status') echo '{{\"loggedIn\": true}}';;\n *) exit 2;;\nesac\n"
+        ),
+    )?;
+    for agent in ["pi", "claude"] {
+        std::fs::set_permissions(bin.join(agent), std::fs::Permissions::from_mode(0o755))?;
+    }
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    let hold = dir.path().join("hold");
+    std::fs::write(&hold, b"")?;
+    let log = dir.path().join("first-inputs.log");
+    let executor = std::sync::Arc::new(HeldFirstInputs {
+        registry: std::sync::Arc::new(hoh_app::host::agents::Registry::new(
+            bin.as_os_str().to_owned(),
+        )),
+        project: project.clone(),
+        run_id: std::sync::Mutex::new(String::new()),
+        hold: hold.clone(),
+        log: log.clone(),
+    });
+    let mut config = config(&project);
+    config.runner = Some(hoh_app::host::RunnerConfig {
+        executor: executor.clone(),
+        context: hoh_core::decision::Context::default(),
+    });
+    let host = start_when_free(config).await?;
+    let run_id = started(&host, "s1").await?;
+    *executor.run_id.lock().map_err(|e| e.to_string())? = run_id.clone();
+    exec(
+        &project,
+        &format!(
+            "INSERT INTO specs(spec_id, project_id, sha256, revision) SELECT 's1', project_id, printf('%064d', 1), 1 \
+             FROM projects; UPDATE runs SET state = 'RUNNING', spec_id = 's1' WHERE run_id = '{run_id}';"
+        ),
+    )?;
+    let commander = format!(
+        "SELECT agent || '/' || role_epoch || '/' || coalesce(session_id, '-') FROM role_bindings \
+         WHERE run_id = '{run_id}' AND role = 'commander'"
+    );
+    let offered = |epoch: u64| -> R<bool> {
+        Ok(std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .any(|l| l.contains(&format!("/session-start/commander/{epoch} "))))
+    };
+    // Waits on the test's runtime, which the host shares: never a blocking sleep.
+    async fn until(what: &str, done: &dyn Fn() -> R<bool>, seen: &dyn Fn() -> R<String>) -> R {
+        let end = std::time::Instant::now() + Duration::from_secs(30);
+        while !done()? {
+            if std::time::Instant::now() > end {
+                return Err(format!("{what}: {}", seen()?).into());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Ok(())
+    }
+    let seen = || query(&project, &commander);
+    for (key, expected, agent) in [("to-pi", 0, "pi"), ("to-claude", 1, "claude")] {
+        let (status, body) = exchange(
+            &host,
+            "POST",
+            "/v1/commands",
+            Some(&configure(
+                key,
+                None,
+                expected,
+                json!({"bindings": {"commander": {"agent": agent}}, "apply_at": "checkpoint"}),
+            )),
+        )
+        .await?;
+        assert_eq!(status, 202, "{body}");
+        let epoch = expected as u64 + 2;
+        let bound = format!("{agent}/{epoch}/{run_id}/session/commander/{epoch}");
+        until(
+            &format!("{agent} bound and offered"),
+            &|| Ok(query(&project, &commander)? == bound && offered(epoch)?),
+            &seen,
+        )
+        .await?;
+    }
+    std::fs::remove_file(&hold)?;
+    let notice = |epoch: u64| {
+        format!(
+            "SELECT o.state || ':' || coalesce(json_extract(r.result_json, '$.rejected'), json_extract(r.result_json, \
+             '$.session_id')) FROM outbox o LEFT JOIN receipts r ON r.message_id = o.message_id \
+             WHERE o.message_id = '{run_id}/session-start/commander/{epoch}'"
+        )
+    };
+    until(
+        "the epoch-3 first input taken",
+        &|| Ok(query(&project, &notice(3))?.starts_with("ACKED:")),
+        &seen,
+    )
+    .await?;
+    host.shutdown().await;
+    let lines = std::fs::read_to_string(&log)?;
+    for line in lines.lines() {
+        let fields: Vec<&str> = line.split(' ').collect();
+        let notice_epoch = fields[0].rsplit('/').next().unwrap_or_default();
+        assert_eq!(
+            notice_epoch, fields[2],
+            "offered a notice its binding had passed: {lines}"
+        );
+    }
+    assert_eq!(
+        query(&project, &notice(2))?,
+        "ACKED:STALE_ROLE_EPOCH",
+        "superseded"
+    );
+    assert_eq!(
+        query(&project, &notice(3))?,
+        format!("ACKED:{run_id}/session/commander/3")
+    );
+    let took: Vec<&str> = lines.lines().filter(|l| l.ends_with(" took")).collect();
+    assert_eq!(took.len(), 1, "{lines}");
+    assert!(
+        took[0].starts_with(&format!("{run_id}/session-start/commander/3 ")),
+        "{lines}"
+    );
+    Ok(())
+}
