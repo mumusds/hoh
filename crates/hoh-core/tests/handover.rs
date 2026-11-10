@@ -256,19 +256,43 @@ async fn test_019_01_a_late_decision_of_the_old_commander_is_rejected_stale_role
     Ok(())
 }
 
+/// The developer taking what is delivered to it, with nothing of its own to commit.
+struct Takes;
+
+impl hoh_core::delivery::Consumer for Takes {
+    fn effect(&self, _: &Message) -> ConsumeEffect {
+        ConsumeEffect::default()
+    }
+}
+
+/// A clock standing still.
+struct Still(std::time::SystemTime);
+
+impl hoh_core::delivery::Clock for Still {
+    fn now(&self) -> std::time::SystemTime {
+        self.0
+    }
+}
+
 #[tokio::test]
 async fn test_019_03_the_new_commanders_dispatches_of_running_or_accepted_tasks_are_rejected() -> R
 {
-    // AC-019-03: before the handover T has one RUNNING attempt, M is ACKED and T2 ACCEPTED. The new Commander's
-    // dispatches of T and T2 (its own epoch, their current revisions) are REJECTED with their reason; T keeps its one
-    // attempt, T2 runs nothing, M's delivery count stays 1. (These state checks predate M2-T17: the test holds them
-    // across the handover.)
+    // AC-019-03 (TEST-019-03's steps): before the handover T has one RUNNING attempt A, M is ACKED and T2 ACCEPTED.
+    // After the handover the new Commander's dispatches of T and T2 (its own epoch, the run's revision) are REJECTED
+    // with their reason; the delivery loop runs (it delivers a message pending for the developer, and never M again);
+    // A settles through the runner's settle (the developer's in-flight result is not fenced by the Commander's
+    // handover, REQ-019 decision 1) and a round runs after it. Then T has had one attempt, T2 none, M one delivery.
     let dir = tempfile::tempdir()?;
     let (store, path) = open(&dir)?;
     world(&store, &path).await?;
-    hand_over(&store, &path).await?;
     let attempts = "SELECT (SELECT count(*) FROM attempts WHERE task_id = 'T') || '/' || \
                     (SELECT count(*) FROM attempts WHERE task_id = 'T2')";
+    let delivered = |id: &str| {
+        format!("SELECT state || '/' || attempt_count FROM outbox WHERE message_id = '{id}'")
+    };
+    assert_eq!(one(&path, attempts)?, "1/0");
+    assert_eq!(one(&path, &delivered("M"))?, "ACKED/1");
+    hand_over(&store, &path).await?;
     // A decision expects the run's revision (as decide's own tests send it), its current one: only the tasks' states
     // can refuse these dispatches.
     let run: u64 = one(&path, "SELECT revision FROM runs WHERE run_id = 'R'")?.parse()?;
@@ -299,20 +323,61 @@ async fn test_019_03_the_new_commanders_dispatches_of_running_or_accepted_tasks_
         )?,
         "REJECTED:ILLEGAL_TRANSITION,REJECTED:ILLEGAL_TRANSITION"
     );
+    // The delivery loop, with a message pending for the developer: it is delivered once, M is not taken again.
+    let pending: Message = serde_json::from_value(json!({
+        "schema_version": "1.0", "message_id": "P", "run_id": "R", "task_id": "T", "attempt_id": "A",
+        "sender_role": "runtime", "recipient_role": "developer", "role_epoch": 1, "correlation_id": "c",
+        "causation_id": null, "idempotency_key": "k-P", "expected_revision": 5,
+        "spec_sha256": format!("{:064}", 1), "candidate_id": null, "kind": "steer", "payload": {"text": "go on"}
+    }))?;
+    queue(&store, &pending).await?;
+    let clock = Still(std::time::SystemTime::now());
+    let local = hoh_core::delivery::LocalTransport::new(&store, &clock).with("developer", Takes);
+    let dispatcher = hoh_core::delivery::Dispatcher {
+        store: &store,
+        clock: &clock,
+        transport: &local,
+        roles: local.roles(),
+        max_attempts: 3,
+        batch: 10,
+    };
+    for _ in 0..3 {
+        dispatcher.tick().await?;
+    }
+    assert_eq!(one(&path, &delivered("P"))?, "ACKED/1", "the loop ran");
     assert_eq!(
-        one(
-            &path,
-            "SELECT state || '/' || attempt_count FROM outbox WHERE message_id = 'M'"
-        )?,
-        "ACKED/1"
+        one(&path, &delivered("M"))?,
+        "ACKED/1",
+        "M not delivered again"
+    );
+    // A settles as the runner settles a turn that ended well; a round after it dispatches nothing of T or T2.
+    assert!(
+        store
+            .runner_finished(
+                "A",
+                hoh_core::persistence::Ending {
+                    success: true,
+                    detail: "done".to_owned(),
+                    class: hoh_core::retry::FailureClass::Transient { retry_after: None },
+                    at: std::time::SystemTime::now(),
+                    draw: 0,
+                    observed: hoh_core::persistence::Observed::default(),
+                    unknown_effect: false,
+                },
+            )
+            .await?
     );
     assert_eq!(
         one(
             &path,
-            "SELECT state || '/' || revision FROM tasks WHERE task_id IN ('T', 'T2') ORDER BY task_id LIMIT 1"
+            "SELECT a.state || '/' || t.state FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+             WHERE a.attempt_id = 'A'"
         )?,
-        "RUNNING/5"
+        "SETTLED/IMPLEMENTED"
     );
+    store.schedule_round("R", Context::default()).await?;
+    assert_eq!(one(&path, attempts)?, "1/0", "after T settled");
+    assert_eq!(one(&path, &delivered("M"))?, "ACKED/1");
     assert_eq!(
         one(&path, "SELECT state FROM tasks WHERE task_id = 'T2'")?,
         "ACCEPTED"
