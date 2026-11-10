@@ -1049,11 +1049,13 @@ async fn a_late_failure_of_an_earlier_delivery_does_not_undo_a_later_success() -
     Ok(())
 }
 
-/// A transport whose delivery of `stuck` never returns.
+/// A transport whose delivery of `stuck` never returns; each time it is taken, `taken` is told, so a test cancels the
+/// tick only once it is known to hang there (ADR-022 decision 10, convention v2).
 struct Stuck<'a, T: Transport> {
     inner: &'a T,
     stuck: &'static str,
     calls: Mutex<Vec<String>>,
+    taken: tokio::sync::mpsc::UnboundedSender<()>,
 }
 
 impl<T: Transport> Transport for Stuck<'_, T> {
@@ -1062,6 +1064,7 @@ impl<T: Transport> Transport for Stuck<'_, T> {
             calls.push(row.message_id.clone());
         }
         if row.message_id == self.stuck {
+            let _ = self.taken.send(());
             std::future::pending::<()>().await;
         }
         self.inner.deliver(row).await
@@ -1072,6 +1075,20 @@ impl<T: Transport> Transport for Stuck<'_, T> {
 async fn deliveries_taken_and_never_settled_stop_at_the_limit_and_cost_no_other_message() -> R {
     // M2T04R-02, -03: each tick hangs on `a` and is cancelled; `b`, behind it, must not lose deliveries it never got,
     // and `a` must go to DEAD_LETTER once its deliveries are spent, not be taken forever.
+    taken_and_never_settled(false).await
+}
+
+#[tokio::test]
+async fn deliveries_taken_and_never_settled_stop_at_the_limit_even_when_the_store_is_slow() -> R {
+    // The same with another connection holding the database for 300 ms before the fourth tick: no part of the test
+    // rests on how fast a tick reaches its rows (a 200 ms budget per tick cut the fourth before it reached `b` on a slow
+    // runner, CI run 42801472092).
+    taken_and_never_settled(true).await
+}
+
+/// Three ticks hang on `a`, each cancelled once it is known to hang there; the fourth runs to its end (`hold`: with
+/// the database held for 300 ms when it starts).
+async fn taken_and_never_settled(hold: bool) -> R {
     let dir = tempfile::tempdir()?;
     let (store, db) = open(&dir)?;
     seed(&db, WORLD)?;
@@ -1086,10 +1103,12 @@ async fn deliveries_taken_and_never_settled_stop_at_the_limit_and_cost_no_other_
     .await?;
     let clock = FakeClock::new();
     let local = LocalTransport::new(&store, &clock).with("qa", Noop);
+    let (taken, mut hung) = tokio::sync::mpsc::unbounded_channel();
     let transport = Stuck {
         inner: &local,
         stuck: "a",
         calls: Mutex::new(Vec::new()),
+        taken,
     };
     let dispatcher = Dispatcher {
         store: &store,
@@ -1099,10 +1118,36 @@ async fn deliveries_taken_and_never_settled_stop_at_the_limit_and_cost_no_other_
         max_attempts: 3,
         batch: 2,
     };
-    for _ in 0..4 {
-        let _ = tokio::time::timeout(Duration::from_millis(200), dispatcher.tick()).await;
+    for round in 1..=3 {
+        tokio::select! {
+            ended = dispatcher.tick() => {
+                return Err(format!("round {round}: the tick ended without hanging on `a`: {ended:?}").into());
+            }
+            Some(()) = hung.recv() => {}
+        }
         clock.set(clock.now() + Duration::from_secs(120));
     }
+    let held = if hold {
+        let holder = Holder::hold(&db)?;
+        Some(std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            holder.release().map_err(|e| e.to_string())
+        }))
+    } else {
+        None
+    };
+    // `a`'s deliveries are spent: the fourth tick dead-letters it and delivers `b`, running to its end (the bound only
+    // turns a hang into a failure); `a` taken once more fails at once.
+    tokio::select! {
+        ended = tokio::time::timeout(Duration::from_secs(60), dispatcher.tick()) => {
+            ended.map_err(|_| "the fourth tick did not end within 60 s")??;
+        }
+        Some(()) = hung.recv() => return Err("`a` was taken a fourth time".into()),
+    }
+    if let Some(held) = held {
+        held.join().map_err(|_| "the holder panicked")??;
+    }
+    assert!(hung.try_recv().is_err(), "`a` taken again");
     let calls = transport
         .calls
         .lock()
