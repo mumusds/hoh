@@ -4168,7 +4168,9 @@ fn test_019_05_a_host_killed_after_the_handover_commit_keeps_epoch_2_and_starts_
         served <= Duration::from_secs(30),
         "reconciled and serving after {served:?}"
     );
-    let end = Instant::now() + Duration::from_secs(30);
+    // AC-019-05's bound runs from the restart to the reconcile's end, the new Commander's session bound and its first
+    // input given included (M2T17R-56): one 30 s from the restart, not another 30 s from serving.
+    let end = restarted + Duration::from_secs(30);
     let delivered = |project: &Path| -> R<bool> {
         Ok(
             query(&db(project), commander)? == "pi/2/R/session/commander/2"
@@ -4179,7 +4181,7 @@ fn test_019_05_a_host_killed_after_the_handover_commit_keeps_epoch_2_and_starts_
     while !delivered(&project)? {
         assert!(
             Instant::now() < end,
-            "{} / {}",
+            "not reconciled 30 s after the restart: {} / {}",
             query(&db(&project), commander)?,
             query(&db(&project), notice)?
         );

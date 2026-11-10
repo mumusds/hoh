@@ -242,5 +242,15 @@ fn a_first_input_is_kept_once_whole_and_another_is_refused()
         .map(|e| e.map(|e| e.file_name()))
         .collect::<Result<_, _>>()?;
     assert_eq!(names.len(), 1, "{names:?}");
+    // A crash between the staging and its removal left a staged file (another pid's): the notice given again keeps
+    // the input and leaves no staged file (M2T17R-55).
+    let leftover = path
+        .parent()
+        .ok_or("dir")?
+        .join(format!(".1.{}", "R%2Fsession-start%2Fcommander%2F2"));
+    std::fs::write(&leftover, b"half")?;
+    keep_first_input(project.path(), &start)?;
+    assert!(!leftover.exists(), "the leftover staged file");
+    assert_eq!(std::fs::read(&path)?, kept);
     Ok(())
 }

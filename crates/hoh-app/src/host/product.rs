@@ -74,8 +74,10 @@ pub fn first_input_path(project: &Path, session_id: &str) -> PathBuf {
 }
 
 /// Keep `start`'s package as its session's first input: written whole to a file of its own, then linked to its place,
-/// which fails if anything is there already, so the place only ever holds a whole input and only one. The same input
-/// there already (a notice given again after a crash) is taken; another one is refused.
+/// which fails if anything is there already, so the place only ever holds a whole input and only one, and the
+/// directory synced so the link outlives a power loss before the notice is settled (M2T17R-55). The same input there
+/// already (a notice given again after a crash) is taken; another one is refused. A staged file a crash left for this
+/// notice is removed first: the notice is given again until it is settled, so none outlives its settle.
 fn keep_first_input(project: &Path, start: &SessionStart) -> Result<(), String> {
     use std::io::Write as _;
     let session = start
@@ -89,16 +91,23 @@ fn keep_first_input(project: &Path, start: &SessionStart) -> Result<(), String> 
     .map_err(|e| e.to_string())?;
     let dir = path.parent().ok_or("no directory")?;
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let staged = dir.join(format!(
-        ".{}.{}",
-        std::process::id(),
-        component(&start.message_id)
-    ));
+    let suffix = format!(".{}", component(&start.message_id));
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') && name.ends_with(&suffix) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    let staged = dir.join(format!(".{}{suffix}", std::process::id()));
     let written = (|| {
         let mut file = std::fs::File::create(&staged)?;
         file.write_all(&body)?;
         file.sync_all()?;
-        std::fs::hard_link(&staged, &path)
+        std::fs::hard_link(&staged, &path)?;
+        std::fs::File::open(dir)?.sync_all()
     })();
     let _ = std::fs::remove_file(&staged);
     match written {
