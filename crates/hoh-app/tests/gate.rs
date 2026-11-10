@@ -8,7 +8,9 @@ use std::process::{Command, Stdio};
 
 type R<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
-/// `hoh __gate <argv>` given `input` on stdin (then closed): its exit code and stdout, and its pid.
+/// `hoh __gate <argv>` given `input` on stdin (then closed): its exit code and stdout, and its pid. A gate may end
+/// without reading all of it (a usage error, a closed gate): the write then meets a closed pipe, which is no failure
+/// of the test; its exit code and output say what the gate did.
 fn gate(argv: &[&str], input: &[u8]) -> R<(Option<i32>, String, u32)> {
     let mut child = Command::new(env!("CARGO_BIN_EXE_hoh"))
         .arg("__gate")
@@ -19,7 +21,10 @@ fn gate(argv: &[&str], input: &[u8]) -> R<(Option<i32>, String, u32)> {
         .spawn()?;
     let pid = child.id();
     let mut stdin = child.stdin.take().ok_or("no stdin")?;
-    stdin.write_all(input)?;
+    match stdin.write_all(input) {
+        Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => return Err(e.into()),
+        _ => {}
+    }
     drop(stdin);
     let out = child.wait_with_output()?;
     Ok((out.status.code(), String::from_utf8(out.stdout)?, pid))
@@ -71,7 +76,11 @@ fn a_gate_closed_or_told_anything_but_go_runs_nothing() -> R {
 
 #[test]
 fn a_gate_without_a_program_is_a_usage_error() -> R {
-    let (code, _, _) = gate(&[], b"go\n")?;
+    // It ends without reading its input. An input larger than a pipe holds makes the helper's write meet that end
+    // every time (CI run 42845398965 met it once with "go\n" alone: Broken pipe): the exit code is the answer.
+    let mut input = b"go\n".to_vec();
+    input.resize(1 << 20, b'x');
+    let (code, _, _) = gate(&[], &input)?;
     assert_eq!(code, Some(64));
     Ok(())
 }
