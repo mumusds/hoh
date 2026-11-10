@@ -21,7 +21,7 @@ use hoh_agents::identity;
 use hoh_core::decision::Context;
 use hoh_core::delivery::Clock;
 use hoh_core::persistence::{
-    Commit, DispatchNotice, Ending, NewEvent, PersistError, UnfinishedRow,
+    Commit, DispatchNotice, Ending, NewEvent, PersistError, SessionStart, UnfinishedRow,
 };
 use hoh_core::reconcile::{
     Disposition, Effect, EffectState, Process, Unfinished, dispose, work_key,
@@ -167,6 +167,15 @@ pub trait Executor: Send + Sync + std::fmt::Debug {
     /// it, waits for the group to be empty and reports that in [`Outcome::group_gone`] (the hoh-agents substrate's
     /// order: group SIGKILL, reap, `group_gone`).
     fn start(&self, work: &Work) -> Result<Started, Refusal>;
+    /// Give a role's new holder its first input, the checkpoint package of `start` (docs/adr/ADR-024.md decision 4),
+    /// for `start`'s session: the answer says the executor has it. It may be asked again for the same notice (the
+    /// answer lost in a crash) and takes it again without harm. The default takes none, so the notice waits.
+    fn open_session(&self, _start: &SessionStart) -> oneshot::Receiver<Result<(), String>> {
+        let (sent, answer) = oneshot::channel();
+        let _ = sent.send(Err("this executor opens no sessions".to_owned()));
+        answer
+    }
+
     /// Ask `work`'s process to stop the agent's own way (its native cancel), before any signal: the first step when its
     /// lease expired (AC-041-02). It only asks and returns at once: the settle looks at the group around it
     /// (M2T05R-452). Whether it asked a turn it still holds: only then does the settle wait the native grace, and its
@@ -203,6 +212,9 @@ pub struct RunnerConfig {
 /// How often the runner looks again when nothing woke it.
 const TICK: Duration = Duration::from_millis(200);
 
+/// How long a tick waits for the executor to take a new holder's first input; past it the notice waits for the next.
+const OPEN_SESSION: Duration = Duration::from_secs(10);
+
 /// How long the host's stop waits for a probe running to end: its command's polling (10 ms) and its leader's reaping
 /// (1 s at most).
 const PROBE_STOP: Duration = Duration::from_secs(5);
@@ -227,6 +239,8 @@ struct Common {
     passes: AtomicU64,
     jitter: Arc<Jitter>,
     inflight: super::control::Inflight,
+    /// The session.start notices whose delivery failure was already said (once each).
+    undelivered: std::sync::Mutex<std::collections::BTreeSet<String>>,
 }
 
 impl Common {
@@ -279,6 +293,7 @@ pub(super) async fn run(
         passes: AtomicU64::new(0),
         jitter,
         inflight,
+        undelivered: std::sync::Mutex::default(),
     });
     let registry = config.executor.registry();
     let watch = registry
@@ -424,6 +439,43 @@ async fn tick(
             .iter()
             .map(|(role, contract)| (role.clone(), super::agents::required(contract.as_deref())))
             .collect();
+    }
+    // The new holders' first inputs (docs/adr/ADR-024.md decision 4): a notice its binding has passed is superseded,
+    // never delivered; one of the binding's own epoch goes to its session once the binder granted it, and is settled
+    // when the executor has it (at least once: a crash before the settle gives it again).
+    for start in &waiting.session_starts {
+        if start.current_epoch > start.role_epoch {
+            store.supersede_session_start(&start.message_id).await?;
+            continue;
+        }
+        let Some(session) = &start.session_id else {
+            continue;
+        };
+        let answer = tokio::time::timeout(OPEN_SESSION, common.executor.open_session(start)).await;
+        let failure = match answer {
+            Ok(Ok(Ok(()))) => {
+                store
+                    .deliver_session_start(&start.message_id, session)
+                    .await?;
+                continue;
+            }
+            Ok(Ok(Err(e))) => e,
+            Ok(Err(_)) => "the executor dropped the request".to_owned(),
+            Err(_) => format!("no answer within {OPEN_SESSION:?}"),
+        };
+        if common
+            .undelivered
+            .lock()
+            .is_ok_and(|mut said| said.insert(start.message_id.clone()))
+        {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "hoh host: the {} session {session} did not take its first input ({}): {failure}",
+                start.role,
+                start.message_id
+            );
+        }
     }
     // The time taken afresh for each pace and each round, never one from before an awaited step (a settle, the
     // writer's queue): a round after the deadline dispatches nothing (M2T19R-04); with the team's capabilities.

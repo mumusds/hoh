@@ -118,3 +118,147 @@ pub(super) fn prepare(
     };
     Ok((event, notice))
 }
+
+/// A session.start notice waiting for the runner (decision 4): its package, and the binding of its role as it is now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionStart {
+    pub message_id: String,
+    pub run_id: String,
+    pub role: String,
+    /// The epoch the notice was written for.
+    pub role_epoch: i64,
+    pub package: crate::protocol::ContextHandoff,
+    /// The binding's epoch now: past the notice's, the notice is superseded.
+    pub current_epoch: i64,
+    /// The binding's session, none until the binder grants one.
+    pub session_id: Option<String>,
+    pub agent: String,
+}
+
+/// The session.start notices PENDING in project `project_id`'s runs not ended, oldest first.
+pub(super) fn waiting(
+    conn: &Connection,
+    project_id: &str,
+) -> Result<Vec<SessionStart>, PersistError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT o.message_id, o.run_id, b.role, o.role_epoch, json_extract(o.payload_json, '$.package'), \
+             b.role_epoch, b.session_id, b.agent FROM outbox o JOIN runs r ON r.run_id = o.run_id \
+             JOIN role_bindings b ON b.run_id = o.run_id AND b.role = json_extract(o.payload_json, '$.role') \
+             WHERE r.project_id = ?1 AND o.state = 'PENDING' AND json_extract(o.payload_json, '$.notice') IS 'runtime' \
+             AND json_extract(o.payload_json, '$.kind') IS 'session.start' \
+             AND r.state NOT IN ('CANCELLED', 'COMPLETED', 'FAILED', 'INCOMPLETE') ORDER BY o.event_seq, o.message_id",
+        )
+        .map_err(sqlite_error)?;
+    let rows = statement
+        .query_map(params![project_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, String>(7)?,
+            ))
+        })
+        .map_err(sqlite_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sqlite_error)?;
+    rows.into_iter()
+        .map(
+            |(message_id, run_id, role, role_epoch, package, current_epoch, session_id, agent)| {
+                let package = serde_json::from_str(&package)
+                    .map_err(|e| e.to_string())
+                    .and_then(|v| crate::protocol::decode(&v).map_err(|e| e.to_string()))
+                    .map_err(|e| {
+                        PersistError::IntegrityViolation(format!(
+                            "the package of {message_id}: {e}"
+                        ))
+                    })?;
+                Ok(SessionStart {
+                    message_id,
+                    run_id,
+                    role,
+                    role_epoch,
+                    package,
+                    current_epoch,
+                    session_id,
+                    agent,
+                })
+            },
+        )
+        .collect()
+}
+
+/// Settle session.start notice `message_id` (decision 4), in one transaction: `Some(session)` once the executor took
+/// its package for that session, which must be its binding's at the notice's own epoch (receipt, ACKED,
+/// handoff.delivered); `None` when the binding has passed the notice's epoch, so it is never delivered (a rejected
+/// receipt, STALE_ROLE_EPOCH, ACKED, handoff.superseded). Whether it was still PENDING and so settled.
+pub(super) fn settle(
+    conn: &mut Connection,
+    message_id: &str,
+    delivered_to: Option<&str>,
+    ctx: &super::writer::Ctx<'_>,
+) -> Result<bool, PersistError> {
+    let tx = super::writer::begin(conn, ctx)?;
+    let row: Option<(String, String, i64, i64, Option<String>, String)> = tx
+        .query_row(
+            "SELECT o.run_id, b.role, o.role_epoch, b.role_epoch, b.session_id, r.project_id FROM outbox o \
+             JOIN runs r ON r.run_id = o.run_id \
+             JOIN role_bindings b ON b.run_id = o.run_id AND b.role = json_extract(o.payload_json, '$.role') \
+             WHERE o.message_id = ?1 AND o.state = 'PENDING' AND json_extract(o.payload_json, '$.notice') IS 'runtime' \
+             AND json_extract(o.payload_json, '$.kind') IS 'session.start'",
+            params![message_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some((run_id, role, epoch, current, session, project_id)) = row else {
+        return Ok(false);
+    };
+    let (kind, result) = match delivered_to {
+        Some(to) if current == epoch && session.as_deref() == Some(to) => (
+            "handoff.delivered",
+            json!({"session_id": to, "role_epoch": epoch}),
+        ),
+        None if current > epoch => (
+            "handoff.superseded",
+            json!({"rejected": "STALE_ROLE_EPOCH", "role_epoch": epoch, "current_epoch": current}),
+        ),
+        _ => return Ok(false),
+    };
+    let at = crate::time::now_rfc3339();
+    tx.execute(
+        "INSERT INTO receipts(consumer, message_id, applied_at, result_json) VALUES (?1, ?2, ?3, ?4)",
+        params![super::runner::RUNNER, message_id, at, result.to_string()],
+    )
+    .map_err(sqlite_error)?;
+    tx.execute(
+        "UPDATE outbox SET state = 'ACKED', next_retry_at = NULL WHERE message_id = ?1",
+        params![message_id],
+    )
+    .map_err(sqlite_error)?;
+    let mut payload = json!({"run_id": run_id, "role": role, "message_id": message_id});
+    if let (Some(object), Some(extra)) = (payload.as_object_mut(), result.as_object()) {
+        object.extend(extra.clone());
+    }
+    super::writer::write(
+        &tx,
+        &super::writer::Commit {
+            events: vec![super::writer::NewEvent {
+                project_id,
+                event_id: crate::ids::child_id(message_id, kind),
+                run_id: Some(run_id),
+                kind: kind.to_owned(),
+                payload,
+            }],
+            ..super::writer::Commit::default()
+        },
+        ctx,
+    )?;
+    ctx.before_commit()?;
+    tx.commit().map_err(sqlite_error)?;
+    Ok(true)
+}

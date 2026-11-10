@@ -7,7 +7,7 @@ use super::runner::{Executor, Gate, Outcome, Refusal, Started, Work};
 use hoh_agents::adapter::{AttemptRef, Facts, GateCommand, Recorded};
 use hoh_agents::compat::Agent;
 use hoh_core::lifecycle::AttemptState;
-use hoh_core::persistence::{Observed, PromptRecord};
+use hoh_core::persistence::{Observed, PromptRecord, SessionStart};
 use hoh_core::retry::FailureClass;
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -64,6 +64,52 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// `id` as one path component: `%` and `/` escaped, so distinct ids stay distinct.
 fn component(id: &str) -> String {
     id.replace('%', "%25").replace('/', "%2F")
+}
+
+/// Where HoH session `session_id`'s first input is kept for its first turn (docs/adr/ADR-024.md decision 4).
+pub fn first_input_path(project: &Path, session_id: &str) -> PathBuf {
+    project
+        .join(".hoh/first-inputs")
+        .join(format!("{}.json", component(session_id)))
+}
+
+/// Keep `start`'s package as its session's first input: written whole to a file of its own, then linked to its place,
+/// which fails if anything is there already, so the place only ever holds a whole input and only one. The same input
+/// there already (a notice given again after a crash) is taken; another one is refused.
+fn keep_first_input(project: &Path, start: &SessionStart) -> Result<(), String> {
+    use std::io::Write as _;
+    let session = start
+        .session_id
+        .as_deref()
+        .ok_or("the binding has no session")?;
+    let path = first_input_path(project, session);
+    let body = serde_json::to_vec(&serde_json::json!({
+        "message_id": start.message_id, "session_id": session, "package": start.package,
+    }))
+    .map_err(|e| e.to_string())?;
+    let dir = path.parent().ok_or("no directory")?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let staged = dir.join(format!(
+        ".{}.{}",
+        std::process::id(),
+        component(&start.message_id)
+    ));
+    let written = (|| {
+        let mut file = std::fs::File::create(&staged)?;
+        file.write_all(&body)?;
+        file.sync_all()?;
+        std::fs::hard_link(&staged, &path)
+    })();
+    let _ = std::fs::remove_file(&staged);
+    match written {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => match std::fs::read(&path) {
+            Ok(there) if there == body => Ok(()),
+            Ok(_) => Err(format!("{} holds another first input", path.display())),
+            Err(e) => Err(format!("{}: {e}", path.display())),
+        },
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
 }
 
 /// The id HoH gives a new Pi session for HoH session `session_id` (ADR-013 decision 1): a UUID-shaped digest of it, the
@@ -292,6 +338,14 @@ impl Executor for ProductExecutor {
                 let _ = tx.send(Ok(()));
             }
         }
+        rx
+    }
+
+    /// The new holder's first input kept for its session's first turn (`first_input_path`): the Commander's turns
+    /// begin with it (M2-T08).
+    fn open_session(&self, start: &SessionStart) -> oneshot::Receiver<Result<(), String>> {
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(keep_first_input(&self.project, start));
         rx
     }
 

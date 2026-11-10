@@ -27,6 +27,7 @@ mod rounds;
 mod runner;
 mod team;
 pub use control::{CancelPass, Finished, PauseStep};
+pub use handover::SessionStart;
 pub use leases::{Grant, LEASE_TTL, LeaseView};
 pub use outbox::{ConsumeEffect, Consumed, OutboxRow, Settlement, backoff};
 pub use plan::Imported;
@@ -861,6 +862,27 @@ impl Store {
     /// A runtime notice taken (ACKED); false when it was not PENDING.
     pub async fn ack_notice(&self, message_id: &str) -> Result<bool, PersistError> {
         self.runner_step(runner::RunnerJob::Ack(message_id.to_owned()))
+            .await
+    }
+
+    /// Settle session.start notice `message_id` as delivered to `session_id`, which must be its role's session at the
+    /// notice's own epoch (docs/adr/ADR-024.md decision 4); whether it was PENDING and so settled.
+    pub async fn deliver_session_start(
+        &self,
+        message_id: &str,
+        session_id: &str,
+    ) -> Result<bool, PersistError> {
+        self.runner_step(runner::RunnerJob::SessionStart(
+            message_id.to_owned(),
+            Some(session_id.to_owned()),
+        ))
+        .await
+    }
+
+    /// Settle session.start notice `message_id` as superseded, its role's binding being past its epoch (decision 4);
+    /// whether it was PENDING and so settled.
+    pub async fn supersede_session_start(&self, message_id: &str) -> Result<bool, PersistError> {
+        self.runner_step(runner::RunnerJob::SessionStart(message_id.to_owned(), None))
             .await
     }
 

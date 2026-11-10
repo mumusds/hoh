@@ -1449,3 +1449,138 @@ async fn a_commander_change_of_a_run_without_a_spec_is_refused_until_the_run_has
     assert_eq!(notices(&path)?, 1);
     Ok(())
 }
+
+#[tokio::test]
+async fn a_session_start_goes_once_to_its_epochs_session_and_a_superseded_one_never() -> R {
+    // ADR-024 decision 4: the runner sees a commander's session.start notice with its package and the binding's
+    // epoch and session; it is delivered only to the session of the notice's own epoch, once (receipt, ACKED,
+    // handoff.delivered); a notice whose epoch the binding has passed is never delivered, only superseded (receipt
+    // rejected STALE_ROLE_EPOCH, ACKED, handoff.superseded).
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    working(&store, &path).await?;
+    let change = |key: &str, expected: i64, agent: &str| {
+        team_change(key, expected, json!({"commander": {"agent": agent}}))
+    };
+    let checkpoint = || store.team_checkpoint("R1", crate::persistence::Availability::default());
+    store.submit_command(change("pi", 0, "pi")).await?;
+    checkpoint().await?;
+    let start = store
+        .runner_waiting("p1")
+        .await?
+        .session_starts
+        .pop()
+        .ok_or("no session start")?;
+    assert_eq!(
+        (
+            start.role.as_str(),
+            start.role_epoch,
+            start.current_epoch,
+            start.session_id.as_deref(),
+            start.agent.as_str()
+        ),
+        ("commander", 2, 2, None, "pi")
+    );
+    assert_eq!(
+        (start.package.role_epoch, start.package.run_id.as_str()),
+        (2, "R1")
+    );
+    assert!(
+        !store
+            .deliver_session_start(&start.message_id, "R1/session/commander/2")
+            .await?,
+        "no session yet"
+    );
+    store
+        .bind_session(crate::persistence::SessionGrant {
+            run_id: "R1".to_owned(),
+            role: "commander".to_owned(),
+            role_epoch: 2,
+            agent: "pi".to_owned(),
+            agent_version: "1".to_owned(),
+            capabilities: json!({}),
+        })
+        .await?;
+    let start = store
+        .runner_waiting("p1")
+        .await?
+        .session_starts
+        .pop()
+        .ok_or("no session start")?;
+    let session = start.session_id.clone().ok_or("no session")?;
+    assert!(
+        !store.supersede_session_start(&start.message_id).await?,
+        "its epoch is the binding's"
+    );
+    assert!(
+        !store
+            .deliver_session_start(&start.message_id, "another")
+            .await?
+    );
+    assert!(
+        store
+            .deliver_session_start(&start.message_id, &session)
+            .await?
+    );
+    assert!(
+        !store
+            .deliver_session_start(&start.message_id, &session)
+            .await?,
+        "once"
+    );
+    assert!(store.runner_waiting("p1").await?.session_starts.is_empty());
+    let settled = |id: &str| -> R<Vec<Vec<Value>>> {
+        values(
+            &path,
+            &format!(
+                "SELECT o.state, r.consumer, r.result_json, (SELECT group_concat(kind) FROM events \
+                 WHERE kind IN ('handoff.delivered', 'handoff.superseded') \
+                 AND json_extract(payload_json, '$.message_id') = o.message_id) \
+                 FROM outbox o JOIN receipts r ON r.message_id = o.message_id WHERE o.message_id = '{id}'"
+            ),
+        )
+    };
+    let delivered = settled(&start.message_id)?;
+    assert_eq!(
+        delivered[0][..2],
+        [json!("ACKED"), json!("runner")],
+        "{delivered:?}"
+    );
+    assert_eq!(delivered[0][3], json!("handoff.delivered"));
+    assert_eq!(
+        serde_json::from_str::<Value>(delivered[0][2].as_str().ok_or("result")?)?["session_id"],
+        json!(session)
+    );
+    // Two more changes before any delivery: the epoch-3 notice is passed by epoch 4.
+    store.submit_command(change("claude", 1, "claude")).await?;
+    checkpoint().await?;
+    store.submit_command(change("codex", 2, "codex")).await?;
+    checkpoint().await?;
+    let starts = store.runner_waiting("p1").await?.session_starts;
+    assert_eq!(
+        starts
+            .iter()
+            .map(|s| (s.role_epoch, s.current_epoch))
+            .collect::<Vec<_>>(),
+        [(3, 4), (4, 4)]
+    );
+    let stale = &starts[0];
+    assert!(
+        !store
+            .deliver_session_start(&stale.message_id, "any")
+            .await?
+    );
+    assert!(store.supersede_session_start(&stale.message_id).await?);
+    assert!(
+        !store.supersede_session_start(&stale.message_id).await?,
+        "once"
+    );
+    let superseded = settled(&stale.message_id)?;
+    assert_eq!(superseded[0][0], json!("ACKED"));
+    assert_eq!(superseded[0][3], json!("handoff.superseded"));
+    assert_eq!(
+        serde_json::from_str::<Value>(superseded[0][2].as_str().ok_or("result")?)?["rejected"],
+        json!("STALE_ROLE_EPOCH")
+    );
+    Ok(())
+}
