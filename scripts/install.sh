@@ -17,8 +17,10 @@
 # does not run or names no version; 69 the user's systemd manager cannot do what was asked, something still runs this
 # installation or its lock cannot be opened, locked or told (nothing removed), another install.sh of it holds the
 # installer's lock, that lock cannot be made, opened or locked, or the installed binary does not run; 77 run as root;
-# 78 a home, root or project systemd cannot use. Refusals write nothing of the installation (those that run the
-# bundle's binary leave the installers' lock file). An uninstall that finds nothing installed says so, writes nothing.
+# 78 a home, root or project systemd cannot use; 74 a command failed that the installer has no word of its own for
+# (it is named, with its exit code and line). Refusals write nothing of the installation (those that run the bundle's
+# binary leave the installers' lock file, and a run lock just remade). An uninstall that finds nothing installed says
+# so and writes nothing.
 set -Eeuo pipefail
 
 say() { printf 'install.sh: %s\n' "$*" >&2; }
@@ -28,6 +30,17 @@ fail() {
   say "$*"
   exit "$code"
 }
+
+# A failure the installer does not handle on its own is said, with its command, exit code and line, and ends it with
+# 74, never with the command's own code (which may be one of the codes above) and no word (design correction 10,
+# M2T14R-602, -701). In a command substitution it only ends that subshell; its caller then fails or handles it.
+unexpected() {
+  local rc=$1 line=$2 command=$3
+  ((BASH_SUBSHELL == 0)) || exit "$rc"
+  say "$command failed unexpectedly (exit $rc, line $line): nothing more was done"
+  exit 74
+}
+trap 'unexpected "$?" "$LINENO" "$BASH_COMMAND"' ERR
 usage() {
   sed -n '5,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
   exit "${1:-64}"
@@ -135,7 +148,8 @@ refusals() {
 # (design corrections 1 and 2, M2T14R-101).
 check_paths() {
   local real_root
-  real_root="$(readlink -m -- "$root")"
+  # A root that cannot be resolved (a link to itself) cannot be named either (M2T14R-753).
+  real_root="$(readlink -m -- "$root" 2>&1)" || fail 78 "the installation's root $root cannot be resolved: $real_root"
   refuse_chars "the installation's root" "$root" '*' '?' '[' '"' '\' "'"
   refuse_chars "the installation's root" "$real_root" '*' '?' '[' '"' '\' "'"
   refuse_chars "HOME" "$HOME" '"' '\' "'"
@@ -177,7 +191,7 @@ install() {
   asked="$("$src/bin/hoh" --version 2>&1)" || fail 64 "$src/bin/hoh does not run (--version: exit $?): $asked"
   semver="$(sed -n '1s/^hoh //p' <<<"$asked")"
   [[ "$semver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail 64 "$src/bin/hoh --version does not name a version: $asked"
-  real_root="$(readlink -m -- "$root")"
+  real_root="$(readlink -m -- "$root" 2>&1)" || fail 78 "the installation's root $root cannot be resolved: $real_root"
   "$src/bin/hoh" __unit check "$HOME" "$root" "$real_root" ||
     fail "$?" "nothing of the installation was written: the systemd unit cannot take this home or root (said above)"
   sha="$(sha256sum -- "$src/bin/hoh" | cut -c1-12)"
@@ -212,9 +226,13 @@ install() {
   fi
   [[ ! -e "$override" ]] || say "note: $override overrides the installed $template"
   if manager; then
-    ((changed == 0)) || systemctl --user daemon-reload
-    local shown
-    shown="$(systemctl --user show -p LoadState,FragmentPath hoh-host@x.service)"
+    local shown said
+    if ((changed)); then
+      said="$(systemctl --user daemon-reload 2>&1)" ||
+        fail 69 "systemctl --user daemon-reload failed (exit $?): ${said:-no message}; the installed files are kept"
+    fi
+    shown="$(systemctl --user show -p LoadState,FragmentPath hoh-host@x.service 2>&1)" ||
+      fail 69 "systemctl --user show hoh-host@x.service failed (exit $?): ${shown:-no message}; the installed files are kept"
     if ! grep -qx 'LoadState=loaded' <<<"$shown" ||
       ! grep -qxF -e "FragmentPath=$template" -e "FragmentPath=$override" <<<"$shown"; then
       fail 69 "the user's systemd manager does not read $template (is its XDG_DATA_HOME another?): $(tr '\n' ' ' <<<"$shown")"
@@ -225,7 +243,8 @@ install() {
   fi
   local project
   for project in "$@"; do
-    "$current/bin/hoh" __unit enable "$project"
+    "$current/bin/hoh" __unit enable "$project" ||
+      fail "$?" "$project's instance was not enabled (said above); the installed files are kept"
   done
   # The installed command must run: a failure here is the install's, not hidden by the message (M2T14R-301).
   local shown
@@ -239,64 +258,80 @@ install() {
   fi
 }
 
-# Disable every instance enabled again while the uninstall ran (its link in a .wants directory of the user's
-# configuration) and check its link is gone; 1 when one is left (design correction 9, M2T14R-600).
-disable_enabled_again() {
-  local file unit left=0
-  for file in "$config/systemd/user/"*.wants/hoh-host@*.service; do
-    [[ -e "$file" || -L "$file" ]] || continue
+# Every link in the user's unit configuration that names an instance, in any directory (.wants, .requires, or another
+# an [Install] setting makes): what enables an instance on disk (design correction 10, M2T14R-700).
+enablement_links() {
+  [[ -d "$config/systemd/user" ]] || return 0
+  find "$config/systemd/user" -mindepth 2 -type l -name 'hoh-host@?*.service' -print0
+}
+
+# The installation's instances, one per line: those with a file under the root, those a link enables, those the
+# manager has loaded.
+instance_units() {
+  local file unit
+  local -A seen=()
+  for file in "$hosts"/*.env; do
+    [[ -e "$file" ]] || continue
     unit="$(basename -- "$file")"
-    if manager && systemctl --user disable --quiet "$unit" && [[ ! -e "$file" && ! -L "$file" ]]; then
-      printf 'disabled %s: it was enabled again while the uninstall ran\n' "$unit"
+    seen["hoh-host@${unit%.env}.service"]=1
+  done
+  while IFS= read -r -d '' file; do
+    seen["$(basename -- "$file")"]=1
+  done < <(enablement_links)
+  while read -r unit _; do
+    [[ "$unit" != hoh-host@*.service ]] || seen["$unit"]=1
+  done < <(systemctl --user list-units --all --plain --no-legend 'hoh-host@*.service' 2>/dev/null || true)
+  [[ ${#seen[@]} == 0 ]] || printf '%s\n' "${!seen[@]}"
+}
+
+# Stop and disable the installation's instances, each checked with the manager: inactive or failed, and not enabled by
+# whatever link (`is-enabled`, design corrections 1, 9 and 10); 1 when one is left. `first` stops and disables each;
+# `final`, under both locks, acts on one still enabled, which a run enabled again after the first pass. With no
+# manager to ask or disable with, an instance a link still enables refuses the uninstall (M2T14R-151, -700).
+settle_instances() {
+  local pass=$1 unit active enabled link left=0
+  if ! manager; then
+    while IFS= read -r -d '' link; do
+      say "$(basename -- "$link") is enabled, and no user systemd manager answers to disable it"
+      left=1
+    done < <(enablement_links)
+    return "$left"
+  fi
+  while read -r unit; do
+    [[ -n "$unit" ]] || continue
+    if [[ "$pass" == final ]]; then
+      enabled="$(systemctl --user is-enabled "$unit" 2>/dev/null || true)"
+      [[ "$enabled" == enabled* ]] || continue
+    fi
+    active="" enabled=""
+    if systemctl --user disable --now --quiet "$unit"; then
+      active="$(systemctl --user show -p ActiveState --value "$unit" 2>/dev/null || true)"
+      enabled="$(systemctl --user is-enabled "$unit" 2>/dev/null || true)"
+    fi
+    if [[ ("$active" == inactive || "$active" == failed) && -n "$enabled" && "$enabled" != enabled* ]]; then
+      if [[ "$pass" == first ]]; then
+        printf 'stopped and disabled %s\n' "$unit"
+      else
+        printf 'disabled %s: it was enabled again while the uninstall ran\n' "$unit"
+      fi
     else
-      say "$unit was enabled again while the uninstall ran and is still enabled"
+      say "could not stop and disable $unit (ActiveState=${active:-unknown}, is-enabled ${enabled:-unknown})"
       left=1
     fi
-  done
+  done < <(instance_units)
+  [[ "$pass" != first ]] || systemctl --user reset-failed 'hoh-host@*.service' 2>/dev/null || true
   return "$left"
 }
 
 remove() {
-  local hosts="$root/hosts" file unit active failed=0
+  local hosts="$root/hosts" failed=0
   if ! installed; then
     printf 'not installed\n'
     return 0
   fi
   # Only what this installer wrote is removed, all of it under its own root or at its fixed places; never a path
   # taken from the manager's configuration (docs/adr/ADR-023.md design correction 1, M2T14R-01).
-  if manager; then
-    local -A instances=()
-    for file in "$hosts"/*.env "$config/systemd/user/"*.wants/hoh-host@*.service; do
-      [[ -e "$file" || -L "$file" ]] || continue
-      unit="$(basename -- "$file")"
-      unit="${unit%.env}"
-      [[ "$unit" == hoh-host@* ]] || unit="hoh-host@$unit.service"
-      instances["$unit"]=1
-    done
-    while read -r unit _; do
-      [[ "$unit" != hoh-host@*.service ]] || instances["$unit"]=1
-    done < <(systemctl --user list-units --all --plain --no-legend 'hoh-host@*.service' 2>/dev/null || true)
-    for unit in "${!instances[@]}"; do
-      active=""
-      if systemctl --user disable --now --quiet "$unit"; then
-        active="$(systemctl --user show -p ActiveState --value "$unit" 2>/dev/null || true)"
-      fi
-      if [[ "$active" == inactive || "$active" == failed ]]; then
-        printf 'stopped and disabled %s\n' "$unit"
-      else
-        say "could not stop and disable $unit (ActiveState=${active:-unknown})"
-        failed=1
-      fi
-    done
-    systemctl --user reset-failed 'hoh-host@*.service' 2>/dev/null || true
-  else
-    # No manager to disable an enabled instance with: it would be left naming a removed template (M2T14R-151).
-    for file in "$config/systemd/user/"*.wants/hoh-host@*.service; do
-      [[ -e "$file" || -L "$file" ]] || continue
-      say "$(basename -- "$file") is enabled, and no user systemd manager answers to disable it"
-      failed=1
-    done
-  fi
+  settle_instances first || failed=1
   # The installation's own lock, exclusive (design correction 2, M2T14R-100): every run of an installed hoh holds it
   # shared for its life, so it is had only once none runs, and while it is held none can start; what follows is
   # removed under it.
@@ -359,7 +394,7 @@ remove() {
   # pass (an `__unit enable` that ended before the run lock was had) is disabled now, and what is seen now stays so
   # (design correction 9, M2T14R-600).
   if ((held && !running && !failed)); then
-    disable_enabled_again || failed=1
+    settle_instances final || failed=1
   fi
   # The closing word follows the cause: something runs or stays enabled, or only the lock was not had (M2T14R-652).
   if ((failed || running || run_holds)); then

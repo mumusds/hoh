@@ -630,6 +630,26 @@ fn a_home_the_unit_cannot_name_is_refused_before_any_installation_file_is_writte
 }
 
 #[test]
+fn a_root_that_cannot_be_resolved_is_refused_with_78_before_anything_is_written() -> R {
+    // M2T14R-753 (design correction 10): an installation root that is a link to itself cannot be resolved, so the unit
+    // cannot name it: 78 with the reason, nothing written; before, `readlink -m` failing ended the install with 1 (the
+    // code of a foreign command link) and no word.
+    let install = Install::new()?;
+    std::fs::create_dir_all(install.data())?;
+    std::os::unix::fs::symlink("hoh", install.data().join("hoh"))?;
+    let before = tree(&install.home())?;
+    let out = install.run("bundle", &[])?;
+    assert_eq!(out.status.code(), Some(78), "{}", text(&out));
+    assert!(
+        String::from_utf8(out.stderr.clone())?.contains("cannot be resolved"),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(tree(&install.home())?, before);
+    Ok(())
+}
+
+#[test]
 fn a_bundle_whose_binary_does_not_run_is_refused_with_64_and_its_exit_code() -> R {
     // Design correction 9 (M2T14R-602, -651): the bundle's binary is asked its version on its own; any failure, or no
     // version named, is 64 with what it said, leaving only the installers' lock file. Before, a failing binary ended
@@ -887,6 +907,91 @@ fn an_enabled_instance_with_no_user_manager_to_disable_it_keeps_the_uninstall_fr
     );
     assert!(!stderr.contains("enabled again"), "{stderr}");
     assert_eq!(tree(&install.home())?, before);
+    Ok(())
+}
+
+#[test]
+fn an_instance_a_requires_link_enables_with_no_user_manager_keeps_the_uninstall_from_removing_anything()
+-> R {
+    // Design correction 10 (M2T14R-700): with no manager to ask, an instance enabled by any link in the user's unit
+    // configuration (here a .requires one, which a drop-in's RequiredBy= makes) refuses the uninstall as a .wants one
+    // does; before, only .wants links were looked at and everything was removed.
+    let install = Install::new()?;
+    let out = install.run("bundle", &[])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let requires = install
+        .home()
+        .join(".config/systemd/user/default.target.requires");
+    std::fs::create_dir_all(&requires)?;
+    let template = install.data().join("systemd/user/hoh-host@.service");
+    std::os::unix::fs::symlink(
+        &template,
+        requires.join("hoh-host@0123456789abcdef.service"),
+    )?;
+    let before = tree(&install.home())?;
+    let out = install.run("bundle", &["--uninstall"])?;
+    assert_eq!(out.status.code(), Some(69), "{}", text(&out));
+    let stderr = String::from_utf8(out.stderr.clone())?;
+    assert!(
+        stderr.contains(
+            "hoh-host@0123456789abcdef.service is enabled, and no user systemd manager answers to disable it"
+        ),
+        "{stderr}"
+    );
+    assert_eq!(tree(&install.home())?, before);
+    Ok(())
+}
+
+#[test]
+fn a_manager_that_fails_during_the_install_is_said_and_ends_it_with_69() -> R {
+    // Design correction 10 (M2T14R-701): `systemctl --user daemon-reload` or `show` failing during the install (a
+    // stand-in exiting 23) ends it with 69, saying which and what the manager said; before, set -e ended it with 23
+    // and no word of its own.
+    let install = Install::new()?;
+    std::fs::create_dir_all(install.root.path().join("r/systemd"))?;
+    let _socket =
+        std::os::unix::net::UnixListener::bind(install.root.path().join("r/systemd/private"))?;
+    let template = install.data().join("systemd/user/hoh-host@.service");
+    for failing in ["daemon-reload", "show"] {
+        script(
+            &install.stubs().join("systemctl"),
+            &format!(
+                "#!/bin/sh\ncase \" $* \" in *\" {failing} \"*) echo manager-error >&2; exit 23;; *\" show \"*) printf 'LoadState=loaded\\nFragmentPath=%s\\n' '{t}';; esac\nexit 0\n",
+                t = template.display()
+            ),
+        )?;
+        if template.exists() {
+            std::fs::remove_file(&template)?;
+        }
+        let out = install.run("bundle", &[])?;
+        assert_eq!(out.status.code(), Some(69), "{failing}: {}", text(&out));
+        let stderr = String::from_utf8(out.stderr.clone())?;
+        assert!(
+            stderr.contains(&format!("systemctl --user {failing}")),
+            "{stderr}"
+        );
+        assert!(stderr.contains("exit 23"), "{stderr}");
+        assert!(stderr.contains("manager-error"), "{stderr}");
+    }
+    Ok(())
+}
+
+#[test]
+fn an_unexpected_failure_is_said_with_its_command_and_ends_the_install_with_74() -> R {
+    // Design correction 10: a command whose failure install.sh does not handle on its own (a stand-in cp: no space
+    // left) is said with its command, exit code and line, and ends the install with 74; before, set -e ended it with
+    // cp's 1, the code of a foreign ~/.local/bin/hoh, and no word of its own.
+    let install = Install::new()?;
+    script(
+        &install.stubs().join("cp"),
+        "#!/bin/sh\necho 'cp: error writing: No space left on device' >&2\nexit 1\n",
+    )?;
+    let out = install.run("bundle", &[])?;
+    assert_eq!(out.status.code(), Some(74), "{}", text(&out));
+    let stderr = String::from_utf8(out.stderr.clone())?;
+    assert!(stderr.contains("cp -R"), "{stderr}");
+    assert!(stderr.contains("failed unexpectedly (exit 1"), "{stderr}");
+    assert!(!install.home().join(".local/bin/hoh").is_symlink());
     Ok(())
 }
 
