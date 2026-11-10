@@ -1454,6 +1454,15 @@ fn a_bundle_whose_directory_ends_with_a_newline_installs_from_it() -> R {
     let out = install.run_script(&dir.join("install.sh"), &[], &[])?;
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     assert!(install.data().join("hoh/current/bin/hoh").exists());
+    // M2T14R-1250: its version is named by its binary's digest, not by what sha256sum prints for a file name with a
+    // newline (an escaped name, so a backslash and 11 digits).
+    let version = version_of(&dir.join("bin/hoh"))?;
+    assert_eq!(
+        std::fs::read_link(install.data().join("hoh/current"))?,
+        Path::new("versions").join(&version),
+        "{}",
+        text(&out)
+    );
     Ok(())
 }
 
@@ -1588,6 +1597,178 @@ fn a_program_run_through_a_linked_data_directory_keeps_the_uninstall_from_removi
     );
     assert!(install.home().join(".local/bin/hoh").is_symlink());
     drop(running);
+    Ok(())
+}
+
+#[test]
+fn a_program_run_through_a_root_whose_target_is_gone_keeps_the_uninstall_from_removing_anything()
+-> R {
+    // M2T14R-1251 (design correction 15): the root a link to <d>/inst, a program of the installation running, then <d>
+    // removed with its contents. The root is resolved for the scan without any part of it having to exist (`readlink
+    // -m`), so the program's physical path is found: 69 with its pid, template and link kept. Before, `readlink -f`
+    // failed (<d> gone), the scan fell back to the root's own path, missed the program, and the uninstall exited 0.
+    let install = Install::new()?;
+    let target = install.root.path().join("d/inst");
+    std::fs::create_dir_all(&target)?;
+    std::fs::create_dir_all(install.data())?;
+    std::os::unix::fs::symlink(&target, install.data().join("hoh"))?;
+    let out = install.run("bundle", &[])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let program = install.data().join("hoh/current/bin/program");
+    installed::executable(&program, &[&std::env::current_exe()?])?;
+    let running = Running(
+        Command::new(&program)
+            .args(["--exact", "a_program_of_the_installation", "--ignored"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?,
+    );
+    let pid = running.0.id();
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !std::fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|exe| exe.starts_with(&target))
+    {
+        if std::time::Instant::now() > end {
+            return Err("the program did not start".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    std::fs::remove_dir_all(install.root.path().join("d"))?;
+    let out = install.run("bundle", &["--uninstall"])?;
+    assert_eq!(out.status.code(), Some(69), "{}", text(&out));
+    let stderr = String::from_utf8(out.stderr.clone())?;
+    assert!(stderr.contains(&format!("pid {pid}")), "{stderr}");
+    assert!(
+        install
+            .data()
+            .join("systemd/user/hoh-host@.service")
+            .exists()
+    );
+    assert!(install.home().join(".local/bin/hoh").is_symlink());
+    drop(running);
+    Ok(())
+}
+
+#[test]
+fn a_program_whose_path_cannot_be_read_keeps_the_uninstall_from_removing_anything() -> R {
+    // M2T14R-1201 (design correction 15): a program of the installation running, and `readlink` of its
+    // /proc/<pid>/exe failing (a stand-in, for that process alone). It is this user's and alive, so what it runs cannot
+    // be told: 69, nothing removed. Before, `|| true` took it for an ended or another user's process, exit 0.
+    let install = Install::new()?;
+    let out = install.run("bundle", &[])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let program = install.data().join("hoh/current/bin/program");
+    installed::executable(&program, &[&std::env::current_exe()?])?;
+    let running = Running(
+        Command::new(&program)
+            .args(["--exact", "a_program_of_the_installation", "--ignored"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?,
+    );
+    let pid = running.0.id();
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !std::fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|exe| exe.ends_with("program"))
+    {
+        if std::time::Instant::now() > end {
+            return Err("the program did not start".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    script(
+        &install.stubs().join("readlink"),
+        &format!(
+            "#!/bin/sh\ncase \"$*\" in *\"/proc/{pid}/exe\") echo 'readlink: failing' >&2; exit 23;; esac\nexec /usr/bin/readlink \"$@\"\n"
+        ),
+    )?;
+    let out = install.run("bundle", &["--uninstall"])?;
+    assert_eq!(out.status.code(), Some(69), "{}", text(&out));
+    let stderr = String::from_utf8(out.stderr.clone())?;
+    assert!(
+        stderr.contains(&format!("cannot tell what process {pid} runs")),
+        "{stderr}"
+    );
+    assert!(stderr.contains("could not be told"), "{stderr}");
+    assert!(install.data().join("hoh/current/bin/hoh").exists());
+    drop(running);
+    Ok(())
+}
+
+#[test]
+fn a_zombie_of_this_user_does_not_keep_the_uninstall_from_completing() -> R {
+    // Design correction 15: a process that has ended but is not yet reaped (a zombie: here a child of this test) has no
+    // program path to read, and runs nothing: it is no reason to refuse.
+    let install = Install::new()?;
+    let out = install.run("bundle", &[])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let mut child = Command::new("/bin/true").spawn()?;
+    let pid = child.id();
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+        if stat
+            .rsplit_once(") ")
+            .is_some_and(|(_, rest)| rest.starts_with('Z'))
+        {
+            break;
+        }
+        if std::time::Instant::now() > end {
+            return Err("the child did not end".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let out = install.run("bundle", &["--uninstall"])?;
+    let _ = child.wait();
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(!install.data().join("hoh").exists());
+    Ok(())
+}
+
+#[test]
+fn a_root_that_cannot_be_removed_ends_the_uninstall_with_74_saying_why() -> R {
+    // M2T14R-1202 (design correction 15): the data directory not writable (0555; the installers' lock file in it
+    // still is), so the emptied root cannot be removed: the rest is removed and said, then the failure with rmdir's own
+    // words, exit 74. Before, any rmdir failure was said as "holds files this installer did not write", exit 0.
+    let install = Install::new()?;
+    let top = install.root.path().to_path_buf();
+    {
+        let out = install.run("bundle", &[])?;
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+        let data = install.data();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o555))?;
+        let _restore = installed::Restore(vec![data.clone()]);
+        let out = install.run("bundle", &["--uninstall"])?;
+        assert_eq!(out.status.code(), Some(74), "{}", text(&out));
+        let stderr = String::from_utf8(out.stderr.clone())?;
+        assert!(
+            stderr.contains(&format!("cannot remove {}", data.join("hoh").display())),
+            "{stderr}"
+        );
+        assert!(stderr.contains("Permission denied"), "{stderr}");
+        assert!(!stderr.contains("did not write"), "{stderr}");
+        assert!(!data.join("hoh/versions").exists() && !data.join("hoh/current").is_symlink());
+    }
+    drop(install);
+    assert!(!top.exists(), "{} left", top.display());
+    Ok(())
+}
+
+#[test]
+fn a_regular_file_with_an_instances_name_enables_nothing() -> R {
+    // M2T14R-1203 (design correction 15): systemd reads only symbolic links in a .wants directory ("is not a symlink,
+    // ignoring"); a regular file named hoh-host@….service there enables nothing, and with no manager the uninstall
+    // completes, the file left. Before, it was taken for an enabling link: 69.
+    let install = Install::new()?;
+    let out = install.run("bundle", &[])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let wants = install
+        .home()
+        .join(".config/systemd/user/default.target.wants");
+    std::fs::create_dir_all(&wants)?;
+    std::fs::write(wants.join("hoh-host@0123456789abcdef.service"), "")?;
+    let out = install.run("bundle", &["--uninstall"])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(!install.data().join("hoh").exists());
+    assert!(wants.join("hoh-host@0123456789abcdef.service").is_file());
     Ok(())
 }
 
@@ -1858,7 +2039,7 @@ fn links_that_are_not_hohs_in_the_unit_directories_do_not_stop_the_uninstall() -
 
 #[test]
 fn a_root_that_cannot_be_resolved_for_the_scan_keeps_the_uninstall_from_removing_anything() -> R {
-    // M2T14R-951: the /proc scan names programs by the root's resolved path; `readlink -f` failing (a stand-in) cannot
+    // M2T14R-951: the /proc scan names programs by the root's resolved path; `readlink -m` failing (a stand-in) cannot
     // tell where they would run from: 69, nothing removed (before, the root's own path was used and the scan could miss
     // a program run through a link).
     let install = Install::new()?;
@@ -1866,7 +2047,7 @@ fn a_root_that_cannot_be_resolved_for_the_scan_keeps_the_uninstall_from_removing
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     script(
         &install.stubs().join("readlink"),
-        "#!/bin/sh\ncase \"$1\" in -f) echo 'readlink: failing' >&2; exit 1;; esac\nexec /usr/bin/readlink \"$@\"\n",
+        "#!/bin/sh\ncase \"$1\" in -m) echo 'readlink: failing' >&2; exit 1;; esac\nexec /usr/bin/readlink \"$@\"\n",
     )?;
     let out = install.run("bundle", &["--uninstall"])?;
     assert_eq!(out.status.code(), Some(69), "{}", text(&out));

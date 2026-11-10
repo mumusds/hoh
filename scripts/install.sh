@@ -19,8 +19,9 @@
 # design corrections 11 to 14), an uninstall's daemon-reload fails once the template is removed (the rest removed and
 # each removal said, design correction 14), ~/.local/bin/hoh cannot be read or told, `id -u` fails, another install.sh
 # of it holds the installer's lock, that lock cannot be made, opened or locked, or the installed binary does not run; 77
-# run as root; 78 a home, root or project systemd cannot use; 74 a command failed that the installer has no word of its
-# own for (it is named, with its exit code and line). Refusals write nothing of the installation (those that run the
+# run as root; 78 a home, root or project systemd cannot use; 74 the emptied root cannot be removed (said with rmdir's
+# words, the rest removed), or a command failed that the installer has no word of its own for (it is named, with its
+# exit code and line). Refusals write nothing of the installation (those that run the
 # bundle's binary leave the installers' lock file, and a run lock just remade). An uninstall that finds nothing
 # installed says so and writes nothing.
 set -Eeuo pipefail
@@ -146,8 +147,9 @@ take_lock() {
 # (design corrections 12 and 13; M2T14R-902, -903, -1000, -1050): a name a searchable directory does not hold,
 # something on the way that is no directory, or more links than the kernel follows (40: none, systemd included, can
 # reach through them). Bash's tests answer "no" also when they cannot look, so a link they cannot follow is followed
-# here, one at a time: its target read and asked the same (a link to nothing is not there, it was seen). `$2` is the
-# number of links followed so far.
+# here, one at a time: its target read and asked again (a link to nothing is not there, it was seen; a target there,
+# where the kernel's look at the path did not reach, cannot be told: design correction 14). `$2` is the number of
+# links followed so far.
 there() {
   local path=$1 hops=${2:-0} target dir rc
   [[ ! -e "$path" ]] || return 0
@@ -311,7 +313,8 @@ install() {
   real_root="${real_root%$'\n'x}"
   "$src/bin/hoh" __unit check "$HOME" "$root" "$real_root" ||
     refused_by 64 "$?" "nothing of the installation was written: $src/bin/hoh __unit check refused this home or root, or failed (said above)"
-  sha="$(sha256sum -- "$src/bin/hoh" | cut -c1-12)"
+  # Read from its input: given a name, sha256sum escapes one with a newline or a backslash (M2T14R-1250).
+  sha="$(sha256sum <"$src/bin/hoh" | cut -c1-12)"
   name="$semver-$sha"
   # A version directory is named by its binary and never changed once there: a host running from it, and the agents
   # it starts through its start gate, keep using it until they restart.
@@ -420,7 +423,8 @@ enabling_links() {
         return 1
       fi
       for link in "$sub"/hoh-host@?*.service; do
-        [[ -e "$link" || -L "$link" ]] || continue
+        # Only a symbolic link enables (systemd ignores any other file there, "is not a symlink"; M2T14R-1203).
+        [[ -L "$link" ]] || continue
         enabling+=("${link##*/}")
       done
     done
@@ -472,14 +476,38 @@ enablement_of() {
   esac
 }
 
-# Stop and disable the installation's instances, each checked with the manager: inactive or failed, and not enabled by
-# whatever link (`is-enabled`, design corrections 1, 9, 10 and 11); 1 when one is left, else 2 when they cannot be
-# listed or one's state cannot be told after its disable (said; M2T14R-952). `first`
-# stops and disables each; `final`, under both locks, acts on any the manager does not say is not enabled, which a run
-# enabled again after the first pass. With no manager to ask or disable with, an instance a link enables refuses the
-# uninstall (M2T14R-151, -700), and so does a directory that cannot be listed.
+# Whether the manager says `$1` has stopped, its words into `active` and `job`: 0 stopped (ActiveState inactive or
+# failed, and no job pending), 1 not (another state, or a job pending: a start a run asked for goes on in the manager
+# after the run has ended, M2T14R-1200), 2 no answer to tell by (design corrections 13 and 15, M2T14R-1051). The
+# properties are read as `Key=Value` lines, whatever order the manager gives them in.
+stopped_of() {
+  local shown line have_active=0 have_job=0
+  active="" job=""
+  shown="$(systemctl --user show -p ActiveState -p Job "$1" 2>/dev/null)" || return 2
+  while IFS= read -r line; do
+    case "$line" in
+      ActiveState=*) active=${line#ActiveState=} have_active=1 ;;
+      Job=*) job=${line#Job=} have_job=1 ;;
+    esac
+  done <<<"$shown"
+  if ((!have_active || !have_job)) || [[ -z "$active" ]]; then
+    return 2
+  fi
+  [[ -z "$job" ]] || return 1
+  case "$active" in
+    inactive | failed) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Stop and disable the installation's instances, each checked with the manager: inactive or failed with no job pending,
+# and not enabled by whatever link (`is-enabled`, design corrections 1, 9, 10, 11 and 15); 1 when one is left, else 2
+# when they cannot be listed or one's state cannot be told after its disable (said; M2T14R-952). `first` stops and
+# disables each; `final`, under both locks, acts on any the manager does not say is both not enabled and stopped, which
+# a run enabled or started again after the first pass. With no manager to ask or disable with, an instance a link
+# enables refuses the uninstall (M2T14R-151, -700), and so does a directory that cannot be listed.
 settle_instances() {
-  local pass=$1 unit active enabled state stopped disabled left=0 untold=0
+  local pass=$1 unit active job enabled state stopped disabled again left=0 untold=0
   if ! manager; then
     enabling_links || return 2
     for unit in "${enabling[@]}"; do
@@ -490,29 +518,32 @@ settle_instances() {
   fi
   instance_units || return 2
   for unit in "${instances[@]}"; do
+    again=started
     if [[ "$pass" == final ]]; then
+      # Settled already (not enabled, stopped, no job) is left as it is. A run since the first pass may have enabled
+      # it again, or started it: its start job goes on after the run ends (design correction 15, M2T14R-1200).
       state=0
       enablement_of "$unit" || state=$?
-      ((state != 1)) || continue
+      stopped=0
+      stopped_of "$unit" || stopped=$?
+      ((state != 1 || stopped != 0)) || continue
+      ((state == 1)) || again=enabled
     fi
-    active="" enabled="" state=2 disabled=0
+    active="" job="" enabled="" state=2 stopped=2 disabled=0
     if systemctl --user disable --now --quiet "$unit"; then
       disabled=1
-      active="$(systemctl --user show -p ActiveState --value "$unit" 2>/dev/null)" || active=""
+      stopped=0
+      stopped_of "$unit" || stopped=$?
       state=0
       enablement_of "$unit" || state=$?
     fi
-    # Stopped, three ways: 0 inactive or failed, 1 a state that runs, 2 no answer (design correction 13, M2T14R-1051).
-    case "$active" in
-      inactive | failed) stopped=0 ;;
-      "") stopped=2 ;;
-      *) stopped=1 ;;
-    esac
     if ((disabled && stopped == 0 && state == 1)); then
       if [[ "$pass" == first ]]; then
         printf 'stopped and disabled %s\n' "$unit"
-      else
+      elif [[ "$again" == enabled ]]; then
         printf 'disabled %s: it was enabled again while the uninstall ran\n' "$unit"
+      else
+        printf 'stopped %s: it was started again while the uninstall ran\n' "$unit"
       fi
     elif ((disabled && stopped == 0 && state == 2)); then
       say "cannot tell whether $unit is still enabled after its disable (is-enabled ${enabled:-no answer})"
@@ -521,7 +552,7 @@ settle_instances() {
       say "cannot tell whether $unit stopped after its disable (ActiveState: no answer, is-enabled ${enabled:-no answer})"
       untold=1
     else
-      say "could not stop and disable $unit (ActiveState=${active:-unknown}, is-enabled ${enabled:-no answer})"
+      say "could not stop and disable $unit (ActiveState=${active:-unknown}${job:+, job $job pending}, is-enabled ${enabled:-no answer})"
       left=1
     fi
   done
@@ -529,6 +560,39 @@ settle_instances() {
   ((left)) && return 1
   ((untold)) && return 2
   return 0
+}
+
+# Whether a process whose program's path cannot be read is beyond what the scan has to tell: gone; not this user's (its
+# /proc directory another's: another user's, or one made undumpable); one the kernel denies this user a look at
+# (`Permission denied`, the kernel's reason in the C locale: credentials or a state beyond a plain process of this user,
+# such as the user's own systemd manager with its capability, which no run of this installation has, its binary
+# carrying none); or ended and not yet reaped (state Z or X, running nothing). The run lock covers any run once it holds
+# it. Any other process of this user cannot be told (design correction 15, M2T14R-1201).
+beyond_the_scan() {
+  local proc=$1 why stat
+  [[ -e "$proc" && -O "$proc" ]] || return 0
+  if ! why="$(LC_ALL=C readlink -v -- "$proc/exe" 2>&1 >/dev/null)" && [[ "$why" == *": Permission denied" ]]; then
+    return 0
+  fi
+  if ! stat="$(cat -- "$proc/stat" 2>/dev/null)"; then
+    [[ -e "$proc" ]] && return 1
+    return 0
+  fi
+  case "${stat##*) }" in
+    Z* | X*) return 0 ;;
+  esac
+  return 1
+}
+
+# Whether the directory `$1` still holds an entry, names beginning with a dot included.
+holds_entries() {
+  local entry
+  for entry in "$1"/* "$1"/.[!.]* "$1"/..?*; do
+    if [[ -e "$entry" || -L "$entry" ]]; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 remove() {
@@ -597,14 +661,16 @@ remove() {
   # Nothing is removed while a process still runs this installation's binaries: a host its unit did not run, an
   # agent's start gate, an instance that did not stop (M2T14R-03); the scan names them.
   local real proc exe running=0 root_there=0
-  # The root as /proc names the programs' paths, physical ones: resolved whether or not it is there (a program run
-  # through a link to a directory removed since still shows the resolved path, M2T14R-1150). One that cannot be
-  # resolved is looked for by its own path when it is not there (a link to nothing, M2T14R-1052; nothing under it is
-  # removed), and cannot be told when it is (M2T14R-951; design corrections 13 and 14). A program's path that cannot be
+  # The root as /proc names the programs' paths, physical ones: resolved whether or not it, or any part of its way, is
+  # there (`readlink -m`: a program run through a link to a directory removed since still shows the path the link
+  # names, M2T14R-1150, -1251). One that cannot be resolved is looked for by its own path when it is not there (a link
+  # to nothing, M2T14R-1052; nothing under it is removed), and cannot be told when it is (M2T14R-951; design
+  # corrections 13 to 15). A link on the way removed by hand while a program ran takes with it the only path to that
+  # program: what the uninstall then removes (the template, the command link) is nothing a running program uses. A program's path that cannot be
   # read below is a process that ended, or another user's, which the scan cannot see (that one, once it holds the run
   # lock, refuses the uninstall above).
   there "$root" || root_there=$?
-  if real="$(readlink -f -- "$root" && printf x)"; then
+  if real="$(readlink -m -- "$root" && printf x)"; then
     real="${real%$'\n'x}"
   elif ((root_there == 1)); then
     real="$root"
@@ -614,10 +680,14 @@ remove() {
     real="$root"
   fi
   for proc in /proc/[0-9]*; do
-    exe="$(readlink -- "$proc/exe" 2>/dev/null || true)"
-    if [[ "$exe" == "$real"/* || "$exe" == "$root"/* ]]; then
-      say "still running from $root: pid ${proc#/proc/}: $(tr '\0' ' ' <"$proc/cmdline" 2>/dev/null || true)"
-      running=1
+    if exe="$(readlink -- "$proc/exe" 2>/dev/null)"; then
+      if [[ "$exe" == "$real"/* || "$exe" == "$root"/* ]]; then
+        say "still running from $root: pid ${proc#/proc/}: $(tr '\0' ' ' <"$proc/cmdline" 2>/dev/null || true)"
+        running=1
+      fi
+    elif ! beyond_the_scan "$proc"; then
+      say "cannot tell what process ${proc#/proc/} runs: its program's path cannot be read"
+      unsure=1
     fi
   done
   if ((run_holds)); then
@@ -657,7 +727,7 @@ remove() {
   fi
   # A reload that fails leaves the removed template loaded in the manager: the rest is removed all the same, and the
   # uninstall ends with 69, saying so (M2T14R-1102).
-  local reload_rc=0 reload_said=""
+  local reload_rc=0 reload_said="" said not_removed=""
   if manager; then
     reload_said="$(systemctl --user daemon-reload 2>&1)" || reload_rc=$?
   fi
@@ -671,11 +741,18 @@ remove() {
   if ((root_there == 0)); then
     rm -rf -- "$hosts" "$root/versions"
     rm -f -- "$root/current" "$root"/current.tmp.* "$root/.lock"
-    if rmdir -- "$root" 2>/dev/null; then
+    # Kept when something is still in it; any other failure to remove it is said as it is (M2T14R-1202).
+    if said="$(rmdir -- "$root" 2>&1)"; then
       printf 'removed %s\n' "$root"
-    else
+    elif holds_entries "$root"; then
       say "kept $root: it holds files this installer did not write (its versions, instance files and links removed)"
+    else
+      not_removed="cannot remove $root: ${said:-no message}"
     fi
+  fi
+  if [[ -n "$not_removed" ]]; then
+    ((reload_rc == 0)) || say "systemctl --user daemon-reload failed (exit $reload_rc): ${reload_said:-no message}; run systemctl --user daemon-reload"
+    fail 74 "$not_removed; what is said above as removed is removed"
   fi
   if ((reload_rc)); then
     fail 69 "systemctl --user daemon-reload failed (exit $reload_rc): ${reload_said:-no message}; what is said above as removed is removed, but the manager keeps the removed template loaded until it reloads: run systemctl --user daemon-reload"
