@@ -1889,11 +1889,8 @@ fn a_zombie_of_this_user_does_not_keep_the_uninstall_from_completing() -> R {
     let pid = child.id();
     let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
-        if stat
-            .rsplit_once(") ")
-            .is_some_and(|(_, rest)| rest.starts_with('Z'))
-        {
+        // A zombie by the parent's own view (ADR-022 decision 10, v2; CIR-350).
+        if hoh_agents::identity::child_ended(pid)? {
             break;
         }
         if std::time::Instant::now() > end {

@@ -63,8 +63,9 @@ pub fn start_id(pid: u32) -> io::Result<Option<String>> {
         .ok_or_else(|| io::Error::other(format!("/proc/{pid}/stat has no start time")))
 }
 
-/// Whether process `pid`, not a child of this process, has ended as a whole (ADR-022 decision 10, the convention for
-/// observing processes in tests, version 2 as revised after review round 3): no process has the number (`pidfd_open`
+/// Whether process `pid` has ended as a whole, judged from outside: a process that is no child of this one, or a child
+/// that other code of this process reaps (ADR-022 decision 10, the convention for observing processes in tests,
+/// version 2 as revised after review rounds 3 and 4; a child this code waits for itself is judged by [`child_ended`]): no process has the number (`pidfd_open`
 /// gives no process); or, when `start` is given, the start time read once the pidfd is held is another (the recorded
 /// process is gone, its number another's, whatever that one's state: CIR-101); or the pidfd is readable, which the
 /// kernel makes it once the thread group's leader has exited and no other thread of it is left (`pidfd_poll`). A
@@ -1065,11 +1066,10 @@ mod tests {
         let _guard = Guard(leader);
         let found = found(leader)?;
         drop(child.stdin.take());
-        assert!(wait_until(|| found.leader() == Leader::Unreaped
-            && std::fs::read_to_string(format!("/proc/{leader}/stat"))
-                .is_ok_and(|stat| stat.rsplit(')').next().is_some_and(
-                    |rest| rest.trim_start().starts_with('Z')
-                ))));
+        // A zombie by the parent's own view (ADR-022 decision 10, v2; CIR-350), not by its stat's state letter.
+        assert!(wait_until(
+            || found.leader() == Leader::Unreaped && matches!(child_ended(leader), Ok(true))
+        ));
         std::thread::sleep(HELD_FOR + Duration::from_millis(50));
         assert_eq!(found.look(), Group::Held);
         child.wait()?;

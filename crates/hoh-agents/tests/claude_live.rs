@@ -387,8 +387,9 @@ async fn the_observer_needs_descent_counts_zombies_and_keeps_its_deadline() -> R
         rustix::process::Pid::from_raw(i32::try_from(pid)?).ok_or("pid 0")?,
         rustix::process::Signal::KILL,
     )?;
+    // A zombie by the parent's own view (CIR-350).
     let zombie = clear_by(Instant::now(), Duration::from_secs(5), || {
-        matches!(stat_of(pid), Ok(Some(('Z', _, _))))
+        matches!(hoh_agents::identity::child_ended(pid), Ok(true))
     })
     .await;
     assert!(zombie.is_some(), "never a zombie");

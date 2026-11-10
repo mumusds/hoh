@@ -762,7 +762,10 @@ impl Drop for Marked {
 }
 
 /// A writer that appends to `file` every 50 ms for 120 s by the clock (longer than any wait of these tests, so only a
-/// signal ends it in time) and starts no process of its own (a signal to a child must not hasten its end).
+/// signal ends it in time) and starts no process of its own (a signal to a child must not hasten its end). Its shell
+/// marks it started (`started_mark`, a builtin's write) before it execs python in its place, so a test can tell that
+/// it ran whatever python's start-up and a scan that ends it at once (CIR-353). No quote but double ones, no `$`: it
+/// is put inside other scripts' single quotes and trap strings.
 fn writer(file: &Path) -> R<String> {
     // The file exists before the writer: one stopped before its first write leaves it empty (M2T06R-150).
     if !file.exists() {
@@ -775,10 +778,16 @@ fn writer(file: &Path) -> R<String> {
          with open(sys.argv[1], 'a') as f:\n        f.write('x\\n')\n    time.sleep(0.05)\n",
     )?;
     Ok(format!(
-        "/usr/bin/python3 {} {}",
+        "/bin/sh -c \"echo started >> {}; exec /usr/bin/python3 {} {}\"",
+        started_mark(file).display(),
         script.display(),
         file.display()
     ))
+}
+
+/// Where [`writer`] marks that it started.
+fn started_mark(file: &Path) -> PathBuf {
+    file.with_extension("started")
 }
 
 /// The writer in a session of its own, orphaned at once (its parent subshell exits): nothing but its environment ties
@@ -869,15 +878,15 @@ async fn cancel_with_a_writer_outside(dir: &Path, script: &str, file: &Path) -> 
         Vec::<u32>::new(),
         "a process of the attempt lives on"
     );
-    // The writer ran (its file was made empty before it; it writes for 3.5 s or more before the SIGKILL step): a leader
-    // that missed its trap, a writer that never started or a cancel that skipped the step starting it would leave
-    // nothing to find, and pass (CIR-252).
+    // The writer started (its own mark, made before python starts): a leader that missed its trap, a writer that
+    // never started or a cancel that skipped the step starting it would leave nothing to find, and pass (CIR-252). Not
+    // its first write: a scan may end it before python has written anything (CIR-353).
+    assert!(
+        started_mark(file).exists(),
+        "the writer never started: nothing was there to find"
+    );
     let size = || -> R<u64> { Ok(std::fs::metadata(file)?.len()) };
     let before = size()?;
-    assert!(
-        before > 0,
-        "the writer never wrote: nothing was there to find"
-    );
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(size()?, before, "the workspace is still written");
     assert!(
