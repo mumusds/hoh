@@ -11,10 +11,6 @@ use serde_json::json;
 /// The Commander: its own messages carry its epoch (decision 6).
 pub(super) const COMMANDER: &str = "commander";
 
-/// Why a role's change is refused while its run has no specification (decision 10): a role-change package needs the
-/// run's spec digest and revision, and none is invented.
-pub(super) const NO_SPEC: &str = "NO_SPEC";
-
 /// Run `run_id`'s current specification: its digest and revision, none before the run has one.
 pub(super) fn spec(conn: &Connection, run_id: &str) -> Result<Option<(String, u64)>, PersistError> {
     let spec: Option<(String, i64)> = conn
@@ -63,7 +59,7 @@ fn ids(conn: &Connection, run_id: &str, sql: &str) -> Result<Vec<String>, Persis
 
 /// The writes that hand run `run_id`'s `role` over to its binding at `role_epoch` (decisions 1 and 2): the
 /// handoff.prepared event and the session.start notice pointing at it, to be committed with the binding. `spec` is the
-/// run's (see [`spec`]); `from` and `to` are the bindings as team.binding_applied records them.
+/// run's (see [`spec`]), none while it has none (CR-014); `from` and `to` are the bindings as team.binding_applied records them.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn prepare(
     conn: &Connection,
@@ -71,7 +67,7 @@ pub(super) fn prepare(
     run_id: &str,
     role: &str,
     role_epoch: i64,
-    spec: (String, u64),
+    spec: Option<(String, u64)>,
     from: &serde_json::Value,
     to: &serde_json::Value,
 ) -> Result<(super::writer::NewEvent, super::writer::NewOutbox), PersistError> {
@@ -106,8 +102,7 @@ pub(super) fn prepare(
         role: role.to_owned(),
         goal,
         role_epoch: epoch,
-        spec_sha256: spec.0,
-        spec_revision: spec.1,
+        spec,
         candidate: super::outbox::current_candidate(conn, run_id)?,
         state,
     });

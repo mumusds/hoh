@@ -247,7 +247,7 @@ impl Message {
                 let agrees = p.run_id == self.run_id
                     && p.role == self.recipient_role
                     && p.role_epoch == self.role_epoch
-                    && p.spec_sha256 == self.spec_sha256
+                    && p.spec_sha256.as_deref() == Some(self.spec_sha256.as_str())
                     && p.task_id.as_deref().is_none_or(|t| t == self.task_id)
                     && (p.handoff_kind != HandoffKind::Verification
                         || (candidate.is_some() && candidate == self.candidate_id.as_deref()));
@@ -292,7 +292,9 @@ pub struct ContextHandoff {
     pub role: String,
     #[serde(deserialize_with = "crate::integer::deserialize")]
     pub role_epoch: u64,
-    pub spec_sha256: String,
+    /// The run's specification digest; none only in a role_change package while the run has no specification
+    /// (CR-014).
+    pub spec_sha256: Option<String>,
     pub candidate: Option<Candidate>,
     pub acceptance_ids: Vec<String>,
     pub references: Vec<ArtifactRef>,
@@ -300,8 +302,9 @@ pub struct ContextHandoff {
     #[serde(deserialize_with = "crate::integer::deserialize")]
     pub budget_tokens: u64,
     pub handoff_kind: HandoffKind,
-    #[serde(deserialize_with = "crate::integer::deserialize")]
-    pub spec_revision: u64,
+    /// The run's specification revision; none exactly when `spec_sha256` is (CR-014).
+    #[serde(deserialize_with = "crate::integer::option")]
+    pub spec_revision: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<HandoffState>,
 }

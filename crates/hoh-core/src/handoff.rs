@@ -59,14 +59,14 @@ pub fn verification(v: &Verification, to: &[Recipient]) -> Option<Vec<Message>> 
                 goal: v.goal.clone(),
                 role: r.role.clone(),
                 role_epoch: r.role_epoch,
-                spec_sha256: v.spec_sha256.clone(),
+                spec_sha256: Some(v.spec_sha256.clone()),
                 candidate: Some(v.candidate.clone()),
                 acceptance_ids: v.acceptance_ids.clone(),
                 references: Vec::new(),
                 output_contract: output_contract(&r.role).to_owned(),
                 budget_tokens: BUDGET_TOKENS,
                 handoff_kind: HandoffKind::Verification,
-                spec_revision: v.spec_revision,
+                spec_revision: Some(v.spec_revision),
                 state: None,
             };
             let Ok(Value::Object(payload)) = serde_json::to_value(&package) else {
@@ -107,8 +107,8 @@ pub struct RoleChange {
     pub goal: String,
     /// The role's epoch once the change is applied.
     pub role_epoch: u64,
-    pub spec_sha256: String,
-    pub spec_revision: u64,
+    /// The run's specification (its digest and revision), none while it has none (CR-014).
+    pub spec: Option<(String, u64)>,
     pub candidate: Option<Candidate>,
     pub state: HandoffState,
 }
@@ -138,14 +138,14 @@ pub fn role_change(c: &RoleChange) -> ContextHandoff {
         goal: c.goal.clone(),
         role: c.role.clone(),
         role_epoch: c.role_epoch,
-        spec_sha256: c.spec_sha256.clone(),
+        spec_sha256: c.spec.as_ref().map(|(sha256, _)| sha256.clone()),
         candidate: c.candidate.clone(),
         acceptance_ids: Vec::new(),
         references: Vec::new(),
         output_contract: role_output_contract(&c.role).to_owned(),
         budget_tokens: BUDGET_TOKENS,
         handoff_kind: HandoffKind::RoleChange,
-        spec_revision: c.spec_revision,
+        spec_revision: c.spec.as_ref().map(|(_, revision)| *revision),
         state: Some(HandoffState {
             applied_decision_ids: ids(&c.state.applied_decision_ids),
             open_issue_ids: ids(&c.state.open_issue_ids),
@@ -223,8 +223,7 @@ mod tests {
             run_id: "R".to_owned(),
             goal: "g".to_owned(),
             role_epoch: 2,
-            spec_sha256: sha(3),
-            spec_revision: 3,
+            spec: Some((sha(3), 3)),
             candidate: Some(inputs().candidate),
             state: HandoffState {
                 applied_decision_ids: vec!["D2".to_owned(), "D1".to_owned(), "D2".to_owned()],
@@ -256,8 +255,8 @@ mod tests {
                 ("commander", 2, None)
             );
             assert_eq!(
-                (package.spec_sha256.as_str(), package.spec_revision),
-                (sha(3).as_str(), 3)
+                (package.spec_sha256.as_deref(), package.spec_revision),
+                (Some(sha(3).as_str()), Some(3))
             );
             assert_eq!(package.candidate, candidate);
             assert_eq!(package.output_contract, "DecisionPayload");
@@ -273,6 +272,22 @@ mod tests {
             );
             assert!(package.acceptance_ids.is_empty() && package.references.is_empty());
         }
+    }
+
+    #[test]
+    fn a_role_change_package_of_a_run_without_a_spec_says_so_with_nulls() {
+        // CR-014: while the run has no specification the package's digest and revision are both null, valid against
+        // protocol.schema.json; nothing is invented.
+        let mut c = change();
+        c.spec = None;
+        let package = role_change(&c);
+        let encoded = protocol::encode(&package).expect("a valid ContextHandoff");
+        assert_eq!(
+            (&encoded["spec_sha256"], &encoded["spec_revision"]),
+            (&serde_json::Value::Null, &serde_json::Value::Null)
+        );
+        let back: ContextHandoff = protocol::decode(&encoded).expect("decodes");
+        assert_eq!(back, package);
     }
 
     #[test]

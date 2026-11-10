@@ -410,8 +410,6 @@ const AGENT_UNAVAILABLE: &str = "AGENT_UNAVAILABLE";
 
 /// Why a change to an agent not logged in is refused (`$defs.BlockedReason`).
 const BLOCKED_AUTH: &str = "BLOCKED_AUTH";
-/// What a refusal for a run without a specification says (docs/adr/ADR-024.md decision 10).
-const NO_SPEC_DETAIL: &str = "the run has no specification yet";
 
 /// The event kinds of a checkpoint's verdict on a changed role (decision 8, third version): the change is refused (its
 /// new agent unavailable: the old binding works on), or pending again (the agent is there: the role is held until its
@@ -644,33 +642,11 @@ pub(super) fn checkpoint(
             continue;
         }
         // A change to a new holder hands the role over with a package naming the run's spec, whatever the role
-        // (ADR-024 decisions 1 and 2, M2T17R-03): with no spec it is refused and the old binding works on until the
-        // run has one (decision 10). A role left with no agent has no new holder to hand over to.
+        // (ADR-024 decisions 1 and 2, M2T17R-03): none while the run has none (CR-014: the package says so with nulls,
+        // the change applies as REQ-018 behaviour 5 says, M2T17R-100). A role left with no agent has no new holder.
         let handover_spec = match target {
-            Some(_) => match super::handover::spec(&tx, run_id)? {
-                Some(spec) => Some(spec),
-                None => {
-                    behind = true;
-                    if new_refusal(super::handover::NO_SPEC, NO_SPEC_DETAIL) {
-                        changed = true;
-                        events.push(verdict(
-                            REFUSED,
-                            serde_json::json!({
-                                "run_id": run_id, "role": binding.role, "config_revision": revision,
-                                "agent": target.map(|role| role.agent.as_str()),
-                                "reason": super::handover::NO_SPEC,
-                                "detail": NO_SPEC_DETAIL,
-                                "kept": {
-                                    "agent": binding.agent, "model": binding.model,
-                                    "role_epoch": binding.role_epoch,
-                                },
-                            }),
-                        ));
-                    }
-                    continue;
-                }
-            },
-            _ => None,
+            Some(_) => Some(super::handover::spec(&tx, run_id)?),
+            None => None,
         };
         if live.contains(&binding.role) {
             behind = true;
