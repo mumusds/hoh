@@ -1266,9 +1266,7 @@ async fn a_hosts_stop_ends_the_probe_it_has_running() -> R {
     let alive = !hoh_agents::identity::ended(pid, Some(&start))?;
     world.stop_fakes()?;
     if alive {
-        let _ = Command::new("kill")
-            .args(["-KILL", &pid.to_string()])
-            .status();
+        let _ = hoh_agents::identity::signal_if_same(pid, &start, rustix::process::Signal::KILL);
     }
     assert!(!alive, "the probe's command {pid} outlived the host");
     assert!(took < Duration::from_secs(10), "the stop took {took:?}");
@@ -1461,10 +1459,9 @@ fn a_hosts_stop_kills_the_schema_command_however_late_its_reader_runs() -> R {
         std::thread::sleep(Duration::from_millis(10));
         (alive, untold) = look(&started);
     }
-    for pid in &alive {
-        let _ = Command::new("kill")
-            .args(["-KILL", &pid.to_string()])
-            .status();
+    // Only a process still of its start time is killed (CIR-103, -152).
+    for (pid, start) in started.iter().filter(|(pid, _)| alive.contains(pid)) {
+        let _ = hoh_agents::identity::signal_if_same(*pid, start, rustix::process::Signal::KILL);
     }
     let (code, took) = outcome?;
     assert_eq!(started.len(), 2, "{started:?}");

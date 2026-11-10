@@ -754,20 +754,46 @@ fn test_036_02_a_transition_killed_at_any_point_is_all_or_nothing() -> R {
     Ok(())
 }
 
-/// A helper process unrelated to any attempt that records every catchable signal it gets, one line each, in `log`.
+/// A helper process unrelated to any attempt that records every catchable signal it gets, one line each, in `log`,
+/// returned once it says its traps are set (a builtin's write of its pid to `<log>.ready`): a signal before them would
+/// end it unrecorded, and an empty log would then pass (CIR-151).
 fn signal_counter(log: &Path) -> R<ChildGuard> {
+    let ready = log.with_extension("ready");
     let script = format!(
-        "for s in TERM INT HUP USR1 USR2 QUIT; do trap \"echo $s >> '{}'\" $s; done; while :; do sleep 0.05; done",
-        log.display()
+        "for s in TERM INT HUP USR1 USR2 QUIT; do trap \"echo $s >> '{}'\" $s; done; echo $$ > '{}'; \
+         while :; do sleep 0.05; done",
+        log.display(),
+        ready.display()
     );
-    Ok(ChildGuard(
+    let helper = ChildGuard(
         Command::new("sh")
             .args(["-c", &script])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()?,
-    ))
+    );
+    trapped_at(&ready)?;
+    Ok(helper)
+}
+
+/// The pid a trap stand-in wrote to `ready` once its traps were set, waited for (at most 10 s; convention v2: a
+/// child's state read only after an event it makes).
+fn trapped_at(ready: &Path) -> R<u32> {
+    let end = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(pid) = std::fs::read_to_string(ready)
+            .unwrap_or_default()
+            .trim()
+            .parse()
+        {
+            return Ok(pid);
+        }
+        if Instant::now() > end {
+            return Err(format!("{} never said its traps were set", ready.display()).into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// What reconcile events and attempts AC-041-03 and AC-041-05 read.
@@ -822,10 +848,11 @@ fn test_041_03_a_reused_pid_or_another_boot_is_not_signalled() -> R {
     let (code, stderr) = serve_and_stop(&project)?;
     assert_eq!(code, 0, "the restarted host: {stderr}");
     let read: Value = serde_json::from_str(&python(&db(&project), READ_RECONCILE, "")?)?;
-    // The helper lives on, the same process, and got no signal.
-    assert_eq!(
-        hoh_agents::identity::start_id(pid)?.as_deref(),
-        Some(me.start_id.as_str())
+    // The helper lives on, the same process, and got no signal: alive by identity::ended with its start time, as a
+    // zombie of the same start time would be a helper killed by SIGKILL, which no trap records (CIR-150).
+    assert!(
+        !hoh_agents::identity::ended(pid, Some(&me.start_id))?,
+        "the helper was killed"
     );
     assert_eq!(std::fs::read_to_string(&log).unwrap_or_default(), "");
     for (attempt, basis) in [("A2", "start_time_differs"), ("A3", "boot_id_differs")] {
@@ -1845,8 +1872,9 @@ async fn a_leaderless_group_keeps_its_slot_and_gets_no_signal() -> R {
     std::fs::write(
         &member,
         format!(
-            "for s in TERM INT HUP; do trap \"echo $s >> {}\" $s; done\nwhile :; do sleep 0.05; done\n",
-            log.display()
+            "for s in TERM INT HUP; do trap \"echo $s >> {}\" $s; done\necho $$ > {}\nwhile :; do sleep 0.05; done\n",
+            log.display(),
+            log.with_extension("ready").display()
         ),
     )?;
     let out = Command::new("sh")
@@ -1860,6 +1888,10 @@ async fn a_leaderless_group_keeps_its_slot_and_gets_no_signal() -> R {
         .output()?;
     let leader: u32 = String::from_utf8_lossy(&out.stdout).trim().parse()?;
     let _guard = GroupGuard(leader);
+    // The member, once its traps are set, with its start time for the end's look (CIR-150, -151).
+    let member_pid = trapped_at(&log.with_extension("ready"))?;
+    let member_start =
+        hoh_agents::identity::start_id(member_pid)?.ok_or("the member is not running")?;
     let end = Instant::now() + Duration::from_secs(5);
     while hoh_agents::identity::start_id(leader)?.is_some() && Instant::now() < end {
         std::thread::sleep(Duration::from_millis(10));
@@ -1926,6 +1958,10 @@ async fn a_leaderless_group_keeps_its_slot_and_gets_no_signal() -> R {
     );
     assert!(!hoh_agents::identity::group_empty(leader));
     assert_eq!(std::fs::read_to_string(&log).unwrap_or_default(), "");
+    assert!(
+        !hoh_agents::identity::ended(member_pid, Some(&member_start))?,
+        "the member was killed"
+    );
     // One settle written for its expired lease over many retries.
     assert_eq!(
         query(
@@ -2608,9 +2644,11 @@ async fn the_runner_keeps_the_slot_of_a_holder_it_cannot_confirm_gone() -> R {
         let (code, stderr) = serve_and_stop(&project)?;
         assert_eq!(code, 0, "{stderr}");
         let log = dir.path().join("signals.log");
+        let ready = log.with_extension("ready");
         let script = format!(
-            "for s in TERM INT HUP; do trap \"echo $s >> '{}'\" $s; done; while :; do sleep 0.05; done",
-            log.display()
+            "for s in TERM INT HUP; do trap \"echo $s >> '{}'\" $s; done; echo $$ > '{}'; while :; do sleep 0.05; done",
+            log.display(),
+            ready.display()
         );
         let live = ChildGuard({
             use std::os::unix::process::CommandExt as _;
@@ -2620,6 +2658,10 @@ async fn the_runner_keeps_the_slot_of_a_holder_it_cannot_confirm_gone() -> R {
                 .stdin(std::process::Stdio::null())
                 .spawn()?
         });
+        // Its traps set before the host starts, and its start time for the end's look (CIR-150, -151).
+        trapped_at(&ready)?;
+        let live_start =
+            hoh_agents::identity::start_id(live.0.id())?.ok_or("live is not running")?;
         let pid = if partial {
             live.0.id().to_string()
         } else {
@@ -2675,6 +2717,10 @@ async fn the_runner_keeps_the_slot_of_a_holder_it_cannot_confirm_gone() -> R {
             "0"
         );
         assert_eq!(std::fs::read_to_string(&log).unwrap_or_default(), "");
+        assert!(
+            !hoh_agents::identity::ended(live.0.id(), Some(&live_start))?,
+            "partial={partial}: live was killed"
+        );
         host.shutdown().await;
         drop(live);
     }

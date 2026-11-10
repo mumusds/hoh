@@ -385,24 +385,14 @@ fn hoh_in(manager: &Manager, project: &Path, program: Option<&Path>, args: &[&st
         .output()?)
 }
 
-/// The `hoh __host` processes of this user whose project is `project`.
+/// The `hoh __host` processes of this user whose project is `project`; a host's copy forked to start a command and not
+/// yet exec'd is none (`identity::running_with`; ADR-022 decision 10, v2; CIR-154).
 fn hosts_of(project: &Path) -> R<Vec<u32>> {
-    let mut out = Vec::new();
-    for entry in std::fs::read_dir("/proc")? {
-        let Ok(pid) = entry?.file_name().to_string_lossy().parse::<u32>() else {
-            continue;
-        };
-        let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
-            continue;
-        };
+    let project = project.as_os_str().as_encoded_bytes();
+    Ok(hoh_agents::identity::running_with(|cmdline| {
         let args: Vec<&[u8]> = cmdline.split(|b| *b == 0).collect();
-        if args.get(1) == Some(&&b"__host"[..])
-            && args.get(2) == Some(&project.as_os_str().as_encoded_bytes())
-        {
-            out.push(pid);
-        }
-    }
-    Ok(out)
+        args.get(1) == Some(&&b"__host"[..]) && args.get(2) == Some(&project)
+    })?)
 }
 
 #[test]
