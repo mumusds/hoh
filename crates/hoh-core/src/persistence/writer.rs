@@ -118,6 +118,11 @@ enum Job {
         Box<(Proposal, Context)>,
         oneshot::Sender<Result<Decided, PersistError>>,
     ),
+    /// A Commander's message other than a decision, through its sender's fence (docs/adr/ADR-024.md decision 6).
+    Fence(
+        Box<crate::protocol::Message>,
+        oneshot::Sender<Result<decide::Fenced, PersistError>>,
+    ),
     Attempt(Box<AttemptJob>, oneshot::Sender<Result<(), PersistError>>),
     /// A terminal attempt move decided with its cancel latch.
     EndAttempt(
@@ -315,6 +320,7 @@ impl Job {
             Job::EnsureProject(..) => "EnsureProject",
             Job::ScratchTask(..) => "ScratchTask",
             Job::Decide(..) => "Decide",
+            Job::Fence(..) => "Fence",
             Job::Attempt(..) => "Attempt",
             Job::EndAttempt(..) => "EndAttempt",
             Job::Command(..) => "Command",
@@ -498,6 +504,13 @@ impl Writer {
                                 decide::decide(&mut conn, &proposal, &context, &ctx),
                             );
                         }
+                        Job::Fence(message, reply) => {
+                            answer(
+                                &ctx,
+                                reply,
+                                decide::commander_message(&mut conn, &message, &ctx),
+                            );
+                        }
                     }
                     // Only what has committed is visible to this connection's next read.
                     if let Ok(now) = commands::max_seq(&conn) {
@@ -589,6 +602,13 @@ impl Writer {
     ) -> Result<Decided, PersistError> {
         self.submit(|tx| Job::Decide(Box::new((proposal, context)), tx))
             .await
+    }
+
+    pub(super) async fn fence(
+        &self,
+        message: crate::protocol::Message,
+    ) -> Result<decide::Fenced, PersistError> {
+        self.submit(|tx| Job::Fence(Box::new(message), tx)).await
     }
 
     pub(super) async fn attempt(&self, job: AttemptJob) -> Result<(), PersistError> {

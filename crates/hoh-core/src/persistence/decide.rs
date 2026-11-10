@@ -12,7 +12,7 @@ use crate::decision::{
     Snapshot, TaskView,
 };
 use crate::lifecycle::Lifecycle;
-use crate::protocol::{self, RejectionReason, RunState, TaskState};
+use crate::protocol::{self, Message, RejectionReason, RunState, TaskState};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -654,3 +654,98 @@ fn load_evidence(
 
 #[cfg(test)]
 mod tests;
+
+/// What the Commander's fence answers for one of its messages (docs/adr/ADR-024.md decision 6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Fenced {
+    /// Its epoch is the commander's binding now: it passes, nothing written (where it goes is its router's).
+    Current,
+    /// Its epoch is not the binding's (an old Commander's, after a handover): only history, a decisions row REJECTED
+    /// with this reason and its decision.rejected event, nothing else changed.
+    Rejected {
+        reason: RejectionReason,
+        detail: String,
+        event_seq: i64,
+    },
+}
+
+/// The sender's fence of a Commander's steer, query or other message (REQ-019 behaviour 3; ADR-024 decision 6): the
+/// one its every output passes when it enters, as a decision does in [`decide`]. A message whose role_epoch (the
+/// sender's: every message the Commander sends carries its own epoch) is not the commander binding's now is recorded
+/// as a decision REJECTED STALE_ROLE_EPOCH, its payload the message, with one decision.rejected event, in one
+/// transaction; nothing else is written. A decision is refused here: it goes through [`decide`].
+pub(super) fn commander_message(
+    conn: &mut Connection,
+    message: &Message,
+    ctx: &super::writer::Ctx<'_>,
+) -> Result<Fenced, PersistError> {
+    if message.sender_role != COMMANDER || message.kind == protocol::MessageKind::Decision {
+        return Err(PersistError::InvalidProposal(format!(
+            "{}: the Commander's fence takes the Commander's messages other than decisions",
+            message.message_id
+        )));
+    }
+    let role_epoch = to_i64(message.role_epoch, "role_epoch")?;
+    let expected_revision = to_i64(message.expected_revision, "expected_revision")?;
+    let tx = super::writer::begin(conn, ctx)?;
+    let (project_id, _) = load_run(&tx, &message.run_id)?;
+    let current: Option<i64> = tx
+        .query_row(
+            "SELECT role_epoch FROM role_bindings WHERE run_id = ?1 AND role = ?2",
+            params![message.run_id, COMMANDER],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    if current == Some(role_epoch) {
+        return Ok(Fenced::Current);
+    }
+    let reason = RejectionReason::StaleRoleEpoch;
+    let detail = format!(
+        "role epoch {} is not the commander's current {current:?}",
+        message.role_epoch
+    );
+    let recorded = serde_json::to_value(message)
+        .map_err(|e| PersistError::InvalidProposal(format!("{}: {e}", message.message_id)))?;
+    tx.execute(
+        "INSERT INTO decisions(decision_id, run_id, role_epoch, expected_revision, reason_code, payload_json, state) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'REJECTED')",
+        params![
+            message.message_id,
+            message.run_id,
+            role_epoch,
+            expected_revision,
+            reason_name(reason),
+            recorded.to_string()
+        ],
+    )
+    .map_err(sqlite_error)?;
+    let done = writer::write(
+        &tx,
+        &Commit {
+            events: vec![NewEvent {
+                project_id,
+                event_id: child_id(&message.message_id, "rejected"),
+                run_id: Some(message.run_id.clone()),
+                kind: "decision.rejected".to_owned(),
+                payload: json!({
+                    "decision_id": message.message_id,
+                    "kind": message.kind,
+                    "reason_code": reason_name(reason),
+                    "detail": detail,
+                    "role_epoch": message.role_epoch,
+                    "current_role_epoch": current,
+                }),
+            }],
+            ..Commit::default()
+        },
+        ctx,
+    )?;
+    ctx.before_commit()?;
+    tx.commit().map_err(sqlite_error)?;
+    Ok(Fenced::Rejected {
+        reason,
+        detail,
+        event_seq: done.event_seqs[0],
+    })
+}
