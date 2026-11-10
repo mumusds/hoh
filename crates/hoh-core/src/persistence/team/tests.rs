@@ -1827,11 +1827,11 @@ fn ready_task(path: &PathBuf, task_id: &str, seq: i64) -> R {
 }
 
 #[tokio::test]
-async fn a_first_input_stays_owed_until_the_agent_answered_a_turn_of_its_session() -> R {
-    // M2T17R-200 (docs/adr/ADR-024.md decision 4, design correction of round 3): the session's first attempt started
-    // its process (pid recorded) and was disposed of before its gate opened, so no turn reached the agent; the next
-    // attempt still starts from the first input. Once a turn of the session was answered by the agent (its native
-    // session recorded), later attempts do not.
+async fn a_first_input_stays_owed_until_a_turn_of_its_session_completed() -> R {
+    // M2T17R-200, -300 (docs/adr/ADR-024.md decision 4, design correction of rounds 3 and 4): the session's first
+    // attempt started its process (pid recorded) and was disposed of before its gate opened; the second failed after
+    // the agent gave its session id, before any input reached it; each next attempt still starts from the first input.
+    // Once a turn of the session completed (SETTLED), later attempts do not.
     let dir = tempfile::tempdir()?;
     let (store, path) = open(&dir)?;
     let context = handed_over_developer(&store, &path).await?;
@@ -1859,38 +1859,55 @@ async fn a_first_input_stays_owed_until_the_agent_answered_a_turn_of_its_session
         first_input(&path, &second.task_id, &second.attempt_id)?,
         "owed still: no turn reached the agent"
     );
+    // The second started its process and failed after the agent gave its session id, before any task input reached
+    // it (Codex's thread/start, Pi's get_state answer it; M2T17R-300): the first input is owed still.
     exec(
         &path,
         &format!(
-            "UPDATE attempts SET state = 'SETTLED', pid = 4343, ended_at = '2026-11-10T00:03:00Z' \
-             WHERE attempt_id = '{0}'; DELETE FROM leases WHERE attempt_id = '{0}';
+            "UPDATE attempts SET state = 'FAILED', pid = 4343, ended_at = '2026-11-10T00:03:00Z', \
+             failure_reason = 'PROTOCOL_INCOMPLETE' WHERE attempt_id = '{0}'; DELETE FROM leases WHERE attempt_id = '{0}';
              UPDATE sessions SET native_id = 'thread-1' WHERE session_id = (SELECT session_id FROM attempts
                WHERE attempt_id = '{0}');",
             second.attempt_id
         ),
     )?;
-    // Whether or not the session can be resumed (M2T17R-251): here it cannot.
-    exec(
-        &path,
-        "UPDATE sessions SET capabilities_json = '{\"structured_events\": true}' WHERE native_id = 'thread-1';",
-    )?;
     ready_task(&path, "T3", 4)?;
     let third = store
-        .schedule_round("R1", context)
+        .schedule_round("R1", context.clone())
         .await?
         .dispatched
         .ok_or("T3 not dispatched")?;
+    assert!(
+        first_input(&path, &third.task_id, &third.attempt_id)?,
+        "owed still: a native session id is no proof a turn reached the agent"
+    );
+    // The third's turn completed: given. Whether or not the session can be resumed (M2T17R-251): here it cannot.
+    exec(
+        &path,
+        &format!(
+            "UPDATE attempts SET state = 'SETTLED', pid = 4444, ended_at = '2026-11-10T00:04:00Z' \
+             WHERE attempt_id = '{0}'; DELETE FROM leases WHERE attempt_id = '{0}';
+             UPDATE sessions SET capabilities_json = '{{\"structured_events\": true}}' WHERE native_id = 'thread-1';",
+            third.attempt_id
+        ),
+    )?;
+    ready_task(&path, "T4", 5)?;
+    let fourth = store
+        .schedule_round("R1", context)
+        .await?
+        .dispatched
+        .ok_or("T4 not dispatched")?;
     let assignment = super::assignment(
         &Connection::open(&path)?,
         "p1",
         "R1",
-        &third.task_id,
-        &third.attempt_id,
+        &fourth.task_id,
+        &fourth.attempt_id,
         "developer",
     )?;
     assert!(
         !assignment.first_input,
-        "given: the agent answered a turn of the session"
+        "given: a turn of the session completed"
     );
     assert_eq!(assignment.native_session, None, "it is not resumed");
     Ok(())
@@ -1898,10 +1915,10 @@ async fn a_first_input_stays_owed_until_the_agent_answered_a_turn_of_its_session
 
 #[tokio::test]
 async fn while_a_first_input_is_owed_one_attempt_of_its_session_runs_at_a_time() -> R {
-    // M2T17R-201 (decision 4, design correction of round 3): two READY readers of the developer after its handover;
-    // the first round dispatches one, to start from the first input; while it is in flight no second attempt of the
-    // session is dispatched, so the first input is never given to two turns at once; once the agent answered, the
-    // other task is dispatched without it.
+    // M2T17R-201, -351 (decision 4): two READY readers of the developer after its handover; the first round dispatches
+    // one, to start from the first input; while it is in flight (PREPARED, STARTING or RUNNING) no second attempt of the
+    // session is dispatched, so the first input is never given to two turns at once; once its turn completed, the
+    // other task is dispatched without it, and so is a third beside it: the hold does not outlive the debt.
     let dir = tempfile::tempdir()?;
     let (store, path) = open(&dir)?;
     let context = handed_over_developer(&store, &path).await?;
@@ -1912,27 +1929,43 @@ async fn while_a_first_input_is_owed_one_attempt_of_its_session_runs_at_a_time()
         .dispatched
         .ok_or("nothing dispatched")?;
     assert!(first_input(&path, &first.task_id, &first.attempt_id)?);
-    let round = store.schedule_round("R1", context.clone()).await?;
-    assert!(
-        round.dispatched.is_none(),
-        "a second attempt while the first input is owed: {round:?}"
-    );
+    // Held whether the first is PREPARED, STARTING or RUNNING (M2T17R-351).
+    for state in ["PREPARED", "STARTING", "RUNNING"] {
+        exec(
+            &path,
+            &format!(
+                "UPDATE attempts SET state = '{state}' WHERE attempt_id = '{}';",
+                first.attempt_id
+            ),
+        )?;
+        let round = store.schedule_round("R1", context.clone()).await?;
+        assert!(
+            round.dispatched.is_none(),
+            "a second attempt while the first input is owed, the first {state}: {round:?}"
+        );
+    }
     exec(
         &path,
         &format!(
             "UPDATE attempts SET state = 'SETTLED', pid = 4242, ended_at = '2026-11-10T00:02:00Z' \
-             WHERE attempt_id = '{0}'; DELETE FROM leases WHERE attempt_id = '{0}';
-             UPDATE sessions SET native_id = 'thread-1' WHERE session_id = (SELECT session_id FROM attempts
-               WHERE attempt_id = '{0}');",
+             WHERE attempt_id = '{0}'; DELETE FROM leases WHERE attempt_id = '{0}';",
             first.attempt_id
         ),
     )?;
     let second = store
-        .schedule_round("R1", context)
+        .schedule_round("R1", context.clone())
         .await?
         .dispatched
         .ok_or("the other task not dispatched")?;
     assert!(!first_input(&path, &second.task_id, &second.attempt_id)?);
+    // Given: the hold is lifted for good, a third reader runs beside the second (M2T17R-351).
+    ready_task(&path, "T3", 4)?;
+    let third = store
+        .schedule_round("R1", context)
+        .await?
+        .dispatched
+        .ok_or("held although the first input was given")?;
+    assert!(!first_input(&path, &third.task_id, &third.attempt_id)?);
     Ok(())
 }
 

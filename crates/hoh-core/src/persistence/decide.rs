@@ -589,7 +589,9 @@ pub(super) fn load_binding(
     let pending = super::team::pending(tx, run_id, role)?
         || super::handover::first_input_pending(tx, run_id, role, epoch)?
         || match session.as_deref() {
-            Some(session) => super::handover::first_input_in_flight(tx, session)?,
+            Some(session) => {
+                super::handover::first_input_in_flight(tx, run_id, role, epoch, session)?
+            }
             None => false,
         };
     Ok(Some(BindingView {
