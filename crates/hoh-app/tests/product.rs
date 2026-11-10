@@ -1695,3 +1695,91 @@ async fn test_019_02_the_new_commanders_first_input_is_the_checkpoint_package() 
     world.stop_fakes()?;
     outcome
 }
+
+#[tokio::test]
+async fn a_new_developers_first_turn_starts_from_its_handover_package() -> R {
+    // REQ-019 b2, b4 (docs/adr/ADR-024.md decisions 1 and 4, M2T17R-03): the developer changes from claude to codex in
+    // a run on a spec; its handover writes a session.start notice whose package the product keeps for the new session,
+    // and the new developer's first turn is sent its role's contract, then that package whole, then the task's
+    // header; the attempt's prompt sha256 is what codex was sent.
+    let world = World::new()?;
+    world.claude(None)?;
+    world.codex("m-test")?;
+    world.pi()?;
+    let host = start_when_free(world.config()).await?;
+    let project = world.project();
+    let outcome = async {
+        let run_id = started(&host, "s1").await?;
+        let limit = Duration::from_secs(60);
+        ready(&project, &run_id, &[])?;
+        let developer = format!(
+            "SELECT agent || '/' || role_epoch || '/' || coalesce(session_id, '-') FROM role_bindings \
+             WHERE run_id = '{run_id}' AND role = 'developer'"
+        );
+        until(&project, &developer, &format!("claude/1/{run_id}/session/developer/1"), limit).await?;
+        let revision: i64 =
+            query(&project, "SELECT coalesce(max(revision), 0) FROM team_revisions")?.parse()?;
+        configure(&host, "to-codex", revision, json!({"developer": {"agent": "codex"}})).await?;
+        let session = format!("{run_id}/session/developer/2");
+        until(&project, &developer, &format!("codex/2/{session}"), limit).await?;
+        until(
+            &project,
+            &format!(
+                "SELECT state FROM outbox WHERE message_id = '{run_id}/session-start/developer/2'"
+            ),
+            "ACKED",
+            limit,
+        )
+        .await?;
+        let kept: Value = serde_json::from_str(&std::fs::read_to_string(
+            hoh_app::host::product::first_input_path(&project, &session),
+        )?)?;
+        let package = &kept["package"];
+        assert_eq!(
+            (&package["role"], &package["role_epoch"], &package["output_contract"]),
+            (&json!("developer"), &json!(2), &json!("TaskResult"))
+        );
+        ready(&project, &run_id, &[("T-dev", "developer")])?;
+        until(&project, &ended("T-dev/attempt-1"), "SETTLED/", limit).await?;
+        let sent: Vec<String> = std::fs::read_dir(world.bin().join("codex.d"))?
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("log."))
+            .filter_map(|e| std::fs::read_to_string(e.path().join("received.jsonl")).ok())
+            .flat_map(|log| log.lines().map(str::to_owned).collect::<Vec<_>>())
+            .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
+            .filter(|m| m["method"] == "turn/start")
+            .filter_map(|m| m["params"]["input"][0]["text"].as_str().map(str::to_owned))
+            .collect();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        let text = &sent[0];
+        let block = text
+            .split("```json\n")
+            .nth(1)
+            .and_then(|rest| rest.split("\n```").next())
+            .ok_or(format!("no package in the first turn: {text}"))?;
+        assert_eq!(&serde_json::from_str::<Value>(block)?, package);
+        let (package_at, task_at) = (
+            text.find("```json").ok_or("no package")?,
+            text.find("T-dev").ok_or("no task")?,
+        );
+        assert!(package_at > 0 && package_at < task_at, "{text}");
+        let sha = |bytes: &[u8]| -> String {
+            <sha2::Sha256 as sha2::Digest>::digest(bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        };
+        assert_eq!(
+            query(
+                &project,
+                "SELECT prompt_sha256 FROM attempts WHERE attempt_id = 'T-dev/attempt-1'"
+            )?,
+            sha(text.as_bytes())
+        );
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    world.stop_fakes()?;
+    outcome
+}

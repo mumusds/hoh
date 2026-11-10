@@ -643,34 +643,33 @@ pub(super) fn checkpoint(
             }
             continue;
         }
-        // A commander change hands over a package naming the run's spec: with none, it is refused and the old
-        // binding works on until the run has one (ADR-024 decision 10).
+        // A change to a new holder hands the role over with a package naming the run's spec, whatever the role
+        // (ADR-024 decisions 1 and 2, M2T17R-03): with no spec it is refused and the old binding works on until the
+        // run has one (decision 10). A role left with no agent has no new holder to hand over to.
         let handover_spec = match target {
-            Some(_) if binding.role == super::handover::COMMANDER => {
-                match super::handover::spec(&tx, run_id)? {
-                    Some(spec) => Some(spec),
-                    None => {
-                        behind = true;
-                        if new_refusal(super::handover::NO_SPEC, NO_SPEC_DETAIL) {
-                            changed = true;
-                            events.push(verdict(
-                                REFUSED,
-                                serde_json::json!({
-                                    "run_id": run_id, "role": binding.role, "config_revision": revision,
-                                    "agent": target.map(|role| role.agent.as_str()),
-                                    "reason": super::handover::NO_SPEC,
-                                    "detail": NO_SPEC_DETAIL,
-                                    "kept": {
-                                        "agent": binding.agent, "model": binding.model,
-                                        "role_epoch": binding.role_epoch,
-                                    },
-                                }),
-                            ));
-                        }
-                        continue;
+            Some(_) => match super::handover::spec(&tx, run_id)? {
+                Some(spec) => Some(spec),
+                None => {
+                    behind = true;
+                    if new_refusal(super::handover::NO_SPEC, NO_SPEC_DETAIL) {
+                        changed = true;
+                        events.push(verdict(
+                            REFUSED,
+                            serde_json::json!({
+                                "run_id": run_id, "role": binding.role, "config_revision": revision,
+                                "agent": target.map(|role| role.agent.as_str()),
+                                "reason": super::handover::NO_SPEC,
+                                "detail": NO_SPEC_DETAIL,
+                                "kept": {
+                                    "agent": binding.agent, "model": binding.model,
+                                    "role_epoch": binding.role_epoch,
+                                },
+                            }),
+                        ));
                     }
+                    continue;
                 }
-            }
+            },
             _ => None,
         };
         if live.contains(&binding.role) {
@@ -724,8 +723,16 @@ pub(super) fn checkpoint(
         };
         events.push(applied(&binding.role, epoch, from.clone(), to.clone()));
         if let Some(spec) = handover_spec {
-            let (event, mut notice) =
-                super::handover::prepare(&tx, &project_id, run_id, epoch, spec, &from, &to)?;
+            let (event, mut notice) = super::handover::prepare(
+                &tx,
+                &project_id,
+                run_id,
+                &binding.role,
+                epoch,
+                spec,
+                &from,
+                &to,
+            )?;
             events.push(event);
             notice.event = events.len() - 1;
             outbox.push(notice);

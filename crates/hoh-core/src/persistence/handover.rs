@@ -1,6 +1,6 @@
-//! The Commander's handover (REQ-019; docs/adr/ADR-024.md): what the checkpoint that rebinds the commander writes in
+//! A role's handover (REQ-019; docs/adr/ADR-024.md): what the checkpoint that rebinds a role to a new holder writes in
 //! its own transaction beside the new binding, a handoff.prepared event and one runtime session.start notice to the
-//! new Commander carrying its checkpoint package (b2, b4).
+//! new holder carrying its checkpoint package (b2, b4).
 
 use super::{PersistError, sqlite_error};
 use crate::handoff::{self, RoleChange};
@@ -8,12 +8,11 @@ use crate::protocol::HandoffState;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::json;
 
-/// The role whose change hands its state over in a package (decision 1): the other roles take over from their next
-/// task's own handoff.
+/// The Commander: its own messages carry its epoch (decision 6).
 pub(super) const COMMANDER: &str = "commander";
 
-/// Why a commander change is refused while its run has no specification (decision 10): a role-change package needs
-/// the run's spec digest and revision, and none is invented.
+/// Why a role's change is refused while its run has no specification (decision 10): a role-change package needs the
+/// run's spec digest and revision, and none is invented.
 pub(super) const NO_SPEC: &str = "NO_SPEC";
 
 /// Run `run_id`'s current specification: its digest and revision, none before the run has one.
@@ -34,6 +33,25 @@ pub(super) fn spec(conn: &Connection, run_id: &str) -> Result<Option<(String, u6
     .transpose()
 }
 
+/// Whether run `run_id`'s `role` at `role_epoch` still waits for its first input: its session.start notice is there
+/// and not delivered (decision 4). Such a holder is dispatched nothing, so no task reaches it before its package.
+pub(super) fn first_input_pending(
+    conn: &Connection,
+    run_id: &str,
+    role: &str,
+    role_epoch: i64,
+) -> Result<bool, PersistError> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM outbox WHERE message_id = ?1 AND state <> 'ACKED')",
+        params![crate::ids::child_id(
+            run_id,
+            &format!("session-start/{role}/{role_epoch}")
+        )],
+        |r| r.get(0),
+    )
+    .map_err(sqlite_error)
+}
+
 /// The ids `sql` (one `?1`, the run) reads.
 fn ids(conn: &Connection, run_id: &str, sql: &str) -> Result<Vec<String>, PersistError> {
     let mut statement = conn.prepare(sql).map_err(sqlite_error)?;
@@ -43,13 +61,15 @@ fn ids(conn: &Connection, run_id: &str, sql: &str) -> Result<Vec<String>, Persis
     rows.collect::<Result<_, _>>().map_err(sqlite_error)
 }
 
-/// The writes that hand run `run_id`'s commander over to its binding at `role_epoch` (decision 2): the
+/// The writes that hand run `run_id`'s `role` over to its binding at `role_epoch` (decisions 1 and 2): the
 /// handoff.prepared event and the session.start notice pointing at it, to be committed with the binding. `spec` is the
 /// run's (see [`spec`]); `from` and `to` are the bindings as team.binding_applied records them.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn prepare(
     conn: &Connection,
     project_id: &str,
     run_id: &str,
+    role: &str,
     role_epoch: i64,
     spec: (String, u64),
     from: &serde_json::Value,
@@ -80,9 +100,10 @@ pub(super) fn prepare(
         )?,
     };
     let goal = super::results::started_goal(conn, run_id)?
-        .unwrap_or_else(|| format!("接手运行 {run_id} 的 Commander 职责"));
+        .unwrap_or_else(|| format!("接手运行 {run_id} 的 {role} 职责"));
     let package = handoff::role_change(&RoleChange {
         run_id: run_id.to_owned(),
+        role: role.to_owned(),
         goal,
         role_epoch: epoch,
         spec_sha256: spec.0,
@@ -92,14 +113,14 @@ pub(super) fn prepare(
     });
     let package = crate::protocol::encode(&package)
         .map_err(|e| PersistError::IntegrityViolation(format!("the handover package: {e}")))?;
-    let message_id = crate::ids::child_id(run_id, &format!("session-start/{COMMANDER}/{epoch}"));
+    let message_id = crate::ids::child_id(run_id, &format!("session-start/{role}/{epoch}"));
     let event = super::writer::NewEvent {
         project_id: project_id.to_owned(),
-        event_id: crate::ids::child_id(run_id, &format!("handoff/{COMMANDER}/{epoch}")),
+        event_id: crate::ids::child_id(run_id, &format!("handoff/{role}/{epoch}")),
         run_id: Some(run_id.to_owned()),
         kind: "handoff.prepared".to_owned(),
         payload: json!({
-            "run_id": run_id, "role": COMMANDER, "role_epoch": epoch, "from": from, "to": to,
+            "run_id": run_id, "role": role, "role_epoch": epoch, "from": from, "to": to,
             "message_id": message_id, "spec_revision": package["spec_revision"],
             "candidate_id": package["candidate"]["id"], "state": package["state"],
         }),
@@ -109,10 +130,10 @@ pub(super) fn prepare(
         // Set by the caller to the event's index in its commit.
         event: 0,
         run_id: Some(run_id.to_owned()),
-        recipient_role: COMMANDER.to_owned(),
+        recipient_role: role.to_owned(),
         role_epoch,
         payload: json!({
-            "notice": "runtime", "kind": "session.start", "run_id": run_id, "role": COMMANDER,
+            "notice": "runtime", "kind": "session.start", "run_id": run_id, "role": role,
             "role_epoch": epoch, "package": package,
         }),
     };

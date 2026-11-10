@@ -97,13 +97,15 @@ pub fn verification(v: &Verification, to: &[Recipient]) -> Option<Vec<Message>> 
         .collect()
 }
 
-/// What the new Commander's checkpoint package carries (REQ-019 b4): the run's goal, its current specification and
+/// What a role's new holder's checkpoint package carries (REQ-019 b4): the run's goal, its current specification and
 /// candidate, and its state by row ids, gathered by the store in the transaction that hands the role over.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoleChange {
     pub run_id: String,
+    /// The role handed over (every role whose binding changes, docs/adr/ADR-024.md decision 1).
+    pub role: String,
     pub goal: String,
-    /// The Commander's epoch once the change is applied.
+    /// The role's epoch once the change is applied.
     pub role_epoch: u64,
     pub spec_sha256: String,
     pub spec_revision: u64,
@@ -111,8 +113,17 @@ pub struct RoleChange {
     pub state: HandoffState,
 }
 
-/// The new Commander's first input: a `role_change` ContextHandoff naming rows, each id list sorted and each id once,
-/// never a transcript of the old session (REQ-019 b4). No task of its own; it hands back decisions.
+/// What a role hands back in its turns: the Commander decisions, the others what [`output_contract`] says.
+pub fn role_output_contract(role: &str) -> &'static str {
+    if role == "commander" {
+        "DecisionPayload"
+    } else {
+        output_contract(role)
+    }
+}
+
+/// A role's new holder's first input: a `role_change` ContextHandoff naming rows, each id list sorted and each id once,
+/// never a transcript of the old session (REQ-019 b4). No task of its own; it hands back what its role does.
 pub fn role_change(c: &RoleChange) -> ContextHandoff {
     let ids = |v: &[String]| {
         let mut v = v.to_vec();
@@ -125,13 +136,13 @@ pub fn role_change(c: &RoleChange) -> ContextHandoff {
         run_id: c.run_id.clone(),
         task_id: None,
         goal: c.goal.clone(),
-        role: "commander".to_owned(),
+        role: c.role.clone(),
         role_epoch: c.role_epoch,
         spec_sha256: c.spec_sha256.clone(),
         candidate: c.candidate.clone(),
         acceptance_ids: Vec::new(),
         references: Vec::new(),
-        output_contract: "DecisionPayload".to_owned(),
+        output_contract: role_output_contract(&c.role).to_owned(),
         budget_tokens: BUDGET_TOKENS,
         handoff_kind: HandoffKind::RoleChange,
         spec_revision: c.spec_revision,
@@ -208,6 +219,7 @@ mod tests {
 
     fn change() -> RoleChange {
         RoleChange {
+            role: "commander".to_owned(),
             run_id: "R".to_owned(),
             goal: "g".to_owned(),
             role_epoch: 2,
@@ -260,6 +272,27 @@ mod tests {
                 })
             );
             assert!(package.acceptance_ids.is_empty() && package.references.is_empty());
+        }
+    }
+
+    #[test]
+    fn every_roles_package_names_its_role_and_what_it_hands_back() {
+        // REQ-019 b2/b4 (docs/adr/ADR-024.md decision 1, M2T17R-03): a developer's, QA's or reviewer's new holder gets
+        // a package of the same state, for its own role, its output contract its role's.
+        for (role, contract) in [
+            ("developer", "TaskResult"),
+            ("qa", "TaskResult"),
+            ("reviewer", "IndependentReport"),
+            ("commander", "DecisionPayload"),
+        ] {
+            let mut c = change();
+            c.role = role.to_owned();
+            let package = role_change(&c);
+            protocol::encode(&package).expect("a valid ContextHandoff");
+            assert_eq!(
+                (package.role.as_str(), package.output_contract.as_str()),
+                (role, contract)
+            );
         }
     }
 
