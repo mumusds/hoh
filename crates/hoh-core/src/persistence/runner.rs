@@ -55,6 +55,8 @@ pub struct Waiting {
     /// The agents the runner needs looked at: the project's current team's and those of the bindings in runs not ended
     /// (decision 8, third version; decision 10).
     pub agents: std::collections::BTreeSet<String>,
+    /// The session.start notices waiting (docs/adr/ADR-024.md decision 4).
+    pub session_starts: Vec<super::handover::SessionStart>,
 }
 
 /// One step of the runner.
@@ -88,6 +90,8 @@ pub(super) enum RunnerJob {
         context: Box<crate::decision::Context>,
     },
     Ack(String),
+    /// A session.start notice settled (docs/adr/ADR-024.md decision 4): delivered to this session, or superseded.
+    SessionStart(String, Option<String>),
     /// A session the binder grants (docs/adr/ADR-022.md decision 9).
     BindSession(Box<super::team::SessionGrant>),
     /// A binding the binder blocks because its agent is unavailable, and why.
@@ -195,6 +199,10 @@ pub(super) fn run(
         }
         RunnerJob::Repair(request) => {
             super::retry::request_repair(conn, &request, ctx).map(RunnerDone::Repair)
+        }
+        RunnerJob::SessionStart(message_id, delivered_to) => {
+            super::handover::settle(conn, &message_id, delivered_to.as_deref(), ctx)
+                .map(RunnerDone::Applied)
         }
         RunnerJob::BindSession(grant) => {
             super::team::bind_session(conn, &grant, ctx).map(RunnerDone::Applied)
@@ -314,6 +322,7 @@ fn waiting(conn: &Connection, project_id: &str) -> Result<Waiting, PersistError>
             .map_err(sqlite_error)
     };
     Ok(Waiting {
+        session_starts: super::handover::waiting(conn, project_id)?,
         dispatches,
         started,
         runs,

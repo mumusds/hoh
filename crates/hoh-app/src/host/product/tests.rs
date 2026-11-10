@@ -146,3 +146,54 @@ fn a_native_cancel_says_whether_it_reached_a_turn_the_executor_holds() {
     }
     assert!(!executor.cancel(&work));
 }
+
+#[test]
+fn a_first_input_is_kept_once_whole_and_another_is_refused()
+-> Result<(), Box<dyn std::error::Error>> {
+    // docs/adr/ADR-024.md decision 4: the package is kept at its session's place; the same notice given again (an
+    // answer lost in a crash) is taken; another input for the same session is refused, the first one kept; no staged
+    // file is left.
+    let project = tempfile::tempdir()?;
+    let package = hoh_core::handoff::role_change(&hoh_core::handoff::RoleChange {
+        run_id: "R".to_owned(),
+        goal: "g".to_owned(),
+        role_epoch: 2,
+        spec_sha256: format!("{:064}", 1),
+        spec_revision: 1,
+        candidate: None,
+        state: hoh_core::protocol::HandoffState {
+            applied_decision_ids: vec!["D1".to_owned()],
+            open_issue_ids: Vec::new(),
+            unacked_message_ids: Vec::new(),
+            queued_input_ids: Vec::new(),
+        },
+    });
+    let start = SessionStart {
+        message_id: "R/session-start/commander/2".to_owned(),
+        run_id: "R".to_owned(),
+        role: "commander".to_owned(),
+        role_epoch: 2,
+        package,
+        current_epoch: 2,
+        session_id: Some("R/session/commander/2".to_owned()),
+        agent: "pi".to_owned(),
+    };
+    keep_first_input(project.path(), &start)?;
+    let path = first_input_path(project.path(), "R/session/commander/2");
+    let kept = std::fs::read(&path)?;
+    let input: serde_json::Value = serde_json::from_slice(&kept)?;
+    assert_eq!(
+        input["package"]["state"]["applied_decision_ids"],
+        serde_json::json!(["D1"])
+    );
+    keep_first_input(project.path(), &start)?;
+    let mut other = start.clone();
+    other.message_id = "R/another".to_owned();
+    assert!(keep_first_input(project.path(), &other).is_err());
+    assert_eq!(std::fs::read(&path)?, kept);
+    let names: Vec<_> = std::fs::read_dir(path.parent().ok_or("dir")?)?
+        .map(|e| e.map(|e| e.file_name()))
+        .collect::<Result<_, _>>()?;
+    assert_eq!(names.len(), 1, "{names:?}");
+    Ok(())
+}
