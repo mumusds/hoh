@@ -795,9 +795,9 @@ pub struct Assignment {
     pub prompt: Option<String>,
     pub goal: Option<String>,
     pub title: Option<String>,
-    /// This attempt's turn is the first of a session that was given a first input (its session.start delivered to the
-    /// session, and no other attempt of the session started its process): the turn starts from that input
-    /// (docs/adr/ADR-024.md decision 4, M2T17R-151, -152). The store says it, not the agent's native session.
+    /// This attempt's turn starts from its session's first input: the session was given one (its session.start
+    /// delivered to it) and no turn of it was answered by the agent yet (no native session recorded), so a turn that
+    /// never reached the agent leaves it owed (docs/adr/ADR-024.md decision 4, M2T17R-151, -152, -200).
     pub first_input: bool,
 }
 
@@ -822,8 +822,7 @@ pub(super) fn assignment(
              EXISTS(SELECT 1 FROM outbox o JOIN receipts r ON r.message_id = o.message_id WHERE o.state = 'ACKED' \
               AND json_extract(o.payload_json, '$.kind') = 'session.start' \
               AND json_extract(r.result_json, '$.session_id') = a.session_id) \
-             AND NOT EXISTS(SELECT 1 FROM attempts p WHERE p.session_id = a.session_id \
-              AND p.attempt_id <> a.attempt_id AND p.pid IS NOT NULL) \
+             AND s.native_id IS NULL \
              FROM attempts a LEFT JOIN sessions s ON s.session_id = a.session_id \
              LEFT JOIN role_bindings b ON b.run_id = ?2 AND b.role = ?4 WHERE a.attempt_id = ?1",
             params![attempt_id, run_id, task_id, role],
