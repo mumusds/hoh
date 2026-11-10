@@ -15,6 +15,7 @@ mod attempts;
 mod commands;
 mod control;
 mod decide;
+mod handover;
 mod inputs;
 mod leases;
 mod outbox;

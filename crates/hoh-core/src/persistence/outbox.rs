@@ -322,10 +322,10 @@ struct Current {
 /// The run's current candidate (ADR-018 decision 2): the newest FROZEN or VERIFYING one. The one definition both the
 /// consume fence and the Developer's TaskResult use (M2T04R-54).
 pub(super) fn current_candidate(
-    tx: &Transaction<'_>,
+    conn: &Connection,
     run_id: &str,
 ) -> Result<Option<Candidate>, PersistError> {
-    tx.query_row(
+    conn.query_row(
         "SELECT candidate_id, git_commit, git_tree, spec_sha256, environment_sha256, test_plan_sha256 FROM candidates \
          WHERE run_id = ?1 AND state IN ('FROZEN', 'VERIFYING') ORDER BY created_at DESC, candidate_id DESC LIMIT 1",
         params![run_id],

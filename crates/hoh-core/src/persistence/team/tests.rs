@@ -1222,3 +1222,230 @@ async fn the_agents_to_look_at_include_every_bindings_not_only_the_teams() -> R 
     assert!(waiting.agents.contains("claude"), "{:?}", waiting.agents);
     Ok(())
 }
+
+/// R1 as `working` leaves it, with the state a Commander's handover package names (REQ-019 b4): two APPLIED decisions
+/// and a REJECTED one, an OPEN, a REOPENED and a RESOLVED issue, a QUEUED and a DELIVERED input, an outbox row
+/// PENDING, one DEAD_LETTER and one ACKED, and candidate C1 FROZEN.
+fn handover_state(path: &PathBuf) -> R {
+    exec(
+        path,
+        "INSERT INTO decisions(decision_id, run_id, role_epoch, expected_revision, payload_json, state) VALUES
+           ('D2', 'R1', 1, 1, '{}', 'APPLIED'), ('D1', 'R1', 1, 1, '{}', 'APPLIED'),
+           ('D3', 'R1', 1, 1, '{}', 'REJECTED');
+         INSERT INTO candidates(candidate_id, run_id, git_commit, git_tree, spec_sha256, environment_sha256,
+           test_plan_sha256, source_path, state, created_at) VALUES
+           ('C1', 'R1', printf('%040d', 1), printf('%040d', 2), printf('%064d', 1), printf('%064d', 3),
+            printf('%064d', 4), '/repo', 'FROZEN', '2026-11-09T00:00:00Z');
+         INSERT INTO issues(issue_id, run_id, fingerprint, severity, state, description) VALUES
+           ('I1', 'R1', 'f1', 'high', 'OPEN', 'd'), ('I2', 'R1', 'f2', 'low', 'REOPENED', 'd'),
+           ('I3', 'R1', 'f3', 'low', 'RESOLVED', 'd');
+         INSERT INTO input_queue(input_id, run_id, kind, target_role, state, payload_json) VALUES
+           ('Q1', 'R1', 'STEER', 'developer', 'QUEUED', '{}'), ('Q2', 'R1', 'ASK', NULL, 'DELIVERED', '{}');
+         INSERT INTO outbox(message_id, event_seq, run_id, recipient_role, payload_json, state) VALUES
+           ('M1', (SELECT min(seq) FROM events), 'R1', 'developer', '{}', 'PENDING'),
+           ('M2', (SELECT min(seq) FROM events), 'R1', 'qa', '{}', 'DEAD_LETTER'),
+           ('M3', (SELECT min(seq) FROM events), 'R1', 'qa', '{}', 'ACKED');",
+    )
+}
+
+/// A store whose every commit fails while its flag is set.
+#[derive(Debug, Default)]
+struct FailingCommits(std::sync::atomic::AtomicBool);
+
+impl crate::persistence::FaultHooks for FailingCommits {
+    fn before_commit(&self) -> Result<(), crate::persistence::PersistError> {
+        if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+            Err(crate::persistence::PersistError::IntegrityViolation(
+                "a failed commit".to_owned(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_commander_change_writes_binding_package_and_session_start_in_one_transaction() -> R {
+    // REQ-019 b2, b4 (M2-T17): the commander's change applies at its checkpoint with, in the same transaction, its
+    // binding at epoch 2, team.binding_applied, a handoff.prepared event and one runtime session.start notice to the
+    // commander at epoch 2 carrying the role-change package: the goal, the run's spec and candidate, and the ids of
+    // its state as the database holds them. A checkpoint whose commit fails writes none of it.
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join(".hoh/state.db");
+    let faults = std::sync::Arc::new(FailingCommits::default());
+    let store = Store::open(
+        &path,
+        Options {
+            wal_probe: Some(selftest::test_probe(None)),
+            faults: faults.clone(),
+            ..Options::default()
+        },
+    )?;
+    exec(
+        &path,
+        "INSERT INTO projects(project_id, repo_path, created_at) VALUES ('p1', '/repo', '2026-11-09T00:00:00Z');",
+    )?;
+    working(&store, &path).await?;
+    handover_state(&path)?;
+    store
+        .submit_command(team_change("pi", 0, json!({"commander": {"agent": "pi"}})))
+        .await?;
+    let before = rows::<i64>(
+        &path,
+        "SELECT (SELECT count(*) FROM events), (SELECT count(*) FROM outbox)",
+    )?;
+    faults.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        store
+            .team_checkpoint("R1", crate::persistence::Availability::default())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        binding(&path, "commander")?[..3],
+        [json!("codex"), Value::Null, json!(1)]
+    );
+    assert_eq!(
+        rows::<i64>(
+            &path,
+            "SELECT (SELECT count(*) FROM events), (SELECT count(*) FROM outbox)"
+        )?,
+        before,
+        "a failed commit writes nothing"
+    );
+    faults.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    store
+        .team_checkpoint("R1", crate::persistence::Availability::default())
+        .await?;
+    assert_eq!(
+        binding(&path, "commander")?,
+        [
+            json!("pi"),
+            Value::Null,
+            json!(2),
+            json!(1),
+            json!("ACTIVE"),
+            Value::Null,
+            Value::Null
+        ]
+    );
+    let prepared = values(
+        &path,
+        "SELECT seq, payload_json FROM events WHERE kind = 'handoff.prepared'",
+    )?;
+    assert_eq!(prepared.len(), 1, "one handoff.prepared event");
+    let notices = values(
+        &path,
+        "SELECT message_id, event_seq, recipient_role, role_epoch, state, payload_json FROM outbox \
+         WHERE json_extract(payload_json, '$.kind') = 'session.start'",
+    )?;
+    assert_eq!(notices.len(), 1, "one session.start notice");
+    let notice = &notices[0];
+    assert_eq!(
+        notice[1], prepared[0][0],
+        "the notice points at the handoff event"
+    );
+    assert_eq!(
+        notice[2..5],
+        [json!("commander"), json!(2), json!("PENDING")]
+    );
+    let payload: Value = serde_json::from_str(notice[5].as_str().ok_or("payload")?)?;
+    assert_eq!(payload["notice"], "runtime");
+    assert_eq!(
+        (&payload["role"], &payload["role_epoch"]),
+        (&json!("commander"), &json!(2))
+    );
+    let package: crate::protocol::ContextHandoff = crate::protocol::decode(&payload["package"])?;
+    assert_eq!(
+        (
+            package.goal.as_str(),
+            package.spec_revision,
+            package.spec_sha256.clone()
+        ),
+        ("g", 1, format!("{:064}", 1))
+    );
+    assert_eq!(package.candidate.map(|c| c.id).as_deref(), Some("C1"));
+    let ids = |sql: &str| -> R<Vec<String>> {
+        Ok(rows::<String>(&path, sql)?.into_iter().flatten().collect())
+    };
+    assert_eq!(
+        package.state,
+        Some(crate::protocol::HandoffState {
+            applied_decision_ids: ids(
+                "SELECT decision_id FROM decisions WHERE run_id = 'R1' AND state = 'APPLIED' ORDER BY 1"
+            )?,
+            open_issue_ids: ids(
+                "SELECT issue_id FROM issues WHERE run_id = 'R1' AND state IN ('OPEN', 'REOPENED') ORDER BY 1"
+            )?,
+            unacked_message_ids: ids(&format!(
+                "SELECT message_id FROM outbox WHERE run_id = 'R1' AND state <> 'ACKED' AND message_id <> '{}' \
+                 ORDER BY 1",
+                notice[0].as_str().ok_or("id")?
+            ))?,
+            queued_input_ids: ids(
+                "SELECT input_id FROM input_queue WHERE run_id = 'R1' AND state = 'QUEUED' ORDER BY 1"
+            )?,
+        })
+    );
+    assert_eq!(
+        package
+            .state
+            .as_ref()
+            .map(|s| s.applied_decision_ids.clone()),
+        Some(vec!["D1".to_owned(), "D2".to_owned()]),
+        "the fixture's own"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_commander_change_of_a_run_without_a_spec_is_refused_until_the_run_has_one() -> R {
+    // ADR-024 decision 10: a role-change package names the run's spec, so a run with none keeps its commander (binding
+    // and epoch) with one team.binding_refused, reason NO_SPEC, and no notice; later checkpoints add nothing while it
+    // stays so; once the run has a spec the change applies with its package.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    store
+        .submit_command(start("R1", Config::default().budget))
+        .await?;
+    store
+        .submit_command(team_change("pi", 0, json!({"commander": {"agent": "pi"}})))
+        .await?;
+    let notices = |path: &PathBuf| -> R<i64> {
+        Ok(rows::<i64>(
+            path,
+            "SELECT count(*) FROM outbox WHERE json_extract(payload_json, '$.kind') = 'session.start'",
+        )?[0][0])
+    };
+    for _ in 0..2 {
+        store
+            .team_checkpoint("R1", crate::persistence::Availability::default())
+            .await?;
+        assert_eq!(
+            binding(&path, "commander")?[..3],
+            [json!("codex"), Value::Null, json!(1)]
+        );
+        assert_eq!(
+            rows::<String>(
+                &path,
+                "SELECT json_extract(payload_json, '$.reason') FROM events WHERE kind = 'team.binding_refused'"
+            )?,
+            [["NO_SPEC".to_owned()]]
+        );
+        assert_eq!(notices(&path)?, 0);
+    }
+    exec(
+        &path,
+        "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', 'p1', printf('%064d', 7), 1);
+         UPDATE runs SET spec_id = 's1' WHERE run_id = 'R1';",
+    )?;
+    store
+        .team_checkpoint("R1", crate::persistence::Availability::default())
+        .await?;
+    assert_eq!(
+        binding(&path, "commander")?[..3],
+        [json!("pi"), Value::Null, json!(2)]
+    );
+    assert_eq!(notices(&path)?, 1);
+    Ok(())
+}
