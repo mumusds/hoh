@@ -1328,3 +1328,121 @@ async fn a_start_run_whose_configuration_file_cannot_be_applied_is_refused_not_s
     host.shutdown().await;
     Ok(())
 }
+
+/// One blocking POST of `body` to the host at `port` with `token`, from a thread of its own: its status and body.
+fn post_blocking(port: u16, token: &str, body: &Value) -> R<(u16, Value)> {
+    use std::io::{Read as _, Write as _};
+    let body = body.to_string();
+    let request = format!(
+        "POST /v1/commands HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\nX-HoH-Token: {token}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))?;
+    stream.set_read_timeout(Some(Duration::from_secs(20)))?;
+    stream.write_all(request.as_bytes())?;
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw)?;
+    let text = String::from_utf8(raw)?;
+    let (head, body) = text.split_once("\r\n\r\n").ok_or("no response head")?;
+    let status: u16 = head.split(' ').nth(1).ok_or("no status")?.parse()?;
+    Ok((status, serde_json::from_str(body)?))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_019_04_two_concurrent_team_changes_one_202_one_409_one_epoch_step() -> R {
+    // AC-019-04 (ADR-022 decision 3, ADR-024): a run on a spec with its runner; at team revision r two clients, two OS
+    // threads released together, submit ConfigureTeam at expected_revision r, the commander to each of the two agents
+    // it is not: exactly one 202, the other 409 with current_revision r+1; the binding becomes the accepted one and
+    // the commander's epoch moves by exactly one. 50 rounds.
+    let dir = tempfile::tempdir()?;
+    let mut config = config(dir.path());
+    config.runner = Some(hoh_app::host::RunnerConfig {
+        executor: std::sync::Arc::new(Idle),
+        context: hoh_core::decision::Context::default(),
+    });
+    let host = start_when_free(config).await?;
+    let run_id = started(&host, "s1").await?;
+    exec(
+        dir.path(),
+        &format!(
+            "INSERT INTO specs(spec_id, project_id, sha256, revision) SELECT 's1', project_id, printf('%064d', 1), 1 \
+             FROM projects; UPDATE runs SET state = 'RUNNING', spec_id = 's1', revision = revision + 1 \
+             WHERE run_id = '{run_id}';"
+        ),
+    )?;
+    let binding = format!(
+        "SELECT agent || '/' || role_epoch FROM role_bindings WHERE run_id = '{run_id}' AND role = 'commander'"
+    );
+    let (port, token) = (host.port, host.token.clone());
+    let agents = ["codex", "pi", "claude"];
+    for round in 0..50_i64 {
+        let now = query(dir.path(), &binding)?;
+        let (agent, epoch) = now.split_once('/').ok_or("no binding")?;
+        let epoch: i64 = epoch.parse()?;
+        let r: i64 = query(
+            dir.path(),
+            "SELECT coalesce(max(revision), 0) FROM team_revisions",
+        )?
+        .parse()?;
+        assert_eq!(r, round, "round {round}");
+        let targets: Vec<&str> = agents.iter().copied().filter(|a| *a != agent).collect();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let threads: Vec<_> = targets
+            .iter()
+            .map(|target| {
+                let (barrier, token) = (barrier.clone(), token.clone());
+                let body = configure(
+                    &format!("r{round}-{target}"),
+                    None,
+                    r,
+                    json!({"bindings": {"commander": {"agent": target}}, "apply_at": "checkpoint"}),
+                );
+                let target = (*target).to_owned();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    post_blocking(port, &token, &body)
+                        .map(|reply| (target, reply))
+                        .map_err(|e| e.to_string())
+                })
+            })
+            .collect();
+        let mut replies = Vec::new();
+        for thread in threads {
+            replies.push(thread.join().map_err(|_| "a client panicked")??);
+        }
+        replies.sort_by_key(|(_, (status, _))| *status);
+        let [(accepted, (ok, body)), (_, (stale, refused))] = &replies[..] else {
+            return Err("two replies expected".into());
+        };
+        assert_eq!((*ok, *stale), (202, 409), "round {round}: {replies:?}");
+        assert_eq!(body["revision"], r + 1, "round {round}");
+        assert_eq!(refused["code"], "STALE_REVISION", "round {round}");
+        assert_eq!(refused["current_revision"], r + 1, "round {round}");
+        // Applied at the run's checkpoint: the accepted agent, the epoch one step on, and never two.
+        let want = format!("{accepted}/{}", epoch + 1);
+        let end = std::time::Instant::now() + Duration::from_secs(20);
+        let mut seen = query(dir.path(), &binding)?;
+        while seen != want {
+            let moved: i64 = seen.split_once('/').map_or(Ok(0), |(_, e)| e.parse())?;
+            assert!(
+                moved <= epoch + 1,
+                "round {round}: {seen}, the epoch moved twice"
+            );
+            assert!(
+                std::time::Instant::now() < end,
+                "round {round}: {seen}, not {want}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            seen = query(dir.path(), &binding)?;
+        }
+    }
+    assert_eq!(
+        query(dir.path(), &binding)?
+            .split_once('/')
+            .map(|(_, e)| e.to_owned()),
+        Some("51".to_owned())
+    );
+    host.shutdown().await;
+    Ok(())
+}
