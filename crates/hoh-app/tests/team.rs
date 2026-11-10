@@ -1741,6 +1741,18 @@ async fn a_session_start_passed_by_the_checkpoint_of_the_same_tick_is_never_offe
         query(&project, &notice(3))?,
         format!("ACKED:{run_id}/session/commander/3")
     );
+    // Each notice the executor held back is recorded once as undelivered, with what it said (M2T17R-150).
+    assert_eq!(
+        query(
+            &project,
+            &format!(
+                "SELECT group_concat(json_extract(payload_json, '$.role_epoch') || ':' || \
+                 json_extract(payload_json, '$.detail'), ',') FROM (SELECT * FROM events \
+                 WHERE kind = 'handoff.undelivered' AND run_id = '{run_id}' ORDER BY seq)"
+            )
+        )?,
+        "2:held by the test,3:held by the test"
+    );
     let took: Vec<&str> = lines.lines().filter(|l| l.ends_with(" took")).collect();
     assert_eq!(took.len(), 1, "{lines}");
     assert!(

@@ -22,6 +22,7 @@ fn work(prompt: Option<&str>) -> Work {
             prompt: prompt.map(str::to_owned),
             goal: Some("Ship it".to_owned()),
             title: Some("Write the parser".to_owned()),
+            first_input: false,
         },
     }
 }

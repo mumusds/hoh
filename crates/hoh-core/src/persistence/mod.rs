@@ -724,6 +724,24 @@ impl Store {
         }
     }
 
+    /// The session.start notices PENDING in project `project_id`'s runs not ended, with their bindings now (the
+    /// runner's look after its checkpoints and binder, docs/adr/ADR-024.md decision 4).
+    pub async fn session_starts(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<SessionStart>, PersistError> {
+        match self
+            .writer
+            .runner(runner::RunnerJob::SessionStarts(project_id.to_owned()))
+            .await?
+        {
+            runner::RunnerDone::SessionStarts(starts) => Ok(starts),
+            _ => Err(PersistError::IntegrityViolation(
+                "a runner read answered with something else".to_owned(),
+            )),
+        }
+    }
+
     /// The runner took `notice`: its receipt, the notice ACKED, the attempt STARTING with its work effect PREPARED;
     /// false when it was taken already or its attempt is no longer PREPARED.
     pub async fn runner_received(
@@ -875,6 +893,21 @@ impl Store {
         self.runner_step(runner::RunnerJob::SessionStart(
             message_id.to_owned(),
             Some(session_id.to_owned()),
+        ))
+        .await
+    }
+
+    /// Record once that the executor did not take session.start notice `message_id`, with `detail` (its answer): one
+    /// handoff.undelivered event while the notice is PENDING (docs/adr/ADR-024.md decision 4, M2T17R-150); whether it
+    /// was written now.
+    pub async fn session_start_undelivered(
+        &self,
+        message_id: &str,
+        detail: &str,
+    ) -> Result<bool, PersistError> {
+        self.runner_step(runner::RunnerJob::SessionStartUndelivered(
+            message_id.to_owned(),
+            detail.to_owned(),
         ))
         .await
     }

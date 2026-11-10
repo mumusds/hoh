@@ -322,15 +322,26 @@ impl ProductExecutor {
                 why,
             )
         })?;
-        // A new holder's first turn (no native session to resume yet) starts from its handover package (REQ-019 b4).
-        let package = match (&a.native_session, a.session_id.as_deref()) {
-            (None, Some(session)) => first_input(&self.project, session).map_err(|why| {
-                refused(
-                    "FIRST_INPUT_UNAVAILABLE",
-                    FailureClass::Transient { retry_after: None },
-                    why,
-                )
-            })?,
+        // A new holder's first turn starts from its handover package (REQ-019 b4), as the store says which turn that
+        // is (ADR-024 decision 4): one whose kept input is gone or unreadable is not started without it.
+        let package = match (a.first_input, a.session_id.as_deref()) {
+            (true, Some(session)) => match first_input(&self.project, session) {
+                Ok(Some(package)) => Some(package),
+                Ok(None) => {
+                    return Err(refused(
+                        "FIRST_INPUT_UNAVAILABLE",
+                        FailureClass::Transient { retry_after: None },
+                        format!("the first input of {session} was given but is not kept"),
+                    ));
+                }
+                Err(why) => {
+                    return Err(refused(
+                        "FIRST_INPUT_UNAVAILABLE",
+                        FailureClass::Transient { retry_after: None },
+                        why,
+                    ));
+                }
+            },
             _ => None,
         };
         let text = prompt_text(&contract.text, package.as_ref(), work);

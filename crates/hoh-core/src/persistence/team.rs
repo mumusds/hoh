@@ -819,6 +819,10 @@ pub struct Assignment {
     pub prompt: Option<String>,
     pub goal: Option<String>,
     pub title: Option<String>,
+    /// This attempt's turn is the first of a session that was given a first input (its session.start delivered to the
+    /// session, and no other attempt of the session started its process): the turn starts from that input
+    /// (docs/adr/ADR-024.md decision 4, M2T17R-151, -152). The store says it, not the agent's native session.
+    pub first_input: bool,
 }
 
 /// The assignment of attempt `attempt_id` of task `task_id` in run `run_id` (project `project_id`), `role`.
@@ -838,7 +842,12 @@ pub(super) fn assignment(
               ORDER BY e.seq LIMIT 1), \
              (SELECT json_extract(j.value, '$.title') FROM events e, json_each(json_extract(e.payload_json, '$.tasks')) j \
               WHERE e.run_id = ?2 AND e.kind = 'plan.imported' AND json_extract(j.value, '$.task_id') = ?3 \
-              ORDER BY e.seq DESC LIMIT 1) \
+              ORDER BY e.seq DESC LIMIT 1), \
+             EXISTS(SELECT 1 FROM outbox o JOIN receipts r ON r.message_id = o.message_id WHERE o.state = 'ACKED' \
+              AND json_extract(o.payload_json, '$.kind') = 'session.start' \
+              AND json_extract(r.result_json, '$.session_id') = a.session_id) \
+             AND NOT EXISTS(SELECT 1 FROM attempts p WHERE p.session_id = a.session_id \
+              AND p.attempt_id <> a.attempt_id AND p.pid IS NOT NULL) \
              FROM attempts a LEFT JOIN sessions s ON s.session_id = a.session_id \
              LEFT JOIN role_bindings b ON b.run_id = ?2 AND b.role = ?4 WHERE a.attempt_id = ?1",
             params![attempt_id, run_id, task_id, role],
@@ -854,6 +863,7 @@ pub(super) fn assignment(
                     prompt: None,
                     goal: r.get(7)?,
                     title: r.get(8)?,
+                    first_input: r.get(9)?,
                 })
             },
         )
@@ -1106,6 +1116,9 @@ pub struct TeamMember {
     /// The role was removed from the team (its row stays, BLOCKED, so an old epoch stays fenced): not an availability
     /// block.
     pub removed: bool,
+    /// The role's new holder waits for its first input (its session.start at the binding's epoch not delivered yet):
+    /// it is dispatched nothing meanwhile (docs/adr/ADR-024.md decision 4, M2T17R-150).
+    pub first_input_pending: bool,
 }
 
 /// A run's team: the project's current team revision and the run's roles, in the role order.
@@ -1170,6 +1183,7 @@ pub(super) fn view(
                 blocked_reason: r.get(7)?,
                 pending: None,
                 removed: false,
+                first_input_pending: false,
             })
         })
         .map_err(sqlite_error)?
@@ -1185,6 +1199,8 @@ pub(super) fn view(
             session_id: member.session_id.clone(),
         };
         member.removed = matches!(before(conn, project_id, &binding)?, Before::Absent);
+        member.first_input_pending =
+            super::handover::first_input_pending(conn, run_id, &member.role, member.role_epoch)?;
         if member.config_revision >= team_revision {
             continue;
         }
@@ -1212,6 +1228,7 @@ pub(super) fn view(
                 state: "UNBOUND".to_owned(),
                 blocked_reason: None,
                 removed: false,
+                first_input_pending: false,
                 pending: Some(serde_json::json!({
                     "agent": role.agent.as_str(),
                     "model": role.model,
