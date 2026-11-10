@@ -118,6 +118,8 @@ fn test_001_03_without_a_terminal_bare_hoh_is_a_usage_error() -> R {
     assert_eq!(status.code(), Some(64), "stdout redirected");
     assert_eq!(std::fs::read(&out)?, b"", "stdout");
     pty.wait_for("hoh -p", 0, Duration::from_secs(5))?;
+    // All it wrote read, so the absence below covers all of it.
+    pty.drained(Duration::from_secs(5))?;
     let shown = String::from_utf8_lossy(&pty.output()).into_owned();
     assert!(
         !shown.contains("\u{1b}[?1049h"),

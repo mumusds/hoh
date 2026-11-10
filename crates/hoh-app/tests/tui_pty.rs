@@ -60,6 +60,8 @@ impl Session {
     /// The exit code once `hoh` ends; also checks the terminal was restored (attributes, alternate screen, cursor).
     fn ended(mut self) -> R<Option<i32>> {
         let status = exit_within(&mut self.child, WAIT)?;
+        // Its last bytes read before they are looked at (convention v2: a state read after the event that makes it).
+        self.pty.drained(WAIT)?;
         let out = self.pty.output();
         let entered = find(&out, ENTER_ALT, 0).ok_or("the alternate screen was never entered")?;
         let left = find(&out, LEAVE_ALT, entered).ok_or("the alternate screen was not left")?;

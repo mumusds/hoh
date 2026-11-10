@@ -27,6 +27,8 @@ pub struct Pty {
     output: Arc<Mutex<Vec<u8>>>,
     /// Asks the reader to close its copy of the master.
     stop: Arc<AtomicBool>,
+    /// How many of the reader's polls found nothing to read (see [`Pty::drained`]).
+    quiet: Arc<std::sync::atomic::AtomicU64>,
     reader: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -86,6 +88,8 @@ impl Pty {
         let sink = output.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
+        let quiet = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let quieted = quiet.clone();
         let reader = std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
             let tick = Timespec {
@@ -97,7 +101,11 @@ impl Pty {
             while !stopped.load(Ordering::SeqCst) {
                 let mut fds = [PollFd::new(&reader, PollFlags::IN)];
                 match rustix::event::poll(&mut fds, Some(&tick)) {
-                    Ok(0) | Err(rustix::io::Errno::INTR) => continue,
+                    Ok(0) => {
+                        quieted.fetch_add(1, Ordering::SeqCst);
+                        continue;
+                    }
+                    Err(rustix::io::Errno::INTR) => continue,
                     Ok(_) => {}
                     Err(_) => break,
                 }
@@ -116,8 +124,34 @@ impl Pty {
             slave: Some(slave),
             output,
             stop,
+            quiet,
             reader: Some(reader),
         })
+    }
+
+    /// Wait (at most `timeout`) until everything written to the terminal before this call is in [`Pty::output`]: the
+    /// reader appends what it reads on its own thread, so right after a program exits its last bytes can still be
+    /// unread (two TUI tests failed so under load: "the alternate screen was not left"; ADR-022 decision 10, v2). Once
+    /// nothing more is written (its writer gone), a poll that starts after this call and finds nothing to read shows
+    /// that all of it was read and appended (the reader appends each read before it polls again); the second quiet
+    /// poll counted from here is one that started after this call. A reader that has ended has read all it will.
+    pub fn drained(&self, timeout: Duration) -> R {
+        let from = self.quiet.load(Ordering::SeqCst);
+        let end = Instant::now() + timeout;
+        while self.quiet.load(Ordering::SeqCst) < from + 2
+            && !self
+                .reader
+                .as_ref()
+                .is_none_or(std::thread::JoinHandle::is_finished)
+        {
+            if Instant::now() >= end {
+                return Err(
+                    format!("the terminal's output was not read within {timeout:?}").into(),
+                );
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Ok(())
     }
 
     /// Hang the terminal up as closing its window does: every descriptor of the master is closed (the reader's
