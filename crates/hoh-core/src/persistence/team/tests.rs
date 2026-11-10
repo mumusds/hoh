@@ -1571,6 +1571,31 @@ async fn a_session_start_goes_once_to_its_epochs_session_and_a_superseded_one_ne
             .deliver_session_start(&stale.message_id, "any")
             .await?
     );
+    // Not even to the session of the epoch that passed it: that session's first input is its own notice's package.
+    store
+        .bind_session(crate::persistence::SessionGrant {
+            run_id: "R1".to_owned(),
+            role: "commander".to_owned(),
+            role_epoch: 4,
+            agent: "codex".to_owned(),
+            agent_version: "1".to_owned(),
+            capabilities: json!({}),
+        })
+        .await?;
+    let current = store
+        .runner_waiting("p1")
+        .await?
+        .session_starts
+        .into_iter()
+        .find(|s| s.role_epoch == 4)
+        .and_then(|s| s.session_id)
+        .ok_or("no epoch-4 session")?;
+    assert!(
+        !store
+            .deliver_session_start(&stale.message_id, &current)
+            .await?,
+        "the epoch-3 notice delivered to the epoch-4 session"
+    );
     assert!(store.supersede_session_start(&stale.message_id).await?);
     assert!(
         !store.supersede_session_start(&stale.message_id).await?,
