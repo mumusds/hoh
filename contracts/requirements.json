@@ -800,7 +800,7 @@
     "绑定变更必须先持久化为待交接请求，在该职位当前 turn 结束或到达 writer 安全点后才生效；生效前界面显示 pending，不显示为已完成。",
     "生效时必须在同一事务内完成：更新绑定、该职位 role_epoch+1、追加交接事件、写入新会话启动的 outbox。",
     "role_epoch 低于当前值的 decision、steer 和消息只进入历史（decisions.state=REJECTED，原因 STALE_ROLE_EPOCH），不得改变任何 task/run 状态，也不得产生派发。",
-    "新持有者的首个输入必须是 checkpoint 交接包，包含 goal、当前 spec_sha256/revision、已 APPLIED 的决策、OPEN/REOPENED issue、未 ACK 的 outbox 与 QUEUED 输入、当前 candidate 身份；不能是旧会话全文。",
+    "新持有者的首个输入必须是 checkpoint 交接包，包含 goal、当前 spec_sha256/revision（Run 尚无 spec 时两者为 null，CR-014）、已 APPLIED 的决策、OPEN/REOPENED issue、未 ACK 的 outbox 与 QUEUED 输入、当前 candidate 身份；不能是旧会话全文。",
     "交接不能重复原任务：已 LEASED/RUNNING 的 Task 及其 STARTING/RUNNING attempt 继续执行，已 ACKED 的消息不重投；新持有者对已租用或已 ACCEPTED 的 task 发出的派发，由租约/状态检查拒绝。",
     "紧急中断写者时，必须把该 attempt 标为 UNKNOWN_EFFECT，先 reconcile 工作区 hash 与 commit，然后才允许新写者取得写租约。"
    ],

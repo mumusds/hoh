@@ -94,7 +94,11 @@
           "minimum": 1
         },
         "spec_sha256": {
-          "type": "string",
+          "description": "The run's current specification digest; null only in a role_change package while the run has no specification (CR-014).",
+          "type": [
+            "string",
+            "null"
+          ],
           "pattern": "^[a-f0-9]{64}$"
         },
         "candidate": {
@@ -139,7 +143,11 @@
           ]
         },
         "spec_revision": {
-          "type": "integer",
+          "description": "The run's current specification revision; null exactly when spec_sha256 is (CR-014).",
+          "type": [
+            "integer",
+            "null"
+          ],
           "minimum": 1
         },
         "state": {
@@ -229,6 +237,12 @@
               },
               "acceptance_ids": {
                 "minItems": 1
+              },
+              "spec_sha256": {
+                "type": "string"
+              },
+              "spec_revision": {
+                "type": "integer"
               }
             }
           }
@@ -247,6 +261,12 @@
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 160
+              },
+              "spec_sha256": {
+                "type": "string"
+              },
+              "spec_revision": {
+                "type": "integer"
               }
             }
           }
@@ -262,6 +282,28 @@
           "then": {
             "required": [
               "state"
+            ],
+            "anyOf": [
+              {
+                "properties": {
+                  "spec_sha256": {
+                    "type": "string"
+                  },
+                  "spec_revision": {
+                    "type": "integer"
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "spec_sha256": {
+                    "type": "null"
+                  },
+                  "spec_revision": {
+                    "type": "null"
+                  }
+                }
+              }
             ]
           }
         }
