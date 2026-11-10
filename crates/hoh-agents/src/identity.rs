@@ -1608,6 +1608,54 @@ mod tests {
     }
 
     #[test]
+    fn a_child_stopped_for_this_process_as_its_tracer_is_not_ended() -> io::Result<()> {
+        // CIR-300: the child asks to be traced by this process (PTRACE_TRACEME) and execs, so it stops with SIGTRAP; a
+        // tracer's waitid reports that stop (CLD_TRAPPED) even when only ends are asked for, and a stop is no end. Once
+        // killed, the same child is ended.
+        let mut child = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(
+                "import ctypes, os, sys\n\
+                 libc = ctypes.CDLL(None, use_errno=True)\n\
+                 if libc.ptrace(0, 0, None, None) != 0:\n    \
+                 sys.exit(os.strerror(ctypes.get_errno()))\n\
+                 os.execv('/bin/sleep', ['sleep', '60'])\n",
+            )
+            .spawn()?;
+        let pid = child.id();
+        let raw = Pid::from_raw(i32::try_from(pid).map_err(io::Error::other)?)
+            .ok_or_else(|| io::Error::other("no pid"))?;
+        let looked = (|| {
+            let stops = rustix::process::WaitIdOptions::STOPPED
+                | rustix::process::WaitIdOptions::EXITED
+                | rustix::process::WaitIdOptions::NOHANG
+                | rustix::process::WaitIdOptions::NOWAIT;
+            let mut status = None;
+            within(
+                || {
+                    status = rustix::process::waitid(rustix::process::WaitId::Pid(raw), stops)?;
+                    Ok(status.is_some())
+                },
+                "stopped",
+            )?;
+            let status = status.ok_or_else(|| io::Error::other("no status"))?;
+            assert!(
+                status.trapped(),
+                "the child never stopped for its tracer: exited {}, killed {}",
+                status.exited(),
+                status.killed()
+            );
+            assert!(!child_ended(pid)?, "a ptrace stop read as an end");
+            Ok::<(), io::Error>(())
+        })();
+        let _ = child.kill();
+        let ended_once_killed = within(|| child_ended(pid), "ended once killed");
+        child.wait()?;
+        looked?;
+        ended_once_killed
+    }
+
+    #[test]
     fn a_child_is_alive_until_it_is_reaped_or_a_zombie() -> io::Result<()> {
         // The same through the real /proc: a sleeping child is alive with its own start time; once it ends it is a
         // zombie, and once reaped it is gone.
