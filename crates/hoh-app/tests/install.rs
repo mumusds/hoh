@@ -1558,7 +1558,8 @@ fn a_program_run_through_a_linked_data_directory_keeps_the_uninstall_from_removi
     let out = install.run("bundle", &[])?;
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     let program = install.data().join("hoh/current/bin/program");
-    std::fs::copy(std::env::current_exe()?, &program)?;
+    // Made by another process, never one this process holds open for writing (ETXTBSY otherwise, `installed::executable`).
+    installed::executable(&program, &[&std::env::current_exe()?])?;
     let running = Running(
         Command::new(&program)
             .args(["--exact", "a_program_of_the_installation", "--ignored"])
