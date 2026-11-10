@@ -226,6 +226,24 @@ pub(super) fn submit(
             };
             let at = events.len();
             events.push(command.event.clone());
+            // A notice to a role is addressed to its binding as it is now, in this transaction: after a handover the
+            // commander's epoch is no longer the one the caller may have written (docs/adr/ADR-024.md decision 6).
+            let mut outbox = Vec::new();
+            for o in command.outbox.iter().cloned() {
+                let current: Option<i64> = tx
+                    .query_row(
+                        "SELECT role_epoch FROM role_bindings WHERE run_id = ?1 AND role = ?2",
+                        params![command.run_id, o.recipient_role],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(sqlite_error)?;
+                outbox.push(NewOutbox {
+                    event: o.event + at,
+                    role_epoch: current.unwrap_or(o.role_epoch),
+                    ..o
+                });
+            }
             let done = writer::write(
                 &tx,
                 &Commit {
@@ -235,15 +253,7 @@ pub(super) fn submit(
                         change: Change::Run(to),
                     }],
                     events,
-                    outbox: command
-                        .outbox
-                        .clone()
-                        .into_iter()
-                        .map(|o| NewOutbox {
-                            event: o.event + at,
-                            ..o
-                        })
-                        .collect(),
+                    outbox,
                 },
                 ctx,
             )?;
