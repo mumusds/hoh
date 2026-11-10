@@ -1544,6 +1544,10 @@ fn links_that_are_not_hohs_in_the_unit_directories_do_not_stop_the_uninstall() -
         std::os::unix::fs::symlink("stale.service", at.join("stale.service"))?;
         std::os::unix::fs::symlink("/nowhere", at.join("gone.service"))?;
     }
+    // Design correction 13: a name systemd would read links in, itself a link to itself or to nothing, is followed
+    // and seen not there; it holds no link enabling an instance.
+    std::os::unix::fs::symlink("loop.target.wants", user.join("loop.target.wants"))?;
+    std::os::unix::fs::symlink("/nowhere", user.join("gone.target.requires"))?;
     let out = install.run("bundle", &["--uninstall"])?;
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     assert!(!install.data().join("hoh").exists());
