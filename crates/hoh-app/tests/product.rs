@@ -1263,14 +1263,6 @@ fn the_configured_cancel_graces_reach_every_step_of_the_products_host() {
     assert_eq!((config.cancel.native, config.cancel.term), (native, term));
 }
 
-/// Whether process `pid` has ended (gone, or a zombie not reaped yet).
-fn process_ended(pid: &str) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
-        stat.rsplit_once(')')
-            .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
-    })
-}
-
 /// The id of `pid`'s thread named `name`, if it has one.
 fn thread_named(pid: u32, name: &str) -> Option<i32> {
     std::fs::read_dir(format!("/proc/{pid}/task"))
@@ -1315,6 +1307,7 @@ fn a_hosts_stop_kills_the_schema_command_however_late_its_reader_runs() -> R {
         .spawn()?;
     let host_pid = host.id();
     let pids = [d.join("schema-pid"), d.join("schema-member")];
+    let mut started: Vec<(u32, Option<String>)> = Vec::new();
     let mut traced = None;
     let outcome = (|| -> R<(i32, std::time::Duration)> {
         let info = world.project().join(".hoh/host.json");
@@ -1356,6 +1349,20 @@ fn a_hosts_stop_kills_the_schema_command_however_late_its_reader_runs() -> R {
                 return Err("the schema was never generated".into());
             }
             std::thread::sleep(Duration::from_millis(20));
+        }
+        // The schema commands live now (each hangs 120 s): their numbers and start times name them for the end's
+        // check, so a number taken again is never taken for them (ADR-022 decision 10, convention v2; M2T07R-1151).
+        for p in &pids {
+            let pid: u32 = loop {
+                if let Ok(pid) = std::fs::read_to_string(p)?.trim().parse() {
+                    break pid;
+                }
+                if Instant::now() > end {
+                    return Err(format!("{} never named a process", p.display()).into());
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            started.push((pid, hoh_agents::identity::start_id(pid)?));
         }
         let reader = thread_named(host_pid, "hoh-schema").ok_or("no schema reader thread")?;
         let tid = Pid::from_raw(reader);
@@ -1402,21 +1409,36 @@ fn a_hosts_stop_kills_the_schema_command_however_late_its_reader_runs() -> R {
         let _ = host.kill();
         let _ = host.wait();
     }
-    let recorded: Vec<String> = pids
-        .iter()
-        .filter_map(|p| std::fs::read_to_string(p).ok())
-        .map(|p| p.trim().to_owned())
-        .collect();
+    // Each command's end by identity::ended with its start time: a look that cannot tell is said, never taken for an
+    // end, and only a process seen to be the same one is killed.
+    let look = |started: &[(u32, Option<String>)]| {
+        let (mut alive, mut untold) = (Vec::new(), Vec::new());
+        for (pid, start) in started {
+            match hoh_agents::identity::ended(*pid, start.as_deref()) {
+                Ok(true) => {}
+                Ok(false) => alive.push(*pid),
+                Err(e) => untold.push(format!("{pid}: {e}")),
+            }
+        }
+        (alive, untold)
+    };
     let until = Instant::now() + Duration::from_secs(2);
-    while !recorded.iter().all(|p| process_ended(p)) && Instant::now() < until {
+    let (mut alive, mut untold) = look(&started);
+    while !(alive.is_empty() && untold.is_empty()) && Instant::now() < until {
         std::thread::sleep(Duration::from_millis(10));
+        (alive, untold) = look(&started);
     }
-    let alive: Vec<&String> = recorded.iter().filter(|p| !process_ended(p)).collect();
     for pid in &alive {
-        let _ = Command::new("kill").args(["-KILL", pid.as_str()]).status();
+        let _ = Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .status();
     }
     let (code, took) = outcome?;
-    assert_eq!(recorded.len(), 2, "{recorded:?}");
+    assert_eq!(started.len(), 2, "{started:?}");
+    assert!(
+        untold.is_empty(),
+        "whether the schema commands ended cannot be told: {untold:?}"
+    );
     assert!(
         alive.is_empty(),
         "the schema command outlived the host: {alive:?}"
