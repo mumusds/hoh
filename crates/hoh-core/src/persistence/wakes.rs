@@ -792,6 +792,12 @@ pub(super) fn allocate(
             )
             .map_err(sqlite_error)?;
         let (reasons, _) = unavailability(&tx, &run_id, &wakes, epoch, &state, context)?;
+        // Only on the verdict the step recorded, and only when this view agrees with it: available both, an ordinary
+        // turn; unavailable both, a probe; else nothing until the next step records the change (v17, M2T08R-251).
+        let recorded_unavailable = recorded(&tx, &run_id)?.is_some_and(|r| r.unavailable);
+        if reasons.is_empty() && recorded_unavailable {
+            continue;
+        }
         let probing = if reasons.is_empty() {
             None
         } else {

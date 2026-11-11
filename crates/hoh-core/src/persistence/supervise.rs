@@ -127,16 +127,18 @@ pub(super) fn step(
     }))
 }
 
-/// One writer job of run `run_id`'s output disposal at `context.now()` (v16 decision 2): at most
+/// One writer job of run `run_id`'s output disposal at `context.now()`, of the turns its step (cursor `upto`) saw end
+/// (v16 and v17 decision 2): at most
 /// [`super::outputs::DISPOSE_BATCH`] outputs; once none is left, the run's supervision closed if it ended. Whether
 /// outputs are left for another job.
 pub(super) fn dispose(
     conn: &mut Connection,
     run_id: &str,
+    upto: i64,
     context: &Context,
     ctx: &Ctx<'_>,
 ) -> Result<bool, PersistError> {
-    let more = super::outputs::dispose(conn, run_id, context, ctx)?;
+    let more = super::outputs::dispose(conn, run_id, upto, context, ctx)?;
     if !more {
         close(conn, run_id, context, ctx)?;
     }
@@ -572,7 +574,8 @@ fn fire(
         kind: kind.to_owned(),
         payload,
     };
-    let pending = |due_only: bool| -> Result<Vec<Pending>, PersistError> {
+    // `lenient`: a trigger whose seqs cannot be read is taken with none, for superseding (v17, M2T08R-256).
+    let pending = |due_only: bool, lenient: bool| -> Result<Vec<Pending>, PersistError> {
         let mut statement = tx
             .prepare(
                 "SELECT trigger_id, fingerprint, spec_id, severity, event_seqs_json, created_at, first_seq \
@@ -598,11 +601,15 @@ fn fire(
         rows.into_iter()
             .map(
                 |(trigger_id, fingerprint, spec_id, severity, seqs, created_at, first_seq)| {
-                    let seqs = serde_json::from_str(&seqs).map_err(|e| {
-                        PersistError::IntegrityViolation(format!(
-                            "trigger {trigger_id}: event_seqs_json: {e}"
-                        ))
-                    })?;
+                    let seqs = match serde_json::from_str(&seqs) {
+                        Ok(seqs) => seqs,
+                        Err(_) if lenient => Vec::new(),
+                        Err(e) => {
+                            return Err(PersistError::IntegrityViolation(format!(
+                                "trigger {trigger_id}: event_seqs_json: {e}"
+                            )));
+                        }
+                    };
                     Ok(Pending {
                         trigger_id,
                         fingerprint,
@@ -620,7 +627,7 @@ fn fire(
         Admission::Hold => return Ok((fired, events, None)),
         Admission::Supersede => {
             // Nothing more is owed to a run that is cancelled or ended: its PENDING triggers and its owed wakes.
-            for t in pending(false)? {
+            for t in pending(false, true)? {
                 tx.execute(
                     "UPDATE supervisor_triggers SET state = 'SUPERSEDED' WHERE trigger_id = ?1 AND state = 'PENDING'",
                     params![t.trigger_id],
@@ -648,7 +655,7 @@ fn fire(
         }
         Admission::Fire => {}
     }
-    let due = pending(true)?;
+    let due = pending(true, false)?;
     if run_spec.is_none() {
         // No supervision task without a spec (decision 4): each due trigger waits, deferred once; the Commander is not
         // judged (decision 4 before 5, v13, M2T08R-04).

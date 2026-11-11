@@ -1155,3 +1155,36 @@ async fn a_runs_failing_step_is_recorded_once_per_error_however_they_alternate()
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn a_cancelled_runs_unreadable_trigger_is_still_superseded() -> R {
+    // M2T08R-256 (decision 3): superseding what a cancelled or ended run owes does not read its triggers' events: a
+    // PENDING trigger whose seqs cannot be read is superseded, and the run is no longer stepped.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(
+        &path,
+        &format!(
+            "{WORLD}
+             INSERT INTO supervisor_triggers(trigger_id, run_id, fingerprint, spec_id, severity, event_seqs_json, first_seq,
+               last_seq, due_at, state, created_at) VALUES
+               ('R/trigger/1', 'R', 'fp', 's3', 'high', '[\"unreadable\"]', 1, 1, '2000-01-01T00:00:00.000Z', 'PENDING',
+                '2000-01-01T00:00:00.000Z');
+             UPDATE runs SET state = 'CANCELLED' WHERE run_id = 'R';"
+        ),
+    )?;
+    store.supervise("R", at(&clock, 1000)).await?;
+    assert_eq!(
+        rows(&path, "SELECT state FROM supervisor_triggers")?,
+        [[json!("SUPERSEDED")]]
+    );
+    assert!(
+        !store
+            .runner_waiting("p1")
+            .await?
+            .supervised
+            .contains(&"R".to_owned())
+    );
+    Ok(())
+}

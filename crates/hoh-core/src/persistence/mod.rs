@@ -875,6 +875,7 @@ impl Store {
                     while self
                         .runner_step(runner::RunnerJob::Dispose {
                             run_id: run_id.to_owned(),
+                            upto: done.cursor,
                             context: Box::new(context.clone()),
                         })
                         .await?
