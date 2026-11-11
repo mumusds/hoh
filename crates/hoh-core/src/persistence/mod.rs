@@ -596,6 +596,38 @@ fn leading_keyword(sql: &str) -> String {
         .to_ascii_uppercase()
 }
 
+/// A read-only connection to `path`.
+fn open_reader(path: &Path, options: &Options) -> Result<Reader, PersistError> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    let conn = Connection::open_with_flags(path, flags).map_err(sqlite_error)?;
+    configure(&conn, options, false)?;
+    Ok(Reader { conn })
+}
+
+/// What a check's finishing task holds so that it judges and records its run even when its caller has gone
+/// (docs/adr/ADR-027.md decision 6, M2T10R-03): readers and the writer's evidence request, nothing more. It keeps the
+/// writer running until it is dropped.
+#[derive(Debug, Clone)]
+pub struct EvidenceHandle {
+    path: PathBuf,
+    options: Options,
+    writer: writer::Writer,
+}
+
+impl EvidenceHandle {
+    /// A read-only connection, as [`Store::reader`].
+    pub fn reader(&self) -> Result<Reader, PersistError> {
+        open_reader(&self.path, &self.options)
+    }
+
+    /// As [`Store::record_evidence`].
+    pub async fn record_evidence(&self, recording: Recording) -> Result<(), PersistError> {
+        self.writer.record_evidence(recording).await
+    }
+}
+
 /// An open project database: the writer actor and the means to open readers.
 #[derive(Debug)]
 pub struct Store {
@@ -1512,12 +1544,16 @@ impl Store {
 
     /// A new read-only connection with verified settings.
     pub fn reader(&self) -> Result<Reader, PersistError> {
-        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX
-            | OpenFlags::SQLITE_OPEN_NOFOLLOW;
-        let conn = Connection::open_with_flags(&self.path, flags).map_err(sqlite_error)?;
-        configure(&conn, &self.options, false)?;
-        Ok(Reader { conn })
+        open_reader(&self.path, &self.options)
+    }
+
+    /// A handle that outlives this borrow, for a check's finishing task (docs/adr/ADR-027.md decision 6).
+    pub fn evidence_handle(&self) -> EvidenceHandle {
+        EvidenceHandle {
+            path: self.path.clone(),
+            options: self.options.clone(),
+            writer: self.writer.clone(),
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -1564,6 +1600,11 @@ impl Reader {
     /// The candidate `candidate_id`'s row (docs/adr/ADR-027.md decision 6: what a check is checked against).
     pub fn candidate(&self, candidate_id: &str) -> Result<Option<CandidateRow>, PersistError> {
         candidates::candidate(&self.conn, candidate_id)
+    }
+
+    /// The outcome of the evidence `evidence_id` (a record id), if it is recorded (docs/adr/ADR-027.md decision 8).
+    pub fn evidence_outcome(&self, evidence_id: &str) -> Result<Option<String>, PersistError> {
+        candidates::evidence_outcome(&self.conn, evidence_id)
     }
 
     /// The run `run_id`'s specification and acceptance criteria (docs/adr/ADR-027.md decision 9).

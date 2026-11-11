@@ -8,10 +8,12 @@
 use hoh_app::verify::check::{CheckError, Ran, Request, pre_check, run};
 use hoh_app::verify::freeze::{FreezeError, Inputs, freeze};
 use hoh_core::persistence::selftest::{PROBE_ARG, ProbeCommand};
-use hoh_core::persistence::{Frozen, Options, Store};
+use hoh_core::persistence::{FaultHooks, Frozen, NoFaults, Options, PersistError, Store};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 type R<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -54,7 +56,9 @@ const PLAN: &str = r#"{"schema_version": "1.0", "plan_id": "fixture", "checks": 
   "qa": {"mode": "product", "argv": ["bash", "qa.sh"], "artifacts": ["test-results.jsonl"], "timeout_seconds": 60},
   "slow": {"mode": "product", "argv": ["bash", "-c", "sleep 30"], "artifacts": ["test-results.jsonl"],
            "timeout_seconds": 1},
-  "pack": {"mode": "bundle", "argv": ["true"]}}}
+  "pack": {"mode": "bundle", "argv": ["true"]},
+  "sleepy": {"mode": "product", "argv": ["bash", "-c", "sleep 30"], "timeout_seconds": 60},
+  "blocked": {"mode": "product", "argv": ["bash", "-c", "exit 3"], "artifacts": ["test-results.jsonl"]}}}
 "#;
 
 /// The fixture's specification: REQ-001 with AC-001-01, whose TEST is TEST-001-01.
@@ -80,6 +84,11 @@ impl Fixture {
 
     /// The fixture with `qa` as its committed qa.sh.
     async fn with_qa(qa: &str) -> R<Fixture> {
+        Fixture::with(PLAN, qa, Arc::new(NoFaults)).await
+    }
+
+    /// The fixture with `plan` as its check plan, `qa` as its qa.sh and `faults` in its store.
+    async fn with(plan: &str, qa: &str, faults: Arc<dyn FaultHooks>) -> R<Fixture> {
         let dir = tempfile::tempdir()?;
         let root = &dir.path().join("repo");
         std::fs::create_dir_all(root)?;
@@ -90,7 +99,7 @@ impl Fixture {
             ("src/c.rs", "pub fn c() {}\n"),
             ("contracts/requirements.json", SPEC),
             ("environment.json", "{\"os\": \"linux\"}\n"),
-            ("tests/check-plan.json", PLAN),
+            ("tests/check-plan.json", plan),
             ("qa.sh", qa),
         ] {
             let file = root.join(path);
@@ -103,6 +112,7 @@ impl Fixture {
         hoh_core::state_dir::ensure(&state)?;
         let options = Options {
             wal_probe: Some(probe()),
+            faults,
             ..Options::default()
         };
         let store = Store::open(&state.join("state.db"), options)?;
@@ -927,6 +937,7 @@ async fn the_replica_concludes_on_the_products_records_as_the_product_does() -> 
     go("qa", QA).await?;
     std::fs::remove_file(f.dir.path().join("fail"))?;
     go("qa", QA).await?;
+    go("blocked", &["bash", "-c", "exit 3"]).await?;
     // A check claiming success that observed nothing vetoes its candidate (rule 12): last.
     go("unit", &["bash", "-c", "touch ../sentinel"]).await?;
     let outcomes: Vec<_> = runs
@@ -940,9 +951,23 @@ async fn the_replica_concludes_on_the_products_records_as_the_product_does() -> 
             ("FAIL", Some("TIMED_OUT")),
             ("FAIL", None),
             ("PASS", None),
+            ("BLOCKED", None),
             ("INVALID", Some("INSUFFICIENT"))
         ]
     );
+    // A run its caller dropped: interrupted (M2T10R-55).
+    let dropped = tokio::time::timeout(
+        Duration::from_secs(3),
+        f.run(&c, "sleepy", &["bash", "-c", "sleep 30"]),
+    )
+    .await;
+    assert!(dropped.is_err());
+    for _ in 0..200 {
+        if f.query("SELECT count(*) FROM evidence")? == [(runs.len() + 1).to_string()] {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     let manifest = f.record(&runs[0])?["candidate_manifest"]["path"]
         .as_str()
         .ok_or("no manifest path")?
@@ -964,24 +989,40 @@ async fn the_replica_concludes_on_the_products_records_as_the_product_does() -> 
     );
     let judged: Value = serde_json::from_slice(&out.stdout)?;
     let rows = f.query("SELECT evidence_id || ' ' || status FROM acceptance_results")?;
+    // The product's verdict on each record, as its evidence event carries it.
+    let recorded: Vec<Value> = f
+        .query("SELECT payload_json FROM events WHERE kind = 'evidence.recorded'")?
+        .iter()
+        .map(|p| serde_json::from_str(p))
+        .collect::<Result<_, _>>()?;
+    assert_eq!(recorded.len(), runs.len() + 1);
     assert_eq!(
         judged["members"].as_object().map(|m| m.len()),
-        Some(runs.len())
+        Some(recorded.len())
     );
-    for ran in &runs {
-        let replica = &judged["members"][&ran.record_id];
-        let row = rows
-            .iter()
-            .find_map(|r| r.strip_prefix(&format!("{} ", ran.record_id)));
-        let mut reasons = ran.reasons.clone();
+    let mut seen = Vec::new();
+    for product in &recorded {
+        let id = product["record_id"].as_str().ok_or("no record id")?;
+        let row = rows.iter().find_map(|r| r.strip_prefix(&format!("{id} ")));
+        let mut reasons: Vec<&str> = product["reasons"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
         reasons.sort_unstable();
         assert_eq!(
-            replica,
-            &serde_json::json!([ran.outcome.status.code(), ran.outcome.reason, row, reasons]),
-            "{}",
-            ran.record_id
+            judged["members"][id],
+            serde_json::json!([product["outcome"], product["outcome_reason"], row, reasons]),
+            "{id}"
         );
+        seen.push((
+            product["outcome"].clone(),
+            product["outcome_reason"].clone(),
+        ));
     }
+    assert!(seen.contains(&(serde_json::json!("FAIL"), serde_json::json!("INTERRUPTED"))));
+    assert!(seen.contains(&(serde_json::json!("BLOCKED"), Value::Null)));
     assert_eq!(judged["status"], "FLAKY");
     assert_eq!(judged["invalid"], serde_json::json!([["NO_OBSERVATIONS"]]));
     assert_eq!(f.query("SELECT state FROM candidates")?, ["INVALID"]);
@@ -998,5 +1039,188 @@ async fn a_results_file_that_is_not_utf8_is_a_result_line_invalid() -> R {
     let ran = f.run(&c, "qa", QA).await.map_err(|e| format!("{e:?}"))?;
     assert_eq!(ran.outcome.status.code(), "INVALID");
     assert_eq!(ran.reasons, ["RESULT_LINE_INVALID"]);
+    Ok(())
+}
+
+/// A plan whose checks are not of the locked contracts/check-plan.schema.json's shape.
+const PLAN_OFF_SCHEMA: &str = r#"{"schema_version": "1.0", "plan_id": "fixture", "checks": {
+  "rooted": {"mode": "product", "argv": ["bash", "qa.sh"], "cwd": "/tmp", "artifacts": ["test-results.jsonl"]},
+  "above": {"mode": "product", "argv": ["bash", "qa.sh"], "cwd": "..", "artifacts": ["test-results.jsonl"]},
+  "named": {"mode": "product", "argv": ["bash", "qa.sh"], "artifacts": ["../test-results.jsonl"]},
+  "extra": {"mode": "product", "argv": ["bash", "qa.sh"], "artifacts": ["test-results.jsonl"], "retries": 2}}}
+"#;
+
+#[tokio::test]
+async fn a_check_planned_off_the_plan_schema_never_runs() -> R {
+    // docs/adr/ADR-027.md principle one rule 1 (M2T10R-01): a cwd that is absolute or leaves the checkout, an artifact
+    // name that is a path, a key the schema does not know: refused before anything runs, each named.
+    let f = Fixture::with(PLAN_OFF_SCHEMA, QA_PASSES, Arc::new(NoFaults)).await?;
+    let c = f.frozen().await?;
+    for (check, needle) in [
+        ("rooted", "cwd"),
+        ("above", "cwd"),
+        ("named", "artifact"),
+        ("extra", "retries"),
+    ] {
+        let reasons = check_refused(f.pre_check(&c, check, QA, "Q/attempt-1")?)?;
+        assert!(
+            reasons.iter().any(|r| r.contains(needle)),
+            "{check}: {reasons:?}"
+        );
+        let refused = f.run(&c, check, QA).await;
+        assert!(
+            matches!(refused, Err(CheckError::Refused(_))),
+            "{check}: {refused:?}"
+        );
+    }
+    assert!(!f.state().join("evidence").join(&c).exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_post_check_that_cannot_read_git_is_recorded_invalid() -> R {
+    // M2T10R-02: a check that takes the repository's .git away leaves a post-check that cannot prove the source
+    // unchanged: the record is written (source_unchanged false), the evidence INVALID, the candidate vetoed and the
+    // integrity event raised, as for any other change.
+    let f = Fixture::with_qa(&format!("mv .git ../git.saved\n{QA_PASSES}")).await?;
+    let c = f.frozen().await?;
+    let ran = f.run(&c, "qa", QA).await.map_err(|e| format!("{e:?}"))?;
+    let record = f.record(&ran)?;
+    assert_eq!(record["source_unchanged"], false);
+    assert_eq!(ran.outcome.status.code(), "INVALID");
+    assert!(ran.reasons.contains(&"SOURCE_CHANGED"), "{:?}", ran.reasons);
+    std::fs::rename(f.dir.path().join("git.saved"), f.root().join(".git"))?;
+    assert_eq!(f.query("SELECT outcome FROM evidence")?, ["INVALID"]);
+    assert_eq!(f.query("SELECT state FROM candidates")?, ["INVALID"]);
+    assert_eq!(
+        f.query("SELECT count(*) FROM events WHERE kind = 'integrity_violation'")?,
+        ["1"]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_tracked_file_turned_into_a_fifo_is_a_change_not_a_hang() -> R {
+    // M2T10R-04: the post-check never blocks on a tracked path that is no longer a regular file; it names it.
+    let f = Fixture::with_qa(&format!("rm src/lib.rs && mkfifo src/lib.rs\n{QA_PASSES}")).await?;
+    let c = f.frozen().await?;
+    let ran = tokio::time::timeout(Duration::from_secs(30), f.run(&c, "qa", QA))
+        .await
+        .map_err(|_| "the post-check blocked on a FIFO")?
+        .map_err(|e| format!("{e:?}"))?;
+    assert_eq!(ran.outcome.status.code(), "INVALID");
+    let integrity =
+        f.query("SELECT payload_json FROM events WHERE kind = 'integrity_violation'")?;
+    assert!(
+        integrity.iter().any(|p| p.contains("src/lib.rs")),
+        "{integrity:?}"
+    );
+    std::fs::remove_file(f.root().join("src/lib.rs"))?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_dropped_run_still_stops_its_command_and_records_it_interrupted() -> R {
+    // M2T10R-03 (docs/adr/ADR-027.md decision 6): dropping the run's future is its cancellation: the command is
+    // stopped, and the record (exit 130, never a success claim) and the evidence are still written.
+    let f = Fixture::new().await?;
+    let c = f.frozen().await?;
+    let started = tokio::time::timeout(
+        Duration::from_secs(3),
+        f.run(&c, "sleepy", &["bash", "-c", "sleep 30"]),
+    )
+    .await;
+    assert!(
+        started.is_err(),
+        "the run should still be going: {started:?}"
+    );
+    let mut outcomes = Vec::new();
+    for _ in 0..200 {
+        outcomes = f.query("SELECT outcome FROM evidence")?;
+        if !outcomes.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(outcomes, ["FAIL"]);
+    let dirs: Vec<_> = std::fs::read_dir(f.state().join("evidence").join(&c).join("sleepy"))?
+        .collect::<Result<_, _>>()?;
+    assert_eq!(dirs.len(), 1);
+    let record: Value =
+        serde_json::from_slice(&std::fs::read(dirs[0].path().join("execution.json"))?)?;
+    assert_eq!(
+        (record["exit_code"].as_i64(), record["timed_out"].as_bool()),
+        (Some(130), Some(false))
+    );
+    assert!(
+        record["duration_seconds"].as_f64().unwrap_or(99.0) < 20.0,
+        "{record}"
+    );
+    Ok(())
+}
+
+/// Fails the next commit once armed.
+#[derive(Debug, Default)]
+struct FailOnce(AtomicBool);
+
+impl FaultHooks for FailOnce {
+    fn before_commit(&self) -> Result<(), PersistError> {
+        if self.0.swap(false, Ordering::SeqCst) {
+            return Err(PersistError::Storage("injected commit failure".to_owned()));
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_record_whose_evidence_failed_to_commit_is_recorded_before_the_next_run() -> R {
+    // M2T10R-05: a record written to disk whose evidence did not commit is kept as pending and recorded first when the
+    // next check runs, so a failure is never replaced by a later pass; the history holds both.
+    let faults = Arc::new(FailOnce::default());
+    let failing = QA_PASSES.replace("\"PASS\"", "\"FAIL\"");
+    let f = Fixture::with(
+        PLAN,
+        &format!("if [ -e ../fail ]; then\n{failing}exit 1\nfi\n{QA_PASSES}"),
+        faults.clone(),
+    )
+    .await?;
+    let c = f.frozen().await?;
+    std::fs::write(f.dir.path().join("fail"), b"")?;
+    faults.0.store(true, Ordering::SeqCst);
+    let first = f.run(&c, "qa", QA).await;
+    assert!(matches!(first, Err(CheckError::Store(_))), "{first:?}");
+    assert!(f.query("SELECT outcome FROM evidence")?.is_empty());
+    std::fs::remove_file(f.dir.path().join("fail"))?;
+    let second = f.run(&c, "qa", QA).await.map_err(|e| format!("{e:?}"))?;
+    assert_eq!(second.outcome.status.code(), "PASS");
+    let mut outcomes = f.query("SELECT outcome FROM evidence")?;
+    outcomes.sort();
+    assert_eq!(outcomes, ["FAIL", "PASS"]);
+    let mut rows = f.query("SELECT status FROM acceptance_results")?;
+    rows.sort();
+    assert_eq!(rows, ["FAIL", "PASS"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn hohs_state_left_unignored_after_the_freeze_is_refused_before_the_run() -> R {
+    // M2T10R-06 (docs/adr/ADR-027.md decision 3): the pre-check repeats the freeze's guard on HoH's own state, naming
+    // each path git would see, before any record directory is made.
+    let f = Fixture::new().await?;
+    let c = f.frozen().await?;
+    std::fs::write(
+        f.state().join(".gitignore"),
+        "*\n!evidence/\n!evidence/**\n",
+    )?;
+    let reasons = check_refused(f.pre_check(&c, "qa", QA, "Q/attempt-1")?)?;
+    assert!(
+        reasons.iter().any(|r| r.contains("evidence")),
+        "{reasons:?}"
+    );
+    assert!(matches!(
+        f.run(&c, "qa", QA).await,
+        Err(CheckError::Refused(_))
+    ));
+    assert!(!f.state().join("evidence").join(&c).exists());
     Ok(())
 }

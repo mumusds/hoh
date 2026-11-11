@@ -48,9 +48,10 @@ BLOCKS = {
 ARTIFACTS = ('independent-report.json', 'native-attempt.json', 'raw-session.jsonl')
 
 
-def judgement(candidate: dict, profile: str) -> dict:
-    """Principle one's judgement of every member of the candidate: its vetoes, outcome and each TEST's status."""
-    world = traceability.World(ROOT, candidate, profile)
+def judgement(candidate: dict, profile: str, check: str) -> dict:
+    """Principle one's judgement of every member of the candidate: its vetoes, outcome and each TEST's status, as this
+    check sees them: every earlier run of the traceability check counts as it is (M2T10R-51)."""
+    world = traceability.World(ROOT, candidate, profile, check_id=check)
     found = traceability.members(world)
     report = traceability.report(world, found, [])
     report['members'] = [{'path': m.rel, 'check_id': m.check, 'damaged': m.damaged, 'reasons': m.reasons,
@@ -80,7 +81,8 @@ def context(role: str, profile: str, candidate: dict, judged: dict, judgement_pa
                              f'{json.dumps(judged["invalid"][:50])}. Records are claims to check, not proof.'),
         'TASK_CONTEXT': (f'Role {role}, check {CHECK[role]}. Do not modify, add or delete any tracked file, and create '
                          f'no file in the checkout except under {observations} (ignored by git), where your notes, '
-                         'logs and experiment outputs go; an experiment that needs a writable tree runs in a copy under '
+                         'logs and experiment outputs go; a planned check you run goes through tools/run_check.py with '
+                         f'its --out under {observations}; an experiment that needs a writable tree runs in a copy under '
                          '/tmp that you delete. Never touch the user\'s .hoh/ or agent credentials; start no agent '
                          'session. A fixture or mock result is never live. End with the ```hoh-report block of the '
                          'output contract: status PASS only when the scope was fully examined and no critical or high '
@@ -149,7 +151,9 @@ def attempt(role: str, agent: str, model: str | None, prompt: Path, report: Path
     pattern = None if reported else blocked(agent, directory)
     return {'agent': agent, 'model': model, 'exit_code': done.returncode,
             'attempt_dir': str(directory) if directory else None, 'report': str(report) if reported else None,
-            'external': not reported and (done.returncode in NOT_STARTED or pattern is not None),
+            # agent_task passes a started CLI's own exit code through: only with no attempt record did it end before
+            # the CLI started (M2T10R-53).
+            'external': not reported and ((directory is None and done.returncode in NOT_STARTED) or pattern is not None),
             'pattern': pattern}
 
 
@@ -186,12 +190,15 @@ def main(argv=None) -> int:
     try:
         candidate = load_json(Path(candidate_file))
         plan = load_json(safe_path(ROOT, candidate['test_plan']['path']))['checks'][check]
-        judged = judgement(candidate, a.profile)
+        judged = judgement(candidate, a.profile, check)
     except (ValueError, KeyError, TypeError, OSError) as exc:
         print(f'independent: {exc}', file=sys.stderr)
         return 1
     budget = float(plan.get('timeout_seconds', 3600)) - GRACE
-    observations = out_dir / 'observations'
+    # Beside the record's directory, never in it: a check a session runs there through run_check is a record of its own,
+    # whose directory must not lie in this one's (rule 7, M2T10R-52).
+    record_dir = out_dir.parent
+    observations = record_dir.parent / f'{record_dir.name}-observations'
     observations.mkdir(exist_ok=True)
     judgement_path = out_dir / 'judgement.json'
     atomic_json(judgement_path, judged)

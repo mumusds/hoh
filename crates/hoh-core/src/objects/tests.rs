@@ -260,3 +260,37 @@ fn an_object_that_cannot_be_read_is_repaired_like_a_damaged_one() -> R {
     assert_eq!(get(dir.path(), &sha)?, b"original");
     Ok(())
 }
+
+#[test]
+fn only_a_regular_file_is_hashed_and_nothing_else_blocks() -> R {
+    // M2T10R-04: a FIFO or a device in a hashed path is refused at once, never read (a FIFO would block its reader
+    // until someone writes, a device may never end).
+    let dir = tempfile::tempdir()?;
+    let fifo = dir.path().join("fifo");
+    let made = std::process::Command::new("mkfifo").arg(&fifo).status()?;
+    assert!(made.success());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path = fifo.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(hash_file(&path));
+    });
+    let refused = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .map_err(|_| "hashing a FIFO blocked")?;
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|e| e.contains("not a regular file")),
+        "{refused:?}"
+    );
+    let device = hash_file(std::path::Path::new("/dev/zero"));
+    assert!(
+        device
+            .as_ref()
+            .is_err_and(|e| e.contains("not a regular file")),
+        "{device:?}"
+    );
+    let _ = std::fs::write(dir.path().join("plain"), b"x");
+    assert!(hash_file(&dir.path().join("plain")).is_ok());
+    Ok(())
+}

@@ -3,10 +3,12 @@
 //! candidate, each difference named.
 
 use crate::host::control::git;
-use hoh_core::persistence::{AcceptanceRow, ArtifactRow, PersistError, Reader, Recording};
+use hoh_core::persistence::{
+    AcceptanceRow, ArtifactRow, EvidenceHandle, PersistError, Reader, Recording,
+};
 use hoh_core::verification::{
-    AcSpec, Evidence, FileRef, Manifest, NamedRef, Planned, Record, Runner, Sealed, outcome, rows,
-    valid,
+    AcSpec, Evidence, FileRef, Manifest, NamedRef, OUTCOME_REASONS, Outcome, Planned, Reason,
+    Record, Runner, Sealed, Status, outcome, plan_shape, rows, valid,
 };
 use serde_json::Value;
 use std::path::Path;
@@ -173,10 +175,21 @@ pub fn pre_check(
         }
     }
     reasons.extend(differences(checkout, m)?);
+    // HoH's own state still ignored and untracked, as the freeze required (decision 3, M2T10R-06).
+    let record = format!("evidence/{id}/{}/RECORD", request.check_id);
+    let writes = [
+        format!("{record}/execution.json"),
+        format!("{record}/{PENDING}"),
+        format!("{record}/stdout.log"),
+        format!("{record}/artifacts/test-results.jsonl"),
+    ];
+    reasons.extend(crate::verify::freeze::state_guard(checkout, state, &writes).map_err(io)?);
     // The check as the frozen plan has it (failure mode 6), read from the plan object.
     let plan: Value = object(&m.test_plan.sha256)
         .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|e| e.to_string()))
         .map_err(|e| refused(format!("the frozen test plan of {id} cannot be read: {e}")))?;
+    // The plan of the locked check-plan schema's shape (principle one rule 1, M2T10R-01).
+    reasons.extend(plan_shape(&plan));
     let check = &request.check_id;
     let planned = match plan["checks"].get(check.as_str()) {
         None => {
@@ -204,6 +217,16 @@ pub fn pre_check(
                 reasons.push(format!(
                     "argv differs from the frozen plan: {:?} is not {:?}",
                     request.argv, planned.argv
+                ));
+            }
+            let inside = std::fs::canonicalize(checkout.join(&planned.cwd))
+                .ok()
+                .zip(std::fs::canonicalize(checkout).ok())
+                .is_some_and(|(cwd, root)| cwd.starts_with(&root) && cwd.is_dir());
+            if !inside {
+                reasons.push(format!(
+                    "cwd {} is not a directory inside the checkout",
+                    planned.cwd
                 ));
             }
             if !["mock", "live", "product"].contains(&planned.mode.as_str()) {
@@ -461,16 +484,19 @@ pub async fn run(
     state: &Path,
     request: &Request,
 ) -> Result<Ran, CheckError> {
-    use hoh_agents::process::{Config, Event, Process};
     let blocking = |e: tokio::task::JoinError| CheckError::Io(format!("the check stopped: {e}"));
     let io = CheckError::Io;
+    let handle = store.evidence_handle();
+    // First the records a crash or a failed commit left without their evidence: a later run never takes their place
+    // in the history (M2T10R-05).
+    reconcile(&handle, state).await?;
     let project = state
         .parent()
         .ok_or_else(|| io(format!("{} has no parent", state.display())))?
         .to_owned();
     // Before: the pre-check, the workspace observed, the record's own new directory.
     let (ready, tree_before, record_id, record_dir, timeout, export) = {
-        let reader = store.reader().map_err(CheckError::Store)?;
+        let reader = handle.reader().map_err(CheckError::Store)?;
         let (checkout, state, request, project) = (
             checkout.to_owned(),
             state.to_owned(),
@@ -515,6 +541,70 @@ pub async fn run(
         .await
         .map_err(blocking)??
     };
+    // The run, its post-check and its record are a task of their own: dropping this future cancels the command, never
+    // its record (docs/adr/ADR-027.md decision 6, M2T10R-03).
+    let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
+    let finishing = tokio::spawn(finish(
+        handle,
+        Finish {
+            checkout: checkout.to_owned(),
+            state: state.to_owned(),
+            project,
+            request: request.clone(),
+            ready,
+            tree_before,
+            record_id,
+            record_dir,
+            timeout,
+            export,
+        },
+        cancelled,
+    ));
+    let ran = finishing.await.map_err(blocking)?;
+    drop(cancel);
+    ran
+}
+
+/// What the pre-phase hands the finishing task.
+struct Finish {
+    checkout: std::path::PathBuf,
+    state: std::path::PathBuf,
+    project: std::path::PathBuf,
+    request: Request,
+    ready: Ready,
+    tree_before: Value,
+    record_id: String,
+    record_dir: std::path::PathBuf,
+    timeout: f64,
+    export: std::path::PathBuf,
+}
+
+/// The command on the process substrate, then the post-check, the record, the objects, the judgement and the evidence.
+/// Once the command has started this always ends in a record: `cancelled` resolving (its sender dropped) cancels the
+/// command and the run is recorded as interrupted; a post-check that fails is recorded as a change it cannot rule out;
+/// the evidence is kept as pending beside the record before it is committed, so a failed commit is recorded by the
+/// next run's [`reconcile`] (M2T10R-02, -03, -05).
+async fn finish(
+    handle: EvidenceHandle,
+    f: Finish,
+    mut cancelled: tokio::sync::oneshot::Receiver<()>,
+) -> Result<Ran, CheckError> {
+    use hoh_agents::process::{Config, Escalation, Event, Process};
+    let blocking = |e: tokio::task::JoinError| CheckError::Io(format!("the check stopped: {e}"));
+    let io = CheckError::Io;
+    let Finish {
+        checkout,
+        state,
+        project,
+        request,
+        ready,
+        tree_before,
+        record_id,
+        record_dir,
+        timeout,
+        export,
+    } = f;
+    let request = &request;
     // The command, on the process substrate (argv only, its own process group, the plan's timeout).
     let artifacts_dir = record_dir.join("artifacts");
     let (stdout, stderr) = (record_dir.join("stdout.log"), record_dir.join("stderr.log"));
@@ -541,9 +631,18 @@ pub async fn run(
     let (exit_code, timed_out) = match Process::spawn(command, config) {
         Ok(mut process) => {
             let mut report = None;
-            while let Some(event) = process.next().await {
-                if let Event::Exit(r) = event {
-                    report = Some(r);
+            let mut cancelling = false;
+            loop {
+                tokio::select! {
+                    event = process.next() => match event {
+                        Some(Event::Exit(r)) => report = Some(r),
+                        Some(_) => {}
+                        None => break,
+                    },
+                    _ = &mut cancelled, if !cancelling => {
+                        cancelling = true;
+                        process.cancel(Escalation::default());
+                    }
                 }
             }
             let report = report
@@ -575,7 +674,13 @@ pub async fn run(
             (record_dir.clone(), record_id.clone(), export.clone());
         tokio::task::spawn_blocking(move || -> Result<Done, CheckError> {
             let io = |e: String| CheckError::Io(e);
-            let integrity = differences(&checkout, &ready.sealed.manifest)?;
+            // A post-check that cannot run cannot show the source unchanged: that is recorded, never lost (M2T10R-02).
+            let integrity = differences(&checkout, &ready.sealed.manifest).unwrap_or_else(|e| {
+                vec![format!(
+                    "post-check failed, so the source cannot be shown unchanged: {}",
+                    described(&e)
+                )]
+            });
             let tree_after = crate::host::control::workspace(&checkout);
             let rel = |p: &Path| relative_to(&project, p);
             let file = |p: &Path| -> Result<FileRef, CheckError> {
@@ -636,16 +741,7 @@ pub async fn run(
                         .map(|b| b.trim().to_owned()),
                 },
             };
-            let execution = record_dir.join("execution.json");
             let bytes = serde_json::to_vec_pretty(&record).map_err(|e| io(e.to_string()))?;
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&execution)
-                .and_then(|mut f| {
-                    std::io::Write::write_all(&mut f, &bytes).and_then(|()| f.sync_all())
-                })
-                .map_err(|e| io(format!("{}: {e}", execution.display())))?;
             // Observations (decision 8): the result lines; without any, the declared artifacts found with the
             // record's own conclusion.
             let mut observations = Vec::new();
@@ -686,7 +782,15 @@ pub async fn run(
             for a in &record.artifacts {
                 objects.push(keep(&project.join(&a.path), "artifact", &a.name)?);
             }
-            let record_object = keep(&execution, "execution", "execution.json")?;
+            let record_sha = hoh_core::objects::put(&project, &bytes).map_err(io)?;
+            let record_object = ArtifactRow {
+                path: hoh_core::objects::relative_path(&record_sha),
+                sha256: record_sha,
+                bytes: bytes.len() as u64,
+                mime: "application/octet-stream".to_owned(),
+                kind: "execution".to_owned(),
+                name: "execution.json".to_owned(),
+            };
             let git_tree = tree_after["head_tree"]
                 .as_str()
                 .unwrap_or_default()
@@ -714,7 +818,7 @@ pub async fn run(
     };
     // The judgement (principle one) and its rows (decision 9).
     let (recording, ran) = {
-        let reader = store.reader().map_err(CheckError::Store)?;
+        let reader = handle.reader().map_err(CheckError::Store)?;
         let (project, state, ready, checkout) = (
             project.clone(),
             state.to_owned(),
@@ -835,11 +939,232 @@ pub async fn run(
         .await
         .map_err(blocking)??
     };
-    store
+    // Pending first, then the record file, then the commit: from the pending evidence on, the next run can finish
+    // what a crash or a failed commit leaves (M2T10R-05); the record appears whole or not at all (M2T10R-56).
+    {
+        let (record_dir, pending) = (ran.record_dir.clone(), Pending::of(&recording));
+        tokio::task::spawn_blocking(move || -> Result<(), CheckError> {
+            let text =
+                serde_json::to_vec_pretty(&pending).map_err(|e| CheckError::Io(e.to_string()))?;
+            write_new(&record_dir.join(PENDING), &text)?;
+            let bytes = serde_json::to_vec_pretty(&pending.record)
+                .map_err(|e| CheckError::Io(e.to_string()))?;
+            write_new(&record_dir.join("execution.json"), &bytes)
+        })
+        .await
+        .map_err(blocking)??;
+    }
+    handle
         .record_evidence(recording)
         .await
         .map_err(CheckError::Store)?;
     Ok(ran)
+}
+
+/// A record directory's pending evidence (M2T10R-05): what is committed, kept beside the record until it is.
+const PENDING: &str = "recording.json";
+
+/// What a [`CheckError`] says.
+fn described(e: &CheckError) -> String {
+    match e {
+        CheckError::Refused(reasons) => reasons.join("; "),
+        CheckError::Store(e) => e.to_string(),
+        CheckError::Io(why) => why.clone(),
+    }
+}
+
+/// `bytes` as the new file `path`, whole or not at all: written to a staged name and synced, then linked (never over an
+/// existing file, the evidence is append-only), the directory synced (M2T10R-56).
+fn write_new(path: &Path, bytes: &[u8]) -> Result<(), CheckError> {
+    use std::io::Write as _;
+    let at = |e: std::io::Error| CheckError::Io(format!("{}: {e}", path.display()));
+    let dir = path
+        .parent()
+        .ok_or_else(|| CheckError::Io(format!("{} has no parent", path.display())))?;
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let staged = dir.join(format!(".{name}.staged"));
+    // A crash's leftover is not the file: it is only ever the staged copy.
+    let _ = std::fs::remove_file(&staged);
+    let written = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::hard_link(&staged, path)?;
+        std::fs::File::open(dir)?.sync_all()
+    })();
+    let _ = std::fs::remove_file(&staged);
+    written.map_err(at)
+}
+
+/// A [`Recording`] as text (its codes as their strings), to be read back by [`reconcile`].
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Pending {
+    record: Record,
+    record_object: ArtifactRow,
+    objects: Vec<ArtifactRow>,
+    outcome: String,
+    outcome_reason: Option<String>,
+    reasons: Vec<String>,
+    tree_before: Value,
+    tree_after: Value,
+    clock: Value,
+    observations: Vec<Value>,
+    rows: Vec<PendingRow>,
+    integrity: Vec<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PendingRow {
+    ac_id: String,
+    spec_id: String,
+    status: String,
+    reason: String,
+}
+
+impl Pending {
+    fn of(r: &Recording) -> Pending {
+        Pending {
+            record: r.record.clone(),
+            record_object: r.record_object.clone(),
+            objects: r.objects.clone(),
+            outcome: r.outcome.status.code().to_owned(),
+            outcome_reason: r.outcome.reason.map(str::to_owned),
+            reasons: r.reasons.iter().map(|c| (*c).to_owned()).collect(),
+            tree_before: r.tree_before.clone(),
+            tree_after: r.tree_after.clone(),
+            clock: r.clock.clone(),
+            observations: r.observations.clone(),
+            rows: r
+                .rows
+                .iter()
+                .map(|row| PendingRow {
+                    ac_id: row.ac_id.clone(),
+                    spec_id: row.spec_id.clone(),
+                    status: row.status.to_owned(),
+                    reason: row.reason.clone(),
+                })
+                .collect(),
+            integrity: r.integrity.clone(),
+        }
+    }
+
+    fn into_recording(self) -> Result<Recording, String> {
+        let status = |c: &str| Status::from_code(c).ok_or_else(|| format!("unknown status {c}"));
+        let reason = match self.outcome_reason {
+            None => None,
+            Some(r) => Some(
+                OUTCOME_REASONS
+                    .into_iter()
+                    .find(|x| *x == r)
+                    .ok_or_else(|| format!("unknown outcome reason {r}"))?,
+            ),
+        };
+        let outcome = Outcome {
+            status: status(&self.outcome)?,
+            reason,
+        };
+        let reasons = self
+            .reasons
+            .iter()
+            .map(|c| {
+                Reason::from_code(c)
+                    .map(Reason::code)
+                    .ok_or_else(|| format!("unknown reason {c}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let rows = self
+            .rows
+            .into_iter()
+            .map(|r| {
+                Ok(AcceptanceRow {
+                    ac_id: r.ac_id,
+                    spec_id: r.spec_id,
+                    status: status(&r.status)?.code(),
+                    reason: r.reason,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(Recording {
+            record: self.record,
+            record_object: self.record_object,
+            objects: self.objects,
+            outcome,
+            reasons,
+            tree_before: self.tree_before,
+            tree_after: self.tree_after,
+            clock: self.clock,
+            observations: self.observations,
+            rows,
+            integrity: self.integrity,
+        })
+    }
+}
+
+/// Record the evidence of every record under `state` whose pending evidence was never committed (a crash or a failed
+/// commit, M2T10R-05), and write a record file a crash left unwritten from it. A check's run does this first, so a
+/// later run never takes an earlier one's place in the history; M2-T16 also calls it when the host starts. Returns how
+/// many it recorded.
+pub async fn reconcile(handle: &EvidenceHandle, state: &Path) -> Result<usize, CheckError> {
+    let (h, root) = (handle.clone(), state.join("evidence"));
+    let found = tokio::task::spawn_blocking(move || -> Result<Vec<Recording>, CheckError> {
+        let reader = h.reader().map_err(CheckError::Store)?;
+        let dirs = |d: &Path| -> Vec<std::path::PathBuf> {
+            let mut all: Vec<_> = std::fs::read_dir(d)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect();
+            all.sort();
+            all
+        };
+        let mut found = Vec::new();
+        for candidate in dirs(&root) {
+            for check in dirs(&candidate) {
+                for record_dir in dirs(&check) {
+                    let file = record_dir.join(PENDING);
+                    let Ok(text) = std::fs::read(&file) else {
+                        continue;
+                    };
+                    let unreadable = |e: String| CheckError::Io(format!("{}: {e}", file.display()));
+                    let pending: Pending =
+                        serde_json::from_slice(&text).map_err(|e| unreadable(e.to_string()))?;
+                    if reader
+                        .evidence_outcome(&pending.record.record_id)
+                        .map_err(CheckError::Store)?
+                        .is_some()
+                    {
+                        continue;
+                    }
+                    let execution = record_dir.join("execution.json");
+                    if !execution.exists() {
+                        let bytes = serde_json::to_vec_pretty(&pending.record)
+                            .map_err(|e| unreadable(e.to_string()))?;
+                        write_new(&execution, &bytes)?;
+                    }
+                    found.push(pending.into_recording().map_err(unreadable)?);
+                }
+            }
+        }
+        Ok(found)
+    })
+    .await
+    .map_err(|e| CheckError::Io(format!("the reconciliation stopped: {e}")))??;
+    let recorded = found.len();
+    for recording in found {
+        handle
+            .record_evidence(recording)
+            .await
+            .map_err(CheckError::Store)?;
+    }
+    Ok(recorded)
 }
 
 #[cfg(test)]
