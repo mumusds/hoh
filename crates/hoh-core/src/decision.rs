@@ -387,21 +387,24 @@ pub fn validate(proposal: &Proposal, snapshot: &Snapshot) -> Result<Effect, Reje
             ),
         );
     }
-    // BLOCKED and WAITING_EXTERNAL judge task moves and assumptions only: a run's moves out of them are the user's
-    // commands and the Runtime's facts (docs/adr/ADR-025.md decision 6, ADR-011 §3.4).
+    // BLOCKED and WAITING_EXTERNAL judge task moves, assumptions and requests for a person only: a run's moves out
+    // of them are the user's commands and the Runtime's facts (docs/adr/ADR-025.md decision 6, ADR-011 §3.4); asking
+    // a person moves no run, and BLOCKED is when one is asked (v13, M2T08R-02).
     let suspended_ok = matches!(
         snapshot.run.state,
         RunState::Blocked | RunState::WaitingExternal
     ) && matches!(
         proposal.payload,
-        DecisionPayload::TransitionTask { .. } | DecisionPayload::RecordAssumption { .. }
+        DecisionPayload::TransitionTask { .. }
+            | DecisionPayload::RecordAssumption { .. }
+            | DecisionPayload::RequestUserDecision { .. }
     );
     if !lifecycle::is_working(snapshot.run.state) && !suspended_ok {
         return reject(
             IllegalTransition,
             format!(
-                "the run is {}; decisions apply to working runs only (BLOCKED and WAITING_EXTERNAL: task moves and \
-                 assumptions)",
+                "the run is {}; decisions apply to working runs only (BLOCKED and WAITING_EXTERNAL: task moves, \
+                 assumptions and requests for a person)",
                 snapshot.run.state.as_str()
             ),
         );

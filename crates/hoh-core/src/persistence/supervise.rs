@@ -59,8 +59,8 @@ impl CommitTimes {
     }
 }
 
-/// How many of a run's events one batch of a step looks at at most, in one transaction; the step goes on from the
-/// batch's cursor until it has caught up (docs/adr/ADR-025.md decision 2).
+/// How many of a run's events one batch of a step looks at at most, in one transaction and one writer job; the step
+/// goes on from the batch's cursor, a job each, until it has caught up (docs/adr/ADR-025.md decision 2, v13).
 const STEP: i64 = 10_000;
 
 /// A trigger fired by a step.
@@ -81,50 +81,121 @@ pub struct Supervised {
     pub fired: Vec<Fired>,
 }
 
-/// One step of run `run_id`'s supervisor at `context.now()`: its batches, each in its own transaction, then the firing
-/// of its due triggers in the last one.
+/// One batch of run `run_id`'s supervisor step at `context.now()`, one writer job: at most [`STEP`] of its events
+/// after its cursor taken in, in one transaction. None when that batch has not caught up with what is committed: the
+/// caller submits the next batch as another job, so the writer's priority lane (a cancel, a pause) waits one batch at
+/// most (v13, M2T08R-03). Once caught up, the due triggers are fired by the step's one verdict and the Commander
+/// judged, in that batch's transaction, so no trigger fires on part of what was committed before the step (M2T08D-900,
+/// docs/adr/ADR-025.md decision 2); then the outputs of its turns and the close of an ended run.
 pub(super) fn step(
     conn: &mut Connection,
     run_id: &str,
     context: &Context,
     ctx: &Ctx<'_>,
-) -> Result<Supervised, PersistError> {
-    // In batches of at most STEP events, each its own transaction, until the run's committed events are all taken
-    // in; only then are due triggers fired, so no trigger fires on part of what was committed before the step
-    // (M2T08D-900, docs/adr/ADR-025.md decision 2).
-    loop {
-        let tx = writer::begin(conn, ctx)?;
-        let (project_id, high, caught_up) = take_in_batch(&tx, run_id, context, ctx)?;
-        if !caught_up {
-            ctx.before_commit()?;
-            tx.commit().map_err(sqlite_error)?;
-            continue;
-        }
-        let (fired, events) = fire(&tx, &project_id, run_id, context, ctx)?;
-        writer::write(
-            &tx,
-            &Commit {
-                events,
-                ..Commit::default()
-            },
-            ctx,
-        )?;
-        // Whether its Commander is available, with what this step woke counted (decision 5).
-        let judged = wakes::judge(&tx, &project_id, run_id, context, ctx)?;
+) -> Result<Option<Supervised>, PersistError> {
+    let tx = writer::begin(conn, ctx)?;
+    let (project_id, high, caught_up) = take_in_batch(&tx, run_id, context, ctx)?;
+    if !caught_up {
+        ctx.before_commit()?;
+        tx.commit().map_err(sqlite_error)?;
+        return Ok(None);
+    }
+    let (fired, events, verdict) = fire(&tx, &project_id, run_id, context, ctx)?;
+    writer::write(
+        &tx,
+        &Commit {
+            events,
+            ..Commit::default()
+        },
+        ctx,
+    )?;
+    // Its Commander judged by the same verdict, with what this step woke counted (decision 5); none for a run the
+    // step does not judge (no binding, no spec, a state that holds or supersedes).
+    if let Some(verdict) = verdict {
+        let judged = wakes::judge(&tx, &project_id, run_id, &verdict, context, ctx)?;
         if !judged.cas.is_empty() || !judged.events.is_empty() {
             writer::write(&tx, &judged, ctx)?;
         }
-        ctx.before_commit()?;
-        tx.commit().map_err(sqlite_error)?;
-        // Then the outputs of its turns, one transaction each, after the judgement: a probe that settled releases its
-        // claims before its answer is disposed of (decision 5, -454).
-        super::outputs::dispose(conn, run_id, context, ctx)?;
-        return Ok(Supervised {
-            cursor: high,
-            fired,
-        });
     }
+    ctx.before_commit()?;
+    tx.commit().map_err(sqlite_error)?;
+    // Then the outputs of its turns, one transaction each, after the judgement: a probe that settled releases its
+    // claims before its answer is disposed of (decision 5, -454).
+    super::outputs::dispose(conn, run_id, context, ctx)?;
+    close(conn, run_id, context, ctx)?;
+    Ok(Some(Supervised {
+        cursor: high,
+        fired,
+    }))
 }
+
+/// Run `run_id`'s supervision closed, once it is cancelled or ended and nothing is left of it (v13, M2T08R-06): no
+/// PENDING trigger, no wake neither answered nor superseded, no output pending, and a woken or an output since the
+/// last close. `supervisor.closed` then; the host steps an ended run only while it has something since its last.
+fn close(
+    conn: &mut Connection,
+    run_id: &str,
+    context: &Context,
+    ctx: &Ctx<'_>,
+) -> Result<(), PersistError> {
+    let tx = writer::begin(conn, ctx)?;
+    let (project_id, state): (String, String) = tx
+        .query_row(
+            "SELECT project_id, state FROM runs WHERE run_id = ?1",
+            params![run_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(sqlite_error)?;
+    let state = writer::parse::<RunState>(&state)?;
+    if !matches!(admission(state), Admission::Supersede) {
+        return Ok(());
+    }
+    let last: Option<i64> = tx
+        .query_row(
+            "SELECT max(seq) FROM events WHERE run_id = ?1 AND kind IN (?2, ?3) AND seq > \
+             (SELECT coalesce(max(seq), 0) FROM events WHERE run_id = ?1 AND kind = ?4)",
+            params![run_id, wakes::WOKEN, super::outputs::OUTPUT, CLOSED],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    let Some(last) = last else {
+        return Ok(());
+    };
+    let pending: bool = tx
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM supervisor_triggers WHERE run_id = ?1 AND state = 'PENDING')",
+            params![run_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    if pending
+        || wakes::of_run(&tx, run_id)?
+            .iter()
+            .any(|w| !w.superseded && !w.settled())
+        || super::outputs::pending(&tx, run_id)?.is_some()
+    {
+        return Ok(());
+    }
+    writer::write(
+        &tx,
+        &Commit {
+            events: vec![NewEvent {
+                project_id,
+                event_id: child_id(run_id, &format!("supervisor/closed/{last}")),
+                run_id: Some(run_id.to_owned()),
+                kind: CLOSED.to_owned(),
+                payload: json!({"state": state.as_str(), "at": rfc3339_millis_utc(context.now())}),
+            }],
+            ..Commit::default()
+        },
+        ctx,
+    )?;
+    ctx.before_commit()?;
+    tx.commit().map_err(sqlite_error)
+}
+
+/// A run's supervision closed (v13, M2T08R-06).
+pub(super) const CLOSED: &str = "supervisor.closed";
 
 /// One batch of run `run_id`'s events after its cursor (at most [`STEP`]) taken in inside `tx`: its project, the
 /// cursor after it, and whether it reached the last event committed (a batch of fewer than STEP events).
@@ -190,40 +261,70 @@ fn take_in_batch(
             .collect::<Result<_, _>>()
             .map_err(sqlite_error)?
     };
+    // The batch's waking events joined by key in memory, in the order of each key's first: then one read and one
+    // write per key (v13, M2T08R-03; once per event rewrote the whole seq array each time).
+    let mut joined: Vec<Joined> = Vec::new();
+    let mut index: std::collections::BTreeMap<(String, Option<String>), usize> =
+        std::collections::BTreeMap::new();
+    let mut specs: std::collections::BTreeMap<i64, Option<String>> =
+        std::collections::BTreeMap::new();
     for (seq, kind, payload) in &waking {
         let payload: Value = serde_json::from_str(payload).unwrap_or(Value::Null);
-        if let Some(wake) = supervise::classify(policy, kind, &payload, revision) {
-            let spec_id = match wake.key.spec_revision {
-                Some(revision) => tx
-                    .query_row(
-                        "SELECT spec_id FROM specs WHERE project_id = ?1 AND revision = ?2",
-                        params![project_id, revision],
-                        |r| r.get::<_, String>(0),
-                    )
-                    .optional()
-                    .map_err(sqlite_error)?,
-                None => None,
-            };
-            // Timed from its commit (REQ-021 decision 4); an event an earlier writer committed, from now.
-            // A revision the project has no spec row for keys by the revision itself, so revisions never merge.
-            // A re-trigger's base fingerprint already carries the revision of the wake it re-triggers (M2T08D-954);
-            // known by its kind, not by a suffix a producer's fingerprint may have too (M2T08D-1000).
-            let fingerprint = match (spec_id.as_deref(), wake.key.spec_revision) {
-                (None, Some(revision)) if !wake.retrigger => {
-                    format!("{}@r{revision}", wake.key.fingerprint)
+        let Some(wake) = supervise::classify(policy, kind, &payload, revision) else {
+            continue;
+        };
+        let spec_id = match wake.key.spec_revision {
+            Some(revision) => match specs.get(&revision) {
+                Some(known) => known.clone(),
+                None => {
+                    let found = tx
+                        .query_row(
+                            "SELECT spec_id FROM specs WHERE project_id = ?1 AND revision = ?2",
+                            params![project_id, revision],
+                            |r| r.get::<_, String>(0),
+                        )
+                        .optional()
+                        .map_err(sqlite_error)?;
+                    specs.insert(revision, found.clone());
+                    found
                 }
-                _ => wake.key.fingerprint.clone(),
-            };
-            take_in(
-                tx,
-                run_id,
-                &fingerprint,
-                spec_id.as_deref(),
-                wake.severity,
-                *seq,
-                ctx.committed_at(*seq).unwrap_or(now),
-            )?;
+            },
+            None => None,
+        };
+        // Timed from its commit (REQ-021 decision 4); an event an earlier writer committed, from now.
+        // A revision the project has no spec row for keys by the revision itself, so revisions never merge.
+        // A re-trigger's base fingerprint already carries the revision of the wake it re-triggers (M2T08D-954);
+        // known by its kind, not by a suffix a producer's fingerprint may have too (M2T08D-1000; escaped, v13).
+        let fingerprint = match (spec_id.as_deref(), wake.key.spec_revision) {
+            (None, Some(revision)) if !wake.retrigger => {
+                format!("{}@r{revision}", wake.key.fingerprint)
+            }
+            _ => wake.key.fingerprint.clone(),
+        };
+        let at = ctx.committed_at(*seq).unwrap_or(now);
+        let key = (fingerprint, spec_id);
+        match index.get(&key) {
+            Some(&i) => {
+                let j = &mut joined[i];
+                j.seqs.push(*seq);
+                j.last_at = at;
+                j.severity = j.severity.max(wake.severity);
+            }
+            None => {
+                index.insert(key.clone(), joined.len());
+                joined.push(Joined {
+                    fingerprint: key.0,
+                    spec_id: key.1,
+                    severity: wake.severity,
+                    seqs: vec![*seq],
+                    first_at: at,
+                    last_at: at,
+                });
+            }
         }
+    }
+    for j in &joined {
+        take_in(tx, run_id, j)?;
     }
     if high > cursor {
         tx.execute(
@@ -236,22 +337,28 @@ fn take_in_batch(
     Ok((project_id, high, looked < STEP))
 }
 
-/// Event `seq` of key (`fingerprint`, `spec_id`), committed at `at`: joined to the key's PENDING trigger, else a new
-/// one (REQ-021 decision 3); its due time again by decision 1, from its first and last events' commits.
-fn take_in(
-    tx: &Transaction<'_>,
-    run_id: &str,
-    fingerprint: &str,
-    spec_id: Option<&str>,
+/// A batch's events of one key, joined in memory: their highest severity, their seqs, and when the first and the last
+/// committed.
+struct Joined {
+    fingerprint: String,
+    spec_id: Option<String>,
     severity: Severity,
-    seq: i64,
-    at: SystemTime,
-) -> Result<(), PersistError> {
+    seqs: Vec<i64>,
+    first_at: SystemTime,
+    last_at: SystemTime,
+}
+
+/// A batch's events of one key `j`: joined to the key's PENDING trigger, else a new one (REQ-021 decision 3), in one
+/// write; its due time again by decision 1, from its first and last events' commits.
+fn take_in(tx: &Transaction<'_>, run_id: &str, j: &Joined) -> Result<(), PersistError> {
+    let (Some(&first_seq), Some(&last_seq)) = (j.seqs.first(), j.seqs.last()) else {
+        return Ok(());
+    };
     let pending: Option<(String, String, String, String)> = tx
         .query_row(
             "SELECT trigger_id, severity, event_seqs_json, created_at FROM supervisor_triggers \
              WHERE run_id = ?1 AND fingerprint = ?2 AND ifnull(spec_id, '') = ifnull(?3, '') AND state = 'PENDING'",
-            params![run_id, fingerprint, spec_id],
+            params![run_id, j.fingerprint, j.spec_id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()
@@ -265,13 +372,13 @@ fn take_in(
             })?;
             let severity = Severity::named(&was)
                 .unwrap_or(Severity::Normal)
-                .max(severity);
+                .max(j.severity);
             let mut seqs: Vec<i64> = serde_json::from_str(&seqs).map_err(|e| {
                 PersistError::IntegrityViolation(format!(
                     "trigger {trigger_id}: event_seqs_json: {e}"
                 ))
             })?;
-            seqs.push(seq);
+            seqs.extend(&j.seqs);
             tx.execute(
                 "UPDATE supervisor_triggers SET severity = ?2, event_seqs_json = ?3, last_seq = ?4, due_at = ?5 \
                  WHERE trigger_id = ?1",
@@ -279,8 +386,8 @@ fn take_in(
                     trigger_id,
                     severity.as_str(),
                     json!(seqs).to_string(),
-                    seq,
-                    rfc3339_millis_utc(supervise::due_at(severity, first, at))
+                    last_seq,
+                    rfc3339_millis_utc(supervise::due_at(severity, first, j.last_at))
                 ],
             )
             .map_err(sqlite_error)?;
@@ -288,17 +395,18 @@ fn take_in(
         None => {
             tx.execute(
                 "INSERT INTO supervisor_triggers(trigger_id, run_id, fingerprint, spec_id, severity, event_seqs_json, \
-                 first_seq, last_seq, due_at, state, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, 'PENDING', ?9)",
+                 first_seq, last_seq, due_at, state, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'PENDING', ?10)",
                 params![
-                    child_id(run_id, &format!("trigger/{seq}")),
+                    child_id(run_id, &format!("trigger/{first_seq}")),
                     run_id,
-                    fingerprint,
-                    spec_id,
-                    severity.as_str(),
-                    json!([seq]).to_string(),
-                    seq,
-                    rfc3339_millis_utc(supervise::due_at(severity, at, at)),
-                    rfc3339_millis_utc(at)
+                    j.fingerprint,
+                    j.spec_id,
+                    j.severity.as_str(),
+                    json!(j.seqs).to_string(),
+                    first_seq,
+                    last_seq,
+                    rfc3339_millis_utc(supervise::due_at(j.severity, j.first_at, j.last_at)),
+                    rfc3339_millis_utc(j.first_at)
                 ],
             )
             .map_err(sqlite_error)?;
@@ -360,14 +468,17 @@ fn record(run_id: &str, t: &Pending, now: SystemTime, ctx: &Ctx<'_>) -> Value {
     })
 }
 
-/// Fire run `run_id`'s triggers due at `now`, as its state allows: the fired ones and the events to write.
+/// Fire run `run_id`'s triggers due at `now`, as its state allows and by the step's one verdict on its Commander
+/// (v13): the fired ones, the events to write, and the verdict when the step is to judge the Commander by it (a run
+/// with a binding and a spec, in a state that fires).
+#[allow(clippy::type_complexity)]
 fn fire(
     tx: &Transaction<'_>,
     project_id: &str,
     run_id: &str,
     context: &Context,
     ctx: &Ctx<'_>,
-) -> Result<(Vec<Fired>, Vec<NewEvent>), PersistError> {
+) -> Result<(Vec<Fired>, Vec<NewEvent>, Option<wakes::Verdict>), PersistError> {
     let now = context.now();
     let (state, run_spec): (String, Option<String>) = tx
         .query_row(
@@ -388,7 +499,7 @@ fn fire(
     let mut fired = Vec::new();
     let mut events = Vec::new();
     if !bound {
-        return Ok((fired, events));
+        return Ok((fired, events, None));
     }
     let event = |id: String, kind: &str, payload: Value| NewEvent {
         project_id: project_id.to_owned(),
@@ -442,7 +553,7 @@ fn fire(
             .collect()
     };
     match admission(state) {
-        Admission::Hold => return Ok((fired, events)),
+        Admission::Hold => return Ok((fired, events, None)),
         Admission::Supersede => {
             // Nothing more is owed to a run that is cancelled or ended: its PENDING triggers and its owed wakes.
             for t in pending(false)? {
@@ -469,13 +580,14 @@ fn fire(
                     json!({"wake": wake.id, "reason": state.as_str()}),
                 ));
             }
-            return Ok((fired, events));
+            return Ok((fired, events, None));
         }
         Admission::Fire => {}
     }
     let due = pending(true)?;
     if run_spec.is_none() {
-        // No supervision task without a spec (decision 4): each due trigger waits, deferred once.
+        // No supervision task without a spec (decision 4): each due trigger waits, deferred once; the Commander is not
+        // judged (decision 4 before 5, v13, M2T08R-04).
         for t in due {
             let deferred: bool = tx
                 .query_row(
@@ -496,8 +608,12 @@ fn fire(
                 ));
             }
         }
-        return Ok((fired, events));
+        return Ok((fired, events, None));
     }
+    // The step's one verdict, before anything fires (v13, M2T08R-05, -08).
+    let Some(verdict) = wakes::verdict(tx, run_id, context)? else {
+        return Ok((fired, events, None));
+    };
     let all = wakes::of_run(tx, run_id)?;
     // The run's turn in flight, if any, and whether its wake may still be preempted (decision 3): a non-integrity wake
     // never preempted before.
@@ -508,12 +624,29 @@ fn fire(
         .and_then(|w| w.turns.last().map(|t| (w.id.clone(), t.attempt_id.clone())));
     let mut owed: Vec<wakes::Wake> = all.into_iter().filter(wakes::Wake::owed).collect();
     for t in due {
+        let severity = Severity::named(&t.severity).unwrap_or(Severity::Normal);
+        // A routine trigger is not kept while the Commander is unavailable, however late the step that finds it due
+        // (decision 5, v13, M2T08R-05).
+        if severity == Severity::Normal && !verdict.available() {
+            tx.execute(
+                "UPDATE supervisor_triggers SET state = 'SUPERSEDED' WHERE trigger_id = ?1 AND state = 'PENDING'",
+                params![t.trigger_id],
+            )
+            .map_err(sqlite_error)?;
+            let mut payload = record(run_id, &t, now, ctx);
+            payload["reason"] = json!("COMMANDER_UNAVAILABLE");
+            events.push(event(
+                child_id(&t.trigger_id, "superseded"),
+                wakes::SUPERSEDED,
+                payload,
+            ));
+            continue;
+        }
         tx.execute(
             "UPDATE supervisor_triggers SET state = 'HANDLED' WHERE trigger_id = ?1 AND state = 'PENDING'",
             params![t.trigger_id],
         )
         .map_err(sqlite_error)?;
-        let severity = Severity::named(&t.severity).unwrap_or(Severity::Normal);
         // The tasks its events name: what the wake's turn will be shown, and fenced by (decisions 3 and 6).
         // A re-trigger names every task its stale turn was shown (task_ids); a Commander's own mistakes in a row back
         // its wake off from now (decision 6, -700, -752).
@@ -611,7 +744,7 @@ fn fire(
         // be allocated once that turn stops; in this woken's transaction (decision 3, -800, -953, -1056).
         if edge
             && let Some((target_wake, target_attempt)) = target.take()
-            && wakes::could_allocate(tx, run_id, context, wake_not_before)?
+            && wakes::could_allocate(tx, run_id, context, wake_not_before, &verdict)?
         {
             let mut preempt = record;
             preempt["wake"] = json!(wake_id);
@@ -631,7 +764,7 @@ fn fire(
             event_seqs: t.seqs,
         });
     }
-    Ok((fired, events))
+    Ok((fired, events, Some(verdict)))
 }
 
 #[cfg(test)]

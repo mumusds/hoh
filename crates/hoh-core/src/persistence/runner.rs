@@ -58,7 +58,8 @@ pub struct Waiting {
     /// The session.start notices waiting (docs/adr/ADR-024.md decision 4).
     pub session_starts: Vec<super::handover::SessionStart>,
     /// The runs whose supervisor steps (docs/adr/ADR-025.md decision 2): those not ended, and an ended one while it
-    /// still has a PENDING trigger or a wake owed (superseded by its next step).
+    /// still has a PENDING trigger, or a woken or an output since its supervision was last closed (superseded and
+    /// closed by its next step; v13, M2T08R-06).
     pub supervised: Vec<String>,
 }
 
@@ -137,7 +138,8 @@ pub(super) enum RunnerDone {
     /// How many leases were renewed.
     Renewed(usize),
     Paced(super::retry::Paced),
-    Supervised(super::supervise::Supervised),
+    /// One batch of a supervisor step: none while it has not caught up (docs/adr/ADR-025.md v13 decision 2).
+    Supervised(Option<super::supervise::Supervised>),
     Allocated(Option<super::wakes::Allocated>),
     Stops(Vec<super::wakes::Stop>),
     Repair(super::retry::RepairVerdict),
@@ -383,12 +385,22 @@ fn waiting(conn: &Connection, project_id: &str) -> Result<Waiting, PersistError>
         let mut statement = conn
             .prepare(
                 "SELECT r.run_id FROM runs r WHERE r.project_id = ?1 AND (r.state NOT IN ('CANCELLED', 'COMPLETED', 'FAILED') \
-                 OR EXISTS (SELECT 1 FROM supervisor_triggers t WHERE t.run_id = r.run_id AND t.state = 'PENDING')) \
+                 OR EXISTS (SELECT 1 FROM supervisor_triggers t WHERE t.run_id = r.run_id AND t.state = 'PENDING') \
+                 OR EXISTS (SELECT 1 FROM events e WHERE e.run_id = r.run_id AND e.kind IN (?2, ?3) AND e.seq > \
+                   (SELECT coalesce(max(c.seq), 0) FROM events c WHERE c.run_id = r.run_id AND c.kind = ?4))) \
                  ORDER BY r.created_at, r.run_id",
             )
             .map_err(sqlite_error)?;
         statement
-            .query_map(params![project_id], |r| r.get(0))
+            .query_map(
+                params![
+                    project_id,
+                    super::wakes::WOKEN,
+                    super::outputs::OUTPUT,
+                    super::supervise::CLOSED
+                ],
+                |r| r.get(0),
+            )
             .map_err(sqlite_error)?
             .collect::<Result<_, _>>()
             .map_err(sqlite_error)?

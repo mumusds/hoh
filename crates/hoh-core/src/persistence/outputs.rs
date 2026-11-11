@@ -2,8 +2,9 @@
 //! `supervisor.output` when the turn succeeded, then each disposed of exactly once by the supervisor's step, one
 //! transaction each. An output's end is the first `decision.applied`/`decision.rejected` that names it (a decision put
 //! through `decide` in the output's transaction) or one `supervisor.output_disposed{outcome}`: `replay`, `deferred`
-//! (not a decision), `invalid` (with a reason), `unsupported` (a request for a person: NEED_DECISION claimed for it;
-//! create_tasks) or `superseded` (the run cancelled or ended). A paused run's outputs wait.
+//! (not a decision), `invalid` (with a reason), `unsupported` (past decide's fences but not applied yet: a request for
+//! a person, NEED_DECISION claimed for it; create_tasks) or `superseded` (the run cancelled or ended). A paused run's
+//! outputs wait.
 
 use super::blockers::{self, Claims};
 use super::decide::{self, Decided};
@@ -16,7 +17,7 @@ use crate::protocol::{self, BlockedReason, DecisionPayload, Message, MessageKind
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 
-const OUTPUT: &str = "supervisor.output";
+pub(super) const OUTPUT: &str = "supervisor.output";
 const DISPOSED: &str = "supervisor.output_disposed";
 const FAILED: &str = "supervisor.output_failed";
 /// A disposal that fails for a reason other than the data ends the output INTERNAL at its third failure.
@@ -69,7 +70,7 @@ pub(super) fn recorded(
 }
 
 /// The next output of run `run_id` with no end yet: its id, turn and text.
-fn pending(
+pub(super) fn pending(
     tx: &Transaction<'_>,
     run_id: &str,
 ) -> Result<Option<(String, String, String)>, PersistError> {
@@ -290,15 +291,19 @@ fn one(
     };
     // Its id in this turn's namespace: a message id reused by another turn or run is another decision (-259).
     proposal.decision_id = child_id(attempt_id, &message.message_id);
-    match &proposal.payload {
-        DecisionPayload::RequestUserDecision { .. } => {
-            return person(tx, project_id, run_id, &proposal, context, ctx).map(Some);
-        }
-        DecisionPayload::CreateTasks { .. } => return Ok(Some(end("unsupported", None))),
-        _ => {}
-    }
+    // Every decision, a request for a person too, passes decide's fences (v13, M2T08R-02).
     match decide::decide_in(tx, &proposal, context, ctx, Some(output_id)) {
         Ok(Decided::Applied { .. } | Decided::Rejected { .. }) => Ok(None),
+        Ok(Decided::Unsupported { .. }) => match &proposal.payload {
+            DecisionPayload::RequestUserDecision { .. } => {
+                person(tx, project_id, run_id, &proposal, context, ctx).map(Some)
+            }
+            _ => Ok(Some(End {
+                outcome: "unsupported",
+                reason: None,
+                extra: json!({"decision_id": proposal.decision_id}),
+            })),
+        },
         Ok(Decided::Replayed { .. }) => Ok(Some(End {
             outcome: "replay",
             reason: None,
@@ -310,14 +315,13 @@ fn one(
             extra: json!({"decision_id": proposal.decision_id}),
         })),
         Err(PersistError::InvalidProposal(_)) => Ok(Some(end("invalid", Some("PAYLOAD")))),
-        Err(PersistError::Unsupported(_)) => Ok(Some(end("unsupported", None))),
         Err(e) => Err(e),
     }
 }
 
-/// A request for a person (decide does not apply it yet, M2-T13): `unsupported`, with NEED_DECISION claimed for it
-/// (source `commander:<decision_id>`, released by its answer) and the run blocked by it; the same id again is a replay
-/// (same payload) or a key reuse.
+/// A request for a person past decide's fences (decide does not apply it yet, M2-T13; its decisions row stays
+/// PROPOSED, so the same id again is a replay or a key reuse): `unsupported`, with NEED_DECISION claimed for it (source
+/// `commander:<decision_id>`, released by its answer) and the run blocked by it.
 fn person(
     tx: &Transaction<'_>,
     project_id: &str,
@@ -329,22 +333,6 @@ fn person(
     let payload = protocol::encode(&proposal.payload)
         .map_err(|e| PersistError::InvalidProposal(e.to_string()))?;
     let digest = super::wakes::sha256_hex(payload.to_string().as_bytes());
-    let seen: Option<String> = tx
-        .query_row(
-            "SELECT json_extract(payload_json, '$.payload_sha256') FROM events WHERE run_id = ?1 AND kind = ?2 \
-             AND json_extract(payload_json, '$.decision_id') = ?3 AND json_extract(payload_json, '$.outcome') = 'unsupported'",
-            params![run_id, DISPOSED, proposal.decision_id],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(sqlite_error)?;
-    if let Some(seen) = seen {
-        return Ok(End {
-            outcome: if seen == digest { "replay" } else { "invalid" },
-            reason: (seen != digest).then_some("KEY_REUSE"),
-            extra: json!({"decision_id": proposal.decision_id}),
-        });
-    }
     let mut claims = Claims::load(tx, project_id, run_id)?;
     let before = claims.reasons();
     claims.set(

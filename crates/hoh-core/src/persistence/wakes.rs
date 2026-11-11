@@ -322,20 +322,23 @@ pub(super) fn of_run(tx: &Connection, run_id: &str) -> Result<Vec<Wake>, Persist
 }
 
 /// Rearm run `run_id`'s wakes whose last turn ended without settling and is not rearmed yet (decision 3): each owed
-/// again, with `supervisor.rearmed{reason, failures, retry_not_before, role_epoch}` (a failure counted under the
-/// Commander's epoch `epoch` and backed off by ADR-020's bound; a preempted or withdrawn turn neither), and its
-/// supervision task CANCELLED if no ending moved it yet. The moves and events for the caller's commit.
+/// again, with `supervisor.rearmed{reason, failures, retry_not_before, role_epoch}` (a failure counted under the epoch
+/// of the attempt that ended, not the binding's now (v13, M2T08R-53), and backed off by ADR-020's bound; a preempted
+/// or withdrawn turn neither), and its supervision task CANCELLED if no ending moved it yet. The moves and events for
+/// the caller's commit.
 fn rearm(
     tx: &Transaction<'_>,
     project_id: &str,
     run_id: &str,
     wakes: &mut [Wake],
-    epoch: i64,
     now: std::time::SystemTime,
 ) -> Result<(Vec<StateCas>, Vec<NewEvent>), PersistError> {
     let mut cas = Vec::new();
     let mut events = Vec::new();
     for wake in wakes.iter_mut().filter(|w| !w.superseded && !w.settled()) {
+        let Some(epoch) = wake.turns.last().map(|t| t.role_epoch) else {
+            continue;
+        };
         let failures = wake.failures(epoch);
         let Some(turn) = wake.turns.last_mut() else {
             continue;
@@ -439,9 +442,12 @@ pub struct Supervision {
     pub workdir: Option<String>,
 }
 
-/// How many of its wake's events a turn is shown, and how much of each payload (decision 7: bounded).
+/// How many of its wake's events a turn is shown, and how much of each payload; how many of its tasks and of the run's
+/// other owed wakes (decision 7: bounded, v13 M2T08R-57; the snapshots are never cut).
 const SHOWN_EVENTS: usize = 50;
 const SHOWN_PAYLOAD: usize = 2_000;
+const SHOWN_TASKS: usize = 50;
+const SHOWN_WAKES: usize = 50;
 
 /// How urgent an event of a wake is, most first: integrity, critical, high, the rest (decision 7's order).
 fn urgency(kind: &str, payload: &Value) -> u8 {
@@ -535,7 +541,7 @@ pub(super) fn supervision_input(
         .map_err(sqlite_error)?;
     let candidate = super::outbox::current_candidate(conn, run_id)?.map(|c| c.id);
     let mut tasks = Vec::new();
-    for task in this.task_ids.iter() {
+    for task in this.task_ids.iter().take(SHOWN_TASKS) {
         let row: Option<(String, i64, String, Option<String>)> = conn
             .query_row(
                 "SELECT state, revision, role, blocked_reason FROM tasks WHERE task_id = ?1",
@@ -548,9 +554,13 @@ pub(super) fn supervision_input(
             tasks.push(json!({"task_id": task, "state": state, "revision": revision, "role": role, "blocked_reason": blocked}));
         }
     }
-    let other: Vec<Value> = wakes
+    let others: Vec<&Wake> = wakes
         .iter()
         .filter(|w| w.id != wake_id && w.owed())
+        .collect();
+    let other: Vec<Value> = others
+        .iter()
+        .take(SHOWN_WAKES)
         .map(|w| json!({"id": w.id, "fingerprint": w.fingerprint, "severity": w.severity.as_str()}))
         .collect();
     let mut roles = Vec::new();
@@ -626,9 +636,11 @@ pub(super) fn supervision_input(
                 "candidate_id": candidate},
             "snapshots": allocation["snapshots"],
             "tasks": tasks,
+            "tasks_total": this.task_ids.len(),
             "events": shown,
             "events_total": total,
             "other_wakes": other,
+            "other_wakes_total": others.len(),
             "roles": roles,
             "recent_rejections": rejections,
         }),
@@ -743,7 +755,7 @@ pub(super) fn allocate(
         };
         let mut wakes = of_run(&tx, &run_id)?;
         let epoch = decide::to_i64(binding.role_epoch, "role_epoch")?;
-        let (moves, events) = rearm(&tx, project_id, &run_id, &mut wakes, epoch, now)?;
+        let (moves, events) = rearm(&tx, project_id, &run_id, &mut wakes, now)?;
         rearmed.cas.extend(moves);
         rearmed.events.extend(events);
         if !binding.active {
@@ -1005,14 +1017,19 @@ pub(super) fn allocate(
 }
 
 /// Whether run `run_id` could give a wake whose backoff ends at `not_before` a turn once its turn in flight stops
-/// (decision 3, the preempt's condition): its Commander's binding ACTIVE with a session, its budget not stopping it,
-/// the backoff over. The run's state is the caller's (it fires only in an admitting state).
+/// (decision 3, the preempt's condition): its Commander available by the step's `verdict` (v13, M2T08R-08), its
+/// binding ACTIVE with a session, its budget not stopping it, the backoff over. The run's state is the caller's (it
+/// fires only in an admitting state).
 pub(super) fn could_allocate(
     tx: &Transaction<'_>,
     run_id: &str,
     context: &Context,
     not_before: Option<std::time::SystemTime>,
+    verdict: &Verdict,
 ) -> Result<bool, PersistError> {
+    if !verdict.available() {
+        return Ok(false);
+    }
     let bound: bool = tx
         .query_row(
             "SELECT EXISTS (SELECT 1 FROM role_bindings WHERE run_id = ?1 AND role = ?2 AND state = 'ACTIVE' \
@@ -1080,9 +1097,10 @@ fn registry_reason(
 }
 
 /// Why run `run_id`'s Commander, at role epoch `epoch` and binding state `binding`, is unavailable now (empty:
-/// available; decision 5): its binding BLOCKED (`binding_blocked`); an owed wake with MAX_RETRIES failures under the
-/// epoch (`failures_capped`); its last turn of the epoch that ended failed for authentication or capability (`auth`,
-/// `capability`).
+/// available; decision 5): its binding BLOCKED (`binding_blocked`); the registry's looks; inactive past its limit; a
+/// wake not answered (owed, or its probe in flight: v13, M2T08R-01) with MAX_RETRIES failures under the epoch
+/// (`failures_capped`); its last turn of the epoch that ended failed for authentication or capability (`auth`,
+/// `capability`). Every judgement of a step and of the allocation goes through it.
 fn unavailability(
     tx: &Transaction<'_>,
     run_id: &str,
@@ -1101,7 +1119,10 @@ fn unavailability(
         reasons.push("inactive");
     }
     let cap = i64::from(crate::retry::MAX_RETRIES);
-    if wakes.iter().any(|w| w.owed() && w.failures(epoch) >= cap) {
+    if wakes
+        .iter()
+        .any(|w| !w.superseded && !w.settled() && w.failures(epoch) >= cap)
+    {
         reasons.push("failures_capped");
     }
     let last = wakes
@@ -1164,15 +1185,57 @@ fn recorded(tx: &Transaction<'_>, run_id: &str) -> Result<Option<Recorded>, Pers
     .transpose()
 }
 
-/// Judge run `run_id`'s Commander at `context.now()` (decision 5), in the supervisor's step: unavailable, it records
-/// `supervisor.unavailable{reasons}` when that changes and, while the run owes it a decision (an owed wake or a
-/// PENDING trigger), claims COMMANDER_UNAVAILABLE (and NEED_DECISION when a need_decision is owed) for the run, which
-/// is BLOCKED by it, its routine (normal) triggers superseded; available again, `supervisor.available` and the claims
-/// released (the run back in its state once nothing else is claimed). Only in a state that admits supervision.
+/// A run's Commander as one step judges it (docs/adr/ADR-025.md v13 decision 5): why it is unavailable (empty:
+/// available) and the registry look that stands behind it. Firing, the preempt's condition and the claims of the step
+/// all go by it.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct Verdict {
+    pub reasons: Vec<&'static str>,
+    pub observation: Value,
+}
+
+impl Verdict {
+    pub fn available(&self) -> bool {
+        self.reasons.is_empty()
+    }
+}
+
+/// Run `run_id`'s verdict at `context.now()`: none for a run with no Commander binding (not supervised).
+pub(super) fn verdict(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    context: &Context,
+) -> Result<Option<Verdict>, PersistError> {
+    let binding: Option<(String, i64)> = tx
+        .query_row(
+            "SELECT state, role_epoch FROM role_bindings WHERE run_id = ?1 AND role = ?2",
+            params![run_id, COMMANDER],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some((binding, epoch)) = binding else {
+        return Ok(None);
+    };
+    let wakes = of_run(tx, run_id)?;
+    let (reasons, observation) = unavailability(tx, run_id, &wakes, epoch, &binding, context)?;
+    Ok(Some(Verdict {
+        reasons,
+        observation,
+    }))
+}
+
+/// Judge run `run_id`'s Commander by the step's `verdict` at `context.now()` (decision 5), in the supervisor's step:
+/// unavailable, it records `supervisor.unavailable{reasons}` when that changes and, while the run owes it a decision (a
+/// wake not answered, owed or in flight (v13), or a PENDING trigger), claims COMMANDER_UNAVAILABLE (and NEED_DECISION
+/// when a need_decision is owed) for the run, which is BLOCKED by it, its routine (normal) triggers superseded;
+/// available again, `supervisor.available` and the claims released (the run back in its state once nothing else is
+/// claimed). Only in a state that admits supervision.
 pub(super) fn judge(
     tx: &Transaction<'_>,
     project_id: &str,
     run_id: &str,
+    verdict: &Verdict,
     context: &Context,
     ctx: &Ctx<'_>,
 ) -> Result<Commit, PersistError> {
@@ -1186,7 +1249,7 @@ pub(super) fn judge(
         )
         .optional()
         .map_err(sqlite_error)?;
-    let Some((binding, epoch, state, _resume)) = row else {
+    let Some((_binding, epoch, state, _resume)) = row else {
         return Ok(commit);
     };
     let state = writer::parse::<RunState>(&state)?;
@@ -1197,7 +1260,7 @@ pub(super) fn judge(
     let now = context.now();
     let at = rfc3339_utc(now);
     let wakes = of_run(tx, run_id)?;
-    let (reasons, observation) = unavailability(tx, run_id, &wakes, epoch, &binding, context)?;
+    let (reasons, observation) = (&verdict.reasons, &verdict.observation);
     let last = recorded(tx, run_id)?;
     let event = |id: String, kind: &str, payload: Value| NewEvent {
         project_id: project_id.to_owned(),
@@ -1234,9 +1297,10 @@ pub(super) fn judge(
                 json!({"reasons": reasons, "observation": observation, "at": at, "role_epoch": epoch}),
             ));
         }
-        // What the run owes its Commander: its owed wakes and its PENDING triggers.
+        // What the run owes its Commander: its wakes not answered (owed, or in flight: a probe's wake is still owed
+        // its decision, v13) and its PENDING triggers.
         let mut seqs: Vec<i64> = Vec::new();
-        for wake in wakes.iter().filter(|w| w.owed()) {
+        for wake in wakes.iter().filter(|w| !w.superseded && !w.settled()) {
             seqs.extend(&wake.event_seqs);
             owed_records.push(json!({"wake": wake.id, "fingerprint": wake.fingerprint}));
         }
@@ -1294,8 +1358,16 @@ pub(super) fn judge(
     let changed = union != before;
     commit.events.extend(claims.store(tx)?);
     if !desired.is_empty() && !had {
+        // One per blocking episode, numbered by the run's earlier ones (v13, M2T08R-51).
+        let episode: i64 = tx
+            .query_row(
+                "SELECT count(*) FROM events WHERE run_id = ?1 AND kind = 'supervisor.blocked'",
+                params![run_id],
+                |r| r.get(0),
+            )
+            .map_err(sqlite_error)?;
         commit.events.push(event(
-            child_id(run_id, &format!("supervisor/{number}/blocked")),
+            child_id(run_id, &format!("supervisor/blocked/{episode}")),
             "supervisor.blocked",
             json!({"reasons": reasons, "owed": owed_records}),
         ));

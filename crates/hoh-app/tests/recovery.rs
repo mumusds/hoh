@@ -4492,8 +4492,9 @@ fn team_on(project: &Path, agent: &str) -> R {
 }
 
 /// TEST-021-03's world: run R RUNNING on s1 with its Commander bound; the supervisor took in R's events up to seq 120
-/// (its cursor), the decision it led to APPLIED; seqs 121 to 125 are five need_decision events of one key, committed
-/// and not taken in.
+/// (its cursor): among them need_decision events of the same key (seq 100) and of another (110), and a Commander
+/// output (115) its decision ended (116, APPLIED); seqs 121 to 125 are five need_decision events of one key, committed
+/// and not taken in (M2T08R-52: what is up to the cursor would wake, or be disposed of, if taken in again).
 fn supervised_world(project: &Path) -> R {
     seed(
         project,
@@ -4511,7 +4512,15 @@ fn supervised_world(project: &Path) -> R {
         project,
         "WITH RECURSIVE n(i) AS (SELECT (SELECT coalesce(max(seq), 0) FROM events) + 1 UNION ALL SELECT i + 1 FROM n WHERE i < 120)
          INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
-           SELECT :p, 'filler/' || i, 'R', 'token.delta', '{}', '2026-11-07T00:00:00Z' FROM n;
+           SELECT :p, 'filler/' || i, 'R',
+             CASE i WHEN 100 THEN 'need_decision' WHEN 110 THEN 'need_decision' WHEN 115 THEN 'supervisor.output'
+               WHEN 116 THEN 'decision.applied' ELSE 'token.delta' END,
+             CASE i WHEN 100 THEN json_object('task_id', 'T', 'fingerprint', 'fp-T')
+               WHEN 110 THEN json_object('task_id', 'U', 'fingerprint', 'fp-other')
+               WHEN 115 THEN json_object('output_id', 'R/old/output/0', 'attempt_id', 'R/old', 'line', 0, 'text', '{}')
+               WHEN 116 THEN json_object('decision_id', 'd-before', 'output_id', 'R/old/output/0')
+               ELSE '{}' END,
+             '2026-11-07T00:00:00Z' FROM n;
          INSERT INTO supervisor_cursor(run_id, last_handled_seq) VALUES ('R', 120);
          WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5)
          INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
@@ -4522,7 +4531,8 @@ fn supervised_world(project: &Path) -> R {
 
 /// AC-021-03: a host killed with SIGKILL as its supervisor's step begins (cursor 120, seqs 121 to 125 committed and not
 /// taken in); the next host takes in only seqs after the cursor: one trigger with seqs 121 to 125, none for a seq up to
-/// 120, no new APPLIED decision, and the cursor at least 120.
+/// 120 (the same key's 100 not joined, the other key's 110 no trigger), no new APPLIED decision and the output its
+/// decision ended not disposed of again, and the cursor at least 120.
 #[test]
 fn test_021_03_a_host_killed_in_its_supervisors_step_wakes_once_for_what_it_had_not_taken_in() -> R
 {
@@ -4540,7 +4550,7 @@ fn test_021_03_a_host_killed_in_its_supervisors_step_wakes_once_for_what_it_had_
          print(json.dumps([r[0] for r in c.execute(\"SELECT seq FROM events WHERE kind = 'need_decision' ORDER BY seq\")]))",
         "",
     )?;
-    assert_eq!(seqs.trim(), "[121, 122, 123, 124, 125]");
+    assert_eq!(seqs.trim(), "[100, 110, 121, 122, 123, 124, 125]");
     // The first host dies by SIGKILL as its supervisor's first step begins.
     let killed = start_child(
         &project,
@@ -4594,6 +4604,13 @@ fn test_021_03_a_host_killed_in_its_supervisors_step_wakes_once_for_what_it_had_
     assert_eq!(
         read("SELECT count(*) FROM decisions WHERE state = 'APPLIED'")?,
         "1"
+    );
+    assert_eq!(
+        read(
+            "SELECT group_concat(seq) FROM events WHERE json_extract(payload_json, '$.output_id') = 'R/old/output/0'"
+        )?,
+        "115,116",
+        "the output its decision ended is not disposed of again"
     );
     let cursor: i64 =
         read("SELECT last_handled_seq FROM supervisor_cursor WHERE run_id = 'R'")?.parse()?;

@@ -854,24 +854,30 @@ impl Store {
     }
 
     /// One step of run `run_id`'s supervisor at `context.now()` (REQ-021, docs/adr/ADR-025.md decision 2): its events
-    /// after its cursor taken in, the triggers due fired as its state allows.
+    /// after its cursor taken in, a writer job per batch until it has caught up (so a cancel or a pause waits one batch
+    /// at most, v13), then the triggers due fired as its state allows.
     pub async fn supervise(
         &self,
         run_id: &str,
         context: crate::decision::Context,
     ) -> Result<Supervised, PersistError> {
-        match self
-            .writer
-            .runner(runner::RunnerJob::Supervise {
-                run_id: run_id.to_owned(),
-                context: Box::new(context),
-            })
-            .await?
-        {
-            runner::RunnerDone::Supervised(done) => Ok(done),
-            _ => Err(PersistError::IntegrityViolation(
-                "a supervisor step answered with something else".to_owned(),
-            )),
+        loop {
+            match self
+                .writer
+                .runner(runner::RunnerJob::Supervise {
+                    run_id: run_id.to_owned(),
+                    context: Box::new(context.clone()),
+                })
+                .await?
+            {
+                runner::RunnerDone::Supervised(Some(done)) => return Ok(done),
+                runner::RunnerDone::Supervised(None) => {}
+                _ => {
+                    return Err(PersistError::IntegrityViolation(
+                        "a supervisor step answered with something else".to_owned(),
+                    ));
+                }
+            }
         }
     }
 

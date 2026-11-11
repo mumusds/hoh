@@ -35,6 +35,10 @@ pub enum Decided {
     Replayed { state: String },
     /// Its decision id was decided before with other content: nothing written (KEY_REUSE).
     KeyReuse,
+    /// Past every fence, of a kind not applied yet (`request_user_decision`, `create_tasks`): its decisions row is
+    /// written PROPOSED inside the caller's transaction, nothing else (docs/adr/ADR-025.md v13 decision 8). [`decide`]
+    /// gives [`PersistError::Unsupported`] for it and writes nothing.
+    Unsupported { kind: &'static str },
 }
 
 /// See [`crate::ids::child_id`].
@@ -62,6 +66,9 @@ pub(super) fn decide(
 ) -> Result<Decided, PersistError> {
     let tx = super::writer::begin(conn, ctx)?;
     let decided = decide_in(&tx, proposal, context, ctx, None)?;
+    if let Decided::Unsupported { kind } = decided {
+        return Err(PersistError::Unsupported(kind));
+    }
     if !matches!(decided, Decided::Replayed { .. } | Decided::KeyReuse) {
         tx.commit().map_err(sqlite_error)?;
     }
@@ -207,7 +214,7 @@ pub(super) fn decide_in(
         },
     };
     let decided = match verdict {
-        Ok(Effect::Unsupported(kind)) => return Err(PersistError::Unsupported(kind)),
+        Ok(Effect::Unsupported(kind)) => return Ok(Decided::Unsupported { kind }),
         Ok(effect) => {
             let lease = match &effect {
                 Effect::Dispatch {

@@ -781,6 +781,47 @@ async fn test_043_04_pause_and_cancel_take_effect_with_the_commander_down() -> R
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_whose_supervisor_step_fails_holds_up_no_other_run() -> R {
+    // M2T08R-51 (docs/adr/ADR-025.md v13 decision 5): a supervisor step that fails is isolated to its run: run X, older
+    // than R, has a trigger its step cannot read, so each of its steps fails; R's task is still dispatched and runs.
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let agents = Arc::new(Agents::new(&[("T1", "sleep 3")]));
+    let _leaders = Leaders(agents.leaders.clone());
+    let (project, host) = host_seeded(
+        dir.path(),
+        &agents,
+        None,
+        "INSERT INTO runs(run_id, project_id, spec_id, state, mode, revision, created_at) VALUES
+           ('X', :p, 's1', 'RUNNING', 'AUTO', 1, '2026-11-06T00:00:00Z');
+         INSERT INTO sessions(session_id, agent, role, agent_version, capabilities_json) VALUES
+           ('sx', 'codex', 'commander', '1', '{}');
+         INSERT INTO role_bindings(run_id, role, agent, session_id, role_epoch, config_revision, bound_at) VALUES
+           ('X', 'commander', 'codex', 'sx', 1, 1, '2026-11-06T00:00:00Z');
+         INSERT INTO supervisor_triggers(trigger_id, run_id, fingerprint, spec_id, severity, event_seqs_json, first_seq,
+           last_seq, due_at, state, created_at) VALUES
+           ('X/trigger/1', 'X', 'fp', 's1', 'high', '[\"unreadable\"]', 1, 1, '2000-01-01T00:00:00.000Z', 'PENDING',
+            '2000-01-01T00:00:00.000Z');",
+    )
+    .await?;
+    until(
+        &project,
+        "SELECT state FROM attempts WHERE task_id = 'T1'",
+        "RUNNING",
+        Duration::from_secs(10),
+    )
+    .await?;
+    assert_eq!(
+        query(
+            &project,
+            "SELECT state FROM supervisor_triggers WHERE trigger_id = 'X/trigger/1'"
+        )?,
+        "PENDING"
+    );
+    host.shutdown().await;
+    Ok(())
+}
+
 /// Wait until `sql` gives a number at least `least`, for at most `limit`.
 async fn until_at_least(project: &Path, sql: &str, least: i64, limit: Duration) -> R {
     let end = Instant::now() + limit;
