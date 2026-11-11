@@ -3472,3 +3472,140 @@ async fn a_turn_reconciled_to_an_unknown_effect_has_ended_and_its_wake_is_rearme
     assert_eq!(rearms(&path)?[0]["reason"], json!("failure"));
     Ok(())
 }
+
+// Implementation review round 4 (docs/adr/ADR-025.md v18: the two tables item by item).
+
+#[tokio::test]
+async fn a_registry_fault_recorded_follows_its_agent_through_a_handover_under_the_same_reason() -> R
+{
+    // M2T08R-300 (decision 5's reasons table, v18): codex unavailable blocks the run; handed to claude, also
+    // unavailable, the record is rewritten for claude though the reason's name is the same; a new host with no look
+    // yet keeps the run BLOCKED (the recorded fault is the current agent's).
+    use crate::decision::Observation;
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    wake(&store, &clock, "R", "D", "fp", 0).await?;
+    let look = |agent: &str, n, ms| Context {
+        observations: Some(
+            [(
+                agent.to_owned(),
+                Observation {
+                    host_epoch: 1,
+                    n,
+                    available: false,
+                    logged_in: true,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        ),
+        ..context(&clock, ms)
+    };
+    store.supervise("R", look("codex", 100, 3000)).await?;
+    assert_eq!(blocked(&path)?.0, "BLOCKED");
+    exec(
+        &path,
+        "INSERT INTO sessions(session_id, agent, role, agent_version, capabilities_json) VALUES
+           ('sc3', 'claude', 'commander', '1', '{}');
+         UPDATE role_bindings SET agent = 'claude', session_id = 'sc3', role_epoch = 2
+           WHERE run_id = 'R' AND role = 'commander';",
+    )?;
+    store.supervise("R", look("claude", 2, 4000)).await?;
+    store
+        .allocate_supervision("p1", look("claude", 2, 4000))
+        .await?;
+    assert_eq!(
+        value(
+            &path,
+            "SELECT json_extract(payload_json, '$.observation.agent') FROM events \
+             WHERE kind = 'supervisor.unavailable' ORDER BY seq DESC LIMIT 1"
+        )?,
+        json!("claude")
+    );
+    store.supervise("R", context(&clock, 5000)).await?;
+    assert!(
+        store
+            .allocate_supervision("p1", context(&clock, 5000))
+            .await?
+            .is_none()
+    );
+    assert_eq!(
+        blocked(&path)?.0,
+        "BLOCKED",
+        "no look of claude found it available"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_disposal_job_is_budgeted_by_the_snapshots_its_decisions_compare() -> R {
+    // M2T08R-301 (decision 2's jobs table, v18): a turn shown 12 000 tasks answers with three decisions; one disposal
+    // job compares one decision's 12 000 snapshots and stops (more left); the step's jobs dispose of all three.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    exec(
+        &path,
+        "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 11999)
+         INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq)
+         SELECT 'T' || i, 'R', 's3', 'PENDING', 1, 'developer', 0, 10 + i FROM n;",
+    )?;
+    clock.set(0);
+    for c in 0..12 {
+        store
+            .commit(Commit {
+                events: (0..1000)
+                    .map(|i| NewEvent {
+                        project_id: "p1".to_owned(),
+                        event_id: format!("nd/{c}/{i}"),
+                        run_id: Some("R".to_owned()),
+                        kind: "need_decision".to_owned(),
+                        payload: json!({"task_id": format!("T{}", c * 1000 + i), "fingerprint": "many"}),
+                    })
+                    .collect(),
+                ..Commit::default()
+            })
+            .await?;
+    }
+    let w = store.supervise("R", context(&clock, 2000)).await?.fired[0]
+        .trigger_id
+        .clone();
+    let a = store
+        .allocate_supervision("p1", context(&clock, 2100))
+        .await?
+        .ok_or("allocated")?;
+    let nonce = nonce_of(&path, &a.attempt_id)?;
+    let lines: Vec<String> = (0..3)
+        .map(|i| {
+            line(
+                &nonce,
+                output(
+                    &format!("m{i}"),
+                    "decision",
+                    &w,
+                    &a.attempt_id,
+                    1,
+                    assumption(),
+                ),
+            )
+        })
+        .collect();
+    observed(&store, &clock, &a.attempt_id, 2200, &lines).await?;
+    settled(&store, &a.attempt_id, 2300).await?;
+    let mut conn = Connection::open(&path)?;
+    let ctx = crate::persistence::writer::Ctx::quiet();
+    assert!(super::super::supervise::dispose(
+        &mut conn,
+        "R",
+        i64::MAX,
+        &context(&clock, 2400),
+        &ctx
+    )?);
+    assert_eq!(ends(&path)?.len(), 1);
+    store.supervise("R", context(&clock, 2500)).await?;
+    assert_eq!(ends(&path)?.len(), 3);
+    Ok(())
+}
