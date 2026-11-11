@@ -25,6 +25,7 @@ mod results;
 mod retry;
 mod rounds;
 mod runner;
+mod supervise;
 mod team;
 pub use control::{CancelPass, Finished, PauseStep};
 pub use handover::SessionStart;
@@ -36,6 +37,7 @@ pub use results::{TaskResultOutcome, VERIFIERS};
 pub use retry::{Failure, Paced, Repair, RepairRequest, RepairVerdict};
 pub use rounds::{Dispatched, RoundOutcome};
 pub use runner::{DispatchNotice, Ending, Observed, PromptRecord, RUNNER, Waiting};
+pub use supervise::{Fired, Supervised};
 pub use team::{
     Assignment, Availability, FileTeam, SessionGrant, TeamChange, TeamConfig, TeamMember, TeamView,
     Unbound, session_id,
@@ -836,6 +838,28 @@ impl Store {
     /// One look at run `run_id` as a whole at `context.now()` (ADR-020 decisions 4, 5 and 7): woken from
     /// WAITING_EXTERNAL when a retry is due; BLOCKED for a cost limit it cannot enforce, a task its session cannot run
     /// or nothing able to move on; INCOMPLETE when its budget stops it; WAITING_EXTERNAL when only retries are left.
+    /// One step of run `run_id`'s supervisor at `context.now()` (REQ-021, docs/adr/ADR-025.md decision 2): its events
+    /// after its cursor taken in, the triggers due fired.
+    pub async fn supervise(
+        &self,
+        run_id: &str,
+        context: crate::decision::Context,
+    ) -> Result<Supervised, PersistError> {
+        match self
+            .writer
+            .runner(runner::RunnerJob::Supervise {
+                run_id: run_id.to_owned(),
+                context: Box::new(context),
+            })
+            .await?
+        {
+            runner::RunnerDone::Supervised(done) => Ok(done),
+            _ => Err(PersistError::IntegrityViolation(
+                "a supervisor step answered with something else".to_owned(),
+            )),
+        }
+    }
+
     pub async fn pace_run(
         &self,
         run_id: &str,

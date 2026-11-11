@@ -23,6 +23,35 @@ pub fn now_rfc3339() -> String {
     rfc3339_utc(SystemTime::now())
 }
 
+/// `at` in UTC to the millisecond, fixed width (`YYYY-MM-DDTHH:MM:SS.mmmZ`), so two such times compare as text: the
+/// supervisor's trigger times, which REQ-021's debounce needs finer than a second (docs/adr/ADR-025.md decision 2).
+pub fn rfc3339_millis_utc(at: SystemTime) -> String {
+    let base = rfc3339_utc(at);
+    let millis = at
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_millis())
+        .unwrap_or(0);
+    format!("{}.{millis:03}Z", base.trim_end_matches('Z'))
+}
+
+/// The instant of a contract `date-time` to the millisecond: [`parse_rfc3339`] and its fraction's first three digits.
+pub fn parse_rfc3339_millis(text: &str) -> Option<SystemTime> {
+    let whole = parse_rfc3339(text)?;
+    let fraction: String = text
+        .get(19..)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .map(|digits| digits.chars().take_while(char::is_ascii_digit).collect())
+        .unwrap_or_default();
+    let millis: u64 = fraction
+        .chars()
+        .chain(std::iter::repeat('0'))
+        .take(3)
+        .collect::<String>()
+        .parse()
+        .ok()?;
+    Some(whole + std::time::Duration::from_millis(millis))
+}
+
 /// The latest instant the store's fixed-width form can write: 9999-12-31T23:59:59Z.
 const LAST: u64 = 253_402_300_799;
 
@@ -133,6 +162,23 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn a_millisecond_time_round_trips_and_compares_as_text() {
+        // docs/adr/ADR-025.md decision 2: the supervisor's trigger times.
+        let at = UNIX_EPOCH + Duration::from_millis(1_793_754_123_045);
+        assert_eq!(rfc3339_millis_utc(at), "2026-11-04T01:02:03.045Z");
+        assert_eq!(parse_rfc3339_millis("2026-11-04T01:02:03.045Z"), Some(at));
+        assert_eq!(
+            parse_rfc3339_millis("2026-11-04T01:02:03Z"),
+            Some(at - Duration::from_millis(45))
+        );
+        assert_eq!(parse_rfc3339_millis("2026-11-04T01:02:03.0459Z"), Some(at));
+        assert!(
+            rfc3339_millis_utc(at + Duration::from_millis(955))
+                > rfc3339_millis_utc(at + Duration::from_millis(100))
+        );
+    }
 
     #[test]
     fn formats_known_instants() {

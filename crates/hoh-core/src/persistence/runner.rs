@@ -87,6 +87,11 @@ pub(super) enum RunnerJob {
     },
     /// One more repair, or its refusal for a decision (ADR-020 decision 10).
     Repair(Box<super::retry::RepairRequest>),
+    /// One step of a run's supervisor (docs/adr/ADR-025.md decision 2).
+    Supervise {
+        run_id: String,
+        context: Box<crate::decision::Context>,
+    },
     /// One look at a run as a whole (ADR-020 decisions 4, 5 and 7).
     Pace {
         run_id: String,
@@ -117,6 +122,7 @@ pub(super) enum RunnerDone {
     /// How many leases were renewed.
     Renewed(usize),
     Paced(super::retry::Paced),
+    Supervised(super::supervise::Supervised),
     Repair(super::retry::RepairVerdict),
 }
 
@@ -212,6 +218,9 @@ pub(super) fn run(
         }
         RunnerJob::Repair(request) => {
             super::retry::request_repair(conn, &request, ctx).map(RunnerDone::Repair)
+        }
+        RunnerJob::Supervise { run_id, context } => {
+            super::supervise::step(conn, &run_id, &context, ctx).map(RunnerDone::Supervised)
         }
         RunnerJob::SessionStart(message_id, delivered_to) => {
             super::handover::settle(conn, &message_id, delivered_to.as_deref(), ctx)
