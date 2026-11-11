@@ -175,16 +175,10 @@ fn a_pi_session_id_is_uuid_shaped_and_the_same_for_its_hoh_session() {
 }
 
 #[test]
-fn a_turns_facts_become_its_outcome_with_the_prompt_it_was_sent() {
+fn a_turns_facts_become_its_outcome() {
     // Decision 12: the verdict, the failure code as the reason and its class, the group's end, and what the turn showed
-    // (events in order, the agent's own session, model, usage, the raw logs, the prompt record).
-    let prompt = PromptRecord {
-        layer: "builtin".to_owned(),
-        role: "developer".to_owned(),
-        path: "resources/prompts/developer.md".to_owned(),
-        content_sha256: "c".repeat(64),
-        sent_sha256: "s".repeat(64),
-    };
+    // (events in order, the agent's own session, model, usage, the raw logs). The prompt record is no longer part of
+    // it: it is recorded when the attempt is marked RUNNING (docs/adr/ADR-026.md decision 7).
     let facts = Facts {
         state: AttemptState::Failed,
         failure: Some("PROTOCOL_FRAME_TOO_LARGE".to_owned()),
@@ -204,7 +198,7 @@ fn a_turns_facts_become_its_outcome_with_the_prompt_it_was_sent() {
         ],
         degraded: Some("initialize timed out".to_owned()),
     };
-    let o = outcome(facts, prompt.clone());
+    let o = outcome(facts);
     assert!(!o.success);
     assert_eq!(o.detail, "PROTOCOL_FRAME_TOO_LARGE");
     assert!(o.group_gone);
@@ -212,7 +206,7 @@ fn a_turns_facts_become_its_outcome_with_the_prompt_it_was_sent() {
     assert_eq!(o.observed.native_session.as_deref(), Some("n-1"));
     assert_eq!(o.observed.resolved_model.as_deref(), Some("m"));
     assert_eq!(o.observed.raw_log_path.as_deref(), Some("/logs"));
-    assert_eq!(o.observed.prompt, Some(prompt));
+    assert_eq!(o.observed.prompt, None);
     // A degraded App Server's event is the adapter's own, recorded once (M2T07R-201).
     let kinds: Vec<&str> = o.observed.events.iter().map(|e| e.1.as_str()).collect();
     assert_eq!(kinds, ["adapter.diagnostic"]);

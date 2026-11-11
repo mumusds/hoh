@@ -473,6 +473,7 @@ async fn an_ending_records_what_the_agents_turn_showed() -> R {
                         path: ".hoh/prompts/developer.md".to_owned(),
                         content_sha256: format!("{:064}", 7),
                         sent_sha256: format!("{:064}", 8),
+                    packed: None,
                     }),
                     events: vec![(
                         "frame-too-large".to_owned(),
@@ -1246,6 +1247,7 @@ fn two_prompt_files_of_the_same_content_are_two_sources() {
         path: path.to_owned(),
         content_sha256: "c".repeat(64),
         sent_sha256: "s".repeat(64),
+        packed: None,
     };
     assert_ne!(
         record(".hoh/prompts/a.md").revision_id(),
@@ -1330,5 +1332,88 @@ async fn a_refusal_the_same_input_would_meet_again_blocks_its_task_for_a_decisio
             .await?
             .is_empty()
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_turns_prompt_is_recorded_in_the_commit_that_marks_it_running() -> R {
+    // docs/adr/ADR-026.md decision 7 (M2T09D-02): the record is written before the start gate opens, so an attempt a
+    // reconcile settles after a crash between its effect's commit and its end still has it.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(WORLD)?;
+    let clock = at("2026-11-07T00:00:00Z")?;
+    let dispatched = tick(&store, clock).await?;
+    let [attempt] = dispatched.as_slice() else {
+        return Err(format!("dispatched {dispatched:?}").into());
+    };
+    let notice = store
+        .runner_waiting("p1")
+        .await?
+        .dispatches
+        .into_iter()
+        .find(|d| &d.attempt_id == attempt)
+        .ok_or("no dispatch notice")?;
+    assert!(store.runner_received(notice, clock).await?);
+    let object = "ab".repeat(32);
+    let prompt = crate::persistence::PromptRecord {
+        layer: "builtin".to_owned(),
+        role: "developer".to_owned(),
+        path: "resources/prompts/developer.md".to_owned(),
+        content_sha256: "c".repeat(64),
+        sent_sha256: "d".repeat(64),
+        packed: Some(crate::persistence::Packing {
+            resource_bundle_version: "0.0.0+fixture".to_owned(),
+            event: json!({"prompt_sha256": "d".repeat(64), "manifest": object}),
+            artifacts: vec![crate::persistence::ArtifactRow {
+                sha256: object.clone(),
+                path: format!(".hoh/objects/sha256/ab/{object}"),
+                bytes: 12,
+                mime: "application/json".to_owned(),
+            }],
+        }),
+    };
+    assert!(
+        store
+            .runner_running_with(
+                attempt,
+                crate::persistence::AttemptFacts {
+                    pid: Some(4242),
+                    ..Default::default()
+                },
+                json!({"kind": "proc"}),
+                Some(prompt),
+            )
+            .await?
+    );
+    let conn = Connection::open(&path)?;
+    let (state, sent, bundle, revision): (String, String, String, String) = conn.query_row(
+        "SELECT state, prompt_sha256, resource_bundle_version, prompt_revision FROM attempts WHERE attempt_id = ?1",
+        [attempt],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )?;
+    assert_eq!(
+        (state.as_str(), sent, bundle.as_str()),
+        ("RUNNING", "d".repeat(64), "0.0.0+fixture")
+    );
+    let layer: String = conn.query_row(
+        "SELECT layer FROM prompt_revisions WHERE revision_id = ?1",
+        [&revision],
+        |r| r.get(0),
+    )?;
+    assert_eq!(layer, "builtin");
+    let packed: String = conn.query_row(
+        "SELECT payload_json FROM events WHERE kind = 'context.packed' AND json_extract(payload_json, '$.attempt_id') = ?1",
+        [attempt],
+        |r| r.get(0),
+    )?;
+    let packed: Value = serde_json::from_str(&packed)?;
+    assert_eq!(packed["manifest"], json!(object));
+    let artifact: (String, i64) = conn.query_row(
+        "SELECT path, bytes FROM artifacts WHERE sha256 = ?1",
+        [&object],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    assert_eq!(artifact, (format!(".hoh/objects/sha256/ab/{object}"), 12));
     Ok(())
 }

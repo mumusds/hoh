@@ -284,6 +284,7 @@ impl hoh_app::host::Executor for Agents {
             pid,
             gate,
             ended: reaping(child),
+            prompt: None,
         })
     }
 
@@ -2381,7 +2382,12 @@ impl hoh_app::host::Executor for LeavesItsGroup {
                 unknown_effect: false,
             });
         });
-        Ok(hoh_app::host::Started { pid, gate, ended })
+        Ok(hoh_app::host::Started {
+            pid,
+            gate,
+            ended,
+            prompt: None,
+        })
     }
 }
 

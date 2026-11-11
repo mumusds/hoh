@@ -39,7 +39,9 @@ pub use reconcile::{EffectRow, UnfinishedRow};
 pub use results::{TaskResultOutcome, VERIFIERS};
 pub use retry::{Failure, Paced, Repair, RepairRequest, RepairVerdict};
 pub use rounds::{Dispatched, RoundOutcome};
-pub use runner::{DispatchNotice, Ending, Observed, PromptRecord, RUNNER, Waiting};
+pub use runner::{
+    ArtifactRow, DispatchNotice, Ending, Observed, Packing, PromptRecord, RUNNER, Waiting,
+};
 pub use supervise::{Fired, Supervised};
 pub use team::{
     Assignment, Availability, FileTeam, SessionGrant, TeamChange, TeamConfig, TeamMember, TeamView,
@@ -808,10 +810,24 @@ impl Store {
         facts: AttemptFacts,
         tracking: serde_json::Value,
     ) -> Result<bool, PersistError> {
+        self.runner_running_with(attempt_id, facts, tracking, None)
+            .await
+    }
+
+    /// [`Store::runner_running`] with the prompt the attempt is about to be sent, recorded in the same commit, before
+    /// its start gate opens (docs/adr/ADR-026.md decision 7).
+    pub async fn runner_running_with(
+        &self,
+        attempt_id: &str,
+        facts: AttemptFacts,
+        tracking: serde_json::Value,
+        prompt: Option<PromptRecord>,
+    ) -> Result<bool, PersistError> {
         self.runner_step(runner::RunnerJob::Running {
             attempt_id: attempt_id.to_owned(),
             facts: Box::new(facts),
             tracking,
+            prompt: prompt.map(Box::new),
         })
         .await
     }

@@ -580,7 +580,12 @@ impl hoh_app::host::Executor for Sixty {
                 unknown_effect: false,
             });
         });
-        Ok(hoh_app::host::Started { pid, gate, ended })
+        Ok(hoh_app::host::Started {
+            pid,
+            gate,
+            ended,
+            prompt: None,
+        })
     }
 }
 

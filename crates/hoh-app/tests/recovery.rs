@@ -197,7 +197,12 @@ impl hoh_app::host::Executor for FakeExecutor {
         let pid = child.id();
         let gate = gate(&mut child);
         let ended = reaping(child);
-        Ok(hoh_app::host::Started { pid, gate, ended })
+        Ok(hoh_app::host::Started {
+            pid,
+            gate,
+            ended,
+            prompt: None,
+        })
     }
 }
 
@@ -286,7 +291,12 @@ impl hoh_app::host::Executor for FailingExecutor {
         let pid = child.id();
         let gate = gate(&mut child);
         let ended = reaping_with(child, Duration::ZERO, Some(self.0));
-        Ok(hoh_app::host::Started { pid, gate, ended })
+        Ok(hoh_app::host::Started {
+            pid,
+            gate,
+            ended,
+            prompt: None,
+        })
     }
 }
 
@@ -1593,7 +1603,12 @@ impl hoh_app::host::Executor for StuckExecutor {
     ) -> Result<hoh_app::host::Started, hoh_app::host::Refusal> {
         let (child, pid, gate) = self.spawn()?;
         let ended = reaping(child);
-        Ok(hoh_app::host::Started { pid, gate, ended })
+        Ok(hoh_app::host::Started {
+            pid,
+            gate,
+            ended,
+            prompt: None,
+        })
     }
 
     fn cancel(&self, work: &hoh_app::host::Work) -> bool {
@@ -2927,7 +2942,12 @@ impl hoh_app::host::Executor for LeavesAMember {
         } else {
             reaping(child)
         };
-        Ok(hoh_app::host::Started { pid, gate, ended })
+        Ok(hoh_app::host::Started {
+            pid,
+            gate,
+            ended,
+            prompt: None,
+        })
     }
 }
 
@@ -3438,6 +3458,7 @@ impl hoh_app::host::Executor for Faulty {
                     Err("no process".to_owned())
                 }),
                 ended,
+                prompt: None,
             });
         }
         let started = self.inner.start(work)?;
@@ -3532,7 +3553,12 @@ impl hoh_app::host::Executor for Cancellable {
     ) -> Result<hoh_app::host::Started, hoh_app::host::Refusal> {
         let (child, pid, gate) = self.0.spawn()?;
         let ended = reaping_after(child, Duration::from_millis(100));
-        Ok(hoh_app::host::Started { pid, gate, ended })
+        Ok(hoh_app::host::Started {
+            pid,
+            gate,
+            ended,
+            prompt: None,
+        })
     }
 
     fn cancel(&self, work: &hoh_app::host::Work) -> bool {
@@ -3628,7 +3654,12 @@ impl hoh_app::host::Executor for LeaderOnlyCancel {
                 unknown_effect: false,
             });
         });
-        Ok(hoh_app::host::Started { pid, gate, ended })
+        Ok(hoh_app::host::Started {
+            pid,
+            gate,
+            ended,
+            prompt: None,
+        })
     }
 
     fn cancel(&self, work: &hoh_app::host::Work) -> bool {
