@@ -2561,7 +2561,7 @@
     }
    ],
    "decisions": [
-    "产品中对相同内容重复冻结：选择返回已有 candidate_id，不新增行。自举工具 tools/candidate.py 则拒绝覆盖已存在的清单文件。",
+    "产品中对相同内容重复冻结：同一 Run 内返回已有 candidate_id 与它的状态，不新增行；已是 STALE、INVALID、REJECTED 的不复活；另一 Run 冻结相同内容时拒绝并说明（产生新的提交后再冻结），不复用另一 Run 的候选与它的验收。自举工具 tools/candidate.py 则拒绝覆盖已存在的清单文件。",
     "符号链接和子模块：选择拒绝冻结，直到实现显式身份规则并有测试。",
     "evidence.outcome 枚举里没有 INSUFFICIENT。选择存为 outcome=INVALID，并附原因码 INSUFFICIENT。",
     "（CR-003）测试名约定：测试名含 `test_NNN_MM` 片段即覆盖 TEST-NNN-MM；检查脚本把逐测试结果写入 $HOH_EVIDENCE_DIR/test-results.jsonl（contracts/test-result.schema.json）。"
