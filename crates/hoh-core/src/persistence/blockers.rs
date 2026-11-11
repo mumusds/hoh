@@ -162,6 +162,11 @@ impl Claims {
         }
     }
 
+    /// Whether `source` holds any open claim.
+    pub(super) fn held_by(&self, source: &str) -> bool {
+        self.open.iter().any(|(s, _)| s == source)
+    }
+
     /// The run's blocker set: the reasons of its open claims, by precedence.
     pub(super) fn reasons(&self) -> Vec<BlockedReason> {
         ordered(self.open.iter().map(|(_, r)| *r))

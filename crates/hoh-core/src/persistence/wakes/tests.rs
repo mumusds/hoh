@@ -1072,3 +1072,259 @@ async fn a_turn_past_its_limit_is_stopped_and_counts_as_a_failure() -> R {
     );
     Ok(())
 }
+
+/// R's state, blocked reasons and the supervisor's open claims (`reason source`).
+fn blocked(path: &PathBuf) -> R<(String, Value, Vec<String>)> {
+    let (state, reasons): (String, String) = Connection::open(path)?.query_row(
+        "SELECT state, blocked_reasons_json FROM runs WHERE run_id = 'R'",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let conn = Connection::open(path)?;
+    let mut s = conn.prepare(
+        "SELECT kind, json_extract(payload_json, '$.reason'), json_extract(payload_json, '$.source') FROM events \
+         WHERE run_id = 'R' AND kind IN ('run.blocker_claimed', 'run.blocker_released') ORDER BY seq",
+    )?;
+    let mut open: Vec<String> = Vec::new();
+    for row in s.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })? {
+        let (kind, reason, source) = row?;
+        let claim = format!("{reason} {source}");
+        if kind == "run.blocker_claimed" {
+            open.push(claim);
+        } else {
+            open.retain(|c| *c != claim);
+        }
+    }
+    Ok((state, serde_json::from_str(&reasons)?, open))
+}
+
+fn unavailable(path: &PathBuf) -> R<Vec<Value>> {
+    let conn = Connection::open(path)?;
+    let mut s = conn.prepare(
+        "SELECT kind, json_extract(payload_json, '$.reasons') FROM events WHERE run_id = 'R' \
+         AND kind IN ('supervisor.unavailable', 'supervisor.available') ORDER BY seq",
+    )?;
+    let rows = s
+        .query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.into_iter()
+        .map(|(kind, reasons)| {
+            Ok(json!([
+                kind,
+                reasons
+                    .map(|r| serde_json::from_str::<Value>(&r))
+                    .transpose()?
+            ]))
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_run_whose_commander_is_unavailable_is_blocked_while_it_owes_a_decision() -> R {
+    // M2-T08 done_when; docs/adr/ADR-025.md decision 5: the commander's binding BLOCKED makes it unavailable; with a
+    // need_decision wake owed the run is BLOCKED by the supervisor's claims (COMMANDER_UNAVAILABLE, NEED_DECISION) and
+    // nothing is allocated; the binding ACTIVE again, the claims are released, the run is back at work and the wake is
+    // allocated. Unavailable with nothing owed blocks nothing.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(
+        &path,
+        &format!(
+            "{WORLD}
+             UPDATE role_bindings SET state = 'BLOCKED', blocked_reason = 'BLOCKED_AUTH' WHERE run_id = 'R' AND role = 'commander';"
+        ),
+    )?;
+    store.supervise("R", context(&clock, 0)).await?;
+    assert_eq!(blocked(&path)?.0, "RUNNING", "nothing owed: not blocked");
+    let w = wake(&store, &clock, "R", "D", "fp", 100).await?;
+    assert_eq!(
+        blocked(&path)?,
+        (
+            "BLOCKED".to_owned(),
+            json!(["COMMANDER_UNAVAILABLE", "NEED_DECISION"]),
+            vec![
+                "COMMANDER_UNAVAILABLE supervisor".to_owned(),
+                "NEED_DECISION supervisor".to_owned()
+            ]
+        )
+    );
+    assert_eq!(
+        unavailable(&path)?,
+        [json!(["supervisor.unavailable", ["binding_blocked"]])]
+    );
+    assert_eq!(
+        value(
+            &path,
+            "SELECT count(*) FROM events WHERE kind = 'supervisor.blocked'"
+        )?,
+        json!(1)
+    );
+    assert!(
+        store
+            .allocate_supervision("p1", context(&clock, 3000))
+            .await?
+            .is_none()
+    );
+    exec(
+        &path,
+        "UPDATE role_bindings SET state = 'ACTIVE', blocked_reason = NULL WHERE run_id = 'R' AND role = 'commander';",
+    )?;
+    store.supervise("R", context(&clock, 4000)).await?;
+    assert_eq!(
+        blocked(&path)?,
+        ("RUNNING".to_owned(), json!([]), Vec::<String>::new())
+    );
+    assert_eq!(
+        unavailable(&path)?,
+        [
+            json!(["supervisor.unavailable", ["binding_blocked"]]),
+            json!(["supervisor.available", null])
+        ]
+    );
+    let a = store
+        .allocate_supervision("p1", context(&clock, 4100))
+        .await?
+        .ok_or("allocated once available")?;
+    assert_eq!(a.wake, w);
+    Ok(())
+}
+
+/// Fail the wake's turns until it has `n` failures, each allocated after the previous backoff; the time after.
+async fn fail_turns(
+    store: &Store,
+    clock: &TestClock,
+    n: usize,
+    mut ms: u64,
+    class: crate::retry::FailureClass,
+) -> R<u64> {
+    for i in 0..n {
+        let a = store
+            .allocate_supervision("p1", context(clock, ms))
+            .await?
+            .ok_or(format!("failure {i}: allocated"))?;
+        run_turn(store, clock, &a.attempt_id, ms, false, class).await?;
+        ms += 301_000;
+    }
+    Ok(ms)
+}
+
+#[tokio::test]
+async fn a_wake_failing_up_to_its_cap_blocks_its_run_until_a_probe_of_it_settles() -> R {
+    // M2T08D-950, -1054 (decisions 3 and 5): MAX_RETRIES failures of one wake under the current epoch make the
+    // Commander unavailable: the run is BLOCKED, no ordinary allocation; past the cooldown one probe is allocated, to
+    // the capped wake, on the BLOCKED run; once it settles the supervisor's claims are released and the run works.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    let w = wake(&store, &clock, "R", "D", "fp", 0).await?;
+    let mut ms = fail_turns(&store, &clock, 8, 3000, TRANSIENT).await?;
+    // The eighth failure's rearm, then the step that judges it.
+    assert!(
+        store
+            .allocate_supervision("p1", context(&clock, ms))
+            .await?
+            .is_none()
+    );
+    store.supervise("R", context(&clock, ms)).await?;
+    assert_eq!(
+        blocked(&path)?.1,
+        json!(["COMMANDER_UNAVAILABLE", "NEED_DECISION"])
+    );
+    assert_eq!(
+        unavailable(&path)?,
+        [json!(["supervisor.unavailable", ["failures_capped"]])]
+    );
+    // Within the cooldown: no probe.
+    assert!(
+        store
+            .allocate_supervision("p1", context(&clock, ms + 1000))
+            .await?
+            .is_none()
+    );
+    ms += 300_000;
+    let probe = store
+        .allocate_supervision("p1", context(&clock, ms))
+        .await?
+        .ok_or("the probe")?;
+    assert_eq!(probe.wake, w);
+    assert_eq!(
+        blocked(&path)?.0,
+        "BLOCKED",
+        "the probe runs on the BLOCKED run"
+    );
+    assert_eq!(
+        value(
+            &path,
+            "SELECT json_extract(payload_json, '$.wake') FROM events WHERE kind = 'supervisor.probe'"
+        )?,
+        json!(w)
+    );
+    run_turn(&store, &clock, &probe.attempt_id, ms, true, TRANSIENT).await?;
+    store.supervise("R", context(&clock, ms + 1000)).await?;
+    assert_eq!(
+        blocked(&path)?,
+        ("RUNNING".to_owned(), json!([]), Vec::<String>::new())
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn failures_of_an_earlier_epoch_and_an_auth_failure_are_judged_by_the_current_commander() -> R
+{
+    // M2T08D-1054a (decision 5): a handover to a new Commander epoch leaves its failures behind: available at once; an
+    // Auth failure of a turn makes it unavailable at once (reason auth).
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    wake(&store, &clock, "R", "D", "fp", 0).await?;
+    let ms = fail_turns(&store, &clock, 8, 3000, TRANSIENT).await?;
+    store
+        .allocate_supervision("p1", context(&clock, ms))
+        .await?;
+    store.supervise("R", context(&clock, ms)).await?;
+    assert_eq!(blocked(&path)?.0, "BLOCKED");
+    exec(
+        &path,
+        "UPDATE role_bindings SET role_epoch = 2 WHERE run_id = 'R' AND role = 'commander';",
+    )?;
+    store.supervise("R", context(&clock, ms + 1000)).await?;
+    assert_eq!(
+        blocked(&path)?.0,
+        "RUNNING",
+        "the new epoch has no failures"
+    );
+    let a = store
+        .allocate_supervision("p1", context(&clock, ms + 2000))
+        .await?
+        .ok_or("allocated at the new epoch")?;
+    run_turn(
+        &store,
+        &clock,
+        &a.attempt_id,
+        ms + 2000,
+        false,
+        crate::retry::FailureClass::Auth,
+    )
+    .await?;
+    store
+        .allocate_supervision("p1", context(&clock, ms + 3000))
+        .await?;
+    store.supervise("R", context(&clock, ms + 3000)).await?;
+    assert_eq!(blocked(&path)?.0, "BLOCKED");
+    assert_eq!(
+        unavailable(&path)?.last().cloned(),
+        Some(json!(["supervisor.unavailable", ["auth"]]))
+    );
+    Ok(())
+}
