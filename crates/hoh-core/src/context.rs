@@ -38,8 +38,12 @@ pub fn estimate(text: &str) -> u64 {
 
 /// The three classes' shares of `remaining` tokens: floors of 45, 35 and 20 percent.
 pub fn shares(remaining: u64) -> [u64; 3] {
+    shares_of(remaining, SHARES)
+}
+
+fn shares_of(remaining: u64, percent: [u64; 3]) -> [u64; 3] {
     // In u128 so no remaining overflows; each share is at most `remaining`, so it fits back in u64.
-    SHARES.map(|percent| (u128::from(remaining) * u128::from(percent) / 100) as u64)
+    percent.map(|p| (u128::from(remaining) * u128::from(p.min(100)) / 100) as u64)
 }
 
 /// The truncation policy every packed prompt records.
@@ -100,6 +104,9 @@ pub struct Mandatory {
     pub task: String,
     pub evidence: String,
     pub lead: String,
+    /// The schemas the role hands back (`output_schemas`): placed at the end of the task layer's items, counted with
+    /// the role contract (docs/15; docs/adr/ADR-026.md decision 3).
+    pub schemas: String,
 }
 
 /// A candidate for the remaining budget. The caller gives the scores; the packer computes the sha256 of `text`.
@@ -223,6 +230,23 @@ pub fn pack(
     entries: &[Entry],
     budget: u64,
 ) -> Result<Packed, PackError> {
+    pack_with(template, mandatory, entries, budget, SHARES)
+}
+
+/// [`pack`] with the run's own shares, in percent of what the mandatory items leave (its configuration snapshot,
+/// docs/adr/ADR-026.md decision 7); together at most 100.
+pub fn pack_with(
+    template: &str,
+    mandatory: &Mandatory,
+    entries: &[Entry],
+    budget: u64,
+    percent: [u64; 3],
+) -> Result<Packed, PackError> {
+    if percent.iter().sum::<u64>() > 100 {
+        return Err(PackError::Template(format!(
+            "shares {percent:?} exceed 100"
+        )));
+    }
     let parts = Template::parse(template)?;
     let (base, _) = base_layers(mandatory, parts.first(), &ZERO_SHA)?;
     let required = estimate(&parts.fill(&base));
@@ -232,7 +256,7 @@ pub fn pack(
             available: budget,
         });
     }
-    let caps = shares(budget - required);
+    let caps = shares_of(budget - required, percent);
     // Rank each class's entries by one total order; an entry given twice (same path and text) counts once.
     let mut ranked: Vec<(&Entry, String)> = entries
         .iter()
@@ -249,9 +273,9 @@ pub fn pack(
             .then(a.summary.cmp(&b.summary))
             .then((a.kind == Kind::Memory).cmp(&(b.kind == Kind::Memory)))
     });
-    ranked.dedup_by(|(b, b_sha), (a, a_sha)| {
-        a.class == b.class && a.path == b.path && a_sha == b_sha
-    });
+    // One per (class, path, sha256), the first in that order (M2T09D-157): not only adjacent ones.
+    let mut seen = std::collections::BTreeSet::new();
+    ranked.retain(|(e, sha)| seen.insert((e.class, e.path.clone(), sha.clone())));
     let mut blocks: [String; 3] = Default::default();
     let mut used = [0u64; 3];
     let mut broken = [false; 3];
@@ -322,12 +346,12 @@ pub fn pack(
         evidence: used[Class::Evidence as usize],
         knowledge: used[Class::Knowledge as usize],
         layers: Layers {
-            role_contract: estimate(&parts.fill(&empty)),
+            role_contract: estimate(&format!("{}{}", parts.fill(&empty), mandatory.schemas)),
             project: estimate(&layers[Layer::Project as usize]),
             task: estimate(&format!(
                 "{}{}",
                 layers[Layer::Goal as usize],
-                layers[Layer::Task as usize]
+                layers[Layer::Task as usize].replacen(&mandatory.schemas, "", 1)
             )),
             evidence: estimate(&layers[Layer::Evidence as usize]),
         },
@@ -343,6 +367,99 @@ pub fn pack(
         index_object,
         index_sha256,
     })
+}
+
+/// The schemas `role` hands back, as its contract's output section names them (docs/adr/ADR-026.md decision 3): each
+/// a heading line and one line of compact JSON that defines every local `$ref` it uses. A role without a built-in
+/// contract hands back a TaskResult.
+pub fn output_schemas(role: &str) -> Result<String, String> {
+    let names: &[&str] = match role {
+        "commander" => &["Message", "DecisionPayload"],
+        "qa" => &["TaskResult", "AcceptanceObservation", "IndependentReport"],
+        "reviewer" => &["TaskResult", "IndependentReport"],
+        _ => &["TaskResult"],
+    };
+    let source = |path: &str| -> Result<Value, String> {
+        let text = crate::objects::RESOURCES
+            .iter()
+            .find(|(p, _)| *p == path)
+            .map(|(_, text)| *text)
+            .ok_or_else(|| format!("{path} is not built in"))?;
+        serde_json::from_str(text).map_err(|e| format!("{path}: {e}"))
+    };
+    let protocol = source("contracts/protocol.schema.json")?;
+    let mut out = String::new();
+    for name in names {
+        let (path, schema) = match *name {
+            // Only what the agent writes itself, its ```hoh-report block: the bridge fills in the rest, and the contract
+            // says a report naming those fields itself is refused (docs/adr/ADR-026.md decision 3, M2T09D-159).
+            "IndependentReport" => {
+                let full = source("contracts/independent-report.schema.json")?;
+                let mine = ["role", "status", "scope", "findings"];
+                let properties: serde_json::Map<String, Value> = mine
+                    .iter()
+                    .filter_map(|k| Some(((*k).to_owned(), full["properties"].get(*k)?.clone())))
+                    .collect();
+                if properties.len() != mine.len() {
+                    return Err(
+                        "independent-report.schema.json lacks a hoh-report field".to_owned()
+                    );
+                }
+                (
+                    "contracts/independent-report.schema.json 的 hoh-report 块子集".to_owned(),
+                    json!({"type": "object", "additionalProperties": false, "required": mine,
+                        "properties": properties}),
+                )
+            }
+            "AcceptanceObservation" => (
+                "contracts/acceptance-observation.schema.json".to_owned(),
+                source("contracts/acceptance-observation.schema.json")?,
+            ),
+            _ => {
+                let defs = protocol
+                    .get("$defs")
+                    .and_then(Value::as_object)
+                    .ok_or("no $defs")?;
+                let mut schema = defs
+                    .get(*name)
+                    .cloned()
+                    .ok_or_else(|| format!("no {name}"))?;
+                // Every definition it reaches, by name, so the block stands alone.
+                let mut reached = std::collections::BTreeMap::new();
+                let mut todo = vec![schema.clone()];
+                while let Some(node) = todo.pop() {
+                    let text = node.to_string();
+                    for reference in text.split("\"#/$defs/").skip(1) {
+                        let target = reference.split('"').next().unwrap_or_default().to_owned();
+                        if let std::collections::btree_map::Entry::Vacant(slot) =
+                            reached.entry(target)
+                        {
+                            let def = defs
+                                .get(slot.key())
+                                .cloned()
+                                .ok_or_else(|| format!("no {}", slot.key()))?;
+                            todo.push(def.clone());
+                            slot.insert(def);
+                        }
+                    }
+                }
+                if !reached.is_empty()
+                    && let Some(object) = schema.as_object_mut()
+                {
+                    object.insert(
+                        "$defs".to_owned(),
+                        Value::Object(reached.into_iter().collect()),
+                    );
+                }
+                (
+                    format!("contracts/protocol.schema.json#/$defs/{name}"),
+                    schema,
+                )
+            }
+        };
+        out.push_str(&format!("#### 输出 Schema：{name}（{path}）\n{schema}\n"));
+    }
+    Ok(out)
 }
 
 /// An entry's block as it goes into its layer: a heading line with its class, path and sha256, then its full text
@@ -401,11 +518,15 @@ fn base_layers(
         mandatory.task.clone(),
         mandatory.evidence.clone(),
     ];
+    let task = Layer::Task as usize;
+    layers[task] = join(&layers[task], &mandatory.schemas);
     layers[first as usize] = join(&layers[first as usize], &mandatory.lead);
     let at = [0, 1, 2, 3].map(|l| layers[l].len());
     let sha = String::from_utf8_lossy(index_sha256.as_ref());
-    let pointer =
-        format!("引用索引：未装入全文的条目（path 与 sha256，可取回原文）见对象 sha256:{sha}");
+    let pointer = format!(
+        "引用索引：未装入全文的条目（path 与 sha256，可取回原文）见 .hoh/objects/sha256/{}/{sha}",
+        &sha[..2.min(sha.len())]
+    );
     // Always on a line of its own after a blank line, whatever precedes it (the layer's items, its last entry).
     let evidence = Layer::Evidence as usize;
     layers[evidence] = format!("{}\n\n{pointer}", layers[evidence]);
