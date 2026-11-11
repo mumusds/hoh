@@ -355,6 +355,25 @@ pub struct Producer {
     pub role: String,
 }
 
+/// A check's entry in the candidate's release policy (contracts/release-policy.json `checks`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Policy {
+    pub mode: String,
+    pub degradable: bool,
+    pub requires_plugins: bool,
+}
+
+/// What the candidate's release policy says of a check (docs/adr/ADR-027.md principle one: a candidate without
+/// `contracts/release-policy.json` has no policy).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyCheck {
+    /// The candidate has no release policy: nothing degrades, nothing requires plugins.
+    NoPolicy,
+    /// The policy has no such check.
+    Missing,
+    Check(Policy),
+}
+
 /// What evidence is judged against beyond the candidate and spec: the store's attempts and candidates, the files as
 /// they are now, and the frozen check plan.
 pub trait Lookup {
@@ -374,6 +393,8 @@ pub trait Lookup {
     fn planned(&self, check_id: &str) -> Option<Planned>;
     /// The live-sessions document at `path`.
     fn live_sessions(&self, path: &str) -> Option<Value>;
+    /// The candidate's release policy on `check_id`.
+    fn policy(&self, check_id: &str) -> PolicyCheck;
 }
 
 /// Why evidence does not count: a closed set (docs/adr/ADR-027.md decision 8). The first eleven are AC-052-04's;
@@ -394,7 +415,6 @@ pub enum Reason {
     ErrorOutputChanged,
     ArtifactChanged,
     ArtifactsDifferFromPlan,
-    TimedOut,
     ExitInconsistent,
     CommandMismatch,
     ModeMismatch,
@@ -407,6 +427,9 @@ pub enum Reason {
     OutsideRecordDir,
     RecordDirOverlap,
     LiveSessionsUnbound,
+    LiveSessionsMissing,
+    CheckNotInPolicy,
+    PlanModeNotPolicy,
     ProducerMismatch,
     ProducerNotIndependent,
 }
@@ -429,7 +452,6 @@ impl Reason {
             Reason::ErrorOutputChanged => "ERROR_OUTPUT_CHANGED",
             Reason::ArtifactChanged => "ARTIFACT_CHANGED",
             Reason::ArtifactsDifferFromPlan => "ARTIFACTS_DIFFER_FROM_PLAN",
-            Reason::TimedOut => "TIMED_OUT",
             Reason::ExitInconsistent => "EXIT_INCONSISTENT",
             Reason::CommandMismatch => "COMMAND_MISMATCH",
             Reason::ModeMismatch => "MODE_MISMATCH",
@@ -442,6 +464,9 @@ impl Reason {
             Reason::OutsideRecordDir => "OUTSIDE_RECORD_DIR",
             Reason::RecordDirOverlap => "RECORD_DIR_OVERLAP",
             Reason::LiveSessionsUnbound => "LIVE_SESSIONS_UNBOUND",
+            Reason::LiveSessionsMissing => "LIVE_SESSIONS_MISSING",
+            Reason::CheckNotInPolicy => "CHECK_NOT_IN_POLICY",
+            Reason::PlanModeNotPolicy => "PLAN_MODE_NOT_POLICY",
             Reason::ProducerMismatch => "PRODUCER_MISMATCH",
             Reason::ProducerNotIndependent => "PRODUCER_NOT_INDEPENDENT",
         }
@@ -463,13 +488,46 @@ impl Invalid {
     }
 }
 
-/// Whether evidence `e` counts for candidate `c` under spec `s` (REQ-052 behaviour 7; docs/adr/ADR-027.md decision
-/// 8): every binding matches, it observed something, its producer is a qa or reviewer attempt of the candidate's run,
-/// its record holds every rule tools/release_gate.py applies to one record, and every file it names is what it
-/// recorded. Every reason found is reported, none before another.
+/// Whether the record `r` claims success: exit 0 and not timed out (principle one, rules 9 and 12).
+fn claims_success(r: &Record) -> bool {
+    r.exit_code == 0 && !r.timed_out
+}
+
+/// The live-sessions document of a live record, if it lists one among its artifacts.
+fn sessions_of(r: &Record, world: &dyn Lookup) -> Option<Option<Value>> {
+    r.artifacts
+        .iter()
+        .find(|a| a.name == "live-sessions.json")
+        .map(|a| world.live_sessions(&a.path))
+}
+
+/// Whether `v` has contracts/live-session.schema.json's shape and binds check `check` and candidate `candidate`.
+fn bound(v: &Value, check: &str, candidate: &str) -> bool {
+    let text = |x: &Value| x.as_str().is_some_and(|s| !s.is_empty());
+    v["schema_version"] == "1.0"
+        && v["check_id"] == check
+        && v["harness_candidate_id"] == candidate
+        && v["sessions"].as_array().is_some_and(|sessions| {
+            !sessions.is_empty()
+                && sessions.iter().all(|s| {
+                    ["codex", "claude", "pi"].contains(&s["agent"].as_str().unwrap_or_default())
+                        && text(&s["cli_version"])
+                        && text(&s["session_id"])
+                        && text(&s["resolved_model"])
+                })
+        })
+}
+
+/// Whether evidence `e` counts for candidate `c` under spec `s` (REQ-052 behaviour 7; docs/adr/ADR-027.md
+/// principle one's "veto" and "store" rules, decision 8): every binding matches, its producer is a qa or reviewer
+/// attempt of the candidate's run, its record holds every rule tools/release_gate.py applies to one record, and every
+/// file it names is what it recorded. Rules 9 (duration) and 12 (artifacts, observations, live sessions) veto only a
+/// record that claims success; a timeout and an exit code are conclusions ([`outcome`]). Every reason found is
+/// reported, none before another.
 pub fn valid(e: &Evidence, c: &Sealed, s: &str, world: &dyn Lookup) -> Result<(), Invalid> {
     let m = &c.manifest;
     let r = &e.record;
+    let success = claims_success(r);
     let mut reasons = Vec::new();
     let mut need = |ok: bool, reason: Reason| {
         if !ok {
@@ -503,17 +561,18 @@ pub fn valid(e: &Evidence, c: &Sealed, s: &str, world: &dyn Lookup) -> Result<()
             );
         }
     }
-    let millis = |t: &str| {
+    let seconds = |t: &str| {
         crate::time::parse_rfc3339_millis(t)
             .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs_f64())
     };
-    match millis(&r.started_at).zip(millis(&r.finished_at)) {
+    match seconds(&r.started_at).zip(seconds(&r.finished_at)) {
         Some((start, end)) if end >= start => {
-            // tools/release_gate.py: the recorded duration within max(5 s, 1 %) of the interval.
+            // tools/release_gate.py: the recorded duration within max(5 s, 1 %) of the interval; run_check records 0
+            // for an interrupted run, which claims nothing (M2T10D-502).
             let elapsed = end - start;
             need(
-                (elapsed - r.duration_seconds).abs() <= (elapsed * 0.01).max(5.0),
+                !success || (elapsed - r.duration_seconds).abs() <= (elapsed * 0.01).max(5.0),
                 Reason::DurationMismatch,
             );
         }
@@ -529,17 +588,23 @@ pub fn valid(e: &Evidence, c: &Sealed, s: &str, world: &dyn Lookup) -> Result<()
         holds(&r.stderr.path, &r.stderr.sha256),
         Reason::ErrorOutputChanged,
     );
-    need(r.missing_artifacts.is_empty(), Reason::ArtifactMissing);
-    need(!e.observations.is_empty(), Reason::NoObservations);
+    need(
+        !success || r.missing_artifacts.is_empty(),
+        Reason::ArtifactMissing,
+    );
+    need(
+        !success || !e.observations.is_empty(),
+        Reason::NoObservations,
+    );
     need(
         r.artifacts.iter().all(|a| holds(&a.path, &a.sha256)),
         Reason::ArtifactChanged,
     );
-    need(!r.timed_out, Reason::TimedOut);
     need(
         r.exit_code != 0 || !e.observations.iter().any(|o| o["status"] == "FAIL"),
         Reason::ExitInconsistent,
     );
+    let policy = world.policy(&r.check_id);
     match world.planned(&r.check_id) {
         None => need(false, Reason::CheckNotPlanned),
         Some(plan) => {
@@ -555,15 +620,24 @@ pub fn valid(e: &Evidence, c: &Sealed, s: &str, world: &dyn Lookup) -> Result<()
                     .collect()
             };
             need(normal(&r.cwd) == normal(&plan.cwd), Reason::CwdMismatch);
-            let mut found: Vec<&str> = r.artifacts.iter().map(|a| a.name.as_str()).collect();
+            let mut accounted: Vec<&str> = r
+                .artifacts
+                .iter()
+                .map(|a| a.name.as_str())
+                .chain(r.missing_artifacts.iter().map(String::as_str))
+                .collect();
             let mut declared: Vec<&str> = plan.artifacts.iter().map(String::as_str).collect();
-            found.sort_unstable();
-            found.dedup();
+            accounted.sort_unstable();
+            accounted.dedup();
             declared.sort_unstable();
             declared.dedup();
-            need(found == declared, Reason::ArtifactsDifferFromPlan);
+            need(accounted == declared, Reason::ArtifactsDifferFromPlan);
+            if let PolicyCheck::Check(p) = &policy {
+                need(p.mode == plan.mode, Reason::PlanModeNotPolicy);
+            }
         }
     }
+    need(policy != PolicyCheck::Missing, Reason::CheckNotInPolicy);
     need(
         holds(&r.candidate_manifest.path, &r.candidate_manifest.sha256)
             && world.candidate_at(&r.candidate_manifest.path).as_deref()
@@ -584,16 +658,22 @@ pub fn valid(e: &Evidence, c: &Sealed, s: &str, world: &dyn Lookup) -> Result<()
     );
     need(!world.overlaps(&e.record_dir), Reason::RecordDirOverlap);
     if r.mode == "live" {
-        let bound = r
-            .artifacts
-            .iter()
-            .find(|a| a.name == "live-sessions.json")
-            .and_then(|a| world.live_sessions(&a.path))
-            .is_some_and(|v| {
-                v["check_id"] == r.check_id.as_str()
-                    && v["harness_candidate_id"] == c.candidate_id.as_str()
-            });
-        need(bound, Reason::LiveSessionsUnbound);
+        match sessions_of(r, world) {
+            // Rule 10: a sessions document there must be of the schema's shape and bound to this check.
+            Some(doc) => need(
+                doc.is_some_and(|v| bound(&v, &r.check_id, &c.candidate_id)),
+                Reason::LiveSessionsUnbound,
+            ),
+            // Rule 12: a live record claiming success has its sessions, declared by the plan or not (M2T10D-501);
+            // declared and missing, it is ARTIFACT_MISSING already.
+            None => need(
+                !success
+                    || r.missing_artifacts
+                        .iter()
+                        .any(|m| m == "live-sessions.json"),
+                Reason::LiveSessionsMissing,
+            ),
+        }
     }
     match reasons.as_slice() {
         [] => Ok(()),
@@ -605,6 +685,148 @@ pub fn valid(e: &Evidence, c: &Sealed, s: &str, world: &dyn Lookup) -> Result<()
             class: "INVALID",
             reasons,
         }),
+    }
+}
+
+/// An evidence's or a conclusion's status (contracts/sql/001_initial.sql `evidence.outcome`,
+/// `acceptance_results.status`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    Pass,
+    Degraded,
+    Fail,
+    Blocked,
+    Invalid,
+}
+
+impl Status {
+    pub fn code(self) -> &'static str {
+        match self {
+            Status::Pass => "PASS",
+            Status::Degraded => "DEGRADED",
+            Status::Fail => "FAIL",
+            Status::Blocked => "BLOCKED",
+            Status::Invalid => "INVALID",
+        }
+    }
+}
+
+/// An evidence's outcome and, where the outcome table names one, its reason (`INSUFFICIENT`, `TIMED_OUT`,
+/// `PLUGINS_MISSING`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Outcome {
+    pub status: Status,
+    pub reason: Option<&'static str>,
+}
+
+/// The outcome of evidence `e` whose validity is `verdict` (docs/adr/ADR-027.md principle one, the outcome function):
+/// the first that holds of (1) vetoed → INVALID; (2) timed out → FAIL; (3) a compliant degradation of complete
+/// evidence → DEGRADED whatever its exit code; (4) a check requiring plugins whose Pi sessions do not all list them →
+/// FAIL; (5) exit 0 → PASS; (6) exit 3 → BLOCKED; (7) FAIL. Complete evidence has no artifact missing and, for a live
+/// check, its bound sessions (M2T10D-500, -501).
+pub fn outcome(e: &Evidence, verdict: &Result<(), Invalid>, world: &dyn Lookup) -> Outcome {
+    let r = &e.record;
+    let of = |status, reason| Outcome { status, reason };
+    if let Err(invalid) = verdict {
+        let reason = (invalid.class == "INSUFFICIENT").then_some("INSUFFICIENT");
+        return of(Status::Invalid, reason);
+    }
+    if r.timed_out {
+        return of(Status::Fail, Some("TIMED_OUT"));
+    }
+    let policy = match world.policy(&r.check_id) {
+        PolicyCheck::Check(p) => Some(p),
+        _ => None,
+    };
+    let sessions = if r.mode == "live" {
+        sessions_of(r, world).flatten()
+    } else {
+        None
+    };
+    let complete = r.missing_artifacts.is_empty() && (r.mode != "live" || sessions.is_some());
+    // A compliant degradation (rule 14): a degradable check, at least one DEGRADED line, each with its basis, and no
+    // FAIL line; SKIPPED lines leave their TESTs without a conclusion, as the gate judges each AC (M2T10D-551).
+    let compliant = policy.as_ref().is_some_and(|p| p.degradable)
+        && e.observations.iter().any(|o| o["status"] == "DEGRADED")
+        && e.observations
+            .iter()
+            .filter(|o| o["status"] == "DEGRADED")
+            .all(|o| based(&o))
+        && !e.observations.iter().any(|o| o["status"] == "FAIL");
+    if compliant && complete {
+        return of(Status::Degraded, None);
+    }
+    if r.exit_code == 0 {
+        let plugins = policy.as_ref().is_none_or(|p| !p.requires_plugins)
+            || sessions.as_ref().is_some_and(|v| {
+                v["sessions"].as_array().is_some_and(|all| {
+                    all.iter()
+                        .filter(|s| s["agent"] == "pi")
+                        .all(|s| s["plugins"].as_array().is_some_and(|p| !p.is_empty()))
+                })
+            });
+        if !plugins {
+            return of(Status::Fail, Some("PLUGINS_MISSING"));
+        }
+        if complete {
+            return of(Status::Pass, None);
+        }
+    }
+    if r.exit_code == 3 {
+        return of(Status::Blocked, None);
+    }
+    of(Status::Fail, None)
+}
+
+/// Whether a DEGRADED line carries its basis: a `detail` naming the reason and the upstream reference (rule 14).
+fn based(line: &&Value) -> bool {
+    line["detail"]
+        .as_str()
+        .is_some_and(|d| !d.trim().is_empty())
+}
+
+/// What member `e`, of outcome `outcome`, concludes on TEST `test_id` (docs/adr/ADR-027.md principle one, the
+/// conclusion function): `scenario` when its check is the TEST's scenario check, `requirement` when the TEST's
+/// requirement may degrade, `check` when the policy lets its check degrade. The first that holds of (1) vetoed →
+/// INVALID; (2) a FAIL line → FAIL; (3) a DEGRADED line that is not compliant (scenario check, degradable check and
+/// requirement, its basis) → FAIL; (4) the scenario check passing with its lines all PASS → PASS; (5) a degraded run's
+/// lines all PASS or compliant DEGRADED, one DEGRADED at least → DEGRADED; else nothing (a compliant DEGRADED line in
+/// a run that was blocked or timed out among them, M2T10D-551).
+pub fn conclude(
+    e: &Evidence,
+    outcome: &Outcome,
+    test_id: &str,
+    scenario: bool,
+    requirement: bool,
+    check: bool,
+) -> Option<Status> {
+    let lines: Vec<&Value> = e
+        .observations
+        .iter()
+        .filter(|o| o["test_id"] == test_id)
+        .collect();
+    let degraded: Vec<&&Value> = lines.iter().filter(|o| o["status"] == "DEGRADED").collect();
+    let compliant = scenario && requirement && check && degraded.iter().all(|o| based(o));
+    if outcome.status == Status::Invalid {
+        Some(Status::Invalid)
+    } else if lines.iter().any(|o| o["status"] == "FAIL") || (!degraded.is_empty() && !compliant) {
+        Some(Status::Fail)
+    } else if scenario
+        && outcome.status == Status::Pass
+        && !lines.is_empty()
+        && lines.iter().all(|o| o["status"] == "PASS")
+    {
+        Some(Status::Pass)
+    } else if scenario
+        && outcome.status == Status::Degraded
+        && !degraded.is_empty()
+        && lines
+            .iter()
+            .all(|o| o["status"] == "PASS" || o["status"] == "DEGRADED")
+    {
+        Some(Status::Degraded)
+    } else {
+        None
     }
 }
 
