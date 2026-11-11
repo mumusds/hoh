@@ -2560,6 +2560,24 @@ async fn test_039_04_repacking_from_an_attempts_record_gives_the_prompt_it_was_s
         assert!(!inputs.is_empty());
         assert_eq!(packed["policy"]["rule"], "prefix");
         assert!(packed["policy"]["estimator"].is_string());
+        // Its raw logs were kept as objects and registered with it as their producer, with its work's OBSERVED
+        // (docs/adr/ADR-026.md decision 10).
+        let produced: Value = serde_json::from_str(&query(
+            &project,
+            "SELECT payload_json FROM events WHERE kind = 'attempt.artifacts' \
+             AND json_extract(payload_json, '$.attempt_id') = 'T-a/attempt-4'",
+        )?)?;
+        let items = produced["items"].as_array().ok_or("no items")?;
+        assert!(items.iter().any(|i| i["kind"] == "raw_log"), "{produced}");
+        for item in items {
+            let path = item["path"].as_str().ok_or("no path")?;
+            assert!(project.join(path).is_file(), "{path}");
+            let registered = query(
+                &project,
+                &format!("SELECT count(*) FROM artifacts WHERE sha256 = '{}' AND path = '{path}'", item["sha256"].as_str().unwrap_or_default()),
+            )?;
+            assert_eq!(registered, "1", "{path}");
+        }
         // What codex was sent is what was recorded.
         let sent = codex_prompts(&world)?;
         assert_eq!(sent.len(), 1, "{sent:?}");
@@ -2658,6 +2676,128 @@ async fn a_turn_whose_mandatory_items_exceed_its_runs_budget_is_refused_and_its_
             "nothing sent, no process"
         );
         assert!(codex_prompts(&world)?.is_empty());
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    world.stop_fakes()?;
+    outcome
+}
+
+#[tokio::test]
+async fn a_new_commanders_prompt_carries_references_and_none_of_its_predecessors_logs() -> R {
+    // REQ-039 behaviour 5 and failure mode 3 (docs/adr/ADR-026.md decision 10), the Commander half of AC-039-03 (whose
+    // QA half needs M2-T16's dispatch, CR-016; this test is no evidence of AC-039-03): the old Commander's session
+    // produced a raw log of more than 200 KB holding a unique sentinel, registered as its object; an adapter frame and a
+    // TaskResult inside a candidate_ready hold it too. The new Commander's package references the log's object (64 hex
+    // digits, the file there); its first prompt holds the sentinel 0 times and fits the package's budget.
+    let world = World::new()?;
+    world.claude(None)?;
+    world.codex("m-test")?;
+    world.pi()?;
+    let host = start_when_free(world.config()).await?;
+    let project = world.project();
+    let outcome = async {
+        let run_id = started(&host, "s1").await?;
+        let limit = Duration::from_secs(60);
+        let commander = format!(
+            "SELECT agent || '/' || role_epoch || '/' || coalesce(session_id, '-') FROM role_bindings \
+             WHERE run_id = '{run_id}' AND role = 'commander'"
+        );
+        let old_session = format!("{run_id}/session/commander/1");
+        until(&project, &commander, &format!("codex/1/{old_session}"), limit).await?;
+        let sentinel = "SENTINEL-039-03-c4e1";
+        let log = format!("{}\n{sentinel}\n", "x".repeat(210_000));
+        let sha = hoh_core::objects::put(&project, log.as_bytes())?;
+        let item = json!({"artifact_id": format!("{sha}:p"), "sha256": sha,
+            "path": hoh_core::objects::relative_path(&sha), "bytes": log.len(), "mime": "text/plain",
+            "kind": "raw_log", "name": "stdout.jsonl"});
+        exec(
+            &project,
+            &format!(
+                "INSERT INTO specs(spec_id, project_id, sha256, revision) \
+                   SELECT 's3', project_id, printf('%064d', 3), 3 FROM runs WHERE run_id = '{run_id}';
+                 UPDATE runs SET spec_id = 's3' WHERE run_id = '{run_id}';
+                 INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq)
+                   VALUES ('T-old', '{run_id}', 's3', 'CANCELLED', 1, 'commander', 0, 1);
+                 INSERT INTO attempts(attempt_id, task_id, session_id, state, role_epoch, host_epoch, config_revision)
+                   VALUES ('T-old/attempt-1', 'T-old', '{old_session}', 'SETTLED', 1, 1, 1);
+                 INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
+                   SELECT project_id, 'T-old/attempt-1/artifacts', '{run_id}', 'attempt.artifacts',
+                   json_object('attempt_id', 'T-old/attempt-1', 'items', json_array(json('{item}'))),
+                   '2026-11-10T00:00:00Z' FROM runs WHERE run_id = '{run_id}';
+                 INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
+                   SELECT project_id, 'frame-039-03', '{run_id}', 'adapter.unknown_event',
+                   '{{\"frame\": \"{sentinel}\"}}', '2026-11-10T00:00:00Z' FROM runs WHERE run_id = '{run_id}';
+                 INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
+                   SELECT project_id, 'ready-039-03', '{run_id}', 'candidate_ready',
+                   '{{\"task_result_json\": \"{sentinel}\"}}', '2026-11-10T00:00:00Z' FROM runs WHERE run_id = '{run_id}';"
+            ),
+        )?;
+        let revision: i64 =
+            query(&project, "SELECT coalesce(max(revision), 0) FROM team_revisions")?.parse()?;
+        configure(&host, "to-pi", revision, json!({"commander": {"agent": "pi"}})).await?;
+        let new_session = format!("{run_id}/session/commander/2");
+        until(&project, &commander, &format!("pi/2/{new_session}"), limit).await?;
+        let kept = hoh_app::host::product::first_input_path(&project, &new_session);
+        let end = Instant::now() + limit;
+        while !kept.exists() {
+            assert!(Instant::now() < end, "no first input at {}", kept.display());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let input: Value = serde_json::from_str(&std::fs::read_to_string(&kept)?)?;
+        let package: hoh_core::protocol::ContextHandoff = hoh_core::protocol::decode(&input["package"])?;
+        assert!(!package.references.is_empty(), "the package references nothing");
+        for r in &package.references {
+            assert!(r.sha256.len() == 64 && r.sha256.bytes().all(|b| b.is_ascii_hexdigit()), "{r:?}");
+            assert!(project.join(&r.path).is_file(), "{} is not there", r.path);
+        }
+        assert!(package.references.iter().any(|r| r.sha256 == sha), "the old log is referenced");
+        exec(
+            &project,
+            &format!(
+                "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) \
+                   SELECT project_id, 'nd-039-03', '{run_id}', 'need_decision', '{{\"fingerprint\": \"fp-039-03\"}}', \
+                   '2026-11-10T00:00:00Z' FROM runs WHERE run_id = '{run_id}';"
+            ),
+        )?;
+        until(
+            &project,
+            "SELECT count(*) FROM attempts a JOIN tasks t ON t.task_id = a.task_id WHERE t.role = 'commander' \
+             AND a.state = 'SETTLED' AND a.session_id LIKE '%/commander/2'",
+            "1",
+            limit,
+        )
+        .await?;
+        let mut prompts = Vec::new();
+        for entry in std::fs::read_dir(world.bin().join("pi.d"))? {
+            if let Ok(text) = std::fs::read_to_string(entry?.path().join("received.jsonl")) {
+                for line in text.lines() {
+                    let command: Value = serde_json::from_str(line).unwrap_or(Value::Null);
+                    if command["type"] == "prompt" {
+                        prompts.push(command["message"].as_str().unwrap_or_default().to_owned());
+                    }
+                }
+            }
+        }
+        let [sent] = prompts.as_slice() else {
+            return Err(format!("the pi Commander was sent {} prompts", prompts.len()).into());
+        };
+        assert_eq!(sent.matches(sentinel).count(), 0);
+        assert!(sent.contains(&sha), "the reference is in the package it was sent");
+        let tokens = hoh_core::context::estimate(sent);
+        assert!(tokens <= package.budget_tokens, "{tokens} > {}", package.budget_tokens);
+        // The package first, then the wake's evidence (docs/adr/ADR-026.md decision 3).
+        let (handover, wake_event) = (
+            sent.find("交接包（本会话的首个输入）").ok_or("no package")?,
+            sent.find("events/").ok_or("no wake event")?,
+        );
+        assert!(handover < wake_event, "{sent}");
+        keep(
+            "m2t09-commander-handover",
+            &json!({"package": input["package"], "prompt_sha256": <sha2::Sha256 as sha2::Digest>::digest(sent.as_bytes()).iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                "tokens": tokens, "sentinel_count": 0}),
+        )?;
         R::Ok(())
     }
     .await;

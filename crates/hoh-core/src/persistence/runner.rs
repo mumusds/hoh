@@ -196,6 +196,9 @@ pub struct Observed {
     /// A supervision turn's file-bridge lines (docs/adr/ADR-025.md decision 8): the runner carries them into its work's
     /// OBSERVED, where they are recorded as its outputs when it succeeded.
     pub messages: Vec<String>,
+    /// Its raw logs kept as objects (docs/adr/ADR-026.md decision 10): the runner carries them into its work's OBSERVED,
+    /// where they are registered with their producer.
+    pub artifacts: Vec<ArtifactRow>,
 }
 
 /// Where a turn's prompt came from and what was sent (decision 11, AC-018-05): a `prompt_revisions` row (the role
@@ -230,6 +233,67 @@ pub struct ArtifactRow {
     pub path: String,
     pub bytes: u64,
     pub mime: String,
+    /// What it is (`raw_log`, or a packed input's kind: `template`, `entry`, `manifest`, ...) and the name it stands
+    /// for (a raw log's file name, an entry's path).
+    pub kind: String,
+    pub name: String,
+}
+
+impl ArtifactRow {
+    /// As `attempt.artifacts` and the work effect's OBSERVED detail carry it.
+    pub fn json(&self) -> Value {
+        json!({"artifact_id": artifact_id(&self.sha256, &self.path), "sha256": self.sha256, "path": self.path,
+            "bytes": self.bytes, "mime": self.mime, "kind": self.kind, "name": self.name})
+    }
+
+    /// One read back from [`ArtifactRow::json`].
+    pub fn from_json(v: &Value) -> Option<ArtifactRow> {
+        Some(ArtifactRow {
+            sha256: v.get("sha256")?.as_str()?.to_owned(),
+            path: v.get("path")?.as_str()?.to_owned(),
+            bytes: v.get("bytes")?.as_u64()?,
+            mime: v.get("mime")?.as_str()?.to_owned(),
+            kind: v.get("kind")?.as_str()?.to_owned(),
+            name: v.get("name")?.as_str()?.to_owned(),
+        })
+    }
+}
+
+/// An `artifacts` row's id: its content and its path.
+fn artifact_id(sha256: &str, path: &str) -> String {
+    format!("{sha256}:{path}")
+}
+
+/// Register `rows` in `artifacts` in the caller's transaction, each read back (docs/adr/ADR-026.md decision 6): a row
+/// of the same digest and path that says another size is no registration of it.
+pub(super) fn register(tx: &Transaction<'_>, rows: &[ArtifactRow]) -> Result<(), PersistError> {
+    for a in rows {
+        tx.execute(
+            "INSERT OR IGNORE INTO artifacts(artifact_id, sha256, path, bytes, mime) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                artifact_id(&a.sha256, &a.path),
+                a.sha256,
+                a.path,
+                i64::try_from(a.bytes).unwrap_or(i64::MAX),
+                a.mime
+            ],
+        )
+        .map_err(sqlite_error)?;
+        let bytes: i64 = tx
+            .query_row(
+                "SELECT bytes FROM artifacts WHERE sha256 = ?1 AND path = ?2",
+                params![a.sha256, a.path],
+                |r| r.get(0),
+            )
+            .map_err(sqlite_error)?;
+        if u64::try_from(bytes).ok() != Some(a.bytes) {
+            return Err(PersistError::IntegrityViolation(format!(
+                "artifact {} at {} is registered with {bytes} bytes, not {}",
+                a.sha256, a.path, a.bytes
+            )));
+        }
+    }
+    Ok(())
 }
 
 impl PromptRecord {
@@ -633,6 +697,16 @@ fn effect(
             _ => None,
         })
         .unwrap_or_default();
+    // Its raw logs kept as objects (docs/adr/ADR-026.md decision 10): registered with their producer in this
+    // OBSERVED, so a crash before its end's commit keeps them; never kept in the effect's own event.
+    let artifacts: Vec<ArtifactRow> = detail
+        .as_object_mut()
+        .and_then(|d| d.remove("artifacts"))
+        .and_then(|a| {
+            a.as_array()
+                .map(|a| a.iter().filter_map(ArtifactRow::from_json).collect())
+        })
+        .unwrap_or_default();
     let mut events = vec![event(
         &project_id,
         &run_id,
@@ -640,6 +714,28 @@ fn effect(
         &kind,
         json!({"effect_key": key, "attempt_id": attempt_id, "from": from.as_str(), "detail": detail}),
     )];
+    if to == EffectState::Observed
+        && key == crate::reconcile::work_key(attempt_id)
+        && !artifacts.is_empty()
+    {
+        register(&tx, &artifacts)?;
+        let (role, session): (Option<String>, Option<String>) = tx
+            .query_row(
+                "SELECT t.role, a.session_id FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+                 WHERE a.attempt_id = ?1",
+                params![attempt_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(sqlite_error)?;
+        events.push(event(
+            &project_id,
+            &run_id,
+            child_id(attempt_id, "artifacts"),
+            "attempt.artifacts",
+            json!({"attempt_id": attempt_id, "run_id": run_id, "role": role, "session_id": session,
+                "items": artifacts.iter().map(ArtifactRow::json).collect::<Vec<_>>()}),
+        ));
+    }
     if to == EffectState::Observed
         && key == crate::reconcile::work_key(attempt_id)
         && super::wakes::is_supervision(&tx, &task_id)?
@@ -783,33 +879,7 @@ pub(super) fn record_prompt(
     let Some(packed) = &prompt.packed else {
         return Ok(Vec::new());
     };
-    for a in &packed.artifacts {
-        tx.execute(
-            "INSERT OR IGNORE INTO artifacts(artifact_id, sha256, path, bytes, mime) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                format!("{}:{}", a.sha256, a.path),
-                a.sha256,
-                a.path,
-                i64::try_from(a.bytes).unwrap_or(i64::MAX),
-                a.mime
-            ],
-        )
-        .map_err(sqlite_error)?;
-        // Registered as it is: a row of the same digest and path that says otherwise is no registration of it.
-        let bytes: i64 = tx
-            .query_row(
-                "SELECT bytes FROM artifacts WHERE sha256 = ?1 AND path = ?2",
-                params![a.sha256, a.path],
-                |r| r.get(0),
-            )
-            .map_err(sqlite_error)?;
-        if u64::try_from(bytes).ok() != Some(a.bytes) {
-            return Err(PersistError::IntegrityViolation(format!(
-                "artifact {} at {} is registered with {bytes} bytes, not {}",
-                a.sha256, a.path, a.bytes
-            )));
-        }
-    }
+    register(tx, &packed.artifacts)?;
     let mut payload = packed.event.clone();
     if let Some(object) = payload.as_object_mut() {
         object.insert("attempt_id".to_owned(), json!(attempt_id));

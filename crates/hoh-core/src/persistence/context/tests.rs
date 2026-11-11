@@ -219,3 +219,48 @@ fn an_events_causal_rank_comes_from_the_wake_subject_and_its_snapshot() -> R {
     );
     Ok(())
 }
+
+fn produced(conn: &Connection, attempt: &str, items: &[(&str, &str)]) -> R {
+    let items: Vec<Value> = items
+        .iter()
+        .map(|(sha, name)| {
+            json!({"artifact_id": format!("{sha}:p"), "sha256": sha, "path": crate::objects::relative_path(sha),
+                "bytes": 1, "mime": "text/plain", "kind": "raw_log", "name": name})
+        })
+        .collect();
+    conn.execute(
+        "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES \
+         ('p1', ?1, 'R', 'attempt.artifacts', ?2, '2026-11-07T00:00:00Z')",
+        rusqlite::params![
+            crate::ids::child_id(attempt, "artifacts"),
+            json!({"attempt_id": attempt, "items": items}).to_string()
+        ],
+    )?;
+    Ok(())
+}
+
+#[test]
+fn a_handovers_references_are_its_producers_registered_objects_newest_first_and_bounded() -> R {
+    // docs/adr/ADR-026.md decision 10 (M2T09D-100): references come from attempt.artifacts, each attempt its own
+    // event, objects shared by content counted once; never more than the limit.
+    let (_dir, conn) = world()?;
+    let (a, b, c) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
+    produced(&conn, "A0", &[(&a, "stdout.jsonl"), (&b, "stderr.log")])?;
+    // A1 produced the same stderr bytes as A0: one object, both producers.
+    produced(&conn, "A1", &[(&c, "stdout.jsonl"), (&b, "stderr.log")])?;
+    let refs = references(&conn, &["A1".to_owned(), "A0".to_owned()], 20)?;
+    let shas: Vec<&str> = refs.iter().map(|r| r.sha256.as_str()).collect();
+    assert_eq!(shas, [c.as_str(), b.as_str(), a.as_str()]);
+    assert!(
+        refs.iter()
+            .all(|r| r.path == crate::objects::relative_path(&r.sha256))
+    );
+    assert_eq!(
+        references(&conn, &["A1".to_owned(), "A0".to_owned()], 2)?.len(),
+        2
+    );
+    assert!(references(&conn, &["nobody".to_owned()], 20)?.is_empty());
+    // The run's budget for its packages: its snapshot's.
+    assert_eq!(budget(&conn, "R")?, 20_000);
+    Ok(())
+}

@@ -367,5 +367,63 @@ fn attempt_tasks(
     Ok(out)
 }
 
+/// The objects attempts `attempts` produced, in that order and each attempt's in its own order, as references: from
+/// their `attempt.artifacts` events (docs/adr/ADR-026.md decision 10), an object two of them produced once, at most
+/// `limit`.
+pub(super) fn references(
+    conn: &Connection,
+    attempts: &[String],
+    limit: usize,
+) -> Result<Vec<crate::protocol::ArtifactRef>, PersistError> {
+    let mut out: Vec<crate::protocol::ArtifactRef> = Vec::new();
+    let mut seen = BTreeSet::new();
+    for attempt in attempts {
+        let payload: Option<String> = conn
+            .query_row(
+                "SELECT payload_json FROM events WHERE event_id = ?1 AND kind = 'attempt.artifacts'",
+                params![crate::ids::child_id(attempt, "artifacts")],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sqlite_error)?;
+        let Some(payload) = payload else { continue };
+        let payload: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
+        for item in payload["items"].as_array().cloned().unwrap_or_default() {
+            let (Some(sha256), Some(path)) = (item["sha256"].as_str(), item["path"].as_str())
+            else {
+                continue;
+            };
+            if out.len() >= limit {
+                return Ok(out);
+            }
+            if seen.insert((sha256.to_owned(), path.to_owned())) {
+                out.push(crate::protocol::ArtifactRef {
+                    path: path.to_owned(),
+                    sha256: sha256.to_owned(),
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The context budget of run `run_id`'s packages: its snapshot's, else [`crate::context::CONTEXT_V1`]'s.
+pub(super) fn budget(conn: &Connection, run_id: &str) -> Result<u64, PersistError> {
+    let snapshot: Option<String> = conn
+        .query_row(
+            "SELECT json_extract(config_snapshot_json, '$.context') FROM runs WHERE run_id = ?1",
+            params![run_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?
+        .flatten();
+    Ok(snapshot
+        .as_deref()
+        .and_then(params_of)
+        .unwrap_or(crate::context::CONTEXT_V1)
+        .budget_tokens)
+}
+
 #[cfg(test)]
 mod tests;

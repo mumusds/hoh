@@ -132,6 +132,79 @@ fn put_with(
     Ok(sha256)
 }
 
+/// Keeps the file `file` as an object, copied and hashed in pieces (a raw log is not bounded), and returns its sha256
+/// and size: copied to a staged file of its own under `.hoh/objects/staging`, synced, then linked to its place as
+/// [`put`] does (the same bytes there already taken; a damaged object replaced by them).
+pub fn put_file(project: &Path, file: &Path) -> Result<(String, u64), String> {
+    use std::io::{Read as _, Write as _};
+    use std::sync::atomic::Ordering;
+    let staging = project.join(".hoh/objects/staging");
+    std::fs::create_dir_all(&staging).map_err(|e| format!("{}: {e}", staging.display()))?;
+    let mut tries = 0;
+    let (staged, mut out) = loop {
+        let staged = staging.join(format!(
+            ".{}.{}",
+            std::process::id(),
+            STAGED.fetch_add(1, Ordering::Relaxed)
+        ));
+        match std::fs::File::create_new(&staged) {
+            Ok(out) => break (staged, out),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && tries < 1_000 => tries += 1,
+            Err(e) => return Err(format!("{}: {e}", staged.display())),
+        }
+    };
+    let copied = (|| -> Result<(String, u64), String> {
+        let at = |e: std::io::Error| format!("{}: {e}", file.display());
+        let mut input = std::fs::File::open(file).map_err(at)?;
+        let mut digest = Sha256::new();
+        let mut size = 0u64;
+        let mut buffer = vec![0u8; 1 << 16];
+        loop {
+            let n = input.read(&mut buffer).map_err(at)?;
+            if n == 0 {
+                break;
+            }
+            digest.update(&buffer[..n]);
+            out.write_all(&buffer[..n])
+                .map_err(|e| format!("{}: {e}", staged.display()))?;
+            size += n as u64;
+        }
+        out.sync_all()
+            .map_err(|e| format!("{}: {e}", staged.display()))?;
+        let sha: String = digest
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let path = object_path(project, &sha)?;
+        let dir = path.parent().ok_or("no directory")?;
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        match std::fs::hard_link(&staged, &path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if get(project, &sha).is_err() {
+                    std::fs::rename(&staged, &path)
+                        .map_err(|e| format!("{}: {e}", path.display()))?;
+                    get(project, &sha)?;
+                }
+            }
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        }
+        let top = project.join(".hoh");
+        let mut at = Some(dir);
+        while let Some(d) = at {
+            std::fs::File::open(d)
+                .and_then(|f| f.sync_all())
+                .map_err(|e| format!("{}: {e}", d.display()))?;
+            at = if d == top { None } else { d.parent() };
+        }
+        Ok((sha, size))
+    })();
+    drop(out);
+    let _ = std::fs::remove_file(&staged);
+    copied
+}
+
 /// The object named `sha256`, if its bytes still match its name.
 pub fn get(project: &Path, sha256: &str) -> Result<Vec<u8>, String> {
     let path = object_path(project, sha256)?;

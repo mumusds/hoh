@@ -14,6 +14,9 @@ use serde_json::{Value, json};
 /// The roles a candidate is handed to (REQ-037: QA and Review verify the same candidate in parallel).
 pub const VERIFIERS: [&str; 2] = ["qa", "reviewer"];
 
+/// At most this many objects a handover package references (docs/adr/ADR-026.md decision 10).
+pub(super) const REFERENCES: usize = 20;
+
 /// What became of a TaskResult.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskResultOutcome {
@@ -271,6 +274,13 @@ pub(super) fn accept(
         task_revision: u64::try_from(revision + 2)
             .map_err(|_| PersistError::IntegrityViolation("task revision".to_owned()))?,
         cause: ready_id.clone(),
+        // What the Developer's attempt produced, by reference only (docs/adr/ADR-026.md decision 10).
+        references: super::context::references(
+            &tx,
+            std::slice::from_ref(&result.attempt_id),
+            REFERENCES,
+        )?,
+        budget_tokens: super::context::budget(&tx, &result.run_id)?,
     };
     // No acceptance criteria, nothing to verify against: refused whole, no QA attempt (REQ-022).
     let messages = handoff::verification(&verification, &recipients).ok_or_else(|| {

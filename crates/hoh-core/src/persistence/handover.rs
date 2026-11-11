@@ -102,6 +102,22 @@ fn ids(conn: &Connection, run_id: &str, sql: &str) -> Result<Vec<String>, Persis
     rows.collect::<Result<_, _>>().map_err(sqlite_error)
 }
 
+/// The attempts of the previous holder's session (`from`, as team.binding_applied records it), newest first.
+fn previous(conn: &Connection, from: &serde_json::Value) -> Result<Vec<String>, PersistError> {
+    let Some(session) = from.get("session_id").and_then(serde_json::Value::as_str) else {
+        return Ok(Vec::new());
+    };
+    let mut statement = conn
+        .prepare("SELECT attempt_id FROM attempts WHERE session_id = ?1 ORDER BY rowid DESC")
+        .map_err(sqlite_error)?;
+    let rows = statement
+        .query_map(params![session], |r| r.get(0))
+        .map_err(sqlite_error)?
+        .collect::<Result<_, _>>()
+        .map_err(sqlite_error)?;
+    Ok(rows)
+}
+
 /// The writes that hand run `run_id`'s `role` over to its binding at `role_epoch` (decisions 1 and 2): the
 /// handoff.prepared event and the session.start notice pointing at it, to be committed with the binding. `spec` is the
 /// run's (see [`spec`]), none while it has none (CR-014); `from` and `to` are the bindings as team.binding_applied records them.
@@ -150,6 +166,14 @@ pub(super) fn prepare(
         spec,
         candidate: super::outbox::current_candidate(conn, run_id)?,
         state,
+        // What the role's previous holder produced in this run, newest first, by reference only: none of its content
+        // is read (docs/adr/ADR-026.md decision 10).
+        references: super::context::references(
+            conn,
+            &previous(conn, from)?,
+            super::results::REFERENCES,
+        )?,
+        budget_tokens: super::context::budget(conn, run_id)?,
     });
     let package = crate::protocol::encode(&package)
         .map_err(|e| PersistError::IntegrityViolation(format!("the handover package: {e}")))?;

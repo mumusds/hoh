@@ -3,10 +3,13 @@
 //! specification and the role's own current epoch; and the role-change package a new Commander takes over from
 //! (REQ-019 b4). Pure: the store gathers the inputs and queues the messages.
 
-use crate::protocol::{Candidate, ContextHandoff, HandoffKind, HandoffState, Message, MessageKind};
+use crate::protocol::{
+    ArtifactRef, Candidate, ContextHandoff, HandoffKind, HandoffState, Message, MessageKind,
+};
 use serde_json::Value;
 
-/// The context budget of a verification package until context packing sets it (M2-T09).
+/// The context budget of a package whose run's configuration names none (docs/adr/ADR-026.md decisions 7 and 8: the
+/// run's own is `context.budget_tokens` in its snapshot, this value when it started).
 pub const BUDGET_TOKENS: u64 = 32_000;
 
 /// What every verification handoff of one candidate shares.
@@ -26,6 +29,11 @@ pub struct Verification {
     pub task_revision: u64,
     /// The `candidate_ready` event the handoffs follow.
     pub cause: String,
+    /// The objects the Developer's attempt produced (its raw logs), by reference only, never their content
+    /// (docs/adr/ADR-026.md decision 10).
+    pub references: Vec<ArtifactRef>,
+    /// The run's context budget (its configuration snapshot).
+    pub budget_tokens: u64,
 }
 
 /// A role that receives a handoff, at its current epoch.
@@ -62,9 +70,9 @@ pub fn verification(v: &Verification, to: &[Recipient]) -> Option<Vec<Message>> 
                 spec_sha256: Some(v.spec_sha256.clone()),
                 candidate: Some(v.candidate.clone()),
                 acceptance_ids: v.acceptance_ids.clone(),
-                references: Vec::new(),
+                references: v.references.clone(),
                 output_contract: output_contract(&r.role).to_owned(),
-                budget_tokens: BUDGET_TOKENS,
+                budget_tokens: v.budget_tokens,
                 handoff_kind: HandoffKind::Verification,
                 spec_revision: Some(v.spec_revision),
                 state: None,
@@ -111,6 +119,11 @@ pub struct RoleChange {
     pub spec: Option<(String, u64)>,
     pub candidate: Option<Candidate>,
     pub state: HandoffState,
+    /// The objects the role's previous holder produced in this run (its raw logs), newest first, by reference only:
+    /// none of its content is read (docs/adr/ADR-026.md decision 10; ADR-024 decision 1 holds).
+    pub references: Vec<ArtifactRef>,
+    /// The run's context budget (its configuration snapshot).
+    pub budget_tokens: u64,
 }
 
 /// What a role hands back in its turns: the Commander decisions, the others what [`output_contract`] says.
@@ -141,9 +154,9 @@ pub fn role_change(c: &RoleChange) -> ContextHandoff {
         spec_sha256: c.spec.as_ref().map(|(sha256, _)| sha256.clone()),
         candidate: c.candidate.clone(),
         acceptance_ids: Vec::new(),
-        references: Vec::new(),
+        references: c.references.clone(),
         output_contract: role_output_contract(&c.role).to_owned(),
-        budget_tokens: BUDGET_TOKENS,
+        budget_tokens: c.budget_tokens,
         handoff_kind: HandoffKind::RoleChange,
         spec_revision: c.spec.as_ref().map(|(_, revision)| *revision),
         state: Some(HandoffState {
@@ -183,6 +196,8 @@ mod tests {
             goal: "g".to_owned(),
             task_revision: 5,
             cause: "e".to_owned(),
+            references: Vec::new(),
+            budget_tokens: BUDGET_TOKENS,
         }
     }
 
@@ -231,6 +246,8 @@ mod tests {
                 unacked_message_ids: vec!["M1".to_owned()],
                 queued_input_ids: vec!["Q1".to_owned(), "Q1".to_owned()],
             },
+            references: Vec::new(),
+            budget_tokens: BUDGET_TOKENS,
         }
     }
 
