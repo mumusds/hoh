@@ -1,0 +1,146 @@
+//! A run's frozen candidates (REQ-052 behaviours 1 to 3; decision 1 as CR-017 scopes it to one run;
+//! docs/adr/ADR-027.md decisions 4 and 5): one row per content identity, owned by one run.
+
+use super::runner::ArtifactRow;
+use super::{PersistError, sqlite_error};
+use crate::verification::Sealed;
+use rusqlite::{Connection, OptionalExtension, params};
+use serde_json::json;
+
+/// A candidate to freeze for `run_id`: its sealed manifest, its export kept as an object (the row's `source_path`),
+/// and the bytes of its specification, environment and test plan kept as objects (decision 4).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Freeze {
+    pub run_id: String,
+    pub sealed: Sealed,
+    pub export: ArtifactRow,
+    pub inputs: Vec<ArtifactRow>,
+}
+
+/// What a freeze did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Frozen {
+    /// A new FROZEN row; the run's earlier current candidates (FROZEN, VERIFYING, ACCEPTED) made STALE.
+    New {
+        candidate_id: String,
+        superseded: Vec<String>,
+    },
+    /// The same content frozen before in this run: its id and its state as they are; nothing written, nothing
+    /// revived (REQ-052 decision 1 within one run, CR-017).
+    Existing { candidate_id: String, state: String },
+}
+
+/// The states of a run's current candidate: a newer freeze makes them STALE.
+const CURRENT: &str = "('FROZEN', 'VERIFYING', 'ACCEPTED')";
+
+/// Freeze `job` in one transaction: refused with nothing written when the run does not exist, the content belongs to
+/// another run, or the specification, environment or test plan bytes are not among the objects it registers.
+pub(super) fn freeze(
+    conn: &mut Connection,
+    job: &Freeze,
+    ctx: &super::writer::Ctx<'_>,
+) -> Result<Frozen, PersistError> {
+    let tx = super::writer::begin(conn, ctx)?;
+    let project_id: String = tx
+        .query_row(
+            "SELECT project_id FROM runs WHERE run_id = ?1",
+            params![job.run_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?
+        .ok_or_else(|| PersistError::RunNotFound(job.run_id.clone()))?;
+    let id = &job.sealed.candidate_id;
+    let existing: Option<(String, String)> = tx
+        .query_row(
+            "SELECT run_id, state FROM candidates WHERE candidate_id = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    match existing {
+        Some((run_id, state)) if run_id == job.run_id => {
+            return Ok(Frozen::Existing {
+                candidate_id: id.clone(),
+                state,
+            });
+        }
+        Some((run_id, _)) => {
+            return Err(PersistError::CandidateOfAnotherRun {
+                candidate_id: id.clone(),
+                run_id,
+            });
+        }
+        None => {}
+    }
+    let m = &job.sealed.manifest;
+    let kept: Vec<&ArtifactRow> = std::iter::once(&job.export).chain(&job.inputs).collect();
+    for (what, sha256) in [
+        ("specification", &m.spec.sha256),
+        ("environment", &m.environment.sha256),
+        ("test plan", &m.test_plan.sha256),
+    ] {
+        if !kept.iter().any(|a| &a.sha256 == sha256) {
+            return Err(PersistError::IntegrityViolation(format!(
+                "candidate {id}: its {what} ({sha256}) is not kept as an object"
+            )));
+        }
+    }
+    let rows: Vec<ArtifactRow> = kept.into_iter().cloned().collect();
+    super::runner::register(&tx, &rows)?;
+    let superseded: Vec<String> = {
+        let mut statement = tx
+            .prepare(&format!(
+                "SELECT candidate_id FROM candidates WHERE run_id = ?1 AND state IN {CURRENT} ORDER BY candidate_id"
+            ))
+            .map_err(sqlite_error)?;
+        let rows = statement
+            .query_map(params![job.run_id], |r| r.get(0))
+            .map_err(sqlite_error)?;
+        rows.collect::<Result<_, _>>().map_err(sqlite_error)?
+    };
+    tx.execute(
+        &format!("UPDATE candidates SET state = 'STALE' WHERE run_id = ?1 AND state IN {CURRENT}"),
+        params![job.run_id],
+    )
+    .map_err(sqlite_error)?;
+    let now = crate::time::now_rfc3339();
+    tx.execute(
+        "INSERT INTO candidates(candidate_id, run_id, git_commit, git_tree, spec_sha256, environment_sha256, \
+         test_plan_sha256, source_path, state, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'FROZEN', ?9)",
+        params![
+            id,
+            job.run_id,
+            m.git_commit,
+            m.git_tree,
+            m.spec.sha256,
+            m.environment.sha256,
+            m.test_plan.sha256,
+            job.export.path,
+            now
+        ],
+    )
+    .map_err(sqlite_error)?;
+    tx.execute(
+        "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            project_id,
+            crate::ids::child_id(id, "frozen"),
+            job.run_id,
+            "candidate.frozen",
+            json!({"candidate_id": id, "superseded": superseded, "source_path": job.export.path}).to_string(),
+            now
+        ],
+    )
+    .map_err(sqlite_error)?;
+    ctx.before_commit()?;
+    tx.commit().map_err(sqlite_error)?;
+    Ok(Frozen::New {
+        candidate_id: id.clone(),
+        superseded,
+    })
+}
+
+#[cfg(test)]
+mod tests;
