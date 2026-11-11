@@ -446,7 +446,7 @@ const SHOWN_WAKES: usize = 50;
 
 /// How urgent an event of a wake is, by its kind and its payload's `severity`, most first: integrity, critical, high,
 /// the rest (decision 7's order).
-fn urgency(kind: &str, severity: Option<&str>) -> u8 {
+pub(super) fn urgency(kind: &str, severity: Option<&str>) -> u8 {
     match (kind, severity) {
         ("integrity_violation", _) => 0,
         ("issue.opened", Some("critical")) => 1,
@@ -852,7 +852,7 @@ pub(super) fn allocate(
                 |r| r.get(0),
             )
             .map_err(sqlite_error)?;
-        let (reasons, _) = unavailability(&tx, &run_id, &wakes, epoch, &state, context)?;
+        let (reasons, _, _) = unavailability(&tx, &run_id, &wakes, epoch, &state, context)?;
         // Only on the verdict the step recorded, and only when this view agrees with it: available both, an ordinary
         // turn; unavailable both, a probe; else nothing until the next step records the change (v17, M2T08R-251).
         let recorded_unavailable = recorded(&tx, &run_id)?.is_some_and(|r| r.unavailable);
@@ -1188,7 +1188,7 @@ fn unavailability(
     epoch: i64,
     binding: &str,
     context: &Context,
-) -> Result<(Vec<&'static str>, Value), PersistError> {
+) -> Result<(Vec<&'static str>, Value, Option<String>), PersistError> {
     let mut reasons = Vec::new();
     if binding == "BLOCKED" {
         reasons.push("binding_blocked");
@@ -1233,9 +1233,11 @@ fn unavailability(
         .collect();
     ended.sort_by_key(|t| t.allocated_seq);
     let mut held: BTreeSet<&'static str> = BTreeSet::new();
+    let mut refused = None;
     for turn in ended {
         if turn.state == Some(AttemptState::Settled) {
             held.clear();
+            refused = None;
             continue;
         }
         match classes.get(&turn.attempt_id).map(String::as_str) {
@@ -1247,6 +1249,7 @@ fn unavailability(
             }
             Some("decision") => {
                 held.insert("context");
+                refused = Some(turn.attempt_id.clone());
             }
             _ => {}
         }
@@ -1256,7 +1259,7 @@ fn unavailability(
             .into_iter()
             .filter(|r| held.contains(r)),
     );
-    Ok((reasons, observation))
+    Ok((reasons, observation, refused))
 }
 
 /// The run's last `supervisor.unavailable` or `supervisor.available`.
@@ -1301,6 +1304,8 @@ fn recorded(tx: &Connection, run_id: &str) -> Result<Option<Recorded>, PersistEr
 pub(super) struct Verdict {
     pub reasons: Vec<&'static str>,
     pub observation: Value,
+    /// The turn whose deterministic refusal holds `context` (docs/adr/ADR-026.md decision 9), named in the record.
+    pub refused: Option<String>,
 }
 
 impl Verdict {
@@ -1327,10 +1332,12 @@ pub(super) fn verdict(
         return Ok(None);
     };
     let wakes = of_run(tx, run_id)?;
-    let (reasons, observation) = unavailability(tx, run_id, &wakes, epoch, &binding, context)?;
+    let (reasons, observation, refused) =
+        unavailability(tx, run_id, &wakes, epoch, &binding, context)?;
     Ok(Some(Verdict {
         reasons,
         observation,
+        refused,
     }))
 }
 
@@ -1409,7 +1416,8 @@ pub(super) fn judge(
             commit.events.push(event(
                 child_id(run_id, &format!("supervisor/{number}")),
                 UNAVAILABLE,
-                json!({"reasons": reasons, "observation": observation, "at": at, "role_epoch": epoch}),
+                json!({"reasons": reasons, "observation": observation, "refused_attempt": verdict.refused,
+                    "at": at, "role_epoch": epoch}),
             ));
         }
         // What the run owes its Commander, blocking (v15): its owed wakes; a wake whose last turn is a probe in flight

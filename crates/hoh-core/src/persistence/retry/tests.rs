@@ -484,6 +484,7 @@ async fn an_ending_records_what_the_agents_turn_showed() -> R {
                     workspace: None,
                     messages: Vec::new(),
                     artifacts: Vec::new(),
+                    artifacts_failed: Vec::new(),
                 },
                 unknown_effect: false,
             },
@@ -1495,5 +1496,56 @@ async fn a_turns_raw_logs_are_registered_with_their_producer_in_its_works_observ
         |r| r.get(0),
     )?;
     assert!(!observed.contains("artifacts"), "{observed}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_raw_log_that_could_not_be_kept_is_recorded_as_a_failure_with_its_producer() -> R {
+    // M2T09R-01: the OBSERVED records what could not be kept, so a missing reference is never silent.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(WORLD)?;
+    let clock = at("2026-11-07T00:00:00Z")?;
+    let dispatched = tick(&store, clock).await?;
+    let [attempt] = dispatched.as_slice() else {
+        return Err(format!("dispatched {dispatched:?}").into());
+    };
+    let notice = store
+        .runner_waiting("p1")
+        .await?
+        .dispatches
+        .into_iter()
+        .find(|d| &d.attempt_id == attempt)
+        .ok_or("no dispatch notice")?;
+    assert!(store.runner_received(notice, clock).await?);
+    assert!(
+        store
+            .runner_running(
+                attempt,
+                crate::persistence::AttemptFacts::default(),
+                json!({})
+            )
+            .await?
+    );
+    let key = crate::reconcile::work_key(attempt);
+    assert!(
+        store
+            .runner_effect(
+                attempt,
+                &key,
+                crate::reconcile::EffectState::Started,
+                crate::reconcile::EffectState::Observed,
+                json!({"success": true, "artifacts_failed": [{"name": "stderr.log", "error": "Permission denied"}]}),
+            )
+            .await?
+    );
+    let produced: String = Connection::open(&path)?.query_row(
+        "SELECT payload_json FROM events WHERE kind = 'attempt.artifacts'",
+        [],
+        |r| r.get(0),
+    )?;
+    let produced: Value = serde_json::from_str(&produced)?;
+    assert_eq!(produced["failed"][0]["name"], "stderr.log");
+    assert_eq!(produced["items"], json!([]));
     Ok(())
 }

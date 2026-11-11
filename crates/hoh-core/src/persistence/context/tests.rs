@@ -151,6 +151,10 @@ fn test_039_02_a_supervision_turn_takes_every_snapshot_tasks_acceptance() -> R {
             && m.task.contains("- 输出文件：/p/b")
             && m.task.contains("- 项目根：/p")
     );
+    // The turn's own identity, which its answers name (M2T09R-03).
+    for id in ["- run_id：R", "- task_id：W/turn/1", "- attempt_id：A9"] {
+        assert!(m.task.contains(id), "{id} missing from {}", m.task);
+    }
     assert!(m.goal.contains("唤醒 W"));
     assert!(m.schemas.contains("DecisionPayload") && m.schemas.contains("Message"));
     // The run's state first, then the event, a TaskResult inside an event a reference only.
@@ -181,8 +185,10 @@ fn test_039_02_a_wake_about_no_task_says_so_and_lists_no_acceptance() -> R {
 
 #[test]
 fn an_events_causal_rank_comes_from_the_wake_subject_and_its_snapshot() -> R {
-    // docs/adr/ADR-026.md decision 11: 2 when a subject field matches, 1 when it names a snapshot task (directly or by
-    // its attempt), 0 else; a TaskResult inside an event is a reference only.
+    // docs/adr/ADR-026.md decision 11: causal 2 when a subject field matches, 1 when it names a snapshot task (directly
+    // or by its attempt), 0 else; relevance = the supervisor's severity band (ADR-025 decision 7: integrity 3, critical
+    // 2, high and need_decision-like 1, the rest 0) x 3 + causal (M2T09R-54); a TaskResult or a raw frame inside an
+    // event, at any depth, is a reference only.
     let (_dir, conn) = world()?;
     let s = supervision(
         json!({"T1": 5, "T2": 2}),
@@ -190,7 +196,7 @@ fn an_events_causal_rank_comes_from_the_wake_subject_and_its_snapshot() -> R {
         json!([
             {"seq": 1, "kind": "team.binding_blocked", "payload": {"role": "qa"}},
             {"seq": 2, "kind": "need_decision", "payload": {"attempt_id": "A0"}},
-            {"seq": 3, "kind": "need_decision", "payload": {"task_id": "T9", "task_result_json": "SENTINEL"}},
+            {"seq": 3, "kind": "need_decision", "payload": {"task_id": "T9", "task_result_json": "SENTINEL", "detail": {"frame": "SENTINEL"}}},
             {"seq": 4, "kind": "issue.opened", "payload": {"task_id": "T9", "severity": "critical"}}
         ]),
     );
@@ -201,13 +207,17 @@ fn an_events_causal_rank_comes_from_the_wake_subject_and_its_snapshot() -> R {
             .iter()
             .find(|e| e.path == format!("events/{seq}"))
     };
-    assert_eq!(of(1).map(|e| (e.causal, e.relevance)), Some((2, 2)));
+    assert_eq!(
+        of(1).map(|e| (e.causal, e.relevance)),
+        Some((2, 5)),
+        "high, the subject's role"
+    );
     assert_eq!(
         of(2).map(|e| (e.causal, e.relevance)),
-        Some((1, 1)),
+        Some((1, 4)),
         "A0 is T1's attempt"
     );
-    assert_eq!(of(3).map(|e| (e.causal, e.relevance)), Some((0, 0)));
+    assert_eq!(of(3).map(|e| (e.causal, e.relevance)), Some((0, 3)));
     assert_eq!(
         of(4).map(|e| (e.causal, e.relevance)),
         Some((0, 6)),
@@ -262,5 +272,115 @@ fn a_handovers_references_are_its_producers_registered_objects_newest_first_and_
     assert!(references(&conn, &["nobody".to_owned()], 20)?.is_empty());
     // The run's budget for its packages: its snapshot's.
     assert_eq!(budget(&conn, "R")?, 20_000);
+    Ok(())
+}
+
+#[test]
+fn a_large_run_state_never_pushes_the_wakes_events_out() -> R {
+    // M2T09R-51: the run's state entries rank after the wake's events and each has a short form, so under a tight
+    // evidence share the events (an integrity violation first) still go in, at least as their summaries.
+    let (_dir, conn) = world()?;
+    let mut s = supervision(
+        json!({"T1": 5}),
+        &[("task_id", "T1")],
+        json!([
+            {"seq": 7, "kind": "integrity_violation", "payload": {"task_id": "T1", "detail": "x".repeat(20_000)}},
+            {"seq": 8, "kind": "need_decision", "payload": {"task_id": "T1", "detail": "y".repeat(20_000)}}
+        ]),
+    );
+    let others: Vec<Value> = (0..200)
+        .map(|n| json!({"id": format!("R/trigger/{n}"), "fingerprint": "f".repeat(60), "severity": "high"}))
+        .collect();
+    s.summary["other_wakes"] = json!(others);
+    let facts = facts(&conn, "R", "W/turn/1", "A9", Some(&s))?;
+    let m = crate::context::mandatory(&facts, "commander", "", Some("/p/b"), Some("/p"))?;
+    let template = crate::config::builtin_contract("commander").ok_or("commander")?;
+    let budget = crate::context::required(template, &m)? + 1_000;
+    let packed = crate::context::pack(template, &m, &facts.entries, budget)?;
+    let placed = |path: &str| {
+        packed
+            .inputs
+            .iter()
+            .find(|i| i.path == path)
+            .map(|i| i.disposition)
+    };
+    assert_ne!(
+        placed("events/7"),
+        Some(crate::context::Disposition::Reference),
+        "the integrity violation"
+    );
+    assert_ne!(
+        placed("events/8"),
+        Some(crate::context::Disposition::Reference)
+    );
+    let order: Vec<&str> = packed.inputs.iter().map(|i| i.path.as_str()).collect();
+    assert_eq!(&order[..2], ["events/7", "events/8"], "{order:?}");
+    Ok(())
+}
+
+#[test]
+fn test_039_02_a_verification_turns_mandatory_items_come_from_its_package_and_rows() -> R {
+    // docs/adr/ADR-026.md decisions 3 and 10 (M2T09R-04, -50): the collector M2-T16's QA and Reviewer dispatch will
+    // use: the package's acceptance_ids' text under its spec, its candidate, its references as references only, and
+    // the Developer's own account (status and summary only, marked a claim, ranked last); nothing else of its
+    // TaskResult.
+    let (_dir, conn) = world()?;
+    let result = json!({"status": "COMPLETED", "summary": "自测通过", "issues": [{"note": "SENTINEL-R50"}],
+        "next_action": "SENTINEL-R50"});
+    conn.execute(
+        "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES \
+         ('p1', 'ready-1', 'R', 'candidate_ready', ?1, '2026-11-07T00:00:00Z')",
+        rusqlite::params![
+            json!({"task_id": "T1", "candidate_id": "CAND-7", "attempt_id": "A0",
+            "task_result_json": result.to_string()})
+            .to_string()
+        ],
+    )?;
+    let sha = "d".repeat(64);
+    let package: crate::protocol::ContextHandoff = serde_json::from_value(json!({
+        "schema_version": "1.0", "run_id": "R", "task_id": "T1", "goal": "交付上下文装箱", "role": "qa",
+        "role_epoch": 1, "spec_sha256": format!("{:064}", 2), "spec_revision": 2,
+        "candidate": {"id": "CAND-7", "git_commit": format!("{:040}", 7), "git_tree": format!("{:040}", 8),
+            "spec_sha256": format!("{:064}", 2), "environment_sha256": format!("{:064}", 3),
+            "test_plan_sha256": format!("{:064}", 4)},
+        "acceptance_ids": ["AC-1-01", "AC-1-02"],
+        "references": [{"path": crate::objects::relative_path(&sha), "sha256": sha}],
+        "output_contract": "TaskResult", "budget_tokens": 20000, "handoff_kind": "verification", "state": null
+    }))?;
+    let facts = verification(&conn, &package)?;
+    let m = crate::context::mandatory(&facts, "qa", "", None, None)?;
+    for body in texts(
+        &conn,
+        "SELECT body FROM acceptance_criteria WHERE ac_id IN ('AC-1-01', 'AC-1-02')",
+    )? {
+        assert!(m.task.contains(&body), "AC text missing: {body}");
+    }
+    assert!(!m.task.contains("另一任务的验收"), "only the package's AC");
+    assert!(m.task.contains("CAND-7") && m.task.contains(&format!("{:040}", 7)));
+    assert!(m.project.contains(&format!("{:064}", 2)));
+    assert_eq!(
+        facts.params.map(|p| p.budget_tokens),
+        Some(20_000),
+        "the package's budget"
+    );
+    let claim = facts
+        .entries
+        .iter()
+        .find(|e| e.path == "claims/CAND-7")
+        .ok_or("no claim")?;
+    assert!(claim.text.contains("开发者自述，仅作线索") && claim.text.contains("自测通过"));
+    assert!(
+        facts
+            .entries
+            .iter()
+            .all(|e| !e.text.contains("SENTINEL-R50")),
+        "only status and summary"
+    );
+    assert!(
+        facts.entries.iter().any(|e| e.text.contains(&sha)),
+        "the reference listed"
+    );
+    let lowest = facts.entries.iter().map(|e| e.relevance).min().unwrap_or(0);
+    assert_eq!(claim.relevance, lowest, "the claim ranks last");
     Ok(())
 }

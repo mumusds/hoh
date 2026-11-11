@@ -470,3 +470,50 @@ fn a_bridge_is_read_line_by_line_within_its_bounds() -> Result<(), Box<dyn std::
     assert!(read_bridge(&file).iter().map(String::len).sum::<usize>() <= BRIDGE_BYTES);
     Ok(())
 }
+
+#[test]
+fn a_log_that_cannot_be_kept_as_an_object_is_registered_in_place_and_one_unreadable_is_a_recorded_failure()
+-> Result<(), Box<dyn std::error::Error>> {
+    // M2T09R-01 (docs/adr/ADR-026.md decision 10): no log is dropped in silence.
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir()?;
+    let logs = dir.path().join(".hoh/attempts/A");
+    std::fs::create_dir_all(&logs)?;
+    std::fs::write(logs.join("stdout.jsonl"), b"{\"a\":1}\n")?;
+    std::fs::write(logs.join("stderr.log"), b"warn\n")?;
+    // Normally: each an object.
+    let (rows, failed) = keep_logs(dir.path(), &logs);
+    assert!(failed.is_empty(), "{failed:?}");
+    assert!(
+        rows.iter()
+            .all(|r| r.kind == "raw_log" && r.path.starts_with(".hoh/objects/")),
+        "{rows:?}"
+    );
+    // The object directory unwritable: registered where they are, under their own sha256.
+    std::fs::remove_dir_all(dir.path().join(".hoh/objects"))?;
+    std::fs::write(dir.path().join(".hoh/objects"), b"not a directory")?;
+    let (rows, failed) = keep_logs(dir.path(), &logs);
+    assert!(failed.is_empty(), "{failed:?}");
+    assert_eq!(rows.len(), 2);
+    for row in &rows {
+        assert_eq!(row.kind, "raw_log_in_place");
+        let bytes = std::fs::read(dir.path().join(&row.path))?;
+        assert_eq!(sha256_hex(&bytes), row.sha256, "{}", row.path);
+    }
+    // Unreadable too: a recorded failure naming it.
+    std::fs::set_permissions(
+        logs.join("stderr.log"),
+        std::fs::Permissions::from_mode(0o000),
+    )?;
+    if std::fs::read(logs.join("stderr.log")).is_err() {
+        let (rows, failed) = keep_logs(dir.path(), &logs);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert_eq!(failed[0]["name"], "stderr.log");
+    }
+    std::fs::set_permissions(
+        logs.join("stderr.log"),
+        std::fs::Permissions::from_mode(0o644),
+    )?;
+    Ok(())
+}

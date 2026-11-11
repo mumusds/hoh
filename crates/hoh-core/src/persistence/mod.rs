@@ -1523,6 +1523,15 @@ impl Reader {
         retry::repair_count(&self.conn, run_id, repair)
     }
 
+    /// What a verification turn's context is packed from, given its handover package (docs/adr/ADR-026.md decisions 3
+    /// and 10): the collector M2-T16's QA and Reviewer dispatch packs with.
+    pub fn verification_context(
+        &self,
+        package: &crate::protocol::ContextHandoff,
+    ) -> Result<crate::context::Facts, PersistError> {
+        context::verification(&self.conn, package)
+    }
+
     /// The attempt `attempt_id`, if it exists.
     pub fn attempt(&self, attempt_id: &str) -> Result<Option<AttemptRow>, PersistError> {
         attempts::read_attempt(&self.conn, attempt_id)

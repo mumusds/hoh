@@ -199,6 +199,9 @@ pub struct Observed {
     /// Its raw logs kept as objects (docs/adr/ADR-026.md decision 10): the runner carries them into its work's OBSERVED,
     /// where they are registered with their producer.
     pub artifacts: Vec<ArtifactRow>,
+    /// Its raw logs that could not be kept or even read (`{name, error}`), recorded with the others so a missing
+    /// reference is never silent (M2T09R-01).
+    pub artifacts_failed: Vec<Value>,
 }
 
 /// Where a turn's prompt came from and what was sent (decision 11, AC-018-05): a `prompt_revisions` row (the role
@@ -707,6 +710,11 @@ fn effect(
                 .map(|a| a.iter().filter_map(ArtifactRow::from_json).collect())
         })
         .unwrap_or_default();
+    let failed: Vec<Value> = detail
+        .as_object_mut()
+        .and_then(|d| d.remove("artifacts_failed"))
+        .and_then(|a| a.as_array().cloned())
+        .unwrap_or_default();
     let mut events = vec![event(
         &project_id,
         &run_id,
@@ -716,7 +724,7 @@ fn effect(
     )];
     if to == EffectState::Observed
         && key == crate::reconcile::work_key(attempt_id)
-        && !artifacts.is_empty()
+        && (!artifacts.is_empty() || !failed.is_empty())
     {
         register(&tx, &artifacts)?;
         let (role, session): (Option<String>, Option<String>) = tx
@@ -733,7 +741,7 @@ fn effect(
             child_id(attempt_id, "artifacts"),
             "attempt.artifacts",
             json!({"attempt_id": attempt_id, "run_id": run_id, "role": role, "session_id": session,
-                "items": artifacts.iter().map(ArtifactRow::json).collect::<Vec<_>>()}),
+                "items": artifacts.iter().map(ArtifactRow::json).collect::<Vec<_>>(), "failed": failed}),
         ));
     }
     if to == EffectState::Observed

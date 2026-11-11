@@ -12,8 +12,9 @@ use std::collections::{BTreeMap, BTreeSet};
 pub(super) const SUBJECT_FIELDS: [&str; 5] =
     ["task_id", "issue_id", "attempt_id", "role", "candidate_id"];
 
-/// Relevance above every event's, so the run's state goes in before the events that led to it.
-const STATE_RELEVANCE: u64 = 100;
+/// Fields of a wake's event payload whose text is another session's or agent's output (an adapter's raw frame, a
+/// whole TaskResult): references only, never entry text (docs/adr/ADR-026.md decisions 10 and 11).
+const REFERENCE_ONLY: [&str; 2] = ["task_result_json", "frame"];
 
 /// The facts of attempt `attempt_id` of task `task_id`, role `role`, in run `run_id`; `supervision` for a Commander
 /// turn.
@@ -50,7 +51,14 @@ pub(super) fn facts(
     };
     let titles = titles(conn, run_id)?;
     match supervision {
-        Some(s) => wake(conn, &mut facts, s, spec_id.as_deref(), &titles)?,
+        Some(s) => wake(
+            conn,
+            &mut facts,
+            s,
+            [run_id, task_id, attempt_id],
+            spec_id.as_deref(),
+            &titles,
+        )?,
         None => work(
             conn,
             &mut facts,
@@ -204,33 +212,59 @@ fn work(
 
 /// How severe a wake's event is, most first: integrity 3, critical 2, high 1, the rest 0 (ADR-025 decision 7).
 fn band(kind: &str, severity: Option<&str>) -> u64 {
-    match (kind, severity) {
-        ("integrity_violation", _) => 3,
-        (_, Some("critical")) => 2,
-        (_, Some("high")) => 1,
-        _ => 0,
+    // The supervisor's own order (ADR-025 decision 7): integrity, critical, high (need_decision and the like), the rest.
+    3 - u64::from(super::wakes::urgency(kind, severity).min(3))
+}
+
+/// `value` with every field named in [`REFERENCE_ONLY`], at any depth, replaced by a note that it is a reference only.
+fn redacted(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| {
+                    if REFERENCE_ONLY.contains(&k.as_str()) {
+                        (k.clone(), json!("（只供引用，见该事件）"))
+                    } else {
+                        (k.clone(), redacted(v))
+                    }
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(redacted).collect()),
+        other => other.clone(),
     }
 }
 
-/// A Commander turn's question, header, scope (the wake's whole snapshot), acceptance (its subject tasks') and its
-/// evidence: the run's state first, then the wake's events by severity, cause and recency (decision 11).
+/// A Commander turn's question, header, scope (the wake's whole snapshot), acceptance (every snapshot task's) and its
+/// evidence: the wake's events by severity, cause and recency, then the run's state, each with a short form of its own,
+/// so a large state entry can never push the events that woke it out (decision 11, M2T09R-51).
 fn wake(
     conn: &Connection,
     facts: &mut Facts,
     s: &super::Supervision,
+    [run_id, task_id, attempt_id]: [&str; 3],
     spec_id: Option<&str>,
     titles: &BTreeMap<String, String>,
 ) -> Result<(), PersistError> {
     let summary = &s.summary;
     let wake = &summary["wake"];
+    let kinds: BTreeSet<&str> = summary["events"]
+        .as_array()
+        .map(|e| e.iter().filter_map(|e| e["kind"].as_str()).collect())
+        .unwrap_or_default();
     facts.question = Some(format!(
-        "唤醒 {}（严重度 {}，指纹 {}）",
+        "唤醒 {}（种类 {}，严重度 {}，指纹 {}）",
         s.wake,
+        kinds.into_iter().collect::<Vec<_>>().join("、"),
         wake["severity"].as_str().unwrap_or("?"),
         wake["fingerprint"].as_str().unwrap_or("?")
     ));
     let total = |key: &str| summary[key].as_u64().unwrap_or(0).to_string();
+    // The turn's own identity first: its answers name it (commander.md's output contract, M2T09R-03).
     facts.header = vec![
+        ("run_id".to_owned(), run_id.to_owned()),
+        ("task_id".to_owned(), task_id.to_owned()),
+        ("attempt_id".to_owned(), attempt_id.to_owned()),
         ("causation_id".to_owned(), s.wake.clone()),
         (
             "expected_revision（Run 的 revision）".to_owned(),
@@ -276,15 +310,21 @@ fn wake(
         }
     }
     facts.acceptance.sort();
-    // The run's state, before the events.
-    for key in ["tasks", "roles", "other_wakes", "recent_rejections"] {
+    // The run's state, after the events (relevance 0, recency 0), each with its count as its short form.
+    for (key, what) in [
+        ("tasks", "快照任务的状态"),
+        ("roles", "职位绑定"),
+        ("other_wakes", "其他待执行的唤醒"),
+        ("recent_rejections", "最近被拒或无效的回答"),
+    ] {
+        let count = summary[key].as_array().map_or(0, Vec::len);
         facts.entries.push(Entry {
             class: Class::Evidence,
             kind: Kind::Plain,
             path: format!("summary/{key}"),
             text: summary[key].to_string(),
-            summary: None,
-            relevance: STATE_RELEVANCE,
+            summary: Some(format!("{what}：{count} 条（全文见引用）")),
+            relevance: 0,
             recency: 0,
             causal: 0,
         });
@@ -297,15 +337,7 @@ fn wake(
     for event in events {
         let seq = event["seq"].as_u64().unwrap_or(0);
         let kind = event["kind"].as_str().unwrap_or_default();
-        let mut payload = event["payload"].clone();
-        if let Some(object) = payload.as_object_mut()
-            && object.contains_key("task_result_json")
-        {
-            object.insert(
-                "task_result_json".to_owned(),
-                json!("（只供引用，见该事件）"),
-            );
-        }
+        let payload = redacted(&event["payload"]);
         let field = |name: &str| payload.get(name).and_then(Value::as_str).map(str::to_owned);
         let causal = if SUBJECT_FIELDS
             .iter()
@@ -365,6 +397,130 @@ fn attempt_tasks(
         }
     }
     Ok(out)
+}
+
+/// The facts of a verification turn from its package (docs/adr/ADR-026.md decisions 3 and 10): the collector M2-T16's
+/// QA and Reviewer dispatch uses. Its scope is the package's task and candidate, its in-scope acceptance the package's
+/// `acceptance_ids` under its spec, its budget the package's; its evidence the package's references (listed, never
+/// read) and the Developer's own account of the candidate, only its status and summary, marked a claim and ranked
+/// after everything else (docs/07 section 4: requirements, AC and artifacts first).
+pub(super) fn verification(
+    conn: &Connection,
+    package: &crate::protocol::ContextHandoff,
+) -> Result<Facts, PersistError> {
+    let run_id = package.run_id.as_str();
+    let spec_id: Option<String> = match (&package.spec_sha256, package.spec_revision) {
+        (Some(sha), Some(revision)) => conn
+            .query_row(
+                "SELECT s.spec_id FROM specs s JOIN runs r ON r.project_id = s.project_id \
+                 WHERE r.run_id = ?1 AND s.sha256 = ?2 AND s.revision = ?3",
+                params![run_id, sha, i64::try_from(revision).unwrap_or(i64::MAX)],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sqlite_error)?,
+        _ => None,
+    };
+    let mut facts = Facts {
+        goal: Some(package.goal.clone()),
+        spec: package
+            .spec_sha256
+            .clone()
+            .zip(package.spec_revision.and_then(|r| i64::try_from(r).ok())),
+        candidate: package
+            .candidate
+            .as_ref()
+            .map(|c| (c.id.clone(), c.git_commit.clone(), c.git_tree.clone())),
+        ..Facts::default()
+    };
+    let snapshot: Option<String> = conn
+        .query_row(
+            "SELECT json_extract(config_snapshot_json, '$.context') FROM runs WHERE run_id = ?1",
+            params![run_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?
+        .flatten();
+    let shares = snapshot
+        .as_deref()
+        .and_then(params_of)
+        .unwrap_or(crate::context::CONTEXT_V1)
+        .shares;
+    facts.params = Some(Params {
+        budget_tokens: package.budget_tokens,
+        shares,
+    });
+    let candidate = package
+        .candidate
+        .as_ref()
+        .map(|c| c.id.clone())
+        .unwrap_or_default();
+    facts.scope.push(format!(
+        "验证任务 {} 的候选 {candidate}（职位 {}）",
+        package.task_id.as_deref().unwrap_or("-"),
+        package.role
+    ));
+    if let Some(spec_id) = spec_id.as_deref() {
+        for id in &package.acceptance_ids {
+            let body: Option<String> = conn
+                .query_row(
+                    "SELECT body FROM acceptance_criteria WHERE ac_id = ?1 AND spec_id = ?2",
+                    params![id, spec_id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(sqlite_error)?;
+            if let Some(body) = body {
+                facts.acceptance.push((id.clone(), body));
+            }
+        }
+    }
+    facts.acceptance.sort();
+    for (n, r) in package.references.iter().enumerate() {
+        facts.entries.push(Entry {
+            class: Class::Evidence,
+            kind: Kind::Plain,
+            path: format!("references/{n}"),
+            text: format!(
+                "引用（只供取回，不在此展开）：{} sha256:{}",
+                r.path, r.sha256
+            ),
+            summary: None,
+            relevance: 1,
+            recency: 0,
+            causal: 0,
+        });
+    }
+    // The Developer's own account: status and summary only, a claim (docs/07 section 4, ADR-026 decision 10).
+    let ready: Option<String> = conn
+        .query_row(
+            "SELECT json_extract(payload_json, '$.task_result_json') FROM events WHERE run_id = ?1 \
+             AND kind = 'candidate_ready' AND json_extract(payload_json, '$.candidate_id') = ?2 \
+             ORDER BY seq DESC LIMIT 1",
+            params![run_id, candidate],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?
+        .flatten();
+    if let Some(result) = ready.and_then(|t| serde_json::from_str::<Value>(&t).ok()) {
+        facts.entries.push(Entry {
+            class: Class::Evidence,
+            kind: Kind::Plain,
+            path: format!("claims/{candidate}"),
+            text: format!(
+                "开发者自述，仅作线索：status={}；summary={}",
+                result["status"].as_str().unwrap_or("?"),
+                result["summary"].as_str().unwrap_or("")
+            ),
+            summary: None,
+            relevance: 0,
+            recency: 0,
+            causal: 0,
+        });
+    }
+    Ok(facts)
 }
 
 /// The objects attempts `attempts` produced, in that order and each attempt's in its own order, as references: from

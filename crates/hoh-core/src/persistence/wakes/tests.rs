@@ -4233,6 +4233,14 @@ async fn a_supervision_turn_refused_for_its_context_makes_its_commander_unavaila
         unavailable(&path)?.last().cloned(),
         Some(json!(["supervisor.unavailable", ["context"]]))
     );
+    // The record names the refused turn (M2T09R-05, -55).
+    let refused: String = Connection::open(&path)?.query_row(
+        "SELECT json_extract(payload_json, '$.refused_attempt') FROM events WHERE kind = 'supervisor.unavailable' \
+         ORDER BY seq DESC LIMIT 1",
+        [],
+        |r| r.get(0),
+    )?;
+    assert_eq!(refused, a.attempt_id);
     // No turn by backoff meanwhile; past the cooldown one probe, which settles and recovers.
     assert!(
         store

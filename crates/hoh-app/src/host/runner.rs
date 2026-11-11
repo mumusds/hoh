@@ -801,6 +801,9 @@ async fn attempt(
     }
     // Its raw logs kept as objects, registered with their producer with this OBSERVED (docs/adr/ADR-026.md decision
     // 10).
+    if !outcome.observed.artifacts_failed.is_empty() {
+        observed["artifacts_failed"] = json!(outcome.observed.artifacts_failed);
+    }
     if !outcome.observed.artifacts.is_empty() {
         observed["artifacts"] = json!(
             outcome

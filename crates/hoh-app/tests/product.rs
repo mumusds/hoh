@@ -2031,6 +2031,9 @@ async fn test_019_02_the_new_commanders_first_input_is_the_checkpoint_package() 
             sent.find("# 本次唤醒").ok_or("no wake")?,
         );
         assert!(contract < handover && handover < wake, "{sent}");
+        // The wake's own evidence too, not only its heading (docs/adr/ADR-026.md decision 3).
+        let evidence = sent.find("events/").ok_or("no wake evidence")?;
+        assert!(handover < evidence, "{sent}");
         assert!(sent.contains(&format!("{:064}", 3)), "the package names revision 3's digest: {sent}");
         assert_eq!(sent.matches(sentinel).count(), 0, "{sent}");
         R::Ok(())
@@ -2504,7 +2507,11 @@ fn task_with_acceptance(
          INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate)
            VALUES ('{task}', '{run_id}', 's1', 'READY', 1, 'developer', 0,
            (SELECT coalesce(max(created_seq), 0) + 1 FROM tasks), 1);
-         INSERT INTO task_requirements(task_id, requirement_id, spec_id) VALUES ('{task}', 'REQ-X', 's1');"
+         INSERT INTO task_requirements(task_id, requirement_id, spec_id) VALUES ('{task}', 'REQ-X', 's1');
+         INSERT INTO candidates(candidate_id, run_id, git_commit, git_tree, spec_sha256, environment_sha256,
+           test_plan_sha256, source_path, state, created_at) VALUES
+           ('CAND-039', '{run_id}', printf('%040d', 39), printf('%040d', 40), printf('%064d', 1), printf('%064d', 4),
+            printf('%064d', 5), '/repo', 'FROZEN', '2026-11-10T00:00:00Z');"
     );
     for n in 1..=earlier {
         sql.push_str(&format!(
@@ -2586,6 +2593,21 @@ async fn test_039_04_repacking_from_an_attempts_record_gives_the_prompt_it_was_s
         };
         assert_eq!(digest(sent[0].as_bytes()), sha);
         assert!(sent[0].contains("份额是硬上限 {{GOAL}}"), "an AC naming a placeholder is text");
+        assert!(sent[0].contains("CAND-039") && sent[0].contains(&format!("{:040}", 39)), "the candidate");
+        // Recorded in the commit that marked it RUNNING, before its gate opened (decision 7, M2T09R-56): with its
+        // tracking, before its work's OBSERVED.
+        let seq = |sql: &str| -> R<i64> { Ok(query(&project, sql)?.parse()?) };
+        let packed_at = seq(
+            "SELECT seq FROM events WHERE kind = 'context.packed' AND json_extract(payload_json, '$.attempt_id') = 'T-a/attempt-4'",
+        )?;
+        let tracking_at = seq("SELECT seq FROM events WHERE event_id = 'T-a/attempt-4/tracking'")?;
+        let observed_at = seq(
+            "SELECT seq FROM events WHERE kind = 'effect.observed' AND json_extract(payload_json, '$.attempt_id') = 'T-a/attempt-4'",
+        )?;
+        assert!(
+            packed_at < observed_at && (packed_at - tracking_at).abs() <= 3,
+            "{packed_at} {tracking_at} {observed_at}"
+        );
         // Its evidence went in as summaries, ranked newest first.
         let summaries: Vec<&str> = inputs
             .iter()
@@ -2707,7 +2729,8 @@ async fn a_new_commanders_prompt_carries_references_and_none_of_its_predecessors
         let old_session = format!("{run_id}/session/commander/1");
         until(&project, &commander, &format!("codex/1/{old_session}"), limit).await?;
         let sentinel = "SENTINEL-039-03-c4e1";
-        let log = format!("{}\n{sentinel}\n", "x".repeat(210_000));
+        // At its start, in its middle and at its end (M2T09R-53): a head or a tail of it in the prompt would show.
+        let log = format!("{sentinel}\n{}\n{sentinel}\n{}\n{sentinel}\n", "x".repeat(105_000), "y".repeat(105_000));
         let sha = hoh_core::objects::put(&project, log.as_bytes())?;
         let item = json!({"artifact_id": format!("{sha}:p"), "sha256": sha,
             "path": hoh_core::objects::relative_path(&sha), "bytes": log.len(), "mime": "text/plain",
@@ -2728,6 +2751,9 @@ async fn a_new_commanders_prompt_carries_references_and_none_of_its_predecessors
                    '2026-11-10T00:00:00Z' FROM runs WHERE run_id = '{run_id}';
                  INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
                    SELECT project_id, 'frame-039-03', '{run_id}', 'adapter.unknown_event',
+                   '{{\"frame\": \"{sentinel}\"}}', '2026-11-10T00:00:00Z' FROM runs WHERE run_id = '{run_id}';
+                 INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
+                   SELECT project_id, 'diagnostic-039-03', '{run_id}', 'adapter.diagnostic',
                    '{{\"frame\": \"{sentinel}\"}}', '2026-11-10T00:00:00Z' FROM runs WHERE run_id = '{run_id}';
                  INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
                    SELECT project_id, 'ready-039-03', '{run_id}', 'candidate_ready',
@@ -2757,7 +2783,8 @@ async fn a_new_commanders_prompt_carries_references_and_none_of_its_predecessors
             &project,
             &format!(
                 "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) \
-                   SELECT project_id, 'nd-039-03', '{run_id}', 'need_decision', '{{\"fingerprint\": \"fp-039-03\"}}', \
+                   SELECT project_id, 'nd-039-03', '{run_id}', 'need_decision', \
+                   '{{\"fingerprint\": \"fp-039-03\", \"task_result_json\": \"{sentinel}\", \"detail\": {{\"frame\": \"{sentinel}\"}}}}', \
                    '2026-11-10T00:00:00Z' FROM runs WHERE run_id = '{run_id}';"
             ),
         )?;
@@ -2785,6 +2812,14 @@ async fn a_new_commanders_prompt_carries_references_and_none_of_its_predecessors
         };
         assert_eq!(sent.matches(sentinel).count(), 0);
         assert!(sent.contains(&sha), "the reference is in the package it was sent");
+        // The turn's own identity, which its answers name (M2T09R-03).
+        let turn = query(
+            &project,
+            "SELECT a.attempt_id || '|' || a.task_id FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+             WHERE t.role = 'commander' AND a.session_id LIKE '%/commander/2'",
+        )?;
+        let (attempt, task) = turn.split_once('|').ok_or("no commander turn")?;
+        assert!(sent.contains(&format!("attempt_id：{attempt}")) && sent.contains(&format!("task_id：{task}")), "{sent}");
         let tokens = hoh_core::context::estimate(sent);
         assert!(tokens <= package.budget_tokens, "{tokens} > {}", package.budget_tokens);
         // The package first, then the wake's evidence (docs/adr/ADR-026.md decision 3).
