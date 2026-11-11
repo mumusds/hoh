@@ -1,7 +1,7 @@
 # CR-015 · AC-021-04 以 Run 的 revision 叙述过期决策
 
 ID：CR-015
-状态：PROPOSED（待独立审查；PASS 后依 CR-003 D1 预授权批准）
+状态：WITHDRAWN（2026-11-11，设计审查第 2 轮：Codex M2T08D-107、Claude M2T08D-160 均判其放宽检查；改由 ADR-025 第三版决定 6 的 Task 快照栅栏，AC-021-04 按原文成立，不需要 CR）
 批准人：（待定）
 日期：2026-11-11
 基线：修改受锁文件 `contracts/requirements.json`（REQ-021 的 AC-021-04）与 `contracts/acceptance-scenarios.json`（TEST-021-04），重新上锁
