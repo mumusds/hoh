@@ -649,7 +649,7 @@
     "AC-054-03",
     "AC-039-03"
    ],
-   "done_when": "AC-021-05、AC-035-03/05、AC-036-03、AC-037-02/03/04、AC-053-03、AC-054-03 通过；Commander 不可用时 candidate_ready 仍派发 QA/Review；FAILED/UNKNOWN 永不投影为 PASS；AC-039-03 通过（CR-016：QA 的 Prompt 经产品 QA 派发、同一收集函数与装箱器生成，由 FakeAgent 捕获）。"
+   "done_when": "AC-021-05、AC-035-03/05、AC-036-03、AC-037-02/03/04、AC-053-03、AC-054-03 通过；Commander 不可用时 candidate_ready 仍派发 QA/Review；FAILED/UNKNOWN 永不投影为 PASS；AC-039-03 通过（CR-016：QA 的 Prompt 经产品 QA 派发、同一收集函数与装箱器生成，由 FakeAgent 捕获）；为 QA、Reviewer 与返工的 Developer 加入代码类上下文来源（冻结候选相对其基准改动的文件，ADR-026 决定 12），并写 handoffs 表（ADR-026 决定 6）。"
   },
   {
    "id": "M2-T18",
@@ -877,7 +877,7 @@
     "REQ-046",
     "REQ-047"
    ],
-   "done_when": "本里程碑全部需求spec_maturity=detailed；validate_bundle通过；CR已APPROVED并relock；按每个实现任务≤2项需求、≤8条AC拆分本里程碑实现任务（更新 development-tasks.json 的 requirements/acceptance/checks/depends_on，validate_bundle 的归属规则通过）；每条 AC 只分给依赖闭包已提供其所需能力（host、API、CLI 最终结果、QA/Review 循环、systemd、doctor、TUI 等）的任务（CR3R-02）。"
+   "done_when": "本里程碑全部需求spec_maturity=detailed；validate_bundle通过；CR已APPROVED并relock；按每个实现任务≤2项需求、≤8条AC拆分本里程碑实现任务（更新 development-tasks.json 的 requirements/acceptance/checks/depends_on，validate_bundle 的归属规则通过）；每条 AC 只分给依赖闭包已提供其所需能力（host、API、CLI 最终结果、QA/Review 循环、systemd、doctor、TUI 等）的任务（CR3R-02）；拆分时把 REQ-039 按任务范围选代码的上下文来源（ADR-026 决定 12）分给一个实现任务，写进它的 done_when（CR-016）。"
   },
   {
    "id": "M3-T02",

@@ -1,7 +1,7 @@
 # CR-016 · AC-039-03 改归 QA 派发任务
 
 ID：CR-016
-状态：PROPOSED（待独立审查；属 CR-003 D1 预授权的细化，审查判定 PASS 后由 CTO 批准）
+状态：PROPOSED（设计审查第 2 轮：Codex 判 CR-016 单项 PASS，Claude PASS 并要求补承接项 -155；补后待第 3 轮复核，属 CR-003 D1 预授权的细化，审查判定 PASS 后由 CTO 批准）
 批准人：（待定）
 日期：2026-11-11
 基线：不改受锁文件，不重新上锁（只改 `contracts/development-tasks.json` 的任务归属，重新生成 docs/18）
@@ -16,13 +16,14 @@ M2-T09（依赖 M2-T07、M2-T04、M2-T17）的依赖闭包里没有 QA 派发：
 
 1. AC-039-03 从 M2-T09 改归 M2-T16，做法与 CR-004 F2、CR-008、CR-010 相同：AC 分给了早于其所需能力的任务，就改归属。
    - M2-T09：acceptance 写明 AC-039-01、AC-039-02、AC-039-04；done_when 改为“AC-039-01、-02、-04 通过；交接只传引用（REQ-039 行为 5）由 Commander 交接的非 AC 测试覆盖。需要 QA 派发的 AC-039-03 归 M2-T16（CR-016）。”
-   - M2-T16：requirements 加上 REQ-039；acceptance 加上 AC-039-03；done_when 加上“AC-039-03 通过（CR-016：QA 的 Prompt 经产品 QA 派发、同一收集函数与装箱器生成，由 FakeAgent 捕获）”。
+   - M2-T16：requirements 加上 REQ-039；acceptance 加上 AC-039-03；done_when 加上“AC-039-03 通过（CR-016：QA 的 Prompt 经产品 QA 派发、同一收集函数与装箱器生成，由 FakeAgent 捕获）”，以及 ADR-026 移交给它的两项：为 QA、Reviewer 与返工的 Developer 加入代码类上下文来源（冻结候选相对其基准改动的文件，ADR-026 决定 12），写 handoffs 表（决定 6）。
+   - M3-T01：done_when 加上“拆分时把 REQ-039 按任务范围选代码的上下文来源分给一个实现任务，写进它的 done_when”（M3-T02、M3-T04 的需求里没有 REQ-039，承接必须有契约载体，设计审查 M2T09D-155）。
    - `integration` 检查的所有者不变。
 2. M2-T09 仍按 REQ-039 行为 5 与失败模式 3 实现交接只传引用（ADR-026 决定 10）：两种交接包的 references 与预算、只供引用的种类与字段白名单、QA 收集函数。它用不带 TEST id 的补充测试验证能验证的部分：新 Commander 经产品执行器与假 pi 的首个 Prompt 中哨兵（放在前任原始日志、adapter 原始帧与 TaskResult 非白名单字段里）出现 0 次，references 非空且每项为 64 位十六进制、文件存在，Prompt 的估算不超过交接包的 budget_tokens；QA 的收集与装箱有函数级测试。这些测试的名字里没有 `test_039_03`，不生成 TEST-039-03 的记录，不计为 AC-039-03 的证据；正式的 TEST-039-03 由 M2-T16 实现。
 
 ## 影响
 
-- `contracts/development-tasks.json`：M2-T09 与 M2-T16 两项。
+- `contracts/development-tasks.json`：M2-T09、M2-T16 与 M3-T01 三项。
 - 重新生成 `docs/18`（`tools/gen_spec_views.py`）。
 - M2-T16 的 AC 数由 9 变 10、需求由 6 变 7。docs/08 “每个实现任务 ≤2 项需求、≤8 条 AC”是 M3–M7 拆分时的规则；M2-T16 在 CR-004 时已超出，这里沿用同一处理（能力所在的任务承接），不另拆任务。
 
