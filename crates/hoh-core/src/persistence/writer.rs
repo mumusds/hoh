@@ -148,6 +148,11 @@ enum Job {
         Box<OutboxJob>,
         oneshot::Sender<Result<OutboxDone, PersistError>>,
     ),
+    /// A check's evidence to record ([`super::evidence::record`]).
+    Evidence(
+        Box<super::evidence::Recording>,
+        oneshot::Sender<Result<(), PersistError>>,
+    ),
     /// A candidate to freeze ([`super::candidates::freeze`]).
     Candidates(
         Box<super::candidates::Freeze>,
@@ -350,6 +355,7 @@ impl Job {
             Job::Pragmas(..) => "Pragmas",
             Job::Outbox(..) => "Outbox",
             Job::Candidates(..) => "Candidates",
+            Job::Evidence(..) => "Evidence",
             Job::Plan(..) => "Plan",
             Job::Round(..) => "Round",
             Job::Reconcile(..) => "Reconcile",
@@ -497,6 +503,13 @@ impl Writer {
                                 &ctx,
                                 reply,
                                 run_outbox(&mut conn, *job, &writer_claims, &ctx),
+                            ));
+                        }
+                        Job::Evidence(job, reply) => {
+                            deferred = Some(answer(
+                                &ctx,
+                                reply,
+                                super::evidence::record(&mut conn, &job, &ctx),
                             ));
                         }
                         Job::Candidates(job, reply) => {
@@ -703,6 +716,14 @@ impl Writer {
 
     pub(super) async fn outbox(&self, job: OutboxJob) -> Result<OutboxDone, PersistError> {
         self.submit(|tx| Job::Outbox(Box::new(job), tx)).await
+    }
+
+    pub(super) async fn record_evidence(
+        &self,
+        recording: super::evidence::Recording,
+    ) -> Result<(), PersistError> {
+        self.submit(|tx| Job::Evidence(Box::new(recording), tx))
+            .await
     }
 
     pub(super) async fn freeze_candidate(

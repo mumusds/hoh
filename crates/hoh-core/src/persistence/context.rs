@@ -534,8 +534,8 @@ pub(super) fn verification(
 }
 
 /// The objects attempts `attempts` produced, in that order and each attempt's in its own order, as references: from
-/// their `attempt.artifacts` events (docs/adr/ADR-026.md decision 10), an object two of them produced once, at most
-/// `limit`.
+/// their `attempt.artifacts` events (docs/adr/ADR-026.md decision 10) and the `evidence.recorded` of each check they
+/// ran (docs/adr/ADR-027.md decision 8), merged in event order; an object produced twice once, at most `limit`.
 pub(super) fn references(
     conn: &Connection,
     attempts: &[String],
@@ -544,29 +544,45 @@ pub(super) fn references(
     let mut out: Vec<crate::protocol::ArtifactRef> = Vec::new();
     let mut seen = BTreeSet::new();
     for attempt in attempts {
-        let payload: Option<String> = conn
-            .query_row(
-                "SELECT payload_json FROM events WHERE event_id = ?1 AND kind = 'attempt.artifacts'",
-                params![crate::ids::child_id(attempt, "artifacts")],
-                |r| r.get(0),
+        // The attempt's own artifacts and each check it ran (`evidence.recorded`, docs/adr/ADR-027.md decision 8), in
+        // the order they were written.
+        let mut statement = conn
+            .prepare(
+                "SELECT kind, payload_json FROM events \
+                 WHERE (event_id = ?1 AND kind = 'attempt.artifacts') \
+                    OR (kind = 'evidence.recorded' AND json_extract(payload_json, '$.attempt_id') = ?2) \
+                 ORDER BY seq",
             )
-            .optional()
             .map_err(sqlite_error)?;
-        let Some(payload) = payload else { continue };
-        let payload: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
-        for item in payload["items"].as_array().cloned().unwrap_or_default() {
-            let (Some(sha256), Some(path)) = (item["sha256"].as_str(), item["path"].as_str())
-            else {
-                continue;
+        let payloads = statement
+            .query_map(
+                params![crate::ids::child_id(attempt, "artifacts"), attempt],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .map_err(sqlite_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sqlite_error)?;
+        for (kind, payload) in payloads {
+            let payload: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
+            let items = if kind == "attempt.artifacts" {
+                &payload["items"]
+            } else {
+                &payload["artifacts"]
             };
-            if out.len() >= limit {
-                return Ok(out);
-            }
-            if seen.insert((sha256.to_owned(), path.to_owned())) {
-                out.push(crate::protocol::ArtifactRef {
-                    path: path.to_owned(),
-                    sha256: sha256.to_owned(),
-                });
+            for item in items.as_array().cloned().unwrap_or_default() {
+                let (Some(sha256), Some(path)) = (item["sha256"].as_str(), item["path"].as_str())
+                else {
+                    continue;
+                };
+                if out.len() >= limit {
+                    return Ok(out);
+                }
+                if seen.insert((sha256.to_owned(), path.to_owned())) {
+                    out.push(crate::protocol::ArtifactRef {
+                        path: path.to_owned(),
+                        sha256: sha256.to_owned(),
+                    });
+                }
             }
         }
     }

@@ -263,7 +263,7 @@ impl ArtifactRow {
 }
 
 /// An `artifacts` row's id: its content and its path.
-fn artifact_id(sha256: &str, path: &str) -> String {
+pub(super) fn artifact_id(sha256: &str, path: &str) -> String {
     format!("{sha256}:{path}")
 }
 

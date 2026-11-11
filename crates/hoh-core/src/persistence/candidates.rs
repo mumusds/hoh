@@ -202,5 +202,49 @@ pub(super) fn producer(
     .map_err(sqlite_error)
 }
 
+/// A run's specification as the acceptance rows need it: its id and digest, and each criterion with its scenario check
+/// and whether its requirement may degrade (`(ac_id, check_id, degradable)`, by ac_id).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunAcceptance {
+    pub spec_id: String,
+    pub spec_sha256: String,
+    pub criteria: Vec<(String, String, bool)>,
+}
+
+/// The run `run_id`'s specification and criteria, if the run exists and has a specification.
+pub(super) fn acceptance(
+    conn: &Connection,
+    run_id: &str,
+) -> Result<Option<RunAcceptance>, PersistError> {
+    let spec: Option<(String, String)> = conn
+        .query_row(
+            "SELECT s.spec_id, s.sha256 FROM runs r JOIN specs s ON s.spec_id = r.spec_id WHERE r.run_id = ?1",
+            params![run_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some((spec_id, spec_sha256)) = spec else {
+        return Ok(None);
+    };
+    let mut statement = conn
+        .prepare(
+            "SELECT a.ac_id, a.check_id, q.release_class = 'degradable' FROM acceptance_criteria a \
+             JOIN requirements q ON q.requirement_id = a.requirement_id AND q.spec_id = a.spec_id \
+             WHERE a.spec_id = ?1 ORDER BY a.ac_id",
+        )
+        .map_err(sqlite_error)?;
+    let criteria = statement
+        .query_map(params![spec_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .map_err(sqlite_error)?
+        .collect::<Result<Vec<(String, String, bool)>, _>>()
+        .map_err(sqlite_error)?;
+    Ok(Some(RunAcceptance {
+        spec_id,
+        spec_sha256,
+        criteria,
+    }))
+}
+
 #[cfg(test)]
 mod tests;

@@ -18,6 +18,7 @@ mod commands;
 mod context;
 mod control;
 mod decide;
+mod evidence;
 mod handover;
 mod inputs;
 mod leases;
@@ -32,8 +33,9 @@ mod runner;
 mod supervise;
 mod team;
 mod wakes;
-pub use candidates::{CandidateRow, Freeze, Frozen};
+pub use candidates::{CandidateRow, Freeze, Frozen, RunAcceptance};
 pub use control::{CancelPass, Finished, PauseStep};
+pub use evidence::{AcceptanceRow, Recording};
 pub use handover::SessionStart;
 pub use leases::{Grant, LEASE_TTL, LeaseView};
 pub use outbox::{ConsumeEffect, Consumed, OutboxRow, Settlement, backoff};
@@ -239,6 +241,9 @@ pub enum PersistError {
         candidate_id: String,
         run_id: String,
     },
+    /// Evidence the store does not take: its candidate is not frozen here, or its producer is not a qa or reviewer
+    /// attempt of the candidate's run (docs/adr/ADR-027.md principle two); nothing was written.
+    EvidenceRefused(String),
     /// Any other SQLite or I/O failure.
     Storage(String),
 }
@@ -362,6 +367,7 @@ impl std::fmt::Display for PersistError {
             },
             PersistError::WriterStopped => write!(f, "the database writer is not running"),
             PersistError::NotScratch(why) => write!(f, "not a scratch database: {why}"),
+            PersistError::EvidenceRefused(why) => write!(f, "evidence refused: {why}"),
             PersistError::CandidateOfAnotherRun {
                 candidate_id,
                 run_id,
@@ -1226,6 +1232,13 @@ impl Store {
         self.writer.fence(message.clone()).await
     }
 
+    /// Record a check's evidence in one transaction (docs/adr/ADR-027.md decisions 7 to 9): the evidence row and its
+    /// acceptance rows, its objects, `evidence.recorded`, `integrity_violation` when the source changed, and the
+    /// candidate made INVALID when the evidence is.
+    pub async fn record_evidence(&self, recording: Recording) -> Result<(), PersistError> {
+        self.writer.record_evidence(recording).await
+    }
+
     /// Freeze a candidate for its run in one transaction (docs/adr/ADR-027.md decision 5): a new FROZEN row whose run's
     /// earlier current candidates go STALE, its export and inputs registered and a `candidate.frozen` event; the same
     /// content again in the run returns its id and state; another run's content is refused.
@@ -1551,6 +1564,11 @@ impl Reader {
     /// The candidate `candidate_id`'s row (docs/adr/ADR-027.md decision 6: what a check is checked against).
     pub fn candidate(&self, candidate_id: &str) -> Result<Option<CandidateRow>, PersistError> {
         candidates::candidate(&self.conn, candidate_id)
+    }
+
+    /// The run `run_id`'s specification and acceptance criteria (docs/adr/ADR-027.md decision 9).
+    pub fn acceptance(&self, run_id: &str) -> Result<Option<RunAcceptance>, PersistError> {
+        candidates::acceptance(&self.conn, run_id)
     }
 
     /// The attempt `attempt_id`'s run and task role: who may produce evidence (docs/adr/ADR-027.md principle two).
