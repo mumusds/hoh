@@ -507,42 +507,67 @@ fn fire(
         .map_err(sqlite_error)?;
         let severity = Severity::named(&t.severity).unwrap_or(Severity::Normal);
         // The tasks its events name: what the wake's turn will be shown, and fenced by (decisions 3 and 6).
+        // A re-trigger names every task its stale turn was shown (task_ids); a Commander's own mistakes in a row back
+        // its wake off from now (decision 6, -700, -752).
         let mut task_ids: Vec<String> = Vec::new();
+        let mut mistakes = 0;
         for seq in &t.seqs {
-            let named: Option<String> = tx
+            let (kind, payload): (String, String) = tx
                 .query_row(
-                    "SELECT json_extract(payload_json, '$.task_id') FROM events WHERE seq = ?1",
+                    "SELECT kind, payload_json FROM events WHERE seq = ?1",
                     params![seq],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
-                .optional()
-                .map_err(sqlite_error)?
-                .flatten();
-            if let Some(task) = named.filter(|t| !task_ids.contains(t)) {
-                task_ids.push(task);
+                .map_err(sqlite_error)?;
+            let payload: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
+            let named = payload["task_id"].as_str().into_iter().chain(
+                payload["task_ids"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str),
+            );
+            for task in named {
+                if !task_ids.iter().any(|t| t == task) {
+                    task_ids.push(task.to_owned());
+                }
+            }
+            if kind == "supervisor.retrigger" && payload["own_mistake"] == json!(true) {
+                mistakes = mistakes.max(payload["n"].as_u64().unwrap_or(1));
             }
         }
+        let not_before = (mistakes > 0).then(|| {
+            rfc3339_millis_utc(
+                now + crate::retry::bound(u32::try_from(mistakes - 1).unwrap_or(u32::MAX)),
+            )
+        });
         let mut payload = record(run_id, &t, now, ctx);
         payload["woken_at"] = json!(rfc3339_millis_utc(now));
         payload["wake_latency_ms"] = payload["latency_ms"].clone();
         payload["task_ids"] = json!(task_ids);
+        if let Some(not_before) = &not_before {
+            payload["retry_not_before"] = json!(not_before);
+        }
         // A trigger of the key of a wake still owed and not in flight joins it (decision 3, -951, -1053).
         let joined = owed
             .iter_mut()
             .find(|w| w.fingerprint == t.fingerprint && w.spec_id == t.spec_id);
         // The integrity edge: a new integrity wake, or a merge that makes a wake integrity (-1053).
-        let (wake_id, edge, not_before) = match joined {
+        let (wake_id, edge, wake_not_before) = match joined {
             Some(wake) => {
                 let edge = wake.severity != Severity::Integrity && severity == Severity::Integrity;
                 wake.severity = wake.severity.max(severity);
+                if let Some(at) = &not_before {
+                    let later = wake
+                        .not_before
+                        .as_ref()
+                        .map_or(at.clone(), |(was, _)| was.clone().max(at.clone()));
+                    wake.not_before = Some((later, i64::MAX));
+                }
                 payload["wake"] = json!(wake.id);
                 payload["merged_into"] = json!(wake.id);
                 payload["wake_severity"] = json!(wake.severity.as_str());
-                (
-                    wake.id.clone(),
-                    edge,
-                    wake.retry_not_before().map(str::to_owned),
-                )
+                (wake.id.clone(), edge, wake.retry_not_before())
             }
             None => {
                 payload["wake"] = json!(t.trigger_id);
@@ -559,8 +584,13 @@ fn fire(
                     turns: Vec::new(),
                     superseded: false,
                     preempted: false,
+                    not_before: not_before.clone().map(|at| (at, i64::MAX)),
                 });
-                (t.trigger_id.clone(), severity == Severity::Integrity, None)
+                (
+                    t.trigger_id.clone(),
+                    severity == Severity::Integrity,
+                    not_before.as_deref().and_then(parse_rfc3339_millis),
+                )
             }
         };
         let record = payload.clone();
@@ -573,7 +603,7 @@ fn fire(
         // be allocated once that turn stops; in this woken's transaction (decision 3, -800, -953, -1056).
         if edge
             && let Some((target_wake, target_attempt)) = target.take()
-            && wakes::could_allocate(tx, run_id, context, not_before.as_deref())?
+            && wakes::could_allocate(tx, run_id, context, wake_not_before)?
         {
             let mut preempt = record;
             preempt["wake"] = json!(wake_id);

@@ -90,6 +90,9 @@ pub(super) struct Wake {
     pub superseded: bool,
     /// A turn of it was preempted: its later turns are protected (decision 3, -800).
     pub preempted: bool,
+    /// The latest backoff a woken of it set (a Commander's own mistake re-triggered, decision 6), with that woken's
+    /// seq: it holds until a turn is allocated after it.
+    pub not_before: Option<(String, i64)>,
 }
 
 impl Wake {
@@ -122,12 +125,21 @@ impl Wake {
         i64::try_from(counted).unwrap_or(i64::MAX)
     }
 
-    /// Not to be allocated before this time: its last failure's backoff.
-    pub fn retry_not_before(&self) -> Option<&str> {
-        self.turns
+    /// Not to be allocated before this time: the later of its last failure's backoff and the backoff a woken of it set
+    /// after its last allocation (two re-triggers merged take the later, -853).
+    pub fn retry_not_before(&self) -> Option<std::time::SystemTime> {
+        let rearm = self
+            .turns
             .last()
             .and_then(|t| t.rearm.as_ref())
             .and_then(|r| r.retry_not_before.as_deref())
+            .and_then(crate::time::parse_rfc3339_millis);
+        let woken = self
+            .not_before
+            .as_ref()
+            .filter(|(_, seq)| self.turns.last().is_none_or(|t| t.allocated_seq < *seq))
+            .and_then(|(at, _)| crate::time::parse_rfc3339_millis(at));
+        rearm.max(woken)
     }
 }
 
@@ -190,10 +202,18 @@ pub(super) fn of_run(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<Wake>, Pe
                     .as_array()
                     .map(|s| s.iter().filter_map(Value::as_i64).collect())
                     .unwrap_or_default();
+                let not_before = text(&payload, "retry_not_before").map(|at| (at, seq));
                 if let Some(i) = wake(&mut wakes).filter(|_| payload["merged_into"].is_string()) {
                     wakes[i].severity = wakes[i].severity.max(severity);
                     wakes[i].task_ids.extend(tasks);
                     wakes[i].event_seqs.extend(seqs);
+                    if let Some((at, seq)) = not_before {
+                        let later = wakes[i]
+                            .not_before
+                            .as_ref()
+                            .map_or(at.clone(), |(was, _)| was.clone().max(at));
+                        wakes[i].not_before = Some((later, seq));
+                    }
                 } else {
                     wakes.push(Wake {
                         id: named
@@ -209,6 +229,7 @@ pub(super) fn of_run(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<Wake>, Pe
                         turns: Vec::new(),
                         superseded: false,
                         preempted: false,
+                        not_before,
                     });
                 }
             }
@@ -485,7 +506,6 @@ pub(super) fn allocate(
     };
     let mut candidates = Vec::new();
     let mut rearmed = Commit::default();
-    let stamp = rfc3339_utc(now);
     for (run_id, spec_id, run_revision) in runs {
         let Some(binding) = decide::load_binding(&tx, &run_id, COMMANDER)? else {
             continue;
@@ -521,7 +541,7 @@ pub(super) fn allocate(
         for wake in wakes
             .into_iter()
             .filter(Wake::owed)
-            .filter(|w| w.retry_not_before().is_none_or(|t| t <= stamp.as_str()))
+            .filter(|w| w.retry_not_before().is_none_or(|t| t <= now))
             .filter(|w| {
                 probing
                     .as_ref()
@@ -690,7 +710,7 @@ pub(super) fn could_allocate(
     tx: &Transaction<'_>,
     run_id: &str,
     context: &Context,
-    not_before: Option<&str>,
+    not_before: Option<std::time::SystemTime>,
 ) -> Result<bool, PersistError> {
     let bound: bool = tx
         .query_row(
@@ -700,10 +720,9 @@ pub(super) fn could_allocate(
             |r| r.get(0),
         )
         .map_err(sqlite_error)?;
-    let now = rfc3339_utc(context.now());
     Ok(bound
         && super::retry::budget_stop(tx, run_id, context)?.is_none()
-        && not_before.is_none_or(|t| t <= now.as_str()))
+        && not_before.is_none_or(|t| t <= context.now()))
 }
 
 /// Why run `run_id`'s Commander, at role epoch `epoch` and binding state `binding`, is unavailable now (empty:

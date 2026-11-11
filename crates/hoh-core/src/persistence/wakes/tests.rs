@@ -1328,3 +1328,260 @@ async fn failures_of_an_earlier_epoch_and_an_auth_failure_are_judged_by_the_curr
     );
     Ok(())
 }
+
+/// A Commander decision for R answering `wake` (its causation), with the envelope `revision` and `epoch`.
+fn decision(
+    id: &str,
+    wake: &str,
+    revision: u64,
+    epoch: u64,
+    payload: Value,
+) -> R<crate::decision::Proposal> {
+    let message: crate::protocol::Message = serde_json::from_value(json!({
+        "schema_version": "1.0", "message_id": id, "run_id": "R", "task_id": "-", "attempt_id": "-",
+        "sender_role": "commander", "recipient_role": "runtime", "role_epoch": epoch, "correlation_id": "c",
+        "causation_id": wake, "idempotency_key": format!("k-{id}"), "expected_revision": revision,
+        "spec_sha256": format!("{:064}", 3), "candidate_id": null, "kind": "decision", "payload": payload
+    }))?;
+    Ok(crate::decision::Proposal::from_message(&message)?)
+}
+
+fn assumption() -> Value {
+    json!({"kind": "record_assumption", "statement": "s", "basis": "b"})
+}
+
+fn retriggers(path: &PathBuf) -> R<Vec<Value>> {
+    let conn = Connection::open(path)?;
+    let mut s = conn.prepare(
+        "SELECT json_object('decision_id', json_extract(payload_json, '$.decision_id'), 'reason', \
+         json_extract(payload_json, '$.reason'), 'base_fingerprint', json_extract(payload_json, '$.base_fingerprint'), \
+         'task_ids', json(json_extract(payload_json, '$.task_ids')), 'own_mistake', CASE json_extract(payload_json, '$.own_mistake') WHEN 1 THEN json('true') ELSE json('false') END, \
+         'n', json_extract(payload_json, '$.n')) FROM events WHERE kind = 'supervisor.retrigger' ORDER BY seq",
+    )?;
+    let rows = s
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.iter().map(|r| Ok(serde_json::from_str(r)?)).collect()
+}
+
+#[tokio::test]
+async fn a_decision_on_a_changed_task_is_stale_and_retriggered_once_with_the_new_revision() -> R {
+    // REQ-021 behaviour 6, docs/adr/ADR-025.md decision 6 (the task-snapshot fence): the wake's turn was shown D at
+    // revision 4; D moves to 5 before the answer; the answer, at the run's current revision and the Commander's
+    // epoch, is REJECTED STALE_REVISION with exactly one supervisor.retrigger naming D; the re-trigger fires after
+    // the debounce, its turn is shown D at 5, and its answer is APPLIED.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    let w = wake(&store, &clock, "R", "D", "fp", 0).await?;
+    let first_turn = store
+        .allocate_supervision("p1", context(&clock, 3000))
+        .await?
+        .ok_or("allocated")?;
+    exec(&path, "UPDATE tasks SET revision = 5 WHERE task_id = 'D';")?;
+    let first = store
+        .decide(
+            decision("d1", &w, 1, 1, assumption())?,
+            context(&clock, 3100),
+        )
+        .await?;
+    assert!(
+        matches!(
+            &first,
+            crate::persistence::Decided::Rejected {
+                reason: crate::protocol::RejectionReason::StaleRevision,
+                ..
+            }
+        ),
+        "{first:?}"
+    );
+    assert_eq!(
+        retriggers(&path)?,
+        [
+            json!({"decision_id": "d1", "reason": "STALE_REVISION", "base_fingerprint": "fp", "task_ids": ["D"],
+                "own_mistake": false, "n": 0})
+        ]
+    );
+    assert_eq!(
+        value(
+            &path,
+            "SELECT json_array(json_extract(payload_json, '$.causation_id'), json_extract(payload_json, '$.decided_at') IS NOT NULL) FROM events WHERE kind = 'decision.rejected'"
+        )?,
+        json!([w, 1])
+    );
+    let fired = store.supervise("R", context(&clock, 5200)).await?.fired;
+    let [again] = fired.as_slice() else {
+        return Err(format!("{fired:?}").into());
+    };
+    assert_eq!(again.fingerprint, "fp#retrigger");
+    // The stale answer's turn completed: its wake is answered; the re-trigger carries it on.
+    end(&path, &first_turn.attempt_id, "SETTLED")?;
+    let turn = store
+        .allocate_supervision("p1", context(&clock, 5300))
+        .await?
+        .ok_or("the re-trigger allocated")?;
+    assert_eq!(turn.wake, again.trigger_id);
+    assert_eq!(
+        value(
+            &path,
+            &format!(
+                "SELECT json_extract(payload_json, '$.snapshots') FROM events WHERE kind = 'supervisor.allocated' AND json_extract(payload_json, '$.wake') = '{}'",
+                turn.wake
+            )
+        )?,
+        json!({"D": 5})
+    );
+    let second = store
+        .decide(
+            decision("d2", &turn.wake, 1, 1, assumption())?,
+            context(&clock, 5400),
+        )
+        .await?;
+    assert!(
+        matches!(second, crate::persistence::Decided::Applied { .. }),
+        "{second:?}"
+    );
+    assert_eq!(retriggers(&path)?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn only_stale_revisions_and_epochs_retrigger_and_a_commanders_own_mistake_is_backed_off() -> R
+{
+    // Decision 6: STALE_ROLE_EPOCH re-triggers; SPEC_MISMATCH does not. Envelope values that differ from what the
+    // turn was given are the Commander's own mistake: n counts them in a row, the re-triggered wake is allocated only
+    // from its woken time + retry::bound(n - 1); an APPLIED decision sets n back to 0.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    let w = wake(&store, &clock, "R", "D", "fp", 0).await?;
+    let a = store
+        .allocate_supervision("p1", context(&clock, 3000))
+        .await?
+        .ok_or("allocated")?;
+    // Not what it was given: revision 0 (it was given 1).
+    store
+        .decide(
+            decision("d1", &w, 0, 1, assumption())?,
+            context(&clock, 3100),
+        )
+        .await?;
+    // A wrong epoch.
+    store
+        .decide(
+            decision("d2", &w, 1, 7, assumption())?,
+            context(&clock, 3200),
+        )
+        .await?;
+    // A wrong specification: no re-trigger.
+    let mut wrong = decision("d3", &w, 1, 1, assumption())?;
+    wrong.spec_sha256 = format!("{:064}", 9);
+    store.decide(wrong, context(&clock, 3300)).await?;
+    let seen: Vec<(Value, Value, Value)> = retriggers(&path)?
+        .into_iter()
+        .map(|r| {
+            (
+                r["reason"].clone(),
+                r["own_mistake"].clone(),
+                r["n"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (json!("STALE_REVISION"), json!(true), json!(1)),
+            (json!("STALE_ROLE_EPOCH"), json!(true), json!(2))
+        ]
+    );
+    // The re-trigger (both join one trigger: the later backoff, n = 2: 4 s from its woken time).
+    end(&path, &a.attempt_id, "SETTLED")?;
+    let fired = store.supervise("R", context(&clock, 5300)).await?.fired;
+    assert_eq!(fired.len(), 1);
+    assert!(
+        store
+            .allocate_supervision("p1", context(&clock, 5300 + 3999))
+            .await?
+            .is_none()
+    );
+    let turn = store
+        .allocate_supervision("p1", context(&clock, 5300 + 4000))
+        .await?
+        .ok_or("allocated after the backoff")?;
+    let applied = store
+        .decide(
+            decision("d4", &turn.wake, 1, 1, assumption())?,
+            context(&clock, 9400),
+        )
+        .await?;
+    assert!(
+        matches!(applied, crate::persistence::Decided::Applied { .. }),
+        "{applied:?}"
+    );
+    store
+        .decide(
+            decision("d5", &turn.wake, 0, 1, assumption())?,
+            context(&clock, 9500),
+        )
+        .await?;
+    assert_eq!(
+        retriggers(&path)?.last().map(|r| r["n"].clone()),
+        Some(json!(1))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_decision_id_seen_again_is_replayed_or_a_key_reuse() -> R {
+    // Decision 6: the same decision id with the same content is a replay (nothing written again); with other content a
+    // key reuse (nothing written); neither is an integrity violation.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    let w = wake(&store, &clock, "R", "D", "fp", 0).await?;
+    store
+        .allocate_supervision("p1", context(&clock, 3000))
+        .await?
+        .ok_or("allocated")?;
+    let first = store
+        .decide(
+            decision("d1", &w, 1, 1, assumption())?,
+            context(&clock, 3100),
+        )
+        .await?;
+    assert!(
+        matches!(first, crate::persistence::Decided::Applied { .. }),
+        "{first:?}"
+    );
+    let events = value(&path, "SELECT count(*) FROM events")?;
+    let again = store
+        .decide(
+            decision("d1", &w, 1, 1, assumption())?,
+            context(&clock, 3200),
+        )
+        .await?;
+    assert_eq!(
+        again,
+        crate::persistence::Decided::Replayed {
+            state: "APPLIED".to_owned()
+        }
+    );
+    let other = store
+        .decide(
+            decision(
+                "d1",
+                &w,
+                1,
+                1,
+                json!({"kind": "record_assumption", "statement": "other", "basis": "b"}),
+            )?,
+            context(&clock, 3300),
+        )
+        .await?;
+    assert_eq!(other, crate::persistence::Decided::KeyReuse);
+    assert_eq!(value(&path, "SELECT count(*) FROM events")?, events);
+    Ok(())
+}
