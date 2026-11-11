@@ -24,6 +24,7 @@ fn work(prompt: Option<&str>) -> Work {
             title: Some("Write the parser".to_owned()),
             first_input: false,
             supervision: None,
+            context: None,
         },
     }
 }
@@ -312,6 +313,7 @@ fn a_commander_turn_is_told_its_wake_the_values_to_name_its_nonce_and_its_bridge
         role_epoch: 2,
         summary: serde_json::json!({"wake": {"id": "R1/trigger/3"}, "snapshots": {"T1": 4}}),
         workdir: None,
+        subject: Vec::new(),
     };
     let text = supervision_text(&s, Path::new("/p/.hoh/attempts/x/messages.jsonl"));
     for part in [

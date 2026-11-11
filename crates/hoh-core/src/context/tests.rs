@@ -1019,3 +1019,108 @@ fn a_runs_own_shares_are_the_caps() -> R {
     ));
     Ok(())
 }
+
+#[test]
+fn a_turns_mandatory_items_say_what_is_missing_instead_of_leaving_it_out() -> R {
+    let none = Facts::default();
+    let m = super::mandatory(&none, "developer", "", None, None)?;
+    assert_eq!(m.goal, "Run 目标：（未给出）");
+    assert_eq!(m.project, "spec：尚无 spec");
+    assert!(
+        m.task.contains("（无）") && m.task.contains("尚无候选"),
+        "{}",
+        m.task
+    );
+    assert!(m.schemas.contains("TaskResult"));
+    let facts = Facts {
+        goal: Some("交付 v1".to_owned()),
+        question: Some("唤醒 W（high）".to_owned()),
+        spec: Some(("f".repeat(64), 3)),
+        scope: vec!["T1 装箱（developer，写者）".to_owned()],
+        acceptance: vec![
+            ("AC-1".to_owned(), "正文一 {{GOAL}}".to_owned()),
+            ("AC-2".to_owned(), "正文二".to_owned()),
+        ],
+        candidate: Some(("CAND-1".to_owned(), "a".repeat(40), "b".repeat(40))),
+        header: vec![("nonce".to_owned(), "n-1".to_owned())],
+        ..Facts::default()
+    };
+    let m = super::mandatory(
+        &facts,
+        "commander",
+        "LEAD",
+        Some("/p/.hoh/attempts/A/messages.jsonl"),
+        Some("/p"),
+    )?;
+    assert_eq!(
+        m.goal,
+        "Run 目标：交付 v1\n本次唤醒要回答的问题：唤醒 W（high）"
+    );
+    assert!(m.project.contains(&"f".repeat(64)) && m.project.contains("revision：3"));
+    for want in [
+        "- AC-1：正文一 {{GOAL}}",
+        "- AC-2：正文二",
+        "candidate_id：CAND-1",
+        &"a".repeat(40),
+        &"b".repeat(40),
+        "- nonce：n-1",
+        "- 输出文件：/p/.hoh/attempts/A/messages.jsonl",
+        "- 项目根：/p",
+    ] {
+        assert!(m.task.contains(want), "{want} missing from {}", m.task);
+    }
+    assert_eq!(m.lead, "LEAD");
+    assert!(m.schemas.contains("DecisionPayload"));
+    // Its acceptance text stays a value: packed whole, never read as a placeholder.
+    let packed = pack(COMMANDER, &m, &[], required(COMMANDER, &m)?)?;
+    assert!(packed.prompt.contains("- AC-1：正文一 {{GOAL}}"));
+    Ok(())
+}
+
+#[test]
+fn a_first_input_is_the_package_itself_or_a_marked_summary_of_another_shape() -> R {
+    // docs/adr/ADR-026.md decision 3, v4 (M2T09D-201): a summary never passes for the package.
+    let small = json!({"handoff_kind": "role_change", "state": {"open_issue_ids": ["i1", "i2"], "applied_decision_ids": []}});
+    let text = super::lead(&small, ".hoh/objects/sha256/aa/x");
+    assert!(text.starts_with("#### 交接包（本会话的首个输入）"));
+    let block = |text: &str| -> Result<Value, Box<dyn std::error::Error>> {
+        Ok(serde_json::from_str(
+            text.split("```json\n")
+                .nth(1)
+                .and_then(|t| t.split("\n```").next())
+                .ok_or("no block")?,
+        )?)
+    };
+    assert_eq!(block(&text)?, small, "within the cap, the package as it is");
+    assert!(!text.contains(".hoh/objects"));
+    let ids: Vec<String> = (0..10_000).map(|n| format!("m{n:05}")).collect();
+    let big = json!({"handoff_kind": "role_change", "state": {"unacked_message_ids": ids, "open_issue_ids": ["i1"]}});
+    let text = super::lead(&big, ".hoh/objects/sha256/aa/x");
+    assert!(text.len() < 10_000, "bounded: {}", text.len());
+    assert!(
+        text.starts_with("#### 交接包摘要（不是完整交接包"),
+        "{text:.80}"
+    );
+    assert!(text.contains(".hoh/objects/sha256/aa/x"));
+    let shown = block(&text)?;
+    assert!(
+        shown.get("state").is_none(),
+        "no ContextHandoff state: it cannot pass for the package"
+    );
+    assert_eq!(shown["handoff_kind"], "role_change");
+    assert_eq!(
+        shown["state_summary"]["unacked_message_ids"]["total"],
+        10_000
+    );
+    assert_eq!(
+        shown["state_summary"]["unacked_message_ids"]["first"]
+            .as_array()
+            .map(Vec::len),
+        Some(LEAD_IDS)
+    );
+    assert_eq!(
+        shown["state_summary"]["open_issue_ids"],
+        json!({"total": 1, "first": ["i1"]})
+    );
+    Ok(())
+}

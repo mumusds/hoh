@@ -110,7 +110,7 @@ pub struct Mandatory {
 }
 
 /// A candidate for the remaining budget. The caller gives the scores; the packer computes the sha256 of `text`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     pub class: Class,
     pub kind: Kind,
@@ -635,6 +635,9 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
         .map(|b| format!("{b:02x}"))
         .collect()
 }
+
+mod turn;
+pub use turn::{CONTEXT_V1, Facts, LEAD_IDS, Params, lead, mandatory};
 
 #[cfg(test)]
 mod tests;

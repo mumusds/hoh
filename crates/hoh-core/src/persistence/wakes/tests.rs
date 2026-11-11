@@ -1422,6 +1422,34 @@ async fn a_decision_on_a_changed_task_is_stale_and_retriggered_once_with_the_new
         .await?
         .ok_or("the re-trigger allocated")?;
     assert_eq!(turn.wake, again.trigger_id);
+    // Its subject is D, read from the retrigger's task_ids, and D's acceptance is in its context's scope
+    // (docs/adr/ADR-026.md decisions 3 and 11, M2T09D-200).
+    let notice = store
+        .runner_waiting("p1")
+        .await?
+        .dispatches
+        .into_iter()
+        .find(|d| d.attempt_id == turn.attempt_id)
+        .ok_or("no dispatch notice for the re-trigger's turn")?;
+    let s = notice
+        .assignment
+        .supervision
+        .as_ref()
+        .ok_or("no supervision input")?;
+    assert_eq!(s.subject, [("task_id".to_owned(), "D".to_owned())]);
+    let facts = notice
+        .assignment
+        .context
+        .as_ref()
+        .ok_or("no context facts")?;
+    assert!(
+        facts
+            .scope
+            .iter()
+            .any(|l| l.contains("D") && l.contains("revision 5")),
+        "{:?}",
+        facts.scope
+    );
     assert_eq!(
         value(
             &path,
@@ -1980,9 +2008,51 @@ async fn a_turns_assignment_carries_its_wake_its_nonce_and_a_bounded_summary() -
     let events = summary["events"].as_array().ok_or("events")?;
     assert_eq!(events.len(), 50);
     assert_eq!(summary["events_total"], json!(60));
+    // Each payload whole: the context packer bounds what goes in, with a summary and a reference for the rest
+    // (docs/adr/ADR-026.md decision 11; until M2-T09 each was cut to 2 000 bytes).
     assert!(
-        events.iter().all(|e| e.to_string().len() < 5_000),
-        "bounded payloads"
+        events
+            .iter()
+            .all(|e| e["payload"]["detail"].as_str().map(str::len) == Some(10_000)),
+        "whole payloads"
+    );
+    // Its wake's subject and the facts its context is packed from (docs/adr/ADR-026.md decisions 3 and 11).
+    assert!(
+        s.subject.contains(&("task_id".to_owned(), "D".to_owned())),
+        "{:?}",
+        s.subject
+    );
+    let facts = notice
+        .assignment
+        .context
+        .as_ref()
+        .ok_or("no context facts")?;
+    assert!(facts.question.as_deref().is_some_and(|q| q.contains(&w)));
+    assert!(
+        facts
+            .header
+            .contains(&("nonce".to_owned(), s.nonce.clone()))
+    );
+    assert_eq!(facts.spec, Some((format!("{:064}", 3), 3)));
+    assert!(
+        facts
+            .scope
+            .iter()
+            .any(|l| l.contains("D") && l.contains("revision 4")),
+        "{:?}",
+        facts.scope
+    );
+    let event_entries: Vec<&crate::context::Entry> = facts
+        .entries
+        .iter()
+        .filter(|e| e.path.starts_with("events/"))
+        .collect();
+    assert_eq!(event_entries.len(), 50);
+    assert!(
+        event_entries
+            .iter()
+            .all(|e| e.summary.is_some() && e.causal == 2),
+        "every event names D, the subject"
     );
     assert_eq!(
         summary["other_wakes"],

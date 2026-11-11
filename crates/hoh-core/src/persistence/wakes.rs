@@ -430,12 +430,15 @@ pub struct Supervision {
     pub summary: Value,
     /// Its session's own working directory, recorded at its first turn (decision 3); none: the project's.
     pub workdir: Option<String>,
+    /// Its wake's subject: the values of the five subject fields over all its trigger's events, as (field, value)
+    /// pairs, sorted (docs/adr/ADR-026.md decision 11).
+    pub subject: Vec<(String, String)>,
 }
 
-/// How many of its wake's events a turn is shown, and how much of each payload; how many of its tasks and of the run's
-/// other owed wakes (decision 7: bounded, v13 M2T08R-57; the snapshots are never cut).
+/// How many of its wake's events a turn is offered (each whole: the context packer bounds what goes in, with a summary
+/// and a reference for the rest, docs/adr/ADR-026.md decision 11); how many of its tasks and of the run's other owed
+/// wakes (decision 7: bounded, v13 M2T08R-57; the snapshots are never cut).
 const SHOWN_EVENTS: usize = 50;
-const SHOWN_PAYLOAD: usize = 2_000;
 const SHOWN_TASKS: usize = 50;
 /// How many of the run's latest dispositions the summary looks through for its recent invalid answers (M2T08R-501).
 const RECENT_DISPOSITIONS: i64 = 200;
@@ -539,13 +542,51 @@ pub(super) fn supervision_input(
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .map_err(sqlite_error)?;
-        let payload = if payload.len() > SHOWN_PAYLOAD {
-            json!({"truncated": true, "head": payload.chars().take(SHOWN_PAYLOAD).collect::<String>()})
-        } else {
-            serde_json::from_str(&payload).unwrap_or(Value::Null)
-        };
+        let payload: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
         shown.push(json!({"seq": -seq, "kind": kind, "payload": payload}));
     }
+    // Its subject, from all its trigger's events (not only the shown ones): one read of the five fields and of a
+    // retrigger's `task_ids`, each element a task_id (docs/adr/ADR-026.md decision 11, M2T09D-200).
+    let subject: Vec<(String, String)> = {
+        let fields = super::context::SUBJECT_FIELDS;
+        let mut statement = conn
+            .prepare(&format!(
+                "SELECT {}, json_extract(payload_json, '$.task_ids') FROM events \
+                 WHERE seq IN (SELECT value FROM json_each(?1))",
+                fields
+                    .iter()
+                    .map(|f| format!("json_extract(payload_json, '$.{f}')"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+            .map_err(sqlite_error)?;
+        let rows: Vec<Vec<Option<String>>> = statement
+            .query_map(params![json!(this.event_seqs).to_string()], |r| {
+                (0..=fields.len())
+                    .map(|i| r.get::<_, Option<String>>(i))
+                    .collect()
+            })
+            .map_err(sqlite_error)?
+            .collect::<Result<_, _>>()
+            .map_err(sqlite_error)?;
+        let set: std::collections::BTreeSet<(String, String)> = rows
+            .into_iter()
+            .flat_map(|mut row| {
+                let listed: Vec<String> = row
+                    .pop()
+                    .flatten()
+                    .and_then(|text| serde_json::from_str(&text).ok())
+                    .unwrap_or_default();
+                fields
+                    .iter()
+                    .zip(row)
+                    .filter_map(|(f, v)| Some(((*f).to_owned(), v?)))
+                    .chain(listed.into_iter().map(|t| ("task_id".to_owned(), t)))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        set.into_iter().collect()
+    };
     let (state, spec_id, spec_sha256): (String, Option<String>, Option<String>) = conn
         .query_row(
             "SELECT r.state, r.spec_id, s.sha256 FROM runs r LEFT JOIN specs s ON s.spec_id = r.spec_id \
@@ -658,6 +699,7 @@ pub(super) fn supervision_input(
         .flatten();
     Ok(Some(Supervision {
         workdir,
+        subject,
         wake: wake_id.clone(),
         nonce: nonce.unwrap_or_default(),
         run_revision,
