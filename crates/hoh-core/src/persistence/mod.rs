@@ -925,6 +925,20 @@ impl Store {
         }
     }
 
+    /// Run `run_id`'s supervisor step failed with `error` (docs/adr/ADR-025.md v15 decision 5): recorded as
+    /// `supervisor.step_failed` unless the run's last such record has the same error; whether it was written.
+    pub async fn supervision_failed(
+        &self,
+        run_id: &str,
+        error: &str,
+    ) -> Result<bool, PersistError> {
+        self.runner_step(runner::RunnerJob::StepFailed(
+            run_id.to_owned(),
+            error.to_owned(),
+        ))
+        .await
+    }
+
     /// Withdraw supervision turn `attempt_id` while it is PREPARED (docs/adr/ADR-025.md decision 3); whether it was.
     pub async fn withdraw_turn(
         &self,

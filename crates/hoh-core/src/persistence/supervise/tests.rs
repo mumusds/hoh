@@ -1056,3 +1056,81 @@ async fn a_step_is_one_writer_job_per_batch_until_it_has_caught_up() -> R {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn a_backlog_of_one_key_taken_in_by_one_batch_is_due_two_seconds_after_its_last_commit() -> R
+{
+    // M2T08R-151 (decision 2): three events of one key committed at 0, 1.5 and 1.8 s and taken in by one batch (at
+    // 1.9 s) make a trigger timed from its first and last commits: due at 3.8 s, not before.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    let mut seqs = Vec::new();
+    for ms in [0, 1500, 1800] {
+        clock.set(ms);
+        seqs.extend(
+            events(
+                &store,
+                &format!("k/{ms}"),
+                &[("issue.opened", issue("k", 3))],
+            )
+            .await?,
+        );
+    }
+    assert!(
+        store
+            .supervise("R", at(&clock, 1900))
+            .await?
+            .fired
+            .is_empty()
+    );
+    assert!(
+        store
+            .supervise("R", at(&clock, 3700))
+            .await?
+            .fired
+            .is_empty()
+    );
+    let fired = store.supervise("R", at(&clock, 3800)).await?.fired;
+    assert_eq!(
+        fired
+            .iter()
+            .map(|f| f.event_seqs.clone())
+            .collect::<Vec<_>>(),
+        [seqs]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_integrity_event_joined_in_a_batch_makes_its_trigger_due_at_once() -> R {
+    // M2T08R-151 (decision 2, REQ-021 behaviour 4): a high issue and an integrity violation of the same key taken in
+    // by one batch make one integrity trigger, due at once (the debounce skipped).
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    clock.set(0);
+    let seqs = events(
+        &store,
+        "joined",
+        &[
+            ("issue.opened", issue("k", 3)),
+            (
+                "integrity_violation",
+                json!({"fingerprint": "k", "spec_revision": 3, "reason": "db"}),
+            ),
+        ],
+    )
+    .await?;
+    let fired = store.supervise("R", at(&clock, 100)).await?.fired;
+    assert_eq!(
+        fired
+            .iter()
+            .map(|f| (f.severity, f.event_seqs.clone()))
+            .collect::<Vec<_>>(),
+        [(crate::supervise::Severity::Integrity, seqs)]
+    );
+    Ok(())
+}

@@ -194,6 +194,55 @@ fn close(
     tx.commit().map_err(sqlite_error)
 }
 
+/// Run `run_id`'s supervisor step failed with `error`: `supervisor.step_failed{error}` in a transaction of its own,
+/// unless the run's last one has the same error (v15, M2T08R-152: seen in the run's events, once per error); whether
+/// it was written.
+pub(super) fn step_failed(
+    conn: &mut Connection,
+    run_id: &str,
+    error: &str,
+    ctx: &Ctx<'_>,
+) -> Result<bool, PersistError> {
+    let tx = writer::begin(conn, ctx)?;
+    let project_id: String = tx
+        .query_row(
+            "SELECT project_id FROM runs WHERE run_id = ?1",
+            params![run_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    let (n, last): (i64, Option<String>) = tx
+        .query_row(
+            "SELECT count(*), (SELECT json_extract(payload_json, '$.error') FROM events WHERE run_id = ?1 \
+             AND kind = ?2 ORDER BY seq DESC LIMIT 1) FROM events WHERE run_id = ?1 AND kind = ?2",
+            params![run_id, STEP_FAILED],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(sqlite_error)?;
+    if last.as_deref() == Some(error) {
+        return Ok(false);
+    }
+    writer::write(
+        &tx,
+        &Commit {
+            events: vec![NewEvent {
+                project_id,
+                event_id: child_id(run_id, &format!("supervisor/step_failed/{n}")),
+                run_id: Some(run_id.to_owned()),
+                kind: STEP_FAILED.to_owned(),
+                payload: json!({"error": error}),
+            }],
+            ..Commit::default()
+        },
+        ctx,
+    )?;
+    ctx.before_commit()?;
+    tx.commit().map_err(sqlite_error)?;
+    Ok(true)
+}
+
+const STEP_FAILED: &str = "supervisor.step_failed";
+
 /// A run's supervision closed (v13, M2T08R-06).
 pub(super) const CLOSED: &str = "supervisor.closed";
 
