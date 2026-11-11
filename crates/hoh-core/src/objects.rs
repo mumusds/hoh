@@ -68,8 +68,8 @@ static STAGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(
 
 /// Keeps `bytes` as an object and returns its sha256: written whole to a file of its own, synced, then linked to its
 /// place, which fails if anything is there already; the directory synced so the link outlives a power loss. The same
-/// bytes there already are taken; other bytes there are refused and left as they are (a damaged object is for a
-/// person to see, never silently replaced).
+/// bytes there already are taken; other bytes there (a damaged object) are replaced by this write's synced copy, which
+/// its name says is right, then checked again (docs/adr/ADR-026.md decision 6).
 pub fn put(project: &Path, bytes: &[u8]) -> Result<String, String> {
     put_with(project, bytes, &|dir| std::fs::File::open(dir)?.sync_all())
 }
@@ -110,10 +110,15 @@ fn put_with(
             // what it must hold, so this write's own staged copy (whole and synced) is renamed over it, then read
             // back.
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                if get(project, &sha256).is_err() {
+                if !holds(&path, &sha256)? {
                     std::fs::rename(&staged, &path)
                         .map_err(|e| format!("{}: {e}", path.display()))?;
-                    get(project, &sha256)?;
+                    if !holds(&path, &sha256)? {
+                        return Err(format!(
+                            "{}: its bytes no longer match its name",
+                            path.display()
+                        ));
+                    }
                 }
                 Ok(())
             }
@@ -182,10 +187,15 @@ pub fn put_file(project: &Path, file: &Path) -> Result<(String, u64), String> {
         match std::fs::hard_link(&staged, &path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                if get(project, &sha).is_err() {
+                if !holds(&path, &sha)? {
                     std::fs::rename(&staged, &path)
                         .map_err(|e| format!("{}: {e}", path.display()))?;
-                    get(project, &sha)?;
+                    if !holds(&path, &sha)? {
+                        return Err(format!(
+                            "{}: its bytes no longer match its name",
+                            path.display()
+                        ));
+                    }
                 }
             }
             Err(e) => return Err(format!("{}: {e}", path.display())),
@@ -203,6 +213,38 @@ pub fn put_file(project: &Path, file: &Path) -> Result<(String, u64), String> {
     drop(out);
     let _ = std::fs::remove_file(&staged);
     copied
+}
+
+/// The sha256 of the file `file` and its size, read in fixed-size pieces (M2T09R-02: a raw log is not bounded, so it is
+/// never read whole to be checked).
+pub fn hash_file(file: &Path) -> Result<(String, u64), String> {
+    use std::io::Read as _;
+    let at = |e: std::io::Error| format!("{}: {e}", file.display());
+    let mut input = std::fs::File::open(file).map_err(at)?;
+    let mut digest = Sha256::new();
+    let mut size = 0u64;
+    let mut buffer = vec![0u8; 1 << 16];
+    loop {
+        let n = input.read(&mut buffer).map_err(at)?;
+        if n == 0 {
+            break;
+        }
+        digest.update(&buffer[..n]);
+        size += n as u64;
+    }
+    Ok((
+        digest
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+        size,
+    ))
+}
+
+/// Whether the file at `path` holds bytes whose sha256 is `sha256`, read in pieces.
+fn holds(path: &Path, sha256: &str) -> Result<bool, String> {
+    Ok(hash_file(path)?.0 == sha256)
 }
 
 /// The object named `sha256`, if its bytes still match its name.

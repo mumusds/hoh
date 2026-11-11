@@ -351,7 +351,7 @@ pub fn pack_with(
             task: estimate(&format!(
                 "{}{}",
                 layers[Layer::Goal as usize],
-                layers[Layer::Task as usize].replacen(&mandatory.schemas, "", 1)
+                layers[Layer::Task as usize].replacen(&format!("\n\n{}", mandatory.schemas), "", 1)
             )),
             evidence: estimate(&layers[Layer::Evidence as usize]),
         },

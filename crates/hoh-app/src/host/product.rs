@@ -263,6 +263,7 @@ fn outcome(facts: Facts) -> Outcome {
             workspace: None,
             messages: Vec::new(),
             artifacts: Vec::new(),
+            artifacts_failed: Vec::new(),
         },
         unknown_effect: facts.state == AttemptState::UnknownEffect,
     }
@@ -593,10 +594,16 @@ impl Executor for ProductExecutor {
             // Its raw logs kept as objects, on a blocking thread (docs/adr/ADR-026.md decision 10); one that cannot
             // be kept is left in its directory, unregistered.
             let (logs, kept_in) = (logs.clone(), project.clone());
-            outcome.observed.artifacts =
-                tokio::task::spawn_blocking(move || keep_logs(&kept_in, &logs))
-                    .await
-                    .unwrap_or_default();
+            let (rows, failed) = tokio::task::spawn_blocking(move || keep_logs(&kept_in, &logs))
+                .await
+                .unwrap_or_else(|e| {
+                    (
+                        Vec::new(),
+                        vec![serde_json::json!({"name": "*", "error": e.to_string()})],
+                    )
+                });
+            outcome.observed.artifacts = rows;
+            outcome.observed.artifacts_failed = failed;
             keep_diagnostics(&outcome);
             let _ = tx.send(outcome);
         });
@@ -630,38 +637,74 @@ const BRIDGE: &str = "messages.jsonl";
 
 /// Where the raw logs of attempt `attempt_id` go in the project at `project`.
 /// Every regular file of an attempt's log directory `logs` kept as an object of the project at `project`, by name
-/// order; a file that cannot be kept is skipped (it stays in its directory, unregistered).
-fn keep_logs(project: &Path, logs: &Path) -> Vec<hoh_core::persistence::ArtifactRow> {
-    let mut files: Vec<PathBuf> = std::fs::read_dir(logs)
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
-                .map(|e| e.path())
-                .collect()
-        })
-        .unwrap_or_default();
+/// order (docs/adr/ADR-026.md decision 10). A file that cannot be kept as an object (the object directory unwritable,
+/// full) is registered where it is, under its own sha256 read in pieces, so it can still be referenced; one that cannot
+/// even be read, or a directory that cannot be listed, is returned as a failure (`{name, error}`) to be recorded with
+/// the rest, never dropped in silence (M2T09R-01).
+fn keep_logs(
+    project: &Path,
+    logs: &Path,
+) -> (
+    Vec<hoh_core::persistence::ArtifactRow>,
+    Vec<serde_json::Value>,
+) {
+    let mut failed = Vec::new();
+    let mut files: Vec<PathBuf> = match std::fs::read_dir(logs) {
+        Ok(entries) => entries
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+            .map(|e| e.path())
+            .collect(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            failed.push(
+                serde_json::json!({"name": logs.display().to_string(), "error": e.to_string()}),
+            );
+            Vec::new()
+        }
+    };
     files.sort();
-    files
-        .into_iter()
-        .filter_map(|file| {
-            let (sha, bytes) = hoh_core::objects::put_file(project, &file).ok()?;
-            let name = file.file_name()?.to_string_lossy().into_owned();
-            let mime = if name.ends_with(".jsonl") {
-                "application/x-ndjson"
-            } else {
-                "text/plain"
-            };
-            Some(hoh_core::persistence::ArtifactRow {
-                path: hoh_core::objects::relative_path(&sha),
-                sha256: sha,
+    let mut rows = Vec::new();
+    for file in files {
+        let name = file
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let mime = if name.ends_with(".jsonl") {
+            "application/x-ndjson"
+        } else {
+            "text/plain"
+        };
+        let kept = hoh_core::objects::put_file(project, &file)
+            .map(|(sha, bytes)| {
+                (
+                    hoh_core::objects::relative_path(&sha),
+                    sha,
+                    bytes,
+                    "raw_log",
+                )
+            })
+            .or_else(|_| {
+                let (sha, bytes) = hoh_core::objects::hash_file(&file)?;
+                let path = file
+                    .strip_prefix(project)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| file.display().to_string());
+                Ok::<_, String>((path, sha, bytes, "raw_log_in_place"))
+            });
+        match kept {
+            Ok((path, sha256, bytes, kind)) => rows.push(hoh_core::persistence::ArtifactRow {
+                path,
+                sha256,
                 bytes,
                 mime: mime.to_owned(),
-                kind: "raw_log".to_owned(),
+                kind: kind.to_owned(),
                 name,
-            })
-        })
-        .collect()
+            }),
+            Err(error) => failed.push(serde_json::json!({"name": name, "error": error})),
+        }
+    }
+    (rows, failed)
 }
 
 fn attempt_logs(project: &Path, attempt_id: &str) -> PathBuf {

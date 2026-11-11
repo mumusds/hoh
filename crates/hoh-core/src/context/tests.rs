@@ -22,7 +22,7 @@ fn mandatory() -> Mandatory {
     Mandatory {
         goal: "把 HoH 的上下文装箱做完".to_owned(),
         project: "spec_sha256: 5f1c0d2e9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1\nspec revision: 3".to_owned(),
-        task: "任务：T1 装箱（developer，写者）\n验收标准：\n- AC-1：强制项永不裁剪。\n- AC-2：份额是硬上限。\n候选：CAND-1 commit 0123abc\n输出 Schema：{\"type\":\"object\"}".to_owned(),
+        task: "任务：T1 装箱（developer，写者）\n验收标准：\n- AC-1：强制项永不裁剪。\n- AC-2：份额是硬上限。\n候选：CAND-1 commit 0123abc".to_owned(),
         evidence: String::new(),
         lead: String::new(),
         schemas: output_schemas("developer").unwrap_or_default(),
@@ -330,6 +330,12 @@ fn test_039_02_mandatory_items_survive_every_budget_and_below_m_nothing_is_packe
         entry(Class::Knowledge, "docs/a.md", 18_000, (90, 0, 0)),
         entry(Class::Knowledge, "docs/b.md", 600, (10, 0, 0)),
     ];
+    // The developer's real output schema, not a stand-in.
+    assert!(
+        m.schemas.contains("TaskResult") && m.schemas.contains("\"$defs\""),
+        "{}",
+        m.schemas
+    );
     let big_m = required(DEVELOPER, &m)?;
     let mut rng = SplitMix64::new(SEED);
     let mut budgets = vec![big_m - 1, big_m];
@@ -352,7 +358,8 @@ fn test_039_02_mandatory_items_survive_every_budget_and_below_m_nothing_is_packe
             }
             Err(other) => return Err(format!("budget {budget}: {other:?}").into()),
             Ok(packed) => {
-                let complete = [&m.goal, &m.project, &m.task]
+                // Goal, spec, scope with every AC and the candidate, and the role's output schema (M2T09R-52).
+                let complete = [&m.goal, &m.project, &m.task, &m.schemas]
                     .iter()
                     .all(|v| packed.prompt.contains(v.as_str()))
                     && contract_pieces(DEVELOPER)
@@ -842,8 +849,9 @@ fn the_golden_prompts_change_only_with_the_format() -> R {
         let m = Mandatory {
             lead: lead.to_owned(),
             evidence: evidence.to_owned(),
-            // Its own schemas text: the golden depends on this code only, not on a schema file's text.
+            // Its own texts: the golden depends on this code only, not on a schema file's or a fixture's text.
             schemas: "schemas".to_owned(),
+            task: "任务：T1（developer）\n- AC-1：正文".to_owned(),
             ..mandatory()
         };
         let packed = pack(template, &m, &entries, required(template, &m)? + 3_000)?;
@@ -870,9 +878,9 @@ fn the_golden_prompts_change_only_with_the_format() -> R {
 
 /// The golden prompts' sha256 under FORMAT hoh-context/1.
 const GOLDEN_1: [&str; 3] = [
-    "fa0674eed4ff17247c20a741cd7c9c9a12cc0cf18350ce9b041a594e0883acd8",
-    "29f861e1a3301b776cca9e491fbec6c1c2ea78d27edca5cff7662101362efe04",
-    "3e6bb95a336ff03084989764d5340ea40cb7b975521144d676b6740bb2559489",
+    "b9647e15d5000c809af6b71458011202b0ef74bdbf88c740d959235c3ba438e2",
+    "bc8629c5d99cfe33a616827a21afc564acb7be69d55d66897e45d5b0db119555",
+    "0fcf2c0b1fd9598cb39b10b03359eb94c9245106876381879c19fb2104de9dd3",
 ];
 
 #[test]

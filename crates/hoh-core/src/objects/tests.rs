@@ -201,3 +201,22 @@ fn a_file_is_kept_as_an_object_by_streaming_it_whatever_its_size() -> R {
     assert!(!staging.exists() || std::fs::read_dir(&staging)?.next().is_none());
     Ok(())
 }
+
+#[test]
+fn a_file_is_hashed_in_pieces_and_an_object_checked_without_reading_it_whole() -> R {
+    // M2T09R-02: keeping a large raw log again checks the object there by hashing it in pieces.
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("big.log");
+    let bytes = vec![b'z'; 5 << 20];
+    std::fs::write(&file, &bytes)?;
+    assert_eq!(hash_file(&file)?, (sha256_hex(&bytes), bytes.len() as u64));
+    let (sha, _) = put_file(dir.path(), &file)?;
+    let object = object_path(dir.path(), &sha)?;
+    assert!(holds(&object, &sha)?);
+    // Damaged: keeping it again puts the right bytes back.
+    std::fs::write(&object, b"damaged")?;
+    assert!(!holds(&object, &sha)?);
+    put_file(dir.path(), &file)?;
+    assert!(holds(&object, &sha)?);
+    Ok(())
+}
