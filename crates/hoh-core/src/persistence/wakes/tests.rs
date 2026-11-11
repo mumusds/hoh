@@ -3642,16 +3642,18 @@ async fn a_pending_retrigger_is_owed_and_keeps_its_run_blocked() -> R {
 
 #[tokio::test]
 async fn a_runs_closed_wakes_stay_behind_its_horizon() -> R {
-    // M2T08R-352 (decision 2's jobs table, v19): once its wakes are answered and their outputs disposed of, a step
-    // records the run's horizon past them; the wakes rebuilt from then on are only those after it, so a tick's work
-    // does not grow with the run's history.
+    // M2T08R-352 (decision 2's jobs table, v19, v20's readers table): once its wakes are answered and their outputs
+    // disposed of, a step records the run's horizon past them, keeping only the wake of the current epoch's last
+    // SETTLED turn (the recovery facts read it); the wakes rebuilt from then on are that one and those after it, so a
+    // tick's work does not grow with the run's history.
     let dir = tempfile::tempdir()?;
     let clock = std::sync::Arc::new(TestClock::default());
     let (store, path) = open(&dir, &clock)?;
     exec(&path, WORLD)?;
     let mut ms = 0;
+    let mut last = String::new();
     for n in 0..3 {
-        wake(&store, &clock, "R", "D", &format!("fp{n}"), ms).await?;
+        last = wake(&store, &clock, "R", "D", &format!("fp{n}"), ms).await?;
         let a = store
             .allocate_supervision("p1", context(&clock, ms + 2100))
             .await?
@@ -3669,16 +3671,21 @@ async fn a_runs_closed_wakes_stay_behind_its_horizon() -> R {
         .is_some_and(|n| n >= 1)
     );
     let conn = Connection::open(&path)?;
-    assert!(
-        super::of_run(&conn, "R")?.is_empty(),
-        "every wake is behind the horizon"
+    let kept: Vec<String> = super::of_run(&conn, "R")?
+        .into_iter()
+        .map(|w| w.id)
+        .collect();
+    assert_eq!(
+        kept,
+        [last.clone()],
+        "only the last settled turn's wake is kept"
     );
     let w = wake(&store, &clock, "R", "D", "after", ms + 100).await?;
     let open: Vec<String> = super::of_run(&Connection::open(&path)?, "R")?
         .into_iter()
         .map(|w| w.id)
         .collect();
-    assert_eq!(open, [w]);
+    assert_eq!(open, [last, w]);
     Ok(())
 }
 
@@ -3833,5 +3840,120 @@ async fn a_turn_settled_after_its_steps_verdict_waits_for_the_next_step() -> R {
         json!(["REJECTED", "STALE_REVISION"])
     );
     assert_eq!(retriggers(&path)?.len(), 1);
+    Ok(())
+}
+
+// Implementation review round 5 (docs/adr/ADR-025.md v20: the horizon pinned by every reader of what lies behind it).
+
+#[tokio::test]
+async fn an_auth_recovery_by_a_closed_wakes_turn_survives_the_horizon() -> R {
+    // M2T08R-400 (decisions 2 and 5, v20): A's turn fails (transient), B's (integrity) fails for Auth: BLOCKED. Past
+    // the cooldown, both aged, the probe goes to the older A and settles: available again. A is closed while B is still
+    // owed; the horizon must not leave A's settled turn behind, or the next steps would find B's Auth failure with no
+    // recovery after it and block again.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    wake(&store, &clock, "R", "D", "a", 0).await?;
+    let a = store
+        .allocate_supervision("p1", context(&clock, 3000))
+        .await?
+        .ok_or("A allocated")?;
+    run_turn(&store, &clock, &a.attempt_id, 3000, false, TRANSIENT).await?;
+    let b = integrity(&store, &clock, "R", "D", "b", 3600).await?;
+    store.supervise("R", context(&clock, 3700)).await?;
+    let bt = store
+        .allocate_supervision("p1", context(&clock, 3700))
+        .await?
+        .ok_or("B allocated")?;
+    assert_eq!(bt.wake, b);
+    run_turn(
+        &store,
+        &clock,
+        &bt.attempt_id,
+        3800,
+        false,
+        crate::retry::FailureClass::Auth,
+    )
+    .await?;
+    store.supervise("R", context(&clock, 4500)).await?;
+    store
+        .allocate_supervision("p1", context(&clock, 4500))
+        .await?;
+    assert_eq!(blocked(&path)?.0, "BLOCKED");
+    let ms = 17 * 60_000;
+    store.supervise("R", context(&clock, ms)).await?;
+    let probe = store
+        .allocate_supervision("p1", context(&clock, ms))
+        .await?
+        .ok_or("the probe")?;
+    assert_ne!(probe.wake, b, "the older wake is probed");
+    run_turn(&store, &clock, &probe.attempt_id, ms + 100, true, TRANSIENT).await?;
+    store.supervise("R", context(&clock, ms + 1000)).await?;
+    assert_eq!(blocked(&path)?.0, "RUNNING");
+    store
+        .allocate_supervision("p1", context(&clock, ms + 1000))
+        .await?;
+    store.supervise("R", context(&clock, ms + 2000)).await?;
+    store.supervise("R", context(&clock, ms + 3000)).await?;
+    assert_eq!(
+        blocked(&path)?.0,
+        "RUNNING",
+        "no new failure, no new blocking"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_superseded_wakes_waiting_output_holds_the_horizon_until_it_is_disposed_of() -> R {
+    // M2T08R-401 (decisions 2, 3 and 8, v20): a turn's output recorded at its OBSERVED work, then its run cancelled and
+    // the turn ended without settling: the step supersedes the wake but the horizon stays before the waiting output, so
+    // a disposal after a restart (a fresh job) still gives it its one end (superseded) before the run is closed.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    let w = wake(&store, &clock, "R", "D", "fp", 0).await?;
+    let a = store
+        .allocate_supervision("p1", context(&clock, 3000))
+        .await?
+        .ok_or("allocated")?;
+    let nonce = nonce_of(&path, &a.attempt_id)?;
+    observed(
+        &store,
+        &clock,
+        &a.attempt_id,
+        3100,
+        &[line(
+            &nonce,
+            output("m1", "decision", &w, &a.attempt_id, 1, assumption()),
+        )],
+    )
+    .await?;
+    exec(
+        &path,
+        &format!(
+            "UPDATE runs SET state = 'CANCEL_REQUESTED' WHERE run_id = 'R';
+             UPDATE attempts SET state = 'CANCELLED', ended_at = '2027-01-15T08:00:00Z' WHERE attempt_id = '{}';",
+            a.attempt_id
+        ),
+    )?;
+    let mut conn = Connection::open(&path)?;
+    let ctx = crate::persistence::writer::Ctx::quiet();
+    super::super::supervise::step(&mut conn, "R", &context(&clock, 4000), &ctx)?;
+    assert_eq!(
+        super::super::outputs::waiting(&conn, "R")?.len(),
+        1,
+        "the output still waits for its end"
+    );
+    store.supervise("R", context(&clock, 5000)).await?;
+    assert_eq!(
+        ends(&path)?,
+        [(
+            format!("{}/output/0", a.attempt_id),
+            "superseded".to_owned()
+        )]
+    );
     Ok(())
 }

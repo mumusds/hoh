@@ -260,13 +260,15 @@ pub(super) fn step_failed(
             |r| r.get(0),
         )
         .map_err(sqlite_error)?;
-    // Once per run and error, however errors alternate (v16, M2T08R-202).
-    let (n, seen): (i64, bool) = tx
+    // Once per run and error, however errors alternate (v16, M2T08R-202): by an event id derived from the error's
+    // digest, not a JSON comparison over the run's records (v20, M2T08R-403).
+    let digest = wakes::sha256_hex(error.as_bytes());
+    let event_id = child_id(run_id, &format!("supervisor/step_failed/{}", &digest[..16]));
+    let seen: bool = tx
         .query_row(
-            "SELECT count(*), coalesce(max(json_extract(payload_json, '$.error') = ?3), 0) FROM events \
-             WHERE run_id = ?1 AND kind = ?2",
-            params![run_id, STEP_FAILED, error],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            "SELECT EXISTS (SELECT 1 FROM events WHERE event_id = ?1)",
+            params![event_id],
+            |r| r.get(0),
         )
         .map_err(sqlite_error)?;
     if seen {
@@ -277,7 +279,7 @@ pub(super) fn step_failed(
         &Commit {
             events: vec![NewEvent {
                 project_id,
-                event_id: child_id(run_id, &format!("supervisor/step_failed/{n}")),
+                event_id,
                 run_id: Some(run_id.to_owned()),
                 kind: STEP_FAILED.to_owned(),
                 payload: json!({"error": error}),
@@ -331,15 +333,13 @@ fn take_in_batch(
         .optional()
         .map_err(sqlite_error)?
         .unwrap_or(0);
-    // At most STEP events per batch: the cursor stops at the last one looked at (docs/adr/ADR-025.md decision 2).
-    let (high, looked): (i64, i64) = tx
-        .query_row(
-            "SELECT coalesce(max(seq), ?2), count(*) FROM (SELECT seq FROM events WHERE run_id = ?1 AND seq > ?2 \
-             ORDER BY seq LIMIT ?3)",
-            params![run_id, cursor, STEP],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
+    // A batch is a window of the global seq after the cursor, at most STEP long, read by its rowid range: at most STEP
+    // events looked at, and the cursor moves to the window's end even when none of them is this run's (v20,
+    // M2T08R-451: by the run's index each step scanned all of the run's events).
+    let last: i64 = tx
+        .query_row("SELECT coalesce(max(seq), 0) FROM events", [], |r| r.get(0))
         .map_err(sqlite_error)?;
+    let high = last.min(cursor.saturating_add(STEP)).max(cursor);
     let kinds = KINDS
         .iter()
         .map(|k| format!("'{k}'"))
@@ -348,8 +348,8 @@ fn take_in_batch(
     let waking: Vec<(i64, String, String)> = {
         let mut statement = tx
             .prepare(&format!(
-                "SELECT seq, kind, payload_json FROM events WHERE run_id = ?1 AND seq > ?2 AND seq <= ?3 \
-                 AND kind IN ({kinds}) ORDER BY seq"
+                "SELECT seq, kind, payload_json FROM events WHERE seq > ?2 AND seq <= ?3 AND +run_id = ?1 \
+                 AND +kind IN ({kinds}) ORDER BY seq"
             ))
             .map_err(sqlite_error)?;
         statement
@@ -433,7 +433,7 @@ fn take_in_batch(
         )
         .map_err(sqlite_error)?;
     }
-    Ok((project_id, high, looked < STEP))
+    Ok((project_id, high, high >= last))
 }
 
 /// A batch's events of one key, joined in memory: their highest severity, their seqs, and when the first and the last

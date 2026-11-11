@@ -600,22 +600,31 @@ pub(super) fn supervision_input(
     }
     // The latest ten, from two index range scans newest first (v18: no scan of the run's whole history).
     let rejections: Vec<Value> = {
-        let mut rows: Vec<(i64, String, String)> = Vec::new();
-        for sql in [
+        // The latest ten, newest first: the rejections by their own index range, the invalid ends only after the
+        // horizon (v18, v20 M2T08R-403: no scan of the run's whole history).
+        let read =
+            |sql: &str, from: Option<i64>| -> Result<Vec<(i64, String, String)>, PersistError> {
+                let mut statement = conn.prepare(sql).map_err(sqlite_error)?;
+                let map = |r: &rusqlite::Row<'_>| Ok((r.get(0)?, r.get(1)?, r.get(2)?));
+                let rows = match from {
+                    Some(from) => statement.query_map(params![run_id, from], map),
+                    None => statement.query_map(params![run_id], map),
+                }
+                .map_err(sqlite_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(sqlite_error)?;
+                Ok(rows)
+            };
+        let mut rows = read(
             "SELECT seq, kind, payload_json FROM events WHERE run_id = ?1 AND kind = 'decision.rejected' \
              ORDER BY seq DESC LIMIT 10",
+            None,
+        )?;
+        rows.extend(read(
             "SELECT seq, kind, payload_json FROM events WHERE run_id = ?1 AND kind = 'supervisor.output_disposed' \
-             AND json_extract(payload_json, '$.outcome') = 'invalid' ORDER BY seq DESC LIMIT 10",
-        ] {
-            let mut statement = conn.prepare(sql).map_err(sqlite_error)?;
-            rows.extend(
-                statement
-                    .query_map(params![run_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-                    .map_err(sqlite_error)?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(sqlite_error)?,
-            );
-        }
+             AND json_extract(payload_json, '$.outcome') = 'invalid' AND seq >= ?2 ORDER BY seq DESC LIMIT 10",
+            Some(horizon(conn, run_id)?),
+        )?);
         rows.sort_by_key(|(seq, _, _)| std::cmp::Reverse(*seq));
         rows.truncate(10);
         rows.into_iter()
@@ -730,44 +739,13 @@ pub(super) fn allocate(
             .collect::<Result<_, _>>()
             .map_err(sqlite_error)?
     };
+    // Each run's latest allocation, by one index lookup per run (v20, M2T08R-451: no aggregation over all of them).
     let mut last: BTreeMap<String, i64> = BTreeMap::new();
-    {
-        let mut statement = tx
-            .prepare(
-                "SELECT e.run_id, max(e.seq) FROM events e JOIN runs r ON r.run_id = e.run_id \
-                 WHERE r.project_id = ?1 AND e.kind = ?2 GROUP BY e.run_id",
-            )
-            .map_err(sqlite_error)?;
-        for row in statement
-            .query_map(params![project_id, ALLOCATED], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
-            .map_err(sqlite_error)?
-        {
-            let (run, seq): (String, i64) = row.map_err(sqlite_error)?;
-            last.insert(run, seq);
+    for (run_id, _, _) in &runs {
+        if let Some((seq, _)) = latest_allocation(&tx, run_id)? {
+            last.insert(run_id.clone(), seq);
         }
     }
-    // Preempts whose target has ended name the wake that takes the slot next, while it is still to be allocated
-    // (decision 3, -800, -850).
-    let named: Vec<(String, String, i64)> = {
-        let mut statement = tx
-            .prepare(
-                "SELECT e.run_id, json_extract(e.payload_json, '$.wake'), e.seq FROM events e \
-                 JOIN runs r ON r.run_id = e.run_id JOIN attempts a \
-                 ON a.attempt_id = json_extract(e.payload_json, '$.target_attempt') \
-                 WHERE r.project_id = ?1 AND e.kind = ?2 \
-                 AND a.state IN ('SETTLED', 'FAILED', 'CANCELLED', 'UNKNOWN_EFFECT')",
-            )
-            .map_err(sqlite_error)?;
-        statement
-            .query_map(params![project_id, PREEMPT], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-            })
-            .map_err(sqlite_error)?
-            .collect::<Result<_, _>>()
-            .map_err(sqlite_error)?
-    };
     let mut candidates = Vec::new();
     let mut rearmed = Commit::default();
     for (run_id, spec_id, run_revision) in runs {
@@ -777,6 +755,29 @@ pub(super) fn allocate(
         let mut wakes = of_run(&tx, &run_id)?;
         let epoch = decide::to_i64(binding.role_epoch, "role_epoch")?;
         let (moves, events) = rearm(&tx, project_id, &run_id, &mut wakes, now)?;
+        // Preempts whose target has ended name the wake that takes the slot next, while it is still to be allocated
+        // (decision 3, -800, -850): this run's, after its horizon, by the wake they name (v20, M2T08R-402).
+        let named: BTreeMap<String, i64> = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT json_extract(e.payload_json, '$.wake'), max(e.seq) FROM events e JOIN attempts a \
+                     ON a.attempt_id = json_extract(e.payload_json, '$.target_attempt') \
+                     WHERE e.run_id = ?1 AND e.kind = ?2 AND e.seq >= ?3 \
+                     AND a.state IN ('SETTLED', 'FAILED', 'CANCELLED', 'UNKNOWN_EFFECT') \
+                     GROUP BY json_extract(e.payload_json, '$.wake')",
+                )
+                .map_err(sqlite_error)?;
+            let rows: Vec<(Option<String>, i64)> = statement
+                .query_map(params![run_id, PREEMPT, horizon(&tx, &run_id)?], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .map_err(sqlite_error)?
+                .collect::<Result<_, _>>()
+                .map_err(sqlite_error)?;
+            rows.into_iter()
+                .filter_map(|(wake, seq)| Some((wake?, seq)))
+                .collect()
+        };
         rearmed.cas.extend(moves);
         rearmed.events.extend(events);
         if !binding.active {
@@ -832,11 +833,9 @@ pub(super) fn allocate(
             let aged = parse_rfc3339_millis(&wake.woken_at)
                 .and_then(|at| now.duration_since(at).ok())
                 .is_some_and(|waited| waited > SUPERVISION_TURN);
-            let first = named.iter().any(|(run, id, seq)| {
-                *run == run_id
-                    && *id == wake.id
-                    && wake.turns.last().is_none_or(|t| t.allocated_seq < *seq)
-            });
+            let first = named
+                .get(&wake.id)
+                .is_some_and(|seq| wake.turns.last().is_none_or(|t| t.allocated_seq < *seq));
             let level = if first {
                 0
             } else if aged {
@@ -900,13 +899,8 @@ pub(super) fn allocate(
         }
         return Ok(None);
     };
-    let generation: i64 = tx
-        .query_row(
-            "SELECT count(*) FROM events WHERE run_id = ?1 AND kind = ?2",
-            params![chosen.run_id, ALLOCATED],
-            |r| r.get(0),
-        )
-        .map_err(sqlite_error)?;
+    // The run's allocations so far: its latest's generation and one (v20, M2T08R-451: not a count over them all).
+    let generation: i64 = latest_allocation(&tx, &chosen.run_id)?.map_or(0, |(_, g)| g + 1);
     let task_id = format!("{}/turn/{generation}", chosen.wake.id);
     tx.execute(
         "INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq) VALUES \
@@ -1469,6 +1463,18 @@ pub(super) fn judge(
     Ok(commit)
 }
 
+/// Run `run_id`'s latest `supervisor.allocated`: its seq and generation (one index lookup; v20).
+fn latest_allocation(conn: &Connection, run_id: &str) -> Result<Option<(i64, i64)>, PersistError> {
+    conn.query_row(
+        "SELECT seq, coalesce(json_extract(payload_json, '$.generation'), 0) FROM events \
+         WHERE run_id = ?1 AND kind = ?2 ORDER BY seq DESC LIMIT 1",
+        params![run_id, ALLOCATED],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .optional()
+    .map_err(sqlite_error)
+}
+
 /// Whether event `event_id` exists (the unique index; v18).
 fn has_event(tx: &Connection, event_id: &str) -> Result<bool, PersistError> {
     tx.query_row(
@@ -1504,17 +1510,33 @@ pub(super) fn advance_horizon(
     project_id: &str,
     run_id: &str,
 ) -> Result<Option<NewEvent>, PersistError> {
+    // The readers table (v20): kept are the open wakes, every wake with an unterminated output on any of its turns
+    // (a superseded one too, M2T08R-401), and the wake of the current Commander epoch's last SETTLED turn (the Auth
+    // and Capability recovery, the probe's cooldown, M2T08R-400).
     let waiting = super::outputs::pending_attempts(tx, run_id)?;
-    let open = of_run(tx, run_id)?
-        .into_iter()
+    let epoch: Option<i64> = tx
+        .query_row(
+            "SELECT role_epoch FROM role_bindings WHERE run_id = ?1 AND role = ?2",
+            params![run_id, COMMANDER],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let wakes = of_run(tx, run_id)?;
+    let last_settled = wakes
+        .iter()
+        .flat_map(|w| w.turns.iter().map(move |t| (w, t)))
+        .filter(|(_, t)| Some(t.role_epoch) == epoch && t.state == Some(AttemptState::Settled))
+        .max_by_key(|(_, t)| t.allocated_seq)
+        .map(|(w, _)| w.woken_seq);
+    let open = wakes
+        .iter()
         .filter(|w| {
-            !w.superseded
-                && (!w.settled()
-                    || w.turns
-                        .last()
-                        .is_some_and(|t| waiting.contains(&t.attempt_id)))
+            let unterminated = w.turns.iter().any(|t| waiting.contains(&t.attempt_id));
+            unterminated || (!w.superseded && !w.settled())
         })
         .map(|w| w.woken_seq)
+        .chain(last_settled)
         .min();
     let next = match open {
         Some(seq) => seq,
@@ -1552,11 +1574,12 @@ pub(super) fn advance_horizon(
 fn probe_attempts(tx: &Transaction<'_>, run_id: &str) -> Result<BTreeSet<String>, PersistError> {
     let mut statement = tx
         .prepare(
-            "SELECT json_extract(payload_json, '$.attempt_id') FROM events WHERE run_id = ?1 AND kind = ?2",
+            "SELECT json_extract(payload_json, '$.attempt_id') FROM events WHERE run_id = ?1 AND kind = ?2 \
+             AND seq >= ?3",
         )
         .map_err(sqlite_error)?;
     let rows: Vec<Option<String>> = statement
-        .query_map(params![run_id, PROBE], |r| r.get(0))
+        .query_map(params![run_id, PROBE, horizon(tx, run_id)?], |r| r.get(0))
         .map_err(sqlite_error)?
         .collect::<Result<_, _>>()
         .map_err(sqlite_error)?;
