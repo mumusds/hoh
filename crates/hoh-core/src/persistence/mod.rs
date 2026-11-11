@@ -870,7 +870,17 @@ impl Store {
                 })
                 .await?
             {
-                runner::RunnerDone::Supervised(Some(done)) => return Ok(done),
+                runner::RunnerDone::Supervised(Some(done)) => {
+                    // Then its outputs, a job per batch until none is left (v16).
+                    while self
+                        .runner_step(runner::RunnerJob::Dispose {
+                            run_id: run_id.to_owned(),
+                            context: Box::new(context.clone()),
+                        })
+                        .await?
+                    {}
+                    return Ok(done);
+                }
                 runner::RunnerDone::Supervised(None) => {}
                 _ => {
                     return Err(PersistError::IntegrityViolation(

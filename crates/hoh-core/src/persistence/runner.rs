@@ -110,6 +110,11 @@ pub(super) enum RunnerJob {
     WithdrawTurn(String, std::time::SystemTime),
     /// A run's supervisor step failed with this error (docs/adr/ADR-025.md v15 decision 5).
     StepFailed(String, String),
+    /// One job of a run's output disposal (docs/adr/ADR-025.md v16 decision 2).
+    Dispose {
+        run_id: String,
+        context: Box<crate::decision::Context>,
+    },
     /// One look at a run as a whole (ADR-020 decisions 4, 5 and 7).
     Pace {
         run_id: String,
@@ -253,6 +258,9 @@ pub(super) fn run(
         } => super::wakes::stops(conn, &project_id, &context, ctx).map(RunnerDone::Stops),
         RunnerJob::WithdrawTurn(attempt_id, at) => {
             super::wakes::withdraw_turn(conn, &attempt_id, at, ctx).map(RunnerDone::Applied)
+        }
+        RunnerJob::Dispose { run_id, context } => {
+            super::supervise::dispose(conn, &run_id, &context, ctx).map(RunnerDone::Applied)
         }
         RunnerJob::StepFailed(run_id, error) => {
             super::supervise::step_failed(conn, &run_id, &error, ctx).map(RunnerDone::Applied)

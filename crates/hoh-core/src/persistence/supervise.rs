@@ -119,14 +119,28 @@ pub(super) fn step(
     }
     ctx.before_commit()?;
     tx.commit().map_err(sqlite_error)?;
-    // Then the outputs of its turns, one transaction each, after the judgement: a probe that settled releases its
-    // claims before its answer is disposed of (decision 5, -454).
-    super::outputs::dispose(conn, run_id, context, ctx)?;
-    close(conn, run_id, context, ctx)?;
+    // Then the outputs of its turns, in jobs of their own ([`dispose`]), after the judgement: a probe that settled
+    // releases its claims before its answer is disposed of (decision 5, -454).
     Ok(Some(Supervised {
         cursor: high,
         fired,
     }))
+}
+
+/// One writer job of run `run_id`'s output disposal at `context.now()` (v16 decision 2): at most
+/// [`super::outputs::DISPOSE_BATCH`] outputs; once none is left, the run's supervision closed if it ended. Whether
+/// outputs are left for another job.
+pub(super) fn dispose(
+    conn: &mut Connection,
+    run_id: &str,
+    context: &Context,
+    ctx: &Ctx<'_>,
+) -> Result<bool, PersistError> {
+    let more = super::outputs::dispose(conn, run_id, context, ctx)?;
+    if !more {
+        close(conn, run_id, context, ctx)?;
+    }
+    Ok(more)
 }
 
 /// Run `run_id`'s supervision closed, once it is cancelled or ended and nothing is left of it (v13, M2T08R-06): no
@@ -172,7 +186,7 @@ fn close(
         || wakes::of_run(&tx, run_id)?
             .iter()
             .any(|w| !w.superseded && !w.settled())
-        || super::outputs::pending(&tx, run_id)?.is_some()
+        || !super::outputs::waiting(&tx, run_id)?.is_empty()
     {
         return Ok(());
     }
@@ -211,15 +225,16 @@ pub(super) fn step_failed(
             |r| r.get(0),
         )
         .map_err(sqlite_error)?;
-    let (n, last): (i64, Option<String>) = tx
+    // Once per run and error, however errors alternate (v16, M2T08R-202).
+    let (n, seen): (i64, bool) = tx
         .query_row(
-            "SELECT count(*), (SELECT json_extract(payload_json, '$.error') FROM events WHERE run_id = ?1 \
-             AND kind = ?2 ORDER BY seq DESC LIMIT 1) FROM events WHERE run_id = ?1 AND kind = ?2",
-            params![run_id, STEP_FAILED],
+            "SELECT count(*), coalesce(max(json_extract(payload_json, '$.error') = ?3), 0) FROM events \
+             WHERE run_id = ?1 AND kind = ?2",
+            params![run_id, STEP_FAILED, error],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .map_err(sqlite_error)?;
-    if last.as_deref() == Some(error) {
+    if seen {
         return Ok(false);
     }
     writer::write(

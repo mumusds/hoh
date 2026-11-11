@@ -69,23 +69,57 @@ pub(super) fn recorded(
         .collect()
 }
 
-/// The next output of run `run_id` with no end yet: its id, turn and text.
-pub(super) fn pending(
-    tx: &Transaction<'_>,
-    run_id: &str,
-) -> Result<Option<(String, String, String)>, PersistError> {
-    tx.query_row(
-        "SELECT json_extract(e.payload_json, '$.output_id'), json_extract(e.payload_json, '$.attempt_id'), \
-         json_extract(e.payload_json, '$.text') FROM events e WHERE e.run_id = ?1 AND e.kind = ?2 \
-         AND NOT EXISTS (SELECT 1 FROM events d WHERE d.run_id = e.run_id \
-           AND d.kind IN (?3, 'decision.applied', 'decision.rejected') \
-           AND json_extract(d.payload_json, '$.output_id') = json_extract(e.payload_json, '$.output_id')) \
-         ORDER BY e.seq LIMIT 1",
-        params![run_id, OUTPUT, DISPOSED],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-    )
-    .optional()
-    .map_err(sqlite_error)
+/// How many outputs one writer job disposes of at most (docs/adr/ADR-025.md v16 decision 2, M2T08R-201).
+pub(super) const DISPOSE_BATCH: usize = 50;
+
+/// An output of a run with no end yet: its id, its turn and its event's seq.
+pub(super) struct Waiting {
+    pub output_id: String,
+    pub attempt_id: String,
+    pub seq: i64,
+}
+
+/// The outputs of run `run_id` with no end yet, in order: one scan of the run's outputs and one of their ends, matched
+/// by a set (v16, M2T08R-201: a correlated lookup per output made it quadratic).
+pub(super) fn waiting(conn: &Connection, run_id: &str) -> Result<Vec<Waiting>, PersistError> {
+    let ended: std::collections::BTreeSet<String> = {
+        let mut statement = conn
+            .prepare(
+                "SELECT json_extract(payload_json, '$.output_id') FROM events WHERE run_id = ?1 \
+                 AND kind IN (?2, 'decision.applied', 'decision.rejected')",
+            )
+            .map_err(sqlite_error)?;
+        let rows: Vec<Option<String>> = statement
+            .query_map(params![run_id, DISPOSED], |r| r.get(0))
+            .map_err(sqlite_error)?
+            .collect::<Result<_, _>>()
+            .map_err(sqlite_error)?;
+        rows.into_iter().flatten().collect()
+    };
+    let mut statement = conn
+        .prepare(
+            "SELECT json_extract(payload_json, '$.output_id'), json_extract(payload_json, '$.attempt_id'), seq \
+             FROM events WHERE run_id = ?1 AND kind = ?2 ORDER BY seq",
+        )
+        .map_err(sqlite_error)?;
+    let rows: Vec<(Option<String>, Option<String>, i64)> = statement
+        .query_map(params![run_id, OUTPUT], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .map_err(sqlite_error)?
+        .collect::<Result<_, _>>()
+        .map_err(sqlite_error)?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(output_id, attempt_id, seq)| {
+            let output_id = output_id?;
+            (!ended.contains(&output_id)).then_some(Waiting {
+                output_id,
+                attempt_id: attempt_id.unwrap_or_default(),
+                seq,
+            })
+        })
+        .collect())
 }
 
 /// The turns of run `run_id` with an output that has no end yet (docs/adr/ADR-025.md v14 decision 3: their wakes are
@@ -94,20 +128,10 @@ pub(super) fn pending_attempts(
     tx: &Transaction<'_>,
     run_id: &str,
 ) -> Result<std::collections::BTreeSet<String>, PersistError> {
-    let mut statement = tx
-        .prepare(
-            "SELECT DISTINCT json_extract(e.payload_json, '$.attempt_id') FROM events e WHERE e.run_id = ?1 \
-             AND e.kind = ?2 AND NOT EXISTS (SELECT 1 FROM events d WHERE d.run_id = e.run_id \
-               AND d.kind IN (?3, 'decision.applied', 'decision.rejected') \
-               AND json_extract(d.payload_json, '$.output_id') = json_extract(e.payload_json, '$.output_id'))",
-        )
-        .map_err(sqlite_error)?;
-    let rows: Vec<Option<String>> = statement
-        .query_map(params![run_id, OUTPUT, DISPOSED], |r| r.get(0))
-        .map_err(sqlite_error)?
-        .collect::<Result<_, _>>()
-        .map_err(sqlite_error)?;
-    Ok(rows.into_iter().flatten().collect())
+    Ok(waiting(tx, run_id)?
+        .into_iter()
+        .map(|w| w.attempt_id)
+        .collect())
 }
 
 /// How one output ends, short of a decision put through `decide`.
@@ -125,15 +149,26 @@ fn end(outcome: &'static str, reason: Option<&'static str>) -> End {
     }
 }
 
-/// Dispose of run `run_id`'s outputs at `context.now()`, one transaction each, until none is left, the run's state
-/// holds them, or one fails (its failure counted; the run's others wait for the next step).
+/// Dispose of run `run_id`'s outputs at `context.now()`, one transaction each, at most [`DISPOSE_BATCH`] in this
+/// writer job (v16): whether some are left for another job. It stops, none left for now, when the run's state holds
+/// them or one fails (its failure counted; the run's others wait for the next step).
 pub(super) fn dispose(
     conn: &mut Connection,
     run_id: &str,
     context: &Context,
     ctx: &Ctx<'_>,
-) -> Result<(), PersistError> {
-    loop {
+) -> Result<bool, PersistError> {
+    let list = waiting(conn, run_id)?;
+    let more = list.len() > DISPOSE_BATCH;
+    // Each turn's allocation read once in this job.
+    let mut allocations: std::collections::BTreeMap<String, Value> =
+        std::collections::BTreeMap::new();
+    for Waiting {
+        output_id,
+        attempt_id,
+        seq,
+    } in list.into_iter().take(DISPOSE_BATCH)
+    {
         let tx = writer::begin(conn, ctx)?;
         let (project_id, state): (String, String) = tx
             .query_row(
@@ -147,14 +182,22 @@ pub(super) fn dispose(
             state,
             RunState::PauseRequested | RunState::Paused | RunState::Incomplete
         ) {
-            return Ok(());
+            return Ok(false);
         }
-        let Some((output_id, attempt_id, text)) = pending(&tx, run_id)? else {
-            return Ok(());
-        };
+        let text: String = tx
+            .query_row(
+                "SELECT coalesce(json_extract(payload_json, '$.text'), '') FROM events WHERE seq = ?1",
+                params![seq],
+                |r| r.get(0),
+            )
+            .map_err(sqlite_error)?;
         let ended = if state.is_terminal() || state == RunState::CancelRequested {
             Ok(Some(end("superseded", None)))
         } else {
+            if !allocations.contains_key(&attempt_id) {
+                let allocation = allocation(&tx, run_id, &attempt_id)?;
+                allocations.insert(attempt_id.clone(), allocation);
+            }
             one(
                 &tx,
                 &project_id,
@@ -162,6 +205,7 @@ pub(super) fn dispose(
                 &output_id,
                 &attempt_id,
                 &text,
+                &allocations[&attempt_id],
                 context,
                 ctx,
             )
@@ -202,10 +246,27 @@ pub(super) fn dispose(
             Err(e) => {
                 drop(tx);
                 failed(conn, &project_id, run_id, &output_id, &attempt_id, &e, ctx)?;
-                return Ok(());
+                return Ok(false);
             }
         }
     }
+    Ok(more)
+}
+
+/// Turn `attempt_id`'s `supervisor.allocated` (null when there is none).
+fn allocation(tx: &Transaction<'_>, run_id: &str, attempt_id: &str) -> Result<Value, PersistError> {
+    let allocation: Option<String> = tx
+        .query_row(
+            "SELECT payload_json FROM events WHERE run_id = ?1 AND kind = 'supervisor.allocated' \
+             AND json_extract(payload_json, '$.attempt_id') = ?2",
+            params![run_id, attempt_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    Ok(allocation
+        .and_then(|a| serde_json::from_str(&a).ok())
+        .unwrap_or(Value::Null))
 }
 
 /// Count a failed disposal of `output_id` in a transaction of its own; the third ends it INTERNAL.
@@ -264,21 +325,10 @@ fn one(
     output_id: &str,
     attempt_id: &str,
     text: &str,
+    allocation: &Value,
     context: &Context,
     ctx: &Ctx<'_>,
 ) -> Result<Option<End>, PersistError> {
-    let allocation: Option<String> = tx
-        .query_row(
-            "SELECT payload_json FROM events WHERE run_id = ?1 AND kind = 'supervisor.allocated' \
-             AND json_extract(payload_json, '$.attempt_id') = ?2",
-            params![run_id, attempt_id],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(sqlite_error)?;
-    let allocation: Value = allocation
-        .and_then(|a| serde_json::from_str(&a).ok())
-        .unwrap_or(Value::Null);
     let wake = allocation["wake"].as_str().unwrap_or_default();
     let Ok(Value::Object(line)) = serde_json::from_str::<Value>(text) else {
         return Ok(Some(end("invalid", Some("FORMAT"))));
