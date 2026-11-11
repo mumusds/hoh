@@ -30,6 +30,33 @@ const KINDS: &[&str] = &[
     "task.implemented",
 ];
 
+/// The events this writer committed, by transaction: the transaction's last seq, the seq before it, and when it
+/// committed by the store's clock; the latest [`KEPT`] transactions (docs/adr/ADR-025.md decision 2).
+#[derive(Debug, Default)]
+pub(super) struct CommitTimes(std::collections::BTreeMap<i64, (i64, SystemTime)>);
+
+/// How many transactions' commit instants a writer keeps.
+const KEPT: usize = 100_000;
+
+impl CommitTimes {
+    /// A transaction committed the events after `before` up to `last`, at `at`.
+    pub(super) fn record(&mut self, before: i64, last: i64, at: SystemTime) {
+        self.0.insert(last, (before, at));
+        while self.0.len() > KEPT {
+            self.0.pop_first();
+        }
+    }
+
+    /// When event `seq` committed, if this writer committed it (not an earlier host's, not forgotten).
+    pub(super) fn of(&self, seq: i64) -> Option<SystemTime> {
+        self.0
+            .range(seq..)
+            .next()
+            .filter(|(_, (before, _))| *before < seq)
+            .map(|(_, (_, at))| *at)
+    }
+}
+
 /// A trigger fired by a step.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fired {
@@ -119,6 +146,7 @@ pub(super) fn step(
                     .map_err(sqlite_error)?,
                 None => None,
             };
+            // Timed from its commit (REQ-021 decision 4); an event an earlier writer committed, from now.
             take_in(
                 &tx,
                 run_id,
@@ -126,7 +154,7 @@ pub(super) fn step(
                 spec_id.as_deref(),
                 wake.severity,
                 *seq,
-                now,
+                ctx.committed_at(*seq).unwrap_or(now),
             )?;
         }
     }
@@ -138,7 +166,7 @@ pub(super) fn step(
         )
         .map_err(sqlite_error)?;
     }
-    let (fired, events) = fire(&tx, &project_id, run_id, now)?;
+    let (fired, events) = fire(&tx, &project_id, run_id, now, ctx)?;
     writer::write(
         &tx,
         &Commit {
@@ -155,8 +183,8 @@ pub(super) fn step(
     })
 }
 
-/// Event `seq` of key (`fingerprint`, `spec_id`) taken in at `now`: joined to the key's PENDING trigger, else a new
-/// one (REQ-021 decision 3); its due time again by decision 1.
+/// Event `seq` of key (`fingerprint`, `spec_id`), committed at `at`: joined to the key's PENDING trigger, else a new
+/// one (REQ-021 decision 3); its due time again by decision 1, from its first and last events' commits.
 fn take_in(
     tx: &Transaction<'_>,
     run_id: &str,
@@ -164,7 +192,7 @@ fn take_in(
     spec_id: Option<&str>,
     severity: Severity,
     seq: i64,
-    now: SystemTime,
+    at: SystemTime,
 ) -> Result<(), PersistError> {
     let pending: Option<(String, String, String, String)> = tx
         .query_row(
@@ -199,7 +227,7 @@ fn take_in(
                     severity.as_str(),
                     json!(seqs).to_string(),
                     seq,
-                    rfc3339_millis_utc(supervise::due_at(severity, first, now))
+                    rfc3339_millis_utc(supervise::due_at(severity, first, at))
                 ],
             )
             .map_err(sqlite_error)?;
@@ -216,8 +244,8 @@ fn take_in(
                     severity.as_str(),
                     json!([seq]).to_string(),
                     seq,
-                    rfc3339_millis_utc(supervise::due_at(severity, now, now)),
-                    rfc3339_millis_utc(now)
+                    rfc3339_millis_utc(supervise::due_at(severity, at, at)),
+                    rfc3339_millis_utc(at)
                 ],
             )
             .map_err(sqlite_error)?;
@@ -227,18 +255,22 @@ fn take_in(
 }
 
 /// The run's PENDING triggers due at `now`, HANDLED, each with its `supervisor.woken` event: its key, events, first
-/// event time, wake time and latency (REQ-021 behaviour 7).
+/// event time, wake time and latency (REQ-021 behaviour 7), on the store's clock from its first event's commit; one
+/// an earlier writer committed is timed from when it was taken in, `latency_basis` saying so.
 fn fire(
     tx: &Transaction<'_>,
     project_id: &str,
     run_id: &str,
     now: SystemTime,
+    ctx: &Ctx<'_>,
 ) -> Result<(Vec<Fired>, Vec<NewEvent>), PersistError> {
-    let due: Vec<(String, String, Option<String>, String, String, String)> = {
+    type Due = (String, String, Option<String>, String, String, String, i64);
+    let due: Vec<Due> = {
         let mut statement = tx
             .prepare(
-                "SELECT trigger_id, fingerprint, spec_id, severity, event_seqs_json, created_at FROM supervisor_triggers \
-                 WHERE run_id = ?1 AND state = 'PENDING' AND due_at <= ?2 ORDER BY due_at, first_seq",
+                "SELECT trigger_id, fingerprint, spec_id, severity, event_seqs_json, created_at, first_seq \
+                 FROM supervisor_triggers WHERE run_id = ?1 AND state = 'PENDING' AND due_at <= ?2 \
+                 ORDER BY due_at, first_seq",
             )
             .map_err(sqlite_error)?;
         statement
@@ -250,6 +282,7 @@ fn fire(
                     r.get(3)?,
                     r.get(4)?,
                     r.get(5)?,
+                    r.get(6)?,
                 ))
             })
             .map_err(sqlite_error)?
@@ -258,7 +291,7 @@ fn fire(
     };
     let mut fired = Vec::new();
     let mut events = Vec::new();
-    for (trigger_id, fingerprint, spec_id, severity, seqs, created_at) in due {
+    for (trigger_id, fingerprint, spec_id, severity, seqs, created_at, first_seq) in due {
         let event_seqs: Vec<i64> = serde_json::from_str(&seqs).map_err(|e| {
             PersistError::IntegrityViolation(format!("trigger {trigger_id}: event_seqs_json: {e}"))
         })?;
@@ -267,6 +300,11 @@ fn fire(
                 "trigger {trigger_id}: created_at {created_at}"
             ))
         })?;
+        let basis = if ctx.committed_at(first_seq).is_some() {
+            "commit"
+        } else {
+            "across_restart"
+        };
         let latency = now
             .duration_since(first)
             .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
@@ -288,6 +326,7 @@ fn fire(
                 "first_event_at": created_at,
                 "woken_at": rfc3339_millis_utc(now),
                 "wake_latency_ms": latency,
+                "latency_basis": basis,
             }),
         });
         fired.push(Fired {

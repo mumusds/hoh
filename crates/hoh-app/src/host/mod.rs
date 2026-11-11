@@ -293,9 +293,16 @@ impl Host {
         std::fs::create_dir_all(&files)
             .map_err(|e| StartError::other(format!("cannot make {}: {e}", files.display())))?;
         let lock = take_lock(&files)?;
-        let store =
-            Store::open_with_mountinfo(&files.join("state.db"), config.store.clone(), &mountinfo)
-                .map_err(StartError::store)?;
+        let store = Store::open_with_mountinfo(
+            &files.join("state.db"),
+            // Commits stamped by the host's clock, the one its supervisor steps by (docs/adr/ADR-025.md decision 2).
+            hoh_core::persistence::Options {
+                clock: Some(hoh_core::persistence::StoreClock(config.clock.0.clone())),
+                ..config.store.clone()
+            },
+            &mountinfo,
+        )
+        .map_err(StartError::store)?;
         // The writer holds the lock from here on: it lets the project go only after its last write (ADR-016
         // decision 12). A start that fails from here waits for that before it returns.
         let ended = store.writer_ended();

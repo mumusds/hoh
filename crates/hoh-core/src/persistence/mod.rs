@@ -74,6 +74,19 @@ pub struct Options {
     pub wal_probe: Option<selftest::ProbeCommand>,
     /// Fault injection points; the product's [`NoFaults`] does nothing (CR-006).
     pub faults: Arc<dyn FaultHooks>,
+    /// The clock the writer stamps each commit with (docs/adr/ADR-025.md decision 2: the supervisor's debounce and
+    /// latency run from commit instants): the host's clock; `None`, the system clock.
+    pub clock: Option<StoreClock>,
+}
+
+/// A clock for [`Options::clock`].
+#[derive(Clone)]
+pub struct StoreClock(pub Arc<dyn crate::delivery::Clock>);
+
+impl std::fmt::Debug for StoreClock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StoreClock")
+    }
 }
 
 impl Default for Options {
@@ -83,6 +96,7 @@ impl Default for Options {
             queue: 64,
             wal_probe: None,
             faults: Arc::new(NoFaults),
+            clock: None,
         }
     }
 }
