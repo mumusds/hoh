@@ -422,6 +422,9 @@ fn an_interrupted_writer_lets_its_lease_go_only_with_its_workspace_record() -> R
         (AttemptState::UnknownEffect, true),
         (AttemptState::Cancelled, false),
         (AttemptState::Cancelled, true),
+        // HoH's own stop of a writer (an oversize frame, a deadline) ends it FAILED too (M2T17FR-50).
+        (AttemptState::Failed, false),
+        (AttemptState::Failed, true),
     ] {
         let dir = tempfile::tempdir()?;
         let mut conn = world(&dir)?;
@@ -469,22 +472,41 @@ fn an_interrupted_writer_lets_its_lease_go_only_with_its_workspace_record() -> R
 
 #[test]
 fn only_an_interrupted_writers_end_needs_a_workspace_record() -> R {
-    // REQ-019 behaviour 6 (decision 9): a writer that fails or completes ended by itself; a STARTING writer cancelled
-    // never ran its agent; a reader is no writer: none of them needs the record, and their leases go at their end.
+    // REQ-019 behaviour 6 (decision 9 after round 1, M2T17FR-50, -53): a writer that completed (SETTLED) ended by
+    // itself; a STARTING writer cancelled or refused its start never ran its agent; a reader is no writer: none of
+    // them needs the record, and their leases go at their end. A STARTING writer moved to UNKNOWN_EFFECT does.
     let quiet = crate::persistence::writer::Ctx::quiet();
-    for to in [AttemptState::Failed, AttemptState::Settled] {
+    let dir = tempfile::tempdir()?;
+    let mut conn = world(&dir)?;
+    running(&mut conn, "a-w1", "writer")?;
+    attempts::apply(
+        &mut conn,
+        &moving("a-w1", AttemptState::Running, AttemptState::Settled, 9),
+        &quiet,
+    )?;
+    assert!(workspace_events(&conn, "a-w1")?.is_empty());
+    assert_eq!(
+        in_tx(&mut conn, |tx| grant(tx, "p1", "writer", "a-w2", at(9)))?.epoch,
+        2
+    );
+    for to in [AttemptState::Cancelled, AttemptState::Failed] {
         let dir = tempfile::tempdir()?;
         let mut conn = world(&dir)?;
-        running(&mut conn, "a-w1", "writer")?;
+        in_tx(&mut conn, |tx| grant(tx, "p1", "writer", "a-w1", at(0)))?;
         attempts::apply(
             &mut conn,
-            &moving("a-w1", AttemptState::Running, to, 9),
+            &moving("a-w1", AttemptState::Prepared, AttemptState::Starting, 1),
             &quiet,
         )?;
-        assert!(workspace_events(&conn, "a-w1")?.is_empty());
+        attempts::apply(
+            &mut conn,
+            &moving("a-w1", AttemptState::Starting, to, 9),
+            &quiet,
+        )?;
         assert_eq!(
             in_tx(&mut conn, |tx| grant(tx, "p1", "writer", "a-w2", at(9)))?.epoch,
-            2
+            2,
+            "{to:?}"
         );
     }
     let dir = tempfile::tempdir()?;
@@ -495,16 +517,25 @@ fn only_an_interrupted_writers_end_needs_a_workspace_record() -> R {
         &moving("a-w1", AttemptState::Prepared, AttemptState::Starting, 1),
         &quiet,
     )?;
-    attempts::apply(
+    let refused = attempts::apply(
         &mut conn,
-        &moving("a-w1", AttemptState::Starting, AttemptState::Cancelled, 9),
+        &moving(
+            "a-w1",
+            AttemptState::Starting,
+            AttemptState::UnknownEffect,
+            9,
+        ),
         &quiet,
-    )?;
-    assert_eq!(
-        in_tx(&mut conn, |tx| grant(tx, "p1", "writer", "a-w2", at(9)))?.epoch,
-        2
     );
-    for to in [AttemptState::UnknownEffect, AttemptState::Cancelled] {
+    assert!(
+        matches!(refused, Err(PersistError::WorkspaceRecordRequired(_))),
+        "{refused:?}"
+    );
+    for to in [
+        AttemptState::UnknownEffect,
+        AttemptState::Cancelled,
+        AttemptState::Failed,
+    ] {
         let dir = tempfile::tempdir()?;
         let mut conn = world(&dir)?;
         running(&mut conn, "a-q1", "reader-1")?;

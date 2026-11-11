@@ -301,8 +301,38 @@ fn record_pass(
         PassEnd::Unreaped => "unreaped",
     };
     events.push(event(end, pass.at));
-    if pass.end == PassEnd::Empty && matches!(state, AttemptState::Starting | AttemptState::Running)
-    {
+    let ends = pass.end == PassEnd::Empty
+        && matches!(state, AttemptState::Starting | AttemptState::Running);
+    // Its work, started and never observed, is not known to have happened or not (ADR-021 decision 8e), named as the
+    // runner's end and a reconcile name it (docs/adr/ADR-022.md decision 12 v3, M2T07R-552).
+    let unknown = if ends {
+        attempts::started_effects(&tx, &pass.attempt_id)?
+    } else {
+        Vec::new()
+    };
+    if !unknown.is_empty() {
+        events.push(NewEvent {
+            project_id: project_id.clone(),
+            event_id: child_id(&pass.attempt_id, &format!("cancel/{number}/diagnostic")),
+            run_id: Some(run_id.clone()),
+            kind: "cancel.diagnostic".to_owned(),
+            payload: json!({
+                "code": "UNKNOWN_EFFECT", "attempt_id": pass.attempt_id, "effect_keys": unknown,
+                "detail": "cancelled with effects started and never observed: what they did is not known",
+            }),
+        });
+    }
+    // The pass's steps first, then its end: the workspace's record a writer's end carries follows the stop it was
+    // taken after (docs/adr/ADR-024.md decision 9, M2T17FR-51).
+    let done = writer::write(
+        &tx,
+        &Commit {
+            events,
+            ..Commit::default()
+        },
+        ctx,
+    )?;
+    if ends {
         attempts::move_attempt(
             &tx,
             &AttemptMove {
@@ -317,32 +347,9 @@ fn record_pass(
             },
             ctx,
         )?;
-        // Its work, started and never observed, is not known to have happened or not (ADR-021 decision 8e), named as
-        // the runner's end and a reconcile name it (docs/adr/ADR-022.md decision 12 v3, M2T07R-552).
-        let unknown = attempts::started_effects(&tx, &pass.attempt_id)?;
         attempts::effects_unknown(&tx, &pass.attempt_id)?;
-        if !unknown.is_empty() {
-            events.push(NewEvent {
-                project_id: project_id.clone(),
-                event_id: child_id(&pass.attempt_id, &format!("cancel/{number}/diagnostic")),
-                run_id: Some(run_id.clone()),
-                kind: "cancel.diagnostic".to_owned(),
-                payload: json!({
-                    "code": "UNKNOWN_EFFECT", "attempt_id": pass.attempt_id, "effect_keys": unknown,
-                    "detail": "cancelled with effects started and never observed: what they did is not known",
-                }),
-            });
-        }
         super::retry::accrue_wall(&tx, &run_id, &pass.attempt_id, pass.at, None)?;
     }
-    let done = writer::write(
-        &tx,
-        &Commit {
-            events,
-            ..Commit::default()
-        },
-        ctx,
-    )?;
     tx.commit().map_err(sqlite_error)?;
     Ok(done.event_seqs.last().copied().unwrap_or(0))
 }

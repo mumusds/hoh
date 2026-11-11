@@ -436,12 +436,13 @@ pub(super) fn move_attempt(
     if changed != 1 {
         return Err(stale(Some(state)));
     }
-    // An interrupted end of the writer lease's holder (its agent stopped without an observed result) lets the lease go
-    // only with the workspace's record, written first in this transaction: no other writer can be granted before the
-    // workspace it left is recorded (REQ-019 behaviour 6, docs/adr/ADR-024.md decision 9). The row names it whether
-    // or not it expired: an expired lease of a holder not ended still holds the slot.
+    // An interrupted end of the writer lease's holder (its turn not completed: HoH's own stop ends it FAILED too, an
+    // oversize frame or a deadline, M2T17FR-50) lets the lease go only with the workspace's record, written first in
+    // this transaction: no other writer can be granted before the workspace it left is recorded (REQ-019 behaviour
+    // 6, docs/adr/ADR-024.md decision 9). The row names it whether or not it expired: an expired lease of a holder not
+    // ended still holds the slot.
     let interrupted = m.to == AttemptState::UnknownEffect
-        || (m.from == AttemptState::Running && m.to == AttemptState::Cancelled);
+        || (m.from == AttemptState::Running && m.to.is_terminal() && m.to != AttemptState::Settled);
     if interrupted && leases::names_writer(tx, &m.attempt_id)? {
         let Some(workspace) = &f.workspace else {
             return Err(PersistError::WorkspaceRecordRequired(m.attempt_id.clone()));
