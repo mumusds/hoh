@@ -2729,3 +2729,148 @@ async fn a_second_blocking_episode_under_the_same_reasons_is_its_own() -> R {
     );
     Ok(())
 }
+
+// Implementation review round 2 (docs/adr/ADR-025.md v14: the ended turns folded before the verdict; recovery only by
+// its facts; an obligation until its turn's outputs are disposed). Steps run in the host's order: supervise, then
+// allocate.
+
+#[tokio::test]
+async fn an_auth_unavailability_outlasts_a_probe_that_fails_for_another_reason() -> R {
+    // M2T08R-100 (decision 5, v14): an Auth failure makes the Commander unavailable until a turn of its epoch settles
+    // (or its epoch changes); a probe that fails for another reason only restarts the cooldown: the run stays BLOCKED
+    // and no availability is recorded.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    wake(&store, &clock, "R", "D", "fp", 0).await?;
+    let a = store
+        .allocate_supervision("p1", context(&clock, 3000))
+        .await?
+        .ok_or("allocated")?;
+    run_turn(
+        &store,
+        &clock,
+        &a.attempt_id,
+        3000,
+        false,
+        crate::retry::FailureClass::Auth,
+    )
+    .await?;
+    store.supervise("R", context(&clock, 4000)).await?;
+    store
+        .allocate_supervision("p1", context(&clock, 4000))
+        .await?;
+    assert_eq!(blocked(&path)?.0, "BLOCKED");
+    store.supervise("R", context(&clock, 305_000)).await?;
+    let probe = store
+        .allocate_supervision("p1", context(&clock, 305_000))
+        .await?
+        .ok_or("the probe")?;
+    run_turn(&store, &clock, &probe.attempt_id, 305_100, false, TRANSIENT).await?;
+    store.supervise("R", context(&clock, 306_000)).await?;
+    store
+        .allocate_supervision("p1", context(&clock, 306_000))
+        .await?;
+    assert_eq!(
+        blocked(&path)?.0,
+        "BLOCKED",
+        "a failed probe is no recovery"
+    );
+    assert_eq!(
+        unavailable(&path)?,
+        [json!(["supervisor.unavailable", ["auth"]])]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_step_counts_an_ended_turns_failure_before_its_verdict() -> R {
+    // M2T08R-102 (decisions 3 and 5, v14): the step folds the ended turns (their rearms) before its verdict, as the
+    // allocation does: right after the eighth failure, the host's next step already finds the Commander unavailable,
+    // supersedes a routine trigger due then, and blocks the run.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    wake(&store, &clock, "R", "D", "fp", 0).await?;
+    let ms = fail_turns(&store, &clock, 8, 3000, TRANSIENT).await?;
+    clock.set(ms);
+    event(
+        &store,
+        "R",
+        "R/iteration",
+        "iteration.completed",
+        json!({"iteration": 1}),
+    )
+    .await?;
+    store.supervise("R", context(&clock, ms + 3000)).await?;
+    assert_eq!(
+        value(
+            &path,
+            "SELECT json_array((SELECT count(*) FROM events WHERE kind = 'supervisor.woken' \
+             AND json_extract(payload_json, '$.severity') = 'normal'), \
+             (SELECT state FROM supervisor_triggers WHERE fingerprint LIKE 'iteration.completed%'))"
+        )?,
+        json!([0, "SUPERSEDED"])
+    );
+    assert_eq!(
+        blocked(&path)?.1,
+        json!(["COMMANDER_UNAVAILABLE", "NEED_DECISION"])
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_settled_turn_is_owed_until_its_outputs_are_disposed_of() -> R {
+    // M2T08R-103 (decision 3, v14): a wake whose turn settled is still an obligation while that turn's outputs wait
+    // to be disposed of: with its Commander still unavailable the step keeps the run BLOCKED, the stale answer is
+    // re-triggered, and the run stays BLOCKED through the next step.
+    use crate::decision::Observation;
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    let w = wake(&store, &clock, "R", "D", "fp", 0).await?;
+    let a = store
+        .allocate_supervision("p1", context(&clock, 3000))
+        .await?
+        .ok_or("allocated")?;
+    let gone = |ms| Context {
+        observations: Some(
+            [(
+                "codex".to_owned(),
+                Observation {
+                    host_epoch: 1,
+                    n: 1,
+                    available: false,
+                    logged_in: true,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        ),
+        ..context(&clock, ms)
+    };
+    store.supervise("R", gone(3100)).await?;
+    assert_eq!(blocked(&path)?.0, "BLOCKED");
+    let nonce = nonce_of(&path, &a.attempt_id)?;
+    bridged_turn(
+        &store,
+        &clock,
+        &a.attempt_id,
+        3200,
+        true,
+        &[line(
+            &nonce,
+            output("m1", "decision", &w, &a.attempt_id, 1, assumption()),
+        )],
+    )
+    .await?;
+    store.supervise("R", gone(4000)).await?;
+    assert_eq!(blocked(&path)?.0, "BLOCKED", "its output was still owed");
+    assert_eq!(retriggers(&path)?.len(), 1);
+    store.supervise("R", gone(5000)).await?;
+    assert_eq!(blocked(&path)?.0, "BLOCKED", "its re-trigger is owed");
+    Ok(())
+}

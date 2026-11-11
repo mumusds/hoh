@@ -88,6 +88,28 @@ pub(super) fn pending(
     .map_err(sqlite_error)
 }
 
+/// The turns of run `run_id` with an output that has no end yet (docs/adr/ADR-025.md v14 decision 3: their wakes are
+/// still owed).
+pub(super) fn pending_attempts(
+    tx: &Transaction<'_>,
+    run_id: &str,
+) -> Result<std::collections::BTreeSet<String>, PersistError> {
+    let mut statement = tx
+        .prepare(
+            "SELECT DISTINCT json_extract(e.payload_json, '$.attempt_id') FROM events e WHERE e.run_id = ?1 \
+             AND e.kind = ?2 AND NOT EXISTS (SELECT 1 FROM events d WHERE d.run_id = e.run_id \
+               AND d.kind IN (?3, 'decision.applied', 'decision.rejected') \
+               AND json_extract(d.payload_json, '$.output_id') = json_extract(e.payload_json, '$.output_id'))",
+        )
+        .map_err(sqlite_error)?;
+    let rows: Vec<Option<String>> = statement
+        .query_map(params![run_id, OUTPUT, DISPOSED], |r| r.get(0))
+        .map_err(sqlite_error)?
+        .collect::<Result<_, _>>()
+        .map_err(sqlite_error)?;
+    Ok(rows.into_iter().flatten().collect())
+}
+
 /// How one output ends, short of a decision put through `decide`.
 struct End {
     outcome: &'static str,

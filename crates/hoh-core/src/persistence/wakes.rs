@@ -196,16 +196,14 @@ pub(super) fn of_run(tx: &Connection, run_id: &str) -> Result<Vec<Wake>, Persist
         .collect::<Result<_, _>>()
         .map_err(sqlite_error)?;
     let mut wakes: Vec<Wake> = Vec::new();
+    // Each wake's place by its id: linear in the run's supervisor events (v14, M2T08R-101).
+    let mut index: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     for (seq, kind, payload) in rows {
         let payload: Value = serde_json::from_str(&payload).map_err(|e| {
             PersistError::IntegrityViolation(format!("supervisor event {seq} of {run_id}: {e}"))
         })?;
         let named = text(&payload, "wake");
-        let wake = |wakes: &mut Vec<Wake>| -> Option<usize> {
-            named
-                .as_deref()
-                .and_then(|id| wakes.iter().position(|w| w.id == id))
-        };
+        let wake = || -> Option<usize> { named.as_deref().and_then(|id| index.get(id).copied()) };
         match kind.as_str() {
             WOKEN => {
                 let severity = payload["severity"]
@@ -225,7 +223,7 @@ pub(super) fn of_run(tx: &Connection, run_id: &str) -> Result<Vec<Wake>, Persist
                     .map(|s| s.iter().filter_map(Value::as_i64).collect())
                     .unwrap_or_default();
                 let not_before = text(&payload, "retry_not_before").map(|at| (at, seq));
-                if let Some(i) = wake(&mut wakes).filter(|_| payload["merged_into"].is_string()) {
+                if let Some(i) = wake().filter(|_| payload["merged_into"].is_string()) {
                     wakes[i].severity = wakes[i].severity.max(severity);
                     wakes[i].task_ids.extend(tasks);
                     wakes[i].event_seqs.extend(seqs);
@@ -237,10 +235,12 @@ pub(super) fn of_run(tx: &Connection, run_id: &str) -> Result<Vec<Wake>, Persist
                         wakes[i].not_before = Some((later, seq));
                     }
                 } else {
+                    let id = named
+                        .or_else(|| text(&payload, "trigger_id"))
+                        .unwrap_or_default();
+                    index.entry(id.clone()).or_insert(wakes.len());
                     wakes.push(Wake {
-                        id: named
-                            .or_else(|| text(&payload, "trigger_id"))
-                            .unwrap_or_default(),
+                        id,
                         fingerprint: text(&payload["dedup_key"], "fingerprint").unwrap_or_default(),
                         spec_id: text(&payload["dedup_key"], "spec_id"),
                         severity,
@@ -256,9 +256,7 @@ pub(super) fn of_run(tx: &Connection, run_id: &str) -> Result<Vec<Wake>, Persist
                 }
             }
             ALLOCATED => {
-                if let (Some(i), Some(attempt_id)) =
-                    (wake(&mut wakes), text(&payload, "attempt_id"))
-                {
+                if let (Some(i), Some(attempt_id)) = (wake(), text(&payload, "attempt_id")) {
                     wakes[i].turns.push(Turn {
                         generation: payload["generation"].as_i64().unwrap_or(0),
                         attempt_id,
@@ -272,8 +270,7 @@ pub(super) fn of_run(tx: &Connection, run_id: &str) -> Result<Vec<Wake>, Persist
                 }
             }
             REARMED => {
-                if let (Some(i), Some(attempt_id)) =
-                    (wake(&mut wakes), text(&payload, "attempt_id"))
+                if let (Some(i), Some(attempt_id)) = (wake(), text(&payload, "attempt_id"))
                     && let Some(turn) = wakes[i]
                         .turns
                         .iter_mut()
@@ -288,14 +285,14 @@ pub(super) fn of_run(tx: &Connection, run_id: &str) -> Result<Vec<Wake>, Persist
                 }
             }
             PREEMPT => {
-                if let Some(i) = text(&payload, "target_wake")
-                    .and_then(|id| wakes.iter().position(|w| w.id == id))
+                if let Some(i) =
+                    text(&payload, "target_wake").and_then(|id| index.get(&id).copied())
                 {
                     wakes[i].preempted = true;
                 }
             }
             _ => {
-                if let Some(i) = wake(&mut wakes) {
+                if let Some(i) = wake() {
                     wakes[i].superseded = true;
                 }
             }
@@ -326,7 +323,7 @@ pub(super) fn of_run(tx: &Connection, run_id: &str) -> Result<Vec<Wake>, Persist
 /// of the attempt that ended, not the binding's now (v13, M2T08R-53), and backed off by ADR-020's bound; a preempted
 /// or withdrawn turn neither), and its supervision task CANCELLED if no ending moved it yet. The moves and events for
 /// the caller's commit.
-fn rearm(
+pub(super) fn rearm(
     tx: &Transaction<'_>,
     project_id: &str,
     run_id: &str,
@@ -449,9 +446,10 @@ const SHOWN_PAYLOAD: usize = 2_000;
 const SHOWN_TASKS: usize = 50;
 const SHOWN_WAKES: usize = 50;
 
-/// How urgent an event of a wake is, most first: integrity, critical, high, the rest (decision 7's order).
-fn urgency(kind: &str, payload: &Value) -> u8 {
-    match (kind, payload["severity"].as_str()) {
+/// How urgent an event of a wake is, by its kind and its payload's `severity`, most first: integrity, critical, high,
+/// the rest (decision 7's order).
+fn urgency(kind: &str, severity: Option<&str>) -> u8 {
+    match (kind, severity) {
         ("integrity_violation", _) => 0,
         ("issue.opened", Some("critical")) => 1,
         ("issue.opened", Some("high"))
@@ -503,34 +501,44 @@ pub(super) fn supervision_input(
     let Some(this) = wakes.iter().find(|w| w.id == wake_id) else {
         return Ok(None);
     };
-    // Its events, most urgent first, then the newest.
-    let mut events: Vec<(u8, i64, String, Value)> = Vec::new();
-    for seq in &this.event_seqs {
-        let row: Option<(String, String)> = conn
+    // Its events, most urgent first, then the newest: ordered by kind and severity read in one statement, and only the
+    // shown ones' payloads read (linear in its events, v14 M2T08R-101).
+    let mut order: Vec<(u8, i64)> = {
+        let mut statement = conn
+            .prepare(
+                "SELECT seq, kind, json_extract(payload_json, '$.severity') FROM events \
+                 WHERE seq IN (SELECT value FROM json_each(?1))",
+            )
+            .map_err(sqlite_error)?;
+        let rows: Vec<(i64, String, Option<String>)> = statement
+            .query_map(params![json!(this.event_seqs).to_string()], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .map_err(sqlite_error)?
+            .collect::<Result<_, _>>()
+            .map_err(sqlite_error)?;
+        rows.into_iter()
+            .map(|(seq, kind, severity)| (urgency(&kind, severity.as_deref()), -seq))
+            .collect()
+    };
+    order.sort_unstable();
+    let total = order.len();
+    let mut shown: Vec<Value> = Vec::new();
+    for (_, seq) in order.into_iter().take(SHOWN_EVENTS) {
+        let (kind, payload): (String, String) = conn
             .query_row(
                 "SELECT kind, payload_json FROM events WHERE seq = ?1",
-                params![seq],
+                params![-seq],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
-            .optional()
             .map_err(sqlite_error)?;
-        if let Some((kind, payload)) = row {
-            let value: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
-            let shown = if payload.len() > SHOWN_PAYLOAD {
-                json!({"truncated": true, "head": payload.chars().take(SHOWN_PAYLOAD).collect::<String>()})
-            } else {
-                value.clone()
-            };
-            events.push((urgency(&kind, &value), -*seq, kind, shown));
-        }
+        let payload = if payload.len() > SHOWN_PAYLOAD {
+            json!({"truncated": true, "head": payload.chars().take(SHOWN_PAYLOAD).collect::<String>()})
+        } else {
+            serde_json::from_str(&payload).unwrap_or(Value::Null)
+        };
+        shown.push(json!({"seq": -seq, "kind": kind, "payload": payload}));
     }
-    events.sort_by_key(|a| (a.0, a.1));
-    let total = events.len();
-    let shown: Vec<Value> = events
-        .into_iter()
-        .take(SHOWN_EVENTS)
-        .map(|(_, seq, kind, payload)| json!({"seq": -seq, "kind": kind, "payload": payload}))
-        .collect();
     let (state, spec_id, spec_sha256): (String, Option<String>, Option<String>) = conn
         .query_row(
             "SELECT r.state, r.spec_id, s.sha256 FROM runs r LEFT JOIN specs s ON s.spec_id = r.spec_id \
@@ -1125,28 +1133,51 @@ fn unavailability(
     {
         reasons.push("failures_capped");
     }
-    let last = wakes
+    // Auth or Capability: a turn of the epoch failed so and no turn of the epoch settled after it, in the turns'
+    // order; a turn that failed otherwise, was withdrawn or preempted recovers nothing (v14, M2T08R-100).
+    let classes: BTreeMap<String, String> = {
+        let mut statement = tx
+            .prepare(
+                "SELECT json_extract(payload_json, '$.attempt_id'), json_extract(payload_json, '$.failure.class') \
+                 FROM events WHERE run_id = ?1 AND kind = 'supervisor.turn_failed'",
+            )
+            .map_err(sqlite_error)?;
+        let rows: Vec<(Option<String>, Option<String>)> = statement
+            .query_map(params![run_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(sqlite_error)?
+            .collect::<Result<_, _>>()
+            .map_err(sqlite_error)?;
+        rows.into_iter()
+            .filter_map(|(attempt, class)| Some((attempt?, class?)))
+            .collect()
+    };
+    let mut ended: Vec<&Turn> = wakes
         .iter()
         .flat_map(|w| w.turns.iter())
         .filter(|t| t.role_epoch == epoch && t.ended())
-        .max_by_key(|t| t.ended_at.clone());
-    if let Some(turn) = last.filter(|t| t.state != Some(AttemptState::Settled)) {
-        let class: Option<String> = tx
-            .query_row(
-                "SELECT json_extract(payload_json, '$.failure.class') FROM events WHERE run_id = ?1 \
-                 AND kind = 'supervisor.turn_failed' AND json_extract(payload_json, '$.attempt_id') = ?2",
-                params![run_id, turn.attempt_id],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(sqlite_error)?
-            .flatten();
-        match class.as_deref() {
-            Some("auth") => reasons.push("auth"),
-            Some("capability") => reasons.push("capability"),
+        .collect();
+    ended.sort_by_key(|t| t.allocated_seq);
+    let mut held: BTreeSet<&'static str> = BTreeSet::new();
+    for turn in ended {
+        if turn.state == Some(AttemptState::Settled) {
+            held.clear();
+            continue;
+        }
+        match classes.get(&turn.attempt_id).map(String::as_str) {
+            Some("auth") => {
+                held.insert("auth");
+            }
+            Some("capability") => {
+                held.insert("capability");
+            }
             _ => {}
         }
     }
+    reasons.extend(
+        ["auth", "capability"]
+            .into_iter()
+            .filter(|r| held.contains(r)),
+    );
     Ok((reasons, observation))
 }
 
@@ -1298,9 +1329,17 @@ pub(super) fn judge(
             ));
         }
         // What the run owes its Commander: its wakes not answered (owed, or in flight: a probe's wake is still owed
-        // its decision, v13) and its PENDING triggers.
+        // its decision, v13; or settled with outputs of that turn still to dispose of, v14 M2T08R-103) and its
+        // PENDING triggers.
+        let waiting = super::outputs::pending_attempts(tx, run_id)?;
         let mut seqs: Vec<i64> = Vec::new();
-        for wake in wakes.iter().filter(|w| !w.superseded && !w.settled()) {
+        for wake in wakes.iter().filter(|w| {
+            !w.superseded
+                && (!w.settled()
+                    || w.turns
+                        .last()
+                        .is_some_and(|t| waiting.contains(&t.attempt_id)))
+        }) {
             seqs.extend(&wake.event_seqs);
             owed_records.push(json!({"wake": wake.id, "fingerprint": wake.fingerprint}));
         }
