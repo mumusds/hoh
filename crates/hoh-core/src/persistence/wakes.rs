@@ -68,8 +68,11 @@ pub(super) struct Turn {
 }
 
 impl Turn {
+    /// Its attempt has ended: a terminal state, or UNKNOWN_EFFECT (its outcome unknown, no answer recorded; decision 3:
+    /// the wake is rearmed, a failure, and asked again; found after round 3: it was left in flight for ever).
     fn ended(&self) -> bool {
-        self.state.is_none_or(AttemptState::is_terminal)
+        self.state
+            .is_none_or(|s| s.is_terminal() || s == AttemptState::UnknownEffect)
     }
 }
 

@@ -149,7 +149,8 @@ fn end(outcome: &'static str, reason: Option<&'static str>) -> End {
     }
 }
 
-/// How turn `attempt_id` ended, by its `attempt.moved` event: the state and that event's seq; none while it has not.
+/// How turn `attempt_id` ended, by its first `attempt.moved` to an end (SETTLED, FAILED, CANCELLED, or UNKNOWN_EFFECT,
+/// which ends a supervision turn as it does in the wakes model): the state and that event's seq; none while it has not.
 fn turn_end(conn: &Connection, attempt_id: &str) -> Result<Option<(String, i64)>, PersistError> {
     let ids: Vec<String> = ["SETTLED", "FAILED", "CANCELLED", "UNKNOWN_EFFECT"]
         .iter()
