@@ -103,6 +103,8 @@ struct World {
     overlapping: Vec<String>,
     plan: Vec<(String, Planned)>,
     sessions: Vec<(String, Value)>,
+    /// `None`: the candidate has no release policy.
+    policy: Option<Vec<(String, Policy)>>,
 }
 
 impl Lookup for World {
@@ -154,6 +156,16 @@ impl Lookup for World {
             .iter()
             .find(|(p, _)| p == path)
             .map(|(_, v)| v.clone())
+    }
+
+    fn policy(&self, check_id: &str) -> PolicyCheck {
+        match &self.policy {
+            None => PolicyCheck::NoPolicy,
+            Some(checks) => checks
+                .iter()
+                .find(|(c, _)| c == check_id)
+                .map_or(PolicyCheck::Missing, |(_, p)| PolicyCheck::Check(p.clone())),
+        }
     }
 }
 
@@ -241,6 +253,7 @@ fn world0(c: &Sealed, e: &Evidence) -> World {
             },
         )],
         sessions: Vec::new(),
+        policy: None,
     }
 }
 
@@ -317,7 +330,11 @@ fn test_052_04_evidence_is_valid_only_when_every_binding_holds() -> R {
         ),
         (
             "missing_artifacts",
-            |e| e.record.missing_artifacts = vec!["report.json".to_owned()],
+            |e| {
+                // Declared and not found (found and missing together still the plan's, rule 8).
+                e.record.missing_artifacts = vec!["test-results.jsonl".to_owned()];
+                e.record.artifacts.clear();
+            },
             "INVALID",
             "ARTIFACT_MISSING",
         ),
@@ -356,7 +373,7 @@ fn every_rule_the_gate_applies_to_one_record_has_a_reason_of_its_own() -> R {
     let w0 = world0(&c, &base);
     assert_eq!(valid(&base, &c, &s, &w0), Ok(()));
     type Tamper = fn(&mut Evidence, &mut World);
-    let variants: [(&str, Tamper, Reason); 20] = [
+    let variants: [(&str, Tamper, Reason); 22] = [
         (
             "stderr sha256",
             |e, _| e.record.stderr.sha256 = "0".repeat(64),
@@ -371,11 +388,6 @@ fn every_rule_the_gate_applies_to_one_record_has_a_reason_of_its_own() -> R {
             "artifact names",
             |e, _| e.record.artifacts[0].name = "other.jsonl".to_owned(),
             Reason::ArtifactsDifferFromPlan,
-        ),
-        (
-            "timed out",
-            |e, _| e.record.timed_out = true,
-            Reason::TimedOut,
         ),
         (
             "exit 0 with a failing test",
@@ -463,12 +475,41 @@ fn every_rule_the_gate_applies_to_one_record_has_a_reason_of_its_own() -> R {
             Reason::ProducerNotIndependent,
         ),
         (
-            "live without its sessions",
+            "a live check claiming success without its sessions",
             |e, w| {
                 e.record.mode = "live".to_owned();
                 w.plan[0].1.mode = "live".to_owned();
+                w.plan[0].1.artifacts.push("live-sessions.json".to_owned());
+                e.record.missing_artifacts = vec!["live-sessions.json".to_owned()];
             },
-            Reason::LiveSessionsUnbound,
+            Reason::ArtifactMissing,
+        ),
+        (
+            "check not in the release policy",
+            |_, w| w.policy = Some(Vec::new()),
+            Reason::CheckNotInPolicy,
+        ),
+        (
+            "planned in another mode than the policy's",
+            |_, w| {
+                w.policy = Some(vec![(
+                    "unit".to_owned(),
+                    Policy {
+                        mode: "mock".to_owned(),
+                        degradable: false,
+                        requires_plugins: false,
+                    },
+                )]);
+            },
+            Reason::PlanModeNotPolicy,
+        ),
+        (
+            "found and missing artifacts not the plan's (a failed run, so nothing is claimed missing)",
+            |e, _| {
+                e.record.exit_code = 1;
+                e.record.missing_artifacts = vec!["report.json".to_owned()];
+            },
+            Reason::ArtifactsDifferFromPlan,
         ),
     ];
     for (aspect, tamper, reason) in variants {
@@ -502,15 +543,18 @@ fn a_live_record_counts_only_with_sessions_bound_to_its_check_and_candidate() ->
     let mut w = world0(&c, &e);
     w.plan[0].1.mode = "live".to_owned();
     let path = e.record.artifacts[1].path.clone();
-    let bound = json!({"check_id": "unit", "harness_candidate_id": c.candidate_id});
+    // A document of the schema's shape: one session at least.
+    let bound = json!({"schema_version": "1.0", "check_id": "unit", "harness_candidate_id": c.candidate_id,
+                       "sessions": [{"agent": "codex", "cli_version": "1", "session_id": "s1", "resolved_model": "m"}]});
     w.sessions.push((path.clone(), bound.clone()));
     assert_eq!(valid(&e, &c, &s, &w), Ok(()));
     for (key, other) in [
-        ("check_id", "adapter-live"),
-        ("harness_candidate_id", "CAND-x"),
+        ("check_id", json!("adapter-live")),
+        ("harness_candidate_id", json!("CAND-x")),
+        ("sessions", json!([])),
     ] {
         let mut v = bound.clone();
-        v[key] = json!(other);
+        v[key] = other;
         let mut w2 = w.clone();
         w2.sessions = vec![(path.clone(), v)];
         assert_eq!(
@@ -530,7 +574,7 @@ fn every_reason_is_found_together_and_none_hides_another() -> R {
     let mut e = e0(&c);
     let mut w = world0(&c, &e);
     e.record.stderr.sha256 = "0".repeat(64);
-    e.record.timed_out = true;
+    e.record.runner.euid = 0;
     e.record.candidate_id = format!("CAND-{}", "0".repeat(64));
     w.producers[0].1.role = "developer".to_owned();
     let got = valid(&e, &c, &s, &w).map_err(|i| i.codes());
@@ -540,7 +584,7 @@ fn every_reason_is_found_together_and_none_hides_another() -> R {
             "CANDIDATE_MISMATCH",
             "PRODUCER_NOT_INDEPENDENT",
             "ERROR_OUTPUT_CHANGED",
-            "TIMED_OUT"
+            "RUNNER_ROOT"
         ])
     );
     Ok(())
@@ -573,5 +617,329 @@ fn a_record_is_read_only_in_the_schemas_shape() -> R {
     let mut stdout = value.clone();
     stdout["stdout"]["path"] = json!("/etc/passwd");
     assert!(Record::from_value(&stdout).is_err());
+    Ok(())
+}
+
+/// A test-result line.
+fn line(test: &str, status: &str) -> Value {
+    json!({"schema_version": "1.0", "test_id": test, "name": format!("{test} case"), "status": status})
+}
+
+fn degraded(test: &str) -> Value {
+    let mut v = line(test, "DEGRADED");
+    v["detail"] = json!("pi plugin x unavailable; upstream: https://example.invalid/issue/1");
+    v
+}
+
+fn degradable_policy() -> Option<Vec<(String, Policy)>> {
+    Some(vec![(
+        "unit".to_owned(),
+        Policy {
+            mode: "product".to_owned(),
+            degradable: true,
+            requires_plugins: false,
+        },
+    )])
+}
+
+#[test]
+fn a_run_that_does_not_claim_success_may_lack_its_artifacts_observations_and_duration() -> R {
+    // docs/adr/ADR-027.md principle one, rules 9 and 12 (M2T10D-450, -502): missing artifacts, no observations and a
+    // duration that disagrees with its interval veto only a record that claims success (exit 0, not timed out); a
+    // failed, blocked, interrupted or timed-out run is valid evidence of that.
+    let c = manifest().seal();
+    let s = c.manifest.spec.sha256.clone();
+    for (exit, timed_out) in [(1, false), (3, false), (130, false), (124, true)] {
+        let mut e = e0(&c);
+        let w = world0(&c, &e);
+        e.record.exit_code = exit;
+        e.record.timed_out = timed_out;
+        e.record.missing_artifacts = vec!["test-results.jsonl".to_owned()];
+        e.record.artifacts.clear();
+        e.observations.clear();
+        // tools/run_check.py writes 0 for an interrupted run's duration: here over a 30 s interval.
+        e.record.finished_at = "2026-11-11T10:00:30Z".to_owned();
+        e.record.duration_seconds = 0.0;
+        assert_eq!(valid(&e, &c, &s, &w), Ok(()), "exit {exit}");
+    }
+    // Claiming success, each is a veto.
+    let mut e = e0(&c);
+    let w = world0(&c, &e);
+    e.record.finished_at = "2026-11-11T10:00:30Z".to_owned();
+    e.record.duration_seconds = 0.0;
+    assert_eq!(
+        valid(&e, &c, &s, &w).map_err(|i| i.codes()),
+        Err(vec!["DURATION_MISMATCH"])
+    );
+    Ok(())
+}
+
+#[test]
+fn the_outcome_is_the_first_of_the_ordered_rules_that_holds() -> R {
+    // Principle one's outcome function (M2T10D-254, -302, -401, -402, -451, -500, -501).
+    let c = manifest().seal();
+    let s = c.manifest.spec.sha256.clone();
+    let base = e0(&c);
+    let w0 = world0(&c, &base);
+    let outcome_of = |e: &Evidence, w: &World| outcome(e, &valid(e, &c, &s, w), w);
+    let status = |o: Outcome| (o.status.code(), o.reason);
+    assert_eq!(status(outcome_of(&base, &w0)), ("PASS", None));
+    // A veto is INVALID; no observations on a run claiming success is INSUFFICIENT.
+    let mut e = base.clone();
+    e.record.runner.euid = 0;
+    assert_eq!(status(outcome_of(&e, &w0)), ("INVALID", None));
+    let mut e = base.clone();
+    e.observations.clear();
+    assert_eq!(
+        status(outcome_of(&e, &w0)),
+        ("INVALID", Some("INSUFFICIENT"))
+    );
+    // Exit codes.
+    for (exit, expected) in [(0, "PASS"), (3, "BLOCKED"), (1, "FAIL"), (101, "FAIL")] {
+        let mut e = base.clone();
+        e.record.exit_code = exit;
+        assert_eq!(outcome_of(&e, &w0).status.code(), expected, "exit {exit}");
+    }
+    // A compliant degradation is DEGRADED whatever the exit code, never after a timeout, never with an artifact
+    // missing.
+    let mut wd = w0.clone();
+    wd.policy = degradable_policy();
+    for exit in [0, 3, 1] {
+        let mut e = base.clone();
+        e.record.exit_code = exit;
+        e.observations = vec![line("TEST-048-01", "PASS"), degraded("TEST-048-02")];
+        assert_eq!(
+            status(outcome_of(&e, &wd)),
+            ("DEGRADED", None),
+            "exit {exit}"
+        );
+        let mut timed = e.clone();
+        timed.record.timed_out = true;
+        assert_eq!(
+            status(outcome_of(&timed, &wd)),
+            ("FAIL", Some("TIMED_OUT")),
+            "exit {exit} timed out"
+        );
+        if exit != 0 {
+            let mut incomplete = e.clone();
+            let mut wi = wd.clone();
+            wi.plan[0].1.artifacts.push("report.json".to_owned());
+            incomplete.record.missing_artifacts = vec!["report.json".to_owned()];
+            assert_ne!(
+                outcome_of(&incomplete, &wi).status.code(),
+                "DEGRADED",
+                "exit {exit} with an artifact missing"
+            );
+        }
+    }
+    // SKIPPED lines beside a compliant degradation leave it DEGRADED (their TESTs conclude nothing); a FAIL line does
+    // not (M2T10D-551).
+    let mut e = base.clone();
+    e.record.exit_code = 3;
+    e.observations = vec![degraded("TEST-048-01"), line("TEST-049-01", "SKIPPED")];
+    assert_eq!(outcome_of(&e, &wd).status.code(), "DEGRADED");
+    e.observations = vec![degraded("TEST-048-01"), line("TEST-049-01", "FAIL")];
+    assert_eq!(outcome_of(&e, &wd).status.code(), "BLOCKED");
+    // Not compliant: a check the policy does not let degrade, or a DEGRADED line without its basis.
+    let mut e = base.clone();
+    e.record.exit_code = 3;
+    e.observations = vec![degraded("TEST-048-02")];
+    assert_eq!(outcome_of(&e, &w0).status.code(), "BLOCKED");
+    e.observations = vec![line("TEST-048-02", "DEGRADED")];
+    assert_eq!(outcome_of(&e, &wd).status.code(), "BLOCKED");
+    // A live check: PASS needs its bound sessions, whether or not the plan declares them; a check that requires
+    // plugins passes only when every Pi session lists them.
+    let mut e = base.clone();
+    e.record.mode = "live".to_owned();
+    let mut wl = world0(&c, &e);
+    wl.plan[0].1.mode = "live".to_owned();
+    assert_eq!(
+        status(outcome_of(&e, &wl)),
+        ("INVALID", None),
+        "live without sessions"
+    );
+    e.record.artifacts.push(NamedRef {
+        name: "live-sessions.json".to_owned(),
+        path: format!("{DIR}/artifacts/live-sessions.json"),
+        sha256: "d".repeat(64),
+    });
+    let mut wl = world0(&c, &e);
+    wl.plan[0].1.mode = "live".to_owned();
+    wl.policy = Some(vec![(
+        "unit".to_owned(),
+        Policy {
+            mode: "live".to_owned(),
+            degradable: true,
+            requires_plugins: true,
+        },
+    )]);
+    let sessions = |plugins: Value| {
+        json!({"schema_version": "1.0", "check_id": "unit", "harness_candidate_id": c.candidate_id,
+               "sessions": [{"agent": "pi", "cli_version": "1", "session_id": "p1", "resolved_model": "m",
+                             "plugins": plugins}]})
+    };
+    let path = e.record.artifacts[1].path.clone();
+    wl.sessions = vec![(path.clone(), sessions(json!(["hoh"])))];
+    assert_eq!(status(outcome_of(&e, &wl)), ("PASS", None));
+    wl.sessions = vec![(path, sessions(json!([])))];
+    assert_eq!(
+        status(outcome_of(&e, &wl)),
+        ("FAIL", Some("PLUGINS_MISSING"))
+    );
+    Ok(())
+}
+
+#[test]
+fn a_members_conclusion_on_a_test_is_one_function_of_its_outcome_and_lines() -> R {
+    // Principle one's conclude(member, TEST) (M2T10D-403, -452, -551): failures count from any check, satisfaction
+    // only from the scenario check; a DEGRADED line fails unless it is compliant (scenario check, degradable check and
+    // requirement, its detail), and a compliant one in a run that did not degrade (blocked, timed out) concludes
+    // nothing.
+    let c = manifest().seal();
+    let of = |status: Status| Outcome {
+        status,
+        reason: None,
+    };
+    let with = |lines: Vec<Value>| {
+        let mut e = e0(&c);
+        e.observations = lines;
+        e
+    };
+    let t = "TEST-001-01";
+    let bare = line(t, "DEGRADED");
+    type Case = (Vec<Value>, Status, bool, bool, bool, Option<&'static str>);
+    // (lines, outcome, scenario, requirement degradable, check degradable, conclusion)
+    let cases: Vec<Case> = vec![
+        // (1) a vetoed member, whatever its lines.
+        (
+            vec![line(t, "PASS")],
+            Status::Invalid,
+            true,
+            false,
+            false,
+            Some("INVALID"),
+        ),
+        // (2) a FAIL line, from any check.
+        (
+            vec![line(t, "PASS"), line(t, "FAIL")],
+            Status::Pass,
+            false,
+            false,
+            false,
+            Some("FAIL"),
+        ),
+        // (3) a DEGRADED line that is not compliant.
+        (
+            vec![degraded(t)],
+            Status::Degraded,
+            false,
+            true,
+            true,
+            Some("FAIL"),
+        ),
+        (
+            vec![degraded(t)],
+            Status::Degraded,
+            true,
+            false,
+            true,
+            Some("FAIL"),
+        ),
+        (
+            vec![degraded(t)],
+            Status::Degraded,
+            true,
+            true,
+            false,
+            Some("FAIL"),
+        ),
+        (
+            vec![bare.clone()],
+            Status::Degraded,
+            true,
+            true,
+            true,
+            Some("FAIL"),
+        ),
+        (vec![bare], Status::Blocked, true, true, true, Some("FAIL")),
+        // (4) the scenario check passing with its lines all PASS.
+        (
+            vec![line(t, "PASS")],
+            Status::Pass,
+            true,
+            false,
+            false,
+            Some("PASS"),
+        ),
+        // (5) a compliant degradation.
+        (
+            vec![line(t, "PASS"), degraded(t)],
+            Status::Degraded,
+            true,
+            true,
+            true,
+            Some("DEGRADED"),
+        ),
+        // (6) nothing to conclude.
+        (vec![line(t, "PASS")], Status::Pass, false, true, true, None),
+        (vec![line(t, "PASS")], Status::Fail, true, true, true, None),
+        (
+            vec![line(t, "PASS")],
+            Status::Blocked,
+            true,
+            true,
+            true,
+            None,
+        ),
+        (
+            vec![line(t, "SKIPPED")],
+            Status::Pass,
+            true,
+            true,
+            true,
+            None,
+        ),
+        (
+            vec![line(t, "PASS"), line(t, "SKIPPED")],
+            Status::Pass,
+            true,
+            true,
+            true,
+            None,
+        ),
+        (
+            vec![line("TEST-002-01", "PASS")],
+            Status::Pass,
+            true,
+            true,
+            true,
+            None,
+        ),
+        (
+            vec![line(t, "PASS")],
+            Status::Degraded,
+            true,
+            true,
+            true,
+            None,
+        ),
+        (vec![degraded(t)], Status::Blocked, true, true, true, None),
+        (vec![degraded(t)], Status::Fail, true, true, true, None),
+    ];
+    for (lines, status, scenario, requirement, check, expected) in cases {
+        let got = conclude(
+            &with(lines.clone()),
+            &of(status),
+            t,
+            scenario,
+            requirement,
+            check,
+        );
+        assert_eq!(
+            got.map(Status::code),
+            expected,
+            "{lines:?} {status:?} scenario {scenario} requirement {requirement} check {check}"
+        );
+    }
     Ok(())
 }
