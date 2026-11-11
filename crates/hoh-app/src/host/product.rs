@@ -262,6 +262,7 @@ fn outcome(facts: Facts) -> Outcome {
             raw_log_path: Some(facts.raw_log_path),
             workspace: None,
             messages: Vec::new(),
+            artifacts: Vec::new(),
         },
         unknown_effect: facts.state == AttemptState::UnknownEffect,
     }
@@ -371,10 +372,13 @@ impl ProductExecutor {
                 sha256: sha,
                 bytes: object.bytes.len() as u64,
                 mime: object.mime.to_owned(),
+                kind: object.kind.to_owned(),
+                name: object.name.clone(),
             });
         }
+        // One row per object (an entry's text may also be another's).
         artifacts.sort_by(|x, y| x.sha256.cmp(&y.sha256));
-        artifacts.dedup();
+        artifacts.dedup_by(|x, y| x.sha256 == y.sha256);
         let record = PromptRecord {
             layer: contract.layer.to_owned(),
             role: work.role.clone(),
@@ -565,6 +569,8 @@ impl Executor for ProductExecutor {
             .supervision
             .as_ref()
             .map(|_| attempt_logs(&self.project, &work.attempt_id).join(BRIDGE));
+        let logs = attempt_logs(&self.project, &work.attempt_id);
+        let project = self.project.clone();
         tokio::spawn(async move {
             let facts = turn.await;
             if let Ok(mut cancels) = cancels.lock() {
@@ -584,6 +590,13 @@ impl Executor for ProductExecutor {
             if let Some(bridge) = &bridge {
                 outcome.observed.messages = read_bridge(bridge);
             }
+            // Its raw logs kept as objects, on a blocking thread (docs/adr/ADR-026.md decision 10); one that cannot
+            // be kept is left in its directory, unregistered.
+            let (logs, kept_in) = (logs.clone(), project.clone());
+            outcome.observed.artifacts =
+                tokio::task::spawn_blocking(move || keep_logs(&kept_in, &logs))
+                    .await
+                    .unwrap_or_default();
             keep_diagnostics(&outcome);
             let _ = tx.send(outcome);
         });
@@ -616,6 +629,41 @@ impl Executor for ProductExecutor {
 const BRIDGE: &str = "messages.jsonl";
 
 /// Where the raw logs of attempt `attempt_id` go in the project at `project`.
+/// Every regular file of an attempt's log directory `logs` kept as an object of the project at `project`, by name
+/// order; a file that cannot be kept is skipped (it stays in its directory, unregistered).
+fn keep_logs(project: &Path, logs: &Path) -> Vec<hoh_core::persistence::ArtifactRow> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(logs)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+                .map(|e| e.path())
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort();
+    files
+        .into_iter()
+        .filter_map(|file| {
+            let (sha, bytes) = hoh_core::objects::put_file(project, &file).ok()?;
+            let name = file.file_name()?.to_string_lossy().into_owned();
+            let mime = if name.ends_with(".jsonl") {
+                "application/x-ndjson"
+            } else {
+                "text/plain"
+            };
+            Some(hoh_core::persistence::ArtifactRow {
+                path: hoh_core::objects::relative_path(&sha),
+                sha256: sha,
+                bytes,
+                mime: mime.to_owned(),
+                kind: "raw_log".to_owned(),
+                name,
+            })
+        })
+        .collect()
+}
+
 fn attempt_logs(project: &Path, attempt_id: &str) -> PathBuf {
     project.join(".hoh/attempts").join(component(attempt_id))
 }

@@ -183,3 +183,21 @@ fn every_directory_on_the_way_to_an_object_is_synced_after_its_link() -> R {
     assert!(failed.is_err(), "{failed:?}");
     Ok(())
 }
+
+#[test]
+fn a_file_is_kept_as_an_object_by_streaming_it_whatever_its_size() -> R {
+    // docs/adr/ADR-026.md decision 10: a turn's raw logs are not bounded; they are copied and hashed in pieces.
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("stdout.jsonl");
+    let bytes: Vec<u8> = (0..3_000_000u32).map(|n| (n % 251) as u8).collect();
+    std::fs::write(&file, &bytes)?;
+    let (sha, size) = put_file(dir.path(), &file)?;
+    assert_eq!(size, bytes.len() as u64);
+    assert_eq!(sha, sha256_hex(&bytes));
+    assert_eq!(get(dir.path(), &sha)?, bytes);
+    // Again: the same object, nothing staged left.
+    assert_eq!(put_file(dir.path(), &file)?, (sha.clone(), size));
+    let staging = dir.path().join(".hoh/objects/staging");
+    assert!(!staging.exists() || std::fs::read_dir(&staging)?.next().is_none());
+    Ok(())
+}

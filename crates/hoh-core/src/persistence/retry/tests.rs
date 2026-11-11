@@ -483,6 +483,7 @@ async fn an_ending_records_what_the_agents_turn_showed() -> R {
                     raw_log_path: Some("/logs/a".to_owned()),
                     workspace: None,
                     messages: Vec::new(),
+                    artifacts: Vec::new(),
                 },
                 unknown_effect: false,
             },
@@ -1370,6 +1371,8 @@ async fn a_turns_prompt_is_recorded_in_the_commit_that_marks_it_running() -> R {
                 path: format!(".hoh/objects/sha256/ab/{object}"),
                 bytes: 12,
                 mime: "application/json".to_owned(),
+                kind: "manifest".to_owned(),
+                name: "manifest".to_owned(),
             }],
         }),
     };
@@ -1415,5 +1418,82 @@ async fn a_turns_prompt_is_recorded_in_the_commit_that_marks_it_running() -> R {
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     assert_eq!(artifact, (format!(".hoh/objects/sha256/ab/{object}"), 12));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_turns_raw_logs_are_registered_with_their_producer_in_its_works_observed() -> R {
+    // docs/adr/ADR-026.md decision 10 (M2T09D-100, -101): the OBSERVED transaction registers the objects and writes
+    // attempt.artifacts naming the attempt, so a crash before its end's commit keeps them; the detail kept in the
+    // effect's own event does not carry them.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(WORLD)?;
+    let clock = at("2026-11-07T00:00:00Z")?;
+    let dispatched = tick(&store, clock).await?;
+    let [attempt] = dispatched.as_slice() else {
+        return Err(format!("dispatched {dispatched:?}").into());
+    };
+    let notice = store
+        .runner_waiting("p1")
+        .await?
+        .dispatches
+        .into_iter()
+        .find(|d| &d.attempt_id == attempt)
+        .ok_or("no dispatch notice")?;
+    assert!(store.runner_received(notice, clock).await?);
+    assert!(
+        store
+            .runner_running(
+                attempt,
+                crate::persistence::AttemptFacts::default(),
+                json!({"kind": "proc"})
+            )
+            .await?
+    );
+    let log = "e".repeat(64);
+    let row = crate::persistence::ArtifactRow {
+        sha256: log.clone(),
+        path: crate::objects::relative_path(&log),
+        bytes: 300,
+        mime: "text/plain".to_owned(),
+        kind: "raw_log".to_owned(),
+        name: "stderr.log".to_owned(),
+    };
+    let key = crate::reconcile::work_key(attempt);
+    assert!(
+        store
+            .runner_effect(
+                attempt,
+                &key,
+                crate::reconcile::EffectState::Started,
+                crate::reconcile::EffectState::Observed,
+                json!({"success": true, "detail": "SETTLED", "artifacts": [row.json()]}),
+            )
+            .await?
+    );
+    // No end committed: a crash here keeps them.
+    let conn = Connection::open(&path)?;
+    let bytes: i64 = conn.query_row(
+        "SELECT bytes FROM artifacts WHERE sha256 = ?1",
+        [&log],
+        |r| r.get(0),
+    )?;
+    assert_eq!(bytes, 300);
+    let produced: String = conn.query_row(
+        "SELECT payload_json FROM events WHERE kind = 'attempt.artifacts'",
+        [],
+        |r| r.get(0),
+    )?;
+    let produced: Value = serde_json::from_str(&produced)?;
+    assert_eq!(produced["attempt_id"], json!(attempt));
+    assert_eq!(produced["role"], "developer");
+    assert_eq!(produced["items"][0]["name"], "stderr.log");
+    let observed: String = conn.query_row(
+        "SELECT payload_json FROM events WHERE kind = 'effect.observed'",
+        [],
+        |r| r.get(0),
+    )?;
+    assert!(!observed.contains("artifacts"), "{observed}");
     Ok(())
 }

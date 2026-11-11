@@ -1192,3 +1192,62 @@ fn a_recorded_prompt_repacks_to_the_same_bytes_from_its_objects_alone() -> R {
     assert_ne!(changed.sha256, recorded.packed.sha256);
     Ok(())
 }
+
+#[test]
+fn each_built_in_roles_mandatory_items_leave_most_of_the_default_budget() -> R {
+    // docs/adr/ADR-026.md "风险与余项": M for each built-in role with typical facts (a goal, five acceptance criteria of
+    // 300 bytes, a candidate, a Commander's header), and how many such criteria fill the default budget.
+    let ac = |n: usize| -> Vec<(String, String)> {
+        (0..n)
+            .map(|i| (format!("AC-{i:03}"), "验".repeat(100)))
+            .collect()
+    };
+    let facts = |n: usize| Facts {
+        goal: Some("交付 v1：上下文装箱".to_owned()),
+        spec: Some(("f".repeat(64), 3)),
+        scope: vec!["任务：T1 装箱（职位 developer，写者；依赖：无）".to_owned()],
+        acceptance: ac(n),
+        candidate: Some(("CAND-1".to_owned(), "a".repeat(40), "b".repeat(40))),
+        header: vec![
+            ("causation_id".to_owned(), "R/trigger/1".to_owned()),
+            ("nonce".to_owned(), "n".repeat(32)),
+        ],
+        ..Facts::default()
+    };
+    let mut measured = serde_json::Map::new();
+    for role in [
+        "commander",
+        "cto",
+        "developer",
+        "qa",
+        "researcher",
+        "reviewer",
+    ] {
+        let template = crate::config::builtin_contract(role).ok_or(role)?;
+        let m = required(
+            template,
+            &super::mandatory(&facts(5), role, "", Some("/p/b"), Some("/p"))?,
+        )?;
+        assert!(m < CONTEXT_V1.budget_tokens / 4, "{role}: M = {m}");
+        // The number of such criteria at which the mandatory items no longer fit.
+        let (mut lo, mut hi) = (5usize, 5_000usize);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let need = required(
+                template,
+                &super::mandatory(&facts(mid), role, "", Some("/p/b"), Some("/p"))?,
+            )?;
+            if need > CONTEXT_V1.budget_tokens {
+                hi = mid
+            } else {
+                lo = mid + 1
+            }
+        }
+        measured.insert(
+            role.to_owned(),
+            json!({"mandatory_with_5_ac": m, "ac_of_300_bytes_to_exceed_32000": lo}),
+        );
+    }
+    keep("m2t09-mandatory-sizes.json", &Value::Object(measured));
+    Ok(())
+}

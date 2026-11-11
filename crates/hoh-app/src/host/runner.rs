@@ -799,6 +799,18 @@ async fn attempt(
     if !outcome.observed.messages.is_empty() {
         observed["messages"] = json!(outcome.observed.messages);
     }
+    // Its raw logs kept as objects, registered with their producer with this OBSERVED (docs/adr/ADR-026.md decision
+    // 10).
+    if !outcome.observed.artifacts.is_empty() {
+        observed["artifacts"] = json!(
+            outcome
+                .observed
+                .artifacts
+                .iter()
+                .map(hoh_core::persistence::ArtifactRow::json)
+                .collect::<Vec<_>>()
+        );
+    }
     if let (Some(observed), Value::Object(class)) =
         (observed.as_object_mut(), outcome.class.to_json())
     {

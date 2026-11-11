@@ -176,6 +176,8 @@ fn a_first_input_found_in_place_is_taken_only_once_its_directory_is_synced()
                 unacked_message_ids: Vec::new(),
                 queued_input_ids: Vec::new(),
             },
+            references: Vec::new(),
+            budget_tokens: hoh_core::handoff::BUDGET_TOKENS,
         }),
         current_epoch: 2,
         session_id: Some("R/session/developer/2".to_owned()),
@@ -350,6 +352,8 @@ fn a_first_input_is_kept_once_whole_and_another_is_refused()
             unacked_message_ids: Vec::new(),
             queued_input_ids: Vec::new(),
         },
+        references: Vec::new(),
+        budget_tokens: hoh_core::handoff::BUDGET_TOKENS,
     });
     let start = SessionStart {
         message_id: "R/session-start/commander/2".to_owned(),
