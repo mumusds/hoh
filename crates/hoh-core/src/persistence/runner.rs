@@ -97,6 +97,13 @@ pub(super) enum RunnerJob {
         project_id: String,
         context: Box<crate::decision::Context>,
     },
+    /// The supervision turns of a project to stop now (docs/adr/ADR-025.md decision 3).
+    Stops {
+        project_id: String,
+        context: Box<crate::decision::Context>,
+    },
+    /// Withdraw a PREPARED supervision turn.
+    WithdrawTurn(String, std::time::SystemTime),
     /// One look at a run as a whole (ADR-020 decisions 4, 5 and 7).
     Pace {
         run_id: String,
@@ -129,6 +136,7 @@ pub(super) enum RunnerDone {
     Paced(super::retry::Paced),
     Supervised(super::supervise::Supervised),
     Allocated(Option<super::wakes::Allocated>),
+    Stops(Vec<super::wakes::Stop>),
     Repair(super::retry::RepairVerdict),
 }
 
@@ -229,6 +237,13 @@ pub(super) fn run(
             project_id,
             context,
         } => super::wakes::allocate(conn, &project_id, &context, ctx).map(RunnerDone::Allocated),
+        RunnerJob::Stops {
+            project_id,
+            context,
+        } => super::wakes::stops(conn, &project_id, &context, ctx).map(RunnerDone::Stops),
+        RunnerJob::WithdrawTurn(attempt_id, at) => {
+            super::wakes::withdraw_turn(conn, &attempt_id, at, ctx).map(RunnerDone::Applied)
+        }
         RunnerJob::Supervise { run_id, context } => {
             super::supervise::step(conn, &run_id, &context, ctx).map(RunnerDone::Supervised)
         }

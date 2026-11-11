@@ -22,6 +22,8 @@ pub(super) const WOKEN: &str = "supervisor.woken";
 pub(super) const ALLOCATED: &str = "supervisor.allocated";
 pub(super) const REARMED: &str = "supervisor.rearmed";
 pub(super) const SUPERSEDED: &str = "supervisor.superseded";
+pub(super) const PREEMPT: &str = "supervisor.preempt";
+const TURN_LIMIT: &str = "supervisor.turn_limit";
 
 /// How long a supervision turn may be in flight, and how long a wake waits before it goes first (decision 3).
 pub const SUPERVISION_TURN: Duration = Duration::from_secs(15 * 60);
@@ -49,6 +51,9 @@ pub(super) struct Turn {
     pub state: Option<AttemptState>,
     /// Its `supervisor.rearmed`, once written.
     pub rearm: Option<Rearm>,
+    /// When it was allocated (RFC 3339 UTC) and that event's seq.
+    pub allocated_at: Option<String>,
+    pub allocated_seq: i64,
 }
 
 impl Turn {
@@ -71,6 +76,8 @@ pub(super) struct Wake {
     pub task_ids: BTreeSet<String>,
     pub turns: Vec<Turn>,
     pub superseded: bool,
+    /// A turn of it was preempted: its later turns are protected (decision 3, -800).
+    pub preempted: bool,
 }
 
 impl Wake {
@@ -130,12 +137,13 @@ fn text(payload: &Value, field: &str) -> Option<String> {
 pub(super) fn of_run(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<Wake>, PersistError> {
     let mut statement = tx
         .prepare(
-            "SELECT seq, kind, payload_json FROM events WHERE run_id = ?1 AND kind IN (?2, ?3, ?4, ?5) ORDER BY seq",
+            "SELECT seq, kind, payload_json FROM events WHERE run_id = ?1 AND kind IN (?2, ?3, ?4, ?5, ?6) \
+             ORDER BY seq",
         )
         .map_err(sqlite_error)?;
     let rows: Vec<(i64, String, String)> = statement
         .query_map(
-            params![run_id, WOKEN, ALLOCATED, REARMED, SUPERSEDED],
+            params![run_id, WOKEN, ALLOCATED, REARMED, SUPERSEDED, PREEMPT],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .map_err(sqlite_error)?
@@ -182,6 +190,7 @@ pub(super) fn of_run(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<Wake>, Pe
                         task_ids: tasks,
                         turns: Vec::new(),
                         superseded: false,
+                        preempted: false,
                     });
                 }
             }
@@ -194,6 +203,8 @@ pub(super) fn of_run(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<Wake>, Pe
                         attempt_id,
                         state: None,
                         rearm: None,
+                        allocated_at: text(&payload, "allocated_at"),
+                        allocated_seq: seq,
                     });
                 }
             }
@@ -211,6 +222,13 @@ pub(super) fn of_run(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<Wake>, Pe
                         role_epoch: payload["role_epoch"].as_i64().unwrap_or(0),
                         retry_not_before: text(&payload, "retry_not_before"),
                     });
+                }
+            }
+            PREEMPT => {
+                if let Some(i) = text(&payload, "target_wake")
+                    .and_then(|id| wakes.iter().position(|w| w.id == id))
+                {
+                    wakes[i].preempted = true;
                 }
             }
             _ => {
@@ -269,9 +287,18 @@ fn rearm(
                 |r| r.get(0),
             )
             .map_err(sqlite_error)?;
+        let overdue: bool = tx
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM events WHERE run_id = ?1 AND kind = ?2 \
+                 AND json_extract(payload_json, '$.attempt_id') = ?3)",
+                params![run_id, TURN_LIMIT, turn.attempt_id],
+                |r| r.get(0),
+            )
+            .map_err(sqlite_error)?;
+        // A turn stopped at its limit is a failure even when withdrawn before it started (decision 3).
         let reason = if preempted {
             "preempted"
-        } else if turn.state == Some(AttemptState::Cancelled) {
+        } else if turn.state == Some(AttemptState::Cancelled) && !overdue {
             "withdrawn"
         } else {
             "failure"
@@ -352,7 +379,7 @@ struct Candidate {
     run_revision: i64,
     role_epoch: u64,
     wake: Wake,
-    /// 0 aged, 1 integrity, 2 the rest.
+    /// 0 named by a preempt, 1 aged, 2 integrity, 3 the rest.
     level: u8,
     /// The seq of the run's last allocation (-1: none): the run allocated last goes last within a level.
     last: i64,
@@ -413,6 +440,26 @@ pub(super) fn allocate(
             last.insert(run, seq);
         }
     }
+    // Preempts whose target has ended name the wake that takes the slot next, while it is still to be allocated
+    // (decision 3, -800, -850).
+    let named: Vec<(String, String, i64)> = {
+        let mut statement = tx
+            .prepare(
+                "SELECT e.run_id, json_extract(e.payload_json, '$.wake'), e.seq FROM events e \
+                 JOIN runs r ON r.run_id = e.run_id JOIN attempts a \
+                 ON a.attempt_id = json_extract(e.payload_json, '$.target_attempt') \
+                 WHERE r.project_id = ?1 AND e.kind = ?2 \
+                 AND a.state IN ('SETTLED', 'FAILED', 'CANCELLED', 'UNKNOWN_EFFECT')",
+            )
+            .map_err(sqlite_error)?;
+        statement
+            .query_map(params![project_id, PREEMPT], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .map_err(sqlite_error)?
+            .collect::<Result<_, _>>()
+            .map_err(sqlite_error)?
+    };
     let mut candidates = Vec::new();
     let mut rearmed = Commit::default();
     let stamp = rfc3339_utc(now);
@@ -439,12 +486,19 @@ pub(super) fn allocate(
             let aged = parse_rfc3339_millis(&wake.woken_at)
                 .and_then(|at| now.duration_since(at).ok())
                 .is_some_and(|waited| waited > SUPERVISION_TURN);
-            let level = if aged {
+            let first = named.iter().any(|(run, id, seq)| {
+                *run == run_id
+                    && *id == wake.id
+                    && wake.turns.last().is_none_or(|t| t.allocated_seq < *seq)
+            });
+            let level = if first {
                 0
-            } else if wake.severity == Severity::Integrity {
+            } else if aged {
                 1
-            } else {
+            } else if wake.severity == Severity::Integrity {
                 2
+            } else {
+                3
             };
             candidates.push(Candidate {
                 run_id: run_id.clone(),
@@ -572,6 +626,210 @@ pub(super) fn allocate(
         attempt_id,
         lease: grant,
     }))
+}
+
+/// Whether run `run_id` could give a wake whose backoff ends at `not_before` a turn once its turn in flight stops
+/// (decision 3, the preempt's condition): its Commander's binding ACTIVE with a session, its budget not stopping it,
+/// the backoff over. The run's state is the caller's (it fires only in an admitting state).
+pub(super) fn could_allocate(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    context: &Context,
+    not_before: Option<&str>,
+) -> Result<bool, PersistError> {
+    let bound: bool = tx
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM role_bindings WHERE run_id = ?1 AND role = ?2 AND state = 'ACTIVE' \
+             AND session_id IS NOT NULL)",
+            params![run_id, COMMANDER],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    let now = rfc3339_utc(context.now());
+    Ok(bound
+        && super::retry::budget_stop(tx, run_id, context)?.is_none()
+        && not_before.is_none_or(|t| t <= now.as_str()))
+}
+
+/// A supervision turn in flight the host must stop now (decision 3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stop {
+    pub run_id: String,
+    pub wake: String,
+    pub attempt_id: String,
+    /// `preempted` (a preempt names it) or `turn_limit` (in flight longer than [`SUPERVISION_TURN`]).
+    pub reason: &'static str,
+    /// Its attempt's state: a PREPARED one is withdrawn in the store, a STARTING or RUNNING one settled by the host.
+    pub state: String,
+}
+
+/// The supervision turns of project `project_id` to stop at `context.now()`: those a preempt names, and those in flight
+/// longer than a turn's limit, whose `supervisor.turn_limit` is recorded once here.
+pub(super) fn stops(
+    conn: &mut Connection,
+    project_id: &str,
+    context: &Context,
+    ctx: &Ctx<'_>,
+) -> Result<Vec<Stop>, PersistError> {
+    let now = context.now();
+    let tx = writer::begin(conn, ctx)?;
+    let runs: Vec<String> = {
+        let mut statement = tx
+            .prepare("SELECT run_id FROM runs WHERE project_id = ?1 ORDER BY created_at, run_id")
+            .map_err(sqlite_error)?;
+        statement
+            .query_map(params![project_id], |r| r.get(0))
+            .map_err(sqlite_error)?
+            .collect::<Result<_, _>>()
+            .map_err(sqlite_error)?
+    };
+    let mut found = Vec::new();
+    let mut events = Vec::new();
+    for run_id in runs {
+        for wake in of_run(&tx, &run_id)?.into_iter().filter(Wake::in_flight) {
+            let Some(turn) = wake.turns.last() else {
+                continue;
+            };
+            let preempted: bool = tx
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM events WHERE run_id = ?1 AND kind = ?2 \
+                     AND json_extract(payload_json, '$.target_attempt') = ?3)",
+                    params![run_id, PREEMPT, turn.attempt_id],
+                    |r| r.get(0),
+                )
+                .map_err(sqlite_error)?;
+            let overdue = turn
+                .allocated_at
+                .as_deref()
+                .and_then(crate::time::parse_rfc3339)
+                .is_some_and(|at| at + SUPERVISION_TURN < now);
+            let reason = if preempted {
+                "preempted"
+            } else if overdue {
+                let recorded: bool = tx
+                    .query_row(
+                        "SELECT EXISTS (SELECT 1 FROM events WHERE run_id = ?1 AND kind = ?2 \
+                         AND json_extract(payload_json, '$.attempt_id') = ?3)",
+                        params![run_id, TURN_LIMIT, turn.attempt_id],
+                        |r| r.get(0),
+                    )
+                    .map_err(sqlite_error)?;
+                if !recorded {
+                    events.push(NewEvent {
+                        project_id: project_id.to_owned(),
+                        event_id: child_id(&turn.attempt_id, "turn_limit"),
+                        run_id: Some(run_id.clone()),
+                        kind: TURN_LIMIT.to_owned(),
+                        payload: json!({
+                            "wake": wake.id,
+                            "attempt_id": turn.attempt_id,
+                            "allocated_at": turn.allocated_at,
+                            "limit_ms": u64::try_from(SUPERVISION_TURN.as_millis()).unwrap_or(u64::MAX),
+                            "at": rfc3339_utc(now),
+                        }),
+                    });
+                }
+                "turn_limit"
+            } else {
+                continue;
+            };
+            found.push(Stop {
+                run_id: run_id.clone(),
+                wake: wake.id.clone(),
+                attempt_id: turn.attempt_id.clone(),
+                reason,
+                state: turn
+                    .state
+                    .map_or_else(String::new, |s| s.as_str().to_owned()),
+            });
+        }
+    }
+    if !events.is_empty() {
+        writer::write(
+            &tx,
+            &Commit {
+                events,
+                ..Commit::default()
+            },
+            ctx,
+        )?;
+        ctx.before_commit()?;
+        tx.commit().map_err(sqlite_error)?;
+    }
+    Ok(found)
+}
+
+/// Withdraw supervision turn `attempt_id` while it is PREPARED, at `at` (decision 3: a preempted or overdue turn not
+/// started yet): its attempt and task CANCELLED, its dispatch notice settled, its slot free; whether it was withdrawn.
+pub(super) fn withdraw_turn(
+    conn: &mut Connection,
+    attempt_id: &str,
+    at: std::time::SystemTime,
+    ctx: &Ctx<'_>,
+) -> Result<bool, PersistError> {
+    let tx = writer::begin(conn, ctx)?;
+    let row: Option<(String, String, i64, String, String, String)> = tx
+        .query_row(
+            "SELECT a.state, t.task_id, t.revision, t.state, t.run_id, r.project_id FROM attempts a \
+             JOIN tasks t ON t.task_id = a.task_id JOIN runs r ON r.run_id = t.run_id \
+             WHERE a.attempt_id = ?1 AND t.role = ?2",
+            params![attempt_id, COMMANDER],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some((state, task_id, revision, task_state, run_id, project_id)) = row else {
+        return Ok(false);
+    };
+    if state != AttemptState::Prepared.as_str() {
+        return Ok(false);
+    }
+    super::attempts::move_attempt(
+        &tx,
+        &super::attempts::AttemptMove {
+            attempt_id: attempt_id.to_owned(),
+            from: AttemptState::Prepared,
+            to: AttemptState::Cancelled,
+            facts: super::attempts::AttemptFacts {
+                ended_at: Some(rfc3339_utc(at)),
+                ..super::attempts::AttemptFacts::default()
+            },
+        },
+        ctx,
+    )?;
+    tx.execute(
+        "UPDATE outbox SET state = 'ACKED', next_retry_at = NULL WHERE state = 'PENDING' \
+         AND json_extract(payload_json, '$.notice') IS 'runtime' AND json_extract(payload_json, '$.kind') IS 'dispatch' \
+         AND json_extract(payload_json, '$.attempt_id') = ?1",
+        params![attempt_id],
+    )
+    .map_err(sqlite_error)?;
+    let mut cas = Vec::new();
+    if writer::parse::<TaskState>(&task_state)? == TaskState::Leased {
+        cas.push(StateCas {
+            id: task_id.clone(),
+            expected_revision: revision,
+            change: Change::Task(TaskState::Cancelled),
+        });
+    }
+    writer::write(
+        &tx,
+        &Commit {
+            cas,
+            events: vec![NewEvent {
+                project_id,
+                event_id: child_id(attempt_id, "withdrawn"),
+                run_id: Some(run_id),
+                kind: "supervisor.withdrawn".to_owned(),
+                payload: json!({"attempt_id": attempt_id, "task_id": task_id}),
+            }],
+            ..Commit::default()
+        },
+        ctx,
+    )?;
+    ctx.before_commit()?;
+    tx.commit().map_err(sqlite_error)?;
+    Ok(true)
 }
 
 #[cfg(test)]

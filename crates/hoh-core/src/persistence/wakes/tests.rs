@@ -861,3 +861,214 @@ async fn a_task_result_for_a_supervision_task_is_refused() -> R {
     let _ = value(&path, "SELECT 1")?;
     Ok(())
 }
+
+/// The kinds and seqs of `run`'s supervisor events from `kinds`, in order: `kind wake [target]`.
+fn supervisor(path: &PathBuf, run: &str) -> R<Vec<(i64, String)>> {
+    let conn = Connection::open(path)?;
+    let mut s = conn.prepare(
+        "SELECT seq, kind || ' ' || coalesce(json_extract(payload_json, '$.wake'), '-') \
+         || coalesce(' ' || json_extract(payload_json, '$.target_attempt'), '') \
+         FROM events WHERE run_id = ?1 AND kind IN ('supervisor.woken', 'supervisor.preempt') ORDER BY seq",
+    )?;
+    let rows = s
+        .query_map([run], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// An integrity violation on `run` (task `task`) committed and its step run at `ms`: the integrity wake.
+async fn integrity(
+    store: &Store,
+    clock: &TestClock,
+    run: &str,
+    task: &str,
+    tag: &str,
+    ms: u64,
+) -> R<String> {
+    clock.set(ms);
+    event(
+        store,
+        run,
+        &format!("{run}/integrity/{tag}"),
+        "integrity_violation",
+        json!({"task_id": task, "reason": tag, "fingerprint": format!("iv/{tag}")}),
+    )
+    .await?;
+    let fired = store.supervise(run, context(clock, ms)).await?.fired;
+    Ok(fired.first().ok_or("integrity fired")?.trigger_id.clone())
+}
+
+#[tokio::test]
+async fn an_integrity_wake_preempts_its_runs_turn_once_and_takes_the_slot_next() -> R {
+    // M2T08D-800, -850, -953, -1056 (decision 3): an integrity wake preempts its own run's turn in flight of a wake never
+    // preempted, in the transaction of its woken; once the target has ended the slot goes to the named integrity wake
+    // first, before an older aged wake of another run; the preempted wake is rearmed (preempted, no failure) and its
+    // next turn is protected: a second integrity wake does not preempt it.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    // S's wake A, older, while S is paused.
+    let a_wake = wake(&store, &clock, "S", "E", "a", 0).await?;
+    exec(
+        &path,
+        "UPDATE runs SET state = 'PAUSED', resume_state = 'RUNNING' WHERE run_id = 'S';",
+    )?;
+    let w = wake(&store, &clock, "R", "D", "w", 2500).await?;
+    let turn = store
+        .allocate_supervision("p1", context(&clock, 5000))
+        .await?
+        .ok_or("W allocated")?;
+    assert_eq!(turn.wake, w);
+    exec(
+        &path,
+        "UPDATE runs SET state = 'RUNNING', resume_state = NULL WHERE run_id = 'S';",
+    )?;
+    // 16 min later A is aged; an integrity violation on R preempts W's turn in its woken's transaction.
+    let i = integrity(&store, &clock, "R", "D", "one", 16 * 60_000).await?;
+    let events = supervisor(&path, "R")?;
+    let woken_at = events
+        .iter()
+        .position(|(_, e)| *e == format!("supervisor.woken {i}"))
+        .ok_or("woken")?;
+    assert_eq!(
+        events.get(woken_at + 1).map(|(_, e)| e.clone()),
+        Some(format!("supervisor.preempt {i} {}", turn.attempt_id))
+    );
+    assert_eq!(
+        events[woken_at + 1].0,
+        events[woken_at].0 + 1,
+        "the same commit"
+    );
+    let stops = store
+        .supervision_stops("p1", context(&clock, 16 * 60_000 + 10))
+        .await?;
+    assert_eq!(
+        stops
+            .iter()
+            .map(|s| (s.attempt_id.as_str(), s.reason))
+            .collect::<Vec<_>>(),
+        [(turn.attempt_id.as_str(), "preempted")]
+    );
+    // The host stops it (here: ended); the named integrity wake goes first, before the aged A.
+    end(&path, &turn.attempt_id, "FAILED")?;
+    let next = store
+        .allocate_supervision("p1", context(&clock, 16 * 60_000 + 100))
+        .await?
+        .ok_or("allocated")?;
+    assert_eq!(next.wake, i);
+    let rearmed = rearms(&path)?;
+    assert_eq!(
+        (&rearmed[0]["reason"], &rearmed[0]["failures"]),
+        (&json!("preempted"), &json!(0))
+    );
+    end(&path, &next.attempt_id, "SETTLED")?;
+    // Then the aged A (other run), then W again; W's turn is protected now.
+    let after = store
+        .allocate_supervision("p1", context(&clock, 16 * 60_000 + 200))
+        .await?
+        .ok_or("allocated")?;
+    assert_eq!(after.wake, a_wake);
+    end(&path, &after.attempt_id, "SETTLED")?;
+    let again = store
+        .allocate_supervision("p1", context(&clock, 16 * 60_000 + 300))
+        .await?
+        .ok_or("allocated")?;
+    assert_eq!(again.wake, w);
+    integrity(&store, &clock, "R", "D", "two", 16 * 60_000 + 400).await?;
+    assert_eq!(
+        supervisor(&path, "R")?
+            .iter()
+            .filter(|(_, e)| e.starts_with("supervisor.preempt"))
+            .count(),
+        1,
+        "a preempted wake's turn is not preempted again"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn integrity_does_not_preempt_integrity_nor_another_runs_turn() -> R {
+    // Decision 3: an integrity wake does not preempt an integrity wake's turn, nor a turn of another run.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    integrity(&store, &clock, "R", "D", "first", 0).await?;
+    let turn = store
+        .allocate_supervision("p1", context(&clock, 100))
+        .await?
+        .ok_or("allocated")?;
+    integrity(&store, &clock, "R", "D", "second", 200).await?;
+    integrity(&store, &clock, "S", "E", "other", 300).await?;
+    end(&path, &turn.attempt_id, "SETTLED")?;
+    let preempts: i64 = Connection::open(&path)?.query_row(
+        "SELECT count(*) FROM events WHERE kind = 'supervisor.preempt'",
+        [],
+        |r| r.get(0),
+    )?;
+    assert_eq!(preempts, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_turn_past_its_limit_is_stopped_and_counts_as_a_failure() -> R {
+    // Decision 3 (a turn's limit): a supervision turn in flight longer than 15 min is named for the host to stop
+    // (turn_limit, recorded once); a PREPARED one is withdrawn in the store (its task CANCELLED, its notice settled,
+    // its slot freed) and its wake rearmed as a failure.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    wake(&store, &clock, "R", "D", "fp", 0).await?;
+    let turn = store
+        .allocate_supervision("p1", context(&clock, 3000))
+        .await?
+        .ok_or("allocated")?;
+    assert!(
+        store
+            .supervision_stops("p1", context(&clock, 3000 + 14 * 60_000))
+            .await?
+            .is_empty()
+    );
+    let late = 3000 + 15 * 60_000 + 1;
+    let stops = store.supervision_stops("p1", context(&clock, late)).await?;
+    assert_eq!(
+        stops
+            .iter()
+            .map(|s| (s.attempt_id.as_str(), s.reason, s.state.as_str()))
+            .collect::<Vec<_>>(),
+        [(turn.attempt_id.as_str(), "turn_limit", "PREPARED")]
+    );
+    store
+        .supervision_stops("p1", context(&clock, late + 1))
+        .await?;
+    assert_eq!(
+        value(
+            &path,
+            "SELECT count(*) FROM events WHERE kind = 'supervisor.turn_limit'"
+        )?,
+        json!(1)
+    );
+    assert!(store.withdraw_turn(&turn.attempt_id, t(late + 2)).await?);
+    assert_eq!(
+        value(
+            &path,
+            &format!(
+                "SELECT json_array(a.state, t.state, (SELECT state FROM outbox WHERE json_extract(payload_json, '$.attempt_id') = a.attempt_id)) \
+                 FROM attempts a JOIN tasks t ON t.task_id = a.task_id WHERE a.attempt_id = '{}'",
+                turn.attempt_id
+            )
+        )?,
+        json!(["CANCELLED", "CANCELLED", "ACKED"])
+    );
+    store
+        .allocate_supervision("p1", context(&clock, late + 3))
+        .await?;
+    let rearmed = rearms(&path)?;
+    assert_eq!(
+        (&rearmed[0]["reason"], &rearmed[0]["failures"]),
+        (&json!("failure"), &json!(1))
+    );
+    Ok(())
+}

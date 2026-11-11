@@ -100,7 +100,7 @@ pub(super) fn step(
             tx.commit().map_err(sqlite_error)?;
             continue;
         }
-        let (fired, events) = fire(&tx, &project_id, run_id, context.now(), ctx)?;
+        let (fired, events) = fire(&tx, &project_id, run_id, context, ctx)?;
         writer::write(
             &tx,
             &Commit {
@@ -352,9 +352,10 @@ fn fire(
     tx: &Transaction<'_>,
     project_id: &str,
     run_id: &str,
-    now: SystemTime,
+    context: &Context,
     ctx: &Ctx<'_>,
 ) -> Result<(Vec<Fired>, Vec<NewEvent>), PersistError> {
+    let now = context.now();
     let (state, run_spec): (String, Option<String>) = tx
         .query_row(
             "SELECT state, spec_id FROM runs WHERE run_id = ?1",
@@ -484,8 +485,15 @@ fn fire(
         }
         return Ok((fired, events));
     }
-    let mut owed = wakes::of_run(tx, run_id)?;
-    owed.retain(wakes::Wake::owed);
+    let all = wakes::of_run(tx, run_id)?;
+    // The run's turn in flight, if any, and whether its wake may still be preempted (decision 3): a non-integrity wake
+    // never preempted before.
+    let mut target = all
+        .iter()
+        .find(|w| w.in_flight())
+        .filter(|w| w.severity != Severity::Integrity && !w.preempted)
+        .and_then(|w| w.turns.last().map(|t| (w.id.clone(), t.attempt_id.clone())));
+    let mut owed: Vec<wakes::Wake> = all.into_iter().filter(wakes::Wake::owed).collect();
     for t in due {
         tx.execute(
             "UPDATE supervisor_triggers SET state = 'HANDLED' WHERE trigger_id = ?1 AND state = 'PENDING'",
@@ -517,12 +525,19 @@ fn fire(
         let joined = owed
             .iter_mut()
             .find(|w| w.fingerprint == t.fingerprint && w.spec_id == t.spec_id);
-        match joined {
+        // The integrity edge: a new integrity wake, or a merge that makes a wake integrity (-1053).
+        let (wake_id, edge, not_before) = match joined {
             Some(wake) => {
+                let edge = wake.severity != Severity::Integrity && severity == Severity::Integrity;
                 wake.severity = wake.severity.max(severity);
                 payload["wake"] = json!(wake.id);
                 payload["merged_into"] = json!(wake.id);
                 payload["wake_severity"] = json!(wake.severity.as_str());
+                (
+                    wake.id.clone(),
+                    edge,
+                    wake.retry_not_before().map(str::to_owned),
+                )
             }
             None => {
                 payload["wake"] = json!(t.trigger_id);
@@ -537,14 +552,33 @@ fn fire(
                     task_ids: task_ids.iter().cloned().collect(),
                     turns: Vec::new(),
                     superseded: false,
+                    preempted: false,
                 });
+                (t.trigger_id.clone(), severity == Severity::Integrity, None)
             }
-        }
+        };
+        let record = payload.clone();
         events.push(event(
             child_id(&t.trigger_id, "woken"),
             wakes::WOKEN,
             payload,
         ));
+        // At its edge an integrity wake preempts its own run's turn in flight of a wake never preempted, when it could
+        // be allocated once that turn stops; in this woken's transaction (decision 3, -800, -953, -1056).
+        if edge
+            && let Some((target_wake, target_attempt)) = target.take()
+            && wakes::could_allocate(tx, run_id, context, not_before.as_deref())?
+        {
+            let mut preempt = record;
+            preempt["wake"] = json!(wake_id);
+            preempt["target_wake"] = json!(target_wake);
+            preempt["target_attempt"] = json!(target_attempt);
+            events.push(event(
+                child_id(&target_attempt, "preempt"),
+                wakes::PREEMPT,
+                preempt,
+            ));
+        }
         fired.push(Fired {
             trigger_id: t.trigger_id,
             fingerprint: t.fingerprint,
