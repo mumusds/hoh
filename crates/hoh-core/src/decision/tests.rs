@@ -536,3 +536,24 @@ fn a_blocked_or_waiting_run_takes_task_moves_and_assumptions_only() {
     paused.run.state = RunState::Paused;
     assert_eq!(reason(&assumption, &paused), IllegalTransition);
 }
+
+#[test]
+fn a_blocked_or_waiting_run_judges_a_request_for_a_person() {
+    // M2T08R-02 (docs/adr/ADR-025.md v13 decision 6): asking a person moves no run, and BLOCKED is when one is
+    // asked: request_user_decision passes the fences on a BLOCKED or WAITING_EXTERNAL run (unsupported, not applied);
+    // stale, it is rejected like any decision.
+    let ask = proposal(
+        json!({"kind": "request_user_decision", "question_id": "q", "question": "?", "requires_user": true}),
+    );
+    for state in [RunState::Blocked, RunState::WaitingExternal] {
+        let mut s = snapshot();
+        s.run.state = state;
+        assert_eq!(
+            validate(&ask, &s),
+            Ok(Effect::Unsupported("request_user_decision")),
+            "{state:?}"
+        );
+        s.commander_epoch = Some(ask.role_epoch + 1);
+        assert_eq!(reason(&ask, &s), StaleRoleEpoch, "{state:?}");
+    }
+}

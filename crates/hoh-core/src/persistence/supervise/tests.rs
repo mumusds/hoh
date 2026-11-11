@@ -646,7 +646,7 @@ async fn a_retrigger_chain_on_an_unknown_revision_keeps_one_key() -> R {
 async fn a_producers_fingerprint_ending_like_a_retrigger_still_keys_by_its_unknown_revision() -> R {
     // M2T08D-1000, -1052 (docs/adr/ADR-025.md decision 2): a re-trigger is known by its event's kind, not by its
     // fingerprint's suffix: two issues named "fp#retrigger" on revisions 9 and 10, which the project has no rows for,
-    // key apart.
+    // key apart (their own "#" escaped, v13 M2T08R-07).
     let dir = tempfile::tempdir()?;
     let clock = std::sync::Arc::new(TestClock::default());
     let (store, path) = open(&dir, &clock)?;
@@ -667,8 +667,8 @@ async fn a_producers_fingerprint_ending_like_a_retrigger_still_keys_by_its_unkno
             "SELECT fingerprint, spec_id FROM supervisor_triggers ORDER BY fingerprint"
         )?,
         [
-            [json!("fp#retrigger@r10"), Value::Null],
-            [json!("fp#retrigger@r9"), Value::Null]
+            [json!("fp%23retrigger@r10"), Value::Null],
+            [json!("fp%23retrigger@r9"), Value::Null]
         ]
     );
     Ok(())
@@ -912,5 +912,147 @@ async fn a_runs_supervision_policy_is_the_one_frozen_in_its_snapshot() -> R {
     clock.set(4000);
     events(&store, "intensive", &[implemented()]).await?;
     assert_eq!(store.supervise("R", at(&clock, 7000)).await?.fired.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_batch_writes_each_keys_trigger_once_however_many_events_it_joins() -> R {
+    // M2T08R-03 (docs/adr/ADR-025.md v13 decision 2): a batch joins its events of one key in memory and writes their
+    // trigger once, not once per event (which rewrote the whole seq array each time): 3 000 events of one key change a
+    // handful of rows, and the trigger holds all 3 000.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    clock.set(0);
+    let same: Vec<(&str, Value)> = (0..3000)
+        .map(|_| ("issue.opened", issue("fp", 3)))
+        .collect();
+    events(&store, "same", &same).await?;
+    let mut conn = Connection::open(&path)?;
+    let before = conn.total_changes();
+    let ctx = crate::persistence::writer::Ctx::quiet();
+    let _ = super::step(&mut conn, "R", &at(&clock, 100), &ctx)?;
+    let changed = conn.total_changes() - before;
+    assert!(changed < 10, "{changed} rows changed for one key");
+    assert_eq!(
+        count(
+            &path,
+            "SELECT json_array_length(event_seqs_json) FROM supervisor_triggers"
+        )?,
+        3000
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_ordinary_fingerprint_never_joins_a_retrigger_chains_key() -> R {
+    // M2T08R-07 (docs/adr/ADR-025.md v13 decision 2): on a revision the project has, an issue named "fp#retrigger"
+    // and a re-trigger of base "fp" are two triggers, each with its own event (an ordinary event never joins a
+    // re-trigger chain nor takes its own-mistake backoff).
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    clock.set(0);
+    events(
+        &store,
+        "collide",
+        &[
+            ("issue.opened", issue("fp#retrigger", 3)),
+            (
+                "supervisor.retrigger",
+                json!({"base_fingerprint": "fp", "spec_revision": 3, "own_mistake": true, "n": 8, "task_ids": ["D"]}),
+            ),
+        ],
+    )
+    .await?;
+    store.supervise("R", at(&clock, 0)).await?;
+    let fired = store.supervise("R", at(&clock, 3000)).await?.fired;
+    assert_eq!(
+        fired.iter().map(|f| f.event_seqs.len()).collect::<Vec<_>>(),
+        [1, 1],
+        "{fired:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_run_with_no_spec_is_not_judged_whatever_its_commander() -> R {
+    // M2T08R-04 (docs/adr/ADR-025.md v13 decision 4 before 5): a run with no spec only defers its due triggers
+    // (NO_SPEC); its Commander, BLOCKED here, is not judged: no supervisor.unavailable, no claim, the run works on.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(
+        &path,
+        &format!(
+            "{WORLD} UPDATE runs SET spec_id = NULL WHERE run_id = 'R';
+             UPDATE role_bindings SET state = 'BLOCKED', blocked_reason = 'BLOCKED_AUTH' WHERE run_id = 'R' AND role = 'commander';"
+        ),
+    )?;
+    events(&store, "nd", &[("need_decision", json!({"task_id": "D"}))]).await?;
+    store.supervise("R", at(&clock, 3000)).await?;
+    assert_eq!(
+        rows(
+            &path,
+            "SELECT state, blocked_reasons_json FROM runs WHERE run_id = 'R'"
+        )?,
+        [[json!("RUNNING"), json!("[]")]]
+    );
+    let trigger: String = Connection::open(&path)?.query_row(
+        "SELECT trigger_id FROM supervisor_triggers WHERE state = 'PENDING'",
+        [],
+        |r| r.get(0),
+    )?;
+    assert_eq!(
+        supervisor_events(&path)?,
+        [format!("supervisor.deferred {trigger} NO_SPEC")]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_step_is_one_writer_job_per_batch_until_it_has_caught_up() -> R {
+    // M2T08R-03 (docs/adr/ADR-025.md v13 decision 2): one supervisor job takes in one batch: with 25 000 events after
+    // the cursor, a job's batch has not caught up (none, the cursor at its last event) and fires nothing; the store
+    // submits job after job until one has caught up, which fires the integrity violation at the end.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    clock.set(0);
+    let mut seqs = Vec::new();
+    for n in 0..25 {
+        let chunk: Vec<(&str, Value)> = (0..1000)
+            .map(|i| ("token.delta", json!({"i": i})))
+            .collect();
+        seqs.extend(events(&store, &format!("job/{n}"), &chunk).await?);
+    }
+    let last = events(
+        &store,
+        "end",
+        &[("integrity_violation", json!({"reason": "db"}))],
+    )
+    .await?;
+    let mut conn = Connection::open(&path)?;
+    let ctx = crate::persistence::writer::Ctx::quiet();
+    assert_eq!(super::step(&mut conn, "R", &at(&clock, 0), &ctx)?, None);
+    assert_eq!(
+        count(
+            &path,
+            "SELECT last_handled_seq FROM supervisor_cursor WHERE run_id = 'R'"
+        )?,
+        seqs[9_999]
+    );
+    let done = store.supervise("R", at(&clock, 0)).await?;
+    assert_eq!(done.cursor, last[0]);
+    assert_eq!(
+        done.fired
+            .iter()
+            .map(|f| f.event_seqs.clone())
+            .collect::<Vec<_>>(),
+        [last]
+    );
     Ok(())
 }

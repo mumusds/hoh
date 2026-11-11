@@ -241,6 +241,8 @@ struct Common {
     inflight: super::control::Inflight,
     /// The session.start notices whose delivery failure was already said (once each).
     undelivered: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    /// Each run's supervisor step failure already said, by its text (docs/adr/ADR-025.md v13 decision 5).
+    unsupervised: std::sync::Mutex<std::collections::BTreeSet<String>>,
 }
 
 impl Common {
@@ -294,6 +296,7 @@ pub(super) async fn run(
         jitter,
         inflight,
         undelivered: std::sync::Mutex::default(),
+        unsupervised: std::sync::Mutex::default(),
     });
     let registry = config.executor.registry();
     let watch = registry
@@ -507,7 +510,7 @@ async fn tick(
         .as_ref()
         .map(|registry| registry.observations(common.host_epoch));
     for run in &waiting.supervised {
-        store
+        let stepped = store
             .supervise(
                 run,
                 Context {
@@ -515,7 +518,29 @@ async fn tick(
                     ..at()
                 },
             )
-            .await?;
+            .await;
+        // A run's failing step is its own: said once, and the tick goes on with the other runs, the allocation and
+        // the dispatches; a store that cannot write ends the tick (v13 decision 5, M2T08R-51).
+        match stepped {
+            Ok(_) => {}
+            Err(
+                e @ (PersistError::WriterStopped | PersistError::Busy(_) | PersistError::Full(_)),
+            ) => return Err(e),
+            Err(e) => {
+                let said = format!("{run}: {e}");
+                if common
+                    .unsupervised
+                    .lock()
+                    .is_ok_and(|mut seen| seen.insert(said.clone()))
+                {
+                    use std::io::Write as _;
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "hoh host: the supervisor step of run {said}"
+                    );
+                }
+            }
+        }
     }
     store.allocate_supervision(&project_id, at()).await?;
     for stop in store.supervision_stops(&project_id, at()).await? {

@@ -300,3 +300,41 @@ fn the_wake_set_is_req_021s_closed_set_with_the_stale_retrigger() {
         );
     }
 }
+
+#[test]
+fn an_ordinary_fingerprint_is_escaped_so_only_the_runtimes_suffixes_carry_hash_and_at() {
+    // M2T08R-07 (docs/adr/ADR-025.md v13 decision 2): the stored key is injective by kind: an event's own fingerprint
+    // has %, # and @ escaped (%25, %23, %40), so it never equals a re-trigger chain's "<base>#retrigger" nor another
+    // revision's "<fingerprint>@r<revision>"; a default fingerprint (kind/subject) likewise; a re-trigger's base is a
+    // stored key already and is kept.
+    let named = classify(
+        Policy::Balanced,
+        "need_decision",
+        &json!({"fingerprint": "fp%1#retrigger@r9"}),
+        Some(3),
+    );
+    assert_eq!(
+        named.map(|w| w.key.fingerprint),
+        Some("fp%251%23retrigger%40r9".to_owned())
+    );
+    let default = classify(
+        Policy::Balanced,
+        "need_decision",
+        &json!({"task_id": "T#1@x"}),
+        Some(3),
+    );
+    assert_eq!(
+        default.map(|w| w.key.fingerprint),
+        Some("need_decision/T%231%40x".to_owned())
+    );
+    let chain = classify(
+        Policy::Balanced,
+        "supervisor.retrigger",
+        &json!({"base_fingerprint": "fp%23x@r9#retrigger"}),
+        Some(3),
+    );
+    assert_eq!(
+        chain.map(|w| w.key.fingerprint),
+        Some("fp%23x@r9#retrigger".to_owned())
+    );
+}

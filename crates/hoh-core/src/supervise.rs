@@ -131,7 +131,7 @@ pub fn classify(
         }
         _ => return None,
     };
-    let fingerprint = match payload["fingerprint"].as_str() {
+    let fingerprint = escape(&match payload["fingerprint"].as_str() {
         Some(named) => named.to_owned(),
         None => {
             let subject = ["task_id", "issue_id", "attempt_id", "role", "candidate_id"]
@@ -140,7 +140,7 @@ pub fn classify(
                 .unwrap_or("");
             format!("{kind}/{subject}")
         }
-    };
+    });
     Some(Wake {
         key: Key {
             fingerprint,
@@ -149,6 +149,16 @@ pub fn classify(
         severity,
         retrigger: false,
     })
+}
+
+/// An event's own fingerprint as the stored key holds it (docs/adr/ADR-025.md v13 decision 2, M2T08R-07): `%`, `#`
+/// and `@` escaped, so only the suffixes the Runtime adds (`#retrigger`, `@r<revision>`) carry `#` and `@` and an
+/// ordinary key never equals a re-trigger chain's or another revision's.
+fn escape(fingerprint: &str) -> String {
+    fingerprint
+        .replace('%', "%25")
+        .replace('#', "%23")
+        .replace('@', "%40")
 }
 
 /// A key's trigger while it collects events: when its first and last events were taken in, its highest severity and
