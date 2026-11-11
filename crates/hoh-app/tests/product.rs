@@ -1981,7 +1981,50 @@ async fn test_019_02_the_new_commanders_first_input_is_the_checkpoint_package() 
             "ACKED/1",
             limit,
         )
-        .await
+        .await?;
+        // What the new Commander is actually sent (docs/adr/ADR-025.md decision 10, M2T17R-54): woken by a
+        // need_decision, its first turn begins with the role's contract and then the kept package, whole; the sentinel
+        // reaches it 0 times.
+        exec(
+            &project,
+            &format!(
+                "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) \
+                   SELECT project_id, 'nd-019-02', '{run_id}', 'need_decision', '{{\"fingerprint\": \"fp-019-02\"}}', \
+                   '2026-11-10T00:00:00Z' FROM runs WHERE run_id = '{run_id}';"
+            ),
+        )?;
+        until(
+            &project,
+            "SELECT count(*) FROM attempts a JOIN tasks t ON t.task_id = a.task_id WHERE t.role = 'commander' \
+             AND a.state = 'SETTLED'",
+            "1",
+            limit,
+        )
+        .await?;
+        let mut prompts = Vec::new();
+        for entry in std::fs::read_dir(world.bin().join("pi.d"))? {
+            let received = entry?.path().join("received.jsonl");
+            if let Ok(text) = std::fs::read_to_string(&received) {
+                for line in text.lines() {
+                    let command: Value = serde_json::from_str(line).unwrap_or(Value::Null);
+                    if command["type"] == "prompt" {
+                        prompts.push(command["message"].as_str().unwrap_or_default().to_owned());
+                    }
+                }
+            }
+        }
+        let [sent] = prompts.as_slice() else {
+            return Err(format!("the pi Commander was sent {} prompts", prompts.len()).into());
+        };
+        let (contract, handover, wake) = (
+            sent.find("Commander").ok_or("no role contract")?,
+            sent.find("# 交接包").ok_or("no handover package")?,
+            sent.find("# 本次唤醒").ok_or("no wake")?,
+        );
+        assert!(contract < handover && handover < wake, "{sent}");
+        assert!(sent.contains(&format!("{:064}", 3)), "the package names revision 3's digest: {sent}");
+        assert_eq!(sent.matches(sentinel).count(), 0, "{sent}");
+        R::Ok(())
     }
     .await;
     host.shutdown().await;

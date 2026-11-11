@@ -361,10 +361,20 @@ async fn host_with(
     agents: &Arc<Agents>,
     clock: Option<Arc<TestClock>>,
 ) -> R<(PathBuf, Host)> {
+    host_seeded(dir, agents, clock, "").await
+}
+
+/// [`host_with`] with `more` seeded after [`WORLD`].
+async fn host_seeded(
+    dir: &Path,
+    agents: &Arc<Agents>,
+    clock: Option<Arc<TestClock>>,
+    more: &str,
+) -> R<(PathBuf, Host)> {
     let project = dir.join("p");
     std::fs::create_dir_all(&project)?;
     Host::start(config(&project)).await?.shutdown().await;
-    seed(&project, WORLD)?;
+    seed(&project, &format!("{WORLD}{more}"))?;
     let mut config = config(&project);
     config.runner = Some(hoh_app::host::RunnerConfig {
         executor: agents.clone(),
@@ -706,11 +716,21 @@ async fn test_043_02_a_cancel_escalates_records_the_workspace_and_only_then_is_c
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_043_04_pause_and_cancel_take_effect_with_the_commander_down() -> R {
     // AC-043-04: the Commander fails at its start; a pause and then a cancel are accepted and reach PAUSED and
-    // CANCELLED, and the Commander is never called.
+    // CANCELLED, and the Commander is never called. R is supervised (its Commander bound, docs/adr/ADR-025.md decision
+    // 10): its supervisor takes in the pause's and the cancel's events and none of them wakes it.
     let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
     let agents = Arc::new(Agents::new(&[("T1", "sleep 3")]));
     let _leaders = Leaders(agents.leaders.clone());
-    let (project, host) = host(dir.path(), &agents).await?;
+    let (project, host) = host_seeded(
+        dir.path(),
+        &agents,
+        None,
+        "INSERT INTO sessions(session_id, agent, role, agent_version, capabilities_json) VALUES
+           ('sc', 'codex', 'commander', '1', '{}');
+         INSERT INTO role_bindings(run_id, role, agent, session_id, role_epoch, config_revision, bound_at) VALUES
+           ('R', 'commander', 'codex', 'sc', 1, 1, '2026-11-07T00:00:00Z');",
+    )
+    .await?;
     until(
         &project,
         "SELECT state FROM attempts WHERE task_id = 'T1'",
@@ -737,8 +757,43 @@ async fn test_043_04_pause_and_cancel_take_effect_with_the_commander_down() -> R
     )
     .await?;
     assert_eq!(agents.commander.load(Ordering::SeqCst), 0);
+    // Its supervisor took in the run's events past the cancel's and woke nothing.
+    let cancelled: i64 = query(
+        &project,
+        "SELECT max(seq) FROM events WHERE run_id = 'R' AND kind = 'run.cancel_requested'",
+    )?
+    .parse()?;
+    until_at_least(
+        &project,
+        "SELECT last_handled_seq FROM supervisor_cursor WHERE run_id = 'R'",
+        cancelled,
+        Duration::from_secs(10),
+    )
+    .await?;
+    assert_eq!(
+        query(
+            &project,
+            "SELECT count(*) FROM events WHERE kind = 'supervisor.woken'"
+        )?,
+        "0"
+    );
     host.shutdown().await;
     Ok(())
+}
+
+/// Wait until `sql` gives a number at least `least`, for at most `limit`.
+async fn until_at_least(project: &Path, sql: &str, least: i64, limit: Duration) -> R {
+    let end = Instant::now() + limit;
+    loop {
+        let got = query(project, sql)?;
+        if got.parse::<i64>().is_ok_and(|n| n >= least) {
+            return Ok(());
+        }
+        if Instant::now() > end {
+            return Err(format!("{sql}: {got:?}, not at least {least}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
