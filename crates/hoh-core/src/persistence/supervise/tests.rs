@@ -1134,3 +1134,24 @@ async fn an_integrity_event_joined_in_a_batch_makes_its_trigger_due_at_once() ->
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn a_runs_failing_step_is_recorded_once_per_error_however_they_alternate() -> R {
+    // M2T08R-202 (docs/adr/ADR-025.md v15 decision 5): supervisor.step_failed is written once per run and error: A, B,
+    // then A again records A and B.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    for error in ["A", "B", "A"] {
+        store.supervision_failed("R", error).await?;
+    }
+    assert_eq!(
+        rows(
+            &path,
+            "SELECT json_extract(payload_json, '$.error') FROM events WHERE kind = 'supervisor.step_failed' ORDER BY seq"
+        )?,
+        [[json!("A")], [json!("B")]]
+    );
+    Ok(())
+}

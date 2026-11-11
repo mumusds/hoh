@@ -771,9 +771,9 @@ pub(super) fn allocate(
             if wakes.iter().any(Wake::owed)
                 && let Some(reason) = inactive_reason(&tx, &run_id)?
             {
-                rearmed
-                    .events
-                    .extend(defer_once(&tx, project_id, &run_id, reason, &wakes, now)?);
+                rearmed.events.extend(defer_once(
+                    &tx, project_id, &run_id, reason, epoch, &wakes, now,
+                )?);
             }
             continue;
         }
@@ -848,7 +848,13 @@ pub(super) fn allocate(
                 if told.insert(c.run_id.clone()) {
                     let wakes = of_run(&tx, &c.run_id)?;
                     rearmed.events.extend(defer_once(
-                        &tx, project_id, &c.run_id, "NO_SLOT", &wakes, now,
+                        &tx,
+                        project_id,
+                        &c.run_id,
+                        "NO_SLOT",
+                        decide::to_i64(c.role_epoch, "role_epoch")?,
+                        &wakes,
+                        now,
                     )?);
                 }
             }
@@ -1072,7 +1078,13 @@ fn registry_reason(
         .as_deref()
         .and_then(|a| context.observations.as_ref().and_then(|o| o.get(a)))
         .copied();
-    let last = recorded(tx, run_id)?.filter(|r| r.unavailable);
+    // A recorded registry fault is the fact of the agent it names: it applies only while that agent holds the role
+    // (looks are counted per agent; v16, M2T08R-200).
+    let last = recorded(tx, run_id)?.filter(|r| {
+        r.unavailable
+            && r.observation["agent"].as_str().is_some()
+            && r.observation["agent"].as_str() == agent.as_deref()
+    });
     let before = last.as_ref().and_then(|r| {
         let reasons = r.reasons.as_array()?;
         let reason = reasons.iter().find_map(|x| match x.as_str() {
@@ -1082,7 +1094,7 @@ fn registry_reason(
         })?;
         Some((reason, r.observation.clone()))
     });
-    let identity = |o: &crate::decision::Observation| json!({"host_epoch": o.host_epoch, "n": o.n});
+    let identity = |o: &crate::decision::Observation| json!({"agent": agent, "host_epoch": o.host_epoch, "n": o.n});
     Ok(match (look, before) {
         (Some(o), _) if !o.available => (Some("agent_unavailable"), identity(&o)),
         (Some(o), _) if !o.logged_in => (Some("login_missing"), identity(&o)),
@@ -1541,21 +1553,24 @@ fn inactive_reason(conn: &Connection, run_id: &str) -> Result<Option<&'static st
 
 /// One `supervisor.deferred{reason}` for run `run_id`, unless one of that reason was written since its last
 /// allocation.
+#[allow(clippy::too_many_arguments)]
 fn defer_once(
     tx: &Transaction<'_>,
     project_id: &str,
     run_id: &str,
     reason: &str,
+    epoch: i64,
     wakes: &[Wake],
     now: std::time::SystemTime,
 ) -> Result<Option<NewEvent>, PersistError> {
+    // Once per reason and Commander epoch since the run's last allocation (v16: a deferral is its holder's fact).
     let (told, n): (bool, i64) = tx
         .query_row(
             "SELECT EXISTS (SELECT 1 FROM events WHERE run_id = ?1 AND kind = 'supervisor.deferred' \
-               AND json_extract(payload_json, '$.reason') = ?2 \
+               AND json_extract(payload_json, '$.reason') = ?2 AND json_extract(payload_json, '$.role_epoch') = ?4 \
                AND seq > coalesce((SELECT max(seq) FROM events WHERE run_id = ?1 AND kind = ?3), 0)), \
              (SELECT count(*) FROM events WHERE run_id = ?1 AND kind = 'supervisor.deferred')",
-            params![run_id, reason, ALLOCATED],
+            params![run_id, reason, ALLOCATED, epoch],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .map_err(sqlite_error)?;
@@ -1572,7 +1587,7 @@ fn defer_once(
         event_id: child_id(run_id, &format!("deferred/{n}")),
         run_id: Some(run_id.to_owned()),
         kind: "supervisor.deferred".to_owned(),
-        payload: json!({"reason": reason, "wakes": owed, "at": rfc3339_utc(now)}),
+        payload: json!({"reason": reason, "role_epoch": epoch, "wakes": owed, "at": rfc3339_utc(now)}),
     }))
 }
 
@@ -1588,13 +1603,21 @@ fn inactive_too_long(
     else {
         return Ok(false);
     };
+    // Counted from the deferral of the Commander's current epoch, not an earlier holder's (v16).
+    let epoch: i64 = tx
+        .query_row(
+            "SELECT role_epoch FROM role_bindings WHERE run_id = ?1 AND role = ?2",
+            params![run_id, COMMANDER],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
     let since: Option<String> = tx
         .query_row(
             "SELECT json_extract(payload_json, '$.at') FROM events WHERE run_id = ?1 AND kind = 'supervisor.deferred' \
-             AND json_extract(payload_json, '$.reason') = ?2 \
+             AND json_extract(payload_json, '$.reason') = ?2 AND json_extract(payload_json, '$.role_epoch') = ?4 \
              AND seq > coalesce((SELECT max(seq) FROM events WHERE run_id = ?1 AND kind = ?3), 0) \
              ORDER BY seq LIMIT 1",
-            params![run_id, reason, ALLOCATED],
+            params![run_id, reason, ALLOCATED, epoch],
             |r| r.get(0),
         )
         .optional()

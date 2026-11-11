@@ -2165,7 +2165,7 @@ async fn a_commander_session_is_given_its_own_directory_outside_the_project_once
 #[tokio::test]
 async fn a_commander_whose_agent_the_registry_finds_unavailable_waits_for_a_newer_look() -> R {
     // Decision 5 (-306, -355): the registry's last look at the Commander's agent finding it unavailable (or not logged
-    // in) makes the Commander unavailable, the look's identity recorded; a host that has not looked yet leaves it so;
+    // in) makes the Commander unavailable, the look's identity recorded with the agent it is of (v16, M2T08R-200); a host that has not looked yet leaves it so;
     // only a later look (by its identity, host epoch first) finding it available ends it.
     use crate::decision::Observation;
     let dir = tempfile::tempdir()?;
@@ -2192,7 +2192,7 @@ async fn a_commander_whose_agent_the_registry_finds_unavailable_waits_for_a_newe
             &path,
             "SELECT json_object('reasons', json(json_extract(payload_json, '$.reasons')), 'observation', json(json_extract(payload_json, '$.observation'))) FROM events WHERE kind = 'supervisor.unavailable'"
         )?,
-        json!({"reasons": ["login_missing"], "observation": {"host_epoch": 1, "n": 4}})
+        json!({"reasons": ["login_missing"], "observation": {"agent": "codex", "host_epoch": 1, "n": 4}})
     );
     // A new host that has not looked yet: still unavailable.
     store.supervise("R", seen(4000, vec![])).await?;
@@ -2911,6 +2911,122 @@ async fn a_probe_settled_while_its_commander_is_unavailable_otherwise_is_owed_un
             "SELECT count(*) FROM events WHERE kind = 'supervisor.blocked'"
         )?,
         json!(2)
+    );
+    Ok(())
+}
+
+// Implementation review round 3 (docs/adr/ADR-025.md v16: each unavailability reason judged on its own subject).
+
+#[tokio::test]
+async fn a_registry_fault_of_the_old_agent_does_not_hold_a_commander_handed_to_another() -> R {
+    // M2T08R-200 (decision 5, v16): the registry's looks are counted per agent; an unavailability it recorded for the
+    // Commander's old agent (codex, look 100) does not apply once the role is held by another agent (claude), whose
+    // own look (2) finds it available: the run works again.
+    use crate::decision::Observation;
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    wake(&store, &clock, "R", "D", "fp", 0).await?;
+    let look = |agent: &str, n, available, ms| Context {
+        observations: Some(
+            [(
+                agent.to_owned(),
+                Observation {
+                    host_epoch: 1,
+                    n,
+                    available,
+                    logged_in: true,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        ),
+        ..context(&clock, ms)
+    };
+    store
+        .supervise("R", look("codex", 100, false, 3000))
+        .await?;
+    assert_eq!(blocked(&path)?.0, "BLOCKED");
+    exec(
+        &path,
+        "INSERT INTO sessions(session_id, agent, role, agent_version, capabilities_json) VALUES
+           ('sc3', 'claude', 'commander', '1', '{}');
+         UPDATE role_bindings SET agent = 'claude', session_id = 'sc3', role_epoch = 2
+           WHERE run_id = 'R' AND role = 'commander';",
+    )?;
+    store.supervise("R", look("claude", 2, true, 4000)).await?;
+    assert_eq!(blocked(&path)?.0, "RUNNING", "the new agent's own look");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_commander_without_a_session_is_timed_from_its_own_epochs_deferral() -> R {
+    // M2T08R-200's class (decision 3, v16): how long a Commander has been without a session is measured from the
+    // deferral of its own epoch, not from an earlier holder's: a holder that has lacked one for 6 minutes is not
+    // unavailable because the one before it lacked one 31 minutes ago.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(
+        &path,
+        &format!(
+            "{WORLD} UPDATE role_bindings SET session_id = NULL WHERE run_id = 'R' AND role = 'commander';"
+        ),
+    )?;
+    wake(&store, &clock, "R", "D", "fp", 0).await?;
+    store.supervise("R", context(&clock, 3000)).await?;
+    store
+        .allocate_supervision("p1", context(&clock, 3000))
+        .await?;
+    assert_eq!(deferred(&path)?, ["NO_SESSION"]);
+    exec(
+        &path,
+        "UPDATE role_bindings SET role_epoch = 2 WHERE run_id = 'R' AND role = 'commander';",
+    )?;
+    let handed = 3000 + 25 * 60_000;
+    store.supervise("R", context(&clock, handed)).await?;
+    store
+        .allocate_supervision("p1", context(&clock, handed))
+        .await?;
+    let later = 3000 + 31 * 60_000;
+    store.supervise("R", context(&clock, later)).await?;
+    assert_eq!(blocked(&path)?.0, "RUNNING", "6 minutes without a session");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_turns_outputs_are_disposed_of_at_most_fifty_per_writer_job() -> R {
+    // M2T08R-201 (decision 2's jobs table, v16): one disposal job ends at most 50 outputs and says more are left; the
+    // store's step submits job after job until all 120 of the turn's outputs have ended, in order.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    wake(&store, &clock, "R", "D", "fp", 0).await?;
+    let a = store
+        .allocate_supervision("p1", context(&clock, 3000))
+        .await?
+        .ok_or("allocated")?;
+    let lines: Vec<String> = (0..120).map(|_| "not json".to_owned()).collect();
+    bridged_turn(&store, &clock, &a.attempt_id, 3000, true, &lines).await?;
+    let mut conn = Connection::open(&path)?;
+    let ctx = crate::persistence::writer::Ctx::quiet();
+    assert!(super::super::supervise::dispose(
+        &mut conn,
+        "R",
+        &context(&clock, 4000),
+        &ctx
+    )?);
+    assert_eq!(ends(&path)?.len(), 50);
+    store.supervise("R", context(&clock, 4100)).await?;
+    let ended = ends(&path)?;
+    assert_eq!(ended.len(), 120);
+    assert!(
+        ended.iter().enumerate().all(|(n, (id, end))| *id
+            == format!("{}/output/{n}", a.attempt_id)
+            && end == "invalid:FORMAT"),
+        "{ended:?}"
     );
     Ok(())
 }
