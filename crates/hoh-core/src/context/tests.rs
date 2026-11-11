@@ -1078,49 +1078,35 @@ fn a_turns_mandatory_items_say_what_is_missing_instead_of_leaving_it_out() -> R 
 }
 
 #[test]
-fn a_first_input_is_the_package_itself_or_a_marked_summary_of_another_shape() -> R {
-    // docs/adr/ADR-026.md decision 3, v4 (M2T09D-201): a summary never passes for the package.
-    let small = json!({"handoff_kind": "role_change", "state": {"open_issue_ids": ["i1", "i2"], "applied_decision_ids": []}});
-    let text = super::lead(&small, ".hoh/objects/sha256/aa/x");
-    assert!(text.starts_with("#### 交接包（本会话的首个输入）"));
-    let block = |text: &str| -> Result<Value, Box<dyn std::error::Error>> {
-        Ok(serde_json::from_str(
-            text.split("```json\n")
-                .nth(1)
-                .and_then(|t| t.split("\n```").next())
-                .ok_or("no block")?,
-        )?)
+fn a_first_input_is_the_whole_package_however_long_and_counts_against_the_budget() -> R {
+    // REQ-019 behaviour 4 (docs/adr/ADR-026.md decision 3, M2T09D-250): never cut or summarised; too long for the
+    // budget is CONTEXT_BUDGET_TOO_SMALL.
+    let ids: Vec<String> = (0..51).map(|n| format!("D{n:03}")).collect();
+    let package = json!({"handoff_kind": "role_change", "state": {"applied_decision_ids": ids}});
+    let text = super::lead(&package);
+    let shown: Value = serde_json::from_str(
+        text.split("```json\n")
+            .nth(1)
+            .and_then(|t| t.split("\n```").next())
+            .ok_or("no block")?,
+    )?;
+    assert_eq!(shown, package, "the package as it is, D050 included");
+    let without = mandatory();
+    let with = Mandatory {
+        lead: text.clone(),
+        ..mandatory()
     };
-    assert_eq!(block(&text)?, small, "within the cap, the package as it is");
-    assert!(!text.contains(".hoh/objects"));
-    let ids: Vec<String> = (0..10_000).map(|n| format!("m{n:05}")).collect();
-    let big = json!({"handoff_kind": "role_change", "state": {"unacked_message_ids": ids, "open_issue_ids": ["i1"]}});
-    let text = super::lead(&big, ".hoh/objects/sha256/aa/x");
-    assert!(text.len() < 10_000, "bounded: {}", text.len());
+    let (m0, m1) = (required(DEVELOPER, &without)?, required(DEVELOPER, &with)?);
     assert!(
-        text.starts_with("#### 交接包摘要（不是完整交接包"),
-        "{text:.80}"
-    );
-    assert!(text.contains(".hoh/objects/sha256/aa/x"));
-    let shown = block(&text)?;
-    assert!(
-        shown.get("state").is_none(),
-        "no ContextHandoff state: it cannot pass for the package"
-    );
-    assert_eq!(shown["handoff_kind"], "role_change");
-    assert_eq!(
-        shown["state_summary"]["unacked_message_ids"]["total"],
-        10_000
+        m1 >= m0 + estimate(&text),
+        "the package is counted with the mandatory items: {m0} -> {m1}"
     );
     assert_eq!(
-        shown["state_summary"]["unacked_message_ids"]["first"]
-            .as_array()
-            .map(Vec::len),
-        Some(LEAD_IDS)
-    );
-    assert_eq!(
-        shown["state_summary"]["open_issue_ids"],
-        json!({"total": 1, "first": ["i1"]})
+        pack(DEVELOPER, &with, &[], m1 - 1).err(),
+        Some(PackError::TooSmall {
+            required: m1,
+            available: m1 - 1
+        })
     );
     Ok(())
 }
