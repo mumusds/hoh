@@ -542,7 +542,16 @@ async fn tick(
             }
         }
     }
-    store.allocate_supervision(&project_id, at()).await?;
+    // The allocation judges by the same looks (docs/adr/ADR-025.md v14 decision 5).
+    store
+        .allocate_supervision(
+            &project_id,
+            Context {
+                observations: observed.clone(),
+                ..at()
+            },
+        )
+        .await?;
     for stop in store.supervision_stops(&project_id, at()).await? {
         if stop.state == "PREPARED" {
             store

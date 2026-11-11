@@ -610,7 +610,22 @@ fn fire(
         }
         return Ok((fired, events, None));
     }
-    // The step's one verdict, before anything fires (v13, M2T08R-05, -08).
+    // The ended turns folded first (their rearms), as the allocation folds them, so the step's verdict and the
+    // allocation's count the same failures (v14, M2T08R-102); then the step's one verdict, before anything fires
+    // (v13, M2T08R-05, -08).
+    let mut ended = wakes::of_run(tx, run_id)?;
+    let (cas, rearmed) = wakes::rearm(tx, project_id, run_id, &mut ended, now)?;
+    if !cas.is_empty() || !rearmed.is_empty() {
+        writer::write(
+            tx,
+            &Commit {
+                cas,
+                events: rearmed,
+                ..Commit::default()
+            },
+            ctx,
+        )?;
+    }
     let Some(verdict) = wakes::verdict(tx, run_id, context)? else {
         return Ok((fired, events, None));
     };
@@ -623,6 +638,14 @@ fn fire(
         .filter(|w| w.severity != Severity::Integrity && !w.preempted)
         .and_then(|w| w.turns.last().map(|t| (w.id.clone(), t.attempt_id.clone())));
     let mut owed: Vec<wakes::Wake> = all.into_iter().filter(wakes::Wake::owed).collect();
+    // The first owed wake of each key.
+    let mut keyed: std::collections::BTreeMap<(String, Option<String>), usize> =
+        std::collections::BTreeMap::new();
+    for (i, w) in owed.iter().enumerate() {
+        keyed
+            .entry((w.fingerprint.clone(), w.spec_id.clone()))
+            .or_insert(i);
+    }
     for t in due {
         let severity = Severity::named(&t.severity).unwrap_or(Severity::Normal);
         // A routine trigger is not kept while the Commander is unavailable, however late the step that finds it due
@@ -650,16 +673,27 @@ fn fire(
         // The tasks its events name: what the wake's turn will be shown, and fenced by (decisions 3 and 6).
         // A re-trigger names every task its stale turn was shown (task_ids); a Commander's own mistakes in a row back
         // its wake off from now (decision 6, -700, -752).
+        // Its events read by one statement and their tasks kept once each by a set: linear in its events (v14,
+        // M2T08R-101; a lookup per task made firing quadratic).
         let mut task_ids: Vec<String> = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
         let mut mistakes = 0;
-        for seq in &t.seqs {
-            let (kind, payload): (String, String) = tx
-                .query_row(
-                    "SELECT kind, payload_json FROM events WHERE seq = ?1",
-                    params![seq],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
+        let rows: Vec<(String, String)> = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT kind, payload_json FROM events WHERE seq IN (SELECT value FROM json_each(?1)) \
+                     ORDER BY seq",
                 )
                 .map_err(sqlite_error)?;
+            statement
+                .query_map(params![json!(t.seqs).to_string()], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .map_err(sqlite_error)?
+                .collect::<Result<_, _>>()
+                .map_err(sqlite_error)?
+        };
+        for (kind, payload) in rows {
             let payload: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
             let named = payload["task_id"].as_str().into_iter().chain(
                 payload["task_ids"]
@@ -669,7 +703,7 @@ fn fire(
                     .filter_map(Value::as_str),
             );
             for task in named {
-                if !task_ids.iter().any(|t| t == task) {
+                if seen.insert(task.to_owned()) {
                     task_ids.push(task.to_owned());
                 }
             }
@@ -689,10 +723,12 @@ fn fire(
         if let Some(not_before) = &not_before {
             payload["retry_not_before"] = json!(not_before);
         }
-        // A trigger of the key of a wake still owed and not in flight joins it (decision 3, -951, -1053).
-        let joined = owed
-            .iter_mut()
-            .find(|w| w.fingerprint == t.fingerprint && w.spec_id == t.spec_id);
+        // A trigger of the key of a wake still owed and not in flight joins it (decision 3, -951, -1053); found by
+        // its key (v14, -101).
+        let joined = keyed
+            .get(&(t.fingerprint.clone(), t.spec_id.clone()))
+            .copied()
+            .map(|i| &mut owed[i]);
         // The integrity edge: a new integrity wake, or a merge that makes a wake integrity (-1053).
         let (wake_id, edge, wake_not_before) = match joined {
             Some(wake) => {
@@ -713,6 +749,9 @@ fn fire(
             None => {
                 payload["wake"] = json!(t.trigger_id);
                 payload["wake_severity"] = json!(severity.as_str());
+                keyed
+                    .entry((t.fingerprint.clone(), t.spec_id.clone()))
+                    .or_insert(owed.len());
                 owed.push(wakes::Wake {
                     id: t.trigger_id.clone(),
                     fingerprint: t.fingerprint.clone(),
