@@ -1052,7 +1052,7 @@ async fn a_cancelled_writer_lets_its_lease_go_with_its_workspace_record_which_th
 {
     // REQ-019 behaviour 6 (docs/adr/ADR-024.md decision 9, M2T17R-52), the cancel's path: A1 is the writer lease's
     // holder. A pass that found its group empty without the record is refused: A1 stays RUNNING, its lease held.
-    // The cancel's step takes the record once the group is empty and ends A1 CANCELLED with it, before its reap's
+    // The cancel's step takes the record once the group is empty and ends A1 CANCELLED with it, after its reap's
     // event; that pass is the step's last, so the run's record is the same one, taken once.
     let dir = tempfile::tempdir()?;
     let (store, path) = open(&dir)?;
@@ -1131,8 +1131,9 @@ async fn a_cancelled_writer_lets_its_lease_go_with_its_workspace_record_which_th
     let attempt: Value = serde_json::from_str(&attempt)?;
     assert_eq!(attempt["to"], "CANCELLED", "{attempt}");
     assert_eq!(attempt["workspace"]["workspace_sha256"], "record-1");
+    // After the pass's steps (M2T17FR-51): the record follows the stop it was taken after.
     let reaped = count(&path, "SELECT seq FROM events WHERE kind = 'cancel.reaped'")?;
-    assert!(recorded < reaped, "{recorded} {reaped}");
+    assert!(recorded > reaped, "{recorded} {reaped}");
     let run: Value = serde_json::from_str(&conn.query_row(
         "SELECT payload_json FROM events WHERE kind = 'cancel.workspace'",
         [],

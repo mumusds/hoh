@@ -1149,6 +1149,114 @@ async fn a_turn_that_ends_after_starting_a_command_ends_unknown_effect_and_is_no
     outcome
 }
 
+/// `git` in `dir` (a test's own repository), its stdout.
+fn git(dir: &Path, args: &[&str]) -> R<String> {
+    let out = std::process::Command::new("git")
+        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+        .args(args)
+        .current_dir(dir)
+        .output()?;
+    if !out.status.success() {
+        return Err(format!("git {args:?}: {}", String::from_utf8_lossy(&out.stderr)).into());
+    }
+    Ok(String::from_utf8(out.stdout)?)
+}
+
+#[tokio::test]
+async fn a_writer_the_host_stops_for_an_oversize_frame_lets_its_lease_go_with_the_workspace_recorded()
+-> R {
+    // M2T17FR-50, -53 (REQ-019 behaviour 6, docs/adr/ADR-024.md decision 9 after round 1): HoH itself stops a writer's
+    // claude turn that sends a frame over the limit; the attempt ends FAILED (PROTOCOL_FRAME_TOO_LARGE), by the
+    // runner's own end, with the workspace's record in the same transaction, taken after the stop in the project's git
+    // work tree (its uncommitted change in the record's diff); the next writer is granted only after it.
+    let world = World::new()?;
+    world.claude(None)?;
+    let project = world.project();
+    git(&project, &["init", "-q"])?;
+    std::fs::write(project.join(".gitignore"), ".hoh/\n")?;
+    std::fs::write(project.join("a.txt"), "one\n")?;
+    git(&project, &["add", ".gitignore", "a.txt"])?;
+    git(&project, &["commit", "-q", "-m", "first"])?;
+    std::fs::write(project.join("a.txt"), "two\n")?;
+    let host = start_when_free(world.config()).await?;
+    let outcome = async {
+        let run_id = started(&host, "s1").await?;
+        ready(&project, &run_id, &[])?;
+        exec(
+            &project,
+            &format!(
+                "INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate) \
+                 VALUES ('T-HUGE', '{run_id}', 's1', 'READY', 1, 'developer', 1, 1, 1);"
+            ),
+        )?;
+        until(
+            &project,
+            "SELECT count(*) FROM attempts WHERE attempt_id = 'T-HUGE/attempt-1'",
+            "1",
+            Duration::from_secs(30),
+        )
+        .await?;
+        exec(
+            &project,
+            &format!(
+                "INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate) \
+                 VALUES ('T-NEXT', '{run_id}', 's1', 'READY', 1, 'developer', 1, 2, 1);"
+            ),
+        )?;
+        let limit = Duration::from_secs(60);
+        until(
+            &project,
+            &ended("T-HUGE/attempt-1"),
+            "FAILED/PROTOCOL_FRAME_TOO_LARGE",
+            limit,
+        )
+        .await?;
+        until(
+            &project,
+            "SELECT count(*) FROM outbox WHERE json_extract(payload_json, '$.kind') = 'dispatch' \
+             AND json_extract(payload_json, '$.task_id') = 'T-NEXT'",
+            "1",
+            limit,
+        )
+        .await?;
+        let record: Value = serde_json::from_str(&query(
+            &project,
+            "SELECT payload_json FROM events WHERE kind = 'attempt.workspace' \
+             AND json_extract(payload_json, '$.attempt_id') = 'T-HUGE/attempt-1'",
+        )?)?;
+        assert_eq!(record["to"], "FAILED", "{record}");
+        let workspace = &record["workspace"];
+        assert_eq!(
+            workspace["head"],
+            json!(git(&project, &["rev-parse", "HEAD"])?.trim()),
+            "{record}"
+        );
+        let diff = std::process::Command::new("git")
+            .args(["diff", "--binary", "--no-ext-diff", "--no-textconv", "HEAD"])
+            .current_dir(&project)
+            .output()?
+            .stdout;
+        let digest = <sha2::Sha256 as sha2::Digest>::digest(&diff);
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(workspace["diff_sha256"], json!(hex), "{record}");
+        let at = |sql: &str| -> R<i64> { Ok(query(&project, sql)?.parse()?) };
+        let recorded = at("SELECT seq FROM events WHERE kind = 'attempt.workspace' \
+             AND json_extract(payload_json, '$.attempt_id') = 'T-HUGE/attempt-1'")?;
+        let ended_at = at("SELECT seq FROM events WHERE kind = 'attempt.moved' \
+             AND json_extract(payload_json, '$.attempt_id') = 'T-HUGE/attempt-1' \
+             AND json_extract(payload_json, '$.to') = 'FAILED'")?;
+        let granted = at("SELECT event_seq FROM outbox WHERE json_extract(payload_json, '$.kind') = 'dispatch' \
+             AND json_extract(payload_json, '$.task_id') = 'T-NEXT'")?;
+        assert_eq!(recorded + 1, ended_at, "the record is in its end's transaction");
+        assert!(recorded < granted, "the next writer was granted before the record");
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    world.stop_fakes()?;
+    outcome
+}
+
 #[tokio::test]
 async fn a_writers_turn_that_ends_unknown_effect_lets_its_lease_go_with_the_workspace_recorded() -> R
 {

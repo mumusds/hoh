@@ -935,9 +935,15 @@ async fn reconcile_a1_at(at: SystemTime, records: &str) -> R<(String, f64, Strin
     let [row] = rows.as_slice() else {
         return Err(format!("unfinished: {rows:?}").into());
     };
+    // A1 holds the writer lease: its end from RUNNING carries the workspace's record, as the host gives it when the
+    // store asks (REQ-019 behaviour 6, docs/adr/ADR-024.md decision 9 after round 1).
+    let row = crate::persistence::UnfinishedRow {
+        workspace: Some(json!({"workspace_sha256": "test"})),
+        ..row.clone()
+    };
     store
         .reconcile_apply(
-            row.clone(),
+            row,
             Disposition::Ended {
                 to: crate::lifecycle::AttemptState::Failed,
                 task_to: crate::protocol::TaskState::Ready,
