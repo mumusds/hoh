@@ -1180,7 +1180,7 @@ async fn the_binder_binds_a_session_per_role_and_epoch_or_blocks_an_unavailable_
 async fn a_dispatch_resumes_the_agents_own_session_only_where_the_session_can_be_resumed() -> R {
     // M2T07R-257 (ADR-022 decision 9): the agent's own session id goes with a dispatch only when the session's
     // capabilities have resume; otherwise the turn starts a session of its own. The id is from A0, a turn of the
-    // session that completed (a native session is resumed only then, ADR-024 decision 4, M2T17R-450).
+    // session that completed, as its settle records it (a session.native event; ADR-024 decision 4, M2T17R-450, -600).
     for (capabilities, resumed) in [
         (
             r#"{"structured_events": true, "resume": true}"#,
@@ -1197,7 +1197,11 @@ async fn a_dispatch_resumes_the_agents_own_session_only_where_the_session_can_be
             &path,
             &format!(
                 "UPDATE sessions SET native_id = 'n-1', capabilities_json = '{capabilities}' WHERE session_id = 'sd';
-                 UPDATE attempts SET session_id = 'sd' WHERE attempt_id = 'A0';"
+                 UPDATE attempts SET session_id = 'sd' WHERE attempt_id = 'A0';
+                 INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+                   ('p1', 'A0/session.native', 'R1', 'session.native',
+                    '{{\"session_id\": \"sd\", \"native_id\": \"n-1\", \"attempt_id\": \"A0\"}}',
+                    '2026-11-09T00:01:00Z');"
             ),
         )?;
         let context = crate::decision::Context {
@@ -1870,16 +1874,10 @@ async fn a_session_never_handed_over_is_resumed_only_once_a_turn_of_it_completed
         .dispatched
         .ok_or("T1 not dispatched")?;
     assert_eq!(resumed(&first)?, None, "no turn of the session completed");
-    exec(
-        &path,
-        &format!(
-            "UPDATE attempts SET state = 'SETTLED', pid = 4242, ended_at = '2026-11-09T00:02:00Z' \
-             WHERE attempt_id = '{0}'; DELETE FROM leases WHERE attempt_id = '{0}';",
-            first.attempt_id
-        ),
-    )?;
+    // The next turn completes, as the runner settles it: its own id is the one resumed, never the failed A0's.
+    turn_ends(&store, &path, &first.attempt_id, true, "n1").await?;
     let second = dispatch_next(&store, &path, &context, "T2", 3).await?;
-    assert_eq!(resumed(&second)?.as_deref(), Some("n0"));
+    assert_eq!(resumed(&second)?.as_deref(), Some("n1"));
     Ok(())
 }
 
@@ -1917,6 +1915,38 @@ async fn turn_ends(
                     ..crate::persistence::Observed::default()
                 },
                 unknown_effect: false,
+            },
+        )
+        .await?;
+    exec(
+        path,
+        &format!("DELETE FROM leases WHERE attempt_id = '{attempt_id}';"),
+    )
+}
+
+/// Attempt `attempt_id` RUNNING, then ended by the runner as a turn that showed native session `native` and started an
+/// effect it never reported: UNKNOWN_EFFECT.
+async fn turn_ends_unknown(store: &Store, path: &PathBuf, attempt_id: &str, native: &str) -> R {
+    exec(
+        path,
+        &format!(
+            "UPDATE attempts SET state = 'RUNNING', pid = 4242 WHERE attempt_id = '{attempt_id}';"
+        ),
+    )?;
+    store
+        .runner_finished(
+            attempt_id,
+            crate::persistence::Ending {
+                success: true,
+                detail: "done".to_owned(),
+                class: crate::retry::FailureClass::Transient { retry_after: None },
+                at: std::time::SystemTime::now(),
+                draw: 0,
+                observed: crate::persistence::Observed {
+                    native_session: Some(native.to_owned()),
+                    ..crate::persistence::Observed::default()
+                },
+                unknown_effect: true,
             },
         )
         .await?;
@@ -2003,6 +2033,87 @@ async fn only_a_completed_turn_names_the_native_session_to_resume() -> R {
         Some("good-completed"),
         "a failed turn does not replace the completed one's"
     );
+    // Nor a cancelled turn's, nor one whose effect is unknown, each with an id of its own (M2T17R-650).
+    exec(
+        &path,
+        &format!(
+            "UPDATE attempts SET cancel_requested = 1 WHERE attempt_id = '{}';",
+            fourth.attempt_id
+        ),
+    )?;
+    turn_ends(&store, &path, &fourth.attempt_id, true, "cancelled-early").await?;
+    let fifth = dispatch_next(&store, &path, &context, "T5", 7).await?;
+    assert_eq!(
+        resumed(&fifth)?.as_deref(),
+        Some("good-completed"),
+        "a cancelled turn does not replace it"
+    );
+    turn_ends_unknown(&store, &path, &fifth.attempt_id, "unknown-early").await?;
+    let sixth = dispatch_next(&store, &path, &context, "T6", 8).await?;
+    assert_eq!(
+        resumed(&sixth)?.as_deref(),
+        Some("good-completed"),
+        "a turn whose effect is unknown does not replace it"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_native_id_no_completed_turn_recorded_is_never_resumed() -> R {
+    // M2T17R-600, -601 (docs/adr/ADR-024.md decision 4, round 7): the session row holds an id no completed turn
+    // recorded (an older version's failed turn, an adapter's early upsert), and a turn of the session was settled by
+    // the reconcile, which saw no id: nothing is resumed. A turn the runner settles SETTLED records its id, which is
+    // then resumed; the row's own value never is.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    working(&store, &path).await?;
+    a0_ends(&path)?;
+    exec(
+        &path,
+        "UPDATE sessions SET capabilities_json = '{\"structured_events\": true, \"resume\": true}', \
+           native_id = 'legacy-early' WHERE session_id = 'sd';",
+    )?;
+    let context = crate::decision::Context {
+        required_capabilities: [(
+            "developer".to_owned(),
+            ["structured_events".to_owned()].into(),
+        )]
+        .into(),
+        ..crate::decision::Context::default()
+    };
+    let resumed = |d: &crate::persistence::Dispatched| -> R<Option<String>> {
+        Ok(super::assignment(
+            &Connection::open(&path)?,
+            "p1",
+            "R1",
+            &d.task_id,
+            &d.attempt_id,
+            "developer",
+        )?
+        .native_session)
+    };
+    let reconciled = store
+        .schedule_round("R1", context.clone())
+        .await?
+        .dispatched
+        .ok_or("T1 not dispatched")?;
+    exec(
+        &path,
+        &format!(
+            "UPDATE attempts SET state = 'SETTLED', pid = 4242, ended_at = '2026-11-10T00:02:00Z' \
+             WHERE attempt_id = '{0}'; DELETE FROM leases WHERE attempt_id = '{0}';",
+            reconciled.attempt_id
+        ),
+    )?;
+    let next = dispatch_next(&store, &path, &context, "T2", 3).await?;
+    assert_eq!(resumed(&next)?, None, "an id no completed turn recorded");
+    turn_ends(&store, &path, &next.attempt_id, true, "good-completed").await?;
+    exec(
+        &path,
+        "UPDATE sessions SET native_id = 'overwritten-early' WHERE session_id = 'sd';",
+    )?;
+    let last = dispatch_next(&store, &path, &context, "T3", 4).await?;
+    assert_eq!(resumed(&last)?.as_deref(), Some("good-completed"));
     Ok(())
 }
 
@@ -2088,7 +2199,9 @@ async fn a_first_input_stays_owed_until_a_turn_of_its_session_completed() -> R {
         assignment.native_session, None,
         "a session no turn completed is not resumed (M2T17R-450)"
     );
-    end(&path, &fourth.attempt_id, "SETTLED", 4245)?;
+    // The fourth's turn completes, as the runner settles it: the first input given, its own id the one resumed (never
+    // the failed third's, M2T17R-600).
+    turn_ends(&store, &path, &fourth.attempt_id, true, "thread-4").await?;
     let fifth = dispatch_next(&store, &path, &context, "T5", 6).await?;
     let assignment = assigned(&path, &fifth)?;
     assert!(
@@ -2097,14 +2210,15 @@ async fn a_first_input_stays_owed_until_a_turn_of_its_session_completed() -> R {
     );
     assert_eq!(
         assignment.native_session.as_deref(),
-        Some("thread-1"),
+        Some("thread-4"),
         "resumed now"
     );
     // Whether or not the session can be resumed (M2T17R-251): here it no longer can.
     end(&path, &fifth.attempt_id, "SETTLED", 4246)?;
     exec(
         &path,
-        "UPDATE sessions SET capabilities_json = '{\"structured_events\": true}' WHERE native_id = 'thread-1';",
+        "UPDATE sessions SET capabilities_json = '{\"structured_events\": true}' WHERE session_id = (SELECT session_id \
+         FROM attempts WHERE attempt_id = 'T5/attempt-1');",
     )?;
     let sixth = dispatch_next(&store, &path, &context, "T6", 7).await?;
     let assignment = assigned(&path, &sixth)?;

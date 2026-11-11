@@ -669,19 +669,37 @@ fn finished(
         )
         .map_err(sqlite_error)?;
     }
-    // The agent's own session id on the attempt's session row (its later turns resume it), from a turn that completed
-    // only: an id given before any input (Pi's get_state, Codex's thread/start) names a session that may never have
-    // been persisted, and a failed turn must not replace a completed one's (docs/adr/ADR-024.md decision 4, M2T17R-500).
+    // The agent's own session id, from a turn that completed only: an id given before any input (Pi's get_state, Codex's
+    // thread/start) names a session that may never have been persisted, and a failed turn must not replace a completed
+    // one's (M2T17R-500). The completed turn records it as a session.native event in its own settle's transaction: that
+    // record, not the session row (which older versions and direct adapters fill), is what a later turn resumes
+    // (docs/adr/ADR-024.md decision 4, M2T17R-600, -601).
+    let mut commit = Commit::default();
     if to == AttemptState::Settled
         && let Some(native) = &ending.observed.native_session
     {
-        tx.execute(
-            "UPDATE sessions SET native_id = ?2 WHERE session_id = (SELECT session_id FROM attempts WHERE attempt_id = ?1)",
-            params![attempt_id, native],
-        )
-        .map_err(sqlite_error)?;
+        let session: Option<String> = tx
+            .query_row(
+                "SELECT session_id FROM attempts WHERE attempt_id = ?1",
+                params![attempt_id],
+                |r| r.get(0),
+            )
+            .map_err(sqlite_error)?;
+        if let Some(session) = session {
+            tx.execute(
+                "UPDATE sessions SET native_id = ?2 WHERE session_id = ?1",
+                params![session, native],
+            )
+            .map_err(sqlite_error)?;
+            commit.events.push(NewEvent {
+                project_id: project_id.clone(),
+                event_id: crate::ids::child_id(attempt_id, "session.native"),
+                run_id: Some(run_id.clone()),
+                kind: "session.native".to_owned(),
+                payload: json!({"session_id": session, "native_id": native, "attempt_id": attempt_id}),
+            });
+        }
     }
-    let mut commit = Commit::default();
     for (key, kind, payload) in &ending.observed.events {
         commit.events.push(NewEvent {
             project_id: project_id.clone(),
