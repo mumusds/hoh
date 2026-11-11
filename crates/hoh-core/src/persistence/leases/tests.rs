@@ -1,5 +1,5 @@
 use super::*;
-use crate::lifecycle::AttemptState;
+use crate::lifecycle::{AttemptState, Lifecycle as _};
 use crate::persistence::attempts::{self, AttemptFacts, AttemptJob, AttemptMove};
 use crate::persistence::{Options, Store, selftest};
 use rusqlite::Connection;
@@ -342,7 +342,8 @@ fn times_with_offsets_are_judged_as_instants() -> R {
 #[test]
 fn an_attempt_whose_effect_is_unknown_lets_its_lease_go_at_that_move() -> R {
     // ADR-019 decision 5 (amends ADR-017 decision 4): UNKNOWN_EFFECT is entered only once the attempt's process is
-    // gone, so it holds no slot; its task gets no new attempt by itself, but another writer task may run.
+    // gone, so it holds no slot; its task gets no new attempt by itself, but another writer task may run. A writer's
+    // move there carries its workspace's record (REQ-019 behaviour 6, docs/adr/ADR-024.md decision 9).
     let dir = tempfile::tempdir()?;
     let mut conn = world(&dir)?;
     in_tx(&mut conn, |tx| grant(tx, "p1", "writer", "a-w1", at(0)))?;
@@ -353,11 +354,14 @@ fn an_attempt_whose_effect_is_unknown_lets_its_lease_go_at_that_move() -> R {
     )?;
     attempts::apply(
         &mut conn,
-        &moving(
-            "a-w1",
-            AttemptState::Starting,
-            AttemptState::UnknownEffect,
-            9,
+        &recorded(
+            moving(
+                "a-w1",
+                AttemptState::Starting,
+                AttemptState::UnknownEffect,
+                9,
+            ),
+            serde_json::json!({"head": null}),
         ),
         &crate::persistence::writer::Ctx::quiet(),
     )?;
@@ -366,5 +370,150 @@ fn an_attempt_whose_effect_is_unknown_lets_its_lease_go_at_that_move() -> R {
     assert!(!held[0].effective);
     let next = in_tx(&mut conn, |tx| grant(tx, "p1", "writer", "a-w2", at(9)))?;
     assert_eq!(next.epoch, 2);
+    Ok(())
+}
+
+/// `job` with the workspace record `record`.
+fn recorded(job: AttemptJob, record: serde_json::Value) -> AttemptJob {
+    match job {
+        AttemptJob::Move(mut m) => {
+            m.facts.workspace = Some(record);
+            AttemptJob::Move(m)
+        }
+        other => other,
+    }
+}
+
+/// `attempt` RUNNING (granted `kind` at 0, started at 1, running at 2).
+fn running(conn: &mut Connection, attempt: &str, kind: &str) -> R {
+    in_tx(conn, |tx| grant(tx, "p1", kind, attempt, at(0)))?;
+    let quiet = crate::persistence::writer::Ctx::quiet();
+    attempts::apply(
+        conn,
+        &moving(attempt, AttemptState::Prepared, AttemptState::Starting, 1),
+        &quiet,
+    )?;
+    attempts::apply(
+        conn,
+        &moving(attempt, AttemptState::Starting, AttemptState::Running, 2),
+        &quiet,
+    )?;
+    Ok(())
+}
+
+fn workspace_events(conn: &Connection, attempt: &str) -> Result<Vec<String>, rusqlite::Error> {
+    conn.prepare(
+        "SELECT payload_json FROM events WHERE kind = 'attempt.workspace' \
+         AND json_extract(payload_json, '$.attempt_id') = ?1",
+    )?
+    .query_map([attempt], |r| r.get(0))?
+    .collect()
+}
+
+#[test]
+fn an_interrupted_writer_lets_its_lease_go_only_with_its_workspace_record() -> R {
+    // REQ-019 behaviour 6 (docs/adr/ADR-024.md decision 9, M2T17R-52): a writer whose end is interrupted (to
+    // UNKNOWN_EFFECT, or RUNNING to CANCELLED) without the workspace's record is refused: nothing is written, its lease
+    // stays effective and no other writer is granted. With the record, the record is written in the end's transaction
+    // and the next writer is granted. Its lease expired meanwhile changes nothing (the settle's shape).
+    let quiet = crate::persistence::writer::Ctx::quiet();
+    for (to, expired) in [
+        (AttemptState::UnknownEffect, false),
+        (AttemptState::UnknownEffect, true),
+        (AttemptState::Cancelled, false),
+        (AttemptState::Cancelled, true),
+    ] {
+        let dir = tempfile::tempdir()?;
+        let mut conn = world(&dir)?;
+        running(&mut conn, "a-w1", "writer")?;
+        let ended = if expired { 300 } else { 9 };
+        let refused = attempts::apply(
+            &mut conn,
+            &moving("a-w1", AttemptState::Running, to, ended),
+            &quiet,
+        );
+        assert!(
+            matches!(refused, Err(PersistError::WorkspaceRecordRequired(_))),
+            "{to:?} expired={expired}: {refused:?}"
+        );
+        let state: String = conn.query_row(
+            "SELECT state FROM attempts WHERE attempt_id = 'a-w1'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(state, "RUNNING", "{to:?} expired={expired}");
+        let held = in_tx(&mut conn, |tx| held(tx, "p1", at(ended)))?;
+        assert!(held[0].effective, "{to:?} expired={expired}: {held:?}");
+        assert!(
+            in_tx(&mut conn, |tx| grant(tx, "p1", "writer", "a-w2", at(ended))).is_err(),
+            "{to:?} expired={expired}: another writer granted before the record"
+        );
+        attempts::apply(
+            &mut conn,
+            &recorded(
+                moving("a-w1", AttemptState::Running, to, ended),
+                serde_json::json!({"head": "h", "workspace_sha256": "w"}),
+            ),
+            &quiet,
+        )?;
+        let records = workspace_events(&conn, "a-w1")?;
+        assert_eq!(records.len(), 1, "{to:?} expired={expired}");
+        let record: serde_json::Value = serde_json::from_str(&records[0])?;
+        assert_eq!(record["workspace"]["workspace_sha256"], "w");
+        assert_eq!(record["to"], to.as_str());
+        let next = in_tx(&mut conn, |tx| grant(tx, "p1", "writer", "a-w2", at(ended)))?;
+        assert_eq!(next.epoch, 2, "{to:?} expired={expired}");
+    }
+    Ok(())
+}
+
+#[test]
+fn only_an_interrupted_writers_end_needs_a_workspace_record() -> R {
+    // REQ-019 behaviour 6 (decision 9): a writer that fails or completes ended by itself; a STARTING writer cancelled
+    // never ran its agent; a reader is no writer: none of them needs the record, and their leases go at their end.
+    let quiet = crate::persistence::writer::Ctx::quiet();
+    for to in [AttemptState::Failed, AttemptState::Settled] {
+        let dir = tempfile::tempdir()?;
+        let mut conn = world(&dir)?;
+        running(&mut conn, "a-w1", "writer")?;
+        attempts::apply(
+            &mut conn,
+            &moving("a-w1", AttemptState::Running, to, 9),
+            &quiet,
+        )?;
+        assert!(workspace_events(&conn, "a-w1")?.is_empty());
+        assert_eq!(
+            in_tx(&mut conn, |tx| grant(tx, "p1", "writer", "a-w2", at(9)))?.epoch,
+            2
+        );
+    }
+    let dir = tempfile::tempdir()?;
+    let mut conn = world(&dir)?;
+    in_tx(&mut conn, |tx| grant(tx, "p1", "writer", "a-w1", at(0)))?;
+    attempts::apply(
+        &mut conn,
+        &moving("a-w1", AttemptState::Prepared, AttemptState::Starting, 1),
+        &quiet,
+    )?;
+    attempts::apply(
+        &mut conn,
+        &moving("a-w1", AttemptState::Starting, AttemptState::Cancelled, 9),
+        &quiet,
+    )?;
+    assert_eq!(
+        in_tx(&mut conn, |tx| grant(tx, "p1", "writer", "a-w2", at(9)))?.epoch,
+        2
+    );
+    for to in [AttemptState::UnknownEffect, AttemptState::Cancelled] {
+        let dir = tempfile::tempdir()?;
+        let mut conn = world(&dir)?;
+        running(&mut conn, "a-q1", "reader-1")?;
+        attempts::apply(
+            &mut conn,
+            &moving("a-q1", AttemptState::Running, to, 9),
+            &quiet,
+        )?;
+        assert!(workspace_events(&conn, "a-q1")?.is_empty());
+    }
     Ok(())
 }

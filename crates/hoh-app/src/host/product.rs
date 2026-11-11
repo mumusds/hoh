@@ -260,6 +260,7 @@ fn outcome(facts: Facts, prompt: PromptRecord) -> Outcome {
             events,
             prompt: Some(prompt),
             raw_log_path: Some(facts.raw_log_path),
+            workspace: None,
         },
         unknown_effect: facts.state == AttemptState::UnknownEffect,
     }

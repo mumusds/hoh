@@ -994,6 +994,7 @@ async fn a_cancels_pass_that_ends_an_attempt_names_the_effects_it_left_unknown()
             sent: Vec::new(),
             end: crate::cancel::PassEnd::Empty,
             at,
+            workspace: None,
         })
         .await?;
     let conn = Connection::open(&path)?;
@@ -1010,5 +1011,208 @@ async fn a_cancels_pass_that_ends_an_attempt_names_the_effects_it_left_unknown()
         |r| r.get(0),
     )?;
     assert_eq!(keys, r#"["A1/work"]"#);
+    Ok(())
+}
+
+/// [`Fake`]'s group (A1's, and `also`'s, which ends with it), whose workspace records are numbered: each look at the
+/// workspace counted.
+struct Counted {
+    fake: Fake,
+    also: Option<&'static str>,
+    records: Arc<Mutex<u32>>,
+}
+
+impl Processes for Counted {
+    fn control(&self, attempt: &AttemptRow) -> Option<(Box<dyn ProcessControl + Send>, bool)> {
+        if Some(attempt.attempt_id.as_str()) == self.also {
+            let group: Box<dyn ProcessControl + Send> = Box::new(Group {
+                clock: self.fake.clock.clone(),
+                exits_after: 30,
+                state: self.fake.state.clone(),
+            });
+            return Some((group, true));
+        }
+        self.fake.control(attempt)
+    }
+    fn workspace(&self) -> Value {
+        let n = self
+            .records
+            .lock()
+            .map(|mut n| {
+                *n += 1;
+                *n
+            })
+            .unwrap_or(0);
+        json!({"workspace_sha256": format!("record-{n}")})
+    }
+}
+
+#[tokio::test]
+async fn a_cancelled_writer_lets_its_lease_go_with_its_workspace_record_which_the_run_reuses() -> R
+{
+    // REQ-019 behaviour 6 (docs/adr/ADR-024.md decision 9, M2T17R-52), the cancel's path: A1 is the writer lease's
+    // holder. A pass that found its group empty without the record is refused: A1 stays RUNNING, its lease held.
+    // The cancel's step takes the record once the group is empty and ends A1 CANCELLED with it, before its reap's
+    // event; that pass is the step's last, so the run's record is the same one, taken once.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(&format!(
+        "{WORLD}
+         UPDATE tasks SET writer = 1 WHERE task_id IN ('T1', 'T2');
+         INSERT INTO leases(project_id, kind, attempt_id, epoch, expires_at) VALUES
+           ('p1', 'writer', 'A1', 1, '2026-11-07T00:02:00Z');"
+    ))?;
+    store.submit_command(cancel_run(1)).await?;
+    let refused = store
+        .cancel_pass(super::CancelPass {
+            attempt_id: "A1".to_owned(),
+            sent: Vec::new(),
+            end: crate::cancel::PassEnd::Empty,
+            at: parse_rfc3339("2026-11-07T00:00:05Z").ok_or("time")?,
+            workspace: None,
+        })
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(crate::persistence::PersistError::WorkspaceRecordRequired(_))
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(
+        count(
+            &path,
+            "SELECT count(*) FROM attempts WHERE attempt_id = 'A1' AND state = 'RUNNING'"
+        )?,
+        1
+    );
+    assert_eq!(
+        count(
+            &path,
+            "SELECT count(*) FROM events WHERE kind IN ('cancel.reaped', 'attempt.workspace')"
+        )?,
+        0
+    );
+    let clock = Arc::new(FakeClock(Mutex::new(Duration::ZERO)));
+    let advance = clock.clone();
+    let wait: Arc<dyn Fn(Duration) + Send + Sync> = Arc::new(move |d| {
+        if let Ok(mut at) = advance.0.lock() {
+            *at += d;
+        }
+    });
+    let records = Arc::new(Mutex::new(0));
+    let processes: Arc<dyn Processes> = Arc::new(Counted {
+        fake: Fake {
+            clock: clock.clone(),
+            state: Arc::new(Mutex::new((None, Vec::new()))),
+        },
+        also: None,
+        records: records.clone(),
+    });
+    let canceller = Canceller::new(GRACES, Duration::from_secs(1));
+    let mut steps = 0;
+    while canceller
+        .step(&store, "R", processes.clone(), clock.clone(), wait.clone())
+        .await?
+        != Finished::Cancelled
+    {
+        steps += 1;
+        if steps > 20 {
+            return Err("never cancelled".into());
+        }
+    }
+    let conn = Connection::open(&path)?;
+    let (recorded, attempt): (i64, String) = conn.query_row(
+        "SELECT seq, payload_json FROM events WHERE kind = 'attempt.workspace' \
+         AND json_extract(payload_json, '$.attempt_id') = 'A1'",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let attempt: Value = serde_json::from_str(&attempt)?;
+    assert_eq!(attempt["to"], "CANCELLED", "{attempt}");
+    assert_eq!(attempt["workspace"]["workspace_sha256"], "record-1");
+    let reaped = count(&path, "SELECT seq FROM events WHERE kind = 'cancel.reaped'")?;
+    assert!(recorded < reaped, "{recorded} {reaped}");
+    let run: Value = serde_json::from_str(&conn.query_row(
+        "SELECT payload_json FROM events WHERE kind = 'cancel.workspace'",
+        [],
+        |r| r.get::<_, String>(0),
+    )?)?;
+    assert_eq!(run["workspace_sha256"], "record-1", "{run}");
+    assert_eq!(records.lock().map(|n| *n).unwrap_or(0), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_run_record_is_taken_again_when_a_pass_came_after_the_writers() -> R {
+    // Decision 9 of docs/adr/ADR-024.md: the run's record reuses the writer's only when no pass came after the one
+    // that took it. Here reader A3's group ends with A1's, its pass right after A1's in the same step: the run's record
+    // is taken again, after both.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(&format!(
+        "{WORLD}
+         UPDATE tasks SET writer = 1 WHERE task_id IN ('T1', 'T2');
+         INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, created_seq, cost_estimate) VALUES
+           ('T3', 'R', 's1', 'RUNNING', 3, 'qa', 3, 1);
+         INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, pid, started_at) VALUES
+           ('A3', 'T3', 'RUNNING', 1, 1, 1, 4343, '2026-11-07T00:00:00Z');
+         INSERT INTO leases(project_id, kind, attempt_id, epoch, expires_at) VALUES
+           ('p1', 'writer', 'A1', 1, '2026-11-07T00:02:00Z'), ('p1', 'reader-1', 'A3', 1, '2026-11-07T00:02:00Z');"
+    ))?;
+    store.submit_command(cancel_run(1)).await?;
+    let clock = Arc::new(FakeClock(Mutex::new(Duration::ZERO)));
+    let advance = clock.clone();
+    let wait: Arc<dyn Fn(Duration) + Send + Sync> = Arc::new(move |d| {
+        if let Ok(mut at) = advance.0.lock() {
+            *at += d;
+        }
+    });
+    let records = Arc::new(Mutex::new(0));
+    let processes: Arc<dyn Processes> = Arc::new(Counted {
+        fake: Fake {
+            clock: clock.clone(),
+            state: Arc::new(Mutex::new((None, Vec::new()))),
+        },
+        also: Some("A3"),
+        records: records.clone(),
+    });
+    let canceller = Canceller::new(GRACES, Duration::from_secs(1));
+    let mut steps = 0;
+    while canceller
+        .step(&store, "R", processes.clone(), clock.clone(), wait.clone())
+        .await?
+        != Finished::Cancelled
+    {
+        steps += 1;
+        if steps > 20 {
+            return Err("never cancelled".into());
+        }
+    }
+    let conn = Connection::open(&path)?;
+    let order: Vec<String> = conn
+        .prepare(
+            "SELECT json_extract(payload_json, '$.attempt_id') FROM events WHERE kind = 'cancel.reaped' ORDER BY seq",
+        )?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    assert_eq!(
+        order,
+        ["A1", "A3"],
+        "the reader's pass came after the writer's"
+    );
+    let attempt: Value = serde_json::from_str(&conn.query_row(
+        "SELECT payload_json FROM events WHERE kind = 'attempt.workspace'",
+        [],
+        |r| r.get::<_, String>(0),
+    )?)?;
+    assert_eq!(attempt["workspace"]["workspace_sha256"], "record-1");
+    let run: Value = serde_json::from_str(&conn.query_row(
+        "SELECT payload_json FROM events WHERE kind = 'cancel.workspace'",
+        [],
+        |r| r.get::<_, String>(0),
+    )?)?;
+    assert_eq!(run["workspace_sha256"], "record-2", "{run}");
+    assert_eq!(records.lock().map(|n| *n).unwrap_or(0), 2);
     Ok(())
 }

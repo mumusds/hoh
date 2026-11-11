@@ -241,10 +241,33 @@ pub(super) fn stopped(stopped: &identity::Stopped) -> Process {
     }
 }
 
-/// Reconcile the project's unfinished attempts; done before the host serves anything.
+/// `row`'s disposition and the process found applied in one transaction (`Store::reconcile_apply`), after its stop:
+/// an interrupted end of the writer lease's holder with the workspace's record of `project`, taken when the store asks
+/// for it (REQ-019 behaviour 6, docs/adr/ADR-024.md decision 9).
+pub(super) async fn apply(
+    store: &Store,
+    project: &std::path::Path,
+    row: UnfinishedRow,
+    (disposition, process): (Disposition, reconcile::Process),
+    cause: &'static str,
+    at: std::time::SystemTime,
+    draw: u32,
+) -> Result<i64, PersistError> {
+    super::control::recorded_end(project, move |workspace| {
+        let row = UnfinishedRow {
+            workspace,
+            ..row.clone()
+        };
+        store.reconcile_apply(row, disposition.clone(), process.clone(), cause, at, draw)
+    })
+    .await
+}
+
+/// Reconcile the project's unfinished attempts (in `project`); done before the host serves anything.
 pub(super) async fn run(
     store: &Store,
     project_id: &str,
+    project: &std::path::Path,
     host_epoch: i64,
     settings: &ReconcileSettings,
     clock: &dyn hoh_core::delivery::Clock,
@@ -312,16 +335,16 @@ pub(super) async fn run(
                 Disposition::UnknownEffect { .. } => "unknown_effect",
             })
             .or_default() += 1;
-        store
-            .reconcile_apply(
-                row,
-                disposition,
-                process,
-                "reconcile",
-                clock.now(),
-                jitter.draw(),
-            )
-            .await?;
+        apply(
+            store,
+            project,
+            row,
+            (disposition, process),
+            "reconcile",
+            clock.now(),
+            jitter.draw(),
+        )
+        .await?;
     }
     store
         .reconcile_completed(project_id, host_epoch, json!(counts))
@@ -499,6 +522,7 @@ mod tests {
             work_class: None,
             work_ended_at: None,
             cancel_requested: false,
+            workspace: None,
         };
         let process = end(
             Seen::Gone("no_process".to_owned()),

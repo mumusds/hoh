@@ -664,6 +664,28 @@ async fn test_043_02_a_cancel_escalates_records_the_workspace_and_only_then_is_c
         record["logs"][0]["attempt_id"],
         json!(query(&project, "SELECT attempt_id FROM attempts")?)
     );
+    // REQ-019 behaviour 6 (docs/adr/ADR-024.md decision 9): T1's attempt held the writer lease, which went only with its
+    // own record, written in its pass's end before the reap's event; that pass was the step's last, so the run's
+    // record is the same.
+    let attempt: Value = serde_json::from_str(&query(
+        &project,
+        "SELECT payload_json FROM events WHERE kind = 'attempt.workspace'",
+    )?)?;
+    assert_eq!(attempt["to"], json!("CANCELLED"), "{attempt}");
+    for field in [
+        "head",
+        "head_tree",
+        "diff_sha256",
+        "untracked_sha256",
+        "status_sha256",
+        "workspace_sha256",
+    ] {
+        assert_eq!(
+            attempt["workspace"][field], record[field],
+            "{field}: {attempt} {record}"
+        );
+    }
+    assert!(at("attempt.workspace")? < at("cancel.reaped")?);
     // The unfinished candidate is not marked verified; the tasks are CANCELLED.
     assert_eq!(
         query(

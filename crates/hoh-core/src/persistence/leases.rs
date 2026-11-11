@@ -176,6 +176,17 @@ pub(super) fn release_held_by(
     Ok(())
 }
 
+/// Whether the project's writer lease row names `attempt_id`, expired or not (docs/adr/ADR-024.md decision 9: an
+/// expired lease of a holder not ended still holds the slot).
+pub(super) fn names_writer(tx: &Transaction<'_>, attempt_id: &str) -> Result<bool, PersistError> {
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM leases WHERE kind = 'writer' AND attempt_id = ?1)",
+        params![attempt_id],
+        |r| r.get(0),
+    )
+    .map_err(sqlite_error)
+}
+
 /// A writer task's attempt may start only while it holds the unexpired writer lease (REQ-037 b2); other tasks need
 /// none here.
 pub(super) fn require_writer(

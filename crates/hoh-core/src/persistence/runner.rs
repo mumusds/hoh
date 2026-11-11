@@ -153,6 +153,10 @@ pub struct Observed {
     pub prompt: Option<PromptRecord>,
     /// The directory of its raw logs.
     pub raw_log_path: Option<String>,
+    /// The workspace's record, taken once its processes were proven gone: its end needs it when it is an interrupted end
+    /// of the writer lease's holder, and the store asks for it then (REQ-019 behaviour 6, docs/adr/ADR-024.md decision
+    /// 9).
+    pub workspace: Option<serde_json::Value>,
 }
 
 /// Where a turn's prompt came from and what was sent (decision 11, AC-018-05): a `prompt_revisions` row (the role
@@ -638,6 +642,7 @@ fn finished(
             facts: AttemptFacts {
                 ended_at: Some(crate::time::rfc3339_utc(ending.at)),
                 failure_reason: (!success).then(|| ending.detail.clone()),
+                workspace: ending.observed.workspace.clone(),
                 resolved_model: ending.observed.resolved_model.clone(),
                 usage: ending.observed.usage.clone(),
                 raw_log_path: ending.observed.raw_log_path.clone(),

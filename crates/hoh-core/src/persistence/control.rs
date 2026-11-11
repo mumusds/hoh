@@ -22,6 +22,9 @@ pub struct CancelPass {
     pub end: PassEnd,
     /// When the pass ended.
     pub at: SystemTime,
+    /// The workspace's record, taken after the pass found the group empty: a pass that ends the writer lease's RUNNING
+    /// holder needs it (REQ-019 behaviour 6, docs/adr/ADR-024.md decision 9); `None` until the store asks for it.
+    pub workspace: Option<Value>,
 }
 
 /// What [`finish_cancel`] came to.
@@ -308,6 +311,7 @@ fn record_pass(
                 to: AttemptState::Cancelled,
                 facts: AttemptFacts {
                     ended_at: Some(rfc3339_utc(pass.at)),
+                    workspace: pass.workspace.clone(),
                     ..AttemptFacts::default()
                 },
             },

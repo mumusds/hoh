@@ -778,20 +778,24 @@ async fn attempt(
         return Ok(());
     }
     hooks.runner(RunnerPoint::AfterEffectCommitted);
-    store
-        .runner_finished(
-            &id,
-            Ending {
-                success: outcome.success,
-                detail: outcome.detail.clone(),
-                class: outcome.class,
-                at: ended,
-                draw: common.jitter.draw(),
-                observed: outcome.observed.clone(),
-                unknown_effect: unknown,
-            },
-        )
-        .await?;
+    let ending = Ending {
+        success: outcome.success,
+        detail: outcome.detail.clone(),
+        class: outcome.class,
+        at: ended,
+        draw: common.jitter.draw(),
+        observed: outcome.observed.clone(),
+        unknown_effect: unknown,
+    };
+    // An interrupted writer's end goes with its workspace's record (REQ-019 behaviour 6, docs/adr/ADR-024.md
+    // decision 9), its processes proven gone above.
+    let id = id.as_str();
+    super::control::recorded_end(&common.shared.root, move |workspace| {
+        let mut ending = ending.clone();
+        ending.observed.workspace = workspace;
+        store.runner_finished(id, ending)
+    })
+    .await?;
     Ok(())
 }
 
@@ -947,15 +951,15 @@ async fn settle(
         lease_expired: cause == "lease_expired" || row.lease_expired,
         work_outcome: row.work_outcome,
     });
-    store
-        .reconcile_apply(
-            row,
-            disposition.clone(),
-            process,
-            cause,
-            common.clock.now(),
-            common.jitter.draw(),
-        )
-        .await?;
+    super::reconcile::apply(
+        store,
+        &common.shared.root,
+        row,
+        (disposition.clone(), process),
+        cause,
+        common.clock.now(),
+        common.jitter.draw(),
+    )
+    .await?;
     Ok(Some((disposition, finding)))
 }
