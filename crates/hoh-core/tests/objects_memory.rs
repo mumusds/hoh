@@ -2,6 +2,10 @@
 //! checks the object by hashing it in pieces: the process's peak memory does not grow with the log's size. A test
 //! binary of its own, so its peak (VmHWM) is this test's.
 
+// No SQLite outside hoh-core::persistence (AC-062-05; see clippy.toml), and no unsafe code (no FFI way around it).
+#![forbid(clippy::disallowed_methods)]
+#![forbid(unsafe_code)]
+
 type R = Result<(), Box<dyn std::error::Error>>;
 
 /// The process's peak resident memory, in KiB.
