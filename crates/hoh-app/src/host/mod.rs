@@ -116,6 +116,18 @@ impl HostConfig {
         gate: std::path::PathBuf,
         path: std::ffi::OsString,
     ) -> HostConfig {
+        HostConfig::product_with(project, config, gate, Arc::new(agents::Registry::new(path)))
+    }
+
+    /// The product's host as [`HostConfig::product`], its agents those of `registry` (tests give one whose pi settings
+    /// are their own, M2T17R-59).
+    #[doc(hidden)]
+    pub fn product_with(
+        project: &Path,
+        config: hoh_core::config::Config,
+        gate: std::path::PathBuf,
+        registry: Arc<agents::Registry>,
+    ) -> HostConfig {
         let mut host = HostConfig::new(project);
         let execution = &config.execution;
         let graces = (
@@ -134,7 +146,7 @@ impl HostConfig {
         };
         host.runner = Some(RunnerConfig {
             executor: Arc::new(product::ProductExecutor::new(
-                Arc::new(agents::Registry::new(path)),
+                registry,
                 project.to_path_buf(),
                 gate,
                 graces,

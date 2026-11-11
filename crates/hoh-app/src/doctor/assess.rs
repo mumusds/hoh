@@ -83,7 +83,7 @@ pub fn unfinished(what: &str, e: &ProbeError) -> Option<String> {
 
 /// Run the agent's status command; the conclusion and, if it is not clear, why.
 pub(super) fn auth(agent: Agent, launcher: &Path, env: &ProbeEnv) -> (Auth, Option<String>) {
-    match login::status(agent, launcher, env) {
+    match login::status(agent, launcher, env, login::pi_agent_dir().as_deref()) {
         Ok((out, provider)) => match conclusion(agent, &out) {
             Some(Auth::Missing) => (Auth::Missing, Some(login::hint(agent, provider.as_deref()))),
             Some(found) => (found, None),

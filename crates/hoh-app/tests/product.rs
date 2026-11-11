@@ -101,11 +101,16 @@ impl World {
             self.bin().display(),
             self.dir.path().join("tools").display()
         );
-        let mut config = HostConfig::product(
+        // pi's settings from a directory of the world's own, never the user's ~/.pi/agent (M2T17R-59).
+        let registry = hoh_app::host::agents::Registry::with_pi_dir(
+            path.into(),
+            Some(self.dir.path().join("pi-agent")),
+        );
+        let mut config = HostConfig::product_with(
             &self.project(),
             effective,
             env!("CARGO_BIN_EXE_hoh").into(),
-            path.into(),
+            std::sync::Arc::new(registry),
         );
         config.port = 0;
         config.store.wal_probe = Some(probe());
