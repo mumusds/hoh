@@ -565,7 +565,7 @@ fn untracked_content(path: &Path, deadline: Instant) -> String {
 /// them; read-only, nothing reset, cleaned or removed. A directory that is not a git work tree, or a git that fails,
 /// is recorded as such. The untracked files' contents are hashed within [`UNTRACKED_BUDGET`]: the ones left are
 /// recorded by size and modification time, and `untracked_unhashed` counts them.
-pub(super) fn workspace(project: &Path) -> Value {
+pub(crate) fn workspace(project: &Path) -> Value {
     workspace_within(project, UNTRACKED_BUDGET)
 }
 

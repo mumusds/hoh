@@ -428,6 +428,7 @@ pub enum Reason {
     RecordDirOverlap,
     LiveSessionsUnbound,
     LiveSessionsMissing,
+    ResultLineInvalid,
     CheckNotInPolicy,
     PlanModeNotPolicy,
     ProducerMismatch,
@@ -465,6 +466,7 @@ impl Reason {
             Reason::RecordDirOverlap => "RECORD_DIR_OVERLAP",
             Reason::LiveSessionsUnbound => "LIVE_SESSIONS_UNBOUND",
             Reason::LiveSessionsMissing => "LIVE_SESSIONS_MISSING",
+            Reason::ResultLineInvalid => "RESULT_LINE_INVALID",
             Reason::CheckNotInPolicy => "CHECK_NOT_IN_POLICY",
             Reason::PlanModeNotPolicy => "PLAN_MODE_NOT_POLICY",
             Reason::ProducerMismatch => "PRODUCER_MISMATCH",
@@ -493,12 +495,66 @@ fn claims_success(r: &Record) -> bool {
     r.exit_code == 0 && !r.timed_out
 }
 
+/// The record's interval in seconds, when its times parse and do not run backwards.
+fn interval(r: &Record) -> Option<f64> {
+    let seconds = |t: &str| {
+        crate::time::parse_rfc3339_millis(t)
+            .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs_f64())
+    };
+    let (start, end) = seconds(&r.started_at).zip(seconds(&r.finished_at))?;
+    (end >= start).then_some(end - start)
+}
+
+/// Whether the recorded duration agrees with the interval: within max(5 s, 1 %), as tools/release_gate.py has it.
+fn duration_agrees(r: &Record) -> bool {
+    interval(r)
+        .is_some_and(|elapsed| (elapsed - r.duration_seconds).abs() <= (elapsed * 0.01).max(5.0))
+}
+
 /// The live-sessions document of a live record, if it lists one among its artifacts.
 fn sessions_of(r: &Record, world: &dyn Lookup) -> Option<Option<Value>> {
     r.artifacts
         .iter()
         .find(|a| a.name == "live-sessions.json")
         .map(|a| world.live_sessions(&a.path))
+}
+
+/// Whether `v` has contracts/test-result.schema.json's shape (rule 1): the in-crate validator is not used for the
+/// same reason as the record's; an observation naming an `artifact` is not a result line (decision 8).
+fn result_line(v: &Value) -> bool {
+    let Some(o) = v.as_object() else {
+        return false;
+    };
+    let known = [
+        "schema_version",
+        "test_id",
+        "name",
+        "status",
+        "duration_ms",
+        "detail",
+    ];
+    let test_id = v["test_id"].as_str().is_some_and(|t| {
+        let b = t.as_bytes();
+        // ^TEST-[0-9]{3}-[0-9]{2}$
+        b.len() == 11
+            && t.starts_with("TEST-")
+            && b[8] == b'-'
+            && b[5..8].iter().chain(&b[9..11]).all(u8::is_ascii_digit)
+    });
+    o.keys().all(|k| known.contains(&k.as_str()))
+        && v["schema_version"] == "1.0"
+        && test_id
+        && v["name"]
+            .as_str()
+            .is_some_and(|n| !n.is_empty() && n.chars().count() <= 512)
+        && ["PASS", "FAIL", "DEGRADED", "SKIPPED"]
+            .contains(&v["status"].as_str().unwrap_or_default())
+        && (v
+            .get("duration_ms")
+            .is_none_or(|d| d.is_null() || d.as_u64().is_some()))
+        && v.get("detail")
+            .is_none_or(|d| d.as_str().is_some_and(|t| t.chars().count() <= 4096))
 }
 
 /// Whether `v` has contracts/live-session.schema.json's shape and binds check `check` and candidate `candidate`.
@@ -561,22 +617,11 @@ pub fn valid(e: &Evidence, c: &Sealed, s: &str, world: &dyn Lookup) -> Result<()
             );
         }
     }
-    let seconds = |t: &str| {
-        crate::time::parse_rfc3339_millis(t)
-            .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs_f64())
-    };
-    match seconds(&r.started_at).zip(seconds(&r.finished_at)) {
-        Some((start, end)) if end >= start => {
-            // tools/release_gate.py: the recorded duration within max(5 s, 1 %) of the interval; run_check records 0
-            // for an interrupted run, which claims nothing (M2T10D-502).
-            let elapsed = end - start;
-            need(
-                !success || (elapsed - r.duration_seconds).abs() <= (elapsed * 0.01).max(5.0),
-                Reason::DurationMismatch,
-            );
-        }
-        _ => need(false, Reason::IntervalInvalid),
+    match interval(r) {
+        // tools/release_gate.py: the recorded duration within max(5 s, 1 %) of the interval; run_check records 0
+        // for an interrupted run, which claims nothing (M2T10D-502).
+        Some(_) => need(!success || duration_agrees(r), Reason::DurationMismatch),
+        None => need(false, Reason::IntervalInvalid),
     }
     need(r.source_unchanged, Reason::SourceChanged);
     let holds = |f: &str, sha: &str| world.sha256_of(f).as_deref() == Some(sha);
@@ -595,6 +640,13 @@ pub fn valid(e: &Evidence, c: &Sealed, s: &str, world: &dyn Lookup) -> Result<()
     need(
         !success || !e.observations.is_empty(),
         Reason::NoObservations,
+    );
+    need(
+        e.observations
+            .iter()
+            .filter(|o| o.get("artifact").is_none())
+            .all(result_line),
+        Reason::ResultLineInvalid,
     );
     need(
         r.artifacts.iter().all(|a| holds(&a.path, &a.sha256)),
@@ -722,8 +774,8 @@ pub struct Outcome {
 /// The outcome of evidence `e` whose validity is `verdict` (docs/adr/ADR-027.md principle one, the outcome function):
 /// the first that holds of (1) vetoed → INVALID; (2) timed out → FAIL; (3) a compliant degradation of complete
 /// evidence → DEGRADED whatever its exit code; (4) a check requiring plugins whose Pi sessions do not all list them →
-/// FAIL; (5) exit 0 → PASS; (6) exit 3 → BLOCKED; (7) FAIL. Complete evidence has no artifact missing and, for a live
-/// check, its bound sessions (M2T10D-500, -501).
+/// FAIL; (5) exit 0 → PASS; (6) exit 3 → BLOCKED; (7) FAIL. Complete evidence has no artifact missing, a duration that
+/// agrees with its interval and, for a live check, its bound sessions (M2T10D-500, -501, -600).
 pub fn outcome(e: &Evidence, verdict: &Result<(), Invalid>, world: &dyn Lookup) -> Outcome {
     let r = &e.record;
     let of = |status, reason| Outcome { status, reason };
@@ -743,7 +795,11 @@ pub fn outcome(e: &Evidence, verdict: &Result<(), Invalid>, world: &dyn Lookup) 
     } else {
         None
     };
-    let complete = r.missing_artifacts.is_empty() && (r.mode != "live" || sessions.is_some());
+    // Complete evidence: no artifact missing, a live check's bound sessions, a duration that agrees with its interval
+    // (M2T10D-500, -501, -600).
+    let complete = r.missing_artifacts.is_empty()
+        && (r.mode != "live" || sessions.is_some())
+        && duration_agrees(r);
     // A compliant degradation (rule 14): a degradable check, at least one DEGRADED line, each with its basis, and no
     // FAIL line; SKIPPED lines leave their TESTs without a conclusion, as the gate judges each AC (M2T10D-551).
     let compliant = policy.as_ref().is_some_and(|p| p.degradable)
@@ -828,6 +884,34 @@ pub fn conclude(
     } else {
         None
     }
+}
+
+/// An acceptance criterion of the run's spec as the rows need it: its declared TEST, its scenario check, and whether
+/// its requirement may degrade.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcSpec {
+    pub ac_id: String,
+    pub test_id: String,
+    pub check_id: String,
+    pub degradable: bool,
+}
+
+/// The acceptance rows of evidence `e` of outcome `outcome` on the spec's criteria `acs`, `check` when the policy lets
+/// its check degrade (docs/adr/ADR-027.md decision 9).
+pub fn rows(e: &Evidence, outcome: &Outcome, acs: &[AcSpec], check: bool) -> Vec<(String, Status)> {
+    let checked = &e.record.check_id;
+    let named = |test: &str| e.observations.iter().any(|o| o["test_id"] == test);
+    acs.iter()
+        .filter_map(|ac| {
+            let scenario = &ac.check_id == checked;
+            let status = if outcome.status == Status::Invalid {
+                (scenario || named(&ac.test_id)).then_some(Status::Invalid)
+            } else {
+                conclude(e, outcome, &ac.test_id, scenario, ac.degradable, check)
+            };
+            status.map(|s| (ac.ac_id.clone(), s))
+        })
+        .collect()
 }
 
 #[cfg(test)]

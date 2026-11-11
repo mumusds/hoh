@@ -5,10 +5,11 @@
 #![forbid(clippy::disallowed_methods)]
 #![forbid(unsafe_code)]
 
-use hoh_app::verify::check::{CheckError, Request, pre_check};
+use hoh_app::verify::check::{CheckError, Ran, Request, pre_check, run};
 use hoh_app::verify::freeze::{FreezeError, Inputs, freeze};
 use hoh_core::persistence::selftest::{PROBE_ARG, ProbeCommand};
 use hoh_core::persistence::{Frozen, Options, Store};
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -49,8 +50,19 @@ fn probe() -> ProbeCommand {
 
 /// The fixture's frozen check plan: `unit` runs in the product, `pack` is a bundle check the product refuses.
 const PLAN: &str = r#"{"schema_version": "1.0", "plan_id": "fixture", "checks": {
-  "unit": {"mode": "product", "argv": ["bash", "-c", "touch sentinel"]},
+  "unit": {"mode": "product", "argv": ["bash", "-c", "touch ../sentinel"]},
+  "qa": {"mode": "product", "argv": ["bash", "qa.sh"], "artifacts": ["test-results.jsonl"], "timeout_seconds": 60},
+  "slow": {"mode": "product", "argv": ["bash", "-c", "sleep 30"], "artifacts": ["test-results.jsonl"],
+           "timeout_seconds": 1},
   "pack": {"mode": "bundle", "argv": ["true"]}}}
+"#;
+
+/// The fixture's specification: REQ-001 with AC-001-01, whose TEST is TEST-001-01.
+const SPEC: &str = r#"{"requirements": [{"id": "REQ-001", "acceptance": [{"id": "AC-001-01", "test_id": "TEST-001-01"}]}]}
+"#;
+
+/// The fixture's qa check: one passing result for TEST-001-01.
+const QA_PASSES: &str = r#"printf '%s\n' '{"schema_version": "1.0", "test_id": "TEST-001-01", "name": "test_001_01_works", "status": "PASS"}' > "$HOH_EVIDENCE_DIR/test-results.jsonl"
 "#;
 
 /// A clean repository with three committed sources and its spec, environment and test plan files (AC-052-01's
@@ -63,16 +75,23 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> R<Fixture> {
+        Fixture::with_qa(QA_PASSES).await
+    }
+
+    /// The fixture with `qa` as its committed qa.sh.
+    async fn with_qa(qa: &str) -> R<Fixture> {
         let dir = tempfile::tempdir()?;
-        let root = dir.path();
+        let root = &dir.path().join("repo");
+        std::fs::create_dir_all(root)?;
         git(root, &["init", "-q"])?;
         for (path, text) in [
-            ("src/a.rs", "pub fn a() {}\n"),
+            ("src/lib.rs", "pub fn a() {}\n"),
             ("src/b.rs", "pub fn b() {}\n"),
             ("src/c.rs", "pub fn c() {}\n"),
-            ("contracts/requirements.json", "{\"requirements\": []}\n"),
+            ("contracts/requirements.json", SPEC),
             ("environment.json", "{\"os\": \"linux\"}\n"),
             ("tests/check-plan.json", PLAN),
+            ("qa.sh", qa),
         ] {
             let file = root.join(path);
             std::fs::create_dir_all(file.parent().ok_or("no parent")?)?;
@@ -100,16 +119,21 @@ impl Fixture {
         })
     }
 
-    fn root(&self) -> &Path {
-        self.dir.path()
+    fn root(&self) -> PathBuf {
+        self.dir.path().join("repo")
     }
 
     fn state(&self) -> PathBuf {
-        self.dir.path().join(".hoh")
+        self.root().join(".hoh")
+    }
+
+    /// Where the `unit` check's command leaves its mark: outside the checkout, so it changes nothing there.
+    fn sentinel(&self) -> PathBuf {
+        self.dir.path().join("sentinel")
     }
 
     async fn freeze(&self, run: &str) -> Result<Frozen, FreezeError> {
-        freeze(&self.store, self.root(), &self.state(), run, &self.inputs).await
+        freeze(&self.store, &self.root(), &self.state(), run, &self.inputs).await
     }
 
     /// Every candidate row as `id run state`, by Python's sqlite3 (test code: the product writes only in
@@ -174,7 +198,7 @@ impl Fixture {
         let reader = self.store.reader()?;
         Ok(pre_check(
             &reader,
-            self.root(),
+            &self.root(),
             &self.state(),
             &Request {
                 candidate_id: candidate_id.to_owned(),
@@ -186,7 +210,7 @@ impl Fixture {
     }
 }
 
-const ARGV: &[&str] = &["bash", "-c", "touch sentinel"];
+const ARGV: &[&str] = &["bash", "-c", "touch ../sentinel"];
 
 /// The new candidate's id of a freeze.
 fn new_id(frozen: Frozen) -> R<String> {
@@ -290,11 +314,11 @@ async fn every_difference_from_the_frozen_candidate_is_named_before_anything_run
             "a new commit",
             |f| {
                 std::fs::write(
-                    f.root().join("src/a.rs"),
+                    f.root().join("src/lib.rs"),
                     "pub fn a() { 1; }
 ",
                 )?;
-                git(f.root(), &["commit", "-q", "-am", "next"])?;
+                git(&f.root(), &["commit", "-q", "-am", "next"])?;
                 Ok(())
             },
             "unit",
@@ -336,7 +360,7 @@ async fn every_difference_from_the_frozen_candidate_is_named_before_anything_run
             "a source changed under assume-unchanged",
             |f| {
                 git(
-                    f.root(),
+                    &f.root(),
                     &["update-index", "--assume-unchanged", "src/b.rs"],
                 )?;
                 Ok(std::fs::write(
@@ -361,7 +385,7 @@ async fn every_difference_from_the_frozen_candidate_is_named_before_anything_run
             reasons.iter().any(|r| r.contains(named)),
             "{case}: {reasons:?}"
         );
-        assert!(!f.root().join("sentinel").exists(), "{case}");
+        assert!(!f.sentinel().exists(), "{case}");
     }
     // An environment under .hoh/ changed after the freeze (failure mode 3).
     let mut f = Fixture::new().await?;
@@ -503,12 +527,12 @@ async fn hidden_changes_links_and_submodules_are_refused_by_name() -> R {
         ("uncommitted change", "dirty"),
     ] {
         let f = Fixture::new().await?;
-        let root = f.root();
+        let root = &f.root();
         let named = match setup {
             "assume" => {
-                git(root, &["update-index", "--assume-unchanged", "src/a.rs"])?;
-                std::fs::write(root.join("src/a.rs"), "pub fn a() { changed() }\n")?;
-                "src/a.rs"
+                git(root, &["update-index", "--assume-unchanged", "src/lib.rs"])?;
+                std::fs::write(root.join("src/lib.rs"), "pub fn a() { changed() }\n")?;
+                "src/lib.rs"
             }
             "skip" => {
                 git(root, &["update-index", "--skip-worktree", "src/b.rs"])?;
@@ -556,8 +580,8 @@ async fn hohs_own_state_must_be_ignored_and_untracked_and_its_environment_may_li
     // refused by name; an environment description under .hoh/ (ignored, not tracked) is bound by its digest.
     let f = Fixture::new().await?;
     std::fs::write(f.state().join("host.json"), "{}\n")?;
-    git(f.root(), &["add", "-f", ".hoh/host.json"])?;
-    git(f.root(), &["commit", "-q", "-m", "tracked state"])?;
+    git(&f.root(), &["add", "-f", ".hoh/host.json"])?;
+    git(&f.root(), &["commit", "-q", "-m", "tracked state"])?;
     let reasons = refused(f.freeze("R").await)?;
     assert!(
         reasons.iter().any(|r| r.contains(".hoh/host.json")),
@@ -618,5 +642,244 @@ async fn the_same_content_for_another_run_is_refused_by_the_store() -> R {
         matches!(&other, Err(FreezeError::Store(e)) if e.to_string().contains("new commit")),
         "{other:?}"
     );
+    Ok(())
+}
+
+impl Fixture {
+    /// The run's spec as the store knows it: the fixture spec's digest, REQ-001 and its AC-001-01, scenario-checked by
+    /// qa.
+    fn seed_spec(&self) -> R {
+        let (sha, _) =
+            hoh_core::objects::hash_file(&self.root().join("contracts/requirements.json"))?;
+        self.seed(&format!(
+            "UPDATE specs SET sha256 = '{sha}' WHERE spec_id = (SELECT spec_id FROM runs WHERE run_id = 'R');
+             INSERT INTO requirements(requirement_id, spec_id, title, required_release)
+               SELECT 'REQ-001', spec_id, 'one', 1 FROM runs WHERE run_id = 'R';
+             INSERT INTO acceptance_criteria(ac_id, requirement_id, spec_id, body, check_id)
+               SELECT 'AC-001-01', 'REQ-001', spec_id, 'it works', 'qa' FROM runs WHERE run_id = 'R';"
+        ))
+    }
+
+    /// One text column of `sql` over the project's database, by Python's sqlite3.
+    fn query(&self, sql: &str) -> R<Vec<String>> {
+        let out = Command::new("python3")
+            .args([
+                "-c",
+                "import sqlite3,sys\n\
+                 c=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True)\n\
+                 for r in c.execute(sys.argv[2]):print(r[0])",
+            ])
+            .arg(self.state().join("state.db"))
+            .arg(sql)
+            .output()?;
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).into_owned().into());
+        }
+        Ok(String::from_utf8(out.stdout)?
+            .lines()
+            .map(str::to_owned)
+            .collect())
+    }
+
+    /// A frozen candidate of run R with its qa attempt and spec seeded.
+    async fn frozen(&self) -> R<String> {
+        self.seed_attempts()?;
+        self.seed_spec()?;
+        new_id(self.freeze("R").await?)
+    }
+
+    async fn run(&self, candidate: &str, check: &str, argv: &[&str]) -> Result<Ran, CheckError> {
+        run(
+            &self.store,
+            &self.root(),
+            &self.state(),
+            &Request {
+                candidate_id: candidate.to_owned(),
+                check_id: check.to_owned(),
+                argv: argv.iter().map(|a| (*a).to_owned()).collect(),
+                producer_attempt_id: "Q/attempt-1".to_owned(),
+            },
+        )
+        .await
+    }
+
+    /// The record a run wrote.
+    fn record(&self, ran: &Ran) -> R<Value> {
+        Ok(serde_json::from_slice(&std::fs::read(
+            ran.record_dir.join("execution.json"),
+        )?)?)
+    }
+}
+
+const QA: &[&str] = &["bash", "qa.sh"];
+
+#[tokio::test]
+async fn test_052_02_a_check_that_changes_the_source_is_invalid_even_when_it_exits_zero() -> R {
+    // AC-052-02 (REQ-052 behaviour 5, failure mode 2; docs/adr/ADR-027.md decisions 6, 7, 9, 12): the positive control
+    // in a repository and database of its own (M2T10D-158) gives valid evidence and a PASS row; a qa check that
+    // rewrites src/lib.rs (variant: creates an untracked file) and exits 0 gives a record with exit_code 0 and
+    // source_unchanged false, evidence INVALID, no PASS row for C, an integrity event, and a vetoed candidate.
+    let control = Fixture::new().await?;
+    let c0 = control.frozen().await?;
+    let ran = control
+        .run(&c0, "qa", QA)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let record = control.record(&ran)?;
+    assert_eq!(
+        (
+            record["exit_code"].as_i64(),
+            record["source_unchanged"].as_bool()
+        ),
+        (Some(0), Some(true))
+    );
+    // The record the product wrote is valid under the locked execution.schema.json (docs/adr/ADR-027.md decision 8,
+    // M2T10D-255), by Python's jsonschema.
+    let script = "import json,sys\nimport jsonschema\n\
+        schema = json.load(open(sys.argv[1] + '/contracts/execution.schema.json'))\n\
+        jsonschema.validate(json.load(open(sys.argv[2])), schema, format_checker=jsonschema.FormatChecker())\n";
+    let out = Command::new("python3")
+        .args([
+            "-I",
+            "-c",
+            script,
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../.."),
+        ])
+        .arg(ran.record_dir.join("execution.json"))
+        .output()?;
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(ran.outcome.status.code(), "PASS", "{:?}", ran.reasons);
+    assert_eq!(control.query("SELECT outcome FROM evidence")?, ["PASS"]);
+    assert_eq!(
+        control.query("SELECT ac_id || ':' || status FROM acceptance_results")?,
+        ["AC-001-01:PASS"]
+    );
+    for (variant, script) in [
+        (
+            "rewrites src/lib.rs",
+            format!("printf 'pub fn a() {{ 1; }}\\n' > src/lib.rs\n{QA_PASSES}"),
+        ),
+        (
+            "creates an untracked file",
+            format!("touch new.rs\n{QA_PASSES}"),
+        ),
+    ] {
+        let f = Fixture::with_qa(&script).await?;
+        let c = f.frozen().await?;
+        let ran = f
+            .run(&c, "qa", QA)
+            .await
+            .map_err(|e| format!("{variant}: {e:?}"))?;
+        let record = f.record(&ran)?;
+        assert_eq!(record["exit_code"], 0, "{variant}");
+        assert_eq!(record["source_unchanged"], false, "{variant}");
+        assert_eq!(ran.outcome.status.code(), "INVALID", "{variant}");
+        assert!(
+            ran.reasons.contains(&"SOURCE_CHANGED"),
+            "{variant}: {:?}",
+            ran.reasons
+        );
+        assert_eq!(
+            f.query("SELECT outcome FROM evidence")?,
+            ["INVALID"],
+            "{variant}"
+        );
+        let rows = f.query(&format!(
+            "SELECT status FROM acceptance_results WHERE candidate_id = '{c}'"
+        ))?;
+        assert!(
+            !rows.is_empty() && !rows.iter().any(|r| r == "PASS"),
+            "{variant}: {rows:?}"
+        );
+        assert_eq!(
+            f.query("SELECT state FROM candidates")?,
+            ["INVALID"],
+            "{variant}"
+        );
+        assert_eq!(
+            f.query("SELECT count(*) FROM events WHERE kind = 'integrity_violation'")?,
+            ["1"],
+            "{variant}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_052_03_a_check_that_differs_from_its_frozen_candidate_never_runs() -> R {
+    // AC-052-03 (REQ-052 behaviour 4, failure mode 6; docs/adr/ADR-027.md decisions 6 and 12): the positive control
+    // runs the sentinel check on the clean candidate and the sentinel appears; with the test plan changed by a byte, or
+    // with argv not the plan's, the check is refused before it runs: no sentinel, no record.
+    let control = Fixture::new().await?;
+    let c0 = control.frozen().await?;
+    control
+        .run(&c0, "unit", ARGV)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert!(control.sentinel().exists(), "the control ran its command");
+    for (variant, plan_byte, argv, named) in [
+        ("test plan changed by a byte", true, ARGV, "test_plan"),
+        (
+            "argv not the plan's",
+            false,
+            &["bash", "-c", "touch ../sentinel; true"][..],
+            "argv differs from the frozen plan",
+        ),
+    ] {
+        let f = Fixture::new().await?;
+        let c = f.frozen().await?;
+        if plan_byte {
+            let plan = f.root().join("tests/check-plan.json");
+            let mut text = std::fs::read_to_string(&plan)?;
+            text.push(' ');
+            std::fs::write(plan, text)?;
+        }
+        let refused = f.run(&c, "unit", argv).await;
+        let Err(CheckError::Refused(reasons)) = refused else {
+            return Err(format!("{variant}: not refused: {refused:?}").into());
+        };
+        assert!(
+            reasons.iter().any(|r| r.contains(named)),
+            "{variant}: {reasons:?}"
+        );
+        assert!(!f.sentinel().exists(), "{variant}: the command ran");
+        assert!(
+            !f.state().join("evidence").exists(),
+            "{variant}: a record was written"
+        );
+        assert!(
+            f.query("SELECT evidence_id FROM evidence")?.is_empty(),
+            "{variant}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_check_past_its_timeout_fails_without_vetoing_its_candidate() -> R {
+    // docs/adr/ADR-027.md principle one (outcome (2), rule 12 on a run that claims nothing): the record says timed out,
+    // its missing results are no veto, the evidence is FAIL (TIMED_OUT), the candidate stays FROZEN.
+    let f = Fixture::new().await?;
+    let c = f.frozen().await?;
+    let ran = f
+        .run(&c, "slow", &["bash", "-c", "sleep 30"])
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let record = f.record(&ran)?;
+    assert_eq!(record["timed_out"], true);
+    assert_eq!(
+        record["missing_artifacts"],
+        serde_json::json!(["test-results.jsonl"])
+    );
+    assert_eq!(
+        (ran.outcome.status.code(), ran.outcome.reason),
+        ("FAIL", Some("TIMED_OUT"))
+    );
+    assert!(ran.reasons.is_empty(), "{:?}", ran.reasons);
+    assert_eq!(f.query("SELECT state FROM candidates")?, ["FROZEN"]);
     Ok(())
 }

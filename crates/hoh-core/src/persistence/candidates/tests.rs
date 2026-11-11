@@ -310,3 +310,27 @@ async fn a_reader_gives_a_candidates_row_and_an_attempts_run_and_role() -> R {
     assert_eq!(reader.producer("nobody")?, None);
     Ok(())
 }
+
+#[tokio::test]
+async fn a_reader_gives_a_runs_spec_digest_and_its_acceptance_criteria() -> R {
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    Connection::open(&path)?.execute_batch(
+        "INSERT INTO requirements(requirement_id, spec_id, title, required_release, release_class) VALUES
+           ('REQ-001', 's1', 'one', 1, 'required'), ('REQ-048', 's1', 'plugins', 1, 'degradable');
+         INSERT INTO acceptance_criteria(ac_id, requirement_id, spec_id, body, check_id) VALUES
+           ('AC-001-01', 'REQ-001', 's1', 'a', 'unit'), ('AC-048-01', 'REQ-048', 's1', 'b', 'plugin-live');",
+    )?;
+    let got = store.reader()?.acceptance("R")?.ok_or("no run")?;
+    assert_eq!(got.spec_id, "s1");
+    assert_eq!(got.spec_sha256, format!("{:064}", 1));
+    assert_eq!(
+        got.criteria,
+        vec![
+            ("AC-001-01".to_owned(), "unit".to_owned(), false),
+            ("AC-048-01".to_owned(), "plugin-live".to_owned(), true)
+        ]
+    );
+    assert_eq!(store.reader()?.acceptance("NO-RUN")?, None);
+    Ok(())
+}

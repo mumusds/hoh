@@ -1229,3 +1229,70 @@ async fn a_run_with_no_cursor_starts_at_its_own_first_event() -> R {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn evidence_whose_source_changed_wakes_the_commander_in_the_step_that_sees_it() -> R {
+    // docs/adr/ADR-027.md decision 7: the integrity_violation a check's evidence writes (in the evidence's own
+    // transaction) is in the supervisor's closed set and fires in the step that takes it in.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(
+        &path,
+        &format!(
+            "{WORLD}
+             INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq) VALUES
+               ('Q', 'R', 's3', 'RUNNING', 1, 'qa', 0, 2);
+             INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision) VALUES
+               ('Q/attempt-1', 'Q', 'RUNNING', 1, 1, 1);"
+        ),
+    )?;
+    let object = |n: char| crate::persistence::ArtifactRow {
+        sha256: n.to_string().repeat(64),
+        path: format!(".hoh/objects/sha256/{n}{n}/{}", n.to_string().repeat(64)),
+        bytes: 1,
+        mime: "application/octet-stream".to_owned(),
+        kind: "artifact".to_owned(),
+        name: n.to_string(),
+    };
+    let file = |p: &str| json!({"path": p, "sha256": "a".repeat(64)});
+    let record: crate::verification::Record = serde_json::from_value(json!({
+        "schema_version": "1.1", "record_type": "command_execution", "record_id": "r1", "check_id": "unit",
+        "candidate_id": "C1", "spec_sha256": format!("{:064}", 3), "mode": "product", "command": ["true"], "cwd": ".",
+        "started_at": "2026-11-11T10:00:00Z", "finished_at": "2026-11-11T10:00:01Z", "duration_seconds": 1.0,
+        "exit_code": 0, "timed_out": false, "stdout": file("o"), "stderr": file("e"), "candidate_manifest": file("c"),
+        "source_unchanged": false, "environment_sha256": format!("{:064}", 5),
+        "test_plan_sha256": format!("{:064}", 6), "artifacts": [], "missing_artifacts": [],
+        "producer_attempt_id": "Q/attempt-1", "runner": {"tool": "hoh", "euid": 1000}
+    }))?;
+    store
+        .record_evidence(crate::persistence::Recording {
+            record,
+            record_object: object('b'),
+            objects: vec![object('c')],
+            outcome: crate::verification::Outcome {
+                status: crate::verification::Status::Invalid,
+                reason: None,
+            },
+            reasons: vec!["SOURCE_CHANGED"],
+            tree_before: json!({"head_tree": "t1"}),
+            tree_after: json!({"head_tree": "t2"}),
+            observations: Vec::new(),
+            rows: Vec::new(),
+            integrity: vec!["source changed: src/lib.rs".to_owned()],
+        })
+        .await?;
+    let seq = count(
+        &path,
+        "SELECT seq FROM events WHERE kind = 'integrity_violation' AND event_id = 'r1/integrity'",
+    )?;
+    let step = store.supervise("R", at(&clock, 1000)).await?;
+    assert_eq!(
+        step.fired
+            .iter()
+            .map(|f| f.event_seqs.clone())
+            .collect::<Vec<_>>(),
+        [vec![seq]]
+    );
+    Ok(())
+}

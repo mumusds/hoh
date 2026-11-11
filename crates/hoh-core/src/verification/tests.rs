@@ -210,7 +210,7 @@ fn e0(c: &Sealed) -> Evidence {
         },
         git_tree: m.git_tree.clone(),
         record_dir: DIR.to_owned(),
-        observations: vec![json!({"test_id": "TEST-052-04", "status": "PASS"})],
+        observations: vec![line("TEST-052-04", "PASS")],
     }
 }
 
@@ -373,7 +373,15 @@ fn every_rule_the_gate_applies_to_one_record_has_a_reason_of_its_own() -> R {
     let w0 = world0(&c, &base);
     assert_eq!(valid(&base, &c, &s, &w0), Ok(()));
     type Tamper = fn(&mut Evidence, &mut World);
-    let variants: [(&str, Tamper, Reason); 22] = [
+    let variants: [(&str, Tamper, Reason); 23] = [
+        (
+            "a result line not of the schema's shape",
+            |e, _| {
+                e.observations
+                    .push(json!({"schema_version": "1.0", "test_id": "TEST-052-04", "name": "x", "status": "MAYBE"}));
+            },
+            Reason::ResultLineInvalid,
+        ),
         (
             "stderr sha256",
             |e, _| e.record.stderr.sha256 = "0".repeat(64),
@@ -391,10 +399,7 @@ fn every_rule_the_gate_applies_to_one_record_has_a_reason_of_its_own() -> R {
         ),
         (
             "exit 0 with a failing test",
-            |e, _| {
-                e.observations
-                    .push(json!({"test_id": "TEST-052-04", "status": "FAIL"}))
-            },
+            |e, _| e.observations.push(line("TEST-052-04", "FAIL")),
             Reason::ExitInconsistent,
         ),
         (
@@ -730,6 +735,17 @@ fn the_outcome_is_the_first_of_the_ordered_rules_that_holds() -> R {
                 "DEGRADED",
                 "exit {exit} with an artifact missing"
             );
+            // A duration that disagrees with its interval: no veto for a run that claims nothing, but no
+            // degradation either (M2T10D-600).
+            let mut skewed = e.clone();
+            skewed.record.finished_at = "2026-11-11T10:00:01Z".to_owned();
+            skewed.record.duration_seconds = 200.0;
+            assert_eq!(valid(&skewed, &c, &s, &wd), Ok(()), "exit {exit} skewed");
+            assert_ne!(
+                outcome_of(&skewed, &wd).status.code(),
+                "DEGRADED",
+                "exit {exit} with its duration skewed"
+            );
         }
     }
     // SKIPPED lines beside a compliant degradation leave it DEGRADED (their TESTs conclude nothing); a FAIL line does
@@ -941,5 +957,71 @@ fn a_members_conclusion_on_a_test_is_one_function_of_its_outcome_and_lines() -> 
             "{lines:?} {status:?} scenario {scenario} requirement {requirement} check {check}"
         );
     }
+    Ok(())
+}
+
+#[test]
+fn an_evidences_rows_are_its_conclusions_on_the_specs_acceptance_criteria() -> R {
+    // docs/adr/ADR-027.md decision 9: a row per (AC, evidence) whose conclusion is not "nothing"; a vetoed evidence
+    // writes INVALID for its check's scenario ACs and the ACs its lines name, the rest of the veto being the
+    // candidate's INVALID state.
+    let c = manifest().seal();
+    let ac = |id: &str, test: &str, check: &str, degradable: bool| AcSpec {
+        ac_id: id.to_owned(),
+        test_id: test.to_owned(),
+        check_id: check.to_owned(),
+        degradable,
+    };
+    let acs = vec![
+        ac("AC-001-01", "TEST-001-01", "unit", false),
+        ac("AC-001-02", "TEST-001-02", "unit", false),
+        ac("AC-002-01", "TEST-002-01", "recovery", false),
+        ac("AC-003-01", "TEST-003-01", "integration", false),
+    ];
+    let mut e = e0(&c);
+    e.observations = vec![
+        line("TEST-001-01", "PASS"),
+        line("TEST-001-02", "SKIPPED"),
+        line("TEST-002-01", "FAIL"),
+        line("TEST-002-01", "PASS"),
+    ];
+    let pass = Outcome {
+        status: Status::Pass,
+        reason: None,
+    };
+    let codes = |rows: Vec<(String, Status)>| -> Vec<(String, &'static str)> {
+        rows.into_iter().map(|(a, s)| (a, s.code())).collect()
+    };
+    // A PASS unit run: its scenario AC with all PASS lines is PASS; a skipped one has no row; another check's AC
+    // fails on its FAIL line; an AC it says nothing of has no row.
+    assert_eq!(
+        codes(rows(&e, &pass, &acs, false)),
+        vec![
+            ("AC-001-01".to_owned(), "PASS"),
+            ("AC-002-01".to_owned(), "FAIL")
+        ]
+    );
+    // Vetoed: INVALID for unit's scenario ACs and the ACs its lines name, nothing for the others.
+    let invalid = Outcome {
+        status: Status::Invalid,
+        reason: None,
+    };
+    assert_eq!(
+        codes(rows(&e, &invalid, &acs, false)),
+        vec![
+            ("AC-001-01".to_owned(), "INVALID"),
+            ("AC-001-02".to_owned(), "INVALID"),
+            ("AC-002-01".to_owned(), "INVALID")
+        ]
+    );
+    // A blocked run writes only its failures.
+    let blocked = Outcome {
+        status: Status::Blocked,
+        reason: None,
+    };
+    assert_eq!(
+        codes(rows(&e, &blocked, &acs, false)),
+        vec![("AC-002-01".to_owned(), "FAIL")]
+    );
     Ok(())
 }
