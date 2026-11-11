@@ -351,7 +351,15 @@ pub fn pack_with(
             task: estimate(&format!(
                 "{}{}",
                 layers[Layer::Goal as usize],
-                layers[Layer::Task as usize].replacen(&format!("\n\n{}", mandatory.schemas), "", 1)
+                if mandatory.schemas.is_empty() {
+                    layers[Layer::Task as usize].clone()
+                } else {
+                    layers[Layer::Task as usize].replacen(
+                        &format!("\n\n{}", mandatory.schemas),
+                        "",
+                        1,
+                    )
+                }
             )),
             evidence: estimate(&layers[Layer::Evidence as usize]),
         },

@@ -1268,6 +1268,8 @@ struct Recorded {
     reasons: Value,
     /// The registry look its reasons stand on (null: none).
     observation: Value,
+    /// The refused turn its `context` stands on (null: none; docs/adr/ADR-026.md decision 9).
+    refused: Value,
     /// Its time (the supervisor's clock) and seq.
     at: String,
     seq: i64,
@@ -1290,6 +1292,7 @@ fn recorded(tx: &Connection, run_id: &str) -> Result<Option<Recorded>, PersistEr
             unavailable: kind == UNAVAILABLE,
             reasons: payload["reasons"].clone(),
             observation: payload["observation"].clone(),
+            refused: payload["refused_attempt"].clone(),
             at: text(&payload, "at").unwrap_or_default(),
             seq,
         })
@@ -1412,6 +1415,8 @@ pub(super) fn judge(
             !r.unavailable
                 || r.reasons != json!(reasons)
                 || (registry && r.observation["agent"] != observation["agent"])
+                // A later refusal (a probe refused again) names its own turn (M2T09R-101).
+                || r.refused != json!(verdict.refused)
         }) {
             commit.events.push(event(
                 child_id(run_id, &format!("supervisor/{number}")),

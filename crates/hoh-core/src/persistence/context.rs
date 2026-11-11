@@ -461,7 +461,14 @@ pub(super) fn verification(
         package.task_id.as_deref().unwrap_or("-"),
         package.role
     ));
-    if let Some(spec_id) = spec_id.as_deref() {
+    // Every AC the package names, whole: one missing, or a spec that cannot be found, is an error, never a context
+    // without it (M2T09R-102).
+    if !package.acceptance_ids.is_empty() {
+        let spec_id = spec_id.as_deref().ok_or_else(|| {
+            PersistError::IntegrityViolation(format!(
+                "the verification package of {run_id} names a specification this project does not have"
+            ))
+        })?;
         for id in &package.acceptance_ids {
             let body: Option<String> = conn
                 .query_row(
@@ -471,9 +478,12 @@ pub(super) fn verification(
                 )
                 .optional()
                 .map_err(sqlite_error)?;
-            if let Some(body) = body {
-                facts.acceptance.push((id.clone(), body));
-            }
+            let body = body.ok_or_else(|| {
+                PersistError::IntegrityViolation(format!(
+                    "{id} of the verification package is not in its specification"
+                ))
+            })?;
+            facts.acceptance.push((id.clone(), body));
         }
     }
     facts.acceptance.sort();

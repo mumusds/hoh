@@ -220,3 +220,23 @@ fn a_file_is_hashed_in_pieces_and_an_object_checked_without_reading_it_whole() -
     assert!(holds(&object, &sha)?);
     Ok(())
 }
+
+#[test]
+fn an_object_that_cannot_be_read_is_repaired_like_a_damaged_one() -> R {
+    // M2T09R-156: an object there that cannot even be opened is no reason to refuse the write: its name says what it
+    // must hold.
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir()?;
+    let sha = put(dir.path(), b"original")?;
+    let path = object_path(dir.path(), &sha)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))?;
+    if std::fs::read(&path).is_ok() {
+        eprintln!(
+            "skipped: this user reads mode-000 files (root), so the object cannot be made unreadable"
+        );
+        return Ok(());
+    }
+    assert_eq!(put(dir.path(), b"original")?, sha);
+    assert_eq!(get(dir.path(), &sha)?, b"original");
+    Ok(())
+}

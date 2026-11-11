@@ -789,36 +789,7 @@ async fn attempt(
     // have, from the time it ended (ADR-020 decision 1, M2T19R-03).
     let ended = common.clock.now();
     let unknown = outcome.unknown_effect;
-    let mut observed = json!({
-        "success": outcome.success,
-        "detail": outcome.detail,
-        "ended_at": hoh_core::time::rfc3339_utc(ended),
-    });
-    // A supervision turn's bridge lines, recorded as its outputs with this OBSERVED when it succeeded
-    // (docs/adr/ADR-025.md decision 8).
-    if !outcome.observed.messages.is_empty() {
-        observed["messages"] = json!(outcome.observed.messages);
-    }
-    // Its raw logs kept as objects, registered with their producer with this OBSERVED (docs/adr/ADR-026.md decision
-    // 10).
-    if !outcome.observed.artifacts_failed.is_empty() {
-        observed["artifacts_failed"] = json!(outcome.observed.artifacts_failed);
-    }
-    if !outcome.observed.artifacts.is_empty() {
-        observed["artifacts"] = json!(
-            outcome
-                .observed
-                .artifacts
-                .iter()
-                .map(hoh_core::persistence::ArtifactRow::json)
-                .collect::<Vec<_>>()
-        );
-    }
-    if let (Some(observed), Value::Object(class)) =
-        (observed.as_object_mut(), outcome.class.to_json())
-    {
-        observed.extend(class);
-    }
+    let observed = observed_detail(&outcome, ended);
     // An unknown effect has no result to record: its work effect stays STARTED, so a crash from here on settles it
     // UNKNOWN_EFFECT too.
     if !unknown
@@ -1100,4 +1071,73 @@ async fn settle(
     )
     .await?;
     Ok(Some((disposition, finding)))
+}
+
+/// A work's OBSERVED detail from its outcome: its verdict and end, its class, a supervision turn's bridge lines, and
+/// its raw logs kept as objects and those that could not be (docs/adr/ADR-025.md decision 8; docs/adr/ADR-026.md
+/// decision 10): the store registers the logs with their producer in this OBSERVED's transaction.
+fn observed_detail(outcome: &Outcome, ended: std::time::SystemTime) -> Value {
+    let mut observed = json!({
+        "success": outcome.success,
+        "detail": outcome.detail,
+        "ended_at": hoh_core::time::rfc3339_utc(ended),
+    });
+    if !outcome.observed.messages.is_empty() {
+        observed["messages"] = json!(outcome.observed.messages);
+    }
+    if !outcome.observed.artifacts_failed.is_empty() {
+        observed["artifacts_failed"] = json!(outcome.observed.artifacts_failed);
+    }
+    if !outcome.observed.artifacts.is_empty() {
+        observed["artifacts"] = json!(
+            outcome
+                .observed
+                .artifacts
+                .iter()
+                .map(hoh_core::persistence::ArtifactRow::json)
+                .collect::<Vec<_>>()
+        );
+    }
+    if let (Some(observed), Value::Object(class)) =
+        (observed.as_object_mut(), outcome.class.to_json())
+    {
+        observed.extend(class);
+    }
+    observed
+}
+
+#[cfg(test)]
+mod observed_tests {
+    use super::*;
+
+    #[test]
+    fn a_turns_kept_and_failed_logs_ride_its_observed_detail() {
+        // M2T09R-151: the glue between the executor and the OBSERVED transaction carries both.
+        let row = hoh_core::persistence::ArtifactRow {
+            sha256: "a".repeat(64),
+            path: ".hoh/attempts/A/stderr.log".to_owned(),
+            bytes: 3,
+            mime: "text/plain".to_owned(),
+            kind: "raw_log_in_place".to_owned(),
+            name: "stderr.log".to_owned(),
+        };
+        let outcome = Outcome {
+            success: true,
+            detail: "SETTLED".to_owned(),
+            group_gone: true,
+            class: FailureClass::Transient { retry_after: None },
+            observed: hoh_core::persistence::Observed {
+                artifacts: vec![row.clone()],
+                artifacts_failed: vec![
+                    json!({"name": "stdout.jsonl", "error": "Permission denied"}),
+                ],
+                ..Default::default()
+            },
+            unknown_effect: false,
+        };
+        let detail = observed_detail(&outcome, std::time::UNIX_EPOCH);
+        assert_eq!(detail["artifacts"], json!([row.json()]));
+        assert_eq!(detail["artifacts_failed"][0]["name"], "stdout.jsonl");
+        assert_eq!(detail["success"], true);
+    }
 }

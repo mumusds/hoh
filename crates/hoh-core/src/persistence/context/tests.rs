@@ -155,9 +155,14 @@ fn test_039_02_a_supervision_turn_takes_every_snapshot_tasks_acceptance() -> R {
     for id in ["- run_id：R", "- task_id：W/turn/1", "- attempt_id：A9"] {
         assert!(m.task.contains(id), "{id} missing from {}", m.task);
     }
-    assert!(m.goal.contains("唤醒 W"));
+    assert!(
+        m.goal.contains("唤醒 W") && m.goal.contains("supervisor.retrigger"),
+        "the wake's kind (-54, -159): {}",
+        m.goal
+    );
     assert!(m.schemas.contains("DecisionPayload") && m.schemas.contains("Message"));
-    // The run's state first, then the event, a TaskResult inside an event a reference only.
+    // Entries as gathered: the run's state and the event (the packer ranks the events first, -51); a TaskResult
+    // inside an event a reference only.
     let paths: Vec<&str> = facts.entries.iter().map(|e| e.path.as_str()).collect();
     assert_eq!(
         paths,
@@ -343,7 +348,8 @@ fn test_039_02_a_verification_turns_mandatory_items_come_from_its_package_and_ro
         "candidate": {"id": "CAND-7", "git_commit": format!("{:040}", 7), "git_tree": format!("{:040}", 8),
             "spec_sha256": format!("{:064}", 2), "environment_sha256": format!("{:064}", 3),
             "test_plan_sha256": format!("{:064}", 4)},
-        "acceptance_ids": ["AC-1-01", "AC-1-02"],
+        // Not T1's own: one of T1's and one of T2's, so only the package says which (M2T09R-152).
+        "acceptance_ids": ["AC-1-02", "AC-2-01"],
         "references": [{"path": crate::objects::relative_path(&sha), "sha256": sha}],
         "output_contract": "TaskResult", "budget_tokens": 20000, "handoff_kind": "verification", "state": null
     }))?;
@@ -351,11 +357,22 @@ fn test_039_02_a_verification_turns_mandatory_items_come_from_its_package_and_ro
     let m = crate::context::mandatory(&facts, "qa", "", None, None)?;
     for body in texts(
         &conn,
-        "SELECT body FROM acceptance_criteria WHERE ac_id IN ('AC-1-01', 'AC-1-02')",
+        "SELECT body FROM acceptance_criteria WHERE ac_id IN ('AC-1-02', 'AC-2-01')",
     )? {
         assert!(m.task.contains(&body), "AC text missing: {body}");
     }
-    assert!(!m.task.contains("另一任务的验收"), "only the package's AC");
+    assert!(
+        !m.task.contains("强制项逐字节出现"),
+        "T1's AC-1-01 is not in the package"
+    );
+    assert!(
+        m.task.contains(&format!("{:040}", 8)),
+        "the candidate's tree"
+    );
+    assert!(
+        m.schemas.contains("TaskResult") && m.schemas.contains("AcceptanceObservation"),
+        "qa's schemas"
+    );
     assert!(m.task.contains("CAND-7") && m.task.contains(&format!("{:040}", 7)));
     assert!(m.project.contains(&format!("{:064}", 2)));
     assert_eq!(
@@ -380,7 +397,36 @@ fn test_039_02_a_verification_turns_mandatory_items_come_from_its_package_and_ro
         facts.entries.iter().any(|e| e.text.contains(&sha)),
         "the reference listed"
     );
-    let lowest = facts.entries.iter().map(|e| e.relevance).min().unwrap_or(0);
-    assert_eq!(claim.relevance, lowest, "the claim ranks last");
+    assert!(
+        facts
+            .entries
+            .iter()
+            .filter(|e| e.path != claim.path)
+            .all(|e| e.relevance > claim.relevance),
+        "the claim ranks strictly last"
+    );
+    // Packed: the claim goes in after every other evidence entry.
+    let template = crate::config::builtin_contract("qa").ok_or("qa")?;
+    let packed = crate::context::pack(
+        template,
+        &m,
+        &facts.entries,
+        crate::context::required(template, &m)? + 2_000,
+    )?;
+    let evidence: Vec<&str> = packed
+        .inputs
+        .iter()
+        .filter(|i| i.class == crate::context::Class::Evidence)
+        .map(|i| i.path.as_str())
+        .collect();
+    assert_eq!(evidence.last(), Some(&"claims/CAND-7"), "{evidence:?}");
+    // An AC the package names that is not in its spec, or a spec the project lacks: an error, never a context
+    // without it (M2T09R-102).
+    let mut missing = package.clone();
+    missing.acceptance_ids.push("AC-9-99".to_owned());
+    assert!(verification(&conn, &missing).is_err());
+    let mut unknown = package.clone();
+    unknown.spec_sha256 = Some("9".repeat(64));
+    assert!(verification(&conn, &unknown).is_err());
     Ok(())
 }

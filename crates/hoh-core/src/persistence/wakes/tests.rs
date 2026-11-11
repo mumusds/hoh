@@ -4264,5 +4264,68 @@ async fn a_supervision_turn_refused_for_its_context_makes_its_commander_unavaila
     .await?;
     store.supervise("R", context(&clock, later + 1000)).await?;
     assert_eq!(blocked(&path)?.0, "RUNNING");
+    // Unavailable later for another reason: the record names no refused turn (it was cleared by the settle, -159).
+    exec(
+        &path,
+        "UPDATE role_bindings SET state = 'BLOCKED', blocked_reason = 'AGENT_UNAVAILABLE' WHERE run_id = 'R' AND role = 'commander';",
+    )?;
+    wake(&store, &clock, "R", "D", "fp2", later + 2000).await?;
+    store.supervise("R", context(&clock, later + 9000)).await?;
+    let (reasons, refused): (String, Option<String>) = Connection::open(&path)?.query_row(
+        "SELECT json_extract(payload_json, '$.reasons'), json_extract(payload_json, '$.refused_attempt') FROM events \
+         WHERE kind = 'supervisor.unavailable' ORDER BY seq DESC LIMIT 1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    assert_eq!((reasons.as_str(), refused), ("[\"binding_blocked\"]", None));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_probe_refused_again_is_the_turn_its_records_unavailability_names() -> R {
+    // M2T09R-101 (docs/adr/ADR-026.md decision 9): the record names the latest refused turn, so its diagnosis leads to
+    // the refusal (and its required and available) that holds the Commander now.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    wake(&store, &clock, "R", "D", "fp", 0).await?;
+    let a = store
+        .allocate_supervision("p1", context(&clock, 3000))
+        .await?
+        .ok_or("allocated")?;
+    run_turn(
+        &store,
+        &clock,
+        &a.attempt_id,
+        3000,
+        false,
+        crate::retry::FailureClass::Decision,
+    )
+    .await?;
+    store.supervise("R", context(&clock, 4000)).await?;
+    let later = 4000 + crate::retry::CAP.as_millis() as u64 + 1000;
+    let probe = store
+        .allocate_supervision("p1", context(&clock, later))
+        .await?
+        .ok_or("a probe past the cooldown")?;
+    run_turn(
+        &store,
+        &clock,
+        &probe.attempt_id,
+        later,
+        false,
+        crate::retry::FailureClass::Decision,
+    )
+    .await?;
+    store.supervise("R", context(&clock, later + 1000)).await?;
+    assert_eq!(blocked(&path)?.0, "BLOCKED");
+    let refused: String = Connection::open(&path)?.query_row(
+        "SELECT json_extract(payload_json, '$.refused_attempt') FROM events WHERE kind = 'supervisor.unavailable' \
+         ORDER BY seq DESC LIMIT 1",
+        [],
+        |r| r.get(0),
+    )?;
+    assert_eq!(refused, probe.attempt_id);
     Ok(())
 }
