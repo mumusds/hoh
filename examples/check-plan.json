@@ -1,7 +1,7 @@
 {
   "schema_version": "1.0",
   "plan_id": "hoh-product-example",
-  "description": "Example only. M0-T03 copies this to tests/check-plan.json and replaces every command with the real one once it exists. Scripts under scripts/product/ are created by the milestone that needs them. Live checks must write live-sessions.json (contracts/live-session.schema.json) into $HOH_EVIDENCE_DIR; the soak check also writes timeline.jsonl (contracts/soak-event.schema.json). Every check that is the scenario check of an AC writes test-results.jsonl (contracts/test-result.schema.json); independent checks write independent-report.json (tools/agent_task.py --report-out); build writes hoh-release.tar.gz (CR-003).",
+  "description": "Example only. M0-T03 copies this to tests/check-plan.json and replaces every command with the real one once it exists. Scripts under scripts/product/ are created by the milestone that needs them. Live checks must write live-sessions.json (contracts/live-session.schema.json) into $HOH_EVIDENCE_DIR; the soak check also writes timeline.jsonl (contracts/soak-event.schema.json). Every check that is the scenario check of an AC writes test-results.jsonl (contracts/test-result.schema.json); independent checks write independent-report.json (tools/agent_task.py --report-out) and copy the reporting attempt's record and raw stream as native-attempt.json and raw-session.jsonl; traceability writes traceability-report.json (docs/adr/ADR-027.md); build writes hoh-release.tar.gz (CR-003).",
   "checks": {
     "build": {"mode": "product", "argv": ["bash", "scripts/product/build.sh"], "timeout_seconds": 3600, "description": "cargo build --workspace --release --locked; npm ci && npm run build in web/ (from M6)", "artifacts": ["hoh-release.tar.gz"]},
     "static": {"mode": "product", "argv": ["bash", "scripts/product/static.sh"], "timeout_seconds": 1800, "description": "cargo fmt --check; cargo clippy --workspace --all-targets --locked -D warnings; tsc/eslint for web/", "artifacts": ["test-results.jsonl"]},
@@ -14,8 +14,8 @@
     "web-e2e": {"mode": "product", "argv": ["bash", "scripts/product/web-e2e.sh"], "timeout_seconds": 3600, "artifacts": ["test-results.jsonl"]},
     "deployment": {"mode": "product", "argv": ["bash", "scripts/product/deploy-smoke.sh"], "timeout_seconds": 3600, "artifacts": ["test-results.jsonl"]},
     "soak": {"mode": "live", "argv": ["bash", "scripts/product/soak.sh"], "timeout_seconds": 345600, "artifacts": ["live-sessions.json", "timeline.jsonl", "test-results.jsonl"]},
-    "independent-qa": {"mode": "live", "argv": ["bash", "scripts/product/independent.sh", "qa"], "timeout_seconds": 14400, "artifacts": ["live-sessions.json", "independent-report.json"]},
-    "independent-review": {"mode": "live", "argv": ["bash", "scripts/product/independent.sh", "reviewer"], "timeout_seconds": 14400, "artifacts": ["live-sessions.json", "independent-report.json"]},
-    "traceability": {"mode": "product", "argv": ["bash", "scripts/product/traceability.sh"], "timeout_seconds": 1800, "artifacts": ["test-results.jsonl"]}
+    "independent-qa": {"mode": "live", "argv": ["bash", "scripts/product/independent.sh", "qa", "v1"], "timeout_seconds": 14400, "artifacts": ["live-sessions.json", "independent-report.json", "native-attempt.json", "raw-session.jsonl"]},
+    "independent-review": {"mode": "live", "argv": ["bash", "scripts/product/independent.sh", "reviewer", "v1"], "timeout_seconds": 14400, "artifacts": ["live-sessions.json", "independent-report.json", "native-attempt.json", "raw-session.jsonl"]},
+    "traceability": {"mode": "product", "argv": ["bash", "scripts/product/traceability.sh", "v1"], "timeout_seconds": 1800, "artifacts": ["test-results.jsonl", "traceability-report.json"]}
   }
 }

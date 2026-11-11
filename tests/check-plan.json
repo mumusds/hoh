@@ -140,41 +140,45 @@
       "mode": "live",
       "argv": [
         "bash",
-        "scripts/product/not-implemented.sh",
-        "independent-qa",
-        "M2-T10"
+        "scripts/product/independent.sh",
+        "qa",
+        "v0.1"
       ],
       "timeout_seconds": 14400,
       "artifacts": [
         "live-sessions.json",
-        "independent-report.json"
+        "independent-report.json",
+        "native-attempt.json",
+        "raw-session.jsonl"
       ]
     },
     "independent-review": {
       "mode": "live",
       "argv": [
         "bash",
-        "scripts/product/not-implemented.sh",
-        "independent-review",
-        "M2-T10"
+        "scripts/product/independent.sh",
+        "reviewer",
+        "v0.1"
       ],
       "timeout_seconds": 14400,
       "artifacts": [
         "live-sessions.json",
-        "independent-report.json"
+        "independent-report.json",
+        "native-attempt.json",
+        "raw-session.jsonl"
       ]
     },
     "traceability": {
       "mode": "product",
       "argv": [
         "bash",
-        "scripts/product/not-implemented.sh",
-        "traceability",
-        "M2-T10"
+        "scripts/product/traceability.sh",
+        "v0.1"
       ],
       "timeout_seconds": 1800,
       "artifacts": [
-        "test-results.jsonl"
+        "test-results.jsonl",
+        "traceability-report.json"
       ]
     }
   }

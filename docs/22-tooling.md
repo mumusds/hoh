@@ -47,11 +47,18 @@ python3 tools/run_check.py --check-id unit \
 
 - **执行内容：** `run_check` 只执行计划中的 argv；`--` 后给出命令时必须与计划完全一致。mode 与 cwd 只能来自计划。
 - **环境变量：** 子进程拿到 `HOH_EVIDENCE_DIR`、`HOH_CHECK_ID`、`HOH_CANDIDATE_ID`、`HOH_SPEC_SHA256`、`HOH_CANDIDATE_FILE`、`HOH_CHECK_RECORD_ID`。
-- **逐测试结果：** 凡是某条 AC 的场景检查，都要在 `$HOH_EVIDENCE_DIR/test-results.jsonl` 写逐测试结果（`contracts/test-result.schema.json`）；build 检查产出 `hoh-release.tar.gz`；independent-qa/independent-review 产出 `independent-report.json`。validate_bundle 要求检查计划声明这些产物。
+- **逐测试结果：** 凡是某条 AC 的场景检查，都要在 `$HOH_EVIDENCE_DIR/test-results.jsonl` 写逐测试结果（`contracts/test-result.schema.json`）；build 检查产出 `hoh-release.tar.gz`；independent-qa/independent-review 产出 `live-sessions.json`、`independent-report.json`、`native-attempt.json` 与 `raw-session.jsonl`；traceability 产出 `test-results.jsonl` 与 `traceability-report.json`。validate_bundle 要求检查计划声明这些产物。
 - **产物：** 计划声明的产物缺失时检查失败；证据目录只能追加，不能覆盖。
 - **信号：** SIGTERM/SIGHUP/Ctrl-C 时先停止检查进程组（给内层 agent_task 留 15 s 收尾），再写入退出码 130 的执行记录。候选清单必须位于项目内。
 - **候选校验：** 冻结清单保存 Git commit/tree、全部已跟踪文件的 hash 和 spec/environment/test plan 的 hash，检查前后都会校验。候选改动、环境清单被改、出现未跟踪源码都会被拒绝。
 - **身份规则：** 测试计划必须是已提交的文件。自举工具拒绝子模块和符号链接，候选清单以排他方式写入。正式产品如需支持这些，必须另做显式身份规则和测试。
+
+## 验证检查：traceability 与 independent-*（ADR-027 决定 10、11）
+
+- `scripts/product/traceability.sh <profile>`（经 run_check 运行；现在的 argv 是 v0.1，改成 v1 由 M7-T02 承接）：先运行本检查的自测（tests/bundle 里名称含 `test_NNN_MM` 的测试，只选 profile 中以 traceability 为场景检查的 TEST，结果写进本次的 `test-results.jsonl`；找不到时不写行，该 TEST 为 NOT_RUN）；再在 `.hoh-dev/` 与 `.hoh/evidence/` 下找声明本候选的全部 `execution.json`（不能解析或不合 schema 而字节含本候选 id 的也算，记为损坏），按原则一判定（`scripts/product/traceability.py`：规则表的否决、有序的 outcome、逐成员逐 TEST 的结论、对全部成员量化的 TEST 状态；入库规则 17 要查产品的库，不在其中）；最后写 `traceability-report.json{candidate_id, profile, tests:{id:{check, members, passing, status}}, unsatisfied, invalid}`。退出 0 当且仅当每个范围内 TEST 满足（PASS，或可降级需求上的 DEGRADED）且没有无效成员。policy 取候选跟踪的 `contracts/release-policy.json`，没有就没有 policy；记录与结果行按本仓库受锁的 schema 核对。**release_gate 不读这份报告**（门禁受锁），它的作用是让每个 TEST 的历史（先失败后通过记为 FLAKY、失败来自哪个检查都算）在发布清单汇总之前就可见。与门禁的逐项差异见 ADR-027 原则一的差异表，tests/bundle/test_traceability.py 各有用例。
+- `scripts/product/independent.sh <qa|reviewer> <profile>`：上下文由候选与原则一的判定（`judgement.json`：全部成员、否决原因、outcome、各 TEST 的状态）生成，按 `resources/prompts/<role>.md` 渲染为 `prompt.md`；经 `tools/agent_task.py --report-out` 依次运行全新的原生会话（qa：pi、claude；reviewer：codex、codex `--model gpt-6.1-sol`、claude），写出报告即停（含 FAIL、UNKNOWN，不换 Agent 找 PASS），没写出报告才换下一个。写出报告的那次的报告、attempt 记录与原始流复制为 `independent-report.json`、`native-attempt.json`、`raw-session.jsonl`，并核对与报告引用的 sha256 一致；`live-sessions.json` 由 agent_task 写。每次尝试都列在 `independent-attempts.json`。会话的笔记与实验输出写到证据目录下的 `observations/`。退出 0 当且仅当报告为 PASS 且没有 critical/high；3（BLOCKED）当且仅当每个 Agent 都试过、都没写出报告、且每次都可归为外部阻塞：agent_task 在 CLI 启动前结束（127、78、64），或该 CLI 的错误输出含已记录的鉴权、配额、容量失败（取自已安装构建：codex-cli 0.166.0 与 Claude Code 2.1.319 的二进制、Pi 1.5.0 的 pi-ai 包，Codex 的容量失败另见本项目的 attempt 记录；CLI 升级后若措辞变了，需更新 `scripts/product/independent.py` 的 BLOCKS）；其余为 1。CI 没有认证，只运行带假 CLI 的套件测试（tests/bundle/test_independent.py，在临时 ROOT 里，从不写真实的 `.hoh-dev/`）；假 Agent 的结果永不报为 live。
+- **原因码的命名空间（ADR-027 决定 8）：** `valid` 的原因（如 SOURCE_CHANGED、INSUFFICIENT）是 `evidence.recorded` 与 `integrity_violation` 载荷里 `reasons` 字段的字符串，随事件经 `/v1/events` 原样发出，事件种类就是它们的命名空间；它们不进以 ReasonCode 为类型的字段，所以不需要 CR（REQ-052 决定 3 与 ADR-022 的 PROMPT_UNAVAILABLE 是同样的先例）。
+- **受锁写者的残留（ADR-027 规则 9）：** run_check 用墙钟记起止、单调钟记时长。主机挂起或墙钟前跳使两者不符时，该记录只是不完整、无结论，同一候选上重跑可以补上；但墙钟回拨超过运行时长会使记下的区间倒置，按 INTERVAL_INVALID 否决，traceability 中该成员使整份报告不满足（产品的检查驱动以开始的墙钟加单调耗时作结束时间，区间不会倒置）。门禁的时长容差 max(5 s, 1%) 之内的挂起照样被接受。
 
 ## 最终 Manifest 与门禁
 
@@ -96,5 +103,7 @@ python3 tools/release_gate.py --manifest .hoh-dev/release/manifest.json
 - 原生桥：原生进程失败返回非 0；超时 124，中断 130，缺 CLI 127，不支持参数或以 root 运行 78，attempt 目录已存在 64，`--report-out` 无法生成有效报告 65。
 - bootstrap：用法错误 64，能力缺失 3/78。
 - run_check：拒绝执行时返回 1，否则返回命令退出码；源码被改或产物缺失时返回非 0。
+- traceability.sh：每个范围内 TEST 满足且没有无效成员时 0，否则 1；不经 run_check（缺 `HOH_EVIDENCE_DIR`/`HOH_CANDIDATE_FILE`）运行为 64。
+- independent.sh：报告 PASS 且没有 critical/high 时 0；每次尝试都是外部阻塞时 3；其余 1；不经 run_check 运行为 64。
 
 JSON 输出与 stderr 诊断分开。任何返回 0 都不意味着另一层级的产品验收已通过。

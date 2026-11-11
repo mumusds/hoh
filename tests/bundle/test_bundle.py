@@ -75,6 +75,21 @@ class BundleContracts(unittest.TestCase):
                      ['python3','-m','unittest','discover'],['node','-r','./setup.js','scripts/x.mjs'],['node','--input-type=module','scripts/x.mjs'],
                      ['bash','--rcfile','/dev/null','scripts/x.sh'],['python3','--check-hash-based-pycs','never','tools/x.py'],['env','-iu','X','bash','scripts/x.sh']]:
             with self.subTest(argv=argv):self.assertIsNone(problem(argv))
+    def test_verification_checks_declare_their_artifacts(self):
+        # docs/adr/ADR-027.md decision 13: run_check binds by digest and reports missing only what the plan declares.
+        import validate_bundle
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)/'kit';shutil.copytree(ROOT,root,ignore=shutil.ignore_patterns('.git','.hoh-dev','__pycache__','target','npm'))
+            for rel in ('tests/check-plan.json','examples/check-plan.json'):
+                plan=load_json(root/rel)
+                plan['checks']['traceability']['artifacts']=['test-results.jsonl']
+                plan['checks']['independent-qa']['artifacts']=['live-sessions.json','independent-report.json','raw-session.jsonl']
+                (root/rel).write_text(json.dumps(plan))
+            errors=validate_bundle.validate(root)['errors']
+            for rel in ('tests/check-plan.json','examples/check-plan.json'):
+                with self.subTest(plan=rel):
+                    self.assertTrue(any(e.startswith(rel) and 'traceability' in e and 'traceability-report.json' in e for e in errors),errors)
+                    self.assertTrue(any(e.startswith(rel) and 'independent-qa' in e and 'native-attempt.json' in e for e in errors),errors)
     def test_compat_manifest_schema_matches_ac_027_01(self):
         # CR3R-04: the schema forbade the field names AC-027-01 required.
         import validate_bundle
