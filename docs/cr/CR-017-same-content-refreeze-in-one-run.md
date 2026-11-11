@@ -20,8 +20,8 @@ REQ-052 决定 1 改为：“产品中对相同内容重复冻结：同一 Run �
 - 重新生成 `docs/02`、`docs/18`，重新上锁。
 - ADR-027 决定 5。新 Run 没有新提交就不能冻结（如取消后重验），处理方式移交 M2-T16。
 - `contracts/development-tasks.json`（不在锁内），ADR-027 的移交（M2T10D-162、-260）：
-  - M2-T16 的 done_when 加“Developer COMPLETED 时由 Runtime 在写租约下冻结、再 candidate_ready；QA/Reviewer Attempt 经 ADR-027 的检查驱动运行检查并写证据（原则二：只有它们能产出证据）；候选迁移带原状态条件，不覆盖 M2-T10 写入的否决 INVALID；候选的 VERIFYING/ACCEPTED/REJECTED 迁移（INVALID 只由 M2-T10 的证据写入，M2-T16 从不写）；新 Run 无新提交与同 Run 同内容遇 STALE/INVALID 的情形；`.hoh/` 下字节稳定的环境描述”；
-  - M2-T18 的 done_when 加“acceptance_results 的投影按 ADR-027 原则一的历史规则（该候选上该 AC 任一非 PASS 行即不满足；候选为 INVALID 即全不满足；有 profile 时补原则一规则 16）”；
+  - M2-T16 的 done_when 加“Developer COMPLETED 时由 Runtime 在写租约下冻结、再 candidate_ready；QA/Reviewer Attempt 经 ADR-027 的检查驱动运行检查并写证据（原则二：只有它们能产出证据）；候选迁移带原状态条件，不覆盖 M2-T10 写入的否决 INVALID；Attempt 级运行后核对不符时经 M2-T10 的 Store::record_evidence 写 INVALID 证据；候选的 VERIFYING/ACCEPTED/REJECTED 迁移（INVALID 只由 M2-T10 的证据写入，M2-T16 从不写）；新 Run 无新提交与同 Run 同内容遇 STALE/INVALID 的情形；`.hoh/` 下字节稳定的环境描述”；
+  - M2-T18 的 done_when 加“acceptance_results 的投影按 ADR-027 原则一的历史规则（该候选上该 AC 任一 INVALID 或 FAIL 行即不满足；可降级需求上只有 PASS 与合规 DEGRADED 且至少一条 DEGRADED 为 DEGRADED 并满足；候选为 INVALID 即全不满足；有 profile 时补原则一规则 16；检查级状态由原则一推出）”；
   - M3-T02 的 done_when 加“TEST-032-01 的测试在 tests/bundle、名称含 test_032_01（traceability 自测据此定位）”；
   - M7-T02 的 done_when 加“traceability 与 independent-* 检查的 argv 改为 v1；TEST-069-01 的测试在 tests/bundle、名称含 test_069_01”；
   - M7-T03 的 done_when 加“产品里 soak 检查的满足条件按 ADR-027 原则一规则 18（含逐事件的候选绑定）”。
