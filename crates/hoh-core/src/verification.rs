@@ -387,6 +387,8 @@ pub trait Lookup {
     fn candidate_at(&self, path: &str) -> Option<String>;
     /// Whether `path`, resolved (`..` and links), is inside the directory `dir`.
     fn inside(&self, path: &str, dir: &str) -> bool;
+    /// Whether another record directory than `record_dir` uses the record id `record_id` (rule 19).
+    fn record_id_reused(&self, record_id: &str, record_dir: &str) -> bool;
     /// Whether the directory `dir` is, holds or lies in another record's directory.
     fn overlaps(&self, dir: &str) -> bool;
     /// The frozen plan's entry for `check_id`.
@@ -421,11 +423,11 @@ pub enum Reason {
     CwdMismatch,
     CheckNotPlanned,
     ManifestMismatch,
-    DurationMismatch,
     RunnerTool,
     RunnerRoot,
     OutsideRecordDir,
     RecordDirOverlap,
+    RecordIdReused,
     LiveSessionsUnbound,
     LiveSessionsMissing,
     ResultLineInvalid,
@@ -459,11 +461,11 @@ impl Reason {
             Reason::CwdMismatch => "CWD_MISMATCH",
             Reason::CheckNotPlanned => "CHECK_NOT_PLANNED",
             Reason::ManifestMismatch => "MANIFEST_MISMATCH",
-            Reason::DurationMismatch => "DURATION_MISMATCH",
             Reason::RunnerTool => "RUNNER_TOOL",
             Reason::RunnerRoot => "RUNNER_ROOT",
             Reason::OutsideRecordDir => "OUTSIDE_RECORD_DIR",
             Reason::RecordDirOverlap => "RECORD_DIR_OVERLAP",
+            Reason::RecordIdReused => "RECORD_ID_REUSED",
             Reason::LiveSessionsUnbound => "LIVE_SESSIONS_UNBOUND",
             Reason::LiveSessionsMissing => "LIVE_SESSIONS_MISSING",
             Reason::ResultLineInvalid => "RESULT_LINE_INVALID",
@@ -617,12 +619,9 @@ pub fn valid(e: &Evidence, c: &Sealed, s: &str, world: &dyn Lookup) -> Result<()
             );
         }
     }
-    match interval(r) {
-        // tools/release_gate.py: the recorded duration within max(5 s, 1 %) of the interval; run_check records 0
-        // for an interrupted run, which claims nothing (M2T10D-502).
-        Some(_) => need(!success || duration_agrees(r), Reason::DurationMismatch),
-        None => need(false, Reason::IntervalInvalid),
-    }
+    // Rule 9: an interval that runs backwards vetoes (AC-052-04 variant 8); a duration that disagrees with it never
+    // does, it only leaves the record incomplete ([`outcome`], M2T10D-701).
+    need(interval(r).is_some(), Reason::IntervalInvalid);
     need(r.source_unchanged, Reason::SourceChanged);
     let holds = |f: &str, sha: &str| world.sha256_of(f).as_deref() == Some(sha);
     need(
@@ -709,6 +708,10 @@ pub fn valid(e: &Evidence, c: &Sealed, s: &str, world: &dyn Lookup) -> Result<()
         Reason::OutsideRecordDir,
     );
     need(!world.overlaps(&e.record_dir), Reason::RecordDirOverlap);
+    need(
+        !world.record_id_reused(&r.record_id, &e.record_dir),
+        Reason::RecordIdReused,
+    );
     if r.mode == "live" {
         match sessions_of(r, world) {
             // Rule 10: a sessions document there must be of the schema's shape and bound to this check.
@@ -802,7 +805,14 @@ pub fn outcome(e: &Evidence, verdict: &Result<(), Invalid>, world: &dyn Lookup) 
         && duration_agrees(r);
     // A compliant degradation (rule 14): a degradable check, at least one DEGRADED line, each with its basis, and no
     // FAIL line; SKIPPED lines leave their TESTs without a conclusion, as the gate judges each AC (M2T10D-551).
-    let compliant = policy.as_ref().is_some_and(|p| p.degradable)
+    // Its diagnostic: a non-empty output of the record (rule 14, M2T10D-704).
+    let empty = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    let diagnosed = [&r.stdout.sha256, &r.stderr.sha256]
+        .into_iter()
+        .chain(r.artifacts.iter().map(|a| &a.sha256))
+        .any(|sha| sha != empty);
+    let compliant = diagnosed
+        && policy.as_ref().is_some_and(|p| p.degradable)
         && e.observations.iter().any(|o| o["status"] == "DEGRADED")
         && e.observations
             .iter()
@@ -828,10 +838,14 @@ pub fn outcome(e: &Evidence, verdict: &Result<(), Invalid>, world: &dyn Lookup) 
             return of(Status::Pass, None);
         }
     }
-    if r.exit_code == 3 {
-        return of(Status::Blocked, None);
+    match r.exit_code {
+        3 => of(Status::Blocked, None),
+        // Not a test failure (M2T10D-753): the command did not start, or the run was interrupted or killed.
+        127 => of(Status::Fail, Some("NOT_STARTED")),
+        130 => of(Status::Fail, Some("INTERRUPTED")),
+        code if code < 0 => of(Status::Fail, Some("INTERRUPTED")),
+        _ => of(Status::Fail, None),
     }
-    of(Status::Fail, None)
 }
 
 /// Whether a DEGRADED line carries its basis: a `detail` naming the reason and the upstream reference (rule 14).

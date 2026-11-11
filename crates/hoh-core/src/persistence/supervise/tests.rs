@@ -1277,6 +1277,7 @@ async fn evidence_whose_source_changed_wakes_the_commander_in_the_step_that_sees
             reasons: vec!["SOURCE_CHANGED"],
             tree_before: json!({"head_tree": "t1"}),
             tree_after: json!({"head_tree": "t2"}),
+            clock: json!({"wall_finished_at": "2026-11-11T10:00:05Z", "monotonic_seconds": 5.0}),
             observations: Vec::new(),
             rows: Vec::new(),
             integrity: vec!["source changed: src/lib.rs".to_owned()],

@@ -143,6 +143,7 @@ fn recording(record_id: &str, candidate: &str, producer: &str) -> Recording {
         reasons: Vec::new(),
         tree_before: json!({"head": "a", "tree": "b"}),
         tree_after: json!({"head": "a", "tree": "b"}),
+        clock: json!({"wall_finished_at": "2026-11-11T10:00:05Z", "monotonic_seconds": 5.0}),
         observations: vec![json!({"test_id": "TEST-001-01", "status": "PASS"})],
         rows: vec![AcceptanceRow {
             ac_id: "AC-001-01".to_owned(),

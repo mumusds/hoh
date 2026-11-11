@@ -272,6 +272,27 @@ fn new_record_id() -> String {
     )
 }
 
+/// A run's exit code and `timed_out` as the record writes them, from the substrate's two dimensions
+/// (docs/adr/ADR-027.md decision 6, M2T10D-700): a cancelled or abandoned run is 130 (run_check's interrupt), whatever
+/// the child exited with, so it never claims success; a run past its deadline is timed out; a signal is its negative
+/// number (Python's convention, as run_check records it).
+fn recorded_exit(
+    status: Option<hoh_agents::process::Termination>,
+    cause: hoh_agents::process::Cause,
+) -> (i64, bool) {
+    use hoh_agents::process::{Cause, Termination};
+    let code = match status {
+        Some(Termination::Code(code)) => i64::from(code),
+        Some(Termination::Signal(signal)) => -i64::from(signal),
+        None => -9,
+    };
+    match cause {
+        Cause::Cancelled | Cause::Abandoned => (130, false),
+        Cause::DeadlineExceeded => (code, true),
+        Cause::Exited => (code, false),
+    }
+}
+
 /// `path` relative to the project root `project`, as records name files.
 fn relative_to(project: &Path, path: &Path) -> String {
     path.strip_prefix(project)
@@ -286,6 +307,7 @@ fn relative_to(project: &Path, path: &Path) -> String {
 /// differences.
 struct Done {
     evidence: Evidence,
+    clock: Value,
     tree_before: Value,
     tree_after: Value,
     integrity: Vec<String>,
@@ -333,6 +355,27 @@ impl hoh_core::verification::Lookup for World<'_> {
         real(path)
             .zip(real(dir))
             .is_some_and(|(p, d)| p.starts_with(d))
+    }
+
+    fn record_id_reused(&self, record_id: &str, record_dir: &str) -> bool {
+        // A record directory is named by its record id: another one of the same name is a reuse (rule 19).
+        let own = self.project.join(record_dir);
+        let mut reused = false;
+        for candidate in std::fs::read_dir(self.evidence)
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            for check in std::fs::read_dir(candidate.path())
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                let other = check.path().join(record_id);
+                reused |= other != own && other.is_dir();
+            }
+        }
+        reused
     }
 
     fn overlaps(&self, dir: &str) -> bool {
@@ -418,7 +461,7 @@ pub async fn run(
     state: &Path,
     request: &Request,
 ) -> Result<Ran, CheckError> {
-    use hoh_agents::process::{Cause, Config, Event, Process, Termination};
+    use hoh_agents::process::{Config, Event, Process};
     let blocking = |e: tokio::task::JoinError| CheckError::Io(format!("the check stopped: {e}"));
     let io = CheckError::Io;
     let project = state
@@ -475,7 +518,9 @@ pub async fn run(
     // The command, on the process substrate (argv only, its own process group, the plan's timeout).
     let artifacts_dir = record_dir.join("artifacts");
     let (stdout, stderr) = (record_dir.join("stdout.log"), record_dir.join("stderr.log"));
+    // Started on the wall clock, measured on the monotonic clock (docs/05; docs/adr/ADR-027.md decision 6).
     let started = std::time::SystemTime::now();
+    let began = std::time::Instant::now();
     let mut command = std::process::Command::new(&ready.planned.argv[0]);
     command
         .args(&ready.planned.argv[1..])
@@ -503,13 +548,7 @@ pub async fn run(
             }
             let report = report
                 .ok_or_else(|| io("the check's process ended without its report".to_owned()))?;
-            let code = match report.status {
-                Some(Termination::Code(code)) => i64::from(code),
-                // Python's convention, as tools/run_check.py records it (docs/adr/ADR-027.md decision 6).
-                Some(Termination::Signal(signal)) => -i64::from(signal),
-                None => -9,
-            };
-            (code, report.cause == Cause::DeadlineExceeded)
+            recorded_exit(report.status, report.cause)
         }
         Err(e) => {
             // As run_check does when the command cannot start: 127, the error as its stderr.
@@ -518,7 +557,12 @@ pub async fn run(
             (127, false)
         }
     };
-    let finished = std::time::SystemTime::now();
+    let elapsed = began.elapsed();
+    let wall_finished = std::time::SystemTime::now();
+    // The record's finish is its start plus the monotonic time: interval and duration agree by construction and never
+    // run backwards, the duration is the time that passed (a jumped or stepped-back wall clock moves neither); the
+    // wall clock's own finish goes to the evidence event (M2T10D-701, -750).
+    let finished = started + elapsed;
     // After: the post-check, the record, the objects.
     let done = {
         let (checkout, request, project, ready) = (
@@ -558,10 +602,7 @@ pub async fn run(
             }
             let export_ref = file(&export)?;
             let instant = |t| hoh_core::time::rfc3339_millis_utc(t);
-            let duration = finished
-                .duration_since(started)
-                .map(|d| d.as_secs_f64())
-                .unwrap_or(0.0);
+            let duration = elapsed.as_secs_f64();
             let m = &ready.sealed.manifest;
             let record = Record {
                 schema_version: "1.1".to_owned(),
@@ -575,7 +616,6 @@ pub async fn run(
                 cwd: ready.planned.cwd.clone(),
                 started_at: instant(started),
                 finished_at: instant(finished),
-                // One wall clock for the interval and the duration (decision 6, M2T10D-655).
                 duration_seconds: duration,
                 exit_code,
                 timed_out,
@@ -655,6 +695,10 @@ pub async fn run(
                 .unwrap_or_default()
                 .to_owned();
             Ok(Done {
+                clock: serde_json::json!({
+                    "wall_finished_at": hoh_core::time::rfc3339_millis_utc(wall_finished),
+                    "monotonic_seconds": duration,
+                }),
                 evidence: Evidence {
                     record,
                     git_tree,
@@ -783,6 +827,7 @@ pub async fn run(
                     reasons,
                     tree_before: done.tree_before.clone(),
                     tree_after: done.tree_after.clone(),
+                    clock: done.clock.clone(),
                     observations: e.observations.clone(),
                     rows: rows_out,
                     integrity: done.integrity.clone(),
@@ -798,4 +843,45 @@ pub async fn run(
         .await
         .map_err(CheckError::Store)?;
     Ok(ran)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hoh_agents::process::{Cause, Termination};
+
+    #[test]
+    fn a_cancelled_run_never_claims_success_and_a_late_one_is_timed_out() {
+        // docs/adr/ADR-027.md decision 6 (M2T10D-700): the substrate's cause and termination are two dimensions.
+        assert_eq!(
+            recorded_exit(Some(Termination::Code(0)), Cause::Exited),
+            (0, false)
+        );
+        assert_eq!(
+            recorded_exit(Some(Termination::Code(101)), Cause::Exited),
+            (101, false)
+        );
+        assert_eq!(
+            recorded_exit(Some(Termination::Signal(15)), Cause::Exited),
+            (-15, false)
+        );
+        // Cancelled, even when the child exits 0 on its SIGTERM: an interrupt.
+        assert_eq!(
+            recorded_exit(Some(Termination::Code(0)), Cause::Cancelled),
+            (130, false)
+        );
+        assert_eq!(
+            recorded_exit(Some(Termination::Signal(9)), Cause::Abandoned),
+            (130, false)
+        );
+        assert_eq!(recorded_exit(None, Cause::Cancelled), (130, false));
+        assert_eq!(
+            recorded_exit(Some(Termination::Signal(15)), Cause::DeadlineExceeded),
+            (-15, true)
+        );
+        assert_eq!(
+            recorded_exit(Some(Termination::Code(0)), Cause::DeadlineExceeded),
+            (0, true)
+        );
+    }
 }
