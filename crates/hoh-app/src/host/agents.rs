@@ -53,17 +53,26 @@ pub struct Registry {
     /// The host's stop: every probe command running is killed and none starts (decision 10 v6, M2T07R-202, -300, -450,
     /// -700).
     stopping: probe::ProbeStop,
+    /// Where pi keeps its settings, which name the provider its login is checked for (docs/adr/ADR-024.md decision 7).
+    pi_dir: Option<PathBuf>,
 }
 
 impl Registry {
-    /// Agents looked for on `path`.
+    /// Agents looked for on `path`; pi's settings where pi keeps them (`$PI_CODING_AGENT_DIR`, else `~/.pi/agent`).
     pub fn new(path: OsString) -> Registry {
+        Registry::with_pi_dir(path, hoh_agents::login::pi_agent_dir())
+    }
+
+    /// Agents looked for on `path`, pi's settings read from `pi_dir` only (tests give a directory of their own,
+    /// M2T17R-59).
+    pub fn with_pi_dir(path: OsString, pi_dir: Option<PathBuf>) -> Registry {
         Registry {
             path,
             seen: Mutex::new(BTreeMap::new()),
             wanted: Mutex::new(BTreeSet::new()),
             logins: Mutex::new(BTreeMap::new()),
             stopping: probe::ProbeStop::default(),
+            pi_dir,
         }
     }
 
@@ -108,7 +117,8 @@ impl Registry {
         if recent {
             return;
         }
-        let missing = hoh_agents::login::missing(agent, &ready.launcher, &self.env());
+        let missing =
+            hoh_agents::login::missing(agent, &ready.launcher, &self.env(), self.pi_dir.as_deref());
         if self.stopping.is_stopped() {
             return;
         }

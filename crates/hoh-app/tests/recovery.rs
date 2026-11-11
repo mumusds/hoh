@@ -528,7 +528,11 @@ fn recovery_host() {
         });
     }
     if let Some(bin) = std::env::var_os(CHILD_AGENTS) {
-        let registry = Arc::new(hoh_app::host::agents::Registry::new(bin.clone()));
+        let pi_dir = PathBuf::from(&bin).join("pi-agent");
+        let registry = Arc::new(hoh_app::host::agents::Registry::with_pi_dir(
+            bin.clone(),
+            Some(pi_dir),
+        ));
         config.runner = Some(hoh_app::host::RunnerConfig {
             executor: Arc::new(Handovers {
                 registry,

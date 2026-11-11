@@ -144,3 +144,62 @@ fn a_look_the_hosts_stop_ends_says_nothing_of_its_agent() -> R {
     );
     Ok(())
 }
+
+#[test]
+fn a_registry_reads_pis_settings_from_its_own_directory_only() -> R {
+    // M2T17R-59 (docs/adr/ADR-024.md decision 7): which provider pi's login is checked for comes from the settings in
+    // the registry's pi directory, never from the user's ~/.pi/agent behind a test's back. With a default provider
+    // there, its status command runs for it and a clear "not logged in" is recorded; with none, no status command
+    // runs and the login is not taken as missing.
+    let bin = tempfile::tempdir()?;
+    let help = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/protocol/pi/1.5.0/help.txt"
+    );
+    let script = bin.path().join("pi");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho \"$*\" >> '{runs}'\ncase \"$1\" in\n --version) echo '1.5.0';;\n --help) cat '{help}';;\n \
+             auth) echo '{{\"status\": \"not_ready\", \"reason\": \"credentials_not_configured\"}}'; exit 1;;\n \
+             *) exit 2;;\nesac\n",
+            runs = bin.path().join("runs").display()
+        ),
+    )?;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+    let path: OsString = format!("{}:/usr/bin:/bin", bin.path().display()).into();
+    let wanted: BTreeSet<String> = ["pi".to_owned()].into();
+    let configured = tempfile::tempdir()?;
+    std::fs::write(
+        configured.path().join("settings.json"),
+        r#"{"defaultProvider": "zz-test-provider"}"#,
+    )?;
+    let registry = Registry::with_pi_dir(path.clone(), Some(configured.path().to_path_buf()));
+    registry.want(&wanted);
+    registry.refresh();
+    let known = registry.availability();
+    assert!(known.auth_missing.contains_key("pi"), "{known:?}");
+    assert!(
+        std::fs::read_to_string(bin.path().join("runs"))?
+            .lines()
+            .any(|l| l == "auth check --provider zz-test-provider --json --no-refresh"),
+        "pi's status command was not run for the provider of the registry's directory"
+    );
+    std::fs::remove_file(bin.path().join("runs"))?;
+    let empty = tempfile::tempdir()?;
+    let registry = Registry::with_pi_dir(path, Some(empty.path().to_path_buf()));
+    registry.want(&wanted);
+    registry.refresh();
+    let known = registry.availability();
+    assert!(
+        known.auth_missing.is_empty() && known.available == Some(["pi".to_owned()].into()),
+        "{known:?}"
+    );
+    assert!(
+        !std::fs::read_to_string(bin.path().join("runs"))?
+            .lines()
+            .any(|l| l.starts_with("auth")),
+        "a status command ran with no provider in the registry's directory"
+    );
+    Ok(())
+}

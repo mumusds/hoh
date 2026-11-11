@@ -86,12 +86,15 @@ pub fn conclusion(agent: Agent, out: &Captured) -> Option<Login> {
     }
 }
 
-/// pi's default provider, from its settings (not its credentials): `$PI_CODING_AGENT_DIR/settings.json`, else
-/// `~/.pi/agent/settings.json`.
-pub fn pi_provider() -> Option<String> {
-    let dir = std::env::var_os("PI_CODING_AGENT_DIR")
+/// Where pi keeps its settings: `$PI_CODING_AGENT_DIR`, else `~/.pi/agent`.
+pub fn pi_agent_dir() -> Option<PathBuf> {
+    std::env::var_os("PI_CODING_AGENT_DIR")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".pi/agent")))?;
+        .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".pi/agent")))
+}
+
+/// pi's default provider, from its settings in `dir` (`settings.json`, not its credentials).
+pub fn pi_provider(dir: &Path) -> Option<String> {
     let settings: Value =
         serde_json::from_slice(&std::fs::read(dir.join("settings.json")).ok()?).ok()?;
     settings["defaultProvider"]
@@ -103,14 +106,20 @@ pub fn pi_provider() -> Option<String> {
 /// Why a status command could not be run for `agent`: pi without a default provider has none that needs no model call.
 pub const NO_PI_PROVIDER: &str = "pi 没有默认 provider，无法在不调用模型的情况下检查；运行 pi auth check --provider <provider> 或 hoh doctor --live";
 
-/// Run `agent`'s status command (`launcher`, under `env`'s limits and stop): its output, the provider it checked (pi),
-/// or `Err(None)` when there is no command to run (pi without a default provider), `Err(Some(e))` when it failed.
+/// Run `agent`'s status command (`launcher`, under `env`'s limits and stop): its output, the provider it checked (pi,
+/// from the settings in `pi_dir`), or `Err(None)` when there is no command to run (pi without a default provider),
+/// `Err(Some(e))` when it failed.
 pub fn status(
     agent: Agent,
     launcher: &Path,
     env: &ProbeEnv,
+    pi_dir: Option<&Path>,
 ) -> Result<(Captured, Option<String>), Option<ProbeError>> {
-    let provider = (agent == Agent::Pi).then(pi_provider).flatten();
+    let provider = if agent == Agent::Pi {
+        pi_dir.and_then(pi_provider)
+    } else {
+        None
+    };
     let args: Vec<&str> = match agent {
         Agent::Codex => vec!["login", "status"],
         Agent::Claude => vec!["auth", "status", "--json"],
@@ -126,7 +135,12 @@ pub fn status(
 
 /// What logging in takes when `agent`'s status command says it is not logged in; `None` when it says it is, says
 /// nothing clear, or could not be run (the registry then lets a change go ahead: only a clear "not logged in" refuses).
-pub fn missing(agent: Agent, launcher: &Path, env: &ProbeEnv) -> Option<String> {
-    let (out, provider) = status(agent, launcher, env).ok()?;
+pub fn missing(
+    agent: Agent,
+    launcher: &Path,
+    env: &ProbeEnv,
+    pi_dir: Option<&Path>,
+) -> Option<String> {
+    let (out, provider) = status(agent, launcher, env, pi_dir).ok()?;
     (conclusion(agent, &out)? == Login::Missing).then(|| hint(agent, provider.as_deref()))
 }

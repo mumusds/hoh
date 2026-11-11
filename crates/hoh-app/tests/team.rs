@@ -999,8 +999,9 @@ async fn the_runner_binds_each_role_to_a_session_of_its_available_agent_or_block
     let project = dir.path().join("p");
     std::fs::create_dir_all(&project)?;
     let mut config = config(&project);
-    let registry = std::sync::Arc::new(hoh_app::host::agents::Registry::new(
+    let registry = std::sync::Arc::new(hoh_app::host::agents::Registry::with_pi_dir(
         format!("{}:/usr/bin:/bin", bin.display()).into(),
+        Some(dir.path().join("pi-agent")),
     ));
     config.runner = Some(hoh_app::host::RunnerConfig {
         executor: std::sync::Arc::new(Registered(registry)),
@@ -1473,8 +1474,9 @@ async fn a_change_to_a_logged_out_agent_is_refused_blocked_auth_and_the_old_bind
     let project = dir.path().join("p");
     std::fs::create_dir_all(&project)?;
     let mut config = config(&project);
-    let registry = std::sync::Arc::new(hoh_app::host::agents::Registry::new(
+    let registry = std::sync::Arc::new(hoh_app::host::agents::Registry::with_pi_dir(
         bin.as_os_str().to_owned(),
+        Some(dir.path().join("pi-agent")),
     ));
     config.runner = Some(hoh_app::host::RunnerConfig {
         executor: std::sync::Arc::new(Registered(registry)),
@@ -1626,8 +1628,9 @@ async fn a_session_start_passed_by_the_checkpoint_of_the_same_tick_is_never_offe
     std::fs::write(&hold, b"")?;
     let log = dir.path().join("first-inputs.log");
     let executor = std::sync::Arc::new(HeldFirstInputs {
-        registry: std::sync::Arc::new(hoh_app::host::agents::Registry::new(
+        registry: std::sync::Arc::new(hoh_app::host::agents::Registry::with_pi_dir(
             bin.as_os_str().to_owned(),
+            Some(dir.path().join("pi-agent")),
         )),
         project: project.clone(),
         run_id: std::sync::Mutex::new(String::new()),
