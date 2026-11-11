@@ -38,7 +38,8 @@ fn open(dir: &tempfile::TempDir, clock: &std::sync::Arc<TestClock>) -> R<(Store,
     Ok((Store::open(&path, options)?, path))
 }
 
-/// Run R RUNNING on spec s3 (revision 3; s4 is revision 4), the delivery world's developer task D with its candidate.
+/// Run R RUNNING on spec s3 (revision 3; s4 is revision 4), supervised by its commander's binding, the delivery
+/// world's developer task D with its candidate.
 const WORLD: &str = "
 INSERT INTO projects(project_id, repo_path, host_epoch, created_at) VALUES ('p1', '/repo', 1, '2026-11-07T00:00:00Z');
 INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s3', 'p1', printf('%064d', 3), 3), ('s4', 'p1', printf('%064d', 4), 4);
@@ -46,8 +47,10 @@ INSERT INTO runs(run_id, project_id, spec_id, state, mode, revision, created_at)
 INSERT INTO requirements(requirement_id, spec_id, title, required_release) VALUES ('REQ-021', 's3', 'supervision', 1);
 INSERT INTO acceptance_criteria(ac_id, requirement_id, spec_id, body, check_id) VALUES ('AC-021-01', 'REQ-021', 's3', 'storm', 'unit');
 INSERT INTO sessions(session_id, agent, role, agent_version, capabilities_json) VALUES
-  ('sd', 'claude', 'developer', '1', '{}'), ('sq', 'pi', 'qa', '1', '{}'), ('sr', 'codex', 'reviewer', '1', '{}');
+  ('sd', 'claude', 'developer', '1', '{}'), ('sq', 'pi', 'qa', '1', '{}'), ('sr', 'codex', 'reviewer', '1', '{}'),
+  ('sc', 'codex', 'commander', '1', '{}');
 INSERT INTO role_bindings(run_id, role, agent, session_id, role_epoch, config_revision, bound_at) VALUES
+  ('R', 'commander', 'codex', 'sc', 1, 1, '2026-11-07T00:00:00Z'),
   ('R', 'developer', 'claude', 'sd', 1, 1, '2026-11-07T00:00:00Z'),
   ('R', 'qa', 'pi', 'sq', 1, 1, '2026-11-07T00:00:00Z'),
   ('R', 'reviewer', 'codex', 'sr', 1, 1, '2026-11-07T00:00:00Z');
@@ -667,6 +670,215 @@ async fn a_producers_fingerprint_ending_like_a_retrigger_still_keys_by_its_unkno
             [json!("fp#retrigger@r10"), Value::Null],
             [json!("fp#retrigger@r9"), Value::Null]
         ]
+    );
+    Ok(())
+}
+
+/// The kinds of R's supervisor events in order, each with its wake (or trigger) and, for a merge, the wake it joined.
+fn supervisor_events(path: &PathBuf) -> R<Vec<String>> {
+    Ok(rows(
+        path,
+        "SELECT kind || ' ' || coalesce(json_extract(payload_json, '$.wake'), json_extract(payload_json, '$.trigger_id'), '-') \
+         || coalesce(' -> ' || json_extract(payload_json, '$.merged_into'), '') \
+         || coalesce(' ' || json_extract(payload_json, '$.reason'), '') \
+         FROM events WHERE kind LIKE 'supervisor.%' ORDER BY seq",
+    )?
+    .into_iter()
+    .map(|r| r[0].as_str().unwrap_or("?").to_owned())
+    .collect())
+}
+
+#[tokio::test]
+async fn a_run_with_no_commander_binding_is_not_supervised() -> R {
+    // docs/adr/ADR-025.md decision 5: a run with no commander binding (test worlds only; StartRun binds every role) is
+    // not supervised: its due trigger does not fire.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(
+        &path,
+        &format!("{WORLD} DELETE FROM role_bindings WHERE role = 'commander';"),
+    )?;
+    events(&store, "nd", &[("need_decision", json!({"task_id": "D"}))]).await?;
+    let step = store.supervise("R", at(&clock, 3000)).await?;
+    assert!(step.fired.is_empty(), "{step:?}");
+    assert_eq!(supervisor_events(&path)?, Vec::<String>::new());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_trigger_of_a_key_whose_wake_is_still_owed_joins_that_wake() -> R {
+    // M2T08D-951, -1053 (docs/adr/ADR-025.md decision 3): a second trigger of the key of a wake not in flight is
+    // woken into that wake (merged_into), not as a second one; the wake takes the higher severity.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    events(
+        &store,
+        "first",
+        &[(
+            "need_decision",
+            json!({"task_id": "D", "fingerprint": "fp"}),
+        )],
+    )
+    .await?;
+    let first = store.supervise("R", at(&clock, 2000)).await?.fired;
+    assert_eq!(first.len(), 1);
+    clock.set(5000);
+    events(
+        &store,
+        "second",
+        &[(
+            "issue.opened",
+            json!({"severity": "critical", "fingerprint": "fp", "task_id": "D"}),
+        )],
+    )
+    .await?;
+    let second = store.supervise("R", at(&clock, 7000)).await?.fired;
+    assert_eq!(second.len(), 1);
+    let wake = &first[0].trigger_id;
+    assert_eq!(
+        supervisor_events(&path)?,
+        [
+            format!("supervisor.woken {wake}"),
+            format!("supervisor.woken {wake} -> {wake}")
+        ]
+    );
+    assert_eq!(
+        rows(
+            &path,
+            "SELECT json_extract(payload_json, '$.wake_severity') FROM events WHERE kind = 'supervisor.woken' ORDER BY seq"
+        )?,
+        [[json!("high")], [json!("critical")]]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_paused_run_fires_nothing_and_a_cancelled_one_supersedes_what_it_owes() -> R {
+    // docs/adr/ADR-025.md decision 3 (admission by run state): a due trigger of a PAUSED run stays PENDING and fires
+    // once the run works again; CANCEL_REQUESTED supersedes the PENDING triggers and the wakes owed.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(
+        &path,
+        &format!(
+            "{WORLD} UPDATE runs SET state = 'PAUSED', resume_state = 'RUNNING' WHERE run_id = 'R';"
+        ),
+    )?;
+    events(
+        &store,
+        "a",
+        &[(
+            "need_decision",
+            json!({"task_id": "D", "fingerprint": "fa"}),
+        )],
+    )
+    .await?;
+    assert!(
+        store
+            .supervise("R", at(&clock, 3000))
+            .await?
+            .fired
+            .is_empty()
+    );
+    assert_eq!(
+        count(
+            &path,
+            "SELECT count(*) FROM supervisor_triggers WHERE state = 'PENDING'"
+        )?,
+        1
+    );
+    exec(
+        &path,
+        "UPDATE runs SET state = 'RUNNING', resume_state = NULL WHERE run_id = 'R';",
+    )?;
+    let woken = store.supervise("R", at(&clock, 4000)).await?.fired;
+    assert_eq!(woken.len(), 1);
+    events(
+        &store,
+        "b",
+        &[(
+            "need_decision",
+            json!({"task_id": "D", "fingerprint": "fb"}),
+        )],
+    )
+    .await?;
+    store.supervise("R", at(&clock, 4500)).await?;
+    exec(
+        &path,
+        "UPDATE runs SET state = 'CANCEL_REQUESTED' WHERE run_id = 'R';",
+    )?;
+    assert!(
+        store
+            .supervise("R", at(&clock, 9000))
+            .await?
+            .fired
+            .is_empty()
+    );
+    assert_eq!(
+        count(
+            &path,
+            "SELECT count(*) FROM supervisor_triggers WHERE state = 'PENDING'"
+        )?,
+        0
+    );
+    let trigger_b: String = Connection::open(&path)?.query_row(
+        "SELECT trigger_id FROM supervisor_triggers WHERE fingerprint = 'fb'",
+        [],
+        |r| r.get(0),
+    )?;
+    let wake_a = &woken[0].trigger_id;
+    let mut superseded: Vec<String> = supervisor_events(&path)?
+        .into_iter()
+        .filter(|e| e.starts_with("supervisor.superseded"))
+        .collect();
+    superseded.sort();
+    let mut expected = vec![
+        format!("supervisor.superseded {wake_a} CANCEL_REQUESTED"),
+        format!("supervisor.superseded {trigger_b} CANCEL_REQUESTED"),
+    ];
+    expected.sort();
+    assert_eq!(superseded, expected);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_run_with_no_spec_defers_each_due_trigger_once() -> R {
+    // docs/adr/ADR-025.md decision 4: a run with no spec can have no supervision task: its due trigger stays PENDING
+    // and is deferred once (NO_SPEC), not again on the next step.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(
+        &path,
+        &format!("{WORLD} UPDATE runs SET spec_id = NULL WHERE run_id = 'R';"),
+    )?;
+    events(&store, "nd", &[("need_decision", json!({"task_id": "D"}))]).await?;
+    assert!(
+        store
+            .supervise("R", at(&clock, 3000))
+            .await?
+            .fired
+            .is_empty()
+    );
+    assert!(
+        store
+            .supervise("R", at(&clock, 4000))
+            .await?
+            .fired
+            .is_empty()
+    );
+    let trigger: String = Connection::open(&path)?.query_row(
+        "SELECT trigger_id FROM supervisor_triggers WHERE state = 'PENDING'",
+        [],
+        |r| r.get(0),
+    )?;
+    assert_eq!(
+        supervisor_events(&path)?,
+        [format!("supervisor.deferred {trigger} NO_SPEC")]
     );
     Ok(())
 }

@@ -4,9 +4,11 @@
 //! (`Context.now`), to the millisecond; an event's own `created_at` is the writer's wall clock and plays no part.
 
 use super::writer::{self, Commit, Ctx, NewEvent};
-use super::{PersistError, sqlite_error};
+use super::{PersistError, sqlite_error, wakes};
 use crate::decision::Context;
 use crate::ids::child_id;
+use crate::lifecycle::Lifecycle as _;
+use crate::protocol::RunState;
 use crate::supervise::{self, Policy, Severity};
 use crate::time::{parse_rfc3339_millis, rfc3339_millis_utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -292,9 +294,60 @@ fn take_in(
     Ok(())
 }
 
-/// The run's PENDING triggers due at `now`, HANDLED, each with its `supervisor.woken` event: its key, events, first
-/// event time, wake time and latency (REQ-021 behaviour 7), on the store's clock from its first event's commit; one
-/// an earlier writer committed is timed from when it was taken in, `latency_basis` saying so.
+/// What a run's state allows its supervisor (docs/adr/ADR-025.md decision 3, admission by run state).
+enum Admission {
+    /// Working, BLOCKED or WAITING_EXTERNAL: triggers fire.
+    Fire,
+    /// PAUSE_REQUESTED, PAUSED or INCOMPLETE: nothing fires; what is owed stays.
+    Hold,
+    /// CANCEL_REQUESTED or ended: what is owed is superseded.
+    Supersede,
+}
+
+fn admission(state: RunState) -> Admission {
+    match state {
+        RunState::PauseRequested | RunState::Paused | RunState::Incomplete => Admission::Hold,
+        RunState::CancelRequested
+        | RunState::Cancelled
+        | RunState::Failed
+        | RunState::Completed => Admission::Supersede,
+        _ => Admission::Fire,
+    }
+}
+
+/// A PENDING trigger of a run.
+struct Pending {
+    trigger_id: String,
+    fingerprint: String,
+    spec_id: Option<String>,
+    severity: String,
+    seqs: Vec<i64>,
+    created_at: String,
+    first_seq: i64,
+}
+
+/// The record every `supervisor.*` event of a trigger carries (decision 2, -161).
+fn record(run_id: &str, t: &Pending, now: SystemTime, ctx: &Ctx<'_>) -> Value {
+    let basis = if ctx.committed_at(t.first_seq).is_some() {
+        "commit"
+    } else {
+        "across_restart"
+    };
+    let latency = parse_rfc3339_millis(&t.created_at)
+        .and_then(|first| now.duration_since(first).ok())
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+    json!({
+        "trigger_id": t.trigger_id,
+        "dedup_key": {"run_id": run_id, "fingerprint": t.fingerprint, "spec_id": t.spec_id},
+        "severity": t.severity,
+        "event_seqs": t.seqs,
+        "first_event_at": t.created_at,
+        "latency_basis": basis,
+        "latency_ms": latency,
+    })
+}
+
+/// Fire run `run_id`'s triggers due at `now`, as its state allows: the fired ones and the events to write.
 fn fire(
     tx: &Transaction<'_>,
     project_id: &str,
@@ -302,77 +355,202 @@ fn fire(
     now: SystemTime,
     ctx: &Ctx<'_>,
 ) -> Result<(Vec<Fired>, Vec<NewEvent>), PersistError> {
-    type Due = (String, String, Option<String>, String, String, String, i64);
-    let due: Vec<Due> = {
+    let (state, run_spec): (String, Option<String>) = tx
+        .query_row(
+            "SELECT state, spec_id FROM runs WHERE run_id = ?1",
+            params![run_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(sqlite_error)?;
+    let state = writer::parse::<RunState>(&state)?;
+    // A run with no commander binding is not supervised (decision 5; test worlds only).
+    let bound: bool = tx
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM role_bindings WHERE run_id = ?1 AND role = 'commander')",
+            params![run_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    let mut fired = Vec::new();
+    let mut events = Vec::new();
+    if !bound {
+        return Ok((fired, events));
+    }
+    let event = |id: String, kind: &str, payload: Value| NewEvent {
+        project_id: project_id.to_owned(),
+        event_id: id,
+        run_id: Some(run_id.to_owned()),
+        kind: kind.to_owned(),
+        payload,
+    };
+    let pending = |due_only: bool| -> Result<Vec<Pending>, PersistError> {
         let mut statement = tx
             .prepare(
                 "SELECT trigger_id, fingerprint, spec_id, severity, event_seqs_json, created_at, first_seq \
-                 FROM supervisor_triggers WHERE run_id = ?1 AND state = 'PENDING' AND due_at <= ?2 \
+                 FROM supervisor_triggers WHERE run_id = ?1 AND state = 'PENDING' AND (?2 OR due_at <= ?3) \
                  ORDER BY due_at, first_seq",
             )
             .map_err(sqlite_error)?;
-        statement
-            .query_map(params![run_id, rfc3339_millis_utc(now)], |r| {
+        let rows = statement
+            .query_map(params![run_id, !due_only, rfc3339_millis_utc(now)], |r| {
                 Ok((
-                    r.get(0)?,
+                    r.get::<_, String>(0)?,
                     r.get(1)?,
                     r.get(2)?,
                     r.get(3)?,
-                    r.get(4)?,
+                    r.get::<_, String>(4)?,
                     r.get(5)?,
                     r.get(6)?,
                 ))
             })
             .map_err(sqlite_error)?
-            .collect::<Result<_, _>>()
-            .map_err(sqlite_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sqlite_error)?;
+        rows.into_iter()
+            .map(
+                |(trigger_id, fingerprint, spec_id, severity, seqs, created_at, first_seq)| {
+                    let seqs = serde_json::from_str(&seqs).map_err(|e| {
+                        PersistError::IntegrityViolation(format!(
+                            "trigger {trigger_id}: event_seqs_json: {e}"
+                        ))
+                    })?;
+                    Ok(Pending {
+                        trigger_id,
+                        fingerprint,
+                        spec_id,
+                        severity,
+                        seqs,
+                        created_at,
+                        first_seq,
+                    })
+                },
+            )
+            .collect()
     };
-    let mut fired = Vec::new();
-    let mut events = Vec::new();
-    for (trigger_id, fingerprint, spec_id, severity, seqs, created_at, first_seq) in due {
-        let event_seqs: Vec<i64> = serde_json::from_str(&seqs).map_err(|e| {
-            PersistError::IntegrityViolation(format!("trigger {trigger_id}: event_seqs_json: {e}"))
-        })?;
-        let first = parse_rfc3339_millis(&created_at).ok_or_else(|| {
-            PersistError::IntegrityViolation(format!(
-                "trigger {trigger_id}: created_at {created_at}"
-            ))
-        })?;
-        let basis = if ctx.committed_at(first_seq).is_some() {
-            "commit"
-        } else {
-            "across_restart"
-        };
-        let latency = now
-            .duration_since(first)
-            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+    match admission(state) {
+        Admission::Hold => return Ok((fired, events)),
+        Admission::Supersede => {
+            // Nothing more is owed to a run that is cancelled or ended: its PENDING triggers and its owed wakes.
+            for t in pending(false)? {
+                tx.execute(
+                    "UPDATE supervisor_triggers SET state = 'SUPERSEDED' WHERE trigger_id = ?1 AND state = 'PENDING'",
+                    params![t.trigger_id],
+                )
+                .map_err(sqlite_error)?;
+                let mut payload = record(run_id, &t, now, ctx);
+                payload["reason"] = json!(state.as_str());
+                events.push(event(
+                    child_id(&t.trigger_id, "superseded"),
+                    wakes::SUPERSEDED,
+                    payload,
+                ));
+            }
+            for wake in wakes::of_run(tx, run_id)?
+                .into_iter()
+                .filter(wakes::Wake::owed)
+            {
+                events.push(event(
+                    child_id(&wake.id, "superseded"),
+                    wakes::SUPERSEDED,
+                    json!({"wake": wake.id, "reason": state.as_str()}),
+                ));
+            }
+            return Ok((fired, events));
+        }
+        Admission::Fire => {}
+    }
+    let due = pending(true)?;
+    if run_spec.is_none() {
+        // No supervision task without a spec (decision 4): each due trigger waits, deferred once.
+        for t in due {
+            let deferred: bool = tx
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM events WHERE run_id = ?1 AND kind = 'supervisor.deferred' \
+                     AND json_extract(payload_json, '$.trigger_id') = ?2 \
+                     AND json_extract(payload_json, '$.reason') = 'NO_SPEC')",
+                    params![run_id, t.trigger_id],
+                    |r| r.get(0),
+                )
+                .map_err(sqlite_error)?;
+            if !deferred {
+                let mut payload = record(run_id, &t, now, ctx);
+                payload["reason"] = json!("NO_SPEC");
+                events.push(event(
+                    child_id(&t.trigger_id, "deferred/NO_SPEC"),
+                    "supervisor.deferred",
+                    payload,
+                ));
+            }
+        }
+        return Ok((fired, events));
+    }
+    let mut owed = wakes::of_run(tx, run_id)?;
+    owed.retain(wakes::Wake::owed);
+    for t in due {
         tx.execute(
             "UPDATE supervisor_triggers SET state = 'HANDLED' WHERE trigger_id = ?1 AND state = 'PENDING'",
-            params![trigger_id],
+            params![t.trigger_id],
         )
         .map_err(sqlite_error)?;
-        events.push(NewEvent {
-            project_id: project_id.to_owned(),
-            event_id: child_id(&trigger_id, "woken"),
-            run_id: Some(run_id.to_owned()),
-            kind: "supervisor.woken".to_owned(),
-            payload: json!({
-                "trigger_id": trigger_id,
-                "dedup_key": {"run_id": run_id, "fingerprint": fingerprint, "spec_id": spec_id},
-                "severity": severity,
-                "event_seqs": event_seqs,
-                "first_event_at": created_at,
-                "woken_at": rfc3339_millis_utc(now),
-                "wake_latency_ms": latency,
-                "latency_basis": basis,
-            }),
-        });
+        let severity = Severity::named(&t.severity).unwrap_or(Severity::Normal);
+        // The tasks its events name: what the wake's turn will be shown, and fenced by (decisions 3 and 6).
+        let mut task_ids: Vec<String> = Vec::new();
+        for seq in &t.seqs {
+            let named: Option<String> = tx
+                .query_row(
+                    "SELECT json_extract(payload_json, '$.task_id') FROM events WHERE seq = ?1",
+                    params![seq],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(sqlite_error)?
+                .flatten();
+            if let Some(task) = named.filter(|t| !task_ids.contains(t)) {
+                task_ids.push(task);
+            }
+        }
+        let mut payload = record(run_id, &t, now, ctx);
+        payload["woken_at"] = json!(rfc3339_millis_utc(now));
+        payload["wake_latency_ms"] = payload["latency_ms"].clone();
+        payload["task_ids"] = json!(task_ids);
+        // A trigger of the key of a wake still owed and not in flight joins it (decision 3, -951, -1053).
+        let joined = owed
+            .iter_mut()
+            .find(|w| w.fingerprint == t.fingerprint && w.spec_id == t.spec_id);
+        match joined {
+            Some(wake) => {
+                wake.severity = wake.severity.max(severity);
+                payload["wake"] = json!(wake.id);
+                payload["merged_into"] = json!(wake.id);
+                payload["wake_severity"] = json!(wake.severity.as_str());
+            }
+            None => {
+                payload["wake"] = json!(t.trigger_id);
+                payload["wake_severity"] = json!(severity.as_str());
+                owed.push(wakes::Wake {
+                    id: t.trigger_id.clone(),
+                    fingerprint: t.fingerprint.clone(),
+                    spec_id: t.spec_id.clone(),
+                    severity,
+                    woken_at: rfc3339_millis_utc(now),
+                    woken_seq: 0,
+                    task_ids: task_ids.iter().cloned().collect(),
+                    turns: Vec::new(),
+                    superseded: false,
+                });
+            }
+        }
+        events.push(event(
+            child_id(&t.trigger_id, "woken"),
+            wakes::WOKEN,
+            payload,
+        ));
         fired.push(Fired {
-            trigger_id,
-            fingerprint,
-            spec_id,
-            severity: Severity::named(&severity).unwrap_or(Severity::Normal),
-            event_seqs,
+            trigger_id: t.trigger_id,
+            fingerprint: t.fingerprint,
+            spec_id: t.spec_id,
+            severity,
+            event_seqs: t.seqs,
         });
     }
     Ok((fired, events))
