@@ -109,6 +109,11 @@ pub(super) fn step(
             },
             ctx,
         )?;
+        // Whether its Commander is available, with what this step woke counted (decision 5).
+        let judged = wakes::judge(&tx, &project_id, run_id, context, ctx)?;
+        if !judged.cas.is_empty() || !judged.events.is_empty() {
+            writer::write(&tx, &judged, ctx)?;
+        }
         ctx.before_commit()?;
         tx.commit().map_err(sqlite_error)?;
         return Ok(Supervised {
@@ -550,6 +555,7 @@ fn fire(
                     woken_at: rfc3339_millis_utc(now),
                     woken_seq: 0,
                     task_ids: task_ids.iter().cloned().collect(),
+                    event_seqs: t.seqs.clone(),
                     turns: Vec::new(),
                     superseded: false,
                     preempted: false,

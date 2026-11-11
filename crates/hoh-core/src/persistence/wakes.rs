@@ -10,7 +10,7 @@ use super::{PersistError, leases, sqlite_error};
 use crate::decision::Context;
 use crate::ids::child_id;
 use crate::lifecycle::{AttemptState, Lifecycle as _};
-use crate::protocol::TaskState;
+use crate::protocol::{BlockedReason, RunState, TaskState};
 use crate::supervise::Severity;
 use crate::time::{parse_rfc3339_millis, rfc3339_utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -23,6 +23,13 @@ pub(super) const ALLOCATED: &str = "supervisor.allocated";
 pub(super) const REARMED: &str = "supervisor.rearmed";
 pub(super) const SUPERSEDED: &str = "supervisor.superseded";
 pub(super) const PREEMPT: &str = "supervisor.preempt";
+const UNAVAILABLE: &str = "supervisor.unavailable";
+const AVAILABLE: &str = "supervisor.available";
+const PROBE: &str = "supervisor.probe";
+/// The supervisor's blocker claims' source (decision 5).
+const SUPERVISOR: &str = "supervisor";
+/// The cooldown before a half-open probe: ADR-020's largest backoff (decision 5).
+const COOLDOWN: Duration = crate::retry::CAP;
 const TURN_LIMIT: &str = "supervisor.turn_limit";
 
 /// How long a supervision turn may be in flight, and how long a wake waits before it goes first (decision 3).
@@ -54,6 +61,9 @@ pub(super) struct Turn {
     /// When it was allocated (RFC 3339 UTC) and that event's seq.
     pub allocated_at: Option<String>,
     pub allocated_seq: i64,
+    /// Its attempt's role epoch and end (RFC 3339 UTC).
+    pub role_epoch: i64,
+    pub ended_at: Option<String>,
 }
 
 impl Turn {
@@ -74,6 +84,8 @@ pub(super) struct Wake {
     pub woken_seq: i64,
     /// The tasks its events name, over every trigger merged into it.
     pub task_ids: BTreeSet<String>,
+    /// Its events' seqs, over every trigger merged into it.
+    pub event_seqs: Vec<i64>,
     pub turns: Vec<Turn>,
     pub superseded: bool,
     /// A turn of it was preempted: its later turns are protected (decision 3, -800).
@@ -174,9 +186,14 @@ pub(super) fn of_run(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<Wake>, Pe
                             .collect::<BTreeSet<_>>()
                     })
                     .unwrap_or_default();
+                let seqs: Vec<i64> = payload["event_seqs"]
+                    .as_array()
+                    .map(|s| s.iter().filter_map(Value::as_i64).collect())
+                    .unwrap_or_default();
                 if let Some(i) = wake(&mut wakes).filter(|_| payload["merged_into"].is_string()) {
                     wakes[i].severity = wakes[i].severity.max(severity);
                     wakes[i].task_ids.extend(tasks);
+                    wakes[i].event_seqs.extend(seqs);
                 } else {
                     wakes.push(Wake {
                         id: named
@@ -188,6 +205,7 @@ pub(super) fn of_run(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<Wake>, Pe
                         woken_at: text(&payload, "woken_at").unwrap_or_default(),
                         woken_seq: seq,
                         task_ids: tasks,
+                        event_seqs: seqs,
                         turns: Vec::new(),
                         superseded: false,
                         preempted: false,
@@ -205,6 +223,8 @@ pub(super) fn of_run(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<Wake>, Pe
                         rearm: None,
                         allocated_at: text(&payload, "allocated_at"),
                         allocated_seq: seq,
+                        role_epoch: 0,
+                        ended_at: None,
                     });
                 }
             }
@@ -240,18 +260,19 @@ pub(super) fn of_run(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<Wake>, Pe
     }
     for wake in &mut wakes {
         for turn in &mut wake.turns {
-            let state: Option<String> = tx
+            let row: Option<(String, i64, Option<String>)> = tx
                 .query_row(
-                    "SELECT state FROM attempts WHERE attempt_id = ?1",
+                    "SELECT state, role_epoch, ended_at FROM attempts WHERE attempt_id = ?1",
                     params![turn.attempt_id],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
                 .optional()
                 .map_err(sqlite_error)?;
-            turn.state = state
-                .as_deref()
-                .map(super::writer::parse::<AttemptState>)
-                .transpose()?;
+            if let Some((state, epoch, ended_at)) = row {
+                turn.state = Some(super::writer::parse::<AttemptState>(&state)?);
+                turn.role_epoch = epoch;
+                turn.ended_at = ended_at;
+            }
         }
     }
     Ok(wakes)
@@ -373,6 +394,8 @@ pub struct Allocated {
 
 /// A wake that may be allocated now, with what orders it.
 struct Candidate {
+    /// Its turn is a probe of an unavailable Commander (decision 5).
+    probe: bool,
     run_id: String,
     project_id: String,
     spec_id: String,
@@ -478,10 +501,32 @@ pub(super) fn allocate(
         if wakes.iter().any(Wake::in_flight) {
             continue;
         }
+        // An unavailable Commander gets no turn but a probe (decision 5).
+        let state: String = tx
+            .query_row(
+                "SELECT state FROM role_bindings WHERE run_id = ?1 AND role = ?2",
+                params![run_id, COMMANDER],
+                |r| r.get(0),
+            )
+            .map_err(sqlite_error)?;
+        let reasons = unavailability(&tx, &run_id, &wakes, epoch, &state)?;
+        let probing = if reasons.is_empty() {
+            None
+        } else {
+            match probe(&tx, &run_id, &reasons, &wakes, epoch, now)? {
+                Some(target) => Some(target),
+                None => continue,
+            }
+        };
         for wake in wakes
             .into_iter()
             .filter(Wake::owed)
             .filter(|w| w.retry_not_before().is_none_or(|t| t <= stamp.as_str()))
+            .filter(|w| {
+                probing
+                    .as_ref()
+                    .is_none_or(|target| target.as_ref().is_none_or(|id| *id == w.id))
+            })
         {
             let aged = parse_rfc3339_millis(&wake.woken_at)
                 .and_then(|at| now.duration_since(at).ok())
@@ -501,6 +546,7 @@ pub(super) fn allocate(
                 3
             };
             candidates.push(Candidate {
+                probe: probing.is_some(),
                 run_id: run_id.clone(),
                 project_id: project_id.to_owned(),
                 spec_id: spec_id.clone(),
@@ -571,6 +617,15 @@ pub(super) fn allocate(
     }
     let lease = json!({"kind": grant.kind, "epoch": grant.epoch, "expires_at": grant.expires_at});
     let role_epoch = decide::to_i64(chosen.role_epoch, "role_epoch")?;
+    if chosen.probe {
+        rearmed.events.push(NewEvent {
+            project_id: chosen.project_id.clone(),
+            event_id: child_id(&task_id, "probe"),
+            run_id: Some(chosen.run_id.clone()),
+            kind: PROBE.to_owned(),
+            payload: json!({"wake": chosen.wake.id, "attempt_id": attempt_id, "observation": null, "at": rfc3339_utc(now)}),
+        });
+    }
     // The dispatch notice refers to the allocation's event, after the rearms.
     let allocated_at = rearmed.events.len();
     let commit = Commit {
@@ -649,6 +704,336 @@ pub(super) fn could_allocate(
     Ok(bound
         && super::retry::budget_stop(tx, run_id, context)?.is_none()
         && not_before.is_none_or(|t| t <= now.as_str()))
+}
+
+/// Why run `run_id`'s Commander, at role epoch `epoch` and binding state `binding`, is unavailable now (empty:
+/// available; decision 5): its binding BLOCKED (`binding_blocked`); an owed wake with MAX_RETRIES failures under the
+/// epoch (`failures_capped`); its last turn of the epoch that ended failed for authentication or capability (`auth`,
+/// `capability`).
+fn unavailability(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    wakes: &[Wake],
+    epoch: i64,
+    binding: &str,
+) -> Result<Vec<&'static str>, PersistError> {
+    let mut reasons = Vec::new();
+    if binding == "BLOCKED" {
+        reasons.push("binding_blocked");
+    }
+    let cap = i64::from(crate::retry::MAX_RETRIES);
+    if wakes.iter().any(|w| w.owed() && w.failures(epoch) >= cap) {
+        reasons.push("failures_capped");
+    }
+    let last = wakes
+        .iter()
+        .flat_map(|w| w.turns.iter())
+        .filter(|t| t.role_epoch == epoch && t.ended())
+        .max_by_key(|t| t.ended_at.clone());
+    if let Some(turn) = last.filter(|t| t.state != Some(AttemptState::Settled)) {
+        let class: Option<String> = tx
+            .query_row(
+                "SELECT json_extract(payload_json, '$.failure.class') FROM events WHERE run_id = ?1 \
+                 AND kind = 'supervisor.turn_failed' AND json_extract(payload_json, '$.attempt_id') = ?2",
+                params![run_id, turn.attempt_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sqlite_error)?
+            .flatten();
+        match class.as_deref() {
+            Some("auth") => reasons.push("auth"),
+            Some("capability") => reasons.push("capability"),
+            _ => {}
+        }
+    }
+    Ok(reasons)
+}
+
+/// The run's last `supervisor.unavailable` or `supervisor.available`.
+struct Recorded {
+    unavailable: bool,
+    reasons: Value,
+    /// Its time (the supervisor's clock) and seq.
+    at: String,
+    seq: i64,
+}
+
+fn recorded(tx: &Transaction<'_>, run_id: &str) -> Result<Option<Recorded>, PersistError> {
+    let row: Option<(i64, String, String)> = tx
+        .query_row(
+            "SELECT seq, kind, payload_json FROM events WHERE run_id = ?1 AND kind IN (?2, ?3) \
+             ORDER BY seq DESC LIMIT 1",
+            params![run_id, UNAVAILABLE, AVAILABLE],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    row.map(|(seq, kind, payload)| {
+        let payload: Value = serde_json::from_str(&payload)
+            .map_err(|e| PersistError::IntegrityViolation(format!("{kind} of {run_id}: {e}")))?;
+        Ok(Recorded {
+            unavailable: kind == UNAVAILABLE,
+            reasons: payload["reasons"].clone(),
+            at: text(&payload, "at").unwrap_or_default(),
+            seq,
+        })
+    })
+    .transpose()
+}
+
+/// Judge run `run_id`'s Commander at `context.now()` (decision 5), in the supervisor's step: unavailable, it records
+/// `supervisor.unavailable{reasons}` when that changes and, while the run owes it a decision (an owed wake or a
+/// PENDING trigger), claims COMMANDER_UNAVAILABLE (and NEED_DECISION when a need_decision is owed) for the run, which
+/// is BLOCKED by it, its routine (normal) triggers superseded; available again, `supervisor.available` and the claims
+/// released (the run back in its state once nothing else is claimed). Only in a state that admits supervision.
+pub(super) fn judge(
+    tx: &Transaction<'_>,
+    project_id: &str,
+    run_id: &str,
+    context: &Context,
+    ctx: &Ctx<'_>,
+) -> Result<Commit, PersistError> {
+    let mut commit = Commit::default();
+    let row: Option<(String, i64, String, Option<String>)> = tx
+        .query_row(
+            "SELECT b.state, b.role_epoch, r.state, r.resume_state FROM role_bindings b JOIN runs r \
+             ON r.run_id = b.run_id WHERE b.run_id = ?1 AND b.role = ?2",
+            params![run_id, COMMANDER],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some((binding, epoch, state, resume)) = row else {
+        return Ok(commit);
+    };
+    let state = writer::parse::<RunState>(&state)?;
+    let working = crate::lifecycle::is_working(state);
+    if !working && !matches!(state, RunState::Blocked | RunState::WaitingExternal) {
+        return Ok(commit);
+    }
+    let now = context.now();
+    let at = rfc3339_utc(now);
+    let wakes = of_run(tx, run_id)?;
+    let reasons = unavailability(tx, run_id, &wakes, epoch, &binding)?;
+    let last = recorded(tx, run_id)?;
+    let event = |id: String, kind: &str, payload: Value| NewEvent {
+        project_id: project_id.to_owned(),
+        event_id: id,
+        run_id: Some(run_id.to_owned()),
+        kind: kind.to_owned(),
+        payload,
+    };
+    let number: i64 = tx
+        .query_row(
+            "SELECT count(*) FROM events WHERE run_id = ?1 AND kind IN (?2, ?3)",
+            params![run_id, UNAVAILABLE, AVAILABLE],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    let mut desired: Vec<BlockedReason> = Vec::new();
+    let mut owed_records = Vec::new();
+    if reasons.is_empty() {
+        if last.as_ref().is_some_and(|r| r.unavailable) {
+            commit.events.push(event(
+                child_id(run_id, &format!("supervisor/{number}")),
+                AVAILABLE,
+                json!({"at": at, "role_epoch": epoch}),
+            ));
+        }
+    } else {
+        if last
+            .as_ref()
+            .is_none_or(|r| !r.unavailable || r.reasons != json!(reasons))
+        {
+            commit.events.push(event(
+                child_id(run_id, &format!("supervisor/{number}")),
+                UNAVAILABLE,
+                json!({"reasons": reasons, "observation": null, "at": at, "role_epoch": epoch}),
+            ));
+        }
+        // What the run owes its Commander: its owed wakes and its PENDING triggers.
+        let mut seqs: Vec<i64> = Vec::new();
+        for wake in wakes.iter().filter(|w| w.owed()) {
+            seqs.extend(&wake.event_seqs);
+            owed_records.push(json!({"wake": wake.id, "fingerprint": wake.fingerprint}));
+        }
+        let triggers: Vec<(String, String, String)> = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT trigger_id, severity, event_seqs_json FROM supervisor_triggers \
+                     WHERE run_id = ?1 AND state = 'PENDING' ORDER BY first_seq",
+                )
+                .map_err(sqlite_error)?;
+            statement
+                .query_map(params![run_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .map_err(sqlite_error)?
+                .collect::<Result<_, _>>()
+                .map_err(sqlite_error)?
+        };
+        for (trigger_id, severity, trigger_seqs) in triggers {
+            if severity == Severity::Normal.as_str() {
+                // A routine trigger is not kept while the Commander is unavailable (decision 5).
+                tx.execute(
+                    "UPDATE supervisor_triggers SET state = 'SUPERSEDED' WHERE trigger_id = ?1 AND state = 'PENDING'",
+                    params![trigger_id],
+                )
+                .map_err(sqlite_error)?;
+                commit.events.push(event(
+                    child_id(&trigger_id, "superseded"),
+                    SUPERSEDED,
+                    json!({"trigger_id": trigger_id, "reason": "COMMANDER_UNAVAILABLE"}),
+                ));
+                continue;
+            }
+            seqs.extend(serde_json::from_str::<Vec<i64>>(&trigger_seqs).unwrap_or_default());
+            owed_records.push(json!({"trigger_id": trigger_id}));
+        }
+        if !owed_records.is_empty() {
+            desired.push(BlockedReason::CommanderUnavailable);
+            let decision: bool = tx
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM events WHERE kind = 'need_decision' \
+                     AND seq IN (SELECT value FROM json_each(?1)))",
+                    params![json!(seqs).to_string()],
+                    |r| r.get(0),
+                )
+                .map_err(sqlite_error)?;
+            if decision {
+                desired.push(BlockedReason::NeedDecision);
+            }
+        }
+    }
+    let mut claims = super::blockers::Claims::load(tx, project_id, run_id)?;
+    let before = claims.reasons();
+    let had = claims.held_by(SUPERVISOR);
+    claims.set(SUPERVISOR, &desired);
+    let union = claims.reasons();
+    let changed = union != before;
+    commit.events.extend(claims.store(tx)?);
+    let revision: i64 = tx
+        .query_row(
+            "SELECT revision FROM runs WHERE run_id = ?1",
+            params![run_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    if !desired.is_empty() && !had {
+        commit.events.push(event(
+            child_id(run_id, &format!("supervisor/{number}/blocked")),
+            "supervisor.blocked",
+            json!({"reasons": reasons, "owed": owed_records}),
+        ));
+    }
+    if !union.is_empty() && state != RunState::Blocked {
+        let (moves, withdrawn) = super::control::withdraw(
+            tx,
+            project_id,
+            run_id,
+            &at,
+            super::control::Withdraw::Blocked,
+            ctx,
+        )?;
+        commit.cas.extend(moves);
+        commit.events.extend(withdrawn);
+        commit.cas.push(StateCas {
+            id: run_id.to_owned(),
+            expected_revision: revision,
+            change: Change::Run(RunState::Blocked),
+        });
+        commit.events.push(event(
+            child_id(run_id, &format!("blocked/{revision}")),
+            "run.blocked",
+            json!({"reasons": union.iter().map(|r| r.as_str()).collect::<Vec<_>>(), "detail": "the commander is unavailable"}),
+        ));
+    } else if state == RunState::Blocked && changed {
+        if union.is_empty() {
+            let to = resume
+                .as_deref()
+                .map(writer::parse::<RunState>)
+                .transpose()?
+                .unwrap_or(RunState::Running);
+            commit.cas.push(StateCas {
+                id: run_id.to_owned(),
+                expected_revision: revision,
+                change: Change::Unblock(to),
+            });
+            commit.events.push(event(
+                child_id(run_id, &format!("resumed/{revision}")),
+                "run.resumed",
+                json!({"from": state.as_str(), "to": to.as_str(), "due": []}),
+            ));
+        } else {
+            commit.cas.push(StateCas {
+                id: run_id.to_owned(),
+                expected_revision: revision,
+                change: Change::Touch(writer::Entity::Run),
+            });
+        }
+    }
+    Ok(commit)
+}
+
+/// Whether run `run_id`'s Commander, unavailable for `reasons`, may be probed at `now` (decision 5): only for capped
+/// failures or a failed turn's class, its binding active; one probe per cooldown from the unavailability (or from the
+/// last probe's failed end), the next at once after a probe that settled. The wake to probe: the oldest capped one.
+fn probe(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    reasons: &[&str],
+    wakes: &[Wake],
+    epoch: i64,
+    now: std::time::SystemTime,
+) -> Result<Option<Option<String>>, PersistError> {
+    if reasons.is_empty()
+        || reasons
+            .iter()
+            .any(|r| !matches!(*r, "failures_capped" | "auth" | "capability"))
+    {
+        return Ok(None);
+    }
+    let Some(since) = recorded(tx, run_id)?.filter(|r| r.unavailable) else {
+        return Ok(None);
+    };
+    let last: Option<String> = tx
+        .query_row(
+            "SELECT json_extract(payload_json, '$.attempt_id') FROM events WHERE run_id = ?1 AND kind = ?2 \
+             AND seq > ?3 ORDER BY seq DESC LIMIT 1",
+            params![run_id, PROBE, since.seq],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?
+        .flatten();
+    // The cooldown runs from the unavailability, or from the last probe's failed end; a probe that settled lets the
+    // next one go at once.
+    let cooled = match last {
+        None => crate::time::parse_rfc3339(&since.at).is_some_and(|from| from + COOLDOWN <= now),
+        Some(attempt) => match wakes
+            .iter()
+            .flat_map(|w| w.turns.iter())
+            .find(|t| t.attempt_id == attempt)
+        {
+            Some(t) if t.state == Some(AttemptState::Settled) => true,
+            Some(t) if t.ended() => t
+                .ended_at
+                .as_deref()
+                .and_then(crate::time::parse_rfc3339)
+                .is_some_and(|from| from + COOLDOWN <= now),
+            _ => false,
+        },
+    };
+    if !cooled {
+        return Ok(None);
+    }
+    let cap = i64::from(crate::retry::MAX_RETRIES);
+    Ok(Some(
+        wakes
+            .iter()
+            .filter(|w| w.owed() && w.failures(epoch) >= cap)
+            .min_by_key(|w| w.woken_seq)
+            .map(|w| w.id.clone()),
+    ))
 }
 
 /// A supervision turn in flight the host must stop now (decision 3).
