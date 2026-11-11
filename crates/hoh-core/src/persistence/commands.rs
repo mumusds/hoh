@@ -45,6 +45,8 @@ pub enum RunTarget {
     Start {
         mode: String,
         budget: crate::config::Budget,
+        /// `supervision.policy`, frozen into the run's snapshot (docs/adr/ADR-025.md decision 9).
+        policy: String,
     },
     /// The project's team (ConfigureTeam, docs/adr/ADR-022.md decisions 3 and 4): revision r+1 over the current r,
     /// applied at once; `expected_revision` is the team revision. An empty `run_id` is the project's command (null in
@@ -125,7 +127,11 @@ pub(super) fn submit(
     }
     let mut team_revision = None;
     let (revision, event_seq) = match &command.target {
-        RunTarget::Start { mode, budget } => {
+        RunTarget::Start {
+            mode,
+            budget,
+            policy,
+        } => {
             if command.expected_revision != 0 {
                 return Err(PersistError::StaleRevision {
                     entity: writer::Entity::Run,
@@ -144,7 +150,13 @@ pub(super) fn submit(
                 ],
             )
             .map_err(sqlite_error)?;
-            super::team::start_run(&tx, &command.run_id, &command.event.project_id, budget)?;
+            super::team::start_run(
+                &tx,
+                &command.run_id,
+                &command.event.project_id,
+                budget,
+                policy,
+            )?;
             let done = writer::write(
                 &tx,
                 &Commit {

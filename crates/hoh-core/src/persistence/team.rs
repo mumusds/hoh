@@ -80,12 +80,14 @@ pub(super) fn revision(conn: &Connection, project_id: &str) -> Result<i64, Persi
 }
 
 /// In StartRun's transaction: bind every role of the current revision to run `run_id` at epoch 1, snapshot the
-/// scheduler (CR-007 S2) and write the run's budget and deadline (ADR-020 decision 7).
+/// scheduler (CR-007 S2) and the supervision policy (docs/adr/ADR-025.md decision 9), and write the run's budget and
+/// deadline (ADR-020 decision 7).
 pub(super) fn start_run(
     tx: &Connection,
     run_id: &str,
     project_id: &str,
     budget: &Budget,
+    policy: &str,
 ) -> Result<(), PersistError> {
     let (revision, config) = current(tx, project_id)?;
     let now = crate::time::now_rfc3339();
@@ -106,6 +108,7 @@ pub(super) fn start_run(
     }
     let snapshot = serde_json::json!({
         "scheduler": settings(&Params::from_settings(Some(&config.scheduler))),
+        "supervision": {"policy": policy},
     });
     tx.execute(
         "UPDATE runs SET config_revision = ?2, config_snapshot_json = ?3, deadline_at = ?4 WHERE run_id = ?1",

@@ -37,6 +37,7 @@ fn start(run_id: &str, budget: Budget) -> SubmitCommand {
         target: RunTarget::Start {
             mode: "AUTO".to_owned(),
             budget,
+            policy: "balanced".to_owned(),
         },
         event: NewEvent {
             project_id: "p1".to_owned(),
@@ -2811,5 +2812,24 @@ async fn a_control_notice_to_the_commander_carries_its_epoch_after_a_handover() 
         )?,
         [[2]]
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_started_run_freezes_its_supervision_policy_in_its_snapshot() -> R {
+    // docs/adr/ADR-025.md decision 9: StartRun writes the policy it is given into the run's snapshot.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    let mut command = start("R-policy", Config::default().budget);
+    if let RunTarget::Start { policy, .. } = &mut command.target {
+        *policy = "intensive".to_owned();
+    }
+    store.submit_command(command).await?;
+    let snapshot: String = Connection::open(&path)?.query_row(
+        "SELECT json_extract(config_snapshot_json, '$.supervision.policy') FROM runs WHERE run_id = 'R-policy'",
+        [],
+        |r| r.get(0),
+    )?;
+    assert_eq!(snapshot, "intensive");
     Ok(())
 }

@@ -134,18 +134,23 @@ fn take_in_batch(
     context: &Context,
     ctx: &Ctx<'_>,
 ) -> Result<(String, i64, bool), PersistError> {
-    let run: Option<(String, Option<i64>)> = tx
+    let run: Option<(String, Option<i64>, Option<String>)> = tx
         .query_row(
-            "SELECT r.project_id, s.revision FROM runs r LEFT JOIN specs s ON s.spec_id = r.spec_id WHERE r.run_id = ?1",
+            "SELECT r.project_id, s.revision, json_extract(r.config_snapshot_json, '$.supervision.policy') FROM runs r \
+             LEFT JOIN specs s ON s.spec_id = r.spec_id WHERE r.run_id = ?1",
             params![run_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()
         .map_err(sqlite_error)?;
-    let Some((project_id, revision)) = run else {
+    let Some((project_id, revision, policy)) = run else {
         return Err(PersistError::RunNotFound(run_id.to_owned()));
     };
-    let policy = Policy::Balanced;
+    // The policy frozen in the run's snapshot at StartRun (decision 9); balanced when it names none.
+    let policy = policy
+        .as_deref()
+        .and_then(Policy::named)
+        .unwrap_or(Policy::Balanced);
     let now = context.now();
     let cursor: i64 = tx
         .query_row(
