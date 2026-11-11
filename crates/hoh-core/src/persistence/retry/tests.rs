@@ -1256,3 +1256,79 @@ fn two_prompt_files_of_the_same_content_are_two_sources() {
         record(".hoh/prompts/a.md").revision_id()
     );
 }
+
+#[tokio::test]
+async fn a_refusal_the_same_input_would_meet_again_blocks_its_task_for_a_decision_at_once() -> R {
+    // docs/adr/ADR-026.md decision 9: CONTEXT_BUDGET_TOO_SMALL refuses the start; no retry, NEED_DECISION with a
+    // need_decision event (which wakes the Commander), the attempt's failure reason kept.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(WORLD)?;
+    let clock = at("2026-11-07T00:00:00Z")?;
+    let dispatched = tick(&store, clock).await?;
+    let [attempt] = dispatched.as_slice() else {
+        return Err(format!("dispatched {dispatched:?}").into());
+    };
+    let notice = store
+        .runner_waiting("p1")
+        .await?
+        .dispatches
+        .into_iter()
+        .find(|d| &d.attempt_id == attempt)
+        .ok_or("no dispatch notice")?;
+    assert!(store.runner_received(notice, clock).await?);
+    assert!(
+        store
+            .runner_finished(
+                attempt,
+                Ending {
+                    success: false,
+                    detail: "CONTEXT_BUDGET_TOO_SMALL".to_owned(),
+                    class: FailureClass::Decision,
+                    at: clock,
+                    draw: 0,
+                    observed: Default::default(),
+                    unknown_effect: false,
+                },
+            )
+            .await?
+    );
+    let conn = Connection::open(&path)?;
+    let (state, reason, next, count): (String, Option<String>, Option<String>, i64) = conn.query_row(
+        "SELECT state, blocked_reason, next_retry_at, attempt_count FROM tasks WHERE task_id = 'T1'",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )?;
+    assert_eq!(
+        (state.as_str(), reason.as_deref(), next, count),
+        ("BLOCKED", Some("NEED_DECISION"), None, 1)
+    );
+    let failure: String = conn.query_row(
+        "SELECT failure_reason FROM attempts WHERE attempt_id = ?1",
+        [attempt],
+        |r| r.get(0),
+    )?;
+    assert_eq!(failure, "CONTEXT_BUDGET_TOO_SMALL");
+    let need: Value = conn
+        .query_row(
+            "SELECT payload_json FROM events WHERE kind = 'need_decision'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .map(|p| serde_json::from_str(&p))??;
+    assert_eq!(need["reason"], "refused_deterministically");
+    assert_eq!(need["task_id"], "T1");
+    let retries: i64 = conn.query_row(
+        "SELECT count(*) FROM events WHERE kind = 'task.retry_scheduled'",
+        [],
+        |r| r.get(0),
+    )?;
+    assert_eq!(retries, 0);
+    // Nothing dispatched again.
+    assert!(
+        tick(&store, clock + Duration::from_secs(3_600))
+            .await?
+            .is_empty()
+    );
+    Ok(())
+}

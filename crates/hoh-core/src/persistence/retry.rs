@@ -61,7 +61,7 @@ fn millis(d: std::time::Duration) -> u64 {
 
 /// Decide `task` after `attempt_id` failed with `failure` (ADR-020 decisions 2 and 3): one more failure in its
 /// `attempt_count`, then READY at its `next_retry_at`, or BLOCKED for authentication, capability or a decision once
-/// its retries are used up (with a `need_decision` event). A task no longer LEASED or RUNNING is left alone.
+/// its retries are used up or a retry would be refused again (with a `need_decision` event). A task no longer LEASED or RUNNING is left alone.
 pub(super) fn fail_task(
     tx: &Transaction<'_>,
     task: &TaskRef<'_>,
@@ -145,6 +145,28 @@ pub(super) fn fail_task(
                         "{} failed {failures} times; {} retries are used up",
                         task.task_id,
                         crate::retry::MAX_RETRIES
+                    ),
+                }),
+            ));
+            (TaskState::Blocked, None, Some(BlockedReason::NeedDecision))
+        }
+        // Refused before anything ran, and the same input would be refused again (docs/adr/ADR-026.md decision 9):
+        // a decision at once; the attempt's failure reason and its `attempt.start_refused` say why.
+        AfterFailure::Decide => {
+            events.push(event(
+                task.project_id,
+                task.run_id,
+                child_id(attempt_id, "need_decision"),
+                "need_decision",
+                json!({
+                    "run_id": task.run_id,
+                    "task_id": task.task_id,
+                    "attempt_id": attempt_id,
+                    "reason": "refused_deterministically",
+                    "attempt_count": failures,
+                    "detail": format!(
+                        "{} was refused before anything ran, and the same input would be refused again",
+                        task.task_id
                     ),
                 }),
             ));
