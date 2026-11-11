@@ -683,11 +683,37 @@ fn a_run_that_does_not_claim_success_may_lack_its_artifacts_observations_and_dur
     let verdict = valid(&e, &c, &s, &w);
     assert_eq!(verdict, Ok(()));
     let o = outcome(&e, &verdict, &w);
-    assert_ne!(o.status.code(), "PASS");
+    // It fails for a reason that is no test failure: a rerun on the same candidate can supply it (M2T10D-801).
+    assert_eq!((o.status.code(), o.reason), ("FAIL", Some("INCOMPLETE")));
     assert_eq!(
         conclude(&e, &o, "TEST-052-04", true, false, false),
         None,
         "its PASS line proves nothing"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_timed_out_run_exiting_0_with_a_failing_line_is_a_failure_not_a_veto() -> R {
+    // Rule 11 vetoes a FAIL line only in a record that claims success (exit 0, not timed out): past its deadline the
+    // product records the child's own exit code, which may be 0 after SIGTERM (M2T10D-854).
+    let c = manifest().seal();
+    let s = c.manifest.spec.sha256.clone();
+    let mut e = e0(&c);
+    let w = world0(&c, &e);
+    e.observations.push(line("TEST-052-04", "FAIL"));
+    assert_eq!(
+        valid(&e, &c, &s, &w).map_err(|i| i.codes()),
+        Err(vec!["EXIT_INCONSISTENT"])
+    );
+    e.record.timed_out = true;
+    let verdict = valid(&e, &c, &s, &w);
+    assert_eq!(verdict, Ok(()));
+    let o = outcome(&e, &verdict, &w);
+    assert_eq!((o.status.code(), o.reason), ("FAIL", Some("TIMED_OUT")));
+    assert_eq!(
+        conclude(&e, &o, "TEST-052-04", true, false, false),
+        Some(Status::Fail)
     );
     Ok(())
 }
