@@ -18,6 +18,8 @@ mod clippy_canary;
 #[forbid(clippy::disallowed_methods)]
 pub mod config;
 #[forbid(clippy::disallowed_methods)]
+pub mod context;
+#[forbid(clippy::disallowed_methods)]
 pub mod dag;
 #[forbid(clippy::disallowed_methods)]
 pub mod decision;
