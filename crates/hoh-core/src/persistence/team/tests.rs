@@ -176,7 +176,9 @@ async fn a_started_run_snapshots_the_scheduler_and_gets_its_budget() -> R {
     assert_eq!(
         snapshot,
         json!({"scheduler": {"weights": {"user_value": 4, "unblock_value": 3, "risk_reduction": 3,
-            "information_gain": 2}, "max_wait_rounds": 20}})
+            "information_gain": 2}, "max_wait_rounds": 20},
+            // The supervision policy, frozen too (docs/adr/ADR-025.md decision 9).
+            "supervision": {"policy": "balanced"}})
     );
     assert_eq!(
         values(
