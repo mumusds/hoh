@@ -638,3 +638,35 @@ async fn a_retrigger_chain_on_an_unknown_revision_keeps_one_key() -> R {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn a_producers_fingerprint_ending_like_a_retrigger_still_keys_by_its_unknown_revision() -> R {
+    // M2T08D-1000, -1052 (docs/adr/ADR-025.md decision 2): a re-trigger is known by its event's kind, not by its
+    // fingerprint's suffix: two issues named "fp#retrigger" on revisions 9 and 10, which the project has no rows for,
+    // key apart.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    events(
+        &store,
+        "suffix",
+        &[
+            ("issue.opened", issue("fp#retrigger", 9)),
+            ("issue.opened", issue("fp#retrigger", 10)),
+        ],
+    )
+    .await?;
+    store.supervise("R", at(&clock, 0)).await?;
+    assert_eq!(
+        rows(
+            &path,
+            "SELECT fingerprint, spec_id FROM supervisor_triggers ORDER BY fingerprint"
+        )?,
+        [
+            [json!("fp#retrigger@r10"), Value::Null],
+            [json!("fp#retrigger@r9"), Value::Null]
+        ]
+    );
+    Ok(())
+}

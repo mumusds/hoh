@@ -57,7 +57,8 @@ impl CommitTimes {
     }
 }
 
-/// How many of a run's events one step looks at at most; the next step goes on from its cursor.
+/// How many of a run's events one batch of a step looks at at most, in one transaction; the step goes on from the
+/// batch's cursor until it has caught up (docs/adr/ADR-025.md decision 2).
 const STEP: i64 = 10_000;
 
 /// A trigger fired by a step.
@@ -78,7 +79,8 @@ pub struct Supervised {
     pub fired: Vec<Fired>,
 }
 
-/// One step of run `run_id`'s supervisor at `context.now()`, in one transaction.
+/// One step of run `run_id`'s supervisor at `context.now()`: its batches, each in its own transaction, then the firing
+/// of its due triggers in the last one.
 pub(super) fn step(
     conn: &mut Connection,
     run_id: &str,
@@ -189,9 +191,10 @@ fn take_in_batch(
             };
             // Timed from its commit (REQ-021 decision 4); an event an earlier writer committed, from now.
             // A revision the project has no spec row for keys by the revision itself, so revisions never merge.
-            // A re-trigger's base fingerprint already carries the revision of the wake it re-triggers (M2T08D-954).
+            // A re-trigger's base fingerprint already carries the revision of the wake it re-triggers (M2T08D-954);
+            // known by its kind, not by a suffix a producer's fingerprint may have too (M2T08D-1000).
             let fingerprint = match (spec_id.as_deref(), wake.key.spec_revision) {
-                (None, Some(revision)) if !wake.key.fingerprint.ends_with("#retrigger") => {
+                (None, Some(revision)) if !wake.retrigger => {
                     format!("{}@r{revision}", wake.key.fingerprint)
                 }
                 _ => wake.key.fingerprint.clone(),
