@@ -105,11 +105,18 @@ pub fn classify(
     let severity = match kind {
         "integrity_violation" => Severity::Integrity,
         "issue.opened" => issue_severity(payload)?,
-        "need_decision"
-        | "no_progress"
-        | "budget.risk"
-        | "team.binding_blocked"
-        | "team.binding_refused" => Severity::High,
+        "need_decision" | "no_progress" | "budget.risk" | "team.binding_blocked" => Severity::High,
+        // A stale decision's re-trigger (REQ-021 behaviour 6; docs/adr/ADR-025.md decision 6): keyed on its base
+        // fingerprint, so a chain of them keeps one key.
+        "supervisor.retrigger" => {
+            return payload["base_fingerprint"].as_str().map(|base| Wake {
+                key: Key {
+                    fingerprint: format!("{}#retrigger", base.trim_end_matches("#retrigger")),
+                    spec_revision: payload["spec_revision"].as_i64().or(spec_revision),
+                },
+                severity: Severity::High,
+            });
+        }
         "spec.changed" | "milestone_ready" | "release_request" => Severity::Normal,
         "iteration.completed" if policy != Policy::Efficient => Severity::Normal,
         "task.implemented"
