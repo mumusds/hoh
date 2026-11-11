@@ -35,6 +35,8 @@ pub mod integer;
 pub mod lifecycle;
 #[forbid(clippy::disallowed_methods)]
 pub mod nullable;
+#[forbid(clippy::disallowed_methods)]
+pub mod objects;
 pub mod persistence;
 #[forbid(clippy::disallowed_methods)]
 pub mod protocol;
