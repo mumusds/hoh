@@ -403,3 +403,71 @@ async fn a_late_step_times_the_trigger_from_its_events_commit_not_from_when_it_t
     assert_eq!(restarted, [[json!(2000), json!("across_restart")]]);
     Ok(())
 }
+
+/// Moves the test clock by `by_ms` just before each commit while armed: a transaction whose COMMIT takes that long.
+#[derive(Debug)]
+struct SlowCommit {
+    clock: std::sync::Arc<TestClock>,
+    by_ms: u64,
+    armed: std::sync::atomic::AtomicBool,
+}
+
+impl crate::persistence::FaultHooks for SlowCommit {
+    fn before_commit(&self) -> Result<(), crate::persistence::PersistError> {
+        if self.armed.load(std::sync::atomic::Ordering::SeqCst) {
+            let now = self.clock.0.lock().map(|m| *m).unwrap_or(0);
+            self.clock.set(now + self.by_ms);
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_slow_commit_times_its_events_from_after_the_commit() -> R {
+    // REQ-021 decision 4 (docs/adr/ADR-025.md decision 2, M2T08D-202, -301): an event's commit instant is read after
+    // its COMMIT, before the caller is answered. A transaction that begins at 0 s and commits at 3 s makes a trigger
+    // due at 5 s (2 s of quiet after the commit), not at 2 s, with a 2 s latency when it fires at 5 s.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let hooks = std::sync::Arc::new(SlowCommit {
+        clock: clock.clone(),
+        by_ms: 3000,
+        armed: std::sync::atomic::AtomicBool::new(false),
+    });
+    let path = dir.path().join(".hoh/state.db");
+    let store = Store::open(
+        &path,
+        Options {
+            wal_probe: Some(selftest::test_probe(None)),
+            clock: Some(StoreClock(clock.clone())),
+            faults: hooks.clone(),
+            ..Options::default()
+        },
+    )?;
+    exec(&path, WORLD)?;
+    clock.set(0);
+    hooks.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    let seqs = events(
+        &store,
+        "slow",
+        &[("need_decision", json!({"task_id": "D"}))],
+    )
+    .await?;
+    hooks
+        .armed
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        store.supervise("R", at(&clock, 4900)).await?.fired.len(),
+        0,
+        "due 2 s after the commit at 3 s, not after the start at 0 s"
+    );
+    let step = store.supervise("R", at(&clock, 5000)).await?;
+    assert_eq!(step.fired.len(), 1);
+    assert_eq!(step.fired[0].event_seqs, seqs);
+    let latency = rows(
+        &path,
+        "SELECT json_extract(payload_json, '$.wake_latency_ms') FROM events WHERE kind = 'supervisor.woken'",
+    )?;
+    assert_eq!(latency, [[json!(2000)]]);
+    Ok(())
+}

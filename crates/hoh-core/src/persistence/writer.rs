@@ -278,15 +278,21 @@ pub(super) fn begin<'c>(
 }
 
 /// Send a request's answer; one that succeeded passes the Committed point first (after its commit, before its answer).
-fn answer<T>(
+/// A request's answer, sent only once the instant its transaction committed is recorded (docs/adr/ADR-025.md
+/// decision 2): a caller that moves the clock once answered cannot move that instant.
+type Reply = Box<dyn FnOnce()>;
+
+fn answer<T: 'static>(
     ctx: &Ctx<'_>,
     reply: oneshot::Sender<Result<T, PersistError>>,
     result: Result<T, PersistError>,
-) {
+) -> Reply {
     if result.is_ok() {
         ctx.at(WritePoint::Committed);
     }
-    let _ = reply.send(result);
+    Box::new(move || {
+        let _ = reply.send(result);
+    })
 }
 
 /// Test-only fault injection inside the writer.
@@ -427,11 +433,6 @@ impl Writer {
                         continue;
                     }
                     before();
-                    // The commit instant of what this request commits: read before it runs, so before its answer
-                    // (a caller moving the clock once answered cannot move it), by the store's clock.
-                    let started = clock
-                        .as_ref()
-                        .map_or_else(std::time::SystemTime::now, |c| c.0.now());
                     let ctx = Ctx {
                         job: job.name(),
                         hooks: faults.as_ref(),
@@ -439,12 +440,17 @@ impl Writer {
                         after_events: &after_events,
                         commits: &commits,
                     };
+                    let mut deferred: Option<Reply> = None;
                     match job {
                         Job::Commit(commit, reply) => {
-                            answer(&ctx, reply, apply(&mut conn, &commit, &ctx));
+                            deferred = Some(answer(&ctx, reply, apply(&mut conn, &commit, &ctx)));
                         }
                         Job::Command(command, reply) => {
-                            answer(&ctx, reply, commands::submit(&mut conn, &command, &ctx));
+                            deferred = Some(answer(
+                                &ctx,
+                                reply,
+                                commands::submit(&mut conn, &command, &ctx),
+                            ));
                         }
                         Job::BeginHost(ids, reply) => {
                             let started = commands::begin_host(&mut conn, &ids.0, &ids.1);
@@ -452,7 +458,7 @@ impl Writer {
                                 project_id: s.project_id.clone(),
                                 host_epoch: s.host_epoch,
                             });
-                            answer(&ctx, reply, started);
+                            deferred = Some(answer(&ctx, reply, started));
                             if begun.is_some() {
                                 fence = begun;
                             }
@@ -463,36 +469,48 @@ impl Writer {
                         Job::Outbox(job, reply) => {
                             // A claim travels as a guard registered here: dropped before it is handed to a
                             // transport, wherever that happens, it is returned and undone (M2T04R-100, -200).
-                            answer(
+                            deferred = Some(answer(
                                 &ctx,
                                 reply,
                                 run_outbox(&mut conn, *job, &writer_claims, &ctx),
-                            );
+                            ));
                         }
                         Job::Plan(request, reply) => {
                             let (run_id, plan) = *request;
-                            answer(
+                            deferred = Some(answer(
                                 &ctx,
                                 reply,
                                 super::plan::import(&mut conn, &run_id, &plan, &ctx),
-                            );
+                            ));
                         }
                         Job::Round(request, reply) => {
                             let (run_id, context) = *request;
-                            answer(
+                            deferred = Some(answer(
                                 &ctx,
                                 reply,
                                 super::rounds::round(&mut conn, &run_id, &context, &ctx),
-                            );
+                            ));
                         }
                         Job::Reconcile(job, reply) => {
-                            answer(&ctx, reply, super::reconcile::run(&mut conn, *job, &ctx));
+                            deferred = Some(answer(
+                                &ctx,
+                                reply,
+                                super::reconcile::run(&mut conn, *job, &ctx),
+                            ));
                         }
                         Job::Runner(job, reply) => {
-                            answer(&ctx, reply, super::runner::run(&mut conn, *job, &ctx));
+                            deferred = Some(answer(
+                                &ctx,
+                                reply,
+                                super::runner::run(&mut conn, *job, &ctx),
+                            ));
                         }
                         Job::Control(job, reply) => {
-                            answer(&ctx, reply, super::control::run(&mut conn, *job, &ctx));
+                            deferred = Some(answer(
+                                &ctx,
+                                reply,
+                                super::control::run(&mut conn, *job, &ctx),
+                            ));
                         }
                         Job::Keep(held, reply) => {
                             kept.0.push(held);
@@ -501,44 +519,62 @@ impl Writer {
                         // Taken above: it only wakes the loop.
                         Job::Wake => {}
                         Job::EnsureProject(id, repo, reply) => {
-                            answer(&ctx, reply, ensure_project(&mut conn, &id, &repo, &ctx));
+                            deferred = Some(answer(
+                                &ctx,
+                                reply,
+                                ensure_project(&mut conn, &id, &repo, &ctx),
+                            ));
                         }
                         Job::ScratchTask(ids, reply) => {
-                            answer(&ctx, reply, scratch_task(&mut conn, &ids, &ctx));
+                            deferred =
+                                Some(answer(&ctx, reply, scratch_task(&mut conn, &ids, &ctx)));
                         }
                         Job::Attempt(job, reply) => {
-                            answer(&ctx, reply, attempts::apply(&mut conn, &job, &ctx));
+                            deferred =
+                                Some(answer(&ctx, reply, attempts::apply(&mut conn, &job, &ctx)));
                         }
                         Job::EndAttempt(request, reply) => {
                             let (change, latch) = *request;
-                            answer(&ctx, reply, attempts::end(&mut conn, &change, &latch, &ctx));
+                            deferred = Some(answer(
+                                &ctx,
+                                reply,
+                                attempts::end(&mut conn, &change, &latch, &ctx),
+                            ));
                         }
                         Job::Decide(request, reply) => {
                             let (proposal, context) = *request;
-                            answer(
+                            deferred = Some(answer(
                                 &ctx,
                                 reply,
                                 decide::decide(&mut conn, &proposal, &context, &ctx),
-                            );
+                            ));
                         }
                         Job::Fence(message, reply) => {
-                            answer(
+                            deferred = Some(answer(
                                 &ctx,
                                 reply,
                                 decide::commander_message(&mut conn, &message, &ctx),
-                            );
+                            ));
                         }
                     }
                     // Only what has committed is visible to this connection's next read.
+                    // Its commit instant: read after its COMMIT, before its answer, by the store's clock
+                    // (docs/adr/ADR-025.md decision 2), whatever the request was.
                     if let Ok(now) = commands::max_seq(&conn) {
+                        let at = clock
+                            .as_ref()
+                            .map_or_else(std::time::SystemTime::now, |c| c.0.now());
                         committed.send_if_modified(|seq| {
                             let moved = now > *seq;
                             if moved {
-                                commits.borrow_mut().record(*seq, now, started);
+                                commits.borrow_mut().record(*seq, now, at);
                                 *seq = now;
                             }
                             moved
                         });
+                    }
+                    if let Some(send) = deferred {
+                        send();
                     }
                 }
                 // Every claim not handed to a transport is undone before the store closes, the guards of some
