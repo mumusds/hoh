@@ -35,20 +35,63 @@ fn the_same_content_twice_is_one_object_and_leaves_nothing_staged() -> R {
 }
 
 #[test]
-fn an_object_whose_bytes_no_longer_match_its_name_is_refused_and_never_overwritten() -> R {
+fn a_damaged_object_is_refused_on_reading_and_repaired_by_its_own_bytes() -> R {
     let dir = tempfile::tempdir()?;
     let sha = put(dir.path(), b"original")?;
     let path = object_path(dir.path(), &sha)?;
     std::fs::write(&path, b"tampered")?;
     let read = get(dir.path(), &sha);
     assert!(read.is_err(), "{read:?}");
-    let again = put(dir.path(), b"original");
-    assert!(again.is_err(), "{again:?}");
-    assert_eq!(
-        std::fs::read(&path)?,
-        b"tampered",
-        "a damaged object is left for a person to see"
-    );
+    // Its name says what it must hold: the next write of those bytes puts them back.
+    assert_eq!(put(dir.path(), b"original")?, sha);
+    assert_eq!(get(dir.path(), &sha)?, b"original");
+    let shard = path.parent().ok_or("shard")?;
+    assert_eq!(std::fs::read_dir(shard)?.count(), 1, "no staged file left");
+    Ok(())
+}
+
+#[test]
+fn a_staged_file_a_crash_left_does_not_stand_in_the_way() -> R {
+    let dir = tempfile::tempdir()?;
+    let sha = sha256_hex(b"after a crash");
+    let shard = object_path(dir.path(), &sha)?
+        .parent()
+        .ok_or("shard")?
+        .to_owned();
+    std::fs::create_dir_all(&shard)?;
+    // Whatever a dead writer of the same process id left, under the next names this process would use.
+    let next = STAGED.load(std::sync::atomic::Ordering::Relaxed);
+    for n in next..next + 64 {
+        std::fs::write(
+            shard.join(format!(".{sha}.{}.{n}", std::process::id())),
+            b"half",
+        )?;
+    }
+    assert_eq!(put(dir.path(), b"after a crash")?, sha);
+    assert_eq!(get(dir.path(), &sha)?, b"after a crash");
+    Ok(())
+}
+
+#[test]
+fn many_writers_of_the_same_bytes_at_once_all_get_one_whole_object() -> R {
+    let dir = tempfile::tempdir()?;
+    let bytes = vec![7u8; 1 << 20];
+    let shas: Vec<String> = std::thread::scope(|scope| -> Result<Vec<String>, String> {
+        let handles: Vec<_> = (0..8)
+            .map(|_| scope.spawn(|| put(dir.path(), &bytes)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().map_err(|_| "panicked".to_owned()).and_then(|r| r))
+            .collect()
+    })?;
+    assert!(shas.windows(2).all(|w| w[0] == w[1]));
+    assert_eq!(get(dir.path(), &shas[0])?, bytes);
+    let shard = object_path(dir.path(), &shas[0])?
+        .parent()
+        .ok_or("shard")?
+        .to_owned();
+    assert_eq!(std::fs::read_dir(shard)?.count(), 1, "no staged file left");
     Ok(())
 }
 
@@ -80,6 +123,12 @@ fn the_resource_bundle_version_is_the_crate_version_and_a_digest_of_every_resour
         "{v}"
     );
     assert_eq!(v, resource_bundle_version());
+    // The packing format is part of it: another format, another version.
+    assert_eq!(
+        digest_of(&with_format(&RESOURCES, crate::context::FORMAT)),
+        digest
+    );
+    assert_ne!(digest_of(&with_format(&RESOURCES, "hoh-context/0")), digest);
     let paths: Vec<&str> = RESOURCES.iter().map(|(p, _)| *p).collect();
     for want in [
         "resources/prompts/commander.md",
@@ -90,6 +139,7 @@ fn the_resource_bundle_version_is_the_crate_version_and_a_digest_of_every_resour
         "resources/prompts/reviewer.md",
         "contracts/protocol.schema.json",
         "contracts/independent-report.schema.json",
+        "contracts/acceptance-observation.schema.json",
     ] {
         assert!(paths.contains(&want), "{want} not in the bundle");
     }

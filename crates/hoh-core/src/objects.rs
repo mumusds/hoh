@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 /// Every resource built into the binary that a packed prompt can depend on, by its path in the source tree: the
 /// built-in role contracts and the schemas the output contracts come from.
-pub const RESOURCES: [(&str, &str); 8] = [
+pub const RESOURCES: [(&str, &str); 9] = [
     (
         "resources/prompts/commander.md",
         include_str!("../../../resources/prompts/commander.md"),
@@ -41,6 +41,10 @@ pub const RESOURCES: [(&str, &str); 8] = [
         "contracts/independent-report.schema.json",
         include_str!("../../../contracts/independent-report.schema.json"),
     ),
+    (
+        "contracts/acceptance-observation.schema.json",
+        include_str!("../../../contracts/acceptance-observation.schema.json"),
+    ),
 ];
 
 /// Where the object named `sha256` lives under the project at `project`; only a lower-case sha256 names one.
@@ -58,6 +62,10 @@ pub fn object_path(project: &Path, sha256: &str) -> Result<PathBuf, String> {
         .join(sha256))
 }
 
+/// The counter of staged names: each staged file has its own name, this process's id and the next count, created
+/// only if absent (a name a dead process of the same id left is skipped, never reused).
+static STAGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Keeps `bytes` as an object and returns its sha256: written whole to a file of its own, synced, then linked to its
 /// place, which fails if anything is there already; the directory synced so the link outlives a power loss. The same
 /// bytes there already are taken; other bytes there are refused and left as they are (a damaged object is for a
@@ -74,33 +82,47 @@ fn put_with(
     sync_dir: &dyn Fn(&Path) -> std::io::Result<()>,
 ) -> Result<String, String> {
     use std::io::Write as _;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    // Each staged file its own name: this process's id and a counter, created only if absent.
-    static STAGED: AtomicU64 = AtomicU64::new(0);
+    use std::sync::atomic::Ordering;
     let sha256 = sha256_hex(bytes);
     let path = object_path(project, &sha256)?;
     let dir = path.parent().ok_or("no directory")?;
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let staged = dir.join(format!(
-        ".{sha256}.{}.{}",
-        std::process::id(),
-        STAGED.fetch_add(1, Ordering::Relaxed)
-    ));
-    let written = (|| {
-        let mut file = std::fs::File::create_new(&staged)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        std::fs::hard_link(&staged, &path)
-    })();
-    let _ = std::fs::remove_file(&staged);
-    match written {
-        Ok(()) => {}
-        // Made by another write of the same bytes, or damaged: taken only if its bytes match its name.
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            get(project, &sha256)?;
+    let mut tries = 0;
+    let (staged, mut file) = loop {
+        let staged = dir.join(format!(
+            ".{sha256}.{}.{}",
+            std::process::id(),
+            STAGED.fetch_add(1, Ordering::Relaxed)
+        ));
+        match std::fs::File::create_new(&staged) {
+            Ok(file) => break (staged, file),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && tries < 1_000 => tries += 1,
+            Err(e) => return Err(format!("{}: {e}", staged.display())),
         }
-        Err(e) => return Err(format!("{}: {e}", path.display())),
-    }
+    };
+    let placed = (|| -> Result<(), String> {
+        let at = |e: std::io::Error| format!("{}: {e}", staged.display());
+        file.write_all(bytes).map_err(at)?;
+        file.sync_all().map_err(at)?;
+        match std::fs::hard_link(&staged, &path) {
+            Ok(()) => Ok(()),
+            // Made by another write of the same bytes: taken if its bytes match its name. Damaged: its name says
+            // what it must hold, so this write's own staged copy (whole and synced) is renamed over it, then read
+            // back.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if get(project, &sha256).is_err() {
+                    std::fs::rename(&staged, &path)
+                        .map_err(|e| format!("{}: {e}", path.display()))?;
+                    get(project, &sha256)?;
+                }
+                Ok(())
+            }
+            Err(e) => Err(format!("{}: {e}", path.display())),
+        }
+    })();
+    drop(file);
+    let _ = std::fs::remove_file(&staged);
+    placed?;
     let top = project.join(".hoh");
     let mut at = Some(dir);
     while let Some(d) = at {
@@ -126,7 +148,18 @@ pub fn get(project: &Path, sha256: &str) -> Result<Vec<u8>, String> {
 /// `<crate version>+<digest of every resource>`: the same binary gives the same version, and a binary whose
 /// resources differ in any byte gives another.
 pub fn resource_bundle_version() -> String {
-    format!("{}+{}", env!("CARGO_PKG_VERSION"), digest_of(&RESOURCES))
+    format!(
+        "{}+{}",
+        env!("CARGO_PKG_VERSION"),
+        digest_of(&with_format(&RESOURCES, crate::context::FORMAT))
+    )
+}
+
+/// The resources and the packing format, which the digest covers as one more line.
+fn with_format<'a>(resources: &[(&'a str, &'a str)], format: &'a str) -> Vec<(&'a str, &'a str)> {
+    let mut all = resources.to_vec();
+    all.push(("context::FORMAT", format));
+    all
 }
 
 /// The sha256 of the resources' `<path> <sha256>` lines, sorted by path.
