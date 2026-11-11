@@ -189,8 +189,11 @@ fn take_in_batch(
             };
             // Timed from its commit (REQ-021 decision 4); an event an earlier writer committed, from now.
             // A revision the project has no spec row for keys by the revision itself, so revisions never merge.
+            // A re-trigger's base fingerprint already carries the revision of the wake it re-triggers (M2T08D-954).
             let fingerprint = match (spec_id.as_deref(), wake.key.spec_revision) {
-                (None, Some(revision)) => format!("{}@r{revision}", wake.key.fingerprint),
+                (None, Some(revision)) if !wake.key.fingerprint.ends_with("#retrigger") => {
+                    format!("{}@r{revision}", wake.key.fingerprint)
+                }
                 _ => wake.key.fingerprint.clone(),
             };
             take_in(

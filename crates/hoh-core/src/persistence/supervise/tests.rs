@@ -610,3 +610,31 @@ async fn a_capped_step_fires_nothing_before_it_has_caught_up_with_what_is_commit
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn a_retrigger_chain_on_an_unknown_revision_keeps_one_key() -> R {
+    // M2T08D-954 (docs/adr/ADR-025.md decision 2): a re-trigger of a wake whose fingerprint already carries "@r9"
+    // keys as "<fingerprint>#retrigger" once, and a re-trigger of that re-trigger keys the same.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    events(
+        &store,
+        "chain",
+        &[
+            ("supervisor.retrigger", json!({"base_fingerprint": "fp@r9", "spec_revision": 9, "task_ids": ["D"]})),
+            ("supervisor.retrigger", json!({"base_fingerprint": "fp@r9#retrigger", "spec_revision": 9, "task_ids": ["D"]})),
+        ],
+    )
+    .await?;
+    store.supervise("R", at(&clock, 0)).await?;
+    assert_eq!(
+        rows(
+            &path,
+            "SELECT DISTINCT fingerprint FROM supervisor_triggers"
+        )?,
+        [[json!("fp@r9#retrigger")]]
+    );
+    Ok(())
+}
