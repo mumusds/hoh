@@ -230,6 +230,20 @@ class GateComparison(Envelope):
         self.f.edit_test_results('static',static);self.f.edit_execution('static',exit_code=1)
         self.assertRegex(self.gate(),'static: command failed')
         self.assertEqual(self.report(own(*SELF_TESTS))['tests'][t]['status'],'FLAKY')
+    def test_rule_11_on_a_check_that_is_not_the_scenario(self):
+        # Listed difference (M2T10R-54): the gate reads only the scenario check's lines; the replica vetoes any record
+        # claiming success with a FAIL line.
+        t=self.scenario_tests('unit')[0]
+        self.f.edit_test_results('static',self.lines_of('static')+[{'schema_version':'1.0','test_id':t,'name':'cross','status':'FAIL'}])
+        self.assertIsNone(self.gate());self.vetoed_without_gate('static','EXIT_INCONSISTENT')
+    def test_a_degraded_line_on_a_check_that_is_not_the_scenario(self):
+        # Listed difference (M2T10R-54): conclusion (3) on a non-scenario check's DEGRADED line, which the gate never reads.
+        t=self.scenario_tests('unit')[0]
+        self.f.edit_test_results('static',self.lines_of('static')+[{'schema_version':'1.0','test_id':t,'name':'cross','status':'DEGRADED','detail':DETAIL}])
+        self.assertIsNone(self.gate())
+        self.assertEqual(self.report(own(*SELF_TESTS))['tests'][t]['status'],'FLAKY')
+    def vetoed_without_gate(self,key,code):
+        w,found=self.judged();m=self.member(found,key);self.assertIn(code,m.reasons)
     def test_a_member_outside_the_manifest(self):
         t=self.scenario_tests('unit')[0];lines=self.lines_of('unit')
         for l in lines:
@@ -347,6 +361,11 @@ class History(Envelope):
         failing=[{'schema_version':'1.0','test_id':'TEST-052-05','name':'old','status':'FAIL'}]
         self.another('traceability','tr-earlier',lines=failing,exit_code=1)
         rep=self.report(own(*SELF_TESTS));self.assertEqual(rep['tests']['TEST-052-05']['status'],'FLAKY')
+    def test_another_check_sees_an_earlier_traceability_run_as_it_is(self):
+        # M2T10R-51: only the traceability check's own run takes its TESTs from its self-test lines; any other check
+        # (the independent ones' judgement) counts the earlier traceability members as any member.
+        w=tr.World(self.f.root,self.f.candidate,self.profile,check_id='independent-review',requirements=self.requirements)
+        rep=tr.report(w,tr.members(w),[]);self.assertEqual(rep['tests']['TEST-052-05']['status'],'PASS')
     def test_an_earlier_traceability_pass_does_not_satisfy_this_run(self):
         rep=self.report([]);self.assertEqual(rep['tests']['TEST-052-05']['status'],'NOT_RUN')
         self.assertIn({'id':'TEST-052-05','status':'NOT_RUN'},rep['unsatisfied'])
@@ -389,21 +408,26 @@ class EndToEnd(unittest.TestCase):
         spec={'requirements':[{'id':'REQ-901','release_targets':['v0.1'],'release_class':'required',
                                'acceptance':[{'id':'AC-901-01','test_id':'TEST-901-01'},{'id':'AC-901-02','test_id':'TEST-901-02'}]},
                               {'id':'REQ-902','release_targets':['v0.1'],'release_class':'required','acceptance':[{'id':'AC-902-01','test_id':'TEST-902-01'}]},
+                              {'id':'REQ-904','release_targets':['v0.1'],'release_class':'required','acceptance':[{'id':'AC-901-03','test_id':'TEST-901-03'}]},
                               {'id':'REQ-903','release_targets':['v1'],'release_class':'required','acceptance':[{'id':'AC-903-01','test_id':'TEST-903-01'}]}]}
         (r/'contracts/requirements.json').write_text(json.dumps(spec,indent=1))
         (r/'contracts/acceptance-scenarios.json').write_text(json.dumps({'scenarios':[{'id':'TEST-901-01','check_id':'unit'},{'id':'TEST-901-02','check_id':'unit'},
-                                                                                     {'id':'TEST-902-01','check_id':'traceability'},{'id':'TEST-903-01','check_id':'unit'}]}))
+                                                                                     {'id':'TEST-902-01','check_id':'traceability'},{'id':'TEST-903-01','check_id':'unit'},
+                                                                                     {'id':'TEST-901-03','check_id':'integration'}]}))
         (r/'fixture-tests').mkdir()
         for name in ('fixture::test_901_01_first','fixture::test_901_02_second'):(r/'fixture-tests'/name.split('::')[1]).write_text(name+'\n')
+        (r/'integration-tests').mkdir();(r/'integration-tests/test_901_03_third').write_text('integration::test_901_03_third\n')
         # A fixture `unit` check: each file under fixture-tests/ is a test, failing while .hoh-dev/fixture-fail exists.
         (r/'unit.sh').write_text('set -Eeuo pipefail\nlog="$(mktemp)";trap \'rm -f "$log"\' EXIT;rc=0\n'
                                  'for f in fixture-tests/*;do if [[ -e .hoh-dev/fixture-fail ]];then echo "test $(cat "$f") ... FAILED";rc=101;'
                                  'else echo "test $(cat "$f") ... ok";fi;done>"$log"\ncat "$log"\n'
                                  'python3 scripts/product/test_results.py --log "$log" --out "$HOH_EVIDENCE_DIR/test-results.jsonl"\nexit $rc\n')
+        (r/'integ.sh').write_text((r/'unit.sh').read_text().replace('fixture-tests/','integration-tests/'))
         (r/'tests/bundle').mkdir(parents=True)
         (r/'tests/bundle/test_fixture.py').write_text('import unittest\nclass Fixture(unittest.TestCase):\n    def test_902_01_the_fixture_self_test(self):pass\n')
         plan={'schema_version':'1.0','plan_id':'traceability-fixture','description':'Synthetic fixture plan.','checks':{
             'unit':{'mode':'product','argv':['bash','unit.sh'],'artifacts':['test-results.jsonl'],'timeout_seconds':60},
+            'integration':{'mode':'product','argv':['bash','integ.sh'],'artifacts':['test-results.jsonl'],'timeout_seconds':60},
             'traceability':{'mode':'product','argv':['bash','scripts/product/traceability.sh','v0.1'],'artifacts':['test-results.jsonl','traceability-report.json'],'timeout_seconds':300}}}
         (r/'plan.json').write_text(json.dumps(plan,indent=1))
         (r/'.gitignore').write_text('.hoh-dev/\n__pycache__/\n')
@@ -432,25 +456,30 @@ class EndToEnd(unittest.TestCase):
     def commit(self,message):self.git('add','-A');self.git('commit','-qm',message)
     def test_052_05_traceability_passes_c_and_lists_what_c_prime_lost(self):
         c=self.freeze('c');cid=load_json(self.root/c)['candidate_id']
-        self.assertEqual(self.check(c,'unit')[0],0)
+        self.assertEqual((self.check(c,'unit')[0],self.check(c,'integration')[0]),(0,0))
         rc,report,out=self.traceability(c)
         self.assertEqual(rc,0,(out/'stderr.log').read_text())
         self.assertEqual(report['candidate_id'],cid)
-        self.assertEqual({t:v['status'] for t,v in report['tests'].items()},{'TEST-901-01':'PASS','TEST-901-02':'PASS','TEST-902-01':'PASS'})
+        # Each TEST with its status, its source check and the passing tests that satisfy it (AC-052-05, M2T10R-50).
+        self.assertEqual({t:(v['status'],v['check'],v['passing']) for t,v in report['tests'].items()},
+                         {'TEST-901-01':('PASS','unit',['fixture::test_901_01_first']),'TEST-901-02':('PASS','unit',['fixture::test_901_02_second']),
+                          'TEST-901-03':('PASS','integration',['integration::test_901_03_third']),
+                          'TEST-902-01':('PASS','traceability',['test_fixture.Fixture.test_902_01_the_fixture_self_test'])})
+        self.assertEqual(report['tests']['TEST-901-03']['members'],['.hoh-dev/evidence/2-integration/execution.json'])
         self.assertEqual((report['unsatisfied'],report['invalid']),([],[]))
         self.assertEqual([json.loads(l)['test_id'] for l in (out/'artifacts/test-results.jsonl').read_text().splitlines()],['TEST-902-01'])
         # C': a test of a v0.1 AC really deleted, frozen anew, its check rerun.
         (self.root/'fixture-tests/test_901_02_second').unlink();self.commit('drop a test')
         c2=self.freeze('c2');cid2=load_json(self.root/c2)['candidate_id'];self.assertNotEqual(cid2,cid)
-        self.assertEqual(self.check(c2,'unit')[0],0)
+        self.assertEqual((self.check(c2,'unit')[0],self.check(c2,'integration')[0]),(0,0))
         rc,report,out=self.traceability(c2)
         self.assertNotEqual(rc,0);self.assertEqual(report['candidate_id'],cid2)
         self.assertEqual(report['unsatisfied'],[{'id':'TEST-901-02','status':'NOT_RUN'}])
         self.assertIn('NOT_RUN TEST-901-02',(out/'stderr.log').read_text())
         # Each report stays bound to its own candidate.
-        self.assertEqual(load_json(self.root/'.hoh-dev/evidence/2-traceability/artifacts/traceability-report.json')['candidate_id'],cid)
+        self.assertEqual(load_json(self.root/'.hoh-dev/evidence/3-traceability/artifacts/traceability-report.json')['candidate_id'],cid)
     def test_052_05_only_failures_or_a_failure_then_a_pass_exit_nonzero(self):
-        c=self.freeze('c');(self.root/'.hoh-dev/fixture-fail').write_text('')
+        c=self.freeze('c');self.check(c,'integration');(self.root/'.hoh-dev/fixture-fail').write_text('')
         self.assertEqual(self.check(c,'unit')[0],101)
         rc,report,_=self.traceability(c)
         self.assertEqual((rc,report['tests']['TEST-901-01']['status']),(1,'FAIL'))
@@ -459,7 +488,7 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual((rc,report['tests']['TEST-901-01']['status']),(1,'FLAKY'))
     def test_a_missing_self_test_writes_no_line_and_is_not_run(self):
         (self.root/'tests/bundle/test_fixture.py').write_text('import unittest\nclass Fixture(unittest.TestCase):\n    def test_renamed(self):pass\n')
-        self.commit('lose the self-test');c=self.freeze('c');self.check(c,'unit')
+        self.commit('lose the self-test');c=self.freeze('c');self.check(c,'unit');self.check(c,'integration')
         rc,report,out=self.traceability(c)
         self.assertEqual((rc,report['unsatisfied']),(1,[{'id':'TEST-902-01','status':'NOT_RUN'}]))
         self.assertEqual((out/'artifacts/test-results.jsonl').read_text(),'')

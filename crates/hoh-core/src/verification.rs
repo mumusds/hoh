@@ -348,6 +348,122 @@ pub struct Planned {
     pub artifacts: Vec<String>,
 }
 
+/// Every way `plan` is not of the locked contracts/check-plan.schema.json's shape, each named (rule 1; M2T10R-01). The
+/// in-crate validator cannot read that schema's `^(?!/)` pattern, so the shape is checked here, and an integration
+/// test holds these verdicts to Python jsonschema's on the locked schema itself.
+pub fn plan_shape(plan: &Value) -> Vec<String> {
+    let Some(top) = plan.as_object() else {
+        return vec!["the plan is not an object".to_owned()];
+    };
+    let mut problems: Vec<String> = top
+        .keys()
+        .filter(|k| !["schema_version", "plan_id", "description", "checks"].contains(&k.as_str()))
+        .map(|k| format!("the plan has a key the schema does not know: {k}"))
+        .collect();
+    if plan["schema_version"] != "1.0" {
+        problems.push("the plan's schema_version is not 1.0".to_owned());
+    }
+    if !plan["plan_id"]
+        .as_str()
+        .is_some_and(|s| (1..=160).contains(&s.chars().count()))
+    {
+        problems.push("the plan's plan_id is missing, empty or longer than 160".to_owned());
+    }
+    if top.get("description").is_some_and(|d| !d.is_string()) {
+        problems.push("the plan's description is not a string".to_owned());
+    }
+    match plan["checks"].as_object() {
+        Some(checks) if !checks.is_empty() => {
+            for (name, entry) in checks {
+                problems.extend(entry_shape(name, entry));
+            }
+        }
+        _ => problems.push("the plan has no checks".to_owned()),
+    }
+    problems
+}
+
+/// Every way the plan entry `entry` of check `name` is not of the schema's shape.
+fn entry_shape(name: &str, entry: &Value) -> Vec<String> {
+    let named = |what: String| format!("check {name}: {what}");
+    let mut problems = Vec::new();
+    // ^[a-z][a-z0-9-]{0,63}$
+    let b = name.as_bytes();
+    if !(b.first().is_some_and(u8::is_ascii_lowercase)
+        && b.len() <= 64
+        && b.iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-'))
+    {
+        problems.push(named("its name is not of the schema's pattern".to_owned()));
+    }
+    let Some(o) = entry.as_object() else {
+        problems.push(named("its entry is not an object".to_owned()));
+        return problems;
+    };
+    let known = [
+        "mode",
+        "argv",
+        "cwd",
+        "timeout_seconds",
+        "artifacts",
+        "description",
+    ];
+    for k in o.keys().filter(|k| !known.contains(&k.as_str())) {
+        problems.push(named(format!("a key the schema does not know: {k}")));
+    }
+    if !["bundle", "mock", "product", "live"].contains(&entry["mode"].as_str().unwrap_or_default())
+    {
+        problems.push(named("mode is not one of the schema's".to_owned()));
+    }
+    if !entry["argv"].as_array().is_some_and(|a| {
+        !a.is_empty() && a.iter().all(|x| x.as_str().is_some_and(|s| !s.is_empty()))
+    }) {
+        problems.push(named("argv is not a list of non-empty strings".to_owned()));
+    }
+    if let Some(cwd) = o.get("cwd")
+        && !cwd
+            .as_str()
+            .is_some_and(|c| !c.is_empty() && !c.starts_with('/'))
+    {
+        problems.push(named(format!("cwd {cwd} is not a relative path")));
+    }
+    if let Some(t) = o.get("timeout_seconds")
+        && !(t.is_number() && t.as_f64().is_some_and(|t| t > 0.0))
+    {
+        problems.push(named("timeout_seconds is not a positive number".to_owned()));
+    }
+    if let Some(a) = o.get("artifacts") {
+        match a.as_array() {
+            Some(names) => {
+                let mut seen = std::collections::BTreeSet::new();
+                for n in names {
+                    // ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$
+                    let fits = n.as_str().is_some_and(|s| {
+                        let b = s.as_bytes();
+                        b.first().is_some_and(u8::is_ascii_alphanumeric)
+                            && b.len() <= 128
+                            && b.iter()
+                                .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(c))
+                    });
+                    if !fits {
+                        problems.push(named(format!(
+                            "artifact name {n} is not of the schema's pattern"
+                        )));
+                    }
+                    if !seen.insert(n.to_string()) {
+                        problems.push(named(format!("artifact {n} is declared twice")));
+                    }
+                }
+            }
+            None => problems.push(named("artifacts is not a list".to_owned())),
+        }
+    }
+    if o.get("description").is_some_and(|d| !d.is_string()) {
+        problems.push(named("description is not a string".to_owned()));
+    }
+    problems
+}
+
 /// The attempt that produced evidence: its run and its task's role (principle two).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Producer {
@@ -404,6 +520,7 @@ pub trait Lookup {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Reason {
     CandidateMismatch,
+    RecordInvalid,
     TreeMismatch,
     SpecMismatch,
     EnvironmentMismatch,
@@ -438,10 +555,53 @@ pub enum Reason {
 }
 
 impl Reason {
+    /// Every reason, in declaration order.
+    pub const ALL: [Reason; 33] = [
+        Reason::CandidateMismatch,
+        Reason::RecordInvalid,
+        Reason::TreeMismatch,
+        Reason::SpecMismatch,
+        Reason::EnvironmentMismatch,
+        Reason::TestPlanMismatch,
+        Reason::ProducerMissing,
+        Reason::IntervalInvalid,
+        Reason::SourceChanged,
+        Reason::OutputChanged,
+        Reason::ArtifactMissing,
+        Reason::NoObservations,
+        Reason::ErrorOutputChanged,
+        Reason::ArtifactChanged,
+        Reason::ArtifactsDifferFromPlan,
+        Reason::ExitInconsistent,
+        Reason::CommandMismatch,
+        Reason::ModeMismatch,
+        Reason::CwdMismatch,
+        Reason::CheckNotPlanned,
+        Reason::ManifestMismatch,
+        Reason::RunnerTool,
+        Reason::RunnerRoot,
+        Reason::OutsideRecordDir,
+        Reason::RecordDirOverlap,
+        Reason::RecordIdReused,
+        Reason::LiveSessionsUnbound,
+        Reason::LiveSessionsMissing,
+        Reason::ResultLineInvalid,
+        Reason::CheckNotInPolicy,
+        Reason::PlanModeNotPolicy,
+        Reason::ProducerMismatch,
+        Reason::ProducerNotIndependent,
+    ];
+
+    /// The reason whose code is `code`.
+    pub fn from_code(code: &str) -> Option<Reason> {
+        Reason::ALL.into_iter().find(|r| r.code() == code)
+    }
+
     /// The code written into event payloads and acceptance_results.reason.
     pub fn code(self) -> &'static str {
         match self {
             Reason::CandidateMismatch => "CANDIDATE_MISMATCH",
+            Reason::RecordInvalid => "RECORD_INVALID",
             Reason::TreeMismatch => "TREE_MISMATCH",
             Reason::SpecMismatch => "SPEC_MISMATCH",
             Reason::EnvironmentMismatch => "ENVIRONMENT_MISMATCH",
@@ -565,6 +725,13 @@ pub fn valid(e: &Evidence, c: &Sealed, s: &str, world: &dyn Lookup) -> Result<()
         }
     };
     need(r.candidate_id == c.candidate_id, Reason::CandidateMismatch);
+    // Rule 1: the record is of the locked contracts/execution.schema.json's shape (M2T10R-01).
+    need(
+        serde_json::to_value(r)
+            .ok()
+            .is_some_and(|v| Record::from_value(&v).is_ok()),
+        Reason::RecordInvalid,
+    );
     need(e.git_tree == m.git_tree, Reason::TreeMismatch);
     need(
         r.spec_sha256 == s && s == m.spec.sha256,
@@ -726,6 +893,19 @@ pub enum Status {
 }
 
 impl Status {
+    /// The status whose code is `code`.
+    pub fn from_code(code: &str) -> Option<Status> {
+        [
+            Status::Pass,
+            Status::Degraded,
+            Status::Fail,
+            Status::Blocked,
+            Status::Invalid,
+        ]
+        .into_iter()
+        .find(|s| s.code() == code)
+    }
+
     pub fn code(self) -> &'static str {
         match self {
             Status::Pass => "PASS",
@@ -737,8 +917,17 @@ impl Status {
     }
 }
 
-/// An evidence's outcome and, where the outcome table names one, its reason (`INSUFFICIENT`, `TIMED_OUT`,
-/// `PLUGINS_MISSING`).
+/// The reasons the outcome function gives (principle one's outcome table).
+pub const OUTCOME_REASONS: [&str; 6] = [
+    "INSUFFICIENT",
+    "TIMED_OUT",
+    "PLUGINS_MISSING",
+    "NOT_STARTED",
+    "INTERRUPTED",
+    "INCOMPLETE",
+];
+
+/// An evidence's outcome and, where the outcome table names one, its reason (one of [`OUTCOME_REASONS`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Outcome {
     pub status: Status,

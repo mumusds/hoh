@@ -22,6 +22,8 @@ findings=[{'id':'F-1','severity':'high','summary':'a fake high finding'}] if beh
 status={'fail':'FAIL'}.get(behaviour,'PASS')
 report='Fake '+role+' result.\n```hoh-report\n'+json.dumps({'role':role,'status':status,'scope':['fake scope'],'findings':findings})+'\n```'
 text='Fake result without a report.' if behaviour=='noreport' else report
+if behaviour=='started78':
+ print(json.dumps({'type':'thread.started','thread_id':sid} if name=='codex' else {'type':'system','subtype':'init','session_id':sid}));sys.exit(78)
 errors={'capacity':'Selected model is at capacity. Please try a different model.','auth':'Invalid API key · Fix external API key',
         'quota':'Claude AI usage limit reached|1700000000','nokey':'No API key found for anthropic','crash':'unexpected internal error'}
 if name=='codex':
@@ -55,10 +57,14 @@ class Independent(unittest.TestCase):
         base=Path(self.temp.name);r=self.root=base/'repo';self.bin=base/'bin';self.bin.mkdir();self.trace=base/'trace.jsonl'
         for rel in FILES:(r/rel).parent.mkdir(parents=True,exist_ok=True);shutil.copy2(ROOT/rel,r/rel)
         (r/'contracts/requirements.json').write_text(json.dumps({'requirements':[{'id':'REQ-901','release_targets':['v0.1'],'release_class':'required',
-                                                                                'acceptance':[{'id':'AC-901-01','test_id':'TEST-901-01'}]}]}))
-        (r/'contracts/acceptance-scenarios.json').write_text(json.dumps({'scenarios':[{'id':'TEST-901-01','check_id':'independent-review'}]}))
+                                                                                'acceptance':[{'id':'AC-901-01','test_id':'TEST-901-01'},{'id':'AC-901-02','test_id':'TEST-901-02'}]}]}))
+        (r/'contracts/acceptance-scenarios.json').write_text(json.dumps({'scenarios':[{'id':'TEST-901-01','check_id':'independent-review'},
+                                                                                     {'id':'TEST-901-02','check_id':'traceability'}]}))
+        # A stand-in traceability check: one passing line for its TEST.
+        (r/'trace.sh').write_text('printf \'%s\\n\' \'{"schema_version": "1.0", "test_id": "TEST-901-02", "name": "test_901_02_x", "status": "PASS"}\' > "$HOH_EVIDENCE_DIR/test-results.jsonl"\n')
         checks={f'independent-{c}':{'mode':'live','argv':['bash','scripts/product/independent.sh',role,'v0.1'],'artifacts':ARTIFACTS,'timeout_seconds':120}
                 for c,role in (('qa','qa'),('review','reviewer'))}
+        checks['traceability']={'mode':'product','argv':['bash','trace.sh'],'artifacts':['test-results.jsonl'],'timeout_seconds':60}
         (r/'plan.json').write_text(json.dumps({'schema_version':'1.0','plan_id':'independent-fixture','description':'Synthetic fixture plan.','checks':checks},indent=1))
         (r/'.gitignore').write_text('.hoh-dev/\n__pycache__/\n')
         git=lambda *a:subprocess.run(['git','-c','user.name=t','-c','user.email=t@invalid.example',*a],cwd=r,check=True,env=self.env())
@@ -102,10 +108,18 @@ class Independent(unittest.TestCase):
         calls=self.calls();self.assertEqual([c['agent'] for c in calls],['codex'])
         # The prompt: the reviewer's role contract, the candidate, principle one's judgement, the observations directory.
         prompt=calls[0]['prompt'];self.assertIn('[HOH_DELEGATED_TASK]',prompt);self.assertIn(self.candidate['candidate_id'],prompt)
-        self.assertIn(str(artifacts/'observations'),prompt);self.assertIn(str(artifacts/'judgement.json'),prompt)
+        # Observations beside the record's directory, never in it (M2T10R-52).
+        record_dir=artifacts.parent;observations=record_dir.parent/f'{record_dir.name}-observations'
+        self.assertIn(str(observations),prompt);self.assertTrue(observations.is_dir());self.assertIn(str(artifacts/'judgement.json'),prompt)
         self.assertEqual(Path(calls[0]['cwd']).resolve(),self.root.resolve())
         judgement=load_json(artifacts/'judgement.json');self.assertEqual(judgement['candidate_id'],self.candidate['candidate_id'])
         self.assertIn('TEST-901-01',judgement['tests'])
+    def test_the_judgement_counts_an_earlier_traceability_run(self):
+        # M2T10R-51: the independent check judges as itself, so a traceability run that passed is counted, not taken
+        # for its own missing self-test.
+        self.agents('codex');record,_,_=self.check('traceability',{});self.assertEqual(record['exit_code'],0)
+        record,artifacts,_=self.check('independent-review',{'codex':'pass'});self.assertEqual(record['exit_code'],0)
+        self.assertEqual(load_json(artifacts/'judgement.json')['tests']['TEST-901-02']['status'],'PASS')
     def test_a_capacity_error_falls_back_to_the_next_model_then_agent(self):
         self.agents('codex','claude')
         record,artifacts,_=self.check('independent-review',{'codex':'capacity','codex:gpt-6.1-sol':'pass'})
@@ -135,6 +149,12 @@ class Independent(unittest.TestCase):
     def test_a_session_without_a_report_is_not_an_external_block(self):
         self.agents('pi','claude');record,_,stderr=self.check('independent-qa',{'pi':'noreport','claude':'auth'})
         self.assertEqual(record['exit_code'],1,stderr);self.assertEqual([c['agent'] for c in self.calls()],['pi','claude'])
+    def test_a_cli_that_started_and_exited_78_is_not_an_external_block(self):
+        # M2T10R-53: agent_task passes a started CLI's own exit code through; only with no attempt record did it end
+        # before the CLI started.
+        self.agents('codex','claude')
+        record,_,stderr=self.check('independent-review',{'codex':'started78','codex:gpt-6.1-sol':'started78','claude':'started78'})
+        self.assertEqual(record['exit_code'],1,stderr)
     def test_an_unknown_failure_is_not_an_external_block(self):
         self.agents('pi','claude');record,_,_=self.check('independent-qa',{'pi':'crash','claude':'crash'})
         self.assertEqual(record['exit_code'],1)

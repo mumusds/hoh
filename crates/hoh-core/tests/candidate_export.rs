@@ -85,6 +85,71 @@ fn python_validates(
 }
 
 #[test]
+fn the_plan_shape_check_agrees_with_the_locked_check_plan_schema() -> R {
+    // docs/adr/ADR-027.md principle one rule 1 (M2T10R-01): plan_shape refuses exactly what Python's jsonschema refuses.
+    let good = serde_json::json!({"schema_version": "1.0", "plan_id": "p", "description": "d", "checks": {
+        "unit": {"mode": "product", "argv": ["bash", "u.sh"], "cwd": "sub/dir", "timeout_seconds": 1.5,
+                 "artifacts": ["test-results.jsonl", "a_b-c.1"], "description": "x"},
+        "qa-2": {"mode": "live", "argv": ["x"]}}});
+    let mut cases = vec![("valid", good.clone())];
+    let entry = |key: &str, value: serde_json::Value| {
+        let mut v = good.clone();
+        v["checks"]["unit"][key] = value;
+        v
+    };
+    cases.extend([
+        ("absolute cwd", entry("cwd", serde_json::json!("/tmp"))),
+        ("empty cwd", entry("cwd", serde_json::json!(""))),
+        ("unknown mode", entry("mode", serde_json::json!("fake"))),
+        ("empty argv", entry("argv", serde_json::json!([]))),
+        (
+            "empty argument",
+            entry("argv", serde_json::json!(["bash", ""])),
+        ),
+        (
+            "zero timeout",
+            entry("timeout_seconds", serde_json::json!(0)),
+        ),
+        (
+            "text timeout",
+            entry("timeout_seconds", serde_json::json!("1")),
+        ),
+        (
+            "path artifact",
+            entry("artifacts", serde_json::json!(["../x"])),
+        ),
+        (
+            "dot artifact",
+            entry("artifacts", serde_json::json!([".x"])),
+        ),
+        ("twice", entry("artifacts", serde_json::json!(["x", "x"]))),
+        (
+            "long artifact",
+            entry("artifacts", serde_json::json!(["a".repeat(129)])),
+        ),
+        ("unknown key", entry("retries", serde_json::json!(2))),
+    ]);
+    let mut top = |key: &str, value: serde_json::Value| {
+        let mut v = good.clone();
+        v[key] = value;
+        cases.push((key.to_owned().leak(), v));
+    };
+    top("schema_version", serde_json::json!("2.0"));
+    top("plan_id", serde_json::json!(""));
+    top("checks", serde_json::json!({}));
+    top("extra", serde_json::json!(1));
+    let mut bad_name = good.clone();
+    bad_name["checks"]["Unit"] = good["checks"]["unit"].clone();
+    cases.push(("upper-case check name", bad_name));
+    for (label, plan) in cases {
+        let python = python_validates("check-plan.schema.json", &plan)?.is_ok();
+        let ours = hoh_core::verification::plan_shape(&plan);
+        assert_eq!(ours.is_empty(), python, "{label}: {ours:?}");
+    }
+    Ok(())
+}
+
+#[test]
 fn a_product_execution_record_is_valid_under_the_locked_schema_and_its_shape_check_agrees() -> R {
     // docs/adr/ADR-027.md decision 8 (M2T10D-255): the product writes records the gate reads; Record::from_value
     // refuses what the locked schema refuses.

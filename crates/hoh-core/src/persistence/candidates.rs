@@ -212,6 +212,20 @@ pub struct RunAcceptance {
 }
 
 /// The run `run_id`'s specification and criteria, if the run exists and has a specification.
+/// The outcome of the evidence `evidence_id`, if it is recorded.
+pub(super) fn evidence_outcome(
+    conn: &Connection,
+    evidence_id: &str,
+) -> Result<Option<String>, PersistError> {
+    conn.query_row(
+        "SELECT outcome FROM evidence WHERE evidence_id = ?1",
+        params![evidence_id],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(sqlite_error)
+}
+
 pub(super) fn acceptance(
     conn: &Connection,
     run_id: &str,

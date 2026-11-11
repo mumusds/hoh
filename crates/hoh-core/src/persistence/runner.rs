@@ -230,7 +230,7 @@ pub struct Packing {
 
 /// An object to register in `artifacts` (docs/adr/ADR-026.md decision 6): its sha256, its path relative to the
 /// project (`.hoh/objects/sha256/<2>/<64>`), its size and type.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ArtifactRow {
     pub sha256: String,
     pub path: String,

@@ -592,6 +592,37 @@ fn a_live_record_counts_only_with_sessions_bound_to_its_check_and_candidate() ->
 }
 
 #[test]
+fn a_record_off_the_execution_schema_is_vetoed() -> R {
+    // Rule 1 (docs/adr/ADR-027.md principle one, M2T10R-01): the record itself is of the locked
+    // contracts/execution.schema.json's shape, as Record::from_value checks it; one that is not counts for nothing.
+    let c = manifest().seal();
+    let s = c.manifest.spec.sha256.clone();
+    for (label, tamper) in [
+        (
+            "an absolute cwd",
+            (|e: &mut Evidence| e.record.cwd = "/tmp".to_owned()) as fn(&mut Evidence),
+        ),
+        ("an empty record id", |e: &mut Evidence| {
+            e.record.record_id = String::new()
+        }),
+        ("a negative duration", |e: &mut Evidence| {
+            e.record.duration_seconds = -1.0
+        }),
+    ] {
+        let mut e = e0(&c);
+        let mut w = world0(&c, &e);
+        tamper(&mut e);
+        w.plan[0].1.cwd = e.record.cwd.clone();
+        let codes = valid(&e, &c, &s, &w).map_err(|i| i.codes());
+        assert!(
+            codes.as_ref().is_err_and(|c| c.contains(&"RECORD_INVALID")),
+            "{label}: {codes:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn every_line_of_a_results_file_is_held_to_its_schema() -> R {
     // Rule 1 (docs/adr/ADR-027.md principle one): the observations are either the results file's lines, each held to
     // the locked contracts/test-result.schema.json as the gate and the replica hold them, or, when it has none, the
@@ -1154,4 +1185,25 @@ fn an_evidences_rows_are_its_conclusions_on_the_specs_acceptance_criteria() -> R
         vec![("AC-002-01".to_owned(), "FAIL")]
     );
     Ok(())
+}
+
+#[test]
+fn every_code_reads_back_as_its_reason_status_or_outcome_reason() {
+    // A pending recording is kept as text and read back (M2T10R-05): every code names exactly one.
+    let codes: std::collections::BTreeSet<_> = Reason::ALL.iter().map(|r| r.code()).collect();
+    assert_eq!(codes.len(), Reason::ALL.len());
+    for r in Reason::ALL {
+        assert_eq!(Reason::from_code(r.code()), Some(r));
+    }
+    for s in [
+        Status::Pass,
+        Status::Degraded,
+        Status::Fail,
+        Status::Blocked,
+        Status::Invalid,
+    ] {
+        assert_eq!(Status::from_code(s.code()), Some(s));
+    }
+    assert_eq!(Reason::from_code("NOPE"), None);
+    assert_eq!(Status::from_code("NOPE"), None);
 }

@@ -112,6 +112,68 @@ fn relative(path: &Path) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("/"))
 }
 
+/// Files HoH writes inside its state directories, as samples of each (a pattern may re-include what lies below a
+/// directory without the directory itself).
+const NESTED: &[&str] = &[
+    "objects/sha256/00/0000000000000000000000000000000000000000000000000000000000000000",
+    "evidence/CANDIDATE/CHECK/RECORD/execution.json",
+    "evidence/CANDIDATE/CHECK/RECORD/artifacts/test-results.jsonl",
+    "attempts/ATTEMPT/stdout.jsonl",
+    "sessions/SESSION/notes.md",
+    "first-inputs/INPUT.json",
+];
+
+/// Every way HoH's own state under `state` is visible to git in the checkout `checkout` (docs/adr/ADR-027.md decision 3):
+/// each path HoH writes that is tracked or not ignored, by name: its fixed names, files inside its directories, and
+/// `writes`, the paths (relative to `state`) the caller is about to write. The freeze and every check's pre-check run
+/// it (M2T10R-06): a `.hoh/.gitignore` changed after the freeze would otherwise let the check's own record dirty the
+/// checkout and veto a clean candidate.
+pub(crate) fn state_guard(
+    checkout: &Path,
+    state: &Path,
+    writes: &[String],
+) -> Result<Vec<String>, String> {
+    let canonical =
+        |p: &Path| std::fs::canonicalize(p).map_err(|e| format!("{}: {e}", p.display()));
+    let git = |args: &[&str]| git(checkout, args);
+    let mut reasons = Vec::new();
+    // HoH's own state: ignored and untracked, each path by name (decision 3).
+    if let Ok(inside) = canonical(state)?.strip_prefix(canonical(checkout)?) {
+        let paths: Vec<String> = STATE_PATHS
+            .iter()
+            .chain(NESTED)
+            .map(|p| (*p).to_owned())
+            .chain(writes.iter().cloned())
+            .map(|p| format!("{}/{p}", inside.to_string_lossy()))
+            .collect();
+        let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+        let mut ls = vec!["ls-files", "-z", "--"];
+        ls.extend(&refs);
+        for tracked in entries(&git(&ls)?) {
+            reasons.push(format!("{tracked} is tracked: HoH's own state must not be"));
+        }
+        // `-z` needs `--stdin`; these paths are HoH's own fixed names, one per line.
+        let mut check = vec!["check-ignore", "--"];
+        check.extend(&refs);
+        let (status, out) = git_run(checkout, &check)?;
+        if status.code() != Some(0) && status.code() != Some(1) {
+            return Err(format!("git check-ignore: {status}"));
+        }
+        let ignored: Vec<String> = String::from_utf8_lossy(&out)
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        for p in &paths {
+            if !ignored.contains(p) {
+                reasons.push(format!(
+                    "{p} is not ignored by git: HoH's own state must be"
+                ));
+            }
+        }
+    }
+    Ok(reasons)
+}
+
 fn prepare(checkout: &Path, state: &Path, inputs: &Inputs) -> Result<Prepared, FreezeError> {
     let io = |e: String| FreezeError::Io(e);
     hoh_core::state_dir::ensure(state).map_err(|e| io(format!("{}: {e}", state.display())))?;
@@ -127,38 +189,7 @@ fn prepare(checkout: &Path, state: &Path, inputs: &Inputs) -> Result<Prepared, F
             checkout.display()
         )]));
     }
-    let mut reasons = Vec::new();
-    // HoH's own state: ignored and untracked, each path by name (decision 3).
-    if let Ok(inside) = canonical(state)?.strip_prefix(canonical(checkout)?) {
-        let paths: Vec<String> = STATE_PATHS
-            .iter()
-            .map(|p| format!("{}/{p}", inside.to_string_lossy()))
-            .collect();
-        let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
-        let mut ls = vec!["ls-files", "-z", "--"];
-        ls.extend(&refs);
-        for tracked in entries(&git(&ls)?) {
-            reasons.push(format!("{tracked} is tracked: HoH's own state must not be"));
-        }
-        // `-z` needs `--stdin`; these paths are HoH's own fixed names, one per line.
-        let mut check = vec!["check-ignore", "--"];
-        check.extend(&refs);
-        let (status, out) = git_run(checkout, &check).map_err(io)?;
-        if status.code() != Some(0) && status.code() != Some(1) {
-            return Err(io(format!("git check-ignore: {status}")));
-        }
-        let ignored: Vec<String> = String::from_utf8_lossy(&out)
-            .lines()
-            .map(str::to_owned)
-            .collect();
-        for p in &paths {
-            if !ignored.contains(p) {
-                reasons.push(format!(
-                    "{p} is not ignored by git: HoH's own state must be"
-                ));
-            }
-        }
-    }
+    let mut reasons = state_guard(checkout, state, &[]).map_err(io)?;
     // Committed as it is (REQ-052 behaviour 1, failure modes 1 and 5; decision 4).
     let status = entries(&git(&[
         "status",

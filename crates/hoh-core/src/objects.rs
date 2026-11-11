@@ -223,12 +223,24 @@ pub fn put_file(project: &Path, file: &Path) -> Result<(String, u64), String> {
     copied
 }
 
-/// The sha256 of the file `file` and its size, read in fixed-size pieces (M2T09R-02: a raw log is not bounded, so it is
-/// never read whole to be checked).
+/// The sha256 of the regular file `file` and its size, read in fixed-size pieces (M2T09R-02: a raw log is not bounded,
+/// so it is never read whole to be checked). Anything else is refused without being read: it is opened without blocking
+/// and kept only if it is a regular file, since a FIFO blocks its reader until someone writes and a device may never end
+/// (M2T10R-04).
 pub fn hash_file(file: &Path) -> Result<(String, u64), String> {
+    use rustix::fs::{Mode, OFlags};
     use std::io::Read as _;
     let at = |e: std::io::Error| format!("{}: {e}", file.display());
-    let mut input = std::fs::File::open(file).map_err(at)?;
+    let fd = rustix::fs::open(
+        file,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| at(e.into()))?;
+    let mut input = std::fs::File::from(fd);
+    if !input.metadata().map_err(at)?.file_type().is_file() {
+        return Err(format!("{}: not a regular file", file.display()));
+    }
     let mut digest = Sha256::new();
     let mut size = 0u64;
     let mut buffer = vec![0u8; 1 << 16];
