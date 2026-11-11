@@ -669,8 +669,12 @@ fn finished(
         )
         .map_err(sqlite_error)?;
     }
-    // The agent's own session id on the attempt's session row (its later turns resume it).
-    if let Some(native) = &ending.observed.native_session {
+    // The agent's own session id on the attempt's session row (its later turns resume it), from a turn that completed
+    // only: an id given before any input (Pi's get_state, Codex's thread/start) names a session that may never have
+    // been persisted, and a failed turn must not replace a completed one's (docs/adr/ADR-024.md decision 4, M2T17R-500).
+    if to == AttemptState::Settled
+        && let Some(native) = &ending.observed.native_session
+    {
         tx.execute(
             "UPDATE sessions SET native_id = ?2 WHERE session_id = (SELECT session_id FROM attempts WHERE attempt_id = ?1)",
             params![attempt_id, native],
