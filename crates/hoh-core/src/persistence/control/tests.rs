@@ -438,6 +438,7 @@ async fn a_started_run_is_created_with_its_exact_accepted_body_and_replayed_byte
             RunTarget::Start {
                 mode: "AUTO".to_owned(),
                 budget: crate::config::Config::default().budget,
+                policy: "balanced".to_owned(),
             },
         )
     };

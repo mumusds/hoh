@@ -882,3 +882,35 @@ async fn a_run_with_no_spec_defers_each_due_trigger_once() -> R {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn a_runs_supervision_policy_is_the_one_frozen_in_its_snapshot() -> R {
+    // docs/adr/ADR-025.md decision 9: supervision.policy is frozen into the run's snapshot at StartRun (balanced when
+    // it names none); intensive also wakes on task.implemented with risk_reduction >= 4, balanced does not.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    let implemented = || {
+        (
+            "task.implemented",
+            json!({"task_id": "D", "risk_reduction": 4}),
+        )
+    };
+    events(&store, "balanced", &[implemented()]).await?;
+    assert!(
+        store
+            .supervise("R", at(&clock, 3000))
+            .await?
+            .fired
+            .is_empty()
+    );
+    exec(
+        &path,
+        "UPDATE runs SET config_snapshot_json = '{\"supervision\": {\"policy\": \"intensive\"}}' WHERE run_id = 'R';",
+    )?;
+    clock.set(4000);
+    events(&store, "intensive", &[implemented()]).await?;
+    assert_eq!(store.supervise("R", at(&clock, 7000)).await?.fired.len(), 1);
+    Ok(())
+}

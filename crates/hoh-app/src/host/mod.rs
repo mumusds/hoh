@@ -153,6 +153,8 @@ impl HostConfig {
             )),
             context: hoh_core::decision::Context {
                 reader_slots: Some(execution.reader_slots),
+                // The supervisor's own slot, or a reader slot (docs/adr/ADR-025.md decision 3).
+                reserve_supervisor_slot: Some(execution.reserve_supervisor_slot),
                 ..hoh_core::decision::Context::default()
             },
         });

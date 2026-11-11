@@ -744,9 +744,13 @@ async fn submit_command(
                 "StartRun",
                 RunTarget::Start {
                     mode: mode.clone(),
-                    budget: effective.map_or_else(
+                    budget: effective.as_ref().map_or_else(
                         || hoh_core::config::Config::default().budget,
-                        |config| config.budget,
+                        |config| config.budget.clone(),
+                    ),
+                    policy: effective.as_ref().map_or_else(
+                        || hoh_core::config::Config::default().supervision.policy,
+                        |config| config.supervision.policy.clone(),
                     ),
                 },
                 "run.created",

@@ -120,6 +120,7 @@ async fn world(store: &Store, path: &Path) -> R {
             target: RunTarget::Start {
                 mode: "AUTO".to_owned(),
                 budget: Config::default().budget,
+                policy: "balanced".to_owned(),
             },
             event: NewEvent {
                 project_id: "p1".to_owned(),
