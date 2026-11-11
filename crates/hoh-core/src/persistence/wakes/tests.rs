@@ -4203,3 +4203,58 @@ async fn an_output_whose_disposal_fails_three_times_ends_internal() -> R {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn a_supervision_turn_refused_for_its_context_makes_its_commander_unavailable_at_once() -> R {
+    // docs/adr/ADR-026.md decision 9 (M2T09D-01, -52): a turn the executor refused deterministically (class Decision:
+    // CONTEXT_BUDGET_TOO_SMALL) is not retried by backoff: its Commander is unavailable at once for `context`, the run
+    // BLOCKED; a half-open probe is allowed as for a capability failure, and a turn of the epoch that settles recovers.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    wake(&store, &clock, "R", "D", "fp", 0).await?;
+    let a = store
+        .allocate_supervision("p1", context(&clock, 3000))
+        .await?
+        .ok_or("allocated")?;
+    run_turn(
+        &store,
+        &clock,
+        &a.attempt_id,
+        3000,
+        false,
+        crate::retry::FailureClass::Decision,
+    )
+    .await?;
+    store.supervise("R", context(&clock, 4000)).await?;
+    assert_eq!(blocked(&path)?.0, "BLOCKED");
+    assert_eq!(
+        unavailable(&path)?.last().cloned(),
+        Some(json!(["supervisor.unavailable", ["context"]]))
+    );
+    // No turn by backoff meanwhile; past the cooldown one probe, which settles and recovers.
+    assert!(
+        store
+            .allocate_supervision("p1", context(&clock, 5000))
+            .await?
+            .is_none()
+    );
+    let later = 4000 + crate::retry::CAP.as_millis() as u64 + 1000;
+    let probe = store
+        .allocate_supervision("p1", context(&clock, later))
+        .await?
+        .ok_or("a probe past the cooldown")?;
+    run_turn(
+        &store,
+        &clock,
+        &probe.attempt_id,
+        later,
+        true,
+        crate::retry::FailureClass::Decision,
+    )
+    .await?;
+    store.supervise("R", context(&clock, later + 1000)).await?;
+    assert_eq!(blocked(&path)?.0, "RUNNING");
+    Ok(())
+}

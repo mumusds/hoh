@@ -1205,8 +1205,9 @@ fn unavailability(
     {
         reasons.push("failures_capped");
     }
-    // Auth or Capability: a turn of the epoch failed so and no turn of the epoch settled after it, in the turns'
-    // order; a turn that failed otherwise, was withdrawn or preempted recovers nothing (v14, M2T08R-100).
+    // Auth, Capability or a deterministic refusal (Decision, held as `context`: docs/adr/ADR-026.md decision 9): a turn
+    // of the epoch failed so and no turn of the epoch settled after it, in the turns' order; a turn that failed
+    // otherwise, was withdrawn or preempted recovers nothing (v14, M2T08R-100).
     let classes: BTreeMap<String, String> = {
         let mut statement = tx
             .prepare(
@@ -1244,11 +1245,14 @@ fn unavailability(
             Some("capability") => {
                 held.insert("capability");
             }
+            Some("decision") => {
+                held.insert("context");
+            }
             _ => {}
         }
     }
     reasons.extend(
-        ["auth", "capability"]
+        ["auth", "capability", "context"]
             .into_iter()
             .filter(|r| held.contains(r)),
     );
@@ -1647,7 +1651,7 @@ fn probe(
     if reasons.is_empty()
         || reasons
             .iter()
-            .any(|r| !matches!(*r, "failures_capped" | "auth" | "capability"))
+            .any(|r| !matches!(*r, "failures_capped" | "auth" | "capability" | "context"))
     {
         return Ok(None);
     }
