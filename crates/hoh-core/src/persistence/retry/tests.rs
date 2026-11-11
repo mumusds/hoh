@@ -430,8 +430,8 @@ async fn a_failure_recorded_before_a_crash_is_retried_by_its_recorded_class() ->
 
 #[tokio::test]
 async fn an_ending_records_what_the_agents_turn_showed() -> R {
-    // docs/adr/ADR-022.md decision 12: the resolved model, the usage, the agent's own session id and the turn's events
-    // are written in the commit of the attempt's end.
+    // docs/adr/ADR-022.md decision 12: the resolved model, the usage and the turn's events are written in the commit of
+    // the attempt's end; the agent's own session id only when the turn completed (ADR-024 decision 4).
     let dir = tempfile::tempdir()?;
     let (store, path) = open(&dir)?;
     Connection::open(&path)?.execute_batch(WORLD)?;
@@ -505,12 +505,15 @@ async fn an_ending_records_what_the_agents_turn_showed() -> R {
             "/logs/a"
         )
     );
-    let native: String = conn.query_row(
+    // The agent's own session id is written by a turn that completed only: this one failed, so none is (ADR-024
+    // decision 4, M2T17R-500: an id seen in a failed turn may name a session never persisted; resuming it would be
+    // refused for good). only_a_completed_turn_names_the_native_session_to_resume has the completed turn's.
+    let native: Option<String> = conn.query_row(
         "SELECT native_id FROM sessions WHERE session_id = ?1",
         [&session],
         |r| r.get(0),
     )?;
-    assert_eq!(native, "native-1");
+    assert_eq!(native, None);
     let (event_id, payload): (String, String) = conn.query_row(
         "SELECT event_id, payload_json FROM events WHERE kind = 'adapter.diagnostic'",
         [],

@@ -1841,7 +1841,7 @@ async fn a_session_never_handed_over_is_resumed_only_once_a_turn_of_it_completed
         &path,
         "UPDATE sessions SET capabilities_json = '{\"structured_events\": true, \"resume\": true}', \
            native_id = 'n0' WHERE session_id = 'sd';
-         UPDATE attempts SET state = 'FAILED', ended_at = '2026-11-09T00:01:00Z' WHERE attempt_id = 'A0';
+         UPDATE attempts SET state = 'FAILED', ended_at = '2026-11-09T00:01:00Z', session_id = 'sd' WHERE attempt_id = 'A0';
          UPDATE tasks SET state = 'CANCELLED', revision = 3 WHERE task_id = 'T0';
          DELETE FROM leases WHERE attempt_id = 'A0';",
     )?;
@@ -1880,6 +1880,129 @@ async fn a_session_never_handed_over_is_resumed_only_once_a_turn_of_it_completed
     )?;
     let second = dispatch_next(&store, &path, &context, "T2", 3).await?;
     assert_eq!(resumed(&second)?.as_deref(), Some("n0"));
+    Ok(())
+}
+
+/// Attempt `attempt_id` RUNNING, then ended by the runner as a turn that showed native session `native`: its success
+/// as `success`.
+async fn turn_ends(
+    store: &Store,
+    path: &PathBuf,
+    attempt_id: &str,
+    success: bool,
+    native: &str,
+) -> R {
+    exec(
+        path,
+        &format!(
+            "UPDATE attempts SET state = 'RUNNING', pid = 4242 WHERE attempt_id = '{attempt_id}';"
+        ),
+    )?;
+    store
+        .runner_finished(
+            attempt_id,
+            crate::persistence::Ending {
+                success,
+                detail: if success {
+                    "done"
+                } else {
+                    "PROTOCOL_INCOMPLETE"
+                }
+                .to_owned(),
+                class: crate::retry::FailureClass::Transient { retry_after: None },
+                at: std::time::SystemTime::now(),
+                draw: 0,
+                observed: crate::persistence::Observed {
+                    native_session: Some(native.to_owned()),
+                    ..crate::persistence::Observed::default()
+                },
+                unknown_effect: false,
+            },
+        )
+        .await?;
+    exec(
+        path,
+        &format!("DELETE FROM leases WHERE attempt_id = '{attempt_id}';"),
+    )
+}
+
+#[tokio::test]
+async fn only_a_completed_turn_names_the_native_session_to_resume() -> R {
+    // M2T17R-500 (docs/adr/ADR-024.md decision 4, round 6): the resume target is written only by a turn that completed.
+    // A first turn fails after the agent gave an id it may never have persisted: nothing is written; a turn the
+    // reconcile settled writes none either, the next turn starts its own; that one completes: its id is the target; a
+    // later turn fails with yet another id: the target stays the completed turn's (-550 too).
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    working(&store, &path).await?;
+    a0_ends(&path)?;
+    exec(
+        &path,
+        "UPDATE sessions SET capabilities_json = '{\"structured_events\": true, \"resume\": true}' WHERE session_id = 'sd';",
+    )?;
+    let context = crate::decision::Context {
+        required_capabilities: [(
+            "developer".to_owned(),
+            ["structured_events".to_owned()].into(),
+        )]
+        .into(),
+        ..crate::decision::Context::default()
+    };
+    let resumed = |d: &crate::persistence::Dispatched| -> R<Option<String>> {
+        Ok(super::assignment(
+            &Connection::open(&path)?,
+            "p1",
+            "R1",
+            &d.task_id,
+            &d.attempt_id,
+            "developer",
+        )?
+        .native_session)
+    };
+    let native = |path: &PathBuf| -> R<Vec<Vec<Value>>> {
+        values(
+            path,
+            "SELECT native_id FROM sessions WHERE session_id = 'sd'",
+        )
+    };
+    let first = store
+        .schedule_round("R1", context.clone())
+        .await?
+        .dispatched
+        .ok_or("T1 not dispatched")?;
+    turn_ends(&store, &path, &first.attempt_id, false, "early-unpersisted").await?;
+    assert_eq!(
+        native(&path)?,
+        [[Value::Null]],
+        "a failed turn names nothing"
+    );
+    // A turn the reconcile found completed (its runner gone before its settle, M2T17R-550's E2): SETTLED, no id seen,
+    // none written; the next turn starts its own, not the failed turn's.
+    let reconciled = dispatch_next(&store, &path, &context, "T2a", 3).await?;
+    exec(
+        &path,
+        &format!(
+            "UPDATE attempts SET state = 'SETTLED', pid = 4242, ended_at = '2026-11-10T00:02:00Z' \
+             WHERE attempt_id = '{0}'; DELETE FROM leases WHERE attempt_id = '{0}';",
+            reconciled.attempt_id
+        ),
+    )?;
+    let second = dispatch_next(&store, &path, &context, "T2", 4).await?;
+    assert_eq!(
+        resumed(&second)?,
+        None,
+        "no completed turn named a native session"
+    );
+    turn_ends(&store, &path, &second.attempt_id, true, "good-completed").await?;
+    let third = dispatch_next(&store, &path, &context, "T3", 5).await?;
+    assert_eq!(resumed(&third)?.as_deref(), Some("good-completed"));
+    turn_ends(&store, &path, &third.attempt_id, false, "another-early").await?;
+    let fourth = dispatch_next(&store, &path, &context, "T4", 6).await?;
+    assert_eq!(
+        resumed(&fourth)?.as_deref(),
+        Some("good-completed"),
+        "a failed turn does not replace the completed one's"
+    );
     Ok(())
 }
 
