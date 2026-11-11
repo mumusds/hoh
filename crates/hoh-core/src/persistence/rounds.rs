@@ -45,6 +45,8 @@ struct Row {
     state: TaskState,
     revision: i64,
     role: String,
+    /// A scheduled retry: `fail_task` gave it a `next_retry_at`, cleared only when an attempt of it settles.
+    retry: bool,
 }
 
 pub(super) fn round(
@@ -66,7 +68,11 @@ pub(super) fn round(
     let Some((project_id, state, run_revision, run_spec, snapshot)) = run else {
         return Err(PersistError::RunNotFound(run_id.to_owned()));
     };
-    if !WORKING.contains(&writer::parse::<RunState>(&state)?) {
+    // A BLOCKED run dispatches its scheduled retries only: runtime-class dispatches, not decisions
+    // (docs/adr/ADR-025.md decisions 3 and 5, CR-003).
+    let state = writer::parse::<RunState>(&state)?;
+    let retries_only = state == RunState::Blocked;
+    if !WORKING.contains(&state) && !retries_only {
         return Ok(RoundOutcome::default());
     }
     // A budget that stops the run, or a cost limit it cannot enforce, dispatches nothing more (REQ-042 behaviour 6
@@ -76,6 +82,9 @@ pub(super) fn round(
     }
     let params = parameters(&snapshot)?;
     let mut rows = candidates(&tx, run_id, run_spec.as_deref(), context)?;
+    if retries_only {
+        rows.retain(|r| r.retry && r.state == TaskState::Ready);
+    }
     let slots = Slots {
         writer: leases::free_slot(&tx, &project_id, true, context.reader_slots(), now)?.is_some(),
         readers: u32::from(
@@ -150,6 +159,18 @@ pub(super) fn round(
         change: Change::Task(TaskState::Leased),
     });
     let lease = json!({"kind": grant.kind, "epoch": grant.epoch, "expires_at": grant.expires_at});
+    let mut notice = json!({
+        "notice": "runtime",
+        "kind": "dispatch",
+        "task_id": selected.task_id,
+        "role": task.role,
+        "attempt_id": attempt_id,
+        "lease": lease,
+    });
+    // A runtime-class dispatch carries its origin: the runner takes it on a BLOCKED or WAITING_EXTERNAL run too.
+    if task.retry {
+        notice["origin"] = json!("retry");
+    }
     let w = params.weights;
     let commit = Commit {
         cas,
@@ -186,14 +207,7 @@ pub(super) fn round(
             run_id: Some(run_id.to_owned()),
             recipient_role: task.role.clone(),
             role_epoch: decide::to_i64(binding.role_epoch, "role_epoch")?,
-            payload: json!({
-                "notice": "runtime",
-                "kind": "dispatch",
-                "task_id": selected.task_id,
-                "role": task.role,
-                "attempt_id": attempt_id,
-                "lease": lease,
-            }),
+            payload: notice,
         }],
     };
     let done = writer::write(&tx, &commit, ctx)?;
@@ -259,7 +273,7 @@ fn candidates(
              t.unblock_value, t.risk_reduction, t.information_gain, t.cost_estimate, t.wait_rounds, \
              t.first_eligible_seq, \
              (SELECT count(*) FROM task_dependencies d JOIN tasks u ON u.task_id = d.depends_on \
-              WHERE d.task_id = t.task_id AND u.state <> 'ACCEPTED') \
+              WHERE d.task_id = t.task_id AND u.state <> 'ACCEPTED'), t.next_retry_at IS NOT NULL \
              FROM tasks t WHERE t.run_id = ?1 AND t.state IN ('READY', 'PENDING') \
              AND (t.next_retry_at IS NULL OR t.next_retry_at <= ?2) ORDER BY t.created_seq, t.task_id",
         )
@@ -288,6 +302,7 @@ fn candidates(
                         r.get::<_, u32>(13)?,
                         r.get::<_, Option<i64>>(14)?,
                         r.get::<_, i64>(15)?,
+                        r.get::<_, bool>(16)?,
                     ),
                 ))
             },
@@ -298,7 +313,7 @@ fn candidates(
     for row in raw {
         let (
             (task_id, state, revision, spec_id, role, writer, created_seq, layer),
-            (user, unblock, risk, info, cost, wait_rounds, first_eligible_seq, open),
+            (user, unblock, risk, info, cost, wait_rounds, first_eligible_seq, open, retry),
         ) = row.map_err(sqlite_error)?;
         let state = writer::parse::<TaskState>(&state)?;
         if state == TaskState::Pending && open > 0 {
@@ -343,6 +358,7 @@ fn candidates(
             state,
             revision,
             role,
+            retry,
         });
     }
     Ok(rows)

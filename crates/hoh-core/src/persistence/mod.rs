@@ -12,6 +12,7 @@
 #![allow(clippy::disallowed_methods)]
 
 mod attempts;
+mod blockers;
 mod commands;
 mod control;
 mod decide;

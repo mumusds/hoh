@@ -436,6 +436,15 @@ pub(super) fn move_attempt(
     if changed != 1 {
         return Err(stale(Some(state)));
     }
+    // A settled attempt ends its task's retry: a task back to READY later (rework, a failed review) is no scheduled
+    // retry; the dispatch keeps `next_retry_at` so that a withdrawn retry stays one (docs/adr/ADR-025.md decision 5).
+    if m.to == AttemptState::Settled {
+        tx.execute(
+            "UPDATE tasks SET next_retry_at = NULL WHERE task_id = ?1",
+            params![task_id],
+        )
+        .map_err(sqlite_error)?;
+    }
     // An interrupted end of the writer lease's holder (its turn not completed: HoH's own stop ends it FAILED too, an
     // oversize frame or a deadline, M2T17FR-50) lets the lease go only with the workspace's record, written first in
     // this transaction: no other writer can be granted before the workspace it left is recorded (REQ-019 behaviour

@@ -6,6 +6,7 @@
 //! due works again; a working run with a cost limit it cannot enforce, a task its session cannot run, a stopped
 //! budget, nothing left but waiting, or nothing able to move on, becomes BLOCKED, INCOMPLETE or WAITING_EXTERNAL.
 
+use super::blockers;
 use super::decide::{child_id, load_binding};
 use super::writer::{self, Change, Commit, Ctx, NewEvent, StateCas};
 use super::{PersistError, sqlite_error};
@@ -342,19 +343,6 @@ pub(super) fn budget_stop(
     })
 }
 
-/// BlockedReason precedence for a run (protocol.schema.json): BLOCKED_AUTH > COMMANDER_UNAVAILABLE >
-/// BUDGET_UNENFORCEABLE > BLOCKED_CAPABILITY > NEED_DECISION; the others after them.
-fn precedence(reason: BlockedReason) -> u8 {
-    match reason {
-        BlockedReason::BlockedAuth => 0,
-        BlockedReason::CommanderUnavailable => 1,
-        BlockedReason::BudgetUnenforceable => 2,
-        BlockedReason::BlockedCapability => 3,
-        BlockedReason::NeedDecision => 4,
-        _ => 5,
-    }
-}
-
 /// What a pace did to a run.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Paced {
@@ -364,6 +352,8 @@ pub struct Paced {
     pub waiting_until: Option<String>,
     /// The run is now BLOCKED, for these reasons.
     pub blocked: Vec<BlockedReason>,
+    /// A BLOCKED run whose claims were all released, back in its state.
+    pub unblocked: bool,
     /// The run is now INCOMPLETE, for this stop.
     pub incomplete: Option<&'static str>,
     /// Tasks moved to BLOCKED because their session lacks a required capability.
@@ -382,15 +372,13 @@ struct TaskRow {
 
 /// What blocks the run's BLOCKED tasks, by precedence, each once.
 fn blocked_reasons(tasks: &[TaskRow]) -> Vec<BlockedReason> {
-    let mut reasons: Vec<BlockedReason> = tasks
-        .iter()
-        .filter(|t| t.state == TaskState::Blocked)
-        .filter_map(|t| t.blocked_reason.as_deref())
-        .filter_map(BlockedReason::parse)
-        .collect();
-    reasons.sort_by_key(|r| precedence(*r));
-    reasons.dedup();
-    reasons
+    blockers::ordered(
+        tasks
+            .iter()
+            .filter(|t| t.state == TaskState::Blocked)
+            .filter_map(|t| t.blocked_reason.as_deref())
+            .filter_map(BlockedReason::parse),
+    )
 }
 
 /// The run's tasks not yet ACCEPTED or CANCELLED, as `run.incomplete` lists them.
@@ -402,8 +390,13 @@ fn remaining(tasks: &[TaskRow]) -> Vec<&str> {
         .collect()
 }
 
-/// One look at run `run_id` at `context.now()` (ADR-020 decisions 4, 5 and 7); a pace that changes nothing writes
-/// nothing.
+/// One look at run `run_id` at `context.now()` (ADR-020 decisions 4, 5 and 7; docs/adr/ADR-025.md decision 5): a
+/// working, WAITING_EXTERNAL or BLOCKED run. A budget that stops it ends it INCOMPLETE once nothing of it runs.
+/// Otherwise the budget's claim (a cost limit it cannot enforce) and the pace's (what blocks the tasks of a run none of
+/// whose tasks can move on) are recomputed as a whole; a run with claims open is BLOCKED (its decision-class
+/// dispatches withdrawn), a BLOCKED one whose claims are all released goes back to its resume state; a working run
+/// with nothing to do but a retry waits for it (WAITING_EXTERNAL), a waiting one is woken when one is due or nothing
+/// waits any more. A BLOCKED run never parks. A pace that changes nothing writes nothing.
 pub(super) fn pace(
     conn: &mut Connection,
     run_id: &str,
@@ -413,20 +406,21 @@ pub(super) fn pace(
     let now = context.now();
     let at = rfc3339_utc(now);
     let tx = writer::begin(conn, ctx)?;
-    let run: Option<(String, String, i64, Option<String>, String)> = tx
+    let run: Option<(String, String, i64, Option<String>)> = tx
         .query_row(
-            "SELECT project_id, state, revision, resume_state, blocked_reasons_json FROM runs WHERE run_id = ?1",
+            "SELECT project_id, state, revision, resume_state FROM runs WHERE run_id = ?1",
             params![run_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()
         .map_err(sqlite_error)?;
-    let Some((project_id, state, revision, resume, blockers)) = run else {
+    let Some((project_id, state, revision, resume)) = run else {
         return Err(PersistError::RunNotFound(run_id.to_owned()));
     };
     let state = writer::parse::<RunState>(&state)?;
     let working = matches!(state, RunState::Running | RunState::Verifying);
-    if !working && state != RunState::WaitingExternal {
+    let blocked = state == RunState::Blocked;
+    if !working && !blocked && state != RunState::WaitingExternal {
         return Ok(Paced::default());
     }
     let mut statement = tx
@@ -496,8 +490,16 @@ pub(super) fn pace(
             |r| r.get(0),
         )
         .map_err(sqlite_error)?;
-    if state == RunState::WaitingExternal {
-        if let Some(stop) = stop {
+    let back = |resume: &Option<String>| -> Result<RunState, PersistError> {
+        Ok(resume
+            .as_deref()
+            .map(writer::parse::<RunState>)
+            .transpose()?
+            .unwrap_or(RunState::Running))
+    };
+    if let Some(stop) = stop {
+        // A budget that stops the run: INCOMPLETE once nothing of it runs, whatever blocks it (REQ-042 behaviour 6).
+        if unfinished == 0 {
             commit.cas.push(run_cas(RunState::Incomplete));
             commit.events.push(event(
                 &project_id,
@@ -507,103 +509,42 @@ pub(super) fn pace(
                 json!({"stop": stop.as_str(), "from": state.as_str(), "remaining": remaining(&tasks)}),
             ));
             paced.incomplete = Some(stop.as_str());
-        } else if tasks.iter().any(due) {
-            let to = resume
-                .as_deref()
-                .map(writer::parse::<RunState>)
-                .transpose()?
-                .unwrap_or(RunState::Running);
-            commit.cas.push(run_cas(to));
-            commit.events.push(event(
-                &project_id,
-                run_id,
-                child_id(run_id, &format!("resumed/{revision}")),
-                "run.resumed",
-                json!({"from": state.as_str(), "to": to.as_str(), "due": tasks.iter().filter(|t| due(t)).map(|t| t.task_id.as_str()).collect::<Vec<_>>()}),
-            ));
-            paced.woke = true;
-        } else if !tasks.iter().any(waiting) {
-            // Nothing waits any more (its last waiting task was blocked, or moved on): blocked by what blocks its
-            // tasks, else back to work (M2T19R-05).
-            let reasons = blocked_reasons(&tasks);
-            if reasons.is_empty() {
-                let to = resume
-                    .as_deref()
-                    .map(writer::parse::<RunState>)
-                    .transpose()?
-                    .unwrap_or(RunState::Running);
-                commit.cas.push(run_cas(to));
-                commit.events.push(event(
-                    &project_id,
-                    run_id,
-                    child_id(run_id, &format!("resumed/{revision}")),
-                    "run.resumed",
-                    json!({"from": state.as_str(), "to": to.as_str(), "due": []}),
-                ));
-                paced.woke = true;
-            } else {
-                paced.blocked = block_run(&tx, run_id, &blockers, &reasons)?;
-                commit.cas.push(run_cas(RunState::Blocked));
-                commit.events.push(event(
-                    &project_id,
-                    run_id,
-                    child_id(run_id, &format!("blocked/{revision}")),
-                    "run.blocked",
-                    json!({"reasons": paced.blocked.iter().map(|r| r.as_str()).collect::<Vec<_>>(), "detail": "nothing of the run waits any more and no task can move on"}),
-                ));
-            }
-        } else {
-            return Ok(paced);
         }
-    } else if budget::unenforceable(&budget) {
-        // A cost limit it cannot enforce: blocked before any dispatch (CR-002, AC-042-06).
-        paced.blocked = block_run(
-            &tx,
-            run_id,
-            &blockers,
-            &[BlockedReason::BudgetUnenforceable],
-        )?;
-        commit.cas.push(run_cas(RunState::Blocked));
-        commit.events.push(event(
-            &project_id,
-            run_id,
-            child_id(run_id, &format!("blocked/{revision}")),
-            "run.blocked",
-            json!({"reasons": paced.blocked.iter().map(|r| r.as_str()).collect::<Vec<_>>(), "detail": "a cost limit is set while the price is unknown"}),
-        ));
     } else {
-        // Tasks their session cannot run are blocked, not left out silently (AC-042-03 R2; ADR-020 decision 5).
-        for task in tasks.iter_mut().filter(|t| due(t)) {
-            let (Some(binding), Some(required)) = (
-                load_binding(&tx, run_id, &task.role)?,
-                context.required_capabilities.get(&task.role),
-            ) else {
-                continue;
-            };
-            if !binding.active || required.is_subset(&binding.capabilities) {
-                continue;
+        if state != RunState::WaitingExternal {
+            // Tasks their session cannot run are blocked, not left out silently (AC-042-03 R2; ADR-020 decision 5).
+            for task in tasks.iter_mut().filter(|t| due(t)) {
+                let (Some(binding), Some(required)) = (
+                    load_binding(&tx, run_id, &task.role)?,
+                    context.required_capabilities.get(&task.role),
+                ) else {
+                    continue;
+                };
+                if !binding.active || required.is_subset(&binding.capabilities) {
+                    continue;
+                }
+                let missing: Vec<&String> = required.difference(&binding.capabilities).collect();
+                tx.execute(
+                    "UPDATE tasks SET blocked_reason = ?1, next_retry_at = NULL WHERE task_id = ?2",
+                    params![BlockedReason::BlockedCapability.as_str(), task.task_id],
+                )
+                .map_err(sqlite_error)?;
+                commit.cas.push(StateCas {
+                    id: task.task_id.clone(),
+                    expected_revision: task.revision,
+                    change: Change::Task(TaskState::Blocked),
+                });
+                commit.events.push(event(
+                    &project_id,
+                    run_id,
+                    child_id(&task.task_id, &format!("blocked/{}", task.revision)),
+                    "task.blocked",
+                    json!({"task_id": task.task_id, "reason": BlockedReason::BlockedCapability.as_str(), "missing": missing}),
+                ));
+                paced.capability_blocked.push(task.task_id.clone());
+                task.state = TaskState::Blocked;
+                task.blocked_reason = Some(BlockedReason::BlockedCapability.as_str().to_owned());
             }
-            let missing: Vec<&String> = required.difference(&binding.capabilities).collect();
-            tx.execute(
-                "UPDATE tasks SET blocked_reason = ?1, next_retry_at = NULL WHERE task_id = ?2",
-                params![BlockedReason::BlockedCapability.as_str(), task.task_id],
-            )
-            .map_err(sqlite_error)?;
-            commit.cas.push(StateCas {
-                id: task.task_id.clone(),
-                expected_revision: task.revision,
-                change: Change::Task(TaskState::Blocked),
-            });
-            commit.events.push(event(
-                &project_id,
-                run_id,
-                child_id(&task.task_id, &format!("blocked/{}", task.revision)),
-                "task.blocked",
-                json!({"task_id": task.task_id, "reason": BlockedReason::BlockedCapability.as_str(), "missing": missing}),
-            ));
-            paced.capability_blocked.push(task.task_id.clone());
-            task.state = TaskState::Blocked;
-            task.blocked_reason = Some(BlockedReason::BlockedCapability.as_str().to_owned());
         }
         let in_flight = tasks.iter().any(|t| {
             matches!(
@@ -614,87 +555,122 @@ pub(super) fn pace(
                     | TaskState::Verifying
             )
         });
-        if let Some(stop) = stop {
-            if unfinished == 0 {
-                commit.cas.push(run_cas(RunState::Incomplete));
+        let any_due = tasks.iter().any(due);
+        let any_waiting = tasks.iter().any(waiting);
+        // Stalled: nothing runs, nothing is in flight, nothing is due and nothing waits for a retry.
+        let stalled = unfinished == 0 && !in_flight && !any_due && !any_waiting;
+        let mut claims = blockers::Claims::load(&tx, &project_id, run_id)?;
+        let unenforceable = budget::unenforceable(&budget);
+        claims.set(
+            blockers::BUDGET,
+            if unenforceable {
+                &[BlockedReason::BudgetUnenforceable]
+            } else {
+                &[]
+            },
+        );
+        claims.set(
+            blockers::PACE,
+            &if stalled {
+                blocked_reasons(&tasks)
+            } else {
+                Vec::new()
+            },
+        );
+        let reasons = claims.reasons();
+        let changed = claims.changed();
+        commit.events.extend(claims.store(&tx)?);
+        if !reasons.is_empty() {
+            if blocked {
+                if changed {
+                    commit.cas.push(StateCas {
+                        id: run_id.to_owned(),
+                        expected_revision: revision,
+                        change: Change::Touch(writer::Entity::Run),
+                    });
+                }
+            } else {
+                // Blocked in this transaction: its decision-class dispatches not yet taken are withdrawn
+                // (docs/adr/ADR-025.md decision 3).
+                let (moves, withdrawn) = super::control::withdraw(
+                    &tx,
+                    &project_id,
+                    run_id,
+                    &at,
+                    super::control::Withdraw::Blocked,
+                    ctx,
+                )?;
+                commit.cas.extend(moves);
+                commit.events.extend(withdrawn);
+                commit.cas.push(run_cas(RunState::Blocked));
+                let detail = if unenforceable {
+                    "a cost limit is set while the price is unknown"
+                } else if state == RunState::WaitingExternal {
+                    "nothing of the run waits any more and no task can move on"
+                } else {
+                    "no task of the run can move on"
+                };
                 commit.events.push(event(
                     &project_id,
                     run_id,
-                    child_id(run_id, &format!("incomplete/{revision}")),
-                    "run.incomplete",
-                    json!({"stop": stop.as_str(), "from": state.as_str(), "remaining": remaining(&tasks)}),
+                    child_id(run_id, &format!("blocked/{revision}")),
+                    "run.blocked",
+                    json!({"reasons": reasons.iter().map(|r| r.as_str()).collect::<Vec<_>>(), "detail": detail}),
                 ));
-                paced.incomplete = Some(stop.as_str());
+                paced.blocked = reasons;
             }
-        } else if unfinished == 0 && !in_flight && !tasks.iter().any(due) {
-            if let Some(next) = tasks
+        } else if blocked || (state == RunState::WaitingExternal && (any_due || !any_waiting)) {
+            // Back to work: its claims all released, its retry due, or nothing of it waits any more (M2T19R-05).
+            let to = back(&resume)?;
+            commit.cas.push(if blocked {
+                StateCas {
+                    id: run_id.to_owned(),
+                    expected_revision: revision,
+                    change: Change::Unblock(to),
+                }
+            } else {
+                run_cas(to)
+            });
+            commit.events.push(event(
+                &project_id,
+                run_id,
+                child_id(run_id, &format!("resumed/{revision}")),
+                "run.resumed",
+                json!({"from": state.as_str(), "to": to.as_str(), "due": tasks.iter().filter(|t| due(t)).map(|t| t.task_id.as_str()).collect::<Vec<_>>()}),
+            ));
+            if blocked {
+                paced.unblocked = true;
+            } else {
+                paced.woke = true;
+            }
+        } else if working
+            && unfinished == 0
+            && !in_flight
+            && !any_due
+            && let Some(next) = tasks
                 .iter()
                 .filter(|t| waiting(t))
                 .filter_map(|t| t.next_retry_at.clone())
                 .min()
-            {
-                commit.cas.push(run_cas(RunState::WaitingExternal));
-                commit.events.push(event(
-                    &project_id,
-                    run_id,
-                    child_id(run_id, &format!("waiting/{revision}")),
-                    "run.waiting",
-                    json!({"next_retry_at": next, "waiting": tasks.iter().filter(|t| waiting(t)).map(|t| t.task_id.as_str()).collect::<Vec<_>>()}),
-                ));
-                paced.waiting_until = Some(next);
-            } else {
-                let reasons = blocked_reasons(&tasks);
-                if !reasons.is_empty() {
-                    // Nothing of the run can move on: it is blocked by what blocks its tasks (ADR-020 decision 5).
-                    paced.blocked = block_run(&tx, run_id, &blockers, &reasons)?;
-                    commit.cas.push(run_cas(RunState::Blocked));
-                    commit.events.push(event(
-                        &project_id,
-                        run_id,
-                        child_id(run_id, &format!("blocked/{revision}")),
-                        "run.blocked",
-                        json!({"reasons": paced.blocked.iter().map(|r| r.as_str()).collect::<Vec<_>>(), "detail": "no task of the run can move on"}),
-                    ));
-                }
-            }
+        {
+            commit.cas.push(run_cas(RunState::WaitingExternal));
+            commit.events.push(event(
+                &project_id,
+                run_id,
+                child_id(run_id, &format!("waiting/{revision}")),
+                "run.waiting",
+                json!({"next_retry_at": next, "waiting": tasks.iter().filter(|t| waiting(t)).map(|t| t.task_id.as_str()).collect::<Vec<_>>()}),
+            ));
+            paced.waiting_until = Some(next);
         }
     }
-    if commit.cas.is_empty() {
+    if commit.cas.is_empty() && commit.events.is_empty() {
         return Ok(paced);
     }
     writer::write(&tx, &commit, ctx)?;
     ctx.before_commit()?;
     tx.commit().map_err(sqlite_error)?;
     Ok(paced)
-}
-
-/// Record `reasons` in the run's blocker set (kept with those already there) and its `blocked_reason` as the set's
-/// first by precedence; the set, ordered.
-fn block_run(
-    tx: &Transaction<'_>,
-    run_id: &str,
-    blockers: &str,
-    reasons: &[BlockedReason],
-) -> Result<Vec<BlockedReason>, PersistError> {
-    let mut set: Vec<BlockedReason> = serde_json::from_str::<Vec<String>>(blockers)
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|r| BlockedReason::parse(r))
-        .chain(reasons.iter().copied())
-        .collect();
-    set.sort_by_key(|r| precedence(*r));
-    set.dedup();
-    let json: Vec<&str> = set.iter().map(|r| r.as_str()).collect();
-    tx.execute(
-        "UPDATE runs SET blocked_reasons_json = ?1, blocked_reason = ?2 WHERE run_id = ?3",
-        params![
-            serde_json::to_string(&json).map_err(|e| PersistError::Storage(e.to_string()))?,
-            set.first().map(|r| r.as_str()),
-            run_id
-        ],
-    )
-    .map_err(sqlite_error)?;
-    Ok(set)
 }
 
 /// A repair a task asks for (REQ-042 behaviour 5, ADR-020 decision 10).

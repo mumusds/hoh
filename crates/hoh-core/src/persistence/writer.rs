@@ -46,6 +46,9 @@ pub enum Change {
     /// Move the run to this state; the transition table and the resume_state rule decide whether that is legal
     /// (ADR-011 §1).
     Run(RunState),
+    /// Move a BLOCKED run whose blocker claims are all released back to this state, its blocker set cleared in the
+    /// same update: the blocking mechanism's own move (docs/adr/ADR-025.md decision 5).
+    Unblock(RunState),
     /// Move the task to this state, checked against the task machine.
     Task(TaskState),
     /// Grow only the revision (a decision that changes no state still orders later ones).
@@ -55,7 +58,7 @@ pub enum Change {
 impl Change {
     pub fn entity(self) -> Entity {
         match self {
-            Change::Run(_) => Entity::Run,
+            Change::Run(_) | Change::Unblock(_) => Entity::Run,
             Change::Task(_) => Entity::Task,
             Change::Touch(entity) => entity,
         }
@@ -931,6 +934,28 @@ pub(super) fn write(
         .map_err(sqlite_error)?;
         event_seqs.push(tx.last_insert_rowid());
     }
+    // A run leaves BLOCKED only with every blocker claim released, this commit's releases counted
+    // (docs/adr/ADR-025.md decision 5).
+    for cas in &commit.cas {
+        if let Change::Unblock(to) = cas.change {
+            let open = super::blockers::Claims::load(tx, "", &cas.id)?.reasons();
+            if !open.is_empty() {
+                return Err(PersistError::IllegalTransition {
+                    entity: Entity::Run,
+                    id: cas.id.clone(),
+                    from: RunState::Blocked.as_str().to_owned(),
+                    to: to.as_str().to_owned(),
+                    why: format!(
+                        "blocker claims are open: {}",
+                        open.iter()
+                            .map(|r| r.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                });
+            }
+        }
+    }
     ctx.at(WritePoint::EventsWritten);
     for message in &commit.outbox {
         let seq = *event_seqs.get(message.event).ok_or_else(|| {
@@ -1036,6 +1061,29 @@ fn compare_and_set(tx: &Transaction<'_>, cas: &StateCas) -> Result<i64, PersistE
             tx.execute(
                 "UPDATE runs SET state = ?1, revision = revision + 1, resume_state = ?2 \
                  WHERE run_id = ?3 AND revision = ?4 AND state = ?5",
+                params![to.as_str(), resume.map(Lifecycle::as_str), cas.id, revision, state],
+            )
+        }
+        Change::Unblock(to) => {
+            let from = parse::<RunState>(&state)?;
+            if from != RunState::Blocked || !lifecycle::is_working(to) {
+                return Err(illegal(
+                    from.as_str(),
+                    to.as_str(),
+                    "only a BLOCKED run is unblocked, to a working state".to_owned(),
+                ));
+            }
+            let saved = saved.as_deref().map(parse::<RunState>).transpose()?;
+            let resume = lifecycle::resume_state(from, to, saved).map_err(|_| {
+                illegal(
+                    from.as_str(),
+                    to.as_str(),
+                    format!("resume_state is {}", saved.map_or("unset", Lifecycle::as_str)),
+                )
+            })?;
+            tx.execute(
+                "UPDATE runs SET state = ?1, revision = revision + 1, resume_state = ?2, blocked_reason = NULL, \
+                 blocked_reasons_json = '[]' WHERE run_id = ?3 AND revision = ?4 AND state = ?5",
                 params![to.as_str(), resume.map(Lifecycle::as_str), cas.id, revision, state],
             )
         }
