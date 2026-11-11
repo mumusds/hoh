@@ -660,12 +660,11 @@ fn fire(
         // No supervision task without a spec (decision 4): each due trigger waits, deferred once; the Commander is not
         // judged (decision 4 before 5, v13, M2T08R-04).
         for t in due {
+            // By its event id, not a JSON comparison per trigger (v18, M2T08R-302).
             let deferred: bool = tx
                 .query_row(
-                    "SELECT EXISTS (SELECT 1 FROM events WHERE run_id = ?1 AND kind = 'supervisor.deferred' \
-                     AND json_extract(payload_json, '$.trigger_id') = ?2 \
-                     AND json_extract(payload_json, '$.reason') = 'NO_SPEC')",
-                    params![run_id, t.trigger_id],
+                    "SELECT EXISTS (SELECT 1 FROM events WHERE event_id = ?1)",
+                    params![child_id(&t.trigger_id, "deferred/NO_SPEC")],
                     |r| r.get(0),
                 )
                 .map_err(sqlite_error)?;

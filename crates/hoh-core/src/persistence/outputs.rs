@@ -72,6 +72,10 @@ pub(super) fn recorded(
 /// How many outputs one writer job disposes of at most (docs/adr/ADR-025.md v16 decision 2, M2T08R-201).
 pub(super) const DISPOSE_BATCH: usize = 50;
 
+/// How many snapshot units (one per output and one per task snapshot its decision's fence compares) one writer job
+/// spends at most, at least one output (v18, M2T08R-301).
+pub(super) const DISPOSE_BUDGET: usize = 10_000;
+
 /// An output of a run with no end yet: its id, its turn and its event's seq.
 pub(super) struct Waiting {
     pub output_id: String,
@@ -209,7 +213,9 @@ pub(super) fn dispose(
             list.push((w, settled));
         }
     }
-    let more = list.len() > DISPOSE_BATCH;
+    let total = list.len();
+    let mut processed = 0;
+    let mut spent = 0;
     // Each turn's allocation read once in this job.
     let mut allocations: std::collections::BTreeMap<String, Value> =
         std::collections::BTreeMap::new();
@@ -222,6 +228,9 @@ pub(super) fn dispose(
         settled,
     ) in list.into_iter().take(DISPOSE_BATCH)
     {
+        if processed > 0 && spent >= DISPOSE_BUDGET {
+            return Ok(true);
+        }
         let tx = writer::begin(conn, ctx)?;
         let (project_id, state): (String, String) = tx
             .query_row(
@@ -254,6 +263,9 @@ pub(super) fn dispose(
                 let allocation = allocation(&tx, run_id, &attempt_id)?;
                 allocations.insert(attempt_id.clone(), allocation);
             }
+            spent += allocations[&attempt_id]["snapshots"]
+                .as_object()
+                .map_or(0, serde_json::Map::len);
             one(
                 &tx,
                 &project_id,
@@ -298,6 +310,8 @@ pub(super) fn dispose(
                 }
                 ctx.before_commit()?;
                 tx.commit().map_err(sqlite_error)?;
+                processed += 1;
+                spent += 1;
             }
             Err(e) => {
                 drop(tx);
@@ -306,20 +320,32 @@ pub(super) fn dispose(
             }
         }
     }
-    Ok(more)
+    Ok(total > processed)
 }
 
 /// Turn `attempt_id`'s `supervisor.allocated` (null when there is none).
+/// Found by its event id, `<turn task>/allocated` (v18: no JSON comparison per item).
 fn allocation(tx: &Transaction<'_>, run_id: &str, attempt_id: &str) -> Result<Value, PersistError> {
-    let allocation: Option<String> = tx
+    let task: Option<String> = tx
         .query_row(
-            "SELECT payload_json FROM events WHERE run_id = ?1 AND kind = 'supervisor.allocated' \
-             AND json_extract(payload_json, '$.attempt_id') = ?2",
-            params![run_id, attempt_id],
+            "SELECT a.task_id FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+             WHERE a.attempt_id = ?1 AND t.run_id = ?2",
+            params![attempt_id, run_id],
             |r| r.get(0),
         )
         .optional()
         .map_err(sqlite_error)?;
+    let allocation: Option<String> = match task {
+        Some(task) => tx
+            .query_row(
+                "SELECT payload_json FROM events WHERE event_id = ?1 AND kind = 'supervisor.allocated'",
+                params![child_id(&task, "allocated")],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sqlite_error)?,
+        None => None,
+    };
     Ok(allocation
         .and_then(|a| serde_json::from_str(&a).ok())
         .unwrap_or(Value::Null))
@@ -420,7 +446,14 @@ fn one(
     // Its id in this turn's namespace: a message id reused by another turn or run is another decision (-259).
     proposal.decision_id = child_id(attempt_id, &message.message_id);
     // Every decision, a request for a person too, passes decide's fences (v13, M2T08R-02).
-    match decide::decide_in(tx, &proposal, context, ctx, Some(output_id)) {
+    match decide::decide_in(
+        tx,
+        &proposal,
+        context,
+        ctx,
+        Some(output_id),
+        Some(allocation),
+    ) {
         Ok(Decided::Applied { .. } | Decided::Rejected { .. }) => Ok(None),
         Ok(Decided::Unsupported { .. }) => match &proposal.payload {
             DecisionPayload::RequestUserDecision { .. } => {

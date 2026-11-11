@@ -346,22 +346,9 @@ pub(super) fn rearm(
         if !turn.ended() || turn.rearm.is_some() {
             continue;
         }
-        let preempted: bool = tx
-            .query_row(
-                "SELECT EXISTS (SELECT 1 FROM events WHERE run_id = ?1 AND kind = 'supervisor.preempt' \
-                 AND json_extract(payload_json, '$.target_attempt') = ?2)",
-                params![run_id, turn.attempt_id],
-                |r| r.get(0),
-            )
-            .map_err(sqlite_error)?;
-        let overdue: bool = tx
-            .query_row(
-                "SELECT EXISTS (SELECT 1 FROM events WHERE run_id = ?1 AND kind = ?2 \
-                 AND json_extract(payload_json, '$.attempt_id') = ?3)",
-                params![run_id, TURN_LIMIT, turn.attempt_id],
-                |r| r.get(0),
-            )
-            .map_err(sqlite_error)?;
+        // By their event ids, `<attempt>/preempt` and `<attempt>/turn_limit` (v18: no JSON comparison per item).
+        let preempted = has_event(tx, &child_id(&turn.attempt_id, "preempt"))?;
+        let overdue = has_event(tx, &child_id(&turn.attempt_id, "turn_limit"))?;
         // A turn stopped at its limit is a failure even when withdrawn before it started (decision 3).
         let reason = if preempted {
             "preempted"
@@ -475,15 +462,27 @@ pub(super) fn supervision_input(
     run_id: &str,
     attempt_id: &str,
 ) -> Result<Option<Supervision>, PersistError> {
-    let allocation: Option<String> = conn
+    // By its event id, `<turn task>/allocated` (v18).
+    let task: Option<String> = conn
         .query_row(
-            "SELECT payload_json FROM events WHERE run_id = ?1 AND kind = ?2 \
-             AND json_extract(payload_json, '$.attempt_id') = ?3",
-            params![run_id, ALLOCATED, attempt_id],
+            "SELECT a.task_id FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+             WHERE a.attempt_id = ?1 AND t.run_id = ?2",
+            params![attempt_id, run_id],
             |r| r.get(0),
         )
         .optional()
         .map_err(sqlite_error)?;
+    let allocation: Option<String> = match task {
+        Some(task) => conn
+            .query_row(
+                "SELECT payload_json FROM events WHERE event_id = ?1 AND kind = ?2",
+                params![child_id(&task, "allocated"), ALLOCATED],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sqlite_error)?,
+        None => None,
+    };
     let Some(allocation) = allocation else {
         return Ok(None);
     };
@@ -596,20 +595,28 @@ pub(super) fn supervision_input(
             );
         }
     }
+    // The latest ten, from two index range scans newest first (v18: no scan of the run's whole history).
     let rejections: Vec<Value> = {
-        let mut statement = conn
-            .prepare(
-                "SELECT kind, payload_json FROM events WHERE run_id = ?1 AND (kind = 'decision.rejected' \
-                 OR (kind = 'supervisor.output_disposed' AND json_extract(payload_json, '$.outcome') = 'invalid')) \
-                 ORDER BY seq DESC LIMIT 10",
-            )
-            .map_err(sqlite_error)?;
-        let rows: Vec<(String, String)> = statement
-            .query_map(params![run_id], |r| Ok((r.get(0)?, r.get(1)?)))
-            .map_err(sqlite_error)?
-            .collect::<Result<_, _>>()
-            .map_err(sqlite_error)?;
+        let mut rows: Vec<(i64, String, String)> = Vec::new();
+        for sql in [
+            "SELECT seq, kind, payload_json FROM events WHERE run_id = ?1 AND kind = 'decision.rejected' \
+             ORDER BY seq DESC LIMIT 10",
+            "SELECT seq, kind, payload_json FROM events WHERE run_id = ?1 AND kind = 'supervisor.output_disposed' \
+             AND json_extract(payload_json, '$.outcome') = 'invalid' ORDER BY seq DESC LIMIT 10",
+        ] {
+            let mut statement = conn.prepare(sql).map_err(sqlite_error)?;
+            rows.extend(
+                statement
+                    .query_map(params![run_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                    .map_err(sqlite_error)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(sqlite_error)?,
+            );
+        }
+        rows.sort_by_key(|(seq, _, _)| std::cmp::Reverse(*seq));
+        rows.truncate(10);
         rows.into_iter()
+            .map(|(_, kind, payload)| (kind, payload))
             .map(|(kind, payload)| {
                 let p: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
                 json!({"kind": kind, "decision_id": p["decision_id"], "output_id": p["output_id"],
@@ -1339,10 +1346,16 @@ pub(super) fn judge(
             ));
         }
     } else {
-        if last
-            .as_ref()
-            .is_none_or(|r| !r.unavailable || r.reasons != json!(reasons))
-        {
+        // Rewritten when the reasons or their subject change: a registry fault names its agent, so a fault of another
+        // agent under the same reason's name is a new record (v18, M2T08R-300).
+        let registry = reasons
+            .iter()
+            .any(|r| matches!(*r, "agent_unavailable" | "login_missing"));
+        if last.as_ref().is_none_or(|r| {
+            !r.unavailable
+                || r.reasons != json!(reasons)
+                || (registry && r.observation["agent"] != observation["agent"])
+        }) {
             commit.events.push(event(
                 child_id(run_id, &format!("supervisor/{number}")),
                 UNAVAILABLE,
@@ -1449,6 +1462,16 @@ pub(super) fn judge(
     commit.cas.extend(moved.cas);
     commit.events.extend(moved.events);
     Ok(commit)
+}
+
+/// Whether event `event_id` exists (the unique index; v18).
+fn has_event(tx: &Connection, event_id: &str) -> Result<bool, PersistError> {
+    tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM events WHERE event_id = ?1)",
+        params![event_id],
+        |r| r.get(0),
+    )
+    .map_err(sqlite_error)
 }
 
 /// The attempts of run `run_id` allocated as probes (`supervisor.probe`).
@@ -1677,14 +1700,7 @@ pub(super) fn stops(
             let Some(turn) = wake.turns.last() else {
                 continue;
             };
-            let preempted: bool = tx
-                .query_row(
-                    "SELECT EXISTS (SELECT 1 FROM events WHERE run_id = ?1 AND kind = ?2 \
-                     AND json_extract(payload_json, '$.target_attempt') = ?3)",
-                    params![run_id, PREEMPT, turn.attempt_id],
-                    |r| r.get(0),
-                )
-                .map_err(sqlite_error)?;
+            let preempted = has_event(&tx, &child_id(&turn.attempt_id, "preempt"))?;
             let overdue = turn
                 .allocated_at
                 .as_deref()
@@ -1693,14 +1709,7 @@ pub(super) fn stops(
             let reason = if preempted {
                 "preempted"
             } else if overdue {
-                let recorded: bool = tx
-                    .query_row(
-                        "SELECT EXISTS (SELECT 1 FROM events WHERE run_id = ?1 AND kind = ?2 \
-                         AND json_extract(payload_json, '$.attempt_id') = ?3)",
-                        params![run_id, TURN_LIMIT, turn.attempt_id],
-                        |r| r.get(0),
-                    )
-                    .map_err(sqlite_error)?;
+                let recorded = has_event(&tx, &child_id(&turn.attempt_id, "turn_limit"))?;
                 if !recorded {
                     events.push(NewEvent {
                         project_id: project_id.to_owned(),
@@ -1785,10 +1794,8 @@ pub(super) fn withdraw_turn(
         ctx,
     )?;
     tx.execute(
-        "UPDATE outbox SET state = 'ACKED', next_retry_at = NULL WHERE state = 'PENDING' \
-         AND json_extract(payload_json, '$.notice') IS 'runtime' AND json_extract(payload_json, '$.kind') IS 'dispatch' \
-         AND json_extract(payload_json, '$.attempt_id') = ?1",
-        params![attempt_id],
+        "UPDATE outbox SET state = 'ACKED', next_retry_at = NULL WHERE state = 'PENDING' AND message_id = ?1",
+        params![child_id(attempt_id, "dispatch")],
     )
     .map_err(sqlite_error)?;
     let mut cas = Vec::new();

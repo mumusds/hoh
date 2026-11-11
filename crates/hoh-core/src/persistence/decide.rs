@@ -65,7 +65,7 @@ pub(super) fn decide(
     ctx: &super::writer::Ctx<'_>,
 ) -> Result<Decided, PersistError> {
     let tx = super::writer::begin(conn, ctx)?;
-    let decided = decide_in(&tx, proposal, context, ctx, None)?;
+    let decided = decide_in(&tx, proposal, context, ctx, None, None)?;
     if let Decided::Unsupported { kind } = decided {
         return Err(PersistError::Unsupported(kind));
     }
@@ -107,7 +107,13 @@ fn answered(
     };
     let payload: Value = serde_json::from_str(&payload)
         .map_err(|e| PersistError::IntegrityViolation(format!("allocation of {wake}: {e}")))?;
-    Ok(Some(Answered {
+    answered_by(&payload).map(Some)
+}
+
+/// The turn an allocation's `payload` gave.
+fn answered_by(payload: &Value) -> Result<Answered, PersistError> {
+    let wake = payload["wake"].as_str().unwrap_or_default();
+    Ok(Answered {
         wake: wake.to_owned(),
         fingerprint: payload["dedup_key"]["fingerprint"]
             .as_str()
@@ -120,21 +126,27 @@ fn answered(
             .unwrap_or_default(),
         run_revision: payload["run_revision"].as_i64().unwrap_or(-1),
         role_epoch: payload["role_epoch"].as_i64().unwrap_or(-1),
-    }))
+    })
 }
 
-/// The task-snapshot fence (docs/adr/ADR-025.md decision 6): a task the answered turn was shown has moved since.
+/// The task-snapshot fence (docs/adr/ADR-025.md decision 6): a task the answered turn was shown has moved since; all
+/// its snapshots compared in one statement, the first moved by task id (v18, M2T08R-301).
 fn fenced(tx: &Transaction<'_>, turn: &Answered) -> Result<Option<Rejection>, PersistError> {
-    for (task, shown) in &turn.snapshots {
-        let now: Option<i64> = tx
-            .query_row(
-                "SELECT revision FROM tasks WHERE task_id = ?1",
-                params![task],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(sqlite_error)?;
-        if now != shown.as_i64() {
+    if turn.snapshots.is_empty() {
+        return Ok(None);
+    }
+    let moved: Option<(String, Option<i64>, Option<i64>)> = tx
+        .query_row(
+            "SELECT j.key, j.value, t.revision FROM json_each(?1) j LEFT JOIN tasks t ON t.task_id = j.key \
+             WHERE t.revision IS NOT j.value ORDER BY j.key LIMIT 1",
+            params![Value::Object(turn.snapshots.clone()).to_string()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    if let Some((task, shown, now)) = moved {
+        let shown = shown.map_or_else(|| "none".to_owned(), |n| n.to_string());
+        {
             return Ok(Some(Rejection {
                 reason: RejectionReason::StaleRevision,
                 detail: format!(
@@ -152,12 +164,15 @@ fn fenced(tx: &Transaction<'_>, turn: &Answered) -> Result<Option<Rejection>, Pe
 /// its own record): a decision id seen before is a replay (same content) or a key reuse (other content), nothing
 /// written; otherwise the decisions row, its verdict, its effect and its event, and for a stale answer to a wake its
 /// one re-trigger.
+/// `allocation`: the `supervisor.allocated` of the turn whose output this decision is, already read by the caller (its
+/// own turn is the one it answers; v18, M2T08R-301): none to look the wake's latest up.
 pub(super) fn decide_in(
     tx: &Transaction<'_>,
     proposal: &Proposal,
     context: &Context,
     ctx: &super::writer::Ctx<'_>,
     output_id: Option<&str>,
+    allocation: Option<&Value>,
 ) -> Result<Decided, PersistError> {
     // The payload is checked against $defs.DecisionPayload again on the way in, whoever built the proposal.
     let payload = protocol::encode(&proposal.payload)
@@ -197,7 +212,10 @@ pub(super) fn decide_in(
     )
     .map_err(sqlite_error)?;
     let snapshot = load_snapshot(tx, &project_id, proposal, context, run)?;
-    let turn = answered(tx, &proposal.run_id, proposal.causation_id.as_deref())?;
+    let turn = match allocation.filter(|a| a["wake"].as_str() == proposal.causation_id.as_deref()) {
+        Some(allocation) => Some(answered_by(allocation)?),
+        None => answered(tx, &proposal.run_id, proposal.causation_id.as_deref())?,
+    };
     // The fences in order: the Commander's epoch, the run's revision, then the tasks its turn was shown.
     let verdict = match decision::validate(proposal, &snapshot) {
         Err(r)
