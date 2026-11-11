@@ -44,7 +44,7 @@ pub use team::{
     Assignment, Availability, FileTeam, SessionGrant, TeamChange, TeamConfig, TeamMember, TeamView,
     Unbound, session_id,
 };
-pub use wakes::Allocated;
+pub use wakes::{Allocated, SUPERVISION_TURN, Stop};
 pub mod location;
 pub mod selftest;
 mod writer;
@@ -894,6 +894,38 @@ impl Store {
                 "an allocation answered with something else".to_owned(),
             )),
         }
+    }
+
+    /// The supervision turns of project `project_id` the host must stop at `context.now()` (docs/adr/ADR-025.md
+    /// decision 3): those a preempt names, and those in flight longer than a turn's limit.
+    pub async fn supervision_stops(
+        &self,
+        project_id: &str,
+        context: crate::decision::Context,
+    ) -> Result<Vec<Stop>, PersistError> {
+        match self
+            .writer
+            .runner(runner::RunnerJob::Stops {
+                project_id: project_id.to_owned(),
+                context: Box::new(context),
+            })
+            .await?
+        {
+            runner::RunnerDone::Stops(stops) => Ok(stops),
+            _ => Err(PersistError::IntegrityViolation(
+                "a read of the turns to stop answered otherwise".to_owned(),
+            )),
+        }
+    }
+
+    /// Withdraw supervision turn `attempt_id` while it is PREPARED (docs/adr/ADR-025.md decision 3); whether it was.
+    pub async fn withdraw_turn(
+        &self,
+        attempt_id: &str,
+        at: std::time::SystemTime,
+    ) -> Result<bool, PersistError> {
+        self.runner_step(runner::RunnerJob::WithdrawTurn(attempt_id.to_owned(), at))
+            .await
     }
 
     /// One look at run `run_id` as a whole at `context.now()` (ADR-020 decisions 4, 5 and 7; docs/adr/ADR-025.md
