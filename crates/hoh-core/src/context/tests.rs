@@ -1110,3 +1110,85 @@ fn a_first_input_is_the_whole_package_however_long_and_counts_against_the_budget
     );
     Ok(())
 }
+
+#[test]
+fn a_recorded_prompt_repacks_to_the_same_bytes_from_its_objects_alone() -> R {
+    // docs/adr/ADR-026.md decision 7 (REQ-039 b8): the manifest names every input; repacking reads only the objects.
+    let m = Mandatory {
+        lead: "lead".to_owned(),
+        ..mandatory()
+    };
+    let entries = vec![
+        with_summary(entry(Class::Code, "a.rs", 9_000, (9, 1, 1)), 30),
+        entry(Class::Evidence, "b.log", 60, (5, 2, 0)),
+        Entry {
+            kind: Kind::Memory,
+            ..entry(Class::Knowledge, "m.md", 60, (5, 0, 2))
+        },
+    ];
+    let params = Params {
+        budget_tokens: required(DEVELOPER, &m)? + 2_000,
+        shares: [40, 40, 20],
+    };
+    let package = json!({"handoff_kind": "role_change"});
+    let contract = Contract {
+        layer: "builtin",
+        path: "resources/prompts/developer.md",
+        text: DEVELOPER,
+    };
+    let recorded = record(contract, &m, Some(&package), &entries, params, "0.0.0+test")?;
+    let store: std::collections::BTreeMap<String, Vec<u8>> = recorded
+        .objects
+        .iter()
+        .map(|o| (o.sha256(), o.bytes.clone()))
+        .collect();
+    let get = |sha: &str| {
+        store
+            .get(sha)
+            .cloned()
+            .ok_or_else(|| format!("{sha} not kept"))
+    };
+    let manifest = get(&recorded.manifest_sha256)?;
+    let again = repack(&manifest, "0.0.0+test", &get)?;
+    assert_eq!(again.sha256, recorded.packed.sha256);
+    assert_eq!(again.prompt, recorded.packed.prompt);
+    // The inputs list: the template, the first input, the manifest, then every entry.
+    let kinds: Vec<&str> = recorded.event["inputs"]
+        .as_array()
+        .ok_or("inputs")?
+        .iter()
+        .filter_map(|i| i["kind"].as_str())
+        .collect();
+    assert_eq!(
+        kinds,
+        ["template", "lead", "manifest", "entry", "entry", "entry"]
+    );
+    assert_eq!(
+        recorded.event["prompt_sha256"],
+        json!(recorded.packed.sha256)
+    );
+    assert_eq!(recorded.event["estimated"], json!(true));
+    assert_eq!(recorded.event["policy"]["shares"], json!([40, 40, 20]));
+    // Another version is refused, never repacked as this one.
+    assert!(repack(&manifest, "0.0.1+other", &get).is_err());
+    // A manifest naming another object for an entry packs another prompt.
+    let other = recorded
+        .objects
+        .iter()
+        .find(|o| o.kind == "entry" && o.name == "b.log")
+        .ok_or("b.log")?
+        .sha256();
+    let swapped = String::from_utf8(manifest.clone())?.replacen(
+        &recorded
+            .objects
+            .iter()
+            .find(|o| o.kind == "entry" && o.name == "m.md")
+            .ok_or("m.md")?
+            .sha256(),
+        &other,
+        1,
+    );
+    let changed = repack(swapped.as_bytes(), "0.0.0+test", &get)?;
+    assert_ne!(changed.sha256, recorded.packed.sha256);
+    Ok(())
+}
