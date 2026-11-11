@@ -187,9 +187,13 @@ fn work(
             class: Class::Evidence,
             kind: Kind::Plain,
             path: format!("attempts/{id}"),
+            // Its own short form: the end and the first of the reason (the packer never summarises).
+            summary: Some(format!(
+                "{id} {state}：{}",
+                failure.as_deref().unwrap_or("").chars().take(120).collect::<String>()
+            )),
             text: json!({"attempt_id": id, "state": state, "failure_reason": failure, "ended_at": ended})
                 .to_string(),
-            summary: None,
             relevance: 1,
             recency: n as u64 + 1,
             causal: 0,

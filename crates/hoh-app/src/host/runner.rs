@@ -139,6 +139,9 @@ pub struct Refusal {
     pub reason: String,
     pub class: FailureClass,
     pub detail: Option<String>,
+    /// What the refusal measured, structured (docs/05 `details`; CONTEXT_BUDGET_TOO_SMALL's required and available,
+    /// docs/adr/ADR-026.md decision 9).
+    pub details: Option<Value>,
 }
 
 /// A refusal nothing classified (a test executor's text): transient.
@@ -148,6 +151,7 @@ impl From<String> for Refusal {
             reason: format!("the process did not start: {detail}"),
             class: FailureClass::Transient { retry_after: None },
             detail: None,
+            details: None,
         }
     }
 }
@@ -679,7 +683,14 @@ async fn attempt(
         return Ok(());
     }
     let key = work.effect_key.clone();
-    let started = match common.executor.start(&work) {
+    // On a blocking thread: the product's executor writes the turn's packed objects before it starts the process
+    // (docs/adr/ADR-026.md decision 6).
+    let executor = common.executor.clone();
+    let held = work.clone();
+    let start = tokio::task::spawn_blocking(move || executor.start(&held))
+        .await
+        .unwrap_or_else(|e| Err(Refusal::from(format!("its start was lost: {e}"))));
+    let started = match start {
         Ok(started) => started,
         Err(refusal) => {
             // Nothing ran: its work stays PREPARED, the attempt fails from STARTING by the refusal's class (its task
@@ -690,7 +701,8 @@ async fn attempt(
                 ending.observed.events.push((
                     "start-refused".to_owned(),
                     "attempt.start_refused".to_owned(),
-                    serde_json::json!({"attempt_id": id, "reason": refusal.reason, "detail": detail}),
+                    serde_json::json!({"attempt_id": id, "reason": refusal.reason, "detail": detail,
+                        "details": refusal.details}),
                 ));
             }
             store.runner_finished(&id, ending).await?;

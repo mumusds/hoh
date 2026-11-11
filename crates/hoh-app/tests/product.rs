@@ -2238,7 +2238,7 @@ async fn a_new_holders_later_turns_in_its_session_carry_no_package() -> R {
         let turn = |task: &str| {
             prompts
                 .iter()
-                .find(|p| p.contains(&format!("任务：{task}\n")))
+                .find(|p| p.contains(&format!("任务：{task}（")))
                 .cloned()
                 .ok_or(format!("no turn of {task}: {prompts:?}"))
         };
@@ -2470,4 +2470,198 @@ async fn a_codex_commander_turn_runs_in_its_sessions_own_directory() -> R {
 #[tokio::test]
 async fn a_pi_commander_turn_runs_in_its_sessions_own_directory() -> R {
     a_commander_turn_runs_in_its_sessions_own_directory("pi").await
+}
+
+/// The texts codex was sent in its turns (turn/start's input), oldest first.
+fn codex_prompts(world: &World) -> R<Vec<String>> {
+    Ok(std::fs::read_dir(world.bin().join("codex.d"))?
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("log."))
+        .filter_map(|e| std::fs::read_to_string(e.path().join("received.jsonl")).ok())
+        .flat_map(|log| log.lines().map(str::to_owned).collect::<Vec<_>>())
+        .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
+        .filter(|m| m["method"] == "turn/start")
+        .filter_map(|m| m["params"]["input"][0]["text"].as_str().map(str::to_owned))
+        .collect())
+}
+
+/// Developer task `task` of run `run_id` READY with two acceptance criteria and `earlier` failed attempts
+/// (`<task>/attempt-1` on), each with a failure reason of `reason_bytes` bytes, in one transaction: its first turn is
+/// `<task>/attempt-<earlier + 1>`.
+fn task_with_acceptance(
+    project: &Path,
+    run_id: &str,
+    task: &str,
+    earlier: usize,
+    reason_bytes: usize,
+) -> R {
+    let mut sql = format!(
+        "BEGIN;
+         INSERT OR IGNORE INTO requirements(requirement_id, spec_id, title, required_release) VALUES ('REQ-X', 's1', 'x', 1);
+         INSERT OR IGNORE INTO acceptance_criteria(ac_id, requirement_id, spec_id, body, check_id) VALUES
+           ('AC-X-01', 'REQ-X', 's1', '装箱后强制项逐字节出现', 'unit'),
+           ('AC-X-02', 'REQ-X', 's1', '份额是硬上限 {{{{GOAL}}}}', 'unit');
+         INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate)
+           VALUES ('{task}', '{run_id}', 's1', 'READY', 1, 'developer', 0,
+           (SELECT coalesce(max(created_seq), 0) + 1 FROM tasks), 1);
+         INSERT INTO task_requirements(task_id, requirement_id, spec_id) VALUES ('{task}', 'REQ-X', 's1');"
+    );
+    for n in 1..=earlier {
+        sql.push_str(&format!(
+            "INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, failure_reason, \
+             ended_at) VALUES ('{task}/attempt-{n}', '{task}', 'FAILED', 1, 1, 1, \
+             '{n}:' || replace(hex(zeroblob({reason_bytes})), '00', 'r'), '2026-11-07T00:0{n}:00Z');"
+        ));
+    }
+    sql.push_str("COMMIT;");
+    exec(project, &sql)
+}
+
+#[tokio::test]
+async fn test_039_04_repacking_from_an_attempts_record_gives_the_prompt_it_was_sent() -> R {
+    // AC-039-04 (docs/adr/ADR-026.md decision 7): attempt A ran with its prompt recorded (its sha256, the resource
+    // bundle version, its inputs list and its truncation policy); repacked from that record and the same bundle, the
+    // prompt's sha256 is A's, whatever changed meanwhile in the live state, its contract file or its logs. A's evidence
+    // went in as summaries (its earlier attempts' reasons are too long for the evidence share) in ranked order.
+    let world = World::new()?;
+    world.codex("gpt-6-astra")?;
+    let project = world.project();
+    std::fs::create_dir_all(project.join(".hoh/prompts"))?;
+    std::fs::write(
+        project.join(".hoh/prompts/dev.md"),
+        "你是开发者。\n\n{{GOAL}}\n\n{{TASK_CONTEXT}}\n\n{{PROJECT_CONTEXT}}\n\n{{EVIDENCE_CONTEXT}}\n",
+    )?;
+    std::fs::write(
+        project.join(".hoh/config.toml"),
+        "config_version = \"1.0\"\n[team.developer]\nagent = \"codex\"\nprompt = \".hoh/prompts/dev.md\"\n",
+    )?;
+    let host = start_when_free(world.config()).await?;
+    let outcome = async {
+        let run_id = started(&host, "s1").await?;
+        ready(&project, &run_id, &[])?;
+        task_with_acceptance(&project, &run_id, "T-a", 3, 40_000)?;
+        until(&project, &ended("T-a/attempt-4"), "SETTLED/", Duration::from_secs(60)).await?;
+        let row: Value = serde_json::from_str(&query(
+            &project,
+            "SELECT json_object('prompt_sha256', prompt_sha256, 'resource_bundle_version', resource_bundle_version) \
+             FROM attempts WHERE attempt_id = 'T-a/attempt-4'",
+        )?)?;
+        let packed: Value = serde_json::from_str(&query(
+            &project,
+            "SELECT payload_json FROM events WHERE kind = 'context.packed' \
+             AND json_extract(payload_json, '$.attempt_id') = 'T-a/attempt-4'",
+        )?)?;
+        // The four fields, none empty.
+        let sha = row["prompt_sha256"].as_str().ok_or("no prompt sha256")?.to_owned();
+        let version = row["resource_bundle_version"].as_str().ok_or("no bundle version")?;
+        assert_eq!(sha.len(), 64);
+        assert_eq!(version, hoh_core::objects::resource_bundle_version());
+        let inputs = packed["inputs"].as_array().ok_or("no inputs")?;
+        assert!(!inputs.is_empty());
+        assert_eq!(packed["policy"]["rule"], "prefix");
+        assert!(packed["policy"]["estimator"].is_string());
+        // What codex was sent is what was recorded.
+        let sent = codex_prompts(&world)?;
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        let digest = |bytes: &[u8]| -> String {
+            <sha2::Sha256 as sha2::Digest>::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+        };
+        assert_eq!(digest(sent[0].as_bytes()), sha);
+        assert!(sent[0].contains("份额是硬上限 {{GOAL}}"), "an AC naming a placeholder is text");
+        // Its evidence went in as summaries, ranked newest first.
+        let summaries: Vec<&str> = inputs
+            .iter()
+            .filter(|i| i["kind"] == "entry" && i["disposition"] == "summary")
+            .filter_map(|i| i["path"].as_str())
+            .collect();
+        assert_eq!(summaries, ["attempts/T-a/attempt-3", "attempts/T-a/attempt-2", "attempts/T-a/attempt-1"]);
+        // Everything it was packed from changes; the repack reads its objects only.
+        std::fs::write(project.join(".hoh/prompts/dev.md"), "另一个契约。\n")?;
+        exec(
+            &project,
+            "UPDATE acceptance_criteria SET body = 'changed'; DELETE FROM attempts WHERE task_id = 'T-a' AND attempt_id <> 'T-a/attempt-4'; \
+             UPDATE runs SET config_snapshot_json = '{}';",
+        )?;
+        let _ = std::fs::remove_dir_all(project.join(".hoh/attempts"));
+        let manifest = packed["manifest"].as_str().ok_or("no manifest")?;
+        let again = hoh_core::objects::repack(&project, manifest)?;
+        assert_eq!(again.sha256, sha);
+        keep(
+            "test-039-04",
+            &json!({"attempt": row, "context_packed": packed, "repacked_sha256": again.sha256}),
+        )?;
+        // A damaged object fails the repack; it is never repacked into something else.
+        let entry = inputs
+            .iter()
+            .find(|i| i["kind"] == "entry")
+            .and_then(|i| i["sha256"].as_str())
+            .ok_or("no entry")?;
+        let object = project.join(hoh_core::objects::relative_path(entry));
+        std::fs::write(&object, b"damaged")?;
+        assert!(hoh_core::objects::repack(&project, manifest).is_err());
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    world.stop_fakes()?;
+    outcome
+}
+
+#[tokio::test]
+async fn a_turn_whose_mandatory_items_exceed_its_runs_budget_is_refused_and_its_task_waits_for_a_decision()
+-> R {
+    // REQ-039 failure mode 1 (docs/adr/ADR-026.md decision 9): the run's budget (its snapshot) below what the task's
+    // mandatory items need: the attempt fails CONTEXT_BUDGET_TOO_SMALL before anything runs, with both numbers; its
+    // task is BLOCKED for a decision with a need_decision event; no prompt is recorded.
+    let world = World::new()?;
+    world.codex("gpt-6-astra")?;
+    let project = world.project();
+    std::fs::create_dir_all(project.join(".hoh"))?;
+    std::fs::write(
+        project.join(".hoh/config.toml"),
+        "config_version = \"1.0\"\n[team.developer]\nagent = \"codex\"\n",
+    )?;
+    let host = start_when_free(world.config()).await?;
+    let outcome = async {
+        let run_id = started(&host, "s1").await?;
+        exec(
+            &project,
+            &format!(
+                "UPDATE runs SET config_snapshot_json = json_set(config_snapshot_json, '$.context', \
+                 json('{{\"budget_tokens\": 100, \"shares\": [45, 35, 20]}}')) WHERE run_id = '{run_id}';"
+            ),
+        )?;
+        ready(&project, &run_id, &[("T-b", "developer")])?;
+        until(&project, &ended("T-b/attempt-1"), "FAILED/CONTEXT_BUDGET_TOO_SMALL", Duration::from_secs(60)).await?;
+        let refused: Value = serde_json::from_str(&query(
+            &project,
+            "SELECT payload_json FROM events WHERE kind = 'attempt.start_refused' AND event_id = 'T-b/attempt-1/start-refused'",
+        )?)?;
+        assert_eq!(refused["details"]["available"], 100, "{refused}");
+        assert!(refused["details"]["required"].as_u64().is_some_and(|r| r > 100), "{refused}");
+        assert_eq!(refused["details"]["estimated"], true);
+        assert_eq!(
+            query(&project, "SELECT state || '/' || blocked_reason FROM tasks WHERE task_id = 'T-b'")?,
+            "BLOCKED/NEED_DECISION"
+        );
+        assert_eq!(
+            query(
+                &project,
+                "SELECT json_extract(payload_json, '$.reason') FROM events WHERE kind = 'need_decision' \
+                 AND json_extract(payload_json, '$.task_id') = 'T-b'"
+            )?,
+            "refused_deterministically"
+        );
+        assert_eq!(
+            query(&project, "SELECT coalesce(prompt_sha256, '') || '/' || coalesce(pid, '') FROM attempts WHERE attempt_id = 'T-b/attempt-1'")?,
+            "/",
+            "nothing sent, no process"
+        );
+        assert!(codex_prompts(&world)?.is_empty());
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    world.stop_fakes()?;
+    outcome
 }

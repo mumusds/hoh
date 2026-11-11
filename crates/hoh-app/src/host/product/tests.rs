@@ -24,42 +24,131 @@ fn work(prompt: Option<&str>) -> Work {
             title: Some("Write the parser".to_owned()),
             first_input: false,
             supervision: None,
-            context: None,
+            context: Some(hoh_core::context::Facts {
+                goal: Some("Ship it".to_owned()),
+                scope: vec!["任务：T1 Write the parser（职位 developer）".to_owned()],
+                ..hoh_core::context::Facts::default()
+            }),
         },
     }
 }
 
-#[test]
-fn a_turn_is_sent_its_roles_contract_then_the_tasks_header() {
-    // ADR-022 decision 11: the contract, then the run's goal, the task's id and title, and the role.
-    let text = prompt_text("Contract.\n\n", None, &work(None));
-    assert!(text.starts_with("Contract.\n\n---\n"), "{text}");
-    for part in ["Ship it", "T1 Write the parser", "developer"] {
-        assert!(text.contains(part), "{part}: {text}");
+fn executor(project: &Path) -> ProductExecutor {
+    ProductExecutor::new(
+        Arc::new(Registry::new(std::ffi::OsString::new())),
+        project.to_owned(),
+        PathBuf::from("hoh"),
+        (Duration::from_secs(10), Duration::from_secs(5)),
+    )
+}
+
+fn contract(text: &str) -> hoh_core::config::Contract {
+    hoh_core::config::Contract {
+        layer: "project",
+        path: ".hoh/prompts/c.md".to_owned(),
+        text: text.to_owned(),
     }
-    assert!(!text.contains("交接包"), "{text}");
 }
 
 #[test]
-fn a_sessions_first_turn_is_sent_its_handover_package_after_the_contract_and_before_the_task()
+fn a_turn_is_sent_its_roles_contract_then_its_layers() -> Result<(), Box<dyn std::error::Error>> {
+    // ADR-022 decision 11 and docs/adr/ADR-026.md decisions 2 and 7: a contract without placeholders first, verbatim,
+    // then the four layers (the run's goal, the task's id and title, the role); every input kept as an object and the
+    // record names them.
+    let dir = tempfile::tempdir()?;
+    let (text, record) = executor(dir.path())
+        .pack(&work(None), &contract("Contract.\n\n"), None)
+        .map_err(|r| format!("{r:?}"))?;
+    assert!(text.starts_with("Contract.\n\n### 当前目标\n"), "{text}");
+    for part in ["Ship it", "T1 Write the parser", "developer", "TaskResult"] {
+        assert!(text.contains(part), "{part}: {text}");
+    }
+    assert!(!text.contains("交接包"), "{text}");
+    assert_eq!(record.sent_sha256, sha256_hex(text.as_bytes()));
+    let packed = record.packed.ok_or("no packing record")?;
+    assert_eq!(
+        packed.resource_bundle_version,
+        hoh_core::objects::resource_bundle_version()
+    );
+    for artifact in &packed.artifacts {
+        let bytes = std::fs::read(dir.path().join(&artifact.path))?;
+        assert_eq!(sha256_hex(&bytes), artifact.sha256, "{}", artifact.path);
+    }
+    let manifest = packed.event["manifest"].as_str().ok_or("no manifest")?;
+    let again = hoh_core::objects::repack(dir.path(), manifest)?;
+    assert_eq!(again.prompt, text, "repacked from its objects alone");
+    Ok(())
+}
+
+#[test]
+fn a_sessions_first_turn_is_sent_its_whole_handover_package_before_every_other_context()
 -> Result<(), Box<dyn std::error::Error>> {
-    // REQ-019 b4 (docs/adr/ADR-024.md decision 4, M2T17R-03): a new holder's first turn has its kept package, whole,
-    // between its role's contract and the task's header.
+    // REQ-019 b4 (docs/adr/ADR-024.md decision 4; docs/adr/ADR-026.md decision 3): a new holder's first turn has its
+    // kept package, whole, after the contract and the goal and before the task and every other context.
+    let dir = tempfile::tempdir()?;
     let package =
         serde_json::json!({"handoff_kind": "role_change", "role": "developer", "run_id": "R9"});
-    let text = prompt_text("Contract.\n\n", Some(&package), &work(None));
-    let (contract, package_at, task) = (
+    let (text, _) = executor(dir.path())
+        .pack(&work(None), &contract("Contract.\n\n"), Some(&package))
+        .map_err(|r| format!("{r:?}"))?;
+    let (contract_at, goal, package_at, task) = (
         text.find("Contract.").ok_or("no contract")?,
+        text.find("Ship it").ok_or("no goal")?,
         text.find("\"run_id\": \"R9\"").ok_or("no package")?,
-        text.find("# 本次任务").ok_or("no task")?,
+        text.find("T1 Write the parser").ok_or("no task")?,
     );
-    assert!(contract < package_at && package_at < task, "{text}");
+    assert!(
+        contract_at < goal && goal < package_at && package_at < task,
+        "{text}"
+    );
     let block = text
         .split("```json\n")
         .nth(1)
         .and_then(|rest| rest.split("\n```").next())
         .ok_or("no package block")?;
     assert_eq!(serde_json::from_str::<serde_json::Value>(block)?, package);
+    Ok(())
+}
+
+#[test]
+fn a_turn_whose_mandatory_items_exceed_its_budget_is_refused_with_both_numbers()
+-> Result<(), Box<dyn std::error::Error>> {
+    // REQ-039 failure mode 1 (docs/adr/ADR-026.md decision 9): CONTEXT_BUDGET_TOO_SMALL, deterministic, with what the
+    // mandatory items need and what the budget is; nothing kept, nothing sent.
+    let dir = tempfile::tempdir()?;
+    let mut tight = work(None);
+    if let Some(facts) = tight.assignment.context.as_mut() {
+        facts.params = Some(hoh_core::context::Params {
+            budget_tokens: 10,
+            shares: [45, 35, 20],
+        });
+    }
+    let refusal = executor(dir.path())
+        .pack(&tight, &contract("Contract.\n\n"), None)
+        .err()
+        .ok_or("packed within 10 tokens")?;
+    assert_eq!(refusal.reason, "CONTEXT_BUDGET_TOO_SMALL");
+    assert_eq!(refusal.class, FailureClass::Decision);
+    let details = refusal.details.ok_or("no details")?;
+    assert_eq!(details["available"], 10);
+    assert!(
+        details["required"].as_u64().is_some_and(|r| r > 10),
+        "{details}"
+    );
+    assert_eq!(details["estimated"], true);
+    assert!(
+        !dir.path().join(".hoh/objects").exists(),
+        "nothing kept for a turn that never starts"
+    );
+    // A contract with only some placeholders is refused the same way, as PROMPT_UNAVAILABLE.
+    let refusal = executor(dir.path())
+        .pack(&work(None), &contract("{{GOAL}} only"), None)
+        .err()
+        .ok_or("packed a malformed contract")?;
+    assert_eq!(
+        (refusal.reason.as_str(), refusal.class),
+        ("PROMPT_UNAVAILABLE", FailureClass::Decision)
+    );
     Ok(())
 }
 
@@ -303,10 +392,15 @@ fn a_first_input_is_kept_once_whole_and_another_is_refused()
 }
 
 #[test]
-fn a_commander_turn_is_told_its_wake_the_values_to_name_its_nonce_and_its_bridge() {
-    // docs/adr/ADR-025.md decisions 7 and 8: after the task's header, the wake it answers (its causation), the run's
-    // revision and the Commander's epoch its decision names, the nonce, the bridge file, and the summary as JSON.
-    let s = hoh_core::persistence::Supervision {
+fn a_commander_turn_is_told_its_wake_the_values_to_name_its_nonce_and_its_bridge()
+-> Result<(), Box<dyn std::error::Error>> {
+    // docs/adr/ADR-025.md decisions 7 and 8, docs/adr/ADR-026.md decision 3: the wake it answers (its causation), the
+    // run's revision and the Commander's epoch its decision names, the nonce, the bridge file and the project's root,
+    // in its task layer, never cut.
+    let dir = tempfile::tempdir()?;
+    let mut work = work(None);
+    work.role = "commander".to_owned();
+    work.assignment.supervision = Some(hoh_core::persistence::Supervision {
         wake: "R1/trigger/3".to_owned(),
         nonce: "n0nce".to_owned(),
         run_revision: 7,
@@ -314,18 +408,46 @@ fn a_commander_turn_is_told_its_wake_the_values_to_name_its_nonce_and_its_bridge
         summary: serde_json::json!({"wake": {"id": "R1/trigger/3"}, "snapshots": {"T1": 4}}),
         workdir: None,
         subject: Vec::new(),
-    };
-    let text = supervision_text(&s, Path::new("/p/.hoh/attempts/x/messages.jsonl"));
-    for part in [
-        "causation_id：R1/trigger/3",
-        "expected_revision：7",
-        "role_epoch：2",
-        "nonce：n0nce",
-        "/p/.hoh/attempts/x/messages.jsonl",
-        "\"snapshots\"",
-    ] {
-        assert!(text.contains(part), "{part}: {text}");
+    });
+    if let Some(facts) = work.assignment.context.as_mut() {
+        facts.header = vec![
+            ("causation_id".to_owned(), "R1/trigger/3".to_owned()),
+            (
+                "expected_revision（Run 的 revision）".to_owned(),
+                "7".to_owned(),
+            ),
+            ("role_epoch".to_owned(), "2".to_owned()),
+            ("nonce".to_owned(), "n0nce".to_owned()),
+        ];
     }
+    let builtin = hoh_core::config::Contract {
+        layer: "builtin",
+        path: "resources/prompts/commander.md".to_owned(),
+        text: hoh_core::config::builtin_contract("commander")
+            .ok_or("no commander")?
+            .to_owned(),
+    };
+    let (text, _) = executor(dir.path())
+        .pack(&work, &builtin, None)
+        .map_err(|r| format!("{r:?}"))?;
+    let bridge = dir
+        .path()
+        .join(".hoh/attempts")
+        .join(component("R1/T1/a1"))
+        .join("messages.jsonl");
+    for part in [
+        "causation_id：R1/trigger/3".to_owned(),
+        "expected_revision（Run 的 revision）：7".to_owned(),
+        "role_epoch：2".to_owned(),
+        "nonce：n0nce".to_owned(),
+        format!("输出文件：{}", bridge.display()),
+        format!("项目根：{}", dir.path().display()),
+        "DecisionPayload".to_owned(),
+    ] {
+        assert!(text.contains(&part), "{part}: {text}");
+    }
+    assert!(!text.contains("{{"), "{text}");
+    Ok(())
 }
 
 #[test]
