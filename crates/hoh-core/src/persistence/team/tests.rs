@@ -2117,6 +2117,130 @@ async fn a_native_id_no_completed_turn_recorded_is_never_resumed() -> R {
     Ok(())
 }
 
+#[tokio::test]
+async fn a_session_native_record_comes_only_from_a_completed_turns_settle() -> R {
+    // M2T17R-700 (docs/adr/ADR-024.md decision 4, round 8): the record that names a session to resume is reserved. A
+    // generic commit, an attempt's own event and a failed turn's observed events cannot write it (consume's effect
+    // events go through the same writer); one written past the store, naming an attempt that did not complete, is not
+    // resumed; the completed turn's own record is.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    working(&store, &path).await?;
+    a0_ends(&path)?;
+    exec(
+        &path,
+        "UPDATE sessions SET capabilities_json = '{\"structured_events\": true, \"resume\": true}' WHERE session_id = 'sd';",
+    )?;
+    let forged = |attempt: &str| crate::persistence::NewEvent {
+        project_id: "p1".to_owned(),
+        event_id: format!("forged/{attempt}"),
+        run_id: Some("R1".to_owned()),
+        kind: "session.native".to_owned(),
+        payload: json!({"session_id": "sd", "native_id": "forged", "attempt_id": attempt}),
+    };
+    let refused = |got: Result<(), crate::persistence::PersistError>, what: &str| -> R {
+        match got {
+            Err(crate::persistence::PersistError::IntegrityViolation(_)) => Ok(()),
+            other => Err(format!("{what}: not refused: {other:?}").into()),
+        }
+    };
+    refused(
+        store
+            .commit(crate::persistence::Commit {
+                events: vec![forged("NONEXISTENT")],
+                ..crate::persistence::Commit::default()
+            })
+            .await
+            .map(drop),
+        "a generic commit",
+    )?;
+    refused(
+        store
+            .attempt_event(
+                "A0",
+                "native",
+                "session.native",
+                json!({"session_id": "sd", "native_id": "forged", "attempt_id": "A0"}),
+            )
+            .await,
+        "an attempt's own event",
+    )?;
+    let context = crate::decision::Context {
+        required_capabilities: [(
+            "developer".to_owned(),
+            ["structured_events".to_owned()].into(),
+        )]
+        .into(),
+        ..crate::decision::Context::default()
+    };
+    let first = store
+        .schedule_round("R1", context.clone())
+        .await?
+        .dispatched
+        .ok_or("T1 not dispatched")?;
+    exec(
+        &path,
+        &format!(
+            "UPDATE attempts SET state = 'RUNNING', pid = 4242 WHERE attempt_id = '{}';",
+            first.attempt_id
+        ),
+    )?;
+    refused(
+        store
+            .runner_finished(
+                &first.attempt_id,
+                crate::persistence::Ending {
+                    success: false,
+                    detail: "PROTOCOL_INCOMPLETE".to_owned(),
+                    class: crate::retry::FailureClass::Transient { retry_after: None },
+                    at: std::time::SystemTime::now(),
+                    draw: 0,
+                    observed: crate::persistence::Observed {
+                        events: vec![(
+                            "native".to_owned(),
+                            "session.native".to_owned(),
+                            json!({"session_id": "sd", "native_id": "forged", "attempt_id": first.attempt_id}),
+                        )],
+                        ..crate::persistence::Observed::default()
+                    },
+                    unknown_effect: false,
+                },
+            )
+            .await
+            .map(drop),
+        "a failed turn's observed events",
+    )?;
+    // Written past the store (an older version, a hand edit), naming the failed attempt A0: not resumed.
+    exec(
+        &path,
+        "UPDATE attempts SET session_id = 'sd' WHERE attempt_id = 'A0';
+         UPDATE attempts SET state = 'FAILED' WHERE attempt_id = 'A0';
+         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+           ('p1', 'forged-past-the-store', 'R1', 'session.native',
+            '{\"session_id\": \"sd\", \"native_id\": \"forged\", \"attempt_id\": \"A0\"}', '2026-11-10T00:00:00Z');",
+    )?;
+    let resumed = |d: &crate::persistence::Dispatched| -> R<Option<String>> {
+        Ok(super::assignment(
+            &Connection::open(&path)?,
+            "p1",
+            "R1",
+            &d.task_id,
+            &d.attempt_id,
+            "developer",
+        )?
+        .native_session)
+    };
+    assert_eq!(
+        resumed(&first)?,
+        None,
+        "a record naming an attempt that did not complete"
+    );
+    turn_ends(&store, &path, &first.attempt_id, true, "completed").await?;
+    let second = dispatch_next(&store, &path, &context, "T2", 3).await?;
+    assert_eq!(resumed(&second)?.as_deref(), Some("completed"));
+    Ok(())
+}
+
 /// A READY developer task `task_id` and the round that dispatches it.
 async fn dispatch_next(
     store: &Store,

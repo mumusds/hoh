@@ -819,7 +819,9 @@ pub(super) fn assignment(
             "SELECT a.agent, b.model, a.role_epoch, a.config_revision, a.session_id, \
              CASE WHEN json_extract(s.capabilities_json, '$.resume') = 1 THEN (SELECT json_extract(n.payload_json, \
               '$.native_id') FROM events n WHERE n.run_id = ?2 AND n.kind = 'session.native' \
-              AND json_extract(n.payload_json, '$.session_id') = a.session_id ORDER BY n.seq DESC LIMIT 1) END, \
+              AND json_extract(n.payload_json, '$.session_id') = a.session_id \
+              AND EXISTS(SELECT 1 FROM attempts p WHERE p.attempt_id = json_extract(n.payload_json, '$.attempt_id') \
+               AND p.session_id = a.session_id AND p.state = 'SETTLED') ORDER BY n.seq DESC LIMIT 1) END, \
              s.agent_version, \
              (SELECT json_extract(e.payload_json, '$.goal') FROM events e WHERE e.run_id = ?2 AND e.kind = 'run.created' \
               ORDER BY e.seq LIMIT 1), \

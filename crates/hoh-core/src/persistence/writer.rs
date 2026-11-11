@@ -812,6 +812,36 @@ fn apply(conn: &mut Connection, commit: &Commit, ctx: &Ctx<'_>) -> Result<Commit
     Ok(done)
 }
 
+/// The kind of the record that names the native session a later turn of a HoH session resumes: written only by the
+/// runner's settle of a turn that completed, through [`write_session_native`]; every other writer is refused
+/// (docs/adr/ADR-024.md decision 4, M2T17R-700).
+pub(super) const SESSION_NATIVE: &str = "session.native";
+
+/// The record that turn `attempt_id` of HoH session `session_id` completed with the agent's native session `native`
+/// (decision 4): the only way a session.native event is written, inside the settle's own transaction.
+pub(super) fn write_session_native(
+    tx: &Transaction<'_>,
+    project_id: &str,
+    run_id: &str,
+    attempt_id: &str,
+    session_id: &str,
+    native: &str,
+) -> Result<(), PersistError> {
+    tx.execute(
+        "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            project_id,
+            crate::ids::child_id(attempt_id, SESSION_NATIVE),
+            run_id,
+            SESSION_NATIVE,
+            serde_json::json!({"session_id": session_id, "native_id": native, "attempt_id": attempt_id}).to_string(),
+            crate::time::now_rfc3339()
+        ],
+    )
+    .map_err(sqlite_error)?;
+    Ok(())
+}
+
 /// The writes of `commit` inside the caller's transaction.
 pub(super) fn write(
     tx: &Transaction<'_>,
@@ -826,6 +856,12 @@ pub(super) fn write(
     let now = crate::time::now_rfc3339();
     let mut event_seqs = Vec::with_capacity(commit.events.len());
     for event in &commit.events {
+        if event.kind == SESSION_NATIVE {
+            return Err(PersistError::IntegrityViolation(format!(
+                "event {}: {SESSION_NATIVE} is written only by the settle of a turn that completed",
+                event.event_id
+            )));
+        }
         tx.execute(
             "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![

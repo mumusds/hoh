@@ -691,13 +691,7 @@ fn finished(
                 params![session, native],
             )
             .map_err(sqlite_error)?;
-            commit.events.push(NewEvent {
-                project_id: project_id.clone(),
-                event_id: crate::ids::child_id(attempt_id, "session.native"),
-                run_id: Some(run_id.clone()),
-                kind: "session.native".to_owned(),
-                payload: json!({"session_id": session, "native_id": native, "attempt_id": attempt_id}),
-            });
+            writer::write_session_native(&tx, &project_id, &run_id, attempt_id, &session, native)?;
         }
     }
     for (key, kind, payload) in &ending.observed.events {
