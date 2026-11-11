@@ -113,59 +113,9 @@ pub fn mandatory(
     })
 }
 
-/// A first input as its prompt shows it (docs/adr/ADR-026.md decision 3, v4): the package itself when no `state` id
-/// list is longer than [`LEAD_IDS`]; else a summary marked as one, of another shape than a ContextHandoff (each list as
-/// its total and its first ids, under `state_summary`), and where the whole package is kept. A summary never passes for
-/// the package.
-pub fn lead(package: &serde_json::Value, kept_at: &str) -> String {
-    let long = package
-        .get("state")
-        .and_then(serde_json::Value::as_object)
-        .is_some_and(|state| {
-            state
-                .values()
-                .any(|ids| ids.as_array().is_some_and(|l| l.len() > LEAD_IDS))
-        });
-    let pretty =
-        |v: &serde_json::Value| serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string());
-    if !long {
-        return format!(
-            "#### 交接包（本会话的首个输入）\n\n```json\n{}\n```",
-            pretty(package)
-        );
-    }
-    let mut summary = serde_json::Map::new();
-    if let Some(object) = package.as_object() {
-        for (key, value) in object {
-            if key != "state" {
-                summary.insert(key.clone(), value.clone());
-            }
-        }
-    }
-    let lists: serde_json::Map<String, serde_json::Value> = package["state"]
-        .as_object()
-        .map(|state| {
-            state
-                .iter()
-                .map(|(name, ids)| {
-                    let list = ids.as_array().cloned().unwrap_or_default();
-                    let first: Vec<serde_json::Value> =
-                        list.iter().take(LEAD_IDS).cloned().collect();
-                    (
-                        name.clone(),
-                        serde_json::json!({"total": list.len(), "first": first}),
-                    )
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    summary.insert("state_summary".to_owned(), serde_json::Value::Object(lists));
-    format!(
-        "#### 交接包摘要（不是完整交接包：state 的列表各只列前 {LEAD_IDS} 个与总数）\n\n```json\n{}\n```\n\n\
-         完整交接包（本会话的首个输入）：{kept_at}",
-        pretty(&serde_json::Value::Object(summary))
-    )
+/// A first input as its prompt shows it: the whole handover package, never cut (REQ-019 behaviour 4: a new holder's
+/// first input is the whole checkpoint package; docs/adr/ADR-026.md decision 3).
+pub fn lead(package: &serde_json::Value) -> String {
+    let json = serde_json::to_string_pretty(package).unwrap_or_else(|_| package.to_string());
+    format!("#### 交接包（本会话的首个输入）\n\n```json\n{json}\n```")
 }
-
-/// How many ids of each `state` list a first input shows.
-pub const LEAD_IDS: usize = 50;

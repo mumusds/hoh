@@ -1,8 +1,8 @@
 # CR-016 · AC-039-03 改归 QA 派发任务
 
 ID：CR-016
-状态：PROPOSED（设计审查第 2 轮：Codex 判 CR-016 单项 PASS，Claude PASS 并要求补承接项 -155；补后待第 3 轮复核，属 CR-003 D1 预授权的细化，审查判定 PASS 后由 CTO 批准）
-批准人：（待定）
+状态：APPROVED
+批准人：CTO 依 CR-003 D1 预授权（独立审查：Codex 设计审查第 2 轮 01a1cb87-6ed4-71a0-a5bc-d7869d8e5090 与第 3 轮 01a1cb9a-ce13-78d1-9047-bdb156596447 判 CR-016 PASS；Claude 第 2 轮 7f9bd306-5cea-4e07-ac25-28c535a78afd 判归属正确，补承接项 M2T09D-155 后经 Codex 第 3 轮复核）
 日期：2026-11-11
 基线：不改受锁文件，不重新上锁（只改 `contracts/development-tasks.json` 的任务归属，重新生成 docs/18）
 
