@@ -226,6 +226,40 @@ pub(super) fn submit(
             };
             let at = events.len();
             events.push(command.event.clone());
+            // A resume while blockers are claimed returns to BLOCKED, its resume state kept for when they are all
+            // released (docs/adr/ADR-025.md decision 5).
+            let mut to = to;
+            let mut cas = Vec::new();
+            if *target == RunTarget::Resume {
+                let reasons: String = tx
+                    .query_row(
+                        "SELECT blocked_reasons_json FROM runs WHERE run_id = ?1",
+                        params![command.run_id],
+                        |r| r.get(0),
+                    )
+                    .map_err(sqlite_error)?;
+                let reasons: Vec<String> = serde_json::from_str(&reasons).unwrap_or_default();
+                if !reasons.is_empty() {
+                    to = RunState::Blocked;
+                    let (moves, withdrawn) = super::control::withdraw(
+                        &tx,
+                        &project_id,
+                        &command.run_id,
+                        &crate::time::now_rfc3339(),
+                        super::control::Withdraw::Blocked,
+                        ctx,
+                    )?;
+                    cas.extend(moves);
+                    events.extend(withdrawn);
+                    events.push(NewEvent {
+                        project_id: project_id.clone(),
+                        event_id: crate::ids::child_id(&command.run_id, &format!("resumed-blocked/{}", command.command_id)),
+                        run_id: Some(command.run_id.clone()),
+                        kind: "run.blocked".to_owned(),
+                        payload: serde_json::json!({"reasons": reasons, "detail": "resumed with its blockers claimed"}),
+                    });
+                }
+            }
             // A notice to a role is addressed to its binding as it is now, in this transaction: after a handover the
             // commander's epoch is no longer the one the caller may have written (docs/adr/ADR-024.md decision 6).
             let mut outbox = Vec::new();
@@ -244,20 +278,22 @@ pub(super) fn submit(
                     ..o
                 });
             }
+            let run_at = cas.len();
+            cas.push(StateCas {
+                id: command.run_id.clone(),
+                expected_revision: command.expected_revision,
+                change: Change::Run(to),
+            });
             let done = writer::write(
                 &tx,
                 &Commit {
-                    cas: vec![StateCas {
-                        id: command.run_id.clone(),
-                        expected_revision: command.expected_revision,
-                        change: Change::Run(to),
-                    }],
+                    cas,
                     events,
                     outbox,
                 },
                 ctx,
             )?;
-            (done.revisions[0], done.event_seqs[at])
+            (done.revisions[run_at], done.event_seqs[at])
         }
     };
 

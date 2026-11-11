@@ -641,6 +641,80 @@ async fn every_legal_run_edge_is_written_and_every_illegal_one_refused() -> R {
 }
 
 #[tokio::test]
+async fn a_run_is_unblocked_only_from_blocked_with_every_claim_released() -> R {
+    // docs/adr/ADR-025.md decision 5: the blocking mechanism's own move clears the set with the state, and only once
+    // every claim is released (this commit's releases counted); not from another state, not to a suspended one.
+    let dir = tempfile::tempdir()?;
+    let path = db_in(&dir);
+    let store = Store::open(&path, test_options())?;
+    seed(&path)?;
+    let conn = Connection::open(&path)?;
+    conn.execute_batch(
+        "UPDATE runs SET state = 'BLOCKED', resume_state = 'RUNNING', blocked_reason = 'NEED_DECISION',
+         blocked_reasons_json = '[\"NEED_DECISION\"]' WHERE run_id = 'r1';
+         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+           ('p1', 'claim-1', 'r1', 'run.blocker_claimed', '{\"reason\": \"NEED_DECISION\", \"source\": \"pace\"}',
+            '2026-11-07T00:00:00Z');",
+    )?;
+    let unblock = |to, events: Vec<NewEvent>| {
+        store.commit(Commit {
+            cas: vec![StateCas {
+                id: "r1".to_owned(),
+                expected_revision: 0,
+                change: Change::Unblock(to),
+            }],
+            events,
+            ..Commit::default()
+        })
+    };
+    let release = || NewEvent {
+        project_id: "p1".to_owned(),
+        event_id: "release-1".to_owned(),
+        run_id: Some("r1".to_owned()),
+        kind: "run.blocker_released".to_owned(),
+        payload: serde_json::json!({"reason": "NEED_DECISION", "source": "pace"}),
+    };
+    match unblock(RunState::Running, Vec::new()).await {
+        Err(PersistError::IllegalTransition { why, .. }) => {
+            assert!(why.contains("claims are open"), "{why}")
+        }
+        other => return Err(format!("unblocked with a claim open: {other:?}").into()),
+    }
+    assert!(
+        matches!(
+            unblock(RunState::Paused, vec![release()]).await,
+            Err(PersistError::IllegalTransition { .. })
+        ),
+        "only to a working state"
+    );
+    unblock(RunState::Running, vec![release()]).await?;
+    assert_eq!(run_row(&path)?, ("RUNNING".to_owned(), 1, None));
+    let set: (Option<String>, String) = conn.query_row(
+        "SELECT blocked_reason, blocked_reasons_json FROM runs WHERE run_id = 'r1'",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    assert_eq!(set, (None, "[]".to_owned()));
+    assert!(
+        matches!(
+            store
+                .commit(Commit {
+                    cas: vec![StateCas {
+                        id: "r1".to_owned(),
+                        expected_revision: 1,
+                        change: Change::Unblock(RunState::Running),
+                    }],
+                    ..Commit::default()
+                })
+                .await,
+            Err(PersistError::IllegalTransition { .. })
+        ),
+        "a RUNNING run is not unblocked"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn blockers_survive_a_pause_and_hold_back_work() -> R {
     // M2T02R-02: a run BLOCKED on NEED_DECISION that is paused and resumed stays blocked; it works again only once
     // its blockers are removed (by the blocking mechanism; here by hand).

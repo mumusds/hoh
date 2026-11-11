@@ -282,7 +282,9 @@ fn waiting(conn: &Connection, project_id: &str) -> Result<Waiting, PersistError>
              JOIN attempts a ON a.attempt_id = json_extract(o.payload_json, '$.attempt_id') \
              WHERE r.project_id = ?1 AND o.state = 'PENDING' AND json_extract(o.payload_json, '$.notice') IS 'runtime' \
              AND json_extract(o.payload_json, '$.kind') IS 'dispatch' AND a.state = 'PREPARED' \
-             AND r.state IN ('CREATED', 'DISCOVERING', 'SPECIFYING', 'READY', 'RUNNING', 'VERIFYING') ORDER BY o.event_seq",
+             AND (r.state IN ('CREATED', 'DISCOVERING', 'SPECIFYING', 'READY', 'RUNNING', 'VERIFYING') \
+                  OR (r.state IN ('BLOCKED', 'WAITING_EXTERNAL') AND json_extract(o.payload_json, '$.origin') IS NOT NULL)) \
+             ORDER BY o.event_seq",
         )
         .map_err(sqlite_error)?;
     let dispatches = statement
@@ -327,8 +329,8 @@ fn waiting(conn: &Connection, project_id: &str) -> Result<Waiting, PersistError>
         .map_err(sqlite_error)?;
     let mut statement = conn
         .prepare(
-            "SELECT run_id FROM runs WHERE project_id = ?1 AND state IN ('RUNNING', 'VERIFYING', 'WAITING_EXTERNAL') \
-             ORDER BY created_at, run_id",
+            "SELECT run_id FROM runs WHERE project_id = ?1 \
+             AND state IN ('RUNNING', 'VERIFYING', 'WAITING_EXTERNAL', 'BLOCKED') ORDER BY created_at, run_id",
         )
         .map_err(sqlite_error)?;
     let runs = statement
@@ -430,12 +432,15 @@ fn received(
         )
         .optional()
         .map_err(sqlite_error)?;
-    // Nothing starts for a run that does not work (paused or cancelled meanwhile, docs/adr/ADR-021.md decision 7).
+    // Nothing starts for a run that does not work (paused or cancelled meanwhile, docs/adr/ADR-021.md decision 7); a
+    // runtime-class dispatch (its notice carries an origin) starts on a BLOCKED or WAITING_EXTERNAL run too
+    // (docs/adr/ADR-025.md decision 3, CR-003).
     let working: bool = tx
         .query_row(
-            "SELECT state IN ('CREATED', 'DISCOVERING', 'SPECIFYING', 'READY', 'RUNNING', 'VERIFYING') FROM runs \
-             WHERE run_id = ?1",
-            params![notice.run_id],
+            "SELECT r.state IN ('CREATED', 'DISCOVERING', 'SPECIFYING', 'READY', 'RUNNING', 'VERIFYING') \
+             OR (r.state IN ('BLOCKED', 'WAITING_EXTERNAL') AND EXISTS (SELECT 1 FROM outbox o WHERE o.message_id = ?2 \
+                 AND json_extract(o.payload_json, '$.origin') IS NOT NULL)) FROM runs r WHERE r.run_id = ?1",
+            params![notice.run_id, notice.message_id],
             |r| r.get(0),
         )
         .optional()

@@ -115,6 +115,90 @@ pub(super) fn running_attempts(
     Ok(rows)
 }
 
+/// Why PREPARED dispatches are withdrawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Withdraw {
+    /// A pause: every one.
+    Pause,
+    /// The run enters BLOCKED: the decision-class ones; a dispatch whose notice carries an `origin` is runtime-class
+    /// and stays (docs/adr/ADR-025.md decision 3, CR-003).
+    Blocked,
+}
+
+/// Withdraw run `run_id`'s PREPARED dispatches for `why`, in the caller's transaction: each attempt CANCELLED, its
+/// notice settled, its task READY again, nothing counted (docs/adr/ADR-021.md decision 7). The task moves and the
+/// events.
+pub(super) fn withdraw(
+    tx: &rusqlite::Transaction<'_>,
+    project_id: &str,
+    run_id: &str,
+    at: &str,
+    why: Withdraw,
+    ctx: &Ctx<'_>,
+) -> Result<(Vec<StateCas>, Vec<NewEvent>), PersistError> {
+    let prepared: Vec<(String, String, String, i64)> = {
+        let mut statement = tx
+            .prepare(
+                "SELECT a.attempt_id, a.task_id, t.state, t.revision FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+                 WHERE t.run_id = ?1 AND a.state = 'PREPARED' AND (?2 OR NOT EXISTS (SELECT 1 FROM outbox o \
+                 WHERE json_extract(o.payload_json, '$.notice') IS 'runtime' AND json_extract(o.payload_json, '$.kind') IS 'dispatch' \
+                 AND json_extract(o.payload_json, '$.attempt_id') = a.attempt_id \
+                 AND json_extract(o.payload_json, '$.origin') IS NOT NULL)) ORDER BY a.rowid",
+            )
+            .map_err(sqlite_error)?;
+        statement
+            .query_map(params![run_id, why == Withdraw::Pause], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .map_err(sqlite_error)?
+            .collect::<Result<_, _>>()
+            .map_err(sqlite_error)?
+    };
+    let (kind, suffix) = match why {
+        Withdraw::Pause => ("pause.withdrawn", "pause/withdrawn"),
+        Withdraw::Blocked => ("blocked.withdrawn", "blocked/withdrawn"),
+    };
+    let mut cas = Vec::new();
+    let mut events = Vec::new();
+    for (attempt_id, task_id, task_state, task_revision) in prepared {
+        attempts::move_attempt(
+            tx,
+            &AttemptMove {
+                attempt_id: attempt_id.clone(),
+                from: AttemptState::Prepared,
+                to: AttemptState::Cancelled,
+                facts: AttemptFacts {
+                    ended_at: Some(at.to_owned()),
+                    ..AttemptFacts::default()
+                },
+            },
+            ctx,
+        )?;
+        tx.execute(
+            "UPDATE outbox SET state = 'ACKED', next_retry_at = NULL WHERE state = 'PENDING' \
+             AND json_extract(payload_json, '$.notice') IS 'runtime' AND json_extract(payload_json, '$.kind') IS 'dispatch' \
+             AND json_extract(payload_json, '$.attempt_id') = ?1",
+            params![attempt_id],
+        )
+        .map_err(sqlite_error)?;
+        if writer::parse::<TaskState>(&task_state)? == TaskState::Leased {
+            cas.push(StateCas {
+                id: task_id.clone(),
+                expected_revision: task_revision,
+                change: Change::Task(TaskState::Ready),
+            });
+        }
+        events.push(NewEvent {
+            project_id: project_id.to_owned(),
+            event_id: child_id(&attempt_id, suffix),
+            run_id: Some(run_id.to_owned()),
+            kind: kind.to_owned(),
+            payload: json!({"attempt_id": attempt_id, "task_id": task_id}),
+        });
+    }
+    Ok((cas, events))
+}
+
 /// A pausing run's step (REQ-043 behaviour 1, docs/adr/ADR-021.md decision 7): its dispatches not yet taken are
 /// withdrawn (the attempt CANCELLED, its task READY again, its notice acknowledged; not counted as a failure), and once
 /// none of its attempts starts or runs (the safe point: an attempt is never interrupted) it is PAUSED, its pause notice
@@ -140,59 +224,14 @@ fn pause_step(
     if writer::parse::<RunState>(&state)? != RunState::PauseRequested {
         return Ok(PauseStep::NotPausing);
     }
-    let prepared: Vec<(String, String, String, i64)> = {
-        let mut statement = tx
-            .prepare(
-                "SELECT a.attempt_id, a.task_id, t.state, t.revision FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
-                 WHERE t.run_id = ?1 AND a.state = 'PREPARED' ORDER BY a.rowid",
-            )
-            .map_err(sqlite_error)?;
-        statement
-            .query_map(params![run_id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-            })
-            .map_err(sqlite_error)?
-            .collect::<Result<_, _>>()
-            .map_err(sqlite_error)?
-    };
-    let mut cas = Vec::new();
-    let mut events = Vec::new();
-    for (attempt_id, task_id, task_state, task_revision) in prepared {
-        attempts::move_attempt(
-            &tx,
-            &AttemptMove {
-                attempt_id: attempt_id.clone(),
-                from: AttemptState::Prepared,
-                to: AttemptState::Cancelled,
-                facts: AttemptFacts {
-                    ended_at: Some(rfc3339_utc(at)),
-                    ..AttemptFacts::default()
-                },
-            },
-            ctx,
-        )?;
-        tx.execute(
-            "UPDATE outbox SET state = 'ACKED', next_retry_at = NULL WHERE state = 'PENDING' \
-             AND json_extract(payload_json, '$.notice') IS 'runtime' AND json_extract(payload_json, '$.kind') IS 'dispatch' \
-             AND json_extract(payload_json, '$.attempt_id') = ?1",
-            params![attempt_id],
-        )
-        .map_err(sqlite_error)?;
-        if writer::parse::<TaskState>(&task_state)? == TaskState::Leased {
-            cas.push(StateCas {
-                id: task_id.clone(),
-                expected_revision: task_revision,
-                change: Change::Task(TaskState::Ready),
-            });
-        }
-        events.push(NewEvent {
-            project_id: project_id.clone(),
-            event_id: child_id(&attempt_id, "pause/withdrawn"),
-            run_id: Some(run_id.to_owned()),
-            kind: "pause.withdrawn".to_owned(),
-            payload: json!({"attempt_id": attempt_id, "task_id": task_id}),
-        });
-    }
+    let (mut cas, mut events) = withdraw(
+        &tx,
+        &project_id,
+        run_id,
+        &rfc3339_utc(at),
+        Withdraw::Pause,
+        ctx,
+    )?;
     let running: i64 = tx
         .query_row(
             "SELECT count(*) FROM attempts a JOIN tasks t ON t.task_id = a.task_id WHERE t.run_id = ?1 \

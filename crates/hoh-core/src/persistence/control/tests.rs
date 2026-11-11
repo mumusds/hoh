@@ -382,6 +382,41 @@ async fn a_resume_records_the_runs_reconcile_before_it_works_again_and_only_from
 }
 
 #[tokio::test]
+async fn a_resume_with_blockers_claimed_returns_to_blocked_and_keeps_its_resume_state() -> R {
+    // docs/adr/ADR-025.md decision 5: a run paused while BLOCKED, its claims still open, is BLOCKED again on ResumeRun
+    // (not refused), its resume state kept for when the claims are released.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(&format!(
+        "{WORLD}
+         UPDATE attempts SET state = 'FAILED', ended_at = '2026-11-07T00:00:05Z' WHERE attempt_id = 'A1';
+         UPDATE runs SET state = 'PAUSED', resume_state = 'RUNNING', revision = 4, blocked_reason = 'NEED_DECISION',
+           blocked_reasons_json = '[\"NEED_DECISION\"]' WHERE run_id = 'R';
+         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+           ('p1', 'claim-1', 'R', 'run.blocker_claimed', '{{\"reason\": \"NEED_DECISION\", \"source\": \"pace\"}}',
+            '2026-11-07T00:00:00Z');"
+    ))?;
+    let resumed = store
+        .submit_command(command("ResumeRun", "resume", 4, RunTarget::Resume))
+        .await?;
+    assert!(
+        matches!(resumed, CommandOutcome::Accepted { revision: 5, .. }),
+        "{resumed:?}"
+    );
+    assert_eq!(
+        run_state(&path)?,
+        ("BLOCKED".to_owned(), 5, Some("RUNNING".to_owned()))
+    );
+    let reasons: String = Connection::open(&path)?.query_row(
+        "SELECT json_extract(payload_json, '$.reasons') FROM events WHERE kind = 'run.blocked'",
+        [],
+        |r| r.get(0),
+    )?;
+    assert_eq!(reasons, "[\"NEED_DECISION\"]");
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_started_run_is_created_with_its_exact_accepted_body_and_replayed_byte_for_byte() -> R {
     // REQ-005 behaviour 1, decision 5 (docs/adr/ADR-021.md decision 5): StartRun creates the run the host named,
     // CREATED at revision 0, in the command's transaction, and stores the 202 body a replay returns.
