@@ -1,6 +1,7 @@
 //! The Engine host of one project (REQ-022, REQ-036, REQ-041, REQ-062; docs/adr/ADR-016.md).
 //!
-//! Start, in order: the database location is checked read-only; the project lock (a `flock` on the `.hoh` directory,
+//! Start, in order: the database location is checked read-only; `.hoh/` is made with its `.gitignore` holding `*`
+//! when it has none (docs/adr/ADR-027.md decision 3); the project lock (a `flock` on the `.hoh` directory,
 //! the holder's pid in `.hoh/host.lock`) is taken; the store is opened (the location checked again, the WAL self-test,
 //! settings, migrations) and the lock handed to its writer; the host epoch moves on after an integrity check; the
 //! readers are checked; only then are the loopback port and the Unix socket `.hoh/host.sock` bound and
@@ -308,7 +309,8 @@ impl Host {
                 fstype,
             })
         })?;
-        std::fs::create_dir_all(&files)
+        // HoH's own state, kept out of git (docs/adr/ADR-027.md decision 3).
+        hoh_core::state_dir::ensure(&files)
             .map_err(|e| StartError::other(format!("cannot make {}: {e}", files.display())))?;
         let lock = take_lock(&files)?;
         let store = Store::open_with_mountinfo(

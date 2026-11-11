@@ -185,6 +185,26 @@ fn every_directory_on_the_way_to_an_object_is_synced_after_its_link() -> R {
 }
 
 #[test]
+fn the_first_object_of_a_project_makes_its_state_dir_ignored_by_git() -> R {
+    // docs/adr/ADR-027.md decision 3: whatever makes `.hoh/` writes its `.gitignore` holding `*`.
+    let dir = tempfile::tempdir()?;
+    put(dir.path(), b"first")?;
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(".hoh/.gitignore"))?,
+        crate::state_dir::IGNORE_ALL
+    );
+    let other = tempfile::tempdir()?;
+    let file = other.path().join("log");
+    std::fs::write(&file, b"raw")?;
+    put_file(other.path(), &file)?;
+    assert_eq!(
+        std::fs::read_to_string(other.path().join(".hoh/.gitignore"))?,
+        crate::state_dir::IGNORE_ALL
+    );
+    Ok(())
+}
+
+#[test]
 fn a_file_is_kept_as_an_object_by_streaming_it_whatever_its_size() -> R {
     // docs/adr/ADR-026.md decision 10: a turn's raw logs are not bounded; they are copied and hashed in pieces.
     let dir = tempfile::tempdir()?;

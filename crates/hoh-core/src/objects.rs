@@ -74,6 +74,12 @@ pub fn put(project: &Path, bytes: &[u8]) -> Result<String, String> {
     put_with(project, bytes, &|dir| std::fs::File::open(dir)?.sync_all())
 }
 
+/// The project's `.hoh/`, made with its `.gitignore` before an object goes under it (docs/adr/ADR-027.md decision 3).
+fn state_dir(project: &Path) -> Result<(), String> {
+    let top = project.join(".hoh");
+    crate::state_dir::ensure(&top).map_err(|e| format!("{}: {e}", top.display()))
+}
+
 /// [`put`] with `sync_dir` syncing a directory: the object's own directory once its link is made (or found), then
 /// each parent up to `.hoh`, whose entries name the directories a first object made.
 fn put_with(
@@ -86,6 +92,7 @@ fn put_with(
     let sha256 = sha256_hex(bytes);
     let path = object_path(project, &sha256)?;
     let dir = path.parent().ok_or("no directory")?;
+    state_dir(project)?;
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let mut tries = 0;
     let (staged, mut file) = loop {
@@ -144,6 +151,7 @@ pub fn put_file(project: &Path, file: &Path) -> Result<(String, u64), String> {
     use std::io::{Read as _, Write as _};
     use std::sync::atomic::Ordering;
     let staging = project.join(".hoh/objects/staging");
+    state_dir(project)?;
     std::fs::create_dir_all(&staging).map_err(|e| format!("{}: {e}", staging.display()))?;
     let mut tries = 0;
     let (staged, mut out) = loop {

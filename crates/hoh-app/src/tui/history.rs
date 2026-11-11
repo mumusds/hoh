@@ -58,10 +58,11 @@ impl History {
         self.notice.as_deref()
     }
 
-    /// Append `text` (creating `.hoh/` if needed) and keep it; written as one line and synced.
+    /// Append `text` (creating `.hoh/` with its `.gitignore` if needed, docs/adr/ADR-027.md decision 3) and keep it;
+    /// written as one line and synced.
     pub fn append(&mut self, text: &str) -> std::io::Result<()> {
         if let Some(dir) = self.path.parent() {
-            std::fs::create_dir_all(dir)?;
+            hoh_core::state_dir::ensure(dir)?;
         }
         let mut file = std::fs::OpenOptions::new()
             .create(true)
