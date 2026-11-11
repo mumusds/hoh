@@ -407,8 +407,23 @@ impl ProductExecutor {
             .lock()
             .is_ok_and(|e| e.contains(&(ready.launcher.clone(), ready.version.clone())));
         let hoh = self.project.join(".hoh");
+        // A Commander turn runs in its session's own directory, outside the project (docs/adr/ADR-025.md decision 3):
+        // no project file is found from there; it is told the paths it reads.
+        let cwd = match a.supervision.as_ref().and_then(|s| s.workdir.as_deref()) {
+            Some(dir) => {
+                std::fs::create_dir_all(dir).map_err(|e| {
+                    refused(
+                        "WORKDIR_UNAVAILABLE",
+                        FailureClass::Transient { retry_after: None },
+                        format!("{dir}: {e}"),
+                    )
+                })?;
+                PathBuf::from(dir)
+            }
+            None => self.project.clone(),
+        };
         let spec = Spec {
-            cwd: self.project.clone(),
+            cwd,
             model: a.model.clone(),
             resume: a.native_session.clone(),
             prompt: text,

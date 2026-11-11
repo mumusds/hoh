@@ -1996,3 +1996,206 @@ async fn a_turns_assignment_carries_its_wake_its_nonce_and_a_bounded_summary() -
     assert!(work);
     Ok(())
 }
+
+fn deferred(path: &PathBuf) -> R<Vec<String>> {
+    let conn = Connection::open(path)?;
+    let mut s = conn.prepare(
+        "SELECT json_extract(payload_json, '$.reason') FROM events WHERE kind = 'supervisor.deferred' ORDER BY seq",
+    )?;
+    let rows = s
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+#[tokio::test]
+async fn a_commander_with_no_session_is_deferred_once_then_unavailable_past_the_limit() -> R {
+    // Decision 3 ("not active yet"): an owed wake whose Commander has no session waits, with one
+    // supervisor.deferred{NO_SESSION}; past DEFER_LIMIT (30 min) still so, the Commander is unavailable (inactive) and
+    // the run BLOCKED; once it has its session it is available and the wake allocated.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(
+        &path,
+        &format!(
+            "{WORLD} UPDATE role_bindings SET session_id = NULL WHERE run_id = 'R' AND role = 'commander';"
+        ),
+    )?;
+    let w = wake(&store, &clock, "R", "D", "fp", 0).await?;
+    assert!(
+        store
+            .allocate_supervision("p1", context(&clock, 3000))
+            .await?
+            .is_none()
+    );
+    assert!(
+        store
+            .allocate_supervision("p1", context(&clock, 4000))
+            .await?
+            .is_none()
+    );
+    assert_eq!(deferred(&path)?, ["NO_SESSION"]);
+    store
+        .supervise("R", context(&clock, 3000 + 29 * 60_000))
+        .await?;
+    assert_eq!(blocked(&path)?.0, "RUNNING", "within the limit");
+    store
+        .supervise("R", context(&clock, 3000 + 30 * 60_000 + 1))
+        .await?;
+    assert_eq!(
+        blocked(&path)?.1,
+        json!(["COMMANDER_UNAVAILABLE", "NEED_DECISION"])
+    );
+    assert_eq!(
+        unavailable(&path)?.last().cloned(),
+        Some(json!(["supervisor.unavailable", ["inactive"]]))
+    );
+    exec(
+        &path,
+        "UPDATE role_bindings SET session_id = 'sc' WHERE run_id = 'R' AND role = 'commander';",
+    )?;
+    store
+        .supervise("R", context(&clock, 31 * 60_000 + 5000))
+        .await?;
+    assert_eq!(blocked(&path)?.0, "RUNNING");
+    let a = store
+        .allocate_supervision("p1", context(&clock, 31 * 60_000 + 6000))
+        .await?
+        .ok_or("allocated")?;
+    assert_eq!(a.wake, w);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_turn_on_a_reader_slot_waits_while_work_holds_them_all() -> R {
+    // Decision 3: with reserve_supervisor_slot = false, an owed wake waits while work holds every reader slot, with
+    // one supervisor.deferred{NO_SLOT}.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(
+        &path,
+        &format!(
+            "{WORLD}
+             INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq) VALUES
+               ('W1', 'R', 's3', 'RUNNING', 2, 'developer', 0, 5), ('W2', 'R', 's3', 'RUNNING', 2, 'developer', 0, 6);
+             INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision) VALUES
+               ('AW1', 'W1', 'RUNNING', 1, 1, 1), ('AW2', 'W2', 'RUNNING', 1, 1, 1);
+             INSERT INTO leases(project_id, kind, attempt_id, epoch, expires_at) VALUES
+               ('p1', 'reader-1', 'AW1', 1, '2100-01-01T00:00:00Z'), ('p1', 'reader-2', 'AW2', 1, '2100-01-01T00:00:00Z');"
+        ),
+    )?;
+    wake(&store, &clock, "R", "D", "fp", 0).await?;
+    let readers = |ms| Context {
+        reserve_supervisor_slot: Some(false),
+        ..context(&clock, ms)
+    };
+    assert!(
+        store
+            .allocate_supervision("p1", readers(3000))
+            .await?
+            .is_none()
+    );
+    assert!(
+        store
+            .allocate_supervision("p1", readers(4000))
+            .await?
+            .is_none()
+    );
+    assert_eq!(deferred(&path)?, ["NO_SLOT"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_commander_session_is_given_its_own_directory_outside_the_project_once() -> R {
+    // M2T08D-551, -652, -955, -1057 (decision 3): with the host's base directory for Commanders, the first turn of a
+    // Commander session records commander.workdir{session_id, path}: <base>/<project digest>/<session>; its later turns
+    // use the recorded path (no second record) and are told it.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    let base = dir.path().join("state/hoh/commander");
+    let with_base = |ms| Context {
+        commander_dir: Some(base.clone()),
+        ..context(&clock, ms)
+    };
+    wake(&store, &clock, "R", "D", "f1", 0).await?;
+    let a = store
+        .allocate_supervision("p1", with_base(3000))
+        .await?
+        .ok_or("allocated")?;
+    end(&path, &a.attempt_id, "SETTLED")?;
+    wake(&store, &clock, "R", "D", "f2", 4000).await?;
+    let b = store
+        .allocate_supervision("p1", with_base(7000))
+        .await?
+        .ok_or("allocated")?;
+    let recorded = value(
+        &path,
+        "SELECT json_group_array(json_object('session', json_extract(payload_json, '$.session_id'), 'path', \
+         json_extract(payload_json, '$.path'))) FROM events WHERE kind = 'commander.workdir'",
+    )?;
+    let digest = &sha256("p1")[..16];
+    let expected = base.join(digest).join("sc").display().to_string();
+    assert_eq!(recorded, json!([{"session": "sc", "path": expected}]));
+    let told = store
+        .runner_waiting("p1")
+        .await?
+        .dispatches
+        .into_iter()
+        .find(|d| d.attempt_id == b.attempt_id)
+        .and_then(|d| d.assignment.supervision)
+        .and_then(|s| s.workdir);
+    assert_eq!(told.as_deref(), Some(expected.as_str()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_commander_whose_agent_the_registry_finds_unavailable_waits_for_a_newer_look() -> R {
+    // Decision 5 (-306, -355): the registry's last look at the Commander's agent finding it unavailable (or not logged
+    // in) makes the Commander unavailable, the look's identity recorded; a host that has not looked yet leaves it so;
+    // only a later look (by its identity, host epoch first) finding it available ends it.
+    use crate::decision::Observation;
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    wake(&store, &clock, "R", "D", "fp", 0).await?;
+    let seen = |ms, looks: Vec<(&str, Observation)>| Context {
+        observations: Some(looks.into_iter().map(|(a, o)| (a.to_owned(), o)).collect()),
+        ..context(&clock, ms)
+    };
+    let look = |epoch, n, available, logged_in| Observation {
+        host_epoch: epoch,
+        n,
+        available,
+        logged_in,
+    };
+    store
+        .supervise("R", seen(3000, vec![("codex", look(1, 4, true, false))]))
+        .await?;
+    assert_eq!(blocked(&path)?.0, "BLOCKED");
+    assert_eq!(
+        value(
+            &path,
+            "SELECT json_object('reasons', json(json_extract(payload_json, '$.reasons')), 'observation', json(json_extract(payload_json, '$.observation'))) FROM events WHERE kind = 'supervisor.unavailable'"
+        )?,
+        json!({"reasons": ["login_missing"], "observation": {"host_epoch": 1, "n": 4}})
+    );
+    // A new host that has not looked yet: still unavailable.
+    store.supervise("R", seen(4000, vec![])).await?;
+    assert_eq!(blocked(&path)?.0, "BLOCKED");
+    // The same look again: still.
+    store
+        .supervise("R", seen(5000, vec![("codex", look(1, 4, true, true))]))
+        .await?;
+    assert_eq!(blocked(&path)?.0, "BLOCKED");
+    // A later look (the new host's first) finding it available and logged in: available.
+    store
+        .supervise("R", seen(6000, vec![("codex", look(2, 1, true, true))]))
+        .await?;
+    assert_eq!(blocked(&path)?.0, "RUNNING");
+    Ok(())
+}

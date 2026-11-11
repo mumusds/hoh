@@ -155,12 +155,28 @@ impl HostConfig {
                 reader_slots: Some(execution.reader_slots),
                 // The supervisor's own slot, or a reader slot (docs/adr/ADR-025.md decision 3).
                 reserve_supervisor_slot: Some(execution.reserve_supervisor_slot),
+                commander_dir: commander_base(),
                 ..hoh_core::decision::Context::default()
             },
         });
         host.config = config;
         host
     }
+}
+
+/// Where Commander sessions get their own working directories (docs/adr/ADR-025.md decision 3): the user's state
+/// directory (`$XDG_STATE_HOME`, else `~/.local/state`), `hoh/commander`, outside every project; none without either.
+fn commander_base() -> Option<PathBuf> {
+    let state = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .filter(|p| p.is_absolute())
+                .map(|home| home.join(".local/state"))
+        })?;
+    Some(state.join("hoh/commander"))
 }
 
 /// The host's fault injection points (REQ-036, CR-006, approved by the project owner): the product's

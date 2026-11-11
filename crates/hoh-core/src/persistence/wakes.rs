@@ -31,6 +31,7 @@ const SUPERVISOR: &str = "supervisor";
 /// The cooldown before a half-open probe: ADR-020's largest backoff (decision 5).
 const COOLDOWN: Duration = crate::retry::CAP;
 const TURN_LIMIT: &str = "supervisor.turn_limit";
+const WORKDIR: &str = "commander.workdir";
 
 /// How long a supervision turn may be in flight, and how long a wake waits before it goes first (decision 3).
 pub const SUPERVISION_TURN: Duration = Duration::from_secs(15 * 60);
@@ -434,6 +435,8 @@ pub struct Supervision {
     pub role_epoch: i64,
     /// What it is shown (bounded, deterministic).
     pub summary: Value,
+    /// Its session's own working directory, recorded at its first turn (decision 3); none: the project's.
+    pub workdir: Option<String>,
 }
 
 /// How many of its wake's events a turn is shown, and how much of each payload (decision 7: bounded).
@@ -596,7 +599,20 @@ pub(super) fn supervision_input(
     };
     let run_revision = allocation["run_revision"].as_i64().unwrap_or(-1);
     let role_epoch = allocation["role_epoch"].as_i64().unwrap_or(-1);
+    // Its session's own directory, as its first turn recorded it (decision 3, -1057).
+    let workdir: Option<String> = conn
+        .query_row(
+            "SELECT json_extract(e.payload_json, '$.path') FROM events e JOIN attempts a ON a.attempt_id = ?2 \
+             WHERE e.run_id = ?1 AND e.kind = ?3 AND json_extract(e.payload_json, '$.session_id') = a.session_id \
+             ORDER BY e.seq LIMIT 1",
+            params![run_id, attempt_id, WORKDIR],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?
+        .flatten();
     Ok(Some(Supervision {
+        workdir,
         wake: wake_id.clone(),
         nonce: nonce.unwrap_or_default(),
         run_revision,
@@ -665,9 +681,6 @@ pub(super) fn allocate(
     } else {
         leases::free_slot(&tx, project_id, false, context.reader_slots(), now)?
     };
-    let Some(kind) = kind else {
-        return Ok(None);
-    };
     let runs: Vec<(String, String, i64)> = {
         let mut statement = tx
             .prepare(
@@ -733,7 +746,18 @@ pub(super) fn allocate(
         let (moves, events) = rearm(&tx, project_id, &run_id, &mut wakes, epoch, now)?;
         rearmed.cas.extend(moves);
         rearmed.events.extend(events);
-        if !binding.active || super::retry::budget_stop(&tx, &run_id, context)?.is_some() {
+        if !binding.active {
+            // Not active yet: an owed wake waits, said once (decision 3, "not active yet").
+            if wakes.iter().any(Wake::owed)
+                && let Some(reason) = inactive_reason(&tx, &run_id)?
+            {
+                rearmed
+                    .events
+                    .extend(defer_once(&tx, project_id, &run_id, reason, &wakes, now)?);
+            }
+            continue;
+        }
+        if super::retry::budget_stop(&tx, &run_id, context)?.is_some() {
             continue;
         }
         if wakes.iter().any(Wake::in_flight) {
@@ -747,7 +771,7 @@ pub(super) fn allocate(
                 |r| r.get(0),
             )
             .map_err(sqlite_error)?;
-        let reasons = unavailability(&tx, &run_id, &wakes, epoch, &state)?;
+        let (reasons, _) = unavailability(&tx, &run_id, &wakes, epoch, &state, context)?;
         let probing = if reasons.is_empty() {
             None
         } else {
@@ -796,6 +820,26 @@ pub(super) fn allocate(
             });
         }
     }
+    // No slot: with reader slots, work holds them all; each run waiting for one is told once (decision 3).
+    let Some(kind) = kind else {
+        if !context.reserve_supervisor_slot() {
+            let mut told = BTreeSet::new();
+            for c in &candidates {
+                if told.insert(c.run_id.clone()) {
+                    let wakes = of_run(&tx, &c.run_id)?;
+                    rearmed.events.extend(defer_once(
+                        &tx, project_id, &c.run_id, "NO_SLOT", &wakes, now,
+                    )?);
+                }
+            }
+        }
+        if !rearmed.events.is_empty() {
+            writer::write(&tx, &rearmed, ctx)?;
+            ctx.before_commit()?;
+            tx.commit().map_err(sqlite_error)?;
+        }
+        return Ok(None);
+    };
     let Some(chosen) = candidates.into_iter().min_by(|a, b| {
         (a.level, a.last, &a.wake.woken_at, a.wake.woken_seq).cmp(&(
             b.level,
@@ -858,6 +902,40 @@ pub(super) fn allocate(
     // The turn's nonce: in its dispatch notice, which a delivery after a restart gives again; the allocation keeps
     // only its sha256 (decision 8, -266, -455).
     let nonce = nonce()?;
+    // The Commander session's own directory, outside every project, recorded at its first turn (decision 3, -551,
+    // -955, -1057): <base>/<project digest>/<session>, the same for its later turns whatever the environment then.
+    if let Some(base) = &context.commander_dir {
+        let session: Option<String> = tx
+            .query_row(
+                "SELECT session_id FROM attempts WHERE attempt_id = ?1",
+                params![attempt_id],
+                |r| r.get(0),
+            )
+            .map_err(sqlite_error)?;
+        if let Some(session) = session {
+            let recorded: bool = tx
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM events WHERE run_id = ?1 AND kind = ?2 \
+                     AND json_extract(payload_json, '$.session_id') = ?3)",
+                    params![chosen.run_id, WORKDIR, session],
+                    |r| r.get(0),
+                )
+                .map_err(sqlite_error)?;
+            if !recorded {
+                let digest = sha256_hex(chosen.project_id.as_bytes());
+                let path = base
+                    .join(&digest[..16])
+                    .join(session.replace('%', "%25").replace('/', "%2F"));
+                rearmed.events.push(NewEvent {
+                    project_id: chosen.project_id.clone(),
+                    event_id: child_id(&task_id, "workdir"),
+                    run_id: Some(chosen.run_id.clone()),
+                    kind: WORKDIR.to_owned(),
+                    payload: json!({"session_id": session, "path": path.display().to_string()}),
+                });
+            }
+        }
+    }
     if chosen.probe {
         rearmed.events.push(NewEvent {
             project_id: chosen.project_id.clone(),
@@ -948,6 +1026,59 @@ pub(super) fn could_allocate(
         && not_before.is_none_or(|t| t <= context.now()))
 }
 
+/// Whether the registry's looks keep run `run_id`'s Commander unavailable (decision 5, -306, -355): its last look at
+/// the Commander's agent found it unavailable (`agent_unavailable`) or not logged in (`login_missing`); once so recorded,
+/// it stays so until a look of a later identity `(host_epoch, n)` finds it available and logged in (a host that has not
+/// looked yet, or the same look again, leaves it). The reason, and the identity of the look it stands on.
+fn registry_reason(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    context: &Context,
+) -> Result<(Option<&'static str>, Value), PersistError> {
+    let agent: Option<String> = tx
+        .query_row(
+            "SELECT agent FROM role_bindings WHERE run_id = ?1 AND role = ?2",
+            params![run_id, COMMANDER],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let look = agent
+        .as_deref()
+        .and_then(|a| context.observations.as_ref().and_then(|o| o.get(a)))
+        .copied();
+    let last = recorded(tx, run_id)?.filter(|r| r.unavailable);
+    let before = last.as_ref().and_then(|r| {
+        let reasons = r.reasons.as_array()?;
+        let reason = reasons.iter().find_map(|x| match x.as_str() {
+            Some("agent_unavailable") => Some("agent_unavailable"),
+            Some("login_missing") => Some("login_missing"),
+            _ => None,
+        })?;
+        Some((reason, r.observation.clone()))
+    });
+    let identity = |o: &crate::decision::Observation| json!({"host_epoch": o.host_epoch, "n": o.n});
+    Ok(match (look, before) {
+        (Some(o), _) if !o.available => (Some("agent_unavailable"), identity(&o)),
+        (Some(o), _) if !o.logged_in => (Some("login_missing"), identity(&o)),
+        (Some(o), Some((reason, seen))) => {
+            let later = (o.host_epoch, o.n)
+                > (
+                    seen["host_epoch"].as_i64().unwrap_or(i64::MIN),
+                    seen["n"].as_u64().unwrap_or(0),
+                );
+            if later {
+                (None, identity(&o))
+            } else {
+                (Some(reason), seen)
+            }
+        }
+        (Some(o), None) => (None, identity(&o)),
+        (None, Some((reason, seen))) => (Some(reason), seen),
+        (None, None) => (None, Value::Null),
+    })
+}
+
 /// Why run `run_id`'s Commander, at role epoch `epoch` and binding state `binding`, is unavailable now (empty:
 /// available; decision 5): its binding BLOCKED (`binding_blocked`); an owed wake with MAX_RETRIES failures under the
 /// epoch (`failures_capped`); its last turn of the epoch that ended failed for authentication or capability (`auth`,
@@ -958,10 +1089,16 @@ fn unavailability(
     wakes: &[Wake],
     epoch: i64,
     binding: &str,
-) -> Result<Vec<&'static str>, PersistError> {
+    context: &Context,
+) -> Result<(Vec<&'static str>, Value), PersistError> {
     let mut reasons = Vec::new();
     if binding == "BLOCKED" {
         reasons.push("binding_blocked");
+    }
+    let (registry, observation) = registry_reason(tx, run_id, context)?;
+    reasons.extend(registry);
+    if inactive_too_long(tx, run_id, context.now())? {
+        reasons.push("inactive");
     }
     let cap = i64::from(crate::retry::MAX_RETRIES);
     if wakes.iter().any(|w| w.owed() && w.failures(epoch) >= cap) {
@@ -989,13 +1126,15 @@ fn unavailability(
             _ => {}
         }
     }
-    Ok(reasons)
+    Ok((reasons, observation))
 }
 
 /// The run's last `supervisor.unavailable` or `supervisor.available`.
 struct Recorded {
     unavailable: bool,
     reasons: Value,
+    /// The registry look its reasons stand on (null: none).
+    observation: Value,
     /// Its time (the supervisor's clock) and seq.
     at: String,
     seq: i64,
@@ -1017,6 +1156,7 @@ fn recorded(tx: &Transaction<'_>, run_id: &str) -> Result<Option<Recorded>, Pers
         Ok(Recorded {
             unavailable: kind == UNAVAILABLE,
             reasons: payload["reasons"].clone(),
+            observation: payload["observation"].clone(),
             at: text(&payload, "at").unwrap_or_default(),
             seq,
         })
@@ -1057,7 +1197,7 @@ pub(super) fn judge(
     let now = context.now();
     let at = rfc3339_utc(now);
     let wakes = of_run(tx, run_id)?;
-    let reasons = unavailability(tx, run_id, &wakes, epoch, &binding)?;
+    let (reasons, observation) = unavailability(tx, run_id, &wakes, epoch, &binding, context)?;
     let last = recorded(tx, run_id)?;
     let event = |id: String, kind: &str, payload: Value| NewEvent {
         project_id: project_id.to_owned(),
@@ -1091,7 +1231,7 @@ pub(super) fn judge(
             commit.events.push(event(
                 child_id(run_id, &format!("supervisor/{number}")),
                 UNAVAILABLE,
-                json!({"reasons": reasons, "observation": null, "at": at, "role_epoch": epoch}),
+                json!({"reasons": reasons, "observation": observation, "at": at, "role_epoch": epoch}),
             ));
         }
         // What the run owes its Commander: its owed wakes and its PENDING triggers.
@@ -1235,6 +1375,105 @@ fn probe(
             .min_by_key(|w| w.woken_seq)
             .map(|w| w.id.clone()),
     ))
+}
+
+/// How long a Commander may be without a session, or with its first input undelivered, while a decision is owed before
+/// it counts as unavailable (decision 3: longer than a turn's limit and a lease's TTL together).
+const DEFER_LIMIT: Duration = Duration::from_secs(30 * 60);
+
+/// Why run `run_id`'s Commander is not active: no session (`NO_SESSION`), its handover's session.start not delivered
+/// (`FIRST_INPUT_UNDELIVERED`), a team change waiting for its checkpoint (`CHANGE_PENDING`), or its first input in
+/// a turn now (`FIRST_INPUT_IN_FLIGHT`); none for a BLOCKED binding (that is unavailability, decision 5).
+fn inactive_reason(conn: &Connection, run_id: &str) -> Result<Option<&'static str>, PersistError> {
+    let row: Option<(String, i64, Option<String>)> = conn
+        .query_row(
+            "SELECT state, role_epoch, session_id FROM role_bindings WHERE run_id = ?1 AND role = ?2",
+            params![run_id, COMMANDER],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some((state, epoch, session)) = row else {
+        return Ok(None);
+    };
+    if state != "ACTIVE" {
+        return Ok(None);
+    }
+    Ok(match session {
+        None => Some("NO_SESSION"),
+        Some(_) if super::handover::first_input_pending(conn, run_id, COMMANDER, epoch)? => {
+            Some("FIRST_INPUT_UNDELIVERED")
+        }
+        Some(_) if super::team::pending(conn, run_id, COMMANDER)? => Some("CHANGE_PENDING"),
+        Some(_) => Some("FIRST_INPUT_IN_FLIGHT"),
+    })
+}
+
+/// One `supervisor.deferred{reason}` for run `run_id`, unless one of that reason was written since its last
+/// allocation.
+fn defer_once(
+    tx: &Transaction<'_>,
+    project_id: &str,
+    run_id: &str,
+    reason: &str,
+    wakes: &[Wake],
+    now: std::time::SystemTime,
+) -> Result<Option<NewEvent>, PersistError> {
+    let (told, n): (bool, i64) = tx
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM events WHERE run_id = ?1 AND kind = 'supervisor.deferred' \
+               AND json_extract(payload_json, '$.reason') = ?2 \
+               AND seq > coalesce((SELECT max(seq) FROM events WHERE run_id = ?1 AND kind = ?3), 0)), \
+             (SELECT count(*) FROM events WHERE run_id = ?1 AND kind = 'supervisor.deferred')",
+            params![run_id, reason, ALLOCATED],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(sqlite_error)?;
+    if told {
+        return Ok(None);
+    }
+    let owed: Vec<&str> = wakes
+        .iter()
+        .filter(|w| w.owed())
+        .map(|w| w.id.as_str())
+        .collect();
+    Ok(Some(NewEvent {
+        project_id: project_id.to_owned(),
+        event_id: child_id(run_id, &format!("deferred/{n}")),
+        run_id: Some(run_id.to_owned()),
+        kind: "supervisor.deferred".to_owned(),
+        payload: json!({"reason": reason, "wakes": owed, "at": rfc3339_utc(now)}),
+    }))
+}
+
+/// Whether run `run_id`'s Commander has been without a session, or its first input undelivered, longer than
+/// [`DEFER_LIMIT`] while a decision is owed: its latest such deferral since its last allocation, the cause still there.
+fn inactive_too_long(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    now: std::time::SystemTime,
+) -> Result<bool, PersistError> {
+    let Some(reason) = inactive_reason(tx, run_id)?
+        .filter(|r| matches!(*r, "NO_SESSION" | "FIRST_INPUT_UNDELIVERED"))
+    else {
+        return Ok(false);
+    };
+    let since: Option<String> = tx
+        .query_row(
+            "SELECT json_extract(payload_json, '$.at') FROM events WHERE run_id = ?1 AND kind = 'supervisor.deferred' \
+             AND json_extract(payload_json, '$.reason') = ?2 \
+             AND seq > coalesce((SELECT max(seq) FROM events WHERE run_id = ?1 AND kind = ?3), 0) \
+             ORDER BY seq LIMIT 1",
+            params![run_id, reason, ALLOCATED],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?
+        .flatten();
+    Ok(since
+        .as_deref()
+        .and_then(crate::time::parse_rfc3339)
+        .is_some_and(|since| since + DEFER_LIMIT < now))
 }
 
 /// A supervision turn in flight the host must stop now (decision 3).

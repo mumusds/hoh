@@ -55,6 +55,9 @@ pub struct Registry {
     stopping: probe::ProbeStop,
     /// Where pi keeps its settings, which name the provider its login is checked for (docs/adr/ADR-024.md decision 7).
     pi_dir: Option<PathBuf>,
+    /// How many actual looks at each agent this registry made (a probe, a PATH that lacks it, a login check; a cache
+    /// unchanged is none): the `n` of an observation's identity (docs/adr/ADR-025.md decision 5).
+    looks: Mutex<BTreeMap<Agent, u64>>,
 }
 
 impl Registry {
@@ -73,6 +76,7 @@ impl Registry {
             logins: Mutex::new(BTreeMap::new()),
             stopping: probe::ProbeStop::default(),
             pi_dir,
+            looks: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -125,6 +129,7 @@ impl Registry {
         if let Ok(mut logins) = self.logins.lock() {
             logins.insert(agent, (std::time::Instant::now(), missing));
         }
+        self.looked(agent);
     }
 
     /// What was last seen of every agent, without looking (decision 8): those found available, those found unavailable
@@ -189,7 +194,7 @@ impl Registry {
                 && let Some(seen) = seen.get(&agent)
                 && seen.stamp == stamp
             {
-                return Ok((stamp, seen.outcome.clone()));
+                return Ok((stamp, seen.outcome.clone(), false));
             }
             let probed = probe::probe(agent, &env)
                 .map_err(|e| e.to_string())
@@ -202,11 +207,11 @@ impl Registry {
                         facts,
                     })
                 });
-            Ok((stamp, probed))
+            Ok((stamp, probed, true))
         })();
-        let (stamp, outcome) = match outcome {
+        let (stamp, outcome, looked) = match outcome {
             Ok(found) => found,
-            Err(why) => (Stamp::new(), Err(why)),
+            Err(why) => (Stamp::new(), Err(why), true),
         };
         // A look the host's stop ended says nothing of the agent: not recorded, so it stays as last seen (or not looked
         // at), and no dispatch takes the stop for the agent being unavailable (M2T07R-352).
@@ -230,7 +235,44 @@ impl Registry {
                 },
             );
         }
+        if looked {
+            self.looked(agent);
+        }
         outcome
+    }
+
+    fn looked(&self, agent: Agent) {
+        if let Ok(mut looks) = self.looks.lock() {
+            *looks.entry(agent).or_insert(0) += 1;
+        }
+    }
+
+    /// The last actual look at each agent this registry looked at, with its identity `(host_epoch, n)`
+    /// (docs/adr/ADR-025.md decision 5): available when its probe succeeded, logged in unless its login check said
+    /// otherwise.
+    pub fn observations(
+        &self,
+        host_epoch: i64,
+    ) -> BTreeMap<String, hoh_core::decision::Observation> {
+        let looks = self.looks.lock().map(|l| l.clone()).unwrap_or_default();
+        let logins = self.logins.lock().map(|l| l.clone()).unwrap_or_default();
+        let seen = self.seen.lock().map(|s| s.clone()).unwrap_or_default();
+        seen.iter()
+            .filter_map(|(agent, seen)| {
+                let n = *looks.get(agent)?;
+                Some((
+                    agent.as_str().to_owned(),
+                    hoh_core::decision::Observation {
+                        host_epoch,
+                        n,
+                        available: seen.outcome.is_ok(),
+                        logged_in: logins
+                            .get(agent)
+                            .is_none_or(|(_, missing)| missing.is_none()),
+                    },
+                ))
+            })
+            .collect()
     }
 
     /// `agent` as it was last looked at, without looking again; `None` if it never was.
