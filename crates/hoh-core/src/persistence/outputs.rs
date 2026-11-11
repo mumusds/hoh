@@ -86,15 +86,17 @@ pub(super) struct Waiting {
 /// The outputs of run `run_id` with no end yet, in order: one scan of the run's outputs and one of their ends, matched
 /// by a set (v16, M2T08R-201: a correlated lookup per output made it quadratic).
 pub(super) fn waiting(conn: &Connection, run_id: &str) -> Result<Vec<Waiting>, PersistError> {
+    // Only after the run's horizon: every output before it has its end (v19, M2T08R-352).
+    let from = super::wakes::horizon(conn, run_id)?;
     let ended: std::collections::BTreeSet<String> = {
         let mut statement = conn
             .prepare(
                 "SELECT json_extract(payload_json, '$.output_id') FROM events WHERE run_id = ?1 \
-                 AND kind IN (?2, 'decision.applied', 'decision.rejected')",
+                 AND kind IN (?2, 'decision.applied', 'decision.rejected') AND seq >= ?3",
             )
             .map_err(sqlite_error)?;
         let rows: Vec<Option<String>> = statement
-            .query_map(params![run_id, DISPOSED], |r| r.get(0))
+            .query_map(params![run_id, DISPOSED, from], |r| r.get(0))
             .map_err(sqlite_error)?
             .collect::<Result<_, _>>()
             .map_err(sqlite_error)?;
@@ -103,11 +105,11 @@ pub(super) fn waiting(conn: &Connection, run_id: &str) -> Result<Vec<Waiting>, P
     let mut statement = conn
         .prepare(
             "SELECT json_extract(payload_json, '$.output_id'), json_extract(payload_json, '$.attempt_id'), seq \
-             FROM events WHERE run_id = ?1 AND kind = ?2 ORDER BY seq",
+             FROM events WHERE run_id = ?1 AND kind = ?2 AND seq >= ?3 ORDER BY seq",
         )
         .map_err(sqlite_error)?;
     let rows: Vec<(Option<String>, Option<String>, i64)> = statement
-        .query_map(params![run_id, OUTPUT], |r| {
+        .query_map(params![run_id, OUTPUT, from], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?))
         })
         .map_err(sqlite_error)?
@@ -151,6 +153,27 @@ fn end(outcome: &'static str, reason: Option<&'static str>) -> End {
         reason,
         extra: json!({}),
     }
+}
+
+/// Whether turn `attempt_id` was allocated as a probe (its `<turn task>/probe` event, found by its id).
+fn is_probe(conn: &Connection, attempt_id: &str) -> Result<bool, PersistError> {
+    let task: Option<String> = conn
+        .query_row(
+            "SELECT task_id FROM attempts WHERE attempt_id = ?1",
+            params![attempt_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some(task) = task else {
+        return Ok(false);
+    };
+    conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM events WHERE event_id = ?1)",
+        params![child_id(&task, "probe")],
+        |r| r.get(0),
+    )
+    .map_err(sqlite_error)
 }
 
 /// How turn `attempt_id` ended, by its first `attempt.moved` to an end (SETTLED, FAILED, CANCELLED, or UNKNOWN_EFFECT,
@@ -198,10 +221,21 @@ pub(super) fn dispose(
     let mut ends: std::collections::BTreeMap<String, Option<(String, i64)>> =
         std::collections::BTreeMap::new();
     let mut list: Vec<(Waiting, bool)> = Vec::new();
+    // A probe's outputs wait while the step's recorded verdict is unavailable (v19, M2T08R-350).
+    let unavailable = super::wakes::recorded_unavailable(conn, run_id)?;
+    let mut probes: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
     for w in waiting(conn, run_id)? {
         if superseding {
             list.push((w, true));
             continue;
+        }
+        if unavailable {
+            if !probes.contains_key(&w.attempt_id) {
+                probes.insert(w.attempt_id.clone(), is_probe(conn, &w.attempt_id)?);
+            }
+            if probes[&w.attempt_id] {
+                continue;
+            }
         }
         if !ends.contains_key(&w.attempt_id) {
             ends.insert(w.attempt_id.clone(), turn_end(conn, &w.attempt_id)?);

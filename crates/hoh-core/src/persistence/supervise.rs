@@ -84,9 +84,10 @@ pub struct Supervised {
 /// One batch of run `run_id`'s supervisor step at `context.now()`, one writer job: at most [`STEP`] of its events
 /// after its cursor taken in, in one transaction. None when that batch has not caught up with what is committed: the
 /// caller submits the next batch as another job, so the writer's priority lane (a cancel, a pause) waits one batch at
-/// most (v13, M2T08R-03). Once caught up, the due triggers are fired by the step's one verdict and the Commander
-/// judged, in that batch's transaction, so no trigger fires on part of what was committed before the step (M2T08D-900,
-/// docs/adr/ADR-025.md decision 2); then the outputs of its turns and the close of an ended run.
+/// most (v13, M2T08R-03). Once caught up, the due triggers are fired by the step's one verdict, the Commander judged
+/// and the run's horizon moved, in that batch's transaction, so no trigger fires on part of what was committed before
+/// the step (M2T08D-900, docs/adr/ADR-025.md decision 2). The outputs of its turns and the close of an ended run are
+/// the [`dispose`] jobs the caller submits next, given this step's cursor.
 pub(super) fn step(
     conn: &mut Connection,
     run_id: &str,
@@ -117,6 +118,17 @@ pub(super) fn step(
             writer::write(&tx, &judged, ctx)?;
         }
     }
+    // The run's horizon moved past the wakes now closed for good (v19, M2T08R-352).
+    if let Some(horizon) = wakes::advance_horizon(&tx, &project_id, run_id)? {
+        writer::write(
+            &tx,
+            &Commit {
+                events: vec![horizon],
+                ..Commit::default()
+            },
+            ctx,
+        )?;
+    }
     ctx.before_commit()?;
     tx.commit().map_err(sqlite_error)?;
     // Then the outputs of its turns, in jobs of their own ([`dispose`]), after the judgement: a probe that settled
@@ -141,6 +153,27 @@ pub(super) fn dispose(
     let more = super::outputs::dispose(conn, run_id, upto, context, ctx)?;
     if !more {
         close(conn, run_id, context, ctx)?;
+        // The outputs disposed of may have closed wakes: the horizon moves now, not at the next step (v19).
+        let tx = writer::begin(conn, ctx)?;
+        let project_id: String = tx
+            .query_row(
+                "SELECT project_id FROM runs WHERE run_id = ?1",
+                params![run_id],
+                |r| r.get(0),
+            )
+            .map_err(sqlite_error)?;
+        if let Some(horizon) = wakes::advance_horizon(&tx, &project_id, run_id)? {
+            writer::write(
+                &tx,
+                &Commit {
+                    events: vec![horizon],
+                    ..Commit::default()
+                },
+                ctx,
+            )?;
+            ctx.before_commit()?;
+            tx.commit().map_err(sqlite_error)?;
+        }
     }
     Ok(more)
 }
@@ -211,8 +244,8 @@ fn close(
 }
 
 /// Run `run_id`'s supervisor step failed with `error`: `supervisor.step_failed{error}` in a transaction of its own,
-/// unless the run's last one has the same error (v15, M2T08R-152: seen in the run's events, once per error); whether
-/// it was written.
+/// unless the run already has one with that error (v15, M2T08R-152; v16, -202: once per run and error); whether it
+/// was written.
 pub(super) fn step_failed(
     conn: &mut Connection,
     run_id: &str,

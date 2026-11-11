@@ -26,6 +26,7 @@ pub(super) const PREEMPT: &str = "supervisor.preempt";
 const UNAVAILABLE: &str = "supervisor.unavailable";
 const AVAILABLE: &str = "supervisor.available";
 const PROBE: &str = "supervisor.probe";
+const HORIZON: &str = "supervisor.horizon";
 /// The supervisor's blocker claims' source (decision 5).
 const SUPERVISOR: &str = "supervisor";
 /// The cooldown before a half-open probe: ADR-020's largest backoff (decision 5).
@@ -184,15 +185,17 @@ fn text(payload: &Value, field: &str) -> Option<String> {
 
 /// Run `run_id`'s wakes, in the order they were first woken.
 pub(super) fn of_run(tx: &Connection, run_id: &str) -> Result<Vec<Wake>, PersistError> {
+    // Only after the run's horizon: the wakes before it are closed for good (v19, M2T08R-352).
+    let from = horizon(tx, run_id)?;
     let mut statement = tx
         .prepare(
             "SELECT seq, kind, payload_json FROM events WHERE run_id = ?1 AND kind IN (?2, ?3, ?4, ?5, ?6) \
-             ORDER BY seq",
+             AND seq >= ?7 ORDER BY seq",
         )
         .map_err(sqlite_error)?;
     let rows: Vec<(i64, String, String)> = statement
         .query_map(
-            params![run_id, WOKEN, ALLOCATED, REARMED, SUPERSEDED, PREEMPT],
+            params![run_id, WOKEN, ALLOCATED, REARMED, SUPERSEDED, PREEMPT, from],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .map_err(sqlite_error)?
@@ -1167,11 +1170,13 @@ fn unavailability(
         let mut statement = tx
             .prepare(
                 "SELECT json_extract(payload_json, '$.attempt_id'), json_extract(payload_json, '$.failure.class') \
-                 FROM events WHERE run_id = ?1 AND kind = 'supervisor.turn_failed'",
+                 FROM events WHERE run_id = ?1 AND kind = 'supervisor.turn_failed' AND seq >= ?2",
             )
             .map_err(sqlite_error)?;
         let rows: Vec<(Option<String>, Option<String>)> = statement
-            .query_map(params![run_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .query_map(params![run_id, horizon(tx, run_id)?], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .map_err(sqlite_error)?
             .collect::<Result<_, _>>()
             .map_err(sqlite_error)?;
@@ -1220,7 +1225,7 @@ struct Recorded {
     seq: i64,
 }
 
-fn recorded(tx: &Transaction<'_>, run_id: &str) -> Result<Option<Recorded>, PersistError> {
+fn recorded(tx: &Connection, run_id: &str) -> Result<Option<Recorded>, PersistError> {
     let row: Option<(i64, String, String)> = tx
         .query_row(
             "SELECT seq, kind, payload_json FROM events WHERE run_id = ?1 AND kind IN (?2, ?3) \
@@ -1474,6 +1479,75 @@ fn has_event(tx: &Connection, event_id: &str) -> Result<bool, PersistError> {
     .map_err(sqlite_error)
 }
 
+/// Whether the verdict the step last recorded for run `run_id` is unavailable (v19).
+pub(super) fn recorded_unavailable(conn: &Connection, run_id: &str) -> Result<bool, PersistError> {
+    Ok(recorded(conn, run_id)?.is_some_and(|r| r.unavailable))
+}
+
+/// Run `run_id`'s horizon: the seq of its latest `supervisor.horizon` (0: none). Every wake woken before it is closed
+/// for good (docs/adr/ADR-025.md v19 decision 2, M2T08R-352).
+pub(super) fn horizon(conn: &Connection, run_id: &str) -> Result<i64, PersistError> {
+    conn.query_row(
+        "SELECT coalesce((SELECT json_extract(payload_json, '$.seq') FROM events WHERE run_id = ?1 AND kind = ?2 \
+         ORDER BY seq DESC LIMIT 1), 0)",
+        params![run_id, HORIZON],
+        |r| r.get(0),
+    )
+    .map_err(sqlite_error)
+}
+
+/// The horizon run `run_id` may move to now: the seq its earliest open wake was woken at (open: neither superseded
+/// nor answered with its turn's outputs disposed of), or, none open, past its last supervision event; the event
+/// recording it when it is past the recorded one (v19).
+pub(super) fn advance_horizon(
+    tx: &Transaction<'_>,
+    project_id: &str,
+    run_id: &str,
+) -> Result<Option<NewEvent>, PersistError> {
+    let waiting = super::outputs::pending_attempts(tx, run_id)?;
+    let open = of_run(tx, run_id)?
+        .into_iter()
+        .filter(|w| {
+            !w.superseded
+                && (!w.settled()
+                    || w.turns
+                        .last()
+                        .is_some_and(|t| waiting.contains(&t.attempt_id)))
+        })
+        .map(|w| w.woken_seq)
+        .min();
+    let next = match open {
+        Some(seq) => seq,
+        // Past its last supervision event (not any event: the horizon moves only as supervision does).
+        None => tx
+            .query_row(
+                "SELECT coalesce(max(seq), 0) + 1 FROM events WHERE run_id = ?1 AND kind IN \
+                 (?2, ?3, ?4, ?5, ?6, 'supervisor.output', 'supervisor.output_disposed', 'supervisor.turn_failed')",
+                params![run_id, WOKEN, ALLOCATED, REARMED, SUPERSEDED, PREEMPT],
+                |r| r.get(0),
+            )
+            .map_err(sqlite_error)?,
+    };
+    // Recorded only when it passes a wake (none otherwise to leave behind).
+    let passed: bool = tx
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM events WHERE run_id = ?1 AND kind = ?2 AND seq >= ?3 AND seq < ?4)",
+            params![run_id, WOKEN, horizon(tx, run_id)?, next],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    if !passed {
+        return Ok(None);
+    }
+    Ok(Some(NewEvent {
+        project_id: project_id.to_owned(),
+        event_id: child_id(run_id, &format!("supervisor/horizon/{next}")),
+        run_id: Some(run_id.to_owned()),
+        kind: HORIZON.to_owned(),
+        payload: json!({"seq": next}),
+    }))
+}
+
 /// The attempts of run `run_id` allocated as probes (`supervisor.probe`).
 fn probe_attempts(tx: &Transaction<'_>, run_id: &str) -> Result<BTreeSet<String>, PersistError> {
     let mut statement = tx
@@ -1683,12 +1757,17 @@ pub(super) fn stops(
 ) -> Result<Vec<Stop>, PersistError> {
     let now = context.now();
     let tx = writer::begin(conn, ctx)?;
+    // Only the runs with a supervision task in flight, by the tasks' (run, state) index (v19, M2T08R-351).
     let runs: Vec<String> = {
         let mut statement = tx
-            .prepare("SELECT run_id FROM runs WHERE project_id = ?1 ORDER BY created_at, run_id")
+            .prepare(
+                "SELECT r.run_id FROM runs r WHERE r.project_id = ?1 AND EXISTS (SELECT 1 FROM tasks t \
+                 WHERE t.run_id = r.run_id AND t.state IN ('LEASED', 'RUNNING') AND t.role = ?2) \
+                 ORDER BY r.created_at, r.run_id",
+            )
             .map_err(sqlite_error)?;
         statement
-            .query_map(params![project_id], |r| r.get(0))
+            .query_map(params![project_id, COMMANDER], |r| r.get(0))
             .map_err(sqlite_error)?
             .collect::<Result<_, _>>()
             .map_err(sqlite_error)?
