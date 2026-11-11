@@ -101,6 +101,10 @@ def ancestors(tasks:dict,task_id:str)->set[str]:
     return seen
 
 NOT_IMPLEMENTED='scripts/product/not-implemented.sh'
+# The artifacts scripts/product/traceability.sh and independent.sh write (docs/adr/ADR-027.md decisions 10, 11, 13).
+VERIFICATION_ARTIFACTS={'traceability':('test-results.jsonl','traceability-report.json'),
+    'independent-qa':('live-sessions.json','independent-report.json','native-attempt.json','raw-session.jsonl'),
+    'independent-review':('live-sessions.json','independent-report.json','native-attempt.json','raw-session.jsonl')}
 
 def owned_acceptance(task:dict,req_acs:dict[str,list[str]])->list[str]:
     """ACs a task is responsible for: its explicit `acceptance` list, else every AC of its requirements."""
@@ -269,6 +273,10 @@ def validate(root:Path)->dict:
                 check(policy['artifacts']['test_results'] in declared(cid),f'{rel}: {cid} is the scenario check of an AC and must declare {policy["artifacts"]["test_results"]}')
             for cid in ('independent-qa','independent-review'):
                 check(policy['artifacts']['independent_report'] in declared(cid),f'{rel}: {cid} must declare {policy["artifacts"]["independent_report"]}')
+            # docs/adr/ADR-027.md decision 13: what the verification checks write, so run_check binds and reports it.
+            for cid,names in VERIFICATION_ARTIFACTS.items():
+                missing=[n for n in names if n not in declared(cid)]
+                check(not missing,f'{rel}: {cid} must declare {", ".join(missing)}')
             check(policy['artifacts']['release_bundle'] in declared('build'),f'{rel}: build must declare {policy["artifacts"]["release_bundle"]}')
         except Exception as e:errors.append(f'{rel}: {e}')
     resources=load_json(root/'resources/skills/registry.json')['skills']
