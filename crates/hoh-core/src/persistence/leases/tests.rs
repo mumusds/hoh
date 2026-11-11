@@ -412,8 +412,8 @@ fn workspace_events(conn: &Connection, attempt: &str) -> Result<Vec<String>, rus
 
 #[test]
 fn an_interrupted_writer_lets_its_lease_go_only_with_its_workspace_record() -> R {
-    // REQ-019 behaviour 6 (docs/adr/ADR-024.md decision 9, M2T17R-52): a writer whose end is interrupted (to
-    // UNKNOWN_EFFECT, or RUNNING to CANCELLED) without the workspace's record is refused: nothing is written, its lease
+    // REQ-019 behaviour 6 (docs/adr/ADR-024.md decision 9, M2T17R-52, M2T17FR-50): a writer whose end is interrupted
+    // (to UNKNOWN_EFFECT, or from RUNNING to CANCELLED or FAILED) without the workspace's record is refused: nothing is written, its lease
     // stays effective and no other writer is granted. With the record, the record is written in the end's transaction
     // and the next writer is granted. Its lease expired meanwhile changes nothing (the settle's shape).
     let quiet = crate::persistence::writer::Ctx::quiet();

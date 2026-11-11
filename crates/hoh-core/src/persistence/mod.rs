@@ -141,8 +141,8 @@ pub enum PersistError {
     Migration { version: i64, detail: String },
     /// A FOREIGN KEY, CHECK, UNIQUE or NOT NULL constraint failed; nothing of the transaction was written.
     IntegrityViolation(String),
-    /// An interrupted end of the writer lease's holder (to UNKNOWN_EFFECT, or RUNNING to CANCELLED) without the
-    /// workspace's record (`WORKSPACE_RECORD_REQUIRED`): its lease goes only with the record (REQ-019 behaviour 6,
+    /// An interrupted end of the writer lease's holder (to UNKNOWN_EFFECT, or from RUNNING to any end but SETTLED)
+    /// without the workspace's record (`WORKSPACE_RECORD_REQUIRED`): its lease goes only with the record (REQ-019 behaviour 6,
     /// docs/adr/ADR-024.md decision 9); nothing was written, the slot stays held. The caller takes the record and ends
     /// it again with it.
     WorkspaceRecordRequired(String),
