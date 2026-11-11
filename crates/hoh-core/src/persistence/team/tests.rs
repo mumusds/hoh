@@ -2118,6 +2118,156 @@ async fn a_native_id_no_completed_turn_recorded_is_never_resumed() -> R {
 }
 
 #[tokio::test]
+async fn a_session_resumes_only_its_own_latest_completed_turn() -> R {
+    // M2T17R-750, -751 (docs/adr/ADR-024.md decision 4): the record a turn resumes is its own session's, the latest of
+    // that session's completed turns. The developer's and the reviewer's sessions complete turns in turn: each resumes
+    // its own, never the run's latest; a later completed turn replaces its session's earlier one; after a handover to a
+    // new holder on the same agent, the new session resumes nothing of the old holder's.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    working(&store, &path).await?;
+    a0_ends(&path)?;
+    exec(
+        &path,
+        "UPDATE sessions SET capabilities_json = '{\"structured_events\": true, \"resume\": true}' WHERE session_id = 'sd';
+         INSERT INTO sessions(session_id, agent, role, agent_version, capabilities_json) VALUES
+           ('sr', 'codex', 'reviewer', '1', '{\"structured_events\": true, \"resume\": true}');
+         UPDATE role_bindings SET session_id = 'sr' WHERE run_id = 'R1' AND role = 'reviewer';",
+    )?;
+    let context = crate::decision::Context {
+        required_capabilities: ["developer", "reviewer"]
+            .into_iter()
+            .map(|role| (role.to_owned(), ["structured_events".to_owned()].into()))
+            .collect(),
+        ..crate::decision::Context::default()
+    };
+    let resumed = |d: &crate::persistence::Dispatched, role: &str| -> R<Option<String>> {
+        Ok(super::assignment(
+            &Connection::open(&path)?,
+            "p1",
+            "R1",
+            &d.task_id,
+            &d.attempt_id,
+            role,
+        )?
+        .native_session)
+    };
+    let review_next = |task_id: &str, seq: i64| -> R {
+        exec(
+            &path,
+            &format!(
+                "INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate)
+                   VALUES ('{task_id}', 'R1', 's1', 'READY', 1, 'reviewer', 0, {seq}, 1);"
+            ),
+        )
+    };
+    let d1 = store
+        .schedule_round("R1", context.clone())
+        .await?
+        .dispatched
+        .ok_or("T1 not dispatched")?;
+    turn_ends(&store, &path, &d1.attempt_id, true, "d-1").await?;
+    review_next("TR1", 3)?;
+    let r1 = store
+        .schedule_round("R1", context.clone())
+        .await?
+        .dispatched
+        .ok_or("TR1 not dispatched")?;
+    assert_eq!(
+        resumed(&r1, "reviewer")?,
+        None,
+        "the developer's completed turn is not the reviewer's"
+    );
+    turn_ends(&store, &path, &r1.attempt_id, true, "r-1").await?;
+    let d2 = dispatch_next(&store, &path, &context, "T2", 4).await?;
+    assert_eq!(
+        resumed(&d2, "developer")?.as_deref(),
+        Some("d-1"),
+        "its own session's, not the run's latest"
+    );
+    turn_ends(&store, &path, &d2.attempt_id, true, "d-2").await?;
+    review_next("TR2", 5)?;
+    let r2 = store
+        .schedule_round("R1", context.clone())
+        .await?
+        .dispatched
+        .ok_or("TR2 not dispatched")?;
+    assert_eq!(resumed(&r2, "reviewer")?.as_deref(), Some("r-1"));
+    turn_ends(&store, &path, &r2.attempt_id, true, "r-2").await?;
+    let d3 = dispatch_next(&store, &path, &context, "T3", 6).await?;
+    assert_eq!(
+        resumed(&d3, "developer")?.as_deref(),
+        Some("d-2"),
+        "the latest of its completed turns"
+    );
+    turn_ends(&store, &path, &d3.attempt_id, true, "d-3").await?;
+    // A new holder on the same agent (a changed prompt): a new session, which resumes nothing of the old one's.
+    store
+        .submit_command(team_change(
+            "same-agent",
+            0,
+            json!({"developer": {"prompt": "builtin:cto"}}),
+        ))
+        .await?;
+    store
+        .team_checkpoint("R1", crate::persistence::Availability::default())
+        .await?;
+    store
+        .bind_session(crate::persistence::SessionGrant {
+            run_id: "R1".to_owned(),
+            role: "developer".to_owned(),
+            role_epoch: 2,
+            agent: "claude".to_owned(),
+            agent_version: "1".to_owned(),
+            capabilities: json!({"structured_events": true, "resume": true}),
+        })
+        .await?;
+    let start = store
+        .runner_waiting("p1")
+        .await?
+        .session_starts
+        .pop()
+        .ok_or("no session start")?;
+    let session = start.session_id.clone().ok_or("no session")?;
+    assert_ne!(session, "sd");
+    assert!(
+        store
+            .deliver_session_start(&start.message_id, &session)
+            .await?
+    );
+    let d4 = dispatch_next(&store, &path, &context, "T4", 7).await?;
+    assert_eq!(
+        resumed(&d4, "developer")?,
+        None,
+        "the old holder's session is not the new holder's"
+    );
+    turn_ends(&store, &path, &d4.attempt_id, true, "n-1").await?;
+    let d5 = dispatch_next(&store, &path, &context, "T5", 8).await?;
+    assert_eq!(resumed(&d5, "developer")?.as_deref(), Some("n-1"));
+    // Records written past the store after the new session's latest completed turn, whose session and attempt disagree
+    // (M2T17R-700's read check): one names the new session with the old session's completed attempt, the other the old
+    // session with the new one's. Neither is the new session's own completed turn, so neither is resumed.
+    turn_ends(&store, &path, &d5.attempt_id, true, "n-2").await?;
+    exec(
+        &path,
+        &format!(
+            "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+               ('p1', 'forged-session', 'R1', 'session.native',
+                json_object('session_id', '{session}', 'native_id', 'forged-session', 'attempt_id', '{old}'),
+                '2026-11-10T00:00:00Z'),
+               ('p1', 'forged-attempt', 'R1', 'session.native',
+                json_object('session_id', 'sd', 'native_id', 'forged-attempt', 'attempt_id', '{new}'),
+                '2026-11-10T00:00:00Z');",
+            old = d3.attempt_id,
+            new = d4.attempt_id
+        ),
+    )?;
+    let d6 = dispatch_next(&store, &path, &context, "T6", 9).await?;
+    assert_eq!(resumed(&d6, "developer")?.as_deref(), Some("n-2"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_session_native_record_comes_only_from_a_completed_turns_settle() -> R {
     // M2T17R-700 (docs/adr/ADR-024.md decision 4, round 8): the record that names a session to resume is reserved. A
     // generic commit, an attempt's own event and a failed turn's observed events cannot write it (consume's effect
