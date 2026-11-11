@@ -579,7 +579,12 @@
    "requirements": [
     "REQ-039"
    ],
-   "done_when": "REQ-039全部AC通过。"
+   "acceptance": [
+    "AC-039-01",
+    "AC-039-02",
+    "AC-039-04"
+   ],
+   "done_when": "AC-039-01、-02、-04 通过；交接只传引用（REQ-039 行为 5）由 Commander 交接的非 AC 测试覆盖。需要 QA 派发的 AC-039-03 归 M2-T16（CR-016）。"
   },
   {
    "id": "M2-T10",
@@ -629,7 +634,8 @@
     "REQ-036",
     "REQ-037",
     "REQ-053",
-    "REQ-054"
+    "REQ-054",
+    "REQ-039"
    ],
    "acceptance": [
     "AC-021-05",
@@ -640,9 +646,10 @@
     "AC-037-03",
     "AC-037-04",
     "AC-053-03",
-    "AC-054-03"
+    "AC-054-03",
+    "AC-039-03"
    ],
-   "done_when": "AC-021-05、AC-035-03/05、AC-036-03、AC-037-02/03/04、AC-053-03、AC-054-03 通过；Commander 不可用时 candidate_ready 仍派发 QA/Review；FAILED/UNKNOWN 永不投影为 PASS。"
+   "done_when": "AC-021-05、AC-035-03/05、AC-036-03、AC-037-02/03/04、AC-053-03、AC-054-03 通过；Commander 不可用时 candidate_ready 仍派发 QA/Review；FAILED/UNKNOWN 永不投影为 PASS；AC-039-03 通过（CR-016：QA 的 Prompt 经产品 QA 派发、同一收集函数与装箱器生成，由 FakeAgent 捕获）。"
   },
   {
    "id": "M2-T18",
