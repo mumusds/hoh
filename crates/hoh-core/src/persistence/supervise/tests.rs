@@ -504,13 +504,39 @@ async fn a_spec_revision_the_project_lacks_keys_by_its_revision_and_never_merges
     Ok(())
 }
 
+/// Counts the transactions committed while armed.
+#[derive(Debug, Default)]
+struct Commits {
+    armed: std::sync::atomic::AtomicBool,
+    n: std::sync::atomic::AtomicUsize,
+}
+
+impl crate::persistence::FaultHooks for Commits {
+    fn before_commit(&self) -> Result<(), crate::persistence::PersistError> {
+        if self.armed.load(std::sync::atomic::Ordering::SeqCst) {
+            self.n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        Ok(())
+    }
+}
+
 #[tokio::test]
-async fn a_step_takes_in_at_most_ten_thousand_events_and_the_next_takes_the_rest() -> R {
-    // docs/adr/ADR-025.md decision 2 (M2T08D-263c): one step looks at no more than 10 000 of a run's events; its
-    // cursor stops at the last one it looked at, and the next step goes on from there.
+async fn a_step_takes_in_its_events_in_batches_of_at_most_ten_thousand() -> R {
+    // docs/adr/ADR-025.md decision 2 (M2T08D-263c, -900): one step takes in all of a run's committed events, at most
+    // 10 000 per transaction: 11 000 events are two transactions, and the cursor ends past the last one.
     let dir = tempfile::tempdir()?;
     let clock = std::sync::Arc::new(TestClock::default());
-    let (store, path) = open(&dir, &clock)?;
+    let hooks = std::sync::Arc::new(Commits::default());
+    let path = dir.path().join(".hoh/state.db");
+    let store = Store::open(
+        &path,
+        Options {
+            wal_probe: Some(selftest::test_probe(None)),
+            clock: Some(StoreClock(clock.clone())),
+            faults: hooks.clone(),
+            ..Options::default()
+        },
+    )?;
     exec(&path, WORLD)?;
     let mut all = Vec::new();
     for n in 0..11 {
@@ -519,16 +545,68 @@ async fn a_step_takes_in_at_most_ten_thousand_events_and_the_next_takes_the_rest
             .collect();
         all.extend(events(&store, &format!("cap/{n}"), &chunk).await?);
     }
-    let first = store.supervise("R", at(&clock, 0)).await?;
-    assert_eq!(first.cursor, all[9_999]);
-    let second = store.supervise("R", at(&clock, 100)).await?;
-    assert_eq!(second.cursor, *all.last().ok_or("none")?);
+    hooks.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    let step = store.supervise("R", at(&clock, 0)).await?;
+    hooks
+        .armed
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(step.cursor, *all.last().ok_or("none")?);
+    assert_eq!(hooks.n.load(std::sync::atomic::Ordering::SeqCst), 2);
     assert_eq!(
         count(
             &path,
             "SELECT last_handled_seq FROM supervisor_cursor WHERE run_id = 'R'"
         )?,
-        second.cursor
+        step.cursor
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_capped_step_fires_nothing_before_it_has_caught_up_with_what_is_committed() -> R {
+    // M2T08D-900 (docs/adr/ADR-025.md decision 2): K's first event is followed by 9 999 others at 0 s, K's second
+    // (seq 10 001) is committed at 1.5 s. The step at 2 s must not fire K on its first 10 000 events alone: it takes
+    // in batches until it has caught up, so K fires once, at 3.5 s, with both events; an integrity violation past the
+    // first batch fires in that same step.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    clock.set(0);
+    let mut first: Vec<(&str, Value)> = vec![("issue.opened", issue("fpk", 3))];
+    first.extend((0..9_999).map(|i| ("token.delta", json!({"i": i}))));
+    let mut seqs = events(&store, "k1", &first).await?;
+    clock.set(1500);
+    let second = events(&store, "k2", &[("issue.opened", issue("fpk", 3))]).await?;
+    seqs.truncate(1);
+    seqs.extend(second);
+    let early = store.supervise("R", at(&clock, 2000)).await?;
+    assert!(
+        early.fired.is_empty(),
+        "fired before the second event was taken in: {early:?}"
+    );
+    let late = store.supervise("R", at(&clock, 3500)).await?;
+    assert_eq!(late.fired.len(), 1);
+    assert_eq!(late.fired[0].event_seqs, seqs);
+    // An integrity violation committed past a full batch fires in the step that sees it, the same step.
+    clock.set(4000);
+    let filler: Vec<(&str, Value)> = (0..10_000)
+        .map(|i| ("token.delta", json!({"j": i})))
+        .collect();
+    events(&store, "filler", &filler).await?;
+    let integrity = events(
+        &store,
+        "integrity",
+        &[("integrity_violation", json!({"reason": "db"}))],
+    )
+    .await?;
+    let step = store.supervise("R", at(&clock, 4000)).await?;
+    assert_eq!(
+        step.fired
+            .iter()
+            .map(|f| f.event_seqs.clone())
+            .collect::<Vec<_>>(),
+        [integrity]
     );
     Ok(())
 }

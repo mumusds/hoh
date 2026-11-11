@@ -85,7 +85,43 @@ pub(super) fn step(
     context: &Context,
     ctx: &Ctx<'_>,
 ) -> Result<Supervised, PersistError> {
-    let tx = writer::begin(conn, ctx)?;
+    // In batches of at most STEP events, each its own transaction, until the run's committed events are all taken
+    // in; only then are due triggers fired, so no trigger fires on part of what was committed before the step
+    // (M2T08D-900, docs/adr/ADR-025.md decision 2).
+    loop {
+        let tx = writer::begin(conn, ctx)?;
+        let (project_id, high, caught_up) = take_in_batch(&tx, run_id, context, ctx)?;
+        if !caught_up {
+            ctx.before_commit()?;
+            tx.commit().map_err(sqlite_error)?;
+            continue;
+        }
+        let (fired, events) = fire(&tx, &project_id, run_id, context.now(), ctx)?;
+        writer::write(
+            &tx,
+            &Commit {
+                events,
+                ..Commit::default()
+            },
+            ctx,
+        )?;
+        ctx.before_commit()?;
+        tx.commit().map_err(sqlite_error)?;
+        return Ok(Supervised {
+            cursor: high,
+            fired,
+        });
+    }
+}
+
+/// One batch of run `run_id`'s events after its cursor (at most [`STEP`]) taken in inside `tx`: its project, the
+/// cursor after it, and whether it reached the last event committed (a batch of fewer than STEP events).
+fn take_in_batch(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    context: &Context,
+    ctx: &Ctx<'_>,
+) -> Result<(String, i64, bool), PersistError> {
     let run: Option<(String, Option<i64>)> = tx
         .query_row(
             "SELECT r.project_id, s.revision FROM runs r LEFT JOIN specs s ON s.spec_id = r.spec_id WHERE r.run_id = ?1",
@@ -108,13 +144,13 @@ pub(super) fn step(
         .optional()
         .map_err(sqlite_error)?
         .unwrap_or(0);
-    // At most STEP events per step: the cursor stops at the last one looked at (docs/adr/ADR-025.md decision 2).
-    let high: i64 = tx
+    // At most STEP events per batch: the cursor stops at the last one looked at (docs/adr/ADR-025.md decision 2).
+    let (high, looked): (i64, i64) = tx
         .query_row(
-            "SELECT coalesce(max(seq), ?2) FROM (SELECT seq FROM events WHERE run_id = ?1 AND seq > ?2 \
+            "SELECT coalesce(max(seq), ?2), count(*) FROM (SELECT seq FROM events WHERE run_id = ?1 AND seq > ?2 \
              ORDER BY seq LIMIT ?3)",
             params![run_id, cursor, STEP],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .map_err(sqlite_error)?;
     let kinds = KINDS
@@ -158,7 +194,7 @@ pub(super) fn step(
                 _ => wake.key.fingerprint.clone(),
             };
             take_in(
-                &tx,
+                tx,
                 run_id,
                 &fingerprint,
                 spec_id.as_deref(),
@@ -176,21 +212,7 @@ pub(super) fn step(
         )
         .map_err(sqlite_error)?;
     }
-    let (fired, events) = fire(&tx, &project_id, run_id, now, ctx)?;
-    writer::write(
-        &tx,
-        &Commit {
-            events,
-            ..Commit::default()
-        },
-        ctx,
-    )?;
-    ctx.before_commit()?;
-    tx.commit().map_err(sqlite_error)?;
-    Ok(Supervised {
-        cursor: high,
-        fired,
-    })
+    Ok((project_id, high, looked < STEP))
 }
 
 /// Event `seq` of key (`fingerprint`, `spec_id`), committed at `at`: joined to the key's PENDING trigger, else a new
