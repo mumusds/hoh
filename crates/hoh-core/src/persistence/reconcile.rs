@@ -46,6 +46,9 @@ pub struct UnfinishedRow {
     pub work_ended_at: Option<std::time::SystemTime>,
     /// Its run is being cancelled: it ends CANCELLED, whatever else is found (docs/adr/ADR-021.md decision 8e).
     pub cancel_requested: bool,
+    /// The workspace's record its end carries: none from the scan; the host adds it, taken after its stop, when the
+    /// store asks for it (REQ-019 behaviour 6, docs/adr/ADR-024.md decision 9).
+    pub workspace: Option<serde_json::Value>,
 }
 
 /// One attempt's disposition as [`ReconcileJob::Apply`] carries it.
@@ -217,6 +220,7 @@ fn scan(
             work_class,
             work_ended_at,
             cancel_requested,
+            workspace: None,
         });
     }
     Ok(rows)
@@ -403,6 +407,7 @@ fn apply(
                 to,
                 facts: AttemptFacts {
                     ended_at: Some(crate::time::rfc3339_utc(*at)),
+                    workspace: row.workspace.clone(),
                     ..AttemptFacts::default()
                 },
             },

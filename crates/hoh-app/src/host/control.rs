@@ -560,6 +560,28 @@ pub(super) fn workspace(project: &Path) -> Value {
     workspace_within(project, UNTRACKED_BUDGET)
 }
 
+/// Run `end`, one commit of an attempt's end whose processes were proven gone, without a workspace record; when the
+/// store refuses it as an interrupted end of the writer lease's holder, the workspace's record of `project` is taken
+/// on a blocking thread (ADR-021 decision 8g) and `end` runs again with it (REQ-019 behaviour 6,
+/// docs/adr/ADR-024.md decision 9). Whether the end is interrupted is known only inside its transaction (a cancel may
+/// come meanwhile), so the store decides, not this caller.
+pub(super) async fn recorded_end<T, F, Fut>(project: &Path, end: F) -> Result<T, PersistError>
+where
+    F: Fn(Option<Value>) -> Fut,
+    Fut: std::future::Future<Output = Result<T, PersistError>>,
+{
+    match end(None).await {
+        Err(PersistError::WorkspaceRecordRequired(_)) => {
+            let project = project.to_path_buf();
+            let record = tokio::task::spawn_blocking(move || workspace(&project))
+                .await
+                .map_err(|e| PersistError::Storage(format!("the workspace record ended: {e}")))?;
+            end(Some(record)).await
+        }
+        other => other,
+    }
+}
+
 /// How long the workspace record may spend on the untracked files' contents (a huge or sparse file must not hold the
 /// cancel back, M2T06R-102).
 const UNTRACKED_BUDGET: Duration = Duration::from_secs(5);

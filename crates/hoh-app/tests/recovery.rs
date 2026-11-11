@@ -1190,6 +1190,101 @@ fn test_041_05_a_started_effect_is_found_or_unknown_never_done_again() -> R {
     Ok(())
 }
 
+#[test]
+fn a_writer_found_interrupted_at_a_restart_ends_with_the_workspace_it_left_recorded() -> R {
+    // REQ-019 behaviour 6 (docs/adr/ADR-024.md decision 9, M2T17R-52), the startup reconcile's path: writer task T2's
+    // attempt AW is RUNNING and holds the writer lease, its agent long gone and its effect STARTED and not found. The
+    // restarted host's reconcile ends it UNKNOWN_EFFECT with the workspace's record in the same transaction, before
+    // the reconcile completes; its lease is then free. The project is a git work tree with an uncommitted change.
+    let dir = tempfile::tempdir()?;
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    git_in(&project, &["init", "-q"])?;
+    std::fs::write(project.join(".gitignore"), ".hoh/\n")?;
+    std::fs::write(project.join("a.txt"), "one\n")?;
+    git_in(&project, &["add", ".gitignore", "a.txt"])?;
+    git_in(
+        &project,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "first",
+        ],
+    )?;
+    std::fs::write(project.join("a.txt"), "two\n")?;
+    let (code, stderr) = serve_and_stop(&project)?;
+    assert_eq!(code, 0, "{stderr}");
+    seed(
+        &project,
+        &format!(
+            "{RUNNING_WORLD}
+             UPDATE tasks SET writer = 1 WHERE task_id = 'T2';
+             INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, pid, boot_id,
+               process_start_id, started_at) VALUES
+               ('AW', 'T2', 'RUNNING', 1, 1, 1, {gone}, '{boot}', '1', '2026-11-07T00:00:00Z');
+             INSERT INTO effects(effect_key, attempt_id, state) VALUES ('pr:R/T2', 'AW', 'STARTED');
+             INSERT INTO leases(project_id, kind, attempt_id, epoch, expires_at) VALUES
+               (:p, 'writer', 'AW', 1, '2999-01-01T00:00:00Z');",
+            boot = hoh_agents::identity::boot_id()?,
+            gone = 1 << 23,
+        ),
+    )?;
+    let remote = dir.path().join("forge.json");
+    std::fs::write(
+        &remote,
+        json!({"available": {}, "unavailable": ["pr:R/T2"]}).to_string(),
+    )?;
+    let (code, stderr) = serve_and_stop_with(&project, &[(CHILD_REMOTE, remote.as_os_str())])?;
+    assert_eq!(code, 0, "the restarted host: {stderr}");
+    let read: Value = serde_json::from_str(&python(
+        &db(&project),
+        r#"
+import json, sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+one = lambda sql: (c.execute(sql).fetchone() or [None])[0]
+print(json.dumps({
+    "state": one("SELECT state FROM attempts WHERE attempt_id = 'AW'"),
+    "records": [[r[0], json.loads(r[1])] for r in c.execute(
+        "SELECT seq, payload_json FROM events WHERE kind = 'attempt.workspace' AND json_extract(payload_json, '$.attempt_id') = 'AW'")],
+    "ended": one("SELECT seq FROM events WHERE kind = 'attempt.moved' AND json_extract(payload_json, '$.attempt_id') = 'AW' AND json_extract(payload_json, '$.to') = 'UNKNOWN_EFFECT'"),
+    "completed": one("SELECT max(seq) FROM events WHERE kind = 'reconcile.completed'"),
+    "expires_at": one("SELECT expires_at FROM leases WHERE kind = 'writer'"),
+}))
+"#,
+        "",
+    )?)?;
+    assert_eq!(read["state"], "UNKNOWN_EFFECT", "{read}");
+    let records = read["records"].as_array().ok_or("no records")?;
+    assert_eq!(records.len(), 1, "{read}");
+    let (seq, record) = (records[0][0].as_i64(), &records[0][1]);
+    assert_eq!(seq.map(|s| s + 1), read["ended"].as_i64(), "{read}");
+    assert!(seq < read["completed"].as_i64(), "{read}");
+    assert!(
+        read["expires_at"].as_str() < Some("2999"),
+        "the lease was not let go: {read}"
+    );
+    let workspace = &record["workspace"];
+    assert_eq!(
+        workspace["head"],
+        json!(git_in(&project, &["rev-parse", "HEAD"])?.trim()),
+        "{record}"
+    );
+    let diff = Command::new("git")
+        .args(["diff", "--binary", "--no-ext-diff", "--no-textconv", "HEAD"])
+        .current_dir(&project)
+        .output()?
+        .stdout;
+    let digest = <sha2::Sha256 as sha2::Digest>::digest(&diff);
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(workspace["diff_sha256"], json!(hex), "{record}");
+    Ok(())
+}
+
 /// Start a host with these child variables, wait until it serves, then until `done` holds (at most `limit`), stop it
 /// with SIGTERM: its exit code, its stderr, and whether `done` held.
 fn serve_until(
@@ -1914,6 +2009,140 @@ print(json.dumps({{"steps": steps, "grant": list(grant), "disposed": disposed,
     drop(newer);
     host.shutdown().await;
     drop(executor);
+    Ok(())
+}
+
+/// `git` in `dir`, its stdout.
+fn git_in(dir: &Path, args: &[&str]) -> R<String> {
+    let out = Command::new("git").args(args).current_dir(dir).output()?;
+    if !out.status.success() {
+        return Err(format!("git {args:?}: {}", String::from_utf8_lossy(&out.stderr)).into());
+    }
+    Ok(String::from_utf8(out.stdout)?)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_expired_writer_is_granted_again_only_once_the_workspace_it_left_is_recorded() -> R {
+    // REQ-019 behaviour 6 (docs/adr/ADR-024.md decision 9, M2T17R-52), the settle's path: AC-041-02's world in a git
+    // work tree, its agent appending to a tracked file at its SIGTERM. Its lease expires, it is reaped and its effect
+    // is unknown: it ends UNKNOWN_EFFECT with the workspace's record, taken after the stop, in the same transaction
+    // as its end and its lease's release, before the next writer's grant.
+    let dir = tempfile::tempdir()?;
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    git_in(&project, &["init", "-q"])?;
+    std::fs::write(
+        project.join(".gitignore"),
+        ".hoh/\nwork\nwork.at\nwork.ready\n",
+    )?;
+    std::fs::write(project.join("work.term"), "")?;
+    git_in(&project, &["add", ".gitignore", "work.term"])?;
+    git_in(
+        &project,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "first",
+        ],
+    )?;
+    let (code, stderr) = serve_and_stop(&project)?;
+    assert_eq!(code, 0, "{stderr}");
+    seed(&project, WRITERS)?;
+    let clock = Arc::new(FakeClock::default());
+    // Its SIGTERM mark goes to `work.term`, tracked: what the agent did at its stop is in the workspace's diff.
+    let executor = Arc::new(StuckExecutor {
+        cancels: project.join("work"),
+        started: std::sync::Mutex::new(Vec::new()),
+        holds: true,
+    });
+    let mut config = config(&project);
+    config.clock = hoh_app::host::HostClock(clock.clone());
+    config.reconcile.native_grace = Duration::from_millis(300);
+    config.reconcile.term_grace = Duration::from_millis(300);
+    config.reconcile.kill_grace = Duration::from_secs(5);
+    let developer = ["structured_events", "command_exec"].map(str::to_owned);
+    config.runner = Some(hoh_app::host::RunnerConfig {
+        executor: executor.clone(),
+        context: Context {
+            required_capabilities: [("developer".to_owned(), developer.into_iter().collect())]
+                .into(),
+            ..Context::default()
+        },
+    });
+    let host = Host::start(config).await?;
+    let db = db(&project);
+    assert!(wait_for(
+        &db,
+        "SELECT a.state || ':' || l.epoch FROM attempts a JOIN leases l ON l.attempt_id = a.attempt_id \
+         WHERE a.task_id = 'T1' AND l.kind = 'writer'",
+        "RUNNING:4",
+        Duration::from_secs(30)
+    )?);
+    let a1 = query(&db, "SELECT attempt_id FROM attempts WHERE task_id = 'T1'")?;
+    executor.trapped()?;
+    clock.advance(Duration::from_secs(300));
+    assert!(wait_for(
+        &db,
+        "SELECT count(*) FROM outbox WHERE json_extract(payload_json, '$.kind') = 'dispatch' \
+         AND json_extract(payload_json, '$.lease.epoch') = 5",
+        "1",
+        Duration::from_secs(30)
+    )?);
+    host.shutdown().await;
+    drop(executor);
+    let read: Value = serde_json::from_str(&python(
+        &db,
+        &format!(
+            r#"
+import json, sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+record = c.execute("SELECT seq, payload_json FROM events WHERE kind = 'attempt.workspace' AND json_extract(payload_json, '$.attempt_id') = '{a1}'").fetchall()
+ended = c.execute("SELECT seq FROM events WHERE kind = 'attempt.moved' AND json_extract(payload_json, '$.attempt_id') = '{a1}' AND json_extract(payload_json, '$.to') = 'UNKNOWN_EFFECT'").fetchone()
+grant = c.execute("SELECT event_seq FROM outbox WHERE json_extract(payload_json, '$.lease.epoch') = 5").fetchone()
+print(json.dumps({{"records": [[r[0], json.loads(r[1])] for r in record], "ended": ended[0] if ended else None,
+                  "grant": grant[0] if grant else None,
+                  "a1": c.execute("SELECT state FROM attempts WHERE attempt_id = '{a1}'").fetchone()[0]}}))
+"#
+        ),
+        "",
+    )?)?;
+    assert_eq!(read["a1"], "UNKNOWN_EFFECT", "{read}");
+    let records = read["records"].as_array().ok_or("no records")?;
+    assert_eq!(records.len(), 1, "{read}");
+    let (seq, record) = (records[0][0].as_i64(), &records[0][1]);
+    // In the end's own transaction (the end's event right after it), before the next writer's grant.
+    assert_eq!(seq.map(|s| s + 1), read["ended"].as_i64(), "{read}");
+    assert!(seq < read["grant"].as_i64(), "{read}");
+    assert_eq!(record["to"], "UNKNOWN_EFFECT", "{record}");
+    let workspace = &record["workspace"];
+    assert_eq!(
+        workspace["head"],
+        json!(git_in(&project, &["rev-parse", "HEAD"])?.trim()),
+        "{record}"
+    );
+    assert_eq!(
+        workspace["head_tree"],
+        json!(git_in(&project, &["rev-parse", "HEAD^{tree}"])?.trim()),
+        "{record}"
+    );
+    // Taken after the stop: the agent's write at its SIGTERM is in it.
+    assert_eq!(
+        std::fs::read_to_string(project.join("work.term"))?,
+        "term\n"
+    );
+    let diff = Command::new("git")
+        .args(["diff", "--binary", "--no-ext-diff", "--no-textconv", "HEAD"])
+        .current_dir(&project)
+        .output()?
+        .stdout;
+    let digest = <sha2::Sha256 as sha2::Digest>::digest(&diff);
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(workspace["diff_sha256"], json!(hex), "{record}");
     Ok(())
 }
 

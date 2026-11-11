@@ -193,7 +193,8 @@ pub trait Processes: Send + Sync {
         &self,
         attempt: &crate::persistence::AttemptRow,
     ) -> Option<(Box<dyn ProcessControl + Send>, bool)>;
-    /// The workspace's record, taken before the run is CANCELLED (ADR-021 decision 8g); called on a blocking thread.
+    /// The workspace's record, taken before the run is CANCELLED (ADR-021 decision 8g), and before an interrupted
+    /// writer's lease goes (docs/adr/ADR-024.md decision 9); called on a blocking thread.
     fn workspace(&self) -> serde_json::Value;
 }
 
@@ -230,10 +231,14 @@ impl Canceller {
         clock: std::sync::Arc<dyn Clock>,
         wait: std::sync::Arc<dyn Fn(Duration) + Send + Sync>,
     ) -> Result<crate::persistence::Finished, crate::persistence::PersistError> {
+        // The workspace's record a writer's end took, while no pass came after it: the run's record is then the same
+        // (docs/adr/ADR-024.md decision 9), not taken a second time.
+        let mut last_record: Option<serde_json::Value> = None;
         for attempt in store.running_attempts(run_id).await? {
             let Some((mut control, native)) = processes.control(&attempt) else {
                 continue;
             };
+            last_record = None;
             let from = self
                 .progress
                 .lock()
@@ -277,28 +282,49 @@ impl Canceller {
             if repeated {
                 continue;
             }
-            store
-                .cancel_pass(crate::persistence::CancelPass {
-                    attempt_id: attempt.attempt_id,
-                    sent: done.sent,
-                    end: done.end,
-                    at: clock.now(),
-                })
-                .await?;
+            let mut pass = crate::persistence::CancelPass {
+                attempt_id: attempt.attempt_id,
+                sent: done.sent,
+                end: done.end,
+                at: clock.now(),
+                workspace: None,
+            };
+            match store.cancel_pass(pass.clone()).await {
+                // The pass ends the writer lease's RUNNING holder, its group proven empty: its lease goes only with the
+                // workspace's record, taken now and written in the same end (REQ-019 behaviour 6, decision 9).
+                Err(crate::persistence::PersistError::WorkspaceRecordRequired(_)) => {
+                    let record = workspace_of(processes.clone()).await?;
+                    pass.workspace = Some(record.clone());
+                    store.cancel_pass(pass).await?;
+                    last_record = Some(record);
+                }
+                other => {
+                    other?;
+                }
+            }
         }
         if !store.running_attempts(run_id).await?.is_empty() {
             return Ok(crate::persistence::Finished::Running(1));
         }
-        // The record reads git and files: off the async workers (M2T06R-06).
-        let workspace = tokio::task::spawn_blocking(move || processes.workspace())
-            .await
-            .map_err(|e| {
-                crate::persistence::PersistError::IntegrityViolation(format!(
-                    "the workspace record failed: {e}"
-                ))
-            })?;
+        let workspace = match last_record {
+            Some(record) => record,
+            None => workspace_of(processes).await?,
+        };
         store.finish_cancel(run_id, workspace, clock.now()).await
     }
+}
+
+/// The workspace's record: it reads git and files, so off the async workers (M2T06R-06).
+async fn workspace_of(
+    processes: std::sync::Arc<dyn Processes>,
+) -> Result<serde_json::Value, crate::persistence::PersistError> {
+    tokio::task::spawn_blocking(move || processes.workspace())
+        .await
+        .map_err(|e| {
+            crate::persistence::PersistError::IntegrityViolation(format!(
+                "the workspace record failed: {e}"
+            ))
+        })
 }
 
 #[cfg(test)]

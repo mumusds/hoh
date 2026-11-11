@@ -1150,6 +1150,92 @@ async fn a_turn_that_ends_after_starting_a_command_ends_unknown_effect_and_is_no
 }
 
 #[tokio::test]
+async fn a_writers_turn_that_ends_unknown_effect_lets_its_lease_go_with_the_workspace_recorded() -> R
+{
+    // REQ-019 behaviour 6 (docs/adr/ADR-024.md decision 9, M2T17R-52), the runner's own end: a writer's codex turn
+    // starts a command and ends with no report of it. Its end is UNKNOWN_EFFECT, taken by the runner (no reconcile),
+    // with the workspace's record in the same transaction; the next writer is granted only after it. The project is
+    // no git work tree: the record says so and counts (reading A5).
+    let world = World::new()?;
+    world.codex("gpt-6-astra")?;
+    let host = start_when_free(world.config()).await?;
+    let project = world.project();
+    let outcome = async {
+        configure(&host, "dev", 0, json!({"developer": {"agent": "codex"}})).await?;
+        let run_id = started(&host, "s1").await?;
+        ready(&project, &run_id, &[])?;
+        exec(
+            &project,
+            &format!(
+                "INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate) \
+                 VALUES ('T-UNKNOWN', '{run_id}', 's1', 'READY', 1, 'developer', 1, 1, 1);"
+            ),
+        )?;
+        // Another writer task, once the first one holds the writer slot: it waits for it.
+        until(
+            &project,
+            "SELECT count(*) FROM attempts WHERE attempt_id = 'T-UNKNOWN/attempt-1'",
+            "1",
+            Duration::from_secs(30),
+        )
+        .await?;
+        exec(
+            &project,
+            &format!(
+                "INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate) \
+                 VALUES ('T-NEXT', '{run_id}', 's1', 'READY', 1, 'developer', 1, 2, 1);"
+            ),
+        )?;
+        until(
+            &project,
+            "SELECT state FROM attempts WHERE attempt_id = 'T-UNKNOWN/attempt-1'",
+            "UNKNOWN_EFFECT",
+            Duration::from_secs(30),
+        )
+        .await?;
+        until(
+            &project,
+            "SELECT count(*) FROM outbox WHERE json_extract(payload_json, '$.kind') = 'dispatch' \
+             AND json_extract(payload_json, '$.task_id') = 'T-NEXT'",
+            "1",
+            Duration::from_secs(30),
+        )
+        .await?;
+        let record: Value = serde_json::from_str(&query(
+            &project,
+            "SELECT payload_json FROM events WHERE kind = 'attempt.workspace' \
+             AND json_extract(payload_json, '$.attempt_id') = 'T-UNKNOWN/attempt-1'",
+        )?)?;
+        assert_eq!(record["to"], "UNKNOWN_EFFECT", "{record}");
+        assert!(record["workspace"]["error"].is_string(), "{record}");
+        let at = |sql: &str| -> R<i64> { Ok(query(&project, sql)?.parse()?) };
+        let recorded = at("SELECT seq FROM events WHERE kind = 'attempt.workspace' \
+             AND json_extract(payload_json, '$.attempt_id') = 'T-UNKNOWN/attempt-1'")?;
+        let ended = at("SELECT seq FROM events WHERE kind = 'attempt.moved' \
+             AND json_extract(payload_json, '$.attempt_id') = 'T-UNKNOWN/attempt-1' \
+             AND json_extract(payload_json, '$.to') = 'UNKNOWN_EFFECT'")?;
+        let granted = at("SELECT event_seq FROM outbox WHERE json_extract(payload_json, '$.kind') = 'dispatch' \
+             AND json_extract(payload_json, '$.task_id') = 'T-NEXT'")?;
+        assert_eq!(recorded + 1, ended, "the record is in its end's transaction");
+        assert!(recorded < granted, "the next writer was granted before the record");
+        assert_eq!(
+            query(
+                &project,
+                "SELECT count(*) FROM events WHERE kind = 'reconcile.attempt' \
+                 AND json_extract(payload_json, '$.attempt_id') = 'T-UNKNOWN/attempt-1'"
+            )?,
+            "0",
+            "ended by a reconcile, not by the runner"
+        );
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    world.stop_fakes()?;
+    outcome
+}
+
+#[tokio::test]
 async fn an_app_server_that_cannot_start_a_turn_degrades_that_codex_to_exec() -> R {
     // M2T07R-201 (REQ-024 failure mode 4, ADR-022 decision 15): the App Server answers initialize with "method not
     // found": the attempt fails CAPABILITY_UNSUPPORTED with one adapter.degraded event and its facts recorded; the

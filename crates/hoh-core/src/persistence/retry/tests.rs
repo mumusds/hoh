@@ -480,6 +480,7 @@ async fn an_ending_records_what_the_agents_turn_showed() -> R {
                         json!({"attempt_id": attempt, "reason": "PROTOCOL_FRAME_TOO_LARGE", "length": 8}),
                     )],
                     raw_log_path: Some("/logs/a".to_owned()),
+                    workspace: None,
                 },
                 unknown_effect: false,
             },

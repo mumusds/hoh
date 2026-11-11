@@ -349,6 +349,7 @@ impl Host {
         reconcile::run(
             &store,
             &started.project_id,
+            &config.project,
             started.host_epoch,
             &config.reconcile,
             config.clock.0.as_ref(),

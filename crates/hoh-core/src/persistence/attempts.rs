@@ -143,6 +143,10 @@ pub struct AttemptFacts {
     pub cancel_requested: Option<bool>,
     pub usage: Option<Value>,
     pub cost_usd: Option<f64>,
+    /// The workspace's record (`host::control::workspace`), taken after the attempt's processes were proven gone: an
+    /// interrupted end of the writer lease's holder needs it and writes it as `attempt.workspace` before its lease goes
+    /// (REQ-019 behaviour 6, docs/adr/ADR-024.md decision 9).
+    pub workspace: Option<Value>,
 }
 
 /// Move attempt `attempt_id` from `from` to `to`.
@@ -431,6 +435,31 @@ pub(super) fn move_attempt(
         .map_err(sqlite_error)?;
     if changed != 1 {
         return Err(stale(Some(state)));
+    }
+    // An interrupted end of the writer lease's holder (its agent stopped without an observed result) lets the lease go
+    // only with the workspace's record, written first in this transaction: no other writer can be granted before the
+    // workspace it left is recorded (REQ-019 behaviour 6, docs/adr/ADR-024.md decision 9). The row names it whether
+    // or not it expired: an expired lease of a holder not ended still holds the slot.
+    let interrupted = m.to == AttemptState::UnknownEffect
+        || (m.from == AttemptState::Running && m.to == AttemptState::Cancelled);
+    if interrupted && leases::names_writer(tx, &m.attempt_id)? {
+        let Some(workspace) = &f.workspace else {
+            return Err(PersistError::WorkspaceRecordRequired(m.attempt_id.clone()));
+        };
+        event(
+            tx,
+            ctx,
+            &task_id,
+            child_id(&m.attempt_id, "workspace"),
+            "attempt.workspace",
+            json!({
+                "attempt_id": m.attempt_id,
+                "task_id": task_id,
+                "from": m.from.as_str(),
+                "to": m.to.as_str(),
+                "workspace": workspace,
+            }),
+        )?;
     }
     if m.to.is_terminal() || m.to == AttemptState::UnknownEffect {
         // Its leases go with it, at its end (REQ-037; the slot is free once it is both ended and expired). UNKNOWN_EFFECT
