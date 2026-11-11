@@ -651,8 +651,10 @@ pub fn valid(e: &Evidence, c: &Sealed, s: &str, world: &dyn Lookup) -> Result<()
         r.artifacts.iter().all(|a| holds(&a.path, &a.sha256)),
         Reason::ArtifactChanged,
     );
+    // Rule 11: a record claiming success hides no failure; past its deadline a child's own exit code (0 after SIGTERM)
+    // claims nothing, and its FAIL lines are conclusions (M2T10D-854).
     need(
-        r.exit_code != 0 || !e.observations.iter().any(|o| o["status"] == "FAIL"),
+        !success || !e.observations.iter().any(|o| o["status"] == "FAIL"),
         Reason::ExitInconsistent,
     );
     let policy = world.policy(&r.check_id);
@@ -777,8 +779,9 @@ pub struct Outcome {
 /// The outcome of evidence `e` whose validity is `verdict` (docs/adr/ADR-027.md principle one, the outcome function):
 /// the first that holds of (1) vetoed → INVALID; (2) timed out → FAIL; (3) a compliant degradation of complete
 /// evidence → DEGRADED whatever its exit code; (4) a check requiring plugins whose Pi sessions do not all list them →
-/// FAIL; (5) exit 0 → PASS; (6) exit 3 → BLOCKED; (7) FAIL. Complete evidence has no artifact missing, a duration that
-/// agrees with its interval and, for a live check, its bound sessions (M2T10D-500, -501, -600).
+/// FAIL; (5) exit 0 → PASS; (6) exit 3 → BLOCKED; (7) FAIL (NOT_STARTED, INTERRUPTED, INCOMPLETE or none). Complete
+/// evidence has no artifact missing, a duration that agrees with its interval and, for a live check, its bound sessions
+/// (M2T10D-500, -501, -600).
 pub fn outcome(e: &Evidence, verdict: &Result<(), Invalid>, world: &dyn Lookup) -> Outcome {
     let r = &e.record;
     let of = |status, reason| Outcome { status, reason };
@@ -844,6 +847,9 @@ pub fn outcome(e: &Evidence, verdict: &Result<(), Invalid>, world: &dyn Lookup) 
         127 => of(Status::Fail, Some("NOT_STARTED")),
         130 => of(Status::Fail, Some("INTERRUPTED")),
         code if code < 0 => of(Status::Fail, Some("INTERRUPTED")),
+        // Exit 0 reaches here only claiming success with a duration that disagrees with its interval (missing
+        // artifacts or sessions were vetoed): it proves nothing and a rerun can supply it (M2T10D-801).
+        0 => of(Status::Fail, Some("INCOMPLETE")),
         _ => of(Status::Fail, None),
     }
 }
