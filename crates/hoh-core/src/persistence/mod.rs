@@ -937,7 +937,8 @@ impl Store {
     }
 
     /// Run `run_id`'s supervisor step failed with `error` (docs/adr/ADR-025.md v15 decision 5): recorded as
-    /// `supervisor.step_failed` unless the run's last such record has the same error; whether it was written.
+    /// `supervisor.step_failed` unless the run already has one with this error (once per run and error); whether it was
+    /// written.
     pub async fn supervision_failed(
         &self,
         run_id: &str,

@@ -1188,3 +1188,44 @@ async fn a_cancelled_runs_unreadable_trigger_is_still_superseded() -> R {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn a_run_with_no_cursor_starts_at_its_own_first_event() -> R {
+    // M2T08R-552 (decision 2): a run whose supervisor has no cursor yet starts just before its own first event, not at
+    // the store's beginning: 25 000 events of other runs before it, its first batch has caught up.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(
+        &path,
+        &format!(
+            "{WORLD} INSERT INTO runs(run_id, project_id, spec_id, state, mode, revision, created_at) VALUES
+               ('O', 'p1', 's3', 'RUNNING', 'AUTO', 1, '2026-11-07T00:00:02Z');"
+        ),
+    )?;
+    clock.set(0);
+    for n in 0..25 {
+        store
+            .commit(Commit {
+                events: (0..1000)
+                    .map(|i| NewEvent {
+                        project_id: "p1".to_owned(),
+                        event_id: format!("other/{n}/{i}"),
+                        run_id: Some("O".to_owned()),
+                        kind: "token.delta".to_owned(),
+                        payload: json!({}),
+                    })
+                    .collect(),
+                ..Commit::default()
+            })
+            .await?;
+    }
+    events(&store, "own", &[("need_decision", json!({"task_id": "D"}))]).await?;
+    let mut conn = Connection::open(&path)?;
+    let ctx = crate::persistence::writer::Ctx::quiet();
+    assert!(
+        super::step(&mut conn, "R", &at(&clock, 100), &ctx)?.is_some(),
+        "its first batch has caught up"
+    );
+    Ok(())
+}

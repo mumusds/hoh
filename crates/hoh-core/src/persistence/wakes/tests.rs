@@ -3957,3 +3957,179 @@ async fn a_superseded_wakes_waiting_output_holds_the_horizon_until_it_is_dispose
     );
     Ok(())
 }
+
+// Implementation review round 6 (the converged round's small fixes).
+
+#[tokio::test]
+async fn a_recent_invalid_answer_stays_in_the_summary_after_the_horizon_passes_it() -> R {
+    // M2T08R-501, -551 (decision 7): a turn's invalid answer (not JSON) is among the recent rejections the next turns are
+    // shown, also once later turns have settled and the horizon has moved past its wake.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    let mut ms = 0;
+    let mut shown = Vec::new();
+    for n in 0..3 {
+        wake(&store, &clock, "R", "D", &format!("fp{n}"), ms).await?;
+        let a = store
+            .allocate_supervision("p1", context(&clock, ms + 2100))
+            .await?
+            .ok_or("allocated")?;
+        let s = store
+            .runner_waiting("p1")
+            .await?
+            .dispatches
+            .into_iter()
+            .find(|d| d.attempt_id == a.attempt_id)
+            .and_then(|d| d.assignment.supervision)
+            .ok_or("no supervision input")?;
+        shown.push(
+            s.summary["recent_rejections"]
+                .as_array()
+                .map_or(0, Vec::len),
+        );
+        let lines = if n == 0 {
+            vec!["not json".to_owned()]
+        } else {
+            Vec::new()
+        };
+        bridged_turn(&store, &clock, &a.attempt_id, ms + 2200, true, &lines).await?;
+        store.supervise("R", context(&clock, ms + 3000)).await?;
+        ms += 10_000;
+    }
+    assert!(
+        value(
+            &path,
+            "SELECT count(*) FROM events WHERE kind = 'supervisor.horizon'"
+        )?
+        .as_i64()
+        .is_some_and(|n| n >= 1)
+    );
+    assert_eq!(shown, [0, 1, 1], "the invalid answer stays recent");
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_last_settled_turns_wake_is_kept_not_the_latest_woken_wake_with_one() -> R {
+    // M2T08R-553 (v20's readers table): X (integrity) settles first, S fails, Y fails for Auth, the probe of the older S
+    // settles: the wake kept is S's (the last SETTLED turn's), not X's (woken later): no new blocking after recovery.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    let s = wake(&store, &clock, "R", "D", "s", 0).await?;
+    let x = integrity(&store, &clock, "R", "D", "x", 2100).await?;
+    clock.set(2200);
+    event(
+        &store,
+        "R",
+        "R/y",
+        "need_decision",
+        json!({"task_id": "D", "fingerprint": "y"}),
+    )
+    .await?;
+    store.supervise("R", context(&clock, 4200)).await?;
+    let xt = store
+        .allocate_supervision("p1", context(&clock, 4300))
+        .await?
+        .ok_or("X allocated")?;
+    assert_eq!(xt.wake, x);
+    run_turn(&store, &clock, &xt.attempt_id, 4300, true, TRANSIENT).await?;
+    store.supervise("R", context(&clock, 4400)).await?;
+    let st = store
+        .allocate_supervision("p1", context(&clock, 4400))
+        .await?
+        .ok_or("S allocated")?;
+    assert_eq!(st.wake, s);
+    run_turn(&store, &clock, &st.attempt_id, 4400, false, TRANSIENT).await?;
+    store.supervise("R", context(&clock, 4500)).await?;
+    let yt = store
+        .allocate_supervision("p1", context(&clock, 4500))
+        .await?
+        .ok_or("Y allocated")?;
+    run_turn(
+        &store,
+        &clock,
+        &yt.attempt_id,
+        4500,
+        false,
+        crate::retry::FailureClass::Auth,
+    )
+    .await?;
+    store.supervise("R", context(&clock, 5000)).await?;
+    store
+        .allocate_supervision("p1", context(&clock, 5000))
+        .await?;
+    assert_eq!(blocked(&path)?.0, "BLOCKED");
+    let ms = 17 * 60_000;
+    store.supervise("R", context(&clock, ms)).await?;
+    let probe = store
+        .allocate_supervision("p1", context(&clock, ms))
+        .await?
+        .ok_or("the probe")?;
+    assert_eq!(probe.wake, s, "the older S is probed");
+    run_turn(&store, &clock, &probe.attempt_id, ms + 100, true, TRANSIENT).await?;
+    store.supervise("R", context(&clock, ms + 1000)).await?;
+    store
+        .allocate_supervision("p1", context(&clock, ms + 1000))
+        .await?;
+    store.supervise("R", context(&clock, ms + 2000)).await?;
+    store.supervise("R", context(&clock, ms + 3000)).await?;
+    assert_eq!(
+        blocked(&path)?.0,
+        "RUNNING",
+        "no new failure, no new blocking"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_output_whose_disposal_fails_three_times_ends_internal() -> R {
+    // M2T08R-554 (decision 8): a disposal failing for a reason other than the data is counted (output_failed n 1, 2,
+    // 3) and the third ends the output invalid INTERNAL; the run's steps go on.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    let w = wake(&store, &clock, "R", "D", "fp", 0).await?;
+    let a = store
+        .allocate_supervision("p1", context(&clock, 3000))
+        .await?
+        .ok_or("allocated")?;
+    let nonce = nonce_of(&path, &a.attempt_id)?;
+    bridged_turn(
+        &store,
+        &clock,
+        &a.attempt_id,
+        3100,
+        true,
+        &[line(
+            &nonce,
+            output("m1", "decision", &w, &a.attempt_id, 1, assumption()),
+        )],
+    )
+    .await?;
+    exec(&path, "ALTER TABLE decisions RENAME TO decisions_away;")?;
+    for n in 0..3 {
+        store
+            .supervise("R", context(&clock, 4000 + n * 1000))
+            .await?;
+    }
+    exec(&path, "ALTER TABLE decisions_away RENAME TO decisions;")?;
+    assert_eq!(
+        value(
+            &path,
+            "SELECT json_group_array(json_extract(payload_json, '$.n')) FROM events WHERE kind = 'supervisor.output_failed'"
+        )?,
+        json!([1, 2, 3])
+    );
+    assert_eq!(
+        ends(&path)?,
+        [(
+            format!("{}/output/0", a.attempt_id),
+            "invalid:INTERNAL".to_owned()
+        )]
+    );
+    Ok(())
+}

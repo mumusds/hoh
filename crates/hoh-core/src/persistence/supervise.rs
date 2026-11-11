@@ -59,8 +59,9 @@ impl CommitTimes {
     }
 }
 
-/// How many of a run's events one batch of a step looks at at most, in one transaction and one writer job; the step
-/// goes on from the batch's cursor, a job each, until it has caught up (docs/adr/ADR-025.md decision 2, v13).
+/// How many events one batch of a step looks at at most (a window of the global seq after the run's cursor, v20), in
+/// one transaction and one writer job; the step goes on from the batch's cursor, a job each, until it has caught up
+/// (docs/adr/ADR-025.md decision 2, v13).
 const STEP: i64 = 10_000;
 
 /// A trigger fired by a step.
@@ -298,8 +299,9 @@ const STEP_FAILED: &str = "supervisor.step_failed";
 /// A run's supervision closed (v13, M2T08R-06).
 pub(super) const CLOSED: &str = "supervisor.closed";
 
-/// One batch of run `run_id`'s events after its cursor (at most [`STEP`]) taken in inside `tx`: its project, the
-/// cursor after it, and whether it reached the last event committed (a batch of fewer than STEP events).
+/// One batch of run `run_id`'s events after its cursor taken in inside `tx`: the window of the global seq after the
+/// cursor, at most [`STEP`] long (v20); its project, the cursor after it (the window's end), and whether the window
+/// reached the last event committed.
 fn take_in_batch(
     tx: &Transaction<'_>,
     run_id: &str,
@@ -324,15 +326,25 @@ fn take_in_batch(
         .and_then(Policy::named)
         .unwrap_or(Policy::Balanced);
     let now = context.now();
-    let cursor: i64 = tx
+    let cursor: Option<i64> = tx
         .query_row(
             "SELECT last_handled_seq FROM supervisor_cursor WHERE run_id = ?1",
             params![run_id],
             |r| r.get(0),
         )
         .optional()
-        .map_err(sqlite_error)?
-        .unwrap_or(0);
+        .map_err(sqlite_error)?;
+    // A run with no cursor yet starts just before its own first event, not at the store's beginning (M2T08R-552).
+    let cursor = match cursor {
+        Some(cursor) => cursor,
+        None => tx
+            .query_row(
+                "SELECT coalesce(min(seq), 1) - 1 FROM events WHERE run_id = ?1",
+                params![run_id],
+                |r| r.get(0),
+            )
+            .map_err(sqlite_error)?,
+    };
     // A batch is a window of the global seq after the cursor, at most STEP long, read by its rowid range: at most STEP
     // events looked at, and the cursor moves to the window's end even when none of them is this run's (v20,
     // M2T08R-451: by the run's index each step scanned all of the run's events).
