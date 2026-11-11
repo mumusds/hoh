@@ -572,3 +572,38 @@ fn the_policy_names_the_estimator_the_shares_the_order_and_the_rule() {
         ])
     );
 }
+
+#[test]
+fn every_built_in_contract_keeps_each_piece_and_takes_its_four_layers_once() -> R {
+    let m = Mandatory {
+        evidence: "证据强制项".to_owned(),
+        ..mandatory()
+    };
+    for role in [
+        "commander",
+        "cto",
+        "developer",
+        "qa",
+        "researcher",
+        "reviewer",
+    ] {
+        let template = crate::config::builtin_contract(role).ok_or(role)?;
+        let packed = pack(template, &m, &[], required(template, &m)?)?;
+        for piece in contract_pieces(template) {
+            assert!(
+                packed.prompt.contains(piece),
+                "{role}: contract piece missing: {piece:?}"
+            );
+        }
+        for value in [&m.goal, &m.project, &m.task, &"证据强制项".to_owned()] {
+            assert_eq!(
+                packed.prompt.matches(value.as_str()).count(),
+                1,
+                "{role}: {value}"
+            );
+        }
+        assert!(!packed.prompt.contains("{{"), "{role}: a placeholder left");
+        assert_eq!(packed.stats.total, packed.stats.mandatory, "{role}");
+    }
+    Ok(())
+}
