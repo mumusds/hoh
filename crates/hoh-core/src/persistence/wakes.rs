@@ -143,6 +143,27 @@ impl Wake {
     }
 }
 
+/// Lower-case hex of the sha256 of `bytes`.
+pub(super) fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// 32 random bytes as hex: a turn's nonce.
+fn nonce() -> Result<String, PersistError> {
+    let mut bytes = [0u8; 32];
+    let mut filled = 0;
+    while filled < bytes.len() {
+        filled +=
+            rustix::rand::getrandom(&mut bytes[filled..], rustix::rand::GetRandomFlags::empty())
+                .map_err(|e| PersistError::Storage(format!("no random bytes for a nonce: {e}")))?;
+    }
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
 /// Whether `task_id` is a supervision task (role commander).
 pub(super) fn is_supervision(tx: &Connection, task_id: &str) -> Result<bool, PersistError> {
     tx.query_row(
@@ -637,6 +658,9 @@ pub(super) fn allocate(
     }
     let lease = json!({"kind": grant.kind, "epoch": grant.epoch, "expires_at": grant.expires_at});
     let role_epoch = decide::to_i64(chosen.role_epoch, "role_epoch")?;
+    // The turn's nonce: in its dispatch notice, which a delivery after a restart gives again; the allocation keeps
+    // only its sha256 (decision 8, -266, -455).
+    let nonce = nonce()?;
     if chosen.probe {
         rearmed.events.push(NewEvent {
             project_id: chosen.project_id.clone(),
@@ -669,6 +693,7 @@ pub(super) fn allocate(
                 "run_revision": chosen.run_revision,
                 "role_epoch": role_epoch,
                 "allocated_at": rfc3339_utc(now),
+                "nonce_sha256": sha256_hex(nonce.as_bytes()),
             }),
         }])
             .collect(),
@@ -687,6 +712,7 @@ pub(super) fn allocate(
                 "lease": lease,
                 "origin": "supervision",
                 "wake": chosen.wake.id,
+                "nonce": nonce,
             }),
         }],
     };
@@ -823,7 +849,7 @@ pub(super) fn judge(
         )
         .optional()
         .map_err(sqlite_error)?;
-    let Some((binding, epoch, state, resume)) = row else {
+    let Some((binding, epoch, state, _resume)) = row else {
         return Ok(commit);
     };
     let state = writer::parse::<RunState>(&state)?;
@@ -930,13 +956,6 @@ pub(super) fn judge(
     let union = claims.reasons();
     let changed = union != before;
     commit.events.extend(claims.store(tx)?);
-    let revision: i64 = tx
-        .query_row(
-            "SELECT revision FROM runs WHERE run_id = ?1",
-            params![run_id],
-            |r| r.get(0),
-        )
-        .map_err(sqlite_error)?;
     if !desired.is_empty() && !had {
         commit.events.push(event(
             child_id(run_id, &format!("supervisor/{number}/blocked")),
@@ -944,52 +963,18 @@ pub(super) fn judge(
             json!({"reasons": reasons, "owed": owed_records}),
         ));
     }
-    if !union.is_empty() && state != RunState::Blocked {
-        let (moves, withdrawn) = super::control::withdraw(
-            tx,
-            project_id,
-            run_id,
-            &at,
-            super::control::Withdraw::Blocked,
-            ctx,
-        )?;
-        commit.cas.extend(moves);
-        commit.events.extend(withdrawn);
-        commit.cas.push(StateCas {
-            id: run_id.to_owned(),
-            expected_revision: revision,
-            change: Change::Run(RunState::Blocked),
-        });
-        commit.events.push(event(
-            child_id(run_id, &format!("blocked/{revision}")),
-            "run.blocked",
-            json!({"reasons": union.iter().map(|r| r.as_str()).collect::<Vec<_>>(), "detail": "the commander is unavailable"}),
-        ));
-    } else if state == RunState::Blocked && changed {
-        if union.is_empty() {
-            let to = resume
-                .as_deref()
-                .map(writer::parse::<RunState>)
-                .transpose()?
-                .unwrap_or(RunState::Running);
-            commit.cas.push(StateCas {
-                id: run_id.to_owned(),
-                expected_revision: revision,
-                change: Change::Unblock(to),
-            });
-            commit.events.push(event(
-                child_id(run_id, &format!("resumed/{revision}")),
-                "run.resumed",
-                json!({"from": state.as_str(), "to": to.as_str(), "due": []}),
-            ));
-        } else {
-            commit.cas.push(StateCas {
-                id: run_id.to_owned(),
-                expected_revision: revision,
-                change: Change::Touch(writer::Entity::Run),
-            });
-        }
-    }
+    let moved = super::blockers::follow(
+        tx,
+        project_id,
+        run_id,
+        changed,
+        &union,
+        &at,
+        "the commander is unavailable",
+        ctx,
+    )?;
+    commit.cas.extend(moved.cas);
+    commit.events.extend(moved.events);
     Ok(commit)
 }
 

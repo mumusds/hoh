@@ -544,18 +544,42 @@ fn effect(
     if changed != 1 {
         return Ok(false);
     }
-    let (_, _, _, run_id, project_id) = task_of(&tx, attempt_id)?;
+    let (task_id, _, _, run_id, project_id) = task_of(&tx, attempt_id)?;
     let kind = format!("effect.{}", to.as_str().to_ascii_lowercase());
+    let mut detail = detail;
+    // A supervision turn's bridge lines (docs/adr/ADR-025.md decision 8): recorded as its outputs in the transaction of
+    // its work's OBSERVED when it succeeded, else discarded; never kept in the effect's own event.
+    let messages = detail
+        .as_object_mut()
+        .and_then(|d| d.remove("messages"))
+        .and_then(|m| match m {
+            Value::Array(lines) => Some(lines),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let mut events = vec![event(
+        &project_id,
+        &run_id,
+        child_id(key, &kind),
+        &kind,
+        json!({"effect_key": key, "attempt_id": attempt_id, "from": from.as_str(), "detail": detail}),
+    )];
+    if to == EffectState::Observed
+        && key == crate::reconcile::work_key(attempt_id)
+        && super::wakes::is_supervision(&tx, &task_id)?
+    {
+        events.extend(super::outputs::recorded(
+            &project_id,
+            &run_id,
+            attempt_id,
+            detail["success"] == json!(true),
+            &messages,
+        ));
+    }
     writer::write(
         &tx,
         &Commit {
-            events: vec![event(
-                &project_id,
-                &run_id,
-                child_id(key, &kind),
-                &kind,
-                json!({"effect_key": key, "attempt_id": attempt_id, "from": from.as_str(), "detail": detail}),
-            )],
+            events,
             ..Commit::default()
         },
         ctx,
