@@ -67,8 +67,11 @@ with (out / 'test-results.jsonl').open('a', encoding='utf-8') as results:
         print(f"adapter-live: {agent}: {status}: {v.get('detail', '')}", file=sys.stderr)
 candidate = os.environ.get('HOH_CANDIDATE_ID')
 if sessions and candidate:
-    (out / 'live-sessions.json').write_text(json.dumps({'schema_version': '1.0', 'check_id': os.environ.get('HOH_CHECK_ID', 'adapter-live'),
-                                                        'harness_candidate_id': candidate, 'sessions': sessions}, indent=1))
+    # Whole or not at all (docs/adr/ADR-027.md M2T10D-752): a run killed mid-write leaves no half document.
+    staged = out / '.live-sessions.json.tmp'
+    staged.write_text(json.dumps({'schema_version': '1.0', 'check_id': os.environ.get('HOH_CHECK_ID', 'adapter-live'),
+                                  'harness_candidate_id': candidate, 'sessions': sessions}, indent=1))
+    os.replace(staged, out / 'live-sessions.json')
 sys.exit(1 if any(s not in ('PASS', 'BLOCKED', 'NOT_RUN') for s in statuses)
          else 3 if {'BLOCKED', 'NOT_RUN'} & set(statuses) else 0)
 PY

@@ -30,6 +30,9 @@ pub struct Recording {
     pub reasons: Vec<&'static str>,
     pub tree_before: Value,
     pub tree_after: Value,
+    /// The clocks the run was measured by: its wall-clock finish and its monotonic seconds (the record's finish is its
+    /// start plus those seconds, docs/adr/ADR-027.md decision 6).
+    pub clock: Value,
     pub observations: Vec<Value>,
     pub rows: Vec<AcceptanceRow>,
     /// The post-check's reasons when the source or the candidate changed during the check (decision 7).
@@ -138,7 +141,7 @@ pub(super) fn record(
         json!({
             "evidence_id": r.record_id, "record_id": r.record_id, "attempt_id": attempt, "check_id": r.check_id,
             "outcome": job.outcome.status.code(), "outcome_reason": job.outcome.reason,
-            "tree_before": job.tree_before, "tree_after": job.tree_after,
+            "tree_before": job.tree_before, "tree_after": job.tree_after, "clock": job.clock,
             "observations": job.observations, "reasons": job.reasons,
             "artifacts": objects.iter().map(ArtifactRow::json).collect::<Vec<_>>(),
         }),

@@ -101,6 +101,8 @@ struct World {
     files: Vec<(String, String)>,
     candidates: Vec<(String, String)>,
     overlapping: Vec<String>,
+    /// Record ids another record directory uses too.
+    reused: Vec<String>,
     plan: Vec<(String, Planned)>,
     sessions: Vec<(String, Value)>,
     /// `None`: the candidate has no release policy.
@@ -138,6 +140,10 @@ impl Lookup for World {
 
     fn inside(&self, path: &str, dir: &str) -> bool {
         !path.split('/').any(|s| s == "..") && std::path::Path::new(path).starts_with(dir)
+    }
+
+    fn record_id_reused(&self, record_id: &str, _record_dir: &str) -> bool {
+        self.reused.iter().any(|r| r == record_id)
     }
 
     fn overlaps(&self, dir: &str) -> bool {
@@ -243,6 +249,7 @@ fn world0(c: &Sealed, e: &Evidence) -> World {
         files,
         candidates: vec![(r.candidate_manifest.path.clone(), c.candidate_id.clone())],
         overlapping: Vec::new(),
+        reused: Vec::new(),
         plan: vec![(
             r.check_id.clone(),
             Planned {
@@ -375,6 +382,11 @@ fn every_rule_the_gate_applies_to_one_record_has_a_reason_of_its_own() -> R {
     type Tamper = fn(&mut Evidence, &mut World);
     let variants: [(&str, Tamper, Reason); 23] = [
         (
+            "a record id another record directory uses",
+            |e, w| w.reused.push(e.record.record_id.clone()),
+            Reason::RecordIdReused,
+        ),
+        (
             "a result line not of the schema's shape",
             |e, _| {
                 e.observations
@@ -439,11 +451,6 @@ fn every_rule_the_gate_applies_to_one_record_has_a_reason_of_its_own() -> R {
             "candidate manifest of another candidate",
             |_, w| w.candidates[0].1 = format!("CAND-{}", "0".repeat(64)),
             Reason::ManifestMismatch,
-        ),
-        (
-            "duration",
-            |e, _| e.record.duration_seconds = 100.0,
-            Reason::DurationMismatch,
         ),
         (
             "runner tool",
@@ -667,14 +674,20 @@ fn a_run_that_does_not_claim_success_may_lack_its_artifacts_observations_and_dur
         e.record.duration_seconds = 0.0;
         assert_eq!(valid(&e, &c, &s, &w), Ok(()), "exit {exit}");
     }
-    // Claiming success, each is a veto.
+    // A duration that disagrees never vetoes, not even a record claiming success (a clock changed or the host
+    // slept): the record is incomplete, so it satisfies nothing (rule 9, M2T10D-701, -655).
     let mut e = e0(&c);
     let w = world0(&c, &e);
     e.record.finished_at = "2026-11-11T10:00:30Z".to_owned();
     e.record.duration_seconds = 0.0;
+    let verdict = valid(&e, &c, &s, &w);
+    assert_eq!(verdict, Ok(()));
+    let o = outcome(&e, &verdict, &w);
+    assert_ne!(o.status.code(), "PASS");
     assert_eq!(
-        valid(&e, &c, &s, &w).map_err(|i| i.codes()),
-        Err(vec!["DURATION_MISMATCH"])
+        conclude(&e, &o, "TEST-052-04", true, false, false),
+        None,
+        "its PASS line proves nothing"
     );
     Ok(())
 }
@@ -699,11 +712,24 @@ fn the_outcome_is_the_first_of_the_ordered_rules_that_holds() -> R {
         status(outcome_of(&e, &w0)),
         ("INVALID", Some("INSUFFICIENT"))
     );
-    // Exit codes.
-    for (exit, expected) in [(0, "PASS"), (3, "BLOCKED"), (1, "FAIL"), (101, "FAIL")] {
+    // Exit codes; a run that did not start, was interrupted or killed by a signal fails for a reason that is no test
+    // failure (M2T10D-753).
+    for (exit, expected, reason) in [
+        (0, "PASS", None),
+        (3, "BLOCKED", None),
+        (1, "FAIL", None),
+        (101, "FAIL", None),
+        (127, "FAIL", Some("NOT_STARTED")),
+        (130, "FAIL", Some("INTERRUPTED")),
+        (-15, "FAIL", Some("INTERRUPTED")),
+    ] {
         let mut e = base.clone();
         e.record.exit_code = exit;
-        assert_eq!(outcome_of(&e, &w0).status.code(), expected, "exit {exit}");
+        assert_eq!(
+            status(outcome_of(&e, &w0)),
+            (expected, reason),
+            "exit {exit}"
+        );
     }
     // A compliant degradation is DEGRADED whatever the exit code, never after a timeout, never with an artifact
     // missing.
@@ -756,6 +782,18 @@ fn the_outcome_is_the_first_of_the_ordered_rules_that_holds() -> R {
     assert_eq!(outcome_of(&e, &wd).status.code(), "DEGRADED");
     e.observations = vec![degraded("TEST-048-01"), line("TEST-049-01", "FAIL")];
     assert_eq!(outcome_of(&e, &wd).status.code(), "BLOCKED");
+    // A degradation's diagnostic is a non-empty output of the record: with stdout, stderr and every artifact empty it
+    // has none, so it is not compliant (rule 14, M2T10D-704).
+    let empty = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_owned();
+    let mut bare = base.clone();
+    bare.record.exit_code = 3;
+    bare.observations = vec![degraded("TEST-048-01")];
+    bare.record.stdout.sha256 = empty.clone();
+    bare.record.stderr.sha256 = empty.clone();
+    bare.record.artifacts[0].sha256 = empty.clone();
+    let mut we = world0(&c, &bare);
+    we.policy = degradable_policy();
+    assert_eq!(outcome_of(&bare, &we).status.code(), "BLOCKED");
     // Not compliant: a check the policy does not let degrade, or a DEGRADED line without its basis.
     let mut e = base.clone();
     e.record.exit_code = 3;
