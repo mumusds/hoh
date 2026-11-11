@@ -145,6 +145,8 @@ pub struct Context {
     pub wall: Option<std::time::SystemTime>,
     /// `execution.reader_slots` (REQ-037; `None`: the initial value 2).
     pub reader_slots: Option<u32>,
+    /// `execution.reserve_supervisor_slot` (docs/adr/ADR-025.md decision 3; `None`: the initial value true).
+    pub reserve_supervisor_slot: Option<bool>,
 }
 
 impl Context {
@@ -163,6 +165,10 @@ impl Context {
 
     pub fn reader_slots(&self) -> u32 {
         self.reader_slots.unwrap_or(Self::READER_SLOTS)
+    }
+
+    pub fn reserve_supervisor_slot(&self) -> bool {
+        self.reserve_supervisor_slot.unwrap_or(true)
     }
 }
 

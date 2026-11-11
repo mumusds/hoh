@@ -92,6 +92,11 @@ pub(super) enum RunnerJob {
         run_id: String,
         context: Box<crate::decision::Context>,
     },
+    /// One owed wake of a project given a Commander turn, if one can be (docs/adr/ADR-025.md decision 3).
+    Allocate {
+        project_id: String,
+        context: Box<crate::decision::Context>,
+    },
     /// One look at a run as a whole (ADR-020 decisions 4, 5 and 7).
     Pace {
         run_id: String,
@@ -123,6 +128,7 @@ pub(super) enum RunnerDone {
     Renewed(usize),
     Paced(super::retry::Paced),
     Supervised(super::supervise::Supervised),
+    Allocated(Option<super::wakes::Allocated>),
     Repair(super::retry::RepairVerdict),
 }
 
@@ -219,6 +225,10 @@ pub(super) fn run(
         RunnerJob::Repair(request) => {
             super::retry::request_repair(conn, &request, ctx).map(RunnerDone::Repair)
         }
+        RunnerJob::Allocate {
+            project_id,
+            context,
+        } => super::wakes::allocate(conn, &project_id, &context, ctx).map(RunnerDone::Allocated),
         RunnerJob::Supervise { run_id, context } => {
             super::supervise::step(conn, &run_id, &context, ctx).map(RunnerDone::Supervised)
         }

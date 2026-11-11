@@ -428,7 +428,7 @@ pub(super) fn pace(
             "SELECT t.task_id, t.state, t.revision, t.role, t.next_retry_at, t.blocked_reason, \
              (SELECT count(*) FROM task_dependencies d JOIN tasks u ON u.task_id = d.depends_on \
               WHERE d.task_id = t.task_id AND u.state <> 'ACCEPTED') \
-             FROM tasks t WHERE t.run_id = ?1 ORDER BY t.created_seq, t.task_id",
+             FROM tasks t WHERE t.run_id = ?1 AND t.role <> 'commander' ORDER BY t.created_seq, t.task_id",
         )
         .map_err(sqlite_error)?;
     let mut tasks = Vec::new();
@@ -482,12 +482,14 @@ pub(super) fn pace(
         change: Change::Run(to),
     };
     let stop = budget::stop(&budget, context.wall());
-    let unfinished: i64 = tx
+    // Two counts of the attempts not ended (docs/adr/ADR-025.md decision 3): every one, supervision turns too, for a
+    // budget stop, which waits for them; the work attempts only for whether the run can move on or only waits.
+    let (unfinished, unfinished_work): (i64, i64) = tx
         .query_row(
-            "SELECT count(*) FROM attempts a JOIN tasks t ON t.task_id = a.task_id WHERE t.run_id = ?1 \
-             AND a.state IN ('PREPARED', 'STARTING', 'RUNNING')",
+            "SELECT count(*), count(*) FILTER (WHERE t.role <> 'commander') FROM attempts a \
+             JOIN tasks t ON t.task_id = a.task_id WHERE t.run_id = ?1 AND a.state IN ('PREPARED', 'STARTING', 'RUNNING')",
             params![run_id],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .map_err(sqlite_error)?;
     let back = |resume: &Option<String>| -> Result<RunState, PersistError> {
@@ -558,7 +560,7 @@ pub(super) fn pace(
         let any_due = tasks.iter().any(due);
         let any_waiting = tasks.iter().any(waiting);
         // Stalled: nothing runs, nothing is in flight, nothing is due and nothing waits for a retry.
-        let stalled = unfinished == 0 && !in_flight && !any_due && !any_waiting;
+        let stalled = unfinished_work == 0 && !in_flight && !any_due && !any_waiting;
         let mut claims = blockers::Claims::load(&tx, &project_id, run_id)?;
         let unenforceable = budget::unenforceable(&budget);
         claims.set(
@@ -644,7 +646,7 @@ pub(super) fn pace(
                 paced.woke = true;
             }
         } else if working
-            && unfinished == 0
+            && unfinished_work == 0
             && !in_flight
             && !any_due
             && let Some(next) = tasks
