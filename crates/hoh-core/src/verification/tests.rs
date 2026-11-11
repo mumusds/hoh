@@ -92,3 +92,146 @@ fn a_sealed_manifest_reads_back_and_a_forged_or_misshapen_export_is_refused() ->
     assert!(Sealed::from_value(&empty).is_err());
     Ok(())
 }
+
+/// What the checks are judged against: the files and attempts a test world knows.
+struct World {
+    attempts: Vec<String>,
+    files: Vec<(String, String)>,
+}
+
+impl Lookup for World {
+    fn attempt_exists(&self, attempt_id: &str) -> bool {
+        self.attempts.iter().any(|a| a == attempt_id)
+    }
+
+    fn sha256_of(&self, path: &str) -> Option<String> {
+        self.files
+            .iter()
+            .find(|(p, _)| p == path)
+            .map(|(_, s)| s.clone())
+    }
+}
+
+fn e0(c: &Sealed) -> Evidence {
+    let m = &c.manifest;
+    Evidence {
+        check_id: "unit".to_owned(),
+        candidate_id: c.candidate_id.clone(),
+        git_tree: m.git_tree.clone(),
+        spec_sha256: m.spec.sha256.clone(),
+        environment_sha256: m.environment.sha256.clone(),
+        test_plan_sha256: m.test_plan.sha256.clone(),
+        started_at: "2026-11-11T10:00:00Z".to_owned(),
+        finished_at: "2026-11-11T10:00:05Z".to_owned(),
+        source_unchanged: true,
+        stdout: file(".hoh/evidence/C/unit/r1/stdout.log", 9),
+        missing_artifacts: Vec::new(),
+        producer_attempt_id: "T1/attempt-1".to_owned(),
+        observations: vec![json!({"test_id": "TEST-052-04", "status": "PASS"})],
+    }
+}
+
+#[test]
+fn test_052_04_evidence_is_valid_only_when_every_binding_holds() -> R {
+    // AC-052-04 (REQ-052 behaviour 7, docs/adr/ADR-027.md decision 5): e0 valid; each of the 11 tampered aspects not
+    // valid, observations=[] for INSUFFICIENT, the others INVALID, each with its own reason code.
+    let c = manifest().seal();
+    let s = c.manifest.spec.sha256.clone();
+    let base = e0(&c);
+    let world = World {
+        attempts: vec![base.producer_attempt_id.clone()],
+        files: vec![(base.stdout.path.clone(), base.stdout.sha256.clone())],
+    };
+    assert_eq!(valid(&base, &c, &s, &world), Ok(()));
+    type Tamper = fn(&mut Evidence);
+    let variants: [(&str, Tamper, &str, &str); 11] = [
+        (
+            "candidate_id",
+            |e| e.candidate_id = format!("CAND-{}", "0".repeat(64)),
+            "INVALID",
+            "CANDIDATE_MISMATCH",
+        ),
+        (
+            "git_tree",
+            |e| e.git_tree = "e".repeat(40),
+            "INVALID",
+            "TREE_MISMATCH",
+        ),
+        (
+            "spec_sha256",
+            |e| e.spec_sha256 = "0".repeat(64),
+            "INVALID",
+            "SPEC_MISMATCH",
+        ),
+        (
+            "environment_sha256",
+            |e| e.environment_sha256 = "0".repeat(64),
+            "INVALID",
+            "ENVIRONMENT_MISMATCH",
+        ),
+        (
+            "test_plan_sha256",
+            |e| e.test_plan_sha256 = "0".repeat(64),
+            "INVALID",
+            "TEST_PLAN_MISMATCH",
+        ),
+        (
+            "observations",
+            |e| e.observations.clear(),
+            "INSUFFICIENT",
+            "NO_OBSERVATIONS",
+        ),
+        (
+            "producer attempt",
+            |e| e.producer_attempt_id = "nobody".to_owned(),
+            "INVALID",
+            "PRODUCER_MISSING",
+        ),
+        (
+            "finished_at < started_at",
+            |e| e.finished_at = "2026-11-11T09:59:59Z".to_owned(),
+            "INVALID",
+            "INTERVAL_INVALID",
+        ),
+        (
+            "source_unchanged",
+            |e| e.source_unchanged = false,
+            "INVALID",
+            "SOURCE_CHANGED",
+        ),
+        (
+            "stdout sha256",
+            |e| e.stdout.sha256 = "0".repeat(64),
+            "INVALID",
+            "OUTPUT_CHANGED",
+        ),
+        (
+            "missing_artifacts",
+            |e| e.missing_artifacts = vec!["report.json".to_owned()],
+            "INVALID",
+            "ARTIFACT_MISSING",
+        ),
+    ];
+    let mut table = Vec::new();
+    for (aspect, tamper, class, code) in variants {
+        let mut e = base.clone();
+        tamper(&mut e);
+        let got = valid(&e, &c, &s, &world);
+        let Err(invalid) = &got else {
+            return Err(format!("{aspect}: valid").into());
+        };
+        assert_eq!(
+            (invalid.class, invalid.reasons.as_slice()),
+            (class, &[code][..]),
+            "{aspect}"
+        );
+        table.push(json!({"aspect": aspect, "class": invalid.class, "reasons": invalid.reasons}));
+    }
+    if let Some(dir) = std::env::var_os("HOH_EVIDENCE_DIR") {
+        std::fs::write(
+            std::path::Path::new(&dir).join("test_052_04-table.json"),
+            serde_json::to_vec_pretty(&json!({"e0": "valid", "variants": table}))?,
+        )?;
+    }
+    Ok(())
+}

@@ -192,5 +192,94 @@ impl Sealed {
     }
 }
 
+/// A check's result as evidence (REQ-052 behaviour 6; docs/adr/ADR-027.md decision 5): its execution record's
+/// bindings, the git tree it observed, and its observations (test-result lines or AC observations).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Evidence {
+    pub check_id: String,
+    pub candidate_id: String,
+    pub git_tree: String,
+    pub spec_sha256: String,
+    pub environment_sha256: String,
+    pub test_plan_sha256: String,
+    pub started_at: String,
+    pub finished_at: String,
+    pub source_unchanged: bool,
+    pub stdout: FileRef,
+    pub missing_artifacts: Vec<String>,
+    pub producer_attempt_id: String,
+    pub observations: Vec<Value>,
+}
+
+/// What evidence is judged against beyond the candidate: whether its producer attempt exists, and the sha256 of a
+/// file it names now.
+pub trait Lookup {
+    fn attempt_exists(&self, attempt_id: &str) -> bool;
+    fn sha256_of(&self, path: &str) -> Option<String>;
+}
+
+/// Why evidence does not count: its class (`INSUFFICIENT` when it observed nothing, else `INVALID`; the evidence
+/// outcome is INVALID either way, REQ-052 decision 3) and every reason found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Invalid {
+    pub class: &'static str,
+    pub reasons: Vec<&'static str>,
+}
+
+/// Whether evidence `e` counts for candidate `c` under spec `s` (REQ-052 behaviour 7): every binding matches, it
+/// observed something, its producer attempt exists, its interval is sound, its source was unchanged, its output is
+/// what it recorded and none of its declared artifacts is missing.
+pub fn valid(e: &Evidence, c: &Sealed, s: &str, world: &dyn Lookup) -> Result<(), Invalid> {
+    let m = &c.manifest;
+    let mut reasons = Vec::new();
+    if e.candidate_id != c.candidate_id {
+        reasons.push("CANDIDATE_MISMATCH");
+    }
+    if e.git_tree != m.git_tree {
+        reasons.push("TREE_MISMATCH");
+    }
+    if e.spec_sha256 != s || s != m.spec.sha256 {
+        reasons.push("SPEC_MISMATCH");
+    }
+    if e.environment_sha256 != m.environment.sha256 {
+        reasons.push("ENVIRONMENT_MISMATCH");
+    }
+    if e.test_plan_sha256 != m.test_plan.sha256 {
+        reasons.push("TEST_PLAN_MISMATCH");
+    }
+    if !world.attempt_exists(&e.producer_attempt_id) {
+        reasons.push("PRODUCER_MISSING");
+    }
+    let interval = crate::time::parse_rfc3339(&e.started_at)
+        .zip(crate::time::parse_rfc3339(&e.finished_at))
+        .is_some_and(|(start, end)| end >= start);
+    if !interval {
+        reasons.push("INTERVAL_INVALID");
+    }
+    if !e.source_unchanged {
+        reasons.push("SOURCE_CHANGED");
+    }
+    if world.sha256_of(&e.stdout.path).as_deref() != Some(e.stdout.sha256.as_str()) {
+        reasons.push("OUTPUT_CHANGED");
+    }
+    if !e.missing_artifacts.is_empty() {
+        reasons.push("ARTIFACT_MISSING");
+    }
+    if e.observations.is_empty() {
+        reasons.push("NO_OBSERVATIONS");
+    }
+    match reasons.as_slice() {
+        [] => Ok(()),
+        ["NO_OBSERVATIONS"] => Err(Invalid {
+            class: "INSUFFICIENT",
+            reasons,
+        }),
+        _ => Err(Invalid {
+            class: "INVALID",
+            reasons,
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests;
