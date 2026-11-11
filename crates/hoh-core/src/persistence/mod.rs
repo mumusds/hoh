@@ -32,7 +32,7 @@ mod runner;
 mod supervise;
 mod team;
 mod wakes;
-pub use candidates::{Freeze, Frozen};
+pub use candidates::{CandidateRow, Freeze, Frozen};
 pub use control::{CancelPass, Finished, PauseStep};
 pub use handover::SessionStart;
 pub use leases::{Grant, LEASE_TTL, LeaseView};
@@ -1548,6 +1548,19 @@ impl Reader {
 
     /// What a verification turn's context is packed from, given its handover package (docs/adr/ADR-026.md decisions 3
     /// and 10): the collector M2-T16's QA and Reviewer dispatch packs with.
+    /// The candidate `candidate_id`'s row (docs/adr/ADR-027.md decision 6: what a check is checked against).
+    pub fn candidate(&self, candidate_id: &str) -> Result<Option<CandidateRow>, PersistError> {
+        candidates::candidate(&self.conn, candidate_id)
+    }
+
+    /// The attempt `attempt_id`'s run and task role: who may produce evidence (docs/adr/ADR-027.md principle two).
+    pub fn producer(
+        &self,
+        attempt_id: &str,
+    ) -> Result<Option<crate::verification::Producer>, PersistError> {
+        candidates::producer(&self.conn, attempt_id)
+    }
+
     pub fn verification_context(
         &self,
         package: &crate::protocol::ContextHandoff,

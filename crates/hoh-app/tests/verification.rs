@@ -1,0 +1,622 @@
+//! Frozen candidates in the product (REQ-052; docs/adr/ADR-027.md decisions 3 to 5): the freeze driver against real
+//! git repositories and a real store.
+
+// No SQLite outside hoh-core::persistence (AC-062-05; see clippy.toml), and no unsafe code (no FFI way around it).
+#![forbid(clippy::disallowed_methods)]
+#![forbid(unsafe_code)]
+
+use hoh_app::verify::check::{CheckError, Request, pre_check};
+use hoh_app::verify::freeze::{FreezeError, Inputs, freeze};
+use hoh_core::persistence::selftest::{PROBE_ARG, ProbeCommand};
+use hoh_core::persistence::{Frozen, Options, Store};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Duration;
+
+type R<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+/// `git` in `dir` (a test's own repository, no user configuration), its stdout.
+fn git(dir: &Path, args: &[&str]) -> R<String> {
+    let out = Command::new("git")
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "protocol.file.allow=always",
+        ])
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()?;
+    if !out.status.success() {
+        return Err(format!("git {args:?}: {}", String::from_utf8_lossy(&out.stderr)).into());
+    }
+    Ok(String::from_utf8(out.stdout)?)
+}
+
+/// The product binary's WAL self-test probe.
+fn probe() -> ProbeCommand {
+    ProbeCommand {
+        program: env!("CARGO_BIN_EXE_hoh").into(),
+        args: vec![PROBE_ARG.into()],
+        env: Vec::new(),
+        answer_timeout: Duration::from_secs(10),
+    }
+}
+
+/// The fixture's frozen check plan: `unit` runs in the product, `pack` is a bundle check the product refuses.
+const PLAN: &str = r#"{"schema_version": "1.0", "plan_id": "fixture", "checks": {
+  "unit": {"mode": "product", "argv": ["bash", "-c", "touch sentinel"]},
+  "pack": {"mode": "bundle", "argv": ["true"]}}}
+"#;
+
+/// A clean repository with three committed sources and its spec, environment and test plan files (AC-052-01's
+/// fixture), a store under its `.hoh/` holding run R (and run S), and the inputs.
+struct Fixture {
+    dir: tempfile::TempDir,
+    store: Store,
+    inputs: Inputs,
+}
+
+impl Fixture {
+    async fn new() -> R<Fixture> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        git(root, &["init", "-q"])?;
+        for (path, text) in [
+            ("src/a.rs", "pub fn a() {}\n"),
+            ("src/b.rs", "pub fn b() {}\n"),
+            ("src/c.rs", "pub fn c() {}\n"),
+            ("contracts/requirements.json", "{\"requirements\": []}\n"),
+            ("environment.json", "{\"os\": \"linux\"}\n"),
+            ("tests/check-plan.json", PLAN),
+        ] {
+            let file = root.join(path);
+            std::fs::create_dir_all(file.parent().ok_or("no parent")?)?;
+            std::fs::write(file, text)?;
+        }
+        git(root, &["add", "."])?;
+        git(root, &["commit", "-q", "-m", "fixture"])?;
+        let state = root.join(".hoh");
+        hoh_core::state_dir::ensure(&state)?;
+        let options = Options {
+            wal_probe: Some(probe()),
+            ..Options::default()
+        };
+        let store = Store::open(&state.join("state.db"), options)?;
+        let repo = root.to_string_lossy().into_owned();
+        store.scratch_task("p1", &repo, "R", "T").await?;
+        Ok(Fixture {
+            dir,
+            store,
+            inputs: Inputs {
+                spec: "contracts/requirements.json".into(),
+                environment: "environment.json".into(),
+                test_plan: "tests/check-plan.json".into(),
+            },
+        })
+    }
+
+    fn root(&self) -> &Path {
+        self.dir.path()
+    }
+
+    fn state(&self) -> PathBuf {
+        self.dir.path().join(".hoh")
+    }
+
+    async fn freeze(&self, run: &str) -> Result<Frozen, FreezeError> {
+        freeze(&self.store, self.root(), &self.state(), run, &self.inputs).await
+    }
+
+    /// Every candidate row as `id run state`, by Python's sqlite3 (test code: the product writes only in
+    /// persistence).
+    fn candidates(&self) -> R<Vec<String>> {
+        let out = Command::new("python3")
+            .args([
+                "-c",
+                "import sqlite3,sys\n\
+                 c=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True)\n\
+                 for r in c.execute('SELECT candidate_id, run_id, state FROM candidates ORDER BY 1'):print(*r)",
+            ])
+            .arg(self.state().join("state.db"))
+            .output()?;
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).into_owned().into());
+        }
+        Ok(String::from_utf8(out.stdout)?
+            .lines()
+            .map(str::to_owned)
+            .collect())
+    }
+}
+
+impl Fixture {
+    /// Run `sql` on the project's database: the test's own fixture rows (Python's sqlite3, like host.rs's seeds).
+    fn seed(&self, sql: &str) -> R {
+        let out = Command::new("python3")
+            .args([
+                "-c",
+                "import sqlite3,sys\nc=sqlite3.connect(sys.argv[1])\nc.executescript(sys.argv[2])\nc.commit()",
+            ])
+            .arg(self.state().join("state.db"))
+            .arg(sql)
+            .output()?;
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).into_owned().into());
+        }
+        Ok(())
+    }
+
+    /// Run R's qa task Q with attempt `Q/attempt-1`, and a developer task D with attempt `D/attempt-1`.
+    fn seed_attempts(&self) -> R {
+        self.seed(
+            "INSERT INTO tasks(task_id, run_id, spec_id, state, role, created_seq)
+               SELECT 'Q', 'R', spec_id, 'RUNNING', 'qa', 2 FROM runs WHERE run_id = 'R';
+             INSERT INTO tasks(task_id, run_id, spec_id, state, role, created_seq)
+               SELECT 'D', 'R', spec_id, 'RUNNING', 'developer', 3 FROM runs WHERE run_id = 'R';
+             INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision) VALUES
+               ('Q/attempt-1', 'Q', 'RUNNING', 1, 1, 1), ('D/attempt-1', 'D', 'RUNNING', 1, 1, 1);",
+        )
+    }
+
+    /// A check of `check_id` with `argv` by `producer` on candidate `candidate_id`, pre-checked.
+    fn pre_check(
+        &self,
+        candidate_id: &str,
+        check_id: &str,
+        argv: &[&str],
+        producer: &str,
+    ) -> R<Result<hoh_app::verify::check::Ready, CheckError>> {
+        let reader = self.store.reader()?;
+        Ok(pre_check(
+            &reader,
+            self.root(),
+            &self.state(),
+            &Request {
+                candidate_id: candidate_id.to_owned(),
+                check_id: check_id.to_owned(),
+                argv: argv.iter().map(|a| (*a).to_owned()).collect(),
+                producer_attempt_id: producer.to_owned(),
+            },
+        ))
+    }
+}
+
+const ARGV: &[&str] = &["bash", "-c", "touch sentinel"];
+
+/// The new candidate's id of a freeze.
+fn new_id(frozen: Frozen) -> R<String> {
+    match frozen {
+        Frozen::New { candidate_id, .. } => Ok(candidate_id),
+        other => Err(format!("not new: {other:?}").into()),
+    }
+}
+
+fn check_refused(result: Result<hoh_app::verify::check::Ready, CheckError>) -> R<Vec<String>> {
+    match result {
+        Err(CheckError::Refused(reasons)) => Ok(reasons),
+        other => Err(format!("not refused: {other:?}").into()),
+    }
+}
+
+#[tokio::test]
+async fn a_check_on_its_frozen_candidate_by_a_qa_attempt_is_cleared_to_run() -> R {
+    // The positive control of the pre-check (docs/adr/ADR-027.md decision 6).
+    let f = Fixture::new().await?;
+    f.seed_attempts()?;
+    let id = new_id(f.freeze("R").await?)?;
+    let ready = f
+        .pre_check(&id, "unit", ARGV, "Q/attempt-1")?
+        .map_err(|e| format!("{e:?}"))?;
+    assert_eq!(ready.run_id, "R");
+    assert_eq!(ready.sealed.candidate_id, id);
+    assert_eq!(ready.planned.argv, ARGV);
+    assert_eq!(ready.planned.mode, "product");
+    assert_eq!(ready.planned.cwd, ".");
+    Ok(())
+}
+
+#[tokio::test]
+async fn every_difference_from_the_frozen_candidate_is_named_before_anything_runs() -> R {
+    // REQ-052 behaviour 4, failure modes 3, 4 and 6 (docs/adr/ADR-027.md decision 6, principle two): each variant is
+    // refused with its own named reason; the sentinel the check would create never appears.
+    type Change = fn(&Fixture) -> R;
+    /// A case: its name, the change after the freeze, the check, its argv, the producer, and the reason it names.
+    type Variant = (
+        &'static str,
+        Change,
+        &'static str,
+        &'static [&'static str],
+        &'static str,
+        &'static str,
+    );
+    let variants: [Variant; 10] = [
+        (
+            "test plan changed by a byte",
+            |f| {
+                let plan = f.root().join("tests/check-plan.json");
+                let mut text = std::fs::read_to_string(&plan)?;
+                text.push(' ');
+                Ok(std::fs::write(plan, text)?)
+            },
+            "unit",
+            ARGV,
+            "Q/attempt-1",
+            "test_plan_sha256 mismatch",
+        ),
+        (
+            "argv not the plan's",
+            |_| Ok(()),
+            "unit",
+            &["bash", "-c", "true"],
+            "Q/attempt-1",
+            "argv differs from the frozen plan",
+        ),
+        (
+            "check not in the plan",
+            |_| Ok(()),
+            "lint",
+            ARGV,
+            "Q/attempt-1",
+            "not in the frozen plan",
+        ),
+        (
+            "a bundle check",
+            |_| Ok(()),
+            "pack",
+            &["true"],
+            "Q/attempt-1",
+            "bundle",
+        ),
+        (
+            "spec changed",
+            |f| {
+                Ok(std::fs::write(
+                    f.root().join("contracts/requirements.json"),
+                    "{}
+",
+                )?)
+            },
+            "unit",
+            ARGV,
+            "Q/attempt-1",
+            "spec_sha256 mismatch",
+        ),
+        (
+            "a new commit",
+            |f| {
+                std::fs::write(
+                    f.root().join("src/a.rs"),
+                    "pub fn a() { 1; }
+",
+                )?;
+                git(f.root(), &["commit", "-q", "-am", "next"])?;
+                Ok(())
+            },
+            "unit",
+            ARGV,
+            "Q/attempt-1",
+            "checkout changed",
+        ),
+        (
+            "an untracked file",
+            |f| {
+                Ok(std::fs::write(
+                    f.root().join("new.txt"),
+                    "x
+",
+                )?)
+            },
+            "unit",
+            ARGV,
+            "Q/attempt-1",
+            "worktree dirty",
+        ),
+        (
+            "the developer as producer",
+            |_| Ok(()),
+            "unit",
+            ARGV,
+            "D/attempt-1",
+            "PRODUCER_NOT_INDEPENDENT",
+        ),
+        (
+            "no such producer",
+            |_| Ok(()),
+            "unit",
+            ARGV,
+            "nobody",
+            "PRODUCER_MISSING",
+        ),
+        (
+            "a source changed under assume-unchanged",
+            |f| {
+                git(
+                    f.root(),
+                    &["update-index", "--assume-unchanged", "src/b.rs"],
+                )?;
+                Ok(std::fs::write(
+                    f.root().join("src/b.rs"),
+                    "pub fn b() { 2; }
+",
+                )?)
+            },
+            "unit",
+            ARGV,
+            "Q/attempt-1",
+            "src/b.rs",
+        ),
+    ];
+    for (case, change, check, argv, producer, named) in variants {
+        let f = Fixture::new().await?;
+        f.seed_attempts()?;
+        let id = new_id(f.freeze("R").await?)?;
+        change(&f)?;
+        let reasons = check_refused(f.pre_check(&id, check, argv, producer)?)?;
+        assert!(
+            reasons.iter().any(|r| r.contains(named)),
+            "{case}: {reasons:?}"
+        );
+        assert!(!f.root().join("sentinel").exists(), "{case}");
+    }
+    // An environment under .hoh/ changed after the freeze (failure mode 3).
+    let mut f = Fixture::new().await?;
+    f.seed_attempts()?;
+    std::fs::write(f.state().join("environment.json"), "{\"os\": \"linux\"}\n")?;
+    f.inputs.environment = ".hoh/environment.json".into();
+    let id = new_id(f.freeze("R").await?)?;
+    std::fs::write(f.state().join("environment.json"), "{\"os\": \"other\"}\n")?;
+    let reasons = check_refused(f.pre_check(&id, "unit", ARGV, "Q/attempt-1")?)?;
+    assert!(
+        reasons
+            .iter()
+            .any(|r| r.contains("environment_sha256 mismatch")),
+        "{reasons:?}"
+    );
+    // A producer of another run.
+    let f = Fixture::new().await?;
+    f.seed_attempts()?;
+    let id = new_id(f.freeze("R").await?)?;
+    f.seed(
+        "INSERT INTO runs(run_id, project_id, spec_id, state, mode, created_at)
+           SELECT 'S', project_id, spec_id, 'RUNNING', 'AUTO', created_at FROM runs WHERE run_id = 'R';
+         INSERT INTO tasks(task_id, run_id, spec_id, state, role, created_seq)
+           SELECT 'Q2', 'S', spec_id, 'RUNNING', 'qa', 4 FROM runs WHERE run_id = 'S';
+         INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision) VALUES
+           ('Q2/attempt-1', 'Q2', 'RUNNING', 1, 1, 1);",
+    )?;
+    let reasons = check_refused(f.pre_check(&id, "unit", ARGV, "Q2/attempt-1")?)?;
+    assert!(
+        reasons.iter().any(|r| r.contains("PRODUCER_MISMATCH")),
+        "{reasons:?}"
+    );
+    Ok(())
+}
+
+fn refused(result: Result<Frozen, FreezeError>) -> R<Vec<String>> {
+    match result {
+        Err(FreezeError::Refused(reasons)) => Ok(reasons),
+        other => Err(format!("not refused: {other:?}").into()),
+    }
+}
+
+/// Whether Python's jsonschema accepts the export at `path` under the locked contracts/candidate.schema.json, and
+/// tools/candidate.py computes `id` from it.
+fn export_is_valid(path: &Path, id: &str) -> R {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+    let script = "import json,sys\n\
+        sys.path.insert(0, sys.argv[1] + '/tools')\n\
+        import jsonschema\n\
+        from candidate import identity\n\
+        data = json.load(open(sys.argv[2]))\n\
+        jsonschema.validate(data, json.load(open(sys.argv[1] + '/contracts/candidate.schema.json')))\n\
+        print(identity(data))\n";
+    let out = Command::new("python3")
+        .args(["-I", "-c", script, root])
+        .arg(path)
+        .output()?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).into_owned().into());
+    }
+    assert_eq!(String::from_utf8(out.stdout)?.trim(), id);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_052_01_the_same_content_freezes_to_one_candidate_and_an_untracked_file_is_refused()
+-> R {
+    // AC-052-01: freezing twice gives one id matching ^CAND-[a-f0-9]{64}$ whose export passes candidate.schema.json;
+    // with an untracked file the third freeze fails and the candidates still number one.
+    let f = Fixture::new().await?;
+    let first = f.freeze("R").await?;
+    let Frozen::New { candidate_id, .. } = &first else {
+        return Err(format!("first freeze: {first:?}").into());
+    };
+    let id = candidate_id.clone();
+    assert!(
+        id.len() == 69
+            && id.starts_with("CAND-")
+            && id[5..]
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "{id}"
+    );
+    let second = f.freeze("R").await?;
+    assert_eq!(
+        second,
+        Frozen::Existing {
+            candidate_id: id.clone(),
+            state: "FROZEN".to_owned()
+        }
+    );
+    // The export is kept as an object, valid and of the same identity for the bootstrap tool.
+    let rows = f.candidates()?;
+    assert_eq!(rows, vec![format!("{id} R FROZEN")]);
+    let objects = f.state().join("objects/sha256");
+    let export = walk(&objects)?
+        .into_iter()
+        .find(|p| {
+            std::fs::read_to_string(p).is_ok_and(|t| {
+                t.contains(&format!("\"candidate_id\":\"{id}\""))
+                    || t.contains(&format!("\"candidate_id\": \"{id}\""))
+            })
+        })
+        .ok_or("no export object")?;
+    export_is_valid(&export, &id)?;
+    // An untracked file: refused, naming it; still one candidate.
+    std::fs::write(f.root().join("notes.txt"), "draft\n")?;
+    let reasons = refused(f.freeze("R").await)?;
+    assert!(
+        reasons.iter().any(|r| r.contains("notes.txt")),
+        "{reasons:?}"
+    );
+    assert_eq!(f.candidates()?.len(), 1);
+    Ok(())
+}
+
+fn walk(dir: &Path) -> R<Vec<PathBuf>> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            found.extend(walk(&path)?);
+        } else {
+            found.push(path);
+        }
+    }
+    Ok(found)
+}
+
+#[tokio::test]
+async fn hidden_changes_links_and_submodules_are_refused_by_name() -> R {
+    // docs/adr/ADR-027.md decision 4 (failure mode 5, decision 2; M2T10D-04): an index flag that hides a change, a
+    // tracked symbolic link and a submodule are refused, each naming its path; nothing is frozen.
+    for (case, setup) in [
+        ("assume-unchanged", "assume"),
+        ("skip-worktree", "skip"),
+        ("symbolic link", "link"),
+        ("submodule", "submodule"),
+        ("uncommitted change", "dirty"),
+    ] {
+        let f = Fixture::new().await?;
+        let root = f.root();
+        let named = match setup {
+            "assume" => {
+                git(root, &["update-index", "--assume-unchanged", "src/a.rs"])?;
+                std::fs::write(root.join("src/a.rs"), "pub fn a() { changed() }\n")?;
+                "src/a.rs"
+            }
+            "skip" => {
+                git(root, &["update-index", "--skip-worktree", "src/b.rs"])?;
+                std::fs::write(root.join("src/b.rs"), "pub fn b() { changed() }\n")?;
+                "src/b.rs"
+            }
+            "link" => {
+                std::os::unix::fs::symlink("a.rs", root.join("src/link.rs"))?;
+                git(root, &["add", "src/link.rs"])?;
+                git(root, &["commit", "-q", "-m", "link"])?;
+                "src/link.rs"
+            }
+            "submodule" => {
+                let head = git(root, &["rev-parse", "HEAD"])?;
+                git(
+                    root,
+                    &[
+                        "update-index",
+                        "--add",
+                        "--cacheinfo",
+                        &format!("160000,{},vendor/sub", head.trim()),
+                    ],
+                )?;
+                git(root, &["commit", "-q", "-m", "submodule"])?;
+                "vendor/sub"
+            }
+            _ => {
+                std::fs::write(root.join("src/c.rs"), "pub fn c() { changed() }\n")?;
+                "src/c.rs"
+            }
+        };
+        let reasons = refused(f.freeze("R").await)?;
+        assert!(
+            reasons.iter().any(|r| r.contains(named)),
+            "{case}: {reasons:?}"
+        );
+        assert_eq!(f.candidates()?, Vec::<String>::new(), "{case}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn hohs_own_state_must_be_ignored_and_untracked_and_its_environment_may_live_there() -> R {
+    // docs/adr/ADR-027.md decision 3 (M2T10D-154) and decision 4 (-69): a HoH path that is tracked or not ignored is
+    // refused by name; an environment description under .hoh/ (ignored, not tracked) is bound by its digest.
+    let f = Fixture::new().await?;
+    std::fs::write(f.state().join("host.json"), "{}\n")?;
+    git(f.root(), &["add", "-f", ".hoh/host.json"])?;
+    git(f.root(), &["commit", "-q", "-m", "tracked state"])?;
+    let reasons = refused(f.freeze("R").await)?;
+    assert!(
+        reasons.iter().any(|r| r.contains(".hoh/host.json")),
+        "{reasons:?}"
+    );
+
+    let f = Fixture::new().await?;
+    std::fs::write(f.state().join(".gitignore"), "state.db*\n.gitignore\n")?;
+    std::fs::create_dir_all(f.state().join("objects"))?;
+    let reasons = refused(f.freeze("R").await)?;
+    assert!(
+        reasons.iter().any(|r| r.contains(".hoh/objects")),
+        "{reasons:?}"
+    );
+
+    let mut f = Fixture::new().await?;
+    std::fs::write(
+        f.state().join("environment.json"),
+        "{\"os\": \"linux\", \"agents\": []}\n",
+    )?;
+    f.inputs.environment = ".hoh/environment.json".into();
+    let Frozen::New { .. } = f.freeze("R").await? else {
+        return Err("not frozen".into());
+    };
+    // The specification must be a tracked file of the candidate.
+    let mut g = Fixture::new().await?;
+    std::fs::write(g.state().join("spec.json"), "{}\n")?;
+    g.inputs.spec = ".hoh/spec.json".into();
+    let reasons = refused(g.freeze("R").await)?;
+    assert!(reasons.iter().any(|r| r.contains("spec")), "{reasons:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_same_content_for_another_run_is_refused_by_the_store() -> R {
+    // CR-017 (REQ-052 decision 1 within one run; docs/adr/ADR-027.md decision 5).
+    let f = Fixture::new().await?;
+    f.freeze("R").await?;
+    // A second run of the project, written as the test's own fixture row (Python's sqlite3, like host.rs's seeds).
+    let out = Command::new("python3")
+        .args([
+            "-c",
+            "import sqlite3,sys\n\
+             c=sqlite3.connect(sys.argv[1])\n\
+             c.execute(\"INSERT INTO runs(run_id, project_id, spec_id, state, mode, created_at) \
+             SELECT 'S', project_id, spec_id, 'RUNNING', 'AUTO', created_at FROM runs WHERE run_id='R'\")\n\
+             c.commit()",
+        ])
+        .arg(f.state().join("state.db"))
+        .output()?;
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let other = f.freeze("S").await;
+    assert!(
+        matches!(&other, Err(FreezeError::Store(e)) if e.to_string().contains("new commit")),
+        "{other:?}"
+    );
+    Ok(())
+}

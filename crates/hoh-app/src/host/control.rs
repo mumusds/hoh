@@ -426,7 +426,19 @@ const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 /// Run git read-only in `project` (no optional lock, no fsmonitor, so it writes no index, object or ref) for at most
 /// [`GIT_LIMIT`]; its output.
-fn git(project: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+pub(crate) fn git(project: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    let (status, out) = git_run(project, args)?;
+    if !status.success() {
+        return Err(format!("git {}: {status}", args.join(" ")));
+    }
+    Ok(out)
+}
+
+/// [`git`] whatever its exit status: the status and the output (`git check-ignore` answers "not ignored" with 1).
+pub(crate) fn git_run(
+    project: &Path,
+    args: &[&str],
+) -> Result<(std::process::ExitStatus, Vec<u8>), String> {
     use std::io::Read as _;
     let mut child = std::process::Command::new("git")
         .args(["--no-optional-locks", "-c", "core.fsmonitor=false"])
@@ -460,10 +472,7 @@ fn git(project: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
         .join()
         .map_err(|_| "git: its output was lost".to_owned())?
         .map_err(|e| format!("git {}: {e}", args.join(" ")))?;
-    if !status.success() {
-        return Err(format!("git {}: {status}", args.join(" ")));
-    }
-    Ok(out)
+    Ok((status, out))
 }
 
 fn hex(bytes: &[u8]) -> String {
