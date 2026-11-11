@@ -1104,7 +1104,9 @@ async fn drive(
         state,
         failure,
         cancelled,
-        native_session,
+        // A prompt pi handled started no run: pi wrote no message, so no session file, and a later turn must not be
+        // sent to resume it (M2T17R-551; docs/adr/ADR-024.md decision 4).
+        native_session: native_session.filter(|_| settled != Some(SettledBy::Handled)),
         model,
         disposition,
         settled,

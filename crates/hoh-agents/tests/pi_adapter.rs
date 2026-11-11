@@ -1436,6 +1436,28 @@ async fn pi_runner_mode_runs_the_turn_after_its_gate_without_store_writes() -> R
 }
 
 #[tokio::test]
+async fn a_handled_prompt_names_no_native_session_to_resume() -> R {
+    // M2T17R-551 (docs/adr/ADR-024.md decision 4): a prompt pi disposes of as `handled` (an extension command, an input
+    // handler) starts no run, so pi writes no message and no session file; the turn is SETTLED (REQ-026) but names no
+    // native session, so no later turn is sent to resume a session pi never persisted (it would be refused, for good,
+    // as SESSION_NOT_FOUND). A turn whose run settled names its session (the test above).
+    let world = World::new()?;
+    let mut case = Case::load("rpc-prompt")?;
+    let answer = case.response("p1")?;
+    case.frames[answer]["data"]["disposition"] = json!("handled");
+    case.frames.truncate(answer + 1);
+    let fake = world.fake("handled", &case)?;
+    let attempt = world.attempt_in("pi", "A1", "S1", "1.5.0").await?;
+    let turn = world.turn(&fake, "logs/handled")?;
+    let held = pi::start(&attempt, &turn, &gate(&world)?)?;
+    held.open.send(()).map_err(|()| "gate closed")?;
+    let facts = tokio::time::timeout(Duration::from_secs(30), held.ended).await??;
+    assert_eq!(facts.state, AttemptState::Settled, "{facts:?}");
+    assert_eq!(facts.native_session, None, "{facts:?}");
+    Ok(())
+}
+
+#[tokio::test]
 async fn pi_runner_mode_cancel_is_an_abort_only() -> R {
     // ADR-022 decision 14: the host's ladder is authoritative; the adapter sends Pi's abort and nothing more, even
     // when Pi ignores it past the turn's own graces.
