@@ -201,26 +201,6 @@ impl World {
             .position(|f| f["id"].as_i64() == Some(thread_start) && f.get("result").is_some())
             .ok_or("no thread/start answer")?;
         std::fs::write(d.join("incomplete.jsonl"), lines(&frames[..=answered]))?;
-        // Its retry resumes the thread the cut-short start opened: the recorded resume.
-        let resume = format!("{PROTOCOL}/codex/0.166.0/app-server-resume");
-        let resumed: Vec<Value> = std::fs::read_to_string(format!("{resume}/stdout.jsonl"))?
-            .lines()
-            .map(|l| serde_json::from_str(&l.replace("gpt-6-astra", model)))
-            .collect::<Result<_, _>>()?;
-        std::fs::write(d.join("resume.jsonl"), lines(&resumed))?;
-        let mut resume_requests = serde_json::Map::new();
-        for line in std::fs::read_to_string(format!("{resume}/stdin.txt"))?.lines() {
-            let Ok(m) = serde_json::from_str::<Value>(line) else {
-                continue;
-            };
-            if let (Some(id), Some(method)) = (m["id"].as_i64(), m["method"].as_str()) {
-                resume_requests.insert(id.to_string(), json!(method));
-            }
-        }
-        std::fs::write(
-            d.join("resume-requests.json"),
-            Value::Object(resume_requests).to_string(),
-        )?;
         // An App Server that does not know initialize: the turn degrades to exec (decision 15).
         std::fs::write(
             d.join("degrade.jsonl"),
@@ -249,10 +229,9 @@ impl World {
                     *UNKNOWN*) frames=\"$d/unknown.jsonl\"; opt=--exit-when-done; echo \"$HOH_ATTEMPT_ID\" >> \"$d/effects\";;\n\
                     *DEGRADE*) frames=\"$d/degrade.jsonl\"; opt=;;\n\
                     *INCOMPLETE/attempt-1) frames=\"$d/incomplete.jsonl\"; opt=--exit-when-done;;\n\
-                    *INCOMPLETE/attempt-2) frames=\"$d/resume.jsonl\"; opt=; requests=\"$d/resume-requests.json\";;\n\
                     *) frames=\"$d/frames.jsonl\"; opt=;;\n\
                    esac\n\
-                   exec timeout 60 python3 '{APP_SERVER}' \"$frames\" \"${{requests:-$d/requests.json}}\" \"$d/log.$$\" $opt;;\n\
+                   exec timeout 60 python3 '{APP_SERVER}' \"$frames\" \"$d/requests.json\" \"$d/log.$$\" $opt;;\n\
                  esac\nexit 2\n",
                 d = d.display()
             ),
@@ -276,16 +255,20 @@ impl World {
             }
         }
         std::fs::write(d.join("commands.json"), Value::Object(commands).to_string())?;
-        // A first start that ends once get_state answered, before any prompt (M2T17R-300, -350): pi has given its
-        // session id, no input reached it.
+        // A first start that ends once get_state answered, before any prompt (M2T17R-300, -350, -450): pi has given
+        // its session id and, as pi 1.5.0 persists a session only once it has a message, written no session file.
         let first = std::fs::read_to_string(format!("{case}/stdout.jsonl"))?
             .lines()
             .next()
             .ok_or("no get_state answer")?
             .to_owned();
         std::fs::write(
-            d.join("refused.jsonl"),
-            format!("{first}\n{}\n", json!({"hoh_exit": 1})),
+            d.join("early-exit.jsonl"),
+            format!(
+                "{}\n{first}\n{}\n",
+                json!({"hoh_lazy_session": true}),
+                json!({"hoh_exit": 1})
+            ),
         )?;
         self.script(
             "pi",
@@ -295,7 +278,7 @@ impl World {
                  echo $$ > \"$d/pid.$$\"; printf '%s\\n' \"$@\" > \"$d/argv.$$\"\n\
                  case \"$HOH_ATTEMPT_ID\" in\n\
                   *HUGE*) printf '%s\\n' '{{\"type\":\"agent_start\"}}'; head -c {HUGE} /dev/zero | tr '\\0' x; sleep 20; exit 0;;\n\
-                  *REFUSED/attempt-1) exec timeout 60 python3 '{PI_RPC}' \"$d/refused.jsonl\" \"$d/commands.json\" \"$d/log.$$\" -- \"$@\";;\n\
+                  *EARLY-EXIT/attempt-1) exec timeout 60 python3 '{PI_RPC}' \"$d/early-exit.jsonl\" \"$d/commands.json\" \"$d/log.$$\" -- \"$@\";;\n\
                  esac\n\
                  exec timeout 60 python3 '{PI_RPC}' \"$d/frames.jsonl\" \"$d/commands.json\" \"$d/log.$$\" -- \"$@\"\n",
                 d = d.display()
@@ -1869,7 +1852,7 @@ async fn a_new_holders_first_turn_without_its_kept_input_fails_first_input_unava
         let kept = hoh_app::host::product::first_input_path(&project, &session);
         let whole = std::fs::read(&kept)?;
         // Unreadable, then gone: each attempt of the first turn fails FIRST_INPUT_UNAVAILABLE and sends nothing; the
-        // input back, the retry starts from it (M2T17R-251; the first input owed until the agent answered, -200).
+        // input back, the retry starts from it (M2T17R-251; the first input owed until a turn of the session completed, -200, -300).
         std::fs::write(&kept, b"{")?;
         ready(&project, &run_id, &[("T-dev", "developer")])?;
         until(&project, &ended("T-dev/attempt-1"), "FAILED/FIRST_INPUT_UNAVAILABLE", limit).await?;
@@ -1899,7 +1882,7 @@ async fn a_new_holders_first_turn_without_its_kept_input_fails_first_input_unava
 #[tokio::test]
 async fn a_new_holders_later_turns_in_its_session_carry_no_package() -> R {
     // docs/adr/ADR-024.md decision 4 (M2T17R-151, -152): the developer changes from claude to pi; the first turn of
-    // its new session carries the package, the session's next turn, once pi answered the first, does not (the store
+    // its new session carries the package, the session's next turn, once the first completed, does not (the store
     // says the first input is given; a session that cannot resume is covered by
     // a_first_input_stays_owed_until_a_turn_of_its_session_completed).
     let world = World::new()?;
@@ -1960,9 +1943,10 @@ async fn a_new_holders_later_turns_in_its_session_carry_no_package() -> R {
 
 #[tokio::test]
 async fn a_first_turn_cut_short_after_the_agent_gave_its_session_id_leaves_the_package_owed() -> R {
-    // M2T17R-300 (docs/adr/ADR-024.md decision 4): the new developer's (codex) first attempt is cut short after the App
-    // Server answered thread/start with its thread id, before any turn: no input reached the agent, so its retry, the
-    // first turn codex gets (resuming that thread), starts from the package.
+    // M2T17R-300, -451 (docs/adr/ADR-024.md decision 4): the new developer's (codex) first attempt is cut short after
+    // the App Server answered thread/start with its thread id, before any turn: no input reached the agent, so its
+    // retry, the first turn codex gets, starts from the package, on a thread of its own: a thread no turn completed is
+    // not resumed (it may never have been persisted).
     let world = World::new()?;
     world.claude(None)?;
     world.codex("m-test")?;
@@ -2008,6 +1992,14 @@ async fn a_first_turn_cut_short_after_the_agent_gave_its_session_id_leaves_the_p
             .collect();
         assert_eq!(sent.len(), 1, "only the retry's turn was sent: {sent:?}");
         assert!(sent[0].contains("```json"), "the first turn codex got has no package: {}", sent[0]);
+        let resumes = std::fs::read_dir(world.bin().join("codex.d"))?
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("log."))
+            .filter_map(|e| std::fs::read_to_string(e.path().join("received.jsonl")).ok())
+            .flat_map(|log| log.lines().map(str::to_owned).collect::<Vec<_>>())
+            .filter(|line| line.contains("\"thread/resume\""))
+            .count();
+        assert_eq!(resumes, 0, "a thread no turn completed was resumed");
         R::Ok(())
     }
     .await;
@@ -2018,9 +2010,10 @@ async fn a_first_turn_cut_short_after_the_agent_gave_its_session_id_leaves_the_p
 
 #[tokio::test]
 async fn a_first_pi_start_that_ends_before_its_prompt_leaves_the_package_owed() -> R {
-    // M2T17R-300, -350 (docs/adr/ADR-024.md decision 4): the new developer's (pi) first process answers get_state, which
-    // gives its session id, and ends before any prompt; no input reached pi, so its retry's prompt, the first pi takes,
-    // starts from the package.
+    // M2T17R-300, -350, -450 (docs/adr/ADR-024.md decision 4): the new developer's (pi) first process answers get_state,
+    // which gives its session id, and ends before any prompt, writing no session file (as pi 1.5.0); no input reached
+    // pi, so its retry, not resuming the session no turn completed (which would be refused SESSION_NOT_FOUND for good),
+    // starts pi afresh with the session's id, and its prompt, the first pi takes, starts from the package.
     let world = World::new()?;
     world.claude(None)?;
     world.codex("m-test")?;
@@ -2046,15 +2039,15 @@ async fn a_first_pi_start_that_ends_before_its_prompt_leaves_the_package_owed() 
             limit,
         )
         .await?;
-        ready(&project, &run_id, &[("T-REFUSED", "developer")])?;
+        ready(&project, &run_id, &[("T-EARLY-EXIT", "developer")])?;
         until(
             &project,
-            "SELECT state FROM attempts WHERE attempt_id = 'T-REFUSED/attempt-1' AND state IN ('FAILED', 'UNKNOWN_EFFECT')",
+            "SELECT state FROM attempts WHERE attempt_id = 'T-EARLY-EXIT/attempt-1' AND state IN ('FAILED', 'UNKNOWN_EFFECT')",
             "FAILED",
             limit,
         )
         .await?;
-        until(&project, &ended("T-REFUSED/attempt-2"), "SETTLED/", limit).await?;
+        until(&project, &ended("T-EARLY-EXIT/attempt-2"), "SETTLED/", limit).await?;
         let prompts: Vec<String> = std::fs::read_dir(world.bin().join("pi.d"))?
             .flatten()
             .filter(|e| e.file_name().to_string_lossy().starts_with("log."))
