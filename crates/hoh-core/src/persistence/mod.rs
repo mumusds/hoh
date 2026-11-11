@@ -13,6 +13,7 @@
 
 mod attempts;
 mod blockers;
+mod candidates;
 mod commands;
 mod context;
 mod control;
@@ -31,6 +32,7 @@ mod runner;
 mod supervise;
 mod team;
 mod wakes;
+pub use candidates::{Freeze, Frozen};
 pub use control::{CancelPass, Finished, PauseStep};
 pub use handover::SessionStart;
 pub use leases::{Grant, LEASE_TTL, LeaseView};
@@ -230,6 +232,13 @@ pub enum PersistError {
     WriterStopped,
     /// A scratch-only write ([`Store::scratch_task`]) on a database that is not empty; nothing was written.
     NotScratch(String),
+    /// The candidate's content was frozen by another run (`candidate_id` is its primary key, a row belongs to one run):
+    /// a new commit is needed to freeze it for this run (REQ-052 decision 1 within one run, CR-017); nothing was
+    /// written.
+    CandidateOfAnotherRun {
+        candidate_id: String,
+        run_id: String,
+    },
     /// Any other SQLite or I/O failure.
     Storage(String),
 }
@@ -353,6 +362,13 @@ impl std::fmt::Display for PersistError {
             },
             PersistError::WriterStopped => write!(f, "the database writer is not running"),
             PersistError::NotScratch(why) => write!(f, "not a scratch database: {why}"),
+            PersistError::CandidateOfAnotherRun {
+                candidate_id,
+                run_id,
+            } => write!(
+                f,
+                "candidate {candidate_id} is content run {run_id} froze: make a new commit to freeze it for this run"
+            ),
             PersistError::Storage(detail) => write!(f, "storage error: {detail}"),
         }
     }
@@ -1208,6 +1224,13 @@ impl Store {
         message: &crate::protocol::Message,
     ) -> Result<Fenced, PersistError> {
         self.writer.fence(message.clone()).await
+    }
+
+    /// Freeze a candidate for its run in one transaction (docs/adr/ADR-027.md decision 5): a new FROZEN row whose run's
+    /// earlier current candidates go STALE, its export and inputs registered and a `candidate.frozen` event; the same
+    /// content again in the run returns its id and state; another run's content is refused.
+    pub async fn freeze_candidate(&self, freeze: Freeze) -> Result<Frozen, PersistError> {
+        self.writer.freeze_candidate(freeze).await
     }
 
     /// Validate a plan (`$defs.PlanProposal`) for `run_id` and import it whole, or refuse it with nothing written

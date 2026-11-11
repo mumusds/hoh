@@ -148,6 +148,11 @@ enum Job {
         Box<OutboxJob>,
         oneshot::Sender<Result<OutboxDone, PersistError>>,
     ),
+    /// A candidate to freeze ([`super::candidates::freeze`]).
+    Candidates(
+        Box<super::candidates::Freeze>,
+        oneshot::Sender<Result<super::candidates::Frozen, PersistError>>,
+    ),
     /// A run id and a plan for [`super::plan::import`].
     Plan(
         Box<(String, serde_json::Value)>,
@@ -344,6 +349,7 @@ impl Job {
             Job::BeginHost(..) => "BeginHost",
             Job::Pragmas(..) => "Pragmas",
             Job::Outbox(..) => "Outbox",
+            Job::Candidates(..) => "Candidates",
             Job::Plan(..) => "Plan",
             Job::Round(..) => "Round",
             Job::Reconcile(..) => "Reconcile",
@@ -491,6 +497,13 @@ impl Writer {
                                 &ctx,
                                 reply,
                                 run_outbox(&mut conn, *job, &writer_claims, &ctx),
+                            ));
+                        }
+                        Job::Candidates(job, reply) => {
+                            deferred = Some(answer(
+                                &ctx,
+                                reply,
+                                super::candidates::freeze(&mut conn, &job, &ctx),
                             ));
                         }
                         Job::Plan(request, reply) => {
@@ -690,6 +703,14 @@ impl Writer {
 
     pub(super) async fn outbox(&self, job: OutboxJob) -> Result<OutboxDone, PersistError> {
         self.submit(|tx| Job::Outbox(Box::new(job), tx)).await
+    }
+
+    pub(super) async fn freeze_candidate(
+        &self,
+        freeze: super::candidates::Freeze,
+    ) -> Result<super::candidates::Frozen, PersistError> {
+        self.submit(|tx| Job::Candidates(Box::new(freeze), tx))
+            .await
     }
 
     pub(super) async fn import_plan(
