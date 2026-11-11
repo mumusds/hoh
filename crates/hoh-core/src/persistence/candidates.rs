@@ -142,5 +142,65 @@ pub(super) fn freeze(
     })
 }
 
+/// A candidate's row (contracts/sql/001_initial.sql `candidates`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateRow {
+    pub candidate_id: String,
+    pub run_id: String,
+    pub state: String,
+    pub source_path: String,
+    pub git_commit: String,
+    pub git_tree: String,
+    pub spec_sha256: String,
+    pub environment_sha256: String,
+    pub test_plan_sha256: String,
+}
+
+/// The candidate `candidate_id`'s row, if there is one.
+pub(super) fn candidate(
+    conn: &Connection,
+    candidate_id: &str,
+) -> Result<Option<CandidateRow>, PersistError> {
+    conn.query_row(
+        "SELECT candidate_id, run_id, state, source_path, git_commit, git_tree, spec_sha256, environment_sha256, \
+         test_plan_sha256 FROM candidates WHERE candidate_id = ?1",
+        params![candidate_id],
+        |r| {
+            Ok(CandidateRow {
+                candidate_id: r.get(0)?,
+                run_id: r.get(1)?,
+                state: r.get(2)?,
+                source_path: r.get(3)?,
+                git_commit: r.get(4)?,
+                git_tree: r.get(5)?,
+                spec_sha256: r.get(6)?,
+                environment_sha256: r.get(7)?,
+                test_plan_sha256: r.get(8)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(sqlite_error)
+}
+
+/// The attempt `attempt_id`'s run and its task's role (principle two), if the attempt exists.
+pub(super) fn producer(
+    conn: &Connection,
+    attempt_id: &str,
+) -> Result<Option<crate::verification::Producer>, PersistError> {
+    conn.query_row(
+        "SELECT t.run_id, t.role FROM attempts a JOIN tasks t ON t.task_id = a.task_id WHERE a.attempt_id = ?1",
+        params![attempt_id],
+        |r| {
+            Ok(crate::verification::Producer {
+                run_id: r.get(0)?,
+                role: r.get(1)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(sqlite_error)
+}
+
 #[cfg(test)]
 mod tests;

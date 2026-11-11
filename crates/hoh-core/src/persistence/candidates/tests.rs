@@ -1,6 +1,7 @@
 //! A run's candidates against a real database (docs/adr/ADR-027.md decision 5, CR-017).
 
 use super::*;
+use crate::persistence::CandidateRow;
 use crate::persistence::{Options, Store, selftest};
 use crate::verification::{FileRef, Manifest};
 use rusqlite::Connection;
@@ -265,5 +266,47 @@ async fn a_freeze_without_its_inputs_kept_or_for_no_run_writes_nothing() -> R {
         )?,
         Vec::<String>::new()
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_reader_gives_a_candidates_row_and_an_attempts_run_and_role() -> R {
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    let job = freeze_of("R", 'b');
+    store.freeze_candidate(job.clone()).await?;
+    Connection::open(&path)?.execute_batch(
+        "INSERT INTO tasks(task_id, run_id, spec_id, state, role, created_seq) VALUES
+           ('Q', 'R', 's1', 'RUNNING', 'qa', 1), ('D', 'S', 's1', 'RUNNING', 'developer', 1);
+         INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision) VALUES
+           ('Q/attempt-1', 'Q', 'RUNNING', 1, 1, 1), ('D/attempt-1', 'D', 'RUNNING', 1, 1, 1);",
+    )?;
+    let reader = store.reader()?;
+    let m = &job.sealed.manifest;
+    assert_eq!(
+        reader.candidate(&job.sealed.candidate_id)?,
+        Some(CandidateRow {
+            candidate_id: job.sealed.candidate_id.clone(),
+            run_id: "R".to_owned(),
+            state: "FROZEN".to_owned(),
+            source_path: job.export.path.clone(),
+            git_commit: m.git_commit.clone(),
+            git_tree: m.git_tree.clone(),
+            spec_sha256: m.spec.sha256.clone(),
+            environment_sha256: m.environment.sha256.clone(),
+            test_plan_sha256: m.test_plan.sha256.clone(),
+        })
+    );
+    assert_eq!(reader.candidate("CAND-none")?, None);
+    let producer = |run: &str, role: &str| crate::verification::Producer {
+        run_id: run.to_owned(),
+        role: role.to_owned(),
+    };
+    assert_eq!(reader.producer("Q/attempt-1")?, Some(producer("R", "qa")));
+    assert_eq!(
+        reader.producer("D/attempt-1")?,
+        Some(producer("S", "developer"))
+    );
+    assert_eq!(reader.producer("nobody")?, None);
     Ok(())
 }
