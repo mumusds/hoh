@@ -75,6 +75,39 @@ pub(super) fn import(
     };
     let existing: BTreeSet<String> = states.keys().cloned().collect();
     let plan = dag::validate(raw, &existing, &taken).map_err(PersistError::Plan)?;
+    // The Commander does no work task (CONTRACT 6): no planned task of its role, and none behind a supervision task
+    // (docs/adr/ADR-025.md appendix, -66).
+    let supervision: BTreeSet<String> = {
+        let mut statement = tx
+            .prepare("SELECT task_id FROM tasks WHERE run_id = ?1 AND role = 'commander'")
+            .map_err(sqlite_error)?;
+        let rows = statement
+            .query_map(params![run_id], |r| r.get(0))
+            .map_err(sqlite_error)?;
+        rows.collect::<Result<_, _>>().map_err(sqlite_error)?
+    };
+    let refused: Vec<String> = plan
+        .tasks
+        .iter()
+        .flat_map(|t| {
+            let own = (t.role == "commander")
+                .then(|| format!("task {}: the commander does no work task", t.task_id));
+            let behind = t
+                .depends_on
+                .iter()
+                .filter(|d| supervision.contains(*d))
+                .map(move |d| {
+                    format!(
+                        "task {}: {d} is a supervision task, nothing depends on it",
+                        t.task_id
+                    )
+                });
+            own.into_iter().chain(behind)
+        })
+        .collect();
+    if !refused.is_empty() {
+        return Err(PersistError::Plan(dag::PlanError::Invalid(refused)));
+    }
     // A requirement the run's specification does not have makes the plan invalid (M2T03R-55): a bad request, not a
     // constraint failure of the insert.
     let known: BTreeSet<String> = {

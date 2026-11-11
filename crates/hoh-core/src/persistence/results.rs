@@ -123,7 +123,16 @@ pub(super) fn accept(
         None => None,
     };
     let current = super::outbox::current_candidate(&tx, &result.run_id)?;
-    let refusal = if result.role != role {
+    let refusal = if role == super::wakes::COMMANDER {
+        // A Commander turn answers through its outputs (docs/adr/ADR-025.md decision 8), not a TaskResult.
+        Some((
+            RejectionReason::IllegalTransition,
+            format!(
+                "task {} is a supervision task: a Commander turn reports no TaskResult",
+                result.task_id
+            ),
+        ))
+    } else if result.role != role {
         Some((
             RejectionReason::IllegalTransition,
             format!("task {} is {role}'s, not {}'s", result.task_id, result.role),

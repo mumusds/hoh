@@ -487,3 +487,29 @@ fn a_proposal_is_read_from_a_commander_decision_message_with_a_schema_valid_payl
         Err(ProposalError::NotFromCommander(_))
     ));
 }
+
+#[test]
+fn a_supervision_task_is_moved_by_no_decision() {
+    // docs/adr/ADR-025.md appendix: a supervision task (role commander) is the Commander's own turn: no dispatch and
+    // no task move of it is applied.
+    let mut s = snapshot();
+    let mut own = task("W/turn/0", TaskState::Ready);
+    own.role = "commander".to_owned();
+    s.task = Some(own);
+    assert_eq!(
+        reason(
+            &proposal(json!({"kind": "dispatch", "task_id": "W/turn/0", "role": "commander"})),
+            &s
+        ),
+        IllegalTransition
+    );
+    assert_eq!(
+        reason(
+            &proposal(
+                json!({"kind": "transition_task", "task_id": "W/turn/0", "to_state": "CANCELLED", "reason": "x"})
+            ),
+            &s
+        ),
+        IllegalTransition
+    );
+}

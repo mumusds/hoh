@@ -490,7 +490,40 @@ pub(super) fn move_attempt(
             "to": m.to.as_str(),
             "failure_reason": f.failure_reason,
         }),
-    )
+    )?;
+    if m.to == AttemptState::Settled {
+        // The shared rule of completion, on every path that settles an attempt (docs/adr/ADR-025.md decision 3): a
+        // work task records task.implemented with its risk_reduction (intensive supervision wakes on it).
+        let (project_id, run_id, role, risk): (String, String, String, i64) = tx
+            .query_row(
+                "SELECT r.project_id, t.run_id, t.role, t.risk_reduction FROM tasks t JOIN runs r ON r.run_id = t.run_id \
+                 WHERE t.task_id = ?1",
+                params![task_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .map_err(sqlite_error)?;
+        if role != super::wakes::COMMANDER {
+            super::writer::write(
+                tx,
+                &super::writer::Commit {
+                    events: vec![super::writer::NewEvent {
+                        project_id,
+                        event_id: crate::ids::child_id(&m.attempt_id, "implemented"),
+                        run_id: Some(run_id),
+                        kind: "task.implemented".to_owned(),
+                        payload: serde_json::json!({
+                            "task_id": task_id,
+                            "attempt_id": m.attempt_id,
+                            "risk_reduction": risk,
+                        }),
+                    }],
+                    ..super::writer::Commit::default()
+                },
+                ctx,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// A time a caller gave, as the store's UTC form (leases compare them as text, so an offset or a fraction must not

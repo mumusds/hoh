@@ -139,7 +139,9 @@ async fn an_attempt_moves_along_the_table_with_its_facts_and_events() -> R {
             "attempt.created:PREPARED",
             "attempt.moved:STARTING",
             "attempt.moved:RUNNING",
-            "attempt.moved:SETTLED"
+            "attempt.moved:SETTLED",
+            // The shared rule of completion (docs/adr/ADR-025.md decision 3); it names no state.
+            "task.implemented:PREPARED"
         ]
     );
     Ok(())

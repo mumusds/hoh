@@ -182,10 +182,17 @@ pub(super) fn withdraw(
         )
         .map_err(sqlite_error)?;
         if writer::parse::<TaskState>(&task_state)? == TaskState::Leased {
+            // A withdrawn supervision turn's task is CANCELLED, never READY: its wake is rearmed instead
+            // (docs/adr/ADR-025.md decision 3).
+            let to = if super::wakes::is_supervision(tx, &task_id)? {
+                TaskState::Cancelled
+            } else {
+                TaskState::Ready
+            };
             cas.push(StateCas {
                 id: task_id.clone(),
                 expected_revision: task_revision,
-                change: Change::Task(TaskState::Ready),
+                change: Change::Task(to),
             });
         }
         events.push(NewEvent {

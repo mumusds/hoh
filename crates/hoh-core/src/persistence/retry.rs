@@ -74,6 +74,24 @@ pub(super) fn fail_task(
             events: Vec::new(),
         });
     }
+    // A supervision turn is not retried by a task's policy: its task is CANCELLED, nothing counted, and its wake is
+    // rearmed by the supervisor with the failure's class (docs/adr/ADR-025.md decision 3).
+    if super::wakes::is_supervision(tx, task.task_id)? {
+        return Ok(Failed {
+            cas: Some(StateCas {
+                id: task.task_id.to_owned(),
+                expected_revision: task.revision,
+                change: Change::Task(TaskState::Cancelled),
+            }),
+            events: vec![event(
+                task.project_id,
+                task.run_id,
+                child_id(attempt_id, "turn_failed"),
+                "supervisor.turn_failed",
+                json!({"task_id": task.task_id, "attempt_id": attempt_id, "failure": failure.class.to_json()}),
+            )],
+        });
+    }
     let count: i64 = tx
         .query_row(
             "SELECT attempt_count FROM tasks WHERE task_id = ?1",
@@ -770,6 +788,12 @@ pub(super) fn request_repair(
             request.task_id, request.run_id
         )));
     };
+    if super::wakes::is_supervision(&tx, &request.task_id)? {
+        return Err(PersistError::IntegrityViolation(format!(
+            "{} is a supervision task: a Commander turn takes no repair (docs/adr/ADR-025.md decision 3)",
+            request.task_id
+        )));
+    }
     let state = writer::parse::<TaskState>(&state)?;
     let count = repair_count(&tx, &request.run_id, &request.repair)?;
     let (field, key) = request.repair.key();
