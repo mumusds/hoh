@@ -591,8 +591,8 @@ impl Executor for ProductExecutor {
             if let Some(bridge) = &bridge {
                 outcome.observed.messages = read_bridge(bridge);
             }
-            // Its raw logs kept as objects, on a blocking thread (docs/adr/ADR-026.md decision 10); one that cannot
-            // be kept is left in its directory, unregistered.
+            // Its raw logs kept as objects, on a blocking thread (docs/adr/ADR-026.md decision 10): one that cannot be
+            // kept as an object is registered in place; one that cannot be read is a recorded failure.
             let (logs, kept_in) = (logs.clone(), project.clone());
             let (rows, failed) = tokio::task::spawn_blocking(move || keep_logs(&kept_in, &logs))
                 .await
@@ -649,20 +649,24 @@ fn keep_logs(
     Vec<serde_json::Value>,
 ) {
     let mut failed = Vec::new();
-    let mut files: Vec<PathBuf> = match std::fs::read_dir(logs) {
-        Ok(entries) => entries
-            .flatten()
-            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
-            .map(|e| e.path())
-            .collect(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(e) => {
-            failed.push(
-                serde_json::json!({"name": logs.display().to_string(), "error": e.to_string()}),
-            );
-            Vec::new()
+    // Its directory gone, an entry that cannot be read or told apart: each a recorded failure (M2T09R-100).
+    let directory = logs.display().to_string();
+    let mut files: Vec<PathBuf> = Vec::new();
+    match std::fs::read_dir(logs) {
+        Ok(entries) => {
+            for entry in entries {
+                match entry.and_then(|e| e.file_type().map(|t| (e.path(), t))) {
+                    Ok((path, kind)) if kind.is_file() => files.push(path),
+                    Ok(_) => {}
+                    Err(e) => {
+                        failed.push(serde_json::json!({"name": directory, "error": e.to_string()}))
+                    }
+                }
+            }
         }
-    };
+        Err(e) => failed.push(serde_json::json!({"name": directory, "error": e.to_string()})),
+    }
+
     files.sort();
     let mut rows = Vec::new();
     for file in files {

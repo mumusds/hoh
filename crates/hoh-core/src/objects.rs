@@ -110,7 +110,7 @@ fn put_with(
             // what it must hold, so this write's own staged copy (whole and synced) is renamed over it, then read
             // back.
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                if !holds(&path, &sha256)? {
+                if !holds(&path, &sha256).unwrap_or(false) {
                     std::fs::rename(&staged, &path)
                         .map_err(|e| format!("{}: {e}", path.display()))?;
                     if !holds(&path, &sha256)? {
@@ -187,7 +187,7 @@ pub fn put_file(project: &Path, file: &Path) -> Result<(String, u64), String> {
         match std::fs::hard_link(&staged, &path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                if !holds(&path, &sha)? {
+                if !holds(&path, &sha).unwrap_or(false) {
                     std::fs::rename(&staged, &path)
                         .map_err(|e| format!("{}: {e}", path.display()))?;
                     if !holds(&path, &sha)? {

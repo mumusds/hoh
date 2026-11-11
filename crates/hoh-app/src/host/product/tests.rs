@@ -505,7 +505,11 @@ fn a_log_that_cannot_be_kept_as_an_object_is_registered_in_place_and_one_unreada
         logs.join("stderr.log"),
         std::fs::Permissions::from_mode(0o000),
     )?;
-    if std::fs::read(logs.join("stderr.log")).is_err() {
+    if std::fs::read(logs.join("stderr.log")).is_ok() {
+        eprintln!(
+            "skipped: this user reads mode-000 files (root), so the unreadable branch cannot run"
+        );
+    } else {
         let (rows, failed) = keep_logs(dir.path(), &logs);
         assert_eq!(rows.len(), 1);
         assert_eq!(failed.len(), 1, "{failed:?}");
@@ -515,5 +519,17 @@ fn a_log_that_cannot_be_kept_as_an_object_is_registered_in_place_and_one_unreada
         logs.join("stderr.log"),
         std::fs::Permissions::from_mode(0o644),
     )?;
+    Ok(())
+}
+
+#[test]
+fn a_log_directory_gone_is_a_recorded_failure() -> Result<(), Box<dyn std::error::Error>> {
+    // M2T09R-100: its logs vanished before they were kept: said, not silently nothing.
+    let dir = tempfile::tempdir()?;
+    let logs = dir.path().join(".hoh/attempts/gone");
+    let (rows, failed) = keep_logs(dir.path(), &logs);
+    assert!(rows.is_empty());
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(failed[0]["name"], logs.display().to_string());
     Ok(())
 }

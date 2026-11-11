@@ -2601,13 +2601,20 @@ async fn test_039_04_repacking_from_an_attempts_record_gives_the_prompt_it_was_s
             "SELECT seq FROM events WHERE kind = 'context.packed' AND json_extract(payload_json, '$.attempt_id') = 'T-a/attempt-4'",
         )?;
         let tracking_at = seq("SELECT seq FROM events WHERE event_id = 'T-a/attempt-4/tracking'")?;
+        let started_at = seq(
+            "SELECT seq FROM events WHERE kind = 'effect.started' AND json_extract(payload_json, '$.attempt_id') = 'T-a/attempt-4'",
+        )?;
+        // One commit writes them in this order and nothing else between (M2T09R-153): the record, the work effect
+        // STARTED, the tracking; then, later, the OBSERVED.
+        assert_eq!(
+            (started_at - packed_at, tracking_at - started_at),
+            (1, 1),
+            "{packed_at} {started_at} {tracking_at}"
+        );
         let observed_at = seq(
             "SELECT seq FROM events WHERE kind = 'effect.observed' AND json_extract(payload_json, '$.attempt_id') = 'T-a/attempt-4'",
         )?;
-        assert!(
-            packed_at < observed_at && (packed_at - tracking_at).abs() <= 3,
-            "{packed_at} {tracking_at} {observed_at}"
-        );
+        assert!(tracking_at < observed_at, "{tracking_at} {observed_at}");
         // Its evidence went in as summaries, ranked newest first.
         let summaries: Vec<&str> = inputs
             .iter()
@@ -2833,6 +2840,57 @@ async fn a_new_commanders_prompt_carries_references_and_none_of_its_predecessors
             &json!({"package": input["package"], "prompt_sha256": <sha2::Sha256 as sha2::Digest>::digest(sent.as_bytes()).iter().map(|b| format!("{b:02x}")).collect::<String>(),
                 "tokens": tokens, "sentinel_count": 0}),
         )?;
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    world.stop_fakes()?;
+    outcome
+}
+
+#[tokio::test]
+async fn a_turns_logs_that_cannot_be_kept_as_objects_are_registered_where_they_are() -> R {
+    // M2T09R-01, -151 (docs/adr/ADR-026.md decision 10): the objects' staging place taken by a file, so no raw log can
+    // be kept as an object; the turn's logs are registered in place under their own sha256, with their producer, in its
+    // work's OBSERVED.
+    let world = World::new()?;
+    world.codex("gpt-6-astra")?;
+    let project = world.project();
+    std::fs::create_dir_all(project.join(".hoh/objects"))?;
+    std::fs::write(project.join(".hoh/objects/staging"), b"not a directory")?;
+    std::fs::write(
+        project.join(".hoh/config.toml"),
+        "config_version = \"1.0\"\n[team.developer]\nagent = \"codex\"\n",
+    )?;
+    let host = start_when_free(world.config()).await?;
+    let outcome = async {
+        let run_id = started(&host, "s1").await?;
+        ready(&project, &run_id, &[("T-l", "developer")])?;
+        until(
+            &project,
+            &ended("T-l/attempt-1"),
+            "SETTLED/",
+            Duration::from_secs(60),
+        )
+        .await?;
+        let produced: Value = serde_json::from_str(&query(
+            &project,
+            "SELECT payload_json FROM events WHERE kind = 'attempt.artifacts' \
+             AND json_extract(payload_json, '$.attempt_id') = 'T-l/attempt-1'",
+        )?)?;
+        let items = produced["items"].as_array().ok_or("no items")?;
+        assert!(!items.is_empty(), "{produced}");
+        for item in items {
+            assert_eq!(item["kind"], "raw_log_in_place", "{item}");
+            let path = item["path"].as_str().ok_or("no path")?;
+            assert!(path.starts_with(".hoh/attempts/"), "{path}");
+            let bytes = std::fs::read(project.join(path))?;
+            let digest: String = <sha2::Sha256 as sha2::Digest>::digest(&bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            assert_eq!(item["sha256"].as_str(), Some(digest.as_str()), "{path}");
+        }
         R::Ok(())
     }
     .await;
