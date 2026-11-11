@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 
 /// A file of the candidate by its path relative to the repository and the sha256 of its bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FileRef {
     pub path: String,
     pub sha256: String,
@@ -192,30 +193,259 @@ impl Sealed {
     }
 }
 
-/// A check's result as evidence (REQ-052 behaviour 6; docs/adr/ADR-027.md decision 5): its execution record's
-/// bindings, the git tree it observed, and its observations (test-result lines or AC observations).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Evidence {
+/// A file a record names by its role in the check (contracts/execution.schema.json `artifacts`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamedRef {
+    pub name: String,
+    pub path: String,
+    pub sha256: String,
+}
+
+/// Who ran a check (contracts/execution.schema.json `runner`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Runner {
+    pub tool: String,
+    pub euid: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<String>,
+}
+
+/// A check's execution record exactly as the locked contracts/execution.schema.json 1.1 has it (no field added,
+/// docs/adr/ADR-027.md decision 8): what the product writes and what tools/release_gate.py reads.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Record {
+    pub schema_version: String,
+    pub record_type: String,
+    pub record_id: String,
     pub check_id: String,
     pub candidate_id: String,
-    pub git_tree: String,
     pub spec_sha256: String,
-    pub environment_sha256: String,
-    pub test_plan_sha256: String,
+    pub mode: String,
+    pub command: Vec<String>,
+    pub cwd: String,
     pub started_at: String,
     pub finished_at: String,
-    pub source_unchanged: bool,
+    pub duration_seconds: f64,
+    pub exit_code: i64,
+    pub timed_out: bool,
     pub stdout: FileRef,
+    pub stderr: FileRef,
+    pub candidate_manifest: FileRef,
+    pub source_unchanged: bool,
+    pub environment_sha256: String,
+    pub test_plan_sha256: String,
+    pub artifacts: Vec<NamedRef>,
     pub missing_artifacts: Vec<String>,
     pub producer_attempt_id: String,
+    pub runner: Runner,
+}
+
+impl Record {
+    /// One read from its JSON, refused unless it has the schema's shape: the in-crate validator cannot read the
+    /// schema's `^(?!/)` patterns (no lookaround), so the shape is checked here and an integration test validates
+    /// records with Python's jsonschema against the locked schema itself.
+    pub fn from_value(value: &Value) -> Result<Record, String> {
+        let record: Record = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+        let hex64 = |s: &str| {
+            s.len() == 64
+                && s.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        };
+        let relative = |p: &str| !p.is_empty() && !p.starts_with('/');
+        let bounded = |s: &str| (1..=160).contains(&s.len());
+        let checks: [(bool, &str); 17] = [
+            (record.schema_version == "1.1", "schema_version is not 1.1"),
+            (
+                record.record_type == "command_execution",
+                "record_type is not command_execution",
+            ),
+            (bounded(&record.record_id), "record_id is empty or too long"),
+            (bounded(&record.check_id), "check_id is empty or too long"),
+            (
+                record.candidate_id.strip_prefix("CAND-").is_some_and(hex64),
+                "candidate_id is not a candidate id",
+            ),
+            (
+                [
+                    &record.spec_sha256,
+                    &record.environment_sha256,
+                    &record.test_plan_sha256,
+                ]
+                .iter()
+                .all(|s| hex64(s)),
+                "a digest is not a sha256",
+            ),
+            (
+                ["mock", "live", "product", "bundle"].contains(&record.mode.as_str()),
+                "mode is not one of the schema's",
+            ),
+            (!record.command.is_empty(), "command is empty"),
+            (relative(&record.cwd), "cwd is not relative"),
+            (
+                crate::schema::is_date_time(&record.started_at)
+                    && crate::schema::is_date_time(&record.finished_at),
+                "a time is not a date-time",
+            ),
+            (
+                record.duration_seconds.is_finite() && record.duration_seconds >= 0.0,
+                "duration_seconds is negative",
+            ),
+            (
+                [&record.stdout, &record.stderr, &record.candidate_manifest]
+                    .iter()
+                    .all(|r| relative(&r.path) && hex64(&r.sha256)),
+                "a file reference is not relative or its digest not a sha256",
+            ),
+            (
+                record
+                    .artifacts
+                    .iter()
+                    .all(|a| !a.name.is_empty() && relative(&a.path) && hex64(&a.sha256)),
+                "an artifact reference is malformed",
+            ),
+            (
+                record.missing_artifacts.iter().all(|m| !m.is_empty()),
+                "a missing artifact has no name",
+            ),
+            (
+                bounded(&record.producer_attempt_id),
+                "producer_attempt_id is empty or too long",
+            ),
+            (!record.runner.tool.is_empty(), "runner.tool is empty"),
+            (
+                record.runner.boot_id.is_some() || value["runner"].get("boot_id").is_none(),
+                "runner.boot_id is not a string",
+            ),
+        ];
+        match checks.iter().find(|(ok, _)| !ok) {
+            Some((_, why)) => Err((*why).to_owned()),
+            None => Ok(record),
+        }
+    }
+}
+
+/// A check's result as evidence (REQ-052 behaviour 6; docs/adr/ADR-027.md decision 8): its execution record, the git
+/// tree the check observed, the record's own directory and its observations (test-result lines, or the declared
+/// artifacts and the record's own conclusion for a check whose plan declares no test results).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Evidence {
+    pub record: Record,
+    pub git_tree: String,
+    /// Relative to the checkout root; every file the record names is inside it.
+    pub record_dir: String,
     pub observations: Vec<Value>,
 }
 
-/// What evidence is judged against beyond the candidate: whether its producer attempt exists, and the sha256 of a
-/// file it names now.
+/// The frozen check plan's entry for one check (contracts/check-plan.schema.json).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Planned {
+    pub argv: Vec<String>,
+    pub mode: String,
+    pub cwd: String,
+    pub artifacts: Vec<String>,
+}
+
+/// The attempt that produced evidence: its run and its task's role (principle two).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Producer {
+    pub run_id: String,
+    pub role: String,
+}
+
+/// What evidence is judged against beyond the candidate and spec: the store's attempts and candidates, the files as
+/// they are now, and the frozen check plan.
 pub trait Lookup {
-    fn attempt_exists(&self, attempt_id: &str) -> bool;
+    /// The attempt `attempt_id`'s run and task role, if it exists.
+    fn producer(&self, attempt_id: &str) -> Option<Producer>;
+    /// The run the candidate `candidate_id` belongs to.
+    fn run_of(&self, candidate_id: &str) -> Option<String>;
+    /// The sha256 of the file at `path` (relative to the checkout root) now.
     fn sha256_of(&self, path: &str) -> Option<String>;
+    /// The id the candidate export at `path` computes, if it is one.
+    fn candidate_at(&self, path: &str) -> Option<String>;
+    /// Whether `path`, resolved (`..` and links), is inside the directory `dir`.
+    fn inside(&self, path: &str, dir: &str) -> bool;
+    /// Whether the directory `dir` is, holds or lies in another record's directory.
+    fn overlaps(&self, dir: &str) -> bool;
+    /// The frozen plan's entry for `check_id`.
+    fn planned(&self, check_id: &str) -> Option<Planned>;
+    /// The live-sessions document at `path`.
+    fn live_sessions(&self, path: &str) -> Option<Value>;
+}
+
+/// Why evidence does not count: a closed set (docs/adr/ADR-027.md decision 8). The first eleven are AC-052-04's;
+/// the rest are tools/release_gate.py's other rules for one record, and the producer's (principle two).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Reason {
+    CandidateMismatch,
+    TreeMismatch,
+    SpecMismatch,
+    EnvironmentMismatch,
+    TestPlanMismatch,
+    ProducerMissing,
+    IntervalInvalid,
+    SourceChanged,
+    OutputChanged,
+    ArtifactMissing,
+    NoObservations,
+    ErrorOutputChanged,
+    ArtifactChanged,
+    ArtifactsDifferFromPlan,
+    TimedOut,
+    ExitInconsistent,
+    CommandMismatch,
+    ModeMismatch,
+    CwdMismatch,
+    CheckNotPlanned,
+    ManifestMismatch,
+    DurationMismatch,
+    RunnerTool,
+    RunnerRoot,
+    OutsideRecordDir,
+    RecordDirOverlap,
+    LiveSessionsUnbound,
+    ProducerMismatch,
+    ProducerNotIndependent,
+}
+
+impl Reason {
+    /// The code written into event payloads and acceptance_results.reason.
+    pub fn code(self) -> &'static str {
+        match self {
+            Reason::CandidateMismatch => "CANDIDATE_MISMATCH",
+            Reason::TreeMismatch => "TREE_MISMATCH",
+            Reason::SpecMismatch => "SPEC_MISMATCH",
+            Reason::EnvironmentMismatch => "ENVIRONMENT_MISMATCH",
+            Reason::TestPlanMismatch => "TEST_PLAN_MISMATCH",
+            Reason::ProducerMissing => "PRODUCER_MISSING",
+            Reason::IntervalInvalid => "INTERVAL_INVALID",
+            Reason::SourceChanged => "SOURCE_CHANGED",
+            Reason::OutputChanged => "OUTPUT_CHANGED",
+            Reason::ArtifactMissing => "ARTIFACT_MISSING",
+            Reason::NoObservations => "NO_OBSERVATIONS",
+            Reason::ErrorOutputChanged => "ERROR_OUTPUT_CHANGED",
+            Reason::ArtifactChanged => "ARTIFACT_CHANGED",
+            Reason::ArtifactsDifferFromPlan => "ARTIFACTS_DIFFER_FROM_PLAN",
+            Reason::TimedOut => "TIMED_OUT",
+            Reason::ExitInconsistent => "EXIT_INCONSISTENT",
+            Reason::CommandMismatch => "COMMAND_MISMATCH",
+            Reason::ModeMismatch => "MODE_MISMATCH",
+            Reason::CwdMismatch => "CWD_MISMATCH",
+            Reason::CheckNotPlanned => "CHECK_NOT_PLANNED",
+            Reason::ManifestMismatch => "MANIFEST_MISMATCH",
+            Reason::DurationMismatch => "DURATION_MISMATCH",
+            Reason::RunnerTool => "RUNNER_TOOL",
+            Reason::RunnerRoot => "RUNNER_ROOT",
+            Reason::OutsideRecordDir => "OUTSIDE_RECORD_DIR",
+            Reason::RecordDirOverlap => "RECORD_DIR_OVERLAP",
+            Reason::LiveSessionsUnbound => "LIVE_SESSIONS_UNBOUND",
+            Reason::ProducerMismatch => "PRODUCER_MISMATCH",
+            Reason::ProducerNotIndependent => "PRODUCER_NOT_INDEPENDENT",
+        }
+    }
 }
 
 /// Why evidence does not count: its class (`INSUFFICIENT` when it observed nothing, else `INVALID`; the evidence
@@ -223,54 +453,151 @@ pub trait Lookup {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Invalid {
     pub class: &'static str,
-    pub reasons: Vec<&'static str>,
+    pub reasons: Vec<Reason>,
 }
 
-/// Whether evidence `e` counts for candidate `c` under spec `s` (REQ-052 behaviour 7): every binding matches, it
-/// observed something, its producer attempt exists, its interval is sound, its source was unchanged, its output is
-/// what it recorded and none of its declared artifacts is missing.
+impl Invalid {
+    /// The reasons' codes, in the order found.
+    pub fn codes(&self) -> Vec<&'static str> {
+        self.reasons.iter().map(|r| r.code()).collect()
+    }
+}
+
+/// Whether evidence `e` counts for candidate `c` under spec `s` (REQ-052 behaviour 7; docs/adr/ADR-027.md decision
+/// 8): every binding matches, it observed something, its producer is a qa or reviewer attempt of the candidate's run,
+/// its record holds every rule tools/release_gate.py applies to one record, and every file it names is what it
+/// recorded. Every reason found is reported, none before another.
 pub fn valid(e: &Evidence, c: &Sealed, s: &str, world: &dyn Lookup) -> Result<(), Invalid> {
     let m = &c.manifest;
+    let r = &e.record;
     let mut reasons = Vec::new();
-    if e.candidate_id != c.candidate_id {
-        reasons.push("CANDIDATE_MISMATCH");
+    let mut need = |ok: bool, reason: Reason| {
+        if !ok {
+            reasons.push(reason);
+        }
+    };
+    need(r.candidate_id == c.candidate_id, Reason::CandidateMismatch);
+    need(e.git_tree == m.git_tree, Reason::TreeMismatch);
+    need(
+        r.spec_sha256 == s && s == m.spec.sha256,
+        Reason::SpecMismatch,
+    );
+    need(
+        r.environment_sha256 == m.environment.sha256,
+        Reason::EnvironmentMismatch,
+    );
+    need(
+        r.test_plan_sha256 == m.test_plan.sha256,
+        Reason::TestPlanMismatch,
+    );
+    match world.producer(&r.producer_attempt_id) {
+        None => need(false, Reason::ProducerMissing),
+        Some(p) => {
+            need(
+                world.run_of(&c.candidate_id).as_deref() == Some(p.run_id.as_str()),
+                Reason::ProducerMismatch,
+            );
+            need(
+                p.role == "qa" || p.role == "reviewer",
+                Reason::ProducerNotIndependent,
+            );
+        }
     }
-    if e.git_tree != m.git_tree {
-        reasons.push("TREE_MISMATCH");
+    let millis = |t: &str| {
+        crate::time::parse_rfc3339_millis(t)
+            .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs_f64())
+    };
+    match millis(&r.started_at).zip(millis(&r.finished_at)) {
+        Some((start, end)) if end >= start => {
+            // tools/release_gate.py: the recorded duration within max(5 s, 1 %) of the interval.
+            let elapsed = end - start;
+            need(
+                (elapsed - r.duration_seconds).abs() <= (elapsed * 0.01).max(5.0),
+                Reason::DurationMismatch,
+            );
+        }
+        _ => need(false, Reason::IntervalInvalid),
     }
-    if e.spec_sha256 != s || s != m.spec.sha256 {
-        reasons.push("SPEC_MISMATCH");
+    need(r.source_unchanged, Reason::SourceChanged);
+    let holds = |f: &str, sha: &str| world.sha256_of(f).as_deref() == Some(sha);
+    need(
+        holds(&r.stdout.path, &r.stdout.sha256),
+        Reason::OutputChanged,
+    );
+    need(
+        holds(&r.stderr.path, &r.stderr.sha256),
+        Reason::ErrorOutputChanged,
+    );
+    need(r.missing_artifacts.is_empty(), Reason::ArtifactMissing);
+    need(!e.observations.is_empty(), Reason::NoObservations);
+    need(
+        r.artifacts.iter().all(|a| holds(&a.path, &a.sha256)),
+        Reason::ArtifactChanged,
+    );
+    need(!r.timed_out, Reason::TimedOut);
+    need(
+        r.exit_code != 0 || !e.observations.iter().any(|o| o["status"] == "FAIL"),
+        Reason::ExitInconsistent,
+    );
+    match world.planned(&r.check_id) {
+        None => need(false, Reason::CheckNotPlanned),
+        Some(plan) => {
+            need(r.command == plan.argv, Reason::CommandMismatch);
+            need(
+                r.mode == plan.mode && ["mock", "live", "product"].contains(&r.mode.as_str()),
+                Reason::ModeMismatch,
+            );
+            let normal = |p: &str| -> std::path::PathBuf {
+                std::path::Path::new(p)
+                    .components()
+                    .filter(|c| !matches!(c, std::path::Component::CurDir))
+                    .collect()
+            };
+            need(normal(&r.cwd) == normal(&plan.cwd), Reason::CwdMismatch);
+            let mut found: Vec<&str> = r.artifacts.iter().map(|a| a.name.as_str()).collect();
+            let mut declared: Vec<&str> = plan.artifacts.iter().map(String::as_str).collect();
+            found.sort_unstable();
+            found.dedup();
+            declared.sort_unstable();
+            declared.dedup();
+            need(found == declared, Reason::ArtifactsDifferFromPlan);
+        }
     }
-    if e.environment_sha256 != m.environment.sha256 {
-        reasons.push("ENVIRONMENT_MISMATCH");
-    }
-    if e.test_plan_sha256 != m.test_plan.sha256 {
-        reasons.push("TEST_PLAN_MISMATCH");
-    }
-    if !world.attempt_exists(&e.producer_attempt_id) {
-        reasons.push("PRODUCER_MISSING");
-    }
-    let interval = crate::time::parse_rfc3339(&e.started_at)
-        .zip(crate::time::parse_rfc3339(&e.finished_at))
-        .is_some_and(|(start, end)| end >= start);
-    if !interval {
-        reasons.push("INTERVAL_INVALID");
-    }
-    if !e.source_unchanged {
-        reasons.push("SOURCE_CHANGED");
-    }
-    if world.sha256_of(&e.stdout.path).as_deref() != Some(e.stdout.sha256.as_str()) {
-        reasons.push("OUTPUT_CHANGED");
-    }
-    if !e.missing_artifacts.is_empty() {
-        reasons.push("ARTIFACT_MISSING");
-    }
-    if e.observations.is_empty() {
-        reasons.push("NO_OBSERVATIONS");
+    need(
+        holds(&r.candidate_manifest.path, &r.candidate_manifest.sha256)
+            && world.candidate_at(&r.candidate_manifest.path).as_deref()
+                == Some(c.candidate_id.as_str()),
+        Reason::ManifestMismatch,
+    );
+    need(
+        ["tools/run_check.py", "hoh"].contains(&r.runner.tool.as_str()),
+        Reason::RunnerTool,
+    );
+    need(r.runner.euid != 0, Reason::RunnerRoot);
+    need(
+        [&r.stdout.path, &r.stderr.path]
+            .into_iter()
+            .chain(r.artifacts.iter().map(|a| &a.path))
+            .all(|p| world.inside(p, &e.record_dir)),
+        Reason::OutsideRecordDir,
+    );
+    need(!world.overlaps(&e.record_dir), Reason::RecordDirOverlap);
+    if r.mode == "live" {
+        let bound = r
+            .artifacts
+            .iter()
+            .find(|a| a.name == "live-sessions.json")
+            .and_then(|a| world.live_sessions(&a.path))
+            .is_some_and(|v| {
+                v["check_id"] == r.check_id.as_str()
+                    && v["harness_candidate_id"] == c.candidate_id.as_str()
+            });
+        need(bound, Reason::LiveSessionsUnbound);
     }
     match reasons.as_slice() {
         [] => Ok(()),
-        ["NO_OBSERVATIONS"] => Err(Invalid {
+        [Reason::NoObservations] => Err(Invalid {
             class: "INSUFFICIENT",
             reasons,
         }),
