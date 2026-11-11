@@ -1167,8 +1167,9 @@ async fn a_writer_the_host_stops_for_an_oversize_frame_lets_its_lease_go_with_th
 -> R {
     // M2T17FR-50, -53 (REQ-019 behaviour 6, docs/adr/ADR-024.md decision 9 after round 1): HoH itself stops a writer's
     // claude turn that sends a frame over the limit; the attempt ends FAILED (PROTOCOL_FRAME_TOO_LARGE), by the
-    // runner's own end, with the workspace's record in the same transaction, taken after the stop in the project's git
-    // work tree (its uncommitted change in the record's diff); the next writer is granted only after it.
+    // runner's own end, with the workspace's record in the same transaction: the record holds the project's git work
+    // tree with its uncommitted change (its diff hash); the next writer is granted only after it. That the record is
+    // taken after the stop is the settle's host test's (its agent's SIGTERM write is in the record, M2T17FR-153).
     let world = World::new()?;
     world.claude(None)?;
     let project = world.project();
