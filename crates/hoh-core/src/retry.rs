@@ -24,10 +24,13 @@ pub enum FailureClass {
     Auth,
     /// An incompatible CLI found at run time (BLOCKED_CAPABILITY).
     Capability,
+    /// A refusal before anything ran that the same input would meet again, such as CONTEXT_BUDGET_TOO_SMALL
+    /// (docs/adr/ADR-026.md decision 9): no retry, a decision at once (NEED_DECISION).
+    Decision,
 }
 
 impl FailureClass {
-    /// As an OBSERVED effect and the retry events record it: `{"class": "transient"|"auth"|"capability",
+    /// As an OBSERVED effect and the retry events record it: `{"class": "transient"|"auth"|"capability"|"decision",
     /// "retry_after_ms": n|null}`, so a host that crashes after OBSERVED disposes of it by its class (ADR-020
     /// decision 1).
     pub fn to_json(self) -> serde_json::Value {
@@ -35,6 +38,7 @@ impl FailureClass {
             FailureClass::Transient { retry_after } => ("transient", retry_after),
             FailureClass::Auth => ("auth", None),
             FailureClass::Capability => ("capability", None),
+            FailureClass::Decision => ("decision", None),
         };
         serde_json::json!({
             "class": class,
@@ -53,6 +57,7 @@ impl FailureClass {
             }),
             "auth" => Some(FailureClass::Auth),
             "capability" => Some(FailureClass::Capability),
+            "decision" => Some(FailureClass::Decision),
             _ => None,
         }
     }
@@ -72,6 +77,8 @@ pub enum AfterFailure {
     Blocked(BlockedReason),
     /// Its retries are used up: BLOCKED for a decision (NEED_DECISION).
     Exhausted,
+    /// Retrying would meet the same refusal: BLOCKED for a decision (NEED_DECISION) at once.
+    Decide,
 }
 
 /// The policy for a task's failure: `failures` is its failed attempts including this one (`tasks.attempt_count`
@@ -85,6 +92,7 @@ pub fn after_failure(
     let retry_after = match class {
         FailureClass::Auth => return AfterFailure::Blocked(BlockedReason::BlockedAuth),
         FailureClass::Capability => return AfterFailure::Blocked(BlockedReason::BlockedCapability),
+        FailureClass::Decision => return AfterFailure::Decide,
         FailureClass::Transient { retry_after } => retry_after,
     };
     if failures > MAX_RETRIES {
@@ -161,6 +169,20 @@ mod tests {
 
     fn transient() -> FailureClass {
         FailureClass::Transient { retry_after: None }
+    }
+
+    #[test]
+    fn a_refusal_that_would_refuse_the_same_input_again_asks_for_a_decision_at_once() {
+        // ADR-026 decision 9: CONTEXT_BUDGET_TOO_SMALL is deterministic; no retry, whatever the count.
+        for failures in [1, 2, MAX_RETRIES, MAX_RETRIES + 1] {
+            assert_eq!(
+                after_failure(FailureClass::Decision, failures, at(1_000, 0), 7),
+                AfterFailure::Decide
+            );
+        }
+        let json = FailureClass::Decision.to_json();
+        assert_eq!(json["class"], "decision");
+        assert_eq!(FailureClass::from_json(&json), Some(FailureClass::Decision));
     }
 
     #[test]
