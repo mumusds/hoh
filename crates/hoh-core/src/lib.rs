@@ -49,6 +49,8 @@ pub mod schedule;
 #[forbid(clippy::disallowed_methods)]
 pub mod schema;
 #[forbid(clippy::disallowed_methods)]
+pub mod state_dir;
+#[forbid(clippy::disallowed_methods)]
 pub mod supervise;
 #[forbid(clippy::disallowed_methods)]
 pub mod time;

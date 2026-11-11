@@ -1845,6 +1845,25 @@ async fn a_host_leaves_its_files_and_holds_the_project() -> R {
     Ok(())
 }
 
+/// A host's `.hoh/` is kept out of git: the start writes `.hoh/.gitignore` holding `*` when there is none, and leaves
+/// one already there as it is (docs/adr/ADR-027.md decision 3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_keeps_its_state_dir_out_of_git() -> R {
+    let dir = tempfile::tempdir()?;
+    let host = Host::start(config(dir.path())).await?;
+    let ignore = dir.path().join(".hoh/.gitignore");
+    assert_eq!(
+        std::fs::read_to_string(&ignore)?,
+        hoh_core::state_dir::IGNORE_ALL
+    );
+    host.shutdown().await;
+    std::fs::write(&ignore, "state.db*\n")?;
+    let host = Host::start(config(dir.path())).await?;
+    assert_eq!(std::fs::read_to_string(&ignore)?, "state.db*\n");
+    host.shutdown().await;
+    Ok(())
+}
+
 /// A socket left by a host that did not clean up is removed at the next start; a file that is not a socket is left
 /// and the start refused (ADR-016 decision 1, M2T12R-04).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

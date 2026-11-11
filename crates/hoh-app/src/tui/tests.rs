@@ -92,6 +92,11 @@ fn history_lives_in_the_project_and_survives_bad_lines() {
     h.append("hello").expect("append");
     h.append("说 \"hi\"\n").expect("append");
     let file = dir.path().join(".hoh/input-history.jsonl");
+    // The `.hoh/` it made is kept out of git (docs/adr/ADR-027.md decision 3).
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(".hoh/.gitignore")).expect("read"),
+        hoh_core::state_dir::IGNORE_ALL
+    );
     assert_eq!(
         std::fs::read_to_string(&file).expect("read"),
         "{\"text\":\"hello\"}\n{\"text\":\"说 \\\"hi\\\"\\n\"}\n"
