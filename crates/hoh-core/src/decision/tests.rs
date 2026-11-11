@@ -60,6 +60,7 @@ fn proposal(payload: serde_json::Value) -> Proposal {
         expected_revision: 7,
         spec_sha256: "b".repeat(64),
         candidate_id: Some("C1".to_owned()),
+        causation_id: None,
         payload: serde_json::from_value(payload).expect("payload"),
     }
 }
@@ -512,4 +513,26 @@ fn a_supervision_task_is_moved_by_no_decision() {
         ),
         IllegalTransition
     );
+}
+
+#[test]
+fn a_blocked_or_waiting_run_takes_task_moves_and_assumptions_only() {
+    // docs/adr/ADR-025.md decision 6 (-101, -153, -254): BLOCKED and WAITING_EXTERNAL judge transition_task and
+    // record_assumption; dispatch and transition_run are ILLEGAL_TRANSITION there; a paused run takes none.
+    let assumption = proposal(json!({"kind": "record_assumption", "statement": "s", "basis": "b"}));
+    let to_ready = proposal(
+        json!({"kind": "transition_task", "task_id": "T1", "to_state": "CANCELLED", "reason": "not needed"}),
+    );
+    let run = proposal(json!({"kind": "transition_run", "to_state": "VERIFYING", "reason": "r"}));
+    for state in [RunState::Blocked, RunState::WaitingExternal] {
+        let mut s = snapshot();
+        s.run.state = state;
+        assert!(validate(&assumption, &s).is_ok(), "{state:?}");
+        assert!(validate(&to_ready, &s).is_ok(), "{state:?}");
+        assert_eq!(reason(&dispatch_t1(), &s), IllegalTransition, "{state:?}");
+        assert_eq!(reason(&run, &s), IllegalTransition, "{state:?}");
+    }
+    let mut paused = snapshot();
+    paused.run.state = RunState::Paused;
+    assert_eq!(reason(&assumption, &paused), IllegalTransition);
 }

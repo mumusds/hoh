@@ -26,6 +26,8 @@ pub struct Proposal {
     pub spec_sha256: String,
     /// The candidate the Commander's verdict is about; acceptance is judged on it alone (CONTRACT 7).
     pub candidate_id: Option<String>,
+    /// What it answers: the wake its turn was given (docs/adr/ADR-025.md decision 6), from the message's causation.
+    pub causation_id: Option<String>,
     pub payload: DecisionPayload,
 }
 
@@ -70,6 +72,7 @@ impl Proposal {
             expected_revision: message.expected_revision,
             spec_sha256: message.spec_sha256.clone(),
             candidate_id: message.candidate_id.clone(),
+            causation_id: message.causation_id.clone(),
             payload,
         })
     }
@@ -368,11 +371,21 @@ pub fn validate(proposal: &Proposal, snapshot: &Snapshot) -> Result<Effect, Reje
             ),
         );
     }
-    if !lifecycle::is_working(snapshot.run.state) {
+    // BLOCKED and WAITING_EXTERNAL judge task moves and assumptions only: a run's moves out of them are the user's
+    // commands and the Runtime's facts (docs/adr/ADR-025.md decision 6, ADR-011 §3.4).
+    let suspended_ok = matches!(
+        snapshot.run.state,
+        RunState::Blocked | RunState::WaitingExternal
+    ) && matches!(
+        proposal.payload,
+        DecisionPayload::TransitionTask { .. } | DecisionPayload::RecordAssumption { .. }
+    );
+    if !lifecycle::is_working(snapshot.run.state) && !suspended_ok {
         return reject(
             IllegalTransition,
             format!(
-                "the run is {}; decisions apply to working runs only",
+                "the run is {}; decisions apply to working runs only (BLOCKED and WAITING_EXTERNAL: task moves and \
+                 assumptions)",
                 snapshot.run.state.as_str()
             ),
         );

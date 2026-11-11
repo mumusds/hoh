@@ -702,7 +702,8 @@ async fn proposals_that_cannot_be_recorded_write_nothing() -> R {
         rows(&path, "SELECT count(*) FROM events")?,
     );
     assert_eq!(after, before);
-    // The same decision id twice: the second is refused whole.
+    // The same decision id twice with other content: a key reuse, refused whole (docs/adr/ADR-025.md decision 6: no
+    // longer an integrity violation).
     let first = commander.decide(
         3,
         7,
@@ -712,10 +713,10 @@ async fn proposals_that_cannot_be_recorded_write_nothing() -> R {
     again.expected_revision = 8;
     store.decide(first, context()).await?;
     let once = (tables(&path)?, rows(&path, "SELECT count(*) FROM events")?);
-    assert!(matches!(
-        store.decide(again, context()).await,
-        Err(PersistError::IntegrityViolation(_))
-    ));
+    assert_eq!(
+        store.decide(again, context()).await?,
+        crate::persistence::Decided::KeyReuse
+    );
     assert_eq!(
         (tables(&path)?, rows(&path, "SELECT count(*) FROM events")?),
         once

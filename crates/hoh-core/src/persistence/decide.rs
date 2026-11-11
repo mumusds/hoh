@@ -31,6 +31,10 @@ pub enum Decided {
         detail: String,
         event_seq: i64,
     },
+    /// Its decision id was decided before with the same content: nothing written again; the state it got.
+    Replayed { state: String },
+    /// Its decision id was decided before with other content: nothing written (KEY_REUSE).
+    KeyReuse,
 }
 
 /// See [`crate::ids::child_id`].
@@ -56,13 +60,122 @@ pub(super) fn decide(
     context: &Context,
     ctx: &super::writer::Ctx<'_>,
 ) -> Result<Decided, PersistError> {
+    let tx = super::writer::begin(conn, ctx)?;
+    let decided = decide_in(&tx, proposal, context, ctx)?;
+    if !matches!(decided, Decided::Replayed { .. } | Decided::KeyReuse) {
+        tx.commit().map_err(sqlite_error)?;
+    }
+    Ok(decided)
+}
+
+/// The turn a decision answers: its wake's latest allocation, as `supervisor.allocated` recorded it.
+struct Answered {
+    wake: String,
+    fingerprint: String,
+    spec_id: Option<String>,
+    snapshots: serde_json::Map<String, Value>,
+    run_revision: i64,
+    role_epoch: i64,
+}
+
+fn answered(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    causation: Option<&str>,
+) -> Result<Option<Answered>, PersistError> {
+    let Some(wake) = causation else {
+        return Ok(None);
+    };
+    let payload: Option<String> = tx
+        .query_row(
+            "SELECT payload_json FROM events WHERE run_id = ?1 AND kind = 'supervisor.allocated' \
+             AND json_extract(payload_json, '$.wake') = ?2 ORDER BY seq DESC LIMIT 1",
+            params![run_id, wake],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some(payload) = payload else {
+        return Ok(None);
+    };
+    let payload: Value = serde_json::from_str(&payload)
+        .map_err(|e| PersistError::IntegrityViolation(format!("allocation of {wake}: {e}")))?;
+    Ok(Some(Answered {
+        wake: wake.to_owned(),
+        fingerprint: payload["dedup_key"]["fingerprint"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
+        spec_id: payload["dedup_key"]["spec_id"].as_str().map(str::to_owned),
+        snapshots: payload["snapshots"]
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+        run_revision: payload["run_revision"].as_i64().unwrap_or(-1),
+        role_epoch: payload["role_epoch"].as_i64().unwrap_or(-1),
+    }))
+}
+
+/// The task-snapshot fence (docs/adr/ADR-025.md decision 6): a task the answered turn was shown has moved since.
+fn fenced(tx: &Transaction<'_>, turn: &Answered) -> Result<Option<Rejection>, PersistError> {
+    for (task, shown) in &turn.snapshots {
+        let now: Option<i64> = tx
+            .query_row(
+                "SELECT revision FROM tasks WHERE task_id = ?1",
+                params![task],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sqlite_error)?;
+        if now != shown.as_i64() {
+            return Ok(Some(Rejection {
+                reason: RejectionReason::StaleRevision,
+                detail: format!(
+                    "task {task} was at revision {shown} when wake {} was given its turn; it is at {} now",
+                    turn.wake,
+                    now.map_or_else(|| "none".to_owned(), |n| n.to_string())
+                ),
+            }));
+        }
+    }
+    Ok(None)
+}
+
+/// `decide` inside the caller's transaction (docs/adr/ADR-025.md decision 8: the output bridge commits a decision with
+/// its own record): a decision id seen before is a replay (same content) or a key reuse (other content), nothing
+/// written; otherwise the decisions row, its verdict, its effect and its event, and for a stale answer to a wake its
+/// one re-trigger.
+pub(super) fn decide_in(
+    tx: &Transaction<'_>,
+    proposal: &Proposal,
+    context: &Context,
+    ctx: &super::writer::Ctx<'_>,
+) -> Result<Decided, PersistError> {
     // The payload is checked against $defs.DecisionPayload again on the way in, whoever built the proposal.
     let payload = protocol::encode(&proposal.payload)
         .map_err(|e| PersistError::InvalidProposal(format!("{}: {e}", proposal.decision_id)))?;
     let role_epoch = to_i64(proposal.role_epoch, "role_epoch")?;
     let expected_revision = to_i64(proposal.expected_revision, "expected_revision")?;
-    let tx = super::writer::begin(conn, ctx)?;
-    let (project_id, run) = load_run(&tx, &proposal.run_id)?;
+    let seen: Option<(String, i64, i64, String, String)> = tx
+        .query_row(
+            "SELECT run_id, role_epoch, expected_revision, payload_json, state FROM decisions WHERE decision_id = ?1",
+            params![proposal.decision_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    if let Some((run_id, epoch, revision, recorded, state)) = seen {
+        let same = run_id == proposal.run_id
+            && epoch == role_epoch
+            && revision == expected_revision
+            && serde_json::from_str::<Value>(&recorded).ok().as_ref() == Some(&payload);
+        return Ok(if same {
+            Decided::Replayed { state }
+        } else {
+            Decided::KeyReuse
+        });
+    }
+    let (project_id, run) = load_run(tx, &proposal.run_id)?;
     tx.execute(
         "INSERT INTO decisions(decision_id, run_id, role_epoch, expected_revision, payload_json, state) \
          VALUES (?1, ?2, ?3, ?4, ?5, 'PROPOSED')",
@@ -75,8 +188,24 @@ pub(super) fn decide(
         ],
     )
     .map_err(sqlite_error)?;
-    let snapshot = load_snapshot(&tx, &project_id, proposal, context, run)?;
-    let decided = match decision::validate(proposal, &snapshot) {
+    let snapshot = load_snapshot(tx, &project_id, proposal, context, run)?;
+    let turn = answered(tx, &proposal.run_id, proposal.causation_id.as_deref())?;
+    // The fences in order: the Commander's epoch, the run's revision, then the tasks its turn was shown.
+    let verdict = match decision::validate(proposal, &snapshot) {
+        Err(r)
+            if matches!(
+                r.reason,
+                RejectionReason::StaleRoleEpoch | RejectionReason::StaleRevision
+            ) =>
+        {
+            Err(r)
+        }
+        verdict => match turn.as_ref().map(|t| fenced(tx, t)).transpose()?.flatten() {
+            Some(stale) => Err(stale),
+            None => verdict,
+        },
+    };
+    let decided = match verdict {
         Ok(Effect::Unsupported(kind)) => return Err(PersistError::Unsupported(kind)),
         Ok(effect) => {
             let lease = match &effect {
@@ -87,7 +216,7 @@ pub(super) fn decide(
                     lease_kind,
                     ..
                 } => Some(lease_task(
-                    &tx,
+                    tx,
                     &LeaseRequest {
                         project_id: &project_id,
                         run_id: &proposal.run_id,
@@ -101,7 +230,7 @@ pub(super) fn decide(
                 )?),
                 _ => None,
             };
-            let commit = applied(
+            let mut commit = applied(
                 &project_id,
                 proposal,
                 &snapshot,
@@ -109,22 +238,36 @@ pub(super) fn decide(
                 &payload,
                 lease.as_ref(),
             )?;
-            let done = writer::write(&tx, &commit, ctx)?;
-            resolve(&tx, &proposal.decision_id, "APPLIED", None)?;
+            commit.events[0].payload["causation_id"] = json!(proposal.causation_id);
+            commit.events[0].payload["decided_at"] = json!(crate::time::rfc3339_utc(context.now()));
+            let done = writer::write(tx, &commit, ctx)?;
+            resolve(tx, &proposal.decision_id, "APPLIED", None)?;
             Decided::Applied {
                 run_revision: done.revisions[0],
                 event_seqs: done.event_seqs,
             }
         }
         Err(rejection) => {
-            let event = rejected(&project_id, proposal, &snapshot, context, &rejection);
+            let mut event = rejected(&project_id, proposal, &snapshot, context, &rejection);
+            event.payload["causation_id"] = json!(proposal.causation_id);
+            event.payload["decided_at"] = json!(crate::time::rfc3339_utc(context.now()));
+            let mut events = vec![event];
+            // A stale answer to a wake is re-triggered, exactly once (REQ-021 behaviour 6, decision 6).
+            if let Some(turn) = turn.as_ref().filter(|_| {
+                matches!(
+                    rejection.reason,
+                    RejectionReason::StaleRevision | RejectionReason::StaleRoleEpoch
+                )
+            }) {
+                events.push(retrigger(tx, &project_id, proposal, &rejection, turn)?);
+            }
             let commit = Commit {
-                events: vec![event],
+                events,
                 ..Commit::default()
             };
-            let done = writer::write(&tx, &commit, ctx)?;
+            let done = writer::write(tx, &commit, ctx)?;
             resolve(
-                &tx,
+                tx,
                 &proposal.decision_id,
                 "REJECTED",
                 Some(rejection.reason),
@@ -136,8 +279,60 @@ pub(super) fn decide(
             }
         }
     };
-    tx.commit().map_err(sqlite_error)?;
     Ok(decided)
+}
+
+/// The `supervisor.retrigger` of a stale answer to `turn`'s wake (decision 6): the wake's base fingerprint and the
+/// tasks its turn was shown; `own_mistake` when the envelope differs from what the turn was given, `n` such mistakes of
+/// the run in a row since its last APPLIED decision (the re-triggered wake's backoff).
+fn retrigger(
+    tx: &Transaction<'_>,
+    project_id: &str,
+    proposal: &Proposal,
+    rejection: &Rejection,
+    turn: &Answered,
+) -> Result<NewEvent, PersistError> {
+    let own_mistake = to_i64(proposal.expected_revision, "expected_revision")? != turn.run_revision
+        || to_i64(proposal.role_epoch, "role_epoch")? != turn.role_epoch;
+    let n: i64 = if own_mistake {
+        tx.query_row(
+            "SELECT count(*) + 1 FROM events WHERE run_id = ?1 AND kind = 'supervisor.retrigger' \
+             AND json_extract(payload_json, '$.own_mistake') = 1 \
+             AND seq > coalesce((SELECT max(seq) FROM events WHERE run_id = ?1 AND kind = 'decision.applied'), 0)",
+            params![proposal.run_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?
+    } else {
+        0
+    };
+    let spec_revision: Option<i64> = match &turn.spec_id {
+        Some(spec) => tx
+            .query_row(
+                "SELECT revision FROM specs WHERE spec_id = ?1",
+                params![spec],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sqlite_error)?,
+        None => None,
+    };
+    Ok(NewEvent {
+        project_id: project_id.to_owned(),
+        event_id: child_id(&proposal.decision_id, "retrigger"),
+        run_id: Some(proposal.run_id.clone()),
+        kind: "supervisor.retrigger".to_owned(),
+        payload: json!({
+            "decision_id": proposal.decision_id,
+            "reason": reason_name(rejection.reason),
+            "base_fingerprint": turn.fingerprint.trim_end_matches("#retrigger"),
+            "spec_revision": spec_revision,
+            "task_ids": turn.snapshots.keys().collect::<Vec<_>>(),
+            "trigger": {"wake": turn.wake, "fingerprint": turn.fingerprint, "spec_id": turn.spec_id},
+            "own_mistake": own_mistake,
+            "n": n,
+        }),
+    })
 }
 
 fn resolve(
