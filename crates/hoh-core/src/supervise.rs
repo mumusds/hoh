@@ -80,6 +80,9 @@ pub struct Key {
 pub struct Wake {
     pub key: Key,
     pub severity: Severity,
+    /// A stale decision's re-trigger (`supervisor.retrigger`): its base fingerprint already carries the revision of
+    /// the wake it re-triggers, so its key never takes another (M2T08D-954, -1000).
+    pub retrigger: bool,
 }
 
 /// The severity of an issue event's own `severity` that wakes the Commander: critical and high only (behaviour 2).
@@ -115,6 +118,7 @@ pub fn classify(
                     spec_revision: payload["spec_revision"].as_i64().or(spec_revision),
                 },
                 severity: Severity::High,
+                retrigger: true,
             });
         }
         "spec.changed" | "milestone_ready" | "release_request" => Severity::Normal,
@@ -143,6 +147,7 @@ pub fn classify(
             spec_revision: payload["spec_revision"].as_i64().or(spec_revision),
         },
         severity,
+        retrigger: false,
     })
 }
 
