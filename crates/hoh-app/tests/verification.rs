@@ -883,3 +883,120 @@ async fn a_check_past_its_timeout_fails_without_vetoing_its_candidate() -> R {
     assert_eq!(f.query("SELECT state FROM candidates")?, ["FROZEN"]);
     Ok(())
 }
+
+/// Principle one's replica, scripts/product/traceability.py, on the fixture's records: per record its outcome, its row
+/// on AC-001-01 (decision 9: its conclusion on TEST-001-01, a vetoed record's INVALID only where it is the scenario
+/// check or names the TEST) and its reasons; the TEST's status over all of them; the invalid members' reasons.
+const REPLICA: &str = "import importlib.util,json,sys\nfrom pathlib import Path\n\
+    spec=importlib.util.spec_from_file_location('traceability',sys.argv[1]+'/scripts/product/traceability.py')\n\
+    tr=importlib.util.module_from_spec(spec);spec.loader.exec_module(tr)\n\
+    repo=Path(sys.argv[2]);candidate=json.load(open(repo/sys.argv[3]))\n\
+    reqs=[{'id':'REQ-001','release_targets':['v0.1'],'release_class':'required',\
+    'acceptance':[{'id':'AC-001-01','test_id':'TEST-001-01'}]}]\n\
+    w=tr.World(repo,candidate,'v0.1',requirements=reqs,scenarios={'TEST-001-01':'qa'})\n\
+    found=tr.members(w);test=w.tests()['TEST-001-01'];report=tr.report(w,found,[])\n\
+    named=lambda m:m.check=='qa' or any(isinstance(o,dict) and o.get('test_id')=='TEST-001-01' for o in m.lines)\n\
+    row=lambda m:('INVALID' if named(m) else None) if m.reasons else tr.conclude(w,m,'TEST-001-01',test)\n\
+    print(json.dumps({'members':{m.record['record_id']:[m.outcome[0],m.outcome[1],row(m),sorted(m.reasons)]\
+    for m in found},\
+    'status':report['tests']['TEST-001-01']['status'],'invalid':[i['reasons'] for i in report['invalid']]}))\n";
+
+#[tokio::test]
+async fn the_replica_concludes_on_the_products_records_as_the_product_does() -> R {
+    // docs/adr/ADR-027.md decision 9: on the same members the product's outcomes and acceptance rows and the
+    // replica's outcomes and conclusions agree, record by record; the replica's TEST status follows their history (a
+    // FAIL then a PASS is FLAKY) and names the vetoed member, whose veto set the product's candidate INVALID.
+    let failing = QA_PASSES.replace("\"PASS\"", "\"FAIL\"");
+    let f = Fixture::with_qa(&format!(
+        "if [ -e ../fail ]; then\n{failing}exit 1\nfi\n{QA_PASSES}"
+    ))
+    .await?;
+    let c = f.frozen().await?;
+    let mut runs: Vec<Ran> = Vec::new();
+    let mut go = async |check: &str, argv: &[&str]| -> R {
+        runs.push(
+            f.run(&c, check, argv)
+                .await
+                .map_err(|e| format!("{check}: {e:?}"))?,
+        );
+        Ok(())
+    };
+    go("qa", QA).await?;
+    go("slow", &["bash", "-c", "sleep 30"]).await?;
+    std::fs::write(f.dir.path().join("fail"), b"")?;
+    go("qa", QA).await?;
+    std::fs::remove_file(f.dir.path().join("fail"))?;
+    go("qa", QA).await?;
+    // A check claiming success that observed nothing vetoes its candidate (rule 12): last.
+    go("unit", &["bash", "-c", "touch ../sentinel"]).await?;
+    let outcomes: Vec<_> = runs
+        .iter()
+        .map(|r| (r.outcome.status.code(), r.outcome.reason))
+        .collect();
+    assert_eq!(
+        outcomes,
+        [
+            ("PASS", None),
+            ("FAIL", Some("TIMED_OUT")),
+            ("FAIL", None),
+            ("PASS", None),
+            ("INVALID", Some("INSUFFICIENT"))
+        ]
+    );
+    let manifest = f.record(&runs[0])?["candidate_manifest"]["path"]
+        .as_str()
+        .ok_or("no manifest path")?
+        .to_owned();
+    let out = Command::new("python3")
+        .args([
+            "-I",
+            "-c",
+            REPLICA,
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../.."),
+        ])
+        .arg(f.root())
+        .arg(&manifest)
+        .output()?;
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let judged: Value = serde_json::from_slice(&out.stdout)?;
+    let rows = f.query("SELECT evidence_id || ' ' || status FROM acceptance_results")?;
+    assert_eq!(
+        judged["members"].as_object().map(|m| m.len()),
+        Some(runs.len())
+    );
+    for ran in &runs {
+        let replica = &judged["members"][&ran.record_id];
+        let row = rows
+            .iter()
+            .find_map(|r| r.strip_prefix(&format!("{} ", ran.record_id)));
+        let mut reasons = ran.reasons.clone();
+        reasons.sort_unstable();
+        assert_eq!(
+            replica,
+            &serde_json::json!([ran.outcome.status.code(), ran.outcome.reason, row, reasons]),
+            "{}",
+            ran.record_id
+        );
+    }
+    assert_eq!(judged["status"], "FLAKY");
+    assert_eq!(judged["invalid"], serde_json::json!([["NO_OBSERVATIONS"]]));
+    assert_eq!(f.query("SELECT state FROM candidates")?, ["INVALID"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_results_file_that_is_not_utf8_is_a_result_line_invalid() -> R {
+    // Rule 1 (docs/adr/ADR-027.md principle one): every line of the results file is read as bytes and held to the
+    // schema, as the gate and the replica read it; a file that is not UTF-8 is not taken for one without lines.
+    let f = Fixture::with_qa("printf '\\xff\\xfe\\n' > \"$HOH_EVIDENCE_DIR/test-results.jsonl\"\n")
+        .await?;
+    let c = f.frozen().await?;
+    let ran = f.run(&c, "qa", QA).await.map_err(|e| format!("{e:?}"))?;
+    assert_eq!(ran.outcome.status.code(), "INVALID");
+    assert_eq!(ran.reasons, ["RESULT_LINE_INVALID"]);
+    Ok(())
+}

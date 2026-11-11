@@ -654,21 +654,18 @@ pub async fn run(
                 .iter()
                 .find(|a| a.name == "test-results.jsonl")
             {
-                let text = std::fs::read_to_string(project.join(&results.path)).unwrap_or_default();
-                for line in text.lines().filter(|l| !l.trim().is_empty()) {
-                    observations.push(
-                        serde_json::from_str(line)
-                            .unwrap_or_else(|_| Value::String(line.to_owned())),
-                    );
+                // As bytes, line by line, as the gate and the replica read it: a line that is not JSON (not UTF-8,
+                // say) stays a line, and is not a result line (rule 1).
+                let bytes = std::fs::read(project.join(&results.path)).unwrap_or_default();
+                let blank = |l: &[u8]| l.iter().all(|b| b" \t\n\r\x0b\x0c".contains(b));
+                for line in bytes.split(|b| *b == b'\n').filter(|l| !blank(l)) {
+                    observations.push(serde_json::from_slice(line).unwrap_or_else(|_| {
+                        Value::String(String::from_utf8_lossy(line).into_owned())
+                    }));
                 }
             }
             if observations.is_empty() {
-                for a in &record.artifacts {
-                    observations.push(
-                        serde_json::json!({"artifact": a.name, "path": a.path, "sha256": a.sha256,
-                        "exit_code": record.exit_code, "timed_out": record.timed_out}),
-                    );
-                }
+                observations = hoh_core::verification::fallback(&record);
             }
             // The record's files kept as objects (decision 8).
             let keep = |p: &Path, kind: &str, name: &str| -> Result<ArtifactRow, CheckError> {

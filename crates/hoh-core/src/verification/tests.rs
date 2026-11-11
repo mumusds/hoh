@@ -560,10 +560,23 @@ fn a_live_record_counts_only_with_sessions_bound_to_its_check_and_candidate() ->
                        "sessions": [{"agent": "codex", "cli_version": "1", "session_id": "s1", "resolved_model": "m"}]});
     w.sessions.push((path.clone(), bound.clone()));
     assert_eq!(valid(&e, &c, &s, &w), Ok(()));
+    // The locked contracts/live-session.schema.json decides the shape, as it does for the gate and the replica: a key
+    // it does not know, a value too long, a malformed plugin list.
+    let session = |extra: Value| {
+        let mut v = bound["sessions"].clone();
+        if let (Some(s), Some(extra)) = (v[0].as_object_mut(), extra.as_object()) {
+            s.extend(extra.clone());
+        }
+        v
+    };
     for (key, other) in [
         ("check_id", json!("adapter-live")),
         ("harness_candidate_id", json!("CAND-x")),
         ("sessions", json!([])),
+        ("sessions", session(json!({"note": "x"}))),
+        ("sessions", session(json!({"cli_version": "v".repeat(161)}))),
+        ("sessions", session(json!({"plugins": [{"package": ""}]}))),
+        ("note", json!("x")),
     ] {
         let mut v = bound.clone();
         v[key] = other;
@@ -573,6 +586,56 @@ fn a_live_record_counts_only_with_sessions_bound_to_its_check_and_candidate() ->
             valid(&e, &c, &s, &w2).map_err(|i| i.codes()),
             Err(vec!["LIVE_SESSIONS_UNBOUND"]),
             "{key}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn every_line_of_a_results_file_is_held_to_its_schema() -> R {
+    // Rule 1 (docs/adr/ADR-027.md principle one): the observations are either the results file's lines, each held to
+    // the locked contracts/test-result.schema.json as the gate and the replica hold them, or, when it has none, the
+    // record's artifacts with its own conclusion (decision 8). A line is never taken for the latter by its keys.
+    let c = manifest().seal();
+    let s = c.manifest.spec.sha256.clone();
+    let base = e0(&c);
+    let w = world0(&c, &base);
+    let fallback = |e: &Evidence| -> Vec<Value> {
+        let r = &e.record;
+        r.artifacts
+            .iter()
+            .map(|a| {
+                json!({"artifact": a.name, "path": a.path, "sha256": a.sha256, "exit_code": r.exit_code,
+                       "timed_out": r.timed_out})
+            })
+            .collect()
+    };
+    let mut e = base.clone();
+    e.observations = fallback(&e);
+    assert_eq!(valid(&e, &c, &s, &w), Ok(()), "the artifacts' fallback");
+    for (label, extra) in [
+        (
+            "a line naming an artifact",
+            json!({"artifact": "test-results.jsonl", "test_id": "TEST-052-04", "status": "PASS"}),
+        ),
+        ("a line with a key the schema does not know", {
+            let mut l = line("TEST-052-04", "PASS");
+            l["note"] = json!("x");
+            l
+        }),
+        ("a fractional duration", {
+            let mut l = line("TEST-052-04", "PASS");
+            l["duration_ms"] = json!(1.5);
+            l
+        }),
+        ("a line that is no object", json!("not json")),
+    ] {
+        let mut e = base.clone();
+        e.observations.push(extra);
+        assert_eq!(
+            valid(&e, &c, &s, &w).map_err(|i| i.codes()),
+            Err(vec!["RESULT_LINE_INVALID"]),
+            "{label}"
         );
     }
     Ok(())
@@ -859,7 +922,10 @@ fn the_outcome_is_the_first_of_the_ordered_rules_that_holds() -> R {
                              "plugins": plugins}]})
     };
     let path = e.record.artifacts[1].path.clone();
-    wl.sessions = vec![(path.clone(), sessions(json!(["hoh"])))];
+    wl.sessions = vec![(
+        path.clone(),
+        sessions(json!([{"package": "hoh", "version": "1"}])),
+    )];
     assert_eq!(status(outcome_of(&e, &wl)), ("PASS", None));
     wl.sessions = vec![(path, sessions(json!([])))];
     assert_eq!(
