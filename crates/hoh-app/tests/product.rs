@@ -114,7 +114,16 @@ impl World {
         );
         config.port = 0;
         config.store.wal_probe = Some(probe());
+        // Commander sessions' own directories in the world's, never the user's state directory (ADR-025 decision 3).
+        if let Some(runner) = config.runner.as_mut() {
+            runner.context.commander_dir = Some(self.commander_dir());
+        }
         config
+    }
+
+    /// Where this world's Commander sessions get their own directories.
+    fn commander_dir(&self) -> PathBuf {
+        self.dir.path().join("state/hoh/commander")
     }
 
     /// Bind every built-in role whose agent this world did not install to one it did (claude, then codex, then pi), in
@@ -173,7 +182,7 @@ impl World {
             &format!(
                 "f='{PROTOCOL}/claude/2.1.318'; d='{bin}/claude.d'\n\
                  case \"$1\" in --version) [ -e \"$d/hang\" ] && {{ echo $$ > \"$d/probe-pid\"; sleep 120; }}; [ -e \"$d/slow\" ] && sleep 3; echo '2.1.318 (Claude Code)'; exit 0;; --help) cat \"$f/help.txt\"; exit 0;; esac\n\
-                 echo $$ > \"$d/pid.$$\"; printf '%s\\n' \"$@\" > \"$d/argv.$$\"; env > \"$d/env.$$\"; cat > \"$d/stdin.$$\"\n\
+                 echo $$ > \"$d/pid.$$\"; pwd -P > \"$d/cwd.$$\"; printf '%s\\n' \"$@\" > \"$d/argv.$$\"; env > \"$d/env.$$\"; cat > \"$d/stdin.$$\"\n\
                  case \"$HOH_ATTEMPT_ID\" in\n\
                   *HUGE*) head -n 1 \"$f/success/stdout.jsonl\"; head -c {HUGE} /dev/zero | tr '\\0' x; sleep 20; exit 0;;\n\
                   *CANCEL*) exec python3 -c '{CANCEL_STAND_IN}' \"$d\" \"$f/success/stdout.jsonl\";;\n\
@@ -263,7 +272,7 @@ impl World {
                     generate-json-schema) [ -e \"$d/hang-schema\" ] && {{ sleep 120 & echo $! > \"$d/schema-member\"; echo $$ > \"$d/schema-pid\"; wait; }}\n\
                      [ \"$3\" = --out ] && mkdir -p \"$4\" && cp -R \"$f/app-server-schema/.\" \"$4/\"; exit 0;;\n\
                    esac\n\
-                   echo $$ > \"$d/pid.$$\"; printf '%s\\n' \"$@\" > \"$d/argv.$$\"\n\
+                   echo $$ > \"$d/pid.$$\"; pwd -P > \"$d/cwd.$$\"; printf '%s\\n' \"$@\" > \"$d/argv.$$\"\n\
                    case \"$HOH_ATTEMPT_ID\" in\n\
                     *HUGE*) frames=\"$d/huge.jsonl\"; opt=;;\n\
                     *UNKNOWN*) frames=\"$d/unknown.jsonl\"; opt=--exit-when-done; echo \"$HOH_ATTEMPT_ID\" >> \"$d/effects\";;\n\
@@ -315,7 +324,7 @@ impl World {
             &format!(
                 "f='{PROTOCOL}/pi/1.5.0'; d='{d}'\n\
                  case \"$1\" in --version) echo '1.5.0'; exit 0;; --help) cat \"$f/help.txt\"; exit 0;; esac\n\
-                 echo $$ > \"$d/pid.$$\"; printf '%s\\n' \"$@\" > \"$d/argv.$$\"\n\
+                 echo $$ > \"$d/pid.$$\"; pwd -P > \"$d/cwd.$$\"; printf '%s\\n' \"$@\" > \"$d/argv.$$\"\n\
                  case \"$HOH_ATTEMPT_ID\" in\n\
                   *HUGE*) printf '%s\\n' '{{\"type\":\"agent_start\"}}'; head -c {HUGE} /dev/zero | tr '\\0' x; sleep 20; exit 0;;\n\
                   *EARLY-EXIT/attempt-1) exec timeout 60 python3 '{PI_RPC}' \"$d/early-exit.jsonl\" \"$d/commands.json\" \"$d/log.$$\" -- \"$@\";;\n\
@@ -2367,4 +2376,98 @@ async fn a_first_pi_start_that_ends_before_its_prompt_leaves_the_package_owed() 
     host.shutdown().await;
     world.stop_fakes()?;
     outcome
+}
+
+/// A Commander turn of `agent`'s, woken by a need_decision in a world with only `agent` installed: the directory its
+/// process ran in is its session's own, under the world's Commander directory and outside the project
+/// (docs/adr/ADR-025.md decision 3, -551, -652, -1057).
+async fn a_commander_turn_runs_in_its_sessions_own_directory(agent: &str) -> R {
+    let world = World::new()?;
+    match agent {
+        "claude" => world.claude(None)?,
+        "codex" => world.codex("gpt-6-astra")?,
+        _ => world.pi()?,
+    }
+    world.bind_installed()?;
+    let host = start_when_free(world.config()).await?;
+    let project = world.project();
+    let outcome = async {
+        let run_id = started(&host, "s1").await?;
+        let limit = Duration::from_secs(60);
+        until(
+            &project,
+            &format!(
+                "SELECT count(*) FROM role_bindings WHERE run_id = '{run_id}' AND role = 'commander' \
+                 AND session_id IS NOT NULL"
+            ),
+            "1",
+            limit,
+        )
+        .await?;
+        ready(&project, &run_id, &[])?;
+        exec(
+            &project,
+            &format!(
+                "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) \
+                   SELECT project_id, 'nd-cwd', '{run_id}', 'need_decision', '{{\"fingerprint\": \"fp-cwd\"}}', \
+                   '2026-11-10T00:00:00Z' FROM runs WHERE run_id = '{run_id}';"
+            ),
+        )?;
+        until(
+            &project,
+            "SELECT count(*) FROM attempts a JOIN tasks t ON t.task_id = a.task_id WHERE t.role = 'commander' \
+             AND a.state IN ('SETTLED', 'FAILED')",
+            "1",
+            limit,
+        )
+        .await?;
+        let workdir = query(
+            &project,
+            "SELECT json_extract(payload_json, '$.path') FROM events WHERE kind = 'commander.workdir'",
+        )?;
+        let project_digest = query(&project, "SELECT project_id FROM projects")?;
+        assert!(
+            workdir.starts_with(&world.commander_dir().display().to_string()),
+            "{workdir}"
+        );
+        assert!(!workdir.contains(&project_digest), "the project's id is digested: {workdir}");
+        let canonical = std::fs::canonicalize(&workdir)?;
+        assert!(!canonical.starts_with(std::fs::canonicalize(&project)?));
+        let mut ran_in = Vec::new();
+        for entry in std::fs::read_dir(world.bin().join(format!("{agent}.d")))? {
+            let path = entry?.path();
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("cwd."))
+            {
+                ran_in.push(std::fs::read_to_string(&path)?.trim().to_owned());
+            }
+        }
+        assert!(
+            ran_in.iter().any(|d| Path::new(d) == canonical),
+            "{agent} ran in {ran_in:?}, not {}",
+            canonical.display()
+        );
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    world.stop_fakes()?;
+    outcome
+}
+
+#[tokio::test]
+async fn a_claude_commander_turn_runs_in_its_sessions_own_directory() -> R {
+    a_commander_turn_runs_in_its_sessions_own_directory("claude").await
+}
+
+#[tokio::test]
+async fn a_codex_commander_turn_runs_in_its_sessions_own_directory() -> R {
+    a_commander_turn_runs_in_its_sessions_own_directory("codex").await
+}
+
+#[tokio::test]
+async fn a_pi_commander_turn_runs_in_its_sessions_own_directory() -> R {
+    a_commander_turn_runs_in_its_sessions_own_directory("pi").await
 }

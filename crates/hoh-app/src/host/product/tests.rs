@@ -317,6 +317,7 @@ fn a_commander_turn_is_told_its_wake_the_values_to_name_its_nonce_and_its_bridge
         run_revision: 7,
         role_epoch: 2,
         summary: serde_json::json!({"wake": {"id": "R1/trigger/3"}, "snapshots": {"T1": 4}}),
+        workdir: None,
     };
     let text = supervision_text(&s, Path::new("/p/.hoh/attempts/x/messages.jsonl"));
     for part in [

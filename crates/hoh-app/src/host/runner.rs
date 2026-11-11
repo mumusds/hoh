@@ -502,8 +502,20 @@ async fn tick(
     }
     // The supervisor (docs/adr/ADR-025.md decisions 2, 3, 5 and 8): each run's step (its triggers, its Commander's
     // availability, its turns' outputs), a Commander turn for an owed wake, then the turns to stop now.
+    // The registry's looks, by their identity, judge whether a Commander's agent is there (decision 5).
+    let observed = registry
+        .as_ref()
+        .map(|registry| registry.observations(common.host_epoch));
     for run in &waiting.supervised {
-        store.supervise(run, at()).await?;
+        store
+            .supervise(
+                run,
+                Context {
+                    observations: observed.clone(),
+                    ..at()
+                },
+            )
+            .await?;
     }
     store.allocate_supervision(&project_id, at()).await?;
     for stop in store.supervision_stops(&project_id, at()).await? {

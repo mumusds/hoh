@@ -150,6 +150,22 @@ pub struct Context {
     pub reader_slots: Option<u32>,
     /// `execution.reserve_supervisor_slot` (docs/adr/ADR-025.md decision 3; `None`: the initial value true).
     pub reserve_supervisor_slot: Option<bool>,
+    /// The registry's last actual look at each agent it looked at (docs/adr/ADR-025.md decision 5); `None`: the caller
+    /// gives none (a run's Commander is then judged without them).
+    pub observations: Option<BTreeMap<String, Observation>>,
+    /// Where Commander sessions get their own working directories, outside every project
+    /// (`$XDG_STATE_HOME/hoh/commander`; docs/adr/ADR-025.md decision 3); `None`: none recorded.
+    pub commander_dir: Option<std::path::PathBuf>,
+}
+
+/// One actual look of the host's registry at an agent (a probe or a login check; a cache unchanged is none): its identity
+/// `(host_epoch, n)`, ordered host epoch first, and what it found (docs/adr/ADR-025.md decision 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Observation {
+    pub host_epoch: i64,
+    pub n: u64,
+    pub available: bool,
+    pub logged_in: bool,
 }
 
 impl Context {

@@ -203,3 +203,37 @@ fn a_registry_reads_pis_settings_from_its_own_directory_only() -> R {
     );
     Ok(())
 }
+
+#[test]
+fn each_actual_look_at_an_agent_moves_its_observations_identity_and_a_cached_one_does_not() -> R {
+    // docs/adr/ADR-025.md decision 5 (-306, -355): an observation's identity is (host_epoch, n), n the registry's
+    // actual looks at the agent (a probe, a PATH that lacks it, a login check); a look answered from the cache is none.
+    let dir = tempfile::tempdir()?;
+    fake_claude(dir.path(), "first")?;
+    let registry = Registry::new(format!("{}:/usr/bin:/bin", dir.path().display()).into());
+    assert!(registry.observations(3).is_empty(), "nothing looked at yet");
+    registry.look(Agent::Claude)?;
+    let first = registry.observations(3)["claude"];
+    assert_eq!((first.host_epoch, first.available), (3, true));
+    registry.look(Agent::Claude)?;
+    assert_eq!(
+        registry.observations(3)["claude"].n,
+        first.n,
+        "a cached look"
+    );
+    fake_claude(dir.path(), "second, a little longer")?;
+    registry.look(Agent::Claude)?;
+    assert!(
+        registry.observations(3)["claude"].n > first.n,
+        "probed again"
+    );
+    assert!(registry.look(Agent::Codex).is_err());
+    let codex = registry.observations(3)["codex"];
+    assert!(!codex.available);
+    assert!(registry.look(Agent::Codex).is_err());
+    assert!(
+        registry.observations(3)["codex"].n > codex.n,
+        "a PATH that lacks it is looked at each time"
+    );
+    Ok(())
+}
