@@ -14,7 +14,8 @@ Pseudo-records (not sent as such): {"hoh_wait": {"command": T, "count": N}} wait
 {"hoh_batch": [R, ...]} sends records in one write; {"hoh_split": [R, N]} sends R in N writes; {"hoh_stderr": BYTES}
 writes that many bytes to stderr; {"hoh_hold": PATH} waits until PATH exists; {"hoh_exit": CODE} exits at once; a {"hoh_keep_session": true} anywhere keeps the recorded session id; a {"hoh_new_file": true} anywhere makes
 a new session file even if one is found; a {"hoh_lose_session": true} anywhere deletes the found file and reports a new
-path it never writes.
+path it never writes; a {"hoh_lazy_session": true} anywhere writes a new session file only once the first prompt comes
+(pi 1.5.0 persists a session only when it has a message: SessionManager._persist and _hasConversation).
 LOGDIR gets received.jsonl (every client line) and sent.jsonl (the bytes sent). Records are split on LF only:
 str.splitlines() would also split on U+2028/U+2029 inside JSON strings, which is what this fake exists to test.
 """
@@ -60,8 +61,11 @@ def main() -> int:
     keep = '"hoh_keep_session"' in text  # a pi that reports another session than the one asked for
     fresh = '"hoh_new_file"' in text  # a pi that does not find the session and makes a new file for the id
     lose = '"hoh_lose_session"' in text  # the session file vanishes; pi names a new path it has not written yet
+    lazy = '"hoh_lazy_session"' in text  # a new session is written to its file only once a prompt comes
     text = '\n'.join(l for l in text.split('\n')
-                     if not any(k in l for k in ('"hoh_keep_session"', '"hoh_new_file"', '"hoh_lose_session"')))
+                     if not any(k in l for k in ('"hoh_keep_session"', '"hoh_new_file"', '"hoh_lose_session"',
+                                                 '"hoh_lazy_session"')))
+    unwritten = None  # (path, header) of a new session not written yet (lazy)
     if session_id and not keep:
         recorded_state = next((json.loads(l)['data'] for l in text.split('\n')
                                if l.strip() and json.loads(l).get('command') == 'get_state' and 'data' in json.loads(l)), None)
@@ -85,8 +89,12 @@ def main() -> int:
                 found = d / f'2026-11-04T09-09-09-000Z_{session_id}.jsonl'
             elif found is None or fresh:
                 found = d / f'2026-11-04T00-00-{len(list(d.glob("*.jsonl"))):02d}-000Z_{session_id}.jsonl'
-                found.write_text(json.dumps({'type': 'session', 'version': 3, 'id': session_id,
-                                             'timestamp': '2026-11-04T00:00:00.000Z', 'cwd': cwd}) + '\n')
+                header = json.dumps({'type': 'session', 'version': 3, 'id': session_id,
+                                     'timestamp': '2026-11-04T00:00:00.000Z', 'cwd': cwd}) + '\n'
+                if lazy:
+                    unwritten = (found, header)
+                else:
+                    found.write_text(header)
             if recorded_state and recorded_state.get('sessionFile'):
                 text = text.replace(json.dumps(recorded_state['sessionFile'])[1:-1], str(found))
         if recorded_state and recorded_state.get('sessionId'):
@@ -169,6 +177,9 @@ def main() -> int:
             continue
         if command.get('type') != 'extension_ui_response' and 'type' in command:
             by_type.setdefault(command['type'], []).append(command.get('id'))
+        if command.get('type') == 'prompt' and unwritten is not None:
+            unwritten[0].write_text(unwritten[1])
+            unwritten = None
         code = pump()
         if code is not None:
             return code

@@ -788,7 +788,10 @@ pub struct Assignment {
     pub config_revision: i64,
     pub session_id: Option<String>,
     /// The agent's own session id, to resume; none when the session's capabilities say it cannot be resumed (decision
-    /// 9, M2T07R-257): its next turn starts a new one of its own.
+    /// 9, M2T07R-257), or while no turn of the session completed (no attempt of it SETTLED): an id the agent gave before
+    /// any input (Pi's get_state, Codex's thread/start) names a session it may never have persisted, so resuming it
+    /// would be refused for good; the next turn starts a new one of its own (docs/adr/ADR-024.md decision 4, round 5,
+    /// M2T17R-450, -451).
     pub native_session: Option<String>,
     pub agent_version: Option<String>,
     /// A prompt override file (relative to the project) or `builtin:<role>`; none: the role's own built-in contract.
@@ -814,7 +817,8 @@ pub(super) fn assignment(
     let row: Option<Assignment> = conn
         .query_row(
             "SELECT a.agent, b.model, a.role_epoch, a.config_revision, a.session_id, \
-             CASE WHEN json_extract(s.capabilities_json, '$.resume') = 1 THEN s.native_id END, s.agent_version, \
+             CASE WHEN json_extract(s.capabilities_json, '$.resume') = 1 AND EXISTS(SELECT 1 FROM attempts p \
+              WHERE p.session_id = a.session_id AND p.state = 'SETTLED') THEN s.native_id END, s.agent_version, \
              (SELECT json_extract(e.payload_json, '$.goal') FROM events e WHERE e.run_id = ?2 AND e.kind = 'run.created' \
               ORDER BY e.seq LIMIT 1), \
              (SELECT json_extract(j.value, '$.title') FROM events e, json_each(json_extract(e.payload_json, '$.tasks')) j \
