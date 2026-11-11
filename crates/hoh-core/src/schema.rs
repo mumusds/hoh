@@ -984,6 +984,28 @@ pub fn compat_manifest() -> &'static Schema {
     })
 }
 
+/// `contracts/test-result.schema.json` (one line of a check's test-results.jsonl, CR-003).
+pub fn test_result() -> &'static Schema {
+    static SCHEMA: OnceLock<Schema> = OnceLock::new();
+    SCHEMA.get_or_init(|| {
+        load(
+            "test-result.schema.json",
+            include_str!("../../../contracts/test-result.schema.json"),
+        )
+    })
+}
+
+/// `contracts/live-session.schema.json` (the native sessions a live check used).
+pub fn live_session() -> &'static Schema {
+    static SCHEMA: OnceLock<Schema> = OnceLock::new();
+    SCHEMA.get_or_init(|| {
+        load(
+            "live-session.schema.json",
+            include_str!("../../../contracts/live-session.schema.json"),
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

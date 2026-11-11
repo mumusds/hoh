@@ -522,58 +522,30 @@ fn sessions_of(r: &Record, world: &dyn Lookup) -> Option<Option<Value>> {
         .map(|a| world.live_sessions(&a.path))
 }
 
-/// Whether `v` has contracts/test-result.schema.json's shape (rule 1): the in-crate validator is not used for the
-/// same reason as the record's; an observation naming an `artifact` is not a result line (decision 8).
+/// Whether `v` is a result line: of the locked contracts/test-result.schema.json, by the in-crate validator whose
+/// verdicts the schema corpus pins to Python jsonschema's (rule 1).
 fn result_line(v: &Value) -> bool {
-    let Some(o) = v.as_object() else {
-        return false;
-    };
-    let known = [
-        "schema_version",
-        "test_id",
-        "name",
-        "status",
-        "duration_ms",
-        "detail",
-    ];
-    let test_id = v["test_id"].as_str().is_some_and(|t| {
-        let b = t.as_bytes();
-        // ^TEST-[0-9]{3}-[0-9]{2}$
-        b.len() == 11
-            && t.starts_with("TEST-")
-            && b[8] == b'-'
-            && b[5..8].iter().chain(&b[9..11]).all(u8::is_ascii_digit)
-    });
-    o.keys().all(|k| known.contains(&k.as_str()))
-        && v["schema_version"] == "1.0"
-        && test_id
-        && v["name"]
-            .as_str()
-            .is_some_and(|n| !n.is_empty() && n.chars().count() <= 512)
-        && ["PASS", "FAIL", "DEGRADED", "SKIPPED"]
-            .contains(&v["status"].as_str().unwrap_or_default())
-        && (v
-            .get("duration_ms")
-            .is_none_or(|d| d.is_null() || d.as_u64().is_some()))
-        && v.get("detail")
-            .is_none_or(|d| d.as_str().is_some_and(|t| t.chars().count() <= 4096))
+    crate::schema::test_result().validate(v).is_ok()
 }
 
-/// Whether `v` has contracts/live-session.schema.json's shape and binds check `check` and candidate `candidate`.
+/// The observations of a record without result lines (decision 8): each of its artifacts with the record's own
+/// conclusion. The check driver writes these, and only a list equal to this one is taken for them, never a line by its
+/// keys.
+pub fn fallback(r: &Record) -> Vec<Value> {
+    r.artifacts
+        .iter()
+        .map(|a| {
+            json!({"artifact": a.name, "path": a.path, "sha256": a.sha256, "exit_code": r.exit_code,
+                   "timed_out": r.timed_out})
+        })
+        .collect()
+}
+
+/// Whether `v` is of the locked contracts/live-session.schema.json and binds check `check` and candidate `candidate`.
 fn bound(v: &Value, check: &str, candidate: &str) -> bool {
-    let text = |x: &Value| x.as_str().is_some_and(|s| !s.is_empty());
-    v["schema_version"] == "1.0"
+    crate::schema::live_session().validate(v).is_ok()
         && v["check_id"] == check
         && v["harness_candidate_id"] == candidate
-        && v["sessions"].as_array().is_some_and(|sessions| {
-            !sessions.is_empty()
-                && sessions.iter().all(|s| {
-                    ["codex", "claude", "pi"].contains(&s["agent"].as_str().unwrap_or_default())
-                        && text(&s["cli_version"])
-                        && text(&s["session_id"])
-                        && text(&s["resolved_model"])
-                })
-        })
 }
 
 /// Whether evidence `e` counts for candidate `c` under spec `s` (REQ-052 behaviour 7; docs/adr/ADR-027.md
@@ -641,10 +613,7 @@ pub fn valid(e: &Evidence, c: &Sealed, s: &str, world: &dyn Lookup) -> Result<()
         Reason::NoObservations,
     );
     need(
-        e.observations
-            .iter()
-            .filter(|o| o.get("artifact").is_none())
-            .all(result_line),
+        e.observations == fallback(r) || e.observations.iter().all(result_line),
         Reason::ResultLineInvalid,
     );
     need(
