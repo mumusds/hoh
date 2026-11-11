@@ -9,7 +9,7 @@ use super::{PersistError, sqlite_error};
 use crate::ids::child_id;
 use crate::lifecycle::Lifecycle as _;
 use crate::protocol::{BlockedReason, RunState};
-use rusqlite::{Transaction, params};
+use rusqlite::{OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
@@ -76,6 +76,50 @@ impl Claims {
                 .iter()
                 .filter_map(|r| BlockedReason::parse(r)),
         );
+        // The latest claim event carries the open claims after it and its number (docs/adr/ADR-025.md v20,
+        // M2T08R-403): two index lookups, not the run's whole claim history.
+        let mut latest: Option<(i64, String)> = None;
+        for kind in [CLAIMED, RELEASED] {
+            let row: Option<(i64, String)> = tx
+                .query_row(
+                    "SELECT seq, payload_json FROM events WHERE run_id = ?1 AND kind = ?2 ORDER BY seq DESC LIMIT 1",
+                    params![run_id, kind],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
+                .map_err(sqlite_error)?;
+            if row.as_ref().map(|r| r.0) > latest.as_ref().map(|l| l.0) {
+                latest = row;
+            }
+        }
+        if let Some((_, payload)) = &latest {
+            let payload: Value = serde_json::from_str(payload).map_err(|e| {
+                PersistError::IntegrityViolation(format!("a claim event of {run_id}: {e}"))
+            })?;
+            if let (Some(open), Some(n)) = (payload["open"].as_array(), payload["n"].as_u64()) {
+                let mut claims = Claims {
+                    project_id: project_id.to_owned(),
+                    run_id: run_id.to_owned(),
+                    open: BTreeSet::new(),
+                    stored,
+                    events: Vec::new(),
+                    next: usize::try_from(n).unwrap_or(usize::MAX - 1) + 1,
+                };
+                for pair in open {
+                    let (Some(source), Some(reason)) = (
+                        pair[0].as_str(),
+                        pair[1].as_str().and_then(BlockedReason::parse),
+                    ) else {
+                        return Err(PersistError::IntegrityViolation(format!(
+                            "a claim snapshot of {run_id} names no source or reason: {pair}"
+                        )));
+                    };
+                    claims.open.insert((source.to_owned(), reason));
+                }
+                return Ok(claims);
+            }
+        }
+        // Claim events written before their snapshot: replayed.
         let mut statement = tx
             .prepare(
                 "SELECT kind, payload_json FROM events WHERE run_id = ?1 AND kind IN (?2, ?3) ORDER BY seq",
@@ -122,15 +166,22 @@ impl Claims {
                 } else {
                     PACE
                 };
-                claims.record(CLAIMED, source, reason, true);
                 claims.open.insert((source.to_owned(), reason));
+                claims.record(CLAIMED, source, reason, true);
             }
         }
         Ok(claims)
     }
 
     fn record(&mut self, kind: &str, source: &str, reason: BlockedReason, migrated: bool) {
-        let mut payload = json!({"reason": reason.as_str(), "source": source});
+        // With the open claims after it and its number: the next load reads this one event (v20).
+        let open: Vec<Value> = self
+            .open
+            .iter()
+            .map(|(s, r)| json!([s, r.as_str()]))
+            .collect();
+        let mut payload =
+            json!({"reason": reason.as_str(), "source": source, "open": open, "n": self.next});
         if migrated {
             payload["migrated"] = json!(true);
         }

@@ -396,11 +396,15 @@ fn failed(
     ctx: &Ctx<'_>,
 ) -> Result<(), PersistError> {
     let tx = writer::begin(conn, ctx)?;
+    // Counted by their ids, `<output>/failed/<n>` (v20: no JSON comparison over the run's records).
     let n: i64 = tx
         .query_row(
-            "SELECT count(*) + 1 FROM events WHERE run_id = ?1 AND kind = ?2 \
-             AND json_extract(payload_json, '$.output_id') = ?3",
-            params![run_id, FAILED, output_id],
+            "SELECT count(*) + 1 FROM events WHERE event_id IN (?1, ?2, ?3)",
+            params![
+                child_id(output_id, "failed/1"),
+                child_id(output_id, "failed/2"),
+                child_id(output_id, "failed/3")
+            ],
             |r| r.get(0),
         )
         .map_err(sqlite_error)?;
