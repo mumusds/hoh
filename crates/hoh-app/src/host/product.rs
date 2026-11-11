@@ -254,8 +254,9 @@ fn refused(reason: &str, class: FailureClass, detail: String) -> Refusal {
     }
 }
 
-/// The attempt's outcome from its turn's facts and the prompt it was sent.
-fn outcome(facts: Facts, prompt: PromptRecord) -> Outcome {
+/// The attempt's outcome from its turn's facts (its prompt was recorded when it was marked RUNNING, docs/adr/ADR-026.md
+/// decision 7).
+fn outcome(facts: Facts) -> Outcome {
     let success = facts.state == AttemptState::Settled;
     let mut native_session = facts.native_session.clone();
     let mut events = Vec::new();
@@ -299,7 +300,7 @@ fn outcome(facts: Facts, prompt: PromptRecord) -> Outcome {
             usage: facts.usage,
             native_session,
             events,
-            prompt: Some(prompt),
+            prompt: None,
             raw_log_path: Some(facts.raw_log_path),
             workspace: None,
             messages: Vec::new(),
@@ -400,6 +401,7 @@ impl ProductExecutor {
             path: contract.path,
             content_sha256: sha256_hex(contract.text.as_bytes()),
             sent_sha256: sha256_hex(text.as_bytes()),
+            packed: None,
         };
         let session_id = a.session_id.clone().unwrap_or_default();
         let exec_only = self
@@ -537,7 +539,7 @@ impl Executor for ProductExecutor {
             {
                 e.insert(implementation);
             }
-            let mut outcome = outcome(facts, record);
+            let mut outcome = outcome(facts);
             if let Some(bridge) = &bridge {
                 outcome.observed.messages = read_bridge(bridge);
             }
@@ -552,6 +554,7 @@ impl Executor for ProductExecutor {
                     .map_err(|()| "the turn ended before its gate opened".to_owned())
             }),
             ended,
+            prompt: Some(record),
         })
     }
 

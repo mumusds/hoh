@@ -126,6 +126,9 @@ pub struct Started {
     pub pid: u32,
     pub gate: Gate,
     pub ended: oneshot::Receiver<Outcome>,
+    /// The prompt it is about to be sent, recorded with its identity before its gate opens (docs/adr/ADR-026.md
+    /// decision 7); none from an executor that sends none of its own (a test's).
+    pub prompt: Option<hoh_core::persistence::PromptRecord>,
 }
 
 /// Why an executor started no process for a work (docs/adr/ADR-022.md decision 12): the attempt's failure reason (a
@@ -726,7 +729,12 @@ async fn attempt(
     hooks.runner(RunnerPoint::AfterSpawn);
     // Its tracking is recorded with its identity, in the same commit.
     if !store
-        .runner_running(&id, identity::running(&who), tracking.json(&id))
+        .runner_running_with(
+            &id,
+            identity::running(&who),
+            tracking.json(&id),
+            started.prompt.clone(),
+        )
         .await?
     {
         // Disposed of meanwhile: the gate is dropped unopened, so the process ends without running anything.

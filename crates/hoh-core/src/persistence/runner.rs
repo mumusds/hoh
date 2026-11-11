@@ -84,6 +84,8 @@ pub(super) enum RunnerJob {
         facts: Box<AttemptFacts>,
         /// How its processes are tracked (`attempt.tracking`, docs/adr/ADR-021.md decision 8d v5), recorded with it.
         tracking: serde_json::Value,
+        /// The prompt it was sent, recorded with it (docs/adr/ADR-026.md decision 7).
+        prompt: Option<Box<PromptRecord>>,
     },
     Finished {
         attempt_id: String,
@@ -197,7 +199,8 @@ pub struct Observed {
 }
 
 /// Where a turn's prompt came from and what was sent (decision 11, AC-018-05): a `prompt_revisions` row (the role
-/// contract's layer, path and content sha256) and the attempt's `prompt_sha256` of the bytes sent.
+/// contract's layer, path and content sha256) and the attempt's `prompt_sha256` of the bytes sent; and how it was packed
+/// (docs/adr/ADR-026.md decision 7). Written in the commit that marks the attempt RUNNING, before its start gate opens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptRecord {
     /// `builtin` or `project`.
@@ -206,6 +209,27 @@ pub struct PromptRecord {
     pub path: String,
     pub content_sha256: String,
     pub sent_sha256: String,
+    /// What the context packer recorded; none from an executor that does not pack (a test's).
+    pub packed: Option<Packing>,
+}
+
+/// A packed prompt's record (docs/adr/ADR-026.md decision 7): its resource bundle version, its `context.packed`
+/// event's payload (the attempt id is added), and the objects it wrote, registered as artifacts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Packing {
+    pub resource_bundle_version: String,
+    pub event: serde_json::Value,
+    pub artifacts: Vec<ArtifactRow>,
+}
+
+/// An object to register in `artifacts` (docs/adr/ADR-026.md decision 6): its sha256, its path relative to the
+/// project (`.hoh/objects/sha256/<2>/<64>`), its size and type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactRow {
+    pub sha256: String,
+    pub path: String,
+    pub bytes: u64,
+    pub mime: String,
 }
 
 impl PromptRecord {
@@ -243,7 +267,9 @@ pub(super) fn run(
             attempt_id,
             facts,
             tracking,
-        } => running(conn, &attempt_id, *facts, tracking, ctx).map(RunnerDone::Applied),
+            prompt,
+        } => running(conn, &attempt_id, *facts, tracking, prompt.as_deref(), ctx)
+            .map(RunnerDone::Applied),
         RunnerJob::Finished { attempt_id, ending } => {
             finished(conn, &attempt_id, &ending, ctx).map(RunnerDone::Applied)
         }
@@ -648,6 +674,7 @@ fn running(
     attempt_id: &str,
     facts: AttemptFacts,
     tracking: serde_json::Value,
+    prompt: Option<&PromptRecord>,
     ctx: &Ctx<'_>,
 ) -> Result<bool, PersistError> {
     let tx = writer::begin(conn, ctx)?;
@@ -662,6 +689,10 @@ fn running(
     if started != 1 {
         return Ok(false);
     }
+    let at = facts
+        .started_at
+        .clone()
+        .unwrap_or_else(|| crate::time::rfc3339_utc(std::time::SystemTime::now()));
     attempts::move_attempt(
         &tx,
         &AttemptMove {
@@ -681,11 +712,16 @@ fn running(
     } else {
         Vec::new()
     };
+    // The prompt it is about to be sent, before its gate opens (docs/adr/ADR-026.md decision 7).
+    let packed = match prompt {
+        Some(prompt) => record_prompt(&tx, &project_id, &run_id, attempt_id, prompt, &at)?,
+        None => Vec::new(),
+    };
     writer::write(
         &tx,
         &Commit {
             cas,
-            events: vec![
+            events: packed.into_iter().chain([
                 event(
                     &project_id,
                     &run_id,
@@ -700,7 +736,8 @@ fn running(
                     "attempt.tracking",
                     tracking,
                 ),
-            ],
+            ])
+            .collect(),
             ..Commit::default()
         },
         ctx,
@@ -708,6 +745,82 @@ fn running(
     ctx.before_commit()?;
     tx.commit().map_err(sqlite_error)?;
     Ok(true)
+}
+
+/// Write `prompt`, the record of what attempt `attempt_id` is sent, in the caller's transaction: its source's
+/// `prompt_revisions` row, the attempt's `prompt_revision`, `prompt_sha256` and `resource_bundle_version`, the objects
+/// it packed as `artifacts` rows (each read back), and its `context.packed` event, returned for the caller's commit
+/// (decision 11; docs/adr/ADR-026.md decisions 6 and 7).
+pub(super) fn record_prompt(
+    tx: &Transaction<'_>,
+    project_id: &str,
+    run_id: &str,
+    attempt_id: &str,
+    prompt: &PromptRecord,
+    at: &str,
+) -> Result<Vec<NewEvent>, PersistError> {
+    let revision = prompt.revision_id();
+    tx.execute(
+        "INSERT OR IGNORE INTO prompt_revisions(revision_id, layer, role, content_sha256, path, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![revision, prompt.layer, prompt.role, prompt.content_sha256, prompt.path, at],
+    )
+    .map_err(sqlite_error)?;
+    tx.execute(
+        "UPDATE attempts SET prompt_revision = ?2, prompt_sha256 = ?3, \
+         resource_bundle_version = coalesce(?4, resource_bundle_version) WHERE attempt_id = ?1",
+        params![
+            attempt_id,
+            revision,
+            prompt.sent_sha256,
+            prompt
+                .packed
+                .as_ref()
+                .map(|p| p.resource_bundle_version.as_str())
+        ],
+    )
+    .map_err(sqlite_error)?;
+    let Some(packed) = &prompt.packed else {
+        return Ok(Vec::new());
+    };
+    for a in &packed.artifacts {
+        tx.execute(
+            "INSERT OR IGNORE INTO artifacts(artifact_id, sha256, path, bytes, mime) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                format!("{}:{}", a.sha256, a.path),
+                a.sha256,
+                a.path,
+                i64::try_from(a.bytes).unwrap_or(i64::MAX),
+                a.mime
+            ],
+        )
+        .map_err(sqlite_error)?;
+        // Registered as it is: a row of the same digest and path that says otherwise is no registration of it.
+        let bytes: i64 = tx
+            .query_row(
+                "SELECT bytes FROM artifacts WHERE sha256 = ?1 AND path = ?2",
+                params![a.sha256, a.path],
+                |r| r.get(0),
+            )
+            .map_err(sqlite_error)?;
+        if u64::try_from(bytes).ok() != Some(a.bytes) {
+            return Err(PersistError::IntegrityViolation(format!(
+                "artifact {} at {} is registered with {bytes} bytes, not {}",
+                a.sha256, a.path, a.bytes
+            )));
+        }
+    }
+    let mut payload = packed.event.clone();
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("attempt_id".to_owned(), json!(attempt_id));
+    }
+    Ok(vec![event(
+        project_id,
+        run_id,
+        child_id(attempt_id, "context.packed"),
+        "context.packed",
+        payload,
+    )])
 }
 
 fn finished(
@@ -765,34 +878,28 @@ fn finished(
         ctx,
     )?;
     super::retry::accrue_wall(&tx, &run_id, attempt_id, ending.at, None)?;
-    // The prompt's source and what was sent (decision 11).
-    if let Some(prompt) = &ending.observed.prompt {
-        let revision = prompt.revision_id();
-        tx.execute(
-            "INSERT OR IGNORE INTO prompt_revisions(revision_id, layer, role, content_sha256, path, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                revision,
-                prompt.layer,
-                prompt.role,
-                prompt.content_sha256,
-                prompt.path,
-                crate::time::rfc3339_utc(ending.at)
-            ],
-        )
-        .map_err(sqlite_error)?;
-        tx.execute(
-            "UPDATE attempts SET prompt_revision = ?2, prompt_sha256 = ?3 WHERE attempt_id = ?1",
-            params![attempt_id, revision, prompt.sent_sha256],
-        )
-        .map_err(sqlite_error)?;
-    }
+    // The prompt's source and what was sent (decision 11), from an executor that hands it with its end (a test's); the
+    // product's is recorded when the attempt is marked RUNNING (docs/adr/ADR-026.md decision 7).
+    let prompt_events = match &ending.observed.prompt {
+        Some(prompt) => record_prompt(
+            &tx,
+            &project_id,
+            &run_id,
+            attempt_id,
+            prompt,
+            &crate::time::rfc3339_utc(ending.at),
+        )?,
+        None => Vec::new(),
+    };
     // The agent's own session id, from a turn that completed only: an id given before any input (Pi's get_state, Codex's
     // thread/start) names a session that may never have been persisted, and a failed turn must not replace a completed
     // one's (M2T17R-500). The completed turn records it as a session.native event in its own settle's transaction: that
     // record, not the session row (which older versions and direct adapters fill), is what a later turn resumes
     // (docs/adr/ADR-024.md decision 4, M2T17R-600, -601).
-    let mut commit = Commit::default();
+    let mut commit = Commit {
+        events: prompt_events,
+        ..Commit::default()
+    };
     if to == AttemptState::Settled
         && let Some(native) = &ending.observed.native_session
     {
