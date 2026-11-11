@@ -177,6 +177,9 @@ pub struct Observed {
     /// of the writer lease's holder, and the store asks for it then (REQ-019 behaviour 6, docs/adr/ADR-024.md decision
     /// 9).
     pub workspace: Option<serde_json::Value>,
+    /// A supervision turn's file-bridge lines (docs/adr/ADR-025.md decision 8): the runner carries them into its work's
+    /// OBSERVED, where they are recorded as its outputs when it succeeded.
+    pub messages: Vec<String>,
 }
 
 /// Where a turn's prompt came from and what was sent (decision 11, AC-018-05): a `prompt_revisions` row (the role

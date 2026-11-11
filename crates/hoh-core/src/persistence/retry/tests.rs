@@ -481,6 +481,7 @@ async fn an_ending_records_what_the_agents_turn_showed() -> R {
                     )],
                     raw_log_path: Some("/logs/a".to_owned()),
                     workspace: None,
+                    messages: Vec::new(),
                 },
                 unknown_effect: false,
             },

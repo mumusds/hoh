@@ -179,7 +179,7 @@ fn text(payload: &Value, field: &str) -> Option<String> {
 }
 
 /// Run `run_id`'s wakes, in the order they were first woken.
-pub(super) fn of_run(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<Wake>, PersistError> {
+pub(super) fn of_run(tx: &Connection, run_id: &str) -> Result<Vec<Wake>, PersistError> {
     let mut statement = tx
         .prepare(
             "SELECT seq, kind, payload_json FROM events WHERE run_id = ?1 AND kind IN (?2, ?3, ?4, ?5, ?6) \
@@ -420,6 +420,203 @@ fn rearm(
         });
     }
     Ok((cas, events))
+}
+
+/// What a supervision turn's executor gives the Commander (decisions 7 and 8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Supervision {
+    /// The wake it answers: its messages name it as their causation.
+    pub wake: String,
+    /// Its bridge's nonce.
+    pub nonce: String,
+    /// The run's revision and the Commander's epoch its decisions are to name.
+    pub run_revision: i64,
+    pub role_epoch: i64,
+    /// What it is shown (bounded, deterministic).
+    pub summary: Value,
+}
+
+/// How many of its wake's events a turn is shown, and how much of each payload (decision 7: bounded).
+const SHOWN_EVENTS: usize = 50;
+const SHOWN_PAYLOAD: usize = 2_000;
+
+/// How urgent an event of a wake is, most first: integrity, critical, high, the rest (decision 7's order).
+fn urgency(kind: &str, payload: &Value) -> u8 {
+    match (kind, payload["severity"].as_str()) {
+        ("integrity_violation", _) => 0,
+        ("issue.opened", Some("critical")) => 1,
+        ("issue.opened", Some("high"))
+        | (
+            "need_decision"
+            | "no_progress"
+            | "budget.risk"
+            | "team.binding_blocked"
+            | "supervisor.retrigger",
+            _,
+        ) => 2,
+        _ => 3,
+    }
+}
+
+/// The input of supervision turn `attempt_id` of run `run_id`, from its allocation (decisions 7 and 8): none for an
+/// attempt that is no supervision turn.
+pub(super) fn supervision_input(
+    conn: &Connection,
+    run_id: &str,
+    attempt_id: &str,
+) -> Result<Option<Supervision>, PersistError> {
+    let allocation: Option<String> = conn
+        .query_row(
+            "SELECT payload_json FROM events WHERE run_id = ?1 AND kind = ?2 \
+             AND json_extract(payload_json, '$.attempt_id') = ?3",
+            params![run_id, ALLOCATED, attempt_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some(allocation) = allocation else {
+        return Ok(None);
+    };
+    let allocation: Value = serde_json::from_str(&allocation).map_err(|e| {
+        PersistError::IntegrityViolation(format!("allocation of {attempt_id}: {e}"))
+    })?;
+    let nonce: Option<String> = conn
+        .query_row(
+            "SELECT json_extract(payload_json, '$.nonce') FROM outbox WHERE message_id = ?1",
+            params![child_id(attempt_id, "dispatch")],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?
+        .flatten();
+    let wake_id = allocation["wake"].as_str().unwrap_or_default().to_owned();
+    let wakes = of_run(conn, run_id)?;
+    let Some(this) = wakes.iter().find(|w| w.id == wake_id) else {
+        return Ok(None);
+    };
+    // Its events, most urgent first, then the newest.
+    let mut events: Vec<(u8, i64, String, Value)> = Vec::new();
+    for seq in &this.event_seqs {
+        let row: Option<(String, String)> = conn
+            .query_row(
+                "SELECT kind, payload_json FROM events WHERE seq = ?1",
+                params![seq],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(sqlite_error)?;
+        if let Some((kind, payload)) = row {
+            let value: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
+            let shown = if payload.len() > SHOWN_PAYLOAD {
+                json!({"truncated": true, "head": payload.chars().take(SHOWN_PAYLOAD).collect::<String>()})
+            } else {
+                value.clone()
+            };
+            events.push((urgency(&kind, &value), -*seq, kind, shown));
+        }
+    }
+    events.sort_by_key(|a| (a.0, a.1));
+    let total = events.len();
+    let shown: Vec<Value> = events
+        .into_iter()
+        .take(SHOWN_EVENTS)
+        .map(|(_, seq, kind, payload)| json!({"seq": -seq, "kind": kind, "payload": payload}))
+        .collect();
+    let (state, spec_id, spec_sha256): (String, Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT r.state, r.spec_id, s.sha256 FROM runs r LEFT JOIN specs s ON s.spec_id = r.spec_id \
+             WHERE r.run_id = ?1",
+            params![run_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .map_err(sqlite_error)?;
+    let candidate = super::outbox::current_candidate(conn, run_id)?.map(|c| c.id);
+    let mut tasks = Vec::new();
+    for task in this.task_ids.iter() {
+        let row: Option<(String, i64, String, Option<String>)> = conn
+            .query_row(
+                "SELECT state, revision, role, blocked_reason FROM tasks WHERE task_id = ?1",
+                params![task],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()
+            .map_err(sqlite_error)?;
+        if let Some((state, revision, role, blocked)) = row {
+            tasks.push(json!({"task_id": task, "state": state, "revision": revision, "role": role, "blocked_reason": blocked}));
+        }
+    }
+    let other: Vec<Value> = wakes
+        .iter()
+        .filter(|w| w.id != wake_id && w.owed())
+        .map(|w| json!({"id": w.id, "fingerprint": w.fingerprint, "severity": w.severity.as_str()}))
+        .collect();
+    let mut roles = Vec::new();
+    {
+        let mut statement = conn
+            .prepare(
+                "SELECT role, agent, state, role_epoch, blocked_reason FROM role_bindings WHERE run_id = ?1 ORDER BY role",
+            )
+            .map_err(sqlite_error)?;
+        let rows: Vec<(String, String, String, i64, Option<String>)> = statement
+            .query_map(params![run_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .map_err(sqlite_error)?
+            .collect::<Result<_, _>>()
+            .map_err(sqlite_error)?;
+        for (role, agent, state, epoch, blocked) in rows {
+            let pending = super::handover::first_input_pending(conn, run_id, &role, epoch)?;
+            roles.push(
+                json!({"role": role, "agent": agent, "state": state, "role_epoch": epoch,
+                "blocked_reason": blocked, "first_input_pending": pending}),
+            );
+        }
+    }
+    let rejections: Vec<Value> = {
+        let mut statement = conn
+            .prepare(
+                "SELECT kind, payload_json FROM events WHERE run_id = ?1 AND (kind = 'decision.rejected' \
+                 OR (kind = 'supervisor.output_disposed' AND json_extract(payload_json, '$.outcome') = 'invalid')) \
+                 ORDER BY seq DESC LIMIT 10",
+            )
+            .map_err(sqlite_error)?;
+        let rows: Vec<(String, String)> = statement
+            .query_map(params![run_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(sqlite_error)?
+            .collect::<Result<_, _>>()
+            .map_err(sqlite_error)?;
+        rows.into_iter()
+            .map(|(kind, payload)| {
+                let p: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
+                json!({"kind": kind, "decision_id": p["decision_id"], "output_id": p["output_id"],
+                    "reason": p.get("reason_code").or_else(|| p.get("reason")).cloned().unwrap_or(Value::Null),
+                    "detail": p["detail"]})
+            })
+            .collect()
+    };
+    let run_revision = allocation["run_revision"].as_i64().unwrap_or(-1);
+    let role_epoch = allocation["role_epoch"].as_i64().unwrap_or(-1);
+    Ok(Some(Supervision {
+        wake: wake_id.clone(),
+        nonce: nonce.unwrap_or_default(),
+        run_revision,
+        role_epoch,
+        summary: json!({
+            "wake": {"id": wake_id, "fingerprint": this.fingerprint, "severity": this.severity.as_str(),
+                "spec_id": this.spec_id, "woken_at": this.woken_at},
+            "turn": {"attempt_id": attempt_id, "generation": allocation["generation"],
+                "run_revision": run_revision, "role_epoch": role_epoch},
+            "run": {"run_id": run_id, "state": state, "spec_id": spec_id, "spec_sha256": spec_sha256,
+                "candidate_id": candidate},
+            "snapshots": allocation["snapshots"],
+            "tasks": tasks,
+            "events": shown,
+            "events_total": total,
+            "other_wakes": other,
+            "roles": roles,
+            "recent_rejections": rejections,
+        }),
+    }))
 }
 
 /// A wake given a Commander turn.
