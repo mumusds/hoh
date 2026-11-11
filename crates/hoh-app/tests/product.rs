@@ -117,6 +117,41 @@ impl World {
         config
     }
 
+    /// Bind every built-in role whose agent this world did not install to one it did (claude, then codex, then pi), in
+    /// the project's `.hoh/config.toml` (appended; a new run reads its team from it): no binding is blocked, so nothing
+    /// wakes a Commander the world cannot run and its runs are not BLOCKED for it (docs/adr/ADR-025.md decision 5). For
+    /// the tests whose subject is the executor, not the team or its supervision; call it after installing the fakes
+    /// and after writing the project's own file.
+    fn bind_installed(&self) -> R {
+        use hoh_core::config::Agent;
+        use std::io::Write as _;
+        let installed: Vec<Agent> = [Agent::Claude, Agent::Codex, Agent::Pi]
+            .into_iter()
+            .filter(|a| self.bin().join(a.command()).exists())
+            .collect();
+        let Some(first) = installed.first() else {
+            return Ok(());
+        };
+        let file = self.project().join(".hoh/config.toml");
+        std::fs::create_dir_all(self.project().join(".hoh"))?;
+        let mut text = if file.exists() {
+            String::new()
+        } else {
+            "config_version = \"1.0\"\n".to_owned()
+        };
+        for (role, binding) in hoh_core::config::Config::default().team {
+            if !installed.contains(&binding.agent) {
+                text.push_str(&format!("[team.{role}]\nagent = \"{}\"\n", first.as_str()));
+            }
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(file)?
+            .write_all(text.as_bytes())?;
+        Ok(())
+    }
+
     fn script(&self, name: &str, body: &str) -> R {
         let path = self.bin().join(name);
         std::fs::write(&path, format!("#!/bin/bash\n{body}\n"))?;
@@ -403,6 +438,15 @@ async fn started(host: &Host, key: &str) -> R<String> {
     Ok(accepted["run_id"].as_str().ok_or("no run_id")?.to_owned())
 }
 
+/// The project's current team revision (1 once a project file is loaded, e.g. by [`World::bind_installed`]).
+fn team_revision(project: &Path) -> R<i64> {
+    Ok(query(
+        project,
+        "SELECT coalesce(max(revision), 0) FROM team_revisions",
+    )?
+    .parse()?)
+}
+
 /// Submit ConfigureTeam `bindings` at `expected`; its accepted body.
 async fn configure(host: &Host, key: &str, expected: i64, bindings: Value) -> R<Value> {
     let body = json!({
@@ -466,11 +510,12 @@ async fn an_oversized_frame_fails_only_its_attempt(agent: &str) -> R {
         "codex" => world.codex("gpt-6-astra")?,
         _ => world.pi()?,
     }
+    world.bind_installed()?;
     let host = start_when_free(world.config()).await?;
     let project = world.project();
     let outcome = async {
         if agent != "claude" {
-            configure(&host, "dev", 0, json!({"developer": {"agent": agent}})).await?;
+            configure(&host, "dev", team_revision(&project)?, json!({"developer": {"agent": agent}})).await?;
         }
         let run_id = started(&host, "s1").await?;
         ready(&project, &run_id, &[("T-OK", "developer"), ("T-HUGE", "developer")])?;
@@ -697,6 +742,7 @@ async fn test_018_03_each_role_has_its_own_session_and_an_agents_exit_changes_no
     let world = World::new()?;
     let hold = world.dir.path().join("release");
     world.claude(Some(&hold))?;
+    world.bind_installed()?;
     let host = start_when_free(world.config()).await?;
     let project = world.project();
     let outcome = async {
@@ -919,11 +965,12 @@ async fn a_change_to_an_agent_not_installed_is_refused_until_it_is_and_the_old_b
     // the role's tasks; once it is installed, the change is applied at the role's next checkpoint.
     let world = World::new()?;
     world.claude(None)?;
+    world.bind_installed()?;
     let host = start_when_free(world.config()).await?;
     let project = world.project();
     let outcome = async {
         let run_id = started(&host, "s1").await?;
-        configure(&host, "dev", 0, json!({"developer": {"agent": "pi"}})).await?;
+        configure(&host, "dev", team_revision(&project)?, json!({"developer": {"agent": "pi"}})).await?;
         let limit = Duration::from_secs(30);
         until(
             &project,
@@ -982,6 +1029,7 @@ async fn a_turn_that_cannot_start_fails_by_its_refusals_reason_and_class() -> R 
         project.join(".hoh/config.toml"),
         "config_version = \"1.0\"\n[team.auditor]\nagent = \"claude\"\nprompt = \".hoh/prompts/audit.md\"\n",
     )?;
+    world.bind_installed()?;
     let host = start_when_free(world.config()).await?;
     let outcome = async {
         let run_id = started(&host, "s1").await?;
@@ -1052,6 +1100,7 @@ async fn once_a_turn_ended_the_executor_no_longer_holds_it_and_a_cancel_reaches_
         .ok_or("the product's host has a runner")?
         .executor
         .clone();
+    world.bind_installed()?;
     let host = start_when_free(config).await?;
     let project = world.project();
     let outcome = async {
@@ -1179,6 +1228,7 @@ async fn a_writer_the_host_stops_for_an_oversize_frame_lets_its_lease_go_with_th
     git(&project, &["add", ".gitignore", "a.txt"])?;
     git(&project, &["commit", "-q", "-m", "first"])?;
     std::fs::write(project.join("a.txt"), "two\n")?;
+    world.bind_installed()?;
     let host = start_when_free(world.config()).await?;
     let outcome = async {
         let run_id = started(&host, "s1").await?;
@@ -1351,10 +1401,17 @@ async fn an_app_server_that_cannot_start_a_turn_degrades_that_codex_to_exec() ->
     // task's next attempt runs on exec and settles.
     let world = World::new()?;
     world.codex("gpt-6-astra")?;
+    world.bind_installed()?;
     let host = start_when_free(world.config()).await?;
     let project = world.project();
     let outcome = async {
-        configure(&host, "dev", 0, json!({"developer": {"agent": "codex"}})).await?;
+        configure(
+            &host,
+            "dev",
+            team_revision(&project)?,
+            json!({"developer": {"agent": "codex"}}),
+        )
+        .await?;
         let run_id = started(&host, "s1").await?;
         ready(&project, &run_id, &[("T-DEGRADE", "developer")])?;
         let limit = Duration::from_secs(60);
@@ -1403,6 +1460,7 @@ async fn a_task_dispatched_before_the_first_look_at_its_agent_waits_for_it() -> 
     let world = World::new()?;
     world.claude(None)?;
     let project = world.project();
+    world.bind_installed()?;
     let host = start_when_free(world.config()).await?;
     let run_id = match async {
         let run_id = started(&host, "s1").await?;
@@ -1718,6 +1776,7 @@ async fn a_cancelled_run_stops_its_agent_by_its_native_cancel_then_sigterm_after
     let mut effective = hoh_core::config::Config::default();
     effective.execution.cancel_native_grace_seconds = 1;
     effective.execution.cancel_term_grace_seconds = 1;
+    world.bind_installed()?;
     let host = start_when_free(world.config_of(effective)).await?;
     let project = world.project();
     let signals = world.bin().join("claude.d/signals");

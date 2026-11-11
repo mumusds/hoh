@@ -4037,6 +4037,9 @@ fn test_005_04_a_host_killed_under_its_unit_is_restarted_by_systemd_and_reconcil
         // The host's PATH (the client writes its own into the unit's file): the fake agent and the tools it and the
         // client use, nothing else, so no agent installed on this machine is found.
         unit_claude(&manager.bin())?;
+        // The team on the one agent this machine has: no binding is blocked, so nothing wakes a Commander it cannot run
+        // and the run is not BLOCKED for it (docs/adr/ADR-025.md decision 5).
+        team_on(&project, "claude")?;
         let tools = root.join("tools");
         std::fs::create_dir(&tools)?;
         for tool in ["cat", "head", "sleep", "python3", "systemctl"] {
@@ -4461,5 +4464,143 @@ fn test_019_05_a_host_killed_after_the_handover_commit_keeps_epoch_2_and_starts_
         "pi/2/R/session/commander/2"
     );
     drop(second);
+    Ok(())
+}
+
+/// Bind every built-in role whose agent is not `agent` to it, in the project's `.hoh/config.toml` (appended; a new run
+/// reads its team from it).
+fn team_on(project: &Path, agent: &str) -> R {
+    use std::io::Write as _;
+    std::fs::create_dir_all(project.join(".hoh"))?;
+    let file = project.join(".hoh/config.toml");
+    let mut text = if file.exists() {
+        String::new()
+    } else {
+        "config_version = \"1.0\"\n".to_owned()
+    };
+    for (role, binding) in hoh_core::config::Config::default().team {
+        if binding.agent.as_str() != agent {
+            text.push_str(&format!("[team.{role}]\nagent = \"{agent}\"\n"));
+        }
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(file)?
+        .write_all(text.as_bytes())?;
+    Ok(())
+}
+
+/// TEST-021-03's world: run R RUNNING on s1 with its Commander bound; the supervisor took in R's events up to seq 120
+/// (its cursor), the decision it led to APPLIED; seqs 121 to 125 are five need_decision events of one key, committed
+/// and not taken in.
+fn supervised_world(project: &Path) -> R {
+    seed(
+        project,
+        "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', :p, printf('%064d', 1), 1);
+         INSERT INTO runs(run_id, project_id, spec_id, state, mode, revision, created_at) VALUES
+           ('R', :p, 's1', 'RUNNING', 'AUTO', 3, '2026-11-07T00:00:00Z');
+         INSERT INTO sessions(session_id, agent, role, agent_version, capabilities_json) VALUES
+           ('sc', 'codex', 'commander', '1', '{}');
+         INSERT INTO role_bindings(run_id, role, agent, session_id, role_epoch, config_revision, bound_at) VALUES
+           ('R', 'commander', 'codex', 'sc', 1, 1, '2026-11-07T00:00:00Z');
+         INSERT INTO decisions(decision_id, run_id, role_epoch, expected_revision, payload_json, state) VALUES
+           ('d-before', 'R', 1, 2, '{\"kind\": \"record_assumption\", \"statement\": \"s\", \"basis\": \"b\"}', 'APPLIED');",
+    )?;
+    seed(
+        project,
+        "WITH RECURSIVE n(i) AS (SELECT (SELECT coalesce(max(seq), 0) FROM events) + 1 UNION ALL SELECT i + 1 FROM n WHERE i < 120)
+         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
+           SELECT :p, 'filler/' || i, 'R', 'token.delta', '{}', '2026-11-07T00:00:00Z' FROM n;
+         INSERT INTO supervisor_cursor(run_id, last_handled_seq) VALUES ('R', 120);
+         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5)
+         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
+           SELECT :p, 'nd/' || i, 'R', 'need_decision', json_object('task_id', 'T', 'fingerprint', 'fp-T', 'n', i),
+             '2026-11-07T00:00:01Z' FROM n;",
+    )
+}
+
+/// AC-021-03: a host killed with SIGKILL as its supervisor's step begins (cursor 120, seqs 121 to 125 committed and not
+/// taken in); the next host takes in only seqs after the cursor: one trigger with seqs 121 to 125, none for a seq up to
+/// 120, no new APPLIED decision, and the cursor at least 120.
+#[test]
+fn test_021_03_a_host_killed_in_its_supervisors_step_wakes_once_for_what_it_had_not_taken_in() -> R
+{
+    let dir = tempfile::tempdir()?;
+    let project = dir.path().join("p");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&project)?;
+    std::fs::create_dir_all(&work)?;
+    let (code, stderr) = serve_and_stop(&project)?;
+    assert_eq!(code, 0, "{stderr}");
+    supervised_world(&project)?;
+    let seqs = python(
+        &db(&project),
+        "import sqlite3,sys,json; c=sqlite3.connect(sys.argv[1]); \
+         print(json.dumps([r[0] for r in c.execute(\"SELECT seq FROM events WHERE kind = 'need_decision' ORDER BY seq\")]))",
+        "",
+    )?;
+    assert_eq!(seqs.trim(), "[121, 122, 123, 124, 125]");
+    // The first host dies by SIGKILL as its supervisor's first step begins.
+    let killed = start_child(
+        &project,
+        &[
+            (CHILD_WORK, work.as_os_str()),
+            (CHILD_KILL, std::ffi::OsStr::new("Supervise:Begun")),
+        ],
+    );
+    let status = match killed {
+        Ok(guard) => wait(guard, Duration::from_secs(30))?.0,
+        Err(e) => return Err(format!("the first host: {e}").into()),
+    };
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&status),
+        Some(9),
+        "{status:?}"
+    );
+    let read = |sql: &str| -> R<String> {
+        Ok(python(
+            &db(&project),
+            "import sqlite3,sys; r=sqlite3.connect(sys.argv[1]).execute(sys.stdin.read()).fetchone(); \
+             print('' if r is None or r[0] is None else r[0])",
+            sql,
+        )?
+        .trim()
+        .to_owned())
+    };
+    assert_eq!(
+        read("SELECT last_handled_seq FROM supervisor_cursor WHERE run_id = 'R'")?,
+        "120"
+    );
+    assert_eq!(read("SELECT count(*) FROM supervisor_triggers")?, "0");
+    // The next host.
+    let host = start_child(&project, &[(CHILD_WORK, work.as_os_str())])?;
+    let end = Instant::now() + Duration::from_secs(30);
+    while read("SELECT count(*) FROM events WHERE kind = 'supervisor.woken'")? != "1" {
+        if Instant::now() > end {
+            return Err("no wake after the restart".into());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    drop(host);
+    let triggers = read(
+        "SELECT json_group_array(json_object('seqs', json(event_seqs_json), 'state', state)) FROM supervisor_triggers",
+    )?;
+    let triggers: Value = serde_json::from_str(&triggers)?;
+    assert_eq!(
+        triggers,
+        json!([{"seqs": [121, 122, 123, 124, 125], "state": "HANDLED"}])
+    );
+    assert_eq!(
+        read("SELECT count(*) FROM decisions WHERE state = 'APPLIED'")?,
+        "1"
+    );
+    let cursor: i64 =
+        read("SELECT last_handled_seq FROM supervisor_cursor WHERE run_id = 'R'")?.parse()?;
+    assert!(cursor >= 125, "{cursor}");
+    keep(
+        "test-021-03.json",
+        &json!({"triggers": triggers, "cursor": cursor, "need_decision_seqs": [121, 122, 123, 124, 125]}),
+    )?;
     Ok(())
 }
