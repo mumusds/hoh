@@ -28,6 +28,7 @@ mod rounds;
 mod runner;
 mod supervise;
 mod team;
+mod wakes;
 pub use control::{CancelPass, Finished, PauseStep};
 pub use handover::SessionStart;
 pub use leases::{Grant, LEASE_TTL, LeaseView};
