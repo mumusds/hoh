@@ -437,6 +437,8 @@ pub struct Supervision {
 const SHOWN_EVENTS: usize = 50;
 const SHOWN_PAYLOAD: usize = 2_000;
 const SHOWN_TASKS: usize = 50;
+/// How many of the run's latest dispositions the summary looks through for its recent invalid answers (M2T08R-501).
+const RECENT_DISPOSITIONS: i64 = 200;
 const SHOWN_WAKES: usize = 50;
 
 /// How urgent an event of a wake is, by its kind and its payload's `severity`, most first: integrity, critical, high,
@@ -600,8 +602,8 @@ pub(super) fn supervision_input(
     }
     // The latest ten, from two index range scans newest first (v18: no scan of the run's whole history).
     let rejections: Vec<Value> = {
-        // The latest ten, newest first: the rejections by their own index range, the invalid ends only after the
-        // horizon (v18, v20 M2T08R-403: no scan of the run's whole history).
+        // The latest ten, newest first: the rejections by their own index range, the invalid ends among the latest
+        // dispositions (v18, v20 M2T08R-403, -501: bounded reads, no scan of the run's whole history).
         let read =
             |sql: &str, from: Option<i64>| -> Result<Vec<(i64, String, String)>, PersistError> {
                 let mut statement = conn.prepare(sql).map_err(sqlite_error)?;
@@ -620,10 +622,13 @@ pub(super) fn supervision_input(
              ORDER BY seq DESC LIMIT 10",
             None,
         )?;
+        // The invalid ends among the run's latest dispositions, newest first by the index, whatever the horizon
+        // (M2T08R-501, -551: the horizon is the wakes' lifecycle, not how recent an answer is).
         rows.extend(read(
-            "SELECT seq, kind, payload_json FROM events WHERE run_id = ?1 AND kind = 'supervisor.output_disposed' \
-             AND json_extract(payload_json, '$.outcome') = 'invalid' AND seq >= ?2 ORDER BY seq DESC LIMIT 10",
-            Some(horizon(conn, run_id)?),
+            "SELECT seq, kind, payload_json FROM (SELECT seq, kind, payload_json FROM events WHERE run_id = ?1 \
+             AND kind = 'supervisor.output_disposed' ORDER BY seq DESC LIMIT ?2) \
+             WHERE json_extract(payload_json, '$.outcome') = 'invalid' ORDER BY seq DESC LIMIT 10",
+            Some(RECENT_DISPOSITIONS),
         )?);
         rows.sort_by_key(|(seq, _, _)| std::cmp::Reverse(*seq));
         rows.truncate(10);
