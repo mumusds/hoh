@@ -22,7 +22,7 @@ const KINDS: &[&str] = &[
     "no_progress",
     "budget.risk",
     "team.binding_blocked",
-    "team.binding_refused",
+    "supervisor.retrigger",
     "spec.changed",
     "milestone_ready",
     "release_request",
@@ -56,6 +56,9 @@ impl CommitTimes {
             .map(|(_, (_, at))| *at)
     }
 }
+
+/// How many of a run's events one step looks at at most; the next step goes on from its cursor.
+const STEP: i64 = 10_000;
 
 /// A trigger fired by a step.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,10 +108,12 @@ pub(super) fn step(
         .optional()
         .map_err(sqlite_error)?
         .unwrap_or(0);
+    // At most STEP events per step: the cursor stops at the last one looked at (docs/adr/ADR-025.md decision 2).
     let high: i64 = tx
         .query_row(
-            "SELECT coalesce(max(seq), ?2) FROM events WHERE run_id = ?1 AND seq > ?2",
-            params![run_id, cursor],
+            "SELECT coalesce(max(seq), ?2) FROM (SELECT seq FROM events WHERE run_id = ?1 AND seq > ?2 \
+             ORDER BY seq LIMIT ?3)",
+            params![run_id, cursor, STEP],
             |r| r.get(0),
         )
         .map_err(sqlite_error)?;
@@ -147,10 +152,15 @@ pub(super) fn step(
                 None => None,
             };
             // Timed from its commit (REQ-021 decision 4); an event an earlier writer committed, from now.
+            // A revision the project has no spec row for keys by the revision itself, so revisions never merge.
+            let fingerprint = match (spec_id.as_deref(), wake.key.spec_revision) {
+                (None, Some(revision)) => format!("{}@r{revision}", wake.key.fingerprint),
+                _ => wake.key.fingerprint.clone(),
+            };
             take_in(
                 &tx,
                 run_id,
-                &wake.key.fingerprint,
+                &fingerprint,
                 spec_id.as_deref(),
                 wake.severity,
                 *seq,

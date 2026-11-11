@@ -173,7 +173,6 @@ fn important_events_wake_under_every_policy_and_intensive_wakes_at_least_balance
         ("no_progress", json!({})),
         ("budget.risk", json!({"kind": "usd"})),
         ("team.binding_blocked", json!({"role": "qa"})),
-        ("team.binding_refused", json!({"role": "qa"})),
         ("spec.changed", json!({"spec_revision": 4})),
         ("milestone_ready", json!({"milestone": "M1"})),
         ("release_request", json!({})),
@@ -270,4 +269,34 @@ fn a_trigger_is_due_after_two_quiet_seconds_capped_ten_seconds_after_its_first_e
         "an integrity event makes it due at once"
     );
     assert_eq!(p.seqs, vec![1, 2, 3, 4]);
+}
+
+#[test]
+fn the_wake_set_is_req_021s_closed_set_with_the_stale_retrigger() {
+    // docs/adr/ADR-025.md decision 1 (fifth to ninth versions; M2T08D-262, -164): a refused team change no longer
+    // wakes (it goes in the next wake's summary); a stale decision's re-trigger does, under every policy, keyed on its
+    // base fingerprint and carrying no #retrigger chain.
+    for policy in [Policy::Efficient, Policy::Balanced, Policy::Intensive] {
+        assert_eq!(
+            classify(
+                policy,
+                "team.binding_refused",
+                &json!({"role": "qa"}),
+                Some(1)
+            ),
+            None,
+            "{policy:?}"
+        );
+        let retrigger = classify(
+            policy,
+            "supervisor.retrigger",
+            &json!({"base_fingerprint": "need_decision/T1", "task_ids": ["T1"], "reason": "STALE_REVISION"}),
+            Some(1),
+        );
+        assert_eq!(
+            retrigger.map(|w| (w.key.fingerprint, w.severity)),
+            Some(("need_decision/T1#retrigger".to_owned(), Severity::High)),
+            "{policy:?}"
+        );
+    }
 }

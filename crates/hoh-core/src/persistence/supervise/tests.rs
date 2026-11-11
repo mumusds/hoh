@@ -471,3 +471,64 @@ async fn a_slow_commit_times_its_events_from_after_the_commit() -> R {
     assert_eq!(latency, [[json!(2000)]]);
     Ok(())
 }
+
+#[tokio::test]
+async fn a_spec_revision_the_project_lacks_keys_by_its_revision_and_never_merges_with_another() -> R
+{
+    // docs/adr/ADR-025.md decision 2 (M2T08D-61, -164): an event naming spec revision 9, which the project has no row
+    // for, keys with a NULL spec and its fingerprint carrying "@r9"; one naming revision 8 (no row either) stays apart.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    events(
+        &store,
+        "revs",
+        &[
+            ("issue.opened", issue("fpx", 9)),
+            ("issue.opened", issue("fpx", 8)),
+        ],
+    )
+    .await?;
+    store.supervise("R", at(&clock, 0)).await?;
+    assert_eq!(
+        rows(
+            &path,
+            "SELECT fingerprint, spec_id FROM supervisor_triggers ORDER BY fingerprint"
+        )?,
+        [
+            [json!("fpx@r8"), Value::Null],
+            [json!("fpx@r9"), Value::Null]
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_step_takes_in_at_most_ten_thousand_events_and_the_next_takes_the_rest() -> R {
+    // docs/adr/ADR-025.md decision 2 (M2T08D-263c): one step looks at no more than 10 000 of a run's events; its
+    // cursor stops at the last one it looked at, and the next step goes on from there.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    let mut all = Vec::new();
+    for n in 0..11 {
+        let chunk: Vec<(&str, Value)> = (0..1000)
+            .map(|i| ("token.delta", json!({"i": i})))
+            .collect();
+        all.extend(events(&store, &format!("cap/{n}"), &chunk).await?);
+    }
+    let first = store.supervise("R", at(&clock, 0)).await?;
+    assert_eq!(first.cursor, all[9_999]);
+    let second = store.supervise("R", at(&clock, 100)).await?;
+    assert_eq!(second.cursor, *all.last().ok_or("none")?);
+    assert_eq!(
+        count(
+            &path,
+            "SELECT last_handled_seq FROM supervisor_cursor WHERE run_id = 'R'"
+        )?,
+        second.cursor
+    );
+    Ok(())
+}
