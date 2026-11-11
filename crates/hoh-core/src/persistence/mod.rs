@@ -20,6 +20,7 @@ mod handover;
 mod inputs;
 mod leases;
 mod outbox;
+mod outputs;
 mod plan;
 mod reconcile;
 mod results;

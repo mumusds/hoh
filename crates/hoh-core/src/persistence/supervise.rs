@@ -116,6 +116,9 @@ pub(super) fn step(
         }
         ctx.before_commit()?;
         tx.commit().map_err(sqlite_error)?;
+        // Then the outputs of its turns, one transaction each, after the judgement: a probe that settled releases its
+        // claims before its answer is disposed of (decision 5, -454).
+        super::outputs::dispose(conn, run_id, context, ctx)?;
         return Ok(Supervised {
             cursor: high,
             fired,

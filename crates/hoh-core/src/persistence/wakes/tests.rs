@@ -1585,3 +1585,331 @@ async fn a_decision_id_seen_again_is_replayed_or_a_key_reuse() -> R {
     assert_eq!(value(&path, "SELECT count(*) FROM events")?, events);
     Ok(())
 }
+
+/// sha256 of `text`, lower-case hex.
+fn sha256(text: &str) -> String {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The nonce turn `attempt`'s dispatch notice carries.
+fn nonce_of(path: &PathBuf, attempt: &str) -> R<String> {
+    Ok(Connection::open(path)?.query_row(
+        "SELECT json_extract(payload_json, '$.nonce') FROM outbox WHERE json_extract(payload_json, '$.attempt_id') = ?1",
+        [attempt],
+        |r| r.get(0),
+    )?)
+}
+
+/// One line of the file bridge: `message` wrapped with `nonce`.
+fn line(nonce: &str, message: Value) -> String {
+    json!({"nonce": nonce, "message": message}).to_string()
+}
+
+/// A Commander message of R's turn `attempt` answering `wake`.
+fn output(id: &str, kind: &str, wake: &str, attempt: &str, revision: u64, payload: Value) -> Value {
+    json!({
+        "schema_version": "1.0", "message_id": id, "run_id": "R", "task_id": "-", "attempt_id": attempt,
+        "sender_role": "commander", "recipient_role": "runtime", "role_epoch": 1, "correlation_id": "c",
+        "causation_id": wake, "idempotency_key": format!("k-{id}"), "expected_revision": revision,
+        "spec_sha256": format!("{:064}", 3), "candidate_id": null, "kind": kind, "payload": payload
+    })
+}
+
+/// Run turn `attempt` to its end with `lines` in its file bridge: OBSERVED with them, then SETTLED or FAILED.
+async fn bridged_turn(
+    store: &Store,
+    clock: &TestClock,
+    attempt: &str,
+    ms: u64,
+    success: bool,
+    lines: &[String],
+) -> R {
+    let notice = store
+        .runner_waiting("p1")
+        .await?
+        .dispatches
+        .into_iter()
+        .find(|d| d.attempt_id == attempt)
+        .ok_or("no dispatch notice for the turn")?;
+    clock.set(ms);
+    assert!(store.runner_received(notice, t(ms)).await?);
+    assert!(
+        store
+            .runner_running(
+                attempt,
+                crate::persistence::AttemptFacts {
+                    pid: Some(4242),
+                    ..Default::default()
+                },
+                json!({"kind": "proc"}),
+            )
+            .await?
+    );
+    assert!(
+        store
+            .runner_effect(
+                attempt,
+                &format!("{attempt}/work"),
+                crate::reconcile::EffectState::Started,
+                crate::reconcile::EffectState::Observed,
+                json!({"success": success, "detail": "turn", "messages": lines}),
+            )
+            .await?
+    );
+    assert!(
+        store
+            .runner_finished(
+                attempt,
+                crate::persistence::Ending {
+                    success,
+                    detail: "turn".to_owned(),
+                    class: TRANSIENT,
+                    at: t(ms + 500),
+                    draw: 0,
+                    observed: Default::default(),
+                    unknown_effect: false,
+                },
+            )
+            .await?
+    );
+    Ok(())
+}
+
+fn ends(path: &PathBuf) -> R<Vec<(String, String)>> {
+    let conn = Connection::open(path)?;
+    let mut s = conn.prepare(
+        "SELECT json_extract(payload_json, '$.output_id'), CASE kind WHEN 'supervisor.output_disposed' \
+         THEN json_extract(payload_json, '$.outcome') || coalesce(':' || json_extract(payload_json, '$.reason'), '') \
+         ELSE kind END FROM events WHERE json_extract(payload_json, '$.output_id') IS NOT NULL \
+         AND kind IN ('supervisor.output_disposed', 'decision.applied', 'decision.rejected') ORDER BY seq",
+    )?;
+    let rows = s
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+#[tokio::test]
+async fn a_turn_has_a_nonce_and_its_outputs_are_recorded_only_when_it_succeeds() -> R {
+    // docs/adr/ADR-025.md decision 8 (-100, -258, -266): the dispatch notice carries the turn's nonce, the allocation
+    // only its sha256; a turn that succeeds has each line of its bridge recorded as supervisor.output in the
+    // transaction of its OBSERVED work (not repeated in that event's detail); a failed turn's lines are discarded.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    let w = wake(&store, &clock, "R", "D", "fp", 0).await?;
+    let a = store
+        .allocate_supervision("p1", context(&clock, 3000))
+        .await?
+        .ok_or("allocated")?;
+    let nonce = nonce_of(&path, &a.attempt_id)?;
+    assert_eq!(nonce.len(), 64, "{nonce}");
+    assert_eq!(
+        value(
+            &path,
+            "SELECT json_extract(payload_json, '$.nonce_sha256') FROM events WHERE kind = 'supervisor.allocated'"
+        )?,
+        json!(sha256(&nonce))
+    );
+    let lines = [
+        line(
+            &nonce,
+            output("m1", "decision", &w, &a.attempt_id, 1, assumption()),
+        ),
+        line(
+            &nonce,
+            output("m2", "decision", &w, &a.attempt_id, 1, assumption()),
+        ),
+    ];
+    bridged_turn(&store, &clock, &a.attempt_id, 3000, true, &lines).await?;
+    assert_eq!(
+        value(
+            &path,
+            "SELECT json_group_array(json_extract(payload_json, '$.output_id')) FROM events WHERE kind = 'supervisor.output'"
+        )?,
+        json!([
+            format!("{}/output/0", a.attempt_id),
+            format!("{}/output/1", a.attempt_id)
+        ])
+    );
+    assert_eq!(
+        value(
+            &path,
+            &format!(
+                "SELECT json_extract(payload_json, '$.detail.messages') IS NULL FROM events WHERE kind = 'effect.observed' AND json_extract(payload_json, '$.attempt_id') = '{}'",
+                a.attempt_id
+            )
+        )?,
+        json!(1)
+    );
+    // A failed turn: its lines discarded.
+    let w2 = wake(&store, &clock, "R", "D", "fp2", 4000).await?;
+    let b = store
+        .allocate_supervision("p1", context(&clock, 6100))
+        .await?
+        .ok_or("allocated")?;
+    let nonce = nonce_of(&path, &b.attempt_id)?;
+    bridged_turn(
+        &store,
+        &clock,
+        &b.attempt_id,
+        6100,
+        false,
+        &[line(
+            &nonce,
+            output("m1", "decision", &w2, &b.attempt_id, 1, assumption()),
+        )],
+    )
+    .await?;
+    assert_eq!(
+        value(
+            &path,
+            "SELECT count(*) FROM events WHERE kind = 'supervisor.output'"
+        )?,
+        json!(2)
+    );
+    assert_eq!(
+        value(
+            &path,
+            "SELECT json_extract(payload_json, '$.count') FROM events WHERE kind = 'supervisor.output_discarded'"
+        )?,
+        json!(1)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn each_output_of_a_turn_ends_exactly_once() -> R {
+    // Decision 8 (-109, -150, -206, -263a): the supervisor's step disposes of each recorded output once, in order: a
+    // decision through decide in the output's transaction (its decision event names the output), the same message again
+    // a replay, its id with other content a key reuse, another kind deferred, a wrong nonce or causation invalid, a
+    // request for a person unsupported with NEED_DECISION claimed for it (commander:<decision id>); a later step
+    // writes nothing more.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    let w = wake(&store, &clock, "R", "D", "fp", 0).await?;
+    let a = store
+        .allocate_supervision("p1", context(&clock, 3000))
+        .await?
+        .ok_or("allocated")?;
+    let nonce = nonce_of(&path, &a.attempt_id)?;
+    let at = a.attempt_id.as_str();
+    let ask = json!({"kind": "request_user_decision", "question_id": "q1", "question": "which?", "requires_user": true});
+    let lines = [
+        line(&nonce, output("m1", "decision", &w, at, 1, assumption())),
+        line(&nonce, output("m1", "decision", &w, at, 1, assumption())),
+        line(
+            &nonce,
+            output(
+                "m1",
+                "decision",
+                &w,
+                at,
+                1,
+                json!({"kind": "record_assumption", "statement": "x", "basis": "y"}),
+            ),
+        ),
+        line(
+            &nonce,
+            output("m2", "steer", &w, at, 1, json!({"text": "go on"})),
+        ),
+        line(
+            "not-the-nonce",
+            output("m3", "decision", &w, at, 1, assumption()),
+        ),
+        line(
+            &nonce,
+            output("m4", "decision", "another-wake", at, 1, assumption()),
+        ),
+        "not json".to_owned(),
+        line(&nonce, output("m5", "decision", &w, at, 1, ask)),
+    ];
+    bridged_turn(&store, &clock, at, 3000, true, &lines).await?;
+    store.supervise("R", context(&clock, 4000)).await?;
+    let o = |n: usize| format!("{at}/output/{n}");
+    assert_eq!(
+        ends(&path)?,
+        [
+            (o(0), "decision.applied".to_owned()),
+            (o(1), "replay".to_owned()),
+            (o(2), "invalid:KEY_REUSE".to_owned()),
+            (o(3), "deferred".to_owned()),
+            (o(4), "invalid:NONCE".to_owned()),
+            (o(5), "invalid:CAUSATION".to_owned()),
+            (o(6), "invalid:FORMAT".to_owned()),
+            (o(7), "unsupported".to_owned()),
+        ]
+    );
+    assert_eq!(
+        value(
+            &path,
+            "SELECT json_extract(payload_json, '$.decision_id') FROM events WHERE kind = 'decision.applied'"
+        )?,
+        json!(format!("{at}/m1"))
+    );
+    assert_eq!(
+        blocked(&path)?,
+        (
+            "BLOCKED".to_owned(),
+            json!(["NEED_DECISION"]),
+            vec![format!("NEED_DECISION commander:{at}/m5")]
+        )
+    );
+    let count = value(&path, "SELECT count(*) FROM events")?;
+    store.supervise("R", context(&clock, 5000)).await?;
+    assert_eq!(value(&path, "SELECT count(*) FROM events")?, count);
+    Ok(())
+}
+
+#[tokio::test]
+async fn outputs_wait_while_their_run_is_paused_and_are_superseded_when_it_is_cancelled() -> R {
+    // Decision 6 (non-working states): a paused run's outputs are not disposed of; a cancelled run's are superseded.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    let w = wake(&store, &clock, "R", "D", "fp", 0).await?;
+    let a = store
+        .allocate_supervision("p1", context(&clock, 3000))
+        .await?
+        .ok_or("allocated")?;
+    let nonce = nonce_of(&path, &a.attempt_id)?;
+    bridged_turn(
+        &store,
+        &clock,
+        &a.attempt_id,
+        3000,
+        true,
+        &[line(
+            &nonce,
+            output("m1", "decision", &w, &a.attempt_id, 1, assumption()),
+        )],
+    )
+    .await?;
+    exec(
+        &path,
+        "UPDATE runs SET state = 'PAUSED', resume_state = 'RUNNING' WHERE run_id = 'R';",
+    )?;
+    store.supervise("R", context(&clock, 4000)).await?;
+    assert!(ends(&path)?.is_empty());
+    exec(
+        &path,
+        "UPDATE runs SET state = 'CANCEL_REQUESTED' WHERE run_id = 'R';",
+    )?;
+    store.supervise("R", context(&clock, 5000)).await?;
+    assert_eq!(
+        ends(&path)?,
+        [(
+            format!("{}/output/0", a.attempt_id),
+            "superseded".to_owned()
+        )]
+    );
+    Ok(())
+}

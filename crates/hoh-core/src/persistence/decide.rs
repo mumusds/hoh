@@ -61,7 +61,7 @@ pub(super) fn decide(
     ctx: &super::writer::Ctx<'_>,
 ) -> Result<Decided, PersistError> {
     let tx = super::writer::begin(conn, ctx)?;
-    let decided = decide_in(&tx, proposal, context, ctx)?;
+    let decided = decide_in(&tx, proposal, context, ctx, None)?;
     if !matches!(decided, Decided::Replayed { .. } | Decided::KeyReuse) {
         tx.commit().map_err(sqlite_error)?;
     }
@@ -150,6 +150,7 @@ pub(super) fn decide_in(
     proposal: &Proposal,
     context: &Context,
     ctx: &super::writer::Ctx<'_>,
+    output_id: Option<&str>,
 ) -> Result<Decided, PersistError> {
     // The payload is checked against $defs.DecisionPayload again on the way in, whoever built the proposal.
     let payload = protocol::encode(&proposal.payload)
@@ -240,6 +241,9 @@ pub(super) fn decide_in(
             )?;
             commit.events[0].payload["causation_id"] = json!(proposal.causation_id);
             commit.events[0].payload["decided_at"] = json!(crate::time::rfc3339_utc(context.now()));
+            if let Some(output_id) = output_id {
+                commit.events[0].payload["output_id"] = json!(output_id);
+            }
             let done = writer::write(tx, &commit, ctx)?;
             resolve(tx, &proposal.decision_id, "APPLIED", None)?;
             Decided::Applied {
@@ -251,6 +255,9 @@ pub(super) fn decide_in(
             let mut event = rejected(&project_id, proposal, &snapshot, context, &rejection);
             event.payload["causation_id"] = json!(proposal.causation_id);
             event.payload["decided_at"] = json!(crate::time::rfc3339_utc(context.now()));
+            if let Some(output_id) = output_id {
+                event.payload["output_id"] = json!(output_id);
+            }
             let mut events = vec![event];
             // A stale answer to a wake is re-triggered, exactly once (REQ-021 behaviour 6, decision 6).
             if let Some(turn) = turn.as_ref().filter(|_| {
