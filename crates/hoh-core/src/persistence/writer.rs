@@ -353,6 +353,19 @@ impl Job {
             Job::Runner(job, _) if matches!(**job, super::runner::RunnerJob::Checkpoint(..)) => {
                 "Checkpoint"
             }
+            // The supervisor's writes (docs/adr/ADR-025.md decisions 2, 3 and 8), no attempt's: its steps, its allocations,
+            // its turns to stop and their withdrawals (TEST-021-03 kills a host in a step).
+            Job::Runner(job, _)
+                if matches!(
+                    **job,
+                    super::runner::RunnerJob::Supervise { .. }
+                        | super::runner::RunnerJob::Allocate { .. }
+                        | super::runner::RunnerJob::Stops { .. }
+                        | super::runner::RunnerJob::WithdrawTurn(..)
+                ) =>
+            {
+                "Supervise"
+            }
             Job::Runner(..) => "Runner",
             Job::Control(..) => "Control",
             Job::Wake => "Wake",

@@ -57,6 +57,9 @@ pub struct Waiting {
     pub agents: std::collections::BTreeSet<String>,
     /// The session.start notices waiting (docs/adr/ADR-024.md decision 4).
     pub session_starts: Vec<super::handover::SessionStart>,
+    /// The runs whose supervisor steps (docs/adr/ADR-025.md decision 2): those not ended, and an ended one while it
+    /// still has a PENDING trigger or a wake owed (superseded by its next step).
+    pub supervised: Vec<String>,
 }
 
 /// One step of the runner.
@@ -376,7 +379,22 @@ fn waiting(conn: &Connection, project_id: &str) -> Result<Waiting, PersistError>
             .collect::<Result<_, _>>()
             .map_err(sqlite_error)
     };
+    let supervised = {
+        let mut statement = conn
+            .prepare(
+                "SELECT r.run_id FROM runs r WHERE r.project_id = ?1 AND (r.state NOT IN ('CANCELLED', 'COMPLETED', 'FAILED') \
+                 OR EXISTS (SELECT 1 FROM supervisor_triggers t WHERE t.run_id = r.run_id AND t.state = 'PENDING')) \
+                 ORDER BY r.created_at, r.run_id",
+            )
+            .map_err(sqlite_error)?;
+        statement
+            .query_map(params![project_id], |r| r.get(0))
+            .map_err(sqlite_error)?
+            .collect::<Result<_, _>>()
+            .map_err(sqlite_error)?
+    };
     Ok(Waiting {
+        supervised,
         session_starts: super::handover::waiting(conn, project_id)?,
         dispatches,
         started,

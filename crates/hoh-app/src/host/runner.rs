@@ -500,6 +500,50 @@ async fn tick(
         store.pace_run(run, at()).await?;
         while store.schedule_round(run, at()).await?.dispatched.is_some() {}
     }
+    // The supervisor (docs/adr/ADR-025.md decisions 2, 3, 5 and 8): each run's step (its triggers, its Commander's
+    // availability, its turns' outputs), a Commander turn for an owed wake, then the turns to stop now.
+    for run in &waiting.supervised {
+        store.supervise(run, at()).await?;
+    }
+    store.allocate_supervision(&project_id, at()).await?;
+    for stop in store.supervision_stops(&project_id, at()).await? {
+        if stop.state == "PREPARED" {
+            store
+                .withdraw_turn(&stop.attempt_id, common.clock.now())
+                .await?;
+            continue;
+        }
+        let waiting_out = held_back
+            .get(&stop.attempt_id)
+            .is_some_and(|(at, _)| at.elapsed() < common.settings.retry);
+        if waiting_out {
+            continue;
+        }
+        let entry = common
+            .inflight
+            .lock()
+            .ok()
+            .and_then(|mut f| f.remove(&stop.attempt_id));
+        let last = held_back
+            .get(&stop.attempt_id)
+            .map(|(_, seen)| seen.clone());
+        match settle(
+            common,
+            &stop.attempt_id,
+            entry,
+            stop.reason,
+            last.as_deref(),
+        )
+        .await?
+        {
+            Some((Disposition::Unreaped, seen)) => {
+                held_back.insert(stop.attempt_id.clone(), (Instant::now(), seen));
+            }
+            _ => {
+                held_back.remove(&stop.attempt_id);
+            }
+        }
+    }
     for (message_id, _) in &waiting.started {
         store.ack_notice(message_id).await?;
     }
