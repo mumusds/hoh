@@ -134,6 +134,7 @@ impl hoh_app::host::Executor for FakeCommander {
                 reason: "NOT_SUPERVISION".to_owned(),
                 class: hoh_core::retry::FailureClass::Capability,
                 detail: None,
+                details: None,
             })?;
         let first = self.turns.lock().map(|mut n| {
             *n += 1;
@@ -149,6 +150,7 @@ impl hoh_app::host::Executor for FakeCommander {
                 reason: "SPAWN".to_owned(),
                 class: hoh_core::retry::FailureClass::Transient { retry_after: None },
                 detail: Some(e.to_string()),
+                details: None,
             })?;
         let pid = child.id();
         let stdin = child.stdin.take();

@@ -169,52 +169,9 @@ fn first_input(project: &Path, session_id: &str) -> Result<Option<serde_json::Va
     }
 }
 
-/// The text a turn is sent: the role's contract, then, in a new holder's first turn, its handover package whole
-/// (ADR-024 decision 4), then the task's header (decision 11).
-fn prompt_text(contract: &str, package: Option<&serde_json::Value>, work: &Work) -> String {
-    let a = &work.assignment;
-    let package = package
-        .map(|p| {
-            format!(
-                "\n\n---\n# 交接包（本会话的首个输入，ADR-024）\n\n```json\n{}\n```",
-                serde_json::to_string_pretty(p).unwrap_or_else(|_| p.to_string())
-            )
-        })
-        .unwrap_or_default();
-    format!(
-        "{contract}{package}\n\n---\n# 本次任务\n\n- Run 目标：{goal}\n- 任务：{task}{title}\n- 职位：{role}\n",
-        contract = contract.trim_end(),
-        goal = a.goal.as_deref().unwrap_or("（未给出）"),
-        task = work.task_id,
-        title = a
-            .title
-            .as_deref()
-            .map(|t| format!(" {t}"))
-            .unwrap_or_default(),
-        role = work.role,
-    )
-}
-
 /// At most this many lines and bytes of a Commander turn's bridge are taken (docs/adr/ADR-025.md decision 8).
 pub(super) const BRIDGE_LINES: usize = 1_000;
 pub(super) const BRIDGE_BYTES: usize = 1 << 20;
-
-/// What a Commander turn is told after its task's header (docs/adr/ADR-025.md decisions 7 and 8): the wake it answers,
-/// the values its decision names, the bridge's nonce and file, and what it is shown.
-pub(super) fn supervision_text(s: &hoh_core::persistence::Supervision, bridge: &Path) -> String {
-    format!(
-        "\n---\n# 本次唤醒\n\n- causation_id：{wake}\n- expected_revision：{revision}\n- role_epoch：{epoch}\n\
-         - nonce：{nonce}\n- 输出文件：{bridge}\n\n每条决策一行：`{{\"nonce\": \"{nonce}\", \"message\": {{...}}}}`，\
-         追加写入上面的输出文件。\n\n## 唤醒摘要\n\n```json\n{summary}\n```\n",
-        wake = s.wake,
-        revision = s.run_revision,
-        epoch = s.role_epoch,
-        nonce = s.nonce,
-        bridge = bridge.display(),
-        summary =
-            serde_json::to_string_pretty(&s.summary).unwrap_or_else(|_| s.summary.to_string()),
-    )
-}
 
 /// The non-empty lines of the bridge file `path`, in order, within [`BRIDGE_LINES`] and [`BRIDGE_BYTES`]; none when it is
 /// missing or unreadable.
@@ -251,6 +208,7 @@ fn refused(reason: &str, class: FailureClass, detail: String) -> Refusal {
         reason: reason.to_owned(),
         class,
         detail: Some(detail),
+        details: None,
     }
 }
 
@@ -335,6 +293,103 @@ fn keep_diagnostics(outcome: &Outcome) {
 }
 
 impl ProductExecutor {
+    /// The prompt `work` is sent, packed from its four layers within its run's budget, its inputs kept as objects, and
+    /// the record of it (docs/adr/ADR-026.md decisions 3 to 7); or why it cannot start: CONTEXT_BUDGET_TOO_SMALL with
+    /// what the mandatory items need and the budget (decision 9), PROMPT_UNAVAILABLE for a contract whose placeholders
+    /// are malformed (both deterministic), CONTEXT_UNAVAILABLE when the objects cannot be written (transient).
+    fn pack(
+        &self,
+        work: &Work,
+        contract: &hoh_core::config::Contract,
+        package: Option<&serde_json::Value>,
+    ) -> Result<(String, PromptRecord), Refusal> {
+        use hoh_core::context;
+        let a = &work.assignment;
+        let facts = a.context.clone().unwrap_or_default();
+        let lead = package.map(context::lead).unwrap_or_default();
+        // A Commander turn is told where to write its answers and where the project is (it runs outside it).
+        let bridge = a
+            .supervision
+            .as_ref()
+            .map(|_| attempt_logs(&self.project, &work.attempt_id).join(BRIDGE));
+        if bridge.is_some() {
+            let _ = std::fs::create_dir_all(attempt_logs(&self.project, &work.attempt_id));
+        }
+        let bridge_text = bridge.as_ref().map(|b| b.display().to_string());
+        let project = a
+            .supervision
+            .as_ref()
+            .map(|_| self.project.display().to_string());
+        let deterministic =
+            |why: String| refused("PROMPT_UNAVAILABLE", FailureClass::Decision, why);
+        let mandatory = context::mandatory(
+            &facts,
+            &work.role,
+            &lead,
+            bridge_text.as_deref(),
+            project.as_deref(),
+        )
+        .map_err(deterministic)?;
+        let version = hoh_core::objects::resource_bundle_version();
+        let recorded = context::record(
+            context::Contract {
+                layer: contract.layer,
+                path: &contract.path,
+                text: &contract.text,
+            },
+            &mandatory,
+            package,
+            &facts.entries,
+            facts.params(),
+            &version,
+        )
+        .map_err(|e| match e {
+            context::PackError::TooSmall {
+                required,
+                available,
+            } => Refusal {
+                reason: "CONTEXT_BUDGET_TOO_SMALL".to_owned(),
+                class: FailureClass::Decision,
+                detail: Some(e.to_string()),
+                details: Some(serde_json::json!({
+                    "required": required, "available": available, "estimated": true
+                })),
+            },
+            other => deterministic(other.to_string()),
+        })?;
+        let mut artifacts = Vec::new();
+        for object in &recorded.objects {
+            let sha = hoh_core::objects::put(&self.project, &object.bytes).map_err(|why| {
+                refused(
+                    "CONTEXT_UNAVAILABLE",
+                    FailureClass::Transient { retry_after: None },
+                    why,
+                )
+            })?;
+            artifacts.push(hoh_core::persistence::ArtifactRow {
+                path: hoh_core::objects::relative_path(&sha),
+                sha256: sha,
+                bytes: object.bytes.len() as u64,
+                mime: object.mime.to_owned(),
+            });
+        }
+        artifacts.sort_by(|x, y| x.sha256.cmp(&y.sha256));
+        artifacts.dedup();
+        let record = PromptRecord {
+            layer: contract.layer.to_owned(),
+            role: work.role.clone(),
+            path: contract.path.clone(),
+            content_sha256: sha256_hex(contract.text.as_bytes()),
+            sent_sha256: recorded.packed.sha256.clone(),
+            packed: Some(hoh_core::persistence::Packing {
+                resource_bundle_version: version,
+                event: recorded.event,
+                artifacts,
+            }),
+        };
+        Ok((recorded.packed.prompt, record))
+    }
+
     /// The turn `work` runs and the record of its prompt, or why it cannot start.
     fn prepare(&self, work: &Work) -> Result<(Agent, Ready, Prepared, PromptRecord), Refusal> {
         let a = &work.assignment;
@@ -388,21 +443,7 @@ impl ProductExecutor {
             },
             _ => None,
         };
-        let mut text = prompt_text(&contract.text, package.as_ref(), work);
-        // A Commander turn is told its wake and where to write its answer (docs/adr/ADR-025.md decisions 7, 8).
-        if let Some(s) = &a.supervision {
-            let logs = attempt_logs(&self.project, &work.attempt_id);
-            let _ = std::fs::create_dir_all(&logs);
-            text.push_str(&supervision_text(s, &logs.join(BRIDGE)));
-        }
-        let record = PromptRecord {
-            layer: contract.layer.to_owned(),
-            role: work.role.clone(),
-            path: contract.path,
-            content_sha256: sha256_hex(contract.text.as_bytes()),
-            sent_sha256: sha256_hex(text.as_bytes()),
-            packed: None,
-        };
+        let (text, record) = self.pack(work, &contract, package.as_ref())?;
         let session_id = a.session_id.clone().unwrap_or_default();
         let exec_only = self
             .exec_only
