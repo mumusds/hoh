@@ -527,6 +527,14 @@ async fn tick(
                 e @ (PersistError::WriterStopped | PersistError::Busy(_) | PersistError::Full(_)),
             ) => return Err(e),
             Err(e) => {
+                // Seen in the run's events too, once per error (v15, M2T08R-152); its own failure only said.
+                if let Err(failed) = store.supervision_failed(run, &e.to_string()).await {
+                    use std::io::Write as _;
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "hoh host: recording the failed supervisor step of run {run}: {failed}"
+                    );
+                }
                 let said = format!("{run}: {e}");
                 if common
                     .unsupervised

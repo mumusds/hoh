@@ -1328,17 +1328,21 @@ pub(super) fn judge(
                 json!({"reasons": reasons, "observation": observation, "at": at, "role_epoch": epoch}),
             ));
         }
-        // What the run owes its Commander: its wakes not answered (owed, or in flight: a probe's wake is still owed
-        // its decision, v13; or settled with outputs of that turn still to dispose of, v14 M2T08R-103) and its
-        // PENDING triggers.
+        // What the run owes its Commander, blocking (v15): its owed wakes; a wake whose last turn is a probe in flight
+        // or settled with outputs still to dispose of (M2T08R-01, -50, -103); and its PENDING triggers. An ordinary
+        // turn, allocated while the Commander was available, is answering its wake and blocks nothing (M2T08R-150).
         let waiting = super::outputs::pending_attempts(tx, run_id)?;
+        let probes = probe_attempts(tx, run_id)?;
         let mut seqs: Vec<i64> = Vec::new();
         for wake in wakes.iter().filter(|w| {
-            !w.superseded
-                && (!w.settled()
-                    || w.turns
-                        .last()
-                        .is_some_and(|t| waiting.contains(&t.attempt_id)))
+            w.owed()
+                || (!w.superseded
+                    && w.turns.last().is_some_and(|t| {
+                        probes.contains(&t.attempt_id)
+                            && (!t.ended()
+                                || (t.state == Some(AttemptState::Settled)
+                                    && waiting.contains(&t.attempt_id)))
+                    }))
         }) {
             seqs.extend(&wake.event_seqs);
             owed_records.push(json!({"wake": wake.id, "fingerprint": wake.fingerprint}));
@@ -1424,6 +1428,21 @@ pub(super) fn judge(
     commit.cas.extend(moved.cas);
     commit.events.extend(moved.events);
     Ok(commit)
+}
+
+/// The attempts of run `run_id` allocated as probes (`supervisor.probe`).
+fn probe_attempts(tx: &Transaction<'_>, run_id: &str) -> Result<BTreeSet<String>, PersistError> {
+    let mut statement = tx
+        .prepare(
+            "SELECT json_extract(payload_json, '$.attempt_id') FROM events WHERE run_id = ?1 AND kind = ?2",
+        )
+        .map_err(sqlite_error)?;
+    let rows: Vec<Option<String>> = statement
+        .query_map(params![run_id, PROBE], |r| r.get(0))
+        .map_err(sqlite_error)?
+        .collect::<Result<_, _>>()
+        .map_err(sqlite_error)?;
+    Ok(rows.into_iter().flatten().collect())
 }
 
 /// Whether run `run_id`'s Commander, unavailable for `reasons`, may be probed at `now` (decision 5): only for capped

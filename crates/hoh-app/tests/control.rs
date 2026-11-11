@@ -818,6 +818,16 @@ async fn a_run_whose_supervisor_step_fails_holds_up_no_other_run() -> R {
         )?,
         "PENDING"
     );
+    // Its failure is in X's events once (M2T08R-152), however many ticks failed meanwhile.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        query(
+            &project,
+            "SELECT count(*) || ' ' || max(json_extract(payload_json, '$.error') LIKE '%event_seqs_json%') FROM events \
+             WHERE run_id = 'X' AND kind = 'supervisor.step_failed'"
+        )?,
+        "1 1"
+    );
     host.shutdown().await;
     Ok(())
 }

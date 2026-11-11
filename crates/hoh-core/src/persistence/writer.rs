@@ -362,6 +362,7 @@ impl Job {
                         | super::runner::RunnerJob::Allocate { .. }
                         | super::runner::RunnerJob::Stops { .. }
                         | super::runner::RunnerJob::WithdrawTurn(..)
+                        | super::runner::RunnerJob::StepFailed(..)
                 ) =>
             {
                 "Supervise"

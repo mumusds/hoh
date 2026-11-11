@@ -2673,63 +2673,6 @@ async fn an_integrity_edges_woken_and_its_preempt_are_one_commit() -> R {
     Ok(())
 }
 
-#[tokio::test]
-async fn a_second_blocking_episode_under_the_same_reasons_is_its_own() -> R {
-    // M2T08R-51 (decision 5, v13): the claims released while the Commander stays unavailable (its obligation, a turn in
-    // flight, answered) and claimed again for a new obligation make a second blocking episode with its own
-    // supervisor.blocked, whatever the unavailability events.
-    use crate::decision::Observation;
-    let dir = tempfile::tempdir()?;
-    let clock = std::sync::Arc::new(TestClock::default());
-    let (store, path) = open(&dir, &clock)?;
-    exec(&path, WORLD)?;
-    wake(&store, &clock, "R", "D", "first", 0).await?;
-    let a = store
-        .allocate_supervision("p1", context(&clock, 3000))
-        .await?
-        .ok_or("allocated")?;
-    let gone = |ms| Context {
-        observations: Some(
-            [(
-                "codex".to_owned(),
-                Observation {
-                    host_epoch: 1,
-                    n: 1,
-                    available: false,
-                    logged_in: true,
-                },
-            )]
-            .into_iter()
-            .collect(),
-        ),
-        ..context(&clock, ms)
-    };
-    store.supervise("R", gone(3100)).await?;
-    assert_eq!(blocked(&path)?.0, "BLOCKED", "its turn in flight is owed");
-    run_turn(&store, &clock, &a.attempt_id, 3200, true, TRANSIENT).await?;
-    store.supervise("R", gone(4000)).await?;
-    assert_eq!(blocked(&path)?.0, "RUNNING", "nothing owed");
-    clock.set(5000);
-    event(
-        &store,
-        "R",
-        "R/second",
-        "need_decision",
-        json!({"task_id": "D", "fingerprint": "second"}),
-    )
-    .await?;
-    store.supervise("R", gone(7000)).await?;
-    assert_eq!(blocked(&path)?.0, "BLOCKED");
-    assert_eq!(
-        value(
-            &path,
-            "SELECT count(*) FROM events WHERE kind = 'supervisor.blocked'"
-        )?,
-        json!(2)
-    );
-    Ok(())
-}
-
 // Implementation review round 2 (docs/adr/ADR-025.md v14: the ended turns folded before the verdict; recovery only by
 // its facts; an obligation until its turn's outputs are disposed). Steps run in the host's order: supervise, then
 // allocate.
@@ -2821,26 +2764,13 @@ async fn the_step_counts_an_ended_turns_failure_before_its_verdict() -> R {
     Ok(())
 }
 
-#[tokio::test]
-async fn a_settled_turn_is_owed_until_its_outputs_are_disposed_of() -> R {
-    // M2T08R-103 (decision 3, v14): a wake whose turn settled is still an obligation while that turn's outputs wait
-    // to be disposed of: with its Commander still unavailable the step keeps the run BLOCKED, the stale answer is
-    // re-triggered, and the run stays BLOCKED through the next step.
-    use crate::decision::Observation;
-    let dir = tempfile::tempdir()?;
-    let clock = std::sync::Arc::new(TestClock::default());
-    let (store, path) = open(&dir, &clock)?;
-    exec(&path, WORLD)?;
-    let w = wake(&store, &clock, "R", "D", "fp", 0).await?;
-    let a = store
-        .allocate_supervision("p1", context(&clock, 3000))
-        .await?
-        .ok_or("allocated")?;
-    let gone = |ms| Context {
+/// A context at `ms` whose registry's look finds the Commander's agent (codex) unavailable.
+fn agent_gone(clock: &TestClock, ms: u64) -> Context {
+    Context {
         observations: Some(
             [(
                 "codex".to_owned(),
-                Observation {
+                crate::decision::Observation {
                     host_epoch: 1,
                     n: 1,
                     available: false,
@@ -2850,10 +2780,27 @@ async fn a_settled_turn_is_owed_until_its_outputs_are_disposed_of() -> R {
             .into_iter()
             .collect(),
         ),
-        ..context(&clock, ms)
-    };
-    store.supervise("R", gone(3100)).await?;
-    assert_eq!(blocked(&path)?.0, "BLOCKED");
+        ..context(clock, ms)
+    }
+}
+
+#[tokio::test]
+async fn a_turn_in_flight_when_its_commander_becomes_unavailable_is_answered_and_blocks_nothing()
+-> R {
+    // M2T08R-150 (decision 3, v15): an ordinary turn, allocated while its Commander was available, is answering its
+    // wake: the Commander becoming unavailable mid-turn does not block the run (state and revision unchanged), the
+    // turn's answer is APPLIED, nothing is re-triggered; a new decision owed while it is still unavailable blocks.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    let w = wake(&store, &clock, "R", "D", "fp", 0).await?;
+    let a = store
+        .allocate_supervision("p1", context(&clock, 3000))
+        .await?
+        .ok_or("allocated")?;
+    store.supervise("R", agent_gone(&clock, 3100)).await?;
+    assert_eq!(run_state(&path, "R")?, ("RUNNING".to_owned(), 1));
     let nonce = nonce_of(&path, &a.attempt_id)?;
     bridged_turn(
         &store,
@@ -2867,10 +2814,103 @@ async fn a_settled_turn_is_owed_until_its_outputs_are_disposed_of() -> R {
         )],
     )
     .await?;
-    store.supervise("R", gone(4000)).await?;
-    assert_eq!(blocked(&path)?.0, "BLOCKED", "its output was still owed");
-    assert_eq!(retriggers(&path)?.len(), 1);
-    store.supervise("R", gone(5000)).await?;
-    assert_eq!(blocked(&path)?.0, "BLOCKED", "its re-trigger is owed");
+    store.supervise("R", agent_gone(&clock, 4000)).await?;
+    assert_eq!(
+        ends(&path)?,
+        [(
+            format!("{}/output/0", a.attempt_id),
+            "decision.applied".to_owned()
+        )]
+    );
+    assert!(retriggers(&path)?.is_empty());
+    assert_eq!(blocked(&path)?.0, "RUNNING");
+    clock.set(5000);
+    event(
+        &store,
+        "R",
+        "R/second",
+        "need_decision",
+        json!({"task_id": "D", "fingerprint": "second"}),
+    )
+    .await?;
+    store.supervise("R", agent_gone(&clock, 7000)).await?;
+    assert_eq!(
+        blocked(&path)?.1,
+        json!(["COMMANDER_UNAVAILABLE", "NEED_DECISION"])
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_probe_settled_while_its_commander_is_unavailable_otherwise_is_owed_until_its_outputs_are_disposed_of()
+-> R {
+    // M2T08R-103 (decision 3, v15): a probe's wake is a blocking obligation while the probe is in flight and, once it
+    // settled with the Commander unavailable for another reason (the registry lost its agent meanwhile), until its
+    // outputs are disposed of: the step keeps the run BLOCKED, the probe's answer (at the revision it was given) is
+    // APPLIED, and the next step releases the claims; a new obligation then is a second blocking episode.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    let w = wake(&store, &clock, "R", "D", "fp", 0).await?;
+    let mut ms = fail_turns(&store, &clock, 8, 3000, TRANSIENT).await?;
+    store.supervise("R", context(&clock, ms)).await?;
+    store
+        .allocate_supervision("p1", context(&clock, ms))
+        .await?;
+    assert_eq!(blocked(&path)?.0, "BLOCKED");
+    ms += 300_000;
+    let probe = store
+        .allocate_supervision("p1", context(&clock, ms))
+        .await?
+        .ok_or("the probe")?;
+    let revision = run_state(&path, "R")?.1;
+    let nonce = nonce_of(&path, &probe.attempt_id)?;
+    bridged_turn(
+        &store,
+        &clock,
+        &probe.attempt_id,
+        ms + 100,
+        true,
+        &[line(
+            &nonce,
+            output(
+                "m1",
+                "decision",
+                &w,
+                &probe.attempt_id,
+                u64::try_from(revision)?,
+                assumption(),
+            ),
+        )],
+    )
+    .await?;
+    store.supervise("R", agent_gone(&clock, ms + 1000)).await?;
+    assert_eq!(blocked(&path)?.0, "BLOCKED", "its outputs were owed");
+    assert_eq!(
+        ends(&path)?.last().map(|(_, end)| end.clone()),
+        Some("decision.applied".to_owned())
+    );
+    assert!(retriggers(&path)?.is_empty());
+    store.supervise("R", agent_gone(&clock, ms + 2000)).await?;
+    assert_eq!(blocked(&path)?.0, "RUNNING", "nothing owed any more");
+    clock.set(ms + 3000);
+    event(
+        &store,
+        "R",
+        "R/second",
+        "need_decision",
+        json!({"task_id": "D", "fingerprint": "second"}),
+    )
+    .await?;
+    store.supervise("R", agent_gone(&clock, ms + 6000)).await?;
+    assert_eq!(blocked(&path)?.0, "BLOCKED");
+    assert_eq!(
+        value(
+            &path,
+            "SELECT count(*) FROM events WHERE kind = 'supervisor.blocked'"
+        )?,
+        json!(2)
+    );
     Ok(())
 }
