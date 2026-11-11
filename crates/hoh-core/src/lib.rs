@@ -52,6 +52,8 @@ pub mod schema;
 pub mod supervise;
 #[forbid(clippy::disallowed_methods)]
 pub mod time;
+#[forbid(clippy::disallowed_methods)]
+pub mod verification;
 
 /// Crate version, reported by the `hoh` binary for diagnostics.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
