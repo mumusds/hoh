@@ -649,7 +649,7 @@
     "AC-054-03",
     "AC-039-03"
    ],
-   "done_when": "AC-021-05、AC-035-03/05、AC-036-03、AC-037-02/03/04、AC-053-03、AC-054-03 通过；Commander 不可用时 candidate_ready 仍派发 QA/Review；FAILED/UNKNOWN 永不投影为 PASS；AC-039-03 通过（CR-016：QA 的 Prompt 经产品 QA 派发、同一收集函数与装箱器生成，由 FakeAgent 捕获）；为 QA、Reviewer 与返工的 Developer 加入代码类上下文来源（冻结候选相对其基准改动的文件，ADR-026 决定 12），并写 handoffs 表（ADR-026 决定 6）。"
+   "done_when": "AC-021-05、AC-035-03/05、AC-036-03、AC-037-02/03/04、AC-053-03、AC-054-03 通过；Commander 不可用时 candidate_ready 仍派发 QA/Review；FAILED/UNKNOWN 永不投影为 PASS；AC-039-03 通过（CR-016：QA 的 Prompt 经产品 QA 派发、同一收集函数与装箱器生成，由 FakeAgent 捕获）；为 QA、Reviewer 与返工的 Developer 加入代码类上下文来源（冻结候选相对其基准改动的文件，ADR-026 决定 12），并写 handoffs 表（ADR-026 决定 6）；Developer COMPLETED 时由 Runtime 在写租约下冻结、再 candidate_ready；QA/Reviewer Attempt 经 ADR-027 的检查驱动运行检查并写证据（原则二：只有它们能产出证据）；候选迁移带原状态条件，不覆盖 M2-T10 写入的否决 INVALID；Attempt 级运行后核对不符时经 M2-T10 的 Store::record_evidence 写 INVALID 证据，其执行记录的形态由本任务定义并写在 `.hoh/evidence/` 下（traceability 同样否决）；候选的 VERIFYING/ACCEPTED/REJECTED 迁移（INVALID 只由 M2-T10 的证据写入，M2-T16 从不写）；新 Run 无新提交与同 Run 同内容遇 STALE/INVALID 的情形；`.hoh/` 下字节稳定的环境描述（CR-017，ADR-027 的移交）。"
   },
   {
    "id": "M2-T18",
@@ -675,7 +675,7 @@
     "AC-054-04",
     "AC-054-05"
    ],
-   "done_when": "AC-053-01/02/04/05、AC-054-01/02/04/05 通过；独立报告写入 independent_reports 表并可追溯到原始会话。"
+   "done_when": "AC-053-01/02/04/05、AC-054-01/02/04/05 通过；独立报告写入 independent_reports 表并可追溯到原始会话；acceptance_results 的投影按 ADR-027 原则一的历史规则（该候选上该 AC 有 PASS 与可降级需求上合规 DEGRADED 之外的任一行即不满足，次序与原则一的 TEST 状态相同：FAIL、UNKNOWN、BLOCKED 行与 PASS/DEGRADED 并存为 FLAKY，符合 AC-053-02，否则有 INVALID 行为 INVALID；可降级需求上只有 PASS 与合规 DEGRADED 且至少一条 DEGRADED 为 DEGRADED 并满足；没有行为 NOT_RUN；候选为 INVALID 即全不满足；有 profile 时补原则一规则 16；检查级状态由原则一推出并按历史聚合，BLOCKED 与原因为 TIMED_OUT、NOT_STARTED、INTERRUPTED、INCOMPLETE、PLUGINS_MISSING 的 FAIL 为无结论）（CR-017，ADR-027 的移交）。"
   },
   {
    "id": "M2-T15",
@@ -897,7 +897,7 @@
     "REQ-033",
     "REQ-034"
    ],
-   "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。"
+   "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）；TEST-032-01 的测试在 tests/bundle、名称含 test_032_01（traceability 自测据此定位）（CR-017，ADR-027 的移交）。"
   },
   {
    "id": "M3-T03",
@@ -1251,7 +1251,7 @@
     "REQ-069",
     "REQ-070"
    ],
-   "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。"
+   "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）；traceability 与 independent-* 检查的 argv 改为 v1；TEST-069-01 的测试在 tests/bundle、名称含 test_069_01（CR-017，ADR-027 的移交）。"
   },
   {
    "id": "M7-T03",
@@ -1270,7 +1270,7 @@
    "checks": [
     "soak"
    ],
-   "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。"
+   "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）；产品里 soak 检查的满足条件按 ADR-027 原则一规则 18（含逐事件的候选绑定）（CR-017，ADR-027 的移交）。"
   },
   {
    "id": "M7-T04",

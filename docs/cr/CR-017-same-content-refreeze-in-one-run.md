@@ -1,8 +1,8 @@
 # CR-017 · 相同内容重复冻结限定在同一 Run
 
 ID：CR-017
-状态：PROPOSED（ADR-027 设计审查第 3、4 轮：Codex 与 Claude 都判其内容属 CR-003 D1 的细化；ADR-027 整体审查收敛后由 CTO 批准，届时本行恰为“状态：APPROVED”，再改受锁文件并重新上锁）
-批准人：（待定）
+状态：APPROVED
+批准人：CTO 依 CR-003 D1 预授权（ADR-027 设计审查第 3、4 轮起两位审查者都判其属细化；第 9 轮 Codex 01a1cca9-1ffc-77e0-89a4-f12888c21e1b 与 Claude 54a4a0c6-f93c-4581-ab65-3a00b2441a14 判 PASS、原则一收敛；聚焦第 10 轮 Codex 01a1ccbb-be14-73e3-a61a-4132fd6c265d 判 PASS、CR-017 可以批准，其 low M2T10D-900、-901 已在批准前改正）
 日期：2026-11-11
 基线：修改受锁文件 `contracts/requirements.json`（REQ-052 决定 1），重新上锁
 
@@ -21,7 +21,7 @@ REQ-052 决定 1 改为：“产品中对相同内容重复冻结：同一 Run �
 - ADR-027 决定 5。新 Run 没有新提交就不能冻结（如取消后重验），处理方式移交 M2-T16。
 - `contracts/development-tasks.json`（不在锁内），ADR-027 的移交（M2T10D-162、-260）：
   - M2-T16 的 done_when 加“Developer COMPLETED 时由 Runtime 在写租约下冻结、再 candidate_ready；QA/Reviewer Attempt 经 ADR-027 的检查驱动运行检查并写证据（原则二：只有它们能产出证据）；候选迁移带原状态条件，不覆盖 M2-T10 写入的否决 INVALID；Attempt 级运行后核对不符时经 M2-T10 的 Store::record_evidence 写 INVALID 证据，其执行记录的形态由本任务定义并写在 `.hoh/evidence/` 下（traceability 同样否决）；候选的 VERIFYING/ACCEPTED/REJECTED 迁移（INVALID 只由 M2-T10 的证据写入，M2-T16 从不写）；新 Run 无新提交与同 Run 同内容遇 STALE/INVALID 的情形；`.hoh/` 下字节稳定的环境描述”；
-  - M2-T18 的 done_when 加“acceptance_results 的投影按 ADR-027 原则一的历史规则（该候选上该 AC 有 PASS 与可降级需求上合规 DEGRADED 之外的任一行即不满足：INVALID 行为 INVALID，FAIL、UNKNOWN、BLOCKED 行与 PASS/DEGRADED 并存为 FLAKY，符合 AC-053-02；可降级需求上只有 PASS 与合规 DEGRADED 且至少一条 DEGRADED 为 DEGRADED 并满足；没有行为 NOT_RUN；候选为 INVALID 即全不满足；有 profile 时补原则一规则 16；检查级状态由原则一推出并按历史聚合，BLOCKED 与原因为 TIMED_OUT、NOT_STARTED、INTERRUPTED、INCOMPLETE、PLUGINS_MISSING 的 FAIL 为无结论）”；
+  - M2-T18 的 done_when 加“acceptance_results 的投影按 ADR-027 原则一的历史规则（该候选上该 AC 有 PASS 与可降级需求上合规 DEGRADED 之外的任一行即不满足，次序与原则一的 TEST 状态相同：FAIL、UNKNOWN、BLOCKED 行与 PASS/DEGRADED 并存为 FLAKY，符合 AC-053-02，否则有 INVALID 行为 INVALID；可降级需求上只有 PASS 与合规 DEGRADED 且至少一条 DEGRADED 为 DEGRADED 并满足；没有行为 NOT_RUN；候选为 INVALID 即全不满足；有 profile 时补原则一规则 16；检查级状态由原则一推出并按历史聚合，BLOCKED 与原因为 TIMED_OUT、NOT_STARTED、INTERRUPTED、INCOMPLETE、PLUGINS_MISSING 的 FAIL 为无结论）”；
   - M3-T02 的 done_when 加“TEST-032-01 的测试在 tests/bundle、名称含 test_032_01（traceability 自测据此定位）”；
   - M7-T02 的 done_when 加“traceability 与 independent-* 检查的 argv 改为 v1；TEST-069-01 的测试在 tests/bundle、名称含 test_069_01”；
   - M7-T03 的 done_when 加“产品里 soak 检查的满足条件按 ADR-027 原则一规则 18（含逐事件的候选绑定）”。
