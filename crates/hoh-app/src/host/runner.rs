@@ -676,6 +676,11 @@ async fn attempt(
         "detail": outcome.detail,
         "ended_at": hoh_core::time::rfc3339_utc(ended),
     });
+    // A supervision turn's bridge lines, recorded as its outputs with this OBSERVED when it succeeded
+    // (docs/adr/ADR-025.md decision 8).
+    if !outcome.observed.messages.is_empty() {
+        observed["messages"] = json!(outcome.observed.messages);
+    }
     if let (Some(observed), Value::Object(class)) =
         (observed.as_object_mut(), outcome.class.to_json())
     {

@@ -803,6 +803,8 @@ pub struct Assignment {
     /// agent, or failed, leaves it owed; a native session id is no proof (docs/adr/ADR-024.md decision 4, M2T17R-151,
     /// -152, -200, -300).
     pub first_input: bool,
+    /// A supervision turn's input (docs/adr/ADR-025.md decisions 7 and 8): none for a work task.
+    pub supervision: Option<crate::persistence::Supervision>,
 }
 
 /// The assignment of attempt `attempt_id` of task `task_id` in run `run_id` (project `project_id`), `role`.
@@ -844,6 +846,7 @@ pub(super) fn assignment(
                     goal: r.get(7)?,
                     title: r.get(8)?,
                     first_input: false,
+                    supervision: None,
                 })
             },
         )
@@ -857,6 +860,9 @@ pub(super) fn assignment(
     if let Some(session) = &assignment.session_id {
         assignment.first_input =
             super::handover::first_input_owed(conn, run_id, role, assignment.role_epoch, session)?;
+    }
+    if role == super::wakes::COMMANDER {
+        assignment.supervision = super::wakes::supervision_input(conn, run_id, attempt_id)?;
     }
     Ok(assignment)
 }

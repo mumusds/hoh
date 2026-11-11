@@ -195,6 +195,47 @@ fn prompt_text(contract: &str, package: Option<&serde_json::Value>, work: &Work)
     )
 }
 
+/// At most this many lines and bytes of a Commander turn's bridge are taken (docs/adr/ADR-025.md decision 8).
+pub(super) const BRIDGE_LINES: usize = 1_000;
+pub(super) const BRIDGE_BYTES: usize = 1 << 20;
+
+/// What a Commander turn is told after its task's header (docs/adr/ADR-025.md decisions 7 and 8): the wake it answers,
+/// the values its decision names, the bridge's nonce and file, and what it is shown.
+pub(super) fn supervision_text(s: &hoh_core::persistence::Supervision, bridge: &Path) -> String {
+    format!(
+        "\n---\n# 本次唤醒\n\n- causation_id：{wake}\n- expected_revision：{revision}\n- role_epoch：{epoch}\n\
+         - nonce：{nonce}\n- 输出文件：{bridge}\n\n每条决策一行：`{{\"nonce\": \"{nonce}\", \"message\": {{...}}}}`，\
+         追加写入上面的输出文件。\n\n## 唤醒摘要\n\n```json\n{summary}\n```\n",
+        wake = s.wake,
+        revision = s.run_revision,
+        epoch = s.role_epoch,
+        nonce = s.nonce,
+        bridge = bridge.display(),
+        summary =
+            serde_json::to_string_pretty(&s.summary).unwrap_or_else(|_| s.summary.to_string()),
+    )
+}
+
+/// The non-empty lines of the bridge file `path`, in order, within [`BRIDGE_LINES`] and [`BRIDGE_BYTES`]; none when it is
+/// missing or unreadable.
+pub(super) fn read_bridge(path: &Path) -> Vec<String> {
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let limit = u64::try_from(BRIDGE_BYTES).unwrap_or(u64::MAX);
+    if file.take(limit).read_to_end(&mut bytes).is_err() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&bytes)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .take(BRIDGE_LINES)
+        .map(str::to_owned)
+        .collect()
+}
+
 /// How an adapter's failure code fails its attempt (decision 16, ADR-020 decision 1).
 fn class_of(code: Option<&str>) -> FailureClass {
     match code {
@@ -261,6 +302,7 @@ fn outcome(facts: Facts, prompt: PromptRecord) -> Outcome {
             prompt: Some(prompt),
             raw_log_path: Some(facts.raw_log_path),
             workspace: None,
+            messages: Vec::new(),
         },
         unknown_effect: facts.state == AttemptState::UnknownEffect,
     }
@@ -345,7 +387,13 @@ impl ProductExecutor {
             },
             _ => None,
         };
-        let text = prompt_text(&contract.text, package.as_ref(), work);
+        let mut text = prompt_text(&contract.text, package.as_ref(), work);
+        // A Commander turn is told its wake and where to write its answer (docs/adr/ADR-025.md decisions 7, 8).
+        if let Some(s) = &a.supervision {
+            let logs = attempt_logs(&self.project, &work.attempt_id);
+            let _ = std::fs::create_dir_all(&logs);
+            text.push_str(&supervision_text(s, &logs.join(BRIDGE)));
+        }
         let record = PromptRecord {
             layer: contract.layer.to_owned(),
             role: work.role.clone(),
@@ -454,6 +502,11 @@ impl Executor for ProductExecutor {
         let exec_only = self.exec_only.clone();
         let implementation = (ready.launcher.clone(), ready.version.clone());
         let turn = held.ended;
+        let bridge = work
+            .assignment
+            .supervision
+            .as_ref()
+            .map(|_| attempt_logs(&self.project, &work.attempt_id).join(BRIDGE));
         tokio::spawn(async move {
             let facts = turn.await;
             if let Ok(mut cancels) = cancels.lock() {
@@ -469,7 +522,10 @@ impl Executor for ProductExecutor {
             {
                 e.insert(implementation);
             }
-            let outcome = outcome(facts, record);
+            let mut outcome = outcome(facts, record);
+            if let Some(bridge) = &bridge {
+                outcome.observed.messages = read_bridge(bridge);
+            }
             keep_diagnostics(&outcome);
             let _ = tx.send(outcome);
         });
@@ -496,6 +552,9 @@ impl Executor for ProductExecutor {
         held.is_some()
     }
 }
+
+/// The bridge file of a Commander turn, in its attempt's directory.
+const BRIDGE: &str = "messages.jsonl";
 
 /// Where the raw logs of attempt `attempt_id` go in the project at `project`.
 fn attempt_logs(project: &Path, attempt_id: &str) -> PathBuf {

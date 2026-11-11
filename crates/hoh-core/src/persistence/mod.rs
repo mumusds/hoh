@@ -45,7 +45,7 @@ pub use team::{
     Assignment, Availability, FileTeam, SessionGrant, TeamChange, TeamConfig, TeamMember, TeamView,
     Unbound, session_id,
 };
-pub use wakes::{Allocated, SUPERVISION_TURN, Stop};
+pub use wakes::{Allocated, SUPERVISION_TURN, Stop, Supervision};
 pub mod location;
 pub mod selftest;
 mod writer;

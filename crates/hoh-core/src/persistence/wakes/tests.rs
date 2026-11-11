@@ -1913,3 +1913,86 @@ async fn outputs_wait_while_their_run_is_paused_and_are_superseded_when_it_is_ca
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn a_turns_assignment_carries_its_wake_its_nonce_and_a_bounded_summary() -> R {
+    // Decision 7 (-05, -110, -262, -852): a supervision turn's dispatch gives the executor what the Commander is shown:
+    // the one wake it answers (its events, most severe first, at most 50, each payload bounded), the revisions of its
+    // tasks and the run and the Commander's epoch it is to name, the run's specification and candidate, the other wakes
+    // still owed (id and fingerprint only), the roles' bindings, the run's recent rejected answers, and the turn's
+    // nonce.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    clock.set(0);
+    store
+        .commit(Commit {
+            events: (0..60)
+                .map(|i| NewEvent {
+                    project_id: "p1".to_owned(),
+                    event_id: format!("nd/{i}"),
+                    run_id: Some("R".to_owned()),
+                    kind: "need_decision".to_owned(),
+                    payload: json!({"task_id": "D", "fingerprint": "fp", "n": i, "detail": "x".repeat(10_000)}),
+                })
+                .collect(),
+            ..Commit::default()
+        })
+        .await?;
+    let w = store.supervise("R", context(&clock, 2000)).await?.fired[0]
+        .trigger_id
+        .clone();
+    let other = wake(&store, &clock, "R", "D", "other", 2100).await?;
+    let a = store
+        .allocate_supervision("p1", context(&clock, 4200))
+        .await?
+        .ok_or("allocated")?;
+    assert_eq!(a.wake, w);
+    let notice = store
+        .runner_waiting("p1")
+        .await?
+        .dispatches
+        .into_iter()
+        .find(|d| d.attempt_id == a.attempt_id)
+        .ok_or("no dispatch notice")?;
+    let s = notice
+        .assignment
+        .supervision
+        .ok_or("no supervision input")?;
+    assert_eq!(s.wake, w);
+    assert_eq!(s.nonce, nonce_of(&path, &a.attempt_id)?);
+    assert_eq!((s.run_revision, s.role_epoch), (1, 1));
+    let summary = &s.summary;
+    assert_eq!(summary["wake"]["id"], json!(w));
+    assert_eq!(summary["snapshots"], json!({"D": 4}));
+    assert_eq!(summary["run"]["spec_sha256"], json!(format!("{:064}", 3)));
+    let events = summary["events"].as_array().ok_or("events")?;
+    assert_eq!(events.len(), 50);
+    assert_eq!(summary["events_total"], json!(60));
+    assert!(
+        events.iter().all(|e| e.to_string().len() < 5_000),
+        "bounded payloads"
+    );
+    assert_eq!(
+        summary["other_wakes"],
+        json!([{"id": other, "fingerprint": "other", "severity": "high"}])
+    );
+    let roles: Vec<&str> = summary["roles"]
+        .as_array()
+        .ok_or("roles")?
+        .iter()
+        .filter_map(|r| r["role"].as_str())
+        .collect();
+    assert_eq!(roles, ["commander", "developer"]);
+    assert!(summary["recent_rejections"].is_array());
+    // A work task's assignment has none.
+    let work = store
+        .runner_waiting("p1")
+        .await?
+        .dispatches
+        .into_iter()
+        .all(|d| d.attempt_id == a.attempt_id || d.assignment.supervision.is_none());
+    assert!(work);
+    Ok(())
+}

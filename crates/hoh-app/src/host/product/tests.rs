@@ -23,6 +23,7 @@ fn work(prompt: Option<&str>) -> Work {
             goal: Some("Ship it".to_owned()),
             title: Some("Write the parser".to_owned()),
             first_input: false,
+            supervision: None,
         },
     }
 }
@@ -303,5 +304,46 @@ fn a_first_input_is_kept_once_whole_and_another_is_refused()
     keep_first_input(project.path(), &start)?;
     assert!(!leftover.exists(), "the leftover staged file");
     assert_eq!(std::fs::read(&path)?, kept);
+    Ok(())
+}
+
+#[test]
+fn a_commander_turn_is_told_its_wake_the_values_to_name_its_nonce_and_its_bridge() {
+    // docs/adr/ADR-025.md decisions 7 and 8: after the task's header, the wake it answers (its causation), the run's
+    // revision and the Commander's epoch its decision names, the nonce, the bridge file, and the summary as JSON.
+    let s = hoh_core::persistence::Supervision {
+        wake: "R1/trigger/3".to_owned(),
+        nonce: "n0nce".to_owned(),
+        run_revision: 7,
+        role_epoch: 2,
+        summary: serde_json::json!({"wake": {"id": "R1/trigger/3"}, "snapshots": {"T1": 4}}),
+    };
+    let text = supervision_text(&s, Path::new("/p/.hoh/attempts/x/messages.jsonl"));
+    for part in [
+        "causation_id：R1/trigger/3",
+        "expected_revision：7",
+        "role_epoch：2",
+        "nonce：n0nce",
+        "/p/.hoh/attempts/x/messages.jsonl",
+        "\"snapshots\"",
+    ] {
+        assert!(text.contains(part), "{part}: {text}");
+    }
+}
+
+#[test]
+fn a_bridge_is_read_line_by_line_within_its_bounds() -> Result<(), Box<dyn std::error::Error>> {
+    // Decision 8: the file's non-empty lines in order; none when it is missing; at most BRIDGE_LINES lines and
+    // BRIDGE_BYTES bytes are taken.
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("messages.jsonl");
+    assert!(read_bridge(&file).is_empty());
+    std::fs::write(&file, "one\n\ntwo\n")?;
+    assert_eq!(read_bridge(&file), ["one", "two"]);
+    let many: String = (0..BRIDGE_LINES + 5).map(|i| format!("{i}\n")).collect();
+    std::fs::write(&file, many)?;
+    assert_eq!(read_bridge(&file).len(), BRIDGE_LINES);
+    std::fs::write(&file, "x".repeat(BRIDGE_BYTES + 10))?;
+    assert!(read_bridge(&file).iter().map(String::len).sum::<usize>() <= BRIDGE_BYTES);
     Ok(())
 }
