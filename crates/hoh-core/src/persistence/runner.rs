@@ -113,6 +113,8 @@ pub(super) enum RunnerJob {
     /// One job of a run's output disposal (docs/adr/ADR-025.md v16 decision 2).
     Dispose {
         run_id: String,
+        /// The cursor of the step whose verdict saw the turns end (v17).
+        upto: i64,
         context: Box<crate::decision::Context>,
     },
     /// One look at a run as a whole (ADR-020 decisions 4, 5 and 7).
@@ -259,9 +261,11 @@ pub(super) fn run(
         RunnerJob::WithdrawTurn(attempt_id, at) => {
             super::wakes::withdraw_turn(conn, &attempt_id, at, ctx).map(RunnerDone::Applied)
         }
-        RunnerJob::Dispose { run_id, context } => {
-            super::supervise::dispose(conn, &run_id, &context, ctx).map(RunnerDone::Applied)
-        }
+        RunnerJob::Dispose {
+            run_id,
+            upto,
+            context,
+        } => super::supervise::dispose(conn, &run_id, upto, &context, ctx).map(RunnerDone::Applied),
         RunnerJob::StepFailed(run_id, error) => {
             super::supervise::step_failed(conn, &run_id, &error, ctx).map(RunnerDone::Applied)
         }

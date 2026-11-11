@@ -12,7 +12,7 @@ use super::writer::{self, Commit, Ctx, NewEvent};
 use super::{PersistError, sqlite_error};
 use crate::decision::{Context, Proposal};
 use crate::ids::child_id;
-use crate::lifecycle::Lifecycle as _;
+use crate::lifecycle::{AttemptState, Lifecycle as _};
 use crate::protocol::{self, BlockedReason, DecisionPayload, Message, MessageKind, RunState};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
@@ -149,25 +149,77 @@ fn end(outcome: &'static str, reason: Option<&'static str>) -> End {
     }
 }
 
+/// How turn `attempt_id` ended, by its `attempt.moved` event: the state and that event's seq; none while it has not.
+fn turn_end(conn: &Connection, attempt_id: &str) -> Result<Option<(String, i64)>, PersistError> {
+    let ids: Vec<String> = ["SETTLED", "FAILED", "CANCELLED", "UNKNOWN_EFFECT"]
+        .iter()
+        .map(|state| child_id(attempt_id, state))
+        .collect();
+    conn.query_row(
+        "SELECT json_extract(payload_json, '$.to'), seq FROM events WHERE event_id IN (?1, ?2, ?3, ?4) \
+         ORDER BY seq LIMIT 1",
+        params![ids[0], ids[1], ids[2], ids[3]],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .optional()
+    .map_err(sqlite_error)
+}
+
 /// Dispose of run `run_id`'s outputs at `context.now()`, one transaction each, at most [`DISPOSE_BATCH`] in this
-/// writer job (v16): whether some are left for another job. It stops, none left for now, when the run's state holds
-/// them or one fails (its failure counted; the run's others wait for the next step).
+/// writer job (v16): whether some are left for another job. Only the outputs of turns the step's verdict saw end (their
+/// end event at or below the step's cursor `upto`) are disposed of: a SETTLED turn's as usual, those of a turn that
+/// ended otherwise discarded; the others wait (v17, M2T08R-250). A cancelled or ended run's are superseded whatever
+/// their turn. It stops, none left for now, when the run's state holds them or one fails (its failure counted; the
+/// run's others wait for the next step).
 pub(super) fn dispose(
     conn: &mut Connection,
     run_id: &str,
+    upto: i64,
     context: &Context,
     ctx: &Ctx<'_>,
 ) -> Result<bool, PersistError> {
-    let list = waiting(conn, run_id)?;
+    let state: String = conn
+        .query_row(
+            "SELECT state FROM runs WHERE run_id = ?1",
+            params![run_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    let superseding = {
+        let state = writer::parse::<RunState>(&state)?;
+        state.is_terminal() || state == RunState::CancelRequested
+    };
+    // The outputs that may be disposed of now, each with whether its turn settled.
+    let mut ends: std::collections::BTreeMap<String, Option<(String, i64)>> =
+        std::collections::BTreeMap::new();
+    let mut list: Vec<(Waiting, bool)> = Vec::new();
+    for w in waiting(conn, run_id)? {
+        if superseding {
+            list.push((w, true));
+            continue;
+        }
+        if !ends.contains_key(&w.attempt_id) {
+            ends.insert(w.attempt_id.clone(), turn_end(conn, &w.attempt_id)?);
+        }
+        if let Some((to, at)) = &ends[&w.attempt_id]
+            && *at <= upto
+        {
+            let settled = to == AttemptState::Settled.as_str();
+            list.push((w, settled));
+        }
+    }
     let more = list.len() > DISPOSE_BATCH;
     // Each turn's allocation read once in this job.
     let mut allocations: std::collections::BTreeMap<String, Value> =
         std::collections::BTreeMap::new();
-    for Waiting {
-        output_id,
-        attempt_id,
-        seq,
-    } in list.into_iter().take(DISPOSE_BATCH)
+    for (
+        Waiting {
+            output_id,
+            attempt_id,
+            seq,
+        },
+        settled,
+    ) in list.into_iter().take(DISPOSE_BATCH)
     {
         let tx = writer::begin(conn, ctx)?;
         let (project_id, state): (String, String) = tx
@@ -193,6 +245,9 @@ pub(super) fn dispose(
             .map_err(sqlite_error)?;
         let ended = if state.is_terminal() || state == RunState::CancelRequested {
             Ok(Some(end("superseded", None)))
+        } else if !settled {
+            // Its turn ended without settling: its wake is owed again, another turn answers it (v17).
+            Ok(Some(end("discarded", Some("TURN_NOT_SETTLED"))))
         } else {
             if !allocations.contains_key(&attempt_id) {
                 let allocation = allocation(&tx, run_id, &attempt_id)?;
