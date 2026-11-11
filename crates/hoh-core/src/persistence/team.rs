@@ -106,9 +106,12 @@ pub(super) fn start_run(
         )
         .map_err(sqlite_error)?;
     }
+    // The run's packing parameters, frozen for its life (docs/adr/ADR-026.md decision 7).
+    let context = crate::context::CONTEXT_V1;
     let snapshot = serde_json::json!({
         "scheduler": settings(&Params::from_settings(Some(&config.scheduler))),
         "supervision": {"policy": policy},
+        "context": {"budget_tokens": context.budget_tokens, "shares": context.shares},
     });
     tx.execute(
         "UPDATE runs SET config_revision = ?2, config_snapshot_json = ?3, deadline_at = ?4 WHERE run_id = ?1",
@@ -808,6 +811,8 @@ pub struct Assignment {
     pub first_input: bool,
     /// A supervision turn's input (docs/adr/ADR-025.md decisions 7 and 8): none for a work task.
     pub supervision: Option<crate::persistence::Supervision>,
+    /// What its context is packed from (docs/adr/ADR-026.md decision 3); none from a store too old to say.
+    pub context: Option<crate::context::Facts>,
 }
 
 /// The assignment of attempt `attempt_id` of task `task_id` in run `run_id` (project `project_id`), `role`.
@@ -850,6 +855,7 @@ pub(super) fn assignment(
                     title: r.get(8)?,
                     first_input: false,
                     supervision: None,
+                    context: None,
                 })
             },
         )
@@ -867,6 +873,13 @@ pub(super) fn assignment(
     if role == super::wakes::COMMANDER {
         assignment.supervision = super::wakes::supervision_input(conn, run_id, attempt_id)?;
     }
+    assignment.context = Some(super::context::facts(
+        conn,
+        run_id,
+        task_id,
+        attempt_id,
+        assignment.supervision.as_ref(),
+    )?);
     Ok(assignment)
 }
 

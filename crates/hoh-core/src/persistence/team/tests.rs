@@ -178,7 +178,9 @@ async fn a_started_run_snapshots_the_scheduler_and_gets_its_budget() -> R {
         json!({"scheduler": {"weights": {"user_value": 4, "unblock_value": 3, "risk_reduction": 3,
             "information_gain": 2}, "max_wait_rounds": 20},
             // The supervision policy, frozen too (docs/adr/ADR-025.md decision 9).
-            "supervision": {"policy": "balanced"}})
+            "supervision": {"policy": "balanced"},
+            // The packing parameters, frozen for the run's life (docs/adr/ADR-026.md decision 7).
+            "context": {"budget_tokens": 32_000, "shares": [45, 35, 20]}})
     );
     assert_eq!(
         values(
