@@ -24,10 +24,12 @@ fn mandatory() -> Mandatory {
         project: "spec_sha256: 5f1c0d2e9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1\nspec revision: 3".to_owned(),
         task: "任务：T1 装箱（developer，写者）\n验收标准：\n- AC-1：强制项永不裁剪。\n- AC-2：份额是硬上限。\n候选：CAND-1 commit 0123abc\n输出 Schema：{\"type\":\"object\"}".to_owned(),
         evidence: String::new(),
+        lead: String::new(),
     }
 }
 
-fn entry(class: Class, path: &str, bytes: usize, scores: (u8, u8, u8)) -> Entry {
+/// `scores` = (relevance, recency, causal), the ranking key's order.
+fn entry(class: Class, path: &str, bytes: usize, scores: (u64, u64, u64)) -> Entry {
     // Distinct content per path, ASCII so the byte count is exact.
     let seed = format!("{path}:");
     let text: String = seed.chars().cycle().take(bytes).collect();
@@ -38,8 +40,8 @@ fn entry(class: Class, path: &str, bytes: usize, scores: (u8, u8, u8)) -> Entry 
         text,
         summary: None,
         relevance: scores.0,
-        causal: scores.1,
-        recency: scores.2,
+        recency: scores.1,
+        causal: scores.2,
     }
 }
 
@@ -62,6 +64,31 @@ fn contract_pieces(template: &str) -> Vec<&str> {
     }
     pieces.push(rest);
     pieces.into_iter().filter(|p| !p.is_empty()).collect()
+}
+
+/// What each class put in the developer contract's prompt, read from the prompt itself: the code after the task
+/// layer's items up to the project heading, the knowledge after the project layer's items up to the evidence heading,
+/// the evidence from the evidence layer's start (its items empty here) up to the index pointer.
+fn regions<'a>(prompt: &'a str, m: &Mandatory) -> Result<[&'a str; 3], String> {
+    let after = |value: &str| {
+        prompt
+            .find(value)
+            .map(|at| at + value.len())
+            .ok_or(format!("{value:.40} missing"))
+    };
+    let until = |from: usize, mark: &str| {
+        prompt[from..]
+            .find(mark)
+            .map(|at| &prompt[from..from + at])
+            .ok_or(format!("{mark} missing"))
+    };
+    let code = until(after(&m.task)?, "\n\n### 项目上下文")?;
+    let knowledge = until(after(&m.project)?, "\n\n### 证据上下文")?;
+    let evidence = until(
+        after("\n\n### 证据上下文\n")? + m.evidence.len(),
+        "\n\n引用索引",
+    )?;
+    Ok([code, evidence, knowledge])
 }
 
 fn is_sha256(s: &str) -> bool {
@@ -193,6 +220,35 @@ fn test_039_01_shares_are_hard_caps_and_every_omitted_entry_is_indexed() -> R {
     assert!(packed.stats.total <= 10_000, "total {}", packed.stats.total);
     assert_eq!(packed.stats.total, estimate(&packed.prompt));
     assert!(packed.stats.estimated);
+    // The same caps read from the prompt itself, not from what the packer says it did.
+    let [code, evidence, knowledge] = regions(&packed.prompt, &m)?;
+    assert!(
+        estimate(code) <= 2_700,
+        "code in the prompt {}",
+        estimate(code)
+    );
+    assert!(
+        estimate(evidence) <= 2_100,
+        "evidence in the prompt {}",
+        estimate(evidence)
+    );
+    assert!(
+        estimate(knowledge) <= 1_200,
+        "knowledge in the prompt {}",
+        estimate(knowledge)
+    );
+    assert!(estimate(&packed.prompt) <= 10_000);
+    // Omitted entries counted from the prompt: those whose full text is not in it.
+    let omitted = entries
+        .iter()
+        .filter(|e| !packed.prompt.contains(&e.text))
+        .count();
+    assert_eq!(
+        omitted,
+        packed.index.len(),
+        "omitted entries vs index items"
+    );
+    assert!(omitted > 0 && omitted < entries.len());
     // Each class placed something (the fixture is not vacuous) and left something out.
     for class in [Class::Code, Class::Evidence, Class::Knowledge] {
         let of = |d: Disposition| {
@@ -316,15 +372,16 @@ fn test_039_02_mandatory_items_survive_every_budget_and_below_m_nothing_is_packe
 }
 
 #[test]
-fn entries_rank_by_relevance_then_causal_then_recency_then_path_and_sha256() -> R {
+fn entries_rank_by_relevance_then_recency_then_causal_then_path_and_sha256() -> R {
     let m = mandatory();
     let big_m = required(DEVELOPER, &m)?;
-    // Each entry costs about 40 tokens; the code share fits exactly two.
-    let mk = |path: &str, s: (u8, u8, u8)| entry(Class::Code, path, 90, s);
+    // Each entry costs the same; the code share fits exactly two.
+    let mk = |path: &str, s: (u64, u64, u64)| entry(Class::Code, path, 90, s);
     let entries = vec![
         mk("e", (50, 0, 100)),
         mk("d", (50, 10, 0)),
         mk("c", (60, 0, 0)),
+        mk("f", (50, 0, 7)),
         mk("b", (50, 10, 0)),
         mk("a", (50, 0, 100)),
     ];
@@ -336,7 +393,7 @@ fn entries_rank_by_relevance_then_causal_then_recency_then_path_and_sha256() -> 
         big_m + (2 * cost * 100).div_ceil(45),
     )?;
     let order: Vec<&str> = packed.inputs.iter().map(|i| i.path.as_str()).collect();
-    assert_eq!(order, ["c", "b", "d", "a", "e"]);
+    assert_eq!(order, ["c", "b", "d", "a", "e", "f"]);
     let full: Vec<&str> = packed
         .inputs
         .iter()
@@ -559,14 +616,15 @@ fn a_blank_goal_project_or_task_layer_is_refused_and_values_are_never_substitute
 fn the_policy_names_the_estimator_the_shares_the_order_and_the_rule() {
     let p = policy();
     assert_eq!(p["estimator"], "utf8-bytes/3");
+    assert_eq!(p["format"], FORMAT);
     assert_eq!(p["shares"], json!([45, 35, 20]));
     assert_eq!(p["rule"], "prefix");
     assert_eq!(
         p["order"],
         json!([
             "relevance desc",
-            "causal desc",
             "recency desc",
+            "causal desc",
             "path asc",
             "sha256 asc"
         ])
@@ -605,5 +663,221 @@ fn every_built_in_contract_keeps_each_piece_and_takes_its_four_layers_once() -> 
         assert!(!packed.prompt.contains("{{"), "{role}: a placeholder left");
         assert_eq!(packed.stats.total, packed.stats.mandatory, "{role}");
     }
+    Ok(())
+}
+
+#[test]
+fn one_class_left_unused_lends_nothing_to_another() -> R {
+    // REQ-039 decision 1: hard caps, no borrowing.
+    let m = mandatory();
+    let big_m = required(DEVELOPER, &m)?;
+    let entries = vec![
+        entry(Class::Code, "small.rs", 3, (1, 1, 1)),
+        entry(Class::Evidence, "e1", 600, (9, 0, 0)),
+        entry(Class::Evidence, "e2", 600, (8, 0, 0)),
+        entry(Class::Evidence, "e3", 600, (7, 0, 0)),
+    ];
+    let budget = big_m + 1_000;
+    let packed = pack(DEVELOPER, &m, &entries, budget)?;
+    let [code, evidence, _] = regions(&packed.prompt, &m)?;
+    assert!(
+        estimate(code) < packed.stats.shares[0] / 2,
+        "the code share is mostly unused"
+    );
+    assert!(
+        estimate(evidence) <= packed.stats.shares[1],
+        "evidence {}",
+        estimate(evidence)
+    );
+    assert!(
+        packed
+            .inputs
+            .iter()
+            .any(|i| i.class == Class::Evidence && i.disposition == Disposition::Reference),
+        "the evidence that did not fit its own share stays a reference"
+    );
+    Ok(())
+}
+
+#[test]
+fn every_byte_is_counted_whatever_the_sizes_and_budgets() -> R {
+    // Random entries (ASCII and three-byte text, summaries or none) and budgets from M up: the whole prompt and each
+    // class read back from it stay within the budget and the shares (separators included).
+    const SEED: u64 = 0x0039_0055;
+    let mut rng = SplitMix64::new(SEED);
+    let m = Mandatory {
+        evidence: "证据".to_owned(),
+        ..mandatory()
+    };
+    let big_m = required(DEVELOPER, &m)?;
+    for case in 0..300 {
+        let mut entries = Vec::new();
+        for n in 0..(rng.next_u32() % 8) {
+            let class =
+                [Class::Code, Class::Evidence, Class::Knowledge][(rng.next_u32() % 3) as usize];
+            let bytes = (rng.next_u32() % 1_500) as usize;
+            let mut e = entry(
+                class,
+                &format!("c{case}/{n}"),
+                bytes,
+                (u64::from(rng.next_u32() % 5), 0, 0),
+            );
+            if rng.next_u32().is_multiple_of(2) {
+                e.text = "装".repeat(bytes / 3 + 1);
+            }
+            if rng.next_u32().is_multiple_of(3) {
+                e = with_summary(e, (rng.next_u32() % 200) as usize);
+            }
+            entries.push(e);
+        }
+        let budget = big_m + u64::from(rng.next_u32() % 3_000);
+        let packed = pack(DEVELOPER, &m, &entries, budget)?;
+        assert!(
+            estimate(&packed.prompt) <= budget,
+            "case {case}: {} > {budget}",
+            estimate(&packed.prompt)
+        );
+        let [code, evidence, knowledge] = regions(&packed.prompt, &m)?;
+        for (n, region) in [code, evidence, knowledge].iter().enumerate() {
+            assert!(
+                estimate(region) <= packed.stats.shares[n],
+                "case {case} class {n}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn a_lead_goes_first_in_the_first_placeholders_value_before_any_entry() -> R {
+    let lead = "交接包：首个输入".to_owned();
+    let m = Mandatory {
+        lead: lead.clone(),
+        evidence: "证据强制项".to_owned(),
+        ..mandatory()
+    };
+    let entries = vec![
+        entry(Class::Code, "code.rs", 30, (1, 1, 1)),
+        entry(Class::Evidence, "evidence.log", 30, (1, 1, 1)),
+        entry(Class::Knowledge, "knowledge.md", 30, (1, 1, 1)),
+    ];
+    // The built-in contracts begin with GOAL: the lead follows the goal and precedes every other context, the
+    // commander's evidence included.
+    for template in [DEVELOPER, COMMANDER] {
+        let packed = pack(template, &m, &entries, required(template, &m)? + 2_000)?;
+        let at = |s: &str| packed.prompt.find(s).ok_or_else(|| format!("{s} missing"));
+        let lead_at = at(&lead)?;
+        assert!(at(&m.goal)? < lead_at);
+        for later in [
+            m.project.as_str(),
+            m.task.as_str(),
+            "证据强制项",
+            "code.rs",
+            "evidence.log",
+            "knowledge.md",
+        ] {
+            assert!(lead_at < at(later)?, "{later} before the lead");
+        }
+        assert_eq!(packed.prompt.matches(&lead).count(), 1);
+    }
+    // A template that begins with EVIDENCE: the lead after that layer's items, before its entries.
+    let evidence_first =
+        "前言\n{{EVIDENCE_CONTEXT}}\n---\n{{GOAL}}\n{{TASK_CONTEXT}}\n{{PROJECT_CONTEXT}}\n";
+    let packed = pack(
+        evidence_first,
+        &m,
+        &entries,
+        required(evidence_first, &m)? + 2_000,
+    )?;
+    let at = |s: &str| packed.prompt.find(s).ok_or_else(|| format!("{s} missing"));
+    assert!(at("证据强制项")? < at(&lead)? && at(&lead)? < at("evidence.log")?);
+    assert!(at(&lead)? < at(&m.goal)?);
+    Ok(())
+}
+
+#[test]
+fn the_layers_are_counted_as_req_039_names_them() -> R {
+    let m = mandatory();
+    let packed = pack(DEVELOPER, &m, &[], required(DEVELOPER, &m)?)?;
+    let l = packed.stats.layers;
+    let contract: String = contract_pieces(DEVELOPER).concat();
+    assert_eq!(l.role_contract, estimate(&contract));
+    assert_eq!(l.task, estimate(&format!("{}{}", m.goal, m.task)));
+    assert_eq!(l.project, estimate(&m.project));
+    assert!(l.evidence > 0, "the index pointer");
+    Ok(())
+}
+
+#[test]
+fn the_golden_prompt_changes_only_with_the_format() -> R {
+    // docs/adr/ADR-026.md decision 7: a change to what this code renders must change FORMAT (and so the resource
+    // bundle version), or an old prompt would repack differently under the same version.
+    let m = Mandatory {
+        lead: "lead".to_owned(),
+        evidence: "ev".to_owned(),
+        ..mandatory()
+    };
+    let entries = vec![
+        with_summary(entry(Class::Code, "a.rs", 9_000, (9, 1, 1)), 30),
+        entry(Class::Evidence, "b.log", 60, (5, 2, 0)),
+        Entry {
+            kind: Kind::Memory,
+            ..entry(Class::Knowledge, "m.md", 60, (5, 0, 2))
+        },
+        entry(Class::Knowledge, "big.md", 90_000, (9, 0, 0)),
+    ];
+    // A template of its own, so the golden depends on this code only, not on a contract's text.
+    let template = "契约\n### 目标\n{{GOAL}}\n### 证据\n{{EVIDENCE_CONTEXT}}\n### 任务\n{{TASK_CONTEXT}}\n### 项目\n{{PROJECT_CONTEXT}}\n";
+    let packed = pack(template, &m, &entries, required(template, &m)? + 3_000)?;
+    let golden = [("hoh-context/1", GOLDEN_1)];
+    let want = golden
+        .iter()
+        .find(|(f, _)| *f == FORMAT)
+        .map(|(_, sha)| *sha);
+    assert_eq!(
+        Some(packed.sha256.as_str()),
+        want,
+        "the rendering changed: bump context::FORMAT and add its golden sha256"
+    );
+    Ok(())
+}
+
+/// The golden prompt's sha256 under FORMAT hoh-context/1.
+const GOLDEN_1: &str = "7cccf303e0f6afaf8684b30284d0a5a24b48da49ee5ded3c646d5cb5c2fc712b";
+
+#[test]
+fn an_entry_that_fills_its_share_to_the_byte_fits_and_one_byte_more_does_not() -> R {
+    // No slack anywhere: the block is exactly three times the code share in bytes, so any byte the packer added
+    // without counting it (a separator, a newline) would show in the code read back from the prompt.
+    let m = mandatory();
+    let big_m = required(DEVELOPER, &m)?;
+    let share = 500u64;
+    let budget = big_m + (share * 100).div_ceil(45);
+    assert_eq!(shares(budget - big_m)[0], share);
+    let header = block(
+        &entry(Class::Code, "exact.rs", 0, (1, 1, 1)),
+        Disposition::Full,
+    )
+    .len();
+    let fits = entry(
+        Class::Code,
+        "exact.rs",
+        3 * share as usize - header,
+        (1, 1, 1),
+    );
+    assert_eq!(block(&fits, Disposition::Full).len() as u64, 3 * share);
+    let packed = pack(DEVELOPER, &m, std::slice::from_ref(&fits), budget)?;
+    assert_eq!(packed.inputs[0].disposition, Disposition::Full);
+    let [code, _, _] = regions(&packed.prompt, &m)?;
+    assert_eq!(code.len() as u64, 3 * share, "exactly the block's bytes");
+    assert_eq!(estimate(code), share);
+    let over = entry(
+        Class::Code,
+        "exact.rs",
+        3 * share as usize - header + 1,
+        (1, 1, 1),
+    );
+    let packed = pack(DEVELOPER, &m, &[over], budget)?;
+    assert_eq!(packed.inputs[0].disposition, Disposition::Reference);
     Ok(())
 }

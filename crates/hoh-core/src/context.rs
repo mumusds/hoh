@@ -14,6 +14,10 @@ use sha2::{Digest, Sha256};
 
 /// The estimator's id, recorded in the truncation policy.
 pub const ESTIMATOR: &str = "utf8-bytes/3";
+/// The packing format: the fixed text and layout this code renders. Part of the resource bundle version
+/// (docs/adr/ADR-026.md decision 7), so a build that renders differently never repacks an old prompt as the same
+/// version; the golden test fails when the rendering changes and this does not.
+pub const FORMAT: &str = "hoh-context/1";
 /// Code, evidence and knowledge, in percent of what the mandatory items leave (REQ-039 behaviour 3).
 pub const SHARES: [u64; 3] = [45, 35, 20];
 /// The label of an entry recalled from project memory: experience, not acceptance fact (behaviour 7).
@@ -41,9 +45,10 @@ pub fn shares(remaining: u64) -> [u64; 3] {
 /// The truncation policy every packed prompt records.
 pub fn policy() -> Value {
     json!({
+        "format": FORMAT,
         "estimator": ESTIMATOR,
         "shares": SHARES,
-        "order": ["relevance desc", "causal desc", "recency desc", "path asc", "sha256 asc"],
+        "order": ["relevance desc", "recency desc", "causal desc", "path asc", "sha256 asc"],
         "rule": "prefix",
     })
 }
@@ -85,16 +90,19 @@ pub enum Disposition {
 }
 
 /// The mandatory items of each layer, already rendered by the caller; never cut. Goal, project and task must not be
-/// blank; the evidence layer always has the index pointer.
+/// blank; the evidence layer always has the index pointer. `lead` (a new holder's first input, when it is owed) goes
+/// into the value of the template's first placeholder, after that layer's own items and before any entry, so it is
+/// read before every other context (docs/adr/ADR-026.md decision 3).
 #[derive(Debug, Clone, Default)]
 pub struct Mandatory {
     pub goal: String,
     pub project: String,
     pub task: String,
     pub evidence: String,
+    pub lead: String,
 }
 
-/// A candidate for the remaining budget. Scores are 0..=100; the packer computes the sha256 of `text` itself.
+/// A candidate for the remaining budget. The caller gives the scores; the packer computes the sha256 of `text`.
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub class: Class,
@@ -103,9 +111,9 @@ pub struct Entry {
     pub text: String,
     /// The entry's own summary, if it has one; the packer never summarises.
     pub summary: Option<String>,
-    pub relevance: u8,
-    pub causal: u8,
-    pub recency: u8,
+    pub relevance: u64,
+    pub recency: u64,
+    pub causal: u64,
 }
 
 /// Every entry as it went in, in class order then rank.
@@ -141,10 +149,20 @@ pub struct Stats {
     pub code: u64,
     pub evidence: u64,
     pub knowledge: u64,
-    /// Each layer's filled text, in Layer order.
-    pub layers: [u64; 4],
+    /// The four layers of REQ-039 behaviour 1 and docs/15.
+    pub layers: Layers,
     pub total: u64,
     pub estimated: bool,
+}
+
+/// The estimate of each layer as REQ-039 behaviour 1 names them: the role contract (the template's own text), and
+/// the project, task (the goal's value with the task's) and evidence values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Layers {
+    pub role_contract: u64,
+    pub project: u64,
+    pub task: u64,
+    pub evidence: u64,
 }
 
 /// A packed prompt.
@@ -194,7 +212,7 @@ impl std::error::Error for PackError {}
 /// The estimated tokens the mandatory items take in `template`: the budget below which nothing is packed.
 pub fn required(template: &str, mandatory: &Mandatory) -> Result<u64, PackError> {
     let parts = Template::parse(template)?;
-    let layers = base_layers(mandatory, &ZERO_SHA)?;
+    let (layers, _) = base_layers(mandatory, parts.first(), &ZERO_SHA)?;
     Ok(estimate(&parts.fill(&layers)))
 }
 
@@ -206,7 +224,7 @@ pub fn pack(
     budget: u64,
 ) -> Result<Packed, PackError> {
     let parts = Template::parse(template)?;
-    let base = base_layers(mandatory, &ZERO_SHA)?;
+    let (base, _) = base_layers(mandatory, parts.first(), &ZERO_SHA)?;
     let required = estimate(&parts.fill(&base));
     if budget < required {
         return Err(PackError::TooSmall {
@@ -224,8 +242,8 @@ pub fn pack(
         a.class
             .cmp(&b.class)
             .then(b.relevance.cmp(&a.relevance))
-            .then(b.causal.cmp(&a.causal))
             .then(b.recency.cmp(&a.recency))
+            .then(b.causal.cmp(&a.causal))
             .then(a.path.cmp(&b.path))
             .then(a_sha.cmp(b_sha))
             .then(a.summary.cmp(&b.summary))
@@ -286,13 +304,16 @@ pub fn pack(
     // Each class's blocks after its layer's mandatory items: code in the task layer, knowledge in the project
     // layer, evidence in the evidence layer before the index pointer. Every block adds its own bytes only, so the
     // whole estimate is at most the mandatory estimate plus each block's (subadditivity): within the budget.
-    let mut layers = base_layers(mandatory, &index_sha256)?;
-    layers[Layer::Task as usize].insert_str(mandatory.task.len(), &blocks[Class::Code as usize]);
-    layers[Layer::Project as usize]
-        .insert_str(mandatory.project.len(), &blocks[Class::Knowledge as usize]);
-    layers[Layer::Evidence as usize]
-        .insert_str(mandatory.evidence.len(), &blocks[Class::Evidence as usize]);
+    let (mut layers, at) = base_layers(mandatory, parts.first(), &index_sha256)?;
+    for (class, layer) in [
+        (Class::Code, Layer::Task),
+        (Class::Knowledge, Layer::Project),
+        (Class::Evidence, Layer::Evidence),
+    ] {
+        layers[layer as usize].insert_str(at[layer as usize], &blocks[class as usize]);
+    }
     let prompt = parts.fill(&layers);
+    let empty: [String; 4] = Default::default();
     let stats = Stats {
         budget,
         mandatory: required,
@@ -300,7 +321,16 @@ pub fn pack(
         code: used[Class::Code as usize],
         evidence: used[Class::Evidence as usize],
         knowledge: used[Class::Knowledge as usize],
-        layers: [0, 1, 2, 3].map(|l| estimate(&layers[l])),
+        layers: Layers {
+            role_contract: estimate(&parts.fill(&empty)),
+            project: estimate(&layers[Layer::Project as usize]),
+            task: estimate(&format!(
+                "{}{}",
+                layers[Layer::Goal as usize],
+                layers[Layer::Task as usize]
+            )),
+            evidence: estimate(&layers[Layer::Evidence as usize]),
+        },
         total: estimate(&prompt),
         estimated: true,
     };
@@ -343,12 +373,14 @@ pub(crate) fn block(entry: &Entry, disposition: Disposition) -> String {
 
 const ZERO_SHA: [u8; 64] = [b'0'; 64];
 
-/// The four layers' mandatory text, in Layer order; the evidence layer ends with the index pointer, whose length
-/// does not depend on the index (a sha256 is always 64 hex digits), so the mandatory estimate is known up front.
+/// The four layers' mandatory text, in Layer order, and where each layer's entries go in it: after its own items
+/// (and the lead, in the first layer), before the evidence layer's index pointer. The pointer's length does not
+/// depend on the index (a sha256 is always 64 hex digits), so the mandatory estimate is known up front.
 fn base_layers(
     mandatory: &Mandatory,
+    first: Layer,
     index_sha256: &(impl AsRef<[u8]> + ?Sized),
-) -> Result<[String; 4], PackError> {
+) -> Result<([String; 4], [usize; 4]), PackError> {
     for (layer, text) in [
         (Layer::Goal, &mandatory.goal),
         (Layer::Project, &mandatory.project),
@@ -358,20 +390,26 @@ fn base_layers(
             return Err(PackError::EmptyLayer(layer));
         }
     }
-    let sha = String::from_utf8_lossy(index_sha256.as_ref());
-    let pointer =
-        format!("引用索引：未装入全文的条目（path 与 sha256，可取回原文）见对象 sha256:{sha}");
-    let evidence = if mandatory.evidence.is_empty() {
-        pointer
-    } else {
-        format!("{}\n\n{pointer}", mandatory.evidence)
+    let join = |a: &str, b: &str| match (a.is_empty(), b.is_empty()) {
+        (_, true) => a.to_owned(),
+        (true, false) => b.to_owned(),
+        (false, false) => format!("{a}\n\n{b}"),
     };
-    Ok([
+    let mut layers = [
         mandatory.goal.clone(),
         mandatory.project.clone(),
         mandatory.task.clone(),
-        evidence,
-    ])
+        mandatory.evidence.clone(),
+    ];
+    layers[first as usize] = join(&layers[first as usize], &mandatory.lead);
+    let at = [0, 1, 2, 3].map(|l| layers[l].len());
+    let sha = String::from_utf8_lossy(index_sha256.as_ref());
+    let pointer =
+        format!("引用索引：未装入全文的条目（path 与 sha256，可取回原文）见对象 sha256:{sha}");
+    // Always on a line of its own after a blank line, whatever precedes it (the layer's items, its last entry).
+    let evidence = Layer::Evidence as usize;
+    layers[evidence] = format!("{}\n\n{pointer}", layers[evidence]);
+    Ok((layers, at))
 }
 
 /// A role contract split at its placeholders: either all four, each once, filled in place in the template's own
@@ -383,6 +421,11 @@ struct Template<'a> {
 }
 
 impl<'a> Template<'a> {
+    /// The layer of the template's first placeholder; the goal's when the layers follow the contract.
+    fn first(&self) -> Layer {
+        self.pieces.first().map_or(Layer::Goal, |(_, layer)| *layer)
+    }
+
     fn parse(template: &'a str) -> Result<Template<'a>, PackError> {
         // Each `{{NAME}}` with NAME of capitals, digits and underscores, as tools/render_prompt.py reads them.
         let mut slots: Vec<(usize, usize, Layer)> = Vec::new();
