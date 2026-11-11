@@ -25,6 +25,7 @@ fn mandatory() -> Mandatory {
         task: "任务：T1 装箱（developer，写者）\n验收标准：\n- AC-1：强制项永不裁剪。\n- AC-2：份额是硬上限。\n候选：CAND-1 commit 0123abc\n输出 Schema：{\"type\":\"object\"}".to_owned(),
         evidence: String::new(),
         lead: String::new(),
+        schemas: output_schemas("developer").unwrap_or_default(),
     }
 }
 
@@ -82,7 +83,13 @@ fn regions<'a>(prompt: &'a str, m: &Mandatory) -> Result<[&'a str; 3], String> {
             .map(|at| &prompt[from..from + at])
             .ok_or(format!("{mark} missing"))
     };
-    let code = until(after(&m.task)?, "\n\n### 项目上下文")?;
+    // The task layer's items end with the role's schemas.
+    let items_end = if m.schemas.is_empty() {
+        &m.task
+    } else {
+        &m.schemas
+    };
+    let code = until(after(items_end)?, "\n\n### 项目上下文")?;
     let knowledge = until(after(&m.project)?, "\n\n### 证据上下文")?;
     let evidence = until(
         after("\n\n### 证据上下文\n")? + m.evidence.len(),
@@ -801,7 +808,11 @@ fn the_layers_are_counted_as_req_039_names_them() -> R {
     let packed = pack(DEVELOPER, &m, &[], required(DEVELOPER, &m)?)?;
     let l = packed.stats.layers;
     let contract: String = contract_pieces(DEVELOPER).concat();
-    assert_eq!(l.role_contract, estimate(&contract));
+    assert!(!m.schemas.is_empty());
+    assert_eq!(
+        l.role_contract,
+        estimate(&format!("{contract}{}", m.schemas))
+    );
     assert_eq!(l.task, estimate(&format!("{}{}", m.goal, m.task)));
     assert_eq!(l.project, estimate(&m.project));
     assert!(l.evidence > 0, "the index pointer");
@@ -809,16 +820,15 @@ fn the_layers_are_counted_as_req_039_names_them() -> R {
 }
 
 #[test]
-fn the_golden_prompt_changes_only_with_the_format() -> R {
-    // docs/adr/ADR-026.md decision 7: a change to what this code renders must change FORMAT (and so the resource
-    // bundle version), or an old prompt would repack differently under the same version.
-    let m = Mandatory {
-        lead: "lead".to_owned(),
-        evidence: "ev".to_owned(),
-        ..mandatory()
-    };
+fn the_golden_prompts_change_only_with_the_format() -> R {
+    // docs/adr/ADR-026.md decision 7 (M2T09D-160): a change to what this code renders must change FORMAT (and so the
+    // resource bundle version), or an old prompt would repack differently under the same version. The cases cover
+    // every rendering branch: placeholders in their own order and none, the lead, a summary, the memory label, control
+    // characters in a path, an empty and a non-empty evidence item, a reference only.
+    let in_place = "契约\n### 目标\n{{GOAL}}\n### 证据\n{{EVIDENCE_CONTEXT}}\n### 任务\n{{TASK_CONTEXT}}\n### 项目\n{{PROJECT_CONTEXT}}\n";
+    let none = "只有契约正文。\n\n";
     let entries = vec![
-        with_summary(entry(Class::Code, "a.rs", 9_000, (9, 1, 1)), 30),
+        with_summary(entry(Class::Code, "a\n\tb.rs", 9_000, (9, 1, 1)), 30),
         entry(Class::Evidence, "b.log", 60, (5, 2, 0)),
         Entry {
             kind: Kind::Memory,
@@ -826,24 +836,44 @@ fn the_golden_prompt_changes_only_with_the_format() -> R {
         },
         entry(Class::Knowledge, "big.md", 90_000, (9, 0, 0)),
     ];
-    // A template of its own, so the golden depends on this code only, not on a contract's text.
-    let template = "契约\n### 目标\n{{GOAL}}\n### 证据\n{{EVIDENCE_CONTEXT}}\n### 任务\n{{TASK_CONTEXT}}\n### 项目\n{{PROJECT_CONTEXT}}\n";
-    let packed = pack(template, &m, &entries, required(template, &m)? + 3_000)?;
-    let golden = [("hoh-context/1", GOLDEN_1)];
+    let mut shas = Vec::new();
+    for (template, lead, evidence) in [(in_place, "lead", "ev"), (none, "", ""), (in_place, "", "")]
+    {
+        let m = Mandatory {
+            lead: lead.to_owned(),
+            evidence: evidence.to_owned(),
+            // Its own schemas text: the golden depends on this code only, not on a schema file's text.
+            schemas: "schemas".to_owned(),
+            ..mandatory()
+        };
+        let packed = pack(template, &m, &entries, required(template, &m)? + 3_000)?;
+        let dispositions: Vec<Disposition> = packed.inputs.iter().map(|i| i.disposition).collect();
+        assert!(
+            dispositions.contains(&Disposition::Summary)
+                && dispositions.contains(&Disposition::Reference)
+        );
+        shas.push(packed.sha256);
+    }
+    let golden: [(&str, [&str; 3]); 1] = [("hoh-context/1", GOLDEN_1)];
     let want = golden
         .iter()
         .find(|(f, _)| *f == FORMAT)
-        .map(|(_, sha)| *sha);
+        .map(|(_, s)| s.map(str::to_owned).to_vec());
     assert_eq!(
-        Some(packed.sha256.as_str()),
+        Some(shas),
         want,
-        "the rendering changed: bump context::FORMAT and add its golden sha256"
+        "the rendering changed: before the first release update GOLDEN_1 under review; after it, bump context::FORMAT \
+         and add its golden"
     );
     Ok(())
 }
 
-/// The golden prompt's sha256 under FORMAT hoh-context/1.
-const GOLDEN_1: &str = "7cccf303e0f6afaf8684b30284d0a5a24b48da49ee5ded3c646d5cb5c2fc712b";
+/// The golden prompts' sha256 under FORMAT hoh-context/1.
+const GOLDEN_1: [&str; 3] = [
+    "fa0674eed4ff17247c20a741cd7c9c9a12cc0cf18350ce9b041a594e0883acd8",
+    "29f861e1a3301b776cca9e491fbec6c1c2ea78d27edca5cff7662101362efe04",
+    "3e6bb95a336ff03084989764d5340ea40cb7b975521144d676b6740bb2559489",
+];
 
 #[test]
 fn an_entry_that_fills_its_share_to_the_byte_fits_and_one_byte_more_does_not() -> R {
@@ -879,5 +909,113 @@ fn an_entry_that_fills_its_share_to_the_byte_fits_and_one_byte_more_does_not() -
     );
     let packed = pack(DEVELOPER, &m, &[over], budget)?;
     assert_eq!(packed.inputs[0].disposition, Disposition::Reference);
+    Ok(())
+}
+
+#[test]
+fn each_role_is_given_the_schemas_its_contract_says_it_hands_back_with_every_reference_inside() -> R
+{
+    // docs/adr/ADR-026.md decision 3 (M2T09D-65c): the output contract sections of resources/prompts/*.md.
+    let want: [(&str, &[&str]); 7] = [
+        ("commander", &["Message", "DecisionPayload"]),
+        ("developer", &["TaskResult"]),
+        ("cto", &["TaskResult"]),
+        ("researcher", &["TaskResult"]),
+        (
+            "qa",
+            &["TaskResult", "AcceptanceObservation", "IndependentReport"],
+        ),
+        ("reviewer", &["TaskResult", "IndependentReport"]),
+        ("security", &["TaskResult"]),
+    ];
+    for (role, names) in want {
+        let text = output_schemas(role)?;
+        let headings: Vec<&str> = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("#### 输出 Schema："))
+            .map(|l| l.split(['（', ' ']).next().unwrap_or(l))
+            .collect();
+        assert_eq!(headings, names, "{role}");
+        // Each block is one JSON object whose every local reference it defines itself.
+        for block in text.lines().filter(|l| l.starts_with('{')) {
+            let schema: Value = serde_json::from_str(block)?;
+            let defs = schema.get("$defs").and_then(Value::as_object);
+            for reference in block.split("\"#/$defs/").skip(1) {
+                let name = reference.split('"').next().unwrap_or_default();
+                assert!(
+                    defs.is_some_and(|d| d.contains_key(name)),
+                    "{role}: {name} referenced but not defined"
+                );
+            }
+        }
+        assert_eq!(text, output_schemas(role)?, "deterministic");
+        // The report is only what the agent writes: never a field the bridge fills in.
+        if names.contains(&"IndependentReport") {
+            let report = text
+                .lines()
+                .skip_while(|l| !l.contains("IndependentReport"))
+                .nth(1)
+                .unwrap_or_default();
+            let report: Value = serde_json::from_str(report)?;
+            let keys: Vec<&str> = report["properties"]
+                .as_object()
+                .map(|o| o.keys().map(String::as_str).collect())
+                .unwrap_or_default();
+            assert_eq!(keys, ["findings", "role", "scope", "status"], "{role}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn the_same_entry_given_twice_with_other_scores_goes_in_once() -> R {
+    // docs/adr/ADR-026.md decision 4 (M2T09D-157): one per (class, path, sha256), the higher ranked kept.
+    let m = mandatory();
+    let low = entry(Class::Evidence, "same.log", 60, (1, 0, 0));
+    let high = Entry {
+        relevance: 9,
+        ..low.clone()
+    };
+    let between = entry(Class::Evidence, "other.log", 60, (5, 0, 0));
+    let packed = pack(
+        DEVELOPER,
+        &m,
+        &[low.clone(), between, high],
+        required(DEVELOPER, &m)? + 3_000,
+    )?;
+    let paths: Vec<&str> = packed.inputs.iter().map(|i| i.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        ["same.log", "other.log"],
+        "kept once, at the higher rank"
+    );
+    assert_eq!(packed.prompt.matches(&low.text).count(), 1);
+    Ok(())
+}
+
+#[test]
+fn a_runs_own_shares_are_the_caps() -> R {
+    // docs/adr/ADR-026.md decision 7 (M2T09D-151): pack_with takes the run's shares; more than 100 is refused.
+    let m = mandatory();
+    let entries = vec![
+        entry(Class::Code, "a.rs", 3_000, (1, 0, 0)),
+        entry(Class::Knowledge, "k.md", 3_000, (1, 0, 0)),
+    ];
+    let budget = required(DEVELOPER, &m)? + 2_000;
+    let packed = pack_with(DEVELOPER, &m, &entries, budget, [0, 0, 100])?;
+    assert_eq!(packed.stats.shares, [0, 0, 2_000]);
+    let disposition = |p: &str| {
+        packed
+            .inputs
+            .iter()
+            .find(|i| i.path == p)
+            .map(|i| i.disposition)
+    };
+    assert_eq!(disposition("a.rs"), Some(Disposition::Reference));
+    assert_eq!(disposition("k.md"), Some(Disposition::Full));
+    assert!(matches!(
+        pack_with(DEVELOPER, &m, &entries, budget, [50, 50, 1]),
+        Err(PackError::Template(_))
+    ));
     Ok(())
 }
