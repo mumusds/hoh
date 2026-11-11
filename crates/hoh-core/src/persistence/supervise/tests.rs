@@ -1,7 +1,8 @@
 //! The supervisor's triggers and cursor against a real store (docs/adr/ADR-025.md decision 2), with a test clock.
 
 use crate::decision::Context;
-use crate::persistence::{Commit, NewEvent, Options, Store, selftest};
+use crate::delivery::Clock;
+use crate::persistence::{Commit, NewEvent, Options, Store, StoreClock, selftest};
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -9,10 +10,29 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 type R<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
-fn open(dir: &tempfile::TempDir) -> R<(Store, PathBuf)> {
+/// The test's clock, set by the test: the store stamps commits with it and the supervisor steps at it.
+#[derive(Debug, Default)]
+struct TestClock(std::sync::Mutex<u64>);
+
+impl TestClock {
+    fn set(&self, ms: u64) {
+        if let Ok(mut now) = self.0.lock() {
+            *now = ms;
+        }
+    }
+}
+
+impl Clock for TestClock {
+    fn now(&self) -> SystemTime {
+        t(self.0.lock().map(|m| *m).unwrap_or(0))
+    }
+}
+
+fn open(dir: &tempfile::TempDir, clock: &std::sync::Arc<TestClock>) -> R<(Store, PathBuf)> {
     let path = dir.path().join(".hoh/state.db");
     let options = Options {
         wal_probe: Some(selftest::test_probe(None)),
+        clock: Some(StoreClock(clock.clone())),
         ..Options::default()
     };
     Ok((Store::open(&path, options)?, path))
@@ -45,8 +65,9 @@ fn t(ms: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(1_800_000_000) + Duration::from_millis(ms)
 }
 
-/// The supervisor's context at `ms`.
-fn at(ms: u64) -> Context {
+/// The test's clock moved to `ms`, and the supervisor's context then.
+fn at(clock: &TestClock, ms: u64) -> Context {
+    clock.set(ms);
     Context {
         now: Some(t(ms)),
         wall: Some(t(ms)),
@@ -122,7 +143,8 @@ async fn test_021_01_ten_thousand_deltas_wake_nothing_and_candidate_ready_hands_
     // its developer's result makes one candidate_ready; the clock then runs 3600 s with the supervisor's step every
     // second. No trigger, no wake, no decision; exactly one handoff each to qa and reviewer; the cursor passes them all.
     let dir = tempfile::tempdir()?;
-    let (store, path) = open(&dir)?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
     exec(&path, WORLD)?;
     let decisions = count(&path, "SELECT count(*) FROM decisions")?;
     let mut stream: Vec<(&str, Value)> = Vec::new();
@@ -161,7 +183,7 @@ async fn test_021_01_ten_thousand_deltas_wake_nothing_and_candidate_ready_hands_
     );
     let mut woken = 0;
     for second in 0..=3600 {
-        let step = store.supervise("R", at(second * 1000)).await?;
+        let step = store.supervise("R", at(&clock, second * 1000)).await?;
         woken += step.fired.len();
     }
     assert_eq!(woken, 0);
@@ -199,7 +221,8 @@ async fn test_021_02_the_store_keeps_one_pending_trigger_per_key_and_fires_each_
     // PENDING triggers of one key; an integrity violation at 60 s fires in that step. Each fired trigger records its
     // key, seqs, first event time, wake time and latency.
     let dir = tempfile::tempdir()?;
-    let (store, path) = open(&dir)?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
     exec(&path, WORLD)?;
     let mut plan: Vec<(u64, &str, Value)> = vec![
         (0, "issue.opened", issue("fp1", 3)),
@@ -222,13 +245,14 @@ async fn test_021_02_the_store_keeps_one_pending_trigger_per_key_and_fires_each_
     let mut most_pending = 0;
     for tick in 0..=700 {
         let now = tick * 100;
+        clock.set(now);
         while next < plan.len() && plan[next].0 <= now {
             let (_, kind, payload) = &plan[next];
             let seqs = events(&store, &format!("plan/{next}"), &[(kind, payload.clone())]).await?;
             seq_at.push((plan[next].0, seqs[0]));
             next += 1;
         }
-        for f in store.supervise("R", at(now)).await?.fired {
+        for f in store.supervise("R", at(&clock, now)).await?.fired {
             fired.push((now, f));
         }
         most_pending = most_pending.max(count(
@@ -301,11 +325,12 @@ async fn a_reopened_store_takes_in_only_the_events_after_its_cursor() -> R {
     // REQ-021 behaviour 5 (decision 2 of docs/adr/ADR-025.md): the cursor is persisted; a store opened again over the
     // database takes in only the events after it.
     let dir = tempfile::tempdir()?;
-    let (store, path) = open(&dir)?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
     exec(&path, WORLD)?;
     let first = events(&store, "a", &[("need_decision", json!({"task_id": "D"}))]).await?;
-    store.supervise("R", at(0)).await?;
-    store.supervise("R", at(3000)).await?;
+    store.supervise("R", at(&clock, 0)).await?;
+    store.supervise("R", at(&clock, 3000)).await?;
     assert_eq!(
         count(
             &path,
@@ -314,11 +339,67 @@ async fn a_reopened_store_takes_in_only_the_events_after_its_cursor() -> R {
         1
     );
     drop(store);
-    let (store, _) = open(&dir)?;
+    let (store, _) = open(&dir, &clock)?;
+    clock.set(10_000);
     let second = events(&store, "b", &[("need_decision", json!({"task_id": "D"}))]).await?;
-    store.supervise("R", at(10_000)).await?;
-    let step = store.supervise("R", at(13_000)).await?;
+    store.supervise("R", at(&clock, 10_000)).await?;
+    let step = store.supervise("R", at(&clock, 13_000)).await?;
     assert_eq!(step.fired.len(), 1);
     assert_eq!(step.fired[0].event_seqs, second, "not {first:?} again");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_late_step_times_the_trigger_from_its_events_commit_not_from_when_it_took_it_in() -> R {
+    // REQ-021 decision 4 (docs/adr/ADR-025.md decision 2, M2T08D-09): an event committed at 0 s and first looked at by
+    // the supervisor at 10 s is due at 2 s: it fires in that late step, its first event time the commit's, its latency
+    // 10 s; the window does not start again at the step. An event committed by an earlier writer (the store opened
+    // again) has no commit instant here: its trigger counts from when it was taken in and says so.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    clock.set(0);
+    let seqs = events(
+        &store,
+        "late",
+        &[("need_decision", json!({"task_id": "D"}))],
+    )
+    .await?;
+    let step = store.supervise("R", at(&clock, 10_000)).await?;
+    assert_eq!(step.fired.len(), 1, "due at 2 s, fired in the late step");
+    assert_eq!(step.fired[0].event_seqs, seqs);
+    let woken = rows(
+        &path,
+        "SELECT json_extract(payload_json, '$.first_event_at'), json_extract(payload_json, '$.wake_latency_ms'), \
+         json_extract(payload_json, '$.latency_basis') FROM events WHERE kind = 'supervisor.woken'",
+    )?;
+    assert_eq!(
+        woken,
+        [[
+            json!(crate::time::rfc3339_millis_utc(t(0))),
+            json!(10_000),
+            json!("commit")
+        ]]
+    );
+    clock.set(20_000);
+    let earlier = events(
+        &store,
+        "earlier",
+        &[("need_decision", json!({"task_id": "D"}))],
+    )
+    .await?;
+    drop(store);
+    let (store, _) = open(&dir, &clock)?;
+    store.supervise("R", at(&clock, 30_000)).await?;
+    let step = store.supervise("R", at(&clock, 32_000)).await?;
+    assert_eq!(step.fired.len(), 1);
+    assert_eq!(step.fired[0].event_seqs, earlier);
+    let restarted = rows(
+        &path,
+        "SELECT json_extract(payload_json, '$.wake_latency_ms'), json_extract(payload_json, '$.latency_basis') \
+         FROM events WHERE kind = 'supervisor.woken' ORDER BY seq DESC LIMIT 1",
+    )?;
+    assert_eq!(restarted, [[json!(2000), json!("across_restart")]]);
     Ok(())
 }

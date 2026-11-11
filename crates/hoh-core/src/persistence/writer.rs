@@ -198,6 +198,8 @@ pub(super) struct Ctx<'a> {
     fence: Option<&'a Fence>,
     /// Test-only: inside a commit after its events (`Fault::AbortAfterEvents`); a no-op otherwise.
     after_events: &'a dyn Fn(),
+    /// When each transaction of this writer's life committed (docs/adr/ADR-025.md decision 2).
+    commits: &'a std::cell::RefCell<super::supervise::CommitTimes>,
 }
 
 #[cfg(test)]
@@ -212,7 +214,13 @@ impl Ctx<'_> {
             hooks: &super::NoFaults,
             fence: None,
             after_events: &nothing,
+            commits: Box::leak(Box::default()),
         }
+    }
+
+    /// When the transaction that wrote event `seq` committed, by the store's clock, if this writer committed it.
+    pub(super) fn committed_at(&self, seq: i64) -> Option<std::time::SystemTime> {
+        self.commits.borrow().of(seq)
     }
 
     /// The request reached `point`.
@@ -389,6 +397,7 @@ impl Writer {
         // The claims handed out and not yet handed to a transport (ADR-018 decision 4).
         let writer_claims = Registry::default();
         let faults = options.faults.clone();
+        let clock = options.clock.clone();
         let (end, ended) = watch::channel(false);
         std::thread::Builder::new()
             .name("hoh-db-writer".to_owned())
@@ -399,6 +408,8 @@ impl Writer {
                 let _closer = Closer(writer_claims.clone());
                 // The epoch of the host this writer serves, once it has begun (ADR-019 decision 2).
                 let mut fence: Option<Fence> = None;
+                // When each of its transactions committed, by the store's clock (docs/adr/ADR-025.md decision 2).
+                let commits = std::cell::RefCell::new(super::supervise::CommitTimes::default());
                 loop {
                     // The priority lane first; a queued request after it (ADR-021 decision 8a). When every handle is
                     // gone, what is left of the lane is still done.
@@ -416,11 +427,17 @@ impl Writer {
                         continue;
                     }
                     before();
+                    // The commit instant of what this request commits: read before it runs, so before its answer
+                    // (a caller moving the clock once answered cannot move it), by the store's clock.
+                    let started = clock
+                        .as_ref()
+                        .map_or_else(std::time::SystemTime::now, |c| c.0.now());
                     let ctx = Ctx {
                         job: job.name(),
                         hooks: faults.as_ref(),
                         fence: fence.as_ref(),
                         after_events: &after_events,
+                        commits: &commits,
                     };
                     match job {
                         Job::Commit(commit, reply) => {
@@ -517,6 +534,7 @@ impl Writer {
                         committed.send_if_modified(|seq| {
                             let moved = now > *seq;
                             if moved {
+                                commits.borrow_mut().record(*seq, now, started);
                                 *seq = now;
                             }
                             moved
@@ -532,6 +550,7 @@ impl Writer {
                     hooks: faults.as_ref(),
                     fence: fence.as_ref(),
                     after_events: &after_events,
+                    commits: &commits,
                 };
                 let _ = super::outbox::unclaim_all(&mut conn, &left, &close);
                 drop(conn);
