@@ -44,6 +44,7 @@ pub use team::{
     Assignment, Availability, FileTeam, SessionGrant, TeamChange, TeamConfig, TeamMember, TeamView,
     Unbound, session_id,
 };
+pub use wakes::Allocated;
 pub mod location;
 pub mod selftest;
 mod writer;
@@ -851,11 +852,8 @@ impl Store {
         self.reader()?.repair_count(run_id, repair)
     }
 
-    /// One look at run `run_id` as a whole at `context.now()` (ADR-020 decisions 4, 5 and 7): woken from
-    /// WAITING_EXTERNAL when a retry is due; BLOCKED for a cost limit it cannot enforce, a task its session cannot run
-    /// or nothing able to move on; INCOMPLETE when its budget stops it; WAITING_EXTERNAL when only retries are left.
     /// One step of run `run_id`'s supervisor at `context.now()` (REQ-021, docs/adr/ADR-025.md decision 2): its events
-    /// after its cursor taken in, the triggers due fired.
+    /// after its cursor taken in, the triggers due fired as its state allows.
     pub async fn supervise(
         &self,
         run_id: &str,
@@ -876,6 +874,32 @@ impl Store {
         }
     }
 
+    /// One owed wake of project `project_id` given a Commander turn at `context.now()`, if the slot is free and a
+    /// run admits one (docs/adr/ADR-025.md decision 3): its supervision task, PREPARED attempt, lease and dispatch.
+    pub async fn allocate_supervision(
+        &self,
+        project_id: &str,
+        context: crate::decision::Context,
+    ) -> Result<Option<Allocated>, PersistError> {
+        match self
+            .writer
+            .runner(runner::RunnerJob::Allocate {
+                project_id: project_id.to_owned(),
+                context: Box::new(context),
+            })
+            .await?
+        {
+            runner::RunnerDone::Allocated(done) => Ok(done),
+            _ => Err(PersistError::IntegrityViolation(
+                "an allocation answered with something else".to_owned(),
+            )),
+        }
+    }
+
+    /// One look at run `run_id` as a whole at `context.now()` (ADR-020 decisions 4, 5 and 7; docs/adr/ADR-025.md
+    /// decision 5): woken from WAITING_EXTERNAL when a retry is due; BLOCKED while blocker claims are open (a cost
+    /// limit it cannot enforce, a task its session cannot run, nothing able to move on), back once they are released;
+    /// INCOMPLETE when its budget stops it; WAITING_EXTERNAL when only retries are left.
     pub async fn pace_run(
         &self,
         run_id: &str,

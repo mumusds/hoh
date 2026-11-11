@@ -94,6 +94,17 @@ pub(super) fn free_slot(
     Ok(None)
 }
 
+/// Whether slot `kind` is free at `now`.
+pub(super) fn is_free(
+    tx: &Connection,
+    project_id: &str,
+    kind: &str,
+    now: SystemTime,
+) -> Result<bool, PersistError> {
+    let now = rfc3339_utc(now);
+    Ok(row(tx, project_id, kind)?.is_none_or(|held| !effective(&held, &now)))
+}
+
 /// Grant `kind` to `attempt_id` at `now`: refused while the slot is held.
 pub(super) fn grant(
     tx: &Transaction<'_>,
