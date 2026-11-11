@@ -5,11 +5,12 @@
 //! `supervisor.allocated` until its attempt ends.
 
 use super::decide::{self, LeaseRequest, Leased};
-use super::writer::{self, Commit, Ctx, NewEvent, NewOutbox};
+use super::writer::{self, Change, Commit, Ctx, NewEvent, NewOutbox, StateCas};
 use super::{PersistError, leases, sqlite_error};
 use crate::decision::Context;
 use crate::ids::child_id;
 use crate::lifecycle::{AttemptState, Lifecycle as _};
+use crate::protocol::TaskState;
 use crate::supervise::Severity;
 use crate::time::{parse_rfc3339_millis, rfc3339_utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -28,6 +29,17 @@ pub const SUPERVISION_TURN: Duration = Duration::from_secs(15 * 60);
 /// The supervision task's role: the Commander does no work task (CONTRACT 6, docs/06).
 pub(super) const COMMANDER: &str = "commander";
 
+/// What a turn's `supervisor.rearmed` records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Rearm {
+    /// `failure`, `preempted` or `withdrawn`.
+    pub reason: String,
+    /// The wake's failures under `role_epoch`, this one counted.
+    pub failures: i64,
+    pub role_epoch: i64,
+    pub retry_not_before: Option<String>,
+}
+
 /// One turn given to a wake.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Turn {
@@ -35,8 +47,8 @@ pub(super) struct Turn {
     pub attempt_id: String,
     /// Its attempt's state now (`None`: no such attempt).
     pub state: Option<AttemptState>,
-    /// Its `supervisor.rearmed` is written.
-    pub rearmed: bool,
+    /// Its `supervisor.rearmed`, once written.
+    pub rearm: Option<Rearm>,
 }
 
 impl Turn {
@@ -78,6 +90,36 @@ impl Wake {
     pub fn owed(&self) -> bool {
         !self.superseded && !self.settled() && !self.in_flight()
     }
+
+    /// Its failures under the Commander's epoch `epoch`: a failure of another epoch does not count, a preempted or
+    /// withdrawn turn neither counts nor breaks the run (M2T08D-950, -1054).
+    pub fn failures(&self, epoch: i64) -> i64 {
+        let counted = self
+            .turns
+            .iter()
+            .filter_map(|t| t.rearm.as_ref())
+            .filter(|r| r.reason == "failure" && r.role_epoch == epoch)
+            .count();
+        i64::try_from(counted).unwrap_or(i64::MAX)
+    }
+
+    /// Not to be allocated before this time: its last failure's backoff.
+    pub fn retry_not_before(&self) -> Option<&str> {
+        self.turns
+            .last()
+            .and_then(|t| t.rearm.as_ref())
+            .and_then(|r| r.retry_not_before.as_deref())
+    }
+}
+
+/// Whether `task_id` is a supervision task (role commander).
+pub(super) fn is_supervision(tx: &Connection, task_id: &str) -> Result<bool, PersistError> {
+    tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM tasks WHERE task_id = ?1 AND role = ?2)",
+        params![task_id, COMMANDER],
+        |r| r.get(0),
+    )
+    .map_err(sqlite_error)
 }
 
 fn text(payload: &Value, field: &str) -> Option<String> {
@@ -151,7 +193,7 @@ pub(super) fn of_run(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<Wake>, Pe
                         generation: payload["generation"].as_i64().unwrap_or(0),
                         attempt_id,
                         state: None,
-                        rearmed: false,
+                        rearm: None,
                     });
                 }
             }
@@ -163,7 +205,12 @@ pub(super) fn of_run(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<Wake>, Pe
                         .iter_mut()
                         .find(|t| t.attempt_id == attempt_id)
                 {
-                    turn.rearmed = true;
+                    turn.rearm = Some(Rearm {
+                        reason: text(&payload, "reason").unwrap_or_default(),
+                        failures: payload["failures"].as_i64().unwrap_or(0),
+                        role_epoch: payload["role_epoch"].as_i64().unwrap_or(0),
+                        retry_not_before: text(&payload, "retry_not_before"),
+                    });
                 }
             }
             _ => {
@@ -190,6 +237,99 @@ pub(super) fn of_run(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<Wake>, Pe
         }
     }
     Ok(wakes)
+}
+
+/// Rearm run `run_id`'s wakes whose last turn ended without settling and is not rearmed yet (decision 3): each owed
+/// again, with `supervisor.rearmed{reason, failures, retry_not_before, role_epoch}` (a failure counted under the
+/// Commander's epoch `epoch` and backed off by ADR-020's bound; a preempted or withdrawn turn neither), and its
+/// supervision task CANCELLED if no ending moved it yet. The moves and events for the caller's commit.
+fn rearm(
+    tx: &Transaction<'_>,
+    project_id: &str,
+    run_id: &str,
+    wakes: &mut [Wake],
+    epoch: i64,
+    now: std::time::SystemTime,
+) -> Result<(Vec<StateCas>, Vec<NewEvent>), PersistError> {
+    let mut cas = Vec::new();
+    let mut events = Vec::new();
+    for wake in wakes.iter_mut().filter(|w| !w.superseded && !w.settled()) {
+        let failures = wake.failures(epoch);
+        let Some(turn) = wake.turns.last_mut() else {
+            continue;
+        };
+        if !turn.ended() || turn.rearm.is_some() {
+            continue;
+        }
+        let preempted: bool = tx
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM events WHERE run_id = ?1 AND kind = 'supervisor.preempt' \
+                 AND json_extract(payload_json, '$.target_attempt') = ?2)",
+                params![run_id, turn.attempt_id],
+                |r| r.get(0),
+            )
+            .map_err(sqlite_error)?;
+        let reason = if preempted {
+            "preempted"
+        } else if turn.state == Some(AttemptState::Cancelled) {
+            "withdrawn"
+        } else {
+            "failure"
+        };
+        let (task_id, task_state, task_revision, ended_at): (String, String, i64, Option<String>) = tx
+            .query_row(
+                "SELECT t.task_id, t.state, t.revision, a.ended_at FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+                 WHERE a.attempt_id = ?1",
+                params![turn.attempt_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .map_err(sqlite_error)?;
+        let (failures, retry_not_before) = if reason == "failure" {
+            let failures = failures + 1;
+            let from = ended_at
+                .as_deref()
+                .and_then(crate::time::parse_rfc3339)
+                .unwrap_or(now);
+            let n = u32::try_from(failures - 1).unwrap_or(u32::MAX);
+            (failures, Some(rfc3339_utc(from + crate::retry::bound(n))))
+        } else {
+            (failures, None)
+        };
+        let task_state = writer::parse::<TaskState>(&task_state)?;
+        if !matches!(
+            task_state,
+            TaskState::Cancelled | TaskState::Implemented | TaskState::Accepted
+        ) {
+            cas.push(StateCas {
+                id: task_id.clone(),
+                expected_revision: task_revision,
+                change: Change::Task(TaskState::Cancelled),
+            });
+        }
+        events.push(NewEvent {
+            project_id: project_id.to_owned(),
+            event_id: child_id(&turn.attempt_id, "rearmed"),
+            run_id: Some(run_id.to_owned()),
+            kind: REARMED.to_owned(),
+            payload: json!({
+                "wake": wake.id,
+                "dedup_key": {"run_id": run_id, "fingerprint": wake.fingerprint, "spec_id": wake.spec_id},
+                "attempt_id": turn.attempt_id,
+                "generation": turn.generation,
+                "reason": reason,
+                "failures": failures,
+                "retry_not_before": retry_not_before,
+                "role_epoch": epoch,
+            }),
+        });
+        turn.rearm = Some(Rearm {
+            reason: reason.to_owned(),
+            failures,
+            role_epoch: epoch,
+            retry_not_before,
+        });
+    }
+    Ok((cas, events))
 }
 
 /// A wake given a Commander turn.
@@ -274,18 +414,28 @@ pub(super) fn allocate(
         }
     }
     let mut candidates = Vec::new();
+    let mut rearmed = Commit::default();
+    let stamp = rfc3339_utc(now);
     for (run_id, spec_id, run_revision) in runs {
         let Some(binding) = decide::load_binding(&tx, &run_id, COMMANDER)? else {
             continue;
         };
+        let mut wakes = of_run(&tx, &run_id)?;
+        let epoch = decide::to_i64(binding.role_epoch, "role_epoch")?;
+        let (moves, events) = rearm(&tx, project_id, &run_id, &mut wakes, epoch, now)?;
+        rearmed.cas.extend(moves);
+        rearmed.events.extend(events);
         if !binding.active || super::retry::budget_stop(&tx, &run_id, context)?.is_some() {
             continue;
         }
-        let wakes = of_run(&tx, &run_id)?;
         if wakes.iter().any(Wake::in_flight) {
             continue;
         }
-        for wake in wakes.into_iter().filter(Wake::owed) {
+        for wake in wakes
+            .into_iter()
+            .filter(Wake::owed)
+            .filter(|w| w.retry_not_before().is_none_or(|t| t <= stamp.as_str()))
+        {
             let aged = parse_rfc3339_millis(&wake.woken_at)
                 .and_then(|at| now.duration_since(at).ok())
                 .is_some_and(|waited| waited > SUPERVISION_TURN);
@@ -316,6 +466,11 @@ pub(super) fn allocate(
             b.wake.woken_seq,
         ))
     }) else {
+        if !rearmed.events.is_empty() {
+            writer::write(&tx, &rearmed, ctx)?;
+            ctx.before_commit()?;
+            tx.commit().map_err(sqlite_error)?;
+        }
         return Ok(None);
     };
     let generation: i64 = tx
@@ -362,8 +517,14 @@ pub(super) fn allocate(
     }
     let lease = json!({"kind": grant.kind, "epoch": grant.epoch, "expires_at": grant.expires_at});
     let role_epoch = decide::to_i64(chosen.role_epoch, "role_epoch")?;
+    // The dispatch notice refers to the allocation's event, after the rearms.
+    let allocated_at = rearmed.events.len();
     let commit = Commit {
-        events: vec![NewEvent {
+        cas: rearmed.cas,
+        events: rearmed
+            .events
+            .into_iter()
+            .chain([NewEvent {
             project_id: chosen.project_id.clone(),
             event_id: child_id(&task_id, "allocated"),
             run_id: Some(chosen.run_id.clone()),
@@ -380,10 +541,11 @@ pub(super) fn allocate(
                 "role_epoch": role_epoch,
                 "allocated_at": rfc3339_utc(now),
             }),
-        }],
+        }])
+            .collect(),
         outbox: vec![NewOutbox {
             message_id: child_id(&attempt_id, "dispatch"),
-            event: 0,
+            event: allocated_at,
             run_id: Some(chosen.run_id.clone()),
             recipient_role: COMMANDER.to_owned(),
             role_epoch,
@@ -398,7 +560,6 @@ pub(super) fn allocate(
                 "wake": chosen.wake.id,
             }),
         }],
-        ..Commit::default()
     };
     writer::write(&tx, &commit, ctx)?;
     ctx.before_commit()?;

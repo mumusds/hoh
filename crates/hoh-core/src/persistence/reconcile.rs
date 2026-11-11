@@ -447,6 +447,14 @@ fn apply(
         task_moves.extend(failed.cas);
         task_events = failed.events;
     } else if let Some(to) = task_to {
+        // A supervision turn's task never goes back to READY: CANCELLED, its wake rearmed (docs/adr/ADR-025.md
+        // decision 3).
+        let to = if to == TaskState::Ready && super::wakes::is_supervision(&tx, &row.task_id)? {
+            TaskState::Cancelled
+        } else {
+            to
+        };
+        task_to = Some(to);
         task_moves.push(StateCas {
             id: row.task_id.clone(),
             expected_revision: row.task_revision,

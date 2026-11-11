@@ -406,6 +406,14 @@ pub fn validate(proposal: &Proposal, snapshot: &Snapshot) -> Result<Effect, Reje
 
 fn named_task<'a>(snapshot: &'a Snapshot, task_id: &str) -> Result<&'a TaskView, Rejection> {
     match &snapshot.task {
+        // A supervision task is the Commander's own turn: no decision dispatches or moves it (docs/adr/ADR-025.md
+        // appendix).
+        Some(task) if task.task_id == task_id && task.role == "commander" => reject(
+            RejectionReason::IllegalTransition,
+            format!(
+                "{task_id} is a supervision task, the Commander's own turn; no decision moves it"
+            ),
+        ),
         Some(task) if task.task_id == task_id => Ok(task),
         _ => reject(
             RejectionReason::IllegalTransition,

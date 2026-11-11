@@ -410,3 +410,454 @@ async fn a_supervision_turn_moves_neither_its_runs_state_nor_its_revision() -> R
     assert_eq!(run_state(&path, "R")?, blocked);
     Ok(())
 }
+
+/// Take turn `attempt`'s dispatch and end it as the runner does: started, its work committed and settled when
+/// `success`; else failed with `class` before it ran (a process that never started can only fail).
+async fn run_turn(
+    store: &Store,
+    clock: &TestClock,
+    attempt: &str,
+    ms: u64,
+    success: bool,
+    class: crate::retry::FailureClass,
+) -> R {
+    let notice = store
+        .runner_waiting("p1")
+        .await?
+        .dispatches
+        .into_iter()
+        .find(|d| d.attempt_id == attempt)
+        .ok_or("no dispatch notice for the turn")?;
+    clock.set(ms);
+    assert!(store.runner_received(notice, t(ms)).await?);
+    if success {
+        assert!(
+            store
+                .runner_running(
+                    attempt,
+                    crate::persistence::AttemptFacts {
+                        pid: Some(4242),
+                        ..Default::default()
+                    },
+                    json!({"kind": "proc"}),
+                )
+                .await?
+        );
+        store
+            .runner_effect(
+                attempt,
+                &format!("{attempt}/work"),
+                crate::reconcile::EffectState::Started,
+                crate::reconcile::EffectState::Committed,
+                json!({}),
+            )
+            .await?;
+    }
+    assert!(
+        store
+            .runner_finished(
+                attempt,
+                crate::persistence::Ending {
+                    success,
+                    detail: if success { "answered" } else { "failed" }.to_owned(),
+                    class,
+                    at: t(ms + 500),
+                    draw: 0,
+                    observed: Default::default(),
+                    unknown_effect: false,
+                },
+            )
+            .await?
+    );
+    Ok(())
+}
+
+fn rearms(path: &PathBuf) -> R<Vec<Value>> {
+    let conn = Connection::open(path)?;
+    let mut s = conn.prepare(
+        "SELECT json_object('reason', json_extract(payload_json, '$.reason'), 'failures', \
+         json_extract(payload_json, '$.failures'), 'retry_not_before', json_extract(payload_json, '$.retry_not_before'), \
+         'role_epoch', json_extract(payload_json, '$.role_epoch')) FROM events WHERE kind = 'supervisor.rearmed' ORDER BY seq",
+    )?;
+    let rows = s
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.iter().map(|r| Ok(serde_json::from_str(r)?)).collect()
+}
+
+const TRANSIENT: crate::retry::FailureClass =
+    crate::retry::FailureClass::Transient { retry_after: None };
+
+#[tokio::test]
+async fn a_failed_turn_cancels_its_supervision_task_and_rearms_its_wake_after_a_backoff() -> R {
+    // Decision 3 (other endings and rearming): a supervision turn that fails is not retried by the task's policy: its
+    // task is CANCELLED (no attempt counted, no need_decision); the wake is owed again (supervisor.rearmed, reason
+    // failure, failures 1) and allocated again only from its retry_not_before (ADR-020's backoff), as generation 1.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    let w = wake(&store, &clock, "R", "D", "fp", 0).await?;
+    let a = store
+        .allocate_supervision("p1", context(&clock, 3000))
+        .await?
+        .ok_or("allocated")?;
+    run_turn(&store, &clock, &a.attempt_id, 3000, false, TRANSIENT).await?;
+    assert_eq!(
+        value(
+            &path,
+            &format!(
+                "SELECT json_array(state, attempt_count, next_retry_at) FROM tasks WHERE task_id = '{}'",
+                a.task_id
+            )
+        )?,
+        json!(["CANCELLED", 0, null])
+    );
+    assert_eq!(
+        value(
+            &path,
+            "SELECT count(*) FROM events WHERE kind = 'need_decision' AND run_id = 'R'"
+        )?,
+        json!(1),
+        "only the need_decision that woke it"
+    );
+    // At once: rearmed, but not allocated before its backoff.
+    assert!(
+        store
+            .allocate_supervision("p1", context(&clock, 3600))
+            .await?
+            .is_none()
+    );
+    let rearmed = rearms(&path)?;
+    assert_eq!(rearmed.len(), 1);
+    assert_eq!(
+        (
+            &rearmed[0]["reason"],
+            &rearmed[0]["failures"],
+            &rearmed[0]["role_epoch"]
+        ),
+        (&json!("failure"), &json!(1), &json!(1))
+    );
+    let not_before = rearmed[0]["retry_not_before"]
+        .as_str()
+        .ok_or("retry_not_before")?;
+    let not_before_ms = crate::time::parse_rfc3339(not_before)
+        .ok_or("a time")?
+        .duration_since(t(0))?
+        .as_millis();
+    assert!(not_before_ms > 3500, "{not_before}");
+    let again = store
+        .allocate_supervision("p1", context(&clock, u64::try_from(not_before_ms)?))
+        .await?
+        .ok_or("allocated after the backoff")?;
+    assert_eq!((again.wake.as_str(), again.generation), (w.as_str(), 1));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_withdrawn_turn_rearms_without_a_failure_or_a_backoff() -> R {
+    // Decision 3: a PREPARED turn withdrawn by a pause: its supervision task CANCELLED (not READY), the wake rearmed
+    // (withdrawn) with no failure counted, allocated at once when the run works again.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(
+        &path,
+        &format!(
+            "{WORLD}
+             UPDATE attempts SET state = 'SETTLED', ended_at = '2027-01-15T08:00:00Z' WHERE attempt_id = 'A';
+             UPDATE tasks SET state = 'IMPLEMENTED', revision = 5 WHERE task_id = 'D';"
+        ),
+    )?;
+    wake(&store, &clock, "R", "D", "fp", 0).await?;
+    let a = store
+        .allocate_supervision("p1", context(&clock, 3000))
+        .await?
+        .ok_or("allocated")?;
+    exec(
+        &path,
+        "UPDATE runs SET state = 'PAUSE_REQUESTED', resume_state = 'RUNNING', revision = revision + 1 WHERE run_id = 'R';",
+    )?;
+    assert_eq!(
+        store.pause_step("R", t(3100)).await?,
+        crate::persistence::PauseStep::Paused
+    );
+    assert_eq!(
+        value(
+            &path,
+            &format!("SELECT state FROM tasks WHERE task_id = '{}'", a.task_id)
+        )?,
+        json!("CANCELLED")
+    );
+    exec(
+        &path,
+        "UPDATE runs SET state = 'RUNNING', resume_state = NULL WHERE run_id = 'R';",
+    )?;
+    let again = store
+        .allocate_supervision("p1", context(&clock, 3200))
+        .await?
+        .ok_or("allocated at once")?;
+    assert_eq!(again.generation, 1);
+    let rearmed = rearms(&path)?;
+    assert_eq!(
+        (
+            &rearmed[0]["reason"],
+            &rearmed[0]["failures"],
+            &rearmed[0]["retry_not_before"]
+        ),
+        (&json!("withdrawn"), &json!(0), &Value::Null)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_wakes_failures_count_under_the_current_commander_epoch_only() -> R {
+    // M2T08D-950, -1054 (decision 3): failures are the wake's own, under the Commander's current epoch: two failures
+    // count 2; after a handover to epoch 2 the next failure counts 1.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    wake(&store, &clock, "R", "D", "fp", 0).await?;
+    let mut ms = 3000;
+    for _ in 0..2 {
+        let a = store
+            .allocate_supervision("p1", context(&clock, ms))
+            .await?
+            .ok_or("allocated")?;
+        run_turn(&store, &clock, &a.attempt_id, ms, false, TRANSIENT).await?;
+        store
+            .allocate_supervision("p1", context(&clock, ms + 600))
+            .await?;
+        ms += 600_000;
+    }
+    exec(
+        &path,
+        "UPDATE role_bindings SET role_epoch = 2 WHERE run_id = 'R' AND role = 'commander';",
+    )?;
+    let a = store
+        .allocate_supervision("p1", context(&clock, ms))
+        .await?
+        .ok_or("allocated at the new epoch")?;
+    run_turn(&store, &clock, &a.attempt_id, ms, false, TRANSIENT).await?;
+    store
+        .allocate_supervision("p1", context(&clock, ms + 600))
+        .await?;
+    let counted: Vec<(Value, Value)> = rearms(&path)?
+        .into_iter()
+        .map(|r| (r["failures"].clone(), r["role_epoch"].clone()))
+        .collect();
+    assert_eq!(
+        counted,
+        [
+            (json!(1), json!(1)),
+            (json!(2), json!(1)),
+            (json!(1), json!(2))
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_settled_attempt_records_task_implemented_for_work_only() -> R {
+    // Decision 3 (the shared rule of completion): a work attempt that settles records task.implemented with its
+    // task's risk_reduction (intensive's round boundary); a supervision turn that settles leaves its task IMPLEMENTED
+    // and records none; the settled wake is owed nothing more.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(
+        &path,
+        &format!(
+            "{WORLD}
+             UPDATE tasks SET risk_reduction = 4 WHERE task_id = 'E';
+             UPDATE runs SET state = 'PAUSED', resume_state = 'RUNNING' WHERE run_id = 'R';"
+        ),
+    )?;
+    wake(&store, &clock, "S", "E", "fp", 0).await?;
+    let turn = store
+        .allocate_supervision("p1", context(&clock, 3000))
+        .await?
+        .ok_or("allocated")?;
+    run_turn(&store, &clock, &turn.attempt_id, 3000, true, TRANSIENT).await?;
+    assert_eq!(
+        value(
+            &path,
+            &format!("SELECT state FROM tasks WHERE task_id = '{}'", turn.task_id)
+        )?,
+        json!("IMPLEMENTED")
+    );
+    // E's own attempt, dispatched by a round.
+    exec(
+        &path,
+        "INSERT INTO role_bindings(run_id, role, agent, session_id, role_epoch, config_revision, bound_at) VALUES
+           ('S', 'developer', 'claude', 'sd', 1, 1, '2026-11-07T00:00:00Z');",
+    )?;
+    let work = store
+        .schedule_round(
+            "S",
+            Context {
+                required_capabilities: [("developer".to_owned(), Default::default())].into(),
+                ..context(&clock, 4000)
+            },
+        )
+        .await?
+        .dispatched
+        .ok_or("E dispatched")?;
+    run_turn(&store, &clock, &work.attempt_id, 4000, true, TRANSIENT).await?;
+    assert_eq!(
+        value(
+            &path,
+            "SELECT json_group_array(json_object('task_id', json_extract(payload_json, '$.task_id'), \
+             'risk_reduction', json_extract(payload_json, '$.risk_reduction'))) FROM events WHERE kind = 'task.implemented'"
+        )?,
+        json!([{"task_id": "E", "risk_reduction": 4}])
+    );
+    assert!(
+        store
+            .allocate_supervision("p1", context(&clock, 5000))
+            .await?
+            .is_none()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_supervision_task_is_never_ready_and_takes_no_repair() -> R {
+    // Appendix: rounds see READY and PENDING tasks only, and a supervision task never is either; request_repair
+    // refuses a supervision task.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    wake(&store, &clock, "R", "D", "fp", 0).await?;
+    let a = store
+        .allocate_supervision("p1", context(&clock, 3000))
+        .await?
+        .ok_or("allocated")?;
+    run_turn(&store, &clock, &a.attempt_id, 3000, false, TRANSIENT).await?;
+    assert_eq!(
+        value(
+            &path,
+            "SELECT count(*) FROM tasks WHERE role = 'commander' AND state IN ('READY', 'PENDING')"
+        )?,
+        json!(0)
+    );
+    let refused = store
+        .request_repair(crate::persistence::RepairRequest {
+            run_id: "R".to_owned(),
+            task_id: a.task_id.clone(),
+            repair: crate::persistence::Repair::Local {
+                fingerprint: "F".to_owned(),
+            },
+            limit: 3,
+            detail: "a repair of a supervision task".to_owned(),
+        })
+        .await;
+    assert!(refused.is_err(), "{refused:?}");
+    Ok(())
+}
+
+fn planned(id: &str, role: &str, deps: &[&str]) -> Value {
+    json!({"task_id": id, "title": format!("task {id}"), "role": role, "writer": false, "depends_on": deps,
+           "requirement_ids": ["REQ-021"]})
+}
+
+#[tokio::test]
+async fn a_plan_naming_the_commander_or_a_supervision_task_is_refused() -> R {
+    // Appendix (-66): the Commander does no work task (CONTRACT 6): a plan task of role commander is refused, and so is
+    // one depending on a supervision task; a plain plan still imports.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(
+        &path,
+        &format!(
+            "{WORLD}
+             INSERT INTO requirements(requirement_id, spec_id, title, required_release) VALUES ('REQ-021', 's3', 'supervision', 1);"
+        ),
+    )?;
+    wake(&store, &clock, "R", "D", "fp", 0).await?;
+    let a = store
+        .allocate_supervision("p1", context(&clock, 3000))
+        .await?
+        .ok_or("allocated")?;
+    let commander = store
+        .import_plan("R", json!({"tasks": [planned("X", "commander", &[])]}))
+        .await;
+    assert!(
+        matches!(
+            commander,
+            Err(crate::persistence::PersistError::Plan(
+                crate::dag::PlanError::Invalid(_)
+            ))
+        ),
+        "{commander:?}"
+    );
+    let behind = store
+        .import_plan(
+            "R",
+            json!({"tasks": [planned("Y", "developer", &[a.task_id.as_str()])]}),
+        )
+        .await;
+    assert!(
+        matches!(
+            behind,
+            Err(crate::persistence::PersistError::Plan(
+                crate::dag::PlanError::Invalid(_)
+            ))
+        ),
+        "{behind:?}"
+    );
+    store
+        .import_plan("R", json!({"tasks": [planned("Z", "developer", &["D"])]}))
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_task_result_for_a_supervision_task_is_refused() -> R {
+    // Appendix: a Commander turn answers through its outputs (decision 8), not a TaskResult: one of role commander is
+    // rejected, named as a supervision task's.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    wake(&store, &clock, "R", "D", "fp", 0).await?;
+    let a = store
+        .allocate_supervision("p1", context(&clock, 3000))
+        .await?
+        .ok_or("allocated")?;
+    let notice = store
+        .runner_waiting("p1")
+        .await?
+        .dispatches
+        .into_iter()
+        .find(|d| d.attempt_id == a.attempt_id)
+        .ok_or("notice")?;
+    assert!(store.runner_received(notice, t(3000)).await?);
+    assert!(
+        store
+            .runner_running(
+                &a.attempt_id,
+                crate::persistence::AttemptFacts {
+                    pid: Some(4242),
+                    ..Default::default()
+                },
+                json!({"kind": "proc"}),
+            )
+            .await?
+    );
+    let result: crate::protocol::TaskResult = serde_json::from_value(json!({
+        "schema_version": "1.0", "run_id": "R", "task_id": a.task_id, "attempt_id": a.attempt_id, "role": "commander",
+        "role_epoch": 1, "status": "COMPLETED", "summary": "done", "candidate_id": null, "evidence": [],
+        "issues": [], "next_action": "verify"
+    }))?;
+    let outcome = store.accept_task_result(result).await?;
+    let crate::persistence::TaskResultOutcome::Rejected { detail, .. } = &outcome else {
+        return Err(format!("{outcome:?}").into());
+    };
+    assert!(detail.contains("supervision task"), "{detail}");
+    let _ = value(&path, "SELECT 1")?;
+    Ok(())
+}
