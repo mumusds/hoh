@@ -8,7 +8,7 @@
 //! the sha256 of its full text, in an index object the prompt names by one fixed-length pointer line (behaviour 4).
 //! Every count is the estimate below and marked estimated (behaviour 6, decision 2).
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -68,7 +68,7 @@ pub enum Layer {
 }
 
 /// A candidate entry's class; each has its share and its layer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Class {
     Code,
@@ -77,7 +77,7 @@ pub enum Class {
 }
 
 /// What an entry is: plain, or recalled from project memory (labelled as experience).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
     Plain,
@@ -636,6 +636,8 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
+mod record;
+pub use record::{Contract, Object, Recorded, record, repack};
 mod turn;
 pub use turn::{CONTEXT_V1, Facts, Params, lead, mandatory};
 

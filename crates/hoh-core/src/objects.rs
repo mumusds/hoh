@@ -145,6 +145,18 @@ pub fn get(project: &Path, sha256: &str) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+/// Repacks the prompt whose manifest is the object `manifest_sha256` in the project at `project`, from its objects only
+/// and under this binary's resource bundle version (docs/adr/ADR-026.md decision 7): a damaged object fails it.
+pub fn repack(project: &Path, manifest_sha256: &str) -> Result<crate::context::Packed, String> {
+    let manifest = get(project, manifest_sha256)?;
+    crate::context::repack(&manifest, &resource_bundle_version(), &|sha| get(project, sha))
+}
+
+/// The project-relative path of the object named `sha256` (what `artifacts` rows and references name).
+pub fn relative_path(sha256: &str) -> String {
+    format!(".hoh/objects/sha256/{}/{sha256}", &sha256[..2.min(sha256.len())])
+}
+
 /// `<crate version>+<digest of every resource>`: the same binary gives the same version, and a binary whose
 /// resources differ in any byte gives another.
 pub fn resource_bundle_version() -> String {
