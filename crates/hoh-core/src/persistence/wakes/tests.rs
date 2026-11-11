@@ -3406,3 +3406,69 @@ async fn a_disposal_job_leaves_the_outputs_of_a_turn_its_step_did_not_see_settle
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn a_turn_reconciled_to_an_unknown_effect_has_ended_and_its_wake_is_rearmed() -> R {
+    // Decision 3 (other endings; found by the developer's audit after round 3): a supervision turn whose host died with
+    // its work begun is reconciled to UNKNOWN_EFFECT; that ends the turn (no answer was recorded), so its wake is
+    // rearmed (a failure) and given another turn, and the run's supervision goes on.
+    use crate::reconcile::{Disposition, Process};
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    let w = wake(&store, &clock, "R", "D", "fp", 0).await?;
+    let a = store
+        .allocate_supervision("p1", context(&clock, 3000))
+        .await?
+        .ok_or("allocated")?;
+    let notice = store
+        .runner_waiting("p1")
+        .await?
+        .dispatches
+        .into_iter()
+        .find(|d| d.attempt_id == a.attempt_id)
+        .ok_or("no dispatch")?;
+    assert!(store.runner_received(notice, t(3000)).await?);
+    assert!(
+        store
+            .runner_running(
+                &a.attempt_id,
+                crate::persistence::AttemptFacts {
+                    pid: Some(4242),
+                    ..Default::default()
+                },
+                json!({"kind": "proc"}),
+            )
+            .await?
+    );
+    let rows = store.reconcile_scan("p1", t(3000 + 3_600_000)).await?;
+    let row = rows
+        .into_iter()
+        .find(|r| r.attempt_id == a.attempt_id)
+        .ok_or("the turn is unfinished")?;
+    store
+        .reconcile_apply(
+            row,
+            Disposition::UnknownEffect {
+                effects: Vec::new(),
+                unknown: vec![crate::reconcile::work_key(&a.attempt_id)],
+            },
+            Process::Gone {
+                basis: "no_process".to_owned(),
+            },
+            "reconcile",
+            t(3000 + 3_600_000),
+            0,
+        )
+        .await?;
+    let ms = 3000 + 3_600_000 + 10_000;
+    store.supervise("R", context(&clock, ms)).await?;
+    let next = store
+        .allocate_supervision("p1", context(&clock, ms))
+        .await?
+        .ok_or("the wake is given another turn")?;
+    assert_eq!(next.wake, w);
+    assert_eq!(rearms(&path)?[0]["reason"], json!("failure"));
+    Ok(())
+}
