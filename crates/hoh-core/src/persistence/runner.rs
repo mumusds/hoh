@@ -206,6 +206,8 @@ pub struct Observed {
     /// Its raw logs that could not be kept or even read (`{name, error}`), recorded with the others so a missing
     /// reference is never silent (M2T09R-01).
     pub artifacts_failed: Vec<Value>,
+    /// Its final assistant message, where a verifier's report block is read (docs/adr/ADR-028.md decision 15).
+    pub final_text: Option<String>,
 }
 
 /// Where a turn's prompt came from and what was sent (decision 11, AC-018-05): a `prompt_revisions` row (the role

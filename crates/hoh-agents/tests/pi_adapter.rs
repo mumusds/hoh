@@ -1420,6 +1420,8 @@ async fn pi_runner_mode_runs_the_turn_after_its_gate_without_store_writes() -> R
     held.open.send(()).map_err(|()| "gate closed")?;
     let facts = tokio::time::timeout(Duration::from_secs(30), held.ended).await??;
     assert_eq!(facts.state, AttemptState::Settled, "{facts:?}");
+    // Its final assistant message, where a verifier's report block is read (docs/adr/ADR-028.md decision 15).
+    assert_eq!(facts.final_text.as_deref(), Some("HOH_SAMPLE_OK"));
     assert_eq!(
         facts.native_session.as_deref(),
         Some(turn.launch.session_id.as_str())

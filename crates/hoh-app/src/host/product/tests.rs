@@ -319,8 +319,14 @@ fn a_turns_facts_become_its_outcome() {
             },
         ],
         degraded: Some("initialize timed out".to_owned()),
+        final_text: Some("done\n```hoh-report\n{}\n```".to_owned()),
     };
     let o = outcome(facts);
+    // Its final assistant message, where a verifier's report is read (docs/adr/ADR-028.md decision 15).
+    assert_eq!(
+        o.observed.final_text.as_deref(),
+        Some("done\n```hoh-report\n{}\n```")
+    );
     assert!(!o.success);
     assert_eq!(o.detail, "PROTOCOL_FRAME_TOO_LARGE");
     assert!(o.group_gone);

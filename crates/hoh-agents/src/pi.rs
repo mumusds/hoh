@@ -616,6 +616,7 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
                 group_reaped: driven.report.as_ref().is_some_and(|r| r.group_reaped),
                 recorded: sink.recorded,
                 degraded: None,
+                final_text: driven.reply,
             },
             Err(_) => Facts::incomplete(raw_log_path, sink.recorded),
         }

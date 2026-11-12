@@ -653,6 +653,7 @@ async fn an_ending_records_what_the_agents_turn_showed() -> R {
                     messages_truncated: false,
                     artifacts: Vec::new(),
                     artifacts_failed: Vec::new(),
+                    final_text: None,
                 },
                 unknown_effect: false,
             },

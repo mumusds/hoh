@@ -713,6 +713,7 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
                     group_reaped: driven.report.as_ref().is_some_and(|r| r.group_reaped),
                     recorded: driven.recorded,
                     degraded: None,
+                    final_text: driven.reply,
                 },
                 Ok(app_server::Drove::Degrade(reason, report)) => Facts {
                     failure: Some("CAPABILITY_UNSUPPORTED".to_owned()),
@@ -757,6 +758,7 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
                 group_reaped: driven.report.as_ref().is_some_and(|r| r.group_reaped),
                 recorded,
                 degraded: None,
+                final_text: driven.reply,
             },
             Err(_) => Facts::incomplete(raw_log_path, recorded),
         }

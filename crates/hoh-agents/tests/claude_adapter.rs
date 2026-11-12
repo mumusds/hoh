@@ -1239,6 +1239,8 @@ async fn claude_runner_mode_runs_nothing_before_its_gate_and_reports_facts_witho
     assert_eq!(facts.state, AttemptState::Settled, "{facts:?}");
     assert_eq!(facts.failure, None);
     assert_eq!(facts.native_session.as_deref(), Some("sid-1"));
+    // Its final assistant message, where a verifier's report block is read (docs/adr/ADR-028.md decision 15).
+    assert_eq!(facts.final_text.as_deref(), Some("ok"));
     assert_eq!(facts.resolved_model.as_deref(), Some("m"));
     assert!(facts.group_reaped, "{facts:?}");
     assert_eq!(

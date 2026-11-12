@@ -2202,6 +2202,8 @@ async fn codex_runner_mode_runs_the_app_server_turn_after_its_gate_without_store
     let facts = tokio::time::timeout(Duration::from_secs(30), held.ended).await??;
     assert_eq!(facts.state, AttemptState::Settled, "{facts:?}");
     assert_eq!(facts.degraded, None);
+    // Its final assistant message, where a verifier's report block is read (docs/adr/ADR-028.md decision 15).
+    assert_eq!(facts.final_text.as_deref(), Some("HOH_SAMPLE_OK"));
     let thread = facts.native_session.clone().ok_or("no thread")?;
     assert!(
         facts
