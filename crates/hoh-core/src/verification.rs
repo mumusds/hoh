@@ -1029,6 +1029,7 @@ pub fn rows(e: &Evidence, outcome: &Outcome, acs: &[AcSpec], check: bool) -> Vec
 }
 
 pub mod classify;
+pub mod report;
 
 /// An Issue's fingerprint, the same for every candidate (REQ-054 decision 2): sha256 of its severity and its text with
 /// its whitespace collapsed and lowercased, joined by a line feed.
