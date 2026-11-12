@@ -72,10 +72,12 @@ fn repository() -> R<tempfile::TempDir> {
     let dir = tempfile::tempdir()?;
     let root = dir.path();
     git(root, &["init", "-q"])?;
+    // The layout's inputs where the freeze takes them (`inputs()`), and a source of the project's own.
+    let layout = inputs();
     for (path, text) in [
-        ("src/lib.rs", "pub fn a() {}\n"),
-        ("contracts/requirements.json", "{\"requirements\": []}\n"),
-        ("tests/check-plan.json", "{\"checks\": {}}\n"),
+        (Path::new("src/work.rs"), "pub fn a() {}\n"),
+        (layout.spec.as_path(), "{\"requirements\": []}\n"),
+        (layout.test_plan.as_path(), "{\"checks\": {}}\n"),
     ] {
         let file = root.join(path);
         std::fs::create_dir_all(file.parent().ok_or("no parent")?)?;
@@ -177,9 +179,9 @@ fn a_completed_result_is_frozen_from_the_clean_workspace_with_the_layouts_inputs
             manifest.test_plan.path.as_str()
         ),
         (
-            "contracts/requirements.json",
+            inputs().spec.to_string_lossy().as_ref(),
             ".hoh/environment.json",
-            "tests/check-plan.json"
+            inputs().test_plan.to_string_lossy().as_ref()
         )
     );
     assert!(dir.path().join(".hoh/environment.json").is_file());
@@ -191,11 +193,11 @@ fn a_workspace_that_cannot_be_frozen_is_corrected_and_one_the_host_cannot_read_i
     // A change left uncommitted: the freeze refuses it, the agent's to correct. No git work tree at all: the host
     // cannot prepare it, not the agent's fault, so nothing is counted against it.
     let dir = repository()?;
-    std::fs::write(dir.path().join("src/lib.rs"), "pub fn changed() {}\n")?;
+    std::fs::write(dir.path().join("src/work.rs"), "pub fn changed() {}\n")?;
     let mut ending = ending(&[line("COMPLETED", json!({}))], false);
     let got = reasons(&outcome(dir.path(), &identity(), &mut ending));
     assert!(
-        got.starts_with("correct: its freeze was refused: src/lib.rs is not committed"),
+        got.starts_with("correct: its freeze was refused: src/work.rs is not committed"),
         "{got}"
     );
     let plain = tempfile::tempdir()?;
@@ -232,8 +234,8 @@ fn a_completed_results_self_test_records_are_kept_by_their_digests_the_rest_refu
         item(".hoh/self-tests/A/stale.txt"),
         item(".hoh/self-tests/A/missing.txt"),
         item("/etc/passwd"),
-        item(".hoh/self-tests/A/../../../src/lib.rs"),
-        item("src/lib.rs"),
+        item(".hoh/self-tests/A/../../../src/work.rs"),
+        item("src/work.rs"),
         item(".hoh/self-tests/A/link.txt"),
         item(".hoh/self-tests/B/report.txt"),
     ]);
@@ -272,11 +274,65 @@ fn a_completed_results_self_test_records_are_kept_by_their_digests_the_rest_refu
         rejected,
         [
             "/etc/passwd",
-            ".hoh/self-tests/A/../../../src/lib.rs",
-            "src/lib.rs",
+            ".hoh/self-tests/A/../../../src/work.rs",
+            "src/work.rs",
             ".hoh/self-tests/A/link.txt",
             ".hoh/self-tests/B/report.txt"
         ]
     );
+    Ok(())
+}
+
+#[test]
+fn a_verifiers_report_takes_its_session_log_whatever_its_agent_names_it() -> R {
+    // docs/adr/ADR-028.md decision 15 (M2T16R-50): the report's raw session is the turn's stdout log, which claude and
+    // pi name stdout.jsonl and codex app-server.stdout.jsonl or exec.stdout.jsonl; each settles with that log, never
+    // its stderr log.
+    let dir = tempfile::tempdir()?;
+    for name in [
+        "stdout.jsonl",
+        "app-server.stdout.jsonl",
+        "exec.stdout.jsonl",
+    ] {
+        let identity = Identity {
+            role: "reviewer".to_owned(),
+            ..identity()
+        };
+        let mut ending = ending(&[line("COMPLETED", json!({"role": "reviewer"}))], false);
+        ending.observed.final_text = Some(
+            "done\n```hoh-report\n{\"role\": \"reviewer\", \"status\": \"PASS\", \"scope\": [\"AC-1-01\"], \"findings\": []}\n```\n"
+                .to_owned(),
+        );
+        let log = |n: &str, sha: char| ArtifactRow {
+            sha256: sha.to_string().repeat(64),
+            path: format!(
+                ".hoh/objects/sha256/{0}{0}/{1}",
+                sha,
+                sha.to_string().repeat(64)
+            ),
+            bytes: 1,
+            mime: "application/x-ndjson".to_owned(),
+            kind: "raw_log".to_owned(),
+            name: n.to_owned(),
+        };
+        ending.observed.artifacts = vec![log("stderr.log", 'e'), log(name, 'a')];
+        let reporting = Reporting {
+            project: dir.path().to_owned(),
+            role: "reviewer".to_owned(),
+            session_id: "s-r".to_owned(),
+            candidate_id: format!("CAND-{}", "c".repeat(64)),
+            spec_sha256: "1".repeat(64),
+        };
+        match verifier_outcome(&identity, &mut ending, Some(&reporting)) {
+            VerifierOutcome::Settle { report } => {
+                let kept: serde_json::Value = serde_json::from_slice(&hoh_core::objects::get(
+                    dir.path(),
+                    &report.report.sha256,
+                )?)?;
+                assert_eq!(kept["raw_session"]["sha256"], "a".repeat(64), "{name}");
+            }
+            other => return Err(format!("{name}: {other:?}").into()),
+        }
+    }
     Ok(())
 }

@@ -1680,7 +1680,8 @@ fn restore(
         Err(_) => {
             let bytes = serde_json::to_vec_pretty(&facts.record).map_err(|e| io(e.to_string()))?;
             if &hoh_core::objects::put(project, &bytes).map_err(io)? != sha {
-                return Err(io(format!(
+                // Trying again cannot give its bytes back: permanent (decision 11, M2T16R-62).
+                return Err(CheckError::Damaged(format!(
                     "{}: the record object {sha} is lost and the record does not give its bytes",
                     record_dir.display()
                 )));
@@ -1696,7 +1697,7 @@ fn restore(
         _ => {
             let published = hoh_core::objects::read_regular(&execution).map_err(io)?;
             if published != record_bytes {
-                return Err(io(format!(
+                return Err(CheckError::Damaged(format!(
                     "{}: the record file is not the record {sha} its evidence names",
                     execution.display()
                 )));

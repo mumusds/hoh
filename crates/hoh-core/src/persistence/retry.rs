@@ -100,7 +100,13 @@ pub(super) fn fail_task(
         )
         .map_err(sqlite_error)?;
     let failures = u32::try_from(count.saturating_add(1)).unwrap_or(u32::MAX);
-    let after = crate::retry::after_failure(failure.class, failures, failure.at, failure.draw);
+    // A refused repair standing: the attempt's end is never a retry, the task waits for the decision
+    // (docs/adr/ADR-028.md decision 12, M2T16R-02).
+    let after = if super::verification::refused(tx, task.run_id)?.contains(task.task_id) {
+        AfterFailure::Blocked(crate::protocol::BlockedReason::NeedDecision)
+    } else {
+        crate::retry::after_failure(failure.class, failures, failure.at, failure.draw)
+    };
     let mut events = Vec::new();
     let (to, next, reason) = match after {
         AfterFailure::Retry {

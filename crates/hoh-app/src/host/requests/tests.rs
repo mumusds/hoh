@@ -6,6 +6,23 @@ use std::time::{Duration, Instant};
 
 type R<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
+/// `make()`'s command spawned, again while the kernel says the helper just written is busy: another test's child,
+/// forked while the helper was open for writing, holds it until that child execs (ETXTBSY; the product's agent runs a
+/// helper long after it was written).
+fn spawned(make: impl Fn() -> Command) -> R<std::process::Child> {
+    let end = Instant::now() + Duration::from_secs(10);
+    loop {
+        match make().spawn() {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::ExecutableFileBusy && Instant::now() < end =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            other => return Ok(other?),
+        }
+    }
+}
+
 /// Wait for request `n` and answer it with `answer`; the request.
 fn serve(helpers: &Helpers, n: u64, answer: &Value) -> R<Value> {
     let end = Instant::now() + Duration::from_secs(20);
@@ -32,10 +49,11 @@ fn run_check_asks_for_its_check_and_ends_with_its_exit_code() -> R {
             .run_check
             .starts_with(dir.path().join(".hoh/attempts"))
     );
-    let first = Command::new(&helpers.run_check)
-        .arg("unit")
-        .stdout(Stdio::piped())
-        .spawn()?;
+    let first = spawned(|| {
+        let mut c = Command::new(&helpers.run_check);
+        c.arg("unit").stdout(Stdio::piped());
+        c
+    })?;
     let request = serve(
         &helpers,
         1,
@@ -45,16 +63,23 @@ fn run_check_asks_for_its_check_and_ends_with_its_exit_code() -> R {
     let out = first.wait_with_output()?;
     assert_eq!(out.status.code(), Some(3));
     assert!(String::from_utf8(out.stdout)?.contains("\"outcome\":\"FAIL\""));
-    let second = Command::new(&helpers.run_check).arg("lint").spawn()?;
+    let second = spawned(|| {
+        let mut c = Command::new(&helpers.run_check);
+        c.arg("lint");
+        c
+    })?;
     serve(
         &helpers,
         2,
         &json!({"status": "refused", "reasons": ["worktree dirty: x"]}),
     )?;
     assert_eq!(second.wait_with_output()?.status.code(), Some(2));
-    let bad = Command::new(&helpers.run_check)
-        .arg("a b; rm -rf /")
-        .output()?;
+    let bad = spawned(|| {
+        let mut c = Command::new(&helpers.run_check);
+        c.arg("a b; rm -rf /").stdout(Stdio::piped());
+        c
+    })?
+    .wait_with_output()?;
     assert_eq!(bad.status.code(), Some(2));
     assert!(next(&helpers, 3).is_none(), "nothing was asked");
     Ok(())
@@ -66,10 +91,11 @@ fn ask_sends_its_message_file_and_prints_the_answer() -> R {
     let helpers = write_helpers(dir.path(), "A", 600)?;
     let message = dir.path().join("m.json");
     std::fs::write(&message, "{\"message_id\": \"m1\", \"kind\": \"steer\"}")?;
-    let ask = Command::new(&helpers.ask)
-        .arg(&message)
-        .stdout(Stdio::piped())
-        .spawn()?;
+    let ask = spawned(|| {
+        let mut c = Command::new(&helpers.ask);
+        c.arg(&message).stdout(Stdio::piped());
+        c
+    })?;
     let request = serve(&helpers, 1, &json!({"status": "deferred"}))?;
     assert_eq!(
         request,

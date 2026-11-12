@@ -49,24 +49,35 @@ pub(super) async fn prepare(
     let (project, held) = (project.to_owned(), dir.clone());
     let candidate = candidate_id.clone();
     let prepared = tokio::task::spawn_blocking(move || {
-        // Only a candidate under verification is verified (decision 10, M2T16D-253).
+        // Only a candidate under verification is verified (decision 10, M2T16D-253): one that no longer is ends its
+        // attempt for the reconcile to cancel its task, never for a decision (M2T16R-55).
         let state = reader
             .candidate(&candidate)
             .map_err(|e| Unprepared::Io(e.to_string()))?
             .map(|row| row.state);
         if state.as_deref() != Some("VERIFYING") {
-            return Err(Unprepared::Refused(vec![format!(
+            return Ok(Err(format!(
                 "candidate {candidate} is {}, not VERIFYING",
                 state.as_deref().unwrap_or("not frozen here")
-            )]));
+            )));
         }
         let (sealed, _) = rundir::sealed_of(&reader, &project, &candidate)
             .map_err(|e| Unprepared::Refused(vec![e]))?;
         let pre_tree = rundir::prepare(&project, &held, &sealed)?;
-        Ok::<_, Unprepared>((sealed, pre_tree))
+        Ok::<_, Unprepared>(Ok((sealed, pre_tree)))
     })
     .await
     .map_err(|e| PersistError::Storage(format!("the run directory's preparation ended: {e}")))?;
+    let prepared = match prepared {
+        Ok(Err(not_verifying)) => {
+            return Ok(Err((
+                FailureClass::Transient { retry_after: None },
+                format!("RUN_DIR_REFUSED: {not_verifying}"),
+            )));
+        }
+        Ok(Ok(ready)) => Ok(ready),
+        Err(e) => Err(e),
+    };
     Ok(match prepared {
         Ok((sealed, pre_tree)) => Ok(Verifier {
             dir,
@@ -76,7 +87,7 @@ pub(super) async fn prepare(
             check_id: rundir::check_of(role),
         }),
         Err(e) => {
-            rundir::remove(&dir);
+            rundir::remove_off_thread(dir.clone()).await;
             let class = match e {
                 Unprepared::Refused(_) => FailureClass::Decision,
                 Unprepared::Io(_) => FailureClass::Transient { retry_after: None },

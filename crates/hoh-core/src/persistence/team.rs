@@ -791,6 +791,9 @@ pub struct SessionGrant {
 /// for the prompt's header.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Assignment {
+    /// The store's event watermark when this assignment (and its context) was read: an event after it was not seen
+    /// by the turn's prompt (docs/adr/ADR-028.md decision 3, M2T16R-01).
+    pub context_seq: i64,
     pub agent: Option<String>,
     pub model: Option<String>,
     pub role_epoch: i64,
@@ -832,6 +835,11 @@ pub(super) fn assignment(
     attempt_id: &str,
     role: &str,
 ) -> Result<Assignment, PersistError> {
+    // The watermark first: whatever the reads below see is at or after it, so an event past it may have been missed
+    // and is treated as unseen (docs/adr/ADR-028.md decision 3, M2T16R-01).
+    let context_seq: i64 = conn
+        .query_row("SELECT coalesce(max(seq), 0) FROM events", [], |r| r.get(0))
+        .map_err(sqlite_error)?;
     let row: Option<Assignment> = conn
         .query_row(
             "SELECT a.agent, b.model, a.role_epoch, a.config_revision, a.session_id, \
@@ -852,6 +860,7 @@ pub(super) fn assignment(
             params![attempt_id, run_id, task_id, role],
             |r| {
                 Ok(Assignment {
+                    context_seq,
                     agent: r.get(0)?,
                     model: r.get(1)?,
                     role_epoch: r.get(2)?,
@@ -873,7 +882,10 @@ pub(super) fn assignment(
         .optional()
         .map_err(sqlite_error)?;
     let Some(mut assignment) = row else {
-        return Ok(Assignment::default());
+        return Ok(Assignment {
+            context_seq,
+            ..Assignment::default()
+        });
     };
     assignment.prompt = at_revision(conn, project_id, assignment.config_revision)?
         .and_then(|config| config.team.get(role).and_then(|r| r.prompt.clone()));
@@ -892,7 +904,13 @@ pub(super) fn assignment(
     }
     assignment.context = Some(match &assignment.handoff {
         Some(handoff) => {
-            super::context::verification(conn, &handoff.package, &handoff.source_task_ids)?
+            let mut facts =
+                super::context::verification(conn, &handoff.package, &handoff.source_task_ids)?;
+            // A verifier's own previous attempt's correction or verify-again, with its reasons (M2T16R-07).
+            facts
+                .scope
+                .extend(super::context::corrections(conn, task_id, attempt_id)?);
+            facts
         }
         None => super::context::facts(
             conn,

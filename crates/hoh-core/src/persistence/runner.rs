@@ -624,6 +624,63 @@ fn received(
         return Ok(false);
     }
     let now = crate::time::rfc3339_utc(at);
+    // A refused repair standing holds its task whatever dispatched it (docs/adr/ADR-028.md decision 12, M2T16R-02):
+    // nothing starts; the attempt ends CANCELLED (nothing counted), its lease with it, and the task waits BLOCKED for
+    // the decision.
+    if super::verification::refused(&tx, &notice.run_id)?.contains(&notice.task_id) {
+        tx.execute(
+            "INSERT INTO receipts(consumer, message_id, applied_at, result_json) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                RUNNER,
+                notice.message_id,
+                now,
+                json!({"refused": notice.attempt_id, "reason": "repair_refused"}).to_string()
+            ],
+        )
+        .map_err(sqlite_error)?;
+        attempts::move_attempt(
+            &tx,
+            &AttemptMove {
+                attempt_id: notice.attempt_id.clone(),
+                from: AttemptState::Prepared,
+                to: AttemptState::Cancelled,
+                facts: AttemptFacts {
+                    ended_at: Some(now.clone()),
+                    failure_reason: Some("REPAIR_REFUSED".to_owned()),
+                    ..AttemptFacts::default()
+                },
+            },
+            ctx,
+        )?;
+        let (task_id, task_state, revision, run_id, project_id) = task_of(&tx, &notice.attempt_id)?;
+        let mut commit = Commit {
+            events: vec![event(
+                &project_id,
+                &run_id,
+                child_id(&notice.attempt_id, "refused"),
+                "runner.refused",
+                json!({"attempt_id": notice.attempt_id, "task_id": task_id, "reason": "repair_refused",
+                    "detail": "a refused repair of this task waits for a decision"}),
+            )],
+            ..Commit::default()
+        };
+        if matches!(task_state, TaskState::Leased | TaskState::Running) {
+            tx.execute(
+                "UPDATE tasks SET blocked_reason = 'NEED_DECISION', next_retry_at = NULL WHERE task_id = ?1",
+                params![task_id],
+            )
+            .map_err(sqlite_error)?;
+            commit.cas.push(StateCas {
+                id: task_id,
+                expected_revision: revision,
+                change: Change::Task(TaskState::Blocked),
+            });
+        }
+        writer::write(&tx, &commit, ctx)?;
+        ctx.before_commit()?;
+        tx.commit().map_err(sqlite_error)?;
+        return Ok(false);
+    }
     tx.execute(
         "INSERT INTO receipts(consumer, message_id, applied_at, result_json) VALUES (?1, ?2, ?3, ?4)",
         params![

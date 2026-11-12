@@ -234,7 +234,9 @@ fn report_of(
         .observed
         .artifacts
         .iter()
-        .find(|a| a.kind.starts_with("raw_log") && a.name.starts_with("stdout"))
+        // The turn's stdout log, as each adapter names it: `stdout.jsonl` (claude, pi), `app-server.stdout.jsonl` or
+        // `exec.stdout.jsonl` (codex) (M2T16R-50).
+        .find(|a| a.kind.starts_with("raw_log") && a.name.ends_with("stdout.jsonl"))
         .ok_or("its raw session log was not kept")?;
     let mut sessions = vec![r.session_id.clone()];
     sessions.extend(ending.observed.native_session.clone());
@@ -273,6 +275,12 @@ fn report_of(
     Ok(hoh_core::persistence::VerifierReport {
         role: r.role.clone(),
         status: built["status"].as_str().unwrap_or_default().to_owned(),
+        findings: built["findings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|f| f["summary"].as_str().map(str::to_owned))
+            .collect(),
         report: keep(&built, "independent_report", "independent-report.json")?,
         native_attempt: native,
     })

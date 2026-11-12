@@ -1362,6 +1362,14 @@ async fn a_developers_completed_result_is_frozen_accepted_and_settled_in_one_com
             )?,
             git(&project, &["rev-parse", "HEAD"])?.trim()
         );
+        // With the watermark of the context its prompt was packed from (M2T16R-01).
+        assert_eq!(
+            state(
+                "SELECT typeof(json_extract(payload_json, '$.context_seq')) FROM events \
+                 WHERE kind = 'attempt.workspace_start' AND json_extract(payload_json, '$.attempt_id') = 'T-RESULT/attempt-1'"
+            )?,
+            "integer"
+        );
         // The round's verifier tasks are dispatched by the Runtime (decision 10); each attempt's start delivers its
         // handoff in its RUNNING commit: the message ACKED, a handoffs row DELIVERED whose package object is the
         // message's package (decision 9).

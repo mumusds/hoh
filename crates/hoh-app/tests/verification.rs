@@ -1718,8 +1718,9 @@ async fn a_record_file_that_is_not_the_record_it_names_holds_back_its_candidate(
     std::fs::remove_file(&execution)?;
     std::fs::write(&execution, serde_json::to_vec_pretty(&record)?)?;
     let held = hoh_app::verify::check::reconcile(&f.store.evidence_handle(), &f.state(), &c).await;
+    // Trying again cannot make it the record: a permanent fault (docs/adr/ADR-028.md decision 11, M2T16R-62).
     assert!(
-        matches!(&held, Err(CheckError::Io(why)) if why.contains("execution.json")),
+        matches!(&held, Err(CheckError::Damaged(why)) if why.contains("execution.json")),
         "{held:?}"
     );
     std::fs::remove_file(&execution)?;
