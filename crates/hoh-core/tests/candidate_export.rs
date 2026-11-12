@@ -61,6 +61,8 @@ fn a_product_export_is_a_valid_candidate_with_the_identity_the_bootstrap_tool_co
 }
 
 /// Whether the locked schema `schema` (under contracts/) accepts `value`, by Python's jsonschema: stderr when not.
+/// An error, not a refusal, when that jsonschema cannot check `date-time` (installed without the format extras that
+/// requirements-dev.txt names): it would accept any string there and a negative case would pass for the wrong reason.
 fn python_validates(
     schema: &str,
     value: &serde_json::Value,
@@ -71,16 +73,20 @@ fn python_validates(
     std::fs::write(&path, value.to_string())?;
     let script = "import json,sys\n\
         import jsonschema\n\
+        if 'date-time' not in jsonschema.FormatChecker().checkers:\n    \
+            sys.stderr.write('jsonschema cannot check date-time: install requirements-dev.txt')\n    \
+            sys.exit(3)\n\
         schema = json.load(open(sys.argv[1] + '/contracts/' + sys.argv[2]))\n\
         jsonschema.validate(json.load(open(sys.argv[3])), schema, format_checker=jsonschema.FormatChecker())\n";
     let out = Command::new("python3")
         .args(["-I", "-c", script, root, schema])
         .arg(&path)
         .output()?;
-    Ok(if out.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&out.stderr).into_owned())
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    Ok(match out.status.code() {
+        Some(0) => Ok(()),
+        Some(3) => return Err(stderr.into()),
+        _ => Err(stderr),
     })
 }
 

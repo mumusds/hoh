@@ -757,8 +757,10 @@ async fn test_052_02_a_check_that_changes_the_source_is_invalid_even_when_it_exi
         (Some(0), Some(true))
     );
     // The record the product wrote is valid under the locked execution.schema.json (docs/adr/ADR-027.md decision 8,
-    // M2T10D-255), by Python's jsonschema.
+    // M2T10D-255), by Python's jsonschema, which must be able to check date-time (requirements-dev.txt's extras).
     let script = "import json,sys\nimport jsonschema\n\
+        if 'date-time' not in jsonschema.FormatChecker().checkers:\n    \
+            sys.exit('jsonschema cannot check date-time: install requirements-dev.txt')\n\
         schema = json.load(open(sys.argv[1] + '/contracts/execution.schema.json'))\n\
         jsonschema.validate(json.load(open(sys.argv[2])), schema, format_checker=jsonschema.FormatChecker())\n";
     let out = Command::new("python3")
