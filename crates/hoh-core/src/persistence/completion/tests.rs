@@ -452,3 +452,38 @@ async fn a_cancelled_attempt_is_neither_frozen_nor_judged_its_cancel_takes_prece
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn only_a_completion_handed_to_verification_records_its_task_implemented() -> R {
+    // ADR-025 decision 3's shared rule (task.implemented, on which intensive supervision wakes) under ADR-028 decision
+    // 3: a writer's settle that sends its task back for a correction or blocks it for a decision implemented nothing.
+    let implemented = |path: &Path| -> R<usize> {
+        Ok(texts(
+            path,
+            "SELECT event_id FROM events WHERE kind = 'task.implemented'",
+        )?
+        .len())
+    };
+    for (outcome, want) in [
+        (freeze(freeze_of('b'), result(None)?), 1),
+        (
+            WriterOutcome::Correct {
+                reasons: vec!["no TaskResult".to_owned()],
+            },
+            0,
+        ),
+        (
+            WriterOutcome::Decide {
+                reason: "agent_incomplete".to_owned(),
+                detail: "{}".to_owned(),
+            },
+            0,
+        ),
+    ] {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = open(dir.path())?;
+        let done = store.complete_writer_attempt(completion(outcome)).await?;
+        assert_eq!(implemented(&path)?, want, "{done:?}");
+    }
+    Ok(())
+}
