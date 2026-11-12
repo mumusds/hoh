@@ -1055,3 +1055,91 @@ async fn a_verifiers_request_to_change_the_candidate_is_refused_with_an_issue_an
     assert_eq!(texts(&path, "SELECT issue_id FROM issues")?.len(), 2);
     Ok(())
 }
+
+#[tokio::test]
+async fn a_writer_whose_criteria_an_open_round_with_an_open_issue_covers_waits_for_the_round_to_close()
+-> R {
+    // docs/adr/ADR-028.md decision 13 (REQ-037 decision 1, M2T16D-458, -554, -602): C1's round 1 is open with an OPEN
+    // Issue on C1 (a refused change request). Writer W, whose requirement REQ-1 has a criterion of the round, is not
+    // selected by a scheduling round (it stays READY) and a Commander's dispatch of it is ILLEGAL_TRANSITION; writer V,
+    // whose criteria the round does not cover, is dispatched. Once the round is closed, W is dispatched too.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    let round = verifying(&store).await?;
+    let candidate = texts(&path, "SELECT candidate_id FROM candidates")?.remove(0);
+    store
+        .verifier_request(VerifierRequest::RejectChange(ChangeRequest {
+            run_id: "R".to_owned(),
+            attempt_id: crate::ids::child_id(&round, "task/qa/attempt-1"),
+            message_id: "m1".to_owned(),
+            round_id: round.clone(),
+            candidate_id: candidate,
+            severity: "high".to_owned(),
+            text: "change the parser".to_owned(),
+        }))
+        .await?;
+    Connection::open(&path)?.execute_batch(
+        "INSERT INTO requirements(requirement_id, spec_id, title, required_release) VALUES ('REQ-2', 's1', 'r2', 1);
+         INSERT INTO acceptance_criteria(ac_id, requirement_id, spec_id, body, check_id) VALUES
+           ('AC-2-01', 'REQ-2', 's1', 'b2', 'unit');
+         INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq) VALUES
+           ('W', 'R', 's1', 'READY', 1, 'developer', 1, 10), ('V', 'R', 's1', 'READY', 1, 'developer', 1, 11);
+         INSERT INTO task_requirements(task_id, requirement_id, spec_id) VALUES ('W', 'REQ-1', 's1'), ('V', 'REQ-2', 's1');
+         UPDATE tasks SET state = 'CANCELLED' WHERE role IN ('qa', 'reviewer');
+         INSERT INTO sessions(session_id, agent, role, agent_version, capabilities_json) VALUES ('sc', 'codex', 'commander', '1', '{}');
+         INSERT INTO role_bindings(run_id, role, agent, session_id, role_epoch, config_revision, bound_at) VALUES
+           ('R', 'commander', 'codex', 'sc', 1, 1, '2026-11-12T00:00:00Z');",
+    )?;
+    let mut context = verifiers();
+    context
+        .required_capabilities
+        .insert("developer".to_owned(), Default::default());
+    let first = store
+        .schedule_round("R", context.clone())
+        .await?
+        .dispatched
+        .ok_or("nothing dispatched")?;
+    assert_eq!(first.task_id, "V");
+    assert_eq!(
+        texts(&path, "SELECT state FROM tasks WHERE task_id = 'W'")?,
+        ["READY"]
+    );
+    // The Commander's dispatch of W (V's lease released first, so only the hold refuses it).
+    Connection::open(&path)?.execute_batch(
+        "UPDATE leases SET expires_at = '2000-01-01T00:00:00Z' WHERE kind = 'writer';
+         UPDATE attempts SET state = 'CANCELLED' WHERE task_id = 'V';
+         UPDATE tasks SET state = 'CANCELLED' WHERE task_id = 'V';",
+    )?;
+    let revision: i64 = Connection::open(&path)?.query_row(
+        "SELECT revision FROM runs WHERE run_id = 'R'",
+        [],
+        |r| r.get(0),
+    )?;
+    let message: crate::protocol::Message = serde_json::from_value(json!({
+        "schema_version": "1.0", "message_id": "d1", "run_id": "R", "task_id": "-", "attempt_id": "-",
+        "sender_role": "commander", "recipient_role": "runtime", "role_epoch": 1, "correlation_id": "c",
+        "causation_id": null, "idempotency_key": "k1", "expected_revision": revision,
+        "spec_sha256": "1".repeat(64), "candidate_id": null, "kind": "decision",
+        "payload": {"kind": "dispatch", "task_id": "W", "role": "developer"}
+    }))?;
+    let proposal =
+        crate::decision::Proposal::from_message(&message).map_err(|e| format!("{e:?}"))?;
+    let decided = store.decide(proposal, context.clone()).await?;
+    let crate::persistence::Decided::Rejected { reason, .. } = decided else {
+        return Err(format!("{decided:?}").into());
+    };
+    assert_eq!(reason, crate::protocol::RejectionReason::IllegalTransition);
+    // The round closed: W is dispatched.
+    Connection::open(&path)?.execute(
+        "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+           ('p1', ?1, 'R', 'verification.round_closed', json_object('round_id', ?2), '2026-11-12T00:00:09Z')",
+        [crate::ids::child_id(&round, "closed"), round.clone()],
+    )?;
+    let next = store
+        .schedule_round("R", context)
+        .await?
+        .dispatched
+        .ok_or("W was not dispatched")?;
+    assert_eq!(next.task_id, "W");
+    Ok(())
+}

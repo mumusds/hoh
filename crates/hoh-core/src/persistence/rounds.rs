@@ -84,6 +84,10 @@ pub(super) fn round(
     let mut rows = candidates(&tx, run_id, run_spec.as_deref(), context)?;
     // A round's verifier tasks are the Runtime's: dispatched on a BLOCKED run too (docs/adr/ADR-028.md decision 10).
     let verifiers = super::verification::verifier_tasks(&tx, run_id)?;
+    // A writer an open round with an open Issue holds is not selected: it stays READY until the round closes
+    // (docs/adr/ADR-028.md decision 13).
+    let held = super::verification::held_by_open_rounds(&tx, run_id)?;
+    rows.retain(|r| !held.contains(&r.candidate.task_id));
     if retries_only {
         rows.retain(|r| {
             r.state == TaskState::Ready && (r.retry || verifiers.contains(&r.candidate.task_id))
@@ -237,6 +241,7 @@ pub(super) fn round(
                 "max_wait_rounds": params.max_wait_rounds,
                 "waited": waited,
                 "promoted": promoted,
+                "held_by_open_round": held,
             }),
         }],
         outbox: vec![NewOutbox {

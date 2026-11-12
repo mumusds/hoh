@@ -785,6 +785,7 @@ fn load_task(
         retry_at: next_retry_at
             .filter(|next| next.as_str() > crate::time::rfc3339_utc(now).as_str()),
         runtime_owned: super::verification::verifier_tasks(tx, run_id)?.contains(task_id),
+        held_by_open_round: super::verification::held_by_open_rounds(tx, run_id)?.contains(task_id),
     }))
 }
 
