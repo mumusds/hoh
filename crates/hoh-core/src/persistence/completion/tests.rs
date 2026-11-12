@@ -2696,3 +2696,107 @@ async fn a_source_whose_sibling_round_rejected_the_candidate_waits_for_the_sibli
     assert_eq!(latest["source_task_ids"], json!(["D", "E"]));
     Ok(())
 }
+
+#[tokio::test]
+async fn a_failure_item_of_a_cancelled_owner_is_abandoned_and_of_one_waiting_for_a_decision_is_appended()
+-> R {
+    // Decision 11 step 2a (M2T16D-653, I6): each item ends exactly once by its owner's state at the close: CANCELLED,
+    // abandoned (verification.failures_abandoned, consumed by "abandoned"); BLOCKED for a decision, appended to that
+    // decision (need_decision.appended, consumed by "decision"); neither counted.
+    for (state, kind, by) in [
+        ("CANCELLED", "verification.failures_abandoned", "abandoned"),
+        ("BLOCKED", "need_decision.appended", "decision"),
+    ] {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = open(dir.path())?;
+        let round = verifying(&store).await?;
+        let candidate = texts(&path, "SELECT candidate_id FROM candidates")?.remove(0);
+        store
+            .verifier_request(VerifierRequest::RejectChange(ChangeRequest {
+                run_id: "R".to_owned(),
+                attempt_id: crate::ids::child_id(&round, "task/qa/attempt-1"),
+                message_id: "m1".to_owned(),
+                round_id: round.clone(),
+                candidate_id: candidate,
+                severity: "high".to_owned(),
+                text: "fix the parser".to_owned(),
+            }))
+            .await?;
+        settle_verifiers(&store, &path, "PASS", "PASS").await?;
+        Connection::open(&path)?.execute(
+            "UPDATE tasks SET state = ?1, blocked_reason = CASE WHEN ?1 = 'BLOCKED' THEN 'NEED_DECISION' END, \
+             revision = revision + 1 WHERE task_id = 'D'",
+            rusqlite::params![state],
+        )?;
+        store
+            .reconcile_verification("R", Default::default())
+            .await?;
+        assert_eq!(
+            texts(
+                &path,
+                &format!(
+                    "SELECT json_extract(payload_json, '$.task_id') FROM events WHERE kind = '{kind}'"
+                )
+            )?,
+            ["D"],
+            "{state}"
+        );
+        assert_eq!(
+            texts(
+                &path,
+                "SELECT json_extract(payload_json, '$.by') FROM events WHERE kind = 'verification.failures_consumed'"
+            )?,
+            [by],
+            "{state}"
+        );
+        assert!(
+            texts(&path, "SELECT kind FROM events WHERE kind = 'repair.local'")?.is_empty(),
+            "{state}: not counted"
+        );
+        assert_eq!(
+            texts(&path, "SELECT state FROM tasks WHERE task_id = 'D'")?,
+            [state],
+            "{state}: not moved"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_blocked_verifier_of_a_superseded_candidate_is_cancelled_and_holds_nothing_up() -> R {
+    // Decision 10 (M2T16D-301, -352): C1's QA waits for a decision (BLOCKED, NEED_DECISION); E's completion supersedes
+    // C1. The reconcile cancels the QA task, its blocked reason and retry time cleared, so it gives the run no reason
+    // to wait; the round closes superseded.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    let round = verifying(&store).await?;
+    let qa = crate::ids::child_id(&round, "task/qa");
+    Connection::open(&path)?.execute(
+        "UPDATE tasks SET state = 'BLOCKED', blocked_reason = 'NEED_DECISION', next_retry_at = '2100-01-01T00:00:00Z', \
+         revision = revision + 1 WHERE task_id = ?1",
+        rusqlite::params![qa],
+    )?;
+    second_writer(&path, "E", "AE")?;
+    store
+        .complete_writer_attempt(WriterCompletion {
+            attempt_id: "AE".to_owned(),
+            ..completion(freeze(freeze_of('c'), result_of("E", "AE")?))
+        })
+        .await?;
+    let done = store
+        .reconcile_verification("R", Default::default())
+        .await?;
+    assert!(done.cancelled.contains(&qa), "{:?}", done.cancelled);
+    assert_eq!(
+        texts(
+            &path,
+            &format!(
+                "SELECT state || ':' || coalesce(blocked_reason, '-') || ':' || coalesce(next_retry_at, '-') \
+                 FROM tasks WHERE task_id = '{qa}'"
+            )
+        )?,
+        ["CANCELLED:-:-"]
+    );
+    assert_eq!(done.closed, [(round, "superseded".to_owned())]);
+    Ok(())
+}

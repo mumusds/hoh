@@ -603,6 +603,19 @@ fn a_reworked_developer_turn_is_given_its_rejected_candidates_failures_open_issu
     )?;
     let before = facts(&conn, "R", "T1", "A1", None)?;
     assert!(before.code.is_none(), "no rework, no code source");
+    // Taken before T1's last completion (its candidate_ready): not this rework's.
+    event(
+        &conn,
+        "consumed-0",
+        "verification.failures_consumed",
+        &json!({"round_id": "CAND-5/round/1", "task_id": "T1", "by": "rework", "items": ["ac:SENTINEL-OLD"]}),
+    )?;
+    event(
+        &conn,
+        "ready-before",
+        "candidate_ready",
+        &json!({"task_id": "T1", "candidate_id": "CAND-6", "attempt_id": "A0"}),
+    )?;
     event(
         &conn,
         "consumed-1",
@@ -610,8 +623,32 @@ fn a_reworked_developer_turn_is_given_its_rejected_candidates_failures_open_issu
         &json!({"round_id": "CAND-6/round/1", "task_id": "T1", "by": "rework",
             "items": ["issue:fp-open", "ac:AC-1-02:SENTINEL-AC"]}),
     )?;
+    // A second round's items, taken before T1's next completion: listed too.
+    event(
+        &conn,
+        "opened-2",
+        "verification.round_opened",
+        &json!({"round_id": "CAND-6/round/2", "candidate_id": "CAND-6", "source_task_ids": ["T1"]}),
+    )?;
+    event(
+        &conn,
+        "consumed-2",
+        "verification.failures_consumed",
+        &json!({"round_id": "CAND-6/round/2", "task_id": "T1", "by": "rework", "items": ["ac:SENTINEL-SECOND"]}),
+    )?;
     let rework = rework(&conn, "T1")?.ok_or("no rework context")?;
     assert_eq!(rework.candidate_id, "CAND-6");
+    assert!(
+        rework.items.iter().any(|i| i.contains("SENTINEL-AC"))
+            && rework.items.iter().any(|i| i.contains("SENTINEL-SECOND")),
+        "{:?}",
+        rework.items
+    );
+    assert!(
+        rework.items.iter().all(|i| !i.contains("SENTINEL-OLD")),
+        "{:?}",
+        rework.items
+    );
     let got = facts(&conn, "R", "T1", "A1", None)?;
     let texts: Vec<&str> = got.entries.iter().map(|e| e.text.as_str()).collect();
     assert!(texts.iter().any(|t| t.contains("SENTINEL-AC")), "{texts:?}");

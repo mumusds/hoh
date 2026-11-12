@@ -717,22 +717,32 @@ pub struct ReworkContext {
     pub base: Option<String>,
 }
 
-/// Task `task_id`'s rework context: from the latest failures a rework or a decision of it took; none if none did.
+/// Task `task_id`'s rework context: from the failures its reworks or decisions took since its last completion, the
+/// latest naming the round and the rejected candidate; none if none did.
 pub(super) fn rework(
     conn: &Connection,
     task_id: &str,
 ) -> Result<Option<ReworkContext>, PersistError> {
-    let taken: Option<String> = conn
-        .query_row(
+    // Every failure its reworks (or decisions) took since its last completion (candidate_ready), oldest first: two
+    // rounds on one candidate may each have given it items; the latest names the rejected candidate.
+    let mut statement = conn
+        .prepare(
             "SELECT payload_json FROM events WHERE kind = 'verification.failures_consumed' \
              AND json_extract(payload_json, '$.task_id') = ?1 \
-             AND json_extract(payload_json, '$.by') IN ('rework', 'decision') ORDER BY seq DESC LIMIT 1",
-            params![task_id],
-            |r| r.get(0),
+             AND json_extract(payload_json, '$.by') IN ('rework', 'decision') \
+             AND seq > coalesce((SELECT max(c.seq) FROM events c WHERE c.kind = 'candidate_ready' \
+               AND json_extract(c.payload_json, '$.task_id') = ?1), 0) ORDER BY seq",
         )
-        .optional()
         .map_err(sqlite_error)?;
-    let Some(taken) = taken.and_then(|t| serde_json::from_str::<Value>(&t).ok()) else {
+    let all: Vec<Value> = statement
+        .query_map(params![task_id], |r| r.get::<_, String>(0))
+        .map_err(sqlite_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sqlite_error)?
+        .iter()
+        .filter_map(|t| serde_json::from_str(t).ok())
+        .collect();
+    let Some(taken) = all.last().cloned() else {
         return Ok(None);
     };
     let round_id = taken["round_id"].as_str().unwrap_or_default().to_owned();
@@ -782,10 +792,9 @@ pub(super) fn rework(
     Ok(Some(ReworkContext {
         round_id,
         git_commit,
-        items: taken["items"]
-            .as_array()
-            .into_iter()
-            .flatten()
+        items: all
+            .iter()
+            .flat_map(|t| t["items"].as_array().cloned().unwrap_or_default())
             .filter_map(|i| i.as_str().map(str::to_owned))
             .collect(),
         issues,
