@@ -126,7 +126,6 @@ fn completion(outcome: WriterOutcome) -> WriterCompletion {
         attempt_id: "A".to_owned(),
         ending: ending(),
         outcome,
-        protocol_limit: 2,
     }
 }
 
