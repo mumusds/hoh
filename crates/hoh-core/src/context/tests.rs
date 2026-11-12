@@ -1042,6 +1042,7 @@ fn a_work_turn_starts_with_its_identity_header_and_a_verifier_also_names_its_sou
             role: "developer".to_owned(),
             role_epoch: 3,
             bridge: "/p/.hoh/attempts/T1-attempt-2/messages.jsonl".to_owned(),
+            self_tests: None,
             verified: None,
         }),
         ..Facts::default()
@@ -1327,5 +1328,123 @@ fn each_built_in_roles_mandatory_items_leave_most_of_the_default_budget() -> R {
         );
     }
     keep("m2t09-mandatory-sizes.json", &Value::Object(measured));
+    Ok(())
+}
+
+#[test]
+fn a_registered_objects_text_is_read_into_a_labelled_bounded_evidence_entry() -> R {
+    // docs/adr/ADR-028.md decision 14: the collector names registered objects; the executor reads them by their
+    // digest only. UTF-8 text up to 8 KiB under its label, the cut marked; anything else only its reference.
+    let label = "开发者自测（diagnostic，仅作诊断，不作验收依据）";
+    let load = |n: &str, sha: &str| Load {
+        path: format!("self-tests/{n}"),
+        sha256: sha.to_owned(),
+        name: n.to_owned(),
+        label: label.to_owned(),
+        relevance: 0,
+    };
+    let mut facts = Facts {
+        loads: vec![
+            load("short.txt", &"a".repeat(64)),
+            load("long.txt", &"b".repeat(64)),
+            load("binary.bin", &"c".repeat(64)),
+            load("lost.txt", &"d".repeat(64)),
+        ],
+        ..Facts::default()
+    };
+    // Multi-byte text across the cut: never split inside a character.
+    let long = format!(
+        "{}ALL TESTS PASSED{}",
+        "测".repeat(1000),
+        "x".repeat(10_000)
+    );
+    facts.resolve_loads(|sha| match sha.as_bytes()[0] {
+        b'a' => Ok(b"ALL TESTS PASSED\n".to_vec()),
+        b'b' => Ok(long.clone().into_bytes()),
+        b'c' => Ok(vec![0xff, 0xfe, 0x00]),
+        _ => Err("gone".to_owned()),
+    });
+    assert!(facts.loads.is_empty(), "every load resolved once");
+    let by = |path: &str| facts.entries.iter().find(|e| e.path == path).cloned();
+    let short = by("self-tests/short.txt").ok_or("short")?;
+    assert_eq!(short.class, Class::Evidence);
+    assert_eq!(short.relevance, 0);
+    assert!(
+        short.text.starts_with(label) && short.text.contains("ALL TESTS PASSED"),
+        "{}",
+        short.text
+    );
+    let cut = by("self-tests/long.txt").ok_or("long")?;
+    let body = cut.text.split_once('\n').map(|(_, b)| b).ok_or("no body")?;
+    assert!(body.len() <= LOAD_BYTES + 200, "{}", body.len());
+    assert!(
+        body.contains("截断") && body.contains(&long.len().to_string()),
+        "the cut is marked"
+    );
+    assert!(
+        cut.text.contains("ALL TESTS PASSED"),
+        "within the first 8 KiB"
+    );
+    assert!(
+        !cut.text.contains(&"x".repeat(LOAD_BYTES)),
+        "never past 8 KiB"
+    );
+    for path in ["self-tests/binary.bin", "self-tests/lost.txt"] {
+        let e = by(path).ok_or(path)?;
+        assert!(
+            e.text.starts_with(label) && e.text.contains("sha256:"),
+            "{}",
+            e.text
+        );
+        assert!(e.text.len() < 400, "only its reference: {}", e.text);
+    }
+    Ok(())
+}
+
+#[test]
+fn a_candidates_changed_files_are_code_entries_by_path_and_the_rest_only_counted() -> R {
+    // docs/adr/ADR-028.md decision 14's code source: the executor reads the files (git), the facts render them as
+    // Code entries in path order; a file only listed says why; more than CODE_FILES are counted, not listed.
+    let mut facts = Facts {
+        code: Some(CodeSource {
+            base: "1".repeat(40),
+            commit: "2".repeat(40),
+        }),
+        ..Facts::default()
+    };
+    let files = vec![
+        CodeFile {
+            path: "src/a.rs".to_owned(),
+            text: Ok("pub fn a() {}\n".to_owned()),
+        },
+        CodeFile {
+            path: "src/big.bin".to_owned(),
+            text: Err("非 UTF-8 或超过 64 KiB".to_owned()),
+        },
+    ];
+    facts.add_code(Ok((files, 60)));
+    assert!(facts.code.is_none(), "added once");
+    let code: Vec<&Entry> = facts
+        .entries
+        .iter()
+        .filter(|e| e.class == Class::Code)
+        .collect();
+    assert_eq!(
+        code.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(),
+        ["code/src/a.rs", "code/src/big.bin", "code/more"]
+    );
+    assert!(code[0].text.contains("src/a.rs") && code[0].text.contains("pub fn a() {}"));
+    assert!(code[1].text.contains("只列路径") && code[1].text.contains("64 KiB"));
+    assert!(code[2].text.contains("58"), "{}", code[2].text);
+    let mut failed = Facts {
+        code: Some(CodeSource {
+            base: "1".repeat(40),
+            commit: "2".repeat(40),
+        }),
+        ..Facts::default()
+    };
+    failed.add_code(Err("git diff: no such commit".to_owned()));
+    assert_eq!(failed.entries.len(), 1);
+    assert!(failed.entries[0].text.contains("no such commit"));
     Ok(())
 }

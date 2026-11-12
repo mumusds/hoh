@@ -49,7 +49,7 @@ fn reasons(outcome: &WriterOutcome) -> String {
     match outcome {
         WriterOutcome::Correct { reasons } => format!("correct: {}", reasons.join("; ")),
         WriterOutcome::Decide { reason, detail } => format!("decide {reason}: {detail}"),
-        WriterOutcome::Freeze { job, result } => {
+        WriterOutcome::Freeze { job, result, .. } => {
             format!("freeze {} for {:?}", job.sealed.candidate_id, result.status)
         }
     }
@@ -163,7 +163,7 @@ fn a_completed_result_is_frozen_from_the_clean_workspace_with_the_layouts_inputs
     // committed workspace, the specification and test plan where the layout puts them.
     let dir = repository()?;
     let mut ending = ending(&[line("COMPLETED", json!({}))], false);
-    let WriterOutcome::Freeze { job, result } = outcome(dir.path(), &identity(), &mut ending)
+    let WriterOutcome::Freeze { job, result, .. } = outcome(dir.path(), &identity(), &mut ending)
     else {
         return Err("not a freeze".into());
     };
@@ -201,5 +201,82 @@ fn a_workspace_that_cannot_be_frozen_is_corrected_and_one_the_host_cannot_read_i
     let plain = tempfile::tempdir()?;
     let got = reasons(&outcome(plain.path(), &identity(), &mut ending));
     assert!(got.starts_with("decide freeze_failed: "), "{got}");
+    Ok(())
+}
+
+#[test]
+fn a_completed_results_self_test_records_are_kept_by_their_digests_the_rest_refused_or_only_referenced()
+-> R {
+    // docs/adr/ADR-028.md decisions 2 and 14: TaskResult.evidence takes only project-relative paths under the
+    // attempt's own .hoh/self-tests/<attempt>/; an absolute path, a .., a link or a path elsewhere is dropped with a
+    // bridge.rejected each, never making the result invalid; a file read as a regular file whose bytes match its
+    // digest is kept as an object (kind self_test); one that does not match, or is not there, is only referenced.
+    let dir = repository()?;
+    let tests = dir.path().join(".hoh/self-tests/A");
+    hoh_core::state_dir::ensure(&dir.path().join(".hoh"))?;
+    std::fs::create_dir_all(&tests)?;
+    let report = b"ALL TESTS PASSED\n";
+    std::fs::write(tests.join("report.txt"), report)?;
+    std::fs::write(tests.join("stale.txt"), b"changed after it was named")?;
+    std::os::unix::fs::symlink("report.txt", tests.join("link.txt"))?;
+    let digest = |b: &[u8]| -> String {
+        <sha2::Sha256 as sha2::Digest>::digest(b)
+            .iter()
+            .map(|x| format!("{x:02x}"))
+            .collect()
+    };
+    let sha = digest(report);
+    let item = |path: &str| json!({"path": path, "sha256": sha});
+    let evidence = json!([
+        item(".hoh/self-tests/A/report.txt"),
+        item(".hoh/self-tests/A/stale.txt"),
+        item(".hoh/self-tests/A/missing.txt"),
+        item("/etc/passwd"),
+        item(".hoh/self-tests/A/../../../src/lib.rs"),
+        item("src/lib.rs"),
+        item(".hoh/self-tests/A/link.txt"),
+        item(".hoh/self-tests/B/report.txt"),
+    ]);
+    let mut ending = ending(&[line("COMPLETED", json!({"evidence": evidence}))], false);
+    let WriterOutcome::Freeze { self_tests, .. } = outcome(dir.path(), &identity(), &mut ending)
+    else {
+        return Err("not a freeze".into());
+    };
+    assert_eq!(self_tests.items.len(), 1, "{self_tests:?}");
+    let kept = &self_tests.items[0];
+    assert_eq!(
+        (kept.kind.as_str(), kept.name.as_str(), kept.sha256.as_str()),
+        ("self_test", ".hoh/self-tests/A/report.txt", sha.as_str())
+    );
+    assert_eq!(hoh_core::objects::get(dir.path(), &sha)?, report);
+    let referenced: Vec<&str> = self_tests
+        .failed
+        .iter()
+        .filter_map(|f| f["name"].as_str())
+        .collect();
+    assert_eq!(
+        referenced,
+        [
+            ".hoh/self-tests/A/stale.txt",
+            ".hoh/self-tests/A/missing.txt"
+        ]
+    );
+    let rejected: Vec<String> = ending
+        .observed
+        .events
+        .iter()
+        .filter(|(_, kind, _)| kind == "bridge.rejected")
+        .filter_map(|(_, _, p)| p["evidence"].as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(
+        rejected,
+        [
+            "/etc/passwd",
+            ".hoh/self-tests/A/../../../src/lib.rs",
+            "src/lib.rs",
+            ".hoh/self-tests/A/link.txt",
+            ".hoh/self-tests/B/report.txt"
+        ]
+    );
     Ok(())
 }

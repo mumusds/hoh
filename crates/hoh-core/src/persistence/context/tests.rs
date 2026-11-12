@@ -353,7 +353,7 @@ fn test_039_02_a_verification_turns_mandatory_items_come_from_its_package_and_ro
         "references": [{"path": crate::objects::relative_path(&sha), "sha256": sha}],
         "output_contract": "TaskResult", "budget_tokens": 20000, "handoff_kind": "verification", "state": null
     }))?;
-    let facts = verification(&conn, &package)?;
+    let facts = verification(&conn, &package, &["T1".to_owned()])?;
     let m = crate::context::mandatory(&facts, "qa", "", None, None)?;
     for body in texts(
         &conn,
@@ -424,9 +424,213 @@ fn test_039_02_a_verification_turns_mandatory_items_come_from_its_package_and_ro
     // without it (M2T09R-102).
     let mut missing = package.clone();
     missing.acceptance_ids.push("AC-9-99".to_owned());
-    assert!(verification(&conn, &missing).is_err());
+    assert!(verification(&conn, &missing, &["T1".to_owned()]).is_err());
     let mut unknown = package.clone();
     unknown.spec_sha256 = Some("9".repeat(64));
-    assert!(verification(&conn, &unknown).is_err());
+    assert!(verification(&conn, &unknown, &["T1".to_owned()]).is_err());
+    Ok(())
+}
+
+/// One event of run R.
+fn event(conn: &Connection, id: &str, kind: &str, payload: &Value) -> R {
+    conn.execute(
+        "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES \
+         ('p1', ?1, 'R', ?2, ?3, '2026-11-07T00:00:00Z')",
+        rusqlite::params![id, kind, payload.to_string()],
+    )?;
+    Ok(())
+}
+
+/// The package of a verification of CAND-7 for T1's AC-1-02.
+fn package_of_cand7() -> R<crate::protocol::ContextHandoff> {
+    Ok(serde_json::from_value(json!({
+        "schema_version": "1.0", "run_id": "R", "task_id": "T1", "goal": "交付上下文装箱", "role": "qa",
+        "role_epoch": 1, "spec_sha256": format!("{:064}", 2), "spec_revision": 2,
+        "candidate": {"id": "CAND-7", "git_commit": format!("{:040}", 7), "git_tree": format!("{:040}", 8),
+            "spec_sha256": format!("{:064}", 2), "environment_sha256": format!("{:064}", 3),
+            "test_plan_sha256": format!("{:064}", 4)},
+        "acceptance_ids": ["AC-1-02"], "references": [], "output_contract": "TaskResult", "budget_tokens": 20000,
+        "handoff_kind": "verification", "state": null
+    }))?)
+}
+
+#[test]
+fn a_verification_turn_names_the_developers_registered_self_tests_and_its_rounds_changed_files() -> R
+{
+    // docs/adr/ADR-028.md decision 14: the self-test records the completion registered (kind self_test) are loads
+    // labelled diagnostic and ranked last, the raw logs never; the Developer's summary is marked diagnostic too; the
+    // code source runs from the earliest start HEAD of the round's sources' writer attempts to the candidate's commit.
+    let (_dir, conn) = world()?;
+    conn.execute_batch(
+        "INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq) VALUES
+           ('T3', 'R', 's2', 'VERIFYING', 2, 'developer', 1, 4);
+         INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision)
+           VALUES ('A3', 'T3', 'SETTLED', 1, 1, 1);",
+    )?;
+    // T3's start is the earlier one; A1 of T1 started later from another HEAD; T0 is no source of the round.
+    event(
+        &conn,
+        "ws-T0",
+        "attempt.workspace_start",
+        &json!({"attempt_id": "A9", "head": "0".repeat(40)}),
+    )?;
+    event(
+        &conn,
+        "ws-A3",
+        "attempt.workspace_start",
+        &json!({"attempt_id": "A3", "head": "3".repeat(40)}),
+    )?;
+    event(
+        &conn,
+        "ws-A0",
+        "attempt.workspace_start",
+        &json!({"attempt_id": "A0", "head": "5".repeat(40)}),
+    )?;
+    produced(&conn, "A0", &[(&"e".repeat(64), "stdout.jsonl")])?;
+    let item = json!({"artifact_id": "x", "sha256": "f".repeat(64),
+        "path": crate::objects::relative_path(&"f".repeat(64)), "bytes": 17, "mime": "text/plain",
+        "kind": "self_test", "name": ".hoh/self-tests/A0/report.txt"});
+    event(
+        &conn,
+        &crate::ids::child_id("A0", "artifacts/self_tests"),
+        "attempt.artifacts",
+        &json!({"attempt_id": "A0", "items": [item]}),
+    )?;
+    event(
+        &conn,
+        "ready-1",
+        "candidate_ready",
+        &json!({"task_id": "T1", "candidate_id": "CAND-7", "attempt_id": "A0",
+            "task_result_json": json!({"status": "COMPLETED", "summary": "自测通过"}).to_string()}),
+    )?;
+    let facts = verification(
+        &conn,
+        &package_of_cand7()?,
+        &["T1".to_owned(), "T3".to_owned()],
+    )?;
+    assert_eq!(facts.loads.len(), 1, "{:?}", facts.loads);
+    let load = &facts.loads[0];
+    assert_eq!(load.sha256, "f".repeat(64));
+    assert_eq!(load.name, ".hoh/self-tests/A0/report.txt");
+    assert!(load.label.contains("diagnostic"), "{}", load.label);
+    assert_eq!(load.relevance, 0);
+    let claim = facts
+        .entries
+        .iter()
+        .find(|e| e.path == "claims/CAND-7")
+        .ok_or("no claim")?;
+    assert!(claim.text.contains("diagnostic"), "{}", claim.text);
+    assert_eq!(
+        facts.code,
+        Some(crate::context::CodeSource {
+            base: "3".repeat(40),
+            commit: format!("{:040}", 7)
+        })
+    );
+    Ok(())
+}
+
+#[test]
+fn a_change_request_issue_a_rework_took_is_listed_for_later_verifiers_to_confirm_fixed() -> R {
+    // docs/adr/ADR-028.md decisions 12 and 14 (M2T16D-555): a change request's Issue taken by a rework of one of the
+    // round's sources, not yet RESOLVED, is listed for the later round's verifiers, marked 请确认已修复; one on the
+    // candidate under verification is the round's own, a RESOLVED one is done, a finding's is M2-T18's.
+    let (_dir, conn) = world()?;
+    conn.execute_batch(
+        "INSERT INTO candidates(candidate_id, run_id, git_commit, git_tree, spec_sha256, environment_sha256,
+           test_plan_sha256, source_path, state, created_at)
+           VALUES ('CAND-6', 'R', printf('%040d', 6), printf('%040d', 9), printf('%064d', 2), printf('%064d', 3),
+           printf('%064d', 4), '/repo', 'REJECTED', '2026-11-07T00:00:00Z');
+         INSERT INTO issues(issue_id, run_id, candidate_id, fingerprint, severity, state, description) VALUES
+           ('I-taken', 'R', 'CAND-6', 'fp-taken', 'high', 'OPEN', 'SENTINEL-TAKEN 改写请求：边界条件'),
+           ('I-done', 'R', 'CAND-6', 'fp-done', 'high', 'RESOLVED', 'SENTINEL-DONE 已解决'),
+           ('I-other', 'R', 'CAND-6', 'fp-other', 'high', 'OPEN', 'SENTINEL-OTHER 未被返工取走'),
+           ('I-own', 'R', 'CAND-7', 'fp-own', 'high', 'OPEN', 'SENTINEL-OWN 本轮自己的');",
+    )?;
+    event(
+        &conn,
+        "consumed-1",
+        "verification.failures_consumed",
+        &json!({"round_id": "CAND-6/round/1", "task_id": "T1", "by": "rework",
+            "items": ["issue:fp-taken", "issue:fp-done", "issue:fp-own", "ac:AC-1-02"]}),
+    )?;
+    let facts = verification(&conn, &package_of_cand7()?, &["T1".to_owned()])?;
+    let listed: Vec<&str> = facts
+        .entries
+        .iter()
+        .filter(|e| e.text.contains("请确认已修复"))
+        .map(|e| e.text.as_str())
+        .collect();
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert!(listed[0].contains("SENTINEL-TAKEN") && listed[0].contains("I-taken"));
+    // Another task's rework took nothing of this round's sources.
+    let other = verification(&conn, &package_of_cand7()?, &["T3".to_owned()])?;
+    assert!(
+        other
+            .entries
+            .iter()
+            .all(|e| !e.text.contains("请确认已修复"))
+    );
+    Ok(())
+}
+
+#[test]
+fn a_reworked_developer_turn_is_given_its_rejected_candidates_failures_open_issues_and_changed_files()
+-> R {
+    // docs/adr/ADR-028.md decisions 12 and 14 (Reader::rework_context): the failure items its round's close gave the
+    // task and the rejected candidate's open Issues, as evidence, and the code source with the rejected candidate.
+    let (_dir, conn) = world()?;
+    conn.execute_batch(
+        "INSERT INTO candidates(candidate_id, run_id, git_commit, git_tree, spec_sha256, environment_sha256,
+           test_plan_sha256, source_path, state, created_at)
+           VALUES ('CAND-6', 'R', printf('%040d', 6), printf('%040d', 9), printf('%064d', 2), printf('%064d', 3),
+           printf('%064d', 4), '/repo', 'REJECTED', '2026-11-07T00:00:00Z');
+         INSERT INTO issues(issue_id, run_id, candidate_id, fingerprint, severity, state, description) VALUES
+           ('I-open', 'R', 'CAND-6', 'fp-open', 'critical', 'OPEN', 'SENTINEL-OPEN 边界条件'),
+           ('I-done', 'R', 'CAND-6', 'fp-done', 'high', 'RESOLVED', 'SENTINEL-DONE 已解决');",
+    )?;
+    event(
+        &conn,
+        "ws-A0",
+        "attempt.workspace_start",
+        &json!({"attempt_id": "A0", "head": "5".repeat(40)}),
+    )?;
+    event(
+        &conn,
+        "opened-1",
+        "verification.round_opened",
+        &json!({"round_id": "CAND-6/round/1", "candidate_id": "CAND-6", "source_task_ids": ["T1"]}),
+    )?;
+    let before = facts(&conn, "R", "T1", "A1", None)?;
+    assert!(before.code.is_none(), "no rework, no code source");
+    event(
+        &conn,
+        "consumed-1",
+        "verification.failures_consumed",
+        &json!({"round_id": "CAND-6/round/1", "task_id": "T1", "by": "rework",
+            "items": ["issue:fp-open", "ac:AC-1-02:SENTINEL-AC"]}),
+    )?;
+    let rework = rework(&conn, "T1")?.ok_or("no rework context")?;
+    assert_eq!(rework.candidate_id, "CAND-6");
+    let got = facts(&conn, "R", "T1", "A1", None)?;
+    let texts: Vec<&str> = got.entries.iter().map(|e| e.text.as_str()).collect();
+    assert!(texts.iter().any(|t| t.contains("SENTINEL-AC")), "{texts:?}");
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.contains("SENTINEL-OPEN") && t.contains("I-open")),
+        "{texts:?}"
+    );
+    assert!(
+        texts.iter().all(|t| !t.contains("SENTINEL-DONE")),
+        "{texts:?}"
+    );
+    assert_eq!(
+        got.code,
+        Some(crate::context::CodeSource {
+            base: "5".repeat(40),
+            commit: format!("{:040}", 6)
+        })
+    );
     Ok(())
 }

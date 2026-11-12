@@ -62,7 +62,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 /// `id` as one path component: `%` and `/` escaped, so distinct ids stay distinct.
-fn component(id: &str) -> String {
+pub(super) fn component(id: &str) -> String {
     id.replace('%', "%25").replace('/', "%2F")
 }
 
@@ -317,6 +317,12 @@ impl ProductExecutor {
         use hoh_core::context;
         let a = &work.assignment;
         let mut facts = a.context.clone().unwrap_or_default();
+        // What the store named and only the executor reads (docs/adr/ADR-028.md decision 14): registered objects by
+        // their digests, and the candidate's changed files at its commit.
+        facts.resolve_loads(|sha| hoh_core::objects::get(&self.project, sha));
+        if let Some(source) = facts.code.clone() {
+            facts.add_code(code_files(&self.project, &source));
+        }
         let lead = package.map(context::lead).unwrap_or_default();
         // Every turn has a bridge file in its attempt's directory (docs/adr/ADR-025.md decision 8, docs/adr/ADR-028.md
         // decision 2): a Commander turn is told it with where the project is (it runs outside it); a work turn in its
@@ -332,6 +338,10 @@ impl ProductExecutor {
                     role: work.role.clone(),
                     role_epoch: a.role_epoch,
                     bridge: bridge.display().to_string(),
+                    // A writer's self-test records go to its own directory (docs/adr/ADR-028.md decision 14).
+                    self_tests: a
+                        .writer
+                        .then(|| super::completion::self_tests_dir(&work.attempt_id)),
                     // A verifier is told what it verifies and its request helpers (docs/adr/ADR-028.md decisions 2, 7).
                     verified: a.handoff.as_ref().zip(work.helpers.as_ref()).and_then(
                         |(h, helpers)| {
@@ -764,6 +774,50 @@ fn attempt_logs(project: &Path, attempt_id: &str) -> PathBuf {
 /// (docs/adr/ADR-028.md decisions 2 and 4).
 pub fn bridge_of(project: &Path, attempt_id: &str) -> PathBuf {
     attempt_logs(project, attempt_id).join(BRIDGE)
+}
+
+/// The files the candidate changed (docs/adr/ADR-028.md decision 14's code source). Blocking.
+pub(super) fn code_files(
+    project: &Path,
+    source: &hoh_core::context::CodeSource,
+) -> Result<(Vec<hoh_core::context::CodeFile>, usize), String> {
+    use hoh_core::context::{CODE_BYTES, CODE_FILES, CodeFile};
+    let git = |args: &[&str]| super::control::git(project, args);
+    let names = git(&[
+        "diff",
+        "--name-only",
+        "-z",
+        "--no-renames",
+        &source.base,
+        &source.commit,
+    ])?;
+    let mut paths: Vec<String> = names
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .collect();
+    paths.sort();
+    let total = paths.len();
+    let files = paths
+        .into_iter()
+        .take(CODE_FILES)
+        .map(|path| {
+            let at = format!("{}:{path}", source.commit);
+            let text = match git(&["cat-file", "-s", &at]) {
+                Err(_) => Err("在候选 commit 中没有这个文件（已删除）".to_owned()),
+                Ok(size) => match String::from_utf8_lossy(&size).trim().parse::<u64>() {
+                    Ok(size) if size <= CODE_BYTES => {
+                        git(&["cat-file", "blob", &at]).and_then(|bytes| {
+                            String::from_utf8(bytes).map_err(|_| "不是 UTF-8 文本".to_owned())
+                        })
+                    }
+                    _ => Err(format!("超过 {} KiB", CODE_BYTES / 1024)),
+                },
+            };
+            CodeFile { path, text }
+        })
+        .collect();
+    Ok((files, total))
 }
 
 #[cfg(test)]

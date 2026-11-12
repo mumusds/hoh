@@ -207,6 +207,42 @@ fn work(
             causal: 0,
         });
     }
+    // A reworked task's next attempt: what its round found and the rejected candidate's changes (docs/adr/ADR-028.md
+    // decisions 12 and 14).
+    if let Some(r) = rework(conn, task_id)? {
+        let evidence = |path: String, text: String| Entry {
+            class: Class::Evidence,
+            kind: Kind::Plain,
+            path,
+            text,
+            summary: None,
+            relevance: 3,
+            recency: 0,
+            causal: 0,
+        };
+        for (n, item) in r.items.iter().enumerate() {
+            facts.entries.push(evidence(
+                format!("rework/items/{n}"),
+                format!(
+                    "返工的失败项（轮次 {}，被拒候选 {}）：{item}",
+                    r.round_id, r.candidate_id
+                ),
+            ));
+        }
+        for (id, severity, description) in &r.issues {
+            facts.entries.push(evidence(
+                format!("rework/issues/{id}"),
+                format!(
+                    "被拒候选 {} 上未关闭的 Issue {id}（{severity}）：{description}",
+                    r.candidate_id
+                ),
+            ));
+        }
+        facts.code = r.base.map(|base| crate::context::CodeSource {
+            base,
+            commit: r.git_commit,
+        });
+    }
     Ok(())
 }
 
@@ -403,10 +439,14 @@ fn attempt_tasks(
 /// QA and Reviewer dispatch uses. Its scope is the package's task and candidate, its in-scope acceptance the package's
 /// `acceptance_ids` under its spec, its budget the package's; its evidence the package's references (listed, never
 /// read) and the Developer's own account of the candidate, only its status and summary, marked a claim and ranked
-/// after everything else (docs/07 section 4: requirements, AC and artifacts first).
+/// after everything else (docs/07 section 4: requirements, AC and artifacts first). From the round's sources
+/// `sources` (docs/adr/ADR-028.md decision 14): the Developer's registered self-test records as diagnostic loads, the
+/// code source from their earliest start to the candidate, and the change requests a rework of theirs took, for the
+/// verifier to confirm fixed.
 pub(super) fn verification(
     conn: &Connection,
     package: &crate::protocol::ContextHandoff,
+    sources: &[String],
 ) -> Result<Facts, PersistError> {
     let run_id = package.run_id.as_str();
     let spec_id: Option<String> = match (&package.spec_sha256, package.spec_revision) {
@@ -502,25 +542,26 @@ pub(super) fn verification(
             causal: 0,
         });
     }
-    // The Developer's own account: status and summary only, a claim (docs/07 section 4, ADR-026 decision 10).
-    let ready: Option<String> = conn
+    // The Developer's own account: status and summary only, a claim (docs/07 section 4, ADR-026 decision 10), marked
+    // diagnostic (docs/adr/ADR-028.md decision 14).
+    let ready: Option<(Option<String>, Option<String>)> = conn
         .query_row(
-            "SELECT json_extract(payload_json, '$.task_result_json') FROM events WHERE run_id = ?1 \
-             AND kind = 'candidate_ready' AND json_extract(payload_json, '$.candidate_id') = ?2 \
-             ORDER BY seq DESC LIMIT 1",
+            "SELECT json_extract(payload_json, '$.task_result_json'), json_extract(payload_json, '$.attempt_id') \
+             FROM events WHERE run_id = ?1 AND kind = 'candidate_ready' \
+             AND json_extract(payload_json, '$.candidate_id') = ?2 ORDER BY seq DESC LIMIT 1",
             params![run_id, candidate],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()
-        .map_err(sqlite_error)?
-        .flatten();
-    if let Some(result) = ready.and_then(|t| serde_json::from_str::<Value>(&t).ok()) {
+        .map_err(sqlite_error)?;
+    let (result, producer) = ready.unwrap_or_default();
+    if let Some(result) = result.and_then(|t| serde_json::from_str::<Value>(&t).ok()) {
         facts.entries.push(Entry {
             class: Class::Evidence,
             kind: Kind::Plain,
             path: format!("claims/{candidate}"),
             text: format!(
-                "开发者自述，仅作线索：status={}；summary={}",
+                "开发者自述，仅作线索（diagnostic，不作验收依据）：status={}；summary={}",
                 result["status"].as_str().unwrap_or("?"),
                 result["summary"].as_str().unwrap_or("")
             ),
@@ -530,7 +571,217 @@ pub(super) fn verification(
             causal: 0,
         });
     }
+    if let Some(producer) = producer {
+        facts.loads = self_tests(conn, &producer)?;
+    }
+    facts.code = match (code_base(conn, sources)?, package.candidate.as_ref()) {
+        (Some(base), Some(c)) => Some(crate::context::CodeSource {
+            base,
+            commit: c.git_commit.clone(),
+        }),
+        _ => None,
+    };
+    facts
+        .entries
+        .extend(confirm_fixed(conn, run_id, sources, &candidate)?);
     Ok(facts)
+}
+
+/// The label of a Developer's self-test record in a verifier's context (docs/adr/ADR-028.md decision 14).
+pub(super) const SELF_TEST_LABEL: &str = "开发者自测（diagnostic，仅作诊断，不作验收依据）";
+
+/// The self-test records attempt `attempt_id`'s completion registered (`attempt.artifacts` of kind `self_test`), as
+/// loads: only those objects are ever read (decision 14).
+fn self_tests(
+    conn: &Connection,
+    attempt_id: &str,
+) -> Result<Vec<crate::context::Load>, PersistError> {
+    let payload: Option<String> = conn
+        .query_row(
+            "SELECT payload_json FROM events WHERE event_id = ?1 AND kind = 'attempt.artifacts'",
+            params![crate::ids::child_id(attempt_id, SELF_TESTS_EVENT)],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let payload: Value = payload
+        .and_then(|p| serde_json::from_str(&p).ok())
+        .unwrap_or(Value::Null);
+    Ok(payload["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|i| i["kind"] == "self_test")
+        .filter_map(|i| {
+            let (sha256, name) = (i["sha256"].as_str()?, i["name"].as_str()?);
+            Some(crate::context::Load {
+                path: format!("self-tests/{name}"),
+                sha256: sha256.to_owned(),
+                name: name.to_owned(),
+                label: SELF_TEST_LABEL.to_owned(),
+                relevance: 0,
+            })
+        })
+        .collect())
+}
+
+/// The key (under its attempt) of the `attempt.artifacts` event a completion registers its self-test records in.
+pub(super) const SELF_TESTS_EVENT: &str = "artifacts/self_tests";
+
+/// git's empty tree: the base of a source whose first writer started in a repository without a commit.
+const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+/// The base of the changed files of tasks `sources` (docs/adr/ADR-028.md decision 14, -462): the HEAD at the start of
+/// their earliest writer attempt (`attempt.workspace_start`), git's empty tree when there was none; none when none of
+/// them started one.
+fn code_base(conn: &Connection, sources: &[String]) -> Result<Option<String>, PersistError> {
+    let head: Option<Option<String>> = conn
+        .query_row(
+            "SELECT json_extract(e.payload_json, '$.head') FROM events e \
+             JOIN attempts a ON a.attempt_id = json_extract(e.payload_json, '$.attempt_id') \
+             WHERE e.kind = 'attempt.workspace_start' AND a.task_id IN (SELECT value FROM json_each(?1)) \
+             ORDER BY e.seq LIMIT 1",
+            params![json!(sources).to_string()],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    Ok(head.map(|h| h.unwrap_or_else(|| EMPTY_TREE.to_owned())))
+}
+
+/// The change requests' Issues a rework (or a decision) of tasks `sources` took and that are not resolved, raised on
+/// another candidate than `candidate`: for the verifier to confirm fixed (decisions 12 and 14, -555). A finding's
+/// Issue is M2-T18's.
+fn confirm_fixed(
+    conn: &Connection,
+    run_id: &str,
+    sources: &[String],
+    candidate: &str,
+) -> Result<Vec<Entry>, PersistError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT DISTINCT i.issue_id, i.severity, i.description, coalesce(i.candidate_id, '-') \
+             FROM events e, json_each(json_extract(e.payload_json, '$.items')) j \
+             JOIN issues i ON j.value = 'issue:' || i.fingerprint \
+             WHERE e.kind = 'verification.failures_consumed' \
+             AND json_extract(e.payload_json, '$.by') IN ('rework', 'decision') \
+             AND json_extract(e.payload_json, '$.task_id') IN (SELECT value FROM json_each(?1)) \
+             AND i.run_id = ?2 AND i.state IN ('OPEN', 'REOPENED') AND i.report_id IS NULL \
+             AND coalesce(i.candidate_id, '') <> ?3 ORDER BY i.issue_id",
+        )
+        .map_err(sqlite_error)?;
+    let rows: Vec<(String, String, String, String)> = statement
+        .query_map(
+            params![json!(sources).to_string(), run_id, candidate],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .map_err(sqlite_error)?
+        .collect::<Result<_, _>>()
+        .map_err(sqlite_error)?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, severity, description, on)| Entry {
+            class: Class::Evidence,
+            kind: Kind::Plain,
+            path: format!("confirm/{id}"),
+            text: format!("请确认已修复：Issue {id}（{severity}，提出于候选 {on}）：{description}"),
+            summary: None,
+            relevance: 2,
+            recency: 0,
+            causal: 0,
+        })
+        .collect())
+}
+
+/// What a reworked development task's next attempt is given (docs/adr/ADR-028.md decisions 12 and 14): the round
+/// whose failures its rework took, the rejected candidate, those failure items, the candidate's open Issues and the
+/// base of its changed files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReworkContext {
+    pub round_id: String,
+    pub candidate_id: String,
+    pub git_commit: String,
+    pub items: Vec<String>,
+    /// `(issue_id, severity, description)`.
+    pub issues: Vec<(String, String, String)>,
+    pub base: Option<String>,
+}
+
+/// Task `task_id`'s rework context: from the latest failures a rework or a decision of it took; none if none did.
+pub(super) fn rework(
+    conn: &Connection,
+    task_id: &str,
+) -> Result<Option<ReworkContext>, PersistError> {
+    let taken: Option<String> = conn
+        .query_row(
+            "SELECT payload_json FROM events WHERE kind = 'verification.failures_consumed' \
+             AND json_extract(payload_json, '$.task_id') = ?1 \
+             AND json_extract(payload_json, '$.by') IN ('rework', 'decision') ORDER BY seq DESC LIMIT 1",
+            params![task_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some(taken) = taken.and_then(|t| serde_json::from_str::<Value>(&t).ok()) else {
+        return Ok(None);
+    };
+    let round_id = taken["round_id"].as_str().unwrap_or_default().to_owned();
+    let opened: Option<String> = conn
+        .query_row(
+            "SELECT payload_json FROM events WHERE kind = 'verification.round_opened' \
+             AND json_extract(payload_json, '$.round_id') = ?1",
+            params![round_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let opened: Value = opened
+        .and_then(|o| serde_json::from_str(&o).ok())
+        .unwrap_or(Value::Null);
+    let Some(candidate_id) = opened["candidate_id"].as_str().map(str::to_owned) else {
+        return Ok(None);
+    };
+    let git_commit: String = conn
+        .query_row(
+            "SELECT git_commit FROM candidates WHERE candidate_id = ?1",
+            params![candidate_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?
+        .unwrap_or_default();
+    let mut statement = conn
+        .prepare(
+            "SELECT issue_id, severity, description FROM issues WHERE candidate_id = ?1 \
+             AND state IN ('OPEN', 'REOPENED') ORDER BY issue_id",
+        )
+        .map_err(sqlite_error)?;
+    let issues = statement
+        .query_map(params![candidate_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .map_err(sqlite_error)?
+        .collect::<Result<_, _>>()
+        .map_err(sqlite_error)?;
+    let sources: Vec<String> = opened["source_task_ids"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| t.as_str().map(str::to_owned))
+        .collect();
+    Ok(Some(ReworkContext {
+        round_id,
+        git_commit,
+        items: taken["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|i| i.as_str().map(str::to_owned))
+            .collect(),
+        issues,
+        base: code_base(conn, &sources)?,
+        candidate_id,
+    }))
 }
 
 /// The objects attempts `attempts` produced, in that order and each attempt's in its own order, as references: from
@@ -544,19 +795,23 @@ pub(super) fn references(
     let mut out: Vec<crate::protocol::ArtifactRef> = Vec::new();
     let mut seen = BTreeSet::new();
     for attempt in attempts {
-        // The attempt's own artifacts and each check it ran (`evidence.recorded`, docs/adr/ADR-027.md decision 8), in
-        // the order they were written.
+        // The attempt's own artifacts (its raw logs and its self-test records, docs/adr/ADR-028.md decision 14) and each
+        // check it ran (`evidence.recorded`, docs/adr/ADR-027.md decision 8), in the order they were written.
         let mut statement = conn
             .prepare(
                 "SELECT kind, payload_json FROM events \
-                 WHERE (event_id = ?1 AND kind = 'attempt.artifacts') \
+                 WHERE (event_id IN (?1, ?3) AND kind = 'attempt.artifacts') \
                     OR (kind = 'evidence.recorded' AND json_extract(payload_json, '$.attempt_id') = ?2) \
                  ORDER BY seq",
             )
             .map_err(sqlite_error)?;
         let payloads = statement
             .query_map(
-                params![crate::ids::child_id(attempt, "artifacts"), attempt],
+                params![
+                    crate::ids::child_id(attempt, "artifacts"),
+                    attempt,
+                    crate::ids::child_id(attempt, SELF_TESTS_EVENT)
+                ],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
             )
             .map_err(sqlite_error)?
