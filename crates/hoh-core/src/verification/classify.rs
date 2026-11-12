@@ -91,6 +91,9 @@ pub struct Input {
     pub acs: Vec<Ac>,
     /// A change request of this round or a critical/high unclosed (OPEN or REOPENED) issue on the candidate (docs/adr/ADR-028.md decision 13).
     pub failing_issues: bool,
+    /// A FAIL row of the round's own evidence on an AC outside its scope, whatever its check's outcome (docs/adr/ADR-028.md
+    /// decision 12, implementation correction 6): every failure item is a failing input.
+    pub outside_failed: bool,
 }
 
 /// The class of `input`, by priority: failed, flaky, passable (a positive condition), else inconclusive.
@@ -99,6 +102,7 @@ pub fn classify(input: &Input) -> Class {
         || input.review == Report::Fail
         || input.checks == Checks::Failed
         || input.failing_issues
+        || input.outside_failed
         || input.acs.contains(&Ac::Failed);
     if failed {
         return Class::Failed;
