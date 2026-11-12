@@ -97,6 +97,23 @@ python3 tools/release_gate.py --manifest .hoh-dev/release/manifest.json
 - 不要求人工 approve：单人仓库里作者不能批准自己的 PR；独立审查由项目流程中的独立会话完成并记入 `reports/reviews/`，合并条件仍是 CI 全绿且审查无 critical/high。
 - 仓库设置 `delete_branch_on_merge=true`：PR 合并后远端分支自动删除；本地分支与 worktree 由开发会话在确认补丁已进入 main 后自行清理。
 
+## 产品中的验证派发（ADR-028）
+
+M2-T16 起，产品自己完成“开发者完成 → 冻结 → QA 与 Review 并行验证 → 轮次关闭”的循环（ADR-028）。下列事实与余项供运维与后续任务参考：
+
+- **环境描述** `.hoh/environment.json`：HoH 在冻结前写入（被 git 忽略），字段为 `schema_version`、`hoh{version, commit}`（commit 取构建时的 `HOH_BUILD_COMMIT`，未设为 `unknown`）、`os{sysname, machine}`、`tools{git}`（`git --version` 的输出）。键有序、不含时间与随机值，内容不变就不重写，所以 host 重启不改变它的摘要（ADR-027 决定 4）。
+- **冻结的输入**：在 M3-T02 给出规格的文件位置之前，冻结按项目布局约定取 `contracts/requirements.json` 与 `tests/check-plan.json`（CR-018）。
+- **开发者自测**：写在 `.hoh/self-tests/<attempt>/`（`/` 写作 `%2F`，写者的身份头给出），TaskResult.evidence 只接受这里的项目相对路径；内容摘要相符的存为对象（`self_test` 种类），在验证者的 Prompt 里只取前 8 KiB，标为 diagnostic。
+- **代码类来源**：验证者与返工的 Developer 收到候选相对基准改动的文件（基准为本轮源 Task 最早的写者 Attempt 启动时的 HEAD），按路径排序至多 50 个，每个至多 64 KiB 且为 UTF-8，否则只列路径。
+- **重新验证上限** `REVERIFY_LIMIT = 2`（常量，只经 CR 修改）：同一来源在同一候选上再验证（验证 Task 的 FAILED/BLOCKED/INCOMPLETE 结果、无结论的轮次）按链的首轮计数，验证者篡改使候选 INVALID 后的再冻结按源 Task 计数；超过 2 次即交决策（NEED_DECISION）。
+- **补记与启动**：每个 tick 先补记候选的待入库检查记录；永久错误（事实损坏、记录不属于该候选、记录仍在而对象丢失）立即判定，暂时错误连续至少 3 次且跨至少 10 分钟才判定；判定时 VERIFYING 的候选置 STALE（`candidate.stale{evidence_unrecoverable}`）并写 `integrity_violation`。host 启动时对每个有记录目录的候选补记一次，失败唤醒 Commander 并暂停派发它的验证 Task，直到一次补记成功；没有活 Attempt 的运行目录与请求目录在启动时删除。
+- **请求桥**：验证者的 `run-check` 与 `ask` 是它 attempt 目录里的 POSIX sh 助手，请求写在 `.hoh/attempts/<attempt>/requests/`，每个 Attempt 至多 64 条；不是 `hoh` 子命令（CONTRACT 第 3 条）。
+- **余项**：
+  - 验证者在自己的 `run-check` 进行中改写运行目录，会被记成该检查的 SOURCE_CHANGED，按开发者的失败项返工；有界：同一指纹第 4 次升级为决策（M2T16D-1057）。
+  - 运行目录是候选的 checkout，被测仓库自带的 Agent 指令文件（如 `AGENTS.md`、`CLAUDE.md`）会被验证 Agent 读到；请求目录与助手在项目的 `.hoh/` 下，所以 Agent 能从它们的路径得知项目根（M2T16D-363）。
+  - Commander 不另建修复任务是角色契约层面的约束（commander.md）：PlanProposal 没有与 Issue 关联的字段，无法机械拦截；唤醒摘要把改写请求的 Issue 标为“轮次关闭后由 Runtime 返工”。
+  - 角色间的 query/steer 路由属于 M3-T04；在那之前验证者的其他问题得到 deferred 回应并记 `request.deferred`。
+
 ## 工具退出语义
 
 - 包自测：0 表示启动包通过；product 缺实现或清单时返回 3。
