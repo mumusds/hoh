@@ -1,8 +1,8 @@
 # CR-018 · 验证派发的移交：汇合写 ACCEPTED、规格位置与角色间路由
 
 ID：CR-018
-状态：PROPOSED
-批准人：（待 ADR-028 设计审查判定后，由 CTO 依 CR-003 D1 预授权批准）
+状态：APPROVED
+批准人：CTO 依 CR-003 D1 预授权（ADR-028 设计审查第 13 轮 Claude 44041246-4e37-44e9-8528-fe75b4cc8093 判 PASS；第 14 轮 Codex 01a1cf1b-a781-7a62-aac6-1a3b2ff57511 判 PASS、设计已收敛、CR-018 可由 CTO 依 CR-003 D1 批准）
 日期：2026-11-12
 基线：只改 `contracts/development-tasks.json`（不在锁内）；不改受锁文件
 

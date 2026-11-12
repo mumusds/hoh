@@ -649,7 +649,7 @@
     "AC-054-03",
     "AC-039-03"
    ],
-   "done_when": "AC-021-05、AC-035-03/05、AC-036-03、AC-037-02/03/04、AC-053-03、AC-054-03 通过；Commander 不可用时 candidate_ready 仍派发 QA/Review；FAILED/UNKNOWN 永不投影为 PASS；AC-039-03 通过（CR-016：QA 的 Prompt 经产品 QA 派发、同一收集函数与装箱器生成，由 FakeAgent 捕获）；为 QA、Reviewer 与返工的 Developer 加入代码类上下文来源（冻结候选相对其基准改动的文件，ADR-026 决定 12），并写 handoffs 表（ADR-026 决定 6）；Developer COMPLETED 时由 Runtime 在写租约下冻结、再 candidate_ready；QA/Reviewer Attempt 经 ADR-027 的检查驱动运行检查并写证据（原则二：只有它们能产出证据）；候选迁移带原状态条件，不覆盖 M2-T10 写入的否决 INVALID；Attempt 级运行后核对不符时经 M2-T10 的 Store::record_evidence 写 INVALID 证据，其执行记录的形态由本任务定义并写在 `.hoh/evidence/` 下（traceability 同样否决）；候选的 VERIFYING/ACCEPTED/REJECTED 迁移（INVALID 只由 M2-T10 的证据写入，M2-T16 从不写）；新 Run 无新提交与同 Run 同内容遇 STALE/INVALID 的情形；`.hoh/` 下字节稳定的环境描述（CR-017，ADR-027 的移交）。"
+   "done_when": "AC-021-05、AC-035-03/05、AC-036-03、AC-037-02/03/04、AC-053-03、AC-054-03 通过；Commander 不可用时 candidate_ready 仍派发 QA/Review；FAILED/UNKNOWN 永不投影为 PASS；AC-039-03 通过（CR-016：QA 的 Prompt 经产品 QA 派发、同一收集函数与装箱器生成，由 FakeAgent 捕获）；为 QA、Reviewer 与返工的 Developer 加入代码类上下文来源（冻结候选相对其基准改动的文件，ADR-026 决定 12），并写 handoffs 表（ADR-026 决定 6）；Developer COMPLETED 时由 Runtime 在写租约下冻结、再 candidate_ready；QA/Reviewer Attempt 经 ADR-027 的检查驱动运行检查并写证据（原则二：只有它们能产出证据）；候选迁移带原状态条件，不覆盖 M2-T10 写入的否决 INVALID；Attempt 级运行后核对不符时经 M2-T10 的 Store::record_evidence 写 INVALID 证据，其执行记录的形态由本任务定义并写在 `.hoh/evidence/` 下（traceability 同样否决）；候选的 VERIFYING 与 REJECTED 迁移，以及证据不可恢复时 VERIFYING→STALE（带原状态条件，写 candidate.stale{evidence_unrecoverable}）、验证轮次的建立、关闭、分类与源 Task 的去向（ADR-028 决定 9、11）；验收门禁只认 ACCEPTED 的候选（ADR-028 决定 12），M2-T16 从不写候选的 ACCEPTED（CR-018）（INVALID 只由 M2-T10 的证据写入，M2-T16 从不写）；新 Run 无新提交与同 Run 同内容遇 STALE/INVALID 的情形；`.hoh/` 下字节稳定的环境描述（CR-017，ADR-027 的移交）。"
   },
   {
    "id": "M2-T18",
@@ -675,7 +675,7 @@
     "AC-054-04",
     "AC-054-05"
    ],
-   "done_when": "AC-053-01/02/04/05、AC-054-01/02/04/05 通过；独立报告写入 independent_reports 表并可追溯到原始会话；acceptance_results 的投影按 ADR-027 原则一的历史规则（该候选上该 AC 有 PASS 与可降级需求上合规 DEGRADED 之外的任一行即不满足，次序与原则一的 TEST 状态相同：FAIL、UNKNOWN、BLOCKED 行与 PASS/DEGRADED 并存为 FLAKY，符合 AC-053-02，否则有 INVALID 行为 INVALID；可降级需求上只有 PASS 与合规 DEGRADED 且至少一条 DEGRADED 为 DEGRADED 并满足；没有行为 NOT_RUN；候选为 INVALID 即全不满足；有 profile 时补原则一规则 16；检查级状态由原则一推出并按历史聚合，BLOCKED 与原因为 TIMED_OUT、NOT_STARTED、INTERRUPTED、INCOMPLETE、PLUGINS_MISSING 的 FAIL 为无结论）（CR-017，ADR-027 的移交）。"
+   "done_when": "AC-053-01/02/04/05、AC-054-01/02/04/05 通过；独立报告写入 independent_reports 表并可追溯到原始会话；acceptance_results 的投影按 ADR-027 原则一的历史规则（该候选上该 AC 有 PASS 与可降级需求上合规 DEGRADED 之外的任一行即不满足，次序与原则一的 TEST 状态相同：FAIL、UNKNOWN、BLOCKED 行与 PASS/DEGRADED 并存为 FLAKY，符合 AC-053-02，否则有 INVALID 行为 INVALID；可降级需求上只有 PASS 与合规 DEGRADED 且至少一条 DEGRADED 为 DEGRADED 并满足；没有行为 NOT_RUN；候选为 INVALID 即全不满足；有 profile 时补原则一规则 16；检查级状态由原则一推出并按历史聚合，BLOCKED 与原因为 TIMED_OUT、NOT_STARTED、INTERRUPTED、INCOMPLETE、PLUGINS_MISSING 的 FAIL 为无结论）（CR-017，ADR-027 的移交）。在 ADR-028 的候选级汇合点（verification.candidate_ready_for_join）的同一事务调用汇合函数（AC-054-05）即 verification::classify（AC 维度用 verification::project，用于裁决；AC-053-02 的投影用于展示与已验收计数）：passable 时写候选 ACCEPTED（带原状态条件，不覆盖 INVALID 与 STALE）并由 Runtime 按门禁谓词接受源 Task；不是 passable 时按同一类别处置——failed 判 REJECTED、按 ADR-028 的 I6 登记有主失败项并经 repair_in 返工，inconclusive 在同一候选上重新验证，flaky 交决策，UNKNOWN 永不返工；多轮次候选并各开发 Task 当前轮次范围与每条重新验证链当前轮次的报告状态；AC-054-02 的重派 Review 即 C2 冻结时已开的轮次、不另派；AC-054-05 的 96 种组合与 classify 的穷举测试一致；low/medium finding 登记的 Issue 本身不使分类为 failed，报告 status=FAIL 仍为 failed；independent_reports.session_id 为 HoH 会话 id；finding→Issue 在记录该报告的验证 Attempt 的结算事务里完成（早于轮次关闭），Issue 带 report_id，并有产品路径测试；Issue 的 RESOLVED（含 M2-T16 的改写请求 Issue）须有验证者的观察；REQ-053 失败模式 2 的空观察投影为 INVALID(INSUFFICIENT)；验收投影排除 Runtime 的验证 Task（CR-018，ADR-028 决定 11、12、15 的移交）。"
   },
   {
    "id": "M2-T15",
@@ -701,7 +701,7 @@
     "AC-020-05",
     "AC-027-04"
    ],
-   "done_when": "REQ-020 全部 AC 与 AC-027-04 通过。"
+   "done_when": "REQ-020 全部 AC 与 AC-027-04 通过。绑定恢复后，BLOCKED_AUTH/BLOCKED_CAPABILITY 的验证 Task 回到可派发（ADR-028 的出口表，CR-018）。"
   },
   {
    "id": "M2-T13",
@@ -738,7 +738,7 @@
     "AC-005-01",
     "AC-042-04"
    ],
-   "done_when": "AC-001-01/02、REQ-002 全部 AC、AC-003-03、AC-004-02/03/04、AC-042-04 通过；AC-005-01 通过（CR-010：由 `hoh -p --detach` 拉起的 host 经 FakeAgent 运行）。"
+   "done_when": "AC-001-01/02、REQ-002 全部 AC、AC-003-03、AC-004-02/03/04、AC-042-04 通过；AC-005-01 通过（CR-010：由 `hoh -p --detach` 拉起的 host 经 FakeAgent 运行）。AnswerQuestion 解除时对带修复拒绝的 Task 同一事务调用 M2-T16 的 Store::clear_repair_refusal；解除 BLOCKED(NEED_DECISION) 的路径覆盖 Runtime 的验证 Task（含验证 Attempt 的 UNKNOWN_EFFECT 经决策确认后的解除）与因验证而 BLOCKED 的源 Task（ADR-028 出口表的该行）；AC-042-04 的“QA FAIL”为 COMPLETED 的验证结果配 FAIL 的证据或报告（CR-018）。"
   },
   {
    "id": "M2-T11",
@@ -877,7 +877,7 @@
     "REQ-046",
     "REQ-047"
    ],
-   "done_when": "本里程碑全部需求spec_maturity=detailed；validate_bundle通过；CR已APPROVED并relock；按每个实现任务≤2项需求、≤8条AC拆分本里程碑实现任务（更新 development-tasks.json 的 requirements/acceptance/checks/depends_on，validate_bundle 的归属规则通过）；每条 AC 只分给依赖闭包已提供其所需能力（host、API、CLI 最终结果、QA/Review 循环、systemd、doctor、TUI 等）的任务（CR3R-02）；拆分时把 REQ-039 按任务范围选代码的上下文来源（ADR-026 决定 12）分给一个实现任务，写进它的 done_when（CR-016）。"
+   "done_when": "本里程碑全部需求spec_maturity=detailed；validate_bundle通过；CR已APPROVED并relock；按每个实现任务≤2项需求、≤8条AC拆分本里程碑实现任务（更新 development-tasks.json 的 requirements/acceptance/checks/depends_on，validate_bundle 的归属规则通过）；每条 AC 只分给依赖闭包已提供其所需能力（host、API、CLI 最终结果、QA/Review 循环、systemd、doctor、TUI 等）的任务（CR3R-02）；拆分时把 REQ-039 按任务范围选代码的上下文来源（ADR-026 决定 12）分给一个实现任务，写进它的 done_when（CR-016）。拆分时把 CR-018 交给 M3-T02、M3-T04 的各项分给一个实现任务，写进它的 done_when（承接须有契约载体，M2T16D-1050）。"
   },
   {
    "id": "M3-T02",
@@ -897,7 +897,7 @@
     "REQ-033",
     "REQ-034"
    ],
-   "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）；TEST-032-01 的测试在 tests/bundle、名称含 test_032_01（traceability 自测据此定位）（CR-017，ADR-027 的移交）。"
+   "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）；TEST-032-01 的测试在 tests/bundle、名称含 test_032_01（traceability 自测据此定位）（CR-017，ADR-027 的移交）。规格变化置 STALE 时写 candidate.stale{candidate_id, reason}（ADR-028 决定 11 的持久取代事实）；规格事实源的位置替换 M2-T16 冻结使用的约定路径（ADR-028 决定 4）；以 SPEC_MISMATCH 被挡住的写 Task 经规格变更流程放行；spec.changed 的产生，并把验证中的候选按 REQ-053 行为 7 置 STALE；旧规格下的开发 Task 的迁移或替代（含 task_requirements 的需求映射，使它们在新规格下可派发）（CR-018）。"
   },
   {
    "id": "M3-T03",
@@ -937,7 +937,7 @@
     "REQ-023",
     "REQ-040"
    ],
-   "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。"
+   "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。steer/query 的产品路由与投递：ADR-018 决定 4 的投递循环接入 host 与它的消费者（领取永不取验证交接，ADR-028 决定 9），当前 epoch 的路由，M2T17R-153（新持有者首个输入之前不投递）、M2T17R-154（哪些 Commander 消息还要核对接收方的 epoch）、M2T17R-254（KeyReuse 计为一次拒绝、不重试到死信）（ADR-025 决定 10）；角色间咨询的 wait-for 环检测；接管之后的 query/steer 路由（取代 M2-T16 的 deferred 回应），历史上 deferred 的消息不补投（ADR-028 决定 13）（CR-018）。"
   },
   {
    "id": "M3-T05",
@@ -1073,7 +1073,7 @@
     "REQ-057",
     "REQ-063"
    ],
-   "done_when": "本里程碑全部需求spec_maturity=detailed；validate_bundle通过；CR已APPROVED并relock；按每个实现任务≤2项需求、≤8条AC拆分本里程碑实现任务（更新 development-tasks.json 的 requirements/acceptance/checks/depends_on，validate_bundle 的归属规则通过）；每条 AC 只分给依赖闭包已提供其所需能力（host、API、CLI 最终结果、QA/Review 循环、systemd、doctor、TUI 等）的任务（CR3R-02）。"
+   "done_when": "本里程碑全部需求spec_maturity=detailed；validate_bundle通过；CR已APPROVED并relock；按每个实现任务≤2项需求、≤8条AC拆分本里程碑实现任务（更新 development-tasks.json 的 requirements/acceptance/checks/depends_on，validate_bundle 的归属规则通过）；每条 AC 只分给依赖闭包已提供其所需能力（host、API、CLI 最终结果、QA/Review 循环、systemd、doctor、TUI 等）的任务（CR3R-02）。拆分时把 CR-018 交给 M5-T02 的各项分给一个实现任务，写进它的 done_when（承接须有契约载体，M2T16D-1050）。"
   },
   {
    "id": "M5-T02",
@@ -1092,7 +1092,7 @@
     "REQ-057",
     "REQ-063"
    ],
-   "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。"
+   "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。对最终候选的全范围验证（发布门禁，docs/06 的 Release Gate、REQ-056）是独立的义务，不开验证轮次、可在 ACCEPTED 的候选上进行、不迁移候选与 Task 的状态，由 Runtime 触发，使多 Task Run 的 Run→COMPLETED 可以满足（ADR-028 决定 9 的移交；在此之前门禁 fail-closed）（CR-018）。"
   },
   {
    "id": "M5-T03",
