@@ -684,6 +684,31 @@ async fn attempt(
         return Ok(());
     }
     let key = work.effect_key.clone();
+    // A verifier's handoff package kept as an object before its process starts: its RUNNING commit delivers it
+    // (docs/adr/ADR-028.md decision 9). Not kept, nothing starts: the attempt fails for another.
+    let handoff_package = match work.assignment.handoff.clone() {
+        Some(handoff) => {
+            let root = common.shared.root.clone();
+            let kept = tokio::task::spawn_blocking(move || keep_handoff(&root, &handoff))
+                .await
+                .unwrap_or_else(|e| Err(format!("its keeping ended: {e}")));
+            match kept {
+                Ok(kept) => Some(Box::new(kept)),
+                Err(why) => {
+                    store
+                        .runner_finished(
+                            &id,
+                            common.failed(format!(
+                                "HANDOFF_UNAVAILABLE: its package could not be kept: {why}"
+                            )),
+                        )
+                        .await?;
+                    return Ok(());
+                }
+            }
+        }
+        None => None,
+    };
     // On a blocking thread: the product's executor writes the turn's packed objects before it starts the process
     // (docs/adr/ADR-026.md decision 6).
     let executor = common.executor.clone();
@@ -754,6 +779,7 @@ async fn attempt(
             &id,
             AttemptFacts {
                 workspace_start: start,
+                handoff_package,
                 ..identity::running(&who)
             },
             tracking.json(&id),
@@ -925,6 +951,26 @@ async fn attempt(
     })
     .await?;
     Ok(())
+}
+
+/// Handoff `handoff`'s package kept as an object of the project at `root`: its message id and the object's row.
+fn keep_handoff(
+    root: &std::path::Path,
+    handoff: &hoh_core::persistence::Handoff,
+) -> Result<(String, hoh_core::persistence::ArtifactRow), String> {
+    let bytes = serde_json::to_vec(&handoff.package).map_err(|e| e.to_string())?;
+    let sha256 = hoh_core::objects::put(root, &bytes)?;
+    Ok((
+        handoff.message_id.clone(),
+        hoh_core::persistence::ArtifactRow {
+            path: hoh_core::objects::relative_path(&sha256),
+            sha256,
+            bytes: bytes.len() as u64,
+            mime: "application/json".to_owned(),
+            kind: "handoff".to_owned(),
+            name: handoff.message_id.clone(),
+        },
+    ))
 }
 
 /// The identity `work`'s prompt gave it, which every line of its bridge must name (docs/adr/ADR-028.md decision 2).

@@ -816,6 +816,8 @@ pub struct Assignment {
     pub supervision: Option<crate::persistence::Supervision>,
     /// What its context is packed from (docs/adr/ADR-026.md decision 3); none from a store too old to say.
     pub context: Option<crate::context::Facts>,
+    /// A verifier attempt's handoff, its dispatch's (docs/adr/ADR-028.md decision 9): its message id and package.
+    pub handoff: Option<Handoff>,
     /// Its task holds the write lease: a successful attempt ends through its completion commit (docs/adr/ADR-028.md
     /// decision 4).
     pub writer: bool,
@@ -863,6 +865,7 @@ pub(super) fn assignment(
                     first_input: false,
                     supervision: None,
                     context: None,
+                    handoff: None,
                     writer: r.get::<_, Option<bool>>(9)?.unwrap_or(false),
                 })
             },
@@ -881,14 +884,52 @@ pub(super) fn assignment(
     if role == super::wakes::COMMANDER {
         assignment.supervision = super::wakes::supervision_input(conn, run_id, attempt_id)?;
     }
-    assignment.context = Some(super::context::facts(
-        conn,
-        run_id,
-        task_id,
-        attempt_id,
-        assignment.supervision.as_ref(),
-    )?);
+    // A verifier's turn is packed from its handoff (docs/adr/ADR-028.md decisions 9 and 14).
+    assignment.handoff = handoff(conn, attempt_id)?;
+    assignment.context = Some(match &assignment.handoff {
+        Some(handoff) => super::context::verification(conn, &handoff.package)?,
+        None => super::context::facts(
+            conn,
+            run_id,
+            task_id,
+            attempt_id,
+            assignment.supervision.as_ref(),
+        )?,
+    });
     Ok(assignment)
+}
+
+/// A verifier attempt's handoff (docs/adr/ADR-028.md decision 9): its message id and its package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Handoff {
+    pub message_id: String,
+    pub package: crate::protocol::ContextHandoff,
+}
+
+/// The handoff attempt `attempt_id`'s dispatch names, if it names one.
+fn handoff(conn: &Connection, attempt_id: &str) -> Result<Option<Handoff>, PersistError> {
+    let named: Option<(String, String)> = conn
+        .query_row(
+            "SELECT h.message_id, h.payload_json FROM outbox d JOIN outbox h \
+             ON h.message_id = json_extract(d.payload_json, '$.handoff') WHERE d.message_id = ?1",
+            params![crate::ids::child_id(attempt_id, "dispatch")],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some((message_id, payload)) = named else {
+        return Ok(None);
+    };
+    let message: crate::protocol::Message = serde_json::from_str::<serde_json::Value>(&payload)
+        .map_err(|e| e.to_string())
+        .and_then(|v| crate::protocol::decode(&v).map_err(|e| e.to_string()))
+        .map_err(|e| PersistError::IntegrityViolation(format!("handoff {message_id}: {e}")))?;
+    let package = crate::protocol::decode(&serde_json::Value::Object(message.payload))
+        .map_err(|e| PersistError::IntegrityViolation(format!("handoff {message_id}: {e}")))?;
+    Ok(Some(Handoff {
+        message_id,
+        package,
+    }))
 }
 
 /// The id of the session of `role` at `role_epoch` in run `run_id`: one per run, role and epoch.

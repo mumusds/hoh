@@ -787,6 +787,55 @@ fn effect(
     Ok(true)
 }
 
+/// Handoff `message_id` delivered to verifier attempt `attempt_id` as it starts (docs/adr/ADR-028.md decision 9): its
+/// package object registered, the message ACKED, a `handoffs` row DELIVERED (one per message: a later attempt of the
+/// same verifier task finds it there); its `handoff.delivered` event.
+fn deliver_handoff(
+    tx: &Transaction<'_>,
+    project_id: &str,
+    run_id: &str,
+    attempt_id: &str,
+    message_id: &str,
+    package: &ArtifactRow,
+    at: &str,
+) -> Result<NewEvent, PersistError> {
+    register(tx, std::slice::from_ref(package))?;
+    let (role, role_epoch): (String, i64) = tx
+        .query_row(
+            "SELECT recipient_role, role_epoch FROM outbox WHERE message_id = ?1",
+            params![message_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(sqlite_error)?;
+    tx.execute(
+        "UPDATE outbox SET state = 'ACKED', next_retry_at = NULL WHERE message_id = ?1 \
+         AND state IN ('PENDING', 'DELIVERING')",
+        params![message_id],
+    )
+    .map_err(sqlite_error)?;
+    tx.execute(
+        "INSERT OR IGNORE INTO handoffs(handoff_id, run_id, from_role, to_role, role_epoch, package_artifact_id, state, \
+         created_at) VALUES (?1, ?2, 'runtime', ?3, ?4, ?5, 'DELIVERED', ?6)",
+        params![
+            message_id,
+            run_id,
+            role,
+            role_epoch,
+            artifact_id(&package.sha256, &package.path),
+            at
+        ],
+    )
+    .map_err(sqlite_error)?;
+    Ok(event(
+        project_id,
+        run_id,
+        child_id(attempt_id, "handoff"),
+        "handoff.delivered",
+        json!({"handoff_id": message_id, "attempt_id": attempt_id, "to_role": role, "role_epoch": role_epoch,
+            "package": package.json()}),
+    ))
+}
+
 /// A work attempt's bridge lines as one `attempt.outputs` event (docs/adr/ADR-028.md decision 2, M2T16D-404): its
 /// completion and a reconcile read them through hoh_core::bridge::parse. Registered once, by whichever of its work's
 /// OBSERVED and its end comes first (an UNKNOWN_EFFECT end has no OBSERVED); none when there is nothing to keep.
@@ -850,6 +899,19 @@ fn running(
         .started_at
         .clone()
         .unwrap_or_else(|| crate::time::rfc3339_utc(std::time::SystemTime::now()));
+    // A verifier's handoff, delivered in this commit (docs/adr/ADR-028.md decision 9).
+    let delivered = match facts.handoff_package.as_deref().cloned() {
+        Some((message_id, package)) => Some(deliver_handoff(
+            &tx,
+            &project_id,
+            &run_id,
+            attempt_id,
+            &message_id,
+            &package,
+            &at,
+        )?),
+        None => None,
+    };
     // A writer's workspace at its start, in this commit (docs/adr/ADR-028.md decisions 4 and 14).
     let workspace_start = facts.workspace_start.clone().map(|start| {
         let mut payload = json!({"attempt_id": attempt_id});
@@ -892,7 +954,7 @@ fn running(
         &tx,
         &Commit {
             cas,
-            events: packed.into_iter().chain(workspace_start).chain([
+            events: packed.into_iter().chain(workspace_start).chain(delivered).chain([
                 event(
                     &project_id,
                     &run_id,

@@ -1351,6 +1351,41 @@ async fn a_developers_completed_result_is_frozen_accepted_and_settled_in_one_com
             )?,
             git(&project, &["rev-parse", "HEAD"])?.trim()
         );
+        // The round's verifier tasks are dispatched by the Runtime (decision 10); each attempt's start delivers its
+        // handoff in its RUNNING commit: the message ACKED, a handoffs row DELIVERED whose package object is the
+        // message's package (decision 9).
+        let round = format!("{id}/round/1");
+        for role in ["qa", "reviewer"] {
+            let attempt = format!("{round}/task/{role}/attempt-1");
+            until(
+                &project,
+                &format!("SELECT count(*) FROM attempts WHERE attempt_id = '{attempt}' AND state != 'PREPARED' AND state != 'STARTING'"),
+                "1",
+                limit,
+            )
+            .await?;
+            let handoff = format!("{round}/verify/{role}");
+            assert_eq!(
+                state(&format!("SELECT state FROM outbox WHERE message_id = '{handoff}'"))?,
+                "ACKED",
+                "{role}"
+            );
+            assert_eq!(
+                state(&format!(
+                    "SELECT from_role || ':' || to_role || ':' || state FROM handoffs WHERE handoff_id = '{handoff}'"
+                ))?,
+                format!("runtime:{role}:DELIVERED")
+            );
+            let object = state(&format!(
+                "SELECT a.path FROM handoffs h JOIN artifacts a ON a.artifact_id = h.package_artifact_id \
+                 WHERE h.handoff_id = '{handoff}'"
+            ))?;
+            let package: Value = serde_json::from_slice(&std::fs::read(project.join(&object))?)?;
+            let message: Value = serde_json::from_str(&state(&format!(
+                "SELECT payload_json FROM outbox WHERE message_id = '{handoff}'"
+            ))?)?;
+            assert_eq!(package, message["payload"], "{role}");
+        }
         R::Ok(())
     }
     .await;

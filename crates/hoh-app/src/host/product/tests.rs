@@ -30,6 +30,7 @@ fn work(prompt: Option<&str>) -> Work {
                 ..hoh_core::context::Facts::default()
             }),
             writer: true,
+            handoff: None,
         },
     }
 }
