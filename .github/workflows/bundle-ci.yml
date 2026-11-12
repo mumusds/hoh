@@ -42,6 +42,11 @@ jobs:
       - run: rustup toolchain install  # installs the channel and components from rust-toolchain.toml
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # The Rust tests cross-check shapes with Python's jsonschema, date-time formats included (requirements-dev.txt).
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r requirements-dev.txt
       # TEST-006-02 traces hoh doctor's opens with strace (REQ-006: credential files are never opened).
       - run: sudo apt-get update -q && sudo apt-get install -y -q strace
       # The cgroup tracking tests (CR-011, ADR-021 decision 8d v5) run in a delegated scope of the user's systemd
