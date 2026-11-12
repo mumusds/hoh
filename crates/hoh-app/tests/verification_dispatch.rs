@@ -211,6 +211,10 @@ type RunDir = (String, Option<PathBuf>);
 struct Team {
     /// The Commander's turns are refused at their start (else answered).
     refuse: AtomicBool,
+    /// The project, whose objects keep a verifier's raw session log.
+    project: PathBuf,
+    /// The status a verifier's report block gives.
+    report: std::sync::Mutex<String>,
     spec: String,
     /// The Commander's turns started (refused ones included).
     commander_turns: Arc<AtomicU32>,
@@ -232,10 +236,12 @@ struct Team {
 }
 
 impl Team {
-    fn new(commander: Commander, spec: &str) -> Team {
+    fn new(commander: Commander, spec: &str, project: &Path) -> Team {
         Team {
             refuse: AtomicBool::new(commander.fails()),
             spec: spec.to_owned(),
+            project: project.to_owned(),
+            report: std::sync::Mutex::new("PASS".to_owned()),
             commander_turns: Arc::default(),
             fail: AtomicU32::new(0),
             release: Arc::default(),
@@ -274,6 +280,8 @@ impl hoh_app::host::Executor for Team {
         use std::os::unix::process::CommandExt as _;
         let transient = hoh_core::retry::FailureClass::Transient { retry_after: None };
         let mut messages = Vec::new();
+        let mut final_text = None;
+        let mut artifacts = Vec::new();
         let mut failed = false;
         let mut held = None;
         match work.role.as_str() {
@@ -325,8 +333,25 @@ impl hoh_app::host::Executor for Team {
                 if let Ok(mut dirs) = self.run_dirs.lock() {
                     dirs.push((role.to_owned(), work.run_dir.clone()));
                 }
-                // A verifier reports its work done through its bridge, as the product's agent does.
+                // A verifier reports its work done through its bridge, and its verdict in a hoh-report block of its
+                // final message, its raw session log kept as an object, as the product's agent and executor do.
                 if work.assignment.handoff.is_some() {
+                    let status = self.report.lock().map(|s| s.clone()).unwrap_or_default();
+                    final_text = Some(format!(
+                        "done\n```hoh-report\n{}\n```\n",
+                        json!({"status": status, "scope": ["AC-035-03"], "findings": []})
+                    ));
+                    let raw = format!("{}\n", json!({"type": "result", "result": final_text}));
+                    let sha256 = hoh_core::objects::put(&self.project, raw.as_bytes())
+                        .map_err(|e| refusal(&format!("RAW_LOG: {e}"), transient))?;
+                    artifacts.push(hoh_core::persistence::ArtifactRow {
+                        path: hoh_core::objects::relative_path(&sha256),
+                        sha256,
+                        bytes: raw.len() as u64,
+                        mime: "application/x-ndjson".to_owned(),
+                        kind: "raw_log".to_owned(),
+                        name: "stdout.jsonl".to_owned(),
+                    });
                     messages.push(
                         json!({
                             "schema_version": "1.0", "run_id": work.run_id, "task_id": work.task_id,
@@ -402,6 +427,8 @@ impl hoh_app::host::Executor for Team {
                 observed: hoh_core::persistence::Observed {
                     messages,
                     raw_log_path: Some(raw_log_path),
+                    final_text,
+                    artifacts,
                     ..Default::default()
                 },
                 unknown_effect: false,
@@ -452,7 +479,7 @@ async fn candidate_ready_hands_off(critical: bool) -> R<(u32, Value, Value)> {
     let (project, spec) = project(dir.path()).await?;
     seed(&project, &world(&spec))?;
     let clock = Arc::new(FakeClock::default());
-    let team = Arc::new(Team::new(Commander::Answers, &spec));
+    let team = Arc::new(Team::new(Commander::Answers, &spec, &project));
     let host = host(&project, team.clone(), clock.clone()).await?;
     let outcome = async {
         let step = Duration::from_millis(100);
@@ -531,7 +558,7 @@ async fn test_035_05_with_the_commander_unavailable_qa_and_review_are_still_disp
     let (project, spec) = project(dir.path()).await?;
     seed(&project, &world(&spec))?;
     let clock = Arc::new(FakeClock::default());
-    let team = Arc::new(Team::new(Commander::FailsAtStart, &spec));
+    let team = Arc::new(Team::new(Commander::FailsAtStart, &spec, &project));
     team.developer.store(false, Ordering::SeqCst);
     let host = host(&project, team.clone(), clock.clone()).await?;
     let outcome = async {
@@ -605,7 +632,7 @@ async fn test_036_03_three_attempts_then_qa_in_a_session_of_its_own() -> R {
     let (project, spec) = project(dir.path()).await?;
     seed(&project, &world(&spec))?;
     let clock = Arc::new(FakeClock::default());
-    let team = Arc::new(Team::new(Commander::Answers, &spec));
+    let team = Arc::new(Team::new(Commander::Answers, &spec, &project));
     team.fail.store(2, Ordering::SeqCst);
     let host = host(&project, team.clone(), clock.clone()).await?;
     let outcome = async {
@@ -723,7 +750,7 @@ async fn test_021_05_a_critical_issue_wakes_the_reserved_slot_and_handoffs_survi
         ),
     )?;
     let clock = Arc::new(FakeClock::default());
-    let team = Arc::new(Team::new(Commander::Answers, &spec));
+    let team = Arc::new(Team::new(Commander::Answers, &spec, &project));
     team.developer.store(false, Ordering::SeqCst);
     let host = host(&project, team.clone(), clock.clone()).await?;
     let outcome = async {
@@ -847,7 +874,7 @@ async fn each_verifier_works_in_a_checkout_of_the_candidate_outside_the_project_
     let (project, spec) = project(dir.path()).await?;
     seed(&project, &world(&spec))?;
     let clock = Arc::new(FakeClock::default());
-    let team = Arc::new(Team::new(Commander::Answers, &spec));
+    let team = Arc::new(Team::new(Commander::Answers, &spec, &project));
     let host = host(&project, team.clone(), clock.clone()).await?;
     let outcome = async {
         let step = Duration::from_millis(100);
@@ -905,6 +932,27 @@ async fn each_verifier_works_in_a_checkout_of_the_candidate_outside_the_project_
             )?,
             json!([{"status": "COMPLETED"}])
         );
+        // Each with its report: the block's status, the report kept as an object valid under its schema, naming the
+        // attempt's HoH session and the candidate (decision 15).
+        let reports = rows(
+            &project,
+            "SELECT json_extract(payload_json, '$.role') AS role, json_extract(payload_json, '$.status') AS status, \
+             json_extract(payload_json, '$.report.path') AS path FROM events WHERE kind = 'verification.report' \
+             ORDER BY json_extract(payload_json, '$.role')",
+        )?;
+        let reports = reports.as_array().ok_or("no reports")?;
+        assert_eq!(reports.len(), 2);
+        for r in reports {
+            assert_eq!(r["status"], json!("PASS"), "{r}");
+            let report: Value = serde_json::from_slice(&std::fs::read(
+                project.join(r["path"].as_str().ok_or("no path")?),
+            )?)?;
+            assert_eq!(report["candidate_id"], json!(id), "{report}");
+            assert!(
+                hoh_core::schema::independent_report().validate(&report).is_ok(),
+                "{report}"
+            );
+        }
         wait_for(
             &project,
             &clock,
@@ -936,7 +984,7 @@ async fn a_verifier_that_changes_its_run_directory_makes_the_candidate_invalid()
     let (project, spec) = project(dir.path()).await?;
     seed(&project, &world(&spec))?;
     let clock = Arc::new(FakeClock::default());
-    let team = Arc::new(Team::new(Commander::Answers, &spec));
+    let team = Arc::new(Team::new(Commander::Answers, &spec, &project));
     team.tamper.store(true, Ordering::SeqCst);
     team.release.store(true, Ordering::SeqCst);
     let host = host(&project, team.clone(), clock.clone()).await?;
@@ -996,7 +1044,7 @@ async fn a_verifier_runs_planned_checks_and_asks_through_its_request_helpers() -
     let (project, spec) = project(dir.path()).await?;
     seed(&project, &world(&spec))?;
     let clock = Arc::new(FakeClock::default());
-    let mut team = Team::new(Commander::Answers, &spec);
+    let mut team = Team::new(Commander::Answers, &spec, &project);
     team.out = dir.path().join("out");
     std::fs::create_dir_all(&team.out)?;
     let script = format!(

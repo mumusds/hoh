@@ -111,11 +111,100 @@ fn result_of(
     })
 }
 
-/// What a successful verifier attempt's bridge decides (decision 11): COMPLETED settles it; a legal FAILED, BLOCKED or
-/// INCOMPLETE verifies again within its round; anything else is corrected.
-pub(super) fn verifier_outcome(identity: &Identity, ending: &mut Ending) -> VerifierOutcome {
+/// What a verifier's report is made from beyond its turn (decision 15).
+pub(super) struct Reporting {
+    pub project: std::path::PathBuf,
+    pub role: String,
+    /// Its HoH session (`independent_reports.session_id` references `sessions`, M2T16D-360).
+    pub session_id: String,
+    pub candidate_id: String,
+    pub spec_sha256: String,
+}
+
+/// The report of a verifier's turn (decision 15): the ```hoh-report block of its final assistant message, completed
+/// with its HoH session, the candidate, the spec, its raw session log (kept as an object at its end) and the native
+/// attempt export the Runtime writes; both kept as objects. Why not, when it cannot be made. Blocking.
+fn report_of(
+    r: &Reporting,
+    ending: &Ending,
+) -> Result<hoh_core::persistence::VerifierReport, String> {
+    use hoh_core::verification::report;
+    let text = ending
+        .observed
+        .final_text
+        .as_deref()
+        .ok_or("its final assistant message is missing")?;
+    let body = report::block(text, &r.role)?;
+    let raw = ending
+        .observed
+        .artifacts
+        .iter()
+        .find(|a| a.kind.starts_with("raw_log") && a.name.starts_with("stdout"))
+        .ok_or("its raw session log was not kept")?;
+    let mut sessions = vec![r.session_id.clone()];
+    sessions.extend(ending.observed.native_session.clone());
+    let keep = |value: &serde_json::Value,
+                kind: &str,
+                name: &str|
+     -> Result<hoh_core::persistence::ArtifactRow, String> {
+        let bytes = serde_json::to_vec(value).map_err(|e| e.to_string())?;
+        let sha256 = hoh_core::objects::put(&r.project, &bytes)?;
+        Ok(hoh_core::persistence::ArtifactRow {
+            path: hoh_core::objects::relative_path(&sha256),
+            sha256,
+            bytes: bytes.len() as u64,
+            mime: "application/json".to_owned(),
+            kind: kind.to_owned(),
+            name: name.to_owned(),
+        })
+    };
+    let native = keep(
+        &report::native_attempt(&r.role, "SETTLED", &sessions, &r.candidate_id, &raw.sha256)?,
+        "native_attempt",
+        "native-attempt.json",
+    )?;
+    let reference = |a: &hoh_core::persistence::ArtifactRow| report::ObjectRef {
+        path: a.path.clone(),
+        sha256: a.sha256.clone(),
+    };
+    let built = report::build(
+        &body,
+        &r.role,
+        &r.session_id,
+        (&r.candidate_id, &r.spec_sha256),
+        &reference(raw),
+        &reference(&native),
+    )?;
+    Ok(hoh_core::persistence::VerifierReport {
+        role: r.role.clone(),
+        status: built["status"].as_str().unwrap_or_default().to_owned(),
+        report: keep(&built, "independent_report", "independent-report.json")?,
+        native_attempt: native,
+    })
+}
+
+/// What a successful verifier attempt's bridge decides (decision 11): COMPLETED with a valid report settles it; a
+/// legal FAILED, BLOCKED or INCOMPLETE verifies again within its round; anything else, a missing or invalid report
+/// included, is corrected (decision 15). Blocking (its report's objects).
+pub(super) fn verifier_outcome(
+    identity: &Identity,
+    ending: &mut Ending,
+    reporting: Option<&Reporting>,
+) -> VerifierOutcome {
     match result_of(identity, ending) {
-        Ok(result) if result.status == TaskStatus::Completed => VerifierOutcome::Settle,
+        Ok(result) if result.status == TaskStatus::Completed => {
+            match reporting
+                .ok_or_else(|| "its report could not be made here".to_owned())
+                .and_then(|r| report_of(r, ending))
+            {
+                Ok(report) => VerifierOutcome::Settle {
+                    report: Box::new(report),
+                },
+                Err(why) => VerifierOutcome::Correct {
+                    reasons: vec![format!("its report: {why}")],
+                },
+            }
+        }
         Ok(result) => VerifierOutcome::Reverify {
             status: serde_json::to_value(result.status)
                 .ok()
@@ -135,9 +224,16 @@ pub(super) async fn complete_verifier(
     store: &Store,
     identity: &Identity,
     ending: Ending,
+    reporting: Option<Reporting>,
 ) -> Result<hoh_core::persistence::VerifierCompleted, PersistError> {
-    let mut ending = ending;
-    let outcome = verifier_outcome(identity, &mut ending);
+    let held = identity.clone();
+    let (outcome, ending) = tokio::task::spawn_blocking(move || {
+        let mut ending = ending;
+        let outcome = verifier_outcome(&held, &mut ending, reporting.as_ref());
+        (outcome, ending)
+    })
+    .await
+    .map_err(|e| PersistError::Storage(format!("the completion of a verifier ended: {e}")))?;
     store
         .complete_verifier_attempt(VerifierCompletion {
             attempt_id: identity.attempt_id.clone(),
@@ -221,8 +317,9 @@ pub(super) async fn recover(
     if row.writer {
         complete(store, project, identity, ending).await
     } else {
-        // A verifier's: its result from the same bridge (decision 11).
-        complete_verifier(store, &identity, ending)
+        // A verifier's: its result from the same bridge (decision 11); its final message is not kept across a restart,
+        // so a COMPLETED result cannot be reported here and is corrected (verified again).
+        complete_verifier(store, &identity, ending, None)
             .await
             .map(|_| WriterCompleted::AlreadyEnded)
     }
