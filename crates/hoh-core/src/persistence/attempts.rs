@@ -147,6 +147,9 @@ pub struct AttemptFacts {
     /// interrupted end of the writer lease's holder needs it and writes it as `attempt.workspace` before its lease goes
     /// (REQ-019 behaviour 6, docs/adr/ADR-024.md decision 9).
     pub workspace: Option<Value>,
+    /// A writer's workspace when it starts (`{head}`, the HEAD commit or null), written as `attempt.workspace_start` in
+    /// its RUNNING commit: the base of its changed files (docs/adr/ADR-028.md decisions 4 and 14).
+    pub workspace_start: Option<Value>,
 }
 
 /// Move attempt `attempt_id` from `from` to `to`.

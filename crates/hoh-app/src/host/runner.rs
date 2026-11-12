@@ -21,7 +21,8 @@ use hoh_agents::identity;
 use hoh_core::decision::Context;
 use hoh_core::delivery::Clock;
 use hoh_core::persistence::{
-    Commit, DispatchNotice, Ending, NewEvent, PersistError, SessionStart, UnfinishedRow,
+    AttemptFacts, Commit, DispatchNotice, Ending, NewEvent, PersistError, SessionStart,
+    UnfinishedRow,
 };
 use hoh_core::reconcile::{
     Disposition, Effect, EffectState, Process, Unfinished, dispose, work_key,
@@ -716,7 +717,15 @@ async fn attempt(
     let pid = started.pid;
     let cgroups = common.shared.cgroups.clone();
     let marker = work.marker();
-    let (who, tracking) = tokio::task::spawn_blocking(move || {
+    // A writer's workspace at its start: its HEAD, the base of its changed files (docs/adr/ADR-028.md decisions 4, 14).
+    let root = work.assignment.writer.then(|| common.shared.root.clone());
+    let (who, tracking, start) = tokio::task::spawn_blocking(move || {
+        let start = root.map(|root| {
+            let head = super::control::git(&root, &["rev-parse", "--verify", "HEAD"])
+                .ok()
+                .map(|out| String::from_utf8_lossy(&out).trim().to_owned());
+            json!({ "head": head })
+        });
         let tracking = match cgroups {
             Some(delegated) => match AttemptGroup::adopt(&delegated.attempt(&marker), pid) {
                 Ok(group) => Tracking::of_group(&group),
@@ -724,7 +733,7 @@ async fn attempt(
             },
             None => Tracking::Proc("the host has no delegated cgroup".to_owned()),
         };
-        (identity::of(pid).ok().flatten(), tracking)
+        (identity::of(pid).ok().flatten(), tracking, start)
     })
     .await
     .map_err(|e| PersistError::Storage(format!("the identity of {id}'s process: {e}")))?;
@@ -743,7 +752,10 @@ async fn attempt(
     if !store
         .runner_running_with(
             &id,
-            identity::running(&who),
+            AttemptFacts {
+                workspace_start: start,
+                ..identity::running(&who)
+            },
             tracking.json(&id),
             started.prompt.clone(),
         )
