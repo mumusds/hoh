@@ -127,6 +127,39 @@ pub fn post(dir: &Path, pre_tree: &Value, m: &Manifest) -> TreeCheck {
     }
 }
 
+/// Candidate `candidate_id`'s sealed manifest as the freeze kept it (an object of the project at `project`) and its run.
+/// Blocking.
+pub fn sealed_of(
+    reader: &hoh_core::persistence::Reader,
+    project: &Path,
+    candidate_id: &str,
+) -> Result<(Sealed, String), String> {
+    let row = reader
+        .candidate(candidate_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("candidate {candidate_id} is not frozen in this project"))?;
+    let export = row.source_path.rsplit('/').next().unwrap_or_default();
+    let sealed = hoh_core::objects::get(project, export)
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).map_err(|e| e.to_string()))
+        .and_then(|value| Sealed::from_value(&value))?;
+    if sealed.candidate_id != candidate_id {
+        return Err(format!(
+            "the manifest kept for {candidate_id} computes {}",
+            sealed.candidate_id
+        ));
+    }
+    Ok((sealed, row.run_id))
+}
+
+/// The check a verifier's attempt-level record names (decision 8).
+pub fn check_of(role: &str) -> &'static str {
+    if role == "reviewer" {
+        "independent-review"
+    } else {
+        "independent-qa"
+    }
+}
+
 /// Remove the run directory `dir` (after its attempt is settled); one already gone is fine.
 pub fn remove(dir: &Path) {
     let _ = std::fs::remove_dir_all(dir);

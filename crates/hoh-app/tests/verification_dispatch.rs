@@ -200,6 +200,9 @@ impl Commander {
     }
 }
 
+/// A verifier work's role and the run directory its start was given.
+type RunDir = (String, Option<PathBuf>);
+
 /// Plays every role of run R (see the module's head).
 #[derive(Debug)]
 struct Team {
@@ -212,6 +215,10 @@ struct Team {
     fail: AtomicU32,
     /// Lets the held FakeAgents (verifiers and other readers) end.
     release: Arc<AtomicBool>,
+    /// The qa FakeAgent writes a file into its working directory before it ends.
+    tamper: AtomicBool,
+    /// Each verifier work's role and run directory, as given to its start.
+    run_dirs: Arc<std::sync::Mutex<Vec<RunDir>>>,
     /// Lets the Developer's FakeAgent end (set: it is not held).
     developer: Arc<AtomicBool>,
 }
@@ -224,6 +231,8 @@ impl Team {
             commander_turns: Arc::default(),
             fail: AtomicU32::new(0),
             release: Arc::default(),
+            tamper: AtomicBool::new(false),
+            run_dirs: Arc::default(),
             developer: Arc::new(AtomicBool::new(true)),
         }
     }
@@ -301,10 +310,24 @@ impl hoh_app::host::Executor for Team {
                     );
                 }
             }
-            _ => held = Some(self.release.clone()),
+            role => {
+                held = Some(self.release.clone());
+                if let Ok(mut dirs) = self.run_dirs.lock() {
+                    dirs.push((role.to_owned(), work.run_dir.clone()));
+                }
+            }
         }
-        let mut child = Command::new("sh")
-            .args(["-c", "read -r go; exit 0"])
+        let script = if work.role == "qa" && self.tamper.load(Ordering::SeqCst) {
+            "read -r go; echo changed > tampered.txt; exit 0"
+        } else {
+            "read -r go; exit 0"
+        };
+        let mut command = Command::new("sh");
+        if let Some(dir) = &work.run_dir {
+            command.current_dir(dir);
+        }
+        let mut child = command
+            .args(["-c", script])
             .process_group(0)
             .stdin(std::process::Stdio::piped())
             .spawn()
@@ -367,6 +390,8 @@ async fn host(project: &Path, team: Arc<Team>, clock: Arc<FakeClock>) -> R<Host>
             required_capabilities: ["commander", "developer", "qa", "reviewer", "researcher"]
                 .map(|r| (r.to_owned(), Default::default()))
                 .into(),
+            // Commander directories, and the run directories beside them, in the test's own directory.
+            commander_dir: project.parent().map(|d| d.join("state/hoh/commander")),
             ..Context::default()
         },
     });
@@ -749,6 +774,150 @@ async fn test_021_05_a_critical_issue_wakes_the_reserved_slot_and_handoffs_survi
             );
         }
         team.release.store(true, Ordering::SeqCst);
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    outcome
+}
+
+/// The candidate's commit and tree, and its id.
+fn candidate(project: &Path) -> R<(String, String, String)> {
+    let row = rows(
+        project,
+        "SELECT candidate_id, git_commit, git_tree FROM candidates",
+    )?;
+    let text = |k: &str| {
+        row[0][k]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or(format!("no {k}"))
+    };
+    Ok((
+        text("candidate_id")?,
+        text("git_commit")?,
+        text("git_tree")?,
+    ))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_verifier_works_in_a_checkout_of_the_candidate_outside_the_project_checked_at_both_ends()
+-> R {
+    // docs/adr/ADR-028.md decisions 6 and 8 (REQ-037 behaviours 3 and 5): each verifier attempt is started in its own
+    // run directory outside the project tree, a checkout at the candidate's commit and tree, recorded with its
+    // pre_tree in verification.attempt_started; at its end verification.tree_checked says it is unchanged, and the
+    // directory is removed once the attempt is settled.
+    let dir = tempfile::tempdir()?;
+    let (project, spec) = project(dir.path()).await?;
+    seed(&project, &world(&spec))?;
+    let clock = Arc::new(FakeClock::default());
+    let team = Arc::new(Team::new(Commander::Answers, &spec));
+    let host = host(&project, team.clone(), clock.clone()).await?;
+    let outcome = async {
+        let step = Duration::from_millis(100);
+        // Both started (their start was given its run directory before RUNNING).
+        wait_for(
+            &project,
+            &clock,
+            step,
+            "SELECT count(*) AS n FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+             WHERE t.role IN ('qa', 'reviewer') AND a.state = 'RUNNING'",
+            &|r| r[0]["n"] == json!(2),
+        )?;
+        let (id, commit, tree) = candidate(&project)?;
+        let dirs = team.run_dirs.lock().map(|d| d.clone()).unwrap_or_default();
+        assert_eq!(dirs.len(), 2, "{dirs:?}");
+        for (role, run_dir) in &dirs {
+            let run_dir = run_dir.as_ref().ok_or(format!("{role} has no run directory"))?;
+            assert!(!run_dir.starts_with(&project), "{role}: {}", run_dir.display());
+            let head = Command::new("git").args(["rev-parse", "HEAD", "HEAD^{tree}"]).current_dir(run_dir).output()?;
+            assert_eq!(String::from_utf8(head.stdout)?, format!("{commit}\n{tree}\n"), "{role}");
+        }
+        let started = rows(
+            &project,
+            "SELECT json_extract(payload_json, '$.run_dir') AS run_dir, json_extract(payload_json, '$.pre_tree.head') AS head, \
+             json_extract(payload_json, '$.candidate_id') AS candidate FROM events WHERE kind = 'verification.attempt_started' \
+             ORDER BY seq",
+        )?;
+        assert_eq!(started.as_array().map(Vec::len), Some(2), "{started}");
+        for s in started.as_array().into_iter().flatten() {
+            assert_eq!((&s["head"], &s["candidate"]), (&json!(commit), &json!(id)), "{s}");
+        }
+        team.release.store(true, Ordering::SeqCst);
+        let checked = wait_for(
+            &project,
+            &clock,
+            step,
+            "SELECT json_extract(payload_json, '$.equal') AS equal FROM events WHERE kind = 'verification.tree_checked'",
+            &|r| r.as_array().is_some_and(|a| a.len() == 2),
+        )?;
+        assert_eq!(checked, json!([{"equal": 1}, {"equal": 1}]));
+        wait_for(
+            &project,
+            &clock,
+            step,
+            "SELECT count(*) AS n FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+             WHERE t.role IN ('qa', 'reviewer') AND a.state = 'SETTLED'",
+            &|r| r[0]["n"] == json!(2),
+        )?;
+        let end = Instant::now() + Duration::from_secs(10);
+        while dirs.iter().any(|(_, d)| d.as_ref().is_some_and(|d| d.exists())) && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        for (role, run_dir) in &dirs {
+            assert!(run_dir.as_ref().is_some_and(|d| !d.exists()), "{role}'s run directory was left");
+        }
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_verifier_that_changes_its_run_directory_makes_the_candidate_invalid() -> R {
+    // docs/adr/ADR-028.md decision 8: the qa FakeAgent writes a file into its run directory; at its end the tree check
+    // finds it changed (its status shows the file) and the attempt-level marker record makes the evidence INVALID, the
+    // candidate INVALID, with integrity_violation.
+    let dir = tempfile::tempdir()?;
+    let (project, spec) = project(dir.path()).await?;
+    seed(&project, &world(&spec))?;
+    let clock = Arc::new(FakeClock::default());
+    let team = Arc::new(Team::new(Commander::Answers, &spec));
+    team.tamper.store(true, Ordering::SeqCst);
+    team.release.store(true, Ordering::SeqCst);
+    let host = host(&project, team.clone(), clock.clone()).await?;
+    let outcome = async {
+        let step = Duration::from_millis(100);
+        let checked = wait_for(
+            &project,
+            &clock,
+            step,
+            "SELECT json_extract(payload_json, '$.equal') AS equal, json_extract(payload_json, '$.status') AS status \
+             FROM events WHERE kind = 'verification.tree_checked' AND json_extract(payload_json, '$.attempt_id') LIKE '%task/qa%'",
+            &|r| r.as_array().is_some_and(|a| !a.is_empty()),
+        )?;
+        assert_eq!(checked[0]["equal"], json!(0), "{checked}");
+        assert!(
+            checked[0]["status"].as_str().is_some_and(|s| s.contains("tampered.txt")),
+            "{checked}"
+        );
+        let evidence = wait_for(
+            &project,
+            &clock,
+            step,
+            "SELECT outcome, check_id FROM evidence",
+            &|r| r.as_array().is_some_and(|a| !a.is_empty()),
+        )?;
+        assert_eq!(evidence, json!([{"outcome": "INVALID", "check_id": "independent-qa"}]));
+        assert_eq!(
+            rows(&project, "SELECT state FROM candidates")?,
+            json!([{"state": "INVALID"}])
+        );
+        assert_eq!(
+            rows(&project, "SELECT count(*) AS n FROM events WHERE kind = 'integrity_violation'")?[0]["n"],
+            json!(1)
+        );
         R::Ok(())
     }
     .await;

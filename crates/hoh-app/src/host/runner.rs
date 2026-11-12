@@ -49,6 +49,9 @@ pub struct Work {
     /// What it runs as: its binding's agent, model and session, the role's prompt, the run's goal and the task's title
     /// (docs/adr/ADR-022.md decisions 9 to 12; test executors need none of it).
     pub assignment: hoh_core::persistence::Assignment,
+    /// A verifier's run directory, its working directory: the candidate's checkout outside the project
+    /// (docs/adr/ADR-028.md decision 6); none for any other work.
+    pub run_dir: Option<std::path::PathBuf>,
 }
 
 impl Work {
@@ -251,6 +254,8 @@ struct Common {
     undelivered: std::sync::Mutex<std::collections::BTreeSet<String>>,
     /// Each run's supervisor step failure already said, by its text (docs/adr/ADR-025.md v13 decision 5).
     unsupervised: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    /// Where verifiers' run directories go (docs/adr/ADR-028.md decision 6).
+    runs: std::path::PathBuf,
 }
 
 impl Common {
@@ -305,6 +310,7 @@ pub(super) async fn run(
         inflight,
         undelivered: std::sync::Mutex::default(),
         unsupervised: std::sync::Mutex::default(),
+        runs: crate::verify::rundir::root(config.context.commander_dir.as_deref()),
     });
     let registry = config.executor.registry();
     let watch = registry
@@ -620,6 +626,7 @@ async fn tick(
             role: notice.role.clone(),
             effect_key: work_key(&id),
             assignment: notice.assignment.clone(),
+            run_dir: None,
         };
         let Ok(mut inflight) = common.inflight.lock() else {
             continue;
@@ -709,10 +716,40 @@ async fn attempt(
         }
         None => None,
     };
+    // A verifier's run directory: the candidate's checkout outside the project, prepared and checked before anything
+    // starts; not prepared, nothing starts (docs/adr/ADR-028.md decision 6).
+    let verifier = match &work.assignment.handoff {
+        Some(handoff) => {
+            let candidate = handoff.package.candidate.as_ref().map(|c| c.id.as_str());
+            match super::verifying::prepare(
+                store,
+                &common.shared.root,
+                &common.runs,
+                (&work.project_id, &id, &work.role),
+                candidate,
+            )
+            .await?
+            {
+                Ok(v) => Some(v),
+                Err(why) => {
+                    let ending = super::verifying::unprepared(common.failed(String::new()), why);
+                    store.runner_finished(&id, ending).await?;
+                    return Ok(());
+                }
+            }
+        }
+        None => None,
+    };
+    let remove_run_dir = || {
+        if let Some(v) = &verifier {
+            crate::verify::rundir::remove(&v.dir);
+        }
+    };
     // On a blocking thread: the product's executor writes the turn's packed objects before it starts the process
     // (docs/adr/ADR-026.md decision 6).
     let executor = common.executor.clone();
-    let held = work.clone();
+    let mut held = work.clone();
+    held.run_dir = verifier.as_ref().map(|v| v.dir.clone());
     let start = tokio::task::spawn_blocking(move || executor.start(&held))
         .await
         .unwrap_or_else(|e| Err(Refusal::from(format!("its start was lost: {e}"))));
@@ -732,6 +769,7 @@ async fn attempt(
                 ));
             }
             store.runner_finished(&id, ending).await?;
+            remove_run_dir();
             return Ok(());
         }
     };
@@ -770,6 +808,7 @@ async fn attempt(
                 common.failed("the identity of its process could not be read".to_owned()),
             )
             .await?;
+        remove_run_dir();
         return Ok(());
     };
     hooks.runner(RunnerPoint::AfterSpawn);
@@ -780,6 +819,7 @@ async fn attempt(
             AttemptFacts {
                 workspace_start: start,
                 handoff_package,
+                verification_start: verifier.as_ref().map(|v| Box::new(v.started())),
                 ..identity::running(&who)
             },
             tracking.json(&id),
@@ -788,6 +828,7 @@ async fn attempt(
         .await?
     {
         // Disposed of meanwhile: the gate is dropped unopened, so the process ends without running anything.
+        remove_run_dir();
         return Ok(());
     }
     if let Err(detail) = started.gate.open() {
@@ -925,7 +966,12 @@ async fn attempt(
         return Ok(());
     }
     hooks.runner(RunnerPoint::AfterEffectCommitted);
-    let ending = Ending {
+    // A verifier's run directory looked at again before its end (docs/adr/ADR-028.md decision 8).
+    let tree_checked = match &verifier {
+        Some(v) => Some(super::verifying::check(store, &common.shared.root, &id, v).await),
+        None => None,
+    };
+    let mut ending = Ending {
         success: outcome.success,
         detail: outcome.detail.clone(),
         class: outcome.class,
@@ -934,6 +980,7 @@ async fn attempt(
         observed: outcome.observed.clone(),
         unknown_effect: unknown,
     };
+    ending.observed.events.extend(tree_checked);
     // A writer's success is its completion, still under its write lease and its processes proven gone above: frozen and
     // accepted, corrected or decided by its bridge, and settled, in one commit (docs/adr/ADR-028.md decisions 3, 4).
     if work.assignment.writer && ending.success && !unknown {
@@ -950,6 +997,8 @@ async fn attempt(
         store.runner_finished(id, ending)
     })
     .await?;
+    // Settled: its run directory is no longer needed (decision 6).
+    remove_run_dir();
     Ok(())
 }
 

@@ -884,8 +884,12 @@ pub(super) fn assignment(
     if role == super::wakes::COMMANDER {
         assignment.supervision = super::wakes::supervision_input(conn, run_id, attempt_id)?;
     }
-    // A verifier's turn is packed from its handoff (docs/adr/ADR-028.md decisions 9 and 14).
+    // A verifier's turn is packed from its handoff (docs/adr/ADR-028.md decisions 9 and 14), in a new native session
+    // each time: its run directory is new, and it carries nothing of an earlier candidate (decision 6).
     assignment.handoff = handoff(conn, attempt_id)?;
+    if assignment.handoff.is_some() {
+        assignment.native_session = None;
+    }
     assignment.context = Some(match &assignment.handoff {
         Some(handoff) => super::context::verification(conn, &handoff.package)?,
         None => super::context::facts(

@@ -256,6 +256,24 @@ pub(super) async fn apply(
     draw: u32,
 ) -> Result<i64, PersistError> {
     let complete = matches!(disposition, Disposition::Complete { .. });
+    // A verifier's run directory looked at again before its attempt ends, and removed after (docs/adr/ADR-028.md
+    // decisions 6 and 8).
+    let ends = matches!(
+        disposition,
+        Disposition::Ended { .. }
+            | Disposition::Completed { .. }
+            | Disposition::UnknownEffect { .. }
+    );
+    let run_dir = if ends {
+        super::verifying::check_at_reconcile(
+            store,
+            project,
+            (&row.project_id, &row.run_id, &row.attempt_id),
+        )
+        .await?
+    } else {
+        None
+    };
     let found = row.clone();
     let seq = super::control::recorded_end(project, move |workspace| {
         let row = UnfinishedRow {
@@ -267,6 +285,9 @@ pub(super) async fn apply(
     .await?;
     if complete {
         super::completion::recover(store, project, &found, cause, at, draw).await?;
+    }
+    if let Some(dir) = run_dir {
+        crate::verify::rundir::remove(&dir);
     }
     Ok(seq)
 }

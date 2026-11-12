@@ -735,6 +735,7 @@ mod tests {
             role: "developer".to_owned(),
             effect_key: "A1/work".to_owned(),
             assignment: hoh_core::persistence::Assignment::default(),
+            run_dir: None,
         };
         for reached in [true, false] {
             let mut control = AttemptControl {

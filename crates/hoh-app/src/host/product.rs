@@ -484,7 +484,8 @@ impl ProductExecutor {
                 })?;
                 PathBuf::from(dir)
             }
-            None => self.project.clone(),
+            // A verifier works in its run directory, the candidate's checkout (docs/adr/ADR-028.md decision 6).
+            None => work.run_dir.clone().unwrap_or_else(|| self.project.clone()),
         };
         let spec = Spec {
             cwd,

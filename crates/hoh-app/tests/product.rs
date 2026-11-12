@@ -1164,6 +1164,7 @@ async fn once_a_turn_ended_the_executor_no_longer_holds_it_and_a_cancel_reaches_
             role: "developer".to_owned(),
             effect_key: String::new(),
             assignment: hoh_core::persistence::Assignment::default(),
+            run_dir: None,
         };
         let end = Instant::now() + Duration::from_secs(5);
         while executor.cancel(&work) && Instant::now() < end {
