@@ -493,16 +493,18 @@ pub(super) fn move_attempt(
     )?;
     if m.to == AttemptState::Settled {
         // The shared rule of completion, on every path that settles an attempt (docs/adr/ADR-025.md decision 3): a
-        // work task records task.implemented with its risk_reduction (intensive supervision wakes on it).
-        let (project_id, run_id, role, risk): (String, String, String, i64) = tx
+        // work task records task.implemented with its risk_reduction (intensive supervision wakes on it). Not a writer's
+        // settle that sent its task back for a correction or blocked it for a decision, already moved in this
+        // transaction: it implemented nothing (docs/adr/ADR-028.md decision 3).
+        let (project_id, run_id, role, risk, state): (String, String, String, i64, String) = tx
             .query_row(
-                "SELECT r.project_id, t.run_id, t.role, t.risk_reduction FROM tasks t JOIN runs r ON r.run_id = t.run_id \
-                 WHERE t.task_id = ?1",
+                "SELECT r.project_id, t.run_id, t.role, t.risk_reduction, t.state FROM tasks t \
+                 JOIN runs r ON r.run_id = t.run_id WHERE t.task_id = ?1",
                 params![task_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .map_err(sqlite_error)?;
-        if role != super::wakes::COMMANDER {
+        if role != super::wakes::COMMANDER && !matches!(state.as_str(), "READY" | "BLOCKED") {
             super::writer::write(
                 tx,
                 &super::writer::Commit {
