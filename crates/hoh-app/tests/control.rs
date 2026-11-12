@@ -1287,6 +1287,7 @@ async fn cancel_with_a_writer_outside(
             effect_key: String::new(),
             assignment: Default::default(),
             run_dir: None,
+            helpers: None,
         }
         .marker()
     };
@@ -1526,6 +1527,7 @@ fn t1_marker(project: &Path) -> R<String> {
         effect_key: String::new(),
         assignment: Default::default(),
         run_dir: None,
+        helpers: None,
     }
     .marker())
 }

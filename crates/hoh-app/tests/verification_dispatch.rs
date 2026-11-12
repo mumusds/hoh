@@ -134,6 +134,9 @@ fn git(dir: &Path, args: &[&str]) -> R {
     Ok(())
 }
 
+/// The project's frozen check plan: `unit` fails with exit code 1 and changes nothing.
+const PLAN: &str = "{\"schema_version\": \"1.0\", \"plan_id\": \"fixture\", \"checks\": {\"unit\": {\"mode\": \"product\", \"argv\": [\"sh\", \"-c\", \"exit 1\"]}}}\n";
+
 /// The project's specification as committed (its sha256 is the run's spec digest).
 const SPEC: &str =
     "{\"requirements\": [{\"id\": \"REQ-035\", \"acceptance\": [{\"id\": \"AC-035-03\"}]}]}\n";
@@ -147,7 +150,7 @@ async fn project(dir: &Path) -> R<(PathBuf, String)> {
     for (path, text) in [
         ("src/lib.rs", "pub fn a() {}\n"),
         ("contracts/requirements.json", SPEC),
-        ("tests/check-plan.json", "{\"checks\": {}}\n"),
+        ("tests/check-plan.json", PLAN),
     ] {
         let file = project.join(path);
         std::fs::create_dir_all(file.parent().ok_or("no parent")?)?;
@@ -217,6 +220,11 @@ struct Team {
     release: Arc<AtomicBool>,
     /// The qa FakeAgent writes a file into its working directory before it ends.
     tamper: AtomicBool,
+    /// What the qa FakeAgent runs once released (sh), with `$HOH_RUN_CHECK`, `$HOH_ASK`, its identity (`$RUN_ID`,
+    /// `$TASK_ID`, `$ATTEMPT_ID`, `$ROLE_EPOCH`) and `$OUT`, a directory outside its run directory.
+    qa_script: std::sync::Mutex<Option<String>>,
+    /// The `$OUT` of the qa script.
+    out: PathBuf,
     /// Each verifier work's role and run directory, as given to its start.
     run_dirs: Arc<std::sync::Mutex<Vec<RunDir>>>,
     /// Lets the Developer's FakeAgent end (set: it is not held).
@@ -232,6 +240,8 @@ impl Team {
             fail: AtomicU32::new(0),
             release: Arc::default(),
             tamper: AtomicBool::new(false),
+            qa_script: std::sync::Mutex::default(),
+            out: std::env::temp_dir(),
             run_dirs: Arc::default(),
             developer: Arc::new(AtomicBool::new(true)),
         }
@@ -317,17 +327,30 @@ impl hoh_app::host::Executor for Team {
                 }
             }
         }
+        let qa_script = self.qa_script.lock().ok().and_then(|s| s.clone());
         let script = if work.role == "qa" && self.tamper.load(Ordering::SeqCst) {
-            "read -r go; echo changed > tampered.txt; exit 0"
+            "read -r go; echo changed > tampered.txt; exit 0".to_owned()
+        } else if let Some(body) = qa_script.filter(|_| work.role == "qa") {
+            format!("read -r go; {body}")
         } else {
-            "read -r go; exit 0"
+            "read -r go; exit 0".to_owned()
         };
         let mut command = Command::new("sh");
         if let Some(dir) = &work.run_dir {
             command.current_dir(dir);
         }
+        if let Some(h) = &work.helpers {
+            command
+                .env("HOH_RUN_CHECK", &h.run_check)
+                .env("HOH_ASK", &h.ask)
+                .env("RUN_ID", &work.run_id)
+                .env("TASK_ID", &work.task_id)
+                .env("ATTEMPT_ID", &work.attempt_id)
+                .env("ROLE_EPOCH", work.assignment.role_epoch.to_string())
+                .env("OUT", &self.out);
+        }
         let mut child = command
-            .args(["-c", script])
+            .args(["-c", &script])
             .process_group(0)
             .stdin(std::process::Stdio::piped())
             .spawn()
@@ -917,6 +940,100 @@ async fn a_verifier_that_changes_its_run_directory_makes_the_candidate_invalid()
         assert_eq!(
             rows(&project, "SELECT count(*) AS n FROM events WHERE kind = 'integrity_violation'")?[0]["n"],
             json!(1)
+        );
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    outcome
+}
+
+/// A message of the qa script's attempt, as its `$1` names: `<kind> <recipient> <payload JSON>`.
+const MESSAGE: &str = "message() { printf '{\"schema_version\": \"1.0\", \"message_id\": \"%s\", \"run_id\": \"%s\", \
+\"task_id\": \"%s\", \"attempt_id\": \"%s\", \"sender_role\": \"qa\", \"recipient_role\": \"%s\", \"role_epoch\": %s, \
+\"correlation_id\": \"c\", \"causation_id\": null, \"idempotency_key\": \"%s\", \"expected_revision\": 1, \
+\"spec_sha256\": \"%s\", \"candidate_id\": null, \"kind\": \"%s\", \"payload\": %s}' \
+\"$1\" \"$RUN_ID\" \"$TASK_ID\" \"$ATTEMPT_ID\" \"$3\" \"$ROLE_EPOCH\" \"$1\" \"$SPEC\" \"$2\" \"$4\" > \"$OUT/$1.json\"; }; ";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_verifier_runs_planned_checks_and_asks_through_its_request_helpers() -> R {
+    // docs/adr/ADR-028.md decisions 7 and 13: the qa FakeAgent, in its run directory, runs `run-check unit` (the check
+    // runs there, its producer the qa attempt, and the helper ends with its exit code 1), `run-check nope` (not a
+    // check of the frozen plan: refused, exit 2, verification.check_refused), asks the developer to change the
+    // candidate (rejected: request.rejected and an OPEN Issue on the candidate) and asks an information question
+    // (deferred); no message is queued for the developer.
+    let dir = tempfile::tempdir()?;
+    let (project, spec) = project(dir.path()).await?;
+    seed(&project, &world(&spec))?;
+    let clock = Arc::new(FakeClock::default());
+    let mut team = Team::new(Commander::Answers, &spec);
+    team.out = dir.path().join("out");
+    std::fs::create_dir_all(&team.out)?;
+    let script = format!(
+        "SPEC={spec}; {MESSAGE}\
+         \"$HOH_RUN_CHECK\" unit > \"$OUT/unit.txt\"; echo $? > \"$OUT/unit.code\"; \
+         \"$HOH_RUN_CHECK\" nope > \"$OUT/nope.txt\"; echo $? > \"$OUT/nope.code\"; \
+         message m-change steer developer '{{\"text\": \"rewrite the parser\", \"severity\": \"high\"}}'; \
+         \"$HOH_ASK\" \"$OUT/m-change.json\" > \"$OUT/change.txt\"; \
+         message m-info query developer '{{\"question\": \"what does AC-035-03 mean?\"}}'; \
+         \"$HOH_ASK\" \"$OUT/m-info.json\" > \"$OUT/info.txt\"; exit 0"
+    );
+    *team.qa_script.lock().map_err(|e| e.to_string())? = Some(script);
+    team.release.store(true, Ordering::SeqCst);
+    let team = Arc::new(team);
+    let out = team.out.clone();
+    let host = host(&project, team.clone(), clock.clone()).await?;
+    let outcome = async {
+        let step = Duration::from_millis(100);
+        wait_for(
+            &project,
+            &clock,
+            step,
+            "SELECT count(*) AS n FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+             WHERE t.role = 'qa' AND a.state = 'SETTLED'",
+            &|r| r[0]["n"] == json!(1),
+        )?;
+        let read = |name: &str| std::fs::read_to_string(out.join(name)).unwrap_or_default();
+        assert_eq!(read("unit.code").trim(), "1", "{}", read("unit.txt"));
+        assert!(read("unit.txt").contains("\"status\":\"ran\""), "{}", read("unit.txt"));
+        assert_eq!(read("nope.code").trim(), "2", "{}", read("nope.txt"));
+        assert!(read("change.txt").contains("\"status\":\"rejected\""), "{}", read("change.txt"));
+        assert!(read("info.txt").contains("\"status\":\"deferred\""), "{}", read("info.txt"));
+        let qa = rows(
+            &project,
+            "SELECT a.attempt_id FROM attempts a JOIN tasks t ON t.task_id = a.task_id WHERE t.role = 'qa'",
+        )?[0]["attempt_id"]
+            .clone();
+        assert_eq!(
+            rows(&project, "SELECT check_id, attempt_id, outcome FROM evidence")?,
+            json!([{"check_id": "unit", "attempt_id": qa, "outcome": "FAIL"}])
+        );
+        assert_eq!(
+            rows(
+                &project,
+                "SELECT json_extract(payload_json, '$.check_id') AS check_id FROM events \
+                 WHERE kind = 'verification.check_refused'"
+            )?,
+            json!([{"check_id": "nope"}])
+        );
+        assert_eq!(
+            rows(&project, "SELECT severity, state, description FROM issues")?,
+            json!([{"severity": "high", "state": "OPEN", "description": "rewrite the parser"}])
+        );
+        assert_eq!(
+            rows(
+                &project,
+                "SELECT json_extract(payload_json, '$.message_id') AS m FROM events WHERE kind = 'request.deferred'"
+            )?,
+            json!([{"m": "m-info"}])
+        );
+        assert_eq!(
+            rows(
+                &project,
+                "SELECT count(*) AS n FROM outbox WHERE recipient_role = 'developer' \
+                 AND json_extract(payload_json, '$.kind') IN ('steer', 'query')"
+            )?[0]["n"],
+            json!(0)
         );
         R::Ok(())
     }

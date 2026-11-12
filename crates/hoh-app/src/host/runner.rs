@@ -52,6 +52,8 @@ pub struct Work {
     /// A verifier's run directory, its working directory: the candidate's checkout outside the project
     /// (docs/adr/ADR-028.md decision 6); none for any other work.
     pub run_dir: Option<std::path::PathBuf>,
+    /// A verifier's request helpers, `run-check` and `ask` (docs/adr/ADR-028.md decision 7); none for any other work.
+    pub helpers: Option<super::requests::Helpers>,
 }
 
 impl Work {
@@ -627,6 +629,7 @@ async fn tick(
             effect_key: work_key(&id),
             assignment: notice.assignment.clone(),
             run_dir: None,
+            helpers: None,
         };
         let Ok(mut inflight) = common.inflight.lock() else {
             continue;
@@ -750,6 +753,33 @@ async fn attempt(
     let executor = common.executor.clone();
     let mut held = work.clone();
     held.run_dir = verifier.as_ref().map(|v| v.dir.clone());
+    // A verifier's request helpers, in its attempt directory before it starts (docs/adr/ADR-028.md decision 7).
+    let helpers = match &verifier {
+        Some(_) => {
+            let (root, attempt) = (common.shared.root.clone(), id.clone());
+            let written = tokio::task::spawn_blocking(move || {
+                super::requests::write_helpers(&root, &attempt).map_err(|e| e.to_string())
+            })
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()));
+            match written {
+                Ok(helpers) => Some(helpers),
+                Err(why) => {
+                    store
+                        .runner_finished(
+                            &id,
+                            common
+                                .failed(format!("HELPERS_UNAVAILABLE: its request helpers: {why}")),
+                        )
+                        .await?;
+                    remove_run_dir();
+                    return Ok(());
+                }
+            }
+        }
+        None => None,
+    };
+    held.helpers = helpers.clone();
     let start = tokio::task::spawn_blocking(move || executor.start(&held))
         .await
         .unwrap_or_else(|e| Err(Refusal::from(format!("its start was lost: {e}"))));
@@ -850,7 +880,22 @@ async fn attempt(
         return Ok(());
     }
     hooks.runner(RunnerPoint::AfterEffectStarted);
-    let Ok(outcome) = started.ended.await else {
+    // While a verifier runs, its requests are taken in order, one at a time; once its process has ended none is taken
+    // (a request is never cut off: its check and record end before the end is looked at; decision 7).
+    let mut ended = started.ended;
+    let mut served = 0;
+    let finished = loop {
+        let (Some(v), Some(helpers)) = (&verifier, &helpers) else {
+            break (&mut ended).await;
+        };
+        tokio::select! {
+            outcome = &mut ended => break outcome,
+            () = tokio::time::sleep(Duration::from_millis(200)) => {
+                served += serve_request(common, &work, v, helpers, served + 1).await?;
+            }
+        }
+    };
+    let Ok(outcome) = finished else {
         // The executor lost the process: its end is not known, so it is settled as an expired lease would be, never
         // taken as a failure to run again (M2T05R-04).
         let entry = common.inflight.lock().ok().and_then(|mut f| f.remove(&id));
@@ -966,6 +1011,10 @@ async fn attempt(
         return Ok(());
     }
     hooks.runner(RunnerPoint::AfterEffectCommitted);
+    // A verifier's messages left in its bridge are answered as its requests are (decision 13), before its end.
+    if let Some(v) = &verifier {
+        answer_bridge_messages(common, &work, v, &outcome.observed.messages).await?;
+    }
     // A verifier's run directory looked at again before its end (docs/adr/ADR-028.md decision 8).
     let tree_checked = match &verifier {
         Some(v) => Some(super::verifying::check(store, &common.shared.root, &id, v).await),
@@ -999,6 +1048,173 @@ async fn attempt(
     .await?;
     // Settled: its run directory is no longer needed (decision 6).
     remove_run_dir();
+    Ok(())
+}
+
+/// Serve request `n` of verifier `work` (docs/adr/ADR-028.md decisions 7 and 13), when it is there: 1 when it was
+/// answered, 0 when it is not there yet.
+async fn serve_request(
+    common: &Common,
+    work: &Work,
+    v: &super::verifying::Verifier,
+    helpers: &super::requests::Helpers,
+    n: u64,
+) -> Result<u64, PersistError> {
+    let store = &common.shared.store;
+    let held = helpers.clone();
+    let request = tokio::task::spawn_blocking(move || super::requests::next(&held, n))
+        .await
+        .map_err(|e| PersistError::Storage(format!("the request's read ended: {e}")))?;
+    let Some(request) = request else {
+        return Ok(0);
+    };
+    let answer = match request {
+        _ if n > super::requests::MAX_REQUESTS => {
+            json!({"status": "refused", "reasons": [format!("at most {} requests", super::requests::MAX_REQUESTS)]})
+        }
+        Err(why) => json!({"status": "error", "detail": why}),
+        Ok(request) => match request["kind"].as_str() {
+            Some("check") => {
+                let check_id = request["check_id"].as_str().unwrap_or_default().to_owned();
+                run_check(common, work, v, n, &check_id).await?
+            }
+            Some("message") => {
+                let line = request["message"].to_string();
+                let parsed = hoh_core::bridge::parse(&[line], &identity_of(work)?);
+                match (parsed.messages.first(), parsed.refused.first()) {
+                    (Some(message), _) => {
+                        let round = work
+                            .assignment
+                            .handoff
+                            .as_ref()
+                            .map_or("", |h| h.round_id.as_str());
+                        super::requests::answer_message(store, message, round, &v.candidate_id)
+                            .await
+                    }
+                    (None, refused) => json!({"status": "refused",
+                        "reasons": [refused.map_or("not a message".to_owned(), |r| r.reason.clone())]}),
+                }
+            }
+            _ => json!({"status": "refused", "reasons": ["a request is a check or a message"]}),
+        },
+    };
+    let held = helpers.clone();
+    tokio::task::spawn_blocking(move || super::requests::respond(&held, n, &answer))
+        .await
+        .map_err(|e| PersistError::Storage(format!("the answer's write ended: {e}")))?
+        .map_err(|e| PersistError::Storage(format!("the answer to request {n}: {e}")))?;
+    Ok(1)
+}
+
+/// Run check `check_id` of the candidate's frozen plan for verifier `work` in its run directory, the attempt its
+/// producer, its command carrying the attempt's marker and joining its cgroup (decision 7): the answer to give.
+async fn run_check(
+    common: &Common,
+    work: &Work,
+    v: &super::verifying::Verifier,
+    n: u64,
+    check_id: &str,
+) -> Result<Value, PersistError> {
+    use crate::verify::check::{CheckError, Launch, Request};
+    let store = &common.shared.store;
+    let root = common.shared.root.clone();
+    let plan_sha = v.sealed.manifest.test_plan.sha256.clone();
+    let id = check_id.to_owned();
+    let argv: Option<Vec<String>> = tokio::task::spawn_blocking(move || {
+        let plan: Value = hoh_core::objects::get(&root, &plan_sha)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())?;
+        plan["checks"][&id]["argv"].as_array().map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_owned))
+                .collect()
+        })
+    })
+    .await
+    .map_err(|e| PersistError::Storage(format!("the plan's read ended: {e}")))?;
+    let refused = |reasons: Vec<String>| async move {
+        store
+            .commit(Commit {
+                events: vec![NewEvent {
+                    project_id: common.shared.project_id.clone(),
+                    event_id: hoh_core::ids::child_id(&work.attempt_id, &format!("check_refused/{n}")),
+                    run_id: Some(work.run_id.clone()),
+                    kind: "verification.check_refused".to_owned(),
+                    payload: json!({"attempt_id": work.attempt_id, "check_id": check_id, "reasons": reasons}),
+                }],
+                ..Commit::default()
+            })
+            .await
+            .map(|_| json!({"status": "refused", "reasons": reasons}))
+    };
+    let Some(argv) = argv.filter(|a| !a.is_empty()) else {
+        return refused(vec![format!(
+            "{check_id} is not a check of the candidate's frozen plan"
+        )])
+        .await;
+    };
+    let marker = work.marker();
+    let adopt = common.shared.cgroups.clone().map(|delegated| {
+        let path = delegated.attempt(&marker);
+        Box::new(move |pid: u32| {
+            let _ = AttemptGroup::adopt(&path, pid);
+        }) as Box<dyn FnOnce(u32) + Send>
+    });
+    let ran = crate::verify::check::run_with(
+        store,
+        &v.dir,
+        &common.shared.root.join(".hoh"),
+        &Request {
+            candidate_id: v.candidate_id.clone(),
+            check_id: check_id.to_owned(),
+            argv,
+            producer_attempt_id: work.attempt_id.clone(),
+        },
+        Launch {
+            env: vec![(super::ATTEMPT_ENV.to_owned(), marker)],
+            adopt,
+        },
+    )
+    .await;
+    match ran {
+        Ok(ran) => {
+            let record = ran.record_dir.join("execution.json");
+            let exit_code = tokio::task::spawn_blocking(move || {
+                std::fs::read(&record)
+                    .ok()
+                    .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                    .and_then(|r| r["exit_code"].as_i64())
+            })
+            .await
+            .ok()
+            .flatten();
+            Ok(
+                json!({"status": "ran", "outcome": ran.outcome.status.code(), "reasons": ran.reasons,
+                "record_dir": ran.record_dir.to_string_lossy(), "exit_code": exit_code}),
+            )
+        }
+        Err(CheckError::Refused(reasons)) => refused(reasons).await,
+        Err(e) => Ok(json!({"status": "error", "detail": crate::verify::check::described(&e)})),
+    }
+}
+
+/// The query and steer messages verifier `work` left in its bridge, answered as its requests are (decision 13).
+async fn answer_bridge_messages(
+    common: &Common,
+    work: &Work,
+    v: &super::verifying::Verifier,
+    lines: &[String],
+) -> Result<(), PersistError> {
+    let parsed = hoh_core::bridge::parse(lines, &identity_of(work)?);
+    let round = work
+        .assignment
+        .handoff
+        .as_ref()
+        .map_or("", |h| h.round_id.as_str());
+    for message in &parsed.messages {
+        super::requests::answer_message(&common.shared.store, message, round, &v.candidate_id)
+            .await;
+    }
     Ok(())
 }
 
