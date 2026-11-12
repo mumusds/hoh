@@ -73,10 +73,148 @@ fn a_work_turn_is_told_its_identity_and_its_bridge_file() -> Result<(), Box<dyn 
         "- role：developer",
         "- role_epoch：1",
         &bridge.display().to_string(),
+        // A writer is told where its self-test records go (docs/adr/ADR-028.md decision 14).
+        ".hoh/self-tests/R1%2FT1%2Fa1/",
     ] {
         assert!(text.contains(want), "{want}: {text}");
     }
     assert!(bridge.parent().is_some_and(Path::is_dir));
+    Ok(())
+}
+
+/// Run git in `dir` with a fixed identity.
+fn git_in(dir: &Path, args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
+    let out = std::process::Command::new("git")
+        .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+        .args(args)
+        .current_dir(dir)
+        .output()?;
+    if !out.status.success() {
+        return Err(format!("git {args:?}: {}", String::from_utf8_lossy(&out.stderr)).into());
+    }
+    Ok(String::from_utf8(out.stdout)?.trim().to_owned())
+}
+
+#[test]
+fn a_candidates_changed_files_are_read_from_its_commit_in_path_order_within_their_limits()
+-> Result<(), Box<dyn std::error::Error>> {
+    // docs/adr/ADR-028.md decision 14's code source: git diff --name-only base..commit, by path, at most 50 files, each
+    // read at the candidate's commit (never the workspace); over 64 KiB, not UTF-8 or deleted: its path only.
+    let dir = tempfile::tempdir()?;
+    let root = dir.path();
+    git_in(root, &["init", "-q"])?;
+    std::fs::write(root.join("a.txt"), "old\n")?;
+    std::fs::write(root.join("gone.txt"), "soon gone\n")?;
+    git_in(root, &["add", "."])?;
+    git_in(root, &["commit", "-q", "-m", "base"])?;
+    let base = git_in(root, &["rev-parse", "HEAD"])?;
+    std::fs::write(root.join("a.txt"), "new\n")?;
+    std::fs::remove_file(root.join("gone.txt"))?;
+    std::fs::write(root.join("z.txt"), "last\n")?;
+    std::fs::write(root.join("big.txt"), "x".repeat(70 * 1024))?;
+    std::fs::write(root.join("bin.dat"), [0xff_u8, 0xfe, 0x00])?;
+    std::fs::create_dir_all(root.join("many"))?;
+    for n in 0..55 {
+        std::fs::write(root.join(format!("many/f{n:02}.txt")), format!("{n}\n"))?;
+    }
+    git_in(root, &["add", "-A"])?;
+    git_in(root, &["commit", "-q", "-m", "candidate"])?;
+    let commit = git_in(root, &["rev-parse", "HEAD"])?;
+    // The workspace moved on: the candidate's commit is what is read.
+    std::fs::write(root.join("a.txt"), "workspace\n")?;
+    let (files, total) = code_files(
+        root,
+        &hoh_core::context::CodeSource {
+            base,
+            commit: commit.clone(),
+        },
+    )?;
+    assert_eq!(total, 60);
+    assert_eq!(files.len(), hoh_core::context::CODE_FILES);
+    let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(
+        &paths[..6],
+        [
+            "a.txt",
+            "big.txt",
+            "bin.dat",
+            "gone.txt",
+            "many/f00.txt",
+            "many/f01.txt"
+        ]
+    );
+    assert_eq!(files[0].text, Ok("new\n".to_owned()));
+    assert!(
+        matches!(&files[1].text, Err(why) if why.contains("64 KiB")),
+        "{:?}",
+        files[1]
+    );
+    assert!(
+        matches!(&files[2].text, Err(why) if why.contains("UTF-8")),
+        "{:?}",
+        files[2]
+    );
+    assert!(
+        matches!(&files[3].text, Err(why) if why.contains("删除")),
+        "{:?}",
+        files[3]
+    );
+    // From git's empty tree (a first writer that started without a commit): every file of the candidate.
+    let (all, total) = code_files(
+        root,
+        &hoh_core::context::CodeSource {
+            base: "4b825dc642cb6eb9a060e54bf8d69288fbee4904".to_owned(),
+            commit,
+        },
+    )?;
+    assert_eq!((total, all[0].path.as_str()), (59, "a.txt"));
+    Ok(())
+}
+
+#[test]
+fn a_turns_loads_and_code_source_are_read_into_its_prompt() -> Result<(), Box<dyn std::error::Error>>
+{
+    // docs/adr/ADR-028.md decision 14: the store names a registered object and the code source, the executor reads
+    // them: the object's text under its label in the evidence layer, the changed file's text in the task layer.
+    let dir = tempfile::tempdir()?;
+    let root = dir.path();
+    git_in(root, &["init", "-q"])?;
+    std::fs::write(root.join("README"), "r\n")?;
+    git_in(root, &["add", "."])?;
+    git_in(root, &["commit", "-q", "-m", "base"])?;
+    let base = git_in(root, &["rev-parse", "HEAD"])?;
+    std::fs::write(root.join("lib.rs"), "fn changed_by_the_candidate() {}\n")?;
+    git_in(root, &["add", "."])?;
+    git_in(root, &["commit", "-q", "-m", "candidate"])?;
+    let commit = git_in(root, &["rev-parse", "HEAD"])?;
+    let sha = hoh_core::objects::put(root, b"SENTINEL-SELF-TEST ALL TESTS PASSED\n")?;
+    let mut w = work(None);
+    if let Some(facts) = w.assignment.context.as_mut() {
+        facts.loads.push(hoh_core::context::Load {
+            path: "self-tests/report.txt".to_owned(),
+            sha256: sha,
+            name: "report.txt".to_owned(),
+            label: "开发者自测（diagnostic）".to_owned(),
+            relevance: 0,
+        });
+        facts.code = Some(hoh_core::context::CodeSource { base, commit });
+    }
+    let (text, _) = executor(root)
+        .pack(&w, &contract("Contract.\n\n"), None)
+        .map_err(|r| format!("{r:?}"))?;
+    let evidence = text.find("### 证据上下文").ok_or("no evidence layer")?;
+    let task = text.find("### 任务上下文").ok_or("no task layer")?;
+    let sentinel = text.find("SENTINEL-SELF-TEST").ok_or("no self-test text")?;
+    assert!(sentinel > evidence, "{text}");
+    assert!(
+        text[..sentinel]
+            .rfind("开发者自测（diagnostic）")
+            .is_some_and(|l| l > evidence)
+    );
+    let code = text
+        .find("fn changed_by_the_candidate()")
+        .ok_or("no changed file")?;
+    assert!(code > task && code < evidence, "{text}");
     Ok(())
 }
 

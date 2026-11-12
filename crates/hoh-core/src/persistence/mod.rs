@@ -16,6 +16,7 @@ mod blockers;
 mod candidates;
 mod closing;
 pub use closing::{Reconciled, RecoveryOutcome};
+pub use context::ReworkContext;
 mod commands;
 mod completion;
 mod context;
@@ -39,8 +40,8 @@ mod verification;
 mod wakes;
 pub use candidates::{CandidateRow, Freeze, Frozen, RunAcceptance};
 pub use completion::{
-    VerifierCompleted, VerifierCompletion, VerifierOutcome, VerifierReport, WriterCompleted,
-    WriterCompletion, WriterOutcome,
+    SelfTests, VerifierCompleted, VerifierCompletion, VerifierOutcome, VerifierReport,
+    WriterCompleted, WriterCompletion, WriterOutcome,
 };
 pub use control::{CancelPass, Finished, PauseStep};
 pub use evidence::{AcceptanceRow, Recording};
@@ -1705,11 +1706,19 @@ impl Reader {
         candidates::producer(&self.conn, attempt_id)
     }
 
+    /// A verifier's context from its package and its round's sources (docs/adr/ADR-028.md decision 14).
     pub fn verification_context(
         &self,
         package: &crate::protocol::ContextHandoff,
+        sources: &[String],
     ) -> Result<crate::context::Facts, PersistError> {
-        context::verification(&self.conn, package)
+        context::verification(&self.conn, package, sources)
+    }
+
+    /// Task `task_id`'s rework context (docs/adr/ADR-028.md decisions 12 and 14): the round whose failures a rework of
+    /// it took, its rejected candidate, those failures and the candidate's open Issues; none if none was taken.
+    pub fn rework_context(&self, task_id: &str) -> Result<Option<ReworkContext>, PersistError> {
+        context::rework(&self.conn, task_id)
     }
 
     /// Whether candidate `candidate_id`'s pending check records are to be recovered now (docs/adr/ADR-028.md decision

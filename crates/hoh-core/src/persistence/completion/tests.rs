@@ -136,6 +136,7 @@ fn freeze(job: Freeze, result: TaskResult) -> WriterOutcome {
     WriterOutcome::Freeze {
         job: Box::new(job),
         result: Box::new(result),
+        self_tests: SelfTests::default(),
     }
 }
 
@@ -193,6 +194,69 @@ async fn a_completed_result_freezes_accepts_and_settles_in_one_commit() -> R {
         .len(),
         1
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_completions_self_test_records_are_registered_as_its_attempts_and_referenced_by_its_handoffs()
+-> R {
+    // docs/adr/ADR-028.md decision 14: the records the host kept are registered in the completion's commit, an
+    // `attempt.artifacts` of their own (kind self_test) with the items only referenced; the round's handoffs reference
+    // them as the developer attempt's products.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    let kept = object(7, "self_test", ".hoh/self-tests/A/report.txt");
+    let outcome = WriterOutcome::Freeze {
+        job: Box::new(freeze_of('c')),
+        result: Box::new(result(None)?),
+        self_tests: SelfTests {
+            items: vec![kept.clone()],
+            failed: vec![
+                json!({"name": ".hoh/self-tests/A/gone.txt", "sha256": "e".repeat(64),
+                "error": "its bytes hash to another digest"}),
+            ],
+        },
+    };
+    let done = store.complete_writer_attempt(completion(outcome)).await?;
+    assert!(
+        matches!(done, WriterCompleted::Verifying { .. }),
+        "{done:?}"
+    );
+    let event = texts(
+        &path,
+        "SELECT payload_json FROM events WHERE event_id = 'A/artifacts/self_tests' AND kind = 'attempt.artifacts'",
+    )?;
+    let [event] = event.as_slice() else {
+        return Err(format!("{event:?}").into());
+    };
+    let event: serde_json::Value = serde_json::from_str(event)?;
+    assert_eq!(event["attempt_id"], "A");
+    assert_eq!(event["items"][0]["kind"], "self_test");
+    assert_eq!(event["items"][0]["sha256"], kept.sha256.as_str());
+    assert_eq!(event["failed"][0]["name"], ".hoh/self-tests/A/gone.txt");
+    assert_eq!(
+        texts(
+            &path,
+            &format!(
+                "SELECT path FROM artifacts WHERE sha256 = '{}'",
+                kept.sha256
+            )
+        )?,
+        std::slice::from_ref(&kept.path)
+    );
+    for package in texts(
+        &path,
+        "SELECT payload_json FROM outbox WHERE json_extract(payload_json, '$.kind') = 'handoff'",
+    )? {
+        let package: serde_json::Value = serde_json::from_str(&package)?;
+        let references = &package["payload"]["references"];
+        assert!(
+            references
+                .as_array()
+                .is_some_and(|r| r.iter().any(|r| r["sha256"] == kept.sha256.as_str())),
+            "{references}"
+        );
+    }
     Ok(())
 }
 

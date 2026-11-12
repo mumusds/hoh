@@ -21,6 +21,8 @@ pub enum WriterOutcome {
     Freeze {
         job: Box<Freeze>,
         result: Box<TaskResult>,
+        /// The self-test records its TaskResult names, as the host kept them (docs/adr/ADR-028.md decision 14).
+        self_tests: SelfTests,
     },
     /// Its output must be corrected (missing, invalid, cut, a candidate id that is not the freeze's, a freeze refused,
     /// content already judged): one counted protocol correction, the task back to READY.
@@ -28,6 +30,14 @@ pub enum WriterOutcome {
     /// It needs a decision (FAILED, BLOCKED, INCOMPLETE, no AC to verify, a specification change, no verification
     /// team): the task BLOCKED for a decision.
     Decide { reason: String, detail: String },
+}
+
+/// A Developer's self-test records as the host kept them (docs/adr/ADR-028.md decision 14): the objects of those whose
+/// bytes matched their digests (kind `self_test`), and those only referenced (`{name, sha256, error}`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SelfTests {
+    pub items: Vec<super::runner::ArtifactRow>,
+    pub failed: Vec<serde_json::Value>,
 }
 
 /// A writer attempt's completion.
@@ -99,10 +109,16 @@ pub(super) fn complete(
         task_id,
         revision,
     };
+    // Its self-test records, registered as its own products before anything references them (docs/adr/ADR-028.md
+    // decision 14).
+    if let WriterOutcome::Freeze { self_tests, .. } = &job.outcome {
+        register_self_tests(&tx, &task, &job.attempt_id, self_tests, ctx)?;
+    }
     let done = match &job.outcome {
         WriterOutcome::Freeze {
             job: freeze,
             result,
+            self_tests: _,
         } => freeze_and_accept(&tx, job, &task, freeze, result, ctx)?,
         WriterOutcome::Correct { reasons } => correct(&tx, job, &task, reasons, ctx)?,
         WriterOutcome::Decide { reason, detail } => decide(&tx, job, &task, reason, detail, ctx)?,
@@ -304,6 +320,52 @@ struct Task {
 
 /// Freeze and accept; a refused acceptance rolls the freeze back (no candidate row, nothing made STALE) and becomes a
 /// correction, or a decision for a specification the run does not have.
+/// Register attempt `attempt_id`'s kept self-test records (`artifacts` rows) and their `attempt.artifacts` event, as
+/// the runner registers its raw logs (docs/adr/ADR-026.md decision 10); nothing when it kept and referenced none.
+fn register_self_tests(
+    tx: &Transaction<'_>,
+    task: &Task,
+    attempt_id: &str,
+    kept: &SelfTests,
+    ctx: &super::writer::Ctx<'_>,
+) -> Result<(), PersistError> {
+    if kept.items.is_empty() && kept.failed.is_empty() {
+        return Ok(());
+    }
+    super::runner::register(tx, &kept.items)?;
+    let session: Option<String> = tx
+        .query_row(
+            "SELECT session_id FROM attempts WHERE attempt_id = ?1",
+            params![attempt_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    let role: Option<String> = tx
+        .query_row(
+            "SELECT role FROM tasks WHERE task_id = ?1",
+            params![task.task_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    writer::write(
+        tx,
+        &Commit {
+            events: vec![NewEvent {
+                project_id: task.project_id.clone(),
+                event_id: child_id(attempt_id, super::context::SELF_TESTS_EVENT),
+                run_id: Some(task.run_id.clone()),
+                kind: "attempt.artifacts".to_owned(),
+                payload: json!({"attempt_id": attempt_id, "run_id": task.run_id, "role": role,
+                    "session_id": session, "items": kept.items.iter().map(super::runner::ArtifactRow::json)
+                        .collect::<Vec<_>>(), "failed": kept.failed}),
+            }],
+            ..Commit::default()
+        },
+        ctx,
+    )
+    .map(drop)
+}
+
 fn freeze_and_accept(
     tx: &Transaction<'_>,
     job: &WriterCompletion,

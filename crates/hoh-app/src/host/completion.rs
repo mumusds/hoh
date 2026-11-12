@@ -7,8 +7,8 @@
 use crate::verify::freeze::{self, FreezeError, Inputs};
 use hoh_core::bridge::{self, Identity};
 use hoh_core::persistence::{
-    Ending, Observed, PersistError, Store, UnfinishedRow, VerifierCompletion, VerifierOutcome,
-    WriterCompleted, WriterCompletion, WriterOutcome,
+    ArtifactRow, Ending, Observed, PersistError, SelfTests, Store, UnfinishedRow,
+    VerifierCompletion, VerifierOutcome, WriterCompleted, WriterCompletion, WriterOutcome,
 };
 use hoh_core::protocol::TaskStatus;
 use hoh_core::retry::FailureClass;
@@ -49,6 +49,7 @@ pub(super) fn outcome(project: &Path, identity: &Identity, ending: &mut Ending) 
         TaskStatus::Incomplete => return decide("agent_incomplete"),
         TaskStatus::Completed => {}
     }
+    let self_tests = self_tests(project, &identity.attempt_id, &result.evidence, ending);
     let prepared = crate::verify::environment::ensure(project)
         .map_err(FreezeError::Io)
         .and_then(|_| {
@@ -58,6 +59,7 @@ pub(super) fn outcome(project: &Path, identity: &Identity, ending: &mut Ending) 
         Ok(job) => WriterOutcome::Freeze {
             job: Box::new(job),
             result: Box::new(result),
+            self_tests,
         },
         Err(FreezeError::Refused(reasons)) => WriterOutcome::Correct {
             reasons: reasons
@@ -72,6 +74,99 @@ pub(super) fn outcome(project: &Path, identity: &Identity, ending: &mut Ending) 
             detail: e.to_string(),
         },
     }
+}
+
+/// Where attempt `attempt_id`'s self-test records go, relative to the project (docs/adr/ADR-028.md decision 14).
+pub(crate) fn self_tests_dir(attempt_id: &str) -> String {
+    format!(".hoh/self-tests/{}/", super::product::component(attempt_id))
+}
+
+/// The self-test records `evidence` names (docs/adr/ADR-028.md decision 14): one that is not a project-relative path
+/// under the attempt's own directory, or reaches it through a link, is dropped with a `bridge.rejected` in `ending`'s
+/// events (decision 2, -157); a regular file, read without blocking, whose bytes match its digest is kept as an object
+/// (kind `self_test`); any other is only referenced. Blocking.
+fn self_tests(
+    project: &Path,
+    attempt_id: &str,
+    evidence: &[hoh_core::protocol::ArtifactRef],
+    ending: &mut Ending,
+) -> SelfTests {
+    let dir = self_tests_dir(attempt_id);
+    let mut kept = SelfTests::default();
+    for (n, item) in evidence.iter().enumerate() {
+        if let Err(reason) = admissible(project, &dir, &item.path) {
+            ending.observed.events.push((
+                format!("bridge/rejected/evidence/{n}"),
+                "bridge.rejected".to_owned(),
+                json!({"attempt_id": attempt_id, "evidence": item.path, "sha256": item.sha256,
+                    "reason": reason}),
+            ));
+            continue;
+        }
+        let only_referenced =
+            |error: String| json!({"name": item.path, "sha256": item.sha256, "error": error});
+        let bytes = match hoh_core::objects::read_regular(&project.join(&item.path)) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                kept.failed.push(only_referenced(e));
+                continue;
+            }
+        };
+        let digest: String = <sha2::Sha256 as sha2::Digest>::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        if digest != item.sha256 {
+            kept.failed.push(only_referenced(format!(
+                "its bytes hash to {digest}, not the digest it was named with"
+            )));
+            continue;
+        }
+        match hoh_core::objects::put(project, &bytes) {
+            Ok(sha256) => kept.items.push(ArtifactRow {
+                path: hoh_core::objects::relative_path(&sha256),
+                sha256,
+                bytes: bytes.len() as u64,
+                mime: if std::str::from_utf8(&bytes).is_ok() {
+                    "text/plain; charset=utf-8"
+                } else {
+                    "application/octet-stream"
+                }
+                .to_owned(),
+                kind: "self_test".to_owned(),
+                name: item.path.clone(),
+            }),
+            Err(e) => kept.failed.push(only_referenced(e)),
+        }
+    }
+    kept
+}
+
+/// Why `path` is not a self-test record of the directory `dir` (project-relative, ending in `/`), if it is not: an
+/// absolute path, a `.` or `..` part, a path elsewhere, or a link on the way from the project's root.
+fn admissible(project: &Path, dir: &str, path: &str) -> Result<(), String> {
+    use std::path::Component;
+    let relative = Path::new(path);
+    if relative.is_absolute() {
+        return Err("an absolute path".to_owned());
+    }
+    if relative
+        .components()
+        .any(|c| !matches!(c, Component::Normal(_)))
+    {
+        return Err("a path with a . or .. part".to_owned());
+    }
+    if !path.starts_with(dir) || path.len() == dir.len() {
+        return Err(format!("not a file under {dir}"));
+    }
+    let mut at = project.to_path_buf();
+    for part in relative.components() {
+        at.push(part);
+        if std::fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(format!("{} is a link", at.display()));
+        }
+    }
+    Ok(())
 }
 
 /// The TaskResult a work attempt's bridge gives (docs/adr/ADR-028.md decision 2), its refused lines added to `ending`'s

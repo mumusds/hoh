@@ -891,7 +891,9 @@ pub(super) fn assignment(
         assignment.native_session = None;
     }
     assignment.context = Some(match &assignment.handoff {
-        Some(handoff) => super::context::verification(conn, &handoff.package)?,
+        Some(handoff) => {
+            super::context::verification(conn, &handoff.package, &handoff.source_task_ids)?
+        }
         None => super::context::facts(
             conn,
             run_id,

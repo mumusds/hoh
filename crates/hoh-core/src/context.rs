@@ -647,7 +647,10 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 mod record;
 pub use record::{Contract, Object, Recorded, record, repack};
 mod turn;
-pub use turn::{AttemptIdentity, CONTEXT_V1, Facts, Params, Verified, lead, mandatory};
+pub use turn::{
+    AttemptIdentity, CODE_BYTES, CODE_FILES, CONTEXT_V1, CodeFile, CodeSource, Facts, LOAD_BYTES,
+    Load, Params, Verified, lead, mandatory,
+};
 
 #[cfg(test)]
 mod tests;

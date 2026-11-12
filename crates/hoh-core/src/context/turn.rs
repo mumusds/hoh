@@ -41,7 +41,44 @@ pub struct Facts {
     pub identity: Option<AttemptIdentity>,
     pub params: Option<Params>,
     pub entries: Vec<Entry>,
+    /// Registered objects whose text the executor reads into entries ([`Facts::resolve_loads`], docs/adr/ADR-028.md
+    /// decision 14): the store names them, it never reads a file.
+    pub loads: Vec<Load>,
+    /// A candidate's changed files, read by the executor ([`Facts::add_code`], decision 14's code source).
+    pub code: Option<CodeSource>,
 }
+
+/// A registered object to read into an evidence entry (docs/adr/ADR-028.md decision 14): its digest and the name it
+/// was registered under, the entry's path, its label and its rank.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Load {
+    pub path: String,
+    pub sha256: String,
+    pub name: String,
+    pub label: String,
+    pub relevance: u64,
+}
+
+/// At most this much of a loaded object's text is an entry's (decision 14).
+pub const LOAD_BYTES: usize = 8 * 1024;
+
+/// The files a candidate changed from `base` to `commit` (decision 14's code source).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeSource {
+    pub base: String,
+    pub commit: String,
+}
+
+/// One changed file: its text at the candidate's commit, or why only its path is listed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeFile {
+    pub path: String,
+    pub text: Result<String, String>,
+}
+
+/// At most this many changed files are listed, each read only up to this size (decision 14).
+pub const CODE_FILES: usize = 50;
+pub const CODE_BYTES: u64 = 64 * 1024;
 
 /// The identity a work attempt's every output must repeat, and where its outputs go (docs/adr/ADR-028.md decision 2).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +90,8 @@ pub struct AttemptIdentity {
     pub role_epoch: i64,
     /// Its bridge file: one JSON object per line, its TaskResult and the messages it sends.
     pub bridge: String,
+    /// A writer's directory for its self-test records, relative to the project (docs/adr/ADR-028.md decision 14).
+    pub self_tests: Option<String>,
     /// A verifier's: what it verifies and its helpers.
     pub verified: Option<Verified>,
 }
@@ -73,6 +112,92 @@ impl Facts {
     /// Its packing parameters: the run's, else [`CONTEXT_V1`].
     pub fn params(&self) -> Params {
         self.params.unwrap_or(CONTEXT_V1)
+    }
+
+    /// Its loads read into evidence entries, each object by its digest through `read` (decision 14): UTF-8 text up to
+    /// [`LOAD_BYTES`] under its label, the cut marked; text that is not UTF-8, or an object that cannot be read, only
+    /// its reference.
+    pub fn resolve_loads(&mut self, read: impl Fn(&str) -> Result<Vec<u8>, String>) {
+        for load in std::mem::take(&mut self.loads) {
+            let head = format!("{}：{} sha256:{}", load.label, load.name, load.sha256);
+            let text = match read(&load.sha256).map(String::from_utf8) {
+                Ok(Ok(text)) if text.len() <= LOAD_BYTES => format!("{head}\n{text}"),
+                Ok(Ok(text)) => {
+                    let mut end = LOAD_BYTES;
+                    while !text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    format!(
+                        "{head}\n{}\n…（截断：只取前 {LOAD_BYTES} 字节，原文 {} 字节，全文见引用）",
+                        &text[..end],
+                        text.len()
+                    )
+                }
+                Ok(Err(_)) => format!("{head}（不是 UTF-8 文本，只列引用）"),
+                Err(why) => format!("{head}（对象不可读，只列引用：{why}）"),
+            };
+            self.entries.push(Entry {
+                class: super::Class::Evidence,
+                kind: super::Kind::Plain,
+                path: load.path,
+                text,
+                summary: None,
+                relevance: load.relevance,
+                recency: 0,
+                causal: 0,
+            });
+        }
+    }
+
+    /// Its code source's files as Code entries (decision 14): `files` as the executor read them (in path order, at
+    /// most [`CODE_FILES`]) with how many changed in all, or why none could be read.
+    pub fn add_code(&mut self, files: Result<(Vec<CodeFile>, usize), String>) {
+        let Some(source) = self.code.take() else {
+            return;
+        };
+        let entry = |path: String, text: String| Entry {
+            class: super::Class::Code,
+            kind: super::Kind::Plain,
+            path,
+            text,
+            summary: None,
+            relevance: 1,
+            recency: 0,
+            causal: 0,
+        };
+        let (files, total) = match files {
+            Ok(files) => files,
+            Err(why) => {
+                self.entries.push(entry(
+                    "code/unavailable".to_owned(),
+                    format!("候选相对 {} 改动的文件不可读：{why}", source.base),
+                ));
+                return;
+            }
+        };
+        let listed = files.len();
+        for file in files {
+            let text = match file.text {
+                Ok(text) => format!(
+                    "改动的文件 {}（候选 commit {} 中的内容）：\n{text}",
+                    file.path, source.commit
+                ),
+                Err(why) => format!("改动的文件 {}（只列路径：{why}）", file.path),
+            };
+            self.entries
+                .push(entry(format!("code/{}", file.path), text));
+        }
+        if total > listed {
+            self.entries.push(entry(
+                "code/more".to_owned(),
+                format!(
+                    "另有 {} 个改动的文件未列出（至多列 {CODE_FILES} 个；基准 {}，候选 commit {}）",
+                    total - listed,
+                    source.base,
+                    source.commit
+                ),
+            ));
+        }
     }
 }
 
@@ -114,6 +239,11 @@ pub fn mandatory(
             "- 输出文件（TaskResult 与发出的消息，每行一个 JSON 对象）：{}\n",
             id.bridge
         ));
+        if let Some(dir) = &id.self_tests {
+            task.push_str(&format!(
+                "- 自测记录目录（项目相对路径；TaskResult.evidence 只接受指向这里的文件）：{dir}\n"
+            ));
+        }
         if let Some(v) = &id.verified {
             task.push_str(&format!(
                 "- 被验证的任务（不是本 Task）：{}\n",
