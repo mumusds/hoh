@@ -588,14 +588,16 @@ pub(super) fn pace(
                 task.blocked_reason = Some(BlockedReason::BlockedCapability.as_str().to_owned());
             }
         }
-        let in_flight = tasks.iter().any(|t| {
-            matches!(
-                t.state,
-                TaskState::Leased
-                    | TaskState::Running
-                    | TaskState::Implemented
-                    | TaskState::Verifying
-            )
+        // In flight: only what can still move on (docs/adr/ADR-028.md decision 10, M2T16D-202): a verification round's
+        // source waiting for its round, and its verifier task once done, are not; a source waiting at a passable
+        // candidate's barrier for the join is (M2-T16's transition until M2-T18's join).
+        let verifiers = super::verification::verifier_tasks(&tx, run_id)?;
+        let (sources, joining) = super::verification::sources_and_joining(&tx, run_id)?;
+        let in_flight = tasks.iter().any(|t| match t.state {
+            TaskState::Leased | TaskState::Running => true,
+            TaskState::Implemented => !verifiers.contains(&t.task_id),
+            TaskState::Verifying => !sources.contains(&t.task_id) || joining.contains(&t.task_id),
+            _ => false,
         });
         let any_due = tasks.iter().any(due);
         let any_waiting = tasks.iter().any(waiting);

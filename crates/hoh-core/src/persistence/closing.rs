@@ -594,11 +594,46 @@ pub(super) fn reconcile(
             },
             ctx,
         )?;
+        if matches!(verdict.as_str(), "repair" | "invalidated") {
+            iteration(&tx, (&project_id, run_id), &round.candidate, &verdict, ctx)?;
+        }
         verdicts.insert(round.id.clone(), verdict.clone());
         done.closed.push((round.id.clone(), verdict));
     }
     // (2a) Failure items not yet consumed, by their owner's state.
     consume(&tx, run_id, &project_id, cancelling, ctx, &mut done)?;
+    // A refusal not cleared is a standing condition: a task that could be dispatched waits for its decision
+    // (decision 12, M2T16D-853).
+    for task in super::verification::refused(&tx, run_id)? {
+        let Some((state @ (TaskState::Ready | TaskState::Pending), revision, _)) =
+            task_state(&tx, &task)?
+        else {
+            continue;
+        };
+        tx.execute(
+            "UPDATE tasks SET blocked_reason = 'NEED_DECISION', next_retry_at = NULL WHERE task_id = ?1",
+            params![task],
+        )
+        .map_err(sqlite_error)?;
+        writer::write(
+            &tx,
+            &Commit {
+                cas: vec![StateCas {
+                    id: task.clone(),
+                    expected_revision: revision,
+                    change: Change::Task(TaskState::Blocked),
+                }],
+                events: vec![event(
+                    child_id(&task, &format!("refusal_holds/{revision}")),
+                    "task.blocked",
+                    json!({"task_id": task, "reason": "NEED_DECISION", "from": state.as_str(),
+                        "detail": "a refused repair waits for a decision"}),
+                )],
+                ..Commit::default()
+            },
+            ctx,
+        )?;
+    }
     // (3) and (4): the source tasks' exits and the candidates' barriers.
     exits(
         &tx,
@@ -1143,8 +1178,69 @@ fn exits(
                 },
                 ctx,
             )?;
+            iteration(tx, (project_id, run_id), candidate, "passable", ctx)?;
             done.joinable.push(candidate.to_owned());
         }
     }
     Ok(())
+}
+
+/// Candidate `candidate`'s one iteration, at its first conclusive result (decision 11, M2T16D-362, -657): a round closed
+/// `repair` or `invalidated`, or its join point; `iteration.completed` and an `iterations` row, the run's iteration
+/// usage counted (ADR-020). Nothing when it was counted already.
+fn iteration(
+    tx: &Transaction<'_>,
+    (project_id, run_id): (&str, &str),
+    candidate: &str,
+    verdict: &str,
+    ctx: &Ctx<'_>,
+) -> Result<(), PersistError> {
+    let id = child_id(candidate, "iteration");
+    let counted: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE event_id = ?1)",
+            params![id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    if counted {
+        return Ok(());
+    }
+    let number: i64 = tx
+        .query_row(
+            "SELECT coalesce(max(number), 0) + 1 FROM iterations WHERE run_id = ?1",
+            params![run_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    tx.execute(
+        "INSERT INTO iterations(iteration_id, run_id, number) VALUES (?1, ?2, ?3)",
+        params![
+            child_id(run_id, &format!("iteration/{number}")),
+            run_id,
+            number
+        ],
+    )
+    .map_err(sqlite_error)?;
+    tx.execute(
+        "UPDATE budgets SET used_value = used_value + 1 WHERE scope_kind = 'run' AND scope_id = ?1 \
+         AND kind = 'iterations'",
+        params![run_id],
+    )
+    .map_err(sqlite_error)?;
+    writer::write(
+        tx,
+        &Commit {
+            events: vec![NewEvent {
+                project_id: project_id.to_owned(),
+                event_id: id,
+                run_id: Some(run_id.to_owned()),
+                kind: "iteration.completed".to_owned(),
+                payload: json!({"iteration": number, "candidate_id": candidate, "verdict": verdict}),
+            }],
+            ..Commit::default()
+        },
+        ctx,
+    )
+    .map(drop)
 }

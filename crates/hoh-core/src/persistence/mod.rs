@@ -1296,6 +1296,31 @@ impl Store {
         self.writer.complete_writer_attempt(completion).await
     }
 
+    /// Clear task `task_id`'s standing repair refusal by decision `decision_id` (docs/adr/ADR-028.md decision 12; M2-T13's
+    /// AnswerQuestion calls it in its transaction, CR-018).
+    pub async fn clear_repair_refusal(
+        &self,
+        task_id: &str,
+        decision_id: &str,
+    ) -> Result<(), PersistError> {
+        let (project_id, run_id) = self
+            .reader()?
+            .task_run(task_id)?
+            .ok_or_else(|| PersistError::IntegrityViolation(format!("no task {task_id}")))?;
+        self.commit(Commit {
+            events: vec![NewEvent {
+                project_id,
+                event_id: crate::ids::child_id(task_id, &format!("refusal_cleared/{decision_id}")),
+                run_id: Some(run_id),
+                kind: "repair.refusal_cleared".to_owned(),
+                payload: serde_json::json!({"task_id": task_id, "decision_id": decision_id}),
+            }],
+            ..Commit::default()
+        })
+        .await
+        .map(drop)
+    }
+
     /// Run `run_id`'s verification reconcile (docs/adr/ADR-028.md decision 11): one transaction, idempotent; `pending`
     /// holds the candidates with check records still to be recorded (`.hoh/pending/`).
     pub async fn reconcile_verification(
@@ -1672,6 +1697,22 @@ impl Reader {
         package: &crate::protocol::ContextHandoff,
     ) -> Result<crate::context::Facts, PersistError> {
         context::verification(&self.conn, package)
+    }
+
+    /// Task `task_id`'s project and run, if it exists.
+    pub fn task_run(&self, task_id: &str) -> Result<Option<(String, String)>, PersistError> {
+        self.conn
+            .query_row(
+                "SELECT r.project_id, t.run_id FROM tasks t JOIN runs r ON r.run_id = t.run_id WHERE t.task_id = ?1",
+                rusqlite::params![task_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                e => Err(e),
+            })
+            .map_err(sqlite_error)
     }
 
     /// The attempt `attempt_id`, if it exists.

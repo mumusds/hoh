@@ -351,6 +351,65 @@ pub(super) fn unknown_effect(
     )))
 }
 
+/// Run `run_id`'s rounds' source tasks, and those of them whose current round's candidate is ready for its join.
+#[allow(clippy::type_complexity)]
+pub(super) fn sources_and_joining(
+    tx: &rusqlite::Connection,
+    run_id: &str,
+) -> Result<
+    (
+        std::collections::BTreeSet<String>,
+        std::collections::BTreeSet<String>,
+    ),
+    PersistError,
+> {
+    let mut statement = tx
+        .prepare(
+            "WITH named AS (SELECT e.seq, json_extract(e.payload_json, '$.candidate_id') AS candidate_id, \
+               s.value AS task_id FROM events e, json_each(e.payload_json, '$.source_task_ids') s \
+               WHERE e.kind = ?1 AND e.run_id = ?2) \
+             SELECT n.task_id, EXISTS(SELECT 1 FROM events j WHERE j.kind = 'verification.candidate_ready_for_join' \
+               AND j.run_id = ?2 AND json_extract(j.payload_json, '$.candidate_id') = n.candidate_id) \
+             FROM named n WHERE n.seq = (SELECT max(m.seq) FROM named m WHERE m.task_id = n.task_id)",
+        )
+        .map_err(sqlite_error)?;
+    let rows: Vec<(String, bool)> = statement
+        .query_map(params![ROUND_OPENED, run_id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .map_err(sqlite_error)?
+        .collect::<Result<_, _>>()
+        .map_err(sqlite_error)?;
+    Ok((
+        rows.iter().map(|(t, _)| t.clone()).collect(),
+        rows.iter()
+            .filter(|(_, j)| *j)
+            .map(|(t, _)| t.clone())
+            .collect(),
+    ))
+}
+
+/// The tasks of run `run_id` with a repair refusal no decision has cleared (docs/adr/ADR-028.md decision 12, M2T16D-800):
+/// a `need_decision` of an exhausted repair after the task's last `repair.refusal_cleared`.
+pub(super) fn refused(
+    tx: &rusqlite::Connection,
+    run_id: &str,
+) -> Result<std::collections::BTreeSet<String>, PersistError> {
+    let mut statement = tx
+        .prepare(
+            "SELECT DISTINCT json_extract(n.payload_json, '$.task_id') FROM events n WHERE n.kind = 'need_decision' \
+             AND n.run_id = ?1 AND json_extract(n.payload_json, '$.reason') IN \
+               ('local_repairs_exhausted', 'protocol_repairs_exhausted', 'reverify_exhausted') \
+             AND n.seq > coalesce((SELECT max(c.seq) FROM events c WHERE c.kind = 'repair.refusal_cleared' \
+               AND c.run_id = ?1 AND json_extract(c.payload_json, '$.task_id') = json_extract(n.payload_json, '$.task_id')), 0)",
+        )
+        .map_err(sqlite_error)?;
+    let rows = statement
+        .query_map(params![run_id], |r| r.get(0))
+        .map_err(sqlite_error)?;
+    rows.collect::<Result<_, _>>().map_err(sqlite_error)
+}
+
 /// The verifier tasks of run `run_id`'s rounds.
 pub(super) fn verifier_tasks(
     tx: &Transaction<'_>,
