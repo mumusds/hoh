@@ -80,19 +80,37 @@ pub async fn freeze(
     run_id: &str,
     inputs: &Inputs,
 ) -> Result<Frozen, FreezeError> {
-    let (checkout, state, inputs) = (checkout.to_owned(), state.to_owned(), inputs.clone());
-    let prepared = tokio::task::spawn_blocking(move || prepare(&checkout, &state, &inputs))
+    let (checkout, state, inputs, run) = (
+        checkout.to_owned(),
+        state.to_owned(),
+        inputs.clone(),
+        run_id.to_owned(),
+    );
+    let job = tokio::task::spawn_blocking(move || prepare_job(&checkout, &state, &run, &inputs))
         .await
         .map_err(|e| FreezeError::Io(format!("the freeze stopped: {e}")))??;
     store
-        .freeze_candidate(Freeze {
-            run_id: run_id.to_owned(),
-            sealed: prepared.sealed,
-            export: prepared.export,
-            inputs: prepared.inputs,
-        })
+        .freeze_candidate(job)
         .await
         .map_err(FreezeError::Store)
+}
+
+/// [`freeze`]'s file side for a caller that commits its store side in a transaction of its own (a writer attempt's
+/// completion, docs/adr/ADR-028.md decision 4): the same refusals, the export and inputs kept as objects, the job its
+/// transaction freezes. Blocking: run it off the async threads.
+pub fn prepare_job(
+    checkout: &Path,
+    state: &Path,
+    run_id: &str,
+    inputs: &Inputs,
+) -> Result<Freeze, FreezeError> {
+    let prepared = prepare(checkout, state, inputs)?;
+    Ok(Freeze {
+        run_id: run_id.to_owned(),
+        sealed: prepared.sealed,
+        export: prepared.export,
+        inputs: prepared.inputs,
+    })
 }
 
 /// git's `-z` output as its entries.
