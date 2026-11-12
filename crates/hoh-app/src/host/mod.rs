@@ -11,6 +11,7 @@
 
 pub mod agents;
 mod cgroup;
+mod completion;
 pub(crate) mod control;
 mod http;
 mod processes;

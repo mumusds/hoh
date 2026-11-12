@@ -103,6 +103,9 @@ pub struct Unfinished {
     pub lease_expired: bool,
     /// The outcome recorded when its work was observed (`effect.observed`: success or failure), if it was.
     pub work_outcome: Option<bool>,
+    /// Its task holds the write lease's role (`tasks.writer`): its success is its completion (docs/adr/ADR-028.md
+    /// decision 4), never the generic settle.
+    pub writer: bool,
 }
 
 /// What an effect becomes.
@@ -130,6 +133,10 @@ pub enum Disposition {
         task_to: TaskState,
         effects: Vec<EffectMove>,
     },
+    /// A writer's work was observed done and its task is RUNNING: its effects committed and nothing else; the host then
+    /// completes it as the runner would have (its bridge read, its freeze prepared, one commit with its settle;
+    /// docs/adr/ADR-028.md decision 4), so its attempt stays RUNNING with its write lease until that commit.
+    Complete { effects: Vec<EffectMove> },
     /// Its work was observed and is committed: SETTLED, its task IMPLEMENTED when it was RUNNING.
     Completed {
         effects: Vec<EffectMove>,
@@ -202,6 +209,14 @@ pub fn dispose(u: &Unfinished) -> Disposition {
         )
     });
     match committed {
+        // A writer's success is its completion, not the generic settle (docs/adr/ADR-028.md decision 4).
+        Some(Some(true))
+            if u.state == AttemptState::Running
+                && u.writer
+                && u.task_state == TaskState::Running =>
+        {
+            return Disposition::Complete { effects: moves };
+        }
         Some(Some(true)) if u.state == AttemptState::Running => {
             return Disposition::Completed {
                 effects: moves,
@@ -254,6 +269,7 @@ mod tests {
             effects,
             lease_expired: false,
             work_outcome: Some(true),
+            writer: false,
         }
     }
 
@@ -399,6 +415,55 @@ mod tests {
                 task_to: None
             }
         );
+    }
+
+    #[test]
+    fn a_writers_work_observed_done_is_left_to_its_completion_not_the_generic_settle() {
+        // docs/adr/ADR-028.md decision 4: a writer whose work succeeded and whose task is RUNNING is completed by the
+        // host (its bridge read, its freeze prepared, one commit); the reconcile only commits its effects, so its
+        // attempt stays RUNNING with its write lease and its task is never made IMPLEMENTED.
+        for state in [EffectState::Observed, EffectState::Committed] {
+            let mut writer = unfinished(
+                AttemptState::Running,
+                gone(),
+                vec![effect(&work_key("A"), state, None)],
+            );
+            writer.writer = true;
+            let effects = (state == EffectState::Observed)
+                .then(|| EffectMove {
+                    key: work_key("A"),
+                    from: EffectState::Observed,
+                    to: EffectState::Committed,
+                    external_ref: None,
+                })
+                .into_iter()
+                .collect();
+            assert_eq!(dispose(&writer), Disposition::Complete { effects });
+        }
+        // Its task no longer RUNNING (a cancel moved it): the generic settle, which leaves it alone.
+        let mut moved = unfinished(
+            AttemptState::Running,
+            gone(),
+            vec![effect(&work_key("A"), EffectState::Committed, None)],
+        );
+        moved.writer = true;
+        moved.task_state = TaskState::Cancelled;
+        assert_eq!(
+            dispose(&moved),
+            Disposition::Completed {
+                effects: vec![],
+                task_to: None
+            }
+        );
+        // A writer's failure ends as any attempt's does.
+        let mut failed = unfinished(
+            AttemptState::Running,
+            gone(),
+            vec![effect(&work_key("A"), EffectState::Committed, None)],
+        );
+        failed.writer = true;
+        failed.work_outcome = Some(false);
+        assert!(matches!(dispose(&failed), Disposition::Ended { .. }));
     }
 
     #[test]

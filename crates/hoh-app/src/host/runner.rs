@@ -896,6 +896,13 @@ async fn attempt(
         observed: outcome.observed.clone(),
         unknown_effect: unknown,
     };
+    // A writer's success is its completion, still under its write lease and its processes proven gone above: frozen and
+    // accepted, corrected or decided by its bridge, and settled, in one commit (docs/adr/ADR-028.md decisions 3, 4).
+    if work.assignment.writer && ending.success && !unknown {
+        super::completion::complete(store, &common.shared.root, identity_of(&work)?, ending)
+            .await?;
+        return Ok(());
+    }
     // An interrupted writer's end goes with its workspace's record (REQ-019 behaviour 6, docs/adr/ADR-024.md
     // decision 9), its processes proven gone above.
     let id = id.as_str();
@@ -906,6 +913,22 @@ async fn attempt(
     })
     .await?;
     Ok(())
+}
+
+/// The identity `work`'s prompt gave it, which every line of its bridge must name (docs/adr/ADR-028.md decision 2).
+fn identity_of(work: &Work) -> Result<hoh_core::bridge::Identity, PersistError> {
+    Ok(hoh_core::bridge::Identity {
+        run_id: work.run_id.clone(),
+        task_id: work.task_id.clone(),
+        attempt_id: work.attempt_id.clone(),
+        role: work.role.clone(),
+        role_epoch: u64::try_from(work.assignment.role_epoch).map_err(|_| {
+            PersistError::IntegrityViolation(format!(
+                "attempt {}: role epoch {}",
+                work.attempt_id, work.assignment.role_epoch
+            ))
+        })?,
+    })
 }
 
 /// One step event of a settle. A pass's steps are committed together, in their order (AC-041-02), after its stop
@@ -1059,6 +1082,7 @@ async fn settle(
         effects,
         lease_expired: cause == "lease_expired" || row.lease_expired,
         work_outcome: row.work_outcome,
+        writer: row.writer,
     });
     super::reconcile::apply(
         store,

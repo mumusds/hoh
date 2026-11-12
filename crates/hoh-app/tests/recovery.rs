@@ -164,9 +164,25 @@ fn marker_name(key: &str) -> String {
     key.replace('/', "_")
 }
 
-/// Runs each attempt's work as a FakeAgent, the leader of its own process group (as the substrate starts agents).
+/// Runs each attempt's work as a FakeAgent, the leader of its own process group (as the substrate starts agents), with
+/// its work directory and its project. A writer's work reports INCOMPLETE through its bridge, as the product's agent
+/// writes its TaskResult there (docs/adr/ADR-028.md decisions 2 and 3): the file in its attempt directory, which a
+/// reconcile reads again, and the lines its end carries. Its task is then BLOCKED for a decision after that one
+/// attempt, the end these tests take for done (a writer's work is no longer settled IMPLEMENTED; its freeze, which
+/// needs a committed specification and criteria, is the verification tests' subject).
 #[derive(Debug)]
-struct FakeExecutor(PathBuf);
+struct FakeExecutor(PathBuf, PathBuf);
+
+/// The INCOMPLETE TaskResult of `work`'s writer, by its identity.
+fn incomplete(work: &hoh_app::host::Work) -> String {
+    json!({
+        "schema_version": "1.0", "run_id": work.run_id, "task_id": work.task_id, "attempt_id": work.attempt_id,
+        "role": work.role, "role_epoch": work.assignment.role_epoch, "status": "INCOMPLETE",
+        "summary": "the fake agent's turn ended", "candidate_id": null, "evidence": [], "issues": [],
+        "next_action": "decide"
+    })
+    .to_string()
+}
 
 impl hoh_app::host::Executor for FakeExecutor {
     fn deliver(
@@ -197,10 +213,35 @@ impl hoh_app::host::Executor for FakeExecutor {
         let pid = child.id();
         let gate = gate(&mut child);
         let ended = reaping(child);
+        if !work.assignment.writer {
+            return Ok(hoh_app::host::Started {
+                pid,
+                gate,
+                ended,
+                prompt: None,
+            });
+        }
+        let lines = vec![incomplete(work)];
+        let bridge = hoh_app::host::product::bridge_of(&self.1, &work.attempt_id);
+        std::fs::create_dir_all(
+            bridge
+                .parent()
+                .ok_or_else(|| String::from("no attempt directory"))?,
+        )
+        .and_then(|()| std::fs::write(&bridge, format!("{}\n", lines.join("\n"))))
+        .map_err(|e| e.to_string())?;
+        // Its end carries the lines, as the product's executor reads them; a lost end stays lost.
+        let (end, carried) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            if let Ok(mut outcome) = ended.blocking_recv() {
+                outcome.observed.messages = lines;
+                let _ = end.send(outcome);
+            }
+        });
         Ok(hoh_app::host::Started {
             pid,
             gate,
-            ended,
+            ended: carried,
             prompt: None,
         })
     }
@@ -511,7 +552,7 @@ fn recovery_host() {
     if let Some(work) = std::env::var_os(CHILD_WORK) {
         let developer = ["structured_events", "command_exec"].map(str::to_owned);
         config.runner = Some(hoh_app::host::RunnerConfig {
-            executor: Arc::new(FakeExecutor(PathBuf::from(&work))),
+            executor: Arc::new(FakeExecutor(PathBuf::from(&work), PathBuf::from(&project))),
             context: Context {
                 required_capabilities: [("developer".to_owned(), developer.into_iter().collect())]
                     .into(),
@@ -1292,6 +1333,98 @@ print(json.dumps({
     let digest = <sha2::Sha256 as sha2::Digest>::digest(&diff);
     let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
     assert_eq!(workspace["diff_sha256"], json!(hex), "{record}");
+    Ok(())
+}
+
+#[test]
+fn a_writer_whose_work_was_observed_done_is_completed_from_its_bridge_at_the_restart() -> R {
+    // docs/adr/ADR-028.md decision 4's recovery: writer T2's attempt AW ended successfully (its work OBSERVED with
+    // success) and its host died before the completion's commit. The restarted host's reconcile proves its process
+    // gone, reads its bridge (still in its attempt directory) and takes the completion's path: its FAILED TaskResult
+    // blocks T2 for a decision with the agent's summary, AW SETTLED, the write lease let go with the workspace's
+    // record; never the generic settle (T2 IMPLEMENTED). Writer T3's attempt AX, the same but with no bridge at all,
+    // gets a counted protocol correction (T3 READY again).
+    let dir = tempfile::tempdir()?;
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    let (code, stderr) = serve_and_stop(&project)?;
+    assert_eq!(code, 0, "{stderr}");
+    seed(
+        &project,
+        &format!(
+            "{RUNNING_WORLD}
+             UPDATE tasks SET writer = 1;
+             INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, pid, boot_id,
+               process_start_id, started_at) VALUES
+               ('AW', 'T2', 'RUNNING', 1, 1, 1, {gone}, '{boot}', '1', '2026-11-07T00:00:00Z'),
+               ('AX', 'T3', 'RUNNING', 1, 1, 1, {gone}, '{boot}', '1', '2026-11-07T00:00:00Z');
+             INSERT INTO effects(effect_key, attempt_id, state) VALUES ('AW/work', 'AW', 'OBSERVED'),
+               ('AX/work', 'AX', 'COMMITTED');
+             INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+               (:p, 'AW/work/effect.observed', 'R', 'effect.observed', json_object('effect_key', 'AW/work',
+                 'detail', json_object('success', json('true'), 'ended_at', '2026-11-07T00:00:05Z')),
+                 '2026-11-07T00:00:05Z'),
+               (:p, 'AX/work/effect.observed', 'R', 'effect.observed', json_object('effect_key', 'AX/work',
+                 'detail', json_object('success', json('true'), 'ended_at', '2026-11-07T00:00:05Z')),
+                 '2026-11-07T00:00:05Z');
+             INSERT INTO leases(project_id, kind, attempt_id, epoch, expires_at) VALUES
+               (:p, 'writer', 'AW', 1, '2999-01-01T00:00:00Z');",
+            boot = hoh_agents::identity::boot_id()?,
+            gone = 1 << 23,
+        ),
+    )?;
+    let bridge = project.join(".hoh/attempts/AW");
+    std::fs::create_dir_all(&bridge)?;
+    std::fs::write(
+        bridge.join("messages.jsonl"),
+        format!(
+            "{}\n",
+            json!({"schema_version": "1.0", "run_id": "R", "task_id": "T2", "attempt_id": "AW",
+                "role": "developer", "role_epoch": 1, "status": "FAILED", "summary": "the build broke",
+                "candidate_id": null, "evidence": [], "issues": [], "next_action": "decide"})
+        ),
+    )?;
+    let (code, stderr) = serve_and_stop(&project)?;
+    assert_eq!(code, 0, "the restarted host: {stderr}");
+    let read: Value = serde_json::from_str(&python(
+        &db(&project),
+        r#"
+import json, sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+one = lambda sql: (c.execute(sql).fetchone() or [None])[0]
+print(json.dumps({
+    "attempts": one("SELECT group_concat(attempt_id || ':' || state, ',') FROM (SELECT * FROM attempts WHERE attempt_id IN ('AW', 'AX') ORDER BY attempt_id)"),
+    "t2": one("SELECT state || '/' || coalesce(blocked_reason, '') FROM tasks WHERE task_id = 'T2'"),
+    "decision": one("SELECT payload_json FROM events WHERE kind = 'need_decision' AND json_extract(payload_json, '$.task_id') = 'T2'"),
+    "correction": one("SELECT payload_json FROM events WHERE kind = 'task.protocol_correction' AND json_extract(payload_json, '$.task_id') = 'T3'"),
+    "dispositions": [r[0] for r in c.execute("SELECT json_extract(payload_json, '$.disposition') FROM events WHERE kind = 'reconcile.attempt' ORDER BY seq")],
+    "outputs": one("SELECT json_array_length(payload_json, '$.lines') FROM events WHERE event_id = 'AW/outputs'"),
+    "expires_at": one("SELECT expires_at FROM leases WHERE kind = 'writer' AND attempt_id = 'AW'"),
+}))
+"#,
+        "",
+    )?)?;
+    assert_eq!(read["attempts"], "AW:SETTLED,AX:SETTLED", "{read}");
+    assert_eq!(read["t2"], "BLOCKED/NEED_DECISION", "{read}");
+    let decision: Value =
+        serde_json::from_str(read["decision"].as_str().ok_or("no need_decision")?)?;
+    assert!(
+        decision.to_string().contains("the build broke"),
+        "{decision}"
+    );
+    let correction: Value =
+        serde_json::from_str(read["correction"].as_str().ok_or("no correction for T3")?)?;
+    assert_eq!(correction["attempt_id"], "AX", "{correction}");
+    assert_eq!(
+        read["dispositions"],
+        json!(["completion", "completion"]),
+        "{read}"
+    );
+    assert_eq!(read["outputs"], 1, "{read}");
+    assert!(
+        read["expires_at"].as_str() < Some("2999"),
+        "the lease was not let go: {read}"
+    );
     Ok(())
 }
 
@@ -2331,7 +2464,7 @@ async fn a_leaderless_group_keeps_its_slot_and_gets_no_signal() -> R {
     // Looked at again every 200 ms: an unchanged finding is not written again (M2T05R-157, -253).
     let host = runner_host_with(
         &project,
-        Arc::new(FakeExecutor(work.clone())),
+        Arc::new(FakeExecutor(work.clone(), project.clone())),
         clock,
         Setup {
             retry: Some(Duration::from_millis(200)),
@@ -2443,7 +2576,10 @@ async fn a_settle_waits_for_a_start_still_in_progress() -> R {
     let clock = Arc::new(FakeClock::default());
     let host = runner_host_with(
         &project,
-        Arc::new(SlowStart(latch.clone(), FakeExecutor(work.clone()))),
+        Arc::new(SlowStart(
+            latch.clone(),
+            FakeExecutor(work.clone(), project.clone()),
+        )),
         clock.clone(),
         Setup {
             hooks: Some(Arc::new(OpenAtSettle(latch.clone()))),
@@ -2467,11 +2603,12 @@ async fn a_settle_waits_for_a_start_still_in_progress() -> R {
         "1",
         Duration::from_secs(20)
     )?);
-    // T2's agent runs; A1's never did.
+    // T2's agent runs to its end (its INCOMPLETE result: T2 BLOCKED for a decision); A1's never did.
     assert!(wait_for(
         &db,
-        "SELECT state FROM tasks WHERE task_id = 'T2'",
-        "IMPLEMENTED",
+        "SELECT t.state || '/' || t.blocked_reason || '/' || a.state FROM tasks t JOIN attempts a ON a.task_id = t.task_id \
+         WHERE t.task_id = 'T2'",
+        "BLOCKED/NEED_DECISION/SETTLED",
         Duration::from_secs(20)
     )?);
     let counted = std::fs::read_to_string(work.join("counter")).unwrap_or_default();
@@ -2976,7 +3113,7 @@ async fn a_finished_leader_settles_only_once_its_group_is_gone() -> R {
     let clock = Arc::new(FakeClock::default());
     let probe = Arc::new(GrantProbe::default());
     let executor = Arc::new(LeavesAMember {
-        inner: FakeExecutor(work),
+        inner: FakeExecutor(work, project.clone()),
         probe: Some(probe.clone()),
         negligent: false,
         started: std::sync::Mutex::new(Vec::new()),
@@ -3020,7 +3157,7 @@ async fn a_leader_whose_group_was_not_emptied_keeps_its_slot() -> R {
     let work = dir.path().join("work");
     std::fs::create_dir_all(work.join("markers"))?;
     let executor = Arc::new(LeavesAMember {
-        inner: FakeExecutor(work),
+        inner: FakeExecutor(work, project.clone()),
         probe: None,
         negligent: true,
         started: std::sync::Mutex::new(Vec::new()),
@@ -3099,7 +3236,13 @@ async fn the_runner_keeps_the_slot_of_a_holder_it_cannot_confirm_gone() -> R {
         let work = dir.path().join("work");
         std::fs::create_dir_all(work.join("markers"))?;
         let clock = Arc::new(FakeClock::default());
-        let host = runner_host(&project, Arc::new(FakeExecutor(work)), clock, None).await?;
+        let host = runner_host(
+            &project,
+            Arc::new(FakeExecutor(work, project.clone())),
+            clock,
+            None,
+        )
+        .await?;
         let db = db(&project);
         assert!(wait_for(
             &db,
@@ -3182,7 +3325,7 @@ async fn the_runner_frees_the_slot_of_an_unconfirmed_holder_once_its_group_is_go
     // Looked at again every 200 ms; an unchanged finding is not written again (M2T05R-157).
     let host = runner_host_with(
         &project,
-        Arc::new(FakeExecutor(work)),
+        Arc::new(FakeExecutor(work, project.clone())),
         clock,
         Setup {
             retry: Some(Duration::from_millis(200)),
@@ -3259,7 +3402,7 @@ async fn a_holder_recorded_in_another_world_keeps_its_slot_and_its_settle_is_wri
     let clock = Arc::new(FakeClock::default());
     let host = runner_host_with(
         &project,
-        Arc::new(FakeExecutor(work)),
+        Arc::new(FakeExecutor(work, project.clone())),
         clock,
         Setup {
             retry: Some(Duration::from_millis(200)),
@@ -3335,7 +3478,8 @@ impl hoh_app::host::HostHooks for SlowSettle {
 
 /// M2T05R-102, -150: a write of an attempt's task fails (its receipt; its OBSERVED effect). The task's entry goes
 /// with it: the receipt's failure leaves the dispatch to be delivered again; the later one is settled at once with
-/// the process it holds (its work found by its marker): either way T1 ends IMPLEMENTED and T2 follows, no lease kept
+/// the process it holds (its work found by its marker): either way T1's attempt settles and is completed from its bridge
+/// (its INCOMPLETE result: T1 BLOCKED for a decision, docs/adr/ADR-028.md decisions 3, 4) and T2 follows, no lease kept
 /// alive for a task that ended. Its entry goes only after that settle: ticks during it do not take the attempt up
 /// again (M2T05R-260, -358).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3357,7 +3501,7 @@ async fn a_runner_write_that_fails_does_not_strand_its_attempt() -> R {
         });
         let host = runner_host_with(
             &project,
-            Arc::new(FakeExecutor(work.clone())),
+            Arc::new(FakeExecutor(work.clone(), project.clone())),
             clock,
             Setup {
                 faults: Some(faults),
@@ -3371,8 +3515,8 @@ async fn a_runner_write_that_fails_does_not_strand_its_attempt() -> R {
         assert!(
             wait_for(
                 &db,
-                "SELECT group_concat(state ORDER BY task_id) FROM tasks WHERE task_id IN ('T1', 'T2')",
-                "IMPLEMENTED,IMPLEMENTED",
+                "SELECT group_concat(state || '/' || blocked_reason ORDER BY task_id) FROM tasks WHERE task_id IN ('T1', 'T2')",
+                "BLOCKED/NEED_DECISION,BLOCKED/NEED_DECISION",
                 Duration::from_secs(20)
             )?,
             "nth={nth}: {}",
@@ -3404,7 +3548,7 @@ async fn a_runner_write_that_fails_does_not_strand_its_attempt() -> R {
                     &db,
                     "SELECT json_extract(payload_json, '$.disposition') FROM events WHERE kind = 'reconcile.attempt' AND json_extract(payload_json, '$.cause') = 'runner_error'"
                 )?,
-                "completed"
+                "completion"
             );
         }
         let counted = std::fs::read_to_string(work.join("counter")).unwrap_or_default();
@@ -3489,7 +3633,7 @@ async fn a_failed_start_and_a_gate_that_cannot_open_never_run_the_work() -> R {
         std::fs::create_dir_all(work.join("markers"))?;
         let clock = Arc::new(FakeClock::default());
         let executor = Arc::new(Faulty {
-            inner: FakeExecutor(work.clone()),
+            inner: FakeExecutor(work.clone(), project.clone()),
             start_fails: std::sync::atomic::AtomicBool::new(!gate_fails && !ghost),
             gate_fails,
             ghost: std::sync::atomic::AtomicBool::new(ghost),
@@ -3509,11 +3653,13 @@ async fn a_failed_start_and_a_gate_that_cannot_open_never_run_the_work() -> R {
             "{}",
             query(&db, first)?
         );
+        // The next attempt runs it to its end (its INCOMPLETE result: T1 BLOCKED for a decision, docs/adr/ADR-028.md
+        // decision 3).
         if !gate_fails {
             assert!(wait_for(
                 &db,
-                "SELECT state FROM tasks WHERE task_id = 'T1'",
-                "IMPLEMENTED",
+                "SELECT state || '/' || blocked_reason FROM tasks WHERE task_id = 'T1'",
+                "BLOCKED/NEED_DECISION",
                 Duration::from_secs(20)
             )?);
         }

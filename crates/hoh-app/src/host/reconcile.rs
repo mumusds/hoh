@@ -243,7 +243,9 @@ pub(super) fn stopped(stopped: &identity::Stopped) -> Process {
 
 /// `row`'s disposition and the process found applied in one transaction (`Store::reconcile_apply`), after its stop:
 /// an interrupted end of the writer lease's holder with the workspace's record of `project`, taken when the store asks
-/// for it (REQ-019 behaviour 6, docs/adr/ADR-024.md decision 9).
+/// for it (REQ-019 behaviour 6, docs/adr/ADR-024.md decision 9). A writer whose work was observed done is then
+/// completed from its bridge, its attempt RUNNING with its lease until that commit (docs/adr/ADR-028.md decision 4); a
+/// crash in between leaves it to the next reconcile, which finds it the same.
 pub(super) async fn apply(
     store: &Store,
     project: &std::path::Path,
@@ -253,14 +255,20 @@ pub(super) async fn apply(
     at: std::time::SystemTime,
     draw: u32,
 ) -> Result<i64, PersistError> {
-    super::control::recorded_end(project, move |workspace| {
+    let complete = matches!(disposition, Disposition::Complete { .. });
+    let found = row.clone();
+    let seq = super::control::recorded_end(project, move |workspace| {
         let row = UnfinishedRow {
             workspace,
             ..row.clone()
         };
         store.reconcile_apply(row, disposition.clone(), process.clone(), cause, at, draw)
     })
-    .await
+    .await?;
+    if complete {
+        super::completion::recover(store, project, &found, cause, at, draw).await?;
+    }
+    Ok(seq)
 }
 
 /// Reconcile the project's unfinished attempts (in `project`); done before the host serves anything.
@@ -325,12 +333,14 @@ pub(super) async fn run(
             effects,
             lease_expired: row.lease_expired,
             work_outcome: row.work_outcome,
+            writer: row.writer,
         });
         *counts
             .entry(match disposition {
                 Disposition::Redeliver => "redeliver",
                 Disposition::Unreaped => "unreaped",
                 Disposition::Ended { .. } => "ended",
+                Disposition::Complete { .. } => "completion",
                 Disposition::Completed { .. } => "completed",
                 Disposition::UnknownEffect { .. } => "unknown_effect",
             })
@@ -512,6 +522,9 @@ mod tests {
             state: AttemptState::Running,
             task_state: hoh_core::protocol::TaskState::Running,
             task_revision: 1,
+            role: "developer".to_owned(),
+            writer: false,
+            role_epoch: 1,
             pid: None,
             boot_id: None,
             process_start_id: None,

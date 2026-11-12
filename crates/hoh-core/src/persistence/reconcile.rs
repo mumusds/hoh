@@ -30,6 +30,11 @@ pub struct UnfinishedRow {
     pub state: AttemptState,
     pub task_state: TaskState,
     pub task_revision: i64,
+    /// Its task's role and whether it is the write lease's (`tasks.writer`), and its attempt's role epoch: a writer's
+    /// work observed done is completed from its bridge, which must name them (docs/adr/ADR-028.md decisions 2, 4).
+    pub role: String,
+    pub writer: bool,
+    pub role_epoch: i64,
     pub pid: Option<i64>,
     pub boot_id: Option<String>,
     pub process_start_id: Option<String>,
@@ -143,12 +148,13 @@ fn scan(
             bool,
             Option<i64>,
         ),
+        (String, bool, i64),
     );
     let mut statement = conn
         .prepare(
             "SELECT r.run_id, a.attempt_id, a.task_id, a.state, t.state, t.revision, a.pid, a.boot_id, \
              a.process_start_id, EXISTS(SELECT 1 FROM leases l WHERE l.attempt_id = a.attempt_id AND l.expires_at <= ?2), \
-             (SELECT max(l.epoch) FROM leases l WHERE l.attempt_id = a.attempt_id) \
+             (SELECT max(l.epoch) FROM leases l WHERE l.attempt_id = a.attempt_id), t.role, t.writer, a.role_epoch \
              FROM attempts a JOIN tasks t ON t.task_id = a.task_id JOIN runs r ON r.run_id = t.run_id \
              WHERE r.project_id = ?1 AND a.state IN ('PREPARED', 'STARTING', 'RUNNING') ORDER BY a.rowid",
         )
@@ -165,13 +171,14 @@ fn scan(
                     r.get(5)?,
                 ),
                 (r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?),
+                (r.get(11)?, r.get(12)?, r.get(13)?),
             ))
         })
         .map_err(sqlite_error)?
         .collect::<Result<_, _>>()
         .map_err(sqlite_error)?;
     let mut rows = Vec::with_capacity(raws.len());
-    for (ids, process) in raws {
+    for (ids, process, (role, task_writer, role_epoch)) in raws {
         let (run_id, attempt_id, task_id, state, task_state, task_revision) = ids;
         let (pid, boot_id, start, lease_expired, lease_epoch) = process;
         let effects = effects_of(conn, &attempt_id)?;
@@ -210,6 +217,9 @@ fn scan(
             attempt_id,
             task_id,
             task_revision,
+            role,
+            writer: task_writer,
+            role_epoch,
             pid,
             boot_id,
             process_start_id: start,
@@ -329,6 +339,10 @@ fn apply(
                 task_to,
                 effects,
             } => ("ended", Some(*to), Some(*task_to), effects.as_slice(), &[]),
+            // Its effects only: the host completes it next, its attempt RUNNING and its lease held until then.
+            Disposition::Complete { effects } => {
+                ("completion", None, None, effects.as_slice(), &[])
+            }
             Disposition::Completed { effects, task_to } => (
                 "completed",
                 Some(AttemptState::Settled),
