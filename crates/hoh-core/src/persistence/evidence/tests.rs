@@ -150,6 +150,7 @@ fn recording(record_id: &str, candidate: &str, producer: &str) -> Recording {
             spec_id: "s1".to_owned(),
             status: "PASS",
             reason: "TEST-001-01 case: PASS".to_owned(),
+            failing: Vec::new(),
         }],
         integrity: Vec::new(),
     }
@@ -255,6 +256,7 @@ async fn an_invalid_evidence_vetoes_its_candidate_for_good_and_a_changed_source_
         spec_id: "s1".to_owned(),
         status: "INVALID",
         reason: "SOURCE_CHANGED".to_owned(),
+        failing: Vec::new(),
     }];
     job.integrity = vec!["source changed: src/lib.rs".to_owned()];
     store.record_evidence(job.clone()).await?;

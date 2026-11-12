@@ -269,20 +269,41 @@ pub(super) fn corrections(
         .collect::<Result<_, _>>()
         .map_err(sqlite_error)?;
     let bounded = |text: String| text.chars().take(2000).collect::<String>();
+    // The task's corrections and reverifications, read once within its run (events_run_kind, M2T16R-201), by attempt.
+    let run_id: Option<String> = conn
+        .query_row(
+            "SELECT run_id FROM tasks WHERE task_id = ?1",
+            params![task_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let mut owed: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    let mut statement = conn
+        .prepare(
+            "SELECT json_extract(payload_json, '$.attempt_id'), kind, payload_json FROM events WHERE run_id = ?1 \
+             AND kind IN ('task.protocol_correction', 'task.reverify') AND json_extract(payload_json, '$.task_id') = ?2 \
+             ORDER BY seq",
+        )
+        .map_err(sqlite_error)?;
+    let found = statement
+        .query_map(params![run_id, task_id], |r| {
+            Ok((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(sqlite_error)?;
+    for row in found {
+        let (attempt, kind, payload) = row.map_err(sqlite_error)?;
+        if let Some(attempt) = attempt {
+            owed.entry(attempt).or_default().push((kind, payload));
+        }
+    }
     let mut out: Vec<String> = Vec::new();
     for (previous, state) in earlier {
-        let mut statement = conn
-            .prepare(
-                "SELECT kind, payload_json FROM events WHERE kind IN ('task.protocol_correction', 'task.reverify') \
-                 AND json_extract(payload_json, '$.task_id') = ?1 AND json_extract(payload_json, '$.attempt_id') = ?2 \
-                 ORDER BY seq",
-            )
-            .map_err(sqlite_error)?;
-        let rows: Vec<(String, String)> = statement
-            .query_map(params![task_id, previous], |r| Ok((r.get(0)?, r.get(1)?)))
-            .map_err(sqlite_error)?
-            .collect::<Result<_, _>>()
-            .map_err(sqlite_error)?;
+        let rows = owed.remove(&previous).unwrap_or_default();
         if rows.is_empty() {
             // An accepted end answers what was owed; any other end leaves it owed.
             if state == "SETTLED" {
@@ -317,11 +338,11 @@ pub(super) fn corrections(
     }
     let superseded: Option<String> = conn
         .query_row(
-            "SELECT json_extract(payload_json, '$.detail') FROM events WHERE kind = 'task.superseded' \
+            "SELECT json_extract(payload_json, '$.detail') FROM events WHERE run_id = ?2 AND kind = 'task.superseded' \
              AND json_extract(payload_json, '$.task_id') = ?1 \
-             AND seq > coalesce((SELECT max(c.seq) FROM events c WHERE c.kind = 'candidate_ready' \
+             AND seq > coalesce((SELECT max(c.seq) FROM events c WHERE c.run_id = ?2 AND c.kind = 'candidate_ready' \
                AND json_extract(c.payload_json, '$.task_id') = ?1), 0) ORDER BY seq DESC LIMIT 1",
-            params![task_id],
+            params![task_id, run_id],
             |r| r.get(0),
         )
         .optional()

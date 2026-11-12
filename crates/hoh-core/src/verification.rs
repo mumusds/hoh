@@ -976,10 +976,9 @@ pub fn conclude(
         .filter(|o| o["test_id"] == test_id)
         .collect();
     let degraded: Vec<&&Value> = lines.iter().filter(|o| o["status"] == "DEGRADED").collect();
-    let compliant = scenario && requirement && check && degraded.iter().all(|o| based(o));
     if outcome.status == Status::Invalid {
         Some(Status::Invalid)
-    } else if lines.iter().any(|o| o["status"] == "FAIL") || (!degraded.is_empty() && !compliant) {
+    } else if !failing(e, test_id, scenario, requirement, check).is_empty() {
         Some(Status::Fail)
     } else if scenario
         && outcome.status == Status::Pass
@@ -1000,6 +999,26 @@ pub fn conclude(
     }
 }
 
+/// The result lines of TEST `test_id` in member `e` that fail it ([`conclude`]'s (2) and (3), docs/adr/ADR-028.md
+/// implementation correction 5): its FAIL lines, and its DEGRADED lines that are not compliant: all of them unless its
+/// check is the TEST's scenario check and its requirement and check may degrade, else those without their basis.
+pub fn failing<'a>(
+    e: &'a Evidence,
+    test_id: &str,
+    scenario: bool,
+    requirement: bool,
+    check: bool,
+) -> Vec<&'a Value> {
+    let may_degrade = scenario && requirement && check;
+    e.observations
+        .iter()
+        .filter(|o| o["test_id"] == test_id)
+        .filter(|o| {
+            o["status"] == "FAIL" || (o["status"] == "DEGRADED" && !(may_degrade && based(o)))
+        })
+        .collect()
+}
+
 /// An acceptance criterion of the run's spec as the rows need it: its declared TEST, its scenario check, and whether
 /// its requirement may degrade.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1010,9 +1029,18 @@ pub struct AcSpec {
     pub degradable: bool,
 }
 
+/// An evidence's conclusion on an acceptance criterion (docs/adr/ADR-027.md decision 9): its AC, its status, and for
+/// a FAIL the names of the result lines it failed on, sorted (docs/adr/ADR-028.md implementation correction 5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcRow {
+    pub ac_id: String,
+    pub status: Status,
+    pub failing: Vec<String>,
+}
+
 /// The acceptance rows of evidence `e` of outcome `outcome` on the spec's criteria `acs`, `check` when the policy lets
 /// its check degrade (docs/adr/ADR-027.md decision 9).
-pub fn rows(e: &Evidence, outcome: &Outcome, acs: &[AcSpec], check: bool) -> Vec<(String, Status)> {
+pub fn rows(e: &Evidence, outcome: &Outcome, acs: &[AcSpec], check: bool) -> Vec<AcRow> {
     let checked = &e.record.check_id;
     let named = |test: &str| e.observations.iter().any(|o| o["test_id"] == test);
     acs.iter()
@@ -1023,7 +1051,20 @@ pub fn rows(e: &Evidence, outcome: &Outcome, acs: &[AcSpec], check: bool) -> Vec
             } else {
                 conclude(e, outcome, &ac.test_id, scenario, ac.degradable, check)
             };
-            status.map(|s| (ac.ac_id.clone(), s))
+            status.map(|status| AcRow {
+                ac_id: ac.ac_id.clone(),
+                status,
+                failing: if status == Status::Fail {
+                    failing(e, &ac.test_id, scenario, ac.degradable, check)
+                        .into_iter()
+                        .filter_map(|o| o["name"].as_str().map(str::to_owned))
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .into_iter()
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+            })
         })
         .collect()
 }

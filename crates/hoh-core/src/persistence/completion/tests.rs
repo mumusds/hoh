@@ -2889,12 +2889,39 @@ async fn every_source_of_a_round_whose_reverify_chain_is_spent_waits_for_a_decis
 /// (`(test_id, name, status)`), as a check's evidence records them.
 fn evidence_with(
     path: &Path,
-    (attempt, candidate, record): (&str, &str, &str),
+    ids: (&str, &str, &str),
     (check, outcome): (&str, &str),
     rows: &[(&str, &str, &str)],
     observations: &[(&str, &str, &str)],
 ) -> R {
-    let plain: Vec<(&str, &str)> = rows.iter().map(|(ac, _, status)| (*ac, *status)).collect();
+    // The check driver's failing lines of a FAIL row when no line is DEGRADED: its FAIL lines (correction 5).
+    let judged: Vec<(&str, &str, &str, Vec<&str>)> = rows
+        .iter()
+        .map(|(ac, test, status)| {
+            let failing = observations
+                .iter()
+                .filter(|(t, _, s)| *status == "FAIL" && t == test && *s == "FAIL")
+                .map(|(_, name, _)| *name)
+                .collect();
+            (*ac, *test, *status, failing)
+        })
+        .collect();
+    evidence_judged(path, ids, (check, outcome), &judged, observations)
+}
+
+/// [`evidence_with`], each row with the failing lines the check driver judged it to have (docs/adr/ADR-028.md
+/// implementation correction 5).
+fn evidence_judged(
+    path: &Path,
+    (attempt, candidate, record): (&str, &str, &str),
+    (check, outcome): (&str, &str),
+    rows: &[(&str, &str, &str, Vec<&str>)],
+    observations: &[(&str, &str, &str)],
+) -> R {
+    let plain: Vec<(&str, &str)> = rows
+        .iter()
+        .map(|(ac, _, status, _)| (*ac, *status))
+        .collect();
     evidence_of(
         path,
         (attempt, candidate, record),
@@ -2904,8 +2931,9 @@ fn evidence_with(
     )?;
     let rows: Vec<serde_json::Value> = rows
         .iter()
-        .map(|(ac, test, status)| {
-            json!({"ac_id": ac, "spec_id": "s1", "status": status, "reason": format!("{test} in check {check}")})
+        .map(|(ac, test, status, failing)| {
+            json!({"ac_id": ac, "spec_id": "s1", "status": status, "reason": format!("{test} in check {check}"),
+                "failing": failing})
         })
         .collect();
     let observations: Vec<serde_json::Value> = observations
@@ -3355,6 +3383,111 @@ async fn a_persistent_failing_test_is_one_item_whatever_fails_beside_it() -> R {
     Ok(())
 }
 
+/// Four rounds of D, each failing on the planned check `unit` with a row of `ac` (its TEST `test`) FAIL on a line
+/// `persistent` of status `status` the driver judged `counted` (a failing line) or not, beside a FAIL line that changes
+/// every round: D's state after each round. `ac` outside D's scope is AC-9-01, a criterion of another requirement.
+async fn four_rounds(ac: &str, test: &str, status: &str, counted: bool) -> R<Vec<String>> {
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    Connection::open(&path)?.execute_batch(
+        "INSERT INTO requirements(requirement_id, spec_id, title, required_release) VALUES ('REQ-9', 's1', 'r9', 1);
+         INSERT INTO acceptance_criteria(ac_id, requirement_id, spec_id, body, check_id) VALUES
+           ('AC-9-01', 'REQ-9', 's1', 'b9', 'unit');",
+    )?;
+    let mut states = Vec::new();
+    for (n, tree) in ['b', 'c', 'd', 'e'].into_iter().enumerate() {
+        let attempt = if n == 0 {
+            "A".to_owned()
+        } else {
+            format!("A{n}")
+        };
+        if n > 0 {
+            Connection::open(&path)?.execute_batch(&format!(
+                "UPDATE tasks SET state = 'RUNNING', revision = revision + 1 WHERE task_id = 'D';
+                 INSERT INTO attempts(attempt_id, task_id, session_id, state, role_epoch, host_epoch, config_revision,
+                   started_at) VALUES ('{attempt}', 'D', 'sd', 'RUNNING', 1, 1, 1, '2026-11-12T00:00:0{n}Z');"
+            ))?;
+        }
+        let job = freeze_of(tree);
+        let candidate = job.sealed.candidate_id.clone();
+        store
+            .complete_writer_attempt(WriterCompletion {
+                attempt_id: attempt.clone(),
+                ..completion(freeze(job, result_of("D", &attempt)?))
+            })
+            .await?;
+        let [qa, _] = settle_verifiers(&store, &path, "PASS", "PASS").await?;
+        let companion = format!("{}_case_{n}", test.to_lowercase().replace('-', "_"));
+        let persistent = format!("{}_persistent", test.to_lowercase().replace('-', "_"));
+        let mut failing = vec![companion.as_str()];
+        if counted {
+            failing.push(persistent.as_str());
+        }
+        failing.sort();
+        let mut rows = vec![(ac, test, "FAIL", failing)];
+        if ac != "AC-1-01" {
+            rows.push(("AC-1-01", "TEST-1-01", "PASS", Vec::new()));
+        }
+        evidence_judged(
+            &path,
+            (&qa, &candidate, &format!("rec-{n}")),
+            ("unit", "FAIL"),
+            &rows,
+            &[
+                (test, &persistent, status),
+                (test, &companion, "FAIL"),
+                ("TEST-1-01", "test_1_01_works", "PASS"),
+            ],
+        )?;
+        store
+            .reconcile_verification("R", Default::default())
+            .await?;
+        states.extend(texts(&path, "SELECT state FROM tasks WHERE task_id = 'D'")?);
+    }
+    Ok(states)
+}
+
+const ESCALATED: [&str; 4] = ["READY", "READY", "READY", "BLOCKED"];
+
+#[tokio::test]
+async fn a_persistent_noncompliant_degradation_is_one_item_whatever_fails_beside_it() -> R {
+    // ADR-028 implementation correction 5 (M2T16R-200): a DEGRADED line the conclusion failed on is a failing test
+    // like a FAIL line; persistent beside a FAIL that changes every round, the fourth time D waits for a decision.
+    assert_eq!(
+        four_rounds("AC-1-01", "TEST-1-01", "DEGRADED", true).await?,
+        ESCALATED
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_out_of_scope_persistent_failure_is_one_item_whatever_fails_beside_it() -> R {
+    // ADR-028 implementation corrections 4 and 5 (M2T16R-100, -200, -252): the same outside the round's scope, for a
+    // FAIL line and for a DEGRADED line the conclusion failed on.
+    for status in ["FAIL", "DEGRADED"] {
+        assert_eq!(
+            four_rounds("AC-9-01", "TEST-9-01", status, true).await?,
+            ESCALATED,
+            "{status}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_compliant_degradation_beside_a_failure_is_no_item() -> R {
+    // ADR-028 implementation correction 5 (M2T16R-200): a compliant DEGRADED line beside the FAIL is no failing test,
+    // in scope or outside it, so four rounds of other failures never accumulate on it.
+    for (ac, test) in [("AC-1-01", "TEST-1-01"), ("AC-9-01", "TEST-9-01")] {
+        assert_eq!(
+            four_rounds(ac, test, "DEGRADED", false).await?,
+            ["READY"; 4],
+            "{ac}"
+        );
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_corrections_reason_outlives_an_attempt_that_failed_to_start() -> R {
     // ADR-028 implementation correction 4 (M2T16R-102): A's output is corrected; A2 fails before it ran; A3 is still told
@@ -3463,6 +3596,7 @@ fn pass_recording(
             spec_id: "s1".to_owned(),
             status: "PASS",
             reason: "TEST-1-01 in check unit".to_owned(),
+            failing: Vec::new(),
         }],
         integrity: Vec::new(),
     }

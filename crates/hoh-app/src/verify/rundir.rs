@@ -160,8 +160,16 @@ pub fn check_of(role: &str) -> &'static str {
     }
 }
 
-/// Remove the run directory `dir` (after its attempt is settled); one already gone is fine. Blocking.
+/// Remove the run directory `dir` (after its attempt is settled); one already gone is fine. One a check still finishing
+/// reads (its checkout held, an attempt ended by a cancel or a lease judged expired) is kept: the per-tick removal of
+/// unused run directories takes it once that check ended (docs/adr/ADR-028.md decision 8, M2T16R-150, -250). Blocking.
 pub fn remove(dir: &Path) {
+    if super::check::checkouts_in_flight()
+        .iter()
+        .any(|held| held.starts_with(dir))
+    {
+        return;
+    }
     let _ = std::fs::remove_dir_all(dir);
 }
 
