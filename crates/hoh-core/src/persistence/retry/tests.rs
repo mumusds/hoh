@@ -327,6 +327,55 @@ async fn test_042_05_repairs_past_their_limits_are_refused_for_a_decision_across
 }
 
 #[tokio::test]
+async fn a_work_attempts_bridge_lines_are_kept_with_its_observed_effect_whatever_its_end() -> R {
+    // docs/adr/ADR-028.md decision 2: a work attempt's bridge lines (its TaskResult, its messages) are recorded in the
+    // transaction of its work's OBSERVED, success or not, so its completion and a reconcile after a crash read the same
+    // lines; a supervision turn's stay its outputs (ADR-025 decision 8).
+    for success in [true, false] {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = open(&dir)?;
+        Connection::open(&path)?.execute_batch(&format!(
+            "{WORLD}
+             UPDATE tasks SET state = 'RUNNING', revision = 3 WHERE task_id = 'T1';
+             INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, started_at) VALUES
+               ('A1', 'T1', 'RUNNING', 1, 1, 1, '2026-11-07T00:00:00Z');
+             INSERT INTO effects(effect_key, attempt_id, state) VALUES ('{}', 'A1', 'STARTED');",
+            crate::reconcile::work_key("A1")
+        ))?;
+        let lines = ["{\"status\": \"COMPLETED\"}", "second line"];
+        assert!(
+            store
+                .runner_effect(
+                    "A1",
+                    &crate::reconcile::work_key("A1"),
+                    crate::reconcile::EffectState::Started,
+                    crate::reconcile::EffectState::Observed,
+                    json!({"success": success, "detail": "turn", "messages": lines}),
+                )
+                .await?
+        );
+        let kept: String = Connection::open(&path)?.query_row(
+            "SELECT payload_json FROM events WHERE kind = 'attempt.outputs'",
+            [],
+            |r| r.get(0),
+        )?;
+        let kept: Value = serde_json::from_str(&kept)?;
+        assert_eq!(kept["attempt_id"], "A1");
+        assert_eq!(kept["success"], success);
+        assert_eq!(kept["lines"], json!(lines));
+        let in_effect = count(
+            &path,
+            "SELECT count(*) FROM events WHERE kind = 'effect.observed' AND payload_json LIKE '%second line%'",
+        )?;
+        assert_eq!(
+            in_effect, 0,
+            "the lines are not copied into the effect's own event"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_repair_asked_again_for_the_same_action_is_decided_once() -> R {
     // docs/adr/ADR-028.md decision 12 (M2T16D-09): a barrier's close or a correction asks for its repair inside its own
     // transaction and may run again after a crash before or after it committed; the same action is counted once and
