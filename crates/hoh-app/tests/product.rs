@@ -28,6 +28,36 @@ const PI_RPC: &str = concat!(
 /// A line of 8 MiB with no LF (AC-027-03).
 const HUGE: usize = 8 << 20;
 
+/// A fake agent's TaskResult from nothing but its product prompt's identity header (docs/adr/ADR-028.md decision 2):
+/// the prompt as it came on stdin (`argv[1]`), plain or as JSON lines whose strings hold it; a TaskResult of status
+/// `argv[2]` appended to the bridge file the header names.
+const RESULT_FAKE: &str = r#"import json, re, sys
+raw = open(sys.argv[1], encoding="utf-8").read()
+texts = [raw]
+for line in raw.splitlines():
+    try:
+        stack = [json.loads(line)]
+    except ValueError:
+        continue
+    while stack:
+        x = stack.pop()
+        if isinstance(x, str):
+            texts.append(x)
+        elif isinstance(x, dict):
+            stack.extend(x.values())
+        elif isinstance(x, list):
+            stack.extend(x)
+text = "\n".join(texts)
+field = lambda key: re.search("- " + key + "：(.+)", text).group(1).strip()
+bridge = re.search("- 输出文件（[^）]*）：(.+)", text).group(1).strip()
+result = {"schema_version": "1.0", "run_id": field("run_id"), "task_id": field("task_id"),
+          "attempt_id": field("attempt_id"), "role": field("role"), "role_epoch": int(field("role_epoch")),
+          "status": sys.argv[2], "summary": "done by the fake", "candidate_id": None, "evidence": [], "issues": [],
+          "next_action": "verify"}
+with open(bridge, "a", encoding="utf-8") as f:
+    f.write(json.dumps(result) + "\n")
+"#;
+
 /// The CANCEL turn: SIGINT and SIGTERM blocked before `claude.d/cancel-ready` is made and taken with sigtimedwait, each
 /// written to `claude.d/signals` with the nanosecond it came; a blocked signal stays pending, so none is lost in a
 /// gap of a shell's own handling (the bash trap this replaces is the stand-in whose SIGINT was not recorded in CI run
@@ -172,11 +202,14 @@ impl World {
     /// A fake `claude` 2.1.318: the probe's answers from the recording (`--version` 3 s late while `claude.d/slow`
     /// exists, 120 s with its pid in `claude.d/probe-pid` while `claude.d/hang` does); a turn reads its prompt, then replays the recorded `success` turn (once `hold` exists, if given), or, for
     /// an attempt whose marker names HUGE, its first frame and then 8 MiB with no LF, or, for one whose marker names
-    /// CANCEL, [`CANCEL_STAND_IN`].
+    /// CANCEL, [`CANCEL_STAND_IN`]; one whose marker names RESULT first writes a COMPLETED TaskResult by its prompt's
+    /// identity header ([`RESULT_FAKE`]).
     fn claude(&self, hold: Option<&Path>) -> R {
         let wait = hold.map_or(String::new(), |h| {
             format!("while [ ! -e '{}' ]; do sleep 0.05; done\n", h.display())
         });
+        std::fs::create_dir_all(self.bin().join("claude.d"))?;
+        std::fs::write(self.bin().join("claude.d/result.py"), RESULT_FAKE)?;
         self.script(
             "claude",
             &format!(
@@ -186,6 +219,7 @@ impl World {
                  case \"$HOH_ATTEMPT_ID\" in\n\
                   *HUGE*) head -n 1 \"$f/success/stdout.jsonl\"; head -c {HUGE} /dev/zero | tr '\\0' x; sleep 20; exit 0;;\n\
                   *CANCEL*) exec python3 -c '{CANCEL_STAND_IN}' \"$d\" \"$f/success/stdout.jsonl\";;\n\
+                  *RESULT*) python3 \"$d/result.py\" \"$d/stdin.$$\" COMPLETED || exit 1;;\n\
                  esac\n{wait}cat \"$f/success/stdout.jsonl\"\n",
                 bin = self.bin().display()
             ),
@@ -1218,6 +1252,101 @@ fn git(dir: &Path, args: &[&str]) -> R<String> {
         return Err(format!("git {args:?}: {}", String::from_utf8_lossy(&out.stderr)).into());
     }
     Ok(String::from_utf8(out.stdout)?)
+}
+
+#[tokio::test]
+async fn a_developers_completed_result_is_frozen_accepted_and_settled_in_one_commit() -> R {
+    // docs/adr/ADR-028.md decisions 2 to 4 through the product's executor (TEST-035-03's first half; the verification
+    // tasks its handoffs start are S4's): a fake claude writes, from nothing but its prompt's identity header, a
+    // COMPLETED TaskResult to the bridge the header names. The writer's completion freezes the committed project (its
+    // specification and test plan where the layout puts them, the environment description HoH writes), accepts the
+    // result and settles the attempt in one commit: candidate and task VERIFYING, two handoffs (qa, reviewer) in
+    // candidate_ready's transaction, the attempt SETTLED and the write lease let go.
+    let world = World::new()?;
+    world.claude(None)?;
+    let project = world.project();
+    let spec =
+        "{\"requirements\": [{\"id\": \"REQ-001\", \"acceptance\": [{\"id\": \"AC-001-01\"}]}]}\n";
+    git(&project, &["init", "-q"])?;
+    for (path, text) in [
+        ("src/lib.rs", "pub fn a() {}\n"),
+        ("contracts/requirements.json", spec),
+        ("tests/check-plan.json", "{\"checks\": {}}\n"),
+    ] {
+        let file = project.join(path);
+        std::fs::create_dir_all(file.parent().ok_or("no parent")?)?;
+        std::fs::write(file, text)?;
+    }
+    git(&project, &["add", "."])?;
+    git(&project, &["commit", "-q", "-m", "first"])?;
+    world.bind_installed()?;
+    let digest = <sha2::Sha256 as sha2::Digest>::digest(spec.as_bytes());
+    let sha: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    let host = start_when_free(world.config()).await?;
+    let outcome = async {
+        let run_id = started(&host, "s1").await?;
+        exec(
+            &project,
+            &format!(
+                "INSERT INTO specs(spec_id, project_id, sha256, revision) \
+                 SELECT 'sv', project_id, '{sha}', 7 FROM runs WHERE run_id = '{run_id}';
+                 UPDATE runs SET state = 'RUNNING', spec_id = 'sv' WHERE run_id = '{run_id}';
+                 INSERT INTO requirements(requirement_id, spec_id, title, required_release) VALUES ('REQ-001', 'sv', 'r', 1);
+                 INSERT INTO acceptance_criteria(ac_id, requirement_id, spec_id, body, check_id) VALUES
+                   ('AC-001-01', 'REQ-001', 'sv', 'it works', 'unit');
+                 INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate) \
+                   VALUES ('T-RESULT', '{run_id}', 'sv', 'READY', 1, 'developer', 1, \
+                   (SELECT coalesce(max(created_seq), 0) + 1 FROM tasks), 1);
+                 INSERT INTO task_requirements(task_id, requirement_id, spec_id) VALUES ('T-RESULT', 'REQ-001', 'sv');"
+            ),
+        )?;
+        let limit = Duration::from_secs(60);
+        until(&project, &ended("T-RESULT/attempt-1"), "SETTLED/", limit).await?;
+        let state = |sql: &str| query(&project, sql);
+        assert_eq!(
+            state("SELECT group_concat(state) FROM tasks WHERE task_id = 'T-RESULT'")?,
+            "VERIFYING"
+        );
+        let candidate = state("SELECT candidate_id || '/' || state || '/' || spec_sha256 FROM candidates")?;
+        assert!(
+            candidate.ends_with(&format!("/VERIFYING/{sha}")),
+            "{candidate}"
+        );
+        let id = candidate.split('/').next().ok_or("no candidate")?;
+        assert_eq!(
+            state(
+                "SELECT group_concat(json_extract(payload_json, '$.recipient_role') || ':' || \
+                 json_extract(payload_json, '$.correlation_id'), ',') FROM (SELECT * FROM outbox \
+                 WHERE json_extract(payload_json, '$.kind') = 'handoff' ORDER BY json_extract(payload_json, '$.recipient_role'))"
+            )?,
+            format!("qa:{id},reviewer:{id}")
+        );
+        assert_eq!(
+            state(
+                "SELECT count(DISTINCT event_seq) FROM outbox WHERE json_extract(payload_json, '$.kind') = 'handoff'"
+            )?,
+            "1",
+            "both handoffs in candidate_ready's transaction"
+        );
+        assert_eq!(
+            state("SELECT count(*) FROM events WHERE kind = 'candidate_ready'")?,
+            "1"
+        );
+        assert_eq!(
+            state(
+                "SELECT count(*) FROM leases WHERE kind = 'writer' AND attempt_id = 'T-RESULT/attempt-1' \
+                 AND expires_at = (SELECT ended_at FROM attempts WHERE attempt_id = 'T-RESULT/attempt-1')"
+            )?,
+            "1",
+            "the write lease expires at the attempt's end"
+        );
+        assert!(project.join(".hoh/environment.json").is_file());
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    world.stop_fakes()?;
+    outcome
 }
 
 #[tokio::test]
