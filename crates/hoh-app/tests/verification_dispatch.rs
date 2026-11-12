@@ -1227,3 +1227,62 @@ async fn test_037_02_qa_and_review_run_side_by_side_and_the_round_closes_only_af
     host.shutdown().await;
     outcome
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_damaged_pending_record_makes_its_candidate_stale_and_its_round_superseded() -> R {
+    // docs/adr/ADR-028.md decision 11's recovery (M2T16D-1250, -1251): a pending record of C1 whose facts do not parse
+    // is a permanent fault: judged at once, C1 STALE with candidate.stale{evidence_unrecoverable} and
+    // integrity_violation; its round, once its verifiers end, closes superseded, and D goes back to be frozen anew.
+    let dir = tempfile::tempdir()?;
+    let (project, spec) = project(dir.path()).await?;
+    seed(&project, &world(&spec))?;
+    let clock = Arc::new(FakeClock::default());
+    let team = Arc::new(Team::new(Commander::Answers, &spec, &project));
+    let host = host(&project, team.clone(), clock.clone()).await?;
+    let outcome = async {
+        let step = Duration::from_millis(100);
+        wait_for(&project, &clock, step, VERIFIERS, &|r| r.as_array().is_some_and(|a| a.len() == 2))?;
+        let (id, _, _) = candidate(&project)?;
+        let record = "00000000-0000-4000-8000-000000000001";
+        std::fs::create_dir_all(project.join(format!(".hoh/evidence/{id}/unit/{record}")))?;
+        std::fs::create_dir_all(project.join(".hoh/pending"))?;
+        std::fs::write(
+            project.join(format!(".hoh/pending/{record}.json")),
+            json!({"record": {"candidate_id": id}, "damaged": true}).to_string(),
+        )?;
+        wait_for(&project, &clock, step, "SELECT state FROM candidates", &|r| {
+            r[0]["state"] == "STALE"
+        })?;
+        assert_eq!(
+            rows(
+                &project,
+                "SELECT json_extract(payload_json, '$.kind') AS kind FROM events WHERE kind = 'candidate.reconcile_failed'"
+            )?,
+            json!([{"kind": "permanent"}])
+        );
+        assert_eq!(
+            rows(&project, "SELECT json_extract(payload_json, '$.reason') AS reason FROM events WHERE kind = 'candidate.stale'")?,
+            json!([{"reason": "evidence_unrecoverable"}])
+        );
+        team.release.store(true, Ordering::SeqCst);
+        let closed = wait_for(
+            &project,
+            &clock,
+            step,
+            "SELECT json_extract(payload_json, '$.verdict') AS verdict FROM events WHERE kind = 'verification.round_closed'",
+            &|r| r.as_array().is_some_and(|a| !a.is_empty()),
+        )?;
+        assert_eq!(closed[0]["verdict"], json!("superseded"));
+        wait_for(
+            &project,
+            &clock,
+            step,
+            "SELECT count(*) AS n FROM events WHERE kind = 'task.superseded' AND json_extract(payload_json, '$.task_id') = 'D'",
+            &|r| r[0]["n"] == json!(1),
+        )?;
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    outcome
+}

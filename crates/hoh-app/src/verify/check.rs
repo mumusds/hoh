@@ -39,6 +39,9 @@ pub enum CheckError {
     Store(PersistError),
     /// git or a file could not be read.
     Io(String),
+    /// What a record's recovery found cannot be made good by trying again: its pending facts do not parse, name another
+    /// record, or claim objects that are lost (docs/adr/ADR-028.md decision 11's permanent errors, M2T16D-1251).
+    Damaged(String),
 }
 
 /// git's `-z` output as its entries.
@@ -1231,7 +1234,7 @@ pub(crate) fn described(e: &CheckError) -> String {
     match e {
         CheckError::Refused(reasons) => reasons.join("; "),
         CheckError::Store(e) => e.to_string(),
-        CheckError::Io(why) => why.clone(),
+        CheckError::Io(why) | CheckError::Damaged(why) => why.clone(),
     }
 }
 
@@ -1598,8 +1601,9 @@ fn pending(
                 continue;
             }
             let text = hoh_core::objects::read_regular(&file).map_err(unreadable)?;
+            let damaged = |e: String| CheckError::Damaged(format!("{}: {e}", file.display()));
             let mut facts: Facts =
-                serde_json::from_slice(&text).map_err(|e| unreadable(e.to_string()))?;
+                serde_json::from_slice(&text).map_err(|e| damaged(e.to_string()))?;
             // Bound to its record directory by candidate and check as well as by record id (M2T10R-551).
             let check_id = check
                 .file_name()
@@ -1612,7 +1616,7 @@ fn pending(
                 r.check_id.as_str(),
             ) != (record_id.as_str(), candidate_id, check_id.as_str())
             {
-                return Err(unreadable(format!(
+                return Err(damaged(format!(
                     "it holds record {} of candidate {} and check {}, not the record directory's {record_id} of \
                      {candidate_id} and {check_id}",
                     r.record_id, r.candidate_id, r.check_id
@@ -1650,7 +1654,7 @@ fn pending(
             if !lost.is_empty()
                 && recording.outcome.status != hoh_core::verification::Status::Invalid
             {
-                return Err(unreadable(format!(
+                return Err(damaged(format!(
                     "objects {} are lost, yet the record still holds",
                     lost.join(", ")
                 )));

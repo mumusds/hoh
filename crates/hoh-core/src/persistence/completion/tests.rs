@@ -1904,3 +1904,85 @@ async fn a_completion_after_failures_were_attached_to_its_running_task_goes_back
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn a_candidates_unrecoverable_evidence_is_judged_permanent_at_once_transient_after_three_and_ten_minutes()
+-> R {
+    // Decision 11's recovery (M2T16D-1250, -1251): each failed recovery of a candidate's pending records is recorded;
+    // a permanent one is judged at once, a transient one only after at least 3 in a row over at least 10 minutes, and a
+    // success in between starts the count again. Judged: a VERIFYING candidate STALE with
+    // candidate.stale{evidence_unrecoverable} and integrity_violation; an INVALID one keeps its state, the fact written.
+    let t0 = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
+    let minutes = |m: u64| t0 + std::time::Duration::from_secs(60 * m);
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    verifying(&store).await?;
+    let candidate = texts(&path, "SELECT candidate_id FROM candidates")?.remove(0);
+    let transient = || Err((false, "EIO".to_owned()));
+    store
+        .record_recovery(&candidate, transient(), minutes(0))
+        .await?;
+    store
+        .record_recovery(&candidate, transient(), minutes(4))
+        .await?;
+    store.record_recovery(&candidate, Ok(1), minutes(5)).await?;
+    store
+        .record_recovery(&candidate, transient(), minutes(6))
+        .await?;
+    store
+        .record_recovery(&candidate, transient(), minutes(9))
+        .await?;
+    store
+        .record_recovery(&candidate, transient(), minutes(15))
+        .await?;
+    assert_eq!(
+        texts(&path, "SELECT state FROM candidates")?,
+        ["VERIFYING"],
+        "3 in a row but only 9 minutes since the first after the success"
+    );
+    store
+        .record_recovery(&candidate, transient(), minutes(16))
+        .await?;
+    assert_eq!(texts(&path, "SELECT state FROM candidates")?, ["STALE"]);
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT json_extract(payload_json, '$.reason') FROM events WHERE kind = 'candidate.stale'"
+        )?,
+        ["evidence_unrecoverable"]
+    );
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT kind FROM events WHERE kind = 'candidate.reconcile_recovered'"
+        )?
+        .len(),
+        1
+    );
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT kind FROM events WHERE kind = 'integrity_violation'"
+        )?
+        .len(),
+        1
+    );
+    // A permanent fault on an INVALID candidate: judged at once, its state kept.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    verifying(&store).await?;
+    let candidate = texts(&path, "SELECT candidate_id FROM candidates")?.remove(0);
+    Connection::open(&path)?.execute_batch("UPDATE candidates SET state = 'INVALID';")?;
+    store
+        .record_recovery(&candidate, Err((true, "damaged".to_owned())), minutes(0))
+        .await?;
+    assert_eq!(texts(&path, "SELECT state FROM candidates")?, ["INVALID"]);
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT json_extract(payload_json, '$.reason') FROM events WHERE kind = 'candidate.stale'"
+        )?,
+        ["evidence_unrecoverable"]
+    );
+    Ok(())
+}
