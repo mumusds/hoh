@@ -33,6 +33,7 @@ mod rounds;
 mod runner;
 mod supervise;
 mod team;
+mod verification;
 mod wakes;
 pub use candidates::{CandidateRow, Freeze, Frozen, RunAcceptance};
 pub use completion::{WriterCompleted, WriterCompletion, WriterOutcome};
