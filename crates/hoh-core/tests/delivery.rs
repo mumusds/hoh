@@ -423,8 +423,23 @@ async fn test_022_01_duplicates_and_reordering_apply_each_message_once() -> R {
     Ok(())
 }
 
+/// A task handoff (handoff_kind=task) to `role` at `epoch` about task T at revision 3 with C2: a kind=handoff message
+/// the delivery loop still delivers; it never claims a verification handoff (docs/adr/ADR-028.md decision 9 and its
+/// implementation correction 1).
+fn task_handoff(id: &str, role: &str, epoch: u64) -> R<Message> {
+    let mut m = qa_handoff(id)?;
+    m.recipient_role = role.to_owned();
+    m.role_epoch = epoch;
+    m.payload.insert("role".to_owned(), json!(role));
+    m.payload.insert("role_epoch".to_owned(), json!(epoch));
+    m.payload.insert("handoff_kind".to_owned(), json!("task"));
+    Ok(m)
+}
+
 #[tokio::test]
 async fn test_022_03_a_lost_ack_is_deduplicated_and_an_unanswered_message_dead_letters() -> R {
+    // AC-022-03 with D's result accepted (its two verification handoffs queued, which the loop never claims): QA's
+    // kind=handoff message m and R2's (the reviewer's, never answered) message n, both task handoffs about T.
     let dir = tempfile::tempdir()?;
     let (store, db) = open(&dir)?;
     seed(&db, WORLD)?;
@@ -433,11 +448,13 @@ async fn test_022_03_a_lost_ack_is_deduplicated_and_an_unanswered_message_dead_l
     else {
         return Err("the result was not accepted".into());
     };
-    let (m, n) = (handoffs[0].clone(), handoffs[1].clone());
-    assert!(
-        m.ends_with("/qa") && n.ends_with("/reviewer"),
-        "{handoffs:?}"
-    );
+    let (m, n) = ("m".to_owned(), "n".to_owned());
+    enqueue(
+        &store,
+        "m-n",
+        &[task_handoff(&m, "qa", 2)?, task_handoff(&n, "reviewer", 1)?],
+    )
+    .await?;
     let clock = FakeClock::new();
     let local = LocalTransport::new(&store, &clock)
         .with("qa", Noop)
@@ -455,10 +472,11 @@ async fn test_022_03_a_lost_ack_is_deduplicated_and_an_unanswered_message_dead_l
     dispatcher.tick().await?;
     let after_first = rows(
         &db,
-        "SELECT message_id, state, attempt_count, next_retry_at FROM outbox ORDER BY message_id",
+        "SELECT message_id, state, attempt_count, next_retry_at FROM outbox WHERE message_id IN ('m', 'n') \
+         ORDER BY message_id",
     )?;
     assert!(
-        after_first.iter().all(|r| r[3].is_string()),
+        after_first.len() == 2 && after_first.iter().all(|r| r[3].is_string()),
         "next_retry_at not kept: {after_first:?}"
     );
     let (retries, series) = drain(&dispatcher, &db, &clock).await?;
@@ -491,8 +509,11 @@ async fn test_022_03_a_lost_ack_is_deduplicated_and_an_unanswered_message_dead_l
         [[json!("ACKED"), json!(2)]]
     );
     assert_eq!(
-        one(&db, "SELECT state FROM tasks WHERE task_id = 'D'")?,
-        json!("VERIFYING")
+        rows(
+            &db,
+            "SELECT state FROM tasks WHERE task_id IN ('D', 'T') ORDER BY task_id"
+        )?,
+        [[json!("VERIFYING")], [json!("VERIFYING")]]
     );
     assert_eq!(
         rows(
@@ -501,6 +522,16 @@ async fn test_022_03_a_lost_ack_is_deduplicated_and_an_unanswered_message_dead_l
         )?,
         [[json!("DEAD_LETTER"), json!(3)]]
     );
+    for handoff in &handoffs {
+        assert_eq!(
+            rows(
+                &db,
+                &format!("SELECT state, attempt_count FROM outbox WHERE message_id = '{handoff}'")
+            )?,
+            [[json!("PENDING"), json!(0)]],
+            "the verification handoff {handoff} was claimed"
+        );
+    }
     assert_eq!(
         one(
             &db,
@@ -605,7 +636,8 @@ async fn test_022_04_candidate_ready_hands_the_same_candidate_to_qa_and_reviewer
         "{again:?}"
     );
     assert_eq!(one(&db, "SELECT count(*) FROM outbox")?, json!(2));
-    // Both delivered and acknowledged: an ACK moves no task.
+    // Not through the delivery loop (docs/adr/ADR-028.md decision 9, M2T16D-255): the round's verifier tasks take them
+    // at their dispatch, so a claim skips both even with qa and reviewer consumers registered; nothing moves.
     let clock = FakeClock::new();
     let local = LocalTransport::new(&store, &clock)
         .with("qa", Noop)
@@ -620,26 +652,23 @@ async fn test_022_04_candidate_ready_hands_the_same_candidate_to_qa_and_reviewer
     };
     drain(&dispatcher, &db, &clock).await?;
     assert_eq!(
-        rows(&db, "SELECT DISTINCT state FROM outbox")?,
-        [[json!("ACKED")]]
+        rows(&db, "SELECT DISTINCT state, attempt_count FROM outbox")?,
+        [[json!("PENDING"), json!(0)]]
     );
-    // Both consumers took their handoff (an ack, not a rejection that also settles ACKED).
+    assert_eq!(one(&db, "SELECT count(*) FROM receipts")?, json!(0));
     assert_eq!(
-        rows(
-            &db,
-            "SELECT DISTINCT json_extract(result_json, '$.kind') FROM receipts"
-        )?,
-        [[json!("ack")]]
-    );
-    assert_ne!(
         one(&db, "SELECT state FROM tasks WHERE task_id = 'D'")?,
-        json!("ACCEPTED")
+        json!("VERIFYING")
     );
     Ok(())
 }
 
 #[tokio::test]
 async fn test_022_05_stale_epoch_spec_candidate_and_an_empty_handoff_are_refused() -> R {
+    // AC-022-05's first three messages, through the delivery loop. Its fourth, a verification handoff with no
+    // acceptance criteria, is refused where a verification handoff is delivered: at its verifier task's dispatch
+    // (docs/adr/ADR-028.md decision 9, implementation correction 1;
+    // persistence::completion::tests::test_022_05_an_empty_handoff_found_at_its_dispatch_is_refused_and_creates_no_attempt).
     let dir = tempfile::tempdir()?;
     let (store, db) = open(&dir)?;
     seed(&db, WORLD)?;
@@ -663,29 +692,6 @@ async fn test_022_05_stale_epoch_spec_candidate_and_an_empty_handoff_are_refused
         &stale.iter().map(|(m, _)| m.clone()).collect::<Vec<_>>(),
     )
     .await?;
-    // A handoff with no acceptance criteria cannot be queued by the product; one that got into the outbox anyway.
-    let empty = json!({
-        "schema_version": "1.0", "message_id": "q-empty", "run_id": "R", "task_id": "T", "attempt_id": "-",
-        "sender_role": "runtime", "recipient_role": "qa", "role_epoch": 2, "correlation_id": "C2",
-        "causation_id": null, "idempotency_key": "q-empty", "expected_revision": 3, "spec_sha256": sha(2),
-        "candidate_id": "C2", "kind": "handoff",
-        "payload": {
-            "schema_version": "1.0", "run_id": "R", "task_id": "T", "goal": "verify", "role": "qa", "role_epoch": 2,
-            "spec_sha256": sha(2),
-            "candidate": {"id": "C2", "git_commit": format!("{:040}", 2), "git_tree": format!("{:040}", 12),
-                          "spec_sha256": sha(2), "environment_sha256": sha(3), "test_plan_sha256": sha(4)},
-            "acceptance_ids": [], "references": [], "output_contract": "TaskResult", "budget_tokens": 1000,
-            "handoff_kind": "verification", "spec_revision": 2
-        }
-    });
-    seed(
-        &db,
-        &format!(
-            "INSERT INTO outbox(message_id, event_seq, run_id, recipient_role, role_epoch, payload_json, state) \
-             VALUES ('q-empty', (SELECT max(seq) FROM events), 'R', 'qa', 2, '{}', 'PENDING');",
-            empty.to_string().replace('\'', "''")
-        ),
-    )?;
     let before = (
         one(&db, "SELECT revision FROM tasks WHERE task_id = 'T'")?,
         one(&db, "SELECT count(*) FROM acceptance_results")?,
@@ -701,7 +707,7 @@ async fn test_022_05_stale_epoch_spec_candidate_and_an_empty_handoff_are_refused
         batch: 10,
     };
     let tick = dispatcher.tick().await?;
-    assert_eq!(tick.invalid, ["q-empty"]);
+    assert!(tick.invalid.is_empty(), "{tick:?}");
     for (message, reason) in &stale {
         let reply: Value = serde_json::from_str(
             one(
@@ -734,11 +740,7 @@ async fn test_022_05_stale_epoch_spec_candidate_and_an_empty_handoff_are_refused
         &db,
         "SELECT kind, json_extract(payload_json, '$.message_id') FROM events WHERE kind IN ('message.rejected', 'message.invalid') ORDER BY seq",
     )?;
-    assert_eq!(refusals.len(), 4, "{refusals:?}");
-    assert_eq!(
-        one(&db, "SELECT state FROM outbox WHERE message_id = 'q-empty'")?,
-        json!("DEAD_LETTER")
-    );
+    assert_eq!(refusals.len(), 3, "{refusals:?}");
     keep(
         "test-022-05.json",
         &json!({"refusal_events": refusals, "receipts": rows(&db, "SELECT message_id, result_json FROM receipts")?,
@@ -1284,7 +1286,7 @@ async fn a_handoffs_package_is_fenced_in_full_and_must_agree_with_its_envelope()
         .payload
         .insert("spec_revision".to_owned(), json!(1));
     enqueue(&store, "packages", &[tree.clone(), revision.clone()]).await?;
-    // The null-envelope one got into the outbox anyway: delivered, it is invalid, not applied.
+    // The null-envelope one got into the outbox anyway: consumed, it is invalid, not applied.
     seed(
         &db,
         &format!(
@@ -1305,8 +1307,31 @@ async fn a_handoffs_package_is_fenced_in_full_and_must_agree_with_its_envelope()
         max_attempts: 5,
         batch: 10,
     };
+    // Verification handoffs are never claimed by the delivery loop (docs/adr/ADR-028.md decision 9, implementation
+    // correction 1): consumed directly, the same fences hold.
     let tick = dispatcher.tick().await?;
-    assert_eq!(tick.invalid, ["h-null"]);
+    assert_eq!(tick, hoh_core::delivery::Tick::default());
+    assert_eq!(
+        rows(&db, "SELECT DISTINCT state FROM outbox")?,
+        [[json!("PENDING")]]
+    );
+    let refused = store
+        .consume(
+            "qa",
+            null_envelope.clone(),
+            Touch.effect(&null_envelope),
+            clock.now(),
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(PersistError::IntegrityViolation(_))),
+        "{refused:?}"
+    );
+    for message in [&tree, &revision] {
+        store
+            .consume("qa", message.clone(), Touch.effect(message), clock.now())
+            .await?;
+    }
     for (id, reason) in [
         ("h-tree", "CANDIDATE_MISMATCH"),
         ("h-revision", "SPEC_MISMATCH"),

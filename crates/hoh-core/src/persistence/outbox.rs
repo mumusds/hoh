@@ -86,6 +86,8 @@ pub(super) fn claim_next(
     let stamp = rfc3339_utc(now);
     let roles = json!(roles).to_string();
     let live = json!(live).to_string();
+    // A verification handoff is never claimed: its round's verifier task takes it at its dispatch (docs/adr/ADR-028.md
+    // decision 9, M2T16D-255).
     loop {
         let due: Option<(String, Option<String>, String, i64, String, i64)> = tx
             .query_row(
@@ -94,6 +96,7 @@ pub(super) fn claim_next(
                         OR (state = 'DELIVERING' AND next_retry_at <= ?1)) \
                    AND recipient_role IN (SELECT value FROM json_each(?2)) \
                    AND json_extract(payload_json, '$.notice') IS NOT 'runtime' \
+                   AND json_extract(payload_json, '$.payload.handoff_kind') IS NOT 'verification' \
                    AND message_id NOT IN (SELECT value FROM json_each(?3)) \
                  ORDER BY event_seq, message_id LIMIT 1",
                 params![stamp, roles, live],
