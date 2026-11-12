@@ -180,7 +180,9 @@ async fn a_started_run_snapshots_the_scheduler_and_gets_its_budget() -> R {
             // The supervision policy, frozen too (docs/adr/ADR-025.md decision 9).
             "supervision": {"policy": "balanced"},
             // The packing parameters, frozen for the run's life (docs/adr/ADR-026.md decision 7).
-            "context": {"budget_tokens": 32_000, "shares": [45, 35, 20]}})
+            "context": {"budget_tokens": 32_000, "shares": [45, 35, 20]},
+            // The repair limits its completions and rounds count against (docs/adr/ADR-028.md decisions 11, 12).
+            "repairs": {"local": 3, "protocol": 2}})
     );
     assert_eq!(
         values(

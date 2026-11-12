@@ -36,8 +36,6 @@ pub struct WriterCompletion {
     pub attempt_id: String,
     pub ending: Ending,
     pub outcome: WriterOutcome,
-    /// The run's limit of protocol corrections (`max_protocol_repairs`).
-    pub protocol_limit: u32,
 }
 
 /// What the completion did.
@@ -221,13 +219,14 @@ fn correct(
     ctx: &super::writer::Ctx<'_>,
 ) -> Result<WriterCompleted, PersistError> {
     let root = chain_root(tx, &task.task_id, &job.attempt_id)?;
+    let limit = repair_limit(tx, &task.run_id, "protocol")?;
     let request = RepairRequest {
         run_id: task.run_id.clone(),
         task_id: task.task_id.clone(),
         repair: Repair::Protocol {
             attempt_id: root.clone(),
         },
-        limit: job.protocol_limit,
+        limit,
         detail: reasons.join("; "),
         action_id: Some(job.attempt_id.clone()),
     };
@@ -288,6 +287,33 @@ fn decide(
     Ok(WriterCompleted::Blocked {
         reason: reason.to_owned(),
     })
+}
+
+/// The run's repair limit `kind` (`local` or `protocol`) from its configuration snapshot; a run snapshotted before the
+/// limits were has the configuration's defaults (`max_local_repairs` 3, `max_protocol_repairs` 2).
+pub(super) fn repair_limit(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    kind: &str,
+) -> Result<u32, PersistError> {
+    let limit: Option<i64> = tx
+        .query_row(
+            &format!(
+                "SELECT json_extract(config_snapshot_json, '$.repairs.{kind}') FROM runs WHERE run_id = ?1"
+            ),
+            params![run_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?
+        .flatten();
+    let budget = crate::config::Config::default().budget;
+    let default = if kind == "local" {
+        budget.max_local_repairs
+    } else {
+        budget.max_protocol_repairs
+    };
+    Ok(limit.and_then(|l| u32::try_from(l).ok()).unwrap_or(default))
 }
 
 /// The first attempt of the task since the attempt of its last candidate_ready (insertion order), else its first.

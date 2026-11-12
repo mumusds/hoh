@@ -112,6 +112,9 @@ pub(super) fn start_run(
         "scheduler": settings(&Params::from_settings(Some(&config.scheduler))),
         "supervision": {"policy": policy},
         "context": {"budget_tokens": context.budget_tokens, "shares": context.shares},
+        // The repair limits the run's completions and verification rounds count against (docs/adr/ADR-028.md
+        // decisions 11 and 12), frozen like the rest.
+        "repairs": {"local": budget.max_local_repairs, "protocol": budget.max_protocol_repairs},
     });
     tx.execute(
         "UPDATE runs SET config_revision = ?2, config_snapshot_json = ?3, deadline_at = ?4 WHERE run_id = ?1",
