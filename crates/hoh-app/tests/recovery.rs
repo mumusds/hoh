@@ -3120,9 +3120,11 @@ async fn a_finished_leader_settles_only_once_its_group_is_gone() -> R {
     });
     let host = runner_host(&project, executor.clone(), clock, Some(probe.clone())).await?;
     let db = db(&project);
+    // T1's first attempt by its id: T1 may be dispatched again after it (its writer wrote no TaskResult and is
+    // corrected, docs/adr/ADR-028.md decision 3), so a query by task alone may read the new one (M2T16R-151).
     assert!(wait_for(
         &db,
-        "SELECT state FROM attempts WHERE task_id = 'T1'",
+        "SELECT state FROM attempts WHERE attempt_id = 'T1/attempt-1'",
         "SETTLED",
         Duration::from_secs(20)
     )?);
@@ -3132,7 +3134,11 @@ async fn a_finished_leader_settles_only_once_its_group_is_gone() -> R {
         "1",
         Duration::from_secs(10)
     )?);
-    let pid: u32 = query(&db, "SELECT pid FROM attempts WHERE task_id = 'T1'")?.parse()?;
+    let pid: u32 = query(
+        &db,
+        "SELECT pid FROM attempts WHERE attempt_id = 'T1/attempt-1'",
+    )?
+    .parse()?;
     let at_grant = probe.seen.lock().map(|s| s.clone()).unwrap_or_default();
     assert!(
         !at_grant.is_empty() && at_grant.iter().all(|g| *g == nothing_left()),
@@ -3178,7 +3184,10 @@ async fn a_leader_whose_group_was_not_emptied_keeps_its_slot() -> R {
     )?);
     tokio::time::sleep(Duration::from_millis(600)).await;
     assert_eq!(
-        query(&db, "SELECT state FROM attempts WHERE task_id = 'T1'")?,
+        query(
+            &db,
+            "SELECT state FROM attempts WHERE attempt_id = 'T1/attempt-1'"
+        )?,
         "RUNNING"
     );
     assert_eq!(

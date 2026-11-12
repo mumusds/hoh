@@ -114,14 +114,29 @@ pub(super) fn complete(
     if let WriterOutcome::Freeze { self_tests, .. } = &job.outcome {
         register_self_tests(&tx, &task, &job.attempt_id, self_tests, ctx)?;
     }
-    let done = match &job.outcome {
-        WriterOutcome::Freeze {
-            job: freeze,
-            result,
-            self_tests: _,
-        } => freeze_and_accept(&tx, job, &task, freeze, result, ctx)?,
-        WriterOutcome::Correct { reasons } => correct(&tx, job, &task, reasons, ctx)?,
-        WriterOutcome::Decide { reason, detail } => decide(&tx, job, &task, reason, detail, ctx)?,
+    // A refused repair standing is the first judgement of every exit (implementation correction 4, M2T16R-101): nothing
+    // frozen, corrected or counted; the decision waits.
+    let done = if super::verification::refused(&tx, &task.run_id)?.contains(&task.task_id) {
+        decide(
+            &tx,
+            job,
+            &task,
+            "repair_refused",
+            "a refused repair of this task waits for a decision; nothing is frozen or corrected until it is cleared",
+            ctx,
+        )?
+    } else {
+        match &job.outcome {
+            WriterOutcome::Freeze {
+                job: freeze,
+                result,
+                self_tests: _,
+            } => freeze_and_accept(&tx, job, &task, freeze, result, ctx)?,
+            WriterOutcome::Correct { reasons } => correct(&tx, job, &task, reasons, ctx)?,
+            WriterOutcome::Decide { reason, detail } => {
+                decide(&tx, job, &task, reason, detail, ctx)?
+            }
+        }
     };
     // The attempt settles in the same commit; its task has moved (VERIFYING, READY or BLOCKED), so the settle leaves it
     // alone, and the write lease goes with the attempt's end.
@@ -385,17 +400,6 @@ fn freeze_and_accept(
     if let Some(given) = result.candidate_id.as_ref().filter(|g| **g != id) {
         let reason = format!("the TaskResult names candidate {given}, not the frozen {id}");
         return correct(tx, job, task, &[reason], ctx);
-    }
-    // A refused repair standing: nothing frozen, the decision waits (docs/adr/ADR-028.md decision 12, M2T16D-853).
-    if super::verification::refused(tx, &task.run_id)?.contains(&task.task_id) {
-        return decide(
-            tx,
-            job,
-            task,
-            "repair_refused",
-            "a refused repair of this task waits for a decision; nothing is frozen until it is cleared",
-            ctx,
-        );
     }
     // Failure items attached to its task after its prompt's context was read (the watermark its RUNNING commit recorded,
     // else its RUNNING move): its work did not see them, so nothing is frozen and it goes back to READY for the rework

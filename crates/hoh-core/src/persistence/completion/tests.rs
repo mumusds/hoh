@@ -3253,3 +3253,298 @@ async fn failures_attached_after_the_writers_context_was_read_but_before_it_ran_
     assert_eq!(done, WriterCompleted::Reworked);
     Ok(())
 }
+
+#[tokio::test]
+async fn a_standing_refusal_holds_every_completion_exit_not_only_the_freeze() -> R {
+    // ADR-028 implementation correction 4 (M2T16R-101): the refusal is the completion's first judgement: an output to
+    // correct, or a result naming another candidate, blocks the task for the decision; nothing is counted or frozen.
+    for (case, outcome) in [
+        (
+            "correct",
+            WriterOutcome::Correct {
+                reasons: vec!["it wrote no TaskResult to its bridge".to_owned()],
+            },
+        ),
+        (
+            "mismatch",
+            freeze(
+                freeze_of('b'),
+                result(Some(&format!("CAND-{}", "9".repeat(64))))?,
+            ),
+        ),
+    ] {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = open(dir.path())?;
+        Connection::open(&path)?.execute_batch(
+            "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES ('p1', 'nd-1', \
+             'R', 'need_decision', '{\"task_id\": \"D\", \"reason\": \"local_repairs_exhausted\"}', '2026-11-12T00:00:02Z');",
+        )?;
+        let done = store.complete_writer_attempt(completion(outcome)).await?;
+        assert_eq!(
+            done,
+            WriterCompleted::Blocked {
+                reason: "repair_refused".to_owned()
+            },
+            "{case}"
+        );
+        assert_eq!(
+            texts(
+                &path,
+                "SELECT state || ':' || blocked_reason FROM tasks WHERE task_id = 'D'"
+            )?,
+            ["BLOCKED:NEED_DECISION"],
+            "{case}"
+        );
+        assert!(
+            texts(
+                &path,
+                "SELECT kind FROM events WHERE kind = 'repair.protocol'"
+            )?
+            .is_empty(),
+            "{case}: nothing counted"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_persistent_failing_test_is_one_item_whatever_fails_beside_it() -> R {
+    // ADR-028 implementation correction 4 (M2T16R-100, -155): items are (AC, one failing test); a test failing in
+    // every round beside another that changes each round accumulates, and the fourth time D waits for a decision.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    for (n, tree) in ['b', 'c', 'd', 'e'].into_iter().enumerate() {
+        let attempt = if n == 0 {
+            "A".to_owned()
+        } else {
+            format!("A{n}")
+        };
+        if n > 0 {
+            Connection::open(&path)?.execute_batch(&format!(
+                "UPDATE tasks SET state = 'RUNNING', revision = revision + 1 WHERE task_id = 'D';
+                 INSERT INTO attempts(attempt_id, task_id, session_id, state, role_epoch, host_epoch, config_revision,
+                   started_at) VALUES ('{attempt}', 'D', 'sd', 'RUNNING', 1, 1, 1, '2026-11-12T00:00:0{n}Z');"
+            ))?;
+        }
+        let job = freeze_of(tree);
+        let candidate = job.sealed.candidate_id.clone();
+        store
+            .complete_writer_attempt(WriterCompletion {
+                attempt_id: attempt.clone(),
+                ..completion(freeze(job, result_of("D", &attempt)?))
+            })
+            .await?;
+        let [qa, _] = settle_verifiers(&store, &path, "PASS", "PASS").await?;
+        let companion = format!("test_1_01_case_{n}");
+        evidence_with(
+            &path,
+            (&qa, &candidate, &format!("rec-{n}")),
+            ("unit", "FAIL"),
+            &[("AC-1-01", "TEST-1-01", "FAIL")],
+            &[
+                ("TEST-1-01", "test_1_01_persistent", "FAIL"),
+                ("TEST-1-01", &companion, "FAIL"),
+            ],
+        )?;
+        store
+            .reconcile_verification("R", Default::default())
+            .await?;
+        let state = texts(&path, "SELECT state FROM tasks WHERE task_id = 'D'")?;
+        assert_eq!(state, [if n < 3 { "READY" } else { "BLOCKED" }], "{n}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_corrections_reason_outlives_an_attempt_that_failed_to_start() -> R {
+    // ADR-028 implementation correction 4 (M2T16R-102): A's output is corrected; A2 fails before it ran; A3 is still told
+    // what to correct. An accepted end would clear it.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    store
+        .complete_writer_attempt(completion(WriterOutcome::Correct {
+            reasons: vec!["SENTINEL-CHAIN write one TaskResult as its last line".to_owned()],
+        }))
+        .await?;
+    Connection::open(&path)?.execute_batch(
+        "INSERT INTO attempts(attempt_id, task_id, session_id, state, role_epoch, host_epoch, config_revision, ended_at,
+           failure_reason) VALUES ('A2', 'D', 'sd', 'FAILED', 1, 1, 1, '2026-11-12T00:00:05Z', 'AGENT_UNAVAILABLE');
+         INSERT INTO attempts(attempt_id, task_id, session_id, state, role_epoch, host_epoch, config_revision)
+           VALUES ('A3', 'D', 'sd', 'PREPARED', 1, 1, 1);",
+    )?;
+    let facts = super::super::context::facts(&Connection::open(&path)?, "R", "D", "A3", None)?;
+    assert!(
+        facts.scope.iter().any(|l| l.contains("SENTINEL-CHAIN")),
+        "{:?}",
+        facts.scope
+    );
+    // An accepted end clears it.
+    Connection::open(&path)?.execute_batch(
+        "UPDATE attempts SET state = 'SETTLED' WHERE attempt_id = 'A2';
+         INSERT INTO attempts(attempt_id, task_id, session_id, state, role_epoch, host_epoch, config_revision)
+           VALUES ('A4', 'D', 'sd', 'PREPARED', 1, 1, 1);",
+    )?;
+    let facts = super::super::context::facts(&Connection::open(&path)?, "R", "D", "A4", None)?;
+    assert!(
+        facts.scope.iter().all(|l| !l.contains("SENTINEL-CHAIN")),
+        "{:?}",
+        facts.scope
+    );
+    Ok(())
+}
+
+/// A planned check's PASS record of AC-1-01 by `producer` on `candidate`, as a check's driver hands it to the store.
+fn pass_recording(
+    record_id: &str,
+    candidate: &str,
+    producer: &str,
+) -> crate::persistence::Recording {
+    use crate::verification::{FileRef, NamedRef, Outcome, Record, Runner, Status};
+    let dir = format!(".hoh/evidence/{candidate}/unit/{record_id}");
+    let named = |name: &str, n: u8| FileRef {
+        path: format!("{dir}/{name}"),
+        sha256: object(n, "", "").sha256,
+    };
+    crate::persistence::Recording {
+        record: Record {
+            schema_version: "1.1".to_owned(),
+            record_type: "command_execution".to_owned(),
+            record_id: record_id.to_owned(),
+            check_id: "unit".to_owned(),
+            candidate_id: candidate.to_owned(),
+            spec_sha256: object(1, "", "").sha256,
+            mode: "product".to_owned(),
+            command: vec!["bash".to_owned(), "qa.sh".to_owned()],
+            cwd: ".".to_owned(),
+            started_at: "2026-11-12T10:00:00Z".to_owned(),
+            finished_at: "2026-11-12T10:00:05Z".to_owned(),
+            duration_seconds: 5.0,
+            exit_code: 0,
+            timed_out: false,
+            stdout: named("stdout.log", 5),
+            stderr: named("stderr.log", 6),
+            candidate_manifest: FileRef {
+                path: object(9, "", "").path,
+                sha256: object(9, "", "").sha256,
+            },
+            source_unchanged: true,
+            environment_sha256: object(2, "", "").sha256,
+            test_plan_sha256: object(3, "", "").sha256,
+            artifacts: vec![NamedRef {
+                name: "test-results.jsonl".to_owned(),
+                path: format!("{dir}/artifacts/test-results.jsonl"),
+                sha256: object(10, "", "").sha256,
+            }],
+            missing_artifacts: Vec::new(),
+            producer_attempt_id: producer.to_owned(),
+            runner: Runner {
+                tool: "hoh".to_owned(),
+                euid: 1000,
+                boot_id: None,
+            },
+        },
+        record_object: object(11, "execution", "execution.json"),
+        objects: vec![
+            object(12, "stdout", "stdout.log"),
+            object(13, "stderr", "stderr.log"),
+            object(10, "artifact", "test-results.jsonl"),
+        ],
+        outcome: Outcome {
+            status: Status::Pass,
+            reason: None,
+        },
+        reasons: Vec::new(),
+        tree_before: json!({"head": "a", "tree": "b"}),
+        tree_after: json!({"head": "a", "tree": "b"}),
+        clock: json!({"wall_finished_at": "2026-11-12T10:00:05Z", "monotonic_seconds": 5.0}),
+        observations: vec![json!({"test_id": "TEST-1-01", "status": "PASS"})],
+        rows: vec![crate::persistence::AcceptanceRow {
+            ac_id: "AC-1-01".to_owned(),
+            spec_id: "s1".to_owned(),
+            status: "PASS",
+            reason: "TEST-1-01 in check unit".to_owned(),
+        }],
+        integrity: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn a_late_pass_of_a_round_that_had_a_veto_writes_no_pass_row_whatever_its_close() -> R {
+    // ADR-028 implementation correction 4 (M2T16R-103): round 1 has a vetoed planned check, then C1 is superseded (E's
+    // freeze), so the round closes superseded, not invalidated. A PASS its reviewer records after the close gets no
+    // PASS row: the round had a veto.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    let first = freeze_of('b');
+    let c1 = first.sealed.candidate_id.clone();
+    store
+        .complete_writer_attempt(completion(freeze(first, result(None)?)))
+        .await?;
+    let [qa, reviewer] = settle_verifiers(&store, &path, "PASS", "PASS").await?;
+    evidence_of(&path, (&qa, &c1, "veto"), ("unit", "INVALID"), &[], true)?;
+    second_writer(&path, "E", "AE")?;
+    store
+        .complete_writer_attempt(WriterCompletion {
+            attempt_id: "AE".to_owned(),
+            ..completion(freeze(freeze_of('c'), result_of("E", "AE")?))
+        })
+        .await?;
+    let done = store
+        .reconcile_verification("R", Default::default())
+        .await?;
+    assert_eq!(
+        done.closed,
+        [(
+            crate::ids::child_id(&c1, "round/1"),
+            "superseded".to_owned()
+        )]
+    );
+    store
+        .record_evidence(pass_recording("late-pass", &c1, &reviewer))
+        .await?;
+    assert_eq!(
+        texts(
+            &path,
+            &format!("SELECT status FROM acceptance_results WHERE candidate_id = '{c1}'")
+        )?,
+        Vec::<String>::new()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_superseded_close_dead_letters_its_unstarted_handoffs_however_its_verifiers_ended() -> R {
+    // Decision 9 (M2T16R-153): the run is cancelled and its canceller moved C1's verifier tasks CANCELLED before any
+    // reconcile saw them; the round still closes superseded and its handoffs never taken are DEAD_LETTER.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    let round = verifying(&store).await?;
+    let (qa, reviewer) = (
+        crate::ids::child_id(&round, "task/qa"),
+        crate::ids::child_id(&round, "task/reviewer"),
+    );
+    Connection::open(&path)?.execute(
+        "UPDATE runs SET state = 'CANCEL_REQUESTED' WHERE run_id = 'R'",
+        [],
+    )?;
+    Connection::open(&path)?.execute(
+        "UPDATE tasks SET state = 'CANCELLED', revision = revision + 1 WHERE task_id IN (?1, ?2)",
+        rusqlite::params![qa, reviewer],
+    )?;
+    let done = store
+        .reconcile_verification("R", Default::default())
+        .await?;
+    assert_eq!(done.closed, [(round.clone(), "superseded".to_owned())]);
+    assert_eq!(
+        texts(
+            &path,
+            &format!(
+                "SELECT DISTINCT state FROM outbox WHERE message_id IN ('{}', '{}')",
+                crate::ids::child_id(&round, "verify/qa"),
+                crate::ids::child_id(&round, "verify/reviewer")
+            )
+        )?,
+        ["DEAD_LETTER"]
+    );
+    Ok(())
+}
