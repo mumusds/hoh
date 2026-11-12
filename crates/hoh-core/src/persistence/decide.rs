@@ -828,8 +828,10 @@ pub(super) fn load_binding(
     }))
 }
 
-/// ADR-011 §3 gate: the run's candidates in use, and for each candidate of the run that is VERIFYING or ACCEPTED and
-/// was frozen on the run's current specification, the requirements R that have acceptance criteria there each of
+/// ADR-011 §3 gate: the run's candidates in use, and for each candidate of the run that is ACCEPTED (only the join at
+/// its verification barrier's close accepts one, docs/adr/ADR-028.md decision 12: a VERIFYING candidate counts for
+/// nothing, so no proposal accepts before the barrier or on a FAIL/UNKNOWN) and was frozen on the run's current
+/// specification, the requirements R that have acceptance criteria there each of
 /// which has at least one acceptance result for C and only PASS results, each backed by PASS evidence of C from the
 /// criterion's own check (M2T02R-03).
 fn load_evidence(
@@ -848,7 +850,7 @@ fn load_evidence(
     let mut statement = tx
         .prepare(
             "SELECT c.candidate_id, q.requirement_id FROM candidates c JOIN requirements q ON q.spec_id = ?2 \
-             WHERE c.run_id = ?1 AND c.state IN ('VERIFYING', 'ACCEPTED') AND c.spec_sha256 = ?3 \
+             WHERE c.run_id = ?1 AND c.state = 'ACCEPTED' AND c.spec_sha256 = ?3 \
              AND EXISTS (SELECT 1 FROM acceptance_criteria a WHERE a.requirement_id = q.requirement_id AND a.spec_id = q.spec_id) \
              AND NOT EXISTS ( \
                SELECT 1 FROM acceptance_criteria a WHERE a.requirement_id = q.requirement_id AND a.spec_id = q.spec_id \

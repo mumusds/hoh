@@ -236,6 +236,7 @@ async fn test_042_05_repairs_past_their_limits_are_refused_for_a_decision_across
         },
         limit: 3,
         detail: format!("local repair {n} of F"),
+        action_id: None,
     };
     let protocol = |n: u32| RepairRequest {
         run_id: "R".to_owned(),
@@ -245,6 +246,7 @@ async fn test_042_05_repairs_past_their_limits_are_refused_for_a_decision_across
         },
         limit: 2,
         detail: format!("protocol correction {n} of A1"),
+        action_id: None,
     };
     // F's three local repairs (each failed) and A1's two protocol corrections.
     for n in 1..=3 {
@@ -321,6 +323,56 @@ async fn test_042_05_repairs_past_their_limits_are_refused_for_a_decision_across
             "need_decision_events": decisions, "dispatches": dispatches, "new_attempts": attempts, "task_state": task,
         }),
     )?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_repair_asked_again_for_the_same_action_is_decided_once() -> R {
+    // docs/adr/ADR-028.md decision 12 (M2T16D-09): a barrier's close or a correction asks for its repair inside its own
+    // transaction and may run again after a crash before or after it committed; the same action is counted once and
+    // answered as the first time, at and past the limit too.
+    use crate::persistence::{Repair, RepairRequest, RepairVerdict};
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(&format!(
+        "{WORLD}
+         UPDATE tasks SET state = 'VERIFYING', revision = 4 WHERE task_id = 'T1';"
+    ))?;
+    let request = |action: &str| RepairRequest {
+        run_id: "R".to_owned(),
+        task_id: "T1".to_owned(),
+        repair: Repair::Local {
+            fingerprint: "F".to_owned(),
+        },
+        limit: 1,
+        detail: format!("rework for {action}"),
+        action_id: Some(action.to_owned()),
+    };
+    for _ in 0..2 {
+        assert_eq!(
+            store.request_repair(request("rework/C1/T1")).await?,
+            RepairVerdict::Granted { count: 1 }
+        );
+    }
+    assert_eq!(store.repair_count("R", &request("x").repair).await?, 1);
+    for _ in 0..2 {
+        assert_eq!(
+            store.request_repair(request("rework/C2/T1")).await?,
+            RepairVerdict::Refused { count: 1 }
+        );
+    }
+    let decisions = count(
+        &path,
+        "SELECT count(*) FROM events WHERE kind = 'need_decision'",
+    )?;
+    assert_eq!(decisions, 1);
+    // The first refusal blocked the task; asking again changes nothing more.
+    let state: String = Connection::open(&path)?.query_row(
+        "SELECT state FROM tasks WHERE task_id = 'T1'",
+        [],
+        |r| r.get(0),
+    )?;
+    assert_eq!(state, "BLOCKED");
     Ok(())
 }
 
@@ -735,6 +787,7 @@ async fn a_parked_run_whose_last_waiting_task_is_blocked_is_blocked() -> R {
         },
         limit: 0,
         detail: "refused".to_owned(),
+        action_id: None,
     };
     store.request_repair(request()).await?;
     store

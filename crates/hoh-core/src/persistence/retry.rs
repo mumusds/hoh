@@ -758,6 +758,10 @@ pub struct RepairRequest {
     pub repair: Repair,
     pub limit: u32,
     pub detail: String,
+    /// The action asking for it, when the caller may ask again for the same action (a barrier's close, a correction
+    /// replayed after a crash): asked again, it is answered as the first time and counted once (docs/adr/ADR-028.md
+    /// decision 12, M2T16D-09).
+    pub action_id: Option<String>,
 }
 
 /// The answer to a [`RepairRequest`]: granted as the `count`-th, or refused with `count` already done.
@@ -795,6 +799,21 @@ pub(super) fn request_repair(
     ctx: &Ctx<'_>,
 ) -> Result<RepairVerdict, PersistError> {
     let tx = writer::begin(conn, ctx)?;
+    let (verdict, commit) = repair_in(&tx, request)?;
+    writer::write(&tx, &commit, ctx)?;
+    ctx.before_commit()?;
+    tx.commit().map_err(sqlite_error)?;
+    Ok(verdict)
+}
+
+/// [`request_repair`] inside the caller's transaction: the verdict and what to commit with the caller's own writes
+/// (its counting or `need_decision` event and, when refused, the task's move to BLOCKED). A caller that also moves the
+/// task asks first and moves it only when granted. With an `action_id` the same action asked again is answered as the
+/// first time and adds nothing (docs/adr/ADR-028.md decision 12, M2T16D-09).
+pub(super) fn repair_in(
+    tx: &Connection,
+    request: &RepairRequest,
+) -> Result<(RepairVerdict, Commit), PersistError> {
     let task: Option<(String, String, i64)> = tx
         .query_row(
             "SELECT r.project_id, t.state, t.revision FROM tasks t JOIN runs r ON r.run_id = t.run_id \
@@ -810,15 +829,37 @@ pub(super) fn request_repair(
             request.task_id, request.run_id
         )));
     };
-    if super::wakes::is_supervision(&tx, &request.task_id)? {
+    if super::wakes::is_supervision(tx, &request.task_id)? {
         return Err(PersistError::IntegrityViolation(format!(
             "{} is a supervision task: a Commander turn takes no repair (docs/adr/ADR-025.md decision 3)",
             request.task_id
         )));
     }
+    if let Some(action) = &request.action_id {
+        let earlier: Option<(String, i64)> = tx
+            .query_row(
+                "SELECT kind, json_extract(payload_json, '$.count') FROM events WHERE run_id = ?1 \
+                 AND kind IN (?2, 'need_decision') AND json_extract(payload_json, '$.action_id') = ?3 \
+                 ORDER BY seq LIMIT 1",
+                params![request.run_id, request.repair.kind(), action],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(sqlite_error)?;
+        if let Some((kind, count)) = earlier {
+            let count = u32::try_from(count).unwrap_or(u32::MAX);
+            let verdict = if kind == "need_decision" {
+                RepairVerdict::Refused { count }
+            } else {
+                RepairVerdict::Granted { count }
+            };
+            return Ok((verdict, Commit::default()));
+        }
+    }
     let state = writer::parse::<TaskState>(&state)?;
-    let count = repair_count(&tx, &request.run_id, &request.repair)?;
+    let count = repair_count(tx, &request.run_id, &request.repair)?;
     let (field, key) = request.repair.key();
+    let action = request.action_id.as_deref();
     let mut commit = Commit::default();
     let verdict = if count < request.limit {
         let n = count + 1;
@@ -827,7 +868,10 @@ pub(super) fn request_repair(
             &request.run_id,
             child_id(&request.run_id, &format!("{}/{key}/{n}", request.repair.kind())),
             request.repair.kind(),
-            json!({"task_id": request.task_id, field: key, "count": n, "limit": request.limit, "detail": request.detail}),
+            json!({
+                "task_id": request.task_id, field: key, "count": n, "limit": request.limit, "detail": request.detail,
+                "action_id": action,
+            }),
         ));
         RepairVerdict::Granted { count: n }
     } else {
@@ -851,7 +895,7 @@ pub(super) fn request_repair(
             "need_decision",
             json!({
                 "run_id": request.run_id, "task_id": request.task_id, "reason": request.repair.exhausted(), field: key,
-                "count": count, "limit": request.limit, "detail": request.detail,
+                "count": count, "limit": request.limit, "detail": request.detail, "action_id": action,
             }),
         ));
         if !matches!(
@@ -871,10 +915,7 @@ pub(super) fn request_repair(
         }
         RepairVerdict::Refused { count }
     };
-    writer::write(&tx, &commit, ctx)?;
-    ctx.before_commit()?;
-    tx.commit().map_err(sqlite_error)?;
-    Ok(verdict)
+    Ok((verdict, commit))
 }
 
 /// The cost of run `run_id` (CR-009, ADR-020 decision 9): known only when its price is known (its run-scope usd row
