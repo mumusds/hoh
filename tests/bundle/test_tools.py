@@ -717,6 +717,31 @@ class PersistenceScan(unittest.TestCase):
                           ('Cargo.toml','profile','profile.release.panic'),('embed.rs','included-file','an include macro imported under another name'),
                           ('main.rs','named-file','scripts/db_helper.py: mentions SQLite or holds a SQL write'),
                           ('mod.rs','persistence-macro','macro_rules! in persistence'),('tool.rs','product-root-outside-src',"a product target root outside its member's src/")])
+    def test_a_listed_data_file_read_as_data_is_no_named_file_hit_and_nothing_else_is(self):
+        # CR-019: a member literal may name a file of the whitelist's read_as_data list, a JSON or Markdown file that
+        # mentions SQLite in prose and holds no SQL write (the specification the freeze reads); a listed file holding a
+        # SQL write, a listed script, an entry without a reason and an unlisted data file stay hits.
+        F='#![forbid(clippy::disallowed_methods)]\n#![forbid(unsafe_code)]\n'
+        whitelist={'files':{'clippy.toml':'fixture','contracts/requirements.json':'fixture','contracts/notes.md':'fixture','contracts/writes.json':'fixture',
+                            'scripts/db.sh':'fixture','contracts/other.json':'fixture'},
+                   'read_as_data':{'contracts/requirements.json':'the specification, read as data','contracts/notes.md':'notes, read as data',
+                                   'contracts/writes.json':'listed, but it holds a SQL write','scripts/db.sh':'listed, but a script',
+                                   'contracts/empty.json':''}}
+        files={'crates/hoh-app/src/main.rs':F+'fn main(){ let _ = ("contracts/requirements.json", "contracts/notes.md", '
+                                              '"contracts/writes.json", "scripts/db.sh", "contracts/other.json"); }',
+               'contracts/requirements.json':'{"text": "the store is SQLite"}','contracts/notes.md':'SQLite notes',
+               'contracts/writes.json':'{"sql": "INSERT INTO t VALUES (1)"}','scripts/db.sh':'sqlite3 x.db',
+               'contracts/other.json':'{"text": "SQLite again"}','contracts/empty.json':'{}',
+               'scripts/product/persistence-whitelist.json':json.dumps(whitelist)}
+        rc,res=self.run_scan(files,whitelist=False)
+        self.assertEqual(rc,1)
+        self.assertEqual(sorted((h['path'].rsplit('/',1)[-1],h['kind'],h['match']) for h in res['hits']),
+                         [('main.rs','named-file','contracts/other.json: mentions SQLite or holds a SQL write'),
+                          ('main.rs','named-file','contracts/writes.json: mentions SQLite or holds a SQL write'),
+                          ('main.rs','named-file','scripts/db.sh: mentions SQLite or holds a SQL write'),
+                          ('persistence-whitelist.json','whitelist','read_as_data contracts/empty.json: no reason given'),
+                          ('persistence-whitelist.json','whitelist','read_as_data contracts/writes.json: holds a SQL write'),
+                          ('persistence-whitelist.json','whitelist','read_as_data scripts/db.sh: not a JSON or Markdown file')])
     def test_new_rusqlite_features_need_the_boundary_extended(self):
         rc,res=self.run_scan({},features=['bundled','default','backup'])
         self.assertEqual(self.kinds(res),[('Cargo.lock','rusqlite-feature')])

@@ -1,5 +1,5 @@
 {
- "description": "AC-062-05 whitelist configuration (scripts/product/persistence_scan.py check 6). Besides the Persistence module (crates/hoh-core/src/persistence/) and the members' Rust sources (checked by clippy and the literal rules), only the files listed here, and Markdown under docs/ and reports/, may mention SQLite or hold a SQL write statement. Each entry says why; an entry that no longer needs to be here is itself a hit.",
+ "description": "AC-062-05 whitelist configuration (scripts/product/persistence_scan.py check 6). Besides the Persistence module (crates/hoh-core/src/persistence/) and the members' Rust sources (checked by clippy and the literal rules), only the files listed here, and Markdown under docs/ and reports/, may mention SQLite or hold a SQL write statement. Each entry says why; an entry that no longer needs to be here is itself a hit. read_as_data (CR-019) lists the JSON or Markdown files a member's literal may name although they mention SQLite: read as data, each with its reason, none holding a SQL write.",
  "files": {
   "CHANGELOG.md": "release notes describing the store",
   "CONTRACT.md": "architecture contract naming SQLite as the store",
@@ -32,5 +32,8 @@
   "tests/fixtures/protocol/codex/0.166.0/app-server-schema/v2/ConfigValueWriteParams.json": "recorded Codex schema (merge strategy value upsert)",
   "tests/fixtures/protocol/codex/0.166.0/help.txt": "recorded Codex help (migrate-nfs-db subcommand: SQLite databases)",
   "tools/validate_bundle.py": "kit validator checking the SQL contract on a temporary database"
+ },
+ "read_as_data": {
+  "contracts/requirements.json": "the specification the writer's completion freezes, at CR-018's layout path until M3-T02 (docs/adr/ADR-028.md decision 4): read as bytes and JSON, never run; its prose mentions SQLite, it holds no SQL write"
  }
 }
