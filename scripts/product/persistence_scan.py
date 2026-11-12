@@ -66,7 +66,10 @@ The boundary is enforced by the compiler, and this scan checks that nothing swit
    M2T01R-71); a doc attribute a `macro_rules!` definition
    writes documents the generated item (M2T01R-65). The body of an inline module under exactly `#[cfg(test)]` that is
    not inside a macro invocation (its name any XID identifier, M2T01R-72) is test code for the literal, include and
-   named-file checks, like tests/ (M2T01R-66, -68, -70); module files are never exempt that way (`#[cfg(test)] mod tests;` follows the product rules, M2T01R-67):
+   named-file checks, like tests/ (M2T01R-66, -68, -70); module files are never exempt that way (`#[cfg(test)] mod tests;` follows the product rules, M2T01R-67).
+   A literal may name a file the whitelist lists under read_as_data with its reason (CR-019): a JSON or Markdown
+   file the product reads as data whose prose mentions SQLite (the specification), holding no SQL write; a listed
+   script, a listed file holding a SQL write and an entry without a reason are hits:
    a unit test outside persistence that needs SQLite text belongs under tests/ or in an inline test module. A cargo configuration may not `include` another (M2T01R-62).
 Out of reach of any of this (docs/22-tooling.md): a program, script or SQL that exists only at run time (a name or
 text assembled from pieces, read from the environment or a file outside the candidate), conditional compilation
@@ -140,6 +143,19 @@ def mentions(text: str) -> bool:
 
 # AC-062-05's whitelist configuration: the files besides the Persistence module that may mention SQLite (check 6).
 WHITELIST = 'scripts/product/persistence-whitelist.json'
+# What a member literal may name although it mentions SQLite (CR-019): a JSON or Markdown file the product reads as
+# data, listed with its reason in the whitelist's read_as_data, holding no SQL write.
+DATA_SUFFIXES = ('.json', '.md')
+
+
+def read_as_data(root: Path) -> dict:
+    """The whitelist's read_as_data entries (path -> reason); none when it has none or cannot be read (check 6
+    reports an unreadable whitelist)."""
+    try:
+        listed = json.loads((root / WHITELIST).read_text(encoding='utf-8')).get('read_as_data', {})
+    except (OSError, ValueError, AttributeError):
+        return {}
+    return listed if isinstance(listed, dict) else {}
 # Markdown here is prose about the system, not something the product runs or embeds.
 DOCUMENTATION = ('docs/', 'reports/')
 
@@ -669,6 +685,7 @@ def rel_to(path: Path, root: Path) -> str:
 
 def scan(root: Path, metadata: dict) -> dict:
     hits = []
+    data = read_as_data(root)
     dev_uses = dependency_checks(metadata, hits)
     lint_configuration_checks(root, metadata, hits)
     files = rust_files(root, metadata)
@@ -719,9 +736,12 @@ def scan(root: Path, metadata: dict) -> dict:
                 hits.append({'path': rel, 'kind': 'included-file', 'match': value})
             elif re.search(r'sqlite', value, re.IGNORECASE) or SQL_WRITE.search(value):
                 hits.append({'path': rel, 'kind': 'included-file', 'match': f'{kind}: mentions SQLite or holds a SQL write'})
-        for named, text in named_repository_files(root, path, runtime):
+        for named, target, text in named_repository_files(root, path, runtime):
             # A literal naming a repository file that something runs or reads (`python3 scripts/db_helper.py`) is
-            # checked like the literal itself (M2T01R-45).
+            # checked like the literal itself (M2T01R-45), unless it is a data file listed as read as data that holds
+            # no SQL write (CR-019).
+            if target in data and target.endswith(DATA_SUFFIXES) and not SQL_WRITE.search(text):
+                continue
             if re.search(r'sqlite', text, re.IGNORECASE) or SQL_WRITE.search(text):
                 hits.append({'path': rel, 'kind': 'named-file', 'match': f'{named}: mentions SQLite or holds a SQL write'})
         sqlite_seen = []
@@ -784,9 +804,9 @@ def canary_verdict(log: str) -> dict:
     return {'refused': len(refused), 'required': len(CANARY_REQUIRED), 'problems': problems}
 
 
-def named_repository_files(root: Path, path: Path, literals: list[tuple[int, int, str]]) -> list[tuple[str, str]]:
-    """(literal, contents) for every string literal that names an existing file of the repository, relative to the
-    repository, the source's directory or its member's directory."""
+def named_repository_files(root: Path, path: Path, literals: list[tuple[int, int, str]]) -> list[tuple[str, str, str]]:
+    """(literal, the file relative to the repository, contents) for every string literal that names an existing file of
+    the repository, relative to the repository, the source's directory or its member's directory."""
     out = []
     bases = [root, path.parent] + [p for p in path.parents if (p / 'Cargo.toml').is_file()][:1]
     for _, _, value in literals:
@@ -796,7 +816,7 @@ def named_repository_files(root: Path, path: Path, literals: list[tuple[int, int
             candidate = (base / value).resolve()
             if candidate.is_relative_to(root) and candidate.is_file():
                 try:
-                    out.append((value, candidate.read_bytes().decode('utf-8', errors='replace')))
+                    out.append((value, rel_to(candidate, root), candidate.read_bytes().decode('utf-8', errors='replace')))
                 except OSError:
                     pass
                 break
@@ -843,6 +863,20 @@ def content_checks(root: Path, metadata: dict, hits: list) -> int:
         # Each entry says why the file may mention SQLite (M2T01R-58).
         if not isinstance(why, str) or not why.strip():
             hits.append({'path': WHITELIST, 'kind': 'whitelist', 'match': f'{rel}: no reason given'})
+    # Each read_as_data entry (CR-019): a reason, a JSON or Markdown file of the repository, no SQL write in it.
+    for rel, why in sorted(read_as_data(root).items()):
+        path = root / rel
+        if not isinstance(why, str) or not why.strip():
+            problem = 'no reason given'
+        elif not rel.endswith(DATA_SUFFIXES):
+            problem = 'not a JSON or Markdown file'
+        elif path.is_symlink() or not path.is_file():
+            problem = 'not a file of the repository'
+        elif SQL_WRITE.search(path.read_bytes().decode('utf-8', errors='replace')):
+            problem = 'holds a SQL write'
+        else:
+            continue
+        hits.append({'path': WHITELIST, 'kind': 'whitelist', 'match': f'read_as_data {rel}: {problem}'})
     read = 0
     for path in repository_files(root, metadata):
         rel = rel_to(path, root)
