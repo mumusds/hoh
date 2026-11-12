@@ -81,6 +81,25 @@ pub(super) fn record(
         }
         Some(_) => {}
     }
+    // Recorded already (docs/adr/ADR-027.md decision 8, recovery protocol; M2T10R-101, -150): the same record again is
+    // nothing to do, whoever commits it second; another record under its id is refused.
+    let recorded: Option<String> = tx
+        .query_row(
+            "SELECT artifact_id FROM evidence WHERE evidence_id = ?1",
+            params![r.record_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    if let Some(existing) = recorded {
+        if existing == artifact_id(&job.record_object.sha256, &job.record_object.path) {
+            return Ok(());
+        }
+        return Err(refused(format!(
+            "record {} is recorded already, as another record ({existing})",
+            r.record_id
+        )));
+    }
     let objects: Vec<ArtifactRow> = std::iter::once(&job.record_object)
         .chain(&job.objects)
         .cloned()

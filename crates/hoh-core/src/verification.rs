@@ -555,48 +555,6 @@ pub enum Reason {
 }
 
 impl Reason {
-    /// Every reason, in declaration order.
-    pub const ALL: [Reason; 33] = [
-        Reason::CandidateMismatch,
-        Reason::RecordInvalid,
-        Reason::TreeMismatch,
-        Reason::SpecMismatch,
-        Reason::EnvironmentMismatch,
-        Reason::TestPlanMismatch,
-        Reason::ProducerMissing,
-        Reason::IntervalInvalid,
-        Reason::SourceChanged,
-        Reason::OutputChanged,
-        Reason::ArtifactMissing,
-        Reason::NoObservations,
-        Reason::ErrorOutputChanged,
-        Reason::ArtifactChanged,
-        Reason::ArtifactsDifferFromPlan,
-        Reason::ExitInconsistent,
-        Reason::CommandMismatch,
-        Reason::ModeMismatch,
-        Reason::CwdMismatch,
-        Reason::CheckNotPlanned,
-        Reason::ManifestMismatch,
-        Reason::RunnerTool,
-        Reason::RunnerRoot,
-        Reason::OutsideRecordDir,
-        Reason::RecordDirOverlap,
-        Reason::RecordIdReused,
-        Reason::LiveSessionsUnbound,
-        Reason::LiveSessionsMissing,
-        Reason::ResultLineInvalid,
-        Reason::CheckNotInPolicy,
-        Reason::PlanModeNotPolicy,
-        Reason::ProducerMismatch,
-        Reason::ProducerNotIndependent,
-    ];
-
-    /// The reason whose code is `code`.
-    pub fn from_code(code: &str) -> Option<Reason> {
-        Reason::ALL.into_iter().find(|r| r.code() == code)
-    }
-
     /// The code written into event payloads and acceptance_results.reason.
     pub fn code(self) -> &'static str {
         match self {
@@ -893,19 +851,6 @@ pub enum Status {
 }
 
 impl Status {
-    /// The status whose code is `code`.
-    pub fn from_code(code: &str) -> Option<Status> {
-        [
-            Status::Pass,
-            Status::Degraded,
-            Status::Fail,
-            Status::Blocked,
-            Status::Invalid,
-        ]
-        .into_iter()
-        .find(|s| s.code() == code)
-    }
-
     pub fn code(self) -> &'static str {
         match self {
             Status::Pass => "PASS",
@@ -917,17 +862,8 @@ impl Status {
     }
 }
 
-/// The reasons the outcome function gives (principle one's outcome table).
-pub const OUTCOME_REASONS: [&str; 6] = [
-    "INSUFFICIENT",
-    "TIMED_OUT",
-    "PLUGINS_MISSING",
-    "NOT_STARTED",
-    "INTERRUPTED",
-    "INCOMPLETE",
-];
-
-/// An evidence's outcome and, where the outcome table names one, its reason (one of [`OUTCOME_REASONS`]).
+/// An evidence's outcome and, where the outcome table names one, its reason (`INSUFFICIENT`, `TIMED_OUT`,
+/// `PLUGINS_MISSING`, `NOT_STARTED`, `INTERRUPTED`, `INCOMPLETE`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Outcome {
     pub status: Status,

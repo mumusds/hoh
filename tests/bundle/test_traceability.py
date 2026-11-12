@@ -244,6 +244,16 @@ class GateComparison(Envelope):
         self.assertEqual(self.report(own(*SELF_TESTS))['tests'][t]['status'],'FLAKY')
     def vetoed_without_gate(self,key,code):
         w,found=self.judged();m=self.member(found,key);self.assertIn(code,m.reasons)
+    def test_a_check_a_session_runs_beside_the_independent_record_is_no_overlap(self):
+        # M2T10R-52, -152: a run_check record in <record>-observations beside the independent check's record overlaps
+        # nothing; under the record's own directory it would veto both.
+        self.another('unit','independent-qa-observations/unit-rerun');self.assertIsNone(self.gate())
+        self.assertEqual(self.report(own(*SELF_TESTS))['invalid'],[])
+        self.another('unit','independent-qa/artifacts/observations/unit-rerun')
+        invalid=self.report(own(*SELF_TESTS))['invalid']
+        self.assertEqual(sorted(i['path'] for i in invalid),['.hoh-dev/evidence/independent-qa/artifacts/observations/unit-rerun/execution.json',
+                                                            '.hoh-dev/evidence/independent-qa/execution.json'])
+        self.assertTrue(all(i['reasons']==['RECORD_DIR_OVERLAP'] for i in invalid),invalid)
     def test_a_member_outside_the_manifest(self):
         t=self.scenario_tests('unit')[0];lines=self.lines_of('unit')
         for l in lines:

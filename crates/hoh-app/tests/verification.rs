@@ -1224,3 +1224,143 @@ async fn hohs_state_left_unignored_after_the_freeze_is_refused_before_the_run() 
     assert!(!f.state().join("evidence").join(&c).exists());
     Ok(())
 }
+
+/// Holds the next commit for two seconds once armed: a run's window between its files and its commit.
+#[derive(Debug, Default)]
+struct SlowOnce(AtomicBool);
+
+impl FaultHooks for SlowOnce {
+    fn before_commit(&self) -> Result<(), PersistError> {
+        if self.0.swap(false, Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_secs(2));
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn checks_of_one_candidate_run_side_by_side_without_taking_each_others_records() -> R {
+    // M2T10R-101, -150 (REQ-037: QA and Review verify a candidate in parallel): a run's reconciliation leaves alone the
+    // record another run is still committing, and both runs record their own evidence.
+    let slow = Arc::new(SlowOnce::default());
+    let f = Fixture::with(PLAN, QA_PASSES, slow.clone()).await?;
+    let c = f.frozen().await?;
+    slow.0.store(true, Ordering::SeqCst);
+    let (first, second) = tokio::join!(f.run(&c, "qa", QA), async {
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        f.run(&c, "blocked", &["bash", "-c", "exit 3"]).await
+    });
+    let (first, second) = (
+        first.map_err(|e| format!("{e:?}"))?,
+        second.map_err(|e| format!("{e:?}"))?,
+    );
+    assert_eq!(
+        (first.outcome.status.code(), second.outcome.status.code()),
+        ("PASS", "BLOCKED")
+    );
+    let mut outcomes = f.query("SELECT outcome FROM evidence")?;
+    outcomes.sort();
+    assert_eq!(outcomes, ["BLOCKED", "PASS"]);
+    Ok(())
+}
+
+/// The fixture's qa failing (a FAIL line, exit 1) while `../fail` exists beside the checkout.
+fn qa_failing_on_flag() -> String {
+    let failing = QA_PASSES.replace("\"PASS\"", "\"FAIL\"");
+    format!("if [ -e ../fail ]; then\n{failing}exit 1\nfi\n{QA_PASSES}")
+}
+
+/// The record directories of `check` on candidate `c`.
+fn record_dirs(f: &Fixture, c: &str, check: &str) -> R<Vec<PathBuf>> {
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(f.state().join("evidence").join(c).join(check))?
+        .map(|e| e.map(|e| e.path()))
+        .collect::<Result<_, _>>()?;
+    dirs.retain(|d| d.is_dir());
+    Ok(dirs)
+}
+
+#[tokio::test]
+async fn a_pending_record_that_cannot_be_read_holds_back_its_candidates_runs_only() -> R {
+    // M2T10R-102, -151: an uncommitted record whose pending evidence cannot be read stops the next run of its
+    // candidate, naming the file (a later pass must not take its place); once readable it is recorded first. Another
+    // candidate's runs are not held back by it.
+    use std::os::unix::fs::PermissionsExt as _;
+    let faults = Arc::new(FailOnce::default());
+    let f = Fixture::with(PLAN, &qa_failing_on_flag(), faults.clone()).await?;
+    let c = f.frozen().await?;
+    std::fs::write(f.dir.path().join("fail"), b"")?;
+    faults.0.store(true, Ordering::SeqCst);
+    assert!(f.run(&c, "qa", QA).await.is_err());
+    std::fs::remove_file(f.dir.path().join("fail"))?;
+    let pending = record_dirs(&f, &c, "qa")?[0].join("recording.json");
+    std::fs::set_permissions(&pending, std::fs::Permissions::from_mode(0o000))?;
+    let held = f.run(&c, "qa", QA).await;
+    assert!(
+        matches!(&held, Err(CheckError::Io(why)) if why.contains("recording.json")),
+        "{held:?}"
+    );
+    assert!(f.query("SELECT outcome FROM evidence")?.is_empty());
+    assert_eq!(
+        record_dirs(&f, &c, "qa")?.len(),
+        1,
+        "the held run made no record"
+    );
+    // A new commit's candidate runs.
+    std::fs::write(f.root().join("src/d.rs"), "pub fn d() {}\n")?;
+    git(&f.root(), &["add", "src/d.rs"])?;
+    git(&f.root(), &["commit", "-q", "-m", "d"])?;
+    let c2 = new_id(f.freeze("R").await?)?;
+    let other = f.run(&c2, "qa", QA).await.map_err(|e| format!("{e:?}"))?;
+    assert_eq!(other.outcome.status.code(), "PASS");
+    std::fs::set_permissions(&pending, std::fs::Permissions::from_mode(0o644))?;
+    let mut outcomes = f.query(&format!(
+        "SELECT outcome FROM evidence WHERE candidate_id = '{c}'"
+    ))?;
+    assert!(outcomes.is_empty());
+    super_reconcile(&f, &c).await?;
+    outcomes = f.query(&format!(
+        "SELECT outcome FROM evidence WHERE candidate_id = '{c}'"
+    ))?;
+    assert_eq!(outcomes, ["FAIL"]);
+    Ok(())
+}
+
+/// The reconciliation of candidate `c` alone, as a run of it begins.
+async fn super_reconcile(f: &Fixture, c: &str) -> R {
+    hoh_app::verify::check::reconcile(&f.store.evidence_handle(), &f.root(), &f.state(), c)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_pending_record_is_judged_on_its_files_as_they_are_when_it_is_recorded() -> R {
+    // M2T10R-103: the reconciliation judges the record anew, never replays the judgement it was written with: its
+    // stdout changed since, it is INVALID (rule 7) and vetoes its candidate, as the file scan says.
+    let faults = Arc::new(FailOnce::default());
+    let f = Fixture::with(PLAN, QA_PASSES, faults.clone()).await?;
+    let c = f.frozen().await?;
+    faults.0.store(true, Ordering::SeqCst);
+    assert!(f.run(&c, "qa", QA).await.is_err());
+    let dir = record_dirs(&f, &c, "qa")?.remove(0);
+    std::fs::write(dir.join("stdout.log"), b"rewritten")?;
+    super_reconcile(&f, &c).await?;
+    assert_eq!(f.query("SELECT outcome FROM evidence")?, ["INVALID"]);
+    let payload = f.query("SELECT payload_json FROM events WHERE kind = 'evidence.recorded'")?;
+    assert!(payload[0].contains("OUTPUT_CHANGED"), "{payload:?}");
+    assert_eq!(f.query("SELECT state FROM candidates")?, ["INVALID"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_committed_records_pending_file_is_never_read_again() -> R {
+    // M2T10R-151: once its evidence is recorded, a record's pending file plays no part: damaged later, it stops nothing.
+    let f = Fixture::new().await?;
+    let c = f.frozen().await?;
+    let ran = f.run(&c, "qa", QA).await.map_err(|e| format!("{e:?}"))?;
+    std::fs::write(ran.record_dir.join("recording.json"), b"{")?;
+    let again = f.run(&c, "qa", QA).await.map_err(|e| format!("{e:?}"))?;
+    assert_eq!(again.outcome.status.code(), "PASS");
+    assert_eq!(f.query("SELECT count(*) FROM evidence")?, ["2"]);
+    Ok(())
+}

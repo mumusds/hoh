@@ -1186,24 +1186,3 @@ fn an_evidences_rows_are_its_conclusions_on_the_specs_acceptance_criteria() -> R
     );
     Ok(())
 }
-
-#[test]
-fn every_code_reads_back_as_its_reason_status_or_outcome_reason() {
-    // A pending recording is kept as text and read back (M2T10R-05): every code names exactly one.
-    let codes: std::collections::BTreeSet<_> = Reason::ALL.iter().map(|r| r.code()).collect();
-    assert_eq!(codes.len(), Reason::ALL.len());
-    for r in Reason::ALL {
-        assert_eq!(Reason::from_code(r.code()), Some(r));
-    }
-    for s in [
-        Status::Pass,
-        Status::Degraded,
-        Status::Fail,
-        Status::Blocked,
-        Status::Invalid,
-    ] {
-        assert_eq!(Status::from_code(s.code()), Some(s));
-    }
-    assert_eq!(Reason::from_code("NOPE"), None);
-    assert_eq!(Status::from_code("NOPE"), None);
-}
