@@ -499,6 +499,24 @@ fn planned_of(entry: &Value) -> Planned {
     }
 }
 
+/// How a check's command is started beyond what its plan says: variables of its own (a verifier attempt's marker, so
+/// the attempt's stop and a reconcile find it, docs/adr/ADR-021.md decision 8d) and what to do with its pid as soon as
+/// it exists (join the attempt's cgroup; docs/adr/ADR-028.md decision 7).
+#[derive(Default)]
+pub struct Launch {
+    pub env: Vec<(String, String)>,
+    pub adopt: Option<Box<dyn FnOnce(u32) + Send>>,
+}
+
+impl std::fmt::Debug for Launch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Launch")
+            .field("env", &self.env)
+            .field("adopt", &self.adopt.is_some())
+            .finish()
+    }
+}
+
 /// Run `request`'s check on its frozen candidate (REQ-052 behaviours 4 to 8; docs/adr/ADR-027.md decisions 6 to 9):
 /// pre-checked (refused before anything runs, no record), run on the process substrate with the six variables and the
 /// plan's timeout, post-checked with the same comparison, recorded under `.hoh/evidence/` (a new directory, never
@@ -508,6 +526,17 @@ pub async fn run(
     checkout: &Path,
     state: &Path,
     request: &Request,
+) -> Result<Ran, CheckError> {
+    run_with(store, checkout, state, request, Launch::default()).await
+}
+
+/// [`run`], its command started as `launch` says (a verifier attempt's check, docs/adr/ADR-028.md decision 7).
+pub async fn run_with(
+    store: &hoh_core::persistence::Store,
+    checkout: &Path,
+    state: &Path,
+    request: &Request,
+    launch: Launch,
 ) -> Result<Ran, CheckError> {
     let blocking = |e: tokio::task::JoinError| CheckError::Io(format!("the check stopped: {e}"));
     let io = CheckError::Io;
@@ -590,6 +619,7 @@ pub async fn run(
             lock,
             timeout,
             export,
+            launch,
         },
         cancelled,
     ));
@@ -612,6 +642,7 @@ struct Finish {
     lock: std::fs::File,
     timeout: f64,
     export: std::path::PathBuf,
+    launch: Launch,
 }
 
 /// The command on the process substrate, then the post-check, the record, the objects, the judgement and the evidence.
@@ -640,6 +671,7 @@ async fn finish(
         lock,
         timeout,
         export,
+        launch,
     } = f;
     let request = &request;
     // The command, on the process substrate (argv only, its own process group, the plan's timeout).
@@ -658,7 +690,8 @@ async fn finish(
             &ready.sealed,
             &export,
             &record_id,
-        ));
+        ))
+        .envs(launch.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     let config = Config {
         deadline: Some(std::time::Duration::from_secs_f64(timeout)),
         stdout_copy: Some(stdout.clone()),
@@ -676,6 +709,9 @@ async fn finish(
     };
     let (exit_code, timed_out) = match Process::spawn(command, config) {
         Ok(mut process) => {
+            if let Some(adopt) = launch.adopt {
+                adopt(process.pid());
+            }
             let mut report = None;
             let mut cancelling = false;
             loop {

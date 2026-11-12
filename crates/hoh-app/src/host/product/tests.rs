@@ -33,6 +33,7 @@ fn work(prompt: Option<&str>) -> Work {
             handoff: None,
         },
         run_dir: None,
+        helpers: None,
     }
 }
 

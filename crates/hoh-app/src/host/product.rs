@@ -323,15 +323,37 @@ impl ProductExecutor {
         let bridge = bridge_of(&self.project, &work.attempt_id);
         let _ = std::fs::create_dir_all(attempt_logs(&self.project, &work.attempt_id));
         if a.supervision.is_none() {
-            facts.identity = Some(context::AttemptIdentity {
-                run_id: work.run_id.clone(),
-                task_id: work.task_id.clone(),
-                attempt_id: work.attempt_id.clone(),
-                role: work.role.clone(),
-                role_epoch: a.role_epoch,
-                bridge: bridge.display().to_string(),
-                verified: None,
-            });
+            facts.identity =
+                Some(context::AttemptIdentity {
+                    run_id: work.run_id.clone(),
+                    task_id: work.task_id.clone(),
+                    attempt_id: work.attempt_id.clone(),
+                    role: work.role.clone(),
+                    role_epoch: a.role_epoch,
+                    bridge: bridge.display().to_string(),
+                    // A verifier is told what it verifies and its request helpers (docs/adr/ADR-028.md decisions 2, 7).
+                    verified: a.handoff.as_ref().zip(work.helpers.as_ref()).and_then(
+                        |(h, helpers)| {
+                            let c = h.package.candidate.as_ref()?;
+                            Some(context::Verified {
+                                source_task_ids: h.source_task_ids.clone(),
+                                candidate: vec![
+                                    ("candidate_id".to_owned(), c.id.clone()),
+                                    ("git_commit".to_owned(), c.git_commit.clone()),
+                                    ("git_tree".to_owned(), c.git_tree.clone()),
+                                    ("spec_sha256".to_owned(), c.spec_sha256.clone()),
+                                    (
+                                        "environment_sha256".to_owned(),
+                                        c.environment_sha256.clone(),
+                                    ),
+                                    ("test_plan_sha256".to_owned(), c.test_plan_sha256.clone()),
+                                ],
+                                run_check: helpers.run_check.display().to_string(),
+                                ask: helpers.ask.display().to_string(),
+                            })
+                        },
+                    ),
+                });
         }
         let bridge_text = a.supervision.as_ref().map(|_| bridge.display().to_string());
         let project = a
@@ -562,7 +584,14 @@ impl Executor for ProductExecutor {
         let gate = GateCommand {
             program: self.gate.clone(),
             args: vec!["__gate".into()],
-            env: vec![(super::ATTEMPT_ENV.into(), work.marker().into())],
+            env: std::iter::once((super::ATTEMPT_ENV.into(), work.marker().into()))
+                .chain(work.helpers.iter().flat_map(|h| {
+                    [
+                        ("HOH_RUN_CHECK".into(), h.run_check.clone().into_os_string()),
+                        ("HOH_ASK".into(), h.ask.clone().into_os_string()),
+                    ]
+                }))
+                .collect(),
         };
         let held = match &prepared {
             Prepared::Claude(turn) => hoh_agents::claude::start(&attempt, turn, &gate),

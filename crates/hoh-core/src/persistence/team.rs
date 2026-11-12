@@ -907,23 +907,35 @@ pub(super) fn assignment(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Handoff {
     pub message_id: String,
+    /// Its round and the development tasks the round verifies (not the verifier's own task).
+    pub round_id: String,
+    pub source_task_ids: Vec<String>,
     pub package: crate::protocol::ContextHandoff,
 }
 
 /// The handoff attempt `attempt_id`'s dispatch names, if it names one.
 fn handoff(conn: &Connection, attempt_id: &str) -> Result<Option<Handoff>, PersistError> {
-    let named: Option<(String, String)> = conn
+    let named: Option<(String, String, String, Option<String>)> = conn
         .query_row(
-            "SELECT h.message_id, h.payload_json FROM outbox d JOIN outbox h \
-             ON h.message_id = json_extract(d.payload_json, '$.handoff') WHERE d.message_id = ?1",
-            params![crate::ids::child_id(attempt_id, "dispatch")],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            "SELECT h.message_id, h.payload_json, json_extract(d.payload_json, '$.round_id'), \
+             (SELECT json_extract(e.payload_json, '$.source_task_ids') FROM events e WHERE e.kind = ?2 \
+              AND json_extract(e.payload_json, '$.round_id') = json_extract(d.payload_json, '$.round_id')) \
+             FROM outbox d JOIN outbox h ON h.message_id = json_extract(d.payload_json, '$.handoff') \
+             WHERE d.message_id = ?1",
+            params![
+                crate::ids::child_id(attempt_id, "dispatch"),
+                super::verification::ROUND_OPENED
+            ],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()
         .map_err(sqlite_error)?;
-    let Some((message_id, payload)) = named else {
+    let Some((message_id, payload, round_id, sources)) = named else {
         return Ok(None);
     };
+    let source_task_ids: Vec<String> = sources
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
     let message: crate::protocol::Message = serde_json::from_str::<serde_json::Value>(&payload)
         .map_err(|e| e.to_string())
         .and_then(|v| crate::protocol::decode(&v).map_err(|e| e.to_string()))
@@ -932,6 +944,8 @@ fn handoff(conn: &Connection, attempt_id: &str) -> Result<Option<Handoff>, Persi
         .map_err(|e| PersistError::IntegrityViolation(format!("handoff {message_id}: {e}")))?;
     Ok(Some(Handoff {
         message_id,
+        round_id,
+        source_task_ids,
         package,
     }))
 }
