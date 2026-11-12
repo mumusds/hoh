@@ -89,7 +89,7 @@ pub struct Input {
     pub checks: Checks,
     /// Each in-scope AC's projection; an empty scope is never passable (REQ-053 behaviour 8).
     pub acs: Vec<Ac>,
-    /// A change request of this round or a critical/high OPEN issue on the candidate (docs/adr/ADR-028.md decision 13).
+    /// A change request of this round or a critical/high unclosed (OPEN or REOPENED) issue on the candidate (docs/adr/ADR-028.md decision 13).
     pub failing_issues: bool,
 }
 
