@@ -1028,5 +1028,7 @@ pub fn rows(e: &Evidence, outcome: &Outcome, acs: &[AcSpec], check: bool) -> Vec
         .collect()
 }
 
+pub mod classify;
+
 #[cfg(test)]
 mod tests;
