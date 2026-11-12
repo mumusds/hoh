@@ -135,11 +135,14 @@ fn git(dir: &Path, args: &[&str]) -> R {
 }
 
 /// The project's frozen check plan: `unit` fails with exit code 1 and changes nothing.
-const PLAN: &str = "{\"schema_version\": \"1.0\", \"plan_id\": \"fixture\", \"checks\": {\"unit\": {\"mode\": \"product\", \"argv\": [\"sh\", \"-c\", \"exit 1\"]}}}\n";
+const PLAN: &str = r#"{"schema_version": "1.0", "plan_id": "fixture", "checks": {
+  "unit": {"mode": "product", "argv": ["sh", "-c", "exit 1"]},
+  "pass": {"mode": "product", "artifacts": ["test-results.jsonl"], "argv": ["sh", "-c",
+    "printf '%s\\n' '{\"schema_version\": \"1.0\", \"test_id\": \"TEST-035-03\", \"name\": \"test_035_03_works\", \"status\": \"PASS\"}' > \"$HOH_EVIDENCE_DIR/test-results.jsonl\""]}}}
+"#;
 
 /// The project's specification as committed (its sha256 is the run's spec digest).
-const SPEC: &str =
-    "{\"requirements\": [{\"id\": \"REQ-035\", \"acceptance\": [{\"id\": \"AC-035-03\"}]}]}\n";
+const SPEC: &str = "{\"requirements\": [{\"id\": \"REQ-035\", \"acceptance\": [{\"id\": \"AC-035-03\", \"test_id\": \"TEST-035-03\"}]}]}\n";
 
 /// A committed project whose layout the freeze takes (docs/adr/ADR-028.md decision 4), its store made by one host's
 /// start and stop; the project and the specification's digest.
@@ -215,6 +218,10 @@ struct Team {
     project: PathBuf,
     /// The status a verifier's report block gives.
     report: std::sync::Mutex<String>,
+    /// The reviewer's report status, when it differs from `report`.
+    review_report: std::sync::Mutex<Option<String>>,
+    /// What the reviewer FakeAgent runs once released, as `qa_script` for qa.
+    review_script: std::sync::Mutex<Option<String>>,
     spec: String,
     /// The Commander's turns started (refused ones included).
     commander_turns: Arc<AtomicU32>,
@@ -242,6 +249,8 @@ impl Team {
             spec: spec.to_owned(),
             project: project.to_owned(),
             report: std::sync::Mutex::new("PASS".to_owned()),
+            review_report: std::sync::Mutex::default(),
+            review_script: std::sync::Mutex::default(),
             commander_turns: Arc::default(),
             fail: AtomicU32::new(0),
             release: Arc::default(),
@@ -336,7 +345,10 @@ impl hoh_app::host::Executor for Team {
                 // A verifier reports its work done through its bridge, and its verdict in a hoh-report block of its
                 // final message, its raw session log kept as an object, as the product's agent and executor do.
                 if work.assignment.handoff.is_some() {
-                    let status = self.report.lock().map(|s| s.clone()).unwrap_or_default();
+                    let status = match self.review_report.lock().ok().and_then(|r| r.clone()) {
+                        Some(review) if work.role == "reviewer" => review,
+                        _ => self.report.lock().map(|s| s.clone()).unwrap_or_default(),
+                    };
                     final_text = Some(format!(
                         "done\n```hoh-report\n{}\n```\n",
                         json!({"status": status, "scope": ["AC-035-03"], "findings": []})
@@ -365,10 +377,16 @@ impl hoh_app::host::Executor for Team {
                 }
             }
         }
-        let qa_script = self.qa_script.lock().ok().and_then(|s| s.clone());
+        let qa_script = if work.role == "reviewer" {
+            self.review_script.lock().ok().and_then(|s| s.clone())
+        } else {
+            self.qa_script.lock().ok().and_then(|s| s.clone())
+        };
         let script = if work.role == "qa" && self.tamper.load(Ordering::SeqCst) {
             "read -r go; echo changed > tampered.txt; exit 0".to_owned()
-        } else if let Some(body) = qa_script.filter(|_| work.role == "qa") {
+        } else if let Some(body) =
+            qa_script.filter(|_| matches!(work.role.as_str(), "qa" | "reviewer"))
+        {
             format!("read -r go; {body}")
         } else {
             "read -r go; exit 0".to_owned()
@@ -1113,6 +1131,96 @@ async fn a_verifier_runs_planned_checks_and_asks_through_its_request_helpers() -
             )?[0]["n"],
             json!(0)
         );
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_037_02_qa_and_review_run_side_by_side_and_the_round_closes_only_after_both() -> R {
+    // AC-037-02 (docs/adr/ADR-028.md decisions 6 to 11): QA runs `run-check unit` (fails) and reports FAIL and ends
+    // first; the reviewer, still running then, runs `run-check pass` and reports PASS later. No round_closed between
+    // the two ends; after both, the round closes (its seq after both ends), with two evidence rows (the FAIL the QA
+    // attempt's, the PASS the reviewer's) whose identity is their own run directory's candidate, and C1 REJECTED.
+    let dir = tempfile::tempdir()?;
+    let (project, spec) = project(dir.path()).await?;
+    seed(&project, &world(&spec))?;
+    let clock = Arc::new(FakeClock::default());
+    let mut team = Team::new(Commander::Answers, &spec, &project);
+    team.out = dir.path().join("out");
+    std::fs::create_dir_all(&team.out)?;
+    *team.report.lock().map_err(|e| e.to_string())? = "FAIL".to_owned();
+    *team.review_report.lock().map_err(|e| e.to_string())? = Some("PASS".to_owned());
+    *team.qa_script.lock().map_err(|e| e.to_string())? =
+        Some("\"$HOH_RUN_CHECK\" unit > \"$OUT/qa.txt\"; exit 0".to_owned());
+    // The reviewer runs its check, then waits for the test's word before it ends.
+    *team.review_script.lock().map_err(|e| e.to_string())? = Some(
+        "\"$HOH_RUN_CHECK\" pass > \"$OUT/review.txt\"; while [ ! -e \"$OUT/end-review\" ]; do sleep 0.1; done; exit 0"
+            .to_owned(),
+    );
+    team.release.store(true, Ordering::SeqCst);
+    let team = Arc::new(team);
+    let out = team.out.clone();
+    let host = host(&project, team.clone(), clock.clone()).await?;
+    let outcome = async {
+        let step = Duration::from_millis(100);
+        // QA ended while the reviewer runs (its check recorded).
+        wait_for(
+            &project,
+            &clock,
+            step,
+            "SELECT count(*) AS n FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+             WHERE t.role = 'qa' AND a.state = 'SETTLED'",
+            &|r| r[0]["n"] == json!(1),
+        )?;
+        wait_for(&project, &clock, step, "SELECT count(*) AS n FROM evidence", &|r| r[0]["n"] == json!(2))?;
+        for _ in 0..10 {
+            clock.advance(step);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(
+            rows(&project, "SELECT count(*) AS n FROM events WHERE kind = 'verification.round_closed'")?[0]["n"],
+            json!(0),
+            "closed before the reviewer ended"
+        );
+        std::fs::write(out.join("end-review"), "")?;
+        let closed = wait_for(
+            &project,
+            &clock,
+            step,
+            "SELECT seq, json_extract(payload_json, '$.verdict') AS verdict FROM events \
+             WHERE kind = 'verification.round_closed'",
+            &|r| r.as_array().is_some_and(|a| !a.is_empty()),
+        )?;
+        assert_eq!(
+            closed[0]["verdict"],
+            json!("repair"),
+            "{}",
+            rows(
+                &project,
+                "SELECT ev.check_id, ev.outcome, ev.kind, json_extract(e.payload_json, '$.reasons') AS reasons \
+                 FROM evidence ev LEFT JOIN events e ON e.event_id = ev.evidence_id || '/evidence'"
+            )?
+        );
+        let ends = rows(
+            &project,
+            "SELECT max(e.seq) AS seq FROM events e JOIN attempts a ON a.attempt_id = json_extract(e.payload_json, \
+             '$.attempt_id') JOIN tasks t ON t.task_id = a.task_id WHERE e.kind = 'attempt.moved' \
+             AND json_extract(e.payload_json, '$.to') = 'SETTLED' AND t.role IN ('qa', 'reviewer')",
+        )?;
+        assert!(closed[0]["seq"].as_i64() > ends[0]["seq"].as_i64(), "{closed} {ends}");
+        assert_eq!(
+            rows(
+                &project,
+                "SELECT ev.check_id, ev.outcome, t.role FROM evidence ev JOIN attempts a ON a.attempt_id = ev.attempt_id \
+                 JOIN tasks t ON t.task_id = a.task_id ORDER BY ev.check_id"
+            )?,
+            json!([{"check_id": "pass", "outcome": "PASS", "role": "reviewer"},
+                   {"check_id": "unit", "outcome": "FAIL", "role": "qa"}])
+        );
+        assert_eq!(rows(&project, "SELECT state FROM candidates")?, json!([{"state": "REJECTED"}]));
         R::Ok(())
     }
     .await;

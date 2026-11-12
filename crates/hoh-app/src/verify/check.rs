@@ -940,7 +940,7 @@ pub struct AttemptChange {
 }
 
 /// The command an attempt-level record names: a marker that never runs and is no `hoh` subcommand (M2T16D-162).
-pub const ATTEMPT_MARKER: &str = "hoh-runtime:verification-attempt";
+pub const ATTEMPT_MARKER: &str = hoh_core::verification::ATTEMPT_MARKER;
 
 /// Record `change` (docs/adr/ADR-028.md decision 8): an execution record of a fixed shape under
 /// `.hoh/evidence/<candidate>/<check>/<record>/` (the marker command, exit 1, `source_unchanged` false, empty stdout
@@ -1104,6 +1104,22 @@ fn settle(state: &Path, record_id: &str, lock: std::fs::File) {
 /// `.hoh/pending/<record_id>.json`, HoH's own state outside the record directory the command writes (M2T10R-450); one
 /// the command wrote there for its own record is removed as a change (M2T10R-552), and the file goes after the commit
 /// (M2T10R-554).
+/// The candidates with check records still to be recorded (`.hoh/pending/` under `state`): a verification round waits
+/// for them before it closes (docs/adr/ADR-028.md decision 11, M2T16D-601). A pending file that cannot be read names
+/// no candidate here; its candidate's reconciliation reports it. Blocking.
+pub fn pending_candidates(state: &Path) -> std::collections::BTreeSet<String> {
+    let Ok(entries) = std::fs::read_dir(state.join("pending")) else {
+        return Default::default();
+    };
+    entries
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".json"))
+        .filter_map(|e| hoh_core::objects::read_regular(&e.path()).ok())
+        .filter_map(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .filter_map(|facts| facts["record"]["candidate_id"].as_str().map(str::to_owned))
+        .collect()
+}
+
 fn pending_path(state: &Path, record_id: &str) -> std::path::PathBuf {
     state.join("pending").join(format!("{record_id}.json"))
 }

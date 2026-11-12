@@ -2,7 +2,8 @@
 
 use super::*;
 use crate::persistence::{
-    ArtifactRow, ChangeRequest, Deferred, Options, Store, VerifierReport, VerifierRequest, selftest,
+    ArtifactRow, ChangeRequest, Deferred, Options, Reconciled, Store, VerifierReport,
+    VerifierRequest, selftest,
 };
 use crate::verification::{FileRef, Manifest};
 use rusqlite::Connection;
@@ -1363,6 +1364,369 @@ async fn a_verifiers_missing_result_is_a_protocol_correction_and_an_unknown_effe
             )
         )?,
         ["verifier_unknown_effect"]
+    );
+    Ok(())
+}
+
+/// C1's round 1 with both verifiers settled, their reports `qa` and `review` (PASS, FAIL or UNKNOWN): the round, the
+/// candidate and the two attempts.
+async fn verified(
+    store: &Store,
+    path: &Path,
+    qa: &str,
+    review: &str,
+) -> R<(String, String, [String; 2])> {
+    let round = verifying(store).await?;
+    let candidate = texts(path, "SELECT candidate_id FROM candidates")?.remove(0);
+    let attempts = settle_verifiers(store, path, qa, review).await?;
+    Ok((round, candidate, attempts))
+}
+
+/// The two READY verifier tasks dispatched, started and settled with reports `qa` and `review`: their attempts.
+async fn settle_verifiers(store: &Store, path: &Path, qa: &str, review: &str) -> R<[String; 2]> {
+    let mut attempts = Vec::new();
+    for _ in 0..2 {
+        let d = store
+            .schedule_round("R", verifiers())
+            .await?
+            .dispatched
+            .ok_or("nothing dispatched")?;
+        let role = if d.task_id.ends_with("/qa") {
+            "qa"
+        } else {
+            "reviewer"
+        };
+        let status = if role == "qa" { qa } else { review };
+        Connection::open(path)?.execute_batch(&format!(
+            "UPDATE attempts SET state = 'RUNNING' WHERE attempt_id = '{0}';
+             UPDATE tasks SET state = 'RUNNING', revision = revision + 1 WHERE task_id = '{1}';",
+            d.attempt_id, d.task_id
+        ))?;
+        attempts.push((role.to_owned(), status.to_owned(), d.attempt_id));
+    }
+    for (role, status, attempt) in &attempts {
+        // Report objects of their own: a digest no other object of the test has.
+        let unique = |kind: &str, name: &str| -> R<ArtifactRow> {
+            let n = texts(path, "SELECT artifact_id FROM artifacts")?.len();
+            let sha256 = format!(
+                "{:064x}",
+                0xfeed_0000 + n + usize::from(kind == "native_attempt")
+            );
+            Ok(ArtifactRow {
+                path: format!(".hoh/objects/sha256/{}/{sha256}", &sha256[..2]),
+                sha256,
+                bytes: 10,
+                mime: "application/json".to_owned(),
+                kind: kind.to_owned(),
+                name: name.to_owned(),
+            })
+        };
+        store
+            .complete_verifier_attempt(verifier_completion(
+                attempt,
+                VerifierOutcome::Settle {
+                    report: Box::new(VerifierReport {
+                        role: role.clone(),
+                        status: status.clone(),
+                        report: unique("independent_report", "report.json")?,
+                        native_attempt: unique("native_attempt", "attempt.json")?,
+                    }),
+                },
+            ))
+            .await?;
+    }
+    let of = |role: &str| {
+        attempts
+            .iter()
+            .find(|a| a.0 == role)
+            .map(|a| a.2.clone())
+            .unwrap_or_default()
+    };
+    Ok([of("qa"), of("reviewer")])
+}
+
+/// A planned check's evidence by `attempt` on `candidate`: its outcome and its acceptance rows (written when its round
+/// closes when `deferred`).
+fn evidence_of(
+    path: &Path,
+    (attempt, candidate, record): (&str, &str, &str),
+    (check, outcome): (&str, &str),
+    rows: &[(&str, &str)],
+    deferred: bool,
+) -> R {
+    let rows_json: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|(ac, status)| json!({"ac_id": ac, "spec_id": "s1", "status": status, "reason": ""}))
+        .collect();
+    let conn = Connection::open(path)?;
+    conn.execute(
+        "INSERT OR IGNORE INTO artifacts(artifact_id, sha256, path, bytes, mime) VALUES (?1, ?2, ?3, 1, 'x')",
+        rusqlite::params![format!("{}:{record}", "e".repeat(64)), "e".repeat(64), record],
+    )?;
+    conn.execute(
+        "INSERT INTO evidence(evidence_id, candidate_id, attempt_id, artifact_id, check_id, kind, outcome, mode, \
+         created_at) VALUES (?1, ?2, ?3, ?4, ?5, 'check', ?6, 'product', '2026-11-12T00:00:05Z')",
+        rusqlite::params![record, candidate, attempt, format!("{}:{record}", "e".repeat(64)), check, outcome],
+    )?;
+    conn.execute(
+        "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES ('p1', ?1, 'R', \
+         'evidence.recorded', ?2, '2026-11-12T00:00:05Z')",
+        rusqlite::params![
+            format!("{record}/evidence"),
+            json!({"evidence_id": record, "attempt_id": attempt, "check_id": check, "outcome": outcome,
+                "outcome_reason": null, "reasons": [], "rows": rows_json, "deferred_rows": deferred})
+            .to_string()
+        ],
+    )?;
+    if !deferred {
+        for (ac, status) in rows {
+            conn.execute(
+                "INSERT INTO acceptance_results(ac_id, spec_id, candidate_id, evidence_id, status, reason) \
+                 VALUES (?1, 's1', ?2, ?3, ?4, '')",
+                rusqlite::params![ac, candidate, record, status],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_037_02_a_failed_round_closes_after_both_verifiers_and_reworks_its_source() -> R {
+    // AC-037-02 at the store (docs/adr/ADR-028.md decisions 11 and 12): QA's report FAIL with a failing check, the
+    // reviewer's PASS. Closed only once both are settled: its acceptance rows written then (the FAIL), verdict repair,
+    // C1 REJECTED, the failure items registered with their owner D (I6), D reworked (READY, layer 0), the verifier
+    // tasks done; asked again, nothing more.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    let (round, candidate, [qa, _]) = verified(&store, &path, "FAIL", "PASS").await?;
+    evidence_of(
+        &path,
+        (&qa, &candidate, "rec-1"),
+        ("unit", "FAIL"),
+        &[("AC-1-01", "FAIL")],
+        true,
+    )?;
+    assert_eq!(
+        texts(&path, "SELECT status FROM acceptance_results")?.len(),
+        0,
+        "no row before the round closes (M2T16D-455)"
+    );
+    let done = store
+        .reconcile_verification("R", Default::default())
+        .await?;
+    assert_eq!(done.closed, [(round.clone(), "repair".to_owned())]);
+    assert_eq!(
+        texts(&path, "SELECT status FROM acceptance_results")?,
+        ["FAIL"]
+    );
+    assert_eq!(texts(&path, "SELECT state FROM candidates")?, ["REJECTED"]);
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT json_extract(i.value, '$.task_id') || ':' || json_extract(i.value, '$.item') FROM events e, \
+             json_each(e.payload_json, '$.items') i WHERE e.kind = 'verification.failures' ORDER BY 1"
+        )?,
+        [
+            "D:ac-fail:AC-1-01",
+            "D:check-fail:unit:",
+            "D:report-fail:qa"
+        ]
+    );
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT state || ':' || layer FROM tasks WHERE task_id = 'D'"
+        )?,
+        ["READY:0"]
+    );
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT DISTINCT state FROM tasks WHERE role IN ('qa', 'reviewer')"
+        )?,
+        ["ACCEPTED"]
+    );
+    let events = texts(&path, "SELECT CAST(count(*) AS TEXT) FROM events")?;
+    let again = store
+        .reconcile_verification("R", Default::default())
+        .await?;
+    assert_eq!(again, Reconciled::default());
+    assert_eq!(
+        texts(&path, "SELECT CAST(count(*) AS TEXT) FROM events")?,
+        events
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_passable_round_waits_at_its_candidates_barrier_for_the_join() -> R {
+    // Decision 11: both reports PASS, the check PASS, every scope criterion PASS: passable; C1 stays VERIFYING, D waits,
+    // and the candidate is ready for M2-T18's join (once).
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    let (round, candidate, [qa, _]) = verified(&store, &path, "PASS", "PASS").await?;
+    evidence_of(
+        &path,
+        (&qa, &candidate, "rec-1"),
+        ("unit", "PASS"),
+        &[("AC-1-01", "PASS")],
+        true,
+    )?;
+    let done = store
+        .reconcile_verification("R", Default::default())
+        .await?;
+    assert_eq!(done.closed, [(round, "passable".to_owned())]);
+    assert_eq!(done.joinable, std::slice::from_ref(&candidate));
+    assert_eq!(texts(&path, "SELECT state FROM candidates")?, ["VERIFYING"]);
+    assert_eq!(
+        texts(&path, "SELECT state FROM tasks WHERE task_id = 'D'")?,
+        ["VERIFYING"]
+    );
+    let again = store
+        .reconcile_verification("R", Default::default())
+        .await?;
+    assert!(again.joinable.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_inconclusive_round_is_verified_again_until_its_chain_is_spent() -> R {
+    // Decisions 11 and 12 (M2T16D-260, -362): reports PASS but no check ran: inconclusive; the next round on C1 with D
+    // and the same scope, counted on round 1's chain; past REVERIFY_LIMIT D is BLOCKED for a decision.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    let (round, candidate, _) = verified(&store, &path, "PASS", "PASS").await?;
+    let done = store
+        .reconcile_verification("R", Default::default())
+        .await?;
+    assert_eq!(done.closed, [(round.clone(), "reverify".to_owned())]);
+    let second = crate::ids::child_id(&candidate, "round/2");
+    assert_eq!(done.opened, std::slice::from_ref(&second));
+    let rounds = rounds_of(&path)?;
+    assert_eq!(rounds[1]["chain_root"], json!(round));
+    assert_eq!(rounds[1]["source_task_ids"], json!(["D"]));
+    assert_eq!(rounds[1]["acceptance_ids"], json!(["AC-1-01"]));
+    assert_eq!(
+        texts(&path, "SELECT state FROM tasks WHERE task_id = 'D'")?,
+        ["VERIFYING"]
+    );
+    // Round 2 inconclusive too: round 3, the chain's second; round 3 inconclusive: refused, D BLOCKED.
+    settle_verifiers(&store, &path, "PASS", "PASS").await?;
+    let done = store
+        .reconcile_verification("R", Default::default())
+        .await?;
+    assert_eq!(done.opened, [crate::ids::child_id(&candidate, "round/3")]);
+    settle_verifiers(&store, &path, "PASS", "PASS").await?;
+    let done = store
+        .reconcile_verification("R", Default::default())
+        .await?;
+    assert!(done.opened.is_empty(), "{done:?}");
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT state || ':' || blocked_reason FROM tasks WHERE task_id = 'D'"
+        )?,
+        ["BLOCKED:NEED_DECISION"]
+    );
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT json_extract(payload_json, '$.reason') FROM events WHERE kind = 'need_decision' \
+             AND json_extract(payload_json, '$.task_id') = 'D'"
+        )?,
+        ["reverify_exhausted"]
+    );
+    Ok(())
+}
+
+fn rounds_of(path: &Path) -> R<Vec<serde_json::Value>> {
+    rounds(path)
+}
+
+#[tokio::test]
+async fn a_flaky_criterion_blocks_its_source_for_a_decision() -> R {
+    // Decision 11: a criterion with a PASS and a NOT_RUN row on the candidate is flaky (retesting the same candidate
+    // cannot satisfy it): D BLOCKED for a decision with need_decision{flaky}.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    let (round, candidate, [qa, reviewer]) = verified(&store, &path, "PASS", "PASS").await?;
+    evidence_of(
+        &path,
+        (&qa, &candidate, "rec-1"),
+        ("unit", "PASS"),
+        &[("AC-1-01", "PASS")],
+        true,
+    )?;
+    evidence_of(
+        &path,
+        (&reviewer, &candidate, "rec-2"),
+        ("unit", "PASS"),
+        &[("AC-1-01", "NOT_RUN")],
+        true,
+    )?;
+    let done = store
+        .reconcile_verification("R", Default::default())
+        .await?;
+    assert_eq!(done.closed, [(round, "flaky".to_owned())]);
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT state || ':' || blocked_reason FROM tasks WHERE task_id = 'D'"
+        )?,
+        ["BLOCKED:NEED_DECISION"]
+    );
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT json_extract(payload_json, '$.reason') FROM events WHERE kind = 'need_decision' \
+             AND json_extract(payload_json, '$.task_id') = 'D'"
+        )?,
+        ["flaky"]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_superseded_candidates_round_cancels_its_unstarted_verifiers_and_closes_superseded() -> R
+{
+    // Decisions 9 to 11: E's completion freezes C2 while C1's round 1 has not started (C1 STALE, D moved into C2's
+    // round). C1's verifier tasks are cancelled and their handoffs dead-lettered; the round closes superseded and D,
+    // whose current round is C2's, does not move.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    let round = verifying(&store).await?;
+    second_writer(&path, "E", "AE")?;
+    store
+        .complete_writer_attempt(WriterCompletion {
+            attempt_id: "AE".to_owned(),
+            ..completion(freeze(freeze_of('c'), result_of("E", "AE")?))
+        })
+        .await?;
+    let done = store
+        .reconcile_verification("R", Default::default())
+        .await?;
+    assert_eq!(
+        done.cancelled,
+        [
+            crate::ids::child_id(&round, "task/qa"),
+            crate::ids::child_id(&round, "task/reviewer")
+        ]
+    );
+    assert_eq!(done.closed, [(round.clone(), "superseded".to_owned())]);
+    assert_eq!(
+        texts(
+            &path,
+            &format!(
+                "SELECT DISTINCT state FROM outbox WHERE message_id IN ('{}', '{}')",
+                crate::ids::child_id(&round, "verify/qa"),
+                crate::ids::child_id(&round, "verify/reviewer")
+            )
+        )?,
+        ["DEAD_LETTER"]
+    );
+    assert_eq!(
+        texts(&path, "SELECT state FROM tasks WHERE task_id = 'D'")?,
+        ["VERIFYING"]
     );
     Ok(())
 }

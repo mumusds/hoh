@@ -514,6 +514,17 @@ async fn tick(
         wall: Some(common.clock.wall()),
         ..context.clone()
     };
+    // Each run's verification first (docs/adr/ADR-028.md decision 11): rounds closed, failures taken by their owners,
+    // source tasks moved on, before the pace and the rounds see them; rounds wait for their candidates' pending
+    // records.
+    let state = common.shared.root.join(".hoh");
+    let pending =
+        tokio::task::spawn_blocking(move || crate::verify::check::pending_candidates(&state))
+            .await
+            .unwrap_or_default();
+    for run in waiting.runs.iter().chain(&waiting.pausing) {
+        store.reconcile_verification(run, pending.clone()).await?;
+    }
     for run in &waiting.runs {
         // The run as a whole first: woken when a retry is due, parked, blocked or stopped (ADR-020 decisions 4, 5, 7).
         store.pace_run(run, at()).await?;

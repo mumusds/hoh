@@ -14,6 +14,8 @@
 mod attempts;
 mod blockers;
 mod candidates;
+mod closing;
+pub use closing::Reconciled;
 mod commands;
 mod completion;
 mod context;
@@ -1292,6 +1294,18 @@ impl Store {
         completion: WriterCompletion,
     ) -> Result<WriterCompleted, PersistError> {
         self.writer.complete_writer_attempt(completion).await
+    }
+
+    /// Run `run_id`'s verification reconcile (docs/adr/ADR-028.md decision 11): one transaction, idempotent; `pending`
+    /// holds the candidates with check records still to be recorded (`.hoh/pending/`).
+    pub async fn reconcile_verification(
+        &self,
+        run_id: &str,
+        pending: std::collections::BTreeSet<String>,
+    ) -> Result<Reconciled, PersistError> {
+        self.writer
+            .reconcile_verification(run_id.to_owned(), pending)
+            .await
     }
 
     /// Complete a successful verifier attempt from its bridge's result in one commit (docs/adr/ADR-028.md decision 11).

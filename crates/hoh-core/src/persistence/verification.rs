@@ -68,6 +68,8 @@ pub(super) struct Opening<'a> {
     pub cause: &'a str,
     /// The index, in the caller's commit, of the event its outbox rows hang on.
     pub outbox_event: usize,
+    /// A reverification's round: the inconclusive round it follows and the first round of their chain (decision 12).
+    pub follows: Option<(&'a str, &'a str)>,
 }
 
 /// A round opened: its id, its `verification.round_opened` event and its handoffs, for the caller's commit (its two
@@ -175,12 +177,68 @@ pub(super) fn open_in(tx: &Transaction<'_>, o: &Opening<'_>) -> Result<Opened, P
             "handoffs": handoffs,
         }),
     };
+    let mut event = event;
+    if let (Some((previous, root)), Some(payload)) = (o.follows, event.payload.as_object_mut()) {
+        payload.insert("reverify_of".to_owned(), json!(previous));
+        payload.insert("chain_root".to_owned(), json!(root));
+    }
     Ok(Opened {
         round_id,
         event,
         outbox,
         handoffs,
     })
+}
+
+/// Open the next round after inconclusive round `previous` on candidate `candidate_id` for `sources`, the same scope
+/// (decision 11's `reverify`), counted on chain `root`: its id.
+pub(super) fn reverify(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    candidate_id: &str,
+    previous: &str,
+    root: &str,
+    sources: Vec<Source>,
+    ctx: &super::writer::Ctx<'_>,
+) -> Result<String, PersistError> {
+    let (project_id, spec_id, spec_sha256, spec_revision): (String, String, String, i64) = tx
+        .query_row(
+            "SELECT r.project_id, r.spec_id, s.sha256, s.revision FROM runs r JOIN specs s ON s.spec_id = r.spec_id \
+             WHERE r.run_id = ?1",
+            params![run_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .map_err(sqlite_error)?;
+    let (candidate, _) = super::results::load_candidate(tx, run_id, candidate_id)?
+        .ok_or_else(|| PersistError::IntegrityViolation(format!("no candidate {candidate_id}")))?;
+    let cause = child_id(previous, "closed");
+    let opened = open_in(
+        tx,
+        &Opening {
+            project_id: &project_id,
+            run_id,
+            spec_id: &spec_id,
+            spec_sha256: &spec_sha256,
+            spec_revision: u64::try_from(spec_revision)
+                .map_err(|_| PersistError::IntegrityViolation("spec revision".to_owned()))?,
+            candidate: &candidate,
+            sources,
+            attempt_id: previous,
+            cause: &cause,
+            outbox_event: 0,
+            follows: Some((previous, root)),
+        },
+    )?;
+    super::writer::write(
+        tx,
+        &super::writer::Commit {
+            events: vec![opened.event],
+            outbox: opened.outbox,
+            ..super::writer::Commit::default()
+        },
+        ctx,
+    )?;
+    Ok(opened.round_id)
 }
 
 /// The VERIFYING development tasks of run `run_id` other than `except` whose current round (the latest that names

@@ -106,22 +106,69 @@ pub(super) fn record(
         .collect();
     register(&tx, &objects)?;
     let now = crate::time::now_rfc3339();
+    // An attempt-level record is the attempt's evidence, never a planned check's (docs/adr/ADR-028.md decision 8).
+    let kind = if r.command.first().map(String::as_str) == Some(crate::verification::ATTEMPT_MARKER)
+    {
+        "attempt"
+    } else {
+        "check"
+    };
     tx.execute(
         "INSERT INTO evidence(evidence_id, candidate_id, attempt_id, artifact_id, check_id, kind, outcome, mode, \
-         created_at) VALUES (?1, ?2, ?3, ?4, ?5, 'check', ?6, ?7, ?8)",
+         created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             r.record_id,
             r.candidate_id,
             attempt,
             artifact_id(&job.record_object.sha256, &job.record_object.path),
             r.check_id,
+            kind,
             job.outcome.status.code(),
             r.mode,
             now
         ],
     )
     .map_err(sqlite_error)?;
-    for row in &job.rows {
+    // A verification round's evidence has its acceptance rows written when the round closes (docs/adr/ADR-028.md
+    // decision 11, M2T16D-455, -655); after it closed, at once, PASS and DEGRADED left out of a vetoed candidate or a
+    // round with a vetoed record.
+    let producer_task: Option<String> = tx
+        .query_row(
+            "SELECT task_id FROM attempts WHERE attempt_id = ?1",
+            params![attempt],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let round = match &producer_task {
+        Some(task) => super::verification::round_of_task(&tx, &run_id, task)?,
+        None => None,
+    };
+    let round_closed = match &round {
+        Some((round_id, _)) => tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE event_id = ?1)",
+                params![crate::ids::child_id(round_id, "closed")],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(sqlite_error)?,
+        None => false,
+    };
+    let deferred = round.is_some() && !round_closed;
+    let skip_passes = round_closed
+        && (job.outcome.status == Status::Invalid
+            || tx
+                .query_row(
+                    "SELECT state = 'INVALID' FROM candidates WHERE candidate_id = ?1",
+                    params![r.candidate_id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(sqlite_error)?);
+    for row in job
+        .rows
+        .iter()
+        .filter(|row| !deferred && !(skip_passes && matches!(row.status, "PASS" | "DEGRADED")))
+    {
         tx.execute(
             "INSERT INTO acceptance_results(ac_id, spec_id, candidate_id, evidence_id, status, reason) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -163,6 +210,9 @@ pub(super) fn record(
             "tree_before": job.tree_before, "tree_after": job.tree_after, "clock": job.clock,
             "observations": job.observations, "reasons": job.reasons,
             "artifacts": objects.iter().map(ArtifactRow::json).collect::<Vec<_>>(),
+            "rows": job.rows.iter().map(|row| json!({"ac_id": row.ac_id, "spec_id": row.spec_id,
+                "status": row.status, "reason": row.reason})).collect::<Vec<_>>(),
+            "deferred_rows": deferred,
         }),
     )?;
     if !job.integrity.is_empty() {

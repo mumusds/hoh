@@ -1028,6 +1028,10 @@ pub fn rows(e: &Evidence, outcome: &Outcome, acs: &[AcSpec], check: bool) -> Vec
         .collect()
 }
 
+/// The command an attempt-level record names (docs/adr/ADR-028.md decision 8): a marker that never runs and is no `hoh`
+/// subcommand (M2T16D-162). Its evidence is the attempt's, not a planned check's.
+pub const ATTEMPT_MARKER: &str = "hoh-runtime:verification-attempt";
+
 pub mod classify;
 pub mod report;
 
