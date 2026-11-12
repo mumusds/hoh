@@ -189,7 +189,7 @@ fn brief(v: &Value) -> String {
 #[derive(Debug)]
 pub struct Schema {
     document: Value,
-    patterns: HashMap<String, Regex>,
+    patterns: HashMap<String, Matcher>,
 }
 
 impl Schema {
@@ -409,7 +409,7 @@ impl Schema {
             );
         }
         if let Some(Value::String(pattern)) = obj.get("pattern")
-            && !self.patterns.get(pattern).is_some_and(|re| re.is_match(s))
+            && !self.patterns.get(pattern).is_some_and(|m| m.is_match(s))
         {
             fail(
                 out,
@@ -725,7 +725,7 @@ fn check_schema(
     doc: &Value,
     schema: &Value,
     path: &str,
-    patterns: &mut HashMap<String, Regex>,
+    patterns: &mut HashMap<String, Matcher>,
 ) -> Result<(), SchemaError> {
     let obj = match schema {
         Value::Bool(_) => return Ok(()),
@@ -803,9 +803,18 @@ fn check_schema(
                 let source = value
                     .as_str()
                     .ok_or_else(|| bad("pattern must be a string"))?;
-                portable_pattern(source).map_err(|e| bad(&format!("pattern {source}: {e}")))?;
-                let re = Regex::new(source).map_err(|e| bad(&format!("pattern {source}: {e}")))?;
-                patterns.insert(source.to_owned(), re);
+                let matcher = match not_starting_with(source) {
+                    Some(prefix) => Matcher::NotStartingWith(prefix),
+                    None => {
+                        portable_pattern(source)
+                            .map_err(|e| bad(&format!("pattern {source}: {e}")))?;
+                        Matcher::Regex(
+                            Regex::new(source)
+                                .map_err(|e| bad(&format!("pattern {source}: {e}")))?,
+                        )
+                    }
+                };
+                patterns.insert(source.to_owned(), matcher);
             }
             "minLength" | "maxLength" | "minItems" | "maxItems" | "minProperties"
                 if count(value).is_none() =>
@@ -825,6 +834,35 @@ fn check_schema(
         }
     }
     Ok(())
+}
+
+/// A compiled `pattern`.
+#[derive(Debug, Clone)]
+enum Matcher {
+    Regex(Regex),
+    /// `^(?!<literal>)`: the string does not start with the literal (the regex crate has no lookaround).
+    NotStartingWith(String),
+}
+
+impl Matcher {
+    fn is_match(&self, s: &str) -> bool {
+        match self {
+            Matcher::Regex(re) => re.is_match(s),
+            Matcher::NotStartingWith(prefix) => !s.starts_with(prefix.as_str()),
+        }
+    }
+}
+
+/// The literal of a pattern that is exactly `^(?!<literal>)`, its literal made of characters that mean themselves in
+/// both dialects (no metacharacter, no escape): the one lookahead read, as ECMA-262 means it
+/// (contracts/independent-report.schema.json's relative paths).
+fn not_starting_with(source: &str) -> Option<String> {
+    let literal = source.strip_prefix("^(?!")?.strip_suffix(')')?;
+    let plain = !literal.is_empty()
+        && literal
+            .chars()
+            .all(|c| !"\\^$.|?*+()[]{}".contains(c) && !c.is_control());
+    plain.then(|| literal.to_owned())
 }
 
 /// Refuse pattern constructs whose meaning differs between ECMA-262 (what JSON Schema specifies) and the regex
@@ -1006,6 +1044,28 @@ pub fn live_session() -> &'static Schema {
     })
 }
 
+/// `contracts/independent-report.schema.json` (a verifier's report, docs/adr/ADR-028.md decision 15).
+pub fn independent_report() -> &'static Schema {
+    static SCHEMA: OnceLock<Schema> = OnceLock::new();
+    SCHEMA.get_or_init(|| {
+        load(
+            "independent-report.schema.json",
+            include_str!("../../../contracts/independent-report.schema.json"),
+        )
+    })
+}
+
+/// `contracts/native-attempt.schema.json` (the runtime's export of a native agent attempt).
+pub fn native_attempt() -> &'static Schema {
+    static SCHEMA: OnceLock<Schema> = OnceLock::new();
+    SCHEMA.get_or_init(|| {
+        load(
+            "native-attempt.schema.json",
+            include_str!("../../../contracts/native-attempt.schema.json"),
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1082,6 +1142,26 @@ mod tests {
         assert!(fine.validate(&json!("x")).is_ok());
         assert!(fine.validate(&json!(1)).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn a_leading_negative_lookahead_of_a_literal_means_the_string_does_not_start_with_it() {
+        // contracts/independent-report.schema.json's `^(?!/)` (a relative path): the one `(?` group read, exactly as
+        // ECMA-262 means it; any other `(?` group stays refused.
+        let schema = Schema::new(json!({"pattern": "^(?!/)"})).map_err(|e| e.0);
+        let Ok(schema) = schema else {
+            panic!("{schema:?}");
+        };
+        assert!(schema.validate(&json!("a/b")).is_ok());
+        assert!(schema.validate(&json!("")).is_ok());
+        assert!(schema.validate(&json!("/etc")).is_err());
+        for refused in ["^(?!a)b", "(?!/)", "^(?=/)", "^(?!a|b)", r"^(?!\d)"] {
+            assert!(
+                Schema::new(json!({"pattern": refused})).is_err(),
+                "{refused}"
+            );
+        }
+        assert!(super::independent_report().validate(&json!({})).is_err());
     }
 
     #[test]
