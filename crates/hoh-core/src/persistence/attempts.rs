@@ -150,6 +150,9 @@ pub struct AttemptFacts {
     /// A writer's workspace when it starts (`{head}`, the HEAD commit or null), written as `attempt.workspace_start` in
     /// its RUNNING commit: the base of its changed files (docs/adr/ADR-028.md decisions 4 and 14).
     pub workspace_start: Option<Value>,
+    /// A verifier's handoff delivered as it starts: the message id and its package kept as an object (docs/adr/
+    /// ADR-028.md decision 9); its RUNNING commit acknowledges the message and records a `handoffs` row DELIVERED.
+    pub handoff_package: Option<Box<(String, super::runner::ArtifactRow)>>,
 }
 
 /// Move attempt `attempt_id` from `from` to `to`.

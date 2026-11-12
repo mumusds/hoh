@@ -52,8 +52,8 @@ pub use runner::{
 };
 pub use supervise::{Fired, Supervised};
 pub use team::{
-    Assignment, Availability, FileTeam, SessionGrant, TeamChange, TeamConfig, TeamMember, TeamView,
-    Unbound, session_id,
+    Assignment, Availability, FileTeam, Handoff, SessionGrant, TeamChange, TeamConfig, TeamMember,
+    TeamView, Unbound, session_id,
 };
 pub use wakes::{Allocated, SUPERVISION_TURN, Stop, Supervision};
 pub mod location;
