@@ -15,6 +15,7 @@ mod attempts;
 mod blockers;
 mod candidates;
 mod commands;
+mod completion;
 mod context;
 mod control;
 mod decide;
@@ -34,6 +35,7 @@ mod supervise;
 mod team;
 mod wakes;
 pub use candidates::{CandidateRow, Freeze, Frozen, RunAcceptance};
+pub use completion::{WriterCompleted, WriterCompletion, WriterOutcome};
 pub use control::{CancelPass, Finished, PauseStep};
 pub use evidence::{AcceptanceRow, Recording};
 pub use handover::SessionStart;
@@ -1276,6 +1278,15 @@ impl Store {
     /// content again in the run returns its id and state; another run's content is refused.
     pub async fn freeze_candidate(&self, freeze: Freeze) -> Result<Frozen, PersistError> {
         self.writer.freeze_candidate(freeze).await
+    }
+
+    /// A successful writer attempt's completion in one commit (docs/adr/ADR-028.md decisions 3 and 4): freeze, accept
+    /// and settle; or a protocol correction; or a decision. Nothing written when the attempt already ended.
+    pub async fn complete_writer_attempt(
+        &self,
+        completion: WriterCompletion,
+    ) -> Result<WriterCompleted, PersistError> {
+        self.writer.complete_writer_attempt(completion).await
     }
 
     /// Validate a plan (`$defs.PlanProposal`) for `run_id` and import it whole, or refuse it with nothing written
