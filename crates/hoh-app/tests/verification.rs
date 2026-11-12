@@ -1642,3 +1642,182 @@ async fn the_replica_judges_a_reconciled_record_as_the_product_did() -> R {
     assert_eq!(judged["members"][id][3], serde_json::json!([]));
     Ok(())
 }
+
+/// A process that opens `path` (a FIFO) from the other end after five seconds, so an old blocking open or read ends and
+/// the test with it; killed when the test is done.
+fn rescue(path: &Path, write: bool) -> R<std::process::Child> {
+    let script = if write {
+        "sleep 5; : > \"$0\""
+    } else {
+        "sleep 5; cat \"$0\" > /dev/null"
+    };
+    Ok(Command::new("timeout")
+        .args(["10", "sh", "-c", script])
+        .arg(path)
+        .spawn()?)
+}
+
+#[tokio::test]
+async fn a_record_file_that_is_not_the_record_it_names_holds_back_its_candidate() -> R {
+    // M2T10R-300: a published record file is the record object's bytes or the reconciliation refuses: changed, or no
+    // longer a regular file, it never lets the record be recorded as the facts say.
+    let (f, _, c, dir) = pending_qa(&[]).await?;
+    let execution = dir.join("execution.json");
+    let mut record: Value = serde_json::from_slice(&std::fs::read(&execution)?)?;
+    record["source_unchanged"] = Value::Bool(false);
+    std::fs::remove_file(&execution)?;
+    std::fs::write(&execution, serde_json::to_vec_pretty(&record)?)?;
+    let held = hoh_app::verify::check::reconcile(&f.store.evidence_handle(), &f.state(), &c).await;
+    assert!(
+        matches!(&held, Err(CheckError::Io(why)) if why.contains("execution.json")),
+        "{held:?}"
+    );
+    std::fs::remove_file(&execution)?;
+    assert!(Command::new("mkfifo").arg(&execution).status()?.success());
+    let mut other_end = rescue(&execution, true)?;
+    let began = std::time::Instant::now();
+    let held = hoh_app::verify::check::reconcile(&f.store.evidence_handle(), &f.state(), &c).await;
+    let took = began.elapsed();
+    let _ = other_end.kill();
+    let _ = other_end.wait();
+    assert!(
+        took < Duration::from_secs(3),
+        "the reconciliation blocked for {took:?}"
+    );
+    assert!(matches!(held, Err(CheckError::Io(_))), "{held:?}");
+    assert!(f.query("SELECT outcome FROM evidence")?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_object_or_a_lock_that_is_a_fifo_never_blocks_the_reconciliation() -> R {
+    // M2T10R-301: objects are read, and the record's lock opened, only as regular files and without blocking: a FIFO
+    // object is replaced by the record's own bytes; a FIFO lock is an error at once.
+    let (f, _, c, dir) = pending_qa(&[]).await?;
+    let facts: Value = serde_json::from_slice(&std::fs::read(dir.join("recording.json"))?)?;
+    let object = f
+        .root()
+        .join(facts["record_object"]["path"].as_str().ok_or("no path")?);
+    std::fs::remove_file(&object)?;
+    assert!(Command::new("mkfifo").arg(&object).status()?.success());
+    let mut other_end = rescue(&object, true)?;
+    let began = std::time::Instant::now();
+    let recorded = super_reconcile(&f, &c).await;
+    let took = began.elapsed();
+    let _ = other_end.kill();
+    let _ = other_end.wait();
+    assert!(
+        took < Duration::from_secs(3),
+        "blocked on the object for {took:?}"
+    );
+    assert_eq!(recorded?, 1);
+    assert!(std::fs::symlink_metadata(&object)?.file_type().is_file());
+    let (g, _, c2, dir2) = pending_qa(&[]).await?;
+    let lock = dir2.join(".lock");
+    let _ = std::fs::remove_file(&lock);
+    assert!(Command::new("mkfifo").arg(&lock).status()?.success());
+    let mut other_end = rescue(&lock, false)?;
+    let began = std::time::Instant::now();
+    let held = hoh_app::verify::check::reconcile(&g.store.evidence_handle(), &g.state(), &c2).await;
+    let took = began.elapsed();
+    let _ = other_end.kill();
+    let _ = other_end.wait();
+    assert!(
+        took < Duration::from_secs(3),
+        "blocked on the lock for {took:?}"
+    );
+    assert!(matches!(held, Err(CheckError::Io(_))), "{held:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_command_cannot_keep_its_own_run_from_its_record_through_the_lock_path() -> R {
+    // M2T10R-350: the record's lock is taken before the command runs and held to the commit, so a command that puts a
+    // FIFO where the lock was opened neither hangs the run nor loses its record.
+    let f = Fixture::with_qa(&format!(
+        "rm -f \"$HOH_EVIDENCE_DIR/../.lock\" && mkfifo \"$HOH_EVIDENCE_DIR/../.lock\"\n{QA_PASSES}"
+    ))
+    .await?;
+    let c = f.frozen().await?;
+    let ran = tokio::time::timeout(Duration::from_secs(20), f.run(&c, "qa", QA))
+        .await
+        .map_err(|_| "the run hung on the lock path")?
+        .map_err(|e| format!("{e:?}"))?;
+    assert_eq!(ran.outcome.status.code(), "PASS");
+    assert_eq!(f.query("SELECT outcome FROM evidence")?, ["PASS"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_lost_policy_or_spec_object_is_put_back_before_the_command_runs() -> R {
+    // M2T10R-352: the pre-check finds the frozen spec and policy objects there, or puts them back from the checkout it
+    // has just found unchanged, before the command runs; the record is then judged and recorded as any.
+    let f = Fixture::with_files(
+        PLAN,
+        QA_PASSES,
+        Arc::new(NoFaults),
+        &[("contracts/release-policy.json", policy("product"))],
+    )
+    .await?;
+    let c = f.frozen().await?;
+    for rel in [
+        "contracts/release-policy.json",
+        "contracts/requirements.json",
+    ] {
+        let (sha, _) = hoh_core::objects::hash_file(&f.root().join(rel))?;
+        std::fs::remove_file(f.root().join(hoh_core::objects::relative_path(&sha)))?;
+    }
+    let ran = f.run(&c, "qa", QA).await.map_err(|e| format!("{e:?}"))?;
+    assert_eq!(ran.outcome.status.code(), "PASS");
+    assert_eq!(f.query("SELECT outcome FROM evidence")?, ["PASS"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_pending_record_whose_policy_object_is_lost_is_held_never_judged_without_policy() -> R {
+    // M2T10R-353: the reconciliation reads no checkout; a frozen policy it cannot read is an error, never no policy.
+    let (f, _, c, _) = pending_qa(&[("contracts/release-policy.json", policy("product"))]).await?;
+    let (sha, _) = hoh_core::objects::hash_file(&f.root().join("contracts/release-policy.json"))?;
+    std::fs::remove_file(f.root().join(hoh_core::objects::relative_path(&sha)))?;
+    let held = hoh_app::verify::check::reconcile(&f.store.evidence_handle(), &f.state(), &c).await;
+    assert!(
+        matches!(&held, Err(CheckError::Io(why)) if why.contains("release policy")),
+        "{held:?}"
+    );
+    assert!(f.query("SELECT outcome FROM evidence")?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_damaged_evidence_object_is_put_back_from_its_matching_file() -> R {
+    // M2T10R-353: an object whose bytes no longer match its name is not taken as there; it is put back from the record
+    // file that still matches its digest.
+    let (f, _, c, dir) = pending_qa(&[]).await?;
+    let facts: Value = serde_json::from_slice(&std::fs::read(dir.join("recording.json"))?)?;
+    let artifact = facts["objects"]
+        .as_array()
+        .and_then(|a| a.iter().find(|o| o["kind"] == "artifact"))
+        .ok_or("no artifact object")?;
+    let object = f.root().join(artifact["path"].as_str().ok_or("no path")?);
+    let sha = artifact["sha256"].as_str().ok_or("no sha")?.to_owned();
+    std::fs::remove_file(&object)?;
+    std::fs::write(&object, b"damaged")?;
+    assert_eq!(super_reconcile(&f, &c).await?, 1);
+    assert_eq!(f.query("SELECT outcome FROM evidence")?, ["PASS"]);
+    assert_eq!(hoh_core::objects::hash_file(&object)?.0, sha);
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_next_run_on_an_unchanged_checkout_puts_a_lost_policy_back_and_records_what_was_pending()
+-> R {
+    // M2T10R-352: the pre-check comes before the reconciliation, so a run on the candidate's checkout puts the lost
+    // policy object back and the pending record is then recorded before the run's own.
+    let (f, _, c, _) = pending_qa(&[("contracts/release-policy.json", policy("product"))]).await?;
+    let (sha, _) = hoh_core::objects::hash_file(&f.root().join("contracts/release-policy.json"))?;
+    std::fs::remove_file(f.root().join(hoh_core::objects::relative_path(&sha)))?;
+    let ran = f.run(&c, "qa", QA).await.map_err(|e| format!("{e:?}"))?;
+    assert_eq!(ran.outcome.status.code(), "PASS");
+    assert_eq!(f.query("SELECT outcome FROM evidence")?, ["PASS", "PASS"]);
+    Ok(())
+}
