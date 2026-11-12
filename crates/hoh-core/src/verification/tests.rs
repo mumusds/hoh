@@ -1150,8 +1150,10 @@ fn an_evidences_rows_are_its_conclusions_on_the_specs_acceptance_criteria() -> R
         status: Status::Pass,
         reason: None,
     };
-    let codes = |rows: Vec<(String, Status)>| -> Vec<(String, &'static str)> {
-        rows.into_iter().map(|(a, s)| (a, s.code())).collect()
+    let codes = |rows: Vec<AcRow>| -> Vec<(String, &'static str)> {
+        rows.into_iter()
+            .map(|r| (r.ac_id, r.status.code()))
+            .collect()
     };
     // A PASS unit run: its scenario AC with all PASS lines is PASS; a skipped one has no row; another check's AC
     // fails on its FAIL line; an AC it says nothing of has no row.
@@ -1183,6 +1185,99 @@ fn an_evidences_rows_are_its_conclusions_on_the_specs_acceptance_criteria() -> R
     assert_eq!(
         codes(rows(&e, &blocked, &acs, false)),
         vec![("AC-002-01".to_owned(), "FAIL")]
+    );
+    Ok(())
+}
+
+#[test]
+fn a_rows_failing_lines_are_those_its_conclusion_failed_on() -> R {
+    // docs/adr/ADR-028.md implementation correction 5 (M2T16R-200): a FAIL row names the result lines its conclusion
+    // failed on: its FAIL lines and its DEGRADED lines that are not compliant (all of them when the check is not the
+    // TEST's scenario check or its requirement or check may not degrade; else those without a basis); a compliant
+    // DEGRADED line is never one, and a row that is not FAIL names none.
+    let c = manifest().seal();
+    let named = |name: &str, status: &str, based: bool| {
+        let mut v = json!({"schema_version": "1.0", "test_id": "TEST-001-01", "name": name, "status": status});
+        if based {
+            v["detail"] =
+                json!("pi plugin x unavailable; upstream: https://example.invalid/issue/1");
+        }
+        v
+    };
+    let ac = |check: &str, degradable: bool| AcSpec {
+        ac_id: "AC-001-01".to_owned(),
+        test_id: "TEST-001-01".to_owned(),
+        check_id: check.to_owned(),
+        degradable,
+    };
+    let of = |status: Status| Outcome {
+        status,
+        reason: None,
+    };
+    let mut e = e0(&c);
+    e.observations = vec![
+        named("test_001_01_broken", "FAIL", false),
+        named("test_001_01_based", "DEGRADED", true),
+        named("test_001_01_bare", "DEGRADED", false),
+        named("test_001_01_works", "PASS", false),
+    ];
+    let failing = |rows: Vec<AcRow>| -> Vec<(&'static str, Vec<String>)> {
+        rows.into_iter()
+            .map(|r| (r.status.code(), r.failing))
+            .collect()
+    };
+    let names = |n: &[&str]| n.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+    // Its scenario check, everything degradable: the FAIL line and the DEGRADED line without a basis.
+    assert_eq!(
+        failing(rows(&e, &of(Status::Fail), &[ac("unit", true)], true)),
+        [("FAIL", names(&["test_001_01_bare", "test_001_01_broken"]))]
+    );
+    // Not its scenario check, or a requirement or check that may not degrade: every DEGRADED line too.
+    for (check, degradable, check_degradable) in [
+        ("qa", true, true),
+        ("unit", false, true),
+        ("unit", true, false),
+    ] {
+        assert_eq!(
+            failing(rows(
+                &e,
+                &of(Status::Fail),
+                &[ac(check, degradable)],
+                check_degradable
+            )),
+            [(
+                "FAIL",
+                names(&[
+                    "test_001_01_bare",
+                    "test_001_01_based",
+                    "test_001_01_broken"
+                ])
+            )],
+            "{check} {degradable} {check_degradable}"
+        );
+    }
+    // A DEGRADED line without a basis fails the TEST alone.
+    e.observations = vec![
+        named("test_001_01_bare", "DEGRADED", false),
+        named("test_001_01_works", "PASS", false),
+    ];
+    assert_eq!(
+        failing(rows(&e, &of(Status::Degraded), &[ac("unit", true)], true)),
+        [("FAIL", names(&["test_001_01_bare"]))]
+    );
+    // Compliant: DEGRADED with no failing line; PASS with none.
+    e.observations = vec![
+        named("test_001_01_based", "DEGRADED", true),
+        named("test_001_01_works", "PASS", false),
+    ];
+    assert_eq!(
+        failing(rows(&e, &of(Status::Degraded), &[ac("unit", true)], true)),
+        [("DEGRADED", Vec::new())]
+    );
+    e.observations = vec![named("test_001_01_works", "PASS", false)];
+    assert_eq!(
+        failing(rows(&e, &of(Status::Pass), &[ac("unit", true)], true)),
+        [("PASS", Vec::new())]
     );
     Ok(())
 }

@@ -15,6 +15,8 @@ pub struct AcceptanceRow {
     pub spec_id: String,
     pub status: &'static str,
     pub reason: String,
+    /// A FAIL row's failing result lines' names, sorted (docs/adr/ADR-028.md implementation correction 5).
+    pub failing: Vec<String>,
 }
 
 /// What a check's driver hands the store after the command ran and its record was judged.
@@ -160,11 +162,12 @@ pub(super) fn record(
     let invalidated = match &round {
         Some((round_id, _)) if round_closed => tx
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM evidence ev JOIN attempts a ON a.attempt_id = ev.attempt_id \
-                 JOIN events o ON o.kind = 'verification.round_opened' AND json_extract(o.payload_json, '$.round_id') = ?1 \
-                 AND a.task_id IN (json_extract(o.payload_json, '$.tasks.qa'), json_extract(o.payload_json, '$.tasks.reviewer')) \
-                 WHERE ev.kind = 'check' AND ev.outcome = 'INVALID')",
-                params![round_id],
+                "SELECT EXISTS(SELECT 1 FROM events o JOIN attempts a ON a.task_id IN \
+                 (json_extract(o.payload_json, '$.tasks.qa'), json_extract(o.payload_json, '$.tasks.reviewer')) \
+                 JOIN evidence ev ON ev.attempt_id = a.attempt_id \
+                 WHERE o.run_id = ?2 AND o.kind = 'verification.round_opened' \
+                 AND json_extract(o.payload_json, '$.round_id') = ?1 AND ev.kind = 'check' AND ev.outcome = 'INVALID')",
+                params![round_id, run_id],
                 |row| row.get::<_, bool>(0),
             )
             .map_err(sqlite_error)?,
@@ -227,7 +230,7 @@ pub(super) fn record(
             "observations": job.observations, "reasons": job.reasons,
             "artifacts": objects.iter().map(ArtifactRow::json).collect::<Vec<_>>(),
             "rows": job.rows.iter().map(|row| json!({"ac_id": row.ac_id, "spec_id": row.spec_id,
-                "status": row.status, "reason": row.reason})).collect::<Vec<_>>(),
+                "status": row.status, "reason": row.reason, "failing": row.failing})).collect::<Vec<_>>(),
             "deferred_rows": deferred,
         }),
     )?;

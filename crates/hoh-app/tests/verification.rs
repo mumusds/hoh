@@ -5,7 +5,9 @@
 #![forbid(clippy::disallowed_methods)]
 #![forbid(unsafe_code)]
 
-use hoh_app::verify::check::{CheckError, Ran, Request, pre_check, run};
+use hoh_app::verify::check::{
+    CheckError, Launch, Ran, Request, checkouts_in_flight, pre_check, run, run_with,
+};
 use hoh_app::verify::freeze::{FreezeError, Inputs, freeze};
 use hoh_core::persistence::selftest::{PROBE_ARG, ProbeCommand};
 use hoh_core::persistence::{FaultHooks, Frozen, NoFaults, Options, PersistError, Store};
@@ -940,6 +942,41 @@ async fn a_check_past_its_timeout_fails_without_vetoing_its_candidate() -> R {
     Ok(())
 }
 
+#[tokio::test]
+async fn a_fail_rows_failing_lines_are_recorded_with_its_evidence() -> R {
+    // docs/adr/ADR-028.md implementation correction 5 (M2T16R-200): the check driver records with a FAIL row the lines
+    // its conclusion failed on, sorted: the FAIL line and the DEGRADED line (AC-001-01's requirement may not degrade),
+    // never the passing one.
+    let line = |name: &str, status: &str, extra: &str| {
+        format!(
+            r#"'{{"schema_version": "1.0", "test_id": "TEST-001-01", "name": "{name}", "status": "{status}"{extra}}}'"#
+        )
+    };
+    let qa = format!(
+        "printf '%s\\n' {} {} {} > \"$HOH_EVIDENCE_DIR/test-results.jsonl\"\nexit 1\n",
+        line("test_001_01_works", "PASS", ""),
+        line("test_001_01_broken", "FAIL", ""),
+        line(
+            "test_001_01_bare",
+            "DEGRADED",
+            r#", "detail": "pi plugin x unavailable; upstream: https://example.invalid/issue/1""#
+        ),
+    );
+    let f = Fixture::with_qa(&qa).await?;
+    let c = f.frozen().await?;
+    let ran = f.run(&c, "qa", QA).await.map_err(|e| format!("{e:?}"))?;
+    assert_eq!(ran.outcome.status.code(), "FAIL", "{:?}", ran.reasons);
+    assert_eq!(
+        f.query(
+            "SELECT json_extract(r.value, '$.ac_id') || ' ' || json_extract(r.value, '$.status') || ' ' || \
+             json_extract(r.value, '$.failing') FROM events e, json_each(e.payload_json, '$.rows') r \
+             WHERE e.kind = 'evidence.recorded'"
+        )?,
+        [r#"AC-001-01 FAIL ["test_001_01_bare","test_001_01_broken"]"#]
+    );
+    Ok(())
+}
+
 /// Principle one's replica, scripts/product/traceability.py, on the fixture's records: per record its outcome, its row
 /// on AC-001-01 (decision 9: its conclusion on TEST-001-01, a vetoed record's INVALID only where it is the scenario
 /// check or names the TEST) and its reasons; the TEST's status over all of them; the invalid members' reasons.
@@ -1201,6 +1238,104 @@ async fn a_dropped_run_still_stops_its_command_and_records_it_interrupted() -> R
     assert!(
         record["duration_seconds"].as_f64().unwrap_or(99.0) < 20.0,
         "{record}"
+    );
+    Ok(())
+}
+
+/// Whether checkout `0` was held as read by a check at each commit after it was set.
+#[derive(Debug, Default)]
+struct HeldAtCommit(std::sync::Mutex<(Option<PathBuf>, Vec<bool>)>);
+
+impl FaultHooks for HeldAtCommit {
+    fn before_commit(&self) -> Result<(), PersistError> {
+        if let Ok(mut seen) = self.0.lock()
+            && let Some(checkout) = seen.0.clone()
+        {
+            seen.1.push(checkouts_in_flight().contains(&checkout));
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_check_holds_its_checkout_from_its_command_to_its_record() -> R {
+    // M2T16R-150, -251 (docs/adr/ADR-028.md decision 8): the check driver holds the checkout it reads while its command
+    // runs and until its evidence is committed, so no removal of a run directory takes it from under the check; after,
+    // it is released.
+    let f = Fixture::new().await?;
+    let c = f.frozen().await?;
+    let checkout = f.root();
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let (during, held) = (seen.clone(), checkout.clone());
+    let ran = run_with(
+        &f.store,
+        &f.root(),
+        &f.state(),
+        &Request {
+            candidate_id: c.clone(),
+            check_id: "qa".to_owned(),
+            argv: QA.iter().map(|a| (*a).to_owned()).collect(),
+            producer_attempt_id: "Q/attempt-1".to_owned(),
+        },
+        Launch {
+            env: Vec::new(),
+            adopt: Some(Box::new(move |_pid| {
+                if let Ok(mut d) = during.lock() {
+                    *d = Some(checkouts_in_flight().contains(&held));
+                }
+            })),
+        },
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
+    assert_eq!(ran.outcome.status.code(), "PASS", "{:?}", ran.reasons);
+    assert_eq!(
+        *seen.lock().map_err(|e| e.to_string())?,
+        Some(true),
+        "held while its command runs"
+    );
+    assert!(
+        !checkouts_in_flight().contains(&checkout),
+        "released after its record"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_cancelled_checks_finishing_keeps_its_checkout_until_its_record() -> R {
+    // docs/adr/ADR-028.md test plan -158 (M2T16R-150, -251): the attempt's check is cancelled (its run dropped, as an
+    // attempt's cancel drops it); the finishing that stops the command and records it interrupted still holds the
+    // checkout when it commits the evidence, and releases it after.
+    let probe = Arc::new(HeldAtCommit::default());
+    let f = Fixture::with(PLAN, QA_PASSES, probe.clone()).await?;
+    let c = f.frozen().await?;
+    let checkout = f.root();
+    if let Ok(mut seen) = probe.0.lock() {
+        seen.0 = Some(checkout.clone());
+    }
+    let started = tokio::time::timeout(
+        Duration::from_secs(2),
+        f.run(&c, "sleepy", &["bash", "-c", "sleep 30"]),
+    )
+    .await;
+    assert!(started.is_err(), "still running: {started:?}");
+    let mut outcomes = Vec::new();
+    for _ in 0..200 {
+        outcomes = f.query("SELECT outcome FROM evidence")?;
+        if !outcomes.is_empty() && !checkouts_in_flight().contains(&checkout) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(outcomes, ["FAIL"]);
+    let at_commits = probe.0.lock().map_err(|e| e.to_string())?.1.clone();
+    assert!(
+        !at_commits.is_empty() && at_commits.iter().all(|h| *h),
+        "held at each commit: {at_commits:?}"
+    );
+    assert!(
+        !checkouts_in_flight().contains(&checkout),
+        "released after its record"
     );
     Ok(())
 }

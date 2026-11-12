@@ -128,3 +128,21 @@ fn run_directories_sit_beside_the_commanders_session_directories() {
         Path::new("/s/hoh/runs/p/C%2Fround%2F1%2Ftask%2Fqa%2Fattempt-1")
     );
 }
+
+#[tokio::test]
+async fn a_run_directory_a_check_still_reads_is_never_removed_under_it() -> R {
+    // M2T16R-150, -250 (docs/adr/ADR-028.md decision 8): every removal of a run directory (a settle, the reconcile of
+    // an ended attempt, the per-tick removal) keeps one whose checkout a check still finishing holds; once that check
+    // ended, the next removal takes it.
+    let dir = tempfile::tempdir()?;
+    let run = dir.path().join("run");
+    std::fs::create_dir_all(run.join("src"))?;
+    let finishing = crate::verify::check::hold_checkout(&run);
+    remove(&run);
+    remove_off_thread(run.clone()).await;
+    assert!(run.join("src").exists(), "kept while its check finishes");
+    drop(finishing);
+    remove_off_thread(run.clone()).await;
+    assert!(!run.exists(), "removed once it ended");
+    Ok(())
+}

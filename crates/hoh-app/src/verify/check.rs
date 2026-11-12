@@ -662,7 +662,7 @@ pub(crate) fn hold_checkout(checkout: &Path) -> CheckoutHold {
 }
 
 /// The checkouts a check still finishing reads.
-pub(crate) fn checkouts_in_flight() -> std::collections::BTreeSet<std::path::PathBuf> {
+pub fn checkouts_in_flight() -> std::collections::BTreeSet<std::path::PathBuf> {
     IN_FLIGHT
         .lock()
         .map(|held| held.keys().cloned().collect())
@@ -1443,16 +1443,17 @@ fn judge(reader: &Reader, at: &Judged<'_>, facts: &Facts) -> Result<(Recording, 
                 })
             })
             .collect();
-        for (ac_id, status) in rows(e, &outcome, &acs, check_degradable) {
+        for row in rows(e, &outcome, &acs, check_degradable) {
             let test = acs
                 .iter()
-                .find(|a| a.ac_id == ac_id)
+                .find(|a| a.ac_id == row.ac_id)
                 .map(|a| a.test_id.clone())
                 .unwrap_or_default();
             rows_out.push(AcceptanceRow {
-                ac_id,
+                ac_id: row.ac_id,
                 spec_id: acceptance.spec_id.clone(),
-                status: status.code(),
+                status: row.status.code(),
+                failing: row.failing,
                 reason: if reasons.is_empty() {
                     format!("{test} in check {}", e.record.check_id)
                 } else {

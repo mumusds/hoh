@@ -616,12 +616,12 @@ pub(super) fn reconcile(
                     .prepare(
                         "SELECT message_id FROM outbox WHERE state IN ('PENDING', 'DELIVERING') AND (message_id = ?1 \
                          OR message_id IN (SELECT json_extract(payload_json, '$.to') FROM events \
-                           WHERE kind = 'verification.handoff_reissued' AND json_extract(payload_json, '$.round_id') = ?2 \
-                           AND json_extract(payload_json, '$.role') = ?3))",
+                           WHERE run_id = ?4 AND kind = 'verification.handoff_reissued' \
+                           AND json_extract(payload_json, '$.round_id') = ?2 AND json_extract(payload_json, '$.role') = ?3))",
                     )
                     .map_err(sqlite_error)?;
                 let untaken: Vec<String> = statement
-                    .query_map(params![original, round.id, role], |r| r.get(0))
+                    .query_map(params![original, round.id, role, run_id], |r| r.get(0))
                     .map_err(sqlite_error)?
                     .collect::<Result<_, _>>()
                     .map_err(sqlite_error)?;
@@ -829,7 +829,10 @@ fn classify_round(
             // The item is the AC and its failing tests (decision 12, M2T16R-06): another failure of it is another item.
             let mut tests = BTreeSet::new();
             for (_, evidence_id, _, _, reason) in visible.iter().filter(|r| r.0 == "FAIL") {
-                tests.extend(failing_tests(tx, evidence_id, reason)?);
+                tests.extend(failing_tests(
+                    &row_of_evidence(tx, evidence_id, ac)?,
+                    reason,
+                ));
             }
             // One item per failing test (implementation correction 4, M2T16R-100): a test failing every round is the
             // same item whatever fails beside it.
@@ -847,7 +850,7 @@ fn classify_round(
         for row in &e.rows {
             let ac = row["ac_id"].as_str().unwrap_or_default();
             if row["status"] == json!("FAIL") && !round.scope.iter().any(|s| s == ac) {
-                let tests = failing_tests(tx, &e.id, row["reason"].as_str().unwrap_or_default())?;
+                let tests = failing_tests(row, row["reason"].as_str().unwrap_or_default());
                 if tests.is_empty() {
                     failed.push((None, format!("ac-fail:{ac}")));
                 }
@@ -881,18 +884,12 @@ fn classify_round(
     ))
 }
 
-/// The failing tests of evidence `evidence_id` for the TEST its row's reason names (`<TEST> in check <check>…`): the
-/// names of its FAIL result lines of that TEST, sorted; the TEST itself when it has none named (decision 12).
-fn failing_tests(
+/// Evidence `evidence_id`'s row on AC `ac` as its event recorded it (`Null` when there is none).
+fn row_of_evidence(
     tx: &Transaction<'_>,
     evidence_id: &str,
-    reason: &str,
-) -> Result<Vec<String>, PersistError> {
-    let test = reason
-        .split(" in check")
-        .next()
-        .unwrap_or_default()
-        .to_owned();
+    ac: &str,
+) -> Result<Value, PersistError> {
     let payload: Option<String> = tx
         .query_row(
             "SELECT payload_json FROM events WHERE event_id = ?1",
@@ -904,17 +901,30 @@ fn failing_tests(
     let payload: Value = payload
         .and_then(|p| serde_json::from_str(&p).ok())
         .unwrap_or(Value::Null);
-    let mut names: BTreeSet<String> = payload["observations"]
+    Ok(payload["rows"]
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|o| o["status"] == json!("FAIL") && o["test_id"] == json!(test))
-        .filter_map(|o| o["name"].as_str().map(str::to_owned))
+        .find(|r| r["ac_id"] == json!(ac))
+        .cloned()
+        .unwrap_or(Value::Null))
+}
+
+/// The failing tests of a FAIL row `row`: the failing lines the check driver judged it to have (docs/adr/ADR-028.md
+/// implementation correction 5), never chosen again here; the TEST its reason names (`<TEST> in check <check>…`)
+/// when it names none (decision 12).
+fn failing_tests(row: &Value, reason: &str) -> Vec<String> {
+    let mut names: BTreeSet<String> = row["failing"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|n| n.as_str().map(str::to_owned))
         .collect();
+    let test = reason.split(" in check").next().unwrap_or_default();
     if names.is_empty() && !test.is_empty() {
-        names.insert(test);
+        names.insert(test.to_owned());
     }
-    Ok(names.into_iter().collect())
+    names.into_iter().collect()
 }
 
 /// An item `kind` with what names it (`kind:a<sep>b`), or `kind` alone when nothing does.

@@ -221,12 +221,11 @@ pub(super) async fn check_at_reconcile(
 /// At the host's start (docs/adr/ADR-028.md decision 16): the run directories of project `project_id` under `runs`
 /// and the request directories in the project at `project` that no attempt of `live` uses, removed. Blocking.
 pub(super) fn remove_unused(project: &Path, runs: &Path, project_id: &str, live: &[String]) {
-    // A live attempt's, and one a check still finishing reads (its attempt ended by a cancel, M2T16R-150).
-    let mut kept: std::collections::BTreeSet<PathBuf> = live
+    // A live attempt's; one a check still finishing reads is kept by the removal itself (M2T16R-150, -250).
+    let kept: std::collections::BTreeSet<PathBuf> = live
         .iter()
         .map(|a| rundir::dir_of(runs, project_id, a))
         .collect();
-    kept.extend(crate::verify::check::checkouts_in_flight());
     if let Some(own) = rundir::dir_of(runs, project_id, "-").parent() {
         for entry in std::fs::read_dir(own).into_iter().flatten().flatten() {
             if !kept.contains(&entry.path()) {
