@@ -1341,6 +1341,16 @@ async fn a_developers_completed_result_is_frozen_accepted_and_settled_in_one_com
             "the write lease expires at the attempt's end"
         );
         assert!(project.join(".hoh/environment.json").is_file());
+        // Its start's HEAD, recorded in its RUNNING commit: the base of its changed files (decisions 4, 14).
+        assert_eq!(
+            state(
+                "SELECT json_extract(payload_json, '$.head') FROM events WHERE kind = 'attempt.workspace_start' \
+                 AND json_extract(payload_json, '$.attempt_id') = 'T-RESULT/attempt-1' AND seq < (SELECT seq FROM \
+                 events WHERE kind = 'attempt.moved' AND json_extract(payload_json, '$.attempt_id') = 'T-RESULT/attempt-1' \
+                 AND json_extract(payload_json, '$.to') = 'SETTLED')"
+            )?,
+            git(&project, &["rev-parse", "HEAD"])?.trim()
+        );
         R::Ok(())
     }
     .await;

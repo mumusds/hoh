@@ -850,6 +850,20 @@ fn running(
         .started_at
         .clone()
         .unwrap_or_else(|| crate::time::rfc3339_utc(std::time::SystemTime::now()));
+    // A writer's workspace at its start, in this commit (docs/adr/ADR-028.md decisions 4 and 14).
+    let workspace_start = facts.workspace_start.clone().map(|start| {
+        let mut payload = json!({"attempt_id": attempt_id});
+        if let (Some(payload), Some(start)) = (payload.as_object_mut(), start.as_object()) {
+            payload.extend(start.clone());
+        }
+        event(
+            &project_id,
+            &run_id,
+            child_id(attempt_id, "workspace_start"),
+            "attempt.workspace_start",
+            payload,
+        )
+    });
     attempts::move_attempt(
         &tx,
         &AttemptMove {
@@ -878,7 +892,7 @@ fn running(
         &tx,
         &Commit {
             cas,
-            events: packed.into_iter().chain([
+            events: packed.into_iter().chain(workspace_start).chain([
                 event(
                     &project_id,
                     &run_id,
