@@ -36,8 +36,8 @@ pub struct Parsed {
     pub refused: Vec<Refused>,
 }
 
-/// Parse `lines` (non-empty bridge lines, in order) against `identity`: a line is a TaskResult (it has `status`) or an
-/// HCP message (it has `message_id`); either must hold under the protocol schema and name this attempt's run, task,
+/// Parse `lines` (non-empty bridge lines, in order) against `identity`: a line is a TaskResult (it has `status`, whatever
+/// else it holds) or else an HCP message (it has `message_id`); either must hold under the protocol schema and name this attempt's run, task,
 /// attempt, role and role epoch. Only `query` and `steer` messages are kept; anything else is refused, alone. The last
 /// TaskResult-shaped line decides the result: refused, the result is invalid.
 pub fn parse(lines: &[String], identity: &Identity) -> Parsed {
@@ -65,12 +65,10 @@ pub fn parse(lines: &[String], identity: &Identity) -> Parsed {
     parsed
 }
 
-/// A JSON object with `status` and no `message_id`: meant as a TaskResult, valid or not.
+/// A JSON object with `status`, whatever else it holds: meant as a TaskResult, valid or not (M2T16D-504).
 fn result_shaped(text: &str) -> bool {
-    serde_json::from_str::<Value>(text).is_ok_and(|v| {
-        v.as_object()
-            .is_some_and(|o| o.contains_key("status") && !o.contains_key("message_id"))
-    })
+    serde_json::from_str::<Value>(text)
+        .is_ok_and(|v| v.as_object().is_some_and(|o| o.contains_key("status")))
 }
 
 enum Line {
@@ -81,7 +79,21 @@ enum Line {
 fn line(text: &str, identity: &Identity) -> Result<Line, String> {
     let value: Value = serde_json::from_str(text).map_err(|e| format!("not JSON: {e}"))?;
     let object = value.as_object().ok_or("not a JSON object")?;
-    if object.contains_key("message_id") {
+    if object.contains_key("status") {
+        let result: TaskResult =
+            protocol::decode(&value).map_err(|e| format!("not a TaskResult: {e}"))?;
+        same(
+            identity,
+            [
+                ("run_id", &result.run_id),
+                ("task_id", &result.task_id),
+                ("attempt_id", &result.attempt_id),
+                ("role", &result.role),
+            ],
+            result.role_epoch,
+        )?;
+        Ok(Line::Result(Box::new(result)))
+    } else if object.contains_key("message_id") {
         let message: Message =
             protocol::decode(&value).map_err(|e| format!("not an HCP Message: {e}"))?;
         if !matches!(message.kind, MessageKind::Query | MessageKind::Steer) {
@@ -101,20 +113,6 @@ fn line(text: &str, identity: &Identity) -> Result<Line, String> {
             message.role_epoch,
         )?;
         Ok(Line::Message(Box::new(message)))
-    } else if object.contains_key("status") {
-        let result: TaskResult =
-            protocol::decode(&value).map_err(|e| format!("not a TaskResult: {e}"))?;
-        same(
-            identity,
-            [
-                ("run_id", &result.run_id),
-                ("task_id", &result.task_id),
-                ("attempt_id", &result.attempt_id),
-                ("role", &result.role),
-            ],
-            result.role_epoch,
-        )?;
-        Ok(Line::Result(Box::new(result)))
     } else {
         Err("neither a TaskResult nor an HCP Message".to_owned())
     }

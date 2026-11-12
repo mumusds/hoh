@@ -112,3 +112,18 @@ fn the_last_task_result_shaped_line_decides_even_when_it_is_invalid() {
     let none = parse(&lines(&[message("steer")]), &identity());
     assert_eq!((none.task_result, none.result_invalid), (None, false));
 }
+
+#[test]
+fn a_last_line_with_status_and_a_message_id_is_still_a_task_result_and_invalid() {
+    // docs/adr/ADR-028.md decision 2 (M2T16D-504): an object with `status` is TaskResult-shaped whatever else it holds; a
+    // FAILED that also carries a message_id is refused, and the earlier COMPLETED is not returned.
+    let mut late = result("FAILED", "with a stray message id");
+    late["message_id"] = json!("m9");
+    let parsed = parse(&lines(&[result("COMPLETED", "early"), late]), &identity());
+    assert_eq!(parsed.task_result, None);
+    assert!(parsed.result_invalid);
+    assert_eq!(
+        parsed.refused.iter().map(|r| r.line).collect::<Vec<_>>(),
+        [1]
+    );
+}
