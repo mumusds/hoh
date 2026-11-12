@@ -1973,3 +1973,176 @@ async fn a_lock_path_that_is_a_link_or_a_fifo_with_a_reader_is_refused() -> R {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn a_command_changing_its_record_directory_is_recorded_whatever_it_changed() -> R {
+    // M2T10R-500, -501: permissions taken away and HoH's own logs or directory swapped for others of the same type are
+    // changes recorded (INVALID), never an abort or a held candidate; a command rebuilding its own artifacts/ only
+    // writes its output, and its run is judged on it.
+    for (label, script, invalid) in [
+        (
+            "stdout made unreadable",
+            "chmod 000 \"$HOH_EVIDENCE_DIR/../stdout.log\"; exit 1",
+            true,
+        ),
+        (
+            "the record directory made read-only",
+            "printf '%s\\n' '{\"schema_version\": \"1.0\", \"test_id\": \"TEST-001-01\", \"name\": \"t\", \"status\": \"PASS\"}' > \"$HOH_EVIDENCE_DIR/test-results.jsonl\"; chmod 0555 \"$HOH_EVIDENCE_DIR/..\"",
+            true,
+        ),
+        (
+            "stdout swapped for another file",
+            "mv \"$HOH_EVIDENCE_DIR/../stdout.log\" \"$HOH_EVIDENCE_DIR/../old.log\" && printf REPLACED > \"$HOH_EVIDENCE_DIR/../stdout.log\"",
+            true,
+        ),
+        (
+            "the record directory swapped for another",
+            "d=\"$(dirname \"$HOH_EVIDENCE_DIR\")\"; mv \"$d\" \"$d.old\" && mkdir -p \"$HOH_EVIDENCE_DIR\" && : > \"$d/stdout.log\" && : > \"$d/stderr.log\"",
+            true,
+        ),
+        (
+            "its own artifacts rebuilt",
+            "rm -rf \"$HOH_EVIDENCE_DIR\" && mkdir \"$HOH_EVIDENCE_DIR\"",
+            false,
+        ),
+    ] {
+        let f = Fixture::with_qa(&format!("{script}\n{QA_PASSES}")).await?;
+        let c = f.frozen().await?;
+        let ran = f
+            .run(&c, "qa", QA)
+            .await
+            .map_err(|e| format!("{label}: {e:?}"))?;
+        assert_eq!(
+            ran.outcome.status.code() == "INVALID",
+            invalid,
+            "{label}: {:?}",
+            ran.outcome
+        );
+        assert_eq!(f.query("SELECT count(*) FROM evidence")?, ["1"], "{label}");
+        let again = f.run(&c, "qa", QA).await;
+        assert!(again.is_ok(), "{label}: the candidate is held: {again:?}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn every_change_a_command_makes_to_its_record_directory_is_named_and_none_stops_the_run() -> R
+{
+    // M2T10R-550, -552, -553: each case is recorded INVALID with its own change named in full, the run never aborts and
+    // the candidate is never held; a command planting HoH's pending file for its own record is one of them.
+    for (label, script, change) in [
+        (
+            "stderr turned into a directory holding a closed one",
+            "rm \"$HOH_EVIDENCE_DIR/../stderr.log\" && mkdir -p \"$HOH_EVIDENCE_DIR/../stderr.log/x\" && chmod 0500 \"$HOH_EVIDENCE_DIR/../stderr.log/x\" \"$HOH_EVIDENCE_DIR/../stderr.log\"",
+            "the command removed or replaced stderr.log in its record directory",
+        ),
+        (
+            "stderr made unreadable",
+            "chmod 000 \"$HOH_EVIDENCE_DIR/../stderr.log\"",
+            "the command changed the permissions of stderr.log",
+        ),
+        (
+            "artifacts replaced by a file",
+            "rm -rf \"$HOH_EVIDENCE_DIR\" && : > \"$HOH_EVIDENCE_DIR\"; exit 0",
+            "the command replaced its artifacts directory",
+        ),
+        (
+            "the record directory removed",
+            "rm -rf \"$(dirname \"$HOH_EVIDENCE_DIR\")\"",
+            "the command removed or replaced its record directory",
+        ),
+        (
+            "HoH's pending file planted",
+            "mkdir -p \"$HOH_EVIDENCE_DIR/../../../../../pending\" && printf '{' > \"$HOH_EVIDENCE_DIR/../../../../../pending/$HOH_CHECK_RECORD_ID.json\"",
+            "the command wrote HoH's pending file for its record",
+        ),
+    ] {
+        let f = Fixture::with_qa(&format!("{script}\n{QA_PASSES}")).await?;
+        let c = f.frozen().await?;
+        let ran = f
+            .run(&c, "qa", QA)
+            .await
+            .map_err(|e| format!("{label}: {e:?}"))?;
+        assert_eq!(ran.outcome.status.code(), "INVALID", "{label}");
+        let integrity =
+            f.query("SELECT payload_json FROM events WHERE kind = 'integrity_violation'")?;
+        let named: Vec<String> = integrity
+            .iter()
+            .filter_map(|p| serde_json::from_str::<Value>(p).ok())
+            .flat_map(|p| {
+                p["reasons"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|r| r.as_str().map(str::to_owned))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(named.iter().any(|r| r == change), "{label}: {named:?}");
+        let again = f.run(&c, "qa", QA).await;
+        assert!(again.is_ok(), "{label}: the candidate is held: {again:?}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_pending_record_is_recorded_only_under_its_own_candidate_and_check() -> R {
+    // M2T10R-551: pending facts are bound to the record directory by candidate and check as well as by record id.
+    let (f, _, c, dir) = pending_qa(&[]).await?;
+    let record_id = dir
+        .file_name()
+        .ok_or("no name")?
+        .to_string_lossy()
+        .into_owned();
+    // A directory of the same record id under another candidate's evidence (probe X2 of the review).
+    let other = format!("CAND-{}", "b".repeat(64));
+    let elsewhere = f
+        .state()
+        .join("evidence")
+        .join(&other)
+        .join("qa")
+        .join(&record_id);
+    std::fs::create_dir_all(&elsewhere)?;
+    let refused =
+        hoh_app::verify::check::reconcile(&f.store.evidence_handle(), &f.state(), &other).await;
+    assert!(
+        matches!(&refused, Err(CheckError::Io(why)) if why.contains(&other)),
+        "{refused:?}"
+    );
+    assert!(!elsewhere.join("execution.json").exists());
+    assert_eq!(f.query("SELECT state FROM candidates")?, ["FROZEN"]);
+    std::fs::remove_dir(&elsewhere)?;
+    assert_eq!(super_reconcile(&f, &c).await?, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_committed_records_pending_file_and_lock_are_removed() -> R {
+    // M2T10R-554: once its evidence is recorded, a record's pending facts and lock are no longer kept.
+    let f = Fixture::new().await?;
+    let c = f.frozen().await?;
+    let ran = f.run(&c, "qa", QA).await.map_err(|e| format!("{e:?}"))?;
+    assert!(!pending_of(&f, &ran.record_dir).exists());
+    assert!(
+        !f.state()
+            .join("locks")
+            .join(format!("{}.lock", ran.record_id))
+            .exists()
+    );
+    let (g, _, c2, dir) = pending_qa(&[]).await?;
+    assert!(pending_of(&g, &dir).exists());
+    assert_eq!(super_reconcile(&g, &c2).await?, 1);
+    assert!(!pending_of(&g, &dir).exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn hohs_locks_left_unignored_after_the_freeze_are_refused_before_the_run() -> R {
+    // M2T10R-553: the guard names locks/ as it names evidence/.
+    let f = Fixture::new().await?;
+    let c = f.frozen().await?;
+    std::fs::write(f.state().join(".gitignore"), "*\n!locks/\n!locks/**\n")?;
+    let reasons = check_refused(f.pre_check(&c, "qa", QA, "Q/attempt-1")?)?;
+    assert!(reasons.iter().any(|r| r.contains("locks")), "{reasons:?}");
+    Ok(())
+}
