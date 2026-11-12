@@ -253,7 +253,7 @@ pub fn hash_file(file: &Path) -> Result<(String, u64), String> {
 }
 
 /// The regular file `file`, opened without blocking; anything else refused without being read (M2T10R-04, -203).
-fn open_regular(file: &Path) -> Result<std::fs::File, String> {
+pub fn open_regular(file: &Path) -> Result<std::fs::File, String> {
     use rustix::fs::{Mode, OFlags};
     let at = |e: std::io::Error| format!("{}: {e}", file.display());
     let fd = rustix::fs::open(

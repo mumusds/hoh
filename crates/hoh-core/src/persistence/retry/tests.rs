@@ -376,6 +376,72 @@ async fn a_work_attempts_bridge_lines_are_kept_with_its_observed_effect_whatever
 }
 
 #[tokio::test]
+async fn a_work_attempts_lines_are_kept_once_whether_or_not_its_work_was_observed() -> R {
+    // docs/adr/ADR-028.md decision 2 (M2T16D-404, -456): an attempt that ends UNKNOWN_EFFECT never has its work
+    // OBSERVED, yet its bridge lines are kept by its end; one whose work was OBSERVED keeps them once; a bridge read cut
+    // at its limit says so.
+    for observed_first in [false, true] {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = open(&dir)?;
+        Connection::open(&path)?.execute_batch(&format!(
+            "{WORLD}
+             UPDATE tasks SET state = 'RUNNING', revision = 3 WHERE task_id = 'T1';
+             INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, started_at) VALUES
+               ('A1', 'T1', 'RUNNING', 1, 1, 1, '2026-11-07T00:00:00Z');
+             INSERT INTO effects(effect_key, attempt_id, state) VALUES ('{}', 'A1', 'STARTED');",
+            crate::reconcile::work_key("A1")
+        ))?;
+        let lines = vec!["{\"status\": \"COMPLETED\"}".to_owned()];
+        if observed_first {
+            assert!(
+                store
+                    .runner_effect(
+                        "A1",
+                        &crate::reconcile::work_key("A1"),
+                        crate::reconcile::EffectState::Started,
+                        crate::reconcile::EffectState::Observed,
+                        json!({"success": true, "detail": "turn", "messages": lines, "messages_truncated": true}),
+                    )
+                    .await?
+            );
+        }
+        assert!(
+            store
+                .runner_finished(
+                    "A1",
+                    Ending {
+                        success: observed_first,
+                        detail: "turn".to_owned(),
+                        class: FailureClass::Transient { retry_after: None },
+                        at: at("2026-11-07T00:00:05Z")?,
+                        draw: 0,
+                        observed: crate::persistence::Observed {
+                            messages: lines.clone(),
+                            messages_truncated: true,
+                            ..Default::default()
+                        },
+                        unknown_effect: !observed_first,
+                    },
+                )
+                .await?
+        );
+        let kept: Vec<String> = {
+            let conn = Connection::open(&path)?;
+            let mut q =
+                conn.prepare("SELECT payload_json FROM events WHERE kind = 'attempt.outputs'")?;
+            q.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?
+        };
+        assert_eq!(kept.len(), 1, "observed first: {observed_first}");
+        let kept: Value = serde_json::from_str(&kept[0])?;
+        assert_eq!(
+            (kept["lines"].clone(), kept["truncated"].clone()),
+            (json!(lines), json!(true))
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_repair_asked_again_for_the_same_action_is_decided_once() -> R {
     // docs/adr/ADR-028.md decision 12 (M2T16D-09): a barrier's close or a correction asks for its repair inside its own
     // transaction and may run again after a crash before or after it committed; the same action is counted once and
@@ -584,6 +650,7 @@ async fn an_ending_records_what_the_agents_turn_showed() -> R {
                     raw_log_path: Some("/logs/a".to_owned()),
                     workspace: None,
                     messages: Vec::new(),
+                    messages_truncated: false,
                     artifacts: Vec::new(),
                     artifacts_failed: Vec::new(),
                 },
