@@ -1118,6 +1118,24 @@ async fn a_verifiers_request_to_change_the_candidate_is_refused_with_an_issue_an
         ["m3:developer"]
     );
     assert_eq!(texts(&path, "SELECT issue_id FROM issues")?.len(), 2);
+    // The wait-for view (decision 13): refused and deferred requests are never queued, so no edge; a query from qa to
+    // the developer still PENDING is one (the positive control), an ACKED one is not.
+    assert_eq!(
+        store.reader()?.wait_for("R")?,
+        Vec::<(String, String)>::new()
+    );
+    Connection::open(&path)?.execute_batch(
+        "INSERT INTO outbox(message_id, event_seq, run_id, recipient_role, role_epoch, payload_json, state) \
+         SELECT 'q-open', max(seq), 'R', 'developer', 1, \
+           json_object('kind', 'query', 'sender_role', 'qa', 'recipient_role', 'developer'), 'PENDING' FROM events;
+         INSERT INTO outbox(message_id, event_seq, run_id, recipient_role, role_epoch, payload_json, state) \
+         SELECT 'q-done', max(seq), 'R', 'qa', 1, \
+           json_object('kind', 'steer', 'sender_role', 'reviewer', 'recipient_role', 'qa'), 'ACKED' FROM events;",
+    )?;
+    assert_eq!(
+        store.reader()?.wait_for("R")?,
+        [("qa".to_owned(), "developer".to_owned())]
+    );
     Ok(())
 }
 
@@ -2155,5 +2173,82 @@ async fn a_candidate_whose_pending_records_failed_to_recover_has_its_verifiers_h
         dispatched.push(d.task_id);
     }
     assert_eq!(dispatched, [id("task/qa"), id("task/reviewer")]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_source_whose_candidates_verifiers_tampered_with_is_frozen_anew_until_the_reverify_limit()
+-> R {
+    // Decisions 11 and 12 (M2T16D-256, -750, -751): a candidate made INVALID with no planned-check veto in its round
+    // (a verifier changed its run directory) closes its round superseded and sends D back to be frozen anew, counted by
+    // Repair::Reverify keyed refreeze/D across candidates (never reset by a new one); the third time is past
+    // REVERIFY_LIMIT: D waits for a decision.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    for (n, tree) in ['b', 'c', 'd'].into_iter().enumerate() {
+        let attempt = if n == 0 {
+            "A".to_owned()
+        } else {
+            format!("A{n}")
+        };
+        if n > 0 {
+            Connection::open(&path)?.execute_batch(&format!(
+                "UPDATE tasks SET state = 'RUNNING', revision = revision + 1 WHERE task_id = 'D';
+                 INSERT INTO attempts(attempt_id, task_id, session_id, state, role_epoch, host_epoch, config_revision,
+                   started_at) VALUES ('{attempt}', 'D', 'sd', 'RUNNING', 1, 1, 1, '2026-11-12T00:00:0{n}Z');"
+            ))?;
+        }
+        let job = freeze_of(tree);
+        let candidate = job.sealed.candidate_id.clone();
+        let done = store
+            .complete_writer_attempt(WriterCompletion {
+                attempt_id: attempt.clone(),
+                ..completion(freeze(job, result_of("D", &attempt)?))
+            })
+            .await?;
+        assert!(
+            matches!(done, WriterCompleted::Verifying { .. }),
+            "{n}: {done:?}"
+        );
+        settle_verifiers(&store, &path, "PASS", "PASS").await?;
+        Connection::open(&path)?.execute(
+            "UPDATE candidates SET state = 'INVALID' WHERE candidate_id = ?1",
+            rusqlite::params![candidate],
+        )?;
+        let closed = store
+            .reconcile_verification("R", Default::default())
+            .await?;
+        assert_eq!(
+            closed
+                .closed
+                .iter()
+                .map(|(_, v)| v.as_str())
+                .collect::<Vec<_>>(),
+            ["superseded"],
+            "{n}"
+        );
+        let state = texts(&path, "SELECT state FROM tasks WHERE task_id = 'D'")?;
+        if n < 2 {
+            assert_eq!(state, ["READY"], "{n}: frozen anew");
+        } else {
+            assert_eq!(state, ["BLOCKED"], "past the limit");
+        }
+    }
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT CAST(json_extract(payload_json, '$.count') AS TEXT) || ':' || json_extract(payload_json, '$.round_root') \
+             FROM events WHERE kind = 'repair.reverify' ORDER BY seq"
+        )?,
+        ["1:refreeze/D", "2:refreeze/D"]
+    );
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT json_extract(payload_json, '$.reason') FROM events WHERE kind = 'need_decision' \
+             AND json_extract(payload_json, '$.task_id') = 'D'"
+        )?,
+        ["reverify_exhausted"]
+    );
     Ok(())
 }

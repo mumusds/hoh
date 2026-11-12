@@ -1773,6 +1773,25 @@ impl Reader {
             .map_err(sqlite_error)
     }
 
+    /// Run `run_id`'s wait-for view (docs/adr/ADR-028.md decision 13): one edge, sender role to recipient role, per
+    /// unfinished request between roles (a query or steer PENDING or DELIVERING in the outbox). A refused or deferred
+    /// request is never queued, so it makes no edge.
+    pub fn wait_for(&self, run_id: &str) -> Result<Vec<(String, String)>, PersistError> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT json_extract(payload_json, '$.sender_role'), recipient_role FROM outbox \
+                 WHERE run_id = ?1 AND state IN ('PENDING', 'DELIVERING') \
+                 AND json_extract(payload_json, '$.kind') IN ('query', 'steer') \
+                 AND json_extract(payload_json, '$.sender_role') IS NOT NULL ORDER BY 1, 2",
+            )
+            .map_err(sqlite_error)?;
+        let rows = statement
+            .query_map(rusqlite::params![run_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(sqlite_error)?;
+        rows.collect::<Result<_, _>>().map_err(sqlite_error)
+    }
+
     /// The attempts still live (PREPARED, STARTING or RUNNING): whose run directories and requests are kept.
     pub fn live_attempts(&self) -> Result<Vec<String>, PersistError> {
         let mut statement = self
