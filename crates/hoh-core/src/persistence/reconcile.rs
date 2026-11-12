@@ -34,6 +34,8 @@ pub struct UnfinishedRow {
     /// work observed done is completed from its bridge, which must name them (docs/adr/ADR-028.md decisions 2, 4).
     pub role: String,
     pub writer: bool,
+    /// Its task is a verification round's verifier (docs/adr/ADR-028.md decision 11).
+    pub verifier: bool,
     pub role_epoch: i64,
     pub pid: Option<i64>,
     pub boot_id: Option<String>,
@@ -209,6 +211,7 @@ fn scan(
                 |r| r.get(0),
             )
             .map_err(sqlite_error)?;
+        let verifier = super::verification::round_of_task(conn, &run_id, &task_id)?.is_some();
         rows.push(UnfinishedRow {
             project_id: project_id.to_owned(),
             run_id,
@@ -217,6 +220,7 @@ fn scan(
             attempt_id,
             task_id,
             task_revision,
+            verifier,
             role,
             writer: task_writer,
             role_epoch,
@@ -474,6 +478,18 @@ fn apply(
             expected_revision: row.task_revision,
             change: Change::Task(to),
         });
+    } else if attempt_to == Some(AttemptState::UnknownEffect)
+        && let Some((cas, decision)) = super::verification::unknown_effect(
+            &tx,
+            (&row.project_id, &row.run_id, &row.task_id),
+            (row.task_state, row.task_revision),
+            &row.attempt_id,
+        )?
+    {
+        // A verifier's unknown effect waits for a decision (docs/adr/ADR-028.md decision 11).
+        task_to = Some(TaskState::Blocked);
+        task_moves.push(cas);
+        task_events.push(decision);
     }
     let mut events = vec![NewEvent {
         project_id: row.project_id.clone(),

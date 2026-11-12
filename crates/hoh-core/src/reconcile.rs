@@ -106,6 +106,9 @@ pub struct Unfinished {
     /// Its task holds the write lease's role (`tasks.writer`): its success is its completion (docs/adr/ADR-028.md
     /// decision 4), never the generic settle.
     pub writer: bool,
+    /// Its task is a verification round's verifier: its success is settled by the result in its bridge too
+    /// (docs/adr/ADR-028.md decision 11).
+    pub verifier: bool,
 }
 
 /// What an effect becomes.
@@ -212,7 +215,7 @@ pub fn dispose(u: &Unfinished) -> Disposition {
         // A writer's success is its completion, not the generic settle (docs/adr/ADR-028.md decision 4).
         Some(Some(true))
             if u.state == AttemptState::Running
-                && u.writer
+                && (u.writer || u.verifier)
                 && u.task_state == TaskState::Running =>
         {
             return Disposition::Complete { effects: moves };
@@ -270,6 +273,7 @@ mod tests {
             lease_expired: false,
             work_outcome: Some(true),
             writer: false,
+            verifier: false,
         }
     }
 
@@ -454,6 +458,17 @@ mod tests {
                 effects: vec![],
                 task_to: None
             }
+        );
+        // A verifier's success is settled from its bridge too (docs/adr/ADR-028.md decision 11).
+        let mut verifier = unfinished(
+            AttemptState::Running,
+            gone(),
+            vec![effect(&work_key("A"), EffectState::Committed, None)],
+        );
+        verifier.verifier = true;
+        assert_eq!(
+            dispose(&verifier),
+            Disposition::Complete { effects: vec![] }
         );
         // A writer's failure ends as any attempt's does.
         let mut failed = unfinished(

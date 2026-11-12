@@ -112,6 +112,134 @@ pub(super) fn complete(
     Ok(done)
 }
 
+/// What the host decided from a successful verifier attempt's bridge (docs/adr/ADR-028.md decision 11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifierOutcome {
+    /// Its TaskResult is COMPLETED: settled, its task IMPLEMENTED.
+    Settle,
+    /// Its result is missing, invalid or cut: one counted protocol correction within its round.
+    Correct { reasons: Vec<String> },
+    /// A legal FAILED, BLOCKED or INCOMPLETE result: verified again within its round, counted by `Repair::Reverify`.
+    Reverify { status: String, reason: String },
+}
+
+/// A verifier attempt's completion.
+#[derive(Debug, Clone)]
+pub struct VerifierCompletion {
+    pub attempt_id: String,
+    pub ending: Ending,
+    pub outcome: VerifierOutcome,
+}
+
+/// What a verifier's completion did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifierCompleted {
+    Settled,
+    Corrected { verdict: RepairVerdict },
+    Reverified { verdict: RepairVerdict },
+    AlreadyEnded,
+    Cancelled,
+}
+
+/// Complete verifier attempt `job.attempt_id` in one commit (docs/adr/ADR-028.md decision 11).
+pub(super) fn complete_verifier(
+    conn: &mut Connection,
+    job: &VerifierCompletion,
+    ctx: &super::writer::Ctx<'_>,
+) -> Result<VerifierCompleted, PersistError> {
+    let tx = writer::begin(conn, ctx)?;
+    let attempt: Option<(String, bool, String, String, String, i64)> = tx
+        .query_row(
+            "SELECT a.state, a.cancel_requested, t.task_id, t.run_id, r.project_id, t.revision FROM attempts a \
+             JOIN tasks t ON t.task_id = a.task_id JOIN runs r ON r.run_id = t.run_id WHERE a.attempt_id = ?1",
+            params![job.attempt_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some((state, cancelled, task_id, run_id, project_id, revision)) = attempt else {
+        return Err(PersistError::IntegrityViolation(format!(
+            "no attempt {}",
+            job.attempt_id
+        )));
+    };
+    if state != "RUNNING" {
+        return Ok(VerifierCompleted::AlreadyEnded);
+    }
+    let finish = |tx: Transaction<'_>, done| -> Result<VerifierCompleted, PersistError> {
+        super::runner::finished_in(&tx, &job.attempt_id, &job.ending, ctx)?;
+        ctx.before_commit()?;
+        tx.commit().map_err(sqlite_error)?;
+        Ok(done)
+    };
+    if cancelled {
+        return finish(tx, VerifierCompleted::Cancelled);
+    }
+    let (round_id, root) =
+        super::verification::round_of_task(&tx, &run_id, &task_id)?.ok_or_else(|| {
+            PersistError::IntegrityViolation(format!("{task_id} is no round's verifier"))
+        })?;
+    let task = Task {
+        project_id,
+        run_id,
+        task_id,
+        revision,
+    };
+    let (done, status) = match &job.outcome {
+        VerifierOutcome::Settle => (VerifierCompleted::Settled, "COMPLETED".to_owned()),
+        VerifierOutcome::Correct { reasons } => (
+            VerifierCompleted::Corrected {
+                verdict: correct_attempt(&tx, &job.attempt_id, &task, reasons, ctx)?,
+            },
+            "missing".to_owned(),
+        ),
+        VerifierOutcome::Reverify { status, reason } => {
+            let request = RepairRequest {
+                run_id: task.run_id.clone(),
+                task_id: task.task_id.clone(),
+                repair: Repair::Reverify { root: root.clone() },
+                limit: super::retry::REVERIFY_LIMIT,
+                detail: reason.clone(),
+                action_id: Some(job.attempt_id.clone()),
+            };
+            let (verdict, mut commit) = super::retry::repair_in(&tx, &request)?;
+            if let RepairVerdict::Granted { .. } = verdict {
+                commit.cas.push(StateCas {
+                    id: task.task_id.clone(),
+                    expected_revision: task.revision,
+                    change: Change::Task(TaskState::Ready),
+                });
+                commit.events.push(NewEvent {
+                    project_id: task.project_id.clone(),
+                    event_id: child_id(&job.attempt_id, "reverify"),
+                    run_id: Some(task.run_id.clone()),
+                    kind: "task.reverify".to_owned(),
+                    payload: json!({"task_id": task.task_id, "attempt_id": job.attempt_id, "round_id": round_id,
+                        "round_root": root, "status": status, "reason": reason}),
+                });
+            }
+            writer::write(&tx, &commit, ctx)?;
+            (VerifierCompleted::Reverified { verdict }, status.clone())
+        }
+    };
+    writer::write(
+        &tx,
+        &Commit {
+            events: vec![NewEvent {
+                project_id: task.project_id.clone(),
+                event_id: child_id(&job.attempt_id, "verification_result"),
+                run_id: Some(task.run_id.clone()),
+                kind: "verification.result".to_owned(),
+                payload: json!({"attempt_id": job.attempt_id, "task_id": task.task_id, "round_id": round_id,
+                    "result_status": status}),
+            }],
+            ..Commit::default()
+        },
+        ctx,
+    )?;
+    finish(tx, done)
+}
+
 struct Task {
     project_id: String,
     run_id: String,
@@ -235,7 +363,20 @@ fn correct(
     reasons: &[String],
     ctx: &super::writer::Ctx<'_>,
 ) -> Result<WriterCompleted, PersistError> {
-    let root = chain_root(tx, &task.task_id, &job.attempt_id)?;
+    correct_attempt(tx, &job.attempt_id, task, reasons, ctx)
+        .map(|verdict| WriterCompleted::Corrected { verdict })
+}
+
+/// One counted protocol correction of `attempt_id`'s output (docs/adr/ADR-028.md decision 12): the task READY when
+/// granted, BLOCKED for a decision when refused.
+fn correct_attempt(
+    tx: &Transaction<'_>,
+    attempt_id: &str,
+    task: &Task,
+    reasons: &[String],
+    ctx: &super::writer::Ctx<'_>,
+) -> Result<RepairVerdict, PersistError> {
+    let root = chain_root(tx, &task.task_id, attempt_id)?;
     let limit = repair_limit(tx, &task.run_id, "protocol")?;
     let request = RepairRequest {
         run_id: task.run_id.clone(),
@@ -245,7 +386,7 @@ fn correct(
         },
         limit,
         detail: reasons.join("; "),
-        action_id: Some(job.attempt_id.clone()),
+        action_id: Some(attempt_id.to_owned()),
     };
     let (verdict, mut commit) = super::retry::repair_in(tx, &request)?;
     if let RepairVerdict::Granted { .. } = verdict {
@@ -256,16 +397,16 @@ fn correct(
         });
         commit.events.push(NewEvent {
             project_id: task.project_id.clone(),
-            event_id: child_id(&job.attempt_id, "protocol_correction"),
+            event_id: child_id(attempt_id, "protocol_correction"),
             run_id: Some(task.run_id.clone()),
             kind: "task.protocol_correction".to_owned(),
             payload: json!({
-                "task_id": task.task_id, "attempt_id": job.attempt_id, "root": root, "reasons": reasons,
+                "task_id": task.task_id, "attempt_id": attempt_id, "root": root, "reasons": reasons,
             }),
         });
     }
     writer::write(tx, &commit, ctx)?;
-    Ok(WriterCompleted::Corrected { verdict })
+    Ok(verdict)
 }
 
 /// The task BLOCKED for a decision, with the reason.

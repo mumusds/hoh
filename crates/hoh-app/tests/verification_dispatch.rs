@@ -325,6 +325,19 @@ impl hoh_app::host::Executor for Team {
                 if let Ok(mut dirs) = self.run_dirs.lock() {
                     dirs.push((role.to_owned(), work.run_dir.clone()));
                 }
+                // A verifier reports its work done through its bridge, as the product's agent does.
+                if work.assignment.handoff.is_some() {
+                    messages.push(
+                        json!({
+                            "schema_version": "1.0", "run_id": work.run_id, "task_id": work.task_id,
+                            "attempt_id": work.attempt_id, "role": work.role,
+                            "role_epoch": work.assignment.role_epoch, "status": "COMPLETED",
+                            "summary": "verified", "candidate_id": null, "evidence": [], "issues": [],
+                            "next_action": "report"
+                        })
+                        .to_string(),
+                    );
+                }
             }
         }
         let qa_script = self.qa_script.lock().ok().and_then(|s| s.clone());
@@ -875,6 +888,23 @@ async fn each_verifier_works_in_a_checkout_of_the_candidate_outside_the_project_
             &|r| r.as_array().is_some_and(|a| a.len() == 2),
         )?;
         assert_eq!(checked, json!([{"equal": 1}, {"equal": 1}]));
+        // Their COMPLETED results settle them, each recorded (docs/adr/ADR-028.md decision 11).
+        wait_for(
+            &project,
+            &clock,
+            step,
+            "SELECT json_extract(payload_json, '$.result_status') AS status FROM events \
+             WHERE kind = 'verification.result' ORDER BY seq",
+            &|r| r.as_array().is_some_and(|a| a.len() == 2),
+        )?;
+        assert_eq!(
+            rows(
+                &project,
+                "SELECT DISTINCT json_extract(payload_json, '$.result_status') AS status FROM events \
+                 WHERE kind = 'verification.result'"
+            )?,
+            json!([{"status": "COMPLETED"}])
+        );
         wait_for(
             &project,
             &clock,

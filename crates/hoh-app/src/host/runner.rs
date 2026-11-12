@@ -1037,6 +1037,12 @@ async fn attempt(
             .await?;
         return Ok(());
     }
+    // A verifier's success is settled, corrected or verified again by the result in its bridge (decision 11).
+    if verifier.is_some() && ending.success && !unknown {
+        super::completion::complete_verifier(store, &identity_of(&work)?, ending).await?;
+        remove_run_dir();
+        return Ok(());
+    }
     // An interrupted writer's end goes with its workspace's record (REQ-019 behaviour 6, docs/adr/ADR-024.md
     // decision 9), its processes proven gone above.
     let id = id.as_str();
@@ -1406,6 +1412,7 @@ async fn settle(
         lease_expired: cause == "lease_expired" || row.lease_expired,
         work_outcome: row.work_outcome,
         writer: row.writer,
+        verifier: row.verifier,
     });
     super::reconcile::apply(
         store,
