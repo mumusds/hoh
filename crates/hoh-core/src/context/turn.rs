@@ -37,8 +37,36 @@ pub struct Facts {
     pub candidate: Option<(String, String, String)>,
     /// A Commander turn's header: the values its decision names, in order.
     pub header: Vec<(String, String)>,
+    /// A work turn's identity header (docs/adr/ADR-028.md decision 2): the executor sets it, the store does not.
+    pub identity: Option<AttemptIdentity>,
     pub params: Option<Params>,
     pub entries: Vec<Entry>,
+}
+
+/// The identity a work attempt's every output must repeat, and where its outputs go (docs/adr/ADR-028.md decision 2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptIdentity {
+    pub run_id: String,
+    pub task_id: String,
+    pub attempt_id: String,
+    pub role: String,
+    pub role_epoch: i64,
+    /// Its bridge file: one JSON object per line, its TaskResult and the messages it sends.
+    pub bridge: String,
+    /// A verifier's: what it verifies and its helpers.
+    pub verified: Option<Verified>,
+}
+
+/// What a verification attempt verifies (docs/adr/ADR-028.md decisions 2 and 7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Verified {
+    /// The development tasks of its round: the tasks it verifies, not its own.
+    pub source_task_ids: Vec<String>,
+    /// The candidate's identity, field by field: candidate_id and its five digests.
+    pub candidate: Vec<(String, String)>,
+    /// Its request helpers: `run-check <check_id>` and `ask <message.json>`.
+    pub run_check: String,
+    pub ask: String,
 }
 
 impl Facts {
@@ -70,7 +98,43 @@ pub fn mandatory(
         Some((sha256, revision)) => format!("spec_sha256：{sha256}\nspec revision：{revision}"),
         None => "spec：尚无 spec".to_owned(),
     };
-    let mut task = String::from("#### 作用域\n");
+    let mut task = String::new();
+    if let Some(id) = &facts.identity {
+        task.push_str("#### 本次 Attempt（身份头：每个输出的这些字段须与此逐项一致）\n");
+        for (key, value) in [
+            ("run_id", id.run_id.as_str()),
+            ("task_id", id.task_id.as_str()),
+            ("attempt_id", id.attempt_id.as_str()),
+            ("role", id.role.as_str()),
+        ] {
+            task.push_str(&format!("- {key}：{value}\n"));
+        }
+        task.push_str(&format!("- role_epoch：{}\n", id.role_epoch));
+        task.push_str(&format!(
+            "- 输出文件（TaskResult 与发出的消息，每行一个 JSON 对象）：{}\n",
+            id.bridge
+        ));
+        if let Some(v) = &id.verified {
+            task.push_str(&format!(
+                "- 被验证的任务（不是本 Task）：{}\n",
+                v.source_task_ids.join(", ")
+            ));
+            task.push_str("- 被测候选：\n");
+            for (key, value) in &v.candidate {
+                task.push_str(&format!("  - {key}：{value}\n"));
+            }
+            task.push_str(&format!(
+                "- 运行检查计划条目：{} <check_id>（以检查的退出码结束，被拒为 2）\n",
+                v.run_check
+            ));
+            task.push_str(&format!(
+                "- 发送消息：{} <message.json>（等待回应：rejected 或 deferred）\n",
+                v.ask
+            ));
+        }
+        task.push('\n');
+    }
+    task.push_str("#### 作用域\n");
     if facts.no_task {
         task.push_str("本唤醒不涉及具体任务\n");
     }

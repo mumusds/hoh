@@ -1029,6 +1029,76 @@ fn a_runs_own_shares_are_the_caps() -> R {
 }
 
 #[test]
+fn a_work_turn_starts_with_its_identity_header_and_a_verifier_also_names_its_source_tasks_and_candidate()
+-> R {
+    // docs/adr/ADR-028.md decision 2 (M2T16D-10): the identity every output must repeat is a mandatory item, first in
+    // the task context; a verifier's names the task it verifies apart from its own, the candidate's six digests and its
+    // helpers.
+    let developer = Facts {
+        identity: Some(super::AttemptIdentity {
+            run_id: "R".to_owned(),
+            task_id: "T1".to_owned(),
+            attempt_id: "T1/attempt-2".to_owned(),
+            role: "developer".to_owned(),
+            role_epoch: 3,
+            bridge: "/p/.hoh/attempts/T1-attempt-2/messages.jsonl".to_owned(),
+            verified: None,
+        }),
+        ..Facts::default()
+    };
+    let m = super::mandatory(&developer, "developer", "", None, None)?;
+    assert!(m.task.starts_with("#### 本次 Attempt"), "{}", m.task);
+    for want in [
+        "- run_id：R",
+        "- task_id：T1",
+        "- attempt_id：T1/attempt-2",
+        "- role：developer",
+        "- role_epoch：3",
+        "/p/.hoh/attempts/T1-attempt-2/messages.jsonl",
+    ] {
+        assert!(m.task.contains(want), "{want}: {}", m.task);
+    }
+    assert!(!m.task.contains("被验证的任务"), "{}", m.task);
+    let qa = Facts {
+        identity: Some(super::AttemptIdentity {
+            role: "qa".to_owned(),
+            task_id: "V1".to_owned(),
+            verified: Some(super::Verified {
+                source_task_ids: vec!["T1".to_owned(), "T2".to_owned()],
+                candidate: [
+                    ("candidate_id", "CAND-9"),
+                    ("git_commit", "c"),
+                    ("git_tree", "t"),
+                    ("spec_sha256", "s"),
+                    ("environment_sha256", "e"),
+                    ("test_plan_sha256", "p"),
+                ]
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .to_vec(),
+                run_check: "/p/.hoh/attempts/V1/run-check".to_owned(),
+                ask: "/p/.hoh/attempts/V1/ask".to_owned(),
+            }),
+            ..developer.identity.clone().ok_or("identity")?
+        }),
+        ..Facts::default()
+    };
+    let m = super::mandatory(&qa, "qa", "", None, None)?;
+    let header = &m.task[..m.task.find("#### 作用域").ok_or("no scope")?];
+    for want in [
+        "- task_id：V1",
+        "- role：qa",
+        "被验证的任务（不是本 Task）：T1, T2",
+        "- candidate_id：CAND-9",
+        "- test_plan_sha256：p",
+        "/p/.hoh/attempts/V1/run-check",
+        "/p/.hoh/attempts/V1/ask",
+    ] {
+        assert!(header.contains(want), "{want}: {header}");
+    }
+    Ok(())
+}
+
+#[test]
 fn a_turns_mandatory_items_say_what_is_missing_instead_of_leaving_it_out() -> R {
     let none = Facts::default();
     let m = super::mandatory(&none, "developer", "", None, None)?;
