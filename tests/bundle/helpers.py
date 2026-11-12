@@ -1,11 +1,19 @@
 """Synthetic unit fixtures. NEVER exported as real product acceptance evidence."""
 from pathlib import Path
-import copy,json,os,shutil,subprocess,sys,tempfile
+import copy,json,os,shlex,shutil,subprocess,sys,tempfile
 from datetime import datetime,timedelta,timezone
 ROOT=Path(__file__).resolve().parents[2]
 sys.path.insert(0,str(ROOT/'tools'))
 from common import atomic_json,load_json,ref_for,sha256
 from candidate import freeze
+
+def own_python(bin_dir: Path, rest: str) -> str:
+    """A PATH for a fixture's subprocesses whose python3 is the interpreter running these tests: the product's scripts
+    that a check runs by `python3` then judge under requirements-dev.txt's jsonschema, as a real run_check runs them
+    under the project's environment, whatever PATH the tests were started with (M2T10R-750, -800). Writes the shim
+    into `bin_dir`; `rest` follows it."""
+    shim=bin_dir/'python3';shim.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n');shim.chmod(0o755)
+    return f'{bin_dir}:{rest}'
 
 def json_file(root,path,data):
     p=root/path;atomic_json(p,data);return ref_for(p,root)
