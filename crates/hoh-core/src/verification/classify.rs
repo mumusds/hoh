@@ -36,15 +36,17 @@ pub enum Row {
     Stale,
 }
 
-/// One in-scope AC's projection over its rows on the candidate (the same rule as M2-T18's, AC-053-02).
+/// One in-scope AC's projection over its rows on the candidate: AC-053-02's history rule, except that FAIL beside PASS
+/// is Failed rather than FLAKY, on purpose (it reworks, docs/adr/ADR-028.md decision 11, M2T16D-854). M2-T18's join
+/// gives its AC dimension to this function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ac {
     /// Only PASS and, on a degradable requirement, compliant DEGRADED.
     Satisfied,
     /// A FAIL row (with or without PASS), or DEGRADED where the requirement is not degradable.
     Failed,
-    /// A FLAKY row, or UNKNOWN, BLOCKED or INVALID with a PASS: retesting the same candidate cannot satisfy it
-    /// (REQ-053 decision 1).
+    /// A FLAKY row, or any row other than PASS and compliant DEGRADED beside a PASS (UNKNOWN, BLOCKED, NOT_RUN, STALE,
+    /// INVALID): retesting the same candidate cannot satisfy it (REQ-053 decision 1).
     Flaky,
     /// No observation: no row, or only NOT_RUN, UNKNOWN, BLOCKED, STALE or INVALID (an empty observation's
     /// INVALID(INSUFFICIENT); a vetoed evidence's comes with the candidate INVALID, handled before classifying).
@@ -58,13 +60,13 @@ pub fn project(rows: &[Row], degradable: bool) -> Ac {
         return Ac::Failed;
     }
     let passed = has(Row::Pass) || has(Row::Degraded);
-    if has(Row::Flaky) || (passed && (has(Row::Unknown) || has(Row::Blocked) || has(Row::Invalid)))
-    {
+    let only_passed = rows.iter().all(|r| matches!(r, Row::Pass | Row::Degraded));
+    // Any other row beside a PASS stays on the candidate: the AC cannot be satisfied there any more (ADR-027 principle
+    // one: a row other than PASS and compliant DEGRADED leaves it unsatisfied; M2T16D-803).
+    if has(Row::Flaky) || (passed && !only_passed) {
         return Ac::Flaky;
     }
     if passed {
-        // PASS and compliant DEGRADED, with only NOT_RUN or STALE beside them: an earlier run that observed nothing
-        // does not undo a later one that observed the criterion met.
         return Ac::Satisfied;
     }
     Ac::Undetermined

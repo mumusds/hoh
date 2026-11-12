@@ -4,7 +4,7 @@ use super::*;
 fn an_acs_projection_covers_every_acceptance_status() {
     // docs/adr/ADR-028.md decision 11 (M2T16D-401, -451, -452): every history of rows has one projection.
     use Row::*;
-    let cases: [(&[Row], bool, Ac); 18] = [
+    let cases: [(&[Row], bool, Ac); 19] = [
         (&[], false, Ac::Undetermined),
         (&[Pass], false, Ac::Satisfied),
         (&[Pass, Pass], false, Ac::Satisfied),
@@ -21,7 +21,10 @@ fn an_acs_projection_covers_every_acceptance_status() {
         (&[Unknown], false, Ac::Undetermined),
         (&[Blocked, Stale], false, Ac::Undetermined),
         (&[Invalid], false, Ac::Undetermined),
-        (&[NotRun, Pass], false, Ac::Satisfied),
+        // Any row beside PASS but compliant DEGRADED stays on the candidate and leaves the AC unsatisfiable there
+        // (ADR-027 principle one, M2T16D-803).
+        (&[NotRun, Pass], false, Ac::Flaky),
+        (&[Stale, Pass], false, Ac::Flaky),
         // An empty observation's INVALID(INSUFFICIENT) stays on this candidate: like FLAKY, a later PASS cannot clear it.
         (&[Invalid, Pass], false, Ac::Flaky),
     ];
