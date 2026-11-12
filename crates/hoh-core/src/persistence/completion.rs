@@ -115,12 +115,22 @@ pub(super) fn complete(
 /// What the host decided from a successful verifier attempt's bridge (docs/adr/ADR-028.md decision 11).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerifierOutcome {
-    /// Its TaskResult is COMPLETED: settled, its task IMPLEMENTED.
-    Settle,
+    /// Its TaskResult is COMPLETED and its report valid: settled, its task IMPLEMENTED, its report registered.
+    Settle { report: Box<VerifierReport> },
     /// Its result is missing, invalid or cut: one counted protocol correction within its round.
     Correct { reasons: Vec<String> },
     /// A legal FAILED, BLOCKED or INCOMPLETE result: verified again within its round, counted by `Repair::Reverify`.
     Reverify { status: String, reason: String },
+}
+
+/// A verifier's report kept as objects (docs/adr/ADR-028.md decision 15): its status and its two objects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifierReport {
+    pub role: String,
+    /// PASS, FAIL or UNKNOWN.
+    pub status: String,
+    pub report: super::runner::ArtifactRow,
+    pub native_attempt: super::runner::ArtifactRow,
 }
 
 /// A verifier attempt's completion.
@@ -185,14 +195,56 @@ pub(super) fn complete_verifier(
         task_id,
         revision,
     };
+    let event = |name: &str, kind: &str, payload: serde_json::Value| NewEvent {
+        project_id: task.project_id.clone(),
+        event_id: child_id(&job.attempt_id, name),
+        run_id: Some(task.run_id.clone()),
+        kind: kind.to_owned(),
+        payload,
+    };
     let (done, status) = match &job.outcome {
-        VerifierOutcome::Settle => (VerifierCompleted::Settled, "COMPLETED".to_owned()),
-        VerifierOutcome::Correct { reasons } => (
-            VerifierCompleted::Corrected {
-                verdict: correct_attempt(&tx, &job.attempt_id, &task, reasons, ctx)?,
-            },
-            "missing".to_owned(),
-        ),
+        VerifierOutcome::Settle { report } => {
+            // Its report, kept and named for the round's classification (decision 15).
+            super::runner::register(&tx, &[report.report.clone(), report.native_attempt.clone()])?;
+            writer::write(
+                &tx,
+                &Commit {
+                    events: vec![event(
+                        "verification_report",
+                        "verification.report",
+                        json!({"attempt_id": job.attempt_id, "task_id": task.task_id, "round_id": round_id,
+                            "role": report.role, "status": report.status,
+                            "report": {"path": report.report.path, "sha256": report.report.sha256},
+                            "native_attempt": {"path": report.native_attempt.path,
+                                "sha256": report.native_attempt.sha256}}),
+                    )],
+                    ..Commit::default()
+                },
+                ctx,
+            )?;
+            (VerifierCompleted::Settled, "COMPLETED".to_owned())
+        }
+        VerifierOutcome::Correct { reasons } => {
+            writer::write(
+                &tx,
+                &Commit {
+                    events: vec![event(
+                        "output_invalid",
+                        "verification.output_invalid",
+                        json!({"attempt_id": job.attempt_id, "task_id": task.task_id, "round_id": round_id,
+                            "reasons": reasons}),
+                    )],
+                    ..Commit::default()
+                },
+                ctx,
+            )?;
+            (
+                VerifierCompleted::Corrected {
+                    verdict: correct_attempt(&tx, &job.attempt_id, &task, reasons, ctx)?,
+                },
+                "missing".to_owned(),
+            )
+        }
         VerifierOutcome::Reverify { status, reason } => {
             let request = RepairRequest {
                 run_id: task.run_id.clone(),

@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::persistence::{
-    ArtifactRow, ChangeRequest, Deferred, Options, Store, VerifierRequest, selftest,
+    ArtifactRow, ChangeRequest, Deferred, Options, Store, VerifierReport, VerifierRequest, selftest,
 };
 use crate::verification::{FileRef, Manifest};
 use rusqlite::Connection;
@@ -1178,9 +1178,38 @@ async fn a_verifiers_completed_result_settles_it_and_its_task_is_done() -> R {
     let (store, path) = open(dir.path())?;
     let (round, task, attempt) = verifier_running(&store, &path).await?;
     let done = store
-        .complete_verifier_attempt(verifier_completion(&attempt, VerifierOutcome::Settle))
+        .complete_verifier_attempt(verifier_completion(
+            &attempt,
+            VerifierOutcome::Settle {
+                report: Box::new(VerifierReport {
+                    role: "qa".to_owned(),
+                    status: "PASS".to_owned(),
+                    report: object(7, "independent_report", "report.json"),
+                    native_attempt: object(8, "native_attempt", "attempt.json"),
+                }),
+            },
+        ))
         .await?;
     assert_eq!(done, VerifierCompleted::Settled);
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT json_extract(payload_json, '$.role') || ':' || json_extract(payload_json, '$.status') || ':' || \
+             json_extract(payload_json, '$.report.sha256') FROM events WHERE kind = 'verification.report'"
+        )?,
+        [format!("qa:PASS:{}", object(7, "", "").sha256)]
+    );
+    assert_eq!(
+        texts(
+            &path,
+            &format!(
+                "SELECT path FROM artifacts WHERE sha256 = '{}'",
+                object(8, "", "").sha256
+            )
+        )?
+        .len(),
+        1
+    );
     assert_eq!(
         texts(
             &path,
@@ -1294,6 +1323,13 @@ async fn a_verifiers_missing_result_is_a_protocol_correction_and_an_unknown_effe
             &format!("SELECT state FROM tasks WHERE task_id = '{task}'")
         )?,
         ["READY"]
+    );
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT json_extract(payload_json, '$.reasons[0]') FROM events WHERE kind = 'verification.output_invalid'"
+        )?,
+        ["it wrote no TaskResult to its bridge"]
     );
     let second = format!("{task}/attempt-2");
     Connection::open(&path)?.execute_batch(&format!(

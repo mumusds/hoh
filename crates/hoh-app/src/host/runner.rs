@@ -1038,8 +1038,16 @@ async fn attempt(
         return Ok(());
     }
     // A verifier's success is settled, corrected or verified again by the result in its bridge (decision 11).
-    if verifier.is_some() && ending.success && !unknown {
-        super::completion::complete_verifier(store, &identity_of(&work)?, ending).await?;
+    if let Some(v) = verifier.as_ref().filter(|_| ending.success && !unknown) {
+        let reporting = super::completion::Reporting {
+            project: common.shared.root.clone(),
+            role: work.role.clone(),
+            session_id: work.assignment.session_id.clone().unwrap_or_default(),
+            candidate_id: v.candidate_id.clone(),
+            spec_sha256: v.sealed.manifest.spec.sha256.clone(),
+        };
+        super::completion::complete_verifier(store, &identity_of(&work)?, ending, Some(reporting))
+            .await?;
         remove_run_dir();
         return Ok(());
     }

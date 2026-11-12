@@ -37,8 +37,8 @@ mod verification;
 mod wakes;
 pub use candidates::{CandidateRow, Freeze, Frozen, RunAcceptance};
 pub use completion::{
-    VerifierCompleted, VerifierCompletion, VerifierOutcome, WriterCompleted, WriterCompletion,
-    WriterOutcome,
+    VerifierCompleted, VerifierCompletion, VerifierOutcome, VerifierReport, WriterCompleted,
+    WriterCompletion, WriterOutcome,
 };
 pub use control::{CancelPass, Finished, PauseStep};
 pub use evidence::{AcceptanceRow, Recording};
