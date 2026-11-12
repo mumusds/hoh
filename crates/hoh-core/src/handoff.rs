@@ -12,10 +12,13 @@ use serde_json::Value;
 /// run's own is `context.budget_tokens` in its snapshot, this value when it started).
 pub const BUDGET_TOKENS: u64 = 32_000;
 
-/// What every verification handoff of one candidate shares.
+/// What every verification handoff of one round shares (docs/adr/ADR-028.md decision 9).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Verification {
+    /// The round the handoffs open: each message's id is `child_id(round_id, "verify/<role>")`.
+    pub round_id: String,
     pub run_id: String,
+    /// The round's first source task (its sources sorted): a message names one task (M2T16D-659).
     pub task_id: String,
     /// The Developer's attempt that produced the candidate.
     pub attempt_id: String,
@@ -80,8 +83,8 @@ pub fn verification(v: &Verification, to: &[Recipient]) -> Option<Vec<Message>> 
             let Ok(Value::Object(payload)) = serde_json::to_value(&package) else {
                 return None;
             };
-            // Bounded however long the candidate id is (M2T04R-55, -153).
-            let id = crate::ids::child_id(&v.candidate.id, &format!("verify/{}", r.role));
+            // Bounded however long the round's id is (M2T04R-55, -153).
+            let id = crate::ids::child_id(&v.round_id, &format!("verify/{}", r.role));
             Some(Message {
                 schema_version: "1.0".to_owned(),
                 message_id: id.clone(),
@@ -179,6 +182,7 @@ mod tests {
 
     fn inputs() -> Verification {
         Verification {
+            round_id: "C2/round/1".to_owned(),
             run_id: "R".to_owned(),
             task_id: "T".to_owned(),
             attempt_id: "A".to_owned(),

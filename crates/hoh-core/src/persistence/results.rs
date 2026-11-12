@@ -4,9 +4,8 @@
 //! qa and reviewer, all in one transaction; a stale or mismatched result is one `task_result.rejected` event.
 
 use super::decide::{child_id, load_binding};
-use super::writer::{self, Change, Commit, NewEvent, NewOutbox, StateCas};
+use super::writer::{self, Change, Commit, NewEvent, StateCas};
 use super::{PersistError, sqlite_error};
-use crate::handoff::{self, Recipient, Verification};
 use crate::protocol::{self, Candidate, RejectionReason, TaskResult, TaskState, TaskStatus};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
@@ -53,7 +52,7 @@ pub(super) fn accept(
         ));
     }
     let tx = super::writer::begin(conn, ctx)?;
-    let outcome = accept_in(&tx, result, ctx)?;
+    let outcome = accept_in(&tx, result, false, ctx)?;
     if !matches!(outcome, TaskResultOutcome::Replayed { .. }) {
         tx.commit().map_err(sqlite_error)?;
     }
@@ -63,9 +62,12 @@ pub(super) fn accept(
 /// [`accept`] inside the caller's transaction (docs/adr/ADR-028.md decision 4: a writer attempt's completion freezes,
 /// accepts and settles in one commit). Writes what `accept` writes, never commits; a refusal is written too (its
 /// `task_result.rejected` event), so the caller commits either way.
+/// With `on_verifying`, the result's candidate may be the run's current candidate already under verification: the
+/// same content frozen again, which gets a new round for this task alone (docs/adr/ADR-028.md decision 3's row).
 pub(super) fn accept_in(
     tx: &Transaction<'_>,
     result: &TaskResult,
+    on_verifying: bool,
     ctx: &super::writer::Ctx<'_>,
 ) -> Result<TaskResultOutcome, PersistError> {
     if result.status != TaskStatus::Completed {
@@ -214,10 +216,12 @@ pub(super) fn accept_in(
                     c.id, c.spec_sha256
                 ),
             )),
-            Some((c, state)) if state != "FROZEN" => Some((
-                RejectionReason::CandidateMismatch,
-                format!("candidate {} is {state}, not FROZEN", c.id),
-            )),
+            Some((c, state)) if state != "FROZEN" && !(on_verifying && state == "VERIFYING") => {
+                Some((
+                    RejectionReason::CandidateMismatch,
+                    format!("candidate {} is {state}, not FROZEN", c.id),
+                ))
+            }
             Some((c, _)) if current.as_ref() != Some(c) => Some((
                 RejectionReason::CandidateMismatch,
                 format!(
@@ -257,7 +261,7 @@ pub(super) fn accept_in(
             event_seq: done.event_seqs[0],
         });
     }
-    let (candidate, _) =
+    let (candidate, candidate_state) =
         candidate.ok_or_else(|| PersistError::Storage("no candidate".to_owned()))?;
     let (spec_id, spec_sha256, spec_revision) =
         match (run.spec_id, run.spec_sha256, run.spec_revision) {
@@ -269,49 +273,36 @@ pub(super) fn accept_in(
                 )));
             }
         };
-    let acceptance_ids = acceptance(tx, &result.task_id, &spec_id)?;
-    let mut recipients = Vec::with_capacity(VERIFIERS.len());
-    for role in VERIFIERS {
-        let binding = load_binding(tx, &result.run_id, role)?.ok_or_else(|| {
-            PersistError::IntegrityViolation(format!("run {} has no {role} bound", result.run_id))
-        })?;
-        recipients.push(Recipient {
-            role: role.to_owned(),
-            role_epoch: binding.role_epoch,
-        });
-    }
-    let verification = Verification {
-        run_id: result.run_id.clone(),
+    // The round this result opens (docs/adr/ADR-028.md decision 9): this task, and, on a newly frozen candidate, the
+    // VERIFYING sources of the candidates it superseded; the same content under verification gets a round of its own.
+    let frozen = candidate_state == "FROZEN";
+    let mut sources = vec![super::verification::Source {
         task_id: result.task_id.clone(),
-        attempt_id: result.attempt_id.clone(),
-        candidate: candidate.clone(),
-        spec_sha256,
-        spec_revision: u64::try_from(spec_revision)
-            .map_err(|_| PersistError::IntegrityViolation("spec revision".to_owned()))?,
-        acceptance_ids,
-        goal: goal(tx, &result.run_id, &result.task_id, &candidate.id)?,
-        task_revision: u64::try_from(revision + 2)
-            .map_err(|_| PersistError::IntegrityViolation("task revision".to_owned()))?,
-        cause: ready_id.clone(),
-        // What the Developer's attempt produced, by reference only (docs/adr/ADR-026.md decision 10).
-        references: super::context::references(
+        revision: revision + 2,
+    }];
+    if frozen {
+        sources.extend(super::verification::superseded_sources(
             tx,
-            std::slice::from_ref(&result.attempt_id),
-            REFERENCES,
-        )?,
-        budget_tokens: super::context::budget(tx, &result.run_id)?,
-    };
-    // No acceptance criteria, nothing to verify against: refused whole, no QA attempt (REQ-022).
-    let messages = handoff::verification(&verification, &recipients).ok_or_else(|| {
-        PersistError::IntegrityViolation(format!(
-            "task {} has no acceptance criteria under the run's specification",
-            result.task_id
-        ))
-    })?;
-    let outbox = messages
-        .iter()
-        .map(|m| NewOutbox::hcp(0, m))
-        .collect::<Result<Vec<_>, _>>()?;
+            &result.run_id,
+            &result.task_id,
+        )?);
+    }
+    let round = super::verification::open_in(
+        tx,
+        &super::verification::Opening {
+            project_id: &run.project_id,
+            run_id: &result.run_id,
+            spec_id: &spec_id,
+            spec_sha256: &spec_sha256,
+            spec_revision: u64::try_from(spec_revision)
+                .map_err(|_| PersistError::IntegrityViolation("spec revision".to_owned()))?,
+            candidate: &candidate,
+            sources,
+            attempt_id: &result.attempt_id,
+            cause: &ready_id,
+            outbox_event: 0,
+        },
+    )?;
     let task = |expected: i64, to| StateCas {
         id: result.task_id.clone(),
         expected_revision: expected,
@@ -324,38 +315,45 @@ pub(super) fn accept_in(
                 task(revision, TaskState::Implemented),
                 task(revision + 1, TaskState::Verifying),
             ],
-            events: vec![NewEvent {
-                project_id: run.project_id,
-                event_id: ready_id,
-                run_id: Some(result.run_id.clone()),
-                kind: "candidate_ready".to_owned(),
-                payload: json!({
-                    "task_id": result.task_id,
-                    "candidate_id": candidate.id,
-                    "attempt_id": result.attempt_id,
-                    "handoffs": messages.iter().map(|m| m.message_id.clone()).collect::<Vec<_>>(),
-                    "task_result_json": submitted,
-                }),
-            }],
-            outbox,
+            events: vec![
+                NewEvent {
+                    project_id: run.project_id,
+                    event_id: ready_id,
+                    run_id: Some(result.run_id.clone()),
+                    kind: "candidate_ready".to_owned(),
+                    payload: json!({
+                        "task_id": result.task_id,
+                        "candidate_id": candidate.id,
+                        "attempt_id": result.attempt_id,
+                        "round_id": round.round_id,
+                        "handoffs": round.handoffs,
+                        "task_result_json": submitted,
+                    }),
+                },
+                round.event,
+            ],
+            outbox: round.outbox,
         },
         ctx,
     )?;
-    let moved = tx
-        .execute(
-            "UPDATE candidates SET state = 'VERIFYING' WHERE candidate_id = ?1 AND state = 'FROZEN'",
-            params![candidate.id],
-        )
-        .map_err(sqlite_error)?;
-    if moved != 1 {
-        return Err(PersistError::IntegrityViolation(format!(
-            "candidate {} left FROZEN during the transaction",
-            candidate.id
-        )));
+    if frozen {
+        let moved = tx
+            .execute(
+                "UPDATE candidates SET state = 'VERIFYING' WHERE candidate_id = ?1 AND state = 'FROZEN'",
+                params![candidate.id],
+            )
+            .map_err(sqlite_error)?;
+        if moved != 1 {
+            return Err(PersistError::IntegrityViolation(format!(
+                "candidate {} left FROZEN during the transaction",
+                candidate.id
+            )));
+        }
     }
+    let messages = round.handoffs;
     Ok(TaskResultOutcome::Accepted {
         event_seq: done.event_seqs[0],
-        handoffs: messages.into_iter().map(|m| m.message_id).collect(),
+        handoffs: messages,
     })
 }
 
@@ -434,24 +432,6 @@ fn load_candidate(
 }
 
 /// The task's acceptance criteria under the specification, sorted.
-fn acceptance(
-    tx: &Transaction<'_>,
-    task_id: &str,
-    spec_id: &str,
-) -> Result<Vec<String>, PersistError> {
-    let mut statement = tx
-        .prepare(
-            "SELECT ac.ac_id FROM task_requirements tr JOIN acceptance_criteria ac \
-             ON ac.requirement_id = tr.requirement_id AND ac.spec_id = tr.spec_id \
-             WHERE tr.task_id = ?1 AND tr.spec_id = ?2 ORDER BY ac.ac_id",
-        )
-        .map_err(sqlite_error)?;
-    let rows = statement
-        .query_map(params![task_id, spec_id], |r| r.get(0))
-        .map_err(sqlite_error)?;
-    rows.collect::<Result<_, _>>().map_err(sqlite_error)
-}
-
 /// The run's goal as its StartRun command gave it, if it gave one that is not blank.
 pub(super) fn started_goal(
     conn: &Connection,
@@ -470,7 +450,7 @@ pub(super) fn started_goal(
 }
 
 /// The run's goal (its StartRun command), or a fixed account of what is verified.
-fn goal(
+pub(super) fn goal(
     tx: &Transaction<'_>,
     run_id: &str,
     task_id: &str,

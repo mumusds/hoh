@@ -487,3 +487,212 @@ async fn only_a_completion_handed_to_verification_records_its_task_implemented()
     }
     Ok(())
 }
+
+/// Developer task `task` of run R RUNNING with attempt `attempt`, its requirement REQ-2 (criterion AC-2-01).
+fn second_writer(path: &Path, task: &str, attempt: &str) -> R {
+    Connection::open(path)?.execute_batch(&format!(
+        "INSERT OR IGNORE INTO requirements(requirement_id, spec_id, title, required_release) VALUES ('REQ-2', 's1', 'r2', 1);
+         INSERT OR IGNORE INTO acceptance_criteria(ac_id, requirement_id, spec_id, body, check_id) VALUES
+           ('AC-2-01', 'REQ-2', 's1', 'b2', 'unit');
+         INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq) VALUES
+           ('{task}', 'R', 's1', 'RUNNING', 2, 'developer', 1, (SELECT max(created_seq) + 1 FROM tasks));
+         INSERT INTO task_requirements(task_id, requirement_id, spec_id) VALUES ('{task}', 'REQ-2', 's1');
+         INSERT INTO attempts(attempt_id, task_id, session_id, state, role_epoch, host_epoch, config_revision, started_at)
+           VALUES ('{attempt}', '{task}', 'sd', 'RUNNING', 1, 1, 1, '2026-11-12T00:00:02Z');"
+    ))?;
+    Ok(())
+}
+
+/// [`result`] of task `task`'s attempt `attempt`.
+fn result_of(task: &str, attempt: &str) -> R<TaskResult> {
+    let mut result = result(None)?;
+    (result.task_id, result.attempt_id) = (task.to_owned(), attempt.to_owned());
+    Ok(result)
+}
+
+/// The rounds opened, in order: (round id, candidate, number, source tasks, criteria, verifier tasks, handoffs).
+fn rounds(path: &Path) -> R<Vec<serde_json::Value>> {
+    texts(
+        path,
+        "SELECT payload_json FROM events WHERE kind = 'verification.round_opened' ORDER BY seq",
+    )?
+    .iter()
+    .map(|p| Ok(serde_json::from_str(p)?))
+    .collect()
+}
+
+#[tokio::test]
+async fn a_completion_opens_its_candidates_first_round_with_its_two_runtime_verifier_tasks() -> R {
+    // Decision 9: the completion's commit opens round 1 on the candidate: its source task, its criteria, two verifier
+    // tasks (qa and reviewer: readers, layer 0, READY, no task_requirements) and the two handoffs, whose ids are the
+    // round's, in candidate_ready's transaction.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    let job = freeze_of('b');
+    let c1 = job.sealed.candidate_id.clone();
+    let done = store
+        .complete_writer_attempt(completion(freeze(job, result(None)?)))
+        .await?;
+    let round = crate::ids::child_id(&c1, "round/1");
+    let id = |suffix: &str| crate::ids::child_id(&round, suffix);
+    assert_eq!(
+        done,
+        WriterCompleted::Verifying {
+            candidate_id: c1.clone(),
+            handoffs: vec![id("verify/qa"), id("verify/reviewer")],
+        }
+    );
+    assert_eq!(
+        rounds(&path)?,
+        [json!({
+            "round_id": round, "candidate_id": c1, "number": 1, "source_task_ids": ["D"],
+            "acceptance_ids": ["AC-1-01"], "tasks": {"qa": id("task/qa"), "reviewer": id("task/reviewer")},
+            "handoffs": [id("verify/qa"), id("verify/reviewer")],
+        })]
+    );
+    assert_eq!(
+        texts(
+            &path,
+            &format!(
+                "SELECT task_id || ':' || role || ':' || writer || ':' || layer || ':' || state || ':' || spec_id \
+                 FROM tasks WHERE task_id IN ('{}', '{}') ORDER BY role",
+                id("task/qa"),
+                id("task/reviewer")
+            )
+        )?,
+        [
+            format!("{}:qa:0:0:READY:s1", id("task/qa")),
+            format!("{}:reviewer:0:0:READY:s1", id("task/reviewer"))
+        ]
+    );
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT task_id FROM task_requirements WHERE task_id != 'D'"
+        )?
+        .len(),
+        0
+    );
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT message_id FROM outbox WHERE event_seq = (SELECT seq FROM events WHERE kind = 'candidate_ready') \
+             ORDER BY message_id"
+        )?,
+        [id("verify/qa"), id("verify/reviewer")]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_new_candidate_takes_the_superseded_candidates_verifying_sources_into_its_round() -> R {
+    // Decision 9's supersession: D is VERIFYING in C1's round 1 when E's completion freezes C2 (C1 STALE). C2's round 1
+    // has both sources (one pair of handoffs, AC-053-04), the union of their criteria, D not run again and not moved.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    let first = freeze_of('b');
+    let c1 = first.sealed.candidate_id.clone();
+    store
+        .complete_writer_attempt(completion(freeze(first, result(None)?)))
+        .await?;
+    let d = texts(
+        &path,
+        "SELECT state || ':' || revision FROM tasks WHERE task_id = 'D'",
+    )?;
+    second_writer(&path, "E", "AE")?;
+    let second = freeze_of('c');
+    let c2 = second.sealed.candidate_id.clone();
+    let done = store
+        .complete_writer_attempt(WriterCompletion {
+            attempt_id: "AE".to_owned(),
+            ..completion(freeze(second, result_of("E", "AE")?))
+        })
+        .await?;
+    assert!(
+        matches!(done, WriterCompleted::Verifying { .. }),
+        "{done:?}"
+    );
+    assert_eq!(
+        texts(
+            &path,
+            &format!("SELECT state FROM candidates WHERE candidate_id = '{c1}'")
+        )?,
+        ["STALE"]
+    );
+    let opened = rounds(&path)?;
+    assert_eq!(opened.len(), 2);
+    assert_eq!(opened[1]["candidate_id"], json!(c2));
+    assert_eq!(opened[1]["number"], json!(1));
+    assert_eq!(opened[1]["source_task_ids"], json!(["D", "E"]));
+    assert_eq!(opened[1]["acceptance_ids"], json!(["AC-1-01", "AC-2-01"]));
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT state || ':' || revision FROM tasks WHERE task_id = 'D'"
+        )?,
+        d,
+        "D is neither run again nor moved"
+    );
+    assert_eq!(
+        texts(&path, "SELECT state FROM tasks WHERE task_id = 'E'")?,
+        ["VERIFYING"]
+    );
+    // One pair of handoffs for the round, enveloped by its first source (M2T16D-659).
+    let round = crate::ids::child_id(&c2, "round/1");
+    assert_eq!(
+        texts(
+            &path,
+            &format!(
+                "SELECT json_extract(payload_json, '$.task_id') FROM outbox WHERE message_id LIKE '{round}/%' \
+                 ORDER BY message_id"
+            )
+        )?,
+        ["D", "D"]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_same_content_under_verification_gets_a_new_round_for_the_completing_task_only() -> R {
+    // Decision 3's row (M2T16D-101): E's completion freezes the content of C1, which is VERIFYING: no new candidate,
+    // round 2 on C1 with E alone; D stays in round 1.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    let first = freeze_of('b');
+    let c1 = first.sealed.candidate_id.clone();
+    store
+        .complete_writer_attempt(completion(freeze(first, result(None)?)))
+        .await?;
+    second_writer(&path, "E", "AE")?;
+    let done = store
+        .complete_writer_attempt(WriterCompletion {
+            attempt_id: "AE".to_owned(),
+            ..completion(freeze(freeze_of('b'), result_of("E", "AE")?))
+        })
+        .await?;
+    let round = crate::ids::child_id(&c1, "round/2");
+    assert_eq!(
+        done,
+        WriterCompleted::Verifying {
+            candidate_id: c1.clone(),
+            handoffs: vec![
+                crate::ids::child_id(&round, "verify/qa"),
+                crate::ids::child_id(&round, "verify/reviewer")
+            ],
+        }
+    );
+    assert_eq!(texts(&path, "SELECT state FROM candidates")?, ["VERIFYING"]);
+    let opened = rounds(&path)?;
+    assert_eq!(
+        opened
+            .iter()
+            .map(|r| (r["number"].clone(), r["source_task_ids"].clone()))
+            .collect::<Vec<_>>(),
+        [(json!(1), json!(["D"])), (json!(2), json!(["E"]))]
+    );
+    assert_eq!(
+        texts(&path, "SELECT state FROM tasks WHERE task_id = 'E'")?,
+        ["VERIFYING"]
+    );
+    Ok(())
+}

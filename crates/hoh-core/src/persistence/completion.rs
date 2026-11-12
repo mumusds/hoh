@@ -176,9 +176,15 @@ fn freeze_and_accept(
         )
         .map_err(sqlite_error)
     };
+    // The same content under verification gets a round of its own on that candidate (decision 3's row, M2T16D-101).
+    let mut on_verifying = false;
     let refusal = match super::candidates::freeze_in(tx, freeze) {
         Ok(Frozen::New { .. }) => None,
         Ok(Frozen::Existing { state, .. }) if state == "FROZEN" => None,
+        Ok(Frozen::Existing { state, .. }) if state == "VERIFYING" => {
+            on_verifying = true;
+            None
+        }
         Ok(Frozen::Existing { state, .. }) => Some(format!(
             "the same content was frozen before in this run and is {state}: commit anew"
         )),
@@ -193,7 +199,7 @@ fn freeze_and_accept(
     }
     let mut accepted = result.clone();
     accepted.candidate_id = Some(id.clone());
-    match super::results::accept_in(tx, &accepted, ctx)? {
+    match super::results::accept_in(tx, &accepted, on_verifying, ctx)? {
         TaskResultOutcome::Accepted { handoffs, .. } | TaskResultOutcome::Replayed { handoffs } => {
             tx.execute_batch("RELEASE SAVEPOINT completion_freeze")
                 .map_err(sqlite_error)?;
