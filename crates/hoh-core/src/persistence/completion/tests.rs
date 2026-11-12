@@ -696,3 +696,261 @@ async fn the_same_content_under_verification_gets_a_new_round_for_the_completing
     );
     Ok(())
 }
+
+/// The scheduling round's context for run R: qa and reviewer need no capability, at the completion's time.
+fn verifiers() -> crate::decision::Context {
+    crate::decision::Context {
+        required_capabilities: [
+            ("qa".to_owned(), Default::default()),
+            ("reviewer".to_owned(), Default::default()),
+        ]
+        .into(),
+        now: Some(ending().at),
+        ..crate::decision::Context::default()
+    }
+}
+
+/// D completed into C1's round 1; the round's id.
+async fn verifying(store: &Store) -> R<String> {
+    let job = freeze_of('b');
+    let c1 = job.sealed.candidate_id.clone();
+    store
+        .complete_writer_attempt(completion(freeze(job, result(None)?)))
+        .await?;
+    Ok(crate::ids::child_id(&c1, "round/1"))
+}
+
+#[tokio::test]
+async fn a_rounds_verifier_tasks_are_dispatched_by_the_runtime_even_on_a_blocked_run() -> R {
+    // Decision 10: a runtime-class dispatch with origin "verification", taken on a BLOCKED run too (the Commander
+    // unavailable), each naming its round and its current handoff.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    let round = verifying(&store).await?;
+    Connection::open(&path)?.execute_batch(
+        "UPDATE runs SET state = 'BLOCKED', blocked_reason = 'COMMANDER_UNAVAILABLE' WHERE run_id = 'R';",
+    )?;
+    let mut dispatched = Vec::new();
+    while let Some(d) = store.schedule_round("R", verifiers()).await?.dispatched {
+        dispatched.push(d.task_id);
+    }
+    let id = |suffix: &str| crate::ids::child_id(&round, suffix);
+    assert_eq!(dispatched, [id("task/qa"), id("task/reviewer")]);
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT json_extract(payload_json, '$.origin') || ':' || json_extract(payload_json, '$.round_id') || ':' || \
+             json_extract(payload_json, '$.handoff') FROM outbox WHERE json_extract(payload_json, '$.kind') = 'dispatch' \
+             ORDER BY rowid"
+        )?,
+        [
+            format!("verification:{round}:{}", id("verify/qa")),
+            format!("verification:{round}:{}", id("verify/reviewer"))
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_handoff_of_an_older_epoch_is_dead_lettered_and_issued_again_at_the_current_one() -> R {
+    // Decision 9 (REQ-022 behaviour 8, M2T16D-204): qa was rebound after the handoff was written. Its dispatch refuses
+    // the old message (DEAD_LETTER, STALE_ROLE_EPOCH, nothing else changed) and issues it again at the current epoch,
+    // the package the same but for its epoch; the dispatch and its attempt use the new one.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    let round = verifying(&store).await?;
+    Connection::open(&path)?.execute_batch(
+        "UPDATE role_bindings SET role_epoch = 3 WHERE run_id = 'R' AND role = 'qa';",
+    )?;
+    let d = store
+        .schedule_round("R", verifiers())
+        .await?
+        .dispatched
+        .ok_or("nothing dispatched")?;
+    let old = crate::ids::child_id(&round, "verify/qa");
+    let new = crate::ids::child_id(&old, "e3");
+    assert_eq!(d.task_id, crate::ids::child_id(&round, "task/qa"));
+    assert_eq!(
+        texts(
+            &path,
+            &format!(
+                "SELECT message_id || ':' || state || ':' || role_epoch || ':' || \
+                 json_extract(payload_json, '$.role_epoch') || ':' || json_extract(payload_json, '$.payload.role_epoch') \
+                 FROM outbox WHERE message_id IN ('{old}', '{new}') ORDER BY rowid"
+            )
+        )?,
+        [
+            format!("{old}:DEAD_LETTER:1:1:1"),
+            format!("{new}:PENDING:3:3:3")
+        ]
+    );
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT json_extract(payload_json, '$.reason') FROM events WHERE kind = 'outbox.dead_letter'"
+        )?,
+        ["STALE_ROLE_EPOCH"]
+    );
+    let packages = texts(
+        &path,
+        &format!(
+            "SELECT json_remove(json_extract(payload_json, '$.payload'), '$.role_epoch') FROM outbox \
+             WHERE message_id IN ('{old}', '{new}')"
+        ),
+    )?;
+    assert_eq!(
+        packages[0], packages[1],
+        "the package the same but for its epoch"
+    );
+    assert_eq!(
+        texts(
+            &path,
+            &format!(
+                "SELECT json_extract(payload_json, '$.handoff') FROM outbox WHERE message_id = '{}'",
+                crate::ids::child_id(&d.attempt_id, "dispatch")
+            )
+        )?,
+        [new]
+    );
+    assert_eq!(
+        texts(
+            &path,
+            &format!(
+                "SELECT CAST(role_epoch AS TEXT) FROM attempts WHERE attempt_id = '{}'",
+                d.attempt_id
+            )
+        )?,
+        ["3"]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_022_05_an_empty_handoff_found_at_its_dispatch_is_refused_and_creates_no_attempt() -> R
+{
+    // AC-022-05's fourth message under decision 9 (implementation correction 1): a verification handoff with no
+    // acceptance criteria (only a tampered store has one) is refused at its verifier task's dispatch: message.invalid,
+    // the message DEAD_LETTER, no lease and no attempt, the verifier task BLOCKED for a decision with
+    // integrity_violation; the verified task does not move.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    let round = verifying(&store).await?;
+    let qa = crate::ids::child_id(&round, "verify/qa");
+    let task = crate::ids::child_id(&round, "task/qa");
+    Connection::open(&path)?.execute(
+        "UPDATE outbox SET payload_json = json_set(payload_json, '$.payload.acceptance_ids', json('[]')) \
+         WHERE message_id = ?1",
+        [&qa],
+    )?;
+    let d = texts(
+        &path,
+        "SELECT state || ':' || revision FROM tasks WHERE task_id = 'D'",
+    )?;
+    let round_outcome = store.schedule_round("R", verifiers()).await?;
+    assert!(
+        round_outcome
+            .dispatched
+            .as_ref()
+            .is_none_or(|d| d.task_id != task),
+        "{round_outcome:?}"
+    );
+    assert_eq!(
+        texts(
+            &path,
+            &format!("SELECT state FROM outbox WHERE message_id = '{qa}'")
+        )?,
+        ["DEAD_LETTER"]
+    );
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT json_extract(payload_json, '$.message_id') FROM events WHERE kind = 'message.invalid'"
+        )?,
+        std::slice::from_ref(&qa)
+    );
+    assert_eq!(
+        texts(
+            &path,
+            &format!("SELECT state || ':' || blocked_reason FROM tasks WHERE task_id = '{task}'")
+        )?,
+        ["BLOCKED:NEED_DECISION"]
+    );
+    assert_eq!(
+        texts(
+            &path,
+            &format!("SELECT attempt_id FROM attempts WHERE task_id = '{task}'")
+        )?
+        .len(),
+        0
+    );
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT kind FROM events WHERE kind = 'integrity_violation'"
+        )?
+        .len(),
+        1
+    );
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT state || ':' || revision FROM tasks WHERE task_id = 'D'"
+        )?,
+        d
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_verifier_bound_to_a_source_attempts_session_is_refused_as_not_independent() -> R {
+    // Decision 10 (REQ-036 failure mode 5, M2T16D-361): a forged binding gives the reviewer the developer's session,
+    // which D's attempt used: its dispatch is refused SESSION_NOT_INDEPENDENT, the verifier task BLOCKED for a decision
+    // with integrity_violation, no attempt.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    let round = verifying(&store).await?;
+    Connection::open(&path)?.execute_batch(
+        "UPDATE role_bindings SET session_id = 'sd' WHERE run_id = 'R' AND role = 'reviewer';",
+    )?;
+    while store
+        .schedule_round("R", verifiers())
+        .await?
+        .dispatched
+        .is_some()
+    {}
+    let task = crate::ids::child_id(&round, "task/reviewer");
+    assert_eq!(
+        texts(
+            &path,
+            &format!("SELECT state || ':' || blocked_reason FROM tasks WHERE task_id = '{task}'")
+        )?,
+        ["BLOCKED:NEED_DECISION"]
+    );
+    assert_eq!(
+        texts(
+            &path,
+            &format!("SELECT attempt_id FROM attempts WHERE task_id = '{task}'")
+        )?
+        .len(),
+        0
+    );
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT json_extract(payload_json, '$.reason') FROM events WHERE kind = 'integrity_violation'"
+        )?,
+        ["SESSION_NOT_INDEPENDENT"]
+    );
+    // The qa verifier is dispatched as usual.
+    assert_eq!(
+        texts(
+            &path,
+            &format!(
+                "SELECT CAST(count(*) AS TEXT) FROM attempts WHERE task_id = '{}'",
+                crate::ids::child_id(&round, "task/qa")
+            )
+        )?,
+        ["1"]
+    );
+    Ok(())
+}

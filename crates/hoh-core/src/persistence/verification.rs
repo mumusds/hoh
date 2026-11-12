@@ -9,7 +9,7 @@ use super::{PersistError, sqlite_error};
 use crate::handoff::{self, Recipient, Verification};
 use crate::ids::child_id;
 use crate::protocol::Candidate;
-use rusqlite::{Transaction, params};
+use rusqlite::{OptionalExtension, Transaction, params};
 use serde_json::json;
 
 /// The kind of the event that opens a round.
@@ -202,4 +202,299 @@ fn criteria(
         .query_map(params![task_id, spec_id], |r| r.get(0))
         .map_err(sqlite_error)?;
     rows.collect::<Result<_, _>>().map_err(sqlite_error)
+}
+
+/// The kind of the event that issues a round's handoff again at its role's current epoch.
+pub(super) const HANDOFF_REISSUED: &str = "verification.handoff_reissued";
+
+/// The verifier tasks of run `run_id`'s rounds.
+pub(super) fn verifier_tasks(
+    tx: &Transaction<'_>,
+    run_id: &str,
+) -> Result<std::collections::BTreeSet<String>, PersistError> {
+    let mut statement = tx
+        .prepare(
+            "SELECT t.value FROM events e, json_each(e.payload_json, '$.tasks') t \
+             WHERE e.kind = ?1 AND e.run_id = ?2",
+        )
+        .map_err(sqlite_error)?;
+    let rows = statement
+        .query_map(params![ROUND_OPENED, run_id], |r| r.get(0))
+        .map_err(sqlite_error)?;
+    rows.collect::<Result<_, _>>().map_err(sqlite_error)
+}
+
+/// What a verifier task's dispatch may go on with (decisions 9 and 10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Admission {
+    /// Dispatch it with this handoff, its round's current one (issued again in the transaction when its epoch was
+    /// older than the binding's).
+    Go { round_id: String, handoff: String },
+    /// Refused, written in the transaction: the task BLOCKED for a decision with `integrity_violation`.
+    Refused,
+}
+
+/// The admission of verifier task `task_id` (READY at `revision`) of run `run_id`, about to be leased to its role's
+/// binding at `role_epoch` with `session`: its round's current handoff, which must decode as a valid Message whose
+/// package agrees with its envelope (refused otherwise: `message.invalid`, the message DEAD_LETTER), issued again at the
+/// current epoch when older (REQ-022 behaviour 8: the old one DEAD_LETTER, `STALE_ROLE_EPOCH`), and a session of its
+/// own: not one a source attempt used, nor the Commander's or the other verifier's (SESSION_NOT_INDEPENDENT, REQ-036
+/// failure mode 5). Refusals leave no lease and no attempt (implementation correction 1). `None`: not a verifier task.
+pub(super) fn admit(
+    tx: &Transaction<'_>,
+    ctx: &super::writer::Ctx<'_>,
+    project_id: &str,
+    run_id: &str,
+    (task_id, revision): (&str, i64),
+    role_epoch: u64,
+    session: Option<&str>,
+) -> Result<Option<Admission>, PersistError> {
+    let opened: Option<String> = tx
+        .query_row(
+            "SELECT payload_json FROM events WHERE kind = ?1 AND run_id = ?2 \
+             AND ?3 IN (json_extract(payload_json, '$.tasks.qa'), json_extract(payload_json, '$.tasks.reviewer'))",
+            params![ROUND_OPENED, run_id, task_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some(opened) = opened else {
+        return Ok(None);
+    };
+    let opened: serde_json::Value = serde_json::from_str(&opened)
+        .map_err(|e| PersistError::IntegrityViolation(format!("round of {task_id}: {e}")))?;
+    let round_id = opened["round_id"].as_str().unwrap_or_default().to_owned();
+    let role = super::results::VERIFIERS
+        .into_iter()
+        .find(|r| opened["tasks"][r] == json!(task_id))
+        .ok_or_else(|| PersistError::IntegrityViolation(format!("round {round_id}: {task_id}")))?;
+    let other = super::results::VERIFIERS
+        .into_iter()
+        .find(|r| *r != role)
+        .unwrap_or(role);
+    let sources: Vec<String> = opened["source_task_ids"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    // Its round's current handoff: the original, or the latest issued again.
+    let original = child_id(&round_id, &format!("verify/{role}"));
+    let current: Option<String> = tx
+        .query_row(
+            "SELECT json_extract(payload_json, '$.to') FROM events WHERE kind = ?1 \
+             AND json_extract(payload_json, '$.round_id') = ?2 AND json_extract(payload_json, '$.role') = ?3 \
+             ORDER BY seq DESC LIMIT 1",
+            params![HANDOFF_REISSUED, round_id, role],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let handoff = current.unwrap_or(original);
+    let (state, payload): (String, String) = tx
+        .query_row(
+            "SELECT state, payload_json FROM outbox WHERE message_id = ?1",
+            params![handoff],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(sqlite_error)?;
+    let refuse = |reason: &str, detail: String, invalid: Option<&str>| {
+        refuse(
+            tx,
+            ctx,
+            &Refusal {
+                project_id,
+                run_id,
+                task_id,
+                revision,
+                round_id: &round_id,
+                reason,
+                detail,
+                invalid: invalid.map(|violations| (handoff.as_str(), role, violations)),
+            },
+        )
+        .map(|()| Some(Admission::Refused))
+    };
+    let message = serde_json::from_str::<serde_json::Value>(&payload)
+        .map_err(|e| e.to_string())
+        .and_then(|v| {
+            crate::protocol::decode::<crate::protocol::Message>(&v).map_err(|e| e.to_string())
+        })
+        .and_then(|m| m.check_payload().map(|()| m));
+    let message = match message {
+        Ok(m) => m,
+        Err(violations) => {
+            return refuse(
+                "INVALID_HANDOFF",
+                format!("handoff {handoff} is not a valid verification handoff"),
+                Some(&violations),
+            );
+        }
+    };
+    // A session of its own (decision 10).
+    let mut others: Vec<String> = Vec::new();
+    for source in &sources {
+        let mut statement = tx
+            .prepare("SELECT DISTINCT session_id FROM attempts WHERE task_id = ?1 AND session_id IS NOT NULL")
+            .map_err(sqlite_error)?;
+        let rows = statement
+            .query_map(params![source], |r| r.get::<_, String>(0))
+            .map_err(sqlite_error)?;
+        for row in rows {
+            others.push(row.map_err(sqlite_error)?);
+        }
+    }
+    for bound in ["commander", other] {
+        let session: Option<Option<String>> = tx
+            .query_row(
+                "SELECT session_id FROM role_bindings WHERE run_id = ?1 AND role = ?2",
+                params![run_id, bound],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sqlite_error)?;
+        others.extend(session.flatten());
+    }
+    if let Some(session) = session.filter(|s| others.iter().any(|o| o == s)) {
+        return refuse(
+            "SESSION_NOT_INDEPENDENT",
+            format!(
+                "the {role} would verify in session {session}, which a source attempt, the Commander or the other \
+                 verifier uses"
+            ),
+            None,
+        );
+    }
+    if message.role_epoch == role_epoch {
+        return Ok(Some(Admission::Go { round_id, handoff }));
+    }
+    // Written at an older epoch: refused (DEAD_LETTER, nothing else changed) and issued again at the current one, the
+    // package the same but for its epoch (M2T16D-204).
+    if matches!(state.as_str(), "PENDING" | "DELIVERING") {
+        tx.execute(
+            "UPDATE outbox SET state = 'DEAD_LETTER', last_error = 'STALE_ROLE_EPOCH' WHERE message_id = ?1",
+            params![handoff],
+        )
+        .map_err(sqlite_error)?;
+    }
+    let mut again = message.clone();
+    again.message_id = child_id(&handoff, &format!("e{role_epoch}"));
+    again.idempotency_key = again.message_id.clone();
+    again.role_epoch = role_epoch;
+    again
+        .payload
+        .insert("role_epoch".to_owned(), json!(role_epoch));
+    let mut events = vec![NewEvent {
+        project_id: project_id.to_owned(),
+        event_id: child_id(&again.message_id, "issued"),
+        run_id: Some(run_id.to_owned()),
+        kind: HANDOFF_REISSUED.to_owned(),
+        payload: json!({
+            "round_id": round_id, "role": role, "from": handoff, "to": again.message_id, "role_epoch": role_epoch,
+        }),
+    }];
+    if matches!(state.as_str(), "PENDING" | "DELIVERING") {
+        events.push(NewEvent {
+            project_id: project_id.to_owned(),
+            event_id: child_id(&handoff, "dead_letter"),
+            run_id: Some(run_id.to_owned()),
+            kind: "outbox.dead_letter".to_owned(),
+            payload: json!({
+                "message_id": handoff, "recipient_role": role, "reason": "STALE_ROLE_EPOCH",
+                "role_epoch": message.role_epoch, "current_role_epoch": role_epoch,
+            }),
+        });
+    }
+    super::writer::write(
+        tx,
+        &super::writer::Commit {
+            events,
+            outbox: vec![NewOutbox::hcp(0, &again)?],
+            ..super::writer::Commit::default()
+        },
+        ctx,
+    )?;
+    Ok(Some(Admission::Go {
+        round_id,
+        handoff: again.message_id,
+    }))
+}
+
+/// A verifier task's dispatch refused.
+struct Refusal<'a> {
+    project_id: &'a str,
+    run_id: &'a str,
+    task_id: &'a str,
+    revision: i64,
+    round_id: &'a str,
+    reason: &'a str,
+    detail: String,
+    /// An invalid handoff: its id, the role it is for, and what is wrong with it.
+    invalid: Option<(&'a str, &'a str, &'a str)>,
+}
+
+/// Write refusal `r`: the task READY -> BLOCKED (NEED_DECISION) with `need_decision` and `integrity_violation`; an
+/// invalid handoff also `message.invalid` and DEAD_LETTER.
+fn refuse(
+    tx: &Transaction<'_>,
+    ctx: &super::writer::Ctx<'_>,
+    r: &Refusal<'_>,
+) -> Result<(), PersistError> {
+    tx.execute(
+        "UPDATE tasks SET blocked_reason = 'NEED_DECISION', next_retry_at = NULL WHERE task_id = ?1",
+        params![r.task_id],
+    )
+    .map_err(sqlite_error)?;
+    let key = |what: &str| {
+        child_id(
+            r.task_id,
+            &format!("dispatch-refused/{}/{what}", r.revision),
+        )
+    };
+    let event = |event_id: String, kind: &str, payload: serde_json::Value| NewEvent {
+        project_id: r.project_id.to_owned(),
+        event_id,
+        run_id: Some(r.run_id.to_owned()),
+        kind: kind.to_owned(),
+        payload,
+    };
+    let mut events = Vec::new();
+    if let Some((message_id, role, violations)) = r.invalid {
+        tx.execute(
+            "UPDATE outbox SET state = 'DEAD_LETTER', last_error = 'INVALID' WHERE message_id = ?1",
+            params![message_id],
+        )
+        .map_err(sqlite_error)?;
+        events.push(event(
+            child_id(message_id, &format!("{role}/invalid")),
+            "message.invalid",
+            json!({"message_id": message_id, "consumer": role, "violations": violations}),
+        ));
+    }
+    events.push(event(
+        key("integrity"),
+        "integrity_violation",
+        json!({"task_id": r.task_id, "round_id": r.round_id, "reason": r.reason, "detail": r.detail}),
+    ));
+    events.push(event(
+        key("need_decision"),
+        "need_decision",
+        json!({"run_id": r.run_id, "task_id": r.task_id, "reason": r.reason, "detail": r.detail}),
+    ));
+    super::writer::write(
+        tx,
+        &super::writer::Commit {
+            cas: vec![super::writer::StateCas {
+                id: r.task_id.to_owned(),
+                expected_revision: r.revision,
+                change: super::writer::Change::Task(crate::protocol::TaskState::Blocked),
+            }],
+            events,
+            ..super::writer::Commit::default()
+        },
+        ctx,
+    )
+    .map(drop)
 }

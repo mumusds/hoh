@@ -82,8 +82,12 @@ pub(super) fn round(
     }
     let params = parameters(&snapshot)?;
     let mut rows = candidates(&tx, run_id, run_spec.as_deref(), context)?;
+    // A round's verifier tasks are the Runtime's: dispatched on a BLOCKED run too (docs/adr/ADR-028.md decision 10).
+    let verifiers = super::verification::verifier_tasks(&tx, run_id)?;
     if retries_only {
-        rows.retain(|r| r.retry && r.state == TaskState::Ready);
+        rows.retain(|r| {
+            r.state == TaskState::Ready && (r.retry || verifiers.contains(&r.candidate.task_id))
+        });
     }
     let slots = Slots {
         writer: leases::free_slot(&tx, &project_id, true, context.reader_slots(), now)?.is_some(),
@@ -125,6 +129,36 @@ pub(super) fn round(
     let task = &rows[chosen];
     let binding = decide::load_binding(&tx, run_id, &task.role)?
         .ok_or_else(|| PersistError::Storage(format!("role {} lost its binding", task.role)))?;
+    // A verifier task goes with its round's current handoff, at its role's current epoch, in a session of its own; a
+    // refusal is written and nothing is leased (docs/adr/ADR-028.md decisions 9 and 10).
+    let mut verification = None;
+    if verifiers.contains(&selected.task_id) {
+        let session: Option<String> = tx
+            .query_row(
+                "SELECT session_id FROM role_bindings WHERE run_id = ?1 AND role = ?2",
+                params![run_id, task.role],
+                |r| r.get(0),
+            )
+            .map_err(sqlite_error)?;
+        match super::verification::admit(
+            &tx,
+            ctx,
+            &project_id,
+            run_id,
+            (&selected.task_id, task.revision),
+            binding.role_epoch,
+            session.as_deref(),
+        )? {
+            Some(super::verification::Admission::Go { round_id, handoff }) => {
+                verification = Some((round_id, handoff));
+            }
+            Some(super::verification::Admission::Refused) => {
+                tx.commit().map_err(sqlite_error)?;
+                return Ok(RoundOutcome::default());
+            }
+            None => {}
+        }
+    }
     let attempts: i64 = tx
         .query_row(
             "SELECT count(*) FROM attempts WHERE task_id = ?1",
@@ -168,7 +202,11 @@ pub(super) fn round(
         "lease": lease,
     });
     // A runtime-class dispatch carries its origin: the runner takes it on a BLOCKED or WAITING_EXTERNAL run too.
-    if task.retry {
+    if let Some((round_id, handoff)) = &verification {
+        notice["origin"] = json!("verification");
+        notice["round_id"] = json!(round_id);
+        notice["handoff"] = json!(handoff);
+    } else if task.retry {
         notice["origin"] = json!("retry");
     }
     let w = params.weights;
