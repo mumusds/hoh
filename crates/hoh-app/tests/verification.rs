@@ -89,6 +89,16 @@ impl Fixture {
 
     /// The fixture with `plan` as its check plan, `qa` as its qa.sh and `faults` in its store.
     async fn with(plan: &str, qa: &str, faults: Arc<dyn FaultHooks>) -> R<Fixture> {
+        Fixture::with_files(plan, qa, faults, &[]).await
+    }
+
+    /// [`Fixture::with`] and `extra` files committed too.
+    async fn with_files(
+        plan: &str,
+        qa: &str,
+        faults: Arc<dyn FaultHooks>,
+        extra: &[(&str, String)],
+    ) -> R<Fixture> {
         let dir = tempfile::tempdir()?;
         let root = &dir.path().join("repo");
         std::fs::create_dir_all(root)?;
@@ -101,7 +111,10 @@ impl Fixture {
             ("environment.json", "{\"os\": \"linux\"}\n"),
             ("tests/check-plan.json", plan),
             ("qa.sh", qa),
-        ] {
+        ]
+        .into_iter()
+        .chain(extra.iter().map(|(p, t)| (*p, t.as_str())))
+        {
             let file = root.join(path);
             std::fs::create_dir_all(file.parent().ok_or("no parent")?)?;
             std::fs::write(file, text)?;
@@ -1325,12 +1338,13 @@ async fn a_pending_record_that_cannot_be_read_holds_back_its_candidates_runs_onl
     Ok(())
 }
 
-/// The reconciliation of candidate `c` alone, as a run of it begins.
-async fn super_reconcile(f: &Fixture, c: &str) -> R {
-    hoh_app::verify::check::reconcile(&f.store.evidence_handle(), &f.root(), &f.state(), c)
-        .await
-        .map_err(|e| format!("{e:?}"))?;
-    Ok(())
+/// The reconciliation of candidate `c` alone, as a run of it begins: how many records it recorded.
+async fn super_reconcile(f: &Fixture, c: &str) -> R<usize> {
+    Ok(
+        hoh_app::verify::check::reconcile(&f.store.evidence_handle(), &f.state(), c)
+            .await
+            .map_err(|e| format!("{e:?}"))?,
+    )
 }
 
 #[tokio::test]
@@ -1362,5 +1376,269 @@ async fn a_committed_records_pending_file_is_never_read_again() -> R {
     let again = f.run(&c, "qa", QA).await.map_err(|e| format!("{e:?}"))?;
     assert_eq!(again.outcome.status.code(), "PASS");
     assert_eq!(f.query("SELECT count(*) FROM evidence")?, ["2"]);
+    Ok(())
+}
+
+/// Fails the next commit once `fail` is armed, holds the next commit two seconds once `slow` is.
+#[derive(Debug, Default)]
+struct Faults {
+    fail: AtomicBool,
+    slow: AtomicBool,
+}
+
+impl FaultHooks for Faults {
+    fn before_commit(&self) -> Result<(), PersistError> {
+        if self.fail.swap(false, Ordering::SeqCst) {
+            return Err(PersistError::Storage("injected commit failure".to_owned()));
+        }
+        if self.slow.swap(false, Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_secs(2));
+        }
+        Ok(())
+    }
+}
+
+/// A release policy for the fixture's checks, `qa` in mode `qa_mode`.
+fn policy(qa_mode: &str) -> String {
+    serde_json::json!({"schema_version": "1.1", "checks": {
+        "unit": {"mode": "product"}, "qa": {"mode": qa_mode}, "slow": {"mode": "product"},
+        "pack": {"mode": "bundle"}, "sleepy": {"mode": "product"}, "blocked": {"mode": "product"}}})
+    .to_string()
+}
+
+/// A fixture whose qa evidence did not commit: its record is pending.
+async fn pending_qa(extra: &[(&str, String)]) -> R<(Fixture, Arc<Faults>, String, PathBuf)> {
+    let faults = Arc::new(Faults::default());
+    let f = Fixture::with_files(PLAN, QA_PASSES, faults.clone(), extra).await?;
+    let c = f.frozen().await?;
+    faults.fail.store(true, Ordering::SeqCst);
+    assert!(f.run(&c, "qa", QA).await.is_err());
+    let dir = record_dirs(&f, &c, "qa")?.remove(0);
+    Ok((f, faults, c, dir))
+}
+
+#[tokio::test]
+async fn a_pending_record_is_judged_by_its_candidates_frozen_policy_not_a_later_checkout() -> R {
+    // M2T10R-200: the release policy the candidate tracks is kept as an object at the freeze and judged by its digest;
+    // a later commit's policy plays no part in the reconciliation of an earlier candidate's record.
+    let (f, _, c, _) = pending_qa(&[("contracts/release-policy.json", policy("product"))]).await?;
+    std::fs::write(
+        f.root().join("contracts/release-policy.json"),
+        policy("live"),
+    )?;
+    git(&f.root(), &["commit", "-qam", "another policy"])?;
+    new_id(f.freeze("R").await?)?;
+    assert_eq!(super_reconcile(&f, &c).await?, 1);
+    assert_eq!(f.query("SELECT outcome FROM evidence")?, ["PASS"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_cancelled_reconciliation_keeps_its_record_until_its_commit_ends() -> R {
+    // M2T10R-201: the reconciliation is a task of its own holding the record's lock until its transaction ends, so a
+    // caller that stops waiting releases nothing: a second reconciliation meanwhile leaves the record alone.
+    let (f, faults, c, _) = pending_qa(&[]).await?;
+    faults.slow.store(true, Ordering::SeqCst);
+    let first = tokio::time::timeout(Duration::from_millis(500), super_reconcile(&f, &c)).await;
+    assert!(
+        first.is_err(),
+        "the first reconciliation should still be committing"
+    );
+    assert_eq!(super_reconcile(&f, &c).await?, 0);
+    for _ in 0..50 {
+        if !f.query("SELECT outcome FROM evidence")?.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(f.query("SELECT outcome FROM evidence")?, ["PASS"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_objects_of_a_pending_record_are_restored_or_their_loss_judged_before_its_commit() -> R
+{
+    // M2T10R-202: an object the evidence names is put back from the record's bytes or a file that still matches its
+    // digest; one that cannot be is left out, and then the record is INVALID (its file no longer matches, rule 7).
+    let (f, _, c, dir) = pending_qa(&[]).await?;
+    let facts: Value = serde_json::from_slice(&std::fs::read(dir.join("recording.json"))?)?;
+    let object = |v: &Value| -> R<(PathBuf, String)> {
+        Ok((
+            f.root().join(v["path"].as_str().ok_or("no path")?),
+            v["sha256"].as_str().ok_or("no sha")?.to_owned(),
+        ))
+    };
+    let (record_object, record_sha) = object(&facts["record_object"])?;
+    std::fs::remove_file(&record_object)?;
+    let stdout = facts["objects"]
+        .as_array()
+        .and_then(|a| a.iter().find(|o| o["kind"] == "stdout"))
+        .ok_or("no stdout object")?;
+    let (stdout_object, _) = object(stdout)?;
+    std::fs::remove_file(&stdout_object)?;
+    assert_eq!(super_reconcile(&f, &c).await?, 1);
+    assert_eq!(f.query("SELECT outcome FROM evidence")?, ["PASS"]);
+    assert_eq!(hoh_core::objects::hash_file(&record_object)?.0, record_sha);
+    assert!(
+        stdout_object.is_file(),
+        "the stdout object put back from the matching file"
+    );
+    // A second record whose stdout object is lost and whose stdout changed: INVALID, the lost object not registered.
+    let (g, _, c2, dir2) = pending_qa(&[]).await?;
+    let facts: Value = serde_json::from_slice(&std::fs::read(dir2.join("recording.json"))?)?;
+    let stdout = facts["objects"]
+        .as_array()
+        .and_then(|a| a.iter().find(|o| o["kind"] == "stdout"))
+        .ok_or("no stdout object")?;
+    let lost = g.root().join(stdout["path"].as_str().ok_or("no path")?);
+    std::fs::remove_file(&lost)?;
+    std::fs::write(dir2.join("stdout.log"), b"rewritten")?;
+    assert_eq!(super_reconcile(&g, &c2).await?, 1);
+    assert_eq!(g.query("SELECT outcome FROM evidence")?, ["INVALID"]);
+    // The lost object is not among the evidence's objects (an empty stdout shares its object with an empty stderr, so
+    // its path may still be registered for that one).
+    let payload: Value = serde_json::from_str(
+        &g.query("SELECT payload_json FROM events WHERE kind = 'evidence.recorded'")?[0],
+    )?;
+    let names: Vec<&str> = payload["artifacts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|a| a["name"].as_str())
+        .collect();
+    assert!(!names.contains(&"stdout.log"), "{names:?}");
+    assert!(names.contains(&"stderr.log"), "{names:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_pending_file_that_is_not_a_regular_file_is_an_error_at_once() -> R {
+    // M2T10R-203: the pending facts are read only from a regular file, opened without blocking.
+    let (f, _, c, dir) = pending_qa(&[]).await?;
+    let pending = dir.join("recording.json");
+    std::fs::remove_file(&pending)?;
+    assert!(Command::new("mkfifo").arg(&pending).status()?.success());
+    // Unblocks an old reader after five seconds, so the test ends either way.
+    let mut writer = Command::new("timeout")
+        .args(["10", "sh", "-c", "sleep 5; : > \"$0\""])
+        .arg(&pending)
+        .spawn()?;
+    let began = std::time::Instant::now();
+    let held = hoh_app::verify::check::reconcile(&f.store.evidence_handle(), &f.state(), &c).await;
+    let took = began.elapsed();
+    let _ = writer.kill();
+    let _ = writer.wait();
+    assert!(
+        took < Duration::from_secs(3),
+        "the reconciliation blocked for {took:?}"
+    );
+    assert!(
+        matches!(&held, Err(CheckError::Io(why)) if why.contains("not a regular file")),
+        "{held:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_finishing_run_keeps_its_record_from_any_reconciliation_until_its_commit_ends() -> R {
+    // M2T10R-150, -252: while a run's evidence is being committed, its record is its own: a reconciliation then leaves it.
+    let faults = Arc::new(Faults::default());
+    let f = Fixture::with(PLAN, QA_PASSES, faults.clone()).await?;
+    let c = f.frozen().await?;
+    faults.slow.store(true, Ordering::SeqCst);
+    let (ran, reconciled) = tokio::join!(f.run(&c, "qa", QA), async {
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        super_reconcile(&f, &c).await
+    });
+    assert_eq!(
+        ran.map_err(|e| format!("{e:?}"))?.outcome.status.code(),
+        "PASS"
+    );
+    assert_eq!(reconciled?, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_record_another_holds_is_left_and_one_it_left_is_recorded() -> R {
+    // M2T10R-252: the lock is all that keeps a reconciliation off a record; released, the record is recorded.
+    let (f, _, c, dir) = pending_qa(&[]).await?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(".lock"))?;
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive)?;
+    assert_eq!(super_reconcile(&f, &c).await?, 0);
+    drop(lock);
+    assert_eq!(super_reconcile(&f, &c).await?, 1);
+    assert_eq!(f.query("SELECT outcome FROM evidence")?, ["PASS"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_record_file_a_crash_left_unwritten_is_written_from_its_object() -> R {
+    // M2T10R-252 (decision 8): a crash between the pending facts and the record file: the reconciliation writes the
+    // record file, byte for byte the record object the evidence names.
+    let (f, _, c, dir) = pending_qa(&[]).await?;
+    std::fs::remove_file(dir.join("execution.json"))?;
+    assert_eq!(super_reconcile(&f, &c).await?, 1);
+    let named = f.query("SELECT artifact_id FROM evidence")?;
+    let sha = named[0].split(':').next().ok_or("no artifact id")?;
+    assert_eq!(
+        hoh_core::objects::hash_file(&dir.join("execution.json"))?.0,
+        sha
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_record_directory_that_cannot_be_listed_holds_back_its_candidate() -> R {
+    // M2T10R-102, -252: an enumeration that fails is an error, never "nothing pending".
+    use std::os::unix::fs::PermissionsExt as _;
+    let (f, _, c, dir) = pending_qa(&[]).await?;
+    let check_dir = dir.parent().ok_or("no parent")?.to_owned();
+    std::fs::set_permissions(&check_dir, std::fs::Permissions::from_mode(0o000))?;
+    let held = hoh_app::verify::check::reconcile(&f.store.evidence_handle(), &f.state(), &c).await;
+    std::fs::set_permissions(&check_dir, std::fs::Permissions::from_mode(0o755))?;
+    assert!(matches!(held, Err(CheckError::Io(_))), "{held:?}");
+    assert_eq!(super_reconcile(&f, &c).await?, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_replica_judges_a_reconciled_record_as_the_product_did() -> R {
+    // M2T10R-252 (decision 9): a record recorded by the reconciliation is judged by the file scan as the product did.
+    let (f, _, c, _) = pending_qa(&[]).await?;
+    assert_eq!(super_reconcile(&f, &c).await?, 1);
+    let manifest = {
+        let dir = record_dirs(&f, &c, "qa")?.remove(0);
+        let record: Value = serde_json::from_slice(&std::fs::read(dir.join("execution.json"))?)?;
+        record["candidate_manifest"]["path"]
+            .as_str()
+            .ok_or("no manifest")?
+            .to_owned()
+    };
+    let out = Command::new("python3")
+        .args([
+            "-I",
+            "-c",
+            REPLICA,
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../.."),
+        ])
+        .arg(f.root())
+        .arg(&manifest)
+        .output()?;
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let judged: Value = serde_json::from_slice(&out.stdout)?;
+    let product: Value = serde_json::from_str(
+        &f.query("SELECT payload_json FROM events WHERE kind = 'evidence.recorded'")?[0],
+    )?;
+    let id = product["record_id"].as_str().ok_or("no record id")?;
+    assert_eq!(judged["members"][id][0], product["outcome"]);
+    assert_eq!(judged["members"][id][1], product["outcome_reason"]);
+    assert_eq!(judged["members"][id][3], serde_json::json!([]));
     Ok(())
 }
