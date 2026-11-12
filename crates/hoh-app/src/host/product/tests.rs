@@ -29,6 +29,7 @@ fn work(prompt: Option<&str>) -> Work {
                 scope: vec!["任务：T1 Write the parser（职位 developer）".to_owned()],
                 ..hoh_core::context::Facts::default()
             }),
+            writer: true,
         },
     }
 }
