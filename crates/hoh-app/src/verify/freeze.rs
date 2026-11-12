@@ -39,6 +39,9 @@ impl std::fmt::Display for FreezeError {
 
 impl std::error::Error for FreezeError {}
 
+/// The release policy a candidate may track (docs/adr/ADR-027.md principle one).
+pub(crate) const RELEASE_POLICY: &str = "contracts/release-policy.json";
+
 /// The paths HoH writes under `.hoh/` (docs/adr/ADR-027.md decision 3): each must be ignored and untracked.
 const STATE_PATHS: &[&str] = &[
     "state.db",
@@ -359,6 +362,30 @@ fn prepare(checkout: &Path, state: &Path, inputs: &Inputs) -> Result<Prepared, F
             mime: mime(rel).to_owned(),
             kind: what.replace(' ', "_"),
             name: rel.clone(),
+        });
+    }
+    // The release policy the candidate tracks, kept as its other inputs are: judgements read it by its digest, never a
+    // later checkout (docs/adr/ADR-027.md decision 8, recovery protocol v2; M2T10R-200, -250).
+    if let Some(policy) = sealed
+        .manifest
+        .source_files
+        .iter()
+        .find(|f| f.path == RELEASE_POLICY)
+    {
+        let (sha256, bytes) =
+            hoh_core::objects::put_file(project, &checkout.join(RELEASE_POLICY)).map_err(io)?;
+        if sha256 != policy.sha256 {
+            return Err(FreezeError::Refused(vec![format!(
+                "the release policy {RELEASE_POLICY} changed during the freeze"
+            )]));
+        }
+        kept.push(ArtifactRow {
+            path: hoh_core::objects::relative_path(&sha256),
+            sha256,
+            bytes,
+            mime: "application/json".to_owned(),
+            kind: "release_policy".to_owned(),
+            name: RELEASE_POLICY.to_owned(),
         });
     }
     let bytes = serde_json::to_vec_pretty(&sealed.to_value())

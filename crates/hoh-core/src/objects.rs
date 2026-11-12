@@ -228,19 +228,9 @@ pub fn put_file(project: &Path, file: &Path) -> Result<(String, u64), String> {
 /// and kept only if it is a regular file, since a FIFO blocks its reader until someone writes and a device may never end
 /// (M2T10R-04).
 pub fn hash_file(file: &Path) -> Result<(String, u64), String> {
-    use rustix::fs::{Mode, OFlags};
     use std::io::Read as _;
     let at = |e: std::io::Error| format!("{}: {e}", file.display());
-    let fd = rustix::fs::open(
-        file,
-        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|e| at(e.into()))?;
-    let mut input = std::fs::File::from(fd);
-    if !input.metadata().map_err(at)?.file_type().is_file() {
-        return Err(format!("{}: not a regular file", file.display()));
-    }
+    let mut input = open_regular(file)?;
     let mut digest = Sha256::new();
     let mut size = 0u64;
     let mut buffer = vec![0u8; 1 << 16];
@@ -260,6 +250,38 @@ pub fn hash_file(file: &Path) -> Result<(String, u64), String> {
             .collect(),
         size,
     ))
+}
+
+/// The regular file `file`, opened without blocking; anything else refused without being read (M2T10R-04, -203).
+fn open_regular(file: &Path) -> Result<std::fs::File, String> {
+    use rustix::fs::{Mode, OFlags};
+    let at = |e: std::io::Error| format!("{}: {e}", file.display());
+    let fd = rustix::fs::open(
+        file,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| at(e.into()))?;
+    let input = std::fs::File::from(fd);
+    if !input.metadata().map_err(at)?.file_type().is_file() {
+        return Err(format!("{}: not a regular file", file.display()));
+    }
+    Ok(input)
+}
+
+/// The bytes of the regular file `file`, read whole; anything else is refused at once, never read (M2T10R-203).
+pub fn read_regular(file: &Path) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    open_regular(file)?
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("{}: {e}", file.display()))?;
+    Ok(bytes)
+}
+
+/// Whether the project's object `sha256` is there and still holds its bytes.
+pub fn present(project: &Path, sha256: &str) -> bool {
+    object_path(project, sha256).is_ok_and(|p| holds(&p, sha256).unwrap_or(false))
 }
 
 /// Whether the file at `path` holds bytes whose sha256 is `sha256`, read in pieces.
