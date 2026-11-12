@@ -52,6 +52,9 @@ pub enum WriterCompleted {
     Blocked { reason: String },
     /// The attempt had already ended: nothing written (a completion asked again after its commit).
     AlreadyEnded,
+    /// Its run is being cancelled: nothing frozen, accepted or counted; the attempt CANCELLED, its task the cancel's to
+    /// move (ADR-021 decision 8e).
+    Cancelled,
 }
 
 pub(super) fn complete(
@@ -60,16 +63,16 @@ pub(super) fn complete(
     ctx: &super::writer::Ctx<'_>,
 ) -> Result<WriterCompleted, PersistError> {
     let tx = writer::begin(conn, ctx)?;
-    let attempt: Option<(String, String, String, String, i64)> = tx
+    let attempt: Option<(String, bool, String, String, String, i64)> = tx
         .query_row(
-            "SELECT a.state, t.task_id, t.run_id, r.project_id, t.revision FROM attempts a \
+            "SELECT a.state, a.cancel_requested, t.task_id, t.run_id, r.project_id, t.revision FROM attempts a \
              JOIN tasks t ON t.task_id = a.task_id JOIN runs r ON r.run_id = t.run_id WHERE a.attempt_id = ?1",
             params![job.attempt_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
         )
         .optional()
         .map_err(sqlite_error)?;
-    let Some((state, task_id, run_id, project_id, revision)) = attempt else {
+    let Some((state, cancelled, task_id, run_id, project_id, revision)) = attempt else {
         return Err(PersistError::IntegrityViolation(format!(
             "no attempt {}",
             job.attempt_id
@@ -78,6 +81,14 @@ pub(super) fn complete(
     // Its completion committed already (a reconcile asking again after the commit): nothing more.
     if state != "RUNNING" {
         return Ok(WriterCompleted::AlreadyEnded);
+    }
+    // A cancel takes precedence over how the work ended (ADR-021 decision 8e): nothing frozen, accepted or counted; the
+    // settle ends the attempt CANCELLED (read again in its transaction) and leaves its task to the cancel.
+    if cancelled {
+        super::runner::finished_in(&tx, &job.attempt_id, &job.ending, ctx)?;
+        ctx.before_commit()?;
+        tx.commit().map_err(sqlite_error)?;
+        return Ok(WriterCompleted::Cancelled);
     }
     let task = Task {
         project_id,
