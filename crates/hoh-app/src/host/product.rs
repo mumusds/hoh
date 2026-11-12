@@ -307,17 +307,25 @@ impl ProductExecutor {
     ) -> Result<(String, PromptRecord), Refusal> {
         use hoh_core::context;
         let a = &work.assignment;
-        let facts = a.context.clone().unwrap_or_default();
+        let mut facts = a.context.clone().unwrap_or_default();
         let lead = package.map(context::lead).unwrap_or_default();
-        // A Commander turn is told where to write its answers and where the project is (it runs outside it).
-        let bridge = a
-            .supervision
-            .as_ref()
-            .map(|_| attempt_logs(&self.project, &work.attempt_id).join(BRIDGE));
-        if bridge.is_some() {
-            let _ = std::fs::create_dir_all(attempt_logs(&self.project, &work.attempt_id));
+        // Every turn has a bridge file in its attempt's directory (docs/adr/ADR-025.md decision 8, docs/adr/ADR-028.md
+        // decision 2): a Commander turn is told it with where the project is (it runs outside it); a work turn in its
+        // identity header, the values its every output must repeat.
+        let bridge = attempt_logs(&self.project, &work.attempt_id).join(BRIDGE);
+        let _ = std::fs::create_dir_all(attempt_logs(&self.project, &work.attempt_id));
+        if a.supervision.is_none() {
+            facts.identity = Some(context::AttemptIdentity {
+                run_id: work.run_id.clone(),
+                task_id: work.task_id.clone(),
+                attempt_id: work.attempt_id.clone(),
+                role: work.role.clone(),
+                role_epoch: a.role_epoch,
+                bridge: bridge.display().to_string(),
+                verified: None,
+            });
         }
-        let bridge_text = bridge.as_ref().map(|b| b.display().to_string());
+        let bridge_text = a.supervision.as_ref().map(|_| bridge.display().to_string());
         let project = a
             .supervision
             .as_ref()
@@ -565,11 +573,8 @@ impl Executor for ProductExecutor {
         let exec_only = self.exec_only.clone();
         let implementation = (ready.launcher.clone(), ready.version.clone());
         let turn = held.ended;
-        let bridge = work
-            .assignment
-            .supervision
-            .as_ref()
-            .map(|_| attempt_logs(&self.project, &work.attempt_id).join(BRIDGE));
+        // Every turn's bridge lines are read at its end, however it ended (docs/adr/ADR-028.md decision 2).
+        let bridge = attempt_logs(&self.project, &work.attempt_id).join(BRIDGE);
         let logs = attempt_logs(&self.project, &work.attempt_id);
         let project = self.project.clone();
         tokio::spawn(async move {
@@ -588,9 +593,7 @@ impl Executor for ProductExecutor {
                 e.insert(implementation);
             }
             let mut outcome = outcome(facts);
-            if let Some(bridge) = &bridge {
-                outcome.observed.messages = read_bridge(bridge);
-            }
+            outcome.observed.messages = read_bridge(&bridge);
             // Its raw logs kept as objects, on a blocking thread (docs/adr/ADR-026.md decision 10): one that cannot be
             // kept as an object is registered in place; one that cannot be read is a recorded failure.
             let (logs, kept_in) = (logs.clone(), project.clone());
@@ -632,7 +635,7 @@ impl Executor for ProductExecutor {
     }
 }
 
-/// The bridge file of a Commander turn, in its attempt's directory.
+/// The bridge file of a turn, in its attempt's directory (a Commander turn's outputs, a work turn's TaskResult and messages).
 const BRIDGE: &str = "messages.jsonl";
 
 /// Where the raw logs of attempt `attempt_id` go in the project at `project`.

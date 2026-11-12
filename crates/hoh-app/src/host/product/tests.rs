@@ -51,6 +51,32 @@ fn contract(text: &str) -> hoh_core::config::Contract {
 }
 
 #[test]
+fn a_work_turn_is_told_its_identity_and_its_bridge_file() -> Result<(), Box<dyn std::error::Error>>
+{
+    // docs/adr/ADR-028.md decision 2: a developer's prompt starts its task context with the identity its TaskResult must
+    // repeat and the bridge file in its own attempt directory; the directory exists before the turn.
+    let dir = tempfile::tempdir()?;
+    let w = work(None);
+    let (text, _) = executor(dir.path())
+        .pack(&w, &contract("Contract.\n\n"), None)
+        .map_err(|r| format!("{r:?}"))?;
+    let bridge = attempt_logs(dir.path(), &w.attempt_id).join(BRIDGE);
+    for want in [
+        "#### 本次 Attempt",
+        "- run_id：R1",
+        "- task_id：T1",
+        "- attempt_id：R1/T1/a1",
+        "- role：developer",
+        "- role_epoch：1",
+        &bridge.display().to_string(),
+    ] {
+        assert!(text.contains(want), "{want}: {text}");
+    }
+    assert!(bridge.parent().is_some_and(Path::is_dir));
+    Ok(())
+}
+
+#[test]
 fn a_turn_is_sent_its_roles_contract_then_its_layers() -> Result<(), Box<dyn std::error::Error>> {
     // ADR-022 decision 11 and docs/adr/ADR-026.md decisions 2 and 7: a contract without placeholders first, verbatim,
     // then the four layers (the run's goal, the task's id and title, the role); every input kept as an object and the

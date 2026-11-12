@@ -193,8 +193,9 @@ pub struct Observed {
     /// of the writer lease's holder, and the store asks for it then (REQ-019 behaviour 6, docs/adr/ADR-024.md decision
     /// 9).
     pub workspace: Option<serde_json::Value>,
-    /// A supervision turn's file-bridge lines (docs/adr/ADR-025.md decision 8): the runner carries them into its work's
-    /// OBSERVED, where they are recorded as its outputs when it succeeded.
+    /// Its file-bridge lines: the runner carries them into its work's OBSERVED, where a supervision turn's are recorded
+    /// as its outputs when it succeeded (docs/adr/ADR-025.md decision 8) and a work attempt's as `attempt.outputs`
+    /// whatever its end (docs/adr/ADR-028.md decision 2).
     pub messages: Vec<String>,
     /// Its raw logs kept as objects (docs/adr/ADR-026.md decision 10): the runner carries them into its work's OBSERVED,
     /// where they are registered with their producer.
@@ -690,8 +691,9 @@ fn effect(
     let (task_id, _, _, run_id, project_id) = task_of(&tx, attempt_id)?;
     let kind = format!("effect.{}", to.as_str().to_ascii_lowercase());
     let mut detail = detail;
-    // A supervision turn's bridge lines (docs/adr/ADR-025.md decision 8): recorded as its outputs in the transaction of
-    // its work's OBSERVED when it succeeded, else discarded; never kept in the effect's own event.
+    // Its bridge lines: a supervision turn's recorded as its outputs in the transaction of its work's OBSERVED when it
+    // succeeded, else discarded (docs/adr/ADR-025.md decision 8); a work attempt's kept as `attempt.outputs` whatever
+    // its end (docs/adr/ADR-028.md decision 2); never kept in the effect's own event.
     let messages = detail
         .as_object_mut()
         .and_then(|d| d.remove("messages"))
@@ -744,17 +746,26 @@ fn effect(
                 "items": artifacts.iter().map(ArtifactRow::json).collect::<Vec<_>>(), "failed": failed}),
         ));
     }
-    if to == EffectState::Observed
-        && key == crate::reconcile::work_key(attempt_id)
-        && super::wakes::is_supervision(&tx, &task_id)?
-    {
-        events.extend(super::outputs::recorded(
-            &project_id,
-            &run_id,
-            attempt_id,
-            detail["success"] == json!(true),
-            &messages,
-        ));
+    if to == EffectState::Observed && key == crate::reconcile::work_key(attempt_id) {
+        if super::wakes::is_supervision(&tx, &task_id)? {
+            events.extend(super::outputs::recorded(
+                &project_id,
+                &run_id,
+                attempt_id,
+                detail["success"] == json!(true),
+                &messages,
+            ));
+        } else if !messages.is_empty() {
+            // A work attempt's bridge lines (docs/adr/ADR-028.md decision 2): kept whatever its end, read by its
+            // completion (and a reconcile after a crash) through hoh_core::bridge::parse.
+            events.push(event(
+                &project_id,
+                &run_id,
+                child_id(attempt_id, "outputs"),
+                "attempt.outputs",
+                json!({"attempt_id": attempt_id, "success": detail["success"] == json!(true), "lines": messages}),
+            ));
+        }
     }
     writer::write(
         &tx,
