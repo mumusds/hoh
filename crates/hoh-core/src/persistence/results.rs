@@ -301,6 +301,7 @@ pub(super) fn accept_in(
             attempt_id: &result.attempt_id,
             cause: &ready_id,
             outbox_event: 0,
+            follows: None,
         },
     )?;
     let task = |expected: i64, to| StateCas {
@@ -404,7 +405,7 @@ fn run(tx: &Transaction<'_>, run_id: &str) -> Result<Run, PersistError> {
 }
 
 /// The candidate `id` of `run_id` (its identity and state).
-fn load_candidate(
+pub(super) fn load_candidate(
     tx: &Transaction<'_>,
     run_id: &str,
     id: &str,

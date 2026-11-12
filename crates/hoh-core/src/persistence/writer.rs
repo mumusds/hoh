@@ -163,6 +163,11 @@ enum Job {
         Box<super::completion::WriterCompletion>,
         oneshot::Sender<Result<super::completion::WriterCompleted, PersistError>>,
     ),
+    /// A run's verification reconcile ([`super::closing::reconcile`]): its run and the candidates with pending records.
+    VerificationReconcile(
+        Box<(String, std::collections::BTreeSet<String>)>,
+        oneshot::Sender<Result<super::closing::Reconciled, PersistError>>,
+    ),
     /// A verifier attempt's completion ([`super::completion::complete_verifier`]).
     VerifierCompletion(
         Box<super::completion::VerifierCompletion>,
@@ -373,6 +378,7 @@ impl Job {
             Job::Completion(..) => "Completion",
             Job::Request(..) => "Request",
             Job::VerifierCompletion(..) => "VerifierCompletion",
+            Job::VerificationReconcile(..) => "VerificationReconcile",
             Job::Evidence(..) => "Evidence",
             Job::Plan(..) => "Plan",
             Job::Round(..) => "Round",
@@ -542,6 +548,14 @@ impl Writer {
                                 &ctx,
                                 reply,
                                 super::completion::complete(&mut conn, &job, &ctx),
+                            ));
+                        }
+                        Job::VerificationReconcile(job, reply) => {
+                            let (run_id, pending) = *job;
+                            deferred = Some(answer(
+                                &ctx,
+                                reply,
+                                super::closing::reconcile(&mut conn, &run_id, &pending, &ctx),
                             ));
                         }
                         Job::VerifierCompletion(job, reply) => {
@@ -778,6 +792,15 @@ impl Writer {
         completion: super::completion::WriterCompletion,
     ) -> Result<super::completion::WriterCompleted, PersistError> {
         self.submit(|tx| Job::Completion(Box::new(completion), tx))
+            .await
+    }
+
+    pub(super) async fn reconcile_verification(
+        &self,
+        run_id: String,
+        pending: std::collections::BTreeSet<String>,
+    ) -> Result<super::closing::Reconciled, PersistError> {
+        self.submit(|tx| Job::VerificationReconcile(Box::new((run_id, pending)), tx))
             .await
     }
 
