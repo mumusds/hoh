@@ -30,8 +30,9 @@ const HUGE: usize = 8 << 20;
 
 /// A fake agent's TaskResult from nothing but its product prompt's identity header (docs/adr/ADR-028.md decision 2):
 /// the prompt as it came on stdin (`argv[1]`), plain or as JSON lines whose strings hold it; a TaskResult of status
-/// `argv[2]` appended to the bridge file the header names.
-const RESULT_FAKE: &str = r#"import json, re, sys
+/// `argv[2]` appended to the bridge file the header names. While the file `argv[3]` exists, its bytes are first written
+/// as a self-test record in the directory the header names and named in the result's evidence (decision 14).
+const RESULT_FAKE: &str = r#"import hashlib, json, os, re, sys
 raw = open(sys.argv[1], encoding="utf-8").read()
 texts = [raw]
 for line in raw.splitlines():
@@ -54,6 +55,13 @@ result = {"schema_version": "1.0", "run_id": field("run_id"), "task_id": field("
           "attempt_id": field("attempt_id"), "role": field("role"), "role_epoch": int(field("role_epoch")),
           "status": sys.argv[2], "summary": "done by the fake", "candidate_id": None, "evidence": [], "issues": [],
           "next_action": "verify"}
+tests = re.search("- 自测记录目录（[^）]*）：(.+)", text)
+if len(sys.argv) > 3 and os.path.exists(sys.argv[3]) and tests:
+    record = os.path.join(tests.group(1).strip(), "report.txt")
+    os.makedirs(os.path.dirname(record), exist_ok=True)
+    data = open(sys.argv[3], "rb").read()
+    open(record, "wb").write(data)
+    result["evidence"].append({"path": record, "sha256": hashlib.sha256(data).hexdigest()})
 with open(bridge, "a", encoding="utf-8") as f:
     f.write(json.dumps(result) + "\n")
 "#;
@@ -203,7 +211,8 @@ impl World {
     /// exists, 120 s with its pid in `claude.d/probe-pid` while `claude.d/hang` does); a turn reads its prompt, then replays the recorded `success` turn (once `hold` exists, if given), or, for
     /// an attempt whose marker names HUGE, its first frame and then 8 MiB with no LF, or, for one whose marker names
     /// CANCEL, [`CANCEL_STAND_IN`]; one whose marker names RESULT first writes a COMPLETED TaskResult by its prompt's
-    /// identity header ([`RESULT_FAKE`]).
+    /// identity header ([`RESULT_FAKE`]; with the self-test record `claude.d/self-test` while it exists), then prints
+    /// `claude.d/big-log` while it exists (its raw log's extra lines).
     fn claude(&self, hold: Option<&Path>) -> R {
         let wait = hold.map_or(String::new(), |h| {
             format!("while [ ! -e '{}' ]; do sleep 0.05; done\n", h.display())
@@ -219,7 +228,7 @@ impl World {
                  case \"$HOH_ATTEMPT_ID\" in\n\
                   *HUGE*) head -n 1 \"$f/success/stdout.jsonl\"; head -c {HUGE} /dev/zero | tr '\\0' x; sleep 20; exit 0;;\n\
                   *CANCEL*) exec python3 -c '{CANCEL_STAND_IN}' \"$d\" \"$f/success/stdout.jsonl\";;\n\
-                  *RESULT*) python3 \"$d/result.py\" \"$d/stdin.$$\" COMPLETED || exit 1;;\n\
+                  *RESULT*) python3 \"$d/result.py\" \"$d/stdin.$$\" COMPLETED \"$d/self-test\" || exit 1; [ -f \"$d/big-log\" ] && cat \"$d/big-log\";;\n\
                  esac\n{wait}cat \"$f/success/stdout.jsonl\"\n",
                 bin = self.bin().display()
             ),
@@ -1388,6 +1397,225 @@ async fn a_developers_completed_result_is_frozen_accepted_and_settled_in_one_com
             ))?)?;
             assert_eq!(package, message["payload"], "{role}");
         }
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    world.stop_fakes()?;
+    outcome
+}
+
+/// The criteria of the verified project's one requirement (AC-A and AC-B of AC-053-03), each body with its own
+/// sentinel.
+const AC_A: &str = "SENTINEL-AC-A 解析器拒绝空输入";
+const AC_B: &str = "SENTINEL-AC-B 解析器保留输入顺序";
+
+/// A committed project whose specification has one requirement of two criteria and whose test plan has no check, the
+/// world's roles bound to its installed fakes; the specification's sha256.
+fn verified_project(world: &World) -> R<String> {
+    let project = world.project();
+    let spec = "{\"requirements\": [{\"id\": \"REQ-001\", \"acceptance\": [{\"id\": \"AC-001-01\"}, \
+                {\"id\": \"AC-001-02\"}]}]}\n";
+    git(&project, &["init", "-q"])?;
+    for (path, text) in [
+        ("src/lib.rs", "pub fn a() {}\n"),
+        ("contracts/requirements.json", spec),
+        ("tests/check-plan.json", "{\"checks\": {}}\n"),
+    ] {
+        let file = project.join(path);
+        std::fs::create_dir_all(file.parent().ok_or("no parent")?)?;
+        std::fs::write(file, text)?;
+    }
+    git(&project, &["add", "."])?;
+    git(&project, &["commit", "-q", "-m", "first"])?;
+    world.bind_installed()?;
+    let digest = <sha2::Sha256 as sha2::Digest>::digest(spec.as_bytes());
+    Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// In the started host: developer task T-RESULT of the project's two criteria, completed by the fake claude; once its
+/// candidate's round dispatched QA and QA's first turn ended, the prompt that turn was sent (the fake's stdin), the
+/// round's QA handoff package and the candidate.
+async fn first_qa_prompt(world: &World, host: &Host, spec_sha: &str) -> R<(String, Value, String)> {
+    let project = world.project();
+    let run_id = started(host, "s1").await?;
+    exec(
+        &project,
+        &format!(
+            "INSERT INTO specs(spec_id, project_id, sha256, revision) \
+             SELECT 'sv', project_id, '{spec_sha}', 7 FROM runs WHERE run_id = '{run_id}';
+             UPDATE runs SET state = 'RUNNING', spec_id = 'sv' WHERE run_id = '{run_id}';
+             INSERT INTO requirements(requirement_id, spec_id, title, required_release) VALUES ('REQ-001', 'sv', 'r', 1);
+             INSERT INTO acceptance_criteria(ac_id, requirement_id, spec_id, body, check_id) VALUES
+               ('AC-001-01', 'REQ-001', 'sv', '{AC_A}', 'unit'), ('AC-001-02', 'REQ-001', 'sv', '{AC_B}', 'unit');
+             INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate) \
+               VALUES ('T-RESULT', '{run_id}', 'sv', 'READY', 1, 'developer', 1, \
+               (SELECT coalesce(max(created_seq), 0) + 1 FROM tasks), 1);
+             INSERT INTO task_requirements(task_id, requirement_id, spec_id) VALUES ('T-RESULT', 'REQ-001', 'sv');"
+        ),
+    )?;
+    let limit = Duration::from_secs(60);
+    until(&project, &ended("T-RESULT/attempt-1"), "SETTLED/", limit).await?;
+    let candidate = query(&project, "SELECT candidate_id FROM candidates")?;
+    let round = format!("{candidate}/round/1");
+    let qa = format!("{round}/task/qa/attempt-1");
+    let end = Instant::now() + limit;
+    while query(&project, &ended(&qa))?.is_empty() {
+        assert!(Instant::now() < end, "{qa} did not end");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let d = world.bin().join("claude.d");
+    let mut prompt = None;
+    for entry in std::fs::read_dir(&d)? {
+        let name = entry?.file_name().to_string_lossy().into_owned();
+        let Some(pid) = name.strip_prefix("env.") else {
+            continue;
+        };
+        if std::fs::read_to_string(d.join(&name))?
+            .lines()
+            // The marker is the host instance's, then the attempt's id.
+            .any(|l| l.starts_with("HOH_ATTEMPT_ID=") && l.ends_with(&format!("/{qa}")))
+        {
+            prompt = Some(std::fs::read_to_string(d.join(format!("stdin.{pid}")))?);
+        }
+    }
+    let seen: Vec<String> = std::fs::read_dir(&d)?
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("env."))
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .flat_map(|t| {
+            t.lines()
+                .filter(|l| l.starts_with("HOH_"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let prompt = prompt.ok_or(format!(
+        "no turn of {qa} found among {seen:?}: {}; {}",
+        query(&project, &ended(&qa))?,
+        query(
+            &project,
+            &format!(
+                "SELECT group_concat(kind || ' ' || payload_json, ' | ') FROM events WHERE kind LIKE 'attempt.start%' \
+                 AND json_extract(payload_json, '$.attempt_id') = '{qa}'"
+            )
+        )?
+    ))?;
+    let message: Value = serde_json::from_str(&query(
+        &project,
+        &format!("SELECT payload_json FROM outbox WHERE message_id = '{round}/verify/qa'"),
+    )?)?;
+    Ok((prompt, message["payload"].clone(), candidate))
+}
+
+#[tokio::test]
+async fn test_053_03_qa_is_sent_the_in_scope_criteria_before_the_developers_self_test_record_marked_diagnostic()
+-> R {
+    // AC-053-03 through the product's executor and dispatch (docs/adr/ADR-028.md decision 14, M2T16D-158): the fake
+    // Developer writes its self-test record R, holding ALL TESTS PASSED, under .hoh/self-tests/<its attempt>/ and names
+    // it in its COMPLETED TaskResult. QA's handoff names AC-A and AC-B and the candidate C; QA's prompt has both
+    // criteria's bodies before R's content, which sits in the evidence context layer under its diagnostic label.
+    let world = World::new()?;
+    world.claude(None)?;
+    let sentinel = "ALL TESTS PASSED SENTINEL-053-03";
+    std::fs::write(
+        world.bin().join("claude.d/self-test"),
+        format!("cargo test: 12 passed\n{sentinel}\n"),
+    )?;
+    let spec_sha = verified_project(&world)?;
+    let host = start_when_free(world.config()).await?;
+    let outcome = async {
+        let (prompt, package, candidate) = first_qa_prompt(&world, &host, &spec_sha).await?;
+        assert_eq!(package["acceptance_ids"], json!(["AC-001-01", "AC-001-02"]));
+        assert_eq!(package["candidate"]["id"], candidate.as_str());
+        assert_eq!(package["role"], "qa");
+        let kept = query(
+            &world.project(),
+            "SELECT json_extract(j.value, '$.kind') || ':' || json_extract(j.value, '$.name') FROM events e, \
+             json_each(json_extract(e.payload_json, '$.items')) j WHERE e.event_id = 'T-RESULT/attempt-1/artifacts/self_tests'",
+        )?;
+        assert_eq!(
+            kept,
+            "self_test:.hoh/self-tests/T-RESULT%2Fattempt-1/report.txt"
+        );
+        let at = |what: &str| prompt.find(what).ok_or(format!("{what} is not in the prompt"));
+        let r = at(sentinel)?;
+        assert_eq!(prompt.matches(sentinel).count(), 1, "{prompt}");
+        assert!(at(AC_A)? < r && at(AC_B)? < r, "{prompt}");
+        let evidence = at("### 证据上下文")?;
+        assert!(evidence < r, "R is in the evidence context layer: {prompt}");
+        let block = prompt[..r].rfind("\n#### 〔").ok_or("R has no block")?;
+        assert!(block > evidence, "{prompt}");
+        let head = &prompt[block..r];
+        assert!(head.contains("〔证据〕self-tests/"), "{head}");
+        assert!(head.contains("diagnostic"), "R is labelled diagnostic: {head}");
+        keep(
+            "m2t16-test-053-03",
+            &json!({"candidate_id": candidate, "acceptance_ids": package["acceptance_ids"],
+                "offsets": {"ac_a": at(AC_A)?, "ac_b": at(AC_B)?, "r": r, "evidence_layer": evidence},
+                "block_head": head, "prompt_sha256": <sha2::Sha256 as sha2::Digest>::digest(prompt.as_bytes())
+                    .iter().map(|b| format!("{b:02x}")).collect::<String>()}),
+        )?;
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    world.stop_fakes()?;
+    outcome
+}
+
+#[tokio::test]
+async fn test_039_03_qa_is_sent_the_developers_large_raw_log_by_reference_only() -> R {
+    // AC-039-03's QA half through the product's dispatch (docs/adr/ADR-028.md decision 14, CR-016): the Developer's
+    // raw log of more than 200 KB holds a unique sentinel at its start, middle and end and is registered in its
+    // attempt.artifacts (raw_log). The QA handoff's references are ArtifactRefs (path and 64 hex digits, the file there)
+    // and include that log; QA's prompt holds the sentinel 0 times, names the log only by its reference and fits the
+    // package's budget.
+    let world = World::new()?;
+    world.claude(None)?;
+    let sentinel = "SENTINEL-039-03-qa-7d21";
+    let padding = |c: char| c.to_string().repeat(105_000);
+    let frame = json!({"type": "system", "subtype": "task_started",
+        "description": format!("{sentinel} {} {sentinel} {} {sentinel}", padding('x'), padding('y'))});
+    std::fs::write(world.bin().join("claude.d/big-log"), format!("{frame}\n"))?;
+    let spec_sha = verified_project(&world)?;
+    let host = start_when_free(world.config()).await?;
+    let outcome = async {
+        let project = world.project();
+        let (prompt, package, _) = first_qa_prompt(&world, &host, &spec_sha).await?;
+        let logs = query(
+            &project,
+            "SELECT group_concat(json_extract(j.value, '$.sha256') || ':' || json_extract(j.value, '$.bytes'), ',') \
+             FROM events e, json_each(json_extract(e.payload_json, '$.items')) j \
+             WHERE e.event_id = 'T-RESULT/attempt-1/artifacts' AND json_extract(j.value, '$.kind') = 'raw_log'",
+        )?;
+        let log = logs
+            .split(',')
+            .filter_map(|l| l.split_once(':'))
+            .find(|(sha, bytes)| {
+                bytes.parse::<usize>().is_ok_and(|b| b >= 200_000)
+                    && hoh_core::objects::get(&project, sha)
+                        .is_ok_and(|b| String::from_utf8_lossy(&b).matches(sentinel).count() == 3)
+            })
+            .map(|(sha, _)| sha.to_owned())
+            .ok_or(format!("no raw log of 200 KB holding the sentinel: {logs}"))?;
+        let package: hoh_core::protocol::ContextHandoff = hoh_core::protocol::decode(&package)?;
+        assert!(!package.references.is_empty());
+        for r in &package.references {
+            assert!(r.sha256.len() == 64 && r.sha256.bytes().all(|b| b.is_ascii_hexdigit()), "{r:?}");
+            assert!(project.join(&r.path).is_file(), "{} is not there", r.path);
+        }
+        assert!(package.references.iter().any(|r| r.sha256 == log), "the log is referenced");
+        assert_eq!(prompt.matches(sentinel).count(), 0);
+        assert!(prompt.contains(&log), "the log by its reference");
+        let tokens = hoh_core::context::estimate(&prompt);
+        assert!(tokens <= package.budget_tokens, "{tokens} > {}", package.budget_tokens);
+        keep(
+            "m2t16-test-039-03-qa",
+            &json!({"log_sha256": log, "references": package.references.iter().map(|r| json!({"path": r.path,
+                "sha256": r.sha256})).collect::<Vec<_>>(), "tokens": tokens, "budget_tokens": package.budget_tokens,
+                "sentinel_count": 0}),
+        )?;
         R::Ok(())
     }
     .await;
@@ -2890,11 +3118,14 @@ async fn a_turn_whose_mandatory_items_exceed_its_runs_budget_is_refused_and_its_
 }
 
 #[tokio::test]
-async fn a_new_commanders_prompt_carries_references_and_none_of_its_predecessors_logs() -> R {
-    // REQ-039 behaviour 5 and failure mode 3 (docs/adr/ADR-026.md decision 10), the Commander half of AC-039-03 (whose
-    // QA half needs M2-T16's dispatch, CR-016; this test is no evidence of AC-039-03): the old Commander's session
-    // produced a raw log of more than 200 KB holding a unique sentinel, registered as its object; an adapter frame and a
-    // TaskResult inside a candidate_ready hold it too. The new Commander's package references the log's object (64 hex
+async fn test_039_03_a_new_commanders_prompt_carries_references_and_none_of_the_runs_large_logs()
+-> R {
+    // REQ-039 behaviour 5 and failure mode 3 (docs/adr/ADR-026.md decision 10), the Commander half of AC-039-03 (its QA
+    // half: test_039_03_qa_is_sent_the_developers_large_raw_log_by_reference_only): a Developer attempt of the run
+    // produced a raw log of more than 200 KB holding a unique sentinel, registered in its attempt.artifacts (raw_log);
+    // so did the old Commander's session, the log a Commander's handover references (its predecessor's products,
+    // decision 10; docs/adr/ADR-028.md, implementation correction 3); an adapter frame and a TaskResult inside a
+    // candidate_ready hold the sentinel too. The new Commander's package references the old Commander's log (64 hex
     // digits, the file there); its first prompt holds the sentinel 0 times and fits the package's budget.
     let world = World::new()?;
     world.claude(None)?;
@@ -2918,6 +3149,12 @@ async fn a_new_commanders_prompt_carries_references_and_none_of_its_predecessors
         let item = json!({"artifact_id": format!("{sha}:p"), "sha256": sha,
             "path": hoh_core::objects::relative_path(&sha), "bytes": log.len(), "mime": "text/plain",
             "kind": "raw_log", "name": "stdout.jsonl"});
+        // The Developer's own log: other bytes, the same sentinel.
+        let developer_log = format!("{sentinel}\n{}\n{sentinel}\n", "d".repeat(210_000));
+        let developer_sha = hoh_core::objects::put(&project, developer_log.as_bytes())?;
+        let developer_item = json!({"artifact_id": format!("{developer_sha}:p"), "sha256": developer_sha,
+            "path": hoh_core::objects::relative_path(&developer_sha), "bytes": developer_log.len(),
+            "mime": "text/plain", "kind": "raw_log", "name": "stdout.jsonl"});
         exec(
             &project,
             &format!(
@@ -2931,6 +3168,14 @@ async fn a_new_commanders_prompt_carries_references_and_none_of_its_predecessors
                  INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
                    SELECT project_id, 'T-old/attempt-1/artifacts', '{run_id}', 'attempt.artifacts',
                    json_object('attempt_id', 'T-old/attempt-1', 'items', json_array(json('{item}'))),
+                   '2026-11-10T00:00:00Z' FROM runs WHERE run_id = '{run_id}';
+                 INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq)
+                   VALUES ('T-dev', '{run_id}', 's3', 'IMPLEMENTED', 1, 'developer', 1, 2);
+                 INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision)
+                   VALUES ('T-dev/attempt-1', 'T-dev', 'SETTLED', 1, 1, 1);
+                 INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
+                   SELECT project_id, 'T-dev/attempt-1/artifacts', '{run_id}', 'attempt.artifacts',
+                   json_object('attempt_id', 'T-dev/attempt-1', 'items', json_array(json('{developer_item}'))),
                    '2026-11-10T00:00:00Z' FROM runs WHERE run_id = '{run_id}';
                  INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
                    SELECT project_id, 'frame-039-03', '{run_id}', 'adapter.unknown_event',
@@ -3012,7 +3257,7 @@ async fn a_new_commanders_prompt_carries_references_and_none_of_its_predecessors
         );
         assert!(handover < wake_event, "{sent}");
         keep(
-            "m2t09-commander-handover",
+            "m2t16-test-039-03-commander",
             &json!({"package": input["package"], "prompt_sha256": <sha2::Sha256 as sha2::Digest>::digest(sent.as_bytes()).iter().map(|b| format!("{b:02x}")).collect::<String>(),
                 "tokens": tokens, "sentinel_count": 0}),
         )?;
