@@ -95,6 +95,10 @@ fn keep_first_input_with(
         .session_id
         .as_deref()
         .ok_or("the binding has no session")?;
+    // The package's object, whose digest its handoffs row registered (docs/adr/ADR-028.md decision 9).
+    let package =
+        hoh_core::persistence::package_bytes(&start.package).map_err(|e| e.to_string())?;
+    hoh_core::objects::put(project, &package)?;
     let path = first_input_path(project, session);
     let body = serde_json::to_vec(&serde_json::json!({
         "message_id": start.message_id, "session_id": session, "package": start.package,

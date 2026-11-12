@@ -123,7 +123,7 @@ fn previous(conn: &Connection, from: &serde_json::Value) -> Result<Vec<String>, 
 /// run's (see [`spec`]), none while it has none (CR-014); `from` and `to` are the bindings as team.binding_applied records them.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn prepare(
-    conn: &Connection,
+    conn: &rusqlite::Transaction<'_>,
     project_id: &str,
     run_id: &str,
     role: &str,
@@ -175,9 +175,35 @@ pub(super) fn prepare(
         )?,
         budget_tokens: super::context::budget(conn, run_id)?,
     });
+    let message_id = crate::ids::child_id(run_id, &format!("session-start/{role}/{epoch}"));
+    // Its handoffs row, PREPARED, its package registered as the object of its own bytes, which the executor writes
+    // when it takes the first input (docs/adr/ADR-028.md decision 9).
+    let bytes = package_bytes(&package)?;
+    let sha256 = crate::context::sha256_hex(&bytes);
+    let object = super::runner::ArtifactRow {
+        path: crate::objects::relative_path(&sha256),
+        sha256,
+        bytes: bytes.len() as u64,
+        mime: "application/json".to_owned(),
+        kind: "handoff_package".to_owned(),
+        name: message_id.clone(),
+    };
+    super::runner::register(conn, std::slice::from_ref(&object))?;
+    conn.execute(
+        "INSERT OR IGNORE INTO handoffs(handoff_id, run_id, from_role, to_role, role_epoch, package_artifact_id, state, \
+         created_at) VALUES (?1, ?2, ?3, ?3, ?4, ?5, 'PREPARED', ?6)",
+        params![
+            message_id,
+            run_id,
+            role,
+            role_epoch,
+            super::runner::artifact_id(&object.sha256, &object.path),
+            crate::time::now_rfc3339()
+        ],
+    )
+    .map_err(sqlite_error)?;
     let package = crate::protocol::encode(&package)
         .map_err(|e| PersistError::IntegrityViolation(format!("the handover package: {e}")))?;
-    let message_id = crate::ids::child_id(run_id, &format!("session-start/{role}/{epoch}"));
     let event = super::writer::NewEvent {
         project_id: project_id.to_owned(),
         event_id: crate::ids::child_id(run_id, &format!("handoff/{role}/{epoch}")),
@@ -202,6 +228,15 @@ pub(super) fn prepare(
         }),
     };
     Ok((event, notice))
+}
+
+/// The bytes of handover package `package` as its object keeps them (docs/adr/ADR-028.md decision 9): the store
+/// registers their digest when it writes the handoff, the executor writes them when it takes the first input.
+pub fn package_bytes(package: &crate::protocol::ContextHandoff) -> Result<Vec<u8>, PersistError> {
+    let value = crate::protocol::encode(package)
+        .map_err(|e| PersistError::IntegrityViolation(format!("the handover package: {e}")))?;
+    serde_json::to_vec(&value)
+        .map_err(|e| PersistError::IntegrityViolation(format!("the handover package: {e}")))
 }
 
 /// A session.start notice waiting for the runner (decision 4): its package, and the binding of its role as it is now.
@@ -378,6 +413,17 @@ pub(super) fn settle(
     tx.execute(
         "UPDATE outbox SET state = 'ACKED', next_retry_at = NULL WHERE message_id = ?1",
         params![message_id],
+    )
+    .map_err(sqlite_error)?;
+    // Its handoffs row: DELIVERED with the package, REJECTED when superseded (docs/adr/ADR-028.md decision 9).
+    let (state, from) = if delivered_to.is_some() {
+        ("DELIVERED", "'PREPARED'")
+    } else {
+        ("REJECTED", "'PREPARED', 'DELIVERED'")
+    };
+    tx.execute(
+        &format!("UPDATE handoffs SET state = ?2 WHERE handoff_id = ?1 AND state IN ({from})"),
+        params![message_id, state],
     )
     .map_err(sqlite_error)?;
     let mut payload = json!({"run_id": run_id, "role": role, "message_id": message_id});

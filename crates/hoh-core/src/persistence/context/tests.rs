@@ -634,3 +634,45 @@ fn a_reworked_developer_turn_is_given_its_rejected_candidates_failures_open_issu
     );
     Ok(())
 }
+
+#[test]
+fn a_change_requests_issue_in_a_wake_is_marked_for_the_runtimes_rework_after_its_round() -> R {
+    // docs/adr/ADR-028.md decision 13 (M2T16D-355): an Issue a verifier's change request opened is reworked by the
+    // Runtime once its round closes; the wake that shows it says so, in its text and its short form, so the Commander
+    // does not plan a repair of its own. Another Issue is shown as it is.
+    let (_dir, conn) = world()?;
+    let s = supervision(
+        json!({"T1": 5}),
+        &[("role", "qa")],
+        json!([
+            {"seq": 5, "kind": "issue.opened", "payload": {"issue_id": "I1", "round_id": "CAND-7/round/1",
+                "candidate_id": "CAND-7", "severity": "critical", "source": "change_request"}},
+            {"seq": 6, "kind": "issue.opened", "payload": {"issue_id": "I2", "severity": "critical"}}
+        ]),
+    );
+    let facts = facts(&conn, "R", "W/turn/1", "A9", Some(&s))?;
+    let of = |seq: u64| {
+        facts
+            .entries
+            .iter()
+            .find(|e| e.path == format!("events/{seq}"))
+            .cloned()
+            .ok_or(format!("no event {seq}"))
+    };
+    let marked = of(5)?;
+    assert!(
+        marked.text.contains("轮次关闭后由 Runtime 返工"),
+        "{}",
+        marked.text
+    );
+    assert!(
+        marked
+            .summary
+            .as_deref()
+            .is_some_and(|s| s.contains("轮次关闭后由 Runtime 返工")),
+        "{:?}",
+        marked.summary
+    );
+    assert!(!of(6)?.text.contains("轮次关闭后由 Runtime 返工"));
+    Ok(())
+}
