@@ -272,6 +272,7 @@ fn outcome(facts: Facts) -> Outcome {
             messages_truncated: false,
             artifacts: Vec::new(),
             artifacts_failed: Vec::new(),
+            final_text: facts.final_text,
         },
         unknown_effect: facts.state == AttemptState::UnknownEffect,
     }

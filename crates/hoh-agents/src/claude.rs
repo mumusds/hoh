@@ -549,6 +549,7 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
             group_reaped: driven.report.as_ref().is_some_and(|r| r.group_reaped),
             recorded,
             degraded: None,
+            final_text: driven.result.and_then(|r| r.text),
         }
     });
     Ok(Held {

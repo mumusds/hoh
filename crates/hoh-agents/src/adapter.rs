@@ -65,6 +65,9 @@ pub struct Facts {
     /// Why the agent's preferred transport could not serve this turn (Codex's App Server, decision 15): the next
     /// attempt is to use the other.
     pub degraded: Option<String>,
+    /// The text of its final assistant message, where a verifier's report block is read (docs/adr/ADR-028.md
+    /// decision 15); none when it gave none.
+    pub final_text: Option<String>,
 }
 
 impl Facts {
@@ -84,6 +87,7 @@ impl Facts {
             group_reaped: report.is_some_and(|r| r.group_reaped),
             recorded: Vec::new(),
             degraded: None,
+            final_text: None,
         }
     }
 
@@ -100,6 +104,7 @@ impl Facts {
             group_reaped: false,
             recorded,
             degraded: None,
+            final_text: None,
         }
     }
 }
