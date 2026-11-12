@@ -211,7 +211,6 @@ pub struct RunAcceptance {
     pub criteria: Vec<(String, String, bool)>,
 }
 
-/// The run `run_id`'s specification and criteria, if the run exists and has a specification.
 /// The outcome of the evidence `evidence_id`, if it is recorded.
 pub(super) fn evidence_outcome(
     conn: &Connection,
@@ -226,6 +225,7 @@ pub(super) fn evidence_outcome(
     .map_err(sqlite_error)
 }
 
+/// The run `run_id`'s specification and criteria, if the run exists and has a specification.
 pub(super) fn acceptance(
     conn: &Connection,
     run_id: &str,

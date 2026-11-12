@@ -7,8 +7,8 @@ use hoh_core::persistence::{
     AcceptanceRow, ArtifactRow, EvidenceHandle, PersistError, Reader, Recording,
 };
 use hoh_core::verification::{
-    AcSpec, Evidence, FileRef, Manifest, NamedRef, OUTCOME_REASONS, Outcome, Planned, Reason,
-    Record, Runner, Sealed, Status, outcome, plan_shape, rows, valid,
+    AcSpec, Evidence, FileRef, Manifest, NamedRef, Planned, Record, Runner, Sealed, outcome,
+    plan_shape, rows, valid,
 };
 use serde_json::Value;
 use std::path::Path;
@@ -326,16 +326,19 @@ fn relative_to(project: &Path, path: &Path) -> String {
         .join("/")
 }
 
-/// What a run leaves for the judge: the record and the observations, the trees before and after, and the post-check's
-/// differences.
-struct Done {
-    evidence: Evidence,
-    clock: Value,
+/// A run's facts, which its judgement cannot get again from the files (docs/adr/ADR-027.md decision 8, recovery
+/// protocol): its record and the objects kept of it, the trees before and after, the post-check's differences and the
+/// clocks. They are the record directory's pending file until its evidence is committed; the judgement is never kept
+/// with them, it is made on the files as they are when the record is committed (M2T10R-103).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct Facts {
+    record: Record,
+    record_object: ArtifactRow,
+    objects: Vec<ArtifactRow>,
     tree_before: Value,
     tree_after: Value,
     integrity: Vec<String>,
-    objects: Vec<ArtifactRow>,
-    record_object: ArtifactRow,
+    clock: Value,
 }
 
 /// The world a record is judged in (docs/adr/ADR-027.md principle one): the store's attempts and candidates, the
@@ -489,7 +492,7 @@ pub async fn run(
     let handle = store.evidence_handle();
     // First the records a crash or a failed commit left without their evidence: a later run never takes their place
     // in the history (M2T10R-05).
-    reconcile(&handle, state).await?;
+    reconcile(&handle, checkout, state, &request.candidate_id).await?;
     let project = state
         .parent()
         .ok_or_else(|| io(format!("{} has no parent", state.display())))?
@@ -663,7 +666,7 @@ async fn finish(
     // wall clock's own finish goes to the evidence event (M2T10D-701, -750).
     let finished = started + elapsed;
     // After: the post-check, the record, the objects.
-    let done = {
+    let facts = {
         let (checkout, request, project, ready) = (
             checkout.to_owned(),
             request.clone(),
@@ -672,7 +675,7 @@ async fn finish(
         );
         let (record_dir, record_id, export) =
             (record_dir.clone(), record_id.clone(), export.clone());
-        tokio::task::spawn_blocking(move || -> Result<Done, CheckError> {
+        tokio::task::spawn_blocking(move || -> Result<Facts, CheckError> {
             let io = |e: String| CheckError::Io(e);
             // A post-check that cannot run cannot show the source unchanged: that is recorded, never lost (M2T10R-02).
             let integrity = differences(&checkout, &ready.sealed.manifest).unwrap_or_else(|e| {
@@ -742,27 +745,6 @@ async fn finish(
                 },
             };
             let bytes = serde_json::to_vec_pretty(&record).map_err(|e| io(e.to_string()))?;
-            // Observations (decision 8): the result lines; without any, the declared artifacts found with the
-            // record's own conclusion.
-            let mut observations = Vec::new();
-            if let Some(results) = record
-                .artifacts
-                .iter()
-                .find(|a| a.name == "test-results.jsonl")
-            {
-                // As bytes, line by line, as the gate and the replica read it: a line that is not JSON (not UTF-8,
-                // say) stays a line, and is not a result line (rule 1).
-                let bytes = std::fs::read(project.join(&results.path)).unwrap_or_default();
-                let blank = |l: &[u8]| l.iter().all(|b| b" \t\n\r\x0b\x0c".contains(b));
-                for line in bytes.split(|b| *b == b'\n').filter(|l| !blank(l)) {
-                    observations.push(serde_json::from_slice(line).unwrap_or_else(|_| {
-                        Value::String(String::from_utf8_lossy(line).into_owned())
-                    }));
-                }
-            }
-            if observations.is_empty() {
-                observations = hoh_core::verification::fallback(&record);
-            }
             // The record's files kept as objects (decision 8).
             let keep = |p: &Path, kind: &str, name: &str| -> Result<ArtifactRow, CheckError> {
                 let (sha256, bytes) = hoh_core::objects::put_file(&project, p).map_err(io)?;
@@ -791,177 +773,69 @@ async fn finish(
                 kind: "execution".to_owned(),
                 name: "execution.json".to_owned(),
             };
-            let git_tree = tree_after["head_tree"]
-                .as_str()
-                .unwrap_or_default()
-                .to_owned();
-            Ok(Done {
+            Ok(Facts {
+                record,
+                record_object,
+                objects,
+                tree_before,
+                tree_after,
+                integrity,
                 clock: serde_json::json!({
                     "wall_finished_at": hoh_core::time::rfc3339_millis_utc(wall_finished),
                     "monotonic_seconds": duration,
                 }),
-                evidence: Evidence {
-                    record,
-                    git_tree,
-                    record_dir: rel(&record_dir),
-                    observations,
-                },
-                tree_before,
-                tree_after,
-                integrity,
-                objects,
-                record_object,
             })
         })
         .await
         .map_err(blocking)??
     };
-    // The judgement (principle one) and its rows (decision 9).
-    let (recording, ran) = {
+    // Under the record's lock from its pending file to its commit, so no reconciliation takes it meanwhile (M2T10R-150):
+    // the pending facts first, then the record file, then the judgement on the files as they are and the commit; from
+    // the pending file on, a crash or a failed commit is finished by the next run of the candidate (M2T10R-05).
+    let (lock, recording, ran) = {
         let reader = handle.reader().map_err(CheckError::Store)?;
-        let (project, state, ready, checkout) = (
+        let (project, state, checkout, ready, record_dir) = (
             project.clone(),
-            state.to_owned(),
+            state.clone(),
+            checkout.clone(),
             ready.clone(),
-            checkout.to_owned(),
+            record_dir.clone(),
         );
-        let record_dir = record_dir.clone();
-        tokio::task::spawn_blocking(move || -> Result<(Recording, Ran), CheckError> {
-            let m = &ready.sealed.manifest;
-            let plan: Value = hoh_core::objects::get(&project, &m.test_plan.sha256)
-                .and_then(|b| serde_json::from_slice(&b).map_err(|e| e.to_string()))
-                .map_err(CheckError::Io)?;
-            let policy = m
-                .source_files
-                .iter()
-                .any(|f| f.path == "contracts/release-policy.json")
-                .then(|| std::fs::read(checkout.join("contracts/release-policy.json")).ok())
-                .flatten()
-                .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
-            let world = World {
-                reader: &reader,
-                project: &project,
-                evidence: &state.join("evidence"),
-                plan: &plan,
-                policy,
-            };
-            let e = &done.evidence;
-            let verdict = valid(e, &ready.sealed, &m.spec.sha256, &world);
-            let outcome = outcome(e, &verdict, &world);
-            let reasons: Vec<&'static str> = verdict
-                .as_ref()
-                .err()
-                .map(|i| i.codes())
-                .unwrap_or_default();
-            let check_degradable = matches!(
-                hoh_core::verification::Lookup::policy(&world, &e.record.check_id),
-                hoh_core::verification::PolicyCheck::Check(ref p) if p.degradable
-            );
-            // The rows need the run's spec to be the candidate's; each AC's TEST is the one the frozen spec declares.
-            let mut rows_out = Vec::new();
-            if let Some(acceptance) = reader
-                .acceptance(&ready.run_id)
-                .map_err(CheckError::Store)?
-                && acceptance.spec_sha256 == m.spec.sha256
-            {
-                let spec: Value = hoh_core::objects::get(&project, &m.spec.sha256)
-                    .and_then(|b| serde_json::from_slice(&b).map_err(|e| e.to_string()))
-                    .map_err(CheckError::Io)?;
-                let declared: std::collections::BTreeMap<String, String> = spec["requirements"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .flat_map(|r| r["acceptance"].as_array().into_iter().flatten())
-                    .filter_map(|a| {
-                        Some((
-                            a["id"].as_str()?.to_owned(),
-                            a["test_id"].as_str()?.to_owned(),
-                        ))
-                    })
-                    .collect();
-                let acs: Vec<AcSpec> = acceptance
-                    .criteria
-                    .iter()
-                    .filter_map(|(ac, check, degradable)| {
-                        Some(AcSpec {
-                            ac_id: ac.clone(),
-                            test_id: declared.get(ac)?.clone(),
-                            check_id: check.clone(),
-                            degradable: *degradable,
-                        })
-                    })
-                    .collect();
-                for (ac_id, status) in rows(e, &outcome, &acs, check_degradable) {
-                    let test = acs
-                        .iter()
-                        .find(|a| a.ac_id == ac_id)
-                        .map(|a| a.test_id.clone())
-                        .unwrap_or_default();
-                    rows_out.push(AcceptanceRow {
-                        ac_id,
-                        spec_id: acceptance.spec_id.clone(),
-                        status: status.code(),
-                        reason: if reasons.is_empty() {
-                            format!("{test} in check {}", e.record.check_id)
-                        } else {
-                            format!(
-                                "{test} in check {}: {}",
-                                e.record.check_id,
-                                reasons.join(", ")
-                            )
-                        },
-                    });
-                }
-            }
-            let ran = Ran {
-                record_id: e.record.record_id.clone(),
-                record_dir,
-                outcome,
-                reasons: reasons.clone(),
-            };
-            Ok((
-                Recording {
-                    record: e.record.clone(),
-                    record_object: done.record_object.clone(),
-                    objects: done.objects.clone(),
-                    outcome,
-                    reasons,
-                    tree_before: done.tree_before.clone(),
-                    tree_after: done.tree_after.clone(),
-                    clock: done.clock.clone(),
-                    observations: e.observations.clone(),
-                    rows: rows_out,
-                    integrity: done.integrity.clone(),
+        tokio::task::spawn_blocking(move || -> Result<_, CheckError> {
+            let lock = lock_record(&record_dir, true)?
+                .ok_or_else(|| CheckError::Io("the record's lock was not granted".to_owned()))?;
+            let text =
+                serde_json::to_vec_pretty(&facts).map_err(|e| CheckError::Io(e.to_string()))?;
+            write_new(&record_dir.join(PENDING), &text)?;
+            let bytes = serde_json::to_vec_pretty(&facts.record)
+                .map_err(|e| CheckError::Io(e.to_string()))?;
+            write_new(&record_dir.join("execution.json"), &bytes)?;
+            let (recording, ran) = judge(
+                &reader,
+                &Judged {
+                    project: &project,
+                    state: &state,
+                    checkout: &checkout,
+                    sealed: &ready.sealed,
+                    run_id: &ready.run_id,
+                    record_dir: &record_dir,
                 },
-                ran,
-            ))
+                &facts,
+            )?;
+            Ok((lock, recording, ran))
         })
         .await
         .map_err(blocking)??
     };
-    // Pending first, then the record file, then the commit: from the pending evidence on, the next run can finish
-    // what a crash or a failed commit leaves (M2T10R-05); the record appears whole or not at all (M2T10R-56).
-    {
-        let (record_dir, pending) = (ran.record_dir.clone(), Pending::of(&recording));
-        tokio::task::spawn_blocking(move || -> Result<(), CheckError> {
-            let text =
-                serde_json::to_vec_pretty(&pending).map_err(|e| CheckError::Io(e.to_string()))?;
-            write_new(&record_dir.join(PENDING), &text)?;
-            let bytes = serde_json::to_vec_pretty(&pending.record)
-                .map_err(|e| CheckError::Io(e.to_string()))?;
-            write_new(&record_dir.join("execution.json"), &bytes)
-        })
-        .await
-        .map_err(blocking)??;
-    }
     handle
         .record_evidence(recording)
         .await
         .map_err(CheckError::Store)?;
+    drop(lock);
     Ok(ran)
 }
 
-/// A record directory's pending evidence (M2T10R-05): what is committed, kept beside the record until it is.
+/// A record directory's pending facts (M2T10R-05, -103): kept beside the record until its evidence is committed.
 const PENDING: &str = "recording.json";
 
 /// What a [`CheckError`] says.
@@ -985,9 +859,13 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<(), CheckError> {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let staged = dir.join(format!(".{name}.staged"));
-    // A crash's leftover is not the file: it is only ever the staged copy.
-    let _ = std::fs::remove_file(&staged);
+    // A staged copy of this writer's own: two writers of one record never share one (M2T10R-100).
+    static STAGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let staged = dir.join(format!(
+        ".{name}.{}.{}.staged",
+        std::process::id(),
+        STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let written = (|| -> std::io::Result<()> {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
@@ -995,162 +873,316 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<(), CheckError> {
             .open(&staged)?;
         file.write_all(bytes)?;
         file.sync_all()?;
-        std::fs::hard_link(&staged, path)?;
-        std::fs::File::open(dir)?.sync_all()
+        match std::fs::hard_link(&staged, path) {
+            Ok(()) => std::fs::File::open(dir)?.sync_all(),
+            // Already published: the same bytes are no error, others are.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if std::fs::read(path)? == bytes {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::other("it exists with other bytes"))
+                }
+            }
+            Err(e) => Err(e),
+        }
     })();
     let _ = std::fs::remove_file(&staged);
     written.map_err(at)
 }
 
-/// A [`Recording`] as text (its codes as their strings), to be read back by [`reconcile`].
-#[derive(serde::Serialize, serde::Deserialize)]
-struct Pending {
-    record: Record,
-    record_object: ArtifactRow,
-    objects: Vec<ArtifactRow>,
-    outcome: String,
-    outcome_reason: Option<String>,
-    reasons: Vec<String>,
-    tree_before: Value,
-    tree_after: Value,
-    clock: Value,
-    observations: Vec<Value>,
-    rows: Vec<PendingRow>,
-    integrity: Vec<String>,
+/// Where a record is judged: the project, its state, the checkout, the candidate and its run, the record's directory.
+struct Judged<'a> {
+    project: &'a Path,
+    state: &'a Path,
+    checkout: &'a Path,
+    sealed: &'a Sealed,
+    run_id: &'a str,
+    record_dir: &'a Path,
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PendingRow {
-    ac_id: String,
-    spec_id: String,
-    status: String,
-    reason: String,
-}
-
-impl Pending {
-    fn of(r: &Recording) -> Pending {
-        Pending {
-            record: r.record.clone(),
-            record_object: r.record_object.clone(),
-            objects: r.objects.clone(),
-            outcome: r.outcome.status.code().to_owned(),
-            outcome_reason: r.outcome.reason.map(str::to_owned),
-            reasons: r.reasons.iter().map(|c| (*c).to_owned()).collect(),
-            tree_before: r.tree_before.clone(),
-            tree_after: r.tree_after.clone(),
-            clock: r.clock.clone(),
-            observations: r.observations.clone(),
-            rows: r
-                .rows
-                .iter()
-                .map(|row| PendingRow {
-                    ac_id: row.ac_id.clone(),
-                    spec_id: row.spec_id.clone(),
-                    status: row.status.to_owned(),
-                    reason: row.reason.clone(),
-                })
-                .collect(),
-            integrity: r.integrity.clone(),
+/// The judgement of a run's facts on its files as they are now (principle one; decisions 8 and 9): its observations
+/// read now, its validity, outcome and acceptance rows. The finishing task and the reconciliation both make it, so a
+/// record is never recorded with a judgement older than its files (M2T10R-103).
+fn judge(reader: &Reader, at: &Judged<'_>, facts: &Facts) -> Result<(Recording, Ran), CheckError> {
+    let (project, sealed) = (at.project, at.sealed);
+    let record = &facts.record;
+    // Observations (decision 8): the result lines; without any, the declared artifacts found with the record's own
+    // conclusion. As bytes, line by line, as the gate and the replica read them: a line that is not JSON (not UTF-8,
+    // say) stays a line, and is not a result line (rule 1).
+    let mut observations = Vec::new();
+    if let Some(results) = record
+        .artifacts
+        .iter()
+        .find(|a| a.name == "test-results.jsonl")
+    {
+        let bytes = std::fs::read(project.join(&results.path)).unwrap_or_default();
+        let blank = |l: &[u8]| l.iter().all(|b| b" \t\n\r\x0b\x0c".contains(b));
+        for line in bytes.split(|b| *b == b'\n').filter(|l| !blank(l)) {
+            observations.push(
+                serde_json::from_slice(line)
+                    .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(line).into_owned())),
+            );
         }
     }
-
-    fn into_recording(self) -> Result<Recording, String> {
-        let status = |c: &str| Status::from_code(c).ok_or_else(|| format!("unknown status {c}"));
-        let reason = match self.outcome_reason {
-            None => None,
-            Some(r) => Some(
-                OUTCOME_REASONS
-                    .into_iter()
-                    .find(|x| *x == r)
-                    .ok_or_else(|| format!("unknown outcome reason {r}"))?,
-            ),
-        };
-        let outcome = Outcome {
-            status: status(&self.outcome)?,
-            reason,
-        };
-        let reasons = self
-            .reasons
-            .iter()
-            .map(|c| {
-                Reason::from_code(c)
-                    .map(Reason::code)
-                    .ok_or_else(|| format!("unknown reason {c}"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let rows = self
-            .rows
+    if observations.is_empty() {
+        observations = hoh_core::verification::fallback(record);
+    }
+    let e = &Evidence {
+        record: record.clone(),
+        git_tree: facts.tree_after["head_tree"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
+        record_dir: relative_to(project, at.record_dir),
+        observations,
+    };
+    let m = &sealed.manifest;
+    let plan: Value = hoh_core::objects::get(project, &m.test_plan.sha256)
+        .and_then(|b| serde_json::from_slice(&b).map_err(|e| e.to_string()))
+        .map_err(CheckError::Io)?;
+    let policy = m
+        .source_files
+        .iter()
+        .any(|f| f.path == "contracts/release-policy.json")
+        .then(|| std::fs::read(at.checkout.join("contracts/release-policy.json")).ok())
+        .flatten()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+    let world = World {
+        reader,
+        project,
+        evidence: &at.state.join("evidence"),
+        plan: &plan,
+        policy,
+    };
+    let verdict = valid(e, sealed, &m.spec.sha256, &world);
+    let outcome = outcome(e, &verdict, &world);
+    let reasons: Vec<&'static str> = verdict
+        .as_ref()
+        .err()
+        .map(|i| i.codes())
+        .unwrap_or_default();
+    let check_degradable = matches!(
+        hoh_core::verification::Lookup::policy(&world, &e.record.check_id),
+        hoh_core::verification::PolicyCheck::Check(ref p) if p.degradable
+    );
+    // The rows need the run's spec to be the candidate's; each AC's TEST is the one the frozen spec declares.
+    let mut rows_out = Vec::new();
+    if let Some(acceptance) = reader.acceptance(at.run_id).map_err(CheckError::Store)?
+        && acceptance.spec_sha256 == m.spec.sha256
+    {
+        let spec: Value = hoh_core::objects::get(project, &m.spec.sha256)
+            .and_then(|b| serde_json::from_slice(&b).map_err(|e| e.to_string()))
+            .map_err(CheckError::Io)?;
+        let declared: std::collections::BTreeMap<String, String> = spec["requirements"]
+            .as_array()
             .into_iter()
-            .map(|r| {
-                Ok(AcceptanceRow {
-                    ac_id: r.ac_id,
-                    spec_id: r.spec_id,
-                    status: status(&r.status)?.code(),
-                    reason: r.reason,
+            .flatten()
+            .flat_map(|r| r["acceptance"].as_array().into_iter().flatten())
+            .filter_map(|a| {
+                Some((
+                    a["id"].as_str()?.to_owned(),
+                    a["test_id"].as_str()?.to_owned(),
+                ))
+            })
+            .collect();
+        let acs: Vec<AcSpec> = acceptance
+            .criteria
+            .iter()
+            .filter_map(|(ac, check, degradable)| {
+                Some(AcSpec {
+                    ac_id: ac.clone(),
+                    test_id: declared.get(ac)?.clone(),
+                    check_id: check.clone(),
+                    degradable: *degradable,
                 })
             })
-            .collect::<Result<Vec<_>, String>>()?;
-        Ok(Recording {
-            record: self.record,
-            record_object: self.record_object,
-            objects: self.objects,
+            .collect();
+        for (ac_id, status) in rows(e, &outcome, &acs, check_degradable) {
+            let test = acs
+                .iter()
+                .find(|a| a.ac_id == ac_id)
+                .map(|a| a.test_id.clone())
+                .unwrap_or_default();
+            rows_out.push(AcceptanceRow {
+                ac_id,
+                spec_id: acceptance.spec_id.clone(),
+                status: status.code(),
+                reason: if reasons.is_empty() {
+                    format!("{test} in check {}", e.record.check_id)
+                } else {
+                    format!(
+                        "{test} in check {}: {}",
+                        e.record.check_id,
+                        reasons.join(", ")
+                    )
+                },
+            });
+        }
+    }
+    let ran = Ran {
+        record_id: e.record.record_id.clone(),
+        record_dir: at.record_dir.to_owned(),
+        outcome,
+        reasons: reasons.clone(),
+    };
+    Ok((
+        Recording {
+            record: e.record.clone(),
+            record_object: facts.record_object.clone(),
+            objects: facts.objects.clone(),
             outcome,
             reasons,
-            tree_before: self.tree_before,
-            tree_after: self.tree_after,
-            clock: self.clock,
-            observations: self.observations,
-            rows,
-            integrity: self.integrity,
-        })
+            tree_before: facts.tree_before.clone(),
+            tree_after: facts.tree_after.clone(),
+            clock: facts.clock.clone(),
+            observations: e.observations.clone(),
+            rows: rows_out,
+            integrity: facts.integrity.clone(),
+        },
+        ran,
+    ))
+}
+
+/// The lock of the record directory `dir`: its finishing task holds it from its pending file to its commit, so a
+/// reconciliation never takes a record a live run is still recording (M2T10R-150); the lock goes with its holder,
+/// also when the process dies. Without `wait`, `None` when another holds it.
+fn lock_record(dir: &Path, wait: bool) -> Result<Option<std::fs::File>, CheckError> {
+    use rustix::fs::FlockOperation;
+    let path = dir.join(".lock");
+    let at = |e: std::io::Error| CheckError::Io(format!("{}: {e}", path.display()));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(at)?;
+    let operation = if wait {
+        FlockOperation::LockExclusive
+    } else {
+        FlockOperation::NonBlockingLockExclusive
+    };
+    match rustix::fs::flock(&file, operation) {
+        Ok(()) => Ok(Some(file)),
+        Err(e) if !wait && e == rustix::io::Errno::WOULDBLOCK => Ok(None),
+        Err(e) => Err(at(e.into())),
     }
 }
 
-/// Record the evidence of every record under `state` whose pending evidence was never committed (a crash or a failed
-/// commit, M2T10R-05), and write a record file a crash left unwritten from it. A check's run does this first, so a
-/// later run never takes an earlier one's place in the history; M2-T16 also calls it when the host starts. Returns how
-/// many it recorded.
-pub async fn reconcile(handle: &EvidenceHandle, state: &Path) -> Result<usize, CheckError> {
-    let (h, root) = (handle.clone(), state.join("evidence"));
-    let found = tokio::task::spawn_blocking(move || -> Result<Vec<Recording>, CheckError> {
+/// The directories in `dir`, sorted; none when `dir` does not exist, any other failure an error (M2T10R-102).
+fn subdirectories(dir: &Path) -> Result<Vec<std::path::PathBuf>, CheckError> {
+    let at = |e: std::io::Error| CheckError::Io(format!("{}: {e}", dir.display()));
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(at(e)),
+    };
+    let mut found = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(at)?;
+        if entry.file_type().map_err(at)?.is_dir() {
+            found.push(entry.path());
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
+/// Record the evidence of each record of candidate `candidate_id` whose pending facts were never committed (a crash or
+/// a failed commit; docs/adr/ADR-027.md decision 8, recovery protocol), judged on its files as they are now, and write
+/// a record file a crash left unwritten from them. A record whose evidence is recorded is passed over without reading
+/// its files (M2T10R-151); one a live run holds is left to it (M2T10R-150); a pending file that cannot be read or
+/// parsed is an error, so the candidate's next run waits for it rather than take its place in the history
+/// (M2T10R-102). A check's run does this first for its candidate; M2-T16 also does it when the host starts. Returns
+/// how many it recorded.
+pub async fn reconcile(
+    handle: &EvidenceHandle,
+    checkout: &Path,
+    state: &Path,
+    candidate_id: &str,
+) -> Result<usize, CheckError> {
+    let (h, checkout, state, candidate_id) = (
+        handle.clone(),
+        checkout.to_owned(),
+        state.to_owned(),
+        candidate_id.to_owned(),
+    );
+    let found = tokio::task::spawn_blocking(move || -> Result<Vec<_>, CheckError> {
         let reader = h.reader().map_err(CheckError::Store)?;
-        let dirs = |d: &Path| -> Vec<std::path::PathBuf> {
-            let mut all: Vec<_> = std::fs::read_dir(d)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.is_dir())
-                .collect();
-            all.sort();
-            all
-        };
+        let project = state
+            .parent()
+            .ok_or_else(|| CheckError::Io(format!("{} has no parent", state.display())))?;
+        let mut candidate = None;
         let mut found = Vec::new();
-        for candidate in dirs(&root) {
-            for check in dirs(&candidate) {
-                for record_dir in dirs(&check) {
-                    let file = record_dir.join(PENDING);
-                    let Ok(text) = std::fs::read(&file) else {
-                        continue;
-                    };
-                    let unreadable = |e: String| CheckError::Io(format!("{}: {e}", file.display()));
-                    let pending: Pending =
-                        serde_json::from_slice(&text).map_err(|e| unreadable(e.to_string()))?;
-                    if reader
-                        .evidence_outcome(&pending.record.record_id)
-                        .map_err(CheckError::Store)?
-                        .is_some()
-                    {
-                        continue;
-                    }
-                    let execution = record_dir.join("execution.json");
-                    if !execution.exists() {
-                        let bytes = serde_json::to_vec_pretty(&pending.record)
-                            .map_err(|e| unreadable(e.to_string()))?;
-                        write_new(&execution, &bytes)?;
-                    }
-                    found.push(pending.into_recording().map_err(unreadable)?);
+        for check in subdirectories(&state.join("evidence").join(&candidate_id))? {
+            for record_dir in subdirectories(&check)? {
+                let record_id = record_dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let recorded = |r: &Reader| {
+                    r.evidence_outcome(&record_id)
+                        .map(|o| o.is_some())
+                        .map_err(CheckError::Store)
+                };
+                if recorded(&reader)? {
+                    continue;
                 }
+                let file = record_dir.join(PENDING);
+                let unreadable = |e: String| CheckError::Io(format!("{}: {e}", file.display()));
+                match std::fs::symlink_metadata(&file) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(unreadable(e.to_string())),
+                    Ok(_) => {}
+                }
+                let Some(lock) = lock_record(&record_dir, false)? else {
+                    continue;
+                };
+                if recorded(&reader)? {
+                    continue;
+                }
+                let text = std::fs::read(&file).map_err(|e| unreadable(e.to_string()))?;
+                let facts: Facts =
+                    serde_json::from_slice(&text).map_err(|e| unreadable(e.to_string()))?;
+                if facts.record.record_id != record_id {
+                    return Err(unreadable(format!(
+                        "it holds record {}, not {record_id}",
+                        facts.record.record_id
+                    )));
+                }
+                let bytes = serde_json::to_vec_pretty(&facts.record)
+                    .map_err(|e| unreadable(e.to_string()))?;
+                write_new(&record_dir.join("execution.json"), &bytes)?;
+                if candidate.is_none() {
+                    let row = reader
+                        .candidate(&candidate_id)
+                        .map_err(CheckError::Store)?
+                        .ok_or_else(|| {
+                            CheckError::Io(format!("candidate {candidate_id} is not frozen here"))
+                        })?;
+                    let export = row.source_path.rsplit('/').next().unwrap_or_default();
+                    let sealed = hoh_core::objects::get(project, export)
+                        .and_then(|b| {
+                            serde_json::from_slice::<Value>(&b).map_err(|e| e.to_string())
+                        })
+                        .and_then(|v| Sealed::from_value(&v))
+                        .map_err(CheckError::Io)?;
+                    candidate = Some((sealed, row.run_id));
+                }
+                let Some((sealed, run_id)) = candidate.as_ref() else {
+                    continue;
+                };
+                let (recording, _) = judge(
+                    &reader,
+                    &Judged {
+                        project,
+                        state: &state,
+                        checkout: &checkout,
+                        sealed,
+                        run_id,
+                        record_dir: &record_dir,
+                    },
+                    &facts,
+                )?;
+                found.push((lock, recording));
             }
         }
         Ok(found)
@@ -1158,11 +1190,12 @@ pub async fn reconcile(handle: &EvidenceHandle, state: &Path) -> Result<usize, C
     .await
     .map_err(|e| CheckError::Io(format!("the reconciliation stopped: {e}")))??;
     let recorded = found.len();
-    for recording in found {
+    for (lock, recording) in found {
         handle
             .record_evidence(recording)
             .await
             .map_err(CheckError::Store)?;
+        drop(lock);
     }
     Ok(recorded)
 }
@@ -1171,6 +1204,33 @@ pub async fn reconcile(handle: &EvidenceHandle, state: &Path) -> Result<usize, C
 mod tests {
     use super::*;
     use hoh_agents::process::{Cause, Termination};
+
+    #[test]
+    fn a_file_is_published_whole_once_and_again_only_as_the_same_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // docs/adr/ADR-027.md decision 8, recovery protocol (M2T10R-100): writers of the same record at once each
+        // stage their own copy; the file appears whole, the same bytes again are no error, other bytes are refused, and
+        // no staged copy is left.
+        let dir = tempfile::tempdir()?;
+        let target = dir.path().join("execution.json");
+        let bytes = vec![b'x'; 1 << 20];
+        std::thread::scope(|s| {
+            let writers: Vec<_> = (0..8)
+                .map(|_| s.spawn(|| write_new(&target, &bytes)))
+                .collect();
+            for w in writers {
+                assert!(matches!(w.join(), Ok(Ok(()))));
+            }
+        });
+        assert_eq!(std::fs::read(&target)?, bytes);
+        assert!(write_new(&target, b"other").is_err());
+        assert_eq!(std::fs::read(&target)?, bytes);
+        let names: Vec<_> = std::fs::read_dir(dir.path())?
+            .map(|e| e.map(|e| e.file_name()))
+            .collect::<Result<_, _>>()?;
+        assert_eq!(names, ["execution.json"]);
+        Ok(())
+    }
 
     #[test]
     fn a_cancelled_run_never_claims_success_and_a_late_one_is_timed_out() {

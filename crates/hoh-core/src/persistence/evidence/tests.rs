@@ -358,3 +358,31 @@ async fn a_handover_references_an_attempts_check_outputs_with_its_turn_artifacts
     assert_eq!(limited.len(), 3);
     Ok(())
 }
+
+#[tokio::test]
+async fn recording_a_record_again_is_nothing_and_another_record_under_its_id_is_refused() -> R {
+    // docs/adr/ADR-027.md decision 8, recovery protocol (M2T10R-101, -150): the same record committed by its finishing
+    // task and by a reconciliation is one evidence; a different record under the same id is refused, nothing written.
+    let dir = tempfile::tempdir()?;
+    let (store, path, c) = world(dir.path()).await?;
+    let job = recording("r1", &c, "Q/attempt-1");
+    store.record_evidence(job.clone()).await?;
+    store.record_evidence(job.clone()).await?;
+    assert_eq!(texts(&path, "SELECT evidence_id FROM evidence")?, ["r1"]);
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT event_id FROM events WHERE kind = 'evidence.recorded'"
+        )?,
+        ["r1/evidence"]
+    );
+    let mut other = job.clone();
+    other.record_object = object(9, "execution", "execution.json");
+    let refused = store.record_evidence(other).await;
+    assert!(
+        matches!(&refused, Err(PersistError::EvidenceRefused(why)) if why.contains("r1")),
+        "{refused:?}"
+    );
+    assert_eq!(texts(&path, "SELECT evidence_id FROM evidence")?, ["r1"]);
+    Ok(())
+}
