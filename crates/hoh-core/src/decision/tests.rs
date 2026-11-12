@@ -22,6 +22,7 @@ fn task(id: &str, state: TaskState) -> TaskView {
         requirements: caps(&["REQ-1"]),
         retry_at: None,
         runtime_owned: false,
+        held_by_open_round: false,
     }
 }
 

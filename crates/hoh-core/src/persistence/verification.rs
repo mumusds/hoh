@@ -15,6 +15,36 @@ use serde_json::json;
 /// The kind of the event that opens a round.
 pub(super) const ROUND_OPENED: &str = "verification.round_opened";
 
+/// The kind of the event that closes a round (decision 11).
+pub(super) const ROUND_CLOSED: &str = "verification.round_closed";
+
+/// The writer tasks of run `run_id` an open round holds (decision 13, REQ-037 decision 1): a round not closed whose
+/// candidate has an Issue not closed (OPEN or REOPENED), and the task has a requirement with a criterion in that
+/// round's scope under the run's specification. Not given the write lease until the round closes.
+pub(super) fn held_by_open_rounds(
+    conn: &rusqlite::Connection,
+    run_id: &str,
+) -> Result<std::collections::BTreeSet<String>, PersistError> {
+    let mut statement = conn
+        .prepare(
+            "WITH open AS (SELECT e.payload_json AS p FROM events e WHERE e.kind = ?2 AND e.run_id = ?1 \
+               AND NOT EXISTS (SELECT 1 FROM events c WHERE c.kind = ?3 AND c.run_id = ?1 \
+                 AND json_extract(c.payload_json, '$.round_id') = json_extract(e.payload_json, '$.round_id')) \
+               AND EXISTS (SELECT 1 FROM issues i WHERE i.state IN ('OPEN', 'REOPENED') \
+                 AND i.candidate_id = json_extract(e.payload_json, '$.candidate_id'))), \
+             scope AS (SELECT DISTINCT a.value AS ac_id FROM open o, json_each(o.p, '$.acceptance_ids') a) \
+             SELECT DISTINCT t.task_id FROM tasks t JOIN runs r ON r.run_id = t.run_id \
+             JOIN task_requirements tr ON tr.task_id = t.task_id AND tr.spec_id = r.spec_id \
+             JOIN acceptance_criteria ac ON ac.requirement_id = tr.requirement_id AND ac.spec_id = tr.spec_id \
+             WHERE t.run_id = ?1 AND t.writer = 1 AND ac.ac_id IN (SELECT ac_id FROM scope)",
+        )
+        .map_err(sqlite_error)?;
+    let rows = statement
+        .query_map(params![run_id, ROUND_OPENED, ROUND_CLOSED], |r| r.get(0))
+        .map_err(sqlite_error)?;
+    rows.collect::<Result<_, _>>().map_err(sqlite_error)
+}
+
 /// A development task a round verifies, at its revision once VERIFYING (the revision its handoffs expect).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Source {

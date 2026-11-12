@@ -221,6 +221,9 @@ pub struct TaskView {
     /// A verification round's verifier task: the Runtime's, which no decision moves or dispatches (docs/adr/ADR-028.md
     /// decision 10).
     pub runtime_owned: bool,
+    /// A writer an open round with an open Issue holds: not dispatched until the round closes (docs/adr/ADR-028.md
+    /// decision 13).
+    pub held_by_open_round: bool,
 }
 
 /// The binding of the role a dispatch goes to.
@@ -496,6 +499,15 @@ fn table<S: Lifecycle>(from: S, to: S) -> Result<(), Rejection> {
 fn dispatch(snapshot: &Snapshot, task_id: &str, role: &str) -> Result<Effect, Rejection> {
     use RejectionReason::*;
     let task = named_task(snapshot, task_id)?;
+    if task.held_by_open_round {
+        return reject(
+            IllegalTransition,
+            format!(
+                "{task_id} writes what an open verification round with an open Issue covers; it waits for the round to \
+                 close"
+            ),
+        );
+    }
     if Some(&task.spec_id) != snapshot.run.spec_id.as_ref() {
         return reject(
             SpecMismatch,
