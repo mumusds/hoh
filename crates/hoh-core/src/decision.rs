@@ -218,6 +218,9 @@ pub struct TaskView {
     /// Its persisted `next_retry_at` while it is still ahead of the decision's time (REQ-042 behaviour 2); `None` when
     /// it is due or has no retry.
     pub retry_at: Option<String>,
+    /// A verification round's verifier task: the Runtime's, which no decision moves or dispatches (docs/adr/ADR-028.md
+    /// decision 10).
+    pub runtime_owned: bool,
 }
 
 /// The binding of the role a dispatch goes to.
@@ -444,6 +447,14 @@ fn named_task<'a>(snapshot: &'a Snapshot, task_id: &str) -> Result<&'a TaskView,
             RejectionReason::IllegalTransition,
             format!(
                 "{task_id} is a supervision task, the Commander's own turn; no decision moves it"
+            ),
+        ),
+        // A round's verifier task is the Runtime's: dispatched by the scheduling round, ended by the reconcile
+        // (docs/adr/ADR-028.md decision 10).
+        Some(task) if task.task_id == task_id && task.runtime_owned => reject(
+            RejectionReason::IllegalTransition,
+            format!(
+                "{task_id} is a verification round's task, the Runtime's; no decision moves or dispatches it"
             ),
         ),
         Some(task) if task.task_id == task_id => Ok(task),

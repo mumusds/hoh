@@ -21,6 +21,7 @@ fn task(id: &str, state: TaskState) -> TaskView {
         dependencies: vec![("T0".to_owned(), TaskState::Accepted)],
         requirements: caps(&["REQ-1"]),
         retry_at: None,
+        runtime_owned: false,
     }
 }
 
@@ -513,6 +514,41 @@ fn a_supervision_task_is_moved_by_no_decision() {
         ),
         IllegalTransition
     );
+}
+
+#[test]
+fn a_verifier_task_is_the_runtimes_and_moved_or_dispatched_by_no_decision() {
+    // docs/adr/ADR-028.md decision 10: a round's verifier task (runtime_owned) is ILLEGAL_TRANSITION for every
+    // Commander dispatch and task move, whatever its state.
+    for state in [TaskState::Ready, TaskState::Blocked, TaskState::Running] {
+        let mut s = snapshot();
+        let mut verifier = task("C/round/1/task/qa", state);
+        (verifier.role, verifier.writer, verifier.runtime_owned) = ("qa".to_owned(), false, true);
+        s.task = Some(verifier);
+        assert_eq!(
+            reason(
+                &proposal(
+                    json!({"kind": "dispatch", "task_id": "C/round/1/task/qa", "role": "qa"})
+                ),
+                &s
+            ),
+            IllegalTransition,
+            "{state:?}"
+        );
+        for to in ["CANCELLED", "READY", "BLOCKED"] {
+            assert_eq!(
+                reason(
+                    &proposal(
+                        json!({"kind": "transition_task", "task_id": "C/round/1/task/qa", "to_state": to,
+                        "reason": "x"})
+                    ),
+                    &s
+                ),
+                IllegalTransition,
+                "{state:?} -> {to}"
+            );
+        }
+    }
 }
 
 #[test]

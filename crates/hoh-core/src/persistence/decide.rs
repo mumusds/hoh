@@ -784,6 +784,7 @@ fn load_task(
         // Whole seconds on both sides (the store's form): ahead of `now` until its second has come.
         retry_at: next_retry_at
             .filter(|next| next.as_str() > crate::time::rfc3339_utc(now).as_str()),
+        runtime_owned: super::verification::verifier_tasks(tx, run_id)?.contains(task_id),
     }))
 }
 
