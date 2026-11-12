@@ -174,7 +174,29 @@ pub fn pre_check(
             }
         }
     }
-    reasons.extend(differences(checkout, m)?);
+    let differing = differences(checkout, m)?;
+    // The frozen spec and release-policy objects a judgement reads, there before the command runs: one lost is put
+    // back from the checkout just found unchanged, or the check is refused (M2T10R-352).
+    if differing.is_empty() {
+        let policy = m
+            .source_files
+            .iter()
+            .find(|f| f.path == crate::verify::freeze::RELEASE_POLICY);
+        for kept in std::iter::once(&m.spec).chain(policy) {
+            if !hoh_core::objects::present(project, &kept.sha256)
+                && hoh_core::objects::put_file(project, &checkout.join(&kept.path))
+                    .map(|(sha, _)| sha)
+                    .as_deref()
+                    != Ok(kept.sha256.as_str())
+            {
+                reasons.push(format!(
+                    "the frozen object of {} is lost and the checkout does not give it back",
+                    kept.path
+                ));
+            }
+        }
+    }
+    reasons.extend(differing);
     // HoH's own state still ignored and untracked, as the freeze required (decision 3, M2T10R-06).
     let record = format!("evidence/{id}/{}/RECORD", request.check_id);
     let writes = [
@@ -371,7 +393,7 @@ impl hoh_core::verification::Lookup for World<'_> {
     }
 
     fn candidate_at(&self, path: &str) -> Option<String> {
-        let bytes = std::fs::read(self.project.join(path)).ok()?;
+        let bytes = hoh_core::objects::read_regular(&self.project.join(path)).ok()?;
         let value: Value = serde_json::from_slice(&bytes).ok()?;
         Sealed::from_value(&value).ok().map(|s| s.candidate_id)
     }
@@ -437,7 +459,7 @@ impl hoh_core::verification::Lookup for World<'_> {
     }
 
     fn live_sessions(&self, path: &str) -> Option<Value> {
-        let bytes = std::fs::read(self.project.join(path)).ok()?;
+        let bytes = hoh_core::objects::read_regular(&self.project.join(path)).ok()?;
         serde_json::from_slice(&bytes).ok()
     }
 
@@ -490,15 +512,12 @@ pub async fn run(
     let blocking = |e: tokio::task::JoinError| CheckError::Io(format!("the check stopped: {e}"));
     let io = CheckError::Io;
     let handle = store.evidence_handle();
-    // First the records a crash or a failed commit left without their evidence: a later run never takes their place
-    // in the history (M2T10R-05).
-    reconcile(&handle, state, &request.candidate_id).await?;
     let project = state
         .parent()
         .ok_or_else(|| io(format!("{} has no parent", state.display())))?
         .to_owned();
-    // Before: the pre-check, the workspace observed, the record's own new directory.
-    let (ready, tree_before, record_id, record_dir, timeout, export) = {
+    // Before: the pre-check (refused, nothing has run and nothing is left) and the workspace observed.
+    let before = {
         let reader = handle.reader().map_err(CheckError::Store)?;
         let (checkout, state, request, project) = (
             checkout.to_owned(),
@@ -520,6 +539,19 @@ pub async fn run(
                 .as_f64()
                 .unwrap_or(3600.0);
             let tree_before = crate::host::control::workspace(&checkout);
+            Ok((ready, tree_before, timeout, project.join(&row.source_path)))
+        })
+        .await
+        .map_err(blocking)??
+    };
+    let (ready, tree_before, timeout, export) = before;
+    // Then the records a crash or a failed commit left without their evidence: a later run never takes their place in
+    // the history (M2T10R-05). After the pre-check, which has put back any frozen object a judgement reads (M2T10R-352).
+    reconcile(&handle, state, &request.candidate_id).await?;
+    // The record's own new directory, and its lock.
+    let (record_id, record_dir, lock) = {
+        let (state, request) = (state.to_owned(), request.clone());
+        tokio::task::spawn_blocking(move || -> Result<_, CheckError> {
             let record_id = new_record_id();
             let dir = state
                 .join("evidence")
@@ -532,14 +564,11 @@ pub async fn run(
             std::fs::create_dir(&record_dir)
                 .and_then(|()| std::fs::create_dir(record_dir.join("artifacts")))
                 .map_err(|e| CheckError::Io(format!("{}: {e}", record_dir.display())))?;
-            Ok((
-                ready,
-                tree_before,
-                record_id,
-                record_dir,
-                timeout,
-                project.join(&row.source_path),
-            ))
+            // The record's lock, taken before the command runs and held to the commit: the finishing task never opens
+            // a path the command could have written to lock its record (M2T10R-350).
+            let lock = lock_record(&record_dir, true)?
+                .ok_or_else(|| CheckError::Io("the record's lock was not granted".to_owned()))?;
+            Ok((record_id, record_dir, lock))
         })
         .await
         .map_err(blocking)??
@@ -558,6 +587,7 @@ pub async fn run(
             tree_before,
             record_id,
             record_dir,
+            lock,
             timeout,
             export,
         },
@@ -578,6 +608,8 @@ struct Finish {
     tree_before: Value,
     record_id: String,
     record_dir: std::path::PathBuf,
+    /// The record's lock, held from before the command to the commit.
+    lock: std::fs::File,
     timeout: f64,
     export: std::path::PathBuf,
 }
@@ -604,6 +636,7 @@ async fn finish(
         tree_before,
         record_id,
         record_dir,
+        lock,
         timeout,
         export,
     } = f;
@@ -792,7 +825,7 @@ async fn finish(
     // Under the record's lock from its pending file to its commit, so no reconciliation takes it meanwhile (M2T10R-150):
     // the pending facts first, then the record file, then the judgement on the files as they are and the commit; from
     // the pending file on, a crash or a failed commit is finished by the next run of the candidate (M2T10R-05).
-    let (lock, recording, ran) = {
+    let (recording, ran) = {
         let reader = handle.reader().map_err(CheckError::Store)?;
         let (project, state, ready, record_dir) = (
             project.clone(),
@@ -801,8 +834,6 @@ async fn finish(
             record_dir.clone(),
         );
         tokio::task::spawn_blocking(move || -> Result<_, CheckError> {
-            let lock = lock_record(&record_dir, true)?
-                .ok_or_else(|| CheckError::Io("the record's lock was not granted".to_owned()))?;
             let text =
                 serde_json::to_vec_pretty(&facts).map_err(|e| CheckError::Io(e.to_string()))?;
             write_new(&record_dir.join(PENDING), &text)?;
@@ -820,7 +851,7 @@ async fn finish(
                 },
                 &facts,
             )?;
-            Ok((lock, recording, ran))
+            Ok((recording, ran))
         })
         .await
         .map_err(blocking)??
@@ -1058,14 +1089,28 @@ fn judge(reader: &Reader, at: &Judged<'_>, facts: &Facts) -> Result<(Recording, 
 /// reconciliation never takes a record a live run is still recording (M2T10R-150); the lock goes with its holder,
 /// also when the process dies. Without `wait`, `None` when another holds it.
 fn lock_record(dir: &Path, wait: bool) -> Result<Option<std::fs::File>, CheckError> {
-    use rustix::fs::FlockOperation;
+    use rustix::fs::{FlockOperation, Mode, OFlags};
     let path = dir.join(".lock");
     let at = |e: std::io::Error| CheckError::Io(format!("{}: {e}", path.display()));
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(at)?;
+    // Opened without blocking and kept only as a regular file, before any lock is asked for (M2T10R-301).
+    let fd = rustix::fs::open(
+        &path,
+        OFlags::CREATE
+            | OFlags::WRONLY
+            | OFlags::APPEND
+            | OFlags::NONBLOCK
+            | OFlags::NOFOLLOW
+            | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o644),
+    )
+    .map_err(|e| at(e.into()))?;
+    let file = std::fs::File::from(fd);
+    if !file.metadata().map_err(at)?.file_type().is_file() {
+        return Err(CheckError::Io(format!(
+            "{}: not a regular file",
+            path.display()
+        )));
+    }
     let operation = if wait {
         FlockOperation::LockExclusive
     } else {
@@ -1245,12 +1290,20 @@ fn restore(
             bytes
         }
     };
-    // Written only where a crash left none: a record file there is the file scan's to judge as it is.
+    // Written where a crash left none; one there must be those bytes, as a regular file, or the record is not the
+    // one its evidence would name and the reconciliation refuses it (M2T10R-300).
     let execution = record_dir.join("execution.json");
-    if std::fs::symlink_metadata(&execution)
-        .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
-    {
-        write_new(&execution, &record_bytes)?;
+    match std::fs::symlink_metadata(&execution) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => write_new(&execution, &record_bytes)?,
+        _ => {
+            let published = hoh_core::objects::read_regular(&execution).map_err(io)?;
+            if published != record_bytes {
+                return Err(io(format!(
+                    "{}: the record file is not the record {sha} its evidence names",
+                    execution.display()
+                )));
+            }
+        }
     }
     let record = &facts.record;
     let source = |o: &ArtifactRow| -> Option<std::path::PathBuf> {

@@ -168,7 +168,7 @@ pub fn put_file(project: &Path, file: &Path) -> Result<(String, u64), String> {
     };
     let copied = (|| -> Result<(String, u64), String> {
         let at = |e: std::io::Error| format!("{}: {e}", file.display());
-        let mut input = std::fs::File::open(file).map_err(at)?;
+        let mut input = open_regular(file)?;
         let mut digest = Sha256::new();
         let mut size = 0u64;
         let mut buffer = vec![0u8; 1 << 16];
@@ -292,7 +292,8 @@ fn holds(path: &Path, sha256: &str) -> Result<bool, String> {
 /// The object named `sha256`, if its bytes still match its name.
 pub fn get(project: &Path, sha256: &str) -> Result<Vec<u8>, String> {
     let path = object_path(project, sha256)?;
-    let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    // A regular file opened without blocking, as every object read (M2T10R-301).
+    let bytes = read_regular(&path)?;
     if sha256_hex(&bytes) != sha256 {
         return Err(format!(
             "{}: its bytes no longer match its name",
