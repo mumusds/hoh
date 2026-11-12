@@ -1040,3 +1040,47 @@ async fn a_commander_dispatch_before_the_tasks_retry_is_refused() -> R {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn a_rounds_verifier_task_is_refused_to_every_commander_decision() -> R {
+    // docs/adr/ADR-028.md decision 10: T5 is the qa task of a verification round (its round_opened names it); the
+    // Commander's dispatch and its move of it are ILLEGAL_TRANSITION, and nothing of T5 changes.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    seed(&path, WORLD)?;
+    seed(
+        &path,
+        "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+           ('p1', 'C/round/1/opened', 'R', 'verification.round_opened',
+            json_object('round_id', 'C/round/1', 'candidate_id', 'C', 'number', 1, 'source_task_ids', json('[\"T3\"]'),
+              'tasks', json_object('qa', 'T5', 'reviewer', 'T5r')), '2026-11-04T00:00:00Z');",
+    )?;
+    let before = rows(
+        &path,
+        "SELECT state, revision FROM tasks WHERE task_id = 'T5'",
+    )?;
+    let mut commander = FakeCommander {
+        sent: 0,
+        candidate: None,
+    };
+    for payload in [
+        json!({"kind": "dispatch", "task_id": "T5", "role": "qa"}),
+        json!({"kind": "transition_task", "task_id": "T5", "to_state": "CANCELLED", "reason": "not needed"}),
+    ] {
+        let decided = store
+            .decide(commander.decide(3, 7, payload.clone()), context())
+            .await?;
+        let Decided::Rejected { reason, .. } = decided else {
+            return Err(format!("{payload}: {decided:?}").into());
+        };
+        assert_eq!(reason, RejectionReason::IllegalTransition, "{payload}");
+    }
+    assert_eq!(
+        rows(
+            &path,
+            "SELECT state, revision FROM tasks WHERE task_id = 'T5'"
+        )?,
+        before
+    );
+    Ok(())
+}
