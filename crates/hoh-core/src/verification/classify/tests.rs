@@ -59,6 +59,7 @@ fn of_ac_054_05s_ninety_six_combinations_only_one_is_passable() {
                         checks: c,
                         acs,
                         failing_issues: false,
+                        outside_failed: false,
                     };
                     let class = classify(&input);
                     if class == Class::Passable {
@@ -86,9 +87,16 @@ fn failed_comes_before_flaky_before_inconclusive_and_an_empty_scope_never_passes
         checks: Checks::Passed,
         acs,
         failing_issues,
+        outside_failed: false,
     };
     assert_eq!(classify(&all(vec![Ac::Satisfied], false)), Class::Passable);
     assert_eq!(classify(&all(vec![Ac::Satisfied], true)), Class::Failed);
+    // An AC outside the scope failed by the round's evidence fails it, its own scope all satisfied (correction 6).
+    let outside = Input {
+        outside_failed: true,
+        ..all(vec![Ac::Satisfied], false)
+    };
+    assert_eq!(classify(&outside), Class::Failed);
     assert_eq!(
         classify(&all(vec![Ac::Flaky, Ac::Failed], false)),
         Class::Failed

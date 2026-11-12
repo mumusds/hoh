@@ -527,7 +527,7 @@ pub(super) fn reconcile(
                     "qa": format!("{:?}", input.qa), "review": format!("{:?}", input.review),
                     "checks": format!("{:?}", input.checks),
                     "acs": input.acs.iter().map(|a| format!("{a:?}")).collect::<Vec<_>>(),
-                    "failing_issues": input.failing_issues,
+                    "failing_issues": input.failing_issues, "outside_failed": input.outside_failed,
                 }),
             )
         } else {
@@ -845,11 +845,14 @@ fn classify_round(
         }
         acs.push(projected);
     }
-    // A FAIL row of an AC outside the scope that this round's evidence wrote: every source's (decision 12).
+    // A FAIL row of an AC outside the scope that this round's evidence wrote: every source's (decision 12), and a failing
+    // input whatever its check's outcome (implementation correction 6, M2T16R-300).
+    let mut outside_failed = false;
     for e in evidence {
         for row in &e.rows {
             let ac = row["ac_id"].as_str().unwrap_or_default();
             if row["status"] == json!("FAIL") && !round.scope.iter().any(|s| s == ac) {
+                outside_failed = true;
                 let tests = failing_tests(row, row["reason"].as_str().unwrap_or_default());
                 if tests.is_empty() {
                     failed.push((None, format!("ac-fail:{ac}")));
@@ -879,6 +882,7 @@ fn classify_round(
             checks,
             acs,
             failing_issues: !issues.is_empty(),
+            outside_failed,
         },
         failed,
     ))

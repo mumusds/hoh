@@ -3488,6 +3488,90 @@ async fn a_compliant_degradation_beside_a_failure_is_no_item() -> R {
     Ok(())
 }
 
+/// One round of D whose planned check `unit` ends `outcome` (its reason `reason`) with AC-1-01 PASS and a row of AC-9-01,
+/// outside D's scope, of status `row` on the line `test_9_01_persistent` (DEGRADED): the round's verdict and its items.
+async fn outside_round(
+    outcome: &str,
+    reason: Option<&str>,
+    row: &str,
+) -> R<(Vec<String>, Vec<String>)> {
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    Connection::open(&path)?.execute_batch(
+        "INSERT INTO requirements(requirement_id, spec_id, title, required_release) VALUES ('REQ-9', 's1', 'r9', 1);
+         INSERT INTO acceptance_criteria(ac_id, requirement_id, spec_id, body, check_id) VALUES
+           ('AC-9-01', 'REQ-9', 's1', 'b9', 'unit');",
+    )?;
+    let (_, candidate, [qa, _]) = verified(&store, &path, "PASS", "PASS").await?;
+    let failing = if row == "FAIL" {
+        vec!["test_9_01_persistent"]
+    } else {
+        Vec::new()
+    };
+    evidence_judged(
+        &path,
+        (&qa, &candidate, "rec-1"),
+        ("unit", outcome),
+        &[
+            ("AC-1-01", "TEST-1-01", "PASS", Vec::new()),
+            ("AC-9-01", "TEST-9-01", row, failing),
+        ],
+        &[
+            ("TEST-9-01", "test_9_01_persistent", "DEGRADED"),
+            ("TEST-1-01", "test_1_01_works", "PASS"),
+        ],
+    )?;
+    if let Some(reason) = reason {
+        Connection::open(&path)?.execute(
+            "UPDATE events SET payload_json = json_set(payload_json, '$.outcome_reason', ?1) WHERE event_id = 'rec-1/evidence'",
+            rusqlite::params![reason],
+        )?;
+    }
+    store
+        .reconcile_verification("R", Default::default())
+        .await?;
+    Ok((
+        texts(
+            &path,
+            "SELECT json_extract(payload_json, '$.verdict') FROM events WHERE kind = 'verification.round_closed'",
+        )?,
+        texts(
+            &path,
+            "SELECT json_extract(i.value, '$.item') FROM events e, json_each(e.payload_json, '$.items') i \
+             WHERE e.kind = 'verification.failures' ORDER BY 1",
+        )?,
+    ))
+}
+
+#[tokio::test]
+async fn an_out_of_scope_failure_fails_its_round_whatever_its_checks_outcome() -> R {
+    // ADR-028 implementation correction 6 (M2T16R-300): a FAIL row of this round's evidence on an AC outside its scope
+    // is a failing input of the classification as it is an item: whatever the check's own outcome (PASS or DEGRADED
+    // with a required TEST's DEGRADED line, blocked, timed out, a conclusive FAIL), the round is repaired with its item.
+    for (outcome, reason) in [
+        ("PASS", None),
+        ("DEGRADED", None),
+        ("BLOCKED", None),
+        ("FAIL", Some("TIMED_OUT")),
+        ("FAIL", None),
+    ] {
+        assert_eq!(
+            outside_round(outcome, reason, "FAIL").await?,
+            (
+                vec!["repair".to_owned()],
+                vec!["ac-fail:AC-9-01:test_9_01_persistent".to_owned()]
+            ),
+            "{outcome} {reason:?}"
+        );
+    }
+    // A compliant degradation outside the scope is no FAIL row: passable, no item.
+    assert_eq!(
+        outside_round("DEGRADED", None, "DEGRADED").await?,
+        (vec!["passable".to_owned()], Vec::new())
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_corrections_reason_outlives_an_attempt_that_failed_to_start() -> R {
     // ADR-028 implementation correction 4 (M2T16R-102): A's output is corrected; A2 fails before it ran; A3 is still told
