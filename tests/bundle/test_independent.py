@@ -1,7 +1,7 @@
 """Checks independent-qa and independent-review, scripts/product/independent.sh (docs/adr/ADR-027.md decision 11), with
 fake native CLIs in a fixture ROOT of their own: run_check runs the real script, which runs the real tools/agent_task.py.
 Fake agents only: NEVER live evidence, and nothing here writes into the real .hoh-dev/."""
-import hashlib,json,os,shutil,subprocess,sys,tempfile,unittest
+import hashlib,json,os,shlex,shutil,subprocess,sys,tempfile,unittest
 from pathlib import Path
 from helpers import ROOT,load_json
 
@@ -55,6 +55,9 @@ class Independent(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory(prefix='hoh-independent-');self.addCleanup(self.temp.cleanup)
         base=Path(self.temp.name);r=self.root=base/'repo';self.bin=base/'bin';self.bin.mkdir();self.trace=base/'trace.jsonl'
+        # python3 on that PATH is the interpreter running these tests (requirements-dev.txt's, which can check date-time):
+        # the scripts run under it as a real run_check runs them under the project's environment (M2T10R-750).
+        py=self.bin/'python3';py.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n');py.chmod(0o755)
         for rel in FILES:(r/rel).parent.mkdir(parents=True,exist_ok=True);shutil.copy2(ROOT/rel,r/rel)
         (r/'contracts/requirements.json').write_text(json.dumps({'requirements':[{'id':'REQ-901','release_targets':['v0.1'],'release_class':'required',
                                                                                 'acceptance':[{'id':'AC-901-01','test_id':'TEST-901-01'},{'id':'AC-901-02','test_id':'TEST-901-02'}]}]}))
