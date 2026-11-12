@@ -125,6 +125,40 @@ fn freeze_and_accept(
         let reason = format!("the TaskResult names candidate {given}, not the frozen {id}");
         return correct(tx, job, task, &[reason], ctx);
     }
+    // What would refuse the acceptance whole is decided before any freeze (M2T16D-353, -1055): no criterion to verify
+    // under the run's specification, or no qa or reviewer bound to verify it.
+    let criteria: i64 = tx
+        .query_row(
+            "SELECT count(*) FROM task_requirements tr JOIN runs r ON r.run_id = ?2 \
+             JOIN acceptance_criteria ac ON ac.requirement_id = tr.requirement_id AND ac.spec_id = tr.spec_id \
+             WHERE tr.task_id = ?1 AND tr.spec_id = r.spec_id",
+            params![task.task_id, task.run_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    if criteria == 0 {
+        return decide(
+            tx,
+            job,
+            task,
+            "no_acceptance_criteria",
+            "the task has no acceptance criterion under the run's specification: nothing to verify (REQ-053 \
+             behaviour 8)",
+            ctx,
+        );
+    }
+    for role in super::results::VERIFIERS {
+        if super::decide::load_binding(tx, &task.run_id, role)?.is_none() {
+            return decide(
+                tx,
+                job,
+                task,
+                "verification_team_missing",
+                &format!("no {role} is bound to verify the candidate (M2-T15's staffing rules)"),
+                ctx,
+            );
+        }
+    }
     tx.execute_batch("SAVEPOINT completion_freeze")
         .map_err(sqlite_error)?;
     let rollback = |tx: &Transaction<'_>| {

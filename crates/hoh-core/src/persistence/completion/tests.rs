@@ -354,3 +354,59 @@ async fn content_already_judged_or_another_candidate_id_is_corrected_not_frozen_
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn a_task_without_criteria_or_a_run_without_its_verifiers_is_decided_before_any_freeze() -> R
+{
+    // Decision 3 (M2T16D-353, -1055): accepting would be refused whole (no AC to verify; no qa or reviewer bound), so
+    // the completion decides first: the task BLOCKED for a decision, the attempt settled and its write lease released,
+    // nothing frozen and no other candidate made STALE.
+    for (case, setup, reason) in [
+        (
+            "no criteria",
+            "DELETE FROM task_requirements WHERE task_id = 'D';",
+            "no_acceptance_criteria",
+        ),
+        (
+            "no reviewer",
+            "DELETE FROM role_bindings WHERE role = 'reviewer';",
+            "verification_team_missing",
+        ),
+    ] {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = open(dir.path())?;
+        Connection::open(&path)?.execute_batch(&format!(
+            "{setup}
+             INSERT INTO candidates(candidate_id, run_id, git_commit, git_tree, spec_sha256, environment_sha256,
+               test_plan_sha256, source_path, state, created_at) VALUES ('C0', 'R', printf('%.40c', 'a'),
+               printf('%.40c', 'd'), printf('%.64c', '1'), printf('%.64c', '2'), printf('%.64c', '3'), 'p', 'VERIFYING',
+               '2026-11-12T00:00:00Z');"
+        ))?;
+        let done = store
+            .complete_writer_attempt(completion(freeze(freeze_of('e'), result(None)?)))
+            .await?;
+        assert_eq!(
+            done,
+            WriterCompleted::Blocked {
+                reason: reason.to_owned()
+            },
+            "{case}"
+        );
+        assert_eq!(
+            texts(&path, "SELECT candidate_id || ':' || state FROM candidates")?,
+            ["C0:VERIFYING"],
+            "{case}: nothing frozen, nothing made STALE"
+        );
+        assert_eq!(
+            texts(&path, "SELECT state FROM attempts WHERE attempt_id = 'A'")?,
+            ["SETTLED"],
+            "{case}"
+        );
+        assert_eq!(
+            released(&path)?,
+            "the write lease expires at the attempt's end",
+            "{case}"
+        );
+    }
+    Ok(())
+}
