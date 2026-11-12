@@ -262,6 +262,7 @@ pub(super) async fn apply(
         disposition,
         Disposition::Ended { .. }
             | Disposition::Completed { .. }
+            | Disposition::Complete { .. }
             | Disposition::UnknownEffect { .. }
     );
     let run_dir = if ends {
@@ -355,6 +356,7 @@ pub(super) async fn run(
             lease_expired: row.lease_expired,
             work_outcome: row.work_outcome,
             writer: row.writer,
+            verifier: row.verifier,
         });
         *counts
             .entry(match disposition {
@@ -545,6 +547,7 @@ mod tests {
             task_revision: 1,
             role: "developer".to_owned(),
             writer: false,
+            verifier: false,
             role_epoch: 1,
             pid: None,
             boot_id: None,

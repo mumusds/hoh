@@ -36,7 +36,10 @@ mod team;
 mod verification;
 mod wakes;
 pub use candidates::{CandidateRow, Freeze, Frozen, RunAcceptance};
-pub use completion::{WriterCompleted, WriterCompletion, WriterOutcome};
+pub use completion::{
+    VerifierCompleted, VerifierCompletion, VerifierOutcome, WriterCompleted, WriterCompletion,
+    WriterOutcome,
+};
 pub use control::{CancelPass, Finished, PauseStep};
 pub use evidence::{AcceptanceRow, Recording};
 pub use handover::SessionStart;
@@ -1289,6 +1292,14 @@ impl Store {
         completion: WriterCompletion,
     ) -> Result<WriterCompleted, PersistError> {
         self.writer.complete_writer_attempt(completion).await
+    }
+
+    /// Complete a successful verifier attempt from its bridge's result in one commit (docs/adr/ADR-028.md decision 11).
+    pub async fn complete_verifier_attempt(
+        &self,
+        completion: VerifierCompletion,
+    ) -> Result<VerifierCompleted, PersistError> {
+        self.writer.complete_verifier_attempt(completion).await
     }
 
     /// Answer a verifier's request through its bridge (docs/adr/ADR-028.md decision 13): a change request refused with

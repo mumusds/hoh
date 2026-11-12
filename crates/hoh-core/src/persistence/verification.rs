@@ -237,6 +237,62 @@ fn criteria(
 /// The kind of the event that issues a round's handoff again at its role's current epoch.
 pub(super) const HANDOFF_REISSUED: &str = "verification.handoff_reissued";
 
+/// The round whose verifier task `task_id` is, and the first round of its chain (a reverification's round names it;
+/// docs/adr/ADR-028.md decision 12).
+pub(super) fn round_of_task(
+    tx: &rusqlite::Connection,
+    run_id: &str,
+    task_id: &str,
+) -> Result<Option<(String, String)>, PersistError> {
+    tx.query_row(
+        "SELECT json_extract(payload_json, '$.round_id'), \
+         coalesce(json_extract(payload_json, '$.chain_root'), json_extract(payload_json, '$.round_id')) \
+         FROM events WHERE kind = ?1 AND run_id = ?2 \
+         AND ?3 IN (json_extract(payload_json, '$.tasks.qa'), json_extract(payload_json, '$.tasks.reviewer'))",
+        params![ROUND_OPENED, run_id, task_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .optional()
+    .map_err(sqlite_error)
+}
+
+/// A verifier task whose attempt `attempt_id` ended UNKNOWN_EFFECT (decision 11, REQ-041 behaviour 2): BLOCKED for a
+/// decision that confirms the effect, never run again by itself; its move (blocked_reason set here) and need_decision.
+/// None for any other task, or a verifier task no longer RUNNING (a cancel's).
+pub(super) fn unknown_effect(
+    tx: &Transaction<'_>,
+    (project_id, run_id, task_id): (&str, &str, &str),
+    (state, revision): (crate::protocol::TaskState, i64),
+    attempt_id: &str,
+) -> Result<Option<(super::writer::StateCas, NewEvent)>, PersistError> {
+    if state != crate::protocol::TaskState::Running || round_of_task(tx, run_id, task_id)?.is_none()
+    {
+        return Ok(None);
+    }
+    tx.execute(
+        "UPDATE tasks SET blocked_reason = 'NEED_DECISION', next_retry_at = NULL WHERE task_id = ?1",
+        params![task_id],
+    )
+    .map_err(sqlite_error)?;
+    Ok(Some((
+        super::writer::StateCas {
+            id: task_id.to_owned(),
+            expected_revision: revision,
+            change: super::writer::Change::Task(crate::protocol::TaskState::Blocked),
+        },
+        NewEvent {
+            project_id: project_id.to_owned(),
+            event_id: child_id(attempt_id, "need_decision"),
+            run_id: Some(run_id.to_owned()),
+            kind: "need_decision".to_owned(),
+            payload: json!({"run_id": run_id, "task_id": task_id, "attempt_id": attempt_id,
+                "reason": "verifier_unknown_effect",
+                "detail": "the verifier's attempt ended with an effect not confirmed; it is not run again until a \
+                    decision confirms what it did"}),
+        },
+    )))
+}
+
 /// The verifier tasks of run `run_id`'s rounds.
 pub(super) fn verifier_tasks(
     tx: &Transaction<'_>,

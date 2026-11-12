@@ -1143,3 +1143,190 @@ async fn a_writer_whose_criteria_an_open_round_with_an_open_issue_covers_waits_f
     assert_eq!(next.task_id, "W");
     Ok(())
 }
+
+/// C1's round 1 with its qa verifier's attempt RUNNING (dispatched, then started): the round, the task, the attempt.
+async fn verifier_running(store: &Store, path: &Path) -> R<(String, String, String)> {
+    let round = verifying(store).await?;
+    let d = store
+        .schedule_round("R", verifiers())
+        .await?
+        .dispatched
+        .ok_or("nothing dispatched")?;
+    Connection::open(path)?.execute(
+        "UPDATE attempts SET state = 'RUNNING' WHERE attempt_id = ?1",
+        [&d.attempt_id],
+    )?;
+    Connection::open(path)?.execute(
+        "UPDATE tasks SET state = 'RUNNING', revision = revision + 1 WHERE task_id = ?1",
+        [&d.task_id],
+    )?;
+    Ok((round, d.task_id, d.attempt_id))
+}
+
+fn verifier_completion(attempt: &str, outcome: VerifierOutcome) -> VerifierCompletion {
+    VerifierCompletion {
+        attempt_id: attempt.to_owned(),
+        ending: ending(),
+        outcome,
+    }
+}
+
+#[tokio::test]
+async fn a_verifiers_completed_result_settles_it_and_its_task_is_done() -> R {
+    // Decision 11 (verifier outputs): COMPLETED settles the attempt and its task IMPLEMENTED, the result recorded.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    let (round, task, attempt) = verifier_running(&store, &path).await?;
+    let done = store
+        .complete_verifier_attempt(verifier_completion(&attempt, VerifierOutcome::Settle))
+        .await?;
+    assert_eq!(done, VerifierCompleted::Settled);
+    assert_eq!(
+        texts(
+            &path,
+            &format!("SELECT state FROM tasks WHERE task_id = '{task}'")
+        )?,
+        ["IMPLEMENTED"]
+    );
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT json_extract(payload_json, '$.result_status') || ':' || json_extract(payload_json, '$.round_id') \
+             FROM events WHERE kind = 'verification.result'"
+        )?,
+        [format!("COMPLETED:{round}")]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_verifiers_failed_result_is_verified_again_in_its_round_until_the_reverify_limit() -> R {
+    // Decision 11/12 (M2T16D-260, -362): a legal FAILED, BLOCKED or INCOMPLETE result sends the verifier task back to
+    // READY within its round, counted by Repair::Reverify keyed by the round's chain (REVERIFY_LIMIT = 2); past it the
+    // task is BLOCKED for a decision. A missing result is a protocol correction instead.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    let (round, task, first) = verifier_running(&store, &path).await?;
+    let reverify = |status: &str| VerifierOutcome::Reverify {
+        status: status.to_owned(),
+        reason: format!("the verifier said {status}"),
+    };
+    let mut verdicts = Vec::new();
+    for (n, status) in ["FAILED", "INCOMPLETE", "BLOCKED"].into_iter().enumerate() {
+        let attempt = if n == 0 {
+            first.clone()
+        } else {
+            let attempt = format!("{task}/attempt-{}", n + 1);
+            Connection::open(&path)?.execute_batch(&format!(
+                "UPDATE tasks SET state = 'RUNNING', revision = revision + 1 WHERE task_id = '{task}';
+                 INSERT INTO attempts(attempt_id, task_id, session_id, state, role_epoch, host_epoch, config_revision)
+                   VALUES ('{attempt}', '{task}', 'sq', 'RUNNING', 1, 1, 1);"
+            ))?;
+            attempt
+        };
+        let done = store
+            .complete_verifier_attempt(verifier_completion(&attempt, reverify(status)))
+            .await?;
+        verdicts.push(done);
+        let state = texts(
+            &path,
+            &format!("SELECT state FROM tasks WHERE task_id = '{task}'"),
+        )?;
+        assert_eq!(state, [if n < 2 { "READY" } else { "BLOCKED" }], "{status}");
+    }
+    assert_eq!(
+        verdicts,
+        [
+            VerifierCompleted::Reverified {
+                verdict: RepairVerdict::Granted { count: 1 }
+            },
+            VerifierCompleted::Reverified {
+                verdict: RepairVerdict::Granted { count: 2 }
+            },
+            VerifierCompleted::Reverified {
+                verdict: RepairVerdict::Refused { count: 2 }
+            },
+        ]
+    );
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT json_extract(payload_json, '$.round_root') FROM events WHERE kind = 'repair.reverify'"
+        )?,
+        [round.clone(), round.clone()]
+    );
+    assert_eq!(
+        texts(
+            &path,
+            &format!("SELECT blocked_reason FROM tasks WHERE task_id = '{task}'")
+        )?,
+        ["NEED_DECISION"]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_verifiers_missing_result_is_a_protocol_correction_and_an_unknown_effect_waits_for_a_decision()
+-> R {
+    // Decision 11: a missing or invalid result is corrected in the round (Repair::Protocol, task READY). A verifier
+    // attempt that ends UNKNOWN_EFFECT is never run again by itself (REQ-041 behaviour 2): its task BLOCKED for a
+    // decision with need_decision.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    let (_, task, attempt) = verifier_running(&store, &path).await?;
+    let done = store
+        .complete_verifier_attempt(verifier_completion(
+            &attempt,
+            VerifierOutcome::Correct {
+                reasons: vec!["it wrote no TaskResult to its bridge".to_owned()],
+            },
+        ))
+        .await?;
+    assert_eq!(
+        done,
+        VerifierCompleted::Corrected {
+            verdict: RepairVerdict::Granted { count: 1 }
+        }
+    );
+    assert_eq!(
+        texts(
+            &path,
+            &format!("SELECT state FROM tasks WHERE task_id = '{task}'")
+        )?,
+        ["READY"]
+    );
+    let second = format!("{task}/attempt-2");
+    Connection::open(&path)?.execute_batch(&format!(
+        "UPDATE tasks SET state = 'RUNNING', revision = revision + 1 WHERE task_id = '{task}';
+         INSERT INTO attempts(attempt_id, task_id, session_id, state, role_epoch, host_epoch, config_revision)
+           VALUES ('{second}', '{task}', 'sq', 'RUNNING', 1, 1, 1);"
+    ))?;
+    let mut unknown = ending();
+    unknown.unknown_effect = true;
+    store.runner_finished(&second, unknown).await?;
+    assert_eq!(
+        texts(
+            &path,
+            &format!("SELECT state FROM attempts WHERE attempt_id = '{second}'")
+        )?,
+        ["UNKNOWN_EFFECT"]
+    );
+    assert_eq!(
+        texts(
+            &path,
+            &format!("SELECT state || ':' || blocked_reason FROM tasks WHERE task_id = '{task}'")
+        )?,
+        ["BLOCKED:NEED_DECISION"]
+    );
+    assert_eq!(
+        texts(
+            &path,
+            &format!(
+                "SELECT json_extract(payload_json, '$.reason') FROM events WHERE kind = 'need_decision' \
+                 AND json_extract(payload_json, '$.task_id') = '{task}'"
+            )
+        )?,
+        ["verifier_unknown_effect"]
+    );
+    Ok(())
+}

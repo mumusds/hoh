@@ -163,6 +163,11 @@ enum Job {
         Box<super::completion::WriterCompletion>,
         oneshot::Sender<Result<super::completion::WriterCompleted, PersistError>>,
     ),
+    /// A verifier attempt's completion ([`super::completion::complete_verifier`]).
+    VerifierCompletion(
+        Box<super::completion::VerifierCompletion>,
+        oneshot::Sender<Result<super::completion::VerifierCompleted, PersistError>>,
+    ),
     /// A verifier's request the Runtime answers ([`super::verification::request`]).
     Request(
         Box<super::verification::VerifierRequest>,
@@ -367,6 +372,7 @@ impl Job {
             Job::Candidates(..) => "Candidates",
             Job::Completion(..) => "Completion",
             Job::Request(..) => "Request",
+            Job::VerifierCompletion(..) => "VerifierCompletion",
             Job::Evidence(..) => "Evidence",
             Job::Plan(..) => "Plan",
             Job::Round(..) => "Round",
@@ -536,6 +542,13 @@ impl Writer {
                                 &ctx,
                                 reply,
                                 super::completion::complete(&mut conn, &job, &ctx),
+                            ));
+                        }
+                        Job::VerifierCompletion(job, reply) => {
+                            deferred = Some(answer(
+                                &ctx,
+                                reply,
+                                super::completion::complete_verifier(&mut conn, &job, &ctx),
                             ));
                         }
                         Job::Request(job, reply) => {
@@ -765,6 +778,14 @@ impl Writer {
         completion: super::completion::WriterCompletion,
     ) -> Result<super::completion::WriterCompleted, PersistError> {
         self.submit(|tx| Job::Completion(Box::new(completion), tx))
+            .await
+    }
+
+    pub(super) async fn complete_verifier_attempt(
+        &self,
+        completion: super::completion::VerifierCompletion,
+    ) -> Result<super::completion::VerifierCompleted, PersistError> {
+        self.submit(|tx| Job::VerifierCompletion(Box::new(completion), tx))
             .await
     }
 

@@ -1206,6 +1206,19 @@ pub(super) fn finished_in(
             }),
         });
     }
+    // A verifier whose attempt ended with an effect not confirmed is never run again by itself (REQ-041 behaviour 2):
+    // its task BLOCKED for a decision that confirms the effect (docs/adr/ADR-028.md decision 11, M2T16D-500).
+    if unknown
+        && let Some((cas, decision)) = super::verification::unknown_effect(
+            tx,
+            (&project_id, &run_id, &task_id),
+            (task_state, revision),
+            attempt_id,
+        )?
+    {
+        commit.cas.push(cas);
+        commit.events.push(decision);
+    }
     // An unknown effect leaves its task as it is; a cancelled attempt's task is the cancel's to move.
     if success && !unknown {
         if task_state == TaskState::Running {

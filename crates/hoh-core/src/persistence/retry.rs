@@ -722,7 +722,14 @@ pub enum Repair {
     Local { fingerprint: String },
     /// A protocol-format correction of this attempt.
     Protocol { attempt_id: String },
+    /// One more verification of the same sources on the same candidate, keyed by the first round of its chain
+    /// (docs/adr/ADR-028.md decision 12; limit [`REVERIFY_LIMIT`]).
+    Reverify { root: String },
 }
+
+/// How many times a round's verification is done again on the same candidate (docs/adr/ADR-028.md decision 12, M2T16D-260):
+/// a constant, changed only by a CR (docs/22).
+pub const REVERIFY_LIMIT: u32 = 2;
 
 impl Repair {
     /// The kind of the events that count it.
@@ -730,6 +737,7 @@ impl Repair {
         match self {
             Repair::Local { .. } => "repair.local",
             Repair::Protocol { .. } => "repair.protocol",
+            Repair::Reverify { .. } => "repair.reverify",
         }
     }
 
@@ -738,6 +746,7 @@ impl Repair {
         match self {
             Repair::Local { fingerprint } => ("fingerprint", fingerprint),
             Repair::Protocol { attempt_id } => ("attempt_id", attempt_id),
+            Repair::Reverify { root } => ("round_root", root),
         }
     }
 
@@ -746,6 +755,7 @@ impl Repair {
         match self {
             Repair::Local { .. } => "local_repairs_exhausted",
             Repair::Protocol { .. } => "protocol_repairs_exhausted",
+            Repair::Reverify { .. } => "reverify_exhausted",
         }
     }
 }

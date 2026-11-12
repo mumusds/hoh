@@ -7,8 +7,8 @@
 use crate::verify::freeze::{self, FreezeError, Inputs};
 use hoh_core::bridge::{self, Identity};
 use hoh_core::persistence::{
-    Ending, Observed, PersistError, Store, UnfinishedRow, WriterCompleted, WriterCompletion,
-    WriterOutcome,
+    Ending, Observed, PersistError, Store, UnfinishedRow, VerifierCompletion, VerifierOutcome,
+    WriterCompleted, WriterCompletion, WriterOutcome,
 };
 use hoh_core::protocol::TaskStatus;
 use hoh_core::retry::FailureClass;
@@ -29,36 +29,13 @@ pub(crate) fn inputs() -> Inputs {
 /// as `bridge.rejected` (decision 2). A COMPLETED result has the project's workspace prepared for its freeze: the
 /// environment description first (decision 5). Blocking (git, files): run it off the async threads.
 pub(super) fn outcome(project: &Path, identity: &Identity, ending: &mut Ending) -> WriterOutcome {
-    let parsed = bridge::parse(&ending.observed.messages, identity);
-    for refused in &parsed.refused {
-        ending.observed.events.push((
-            format!("bridge/rejected/{}", refused.line),
-            "bridge.rejected".to_owned(),
-            json!({"attempt_id": identity.attempt_id, "line": refused.line, "line_sha256": refused.sha256,
-                "reason": refused.reason}),
-        ));
-    }
-    let correct = |reason: String| WriterOutcome::Correct {
-        reasons: vec![reason],
-    };
-    // Cut at its limit, its last TaskResult may be lost: not trusted (M2T16D-456).
-    if ending.observed.messages_truncated {
-        return correct(format!(
-            "its bridge was read only up to its limit ({} lines, {} bytes): write one TaskResult as its last line",
-            super::product::BRIDGE_LINES,
-            super::product::BRIDGE_BYTES
-        ));
-    }
-    let Some(result) = parsed.task_result else {
-        return correct(if parsed.result_invalid {
-            let why = parsed
-                .refused
-                .last()
-                .map_or(String::new(), |r| r.reason.clone());
-            format!("its last TaskResult was refused: {why}")
-        } else {
-            "it wrote no TaskResult to its bridge".to_owned()
-        });
+    let result = match result_of(identity, ending) {
+        Ok(result) => result,
+        Err(reason) => {
+            return WriterOutcome::Correct {
+                reasons: vec![reason],
+            };
+        }
     };
     let decide = |reason: &str| WriterOutcome::Decide {
         reason: reason.to_owned(),
@@ -95,6 +72,79 @@ pub(super) fn outcome(project: &Path, identity: &Identity, ending: &mut Ending) 
             detail: e.to_string(),
         },
     }
+}
+
+/// The TaskResult a work attempt's bridge gives (docs/adr/ADR-028.md decision 2), its refused lines added to `ending`'s
+/// events as `bridge.rejected`; or why its output is to be corrected (cut at its limit, missing, or its last TaskResult
+/// refused).
+fn result_of(
+    identity: &Identity,
+    ending: &mut Ending,
+) -> Result<hoh_core::protocol::TaskResult, String> {
+    let parsed = bridge::parse(&ending.observed.messages, identity);
+    for refused in &parsed.refused {
+        ending.observed.events.push((
+            format!("bridge/rejected/{}", refused.line),
+            "bridge.rejected".to_owned(),
+            json!({"attempt_id": identity.attempt_id, "line": refused.line, "line_sha256": refused.sha256,
+                "reason": refused.reason}),
+        ));
+    }
+    // Cut at its limit, its last TaskResult may be lost: not trusted (M2T16D-456).
+    if ending.observed.messages_truncated {
+        return Err(format!(
+            "its bridge was read only up to its limit ({} lines, {} bytes): write one TaskResult as its last line",
+            super::product::BRIDGE_LINES,
+            super::product::BRIDGE_BYTES
+        ));
+    }
+    parsed.task_result.ok_or_else(|| {
+        if parsed.result_invalid {
+            let why = parsed
+                .refused
+                .last()
+                .map_or(String::new(), |r| r.reason.clone());
+            format!("its last TaskResult was refused: {why}")
+        } else {
+            "it wrote no TaskResult to its bridge".to_owned()
+        }
+    })
+}
+
+/// What a successful verifier attempt's bridge decides (decision 11): COMPLETED settles it; a legal FAILED, BLOCKED or
+/// INCOMPLETE verifies again within its round; anything else is corrected.
+pub(super) fn verifier_outcome(identity: &Identity, ending: &mut Ending) -> VerifierOutcome {
+    match result_of(identity, ending) {
+        Ok(result) if result.status == TaskStatus::Completed => VerifierOutcome::Settle,
+        Ok(result) => VerifierOutcome::Reverify {
+            status: serde_json::to_value(result.status)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .unwrap_or_default(),
+            reason: result.summary,
+        },
+        Err(reason) => VerifierOutcome::Correct {
+            reasons: vec![reason],
+        },
+    }
+}
+
+/// Complete verifier attempt `identity.attempt_id`, which ended successfully with its processes proven gone and its
+/// run directory looked at: its result decided from its bridge, then one commit (decision 11).
+pub(super) async fn complete_verifier(
+    store: &Store,
+    identity: &Identity,
+    ending: Ending,
+) -> Result<hoh_core::persistence::VerifierCompleted, PersistError> {
+    let mut ending = ending;
+    let outcome = verifier_outcome(identity, &mut ending);
+    store
+        .complete_verifier_attempt(VerifierCompletion {
+            attempt_id: identity.attempt_id.clone(),
+            ending,
+            outcome,
+        })
+        .await
 }
 
 /// Complete writer attempt `identity.attempt_id`, which ended successfully with its processes proven gone: its outcome
@@ -168,7 +218,14 @@ pub(super) async fn recover(
         observed,
         unknown_effect: false,
     };
-    complete(store, project, identity, ending).await
+    if row.writer {
+        complete(store, project, identity, ending).await
+    } else {
+        // A verifier's: its result from the same bridge (decision 11).
+        complete_verifier(store, &identity, ending)
+            .await
+            .map(|_| WriterCompleted::AlreadyEnded)
+    }
 }
 
 #[cfg(test)]
