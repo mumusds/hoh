@@ -498,3 +498,127 @@ fn refuse(
     )
     .map(drop)
 }
+
+/// A verifier's request through its bridge that the Runtime answers itself (docs/adr/ADR-028.md decisions 7 and 13).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifierRequest {
+    /// A request that the candidate under verification be changed, while its round is open: refused with an Issue.
+    RejectChange(ChangeRequest),
+    /// Any other message: deferred (routing between roles is M3-T04's, CR-018).
+    Defer(Deferred),
+}
+
+/// A refused change request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeRequest {
+    pub run_id: String,
+    pub attempt_id: String,
+    pub message_id: String,
+    pub round_id: String,
+    pub candidate_id: String,
+    /// As the request gave it; anything but critical, high, medium or low is medium.
+    pub severity: String,
+    /// The request's text, the Issue's description.
+    pub text: String,
+}
+
+/// A deferred message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Deferred {
+    pub run_id: String,
+    pub attempt_id: String,
+    pub message_id: String,
+    pub recipient_role: String,
+}
+
+/// Answer `request` in one transaction: the Issue a refused change request opened (the same one when asked again), or
+/// none.
+pub(super) fn request(
+    conn: &mut rusqlite::Connection,
+    request: &VerifierRequest,
+    ctx: &super::writer::Ctx<'_>,
+) -> Result<Option<String>, PersistError> {
+    let tx = super::writer::begin(conn, ctx)?;
+    let (run_id, attempt_id, message_id) = match request {
+        VerifierRequest::RejectChange(r) => (&r.run_id, &r.attempt_id, &r.message_id),
+        VerifierRequest::Defer(d) => (&d.run_id, &d.attempt_id, &d.message_id),
+    };
+    let project_id: String = tx
+        .query_row(
+            "SELECT project_id FROM runs WHERE run_id = ?1",
+            params![run_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    let key = child_id(attempt_id, &format!("request/{message_id}"));
+    let event = |event_id: String, kind: &str, payload: serde_json::Value| NewEvent {
+        project_id: project_id.clone(),
+        event_id,
+        run_id: Some(run_id.clone()),
+        kind: kind.to_owned(),
+        payload,
+    };
+    let answered: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE event_id IN (?1, ?2))",
+            params![child_id(&key, "rejected"), child_id(&key, "deferred")],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    let (events, issue) = match request {
+        // Answered before (asked again): the same answer, nothing written.
+        VerifierRequest::RejectChange(_) if answered => (Vec::new(), Some(key.clone())),
+        VerifierRequest::Defer(_) if answered => (Vec::new(), None),
+        VerifierRequest::RejectChange(r) => {
+            let severity = match r.severity.as_str() {
+                s @ ("critical" | "high" | "medium" | "low") => s,
+                _ => "medium",
+            };
+            let fingerprint = crate::verification::issue_fingerprint(severity, &r.text);
+            tx.execute(
+                "INSERT INTO issues(issue_id, run_id, candidate_id, fingerprint, severity, state, description) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'OPEN', ?6)",
+                params![key, r.run_id, r.candidate_id, fingerprint, severity, r.text],
+            )
+            .map_err(sqlite_error)?;
+            (
+                vec![
+                    event(
+                        child_id(&key, "rejected"),
+                        "request.rejected",
+                        json!({"attempt_id": r.attempt_id, "message_id": r.message_id, "round_id": r.round_id,
+                            "reason_code": "ILLEGAL_TRANSITION",
+                            "detail": "the candidate under verification is not changed; an Issue for the next candidate"}),
+                    ),
+                    event(
+                        child_id(&key, "issue"),
+                        "issue.opened",
+                        json!({"issue_id": key, "round_id": r.round_id, "candidate_id": r.candidate_id,
+                            "severity": severity, "fingerprint": fingerprint, "attempt_id": r.attempt_id,
+                            "source": "change_request"}),
+                    ),
+                ],
+                Some(key.clone()),
+            )
+        }
+        VerifierRequest::Defer(d) => (
+            vec![event(
+                child_id(&key, "deferred"),
+                "request.deferred",
+                json!({"attempt_id": d.attempt_id, "message_id": d.message_id, "recipient_role": d.recipient_role}),
+            )],
+            None,
+        ),
+    };
+    super::writer::write(
+        &tx,
+        &super::writer::Commit {
+            events,
+            ..super::writer::Commit::default()
+        },
+        ctx,
+    )?;
+    ctx.before_commit()?;
+    tx.commit().map_err(sqlite_error)?;
+    Ok(issue)
+}

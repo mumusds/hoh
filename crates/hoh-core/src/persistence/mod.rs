@@ -55,6 +55,7 @@ pub use team::{
     Assignment, Availability, FileTeam, Handoff, SessionGrant, TeamChange, TeamConfig, TeamMember,
     TeamView, Unbound, session_id,
 };
+pub use verification::{ChangeRequest, Deferred, VerifierRequest};
 pub use wakes::{Allocated, SUPERVISION_TURN, Stop, Supervision};
 pub mod location;
 pub mod selftest;
@@ -1288,6 +1289,15 @@ impl Store {
         completion: WriterCompletion,
     ) -> Result<WriterCompleted, PersistError> {
         self.writer.complete_writer_attempt(completion).await
+    }
+
+    /// Answer a verifier's request through its bridge (docs/adr/ADR-028.md decision 13): a change request refused with
+    /// an OPEN Issue on the candidate (its id returned), any other message deferred.
+    pub async fn verifier_request(
+        &self,
+        request: VerifierRequest,
+    ) -> Result<Option<String>, PersistError> {
+        self.writer.verifier_request(request).await
     }
 
     /// Validate a plan (`$defs.PlanProposal`) for `run_id` and import it whole, or refuse it with nothing written
