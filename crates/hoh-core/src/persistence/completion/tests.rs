@@ -1267,6 +1267,7 @@ async fn a_verifiers_completed_result_settles_it_and_its_task_is_done() -> R {
                 report: Box::new(VerifierReport {
                     role: "qa".to_owned(),
                     status: "PASS".to_owned(),
+                    findings: Vec::new(),
                     report: object(7, "independent_report", "report.json"),
                     native_attempt: object(8, "native_attempt", "attempt.json"),
                 }),
@@ -1345,6 +1346,32 @@ async fn a_verifiers_failed_result_is_verified_again_in_its_round_until_the_reve
             &format!("SELECT state FROM tasks WHERE task_id = '{task}'"),
         )?;
         assert_eq!(state, [if n < 2 { "READY" } else { "BLOCKED" }], "{status}");
+        if n == 0 {
+            // Its next attempt is told why it verifies again (M2T16R-07).
+            let next = format!("{task}/attempt-2");
+            Connection::open(&path)?.execute(
+                "INSERT INTO attempts(attempt_id, task_id, session_id, state, role_epoch, host_epoch, config_revision)
+                   VALUES (?1, ?2, 'sq', 'PREPARED', 1, 1, 1)",
+                rusqlite::params![next, task],
+            )?;
+            let assignment = super::super::team::assignment(
+                &Connection::open(&path)?,
+                "p1",
+                "R",
+                &task,
+                &next,
+                "qa",
+            )?;
+            let scope = assignment
+                .context
+                .map(|c| c.scope.join("\n"))
+                .unwrap_or_default();
+            assert!(scope.contains("the verifier said FAILED"), "{scope}");
+            Connection::open(&path)?.execute(
+                "DELETE FROM attempts WHERE attempt_id = ?1",
+                rusqlite::params![next],
+            )?;
+        }
     }
     assert_eq!(
         verdicts,
@@ -1510,6 +1537,7 @@ async fn settle_verifiers(store: &Store, path: &Path, qa: &str, review: &str) ->
                     report: Box::new(VerifierReport {
                         role: role.clone(),
                         status: status.clone(),
+                        findings: Vec::new(),
                         report: unique("independent_report", "report.json")?,
                         native_attempt: unique("native_attempt", "attempt.json")?,
                     }),
@@ -1617,11 +1645,8 @@ async fn test_037_02_a_failed_round_closes_after_both_verifiers_and_reworks_its_
             "SELECT json_extract(i.value, '$.task_id') || ':' || json_extract(i.value, '$.item') FROM events e, \
              json_each(e.payload_json, '$.items') i WHERE e.kind = 'verification.failures' ORDER BY 1"
         )?,
-        [
-            "D:ac-fail:AC-1-01",
-            "D:check-fail:unit:",
-            "D:report-fail:qa"
-        ]
+        // The check's failure is located on AC-1-01 by its FAIL row, so it is no item of its own (M2T16R-05).
+        ["D:ac-fail:AC-1-01", "D:report-fail:qa"]
     );
     assert_eq!(
         texts(
@@ -2798,5 +2823,433 @@ async fn a_blocked_verifier_of_a_superseded_candidate_is_cancelled_and_holds_not
         ["CANCELLED:-:-"]
     );
     assert_eq!(done.closed, [(round, "superseded".to_owned())]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn every_source_of_a_round_whose_reverify_chain_is_spent_waits_for_a_decision() -> R {
+    // Decisions 11 and 12 (M2T16R-03): C2's round verifies D and E; it is inconclusive three times (UNKNOWN reports).
+    // The chain is counted once per round (2 reverifications), and when it is spent both sources wait for a decision,
+    // not only the first one asked.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    verifying(&store).await?;
+    second_writer(&path, "E", "AE")?;
+    store
+        .complete_writer_attempt(WriterCompletion {
+            attempt_id: "AE".to_owned(),
+            ..completion(freeze(freeze_of('c'), result_of("E", "AE")?))
+        })
+        .await?;
+    store
+        .reconcile_verification("R", Default::default())
+        .await?;
+    for n in 0..3 {
+        settle_verifiers(&store, &path, "UNKNOWN", "UNKNOWN").await?;
+        let done = store
+            .reconcile_verification("R", Default::default())
+            .await?;
+        assert_eq!(
+            done.closed
+                .iter()
+                .map(|(_, v)| v.as_str())
+                .collect::<Vec<_>>(),
+            ["reverify"],
+            "{n}"
+        );
+    }
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT task_id || ':' || state || ':' || coalesce(blocked_reason, '-') FROM tasks \
+             WHERE task_id IN ('D', 'E') ORDER BY task_id"
+        )?,
+        ["D:BLOCKED:NEED_DECISION", "E:BLOCKED:NEED_DECISION"]
+    );
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT CAST(json_extract(payload_json, '$.count') AS TEXT) FROM events WHERE kind = 'repair.reverify' ORDER BY seq"
+        )?,
+        ["1", "2"],
+        "counted once per round"
+    );
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT json_extract(payload_json, '$.task_id') FROM events WHERE kind = 'need_decision' \
+             AND json_extract(payload_json, '$.reason') = 'reverify_exhausted' ORDER BY 1"
+        )?,
+        ["D", "E"]
+    );
+    Ok(())
+}
+
+/// [`evidence_of`] whose rows name their TEST (`<test> in check <check>`) and whose result lines are `observations`
+/// (`(test_id, name, status)`), as a check's evidence records them.
+fn evidence_with(
+    path: &Path,
+    (attempt, candidate, record): (&str, &str, &str),
+    (check, outcome): (&str, &str),
+    rows: &[(&str, &str, &str)],
+    observations: &[(&str, &str, &str)],
+) -> R {
+    let plain: Vec<(&str, &str)> = rows.iter().map(|(ac, _, status)| (*ac, *status)).collect();
+    evidence_of(
+        path,
+        (attempt, candidate, record),
+        (check, outcome),
+        &plain,
+        true,
+    )?;
+    let rows: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|(ac, test, status)| {
+            json!({"ac_id": ac, "spec_id": "s1", "status": status, "reason": format!("{test} in check {check}")})
+        })
+        .collect();
+    let observations: Vec<serde_json::Value> = observations
+        .iter()
+        .map(|(test, name, status)| json!({"schema_version": "1.0", "test_id": test, "name": name, "status": status}))
+        .collect();
+    Connection::open(path)?.execute(
+        "UPDATE events SET payload_json = json_set(payload_json, '$.rows', json(?1), '$.observations', json(?2)) \
+         WHERE event_id = ?3",
+        rusqlite::params![
+            json!(rows).to_string(),
+            json!(observations).to_string(),
+            format!("{record}/evidence")
+        ],
+    )?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_check_failure_located_on_an_in_scope_criterion_is_only_its_owners() -> R {
+    // Decision 12 (M2T16R-05): C2's round verifies D (AC-1-01) and E (AC-2-01); the planned check fails on AC-1-01 and
+    // passes AC-2-01. The failure is located: only D is reworked; E has no item and waits for D's successor.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    verifying(&store).await?;
+    second_writer(&path, "E", "AE")?;
+    let c2 = freeze_of('c').sealed.candidate_id.clone();
+    store
+        .complete_writer_attempt(WriterCompletion {
+            attempt_id: "AE".to_owned(),
+            ..completion(freeze(freeze_of('c'), result_of("E", "AE")?))
+        })
+        .await?;
+    store
+        .reconcile_verification("R", Default::default())
+        .await?;
+    let [qa, _] = settle_verifiers(&store, &path, "PASS", "PASS").await?;
+    evidence_with(
+        &path,
+        (&qa, &c2, "rec-1"),
+        ("unit", "FAIL"),
+        &[
+            ("AC-1-01", "TEST-1-01", "FAIL"),
+            ("AC-2-01", "TEST-2-01", "PASS"),
+        ],
+        &[
+            ("TEST-1-01", "test_1_01_parses", "FAIL"),
+            ("TEST-2-01", "test_2_01_orders", "PASS"),
+        ],
+    )?;
+    let done = store
+        .reconcile_verification("R", Default::default())
+        .await?;
+    assert_eq!(done.reworked, ["D"]);
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT DISTINCT json_extract(j.value, '$.task_id') FROM events e, json_each(json_extract(e.payload_json, '$.items')) j \
+             WHERE e.kind = 'verification.failures' AND json_extract(e.payload_json, '$.candidate_id') = (SELECT candidate_id FROM candidates WHERE state = 'REJECTED')"
+        )?,
+        ["D"]
+    );
+    assert_eq!(
+        texts(&path, "SELECT state FROM tasks WHERE task_id = 'E'")?,
+        ["VERIFYING"]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_criterions_failure_is_its_failing_tests_so_different_failures_do_not_share_a_count() -> R
+{
+    // Decision 12 (M2T16R-06, -155): an in-scope AC's FAIL is the item (AC, its failing tests' names); four rounds each
+    // failing AC-1-01 with another test count each once, and D is never escalated for them.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    for (n, tree) in ['b', 'c', 'd', 'e'].into_iter().enumerate() {
+        let attempt = if n == 0 {
+            "A".to_owned()
+        } else {
+            format!("A{n}")
+        };
+        if n > 0 {
+            Connection::open(&path)?.execute_batch(&format!(
+                "UPDATE tasks SET state = 'RUNNING', revision = revision + 1 WHERE task_id = 'D';
+                 INSERT INTO attempts(attempt_id, task_id, session_id, state, role_epoch, host_epoch, config_revision,
+                   started_at) VALUES ('{attempt}', 'D', 'sd', 'RUNNING', 1, 1, 1, '2026-11-12T00:00:0{n}Z');"
+            ))?;
+        }
+        let job = freeze_of(tree);
+        let candidate = job.sealed.candidate_id.clone();
+        store
+            .complete_writer_attempt(WriterCompletion {
+                attempt_id: attempt.clone(),
+                ..completion(freeze(job, result_of("D", &attempt)?))
+            })
+            .await?;
+        let [qa, _] = settle_verifiers(&store, &path, "PASS", "PASS").await?;
+        let name = format!("test_1_01_case_{n}");
+        evidence_with(
+            &path,
+            (&qa, &candidate, &format!("rec-{n}")),
+            ("unit", "FAIL"),
+            &[("AC-1-01", "TEST-1-01", "FAIL")],
+            &[("TEST-1-01", &name, "FAIL")],
+        )?;
+        let done = store
+            .reconcile_verification("R", Default::default())
+            .await?;
+        assert_eq!(done.reworked, ["D"], "{n}");
+    }
+    let items = texts(
+        &path,
+        "SELECT DISTINCT json_extract(j.value, '$.item') FROM events e, json_each(json_extract(e.payload_json, '$.items')) j \
+         WHERE e.kind = 'verification.failures' ORDER BY 1",
+    )?;
+    assert_eq!(items.len(), 4, "{items:?}");
+    assert!(
+        items.iter().all(|i| i.contains("test_1_01_case_")),
+        "{items:?}"
+    );
+    assert!(
+        texts(
+            &path,
+            "SELECT kind FROM events WHERE kind = 'need_decision'"
+        )?
+        .is_empty(),
+        "never escalated"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_fail_reports_item_names_its_findings_sorted() -> R {
+    // Decision 12 (M2T16R-06): a FAIL report's failure item is (role, "report-fail", its findings' summaries sorted),
+    // so a report failing on other findings is another item.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    let (_, _, [qa, _]) = verified(&store, &path, "FAIL", "PASS").await?;
+    Connection::open(&path)?.execute(
+        "UPDATE events SET payload_json = json_set(payload_json, '$.findings', json('[\"z: order lost\", \"a: empty input\"]')) \
+         WHERE kind = 'verification.report' AND json_extract(payload_json, '$.attempt_id') = ?1",
+        rusqlite::params![qa],
+    )?;
+    store
+        .reconcile_verification("R", Default::default())
+        .await?;
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT json_extract(i.value, '$.item') FROM events e, json_each(e.payload_json, '$.items') i \
+             WHERE e.kind = 'verification.failures'"
+        )?,
+        ["report-fail:qa:a: empty input | z: order lost"]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_siblings_rows_published_after_a_round_opened_are_not_its_history() -> R {
+    // Decision 11's history (M2T16R-04, I2, -754): round 1 (D) records a FAIL row of AC-2-01 before round 2 (E, whose
+    // scope AC-2-01 is) opens, but its rows are published only when round 1 closes, after that. Round 2 judges AC-2-01
+    // by the rows visible when it opened and its own: its own PASS, so it is passable whatever the closing order.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    let first = freeze_of('b');
+    let c1 = first.sealed.candidate_id.clone();
+    store
+        .complete_writer_attempt(completion(freeze(first, result(None)?)))
+        .await?;
+    second_writer(&path, "E", "AE")?;
+    let [qa1, _] = settle_verifiers(&store, &path, "PASS", "PASS").await?;
+    evidence_with(
+        &path,
+        (&qa1, &c1, "g1-rec"),
+        ("unit", "FAIL"),
+        &[("AC-2-01", "TEST-2-01", "FAIL")],
+        &[("TEST-2-01", "test_2_01_orders", "FAIL")],
+    )?;
+    store
+        .complete_writer_attempt(WriterCompletion {
+            attempt_id: "AE".to_owned(),
+            ..completion(freeze(freeze_of('b'), result_of("E", "AE")?))
+        })
+        .await?;
+    // Round 1 closes first (its rows published now), then round 2's verifiers find AC-2-01 passing.
+    let first_close = store
+        .reconcile_verification("R", Default::default())
+        .await?;
+    assert_eq!(first_close.closed.len(), 1, "{first_close:?}");
+    let [qa2, _] = settle_verifiers(&store, &path, "PASS", "PASS").await?;
+    evidence_with(
+        &path,
+        (&qa2, &c1, "g2-rec"),
+        ("unit", "PASS"),
+        &[("AC-2-01", "TEST-2-01", "PASS")],
+        &[("TEST-2-01", "test_2_01_orders", "PASS")],
+    )?;
+    let second = store
+        .reconcile_verification("R", Default::default())
+        .await?;
+    assert_eq!(
+        second.closed,
+        [(crate::ids::child_id(&c1, "round/2"), "passable".to_owned())]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_standing_refusal_holds_a_writers_queued_start_and_its_failed_end() -> R {
+    // Decision 12 (M2T16R-02, -955): a refused repair holds its task at every admission and every end. A writer
+    // already dispatched (its attempt PREPARED) when the refusal stands is not started: its attempt CANCELLED, its lease
+    // let go, the task BLOCKED for the decision; a running writer whose attempt then fails transiently is not retried:
+    // BLOCKED for the decision.
+    let refusal = "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES ('p1', 'nd-1', \
+                   'R', 'need_decision', '{\"task_id\": \"D\", \"reason\": \"local_repairs_exhausted\"}', '2026-11-12T00:00:02Z');";
+    // Queued.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    Connection::open(&path)?.execute_batch(
+        "UPDATE attempts SET state = 'FAILED' WHERE attempt_id = 'A';
+         UPDATE leases SET expires_at = '2000-01-01T00:00:00Z';
+         UPDATE tasks SET state = 'READY', revision = revision + 1 WHERE task_id = 'D';",
+    )?;
+    let mut context = verifiers();
+    context
+        .required_capabilities
+        .insert("developer".to_owned(), Default::default());
+    let dispatched = store
+        .schedule_round("R", context)
+        .await?
+        .dispatched
+        .ok_or("D was not dispatched")?;
+    Connection::open(&path)?.execute_batch(refusal)?;
+    let notice = store
+        .runner_waiting("p1")
+        .await?
+        .dispatches
+        .into_iter()
+        .find(|n| n.attempt_id == dispatched.attempt_id)
+        .ok_or("no notice")?;
+    assert!(
+        !store.runner_received(notice, ending().at).await?,
+        "not started"
+    );
+    assert_eq!(
+        texts(
+            &path,
+            &format!(
+                "SELECT state FROM attempts WHERE attempt_id = '{}'",
+                dispatched.attempt_id
+            )
+        )?,
+        ["CANCELLED"]
+    );
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT state || ':' || blocked_reason FROM tasks WHERE task_id = 'D'"
+        )?,
+        ["BLOCKED:NEED_DECISION"]
+    );
+    assert_eq!(
+        texts(
+            &path,
+            &format!(
+                "SELECT l.kind FROM leases l JOIN attempts a ON a.attempt_id = l.attempt_id \
+                 WHERE l.attempt_id = '{}' AND l.expires_at = a.ended_at",
+                dispatched.attempt_id
+            )
+        )?,
+        ["writer"],
+        "its lease let go at its end"
+    );
+    // Running, then failing transiently.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    Connection::open(&path)?.execute_batch(refusal)?;
+    let mut failed = ending();
+    failed.success = false;
+    failed.detail = "TransientExternal".to_owned();
+    // An interrupted writer's end goes with its workspace's record (REQ-019 behaviour 6).
+    failed.observed.workspace = Some(json!({"head": "a".repeat(40), "clean": true}));
+    store.runner_finished("A", failed).await?;
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT state || ':' || coalesce(blocked_reason, '-') FROM tasks WHERE task_id = 'D'"
+        )?,
+        ["BLOCKED:NEED_DECISION"]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_corrections_reasons_are_in_the_next_attempts_mandatory_task_context() -> R {
+    // Decisions 3 and 12 (M2T16R-07): the reasons a correction gives (here a writer's output) reach the task's next
+    // attempt in its mandatory task context, so the agent knows what to correct; a verifier's verify-again too.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    store
+        .complete_writer_attempt(completion(WriterOutcome::Correct {
+            reasons: vec![
+                "SENTINEL-CORRECT the TaskResult names candidate X, not the frozen Y".to_owned(),
+            ],
+        }))
+        .await?;
+    Connection::open(&path)?.execute_batch(
+        "INSERT INTO attempts(attempt_id, task_id, session_id, state, role_epoch, host_epoch, config_revision)
+           VALUES ('A2', 'D', 'sd', 'PREPARED', 1, 1, 1);",
+    )?;
+    let facts = super::super::context::facts(&Connection::open(&path)?, "R", "D", "A2", None)?;
+    let m = crate::context::mandatory(&facts, "developer", "", None, None)?;
+    assert!(m.task.contains("SENTINEL-CORRECT"), "{}", m.task);
+    Ok(())
+}
+
+#[tokio::test]
+async fn failures_attached_after_the_writers_context_was_read_but_before_it_ran_are_unseen() -> R {
+    // Decision 3's row (decision 11 step 2a, M2T16R-01): the context a writer's prompt is packed from is read when its
+    // assignment is made, before its attempt is RUNNING. Failure items attached in between were not in it: its
+    // COMPLETED result is not frozen, D goes back for the rework. The boundary is the context's own watermark, which
+    // the RUNNING commit records with the workspace's start (context_seq).
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    let conn = Connection::open(&path)?;
+    let assignment = super::super::team::assignment(&conn, "p1", "R", "D", "A", "developer")?;
+    let seen = assignment.context_seq;
+    conn.execute_batch(
+        "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES ('p1', 'g1/attached/D',
+           'R', 'verification.failures_attached', '{\"task_id\": \"D\", \"round_id\": \"g1\", \"items\": [\"x\"]}',
+           '2026-11-12T00:00:02Z');
+         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES ('p1', 'A/running',
+           'R', 'attempt.moved', '{\"attempt_id\": \"A\", \"to\": \"RUNNING\"}', '2026-11-12T00:00:03Z');",
+    )?;
+    conn.execute(
+        "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES ('p1', 'A/workspace_start', \
+         'R', 'attempt.workspace_start', json_object('attempt_id', 'A', 'head', null, 'context_seq', ?1), \
+         '2026-11-12T00:00:03Z')",
+        rusqlite::params![seen],
+    )?;
+    let done = store
+        .complete_writer_attempt(completion(freeze(freeze_of('b'), result(None)?)))
+        .await?;
+    assert_eq!(done, WriterCompleted::Reworked);
     Ok(())
 }

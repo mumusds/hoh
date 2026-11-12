@@ -22,10 +22,12 @@ fn frozen(dir: &Path) -> R<(PathBuf, Sealed)> {
     let project = dir.join("project");
     std::fs::create_dir_all(&project)?;
     run_git(&project, &["init", "-q"])?;
+    // The layout's inputs where the freeze takes them, and a source of the project's own.
+    let layout = crate::host::completion_inputs();
     for (path, text) in [
-        ("src/lib.rs", "pub fn a() {}\n"),
-        ("contracts/requirements.json", "{\"requirements\": []}\n"),
-        ("tests/check-plan.json", "{\"checks\": {}}\n"),
+        (Path::new("src/work.rs"), "pub fn a() {}\n"),
+        (layout.spec.as_path(), "{\"requirements\": []}\n"),
+        (layout.test_plan.as_path(), "{\"checks\": {}}\n"),
     ] {
         let file = project.join(path);
         std::fs::create_dir_all(file.parent().ok_or("no parent")?)?;
@@ -90,9 +92,9 @@ fn a_changed_run_directory_is_not_equal_and_its_status_says_why() -> R {
         let run = dir_of(&dir.path().join("runs"), "p1", change);
         let pre_tree = prepare(&project, &run, &sealed).map_err(|e| e.to_string())?;
         match change {
-            "rewrite" => std::fs::write(run.join("src/lib.rs"), "pub fn b() {}\n")?,
+            "rewrite" => std::fs::write(run.join("src/work.rs"), "pub fn b() {}\n")?,
             "commit" => {
-                std::fs::write(run.join("src/lib.rs"), "pub fn c() {}\n")?;
+                std::fs::write(run.join("src/work.rs"), "pub fn c() {}\n")?;
                 run_git(&run, &["commit", "-q", "-am", "verifier's commit"])?;
             }
             _ => std::fs::write(run.join("new.txt"), "x")?,

@@ -148,6 +148,8 @@ pub struct VerifierReport {
     pub role: String,
     /// PASS, FAIL or UNKNOWN.
     pub status: String,
+    /// Its findings' summaries, as its report gives them: a FAIL report's failure item names them (decision 12).
+    pub findings: Vec<String>,
     pub report: super::runner::ArtifactRow,
     pub native_attempt: super::runner::ArtifactRow,
 }
@@ -232,7 +234,7 @@ pub(super) fn complete_verifier(
                         "verification_report",
                         "verification.report",
                         json!({"attempt_id": job.attempt_id, "task_id": task.task_id, "round_id": round_id,
-                            "role": report.role, "status": report.status,
+                            "role": report.role, "status": report.status, "findings": report.findings,
                             "report": {"path": report.report.path, "sha256": report.report.sha256},
                             "native_attempt": {"path": report.native_attempt.path,
                                 "sha256": report.native_attempt.sha256}}),
@@ -395,16 +397,23 @@ fn freeze_and_accept(
             ctx,
         );
     }
-    // Failure items attached to its task while this attempt ran, after its prompt: its work did not see them, so nothing
-    // is frozen and it goes back to READY for the rework its next attempt's context lists (decision 3's row; the items
-    // were counted when attached, M2T16D-800).
+    // Failure items attached to its task after its prompt's context was read (the watermark its RUNNING commit recorded,
+    // else its RUNNING move): its work did not see them, so nothing is frozen and it goes back to READY for the rework
+    // its next attempt's context lists (decision 3's row; the items were counted when attached, M2T16D-800, M2T16R-01).
     let after_prompt: bool = tx
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM events a WHERE a.kind = 'verification.failures_attached' AND a.run_id = ?1 \
-             AND json_extract(a.payload_json, '$.task_id') = ?2 AND a.seq > coalesce((SELECT max(m.seq) FROM events m \
-               WHERE m.kind = 'attempt.moved' AND json_extract(m.payload_json, '$.attempt_id') = ?3 \
-               AND json_extract(m.payload_json, '$.to') = 'RUNNING'), 0))",
-            params![task.run_id, task.task_id, job.attempt_id],
+             AND json_extract(a.payload_json, '$.task_id') = ?2 AND a.seq > coalesce( \
+               (SELECT json_extract(w.payload_json, '$.context_seq') FROM events w WHERE w.event_id = ?4), \
+               (SELECT max(m.seq) FROM events m WHERE m.kind = 'attempt.moved' \
+                 AND json_extract(m.payload_json, '$.attempt_id') = ?3 AND json_extract(m.payload_json, '$.to') = 'RUNNING'), \
+               0))",
+            params![
+                task.run_id,
+                task.task_id,
+                job.attempt_id,
+                child_id(&job.attempt_id, "workspace_start")
+            ],
             |r| r.get(0),
         )
         .map_err(sqlite_error)?;

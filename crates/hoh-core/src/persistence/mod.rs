@@ -1851,6 +1851,29 @@ impl Reader {
             })
     }
 
+    /// The cancelled runs of project `project_id` with a verification round not closed: their cancel ended before the
+    /// rounds' verifiers were settled, and the verification reconcile still closes them (docs/adr/ADR-028.md decision
+    /// 11, M2T16R-53).
+    pub fn cancelled_with_open_rounds(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<String>, PersistError> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT r.run_id FROM runs r JOIN events o ON o.run_id = r.run_id \
+                 AND o.kind = 'verification.round_opened' WHERE r.project_id = ?1 AND r.state = 'CANCELLED' \
+                 AND NOT EXISTS(SELECT 1 FROM events c WHERE c.kind = 'verification.round_closed' \
+                   AND json_extract(c.payload_json, '$.round_id') = json_extract(o.payload_json, '$.round_id')) \
+                 ORDER BY r.run_id",
+            )
+            .map_err(sqlite_error)?;
+        let rows = statement
+            .query_map(rusqlite::params![project_id], |r| r.get(0))
+            .map_err(sqlite_error)?;
+        rows.collect::<Result<_, _>>().map_err(sqlite_error)
+    }
+
     /// The attempts still live (PREPARED, STARTING or RUNNING): whose run directories and requests are kept.
     pub fn live_attempts(&self) -> Result<Vec<String>, PersistError> {
         let mut statement = self

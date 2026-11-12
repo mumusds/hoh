@@ -292,7 +292,7 @@ pub(super) async fn apply(
         super::completion::recover(store, project, &found, cause, at, draw).await?;
     }
     if let Some(dir) = run_dir {
-        crate::verify::rundir::remove(&dir);
+        crate::verify::rundir::remove_off_thread(dir).await;
     }
     Ok(seq)
 }

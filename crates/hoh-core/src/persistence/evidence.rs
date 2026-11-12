@@ -155,8 +155,21 @@ pub(super) fn record(
         None => false,
     };
     let deferred = round.is_some() && !round_closed;
+    // Its round had a vetoed record when it closed invalidated (M2T16R-59: the close's own rule).
+    let invalidated = match &round {
+        Some((round_id, _)) if round_closed => tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE event_id = ?1 \
+                 AND json_extract(payload_json, '$.verdict') = 'invalidated')",
+                params![crate::ids::child_id(round_id, "closed")],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(sqlite_error)?,
+        _ => false,
+    };
     let skip_passes = round_closed
         && (job.outcome.status == Status::Invalid
+            || invalidated
             || tx
                 .query_row(
                     "SELECT state = 'INVALID' FROM candidates WHERE candidate_id = ?1",

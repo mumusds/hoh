@@ -176,6 +176,9 @@ fn work(
         }
     ));
     facts.acceptance = acceptance(conn, task_id, spec_id)?;
+    // What its previous attempt is to correct or do again (docs/adr/ADR-028.md decisions 3, 11 and 12, M2T16R-07): the
+    // reasons the Runtime gave, in the mandatory scope, so the next turn knows them whatever the budget.
+    facts.scope.extend(corrections(conn, task_id, attempt_id)?);
     // Its earlier attempts' ends: runtime facts only (state, failure reason, end), never what the agent said.
     let mut statement = conn
         .prepare(
@@ -244,6 +247,76 @@ fn work(
         });
     }
     Ok(())
+}
+
+/// The Runtime's reasons for task `task_id`'s next attempt (`attempt_id` excluded): its previous attempt's protocol
+/// correction or verify-again, and a refreeze its candidate's loss asked for since its last completion; each bounded.
+pub(super) fn corrections(
+    conn: &Connection,
+    task_id: &str,
+    attempt_id: &str,
+) -> Result<Vec<String>, PersistError> {
+    let previous: Option<String> = conn
+        .query_row(
+            "SELECT attempt_id FROM attempts WHERE task_id = ?1 AND attempt_id <> ?2 ORDER BY rowid DESC LIMIT 1",
+            params![task_id, attempt_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let mut out = Vec::new();
+    let bounded = |text: String| text.chars().take(2000).collect::<String>();
+    if let Some(previous) = previous {
+        let mut statement = conn
+            .prepare(
+                "SELECT kind, payload_json FROM events WHERE kind IN ('task.protocol_correction', 'task.reverify') \
+                 AND json_extract(payload_json, '$.task_id') = ?1 AND json_extract(payload_json, '$.attempt_id') = ?2 \
+                 ORDER BY seq",
+            )
+            .map_err(sqlite_error)?;
+        let rows: Vec<(String, String)> = statement
+            .query_map(params![task_id, previous], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(sqlite_error)?
+            .collect::<Result<_, _>>()
+            .map_err(sqlite_error)?;
+        for (kind, payload) in rows {
+            let p: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
+            out.push(bounded(if kind == "task.protocol_correction" {
+                format!(
+                    "上一次 Attempt {previous} 的输出需要纠正：{}",
+                    p["reasons"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join("；")
+                )
+            } else {
+                format!(
+                    "上一次 Attempt {previous} 以 {} 结束，需要重新验证：{}",
+                    p["status"].as_str().unwrap_or("?"),
+                    p["reason"].as_str().unwrap_or_default()
+                )
+            }));
+        }
+    }
+    let superseded: Option<String> = conn
+        .query_row(
+            "SELECT json_extract(payload_json, '$.detail') FROM events WHERE kind = 'task.superseded' \
+             AND json_extract(payload_json, '$.task_id') = ?1 \
+             AND seq > coalesce((SELECT max(c.seq) FROM events c WHERE c.kind = 'candidate_ready' \
+               AND json_extract(c.payload_json, '$.task_id') = ?1), 0) ORDER BY seq DESC LIMIT 1",
+            params![task_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?
+        .flatten();
+    if let Some(detail) = superseded {
+        out.push(bounded(format!("上一个候选已失效，需要重新冻结：{detail}")));
+    }
+    Ok(out)
 }
 
 /// How severe a wake's event is, most first: integrity 3, critical 2, high 1, the rest 0 (ADR-025 decision 7).

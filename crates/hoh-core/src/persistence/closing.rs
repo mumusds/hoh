@@ -219,29 +219,41 @@ fn evidence(tx: &Transaction<'_>, attempts: &[String]) -> Result<Vec<Evidence>, 
 }
 
 /// The status of the latest report of `role` among `attempts` (decision 15): NOT_RUN without one.
-fn report(tx: &Transaction<'_>, attempts: &[String], role: &str) -> Result<Report, PersistError> {
-    let mut status = None;
+fn report(
+    tx: &Transaction<'_>,
+    attempts: &[String],
+    role: &str,
+) -> Result<(Report, Vec<String>), PersistError> {
+    let mut latest: Option<(String, Option<String>)> = None;
     for attempt in attempts {
-        let found: Option<String> = tx
+        let found: Option<(String, Option<String>)> = tx
             .query_row(
-                "SELECT json_extract(payload_json, '$.status') FROM events WHERE kind = 'verification.report' \
-                 AND json_extract(payload_json, '$.attempt_id') = ?1 AND json_extract(payload_json, '$.role') = ?2 \
-                 ORDER BY seq DESC LIMIT 1",
+                "SELECT json_extract(payload_json, '$.status'), json_extract(payload_json, '$.findings') FROM events \
+                 WHERE kind = 'verification.report' AND json_extract(payload_json, '$.attempt_id') = ?1 \
+                 AND json_extract(payload_json, '$.role') = ?2 ORDER BY seq DESC LIMIT 1",
                 params![attempt, role],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
             .map_err(sqlite_error)?;
         if found.is_some() {
-            status = found;
+            latest = found;
         }
     }
-    Ok(match status.as_deref() {
-        Some("PASS") => Report::Pass,
-        Some("FAIL") => Report::Fail,
-        Some("UNKNOWN") => Report::Unknown,
-        _ => Report::NotRun,
-    })
+    let (status, findings) = latest.unwrap_or_default();
+    let mut findings: Vec<String> = findings
+        .and_then(|f| serde_json::from_str::<Vec<String>>(&f).ok())
+        .unwrap_or_default();
+    findings.sort();
+    Ok((
+        match status.as_str() {
+            "PASS" => Report::Pass,
+            "FAIL" => Report::Fail,
+            "UNKNOWN" => Report::Unknown,
+            _ => Report::NotRun,
+        },
+        findings,
+    ))
 }
 
 fn row_of(status: &str) -> Row {
@@ -544,12 +556,19 @@ pub(super) fn reconcile(
                 .flatten();
             results.insert(role.to_owned(), json!(status));
         }
+        // The evidence whose rows this close published (M2T16R-04).
+        let published: Vec<&str> = evidence
+            .iter()
+            .filter(|e| e.deferred)
+            .map(|e| e.id.as_str())
+            .collect();
         let mut events = vec![event(
             child_id(&round.id, "closed"),
             ROUND_CLOSED,
             json!({"round_id": round.id, "candidate_id": round.candidate, "verdict": verdict,
                 "class": class.map(|c| format!("{c:?}").to_lowercase()), "inputs": inputs,
-                "source_task_ids": round.sources, "candidate_state": candidate, "result_status": results}),
+                "source_task_ids": round.sources, "candidate_state": candidate, "result_status": results,
+                "published": published}),
         )];
         if !items.is_empty() {
             events.push(event(
@@ -710,11 +729,18 @@ fn classify_round(
 ) -> Result<(classify::Input, Vec<(Option<String>, String)>), PersistError> {
     let _ = run_id;
     let mut failed = Vec::new();
-    let qa = report(tx, attempts, "qa")?;
-    let review = report(tx, attempts, "reviewer")?;
-    for (role, status) in [("qa", qa), ("reviewer", review)] {
+    let (qa, qa_findings) = report(tx, attempts, "qa")?;
+    let (review, review_findings) = report(tx, attempts, "reviewer")?;
+    // A FAIL report's item is its role and its findings' summaries, sorted (decision 12, M2T16R-06).
+    for (role, status, findings) in [
+        ("qa", qa, qa_findings),
+        ("reviewer", review, review_findings),
+    ] {
         if status == Report::Fail {
-            failed.push((None, format!("report-fail:{role}")));
+            failed.push((
+                None,
+                named(&format!("report-fail:{role}"), &findings, " | "),
+            ));
         }
     }
     let conclusive_fail = |e: &Evidence| {
@@ -736,35 +762,48 @@ fn classify_round(
         Checks::Inconclusive
     };
     // The rows of each in-scope AC on the candidate: those that existed when the round opened and the round's own
-    // (a sibling's later rows are its own to judge, I2, -754).
+    // (a sibling's later rows are its own to judge, I2, -754). A row exists from its publication: a round's deferred
+    // rows when that round closed (its `published`), the others with their evidence (M2T16R-04).
     let own: BTreeSet<&str> = evidence.iter().map(|e| e.id.as_str()).collect();
     let mut acs = Vec::new();
     for ac in &round.scope {
         let mut statement = tx
             .prepare(
                 "SELECT ar.status, ar.evidence_id, \
-                 coalesce((SELECT seq FROM events WHERE event_id = ar.evidence_id || '/evidence'), 0), \
+                 coalesce((SELECT c.seq FROM events c, json_each(c.payload_json, '$.published') p \
+                   WHERE c.kind = 'verification.round_closed' AND p.value = ar.evidence_id), \
+                   (SELECT seq FROM events WHERE event_id = ar.evidence_id || '/evidence'), 0), \
                  (SELECT r.release_class FROM acceptance_criteria c JOIN requirements r ON r.requirement_id = \
-                  c.requirement_id AND r.spec_id = c.spec_id WHERE c.ac_id = ar.ac_id AND c.spec_id = ar.spec_id) \
+                  c.requirement_id AND r.spec_id = c.spec_id WHERE c.ac_id = ar.ac_id AND c.spec_id = ar.spec_id), \
+                 ar.reason \
                  FROM acceptance_results ar WHERE ar.candidate_id = ?1 AND ar.ac_id = ?2 AND ar.spec_id = ?3",
             )
             .map_err(sqlite_error)?;
-        let rows: Vec<(String, String, i64, Option<String>)> = statement
+        let rows: Vec<(String, String, i64, Option<String>, String)> = statement
             .query_map(params![round.candidate, ac, spec_id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
             })
             .map_err(sqlite_error)?
             .collect::<Result<_, _>>()
             .map_err(sqlite_error)?;
         let degradable = rows.iter().any(|r| r.3.as_deref() == Some("degradable"));
-        let seen: Vec<Row> = rows
+        let visible: Vec<&(String, String, i64, Option<String>, String)> = rows
             .iter()
-            .filter(|(_, evidence, seq, _)| own.contains(evidence.as_str()) || *seq < round.seq)
-            .map(|(status, ..)| row_of(status))
+            .filter(|(_, evidence, seq, ..)| own.contains(evidence.as_str()) || *seq < round.seq)
             .collect();
+        let seen: Vec<Row> = visible.iter().map(|(status, ..)| row_of(status)).collect();
         let projected = classify::project(&seen, degradable);
         if projected == Ac::Failed {
-            failed.push((Some(ac.clone()), format!("ac-fail:{ac}")));
+            // The item is the AC and its failing tests (decision 12, M2T16R-06): another failure of it is another item.
+            let mut tests = BTreeSet::new();
+            for (_, evidence_id, _, _, reason) in visible.iter().filter(|r| r.0 == "FAIL") {
+                tests.extend(failing_tests(tx, evidence_id, reason)?);
+            }
+            let tests: Vec<String> = tests.into_iter().collect();
+            failed.push((
+                Some(ac.clone()),
+                named(&format!("ac-fail:{ac}"), &tests, ","),
+            ));
         }
         acs.push(projected);
     }
@@ -773,10 +812,13 @@ fn classify_round(
         for row in &e.rows {
             let ac = row["ac_id"].as_str().unwrap_or_default();
             if row["status"] == json!("FAIL") && !round.scope.iter().any(|s| s == ac) {
-                failed.push((None, format!("ac-fail:{ac}")));
+                let tests = failing_tests(tx, &e.id, row["reason"].as_str().unwrap_or_default())?;
+                failed.push((None, named(&format!("ac-fail:{ac}"), &tests, ",")));
             }
         }
-        if conclusive_fail(e) {
+        // A check's failure no FAIL row of it locates (a build, say): every source's (decision 12, M2T16R-05).
+        let located = e.rows.iter().any(|row| row["status"] == json!("FAIL"));
+        if conclusive_fail(e) && !located {
             failed.push((
                 None,
                 format!(
@@ -797,6 +839,51 @@ fn classify_round(
         },
         failed,
     ))
+}
+
+/// The failing tests of evidence `evidence_id` for the TEST its row's reason names (`<TEST> in check <check>…`): the
+/// names of its FAIL result lines of that TEST, sorted; the TEST itself when it has none named (decision 12).
+fn failing_tests(
+    tx: &Transaction<'_>,
+    evidence_id: &str,
+    reason: &str,
+) -> Result<Vec<String>, PersistError> {
+    let test = reason
+        .split(" in check")
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    let payload: Option<String> = tx
+        .query_row(
+            "SELECT payload_json FROM events WHERE event_id = ?1",
+            params![format!("{evidence_id}/evidence")],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let payload: Value = payload
+        .and_then(|p| serde_json::from_str(&p).ok())
+        .unwrap_or(Value::Null);
+    let mut names: BTreeSet<String> = payload["observations"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|o| o["status"] == json!("FAIL") && o["test_id"] == json!(test))
+        .filter_map(|o| o["name"].as_str().map(str::to_owned))
+        .collect();
+    if names.is_empty() && !test.is_empty() {
+        names.insert(test);
+    }
+    Ok(names.into_iter().collect())
+}
+
+/// An item `kind` with what names it (`kind:a<sep>b`), or `kind` alone when nothing does.
+fn named(kind: &str, names: &[String], separator: &str) -> String {
+    if names.is_empty() {
+        kind.to_owned()
+    } else {
+        format!("{kind}:{}", names.join(separator))
+    }
 }
 
 /// A (round, task)'s failure items not yet consumed: the round's candidate and each (item, fingerprint).
@@ -1059,10 +1146,29 @@ fn exits(
                     },
                 )?;
                 let mut commit = commit;
-                super::verification::with_deferred(
-                    &mut commit,
-                    &super::verification::deferred_of(tx, &round.id)?,
-                );
+                let deferred = super::verification::deferred_of(tx, &round.id)?;
+                // The chain's verdict is the round's, asked once (its action the round): a sibling source of the round
+                // gets it replayed with nothing written, and is blocked for the same decision here (M2T16R-03).
+                if matches!(verdict, RepairVerdict::Refused { .. }) && commit.events.is_empty() {
+                    tx.execute(
+                        "UPDATE tasks SET blocked_reason = 'NEED_DECISION', next_retry_at = NULL WHERE task_id = ?1",
+                        params![task],
+                    )
+                    .map_err(sqlite_error)?;
+                    commit.cas.push(StateCas {
+                        id: task.to_owned(),
+                        expected_revision: revision,
+                        change: Change::Task(TaskState::Blocked),
+                    });
+                    commit.events.push(event(
+                        child_id(&round.id, &format!("reverify_exhausted/{task}")),
+                        "need_decision",
+                        json!({"run_id": run_id, "task_id": task, "round_id": round.id,
+                            "reason": "reverify_exhausted", "round_root": round.chain_root,
+                            "detail": format!("round {} was inconclusive and its chain is spent", round.id)}),
+                    ));
+                }
+                super::verification::with_deferred(&mut commit, &deferred);
                 writer::write(tx, &commit, ctx)?;
                 if matches!(verdict, RepairVerdict::Granted { .. }) {
                     reverified

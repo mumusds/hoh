@@ -160,9 +160,14 @@ pub fn check_of(role: &str) -> &'static str {
     }
 }
 
-/// Remove the run directory `dir` (after its attempt is settled); one already gone is fine.
+/// Remove the run directory `dir` (after its attempt is settled); one already gone is fine. Blocking.
 pub fn remove(dir: &Path) {
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// [`remove`] off the async threads: a run directory holds a checkout and its checks' outputs (M2T16R-57).
+pub async fn remove_off_thread(dir: PathBuf) {
+    let _ = tokio::task::spawn_blocking(move || remove(&dir)).await;
 }
 
 #[cfg(test)]

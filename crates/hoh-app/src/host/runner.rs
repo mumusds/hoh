@@ -411,10 +411,25 @@ async fn verification_start(common: &Common) -> Result<(), PersistError> {
             .record_start_recovery(candidate, outcome, common.clock.now())
             .await?;
     }
-    let reader = store.reader()?;
+    remove_unused(common).await?;
+    let waiting = store.runner_waiting(&common.shared.project_id).await?;
+    let held = common.shared.root.join(".hoh");
+    let pending =
+        tokio::task::spawn_blocking(move || crate::verify::check::pending_candidates(&held))
+            .await
+            .unwrap_or_default();
+    for run in verified_runs(common, &waiting).await? {
+        store.reconcile_verification(&run, pending.clone()).await?;
+    }
+    Ok(())
+}
+
+/// The run directories and request directories of no live attempt removed (docs/adr/ADR-028.md decisions 6 and 16).
+async fn remove_unused(common: &Common) -> Result<(), PersistError> {
+    let reader = common.shared.store.reader()?;
     let live = tokio::task::spawn_blocking(move || reader.live_attempts())
         .await
-        .map_err(|e| PersistError::Storage(format!("the start's look-up ended: {e}")))??;
+        .map_err(|e| PersistError::Storage(format!("the attempts' look-up ended: {e}")))??;
     let (root, runs, project_id) = (
         common.shared.root.clone(),
         common.runs.clone(),
@@ -424,16 +439,34 @@ async fn verification_start(common: &Common) -> Result<(), PersistError> {
         super::verifying::remove_unused(&root, &runs, &project_id, &live);
     })
     .await;
-    let waiting = store.runner_waiting(&common.shared.project_id).await?;
-    let held = common.shared.root.join(".hoh");
-    let pending =
-        tokio::task::spawn_blocking(move || crate::verify::check::pending_candidates(&held))
-            .await
-            .unwrap_or_default();
-    for run in waiting.runs.iter().chain(&waiting.pausing) {
-        store.reconcile_verification(run, pending.clone()).await?;
-    }
     Ok(())
+}
+
+/// The runs whose verification is reconciled (docs/adr/ADR-028.md decision 11): those the runner paces, those pausing
+/// or being cancelled, and the cancelled ones whose rounds are still open (M2T16R-53).
+async fn verified_runs(
+    common: &Common,
+    waiting: &hoh_core::persistence::Waiting,
+) -> Result<Vec<String>, PersistError> {
+    let reader = common.shared.store.reader()?;
+    let project = common.shared.project_id.clone();
+    let cancelled =
+        tokio::task::spawn_blocking(move || reader.cancelled_with_open_rounds(&project))
+            .await
+            .map_err(|e| PersistError::Storage(format!("the runs' look-up ended: {e}")))??;
+    let mut runs: Vec<String> = Vec::new();
+    for run in waiting
+        .runs
+        .iter()
+        .chain(&waiting.pausing)
+        .chain(&waiting.cancelling)
+        .chain(&cancelled)
+    {
+        if !runs.contains(run) {
+            runs.push(run.clone());
+        }
+    }
+    Ok(runs)
 }
 
 /// The registry's own loop (docs/adr/ADR-022.md decision 10): every tick it looks at the agents the runner wants, off
@@ -628,9 +661,12 @@ async fn tick(
             .record_recovery(candidate, outcome, common.clock.now())
             .await?;
     }
-    for run in waiting.runs.iter().chain(&waiting.pausing) {
-        store.reconcile_verification(run, pending.clone()).await?;
+    for run in verified_runs(common, &waiting).await? {
+        store.reconcile_verification(&run, pending.clone()).await?;
     }
+    // Run directories and request directories no live attempt uses, whichever path ended theirs (a cancel's included,
+    // M2T16R-54): removed, off the async threads.
+    remove_unused(common).await?;
     for run in &waiting.runs {
         // The run as a whole first: woken when a retry is due, parked, blocked or stopped (ADR-020 decisions 4, 5, 7).
         store.pace_run(run, at()).await?;
@@ -860,9 +896,9 @@ async fn attempt(
         }
         None => None,
     };
-    let remove_run_dir = || {
+    let remove_run_dir = || async {
         if let Some(v) = &verifier {
-            crate::verify::rundir::remove(&v.dir);
+            crate::verify::rundir::remove_off_thread(v.dir.clone()).await;
         }
     };
     // On a blocking thread: the product's executor writes the turn's packed objects before it starts the process
@@ -895,7 +931,7 @@ async fn attempt(
                                 .failed(format!("HELPERS_UNAVAILABLE: its request helpers: {why}")),
                         )
                         .await?;
-                    remove_run_dir();
+                    remove_run_dir().await;
                     return Ok(());
                 }
             }
@@ -922,7 +958,7 @@ async fn attempt(
                 ));
             }
             store.runner_finished(&id, ending).await?;
-            remove_run_dir();
+            remove_run_dir().await;
             return Ok(());
         }
     };
@@ -935,12 +971,15 @@ async fn attempt(
     let marker = work.marker();
     // A writer's workspace at its start: its HEAD, the base of its changed files (docs/adr/ADR-028.md decisions 4, 14).
     let root = work.assignment.writer.then(|| common.shared.root.clone());
+    // With the watermark of the context its prompt was packed from: failures attached after it were not seen
+    // (decision 3's row, M2T16R-01).
+    let context_seq = work.assignment.context_seq;
     let (who, tracking, start) = tokio::task::spawn_blocking(move || {
         let start = root.map(|root| {
             let head = super::control::git(&root, &["rev-parse", "--verify", "HEAD"])
                 .ok()
                 .map(|out| String::from_utf8_lossy(&out).trim().to_owned());
-            json!({ "head": head })
+            json!({ "head": head, "context_seq": context_seq })
         });
         let tracking = match cgroups {
             Some(delegated) => match AttemptGroup::adopt(&delegated.attempt(&marker), pid) {
@@ -961,7 +1000,7 @@ async fn attempt(
                 common.failed("the identity of its process could not be read".to_owned()),
             )
             .await?;
-        remove_run_dir();
+        remove_run_dir().await;
         return Ok(());
     };
     hooks.runner(RunnerPoint::AfterSpawn);
@@ -981,7 +1020,7 @@ async fn attempt(
         .await?
     {
         // Disposed of meanwhile: the gate is dropped unopened, so the process ends without running anything.
-        remove_run_dir();
+        remove_run_dir().await;
         return Ok(());
     }
     if let Err(detail) = started.gate.open() {
@@ -1171,7 +1210,7 @@ async fn attempt(
         };
         super::completion::complete_verifier(store, &identity_of(&work)?, ending, Some(reporting))
             .await?;
-        remove_run_dir();
+        remove_run_dir().await;
         return Ok(());
     }
     // An interrupted writer's end goes with its workspace's record (REQ-019 behaviour 6, docs/adr/ADR-024.md
@@ -1184,7 +1223,7 @@ async fn attempt(
     })
     .await?;
     // Settled: its run directory is no longer needed (decision 6).
-    remove_run_dir();
+    remove_run_dir().await;
     Ok(())
 }
 

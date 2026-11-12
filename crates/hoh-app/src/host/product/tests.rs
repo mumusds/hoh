@@ -12,6 +12,7 @@ fn work(prompt: Option<&str>) -> Work {
         role: "developer".to_owned(),
         effect_key: "k".to_owned(),
         assignment: Assignment {
+            context_seq: 0,
             agent: Some("claude".to_owned()),
             model: None,
             role_epoch: 1,

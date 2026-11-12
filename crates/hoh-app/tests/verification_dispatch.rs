@@ -1256,6 +1256,28 @@ async fn test_037_02_qa_and_review_run_side_by_side_and_the_round_closes_only_af
                    {"check_id": "unit", "outcome": "FAIL", "role": "qa"}])
         );
         assert_eq!(rows(&project, "SELECT state FROM candidates")?, json!([{"state": "REJECTED"}]));
+        // Side by side (M2T16R-58): their runs overlap, and each worked on the same candidate, as its own run
+        // directory's start and its evidence say.
+        let runs = rows(
+            &project,
+            "SELECT a.started_at, a.ended_at FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+             WHERE t.role IN ('qa', 'reviewer') ORDER BY t.role",
+        )?;
+        let at = |i: usize, k: &str| runs[i][k].as_str().unwrap_or_default().to_owned();
+        assert!(at(0, "started_at") < at(1, "ended_at") && at(1, "started_at") < at(0, "ended_at"), "{runs}");
+        let (id, commit, tree) = candidate(&project)?;
+        assert_eq!(
+            rows(
+                &project,
+                "SELECT DISTINCT json_extract(payload_json, '$.candidate_id') AS c, json_extract(payload_json, '$.pre_tree.head') AS head, \
+                 json_extract(payload_json, '$.pre_tree.head_tree') AS tree FROM events WHERE kind = 'verification.attempt_started'"
+            )?,
+            json!([{"c": id, "head": commit, "tree": tree}])
+        );
+        assert_eq!(
+            rows(&project, "SELECT DISTINCT candidate_id FROM evidence")?,
+            json!([{"candidate_id": id}])
+        );
         // Both verifiers completed: their handoffs ACCEPTED at the close (decision 9).
         assert_eq!(
             rows(&project, "SELECT to_role, state FROM handoffs ORDER BY to_role")?,
@@ -1626,7 +1648,15 @@ async fn tampering_qa(
     qa: &str,
 ) -> R<(PathBuf, Arc<FakeClock>, Arc<Team>, PathBuf, Host)> {
     let (project, spec) = project(dir).await?;
-    seed(&project, &world(&spec))?;
+    // The passing check is AC-035-03's scenario check, so a PASS row could be written: only the veto keeps it out
+    // (M2T16R-52).
+    seed(
+        &project,
+        &format!(
+            "{}\nUPDATE acceptance_criteria SET check_id = 'pass';",
+            world(&spec)
+        ),
+    )?;
     let clock = Arc::new(FakeClock::default());
     let mut team = Team::new(Commander::Answers, &spec, &project);
     team.out = dir.join("out");
@@ -1713,6 +1743,17 @@ async fn test_037_03_a_qa_that_rewrites_a_tracked_file_makes_its_evidence_invali
             rows(&project, "SELECT count(*) AS n FROM acceptance_results WHERE status = 'PASS'")?,
             json!([{"n": 0}]),
             "C1 has no PASS row"
+        );
+        // The positive control: the reviewer's evidence concluded a PASS row for AC-035-03, which the close left out.
+        assert_eq!(
+            rows(
+                &project,
+                "SELECT json_extract(e.payload_json, '$.rows[0].status') AS status FROM events e \
+                 JOIN evidence ev ON ev.evidence_id = json_extract(e.payload_json, '$.evidence_id') \
+                 JOIN attempts a ON a.attempt_id = ev.attempt_id JOIN tasks t ON t.task_id = a.task_id \
+                 WHERE e.kind = 'evidence.recorded' AND t.role = 'reviewer'"
+            )?,
+            json!([{"status": "PASS"}])
         );
         assert!(
             rows(&project, "SELECT outcome FROM evidence ev JOIN attempts a ON a.attempt_id = ev.attempt_id \
@@ -2026,6 +2067,15 @@ async fn a_verifier_whose_candidate_is_no_longer_verifying_is_refused_its_run_di
             "SELECT DISTINCT state FROM tasks WHERE role IN ('qa', 'reviewer')",
             &|r| r == &json!([{"state": "CANCELLED"}]),
         )?;
+        // Ended without a decision: nothing for the Commander to answer (M2T16R-55).
+        assert_eq!(
+            rows(
+                &project,
+                "SELECT count(*) AS n FROM events WHERE kind = 'need_decision' \
+                 AND json_extract(payload_json, '$.task_id') IN (SELECT task_id FROM tasks WHERE role IN ('qa', 'reviewer'))"
+            )?,
+            json!([{"n": 0}])
+        );
         R::Ok(())
     }
     .await;
@@ -2100,5 +2150,91 @@ async fn a_change_request_left_in_a_verifiers_bridge_is_answered_when_a_reconcil
     }
     .await;
     second.shutdown().await;
+    outcome
+}
+
+/// POST `body` to the host's commands endpoint; the status.
+async fn command(host: &Host, body: &Value) -> R<u16> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let body = body.to_string();
+    let request = format!(
+        "POST /v1/commands HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\nX-HoH-Token: {token}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len(),
+        port = host.port,
+        token = host.token,
+    );
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", host.port)).await?;
+    stream.write_all(request.as_bytes()).await?;
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await?;
+    let text = String::from_utf8(raw)?;
+    let (head, _) = text.split_once("\r\n\r\n").ok_or("no response head")?;
+    Ok(head.split(' ').nth(1).ok_or("no status")?.parse()?)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancelled_runs_open_round_is_closed_superseded_and_its_handoffs_rejected() -> R {
+    // docs/adr/ADR-028.md decision 11 (M2T16R-53): while C1's verifiers run, the run is cancelled. Its verification is
+    // still reconciled: the verifier tasks end CANCELLED, the round closes superseded (a cancelling run), its delivered
+    // handoffs REJECTED.
+    let dir = tempfile::tempdir()?;
+    let (project, spec) = project(dir.path()).await?;
+    seed(&project, &world(&spec))?;
+    let clock = Arc::new(FakeClock::default());
+    let team = Arc::new(Team::new(Commander::Answers, &spec, &project));
+    let host = host(&project, team.clone(), clock.clone()).await?;
+    let outcome = async {
+        let step = Duration::from_millis(100);
+        wait_for(
+            &project,
+            &clock,
+            step,
+            "SELECT count(*) AS n FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+             WHERE t.role IN ('qa', 'reviewer') AND a.state = 'RUNNING'",
+            &|r| r[0]["n"] == json!(2),
+        )?;
+        let revision = rows(&project, "SELECT revision FROM runs WHERE run_id = 'R'")?[0]["revision"].clone();
+        let status = command(
+            &host,
+            &json!({"schema_version": "1.0", "command_id": "c-cancel", "idempotency_key": "cancel",
+                "expected_revision": revision, "kind": "CancelRun", "run_id": "R", "payload": {"reason": "cancel"}}),
+        )
+        .await?;
+        assert_eq!(status, 202);
+        let closed = wait_for(
+            &project,
+            &clock,
+            step,
+            "SELECT json_extract(payload_json, '$.verdict') AS verdict FROM events WHERE kind = 'verification.round_closed'",
+            &|r| r.as_array().is_some_and(|a| !a.is_empty()),
+        )?;
+        assert_eq!(closed, json!([{"verdict": "superseded"}]));
+        assert_eq!(
+            rows(&project, "SELECT DISTINCT state FROM tasks WHERE role IN ('qa', 'reviewer')")?,
+            json!([{"state": "CANCELLED"}])
+        );
+        assert_eq!(
+            rows(&project, "SELECT DISTINCT state FROM handoffs")?,
+            json!([{"state": "REJECTED"}])
+        );
+        // Their run directories go too (M2T16R-54).
+        let dirs: Vec<PathBuf> = team
+            .run_dirs
+            .lock()
+            .map(|d| d.iter().filter_map(|(_, p)| p.clone()).collect())
+            .unwrap_or_default();
+        assert_eq!(dirs.len(), 2);
+        let end = Instant::now() + Duration::from_secs(30);
+        while dirs.iter().any(|d| d.exists()) {
+            assert!(Instant::now() < end, "{dirs:?}");
+            clock.advance(step);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        R::Ok(())
+    }
+    .await;
+    team.release.store(true, Ordering::SeqCst);
+    host.shutdown().await;
     outcome
 }
