@@ -240,6 +240,10 @@ struct Team {
     run_dirs: Arc<std::sync::Mutex<Vec<RunDir>>>,
     /// Lets the Developer's FakeAgent end (set: it is not held).
     developer: Arc<AtomicBool>,
+    /// What the Developer's FakeAgent runs (sh, in the project) before it reports COMPLETED, when set.
+    developer_script: std::sync::Mutex<Option<String>>,
+    /// The verifiers' starts are refused (transiently) while set: none of them runs.
+    refuse_verifiers: AtomicBool,
 }
 
 impl Team {
@@ -259,6 +263,8 @@ impl Team {
             out: std::env::temp_dir(),
             run_dirs: Arc::default(),
             developer: Arc::new(AtomicBool::new(true)),
+            developer_script: std::sync::Mutex::default(),
+            refuse_verifiers: AtomicBool::new(false),
         }
     }
 }
@@ -338,6 +344,10 @@ impl hoh_app::host::Executor for Team {
                 }
             }
             role => {
+                if work.assignment.handoff.is_some() && self.refuse_verifiers.load(Ordering::SeqCst)
+                {
+                    return Err(refusal("NOT_YET", transient));
+                }
                 held = Some(self.release.clone());
                 if let Ok(mut dirs) = self.run_dirs.lock() {
                     dirs.push((role.to_owned(), work.run_dir.clone()));
@@ -382,11 +392,19 @@ impl hoh_app::host::Executor for Team {
         } else {
             self.qa_script.lock().ok().and_then(|s| s.clone())
         };
+        let developer_script = self
+            .developer_script
+            .lock()
+            .ok()
+            .and_then(|s| s.clone())
+            .filter(|_| work.role == "developer");
         let script = if work.role == "qa" && self.tamper.load(Ordering::SeqCst) {
             "read -r go; echo changed > tampered.txt; exit 0".to_owned()
         } else if let Some(body) =
             qa_script.filter(|_| matches!(work.role.as_str(), "qa" | "reviewer"))
         {
+            format!("read -r go; {body}")
+        } else if let Some(body) = &developer_script {
             format!("read -r go; {body}")
         } else {
             "read -r go; exit 0".to_owned()
@@ -394,6 +412,10 @@ impl hoh_app::host::Executor for Team {
         let mut command = Command::new("sh");
         if let Some(dir) = &work.run_dir {
             command.current_dir(dir);
+        }
+        // A writer works in the project (never the test's own directory).
+        if developer_script.is_some() {
+            command.current_dir(&self.project);
         }
         if let Some(h) = &work.helpers {
             command
@@ -1302,15 +1324,29 @@ async fn at_the_hosts_start_a_failed_recovery_wakes_the_commander_and_holds_its_
     let clock = Arc::new(FakeClock::default());
     let team = Arc::new(Team::new(Commander::Answers, &spec, &project));
     let step = Duration::from_millis(100);
+    // The first host's verifiers never run (their starts refused, retried later), so the next host's start finds
+    // C1's round with its verifier tasks waiting, never an attempt whose effect is unknown.
+    team.refuse_verifiers.store(true, Ordering::SeqCst);
     let first = host(&project, team.clone(), clock.clone()).await?;
     let started = async {
-        wait_for(&project, &clock, step, VERIFIERS, &|r| {
-            r.as_array().is_some_and(|a| a.len() == 2)
-        })?;
+        wait_for(
+            &project,
+            &clock,
+            step,
+            "SELECT count(DISTINCT t.task_id) AS n FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+             WHERE t.role IN ('qa', 'reviewer') AND a.state = 'FAILED'",
+            &|r| r[0]["n"] == json!(2),
+        )?;
         R::Ok(candidate(&project)?.0)
     }
     .await;
     first.shutdown().await;
+    team.refuse_verifiers.store(false, Ordering::SeqCst);
+    let verifier_attempts = "SELECT count(*) AS n FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+        WHERE t.role IN ('qa', 'reviewer')";
+    let before = rows(&project, verifier_attempts)?[0]["n"]
+        .as_i64()
+        .unwrap_or_default();
     let id = started?;
     let project_id = rows(&project, "SELECT project_id FROM projects")?[0]["project_id"]
         .as_str()
@@ -1352,16 +1388,26 @@ async fn at_the_hosts_start_a_failed_recovery_wakes_the_commander_and_holds_its_
             &|r| r.as_array().is_some_and(|a| !a.is_empty()),
         )?;
         assert_eq!(woken, json!([{"reason": "reconcile_failed_at_start"}]));
-        assert!(!unused_run.exists(), "{}", unused_run.display());
-        assert!(!unused_requests.exists(), "{}", unused_requests.display());
+        // Removed by the same start, right after the recoveries are recorded.
+        let end = Instant::now() + Duration::from_secs(30);
+        while unused_run.exists() || unused_requests.exists() {
+            assert!(
+                Instant::now() < end,
+                "{} {}",
+                unused_run.display(),
+                unused_requests.display()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
         // Held: a few ticks, and no verifier attempt beyond the first host's.
         for _ in 0..10 {
             clock.advance(step);
             std::thread::sleep(Duration::from_millis(100));
         }
         assert_eq!(
-            rows(&project, "SELECT count(*) AS n FROM attempts a JOIN tasks t ON t.task_id = a.task_id WHERE t.role IN ('qa', 'reviewer')")?,
-            json!([{"n": 2}])
+            rows(&project, verifier_attempts)?[0]["n"].as_i64().unwrap_or_default(),
+            before,
+            "held: no verifier attempt since the first host's"
         );
         let failed = rows(&project, "SELECT count(*) AS n FROM events WHERE kind = 'candidate.reconcile_failed'")?;
         assert!(failed[0]["n"].as_i64().is_some_and(|n| n >= 1), "{failed}");
@@ -1377,8 +1423,18 @@ async fn at_the_hosts_start_a_failed_recovery_wakes_the_commander_and_holds_its_
             &clock,
             step,
             "SELECT count(*) AS n FROM attempts a JOIN tasks t ON t.task_id = a.task_id WHERE t.role IN ('qa', 'reviewer')",
-            &|r| r[0]["n"].as_i64().is_some_and(|n| n > 2),
-        )?;
+            &|r| r[0]["n"].as_i64().is_some_and(|n| n > before),
+        )
+        .map_err(|e| {
+            format!(
+                "{e}; tasks {}; attempts {}",
+                rows(&project, "SELECT task_id, state, blocked_reason, next_retry_at FROM tasks WHERE role IN ('qa', 'reviewer')")
+                    .unwrap_or_default(),
+                rows(&project, "SELECT a.attempt_id, a.state, a.failure_reason FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+                     WHERE t.role IN ('qa', 'reviewer')")
+                    .unwrap_or_default()
+            )
+        })?;
         let _ = second;
         R::Ok(())
     }
@@ -1388,5 +1444,519 @@ async fn at_the_hosts_start_a_failed_recovery_wakes_the_commander_and_holds_its_
         team.release.store(true, Ordering::SeqCst);
         second.shutdown().await;
     }
+    outcome
+}
+
+/// The sha256 of the file at `path`, as lowercase hex.
+fn file_sha256(path: &Path) -> R<String> {
+    let bytes = std::fs::read(path)?;
+    Ok(<sha2::Sha256 as sha2::Digest>::digest(&bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_054_03_qa_fails_first_and_review_still_completes_with_its_report_in_parallel() -> R {
+    // AC-054-03 (docs/adr/ADR-028.md decisions 9, 10 and 15, M2T16D-158): reader_slots 2; QA's planned check fails
+    // and QA ends first, reporting FAIL; the reviewer, still running then, completes normally afterwards. Each role has
+    // exactly one attempt, in sessions of their own; both handoffs carry the same candidate field by field; their runs
+    // overlap; the reviewer's report is kept (its object there, its raw session's digest checks, its native attempt
+    // valid by the schema and naming the report's session); the candidate is not ACCEPTED.
+    let dir = tempfile::tempdir()?;
+    let (project, spec) = project(dir.path()).await?;
+    seed(&project, &world(&spec))?;
+    let clock = Arc::new(FakeClock::default());
+    let mut team = Team::new(Commander::Answers, &spec, &project);
+    team.out = dir.path().join("out");
+    std::fs::create_dir_all(&team.out)?;
+    *team.report.lock().map_err(|e| e.to_string())? = "FAIL".to_owned();
+    *team.review_report.lock().map_err(|e| e.to_string())? = Some("PASS".to_owned());
+    *team.qa_script.lock().map_err(|e| e.to_string())? =
+        Some("\"$HOH_RUN_CHECK\" unit > \"$OUT/qa.txt\"; exit 0".to_owned());
+    *team.review_script.lock().map_err(|e| e.to_string())? =
+        Some("while [ ! -e \"$OUT/end-review\" ]; do sleep 0.1; done; exit 0".to_owned());
+    team.release.store(true, Ordering::SeqCst);
+    let team = Arc::new(team);
+    let out = team.out.clone();
+    let host = host(&project, team.clone(), clock.clone()).await?;
+    let outcome = async {
+        let step = Duration::from_millis(100);
+        wait_for(
+            &project,
+            &clock,
+            step,
+            "SELECT count(*) AS n FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+             WHERE t.role = 'qa' AND a.state = 'SETTLED'",
+            &|r| r[0]["n"] == json!(1),
+        )?;
+        assert_eq!(
+            rows(
+                &project,
+                "SELECT a.state FROM attempts a JOIN tasks t ON t.task_id = a.task_id WHERE t.role = 'reviewer'"
+            )?,
+            json!([{"state": "RUNNING"}]),
+            "the reviewer still runs after QA's FAIL"
+        );
+        std::fs::write(out.join("end-review"), "")?;
+        wait_for(
+            &project,
+            &clock,
+            step,
+            "SELECT count(*) AS n FROM events WHERE kind = 'verification.round_closed'",
+            &|r| r[0]["n"] == json!(1),
+        )?;
+        let attempts = rows(
+            &project,
+            "SELECT t.role, a.attempt_id, a.session_id, a.started_at, a.ended_at, a.state FROM attempts a \
+             JOIN tasks t ON t.task_id = a.task_id WHERE t.role IN ('qa', 'reviewer') ORDER BY t.role",
+        )?;
+        let [qa, review] = attempts.as_array().map(Vec::as_slice).unwrap_or_default() else {
+            return Err(format!("not one attempt each: {attempts}").into());
+        };
+        assert_eq!((&qa["role"], &review["role"]), (&json!("qa"), &json!("reviewer")));
+        assert_eq!((&qa["state"], &review["state"]), (&json!("SETTLED"), &json!("SETTLED")));
+        assert_ne!(qa["session_id"], review["session_id"], "{attempts}");
+        assert!(qa["session_id"].is_string() && review["session_id"].is_string());
+        let at = |a: &Value, k: &str| a[k].as_str().unwrap_or_default().to_owned();
+        assert!(
+            at(qa, "started_at") < at(review, "ended_at") && at(review, "started_at") < at(qa, "ended_at"),
+            "their runs overlap: {attempts}"
+        );
+        let handoffs = rows(
+            &project,
+            "SELECT recipient_role AS role, json_extract(payload_json, '$.payload.candidate') AS candidate FROM outbox \
+             WHERE json_extract(payload_json, '$.payload.handoff_kind') = 'verification' ORDER BY recipient_role",
+        )?;
+        let candidates: Vec<Value> = handoffs
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|h| serde_json::from_str(h["candidate"].as_str().unwrap_or("null")).unwrap_or(Value::Null))
+            .collect();
+        assert_eq!(candidates.len(), 2, "{handoffs}");
+        assert!(candidates[0].is_object(), "{handoffs}");
+        assert_eq!(candidates[0], candidates[1], "field by field");
+        // The reviewer's report, kept.
+        let reported = rows(
+            &project,
+            &format!(
+                "SELECT json_extract(payload_json, '$.status') AS status, json_extract(payload_json, '$.report.path') AS \
+                 path, json_extract(payload_json, '$.report.sha256') AS sha FROM events WHERE kind = 'verification.report' \
+                 AND json_extract(payload_json, '$.attempt_id') = '{}'",
+                at(review, "attempt_id")
+            ),
+        )?;
+        assert_eq!(reported[0]["status"], json!("PASS"), "{reported}");
+        let report_file = project.join(reported[0]["path"].as_str().ok_or("no report path")?);
+        assert_eq!(file_sha256(&report_file)?, reported[0]["sha"].as_str().unwrap_or_default());
+        let report: Value = serde_json::from_slice(&std::fs::read(&report_file)?)?;
+        let raw = &report["raw_session"];
+        assert_eq!(
+            file_sha256(&project.join(raw["path"].as_str().ok_or("no raw session")?))?,
+            raw["sha256"].as_str().unwrap_or_default()
+        );
+        let native_file = project.join(report["native_attempt"]["path"].as_str().ok_or("no native attempt")?);
+        assert_eq!(
+            file_sha256(&native_file)?,
+            report["native_attempt"]["sha256"].as_str().unwrap_or_default()
+        );
+        let native: Value = serde_json::from_slice(&std::fs::read(&native_file)?)?;
+        hoh_core::schema::native_attempt()
+            .validate(&native)
+            .map_err(|v| format!("{v:?}"))?;
+        assert!(
+            native["session_ids"]
+                .as_array()
+                .is_some_and(|ids| ids.contains(&report["session_id"])),
+            "{native} {report}"
+        );
+        assert_eq!(report["session_id"], review["session_id"]);
+        let state = rows(&project, "SELECT state FROM candidates")?;
+        assert_ne!(state[0]["state"], json!("ACCEPTED"));
+        assert_eq!(state, json!([{"state": "REJECTED"}]));
+        keep(
+            "m2t16-test-054-03",
+            &json!({"attempts": attempts, "handoff_candidate": candidates[0], "report": report,
+                "native_attempt": native, "candidate_state": state[0]["state"]}),
+        )?;
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    outcome
+}
+
+/// Keep `value` as `<name>.json` in the check's evidence directory, when the test runs under run_check.
+fn keep(name: &str, value: &Value) -> R {
+    if let Ok(dir) = std::env::var("HOH_EVIDENCE_DIR") {
+        std::fs::write(
+            Path::new(&dir).join(format!("{name}.json")),
+            serde_json::to_vec_pretty(value)?,
+        )?;
+    }
+    Ok(())
+}
+
+/// TEST-037-03's run: the qa FakeAgent runs `qa` (sh, in its run directory) and reports PASS; the reviewer runs the
+/// passing check and reports PASS, ending once `$OUT/end-review` exists. The project, its clock and the out directory.
+async fn tampering_qa(
+    dir: &Path,
+    qa: &str,
+) -> R<(PathBuf, Arc<FakeClock>, Arc<Team>, PathBuf, Host)> {
+    let (project, spec) = project(dir).await?;
+    seed(&project, &world(&spec))?;
+    let clock = Arc::new(FakeClock::default());
+    let mut team = Team::new(Commander::Answers, &spec, &project);
+    team.out = dir.join("out");
+    std::fs::create_dir_all(&team.out)?;
+    *team.qa_script.lock().map_err(|e| e.to_string())? = Some(qa.to_owned());
+    *team.review_script.lock().map_err(|e| e.to_string())? = Some(
+        "\"$HOH_RUN_CHECK\" pass > \"$OUT/review.txt\"; while [ ! -e \"$OUT/end-review\" ]; do sleep 0.1; done; exit 0"
+            .to_owned(),
+    );
+    team.release.store(true, Ordering::SeqCst);
+    let team = Arc::new(team);
+    let out = team.out.clone();
+    let host = host(&project, team.clone(), clock.clone()).await?;
+    Ok((project, clock, team, out, host))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_037_03_a_qa_that_rewrites_a_tracked_file_makes_its_evidence_invalid_and_c1_has_no_pass()
+-> R {
+    // AC-037-03 (docs/adr/ADR-028.md decisions 6, 8 and 11; M2T16D-356, -655, -750): the qa FakeAgent rewrites a
+    // tracked source file of its run directory after 1 s, then asks to run the passing check (the pre-check refuses
+    // it: the checkout is not the candidate, verification.check_refused) and reports PASS. The reviewer runs the passing
+    // check and reports PASS. At QA's end its run directory is checked again: tree_checked with a pre_tree and a
+    // post_tree that differ and git's status naming the file; the attempt-level record makes the evidence INVALID and
+    // C1 INVALID; C1 has no PASS row (the reviewer's PASS rows are not written: C1 is INVALID at its round's close);
+    // the round closes superseded and D goes back to be frozen anew, counted by repair.reverify (refreeze/D).
+    let dir = tempfile::tempdir()?;
+    let (project, clock, team, out, host) = tampering_qa(
+        dir.path(),
+        "sleep 1; echo '// changed by qa' >> src/lib.rs; \"$HOH_RUN_CHECK\" pass > \"$OUT/qa.txt\"; \
+         echo $? > \"$OUT/qa.code\"; exit 0",
+    )
+    .await?;
+    let outcome = async {
+        let step = Duration::from_millis(100);
+        let checked = wait_for(
+            &project,
+            &clock,
+            step,
+            "SELECT json_extract(payload_json, '$.equal') AS equal, json_extract(payload_json, '$.status') AS status, \
+             json_extract(payload_json, '$.pre_tree') AS pre, json_extract(payload_json, '$.post_tree') AS post \
+             FROM events WHERE kind = 'verification.tree_checked' AND json_extract(payload_json, '$.attempt_id') LIKE '%task/qa%'",
+            &|r| r.as_array().is_some_and(|a| !a.is_empty()),
+        )?;
+        assert_eq!(checked[0]["equal"], json!(0), "{checked}");
+        assert!(checked[0]["status"].as_str().is_some_and(|s| s.contains("src/lib.rs")), "{checked}");
+        assert!(checked[0]["pre"].is_string() && checked[0]["post"].is_string(), "{checked}");
+        assert_ne!(checked[0]["pre"], checked[0]["post"], "the tree hashes differ");
+        let read = |name: &str| std::fs::read_to_string(out.join(name)).unwrap_or_default();
+        assert_eq!(read("qa.code").trim(), "2", "refused: {}", read("qa.txt"));
+        assert_eq!(
+            rows(
+                &project,
+                "SELECT json_extract(payload_json, '$.check_id') AS check_id FROM events \
+                 WHERE kind = 'verification.check_refused'"
+            )?,
+            json!([{"check_id": "pass"}])
+        );
+        let invalid = wait_for(
+            &project,
+            &clock,
+            step,
+            "SELECT ev.outcome, ev.check_id, t.role FROM evidence ev JOIN attempts a ON a.attempt_id = ev.attempt_id \
+             JOIN tasks t ON t.task_id = a.task_id WHERE t.role = 'qa'",
+            &|r| r.as_array().is_some_and(|a| !a.is_empty()),
+        )?;
+        assert_eq!(invalid, json!([{"outcome": "INVALID", "check_id": "independent-qa", "role": "qa"}]));
+        assert_eq!(rows(&project, "SELECT state FROM candidates")?, json!([{"state": "INVALID"}]));
+        std::fs::write(out.join("end-review"), "")?;
+        let closed = wait_for(
+            &project,
+            &clock,
+            step,
+            "SELECT json_extract(payload_json, '$.verdict') AS verdict FROM events WHERE kind = 'verification.round_closed'",
+            &|r| r.as_array().is_some_and(|a| !a.is_empty()),
+        )?;
+        assert_eq!(closed, json!([{"verdict": "superseded"}]));
+        assert_eq!(
+            rows(&project, "SELECT count(*) AS n FROM acceptance_results WHERE status = 'PASS'")?,
+            json!([{"n": 0}]),
+            "C1 has no PASS row"
+        );
+        assert!(
+            rows(&project, "SELECT outcome FROM evidence ev JOIN attempts a ON a.attempt_id = ev.attempt_id \
+                 JOIN tasks t ON t.task_id = a.task_id WHERE t.role = 'reviewer'")?
+                .as_array()
+                .is_some_and(|a| a.iter().any(|e| e["outcome"] == json!("PASS"))),
+            "the reviewer ran its passing check"
+        );
+        wait_for(
+            &project,
+            &clock,
+            step,
+            "SELECT json_extract(payload_json, '$.round_root') AS root FROM events WHERE kind = 'repair.reverify'",
+            &|r| r == &json!([{"root": "refreeze/D"}]),
+        )?;
+        assert_eq!(
+            rows(
+                &project,
+                "SELECT count(*) AS n FROM events WHERE kind = 'task.superseded' AND json_extract(payload_json, '$.task_id') = 'D'"
+            )?,
+            json!([{"n": 1}])
+        );
+        keep("m2t16-test-037-03", &json!({"tree_checked": checked, "evidence": invalid, "closed": closed}))?;
+        R::Ok(())
+    }
+    .await;
+    team.release.store(true, Ordering::SeqCst);
+    let _ = std::fs::write(out.join("end-review"), "");
+    host.shutdown().await;
+    outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_037_03_a_qa_that_ran_a_passing_check_before_rewriting_a_tracked_file_still_makes_c1_invalid()
+-> R {
+    // AC-037-03's variant (docs/adr/ADR-028.md decision 8): the passing check runs first, on the untouched checkout,
+    // then the qa FakeAgent rewrites the tracked file; the check at its end still finds the change: C1 INVALID, no PASS
+    // row.
+    let dir = tempfile::tempdir()?;
+    let (project, clock, team, out, host) = tampering_qa(
+        dir.path(),
+        "\"$HOH_RUN_CHECK\" pass > \"$OUT/qa.txt\"; echo $? > \"$OUT/qa.code\"; sleep 1; \
+         echo '// changed by qa' >> src/lib.rs; exit 0",
+    )
+    .await?;
+    let outcome = async {
+        let step = Duration::from_millis(100);
+        wait_for(&project, &clock, step, "SELECT state FROM candidates", &|r| r[0]["state"] == json!("INVALID"))?;
+        let read = |name: &str| std::fs::read_to_string(out.join(name)).unwrap_or_default();
+        assert_eq!(read("qa.code").trim(), "0", "{}", read("qa.txt"));
+        std::fs::write(out.join("end-review"), "")?;
+        wait_for(
+            &project,
+            &clock,
+            step,
+            "SELECT json_extract(payload_json, '$.verdict') AS verdict FROM events WHERE kind = 'verification.round_closed'",
+            &|r| r.as_array().is_some_and(|a| !a.is_empty()),
+        )?;
+        assert_eq!(
+            rows(&project, "SELECT count(*) AS n FROM acceptance_results WHERE status = 'PASS'")?,
+            json!([{"n": 0}])
+        );
+        R::Ok(())
+    }
+    .await;
+    team.release.store(true, Ordering::SeqCst);
+    let _ = std::fs::write(out.join("end-review"), "");
+    host.shutdown().await;
+    outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_037_04_a_change_request_during_the_barrier_is_refused_and_fixed_only_on_c2_after_it()
+-> R {
+    // AC-037-04 (docs/adr/ADR-028.md decisions 1, 11, 12 and 13; M2T16D-656, -757): C1's QA runs its passing check,
+    // then asks through `ask` that the Developer change the candidate and waits. While QA still runs: the request is
+    // refused, one Issue on C1 is open, nothing is queued for the developer (no wait-for edge from QA), and D is not
+    // dispatched. Once both verifiers end, the round closes repair (driven by that Issue alone; every check and both
+    // reports pass), C1 is REJECTED and D's rework is dispatched after the close. The FakeAgent Developer commits and
+    // completes into C2, which has no acceptance row at its freeze, nor while its QA has written evidence and its
+    // reviewer still runs (no join point then); once C2's round closes, every row is C2's, from C2's verifiers.
+    let dir = tempfile::tempdir()?;
+    let (project, spec) = project(dir.path()).await?;
+    // The passing check is AC-035-03's scenario check here, so a round's rows can satisfy it.
+    seed(
+        &project,
+        &format!(
+            "{}\nUPDATE acceptance_criteria SET check_id = 'pass';",
+            world(&spec)
+        ),
+    )?;
+    let clock = Arc::new(FakeClock::default());
+    let mut team = Team::new(Commander::Answers, &spec, &project);
+    team.out = dir.path().join("out");
+    std::fs::create_dir_all(&team.out)?;
+    *team.qa_script.lock().map_err(|e| e.to_string())? = Some(format!(
+        "SPEC={spec}; {MESSAGE}\
+         \"$HOH_RUN_CHECK\" pass > /dev/null; \
+         if [ ! -e \"$OUT/asked\" ]; then : > \"$OUT/asked\"; \
+           message m-change steer developer '{{\"text\": \"请 Developer 修改当前候选后我继续\", \"severity\": \"high\"}}'; \
+           \"$HOH_ASK\" \"$OUT/m-change.json\" > \"$OUT/change.txt\"; : > \"$OUT/qa-waiting\"; \
+           while [ ! -e \"$OUT/qa-go\" ]; do sleep 0.1; done; \
+         fi; exit 0"
+    ));
+    *team.review_script.lock().map_err(|e| e.to_string())? = Some(
+        "\"$HOH_RUN_CHECK\" pass > /dev/null; \
+         if [ -e \"$OUT/second-review\" ]; then : > \"$OUT/review-2-waiting\"; \
+           while [ ! -e \"$OUT/end-review-2\" ]; do sleep 0.1; done; fi; \
+         : > \"$OUT/second-review\"; exit 0"
+            .to_owned(),
+    );
+    *team.developer_script.lock().map_err(|e| e.to_string())? = Some(
+        "git -c user.name=t -c user.email=t@example.invalid commit -q --allow-empty -m work || exit 1; exit 0".to_owned(),
+    );
+    team.release.store(true, Ordering::SeqCst);
+    let team = Arc::new(team);
+    let out = team.out.clone();
+    let host = host(&project, team.clone(), clock.clone()).await?;
+    let outcome = async {
+        let step = Duration::from_millis(100);
+        let until_file = |name: &str| -> R {
+            let end = Instant::now() + Duration::from_secs(60);
+            while !out.join(name).exists() {
+                if Instant::now() > end {
+                    return Err(format!("no {name}").into());
+                }
+                clock.advance(step);
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Ok(())
+        };
+        until_file("qa-waiting")?;
+        let c1 = candidate(&project)?.0;
+        // QA still runs: refused, one Issue on C1, nothing queued for the developer, D not dispatched again.
+        assert!(
+            std::fs::read_to_string(out.join("change.txt"))?.contains("\"status\":\"rejected\""),
+            "{}",
+            std::fs::read_to_string(out.join("change.txt"))?
+        );
+        assert_eq!(
+            rows(
+                &project,
+                "SELECT a.state FROM attempts a JOIN tasks t ON t.task_id = a.task_id WHERE t.role = 'qa'"
+            )?,
+            json!([{"state": "RUNNING"}])
+        );
+        assert_eq!(
+            rows(&project, "SELECT candidate_id, state FROM issues")?,
+            json!([{"candidate_id": c1, "state": "OPEN"}])
+        );
+        assert_eq!(
+            rows(
+                &project,
+                "SELECT count(*) AS n FROM outbox WHERE state IN ('PENDING', 'DELIVERING') \
+                 AND json_extract(payload_json, '$.kind') IN ('query', 'steer') \
+                 AND json_extract(payload_json, '$.sender_role') = 'qa' AND recipient_role = 'developer'"
+            )?,
+            json!([{"n": 0}]),
+            "no wait-for edge from QA to the developer"
+        );
+        assert_eq!(
+            rows(&project, "SELECT count(*) AS n FROM attempts WHERE task_id = 'D'")?,
+            json!([{"n": 1}]),
+            "no repair dispatched while the barrier is open"
+        );
+        std::fs::write(out.join("qa-go"), "")?;
+        let closed = wait_for(
+            &project,
+            &clock,
+            step,
+            "SELECT seq, json_extract(payload_json, '$.verdict') AS verdict, \
+             json_extract(payload_json, '$.inputs.failing_issues') AS issues FROM events \
+             WHERE kind = 'verification.round_closed' ORDER BY seq",
+            &|r| r.as_array().is_some_and(|a| !a.is_empty()),
+        )?;
+        assert_eq!(closed[0]["verdict"], json!("repair"), "{closed}");
+        assert_eq!(
+            rows(&project, "SELECT outcome FROM evidence ORDER BY outcome")?,
+            json!([{"outcome": "PASS"}, {"outcome": "PASS"}]),
+            "only the Issue fails the round"
+        );
+        assert_eq!(
+            rows(&project, &format!("SELECT state FROM candidates WHERE candidate_id = '{c1}'"))?,
+            json!([{"state": "REJECTED"}])
+        );
+        let rework = wait_for(
+            &project,
+            &clock,
+            step,
+            "SELECT o.event_seq AS seq FROM outbox o WHERE o.message_id = 'D/attempt-2/dispatch'",
+            &|r| r.as_array().is_some_and(|a| !a.is_empty()),
+        )?;
+        assert!(
+            rework[0]["seq"].as_i64() > closed[0]["seq"].as_i64(),
+            "the rework is dispatched after the close: {rework} {closed}"
+        );
+        // C2 frozen: no acceptance row of its own yet.
+        let c2 = wait_for(
+            &project,
+            &clock,
+            step,
+            &format!("SELECT candidate_id FROM candidates WHERE candidate_id <> '{c1}'"),
+            &|r| r.as_array().is_some_and(|a| !a.is_empty()),
+        )?[0]["candidate_id"]
+            .as_str()
+            .ok_or("no C2")?
+            .to_owned();
+        let rows_of_c2 = format!("SELECT count(*) AS n FROM acceptance_results WHERE candidate_id = '{c2}'");
+        assert_eq!(rows(&project, &rows_of_c2)?, json!([{"n": 0}]), "at C2's freeze");
+        until_file("review-2-waiting")?;
+        wait_for(
+            &project,
+            &clock,
+            step,
+            &format!(
+                "SELECT count(*) AS n FROM evidence ev JOIN attempts a ON a.attempt_id = ev.attempt_id \
+                 JOIN tasks t ON t.task_id = a.task_id WHERE ev.candidate_id = '{c2}' AND t.role = 'qa' \
+                 AND a.state = 'SETTLED'"
+            ),
+            &|r| r[0]["n"].as_i64().is_some_and(|n| n >= 1),
+        )?;
+        assert_eq!(rows(&project, &rows_of_c2)?, json!([{"n": 0}]), "C2's QA wrote evidence, its reviewer runs");
+        let join = format!(
+            "SELECT count(*) AS n FROM events WHERE kind = 'verification.candidate_ready_for_join' \
+             AND json_extract(payload_json, '$.candidate_id') = '{c2}'"
+        );
+        assert_eq!(rows(&project, &join)?, json!([{"n": 0}]), "no join point while its round is open");
+        std::fs::write(out.join("end-review-2"), "")?;
+        let second = wait_for(
+            &project,
+            &clock,
+            step,
+            "SELECT json_extract(payload_json, '$.verdict') AS verdict, json_extract(payload_json, '$.inputs') AS inputs \
+             FROM events WHERE kind = 'verification.round_closed' ORDER BY seq",
+            &|r| r.as_array().is_some_and(|a| a.len() >= 2),
+        )?;
+        assert_eq!(second[1]["verdict"], json!("passable"), "{second}");
+        wait_for(&project, &clock, step, &join, &|r| r[0]["n"] == json!(1))?;
+        let accepted = rows(
+            &project,
+            &format!(
+                "SELECT ar.candidate_id AS candidate, ev.candidate_id AS evidence_candidate, t.role, \
+                 json_extract(o.payload_json, '$.candidate_id') AS round_candidate FROM acceptance_results ar \
+                 JOIN evidence ev ON ev.evidence_id = ar.evidence_id JOIN attempts a ON a.attempt_id = ev.attempt_id \
+                 JOIN tasks t ON t.task_id = a.task_id JOIN events o ON o.kind = 'verification.round_opened' \
+                 AND t.task_id IN (json_extract(o.payload_json, '$.tasks.qa'), json_extract(o.payload_json, '$.tasks.reviewer')) \
+                 WHERE ar.candidate_id = '{c2}'"
+            ),
+        )?;
+        assert!(accepted.as_array().is_some_and(|a| !a.is_empty()), "C2 has its rows: {accepted}");
+        for row in accepted.as_array().into_iter().flatten() {
+            assert_eq!(
+                (&row["evidence_candidate"], &row["round_candidate"]),
+                (&json!(c2), &json!(c2)),
+                "{row}"
+            );
+        }
+        assert_eq!(
+            rows(&project, &format!("SELECT state FROM candidates WHERE candidate_id = '{c1}'"))?,
+            json!([{"state": "REJECTED"}])
+        );
+        keep(
+            "m2t16-test-037-04",
+            &json!({"c1": c1, "c2": c2, "closed": closed, "rework_dispatch": rework, "c2_rows": accepted}),
+        )?;
+        R::Ok(())
+    }
+    .await;
+    let _ = std::fs::write(out.join("qa-go"), "");
+    let _ = std::fs::write(out.join("end-review-2"), "");
+    host.shutdown().await;
     outcome
 }
