@@ -272,8 +272,13 @@ pub(super) fn complete_verifier(
                 limit: super::retry::REVERIFY_LIMIT,
                 detail: reason.clone(),
                 action_id: Some(job.attempt_id.clone()),
+                hold: false,
             };
             let (verdict, mut commit) = super::retry::repair_in(&tx, &request)?;
+            super::verification::with_deferred(
+                &mut commit,
+                &super::verification::deferred_of(&tx, &round_id)?,
+            );
             if let RepairVerdict::Granted { .. } = verdict {
                 commit.cas.push(StateCas {
                     id: task.task_id.clone(),
@@ -479,8 +484,25 @@ fn freeze_and_accept(
         Ok(Frozen::New { .. }) => None,
         Ok(Frozen::Existing { state, .. }) if state == "FROZEN" => None,
         Ok(Frozen::Existing { state, .. }) if state == "VERIFYING" => {
-            on_verifying = true;
-            None
+            // A flaky round on it: the same content cannot satisfy FLAKY, a new commit can (M2T16D-454, -557).
+            let flaky: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM events WHERE kind = 'verification.round_closed' \
+                     AND json_extract(payload_json, '$.candidate_id') = ?1 \
+                     AND json_extract(payload_json, '$.verdict') = 'flaky')",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .map_err(sqlite_error)?;
+            if flaky {
+                Some(format!(
+                    "the same content is under verification as {id} with a flaky criterion, which the same content \
+                     cannot satisfy: a new commit is needed"
+                ))
+            } else {
+                on_verifying = true;
+                None
+            }
         }
         Ok(Frozen::Existing { state, .. }) => Some(format!(
             "the same content was frozen before in this run and is {state}: commit anew"
@@ -556,6 +578,7 @@ fn correct_attempt(
         limit,
         detail: reasons.join("; "),
         action_id: Some(attempt_id.to_owned()),
+        hold: false,
     };
     let (verdict, mut commit) = super::retry::repair_in(tx, &request)?;
     if let RepairVerdict::Granted { .. } = verdict {

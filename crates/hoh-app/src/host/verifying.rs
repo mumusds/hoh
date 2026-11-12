@@ -49,6 +49,17 @@ pub(super) async fn prepare(
     let (project, held) = (project.to_owned(), dir.clone());
     let candidate = candidate_id.clone();
     let prepared = tokio::task::spawn_blocking(move || {
+        // Only a candidate under verification is verified (decision 10, M2T16D-253).
+        let state = reader
+            .candidate(&candidate)
+            .map_err(|e| Unprepared::Io(e.to_string()))?
+            .map(|row| row.state);
+        if state.as_deref() != Some("VERIFYING") {
+            return Err(Unprepared::Refused(vec![format!(
+                "candidate {candidate} is {}, not VERIFYING",
+                state.as_deref().unwrap_or("not frozen here")
+            )]));
+        }
         let (sealed, _) = rundir::sealed_of(&reader, &project, &candidate)
             .map_err(|e| Unprepared::Refused(vec![e]))?;
         let pre_tree = rundir::prepare(&project, &held, &sealed)?;

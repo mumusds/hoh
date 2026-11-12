@@ -244,6 +244,8 @@ struct Team {
     developer_script: std::sync::Mutex<Option<String>>,
     /// The verifiers' starts are refused (transiently) while set: none of them runs.
     refuse_verifiers: AtomicBool,
+    /// SQL run on the project's store when a verifier's work is delivered (before its run directory is prepared).
+    on_verifier_delivery: std::sync::Mutex<Option<String>>,
 }
 
 impl Team {
@@ -265,6 +267,7 @@ impl Team {
             developer: Arc::new(AtomicBool::new(true)),
             developer_script: std::sync::Mutex::default(),
             refuse_verifiers: AtomicBool::new(false),
+            on_verifier_delivery: std::sync::Mutex::default(),
         }
     }
 }
@@ -281,10 +284,20 @@ fn refusal(reason: &str, class: hoh_core::retry::FailureClass) -> hoh_app::host:
 impl hoh_app::host::Executor for Team {
     fn deliver(
         &self,
-        _work: &hoh_app::host::Work,
+        work: &hoh_app::host::Work,
     ) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
         let (answer, ack) = tokio::sync::oneshot::channel();
-        let _ = answer.send(Ok(()));
+        let sql = self
+            .on_verifier_delivery
+            .lock()
+            .ok()
+            .and_then(|s| s.clone())
+            .filter(|_| work.assignment.handoff.is_some());
+        let done = match sql {
+            Some(sql) => seed(&self.project, &sql).map_err(|e| e.to_string()),
+            None => Ok(()),
+        };
+        let _ = answer.send(done);
         ack
     }
 
@@ -1179,7 +1192,7 @@ async fn test_037_02_qa_and_review_run_side_by_side_and_the_round_closes_only_af
         Some("\"$HOH_RUN_CHECK\" unit > \"$OUT/qa.txt\"; exit 0".to_owned());
     // The reviewer runs its check, then waits for the test's word before it ends.
     *team.review_script.lock().map_err(|e| e.to_string())? = Some(
-        "\"$HOH_RUN_CHECK\" pass > \"$OUT/review.txt\"; while [ ! -e \"$OUT/end-review\" ]; do sleep 0.1; done; exit 0"
+        "\"$HOH_RUN_CHECK\" pass > \"$OUT/review.txt\"; while [ ! -e \"$OUT/end-review\" ] && [ -d \"$OUT\" ]; do sleep 0.1; done; exit 0"
             .to_owned(),
     );
     team.release.store(true, Ordering::SeqCst);
@@ -1243,6 +1256,11 @@ async fn test_037_02_qa_and_review_run_side_by_side_and_the_round_closes_only_af
                    {"check_id": "unit", "outcome": "FAIL", "role": "qa"}])
         );
         assert_eq!(rows(&project, "SELECT state FROM candidates")?, json!([{"state": "REJECTED"}]));
+        // Both verifiers completed: their handoffs ACCEPTED at the close (decision 9).
+        assert_eq!(
+            rows(&project, "SELECT to_role, state FROM handoffs ORDER BY to_role")?,
+            json!([{"to_role": "qa", "state": "ACCEPTED"}, {"to_role": "reviewer", "state": "ACCEPTED"}])
+        );
         R::Ok(())
     }
     .await;
@@ -1409,8 +1427,9 @@ async fn at_the_hosts_start_a_failed_recovery_wakes_the_commander_and_holds_its_
             before,
             "held: no verifier attempt since the first host's"
         );
+        // Tried again with backoff (2 s, then 4 s), not every tick: at most the start's and one more in the 1 s held.
         let failed = rows(&project, "SELECT count(*) AS n FROM events WHERE kind = 'candidate.reconcile_failed'")?;
-        assert!(failed[0]["n"].as_i64().is_some_and(|n| n >= 1), "{failed}");
+        assert!(failed[0]["n"].as_i64().is_some_and(|n| (1..=2).contains(&n)), "{failed}");
         // The fault goes (the record is put aside): the next recovery succeeds and the verifiers go on.
         std::fs::set_permissions(&check_dir, std::fs::Permissions::from_mode(0o755))?;
         std::fs::remove_file(project.join(format!(".hoh/pending/{record}.json")))?;
@@ -1474,8 +1493,10 @@ async fn test_054_03_qa_fails_first_and_review_still_completes_with_its_report_i
     *team.review_report.lock().map_err(|e| e.to_string())? = Some("PASS".to_owned());
     *team.qa_script.lock().map_err(|e| e.to_string())? =
         Some("\"$HOH_RUN_CHECK\" unit > \"$OUT/qa.txt\"; exit 0".to_owned());
-    *team.review_script.lock().map_err(|e| e.to_string())? =
-        Some("while [ ! -e \"$OUT/end-review\" ]; do sleep 0.1; done; exit 0".to_owned());
+    *team.review_script.lock().map_err(|e| e.to_string())? = Some(
+        "while [ ! -e \"$OUT/end-review\" ] && [ -d \"$OUT\" ]; do sleep 0.1; done; exit 0"
+            .to_owned(),
+    );
     team.release.store(true, Ordering::SeqCst);
     let team = Arc::new(team);
     let out = team.out.clone();
@@ -1612,7 +1633,7 @@ async fn tampering_qa(
     std::fs::create_dir_all(&team.out)?;
     *team.qa_script.lock().map_err(|e| e.to_string())? = Some(qa.to_owned());
     *team.review_script.lock().map_err(|e| e.to_string())? = Some(
-        "\"$HOH_RUN_CHECK\" pass > \"$OUT/review.txt\"; while [ ! -e \"$OUT/end-review\" ]; do sleep 0.1; done; exit 0"
+        "\"$HOH_RUN_CHECK\" pass > \"$OUT/review.txt\"; while [ ! -e \"$OUT/end-review\" ] && [ -d \"$OUT\" ]; do sleep 0.1; done; exit 0"
             .to_owned(),
     );
     team.release.store(true, Ordering::SeqCst);
@@ -1683,6 +1704,11 @@ async fn test_037_03_a_qa_that_rewrites_a_tracked_file_makes_its_evidence_invali
             &|r| r.as_array().is_some_and(|a| !a.is_empty()),
         )?;
         assert_eq!(closed, json!([{"verdict": "superseded"}]));
+        assert_eq!(
+            rows(&project, "SELECT DISTINCT state FROM handoffs")?,
+            json!([{"state": "REJECTED"}]),
+            "a superseded round's handoffs"
+        );
         assert_eq!(
             rows(&project, "SELECT count(*) AS n FROM acceptance_results WHERE status = 'PASS'")?,
             json!([{"n": 0}]),
@@ -1788,13 +1814,13 @@ async fn test_037_04_a_change_request_during_the_barrier_is_refused_and_fixed_on
          if [ ! -e \"$OUT/asked\" ]; then : > \"$OUT/asked\"; \
            message m-change steer developer '{{\"text\": \"请 Developer 修改当前候选后我继续\", \"severity\": \"high\"}}'; \
            \"$HOH_ASK\" \"$OUT/m-change.json\" > \"$OUT/change.txt\"; : > \"$OUT/qa-waiting\"; \
-           while [ ! -e \"$OUT/qa-go\" ]; do sleep 0.1; done; \
+           while [ ! -e \"$OUT/qa-go\" ] && [ -d \"$OUT\" ]; do sleep 0.1; done; \
          fi; exit 0"
     ));
     *team.review_script.lock().map_err(|e| e.to_string())? = Some(
         "\"$HOH_RUN_CHECK\" pass > /dev/null; \
          if [ -e \"$OUT/second-review\" ]; then : > \"$OUT/review-2-waiting\"; \
-           while [ ! -e \"$OUT/end-review-2\" ]; do sleep 0.1; done; fi; \
+           while [ ! -e \"$OUT/end-review-2\" ] && [ -d \"$OUT\" ]; do sleep 0.1; done; fi; \
          : > \"$OUT/second-review\"; exit 0"
             .to_owned(),
     );
@@ -1958,5 +1984,121 @@ async fn test_037_04_a_change_request_during_the_barrier_is_refused_and_fixed_on
     let _ = std::fs::write(out.join("qa-go"), "");
     let _ = std::fs::write(out.join("end-review-2"), "");
     host.shutdown().await;
+    outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_verifier_whose_candidate_is_no_longer_verifying_is_refused_its_run_directory() -> R {
+    // docs/adr/ADR-028.md decision 10 (M2T16D-253): between a verifier's dispatch and its run directory's preparation
+    // its candidate stops being VERIFYING (here a veto made it INVALID): the preparation refuses it, nothing starts,
+    // no run directory is made, and the round's verifiers end CANCELLED.
+    let dir = tempfile::tempdir()?;
+    let (project, spec) = project(dir.path()).await?;
+    seed(&project, &world(&spec))?;
+    let clock = Arc::new(FakeClock::default());
+    let team = Team::new(Commander::Answers, &spec, &project);
+    *team
+        .on_verifier_delivery
+        .lock()
+        .map_err(|e| e.to_string())? = Some("UPDATE candidates SET state = 'INVALID';".to_owned());
+    let team = Arc::new(team);
+    let host = host(&project, team.clone(), clock.clone()).await?;
+    let outcome = async {
+        let step = Duration::from_millis(100);
+        let refused = wait_for(
+            &project,
+            &clock,
+            step,
+            "SELECT a.failure_reason AS reason FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+             WHERE t.role IN ('qa', 'reviewer') AND a.state = 'FAILED'",
+            &|r| r.as_array().is_some_and(|a| !a.is_empty()),
+        )?;
+        let reason = refused[0]["reason"].as_str().unwrap_or_default();
+        assert!(reason.contains("RUN_DIR_REFUSED") && reason.contains("VERIFYING"), "{refused}");
+        assert!(
+            team.run_dirs.lock().map(|d| d.is_empty()).unwrap_or(false),
+            "nothing started"
+        );
+        wait_for(
+            &project,
+            &clock,
+            step,
+            "SELECT DISTINCT state FROM tasks WHERE role IN ('qa', 'reviewer')",
+            &|r| r == &json!([{"state": "CANCELLED"}]),
+        )?;
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_request_left_in_a_verifiers_bridge_is_answered_when_a_reconcile_ends_it() -> R {
+    // docs/adr/ADR-028.md decision 13 (the bridge file as well as the request helper): the qa FakeAgent writes a steer
+    // asking the developer to change the candidate into its bridge file and runs on; the host stops. The next host's
+    // reconcile ends the attempt (its effect unknown) and answers what its bridge holds as the runner's own end would:
+    // request.rejected and an OPEN Issue on the candidate, nothing queued for the developer.
+    let dir = tempfile::tempdir()?;
+    let (project, spec) = project(dir.path()).await?;
+    seed(&project, &world(&spec))?;
+    let clock = Arc::new(FakeClock::default());
+    let mut team = Team::new(Commander::Answers, &spec, &project);
+    team.out = dir.path().join("out");
+    std::fs::create_dir_all(&team.out)?;
+    let attempts = project.join(".hoh/attempts");
+    *team.qa_script.lock().map_err(|e| e.to_string())? = Some(format!(
+        "SPEC={spec}; {MESSAGE}\
+         message m-left steer developer '{{\"text\": \"请 Developer 修改当前候选\", \"severity\": \"critical\"}}'; \
+         b=\"{}/$(printf %s \"$ATTEMPT_ID\" | sed 's|%|%25|g; s|/|%2F|g')\"; mkdir -p \"$b\"; \
+         {{ cat \"$OUT/m-left.json\"; echo; }} >> \"$b/messages.jsonl\"; : > \"$OUT/written\"; while [ -d \"$OUT\" ]; do sleep 0.1; done",
+        attempts.display()
+    ));
+    team.release.store(true, Ordering::SeqCst);
+    let team = Arc::new(team);
+    let out = team.out.clone();
+    let step = Duration::from_millis(100);
+    let first = host(&project, team.clone(), clock.clone()).await?;
+    let written = async {
+        let end = Instant::now() + Duration::from_secs(60);
+        while !out.join("written").exists() {
+            if Instant::now() > end {
+                return Err("the qa FakeAgent wrote nothing".into());
+            }
+            clock.advance(step);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        R::Ok(())
+    }
+    .await;
+    first.shutdown().await;
+    written?;
+    let c1 = candidate(&project)?.0;
+    let second = host(&project, team.clone(), clock.clone()).await?;
+    let outcome = async {
+        let rejected = wait_for(
+            &project,
+            &clock,
+            step,
+            "SELECT json_extract(payload_json, '$.message_id') AS m FROM events WHERE kind = 'request.rejected'",
+            &|r| r.as_array().is_some_and(|a| !a.is_empty()),
+        )?;
+        assert_eq!(rejected, json!([{"m": "m-left"}]));
+        assert_eq!(
+            rows(&project, "SELECT candidate_id, severity, state FROM issues")?,
+            json!([{"candidate_id": c1, "severity": "critical", "state": "OPEN"}])
+        );
+        assert_eq!(
+            rows(
+                &project,
+                "SELECT count(*) AS n FROM outbox WHERE recipient_role = 'developer' \
+                 AND json_extract(payload_json, '$.kind') IN ('steer', 'query')"
+            )?[0]["n"],
+            json!(0)
+        );
+        R::Ok(())
+    }
+    .await;
+    second.shutdown().await;
     outcome
 }

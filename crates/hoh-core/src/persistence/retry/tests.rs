@@ -237,6 +237,7 @@ async fn test_042_05_repairs_past_their_limits_are_refused_for_a_decision_across
         limit: 3,
         detail: format!("local repair {n} of F"),
         action_id: None,
+        hold: false,
     };
     let protocol = |n: u32| RepairRequest {
         run_id: "R".to_owned(),
@@ -247,6 +248,7 @@ async fn test_042_05_repairs_past_their_limits_are_refused_for_a_decision_across
         limit: 2,
         detail: format!("protocol correction {n} of A1"),
         action_id: None,
+        hold: false,
     };
     // F's three local repairs (each failed) and A1's two protocol corrections.
     for n in 1..=3 {
@@ -462,6 +464,7 @@ async fn a_repair_asked_again_for_the_same_action_is_decided_once() -> R {
         limit: 1,
         detail: format!("rework for {action}"),
         action_id: Some(action.to_owned()),
+        hold: false,
     };
     for _ in 0..2 {
         assert_eq!(
@@ -905,6 +908,7 @@ async fn a_parked_run_whose_last_waiting_task_is_blocked_is_blocked() -> R {
         limit: 0,
         detail: "refused".to_owned(),
         action_id: None,
+        hold: false,
     };
     store.request_repair(request()).await?;
     store

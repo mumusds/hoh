@@ -1792,6 +1792,65 @@ impl Reader {
         rows.collect::<Result<_, _>>().map_err(sqlite_error)
     }
 
+    /// When candidate `candidate_id`'s recovery may be tried again (docs/adr/ADR-028.md decision 11, M2T16D-1251):
+    /// after its last failure, none succeeding since, by the failure's backoff (2 s doubling per failure in a row, at
+    /// most 300 s); none when no failure stands.
+    pub fn recovery_not_before(
+        &self,
+        candidate_id: &str,
+    ) -> Result<Option<std::time::SystemTime>, PersistError> {
+        let last: Option<(Option<i64>, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT json_extract(f.payload_json, '$.attempt'), json_extract(f.payload_json, '$.at_ms') FROM events f \
+                 WHERE f.kind = 'candidate.reconcile_failed' AND json_extract(f.payload_json, '$.candidate_id') = ?1 \
+                 AND f.seq > coalesce((SELECT max(r.seq) FROM events r WHERE r.kind = 'candidate.reconcile_recovered' \
+                   AND json_extract(r.payload_json, '$.candidate_id') = ?1), 0) ORDER BY f.seq DESC LIMIT 1",
+                rusqlite::params![candidate_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                e => Err(sqlite_error(e)),
+            })?;
+        let Some((attempt, at_ms)) = last else {
+            return Ok(None);
+        };
+        let at = at_ms.and_then(|ms| ms.parse::<u64>().ok()).unwrap_or(0);
+        let doublings = u32::try_from(attempt.unwrap_or(1).saturating_sub(1))
+            .unwrap_or(u32::MAX)
+            .min(16);
+        let backoff = (2u64 << doublings).min(300);
+        Ok(Some(
+            std::time::UNIX_EPOCH
+                + std::time::Duration::from_millis(at)
+                + std::time::Duration::from_secs(backoff),
+        ))
+    }
+
+    /// Verifier task `task_id`'s round in run `run_id` and the candidate it verifies (docs/adr/ADR-028.md decision 9);
+    /// none for any other task.
+    pub fn verifier_round(
+        &self,
+        run_id: &str,
+        task_id: &str,
+    ) -> Result<Option<(String, String)>, PersistError> {
+        self.conn
+            .query_row(
+                "SELECT json_extract(payload_json, '$.round_id'), json_extract(payload_json, '$.candidate_id') \
+                 FROM events WHERE kind = 'verification.round_opened' AND run_id = ?1 \
+                 AND ?2 IN (json_extract(payload_json, '$.tasks.qa'), json_extract(payload_json, '$.tasks.reviewer'))",
+                rusqlite::params![run_id, task_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                e => Err(sqlite_error(e)),
+            })
+    }
+
     /// The attempts still live (PREPARED, STARTING or RUNNING): whose run directories and requests are kept.
     pub fn live_attempts(&self) -> Result<Vec<String>, PersistError> {
         let mut statement = self

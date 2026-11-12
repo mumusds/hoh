@@ -774,6 +774,10 @@ pub struct RepairRequest {
     /// replayed after a crash): asked again, it is answered as the first time and counted once (docs/adr/ADR-028.md
     /// decision 12, M2T16D-09).
     pub action_id: Option<String>,
+    /// The task's attempt runs on (a failure item attached to a LEASED or RUNNING owner, docs/adr/ADR-028.md decision
+    /// 11 step 2a): a refusal leaves the task where it is; its attempt's end, whichever it is, blocks it for the decision
+    /// (decision 12, M2T16D-800). Otherwise a refusal blocks the task now.
+    pub hold: bool,
 }
 
 /// The answer to a [`RepairRequest`]: granted as the `count`-th, or refused with `count` already done.
@@ -910,10 +914,12 @@ pub(super) fn repair_in(
                 "count": count, "limit": request.limit, "detail": request.detail, "action_id": action,
             }),
         ));
-        if !matches!(
-            state,
-            TaskState::Blocked | TaskState::Accepted | TaskState::Cancelled
-        ) {
+        if !request.hold
+            && !matches!(
+                state,
+                TaskState::Blocked | TaskState::Accepted | TaskState::Cancelled
+            )
+        {
             tx.execute(
                 "UPDATE tasks SET blocked_reason = ?1, next_retry_at = NULL WHERE task_id = ?2",
                 params![BlockedReason::NeedDecision.as_str(), request.task_id],

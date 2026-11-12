@@ -14,9 +14,24 @@ pub(super) const MAX_REQUESTS: u64 = 64;
 /// How long `ask` waits for its answer, in seconds.
 const ASK_WAIT: u64 = 60;
 
-/// How long `run-check` waits for its answer at most, in seconds: past every check's own timeout (the plan's, an hour
-/// when it names none) and its grace.
-const CHECK_WAIT: u64 = 4 * 3600;
+/// How long `run-check` waits for its answer, in seconds, under frozen plan `plan` (decision 7): its longest check's
+/// timeout (an hour for a check naming none, as the driver runs it), the stop's grace `grace`, and a minute for the
+/// answer to be written.
+pub(super) fn check_wait(plan: &Value, grace: std::time::Duration) -> u64 {
+    let longest = plan["checks"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(_, c)| c["timeout_seconds"].as_f64().unwrap_or(3600.0))
+        .fold(0.0_f64, f64::max);
+    // A plan of no check still answers within the default.
+    let longest = if longest > 0.0 {
+        longest.ceil() as u64
+    } else {
+        3600
+    };
+    longest + grace.as_secs() + 60
+}
 
 /// A verifier's helpers and the directory its requests go to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,8 +42,13 @@ pub struct Helpers {
 }
 
 /// The helpers of attempt `attempt_id` in the project at `project`, written into its attempt directory (`.hoh/` is
-/// ignored, so they change nothing of the candidate) before its process starts. Blocking.
-pub(super) fn write_helpers(project: &Path, attempt_id: &str) -> std::io::Result<Helpers> {
+/// ignored, so they change nothing of the candidate) before its process starts, `run-check` waiting `check_wait` seconds
+/// at most ([`check_wait`]). Blocking.
+pub(super) fn write_helpers(
+    project: &Path,
+    attempt_id: &str,
+    check_wait: u64,
+) -> std::io::Result<Helpers> {
     use std::os::unix::fs::PermissionsExt as _;
     let dir = super::product::bridge_of(project, attempt_id)
         .parent()
@@ -56,7 +76,7 @@ pub(super) fn write_helpers(project: &Path, attempt_id: &str) -> std::io::Result
          {claim}printf '{{\"kind\":\"check\",\"check_id\":\"%s\"}}\\n' \"$1\" > \"$d/$n.tmp\" && mv \"$d/$n.tmp\" \"$d/$n.json\" || exit 2\n\
          {}code=$(sed -n 's/.*\"exit_code\":\\([0-9][0-9]*\\).*/\\1/p' \"$d/$n.response.json\")\n\
          [ -n \"$code\" ] && exit \"$code\"\nexit 2\n",
-        wait(CHECK_WAIT, "run-check")
+        wait(check_wait, "run-check")
     );
     let ask = format!(
         "#!/bin/sh\n# HoH's request helper (docs/adr/ADR-028.md decisions 7 and 13): ask <message.json> sends one HCP \

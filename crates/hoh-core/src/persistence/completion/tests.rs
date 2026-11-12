@@ -1597,6 +1597,15 @@ async fn test_037_02_a_failed_round_closes_after_both_verifiers_and_reworks_its_
         .reconcile_verification("R", Default::default())
         .await?;
     assert_eq!(done.closed, [(round.clone(), "repair".to_owned())]);
+    // Each verifier's result in the close's payload (decision 15).
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT json_extract(payload_json, '$.result_status.qa') || ':' || \
+             json_extract(payload_json, '$.result_status.reviewer') FROM events WHERE kind = 'verification.round_closed'"
+        )?,
+        ["COMPLETED:COMPLETED"]
+    );
     assert_eq!(
         texts(&path, "SELECT status FROM acceptance_results")?,
         ["FAIL"]
@@ -1766,10 +1775,27 @@ async fn a_flaky_criterion_blocks_its_source_for_a_decision() -> R {
         &[("AC-1-01", "NOT_RUN")],
         true,
     )?;
+    // A question QA asked during the round, deferred: the decision carries it (decision 13, M2T16D-559).
+    store
+        .verifier_request(VerifierRequest::Defer(Deferred {
+            run_id: "R".to_owned(),
+            attempt_id: qa.clone(),
+            message_id: "m-q".to_owned(),
+            recipient_role: "developer".to_owned(),
+        }))
+        .await?;
     let done = store
         .reconcile_verification("R", Default::default())
         .await?;
-    assert_eq!(done.closed, [(round, "flaky".to_owned())]);
+    assert_eq!(done.closed, [(round.clone(), "flaky".to_owned())]);
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT json_extract(payload_json, '$.deferred[0].message_id') FROM events WHERE kind = 'need_decision' \
+             AND json_extract(payload_json, '$.task_id') = 'D'"
+        )?,
+        ["m-q"]
+    );
     assert_eq!(
         texts(
             &path,
@@ -1785,6 +1811,137 @@ async fn a_flaky_criterion_blocks_its_source_for_a_decision() -> R {
         )?,
         ["flaky"]
     );
+    // The decision sends D back; its completion of the same content onto C1 (still VERIFYING, its round flaky) is
+    // corrected: the same content cannot satisfy FLAKY, a new commit is needed (decision 3's row, M2T16D-454, -557).
+    Connection::open(&path)?.execute_batch(
+        "UPDATE tasks SET state = 'RUNNING', blocked_reason = NULL, revision = revision + 1 WHERE task_id = 'D';
+         INSERT INTO attempts(attempt_id, task_id, session_id, state, role_epoch, host_epoch, config_revision, started_at)
+           VALUES ('A2', 'D', 'sd', 'RUNNING', 1, 1, 1, '2026-11-12T00:00:05Z');",
+    )?;
+    let again = store
+        .complete_writer_attempt(WriterCompletion {
+            attempt_id: "A2".to_owned(),
+            ..completion(freeze(freeze_of('b'), result_of("D", "A2")?))
+        })
+        .await?;
+    assert!(
+        matches!(again, WriterCompleted::Corrected { .. }),
+        "{again:?}"
+    );
+    assert!(
+        texts(
+            &path,
+            "SELECT json_extract(payload_json, '$.reasons[0]') FROM events WHERE kind = 'task.protocol_correction'"
+        )?
+        .iter()
+        .any(|r| r.contains("new commit")),
+        "the correction asks for a new commit"
+    );
+    assert_eq!(
+        rounds_of(&path)?.len(),
+        1,
+        "no new round on the flaky candidate"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_change_requests_issue_taken_by_a_rework_is_recorded_as_consumed() -> R {
+    // Decision 12: a rework that takes a change request's Issue records issue.consumed_by_rework{issue_id, task_id,
+    // round_id} (RESOLVED is M2-T18's, after a verifier's observation).
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    let round = verifying(&store).await?;
+    let candidate = texts(&path, "SELECT candidate_id FROM candidates")?.remove(0);
+    let issue = store
+        .verifier_request(VerifierRequest::RejectChange(ChangeRequest {
+            run_id: "R".to_owned(),
+            attempt_id: crate::ids::child_id(&round, "task/qa/attempt-1"),
+            message_id: "m1".to_owned(),
+            round_id: round.clone(),
+            candidate_id: candidate,
+            severity: "high".to_owned(),
+            text: "fix the parser".to_owned(),
+        }))
+        .await?
+        .ok_or("no issue")?;
+    settle_verifiers(&store, &path, "PASS", "PASS").await?;
+    let done = store
+        .reconcile_verification("R", Default::default())
+        .await?;
+    assert_eq!(done.closed, [(round.clone(), "repair".to_owned())]);
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT json_extract(payload_json, '$.issue_id') || ':' || json_extract(payload_json, '$.task_id') || ':' || \
+             json_extract(payload_json, '$.round_id') FROM events WHERE kind = 'issue.consumed_by_rework'"
+        )?,
+        [format!("{issue}:D:{round}")]
+    );
+    assert_eq!(
+        texts(&path, "SELECT state FROM issues")?,
+        ["OPEN"],
+        "not resolved by the rework"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_critical_or_high_issue_a_rounds_report_registered_fails_it_another_rounds_or_a_lower_one_does_not()
+-> R {
+    // Decisions 11 and 13 (M2T16D-1051, -1052, -154): an Issue belongs to a round when its verifier's change request
+    // opened it, or its verifier's report registered it (report_id -> the report's attempt -> its round); a critical
+    // or high one fails the round, a medium one does not; one registered by another round's report is not this
+    // round's.
+    for (severity, own, verdict) in [
+        ("critical", true, "repair"),
+        ("medium", true, "passable"),
+        ("critical", false, "passable"),
+    ] {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = open(dir.path())?;
+        let (round, candidate, [qa, _]) = verified(&store, &path, "PASS", "PASS").await?;
+        evidence_of(
+            &path,
+            (&qa, &candidate, "rec-1"),
+            ("unit", "PASS"),
+            &[("AC-1-01", "PASS")],
+            true,
+        )?;
+        // The report's attempt: QA's of this round, or an attempt of another round's verifier task.
+        let attempt = if own {
+            qa.clone()
+        } else {
+            Connection::open(&path)?.execute_batch(
+                "INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq) VALUES
+                   ('other/task/qa', 'R', 's1', 'IMPLEMENTED', 1, 'qa', 0, 99);
+                 INSERT INTO attempts(attempt_id, task_id, session_id, state, role_epoch, host_epoch, config_revision)
+                   VALUES ('other/task/qa/attempt-1', 'other/task/qa', 'sq', 'SETTLED', 1, 1, 1);",
+            )?;
+            "other/task/qa/attempt-1".to_owned()
+        };
+        let artifact = texts(
+            &path,
+            "SELECT artifact_id FROM artifacts ORDER BY artifact_id LIMIT 1",
+        )?
+        .remove(0);
+        Connection::open(&path)?.execute_batch(&format!(
+            "INSERT INTO independent_reports(report_id, run_id, candidate_id, role, session_id, spec_sha256, status,
+               state, attempt_id, report_artifact_id, raw_session_artifact_id, created_at)
+               VALUES ('rep-1', 'R', '{candidate}', 'qa', 'sq', printf('%.64c', '1'), 'PASS', 'CURRENT', '{attempt}',
+               '{artifact}', '{artifact}', '2026-11-12T00:00:09Z');
+             INSERT INTO issues(issue_id, run_id, candidate_id, fingerprint, severity, state, description, report_id,
+               finding_id) VALUES ('I-f', 'R', '{candidate}', 'fp-f', '{severity}', 'OPEN', 'a finding', 'rep-1', 'F1');"
+        ))?;
+        let done = store
+            .reconcile_verification("R", Default::default())
+            .await?;
+        assert_eq!(
+            done.closed,
+            [(round.clone(), verdict.to_owned())],
+            "{severity} own={own}"
+        );
+    }
     Ok(())
 }
 
@@ -2250,5 +2407,292 @@ async fn a_source_whose_candidates_verifiers_tampered_with_is_frozen_anew_until_
         )?,
         ["reverify_exhausted"]
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_running_owner_whose_failure_items_are_refused_runs_on_and_its_end_waits_for_a_decision()
+-> R {
+    // Decision 11 step 2a and decision 12 (M2T16D-702, -800, -953): a failure item whose owner's attempt is running is
+    // attached and counted; refused (past max_local_repairs, here 0), the owner is not moved while its attempt runs:
+    // need_decision now, and the attempt's end — here a COMPLETED result — freezes nothing and blocks the task for the
+    // decision, in a commit that succeeds.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    let round = verifying(&store).await?;
+    let candidate = texts(&path, "SELECT candidate_id FROM candidates")?.remove(0);
+    store
+        .verifier_request(VerifierRequest::RejectChange(ChangeRequest {
+            run_id: "R".to_owned(),
+            attempt_id: crate::ids::child_id(&round, "task/qa/attempt-1"),
+            message_id: "m1".to_owned(),
+            round_id: round.clone(),
+            candidate_id: candidate.clone(),
+            severity: "high".to_owned(),
+            text: "fix the parser".to_owned(),
+        }))
+        .await?;
+    settle_verifiers(&store, &path, "PASS", "PASS").await?;
+    Connection::open(&path)?.execute_batch(
+        "UPDATE runs SET config_snapshot_json = json_set(coalesce(config_snapshot_json, '{}'), '$.repairs.local', 0) \
+           WHERE run_id = 'R';
+         UPDATE tasks SET state = 'RUNNING', revision = revision + 1 WHERE task_id = 'D';
+         INSERT INTO attempts(attempt_id, task_id, session_id, state, role_epoch, host_epoch, config_revision, started_at)
+           VALUES ('A2', 'D', 'sd', 'RUNNING', 1, 1, 1, '2026-11-12T00:00:05Z');",
+    )?;
+    let done = store
+        .reconcile_verification("R", Default::default())
+        .await?;
+    assert_eq!(done.closed, [(round, "repair".to_owned())]);
+    assert_eq!(
+        texts(&path, "SELECT state FROM tasks WHERE task_id = 'D'")?,
+        ["RUNNING"],
+        "not moved while its attempt runs"
+    );
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT json_extract(payload_json, '$.reason') FROM events WHERE kind = 'need_decision' \
+             AND json_extract(payload_json, '$.task_id') = 'D'"
+        )?,
+        ["local_repairs_exhausted"]
+    );
+    let ended = store
+        .complete_writer_attempt(WriterCompletion {
+            attempt_id: "A2".to_owned(),
+            ..completion(freeze(freeze_of('c'), result_of("D", "A2")?))
+        })
+        .await?;
+    assert_eq!(
+        ended,
+        WriterCompleted::Blocked {
+            reason: "repair_refused".to_owned()
+        }
+    );
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT state || ':' || blocked_reason FROM tasks WHERE task_id = 'D'"
+        )?,
+        ["BLOCKED:NEED_DECISION"]
+    );
+    assert_eq!(
+        texts(&path, "SELECT state FROM attempts WHERE attempt_id = 'A2'")?,
+        ["SETTLED"]
+    );
+    assert_eq!(
+        texts(&path, "SELECT candidate_id FROM candidates")?.len(),
+        1,
+        "nothing frozen"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_transient_recovery_failure_is_tried_again_only_after_its_backoff() -> R {
+    // Decision 11 (M2T16D-1251): transient failures are tried again with backoff (2 s doubling, at most 300 s, from the
+    // last failure), not every tick; a success clears it.
+    let t0 = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
+    let secs = |s: u64| t0 + std::time::Duration::from_secs(s);
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    verifying(&store).await?;
+    let candidate = texts(&path, "SELECT candidate_id FROM candidates")?.remove(0);
+    assert_eq!(store.reader()?.recovery_not_before(&candidate)?, None);
+    let transient = || Err((false, "EIO".to_owned()));
+    store
+        .record_recovery(&candidate, transient(), secs(0))
+        .await?;
+    assert_eq!(
+        store.reader()?.recovery_not_before(&candidate)?,
+        Some(secs(2))
+    );
+    store
+        .record_recovery(&candidate, transient(), secs(3))
+        .await?;
+    assert_eq!(
+        store.reader()?.recovery_not_before(&candidate)?,
+        Some(secs(7))
+    );
+    for n in 0..10 {
+        store
+            .record_recovery(&candidate, transient(), secs(1000 + n))
+            .await?;
+    }
+    assert_eq!(
+        store.reader()?.recovery_not_before(&candidate)?,
+        Some(secs(1009 + 300)),
+        "capped at 300 s"
+    );
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    verifying(&store).await?;
+    let candidate = texts(&path, "SELECT candidate_id FROM candidates")?.remove(0);
+    store
+        .record_recovery(&candidate, transient(), secs(0))
+        .await?;
+    store.record_recovery(&candidate, Ok(0), secs(5)).await?;
+    assert_eq!(
+        store.reader()?.recovery_not_before(&candidate)?,
+        None,
+        "cleared"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_vetoed_planned_check_closes_its_round_invalidated_and_its_item_is_reworked_until_the_fourth()
+-> R {
+    // Decisions 11 and 12 (M2T16D-701, -852, -954, -503): this round's planned check is vetoed (SOURCE_CHANGED) and C
+    // is INVALID, an attempt-level veto alongside: the round closes invalidated, never superseded; the veto is a failure
+    // item (check, reason) of every source, counted by Repair::Local whatever the candidate; the same item in each new
+    // round accumulates, and the fourth time is past max_local_repairs (3): D waits for a decision.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    for (n, tree) in ['b', 'c', 'd', 'e'].into_iter().enumerate() {
+        let attempt = if n == 0 {
+            "A".to_owned()
+        } else {
+            format!("A{n}")
+        };
+        if n > 0 {
+            Connection::open(&path)?.execute_batch(&format!(
+                "UPDATE tasks SET state = 'RUNNING', revision = revision + 1 WHERE task_id = 'D';
+                 INSERT INTO attempts(attempt_id, task_id, session_id, state, role_epoch, host_epoch, config_revision,
+                   started_at) VALUES ('{attempt}', 'D', 'sd', 'RUNNING', 1, 1, 1, '2026-11-12T00:00:0{n}Z');"
+            ))?;
+        }
+        let job = freeze_of(tree);
+        let candidate = job.sealed.candidate_id.clone();
+        store
+            .complete_writer_attempt(WriterCompletion {
+                attempt_id: attempt.clone(),
+                ..completion(freeze(job, result_of("D", &attempt)?))
+            })
+            .await?;
+        let [qa, _] = settle_verifiers(&store, &path, "PASS", "PASS").await?;
+        evidence_of(
+            &path,
+            (&qa, &candidate, &format!("veto-{n}")),
+            ("unit", "INVALID"),
+            &[],
+            true,
+        )?;
+        Connection::open(&path)?.execute_batch(&format!(
+            "UPDATE events SET payload_json = json_set(payload_json, '$.reasons', json_array('SOURCE_CHANGED')) \
+               WHERE event_id = 'veto-{n}/evidence';
+             UPDATE candidates SET state = 'INVALID' WHERE candidate_id = '{candidate}';"
+        ))?;
+        // The attempt-level record of a verifier's run directory, too (-954): the planned check's veto decides.
+        evidence_of(
+            &path,
+            (&qa, &candidate, &format!("attempt-{n}")),
+            ("independent-qa", "INVALID"),
+            &[],
+            true,
+        )?;
+        Connection::open(&path)?.execute(
+            "UPDATE evidence SET kind = 'attempt' WHERE evidence_id = ?1",
+            rusqlite::params![format!("attempt-{n}")],
+        )?;
+        let closed = store
+            .reconcile_verification("R", Default::default())
+            .await?;
+        assert_eq!(
+            closed
+                .closed
+                .iter()
+                .map(|(_, v)| v.as_str())
+                .collect::<Vec<_>>(),
+            ["invalidated"],
+            "{n}"
+        );
+        let state = texts(&path, "SELECT state FROM tasks WHERE task_id = 'D'")?;
+        assert_eq!(state, [if n < 3 { "READY" } else { "BLOCKED" }], "{n}");
+    }
+    let items = texts(
+        &path,
+        "SELECT DISTINCT json_extract(j.value, '$.item') FROM events e, json_each(json_extract(e.payload_json, '$.items')) j \
+         WHERE e.kind = 'verification.failures'",
+    )?;
+    assert_eq!(items, ["veto:unit:SOURCE_CHANGED"]);
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT CAST(json_extract(payload_json, '$.count') AS TEXT) FROM events WHERE kind = 'repair.local' ORDER BY seq"
+        )?,
+        ["1", "2", "3"]
+    );
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT json_extract(payload_json, '$.reason') FROM events WHERE kind = 'need_decision' \
+             AND json_extract(payload_json, '$.task_id') = 'D'"
+        )?,
+        ["local_repairs_exhausted"]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_source_whose_sibling_round_rejected_the_candidate_waits_for_the_siblings_successor() -> R
+{
+    // Decision 11's exits (M2T16D-200, -252, -300, -850): D's round 1 and E's round 2 on the same candidate C1. Round 1
+    // fails (QA's report FAIL): C1 REJECTED, D reworked. Round 2 then closes, classified as usual; its candidate is no
+    // longer VERIFYING and D, round 1's source, is on its way back: E waits for D's successor, neither reworked nor
+    // frozen again. D's next completion freezes C2 and takes E into C2's round.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    let first = freeze_of('b');
+    let c1 = first.sealed.candidate_id.clone();
+    store
+        .complete_writer_attempt(completion(freeze(first, result(None)?)))
+        .await?;
+    second_writer(&path, "E", "AE")?;
+    store
+        .complete_writer_attempt(WriterCompletion {
+            attempt_id: "AE".to_owned(),
+            ..completion(freeze(freeze_of('b'), result_of("E", "AE")?))
+        })
+        .await?;
+    // Round 1's verifiers report FAIL; round 2's PASS.
+    settle_verifiers(&store, &path, "FAIL", "FAIL").await?;
+    settle_verifiers(&store, &path, "PASS", "PASS").await?;
+    let done = store
+        .reconcile_verification("R", Default::default())
+        .await?;
+    let verdicts: Vec<(String, String)> = done.closed.clone();
+    assert_eq!(verdicts.len(), 2, "{verdicts:?}");
+    assert_eq!(
+        verdicts[0],
+        (crate::ids::child_id(&c1, "round/1"), "repair".to_owned())
+    );
+    assert_eq!(texts(&path, "SELECT state FROM candidates")?, ["REJECTED"]);
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT task_id || ':' || state FROM tasks WHERE task_id IN ('D', 'E') ORDER BY task_id"
+        )?,
+        ["D:READY", "E:VERIFYING"],
+        "E waits for D's successor"
+    );
+    Connection::open(&path)?.execute_batch(
+        "UPDATE tasks SET state = 'RUNNING', revision = revision + 1 WHERE task_id = 'D';
+         INSERT INTO attempts(attempt_id, task_id, session_id, state, role_epoch, host_epoch, config_revision, started_at)
+           VALUES ('A2', 'D', 'sd', 'RUNNING', 1, 1, 1, '2026-11-12T00:00:09Z');",
+    )?;
+    let c2 = freeze_of('c').sealed.candidate_id.clone();
+    store
+        .complete_writer_attempt(WriterCompletion {
+            attempt_id: "A2".to_owned(),
+            ..completion(freeze(freeze_of('c'), result_of("D", "A2")?))
+        })
+        .await?;
+    let latest = rounds_of(&path)?
+        .into_iter()
+        .rev()
+        .find(|r| r["candidate_id"] == json!(c2))
+        .ok_or("no round on C2")?;
+    assert_eq!(latest["source_task_ids"], json!(["D", "E"]));
     Ok(())
 }

@@ -410,6 +410,44 @@ pub(super) fn refused(
     rows.collect::<Result<_, _>>().map_err(sqlite_error)
 }
 
+/// The questions round `round_id`'s verifiers asked that were deferred (`request.deferred` of its verifier tasks'
+/// attempts, docs/adr/ADR-028.md decision 13, M2T16D-559): carried by the round's later need_decisions.
+pub(super) fn deferred_of(
+    tx: &rusqlite::Connection,
+    round_id: &str,
+) -> Result<Vec<serde_json::Value>, PersistError> {
+    let mut statement = tx
+        .prepare(
+            "SELECT d.payload_json FROM events d JOIN attempts a ON a.attempt_id = json_extract(d.payload_json, '$.attempt_id') \
+             JOIN events o ON o.kind = ?1 AND json_extract(o.payload_json, '$.round_id') = ?2 \
+             AND a.task_id IN (json_extract(o.payload_json, '$.tasks.qa'), json_extract(o.payload_json, '$.tasks.reviewer')) \
+             WHERE d.kind = 'request.deferred' ORDER BY d.seq",
+        )
+        .map_err(sqlite_error)?;
+    let rows = statement
+        .query_map(params![ROUND_OPENED, round_id], |r| r.get::<_, String>(0))
+        .map_err(sqlite_error)?;
+    rows.map(|row| {
+        let payload = row.map_err(sqlite_error)?;
+        Ok(serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null))
+    })
+    .collect()
+}
+
+/// `commit`'s need_decision events with the round's deferred questions `deferred` added (M2T16D-559).
+pub(super) fn with_deferred(commit: &mut super::writer::Commit, deferred: &[serde_json::Value]) {
+    if deferred.is_empty() {
+        return;
+    }
+    for event in commit
+        .events
+        .iter_mut()
+        .filter(|e| e.kind == "need_decision")
+    {
+        event.payload["deferred"] = json!(deferred);
+    }
+}
+
 /// The verifier tasks of run `run_id`'s rounds.
 pub(super) fn verifier_tasks(
     tx: &Transaction<'_>,

@@ -26,7 +26,7 @@ fn run_check_asks_for_its_check_and_ends_with_its_exit_code() -> R {
     // Decision 7: `run-check <id>` writes {kind: check, check_id} as the next numbered request, prints the answer and
     // ends with the check's exit code; a refusal (no exit code) ends 2; an id that is no plan id is refused at once.
     let dir = tempfile::tempdir()?;
-    let helpers = write_helpers(dir.path(), "C/round/1/task/qa/attempt-1")?;
+    let helpers = write_helpers(dir.path(), "C/round/1/task/qa/attempt-1", 600)?;
     assert!(
         helpers
             .run_check
@@ -63,7 +63,7 @@ fn run_check_asks_for_its_check_and_ends_with_its_exit_code() -> R {
 #[test]
 fn ask_sends_its_message_file_and_prints_the_answer() -> R {
     let dir = tempfile::tempdir()?;
-    let helpers = write_helpers(dir.path(), "A")?;
+    let helpers = write_helpers(dir.path(), "A", 600)?;
     let message = dir.path().join("m.json");
     std::fs::write(&message, "{\"message_id\": \"m1\", \"kind\": \"steer\"}")?;
     let ask = Command::new(&helpers.ask)
@@ -138,5 +138,24 @@ fn a_change_of_the_candidate_is_told_from_other_messages() -> R {
         ),
         ("critical", "fix it", "C")
     );
+    Ok(())
+}
+
+#[test]
+fn run_check_waits_for_the_plans_longest_check_and_its_grace() -> R {
+    // docs/adr/ADR-028.md decision 7: the check's wait is the frozen plan's timeout plus the grace, the plan's longest
+    // check (an hour for one naming none), never a fixed bound a long check outlives.
+    let plan = serde_json::json!({"checks": {"unit": {"timeout_seconds": 60}, "soak": {"timeout_seconds": 7200.5},
+        "plain": {}}});
+    let grace = std::time::Duration::from_secs(15);
+    assert_eq!(check_wait(&plan, grace), 7201 + 15 + 60);
+    assert_eq!(
+        check_wait(&serde_json::json!({"checks": {"plain": {}}}), grace),
+        3600 + 15 + 60
+    );
+    let dir = tempfile::tempdir()?;
+    let helpers = write_helpers(dir.path(), "A", 7276)?;
+    let script = std::fs::read_to_string(&helpers.run_check)?;
+    assert!(script.contains("-ge 7276"), "{script}");
     Ok(())
 }

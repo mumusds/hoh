@@ -611,10 +611,13 @@ async fn tick(
     for candidate in pending.union(&unrecovered) {
         let reader = store.reader()?;
         let id = candidate.clone();
-        let due = tokio::task::spawn_blocking(move || reader.recovery_due(&id))
-            .await
-            .map_err(|e| PersistError::Storage(format!("the recovery's look-up ended: {e}")))??;
-        if !due {
+        // Due, and past its last failure's backoff (decision 11, M2T16D-1251).
+        let (due, not_before) = tokio::task::spawn_blocking(move || {
+            Ok::<_, PersistError>((reader.recovery_due(&id)?, reader.recovery_not_before(&id)?))
+        })
+        .await
+        .map_err(|e| PersistError::Storage(format!("the recovery's look-up ended: {e}")))??;
+        if !due || not_before.is_some_and(|t| common.clock.now() < t) {
             continue;
         }
         let outcome = recovery_outcome(
@@ -869,10 +872,16 @@ async fn attempt(
     held.run_dir = verifier.as_ref().map(|v| v.dir.clone());
     // A verifier's request helpers, in its attempt directory before it starts (docs/adr/ADR-028.md decision 7).
     let helpers = match &verifier {
-        Some(_) => {
+        Some(v) => {
             let (root, attempt) = (common.shared.root.clone(), id.clone());
+            let plan_sha = v.sealed.manifest.test_plan.sha256.clone();
+            let grace = common.settings.term_grace + common.settings.kill_grace;
             let written = tokio::task::spawn_blocking(move || {
-                super::requests::write_helpers(&root, &attempt).map_err(|e| e.to_string())
+                // Its run-check waits for the frozen plan's longest check and the stop's grace (decision 7).
+                let plan: serde_json::Value = hoh_core::objects::get(&root, &plan_sha)
+                    .and_then(|b| serde_json::from_slice(&b).map_err(|e| e.to_string()))?;
+                let wait = super::requests::check_wait(&plan, grace);
+                super::requests::write_helpers(&root, &attempt, wait).map_err(|e| e.to_string())
             })
             .await
             .unwrap_or_else(|e| Err(e.to_string()));

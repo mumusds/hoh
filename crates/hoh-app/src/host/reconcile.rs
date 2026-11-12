@@ -275,6 +275,10 @@ pub(super) async fn apply(
     } else {
         None
     };
+    // A verifier's messages left in its bridge are answered as its own end would answer them (decision 13).
+    if ends && row.verifier {
+        answer_left_messages(store, project, &row).await?;
+    }
     let found = row.clone();
     let seq = super::control::recorded_end(project, move |workspace| {
         let row = UnfinishedRow {
@@ -291,6 +295,38 @@ pub(super) async fn apply(
         crate::verify::rundir::remove(&dir);
     }
     Ok(seq)
+}
+
+/// The query and steer messages verifier attempt `row` left in its bridge file, answered (refused with an Issue, or
+/// deferred) as the runner answers them at its end (docs/adr/ADR-028.md decision 13); answered again, the same answer.
+async fn answer_left_messages(
+    store: &Store,
+    project: &std::path::Path,
+    row: &UnfinishedRow,
+) -> Result<(), PersistError> {
+    let reader = store.reader()?;
+    let (run, task) = (row.run_id.clone(), row.task_id.clone());
+    let round = tokio::task::spawn_blocking(move || reader.verifier_round(&run, &task))
+        .await
+        .map_err(|e| PersistError::Storage(format!("the reconcile's look-up ended: {e}")))??;
+    let Some((round_id, candidate_id)) = round else {
+        return Ok(());
+    };
+    let bridge = super::product::bridge_of(project, &row.attempt_id);
+    let (lines, _) = tokio::task::spawn_blocking(move || super::product::read_bridge(&bridge))
+        .await
+        .map_err(|e| PersistError::Storage(format!("the read of a bridge ended: {e}")))?;
+    let identity = hoh_core::bridge::Identity {
+        run_id: row.run_id.clone(),
+        task_id: row.task_id.clone(),
+        attempt_id: row.attempt_id.clone(),
+        role: row.role.clone(),
+        role_epoch: u64::try_from(row.role_epoch).unwrap_or_default(),
+    };
+    for message in &hoh_core::bridge::parse(&lines, &identity).messages {
+        super::requests::answer_message(store, message, &round_id, &candidate_id).await;
+    }
+    Ok(())
 }
 
 /// Reconcile the project's unfinished attempts (in `project`); done before the host serves anything.

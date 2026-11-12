@@ -258,7 +258,9 @@ fn row_of(status: &str) -> Row {
     }
 }
 
-/// The open Issues of round `round` (decision 13's source predicate, so far the change requests its verifiers made):
+/// The open Issues of round `round` (decision 13's source predicate, M2T16D-1051, -1052): the change requests its
+/// verifiers made (`issue.opened` names the round), and the critical or high findings its verifiers' reports registered
+/// (report_id -> the report's attempt -> one of the round's verifier tasks); a lower one does not fail a round (-154).
 /// (issue id, fingerprint).
 fn round_issues(
     tx: &Transaction<'_>,
@@ -266,13 +268,17 @@ fn round_issues(
 ) -> Result<Vec<(String, String)>, PersistError> {
     let mut statement = tx
         .prepare(
-            "SELECT i.issue_id, i.fingerprint FROM issues i WHERE i.state IN ('OPEN', 'REOPENED') AND i.issue_id IN \
+            "SELECT i.issue_id, i.fingerprint FROM issues i WHERE i.state IN ('OPEN', 'REOPENED') AND (i.issue_id IN \
              (SELECT json_extract(payload_json, '$.issue_id') FROM events WHERE kind = 'issue.opened' \
-              AND json_extract(payload_json, '$.round_id') = ?1) ORDER BY i.issue_id",
+              AND json_extract(payload_json, '$.round_id') = ?1) \
+             OR (i.severity IN ('critical', 'high') AND i.report_id IN (SELECT r.report_id FROM independent_reports r \
+              JOIN attempts a ON a.attempt_id = r.attempt_id WHERE a.task_id IN (?2, ?3)))) ORDER BY i.issue_id",
         )
         .map_err(sqlite_error)?;
     let rows = statement
-        .query_map(params![round.id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .query_map(params![round.id, round.qa, round.reviewer], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
         .map_err(sqlite_error)?;
     rows.collect::<Result<_, _>>().map_err(sqlite_error)
 }
@@ -523,12 +529,27 @@ pub(super) fn reconcile(
             }
             (verdict.to_owned(), None, Value::Null)
         };
+        // Each verifier's last result in the round (decision 15): COMPLETED, FAILED, BLOCKED, INCOMPLETE or missing.
+        let mut results = serde_json::Map::new();
+        for (role, task) in [("qa", &round.qa), ("reviewer", &round.reviewer)] {
+            let status: Option<String> = tx
+                .query_row(
+                    "SELECT json_extract(payload_json, '$.result_status') FROM events WHERE kind = 'verification.result' \
+                     AND json_extract(payload_json, '$.task_id') = ?1 ORDER BY seq DESC LIMIT 1",
+                    params![task],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(sqlite_error)?
+                .flatten();
+            results.insert(role.to_owned(), json!(status));
+        }
         let mut events = vec![event(
             child_id(&round.id, "closed"),
             ROUND_CLOSED,
             json!({"round_id": round.id, "candidate_id": round.candidate, "verdict": verdict,
                 "class": class.map(|c| format!("{c:?}").to_lowercase()), "inputs": inputs,
-                "source_task_ids": round.sources, "candidate_state": candidate}),
+                "source_task_ids": round.sources, "candidate_state": candidate, "result_status": results}),
         )];
         if !items.is_empty() {
             events.push(event(
@@ -567,24 +588,31 @@ pub(super) fn reconcile(
                 });
             }
         }
-        // Its handoffs: ACCEPTED for a verifier that completed, REJECTED when the round was superseded.
-        let to = if verdict == "superseded" {
-            "REJECTED"
-        } else {
-            "ACCEPTED"
-        };
-        tx.execute(
-            "UPDATE handoffs SET state = ?1 WHERE state = 'DELIVERED' AND (handoff_id IN (?2, ?3) OR handoff_id IN \
-             (SELECT json_extract(payload_json, '$.to') FROM events WHERE kind = 'verification.handoff_reissued' \
-              AND json_extract(payload_json, '$.round_id') = ?4))",
-            params![
-                to,
-                child_id(&round.id, "verify/qa"),
-                child_id(&round.id, "verify/reviewer"),
-                round.id
-            ],
-        )
-        .map_err(sqlite_error)?;
+        // Its handoffs (decision 9): ACCEPTED for a verifier whose result was COMPLETED (its task IMPLEMENTED or done),
+        // REJECTED for the other, and for both when the round was superseded.
+        for (role, task) in [("qa", &round.qa), ("reviewer", &round.reviewer)] {
+            let completed = verdict != "superseded"
+                && matches!(
+                    task_state(&tx, task)?,
+                    Some((
+                        TaskState::Implemented | TaskState::Verifying | TaskState::Accepted,
+                        _,
+                        _
+                    ))
+                );
+            tx.execute(
+                "UPDATE handoffs SET state = ?1 WHERE state = 'DELIVERED' AND (handoff_id = ?2 OR handoff_id IN \
+                 (SELECT json_extract(payload_json, '$.to') FROM events WHERE kind = 'verification.handoff_reissued' \
+                  AND json_extract(payload_json, '$.round_id') = ?3 AND json_extract(payload_json, '$.role') = ?4))",
+                params![
+                    if completed { "ACCEPTED" } else { "REJECTED" },
+                    child_id(&round.id, &format!("verify/{role}")),
+                    round.id,
+                    role
+                ],
+            )
+            .map_err(sqlite_error)?;
+        }
         writer::write(
             &tx,
             &Commit {
@@ -883,6 +911,8 @@ fn consume(
                     limit,
                     detail: format!("{item} (round {round})"),
                     action_id: Some(child_id(&round, &format!("rework/{task}/{n}"))),
+                    // An owner whose attempt runs on is blocked by that attempt's end, never under it (-800).
+                    hold: matches!(state, TaskState::Leased | TaskState::Running),
                 },
             )?;
             writer::write(tx, &commit, ctx)?;
@@ -922,6 +952,31 @@ fn consume(
                 json!({"task_id": task, "round_id": round, "state": state.as_str(), "items": names,
                     "counts": counts}),
             ));
+        }
+        // A change request's Issue taken by the rework (decision 12): recorded, still OPEN (RESOLVED is M2-T18's).
+        for (item, _) in &items {
+            let Some(fingerprint) = item.strip_prefix("issue:") else {
+                continue;
+            };
+            let mut statement = tx
+                .prepare(
+                    "SELECT i.issue_id FROM issues i WHERE i.fingerprint = ?1 AND i.report_id IS NULL AND i.issue_id IN \
+                     (SELECT json_extract(payload_json, '$.issue_id') FROM events WHERE kind = 'issue.opened' \
+                      AND json_extract(payload_json, '$.round_id') = ?2) ORDER BY i.issue_id",
+                )
+                .map_err(sqlite_error)?;
+            let issues: Vec<String> = statement
+                .query_map(params![fingerprint, round], |r| r.get(0))
+                .map_err(sqlite_error)?
+                .collect::<Result<_, _>>()
+                .map_err(sqlite_error)?;
+            for issue in issues {
+                commit.events.push(event(
+                    child_id(&issue, &format!("consumed/{task}")),
+                    "issue.consumed_by_rework",
+                    json!({"issue_id": issue, "task_id": task, "round_id": round}),
+                ));
+            }
         }
         commit.events.push(consumed("rework"));
         writer::write(tx, &commit, ctx)?;
@@ -1000,8 +1055,14 @@ fn exits(
                         limit: super::retry::REVERIFY_LIMIT,
                         detail: format!("round {} was inconclusive", round.id),
                         action_id: Some(round.id.clone()),
+                        hold: false,
                     },
                 )?;
+                let mut commit = commit;
+                super::verification::with_deferred(
+                    &mut commit,
+                    &super::verification::deferred_of(tx, &round.id)?,
+                );
                 writer::write(tx, &commit, ctx)?;
                 if matches!(verdict, RepairVerdict::Granted { .. }) {
                     reverified
@@ -1032,7 +1093,8 @@ fn exits(
                             "need_decision",
                             json!({"run_id": run_id, "task_id": task, "round_id": round.id, "reason": "flaky",
                                 "detail": "an acceptance criterion is flaky on this candidate: retesting it cannot satisfy \
-                                    it; the flaky handling or a new candidate is a decision (REQ-055)"}),
+                                    it; the flaky handling or a new candidate is a decision (REQ-055)",
+                                "deferred": super::verification::deferred_of(tx, &round.id)?}),
                         )],
                         ..Commit::default()
                     },
@@ -1080,6 +1142,7 @@ fn exits(
                             round.candidate
                         ),
                         action_id: Some(child_id(&round.id, &format!("refreeze/{task}"))),
+                        hold: false,
                     },
                 )?;
                 if matches!(verdict, RepairVerdict::Granted { .. }) {
