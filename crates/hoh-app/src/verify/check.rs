@@ -201,7 +201,7 @@ pub fn pre_check(
     let record = format!("evidence/{id}/{}/RECORD", request.check_id);
     let writes = [
         format!("{record}/execution.json"),
-        format!("{record}/{PENDING}"),
+        "pending/RECORD.json".to_owned(),
         format!("{record}/stdout.log"),
         format!("{record}/artifacts/test-results.jsonl"),
     ];
@@ -350,7 +350,7 @@ fn relative_to(project: &Path, path: &Path) -> String {
 
 /// A run's facts, which its judgement cannot get again from the files (docs/adr/ADR-027.md decision 8, recovery
 /// protocol): its record and the objects kept of it, the trees before and after, the post-check's differences and the
-/// clocks. They are the record directory's pending file until its evidence is committed; the judgement is never kept
+/// clocks. They are the record's pending file (`.hoh/pending/`) until its evidence is committed; the judgement is never kept
 /// with them, it is made on the files as they are when the record is committed (M2T10R-103).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct Facts {
@@ -711,12 +711,17 @@ async fn finish(
         tokio::task::spawn_blocking(move || -> Result<Facts, CheckError> {
             let io = |e: String| CheckError::Io(e);
             // A post-check that cannot run cannot show the source unchanged: that is recorded, never lost (M2T10R-02).
-            let integrity = differences(&checkout, &ready.sealed.manifest).unwrap_or_else(|e| {
-                vec![format!(
-                    "post-check failed, so the source cannot be shown unchanged: {}",
-                    described(&e)
-                )]
-            });
+            let mut integrity =
+                differences(&checkout, &ready.sealed.manifest).unwrap_or_else(|e| {
+                    vec![format!(
+                        "post-check failed, so the source cannot be shown unchanged: {}",
+                        described(&e)
+                    )]
+                });
+            // The record directory is the command's to write beside its artifacts; once it has ended, the finishing
+            // task takes the reserved names back: whatever the command did to them is a change recorded, never an
+            // abort (M2T10R-450).
+            integrity.extend(reclaim(&record_dir).map_err(io)?);
             let tree_after = crate::host::control::workspace(&checkout);
             let rel = |p: &Path| relative_to(&project, p);
             let file = |p: &Path| -> Result<FileRef, CheckError> {
@@ -822,9 +827,9 @@ async fn finish(
         .await
         .map_err(blocking)??
     };
-    // Under the record's lock from its pending file to its commit, so no reconciliation takes it meanwhile (M2T10R-150):
-    // the pending facts first, then the record file, then the judgement on the files as they are and the commit; from
-    // the pending file on, a crash or a failed commit is finished by the next run of the candidate (M2T10R-05).
+    // Still under the record's lock, taken before the command (M2T10R-150, -350): the pending facts first, then the
+    // record file, then the judgement on the files as they are and the commit; from the pending facts on, a crash or a
+    // failed commit is finished by the candidate's next run (M2T10R-05).
     let (recording, ran) = {
         let reader = handle.reader().map_err(CheckError::Store)?;
         let (project, state, ready, record_dir) = (
@@ -836,7 +841,7 @@ async fn finish(
         tokio::task::spawn_blocking(move || -> Result<_, CheckError> {
             let text =
                 serde_json::to_vec_pretty(&facts).map_err(|e| CheckError::Io(e.to_string()))?;
-            write_new(&record_dir.join(PENDING), &text)?;
+            write_new(&pending_path(&state, &facts.record.record_id), &text)?;
             let bytes = serde_json::to_vec_pretty(&facts.record)
                 .map_err(|e| CheckError::Io(e.to_string()))?;
             write_new(&record_dir.join("execution.json"), &bytes)?;
@@ -864,8 +869,54 @@ async fn finish(
     Ok(ran)
 }
 
-/// A record directory's pending facts (M2T10R-05, -103): kept beside the record until its evidence is committed.
-const PENDING: &str = "recording.json";
+/// Where record `record_id`'s pending facts are kept until its evidence is committed (M2T10R-05, -103):
+/// `.hoh/pending/<record_id>.json`, HoH's own state outside the record directory the command can write, so a command
+/// can neither plant nor remove them (M2T10R-450).
+fn pending_path(state: &Path, record_id: &str) -> std::path::PathBuf {
+    state.join("pending").join(format!("{record_id}.json"))
+}
+
+/// Take the record directory `dir` back from the command after it ended (M2T10R-450): the directory and its
+/// `artifacts/` there, `stdout.log` and `stderr.log` regular files, and no `execution.json` but the one the finishing
+/// task writes. Whatever the command removed, replaced or wrote at these names is put right and named as a change.
+fn reclaim(dir: &Path) -> Result<Vec<String>, String> {
+    let at = |p: &Path, e: std::io::Error| format!("{}: {e}", p.display());
+    let mut changes = Vec::new();
+    let remove = |p: &Path| -> Result<(), String> {
+        match std::fs::symlink_metadata(p) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(at(p, e)),
+            Ok(m) if m.is_dir() => std::fs::remove_dir_all(p).map_err(|e| at(p, e)),
+            Ok(_) => std::fs::remove_file(p).map_err(|e| at(p, e)),
+        }
+    };
+    if !std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) {
+        remove(dir)?;
+        changes.push("the command removed or replaced its record directory".to_owned());
+    }
+    let artifacts = dir.join("artifacts");
+    if std::fs::symlink_metadata(&artifacts).is_ok_and(|m| !m.is_dir()) {
+        remove(&artifacts)?;
+        changes.push("the command replaced its artifacts directory".to_owned());
+    }
+    std::fs::create_dir_all(&artifacts).map_err(|e| at(&artifacts, e))?;
+    for name in ["stdout.log", "stderr.log"] {
+        let p = dir.join(name);
+        if !std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_file()) {
+            remove(&p)?;
+            std::fs::write(&p, b"").map_err(|e| at(&p, e))?;
+            changes.push(format!(
+                "the command removed or replaced {name} in its record directory"
+            ));
+        }
+    }
+    let record = dir.join("execution.json");
+    if std::fs::symlink_metadata(&record).is_ok() {
+        remove(&record)?;
+        changes.push("the command wrote execution.json in its record directory".to_owned());
+    }
+    Ok(changes)
+}
 
 /// What a [`CheckError`] says.
 fn described(e: &CheckError) -> String {
@@ -884,6 +935,7 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<(), CheckError> {
     let dir = path
         .parent()
         .ok_or_else(|| CheckError::Io(format!("{} has no parent", path.display())))?;
+    std::fs::create_dir_all(dir).map_err(at)?;
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -1160,7 +1212,8 @@ fn subdirectories(dir: &Path) -> Result<Vec<std::path::PathBuf>, CheckError> {
 /// back when its bytes are still to be had; one that cannot be is left out only from a record judged INVALID
 /// (M2T10R-202). It reads no checkout (M2T10R-250). The work is a task of its own that keeps each record's lock until
 /// that record's transaction has ended: a caller that stops waiting cancels nothing (M2T10R-201). A check's run does
-/// this first for its candidate; M2-T16 does it for each candidate when the host starts. Returns how many it recorded.
+/// this for its candidate after its pre-check and before its command (M2T10R-352); M2-T16 does it for each candidate
+/// when the host starts. Returns how many it recorded.
 pub async fn reconcile(
     handle: &EvidenceHandle,
     state: &Path,
@@ -1211,7 +1264,7 @@ fn pending(
             if recorded()? {
                 continue;
             }
-            let file = record_dir.join(PENDING);
+            let file = pending_path(state, &record_id);
             let unreadable = |e: String| CheckError::Io(format!("{}: {e}", file.display()));
             match std::fs::symlink_metadata(&file) {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,

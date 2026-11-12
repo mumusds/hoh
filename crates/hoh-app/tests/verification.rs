@@ -1283,6 +1283,16 @@ fn qa_failing_on_flag() -> String {
     format!("if [ -e ../fail ]; then\n{failing}exit 1\nfi\n{QA_PASSES}")
 }
 
+/// Where the pending facts of the record in `dir` are kept: HoH's state outside the record directory (M2T10R-450).
+fn pending_of(f: &Fixture, dir: &Path) -> PathBuf {
+    f.state().join("pending").join(format!(
+        "{}.json",
+        dir.file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default()
+    ))
+}
+
 /// The record directories of `check` on candidate `c`.
 fn record_dirs(f: &Fixture, c: &str, check: &str) -> R<Vec<PathBuf>> {
     let mut dirs: Vec<PathBuf> = std::fs::read_dir(f.state().join("evidence").join(c).join(check))?
@@ -1305,11 +1315,11 @@ async fn a_pending_record_that_cannot_be_read_holds_back_its_candidates_runs_onl
     faults.0.store(true, Ordering::SeqCst);
     assert!(f.run(&c, "qa", QA).await.is_err());
     std::fs::remove_file(f.dir.path().join("fail"))?;
-    let pending = record_dirs(&f, &c, "qa")?[0].join("recording.json");
+    let pending = pending_of(&f, &record_dirs(&f, &c, "qa")?[0]);
     std::fs::set_permissions(&pending, std::fs::Permissions::from_mode(0o000))?;
     let held = f.run(&c, "qa", QA).await;
     assert!(
-        matches!(&held, Err(CheckError::Io(why)) if why.contains("recording.json")),
+        matches!(&held, Err(CheckError::Io(why)) if why.contains("pending")),
         "{held:?}"
     );
     assert!(f.query("SELECT outcome FROM evidence")?.is_empty());
@@ -1372,7 +1382,7 @@ async fn a_committed_records_pending_file_is_never_read_again() -> R {
     let f = Fixture::new().await?;
     let c = f.frozen().await?;
     let ran = f.run(&c, "qa", QA).await.map_err(|e| format!("{e:?}"))?;
-    std::fs::write(ran.record_dir.join("recording.json"), b"{")?;
+    std::fs::write(pending_of(&f, &ran.record_dir), b"{")?;
     let again = f.run(&c, "qa", QA).await.map_err(|e| format!("{e:?}"))?;
     assert_eq!(again.outcome.status.code(), "PASS");
     assert_eq!(f.query("SELECT count(*) FROM evidence")?, ["2"]);
@@ -1461,7 +1471,7 @@ async fn the_objects_of_a_pending_record_are_restored_or_their_loss_judged_befor
     // M2T10R-202: an object the evidence names is put back from the record's bytes or a file that still matches its
     // digest; one that cannot be is left out, and then the record is INVALID (its file no longer matches, rule 7).
     let (f, _, c, dir) = pending_qa(&[]).await?;
-    let facts: Value = serde_json::from_slice(&std::fs::read(dir.join("recording.json"))?)?;
+    let facts: Value = serde_json::from_slice(&std::fs::read(pending_of(&f, &dir))?)?;
     let object = |v: &Value| -> R<(PathBuf, String)> {
         Ok((
             f.root().join(v["path"].as_str().ok_or("no path")?),
@@ -1485,7 +1495,7 @@ async fn the_objects_of_a_pending_record_are_restored_or_their_loss_judged_befor
     );
     // A second record whose stdout object is lost and whose stdout changed: INVALID, the lost object not registered.
     let (g, _, c2, dir2) = pending_qa(&[]).await?;
-    let facts: Value = serde_json::from_slice(&std::fs::read(dir2.join("recording.json"))?)?;
+    let facts: Value = serde_json::from_slice(&std::fs::read(pending_of(&g, &dir2))?)?;
     let stdout = facts["objects"]
         .as_array()
         .and_then(|a| a.iter().find(|o| o["kind"] == "stdout"))
@@ -1515,7 +1525,7 @@ async fn the_objects_of_a_pending_record_are_restored_or_their_loss_judged_befor
 async fn a_pending_file_that_is_not_a_regular_file_is_an_error_at_once() -> R {
     // M2T10R-203: the pending facts are read only from a regular file, opened without blocking.
     let (f, _, c, dir) = pending_qa(&[]).await?;
-    let pending = dir.join("recording.json");
+    let pending = pending_of(&f, &dir);
     std::fs::remove_file(&pending)?;
     assert!(Command::new("mkfifo").arg(&pending).status()?.success());
     // Unblocks an old reader after five seconds, so the test ends either way.
@@ -1701,7 +1711,7 @@ async fn an_object_or_a_lock_that_is_a_fifo_never_blocks_the_reconciliation() ->
     // M2T10R-301: objects are read, and the record's lock opened, only as regular files and without blocking: a FIFO
     // object is replaced by the record's own bytes; a FIFO lock is an error at once.
     let (f, _, c, dir) = pending_qa(&[]).await?;
-    let facts: Value = serde_json::from_slice(&std::fs::read(dir.join("recording.json"))?)?;
+    let facts: Value = serde_json::from_slice(&std::fs::read(pending_of(&f, &dir))?)?;
     let object = f
         .root()
         .join(facts["record_object"]["path"].as_str().ok_or("no path")?);
@@ -1805,7 +1815,7 @@ async fn a_damaged_evidence_object_is_put_back_from_its_matching_file() -> R {
     // M2T10R-353: an object whose bytes no longer match its name is not taken as there; it is put back from the record
     // file that still matches its digest.
     let (f, _, c, dir) = pending_qa(&[]).await?;
-    let facts: Value = serde_json::from_slice(&std::fs::read(dir.join("recording.json"))?)?;
+    let facts: Value = serde_json::from_slice(&std::fs::read(pending_of(&f, &dir))?)?;
     let artifact = facts["objects"]
         .as_array()
         .and_then(|a| a.iter().find(|o| o["kind"] == "artifact"))
@@ -1860,6 +1870,106 @@ async fn a_command_clearing_its_record_directory_leaves_the_records_lock_alone()
     assert_eq!(
         reconciled?, 0,
         "the reconciliation took over a record still being committed"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn whatever_a_command_does_to_its_record_directory_its_run_is_recorded() -> R {
+    // M2T10R-450 (decision 6, 8): after the command, the finishing task takes its record directory's reserved names
+    // back; a command that removed or replaced them, or wrote a record there, leaves a recorded run, INVALID with the
+    // change named, never an abort and never a held candidate. A pending file it plants there is a stray file.
+    for (label, script, named) in [
+        (
+            "stdout removed",
+            "rm \"$HOH_EVIDENCE_DIR/../stdout.log\"; exit 1",
+            Some("stdout.log"),
+        ),
+        (
+            "stderr turned into a directory",
+            "rm \"$HOH_EVIDENCE_DIR/../stderr.log\" && mkdir \"$HOH_EVIDENCE_DIR/../stderr.log\"",
+            Some("stderr.log"),
+        ),
+        (
+            "a record written",
+            "printf '{}' > \"$HOH_EVIDENCE_DIR/../execution.json\"",
+            Some("execution.json"),
+        ),
+        (
+            "the record directory removed",
+            "rm -rf \"$(dirname \"$HOH_EVIDENCE_DIR\")\"",
+            Some("record directory"),
+        ),
+        (
+            "a pending file planted",
+            "printf '{' > \"$HOH_EVIDENCE_DIR/../recording.json\"",
+            None,
+        ),
+    ] {
+        let f = Fixture::with_qa(&format!("{script}\n{QA_PASSES}")).await?;
+        let c = f.frozen().await?;
+        let ran = f
+            .run(&c, "qa", QA)
+            .await
+            .map_err(|e| format!("{label}: {e:?}"))?;
+        let integrity =
+            f.query("SELECT payload_json FROM events WHERE kind = 'integrity_violation'")?;
+        match named {
+            Some(name) => {
+                assert_eq!(ran.outcome.status.code(), "INVALID", "{label}");
+                assert!(
+                    integrity.iter().any(|p| p.contains(name)),
+                    "{label}: {integrity:?}"
+                );
+            }
+            None => {
+                assert_eq!(ran.outcome.status.code(), "PASS", "{label}");
+                assert!(integrity.is_empty(), "{label}: {integrity:?}");
+            }
+        }
+        assert_eq!(f.query("SELECT count(*) FROM evidence")?, ["1"], "{label}");
+        assert!(ran.record_dir.join("execution.json").is_file(), "{label}");
+        let again = f.run(&c, "qa", QA).await;
+        assert!(again.is_ok(), "{label}: the candidate is held: {again:?}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_lock_path_that_is_a_link_or_a_fifo_with_a_reader_is_refused() -> R {
+    // M2T10R-452: the lock is opened without following links and kept only as a regular file, also when a FIFO there
+    // has a reader that lets a non-blocking open through.
+    let (f, _, c, dir) = pending_qa(&[]).await?;
+    let locks = f.state().join("locks");
+    std::fs::create_dir_all(&locks)?;
+    let lock = locks.join(format!(
+        "{}.lock",
+        dir.file_name().ok_or("no name")?.to_string_lossy()
+    ));
+    let _ = std::fs::remove_file(&lock);
+    std::os::unix::fs::symlink(f.dir.path().join("elsewhere"), &lock)?;
+    let held = hoh_app::verify::check::reconcile(&f.store.evidence_handle(), &f.state(), &c).await;
+    assert!(
+        matches!(held, Err(CheckError::Io(_))),
+        "a linked lock: {held:?}"
+    );
+    assert!(
+        !f.dir.path().join("elsewhere").exists(),
+        "the link was followed"
+    );
+    std::fs::remove_file(&lock)?;
+    assert!(Command::new("mkfifo").arg(&lock).status()?.success());
+    let mut reader = Command::new("timeout")
+        .args(["10", "sh", "-c", "exec cat \"$0\" > /dev/null"])
+        .arg(&lock)
+        .spawn()?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let held = hoh_app::verify::check::reconcile(&f.store.evidence_handle(), &f.state(), &c).await;
+    let _ = reader.kill();
+    let _ = reader.wait();
+    assert!(
+        matches!(&held, Err(CheckError::Io(why)) if why.contains("not a regular file")),
+        "a FIFO lock with a reader: {held:?}"
     );
     Ok(())
 }
