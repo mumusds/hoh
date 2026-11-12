@@ -752,6 +752,7 @@ async fn a_supervision_task_is_never_ready_and_takes_no_repair() -> R {
             },
             limit: 3,
             detail: "a repair of a supervision task".to_owned(),
+            action_id: None,
         })
         .await;
     assert!(refused.is_err(), "{refused:?}");

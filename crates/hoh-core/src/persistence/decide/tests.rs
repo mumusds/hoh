@@ -367,7 +367,19 @@ async fn completion_is_applied_only_when_one_candidate_passed_every_criterion() 
             "INSERT INTO acceptance_results(ac_id, spec_id, candidate_id, evidence_id, status) VALUES ('AC-1-02', 's2', 'C1', 'E4', 'PASS');",
             Some(RejectionReason::EvidenceGateUnmet),
         ),
-        (vec!["AC-1-01", "AC-1-02"], "", None),
+        // Every criterion passed but the candidate is still under verification: only the join at its barrier's close
+        // accepts it (docs/adr/ADR-028.md decision 12), so a PASS row of one verifier cannot complete the run while
+        // the other still runs or reports FAIL/UNKNOWN (M2T16D-01, -50).
+        (
+            vec!["AC-1-01", "AC-1-02"],
+            "",
+            Some(RejectionReason::EvidenceGateUnmet),
+        ),
+        (
+            vec!["AC-1-01", "AC-1-02"],
+            "UPDATE candidates SET state = 'ACCEPTED';",
+            None,
+        ),
     ];
     for (i, (criteria, extra, rejection)) in cases.into_iter().enumerate() {
         let dir = tempfile::tempdir()?;
@@ -396,6 +408,59 @@ async fn completion_is_applied_only_when_one_candidate_passed_every_criterion() 
                 assert_eq!(state, [vec![json!("VERIFYING"), json!(7)]], "case {i}")
             }
             (_, other) => return Err(format!("case {i}: {other:?}").into()),
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_verifying_candidate_meeting_every_other_condition_accepts_nothing_before_its_join() -> R
+{
+    // docs/adr/ADR-028.md decision 12 (M2T16D-01, -50, -104): C1 is VERIFYING, every criterion of REQ-1 has PASS rows
+    // backed by PASS evidence of its own check (all the old gate asked), and the task's requirement is REQ-1; while its
+    // barrier has not closed with the join's ACCEPTED (one verifier still running or UNKNOWN), accepting the task,
+    // completing the run and naming accepted requirements are each refused. ACCEPTED is the positive control.
+    let proposals = || {
+        [
+            json!({"kind": "transition_task", "task_id": "T3", "to_state": "ACCEPTED"}),
+            json!({"kind": "transition_run", "to_state": "COMPLETED", "accepted_requirements": ["REQ-1"]}),
+            json!({"kind": "transition_run", "to_state": "VERIFYING", "accepted_requirements": ["REQ-1"]}),
+        ]
+    };
+    for (state, applied) in [("VERIFYING", false), ("ACCEPTED", true)] {
+        for (i, payload) in proposals().into_iter().enumerate() {
+            let dir = tempfile::tempdir()?;
+            let (store, path) = open(&dir)?;
+            seed(&path, WORLD)?;
+            seed(&path, VERIFYING)?;
+            seed(&path, &evidence(&["AC-1-01", "AC-1-02"], ""))?;
+            seed(
+                &path,
+                &format!(
+                    "UPDATE candidates SET state = '{state}';
+                     UPDATE runs SET state = 'RUNNING' WHERE {i} = 2;
+                     UPDATE tasks SET state = 'VERIFYING' WHERE task_id = 'T3';
+                     INSERT INTO task_requirements(task_id, requirement_id, spec_id) VALUES ('T3', 'REQ-1', 's2');"
+                ),
+            )?;
+            let mut commander = FakeCommander {
+                sent: 0,
+                candidate: Some("C1"),
+            };
+            let decided = store
+                .decide(commander.decide(3, 7, payload.clone()), context())
+                .await?;
+            match (applied, decided) {
+                (true, Decided::Applied { .. }) => {}
+                (
+                    false,
+                    Decided::Rejected {
+                        reason: RejectionReason::EvidenceGateUnmet,
+                        ..
+                    },
+                ) => {}
+                (_, other) => return Err(format!("{state} {payload}: {other:?}").into()),
+            }
         }
     }
     Ok(())
