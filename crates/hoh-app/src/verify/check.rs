@@ -617,8 +617,9 @@ struct Finish {
 /// The command on the process substrate, then the post-check, the record, the objects, the judgement and the evidence.
 /// Once the command has started this always ends in a record: `cancelled` resolving (its sender dropped) cancels the
 /// command and the run is recorded as interrupted; a post-check that fails is recorded as a change it cannot rule out;
-/// the evidence is kept as pending beside the record before it is committed, so a failed commit is recorded by the
-/// next run's [`reconcile`] (M2T10R-02, -03, -05).
+/// what the command did to its record directory is recorded as changes (`reclaim`); the run's facts are kept as
+/// pending under `.hoh/pending/` before the commit, so a failed commit is recorded by the next run's [`reconcile`]
+/// (M2T10R-02, -03, -05, -450).
 async fn finish(
     handle: EvidenceHandle,
     f: Finish,
@@ -664,8 +665,16 @@ async fn finish(
         stderr_copy: Some(stderr.clone()),
         ..Config::default()
     };
+    // What HoH made for the run, by identity, before the command can touch it (M2T10R-501).
+    let mut owned = Owned {
+        dir: identity(&record_dir),
+        stdout: None,
+        stderr: None,
+    };
     let (exit_code, timed_out) = match Process::spawn(command, config) {
         Ok(mut process) => {
+            // The copies exist before the child does.
+            (owned.stdout, owned.stderr) = (identity(&stdout), identity(&stderr));
             let mut report = None;
             let mut cancelling = false;
             loop {
@@ -689,6 +698,7 @@ async fn finish(
             // As run_check does when the command cannot start: 127, the error as its stderr.
             std::fs::write(&stdout, b"").map_err(|e| io(e.to_string()))?;
             std::fs::write(&stderr, e.to_string()).map_err(|e| io(e.to_string()))?;
+            (owned.stdout, owned.stderr) = (identity(&stdout), identity(&stderr));
             (127, false)
         }
     };
@@ -706,8 +716,12 @@ async fn finish(
             project.clone(),
             ready.clone(),
         );
-        let (record_dir, record_id, export) =
-            (record_dir.clone(), record_id.clone(), export.clone());
+        let (record_dir, record_id, export, state) = (
+            record_dir.clone(),
+            record_id.clone(),
+            export.clone(),
+            state.clone(),
+        );
         tokio::task::spawn_blocking(move || -> Result<Facts, CheckError> {
             let io = |e: String| CheckError::Io(e);
             // A post-check that cannot run cannot show the source unchanged: that is recorded, never lost (M2T10R-02).
@@ -721,7 +735,13 @@ async fn finish(
             // The record directory is the command's to write beside its artifacts; once it has ended, the finishing
             // task takes the reserved names back: whatever the command did to them is a change recorded, never an
             // abort (M2T10R-450).
-            integrity.extend(reclaim(&record_dir).map_err(io)?);
+            integrity.extend(reclaim(&record_dir, &owned).map_err(io)?);
+            // The record id is new: a pending file there already is one the command wrote (M2T10R-552).
+            let planted = pending_path(&state, &record_id);
+            if std::fs::symlink_metadata(&planted).is_ok() {
+                remove_tree(&planted).map_err(io)?;
+                integrity.push("the command wrote HoH's pending file for its record".to_owned());
+            }
             let tree_after = crate::host::control::workspace(&checkout);
             let rel = |p: &Path| relative_to(&project, p);
             let file = |p: &Path| -> Result<FileRef, CheckError> {
@@ -735,14 +755,15 @@ async fn finish(
             for name in &ready.planned.artifacts {
                 let f = record_dir.join("artifacts").join(name);
                 match std::fs::symlink_metadata(&f) {
-                    Ok(m) if m.file_type().is_file() => {
-                        let r = file(&f)?;
-                        artifacts.push(NamedRef {
+                    // An artifact the command left unreadable is not there to be bound (M2T10R-500).
+                    Ok(m) if m.file_type().is_file() => match file(&f) {
+                        Ok(r) => artifacts.push(NamedRef {
                             name: name.clone(),
                             path: r.path,
                             sha256: r.sha256,
-                        });
-                    }
+                        }),
+                        Err(_) => missing.push(name.clone()),
+                    },
                     _ => missing.push(name.clone()),
                 }
             }
@@ -865,44 +886,113 @@ async fn finish(
         .record_evidence(recording)
         .await
         .map_err(CheckError::Store)?;
-    drop(lock);
+    settle(&state, &record_id, lock);
     Ok(ran)
 }
 
+/// After record `record_id`'s commit: its pending facts and lock file are no longer kept (M2T10R-554). Safe for a
+/// reconciliation meanwhile, which passes over a recorded record before reading and again after locking.
+fn settle(state: &Path, record_id: &str, lock: std::fs::File) {
+    let _ = std::fs::remove_file(pending_path(state, record_id));
+    let _ = std::fs::remove_file(lock_path(state, record_id));
+    drop(lock);
+}
+
 /// Where record `record_id`'s pending facts are kept until its evidence is committed (M2T10R-05, -103):
-/// `.hoh/pending/<record_id>.json`, HoH's own state outside the record directory the command can write, so a command
-/// can neither plant nor remove them (M2T10R-450).
+/// `.hoh/pending/<record_id>.json`, HoH's own state outside the record directory the command writes (M2T10R-450); one
+/// the command wrote there for its own record is removed as a change (M2T10R-552), and the file goes after the commit
+/// (M2T10R-554).
 fn pending_path(state: &Path, record_id: &str) -> std::path::PathBuf {
     state.join("pending").join(format!("{record_id}.json"))
 }
 
-/// Take the record directory `dir` back from the command after it ended (M2T10R-450): the directory and its
-/// `artifacts/` there, `stdout.log` and `stderr.log` regular files, and no `execution.json` but the one the finishing
-/// task writes. Whatever the command removed, replaced or wrote at these names is put right and named as a change.
-fn reclaim(dir: &Path) -> Result<Vec<String>, String> {
+/// Remove `p`, whatever it is: a file, a link (never followed), or a directory tree the command may have closed, which
+/// is opened up for its owner first (M2T10R-550). Nothing there is nothing to do.
+fn remove_tree(p: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let at = |p: &Path, e: std::io::Error| format!("{}: {e}", p.display());
+    fn open_up(p: &Path) {
+        if std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir()) {
+            let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700));
+            for entry in std::fs::read_dir(p).into_iter().flatten().flatten() {
+                open_up(&entry.path());
+            }
+        }
+    }
+    match std::fs::symlink_metadata(p) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(at(p, e)),
+        Ok(m) if m.is_dir() => {
+            open_up(p);
+            std::fs::remove_dir_all(p).map_err(|e| at(p, e))
+        }
+        Ok(_) => std::fs::remove_file(p).map_err(|e| at(p, e)),
+    }
+}
+
+/// A file's or directory's identity: its device and inode.
+fn identity(p: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::symlink_metadata(p)
+        .ok()
+        .map(|m| (m.dev(), m.ino()))
+}
+
+/// What HoH made for a run before its command could touch it: the record directory and the output copies, by identity.
+struct Owned {
+    dir: Option<(u64, u64)>,
+    stdout: Option<(u64, u64)>,
+    stderr: Option<(u64, u64)>,
+}
+
+/// Take the record directory `dir` back from the command after it ended (M2T10R-450, -500, -501): the directory HoH
+/// made, with its owner's access, holding `artifacts/` (the command's own to rebuild), the `stdout.log` and `stderr.log`
+/// HoH made, readable, and no `execution.json` but the one the finishing task writes. Whatever the command removed,
+/// replaced (also by another of the same kind), locked away or wrote at these names is put right and named as a
+/// change. What the command writes into HoH's files in place counts as its output, as it does for run_check.
+fn reclaim(dir: &Path, owned: &Owned) -> Result<Vec<String>, String> {
+    use std::os::unix::fs::PermissionsExt as _;
     let at = |p: &Path, e: std::io::Error| format!("{}: {e}", p.display());
     let mut changes = Vec::new();
-    let remove = |p: &Path| -> Result<(), String> {
-        match std::fs::symlink_metadata(p) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(at(p, e)),
-            Ok(m) if m.is_dir() => std::fs::remove_dir_all(p).map_err(|e| at(p, e)),
-            Ok(_) => std::fs::remove_file(p).map_err(|e| at(p, e)),
-        }
-    };
-    if !std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) {
+    let remove = remove_tree;
+    // Its owner's access back where the command took it, as a change.
+    let grant =
+        |p: &Path, needed: u32, what: &str, changes: &mut Vec<String>| -> Result<(), String> {
+            let mode = std::fs::symlink_metadata(p)
+                .map_err(|e| at(p, e))?
+                .permissions()
+                .mode();
+            if mode & needed != needed {
+                std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode | needed))
+                    .map_err(|e| at(p, e))?;
+                changes.push(format!("the command changed the permissions of {what}"));
+            }
+            Ok(())
+        };
+    let is_dir = std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir());
+    if is_dir && identity(dir) == owned.dir {
+        grant(dir, 0o700, "its record directory", &mut changes)?;
+    } else {
         remove(dir)?;
+        std::fs::create_dir_all(dir).map_err(|e| at(dir, e))?;
         changes.push("the command removed or replaced its record directory".to_owned());
     }
     let artifacts = dir.join("artifacts");
-    if std::fs::symlink_metadata(&artifacts).is_ok_and(|m| !m.is_dir()) {
-        remove(&artifacts)?;
-        changes.push("the command replaced its artifacts directory".to_owned());
+    match std::fs::symlink_metadata(&artifacts) {
+        Ok(m) if m.is_dir() => grant(&artifacts, 0o700, "its artifacts directory", &mut changes)?,
+        Ok(_) => {
+            remove(&artifacts)?;
+            changes.push("the command replaced its artifacts directory".to_owned());
+        }
+        Err(_) => {}
     }
     std::fs::create_dir_all(&artifacts).map_err(|e| at(&artifacts, e))?;
-    for name in ["stdout.log", "stderr.log"] {
+    for (name, made) in [("stdout.log", owned.stdout), ("stderr.log", owned.stderr)] {
         let p = dir.join(name);
-        if !std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_file()) {
+        let file = std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_file());
+        if file && identity(&p) == made {
+            grant(&p, 0o600, name, &mut changes)?;
+        } else {
             remove(&p)?;
             std::fs::write(&p, b"").map_err(|e| at(&p, e))?;
             changes.push(format!(
@@ -1137,6 +1227,11 @@ fn judge(reader: &Reader, at: &Judged<'_>, facts: &Facts) -> Result<(Recording, 
     ))
 }
 
+/// Where record `record_id`'s lock file is: `.hoh/locks/<record_id>.lock`.
+fn lock_path(state: &Path, record_id: &str) -> std::path::PathBuf {
+    state.join("locks").join(format!("{record_id}.lock"))
+}
+
 /// The lock of record `record_id`, `.hoh/locks/<record_id>.lock`: its run holds it from before its command to its
 /// commit, so a reconciliation never takes a record a live run is still recording (M2T10R-150, -350, -400); the lock
 /// goes with its holder, also when the process dies. Without `wait`, `None` when another holds it.
@@ -1151,7 +1246,7 @@ fn lock_record(
     let locks = state.join("locks");
     std::fs::create_dir_all(&locks)
         .map_err(|e| CheckError::Io(format!("{}: {e}", locks.display())))?;
-    let path = locks.join(format!("{record_id}.lock"));
+    let path = lock_path(state, record_id);
     let at = |e: std::io::Error| CheckError::Io(format!("{}: {e}", path.display()));
     // Opened without blocking and kept only as a regular file, before any lock is asked for (M2T10R-301).
     let fd = rustix::fs::open(
@@ -1222,15 +1317,17 @@ pub async fn reconcile(
     let (h, state, candidate_id) = (handle.clone(), state.to_owned(), candidate_id.to_owned());
     tokio::spawn(async move {
         let reader = h.reader().map_err(CheckError::Store)?;
+        let settled = state.clone();
         let found = tokio::task::spawn_blocking(move || pending(&reader, &state, &candidate_id))
             .await
             .map_err(|e| CheckError::Io(format!("the reconciliation stopped: {e}")))??;
         let recorded = found.len();
         for (lock, recording) in found {
+            let record_id = recording.record.record_id.clone();
             h.record_evidence(recording)
                 .await
                 .map_err(CheckError::Store)?;
-            drop(lock);
+            settle(&settled, &record_id, lock);
         }
         Ok(recorded)
     })
@@ -1280,10 +1377,22 @@ fn pending(
             let text = hoh_core::objects::read_regular(&file).map_err(unreadable)?;
             let mut facts: Facts =
                 serde_json::from_slice(&text).map_err(|e| unreadable(e.to_string()))?;
-            if facts.record.record_id != record_id {
+            // Bound to its record directory by candidate and check as well as by record id (M2T10R-551).
+            let check_id = check
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let r = &facts.record;
+            if (
+                r.record_id.as_str(),
+                r.candidate_id.as_str(),
+                r.check_id.as_str(),
+            ) != (record_id.as_str(), candidate_id, check_id.as_str())
+            {
                 return Err(unreadable(format!(
-                    "it holds record {}, not {record_id}",
-                    facts.record.record_id
+                    "it holds record {} of candidate {} and check {}, not the record directory's {record_id} of \
+                     {candidate_id} and {check_id}",
+                    r.record_id, r.candidate_id, r.check_id
                 )));
             }
             let lost = restore(project, &record_dir, &mut facts)?;
