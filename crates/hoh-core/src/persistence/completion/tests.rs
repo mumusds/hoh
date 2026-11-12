@@ -409,3 +409,46 @@ async fn a_task_without_criteria_or_a_run_without_its_verifiers_is_decided_befor
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn a_cancelled_attempt_is_neither_frozen_nor_judged_its_cancel_takes_precedence() -> R {
+    // ADR-021 decision 8e: a cancel takes precedence over how the work ended. A run being cancelled freezes nothing,
+    // accepts nothing and counts no correction: the attempt ends CANCELLED and its task is the cancel's to move.
+    for outcome in [
+        freeze(freeze_of('b'), result(None)?),
+        WriterOutcome::Correct {
+            reasons: vec!["no TaskResult".to_owned()],
+        },
+    ] {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = open(dir.path())?;
+        Connection::open(&path)?
+            .execute_batch("UPDATE attempts SET cancel_requested = 1 WHERE attempt_id = 'A';")?;
+        // An interrupted writer's end carries its workspace's record (REQ-019 behaviour 6).
+        let mut job = completion(outcome);
+        job.ending.observed.workspace = Some(json!({"head": "a".repeat(40)}));
+        let done = store.complete_writer_attempt(job).await?;
+        assert_eq!(done, WriterCompleted::Cancelled);
+        assert_eq!(
+            texts(&path, "SELECT state FROM attempts WHERE attempt_id = 'A'")?,
+            ["CANCELLED"]
+        );
+        assert_eq!(
+            texts(&path, "SELECT candidate_id FROM candidates")?.len(),
+            0
+        );
+        assert_eq!(
+            texts(&path, "SELECT state FROM tasks WHERE task_id = 'D'")?,
+            ["RUNNING"]
+        );
+        assert_eq!(
+            texts(
+                &path,
+                "SELECT kind FROM events WHERE kind IN ('candidate_ready', 'task.protocol_correction') OR kind LIKE 'repair.%'"
+            )?
+            .len(),
+            0
+        );
+    }
+    Ok(())
+}
