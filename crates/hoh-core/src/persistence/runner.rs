@@ -197,6 +197,9 @@ pub struct Observed {
     /// as its outputs when it succeeded (docs/adr/ADR-025.md decision 8) and a work attempt's as `attempt.outputs`
     /// whatever its end (docs/adr/ADR-028.md decision 2).
     pub messages: Vec<String>,
+    /// The bridge was read only up to its limit (`BRIDGE_LINES`, `BRIDGE_BYTES`): its last lines may be lost, so its
+    /// result is not trusted (docs/adr/ADR-028.md decision 2, M2T16D-456).
+    pub messages_truncated: bool,
     /// Its raw logs kept as objects (docs/adr/ADR-026.md decision 10): the runner carries them into its work's OBSERVED,
     /// where they are registered with their producer.
     pub artifacts: Vec<ArtifactRow>,
@@ -694,6 +697,10 @@ fn effect(
     // Its bridge lines: a supervision turn's recorded as its outputs in the transaction of its work's OBSERVED when it
     // succeeded, else discarded (docs/adr/ADR-025.md decision 8); a work attempt's kept as `attempt.outputs` whatever
     // its end (docs/adr/ADR-028.md decision 2); never kept in the effect's own event.
+    let truncated = detail
+        .as_object_mut()
+        .and_then(|d| d.remove("messages_truncated"))
+        .is_some_and(|t| t == json!(true));
     let messages = detail
         .as_object_mut()
         .and_then(|d| d.remove("messages"))
@@ -755,16 +762,16 @@ fn effect(
                 detail["success"] == json!(true),
                 &messages,
             ));
-        } else if !messages.is_empty() {
-            // A work attempt's bridge lines (docs/adr/ADR-028.md decision 2): kept whatever its end, read by its
-            // completion (and a reconcile after a crash) through hoh_core::bridge::parse.
-            events.push(event(
-                &project_id,
-                &run_id,
-                child_id(attempt_id, "outputs"),
-                "attempt.outputs",
-                json!({"attempt_id": attempt_id, "success": detail["success"] == json!(true), "lines": messages}),
-            ));
+        } else if let Some(kept) = outputs(
+            &tx,
+            &project_id,
+            &run_id,
+            attempt_id,
+            detail["success"] == json!(true),
+            truncated,
+            &messages,
+        )? {
+            events.push(kept);
         }
     }
     writer::write(
@@ -778,6 +785,41 @@ fn effect(
     ctx.before_commit()?;
     tx.commit().map_err(sqlite_error)?;
     Ok(true)
+}
+
+/// A work attempt's bridge lines as one `attempt.outputs` event (docs/adr/ADR-028.md decision 2, M2T16D-404): its
+/// completion and a reconcile read them through hoh_core::bridge::parse. Registered once, by whichever of its work's
+/// OBSERVED and its end comes first (an UNKNOWN_EFFECT end has no OBSERVED); none when there is nothing to keep.
+fn outputs(
+    conn: &Connection,
+    project_id: &str,
+    run_id: &str,
+    attempt_id: &str,
+    success: bool,
+    truncated: bool,
+    lines: &[Value],
+) -> Result<Option<NewEvent>, PersistError> {
+    if lines.is_empty() && !truncated {
+        return Ok(None);
+    }
+    let id = child_id(attempt_id, "outputs");
+    let kept: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE event_id = ?1)",
+            params![id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    if kept {
+        return Ok(None);
+    }
+    Ok(Some(event(
+        project_id,
+        run_id,
+        id,
+        "attempt.outputs",
+        json!({"attempt_id": attempt_id, "success": success, "truncated": truncated, "lines": lines}),
+    )))
 }
 
 /// The attempt's process started, held at its start gate: in one transaction the attempt RUNNING with the process's
@@ -1006,6 +1048,27 @@ fn finished(
             )
             .map_err(sqlite_error)?;
             writer::write_session_native(&tx, &project_id, &run_id, attempt_id, &session, native)?;
+        }
+    }
+    // A work attempt's bridge lines, when its work's OBSERVED did not keep them (an UNKNOWN_EFFECT end, a failure that
+    // never reached OBSERVED): kept by its end (docs/adr/ADR-028.md decision 2, M2T16D-404).
+    if !super::wakes::is_supervision(&tx, &task_id)? {
+        let lines: Vec<Value> = ending
+            .observed
+            .messages
+            .iter()
+            .map(|l| Value::String(l.clone()))
+            .collect();
+        if let Some(kept) = outputs(
+            &tx,
+            &project_id,
+            &run_id,
+            attempt_id,
+            ending.success,
+            ending.observed.messages_truncated,
+            &lines,
+        )? {
+            commit.events.push(kept);
         }
     }
     for (key, kind, payload) in &ending.observed.events {

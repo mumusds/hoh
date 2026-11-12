@@ -173,24 +173,31 @@ fn first_input(project: &Path, session_id: &str) -> Result<Option<serde_json::Va
 pub(super) const BRIDGE_LINES: usize = 1_000;
 pub(super) const BRIDGE_BYTES: usize = 1 << 20;
 
-/// The non-empty lines of the bridge file `path`, in order, within [`BRIDGE_LINES`] and [`BRIDGE_BYTES`]; none when it is
-/// missing or unreadable.
-pub(super) fn read_bridge(path: &Path) -> Vec<String> {
+/// The non-empty lines of the bridge file `path`, in order, within [`BRIDGE_LINES`] and [`BRIDGE_BYTES`], and whether the
+/// read was cut at either limit (its last lines may be lost, docs/adr/ADR-028.md decision 2, M2T16D-456); none when it is
+/// missing, unreadable or not a regular file, opened without blocking so a FIFO there is never waited on (docs/adr/
+/// ADR-027.md decision 8's file access).
+pub(super) fn read_bridge(path: &Path) -> (Vec<String>, bool) {
     use std::io::Read as _;
     let mut bytes = Vec::new();
-    let Ok(file) = std::fs::File::open(path) else {
-        return Vec::new();
+    let Ok(file) = hoh_core::objects::open_regular(path) else {
+        return (Vec::new(), false);
     };
     let limit = u64::try_from(BRIDGE_BYTES).unwrap_or(u64::MAX);
-    if file.take(limit).read_to_end(&mut bytes).is_err() {
-        return Vec::new();
+    if file.take(limit + 1).read_to_end(&mut bytes).is_err() {
+        return (Vec::new(), false);
     }
-    String::from_utf8_lossy(&bytes)
-        .lines()
-        .filter(|l| !l.trim().is_empty())
+    let mut truncated = bytes.len() > BRIDGE_BYTES;
+    bytes.truncate(BRIDGE_BYTES);
+    let text = String::from_utf8_lossy(&bytes);
+    let mut lines = text.lines().filter(|l| !l.trim().is_empty());
+    let kept: Vec<String> = lines
+        .by_ref()
         .take(BRIDGE_LINES)
         .map(str::to_owned)
-        .collect()
+        .collect();
+    truncated |= lines.next().is_some();
+    (kept, truncated)
 }
 
 /// How an adapter's failure code fails its attempt (decision 16, ADR-020 decision 1).
@@ -262,6 +269,7 @@ fn outcome(facts: Facts) -> Outcome {
             raw_log_path: Some(facts.raw_log_path),
             workspace: None,
             messages: Vec::new(),
+            messages_truncated: false,
             artifacts: Vec::new(),
             artifacts_failed: Vec::new(),
         },
@@ -593,7 +601,10 @@ impl Executor for ProductExecutor {
                 e.insert(implementation);
             }
             let mut outcome = outcome(facts);
-            outcome.observed.messages = read_bridge(&bridge);
+            (
+                outcome.observed.messages,
+                outcome.observed.messages_truncated,
+            ) = read_bridge(&bridge);
             // Its raw logs kept as objects, on a blocking thread (docs/adr/ADR-026.md decision 10): one that cannot be
             // kept as an object is registered in place; one that cannot be read is a recorded failure.
             let (logs, kept_in) = (logs.clone(), project.clone());

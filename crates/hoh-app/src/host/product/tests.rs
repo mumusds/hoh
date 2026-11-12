@@ -483,17 +483,47 @@ fn a_commander_turn_is_told_its_wake_the_values_to_name_its_nonce_and_its_bridge
 #[test]
 fn a_bridge_is_read_line_by_line_within_its_bounds() -> Result<(), Box<dyn std::error::Error>> {
     // Decision 8: the file's non-empty lines in order; none when it is missing; at most BRIDGE_LINES lines and
-    // BRIDGE_BYTES bytes are taken.
+    // BRIDGE_BYTES bytes are taken, and a read cut at either limit says so (docs/adr/ADR-028.md decision 2, M2T16D-456).
     let dir = tempfile::tempdir()?;
     let file = dir.path().join("messages.jsonl");
-    assert!(read_bridge(&file).is_empty());
+    assert_eq!(read_bridge(&file), (Vec::<String>::new(), false));
     std::fs::write(&file, "one\n\ntwo\n")?;
-    assert_eq!(read_bridge(&file), ["one", "two"]);
+    assert_eq!(
+        read_bridge(&file),
+        (vec!["one".to_owned(), "two".to_owned()], false)
+    );
+    let exact: String = (0..BRIDGE_LINES).map(|i| format!("{i}\n")).collect();
+    std::fs::write(&file, exact)?;
+    assert_eq!(read_bridge(&file).0.len(), BRIDGE_LINES);
+    assert!(!read_bridge(&file).1);
     let many: String = (0..BRIDGE_LINES + 5).map(|i| format!("{i}\n")).collect();
     std::fs::write(&file, many)?;
-    assert_eq!(read_bridge(&file).len(), BRIDGE_LINES);
+    let (lines, truncated) = read_bridge(&file);
+    assert_eq!((lines.len(), truncated), (BRIDGE_LINES, true));
     std::fs::write(&file, "x".repeat(BRIDGE_BYTES + 10))?;
-    assert!(read_bridge(&file).iter().map(String::len).sum::<usize>() <= BRIDGE_BYTES);
+    let (lines, truncated) = read_bridge(&file);
+    assert!(lines.iter().map(String::len).sum::<usize>() <= BRIDGE_BYTES);
+    assert!(truncated);
+    Ok(())
+}
+
+#[test]
+fn a_bridge_that_is_not_a_regular_file_is_never_waited_on() -> Result<(), Box<dyn std::error::Error>>
+{
+    // docs/adr/ADR-027.md decision 8's file access: an agent that leaves a FIFO where its bridge goes gets no lines and
+    // the read returns at once, never blocking on the FIFO's other end.
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("messages.jsonl");
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        &file,
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::from_raw_mode(0o600),
+        0,
+    )?;
+    let started = std::time::Instant::now();
+    assert_eq!(read_bridge(&file), (Vec::<String>::new(), false));
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
     Ok(())
 }
 

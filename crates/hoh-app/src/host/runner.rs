@@ -1085,6 +1085,9 @@ fn observed_detail(outcome: &Outcome, ended: std::time::SystemTime) -> Value {
     if !outcome.observed.messages.is_empty() {
         observed["messages"] = json!(outcome.observed.messages);
     }
+    if outcome.observed.messages_truncated {
+        observed["messages_truncated"] = json!(true);
+    }
     if !outcome.observed.artifacts_failed.is_empty() {
         observed["artifacts_failed"] = json!(outcome.observed.artifacts_failed);
     }
