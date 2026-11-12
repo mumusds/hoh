@@ -2,7 +2,7 @@
 Synthetic fixtures only: NEVER product acceptance evidence."""
 import copy,importlib.util,json,os,shutil,subprocess,sys,tempfile,unittest
 from pathlib import Path
-from helpers import ROOT,ReleaseFixture,json_file,load_json,ref_for,sha256
+from helpers import ROOT,ReleaseFixture,json_file,load_json,own_python,ref_for,sha256
 from release_gate import GateError,validate_manifest
 
 def load_replica():
@@ -426,6 +426,9 @@ class EndToEnd(unittest.TestCase):
            'scripts/product/test_results.py']+[f'contracts/{n}.schema.json' for n in ('execution','test-result','live-session','soak-event','candidate','check-plan')]
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory(prefix='hoh-traceability-');self.addCleanup(self.temp.cleanup);r=self.root=Path(self.temp.name)
+        # Outside the fixture repository, whose tree must stay clean for the freeze.
+        shims=Path(tempfile.mkdtemp(prefix='hoh-traceability-bin-'));self.addCleanup(shutil.rmtree,shims,True)
+        self.path=own_python(shims,os.environ.get('PATH','/usr/bin:/bin'))
         for rel in self.FILES:(r/rel).parent.mkdir(parents=True,exist_ok=True);shutil.copy2(ROOT/rel,r/rel)
         spec={'requirements':[{'id':'REQ-901','release_targets':['v0.1'],'release_class':'required',
                                'acceptance':[{'id':'AC-901-01','test_id':'TEST-901-01'},{'id':'AC-901-02','test_id':'TEST-901-02'}]},
@@ -459,7 +462,7 @@ class EndToEnd(unittest.TestCase):
     def git(self,*args):
         subprocess.run(['git','-c','user.name=t','-c','user.email=t@invalid.example',*args],cwd=self.root,check=True,env=clean_env()|{'GIT_CONFIG_GLOBAL':'/dev/null','GIT_CONFIG_NOSYSTEM':'1'})
     def tool(self,*argv):
-        return subprocess.run([sys.executable,*argv],cwd=self.root,capture_output=True,text=True,env=clean_env(),timeout=300)
+        return subprocess.run([sys.executable,*argv],cwd=self.root,capture_output=True,text=True,env=clean_env()|{'PATH':self.path},timeout=300)
     def freeze(self,name):
         out=f'.hoh-dev/candidates/{name}.json'
         r=self.tool('tools/candidate.py','freeze','--spec','contracts/requirements.json','--environment','.hoh-dev/environment.json','--test-plan','plan.json','--out',out)
