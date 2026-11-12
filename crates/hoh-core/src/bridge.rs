@@ -26,8 +26,11 @@ pub struct Refused {
 /// What the lines said.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Parsed {
-    /// The last valid TaskResult, if any.
+    /// The TaskResult of the last TaskResult-shaped line (an object with `status`), when that line is valid.
     pub task_result: Option<TaskResult>,
+    /// The last TaskResult-shaped line was refused: the attempt's result is invalid, whatever came before it
+    /// (docs/adr/ADR-028.md decision 2, M2T16D-359).
+    pub result_invalid: bool,
     /// The valid `query` and `steer` messages, in order.
     pub messages: Vec<Message>,
     pub refused: Vec<Refused>,
@@ -35,21 +38,39 @@ pub struct Parsed {
 
 /// Parse `lines` (non-empty bridge lines, in order) against `identity`: a line is a TaskResult (it has `status`) or an
 /// HCP message (it has `message_id`); either must hold under the protocol schema and name this attempt's run, task,
-/// attempt, role and role epoch. Only `query` and `steer` messages are kept; anything else is refused, alone.
+/// attempt, role and role epoch. Only `query` and `steer` messages are kept; anything else is refused, alone. The last
+/// TaskResult-shaped line decides the result: refused, the result is invalid.
 pub fn parse(lines: &[String], identity: &Identity) -> Parsed {
     let mut parsed = Parsed::default();
     for (n, text) in lines.iter().enumerate() {
         match line(text, identity) {
-            Ok(Line::Result(result)) => parsed.task_result = Some(*result),
+            Ok(Line::Result(result)) => {
+                parsed.task_result = Some(*result);
+                parsed.result_invalid = false;
+            }
             Ok(Line::Message(message)) => parsed.messages.push(*message),
-            Err(reason) => parsed.refused.push(Refused {
-                line: n,
-                sha256: crate::context::sha256_hex(text.as_bytes()),
-                reason,
-            }),
+            Err(reason) => {
+                if result_shaped(text) {
+                    parsed.task_result = None;
+                    parsed.result_invalid = true;
+                }
+                parsed.refused.push(Refused {
+                    line: n,
+                    sha256: crate::context::sha256_hex(text.as_bytes()),
+                    reason,
+                });
+            }
         }
     }
     parsed
+}
+
+/// A JSON object with `status` and no `message_id`: meant as a TaskResult, valid or not.
+fn result_shaped(text: &str) -> bool {
+    serde_json::from_str::<Value>(text).is_ok_and(|v| {
+        v.as_object()
+            .is_some_and(|o| o.contains_key("status") && !o.contains_key("message_id"))
+    })
 }
 
 enum Line {

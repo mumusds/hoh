@@ -90,3 +90,25 @@ fn a_line_off_its_schema_or_another_identity_is_refused_alone() {
         assert!(!r.reason.is_empty());
     }
 }
+
+#[test]
+fn the_last_task_result_shaped_line_decides_even_when_it_is_invalid() {
+    // docs/adr/ADR-028.md decision 2 (M2T16D-359): an agent that wrote COMPLETED and then a FAILED off its identity meant
+    // the FAILED; the result is invalid (a protocol correction), never the earlier COMPLETED.
+    let mut late = result("FAILED", "changed my mind");
+    late["role_epoch"] = json!(9);
+    let parsed = parse(
+        &lines(&[result("COMPLETED", "early"), message("query"), late]),
+        &identity(),
+    );
+    assert_eq!(parsed.task_result, None);
+    assert!(parsed.result_invalid);
+    assert_eq!(parsed.messages.len(), 1);
+    assert_eq!(
+        parsed.refused.iter().map(|r| r.line).collect::<Vec<_>>(),
+        [2]
+    );
+    // Without any TaskResult-shaped line there is no result and nothing invalid about it.
+    let none = parse(&lines(&[message("steer")]), &identity());
+    assert_eq!((none.task_result, none.result_invalid), (None, false));
+}
