@@ -961,7 +961,21 @@ fn finished(
     ctx: &Ctx<'_>,
 ) -> Result<bool, PersistError> {
     let tx = writer::begin(conn, ctx)?;
-    let (task_id, task_state, revision, run_id, project_id) = task_of(&tx, attempt_id)?;
+    let applied = finished_in(&tx, attempt_id, ending, ctx)?;
+    ctx.before_commit()?;
+    tx.commit().map_err(sqlite_error)?;
+    Ok(applied)
+}
+
+/// [`finished`] inside the caller's transaction (docs/adr/ADR-028.md decision 4: a writer attempt's completion freezes,
+/// accepts and settles in one commit). The caller commits.
+pub(super) fn finished_in(
+    tx: &Transaction<'_>,
+    attempt_id: &str,
+    ending: &Ending,
+    ctx: &Ctx<'_>,
+) -> Result<bool, PersistError> {
+    let (task_id, task_state, revision, run_id, project_id) = task_of(tx, attempt_id)?;
     let (from, cancelled): (String, bool) = tx
         .query_row(
             "SELECT state, cancel_requested FROM attempts WHERE attempt_id = ?1",
@@ -973,7 +987,7 @@ fn finished(
     // A process that never started leaves its attempt STARTING: it can only fail. A cancel takes precedence over how
     // the work ended: CANCELLED, not counted, no retry; the run's cancel moves its task (ADR-021 decision 8e).
     // Its effects still STARTED: none was observed (the runner observes and commits the work it saw end first).
-    let started = super::attempts::started_effects(&tx, attempt_id)?;
+    let started = super::attempts::started_effects(tx, attempt_id)?;
     // A turn that started an effect it never reported, or an effect left STARTED at all: what it did is unknown, so
     // nothing runs it again and its task stays, by the rule a reconcile applies too (ADR-019 decision 5; ADR-022
     // decision 12 v3, M2T07R-200, -451). Only a RUNNING attempt can have started one.
@@ -991,7 +1005,7 @@ fn finished(
         AttemptState::Failed
     };
     attempts::move_attempt(
-        &tx,
+        tx,
         &AttemptMove {
             attempt_id: attempt_id.to_owned(),
             from,
@@ -1008,12 +1022,12 @@ fn finished(
         },
         ctx,
     )?;
-    super::retry::accrue_wall(&tx, &run_id, attempt_id, ending.at, None)?;
+    super::retry::accrue_wall(tx, &run_id, attempt_id, ending.at, None)?;
     // The prompt's source and what was sent (decision 11), from an executor that hands it with its end (a test's); the
     // product's is recorded when the attempt is marked RUNNING (docs/adr/ADR-026.md decision 7).
     let prompt_events = match &ending.observed.prompt {
         Some(prompt) => record_prompt(
-            &tx,
+            tx,
             &project_id,
             &run_id,
             attempt_id,
@@ -1047,12 +1061,12 @@ fn finished(
                 params![session, native],
             )
             .map_err(sqlite_error)?;
-            writer::write_session_native(&tx, &project_id, &run_id, attempt_id, &session, native)?;
+            writer::write_session_native(tx, &project_id, &run_id, attempt_id, &session, native)?;
         }
     }
     // A work attempt's bridge lines, when its work's OBSERVED did not keep them (an UNKNOWN_EFFECT end, a failure that
     // never reached OBSERVED): kept by its end (docs/adr/ADR-028.md decision 2, M2T16D-404).
-    if !super::wakes::is_supervision(&tx, &task_id)? {
+    if !super::wakes::is_supervision(tx, &task_id)? {
         let lines: Vec<Value> = ending
             .observed
             .messages
@@ -1060,7 +1074,7 @@ fn finished(
             .map(|l| Value::String(l.clone()))
             .collect();
         if let Some(kept) = outputs(
-            &tx,
+            tx,
             &project_id,
             &run_id,
             attempt_id,
@@ -1083,7 +1097,7 @@ fn finished(
     // The effects it left STARTED are UNKNOWN, in its ending's transaction, and named for whoever settles them, as the
     // cancel's own pass and a reconcile record them (ADR-021 decision 8e; ADR-022 decision 12 v3, M2T07R-301, -451).
     if unknown || cancelled {
-        super::attempts::effects_unknown(&tx, attempt_id)?;
+        super::attempts::effects_unknown(tx, attempt_id)?;
     }
     if !started.is_empty() && (unknown || cancelled) {
         commit.events.push(NewEvent {
@@ -1109,7 +1123,7 @@ fn finished(
     } else if !unknown && !cancelled {
         // Its task by the retry policy, in this transaction (ADR-020 decision 3).
         let failed = super::retry::fail_task(
-            &tx,
+            tx,
             &super::retry::TaskRef {
                 project_id: &project_id,
                 run_id: &run_id,
@@ -1127,8 +1141,6 @@ fn finished(
         commit.cas.extend(failed.cas);
         commit.events.extend(failed.events);
     }
-    writer::write(&tx, &commit, ctx)?;
-    ctx.before_commit()?;
-    tx.commit().map_err(sqlite_error)?;
+    writer::write(tx, &commit, ctx)?;
     Ok(true)
 }
