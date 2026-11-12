@@ -82,6 +82,18 @@ class GateComparison(Envelope):
     def test_rule_01_a_record_off_its_schema(self):
         self.f.edit_execution('unit',exit_code='zero')
         self.assertTrue(self.vetoed('unit','RECORD_INVALID','execution.schema.json').damaged)
+    def test_rule_01_a_time_that_is_no_rfc3339_date_time(self):
+        # M2T10R-750: Python's fromisoformat takes a space for the 'T'; the schema's date-time format does not.
+        self.f.edit_execution('unit',started_at='2020-01-01 00:00:00+00:00')
+        self.vetoed('unit','RECORD_INVALID','execution.schema.json')
+    def test_rule_01_the_replica_refuses_to_judge_without_a_date_time_checker(self):
+        # M2T10R-750: jsonschema installed without requirements-dev.txt's format extras would accept any string there.
+        class NoDateTime(tr.FormatChecker):
+            def __init__(self):super().__init__();self.checkers.pop('date-time',None)
+        original=tr.FormatChecker;tr.FormatChecker=NoDateTime
+        try:
+            with self.assertRaisesRegex(ValueError,'date-time'):self.world()
+        finally:tr.FormatChecker=original
     def test_rule_01_an_unreadable_record_holding_the_candidate(self):
         row=self.f.check_row('unit');p=self.f.root/row['execution']['path']
         p.write_text('{"candidate_id": "'+self.f.candidate['candidate_id']+'", cut');row['execution']=ref_for(p,self.f.root)

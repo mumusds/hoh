@@ -61,7 +61,11 @@ class World:
         self.names = self.policy['artifacts'] if self.policy else ARTIFACTS
         self.agents = self.policy['profiles'][profile].get('live_agents', {}) if self.policy else {}
         self.requirements, self.scenarios = requirements, scenarios
-        # HoH's locked contracts, beside this script: a project's records follow them whatever the project is.
+        # HoH's locked contracts, beside this script: a project's records follow them whatever the project is. Their
+        # times are date-time formats: a jsonschema without requirements-dev.txt's format extras would accept any
+        # string there, so it is refused rather than trusted (M2T10R-750).
+        if 'date-time' not in FormatChecker().checkers:
+            raise ValueError('jsonschema cannot check date-time: install requirements-dev.txt')
         self.schemas = {n: Draft202012Validator(load_json(ROOT / 'contracts' / f'{n}.schema.json'),
                                                 format_checker=FormatChecker()) for n in SCHEMAS}
 
