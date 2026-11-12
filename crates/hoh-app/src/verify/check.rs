@@ -665,16 +665,17 @@ async fn finish(
         stderr_copy: Some(stderr.clone()),
         ..Config::default()
     };
-    // What HoH made for the run, by identity, before the command can touch it (M2T10R-501).
-    let mut owned = Owned {
+    // What HoH made for the run, by identity, before the child exists (M2T10R-501, -600): the output copies are made
+    // here, and the substrate opens them again truncating the same files.
+    std::fs::write(&stdout, b"").map_err(|e| io(format!("{}: {e}", stdout.display())))?;
+    std::fs::write(&stderr, b"").map_err(|e| io(format!("{}: {e}", stderr.display())))?;
+    let owned = Owned {
         dir: identity(&record_dir),
-        stdout: None,
-        stderr: None,
+        stdout: identity(&stdout),
+        stderr: identity(&stderr),
     };
     let (exit_code, timed_out) = match Process::spawn(command, config) {
         Ok(mut process) => {
-            // The copies exist before the child does.
-            (owned.stdout, owned.stderr) = (identity(&stdout), identity(&stderr));
             let mut report = None;
             let mut cancelling = false;
             loop {
@@ -698,7 +699,6 @@ async fn finish(
             // As run_check does when the command cannot start: 127, the error as its stderr.
             std::fs::write(&stdout, b"").map_err(|e| io(e.to_string()))?;
             std::fs::write(&stderr, e.to_string()).map_err(|e| io(e.to_string()))?;
-            (owned.stdout, owned.stderr) = (identity(&stdout), identity(&stderr));
             (127, false)
         }
     };
@@ -1359,6 +1359,9 @@ fn pending(
                     .map_err(CheckError::Store)
             };
             if recorded()? {
+                // What a crash between a commit and its settling left is swept, without reading it (M2T10R-652).
+                let _ = std::fs::remove_file(pending_path(state, &record_id));
+                let _ = std::fs::remove_file(lock_path(state, &record_id));
                 continue;
             }
             let file = pending_path(state, &record_id);
@@ -1372,6 +1375,8 @@ fn pending(
                 continue;
             };
             if recorded()? {
+                // Committed and settled meanwhile: the lock file this opening made again goes too (M2T10R-601).
+                settle(state, &record_id, lock);
                 continue;
             }
             let text = hoh_core::objects::read_regular(&file).map_err(unreadable)?;

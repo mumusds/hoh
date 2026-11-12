@@ -2146,3 +2146,119 @@ async fn hohs_locks_left_unignored_after_the_freeze_are_refused_before_the_run()
     assert!(reasons.iter().any(|r| r.contains("locks")), "{reasons:?}");
     Ok(())
 }
+
+#[tokio::test]
+async fn the_reclaiming_rules_each_hold_on_their_own() -> R {
+    // M2T10R-651: a record directory swapped for another holding HoH's own logs, an unreadable artifact, and an
+    // artifacts/ closed by the command: each recorded as its rule says, and the candidate's next run goes ahead.
+    for (label, script, outcome, change) in [
+        (
+            "the record directory swapped, HoH's logs moved into the new one",
+            "d=\"$(dirname \"$HOH_EVIDENCE_DIR\")\"; mv \"$d\" \"$d.old\" && mkdir -p \"$HOH_EVIDENCE_DIR\" && mv \"$d.old/stdout.log\" \"$d.old/stderr.log\" \"$d/\"",
+            "INVALID",
+            Some("the command removed or replaced its record directory"),
+        ),
+        (
+            "the results made unreadable",
+            "printf '%s\\n' '{\"schema_version\": \"1.0\", \"test_id\": \"TEST-001-01\", \"name\": \"t\", \"status\": \"PASS\"}' > \"$HOH_EVIDENCE_DIR/test-results.jsonl\" && chmod 000 \"$HOH_EVIDENCE_DIR/test-results.jsonl\"; exit 0",
+            "INVALID",
+            None,
+        ),
+        (
+            "artifacts closed",
+            "chmod 000 \"$HOH_EVIDENCE_DIR\"; exit 0",
+            "INVALID",
+            Some("the command changed the permissions of its artifacts directory"),
+        ),
+    ] {
+        let f = Fixture::with_qa(&format!("{QA_PASSES}{script}\n")).await?;
+        let c = f.frozen().await?;
+        let ran = f
+            .run(&c, "qa", QA)
+            .await
+            .map_err(|e| format!("{label}: {e:?}"))?;
+        assert_eq!(
+            ran.outcome.status.code(),
+            outcome,
+            "{label}: {:?}",
+            ran.reasons
+        );
+        let named: Vec<String> = f
+            .query("SELECT payload_json FROM events WHERE kind = 'integrity_violation'")?
+            .iter()
+            .filter_map(|p| serde_json::from_str::<Value>(p).ok())
+            .flat_map(|p| {
+                p["reasons"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|r| r.as_str().map(str::to_owned))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        match change {
+            Some(change) => assert!(named.iter().any(|r| r == change), "{label}: {named:?}"),
+            None => {
+                let record = f.record(&ran)?;
+                assert_eq!(
+                    record["missing_artifacts"],
+                    serde_json::json!(["test-results.jsonl"]),
+                    "{label}"
+                );
+                assert!(
+                    ran.reasons.contains(&"ARTIFACT_MISSING"),
+                    "{label}: {:?}",
+                    ran.reasons
+                );
+            }
+        }
+        let again = f.run(&c, "qa", QA).await;
+        assert!(again.is_ok(), "{label}: the candidate is held: {again:?}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_pending_record_under_another_check_of_its_candidate_is_refused() -> R {
+    // M2T10R-651: the binding holds by check too, also for a directory that comes first in the enumeration.
+    let (f, _, c, dir) = pending_qa(&[]).await?;
+    let record_id = dir
+        .file_name()
+        .ok_or("no name")?
+        .to_string_lossy()
+        .into_owned();
+    let elsewhere = f
+        .state()
+        .join("evidence")
+        .join(&c)
+        .join("blocked")
+        .join(&record_id);
+    std::fs::create_dir_all(&elsewhere)?;
+    let refused =
+        hoh_app::verify::check::reconcile(&f.store.evidence_handle(), &f.state(), &c).await;
+    assert!(
+        matches!(&refused, Err(CheckError::Io(why)) if why.contains("blocked")),
+        "{refused:?}"
+    );
+    std::fs::remove_dir(&elsewhere)?;
+    assert_eq!(super_reconcile(&f, &c).await?, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn what_a_crash_between_commit_and_settling_left_is_swept() -> R {
+    // M2T10R-652: a recorded record's leftover pending and lock files are removed by the next reconciliation, unread.
+    let f = Fixture::new().await?;
+    let c = f.frozen().await?;
+    let ran = f.run(&c, "qa", QA).await.map_err(|e| format!("{e:?}"))?;
+    let lock = f
+        .state()
+        .join("locks")
+        .join(format!("{}.lock", ran.record_id));
+    std::fs::write(pending_of(&f, &ran.record_dir), b"{")?;
+    std::fs::write(&lock, b"")?;
+    assert_eq!(super_reconcile(&f, &c).await?, 0);
+    assert!(!pending_of(&f, &ran.record_dir).exists());
+    assert!(!lock.exists());
+    Ok(())
+}
