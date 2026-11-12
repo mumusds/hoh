@@ -53,6 +53,26 @@ pub(super) fn accept(
         ));
     }
     let tx = super::writer::begin(conn, ctx)?;
+    let outcome = accept_in(&tx, result, ctx)?;
+    if !matches!(outcome, TaskResultOutcome::Replayed { .. }) {
+        tx.commit().map_err(sqlite_error)?;
+    }
+    Ok(outcome)
+}
+
+/// [`accept`] inside the caller's transaction (docs/adr/ADR-028.md decision 4: a writer attempt's completion freezes,
+/// accepts and settles in one commit). Writes what `accept` writes, never commits; a refusal is written too (its
+/// `task_result.rejected` event), so the caller commits either way.
+pub(super) fn accept_in(
+    tx: &Transaction<'_>,
+    result: &TaskResult,
+    ctx: &super::writer::Ctx<'_>,
+) -> Result<TaskResultOutcome, PersistError> {
+    if result.status != TaskStatus::Completed {
+        return Err(PersistError::Unsupported(
+            "a TaskResult that is not COMPLETED",
+        ));
+    }
     let ready_id = child_id(&result.attempt_id, "result");
     let rejected_id = child_id(&result.attempt_id, "result-rejected");
     // The same attempt's result again: the same one replays; another one is a reuse of its key (REQ-022 b4,
@@ -68,12 +88,12 @@ pub(super) fn accept(
             Err(PersistError::KeyReuse(id.to_owned()))
         }
     };
-    if let Some((seq, payload)) = event(&tx, &ready_id)? {
+    if let Some((seq, payload)) = event(tx, &ready_id)? {
         same(&payload, &ready_id)?;
-        let handoffs = queued(&tx, seq)?;
+        let handoffs = queued(tx, seq)?;
         return Ok(TaskResultOutcome::Replayed { handoffs });
     }
-    if let Some((seq, payload)) = event(&tx, &rejected_id)? {
+    if let Some((seq, payload)) = event(tx, &rejected_id)? {
         same(&payload, &rejected_id)?;
         let reason = serde_json::from_value(payload["reason_code"].clone())
             .map_err(|e| PersistError::IntegrityViolation(format!("{rejected_id}: {e}")))?;
@@ -83,7 +103,7 @@ pub(super) fn accept(
             event_seq: seq,
         });
     }
-    let run = run(&tx, &result.run_id)?;
+    let run = run(tx, &result.run_id)?;
     let task: Option<(String, i64, String)> = tx
         .query_row(
             "SELECT state, revision, role FROM tasks WHERE task_id = ?1 AND run_id = ?2",
@@ -120,12 +140,12 @@ pub(super) fn accept(
             result.attempt_id, result.task_id
         )));
     }
-    let binding = load_binding(&tx, &result.run_id, &result.role)?;
+    let binding = load_binding(tx, &result.run_id, &result.role)?;
     let candidate = match &result.candidate_id {
-        Some(id) => load_candidate(&tx, &result.run_id, id)?,
+        Some(id) => load_candidate(tx, &result.run_id, id)?,
         None => None,
     };
-    let current = super::outbox::current_candidate(&tx, &result.run_id)?;
+    let current = super::outbox::current_candidate(tx, &result.run_id)?;
     let refusal = if role == super::wakes::COMMANDER {
         // A Commander turn answers through its outputs (docs/adr/ADR-025.md decision 8), not a TaskResult.
         Some((
@@ -211,7 +231,7 @@ pub(super) fn accept(
     };
     if let Some((reason, detail)) = refusal {
         let done = writer::write(
-            &tx,
+            tx,
             &Commit {
                 events: vec![NewEvent {
                     project_id: run.project_id,
@@ -231,7 +251,6 @@ pub(super) fn accept(
             },
             ctx,
         )?;
-        tx.commit().map_err(sqlite_error)?;
         return Ok(TaskResultOutcome::Rejected {
             reason,
             detail,
@@ -250,10 +269,10 @@ pub(super) fn accept(
                 )));
             }
         };
-    let acceptance_ids = acceptance(&tx, &result.task_id, &spec_id)?;
+    let acceptance_ids = acceptance(tx, &result.task_id, &spec_id)?;
     let mut recipients = Vec::with_capacity(VERIFIERS.len());
     for role in VERIFIERS {
-        let binding = load_binding(&tx, &result.run_id, role)?.ok_or_else(|| {
+        let binding = load_binding(tx, &result.run_id, role)?.ok_or_else(|| {
             PersistError::IntegrityViolation(format!("run {} has no {role} bound", result.run_id))
         })?;
         recipients.push(Recipient {
@@ -270,17 +289,17 @@ pub(super) fn accept(
         spec_revision: u64::try_from(spec_revision)
             .map_err(|_| PersistError::IntegrityViolation("spec revision".to_owned()))?,
         acceptance_ids,
-        goal: goal(&tx, &result.run_id, &result.task_id, &candidate.id)?,
+        goal: goal(tx, &result.run_id, &result.task_id, &candidate.id)?,
         task_revision: u64::try_from(revision + 2)
             .map_err(|_| PersistError::IntegrityViolation("task revision".to_owned()))?,
         cause: ready_id.clone(),
         // What the Developer's attempt produced, by reference only (docs/adr/ADR-026.md decision 10).
         references: super::context::references(
-            &tx,
+            tx,
             std::slice::from_ref(&result.attempt_id),
             REFERENCES,
         )?,
-        budget_tokens: super::context::budget(&tx, &result.run_id)?,
+        budget_tokens: super::context::budget(tx, &result.run_id)?,
     };
     // No acceptance criteria, nothing to verify against: refused whole, no QA attempt (REQ-022).
     let messages = handoff::verification(&verification, &recipients).ok_or_else(|| {
@@ -299,7 +318,7 @@ pub(super) fn accept(
         change: Change::Task(to),
     };
     let done = writer::write(
-        &tx,
+        tx,
         &Commit {
             cas: vec![
                 task(revision, TaskState::Implemented),
@@ -334,7 +353,6 @@ pub(super) fn accept(
             candidate.id
         )));
     }
-    tx.commit().map_err(sqlite_error)?;
     Ok(TaskResultOutcome::Accepted {
         event_seq: done.event_seqs[0],
         handoffs: messages.into_iter().map(|m| m.message_id).collect(),
