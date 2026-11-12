@@ -320,7 +320,7 @@ impl ProductExecutor {
         // Every turn has a bridge file in its attempt's directory (docs/adr/ADR-025.md decision 8, docs/adr/ADR-028.md
         // decision 2): a Commander turn is told it with where the project is (it runs outside it); a work turn in its
         // identity header, the values its every output must repeat.
-        let bridge = attempt_logs(&self.project, &work.attempt_id).join(BRIDGE);
+        let bridge = bridge_of(&self.project, &work.attempt_id);
         let _ = std::fs::create_dir_all(attempt_logs(&self.project, &work.attempt_id));
         if a.supervision.is_none() {
             facts.identity = Some(context::AttemptIdentity {
@@ -727,6 +727,12 @@ fn keep_logs(
 
 fn attempt_logs(project: &Path, attempt_id: &str) -> PathBuf {
     project.join(".hoh/attempts").join(component(attempt_id))
+}
+
+/// The bridge file of attempt `attempt_id` in the project at `project`, where a reconcile reads it again
+/// (docs/adr/ADR-028.md decisions 2 and 4).
+pub fn bridge_of(project: &Path, attempt_id: &str) -> PathBuf {
+    attempt_logs(project, attempt_id).join(BRIDGE)
 }
 
 #[cfg(test)]
