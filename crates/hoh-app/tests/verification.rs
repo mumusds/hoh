@@ -2108,7 +2108,7 @@ async fn a_pending_record_is_recorded_only_under_its_own_candidate_and_check() -
     let refused =
         hoh_app::verify::check::reconcile(&f.store.evidence_handle(), &f.state(), &other).await;
     assert!(
-        matches!(&refused, Err(CheckError::Io(why)) if why.contains(&other)),
+        matches!(&refused, Err(CheckError::Damaged(why)) if why.contains(&other)),
         "{refused:?}"
     );
     assert!(!elsewhere.join("execution.json").exists());
@@ -2239,7 +2239,7 @@ async fn a_pending_record_under_another_check_of_its_candidate_is_refused() -> R
     let refused =
         hoh_app::verify::check::reconcile(&f.store.evidence_handle(), &f.state(), &c).await;
     assert!(
-        matches!(&refused, Err(CheckError::Io(why)) if why.contains("blocked")),
+        matches!(&refused, Err(CheckError::Damaged(why)) if why.contains("blocked")),
         "{refused:?}"
     );
     std::fs::remove_dir(&elsewhere)?;

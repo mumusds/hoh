@@ -522,6 +522,33 @@ async fn tick(
         tokio::task::spawn_blocking(move || crate::verify::check::pending_candidates(&state))
             .await
             .unwrap_or_default();
+    // The pending records of a candidate still under a round are recovered first; each failure is recorded and judged
+    // (a permanent one at once, transient ones after 3 over 10 minutes, decision 11).
+    let handle = store.evidence_handle();
+    for candidate in &pending {
+        let reader = store.reader()?;
+        let id = candidate.clone();
+        let due = tokio::task::spawn_blocking(move || reader.recovery_due(&id))
+            .await
+            .map_err(|e| PersistError::Storage(format!("the recovery's look-up ended: {e}")))??;
+        if !due {
+            continue;
+        }
+        let outcome =
+            crate::verify::check::reconcile(&handle, &common.shared.root.join(".hoh"), candidate)
+                .await
+                .map_err(|e| {
+                    let permanent = matches!(
+                        e,
+                        crate::verify::check::CheckError::Damaged(_)
+                            | crate::verify::check::CheckError::Refused(_)
+                    );
+                    (permanent, crate::verify::check::described(&e))
+                });
+        store
+            .record_recovery(candidate, outcome, common.clock.now())
+            .await?;
+    }
     for run in waiting.runs.iter().chain(&waiting.pausing) {
         store.reconcile_verification(run, pending.clone()).await?;
     }

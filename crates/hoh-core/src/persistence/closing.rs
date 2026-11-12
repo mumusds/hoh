@@ -1244,3 +1244,131 @@ fn iteration(
     )
     .map(drop)
 }
+
+/// How long transient recovery failures of a candidate must last, and how many in a row, before it is judged
+/// unrecoverable (docs/adr/ADR-028.md decision 11, M2T16D-1251).
+const TRANSIENT_FAILURES: usize = 3;
+const TRANSIENT_SPAN_MS: u128 = 10 * 60 * 1000;
+
+/// One recovery of a candidate's pending records: how many it recorded, or its failure (permanent, and why).
+pub type RecoveryOutcome = Result<usize, (bool, String)>;
+
+/// Record one recovery of candidate `candidate`'s pending check records at `now` (decision 11): a failure is
+/// `candidate.reconcile_failed{attempt, kind, error}`, a success after failures `candidate.reconcile_recovered` (the
+/// count starts again). Judged unrecoverable — a permanent failure at once, transient ones at least 3 in a row over at
+/// least 10 minutes — in this transaction: a VERIFYING candidate STALE (its prior state the condition), any other kept;
+/// the persistent fact `candidate.stale{evidence_unrecoverable}` and `integrity_violation` either way; its pending
+/// facts kept for audit, never tried again (-1252).
+pub(super) fn record_recovery(
+    conn: &mut rusqlite::Connection,
+    candidate: &str,
+    outcome: &RecoveryOutcome,
+    now: std::time::SystemTime,
+    ctx: &Ctx<'_>,
+) -> Result<(), PersistError> {
+    let tx = writer::begin(conn, ctx)?;
+    let (run_id, project_id): (String, String) = tx
+        .query_row(
+            "SELECT c.run_id, r.project_id FROM candidates c JOIN runs r ON r.run_id = c.run_id WHERE c.candidate_id = ?1",
+            params![candidate],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(sqlite_error)?;
+    let of = |kind: &str| -> Result<Vec<(i64, Value)>, PersistError> {
+        let mut statement = tx
+            .prepare(
+                "SELECT seq, payload_json FROM events WHERE kind = ?1 AND json_extract(payload_json, '$.candidate_id') = ?2 \
+                 ORDER BY seq",
+            )
+            .map_err(sqlite_error)?;
+        let rows = statement
+            .query_map(params![kind, candidate], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(sqlite_error)?;
+        rows.map(|row| {
+            let (seq, payload) = row.map_err(sqlite_error)?;
+            Ok((seq, serde_json::from_str(&payload).unwrap_or(Value::Null)))
+        })
+        .collect()
+    };
+    let recovered = of("candidate.reconcile_recovered")?;
+    let failed = of("candidate.reconcile_failed")?;
+    let since = recovered.last().map_or(0, |(seq, _)| *seq);
+    let run: Vec<&(i64, Value)> = failed.iter().filter(|(seq, _)| *seq > since).collect();
+    let millis = |t: std::time::SystemTime| {
+        t.duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis())
+    };
+    let event = |event_id: String, kind: &str, payload: Value| NewEvent {
+        project_id: project_id.clone(),
+        event_id,
+        run_id: Some(run_id.clone()),
+        kind: kind.to_owned(),
+        payload,
+    };
+    let mut events = Vec::new();
+    match outcome {
+        Ok(recorded) => {
+            if !run.is_empty() {
+                events.push(event(
+                    child_id(candidate, &format!("reconcile_recovered/{}", recovered.len() + 1)),
+                    "candidate.reconcile_recovered",
+                    json!({"candidate_id": candidate, "recorded": recorded, "after_failures": run.len()}),
+                ));
+            }
+        }
+        Err((permanent, error)) => {
+            let attempt = run.len() + 1;
+            events.push(event(
+                child_id(candidate, &format!("reconcile_failed/{}", failed.len() + 1)),
+                "candidate.reconcile_failed",
+                json!({"candidate_id": candidate, "attempt": attempt,
+                    "kind": if *permanent { "permanent" } else { "transient" }, "error": error,
+                    "at_ms": millis(now).to_string()}),
+            ));
+            let first = run
+                .first()
+                .and_then(|(_, p)| p["at_ms"].as_str().and_then(|s| s.parse::<u128>().ok()))
+                .unwrap_or_else(|| millis(now));
+            let judged = *permanent
+                || (attempt >= TRANSIENT_FAILURES
+                    && millis(now).saturating_sub(first) >= TRANSIENT_SPAN_MS);
+            let stale: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM events WHERE kind = 'candidate.stale' \
+                     AND json_extract(payload_json, '$.candidate_id') = ?1)",
+                    params![candidate],
+                    |r| r.get(0),
+                )
+                .map_err(sqlite_error)?;
+            if judged && !stale {
+                tx.execute(
+                    "UPDATE candidates SET state = 'STALE' WHERE candidate_id = ?1 AND state = 'VERIFYING'",
+                    params![candidate],
+                )
+                .map_err(sqlite_error)?;
+                events.push(event(
+                    child_id(candidate, "stale"),
+                    "candidate.stale",
+                    json!({"candidate_id": candidate, "reason": "evidence_unrecoverable", "error": error}),
+                ));
+                events.push(event(
+                    child_id(candidate, "unrecoverable"),
+                    "integrity_violation",
+                    json!({"candidate_id": candidate, "reason": "evidence_unrecoverable", "error": error}),
+                ));
+            }
+        }
+    }
+    writer::write(
+        &tx,
+        &Commit {
+            events,
+            ..Commit::default()
+        },
+        ctx,
+    )?;
+    ctx.before_commit()?;
+    tx.commit().map_err(sqlite_error)
+}

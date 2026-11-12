@@ -163,6 +163,15 @@ enum Job {
         Box<super::completion::WriterCompletion>,
         oneshot::Sender<Result<super::completion::WriterCompleted, PersistError>>,
     ),
+    /// One recovery of a candidate's pending records ([`super::closing::record_recovery`]).
+    Recovery(
+        Box<(
+            String,
+            super::closing::RecoveryOutcome,
+            std::time::SystemTime,
+        )>,
+        oneshot::Sender<Result<(), PersistError>>,
+    ),
     /// A run's verification reconcile ([`super::closing::reconcile`]): its run and the candidates with pending records.
     VerificationReconcile(
         Box<(String, std::collections::BTreeSet<String>)>,
@@ -379,6 +388,7 @@ impl Job {
             Job::Request(..) => "Request",
             Job::VerifierCompletion(..) => "VerifierCompletion",
             Job::VerificationReconcile(..) => "VerificationReconcile",
+            Job::Recovery(..) => "Recovery",
             Job::Evidence(..) => "Evidence",
             Job::Plan(..) => "Plan",
             Job::Round(..) => "Round",
@@ -548,6 +558,16 @@ impl Writer {
                                 &ctx,
                                 reply,
                                 super::completion::complete(&mut conn, &job, &ctx),
+                            ));
+                        }
+                        Job::Recovery(job, reply) => {
+                            let (candidate, outcome, now) = *job;
+                            deferred = Some(answer(
+                                &ctx,
+                                reply,
+                                super::closing::record_recovery(
+                                    &mut conn, &candidate, &outcome, now, &ctx,
+                                ),
                             ));
                         }
                         Job::VerificationReconcile(job, reply) => {
@@ -792,6 +812,16 @@ impl Writer {
         completion: super::completion::WriterCompletion,
     ) -> Result<super::completion::WriterCompleted, PersistError> {
         self.submit(|tx| Job::Completion(Box::new(completion), tx))
+            .await
+    }
+
+    pub(super) async fn record_recovery(
+        &self,
+        candidate: String,
+        outcome: super::closing::RecoveryOutcome,
+        now: std::time::SystemTime,
+    ) -> Result<(), PersistError> {
+        self.submit(|tx| Job::Recovery(Box::new((candidate, outcome, now)), tx))
             .await
     }
 

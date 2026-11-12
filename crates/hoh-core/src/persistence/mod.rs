@@ -15,7 +15,7 @@ mod attempts;
 mod blockers;
 mod candidates;
 mod closing;
-pub use closing::Reconciled;
+pub use closing::{Reconciled, RecoveryOutcome};
 mod commands;
 mod completion;
 mod context;
@@ -1321,6 +1321,19 @@ impl Store {
         .map(drop)
     }
 
+    /// Record one recovery of candidate `candidate_id`'s pending check records at `now` (docs/adr/ADR-028.md decision
+    /// 11): how many it recorded, or its failure (permanent, and why).
+    pub async fn record_recovery(
+        &self,
+        candidate_id: &str,
+        outcome: RecoveryOutcome,
+        now: std::time::SystemTime,
+    ) -> Result<(), PersistError> {
+        self.writer
+            .record_recovery(candidate_id.to_owned(), outcome, now)
+            .await
+    }
+
     /// Run `run_id`'s verification reconcile (docs/adr/ADR-028.md decision 11): one transaction, idempotent; `pending`
     /// holds the candidates with check records still to be recorded (`.hoh/pending/`).
     pub async fn reconcile_verification(
@@ -1697,6 +1710,28 @@ impl Reader {
         package: &crate::protocol::ContextHandoff,
     ) -> Result<crate::context::Facts, PersistError> {
         context::verification(&self.conn, package)
+    }
+
+    /// Whether candidate `candidate_id`'s pending check records are to be recovered now (docs/adr/ADR-028.md decision
+    /// 11): it has a verification round not closed, it is VERIFYING, REJECTED or INVALID, and no persistent fact says it
+    /// was superseded (a later freeze listed it, or `candidate.stale`, an unrecoverable one's included).
+    pub fn recovery_due(&self, candidate_id: &str) -> Result<bool, PersistError> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM candidates c WHERE c.candidate_id = ?1 \
+                   AND c.state IN ('VERIFYING', 'REJECTED', 'INVALID')) \
+                 AND EXISTS(SELECT 1 FROM events o WHERE o.kind = 'verification.round_opened' \
+                   AND json_extract(o.payload_json, '$.candidate_id') = ?1 AND NOT EXISTS(SELECT 1 FROM events x \
+                     WHERE x.kind = 'verification.round_closed' \
+                     AND json_extract(x.payload_json, '$.round_id') = json_extract(o.payload_json, '$.round_id'))) \
+                 AND NOT EXISTS(SELECT 1 FROM events s WHERE s.kind = 'candidate.stale' \
+                   AND json_extract(s.payload_json, '$.candidate_id') = ?1) \
+                 AND NOT EXISTS(SELECT 1 FROM events f, json_each(f.payload_json, '$.superseded') v \
+                   WHERE f.kind = 'candidate.frozen' AND v.value = ?1)",
+                rusqlite::params![candidate_id],
+                |r| r.get(0),
+            )
+            .map_err(sqlite_error)
     }
 
     /// Task `task_id`'s project and run, if it exists.
