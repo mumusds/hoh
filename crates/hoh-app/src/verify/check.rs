@@ -566,7 +566,7 @@ pub async fn run(
                 .map_err(|e| CheckError::Io(format!("{}: {e}", record_dir.display())))?;
             // The record's lock, taken before the command runs and held to the commit: the finishing task never opens
             // a path the command could have written to lock its record (M2T10R-350).
-            let lock = lock_record(&record_dir, true)?
+            let lock = lock_record(&state, &record_id, true)?
                 .ok_or_else(|| CheckError::Io("the record's lock was not granted".to_owned()))?;
             Ok((record_id, record_dir, lock))
         })
@@ -1085,12 +1085,21 @@ fn judge(reader: &Reader, at: &Judged<'_>, facts: &Facts) -> Result<(Recording, 
     ))
 }
 
-/// The lock of the record directory `dir`: its finishing task holds it from its pending file to its commit, so a
-/// reconciliation never takes a record a live run is still recording (M2T10R-150); the lock goes with its holder,
-/// also when the process dies. Without `wait`, `None` when another holds it.
-fn lock_record(dir: &Path, wait: bool) -> Result<Option<std::fs::File>, CheckError> {
+/// The lock of record `record_id`, `.hoh/locks/<record_id>.lock`: its run holds it from before its command to its
+/// commit, so a reconciliation never takes a record a live run is still recording (M2T10R-150, -350, -400); the lock
+/// goes with its holder, also when the process dies. Without `wait`, `None` when another holds it.
+fn lock_record(
+    state: &Path,
+    record_id: &str,
+    wait: bool,
+) -> Result<Option<std::fs::File>, CheckError> {
     use rustix::fs::{FlockOperation, Mode, OFlags};
-    let path = dir.join(".lock");
+    // HoH's own state, outside the record directory the command writes beside: a command clearing what lies by its
+    // artifacts cannot remove it (M2T10R-400).
+    let locks = state.join("locks");
+    std::fs::create_dir_all(&locks)
+        .map_err(|e| CheckError::Io(format!("{}: {e}", locks.display())))?;
+    let path = locks.join(format!("{record_id}.lock"));
     let at = |e: std::io::Error| CheckError::Io(format!("{}: {e}", path.display()));
     // Opened without blocking and kept only as a regular file, before any lock is asked for (M2T10R-301).
     let fd = rustix::fs::open(
@@ -1209,7 +1218,7 @@ fn pending(
                 Err(e) => return Err(unreadable(e.to_string())),
                 Ok(_) => {}
             }
-            let Some(lock) = lock_record(&record_dir, false)? else {
+            let Some(lock) = lock_record(state, &record_id, false)? else {
                 continue;
             };
             if recorded()? {
