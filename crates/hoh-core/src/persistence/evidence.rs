@@ -155,13 +155,16 @@ pub(super) fn record(
         None => false,
     };
     let deferred = round.is_some() && !round_closed;
-    // Its round had a vetoed record when it closed invalidated (M2T16R-59: the close's own rule).
+    // Its round had a vetoed planned-check record, whatever its close's verdict (the close's own rule; implementation
+    // correction 4, M2T16R-59, -103).
     let invalidated = match &round {
         Some((round_id, _)) if round_closed => tx
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM events WHERE event_id = ?1 \
-                 AND json_extract(payload_json, '$.verdict') = 'invalidated')",
-                params![crate::ids::child_id(round_id, "closed")],
+                "SELECT EXISTS(SELECT 1 FROM evidence ev JOIN attempts a ON a.attempt_id = ev.attempt_id \
+                 JOIN events o ON o.kind = 'verification.round_opened' AND json_extract(o.payload_json, '$.round_id') = ?1 \
+                 AND a.task_id IN (json_extract(o.payload_json, '$.tasks.qa'), json_extract(o.payload_json, '$.tasks.reviewer')) \
+                 WHERE ev.kind = 'check' AND ev.outcome = 'INVALID')",
+                params![round_id],
                 |row| row.get::<_, bool>(0),
             )
             .map_err(sqlite_error)?,

@@ -221,10 +221,12 @@ pub(super) async fn check_at_reconcile(
 /// At the host's start (docs/adr/ADR-028.md decision 16): the run directories of project `project_id` under `runs`
 /// and the request directories in the project at `project` that no attempt of `live` uses, removed. Blocking.
 pub(super) fn remove_unused(project: &Path, runs: &Path, project_id: &str, live: &[String]) {
-    let kept: std::collections::BTreeSet<PathBuf> = live
+    // A live attempt's, and one a check still finishing reads (its attempt ended by a cancel, M2T16R-150).
+    let mut kept: std::collections::BTreeSet<PathBuf> = live
         .iter()
         .map(|a| rundir::dir_of(runs, project_id, a))
         .collect();
+    kept.extend(crate::verify::check::checkouts_in_flight());
     if let Some(own) = rundir::dir_of(runs, project_id, "-").parent() {
         for entry in std::fs::read_dir(own).into_iter().flatten().flatten() {
             if !kept.contains(&entry.path()) {
@@ -251,5 +253,28 @@ pub(super) fn remove_unused(project: &Path, runs: &Path, project_id: &str, live:
         {
             let _ = std::fs::remove_dir_all(&requests);
         }
+    }
+}
+
+#[cfg(test)]
+mod in_flight_tests {
+    use super::*;
+
+    #[test]
+    fn a_run_directory_whose_check_is_still_finishing_is_kept_until_it_ends() {
+        // M2T16R-150 (docs/adr/ADR-028.md decision 8, -158): an attempt ended (a cancel), but the check it started is
+        // still finishing in its run directory (its post-check reads the checkout): the per-tick removal keeps the
+        // directory until that check's finishing ends, then removes it.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (project, runs) = (dir.path().join("p"), dir.path().join("runs"));
+        let run = rundir::dir_of(&runs, "p1", "R/round/1/task/qa/attempt-1");
+        std::fs::create_dir_all(run.join("src")).expect("run dir");
+        std::fs::create_dir_all(project.join(".hoh/attempts")).expect("attempts");
+        let finishing = crate::verify::check::hold_checkout(&run);
+        remove_unused(&project, &runs, "p1", &[]);
+        assert!(run.exists(), "kept while its check finishes");
+        drop(finishing);
+        remove_unused(&project, &runs, "p1", &[]);
+        assert!(!run.exists(), "removed once it ended");
     }
 }

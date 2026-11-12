@@ -249,24 +249,28 @@ fn work(
     Ok(())
 }
 
-/// The Runtime's reasons for task `task_id`'s next attempt (`attempt_id` excluded): its previous attempt's protocol
-/// correction or verify-again, and a refreeze its candidate's loss asked for since its last completion; each bounded.
+/// The Runtime's reasons for task `task_id`'s next attempt (`attempt_id` excluded): the correction or verify-again not
+/// yet answered — the latest an attempt's end gave, kept across ends that gave no result (a start that failed, a
+/// transient failure, a cancel) and cleared by an accepted end (SETTLED with neither) — and a refreeze its candidate's
+/// loss asked for since its last completion; each bounded (implementation correction 4, M2T16R-07, -102).
 pub(super) fn corrections(
     conn: &Connection,
     task_id: &str,
     attempt_id: &str,
 ) -> Result<Vec<String>, PersistError> {
-    let previous: Option<String> = conn
-        .query_row(
-            "SELECT attempt_id FROM attempts WHERE task_id = ?1 AND attempt_id <> ?2 ORDER BY rowid DESC LIMIT 1",
-            params![task_id, attempt_id],
-            |r| r.get(0),
+    let mut statement = conn
+        .prepare(
+            "SELECT attempt_id, state FROM attempts WHERE task_id = ?1 AND attempt_id <> ?2 ORDER BY rowid",
         )
-        .optional()
         .map_err(sqlite_error)?;
-    let mut out = Vec::new();
+    let earlier: Vec<(String, String)> = statement
+        .query_map(params![task_id, attempt_id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(sqlite_error)?
+        .collect::<Result<_, _>>()
+        .map_err(sqlite_error)?;
     let bounded = |text: String| text.chars().take(2000).collect::<String>();
-    if let Some(previous) = previous {
+    let mut out: Vec<String> = Vec::new();
+    for (previous, state) in earlier {
         let mut statement = conn
             .prepare(
                 "SELECT kind, payload_json FROM events WHERE kind IN ('task.protocol_correction', 'task.reverify') \
@@ -279,27 +283,37 @@ pub(super) fn corrections(
             .map_err(sqlite_error)?
             .collect::<Result<_, _>>()
             .map_err(sqlite_error)?;
-        for (kind, payload) in rows {
-            let p: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
-            out.push(bounded(if kind == "task.protocol_correction" {
-                format!(
-                    "上一次 Attempt {previous} 的输出需要纠正：{}",
-                    p["reasons"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>()
-                        .join("；")
-                )
-            } else {
-                format!(
-                    "上一次 Attempt {previous} 以 {} 结束，需要重新验证：{}",
-                    p["status"].as_str().unwrap_or("?"),
-                    p["reason"].as_str().unwrap_or_default()
-                )
-            }));
+        if rows.is_empty() {
+            // An accepted end answers what was owed; any other end leaves it owed.
+            if state == "SETTLED" {
+                out.clear();
+            }
+            continue;
         }
+        out = rows
+            .into_iter()
+            .map(|(kind, payload)| {
+                let p: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
+                bounded(if kind == "task.protocol_correction" {
+                    format!(
+                        "上一次 Attempt {previous} 的输出需要纠正：{}",
+                        p["reasons"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join("；")
+                    )
+                } else {
+                    format!(
+                        "上一次 Attempt {previous} 以 {} 结束，需要重新验证：{}",
+                        p["status"].as_str().unwrap_or("?"),
+                        p["reason"].as_str().unwrap_or_default()
+                    )
+                })
+            })
+            .collect();
     }
     let superseded: Option<String> = conn
         .query_row(

@@ -620,6 +620,7 @@ pub async fn run_with(
             record_id,
             record_dir,
             lock,
+            _hold: hold_checkout(checkout),
             timeout,
             export,
             launch,
@@ -629,6 +630,43 @@ pub async fn run_with(
     let ran = finishing.await.map_err(blocking)?;
     drop(cancel);
     ran
+}
+
+/// The checkouts whose checks are still finishing in this process, by how many: a run directory one of them reads must
+/// outlive its attempt until they end (docs/adr/ADR-028.md decision 8, M2T16R-150).
+static IN_FLIGHT: std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, usize>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// A check finishing in `checkout`, held until dropped.
+pub(crate) struct CheckoutHold(std::path::PathBuf);
+
+impl Drop for CheckoutHold {
+    fn drop(&mut self) {
+        if let Ok(mut held) = IN_FLIGHT.lock()
+            && let Some(n) = held.get_mut(&self.0)
+        {
+            *n -= 1;
+            if *n == 0 {
+                held.remove(&self.0);
+            }
+        }
+    }
+}
+
+/// Hold `checkout` as read by a check still finishing (see [`CheckoutHold`]).
+pub(crate) fn hold_checkout(checkout: &Path) -> CheckoutHold {
+    if let Ok(mut held) = IN_FLIGHT.lock() {
+        *held.entry(checkout.to_owned()).or_insert(0) += 1;
+    }
+    CheckoutHold(checkout.to_owned())
+}
+
+/// The checkouts a check still finishing reads.
+pub(crate) fn checkouts_in_flight() -> std::collections::BTreeSet<std::path::PathBuf> {
+    IN_FLIGHT
+        .lock()
+        .map(|held| held.keys().cloned().collect())
+        .unwrap_or_default()
 }
 
 /// What the pre-phase hands the finishing task.
@@ -643,6 +681,8 @@ struct Finish {
     record_dir: std::path::PathBuf,
     /// The record's lock, held from before the command to the commit.
     lock: std::fs::File,
+    /// Its checkout held as read until the finishing ends (M2T16R-150).
+    _hold: CheckoutHold,
     timeout: f64,
     export: std::path::PathBuf,
     launch: Launch,
@@ -672,6 +712,7 @@ async fn finish(
         record_id,
         record_dir,
         lock,
+        _hold,
         timeout,
         export,
         launch,

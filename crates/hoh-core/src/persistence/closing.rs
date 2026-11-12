@@ -607,6 +607,38 @@ pub(super) fn reconcile(
                 });
             }
         }
+        // A superseded round's handoffs never taken are DEAD_LETTER, however its verifier tasks ended (a canceller's
+        // move included, decision 9, M2T16R-153).
+        if verdict == "superseded" {
+            for role in ["qa", "reviewer"] {
+                let original = child_id(&round.id, &format!("verify/{role}"));
+                let mut statement = tx
+                    .prepare(
+                        "SELECT message_id FROM outbox WHERE state IN ('PENDING', 'DELIVERING') AND (message_id = ?1 \
+                         OR message_id IN (SELECT json_extract(payload_json, '$.to') FROM events \
+                           WHERE kind = 'verification.handoff_reissued' AND json_extract(payload_json, '$.round_id') = ?2 \
+                           AND json_extract(payload_json, '$.role') = ?3))",
+                    )
+                    .map_err(sqlite_error)?;
+                let untaken: Vec<String> = statement
+                    .query_map(params![original, round.id, role], |r| r.get(0))
+                    .map_err(sqlite_error)?
+                    .collect::<Result<_, _>>()
+                    .map_err(sqlite_error)?;
+                for message in untaken {
+                    tx.execute(
+                        "UPDATE outbox SET state = 'DEAD_LETTER', last_error = 'superseded' WHERE message_id = ?1",
+                        params![message],
+                    )
+                    .map_err(sqlite_error)?;
+                    events.push(event(
+                        child_id(&message, "dead_letter"),
+                        "outbox.dead_letter",
+                        json!({"message_id": message, "recipient_role": role, "reason": "superseded"}),
+                    ));
+                }
+            }
+        }
         // Its handoffs (decision 9): ACCEPTED for a verifier whose result was COMPLETED (its task IMPLEMENTED or done),
         // REJECTED for the other, and for both when the round was superseded.
         for (role, task) in [("qa", &round.qa), ("reviewer", &round.reviewer)] {
@@ -799,11 +831,14 @@ fn classify_round(
             for (_, evidence_id, _, _, reason) in visible.iter().filter(|r| r.0 == "FAIL") {
                 tests.extend(failing_tests(tx, evidence_id, reason)?);
             }
-            let tests: Vec<String> = tests.into_iter().collect();
-            failed.push((
-                Some(ac.clone()),
-                named(&format!("ac-fail:{ac}"), &tests, ","),
-            ));
+            // One item per failing test (implementation correction 4, M2T16R-100): a test failing every round is the
+            // same item whatever fails beside it.
+            if tests.is_empty() {
+                failed.push((Some(ac.clone()), format!("ac-fail:{ac}")));
+            }
+            for test in tests {
+                failed.push((Some(ac.clone()), format!("ac-fail:{ac}:{test}")));
+            }
         }
         acs.push(projected);
     }
@@ -813,7 +848,12 @@ fn classify_round(
             let ac = row["ac_id"].as_str().unwrap_or_default();
             if row["status"] == json!("FAIL") && !round.scope.iter().any(|s| s == ac) {
                 let tests = failing_tests(tx, &e.id, row["reason"].as_str().unwrap_or_default())?;
-                failed.push((None, named(&format!("ac-fail:{ac}"), &tests, ",")));
+                if tests.is_empty() {
+                    failed.push((None, format!("ac-fail:{ac}")));
+                }
+                for test in tests {
+                    failed.push((None, format!("ac-fail:{ac}:{test}")));
+                }
             }
         }
         // A check's failure no FAIL row of it locates (a build, say): every source's (decision 12, M2T16R-05).

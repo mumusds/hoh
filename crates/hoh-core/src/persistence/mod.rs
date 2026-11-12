@@ -1863,7 +1863,7 @@ impl Reader {
             .prepare(
                 "SELECT DISTINCT r.run_id FROM runs r JOIN events o ON o.run_id = r.run_id \
                  AND o.kind = 'verification.round_opened' WHERE r.project_id = ?1 AND r.state = 'CANCELLED' \
-                 AND NOT EXISTS(SELECT 1 FROM events c WHERE c.kind = 'verification.round_closed' \
+                 AND NOT EXISTS(SELECT 1 FROM events c WHERE c.run_id = r.run_id AND c.kind = 'verification.round_closed' \
                    AND json_extract(c.payload_json, '$.round_id') = json_extract(o.payload_json, '$.round_id')) \
                  ORDER BY r.run_id",
             )
