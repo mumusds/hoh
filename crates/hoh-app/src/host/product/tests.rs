@@ -368,6 +368,12 @@ fn a_first_input_found_in_place_is_taken_only_once_its_directory_is_synced()
     };
     keep_first_input_with(project.path(), &start, &synced)?;
     assert_eq!(syncs.get(), 3, "a sync on every call");
+    // The package's object, the bytes whose digest its handoffs row names (docs/adr/ADR-028.md decision 9).
+    let bytes = hoh_core::persistence::package_bytes(&start.package)?;
+    assert_eq!(
+        hoh_core::objects::get(project.path(), &sha256_hex(&bytes))?,
+        bytes
+    );
     start.message_id = "R/another".to_owned();
     assert!(keep_first_input_with(project.path(), &start, &synced).is_err());
     Ok(())

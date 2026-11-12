@@ -2883,3 +2883,95 @@ async fn an_assignment_says_whether_its_task_writes() -> R {
     }
     Ok(())
 }
+
+/// The handoffs rows, `handoff_id:from_role:to_role:role_epoch:state`.
+fn handoff_rows(path: &PathBuf) -> R<Vec<String>> {
+    let conn = Connection::open(path)?;
+    let mut statement = conn.prepare(
+        "SELECT handoff_id || ':' || from_role || ':' || to_role || ':' || role_epoch || ':' || state FROM handoffs \
+         ORDER BY handoff_id",
+    )?;
+    let rows = statement
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<Vec<String>, _>>()?;
+    Ok(rows)
+}
+
+#[tokio::test]
+async fn a_handover_package_is_a_handoffs_row_prepared_delivered_then_accepted_once_its_first_turn_completed()
+-> R {
+    // docs/adr/ADR-028.md decision 9 (ADR-024, ADR-026 decision 6): the handover's transaction writes the row PREPARED,
+    // its package registered as an artifact of the package's own bytes; the executor taking the first input makes it
+    // DELIVERED; the session's first completed turn (the first input paid) ACCEPTED.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    let context = handed_over_developer(&store, &path).await?;
+    let message = crate::ids::child_id("R1", "session-start/developer/2");
+    assert_eq!(
+        handoff_rows(&path)?,
+        [format!("{message}:developer:developer:2:DELIVERED")]
+    );
+    // The package object's row: the bytes the notice carries, as [`super::super::handover::package_bytes`] gives them.
+    let conn = Connection::open(&path)?;
+    let (payload, sha, artifact_path): (String, String, String) = conn.query_row(
+        "SELECT o.payload_json, a.sha256, a.path FROM handoffs h JOIN artifacts a ON a.artifact_id = h.package_artifact_id \
+         JOIN outbox o ON o.message_id = h.handoff_id WHERE h.handoff_id = ?1",
+        rusqlite::params![message],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    let notice: serde_json::Value = serde_json::from_str(&payload)?;
+    let package: crate::protocol::ContextHandoff = crate::protocol::decode(&notice["package"])?;
+    let bytes = super::super::handover::package_bytes(&package)?;
+    let digest: String = <sha2::Sha256 as sha2::Digest>::digest(&bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(sha, digest);
+    assert_eq!(artifact_path, crate::objects::relative_path(&digest));
+    let first = store
+        .schedule_round("R1", context.clone())
+        .await?
+        .dispatched
+        .ok_or("T1 not dispatched")?;
+    turn_ends(&store, &path, &first.attempt_id, true, "thread-1").await?;
+    assert_eq!(
+        handoff_rows(&path)?,
+        [format!("{message}:developer:developer:2:ACCEPTED")]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_handover_package_whose_epoch_was_passed_before_delivery_is_rejected() -> R {
+    // docs/adr/ADR-028.md decision 9 (ADR-024 decision 4, M2T16D-259): the binding moved past the notice's epoch before
+    // the executor took it; the notice is superseded and its row REJECTED, from the old holder's role.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    working(&store, &path).await?;
+    store
+        .submit_command(team_change(
+            "dev",
+            0,
+            json!({"developer": {"agent": "codex"}}),
+        ))
+        .await?;
+    a0_ends(&path)?;
+    store
+        .team_checkpoint("R1", crate::persistence::Availability::default())
+        .await?;
+    let message = crate::ids::child_id("R1", "session-start/developer/2");
+    assert_eq!(
+        handoff_rows(&path)?,
+        [format!("{message}:developer:developer:2:PREPARED")]
+    );
+    exec(
+        &path,
+        "UPDATE role_bindings SET role_epoch = 3 WHERE run_id = 'R1' AND role = 'developer';",
+    )?;
+    assert!(store.supersede_session_start(&message).await?);
+    assert_eq!(
+        handoff_rows(&path)?,
+        [format!("{message}:developer:developer:2:REJECTED")]
+    );
+    Ok(())
+}

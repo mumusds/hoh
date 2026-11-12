@@ -45,7 +45,7 @@ pub use completion::{
 };
 pub use control::{CancelPass, Finished, PauseStep};
 pub use evidence::{AcceptanceRow, Recording};
-pub use handover::SessionStart;
+pub use handover::{SessionStart, package_bytes};
 pub use leases::{Grant, LEASE_TTL, LeaseView};
 pub use outbox::{ConsumeEffect, Consumed, OutboxRow, Settlement, backoff};
 pub use plan::Imported;

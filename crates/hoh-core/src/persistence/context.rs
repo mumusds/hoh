@@ -390,16 +390,23 @@ fn wake(
             0
         };
         let severity = field("severity");
-        let brief: BTreeMap<&str, Value> =
+        let mut brief: BTreeMap<&str, Value> =
             ["task_id", "attempt_id", "reason", "reason_code", "severity"]
                 .into_iter()
                 .filter_map(|k| Some((k, payload.get(k)?.clone())))
                 .collect();
+        let mut text = json!({"seq": seq, "kind": kind, "payload": payload});
+        // A change request's Issue is the Runtime's to rework once its round closes (docs/adr/ADR-028.md decision 13,
+        // M2T16D-355): said, so no repair of the Commander's own is planned for it.
+        if kind == "issue.opened" && field("source").as_deref() == Some("change_request") {
+            brief.insert("handling", json!(REWORKED_AFTER_ROUND));
+            text["handling"] = json!(REWORKED_AFTER_ROUND);
+        }
         facts.entries.push(Entry {
             class: Class::Evidence,
             kind: Kind::Plain,
             path: format!("events/{seq}"),
-            text: json!({"seq": seq, "kind": kind, "payload": payload}).to_string(),
+            text: text.to_string(),
             summary: Some(json!({"seq": seq, "kind": kind, "brief": brief}).to_string()),
             relevance: band(kind, severity.as_deref()) * 3 + causal,
             recency: seq,
@@ -408,6 +415,9 @@ fn wake(
     }
     Ok(())
 }
+
+/// How a wake shows a change request's Issue (docs/adr/ADR-028.md decision 13, M2T16D-355).
+const REWORKED_AFTER_ROUND: &str = "轮次关闭后由 Runtime 返工（不另建修复任务）";
 
 /// The task of each attempt the shown events name.
 fn attempt_tasks(

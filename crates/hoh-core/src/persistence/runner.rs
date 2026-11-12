@@ -1142,6 +1142,19 @@ pub(super) fn finished_in(
         events: prompt_events,
         ..Commit::default()
     };
+    // The session's first completed turn pays its first input: the handover package's row ACCEPTED
+    // (docs/adr/ADR-028.md decision 9).
+    if to == AttemptState::Settled {
+        tx.execute(
+            "UPDATE handoffs SET state = 'ACCEPTED' WHERE state = 'DELIVERED' AND handoff_id IN (\
+               SELECT r.message_id FROM receipts r JOIN outbox o ON o.message_id = r.message_id \
+               WHERE json_extract(o.payload_json, '$.kind') = 'session.start' \
+               AND json_extract(r.result_json, '$.session_id') = \
+                 (SELECT session_id FROM attempts WHERE attempt_id = ?1))",
+            params![attempt_id],
+        )
+        .map_err(sqlite_error)?;
+    }
     if to == AttemptState::Settled
         && let Some(native) = &ending.observed.native_session
     {
