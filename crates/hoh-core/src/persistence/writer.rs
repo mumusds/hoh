@@ -158,6 +158,11 @@ enum Job {
         Box<super::candidates::Freeze>,
         oneshot::Sender<Result<super::candidates::Frozen, PersistError>>,
     ),
+    /// A writer attempt's completion ([`super::completion::complete`]).
+    Completion(
+        Box<super::completion::WriterCompletion>,
+        oneshot::Sender<Result<super::completion::WriterCompleted, PersistError>>,
+    ),
     /// A run id and a plan for [`super::plan::import`].
     Plan(
         Box<(String, serde_json::Value)>,
@@ -355,6 +360,7 @@ impl Job {
             Job::Pragmas(..) => "Pragmas",
             Job::Outbox(..) => "Outbox",
             Job::Candidates(..) => "Candidates",
+            Job::Completion(..) => "Completion",
             Job::Evidence(..) => "Evidence",
             Job::Plan(..) => "Plan",
             Job::Round(..) => "Round",
@@ -517,6 +523,13 @@ impl Writer {
                                 &ctx,
                                 reply,
                                 super::candidates::freeze(&mut conn, &job, &ctx),
+                            ));
+                        }
+                        Job::Completion(job, reply) => {
+                            deferred = Some(answer(
+                                &ctx,
+                                reply,
+                                super::completion::complete(&mut conn, &job, &ctx),
                             ));
                         }
                         Job::Plan(request, reply) => {
@@ -731,6 +744,14 @@ impl Writer {
         freeze: super::candidates::Freeze,
     ) -> Result<super::candidates::Frozen, PersistError> {
         self.submit(|tx| Job::Candidates(Box::new(freeze), tx))
+            .await
+    }
+
+    pub(super) async fn complete_writer_attempt(
+        &self,
+        completion: super::completion::WriterCompletion,
+    ) -> Result<super::completion::WriterCompleted, PersistError> {
+        self.submit(|tx| Job::Completion(Box::new(completion), tx))
             .await
     }
 
