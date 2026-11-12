@@ -4,3 +4,4 @@
 pub mod check;
 pub mod environment;
 pub mod freeze;
+pub mod rundir;

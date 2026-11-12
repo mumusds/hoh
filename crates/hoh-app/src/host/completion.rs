@@ -17,7 +17,7 @@ use std::path::Path;
 
 /// The freeze's inputs by the project layout's convention until the specification's own location exists (decision 4;
 /// M3-T02 replaces them, CR-018): relative to the checkout.
-pub(super) fn inputs() -> Inputs {
+pub(crate) fn inputs() -> Inputs {
     Inputs {
         spec: "contracts/requirements.json".into(),
         environment: ".hoh/environment.json".into(),

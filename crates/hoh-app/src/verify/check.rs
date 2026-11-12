@@ -52,7 +52,7 @@ fn entries(out: &[u8]) -> Vec<String> {
 /// Every way the checkout `checkout` differs from the candidate manifest `m` (REQ-052 behaviours 4 and 5, failure
 /// modes 1, 3 and 4): its commit and tree, anything uncommitted, the tracked inventory, each source's bytes, and the
 /// specification, environment and test plan digests. The pre-check and the post-check are this one function.
-fn differences(checkout: &Path, m: &Manifest) -> Result<Vec<String>, CheckError> {
+pub(crate) fn differences(checkout: &Path, m: &Manifest) -> Result<Vec<String>, CheckError> {
     // The checkout: the candidate's commit, nothing uncommitted, every source as frozen (failure modes 1 and 4).
     let io = CheckError::Io;
     let mut reasons = Vec::new();
@@ -890,6 +890,172 @@ async fn finish(
     Ok(ran)
 }
 
+/// A verifier attempt's run directory found changed (docs/adr/ADR-028.md decision 8): what its attempt-level record
+/// says.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttemptChange {
+    pub candidate_id: String,
+    pub attempt_id: String,
+    /// The role's planned check: `independent-qa` or `independent-review`.
+    pub check_id: String,
+    pub tree_before: Value,
+    pub tree_after: Value,
+    pub reasons: Vec<String>,
+}
+
+/// The command an attempt-level record names: a marker that never runs and is no `hoh` subcommand (M2T16D-162).
+pub const ATTEMPT_MARKER: &str = "hoh-runtime:verification-attempt";
+
+/// Record `change` (docs/adr/ADR-028.md decision 8): an execution record of a fixed shape under
+/// `.hoh/evidence/<candidate>/<check>/<record>/` (the marker command, exit 1, `source_unchanged` false, empty stdout
+/// and stderr, no artifacts, the attempt as its producer), through the same pending facts, judgement and commit as a
+/// check's record, so principle one vetoes it (COMMAND_MISMATCH or CHECK_NOT_PLANNED, SOURCE_CHANGED) and the evidence's
+/// transaction makes the candidate INVALID with `integrity_violation`; a crash before the commit is recorded by the
+/// candidate's next reconciliation. `state` is the project's `.hoh/`.
+pub async fn record_attempt_change(
+    store: &hoh_core::persistence::Store,
+    state: &Path,
+    change: &AttemptChange,
+) -> Result<Ran, CheckError> {
+    let blocking = |e: tokio::task::JoinError| CheckError::Io(format!("the record stopped: {e}"));
+    let handle = store.evidence_handle();
+    // What a pending record of this candidate left is recorded first, as a check's run does (M2T10R-05).
+    reconcile(&handle, state, &change.candidate_id).await?;
+    let reader = handle.reader().map_err(CheckError::Store)?;
+    let (held, change) = (state.to_owned(), change.clone());
+    let (recording, ran, record_id, lock) = tokio::task::spawn_blocking(move || -> Result<_, CheckError> {
+        let state = held;
+        let io = |e: String| CheckError::Io(e);
+        let project = state
+            .parent()
+            .ok_or_else(|| io(format!("{} has no parent", state.display())))?
+            .to_owned();
+        let id = &change.candidate_id;
+        let row = reader
+            .candidate(id)
+            .map_err(CheckError::Store)?
+            .ok_or_else(|| io(format!("candidate {id} is not frozen in this project")))?;
+        let export_sha = row.source_path.rsplit('/').next().unwrap_or_default().to_owned();
+        let sealed = hoh_core::objects::get(&project, &export_sha)
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).map_err(|e| e.to_string()))
+            .and_then(|value| Sealed::from_value(&value))
+            .map_err(io)?;
+        let plan: Value = hoh_core::objects::get(&project, &sealed.manifest.test_plan.sha256)
+            .and_then(|b| serde_json::from_slice(&b).map_err(|e| e.to_string()))
+            .map_err(io)?;
+        let record_id = new_record_id();
+        let record_dir = state.join("evidence").join(id).join(&change.check_id).join(&record_id);
+        std::fs::create_dir_all(record_dir.join("artifacts"))
+            .map_err(|e| io(format!("{}: {e}", record_dir.display())))?;
+        let lock = lock_record(&state, &record_id, true)?
+            .ok_or_else(|| io("the record's lock was not granted".to_owned()))?;
+        let (stdout, stderr) = (record_dir.join("stdout.log"), record_dir.join("stderr.log"));
+        write_new(&stdout, b"")?;
+        write_new(&stderr, b"")?;
+        let file = |p: &Path| -> Result<FileRef, CheckError> {
+            Ok(FileRef {
+                path: relative_to(&project, p),
+                sha256: hoh_core::objects::hash_file(p).map_err(io)?.0,
+            })
+        };
+        let keep = |p: &Path, kind: &str, name: &str| -> Result<ArtifactRow, CheckError> {
+            let (sha256, bytes) = hoh_core::objects::put_file(&project, p).map_err(io)?;
+            Ok(ArtifactRow {
+                path: hoh_core::objects::relative_path(&sha256),
+                sha256,
+                bytes,
+                mime: "application/octet-stream".to_owned(),
+                kind: kind.to_owned(),
+                name: name.to_owned(),
+            })
+        };
+        let now = std::time::SystemTime::now();
+        let m = &sealed.manifest;
+        let record = Record {
+            schema_version: "1.1".to_owned(),
+            record_type: "command_execution".to_owned(),
+            record_id: record_id.clone(),
+            check_id: change.check_id.clone(),
+            candidate_id: sealed.candidate_id.clone(),
+            spec_sha256: m.spec.sha256.clone(),
+            mode: plan["checks"][&change.check_id]["mode"]
+                .as_str()
+                .unwrap_or("product")
+                .to_owned(),
+            command: vec![ATTEMPT_MARKER.to_owned(), change.attempt_id.clone()],
+            cwd: ".".to_owned(),
+            started_at: hoh_core::time::rfc3339_millis_utc(now),
+            finished_at: hoh_core::time::rfc3339_millis_utc(now),
+            duration_seconds: 0.0,
+            // Conventional: the record claims no success (decision 8).
+            exit_code: 1,
+            timed_out: false,
+            stdout: file(&stdout)?,
+            stderr: file(&stderr)?,
+            candidate_manifest: file(&project.join(&row.source_path))?,
+            source_unchanged: false,
+            environment_sha256: m.environment.sha256.clone(),
+            test_plan_sha256: m.test_plan.sha256.clone(),
+            artifacts: Vec::new(),
+            missing_artifacts: Vec::new(),
+            producer_attempt_id: change.attempt_id.clone(),
+            runner: Runner {
+                tool: "hoh".to_owned(),
+                euid: i64::from(rustix::process::geteuid().as_raw()),
+                boot_id: std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                    .ok()
+                    .map(|b| b.trim().to_owned()),
+            },
+        };
+        let bytes = serde_json::to_vec_pretty(&record).map_err(|e| io(e.to_string()))?;
+        let record_sha = hoh_core::objects::put(&project, &bytes).map_err(io)?;
+        let facts = Facts {
+            record_object: ArtifactRow {
+                path: hoh_core::objects::relative_path(&record_sha),
+                sha256: record_sha,
+                bytes: bytes.len() as u64,
+                mime: "application/octet-stream".to_owned(),
+                kind: "execution".to_owned(),
+                name: "execution.json".to_owned(),
+            },
+            objects: vec![
+                keep(&stdout, "stdout", "stdout.log")?,
+                keep(&stderr, "stderr", "stderr.log")?,
+            ],
+            tree_before: change.tree_before.clone(),
+            tree_after: change.tree_after.clone(),
+            integrity: change.reasons.clone(),
+            clock: serde_json::json!({"wall_finished_at": hoh_core::time::rfc3339_millis_utc(now),
+                "monotonic_seconds": 0.0}),
+            record,
+        };
+        // As a check's finish does, under the record's lock: the pending facts, the record file, the judgement.
+        let text = serde_json::to_vec_pretty(&facts).map_err(|e| io(e.to_string()))?;
+        write_new(&pending_path(&state, &record_id), &text)?;
+        write_new(&record_dir.join("execution.json"), &bytes)?;
+        let (recording, ran) = judge(
+            &reader,
+            &Judged {
+                project: &project,
+                state: &state,
+                sealed: &sealed,
+                run_id: &row.run_id,
+                record_dir: &record_dir,
+            },
+            &facts,
+        )?;
+        Ok((recording, ran, record_id, lock))
+    })
+    .await
+    .map_err(blocking)??;
+    handle
+        .record_evidence(recording)
+        .await
+        .map_err(CheckError::Store)?;
+    settle(state, &record_id, lock);
+    Ok(ran)
+}
+
 /// After record `record_id`'s commit: its pending facts and lock file are no longer kept (M2T10R-554). Safe for a
 /// reconciliation meanwhile, which passes over a recorded record before reading and again after locking.
 fn settle(state: &Path, record_id: &str, lock: std::fs::File) {
@@ -1009,7 +1175,7 @@ fn reclaim(dir: &Path, owned: &Owned) -> Result<Vec<String>, String> {
 }
 
 /// What a [`CheckError`] says.
-fn described(e: &CheckError) -> String {
+pub(crate) fn described(e: &CheckError) -> String {
     match e {
         CheckError::Refused(reasons) => reasons.join("; "),
         CheckError::Store(e) => e.to_string(),

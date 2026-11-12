@@ -2264,3 +2264,99 @@ async fn what_a_crash_between_commit_and_settling_left_is_swept() -> R {
     assert!(!lock.exists());
     Ok(())
 }
+
+/// [`PLAN`] with the reviewers' planned checks the attempt-level record names.
+const PLAN_WITH_INDEPENDENT: &str = r#"{"schema_version": "1.0", "plan_id": "fixture", "checks": {
+  "qa": {"mode": "product", "argv": ["bash", "qa.sh"], "artifacts": ["test-results.jsonl"], "timeout_seconds": 60},
+  "independent-qa": {"mode": "product", "argv": ["bash", "-c", "true"]}}}
+"#;
+
+#[tokio::test]
+async fn a_verifier_attempt_whose_run_directory_changed_is_recorded_invalid_by_its_marker_record()
+-> R {
+    // docs/adr/ADR-028.md decision 8: the attempt-level record of a run directory found changed: check
+    // independent-qa, command ["hoh-runtime:verification-attempt", <attempt>] (a marker, never executed), exit 1,
+    // source_unchanged false, empty stdout and stderr, no artifacts, both trees in evidence.recorded; valid under the
+    // locked execution schema; principle one vetoes it (COMMAND_MISMATCH, SOURCE_CHANGED), the candidate INVALID and
+    // integrity_violation in the evidence's transaction. A plan without the check: CHECK_NOT_PLANNED instead.
+    for (plan, mismatch) in [
+        (PLAN_WITH_INDEPENDENT, "COMMAND_MISMATCH"),
+        (PLAN, "CHECK_NOT_PLANNED"),
+    ] {
+        let f = Fixture::with(plan, QA_PASSES, Arc::new(NoFaults)).await?;
+        let c = f.frozen().await?;
+        let ran = hoh_app::verify::check::record_attempt_change(
+            &f.store,
+            &f.state(),
+            &hoh_app::verify::check::AttemptChange {
+                candidate_id: c.clone(),
+                attempt_id: "Q/attempt-1".to_owned(),
+                check_id: "independent-qa".to_owned(),
+                tree_before: serde_json::json!({"workspace_sha256": "a"}),
+                tree_after: serde_json::json!({"workspace_sha256": "b"}),
+                reasons: vec!["the run directory changed: src/lib.rs".to_owned()],
+            },
+        )
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+        let record = f.record(&ran)?;
+        assert_eq!(
+            record["command"],
+            serde_json::json!(["hoh-runtime:verification-attempt", "Q/attempt-1"])
+        );
+        assert_eq!(
+            (
+                record["exit_code"].as_i64(),
+                record["source_unchanged"].as_bool(),
+                record["artifacts"].as_array().map(Vec::len),
+                record["producer_attempt_id"].as_str()
+            ),
+            (Some(1), Some(false), Some(0), Some("Q/attempt-1"))
+        );
+        for log in ["stdout.log", "stderr.log"] {
+            assert_eq!(std::fs::read(ran.record_dir.join(log))?.len(), 0, "{log}");
+        }
+        let script = "import json,sys\nimport jsonschema\n\
+            if 'date-time' not in jsonschema.FormatChecker().checkers:\n    \
+                sys.exit('jsonschema cannot check date-time: install requirements-dev.txt')\n\
+            schema = json.load(open(sys.argv[1] + '/contracts/execution.schema.json'))\n\
+            jsonschema.validate(json.load(open(sys.argv[2])), schema, format_checker=jsonschema.FormatChecker())\n";
+        let out = Command::new("python3")
+            .args([
+                "-I",
+                "-c",
+                script,
+                concat!(env!("CARGO_MANIFEST_DIR"), "/../.."),
+            ])
+            .arg(ran.record_dir.join("execution.json"))
+            .output()?;
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(ran.outcome.status.code(), "INVALID");
+        assert!(
+            ran.reasons.contains(&mismatch) && ran.reasons.contains(&"SOURCE_CHANGED"),
+            "{mismatch}: {:?}",
+            ran.reasons
+        );
+        assert_eq!(
+            f.query("SELECT outcome || ':' || check_id || ':' || attempt_id FROM evidence")?,
+            ["INVALID:independent-qa:Q/attempt-1"]
+        );
+        assert_eq!(f.query("SELECT state FROM candidates")?, ["INVALID"]);
+        assert_eq!(
+            f.query("SELECT count(*) FROM events WHERE kind = 'integrity_violation'")?,
+            ["1"]
+        );
+        assert_eq!(
+            f.query(
+                "SELECT json_extract(payload_json, '$.tree_before.workspace_sha256') || json_extract(payload_json, \
+                 '$.tree_after.workspace_sha256') FROM events WHERE kind = 'evidence.recorded'"
+            )?,
+            ["ab"]
+        );
+    }
+    Ok(())
+}
