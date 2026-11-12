@@ -2,4 +2,5 @@
 //! and check drivers over git, the files and the store.
 
 pub mod check;
+pub mod environment;
 pub mod freeze;
