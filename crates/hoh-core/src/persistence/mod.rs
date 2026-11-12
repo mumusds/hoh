@@ -1331,7 +1331,20 @@ impl Store {
         now: std::time::SystemTime,
     ) -> Result<(), PersistError> {
         self.writer
-            .record_recovery(candidate_id.to_owned(), outcome, now)
+            .record_recovery(candidate_id.to_owned(), outcome, now, false)
+            .await
+    }
+
+    /// Record candidate `candidate_id`'s recovery at the host's start (docs/adr/ADR-028.md decision 16): counted as a
+    /// tick's; a failure also wakes the Commander unless the candidate was superseded, whose failure is never judged.
+    pub async fn record_start_recovery(
+        &self,
+        candidate_id: &str,
+        outcome: RecoveryOutcome,
+        now: std::time::SystemTime,
+    ) -> Result<(), PersistError> {
+        self.writer
+            .record_recovery(candidate_id.to_owned(), outcome, now, true)
             .await
     }
 
@@ -1719,6 +1732,57 @@ impl Reader {
     /// it took, its rejected candidate, those failures and the candidate's open Issues; none if none was taken.
     pub fn rework_context(&self, task_id: &str) -> Result<Option<ReworkContext>, PersistError> {
         context::rework(&self.conn, task_id)
+    }
+
+    /// The candidates whose last recovery failed and none succeeded since, not judged unrecoverable: held until one
+    /// does, so each tick tries them again whether or not they still have pending records (docs/adr/ADR-028.md
+    /// decisions 11 and 16).
+    pub fn unrecovered_candidates(
+        &self,
+    ) -> Result<std::collections::BTreeSet<String>, PersistError> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT json_extract(f.payload_json, '$.candidate_id') FROM events f \
+                 WHERE f.kind = 'candidate.reconcile_failed' \
+                 AND f.seq > coalesce((SELECT max(r.seq) FROM events r WHERE r.kind = 'candidate.reconcile_recovered' \
+                   AND json_extract(r.payload_json, '$.candidate_id') = json_extract(f.payload_json, '$.candidate_id')), 0) \
+                 AND NOT EXISTS(SELECT 1 FROM events s WHERE s.kind = 'candidate.stale' \
+                   AND json_extract(s.payload_json, '$.reason') = 'evidence_unrecoverable' \
+                   AND json_extract(s.payload_json, '$.candidate_id') = json_extract(f.payload_json, '$.candidate_id'))",
+            )
+            .map_err(sqlite_error)?;
+        let rows = statement
+            .query_map([], |r| r.get(0))
+            .map_err(sqlite_error)?;
+        rows.collect::<Result<_, _>>().map_err(sqlite_error)
+    }
+
+    /// Whether candidate `candidate_id`'s records are recovered at the host's start (docs/adr/ADR-028.md decision 16):
+    /// it is frozen here and was not judged unrecoverable (its pending facts are kept for audit only, -1252).
+    pub fn start_recovery_wanted(&self, candidate_id: &str) -> Result<bool, PersistError> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM candidates WHERE candidate_id = ?1) \
+                 AND NOT EXISTS(SELECT 1 FROM events WHERE kind = 'candidate.stale' \
+                   AND json_extract(payload_json, '$.reason') = 'evidence_unrecoverable' \
+                   AND json_extract(payload_json, '$.candidate_id') = ?1)",
+                rusqlite::params![candidate_id],
+                |r| r.get(0),
+            )
+            .map_err(sqlite_error)
+    }
+
+    /// The attempts still live (PREPARED, STARTING or RUNNING): whose run directories and requests are kept.
+    pub fn live_attempts(&self) -> Result<Vec<String>, PersistError> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT attempt_id FROM attempts WHERE state IN ('PREPARED', 'STARTING', 'RUNNING')")
+            .map_err(sqlite_error)?;
+        let rows = statement
+            .query_map([], |r| r.get(0))
+            .map_err(sqlite_error)?;
+        rows.collect::<Result<_, _>>().map_err(sqlite_error)
     }
 
     /// Whether candidate `candidate_id`'s pending check records are to be recovered now (docs/adr/ADR-028.md decision

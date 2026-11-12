@@ -320,6 +320,12 @@ pub(super) async fn run(
         .map(|registry| tokio::spawn(registry_watch(registry, stop.clone())));
     let mut renewed = Instant::now();
     let mut held_back: BTreeMap<String, (Instant, String)> = BTreeMap::new();
+    // Before the first tick: the candidates' records recovered, what no live attempt uses removed, one round sweep
+    // (docs/adr/ADR-028.md decision 16); none of it stops the host.
+    if let Err(e) = verification_start(&common).await {
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), "hoh host: the verification start: {e}");
+    }
     loop {
         if *stop.borrow() {
             break;
@@ -356,6 +362,78 @@ pub(super) async fn run(
         task.abort();
         let _ = task.await;
     }
+}
+
+/// A recovery's outcome as decision 11 records it: what trying again cannot make good (damaged facts, a record that
+/// is not the candidate's) is permanent.
+fn recovery_outcome(
+    recovered: Result<usize, crate::verify::check::CheckError>,
+) -> hoh_core::persistence::RecoveryOutcome {
+    use crate::verify::check::CheckError;
+    recovered.map_err(|e| {
+        let permanent = matches!(e, CheckError::Damaged(_) | CheckError::Refused(_));
+        (permanent, crate::verify::check::described(&e))
+    })
+}
+
+/// The host's start for verification (docs/adr/ADR-028.md decision 16), before the first tick: every candidate with a
+/// record directory, frozen here and not judged unrecoverable, recovered once and recorded (a failure wakes the
+/// Commander unless the candidate was superseded, and holds its verifiers); the run directories and request
+/// directories of no live attempt removed; then one round sweep.
+async fn verification_start(common: &Common) -> Result<(), PersistError> {
+    let store = &common.shared.store;
+    let state = common.shared.root.join(".hoh");
+    let evidence = state.join("evidence");
+    let recorded: Vec<String> = tokio::task::spawn_blocking(move || {
+        std::fs::read_dir(evidence)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect()
+    })
+    .await
+    .unwrap_or_default();
+    let handle = store.evidence_handle();
+    for candidate in &recorded {
+        let reader = store.reader()?;
+        let id = candidate.clone();
+        let wanted = tokio::task::spawn_blocking(move || reader.start_recovery_wanted(&id))
+            .await
+            .map_err(|e| PersistError::Storage(format!("the start's look-up ended: {e}")))??;
+        if !wanted {
+            continue;
+        }
+        let outcome =
+            recovery_outcome(crate::verify::check::reconcile(&handle, &state, candidate).await);
+        store
+            .record_start_recovery(candidate, outcome, common.clock.now())
+            .await?;
+    }
+    let reader = store.reader()?;
+    let live = tokio::task::spawn_blocking(move || reader.live_attempts())
+        .await
+        .map_err(|e| PersistError::Storage(format!("the start's look-up ended: {e}")))??;
+    let (root, runs, project_id) = (
+        common.shared.root.clone(),
+        common.runs.clone(),
+        common.shared.project_id.clone(),
+    );
+    let _ = tokio::task::spawn_blocking(move || {
+        super::verifying::remove_unused(&root, &runs, &project_id, &live);
+    })
+    .await;
+    let waiting = store.runner_waiting(&common.shared.project_id).await?;
+    let held = common.shared.root.join(".hoh");
+    let pending =
+        tokio::task::spawn_blocking(move || crate::verify::check::pending_candidates(&held))
+            .await
+            .unwrap_or_default();
+    for run in waiting.runs.iter().chain(&waiting.pausing) {
+        store.reconcile_verification(run, pending.clone()).await?;
+    }
+    Ok(())
 }
 
 /// The registry's own loop (docs/adr/ADR-022.md decision 10): every tick it looks at the agents the runner wants, off
@@ -522,10 +600,15 @@ async fn tick(
         tokio::task::spawn_blocking(move || crate::verify::check::pending_candidates(&state))
             .await
             .unwrap_or_default();
-    // The pending records of a candidate still under a round are recovered first; each failure is recorded and judged
-    // (a permanent one at once, transient ones after 3 over 10 minutes, decision 11).
+    // The pending records of a candidate still under a round are recovered first, and a candidate held by a failed
+    // recovery is tried again even with none left; each failure is recorded and judged (a permanent one at once,
+    // transient ones after 3 over 10 minutes, decisions 11 and 16).
     let handle = store.evidence_handle();
-    for candidate in &pending {
+    let reader = store.reader()?;
+    let unrecovered = tokio::task::spawn_blocking(move || reader.unrecovered_candidates())
+        .await
+        .map_err(|e| PersistError::Storage(format!("the recovery's look-up ended: {e}")))??;
+    for candidate in pending.union(&unrecovered) {
         let reader = store.reader()?;
         let id = candidate.clone();
         let due = tokio::task::spawn_blocking(move || reader.recovery_due(&id))
@@ -534,17 +617,10 @@ async fn tick(
         if !due {
             continue;
         }
-        let outcome =
+        let outcome = recovery_outcome(
             crate::verify::check::reconcile(&handle, &common.shared.root.join(".hoh"), candidate)
-                .await
-                .map_err(|e| {
-                    let permanent = matches!(
-                        e,
-                        crate::verify::check::CheckError::Damaged(_)
-                            | crate::verify::check::CheckError::Refused(_)
-                    );
-                    (permanent, crate::verify::check::described(&e))
-                });
+                .await,
+        );
         store
             .record_recovery(candidate, outcome, common.clock.now())
             .await?;

@@ -89,8 +89,11 @@ pub(super) fn round(
     let held = super::verification::held_by_open_rounds(&tx, run_id)?;
     // Nor a task whose refused repair waits for its decision, whatever would dispatch it (decision 12, M2T16D-853).
     let refused = super::verification::refused(&tx, run_id)?;
+    // Nor a verifier of a candidate whose pending records failed to recover (decision 16).
+    let recovering = super::closing::held_by_recovery(&tx, run_id)?;
     rows.retain(|r| {
-        !held.contains(&r.candidate.task_id) && !refused.contains(&r.candidate.task_id)
+        let task = &r.candidate.task_id;
+        !held.contains(task) && !refused.contains(task) && !recovering.contains(task)
     });
     if retries_only {
         rows.retain(|r| {

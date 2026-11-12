@@ -59,6 +59,9 @@ const STATE_PATHS: &[&str] = &[
     "host.log",
     "host.sock",
     "input-history.jsonl",
+    // A verification's writes (docs/adr/ADR-028.md decision 17).
+    "environment.json",
+    "self-tests",
 ];
 
 /// What a freeze keeps before its one store transaction.
@@ -146,6 +149,10 @@ const NESTED: &[&str] = &[
     "attempts/ATTEMPT/stdout.jsonl",
     "sessions/SESSION/notes.md",
     "first-inputs/INPUT.json",
+    "self-tests/ATTEMPT/report.txt",
+    "attempts/ATTEMPT/requests/1.json",
+    "attempts/ATTEMPT/run-check",
+    "attempts/ATTEMPT/ask",
 ];
 
 /// Every way HoH's own state under `state` is visible to git in the checkout `checkout` (docs/adr/ADR-027.md decision 3):

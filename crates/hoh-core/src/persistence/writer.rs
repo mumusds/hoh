@@ -169,6 +169,7 @@ enum Job {
             String,
             super::closing::RecoveryOutcome,
             std::time::SystemTime,
+            bool,
         )>,
         oneshot::Sender<Result<(), PersistError>>,
     ),
@@ -561,12 +562,12 @@ impl Writer {
                             ));
                         }
                         Job::Recovery(job, reply) => {
-                            let (candidate, outcome, now) = *job;
+                            let (candidate, outcome, now, at_start) = *job;
                             deferred = Some(answer(
                                 &ctx,
                                 reply,
                                 super::closing::record_recovery(
-                                    &mut conn, &candidate, &outcome, now, &ctx,
+                                    &mut conn, &candidate, &outcome, now, at_start, &ctx,
                                 ),
                             ));
                         }
@@ -820,8 +821,9 @@ impl Writer {
         candidate: String,
         outcome: super::closing::RecoveryOutcome,
         now: std::time::SystemTime,
+        at_start: bool,
     ) -> Result<(), PersistError> {
-        self.submit(|tx| Job::Recovery(Box::new((candidate, outcome, now)), tx))
+        self.submit(|tx| Job::Recovery(Box::new((candidate, outcome, now, at_start)), tx))
             .await
     }
 

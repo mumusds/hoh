@@ -195,3 +195,39 @@ pub(super) async fn check_at_reconcile(
         .await?;
     Ok(Some(dir))
 }
+
+/// At the host's start (docs/adr/ADR-028.md decision 16): the run directories of project `project_id` under `runs`
+/// and the request directories in the project at `project` that no attempt of `live` uses, removed. Blocking.
+pub(super) fn remove_unused(project: &Path, runs: &Path, project_id: &str, live: &[String]) {
+    let kept: std::collections::BTreeSet<PathBuf> = live
+        .iter()
+        .map(|a| rundir::dir_of(runs, project_id, a))
+        .collect();
+    if let Some(own) = rundir::dir_of(runs, project_id, "-").parent() {
+        for entry in std::fs::read_dir(own).into_iter().flatten().flatten() {
+            if !kept.contains(&entry.path()) {
+                rundir::remove(&entry.path());
+            }
+        }
+    }
+    let used: std::collections::BTreeSet<PathBuf> = live
+        .iter()
+        .filter_map(|a| {
+            super::product::bridge_of(project, a)
+                .parent()
+                .map(|d| d.join("requests"))
+        })
+        .collect();
+    for entry in std::fs::read_dir(project.join(".hoh/attempts"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let requests = entry.path().join("requests");
+        if !used.contains(&requests)
+            && std::fs::symlink_metadata(&requests).is_ok_and(|m| m.is_dir())
+        {
+            let _ = std::fs::remove_dir_all(&requests);
+        }
+    }
+}

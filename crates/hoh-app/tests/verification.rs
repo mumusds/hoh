@@ -639,6 +639,37 @@ async fn hohs_own_state_must_be_ignored_and_untracked_and_its_environment_may_li
 }
 
 #[tokio::test]
+async fn the_guard_names_the_paths_verification_writes_under_hohs_state() -> R {
+    // docs/adr/ADR-028.md decision 17: the environment description, the self-test records and a verifier's request
+    // directory and helpers are HoH's writes too; each one a .hoh/.gitignore lets git see is refused by name.
+    for (included, named) in [
+        ("!environment.json", ".hoh/environment.json"),
+        ("!self-tests/\n!self-tests/**", ".hoh/self-tests"),
+        (
+            "!attempts/\n!attempts/*/\n!attempts/*/requests/\n!attempts/*/requests/**",
+            ".hoh/attempts/ATTEMPT/requests",
+        ),
+        (
+            "!attempts/\n!attempts/*/\n!attempts/*/run-check",
+            ".hoh/attempts/ATTEMPT/run-check",
+        ),
+        (
+            "!attempts/\n!attempts/*/\n!attempts/*/ask",
+            ".hoh/attempts/ATTEMPT/ask",
+        ),
+    ] {
+        let f = Fixture::new().await?;
+        std::fs::write(f.state().join(".gitignore"), format!("*\n{included}\n"))?;
+        let reasons = refused(f.freeze("R").await)?;
+        assert!(
+            reasons.iter().any(|r| r.contains(named)),
+            "{named}: {reasons:?}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn the_same_content_for_another_run_is_refused_by_the_store() -> R {
     // CR-017 (REQ-052 decision 1 within one run; docs/adr/ADR-027.md decision 5).
     let f = Fixture::new().await?;

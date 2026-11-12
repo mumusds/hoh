@@ -2050,3 +2050,110 @@ async fn a_candidates_unrecoverable_evidence_is_judged_permanent_at_once_transie
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn a_failed_recovery_at_the_hosts_start_wakes_the_commander_unless_its_candidate_was_superseded()
+-> R {
+    // docs/adr/ADR-028.md decision 16 (M2T16D-1150, -1201): at the host's start a candidate's failed recovery is
+    // counted as decision 11's and, the candidate not superseded, written with integrity_violation; a superseded
+    // candidate's failure is only its reconcile_failed (its results are history), never judged.
+    let t0 = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    verifying(&store).await?;
+    let candidate = texts(&path, "SELECT candidate_id FROM candidates")?.remove(0);
+    store
+        .record_start_recovery(&candidate, Err((false, "EIO".to_owned())), t0)
+        .await?;
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT json_extract(payload_json, '$.attempt') || ':' || json_extract(payload_json, '$.kind') \
+             FROM events WHERE kind = 'candidate.reconcile_failed'"
+        )?,
+        ["1:transient"]
+    );
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT json_extract(payload_json, '$.reason') FROM events WHERE kind = 'integrity_violation'"
+        )?,
+        ["reconcile_failed_at_start"]
+    );
+    assert_eq!(texts(&path, "SELECT state FROM candidates")?, ["VERIFYING"]);
+    // Superseded since (a persistent fact): a permanent fault is only recorded.
+    Connection::open(&path)?.execute(
+        "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) \
+         SELECT project_id, 'stale-spec', 'R', 'candidate.stale', \
+         json_object('candidate_id', ?1, 'reason', 'spec_changed'), '2026-11-12T00:00:00Z' FROM runs WHERE run_id = 'R'",
+        rusqlite::params![candidate],
+    )?;
+    store
+        .record_start_recovery(&candidate, Err((true, "damaged".to_owned())), t0)
+        .await?;
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT kind FROM events WHERE kind = 'candidate.reconcile_failed'"
+        )?
+        .len(),
+        2
+    );
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT kind FROM events WHERE kind = 'integrity_violation'"
+        )?
+        .len(),
+        1,
+        "no wake for a superseded candidate"
+    );
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT json_extract(payload_json, '$.reason') FROM events WHERE kind = 'candidate.stale'"
+        )?,
+        ["spec_changed"],
+        "never judged"
+    );
+    assert_eq!(texts(&path, "SELECT state FROM candidates")?, ["VERIFYING"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_candidate_whose_pending_records_failed_to_recover_has_its_verifiers_held_until_they_do()
+-> R {
+    // docs/adr/ADR-028.md decision 16: a candidate whose last recovery failed is held — its round's verifier tasks
+    // stay READY, not dispatched — until a recovery succeeds.
+    let t0 = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    let round = verifying(&store).await?;
+    let candidate = texts(&path, "SELECT candidate_id FROM candidates")?.remove(0);
+    store
+        .record_start_recovery(&candidate, Err((false, "EIO".to_owned())), t0)
+        .await?;
+    assert_eq!(
+        store.schedule_round("R", verifiers()).await?.dispatched,
+        None
+    );
+    let id = |suffix: &str| crate::ids::child_id(&round, suffix);
+    assert_eq!(
+        texts(
+            &path,
+            &format!(
+                "SELECT state FROM tasks WHERE task_id IN ('{}', '{}')",
+                id("task/qa"),
+                id("task/reviewer")
+            )
+        )?,
+        ["READY", "READY"]
+    );
+    store.record_recovery(&candidate, Ok(1), t0).await?;
+    let mut dispatched = Vec::new();
+    while let Some(d) = store.schedule_round("R", verifiers()).await?.dispatched {
+        dispatched.push(d.task_id);
+    }
+    assert_eq!(dispatched, [id("task/qa"), id("task/reviewer")]);
+    Ok(())
+}

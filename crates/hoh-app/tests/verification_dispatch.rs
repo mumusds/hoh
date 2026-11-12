@@ -1286,3 +1286,107 @@ async fn a_damaged_pending_record_makes_its_candidate_stale_and_its_round_supers
     host.shutdown().await;
     outcome
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn at_the_hosts_start_a_failed_recovery_wakes_the_commander_and_holds_its_verifiers_and_unused_dirs_go()
+-> R {
+    // docs/adr/ADR-028.md decision 16: a host stops while C1's verifiers run. Before the next starts, C1's record
+    // directory gets a pending record its listing cannot read (a transient fault), and a run directory and a request
+    // directory of no attempt appear. At its start, before its first tick: C1's recovery fails, recorded with
+    // integrity_violation (the Commander woken); C1's verifier tasks are not dispatched while it is held; the unused
+    // directories are gone. Once a recovery succeeds, C1's verifiers are dispatched again.
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir()?;
+    let (project, spec) = project(dir.path()).await?;
+    seed(&project, &world(&spec))?;
+    let clock = Arc::new(FakeClock::default());
+    let team = Arc::new(Team::new(Commander::Answers, &spec, &project));
+    let step = Duration::from_millis(100);
+    let first = host(&project, team.clone(), clock.clone()).await?;
+    let started = async {
+        wait_for(&project, &clock, step, VERIFIERS, &|r| {
+            r.as_array().is_some_and(|a| a.len() == 2)
+        })?;
+        R::Ok(candidate(&project)?.0)
+    }
+    .await;
+    first.shutdown().await;
+    let id = started?;
+    let project_id = rows(&project, "SELECT project_id FROM projects")?[0]["project_id"]
+        .as_str()
+        .ok_or("no project")?
+        .to_owned();
+    let component = |id: &str| id.replace('%', "%25").replace('/', "%2F");
+    let unused_run = dir
+        .path()
+        .join("state/hoh/runs")
+        .join(component(&project_id))
+        .join(component("gone/attempt-1"));
+    std::fs::create_dir_all(unused_run.join("src"))?;
+    let unused_requests = project.join(format!(
+        ".hoh/attempts/{}/requests",
+        component("gone/attempt-1")
+    ));
+    std::fs::create_dir_all(&unused_requests)?;
+    std::fs::write(
+        unused_requests.join("1.json"),
+        "{\"kind\":\"check\",\"check_id\":\"unit\"}\n",
+    )?;
+    let record = "00000000-0000-4000-8000-000000000002";
+    let check_dir = project.join(format!(".hoh/evidence/{id}/unit"));
+    std::fs::create_dir_all(check_dir.join(record))?;
+    std::fs::create_dir_all(project.join(".hoh/pending"))?;
+    std::fs::write(
+        project.join(format!(".hoh/pending/{record}.json")),
+        json!({"record": {"candidate_id": id}}).to_string(),
+    )?;
+    std::fs::set_permissions(&check_dir, std::fs::Permissions::from_mode(0o000))?;
+    let second = host(&project, team.clone(), clock.clone()).await;
+    let outcome = async {
+        let second = second.as_ref().map_err(|e| e.to_string())?;
+        let woken = wait_for(
+            &project,
+            &clock,
+            step,
+            "SELECT json_extract(payload_json, '$.reason') AS reason FROM events WHERE kind = 'integrity_violation'",
+            &|r| r.as_array().is_some_and(|a| !a.is_empty()),
+        )?;
+        assert_eq!(woken, json!([{"reason": "reconcile_failed_at_start"}]));
+        assert!(!unused_run.exists(), "{}", unused_run.display());
+        assert!(!unused_requests.exists(), "{}", unused_requests.display());
+        // Held: a few ticks, and no verifier attempt beyond the first host's.
+        for _ in 0..10 {
+            clock.advance(step);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(
+            rows(&project, "SELECT count(*) AS n FROM attempts a JOIN tasks t ON t.task_id = a.task_id WHERE t.role IN ('qa', 'reviewer')")?,
+            json!([{"n": 2}])
+        );
+        let failed = rows(&project, "SELECT count(*) AS n FROM events WHERE kind = 'candidate.reconcile_failed'")?;
+        assert!(failed[0]["n"].as_i64().is_some_and(|n| n >= 1), "{failed}");
+        // The fault goes (the record is put aside): the next recovery succeeds and the verifiers go on.
+        std::fs::set_permissions(&check_dir, std::fs::Permissions::from_mode(0o755))?;
+        std::fs::remove_file(project.join(format!(".hoh/pending/{record}.json")))?;
+        std::fs::remove_dir_all(check_dir.join(record))?;
+        wait_for(&project, &clock, step, "SELECT count(*) AS n FROM events WHERE kind = 'candidate.reconcile_recovered'", &|r| {
+            r[0]["n"] == json!(1)
+        })?;
+        wait_for(
+            &project,
+            &clock,
+            step,
+            "SELECT count(*) AS n FROM attempts a JOIN tasks t ON t.task_id = a.task_id WHERE t.role IN ('qa', 'reviewer')",
+            &|r| r[0]["n"].as_i64().is_some_and(|n| n > 2),
+        )?;
+        let _ = second;
+        R::Ok(())
+    }
+    .await;
+    let _ = std::fs::set_permissions(&check_dir, std::fs::Permissions::from_mode(0o755));
+    if let Ok(second) = second {
+        team.release.store(true, Ordering::SeqCst);
+        second.shutdown().await;
+    }
+    outcome
+}
