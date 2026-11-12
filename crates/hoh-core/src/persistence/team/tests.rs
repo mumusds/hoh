@@ -2837,3 +2837,47 @@ async fn a_started_run_freezes_its_supervision_policy_in_its_snapshot() -> R {
     assert_eq!(snapshot, "intensive");
     Ok(())
 }
+
+#[tokio::test]
+async fn an_assignment_says_whether_its_task_writes() -> R {
+    // docs/adr/ADR-028.md decision 4: the runner routes a successful writer attempt to its completion commit, so the
+    // assignment it is dispatched with carries the task's writer flag.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    let context = handed_over_developer(&store, &path).await?;
+    // Only the tasks under test are eligible.
+    exec(
+        &path,
+        "UPDATE tasks SET state = 'CANCELLED' WHERE state IN ('READY', 'PENDING');",
+    )?;
+    for (task, seq, writer) in [("W1", 20, 1), ("W2", 21, 0)] {
+        ready_task(&path, task, seq)?;
+        exec(
+            &path,
+            &format!("UPDATE tasks SET writer = {writer} WHERE task_id = '{task}';"),
+        )?;
+        let d = store
+            .schedule_round("R1", context.clone())
+            .await?
+            .dispatched
+            .ok_or_else(|| format!("{task} not dispatched"))?;
+        let assignment = super::assignment(
+            &Connection::open(&path)?,
+            "p1",
+            "R1",
+            &d.task_id,
+            &d.attempt_id,
+            "developer",
+        )?;
+        assert_eq!((d.task_id.as_str(), assignment.writer), (task, writer == 1));
+        exec(
+            &path,
+            &format!(
+                "UPDATE attempts SET state = 'SETTLED', ended_at = '2026-11-10T00:02:00Z' WHERE attempt_id = '{}';
+                 DELETE FROM leases WHERE attempt_id = '{}';",
+                d.attempt_id, d.attempt_id
+            ),
+        )?;
+    }
+    Ok(())
+}

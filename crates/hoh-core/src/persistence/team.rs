@@ -813,6 +813,9 @@ pub struct Assignment {
     pub supervision: Option<crate::persistence::Supervision>,
     /// What its context is packed from (docs/adr/ADR-026.md decision 3); none from a store too old to say.
     pub context: Option<crate::context::Facts>,
+    /// Its task holds the write lease: a successful attempt ends through its completion commit (docs/adr/ADR-028.md
+    /// decision 4).
+    pub writer: bool,
 }
 
 /// The assignment of attempt `attempt_id` of task `task_id` in run `run_id` (project `project_id`), `role`.
@@ -837,7 +840,8 @@ pub(super) fn assignment(
               ORDER BY e.seq LIMIT 1), \
              (SELECT json_extract(j.value, '$.title') FROM events e, json_each(json_extract(e.payload_json, '$.tasks')) j \
               WHERE e.run_id = ?2 AND e.kind = 'plan.imported' AND json_extract(j.value, '$.task_id') = ?3 \
-              ORDER BY e.seq DESC LIMIT 1) \
+              ORDER BY e.seq DESC LIMIT 1), \
+             (SELECT t.writer FROM tasks t WHERE t.task_id = ?3) \
              FROM attempts a LEFT JOIN sessions s ON s.session_id = a.session_id \
              LEFT JOIN role_bindings b ON b.run_id = ?2 AND b.role = ?4 WHERE a.attempt_id = ?1",
             params![attempt_id, run_id, task_id, role],
@@ -856,6 +860,7 @@ pub(super) fn assignment(
                     first_input: false,
                     supervision: None,
                     context: None,
+                    writer: r.get::<_, Option<bool>>(9)?.unwrap_or(false),
                 })
             },
         )
