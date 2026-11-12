@@ -87,7 +87,11 @@ pub(super) fn round(
     // A writer an open round with an open Issue holds is not selected: it stays READY until the round closes
     // (docs/adr/ADR-028.md decision 13).
     let held = super::verification::held_by_open_rounds(&tx, run_id)?;
-    rows.retain(|r| !held.contains(&r.candidate.task_id));
+    // Nor a task whose refused repair waits for its decision, whatever would dispatch it (decision 12, M2T16D-853).
+    let refused = super::verification::refused(&tx, run_id)?;
+    rows.retain(|r| {
+        !held.contains(&r.candidate.task_id) && !refused.contains(&r.candidate.task_id)
+    });
     if retries_only {
         rows.retain(|r| {
             r.state == TaskState::Ready && (r.retry || verifiers.contains(&r.candidate.task_id))

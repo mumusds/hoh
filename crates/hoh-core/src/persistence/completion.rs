@@ -50,6 +50,9 @@ pub enum WriterCompleted {
     Corrected { verdict: RepairVerdict },
     /// The task BLOCKED for a decision.
     Blocked { reason: String },
+    /// Failure items were attached to its task after its prompt: nothing frozen, the task back to READY for its rework
+    /// (decision 3's row).
+    Reworked,
     /// The attempt had already ended: nothing written (a completion asked again after its commit).
     AlreadyEnded,
     /// Its run is being cancelled: nothing frozen, accepted or counted; the attempt CANCELLED, its task the cancel's to
@@ -313,6 +316,58 @@ fn freeze_and_accept(
     if let Some(given) = result.candidate_id.as_ref().filter(|g| **g != id) {
         let reason = format!("the TaskResult names candidate {given}, not the frozen {id}");
         return correct(tx, job, task, &[reason], ctx);
+    }
+    // A refused repair standing: nothing frozen, the decision waits (docs/adr/ADR-028.md decision 12, M2T16D-853).
+    if super::verification::refused(tx, &task.run_id)?.contains(&task.task_id) {
+        return decide(
+            tx,
+            job,
+            task,
+            "repair_refused",
+            "a refused repair of this task waits for a decision; nothing is frozen until it is cleared",
+            ctx,
+        );
+    }
+    // Failure items attached to its task while this attempt ran, after its prompt: its work did not see them, so nothing
+    // is frozen and it goes back to READY for the rework its next attempt's context lists (decision 3's row; the items
+    // were counted when attached, M2T16D-800).
+    let after_prompt: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM events a WHERE a.kind = 'verification.failures_attached' AND a.run_id = ?1 \
+             AND json_extract(a.payload_json, '$.task_id') = ?2 AND a.seq > coalesce((SELECT max(m.seq) FROM events m \
+               WHERE m.kind = 'attempt.moved' AND json_extract(m.payload_json, '$.attempt_id') = ?3 \
+               AND json_extract(m.payload_json, '$.to') = 'RUNNING'), 0))",
+            params![task.run_id, task.task_id, job.attempt_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    if after_prompt {
+        tx.execute(
+            "UPDATE tasks SET layer = 0, attempt_count = 0, next_retry_at = NULL WHERE task_id = ?1",
+            params![task.task_id],
+        )
+        .map_err(sqlite_error)?;
+        writer::write(
+            tx,
+            &Commit {
+                cas: vec![StateCas {
+                    id: task.task_id.clone(),
+                    expected_revision: task.revision,
+                    change: Change::Task(TaskState::Ready),
+                }],
+                events: vec![NewEvent {
+                    project_id: task.project_id.clone(),
+                    event_id: child_id(&job.attempt_id, "rework"),
+                    run_id: Some(task.run_id.clone()),
+                    kind: "task.rework".to_owned(),
+                    payload: json!({"task_id": task.task_id, "attempt_id": job.attempt_id,
+                        "reason": "failures_after_prompt"}),
+                }],
+                ..Commit::default()
+            },
+            ctx,
+        )?;
+        return Ok(WriterCompleted::Reworked);
     }
     // What would refuse the acceptance whole is decided before any freeze (M2T16D-353, -1055): no criterion to verify
     // under the run's specification, or no qa or reviewer bound to verify it.

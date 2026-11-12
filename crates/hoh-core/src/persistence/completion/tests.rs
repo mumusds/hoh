@@ -1546,6 +1546,19 @@ async fn test_037_02_a_failed_round_closes_after_both_verifiers_and_reworks_its_
         )?,
         ["ACCEPTED"]
     );
+    // C1's one iteration, on its first conclusive result (decision 11, M2T16D-362).
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT json_extract(payload_json, '$.verdict') || ':' || json_extract(payload_json, '$.iteration') \
+             FROM events WHERE kind = 'iteration.completed'"
+        )?,
+        ["repair:1"]
+    );
+    assert_eq!(
+        texts(&path, "SELECT CAST(number AS TEXT) FROM iterations")?,
+        ["1"]
+    );
     let events = texts(&path, "SELECT CAST(count(*) AS TEXT) FROM events")?;
     let again = store
         .reconcile_verification("R", Default::default())
@@ -1586,6 +1599,13 @@ async fn a_passable_round_waits_at_its_candidates_barrier_for_the_join() -> R {
         .reconcile_verification("R", Default::default())
         .await?;
     assert!(again.joinable.is_empty());
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT json_extract(payload_json, '$.verdict') FROM events WHERE kind = 'iteration.completed'"
+        )?,
+        ["passable"]
+    );
     Ok(())
 }
 
@@ -1727,6 +1747,160 @@ async fn a_superseded_candidates_round_cancels_its_unstarted_verifiers_and_close
     assert_eq!(
         texts(&path, "SELECT state FROM tasks WHERE task_id = 'D'")?,
         ["VERIFYING"]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_round_whose_verifier_is_blocked_and_whose_other_is_done_stalls_its_run() -> R {
+    // Decision 10's in-flight rule (M2T16D-202): a VERIFYING source and an IMPLEMENTED verifier are not in flight; with
+    // qa BLOCKED_AUTH and the reviewer done, nothing of the run can move on: BLOCKED with BLOCKED_AUTH. A source waiting
+    // at a passable candidate's barrier for the join is in flight (M2-T16's transition): its run is not stalled.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    verifying(&store).await?;
+    let d = store
+        .schedule_round("R", verifiers())
+        .await?
+        .dispatched
+        .ok_or("nothing dispatched")?;
+    // The first dispatched (qa) blocked for authentication; the other settled.
+    Connection::open(&path)?.execute(
+        "UPDATE tasks SET state = 'BLOCKED', blocked_reason = 'BLOCKED_AUTH', revision = revision + 1 WHERE task_id = ?1",
+        [&d.task_id],
+    )?;
+    Connection::open(&path)?.execute(
+        "UPDATE attempts SET state = 'FAILED' WHERE attempt_id = ?1",
+        [&d.attempt_id],
+    )?;
+    let other = store
+        .schedule_round("R", verifiers())
+        .await?
+        .dispatched
+        .ok_or("the other was not dispatched")?;
+    Connection::open(&path)?.execute_batch(&format!(
+        "UPDATE attempts SET state = 'SETTLED' WHERE attempt_id = '{0}';
+         UPDATE tasks SET state = 'IMPLEMENTED', revision = revision + 1 WHERE task_id = '{1}';",
+        other.attempt_id, other.task_id
+    ))?;
+    store.pace_run("R", verifiers()).await?;
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT state || ':' || blocked_reasons_json FROM runs WHERE run_id = 'R'"
+        )?,
+        ["BLOCKED:[\"BLOCKED_AUTH\"]"]
+    );
+    // A passable candidate waiting for its join: in flight.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    let (_, candidate, [qa, _]) = verified(&store, &path, "PASS", "PASS").await?;
+    evidence_of(
+        &path,
+        (&qa, &candidate, "rec-1"),
+        ("unit", "PASS"),
+        &[("AC-1-01", "PASS")],
+        true,
+    )?;
+    store
+        .reconcile_verification("R", Default::default())
+        .await?;
+    store.pace_run("R", verifiers()).await?;
+    assert_eq!(
+        texts(&path, "SELECT state FROM runs WHERE run_id = 'R'")?,
+        ["RUNNING"]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_repair_refusal_holds_its_task_until_a_decision_clears_it() -> R {
+    // Decision 12 (M2T16D-800, -853, -950): a refused repair is a standing admission condition. Writer D READY with a
+    // refusal not cleared is BLOCKED by the reconcile and never selected; once Store::clear_repair_refusal records the
+    // decision (repair.refusal_cleared) and the decision sends it back to READY, it is dispatched; a writer's completion
+    // with a refusal standing freezes nothing.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    Connection::open(&path)?.execute_batch(
+        "UPDATE attempts SET state = 'FAILED' WHERE attempt_id = 'A';
+         UPDATE leases SET expires_at = '2000-01-01T00:00:00Z';
+         UPDATE tasks SET state = 'READY' WHERE task_id = 'D';
+         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES ('p1', 'nd-1', 'R',
+           'need_decision', '{\"task_id\": \"D\", \"reason\": \"local_repairs_exhausted\"}', '2026-11-12T00:00:02Z');",
+    )?;
+    let mut context = verifiers();
+    context
+        .required_capabilities
+        .insert("developer".to_owned(), Default::default());
+    store
+        .reconcile_verification("R", Default::default())
+        .await?;
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT state || ':' || blocked_reason FROM tasks WHERE task_id = 'D'"
+        )?,
+        ["BLOCKED:NEED_DECISION"]
+    );
+    store.clear_repair_refusal("D", "decision-1").await?;
+    Connection::open(&path)?.execute_batch(
+        "UPDATE tasks SET state = 'READY', blocked_reason = NULL, revision = revision + 1 WHERE task_id = 'D';",
+    )?;
+    store
+        .reconcile_verification("R", Default::default())
+        .await?;
+    assert_eq!(
+        texts(&path, "SELECT state FROM tasks WHERE task_id = 'D'")?,
+        ["READY"]
+    );
+    let d = store
+        .schedule_round("R", context)
+        .await?
+        .dispatched
+        .ok_or("D was not dispatched")?;
+    assert_eq!(d.task_id, "D");
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT json_extract(payload_json, '$.decision_id') FROM events WHERE kind = 'repair.refusal_cleared'"
+        )?,
+        ["decision-1"]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_completion_after_failures_were_attached_to_its_running_task_goes_back_to_rework() -> R {
+    // Decision 3's row (decision 11 step 2a, M2T16D-800): failure items attached to D while its attempt ran, after its
+    // prompt: its COMPLETED result is not frozen and opens no round; D goes back to READY (layer 0) for the rework its
+    // next attempt's context lists (the items were counted when attached).
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    Connection::open(&path)?.execute_batch(
+        "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES ('p1', 'A/running',
+           'R', 'attempt.moved', '{\"attempt_id\": \"A\", \"to\": \"RUNNING\"}', '2026-11-12T00:00:01Z');
+         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES ('p1', 'g1/attached/D',
+           'R', 'verification.failures_attached', '{\"task_id\": \"D\", \"round_id\": \"g1\", \"items\": [\"x\"]}',
+           '2026-11-12T00:00:02Z');",
+    )?;
+    let done = store
+        .complete_writer_attempt(completion(freeze(freeze_of('b'), result(None)?)))
+        .await?;
+    assert_eq!(done, WriterCompleted::Reworked);
+    assert_eq!(
+        texts(&path, "SELECT candidate_id FROM candidates")?.len(),
+        0
+    );
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT state || ':' || layer FROM tasks WHERE task_id = 'D'"
+        )?,
+        ["READY:0"]
+    );
+    assert_eq!(
+        texts(&path, "SELECT state FROM attempts WHERE attempt_id = 'A'")?,
+        ["SETTLED"]
     );
     Ok(())
 }
