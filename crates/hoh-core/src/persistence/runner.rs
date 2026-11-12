@@ -912,6 +912,20 @@ fn running(
         )?),
         None => None,
     };
+    // A verifier's run directory, in this commit (docs/adr/ADR-028.md decision 6).
+    let verification_start = facts.verification_start.as_deref().map(|start| {
+        let mut payload = json!({"attempt_id": attempt_id});
+        if let (Some(payload), Some(start)) = (payload.as_object_mut(), start.as_object()) {
+            payload.extend(start.clone());
+        }
+        event(
+            &project_id,
+            &run_id,
+            child_id(attempt_id, "verification_started"),
+            "verification.attempt_started",
+            payload,
+        )
+    });
     // A writer's workspace at its start, in this commit (docs/adr/ADR-028.md decisions 4 and 14).
     let workspace_start = facts.workspace_start.clone().map(|start| {
         let mut payload = json!({"attempt_id": attempt_id});
@@ -954,7 +968,12 @@ fn running(
         &tx,
         &Commit {
             cas,
-            events: packed.into_iter().chain(workspace_start).chain(delivered).chain([
+            events: packed
+                .into_iter()
+                .chain(workspace_start)
+                .chain(delivered)
+                .chain(verification_start)
+                .chain([
                 event(
                     &project_id,
                     &run_id,

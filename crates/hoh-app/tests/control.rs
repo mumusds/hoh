@@ -1286,6 +1286,7 @@ async fn cancel_with_a_writer_outside(
             role: "developer".to_owned(),
             effect_key: String::new(),
             assignment: Default::default(),
+            run_dir: None,
         }
         .marker()
     };
@@ -1524,6 +1525,7 @@ fn t1_marker(project: &Path) -> R<String> {
         role: "developer".to_owned(),
         effect_key: String::new(),
         assignment: Default::default(),
+        run_dir: None,
     }
     .marker())
 }

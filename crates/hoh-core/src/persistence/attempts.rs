@@ -153,6 +153,9 @@ pub struct AttemptFacts {
     /// A verifier's handoff delivered as it starts: the message id and its package kept as an object (docs/adr/
     /// ADR-028.md decision 9); its RUNNING commit acknowledges the message and records a `handoffs` row DELIVERED.
     pub handoff_package: Option<Box<(String, super::runner::ArtifactRow)>>,
+    /// A verifier's run directory as it starts (`{run_dir, pre_tree, candidate_id, check_id}`), written as
+    /// `verification.attempt_started` in its RUNNING commit (docs/adr/ADR-028.md decision 6, M2T16D-358).
+    pub verification_start: Option<Box<Value>>,
 }
 
 /// Move attempt `attempt_id` from `from` to `to`.

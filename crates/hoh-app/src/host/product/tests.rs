@@ -32,6 +32,7 @@ fn work(prompt: Option<&str>) -> Work {
             writer: true,
             handoff: None,
         },
+        run_dir: None,
     }
 }
 
