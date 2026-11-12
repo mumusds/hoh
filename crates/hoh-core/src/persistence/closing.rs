@@ -1253,17 +1253,42 @@ const TRANSIENT_SPAN_MS: u128 = 10 * 60 * 1000;
 /// One recovery of a candidate's pending records: how many it recorded, or its failure (permanent, and why).
 pub type RecoveryOutcome = Result<usize, (bool, String)>;
 
+/// The verifier tasks of run `run_id` whose round's candidate is held (docs/adr/ADR-028.md decision 16): its last
+/// recovery failed, none succeeded since.
+pub(super) fn held_by_recovery(
+    tx: &rusqlite::Connection,
+    run_id: &str,
+) -> Result<BTreeSet<String>, PersistError> {
+    let mut statement = tx
+        .prepare(
+            "SELECT t.value FROM events o, json_each(o.payload_json, '$.tasks') t \
+             WHERE o.kind = ?1 AND o.run_id = ?2 AND EXISTS(SELECT 1 FROM events f \
+               WHERE f.kind = 'candidate.reconcile_failed' \
+               AND json_extract(f.payload_json, '$.candidate_id') = json_extract(o.payload_json, '$.candidate_id') \
+               AND f.seq > coalesce((SELECT max(r.seq) FROM events r WHERE r.kind = 'candidate.reconcile_recovered' \
+                 AND json_extract(r.payload_json, '$.candidate_id') = json_extract(o.payload_json, '$.candidate_id')), 0))",
+        )
+        .map_err(sqlite_error)?;
+    let rows = statement
+        .query_map(params![ROUND_OPENED, run_id], |r| r.get(0))
+        .map_err(sqlite_error)?;
+    rows.collect::<Result<_, _>>().map_err(sqlite_error)
+}
+
 /// Record one recovery of candidate `candidate`'s pending check records at `now` (decision 11): a failure is
 /// `candidate.reconcile_failed{attempt, kind, error}`, a success after failures `candidate.reconcile_recovered` (the
 /// count starts again). Judged unrecoverable — a permanent failure at once, transient ones at least 3 in a row over at
 /// least 10 minutes — in this transaction: a VERIFYING candidate STALE (its prior state the condition), any other kept;
 /// the persistent fact `candidate.stale{evidence_unrecoverable}` and `integrity_violation` either way; its pending
-/// facts kept for audit, never tried again (-1252).
+/// facts kept for audit, never tried again (-1252). At the host's start (`at_start`, decision 16), a failure of a
+/// candidate no persistent fact superseded also wakes the Commander (`integrity_violation`); a superseded candidate's
+/// failure is only its `reconcile_failed`, never judged: its results are history (-1201).
 pub(super) fn record_recovery(
     conn: &mut rusqlite::Connection,
     candidate: &str,
     outcome: &RecoveryOutcome,
     now: std::time::SystemTime,
+    at_start: bool,
     ctx: &Ctx<'_>,
 ) -> Result<(), PersistError> {
     let tx = writer::begin(conn, ctx)?;
@@ -1342,7 +1367,24 @@ pub(super) fn record_recovery(
                     |r| r.get(0),
                 )
                 .map_err(sqlite_error)?;
-            if judged && !stale {
+            // Superseded: a later freeze listed it, or it is STALE; either fact persists (decision 16).
+            let superseded = stale
+                || tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM events f, json_each(f.payload_json, '$.superseded') v \
+                         WHERE f.kind = 'candidate.frozen' AND v.value = ?1)",
+                        params![candidate],
+                        |r| r.get(0),
+                    )
+                    .map_err(sqlite_error)?;
+            if at_start && !superseded && !judged {
+                events.push(event(
+                    child_id(candidate, &format!("reconcile_failed/{}/start", failed.len() + 1)),
+                    "integrity_violation",
+                    json!({"candidate_id": candidate, "reason": "reconcile_failed_at_start", "error": error}),
+                ));
+            }
+            if judged && !superseded {
                 tx.execute(
                     "UPDATE candidates SET state = 'STALE' WHERE candidate_id = ?1 AND state = 'VERIFYING'",
                     params![candidate],
