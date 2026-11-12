@@ -12,6 +12,8 @@
 pub mod agents;
 mod cgroup;
 mod completion;
+#[cfg(test)]
+pub(crate) use completion::inputs as completion_inputs;
 pub(crate) mod control;
 mod http;
 mod processes;
