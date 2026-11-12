@@ -1,7 +1,9 @@
 //! A writer attempt's completion against a real database (docs/adr/ADR-028.md decisions 3 and 4).
 
 use super::*;
-use crate::persistence::{ArtifactRow, Options, Store, selftest};
+use crate::persistence::{
+    ArtifactRow, ChangeRequest, Deferred, Options, Store, VerifierRequest, selftest,
+};
 use crate::verification::{FileRef, Manifest};
 use rusqlite::Connection;
 use serde_json::json;
@@ -952,5 +954,104 @@ async fn a_verifier_bound_to_a_source_attempts_session_is_refused_as_not_indepen
         )?,
         ["1"]
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_verifiers_request_to_change_the_candidate_is_refused_with_an_issue_and_others_deferred()
+-> R {
+    // docs/adr/ADR-028.md decision 13 (REQ-037 behaviour 6, failure mode 5): while the round is open, a verifier's
+    // request that the candidate under verification be changed is refused (request.rejected, ILLEGAL_TRANSITION) with
+    // an OPEN Issue on the candidate (its fingerprint sha256(severity, normalised text), a severity outside the four
+    // being medium) and issue.opened, nothing queued; asked again, the same answer and nothing more. Any other request
+    // is deferred (request.deferred), no Issue.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    let round = verifying(&store).await?;
+    let candidate = texts(&path, "SELECT candidate_id FROM candidates")?.remove(0);
+    let outbox = texts(&path, "SELECT message_id FROM outbox")?;
+    let attempt = crate::ids::child_id(&round, "task/qa/attempt-1");
+    let change = |message: &str, severity: &str| {
+        VerifierRequest::RejectChange(ChangeRequest {
+            run_id: "R".to_owned(),
+            attempt_id: attempt.clone(),
+            message_id: message.to_owned(),
+            round_id: round.clone(),
+            candidate_id: candidate.clone(),
+            severity: severity.to_owned(),
+            text: "Fix   the parser\n before release ".to_owned(),
+        })
+    };
+    let issue = store.verifier_request(change("m1", "high")).await?;
+    assert_eq!(issue, Some(crate::ids::child_id(&attempt, "request/m1")));
+    assert_eq!(
+        store.verifier_request(change("m1", "high")).await?,
+        issue,
+        "asked again"
+    );
+    store.verifier_request(change("m2", "urgent")).await?;
+    let fingerprint = |severity: &str| {
+        crate::context::sha256_hex(format!("{severity}\nfix the parser before release").as_bytes())
+    };
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT issue_id || ':' || candidate_id || ':' || severity || ':' || state || ':' || fingerprint \
+             FROM issues ORDER BY issue_id"
+        )?,
+        [
+            format!(
+                "{}:{candidate}:high:OPEN:{}",
+                crate::ids::child_id(&attempt, "request/m1"),
+                fingerprint("high")
+            ),
+            format!(
+                "{}:{candidate}:medium:OPEN:{}",
+                crate::ids::child_id(&attempt, "request/m2"),
+                fingerprint("medium")
+            ),
+        ]
+    );
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT json_extract(payload_json, '$.reason_code') || ':' || json_extract(payload_json, '$.round_id') \
+             FROM events WHERE kind = 'request.rejected'"
+        )?,
+        [
+            format!("ILLEGAL_TRANSITION:{round}"),
+            format!("ILLEGAL_TRANSITION:{round}")
+        ]
+    );
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT json_extract(payload_json, '$.issue_id') || ':' || json_extract(payload_json, '$.severity') \
+             FROM events WHERE kind = 'issue.opened' ORDER BY seq"
+        )?,
+        [
+            format!("{}:high", crate::ids::child_id(&attempt, "request/m1")),
+            format!("{}:medium", crate::ids::child_id(&attempt, "request/m2"))
+        ]
+    );
+    assert_eq!(texts(&path, "SELECT message_id FROM outbox")?, outbox);
+    let deferred = store
+        .verifier_request(VerifierRequest::Defer(Deferred {
+            run_id: "R".to_owned(),
+            attempt_id: attempt.clone(),
+            message_id: "m3".to_owned(),
+            recipient_role: "developer".to_owned(),
+        }))
+        .await?;
+    assert_eq!(deferred, None);
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT json_extract(payload_json, '$.message_id') || ':' || json_extract(payload_json, '$.recipient_role') \
+             FROM events WHERE kind = 'request.deferred'"
+        )?,
+        ["m3:developer"]
+    );
+    assert_eq!(texts(&path, "SELECT issue_id FROM issues")?.len(), 2);
     Ok(())
 }

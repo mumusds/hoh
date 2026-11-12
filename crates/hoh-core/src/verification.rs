@@ -1030,5 +1030,16 @@ pub fn rows(e: &Evidence, outcome: &Outcome, acs: &[AcSpec], check: bool) -> Vec
 
 pub mod classify;
 
+/// An Issue's fingerprint, the same for every candidate (REQ-054 decision 2): sha256 of its severity and its text with
+/// its whitespace collapsed and lowercased, joined by a line feed.
+pub fn issue_fingerprint(severity: &str, text: &str) -> String {
+    let normalised = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    crate::context::sha256_hex(format!("{severity}\n{normalised}").as_bytes())
+}
+
 #[cfg(test)]
 mod tests;

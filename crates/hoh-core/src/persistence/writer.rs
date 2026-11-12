@@ -163,6 +163,11 @@ enum Job {
         Box<super::completion::WriterCompletion>,
         oneshot::Sender<Result<super::completion::WriterCompleted, PersistError>>,
     ),
+    /// A verifier's request the Runtime answers ([`super::verification::request`]).
+    Request(
+        Box<super::verification::VerifierRequest>,
+        oneshot::Sender<Result<Option<String>, PersistError>>,
+    ),
     /// A run id and a plan for [`super::plan::import`].
     Plan(
         Box<(String, serde_json::Value)>,
@@ -361,6 +366,7 @@ impl Job {
             Job::Outbox(..) => "Outbox",
             Job::Candidates(..) => "Candidates",
             Job::Completion(..) => "Completion",
+            Job::Request(..) => "Request",
             Job::Evidence(..) => "Evidence",
             Job::Plan(..) => "Plan",
             Job::Round(..) => "Round",
@@ -530,6 +536,13 @@ impl Writer {
                                 &ctx,
                                 reply,
                                 super::completion::complete(&mut conn, &job, &ctx),
+                            ));
+                        }
+                        Job::Request(job, reply) => {
+                            deferred = Some(answer(
+                                &ctx,
+                                reply,
+                                super::verification::request(&mut conn, &job, &ctx),
                             ));
                         }
                         Job::Plan(request, reply) => {
@@ -753,6 +766,13 @@ impl Writer {
     ) -> Result<super::completion::WriterCompleted, PersistError> {
         self.submit(|tx| Job::Completion(Box::new(completion), tx))
             .await
+    }
+
+    pub(super) async fn verifier_request(
+        &self,
+        request: super::verification::VerifierRequest,
+    ) -> Result<Option<String>, PersistError> {
+        self.submit(|tx| Job::Request(Box::new(request), tx)).await
     }
 
     pub(super) async fn import_plan(
