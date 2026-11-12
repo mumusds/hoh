@@ -4,7 +4,7 @@
 use super::runner::ArtifactRow;
 use super::{PersistError, sqlite_error};
 use crate::verification::Sealed;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::json;
 
 /// A candidate to freeze for `run_id`: its sealed manifest, its export kept as an object (the row's `source_path`),
@@ -41,6 +41,15 @@ pub(super) fn freeze(
     ctx: &super::writer::Ctx<'_>,
 ) -> Result<Frozen, PersistError> {
     let tx = super::writer::begin(conn, ctx)?;
+    let frozen = freeze_in(&tx, job)?;
+    ctx.before_commit()?;
+    tx.commit().map_err(sqlite_error)?;
+    Ok(frozen)
+}
+
+/// [`freeze`] inside the caller's transaction (docs/adr/ADR-028.md decision 4: a writer attempt's completion freezes,
+/// accepts and settles in one commit). The caller commits; an error leaves the transaction to be rolled back.
+pub(super) fn freeze_in(tx: &Transaction<'_>, job: &Freeze) -> Result<Frozen, PersistError> {
     let project_id: String = tx
         .query_row(
             "SELECT project_id FROM runs WHERE run_id = ?1",
@@ -88,7 +97,7 @@ pub(super) fn freeze(
         }
     }
     let rows: Vec<ArtifactRow> = kept.into_iter().cloned().collect();
-    super::runner::register(&tx, &rows)?;
+    super::runner::register(tx, &rows)?;
     let superseded: Vec<String> = {
         let mut statement = tx
             .prepare(&format!(
@@ -134,8 +143,6 @@ pub(super) fn freeze(
         ],
     )
     .map_err(sqlite_error)?;
-    ctx.before_commit()?;
-    tx.commit().map_err(sqlite_error)?;
     Ok(Frozen::New {
         candidate_id: id.clone(),
         superseded,
