@@ -1565,7 +1565,14 @@ async fn a_record_another_holds_is_left_and_one_it_left_is_recorded() -> R {
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(dir.join(".lock"))?;
+        .open({
+            let locks = f.state().join("locks");
+            std::fs::create_dir_all(&locks)?;
+            locks.join(format!(
+                "{}.lock",
+                dir.file_name().ok_or("no name")?.to_string_lossy()
+            ))
+        })?;
     rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive)?;
     assert_eq!(super_reconcile(&f, &c).await?, 0);
     drop(lock);
@@ -1713,7 +1720,12 @@ async fn an_object_or_a_lock_that_is_a_fifo_never_blocks_the_reconciliation() ->
     assert_eq!(recorded?, 1);
     assert!(std::fs::symlink_metadata(&object)?.file_type().is_file());
     let (g, _, c2, dir2) = pending_qa(&[]).await?;
-    let lock = dir2.join(".lock");
+    let locks = g.state().join("locks");
+    std::fs::create_dir_all(&locks)?;
+    let lock = locks.join(format!(
+        "{}.lock",
+        dir2.file_name().ok_or("no name")?.to_string_lossy()
+    ));
     let _ = std::fs::remove_file(&lock);
     assert!(Command::new("mkfifo").arg(&lock).status()?.success());
     let mut other_end = rescue(&lock, false)?;
@@ -1819,5 +1831,35 @@ async fn the_next_run_on_an_unchanged_checkout_puts_a_lost_policy_back_and_recor
     let ran = f.run(&c, "qa", QA).await.map_err(|e| format!("{e:?}"))?;
     assert_eq!(ran.outcome.status.code(), "PASS");
     assert_eq!(f.query("SELECT outcome FROM evidence")?, ["PASS", "PASS"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_command_clearing_its_record_directory_leaves_the_records_lock_alone() -> R {
+    // M2T10R-400: the record's lock is HoH's state outside the directory the command writes to, so a command that
+    // clears what lies beside its artifacts cannot let a reconciliation take over the record its run is committing.
+    let faults = Arc::new(Faults::default());
+    let f = Fixture::with(
+        PLAN,
+        &format!(
+            "rm -f \"$HOH_EVIDENCE_DIR\"/../.lock \"$HOH_EVIDENCE_DIR\"/../.*.lock\n{QA_PASSES}"
+        ),
+        faults.clone(),
+    )
+    .await?;
+    let c = f.frozen().await?;
+    faults.slow.store(true, Ordering::SeqCst);
+    let (ran, reconciled) = tokio::join!(f.run(&c, "qa", QA), async {
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        super_reconcile(&f, &c).await
+    });
+    assert_eq!(
+        ran.map_err(|e| format!("{e:?}"))?.outcome.status.code(),
+        "PASS"
+    );
+    assert_eq!(
+        reconciled?, 0,
+        "the reconciliation took over a record still being committed"
+    );
     Ok(())
 }
