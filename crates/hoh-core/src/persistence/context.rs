@@ -241,6 +241,25 @@ fn work(
                 ),
             ));
         }
+        for t in &r.traced {
+            let observed = if t.observed.is_empty() {
+                String::new()
+            } else {
+                format!("；验证者的观察：{}", t.observed.join("；"))
+            };
+            facts.entries.push(evidence(
+                format!("rework/traced/{}", t.issue_id),
+                format!(
+                    "仍存在的 Issue {}（{}，候选 {}，报告 {}，finding {}）：{}{observed}",
+                    t.issue_id,
+                    t.severity,
+                    t.candidate_id.as_deref().unwrap_or("-"),
+                    t.report_id.as_deref().unwrap_or("-"),
+                    t.finding_id.as_deref().unwrap_or("-"),
+                    t.description
+                ),
+            ));
+        }
         facts.code = r.base.map(|base| crate::context::CodeSource {
             base,
             commit: r.git_commit,
@@ -504,9 +523,15 @@ fn wake(
                 .filter_map(|k| Some((k, payload.get(k)?.clone())))
                 .collect();
         let mut text = json!({"seq": seq, "kind": kind, "payload": payload});
-        // A change request's Issue is the Runtime's to rework once its round closes (docs/adr/ADR-028.md decision 13,
-        // M2T16D-355): said, so no repair of the Commander's own is planned for it.
-        if kind == "issue.opened" && field("source").as_deref() == Some("change_request") {
+        // A change request's, a finding's or an acceptance failure's Issue is the Runtime's to rework once its round
+        // closes (docs/adr/ADR-028.md decision 13, M2T16D-355; docs/adr/ADR-029.md decision 9, M2T18D-258): said, so no
+        // repair of the Commander's own is planned for it.
+        if kind == "issue.opened"
+            && matches!(
+                field("source").as_deref(),
+                Some("change_request" | "finding" | "acceptance")
+            )
+        {
             brief.insert("handling", json!(REWORKED_AFTER_ROUND));
             text["handling"] = json!(REWORKED_AFTER_ROUND);
         }
@@ -559,8 +584,8 @@ fn attempt_tasks(
 /// read) and the Developer's own account of the candidate, only its status and summary, marked a claim and ranked
 /// after everything else (docs/07 section 4: requirements, AC and artifacts first). From the round's sources
 /// `sources` (docs/adr/ADR-028.md decision 14): the Developer's registered self-test records as diagnostic loads, the
-/// code source from their earliest start to the candidate, and the change requests a rework of theirs took, for the
-/// verifier to confirm fixed.
+/// code source from their earliest start to the candidate. The Issues it is to confirm fixed are its mandatory scope's,
+/// added with its round by the store's assignment (docs/adr/ADR-029.md decision 10).
 pub(super) fn verification(
     conn: &Connection,
     package: &crate::protocol::ContextHandoff,
@@ -699,9 +724,6 @@ pub(super) fn verification(
         }),
         _ => None,
     };
-    facts
-        .entries
-        .extend(confirm_fixed(conn, run_id, sources, &candidate)?);
     Ok(facts)
 }
 
@@ -767,50 +789,6 @@ fn code_base(conn: &Connection, sources: &[String]) -> Result<Option<String>, Pe
     Ok(head.map(|h| h.unwrap_or_else(|| EMPTY_TREE.to_owned())))
 }
 
-/// The change requests' Issues a rework (or a decision) of tasks `sources` took and that are not resolved, raised on
-/// another candidate than `candidate`: for the verifier to confirm fixed (decisions 12 and 14, -555). A finding's
-/// Issue is M2-T18's.
-fn confirm_fixed(
-    conn: &Connection,
-    run_id: &str,
-    sources: &[String],
-    candidate: &str,
-) -> Result<Vec<Entry>, PersistError> {
-    let mut statement = conn
-        .prepare(
-            "SELECT DISTINCT i.issue_id, i.severity, i.description, coalesce(i.candidate_id, '-') \
-             FROM events e, json_each(json_extract(e.payload_json, '$.items')) j \
-             JOIN issues i ON j.value = 'issue:' || i.fingerprint \
-             WHERE e.kind = 'verification.failures_consumed' \
-             AND json_extract(e.payload_json, '$.by') IN ('rework', 'decision') \
-             AND json_extract(e.payload_json, '$.task_id') IN (SELECT value FROM json_each(?1)) \
-             AND i.run_id = ?2 AND i.state IN ('OPEN', 'REOPENED') AND i.report_id IS NULL \
-             AND coalesce(i.candidate_id, '') <> ?3 ORDER BY i.issue_id",
-        )
-        .map_err(sqlite_error)?;
-    let rows: Vec<(String, String, String, String)> = statement
-        .query_map(
-            params![json!(sources).to_string(), run_id, candidate],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        )
-        .map_err(sqlite_error)?
-        .collect::<Result<_, _>>()
-        .map_err(sqlite_error)?;
-    Ok(rows
-        .into_iter()
-        .map(|(id, severity, description, on)| Entry {
-            class: Class::Evidence,
-            kind: Kind::Plain,
-            path: format!("confirm/{id}"),
-            text: format!("请确认已修复：Issue {id}（{severity}，提出于候选 {on}）：{description}"),
-            summary: None,
-            relevance: 2,
-            recency: 0,
-            causal: 0,
-        })
-        .collect())
-}
-
 /// What a reworked development task's next attempt is given (docs/adr/ADR-028.md decisions 12 and 14): the round
 /// whose failures its rework took, the rejected candidate, those failure items, the candidate's open Issues and the
 /// base of its changed files.
@@ -823,6 +801,9 @@ pub struct ReworkContext {
     /// `(issue_id, severity, description)`.
     pub issues: Vec<(String, String, String)>,
     pub base: Option<String>,
+    /// The Issues its `issue:<fingerprint>` items name, across the run, with their reports, findings and what the
+    /// verifiers observed (docs/adr/ADR-029.md decision 11, M2T18D-201).
+    pub traced: Vec<super::issues::Traced>,
 }
 
 /// Task `task_id`'s rework context: from the failures its reworks or decisions took since its last completion, the
@@ -897,17 +878,62 @@ pub(super) fn rework(
         .flatten()
         .filter_map(|t| t.as_str().map(str::to_owned))
         .collect();
+    let items: Vec<String> = all
+        .iter()
+        .flat_map(|t| t["items"].as_array().cloned().unwrap_or_default())
+        .filter_map(|i| i.as_str().map(str::to_owned))
+        .collect();
+    // Each `issue:<fingerprint>` item's Issues across the run, with their reports and findings, and what the verifiers
+    // of the rounds it took failures from observed of them (docs/adr/ADR-029.md decision 11, M2T18D-201).
+    let rounds: Vec<String> = all
+        .iter()
+        .filter_map(|t| t["round_id"].as_str().map(str::to_owned))
+        .collect();
+    let run_id: Option<String> = conn
+        .query_row(
+            "SELECT run_id FROM tasks WHERE task_id = ?1",
+            params![task_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let mut traced = Vec::new();
+    if let Some(run_id) = run_id {
+        let mut statement = conn
+            .prepare(
+                "SELECT json_extract(c.value, '$.issue_id'), json_extract(c.value, '$.observed') FROM events e,                  json_each(e.payload_json, '$.confirmations') c WHERE e.run_id = ?1 AND e.kind = 'verification.report'                  AND json_extract(e.payload_json, '$.round_id') IN (SELECT value FROM json_each(?2)) ORDER BY e.seq, c.key",
+            )
+            .map_err(sqlite_error)?;
+        let observed: Vec<(String, String)> = statement
+            .query_map(params![run_id, json!(rounds).to_string()], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .map_err(sqlite_error)?
+            .collect::<Result<_, _>>()
+            .map_err(sqlite_error)?;
+        let fingerprints: BTreeSet<&str> = items
+            .iter()
+            .filter_map(|i| i.strip_prefix("issue:"))
+            .collect();
+        for fingerprint in fingerprints {
+            for mut issue in super::issues::of_fingerprint(conn, &run_id, fingerprint)? {
+                issue.observed = observed
+                    .iter()
+                    .filter(|(id, _)| *id == issue.issue_id)
+                    .map(|(_, text)| text.clone())
+                    .collect();
+                traced.push(issue);
+            }
+        }
+    }
     Ok(Some(ReworkContext {
         round_id,
         git_commit,
-        items: all
-            .iter()
-            .flat_map(|t| t["items"].as_array().cloned().unwrap_or_default())
-            .filter_map(|i| i.as_str().map(str::to_owned))
-            .collect(),
+        items,
         issues,
         base: code_base(conn, &sources)?,
         candidate_id,
+        traced,
     }))
 }
 

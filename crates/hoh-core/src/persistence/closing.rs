@@ -260,7 +260,7 @@ fn report(
     ))
 }
 
-fn row_of(status: &str) -> Row {
+pub(super) fn row_of(status: &str) -> Row {
     match status {
         "PASS" => Row::Pass,
         "DEGRADED" => Row::Degraded,
@@ -338,6 +338,9 @@ pub(super) fn reconcile(
     let (project_id, spec_id, run_state) = run_of(&tx, run_id)?;
     // Reports whose candidate no longer stands, made STALE whoever superseded it (docs/adr/ADR-029.md decision 8).
     super::reports::sweep(&tx, run_id)?;
+    // The Issues' states as the facts say, whatever wrote them before (a store older than ADR-029 decision 10's
+    // materialisation included).
+    super::issues::settle_all(&tx, run_id)?;
     let cancelling = matches!(run_state.as_str(), "CANCEL_REQUESTED" | "CANCELLED");
     let event = |event_id: String, kind: &str, payload: Value| NewEvent {
         project_id: project_id.clone(),
@@ -478,6 +481,14 @@ pub(super) fn reconcile(
             }
         }
         let issues = round_issues(&tx, round)?;
+        // What the round's verifiers were delivered to confirm and what they said of it (docs/adr/ADR-029.md decision
+        // 10): its absent facts are written whatever the verdict; its critical and high entries classify it.
+        let sides = [
+            super::issues::side(&tx, &attempts, "qa")?,
+            super::issues::side(&tx, &attempts, "reviewer")?,
+        ];
+        let entries = super::issues::entries(&tx, run_id, &round.candidate, &sides)?;
+        super::issues::observe_absent(&tx, run_id, &round.id, &round.candidate, &sides, &entries)?;
         let mut items: BTreeSet<Item> = BTreeSet::new();
         let to_all = |items: &mut BTreeSet<Item>, item: String| {
             for task in &round.sources {
@@ -499,10 +510,17 @@ pub(super) fn reconcile(
                 spec_id.as_deref(),
                 &attempts,
                 &evidence,
-                &issues,
+                (&issues, &entries),
             )?;
             let class = classify::classify(&input);
             if class == Class::Failed {
+                // Each acceptance failure an Issue on the candidate, in this close (docs/adr/ADR-029.md decision 9).
+                super::issues::open_acceptance(
+                    &tx,
+                    run_id,
+                    &round.candidate,
+                    &super::issues::ac_failures(failed.iter().map(|(_, item)| item.as_str())),
+                )?;
                 for item in failed {
                     match item {
                         (Some(ac), text) => {
@@ -534,6 +552,7 @@ pub(super) fn reconcile(
                     "checks": format!("{:?}", input.checks),
                     "acs": input.acs.iter().map(|a| format!("{a:?}")).collect::<Vec<_>>(),
                     "failing_issues": input.failing_issues, "outside_failed": input.outside_failed,
+                    "unconfirmed": input.unconfirmed,
                 }),
             )
         } else {
@@ -682,6 +701,8 @@ pub(super) fn reconcile(
         if matches!(verdict.as_str(), "repair" | "invalidated") {
             iteration(&tx, (&project_id, run_id), &round.candidate, &verdict, ctx)?;
         }
+        // Its rows, its absent facts and its Issues materialised before the next round is judged (decision 10).
+        super::issues::settle_all(&tx, run_id)?;
         verdicts.insert(round.id.clone(), verdict.clone());
         done.closed.push((round.id.clone(), verdict));
     }
@@ -730,6 +751,7 @@ pub(super) fn reconcile(
         ctx,
         &mut done,
     )?;
+    super::issues::settle_all(&tx, run_id)?;
     ctx.before_commit()?;
     tx.commit().map_err(sqlite_error)?;
     Ok(done)
@@ -763,10 +785,23 @@ fn classify_round(
     spec_id: Option<&str>,
     attempts: &[String],
     evidence: &[Evidence],
-    issues: &[(String, String)],
+    (issues, entries): (&[(String, String)], &[super::issues::Entry]),
 ) -> Result<(classify::Input, Vec<(Option<String>, String)>), PersistError> {
     let _ = run_id;
     let mut failed = Vec::new();
+    // The critical and high entries delivered for confirmation (docs/adr/ADR-029.md decision 10, -150, -153, -254):
+    // still present is a failing input, every source's item `issue:<fingerprint>`; delivered to both and neither still
+    // present nor confirmed leaves the round unpassable.
+    let mut still = false;
+    let mut unconfirmed = false;
+    for entry in entries.iter().filter(|e| e.grave()) {
+        if entry.still_present {
+            still = true;
+            failed.push((None, format!("issue:{}", entry.fingerprint)));
+        } else if entry.unconfirmed() {
+            unconfirmed = true;
+        }
+    }
     let (qa, qa_findings) = report(tx, attempts, "qa")?;
     let (review, review_findings) = report(tx, attempts, "reviewer")?;
     // A FAIL report's item is its role and its findings' summaries, sorted (decision 12, M2T16R-06).
@@ -880,8 +915,9 @@ fn classify_round(
             review,
             checks,
             acs,
-            failing_issues: !issues.is_empty(),
+            failing_issues: !issues.is_empty() || still,
             outside_failed,
+            unconfirmed,
         },
         failed,
     ))

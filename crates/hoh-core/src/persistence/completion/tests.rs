@@ -1316,6 +1316,7 @@ pub(in crate::persistence) fn consistent(
         raw_session,
         native_session_ids: vec![session],
         native_status: "COMPLETED".to_owned(),
+        confirmations: Vec::new(),
     })
 }
 
@@ -1621,7 +1622,7 @@ async fn settle_verifiers(store: &Store, path: &Path, qa: &str, review: &str) ->
 
 /// A planned check's evidence by `attempt` on `candidate`: its outcome and its acceptance rows (written when its round
 /// closes when `deferred`).
-fn evidence_of(
+pub(in crate::persistence) fn evidence_of(
     path: &Path,
     ids: (&str, &str, &str),
     check: (&str, &str),
@@ -2961,7 +2962,7 @@ async fn every_source_of_a_round_whose_reverify_chain_is_spent_waits_for_a_decis
 
 /// [`evidence_of`] whose rows name their TEST (`<test> in check <check>`) and whose result lines are `observations`
 /// (`(test_id, name, status)`), as a check's evidence records them.
-fn evidence_with(
+pub(in crate::persistence) fn evidence_with(
     path: &Path,
     ids: (&str, &str, &str),
     (check, outcome): (&str, &str),
@@ -2985,7 +2986,7 @@ fn evidence_with(
 
 /// [`evidence_with`], each row with the failing lines the check driver judged it to have (docs/adr/ADR-028.md
 /// implementation correction 5).
-fn evidence_judged(
+pub(in crate::persistence) fn evidence_judged(
     path: &Path,
     (attempt, candidate, record): (&str, &str, &str),
     (check, outcome): (&str, &str),
@@ -3788,7 +3789,7 @@ async fn a_corrections_reason_outlives_an_attempt_that_failed_to_start() -> R {
 }
 
 /// A planned check's PASS record of AC-1-01 by `producer` on `candidate`, as a check's driver hands it to the store.
-fn pass_recording(
+pub(in crate::persistence) fn pass_recording(
     record_id: &str,
     candidate: &str,
     producer: &str,

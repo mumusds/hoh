@@ -386,7 +386,7 @@ impl ProductExecutor {
         )
         .map_err(deterministic)?;
         let version = hoh_core::objects::resource_bundle_version();
-        let recorded = context::record(
+        let mut recorded = context::record(
             context::Contract {
                 layer: contract.layer,
                 path: &contract.path,
@@ -412,6 +412,11 @@ impl ProductExecutor {
             },
             other => deterministic(other.to_string()),
         })?;
+        // A verifier's delivery, fixed with its packing: the Issue ids its mandatory scope gave with their description
+        // (docs/adr/ADR-029.md decision 10).
+        if let (Some(ids), Some(event)) = (&facts.confirm_ids, recorded.event.as_object_mut()) {
+            event.insert("confirm_ids".to_owned(), serde_json::json!(ids));
+        }
         let mut artifacts = Vec::new();
         for object in &recorded.objects {
             let sha = hoh_core::objects::put(&self.project, &object.bytes).map_err(|why| {

@@ -531,10 +531,13 @@ fn a_verification_turn_names_the_developers_registered_self_tests_and_its_rounds
 }
 
 #[test]
-fn a_change_request_issue_a_rework_took_is_listed_for_later_verifiers_to_confirm_fixed() -> R {
-    // docs/adr/ADR-028.md decisions 12 and 14 (M2T16D-555): a change request's Issue taken by a rework of one of the
-    // round's sources, not yet RESOLVED, is listed for the later round's verifiers, marked 请确认已修复; one on the
-    // candidate under verification is the round's own, a RESOLVED one is done, a finding's is M2-T18's.
+fn a_finding_or_change_request_issue_an_earlier_closed_round_of_a_source_opened_is_delivered_to_confirm_fixed()
+-> R {
+    // docs/adr/ADR-029.md decision 10 (`confirm_set`, replacing ADR-028 decision 14's "a change request a rework took",
+    // M2T16D-555): a finding's or a change request's Issue, OPEN or REOPENED, raised on another candidate by an earlier
+    // round with one of this round's sources that is closed, is delivered in the verifier's mandatory scope (not a
+    // trimmable evidence entry), marked 请确认已修复, its id in `confirm_ids`; one on the candidate under verification,
+    // a RESOLVED one, one of an open round, an acceptance failure's and another source's round's are not.
     let (_dir, conn) = world()?;
     conn.execute_batch(
         "INSERT INTO candidates(candidate_id, run_id, git_commit, git_tree, spec_sha256, environment_sha256,
@@ -544,33 +547,120 @@ fn a_change_request_issue_a_rework_took_is_listed_for_later_verifiers_to_confirm
          INSERT INTO issues(issue_id, run_id, candidate_id, fingerprint, severity, state, description) VALUES
            ('I-taken', 'R', 'CAND-6', 'fp-taken', 'high', 'OPEN', 'SENTINEL-TAKEN 改写请求：边界条件'),
            ('I-done', 'R', 'CAND-6', 'fp-done', 'high', 'RESOLVED', 'SENTINEL-DONE 已解决'),
-           ('I-other', 'R', 'CAND-6', 'fp-other', 'high', 'OPEN', 'SENTINEL-OTHER 未被返工取走'),
+           ('I-other', 'R', 'CAND-6', 'fp-other', 'high', 'OPEN', 'SENTINEL-OTHER 另一来源的轮次'),
+           ('I-open', 'R', 'CAND-6', 'fp-open', 'high', 'OPEN', 'SENTINEL-OPEN 轮次未关闭'),
+           ('I-ac', 'R', 'CAND-6', 'fp-ac', 'high', 'OPEN', 'SENTINEL-AC 验收失败'),
            ('I-own', 'R', 'CAND-7', 'fp-own', 'high', 'OPEN', 'SENTINEL-OWN 本轮自己的');",
+    )?;
+    let opened = |round: &str, candidate: &str, sources: &[&str]| {
+        json!({"round_id": round, "candidate_id": candidate, "source_task_ids": sources,
+            "tasks": {"qa": format!("{round}/task/qa"), "reviewer": format!("{round}/task/reviewer")}})
+    };
+    event(
+        &conn,
+        "o-6-1",
+        "verification.round_opened",
+        &opened("CAND-6/round/1", "CAND-6", &["T1"]),
     )?;
     event(
         &conn,
-        "consumed-1",
-        "verification.failures_consumed",
-        &json!({"round_id": "CAND-6/round/1", "task_id": "T1", "by": "rework",
-            "items": ["issue:fp-taken", "issue:fp-done", "issue:fp-own", "ac:AC-1-02"]}),
+        "o-6-2",
+        "verification.round_opened",
+        &opened("CAND-6/round/2", "CAND-6", &["T3"]),
     )?;
-    let facts = verification(&conn, &package_of_cand7()?, &["T1".to_owned()])?;
-    let listed: Vec<&str> = facts
-        .entries
+    event(
+        &conn,
+        "o-6-3",
+        "verification.round_opened",
+        &opened("CAND-6/round/3", "CAND-6", &["T1"]),
+    )?;
+    for (issue, round, source) in [
+        ("I-taken", "CAND-6/round/1", "change_request"),
+        ("I-done", "CAND-6/round/1", "change_request"),
+        ("I-other", "CAND-6/round/2", "change_request"),
+        ("I-open", "CAND-6/round/3", "change_request"),
+        ("I-ac", "CAND-6/round/1", "acceptance"),
+        ("I-own", "CAND-6/round/1", "change_request"),
+    ] {
+        event(
+            &conn,
+            &format!("{issue}/opened"),
+            "issue.opened",
+            &json!({"issue_id": issue, "round_id": round, "source": source, "severity": "high"}),
+        )?;
+    }
+    for round in ["CAND-6/round/1", "CAND-6/round/2"] {
+        event(
+            &conn,
+            &format!("{round}/closed"),
+            "verification.round_closed",
+            &json!({"round_id": round}),
+        )?;
+    }
+    event(
+        &conn,
+        "o-7-1",
+        "verification.round_opened",
+        &opened("CAND-7/round/1", "CAND-7", &["T1"]),
+    )?;
+    let delivery =
+        crate::persistence::issues::deliver(&conn, "R", "CAND-7/round/1", &["T1".to_owned()])?;
+    let listed: Vec<&String> = delivery
+        .lines
         .iter()
-        .filter(|e| e.text.contains("请确认已修复"))
-        .map(|e| e.text.as_str())
+        .filter(|l| l.contains("SENTINEL"))
         .collect();
     assert_eq!(listed.len(), 1, "{listed:?}");
-    assert!(listed[0].contains("SENTINEL-TAKEN") && listed[0].contains("I-taken"));
-    // Another task's rework took nothing of this round's sources.
-    let other = verification(&conn, &package_of_cand7()?, &["T3".to_owned()])?;
     assert!(
-        other
+        listed[0].contains("请确认已修复")
+            && listed[0].contains("SENTINEL-TAKEN")
+            && listed[0].contains("I-taken")
+    );
+    assert_eq!(delivery.confirm_ids, ["I-taken"]);
+    // Another source's round delivers nothing of T1's.
+    let other =
+        crate::persistence::issues::deliver(&conn, "R", "CAND-7/round/1", &["T0".to_owned()])?;
+    assert!(other.lines.is_empty() && other.confirm_ids.is_empty());
+    // A verification turn's facts no longer list them as evidence entries: the store's assignment puts them in scope.
+    let facts = verification(&conn, &package_of_cand7()?, &["T1".to_owned()])?;
+    assert!(
+        facts
             .entries
             .iter()
             .all(|e| !e.text.contains("请确认已修复"))
     );
+    Ok(())
+}
+
+#[test]
+fn a_finding_or_acceptance_issue_in_a_wake_is_marked_for_the_runtimes_rework_after_its_round() -> R
+{
+    // docs/adr/ADR-029.md decision 9 (M2T18D-258): like a change request's, an Issue a finding or an acceptance failure
+    // opened is the Runtime's to rework once its round closes, and the wake says so.
+    let (_dir, conn) = world()?;
+    let s = supervision(
+        json!({"T1": 5}),
+        &[("role", "qa")],
+        json!([
+            {"seq": 5, "kind": "issue.opened", "payload": {"issue_id": "I1", "candidate_id": "CAND-7",
+                "severity": "critical", "source": "finding", "report_id": "rep", "finding_id": "F1"}},
+            {"seq": 6, "kind": "issue.opened", "payload": {"issue_id": "I2", "candidate_id": "CAND-7",
+                "severity": "high", "source": "acceptance", "ac_id": "AC-1-01"}}
+        ]),
+    );
+    let facts = facts(&conn, "R", "W/turn/1", "A9", Some(&s))?;
+    for seq in [5, 6] {
+        let entry = facts
+            .entries
+            .iter()
+            .find(|e| e.path == format!("events/{seq}"))
+            .ok_or(format!("no event {seq}"))?;
+        assert!(
+            entry.text.contains("轮次关闭后由 Runtime 返工"),
+            "{}",
+            entry.text
+        );
+    }
     Ok(())
 }
 

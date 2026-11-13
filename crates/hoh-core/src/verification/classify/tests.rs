@@ -79,6 +79,7 @@ fn test_054_05_only_one_of_ninety_six_combinations_is_accepted() {
                         acs,
                         failing_issues: false,
                         outside_failed: false,
+                        unconfirmed: false,
                     };
                     let class = classify(&input);
                     if class == Class::Passable {
@@ -123,6 +124,7 @@ fn failed_comes_before_flaky_before_inconclusive_and_an_empty_scope_never_passes
         acs,
         failing_issues,
         outside_failed: false,
+        unconfirmed: false,
     };
     assert_eq!(classify(&all(vec![Ac::Satisfied], false)), Class::Passable);
     assert_eq!(classify(&all(vec![Ac::Satisfied], true)), Class::Failed);
@@ -150,4 +152,67 @@ fn failed_comes_before_flaky_before_inconclusive_and_an_empty_scope_never_passes
         ..all(vec![Ac::Satisfied], false)
     };
     assert_eq!(classify(&unknown), Class::Inconclusive);
+}
+
+#[test]
+fn an_unconfirmed_issue_leaves_no_combination_passable_and_changes_nothing_else() {
+    // docs/adr/ADR-029.md decision 10 (M2T18D-153, -254): with `unconfirmed` the exhaustive combinations of the four
+    // dimensions, the coverage, the failing issues and the outside failures have no passable one, and every other class
+    // is what it is without it; without it the 96 combinations are unchanged (the test above).
+    use crate::verification::acceptance::{CheckRun, checks};
+    let run = |outcome: &str| CheckRun {
+        check_id: format!("c-{outcome}"),
+        outcome: outcome.to_owned(),
+        reason: None,
+        fail_lines: false,
+    };
+    let dimensions = [
+        checks(&[run("PASS")]),
+        checks(&[run("PASS"), run("FAIL")]),
+        checks(&[]),
+    ];
+    let reports = [Report::Pass, Report::Fail, Report::Unknown, Report::NotRun];
+    let coverages = [
+        vec![Ac::Satisfied],
+        vec![Ac::Satisfied, Ac::Undetermined],
+        vec![Ac::Flaky],
+        vec![Ac::Failed],
+        Vec::new(),
+    ];
+    let mut seen = 0;
+    for qa in reports {
+        for review in reports {
+            for c in dimensions {
+                for acs in &coverages {
+                    for (failing_issues, outside_failed) in
+                        [(false, false), (true, false), (false, true)]
+                    {
+                        let without = Input {
+                            qa,
+                            review,
+                            checks: c,
+                            acs: acs.clone(),
+                            failing_issues,
+                            outside_failed,
+                            unconfirmed: false,
+                        };
+                        let with = Input {
+                            unconfirmed: true,
+                            ..without.clone()
+                        };
+                        let (before, after) = (classify(&without), classify(&with));
+                        assert_ne!(after, Class::Passable, "{with:?}");
+                        let expected = if before == Class::Passable {
+                            Class::Inconclusive
+                        } else {
+                            before
+                        };
+                        assert_eq!(after, expected, "{with:?}");
+                        seen += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(seen, 4 * 4 * 3 * 5 * 3);
 }

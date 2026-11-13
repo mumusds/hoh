@@ -744,3 +744,37 @@ fn a_log_directory_gone_is_a_recorded_failure() -> Result<(), Box<dyn std::error
     assert_eq!(failed[0]["name"], logs.display().to_string());
     Ok(())
 }
+
+#[test]
+fn a_verifiers_confirm_ids_are_recorded_in_its_context_packed_and_its_entries_are_in_its_mandatory_scope()
+-> Result<(), Box<dyn std::error::Error>> {
+    // docs/adr/ADR-029.md decision 10: the Issue ids the store delivers with their description are recorded in the
+    // attempt's `context.packed` (`confirm_ids`), fixed from then on; the entries are scope lines of the task context,
+    // never trimmed. A turn with none records none.
+    let dir = tempfile::tempdir()?;
+    let mut w = work(None);
+    if let Some(facts) = w.assignment.context.as_mut() {
+        facts
+            .scope
+            .push("请确认已修复：Issue I-1（critical）：SENTINEL 越界".to_owned());
+        facts.confirm_ids = Some(vec!["I-1".to_owned()]);
+    }
+    let (text, record) = executor(dir.path())
+        .pack(&w, &contract("Contract.\n\n"), None)
+        .map_err(|r| format!("{r:?}"))?;
+    assert!(text.contains("SENTINEL 越界"), "{text}");
+    let packed = record.packed.ok_or("no packing")?;
+    assert_eq!(packed.event["confirm_ids"], serde_json::json!(["I-1"]));
+    let (_, plain) = executor(dir.path())
+        .pack(&work(None), &contract("Contract.\n\n"), None)
+        .map_err(|r| format!("{r:?}"))?;
+    assert!(
+        plain
+            .packed
+            .ok_or("no packing")?
+            .event
+            .get("confirm_ids")
+            .is_none()
+    );
+    Ok(())
+}

@@ -46,6 +46,9 @@ pub struct Facts {
     pub loads: Vec<Load>,
     /// A candidate's changed files, read by the executor ([`Facts::add_code`], decision 14's code source).
     pub code: Option<CodeSource>,
+    /// A verifier turn's: the Issue ids its mandatory scope delivers with their description for it to confirm fixed
+    /// (docs/adr/ADR-029.md decision 10), recorded in its `context.packed`; none for any other turn.
+    pub confirm_ids: Option<Vec<String>>,
 }
 
 /// A registered object to read into an evidence entry (docs/adr/ADR-028.md decision 14): its digest and the name it

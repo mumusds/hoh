@@ -282,6 +282,9 @@ pub(super) fn record(
             }),
         )?;
     }
+    // Its rows and its veto change what resolves an Issue (docs/adr/ADR-029.md decision 10): materialised before the
+    // commit.
+    super::issues::settle_all(&tx, &run_id)?;
     ctx.before_commit()?;
     tx.commit().map_err(sqlite_error)
 }

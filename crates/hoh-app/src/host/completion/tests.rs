@@ -284,6 +284,51 @@ fn a_completed_results_self_test_records_are_kept_by_their_digests_the_rest_refu
 }
 
 #[test]
+fn a_verifiers_taskresult_issues_go_with_its_report_for_the_store_to_take_its_confirmations() -> R {
+    // docs/adr/ADR-029.md decision 10: a verifier's TaskResult `issues` (its confirmation entries among them) are handed
+    // to the store with its report; the store keeps the confirmations of the Issues it was delivered.
+    let dir = tempfile::tempdir()?;
+    let identity = Identity {
+        role: "reviewer".to_owned(),
+        ..identity()
+    };
+    let entry = json!({"issue_id": "I-1", "state": "RESOLVED", "observed": "重放后不再越界"});
+    let mut ending = ending(
+        &[line(
+            "COMPLETED",
+            json!({"role": "reviewer", "issues": [entry]}),
+        )],
+        false,
+    );
+    ending.observed.final_text = Some(
+        "done\n```hoh-report\n{\"role\": \"reviewer\", \"status\": \"PASS\", \"scope\": [\"AC-1-01\"], \"findings\": []}\n```\n"
+            .to_owned(),
+    );
+    let text = "{\"type\": \"result\"}\n";
+    let sha256 = hoh_core::objects::put(dir.path(), text.as_bytes())?;
+    ending.observed.artifacts = vec![ArtifactRow {
+        path: hoh_core::objects::relative_path(&sha256),
+        sha256,
+        bytes: text.len() as u64,
+        mime: "application/x-ndjson".to_owned(),
+        kind: "raw_log".to_owned(),
+        name: "stdout.jsonl".to_owned(),
+    }];
+    let reporting = Reporting {
+        project: dir.path().to_owned(),
+        role: "reviewer".to_owned(),
+        session_id: "s-r".to_owned(),
+        candidate_id: format!("CAND-{}", "c".repeat(64)),
+        spec_sha256: "1".repeat(64),
+    };
+    match verifier_outcome(&identity, &mut ending, Some(&reporting)) {
+        VerifierOutcome::Settle { report } => assert_eq!(report.confirmations, [entry]),
+        other => return Err(format!("{other:?}").into()),
+    }
+    Ok(())
+}
+
+#[test]
 fn a_verifiers_report_takes_its_session_log_whatever_its_agent_names_it() -> R {
     // docs/adr/ADR-028.md decision 15 (M2T16R-50): the report's raw session is the turn's stdout log, which claude and
     // pi name stdout.jsonl and codex app-server.stdout.jsonl or exec.stdout.jsonl; each settles with that log, never

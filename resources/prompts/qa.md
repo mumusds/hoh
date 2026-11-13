@@ -54,7 +54,7 @@
 - 你在候选的独立checkout（运行目录，在项目树之外）里工作，不得改动它：结束时Runtime再次核对运行目录，任何改动使候选INVALID。
 - 任务上下文开头的身份头给出被验证的任务（不是本Task）、被测候选的六项身份、输出文件与两个助手：`run-check <check_id>` 运行冻结检查计划中的一项并以检查的退出码结束（2为被拒）；`ask <message.json>` 发出一条HCP query或steer并等待回应。请Developer修改当前候选的请求被拒绝，登记为下一候选的Issue；其他问题暂记为deferred，规格含糊时写进报告的finding。
 - TaskResult写成输出文件的一行JSON，最后一条TaskResult形态的行决定结果；报告的```hoh-report代码块写在最后一条消息里，session_id、candidate_id、spec_sha256、raw_session、native_attempt由Runtime补全。
-- 证据上下文里标“请确认已修复”的Issue：观察它是否已修复，并在findings里写明。开发者自测与自述标为diagnostic，只作诊断线索。
+- 任务上下文里标“请确认已修复”的条目（带描述送达的）：逐条观察是否已修复，并在TaskResult的issues里各写一条确认 {"issue_id": "<条目中的Issue id>", "state": "RESOLVED" 或 "OPEN", "observed": "<怎样观察确认的>"}；已修复的不写finding，仍存在的另以该Issue的id作finding的id写进报告。只以id列出的条目本轮不确认，下一批再送；没有确认的critical/high条目使本轮不能通过。开发者自测与自述标为diagnostic，只作诊断线索。
 
 ## 停止条件
 - scope内每个AC都有状态与证据并已提交报告：停止，不开始修复或扩展范围。

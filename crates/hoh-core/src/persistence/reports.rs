@@ -475,8 +475,8 @@ fn stale_reason(
     })
 }
 
-/// [`intake_in`] in a transaction of its own ([`super::Store::record_report`]): only the report's intake (its row and
-/// events); no task or attempt moves.
+/// [`intake_in`] in a transaction of its own ([`super::Store::record_report`]): only the report's intake (its row, its
+/// events, its findings' Issues and observation facts, materialised by `settle_all`); no task or attempt moves.
 pub(super) fn record(
     conn: &mut rusqlite::Connection,
     intake: &ReportIntake,
@@ -484,6 +484,21 @@ pub(super) fn record(
 ) -> Result<IntakeState, PersistError> {
     let tx = writer::begin(conn, ctx)?;
     let done = intake_in(&tx, intake, ctx)?;
+    // Its findings as Issues and its observations as facts, as in a verifier's settle (docs/adr/ADR-029.md decisions
+    // 9 and 10); no TaskResult here, so no confirmation.
+    if let (Some(report_id), ReportState::Current | ReportState::Stale) =
+        (&done.report_id, done.state)
+    {
+        super::issues::take_report(&tx, &intake.attempt_id, report_id, &intake.report, &[])?;
+        let run_id: String = tx
+            .query_row(
+                "SELECT run_id FROM independent_reports WHERE report_id = ?1",
+                params![report_id],
+                |r| r.get(0),
+            )
+            .map_err(sqlite_error)?;
+        super::issues::settle_all(&tx, &run_id)?;
+    }
     ctx.before_commit()?;
     tx.commit().map_err(sqlite_error)?;
     Ok(done)
