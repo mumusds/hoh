@@ -96,9 +96,12 @@ SQL_WRITE = re.compile(
     r'|ON\s+CONFLICT\b[^;]*?\bDO\s+UPDATE)\b', re.IGNORECASE)
 # Writes that change or remove a row of an append-only table (docs/adr/ADR-029.md decision 6, J1): UPDATE, DELETE,
 # REPLACE (also INSERT OR REPLACE) and an upsert's DO UPDATE. A plain INSERT and INSERT OR IGNORE only add.
-APPEND_ONLY_TABLES = r'(?:main\.)?(?:acceptance_results|evidence)\b'
+# The table as SQLite accepts it: a schema prefix (main., temp.), the name bare or quoted ("…", `…`, […]) (M2T18R-52).
+APPEND_ONLY_TABLES = (r'(?:(?:main|temp)\s*\.\s*)?(?:"(?:acceptance_results|evidence)"|`(?:acceptance_results|evidence)`'
+                      r'|\[(?:acceptance_results|evidence)\]|(?:acceptance_results|evidence)\b)')
 APPEND_ONLY = re.compile(
-    r'\b(?:UPDATE\s+(?:OR\s+\w+\s+)?' + APPEND_ONLY_TABLES + r'\s+SET'
+    r'\b(?:UPDATE\s+(?:OR\s+\w+\s+)?' + APPEND_ONLY_TABLES +
+    r'(?:\s+(?:AS\s+)?(?!SET\b|INDEXED\b|NOT\b)\w+)?(?:\s+(?:INDEXED\s+BY\s+\w+|NOT\s+INDEXED))?\s+SET'
     r'|DELETE\s+FROM\s+' + APPEND_ONLY_TABLES +
     r'|(?:INSERT\s+OR\s+)?REPLACE\s+INTO\s+' + APPEND_ONLY_TABLES +
     r'|INSERT\s+(?:OR\s+\w+\s+)?INTO\s+' + APPEND_ONLY_TABLES + r'[^;]*?\bON\s+CONFLICT\b[^;]*?\bDO\s+UPDATE)',

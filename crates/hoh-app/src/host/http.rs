@@ -1095,14 +1095,19 @@ async fn list_acceptance(
     if !(1..=500).contains(&limit) {
         return unreadable_page();
     }
-    // The cursor is `<freeze seq>:<AC>` of the last item of the previous page.
-    let after = match query.cursor.as_deref().map(|c| c.split_once(':')) {
+    // The cursor is `<freeze seq>:<candidate row>:<AC>` of the last item of the previous page (M2T18R-53).
+    let after = match query.cursor.as_deref().map(|c| {
+        let mut parts = c.splitn(3, ':');
+        (parts.next(), parts.next(), parts.next())
+    }) {
         None => None,
-        Some(Some((seq, ac))) => match seq.parse::<i64>() {
-            Ok(seq) if seq >= 0 && !ac.is_empty() => Some((seq, ac.to_owned())),
+        Some((Some(seq), Some(row), Some(ac))) => match (seq.parse::<i64>(), row.parse::<i64>()) {
+            (Ok(seq), Ok(row)) if seq >= 0 && row >= 0 && !ac.is_empty() => {
+                Some((seq, row, ac.to_owned()))
+            }
             _ => return unreadable_page(),
         },
-        Some(None) => return unreadable_page(),
+        Some(_) => return unreadable_page(),
     };
     let Ok(UrlPath(run_id)) = run_id else {
         return error(
@@ -1123,7 +1128,7 @@ async fn list_acceptance(
             StatusCode::OK,
             axum::Json(json!({
                 "items": page.items,
-                "next_cursor": page.next.map(|(seq, ac)| format!("{seq}:{ac}")),
+                "next_cursor": page.next.map(|(seq, row, ac)| format!("{seq}:{row}:{ac}")),
                 "watermark": page.watermark,
             })),
         )

@@ -92,7 +92,8 @@ pub struct AcceptanceItem {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptancePage {
     pub items: Vec<AcceptanceItem>,
-    pub next: Option<(i64, String)>,
+    /// The last item's candidate (freeze seq, row) and AC.
+    pub next: Option<(i64, i64, String)>,
     pub watermark: i64,
 }
 
@@ -207,6 +208,8 @@ struct Frozen {
     id: String,
     state: String,
     seq: i64,
+    /// Its row, which orders candidates with the same freeze seq (none written: older or imported data, M2T18R-53).
+    rowid: i64,
 }
 
 /// Run `run_id`'s candidates, the latest first: by their `candidate.frozen`, the run's latest candidate being the one
@@ -217,7 +220,7 @@ fn candidates(conn: &Connection, run_id: &str) -> Result<Vec<Frozen>, PersistErr
         .prepare(
             "SELECT c.candidate_id, c.state, coalesce((SELECT max(e.seq) FROM events e WHERE e.run_id = c.run_id \
                AND e.kind = 'candidate.frozen' AND json_extract(e.payload_json, '$.candidate_id') = c.candidate_id), 0) \
-               AS frozen \
+               AS frozen, c.rowid \
              FROM candidates c WHERE c.run_id = ?1 ORDER BY frozen DESC, c.rowid DESC",
         )
         .map_err(sqlite_error)?;
@@ -227,6 +230,7 @@ fn candidates(conn: &Connection, run_id: &str) -> Result<Vec<Frozen>, PersistErr
                 id: r.get(0)?,
                 state: r.get(1)?,
                 seq: r.get(2)?,
+                rowid: r.get(3)?,
             })
         })
         .map_err(sqlite_error)?;
@@ -548,13 +552,13 @@ pub(super) fn acceptance(
 
 /// A page of run `run_id`'s acceptance projection (`GET /v1/runs/{run_id}/acceptance`, decision 5): every candidate of
 /// the run, the latest first, each AC in the run's scope on it by id, labelled by the display projection of its rows
-/// there under the run's specification; at most `limit` items after `after` (the freeze seq and AC of the last item of
+/// there under the run's specification; at most `limit` items after `after` (the freeze seq, the candidate's row and the AC of the last item of
 /// the previous page); the next cursor when more follow. None when there is no such run.
 pub(super) fn acceptance_page(
     conn: &Connection,
     run_id: &str,
     limit: usize,
-    after: Option<(i64, String)>,
+    after: Option<(i64, i64, String)>,
 ) -> Result<Option<AcceptancePage>, PersistError> {
     read(conn, || {
         let Some(spec) = run_spec(conn, run_id)? else {
@@ -572,18 +576,20 @@ pub(super) fn acceptance_page(
         let rounds = closing::rounds(conn, run_id)?;
         let all = candidates(conn, run_id)?;
         let latest = all.first().map(|c| c.id.clone());
-        let mut keyed: Vec<((i64, String), AcceptanceItem)> = Vec::new();
+        let mut keyed: Vec<((i64, i64, String), AcceptanceItem)> = Vec::new();
         for c in &all {
             // Only the candidates at or after the cursor's are read.
-            if after.as_ref().is_some_and(|(seq, _)| c.seq > *seq) {
+            if after
+                .as_ref()
+                .is_some_and(|(seq, row, _)| (c.seq, c.rowid) > (*seq, *row))
+            {
                 continue;
             }
             for a in shown(conn, run_id, &spec_id, c, &scope, &rounds)? {
-                let key = (c.seq, a.ac_id.clone());
-                if after
-                    .as_ref()
-                    .is_some_and(|(seq, ac)| c.seq == *seq && a.ac_id <= *ac)
-                {
+                let key = (c.seq, c.rowid, a.ac_id.clone());
+                if after.as_ref().is_some_and(|(seq, row, ac)| {
+                    (c.seq, c.rowid) == (*seq, *row) && a.ac_id <= *ac
+                }) {
                     continue;
                 }
                 keyed.push((

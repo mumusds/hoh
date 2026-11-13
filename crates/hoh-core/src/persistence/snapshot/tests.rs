@@ -582,6 +582,24 @@ async fn the_lists_give_each_candidates_projection_newest_first_and_each_issues_
     let past = reader.issues_page("R", 1, rest.next)?.ok_or("no run R")?;
     assert!(past.items.is_empty() && past.next.is_none(), "{past:?}");
     assert_eq!(state_of(&path, &acceptance_issue)?, "OPEN");
+    // M2T18R-53: candidates without a `candidate.frozen` (imported or older data) share the freeze seq 0; the cursor
+    // still names one item, so paging one by one gives every item once.
+    drop(reader);
+    Connection::open(&path)?.execute("DELETE FROM events WHERE kind = 'candidate.frozen'", [])?;
+    let reader = store.reader()?;
+    let whole = reader.acceptance_page("R", 500, None)?.ok_or("no run R")?;
+    assert_eq!(whole.items.len(), 2, "{whole:?}");
+    let mut paged = Vec::new();
+    let mut next = None;
+    loop {
+        let page = reader.acceptance_page("R", 1, next)?.ok_or("no run R")?;
+        paged.extend(page.items);
+        next = page.next;
+        if next.is_none() || paged.len() > 4 {
+            break;
+        }
+    }
+    assert_eq!(paged, whole.items);
     assert_eq!(reader.acceptance("NO-RUN")?, None);
     assert_eq!(reader.acceptance_page("NO-RUN", 1, None)?, None);
     assert_eq!(reader.issues_page("NO-RUN", 1, None)?, None);

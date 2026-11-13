@@ -119,7 +119,7 @@ M2-T16 起，产品自己完成“开发者完成 → 冻结 → QA 与 Review �
   - 只追加：`acceptance_results` 与 `evidence` 由写者连接的 TEMP 触发器（含 `recursive_triggers`）拒绝改写与删除，`persistence_scan.py` 的检查 7 只在 `append_only_allow` 列出的文件、函数与语句处放行。
   - 报告入库：`independent_reports` 的 CURRENT/STALE/REJECTED；REJECTED 的验证 Task 置 BLOCKED（NEED_DECISION），解除归 M2-T13；STALE 在冻结与每个对账时翻转。
   - Issue：报告的 finding 与失败关闭的 AC 失败项各登记 Issue；RESOLVED/REOPENED 由观察事实、验收行与否决的状态函数求出，在每个相关写事务里物化，做判定的读者（汇合、快照、`/issues`、发布导出）直接求值。
-  - 余项：没有 finding 的 FAIL 报告不另开 finding Issue（它的 AC 失败另有验收失败 Issue）；被接受 Task 的 low/medium Issue 保持 OPEN，列入发布说明；finding 的 evidence 只是引用（运行目录随 Attempt 删除）；RESOLVED 依赖验证者在 TaskResult.issues 写确认条目，没有确认的 critical/high 使轮次不可通过；TEST-053-05 的“替身永不得 PASS”由 adapter-live.sh 的守卫与发布门禁的审查保证（ADR-029 实施中的更正 7）。
+  - 余项：没有 finding 的 FAIL 报告不另开 finding Issue（它的 AC 失败另有验收失败 Issue）；被接受 Task 的 low/medium Issue 保持 OPEN，列入发布说明；finding 的 evidence 只是引用（运行目录随 Attempt 删除）；RESOLVED 依赖验证者在 TaskResult.issues 写确认条目，没有确认的 critical/high 使轮次不可通过；TEST-053-05：默认 profile 下 adapter-live.sh 的复核要求默认绑定与覆盖每个绑定 Agent 的原生会话；在 `HOH_LIVE_PROFILE=v0.1` 下遵守协议的替身能得 PASS，只由发布审查在各 Agent 的会话存储里核对原生会话 id 挡住（ADR-029 实施中的更正 7，M2T18R-55；在测试内核对原生存储是后续改进）。
   - 运行目录的位置：HoH 的状态与验证者的运行目录（XDG 状态目录下）不得位于系统临时目录（TMPDIR）之下：有的 Agent 插件（pi 的 pi-lens）在临时目录下的工作目录里写自己的状态，验证者的运行目录核对会把它判为改动并否决候选（ADR-029 实施中的更正 8）。
 
 ## 工具退出语义
