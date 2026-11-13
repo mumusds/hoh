@@ -58,13 +58,22 @@ pub(super) fn write_helpers(
     std::fs::create_dir_all(&requests)?;
     let quoted = shell_quote(&requests.to_string_lossy());
     // A request takes the first free number by an atomic mkdir, is written whole and renamed into place, and its
-    // answer is waited for; the host takes the numbers in order.
-    let claim = format!(
-        "d={quoted}\nmkdir -p \"$d\" || exit 2\nn=1\nwhile ! mkdir \"$d/$n.claim\" 2>/dev/null; do n=$((n+1)); done\n"
-    );
-    let wait = |limit: u64, name: &str| {
+    // answer is waited for; the host takes the numbers in order. The directory is the host's, made before the agent
+    // starts: once it is gone (the host removes an attempt's that is no longer live) a helper ends with 2 at its next
+    // look, never making it again nor waiting out its wait (M2T18R-54).
+    let gone = |name: &str| {
+        format!("[ -d \"$d\" ] || {{ echo '{name}: its request directory is gone' >&2; exit 2; }}")
+    };
+    let claim = |name: &str| {
+        let gone = gone(name);
         format!(
-            "waited=0\nwhile [ ! -f \"$d/$n.response.json\" ]; do\n  sleep 1; waited=$((waited+1))\n  \
+            "d={quoted}\n{gone}\nn=1\nwhile ! mkdir \"$d/$n.claim\" 2>/dev/null; do\n  {gone}\n  n=$((n+1))\ndone\n"
+        )
+    };
+    let wait = |limit: u64, name: &str| {
+        let gone = gone(name);
+        format!(
+            "waited=0\nwhile [ ! -f \"$d/$n.response.json\" ]; do\n  {gone}\n  sleep 1; waited=$((waited+1))\n  \
              [ \"$waited\" -ge {limit} ] && {{ echo '{name}: no answer' >&2; exit 2; }}\ndone\n\
              cat \"$d/$n.response.json\"; echo\n"
         )
@@ -73,17 +82,19 @@ pub(super) fn write_helpers(
         "#!/bin/sh\n# HoH's request helper (docs/adr/ADR-028.md decision 7): run-check <check_id> runs a check of the \
          frozen plan on the candidate and ends with its exit code (2: refused).\n\
          case \"$1\" in ''|*[!A-Za-z0-9._-]*) echo 'run-check: give one check id of the frozen plan' >&2; exit 2;; esac\n\
-         {claim}printf '{{\"kind\":\"check\",\"check_id\":\"%s\"}}\\n' \"$1\" > \"$d/$n.tmp\" && mv \"$d/$n.tmp\" \"$d/$n.json\" || exit 2\n\
+         {}printf '{{\"kind\":\"check\",\"check_id\":\"%s\"}}\\n' \"$1\" > \"$d/$n.tmp\" && mv \"$d/$n.tmp\" \"$d/$n.json\" || exit 2\n\
          {}code=$(sed -n 's/.*\"exit_code\":\\([0-9][0-9]*\\).*/\\1/p' \"$d/$n.response.json\")\n\
          [ -n \"$code\" ] && exit \"$code\"\nexit 2\n",
+        claim("run-check"),
         wait(check_wait, "run-check")
     );
     let ask = format!(
         "#!/bin/sh\n# HoH's request helper (docs/adr/ADR-028.md decisions 7 and 13): ask <message.json> sends one HCP \
          query or steer of this attempt and prints the answer (rejected or deferred).\n\
          [ -f \"$1\" ] || {{ echo 'ask: give the message file' >&2; exit 2; }}\n\
-         {claim}{{ printf '{{\"kind\":\"message\",\"message\":'; cat \"$1\"; printf '}}\\n'; }} > \"$d/$n.tmp\" && \
+         {}{{ printf '{{\"kind\":\"message\",\"message\":'; cat \"$1\"; printf '}}\\n'; }} > \"$d/$n.tmp\" && \
          mv \"$d/$n.tmp\" \"$d/$n.json\" || exit 2\n{}exit 0\n",
+        claim("ask"),
         wait(ASK_WAIT, "ask")
     );
     let helpers = Helpers {

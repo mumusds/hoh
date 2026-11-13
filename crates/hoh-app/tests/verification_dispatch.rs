@@ -134,10 +134,11 @@ fn git(dir: &Path, args: &[&str]) -> R {
     Ok(())
 }
 
-/// The project's frozen check plan: `unit` fails with exit code 1 and changes nothing.
+/// The project's frozen check plan: `unit` fails with exit code 1 and changes nothing. Each check has a timeout, so a
+/// request helper's wait is minutes, not the hour a check naming none gets (M2T18R-54).
 const PLAN: &str = r#"{"schema_version": "1.0", "plan_id": "fixture", "checks": {
-  "unit": {"mode": "product", "argv": ["sh", "-c", "exit 1"]},
-  "pass": {"mode": "product", "artifacts": ["test-results.jsonl"], "argv": ["sh", "-c",
+  "unit": {"mode": "product", "timeout_seconds": 60, "argv": ["sh", "-c", "exit 1"]},
+  "pass": {"mode": "product", "artifacts": ["test-results.jsonl"], "timeout_seconds": 60, "argv": ["sh", "-c",
     "printf '%s\\n' '{\"schema_version\": \"1.0\", \"test_id\": \"TEST-035-03\", \"name\": \"test_035_03_works\", \"status\": \"PASS\"}' > \"$HOH_EVIDENCE_DIR/test-results.jsonl\""]}}}
 "#;
 
@@ -260,6 +261,8 @@ struct Team {
     /// The Developer's FakeAgent writes a self-test record of every TEST passing under its attempt's directory and names
     /// it in its TaskResult's evidence (docs/adr/ADR-028.md decision 14).
     self_test: AtomicBool,
+    /// Each FakeAgent started: its process group (its leader's pid) and its leader's start time.
+    agents: std::sync::Mutex<Vec<(u32, Option<String>)>>,
 }
 
 /// The Developer FakeAgent's self-test record: it claims every TEST of TEST-053-01's specification passed.
@@ -290,7 +293,39 @@ impl Team {
             qa_findings: std::sync::Mutex::default(),
             review_findings: std::sync::Mutex::default(),
             self_test: AtomicBool::new(false),
+            agents: std::sync::Mutex::default(),
         }
+    }
+
+    /// End every FakeAgent still running, its whole process group (its request helpers too), then let every held one
+    /// go: a host's stop leaves its agents running (they outlive a host), so a test ends its own once its host is
+    /// stopped, before its directory goes, and none runs a request helper against no host (M2T18R-54). Only a group
+    /// whose leader is still the FakeAgent started is signalled, never a number taken again.
+    fn end_agents(&self) {
+        let agents = self
+            .agents
+            .lock()
+            .map(|mut a| std::mem::take(&mut *a))
+            .unwrap_or_default();
+        for (pgid, start) in agents {
+            let same =
+                start.is_some() && hoh_agents::identity::start_id(pgid).ok().flatten() == start;
+            if let (true, Ok(pgid)) = (same, i32::try_from(pgid)) {
+                let _ = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(pgid),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+        }
+        self.developer.store(true, Ordering::SeqCst);
+        self.release.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A test's Team ends its FakeAgents with it, however the test ended.
+impl Drop for Team {
+    fn drop(&mut self) {
+        self.end_agents();
     }
 }
 
@@ -492,6 +527,9 @@ impl hoh_app::host::Executor for Team {
             .spawn()
             .map_err(|e| refusal(&format!("SPAWN: {e}"), transient))?;
         let pid = child.id();
+        if let Ok(mut agents) = self.agents.lock() {
+            agents.push((pid, hoh_agents::identity::start_id(pid).ok().flatten()));
+        }
         let stdin = child.stdin.take();
         let gate = hoh_app::host::Gate::new(move || {
             use std::io::Write as _;
@@ -607,11 +645,11 @@ async fn candidate_ready_hands_off(critical: bool) -> R<(u32, Value, Value)> {
         }
         let turns = team.commander_turns.load(Ordering::SeqCst) - at_ready;
         let handoffs = rows(&project, HANDOFFS)?;
-        team.release.store(true, Ordering::SeqCst);
         R::Ok((turns, handoffs, verifiers))
     }
     .await;
     host.shutdown().await;
+    team.end_agents();
     outcome
 }
 
@@ -713,11 +751,11 @@ async fn test_035_05_with_the_commander_unavailable_qa_and_review_are_still_disp
             )?[0]["n"],
             json!(0)
         );
-        team.release.store(true, Ordering::SeqCst);
         R::Ok(())
     }
     .await;
     host.shutdown().await;
+    team.end_agents();
     outcome
 }
 
@@ -777,11 +815,11 @@ async fn test_036_03_three_attempts_then_qa_in_a_session_of_its_own() -> R {
             .ok_or("no qa attempt")?;
         let session = qa["session_id"].as_str().ok_or("qa has no session")?;
         assert!(!developer.contains(session), "{session} in {developer:?}");
-        team.release.store(true, Ordering::SeqCst);
         R::Ok(())
     }
     .await;
     host.shutdown().await;
+    team.end_agents();
     outcome
 }
 
@@ -934,11 +972,11 @@ async fn test_021_05_a_critical_issue_wakes_the_reserved_slot_and_handoffs_survi
                 "{event}"
             );
         }
-        team.release.store(true, Ordering::SeqCst);
         R::Ok(())
     }
     .await;
     host.shutdown().await;
+    team.end_agents();
     outcome
 }
 
@@ -1070,6 +1108,7 @@ async fn each_verifier_works_in_a_checkout_of_the_candidate_outside_the_project_
     }
     .await;
     host.shutdown().await;
+    team.end_agents();
     outcome
 }
 
@@ -1121,6 +1160,7 @@ async fn a_verifier_that_changes_its_run_directory_makes_the_candidate_invalid()
     }
     .await;
     host.shutdown().await;
+    team.end_agents();
     outcome
 }
 
@@ -1215,6 +1255,7 @@ async fn a_verifier_runs_planned_checks_and_asks_through_its_request_helpers() -
     }
     .await;
     host.shutdown().await;
+    team.end_agents();
     outcome
 }
 
@@ -1332,6 +1373,7 @@ async fn test_037_02_qa_and_review_run_side_by_side_and_the_round_closes_only_af
     }
     .await;
     host.shutdown().await;
+    team.end_agents();
     outcome
 }
 
@@ -1391,6 +1433,7 @@ async fn a_damaged_pending_record_makes_its_candidate_stale_and_its_round_supers
     }
     .await;
     host.shutdown().await;
+    team.end_agents();
     outcome
 }
 
@@ -1527,9 +1570,9 @@ async fn at_the_hosts_start_a_failed_recovery_wakes_the_commander_and_holds_its_
     .await;
     let _ = std::fs::set_permissions(&check_dir, std::fs::Permissions::from_mode(0o755));
     if let Ok(second) = second {
-        team.release.store(true, Ordering::SeqCst);
         second.shutdown().await;
     }
+    team.end_agents();
     outcome
 }
 
@@ -1672,6 +1715,7 @@ async fn test_054_03_qa_fails_first_and_review_still_completes_with_its_report_i
     }
     .await;
     host.shutdown().await;
+    team.end_agents();
     outcome
 }
 
@@ -1734,6 +1778,7 @@ async fn the_reports_qa_and_review_settle_through_the_host_are_current_rows_of_a
     }
     .await;
     host.shutdown().await;
+    team.end_agents();
     outcome
 }
 
@@ -1887,9 +1932,8 @@ async fn test_037_03_a_qa_that_rewrites_a_tracked_file_makes_its_evidence_invali
         R::Ok(())
     }
     .await;
-    team.release.store(true, Ordering::SeqCst);
-    let _ = std::fs::write(out.join("end-review"), "");
     host.shutdown().await;
+    team.end_agents();
     outcome
 }
 
@@ -1926,9 +1970,8 @@ async fn test_037_03_a_qa_that_ran_a_passing_check_before_rewriting_a_tracked_fi
         R::Ok(())
     }
     .await;
-    team.release.store(true, Ordering::SeqCst);
-    let _ = std::fs::write(out.join("end-review"), "");
     host.shutdown().await;
+    team.end_agents();
     outcome
 }
 
@@ -2129,9 +2172,8 @@ async fn test_037_04_a_change_request_during_the_barrier_is_refused_and_fixed_on
         R::Ok(())
     }
     .await;
-    let _ = std::fs::write(out.join("qa-go"), "");
-    let _ = std::fs::write(out.join("end-review-2"), "");
     host.shutdown().await;
+    team.end_agents();
     outcome
 }
 
@@ -2187,6 +2229,7 @@ async fn a_verifier_whose_candidate_is_no_longer_verifying_is_refused_its_run_di
     }
     .await;
     host.shutdown().await;
+    team.end_agents();
     outcome
 }
 
@@ -2257,6 +2300,7 @@ async fn a_change_request_left_in_a_verifiers_bridge_is_answered_when_a_reconcil
     }
     .await;
     second.shutdown().await;
+    team.end_agents();
     outcome
 }
 
@@ -2341,8 +2385,8 @@ async fn a_cancelled_runs_open_round_is_closed_superseded_and_its_handoffs_rejec
         R::Ok(())
     }
     .await;
-    team.release.store(true, Ordering::SeqCst);
     host.shutdown().await;
+    team.end_agents();
     outcome
 }
 
@@ -2351,11 +2395,11 @@ async fn a_cancelled_runs_open_round_is_closed_superseded_and_its_handoffs_rejec
 const SPEC_AB: &str = "{\"requirements\": [{\"id\": \"REQ-090\", \"acceptance\": [{\"id\": \"AC-090-01\", \"test_id\": \"TEST-090-01\"}, {\"id\": \"AC-090-02\", \"test_id\": \"TEST-090-02\"}]}]}\n";
 
 /// Its check plan: each criterion's scenario check is a real command over the candidate's source, writing its TEST's
-/// result line and failing when the feature is missing.
+/// result line and failing when the feature is missing; each with a timeout, as [`PLAN`]'s.
 const PLAN_AB: &str = r#"{"schema_version": "1.0", "plan_id": "missing-feature", "checks": {
-  "feature-a": {"mode": "product", "artifacts": ["test-results.jsonl"], "argv": ["sh", "-c",
+  "feature-a": {"mode": "product", "artifacts": ["test-results.jsonl"], "timeout_seconds": 60, "argv": ["sh", "-c",
     "if grep -q 'pub fn a()' src/lib.rs; then s=PASS; else s=FAIL; fi; printf '{\"schema_version\": \"1.0\", \"test_id\": \"TEST-090-01\", \"name\": \"test_090_01_feature_a\", \"status\": \"%s\"}\\n' \"$s\" > \"$HOH_EVIDENCE_DIR/test-results.jsonl\"; test \"$s\" = PASS"]},
-  "feature-b": {"mode": "product", "artifacts": ["test-results.jsonl"], "argv": ["sh", "-c",
+  "feature-b": {"mode": "product", "artifacts": ["test-results.jsonl"], "timeout_seconds": 60, "argv": ["sh", "-c",
     "if grep -q 'pub fn b()' src/lib.rs; then s=PASS; else s=FAIL; fi; printf '{\"schema_version\": \"1.0\", \"test_id\": \"TEST-090-02\", \"name\": \"test_090_02_feature_b\", \"status\": \"%s\"}\\n' \"$s\" > \"$HOH_EVIDENCE_DIR/test-results.jsonl\"; test \"$s\" = PASS"]}}}
 "#;
 
@@ -2498,8 +2542,8 @@ async fn missing_feature(finding: bool) -> R<Value> {
         R::Ok(observables)
     }
     .await;
-    team.release.store(true, Ordering::SeqCst);
     host.shutdown().await;
+    team.end_agents();
     outcome
 }
 
@@ -2747,9 +2791,8 @@ async fn test_053_04_a_new_candidate_resets_the_current_projection_and_the_accep
         R::Ok(())
     }
     .await;
-    team.developer.store(true, Ordering::SeqCst);
-    team.release.store(true, Ordering::SeqCst);
     host.shutdown().await;
+    team.end_agents();
     outcome
 }
 
@@ -2835,8 +2878,8 @@ async fn test_054_04_findings_settled_through_the_host_trace_to_their_report_and
         R::Ok(())
     }
     .await;
-    team.release.store(true, Ordering::SeqCst);
     host.shutdown().await;
+    team.end_agents();
     outcome
 }
 
@@ -3080,9 +3123,7 @@ async fn test_054_02_a_report_on_a_superseded_candidate_is_stale() -> R {
         R::Ok(())
     }
     .await;
-    let _ = std::fs::write(out.join("second-go"), "");
-    let _ = std::fs::write(out.join("c1-go"), "");
-    let _ = std::fs::write(out.join("c2-go"), "");
     host.shutdown().await;
+    team.end_agents();
     outcome
 }

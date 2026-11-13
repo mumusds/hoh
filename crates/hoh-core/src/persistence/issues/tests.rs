@@ -97,6 +97,23 @@ pub(in crate::persistence) async fn start(
     round: &str,
     forged: &[(&str, &[&str])],
 ) -> R<(String, String)> {
+    let started = dispatch(store, path, forged).await?;
+    let of = |role: &str| {
+        started
+            .get(&child_id(round, &format!("task/{role}")))
+            .cloned()
+            .ok_or(format!("{round}'s {role} was not dispatched"))
+    };
+    Ok((of("qa")?, of("reviewer")?))
+}
+
+/// Every verifier task the scheduler dispatches now, started and its delivery recorded as [`start`] does: task ->
+/// attempt.
+async fn dispatch(
+    store: &Store,
+    path: &Path,
+    forged: &[(&str, &[&str])],
+) -> R<BTreeMap<String, String>> {
     let mut started = BTreeMap::new();
     while let Some(d) = store.schedule_round("R", verifiers()).await?.dispatched {
         let role = if d.task_id.ends_with("/qa") {
@@ -136,13 +153,7 @@ pub(in crate::persistence) async fn start(
         )?;
         started.insert(d.task_id.clone(), d.attempt_id.clone());
     }
-    let of = |role: &str| {
-        started
-            .get(&child_id(round, &format!("task/{role}")))
-            .cloned()
-            .ok_or(format!("{round}'s {role} was not dispatched"))
-    };
-    Ok((of("qa")?, of("reviewer")?))
+    Ok(started)
 }
 
 /// The confirm_ids attempt `attempt` was delivered.
@@ -1508,4 +1519,815 @@ async fn siblings(r3_closes_first: bool) -> R {
     )?;
     assert!(next.iter().any(|i| i.issue_id == x), "{next:?}");
     Ok(())
+}
+
+// The operation-level interleaving model of decision 10's state function (docs/adr/ADR-029.md test plan, "状态函数";
+// M2T18D-502, -550, -600, -601, -602, -650, -651, -755, -850; M2T18R-51): two sibling rounds on one candidate, two
+// fingerprints and one AC, driven by the store's own transactions (verifier settles, round closes, a freeze that
+// supersedes, a run cancel's close, a veto midway, evidence recorded after its round closed, a change request) in every
+// order a family of scripts allows. After each transaction the materialised Issue states agree with the state function
+// evaluated directly; at the end each Issue is resolved alike in every order it exists in, as the design says.
+
+/// Y's words: a high finding without a locator, so a change request in the same words has Y's fingerprint.
+const Y_TEXT: &str = "解析器在空输入上越界";
+
+/// The test AC-1-01 fails on (A's, and A3's).
+const T: &str = "test_1_01_bounds";
+
+/// One operation of a script.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Op {
+    /// R3's QA records its planned check (AC-1-01 PASS) and settles PASS, confirming X and Y fixed.
+    Qa3,
+    /// R3's reviewer settles PASS, confirming X and Y fixed.
+    Reviewer3,
+    /// R4's verifiers are dispatched (each role's one session is free once R3's settled), both delivered X and Y.
+    Start4,
+    /// R4's QA records its planned check (AC-2-01 PASS; AC-1-01, outside R4's scope, FAIL on T when the family says so)
+    /// and settles, confirming X still OPEN and Y fixed.
+    Qa4,
+    /// R4's reviewer settles PASS, confirming Y fixed.
+    Reviewer4,
+    /// A verification reconcile: the rounds whose verifiers are done close, whatever their verdict.
+    Close,
+    /// R4's reviewer records a vetoed planned check (INVALID) on C3: C3 INVALID under verification, or vetoed though
+    /// already REJECTED.
+    Veto,
+    /// Writer F completes C4: C3 superseded when still under verification, so its rounds close superseded.
+    Supersede,
+    /// The run's cancel requested (as its canceller records it): the rounds then close superseded.
+    Cancel,
+    /// R4's QA asks for a change in Y's words: a change request's Issue on C3, present for Y's fingerprint.
+    ChangeRequest,
+    /// R2's QA (its round long closed) records AC-1-01 PASS on C3: rows at once, on a candidate vetoed or REJECTED.
+    LatePassC3,
+    /// R2's QA records AC-1-01 FAIL of T on C3, a later candidate than A's.
+    LateFailC3,
+    /// R2's QA records AC-1-01 PASS on C4.
+    LatePassC4,
+}
+
+/// The orders every script keeps: R4's verifiers are dispatched once R3's of their role settled (one session per role)
+/// and before any reconcile, so each is delivered X and Y whatever comes next.
+const DISPATCH: &[(Op, Op)] = &[
+    (Op::Qa3, Op::Start4),
+    (Op::Reviewer3, Op::Start4),
+    (Op::Start4, Op::Qa4),
+    (Op::Start4, Op::Reviewer4),
+    (Op::Start4, Op::Close),
+];
+
+/// R3's QA settles before its reviewer (the families beyond the first vary what comes after).
+const R3_FIRST: &[(Op, Op)] = &[(Op::Qa3, Op::Reviewer3)];
+
+/// A family of scripts: its operations (one `Close` per reconcile; one more ends every script), which must come before
+/// which, whether R4's QA fails AC-1-01 outside R4's scope, each Issue's final resolution as the design gives it, and
+/// what at least one of its orders must reach.
+struct Family<'a> {
+    name: &'static str,
+    ops: &'a [Op],
+    before: &'static [&'static [(Op, Op)]],
+    out_of_scope_fail: bool,
+    resolved: &'static [(&'static str, bool)],
+    reaches: &'static [&'static str],
+}
+
+/// Every order of the multiset `ops` in which each `(a, b)` of `before` has every `a` before any `b`.
+fn orders(ops: &[Op], before: &[(Op, Op)]) -> Vec<Vec<Op>> {
+    fn extend(
+        left: &mut BTreeMap<Op, usize>,
+        before: &[(Op, Op)],
+        prefix: &mut Vec<Op>,
+        out: &mut Vec<Vec<Op>>,
+    ) {
+        if left.values().all(|n| *n == 0) {
+            out.push(prefix.clone());
+            return;
+        }
+        let ready: Vec<Op> = left
+            .iter()
+            .filter(|(op, n)| {
+                **n > 0
+                    && before
+                        .iter()
+                        .all(|(a, b)| b != *op || left.get(a).copied().unwrap_or(0) == 0)
+            })
+            .map(|(op, _)| *op)
+            .collect();
+        for op in ready {
+            *left.entry(op).or_default() -= 1;
+            prefix.push(op);
+            extend(left, before, prefix, out);
+            prefix.pop();
+            *left.entry(op).or_default() += 1;
+        }
+    }
+    let mut left = BTreeMap::new();
+    for op in ops {
+        *left.entry(*op).or_default() += 1;
+    }
+    let mut out = Vec::new();
+    extend(&mut left, before, &mut Vec::new(), &mut out);
+    out
+}
+
+/// A check record of `producer` on `candidate`: outcome `status`, its rows `(AC, status)` (a FAIL failing its AC's
+/// test) and its result lines.
+fn recording(
+    record: &str,
+    (candidate, producer): (&str, &str),
+    status: crate::verification::Status,
+    rows: &[(&str, &'static str)],
+) -> crate::persistence::Recording {
+    let test = |ac: &str| match ac {
+        "AC-1-01" => ("TEST-1-01", T),
+        _ => ("TEST-2-01", "test_2_01_ok"),
+    };
+    let mut r = pass_recording(record, candidate, producer);
+    r.outcome.status = status;
+    if status == crate::verification::Status::Invalid {
+        r.reasons = vec!["SOURCE_CHANGED"];
+    }
+    r.observations = rows
+        .iter()
+        .map(|(ac, status)| {
+            json!({"schema_version": "1.0", "test_id": test(ac).0, "name": test(ac).1, "status": status})
+        })
+        .collect();
+    r.rows = rows
+        .iter()
+        .map(|(ac, status)| crate::persistence::AcceptanceRow {
+            ac_id: (*ac).to_owned(),
+            spec_id: "s1".to_owned(),
+            status,
+            reason: format!("{} in check unit", test(ac).0),
+            failing: if *status == "FAIL" {
+                vec![test(ac).1.to_owned()]
+            } else {
+                Vec::new()
+            },
+        })
+        .collect();
+    r
+}
+
+/// Each Issue of run R that disagrees with the state function evaluated now.
+fn disagreements(path: &Path) -> R<Vec<String>> {
+    Ok(judged(&Connection::open(path)?, "R")?
+        .into_iter()
+        .filter(|(row, judged)| (row.state == "RESOLVED") != judged.resolved())
+        .map(|(row, judged)| format!("{} is {} but judged {judged:?}", row.issue.id, row.state))
+        .collect())
+}
+
+/// One script's world: C2's round R2 failed on X (critical, located), Y (high, no locator) and AC-1-01's FAIL on T (A);
+/// D froze C3 (its round R3) and E the same content (R4), both delivered X and Y; R3's verifiers started; writer F
+/// running.
+struct Model {
+    _dir: tempfile::TempDir,
+    store: Store,
+    path: PathBuf,
+    c3: String,
+    c4: String,
+    r4: String,
+    qa2: String,
+    qa3: String,
+    reviewer3: String,
+    qa4: Option<String>,
+    reviewer4: Option<String>,
+    /// Issue id -> its name in the model.
+    names: BTreeMap<String, String>,
+    out_of_scope_fail: bool,
+    /// The transactions so far, for a failure's message.
+    trace: Vec<String>,
+    /// What this script reached (a family's `reaches`).
+    reached: BTreeSet<String>,
+}
+
+impl Model {
+    /// The world every script starts from.
+    async fn world() -> R<Model> {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = open(dir.path())?;
+        freeze_d(&store, &path, 0, 'b').await?;
+        second_writer(&path, "E", "AE")?;
+        let job = freeze_of('c');
+        let c2 = job.sealed.candidate_id.clone();
+        store
+            .complete_writer_attempt(WriterCompletion {
+                attempt_id: "AE".to_owned(),
+                ..completion(freeze(job, result_of("E", "AE")?))
+            })
+            .await?;
+        reconcile(&store).await?;
+        let r2 = child_id(&c2, "round/1");
+        let (qa2, reviewer2) = start(&store, &path, &r2, &[]).await?;
+        evidence_judged(
+            &path,
+            (&qa2, &c2, "rec-2"),
+            ("unit", "FAIL"),
+            &[
+                ("AC-1-01", "TEST-1-01", "FAIL", vec![T]),
+                ("AC-2-01", "TEST-2-01", "PASS", vec![]),
+            ],
+            &[
+                ("TEST-1-01", T, "FAIL"),
+                ("TEST-2-01", "test_2_01_ok", "PASS"),
+            ],
+        )?;
+        settle(&store, &path, &qa2, ("qa", "FAIL"), &[], &[]).await?;
+        settle(
+            &store,
+            &path,
+            &reviewer2,
+            ("reviewer", "FAIL"),
+            &[
+                finding("F1", "critical", X_SUMMARY, &["src/a.rs"]),
+                finding("F2", "high", Y_TEXT, &[]),
+            ],
+            &[],
+        )
+        .await?;
+        assert_eq!(
+            reconcile(&store).await?.closed,
+            [(r2.clone(), "repair".to_owned())]
+        );
+        let report = child_id(&reviewer2, "report");
+        let names: BTreeMap<String, String> = [
+            (child_id(&report, "finding/F1"), "X"),
+            (child_id(&report, "finding/F2"), "Y"),
+            (child_id(&c2, &format!("acceptance/AC-1-01/{T}")), "A"),
+        ]
+        .into_iter()
+        .map(|(id, name)| (id, name.to_owned()))
+        .collect();
+        assert_eq!(
+            texts(&path, "SELECT issue_id FROM issues ORDER BY issue_id")?,
+            names.keys().cloned().collect::<Vec<_>>()
+        );
+        // D freezes C3 (R3); E, reworked too, completes the same content (R4 on C3); F, a third writer, runs.
+        let c3 = freeze_d(&store, &path, 1, 'd').await?;
+        Connection::open(&path)?.execute_batch(
+            "UPDATE tasks SET state = 'RUNNING', revision = revision + 1 WHERE task_id = 'E';
+             INSERT INTO attempts(attempt_id, task_id, session_id, state, role_epoch, host_epoch, config_revision,
+               started_at) VALUES ('AE2', 'E', 'sd', 'RUNNING', 1, 1, 1, '2026-11-12T00:00:05Z');",
+        )?;
+        store
+            .complete_writer_attempt(WriterCompletion {
+                attempt_id: "AE2".to_owned(),
+                ..completion(freeze(freeze_of('d'), result_of("E", "AE2")?))
+            })
+            .await?;
+        second_writer(&path, "F", "AF")?;
+        let (r3, r4) = (child_id(&c3, "round/1"), child_id(&c3, "round/2"));
+        let started = dispatch(&store, &path, &[]).await?;
+        let task = |round: &str, role: &str| child_id(round, &format!("task/{role}"));
+        assert_eq!(
+            started.keys().cloned().collect::<BTreeSet<_>>(),
+            [task(&r3, "qa"), task(&r3, "reviewer")].into(),
+            "one session per role: R4's verifiers wait"
+        );
+        let (qa3, reviewer3) = (
+            started[&task(&r3, "qa")].clone(),
+            started[&task(&r3, "reviewer")].clone(),
+        );
+        let model = Model {
+            _dir: dir,
+            store,
+            path,
+            c3,
+            c4: freeze_of('e').sealed.candidate_id,
+            r4,
+            qa2,
+            qa3,
+            reviewer3,
+            qa4: None,
+            reviewer4: None,
+            names,
+            out_of_scope_fail: false,
+            trace: vec!["world".to_owned()],
+            reached: BTreeSet::new(),
+        };
+        for attempt in [&model.qa3, &model.reviewer3] {
+            model.delivered_x_and_y(attempt)?;
+        }
+        model.check()?;
+        Ok(model)
+    }
+
+    /// A script's own copy of world `self` (its database copied and opened as a store), R4's QA failing AC-1-01 when
+    /// `out_of_scope_fail`.
+    fn copy(&self, out_of_scope_fail: bool) -> R<Model> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join(".hoh/state.db");
+        std::fs::create_dir_all(dir.path().join(".hoh"))?;
+        Connection::open(&self.path)?.execute(
+            "VACUUM INTO ?1",
+            [path.to_str().ok_or("a temporary path is UTF-8")?],
+        )?;
+        let store = Store::open(
+            &path,
+            crate::persistence::Options {
+                wal_probe: Some(crate::persistence::selftest::test_probe(None)),
+                ..crate::persistence::Options::default()
+            },
+        )?;
+        Ok(Model {
+            _dir: dir,
+            store,
+            path,
+            c3: self.c3.clone(),
+            c4: self.c4.clone(),
+            r4: self.r4.clone(),
+            qa2: self.qa2.clone(),
+            qa3: self.qa3.clone(),
+            reviewer3: self.reviewer3.clone(),
+            qa4: None,
+            reviewer4: None,
+            names: self.names.clone(),
+            out_of_scope_fail,
+            trace: self.trace.clone(),
+            reached: BTreeSet::new(),
+        })
+    }
+
+    fn state_of_c3(&self) -> R<String> {
+        Ok(texts(
+            &self.path,
+            &format!(
+                "SELECT state FROM candidates WHERE candidate_id = '{}'",
+                self.c3
+            ),
+        )?
+        .remove(0))
+    }
+
+    fn id(&self, name: &str) -> String {
+        self.names
+            .iter()
+            .find(|(_, n)| *n == name)
+            .map(|(id, _)| id.clone())
+            .unwrap_or_default()
+    }
+
+    fn delivered_x_and_y(&self, attempt: &str) -> R {
+        let mut want = vec![self.id("X"), self.id("Y")];
+        want.sort();
+        assert_eq!(delivered_to(&self.path, attempt)?, want, "{attempt}");
+        Ok(())
+    }
+
+    /// After a transaction: the materialised states agree with the function (J6).
+    fn check(&self) -> R {
+        let wrong = disagreements(&self.path)?;
+        assert!(
+            wrong.is_empty(),
+            "after {}: {wrong:?}",
+            self.trace.join(" > ")
+        );
+        Ok(())
+    }
+
+    fn done(&mut self, what: String) -> R {
+        self.trace.push(what);
+        self.check()
+    }
+
+    async fn record(&mut self, record: crate::persistence::Recording) -> R {
+        let what = format!("record {}", record.record.record_id);
+        self.store.record_evidence(record).await?;
+        self.done(what)
+    }
+
+    async fn settle(
+        &mut self,
+        attempt: &str,
+        (role, status): (&str, &str),
+        confirmations: &[(&str, &str)],
+    ) -> R {
+        let issues: Vec<Value> = confirmations
+            .iter()
+            .map(|(name, state)| confirm(&self.id(name), state, "复核"))
+            .collect();
+        settle(
+            &self.store,
+            &self.path,
+            attempt,
+            (role, status),
+            &[],
+            &issues,
+        )
+        .await?;
+        self.done(format!("settle {attempt}"))
+    }
+
+    async fn close(&mut self) -> R {
+        let before: BTreeSet<String> = texts(&self.path, "SELECT issue_id FROM issues")?
+            .into_iter()
+            .collect();
+        let done = reconcile(&self.store).await?;
+        let frozen_c4 = !texts(
+            &self.path,
+            &format!(
+                "SELECT state FROM candidates WHERE candidate_id = '{}'",
+                self.c4
+            ),
+        )?
+        .is_empty();
+        let a3 = child_id(&self.c3, &format!("acceptance/AC-1-01/{T}"));
+        for id in texts(&self.path, "SELECT issue_id FROM issues")? {
+            if before.contains(&id) {
+                continue;
+            }
+            assert_eq!(id, a3, "the only Issue a close opens here");
+            self.names.insert(id, "A3".to_owned());
+            self.reached.insert(format!(
+                "A3 opened {}",
+                if frozen_c4 { "after C4" } else { "before C4" }
+            ));
+        }
+        let cancelled = texts(&self.path, "SELECT state FROM runs")? == ["CANCEL_REQUESTED"];
+        for (round, verdict) in &done.closed {
+            let name = match round.strip_prefix(&self.c3) {
+                Some("/round/1") => "R3",
+                Some("/round/2") => "R4",
+                _ => round,
+            };
+            let by = if cancelled { " by the cancel" } else { "" };
+            self.reached.insert(format!("{name} closed {verdict}{by}"));
+        }
+        self.done(format!("close {:?}", done.closed))
+    }
+
+    async fn apply(&mut self, op: Op) -> R {
+        use crate::verification::Status;
+        let qa4 = || self.qa4.clone().ok_or("R4's QA is not dispatched");
+        match op {
+            Op::Qa3 => {
+                let qa3 = self.qa3.clone();
+                self.record(recording(
+                    "qa3-check",
+                    (&self.c3, &qa3),
+                    Status::Pass,
+                    &[("AC-1-01", "PASS")],
+                ))
+                .await?;
+                self.settle(
+                    &qa3,
+                    ("qa", "PASS"),
+                    &[("X", "RESOLVED"), ("Y", "RESOLVED")],
+                )
+                .await
+            }
+            Op::Reviewer3 => {
+                let reviewer3 = self.reviewer3.clone();
+                self.settle(
+                    &reviewer3,
+                    ("reviewer", "PASS"),
+                    &[("X", "RESOLVED"), ("Y", "RESOLVED")],
+                )
+                .await
+            }
+            Op::Start4 => {
+                let started = dispatch(&self.store, &self.path, &[]).await?;
+                let task = |role: &str| child_id(&self.r4, &format!("task/{role}"));
+                assert_eq!(
+                    started.keys().cloned().collect::<BTreeSet<_>>(),
+                    [task("qa"), task("reviewer")].into(),
+                    "after {}",
+                    self.trace.join(" > ")
+                );
+                let (qa4, reviewer4) = (
+                    started[&task("qa")].clone(),
+                    started[&task("reviewer")].clone(),
+                );
+                self.delivered_x_and_y(&qa4)?;
+                self.delivered_x_and_y(&reviewer4)?;
+                (self.qa4, self.reviewer4) = (Some(qa4), Some(reviewer4));
+                self.done("dispatch R4".to_owned())
+            }
+            Op::Qa4 => {
+                let qa4 = qa4()?;
+                let mut rows = vec![("AC-2-01", "PASS")];
+                if self.out_of_scope_fail {
+                    rows.push(("AC-1-01", "FAIL"));
+                }
+                let status = if self.out_of_scope_fail {
+                    Status::Fail
+                } else {
+                    Status::Pass
+                };
+                self.record(recording("qa4-check", (&self.c3, &qa4), status, &rows))
+                    .await?;
+                self.settle(
+                    &qa4,
+                    ("qa", status.code()),
+                    &[("X", "OPEN"), ("Y", "RESOLVED")],
+                )
+                .await
+            }
+            Op::Reviewer4 => {
+                let reviewer4 = self
+                    .reviewer4
+                    .clone()
+                    .ok_or("R4's reviewer is not dispatched")?;
+                self.settle(&reviewer4, ("reviewer", "PASS"), &[("Y", "RESOLVED")])
+                    .await
+            }
+            Op::Close => self.close().await,
+            Op::Veto => {
+                let reviewer4 = self
+                    .reviewer4
+                    .clone()
+                    .ok_or("R4's reviewer is not dispatched")?;
+                let state = self.state_of_c3()?;
+                self.reached.insert(format!("veto on {state}"));
+                self.record(recording(
+                    "veto",
+                    (&self.c3, &reviewer4),
+                    Status::Invalid,
+                    &[],
+                ))
+                .await
+            }
+            Op::Supersede => {
+                self.store
+                    .complete_writer_attempt(WriterCompletion {
+                        attempt_id: "AF".to_owned(),
+                        ..completion(freeze(freeze_of('e'), result_of("F", "AF")?))
+                    })
+                    .await?;
+                self.done("C4 frozen".to_owned())
+            }
+            Op::Cancel => {
+                Connection::open(&self.path)?.execute(
+                    "UPDATE runs SET state = 'CANCEL_REQUESTED', revision = revision + 1 WHERE run_id = 'R'",
+                    [],
+                )?;
+                self.done("cancel requested".to_owned())
+            }
+            Op::ChangeRequest => {
+                let qa4 = qa4()?;
+                let issue = self
+                    .store
+                    .verifier_request(crate::persistence::VerifierRequest::RejectChange(
+                        crate::persistence::ChangeRequest {
+                            run_id: "R".to_owned(),
+                            attempt_id: qa4.clone(),
+                            message_id: "m-change".to_owned(),
+                            round_id: self.r4.clone(),
+                            candidate_id: self.c3.clone(),
+                            severity: "high".to_owned(),
+                            text: Y_TEXT.to_owned(),
+                        },
+                    ))
+                    .await?
+                    .ok_or("a change request opens an Issue")?;
+                self.names.insert(issue, "CR".to_owned());
+                self.done("change request".to_owned())
+            }
+            Op::LatePassC3 | Op::LateFailC3 | Op::LatePassC4 => {
+                if op == Op::LatePassC3 {
+                    let state = self.state_of_c3()?;
+                    self.reached.insert(format!("late PASS on {state}"));
+                }
+                let (record, candidate, status, row) = match op {
+                    Op::LatePassC3 => ("late-pass-c3", self.c3.clone(), Status::Pass, "PASS"),
+                    Op::LateFailC3 => ("late-fail-c3", self.c3.clone(), Status::Fail, "FAIL"),
+                    _ => ("late-pass-c4", self.c4.clone(), Status::Pass, "PASS"),
+                };
+                let qa2 = self.qa2.clone();
+                self.record(recording(
+                    record,
+                    (&candidate, &qa2),
+                    status,
+                    &[("AC-1-01", row)],
+                ))
+                .await
+            }
+        }
+    }
+
+    /// Each named Issue's final state: resolved or not.
+    fn resolved(&self) -> R<BTreeMap<String, bool>> {
+        let mut out = BTreeMap::new();
+        for (id, name) in &self.names {
+            out.insert(name.clone(), state_of(&self.path, id)? == "RESOLVED");
+        }
+        Ok(out)
+    }
+}
+
+/// Run every order of family `f`, each from its own copy of the world: each transaction checked, each Issue resolved
+/// alike in every order it exists in and as the family says, every `reaches` reached by some order.
+async fn run_family(f: &Family<'_>) -> R {
+    let before: Vec<(Op, Op)> = std::iter::once(DISPATCH)
+        .chain(f.before.iter().copied())
+        .flatten()
+        .copied()
+        .collect();
+    let all = orders(f.ops, &before);
+    let world = Model::world().await?;
+    // Issue name -> resolved -> the orders that ended so.
+    let mut finals: BTreeMap<String, BTreeMap<bool, Vec<usize>>> = BTreeMap::new();
+    let mut reached = BTreeSet::new();
+    let mut reopened = 0;
+    for (n, order) in all.iter().enumerate() {
+        let mut model = world.copy(f.out_of_scope_fail)?;
+        for op in order {
+            model.apply(*op).await?;
+        }
+        model.close().await?;
+        for (name, resolved) in model.resolved()? {
+            finals
+                .entry(name)
+                .or_default()
+                .entry(resolved)
+                .or_default()
+                .push(n);
+        }
+        reopened += events(&model.path, "issue.reopened")?.len();
+        reached.extend(model.reached);
+    }
+    for (name, by) in &finals {
+        assert_eq!(
+            by.len(),
+            1,
+            "{}: {name} ends resolved in some orders and not in others: {:?}",
+            f.name,
+            by.iter()
+                .map(|(r, orders)| (
+                    r,
+                    orders.iter().take(3).map(|n| &all[*n]).collect::<Vec<_>>()
+                ))
+                .collect::<Vec<_>>()
+        );
+    }
+    // Every Issue but A3 (opened only by a close that classified R4) exists in every order.
+    for (name, by) in finals.iter().filter(|(name, _)| *name != "A3") {
+        assert_eq!(
+            by.values().map(Vec::len).sum::<usize>(),
+            all.len(),
+            "{}: {name} exists in every order",
+            f.name
+        );
+    }
+    for (name, want) in f.resolved {
+        assert_eq!(
+            finals.get(*name).map(|by| by.contains_key(want)),
+            Some(true),
+            "{}: {name} ends resolved = {want}: {finals:?}",
+            f.name
+        );
+    }
+    for what in f.reaches {
+        assert!(
+            reached.contains(*what) || (*what == "reopened" && reopened > 0),
+            "{}: no order reaches {what}: {reached:?}",
+            f.name
+        );
+    }
+    println!(
+        "{}: {} orders, {reopened} reopenings, reached {reached:?}",
+        f.name,
+        all.len()
+    );
+    Ok(())
+}
+
+/// R3's and R4's settles, R4's dispatch and two reconciles (closes).
+const SIBLINGS: [Op; 7] = [
+    Op::Qa3,
+    Op::Reviewer3,
+    Op::Start4,
+    Op::Qa4,
+    Op::Reviewer4,
+    Op::Close,
+    Op::Close,
+];
+
+#[tokio::test]
+async fn interleaved_sibling_settles_and_closes_agree_with_the_state_function_after_every_transaction()
+-> R {
+    // M2T18D-300, -351, -502, -550 (J6): R3 confirms X and Y fixed, R4 confirms Y fixed and X still OPEN, in every
+    // order of the settles and closes: X resolved at R3's close and reopened by R4's QA, or never resolved (R3 failing
+    // on it); Y resolved by the absent facts of either close; A by R3's PASS rows on C3 whatever R3's verdict.
+    run_family(&Family {
+        name: "siblings",
+        ops: &SIBLINGS,
+        before: &[],
+        out_of_scope_fail: false,
+        resolved: &[("X", false), ("Y", true), ("A", true)],
+        reaches: &["reopened", "R3 closed passable", "R3 closed repair"],
+    })
+    .await
+}
+
+#[tokio::test]
+async fn interleaved_veto_midway_and_a_late_pass_on_the_vetoed_candidate_agree_after_every_transaction()
+-> R {
+    // M2T18D-601, -602, -651, -755: R4's reviewer records a vetoed check on C3 while C3 is under verification (INVALID)
+    // or already REJECTED by R3; R4's QA also fails AC-1-01, outside R4's scope; after its round closed, R2's QA records
+    // AC-1-01 PASS on C3 (a PASS row on the vetoed, perhaps REJECTED, candidate). Nothing C3 observed resolves anything.
+    let mut ops = SIBLINGS.to_vec();
+    ops.extend([Op::Veto, Op::LatePassC3]);
+    run_family(&Family {
+        name: "veto",
+        ops: &ops,
+        before: &[
+            R3_FIRST,
+            &[
+                (Op::Start4, Op::Veto),
+                (Op::Veto, Op::Reviewer4),
+                (Op::Veto, Op::LatePassC3),
+            ],
+        ],
+        out_of_scope_fail: true,
+        resolved: &[("X", false), ("Y", false), ("A", false)],
+        reaches: &[
+            "reopened",
+            "veto on VERIFYING",
+            "veto on REJECTED",
+            "late PASS on REJECTED",
+            "R3 closed superseded",
+            "R4 closed invalidated",
+        ],
+    })
+    .await
+}
+
+#[tokio::test]
+async fn interleaved_supersession_and_a_late_acceptance_issue_agree_after_every_transaction() -> R {
+    // M2T18D-502, -550, -650, -850: writer F freezes C4 before or after R3 and R4 close (they close superseded while C3
+    // is under verification, or classified once R3 rejected it, R4 then opening C3's acceptance Issue A3 after C4's
+    // freeze); R4's QA fails AC-1-01 on T outside its scope; after its round closed, R2's QA records AC-1-01 PASS on
+    // C4. Y is resolved by C3's absent facts whatever the closes' verdicts; A and A3 by C4's rows.
+    let mut ops = SIBLINGS.to_vec();
+    ops.extend([Op::Supersede, Op::LatePassC4]);
+    run_family(&Family {
+        name: "supersession",
+        ops: &ops,
+        before: &[
+            R3_FIRST,
+            &[(Op::Start4, Op::Supersede), (Op::Supersede, Op::LatePassC4)],
+        ],
+        out_of_scope_fail: true,
+        resolved: &[("X", false), ("Y", true), ("A", true), ("A3", true)],
+        reaches: &[
+            "reopened",
+            "R3 closed superseded",
+            "R4 closed superseded",
+            "R4 closed repair",
+            "A3 opened after C4",
+        ],
+    })
+    .await
+}
+
+#[tokio::test]
+async fn interleaved_change_request_and_a_run_cancels_close_agree_after_every_transaction() -> R {
+    // M2T18D-701, -800, -850: R4's QA asks for a change in Y's words (its Issue a present fact of Y's fingerprint on
+    // C3) before or after R3's close; the run's cancel is requested at any point after R4's dispatch, so the rounds
+    // close superseded or classified. Y ends unresolved (resolved by R3's close and reopened by the change request, or
+    // never resolved), as does the change request's Issue; A is resolved by R3's PASS rows whatever R3's verdict.
+    let mut ops = SIBLINGS.to_vec();
+    ops.extend([Op::ChangeRequest, Op::Cancel]);
+    run_family(&Family {
+        name: "change request and cancel",
+        ops: &ops,
+        before: &[
+            R3_FIRST,
+            &[
+                (Op::Start4, Op::ChangeRequest),
+                (Op::ChangeRequest, Op::Qa4),
+                (Op::Start4, Op::Cancel),
+            ],
+        ],
+        out_of_scope_fail: false,
+        resolved: &[("X", false), ("Y", false), ("A", true), ("CR", false)],
+        reaches: &[
+            "reopened",
+            "R3 closed superseded by the cancel",
+            "R4 closed superseded by the cancel",
+            "R3 closed repair",
+        ],
+    })
+    .await
+}
+
+#[tokio::test]
+async fn interleaved_late_fail_on_a_newer_candidate_agrees_after_every_transaction() -> R {
+    // M2T18D-600, -650, -850: after its round closed, R2's QA records AC-1-01 FAIL on T on C3 (a later candidate than
+    // A's), before or after R3's PASS rows: A is not resolved, or resolved and reopened.
+    let mut ops = SIBLINGS.to_vec();
+    ops.push(Op::LateFailC3);
+    run_family(&Family {
+        name: "late fail",
+        ops: &ops,
+        before: &[R3_FIRST],
+        out_of_scope_fail: false,
+        resolved: &[("X", false), ("Y", true), ("A", false)],
+        reaches: &["reopened"],
+    })
+    .await
 }

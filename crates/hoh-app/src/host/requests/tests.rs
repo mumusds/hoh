@@ -185,3 +185,72 @@ fn run_check_waits_for_the_plans_longest_check_and_its_grace() -> R {
     assert!(script.contains("-ge 7276"), "{script}");
     Ok(())
 }
+
+/// `child`'s exit code once it ends, or an error (the child killed) when it runs past `limit`.
+fn ended_within(mut child: std::process::Child, limit: Duration) -> R<Option<i32>> {
+    let end = Instant::now() + limit;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status.code());
+        }
+        if Instant::now() > end {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("still running after {limit:?}").into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn a_helper_whose_request_directory_is_gone_ends_with_2_and_makes_none() -> R {
+    // M2T18R-54: the host removes the request directory of an attempt no longer live (verifying.rs), and a test's
+    // project goes with its temporary directory. A helper running then (an orphaned agent's) ends with 2 within its next
+    // poll, never waiting out its whole wait (an hour and more) nor making the directory again.
+    let dir = tempfile::tempdir()?;
+    let message = dir.path().join("m.json");
+    std::fs::write(&message, "{\"message_id\": \"m1\", \"kind\": \"steer\"}")?;
+    // Gone before it runs: refused at once.
+    let helpers = write_helpers(dir.path(), "A", 600)?;
+    std::fs::remove_dir_all(&helpers.requests)?;
+    for (helper, arg) in [
+        (&helpers.run_check, std::ffi::OsStr::new("unit")),
+        (&helpers.ask, message.as_os_str()),
+    ] {
+        let child = spawned(|| {
+            let mut c = Command::new(helper);
+            c.arg(arg).stdout(Stdio::null()).stderr(Stdio::null());
+            c
+        })?;
+        assert_eq!(
+            ended_within(child, Duration::from_secs(5))?,
+            Some(2),
+            "{}",
+            helper.display()
+        );
+        assert!(
+            !helpers.requests.exists(),
+            "{} made it again",
+            helper.display()
+        );
+    }
+    // Gone, with its whole attempt directory, while it waits for its answer: it ends within a few seconds.
+    let helpers = write_helpers(dir.path(), "B", 600)?;
+    let child = spawned(|| {
+        let mut c = Command::new(&helpers.run_check);
+        c.arg("unit").stdout(Stdio::null()).stderr(Stdio::null());
+        c
+    })?;
+    let end = Instant::now() + Duration::from_secs(20);
+    while next(&helpers, 1).is_none() {
+        if Instant::now() > end {
+            return Err("no request 1".into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let attempt = helpers.requests.parent().ok_or("no attempt directory")?;
+    std::fs::remove_dir_all(attempt)?;
+    assert_eq!(ended_within(child, Duration::from_secs(5))?, Some(2));
+    assert!(!attempt.exists(), "the attempt directory was made again");
+    Ok(())
+}
