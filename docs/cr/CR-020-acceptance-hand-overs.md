@@ -20,8 +20,8 @@ ADR-029（M2-T18：验收投影、独立报告的入库与候选汇合）的设�
 
 `contracts/development-tasks.json`：
 
-- M2-T13 的 depends_on 加 `M2-T18`；done_when 加：“受锁 RunResult 的 accepted 与 remaining_requirements 用 ADR-029 决定 12 的 `requirements_passed` 求（按需求计，不用快照按 AC 的计数）；解除汇合级 NEED_DECISION 的出口：join_gate_refused 与 reverify_exhausted 为重新验证（开下一轮）或返工，flaky 为要求新提交的返工（同内容守卫也看汇合的 flaky）或 REQ-055 的 flaky 处置，每种出口都产生新的栅栏编号（ADR-029 J9）（CR-020）”。
-- M5-T02 的 done_when 加：“发布门禁调用 ADR-029 的展示投影时传入 profile（原则一规则 16，只核对 outcome 为 PASS 的证据产生的 PASS 行，`RowFact.live_agents` 取证据的 live-sessions）；全范围验证也逐条确认 Run 中仍 OPEN/REOPENED 的 critical/high Issue（含其 Task 已取消、不再有后续轮次的），未确认的阻断发布；决策出口只有重新验证、返工或取消而阻断保持，任何豁免须所有者批准（CR-018“RESOLVED 须有验证者的观察”）；全范围验证按 ADR-029 决定 10 的满足规则解决验收失败的 Issue（CR-020）”。
+- M2-T13 的 depends_on 加 `M2-T18`；done_when 加：“受锁 RunResult 的 accepted 与 remaining_requirements 用 ADR-029 决定 12 的 `requirements_passed` 求（按需求计，不用快照按 AC 的计数）；解除汇合级 NEED_DECISION 的出口：join_gate_refused 与 reverify_exhausted 为重新验证（开下一轮）或返工，flaky 为要求新提交的返工（同内容守卫也看汇合的 flaky；REQ-055 的 flaky 处置属 M5-T02），每种出口都产生新的栅栏编号（ADR-029 J9）（CR-020）”。
+- M5-T02 的 done_when 加：“发布门禁调用 ADR-029 的展示投影时传入 profile（原则一规则 16，只核对 outcome 为 PASS 的证据产生的 PASS 行，`RowFact.live_agents` 取证据的 live-sessions）；全范围验证也逐条确认 Run 中仍 OPEN/REOPENED 的 critical/high Issue（含其 Task 已取消、不再有后续轮次的），未确认的阻断发布；决策出口只有重新验证、返工或取消而阻断保持，任何豁免须所有者批准（CR-018“RESOLVED 须有验证者的观察”）；全范围验证对遗留 Issue 的确认按 ADR-029 决定 10 的同一条目规则写 absent 事实、经同一写者 `issues::settle_fingerprint`，验收失败的 Issue 由它写出的行按同一状态函数解决；REQ-055 的 flaky 处置解除汇合级 flaky 时产生新的栅栏编号（ADR-029 J9）（CR-020）”。
 - M5-T01 的 done_when 把“拆分时把 CR-018 交给 M5-T02 的各项分给一个实现任务”改为“拆分时把 CR-018 与 CR-020 交给 M5-T02 的各项分给一个实现任务”。
 
 ## 不变的部分
