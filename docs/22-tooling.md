@@ -115,6 +115,11 @@ M2-T16 起，产品自己完成“开发者完成 → 冻结 → QA 与 Review �
   - 角色间的 query/steer 路由属于 M3-T04；在那之前验证者的其他问题得到 deferred 回应并记 `request.deferred`。
   - 取消路径结束验证 Attempt 时不再核对它的运行目录（目录随之后的 tick 删除）：取消只发生在正在取消的 Run 上，它的轮次以 superseded 关闭，候选的结论已无意义（M2T16R-54）。
   - reconcile 结束的验证 Attempt 没有最后一条助手消息，COMPLETED 的结果会被纠正一次（M2T16R-60）。
+- **验收投影与报告（ADR-029，M2-T18）**：
+  - 只追加：`acceptance_results` 与 `evidence` 由写者连接的 TEMP 触发器（含 `recursive_triggers`）拒绝改写与删除，`persistence_scan.py` 的检查 7 只在 `append_only_allow` 列出的文件、函数与语句处放行。
+  - 报告入库：`independent_reports` 的 CURRENT/STALE/REJECTED；REJECTED 的验证 Task 置 BLOCKED（NEED_DECISION），解除归 M2-T13；STALE 在冻结与每个对账时翻转。
+  - Issue：报告的 finding 与失败关闭的 AC 失败项各登记 Issue；RESOLVED/REOPENED 由观察事实、验收行与否决的状态函数求出，在每个相关写事务里物化，做判定的读者（汇合、快照、`/issues`、发布导出）直接求值。
+  - 余项：没有 finding 的 FAIL 报告不另开 finding Issue（它的 AC 失败另有验收失败 Issue）；被接受 Task 的 low/medium Issue 保持 OPEN，列入发布说明；finding 的 evidence 只是引用（运行目录随 Attempt 删除）；RESOLVED 依赖验证者在 TaskResult.issues 写确认条目，没有确认的 critical/high 使轮次不可通过；TEST-053-05 的“替身永不得 PASS”由 adapter-live.sh 的守卫与发布门禁的审查保证（ADR-029 实施中的更正 7）。
 
 ## 工具退出语义
 
