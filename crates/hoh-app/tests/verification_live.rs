@@ -292,7 +292,19 @@ async fn verification_live_candidate_to_qa() -> R {
             return Err(why.into());
         }
     }
-    let world = tempfile::Builder::new().prefix("hoh-live-qa-").tempdir()?;
+    // Outside the system temp directory, as a deployment's state is (XDG state): agent plugins write their own state
+    // into a working directory under it (pi's pi-lens writes `.pi-lens-probe-home/`), which the verifier's run-directory
+    // check rightly counts as a change and vetoes the candidate (ADR-029 implementation correction 8). Not under the
+    // HoH repository either: agents read instruction files from parent directories.
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))
+        .ok_or("neither XDG_CACHE_HOME nor HOME is set")?
+        .join("hoh-live");
+    std::fs::create_dir_all(&base)?;
+    let world = tempfile::Builder::new()
+        .prefix("hoh-live-qa-")
+        .tempdir_in(&base)?;
     let looked = live(&out, &path, &team, world.path()).await;
     let rest = |observations: Value| {
         json!({"agents": team.agents(), "profile": team.profile, "fallbacks": team.fallbacks,

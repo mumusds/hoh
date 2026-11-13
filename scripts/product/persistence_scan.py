@@ -362,10 +362,41 @@ def append_only_allow(root: Path) -> list:
     return [e for e in listed if isinstance(e, dict)] if isinstance(listed, list) else []
 
 
+def function_bodies(code: str) -> list[tuple[int, int, str]]:
+    """Each `fn` with a body in `code` (comments and literals already blanked): (body start, body end, name), the body
+    from its opening to its matching closing brace (M2T18R-02). A declaration ending in `;` has no body."""
+    out = []
+    for m in re.finditer(r'\bfn\s+(?:r#)?(\w+)', code):
+        depth, i = 0, m.end()
+        while i < len(code):
+            c = code[i]
+            if c in '([<':
+                depth += 1
+            elif c in ')]>' and depth > 0:
+                depth -= 1
+            elif c == ';' and depth == 0:
+                break
+            elif c == '{' and depth == 0:
+                level, j = 0, i
+                while j < len(code):
+                    if code[j] == '{':
+                        level += 1
+                    elif code[j] == '}':
+                        level -= 1
+                        if level == 0:
+                            break
+                    j += 1
+                out.append((i, j, m.group(1)))
+                break
+            i += 1
+    return out
+
+
 def enclosing_function(code: str, offset: int) -> str:
-    """The name of the last `fn` declared before `offset` in `code` (comments and literals already blanked)."""
-    names = re.findall(r'\bfn\s+(?:r#)?(\w+)', code[:offset])
-    return names[-1] if names else ''
+    """The name of the innermost function whose body holds `offset` in `code` (comments and literals already
+    blanked); empty outside every function body (module level, a const or impl item after a function)."""
+    inside = [(start, name) for start, end, name in function_bodies(code) if start < offset <= end]
+    return max(inside)[1] if inside else ''
 
 
 def literal_runs(code: str, literals: list[tuple[int, int, str]]) -> list[tuple[int, str]]:
