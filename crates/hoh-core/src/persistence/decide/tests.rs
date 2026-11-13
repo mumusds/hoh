@@ -467,6 +467,77 @@ async fn a_verifying_candidate_meeting_every_other_condition_accepts_nothing_bef
 }
 
 #[tokio::test]
+async fn the_gate_counts_a_compliant_degradation_of_a_degradable_requirement_and_checks_the_spec_digest()
+-> R {
+    // docs/adr/ADR-029.md decision 12 (ADR-011:102 corrected): the gate is `requirements_passed`, the display
+    // projection's satisfied set. C1 ACCEPTED, both criteria of REQ-1 with rows backed by evidence of their own check
+    // whose outcome is the row's: compliant DEGRADED rows of a degradable requirement pass (T3 accepted); DEGRADED rows
+    // of a requirement that may not degrade are FAIL; PASS rows on a candidate frozen on another specification's digest
+    // pass nothing.
+    // (release class, row and evidence status, the candidate's spec digest, applied)
+    let cases = [
+        ("degradable", "DEGRADED", sha(2), true),
+        ("required", "DEGRADED", sha(2), false),
+        ("degradable", "PASS", sha(7), false),
+        ("required", "PASS", sha(2), true),
+    ];
+    let mut kept = Vec::new();
+    for (class, status, digest, applied) in cases {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = open(&dir)?;
+        seed(&path, WORLD)?;
+        seed(&path, VERIFYING)?;
+        seed(
+            &path,
+            &format!(
+                "UPDATE requirements SET release_class = '{class}' WHERE requirement_id = 'REQ-1';
+                 UPDATE candidates SET state = 'ACCEPTED', spec_sha256 = '{digest}';
+                 UPDATE tasks SET state = 'VERIFYING' WHERE task_id = 'T3';
+                 INSERT INTO task_requirements(task_id, requirement_id, spec_id) VALUES ('T3', 'REQ-1', 's2');
+                 INSERT INTO artifacts(artifact_id, sha256, path, bytes, mime) VALUES ('a1', printf('%064d', 9), '/e', 1, 'text/plain');
+                 INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision) VALUES ('A1', 'T3', 'SETTLED', 1, 1, 1);
+                 INSERT INTO evidence(evidence_id, candidate_id, attempt_id, artifact_id, check_id, kind, outcome, mode, created_at)
+                   VALUES ('E1', 'C1', 'A1', 'a1', 'unit', 'check', '{status}', 'product', '2026-11-04T00:00:00Z');
+                 INSERT INTO acceptance_results(ac_id, spec_id, candidate_id, evidence_id, status) VALUES
+                   ('AC-1-01', 's2', 'C1', 'E1', '{status}'), ('AC-1-02', 's2', 'C1', 'E1', '{status}');"
+            ),
+        )?;
+        let mut commander = FakeCommander {
+            sent: 0,
+            candidate: Some("C1"),
+        };
+        let decided = store
+            .decide(
+                commander.decide(
+                    3,
+                    7,
+                    json!({"kind": "transition_task", "task_id": "T3", "to_state": "ACCEPTED"}),
+                ),
+                context(),
+            )
+            .await?;
+        let task = rows(&path, "SELECT state FROM tasks WHERE task_id = 'T3'")?;
+        kept.push(
+            json!({"release_class": class, "status": status, "spec_sha256": digest,
+            "decided": format!("{decided:?}"), "task": task}),
+        );
+        match (applied, &decided) {
+            (true, Decided::Applied { .. }) => assert_eq!(task, [vec![json!("ACCEPTED")]]),
+            (
+                false,
+                Decided::Rejected {
+                    reason: RejectionReason::EvidenceGateUnmet,
+                    ..
+                },
+            ) => assert_eq!(task, [vec![json!("VERIFYING")]]),
+            _ => return Err(format!("{class} {status} {digest}: {decided:?}").into()),
+        }
+    }
+    keep("m2t18-gate-degraded.json", &json!(kept))?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn acceptance_is_judged_on_the_named_current_candidate_only() -> R {
     // M2T02R-01: C1 passed everything and is ACCEPTED, C2 is newer and has no evidence. While both are in use the
     // current candidate is unknown; once C1 is STALE, completing on C2 needs C2's evidence and C1's cannot be named.

@@ -10,18 +10,23 @@ use crate::persistence::{Reconciled, Store, VerifierCompleted, VerifierOutcome, 
 use std::path::{Path, PathBuf};
 
 /// A finding as a report gives it: id, severity, summary and the paths of its evidence.
-fn finding(id: &str, severity: &str, summary: &str, paths: &[&str]) -> Value {
+pub(in crate::persistence) fn finding(
+    id: &str,
+    severity: &str,
+    summary: &str,
+    paths: &[&str],
+) -> Value {
     json!({"id": id, "severity": severity, "summary": summary,
         "evidence": paths.iter().map(|p| json!({"path": p, "sha256": "a".repeat(64)})).collect::<Vec<_>>()})
 }
 
 /// A confirmation entry of a verifier's TaskResult `issues`.
-fn confirm(issue: &str, status: &str, observed: &str) -> Value {
+pub(in crate::persistence) fn confirm(issue: &str, status: &str, observed: &str) -> Value {
     json!({"issue_id": issue, "state": status, "observed": observed})
 }
 
 /// The payloads of the events of kind `kind`, in order.
-fn events(path: &Path, kind: &str) -> R<Vec<Value>> {
+pub(in crate::persistence) fn events(path: &Path, kind: &str) -> R<Vec<Value>> {
     texts(
         path,
         &format!("SELECT payload_json FROM events WHERE kind = '{kind}' ORDER BY seq"),
@@ -44,7 +49,7 @@ fn issue_rows(path: &Path) -> R<Vec<Value>> {
     .collect()
 }
 
-fn state_of(path: &Path, issue: &str) -> R<String> {
+pub(in crate::persistence) fn state_of(path: &Path, issue: &str) -> R<String> {
     Ok(texts(
         path,
         &format!("SELECT state FROM issues WHERE issue_id = '{issue}'"),
@@ -54,7 +59,12 @@ fn state_of(path: &Path, issue: &str) -> R<String> {
 }
 
 /// D's attempt `n` (0 the world's A) completes freezing tree `tree`: the candidate.
-async fn freeze_d(store: &Store, path: &Path, n: usize, tree: char) -> R<String> {
+pub(in crate::persistence) async fn freeze_d(
+    store: &Store,
+    path: &Path,
+    n: usize,
+    tree: char,
+) -> R<String> {
     let attempt = if n == 0 {
         "A".to_owned()
     } else {
@@ -81,7 +91,7 @@ async fn freeze_d(store: &Store, path: &Path, n: usize, tree: char) -> R<String>
 /// Round `round`'s two verifier tasks dispatched and started (with any other READY verifier task), each attempt's
 /// delivery recorded as the executor records it from the store's assignment (`context.packed` `confirm_ids`), unless
 /// `forged` names other ids for its role: (qa attempt, reviewer attempt).
-async fn start(
+pub(in crate::persistence) async fn start(
     store: &Store,
     path: &Path,
     round: &str,
@@ -136,7 +146,7 @@ async fn start(
 }
 
 /// The confirm_ids attempt `attempt` was delivered.
-fn delivered_to(path: &Path, attempt: &str) -> R<Vec<String>> {
+pub(in crate::persistence) fn delivered_to(path: &Path, attempt: &str) -> R<Vec<String>> {
     Ok(delivered(&Connection::open(path)?, attempt)?
         .into_iter()
         .collect())
@@ -144,7 +154,7 @@ fn delivered_to(path: &Path, attempt: &str) -> R<Vec<String>> {
 
 /// Settle verifier attempt `attempt` of `role` with a report `status` consistent with it, its `findings`, and its
 /// TaskResult `issues`.
-async fn settle(
+pub(in crate::persistence) async fn settle(
     store: &Store,
     path: &Path,
     attempt: &str,
@@ -170,7 +180,7 @@ async fn settle(
 }
 
 /// QA attempt `qa`'s PASS evidence of AC-1-01 on `candidate` (its row written at its round's close).
-fn pass(path: &Path, qa: &str, candidate: &str, record: &str) -> R {
+pub(in crate::persistence) fn pass(path: &Path, qa: &str, candidate: &str, record: &str) -> R {
     evidence_of(
         path,
         (qa, candidate, record),
@@ -180,14 +190,14 @@ fn pass(path: &Path, qa: &str, candidate: &str, record: &str) -> R {
     )
 }
 
-async fn reconcile(store: &Store) -> R<Reconciled> {
+pub(in crate::persistence) async fn reconcile(store: &Store) -> R<Reconciled> {
     Ok(store
         .reconcile_verification("R", Default::default())
         .await?)
 }
 
 /// The failure items of round `round`, `task:item`.
-fn items(path: &Path, round: &str) -> R<Vec<String>> {
+pub(in crate::persistence) fn items(path: &Path, round: &str) -> R<Vec<String>> {
     texts(
         path,
         &format!(
@@ -199,7 +209,7 @@ fn items(path: &Path, round: &str) -> R<Vec<String>> {
 }
 
 /// Round `round`'s close: its payload.
-fn closed(path: &Path, round: &str) -> R<Value> {
+pub(in crate::persistence) fn closed(path: &Path, round: &str) -> R<Value> {
     Ok(serde_json::from_str(
         &texts(
             path,
@@ -213,7 +223,8 @@ fn closed(path: &Path, round: &str) -> R<Value> {
     )?)
 }
 
-const X_SUMMARY: &str = "[缺陷] src/a.rs:12 — 越界访问；影响：崩溃；修复方向：检查长度";
+pub(in crate::persistence) const X_SUMMARY: &str =
+    "[缺陷] src/a.rs:12 — 越界访问；影响：崩溃；修复方向：检查长度";
 
 /// A run whose C1 round failed on the reviewer's critical finding X (and the QA's PASS): D reworked and frozen again
 /// as C2, whose round's verifiers are started with the deliveries the store gives (or `forged`).
@@ -365,7 +376,8 @@ async fn test_054_04_findings_become_traceable_issues() -> R {
         json!({"issues": rows, "issue.opened": opened, "issue.observation": observations,
             "round_closed": closed(&path, &r1)?})
     );
-    // Only a low finding, both reports PASS, the check PASS: passable (low never fails a round), its Issue OPEN.
+    // Only a low finding, both reports PASS, the check PASS: passable (low never fails a round) and joined: C1
+    // ACCEPTED, its Issue OPEN (docs/adr/ADR-029.md decision 11).
     let dir = tempfile::tempdir()?;
     let (store, path) = open(dir.path())?;
     let c1 = freeze_d(&store, &path, 0, 'b').await?;
@@ -385,6 +397,7 @@ async fn test_054_04_findings_become_traceable_issues() -> R {
     let done = reconcile(&store).await?;
     assert_eq!(done.closed, [(r1.clone(), "passable".to_owned())]);
     assert_eq!(done.joinable, std::slice::from_ref(&c1));
+    assert_eq!(texts(&path, "SELECT state FROM candidates")?, ["ACCEPTED"]);
     assert_eq!(
         texts(&path, "SELECT severity || ':' || state FROM issues")?,
         ["low:OPEN"]
@@ -1343,7 +1356,7 @@ async fn a_change_requests_issue_confirmed_fixed_after_its_rework_is_resolved() 
 
 /// The materialised state of every Issue of run R agrees with the state function evaluated now (J6: after each
 /// transaction).
-fn agrees(path: &Path) -> R {
+pub(in crate::persistence) fn agrees(path: &Path) -> R {
     for (row, judged) in judged(&Connection::open(path)?, "R")? {
         assert_eq!(
             row.state == "RESOLVED",

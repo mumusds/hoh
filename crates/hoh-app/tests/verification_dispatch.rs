@@ -147,13 +147,18 @@ const SPEC: &str = "{\"requirements\": [{\"id\": \"REQ-035\", \"acceptance\": [{
 /// A committed project whose layout the freeze takes (docs/adr/ADR-028.md decision 4), its store made by one host's
 /// start and stop; the project and the specification's digest.
 async fn project(dir: &Path) -> R<(PathBuf, String)> {
+    project_with(dir, SPEC, PLAN).await
+}
+
+/// [`project`] with specification `spec` and check plan `plan`.
+async fn project_with(dir: &Path, spec: &str, plan: &str) -> R<(PathBuf, String)> {
     let project = dir.join("p");
     std::fs::create_dir_all(&project)?;
     git(&project, &["init", "-q"])?;
     for (path, text) in [
         ("src/lib.rs", "pub fn a() {}\n"),
-        ("contracts/requirements.json", SPEC),
-        ("tests/check-plan.json", PLAN),
+        ("contracts/requirements.json", spec),
+        ("tests/check-plan.json", plan),
     ] {
         let file = project.join(path);
         std::fs::create_dir_all(file.parent().ok_or("no parent")?)?;
@@ -162,7 +167,7 @@ async fn project(dir: &Path) -> R<(PathBuf, String)> {
     git(&project, &["add", "."])?;
     git(&project, &["commit", "-q", "-m", "work"])?;
     Host::start(config(&project)).await?.shutdown().await;
-    let digest = <sha2::Sha256 as sha2::Digest>::digest(SPEC.as_bytes());
+    let digest = <sha2::Sha256 as sha2::Digest>::digest(spec.as_bytes());
     Ok((project, digest.iter().map(|b| format!("{b:02x}")).collect()))
 }
 
@@ -246,7 +251,18 @@ struct Team {
     refuse_verifiers: AtomicBool,
     /// SQL run on the project's store when a verifier's work is delivered (before its run directory is prepared).
     on_verifier_delivery: std::sync::Mutex<Option<String>>,
+    /// The scope a verifier's report block gives.
+    scope: std::sync::Mutex<Vec<String>>,
+    /// The findings the qa FakeAgent's report block gives.
+    qa_findings: std::sync::Mutex<Vec<Value>>,
+    /// The Developer's FakeAgent writes a self-test record of every TEST passing under its attempt's directory and names
+    /// it in its TaskResult's evidence (docs/adr/ADR-028.md decision 14).
+    self_test: AtomicBool,
 }
+
+/// The Developer FakeAgent's self-test record: it claims every TEST of TEST-053-01's specification passed.
+const SELF_TEST: &str = "{\"schema_version\": \"1.0\", \"test_id\": \"TEST-090-01\", \"name\": \"self_a\", \"status\": \"PASS\"}\n\
+    {\"schema_version\": \"1.0\", \"test_id\": \"TEST-090-02\", \"name\": \"self_b\", \"status\": \"PASS\"}\n";
 
 impl Team {
     fn new(commander: Commander, spec: &str, project: &Path) -> Team {
@@ -268,6 +284,9 @@ impl Team {
             developer_script: std::sync::Mutex::default(),
             refuse_verifiers: AtomicBool::new(false),
             on_verifier_delivery: std::sync::Mutex::default(),
+            scope: std::sync::Mutex::new(vec!["AC-035-03".to_owned()]),
+            qa_findings: std::sync::Mutex::default(),
+            self_test: AtomicBool::new(false),
         }
     }
 }
@@ -344,12 +363,26 @@ impl hoh_app::host::Executor for Team {
                     .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                     .is_ok();
                 if !failed {
+                    let mut evidence = Vec::new();
+                    if self.self_test.load(Ordering::SeqCst) {
+                        let dir = format!(
+                            ".hoh/self-tests/{}",
+                            work.attempt_id.replace('%', "%25").replace('/', "%2F")
+                        );
+                        let record = format!("{dir}/self-test.jsonl");
+                        std::fs::create_dir_all(self.project.join(&dir))
+                            .and_then(|()| std::fs::write(self.project.join(&record), SELF_TEST))
+                            .map_err(|e| refusal(&format!("SELF_TEST: {e}"), transient))?;
+                        let digest = <sha2::Sha256 as sha2::Digest>::digest(SELF_TEST.as_bytes());
+                        let sha256: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+                        evidence.push(json!({"path": record, "sha256": sha256}));
+                    }
                     messages.push(
                         json!({
                             "schema_version": "1.0", "run_id": work.run_id, "task_id": work.task_id,
                             "attempt_id": work.attempt_id, "role": work.role,
                             "role_epoch": work.assignment.role_epoch, "status": "COMPLETED",
-                            "summary": "implemented", "candidate_id": null, "evidence": [], "issues": [],
+                            "summary": "implemented", "candidate_id": null, "evidence": evidence, "issues": [],
                             "next_action": "verify"
                         })
                         .to_string(),
@@ -372,9 +405,18 @@ impl hoh_app::host::Executor for Team {
                         Some(review) if work.role == "reviewer" => review,
                         _ => self.report.lock().map(|s| s.clone()).unwrap_or_default(),
                     };
+                    let scope = self.scope.lock().map(|s| s.clone()).unwrap_or_default();
+                    let findings = if work.role == "qa" {
+                        self.qa_findings
+                            .lock()
+                            .map(|f| f.clone())
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
                     final_text = Some(format!(
                         "done\n```hoh-report\n{}\n```\n",
-                        json!({"status": status, "scope": ["AC-035-03"], "findings": []})
+                        json!({"status": status, "scope": scope, "findings": findings})
                     ));
                     let raw = format!("{}\n", json!({"type": "result", "result": final_text}));
                     let sha256 = hoh_core::objects::put(&self.project, raw.as_bytes())
@@ -2299,4 +2341,178 @@ async fn a_cancelled_runs_open_round_is_closed_superseded_and_its_handoffs_rejec
     team.release.store(true, Ordering::SeqCst);
     host.shutdown().await;
     outcome
+}
+
+/// TEST-053-01's specification: REQ-090 with AC-090-01 (feature a, which the project has) and AC-090-02 (feature b,
+/// which it lacks), each with its TEST.
+const SPEC_AB: &str = "{\"requirements\": [{\"id\": \"REQ-090\", \"acceptance\": [{\"id\": \"AC-090-01\", \"test_id\": \"TEST-090-01\"}, {\"id\": \"AC-090-02\", \"test_id\": \"TEST-090-02\"}]}]}\n";
+
+/// Its check plan: each criterion's scenario check is a real command over the candidate's source, writing its TEST's
+/// result line and failing when the feature is missing.
+const PLAN_AB: &str = r#"{"schema_version": "1.0", "plan_id": "missing-feature", "checks": {
+  "feature-a": {"mode": "product", "artifacts": ["test-results.jsonl"], "argv": ["sh", "-c",
+    "if grep -q 'pub fn a()' src/lib.rs; then s=PASS; else s=FAIL; fi; printf '{\"schema_version\": \"1.0\", \"test_id\": \"TEST-090-01\", \"name\": \"test_090_01_feature_a\", \"status\": \"%s\"}\\n' \"$s\" > \"$HOH_EVIDENCE_DIR/test-results.jsonl\"; test \"$s\" = PASS"]},
+  "feature-b": {"mode": "product", "artifacts": ["test-results.jsonl"], "argv": ["sh", "-c",
+    "if grep -q 'pub fn b()' src/lib.rs; then s=PASS; else s=FAIL; fi; printf '{\"schema_version\": \"1.0\", \"test_id\": \"TEST-090-02\", \"name\": \"test_090_02_feature_b\", \"status\": \"%s\"}\\n' \"$s\" > \"$HOH_EVIDENCE_DIR/test-results.jsonl\"; test \"$s\" = PASS"]}}}
+"#;
+
+/// [`world`] with D's requirement REQ-090 (AC-090-01 checked by `feature-a`, AC-090-02 by `feature-b`) instead of
+/// REQ-035.
+fn world_ab(spec: &str) -> String {
+    format!(
+        "{}
+DELETE FROM task_requirements WHERE task_id = 'D';
+DELETE FROM acceptance_criteria WHERE requirement_id = 'REQ-035';
+DELETE FROM requirements WHERE requirement_id = 'REQ-035';
+INSERT INTO requirements(requirement_id, spec_id, title, required_release) VALUES ('REQ-090', 's1', 'features', 1);
+INSERT INTO acceptance_criteria(ac_id, requirement_id, spec_id, body, check_id) VALUES
+  ('AC-090-01', 'REQ-090', 's1', 'feature a', 'feature-a'), ('AC-090-02', 'REQ-090', 's1', 'feature b', 'feature-b');
+INSERT INTO task_requirements(task_id, requirement_id, spec_id) VALUES ('D', 'REQ-090', 's1');",
+        world(spec)
+    )
+}
+
+/// TEST-053-01's run: the Developer's FakeAgent completes (its self-test record claims every TEST passed); QA's runs
+/// both scenario checks through `run-check` and reports FAIL, with one high finding on AC-090-02 when `finding`; the
+/// reviewer reports PASS. Once the round closes: the observables, after the assertions.
+async fn missing_feature(finding: bool) -> R<Value> {
+    let dir = tempfile::tempdir()?;
+    let (project, spec) = project_with(dir.path(), SPEC_AB, PLAN_AB).await?;
+    seed(&project, &world_ab(&spec))?;
+    let clock = Arc::new(FakeClock::default());
+    let mut team = Team::new(Commander::Answers, &spec, &project);
+    team.out = dir.path().join("out");
+    std::fs::create_dir_all(&team.out)?;
+    team.self_test.store(true, Ordering::SeqCst);
+    *team.report.lock().map_err(|e| e.to_string())? = "FAIL".to_owned();
+    *team.review_report.lock().map_err(|e| e.to_string())? = Some("PASS".to_owned());
+    *team.scope.lock().map_err(|e| e.to_string())? =
+        vec!["AC-090-01".to_owned(), "AC-090-02".to_owned()];
+    if finding {
+        *team.qa_findings.lock().map_err(|e| e.to_string())? =
+            vec![json!({"id": "F1", "severity": "high",
+            "summary": "AC-090-02 FAIL：src/lib.rs 没有 b()，test_090_02_feature_b 失败"})];
+    }
+    *team.qa_script.lock().map_err(|e| e.to_string())? = Some(
+        "\"$HOH_RUN_CHECK\" feature-a > \"$OUT/a.txt\"; \"$HOH_RUN_CHECK\" feature-b > \"$OUT/b.txt\"; exit 0".to_owned(),
+    );
+    team.release.store(true, Ordering::SeqCst);
+    let team = Arc::new(team);
+    let host = host(&project, team.clone(), clock.clone()).await?;
+    let outcome = async {
+        let step = Duration::from_millis(100);
+        let closed = wait_for(
+            &project,
+            &clock,
+            step,
+            "SELECT json_extract(payload_json, '$.verdict') AS verdict, json_extract(payload_json, '$.inputs') AS inputs \
+             FROM events WHERE kind = 'verification.round_closed'",
+            &|r| r.as_array().is_some_and(|a| !a.is_empty()),
+        )?;
+        let (c, _, _) = candidate(&project)?;
+        let results = rows(
+            &project,
+            "SELECT ar.ac_id, ar.candidate_id, ar.status, ar.evidence_id, ev.check_id, ev.outcome, t.role AS producer \
+             FROM acceptance_results ar JOIN evidence ev ON ev.evidence_id = ar.evidence_id \
+             JOIN attempts a ON a.attempt_id = ev.attempt_id JOIN tasks t ON t.task_id = a.task_id ORDER BY ar.ac_id",
+        )?;
+        let of = |ac: &str| -> Vec<(Value, Value)> {
+            results
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|r| r["ac_id"] == json!(ac))
+                .map(|r| (r["candidate_id"].clone(), r["status"].clone()))
+                .collect()
+        };
+        let recorded = rows(
+            &project,
+            "SELECT ev.check_id, ev.outcome, e.payload_json AS recorded FROM evidence ev \
+             LEFT JOIN events e ON e.event_id = ev.evidence_id || '/evidence' ORDER BY ev.check_id",
+        )?;
+        let refused = rows(&project, "SELECT kind, payload_json FROM events WHERE kind LIKE 'verification.check%'")?;
+        let outs: Vec<String> = ["a.txt", "b.txt"]
+            .iter()
+            .map(|f| std::fs::read_to_string(team.out.join(f)).unwrap_or_else(|e| e.to_string()))
+            .collect();
+        assert_eq!(of("AC-090-01"), [(json!(c), json!("PASS"))], "{results} {recorded} {refused} {outs:?}");
+        assert_eq!(of("AC-090-02"), [(json!(c), json!("FAIL"))], "{results}");
+        // No row from a Developer's attempt: every producer is a verifier.
+        for row in results.as_array().into_iter().flatten() {
+            assert!(row["producer"] == json!("qa") || row["producer"] == json!("reviewer"), "{row}");
+        }
+        let issues = rows(
+            &project,
+            "SELECT issue_id, candidate_id, severity, state, report_id, finding_id, description FROM issues \
+             ORDER BY issue_id",
+        )?;
+        let open: Vec<&Value> = issues
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|i| i["candidate_id"] == json!(c) && i["state"] == json!("OPEN"))
+            .collect();
+        let acceptance_issue = hoh_core::ids::child_id(&c, "acceptance/AC-090-02/test_090_02_feature_b");
+        assert!(
+            open.iter().any(|i| i["issue_id"] == json!(acceptance_issue) && i["report_id"].is_null()),
+            "the acceptance failure's Issue: {issues}"
+        );
+        if finding {
+            assert!(
+                open.iter().any(|i| i["finding_id"] == json!("F1") && i["severity"] == json!("high")),
+                "the finding's Issue: {issues}"
+            );
+            assert!(open.len() >= 2, "{issues}");
+        }
+        let states = rows(
+            &project,
+            &format!(
+                "SELECT (SELECT state FROM candidates WHERE candidate_id = '{c}') AS candidate, \
+                 (SELECT state FROM tasks WHERE task_id = 'D') AS task"
+            ),
+        )?;
+        assert_ne!(states[0]["candidate"], json!("ACCEPTED"), "{states}");
+        assert_eq!(states[0]["candidate"], json!("REJECTED"), "{states}");
+        assert_ne!(states[0]["task"], json!("ACCEPTED"), "{states}");
+        assert_eq!(closed[0]["verdict"], json!("repair"), "{closed}");
+        let self_tests = rows(
+            &project,
+            "SELECT e.event_id AS event, json_extract(j.value, '$.name') AS name, json_extract(j.value, '$.sha256') \
+             AS sha256 FROM events e, json_each(json_extract(e.payload_json, '$.items')) j \
+             WHERE e.kind = 'attempt.artifacts' AND json_extract(j.value, '$.kind') = 'self_test' ORDER BY e.seq",
+        )?;
+        let digest = <sha2::Sha256 as sha2::Digest>::digest(SELF_TEST.as_bytes());
+        let sha256: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(self_tests[0]["sha256"], json!(sha256), "{self_tests}");
+        let tasks = rows(&project, "SELECT task_id, role, state FROM tasks ORDER BY task_id")?;
+        let candidates = rows(&project, "SELECT candidate_id, state FROM candidates")?;
+        let observables = json!({
+            "variant": if finding { "qa_finding" } else { "no_finding" },
+            "acceptance_results": results, "issues": issues, "candidates": candidates, "tasks": tasks,
+            "round_closed": closed, "developer_self_tests": self_tests,
+        });
+        println!("{observables}");
+        R::Ok(observables)
+    }
+    .await;
+    team.release.store(true, Ordering::SeqCst);
+    host.shutdown().await;
+    outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_053_01_a_missing_feature_fails_ac_b_on_c_and_opens_an_issue() -> R {
+    // AC-053-01 (REQ-053 behaviour 5, failure mode 1; docs/adr/ADR-029.md decision 9, TEST-053-01): a project missing
+    // feature b, the Developer's FakeAgent COMPLETED with its self-test all PASS; QA's FakeAgent runs both scenario
+    // checks (real commands) through `run-check` and reports FAIL with a high finding on AC-090-02; the reviewer PASS.
+    // (AC-090-02, C) FAIL and (AC-090-01, C) PASS, every row from a verifier's evidence (none from the Developer's
+    // attempt); OPEN Issues on C, the acceptance failure's and the finding's; C and D not ACCEPTED. The variant whose
+    // QA report has no finding still has C's OPEN acceptance Issue (-55).
+    let with = missing_feature(true).await?;
+    let without = missing_feature(false).await?;
+    keep(
+        "m2t18-test-053-01",
+        &json!({"with_finding": with, "without_finding": without}),
+    )?;
+    Ok(())
 }

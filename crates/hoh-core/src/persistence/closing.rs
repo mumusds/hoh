@@ -6,7 +6,8 @@
 //! (2a) each development task with failure items not yet consumed takes them by its state (rework, attached and
 //! counted, appended to its decision, or abandoned); (3) each VERIFYING source task whose current round is closed goes
 //! where the exit table says (another round, a decision, waiting for a sibling, or back to be frozen again); (4) a
-//! candidate every one of whose development tasks waits at a passable round is ready for its join (M2-T18's).
+//! candidate every round of which is closed and every one of whose development tasks waits at a passable round is
+//! joined in the same transaction (docs/adr/ADR-029.md decision 11, `join`).
 
 use super::retry::{Repair, RepairRequest, RepairVerdict};
 use super::verification::{ROUND_CLOSED, ROUND_OPENED, Source};
@@ -30,20 +31,21 @@ pub struct Reconciled {
     pub closed: Vec<(String, String)>,
     pub reworked: Vec<String>,
     pub opened: Vec<String>,
+    /// The candidates joined (docs/adr/ADR-029.md decision 11).
     pub joinable: Vec<String>,
 }
 
 /// A round as its `verification.round_opened` recorded it.
 #[derive(Debug, Clone)]
-struct Round {
-    id: String,
-    candidate: String,
-    sources: Vec<String>,
-    scope: Vec<String>,
-    qa: String,
-    reviewer: String,
-    chain_root: String,
-    seq: i64,
+pub(super) struct Round {
+    pub id: String,
+    pub candidate: String,
+    pub sources: Vec<String>,
+    pub scope: Vec<String>,
+    pub qa: String,
+    pub reviewer: String,
+    pub chain_root: String,
+    pub seq: i64,
 }
 
 fn strings(v: &Value) -> Vec<String> {
@@ -56,7 +58,7 @@ fn strings(v: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn rounds(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<Round>, PersistError> {
+pub(super) fn rounds(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<Round>, PersistError> {
     let mut statement = tx
         .prepare(
             "SELECT seq, payload_json FROM events WHERE kind = ?1 AND run_id = ?2 ORDER BY seq",
@@ -108,7 +110,7 @@ fn closed(tx: &Transaction<'_>, run_id: &str) -> Result<BTreeMap<String, String>
     rows.collect::<Result<_, _>>().map_err(sqlite_error)
 }
 
-fn task_state(
+pub(super) fn task_state(
     tx: &Transaction<'_>,
     task_id: &str,
 ) -> Result<Option<(TaskState, i64, Option<String>)>, PersistError> {
@@ -124,7 +126,10 @@ fn task_state(
         .transpose()
 }
 
-fn candidate_state(tx: &Transaction<'_>, candidate: &str) -> Result<Option<String>, PersistError> {
+pub(super) fn candidate_state(
+    tx: &Transaction<'_>,
+    candidate: &str,
+) -> Result<Option<String>, PersistError> {
     tx.query_row(
         "SELECT state FROM candidates WHERE candidate_id = ?1",
         params![candidate],
@@ -138,7 +143,7 @@ fn candidate_state(tx: &Transaction<'_>, candidate: &str) -> Result<Option<Strin
 /// `candidate.stale` names it (a specification change, evidence found unrecoverable); later vetoes do not change it.
 fn superseded(tx: &Transaction<'_>, run_id: &str, candidate: &str) -> Result<bool, PersistError> {
     tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM events WHERE kind = 'candidate.stale' \
+        "SELECT EXISTS(SELECT 1 FROM events WHERE run_id = ?1 AND kind = 'candidate.stale' \
            AND json_extract(payload_json, '$.candidate_id') = ?2) \
          OR EXISTS(SELECT 1 FROM events e, json_each(e.payload_json, '$.superseded') s \
            WHERE e.kind = 'candidate.frozen' AND e.run_id = ?1 AND s.value = ?2)",
@@ -149,7 +154,7 @@ fn superseded(tx: &Transaction<'_>, run_id: &str, candidate: &str) -> Result<boo
 }
 
 /// The attempts of round `round`'s verifier tasks.
-fn attempts(tx: &Transaction<'_>, round: &Round) -> Result<Vec<String>, PersistError> {
+pub(super) fn attempts(tx: &Transaction<'_>, round: &Round) -> Result<Vec<String>, PersistError> {
     let mut statement = tx
         .prepare("SELECT attempt_id FROM attempts WHERE task_id IN (?1, ?2) ORDER BY rowid")
         .map_err(sqlite_error)?;
@@ -159,9 +164,9 @@ fn attempts(tx: &Transaction<'_>, round: &Round) -> Result<Vec<String>, PersistE
     rows.collect::<Result<_, _>>().map_err(sqlite_error)
 }
 
-/// One evidence of a round's verifier attempts.
+/// One planned-check evidence of a round's verifier attempts, or of a candidate.
 #[derive(Debug, Clone)]
-struct Evidence {
+pub(super) struct Evidence {
     id: String,
     check_id: String,
     outcome: String,
@@ -173,47 +178,68 @@ struct Evidence {
     fail_lines: bool,
 }
 
-/// The planned-check evidence (kind `check`, never an attempt-level marker record) of `attempts`.
+/// The planned-check evidence (kind `check`, never an attempt-level marker record) `filter` (a condition on `ev`,
+/// its one parameter `key`) selects, in row order.
+fn evidence_where(
+    tx: &Transaction<'_>,
+    filter: &str,
+    key: &str,
+) -> Result<Vec<Evidence>, PersistError> {
+    let mut statement = tx
+        .prepare(&format!(
+            "SELECT ev.evidence_id, ev.check_id, ev.outcome, \
+             (SELECT payload_json FROM events WHERE event_id = ev.evidence_id || '/evidence') \
+             FROM evidence ev WHERE {filter} AND ev.kind = 'check' ORDER BY ev.rowid"
+        ))
+        .map_err(sqlite_error)?;
+    let rows = statement
+        .query_map(params![key], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .map_err(sqlite_error)?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, check_id, outcome, payload) = row.map_err(sqlite_error)?;
+        let p: Value = payload
+            .and_then(|p| serde_json::from_str(&p).ok())
+            .unwrap_or(Value::Null);
+        out.push(Evidence {
+            id,
+            check_id,
+            outcome,
+            reason: p["outcome_reason"].as_str().map(str::to_owned),
+            reasons: strings(&p["reasons"]),
+            rows: p["rows"].as_array().cloned().unwrap_or_default(),
+            deferred: p["deferred_rows"] == json!(true),
+            fail_lines: p["observations"]
+                .as_array()
+                .is_some_and(|o| o.iter().any(|line| line["status"] == json!("FAIL"))),
+        });
+    }
+    Ok(out)
+}
+
+/// The planned-check evidence of `attempts`, in their order.
 fn evidence(tx: &Transaction<'_>, attempts: &[String]) -> Result<Vec<Evidence>, PersistError> {
     let mut out = Vec::new();
     for attempt in attempts {
-        let mut statement = tx
-            .prepare(
-                "SELECT ev.evidence_id, ev.check_id, ev.outcome, \
-                 (SELECT payload_json FROM events WHERE event_id = ev.evidence_id || '/evidence') \
-                 FROM evidence ev WHERE ev.attempt_id = ?1 AND ev.kind = 'check' ORDER BY ev.rowid",
-            )
-            .map_err(sqlite_error)?;
-        let rows = statement
-            .query_map(params![attempt], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, Option<String>>(3)?,
-                ))
-            })
-            .map_err(sqlite_error)?;
-        for row in rows {
-            let (id, check_id, outcome, payload) = row.map_err(sqlite_error)?;
-            let p: Value = payload
-                .and_then(|p| serde_json::from_str(&p).ok())
-                .unwrap_or(Value::Null);
-            out.push(Evidence {
-                id,
-                check_id,
-                outcome,
-                reason: p["outcome_reason"].as_str().map(str::to_owned),
-                reasons: strings(&p["reasons"]),
-                rows: p["rows"].as_array().cloned().unwrap_or_default(),
-                deferred: p["deferred_rows"] == json!(true),
-                fail_lines: p["observations"]
-                    .as_array()
-                    .is_some_and(|o| o.iter().any(|line| line["status"] == json!("FAIL"))),
-            });
-        }
+        out.extend(evidence_where(tx, "ev.attempt_id = ?1", attempt)?);
     }
     Ok(out)
+}
+
+/// Every planned-check evidence of candidate `candidate` (a join reads the candidate's whole history, docs/adr/ADR-029.md
+/// decisions 4 and 11).
+pub(super) fn candidate_evidence(
+    tx: &Transaction<'_>,
+    candidate: &str,
+) -> Result<Vec<Evidence>, PersistError> {
+    evidence_where(tx, "ev.candidate_id = ?1", candidate)
 }
 
 /// The status of the latest report of `role` among `attempts` (in their order): its last `independent_reports` row
@@ -278,7 +304,7 @@ pub(super) fn row_of(status: &str) -> Row {
 /// verifiers made (`issue.opened` names the round), and the critical or high findings its verifiers' reports registered
 /// (report_id -> the report's attempt -> one of the round's verifier tasks); a lower one does not fail a round (-154).
 /// (issue id, fingerprint).
-fn round_issues(
+pub(super) fn round_issues(
     tx: &Transaction<'_>,
     round: &Round,
 ) -> Result<Vec<(String, String)>, PersistError> {
@@ -299,8 +325,8 @@ fn round_issues(
     rows.collect::<Result<_, _>>().map_err(sqlite_error)
 }
 
-/// The run's spec id and project.
-fn run_of(
+/// The run's project, spec id and state.
+pub(super) fn run_of(
     tx: &Transaction<'_>,
     run_id: &str,
 ) -> Result<(String, Option<String>, String), PersistError> {
@@ -314,13 +340,13 @@ fn run_of(
 
 /// A failure item and its owner.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct Item {
-    task_id: String,
-    item: String,
+pub(super) struct Item {
+    pub task_id: String,
+    pub item: String,
 }
 
 impl Item {
-    fn fingerprint(&self) -> String {
+    pub(super) fn fingerprint(&self) -> String {
         crate::context::sha256_hex(format!("{}\n{}", self.task_id, self.item).as_bytes())
     }
 }
@@ -506,7 +532,6 @@ pub(super) fn reconcile(
             let (input, failed) = classify_round(
                 &tx,
                 round,
-                run_id,
                 spec_id.as_deref(),
                 &attempts,
                 &evidence,
@@ -544,17 +569,7 @@ pub(super) fn reconcile(
                 Class::Flaky => "flaky",
                 Class::Passable => "passable",
             };
-            (
-                verdict.to_owned(),
-                Some(class),
-                json!({
-                    "qa": format!("{:?}", input.qa), "review": format!("{:?}", input.review),
-                    "checks": format!("{:?}", input.checks),
-                    "acs": input.acs.iter().map(|a| format!("{a:?}")).collect::<Vec<_>>(),
-                    "failing_issues": input.failing_issues, "outside_failed": input.outside_failed,
-                    "unconfirmed": input.unconfirmed,
-                }),
-            )
+            (verdict.to_owned(), Some(class), inputs_json(&input))
         } else {
             if verdict == "invalidated" {
                 for e in &vetoed {
@@ -758,7 +773,7 @@ pub(super) fn reconcile(
 }
 
 /// Task `task_id`'s acceptance criteria under specification `spec_id`.
-fn task_criteria(
+pub(super) fn task_criteria(
     tx: &Transaction<'_>,
     task_id: &str,
     spec_id: Option<&str>,
@@ -775,35 +790,100 @@ fn task_criteria(
     rows.collect::<Result<_, _>>().map_err(sqlite_error)
 }
 
-/// The classification input of `round` and the failure items each failing input gives: (the in-scope AC it belongs
-/// to, if any; the item).
-#[allow(clippy::type_complexity)]
-fn classify_round(
+/// A classification input as `verification.round_closed` and `verification.joined` record it.
+pub(super) fn inputs_json(input: &classify::Input) -> Value {
+    json!({
+        "qa": format!("{:?}", input.qa), "review": format!("{:?}", input.review),
+        "checks": format!("{:?}", input.checks),
+        "acs": input.acs.iter().map(|a| format!("{a:?}")).collect::<Vec<_>>(),
+        "failing_issues": input.failing_issues, "outside_failed": input.outside_failed,
+        "unconfirmed": input.unconfirmed,
+    })
+}
+
+/// One acceptance row of an AC on a candidate: its status, evidence and reason, when it was published (a round's
+/// deferred rows when that round closed, its `published`, the others with their evidence, M2T16R-04), and whether its
+/// requirement may degrade.
+pub(super) struct RowAt {
+    pub status: String,
+    pub evidence: String,
+    pub reason: String,
+    pub seq: i64,
+    pub degradable: bool,
+}
+
+/// The rows of AC `ac` on candidate `candidate` under specification `spec_id`.
+pub(super) fn ac_rows(
     tx: &Transaction<'_>,
-    round: &Round,
-    run_id: &str,
+    candidate: &str,
+    ac: &str,
     spec_id: Option<&str>,
-    attempts: &[String],
-    evidence: &[Evidence],
-    (issues, entries): (&[(String, String)], &[super::issues::Entry]),
-) -> Result<(classify::Input, Vec<(Option<String>, String)>), PersistError> {
-    let _ = run_id;
-    let mut failed = Vec::new();
-    // The critical and high entries delivered for confirmation (docs/adr/ADR-029.md decision 10, -150, -153, -254):
-    // still present is a failing input, every source's item `issue:<fingerprint>`; delivered to both and neither still
-    // present nor confirmed leaves the round unpassable.
-    let mut still = false;
-    let mut unconfirmed = false;
-    for entry in entries.iter().filter(|e| e.grave()) {
-        if entry.still_present {
-            still = true;
-            failed.push((None, format!("issue:{}", entry.fingerprint)));
-        } else if entry.unconfirmed() {
-            unconfirmed = true;
-        }
-    }
-    let (qa, qa_findings) = report(tx, attempts, "qa")?;
-    let (review, review_findings) = report(tx, attempts, "reviewer")?;
+) -> Result<Vec<RowAt>, PersistError> {
+    let mut statement = tx
+        .prepare(
+            "SELECT ar.status, ar.evidence_id, \
+             coalesce((SELECT c.seq FROM events c, json_each(c.payload_json, '$.published') p \
+               WHERE c.kind = 'verification.round_closed' AND p.value = ar.evidence_id), \
+               (SELECT seq FROM events WHERE event_id = ar.evidence_id || '/evidence'), 0), \
+             (SELECT r.release_class FROM acceptance_criteria c JOIN requirements r ON r.requirement_id = \
+              c.requirement_id AND r.spec_id = c.spec_id WHERE c.ac_id = ar.ac_id AND c.spec_id = ar.spec_id), \
+             ar.reason \
+             FROM acceptance_results ar WHERE ar.candidate_id = ?1 AND ar.ac_id = ?2 AND ar.spec_id = ?3",
+        )
+        .map_err(sqlite_error)?;
+    let rows = statement
+        .query_map(params![candidate, ac, spec_id], |r| {
+            Ok(RowAt {
+                status: r.get(0)?,
+                evidence: r.get(1)?,
+                seq: r.get(2)?,
+                degradable: r.get::<_, Option<String>>(3)?.as_deref() == Some("degradable"),
+                reason: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+            })
+        })
+        .map_err(sqlite_error)?;
+    rows.collect::<Result<_, _>>().map_err(sqlite_error)
+}
+
+/// One in-scope AC a verdict judges: its rows that verdict sees, each (status, evidence, reason), and whether its
+/// requirement may degrade.
+pub(super) struct Scoped {
+    pub ac: String,
+    pub rows: Vec<(String, String, String)>,
+    pub degradable: bool,
+}
+
+/// What a verdict judges, a round's close or a candidate's join (docs/adr/ADR-029.md decision 11): the QA's and the
+/// reviewer's report (a FAIL one with its findings' summaries), the planned-check evidence, the in-scope ACs, the FAIL
+/// rows of ACs outside the scope (the AC, the row as its evidence recorded it, its reason), whether an open Issue
+/// fails it, the critical or high confirmation entries still present (their fingerprints), and whether one is
+/// unconfirmed.
+pub(super) struct Inputs<'a> {
+    pub reports: [(Report, Vec<String>); 2],
+    pub evidence: &'a [Evidence],
+    pub scoped: Vec<Scoped>,
+    pub outside: Vec<(String, Value, String)>,
+    pub failing_issues: bool,
+    pub still: Vec<String>,
+    pub unconfirmed: bool,
+}
+
+/// A classification input and the failure items its failing inputs give: (the in-scope AC an item belongs to, if any;
+/// the item).
+pub(super) type Judgement = (classify::Input, Vec<(Option<String>, String)>);
+
+/// The classification input of `inputs` and the failure items each failing input gives, (the in-scope AC it belongs
+/// to, if any; the item): one derivation for a round's close and a candidate's join, so that a failed class has at
+/// least one item (ADR-028 implementation correction 6; an open Issue's `issue:` items are the caller's, given
+/// whatever the verdict).
+pub(super) fn judge(tx: &Transaction<'_>, inputs: Inputs<'_>) -> Result<Judgement, PersistError> {
+    // Still present: every source's item `issue:<fingerprint>` (decision 10, -150, -153, -254).
+    let mut failed: Vec<(Option<String>, String)> = inputs
+        .still
+        .iter()
+        .map(|fingerprint| (None, format!("issue:{fingerprint}")))
+        .collect();
+    let [(qa, qa_findings), (review, review_findings)] = inputs.reports;
     // A FAIL report's item is its role and its findings' summaries, sorted (decision 12, M2T16R-06).
     for (role, status, findings) in [
         ("qa", qa, qa_findings),
@@ -816,9 +896,10 @@ fn classify_round(
             ));
         }
     }
-    // The check dimension and the check failures from one judgement over the round's own evidence (docs/adr/ADR-029.md
-    // decision 4, M2T18D-100, -151): a check is judged on all its runs in the round.
-    let runs: Vec<acceptance::CheckRun> = evidence
+    // The check dimension and the check failures from one judgement (docs/adr/ADR-029.md decision 4, M2T18D-100,
+    // -151): a check is judged on all its runs.
+    let runs: Vec<acceptance::CheckRun> = inputs
+        .evidence
         .iter()
         .map(|e| acceptance::CheckRun {
             check_id: e.check_id.clone(),
@@ -828,80 +909,53 @@ fn classify_round(
         })
         .collect();
     let checks = acceptance::checks(&runs);
-    // The rows of each in-scope AC on the candidate: those that existed when the round opened and the round's own
-    // (a sibling's later rows are its own to judge, I2, -754). A row exists from its publication: a round's deferred
-    // rows when that round closed (its `published`), the others with their evidence (M2T16R-04).
-    let own: BTreeSet<&str> = evidence.iter().map(|e| e.id.as_str()).collect();
     let mut acs = Vec::new();
-    for ac in &round.scope {
-        let mut statement = tx
-            .prepare(
-                "SELECT ar.status, ar.evidence_id, \
-                 coalesce((SELECT c.seq FROM events c, json_each(c.payload_json, '$.published') p \
-                   WHERE c.kind = 'verification.round_closed' AND p.value = ar.evidence_id), \
-                   (SELECT seq FROM events WHERE event_id = ar.evidence_id || '/evidence'), 0), \
-                 (SELECT r.release_class FROM acceptance_criteria c JOIN requirements r ON r.requirement_id = \
-                  c.requirement_id AND r.spec_id = c.spec_id WHERE c.ac_id = ar.ac_id AND c.spec_id = ar.spec_id), \
-                 ar.reason \
-                 FROM acceptance_results ar WHERE ar.candidate_id = ?1 AND ar.ac_id = ?2 AND ar.spec_id = ?3",
-            )
-            .map_err(sqlite_error)?;
-        let rows: Vec<(String, String, i64, Option<String>, String)> = statement
-            .query_map(params![round.candidate, ac, spec_id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-            })
-            .map_err(sqlite_error)?
-            .collect::<Result<_, _>>()
-            .map_err(sqlite_error)?;
-        let degradable = rows.iter().any(|r| r.3.as_deref() == Some("degradable"));
-        let visible: Vec<&(String, String, i64, Option<String>, String)> = rows
+    for scoped in &inputs.scoped {
+        let seen: Vec<Row> = scoped
+            .rows
             .iter()
-            .filter(|(_, evidence, seq, ..)| own.contains(evidence.as_str()) || *seq < round.seq)
+            .map(|(status, ..)| row_of(status))
             .collect();
-        let seen: Vec<Row> = visible.iter().map(|(status, ..)| row_of(status)).collect();
-        let projected = classify::project(&seen, degradable);
+        let projected = classify::project(&seen, scoped.degradable);
         if projected == Ac::Failed {
             // The item is the AC and its failing tests (decision 12, M2T16R-06): another failure of it is another item.
             let mut tests = BTreeSet::new();
-            for (_, evidence_id, _, _, reason) in visible.iter().filter(|r| r.0 == "FAIL") {
+            for (_, evidence_id, reason) in scoped.rows.iter().filter(|r| r.0 == "FAIL") {
                 tests.extend(failing_tests(
-                    &row_of_evidence(tx, evidence_id, ac)?,
+                    &row_of_evidence(tx, evidence_id, &scoped.ac)?,
                     reason,
                 ));
             }
             // One item per failing test (implementation correction 4, M2T16R-100): a test failing every round is the
             // same item whatever fails beside it.
             if tests.is_empty() {
-                failed.push((Some(ac.clone()), format!("ac-fail:{ac}")));
+                failed.push((Some(scoped.ac.clone()), format!("ac-fail:{}", scoped.ac)));
             }
             for test in tests {
-                failed.push((Some(ac.clone()), format!("ac-fail:{ac}:{test}")));
+                failed.push((
+                    Some(scoped.ac.clone()),
+                    format!("ac-fail:{}:{test}", scoped.ac),
+                ));
             }
         }
         acs.push(projected);
     }
-    // A FAIL row of an AC outside the scope that this round's evidence wrote: every source's (decision 12), and a failing
-    // input whatever its check's outcome (implementation correction 6, M2T16R-300).
-    let mut outside_failed = false;
-    for e in evidence {
-        for row in &e.rows {
-            let ac = row["ac_id"].as_str().unwrap_or_default();
-            if row["status"] == json!("FAIL") && !round.scope.iter().any(|s| s == ac) {
-                outside_failed = true;
-                let tests = failing_tests(row, row["reason"].as_str().unwrap_or_default());
-                if tests.is_empty() {
-                    failed.push((None, format!("ac-fail:{ac}")));
-                }
-                for test in tests {
-                    failed.push((None, format!("ac-fail:{ac}:{test}")));
-                }
-            }
+    // A FAIL row of an AC outside the scope: every source's (decision 12), and a failing input whatever its check's
+    // outcome (implementation correction 6, M2T16R-300).
+    for (ac, row, reason) in &inputs.outside {
+        let tests = failing_tests(row, reason);
+        if tests.is_empty() {
+            failed.push((None, format!("ac-fail:{ac}")));
+        }
+        for test in tests {
+            failed.push((None, format!("ac-fail:{ac}:{test}")));
         }
     }
     // A failing check no FAIL row of its evidence locates (a build, say, or FAIL lines of an unmapped TEST): every
     // source's (ADR-028 decision 12, M2T16R-05), from the same judgement as the dimension (ADR-029 decision 4).
     for (check, reason) in acceptance::check_failures(&runs) {
-        let located = evidence
+        let located = inputs
+            .evidence
             .iter()
             .filter(|e| e.check_id == check)
             .any(|e| e.rows.iter().any(|row| row["status"] == json!("FAIL")));
@@ -915,16 +969,85 @@ fn classify_round(
             review,
             checks,
             acs,
-            failing_issues: !issues.is_empty() || still,
-            outside_failed,
-            unconfirmed,
+            failing_issues: inputs.failing_issues || !inputs.still.is_empty(),
+            outside_failed: !inputs.outside.is_empty(),
+            unconfirmed: inputs.unconfirmed,
         },
         failed,
     ))
 }
 
+/// The classification input of `round` and the failure items each failing input gives, from the round's own reports
+/// and evidence and the rows of its scope that existed when it opened or are its own (I2, -754).
+fn classify_round(
+    tx: &Transaction<'_>,
+    round: &Round,
+    spec_id: Option<&str>,
+    attempts: &[String],
+    evidence: &[Evidence],
+    (issues, entries): (&[(String, String)], &[super::issues::Entry]),
+) -> Result<Judgement, PersistError> {
+    // The critical and high entries delivered for confirmation (docs/adr/ADR-029.md decision 10, -150, -153, -254):
+    // still present is a failing input; delivered to both and neither still present nor confirmed leaves the round
+    // unpassable.
+    let mut still = Vec::new();
+    let mut unconfirmed = false;
+    for entry in entries.iter().filter(|e| e.grave()) {
+        if entry.still_present {
+            still.push(entry.fingerprint.clone());
+        } else if entry.unconfirmed() {
+            unconfirmed = true;
+        }
+    }
+    // The rows of each in-scope AC on the candidate: those that existed when the round opened and the round's own
+    // (a sibling's later rows are its own to judge, I2, -754).
+    let own: BTreeSet<&str> = evidence.iter().map(|e| e.id.as_str()).collect();
+    let mut scoped = Vec::new();
+    for ac in &round.scope {
+        let rows = ac_rows(tx, &round.candidate, ac, spec_id)?;
+        scoped.push(Scoped {
+            ac: ac.clone(),
+            degradable: rows.iter().any(|r| r.degradable),
+            rows: rows
+                .into_iter()
+                .filter(|r| own.contains(r.evidence.as_str()) || r.seq < round.seq)
+                .map(|r| (r.status, r.evidence, r.reason))
+                .collect(),
+        });
+    }
+    // The FAIL rows of ACs outside the scope that the round's own evidence wrote.
+    let mut outside = Vec::new();
+    for e in evidence {
+        for row in &e.rows {
+            let ac = row["ac_id"].as_str().unwrap_or_default();
+            if row["status"] == json!("FAIL") && !round.scope.iter().any(|s| s == ac) {
+                outside.push((
+                    ac.to_owned(),
+                    row.clone(),
+                    row["reason"].as_str().unwrap_or_default().to_owned(),
+                ));
+            }
+        }
+    }
+    judge(
+        tx,
+        Inputs {
+            reports: [
+                report(tx, attempts, "qa")?,
+                report(tx, attempts, "reviewer")?,
+            ],
+            evidence,
+            scoped,
+            outside,
+            failing_issues: !issues.is_empty(),
+            still,
+            unconfirmed,
+        },
+    )
+}
+
 /// Evidence `evidence_id`'s row on AC `ac` as its event recorded it (`Null` when there is none).
-fn row_of_evidence(
+pub(super) fn row_of_evidence(
     tx: &Transaction<'_>,
     evidence_id: &str,
     ac: &str,
@@ -978,8 +1101,9 @@ fn named(kind: &str, names: &[String], separator: &str) -> String {
 /// A (round, task)'s failure items not yet consumed: the round's candidate and each (item, fingerprint).
 type Owed = (String, Vec<(String, String)>);
 
-/// (2a) Every development task's failure items not yet consumed, by its state now (decision 11).
-fn consume(
+/// (2a) Every development task's failure items not yet consumed, by its state now (decision 11); a failed join's too
+/// (docs/adr/ADR-029.md decision 11: its id in the `round_id` field).
+pub(super) fn consume(
     tx: &Transaction<'_>,
     run_id: &str,
     project_id: &str,
@@ -1129,26 +1253,43 @@ fn consume(
                     "counts": counts}),
             ));
         }
-        // A change request's Issue taken by the rework (decision 12): recorded, still OPEN (RESOLVED is M2-T18's).
+        // An Issue of the item's fingerprint taken by the rework (decision 12): recorded, its state the state function's
+        // (docs/adr/ADR-029.md decision 10). Those of the round, a change request or a finding of its verifiers' reports;
+        // a join's, those of every round on its candidate (decision 11).
+        let rounds = failure_rounds(tx, run_id, &round)?;
         for (item, _) in &items {
             let Some(fingerprint) = item.strip_prefix("issue:") else {
                 continue;
             };
             let mut statement = tx
                 .prepare(
-                    "SELECT i.issue_id FROM issues i WHERE i.fingerprint = ?1 AND i.report_id IS NULL AND i.issue_id IN \
-                     (SELECT json_extract(payload_json, '$.issue_id') FROM events WHERE kind = 'issue.opened' \
-                      AND json_extract(payload_json, '$.round_id') = ?2) ORDER BY i.issue_id",
+                    "SELECT i.issue_id FROM issues i WHERE i.run_id = ?1 AND i.fingerprint = ?2 AND (i.issue_id IN \
+                     (SELECT json_extract(o.payload_json, '$.issue_id') FROM events o WHERE o.run_id = ?1 \
+                      AND o.kind = 'issue.opened' AND json_extract(o.payload_json, '$.round_id') IN \
+                      (SELECT value FROM json_each(?3))) \
+                     OR i.report_id IN (SELECT rep.report_id FROM independent_reports rep \
+                      JOIN attempts a ON a.attempt_id = rep.attempt_id JOIN events r ON r.run_id = ?1 \
+                      AND r.kind = 'verification.round_opened' \
+                      AND json_extract(r.payload_json, '$.round_id') IN (SELECT value FROM json_each(?3)) \
+                      AND a.task_id IN (json_extract(r.payload_json, '$.tasks.qa'), \
+                        json_extract(r.payload_json, '$.tasks.reviewer')))) ORDER BY i.issue_id",
                 )
                 .map_err(sqlite_error)?;
             let issues: Vec<String> = statement
-                .query_map(params![fingerprint, round], |r| r.get(0))
+                .query_map(
+                    params![run_id, fingerprint, json!(rounds).to_string()],
+                    |r| r.get(0),
+                )
                 .map_err(sqlite_error)?
                 .collect::<Result<_, _>>()
                 .map_err(sqlite_error)?;
             for issue in issues {
+                let id = child_id(&issue, &format!("consumed/{task}"));
+                if exists(tx, &id)? {
+                    continue;
+                }
                 commit.events.push(event(
-                    child_id(&issue, &format!("consumed/{task}")),
+                    id,
                     "issue.consumed_by_rework",
                     json!({"issue_id": issue, "task_id": task, "round_id": round}),
                 ));
@@ -1160,8 +1301,49 @@ fn consume(
     Ok(())
 }
 
+/// Whether event `event_id` was written.
+pub(super) fn exists(tx: &Transaction<'_>, event_id: &str) -> Result<bool, PersistError> {
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM events WHERE event_id = ?1)",
+        params![event_id],
+        |r| r.get(0),
+    )
+    .map_err(sqlite_error)
+}
+
+/// The rounds failures registered under `round_id` came from: that round, or every round on the candidate of the join
+/// whose id it is (docs/adr/ADR-029.md decision 11, its `verification.joined`).
+fn failure_rounds(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    round_id: &str,
+) -> Result<Vec<String>, PersistError> {
+    let joined: Option<String> = tx
+        .query_row(
+            "SELECT json_extract(payload_json, '$.candidate_id') FROM events WHERE run_id = ?1 \
+             AND kind = 'verification.joined' AND json_extract(payload_json, '$.join_id') = ?2 LIMIT 1",
+            params![run_id, round_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some(candidate) = joined else {
+        return Ok(vec![round_id.to_owned()]);
+    };
+    let mut statement = tx
+        .prepare(
+            "SELECT json_extract(payload_json, '$.round_id') FROM events WHERE run_id = ?1 AND kind = ?2 \
+             AND json_extract(payload_json, '$.candidate_id') = ?3 ORDER BY seq",
+        )
+        .map_err(sqlite_error)?;
+    let rows = statement
+        .query_map(params![run_id, ROUND_OPENED, candidate], |r| r.get(0))
+        .map_err(sqlite_error)?;
+    rows.collect::<Result<_, _>>().map_err(sqlite_error)
+}
+
 /// Development task `task`'s current round: the latest that names it as a source.
-fn current<'a>(all: &'a [Round], task: &str) -> Option<&'a Round> {
+pub(super) fn current<'a>(all: &'a [Round], task: &str) -> Option<&'a Round> {
     all.iter()
         .rev()
         .find(|r| r.sources.iter().any(|s| s == task))
@@ -1220,46 +1402,19 @@ fn exits(
             ("ACCEPTED", _) | ("VERIFYING", "passable") => {}
             ("VERIFYING", "reverify") => {
                 // Verified again on the same candidate, counted on the round's chain (decision 12).
-                let (verdict, commit) = super::retry::repair_in(
+                let granted = reverify_source(
                     tx,
-                    &RepairRequest {
-                        run_id: run_id.to_owned(),
-                        task_id: task.to_owned(),
-                        repair: Repair::Reverify {
-                            root: round.chain_root.clone(),
-                        },
-                        limit: super::retry::REVERIFY_LIMIT,
+                    (project_id, run_id),
+                    round,
+                    (task, revision),
+                    Reverification {
+                        action: &round.id,
+                        join: None,
                         detail: format!("round {} was inconclusive", round.id),
-                        action_id: Some(round.id.clone()),
-                        hold: false,
                     },
+                    ctx,
                 )?;
-                let mut commit = commit;
-                let deferred = super::verification::deferred_of(tx, &round.id)?;
-                // The chain's verdict is the round's, asked once (its action the round): a sibling source of the round
-                // gets it replayed with nothing written, and is blocked for the same decision here (M2T16R-03).
-                if matches!(verdict, RepairVerdict::Refused { .. }) && commit.events.is_empty() {
-                    tx.execute(
-                        "UPDATE tasks SET blocked_reason = 'NEED_DECISION', next_retry_at = NULL WHERE task_id = ?1",
-                        params![task],
-                    )
-                    .map_err(sqlite_error)?;
-                    commit.cas.push(StateCas {
-                        id: task.to_owned(),
-                        expected_revision: revision,
-                        change: Change::Task(TaskState::Blocked),
-                    });
-                    commit.events.push(event(
-                        child_id(&round.id, &format!("reverify_exhausted/{task}")),
-                        "need_decision",
-                        json!({"run_id": run_id, "task_id": task, "round_id": round.id,
-                            "reason": "reverify_exhausted", "round_root": round.chain_root,
-                            "detail": format!("round {} was inconclusive and its chain is spent", round.id)}),
-                    ));
-                }
-                super::verification::with_deferred(&mut commit, &deferred);
-                writer::write(tx, &commit, ctx)?;
-                if matches!(verdict, RepairVerdict::Granted { .. }) {
+                if granted {
                     reverified
                         .entry(round.id.clone())
                         .or_default()
@@ -1270,29 +1425,13 @@ fn exits(
                 }
             }
             ("VERIFYING", "flaky") => {
-                tx.execute(
-                    "UPDATE tasks SET blocked_reason = 'NEED_DECISION', next_retry_at = NULL WHERE task_id = ?1",
-                    params![task],
-                )
-                .map_err(sqlite_error)?;
-                writer::write(
+                block_flaky(
                     tx,
-                    &Commit {
-                        cas: vec![StateCas {
-                            id: task.to_owned(),
-                            expected_revision: revision,
-                            change: Change::Task(TaskState::Blocked),
-                        }],
-                        events: vec![event(
-                            child_id(&round.id, &format!("flaky/{task}")),
-                            "need_decision",
-                            json!({"run_id": run_id, "task_id": task, "round_id": round.id, "reason": "flaky",
-                                "detail": "an acceptance criterion is flaky on this candidate: retesting it cannot satisfy \
-                                    it; the flaky handling or a new candidate is a decision (REQ-055)",
-                                "deferred": super::verification::deferred_of(tx, &round.id)?}),
-                        )],
-                        ..Commit::default()
-                    },
+                    (project_id, run_id),
+                    (task, revision),
+                    &round.id,
+                    json!({"round_id": round.id}),
+                    super::verification::deferred_of(tx, &round.id)?,
                     ctx,
                 )?;
             }
@@ -1375,13 +1514,18 @@ fn exits(
         )?;
         done.opened.push(opened);
     }
-    // (4) The candidates' barriers.
+    // (4) The candidates' barriers: every round on the candidate closed (one whose sources were all cancelled too,
+    // docs/adr/ADR-029.md decision 11, -252), and every development task of them not cancelled VERIFYING at a passable
+    // current round on it with nothing left to consume; then its join, in this transaction.
     let candidates: BTreeSet<&str> = all.iter().map(|r| r.candidate.as_str()).collect();
     for candidate in candidates {
         if candidate_state(tx, candidate)?.as_deref() != Some("VERIFYING") {
             continue;
         }
         let rounds: Vec<&Round> = all.iter().filter(|r| r.candidate == candidate).collect();
+        if !rounds.iter().all(|r| verdicts.contains_key(&r.id)) {
+            continue;
+        }
         let participants: BTreeSet<&str> = rounds
             .iter()
             .flat_map(|r| r.sources.iter().map(String::as_str))
@@ -1415,15 +1559,10 @@ fn exits(
         if !joinable {
             continue;
         }
+        // The barrier's event, numbered by the candidate's rounds, once; a barrier M2-T16 wrote without a join is
+        // joined now (J9: the join's own event decides, docs/adr/ADR-029.md decision 11).
         let id = child_id(candidate, &format!("join/{}", rounds.len()));
-        let exists: bool = tx
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM events WHERE event_id = ?1)",
-                params![id],
-                |r| r.get(0),
-            )
-            .map_err(sqlite_error)?;
-        if !exists {
+        if !exists(tx, &id)? {
             writer::write(
                 tx,
                 &Commit {
@@ -1436,17 +1575,131 @@ fn exits(
                 },
                 ctx,
             )?;
-            iteration(tx, (project_id, run_id), candidate, "passable", ctx)?;
+        }
+        if super::join::join(tx, run_id, candidate, all, ctx, done)?.is_some() {
             done.joinable.push(candidate.to_owned());
         }
     }
     Ok(())
 }
 
+/// How a source is verified again: the action its repair is asked under (the round, or the join's per round), the
+/// join when a join asks, and why.
+pub(super) struct Reverification<'a> {
+    pub action: &'a str,
+    pub join: Option<&'a str>,
+    pub detail: String,
+}
+
+/// Source `task` (VERIFYING at `revision`) of inconclusive round `round` verified again on the same candidate (decision
+/// 12; a join's inconclusive class too, docs/adr/ADR-029.md decision 11): `Repair::Reverify` on the round's chain, asked
+/// once per action (a sibling source of the round gets the answer replayed with nothing written, and is blocked for the
+/// same decision here, M2T16R-03); a refusal is a decision (`reverify_exhausted`) carrying the round's deferred
+/// questions. Whether it was granted (the caller opens the next round).
+pub(super) fn reverify_source(
+    tx: &Transaction<'_>,
+    (project_id, run_id): (&str, &str),
+    round: &Round,
+    (task, revision): (&str, i64),
+    how: Reverification<'_>,
+    ctx: &Ctx<'_>,
+) -> Result<bool, PersistError> {
+    let (verdict, mut commit) = super::retry::repair_in(
+        tx,
+        &RepairRequest {
+            run_id: run_id.to_owned(),
+            task_id: task.to_owned(),
+            repair: Repair::Reverify {
+                root: round.chain_root.clone(),
+            },
+            limit: super::retry::REVERIFY_LIMIT,
+            detail: how.detail,
+            action_id: Some(how.action.to_owned()),
+            hold: false,
+        },
+    )?;
+    let deferred = super::verification::deferred_of(tx, &round.id)?;
+    if matches!(verdict, RepairVerdict::Refused { .. }) && commit.events.is_empty() {
+        tx.execute(
+            "UPDATE tasks SET blocked_reason = 'NEED_DECISION', next_retry_at = NULL WHERE task_id = ?1",
+            params![task],
+        )
+        .map_err(sqlite_error)?;
+        commit.cas.push(StateCas {
+            id: task.to_owned(),
+            expected_revision: revision,
+            change: Change::Task(TaskState::Blocked),
+        });
+        let mut payload = json!({"run_id": run_id, "task_id": task, "round_id": round.id,
+            "reason": "reverify_exhausted", "round_root": round.chain_root,
+            "detail": format!("round {} was inconclusive and its chain is spent", round.id)});
+        if let Some(join) = how.join {
+            payload["join_id"] = json!(join);
+        }
+        commit.events.push(NewEvent {
+            project_id: project_id.to_owned(),
+            event_id: child_id(how.action, &format!("reverify_exhausted/{task}")),
+            run_id: Some(run_id.to_owned()),
+            kind: "need_decision".to_owned(),
+            payload,
+        });
+    }
+    super::verification::with_deferred(&mut commit, &deferred);
+    writer::write(tx, &commit, ctx)?;
+    Ok(matches!(verdict, RepairVerdict::Granted { .. }))
+}
+
+/// Source `task` (VERIFYING at `revision`) BLOCKED for a decision on a flaky criterion (decision 11; a join's flaky
+/// class too, docs/adr/ADR-029.md decision 11): `need_decision{reason: flaky}` keyed under `at` (the round or the join)
+/// with `about` (the round, or the candidate and the join) and the deferred questions.
+pub(super) fn block_flaky(
+    tx: &Transaction<'_>,
+    (project_id, run_id): (&str, &str),
+    (task, revision): (&str, i64),
+    at: &str,
+    about: Value,
+    deferred: Vec<Value>,
+    ctx: &Ctx<'_>,
+) -> Result<(), PersistError> {
+    tx.execute(
+        "UPDATE tasks SET blocked_reason = 'NEED_DECISION', next_retry_at = NULL WHERE task_id = ?1",
+        params![task],
+    )
+    .map_err(sqlite_error)?;
+    let mut payload = json!({"run_id": run_id, "task_id": task, "reason": "flaky",
+        "detail": "an acceptance criterion is flaky on this candidate: retesting it cannot satisfy \
+            it; the flaky handling or a new candidate is a decision (REQ-055)",
+        "deferred": deferred});
+    if let (Some(payload), Some(about)) = (payload.as_object_mut(), about.as_object()) {
+        payload.extend(about.clone());
+    }
+    writer::write(
+        tx,
+        &Commit {
+            cas: vec![StateCas {
+                id: task.to_owned(),
+                expected_revision: revision,
+                change: Change::Task(TaskState::Blocked),
+            }],
+            events: vec![NewEvent {
+                project_id: project_id.to_owned(),
+                event_id: child_id(at, &format!("flaky/{task}")),
+                run_id: Some(run_id.to_owned()),
+                kind: "need_decision".to_owned(),
+                payload,
+            }],
+            ..Commit::default()
+        },
+        ctx,
+    )
+    .map(drop)
+}
+
 /// Candidate `candidate`'s one iteration, at its first conclusive result (decision 11, M2T16D-362, -657): a round closed
-/// `repair` or `invalidated`, or its join point; `iteration.completed` and an `iterations` row, the run's iteration
-/// usage counted (ADR-020). Nothing when it was counted already.
-fn iteration(
+/// `repair` or `invalidated`, or its join passable or failed (docs/adr/ADR-029.md decision 13; an inconclusive or flaky
+/// one is none); `iteration.completed` and an `iterations` row, the run's iteration usage counted (ADR-020). Nothing
+/// when it was counted already (a barrier M2-T16 counted included).
+pub(super) fn iteration(
     tx: &Transaction<'_>,
     (project_id, run_id): (&str, &str),
     candidate: &str,
@@ -1619,9 +1872,9 @@ pub(super) fn record_recovery(
                     && millis(now).saturating_sub(first) >= TRANSIENT_SPAN_MS);
             let stale: bool = tx
                 .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM events WHERE kind = 'candidate.stale' \
+                    "SELECT EXISTS(SELECT 1 FROM events WHERE run_id = ?2 AND kind = 'candidate.stale' \
                      AND json_extract(payload_json, '$.candidate_id') = ?1)",
-                    params![candidate],
+                    params![candidate, run_id],
                     |r| r.get(0),
                 )
                 .map_err(sqlite_error)?;
@@ -1630,8 +1883,8 @@ pub(super) fn record_recovery(
                 || tx
                     .query_row(
                         "SELECT EXISTS(SELECT 1 FROM events f, json_each(f.payload_json, '$.superseded') v \
-                         WHERE f.kind = 'candidate.frozen' AND v.value = ?1)",
-                        params![candidate],
+                         WHERE f.run_id = ?2 AND f.kind = 'candidate.frozen' AND v.value = ?1)",
+                        params![candidate, run_id],
                         |r| r.get(0),
                     )
                     .map_err(sqlite_error)?;

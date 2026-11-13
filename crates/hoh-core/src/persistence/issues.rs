@@ -875,6 +875,31 @@ pub(super) fn confirm_set(
     rows.collect::<Result<_, _>>().map_err(sqlite_error)
 }
 
+/// The critical and high Issues of `confirm_set(run_id, sources, candidate)` evaluated now (every round before now)
+/// that the state function does not find resolved (decision 11's `unconfirmed`, -556): a join holds while one is, so
+/// the next round is delivered it (the next batch, or one REOPENED after its delivery). Their ids.
+pub(super) fn unresolved_grave(
+    conn: &Connection,
+    run_id: &str,
+    sources: &[String],
+    candidate: &str,
+) -> Result<Vec<String>, PersistError> {
+    let set = confirm_set(conn, run_id, sources, candidate, i64::MAX)?;
+    if !set.iter().any(|i| grave(&i.severity)) {
+        return Ok(Vec::new());
+    }
+    let resolved: BTreeSet<String> = judged(conn, run_id)?
+        .into_iter()
+        .filter(|(_, judged)| judged.resolved())
+        .map(|(row, _)| row.issue.id)
+        .collect();
+    Ok(set
+        .into_iter()
+        .filter(|i| grave(&i.severity) && !resolved.contains(&i.issue_id))
+        .map(|i| i.issue_id)
+        .collect())
+}
+
 /// What a round's verifier is given to confirm (decision 10): its mandatory scope's lines, every entry of the round's
 /// `confirm_set` (one per fingerprint, severity then opening order), the first [`DELIVERED`] with their description,
 /// the rest by id only; and the Issue ids delivered with their description (`confirm_ids`).
@@ -998,4 +1023,4 @@ pub struct Traced {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

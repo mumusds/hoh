@@ -844,9 +844,14 @@ pub(super) fn rework(
         )
         .optional()
         .map_err(sqlite_error)?;
-    let opened: Value = opened
-        .and_then(|o| serde_json::from_str(&o).ok())
-        .unwrap_or(Value::Null);
+    // A failed join's failures name its id (docs/adr/ADR-029.md decision 11, J8): its `verification.joined` gives the
+    // candidate, its participants (the sources) and its rounds.
+    let opened: Value = match opened {
+        Some(o) => serde_json::from_str(&o).unwrap_or(Value::Null),
+        None => joined(conn, &round_id)?
+            .map(|j| json!({"candidate_id": j["candidate_id"], "source_task_ids": j["tasks"]}))
+            .unwrap_or(Value::Null),
+    };
     let Some(candidate_id) = opened["candidate_id"].as_str().map(str::to_owned) else {
         return Ok(None);
     };
@@ -885,10 +890,19 @@ pub(super) fn rework(
         .collect();
     // Each `issue:<fingerprint>` item's Issues across the run, with their reports and findings, and what the verifiers
     // of the rounds it took failures from observed of them (docs/adr/ADR-029.md decision 11, M2T18D-201).
-    let rounds: Vec<String> = all
-        .iter()
-        .filter_map(|t| t["round_id"].as_str().map(str::to_owned))
-        .collect();
+    let mut rounds: Vec<String> = Vec::new();
+    for id in all.iter().filter_map(|t| t["round_id"].as_str()) {
+        rounds.push(id.to_owned());
+        if let Some(j) = joined(conn, id)? {
+            rounds.extend(
+                j["rounds"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|r| r.as_str().map(str::to_owned)),
+            );
+        }
+    }
     let run_id: Option<String> = conn
         .query_row(
             "SELECT run_id FROM tasks WHERE task_id = ?1",
@@ -935,6 +949,20 @@ pub(super) fn rework(
         candidate_id,
         traced,
     }))
+}
+
+/// The `verification.joined` payload of join `join_id`, if it is one (docs/adr/ADR-029.md decision 11).
+fn joined(conn: &Connection, join_id: &str) -> Result<Option<Value>, PersistError> {
+    let payload: Option<String> = conn
+        .query_row(
+            "SELECT payload_json FROM events WHERE kind = 'verification.joined' \
+             AND json_extract(payload_json, '$.join_id') = ?1 ORDER BY seq DESC LIMIT 1",
+            params![join_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    Ok(payload.and_then(|p| serde_json::from_str(&p).ok()))
 }
 
 /// The objects attempts `attempts` produced, in that order and each attempt's in its own order, as references: from

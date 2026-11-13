@@ -831,17 +831,14 @@ pub(super) fn load_binding(
 }
 
 /// ADR-011 §3 gate: the run's candidates in use, and for each candidate of the run that is ACCEPTED (only the join at
-/// its verification barrier's close accepts one, docs/adr/ADR-028.md decision 12: a VERIFYING candidate counts for
-/// nothing, so no proposal accepts before the barrier or on a FAIL/UNKNOWN) and was frozen on the run's current
-/// specification, the requirements R that have acceptance criteria there each of
-/// which has at least one acceptance result for C and only PASS results, each backed by PASS evidence of C from the
-/// criterion's own check (M2T02R-03).
+/// its verification barrier accepts one, docs/adr/ADR-029.md decision 11: a VERIFYING candidate counts for nothing, so
+/// no proposal accepts before the join or on a FAIL/UNKNOWN) the requirements it passed ([`requirements_passed`]).
 fn load_evidence(
     tx: &Transaction<'_>,
     run_id: &str,
     run: &RunView,
 ) -> Result<Evidence, PersistError> {
-    let (Some(spec_id), Some(spec_sha256)) = (&run.spec_id, &run.spec_sha256) else {
+    let (Some(spec_id), Some(_)) = (&run.spec_id, &run.spec_sha256) else {
         return Ok(Evidence::default());
     };
     let required = strings(
@@ -849,28 +846,6 @@ fn load_evidence(
         "SELECT requirement_id FROM requirements WHERE spec_id = ?1 AND required_release = 1",
         &[spec_id],
     )?;
-    let mut statement = tx
-        .prepare(
-            "SELECT c.candidate_id, q.requirement_id FROM candidates c JOIN requirements q ON q.spec_id = ?2 \
-             WHERE c.run_id = ?1 AND c.state = 'ACCEPTED' AND c.spec_sha256 = ?3 \
-             AND EXISTS (SELECT 1 FROM acceptance_criteria a WHERE a.requirement_id = q.requirement_id AND a.spec_id = q.spec_id) \
-             AND NOT EXISTS ( \
-               SELECT 1 FROM acceptance_criteria a WHERE a.requirement_id = q.requirement_id AND a.spec_id = q.spec_id \
-               AND (NOT EXISTS (SELECT 1 FROM acceptance_results x \
-                                WHERE x.ac_id = a.ac_id AND x.spec_id = a.spec_id AND x.candidate_id = c.candidate_id) \
-                    OR EXISTS (SELECT 1 FROM acceptance_results x \
-                               WHERE x.ac_id = a.ac_id AND x.spec_id = a.spec_id AND x.candidate_id = c.candidate_id \
-                               AND (x.status <> 'PASS' OR NOT EXISTS (SELECT 1 FROM evidence e \
-                                    WHERE e.evidence_id = x.evidence_id AND e.candidate_id = c.candidate_id \
-                                    AND e.outcome = 'PASS' AND e.check_id = a.check_id))))) \
-             ORDER BY c.candidate_id, q.requirement_id",
-        )
-        .map_err(sqlite_error)?;
-    let rows = statement
-        .query_map(params![run_id, spec_id, spec_sha256], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })
-        .map_err(sqlite_error)?;
     let live = strings(
         tx,
         "SELECT candidate_id FROM candidates WHERE run_id = ?1 AND state IN ('FROZEN', 'VERIFYING', 'ACCEPTED')",
@@ -881,15 +856,105 @@ fn load_evidence(
         live,
         ..Evidence::default()
     };
-    for row in rows {
-        let (candidate, requirement) = row.map_err(sqlite_error)?;
-        evidence
-            .candidates
-            .entry(candidate)
-            .or_default()
-            .insert(requirement);
+    let accepted = strings(
+        tx,
+        "SELECT candidate_id FROM candidates WHERE run_id = ?1 AND state = 'ACCEPTED'",
+        &[&run_id],
+    )?;
+    for candidate in accepted {
+        let passed = requirements_passed(tx, run_id, spec_id, &candidate)?;
+        if !passed.is_empty() {
+            evidence.candidates.insert(candidate, passed);
+        }
     }
     Ok(evidence)
+}
+
+/// The requirements of specification `spec_id` that candidate `candidate` of run `run_id` passed (docs/adr/ADR-029.md
+/// decision 12, the gate's predicate; ADR-011 §3): none unless the candidate was frozen on that specification (its
+/// spec_sha256 is the specification's, -158); otherwise each requirement with at least one acceptance criterion, every
+/// one of which the display projection of its rows on the candidate satisfies (decision 2, no profile: PASS, or
+/// compliant DEGRADED where the requirement may degrade; a DEGRADED of one that may not is a FAIL; an INVALID, vetoed or
+/// STALE candidate satisfies none), each of those rows backed by evidence of the candidate from the criterion's own
+/// check whose outcome is the row's status (M2T02R-03). `load_evidence` asks it for ACCEPTED candidates, the join for
+/// the VERIFYING one, so the Runtime's acceptance and the Commander's gate are one function.
+pub(super) fn requirements_passed(
+    conn: &Connection,
+    run_id: &str,
+    spec_id: &str,
+    candidate: &str,
+) -> Result<BTreeSet<String>, PersistError> {
+    use crate::verification::acceptance::{self, Observation, RowFact, Standing};
+    let found: Option<(String, bool, bool)> = conn
+        .query_row(
+            "SELECT c.state, c.spec_sha256 = s.sha256, EXISTS(SELECT 1 FROM evidence e \
+               WHERE e.candidate_id = c.candidate_id AND e.outcome = 'INVALID') \
+             FROM candidates c JOIN specs s ON s.spec_id = ?2 WHERE c.candidate_id = ?3 AND c.run_id = ?1",
+            params![run_id, spec_id, candidate],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some((state, frozen_on_it, vetoed)) = found else {
+        return Ok(BTreeSet::new());
+    };
+    if !frozen_on_it {
+        return Ok(BTreeSet::new());
+    }
+    let standing = match state.as_str() {
+        _ if vetoed => Standing::Invalid,
+        "INVALID" => Standing::Invalid,
+        "STALE" => Standing::Stale,
+        _ => Standing::Usable,
+    };
+    let mut statement = conn
+        .prepare(
+            "SELECT q.requirement_id, q.release_class = 'degradable', a.ac_id, a.check_id FROM requirements q \
+             JOIN acceptance_criteria a ON a.requirement_id = q.requirement_id AND a.spec_id = q.spec_id \
+             WHERE q.spec_id = ?1 ORDER BY q.requirement_id, a.ac_id",
+        )
+        .map_err(sqlite_error)?;
+    let criteria: Vec<(String, bool, String, String)> = statement
+        .query_map(params![spec_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
+        .map_err(sqlite_error)?
+        .collect::<Result<_, _>>()
+        .map_err(sqlite_error)?;
+    let mut rows = conn
+        .prepare(
+            "SELECT x.status, e.candidate_id = x.candidate_id AND e.check_id = ?4 AND e.outcome = x.status \
+             FROM acceptance_results x LEFT JOIN evidence e ON e.evidence_id = x.evidence_id \
+             WHERE x.ac_id = ?1 AND x.spec_id = ?2 AND x.candidate_id = ?3",
+        )
+        .map_err(sqlite_error)?;
+    let mut passed: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
+    for (requirement, degradable, ac, check) in criteria {
+        let found: Vec<(String, Option<bool>)> = rows
+            .query_map(params![ac, spec_id, candidate, check], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .map_err(sqlite_error)?
+            .collect::<Result<_, _>>()
+            .map_err(sqlite_error)?;
+        let observation = Observation {
+            rows: found
+                .iter()
+                .map(|(status, _)| RowFact::of(super::closing::row_of(status)))
+                .collect(),
+            degradable,
+            unobserved_claim: false,
+        };
+        let satisfied = found.iter().all(|(_, backed)| *backed == Some(true))
+            && acceptance::display(standing, &observation, None)
+                .label
+                .satisfied();
+        *passed.entry(requirement).or_insert(true) &= satisfied;
+    }
+    Ok(passed
+        .into_iter()
+        .filter_map(|(requirement, ok)| ok.then_some(requirement))
+        .collect())
 }
 
 #[cfg(test)]
