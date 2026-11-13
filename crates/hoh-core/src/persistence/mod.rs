@@ -44,7 +44,7 @@ pub use completion::{
     WriterCompleted, WriterCompletion, WriterOutcome,
 };
 pub use control::{CancelPass, Finished, PauseStep};
-pub use evidence::{AcceptanceRow, Recording};
+pub use evidence::{AcceptanceKey, AcceptanceRow, Recording};
 pub use handover::{SessionStart, package_bytes};
 pub use leases::{Grant, LEASE_TTL, LeaseView};
 pub use outbox::{ConsumeEffect, Consumed, OutboxRow, Settlement, backoff};
@@ -231,6 +231,9 @@ pub enum PersistError {
     Full(String),
     /// The idempotency key was accepted before with another payload (`KEY_REUSE`); nothing was written.
     KeyReuse(String),
+    /// A change or removal of a row of an append-only table (`acceptance_results`, `evidence`) was refused by the
+    /// database (docs/adr/ADR-029.md decision 6, REQ-053 failure mode 4); nothing was written.
+    AppendOnly(String),
     /// The lease a dispatch needs is held: unexpired, or its holder attempt has not ended (`LEASE_UNAVAILABLE`,
     /// CR-007); nothing was written.
     LeaseUnavailable(String),
@@ -324,6 +327,9 @@ impl std::fmt::Display for PersistError {
                 )
             }
             PersistError::IntegrityViolation(detail) => write!(f, "IntegrityViolation: {detail}"),
+            PersistError::AppendOnly(table) => {
+                write!(f, "APPEND_ONLY: {table} rows are never changed or removed")
+            }
             PersistError::WorkspaceRecordRequired(attempt) => write!(
                 f,
                 "WORKSPACE_RECORD_REQUIRED: the interrupted writer {attempt} ends only with its workspace record"
@@ -477,6 +483,49 @@ fn configure(conn: &Connection, options: &Options, writer: bool) -> Result<(), P
     conn.pragma_update(None, "synchronous", "FULL")
         .map_err(sqlite_error)?;
     verify_pragmas(conn, options.busy_timeout)
+}
+
+/// Install, on writer connection `conn`, the guard of the append-only tables (docs/adr/ADR-029.md decision 6, J1):
+/// TEMP triggers that refuse UPDATE and DELETE of `acceptance_results` and `evidence` (only in this connection, so the
+/// locked schema is unchanged), and recursive triggers so a REPLACE's delete is refused too.
+pub(crate) fn guard_append_only(conn: &Connection) -> Result<(), PersistError> {
+    conn.pragma_update(None, "recursive_triggers", true)
+        .map_err(sqlite_error)?;
+    for table in APPEND_ONLY_TABLES {
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM main.sqlite_master WHERE type = 'table' AND name = ?1)",
+                [table],
+                |r| r.get(0),
+            )
+            .map_err(sqlite_error)?;
+        if !exists {
+            continue;
+        }
+        for (verb, suffix) in [("UPDATE", "u"), ("DELETE", "d")] {
+            conn.execute_batch(&format!(
+                "CREATE TEMP TRIGGER IF NOT EXISTS {table}_append_only_{suffix} BEFORE {verb} ON main.{table} \
+                 BEGIN SELECT RAISE(ABORT, '{APPEND_ONLY}: {table}'); END;"
+            ))
+            .map_err(sqlite_error)?;
+        }
+    }
+    Ok(())
+}
+
+/// The tables whose rows are never changed or removed (docs/adr/ADR-029.md decision 6).
+const APPEND_ONLY_TABLES: [&str; 2] = ["acceptance_results", "evidence"];
+
+/// The message of the append-only guard's refusal.
+pub(crate) const APPEND_ONLY: &str = "APPEND_ONLY";
+
+/// `error` as [`PersistError::AppendOnly`] when it is the append-only guard's refusal, else as [`sqlite_error`].
+pub(crate) fn append_only_error(error: rusqlite::Error) -> PersistError {
+    let text = error.to_string();
+    match text.split_once(&format!("{APPEND_ONLY}: ")) {
+        Some((_, table)) => PersistError::AppendOnly(table.trim().to_owned()),
+        None => sqlite_error(error),
+    }
 }
 
 /// Schema migrations in order: `(user_version after it, SQL)`. A script sets its own `user_version`; the runner owns
@@ -717,6 +766,7 @@ impl Store {
         let conn = Connection::open_with_flags(path, flags).map_err(sqlite_error)?;
         configure(&conn, &options, true)?;
         migrate(&conn, migrations)?;
+        guard_append_only(&conn)?;
         let (committed, watermark) = tokio::sync::watch::channel(commands::max_seq(&conn)?);
         let writer = writer::Writer::spawn(conn, &options, committed)?;
         Ok(Store {
@@ -1272,6 +1322,16 @@ impl Store {
         message: &crate::protocol::Message,
     ) -> Result<Fenced, PersistError> {
         self.writer.fence(message.clone()).await
+    }
+
+    /// Change acceptance row `key` to `status`: refused, always (docs/adr/ADR-029.md decision 6, REQ-053 failure mode
+    /// 4). The statement is issued; the database's append-only guard refuses it and nothing changes.
+    pub async fn update_acceptance_result(
+        &self,
+        key: AcceptanceKey,
+        status: &str,
+    ) -> Result<(), PersistError> {
+        self.writer.amend(key, status.to_owned()).await
     }
 
     /// Record a check's evidence in one transaction (docs/adr/ADR-027.md decisions 7 to 9): the evidence row and its

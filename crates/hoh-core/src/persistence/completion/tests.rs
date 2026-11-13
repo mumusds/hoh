@@ -1559,10 +1559,23 @@ async fn settle_verifiers(store: &Store, path: &Path, qa: &str, review: &str) ->
 /// closes when `deferred`).
 fn evidence_of(
     path: &Path,
+    ids: (&str, &str, &str),
+    check: (&str, &str),
+    rows: &[(&str, &str)],
+    deferred: bool,
+) -> R {
+    evidence_of_kind(path, ids, check, rows, deferred, "check")
+}
+
+/// [`evidence_of`] of evidence kind `kind` (`check`, or `attempt` for an attempt-level record): evidence is append-only
+/// (docs/adr/ADR-029.md decision 6), so a fixture inserts the kind it needs.
+fn evidence_of_kind(
+    path: &Path,
     (attempt, candidate, record): (&str, &str, &str),
     (check, outcome): (&str, &str),
     rows: &[(&str, &str)],
     deferred: bool,
+    kind: &str,
 ) -> R {
     let rows_json: Vec<serde_json::Value> = rows
         .iter()
@@ -1575,8 +1588,8 @@ fn evidence_of(
     )?;
     conn.execute(
         "INSERT INTO evidence(evidence_id, candidate_id, attempt_id, artifact_id, check_id, kind, outcome, mode, \
-         created_at) VALUES (?1, ?2, ?3, ?4, ?5, 'check', ?6, 'product', '2026-11-12T00:00:05Z')",
-        rusqlite::params![record, candidate, attempt, format!("{}:{record}", "e".repeat(64)), check, outcome],
+         created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?7, ?6, 'product', '2026-11-12T00:00:05Z')",
+        rusqlite::params![record, candidate, attempt, format!("{}:{record}", "e".repeat(64)), check, outcome, kind],
     )?;
     conn.execute(
         "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES ('p1', ?1, 'R', \
@@ -2609,16 +2622,13 @@ async fn a_vetoed_planned_check_closes_its_round_invalidated_and_its_item_is_rew
              UPDATE candidates SET state = 'INVALID' WHERE candidate_id = '{candidate}';"
         ))?;
         // The attempt-level record of a verifier's run directory, too (-954): the planned check's veto decides.
-        evidence_of(
+        evidence_of_kind(
             &path,
             (&qa, &candidate, &format!("attempt-{n}")),
             ("independent-qa", "INVALID"),
             &[],
             true,
-        )?;
-        Connection::open(&path)?.execute(
-            "UPDATE evidence SET kind = 'attempt' WHERE evidence_id = ?1",
-            rusqlite::params![format!("attempt-{n}")],
+            "attempt",
         )?;
         let closed = store
             .reconcile_verification("R", Default::default())

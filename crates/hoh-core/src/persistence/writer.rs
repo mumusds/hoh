@@ -148,6 +148,11 @@ enum Job {
         Box<OutboxJob>,
         oneshot::Sender<Result<OutboxDone, PersistError>>,
     ),
+    /// A change of an acceptance row, which the append-only guard refuses ([`super::evidence::amend`]).
+    Amend(
+        Box<(super::evidence::AcceptanceKey, String)>,
+        oneshot::Sender<Result<(), PersistError>>,
+    ),
     /// A check's evidence to record ([`super::evidence::record`]).
     Evidence(
         Box<super::evidence::Recording>,
@@ -391,6 +396,7 @@ impl Job {
             Job::VerificationReconcile(..) => "VerificationReconcile",
             Job::Recovery(..) => "Recovery",
             Job::Evidence(..) => "Evidence",
+            Job::Amend(..) => "Amend",
             Job::Plan(..) => "Plan",
             Job::Round(..) => "Round",
             Job::Reconcile(..) => "Reconcile",
@@ -538,6 +544,13 @@ impl Writer {
                                 &ctx,
                                 reply,
                                 run_outbox(&mut conn, *job, &writer_claims, &ctx),
+                            ));
+                        }
+                        Job::Amend(job, reply) => {
+                            deferred = Some(answer(
+                                &ctx,
+                                reply,
+                                super::evidence::amend(&mut conn, &job.0, &job.1, &ctx),
                             ));
                         }
                         Job::Evidence(job, reply) => {
@@ -790,6 +803,15 @@ impl Writer {
 
     pub(super) async fn outbox(&self, job: OutboxJob) -> Result<OutboxDone, PersistError> {
         self.submit(|tx| Job::Outbox(Box::new(job), tx)).await
+    }
+
+    pub(super) async fn amend(
+        &self,
+        key: super::evidence::AcceptanceKey,
+        status: String,
+    ) -> Result<(), PersistError> {
+        self.submit(|tx| Job::Amend(Box::new((key, status)), tx))
+            .await
     }
 
     pub(super) async fn record_evidence(
