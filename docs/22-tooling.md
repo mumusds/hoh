@@ -107,7 +107,7 @@ M2-T16 起，产品自己完成“开发者完成 → 冻结 → QA 与 Review �
 - **代码类来源**：验证者与返工的 Developer 收到候选相对基准改动的文件（基准为本轮源 Task 最早的写者 Attempt 启动时的 HEAD），按路径排序至多 50 个，每个至多 64 KiB 且为 UTF-8，否则只列路径。
 - **重新验证上限** `REVERIFY_LIMIT = 2`（常量，只经 CR 修改）：同一来源在同一候选上再验证（验证 Task 的 FAILED/BLOCKED/INCOMPLETE 结果、无结论的轮次）按链的首轮计数，验证者篡改使候选 INVALID 后的再冻结按源 Task 计数；超过 2 次即交决策（NEED_DECISION）。
 - **补记与启动**：每个 tick 先补记候选的待入库检查记录；永久错误（事实损坏、记录不属于该候选、记录仍在而对象丢失）立即判定，暂时错误连续至少 3 次且跨至少 10 分钟才判定；判定时 VERIFYING 的候选置 STALE（`candidate.stale{evidence_unrecoverable}`）并写 `integrity_violation`。host 启动时对每个有记录目录的候选补记一次，失败唤醒 Commander 并暂停派发它的验证 Task，直到一次补记成功；没有活 Attempt 的运行目录与请求目录在启动时删除。
-- **请求桥**：验证者的 `run-check` 与 `ask` 是它 attempt 目录里的 POSIX sh 助手，请求写在 `.hoh/attempts/<attempt>/requests/`，每个 Attempt 至多 64 条；不是 `hoh` 子命令（CONTRACT 第 3 条）。
+- **请求桥**：验证者的 `run-check` 与 `ask` 是它 attempt 目录里的 POSIX sh 助手，请求写在 `.hoh/attempts/<attempt>/requests/`，每个 Attempt 至多 64 条；不是 `hoh` 子命令（CONTRACT 第 3 条）；请求目录不在了（Attempt 已结束）时助手以 2 退出，不重建目录（M2T18R-54）。
 - **余项**：
   - 验证者在自己的 `run-check` 进行中改写运行目录，会被记成该检查的 SOURCE_CHANGED，按开发者的失败项返工；有界：同一指纹第 4 次升级为决策（M2T16D-1057）。
   - 运行目录是候选的 checkout，被测仓库自带的 Agent 指令文件（如 `AGENTS.md`、`CLAUDE.md`）会被验证 Agent 读到；请求目录与助手在项目的 `.hoh/` 下，所以 Agent 能从它们的路径得知项目根（M2T16D-363）。
