@@ -302,6 +302,21 @@ async fn verification_live_candidate_to_qa() -> R {
         .ok_or("neither XDG_CACHE_HOME nor HOME is set")?
         .join("hoh-live");
     std::fs::create_dir_all(&base)?;
+    // A base under the system temp directory (XDG_CACHE_HOME or HOME set there) would bring back the plugin's write and
+    // its veto: say so instead of producing a misleading verdict (M2T18R-201).
+    let real = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    if real(&base).starts_with(real(&std::env::temp_dir())) {
+        return write_verdict(
+            &out,
+            "BLOCKED",
+            &format!(
+                "the live state's base {} is under the system temp directory; set XDG_CACHE_HOME elsewhere",
+                base.display()
+            ),
+            &[],
+            json!({}),
+        );
+    }
     let world = tempfile::Builder::new()
         .prefix("hoh-live-qa-")
         .tempdir_in(&base)?;
