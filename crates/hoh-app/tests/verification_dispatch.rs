@@ -2839,3 +2839,250 @@ async fn test_054_04_findings_settled_through_the_host_trace_to_their_report_and
     host.shutdown().await;
     outcome
 }
+
+/// TEST-054-02's run: [`world_two`] with T2 independent of T1 and READY, so T2 can freeze C2 while C1's verifiers run.
+fn world_side_by_side(spec: &str) -> String {
+    format!(
+        "{}
+DELETE FROM task_dependencies WHERE task_id = 'T2';
+UPDATE tasks SET state = 'READY', revision = revision + 1 WHERE task_id = 'T2';",
+        world_two(spec)
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_054_02_a_report_on_a_superseded_candidate_is_stale() -> R {
+    // AC-054-02 on the product path (REQ-054 behaviour 4, failure mode 2; docs/adr/ADR-029.md decision 8, ADR-028
+    // decision 9): T1's FakeAgent Developer commits and completes into C1, whose QA and Reviewer FakeAgents start and
+    // wait for the test's word. T2's Developer (held until then) commits and completes into C2: C1 STALE, T1 taken
+    // into C2's round. Then C1's verifiers end and report PASS on C1: the Reviewer's report row is STALE (queryable,
+    // kept), C1's round closes superseded, C2's review in the snapshot is NOT_RUN while C2's Reviewer has not
+    // completed, and exactly one kind=handoff message goes to the reviewer with candidate_id C2.
+    let dir = tempfile::tempdir()?;
+    let (project, spec) = project_with(dir.path(), SPEC_AB, PLAN_AB).await?;
+    seed(&project, &world_side_by_side(&spec))?;
+    let clock = Arc::new(FakeClock::default());
+    let mut team = Team::new(Commander::Answers, &spec, &project);
+    team.out = dir.path().join("out");
+    std::fs::create_dir_all(&team.out)?;
+    let out = team.out.clone();
+    let quoted = out
+        .to_str()
+        .ok_or("the out directory is not UTF-8")?
+        .to_owned();
+    *team.scope.lock().map_err(|e| e.to_string())? = vec!["AC-090-01".to_owned()];
+    // The first Developer turn (T1's) commits at once; a later one (T2's) waits for `second-go` before it commits.
+    *team.developer_script.lock().map_err(|e| e.to_string())? = Some(format!(
+        "if [ -e '{quoted}/first-done' ]; then : > '{quoted}/second-waiting'; \
+           while [ ! -e '{quoted}/second-go' ] && [ -d '{quoted}' ]; do sleep 0.1; done; fi; \
+         : > '{quoted}/first-done'; \
+         git -c user.name=t -c user.email=t@example.invalid commit -q --allow-empty -m work || exit 1; exit 0"
+    ));
+    // A verifier started before `second-round` exists is C1's and ends on `c1-go`; one started after it, C2's, on
+    // `c2-go`. Each says it waits.
+    let verifier = |role: &str| {
+        format!(
+            "if [ -e \"$OUT/second-round\" ]; then w=c2; else w=c1; fi; : > \"$OUT/$w-{role}-waiting\"; \
+             while [ ! -e \"$OUT/$w-go\" ] && [ -d \"$OUT\" ]; do sleep 0.1; done; exit 0"
+        )
+    };
+    *team.qa_script.lock().map_err(|e| e.to_string())? = Some(verifier("qa"));
+    *team.review_script.lock().map_err(|e| e.to_string())? = Some(verifier("reviewer"));
+    team.release.store(true, Ordering::SeqCst);
+    let team = Arc::new(team);
+    let host = host(&project, team.clone(), clock.clone()).await?;
+    let outcome = async {
+        let step = Duration::from_millis(100);
+        let until_file = |name: &str| -> R {
+            let end = Instant::now() + Duration::from_secs(60);
+            while !out.join(name).exists() {
+                if Instant::now() > end {
+                    return Err(format!("no {name}").into());
+                }
+                clock.advance(step);
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Ok(())
+        };
+        // C1 frozen from T1; its QA and Reviewer run; T2's Developer runs, held.
+        until_file("c1-qa-waiting")?;
+        until_file("c1-reviewer-waiting")?;
+        until_file("second-waiting")?;
+        let (c1, _, _) = candidate(&project)?;
+        let opened = |candidate: &str| -> R<Value> {
+            let found = rows(
+                &project,
+                &format!(
+                    "SELECT json_extract(payload_json, '$.round_id') AS round_id, \
+                     json_extract(payload_json, '$.source_task_ids') AS sources FROM events \
+                     WHERE kind = 'verification.round_opened' AND json_extract(payload_json, '$.candidate_id') = '{candidate}'"
+                ),
+            )?;
+            Ok(found[0].clone())
+        };
+        let c1_round = opened(&c1)?;
+        assert_eq!(c1_round["sources"], json!("[\"T1\"]"), "{c1_round}");
+        let c1_round_id = c1_round["round_id"].as_str().ok_or("no C1 round")?.to_owned();
+        assert_eq!(
+            rows(
+                &project,
+                "SELECT t.role, a.state FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+                 WHERE t.role IN ('qa', 'reviewer') ORDER BY t.role"
+            )?,
+            json!([{"role": "qa", "state": "RUNNING"}, {"role": "reviewer", "state": "RUNNING"}]),
+            "C1's verifiers run when C2 is frozen"
+        );
+        // T2 completes into C2.
+        std::fs::write(out.join("second-round"), "")?;
+        std::fs::write(out.join("second-go"), "")?;
+        let c2 = wait_for(
+            &project,
+            &clock,
+            step,
+            &format!("SELECT candidate_id FROM candidates WHERE candidate_id <> '{c1}'"),
+            &|r| r.as_array().is_some_and(|a| !a.is_empty()),
+        )?[0]["candidate_id"]
+            .as_str()
+            .ok_or("no C2")?
+            .to_owned();
+        assert_eq!(
+            rows(&project, &format!("SELECT state FROM candidates WHERE candidate_id = '{c1}'"))?,
+            json!([{"state": "STALE"}])
+        );
+        let c2_round = opened(&c2)?;
+        let sources: Vec<String> =
+            serde_json::from_str(c2_round["sources"].as_str().ok_or("no C2 sources")?)?;
+        assert!(
+            sources.contains(&"T1".to_owned()) && sources.contains(&"T2".to_owned()),
+            "T1 is taken into C2's round: {c2_round}"
+        );
+        assert_eq!(
+            rows(&project, "SELECT count(*) AS n FROM independent_reports")?,
+            json!([{"n": 0}]),
+            "no report before C1's verifiers end"
+        );
+        // C1's verifiers end and report PASS on C1.
+        std::fs::write(out.join("c1-go"), "")?;
+        let c1_reports = wait_for(
+            &project,
+            &clock,
+            step,
+            &format!(
+                "SELECT report_id, role, status, state, candidate_id, session_id, attempt_id FROM independent_reports \
+                 WHERE candidate_id = '{c1}' ORDER BY role"
+            ),
+            &|r| r.as_array().is_some_and(|a| a.len() == 2),
+        )?;
+        let closed = wait_for(
+            &project,
+            &clock,
+            step,
+            &format!(
+                "SELECT json_extract(payload_json, '$.verdict') AS verdict FROM events \
+                 WHERE kind = 'verification.round_closed' AND json_extract(payload_json, '$.round_id') = '{c1_round_id}'"
+            ),
+            &|r| r.as_array().is_some_and(|a| !a.is_empty()),
+        )?;
+        // C2's Reviewer has not completed (it waits for `c2-go`): C2's review is NOT_RUN.
+        let snapshot = host.store().reader()?.acceptance("R")?.ok_or("no run R")?;
+        let c2_rows = rows(
+            &project,
+            &format!("SELECT count(*) AS n FROM independent_reports WHERE candidate_id = '{c2}'"),
+        )?;
+        let shown = acceptance_now(&host, &project).await?;
+        let handoffs = rows(
+            &project,
+            &format!(
+                "SELECT message_id, state, event_seq FROM outbox WHERE recipient_role = 'reviewer' \
+                 AND json_extract(payload_json, '$.kind') = 'handoff' \
+                 AND json_extract(payload_json, '$.candidate_id') = '{c2}'"
+            ),
+        )?;
+        let events = rows(
+            &project,
+            "SELECT seq, kind, payload_json AS payload FROM events WHERE kind IN ('candidate.frozen', 'report.stale', \
+             'verification.report', 'verification.round_opened', 'verification.round_closed') ORDER BY seq",
+        )?;
+        let outbox = rows(
+            &project,
+            "SELECT message_id, recipient_role, state, json_extract(payload_json, '$.kind') AS kind, \
+             json_extract(payload_json, '$.candidate_id') AS candidate_id FROM outbox \
+             WHERE json_extract(payload_json, '$.payload.handoff_kind') = 'verification' ORDER BY event_seq, message_id",
+        )?;
+        keep(
+            "m2t18-test-054-02",
+            &json!({"c1": c1, "c2": c2, "c1_round": c1_round, "c2_round": c2_round, "c1_reports": c1_reports,
+                "c1_round_closed": closed, "c2_report_rows": c2_rows, "snapshot": shown, "c2_reviewer_handoffs": handoffs,
+                "verification_outbox": outbox, "events": events}),
+        )?;
+        let review = c1_reports
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|r| r["role"] == json!("reviewer"))
+            .ok_or("no reviewer report on C1")?;
+        assert_eq!(
+            (&review["status"], &review["state"], &review["candidate_id"]),
+            (&json!("PASS"), &json!("STALE"), &json!(c1)),
+            "{c1_reports}"
+        );
+        assert_eq!(
+            c1_reports
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|r| r["state"].clone())
+                .collect::<Vec<_>>(),
+            [json!("STALE"), json!("STALE")],
+            "{c1_reports}"
+        );
+        let stale_events: Vec<Value> = events
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|e| e["kind"] == json!("report.stale"))
+            .filter_map(|e| serde_json::from_str(e["payload"].as_str()?).ok())
+            .collect();
+        assert!(
+            stale_events.iter().any(|s| s["report_ids"] == json!([review["report_id"]])
+                && s["reason"] == json!("superseded")
+                && s["candidate_id"] == json!(c1)),
+            "{events}"
+        );
+        assert_eq!(closed, json!([{"verdict": "superseded"}]));
+        assert_eq!(c2_rows, json!([{"n": 0}]), "C2's Reviewer has not completed");
+        assert_eq!(
+            (
+                snapshot.candidate.as_ref().map(|c| c.candidate_id.clone()),
+                snapshot.review,
+                snapshot.qa
+            ),
+            (
+                Some(c2.clone()),
+                hoh_core::verification::classify::Report::NotRun,
+                hoh_core::verification::classify::Report::NotRun
+            ),
+            "{shown}"
+        );
+        assert_eq!(shown["snapshot"]["review"], json!("NOT_RUN"), "{shown}");
+        assert_eq!(handoffs.as_array().map(Vec::len), Some(1), "{handoffs}");
+        // C1's report rows are kept and queryable after the close.
+        assert_eq!(
+            rows(
+                &project,
+                &format!(
+                    "SELECT role, state, status FROM independent_reports WHERE candidate_id = '{c1}' ORDER BY role"
+                )
+            )?,
+            json!([{"role": "qa", "state": "STALE", "status": "PASS"},
+                   {"role": "reviewer", "state": "STALE", "status": "PASS"}])
+        );
+        R::Ok(())
+    }
+    .await;
+    let _ = std::fs::write(out.join("second-go"), "");
+    let _ = std::fs::write(out.join("c1-go"), "");
+    let _ = std::fs::write(out.join("c2-go"), "");
+    host.shutdown().await;
+    outcome
+}
