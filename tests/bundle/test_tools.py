@@ -773,6 +773,20 @@ class PersistenceScan(unittest.TestCase):
                           ('fixture.rs','append-only','t: DELETE FROM EVIDENCE'),
                           ('persistence-whitelist.json','append-only-allow','evidence.rs gone UPDATE evidence: not used'),
                           ('persistence-whitelist.json','append-only-allow','evidence.rs other DELETE FROM acceptance_results: no reason given')])
+    def test_an_allowed_functions_allowance_ends_with_its_body(self):
+        # docs/adr/ADR-029.md decision 6 (M2T18R-02): a write after the allowed function's body, at module level or in
+        # an item that follows it, is not inside that function and stays a hit; the same write inside the body is
+        # allowed.
+        allow=[{'file':'crates/hoh-core/src/persistence/evidence.rs','function':'amend','statement':'UPDATE acceptance_results','reason':'the refused interface'}]
+        src=('fn amend(x: u8) -> Result<(), E> where E: Into<u8> { if x > 0 { let _ = "UPDATE acceptance_results SET status = ?1"; } Ok(()) }\n'
+             'const SQL: &str = "UPDATE acceptance_results SET status = ?2";\n'
+             'struct S { f: u8 }\nimpl S { const Q: &str = "UPDATE acceptance_results SET status = ?3"; }\n')
+        files={'crates/hoh-core/src/persistence/evidence.rs':src,
+               'scripts/product/persistence-whitelist.json':json.dumps({'files':{'clippy.toml':'fixture'},'append_only_allow':allow})}
+        rc,res=self.run_scan(files,whitelist=False)
+        self.assertEqual(rc,1)
+        got=sorted(h['match'] for h in res['hits'] if h['kind'].startswith('append-only'))
+        self.assertEqual(got,[': UPDATE ACCEPTANCE_RESULTS SET'])
     def test_new_rusqlite_features_need_the_boundary_extended(self):
         rc,res=self.run_scan({},features=['bundled','default','backup'])
         self.assertEqual(self.kinds(res),[('Cargo.lock','rusqlite-feature')])

@@ -366,7 +366,8 @@ fn developer_sessions(
              SELECT session_id FROM tried WHERE session_id IS NOT NULL \
              UNION SELECT s.native_id FROM sessions s WHERE s.session_id IN (SELECT session_id FROM tried) \
                AND s.native_id IS NOT NULL \
-             UNION SELECT json_extract(n.payload_json, '$.native_id') FROM events n WHERE n.kind = 'session.native' \
+             UNION SELECT json_extract(n.payload_json, '$.native_id') FROM events n WHERE n.run_id = ?2 \
+               AND n.kind = 'session.native' \
                AND json_extract(n.payload_json, '$.attempt_id') IN (SELECT attempt_id FROM tried) \
                AND json_extract(n.payload_json, '$.native_id') IS NOT NULL",
         )
