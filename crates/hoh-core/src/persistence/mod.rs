@@ -27,6 +27,7 @@ mod evidence;
 mod handover;
 mod inputs;
 mod issues;
+mod join;
 mod leases;
 mod outbox;
 mod outputs;
@@ -1818,7 +1819,7 @@ impl Reader {
                  WHERE f.kind = 'candidate.reconcile_failed' \
                  AND f.seq > coalesce((SELECT max(r.seq) FROM events r WHERE r.kind = 'candidate.reconcile_recovered' \
                    AND json_extract(r.payload_json, '$.candidate_id') = json_extract(f.payload_json, '$.candidate_id')), 0) \
-                 AND NOT EXISTS(SELECT 1 FROM events s WHERE s.kind = 'candidate.stale' \
+                 AND NOT EXISTS(SELECT 1 FROM events s WHERE s.run_id = f.run_id AND s.kind = 'candidate.stale' \
                    AND json_extract(s.payload_json, '$.reason') = 'evidence_unrecoverable' \
                    AND json_extract(s.payload_json, '$.candidate_id') = json_extract(f.payload_json, '$.candidate_id'))",
             )
@@ -1836,6 +1837,7 @@ impl Reader {
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM candidates WHERE candidate_id = ?1) \
                  AND NOT EXISTS(SELECT 1 FROM events WHERE kind = 'candidate.stale' \
+                   AND run_id = (SELECT run_id FROM candidates WHERE candidate_id = ?1) \
                    AND json_extract(payload_json, '$.reason') = 'evidence_unrecoverable' \
                    AND json_extract(payload_json, '$.candidate_id') = ?1)",
                 rusqlite::params![candidate_id],
@@ -1970,9 +1972,11 @@ impl Reader {
                      WHERE x.kind = 'verification.round_closed' \
                      AND json_extract(x.payload_json, '$.round_id') = json_extract(o.payload_json, '$.round_id'))) \
                  AND NOT EXISTS(SELECT 1 FROM events s WHERE s.kind = 'candidate.stale' \
+                   AND s.run_id = (SELECT run_id FROM candidates WHERE candidate_id = ?1) \
                    AND json_extract(s.payload_json, '$.candidate_id') = ?1) \
                  AND NOT EXISTS(SELECT 1 FROM events f, json_each(f.payload_json, '$.superseded') v \
-                   WHERE f.kind = 'candidate.frozen' AND v.value = ?1)",
+                   WHERE f.kind = 'candidate.frozen' AND f.run_id = (SELECT run_id FROM candidates \
+                   WHERE candidate_id = ?1) AND v.value = ?1)",
                 rusqlite::params![candidate_id],
                 |r| r.get(0),
             )

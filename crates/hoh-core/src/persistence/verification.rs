@@ -351,42 +351,21 @@ pub(super) fn unknown_effect(
     )))
 }
 
-/// Run `run_id`'s rounds' source tasks, and those of them whose current round's candidate is ready for its join.
-#[allow(clippy::type_complexity)]
-pub(super) fn sources_and_joining(
+/// Run `run_id`'s rounds' source tasks.
+pub(super) fn sources(
     tx: &rusqlite::Connection,
     run_id: &str,
-) -> Result<
-    (
-        std::collections::BTreeSet<String>,
-        std::collections::BTreeSet<String>,
-    ),
-    PersistError,
-> {
+) -> Result<std::collections::BTreeSet<String>, PersistError> {
     let mut statement = tx
         .prepare(
-            "WITH named AS (SELECT e.seq, json_extract(e.payload_json, '$.candidate_id') AS candidate_id, \
-               s.value AS task_id FROM events e, json_each(e.payload_json, '$.source_task_ids') s \
-               WHERE e.kind = ?1 AND e.run_id = ?2) \
-             SELECT n.task_id, EXISTS(SELECT 1 FROM events j WHERE j.kind = 'verification.candidate_ready_for_join' \
-               AND j.run_id = ?2 AND json_extract(j.payload_json, '$.candidate_id') = n.candidate_id) \
-             FROM named n WHERE n.seq = (SELECT max(m.seq) FROM named m WHERE m.task_id = n.task_id)",
+            "SELECT DISTINCT s.value FROM events e, json_each(e.payload_json, '$.source_task_ids') s \
+             WHERE e.kind = ?1 AND e.run_id = ?2",
         )
         .map_err(sqlite_error)?;
-    let rows: Vec<(String, bool)> = statement
-        .query_map(params![ROUND_OPENED, run_id], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
-        .map_err(sqlite_error)?
-        .collect::<Result<_, _>>()
+    let rows = statement
+        .query_map(params![ROUND_OPENED, run_id], |r| r.get(0))
         .map_err(sqlite_error)?;
-    Ok((
-        rows.iter().map(|(t, _)| t.clone()).collect(),
-        rows.iter()
-            .filter(|(_, j)| *j)
-            .map(|(t, _)| t.clone())
-            .collect(),
-    ))
+    rows.collect::<Result<_, _>>().map_err(sqlite_error)
 }
 
 /// The tasks of run `run_id` with a repair refusal no decision has cleared (docs/adr/ADR-028.md decision 12, M2T16D-800):

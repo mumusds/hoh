@@ -6,6 +6,7 @@ use super::runner::{ArtifactRow, artifact_id};
 use super::writer::{self, Commit, NewEvent};
 use super::{PersistError, sqlite_error};
 use crate::ids::child_id;
+use crate::verification::classify::Report;
 use rusqlite::{OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 
@@ -473,6 +474,70 @@ fn stale_reason(
     } else {
         None
     })
+}
+
+/// The report status of `role` over rounds whose verifier attempts are `rounds` (each in its order; docs/adr/ADR-029.md
+/// decision 5's `report_status`, the join's and the snapshot's): each round's latest CURRENT report of the role (never a
+/// STALE or REJECTED one), merged FAIL > UNKNOWN > a round without one (NOT_RUN) > PASS; NOT_RUN for no round. With it,
+/// the findings' summaries of its FAIL reports (their `verification.report` events), sorted.
+pub(super) fn report_status(
+    tx: &Transaction<'_>,
+    rounds: &[Vec<String>],
+    role: &str,
+) -> Result<(Report, Vec<String>), PersistError> {
+    let mut statuses = Vec::new();
+    let mut findings = std::collections::BTreeSet::new();
+    for attempts in rounds {
+        let mut latest: Option<(String, Option<String>)> = None;
+        for attempt in attempts {
+            let found: Option<(String, Option<String>)> = tx
+                .query_row(
+                    "SELECT r.status, (SELECT json_extract(e.payload_json, '$.findings') FROM events e \
+                       WHERE e.run_id = r.run_id AND e.kind = 'verification.report' \
+                       AND json_extract(e.payload_json, '$.attempt_id') = r.attempt_id \
+                       ORDER BY e.seq DESC LIMIT 1) \
+                     FROM independent_reports r WHERE r.attempt_id = ?1 AND r.role = ?2 AND r.state = 'CURRENT' \
+                     ORDER BY r.rowid DESC LIMIT 1",
+                    params![attempt, role],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
+                .map_err(sqlite_error)?;
+            if found.is_some() {
+                latest = found;
+            }
+        }
+        let status = match latest {
+            None => Report::NotRun,
+            Some((status, summaries)) => {
+                let status = match status.as_str() {
+                    "PASS" => Report::Pass,
+                    "FAIL" => Report::Fail,
+                    "UNKNOWN" => Report::Unknown,
+                    _ => Report::NotRun,
+                };
+                if status == Report::Fail {
+                    findings.extend(
+                        summaries
+                            .and_then(|f| serde_json::from_str::<Vec<String>>(&f).ok())
+                            .unwrap_or_default(),
+                    );
+                }
+                status
+            }
+        };
+        statuses.push(status);
+    }
+    let merged = if statuses.contains(&Report::Fail) {
+        Report::Fail
+    } else if statuses.contains(&Report::Unknown) {
+        Report::Unknown
+    } else if statuses.is_empty() || statuses.contains(&Report::NotRun) {
+        Report::NotRun
+    } else {
+        Report::Pass
+    };
+    Ok((merged, findings.into_iter().collect()))
 }
 
 /// [`intake_in`] in a transaction of its own ([`super::Store::record_report`]): only the report's intake (its row, its

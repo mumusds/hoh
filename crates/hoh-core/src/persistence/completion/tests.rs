@@ -1766,9 +1766,9 @@ async fn test_037_02_a_failed_round_closes_after_both_verifiers_and_reworks_its_
 }
 
 #[tokio::test]
-async fn a_passable_round_waits_at_its_candidates_barrier_for_the_join() -> R {
-    // Decision 11: both reports PASS, the check PASS, every scope criterion PASS: passable; C1 stays VERIFYING, D waits,
-    // and the candidate is ready for M2-T18's join (once).
+async fn a_passable_round_at_its_candidates_barrier_is_joined_and_its_candidate_accepted() -> R {
+    // Decision 11: both reports PASS, the check PASS, every scope criterion PASS: passable; the candidate's barrier
+    // holds and its join (docs/adr/ADR-029.md decision 11, in the same transaction) accepts C1 and D (once).
     let dir = tempfile::tempdir()?;
     let (store, path) = open(dir.path())?;
     let (round, candidate, [qa, _]) = verified(&store, &path, "PASS", "PASS").await?;
@@ -1784,10 +1784,17 @@ async fn a_passable_round_waits_at_its_candidates_barrier_for_the_join() -> R {
         .await?;
     assert_eq!(done.closed, [(round, "passable".to_owned())]);
     assert_eq!(done.joinable, std::slice::from_ref(&candidate));
-    assert_eq!(texts(&path, "SELECT state FROM candidates")?, ["VERIFYING"]);
+    assert_eq!(texts(&path, "SELECT state FROM candidates")?, ["ACCEPTED"]);
     assert_eq!(
         texts(&path, "SELECT state FROM tasks WHERE task_id = 'D'")?,
-        ["VERIFYING"]
+        ["ACCEPTED"]
+    );
+    assert_eq!(
+        texts(
+            &path,
+            "SELECT json_extract(payload_json, '$.outcome') FROM events WHERE kind = 'verification.joined'"
+        )?,
+        ["accepted"]
     );
     let again = store
         .reconcile_verification("R", Default::default())
@@ -2096,8 +2103,9 @@ async fn a_superseded_candidates_round_cancels_its_unstarted_verifiers_and_close
 #[tokio::test]
 async fn a_round_whose_verifier_is_blocked_and_whose_other_is_done_stalls_its_run() -> R {
     // Decision 10's in-flight rule (M2T16D-202): a VERIFYING source and an IMPLEMENTED verifier are not in flight; with
-    // qa BLOCKED_AUTH and the reviewer done, nothing of the run can move on: BLOCKED with BLOCKED_AUTH. A source waiting
-    // at a passable candidate's barrier for the join is in flight (M2-T16's transition): its run is not stalled.
+    // qa BLOCKED_AUTH and the reviewer done, nothing of the run can move on: BLOCKED with BLOCKED_AUTH. A passable
+    // candidate's barrier is joined in the same transaction (docs/adr/ADR-029.md decision 13: no source waits for a
+    // join): D ACCEPTED, nothing blocked, the run not stalled.
     let dir = tempfile::tempdir()?;
     let (store, path) = open(dir.path())?;
     verifying(&store).await?;
@@ -2133,7 +2141,7 @@ async fn a_round_whose_verifier_is_blocked_and_whose_other_is_done_stalls_its_ru
         )?,
         ["BLOCKED:[\"BLOCKED_AUTH\"]"]
     );
-    // A passable candidate waiting for its join: in flight.
+    // A passable candidate: joined, nothing waits for it.
     let dir = tempfile::tempdir()?;
     let (store, path) = open(dir.path())?;
     let (_, candidate, [qa, _]) = verified(&store, &path, "PASS", "PASS").await?;
@@ -2147,6 +2155,10 @@ async fn a_round_whose_verifier_is_blocked_and_whose_other_is_done_stalls_its_ru
     store
         .reconcile_verification("R", Default::default())
         .await?;
+    assert_eq!(
+        texts(&path, "SELECT state FROM tasks WHERE task_id = 'D'")?,
+        ["ACCEPTED"]
+    );
     store.pace_run("R", verifiers()).await?;
     assert_eq!(
         texts(&path, "SELECT state FROM runs WHERE run_id = 'R'")?,
