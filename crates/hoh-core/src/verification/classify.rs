@@ -94,6 +94,9 @@ pub struct Input {
     /// A FAIL row of the round's own evidence on an AC outside its scope, whatever its check's outcome (docs/adr/ADR-028.md
     /// decision 12, implementation correction 6): every failure item is a failing input.
     pub outside_failed: bool,
+    /// A critical or high Issue delivered to both verifiers of the round for confirmation, neither still present nor
+    /// confirmed fixed (docs/adr/ADR-029.md decision 10): the round cannot pass; a failure or flakiness still wins.
+    pub unconfirmed: bool,
 }
 
 /// The class of `input`, by priority: failed, flaky, passable (a positive condition), else inconclusive.
@@ -110,7 +113,8 @@ pub fn classify(input: &Input) -> Class {
     if input.acs.contains(&Ac::Flaky) {
         return Class::Flaky;
     }
-    let passable = input.qa == Report::Pass
+    let passable = !input.unconfirmed
+        && input.qa == Report::Pass
         && input.review == Report::Pass
         && input.checks == Checks::Passed
         && !input.acs.is_empty()

@@ -303,6 +303,7 @@ fn report_of(
         raw_session: raw.clone(),
         native_session_ids: checked.session_ids,
         native_status: checked.status,
+        confirmations: Vec::new(),
     })
 }
 
@@ -320,8 +321,17 @@ pub(super) fn verifier_outcome(
                 .ok_or_else(|| "its report could not be made here".to_owned())
                 .and_then(|r| report_of(r, ending))
             {
+                // Its TaskResult issues go with its report: the store keeps the confirmations of what it was
+                // delivered (docs/adr/ADR-029.md decision 10).
                 Ok(report) => VerifierOutcome::Settle {
-                    report: Box::new(report),
+                    report: Box::new(hoh_core::persistence::VerifierReport {
+                        confirmations: result
+                            .issues
+                            .iter()
+                            .map(|o| serde_json::Value::Object(o.clone()))
+                            .collect(),
+                        ..report
+                    }),
                 },
                 Err(why) => VerifierOutcome::Correct {
                     reasons: vec![format!("its report: {why}")],

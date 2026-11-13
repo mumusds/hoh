@@ -910,6 +910,12 @@ pub(super) fn assignment(
             facts
                 .scope
                 .extend(super::context::corrections(conn, task_id, attempt_id)?);
+            // The Issues it is to confirm fixed, in its mandatory scope; the ids delivered with their description are
+            // recorded with its packing (docs/adr/ADR-029.md decision 10).
+            let delivery =
+                super::issues::deliver(conn, run_id, &handoff.round_id, &handoff.source_task_ids)?;
+            facts.scope.extend(delivery.lines);
+            facts.confirm_ids = Some(delivery.confirm_ids);
             facts
         }
         None => super::context::facts(

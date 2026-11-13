@@ -857,6 +857,8 @@ pub(super) fn request(
         },
         ctx,
     )?;
+    // A change request's Issue is a present fact of its fingerprint (docs/adr/ADR-029.md decision 10, M2T18D-701).
+    super::issues::settle_all(&tx, run_id)?;
     ctx.before_commit()?;
     tx.commit().map_err(sqlite_error)?;
     Ok(issue)

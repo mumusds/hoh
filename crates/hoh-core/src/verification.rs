@@ -1075,6 +1075,7 @@ pub const ATTEMPT_MARKER: &str = "hoh-runtime:verification-attempt";
 
 pub mod acceptance;
 pub mod classify;
+pub mod issues;
 pub mod report;
 
 /// An Issue's fingerprint without a locator (a change request's, docs/adr/ADR-028.md decision 13): see

@@ -176,6 +176,9 @@ pub struct VerifierReport {
     /// Its native attempt's `session_ids` and `status`, as the host read them from that object.
     pub native_session_ids: Vec<String>,
     pub native_status: String,
+    /// Its TaskResult's `issues`, whose confirmations of the Issues it was delivered are kept with its report
+    /// (docs/adr/ADR-029.md decision 10); anything else there is dropped with a diagnostic.
+    pub confirmations: Vec<serde_json::Value>,
 }
 
 impl VerifierReport {
@@ -275,23 +278,51 @@ pub(super) fn complete_verifier(
             // Its report, judged and kept (docs/adr/ADR-029.md decision 7), and named for the round's classification
             // (ADR-028 decision 15).
             let intake = super::reports::intake_in(&tx, &report.intake(&job.attempt_id), ctx)?;
+            // A report that stands (CURRENT or STALE): its findings as Issues, its confirmations of the Issues it was
+            // delivered and its observations as facts (docs/adr/ADR-029.md decisions 9 and 10); a REJECTED one is
+            // untrusted: none.
+            let (confirmations, dropped) = match (&intake.report_id, intake.state) {
+                (Some(report_id), state) if state != super::reports::ReportState::Rejected => {
+                    let (kept, dropped) =
+                        super::issues::confirmations(&tx, &job.attempt_id, &report.confirmations)?;
+                    super::issues::take_report(
+                        &tx,
+                        &job.attempt_id,
+                        report_id,
+                        &report.report_json,
+                        &kept,
+                    )?;
+                    (kept, dropped)
+                }
+                _ => (Vec::new(), Vec::new()),
+            };
+            let mut events = vec![event(
+                "verification_report",
+                "verification.report",
+                json!({"attempt_id": job.attempt_id, "task_id": task.task_id, "round_id": round_id,
+                    "role": report.role, "status": report.status, "findings": report.findings,
+                    "report": {"path": report.report.path, "sha256": report.report.sha256},
+                    "native_attempt": {"path": report.native_attempt.path,
+                        "sha256": report.native_attempt.sha256},
+                    "report_id": intake.report_id, "state": intake.state.as_str(),
+                    "confirmations": confirmations}),
+            )];
+            if !dropped.is_empty() {
+                events.push(event(
+                    "confirmations_dropped",
+                    "verification.confirmations_dropped",
+                    json!({"attempt_id": job.attempt_id, "round_id": round_id, "dropped": dropped}),
+                ));
+            }
             writer::write(
                 &tx,
                 &Commit {
-                    events: vec![event(
-                        "verification_report",
-                        "verification.report",
-                        json!({"attempt_id": job.attempt_id, "task_id": task.task_id, "round_id": round_id,
-                            "role": report.role, "status": report.status, "findings": report.findings,
-                            "report": {"path": report.report.path, "sha256": report.report.sha256},
-                            "native_attempt": {"path": report.native_attempt.path,
-                                "sha256": report.native_attempt.sha256},
-                            "report_id": intake.report_id, "state": intake.state.as_str()}),
-                    )],
+                    events,
                     ..Commit::default()
                 },
                 ctx,
             )?;
+            super::issues::settle_all(&tx, &task.run_id)?;
             if intake.state == super::reports::ReportState::Rejected {
                 // The exit of a verifier dispatched in a session not its own (ADR-028 decision 10, M2T16D-361): the
                 // same session would only be refused again; its task waits for a decision (M2-T13's to clear).
