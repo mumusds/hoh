@@ -1800,7 +1800,7 @@ impl Reader {
         &self,
         run_id: &str,
         limit: usize,
-        after: Option<(i64, String)>,
+        after: Option<(i64, i64, String)>,
     ) -> Result<Option<AcceptancePage>, PersistError> {
         snapshot::acceptance_page(&self.conn, run_id, limit, after)
     }

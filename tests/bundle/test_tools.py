@@ -787,6 +787,18 @@ class PersistenceScan(unittest.TestCase):
         self.assertEqual(rc,1)
         got=sorted(h['match'] for h in res['hits'] if h['kind'].startswith('append-only'))
         self.assertEqual(got,[': UPDATE ACCEPTANCE_RESULTS SET'])
+    def test_append_only_writes_are_found_whatever_their_table_is_written_as(self):
+        # docs/adr/ADR-029.md decision 6 (M2T18R-52): an alias, INDEXED BY, NOT INDEXED, a quoted or bracketed table name
+        # and a schema prefix (main., temp.) do not hide a write to an append-only table.
+        src=('fn w(){ let _ = "UPDATE evidence AS e SET outcome = 1"; }\n'
+             'fn x(){ let _ = "UPDATE evidence INDEXED BY i SET outcome = 1"; let _ = "UPDATE acceptance_results NOT INDEXED SET status = 1"; }\n'
+             'fn y(){ let _ = "DELETE FROM \\"evidence\\""; let _ = "DELETE FROM `acceptance_results`"; let _ = "REPLACE INTO [evidence] VALUES (1)"; }\n'
+             'fn z(){ let _ = "UPDATE temp.evidence SET outcome = 1"; let _ = "UPDATE main.\\"acceptance_results\\" SET status = 1"; }\n'
+             'fn fine(){ let _ = "UPDATE evidence_index SET x = 1"; let _ = "DELETE FROM evidences"; }\n')
+        rc,res=self.run_scan({'crates/hoh-core/src/persistence/evidence.rs':src})
+        self.assertEqual(rc,1)
+        got=sorted(h['match'].split(':',1)[0] for h in res['hits'] if h['kind']=='append-only')
+        self.assertEqual(got,['w','x','x','y','y','y','z','z'])
     def test_new_rusqlite_features_need_the_boundary_extended(self):
         rc,res=self.run_scan({},features=['bundled','default','backup'])
         self.assertEqual(self.kinds(res),[('Cargo.lock','rusqlite-feature')])
