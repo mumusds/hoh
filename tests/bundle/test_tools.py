@@ -799,6 +799,13 @@ class PersistenceScan(unittest.TestCase):
         self.assertEqual(rc,1)
         got=sorted(h['match'].split(':',1)[0] for h in res['hits'] if h['kind']=='append-only')
         self.assertEqual(got,['w','x','x','y','y','y','z','z'])
+        # M2T18R-101: quoted schema, alias and index names too.
+        src2=('fn q(){ let _ = "UPDATE evidence AS \\"e\\" SET outcome = 1"; let _ = "UPDATE evidence INDEXED BY \\"evidence_idx\\" SET outcome = 1"; }\n'
+              'fn r(){ let _ = "UPDATE \\"main\\".\\"evidence\\" SET outcome = 1"; let _ = "DELETE FROM `temp`.[acceptance_results]"; }\n')
+        rc,res=self.run_scan({'crates/hoh-core/src/persistence/evidence.rs':src2})
+        self.assertEqual(rc,1)
+        got=sorted(h['match'].split(':',1)[0] for h in res['hits'] if h['kind']=='append-only')
+        self.assertEqual(got,['q','q','r','r'])
     def test_new_rusqlite_features_need_the_boundary_extended(self):
         rc,res=self.run_scan({},features=['bundled','default','backup'])
         self.assertEqual(self.kinds(res),[('Cargo.lock','rusqlite-feature')])

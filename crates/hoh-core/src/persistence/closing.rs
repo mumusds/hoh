@@ -321,9 +321,12 @@ pub(super) fn round_issues(
 ) -> Result<Vec<(String, String)>, PersistError> {
     let mut statement = tx
         .prepare(
-            "SELECT i.issue_id, i.fingerprint FROM issues i WHERE i.state IN ('OPEN', 'REOPENED') AND (i.issue_id IN \
-             (SELECT json_extract(payload_json, '$.issue_id') FROM events WHERE kind = 'issue.opened' \
-              AND json_extract(payload_json, '$.round_id') = ?1) \
+            // Within the round's run (its verifier tasks'), so the events lookup uses events_run_kind (M2T18R-100).
+            "WITH run AS (SELECT run_id FROM tasks WHERE task_id = ?2) \
+             SELECT i.issue_id, i.fingerprint FROM issues i WHERE i.run_id = (SELECT run_id FROM run) \
+             AND i.state IN ('OPEN', 'REOPENED') AND (i.issue_id IN \
+             (SELECT json_extract(payload_json, '$.issue_id') FROM events WHERE run_id = (SELECT run_id FROM run) \
+              AND kind = 'issue.opened' AND json_extract(payload_json, '$.round_id') = ?1) \
              OR (i.severity IN ('critical', 'high') AND i.report_id IN (SELECT r.report_id FROM independent_reports r \
               JOIN attempts a ON a.attempt_id = r.attempt_id WHERE a.task_id IN (?2, ?3)))) ORDER BY i.issue_id",
         )
