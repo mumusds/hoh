@@ -1,5 +1,5 @@
 {
- "description": "AC-062-05 whitelist configuration (scripts/product/persistence_scan.py check 6). Besides the Persistence module (crates/hoh-core/src/persistence/) and the members' Rust sources (checked by clippy and the literal rules), only the files listed here, and Markdown under docs/ and reports/, may mention SQLite or hold a SQL write statement. Each entry says why; an entry that no longer needs to be here is itself a hit. read_as_data (CR-019) lists the JSON or Markdown files a member's literal may name although they mention SQLite: read as data, each with its reason, none holding a SQL write.",
+ "description": "AC-062-05 whitelist configuration (scripts/product/persistence_scan.py check 6). Besides the Persistence module (crates/hoh-core/src/persistence/) and the members' Rust sources (checked by clippy and the literal rules), only the files listed here, and Markdown under docs/ and reports/, may mention SQLite or hold a SQL write statement. Each entry says why; an entry that no longer needs to be here is itself a hit. read_as_data (CR-019) lists the JSON or Markdown files a member's literal may name although they mention SQLite: read as data, each with its reason, none holding a SQL write. append_only_allow (docs/adr/ADR-029.md decision 6, check 7) lists, by file, function and statement, the only places a member's Rust source may change or remove a row of acceptance_results or evidence, each with its reason; anywhere else such a write is a hit, and an entry without a reason or no longer used is itself a hit.",
  "files": {
   "CHANGELOG.md": "release notes describing the store",
   "CONTRACT.md": "architecture contract naming SQLite as the store",
@@ -35,5 +35,25 @@
  },
  "read_as_data": {
   "contracts/requirements.json": "the specification the writer's completion freezes, at CR-018's layout path until M3-T02 (docs/adr/ADR-028.md decision 4): read as bytes and JSON, never run; its prose mentions SQLite, it holds no SQL write"
- }
+ },
+ "append_only_allow": [
+  {
+   "file": "crates/hoh-core/src/persistence/evidence.rs",
+   "function": "amend",
+   "statement": "UPDATE acceptance_results",
+   "reason": "Store::update_acceptance_result, the repository interface REQ-053 failure mode 4 names: it issues the UPDATE and the append-only guard refuses it (AppendOnly, nothing changes)"
+  },
+  {
+   "file": "crates/hoh-core/src/persistence/evidence/tests.rs",
+   "function": "test_053_02_a_fail_row_is_not_updated_to_pass",
+   "statement": "acceptance_results",
+   "reason": "TEST-053-02 / REQ-053 failure mode 4: the refusal test issues this statement on a guarded connection and asserts the database refuses it and nothing changes"
+  },
+  {
+   "file": "crates/hoh-core/src/persistence/evidence/tests.rs",
+   "function": "test_053_02_a_fail_row_is_not_updated_to_pass",
+   "statement": "evidence",
+   "reason": "TEST-053-02 / REQ-053 failure mode 4: the refusal test issues this statement on a guarded connection and asserts the database refuses it and nothing changes"
+  }
+ ]
 }

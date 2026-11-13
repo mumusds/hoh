@@ -19,6 +19,44 @@ pub struct AcceptanceRow {
     pub failing: Vec<String>,
 }
 
+/// The key of an acceptance row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptanceKey {
+    pub ac_id: String,
+    pub spec_id: String,
+    pub candidate_id: String,
+    pub evidence_id: String,
+}
+
+/// Change acceptance row `key` to `status` (docs/adr/ADR-029.md decision 6): the UPDATE is issued and the append-only
+/// guard refuses it; the transaction rolls back and the refusal is [`PersistError::AppendOnly`].
+pub(super) fn amend(
+    conn: &mut rusqlite::Connection,
+    key: &AcceptanceKey,
+    status: &str,
+    ctx: &super::writer::Ctx<'_>,
+) -> Result<(), PersistError> {
+    let tx = super::writer::begin(conn, ctx)?;
+    let changed = tx
+        .execute(
+            "UPDATE acceptance_results SET status = ?5 WHERE ac_id = ?1 AND spec_id = ?2 AND candidate_id = ?3 \
+             AND evidence_id = ?4",
+            params![
+                key.ac_id,
+                key.spec_id,
+                key.candidate_id,
+                key.evidence_id,
+                status
+            ],
+        )
+        .map_err(super::append_only_error)?;
+    // The guard refuses every change; reaching here means it is missing, and nothing may change all the same.
+    drop(tx);
+    Err(PersistError::IntegrityViolation(format!(
+        "the append-only guard of acceptance_results is missing ({changed} rows matched; rolled back)"
+    )))
+}
+
 /// What a check's driver hands the store after the command ran and its record was judged.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Recording {

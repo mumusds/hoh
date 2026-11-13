@@ -388,3 +388,69 @@ async fn recording_a_record_again_is_nothing_and_another_record_under_its_id_is_
     assert_eq!(texts(&path, "SELECT evidence_id FROM evidence")?, ["r1"]);
     Ok(())
 }
+
+#[tokio::test]
+async fn test_053_02_a_fail_row_is_not_updated_to_pass() -> R {
+    // AC-053-02 and REQ-053 failure mode 4 (docs/adr/ADR-029.md decision 6, J1): the repository interface issues the
+    // UPDATE of a FAIL row to PASS and the database refuses it: AppendOnly, the row unchanged. On a connection guarded
+    // as the writer's, every way to change or remove a row of acceptance_results or evidence is refused (UPDATE,
+    // DELETE, INSERT OR REPLACE, REPLACE INTO, an upsert's DO UPDATE), and INSERT OR IGNORE only leaves it.
+    let dir = tempfile::tempdir()?;
+    let (store, path, c) = world(dir.path()).await?;
+    let mut job = recording("r1", &c, "Q/attempt-1");
+    job.outcome.status = Status::Fail;
+    job.rows[0].status = "FAIL";
+    store.record_evidence(job).await?;
+    let rows = "SELECT json_array(ac_id, spec_id, candidate_id, evidence_id, status, reason) FROM acceptance_results";
+    let evidence = "SELECT json_array(evidence_id, candidate_id, attempt_id, artifact_id, check_id, kind, outcome) FROM evidence";
+    let before = (texts(&path, rows)?, texts(&path, evidence)?);
+    assert_eq!(before.0.len(), 1);
+    assert!(before.0[0].contains("\"FAIL\""), "{before:?}");
+    let refused = store
+        .update_acceptance_result(
+            AcceptanceKey {
+                ac_id: "AC-001-01".to_owned(),
+                spec_id: "s1".to_owned(),
+                candidate_id: c.clone(),
+                evidence_id: "r1".to_owned(),
+            },
+            "PASS",
+        )
+        .await;
+    assert!(
+        matches!(&refused, Err(PersistError::AppendOnly(t)) if t == "acceptance_results"),
+        "{refused:?}"
+    );
+    assert_eq!((texts(&path, rows)?, texts(&path, evidence)?), before);
+    let conn = Connection::open(&path)?;
+    super::super::guard_append_only(&conn)?;
+    let key = format!("'AC-001-01', 's1', '{c}', 'r1'");
+    for sql in [
+        "UPDATE acceptance_results SET status = 'PASS' WHERE evidence_id = 'r1'".to_owned(),
+        "DELETE FROM acceptance_results".to_owned(),
+        format!(
+            "INSERT OR REPLACE INTO acceptance_results(ac_id, spec_id, candidate_id, evidence_id, status, reason) VALUES ({key}, 'PASS', '')"
+        ),
+        format!(
+            "REPLACE INTO acceptance_results(ac_id, spec_id, candidate_id, evidence_id, status, reason) VALUES ({key}, 'PASS', '')"
+        ),
+        format!(
+            "INSERT INTO acceptance_results(ac_id, spec_id, candidate_id, evidence_id, status, reason) VALUES ({key}, 'PASS', '') \
+                 ON CONFLICT(ac_id, spec_id, candidate_id, evidence_id) DO UPDATE SET status = 'PASS'"
+        ),
+        "UPDATE evidence SET outcome = 'PASS'".to_owned(),
+        "DELETE FROM evidence".to_owned(),
+    ] {
+        assert!(conn.execute_batch(&sql).is_err(), "refused: {sql}");
+    }
+    conn.execute_batch(&format!(
+        "INSERT OR IGNORE INTO acceptance_results(ac_id, spec_id, candidate_id, evidence_id, status, reason) VALUES ({key}, 'PASS', '')"
+    ))?;
+    let after = (texts(&path, rows)?, texts(&path, evidence)?);
+    assert_eq!(after, before);
+    println!(
+        "{}",
+        json!({"before": before.0, "after": after.0, "refused": refused.err().map(|e| e.to_string())})
+    );
+    Ok(())
+}

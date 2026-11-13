@@ -742,6 +742,37 @@ class PersistenceScan(unittest.TestCase):
                           ('persistence-whitelist.json','whitelist','read_as_data contracts/empty.json: no reason given'),
                           ('persistence-whitelist.json','whitelist','read_as_data contracts/writes.json: holds a SQL write'),
                           ('persistence-whitelist.json','whitelist','read_as_data scripts/db.sh: not a JSON or Markdown file')])
+    def test_writes_to_the_append_only_tables_are_hits_outside_their_allowed_functions(self):
+        # docs/adr/ADR-029.md decision 6 (J1; M2T18D-56, -152, -257, -356, -753): anywhere in the members' Rust sources,
+        # persistence and tests included, an UPDATE, DELETE, REPLACE or upsert of acceptance_results or evidence is a
+        # hit unless the whitelist's append_only_allow names its file, function and statement with a reason; the trigger
+        # DDL, a plain INSERT and INSERT OR IGNORE are no hits; an entry without a reason or no longer used is a hit.
+        allow=[{'file':'crates/hoh-core/src/persistence/evidence.rs','function':'amend','statement':'UPDATE acceptance_results','reason':'the repository interface the database refuses'},
+               {'file':'crates/hoh-core/src/persistence/evidence.rs','function':'gone','statement':'UPDATE evidence','reason':'not there any more'},
+               {'file':'crates/hoh-core/src/persistence/evidence.rs','function':'other','statement':'DELETE FROM acceptance_results','reason':''}]
+        src=('fn amend(){ let _ = "UPDATE acceptance_results SET status = ?1 WHERE ac_id = ?2"; }\n'
+             'fn other(){ let _ = "UPDATE evidence SET outcome = ?1"; let _ = "DELETE FROM acceptance_results";\n'
+             ' let _ = "INSERT OR REPLACE INTO evidence VALUES (1)"; let _ = "REPLACE INTO main.acceptance_results VALUES (1)";\n'
+             ' let _ = concat!("INSERT INTO acceptance_results VALUES (1) ", "ON CONFLICT(ac_id) DO UPDATE SET status = 2");\n'
+             ' let _ = "UPDATE acceptance_results SET status = ?1"; }\n'
+             'fn fine(){ let _ = "CREATE TEMP TRIGGER t BEFORE UPDATE ON main.acceptance_results BEGIN SELECT RAISE(ABORT, \'x\'); END";\n'
+             ' let _ = "INSERT INTO acceptance_results VALUES (1)"; let _ = "INSERT OR IGNORE INTO evidence VALUES (1)"; }\n')
+        files={'crates/hoh-core/src/persistence/evidence.rs':src,
+               'crates/hoh-app/tests/fixture.rs':'fn t(){ let _ = "DELETE FROM evidence WHERE 1"; }',
+               'scripts/product/persistence-whitelist.json':json.dumps({'files':{'clippy.toml':'fixture'},'append_only_allow':allow})}
+        rc,res=self.run_scan(files,whitelist=False)
+        self.assertEqual(rc,1)
+        got=sorted((h['path'].rsplit('/',1)[-1],h['kind'],h['match']) for h in res['hits'] if h['kind'].startswith('append-only'))
+        self.assertEqual(got,
+                         [('evidence.rs','append-only','other: DELETE FROM ACCEPTANCE_RESULTS'),
+                          ('evidence.rs','append-only','other: INSERT INTO ACCEPTANCE_RESULTS VALUES (1) ON CONFLICT(AC_ID) DO UPDATE'),
+                          ('evidence.rs','append-only','other: INSERT OR REPLACE INTO EVIDENCE'),
+                          ('evidence.rs','append-only','other: REPLACE INTO MAIN.ACCEPTANCE_RESULTS'),
+                          ('evidence.rs','append-only','other: UPDATE ACCEPTANCE_RESULTS SET'),
+                          ('evidence.rs','append-only','other: UPDATE EVIDENCE SET'),
+                          ('fixture.rs','append-only','t: DELETE FROM EVIDENCE'),
+                          ('persistence-whitelist.json','append-only-allow','evidence.rs gone UPDATE evidence: not used'),
+                          ('persistence-whitelist.json','append-only-allow','evidence.rs other DELETE FROM acceptance_results: no reason given')])
     def test_new_rusqlite_features_need_the_boundary_extended(self):
         rc,res=self.run_scan({},features=['bundled','default','backup'])
         self.assertEqual(self.kinds(res),[('Cargo.lock','rusqlite-feature')])

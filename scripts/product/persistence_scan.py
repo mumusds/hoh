@@ -71,6 +71,11 @@ The boundary is enforced by the compiler, and this scan checks that nothing swit
    file the product reads as data whose prose mentions SQLite (the specification), holding no SQL write; a listed
    script, a listed file holding a SQL write and an entry without a reason are hits:
    a unit test outside persistence that needs SQLite text belongs under tests/ or in an inline test module. A cargo configuration may not `include` another (M2T01R-62).
+7. Append-only tables (docs/adr/ADR-029.md decision 6, J1): anywhere in the members' Rust sources (persistence and
+   test code included), a literal (or a concat! run) holding an UPDATE, DELETE, REPLACE (INSERT OR REPLACE) or an
+   upsert's DO UPDATE of acceptance_results or evidence is a hit, unless the whitelist's append_only_allow names its
+   file, the function it is in and its statement, with a reason; an entry without a reason or no longer used is a hit.
+   The database refuses such writes too (per-connection TEMP triggers); this check keeps the code from relying on it.
 Out of reach of any of this (docs/22-tooling.md): a program, script or SQL that exists only at run time (a name or
 text assembled from pieces, read from the environment or a file outside the candidate), conditional compilation
 produced by a macro (M2T01R-53/54), and product code that uses a whitelisted development file (a kit test or tool)
@@ -89,6 +94,15 @@ CORE = 'hoh-core'
 SQL_WRITE = re.compile(
     r'\b(?:INSERT\s+(?:OR\s+\w+\s+)?INTO|REPLACE\s+INTO|UPDATE\s+(?:OR\s+\w+\s+)?\S+\s+SET|DELETE\s+FROM|UPSERT'
     r'|ON\s+CONFLICT\b[^;]*?\bDO\s+UPDATE)\b', re.IGNORECASE)
+# Writes that change or remove a row of an append-only table (docs/adr/ADR-029.md decision 6, J1): UPDATE, DELETE,
+# REPLACE (also INSERT OR REPLACE) and an upsert's DO UPDATE. A plain INSERT and INSERT OR IGNORE only add.
+APPEND_ONLY_TABLES = r'(?:main\.)?(?:acceptance_results|evidence)\b'
+APPEND_ONLY = re.compile(
+    r'\b(?:UPDATE\s+(?:OR\s+\w+\s+)?' + APPEND_ONLY_TABLES + r'\s+SET'
+    r'|DELETE\s+FROM\s+' + APPEND_ONLY_TABLES +
+    r'|(?:INSERT\s+OR\s+)?REPLACE\s+INTO\s+' + APPEND_ONLY_TABLES +
+    r'|INSERT\s+(?:OR\s+\w+\s+)?INTO\s+' + APPEND_ONLY_TABLES + r'[^;]*?\bON\s+CONFLICT\b[^;]*?\bDO\s+UPDATE)',
+    re.IGNORECASE)
 ESCAPE = {'n': '\n', 't': '\t', 'r': '\r', '0': '\0', '\\': '\\', '"': '"', "'": "'"}
 LOCKFILES = ('package-lock.json', 'npm-shrinkwrap.json')
 # Every rusqlite API that opens a database or executes SQL with the features below.
@@ -337,6 +351,61 @@ def documentation_spans(code: str) -> list[tuple[int, int]]:
         for m in re.finditer(r'[\[(,]\s*doc\s*=', code[a:b]):
             out.append((a + m.end(), b))
     return out
+
+
+def append_only_allow(root: Path) -> list:
+    """The whitelist's append_only_allow entries ({file, function, statement, reason}); none when it has none."""
+    try:
+        listed = json.loads((root / WHITELIST).read_text(encoding='utf-8')).get('append_only_allow', [])
+    except (OSError, ValueError, AttributeError):
+        return []
+    return [e for e in listed if isinstance(e, dict)] if isinstance(listed, list) else []
+
+
+def enclosing_function(code: str, offset: int) -> str:
+    """The name of the last `fn` declared before `offset` in `code` (comments and literals already blanked)."""
+    names = re.findall(r'\bfn\s+(?:r#)?(\w+)', code[:offset])
+    return names[-1] if names else ''
+
+
+def literal_runs(code: str, literals: list[tuple[int, int, str]]) -> list[tuple[int, str]]:
+    """Each literal with its start, and runs of literals separated only by commas and whitespace joined, with the
+    run's start (as `literal_strings`, keeping offsets)."""
+    out, run = [], []
+    for k, (start, _end, value) in enumerate(literals):
+        out.append((start, value))
+        if run and re.fullmatch(r'[\s,]*', code[literals[k - 1][1]:start]):
+            run.append((start, value))
+        else:
+            if len(run) > 1:
+                out.append((run[0][0], ''.join(v for _, v in run)))
+            run = [(start, value)]
+    if len(run) > 1:
+        out.append((run[0][0], ''.join(v for _, v in run)))
+    return out
+
+
+def append_only_checks(rel: str, code: str, literals: list[tuple[int, int, str]], allow: list, used: set,
+                       hits: list) -> None:
+    """Check 7: a write that changes or removes a row of acceptance_results or evidence, anywhere in the members' Rust
+    sources (persistence and tests included), is a hit unless append_only_allow names its file, function and
+    statement (docs/adr/ADR-029.md decision 6)."""
+    seen = set()
+    for start, value in literal_runs(code, literals):
+        for m in APPEND_ONLY.finditer(value):
+            statement = ' '.join(m.group(0).split()).upper()
+            function = enclosing_function(code, start)
+            if (function, statement) in seen:
+                continue
+            seen.add((function, statement))
+            # An entry without its reason allows nothing (it is a hit itself).
+            allowed = [k for k, e in enumerate(allow) if e.get('file') == rel and e.get('function') == function
+                       and str(e.get('reason', '')).strip()
+                       and ' '.join(str(e.get('statement', '')).split()).upper() in statement]
+            if allowed:
+                used.update(allowed)
+            else:
+                hits.append({'path': rel, 'kind': 'append-only', 'match': f'{function}: {statement}'})
 
 
 def runtime_literals(code: str, literals: list[tuple[int, int, str]]) -> list[tuple[int, int, str]]:
@@ -686,6 +755,8 @@ def rel_to(path: Path, root: Path) -> str:
 def scan(root: Path, metadata: dict) -> dict:
     hits = []
     data = read_as_data(root)
+    allow = append_only_allow(root)
+    used_allow: set = set()
     dev_uses = dependency_checks(metadata, hits)
     lint_configuration_checks(root, metadata, hits)
     files = rust_files(root, metadata)
@@ -704,6 +775,7 @@ def scan(root: Path, metadata: dict) -> dict:
         compact = [re.sub(r'\br#', '', re.sub(r'\s+', '', attr)) for attr in attributes(code)]
         if any(re.search(r'[\[(,]path=', attr) for attr in compact) or re.search(r'\binclude\s*!\s*[(\[{]', code):
             hits.append({'path': rel, 'kind': 'path-or-include', 'match': '#[path] (also in cfg_attr) or include!'})
+        append_only_checks(rel, code, runtime_literals(code, literals), allow, used_allow, hits)
         if rel.startswith(PERSISTENCE):
             if re.search(r'\bmacro_rules\s*!', code):
                 # A macro made in persistence could carry its allowance or a cfg into other code (M2T01R-49).
@@ -777,6 +849,12 @@ def scan(root: Path, metadata: dict) -> dict:
                 hits.extend({'path': rel, 'kind': 'web-dependency', 'match': s[:200]} for s in found)
             elif re.search(r'''(?:\bfrom|\bimport|require\()\s*\(?\s*['"][^'"]*sqlite''', text, re.IGNORECASE):
                 hits.append({'path': rel, 'kind': 'web-import', 'match': 'sqlite'})
+    for k, e in enumerate(allow):
+        name = f"{str(e.get('file', '')).rsplit('/', 1)[-1]} {e.get('function', '')} {e.get('statement', '')}"
+        if not str(e.get('reason', '')).strip():
+            hits.append({'path': WHITELIST, 'kind': 'append-only-allow', 'match': f'{name}: no reason given'})
+        elif k not in used_allow:
+            hits.append({'path': WHITELIST, 'kind': 'append-only-allow', 'match': f'{name}: not used'})
     other_files = content_checks(root, metadata, hits)
     scanned = len(files) + web_files
     return {'files_scanned': scanned, 'web_files_scanned': web_files, 'web_present': web.is_dir(),
