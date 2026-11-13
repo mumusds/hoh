@@ -715,7 +715,8 @@
     "M2-T08",
     "M2-T19",
     "M1-T04",
-    "M2-T16"
+    "M2-T16",
+    "M2-T18"
    ],
    "requirements": [
     "REQ-001",
@@ -738,7 +739,7 @@
     "AC-005-01",
     "AC-042-04"
    ],
-   "done_when": "AC-001-01/02、REQ-002 全部 AC、AC-003-03、AC-004-02/03/04、AC-042-04 通过；AC-005-01 通过（CR-010：由 `hoh -p --detach` 拉起的 host 经 FakeAgent 运行）。AnswerQuestion 解除时对带修复拒绝的 Task 同一事务调用 M2-T16 的 Store::clear_repair_refusal；解除 BLOCKED(NEED_DECISION) 的路径覆盖 Runtime 的验证 Task（含验证 Attempt 的 UNKNOWN_EFFECT 经决策确认后的解除）与因验证而 BLOCKED 的源 Task（ADR-028 出口表的该行）；AC-042-04 的“QA FAIL”为 COMPLETED 的验证结果配 FAIL 的证据或报告（CR-018）。"
+   "done_when": "AC-001-01/02、REQ-002 全部 AC、AC-003-03、AC-004-02/03/04、AC-042-04 通过；AC-005-01 通过（CR-010：由 `hoh -p --detach` 拉起的 host 经 FakeAgent 运行）。AnswerQuestion 解除时对带修复拒绝的 Task 同一事务调用 M2-T16 的 Store::clear_repair_refusal；解除 BLOCKED(NEED_DECISION) 的路径覆盖 Runtime 的验证 Task（含验证 Attempt 的 UNKNOWN_EFFECT 经决策确认后的解除）与因验证而 BLOCKED 的源 Task（ADR-028 出口表的该行）；AC-042-04 的“QA FAIL”为 COMPLETED 的验证结果配 FAIL 的证据或报告（CR-018）。受锁 RunResult 的 accepted 与 remaining_requirements 用 ADR-029 决定 12 的 `requirements_passed` 求（按需求计，不用快照按 AC 的计数）；解除汇合级 NEED_DECISION 的出口：join_gate_refused 与 reverify_exhausted 为重新验证（开下一轮）或返工，flaky 为要求新提交的返工（同内容守卫也看汇合的 flaky；REQ-055 的 flaky 处置属 M5-T02），每种出口都产生新的栅栏编号（ADR-029 J9）（CR-020）。"
   },
   {
    "id": "M2-T11",
@@ -1073,7 +1074,7 @@
     "REQ-057",
     "REQ-063"
    ],
-   "done_when": "本里程碑全部需求spec_maturity=detailed；validate_bundle通过；CR已APPROVED并relock；按每个实现任务≤2项需求、≤8条AC拆分本里程碑实现任务（更新 development-tasks.json 的 requirements/acceptance/checks/depends_on，validate_bundle 的归属规则通过）；每条 AC 只分给依赖闭包已提供其所需能力（host、API、CLI 最终结果、QA/Review 循环、systemd、doctor、TUI 等）的任务（CR3R-02）。拆分时把 CR-018 交给 M5-T02 的各项分给一个实现任务，写进它的 done_when（承接须有契约载体，M2T16D-1050）。"
+   "done_when": "本里程碑全部需求spec_maturity=detailed；validate_bundle通过；CR已APPROVED并relock；按每个实现任务≤2项需求、≤8条AC拆分本里程碑实现任务（更新 development-tasks.json 的 requirements/acceptance/checks/depends_on，validate_bundle 的归属规则通过）；每条 AC 只分给依赖闭包已提供其所需能力（host、API、CLI 最终结果、QA/Review 循环、systemd、doctor、TUI 等）的任务（CR3R-02）。拆分时把 CR-018 与 CR-020 交给 M5-T02 的各项分给一个实现任务，写进它的 done_when（承接须有契约载体，M2T16D-1050）。"
   },
   {
    "id": "M5-T02",
@@ -1092,7 +1093,7 @@
     "REQ-057",
     "REQ-063"
    ],
-   "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。对最终候选的全范围验证（发布门禁，docs/06 的 Release Gate、REQ-056）是独立的义务，不开验证轮次、可在 ACCEPTED 的候选上进行、不迁移候选与 Task 的状态，由 Runtime 触发，使多 Task Run 的 Run→COMPLETED 可以满足（ADR-028 决定 9 的移交；在此之前门禁 fail-closed）（CR-018）。"
+   "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。对最终候选的全范围验证（发布门禁，docs/06 的 Release Gate、REQ-056）是独立的义务，不开验证轮次、可在 ACCEPTED 的候选上进行、不迁移候选与 Task 的状态，由 Runtime 触发，使多 Task Run 的 Run→COMPLETED 可以满足（ADR-028 决定 9 的移交；在此之前门禁 fail-closed）（CR-018）。发布门禁调用 ADR-029 的展示投影时传入 profile（原则一规则 16，只核对 outcome 为 PASS 的证据产生的 PASS 行，`RowFact.live_agents` 取证据的 live-sessions）；全范围验证也逐条确认 Run 中仍 OPEN/REOPENED 的 critical/high Issue（含其 Task 已取消、不再有后续轮次的），未确认的阻断发布；决策出口只有重新验证、返工或取消而阻断保持，任何豁免须所有者批准（CR-018“RESOLVED 须有验证者的观察”）；全范围验证对遗留 Issue 的确认按 ADR-029 决定 10 的同一条目规则写 absent 事实、在同一事务调用 `issues::settle_all`，验收失败的 Issue 由它写出的行按同一状态函数解决；发布导出的 open_issues 与全范围验证的待确认集合在导出的读快照里直接对 ADR-029 决定 10 的状态函数求值，不依赖物化的状态列；REQ-055 的 flaky 处置解除汇合级 flaky 时产生新的栅栏编号（ADR-029 J9）（CR-020）。"
   },
   {
    "id": "M5-T03",

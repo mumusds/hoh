@@ -1,8 +1,8 @@
 # CR-020 · 验收投影与独立报告的移交：RunResult 的计数、规则 16 的 profile 与遗留 Issue 的确认
 
 ID：CR-020
-状态：PROPOSED
-批准人：（待 ADR-029 设计审查收敛后由 CTO 依 CR-003 D1 批准，写入判 PASS 的独立审查会话 id）
+状态：APPROVED
+批准人：CTO 依 CR-003 D1 预授权（ADR-029 设计审查第 9 轮 Claude 3e0b2eb8-df86-43a1-8ce7-a575920f16be 判 PASS；第 10 轮 Codex 01a1d2ea-e3ed-7272-8fda-e1fcf69984ac 判 PASS、设计已收敛、CR-020 满足 CR-003 D1 的四项条件、可由 CTO 批准）
 日期：2026-11-12
 基线：只改 `contracts/development-tasks.json`（不在锁内）；不改受锁文件
 
