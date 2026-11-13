@@ -1510,6 +1510,175 @@ async fn requests_are_checked_before_anything_else() -> R {
     Ok(())
 }
 
+/// Run `ra` on specification `s-acc` (REQ-1 with AC-1-01 and AC-1-02, its task `ra/t`), its candidate C1 frozen first
+/// and REJECTED with a FAIL row of AC-1-01, then C2 VERIFYING without rows; three Issues on C1, `i1` materialised
+/// RESOLVED with nothing that resolves it. Test code: the product never writes outside persistence.
+fn seed_acceptance(host: &Host, project: &Path) -> R<(String, String)> {
+    let (c1, c2) = (
+        format!("CAND-{}", "1".repeat(64)),
+        format!("CAND-{}", "2".repeat(64)),
+    );
+    let script = "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); p=sys.stdin.readline().strip(); \
+                  c.executescript(sys.stdin.read().replace(':p', repr(p))); c.commit(); c.close()";
+    let sql = format!(
+        "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s-acc', :p, printf('%064d', 9), 1);
+         INSERT INTO runs(run_id, project_id, spec_id, state, mode, created_at) VALUES
+           ('ra', :p, 's-acc', 'RUNNING', 'AUTO', '2026-11-13T00:00:00Z');
+         INSERT INTO requirements(requirement_id, spec_id, title, required_release) VALUES ('REQ-1', 's-acc', 'r', 1);
+         INSERT INTO acceptance_criteria(ac_id, requirement_id, spec_id, body, check_id) VALUES
+           ('AC-1-01', 'REQ-1', 's-acc', 'a', 'unit'), ('AC-1-02', 'REQ-1', 's-acc', 'b', 'unit');
+         INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, created_seq, cost_estimate) VALUES
+           ('ra/t', 'ra', 's-acc', 'VERIFYING', 1, 'developer', 1, 1);
+         INSERT INTO task_requirements(task_id, requirement_id, spec_id) VALUES ('ra/t', 'REQ-1', 's-acc');
+         INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, started_at) VALUES
+           ('ra/a', 'ra/t', 'SETTLED', 1, 1, 1, '2026-11-13T00:00:00Z');
+         INSERT INTO candidates(candidate_id, run_id, git_commit, git_tree, spec_sha256, environment_sha256,
+           test_plan_sha256, source_path, state, created_at) VALUES
+           ('{c1}', 'ra', printf('%040d', 1), printf('%040d', 1), printf('%064d', 9), printf('%064d', 2),
+            printf('%064d', 3), 'c1.json', 'REJECTED', '2026-11-13T00:00:00Z'),
+           ('{c2}', 'ra', printf('%040d', 2), printf('%040d', 2), printf('%064d', 9), printf('%064d', 2),
+            printf('%064d', 3), 'c2.json', 'VERIFYING', '2026-11-13T00:00:00Z');
+         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+           (:p, 'ra/f1', 'ra', 'candidate.frozen', json_object('candidate_id', '{c1}', 'superseded', json('[]')),
+            '2026-11-13T00:00:00Z'),
+           (:p, 'ra/f2', 'ra', 'candidate.frozen', json_object('candidate_id', '{c2}', 'superseded', json('[]')),
+            '2026-11-13T00:00:00Z');
+         INSERT INTO artifacts(artifact_id, sha256, path, bytes, mime) VALUES ('ra/art', printf('%064d', 5), 'e', 1, 'x');
+         INSERT INTO evidence(evidence_id, candidate_id, attempt_id, artifact_id, check_id, kind, outcome, mode,
+           created_at) VALUES ('ra/ev', '{c1}', 'ra/a', 'ra/art', 'unit', 'check', 'FAIL', 'product',
+           '2026-11-13T00:00:00Z');
+         INSERT INTO acceptance_results(ac_id, spec_id, candidate_id, evidence_id, status, reason) VALUES
+           ('AC-1-01', 's-acc', '{c1}', 'ra/ev', 'FAIL', 'TEST-001-01 in check unit');
+         INSERT INTO issues(issue_id, run_id, candidate_id, fingerprint, severity, state, description) VALUES
+           ('i1', 'ra', '{c1}', printf('%064d', 11), 'high', 'RESOLVED', 'first'),
+           ('i2', 'ra', '{c1}', printf('%064d', 12), 'low', 'OPEN', 'second'),
+           ('i3', 'ra', '{c1}', printf('%064d', 13), 'medium', 'OPEN', 'third');"
+    );
+    python(&db(project), script, &format!("{}\n{sql}", host.project_id))?;
+    Ok((c1, c2))
+}
+
+/// listAcceptance and listIssues answer as openapi says (docs/adr/ADR-029.md decision 5; M2-T12: the endpoints M2
+/// uses have contract tests): Pages of each candidate's in-scope ACs, the latest candidate first, and of the run's
+/// Issues, newest first, each state evaluated now (i1's RESOLVED column, nothing resolving it: REOPENED), paged by
+/// limit and cursor; getRun's projection has the acceptance summary; a run that does not exist is 404 RUN_NOT_FOUND
+/// and a limit or cursor that cannot be read 404 BAD_REQUEST, Error bodies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn acceptance_and_issues_follow_the_openapi_contract() -> R {
+    let dir = tempfile::tempdir()?;
+    let host = Host::start(config(dir.path())).await?;
+    let (c1, c2) = seed_acceptance(&host, dir.path())?;
+    let to = To::Tcp(host.port);
+    let page = |path: &str| {
+        openapi_schema(&format!(
+            "/paths/~1v1~1runs~1{{run_id}}~1{path}/get/responses/200/content/application~1json/schema"
+        ))
+    };
+    let (acceptance, issues) = (page("acceptance")?, page("issues")?);
+    let run = openapi_schema(
+        "/paths/~1v1~1runs~1{run_id}/get/responses/200/content/application~1json/schema",
+    )?;
+    let error = openapi_schema("/components/schemas/Error")?;
+    let get = |path: String| {
+        let (to, token) = (to.clone(), host.token.clone());
+        async move {
+            let reply = call(&to, "GET", &path, &token, b"").await?;
+            R::Ok((reply.status, reply.json()?))
+        }
+    };
+    let item = |candidate: &str, state: &str, ac: &str, label: &str, latest: bool| {
+        json!({"spec_id": "s-acc", "spec_revision": 1, "candidate_id": candidate, "candidate_state": state,
+            "ac_id": ac, "label": label, "why": null, "latest": latest})
+    };
+    let (status, all) = get("/v1/runs/ra/acceptance".to_owned()).await?;
+    assert_eq!(status, 200, "{all}");
+    conforms(&acceptance, &all)?;
+    assert_eq!(
+        all["items"],
+        json!([
+            item(&c2, "VERIFYING", "AC-1-01", "NOT_RUN", true),
+            item(&c2, "VERIFYING", "AC-1-02", "NOT_RUN", true),
+            item(&c1, "REJECTED", "AC-1-01", "FAIL", false),
+            item(&c1, "REJECTED", "AC-1-02", "NOT_RUN", false),
+        ])
+    );
+    assert_eq!(all["next_cursor"], json!(null));
+    assert!(all["watermark"].as_i64().is_some_and(|w| w > 0), "{all}");
+    let (_, first) = get("/v1/runs/ra/acceptance?limit=3".to_owned()).await?;
+    conforms(&acceptance, &first)?;
+    let cursor = first["next_cursor"]
+        .as_str()
+        .ok_or("a next page")?
+        .to_owned();
+    let (_, second) = get(format!("/v1/runs/ra/acceptance?limit=3&cursor={cursor}")).await?;
+    conforms(&acceptance, &second)?;
+    assert_eq!(second["next_cursor"], json!(null));
+    let paged: Vec<Value> = [&first, &second]
+        .iter()
+        .flat_map(|p| p["items"].as_array().cloned().unwrap_or_default())
+        .collect();
+    assert_eq!(json!(paged), all["items"]);
+    let (status, listed) = get("/v1/runs/ra/issues".to_owned()).await?;
+    assert_eq!(status, 200, "{listed}");
+    conforms(&issues, &listed)?;
+    let issue = |id: &str, severity: &str, state: &str, n: u8, description: &str| {
+        json!({"issue_id": id, "candidate_id": c1, "severity": severity, "state": state,
+            "fingerprint": format!("{:0>64}", 10 + n), "description": description, "report_id": null,
+            "finding_id": null})
+    };
+    assert_eq!(
+        listed["items"],
+        json!([
+            issue("i3", "medium", "OPEN", 3, "third"),
+            issue("i2", "low", "OPEN", 2, "second"),
+            issue("i1", "high", "REOPENED", 1, "first"),
+        ])
+    );
+    let (_, first) = get("/v1/runs/ra/issues?limit=2".to_owned()).await?;
+    conforms(&issues, &first)?;
+    let cursor = first["next_cursor"]
+        .as_str()
+        .ok_or("a next page")?
+        .to_owned();
+    let (_, second) = get(format!("/v1/runs/ra/issues?limit=2&cursor={cursor}")).await?;
+    conforms(&issues, &second)?;
+    assert_eq!(
+        (
+            first["items"].clone(),
+            second["items"].clone(),
+            second["next_cursor"].clone()
+        ),
+        (
+            json!([listed["items"][0], listed["items"][1]]),
+            json!([listed["items"][2]]),
+            json!(null)
+        )
+    );
+    let (status, got) = get("/v1/runs/ra".to_owned()).await?;
+    assert_eq!(status, 200);
+    conforms(&run, &got)?;
+    assert_eq!(
+        got["projection"]["acceptance"],
+        json!({"candidate_id": c2, "candidate_state": "VERIFYING", "accepted": 0, "passing": 0, "total": 2})
+    );
+    for (path, code) in [
+        ("/v1/runs/missing/acceptance", "RUN_NOT_FOUND"),
+        ("/v1/runs/missing/issues", "RUN_NOT_FOUND"),
+        ("/v1/runs/ra/acceptance?limit=0", "BAD_REQUEST"),
+        ("/v1/runs/ra/acceptance?limit=501", "BAD_REQUEST"),
+        ("/v1/runs/ra/acceptance?cursor=nonsense", "BAD_REQUEST"),
+        ("/v1/runs/ra/issues?limit=x", "BAD_REQUEST"),
+        ("/v1/runs/ra/issues?cursor=nonsense", "BAD_REQUEST"),
+    ] {
+        let (status, body) = get(path.to_owned()).await?;
+        assert_eq!(status, 404, "{path}: {body}");
+        conforms(&error, &body)?;
+        assert_eq!(body["code"], code, "{path}: {body}");
+    }
+    host.shutdown().await;
+    Ok(())
+}
+
 /// streamEvents: an SSE stream whose ids are event seqs and whose data are protocol Events, replaying (after, H] and
 /// then going live; `after` and Last-Event-ID that disagree are 409.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

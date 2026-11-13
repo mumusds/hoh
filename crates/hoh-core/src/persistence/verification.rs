@@ -429,7 +429,7 @@ pub(super) fn with_deferred(commit: &mut super::writer::Commit, deferred: &[serd
 
 /// The verifier tasks of run `run_id`'s rounds.
 pub(super) fn verifier_tasks(
-    tx: &Transaction<'_>,
+    tx: &rusqlite::Connection,
     run_id: &str,
 ) -> Result<std::collections::BTreeSet<String>, PersistError> {
     let mut statement = tx

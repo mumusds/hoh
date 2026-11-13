@@ -7,7 +7,7 @@ use super::writer::{self, Commit, NewEvent};
 use super::{PersistError, sqlite_error};
 use crate::ids::child_id;
 use crate::verification::classify::Report;
-use rusqlite::{OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 
 /// The native attempt statuses a report may come from: contracts/release-policy.json `accepted_attempt_statuses`
@@ -481,7 +481,7 @@ fn stale_reason(
 /// STALE or REJECTED one), merged FAIL > UNKNOWN > a round without one (NOT_RUN) > PASS; NOT_RUN for no round. With it,
 /// the findings' summaries of its FAIL reports (their `verification.report` events), sorted.
 pub(super) fn report_status(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     rounds: &[Vec<String>],
     role: &str,
 ) -> Result<(Report, Vec<String>), PersistError> {

@@ -727,6 +727,110 @@ pub(super) fn verification(
     Ok(facts)
 }
 
+/// What a reverification's verifier must run again (docs/adr/ADR-029.md decision 4; -154, -261, -359): for a round a
+/// reverify opened (its `verification.round_opened` names `reverify_of`, a round's or a join's), the candidate's checks
+/// labelled BLOCKED or UNKNOWN with their latest reason, and the scenario checks of its in-scope ACs whose projection on
+/// the candidate is undetermined; QA's also says every in-scope AC's scenario check is to be run again, the round
+/// reading only its own evidence (the reviewer does not repeat it). Nothing for a round no reverify opened. Mandatory
+/// scope lines of verifier `role` of round `round_id` of run `run_id`.
+pub(super) fn reverification(
+    conn: &Connection,
+    run_id: &str,
+    round_id: &str,
+    role: &str,
+) -> Result<Vec<String>, PersistError> {
+    use crate::verification::acceptance::{self, Label};
+    use crate::verification::classify::{self, Ac};
+    let opened: Option<String> = conn
+        .query_row(
+            "SELECT payload_json FROM events WHERE run_id = ?1 AND kind = ?2 \
+             AND json_extract(payload_json, '$.round_id') = ?3",
+            params![run_id, super::verification::ROUND_OPENED, round_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let opened: Value = opened
+        .and_then(|p| serde_json::from_str(&p).ok())
+        .unwrap_or(Value::Null);
+    if opened["reverify_of"].as_str().is_none() {
+        return Ok(Vec::new());
+    }
+    let candidate = opened["candidate_id"].as_str().unwrap_or_default();
+    let mut out = Vec::new();
+    // The candidate's checks with no conclusion, each over all its runs there, with its latest run's reason.
+    let runs: Vec<acceptance::CheckRun> = super::closing::candidate_evidence(conn, candidate)?
+        .iter()
+        .map(super::closing::Evidence::run)
+        .collect();
+    let mut by_check: BTreeMap<&str, Vec<&acceptance::CheckRun>> = BTreeMap::new();
+    for run in &runs {
+        by_check.entry(run.check_id.as_str()).or_default().push(run);
+    }
+    let mut listed = BTreeSet::new();
+    for (check, runs) in by_check {
+        let label = acceptance::check_label(&runs);
+        if matches!(label, Label::Blocked | Label::Unknown) {
+            let reason = runs
+                .last()
+                .map(|r| r.reason.clone().unwrap_or_else(|| r.outcome.clone()))
+                .unwrap_or_default();
+            out.push(format!(
+                "本轮须重跑检查 {check}：它在候选上为 {}（最近的原因：{reason}）",
+                label.code()
+            ));
+            listed.insert(check.to_owned());
+        }
+    }
+    // The scenario checks of the in-scope ACs no row decides on the candidate (not listed above already).
+    let spec_id: Option<String> = conn
+        .query_row(
+            "SELECT spec_id FROM runs WHERE run_id = ?1",
+            params![run_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?
+        .flatten();
+    let mut scope: Vec<&str> = opened["acceptance_ids"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    scope.sort_unstable();
+    for ac in scope {
+        let check: Option<String> = conn
+            .query_row(
+                "SELECT check_id FROM acceptance_criteria WHERE ac_id = ?1 AND spec_id = ?2",
+                params![ac, spec_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sqlite_error)?;
+        let Some(check) = check.filter(|c| !listed.contains(c)) else {
+            continue;
+        };
+        let rows = super::closing::ac_rows(conn, candidate, ac, spec_id.as_deref())?;
+        let statuses: Vec<classify::Row> = rows
+            .iter()
+            .map(|r| super::closing::row_of(&r.status))
+            .collect();
+        let degradable = rows.iter().any(|r| r.degradable);
+        if classify::project(&statuses, degradable) == Ac::Undetermined {
+            out.push(format!(
+                "本轮须重跑 {ac} 的场景检查 {check}：该 AC 在候选上的投影未定"
+            ));
+        }
+    }
+    // QA reruns every in-scope AC's scenario check (the round reads only its own evidence); the reviewer does not
+    // repeat it (-359).
+    if role == "qa" {
+        out.push("本轮须重跑范围内每个 AC 的场景检查：轮次只看本轮的证据".to_owned());
+    }
+    Ok(out)
+}
+
 /// The label of a Developer's self-test record in a verifier's context (docs/adr/ADR-028.md decision 14).
 pub(super) const SELF_TEST_LABEL: &str = "开发者自测（diagnostic，仅作诊断，不作验收依据）";
 

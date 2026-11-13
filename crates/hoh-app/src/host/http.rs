@@ -84,6 +84,8 @@ fn routes(shared: Arc<Shared>, via: Via) -> Router {
         .route("/v1/runs", get(list_runs))
         .route("/v1/runs/{run_id}", get(get_run))
         .route("/v1/runs/{run_id}/team", get(list_team))
+        .route("/v1/runs/{run_id}/acceptance", get(list_acceptance))
+        .route("/v1/runs/{run_id}/issues", get(list_issues))
         .route("/v1/events", get(stream_events))
         .route("/healthz", get(health))
         .fallback(no_route)
@@ -1055,6 +1057,131 @@ async fn list_team(
     }
 }
 
+/// The answer to a page query that names no page (openapi has no 400 for these lists: 404, as `GET /v1/runs`).
+fn unreadable_page() -> Response {
+    error(
+        StatusCode::NOT_FOUND,
+        "BAD_REQUEST",
+        "limit must be 1 to 500, cursor one this host gave",
+        false,
+        None,
+    )
+}
+
+/// The answer for a run that does not exist.
+fn no_run(run_id: &str) -> Response {
+    error(
+        StatusCode::NOT_FOUND,
+        "RUN_NOT_FOUND",
+        format!("run {run_id} does not exist"),
+        false,
+        None,
+    )
+}
+
+/// `GET /v1/runs/{run_id}/acceptance` (openapi `listAcceptance`; docs/adr/ADR-029.md decision 5): a page of the run's
+/// acceptance projection, each AC in its scope on each of its candidates, the latest candidate first, with the
+/// watermark it was read at; at most `limit` (1 to 500, 100 by default) after the opaque `cursor`. A query that cannot
+/// be read names no page: 404, as for `GET /v1/runs`.
+async fn list_acceptance(
+    State(shared): State<Arc<Shared>>,
+    run_id: Result<UrlPath<String>, axum::extract::rejection::PathRejection>,
+    query: Result<Query<TeamQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    let Ok(Query(query)) = query else {
+        return unreadable_page();
+    };
+    let limit = query.limit.unwrap_or(100);
+    if !(1..=500).contains(&limit) {
+        return unreadable_page();
+    }
+    // The cursor is `<freeze seq>:<AC>` of the last item of the previous page.
+    let after = match query.cursor.as_deref().map(|c| c.split_once(':')) {
+        None => None,
+        Some(Some((seq, ac))) => match seq.parse::<i64>() {
+            Ok(seq) if seq >= 0 && !ac.is_empty() => Some((seq, ac.to_owned())),
+            _ => return unreadable_page(),
+        },
+        Some(None) => return unreadable_page(),
+    };
+    let Ok(UrlPath(run_id)) = run_id else {
+        return error(
+            StatusCode::NOT_FOUND,
+            "RUN_NOT_FOUND",
+            "no run has that id",
+            false,
+            None,
+        );
+    };
+    let wanted = run_id.clone();
+    match read(&shared, move |reader| {
+        reader.acceptance_page(&wanted, limit, after)
+    })
+    .await
+    {
+        Ok(Some(page)) => (
+            StatusCode::OK,
+            axum::Json(json!({
+                "items": page.items,
+                "next_cursor": page.next.map(|(seq, ac)| format!("{seq}:{ac}")),
+                "watermark": page.watermark,
+            })),
+        )
+            .into_response(),
+        Ok(None) => no_run(&run_id),
+        Err(e) => store_error(&shared, &run_id, e).await,
+    }
+}
+
+/// `GET /v1/runs/{run_id}/issues` (openapi `listIssues`; docs/adr/ADR-029.md decisions 5 and 10): a page of the run's
+/// Issues, newest first, each state evaluated by the state function now, with the watermark it was read at; at most
+/// `limit` (1 to 500, 100 by default) older than the opaque `cursor`. A query that cannot be read names no page: 404.
+async fn list_issues(
+    State(shared): State<Arc<Shared>>,
+    run_id: Result<UrlPath<String>, axum::extract::rejection::PathRejection>,
+    query: Result<Query<TeamQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    let Ok(Query(query)) = query else {
+        return unreadable_page();
+    };
+    let limit = query.limit.unwrap_or(100);
+    if !(1..=500).contains(&limit) {
+        return unreadable_page();
+    }
+    let before = match query.cursor.as_deref().map(str::parse::<i64>) {
+        None => None,
+        Some(Ok(before)) if before > 0 => Some(before),
+        Some(_) => return unreadable_page(),
+    };
+    let Ok(UrlPath(run_id)) = run_id else {
+        return error(
+            StatusCode::NOT_FOUND,
+            "RUN_NOT_FOUND",
+            "no run has that id",
+            false,
+            None,
+        );
+    };
+    let wanted = run_id.clone();
+    match read(&shared, move |reader| {
+        reader.issues_page(&wanted, limit, before)
+    })
+    .await
+    {
+        Ok(Some(page)) => (
+            StatusCode::OK,
+            axum::Json(json!({
+                "items": page.items,
+                "next_cursor": page.next.map(|n| n.to_string()),
+                "watermark": page.watermark,
+            })),
+        )
+            .into_response(),
+        Ok(None) => no_run(&run_id),
+        Err(e) => store_error(&shared, &run_id, e).await,
+    }
+}
+
 /// `GET /v1/runs/{run_id}` (openapi `getRun`): the run with the watermark it was read at.
 async fn get_run(
     State(shared): State<Arc<Shared>>,
@@ -1071,8 +1198,8 @@ async fn get_run(
         );
     };
     let wanted = run_id.clone();
-    match read(&shared, move |reader| reader.run_view(&wanted)).await {
-        Ok(Some((run, team, watermark))) => (
+    match read(&shared, move |reader| reader.run_projection(&wanted)).await {
+        Ok(Some((run, team, acceptance, watermark))) => (
             StatusCode::OK,
             axum::Json(json!({
                 "run_id": run.run_id,
@@ -1081,6 +1208,14 @@ async fn get_run(
                 "watermark": watermark,
                 "projection": {
                     "mode": run.mode,
+                    // The latest candidate's acceptance summary (docs/adr/ADR-029.md decision 5).
+                    "acceptance": {
+                        "candidate_id": acceptance.candidate.as_ref().map(|c| c.candidate_id.clone()),
+                        "candidate_state": acceptance.candidate.as_ref().map(|c| c.state.clone()),
+                        "accepted": acceptance.accepted,
+                        "passing": acceptance.passing,
+                        "total": acceptance.total,
+                    },
                     // docs/adr/ADR-022.md decision 18.
                     "team": team.members,
                     "team_revision": team.team_revision,

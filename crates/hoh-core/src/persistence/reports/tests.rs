@@ -296,6 +296,21 @@ async fn test_054_02_a_report_on_a_superseded_candidate_is_stale() -> R {
     );
     assert_eq!(done.closed, [(round, "superseded".to_owned())]);
     assert_eq!(handoffs.len(), 1, "{handoffs:?}");
+    // C2's review read before its reviewer completes (decision 5's `report_status`): NOT_RUN, C1's STALE PASS counting
+    // for nothing.
+    let snapshot = store.reader()?.acceptance("R")?.ok_or("no run R")?;
+    assert_eq!(
+        (
+            snapshot.candidate.map(|c| c.candidate_id),
+            snapshot.review,
+            snapshot.qa
+        ),
+        (
+            Some(c2.clone()),
+            crate::verification::classify::Report::NotRun,
+            crate::verification::classify::Report::NotRun
+        )
+    );
     assert_eq!(
         texts(
             &path,

@@ -255,6 +255,8 @@ struct Team {
     scope: std::sync::Mutex<Vec<String>>,
     /// The findings the qa FakeAgent's report block gives.
     qa_findings: std::sync::Mutex<Vec<Value>>,
+    /// The findings the reviewer FakeAgent's report block gives.
+    review_findings: std::sync::Mutex<Vec<Value>>,
     /// The Developer's FakeAgent writes a self-test record of every TEST passing under its attempt's directory and names
     /// it in its TaskResult's evidence (docs/adr/ADR-028.md decision 14).
     self_test: AtomicBool,
@@ -286,6 +288,7 @@ impl Team {
             on_verifier_delivery: std::sync::Mutex::default(),
             scope: std::sync::Mutex::new(vec!["AC-035-03".to_owned()]),
             qa_findings: std::sync::Mutex::default(),
+            review_findings: std::sync::Mutex::default(),
             self_test: AtomicBool::new(false),
         }
     }
@@ -407,13 +410,13 @@ impl hoh_app::host::Executor for Team {
                     };
                     let scope = self.scope.lock().map(|s| s.clone()).unwrap_or_default();
                     let findings = if work.role == "qa" {
-                        self.qa_findings
-                            .lock()
-                            .map(|f| f.clone())
-                            .unwrap_or_default()
+                        &self.qa_findings
                     } else {
-                        Vec::new()
-                    };
+                        &self.review_findings
+                    }
+                    .lock()
+                    .map(|f| f.clone())
+                    .unwrap_or_default();
                     final_text = Some(format!(
                         "done\n```hoh-report\n{}\n```\n",
                         json!({"status": status, "scope": scope, "findings": findings})
@@ -2515,4 +2518,324 @@ async fn test_053_01_a_missing_feature_fails_ac_b_on_c_and_opens_an_issue() -> R
         &json!({"with_finding": with, "without_finding": without}),
     )?;
     Ok(())
+}
+
+/// GET `path` of the host's API: the status and the JSON body.
+async fn get(host: &Host, path: &str) -> R<(u16, Value)> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\nX-HoH-Token: {token}\r\n\r\n",
+        port = host.port,
+        token = host.token,
+    );
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", host.port)).await?;
+    stream.write_all(request.as_bytes()).await?;
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await?;
+    let text = String::from_utf8(raw)?;
+    let (head, body) = text.split_once("\r\n\r\n").ok_or("no response head")?;
+    let status: u16 = head.split(' ').nth(1).ok_or("no status")?.parse()?;
+    Ok((status, serde_json::from_str(body)?))
+}
+
+/// TEST-053-04's run: [`world_ab`]'s criteria under a requirement each, REQ-091 (AC-090-01, feature a) for task T1
+/// READY and REQ-092 (AC-090-02, feature b) for task T2 PENDING until T1 is ACCEPTED.
+fn world_two(spec: &str) -> String {
+    format!(
+        "{}
+DELETE FROM task_requirements WHERE task_id = 'D';
+DELETE FROM tasks WHERE task_id = 'D';
+DELETE FROM acceptance_criteria WHERE requirement_id = 'REQ-035';
+DELETE FROM requirements WHERE requirement_id = 'REQ-035';
+INSERT INTO requirements(requirement_id, spec_id, title, required_release) VALUES
+  ('REQ-091', 's1', 'feature a', 1), ('REQ-092', 's1', 'feature b', 1);
+INSERT INTO acceptance_criteria(ac_id, requirement_id, spec_id, body, check_id) VALUES
+  ('AC-090-01', 'REQ-091', 's1', 'feature a', 'feature-a'), ('AC-090-02', 'REQ-092', 's1', 'feature b', 'feature-b');
+INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate) VALUES
+  ('T1', 'R', 's1', 'READY', 1, 'developer', 1, 1, 1), ('T2', 'R', 's1', 'PENDING', 1, 'developer', 1, 2, 1);
+INSERT INTO task_requirements(task_id, requirement_id, spec_id) VALUES ('T1', 'REQ-091', 's1'), ('T2', 'REQ-092', 's1');
+INSERT INTO task_dependencies(task_id, depends_on) VALUES ('T2', 'T1');",
+        world(spec)
+    )
+}
+
+/// Run R's acceptance as the host shows it now: the snapshot (`Reader::acceptance`), getRun's acceptance summary and
+/// listAcceptance's page, with the number of acceptance rows.
+async fn acceptance_now(host: &Host, project: &Path) -> R<Value> {
+    let snapshot = host.store().reader()?.acceptance("R")?.ok_or("no run R")?;
+    let (status, run) = get(host, "/v1/runs/R").await?;
+    assert_eq!(status, 200, "{run}");
+    let (status, page) = get(host, "/v1/runs/R/acceptance").await?;
+    assert_eq!(status, 200, "{page}");
+    let count = rows(project, "SELECT count(*) AS n FROM acceptance_results")?;
+    Ok(
+        json!({"snapshot": snapshot, "projection": run["projection"]["acceptance"], "acceptance": page,
+        "acceptance_results": count[0]["n"]}),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_053_04_a_new_candidate_resets_the_current_projection_and_the_accepted_count() -> R {
+    // AC-053-04 (REQ-053 failure mode 5; docs/adr/ADR-029.md decision 5, TEST-053-04): T1 (AC-090-01) completes into
+    // C1; its QA runs feature-a, both verifiers PASS, the join accepts C1 and T1, and the snapshot's accepted holds
+    // AC-090-01. T2 (AC-090-02, waiting for T1) then completes into C2: the snapshot's AC-090-01 is NOT_RUN on C2,
+    // accepted one less, the acceptance rows as many as before, C2's qa and reviewer handoffs one each, and the events
+    // `candidate.frozen{superseded: [C1]}`, `report.stale` and C2's `round_opened`. Both snapshots kept.
+    let dir = tempfile::tempdir()?;
+    let (project, spec) = project_with(dir.path(), SPEC_AB, PLAN_AB).await?;
+    seed(&project, &world_two(&spec))?;
+    let clock = Arc::new(FakeClock::default());
+    let mut team = Team::new(Commander::Answers, &spec, &project);
+    team.out = dir.path().join("out");
+    std::fs::create_dir_all(&team.out)?;
+    *team.scope.lock().map_err(|e| e.to_string())? = vec!["AC-090-01".to_owned()];
+    *team.qa_script.lock().map_err(|e| e.to_string())? =
+        Some("\"$HOH_RUN_CHECK\" feature-a > \"$OUT/a.txt\"; exit 0".to_owned());
+    *team.developer_script.lock().map_err(|e| e.to_string())? = Some(
+        "git -c user.name=t -c user.email=t@example.invalid commit -q --allow-empty -m work || exit 1; exit 0".to_owned(),
+    );
+    team.release.store(true, Ordering::SeqCst);
+    let team = Arc::new(team);
+    let host = host(&project, team.clone(), clock.clone()).await?;
+    let outcome = async {
+        let step = Duration::from_millis(100);
+        let c1 = wait_for(&project, &clock, step, "SELECT candidate_id FROM candidates", &|r| {
+            r.as_array().is_some_and(|a| !a.is_empty())
+        })?[0]["candidate_id"]
+            .as_str()
+            .ok_or("no C1")?
+            .to_owned();
+        // T2's Developer waits until the snapshot before it is read.
+        team.developer.store(false, Ordering::SeqCst);
+        wait_for(
+            &project,
+            &clock,
+            step,
+            &format!(
+                "SELECT (SELECT state FROM candidates WHERE candidate_id = '{c1}') AS c1, \
+                 (SELECT state FROM tasks WHERE task_id = 'T1') AS t1"
+            ),
+            &|r| r[0]["c1"] == json!("ACCEPTED") && r[0]["t1"] == json!("ACCEPTED"),
+        )?;
+        let before = acceptance_now(&host, &project).await?;
+        // C2's verifiers wait, so the snapshot after C2's freeze comes before any row of its own.
+        team.release.store(false, Ordering::SeqCst);
+        team.developer.store(true, Ordering::SeqCst);
+        let c2 = wait_for(
+            &project,
+            &clock,
+            step,
+            &format!("SELECT candidate_id FROM candidates WHERE candidate_id <> '{c1}'"),
+            &|r| r.as_array().is_some_and(|a| !a.is_empty()),
+        )?[0]["candidate_id"]
+            .as_str()
+            .ok_or("no C2")?
+            .to_owned();
+        let handoffs = wait_for(
+            &project,
+            &clock,
+            step,
+            &format!(
+                "SELECT recipient_role AS role, count(*) AS n FROM outbox \
+                 WHERE json_extract(payload_json, '$.payload.handoff_kind') = 'verification' \
+                 AND json_extract(payload_json, '$.candidate_id') = '{c2}' GROUP BY recipient_role ORDER BY recipient_role"
+            ),
+            &|r| r.as_array().is_some_and(|a| a.len() == 2),
+        )?;
+        let after = acceptance_now(&host, &project).await?;
+        let snapshot = |v: &Value, ac: &str| -> Value {
+            v["snapshot"]["acs"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|a| a["ac_id"] == json!(ac))
+                .map(|a| json!([a["label"], a["why"], a["counted"]]))
+                .unwrap_or(Value::Null)
+        };
+        assert_eq!(
+            before["snapshot"]["candidate"],
+            json!({"candidate_id": c1, "state": "ACCEPTED"}),
+            "{before}"
+        );
+        assert_eq!(snapshot(&before, "AC-090-01"), json!(["PASS", null, true]), "{before}");
+        assert_eq!(snapshot(&before, "AC-090-02"), json!(["NOT_RUN", null, true]), "{before}");
+        assert_eq!(
+            before["projection"],
+            json!({"candidate_id": c1, "candidate_state": "ACCEPTED", "accepted": 1, "passing": 1, "total": 2})
+        );
+        assert_eq!(
+            after["snapshot"]["candidate"],
+            json!({"candidate_id": c2, "state": "VERIFYING"}),
+            "{after}"
+        );
+        assert_eq!(snapshot(&after, "AC-090-01"), json!(["NOT_RUN", null, true]), "{after}");
+        assert_eq!(snapshot(&after, "AC-090-02"), json!(["NOT_RUN", null, true]), "{after}");
+        assert_eq!(
+            after["snapshot"]["accepted"].as_i64(),
+            before["snapshot"]["accepted"].as_i64().map(|n| n - 1)
+        );
+        assert_eq!(
+            after["projection"],
+            json!({"candidate_id": c2, "candidate_state": "VERIFYING", "accepted": 0, "passing": 0, "total": 2})
+        );
+        assert_eq!(after["acceptance_results"], before["acceptance_results"]);
+        assert!(before["acceptance_results"].as_i64().is_some_and(|n| n >= 1), "{before}");
+        // listAcceptance: C2's labels first and latest, C1's STALE after it.
+        let listed: Vec<Value> = after["acceptance"]["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|i| json!([i["candidate_id"], i["ac_id"], i["label"], i["why"], i["latest"]]))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                json!([c2, "AC-090-01", "NOT_RUN", null, true]),
+                json!([c2, "AC-090-02", "NOT_RUN", null, true]),
+                json!([c1, "AC-090-01", "STALE", "CANDIDATE_STALE", false]),
+                json!([c1, "AC-090-02", "STALE", "CANDIDATE_STALE", false]),
+            ]
+        );
+        assert_eq!(
+            handoffs,
+            json!([{"role": "qa", "n": 1}, {"role": "reviewer", "n": 1}])
+        );
+        let events = rows(
+            &project,
+            "SELECT seq, kind, payload_json AS payload FROM events WHERE kind IN \
+             ('candidate.frozen', 'report.stale', 'verification.round_opened') ORDER BY seq",
+        )?;
+        let of = |kind: &str| -> Vec<Value> {
+            events
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|e| e["kind"] == json!(kind))
+                .filter_map(|e| serde_json::from_str(e["payload"].as_str()?).ok())
+                .collect()
+        };
+        assert!(
+            of("candidate.frozen")
+                .iter()
+                .any(|f| f["candidate_id"] == json!(c2) && f["superseded"] == json!([c1])),
+            "{events}"
+        );
+        let stale = of("report.stale");
+        assert!(
+            stale.iter().any(|s| s["reason"] == json!("superseded")
+                && s["report_ids"].as_array().is_some_and(|r| r.len() == 2)),
+            "C1's two reports made STALE: {events}"
+        );
+        assert!(
+            of("verification.round_opened")
+                .iter()
+                .any(|o| o["candidate_id"] == json!(c2) && o["source_task_ids"] == json!(["T2"])),
+            "{events}"
+        );
+        assert_eq!(
+            rows(
+                &project,
+                "SELECT state FROM independent_reports ORDER BY report_id"
+            )?,
+            json!([{"state": "STALE"}, {"state": "STALE"}])
+        );
+        keep(
+            "m2t18-test-053-04",
+            &json!({"c1": c1, "c2": c2, "before": before, "after": after, "handoffs": handoffs,
+                "events": events}),
+        )?;
+        R::Ok(())
+    }
+    .await;
+    team.developer.store(true, Ordering::SeqCst);
+    team.release.store(true, Ordering::SeqCst);
+    host.shutdown().await;
+    outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_054_04_findings_settled_through_the_host_trace_to_their_report_and_raw_session() -> R
+{
+    // AC-054-04 on the product path (docs/adr/ADR-029.md decisions 9 and 15): the reviewer's FakeAgent reports FAIL with
+    // F1 critical (evidence in src/a.rs) and F2 low, QA PASS, settled through the host. Two Issues on C, critical and
+    // low, each with its fingerprint and finding id; each traces through `issue_chain` and `verify_chain` to its report
+    // object, its finding, the raw session and native attempt objects, the session and the stdout, every link holding.
+    // C REJECTED (the critical finding fails the round).
+    let dir = tempfile::tempdir()?;
+    let (project, spec) = project(dir.path()).await?;
+    seed(&project, &world(&spec))?;
+    let clock = Arc::new(FakeClock::default());
+    let team = Team::new(Commander::Answers, &spec, &project);
+    *team.review_report.lock().map_err(|e| e.to_string())? = Some("FAIL".to_owned());
+    *team.review_findings.lock().map_err(|e| e.to_string())? = vec![
+        json!({"id": "F1", "severity": "critical", "summary": "[缺陷] src/a.rs:12 — 越界访问",
+            "evidence": [{"path": "src/a.rs", "sha256": "a".repeat(64)}]}),
+        json!({"id": "F2", "severity": "low", "summary": "[建议] src/b.rs:3 — 命名"}),
+    ];
+    team.release.store(true, Ordering::SeqCst);
+    let team = Arc::new(team);
+    let host = host(&project, team.clone(), clock.clone()).await?;
+    let outcome = async {
+        let step = Duration::from_millis(100);
+        let closed = wait_for(
+            &project,
+            &clock,
+            step,
+            "SELECT json_extract(payload_json, '$.verdict') AS verdict FROM events \
+             WHERE kind = 'verification.round_closed'",
+            &|r| r.as_array().is_some_and(|a| !a.is_empty()),
+        )?;
+        let (c, _, _) = candidate(&project)?;
+        let issues = rows(
+            &project,
+            "SELECT issue_id, candidate_id, severity, fingerprint, finding_id, report_id FROM issues \
+             WHERE finding_id IS NOT NULL ORDER BY finding_id",
+        )?;
+        let found: Vec<(Value, Value, Value)> = issues
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|i| (i["finding_id"].clone(), i["severity"].clone(), i["candidate_id"].clone()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (json!("F1"), json!("critical"), json!(c)),
+                (json!("F2"), json!("low"), json!(c))
+            ],
+            "{issues}"
+        );
+        let mut traced = Vec::new();
+        for issue in issues.as_array().into_iter().flatten() {
+            assert!(
+                issue["fingerprint"].as_str().is_some_and(|f| f.len() == 64),
+                "{issue}"
+            );
+            let id = issue["issue_id"].as_str().ok_or("no issue id")?;
+            let chain = host
+                .store()
+                .reader()?
+                .issue_chain(id)?
+                .ok_or("a finding's Issue has a chain")?;
+            let check = hoh_core::verification::report::verify_chain(&project, &chain);
+            assert!(check.holds(), "{id}: {check:?} {chain:?}");
+            assert_eq!(chain.report.state, "CURRENT");
+            assert_eq!(json!(chain.report.report_id), issue["report_id"]);
+            traced.push(json!({"chain": chain, "check": check}));
+        }
+        assert_eq!(closed[0]["verdict"], json!("repair"), "{closed}");
+        assert_eq!(
+            rows(&project, &format!("SELECT state FROM candidates WHERE candidate_id = '{c}'"))?,
+            json!([{"state": "REJECTED"}])
+        );
+        keep(
+            "m2t18-test-054-04",
+            &json!({"issues": issues, "traced": traced, "round_closed": closed}),
+        )?;
+        R::Ok(())
+    }
+    .await;
+    team.release.store(true, Ordering::SeqCst);
+    host.shutdown().await;
+    outcome
 }

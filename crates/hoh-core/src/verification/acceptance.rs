@@ -41,6 +41,12 @@ impl Label {
     }
 }
 
+impl serde::Serialize for Label {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.code())
+    }
+}
+
 /// Why a label is what it is, when the rows alone do not say.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Why {
@@ -50,6 +56,23 @@ pub enum Why {
     CandidateInvalid,
     /// The candidate is STALE.
     CandidateStale,
+}
+
+impl Why {
+    /// The reason as a snapshot and `/v1/runs/{run_id}/acceptance` spell it (docs/adr/ADR-029.md decision 2).
+    pub fn code(self) -> &'static str {
+        match self {
+            Why::Insufficient => "INSUFFICIENT",
+            Why::CandidateInvalid => "CANDIDATE_INVALID",
+            Why::CandidateStale => "CANDIDATE_STALE",
+        }
+    }
+}
+
+impl serde::Serialize for Why {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.code())
+    }
 }
 
 /// What the candidate's state lets the rows say (docs/adr/ADR-029.md decision 2).

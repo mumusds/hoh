@@ -910,6 +910,13 @@ pub(super) fn assignment(
             facts
                 .scope
                 .extend(super::context::corrections(conn, task_id, attempt_id)?);
+            // A reverification's checks to run again (docs/adr/ADR-029.md decision 4).
+            facts.scope.extend(super::context::reverification(
+                conn,
+                run_id,
+                &handoff.round_id,
+                role,
+            )?);
             // The Issues it is to confirm fixed, in its mandatory scope; the ids delivered with their description are
             // recorded with its packing (docs/adr/ADR-029.md decision 10).
             let delivery =
