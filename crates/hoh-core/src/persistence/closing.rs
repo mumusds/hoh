@@ -216,7 +216,10 @@ fn evidence(tx: &Transaction<'_>, attempts: &[String]) -> Result<Vec<Evidence>, 
     Ok(out)
 }
 
-/// The status of the latest report of `role` among `attempts` (decision 15): NOT_RUN without one.
+/// The status of the latest report of `role` among `attempts` (in their order): its last `independent_reports` row
+/// that is CURRENT or STALE, never a REJECTED one (docs/adr/ADR-029.md decision 7; a round reads its STALE reports,
+/// ADR-028 -850), and the findings' summaries its attempt's `verification.report` named (decision 15); NOT_RUN without
+/// one.
 fn report(
     tx: &Transaction<'_>,
     attempts: &[String],
@@ -226,9 +229,12 @@ fn report(
     for attempt in attempts {
         let found: Option<(String, Option<String>)> = tx
             .query_row(
-                "SELECT json_extract(payload_json, '$.status'), json_extract(payload_json, '$.findings') FROM events \
-                 WHERE kind = 'verification.report' AND json_extract(payload_json, '$.attempt_id') = ?1 \
-                 AND json_extract(payload_json, '$.role') = ?2 ORDER BY seq DESC LIMIT 1",
+                "SELECT r.status, (SELECT json_extract(e.payload_json, '$.findings') FROM events e \
+                   WHERE e.run_id = r.run_id AND e.kind = 'verification.report' \
+                   AND json_extract(e.payload_json, '$.attempt_id') = r.attempt_id \
+                   ORDER BY e.seq DESC LIMIT 1) \
+                 FROM independent_reports r WHERE r.attempt_id = ?1 AND r.role = ?2 AND r.state <> 'REJECTED' \
+                 ORDER BY r.rowid DESC LIMIT 1",
                 params![attempt, role],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -330,6 +336,8 @@ pub(super) fn reconcile(
     let tx = writer::begin(conn, ctx)?;
     let mut done = Reconciled::default();
     let (project_id, spec_id, run_state) = run_of(&tx, run_id)?;
+    // Reports whose candidate no longer stands, made STALE whoever superseded it (docs/adr/ADR-029.md decision 8).
+    super::reports::sweep(&tx, run_id)?;
     let cancelling = matches!(run_state.as_str(), "CANCEL_REQUESTED" | "CANCELLED");
     let event = |event_id: String, kind: &str, payload: Value| NewEvent {
         project_id: project_id.clone(),

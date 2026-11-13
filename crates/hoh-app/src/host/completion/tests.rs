@@ -303,19 +303,21 @@ fn a_verifiers_report_takes_its_session_log_whatever_its_agent_names_it() -> R {
             "done\n```hoh-report\n{\"role\": \"reviewer\", \"status\": \"PASS\", \"scope\": [\"AC-1-01\"], \"findings\": []}\n```\n"
                 .to_owned(),
         );
-        let log = |n: &str, sha: char| ArtifactRow {
-            sha256: sha.to_string().repeat(64),
-            path: format!(
-                ".hoh/objects/sha256/{0}{0}/{1}",
-                sha,
-                sha.to_string().repeat(64)
-            ),
-            bytes: 1,
-            mime: "application/x-ndjson".to_owned(),
-            kind: "raw_log".to_owned(),
-            name: n.to_owned(),
+        // Kept as objects, as the runner keeps them, so the host's check recomputes them (docs/adr/ADR-029.md
+        // decision 7).
+        let log = |n: &str, text: &str| -> R<ArtifactRow> {
+            let sha256 = hoh_core::objects::put(dir.path(), text.as_bytes())?;
+            Ok(ArtifactRow {
+                path: hoh_core::objects::relative_path(&sha256),
+                sha256,
+                bytes: text.len() as u64,
+                mime: "application/x-ndjson".to_owned(),
+                kind: "raw_log".to_owned(),
+                name: n.to_owned(),
+            })
         };
-        ending.observed.artifacts = vec![log("stderr.log", 'e'), log(name, 'a')];
+        let stdout = log(name, "{\"type\": \"result\"}\n")?;
+        ending.observed.artifacts = vec![log("stderr.log", "warning\n")?, stdout.clone()];
         let reporting = Reporting {
             project: dir.path().to_owned(),
             role: "reviewer".to_owned(),
@@ -329,9 +331,108 @@ fn a_verifiers_report_takes_its_session_log_whatever_its_agent_names_it() -> R {
                     dir.path(),
                     &report.report.sha256,
                 )?)?;
-                assert_eq!(kept["raw_session"]["sha256"], "a".repeat(64), "{name}");
+                assert_eq!(
+                    kept["raw_session"]["sha256"],
+                    json!(stdout.sha256),
+                    "{name}"
+                );
             }
             other => return Err(format!("{name}: {other:?}").into()),
+        }
+    }
+    Ok(())
+}
+
+/// A reviewer's successful end in project `dir` whose final message reports `findings`, its stdout log `raw` kept as an
+/// object (none when `None`); its reporting in HoH session `s-r` with native session `n-r`.
+fn reviewer_end(
+    dir: &Path,
+    findings: serde_json::Value,
+    raw: Option<&str>,
+) -> R<(Identity, Ending, Reporting)> {
+    let identity = Identity {
+        role: "reviewer".to_owned(),
+        ..identity()
+    };
+    let mut ending = ending(&[line("COMPLETED", json!({"role": "reviewer"}))], false);
+    ending.observed.final_text = Some(format!(
+        "done\n```hoh-report\n{}\n```\n",
+        json!({"role": "reviewer", "status": "FAIL", "scope": ["AC-1-01"], "findings": findings})
+    ));
+    ending.observed.native_session = Some("n-r".to_owned());
+    let text = raw.unwrap_or("{\"type\": \"result\"}\n");
+    let sha256 = if raw.is_some() {
+        hoh_core::objects::put(dir, text.as_bytes())?
+    } else {
+        "d".repeat(64)
+    };
+    ending.observed.artifacts = vec![ArtifactRow {
+        path: hoh_core::objects::relative_path(&sha256),
+        sha256,
+        bytes: text.len() as u64,
+        mime: "application/x-ndjson".to_owned(),
+        kind: "raw_log".to_owned(),
+        name: "stdout.jsonl".to_owned(),
+    }];
+    let reporting = Reporting {
+        project: dir.to_owned(),
+        role: "reviewer".to_owned(),
+        session_id: "s-r".to_owned(),
+        candidate_id: format!("CAND-{}", "c".repeat(64)),
+        spec_sha256: "1".repeat(64),
+    };
+    Ok((identity, ending, reporting))
+}
+
+#[test]
+fn a_verifiers_native_attempt_export_is_completed_and_its_checked_report_goes_to_the_store() -> R {
+    // docs/adr/ADR-029.md decision 7 (-400, -450): the export's status is COMPLETED, one of the locked release policy's
+    // accepted_attempt_statuses (it was SETTLED); the store is handed the built report, its raw session's object and
+    // the export's session ids and status as the host's check read them.
+    let dir = tempfile::tempdir()?;
+    let finding = json!([{"id": "F1", "severity": "low", "summary": "a typo"}]);
+    let (identity, mut ending, reporting) =
+        reviewer_end(dir.path(), finding, Some("{\"type\": \"result\"}\n"))?;
+    let outcome = verifier_outcome(&identity, &mut ending, Some(&reporting));
+    let VerifierOutcome::Settle { report } = outcome else {
+        return Err(format!("not settled: {outcome:?}").into());
+    };
+    let native: serde_json::Value = serde_json::from_slice(&hoh_core::objects::get(
+        dir.path(),
+        &report.native_attempt.sha256,
+    )?)?;
+    assert_eq!(native["status"], "COMPLETED");
+    assert_eq!(report.native_status, "COMPLETED");
+    assert_eq!(report.native_session_ids, ["s-r", "n-r"]);
+    assert_eq!(native["session_ids"], json!(report.native_session_ids));
+    assert_eq!(&report.raw_session, &ending.observed.artifacts[0]);
+    let kept: serde_json::Value =
+        serde_json::from_slice(&hoh_core::objects::get(dir.path(), &report.report.sha256)?)?;
+    assert_eq!(report.report_json, kept);
+    assert_eq!(report.report_json["findings"][0]["id"], "F1");
+    Ok(())
+}
+
+#[test]
+fn a_verifiers_report_with_a_repeated_finding_id_or_no_raw_session_object_is_corrected() -> R {
+    // docs/adr/ADR-029.md decision 7 (host side): the host's check refuses it, an output to correct within its round
+    // (`verification.output_invalid` and Repair::Protocol); nothing reaches the store's intake.
+    let dir = tempfile::tempdir()?;
+    let twice = json!([{"id": "F1", "severity": "low", "summary": "a"},
+        {"id": "F1", "severity": "high", "summary": "b"}]);
+    for (what, findings, raw, why) in [
+        ("a finding id twice", twice, Some("{}\n"), "finding id F1"),
+        ("no raw session object", json!([]), None, "raw session"),
+    ] {
+        let (identity, mut ending, reporting) = reviewer_end(dir.path(), findings, raw)?;
+        match verifier_outcome(&identity, &mut ending, Some(&reporting)) {
+            VerifierOutcome::Correct { reasons } => assert!(
+                reasons
+                    .iter()
+                    .any(|r| r.starts_with("its report: ") && r.contains(why)),
+                "{what}: {reasons:?}"
+            ),
+            other => return Err(format!("{what}: {other:?}").into()),
         }
     }
     Ok(())

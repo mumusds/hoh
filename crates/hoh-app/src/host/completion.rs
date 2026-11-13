@@ -218,7 +218,9 @@ pub(super) struct Reporting {
 
 /// The report of a verifier's turn (decision 15): the ```hoh-report block of its final assistant message, completed
 /// with its HoH session, the candidate, the spec, its raw session log (kept as an object at its end) and the native
-/// attempt export the Runtime writes; both kept as objects. Why not, when it cannot be made. Blocking.
+/// attempt export the Runtime writes (status COMPLETED: only a COMPLETED result is reported, docs/adr/ADR-029.md
+/// decision 7); both kept as objects, then checked from their bytes and the raw log's (`report::verify`). Why not, when
+/// it cannot be made or does not check: an output to correct. Blocking.
 fn report_of(
     r: &Reporting,
     ending: &Ending,
@@ -238,25 +240,37 @@ fn report_of(
         // `exec.stdout.jsonl` (codex) (M2T16R-50).
         .find(|a| a.kind.starts_with("raw_log") && a.name.ends_with("stdout.jsonl"))
         .ok_or("its raw session log was not kept")?;
+    // Its digest recomputed from the bytes it is kept as (an object, or in place), read in pieces.
+    let (raw_sha256, _) = hoh_core::objects::hash_file(&r.project.join(&raw.path))
+        .map_err(|e| format!("its raw session log cannot be read: {e}"))?;
     let mut sessions = vec![r.session_id.clone()];
     sessions.extend(ending.observed.native_session.clone());
     let keep = |value: &serde_json::Value,
                 kind: &str,
                 name: &str|
-     -> Result<hoh_core::persistence::ArtifactRow, String> {
+     -> Result<(hoh_core::persistence::ArtifactRow, Vec<u8>), String> {
         let bytes = serde_json::to_vec(value).map_err(|e| e.to_string())?;
         let sha256 = hoh_core::objects::put(&r.project, &bytes)?;
-        Ok(hoh_core::persistence::ArtifactRow {
-            path: hoh_core::objects::relative_path(&sha256),
-            sha256,
-            bytes: bytes.len() as u64,
-            mime: "application/json".to_owned(),
-            kind: kind.to_owned(),
-            name: name.to_owned(),
-        })
+        Ok((
+            hoh_core::persistence::ArtifactRow {
+                path: hoh_core::objects::relative_path(&sha256),
+                sha256,
+                bytes: bytes.len() as u64,
+                mime: "application/json".to_owned(),
+                kind: kind.to_owned(),
+                name: name.to_owned(),
+            },
+            bytes,
+        ))
     };
-    let native = keep(
-        &report::native_attempt(&r.role, "SETTLED", &sessions, &r.candidate_id, &raw.sha256)?,
+    let (native, native_bytes) = keep(
+        &report::native_attempt(
+            &r.role,
+            "COMPLETED",
+            &sessions,
+            &r.candidate_id,
+            &raw.sha256,
+        )?,
         "native_attempt",
         "native-attempt.json",
     )?;
@@ -272,6 +286,8 @@ fn report_of(
         &reference(raw),
         &reference(&native),
     )?;
+    let (kept, report_bytes) = keep(&built, "independent_report", "independent-report.json")?;
+    let checked = report::verify(&report_bytes, &raw_sha256, &native_bytes)?;
     Ok(hoh_core::persistence::VerifierReport {
         role: r.role.clone(),
         status: built["status"].as_str().unwrap_or_default().to_owned(),
@@ -281,8 +297,12 @@ fn report_of(
             .flatten()
             .filter_map(|f| f["summary"].as_str().map(str::to_owned))
             .collect(),
-        report: keep(&built, "independent_report", "independent-report.json")?,
+        report: kept,
         native_attempt: native,
+        report_json: checked.report,
+        raw_session: raw.clone(),
+        native_session_ids: checked.session_ids,
+        native_status: checked.status,
     })
 }
 
