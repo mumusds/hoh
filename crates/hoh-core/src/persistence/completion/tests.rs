@@ -3543,6 +3543,109 @@ async fn outside_round(
     ))
 }
 
+/// One round of D (both reports PASS) with QA evidence `runs`: (record, check, outcome, reason, rows, result lines);
+/// its verdict and its failure items.
+#[allow(clippy::type_complexity)]
+async fn round_with(
+    runs: &[(
+        &str,
+        &str,
+        &str,
+        Option<&str>,
+        &[(&str, &str, &str, Vec<&str>)],
+        &[(&str, &str, &str)],
+    )],
+) -> R<(Vec<String>, Vec<String>)> {
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    let (_, candidate, [qa, _]) = verified(&store, &path, "PASS", "PASS").await?;
+    for (record, check, outcome, reason, rows, lines) in runs {
+        evidence_judged(
+            &path,
+            (&qa, &candidate, record),
+            (check, outcome),
+            rows,
+            lines,
+        )?;
+        if let Some(reason) = reason {
+            Connection::open(&path)?.execute(
+                "UPDATE events SET payload_json = json_set(payload_json, '$.outcome_reason', ?1) WHERE event_id = ?2",
+                rusqlite::params![reason, format!("{record}/evidence")],
+            )?;
+        }
+    }
+    store
+        .reconcile_verification("R", Default::default())
+        .await?;
+    Ok((
+        texts(
+            &path,
+            "SELECT json_extract(payload_json, '$.verdict') FROM events WHERE kind = 'verification.round_closed'",
+        )?,
+        texts(
+            &path,
+            "SELECT json_extract(i.value, '$.item') FROM events e, json_each(e.payload_json, '$.items') i \
+             WHERE e.kind = 'verification.failures' ORDER BY 1",
+        )?,
+    ))
+}
+
+#[tokio::test]
+async fn a_check_failed_only_by_its_result_lines_fails_the_round_with_its_item() -> R {
+    // ADR-029 decision 4 (M2T18D-100, -151): a check that wrote a FAIL result line for a TEST no AC maps and then timed
+    // out is a conclusive failure: the round is failed and the item is the check's, FAIL_LINES, so failed has an item.
+    let passed: &[(&str, &str, &str, Vec<&str>)] = &[("AC-1-01", "TEST-1-01", "PASS", Vec::new())];
+    assert_eq!(
+        round_with(&[
+            (
+                "rec-1",
+                "lint",
+                "FAIL",
+                Some("TIMED_OUT"),
+                &[],
+                &[("TEST-9-99", "test_9_99_unmapped", "FAIL")]
+            ),
+            (
+                "rec-2",
+                "unit",
+                "PASS",
+                None,
+                passed,
+                &[("TEST-1-01", "test_1_01_works", "PASS")]
+            ),
+        ])
+        .await?,
+        (
+            vec!["repair".to_owned()],
+            vec!["check-fail:lint:FAIL_LINES".to_owned()]
+        )
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_check_that_timed_out_and_then_passed_in_its_round_is_passed() -> R {
+    // ADR-029 decision 4 (principle one): a rerun in the same round that passes after a timeout satisfies the check;
+    // the round is passable, not inconclusive.
+    let passed: &[(&str, &str, &str, Vec<&str>)] = &[("AC-1-01", "TEST-1-01", "PASS", Vec::new())];
+    assert_eq!(
+        round_with(&[
+            ("rec-1", "unit", "FAIL", Some("TIMED_OUT"), &[], &[]),
+            (
+                "rec-2",
+                "unit",
+                "PASS",
+                None,
+                passed,
+                &[("TEST-1-01", "test_1_01_works", "PASS")]
+            ),
+        ])
+        .await?,
+        (vec!["passable".to_owned()], Vec::new())
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn an_out_of_scope_failure_fails_its_round_whatever_its_checks_outcome() -> R {
     // ADR-028 implementation correction 6 (M2T16R-300): a FAIL row of this round's evidence on an AC outside its scope
