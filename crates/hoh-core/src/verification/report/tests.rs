@@ -251,3 +251,102 @@ fn each_defect_of_a_report_or_its_objects_is_refused_by_the_hosts_check() {
         );
     }
 }
+
+/// A project at `dir` keeping the reviewer's report with findings F1 and F2 by session `s`, its raw session and native
+/// attempt as objects, and F1's Issue traced as the store registers it.
+fn traced(dir: &std::path::Path) -> IssueChain {
+    let (report, raw_sha256, native) = kept(json!([
+        {"id": "F1", "severity": "critical", "summary": "out of bounds",
+         "evidence": [{"path": "src/a.rs", "sha256": "e".repeat(64)}]},
+        {"id": "F2", "severity": "low", "summary": "a name"}
+    ]));
+    let put = |bytes: &[u8]| crate::objects::put(dir, bytes).unwrap_or_default();
+    let raw = put(b"{\"type\": \"result\"}\n");
+    assert_eq!(raw, raw_sha256);
+    let (native, report) = (put(&native), put(&report));
+    let at = |sha256: String| ObjectRef {
+        path: crate::objects::relative_path(&sha256),
+        sha256,
+    };
+    let report = at(report);
+    IssueChain {
+        issue: ChainIssue {
+            issue_id: "I1".to_owned(),
+            candidate_id: Some(CANDIDATE.to_owned()),
+            severity: "critical".to_owned(),
+            fingerprint: "f".repeat(64),
+            finding_id: "F1".to_owned(),
+        },
+        report: ChainReport {
+            report_id: "A/report".to_owned(),
+            state: "CURRENT".to_owned(),
+            path: report.path,
+            sha256: report.sha256,
+        },
+        raw: at(raw),
+        native: Some(at(native)),
+    }
+}
+
+#[test]
+fn test_054_04_an_issue_traces_to_its_report_object_and_raw_session() {
+    // AC-054-04 (docs/adr/ADR-029.md decision 15): the report object read by its name, its finding, its raw_session and
+    // native_attempt the registered objects with their bytes recomputed, the native attempt holding the report's
+    // session and naming the raw session as its stdout: every link holds.
+    let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let chain = traced(dir.path());
+    let check = verify_chain(dir.path(), &chain);
+    assert_eq!(
+        check,
+        ChainCheck {
+            report_digest: true,
+            finding_present: true,
+            raw_digest: true,
+            native_digest: true,
+            session_in_native: true,
+            stdout_is_raw: true,
+        }
+    );
+    assert!(check.holds());
+}
+
+#[test]
+fn each_broken_link_of_an_issues_chain_is_found() {
+    // Decision 15's negative controls: a finding the report does not name, a raw or native artifact other than the
+    // report's references, a damaged object, a missing native attempt, and nothing at all when the report object is
+    // gone.
+    let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let chain = traced(dir.path());
+    let mut other_finding = chain.clone();
+    other_finding.issue.finding_id = "F9".to_owned();
+    let check = verify_chain(dir.path(), &other_finding);
+    assert!(
+        !check.finding_present && check.report_digest && check.raw_digest,
+        "{check:?}"
+    );
+    let mut other_raw = chain.clone();
+    other_raw.raw.sha256 = "a".repeat(64);
+    let check = verify_chain(dir.path(), &other_raw);
+    assert!(
+        !check.raw_digest && !check.stdout_is_raw && check.native_digest,
+        "{check:?}"
+    );
+    let mut no_native = chain.clone();
+    no_native.native = None;
+    let check = verify_chain(dir.path(), &no_native);
+    assert!(
+        !check.native_digest && !check.session_in_native && check.raw_digest,
+        "{check:?}"
+    );
+    // The native attempt damaged in place: its bytes no longer hash to its name.
+    let native = chain.native.clone().unwrap_or_else(|| panic!("no native"));
+    std::fs::write(dir.path().join(&native.path), b"{}").unwrap_or_else(|e| panic!("{e}"));
+    let check = verify_chain(dir.path(), &chain);
+    assert!(
+        !check.native_digest && !check.session_in_native && check.report_digest,
+        "{check:?}"
+    );
+    // The report object gone: no link can be checked.
+    std::fs::remove_file(dir.path().join(&chain.report.path)).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(verify_chain(dir.path(), &chain), ChainCheck::default());
+}

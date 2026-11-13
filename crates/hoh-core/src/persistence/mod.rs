@@ -38,6 +38,7 @@ mod results;
 mod retry;
 mod rounds;
 mod runner;
+mod snapshot;
 mod supervise;
 mod team;
 mod verification;
@@ -60,6 +61,10 @@ pub use retry::{Failure, Paced, Repair, RepairRequest, RepairVerdict};
 pub use rounds::{Dispatched, RoundOutcome};
 pub use runner::{
     ArtifactRow, DispatchNotice, Ending, Observed, Packing, PromptRecord, RUNNER, Waiting,
+};
+pub use snapshot::{
+    AcShown, AcceptanceItem, AcceptancePage, AcceptanceView, CandidateShown, CheckShown, IssueItem,
+    IssuesPage, RowShown,
 };
 pub use supervise::{Fired, Supervised};
 pub use team::{
@@ -1779,8 +1784,45 @@ impl Reader {
     }
 
     /// The run `run_id`'s specification and acceptance criteria (docs/adr/ADR-027.md decision 9).
-    pub fn acceptance(&self, run_id: &str) -> Result<Option<RunAcceptance>, PersistError> {
+    pub fn run_acceptance(&self, run_id: &str) -> Result<Option<RunAcceptance>, PersistError> {
         candidates::acceptance(&self.conn, run_id)
+    }
+
+    /// The snapshot of run `run_id`'s acceptance on its latest candidate (docs/adr/ADR-029.md decision 5), read in one
+    /// transaction; none when there is no such run.
+    pub fn acceptance(&self, run_id: &str) -> Result<Option<AcceptanceView>, PersistError> {
+        snapshot::acceptance(&self.conn, run_id)
+    }
+
+    /// A page of run `run_id`'s acceptance projection, newest candidate first (openapi `listAcceptance`): at most
+    /// `limit` items after the cursor `after` a previous page gave; none when there is no such run.
+    pub fn acceptance_page(
+        &self,
+        run_id: &str,
+        limit: usize,
+        after: Option<(i64, String)>,
+    ) -> Result<Option<AcceptancePage>, PersistError> {
+        snapshot::acceptance_page(&self.conn, run_id, limit, after)
+    }
+
+    /// A page of run `run_id`'s Issues, newest first, each state evaluated now (openapi `listIssues`): at most `limit`
+    /// older than the cursor `before`; none when there is no such run.
+    pub fn issues_page(
+        &self,
+        run_id: &str,
+        limit: usize,
+        before: Option<i64>,
+    ) -> Result<Option<IssuesPage>, PersistError> {
+        snapshot::issues_page(&self.conn, run_id, limit, before)
+    }
+
+    /// Issue `issue_id` traced to its report and raw session (docs/adr/ADR-029.md decision 15); none when there is no
+    /// such Issue or it is no finding's.
+    pub fn issue_chain(
+        &self,
+        issue_id: &str,
+    ) -> Result<Option<crate::verification::report::IssueChain>, PersistError> {
+        snapshot::issue_chain(&self.conn, issue_id)
     }
 
     /// The attempt `attempt_id`'s run and task role: who may produce evidence (docs/adr/ADR-027.md principle two).
@@ -2067,6 +2109,15 @@ impl Reader {
     /// The run `run_id`, its team (docs/adr/ADR-022.md decision 18) and the highest event seq, read together.
     pub fn run_view(&self, run_id: &str) -> Result<Option<(RunRow, TeamView, i64)>, PersistError> {
         commands::run_view(&self.conn, run_id)
+    }
+
+    /// [`Reader::run_view`] with the run's acceptance snapshot (getRun's projection, docs/adr/ADR-029.md decision 5),
+    /// read together.
+    pub fn run_projection(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<(RunRow, TeamView, AcceptanceView, i64)>, PersistError> {
+        commands::run_projection(&self.conn, run_id)
     }
 
     /// A page of the project's runs, newest first (openapi `listRuns`; ADR-021 decision 6): the runs with their

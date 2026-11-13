@@ -1413,7 +1413,9 @@ fn judge(reader: &Reader, at: &Judged<'_>, facts: &Facts) -> Result<(Recording, 
     );
     // The rows need the run's spec to be the candidate's; each AC's TEST is the one the frozen spec declares.
     let mut rows_out = Vec::new();
-    if let Some(acceptance) = reader.acceptance(at.run_id).map_err(CheckError::Store)?
+    if let Some(acceptance) = reader
+        .run_acceptance(at.run_id)
+        .map_err(CheckError::Store)?
         && acceptance.spec_sha256 == m.spec.sha256
     {
         let spec: Value = hoh_core::objects::get(project, &m.spec.sha256)

@@ -518,6 +518,28 @@ pub(super) fn run_view(
     read
 }
 
+/// [`run_view`] with the run's acceptance snapshot (docs/adr/ADR-029.md decision 5), in one read transaction.
+pub(super) fn run_projection(
+    conn: &Connection,
+    run_id: &str,
+) -> Result<Option<(RunRow, super::team::TeamView, super::AcceptanceView, i64)>, PersistError> {
+    conn.execute_batch("BEGIN").map_err(sqlite_error)?;
+    let read = (|| {
+        let Some((run, _)) = snapshot_rows(conn, run_id)? else {
+            return Ok(None);
+        };
+        let team = super::team::view(conn, run_id, &run.project_id)?;
+        let watermark = max_seq(conn)?;
+        let Some(acceptance) = super::snapshot::view_in(conn, run_id, watermark)? else {
+            return Ok(None);
+        };
+        Ok::<_, PersistError>(Some((run, team, acceptance, watermark)))
+    })();
+    // Ends the read transaction either way; nothing was written.
+    let _ = conn.execute_batch("COMMIT");
+    read
+}
+
 /// A page of runs: each with its creation time, the next page's cursor if there may be one, and the watermark.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunsPage {

@@ -18,7 +18,7 @@ use crate::lifecycle::Lifecycle as _;
 use crate::protocol::TaskState;
 use crate::verification::acceptance;
 use crate::verification::classify::{self, Ac, Class, Report, Row};
-use rusqlite::{OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -58,7 +58,7 @@ fn strings(v: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-pub(super) fn rounds(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<Round>, PersistError> {
+pub(super) fn rounds(tx: &Connection, run_id: &str) -> Result<Vec<Round>, PersistError> {
     let mut statement = tx
         .prepare(
             "SELECT seq, payload_json FROM events WHERE kind = ?1 AND run_id = ?2 ORDER BY seq",
@@ -95,7 +95,10 @@ pub(super) fn rounds(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<Round>, P
 }
 
 /// The verdict of each closed round of run `run_id`.
-fn closed(tx: &Transaction<'_>, run_id: &str) -> Result<BTreeMap<String, String>, PersistError> {
+pub(super) fn closed(
+    tx: &Connection,
+    run_id: &str,
+) -> Result<BTreeMap<String, String>, PersistError> {
     let mut statement = tx
         .prepare(
             "SELECT json_extract(payload_json, '$.round_id'), json_extract(payload_json, '$.verdict') FROM events \
@@ -154,7 +157,7 @@ fn superseded(tx: &Transaction<'_>, run_id: &str, candidate: &str) -> Result<boo
 }
 
 /// The attempts of round `round`'s verifier tasks.
-pub(super) fn attempts(tx: &Transaction<'_>, round: &Round) -> Result<Vec<String>, PersistError> {
+pub(super) fn attempts(tx: &Connection, round: &Round) -> Result<Vec<String>, PersistError> {
     let mut statement = tx
         .prepare("SELECT attempt_id FROM attempts WHERE task_id IN (?1, ?2) ORDER BY rowid")
         .map_err(sqlite_error)?;
@@ -178,13 +181,21 @@ pub(super) struct Evidence {
     fail_lines: bool,
 }
 
+impl Evidence {
+    /// The evidence as the check-level aggregation reads it (docs/adr/ADR-029.md decision 4).
+    pub(super) fn run(&self) -> acceptance::CheckRun {
+        acceptance::CheckRun {
+            check_id: self.check_id.clone(),
+            outcome: self.outcome.clone(),
+            reason: self.reason.clone(),
+            fail_lines: self.fail_lines,
+        }
+    }
+}
+
 /// The planned-check evidence (kind `check`, never an attempt-level marker record) `filter` (a condition on `ev`,
 /// its one parameter `key`) selects, in row order.
-fn evidence_where(
-    tx: &Transaction<'_>,
-    filter: &str,
-    key: &str,
-) -> Result<Vec<Evidence>, PersistError> {
+fn evidence_where(tx: &Connection, filter: &str, key: &str) -> Result<Vec<Evidence>, PersistError> {
     let mut statement = tx
         .prepare(&format!(
             "SELECT ev.evidence_id, ev.check_id, ev.outcome, \
@@ -236,7 +247,7 @@ fn evidence(tx: &Transaction<'_>, attempts: &[String]) -> Result<Vec<Evidence>, 
 /// Every planned-check evidence of candidate `candidate` (a join reads the candidate's whole history, docs/adr/ADR-029.md
 /// decisions 4 and 11).
 pub(super) fn candidate_evidence(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     candidate: &str,
 ) -> Result<Vec<Evidence>, PersistError> {
     evidence_where(tx, "ev.candidate_id = ?1", candidate)
@@ -814,7 +825,7 @@ pub(super) struct RowAt {
 
 /// The rows of AC `ac` on candidate `candidate` under specification `spec_id`.
 pub(super) fn ac_rows(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     candidate: &str,
     ac: &str,
     spec_id: Option<&str>,
@@ -898,16 +909,7 @@ pub(super) fn judge(tx: &Transaction<'_>, inputs: Inputs<'_>) -> Result<Judgemen
     }
     // The check dimension and the check failures from one judgement (docs/adr/ADR-029.md decision 4, M2T18D-100,
     // -151): a check is judged on all its runs.
-    let runs: Vec<acceptance::CheckRun> = inputs
-        .evidence
-        .iter()
-        .map(|e| acceptance::CheckRun {
-            check_id: e.check_id.clone(),
-            outcome: e.outcome.clone(),
-            reason: e.reason.clone(),
-            fail_lines: e.fail_lines,
-        })
-        .collect();
+    let runs: Vec<acceptance::CheckRun> = inputs.evidence.iter().map(Evidence::run).collect();
     let checks = acceptance::checks(&runs);
     let mut acs = Vec::new();
     for scoped in &inputs.scoped {

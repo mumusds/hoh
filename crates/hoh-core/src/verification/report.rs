@@ -7,7 +7,7 @@
 use serde_json::{Value, json};
 
 /// A path and digest a report names (`raw_session`, `native_attempt`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ObjectRef {
     pub path: String,
     pub sha256: String,
@@ -194,6 +194,120 @@ fn native_conforms(export: &Value) -> Result<(), String> {
                 violations.first().map_or("", |v| v.message.as_str())
             )
         })
+}
+
+/// A finding's Issue traced as the store registered it (docs/adr/ADR-029.md decision 15, AC-054-04): the Issue, its
+/// report's row with the report object it names, and the raw session and native attempt objects registered with it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct IssueChain {
+    pub issue: ChainIssue,
+    pub report: ChainReport,
+    /// The report row's raw session artifact.
+    pub raw: ObjectRef,
+    /// The native attempt artifact its settle registered (its `verification.report`); none when it was taken in
+    /// without one (a report recorded on its own).
+    pub native: Option<ObjectRef>,
+}
+
+/// The Issue of an [`IssueChain`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ChainIssue {
+    pub issue_id: String,
+    pub candidate_id: Option<String>,
+    pub severity: String,
+    pub fingerprint: String,
+    pub finding_id: String,
+}
+
+/// The report row of an [`IssueChain`]: its id, state and report object.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ChainReport {
+    pub report_id: String,
+    pub state: String,
+    pub path: String,
+    pub sha256: String,
+}
+
+/// What [`verify_chain`] found, each true when it holds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ChainCheck {
+    /// The report object's bytes hash to its name.
+    pub report_digest: bool,
+    /// The report names the Issue's finding.
+    pub finding_present: bool,
+    /// The report's raw_session is the registered raw artifact, whose bytes hash to its digest.
+    pub raw_digest: bool,
+    /// The report's native_attempt is the registered native artifact, whose bytes hash to its digest.
+    pub native_digest: bool,
+    /// The native attempt's session_ids hold the report's session.
+    pub session_in_native: bool,
+    /// The native attempt's stdout_sha256 is the raw session's digest.
+    pub stdout_is_raw: bool,
+}
+
+impl ChainCheck {
+    /// Every link holds.
+    pub fn holds(&self) -> bool {
+        self.report_digest
+            && self.finding_present
+            && self.raw_digest
+            && self.native_digest
+            && self.session_in_native
+            && self.stdout_is_raw
+    }
+}
+
+/// Check `chain` against the objects of the project at `project` (docs/adr/ADR-029.md decision 15): the report object
+/// read by its name (`objects::get` recomputes its digest), its finding, its raw_session and native_attempt references
+/// equal to the registered artifacts and their bytes recomputed, the native attempt's session_ids holding the report's
+/// session and its stdout_sha256 the raw session's digest. Reads objects; writes nothing.
+pub fn verify_chain(project: &std::path::Path, chain: &IssueChain) -> ChainCheck {
+    let mut check = ChainCheck::default();
+    let report_at = ObjectRef {
+        path: chain.report.path.clone(),
+        sha256: chain.report.sha256.clone(),
+    };
+    let Some(report) =
+        bytes_of(project, &report_at).and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+    else {
+        return check;
+    };
+    check.report_digest = true;
+    check.finding_present = report["findings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|f| f["id"] == json!(chain.issue.finding_id));
+    let named = |r: &ObjectRef| json!({"path": r.path, "sha256": r.sha256});
+    check.raw_digest =
+        report["raw_session"] == named(&chain.raw) && bytes_of(project, &chain.raw).is_some();
+    let native = chain
+        .native
+        .as_ref()
+        .filter(|n| report["native_attempt"] == named(n))
+        .and_then(|n| bytes_of(project, n))
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+    if let Some(native) = native {
+        check.native_digest = true;
+        check.session_in_native = report["session_id"].is_string()
+            && native["session_ids"]
+                .as_array()
+                .is_some_and(|ids| ids.contains(&report["session_id"]));
+        check.stdout_is_raw =
+            check.raw_digest && native["stdout_sha256"] == json!(chain.raw.sha256);
+    }
+    check
+}
+
+/// The bytes of the object `at` names, if they hash to its digest: read by its name when it is kept as an object
+/// (`objects::get` recomputes it), else from its path under the project (a raw log kept in place).
+fn bytes_of(project: &std::path::Path, at: &ObjectRef) -> Option<Vec<u8>> {
+    let bytes = if at.path == crate::objects::relative_path(&at.sha256) {
+        crate::objects::get(project, &at.sha256).ok()?
+    } else {
+        crate::objects::read_regular(&project.join(&at.path)).ok()?
+    };
+    (crate::context::sha256_hex(&bytes) == at.sha256).then_some(bytes)
 }
 
 #[cfg(test)]

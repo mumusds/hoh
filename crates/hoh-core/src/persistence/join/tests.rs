@@ -62,7 +62,7 @@ fn iterations(path: &Path, candidate: &str) -> R<Vec<String>> {
 
 /// Every READY verifier task dispatched and started (eight reader slots: no round waits for another's), each attempt's
 /// delivery recorded as the executor records it from the store's assignment (`context.packed` `confirm_ids`).
-async fn start_all(store: &Store, path: &Path) -> R {
+pub(in crate::persistence) async fn start_all(store: &Store, path: &Path) -> R {
     let context = crate::decision::Context {
         reader_slots: Some(8),
         ..verifiers()
@@ -105,7 +105,7 @@ async fn start_all(store: &Store, path: &Path) -> R {
 }
 
 /// Round `round`'s latest qa and reviewer attempts.
-fn attempts_of(path: &Path, round: &str) -> R<(String, String)> {
+pub(in crate::persistence) fn attempts_of(path: &Path, round: &str) -> R<(String, String)> {
     let of = |role: &str| {
         one(
             path,
@@ -120,7 +120,7 @@ fn attempts_of(path: &Path, round: &str) -> R<(String, String)> {
 
 /// Round `round`'s verifiers (started) settled: QA's PASS evidence of `acs` on `candidate` as `record` (its rows
 /// written at the round's close), then the reports `qa` and `review`.
-async fn verify(
+pub(in crate::persistence) async fn verify(
     store: &Store,
     path: &Path,
     (round, candidate, record): (&str, &str, &str),
@@ -184,7 +184,10 @@ fn late_row(path: &Path, (attempt, candidate, record): (&str, &str, &str), statu
 }
 
 /// C with D's round 1 and E's round 2 (the same content), every verifier started.
-async fn two_sources(store: &Store, path: &Path) -> R<(String, String, String)> {
+pub(in crate::persistence) async fn two_sources(
+    store: &Store,
+    path: &Path,
+) -> R<(String, String, String)> {
     let c = freeze_d(store, path, 0, 'b').await?;
     assert_eq!(complete_e(store, path, "AE", 'b').await?, c);
     start_all(store, path).await?;
@@ -615,6 +618,34 @@ async fn a_join_that_sees_an_inconclusive_check_verifies_each_chain_again_counte
             .to_owned(),
     );
     let (qa_d, _) = attempts_of(&path, &rd)?;
+    // The join's reverification tells each chain's verifiers to run `e2e` again, with its latest reason, and QA alone
+    // every in-scope AC's scenario check (decision 4, -154, -261, -359).
+    let (_, reviewer_e) = attempts_of(&path, &re)?;
+    let conn = Connection::open(&path)?;
+    let rerun_e2e = "本轮须重跑检查 e2e：它在候选上为 UNKNOWN（最近的原因：TIMED_OUT）";
+    let qa_rerun = "本轮须重跑范围内每个 AC 的场景检查：轮次只看本轮的证据";
+    for (round, attempt, role, told_all) in [
+        (&rd, &qa_d, "qa", true),
+        (&re, &reviewer_e, "reviewer", false),
+    ] {
+        let scope = crate::persistence::team::assignment(
+            &conn,
+            "p1",
+            "R",
+            &child_id(round, &format!("task/{role}")),
+            attempt,
+            role,
+        )?
+        .context
+        .ok_or("a verifier has a context")?
+        .scope;
+        assert!(scope.iter().any(|l| l == rerun_e2e), "{role}: {scope:?}");
+        assert_eq!(
+            scope.iter().any(|l| l == qa_rerun),
+            told_all,
+            "{role}: {scope:?}"
+        );
+    }
     evidence_of(&path, (&qa_d, &c, "rec-e2e-2"), ("e2e", "PASS"), &[], true)?;
     verify(
         &store,
