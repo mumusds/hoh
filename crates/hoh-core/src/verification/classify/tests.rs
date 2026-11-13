@@ -38,15 +38,34 @@ fn an_acs_projection_covers_every_acceptance_status() {
 }
 
 #[test]
-fn of_ac_054_05s_ninety_six_combinations_only_one_is_passable() {
-    // AC-054-05's dimensions mapped (docs/adr/ADR-028.md decision 11): QA and Review are the current round's reports,
-    // the deterministic checks one of three, the coverage every AC satisfied or one undetermined.
+fn test_054_05_only_one_of_ninety_six_combinations_is_accepted() {
+    // AC-054-05 (docs/adr/ADR-028.md decision 11, docs/adr/ADR-029.md decisions 4 and 11): QA and Review in {PASS,
+    // FAIL, UNKNOWN, NOT_RUN}, the deterministic checks as the check dimension produces them from {all valid PASS, one
+    // FAIL, an empty list}, the coverage full or one AC missing: only (PASS, PASS, all PASS, full) is passable (the
+    // join's ACCEPTED); every combination with UNKNOWN, every Review PASS beside a failed check and every empty check
+    // list is not.
+    use crate::verification::acceptance::{CheckRun, checks};
+    let run = |outcome: &str| CheckRun {
+        check_id: format!("c-{outcome}"),
+        outcome: outcome.to_owned(),
+        reason: None,
+        fail_lines: false,
+    };
+    let dimensions = [
+        ("all valid PASS", checks(&[run("PASS")])),
+        ("one FAIL", checks(&[run("PASS"), run("FAIL")])),
+        ("empty", checks(&[])),
+    ];
+    assert_eq!(
+        dimensions.map(|(_, c)| c),
+        [Checks::Passed, Checks::Failed, Checks::Inconclusive]
+    );
     let reports = [Report::Pass, Report::Fail, Report::Unknown, Report::NotRun];
-    let checks = [Checks::Passed, Checks::Failed, Checks::Inconclusive];
     let mut passable = Vec::new();
+    let mut table = Vec::new();
     for qa in reports {
         for review in reports {
-            for c in checks {
+            for (name, c) in dimensions {
                 for full in [true, false] {
                     let acs = if full {
                         vec![Ac::Satisfied, Ac::Satisfied]
@@ -69,14 +88,30 @@ fn of_ac_054_05s_ninety_six_combinations_only_one_is_passable() {
                     let any_fail =
                         qa == Report::Fail || review == Report::Fail || c == Checks::Failed;
                     assert_eq!(class == Class::Failed, any_fail, "{input:?}");
+                    if qa == Report::Unknown || review == Report::Unknown {
+                        assert_ne!(class, Class::Passable, "UNKNOWN: {input:?}");
+                    }
+                    if review == Report::Pass && c == Checks::Failed {
+                        assert_ne!(
+                            class,
+                            Class::Passable,
+                            "Review PASS beside a failed check: {input:?}"
+                        );
+                    }
+                    if name == "empty" {
+                        assert_ne!(class, Class::Passable, "an empty check list: {input:?}");
+                    }
+                    table.push(format!("{qa:?},{review:?},{name},{full},{class:?}"));
                 }
             }
         }
     }
+    assert_eq!(table.len(), 96);
     assert_eq!(
         passable,
         [(Report::Pass, Report::Pass, Checks::Passed, true)]
     );
+    println!("{}", table.join("\n"));
 }
 
 #[test]
