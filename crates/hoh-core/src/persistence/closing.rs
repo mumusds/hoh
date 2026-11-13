@@ -15,20 +15,13 @@ use super::{PersistError, sqlite_error};
 use crate::ids::child_id;
 use crate::lifecycle::Lifecycle as _;
 use crate::protocol::TaskState;
-use crate::verification::classify::{self, Ac, Checks, Class, Report, Row};
+use crate::verification::acceptance;
+use crate::verification::classify::{self, Ac, Class, Report, Row};
 use rusqlite::{OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The outcome reasons a FAIL is no conclusion with (decision 11's inconclusive set).
-const INCONCLUSIVE: [&str; 5] = [
-    "TIMED_OUT",
-    "NOT_STARTED",
-    "INTERRUPTED",
-    "INCOMPLETE",
-    "PLUGINS_MISSING",
-];
-
 /// What one reconcile did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Reconciled {
@@ -176,6 +169,8 @@ struct Evidence {
     reasons: Vec<String>,
     rows: Vec<Value>,
     deferred: bool,
+    /// Whether its observations have a FAIL result line (docs/adr/ADR-029.md decision 4).
+    fail_lines: bool,
 }
 
 /// The planned-check evidence (kind `check`, never an attempt-level marker record) of `attempts`.
@@ -212,6 +207,9 @@ fn evidence(tx: &Transaction<'_>, attempts: &[String]) -> Result<Vec<Evidence>, 
                 reasons: strings(&p["reasons"]),
                 rows: p["rows"].as_array().cloned().unwrap_or_default(),
                 deferred: p["deferred_rows"] == json!(true),
+                fail_lines: p["observations"]
+                    .as_array()
+                    .is_some_and(|o| o.iter().any(|line| line["status"] == json!("FAIL"))),
             });
         }
     }
@@ -775,24 +773,18 @@ fn classify_round(
             ));
         }
     }
-    let conclusive_fail = |e: &Evidence| {
-        e.outcome == "FAIL"
-            && !e
-                .reason
-                .as_deref()
-                .is_some_and(|r| INCONCLUSIVE.contains(&r))
-    };
-    let checks = if evidence.iter().any(conclusive_fail) {
-        Checks::Failed
-    } else if !evidence.is_empty()
-        && evidence
-            .iter()
-            .all(|e| matches!(e.outcome.as_str(), "PASS" | "DEGRADED"))
-    {
-        Checks::Passed
-    } else {
-        Checks::Inconclusive
-    };
+    // The check dimension and the check failures from one judgement over the round's own evidence (docs/adr/ADR-029.md
+    // decision 4, M2T18D-100, -151): a check is judged on all its runs in the round.
+    let runs: Vec<acceptance::CheckRun> = evidence
+        .iter()
+        .map(|e| acceptance::CheckRun {
+            check_id: e.check_id.clone(),
+            outcome: e.outcome.clone(),
+            reason: e.reason.clone(),
+            fail_lines: e.fail_lines,
+        })
+        .collect();
+    let checks = acceptance::checks(&runs);
     // The rows of each in-scope AC on the candidate: those that existed when the round opened and the round's own
     // (a sibling's later rows are its own to judge, I2, -754). A row exists from its publication: a round's deferred
     // rows when that round closed (its `published`), the others with their evidence (M2T16R-04).
@@ -862,17 +854,16 @@ fn classify_round(
                 }
             }
         }
-        // A check's failure no FAIL row of it locates (a build, say): every source's (decision 12, M2T16R-05).
-        let located = e.rows.iter().any(|row| row["status"] == json!("FAIL"));
-        if conclusive_fail(e) && !located {
-            failed.push((
-                None,
-                format!(
-                    "check-fail:{}:{}",
-                    e.check_id,
-                    e.reason.as_deref().unwrap_or("")
-                ),
-            ));
+    }
+    // A failing check no FAIL row of its evidence locates (a build, say, or FAIL lines of an unmapped TEST): every
+    // source's (ADR-028 decision 12, M2T16R-05), from the same judgement as the dimension (ADR-029 decision 4).
+    for (check, reason) in acceptance::check_failures(&runs) {
+        let located = evidence
+            .iter()
+            .filter(|e| e.check_id == check)
+            .any(|e| e.rows.iter().any(|row| row["status"] == json!("FAIL")));
+        if !located {
+            failed.push((None, format!("check-fail:{check}:{reason}")));
         }
     }
     Ok((
