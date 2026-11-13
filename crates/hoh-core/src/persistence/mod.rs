@@ -30,6 +30,7 @@ mod outbox;
 mod outputs;
 mod plan;
 mod reconcile;
+mod reports;
 mod results;
 mod retry;
 mod rounds;
@@ -50,6 +51,7 @@ pub use leases::{Grant, LEASE_TTL, LeaseView};
 pub use outbox::{ConsumeEffect, Consumed, OutboxRow, Settlement, backoff};
 pub use plan::Imported;
 pub use reconcile::{EffectRow, UnfinishedRow};
+pub use reports::{IntakeState, ReportIntake, ReportState};
 pub use results::{TaskResultOutcome, VERIFIERS};
 pub use retry::{Failure, Paced, Repair, RepairRequest, RepairVerdict};
 pub use rounds::{Dispatched, RoundOutcome};
@@ -1426,6 +1428,13 @@ impl Store {
         completion: VerifierCompletion,
     ) -> Result<VerifierCompleted, PersistError> {
         self.writer.complete_verifier_attempt(completion).await
+    }
+
+    /// Take a verifier's report in, in a transaction of its own (docs/adr/ADR-029.md decision 7): judged and kept as an
+    /// `independent_reports` row CURRENT, STALE or REJECTED (`report.rejected`), or no row when its session is unknown;
+    /// no task or attempt moves. A verifier's completion takes its report in within its own commit.
+    pub async fn record_report(&self, intake: ReportIntake) -> Result<IntakeState, PersistError> {
+        self.writer.record_report(intake).await
     }
 
     /// Answer a verifier's request through its bridge (docs/adr/ADR-028.md decision 13): a change request refused with

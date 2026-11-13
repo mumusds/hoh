@@ -188,6 +188,11 @@ enum Job {
         Box<super::completion::VerifierCompletion>,
         oneshot::Sender<Result<super::completion::VerifierCompleted, PersistError>>,
     ),
+    /// A verifier's report taken in on its own ([`super::reports::record`]).
+    Report(
+        Box<super::reports::ReportIntake>,
+        oneshot::Sender<Result<super::reports::IntakeState, PersistError>>,
+    ),
     /// A verifier's request the Runtime answers ([`super::verification::request`]).
     Request(
         Box<super::verification::VerifierRequest>,
@@ -397,6 +402,7 @@ impl Job {
             Job::Recovery(..) => "Recovery",
             Job::Evidence(..) => "Evidence",
             Job::Amend(..) => "Amend",
+            Job::Report(..) => "Report",
             Job::Plan(..) => "Plan",
             Job::Round(..) => "Round",
             Job::Reconcile(..) => "Reconcile",
@@ -597,6 +603,13 @@ impl Writer {
                                 &ctx,
                                 reply,
                                 super::completion::complete_verifier(&mut conn, &job, &ctx),
+                            ));
+                        }
+                        Job::Report(job, reply) => {
+                            deferred = Some(answer(
+                                &ctx,
+                                reply,
+                                super::reports::record(&mut conn, &job, &ctx),
                             ));
                         }
                         Job::Request(job, reply) => {
@@ -864,6 +877,13 @@ impl Writer {
     ) -> Result<super::completion::VerifierCompleted, PersistError> {
         self.submit(|tx| Job::VerifierCompletion(Box::new(completion), tx))
             .await
+    }
+
+    pub(super) async fn record_report(
+        &self,
+        intake: super::reports::ReportIntake,
+    ) -> Result<super::reports::IntakeState, PersistError> {
+        self.submit(|tx| Job::Report(Box::new(intake), tx)).await
     }
 
     pub(super) async fn verifier_request(

@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
-type R<T = ()> = Result<T, Box<dyn std::error::Error>>;
+pub(in crate::persistence) type R<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 /// Run R on specification s1 (whose sha256 is the freeze's spec object), developer task D RUNNING with attempt A holding
 /// the write lease, its requirement REQ-1 with one criterion, and the qa and reviewer roles bound.
@@ -34,7 +34,7 @@ INSERT INTO attempts(attempt_id, task_id, session_id, state, role_epoch, host_ep
 INSERT INTO leases(project_id, kind, attempt_id, epoch, expires_at) VALUES ('p1', 'writer', 'A', 1, '2100-01-01T00:00:00Z');
 ";
 
-fn open(dir: &Path) -> R<(Store, PathBuf)> {
+pub(in crate::persistence) fn open(dir: &Path) -> R<(Store, PathBuf)> {
     let path = dir.join(".hoh/state.db");
     let options = Options {
         wal_probe: Some(selftest::test_probe(None)),
@@ -45,7 +45,7 @@ fn open(dir: &Path) -> R<(Store, PathBuf)> {
     Ok((store, path))
 }
 
-fn texts(path: &Path, sql: &str) -> R<Vec<String>> {
+pub(in crate::persistence) fn texts(path: &Path, sql: &str) -> R<Vec<String>> {
     let conn = Connection::open(path)?;
     let mut statement = conn.prepare(sql)?;
     let rows = statement
@@ -65,7 +65,7 @@ fn released(path: &Path) -> R<&'static str> {
     })
 }
 
-fn object(n: u8, kind: &str, name: &str) -> ArtifactRow {
+pub(in crate::persistence) fn object(n: u8, kind: &str, name: &str) -> ArtifactRow {
     let sha256: String = format!("{n:x}").repeat(64).chars().take(64).collect();
     ArtifactRow {
         path: format!(".hoh/objects/sha256/{}/{sha256}", &sha256[..2]),
@@ -78,7 +78,7 @@ fn object(n: u8, kind: &str, name: &str) -> ArtifactRow {
 }
 
 /// A freeze of tree `tree` for run R: spec, environment and test plan kept as objects 1, 2 and 3, the export as 9.
-fn freeze_of(tree: char) -> Freeze {
+pub(in crate::persistence) fn freeze_of(tree: char) -> Freeze {
     let file = |path: &str, n: u8| FileRef {
         path: path.to_owned(),
         sha256: object(n, "", "").sha256,
@@ -104,7 +104,7 @@ fn freeze_of(tree: char) -> Freeze {
     }
 }
 
-fn result(candidate_id: Option<&str>) -> R<TaskResult> {
+pub(in crate::persistence) fn result(candidate_id: Option<&str>) -> R<TaskResult> {
     Ok(serde_json::from_value(json!({
         "schema_version": "1.0", "run_id": "R", "task_id": "D", "attempt_id": "A", "role": "developer",
         "role_epoch": 1, "status": "COMPLETED", "summary": "done", "candidate_id": candidate_id, "evidence": [],
@@ -112,7 +112,7 @@ fn result(candidate_id: Option<&str>) -> R<TaskResult> {
     }))?)
 }
 
-fn ending() -> Ending {
+pub(in crate::persistence) fn ending() -> Ending {
     Ending {
         success: true,
         detail: "turn".to_owned(),
@@ -124,7 +124,7 @@ fn ending() -> Ending {
     }
 }
 
-fn completion(outcome: WriterOutcome) -> WriterCompletion {
+pub(in crate::persistence) fn completion(outcome: WriterOutcome) -> WriterCompletion {
     WriterCompletion {
         attempt_id: "A".to_owned(),
         ending: ending(),
@@ -132,7 +132,7 @@ fn completion(outcome: WriterOutcome) -> WriterCompletion {
     }
 }
 
-fn freeze(job: Freeze, result: TaskResult) -> WriterOutcome {
+pub(in crate::persistence) fn freeze(job: Freeze, result: TaskResult) -> WriterOutcome {
     WriterOutcome::Freeze {
         job: Box::new(job),
         result: Box::new(result),
@@ -556,7 +556,7 @@ async fn only_a_completion_handed_to_verification_records_its_task_implemented()
 }
 
 /// Developer task `task` of run R RUNNING with attempt `attempt`, its requirement REQ-2 (criterion AC-2-01).
-fn second_writer(path: &Path, task: &str, attempt: &str) -> R {
+pub(in crate::persistence) fn second_writer(path: &Path, task: &str, attempt: &str) -> R {
     Connection::open(path)?.execute_batch(&format!(
         "INSERT OR IGNORE INTO requirements(requirement_id, spec_id, title, required_release) VALUES ('REQ-2', 's1', 'r2', 1);
          INSERT OR IGNORE INTO acceptance_criteria(ac_id, requirement_id, spec_id, body, check_id) VALUES
@@ -571,7 +571,7 @@ fn second_writer(path: &Path, task: &str, attempt: &str) -> R {
 }
 
 /// [`result`] of task `task`'s attempt `attempt`.
-fn result_of(task: &str, attempt: &str) -> R<TaskResult> {
+pub(in crate::persistence) fn result_of(task: &str, attempt: &str) -> R<TaskResult> {
     let mut result = result(None)?;
     (result.task_id, result.attempt_id) = (task.to_owned(), attempt.to_owned());
     Ok(result)
@@ -765,7 +765,7 @@ async fn the_same_content_under_verification_gets_a_new_round_for_the_completing
 }
 
 /// The scheduling round's context for run R: qa and reviewer need no capability, at the completion's time.
-fn verifiers() -> crate::decision::Context {
+pub(in crate::persistence) fn verifiers() -> crate::decision::Context {
     crate::decision::Context {
         required_capabilities: [
             ("qa".to_owned(), Default::default()),
@@ -778,7 +778,7 @@ fn verifiers() -> crate::decision::Context {
 }
 
 /// D completed into C1's round 1; the round's id.
-async fn verifying(store: &Store) -> R<String> {
+pub(in crate::persistence) async fn verifying(store: &Store) -> R<String> {
     let job = freeze_of('b');
     let c1 = job.sealed.candidate_id.clone();
     store
@@ -1228,7 +1228,10 @@ async fn a_writer_whose_criteria_an_open_round_with_an_open_issue_covers_waits_f
 }
 
 /// C1's round 1 with its qa verifier's attempt RUNNING (dispatched, then started): the round, the task, the attempt.
-async fn verifier_running(store: &Store, path: &Path) -> R<(String, String, String)> {
+pub(in crate::persistence) async fn verifier_running(
+    store: &Store,
+    path: &Path,
+) -> R<(String, String, String)> {
     let round = verifying(store).await?;
     let d = store
         .schedule_round("R", verifiers())
@@ -1246,7 +1249,80 @@ async fn verifier_running(store: &Store, path: &Path) -> R<(String, String, Stri
     Ok((round, d.task_id, d.attempt_id))
 }
 
-fn verifier_completion(attempt: &str, outcome: VerifierOutcome) -> VerifierCompletion {
+/// Three objects no other object of the test has (a report, a native attempt, a raw session log), by the number of
+/// artifacts registered so far.
+pub(in crate::persistence) fn fresh_objects(path: &Path) -> R<[ArtifactRow; 3]> {
+    let n = texts(path, "SELECT artifact_id FROM artifacts")?.len();
+    let row = |offset: usize, kind: &str, name: &str| {
+        let sha256 = format!("{:064x}", 0xfeed_0000 + n + offset);
+        ArtifactRow {
+            path: format!(".hoh/objects/sha256/{}/{sha256}", &sha256[..2]),
+            sha256,
+            bytes: 10,
+            mime: "application/json".to_owned(),
+            kind: kind.to_owned(),
+            name: name.to_owned(),
+        }
+    };
+    Ok([
+        row(0, "independent_report", "report.json"),
+        row(1, "native_attempt", "attempt.json"),
+        row(2, "raw_log", "stdout.jsonl"),
+    ])
+}
+
+/// A report `status` by `role` of verifier attempt `attempt` consistent with it (docs/adr/ADR-029.md decision 7): its
+/// HoH session (`attempts.session_id`), its round's candidate and that candidate's spec, the objects `[report, native
+/// attempt, raw session]` and references to them, its native sessions [its session], COMPLETED.
+pub(in crate::persistence) fn consistent(
+    path: &Path,
+    attempt: &str,
+    (role, status): (&str, &str),
+    [report, native_attempt, raw_session]: [ArtifactRow; 3],
+) -> R<VerifierReport> {
+    let one = |sql: &str| -> R<String> {
+        Ok(Connection::open(path)?.query_row(sql, rusqlite::params![attempt], |r| r.get(0))?)
+    };
+    let session = one("SELECT session_id FROM attempts WHERE attempt_id = ?1")?;
+    let candidate = one(
+        "SELECT json_extract(e.payload_json, '$.candidate_id') FROM events e JOIN attempts a ON a.attempt_id = ?1 \
+         WHERE e.kind = 'verification.round_opened' AND a.task_id IN \
+         (json_extract(e.payload_json, '$.tasks.qa'), json_extract(e.payload_json, '$.tasks.reviewer'))",
+    )?;
+    let spec: String = Connection::open(path)?.query_row(
+        "SELECT spec_sha256 FROM candidates WHERE candidate_id = ?1",
+        rusqlite::params![candidate],
+        |r| r.get(0),
+    )?;
+    let reference = |a: &ArtifactRow| crate::verification::report::ObjectRef {
+        path: a.path.clone(),
+        sha256: a.sha256.clone(),
+    };
+    let report_json = crate::verification::report::build(
+        &json!({"status": status, "scope": ["AC-1-01"], "findings": []}),
+        role,
+        &session,
+        (&candidate, &spec),
+        &reference(&raw_session),
+        &reference(&native_attempt),
+    )?;
+    Ok(VerifierReport {
+        role: role.to_owned(),
+        status: status.to_owned(),
+        findings: Vec::new(),
+        report,
+        native_attempt,
+        report_json,
+        raw_session,
+        native_session_ids: vec![session],
+        native_status: "COMPLETED".to_owned(),
+    })
+}
+
+pub(in crate::persistence) fn verifier_completion(
+    attempt: &str,
+    outcome: VerifierOutcome,
+) -> VerifierCompletion {
     VerifierCompletion {
         attempt_id: attempt.to_owned(),
         ending: ending(),
@@ -1264,13 +1340,16 @@ async fn a_verifiers_completed_result_settles_it_and_its_task_is_done() -> R {
         .complete_verifier_attempt(verifier_completion(
             &attempt,
             VerifierOutcome::Settle {
-                report: Box::new(VerifierReport {
-                    role: "qa".to_owned(),
-                    status: "PASS".to_owned(),
-                    findings: Vec::new(),
-                    report: object(7, "independent_report", "report.json"),
-                    native_attempt: object(8, "native_attempt", "attempt.json"),
-                }),
+                report: Box::new(consistent(
+                    &path,
+                    &attempt,
+                    ("qa", "PASS"),
+                    [
+                        object(7, "independent_report", "report.json"),
+                        object(8, "native_attempt", "attempt.json"),
+                        object(6, "raw_log", "stdout.jsonl"),
+                    ],
+                )?),
             },
         ))
         .await?;
@@ -1514,33 +1593,18 @@ async fn settle_verifiers(store: &Store, path: &Path, qa: &str, review: &str) ->
         attempts.push((role.to_owned(), status.to_owned(), d.attempt_id));
     }
     for (role, status, attempt) in &attempts {
-        // Report objects of their own: a digest no other object of the test has.
-        let unique = |kind: &str, name: &str| -> R<ArtifactRow> {
-            let n = texts(path, "SELECT artifact_id FROM artifacts")?.len();
-            let sha256 = format!(
-                "{:064x}",
-                0xfeed_0000 + n + usize::from(kind == "native_attempt")
-            );
-            Ok(ArtifactRow {
-                path: format!(".hoh/objects/sha256/{}/{sha256}", &sha256[..2]),
-                sha256,
-                bytes: 10,
-                mime: "application/json".to_owned(),
-                kind: kind.to_owned(),
-                name: name.to_owned(),
-            })
-        };
+        // Report objects of their own (a digest no other object of the test has), the report consistent with its
+        // attempt (docs/adr/ADR-029.md decision 7).
         store
             .complete_verifier_attempt(verifier_completion(
                 attempt,
                 VerifierOutcome::Settle {
-                    report: Box::new(VerifierReport {
-                        role: role.clone(),
-                        status: status.clone(),
-                        findings: Vec::new(),
-                        report: unique("independent_report", "report.json")?,
-                        native_attempt: unique("native_attempt", "attempt.json")?,
-                    }),
+                    report: Box::new(consistent(
+                        path,
+                        attempt,
+                        (role, status),
+                        fresh_objects(path)?,
+                    )?),
                 },
             ))
             .await?;

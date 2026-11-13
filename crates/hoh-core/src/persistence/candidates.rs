@@ -143,6 +143,18 @@ pub(super) fn freeze_in(tx: &Transaction<'_>, job: &Freeze) -> Result<Frozen, Pe
         ],
     )
     .map_err(sqlite_error)?;
+    // Every other candidate of the run is now superseded for its reports (docs/adr/ADR-029.md decision 8): their
+    // CURRENT reports STALE in this transaction.
+    let others: Vec<String> = {
+        let mut statement = tx
+            .prepare("SELECT candidate_id FROM candidates WHERE run_id = ?1 AND candidate_id <> ?2 ORDER BY candidate_id")
+            .map_err(sqlite_error)?;
+        let rows = statement
+            .query_map(params![job.run_id, id], |r| r.get(0))
+            .map_err(sqlite_error)?;
+        rows.collect::<Result<_, _>>().map_err(sqlite_error)?
+    };
+    super::reports::stale_reports(tx, &job.run_id, &others, "superseded", id)?;
     Ok(Frozen::New {
         candidate_id: id.clone(),
         superseded,

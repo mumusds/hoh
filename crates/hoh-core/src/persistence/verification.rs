@@ -509,18 +509,6 @@ pub(super) fn admit(
         .into_iter()
         .find(|r| opened["tasks"][r] == json!(task_id))
         .ok_or_else(|| PersistError::IntegrityViolation(format!("round {round_id}: {task_id}")))?;
-    let other = super::results::VERIFIERS
-        .into_iter()
-        .find(|r| *r != role)
-        .unwrap_or(role);
-    let sources: Vec<String> = opened["source_task_ids"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|s| s.as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default();
     // Its round's current handoff: the original, or the latest issued again.
     let original = child_id(&round_id, &format!("verify/{role}"));
     let current: Option<String> = tx
@@ -551,9 +539,11 @@ pub(super) fn admit(
                 task_id,
                 revision,
                 round_id: &round_id,
+                cause: "dispatch-refused",
                 reason,
                 detail,
                 invalid: invalid.map(|violations| (handoff.as_str(), role, violations)),
+                facts: serde_json::Value::Null,
             },
         )
         .map(|()| Some(Admission::Refused))
@@ -574,36 +564,14 @@ pub(super) fn admit(
             );
         }
     };
-    // A session of its own (decision 10).
-    let mut others: Vec<String> = Vec::new();
-    for source in &sources {
-        let mut statement = tx
-            .prepare("SELECT DISTINCT session_id FROM attempts WHERE task_id = ?1 AND session_id IS NOT NULL")
-            .map_err(sqlite_error)?;
-        let rows = statement
-            .query_map(params![source], |r| r.get::<_, String>(0))
-            .map_err(sqlite_error)?;
-        for row in rows {
-            others.push(row.map_err(sqlite_error)?);
-        }
-    }
-    for bound in ["commander", other] {
-        let session: Option<Option<String>> = tx
-            .query_row(
-                "SELECT session_id FROM role_bindings WHERE run_id = ?1 AND role = ?2",
-                params![run_id, bound],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(sqlite_error)?;
-        others.extend(session.flatten());
-    }
-    if let Some(session) = session.filter(|s| others.iter().any(|o| o == s)) {
+    // A session of its own (decision 10; docs/adr/ADR-029.md decision 7a, the predicate the report's intake applies).
+    let others = conflicting_sessions(tx, run_id, &round_id, role)?;
+    if let Some(session) = session.filter(|s| others.contains(*s)) {
         return refuse(
             "SESSION_NOT_INDEPENDENT",
             format!(
-                "the {role} would verify in session {session}, which a source attempt, the Commander or the other \
-                 verifier uses"
+                "the {role} would verify in session {session}, which a source attempt, the Commander, the Developer \
+                 or the other verifier uses"
             ),
             None,
         );
@@ -663,22 +631,57 @@ pub(super) fn admit(
     }))
 }
 
-/// A verifier task's dispatch refused.
-struct Refusal<'a> {
-    project_id: &'a str,
-    run_id: &'a str,
-    task_id: &'a str,
-    revision: i64,
-    round_id: &'a str,
-    reason: &'a str,
-    detail: String,
-    /// An invalid handoff: its id, the role it is for, and what is wrong with it.
-    invalid: Option<(&'a str, &'a str, &'a str)>,
+/// The sessions verifier role `role` of round `round_id` of run `run_id` may not use (docs/adr/ADR-029.md decision
+/// 7a; one predicate for the dispatch and the report's intake): those of every attempt of the round's source tasks,
+/// the commander's, the developer's and the other verifier role's bindings now, and those of every attempt of the
+/// round's other verifier task.
+pub(super) fn conflicting_sessions(
+    tx: &rusqlite::Connection,
+    run_id: &str,
+    round_id: &str,
+    role: &str,
+) -> Result<std::collections::BTreeSet<String>, PersistError> {
+    let other = super::results::VERIFIERS
+        .into_iter()
+        .find(|r| *r != role)
+        .unwrap_or(role);
+    let mut statement = tx
+        .prepare(
+            "WITH round AS (SELECT payload_json AS p FROM events WHERE kind = ?1 AND run_id = ?2 \
+               AND json_extract(payload_json, '$.round_id') = ?3) \
+             SELECT a.session_id FROM attempts a, round WHERE a.session_id IS NOT NULL \
+               AND (a.task_id IN (SELECT s.value FROM json_each(round.p, '$.source_task_ids') s) \
+                 OR a.task_id = json_extract(round.p, '$.tasks.' || ?4)) \
+             UNION SELECT b.session_id FROM role_bindings b WHERE b.run_id = ?2 AND b.session_id IS NOT NULL \
+               AND b.role IN ('commander', 'developer', ?4)",
+        )
+        .map_err(sqlite_error)?;
+    let rows = statement
+        .query_map(params![ROUND_OPENED, run_id, round_id, other], |r| r.get(0))
+        .map_err(sqlite_error)?;
+    rows.collect::<Result<_, _>>().map_err(sqlite_error)
 }
 
-/// Write refusal `r`: the task READY -> BLOCKED (NEED_DECISION) with `need_decision` and `integrity_violation`; an
-/// invalid handoff also `message.invalid` and DEAD_LETTER.
-fn refuse(
+/// A verifier task refused: its dispatch, or its report at its intake (docs/adr/ADR-029.md decision 7).
+pub(super) struct Refusal<'a> {
+    pub project_id: &'a str,
+    pub run_id: &'a str,
+    pub task_id: &'a str,
+    pub revision: i64,
+    pub round_id: &'a str,
+    /// What refused it, naming its events with the task's revision: `dispatch-refused` or `report-rejected`.
+    pub cause: &'a str,
+    pub reason: &'a str,
+    pub detail: String,
+    /// An invalid handoff: its id, the role it is for, and what is wrong with it.
+    pub invalid: Option<(&'a str, &'a str, &'a str)>,
+    /// More of what the `integrity_violation` records (an object; `null` for none).
+    pub facts: serde_json::Value,
+}
+
+/// Write refusal `r`: the task (READY at its dispatch, RUNNING at its report's intake) -> BLOCKED (NEED_DECISION) with
+/// `need_decision` and `integrity_violation`; an invalid handoff also `message.invalid` and DEAD_LETTER.
+pub(super) fn refuse(
     tx: &Transaction<'_>,
     ctx: &super::writer::Ctx<'_>,
     r: &Refusal<'_>,
@@ -688,12 +691,7 @@ fn refuse(
         params![r.task_id],
     )
     .map_err(sqlite_error)?;
-    let key = |what: &str| {
-        child_id(
-            r.task_id,
-            &format!("dispatch-refused/{}/{what}", r.revision),
-        )
-    };
+    let key = |what: &str| child_id(r.task_id, &format!("{}/{}/{what}", r.cause, r.revision));
     let event = |event_id: String, kind: &str, payload: serde_json::Value| NewEvent {
         project_id: r.project_id.to_owned(),
         event_id,
@@ -714,11 +712,11 @@ fn refuse(
             json!({"message_id": message_id, "consumer": role, "violations": violations}),
         ));
     }
-    events.push(event(
-        key("integrity"),
-        "integrity_violation",
-        json!({"task_id": r.task_id, "round_id": r.round_id, "reason": r.reason, "detail": r.detail}),
-    ));
+    let mut integrity = json!({"task_id": r.task_id, "round_id": r.round_id, "reason": r.reason, "detail": r.detail});
+    for (key, value) in r.facts.as_object().into_iter().flatten() {
+        integrity[key] = value.clone();
+    }
+    events.push(event(key("integrity"), "integrity_violation", integrity));
     events.push(event(
         key("need_decision"),
         "need_decision",

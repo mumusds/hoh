@@ -157,7 +157,9 @@ pub enum VerifierOutcome {
     Reverify { status: String, reason: String },
 }
 
-/// A verifier's report kept as objects (docs/adr/ADR-028.md decision 15): its status and its two objects.
+/// A verifier's report kept as objects (docs/adr/ADR-028.md decision 15) as the host checked it (docs/adr/ADR-029.md
+/// decision 7): its status, the report, its objects and its native attempt's sessions and status, which the store
+/// judges at its intake.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifierReport {
     pub role: String,
@@ -167,6 +169,28 @@ pub struct VerifierReport {
     pub findings: Vec<String>,
     pub report: super::runner::ArtifactRow,
     pub native_attempt: super::runner::ArtifactRow,
+    /// The report as built (contracts/independent-report.schema.json).
+    pub report_json: serde_json::Value,
+    /// Its raw session log's object (the turn's stdout log).
+    pub raw_session: super::runner::ArtifactRow,
+    /// Its native attempt's `session_ids` and `status`, as the host read them from that object.
+    pub native_session_ids: Vec<String>,
+    pub native_status: String,
+}
+
+impl VerifierReport {
+    /// Its intake by attempt `attempt_id` (docs/adr/ADR-029.md decision 7).
+    pub fn intake(&self, attempt_id: &str) -> super::reports::ReportIntake {
+        super::reports::ReportIntake {
+            attempt_id: attempt_id.to_owned(),
+            report: self.report_json.clone(),
+            report_artifact: self.report.clone(),
+            raw_artifact: self.raw_session.clone(),
+            native_artifact: self.native_attempt.clone(),
+            native_session_ids: self.native_session_ids.clone(),
+            native_status: self.native_status.clone(),
+        }
+    }
 }
 
 /// A verifier attempt's completion.
@@ -181,8 +205,16 @@ pub struct VerifierCompletion {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerifierCompleted {
     Settled,
-    Corrected { verdict: RepairVerdict },
-    Reverified { verdict: RepairVerdict },
+    /// Settled with its report REJECTED (docs/adr/ADR-029.md decision 7): its task BLOCKED for a decision.
+    ReportRejected {
+        reasons: Vec<String>,
+    },
+    Corrected {
+        verdict: RepairVerdict,
+    },
+    Reverified {
+        verdict: RepairVerdict,
+    },
     AlreadyEnded,
     Cancelled,
 }
@@ -240,8 +272,9 @@ pub(super) fn complete_verifier(
     };
     let (done, status) = match &job.outcome {
         VerifierOutcome::Settle { report } => {
-            // Its report, kept and named for the round's classification (decision 15).
-            super::runner::register(&tx, &[report.report.clone(), report.native_attempt.clone()])?;
+            // Its report, judged and kept (docs/adr/ADR-029.md decision 7), and named for the round's classification
+            // (ADR-028 decision 15).
+            let intake = super::reports::intake_in(&tx, &report.intake(&job.attempt_id), ctx)?;
             writer::write(
                 &tx,
                 &Commit {
@@ -252,13 +285,42 @@ pub(super) fn complete_verifier(
                             "role": report.role, "status": report.status, "findings": report.findings,
                             "report": {"path": report.report.path, "sha256": report.report.sha256},
                             "native_attempt": {"path": report.native_attempt.path,
-                                "sha256": report.native_attempt.sha256}}),
+                                "sha256": report.native_attempt.sha256},
+                            "report_id": intake.report_id, "state": intake.state.as_str()}),
                     )],
                     ..Commit::default()
                 },
                 ctx,
             )?;
-            (VerifierCompleted::Settled, "COMPLETED".to_owned())
+            if intake.state == super::reports::ReportState::Rejected {
+                // The exit of a verifier dispatched in a session not its own (ADR-028 decision 10, M2T16D-361): the
+                // same session would only be refused again; its task waits for a decision (M2-T13's to clear).
+                super::verification::refuse(
+                    &tx,
+                    ctx,
+                    &super::verification::Refusal {
+                        project_id: &task.project_id,
+                        run_id: &task.run_id,
+                        task_id: &task.task_id,
+                        revision: task.revision,
+                        round_id: &round_id,
+                        cause: "report-rejected",
+                        reason: "report_rejected",
+                        detail: intake.reasons.join("; "),
+                        invalid: None,
+                        facts: json!({"attempt_id": job.attempt_id, "report_id": intake.report_id,
+                            "reasons": intake.reasons}),
+                    },
+                )?;
+                (
+                    VerifierCompleted::ReportRejected {
+                        reasons: intake.reasons,
+                    },
+                    "COMPLETED".to_owned(),
+                )
+            } else {
+                (VerifierCompleted::Settled, "COMPLETED".to_owned())
+            }
         }
         VerifierOutcome::Correct { reasons } => {
             writer::write(
@@ -701,4 +763,4 @@ fn chain_root(
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

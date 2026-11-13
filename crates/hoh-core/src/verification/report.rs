@@ -65,8 +65,14 @@ pub fn build(
         "spec_sha256": spec_sha256, "status": body["status"], "scope": body["scope"], "findings": body["findings"],
         "raw_session": reference(raw_session), "native_attempt": reference(native_attempt),
     }));
+    conforms(&report)?;
+    Ok(report)
+}
+
+/// Whether `report` is valid under contracts/independent-report.schema.json; why not, at its first violation.
+pub fn conforms(report: &Value) -> Result<(), String> {
     crate::schema::independent_report()
-        .validate(&report)
+        .validate(report)
         .map_err(|violations| {
             let first = violations.first();
             format!(
@@ -74,8 +80,84 @@ pub fn build(
                 first.map_or("/", |v| v.instance_path.as_str()),
                 first.map_or("", |v| v.message.as_str())
             )
-        })?;
-    Ok(report)
+        })
+}
+
+/// What the host's check of a report read from its objects (docs/adr/ADR-029.md decision 7): the report, and its
+/// native attempt's session ids and status, which the store judges (it reads no object).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Checked {
+    pub report: Value,
+    pub session_ids: Vec<String>,
+    pub status: String,
+}
+
+/// The host's check of a report before its commit (docs/adr/ADR-029.md decision 7): `report` and `native` are the bytes
+/// of its report and native attempt objects, `raw_sha256` the digest recomputed from its raw session object's bytes.
+/// The report is valid under the locked schema; its raw_session and native_attempt references name those digests; the
+/// native attempt is valid under its schema, its session_ids hold the report's session, its candidate and role are the
+/// report's and its stdout is the raw session; the report's finding ids are unique. Why not, at the first that fails:
+/// an output to correct. Whether the native sessions are another role's needs the store's sessions (its side). Pure.
+pub fn verify(report: &[u8], raw_sha256: &str, native: &[u8]) -> Result<Checked, String> {
+    let parsed: Value = serde_json::from_slice(report)
+        .map_err(|e| format!("the independent report is not JSON: {e}"))?;
+    conforms(&parsed)?;
+    if parsed["raw_session"]["sha256"] != json!(raw_sha256) {
+        return Err(format!(
+            "the report's raw_session names {}, its raw session object's bytes hash to {raw_sha256}",
+            parsed["raw_session"]["sha256"]
+        ));
+    }
+    let native_sha256 = crate::context::sha256_hex(native);
+    if parsed["native_attempt"]["sha256"] != json!(native_sha256) {
+        return Err(format!(
+            "the report's native_attempt names {}, its native attempt object's bytes hash to {native_sha256}",
+            parsed["native_attempt"]["sha256"]
+        ));
+    }
+    let export: Value = serde_json::from_slice(native)
+        .map_err(|e| format!("the native attempt export is not JSON: {e}"))?;
+    native_conforms(&export)?;
+    let session_ids: Vec<String> = export["session_ids"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s.as_str().map(str::to_owned))
+        .collect();
+    let session = parsed["session_id"].as_str().unwrap_or_default();
+    if !session_ids.iter().any(|s| s == session) {
+        return Err(format!(
+            "the native attempt's session_ids {session_ids:?} do not hold the report's session {session}"
+        ));
+    }
+    for key in ["candidate_id", "role"] {
+        if export[key] != parsed[key] {
+            return Err(format!(
+                "the native attempt's {key} {} is not the report's {}",
+                export[key], parsed[key]
+            ));
+        }
+    }
+    if export["stdout_sha256"] != json!(raw_sha256) {
+        return Err(format!(
+            "the native attempt's stdout_sha256 {} is not its raw session's {raw_sha256}",
+            export["stdout_sha256"]
+        ));
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    for finding in parsed["findings"].as_array().into_iter().flatten() {
+        let id = finding["id"].as_str().unwrap_or_default();
+        if !ids.insert(id) {
+            return Err(format!(
+                "the report names finding id {id} more than once: each finding needs an id of its own"
+            ));
+        }
+    }
+    Ok(Checked {
+        status: export["status"].as_str().unwrap_or_default().to_owned(),
+        session_ids,
+        report: parsed,
+    })
 }
 
 /// `value` without its top-level null members (a block that names no findings has none, not null).
@@ -98,15 +180,20 @@ pub fn native_attempt(
         "record_type": "runtime_attempt_export", "role": role, "status": status, "session_ids": session_ids,
         "candidate_id": candidate_id, "stdout_sha256": stdout_sha256,
     });
+    native_conforms(&export)?;
+    Ok(export)
+}
+
+/// Whether `export` is valid under contracts/native-attempt.schema.json; why not, at its first violation.
+fn native_conforms(export: &Value) -> Result<(), String> {
     crate::schema::native_attempt()
-        .validate(&export)
+        .validate(export)
         .map_err(|violations| {
             format!(
                 "the native attempt export is invalid: {}",
                 violations.first().map_or("", |v| v.message.as_str())
             )
-        })?;
-    Ok(export)
+        })
 }
 
 #[cfg(test)]

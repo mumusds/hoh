@@ -1630,6 +1630,68 @@ async fn test_054_03_qa_fails_first_and_review_still_completes_with_its_report_i
     outcome
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_reports_qa_and_review_settle_through_the_host_are_current_rows_of_a_completed_native_attempt()
+-> R {
+    // docs/adr/ADR-029.md decision 7 (-400, -450), the product path: D completes into C1; the QA and Reviewer
+    // FakeAgents complete with PASS reports, settled through the host. Each report's independent_reports row is
+    // CURRENT, on C1, in its attempt's HoH session, and its native attempt export says COMPLETED (one of the locked
+    // release policy's accepted statuses; a forged SETTLED is REJECTED, the store's NATIVE_ATTEMPT_INCOMPLETE test).
+    let dir = tempfile::tempdir()?;
+    let (project, spec) = project(dir.path()).await?;
+    seed(&project, &world(&spec))?;
+    let clock = Arc::new(FakeClock::default());
+    let team = Team::new(Commander::Answers, &spec, &project);
+    team.release.store(true, Ordering::SeqCst);
+    let team = Arc::new(team);
+    let host = host(&project, team.clone(), clock.clone()).await?;
+    let outcome = async {
+        let step = Duration::from_millis(100);
+        wait_for(
+            &project,
+            &clock,
+            step,
+            "SELECT count(*) AS n FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+             WHERE t.role IN ('qa', 'reviewer') AND a.state = 'SETTLED'",
+            &|r| r[0]["n"] == json!(2),
+        )?;
+        let (candidate, _, _) = candidate(&project)?;
+        let reports = rows(
+            &project,
+            "SELECT r.role, r.state, r.reject_reason, r.candidate_id, r.session_id, a.session_id AS attempt_session, \
+             (SELECT json_extract(e.payload_json, '$.native_attempt.path') FROM events e \
+               WHERE e.kind = 'verification.report' AND json_extract(e.payload_json, '$.attempt_id') = r.attempt_id) \
+               AS native_path FROM independent_reports r JOIN attempts a ON a.attempt_id = r.attempt_id \
+             ORDER BY r.role",
+        )?;
+        let reports = reports.as_array().cloned().unwrap_or_default();
+        assert_eq!(
+            reports.iter().map(|r| (r["role"].clone(), r["state"].clone())).collect::<Vec<_>>(),
+            [(json!("qa"), json!("CURRENT")), (json!("reviewer"), json!("CURRENT"))],
+            "{reports:?}"
+        );
+        let mut natives = Vec::new();
+        for report in &reports {
+            assert_eq!(report["candidate_id"], json!(candidate), "{report}");
+            assert_eq!(report["session_id"], report["attempt_session"], "{report}");
+            assert_eq!(report["reject_reason"], Value::Null, "{report}");
+            let native: Value = serde_json::from_slice(&std::fs::read(
+                project.join(report["native_path"].as_str().ok_or("no native attempt")?),
+            )?)?;
+            assert_eq!(native["status"], "COMPLETED", "{native}");
+            natives.push(native);
+        }
+        keep(
+            "m2t18-product-report-state",
+            &json!({"independent_reports": reports, "native_attempts": natives}),
+        )?;
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    outcome
+}
+
 /// Keep `value` as `<name>.json` in the check's evidence directory, when the test runs under run_check.
 fn keep(name: &str, value: &Value) -> R {
     if let Ok(dir) = std::env::var("HOH_EVIDENCE_DIR") {
