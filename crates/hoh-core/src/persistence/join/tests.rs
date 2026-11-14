@@ -1170,7 +1170,9 @@ async fn a_source_at_its_candidates_barrier_is_not_in_flight_and_its_run_blocks_
     Connection::open(&path)?.execute_batch(&format!(
         "UPDATE tasks SET state = 'BLOCKED', blocked_reason = 'BLOCKED_AUTH', revision = revision + 1
            WHERE task_id = '{0}';
-         UPDATE attempts SET state = 'FAILED' WHERE attempt_id = '{qa2}';",
+         UPDATE attempts SET state = 'FAILED' WHERE attempt_id = '{qa2}';
+         -- Its binding BLOCKED with it, as the turn's failure leaves it (docs/adr/ADR-030.md decision 6).
+         UPDATE role_bindings SET state = 'BLOCKED', blocked_reason = 'BLOCKED_AUTH' WHERE run_id = 'R' AND role = 'qa';",
         child_id(&r2, "task/qa")
     ))?;
     settle(&store, &path, &reviewer2, ("reviewer", "PASS"), &[], &[]).await?;

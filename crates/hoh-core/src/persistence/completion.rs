@@ -564,6 +564,9 @@ fn freeze_and_accept(
             ctx,
         );
     }
+    // "Missing" is no binding row only (docs/adr/ADR-030.md decision 8): a built-in role cannot be removed, so only a
+    // hand-made fixture lacks one. A verifier's binding BLOCKED for any reason does not stop the freeze: its task is
+    // marked and waits (decision 7), and without its report there is no join, so the candidate is never ACCEPTED.
     for role in super::results::VERIFIERS {
         if super::decide::load_binding(tx, &task.run_id, role)?.is_none() {
             return decide(
@@ -571,7 +574,9 @@ fn freeze_and_accept(
                 job,
                 task,
                 "verification_team_missing",
-                &format!("no {role} is bound to verify the candidate (M2-T15's staffing rules)"),
+                &format!(
+                    "no {role} is bound to verify the candidate (docs/adr/ADR-030.md decision 8)"
+                ),
                 ctx,
             );
         }

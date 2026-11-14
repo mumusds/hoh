@@ -60,8 +60,10 @@ fn millis(d: std::time::Duration) -> u64 {
 }
 
 /// Decide `task` after `attempt_id` failed with `failure` (ADR-020 decisions 2 and 3): one more failure in its
-/// `attempt_count`, then READY at its `next_retry_at`, or BLOCKED for authentication, capability or a decision once
-/// its retries are used up or a retry would be refused again (with a `need_decision` event). A task no longer LEASED or RUNNING is left alone.
+/// `attempt_count`, then READY at its `next_retry_at`, or BLOCKED for authentication, capability, a model, an agent, an
+/// unverified CLI or a decision once its retries are used up or a retry would be refused again (with a `need_decision`
+/// event); an authentication, capability or model failure blocks its binding too (docs/adr/ADR-030.md decision 6). A
+/// task no longer LEASED or RUNNING is left alone.
 pub(super) fn fail_task(
     tx: &Transaction<'_>,
     task: &TaskRef<'_>,
@@ -74,22 +76,30 @@ pub(super) fn fail_task(
             events: Vec::new(),
         });
     }
+    // An authentication, capability or model failure blocks the binding it ran under, in this transaction, and a
+    // capability or model failure excludes the session's version and identity (docs/adr/ADR-030.md decision 6): the
+    // same tick's pace cannot put the task back READY before staffing sees the registry's fact.
+    let binding =
+        super::staffing::turn_failed(tx, task.project_id, task.run_id, attempt_id, failure.class)?;
     // A supervision turn is not retried by a task's policy: its task is CANCELLED, nothing counted, and its wake is
-    // rearmed by the supervisor with the failure's class (docs/adr/ADR-025.md decision 3).
+    // rearmed by the supervisor with the failure's class (docs/adr/ADR-025.md decision 3); its binding's block and
+    // exclusion go with it (docs/adr/ADR-030.md decision 6, M2T15D-05).
     if super::wakes::is_supervision(tx, task.task_id)? {
+        let mut events = vec![event(
+            task.project_id,
+            task.run_id,
+            child_id(attempt_id, "turn_failed"),
+            "supervisor.turn_failed",
+            json!({"task_id": task.task_id, "attempt_id": attempt_id, "failure": failure.class.to_json()}),
+        )];
+        events.extend(binding);
         return Ok(Failed {
             cas: Some(StateCas {
                 id: task.task_id.to_owned(),
                 expected_revision: task.revision,
                 change: Change::Task(TaskState::Cancelled),
             }),
-            events: vec![event(
-                task.project_id,
-                task.run_id,
-                child_id(attempt_id, "turn_failed"),
-                "supervisor.turn_failed",
-                json!({"task_id": task.task_id, "attempt_id": attempt_id, "failure": failure.class.to_json()}),
-            )],
+            events,
         });
     }
     let count: i64 = tx
@@ -194,6 +204,7 @@ pub(super) fn fail_task(
             }),
         ));
     }
+    events.extend(binding);
     tx.execute(
         "UPDATE tasks SET attempt_count = ?1, next_retry_at = ?2, blocked_reason = COALESCE(?3, blocked_reason) \
          WHERE task_id = ?4",
@@ -404,6 +415,11 @@ pub struct Paced {
     pub incomplete: Option<&'static str>,
     /// Tasks moved to BLOCKED because their session lacks a required capability.
     pub capability_blocked: Vec<String>,
+    /// Due tasks moved to BLOCKED because their role's binding is BLOCKED for a reason of the vacancy set
+    /// (docs/adr/ADR-030.md decision 7).
+    pub vacant: Vec<String>,
+    /// Tasks of a vacant role back to READY: their role is dispatchable again (decision 7).
+    pub recovered: Vec<String>,
 }
 
 struct TaskRow {
@@ -559,40 +575,106 @@ pub(super) fn pace(
             paced.incomplete = Some(stop.as_str());
         }
     } else {
-        if state != RunState::WaitingExternal {
-            // Tasks their session cannot run are blocked, not left out silently (AC-042-03 R2; ADR-020 decision 5).
-            for task in tasks.iter_mut().filter(|t| due(t)) {
-                let (Some(binding), Some(required)) = (
-                    load_binding(&tx, run_id, &task.role)?,
-                    context.required_capabilities.get(&task.role),
-                ) else {
-                    continue;
-                };
-                if !binding.active || required.is_subset(&binding.capabilities) {
-                    continue;
+        // A vacant role's tasks (docs/adr/ADR-030.md decision 7, M2T15D-54), in every state the pace goes on in
+        // (WAITING_EXTERNAL and BLOCKED too), before what is in flight and the stall are judged: first those blocked for a
+        // reason of the vacancy set V whose role is dispatchable again go back to READY; then the due tasks of a role
+        // whose binding is BLOCKED for a reason of V are marked BLOCKED for it, and those whose session lacks a
+        // required capability BLOCKED_CAPABILITY (AC-042-03 R2; ADR-020 decision 5). Neither makes an attempt or
+        // touches `attempt_count`; NEED_DECISION is never V.
+        for task in tasks.iter_mut().filter(|t| t.state == TaskState::Blocked) {
+            let Some(reason) = task
+                .blocked_reason
+                .as_deref()
+                .and_then(BlockedReason::parse)
+                .filter(|r| crate::staffing::VACANCY.contains(r))
+            else {
+                continue;
+            };
+            let Some(epoch) =
+                super::staffing::dispatchable(&tx, run_id, &task.role, context, reason)?
+            else {
+                continue;
+            };
+            tx.execute(
+                "UPDATE tasks SET blocked_reason = NULL, next_retry_at = NULL WHERE task_id = ?1",
+                params![task.task_id],
+            )
+            .map_err(sqlite_error)?;
+            commit.cas.push(StateCas {
+                id: task.task_id.clone(),
+                expected_revision: task.revision,
+                change: Change::Task(TaskState::Ready),
+            });
+            commit.events.push(event(
+                &project_id,
+                run_id,
+                child_id(&task.task_id, &format!("unblocked/{}", task.revision)),
+                super::staffing::TASK_UNBLOCKED,
+                json!({"task_id": task.task_id, "reason": reason.as_str(), "role": task.role, "role_epoch": epoch}),
+            ));
+            paced.recovered.push(task.task_id.clone());
+            task.state = TaskState::Ready;
+            task.blocked_reason = None;
+            task.next_retry_at = None;
+        }
+        // A task moved back to READY by this commit is not marked by it: its role is dispatchable.
+        for task in tasks
+            .iter_mut()
+            .filter(|t| !paced.recovered.contains(&t.task_id))
+            .filter(|t| due(t))
+        {
+            let (reason, payload, vacant) = match super::staffing::vacancy(&tx, run_id, &task.role)?
+            {
+                Some((reason, missing)) => (
+                    reason,
+                    json!({"task_id": task.task_id, "reason": reason.as_str(), "missing": missing,
+                           "cause": "vacancy"}),
+                    true,
+                ),
+                None => {
+                    let (Some(binding), Some(required)) = (
+                        load_binding(&tx, run_id, &task.role)?,
+                        context.required_capabilities.get(&task.role),
+                    ) else {
+                        continue;
+                    };
+                    if !binding.active || required.is_subset(&binding.capabilities) {
+                        continue;
+                    }
+                    let missing: Vec<&String> =
+                        required.difference(&binding.capabilities).collect();
+                    let reason = BlockedReason::BlockedCapability;
+                    (
+                        reason,
+                        json!({"task_id": task.task_id, "reason": reason.as_str(), "missing": missing}),
+                        false,
+                    )
                 }
-                let missing: Vec<&String> = required.difference(&binding.capabilities).collect();
-                tx.execute(
-                    "UPDATE tasks SET blocked_reason = ?1, next_retry_at = NULL WHERE task_id = ?2",
-                    params![BlockedReason::BlockedCapability.as_str(), task.task_id],
-                )
-                .map_err(sqlite_error)?;
-                commit.cas.push(StateCas {
-                    id: task.task_id.clone(),
-                    expected_revision: task.revision,
-                    change: Change::Task(TaskState::Blocked),
-                });
-                commit.events.push(event(
-                    &project_id,
-                    run_id,
-                    child_id(&task.task_id, &format!("blocked/{}", task.revision)),
-                    "task.blocked",
-                    json!({"task_id": task.task_id, "reason": BlockedReason::BlockedCapability.as_str(), "missing": missing}),
-                ));
+            };
+            tx.execute(
+                "UPDATE tasks SET blocked_reason = ?1, next_retry_at = NULL WHERE task_id = ?2",
+                params![reason.as_str(), task.task_id],
+            )
+            .map_err(sqlite_error)?;
+            commit.cas.push(StateCas {
+                id: task.task_id.clone(),
+                expected_revision: task.revision,
+                change: Change::Task(TaskState::Blocked),
+            });
+            commit.events.push(event(
+                &project_id,
+                run_id,
+                child_id(&task.task_id, &format!("blocked/{}", task.revision)),
+                "task.blocked",
+                payload,
+            ));
+            if vacant {
+                paced.vacant.push(task.task_id.clone());
+            } else {
                 paced.capability_blocked.push(task.task_id.clone());
-                task.state = TaskState::Blocked;
-                task.blocked_reason = Some(BlockedReason::BlockedCapability.as_str().to_owned());
             }
+            task.state = TaskState::Blocked;
+            task.blocked_reason = Some(reason.as_str().to_owned());
         }
         // In flight: only what can still move on (docs/adr/ADR-028.md decision 10, M2T16D-202): a verification round's
         // source waiting for its round, and its verifier task once done, are not. Nothing waits for a join: it is its

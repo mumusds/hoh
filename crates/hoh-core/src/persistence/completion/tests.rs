@@ -2123,6 +2123,12 @@ async fn a_round_whose_verifier_is_blocked_and_whose_other_is_done_stalls_its_ru
         "UPDATE attempts SET state = 'FAILED' WHERE attempt_id = ?1",
         [&d.attempt_id],
     )?;
+    // Its binding BLOCKED with it, as the turn's failure leaves it (docs/adr/ADR-030.md decision 6).
+    Connection::open(&path)?.execute(
+        "UPDATE role_bindings SET state = 'BLOCKED', blocked_reason = 'BLOCKED_AUTH' WHERE run_id = 'R' \
+         AND role = (SELECT role FROM tasks WHERE task_id = ?1)",
+        [&d.task_id],
+    )?;
     let other = store
         .schedule_round("R", verifiers())
         .await?

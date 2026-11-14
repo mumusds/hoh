@@ -135,6 +135,9 @@ pub struct Started {
     /// The prompt it is about to be sent, recorded with its identity before its gate opens (docs/adr/ADR-026.md
     /// decision 7); none from an executor that sends none of its own (a test's).
     pub prompt: Option<hoh_core::persistence::PromptRecord>,
+    /// What its turn runs as, taken at its prepare (docs/adr/ADR-030.md decision 2, M2T15D-07): a BLOCKED_AUTH of it is
+    /// the agent's fact only by this; none from an executor without a registry (a test's).
+    pub ran: Option<super::agents::Ran>,
 }
 
 /// Why an executor started no process for a work (docs/adr/ADR-022.md decision 12): the attempt's failure reason (a
@@ -201,7 +204,7 @@ pub trait Executor: Send + Sync + std::fmt::Debug {
 /// The runner's fault injection points (CR-006): the product's hooks do nothing. In order, for one attempt: before
 /// its dispatch is handed over, handed over but not answered, answered but its receipt not written, its process
 /// started at its gate but its identity not recorded, its work effect STARTED and the process running (not yet
-/// OBSERVED), its work effect COMMITTED but its task not yet moved.
+/// OBSERVED), its work effect OBSERVED but not COMMITTED, its work effect COMMITTED but its task not yet moved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunnerPoint {
     BeforeSend,
@@ -211,6 +214,9 @@ pub enum RunnerPoint {
     /// A settle of an attempt this host runs begins (before its task is stopped).
     Settling,
     AfterEffectStarted,
+    /// Its work effect OBSERVED with the outcome and its class, before its end is settled (docs/adr/ADR-030.md
+    /// decision 6's recovery after OBSERVED).
+    AfterEffectObserved,
     AfterEffectCommitted,
 }
 
@@ -612,11 +618,15 @@ async fn tick(
     }
     // Staffing (docs/adr/ADR-030.md decision 1), where the binder was: after the checkpoints, before the first inputs,
     // the reconcile, the paces and the rounds, so they read the bindings it wrote; every binding judged against one
-    // snapshot of the registry, taken now. And what each role of the team needs (ADR-022 decisions 9 and 10).
+    // snapshot of the registry, taken now, and the same snapshot is this tick's for the paces (whether a vacant role is
+    // dispatchable again, decision 7), the supervisor and the allocation (its observations, decisions 1 and 11). And
+    // what each role of the team needs (ADR-022 decisions 9 and 10). A host without a registry has none of them.
     let mut context = context.clone();
     let mut staffed = false;
     if let Some(registry) = &registry {
         let snapshot = registry.snapshot(common.host_epoch);
+        context.observations = Some(snapshot.observations.clone());
+        context.staffing = Some(snapshot.clone());
         staffed = super::agents::staff(
             store,
             &common.shared.root,
@@ -734,21 +744,11 @@ async fn tick(
         while store.schedule_round(run, at()).await?.dispatched.is_some() {}
     }
     // The supervisor (docs/adr/ADR-025.md decisions 2, 3, 5 and 8): each run's step (its triggers, its Commander's
-    // availability, its turns' outputs), a Commander turn for an owed wake, then the turns to stop now.
-    // The registry's looks, by their identity, judge whether a Commander's agent is there (decision 5).
-    let observed = registry
-        .as_ref()
-        .map(|registry| registry.observations(common.host_epoch));
+    // availability, its turns' outputs), a Commander turn for an owed wake, then the turns to stop now. The registry's
+    // looks, by their identity, judge whether a Commander's agent is there (decision 5): the tick's snapshot's
+    // (docs/adr/ADR-030.md decision 1), in `at()`.
     for run in &waiting.supervised {
-        let stepped = store
-            .supervise(
-                run,
-                Context {
-                    observations: observed.clone(),
-                    ..at()
-                },
-            )
-            .await;
+        let stepped = store.supervise(run, at()).await;
         // A run's failing step is its own: said once, and the tick goes on with the other runs, the allocation and
         // the dispatches; a store that cannot write ends the tick (v13 decision 5, M2T08R-51).
         match stepped {
@@ -781,15 +781,7 @@ async fn tick(
         }
     }
     // The allocation judges by the same looks (docs/adr/ADR-025.md v14 decision 5).
-    store
-        .allocate_supervision(
-            &project_id,
-            Context {
-                observations: observed.clone(),
-                ..at()
-            },
-        )
-        .await?;
+    store.allocate_supervision(&project_id, at()).await?;
     for stop in store.supervision_stops(&project_id, at()).await? {
         if stop.state == "PREPARED" {
             store
@@ -919,14 +911,10 @@ async fn attempt(
             match kept {
                 Ok(kept) => Some(Box::new(kept)),
                 Err(why) => {
-                    store
-                        .runner_finished(
-                            &id,
-                            common.failed(format!(
-                                "HANDOFF_UNAVAILABLE: its package could not be kept: {why}"
-                            )),
-                        )
-                        .await?;
+                    let ending = common.failed(format!(
+                        "HANDOFF_UNAVAILABLE: its package could not be kept: {why}"
+                    ));
+                    finished(common, &id, None, ending, |e| store.runner_finished(&id, e)).await?;
                     return Ok(());
                 }
             }
@@ -950,7 +938,7 @@ async fn attempt(
                 Ok(v) => Some(v),
                 Err(why) => {
                     let ending = super::verifying::unprepared(common.failed(String::new()), why);
-                    store.runner_finished(&id, ending).await?;
+                    finished(common, &id, None, ending, |e| store.runner_finished(&id, e)).await?;
                     return Ok(());
                 }
             }
@@ -985,13 +973,9 @@ async fn attempt(
             match written {
                 Ok(helpers) => Some(helpers),
                 Err(why) => {
-                    store
-                        .runner_finished(
-                            &id,
-                            common
-                                .failed(format!("HELPERS_UNAVAILABLE: its request helpers: {why}")),
-                        )
-                        .await?;
+                    let ending =
+                        common.failed(format!("HELPERS_UNAVAILABLE: its request helpers: {why}"));
+                    finished(common, &id, None, ending, |e| store.runner_finished(&id, e)).await?;
                     remove_run_dir().await;
                     return Ok(());
                 }
@@ -1018,11 +1002,13 @@ async fn attempt(
                         "details": refusal.details}),
                 ));
             }
-            store.runner_finished(&id, ending).await?;
+            finished(common, &id, None, ending, |e| store.runner_finished(&id, e)).await?;
             remove_run_dir().await;
             return Ok(());
         }
     };
+    // What its turn runs as, kept while it is in flight, for its end (docs/adr/ADR-030.md decision 2).
+    let ran = started.ran.clone();
     // Its whole identity: without it the gate stays shut (dropped below) and the agent never runs (M2T05R-100). Its
     // cgroup too, while it is held at the gate (nothing of the agent runs yet): what it starts stays in it unless it
     // moves itself out, which the marker scan covers (docs/adr/ADR-021.md decision 8d v5 to v7, CR-011, CR-012);
@@ -1055,12 +1041,11 @@ async fn attempt(
     .map_err(|e| PersistError::Storage(format!("the identity of {id}'s process: {e}")))?;
     let Some(who) = who else {
         drop(started);
-        store
-            .runner_finished(
-                &id,
-                common.failed("the identity of its process could not be read".to_owned()),
-            )
-            .await?;
+        let ending = common.failed("the identity of its process could not be read".to_owned());
+        finished(common, &id, ran.as_ref(), ending, |e| {
+            store.runner_finished(&id, e)
+        })
+        .await?;
         remove_run_dir().await;
         return Ok(());
     };
@@ -1107,7 +1092,7 @@ async fn attempt(
     // (a request is never cut off: its check and record end before the end is looked at; decision 7).
     let mut ended = started.ended;
     let mut served = 0;
-    let finished = loop {
+    let end = loop {
         let (Some(v), Some(helpers)) = (&verifier, &helpers) else {
             break (&mut ended).await;
         };
@@ -1118,7 +1103,7 @@ async fn attempt(
             }
         }
     };
-    let Ok(outcome) = finished else {
+    let Ok(outcome) = end else {
         // The executor lost the process: its end is not known, so it is settled as an expired lease would be, never
         // taken as a failure to run again (M2T05R-04).
         let entry = common.inflight.lock().ok().and_then(|mut f| f.remove(&id));
@@ -1151,6 +1136,9 @@ async fn attempt(
             .await?
     {
         return Ok(());
+    }
+    if !unknown {
+        hooks.runner(RunnerPoint::AfterEffectObserved);
     }
     // Its leader ended: the attempt ends, and its slot with it, only if the executor emptied its group first
     // (M2T05R-101, -202); else it stays RUNNING with its slot held, and a diagnostic says why.
@@ -1256,8 +1244,11 @@ async fn attempt(
     // A writer's success is its completion, still under its write lease and its processes proven gone above: frozen and
     // accepted, corrected or decided by its bridge, and settled, in one commit (docs/adr/ADR-028.md decisions 3, 4).
     if work.assignment.writer && ending.success && !unknown {
-        super::completion::complete(store, &common.shared.root, identity_of(&work)?, ending)
-            .await?;
+        let identity = identity_of(&work)?;
+        finished(common, &id, ran.as_ref(), ending, |e| {
+            super::completion::complete(store, &common.shared.root, identity, e)
+        })
+        .await?;
         return Ok(());
     }
     // A verifier's success is settled, corrected or verified again by the result in its bridge (decision 11).
@@ -1269,23 +1260,57 @@ async fn attempt(
             candidate_id: v.candidate_id.clone(),
             spec_sha256: v.sealed.manifest.spec.sha256.clone(),
         };
-        super::completion::complete_verifier(store, &identity_of(&work)?, ending, Some(reporting))
-            .await?;
+        let identity = identity_of(&work)?;
+        finished(common, &id, ran.as_ref(), ending, |e| {
+            super::completion::complete_verifier(store, &identity, e, Some(reporting))
+        })
+        .await?;
         remove_run_dir().await;
         return Ok(());
     }
     // An interrupted writer's end goes with its workspace's record (REQ-019 behaviour 6, docs/adr/ADR-024.md
     // decision 9), its processes proven gone above.
     let id = id.as_str();
-    super::control::recorded_end(&common.shared.root, move |workspace| {
-        let mut ending = ending.clone();
-        ending.observed.workspace = workspace;
-        store.runner_finished(id, ending)
+    finished(common, id, ran.as_ref(), ending, |ending| {
+        super::control::recorded_end(&common.shared.root, move |workspace| {
+            let mut ending = ending.clone();
+            ending.observed.workspace = workspace;
+            store.runner_finished(id, ending)
+        })
     })
     .await?;
     // Settled: its run directory is no longer needed (decision 6).
     remove_run_dir().await;
     Ok(())
+}
+
+/// Hand attempt `id`'s `ending` to the store by `hand`: every runner path that ends an attempt goes through here
+/// (docs/adr/ADR-030.md decision 2, M2T15D-07). A failure of the Auth class first goes to the registry as what the turn
+/// that `ran` found: latched as its agent's fact only when it ran under the agent's current identity no earlier than
+/// its latest recovery; otherwise the registry's diagnostic is recorded with the attempt's end. A reconcile's end
+/// (crash recovery) does not come here: a new host's registry has nothing of the old one's turns.
+async fn finished<T, F>(
+    common: &Common,
+    id: &str,
+    ran: Option<&super::agents::Ran>,
+    mut ending: Ending,
+    hand: impl FnOnce(Ending) -> F,
+) -> Result<T, PersistError>
+where
+    F: std::future::Future<Output = Result<T, PersistError>>,
+{
+    if !ending.success
+        && ending.class == FailureClass::Auth
+        && let (Some(ran), Some(registry)) = (ran, common.executor.registry())
+        && let Some(said) = registry.turn_auth_failed(ran, id)
+    {
+        ending.observed.events.push((
+            "registry/turn-auth".to_owned(),
+            said.kind.to_owned(),
+            json!({"attempt_id": id, "agent": ran.agent.as_str(), "detail": said.detail}),
+        ));
+    }
+    hand(ending).await
 }
 
 /// Serve request `n` of verifier `work` (docs/adr/ADR-028.md decisions 7 and 13), when it is there: 1 when it was

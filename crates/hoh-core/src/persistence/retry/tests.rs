@@ -968,7 +968,10 @@ async fn a_blocked_run_is_named_by_its_first_reason_and_waits_behind_a_blocked_d
          INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, created_seq, cost_estimate, blocked_reason) VALUES
            ('T2', 'R', 's1', 'BLOCKED', 1, 'developer', 2, 1, 'BLOCKED_AUTH'),
            ('T3', 'R', 's1', 'PENDING', 1, 'developer', 3, 1, NULL);
-         INSERT INTO task_dependencies(task_id, depends_on) VALUES ('T3', 'T1');"
+         INSERT INTO task_dependencies(task_id, depends_on) VALUES ('T3', 'T1');
+         -- T2's turn failed for authentication: its binding is BLOCKED with it (docs/adr/ADR-030.md decision 6).
+         UPDATE role_bindings SET state = 'BLOCKED', blocked_reason = 'BLOCKED_AUTH',
+           missing_json = '[\"claude:BLOCKED_AUTH\"]' WHERE run_id = 'R' AND role = 'developer';"
     ))?;
     store
         .pace_run("R", context(at("2026-11-07T00:00:10Z")?))

@@ -1073,7 +1073,8 @@ async fn a_turn_that_cannot_start_fails_by_its_refusals_reason_and_class() -> R 
     // its task waits for a retry), never another contract in its place, with an attempt.start_refused event saying why.
     // An agent gone from the host since its binding: staffing blocks the bindings to it at its next look
     // (docs/adr/ADR-030.md decisions 4 and 5: no fallback, AGENT_UNAVAILABLE with the line that says why), so a task of
-    // its role due then starts no attempt (the task's own vacancy mark is decision 7's, S5).
+    // its role due then starts no attempt: the pace marks it BLOCKED(AGENT_UNAVAILABLE) for its role's vacancy
+    // (decision 7: task.blocked{cause: vacancy}, attempt_count untouched).
     let world = World::new()?;
     world.claude(None)?;
     let project = world.project();
@@ -1165,8 +1166,26 @@ async fn a_turn_that_cannot_start_fails_by_its_refusals_reason_and_class() -> R 
             .ok_or("no claude in the evidence")?;
         assert_eq!(claude["probe"]["class"], "NotFound", "{evidence}");
         ready(&project, &run_id, &[("T-d", "developer")])?;
-        // Ticks go on (200 ms each): the blocked role is dispatched nothing, and its task waits READY (the vacancy mark
-        // of decision 7 is S5's).
+        // The next pace marks T-d for its role's vacancy: BLOCKED(AGENT_UNAVAILABLE), no attempt, attempt_count 0.
+        until(
+            &project,
+            "SELECT state || '/' || blocked_reason || '/' || attempt_count || '/' || \
+             (SELECT count(*) FROM attempts WHERE task_id = 'T-d') FROM tasks WHERE task_id = 'T-d'",
+            "BLOCKED/AGENT_UNAVAILABLE/0/0",
+            limit,
+        )
+        .await?;
+        let marked: Value = serde_json::from_str(&query(
+            &project,
+            "SELECT json_group_array(json(payload_json)) FROM events WHERE kind = 'task.blocked' \
+             AND json_extract(payload_json, '$.task_id') = 'T-d'",
+        )?)?;
+        assert_eq!(
+            marked,
+            json!([{"task_id": "T-d", "reason": "AGENT_UNAVAILABLE", "missing": ["claude:not_installed"],
+                    "cause": "vacancy"}])
+        );
+        // Ticks go on (200 ms each): the blocked role is dispatched nothing.
         tokio::time::sleep(Duration::from_secs(2)).await;
         assert_eq!(
             query(
@@ -1174,7 +1193,7 @@ async fn a_turn_that_cannot_start_fails_by_its_refusals_reason_and_class() -> R 
                 "SELECT state || '/' || attempt_count || '/' || \
                  (SELECT count(*) FROM attempts WHERE task_id = 'T-d') FROM tasks WHERE task_id = 'T-d'"
             )?,
-            "READY/0/0"
+            "BLOCKED/0/0"
         );
         R::Ok(())
     }

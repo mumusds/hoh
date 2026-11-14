@@ -201,6 +201,7 @@ impl hoh_app::host::Executor for FakeCommander {
             gate,
             ended,
             prompt: None,
+            ran: None,
         })
     }
 }

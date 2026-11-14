@@ -179,7 +179,10 @@ async fn the_paces_claims_are_recomputed_as_a_whole_while_the_run_stays_blocked(
         "{WORLD}
          UPDATE tasks SET state = 'BLOCKED', blocked_reason = 'NEED_DECISION' WHERE task_id = 'T1';
          INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, created_seq, cost_estimate, blocked_reason) VALUES
-           ('T2', 'R', 's1', 'BLOCKED', 1, 'developer', 2, 1, 'BLOCKED_AUTH');"
+           ('T2', 'R', 's1', 'BLOCKED', 1, 'developer', 2, 1, 'BLOCKED_AUTH');
+         -- T2's turn failed for authentication: its binding is BLOCKED with it (docs/adr/ADR-030.md decision 6).
+         UPDATE role_bindings SET state = 'BLOCKED', blocked_reason = 'BLOCKED_AUTH',
+           missing_json = '[\"claude:BLOCKED_AUTH\"]' WHERE run_id = 'R' AND role = 'developer';"
     ))?;
     store
         .pace_run("R", context(at("2026-11-07T00:00:10Z")?))

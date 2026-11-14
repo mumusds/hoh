@@ -652,6 +652,22 @@ pub fn lists_command(help: &str, name: &str) -> bool {
         .any(|line| Some(indent(line)) == column && line.split_whitespace().next() == Some(name))
 }
 
+/// A failure code made of an agent's own text `s` (claude's `result.subtype`, codex's `codexErrorInfo`): `native:<s>`
+/// when `s` is one of HoH's reason codes (`$defs.ReasonCode`, as `hoh_core::protocol::ReasonCode` reads it), else `s`
+/// as it is (docs/adr/ADR-030.md decision 6, M2T15D-300). So an agent's error named like BLOCKED_AUTH or
+/// COMPAT_UNVERIFIED is its own failure, never one of the classes HoH gives only by its own recognitions.
+pub fn native_code(s: &str) -> String {
+    let reserved = serde_json::from_value::<hoh_core::protocol::ReasonCode>(
+        serde_json::Value::String(s.to_owned()),
+    )
+    .is_ok();
+    if reserved {
+        format!("native:{s}")
+    } else {
+        s.to_owned()
+    }
+}
+
 /// Numbers the diagnostics of input moves that did not happen, so two of one attempt never share an event id.
 static NOT_MOVED: AtomicUsize = AtomicUsize::new(1);
 
@@ -1022,5 +1038,145 @@ mod hash_tests {
         );
         println!("hashed {}", sha256_file(Path::new(&log))?);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod native_tests {
+    use super::*;
+    use hoh_core::protocol::{AllVariants, BlockedReason, ErrorCode, RejectionReason};
+
+    /// Every code of `$defs.ReasonCode` (the three enums the protocol test compares with the schema).
+    fn reason_codes() -> Vec<String> {
+        fn names<T: AllVariants + serde::Serialize>() -> Vec<String> {
+            T::ALL
+                .iter()
+                .filter_map(|v| serde_json::to_value(v).ok())
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        }
+        let mut all = names::<BlockedReason>();
+        all.extend(names::<RejectionReason>());
+        all.extend(names::<ErrorCode>());
+        all
+    }
+
+    #[test]
+    fn a_native_text_named_like_a_reason_code_is_marked_native() {
+        // docs/adr/ADR-030.md decision 6 (M2T15D-300): every reason code, and the five the ADR names, become
+        // `native:<code>`; any other text is kept as it is.
+        let codes = reason_codes();
+        for named in [
+            "BLOCKED_AUTH",
+            "BLOCKED_CAPABILITY",
+            "MODEL_UNAVAILABLE",
+            "COMPAT_UNVERIFIED",
+            "AGENT_UNAVAILABLE",
+        ] {
+            assert!(
+                codes.iter().any(|c| c == named),
+                "{named} is no reason code"
+            );
+        }
+        for code in &codes {
+            assert_eq!(native_code(code), format!("native:{code}"));
+        }
+        for text in [
+            "error_max_turns",
+            "error_during_execution",
+            "contextWindowExceeded",
+            "blocked_auth",
+            "BLOCKED_AUTH ",
+            "native:BLOCKED_AUTH",
+            "",
+        ] {
+            assert_eq!(native_code(text), text);
+        }
+    }
+
+    /// The places an agent's own text becomes a failure code (docs/adr/ADR-030.md decision 6: "以单元测试列出全部把原生
+    /// 文字变成失败码的位置"): claude's `result.subtype` of a turn that did not succeed, and codex's `codexErrorInfo` it does
+    /// not recognise (App Server and exec both go through `failure_of`). Each goes through [`native_code`]. The other
+    /// texts the adapters keep are prefixed by what failed (pi's `get_state: <text>`, codex's `initialize: <message>`,
+    /// `thread/start: <message>`, `turn/start: <message>`) and so never equal a code; pi's provider errors become fixed
+    /// codes only.
+    #[test]
+    fn every_place_that_makes_a_failure_code_of_native_text_goes_through_native_code() {
+        use crate::process::Termination;
+        let codes = reason_codes();
+        for code in &codes {
+            let frame = crate::claude::ResultFrame {
+                subtype: Some(code.clone()),
+                is_error: Some(true),
+                text: None,
+            };
+            let claude = crate::claude::verdict(&crate::claude::Ending {
+                result: Some(&frame),
+                exit: Some(Termination::Code(0)),
+                ..crate::claude::Ending::default()
+            });
+            assert_eq!(
+                claude,
+                (AttemptState::Failed, Some(format!("native:{code}"))),
+                "claude {code}"
+            );
+            let error = json!({"codexErrorInfo": code, "message": "m"});
+            let codex = crate::codex::failure_of(Some(&error), false);
+            assert_eq!(codex, format!("native:{code}"), "codex {code}");
+        }
+        // The adapters' own recognitions keep HoH's codes.
+        let frame = crate::claude::ResultFrame {
+            subtype: Some("error_during_execution".to_owned()),
+            is_error: Some(true),
+            text: None,
+        };
+        assert_eq!(
+            crate::claude::verdict(&crate::claude::Ending {
+                result: Some(&frame),
+                auth_failed: true,
+                exit: Some(Termination::Code(1)),
+                ..crate::claude::Ending::default()
+            }),
+            (AttemptState::Failed, Some("BLOCKED_AUTH".to_owned()))
+        );
+        assert_eq!(
+            crate::claude::verdict(&crate::claude::Ending {
+                result: Some(&frame),
+                exit: Some(Termination::Code(1)),
+                ..crate::claude::Ending::default()
+            }),
+            (
+                AttemptState::Failed,
+                Some("error_during_execution".to_owned())
+            )
+        );
+        assert_eq!(
+            crate::codex::failure_of(Some(&json!({"codexErrorInfo": "unauthorized"})), false),
+            "BLOCKED_AUTH"
+        );
+        assert_eq!(
+            crate::codex::failure_of(
+                Some(&json!({"codexErrorInfo": "other", "message": "unexpected status 401"})),
+                false
+            ),
+            "BLOCKED_AUTH"
+        );
+        assert_eq!(
+            crate::codex::failure_of(Some(&json!({"codexErrorInfo": "serverOverloaded"})), false),
+            "TRANSIENT_EXTERNAL"
+        );
+        assert_eq!(
+            crate::pi::error_class("No API key found for x"),
+            "BLOCKED_AUTH"
+        );
+        assert_eq!(
+            crate::pi::error_class("Model not found: y"),
+            "MODEL_UNAVAILABLE"
+        );
+        assert_eq!(crate::pi::error_class("BLOCKED_AUTH"), "PERMANENT_EXTERNAL");
+        assert_eq!(
+            crate::pi::error_class("MODEL_UNAVAILABLE"),
+            "PERMANENT_EXTERNAL"
+        );
     }
 }

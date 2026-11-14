@@ -209,6 +209,7 @@ impl hoh_app::host::Executor for Scripted {
             gate,
             ended,
             prompt: None,
+            ran: None,
         })
     }
 }

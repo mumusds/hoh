@@ -821,6 +821,26 @@ impl Registry {
         }
     }
 
+    /// `agent` as it was last looked at, with what a turn prepared from it now runs as (docs/adr/ADR-030.md decision
+    /// 2, M2T15D-07): the identity of that look and the registry's generation `(host_epoch, n)` of the agent now, read
+    /// under one lock; `None` if it never was looked at.
+    pub fn prepared(&self, agent: Agent) -> Option<Result<(Ready, Ran), String>> {
+        let state = self.state();
+        let known = state.agents.get(&agent)?;
+        let seen = known.seen.as_ref()?;
+        Some(match &seen.outcome {
+            Ok(ready) => Ok((
+                ready.clone(),
+                Ran {
+                    agent,
+                    identity: ready.entry.identity(),
+                    generation: (state.host_epoch, known.looks),
+                },
+            )),
+            Err(probe) => Err(probe.detail.clone()),
+        })
+    }
+
     /// `agent` as it was last looked at, without looking again; `None` if it never was.
     pub fn seen(&self, agent: Agent) -> Option<Result<Ready, String>> {
         self.state()

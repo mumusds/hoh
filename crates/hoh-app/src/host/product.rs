@@ -2,7 +2,7 @@
 //! the adapter's runner mode, its process started at the `hoh __gate` start gate, its prompt the role's contract with
 //! the task's header. The adapter moves no state; the turn's facts come back as the attempt's [`Outcome`].
 
-use super::agents::{Prepared, Ready, Registry, Spec};
+use super::agents::{Prepared, Ran, Ready, Registry, Spec};
 use super::runner::{Executor, Gate, Outcome, Refusal, Started, Work};
 use hoh_agents::adapter::{AttemptRef, Facts, GateCommand, Recorded};
 use hoh_agents::compat::Agent;
@@ -204,11 +204,15 @@ pub(super) fn read_bridge(path: &Path) -> (Vec<String>, bool) {
     (kept, truncated)
 }
 
-/// How an adapter's failure code fails its attempt (decision 16, ADR-020 decision 1).
+/// How an adapter's failure code fails its attempt (decision 16, ADR-020 decision 1; docs/adr/ADR-030.md decision 6):
+/// the codes the adapters themselves recognise, BLOCKED_AUTH, MODEL_UNAVAILABLE and BLOCKED_CAPABILITY, give their
+/// classes; anything else is transient, a bare COMPAT_UNVERIFIED string and an agent's own text marked `native:` too
+/// (only HoH's typed refusals are Compat).
 fn class_of(code: Option<&str>) -> FailureClass {
     match code {
         Some("BLOCKED_AUTH") => FailureClass::Auth,
-        Some("BLOCKED_CAPABILITY" | "MODEL_UNAVAILABLE") => FailureClass::Capability,
+        Some("MODEL_UNAVAILABLE") => FailureClass::Model,
+        Some("BLOCKED_CAPABILITY") => FailureClass::Capability,
         _ => FailureClass::Transient { retry_after: None },
     }
 }
@@ -453,20 +457,22 @@ impl ProductExecutor {
         Ok((recorded.packed.prompt, record))
     }
 
-    /// The turn `work` runs and the record of its prompt, or why it cannot start.
-    fn prepare(&self, work: &Work) -> Result<(Agent, Ready, Prepared, PromptRecord), Refusal> {
+    /// The turn `work` runs, what it runs as and the record of its prompt, or why it cannot start: an agent the
+    /// binding does not name, or that its last look found unusable, is AGENT_UNAVAILABLE in the Unavailable class
+    /// (docs/adr/ADR-030.md decision 6; its task waits for its role's vacancy to end, decision 7).
+    fn prepare(&self, work: &Work) -> Result<(Agent, Ready, Ran, Prepared, PromptRecord), Refusal> {
         let a = &work.assignment;
         let agent = a.agent.as_deref().and_then(Agent::named).ok_or_else(|| {
             refused(
                 "AGENT_UNAVAILABLE",
-                FailureClass::Capability,
+                FailureClass::Unavailable,
                 format!("the binding of {} names no agent", work.role),
             )
         })?;
-        let ready = match self.registry.seen(agent) {
-            Some(Ok(ready)) => ready,
+        let (ready, ran) = match self.registry.prepared(agent) {
+            Some(Ok(prepared)) => prepared,
             Some(Err(why)) => {
-                return Err(refused("AGENT_UNAVAILABLE", FailureClass::Capability, why));
+                return Err(refused("AGENT_UNAVAILABLE", FailureClass::Unavailable, why));
             }
             None => {
                 return Err(refused(
@@ -545,7 +551,7 @@ impl ProductExecutor {
         let prepared = ready
             .turn(agent, spec)
             .map_err(|why| refused("BLOCKED_CAPABILITY", FailureClass::Capability, why))?;
-        Ok((agent, ready, prepared, record))
+        Ok((agent, ready, ran, prepared, record))
     }
 }
 
@@ -590,7 +596,7 @@ impl Executor for ProductExecutor {
     }
 
     fn start(&self, work: &Work) -> Result<Started, Refusal> {
-        let (agent, ready, prepared, record) = self.prepare(work)?;
+        let (agent, ready, ran, prepared, record) = self.prepare(work)?;
         let attempt = AttemptRef {
             attempt_id: work.attempt_id.clone(),
             session_id: work.assignment.session_id.clone().unwrap_or_default(),
@@ -680,6 +686,7 @@ impl Executor for ProductExecutor {
             }),
             ended,
             prompt: Some(record),
+            ran: Some(ran),
         })
     }
 

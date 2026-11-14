@@ -264,8 +264,15 @@ struct Team {
     /// Each FakeAgent started: its process group (its leader's pid) and its leader's start time.
     agents: std::sync::Mutex<Vec<(u32, Option<String>)>>,
     /// The product's agent registry, when set: the runner then staffs the bindings by it (docs/adr/ADR-030.md decision
-    /// 1), and the Team takes each new holder's first input (its session.start) as delivered.
+    /// 1), and the Team takes each new holder's first input (its session.start) as delivered. Each turn then runs as
+    /// the registry's agent at its start says, as the product's prepare takes it (`Started::ran`, decision 2).
     registry: std::sync::Mutex<Option<Arc<hoh_app::host::agents::Registry>>>,
+    /// Developer tasks whose FakeAgent is held until `task_release` (not `developer`).
+    held_tasks: std::sync::Mutex<Vec<String>>,
+    task_release: Arc<AtomicBool>,
+    /// How a verifier's turn fails once released, when it does (docs/adr/ADR-030.md decision 6): no report, its end of
+    /// this class (`BLOCKED_AUTH` for Auth).
+    verifier_fails: std::sync::Mutex<Option<hoh_core::retry::FailureClass>>,
 }
 
 /// The Developer FakeAgent's self-test record: it claims every TEST of TEST-053-01's specification passed.
@@ -298,6 +305,9 @@ impl Team {
             self_test: AtomicBool::new(false),
             agents: std::sync::Mutex::default(),
             registry: std::sync::Mutex::default(),
+            held_tasks: std::sync::Mutex::default(),
+            task_release: Arc::default(),
+            verifier_fails: std::sync::Mutex::default(),
         }
     }
 
@@ -323,6 +333,7 @@ impl Team {
         }
         self.developer.store(true, Ordering::SeqCst);
         self.release.store(true, Ordering::SeqCst);
+        self.task_release.store(true, Ordering::SeqCst);
     }
 }
 
@@ -390,6 +401,7 @@ impl hoh_app::host::Executor for Team {
         let mut final_text = None;
         let mut artifacts = Vec::new();
         let mut failed = false;
+        let mut verifier_class = None;
         let mut held = None;
         match work.role.as_str() {
             "commander" => {
@@ -417,7 +429,15 @@ impl hoh_app::host::Executor for Team {
                 messages.push(json!({"nonce": input.nonce, "message": message}).to_string());
             }
             "developer" => {
-                held = Some(self.developer.clone());
+                let own = self
+                    .held_tasks
+                    .lock()
+                    .is_ok_and(|t| t.contains(&work.task_id));
+                held = Some(if own {
+                    self.task_release.clone()
+                } else {
+                    self.developer.clone()
+                });
                 failed = self
                     .fail
                     .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
@@ -458,9 +478,14 @@ impl hoh_app::host::Executor for Team {
                 if let Ok(mut dirs) = self.run_dirs.lock() {
                     dirs.push((role.to_owned(), work.run_dir.clone()));
                 }
+                let fails = self.verifier_fails.lock().ok().and_then(|f| *f);
+                if let (Some(class), true) = (fails, work.assignment.handoff.is_some()) {
+                    failed = true;
+                    verifier_class = Some(class);
+                }
                 // A verifier reports its work done through its bridge, and its verdict in a hoh-report block of its
                 // final message, its raw session log kept as an object, as the product's agent and executor do.
-                if work.assignment.handoff.is_some() {
+                if work.assignment.handoff.is_some() && !failed {
                     let status = match self.review_report.lock().ok().and_then(|r| r.clone()) {
                         Some(review) if work.role == "reviewer" => review,
                         _ => self.report.lock().map(|s| s.clone()).unwrap_or_default(),
@@ -579,9 +604,15 @@ impl hoh_app::host::Executor for Team {
             }
             let _ = end.send(hoh_app::host::Outcome {
                 success: !failed && status.as_ref().is_ok_and(std::process::ExitStatus::success),
-                detail: if failed { "TransientExternal" } else { "ended" }.to_owned(),
+                detail: match verifier_class {
+                    Some(hoh_core::retry::FailureClass::Auth) => "BLOCKED_AUTH",
+                    Some(_) => "FAILED",
+                    None if failed => "TransientExternal",
+                    None => "ended",
+                }
+                .to_owned(),
                 group_gone,
-                class: transient,
+                class: verifier_class.unwrap_or(transient),
                 observed: hoh_core::persistence::Observed {
                     messages,
                     raw_log_path: Some(raw_log_path),
@@ -592,11 +623,21 @@ impl hoh_app::host::Executor for Team {
                 unknown_effect: false,
             });
         });
+        // What the turn runs as, as the product's prepare takes it from the registry (docs/adr/ADR-030.md decision 2).
+        let ran = self.registry().and_then(|registry| {
+            let agent = work
+                .assignment
+                .agent
+                .as_deref()
+                .and_then(hoh_agents::compat::Agent::named)?;
+            registry.prepared(agent)?.ok().map(|(_, ran)| ran)
+        });
         Ok(hoh_app::host::Started {
             pid,
             gate,
             ended,
             prompt: None,
+            ran,
         })
     }
 }
@@ -3358,4 +3399,435 @@ fn keep_s3(name: &str, value: &Value) -> R {
         )?;
     }
     keep(name, value)
+}
+
+/// TEST-020-03's team (docs/adr/ADR-030.md, its test plan): every role claude but qa, pi with no fallback.
+const PI_QA_TEAM: &str = "config_version = \"1.0\"\n\
+[team.commander]\nagent = \"claude\"\n[team.cto]\nagent = \"claude\"\n[team.developer]\nagent = \"claude\"\n\
+[team.qa]\nagent = \"pi\"\n[team.researcher]\nagent = \"claude\"\n[team.reviewer]\nagent = \"claude\"\n";
+
+/// A fake `pi` 1.5.0 in `bin` (`note` a comment line of its own: another implementation): the unmodified recorded
+/// help; its status command (`auth check`) says not logged in (credentials not configured) until `<bin>/pi.d/logged-in`
+/// exists. pi's settings in `pi_dir` name a default provider, so the registry runs that command (ADR-024 decision 7).
+fn fake_pi(bin: &Path, pi_dir: &Path, note: &str) -> R {
+    use std::os::unix::fs::PermissionsExt as _;
+    let help = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/protocol/pi/1.5.0/help.txt"
+    );
+    let d = bin.join("pi.d");
+    std::fs::create_dir_all(&d)?;
+    std::fs::create_dir_all(pi_dir)?;
+    std::fs::write(
+        pi_dir.join("settings.json"),
+        "{\"defaultProvider\": \"anthropic\"}",
+    )?;
+    // Written beside it and renamed over it: the registry sees another file, never a half-written one.
+    let staged = bin.join(".pi.new");
+    std::fs::write(
+        &staged,
+        format!(
+            "#!/bin/sh\n# {note}\ncase \"$1 $2\" in\n --version*) echo '1.5.0';;\n --help*) cat '{help}';;\n \
+             'auth check') if [ -e '{d}/logged-in' ]; then echo '{{\"status\": \"ready\"}}'; else \
+             echo '{{\"status\": \"not_ready\", \"reason\": \"credentials_not_configured\"}}'; exit 1; fi;;\n \
+             *) exit 2;;\nesac\n",
+            d = d.display()
+        ),
+    )?;
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
+    std::fs::rename(&staged, bin.join("pi"))?;
+    Ok(())
+}
+
+/// [`world_unbound`] with qa pi and a second developer writer task T3 (independent of D) when `t3`.
+fn world_pi_qa(spec: &str, t3: bool) -> String {
+    let mut world = world_unbound(spec);
+    if t3 {
+        world.push_str(
+            "\nINSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate) \
+             VALUES ('T3', 'R', 's1', 'READY', 1, 'developer', 1, 2, 1);",
+        );
+    }
+    world
+}
+
+/// A project of the logged-out-qa world (TEST-020-03's): PI_QA_TEAM, claude and pi on PATH and registered by the
+/// product's compat suite, pi logged in only when `logged_in`; the run seeded (with T3 when `t3`). The project, the
+/// specification's digest, the bin directory and the registry's PATH.
+async fn pi_qa_world(
+    dir: &Path,
+    t3: bool,
+    logged_in: bool,
+) -> R<(PathBuf, String, PathBuf, String)> {
+    let (project, spec) = project(dir).await?;
+    let bin = dir.join("bin");
+    fake_claude(&bin)?;
+    fake_pi(&bin, &dir.join("pi-agent"), "A")?;
+    if logged_in {
+        std::fs::write(bin.join("pi.d/logged-in"), "")?;
+    }
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    std::fs::write(project.join(".hoh/config.toml"), PI_QA_TEAM)?;
+    Host::start(config(&project)).await?.shutdown().await;
+    for agent in [
+        hoh_agents::compat::Agent::Claude,
+        hoh_agents::compat::Agent::Pi,
+    ] {
+        let registered = hoh_app::compat::register(&project, agent, std::ffi::OsStr::new(&path))?;
+        assert_eq!(
+            format!("{:?}", registered.entry.suite.status),
+            "Pass",
+            "{registered:?}"
+        );
+    }
+    seed(&project, &world_pi_qa(&spec, t3))?;
+    Ok((project, spec, bin, path))
+}
+
+/// The Team of the logged-out-qa world: the product's registry over `path`, pi's settings in `<dir>/pi-agent`; T3's
+/// FakeAgent held.
+fn pi_qa_team(dir: &Path, project: &Path, spec: &str, path: &str) -> Arc<Team> {
+    let team = Arc::new(Team::new(Commander::Answers, spec, project));
+    if let Ok(mut registry) = team.registry.lock() {
+        *registry = Some(Arc::new(hoh_app::host::agents::Registry::with_pi_dir(
+            path.to_owned().into(),
+            Some(dir.join("pi-agent")),
+        )));
+    }
+    if let Ok(mut held) = team.held_tasks.lock() {
+        held.push("T3".to_owned());
+    }
+    team
+}
+
+/// The qa member of run R's team view.
+async fn qa_member(host: &Host) -> R<Value> {
+    let (status, page) = get(host, "/v1/runs/R/team").await?;
+    assert_eq!(status, 200, "{page}");
+    page["items"]
+        .as_array()
+        .and_then(|items| items.iter().find(|m| m["role"] == "qa"))
+        .cloned()
+        .ok_or_else(|| format!("no qa member: {page}").into())
+}
+
+/// The candidate D completed into, and its qa verification task, once qa's task is BLOCKED.
+fn qa_blocked(project: &Path, clock: &FakeClock) -> R<(String, String)> {
+    let step = Duration::from_millis(100);
+    let opened = wait_for(
+        project,
+        clock,
+        step,
+        "SELECT json_extract(payload_json, '$.candidate_id') AS candidate, \
+         json_extract(payload_json, '$.tasks.qa') AS qa FROM events WHERE kind = 'verification.round_opened'",
+        &|r| r.as_array().is_some_and(|a| !a.is_empty()),
+    )?;
+    let candidate = opened[0]["candidate"]
+        .as_str()
+        .ok_or("no candidate")?
+        .to_owned();
+    let qa = opened[0]["qa"].as_str().ok_or("no qa task")?.to_owned();
+    wait_for(
+        project,
+        clock,
+        step,
+        &format!("SELECT state, blocked_reason FROM tasks WHERE task_id = '{qa}'"),
+        &|r| r[0]["state"] == "BLOCKED",
+    )?;
+    Ok((candidate, qa))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_020_03_a_logged_out_qa_blocks_itself_only() -> R {
+    // AC-020-03 (docs/adr/ADR-030.md decisions 4 and 7, K4): pi installed and registered but its status command says
+    // it is not logged in, qa pi with no fallback; D (T1) and T3 developer writers, T3 independent of T1. D completes into
+    // C, which is frozen into verification; then the clock moves on an hour, tick by tick, T3's FakeAgent held. The
+    // qa member is BLOCKED(BLOCKED_AUTH) missing [pi:BLOCKED_AUTH]; qa has no attempt; its verification task is BLOCKED
+    // for it with attempt_count 0; C has no PASS row and stays VERIFYING; T3 was dispatched; no qa outbox row waits for
+    // a retry. The variant without T3: once the reviewer ended, the run is BLOCKED(BLOCKED_AUTH), while with T3
+    // running it is not.
+    let mut kept = serde_json::Map::new();
+    for t3 in [true, false] {
+        let dir = tempfile::tempdir()?;
+        let (project, spec, _bin, path) = pi_qa_world(dir.path(), t3, false).await?;
+        let clock = Arc::new(FakeClock::default());
+        let team = pi_qa_team(dir.path(), &project, &spec, &path);
+        // The reviewer ends once dispatched; T3 is held.
+        team.release.store(true, Ordering::SeqCst);
+        let host = host(&project, team.clone(), clock.clone()).await?;
+        let outcome = async {
+            let step = Duration::from_millis(100);
+            let (candidate, qa) = qa_blocked(&project, &clock)?;
+            let reviewer_done = wait_for(
+                &project,
+                &clock,
+                step,
+                "SELECT count(*) AS n FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+                 WHERE t.role = 'reviewer' AND a.state = 'SETTLED'",
+                &|r| r[0]["n"] == 1,
+            )?;
+            assert_eq!(reviewer_done[0]["n"], 1);
+            if t3 {
+                wait_for(
+                    &project,
+                    &clock,
+                    step,
+                    "SELECT count(*) AS n FROM attempts WHERE task_id = 'T3' AND state = 'RUNNING'",
+                    &|r| r[0]["n"] == 1,
+                )?;
+                // An hour, tick by tick.
+                for _ in 0..360 {
+                    clock.advance(Duration::from_secs(10));
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            } else {
+                let run = wait_for(
+                    &project,
+                    &clock,
+                    step,
+                    "SELECT state, blocked_reason FROM runs WHERE run_id = 'R'",
+                    &|r| r[0]["state"] == "BLOCKED",
+                )?;
+                assert_eq!(run[0]["blocked_reason"], "BLOCKED_AUTH", "{run}");
+            }
+            let member = qa_member(&host).await?;
+            assert_eq!(
+                (&member["state"], &member["blocked_reason"], &member["missing"]),
+                (&json!("BLOCKED"), &json!("BLOCKED_AUTH"), &json!(["pi:BLOCKED_AUTH"])),
+                "{member}"
+            );
+            assert_eq!(
+                rows(
+                    &project,
+                    "SELECT count(*) AS n FROM attempts a JOIN tasks t ON t.task_id = a.task_id WHERE t.role = 'qa'"
+                )?,
+                json!([{"n": 0}])
+            );
+            assert_eq!(
+                rows(
+                    &project,
+                    &format!(
+                        "SELECT state, blocked_reason, attempt_count FROM tasks WHERE task_id = '{qa}'"
+                    )
+                )?,
+                json!([{"state": "BLOCKED", "blocked_reason": "BLOCKED_AUTH", "attempt_count": 0}])
+            );
+            assert_eq!(
+                rows(
+                    &project,
+                    &format!(
+                        "SELECT count(*) AS n FROM acceptance_results WHERE candidate_id = '{candidate}' \
+                         AND status = 'PASS'"
+                    )
+                )?,
+                json!([{"n": 0}])
+            );
+            assert_eq!(
+                rows(
+                    &project,
+                    &format!("SELECT state FROM candidates WHERE candidate_id = '{candidate}'")
+                )?,
+                json!([{"state": "VERIFYING"}])
+            );
+            assert_eq!(
+                rows(
+                    &project,
+                    "SELECT count(*) AS n FROM outbox WHERE recipient_role = 'qa' AND next_retry_at IS NOT NULL"
+                )?,
+                json!([{"n": 0}])
+            );
+            let run = rows(&project, "SELECT state, blocked_reason FROM runs WHERE run_id = 'R'")?;
+            if t3 {
+                let t3_attempts = rows(&project, "SELECT count(*) AS n FROM attempts WHERE task_id = 'T3'")?;
+                assert!(t3_attempts[0]["n"].as_i64().is_some_and(|n| n >= 1), "{t3_attempts}");
+                assert_ne!(run[0]["state"], "BLOCKED", "{run}");
+            } else {
+                assert_eq!(
+                    run,
+                    json!([{"state": "BLOCKED", "blocked_reason": "BLOCKED_AUTH"}])
+                );
+            }
+            kept.insert(
+                if t3 { "with_t3" } else { "without_t3" }.to_owned(),
+                json!({
+                    "qa_member": member,
+                    "tasks": rows(&project, "SELECT task_id, role, state, blocked_reason, attempt_count, next_retry_at FROM tasks ORDER BY created_seq")?,
+                    "attempts": rows(&project, "SELECT a.attempt_id, t.role, a.state, a.agent, a.session_id FROM attempts a JOIN tasks t ON t.task_id = a.task_id ORDER BY a.rowid")?,
+                    "role_bindings": rows(&project, "SELECT role, agent, role_epoch, session_id, state, blocked_reason, missing_json FROM role_bindings ORDER BY role")?,
+                    "outbox_qa": rows(&project, "SELECT message_id, state, attempt_count, next_retry_at FROM outbox WHERE recipient_role = 'qa'")?,
+                    "run": run,
+                    "events": rows(&project, "SELECT seq, kind, payload_json FROM events WHERE kind IN ('team.binding_blocked', 'task.blocked', 'task.unblocked', 'run.blocked', 'run.resumed') ORDER BY seq")?,
+                }),
+            );
+            R::Ok(())
+        }
+        .await;
+        host.shutdown().await;
+        team.end_agents();
+        outcome?;
+    }
+    keep("test-020-03", &Value::Object(kept))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_blocked_auth_verifier_is_dispatched_once_its_agent_logs_in() -> R {
+    // CR-018 (docs/cr/CR-018-verification-hand-overs.md:30; docs/adr/ADR-030.md decision 7): TEST-020-03's world, its
+    // qa task BLOCKED(BLOCKED_AUTH). pi logs in: after the registry's next login look, staffing grants qa a session,
+    // the pace writes task.unblocked{reason: BLOCKED_AUTH}, the task is READY again and dispatched to pi.
+    let dir = tempfile::tempdir()?;
+    let (project, spec, bin, path) = pi_qa_world(dir.path(), false, false).await?;
+    let clock = Arc::new(FakeClock::default());
+    let team = pi_qa_team(dir.path(), &project, &spec, &path);
+    let host = host(&project, team.clone(), clock.clone()).await?;
+    let outcome = async {
+        let step = Duration::from_millis(100);
+        let (_, qa) = qa_blocked(&project, &clock)?;
+        std::fs::write(bin.join("pi.d/logged-in"), "")?;
+        // The registry looks at the login again within its 30 s (ADR-024 decision 7).
+        let until = Instant::now() + Duration::from_secs(90);
+        let attempt = loop {
+            let found = rows(
+                &project,
+                &format!("SELECT attempt_id, agent, session_id FROM attempts WHERE task_id = '{qa}'"),
+            )?;
+            if found.as_array().is_some_and(|a| !a.is_empty()) {
+                break found[0].clone();
+            }
+            if Instant::now() > until {
+                return Err(format!("qa was not dispatched: {found}").into());
+            }
+            clock.advance(step);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert_eq!(attempt["agent"], "pi", "{attempt}");
+        let unblocked = rows(
+            &project,
+            &format!(
+                "SELECT json_extract(payload_json, '$.reason') AS reason FROM events WHERE kind = 'task.unblocked' \
+                 AND json_extract(payload_json, '$.task_id') = '{qa}'"
+            ),
+        )?;
+        assert_eq!(unblocked, json!([{"reason": "BLOCKED_AUTH"}]));
+        assert_eq!(
+            rows(
+                &project,
+                "SELECT state, session_id IS NOT NULL AS bound FROM role_bindings WHERE run_id = 'R' AND role = 'qa'"
+            )?,
+            json!([{"state": "ACTIVE", "bound": 1}])
+        );
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    team.end_agents();
+    outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_auth_failure_of_a_replaced_pi_does_not_block_qa() -> R {
+    // M2T15D-07 (docs/adr/ADR-030.md decisions 2, 6 and 7, K8): pi A logged in and registered, qa's turn runs as A,
+    // held. pi on PATH is replaced by B; the registry looks at B and its suite passes (the writer slot is free). A's turn
+    // then fails BLOCKED_AUTH: its task and its binding are BLOCKED_AUTH, but the registry's fact stays B's (A's failure
+    // is an older identity's). With no restart and no other upgrade, qa is rebound (epoch 2, its session granted under
+    // B), the task is unblocked, and a new QA attempt runs in B's session.
+    let dir = tempfile::tempdir()?;
+    let (project, spec, bin, path) = pi_qa_world(dir.path(), false, true).await?;
+    let clock = Arc::new(FakeClock::default());
+    let team = pi_qa_team(dir.path(), &project, &spec, &path);
+    if let Ok(mut fails) = team.verifier_fails.lock() {
+        *fails = Some(hoh_core::retry::FailureClass::Auth);
+    }
+    let host = host(&project, team.clone(), clock.clone()).await?;
+    let outcome = async {
+        let step = Duration::from_millis(100);
+        let first = wait_for(
+            &project,
+            &clock,
+            step,
+            "SELECT a.attempt_id, a.session_id, a.role_epoch FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+             WHERE t.role = 'qa' AND a.state = 'RUNNING'",
+            &|r| r.as_array().is_some_and(|a| !a.is_empty()),
+        )?;
+        let (a_attempt, a_session) = (
+            first[0]["attempt_id"].as_str().ok_or("no attempt")?.to_owned(),
+            first[0]["session_id"].as_str().ok_or("no session")?.to_owned(),
+        );
+        assert_eq!(first[0]["role_epoch"], 1);
+        fake_pi(&bin, &dir.path().join("pi-agent"), "B")?;
+        let b_sha256 = file_sha256(&bin.join("pi"))?;
+        wait_for(
+            &project,
+            &clock,
+            step,
+            &format!(
+                "SELECT json_extract(payload_json, '$.status') AS status FROM events WHERE kind = 'compat.suite_completed' \
+                 AND json_extract(payload_json, '$.agent') = 'pi' \
+                 AND json_extract(payload_json, '$.implementation_sha256') = '{b_sha256}'"
+            ),
+            &|r| r.as_array().is_some_and(|a| a.len() == 1),
+        )?;
+        team.release.store(true, Ordering::SeqCst);
+        let a_end = wait_for(
+            &project,
+            &clock,
+            step,
+            &format!("SELECT state, failure_reason FROM attempts WHERE attempt_id = '{a_attempt}'"),
+            &|r| r[0]["state"] == "FAILED",
+        )?;
+        assert_eq!(a_end[0]["failure_reason"], "BLOCKED_AUTH");
+        let blocked = rows(
+            &project,
+            &format!(
+                "SELECT json_extract(payload_json, '$.cause') AS cause, json_extract(payload_json, '$.reason') AS reason \
+                 FROM events WHERE kind = 'team.binding_blocked' AND json_extract(payload_json, '$.attempt_id') = '{a_attempt}'"
+            ),
+        )?;
+        assert_eq!(blocked, json!([{"cause": "turn", "reason": "BLOCKED_AUTH"}]));
+        let ignored = rows(
+            &project,
+            &format!(
+                "SELECT count(*) AS n FROM events WHERE kind = 'registry.turn_auth_ignored' \
+                 AND json_extract(payload_json, '$.attempt_id') = '{a_attempt}'"
+            ),
+        )?;
+        assert_eq!(ignored, json!([{"n": 1}]), "A's failure was not only a diagnostic");
+        // The task is unblocked and dispatched again in a new session granted under B.
+        let second = wait_for(
+            &project,
+            &clock,
+            step,
+            &format!(
+                "SELECT a.attempt_id, a.session_id, a.role_epoch FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+                 WHERE t.role = 'qa' AND a.attempt_id <> '{a_attempt}'"
+            ),
+            &|r| r.as_array().is_some_and(|a| !a.is_empty()),
+        )?;
+        let b_session = second[0]["session_id"].as_str().ok_or("no session")?.to_owned();
+        assert_ne!(b_session, a_session);
+        assert_eq!(second[0]["role_epoch"], 2);
+        let applied = rows(
+            &project,
+            "SELECT json_extract(payload_json, '$.cause') AS cause FROM events WHERE kind = 'team.binding_applied' \
+             AND json_extract(payload_json, '$.role') = 'qa'",
+        )?;
+        assert_eq!(applied, json!([{"cause": "rebind"}]));
+        let bound = rows(
+            &project,
+            &format!(
+                "SELECT json_extract(payload_json, '$.identity.implementation_sha256') AS sha256 FROM events \
+                 WHERE kind = 'team.session_bound' AND json_extract(payload_json, '$.session_id') = '{b_session}'"
+            ),
+        )?;
+        assert_eq!(bound, json!([{"sha256": b_sha256}]));
+        let unblocked = rows(
+            &project,
+            "SELECT json_extract(payload_json, '$.reason') AS reason FROM events WHERE kind = 'task.unblocked'",
+        )?;
+        assert_eq!(unblocked, json!([{"reason": "BLOCKED_AUTH"}]));
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    team.end_agents();
+    outcome
 }

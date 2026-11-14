@@ -1200,6 +1200,29 @@ async fn a_run_whose_commander_is_unavailable_is_blocked_while_it_owes_a_decisio
     Ok(())
 }
 
+/// Staffing unblocks run R's commander binding (docs/adr/ADR-030.md decision 4): its agent's login recovered (a visible
+/// transition the registry saw) and its session is fresh. A supervision turn's Auth failure blocks the binding
+/// (decision 6, M2T15D-05), and only staffing ends that block.
+async fn login_recovered(store: &Store, path: &PathBuf) -> R {
+    let binding = value(
+        path,
+        "SELECT json_array(agent, role_epoch) FROM role_bindings WHERE run_id = 'R' AND role = 'commander'",
+    )?;
+    assert!(
+        store
+            .staff(crate::persistence::StaffChange {
+                run_id: "R".to_owned(),
+                role: "commander".to_owned(),
+                role_epoch: binding[1].as_i64().ok_or("an epoch")?,
+                agent: binding[0].as_str().ok_or("an agent")?.to_owned(),
+                write: crate::persistence::StaffWrite::Unblock,
+            })
+            .await?,
+        "the commander binding was not blocked"
+    );
+    Ok(())
+}
+
 /// Fail the wake's turns until it has `n` failures, each allocated after the previous backoff; the time after.
 async fn fail_turns(
     store: &Store,
@@ -1324,9 +1347,13 @@ async fn failures_of_an_earlier_epoch_and_an_auth_failure_are_judged_by_the_curr
         .await?;
     store.supervise("R", context(&clock, ms + 3000)).await?;
     assert_eq!(blocked(&path)?.0, "BLOCKED");
+    // The turn's Auth failure blocked the commander binding too (docs/adr/ADR-030.md decision 6, M2T15D-05).
     assert_eq!(
         unavailable(&path)?.last().cloned(),
-        Some(json!(["supervisor.unavailable", ["auth"]]))
+        Some(json!([
+            "supervisor.unavailable",
+            ["binding_blocked", "auth"]
+        ]))
     );
     Ok(())
 }
@@ -2337,6 +2364,7 @@ async fn an_auth_unavailable_commander_probed_again_and_again_keeps_its_run_bloc
         .ok_or("allocated")?;
     let auth = crate::retry::FailureClass::Auth;
     run_turn(&store, &clock, &a.attempt_id, 3000, false, auth).await?;
+    login_recovered(&store, &path).await?;
     store
         .allocate_supervision("p1", context(&clock, 4000))
         .await?;
@@ -2352,6 +2380,7 @@ async fn an_auth_unavailable_commander_probed_again_and_again_keeps_its_run_bloc
         store.supervise("R", context(&clock, ms + 100)).await?;
         assert_eq!(blocked(&path)?.0, "BLOCKED", "probe {n} in flight");
         run_turn(&store, &clock, &probe.attempt_id, ms + 200, false, auth).await?;
+        login_recovered(&store, &path).await?;
         store
             .allocate_supervision("p1", context(&clock, ms + 1000))
             .await?;
@@ -2774,6 +2803,7 @@ async fn an_auth_unavailability_outlasts_a_probe_that_fails_for_another_reason()
         crate::retry::FailureClass::Auth,
     )
     .await?;
+    login_recovered(&store, &path).await?;
     store.supervise("R", context(&clock, 4000)).await?;
     store
         .allocate_supervision("p1", context(&clock, 4000))
@@ -3268,6 +3298,7 @@ async fn an_auth_unavailability_ends_by_a_settled_turn_and_not_by_a_withdrawn_on
         .ok_or("allocated")?;
     let auth = crate::retry::FailureClass::Auth;
     run_turn(&store, &clock, &a.attempt_id, 3000, false, auth).await?;
+    login_recovered(&store, &path).await?;
     store.supervise("R", context(&clock, 4000)).await?;
     store
         .allocate_supervision("p1", context(&clock, 4000))
@@ -3329,7 +3360,10 @@ async fn an_auth_unavailability_ends_with_its_commanders_epoch() -> R {
     assert_eq!(blocked(&path)?.0, "BLOCKED");
     exec(
         &path,
-        "UPDATE role_bindings SET role_epoch = 2 WHERE run_id = 'R' AND role = 'commander';",
+        // The handover makes the new epoch's binding ACTIVE, the turn's block of the old one gone with it
+        // (docs/adr/ADR-030.md decisions 5 and 6).
+        "UPDATE role_bindings SET role_epoch = 2, state = 'ACTIVE', blocked_reason = NULL, missing_json = '[]' \
+         WHERE run_id = 'R' AND role = 'commander';",
     )?;
     store.supervise("R", context(&clock, 5000)).await?;
     assert_eq!(blocked(&path)?.0, "RUNNING");
@@ -3955,6 +3989,7 @@ async fn an_auth_recovery_by_a_closed_wakes_turn_survives_the_horizon() -> R {
         crate::retry::FailureClass::Auth,
     )
     .await?;
+    login_recovered(&store, &path).await?;
     store.supervise("R", context(&clock, 4500)).await?;
     store
         .allocate_supervision("p1", context(&clock, 4500))
@@ -4135,6 +4170,7 @@ async fn the_last_settled_turns_wake_is_kept_not_the_latest_woken_wake_with_one(
         crate::retry::FailureClass::Auth,
     )
     .await?;
+    login_recovered(&store, &path).await?;
     store.supervise("R", context(&clock, 5000)).await?;
     store
         .allocate_supervision("p1", context(&clock, 5000))

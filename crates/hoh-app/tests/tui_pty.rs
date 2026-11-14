@@ -585,6 +585,7 @@ impl hoh_app::host::Executor for Sixty {
             gate,
             ended,
             prompt: None,
+            ran: None,
         })
     }
 }
