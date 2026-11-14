@@ -2,9 +2,10 @@
 //! 3). Status output is only read for its conclusion and never shown.
 
 use super::report::{AgentItem, Auth, Protocol};
-use hoh_agents::compat::{Agent, AgentEntry, CompatManifest, SuiteStatus, Transport};
+use hoh_agents::compat::{self, Agent, AgentEntry, CompatManifest, Transport};
 use hoh_agents::login::{self, Login};
 use hoh_agents::probe::{self, Captured, ProbeEnv, ProbeError};
+use hoh_core::staffing::Compat;
 
 use std::path::Path;
 
@@ -19,41 +20,28 @@ fn install(agent: Agent) -> &'static str {
     }
 }
 
-/// The protocol of a probed CLI against the compat manifest: compatible (or degraded, exec only) only if the
-/// implementation, help and schema hashes match an entry whose suite passed.
+/// The protocol of a probed CLI against the compat manifest, judged by `compat::verdict` as the gate and staffing judge
+/// it (docs/adr/ADR-030.md decision 9): compatible (or degraded, exec only) only if the manifest's entry for the agent
+/// has the probe's whole identity, version and help and schema hashes and records a PASS of this build's compat suite;
+/// anything else is unknown, the detail saying why.
 pub fn protocol(
     entry: &AgentEntry,
     manifest: Option<&CompatManifest>,
     agent: Agent,
 ) -> (Protocol, Option<String>) {
-    let Some(known) = manifest.and_then(|m| m.agents.get(&agent)) else {
-        return (
-            Protocol::Unknown,
-            Some("compat manifest 中没有这一项：该版本未经兼容套件验证".to_owned()),
-        );
+    let why = match compat::verdict(manifest, agent.as_str(), entry, &compat::SUITE_SET_SHA256) {
+        Compat::Verified if entry.transport == Transport::Exec => {
+            return (
+                Protocol::Degraded,
+                Some("只有 exec 可用：没有 app-server（不能中途 steer）".to_owned()),
+            );
+        }
+        Compat::Verified => return (Protocol::Compatible, None),
+        Compat::Pending(why) => format!("该版本未经本构建的兼容套件验证（{why}）"),
+        Compat::Failed(why) => format!("该版本的兼容套件未通过（{why}）"),
+        Compat::Undecided(why) => format!("兼容套件无法判定该版本（{why}）"),
     };
-    let same = known.implementation_sha256 == entry.implementation_sha256
-        && known.help_sha256 == entry.help_sha256
-        && known.schema_sha256 == entry.schema_sha256;
-    if !same {
-        return (
-            Protocol::Unknown,
-            Some("已安装版本的哈希与 compat manifest 不符：该版本未经兼容套件验证".to_owned()),
-        );
-    }
-    if known.suite.status != SuiteStatus::Pass {
-        return (
-            Protocol::Unknown,
-            Some("compat manifest 中该版本的兼容套件未通过".to_owned()),
-        );
-    }
-    if entry.transport == Transport::Exec {
-        return (
-            Protocol::Degraded,
-            Some("只有 exec 可用：没有 app-server（不能中途 steer）".to_owned()),
-        );
-    }
-    (Protocol::Compatible, None)
+    (Protocol::Unknown, Some(why))
 }
 
 /// The conclusion of a native status command (ADR-015 decision 3); `None` when it says nothing clear.
@@ -153,7 +141,7 @@ pub fn agent(agent: Agent, env: &ProbeEnv, manifest: Option<&CompatManifest>) ->
     let remedy = match (protocol, auth_note) {
         (_, Some(note)) => Some(note),
         (Protocol::Unknown, None) => {
-            Some("在没有写任务时运行兼容套件，登记该版本后再用于新 attempt".to_owned())
+            Some("host 在没有写租约时自动运行兼容套件；运行中的写任务结束后即登记该版本".to_owned())
         }
         _ => None,
     };

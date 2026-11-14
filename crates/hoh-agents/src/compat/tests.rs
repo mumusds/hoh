@@ -436,6 +436,7 @@ fn a_pass_of_another_request_definition_is_not_verified() {
         "pi.rs",
         "adapter.rs",
         "probe.rs",
+        "compat/suite.rs",
     ]
     .map(|f| format!("crates/hoh-agents/src/{f}"))
     .into_iter()

@@ -353,17 +353,50 @@ pub fn probe_identified(
     identity: Identity,
     env: &ProbeEnv,
 ) -> Result<AgentEntry, ProbeError> {
+    probe_planned(agent, identity, env, None).map(|(entry, _)| entry)
+}
+
+/// [`probe_identified`], and with a compat suite's `plan` what the tested binary says of it ([`conform`]): the same
+/// commands, limits and stop, the entry unchanged by the plan.
+fn probe_planned(
+    agent: Agent,
+    identity: Identity,
+    env: &ProbeEnv,
+    plan: Option<&crate::compat::suite::Plan>,
+) -> Result<(AgentEntry, Conformance), ProbeError> {
     let mut capabilities: BTreeMap<String, Option<bool>> = CAPABILITIES
         .iter()
         .map(|c| ((*c).to_owned(), None))
         .collect();
     let launcher = &identity.launcher;
-    let (transport, help, schema_sha256) = match agent {
-        Agent::Codex => probe_codex(launcher, env, &mut capabilities)?,
-        Agent::Claude => probe_claude(launcher, env, &mut capabilities)?,
-        Agent::Pi => probe_pi(launcher, env, &mut capabilities)?,
+    // A plan is checked only on the transport it is for ([`conform`] says so of another).
+    let of = |suite: &str| plan.filter(|plan| plan.suite == suite);
+    let ((transport, help, schema_sha256), conformance) = match agent {
+        Agent::Codex => probe_codex(
+            launcher,
+            env,
+            &mut capabilities,
+            of("codex"),
+            of("codex-exec"),
+        )?,
+        Agent::Claude => {
+            let probed = probe_claude(launcher, env, &mut capabilities)?;
+            let help = String::from_utf8_lossy(&probed.1).into_owned();
+            let conformance = of("claude").map_or_else(Conformance::default, |plan| {
+                conform::argv(plan, "claude", &help)
+            });
+            (probed, conformance)
+        }
+        Agent::Pi => {
+            let probed = probe_pi(launcher, env, &mut capabilities)?;
+            let help = String::from_utf8_lossy(&probed.1).into_owned();
+            let conformance = of("pi").map_or_else(Conformance::default, |plan| {
+                conform::argv(plan, "pi", &help)
+            });
+            (probed, conformance)
+        }
     };
-    Ok(AgentEntry {
+    let entry = AgentEntry {
         launcher_sha256: identity.launcher_sha256,
         launcher_path: identity.launcher.display().to_string(),
         implementation_sha256: identity.implementation_sha256,
@@ -379,7 +412,8 @@ pub fn probe_identified(
         help_sha256: hex(&Sha256::digest(&help)),
         schema_sha256,
         capabilities,
-    })
+    };
+    Ok((entry, conformance))
 }
 
 type Probed = (Transport, Vec<u8>, Option<String>);
@@ -392,11 +426,18 @@ fn set(capabilities: &mut BTreeMap<String, Option<bool>>, key: &str, value: bool
 /// lists `app-server` and the schema has everything a turn uses (the schema then decides steer, resume, deltas and
 /// token usage), else `exec --json`; refused when neither can run a turn (M1T07R-15, M1R-04). A listed subcommand
 /// whose help cannot be shown fails the probe.
+///
+/// With a compat suite's plan ([`conform`]): on the App Server (`app_server_plan`), the schema reading checks the
+/// plan's messages and frames, and its launch (`app-server --listen stdio://`) is checked against the tested helps; on
+/// exec (`exec_plan`), each planned launch's argv as `codex::exec_args` builds it from the tested `exec --help` and, for
+/// a resumed one, `exec resume --help` (read only then, as the product reads it).
 fn probe_codex(
     launcher: &Path,
     env: &ProbeEnv,
     caps: &mut BTreeMap<String, Option<bool>>,
-) -> Result<Probed, ProbeError> {
+    app_server_plan: Option<&crate::compat::suite::Plan>,
+    exec_plan: Option<&crate::compat::suite::Plan>,
+) -> Result<(Probed, Conformance), ProbeError> {
     let top = run_ok(launcher, &["--help"], env)?.stdout;
     let top_text = String::from_utf8_lossy(&top).into_owned();
     let listed = |name: &str| crate::adapter::lists_command(&top_text, name);
@@ -412,23 +453,31 @@ fn probe_codex(
     let mut no_app_server = "codex --help lists no app-server".to_owned();
     if listed("app-server") {
         let app = run_ok(launcher, &["app-server", "--help"], env)?.stdout;
+        let app_text = String::from_utf8_lossy(&app).into_owned();
         // It must start on stdio before its schema is worth reading (M1T07R-27).
-        let usable = match crate::codex::app_server_launch_missing(&String::from_utf8_lossy(&app)) {
+        let usable = match crate::codex::app_server_launch_missing(&app_text) {
             Some(why) => Err(why),
             None => {
-                let schema = codex_schema(launcher, env)?;
+                let (schema, conformance) = codex_schema_planned(
+                    launcher,
+                    env,
+                    app_server_plan.map(|p| std::sync::Arc::new(p.clone())),
+                )?;
                 match crate::codex::app_server_interface_missing(
                     &schema.requests,
                     &schema.client_notifications,
                     &schema.notifications,
                 ) {
-                    None => Ok(schema),
+                    None => Ok((schema, conformance)),
                     Some(why) => Err(why),
                 }
             }
         };
         match usable {
-            Ok(schema) => {
+            Ok((schema, mut conformance)) => {
+                if let Some(plan) = app_server_plan {
+                    conformance.merge(conform::app_server_launch(plan, &top_text, &app_text));
+                }
                 help.extend_from_slice(&app);
                 set(caps, "structured_events", true);
                 for (method, capability) in crate::codex::APP_SERVER_GATED {
@@ -445,7 +494,7 @@ fn probe_codex(
                     schema.notifications.contains("thread/tokenUsage/updated"),
                 );
                 caps.insert("command_execution".to_owned(), schema.command_execution);
-                return Ok((Transport::AppServer, help, Some(schema.hash)));
+                return Ok(((Transport::AppServer, help, Some(schema.hash)), conformance));
             }
             Err(why) => no_app_server = why,
         }
@@ -473,7 +522,11 @@ fn probe_codex(
         "command_execution".to_owned(),
         exec_runs_commands(&exec_text),
     );
-    Ok((Transport::Exec, help, None))
+    let conformance = match exec_plan {
+        Some(plan) => conform::exec(plan, launcher, env, &top_text, &exec_text)?,
+        None => Conformance::default(),
+    };
+    Ok(((Transport::Exec, help, None), conformance))
 }
 
 /// What `codex app-server generate-json-schema` produced: its tree hash and the request and notification methods
@@ -493,7 +546,8 @@ pub struct CodexSchema {
 thread_local! {
     /// How many diagnostic paths this thread has written out (a well-formed schema writes none; M1T07R-40).
     static RENDERED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// How many schema files this thread has parsed into values (only the three protocol files are; M1T07R-40).
+    /// How many schema files this thread has parsed into values (only the three protocol files are, and the response
+    /// files a compat suite's plan needs; M1T07R-40).
     static PARSED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Called between the walk or the removal learning of an entry and acting on it, so a test can change the entry
     /// there as a helper the CLI left running could (M1T07R-44).
@@ -1052,21 +1106,21 @@ fn inexact_number(text: &str, work: &Work) -> Result<Option<String>, ()> {
 
 /// A validation result: what the probe cannot decide exactly is `Unknown`, and only `Yes` keeps a method, so an
 /// undecided part never turns into a decision the other way (inside `oneOf`, a wrong "no" would be a wrong "yes";
-/// M1T07R-34).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Truth {
+/// M1T07R-34). The compat suite's checks are three-valued the same way (docs/adr/ADR-030.md decision 10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Truth {
     Yes,
     No,
     Unknown,
 }
 
 impl Truth {
-    fn of(yes: bool) -> Truth {
+    pub fn of(yes: bool) -> Truth {
         if yes { Truth::Yes } else { Truth::No }
     }
 
     /// Every item holds: no if one is no, else undecided if one is.
-    fn all(items: impl IntoIterator<Item = Truth>) -> Truth {
+    pub fn all(items: impl IntoIterator<Item = Truth>) -> Truth {
         let mut all = Truth::Yes;
         for item in items {
             match item {
@@ -1344,6 +1398,16 @@ fn takes_every_id(
 /// -26, -27, M1R-04). doctor --live reads the schema through it too, so it never drives an App Server whose schema the
 /// probe refused (M1T07R-31).
 pub fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<CodexSchema, ProbeError> {
+    codex_schema_planned(launcher, env, None).map(|(schema, _)| schema)
+}
+
+/// [`codex_schema`], and with a compat suite's `plan` what the export says of the plan's messages and frames, checked
+/// in the same reading before `params` are opened ([`read_schema_planned`]).
+fn codex_schema_planned(
+    launcher: &Path,
+    env: &ProbeEnv,
+    plan: Option<std::sync::Arc<crate::compat::suite::Plan>>,
+) -> Result<(CodexSchema, Conformance), ProbeError> {
     // Making the scratch directory, generating, reading and removing the schema share one window: doctor's shared
     // deadline, or without one the probe's own command limit (M1T07R-40).
     let until = reading_deadline(env, Instant::now());
@@ -1360,7 +1424,13 @@ pub fn codex_schema(launcher: &Path, env: &ProbeEnv) -> Result<CodexSchema, Prob
         let (given_up, held) = (given_up.clone(), held.clone());
         move || {
             let _ = tx.send(schema_in_scratch(
-                &launcher, &env, &generate, until, &given_up, &held,
+                &launcher,
+                &env,
+                &generate,
+                until,
+                &given_up,
+                &held,
+                plan.as_deref(),
             ));
             #[cfg(test)]
             hold_after_result();
@@ -1524,7 +1594,8 @@ fn schema_in_scratch(
     until: Instant,
     given_up: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     held: &Held,
-) -> Result<CodexSchema, ProbeError> {
+    plan: Option<&crate::compat::suite::Plan>,
+) -> Result<(CodexSchema, Conformance), ProbeError> {
     let stopped = || ProbeError::Failed {
         argv: generate.to_vec(),
         detail: "given up before the schema was generated".to_owned(),
@@ -1550,7 +1621,7 @@ fn schema_in_scratch(
         &env,
     )
     .map(|_| ());
-    read_and_remove(scratch, generated, generate, Some(until))
+    read_and_remove(scratch, generated, generate, Some(until), plan)
 }
 
 /// Read the schema the CLI generated into `scratch` (if it did), then remove the output; what is not removed fails
@@ -1560,7 +1631,8 @@ fn read_and_remove(
     generated: Result<(), ProbeError>,
     generate: &[String],
     until: Option<Instant>,
-) -> Result<CodexSchema, ProbeError> {
+    plan: Option<&crate::compat::suite::Plan>,
+) -> Result<(CodexSchema, Conformance), ProbeError> {
     let unusable = |detail: String| ProbeError::Failed {
         argv: generate.to_vec(),
         detail,
@@ -1577,11 +1649,15 @@ fn read_and_remove(
         // counted before it is read (M1T07R-40, -42).
         let checks = Work::new(u64::MAX, until).stopped_by(&scratch.given_up);
         let files = schema_files(&scratch.dir, scratch.owned.as_fd(), &checks).map_err(unusable)?;
-        read_schema(
+        // A plan's checks spend a budget of their own, so they never change what the probe finds (docs/adr/ADR-030.md
+        // decision 10).
+        let conforming = Work::new(VALIDATION_BUDGET, until).stopped_by(&scratch.given_up);
+        read_schema_planned(
             &scratch.dir,
             &files,
             &Work::new(VALIDATION_BUDGET, until).stopped_by(&scratch.given_up),
             &checks,
+            plan.map(|plan| (plan, &conforming)),
         )
         .map_err(unusable)
     });
@@ -1606,18 +1682,35 @@ fn read_and_remove(
 /// whose message can be valid, whether the App Server runs commands ([`app_server_runs_commands`]), and the tree hash.
 /// Every other `.json` file must parse too, and is not kept. Work the budget or the deadline cut short is a failure,
 /// never fewer methods (M1T07R-40).
+#[cfg(test)]
 fn read_schema(
     dir: &Path,
     files: &[(PathBuf, Vec<u8>)],
     work: &Work,
     checks: &Work,
 ) -> Result<CodexSchema, String> {
+    read_schema_planned(dir, files, work, checks, None).map(|(schema, _)| schema)
+}
+
+/// [`read_schema`], and with a compat suite's plan and the work it may spend, what the export says of the plan's
+/// messages, headless answers and frames ([`conform::schema`]), judged on the files as written before any `params` is
+/// opened; besides the three protocol files only the response files the answers need are parsed, under the same value
+/// limit (docs/adr/ADR-030.md decision 10, "探测读取的扩展"). The plan never changes what the probe finds.
+fn read_schema_planned(
+    dir: &Path,
+    files: &[(PathBuf, Vec<u8>)],
+    work: &Work,
+    checks: &Work,
+    plan: Option<(&crate::compat::suite::Plan, &Work)>,
+) -> Result<(CodexSchema, Conformance), String> {
     const PROTOCOL: [&str; 3] = [
         "ClientRequest.json",
         "ClientNotification.json",
         "ServerNotification.json",
     ];
     between("parse", dir);
+    let needed = plan.map(|(plan, _)| conform::needed_responses(plan));
+    let mut responses = BTreeMap::new();
     let mut parsed = BTreeMap::new();
     for (file, bytes) in files {
         if !file.extension().is_some_and(|e| e == "json") {
@@ -1652,6 +1745,24 @@ fn read_schema(
             }
             None => {
                 serde_json::from_str::<serde::de::IgnoredAny>(text).map_err(|e| not_json(&e))?;
+                let response = file
+                    .strip_prefix(dir)
+                    .ok()
+                    .and_then(|rel| rel.to_str())
+                    .filter(|rel| needed.as_ref().is_some_and(|n| n.contains(*rel)));
+                if let Some(name) = response {
+                    // Parsed only once it is known to be JSON, and only within the protocol files' value limit.
+                    let value = if json_values(bytes) > MAX_SCHEMA_VALUES {
+                        Err(format!("it has more than {MAX_SCHEMA_VALUES} values"))
+                    } else {
+                        #[cfg(test)]
+                        PARSED.with(|n| n.set(n.get() + 1));
+                        serde_json::from_str::<serde_json::Value>(text)
+                            .map(|value| (value, text))
+                            .map_err(|e| format!("it is not JSON: {e}"))
+                    };
+                    responses.insert(name.to_owned(), value);
+                }
             }
         }
     }
@@ -1672,6 +1783,21 @@ fn read_schema(
             Ok(None) => {}
         }
     }
+    // The plan's messages and frames, judged on the files as written, before their params are opened (decision 10).
+    let conformance = match plan {
+        Some((plan, conforming)) => conform::schema(
+            plan,
+            conform::Export {
+                client_requests: &parsed["ClientRequest.json"].0,
+                client_notifications: &parsed["ClientNotification.json"].0,
+                server_notifications: &parsed["ServerNotification.json"].0,
+                responses: &responses,
+            },
+            conforming,
+        ),
+        None => Conformance::default(),
+    };
+    drop(responses);
     // Whole frames, judged on the files as written, before their params are opened (docs/adr/ADR-030.md decision 12).
     let command_execution = app_server_runs_commands(
         parsed.get("ClientRequest.json").map(|(value, _)| value),
@@ -1742,7 +1868,7 @@ fn read_schema(
     if work.ran_out() || checks.ran_out() {
         return Err("the schema was not read within its time and work limits".to_owned());
     }
-    Ok(schema)
+    Ok((schema, conformance))
 }
 
 /// How long removing a probe's scratch directory may run past the reading window.
@@ -3099,6 +3225,9 @@ fn wait_for_output(outputs: &[Output], wait: Duration) -> io::Result<()> {
         Err(e) => Err(e.into()),
     }
 }
+
+mod conform;
+pub use conform::{Conformance, conform};
 
 #[cfg(test)]
 mod capability_tests;
@@ -5328,7 +5457,7 @@ mod tests {
                 }
             }));
         });
-        let result = read_and_remove(scratch, Ok(()), &["codex".to_owned()], None);
+        let result = read_and_remove(scratch, Ok(()), &["codex".to_owned()], None, None);
         BETWEEN.with(|hook| *hook.borrow_mut() = None);
         let quarantine = named.borrow().clone().ok_or("no quarantine was made")?;
         let Err(ProbeError::Failed { detail, .. }) = result else {
