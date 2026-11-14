@@ -166,6 +166,9 @@ pub struct Observation {
     pub n: u64,
     pub available: bool,
     pub logged_in: bool,
+    /// The agent's staffing fact read with it is usable and its compat suite verified it (docs/adr/ADR-030.md decisions
+    /// 2, 7 and 11).
+    pub verified: bool,
 }
 
 impl Context {

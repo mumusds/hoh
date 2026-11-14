@@ -95,6 +95,14 @@ pub struct Usable {
 /// Each looked-at agent's fact, by agent name.
 pub type Facts = BTreeMap<String, Fact>;
 
+/// What the host's registry knew of the agents it was asked to look at, read at one moment under its lock (decision
+/// 1): each one's fact and its last actual look. One tick's staffing, pace, supervision and allocation share it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Snapshot {
+    pub facts: Facts,
+    pub observations: BTreeMap<String, crate::decision::Observation>,
+}
+
 /// What a turn's failure excludes (decision 6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]

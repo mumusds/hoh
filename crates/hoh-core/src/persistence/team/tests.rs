@@ -1260,6 +1260,55 @@ async fn the_agents_to_look_at_include_every_bindings_not_only_the_teams() -> R 
     Ok(())
 }
 
+#[tokio::test]
+async fn the_agents_to_look_at_include_the_fallbacks_of_each_bindings_revision() -> R {
+    // docs/adr/ADR-030.md decision 2: a role's fallbacks in the revision its binding was made at are looked at too, so
+    // its candidates have facts when staffing evaluates its order; the current team's fallbacks as well.
+    let dir = tempfile::tempdir()?;
+    let (store, _path) = open(&dir)?;
+    let claude_only = json!({
+        "commander": {"agent": "claude"},
+        "cto": {"agent": "claude"},
+        "developer": {"agent": "claude"},
+        "qa": {"agent": "claude", "fallback": ["pi"]},
+        "researcher": {"agent": "claude"},
+        "reviewer": {"agent": "claude"},
+    });
+    store
+        .submit_command(team_change("claude-only", 0, claude_only))
+        .await?;
+    assert_eq!(
+        store.runner_waiting("p1").await?.agents,
+        ["claude".to_owned(), "pi".to_owned()].into(),
+        "the current team's fallbacks"
+    );
+    store
+        .submit_command(start("R1", Config::default().budget))
+        .await?;
+    store
+        .submit_command(team_change(
+            "no-fallback",
+            1,
+            json!({"qa": {"agent": "claude", "fallback": []}}),
+        ))
+        .await?;
+    // R1's qa binding is still at revision 1 (the change waits for its checkpoint): its fallback pi is looked at.
+    assert_eq!(
+        store.runner_waiting("p1").await?.agents,
+        ["claude".to_owned(), "pi".to_owned()].into(),
+        "the fallbacks of R1's qa binding's revision"
+    );
+    store
+        .team_checkpoint("R1", crate::persistence::Availability::default())
+        .await?;
+    assert_eq!(
+        store.runner_waiting("p1").await?.agents,
+        ["claude".to_owned()].into(),
+        "no binding's revision names pi any more"
+    );
+    Ok(())
+}
+
 /// R1 as `working` leaves it, with the state a Commander's handover package names (REQ-019 b4): two APPLIED decisions
 /// and a REJECTED one, an OPEN, a REOPENED and a RESOLVED issue, a QUEUED and a DELIVERED input, an outbox row
 /// PENDING, one DEAD_LETTER and one ACKED, and candidate C1 FROZEN.

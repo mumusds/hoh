@@ -1,23 +1,34 @@
-//! The product's agents (docs/adr/ADR-022.md decisions 9 and 10): the registry that finds and probes each agent CLI
-//! outside the writer, and the binder that gives each binding its session with what its agent's probe found, or
-//! blocks it when its agent is unavailable.
+//! The product's agents (docs/adr/ADR-022.md decisions 9 and 10, docs/adr/ADR-030.md decision 2): the registry that
+//! finds and probes each agent CLI outside the writer and keeps what staffing knows of each, and the binder that gives
+//! each binding its session with what its agent's probe found, or blocks it when its agent is unavailable.
 
 use hoh_agents::capabilities::Probed;
-use hoh_agents::compat::Agent;
+use hoh_agents::compat::{self, Agent, AgentEntry, CompatManifest};
 use hoh_agents::launch;
-use hoh_agents::probe::{self, ProbeEnv};
+use hoh_agents::login::{self, Login};
+use hoh_agents::probe::{self, ProbeEnv, ProbeError};
+use hoh_core::decision::Observation;
 use hoh_core::persistence::{PersistError, SessionGrant, Store, Unbound};
+use hoh_core::staffing::{AgentIdentity, Compat, Fact, FileStamp, Snapshot, Stamp, Usable};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 /// How long one probe command may take.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// How often a wanted agent's login is looked at again (its status command, docs/adr/ADR-024.md decision 7).
+/// How often a wanted agent's login is looked at again (its status command, docs/adr/ADR-024.md decision 7), and how
+/// soon a temporary probe failure is probed again though its files did not change (docs/adr/ADR-030.md decision 2).
 const AUTH_EVERY: Duration = Duration::from_secs(30);
+
+/// The diagnostic of a compat manifest that cannot be read or is not schema-valid (docs/adr/ADR-030.md decision 10).
+pub const MANIFEST_UNREADABLE: &str = "compat.manifest_unreadable";
+
+/// The diagnostic of a turn's BLOCKED_AUTH that is not the agent's fact: another identity's, or older than the agent's
+/// latest recovery (docs/adr/ADR-030.md decision 2, M2T15D-07).
+pub const TURN_AUTH_IGNORED: &str = "registry.turn_auth_ignored";
 
 /// An agent found and probed: what starting its turns needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,36 +39,269 @@ pub struct Ready {
     /// What its probe found.
     pub capabilities: Probed,
     pub facts: launch::Facts,
+    /// The probe's entry: the agent's identity, help and schema hashes and capabilities, its suite not run
+    /// (docs/adr/ADR-030.md decision 2).
+    pub entry: AgentEntry,
+    /// The stamps of the launcher and implementation, read before they were probed.
+    pub stamp: Stamp,
+    /// The `n` of the look that probed it; with the host's epoch, its fact's generation.
+    pub look: u64,
 }
 
-/// The identity of a launcher and its implementation (device, inode, size, modification time): probed again when it
-/// changes.
-type Stamp = Vec<(u64, u64, u64, i64)>;
+/// The class of a look's failure: the variant of the [`ProbeError`] it came from (docs/adr/ADR-030.md decision 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeClass {
+    NotFound,
+    Unsupported,
+    TimedOut,
+    NotStarted,
+    Failed,
+    Io,
+}
 
+impl ProbeClass {
+    pub fn of(error: &ProbeError) -> ProbeClass {
+        match error {
+            ProbeError::NotFound { .. } => ProbeClass::NotFound,
+            ProbeError::Unsupported { .. } => ProbeClass::Unsupported,
+            ProbeError::TimedOut { .. } => ProbeClass::TimedOut,
+            ProbeError::NotStarted { .. } => ProbeClass::NotStarted,
+            ProbeError::Failed { .. } => ProbeClass::Failed,
+            ProbeError::Io(_) => ProbeClass::Io,
+        }
+    }
+
+    /// A temporary failure is probed again [`AUTH_EVERY`] after it though its files did not change; a permanent one
+    /// only once they change.
+    pub fn temporary(self) -> bool {
+        !matches!(self, ProbeClass::NotFound | ProbeClass::Unsupported)
+    }
+}
+
+/// Why a look found an agent unusable: its class and what the probe said (docs/adr/ADR-030.md decision 2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Probe {
+    pub class: ProbeClass,
+    pub detail: String,
+}
+
+impl Probe {
+    fn of(error: &ProbeError) -> Probe {
+        Probe {
+            class: ProbeClass::of(error),
+            detail: error.to_string(),
+        }
+    }
+
+    /// The staffing fact it is.
+    pub fn fact(&self) -> Fact {
+        match self.class {
+            ProbeClass::NotFound => Fact::NotInstalled(self.detail.clone()),
+            ProbeClass::Unsupported => Fact::Unsupported(self.detail.clone()),
+            ProbeClass::TimedOut | ProbeClass::NotStarted | ProbeClass::Failed | ProbeClass::Io => {
+                Fact::ProbeFailed(self.detail.clone())
+            }
+        }
+    }
+}
+
+/// What a turn ran as (docs/adr/ADR-030.md decision 2, M2T15D-07): its agent, the identity of the fact its prepare
+/// used and the registry's generation `(host_epoch, n)` of that agent then. A turn's BLOCKED_AUTH is latched as the
+/// agent's fact only by it ([`Registry::turn_auth_failed`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ran {
+    pub agent: Agent,
+    pub identity: AgentIdentity,
+    pub generation: (i64, u64),
+}
+
+/// Something the registry found that the host records (its kind, as an event's, and what it says); the registry
+/// itself writes nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Diagnostic {
+    pub kind: &'static str,
+    pub detail: String,
+}
+
+/// One file's stamp as the cache compares it (`stat`, following links): device, inode, size, modification and change
+/// time. The change time moves with a chmod or an xattr too, so a change of metadata alone is probed again
+/// (docs/adr/ADR-030.md decision 2, M2T15D-201).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileKey {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl FileKey {
+    fn read(path: &Path) -> std::io::Result<FileKey> {
+        use std::os::unix::fs::MetadataExt as _;
+        let m = std::fs::metadata(path)?;
+        Ok(FileKey {
+            dev: m.dev(),
+            ino: m.ino(),
+            size: m.size(),
+            mtime: (m.mtime(), m.mtime_nsec()),
+            ctime: (m.ctime(), m.ctime_nsec()),
+        })
+    }
+
+    fn stamp(&self) -> FileStamp {
+        FileStamp {
+            dev: self.dev,
+            ino: self.ino,
+            ctime_sec: self.ctime.0,
+            ctime_nsec: self.ctime.1,
+        }
+    }
+}
+
+/// The launcher's and the implementation's.
+type Key = [FileKey; 2];
+
+fn key(launcher: &Path, implementation: &Path) -> std::io::Result<Key> {
+    Ok([FileKey::read(launcher)?, FileKey::read(implementation)?])
+}
+
+fn stamp_of(key: &Key) -> Stamp {
+    Stamp {
+        launcher: key[0].stamp(),
+        implementation: key[1].stamp(),
+    }
+}
+
+/// What an actual look at an agent found.
 #[derive(Debug, Clone)]
 struct Seen {
-    stamp: Stamp,
-    outcome: Result<Ready, String>,
+    /// The files' stamps it was found under; `None` when there were none to read (no launcher, or not readable): looked
+    /// at again each time.
+    key: Option<Key>,
+    /// When: a temporary failure is probed again [`AUTH_EVERY`] after it.
+    at: Instant,
+    outcome: Result<Ready, Probe>,
+    /// A ready agent's session capabilities in the registry's project, once per actual look (`None`: no project yet).
+    session: Option<Result<serde_json::Value, String>>,
+}
+
+/// An agent's login as its status command last said it, and when.
+#[derive(Debug, Clone)]
+struct LoginSeen {
+    at: Instant,
+    /// What logging in takes, when it clearly said logged out.
+    missing: Option<String>,
+}
+
+/// What the registry knows of one agent.
+#[derive(Debug, Default)]
+struct Known {
+    seen: Option<Seen>,
+    login: Option<LoginSeen>,
+    /// Its login check's last clear answer: a logged-out one followed by a logged-in one is a visible recovery.
+    said: Option<Login>,
+    /// Actual looks at it (a probe, a PATH that lacks it, a login check; a cache unchanged is none): the `n` of an
+    /// observation's identity (docs/adr/ADR-025.md decision 5).
+    looks: u64,
+    /// The identity its last usable look found.
+    identity: Option<AgentIdentity>,
+    /// The `n` of its latest recovery fact (a look that found another identity, a visible login): 0 before any.
+    recovered_at: u64,
+    /// A turn's BLOCKED_AUTH, its fact until the next recovery (docs/adr/ADR-030.md decision 2).
+    latched: Option<String>,
+}
+
+/// The registry's state, under its one lock.
+#[derive(Debug, Default)]
+struct State {
+    /// The agents the runner needs looked at (its team's and fallbacks, its bindings'): [`Registry::refresh`] looks at
+    /// them, off the runner's tick, so no probe holds up a tick or the host's stop.
+    wanted: BTreeSet<Agent>,
+    agents: BTreeMap<Agent, Known>,
+    /// The project's compat manifest as the host last read it (docs/adr/ADR-030.md decision 10); `None`: empty.
+    manifest: Option<CompatManifest>,
+    /// The project whose session capabilities the facts carry ([`Registry::open_manifest`]).
+    root: Option<PathBuf>,
+    /// The host epoch the host last named (a snapshot's or observations'): the generations are of it.
+    host_epoch: i64,
+}
+
+impl State {
+    /// `agent`'s fact and observation as the registry knows them now: the one constructor of a snapshot's items and of
+    /// [`Registry::fact`] (docs/adr/ADR-030.md decision 1, M2T15D-100).
+    fn item(&self, agent: Agent, suite_set: &str) -> (Option<Fact>, Option<Observation>) {
+        let Some(known) = self.agents.get(&agent) else {
+            return (None, None);
+        };
+        let fact = self.fact(agent, known, suite_set);
+        let observation = known
+            .seen
+            .as_ref()
+            .filter(|_| known.looks > 0)
+            .map(|seen| Observation {
+                host_epoch: self.host_epoch,
+                n: known.looks,
+                available: seen.outcome.is_ok(),
+                logged_in: known.latched.is_none()
+                    && known.login.as_ref().is_none_or(|l| l.missing.is_none()),
+                verified: matches!(&fact, Some(Fact::Usable(u)) if u.compat == Compat::Verified),
+            });
+        (fact, observation)
+    }
+
+    /// Decision 2's fact of `agent`; `None` while it was not looked at, or while the registry has no project to say
+    /// what a session of it would have.
+    fn fact(&self, agent: Agent, known: &Known, suite_set: &str) -> Option<Fact> {
+        let seen = known.seen.as_ref()?;
+        let ready = match &seen.outcome {
+            Ok(ready) => ready,
+            Err(probe) => return Some(probe.fact()),
+        };
+        let session = match seen.session.as_ref()? {
+            Ok(session) => session,
+            Err(why) => return Some(Fact::Unsupported(why.clone())),
+        };
+        // The status command's "not logged in" first: it says what logging in takes.
+        if let Some(why) = known
+            .login
+            .as_ref()
+            .and_then(|l| l.missing.as_ref())
+            .or(known.latched.as_ref())
+        {
+            return Some(Fact::LoginMissing(why.clone()));
+        }
+        Some(Fact::Usable(Box::new(Usable {
+            version: ready.version.clone(),
+            identity: ready.entry.identity(),
+            stamp: ready.stamp,
+            generation: (self.host_epoch, ready.look),
+            session: session.clone(),
+            granted: hoh_core::decision::granted_capabilities(session),
+            compat: compat::verdict(
+                self.manifest.as_ref(),
+                agent.as_str(),
+                &ready.entry,
+                suite_set,
+            ),
+        })))
+    }
 }
 
 /// The host's agents, found on its PATH and probed lazily (decision 10).
 #[derive(Debug)]
 pub struct Registry {
     path: OsString,
-    seen: Mutex<BTreeMap<Agent, Seen>>,
-    /// The agents the runner needs looked at (its team's, its unbound bindings'): [`Registry::refresh`] looks at them,
-    /// off the runner's tick, so no probe holds up a tick or the host's stop.
-    wanted: Mutex<BTreeSet<Agent>>,
-    /// Each agent's login as last looked at, and when: `Some(what to do)` when its status says it is not logged in.
-    logins: Mutex<BTreeMap<Agent, (std::time::Instant, Option<String>)>>,
+    state: Mutex<State>,
     /// The host's stop: every probe command running is killed and none starts (decision 10 v6, M2T07R-202, -300, -450,
     /// -700).
     stopping: probe::ProbeStop,
     /// Where pi keeps its settings, which name the provider its login is checked for (docs/adr/ADR-024.md decision 7).
     pi_dir: Option<PathBuf>,
-    /// How many actual looks at each agent this registry made (a probe, a PATH that lacks it, a login check; a cache
-    /// unchanged is none): the `n` of an observation's identity (docs/adr/ADR-025.md decision 5).
-    looks: Mutex<BTreeMap<Agent, u64>>,
+    /// [`PROBE_TIMEOUT`] and [`AUTH_EVERY`], shorter in the tests.
+    probe_timeout: Duration,
+    every: Duration,
+    /// This build's suite set ([`compat::SUITE_SET_SHA256`]); the tests verify against one of their own.
+    suite_set: String,
 }
 
 impl Registry {
@@ -71,13 +315,33 @@ impl Registry {
     pub fn with_pi_dir(path: OsString, pi_dir: Option<PathBuf>) -> Registry {
         Registry {
             path,
-            seen: Mutex::new(BTreeMap::new()),
-            wanted: Mutex::new(BTreeSet::new()),
-            logins: Mutex::new(BTreeMap::new()),
+            state: Mutex::new(State::default()),
             stopping: probe::ProbeStop::default(),
             pi_dir,
-            looks: Mutex::new(BTreeMap::new()),
+            probe_timeout: PROBE_TIMEOUT,
+            every: AUTH_EVERY,
+            suite_set: compat::SUITE_SET_SHA256.to_owned(),
         }
+    }
+
+    /// The registry with a probe command's limit and [`AUTH_EVERY`] of a test's.
+    #[cfg(test)]
+    fn with_timings(mut self, probe_timeout: Duration, every: Duration) -> Registry {
+        self.probe_timeout = probe_timeout;
+        self.every = every;
+        self
+    }
+
+    /// The registry verifying against a test's suite set: until the build's digest arrives, [`compat::SUITE_SET_SHA256`]
+    /// matches no schema-valid manifest.
+    #[cfg(test)]
+    fn with_suite_set(mut self, suite_set: &str) -> Registry {
+        self.suite_set = suite_set.to_owned();
+        self
+    }
+
+    fn state(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The host stops: every probe command in its slot is killed (its group and its leader) before this returns, one
@@ -92,44 +356,103 @@ impl Registry {
     /// The agents named `names` are the ones to look at from now on (names that are not agents are left out).
     pub fn want<'a>(&self, names: impl IntoIterator<Item = &'a String>) {
         let agents: BTreeSet<Agent> = names.into_iter().filter_map(|n| Agent::named(n)).collect();
-        if let Ok(mut wanted) = self.wanted.lock() {
-            *wanted = agents;
-        }
+        self.state().wanted = agents;
     }
 
-    /// Look at every wanted agent now (blocking: probed again only when its files changed).
+    /// Look at every wanted agent now (blocking: probed again only when its files changed, or a temporary failure's
+    /// [`AUTH_EVERY`] passed).
     pub fn refresh(&self) {
-        let wanted: Vec<Agent> = self
-            .wanted
-            .lock()
-            .map(|w| w.iter().copied().collect())
-            .unwrap_or_default();
+        let wanted: Vec<Agent> = self.state().wanted.iter().copied().collect();
         for agent in wanted {
             let _ = self.look(agent);
         }
     }
 
+    /// Read the project's compat manifest at `root` into the registry, the one the facts are verified against
+    /// (docs/adr/ADR-030.md decision 10; the host calls it as it starts): missing, it is empty; unreadable or not valid
+    /// against the locked schema, it is empty too and the diagnostic returned says why, for the host to record. The
+    /// temporary files a publish that crashed left beside it are deleted. `root` is the project the facts' session
+    /// capabilities are for.
+    pub fn open_manifest(&self, root: &Path) -> Option<Diagnostic> {
+        if let Ok(entries) = std::fs::read_dir(root.join(".hoh")) {
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(compat::is_manifest_temp)
+                {
+                    // Best effort: a leftover kept is never read, and the next start deletes it.
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+        let (manifest, said) = match read_manifest(&compat::manifest_path(root)) {
+            Ok(manifest) => (manifest, None),
+            Err(detail) => (
+                None,
+                Some(Diagnostic {
+                    kind: MANIFEST_UNREADABLE,
+                    detail,
+                }),
+            ),
+        };
+        let mut state = self.state();
+        state.manifest = manifest;
+        let moved = state.root.as_deref() != Some(root);
+        state.root = Some(root.to_path_buf());
+        for (agent, known) in &mut state.agents {
+            if let Some(seen) = known.seen.as_mut()
+                && let Ok(ready) = &seen.outcome
+                && (moved || seen.session.is_none())
+            {
+                seen.session = Some(ready.session_capabilities(*agent, root));
+            }
+        }
+        said
+    }
+
     /// Look at `agent`'s login (installed: `ready`) unless it was looked at within [`AUTH_EVERY`]: its status command,
-    /// under the host's stop like every probe command (decision 7). A look the stop ended says nothing.
+    /// under the host's stop like every probe command (decision 7). A look the stop ended says nothing. A clear
+    /// "logged in" after a clear "not logged in" is a recovery (docs/adr/ADR-030.md decision 2).
     fn look_at_login(&self, agent: Agent, ready: &Ready) {
         let recent = self
-            .logins
-            .lock()
-            .ok()
-            .and_then(|l| l.get(&agent).map(|(at, _)| at.elapsed() < AUTH_EVERY))
-            .unwrap_or(false);
+            .state()
+            .agents
+            .get(&agent)
+            .and_then(|known| known.login.as_ref())
+            .is_some_and(|login| login.at.elapsed() < self.every);
         if recent {
             return;
         }
-        let missing =
-            hoh_agents::login::missing(agent, &ready.launcher, &self.env(), self.pi_dir.as_deref());
+        let checked = login::status(agent, &ready.launcher, &self.env(), self.pi_dir.as_deref());
         if self.stopping.is_stopped() {
             return;
         }
-        if let Ok(mut logins) = self.logins.lock() {
-            logins.insert(agent, (std::time::Instant::now(), missing));
+        // Only a clear "not logged in" is missing; one that says nothing clear, or could not be run, is not (as
+        // `login::missing`).
+        let (said, missing) = match checked {
+            Ok((out, provider)) => {
+                let said = login::conclusion(agent, &out);
+                let missing =
+                    (said == Some(Login::Missing)).then(|| login::hint(agent, provider.as_deref()));
+                (said, missing)
+            }
+            Err(_) => (None, None),
+        };
+        let mut state = self.state();
+        let known = state.agents.entry(agent).or_default();
+        known.looks += 1;
+        if said == Some(Login::LoggedIn) && known.said == Some(Login::Missing) {
+            known.recovered_at = known.looks;
+            known.latched = None;
         }
-        self.looked(agent);
+        if said.is_some() {
+            known.said = said;
+        }
+        known.login = Some(LoginSeen {
+            at: Instant::now(),
+            missing,
+        });
     }
 
     /// What was last seen of every agent, without looking (decision 8): those found available, those found unavailable
@@ -140,30 +463,31 @@ impl Registry {
             unavailable: BTreeMap::new(),
             auth_missing: BTreeMap::new(),
         };
-        // An agent counts as available only once its login was looked at too: before that, a change to it waits as
-        // for an agent not looked at yet, so it never takes effect ahead of the login check (decision 7).
-        let logins = self.logins.lock().map(|l| l.clone()).unwrap_or_default();
-        for (agent, (_, missing)) in &logins {
-            if let Some(why) = missing {
-                known
-                    .auth_missing
-                    .insert(agent.as_str().to_owned(), why.clone());
+        let state = self.state();
+        for (agent, about) in &state.agents {
+            let name = agent.as_str().to_owned();
+            // A turn's BLOCKED_AUTH latched is a missing login as much as the status command's (decision 2).
+            if let Some(why) = about
+                .login
+                .as_ref()
+                .and_then(|l| l.missing.as_ref())
+                .or(about.latched.as_ref())
+            {
+                known.auth_missing.insert(name.clone(), why.clone());
             }
-        }
-        if let Ok(seen) = self.seen.lock() {
-            for (agent, seen) in seen.iter() {
-                let name = agent.as_str().to_owned();
-                match &seen.outcome {
-                    Ok(_) if logins.contains_key(agent) => {
-                        if let Some(available) = known.available.as_mut() {
-                            available.insert(name);
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(why) => {
-                        known.unavailable.insert(name, why.clone());
+            match about.seen.as_ref().map(|seen| &seen.outcome) {
+                // An agent counts as available only once its login was looked at too: before that, a change to it
+                // waits as for an agent not looked at yet, so it never takes effect ahead of the login check
+                // (decision 7).
+                Some(Ok(_)) if about.login.is_some() => {
+                    if let Some(available) = known.available.as_mut() {
+                        available.insert(name);
                     }
                 }
+                Some(Err(probe)) => {
+                    known.unavailable.insert(name, probe.detail.clone());
+                }
+                Some(Ok(_)) | None => {}
             }
         }
         known
@@ -173,132 +497,253 @@ impl Registry {
         ProbeEnv {
             path: self.path.clone(),
             fixture_root: None,
-            timeout: PROBE_TIMEOUT,
+            timeout: self.probe_timeout,
             log: None,
             deadline: None,
             cancel: Some(self.stopping.clone()),
         }
     }
 
-    /// `agent` as it is now: probed again when its launcher or implementation changed, else as last seen. Blocking: run
-    /// it outside the writer and off the async workers.
+    /// `agent` as it is now: probed again when its launcher or implementation changed (their stamps, change time
+    /// included) or a temporary failure's [`AUTH_EVERY`] passed, else as last seen. Blocking: run it outside the writer
+    /// and off the async workers.
     pub fn look(&self, agent: Agent) -> Result<Ready, String> {
         let env = self.env();
-        let outcome = (|| {
+        let found = (|| {
             let launcher = probe::find_on_path(agent.command(), &env.path)
-                .ok_or_else(|| format!("{} is not on PATH", agent.command()))?;
+                .ok_or_else(|| Probe::of(&ProbeError::NotFound { agent }))?;
             let implementation =
-                probe::resolve_implementation(agent, &launcher).map_err(|e| e.to_string())?;
-            let stamp = stamp(&[&launcher, &implementation]).map_err(|e| e.to_string())?;
-            if let Ok(seen) = self.seen.lock()
-                && let Some(seen) = seen.get(&agent)
-                && seen.stamp == stamp
-            {
-                return Ok((stamp, seen.outcome.clone(), false));
-            }
-            let probed = probe::probe(agent, &env)
-                .map_err(|e| e.to_string())
-                .and_then(|entry| {
-                    let facts = launch::read(agent, &launcher, &env)?;
-                    Ok(Ready {
-                        launcher: launcher.clone(),
-                        version: entry.cli_version,
-                        capabilities: entry.capabilities,
-                        facts,
-                    })
-                });
-            Ok((stamp, probed, true))
+                probe::resolve_implementation(agent, &launcher).map_err(|e| Probe::of(&e))?;
+            let key = key(&launcher, &implementation).map_err(|e| Probe::of(&ProbeError::Io(e)))?;
+            Ok((launcher, key))
         })();
-        let (stamp, outcome, looked) = match outcome {
-            Ok(found) => found,
-            Err(why) => (Stamp::new(), Err(why), true),
+        let (key, outcome, looked) = match found {
+            Err(probe) => (None, Err(probe), true),
+            Ok((launcher, key)) => match self.cached(agent, &key) {
+                Some(outcome) => (Some(key), outcome, false),
+                None => (Some(key), probed(agent, &launcher, &key, &env), true),
+            },
         };
         // A look the host's stop ended says nothing of the agent: not recorded, so it stays as last seen (or not looked
         // at), and no dispatch takes the stop for the agent being unavailable (M2T07R-352).
         if self.stopping.is_stopped() {
-            return outcome;
+            return outcome.map_err(|probe| probe.detail);
         }
         // Its login too, once it is usable (decision 7): looked at before the agent is recorded, so an agent seen
         // usable always has its login looked at.
         if let Ok(ready) = &outcome {
             self.look_at_login(agent, ready);
             if self.stopping.is_stopped() {
-                return outcome;
+                return outcome.map_err(|probe| probe.detail);
             }
         }
-        if let Ok(mut seen) = self.seen.lock() {
-            seen.insert(
-                agent,
-                Seen {
-                    stamp,
-                    outcome: outcome.clone(),
-                },
-            );
-        }
-        if looked {
-            self.looked(agent);
-        }
-        outcome
+        let outcome = if looked {
+            self.record(agent, key, outcome)
+        } else {
+            outcome
+        };
+        outcome.map_err(|probe| probe.detail)
     }
 
-    fn looked(&self, agent: Agent) {
-        if let Ok(mut looks) = self.looks.lock() {
-            *looks.entry(agent).or_insert(0) += 1;
+    /// What was last seen of `agent` under the stamps `key`, unless it is to be probed again: another key, or a
+    /// temporary failure [`AUTH_EVERY`] old.
+    fn cached(&self, agent: Agent, key: &Key) -> Option<Result<Ready, Probe>> {
+        let mut state = self.state();
+        let root = state.root.clone();
+        let seen = state.agents.get_mut(&agent)?.seen.as_mut()?;
+        if seen.key.as_ref() != Some(key) {
+            return None;
         }
+        if let Err(probe) = &seen.outcome
+            && probe.class.temporary()
+            && seen.at.elapsed() >= self.every
+        {
+            return None;
+        }
+        if let (Ok(ready), None, Some(root)) = (&seen.outcome, &seen.session, &root) {
+            seen.session = Some(ready.session_capabilities(agent, root));
+        }
+        Some(seen.outcome.clone())
+    }
+
+    /// Record an actual look at `agent`: its `n` moves; a ready agent gets its session capabilities in the project and,
+    /// when its identity is not the one last found, its recovery (docs/adr/ADR-030.md decision 2).
+    fn record(
+        &self,
+        agent: Agent,
+        key: Option<Key>,
+        mut outcome: Result<Ready, Probe>,
+    ) -> Result<Ready, Probe> {
+        let mut state = self.state();
+        let root = state.root.clone();
+        let known = state.agents.entry(agent).or_default();
+        known.looks += 1;
+        let mut session = None;
+        if let Ok(ready) = &mut outcome {
+            ready.look = known.looks;
+            let identity = ready.entry.identity();
+            if known
+                .identity
+                .as_ref()
+                .is_some_and(|last| *last != identity)
+            {
+                known.recovered_at = known.looks;
+                known.latched = None;
+            }
+            known.identity = Some(identity);
+            session = root.map(|root| ready.session_capabilities(agent, &root));
+        }
+        known.seen = Some(Seen {
+            key,
+            at: Instant::now(),
+            outcome: outcome.clone(),
+            session,
+        });
+        outcome
     }
 
     /// The last actual look at each agent this registry looked at, with its identity `(host_epoch, n)`
     /// (docs/adr/ADR-025.md decision 5): available when its probe succeeded, logged in unless its login check said
-    /// otherwise.
-    pub fn observations(
-        &self,
-        host_epoch: i64,
-    ) -> BTreeMap<String, hoh_core::decision::Observation> {
-        let looks = self.looks.lock().map(|l| l.clone()).unwrap_or_default();
-        let logins = self.logins.lock().map(|l| l.clone()).unwrap_or_default();
-        let seen = self.seen.lock().map(|s| s.clone()).unwrap_or_default();
-        seen.iter()
-            .filter_map(|(agent, seen)| {
-                let n = *looks.get(agent)?;
-                Some((
-                    agent.as_str().to_owned(),
-                    hoh_core::decision::Observation {
-                        host_epoch,
-                        n,
-                        available: seen.outcome.is_ok(),
-                        logged_in: logins
-                            .get(agent)
-                            .is_none_or(|(_, missing)| missing.is_none()),
-                    },
-                ))
+    /// otherwise or a turn's BLOCKED_AUTH is latched, verified when its fact is usable and verified.
+    pub fn observations(&self, host_epoch: i64) -> BTreeMap<String, Observation> {
+        let mut state = self.state();
+        state.host_epoch = host_epoch;
+        state
+            .agents
+            .keys()
+            .filter_map(|agent| {
+                let observation = state.item(*agent, &self.suite_set).1?;
+                Some((agent.as_str().to_owned(), observation))
             })
             .collect()
     }
 
+    /// Each wanted agent's fact and observation, read under the registry's lock in one go (docs/adr/ADR-030.md
+    /// decision 1); an agent not looked at yet has neither.
+    pub fn snapshot(&self, host_epoch: i64) -> Arc<Snapshot> {
+        let mut state = self.state();
+        state.host_epoch = host_epoch;
+        let mut snapshot = Snapshot::default();
+        for agent in &state.wanted {
+            let (fact, observation) = state.item(*agent, &self.suite_set);
+            let name = agent.as_str().to_owned();
+            if let Some(fact) = fact {
+                snapshot.facts.insert(name.clone(), fact);
+            }
+            if let Some(observation) = observation {
+                snapshot.observations.insert(name, observation);
+            }
+        }
+        Arc::new(snapshot)
+    }
+
+    /// `agent`'s fact now, as a snapshot taken now would have it (the same constructor, M2T15D-100); `None` while it
+    /// was not looked at.
+    pub fn fact(&self, agent: Agent) -> Option<Fact> {
+        self.state().item(agent, &self.suite_set).0
+    }
+
+    /// A turn that `ran` as it says failed BLOCKED_AUTH (docs/adr/ADR-030.md decision 2, M2T15D-07): latched as the
+    /// agent's `LoginMissing` fact when it ran under the agent's current identity and no earlier than its latest
+    /// recovery, until the next recovery (a look finding another identity, a visible logged-out then logged-in) or the
+    /// host's restart; a look that only says "logged in" does not clear it. Otherwise it is an older identity's or from
+    /// before the recovery: the fact is left as it is, and the diagnostic returned says so for the host to record.
+    pub fn turn_auth_failed(&self, ran: &Ran, attempt_id: &str) -> Option<Diagnostic> {
+        let mut state = self.state();
+        let epoch = state.host_epoch;
+        let ignored = |detail: String| {
+            Some(Diagnostic {
+                kind: TURN_AUTH_IGNORED,
+                detail,
+            })
+        };
+        let Some(known) = state.agents.get_mut(&ran.agent) else {
+            return ignored(format!(
+                "turn {attempt_id} failed BLOCKED_AUTH; {} was not looked at",
+                ran.agent.as_str()
+            ));
+        };
+        let current = known
+            .seen
+            .as_ref()
+            .and_then(|seen| seen.outcome.as_ref().ok())
+            .map(|ready| ready.entry.identity());
+        let recovered = (epoch, known.recovered_at);
+        match current {
+            Some(identity) if identity == ran.identity && ran.generation >= recovered => {
+                known.latched = Some(format!("turn {attempt_id} failed BLOCKED_AUTH"));
+                None
+            }
+            Some(identity) if identity == ran.identity => ignored(format!(
+                "turn {attempt_id} failed BLOCKED_AUTH; it started at generation {:?}, before {}'s recovery at {recovered:?}",
+                ran.generation,
+                ran.agent.as_str()
+            )),
+            Some(identity) => ignored(format!(
+                "turn {attempt_id} failed BLOCKED_AUTH under {:?}; {} is now {identity:?}",
+                ran.identity,
+                ran.agent.as_str()
+            )),
+            None => ignored(format!(
+                "turn {attempt_id} failed BLOCKED_AUTH; {} was not found ready at its last look",
+                ran.agent.as_str()
+            )),
+        }
+    }
+
     /// `agent` as it was last looked at, without looking again; `None` if it never was.
     pub fn seen(&self, agent: Agent) -> Option<Result<Ready, String>> {
-        self.seen
-            .lock()
-            .ok()
-            .and_then(|seen| seen.get(&agent).map(|s| s.outcome.clone()))
+        self.state()
+            .agents
+            .get(&agent)?
+            .seen
+            .as_ref()
+            .map(|seen| seen.outcome.clone().map_err(|probe| probe.detail))
     }
 }
 
-fn stamp(paths: &[&Path]) -> std::io::Result<Stamp> {
-    use std::os::unix::fs::MetadataExt as _;
-    paths
-        .iter()
-        .map(|p| {
-            std::fs::metadata(p).map(|m| {
-                (
-                    m.dev(),
-                    m.ino(),
-                    m.size(),
-                    m.mtime() * 1_000_000_000 + m.mtime_nsec(),
-                )
-            })
-        })
-        .collect()
+/// Probe `agent` at `launcher`, its files' stamps being `key`: its entry and launch facts.
+fn probed(agent: Agent, launcher: &Path, key: &Key, env: &ProbeEnv) -> Result<Ready, Probe> {
+    let entry = probe::probe(agent, env).map_err(|e| Probe::of(&e))?;
+    // The same commands the probe just ran: their failure now is a temporary one.
+    let facts = launch::read(agent, launcher, env).map_err(|detail| Probe {
+        class: ProbeClass::Failed,
+        detail,
+    })?;
+    Ok(Ready {
+        launcher: launcher.to_path_buf(),
+        version: entry.cli_version.clone(),
+        capabilities: entry.capabilities.clone(),
+        facts,
+        entry,
+        stamp: stamp_of(key),
+        look: 0,
+    })
+}
+
+/// The compat manifest at `path`: `None` when there is none; why when it cannot be read or is not valid against the
+/// locked schema.
+fn read_manifest(path: &Path) -> Result<Option<CompatManifest>, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    hoh_core::schema::compat_manifest()
+        .validate(&value)
+        .map_err(|violations| {
+            let first: Vec<String> = violations
+                .iter()
+                .take(3)
+                .map(|v| format!("{} {}", v.instance_path, v.message))
+                .collect();
+            format!("{}: not schema-valid: {}", path.display(), first.join("; "))
+        })?;
+    serde_json::from_value(value)
+        .map(Some)
+        .map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// The capabilities every role needs, and those a role following `contract`'s role contract needs too (REQ-020
