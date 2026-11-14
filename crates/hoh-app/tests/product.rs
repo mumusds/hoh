@@ -3327,3 +3327,234 @@ async fn a_turns_logs_that_cannot_be_kept_as_objects_are_registered_where_they_a
     world.stop_fakes()?;
     outcome
 }
+
+/// Holds each compat suite whose run ended before its publication until `<dir>/release` exists, making `<dir>/held`
+/// as it does (docs/adr/ADR-030.md decision 10: the suite stays open meanwhile; the test's hook, CR-006).
+#[derive(Debug)]
+struct HoldSuite(PathBuf);
+
+impl hoh_app::host::HostHooks for HoldSuite {
+    fn suite_ran(&self, _agent: &str) {
+        let _ = std::fs::write(self.0.join("held"), "");
+        let end = Instant::now() + Duration::from_secs(120);
+        // Its directory gone, the test that held it has ended.
+        while self.0.exists() && !self.0.join("release").exists() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = std::fs::write(self.0.join("left"), "");
+    }
+}
+
+/// Wait until `file` exists, for at most `limit`.
+async fn exists(file: &Path, limit: Duration) -> R {
+    let end = Instant::now() + limit;
+    while !file.exists() {
+        if Instant::now() > end {
+            return Err(format!("{} never appeared", file.display()).into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Ok(())
+}
+
+/// The project's compat suite events in order, one line each: `seq kind payload`.
+fn suite_events(project: &Path) -> R<Vec<(i64, String, Value)>> {
+    let rows = query(
+        project,
+        "SELECT json_group_array(json_array(seq, kind, json(payload_json))) FROM \
+         (SELECT * FROM events WHERE kind LIKE 'compat.suite_%' ORDER BY seq)",
+    )?;
+    let rows: Vec<(i64, String, Value)> = serde_json::from_str(&rows)?;
+    Ok(rows)
+}
+
+fn kinds(events: &[(i64, String, Value)]) -> Vec<&str> {
+    events.iter().map(|(_, kind, _)| kind.as_str()).collect()
+}
+
+#[tokio::test]
+async fn a_writer_waits_for_a_running_suite() -> R {
+    // docs/adr/ADR-030.md decision 10 (M2T15D-04, K7): the host runs the compat suite of claude, which nothing
+    // registered, once it looked at it; while the suite is open (held here after its run, before its publication) a
+    // writer task due stays READY with no attempt and the writer slot is granted to no one, while a reader task is
+    // dispatched; once the suite published, the next round grants the writer.
+    let world = World::new()?;
+    world.claude(None)?;
+    world.bind_installed()?;
+    let project = world.project();
+    let hold = world.dir.path().join("hold");
+    std::fs::create_dir_all(&hold)?;
+    let mut config = world.config();
+    config.hooks = std::sync::Arc::new(HoldSuite(hold.clone()));
+    let host = start_when_free(config).await?;
+    let outcome = async {
+        let run_id = started(&host, "s1").await?;
+        ready(&project, &run_id, &[])?;
+        exists(&hold.join("held"), Duration::from_secs(60)).await?;
+        let events = suite_events(&project)?;
+        assert_eq!(
+            kinds(&events),
+            ["compat.suite_opened", "compat.suite_started"],
+            "{events:?}"
+        );
+        assert_eq!(events[0].2["agent"], "claude");
+        let suite = events[0].2["suite_id"].clone();
+        exec(
+            &project,
+            &format!(
+                "INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate) \
+                 VALUES ('T-W', '{run_id}', 's1', 'READY', 1, 'developer', 1, 1, 1);"
+            ),
+        )?;
+        ready(&project, &run_id, &[("T-R", "developer")])?;
+        until(
+            &project,
+            "SELECT count(*) FROM attempts WHERE task_id = 'T-R'",
+            "1",
+            Duration::from_secs(30),
+        )
+        .await?;
+        // Rounds go on meanwhile (a tick is 200 ms): the writer is still not granted.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            query(
+                &project,
+                "SELECT state || '/' || (SELECT count(*) FROM attempts WHERE task_id = 'T-W') FROM tasks \
+                 WHERE task_id = 'T-W'"
+            )?,
+            "READY/0"
+        );
+        assert_eq!(
+            query(&project, "SELECT count(*) FROM leases WHERE kind = 'writer'")?,
+            "0"
+        );
+        assert!(!project.join(".hoh/compat-manifest.json").exists());
+        std::fs::write(hold.join("release"), "")?;
+        until(
+            &project,
+            "SELECT count(*) FROM attempts WHERE task_id = 'T-W'",
+            "1",
+            Duration::from_secs(30),
+        )
+        .await?;
+        let events = suite_events(&project)?;
+        assert_eq!(
+            kinds(&events),
+            [
+                "compat.suite_opened",
+                "compat.suite_started",
+                "compat.suite_ended",
+                "compat.suite_completed"
+            ],
+            "{events:?}"
+        );
+        assert_eq!(events[2].2, json!({"suite_id": suite, "status": "PASS"}));
+        let granted: i64 = query(
+            &project,
+            "SELECT min(event_seq) FROM outbox WHERE json_extract(payload_json, '$.kind') = 'dispatch' \
+             AND json_extract(payload_json, '$.task_id') = 'T-W'",
+        )?
+        .parse()?;
+        assert!(
+            events[2].0 < granted,
+            "the writer was granted (seq {granted}) before the suite ended ({})",
+            events[2].0
+        );
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(project.join(".hoh/compat-manifest.json"))?)?;
+        assert_eq!(manifest["agents"]["claude"]["suite"]["status"], "PASS");
+        assert_eq!(
+            manifest["agents"]["claude"]["suite"]["fixture_set_sha256"],
+            json!(hoh_agents::compat::SUITE_SET_SHA256.as_str())
+        );
+        R::Ok(())
+    }
+    .await;
+    let _ = std::fs::write(hold.join("release"), "");
+    host.shutdown().await;
+    world.stop_fakes()?;
+    outcome?;
+    exists(&hold.join("left"), Duration::from_secs(10)).await
+}
+
+#[tokio::test]
+async fn a_stopped_host_abandons_its_suite() -> R {
+    // docs/adr/ADR-030.md decision 10 ("有界、停止与崩溃"): the host stops while its suite is open (held after its run,
+    // before its publication): the suite is stopped and ended `abandoned`, nothing is published.
+    let world = World::new()?;
+    world.claude(None)?;
+    world.bind_installed()?;
+    let project = world.project();
+    let hold = world.dir.path().join("hold");
+    std::fs::create_dir_all(&hold)?;
+    let mut config = world.config();
+    config.hooks = std::sync::Arc::new(HoldSuite(hold.clone()));
+    let host = start_when_free(config).await?;
+    let held = exists(&hold.join("held"), Duration::from_secs(60)).await;
+    host.shutdown().await;
+    std::fs::write(hold.join("release"), "")?;
+    exists(&hold.join("left"), Duration::from_secs(10)).await?;
+    world.stop_fakes()?;
+    held?;
+    let events = suite_events(&project)?;
+    assert_eq!(
+        kinds(&events),
+        [
+            "compat.suite_opened",
+            "compat.suite_started",
+            "compat.suite_ended"
+        ],
+        "{events:?}"
+    );
+    assert_eq!(
+        events[2].2,
+        json!({"suite_id": events[0].2["suite_id"], "status": "abandoned"})
+    );
+    assert!(!project.join(".hoh/compat-manifest.json").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_hosts_start_holds_an_unreadable_manifest_as_empty_and_says_so() -> R {
+    // docs/adr/ADR-030.md decision 10 ("清单只由 host 写，放在注册表里"): the host reads the compat manifest as it starts;
+    // one that is not JSON is held as empty, with a `compat.manifest_unreadable` event of its epoch, and the temporary
+    // file a publication that crashed left beside it is deleted; claude's suite then publishes a whole manifest.
+    let world = World::new()?;
+    world.claude(None)?;
+    world.bind_installed()?;
+    let project = world.project();
+    let hoh = project.join(".hoh");
+    std::fs::write(hoh.join("compat-manifest.json"), "{")?;
+    let leftover = hoh.join(".compat-manifest.json.1.1.tmp");
+    std::fs::write(&leftover, "{")?;
+    let host = start_when_free(world.config()).await?;
+    let outcome = async {
+        until(
+            &project,
+            "SELECT count(*) FROM events WHERE kind = 'compat.suite_completed'",
+            "1",
+            Duration::from_secs(60),
+        )
+        .await?;
+        let said: Value = serde_json::from_str(&query(
+            &project,
+            "SELECT payload_json FROM events WHERE kind = 'compat.manifest_unreadable'",
+        )?)?;
+        assert_eq!(said["host_epoch"], json!(host.host_epoch), "{said}");
+        assert!(
+            said["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("compat-manifest.json")),
+            "{said}"
+        );
+        assert!(!leftover.exists(), "a leftover temporary manifest was kept");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(hoh.join("compat-manifest.json"))?)?;
+        assert_eq!(manifest["agents"]["claude"]["suite"]["status"], "PASS");
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    world.stop_fakes()?;
+    outcome
+}

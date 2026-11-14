@@ -53,6 +53,10 @@ const CHILD_KILL_AT_HANDOVER: &str = "HOH_TEST_RECOVERY_KILL_AT_HANDOVER";
 /// steer) and writes what each got, one line each.
 const CHILD_OLD_COMMANDER: &str = "HOH_TEST_RECOVERY_OLD_COMMANDER";
 
+/// A directory: the child's compat suites are held after their run, before their publication, `<dir>/held` made, until
+/// `<dir>/release` exists (docs/adr/ADR-030.md decision 10).
+const CHILD_HOLD_SUITE: &str = "HOH_TEST_RECOVERY_HOLD_SUITE";
+
 /// The child's exit code when it submitted its decision and was not killed.
 const NOT_KILLED: i32 = 77;
 
@@ -390,6 +394,23 @@ impl hoh_app::host::HostHooks for KillAtRunner {
     }
 }
 
+/// Holds each compat suite whose run ended before its publication until `<0>/release` exists, making `<0>/held` as it
+/// does (the test's hook, CR-006).
+#[derive(Debug)]
+struct HoldSuite(PathBuf);
+
+impl hoh_app::host::HostHooks for HoldSuite {
+    fn suite_ran(&self, _agent: &str) {
+        let _ = std::fs::write(self.0.join("held"), "");
+        let end = Instant::now() + Duration::from_secs(120);
+        // Its directory gone, the test that held it has ended.
+        while self.0.exists() && !self.0.join("release").exists() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = std::fs::write(self.0.join("left"), "");
+    }
+}
+
 fn runner_point(name: &str) -> Option<hoh_app::host::RunnerPoint> {
     use hoh_app::host::RunnerPoint;
     Some(match name {
@@ -597,6 +618,9 @@ fn recovery_host() {
     }
     if let Some(clock) = std::env::var_os(CHILD_CLOCK) {
         config.clock = hoh_app::host::HostClock(Arc::new(FileClock(PathBuf::from(clock))));
+    }
+    if let Some(hold) = std::env::var_os(CHILD_HOLD_SUITE) {
+        config.hooks = Arc::new(HoldSuite(PathBuf::from(hold)));
     }
     let runner_kill = std::env::var(CHILD_RUNNER_KILL).ok();
     if let Some(point) = &runner_kill {
@@ -4807,5 +4831,158 @@ fn test_021_03_a_host_killed_in_its_supervisors_step_wakes_once_for_what_it_had_
         "test-021-03.json",
         &json!({"triggers": triggers, "cursor": cursor, "need_decision_seqs": [121, 122, 123, 124, 125]}),
     )?;
+    Ok(())
+}
+
+#[test]
+fn a_crash_during_the_suite_reopens_the_writer_slot() -> R {
+    // docs/adr/ADR-030.md decision 10 ("有界、停止与崩溃", K7): a host is killed -9 while its compat suite of pi is open
+    // (held after its run, before its publication), a writer task due waiting for it. The next host's epoch closes
+    // that suite, which never ends: the writer slot is granted at once; pi, still unverified, is admitted again in the
+    // new epoch (deferred behind that writer); the manifest changes only when the new suite publishes, once the
+    // writer ended (here by the run's cancel: the test executor takes no work).
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir()?;
+    let project = dir.path().join("project");
+    let bin = dir.path().join("bin");
+    let (first_hold, second_hold) = (dir.path().join("hold-1"), dir.path().join("hold-2"));
+    for d in [&project, &bin, &first_hold, &second_hold] {
+        std::fs::create_dir_all(d)?;
+    }
+    let help = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/protocol/pi/1.5.0/help.txt"
+    );
+    // While `bin/slow` exists its version comes 2 s late, so the next host's first round runs before its first look.
+    std::fs::write(
+        bin.join("pi"),
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n --version) [ -e '{slow}' ] && /bin/sleep 2; echo '1.5.0';;\n \
+             --help) /bin/cat '{help}';;\n *) exit 2;;\nesac\n",
+            slow = bin.join("slow").display()
+        ),
+    )?;
+    std::fs::set_permissions(bin.join("pi"), std::fs::Permissions::from_mode(0o755))?;
+    let manifest = project.join(".hoh/compat-manifest.json");
+    let suites = |epoch: i64, kind: &str| -> R<String> {
+        query(
+            &db(&project),
+            &format!(
+                "SELECT count(*) FROM events WHERE kind = '{kind}' AND json_extract(payload_json, '$.suite_id') IN \
+                 (SELECT json_extract(payload_json, '$.suite_id') FROM events WHERE kind = 'compat.suite_opened' \
+                  AND json_extract(payload_json, '$.host_epoch') = {epoch})"
+            ),
+        )
+    };
+    let wait_file = |file: &Path| -> R {
+        let end = Instant::now() + Duration::from_secs(60);
+        while !file.exists() {
+            if Instant::now() > end {
+                return Err(format!("{} never appeared", file.display()).into());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Ok(())
+    };
+    let first = start_child(
+        &project,
+        &[
+            (CHILD_AGENTS, bin.as_os_str()),
+            (CHILD_HOLD_SUITE, first_hold.as_os_str()),
+        ],
+    )?;
+    wait_file(&first_hold.join("held"))?;
+    let epoch: i64 = query(&db(&project), "SELECT host_epoch FROM projects")?.parse()?;
+    assert_eq!(suites(epoch, "compat.suite_opened")?, "1");
+    assert_eq!(suites(epoch, "compat.suite_started")?, "1");
+    // Run R, its roles bound to pi with sessions, a writer task due: not granted while the suite is open.
+    seed(
+        &project,
+        "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', :p, printf('%064d', 1), 1);
+         INSERT INTO runs(run_id, project_id, spec_id, state, mode, revision, created_at) VALUES
+           ('R', :p, 's1', 'RUNNING', 'AUTO', 1, '2026-11-14T00:00:00Z');
+         INSERT INTO sessions(session_id, agent, role, agent_version, capabilities_json) VALUES
+           ('s-c', 'pi', 'commander', '1.5.0', '{\"structured_events\": true, \"resume\": true}'),
+           ('s-d', 'pi', 'developer', '1.5.0', '{\"structured_events\": true, \"command_execution\": true}');
+         INSERT INTO role_bindings(run_id, role, agent, session_id, role_epoch, config_revision, bound_at) VALUES
+           ('R', 'commander', 'pi', 's-c', 1, 0, '2026-11-14T00:00:00Z'),
+           ('R', 'developer', 'pi', 's-d', 1, 0, '2026-11-14T00:00:00Z');
+         INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate) VALUES
+           ('T-W', 'R', 's1', 'READY', 1, 'developer', 1, 1, 1);",
+    )?;
+    std::thread::sleep(Duration::from_secs(1));
+    let granted = "SELECT count(*) FROM leases WHERE kind = 'writer' AND attempt_id LIKE 'T-W/%'";
+    assert_eq!(query(&db(&project), granted)?, "0");
+    drop(first);
+    assert!(!manifest.exists());
+    // The next host: the old suite never ends, yet the writer slot is granted.
+    std::fs::write(bin.join("slow"), "")?;
+    let second = start_child(
+        &project,
+        &[
+            (CHILD_AGENTS, bin.as_os_str()),
+            (CHILD_HOLD_SUITE, second_hold.as_os_str()),
+        ],
+    )?;
+    let next: i64 = query(&db(&project), "SELECT host_epoch FROM projects")?.parse()?;
+    assert_eq!(next, epoch + 1);
+    assert!(
+        wait_for(&db(&project), granted, "1", Duration::from_secs(30))?,
+        "the writer slot was not granted in the new epoch"
+    );
+    // pi is admitted again in the new epoch, deferred behind that writer; the manifest is as it was.
+    let deferred = "SELECT count(*) FROM events WHERE kind = 'compat.suite_deferred' \
+                    AND json_extract(payload_json, '$.lease_attempt_id') LIKE 'T-W/%'";
+    assert!(
+        wait_for(&db(&project), deferred, "1", Duration::from_secs(30))?,
+        "pi's suite was not admitted again"
+    );
+    assert_eq!(suites(next, "compat.suite_opened")?, "1");
+    assert_eq!(suites(next, "compat.suite_started")?, "0");
+    assert!(
+        !manifest.exists(),
+        "the manifest changed before a publication"
+    );
+    // The writer ends (the run's cancel); the suite runs, held before its publication, then publishes.
+    let info: Value =
+        serde_json::from_str(&std::fs::read_to_string(project.join(".hoh/host.json"))?)?;
+    let revision = query(
+        &db(&project),
+        "SELECT revision FROM runs WHERE run_id = 'R'",
+    )?;
+    let cancel = json!({
+        "schema_version": "1.0", "command_id": "c-cancel", "idempotency_key": "cancel",
+        "expected_revision": revision.parse::<i64>()?, "kind": "CancelRun", "run_id": "R",
+        "payload": {"reason": "the writer ends"},
+    });
+    let (status, body) = http(&info, "POST", "/v1/commands", Some(&cancel.to_string()))?;
+    assert_eq!(status, 202, "{body}");
+    wait_file(&second_hold.join("held"))?;
+    assert_eq!(suites(next, "compat.suite_started")?, "1");
+    assert!(
+        !manifest.exists(),
+        "the manifest changed before a publication"
+    );
+    std::fs::write(second_hold.join("release"), "")?;
+    assert!(
+        wait_for(
+            &db(&project),
+            &format!(
+                "SELECT count(*) FROM events WHERE kind = 'compat.suite_completed' \
+                 AND json_extract(payload_json, '$.suite_id') LIKE '%/compat-suite-opened/{next}/%'"
+            ),
+            "1",
+            Duration::from_secs(30)
+        )?,
+        "the new suite did not publish"
+    );
+    let published: Value = serde_json::from_slice(&std::fs::read(&manifest)?)?;
+    assert_eq!(published["agents"]["pi"]["suite"]["status"], "PASS");
+    assert_eq!(
+        suites(epoch, "compat.suite_ended")?,
+        "0",
+        "the old suite never ended"
+    );
+    drop(second);
     Ok(())
 }

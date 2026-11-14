@@ -399,27 +399,14 @@ pub fn verdict(
 }
 
 /// Where a project's compat manifest is: `.hoh/compat-manifest.json` (ADR-015 decision 2).
-pub fn manifest_path(root: &std::path::Path) -> std::path::PathBuf {
-    root.join(".hoh").join(MANIFEST_FILE)
-}
+pub use hoh_core::compat_manifest::path as manifest_path;
 
-/// The manifest's file name in the project's `.hoh/`.
-const MANIFEST_FILE: &str = "compat-manifest.json";
-
-/// A temporary file a publish writes the whole new manifest to before renaming it over [`manifest_path`]
-/// (docs/adr/ADR-030.md decision 10), `tag` making it the writer's own: `.hoh/.compat-manifest.json.<tag>.tmp`. The host
-/// deletes those a crash left when it opens the manifest ([`is_manifest_temp`]).
-pub fn manifest_temp(root: &std::path::Path, tag: &str) -> std::path::PathBuf {
-    root.join(".hoh")
-        .join(format!(".{MANIFEST_FILE}.{tag}.tmp"))
-}
+/// A temporary file a publication writes the whole new manifest to before renaming it over [`manifest_path`]
+/// (docs/adr/ADR-030.md decision 10): `.hoh/.compat-manifest.json.<tag>.tmp`.
+pub use hoh_core::compat_manifest::temp as manifest_temp;
 
 /// Whether `name` (a file name in `.hoh/`) is one of [`manifest_temp`]'s.
-pub fn is_manifest_temp(name: &str) -> bool {
-    name.strip_prefix(&format!(".{MANIFEST_FILE}."))
-        .and_then(|rest| rest.strip_suffix(".tmp"))
-        .is_some_and(|tag| !tag.is_empty())
-}
+pub use hoh_core::compat_manifest::is_temp as is_manifest_temp;
 
 /// The manifest document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

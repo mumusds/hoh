@@ -33,3 +33,23 @@ pub fn child_id(parent: &str, suffix: &str) -> String {
     let suffix = shorten(suffix, MAX_SUFFIX);
     format!("{}/{suffix}", shorten(parent, MAX_ID - 1 - suffix.len()))
 }
+
+/// The room a series stem leaves for a member's number: `/` and the 20 digits of a u64.
+const MEMBER_ROOM: usize = 21;
+
+/// The stem of the family of ids `family` numbers under `parent` (docs/adr/ADR-030.md decision 5, M2T15D-202):
+/// `<parent>/<family>` while it leaves [`MEMBER_ROOM`] within [`MAX_ID`], else shortened as a long id is (cut and
+/// tagged with its FNV-1a hash) to at most `MAX_ID - 21` bytes. Every member of it ([`member`]) then fits and starts
+/// with `<stem>/`, which a store counts by (unlike `child_id(parent, "<family>/<n>")`, which shortens the whole suffix
+/// and so need not start with `child_id(parent, family)`).
+pub fn series(parent: &str, family: &str) -> String {
+    shorten(&format!("{parent}/{family}"), MAX_ID - MEMBER_ROOM)
+}
+
+/// Member `n` (from 1) of the series whose stem is `stem`: `<stem>/<n>`, in decimal with no leading zero.
+pub fn member(stem: &str, n: u64) -> String {
+    format!("{stem}/{n}")
+}
+
+#[cfg(test)]
+mod tests;

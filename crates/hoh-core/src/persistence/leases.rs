@@ -70,8 +70,106 @@ fn effective(row: &Row, now: &str) -> bool {
     row.expires_at.as_str() > now || !row.holder_ended
 }
 
+/// The compat suite open in a project's current host epoch (docs/adr/ADR-030.md decision 10, K7): opened at its first
+/// deferral or admission, ended by its publication or by the host; at most one at a time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct OpenSuite {
+    /// Member `n` of the epoch's opened series.
+    pub(super) suite_id: String,
+    pub(super) n: u64,
+    /// The id its end takes: member `n` of the epoch's ended series.
+    pub(super) ended_id: String,
+    pub(super) agent: String,
+    pub(super) implementation_sha256: String,
+    /// It was admitted to run (`compat.suite_started`), not only deferred.
+    pub(super) started: bool,
+}
+
+/// The stems of host epoch `host_epoch`'s opened and ended suites in project `project_id` (decision 5's numbering,
+/// M2T15D-202).
+pub(super) fn suite_series(project_id: &str, host_epoch: i64) -> (String, String) {
+    (
+        crate::ids::series(project_id, &format!("compat-suite-opened/{host_epoch}")),
+        crate::ids::series(project_id, &format!("compat-suite-ended/{host_epoch}")),
+    )
+}
+
+/// The id of `suite_id`'s `compat.suite_started`.
+pub(super) fn suite_started_id(suite_id: &str) -> String {
+    crate::ids::child_id(suite_id, "started")
+}
+
+/// The suite open in `project_id`'s current host epoch, if one is: the epoch's opened suites outnumber its ended ones
+/// (counted on the event ids' unique index, decision 5), and the last opened is the open one. Only the current epoch
+/// counts: a suite a host that stopped or crashed left open is closed by the next host's epoch (decision 10, "有界、停止
+/// 与崩溃").
+pub(super) fn suite_open(
+    tx: &Connection,
+    project_id: &str,
+) -> Result<Option<OpenSuite>, PersistError> {
+    let epoch: Option<i64> = tx
+        .query_row(
+            "SELECT host_epoch FROM projects WHERE project_id = ?1",
+            params![project_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some(epoch) = epoch else {
+        return Ok(None);
+    };
+    let (opened, ended) = suite_series(project_id, epoch);
+    let n = super::series::count(tx, &opened)?;
+    if n <= super::series::count(tx, &ended)? {
+        return Ok(None);
+    }
+    let suite_id = crate::ids::member(&opened, n);
+    let payload: Option<String> = tx
+        .query_row(
+            "SELECT payload_json FROM events WHERE event_id = ?1",
+            params![suite_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let payload: serde_json::Value = payload
+        .as_deref()
+        .and_then(|p| serde_json::from_str(p).ok())
+        .ok_or_else(|| {
+            PersistError::IntegrityViolation(format!("compat suite {suite_id} has no opening"))
+        })?;
+    let started: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE event_id = ?1)",
+            params![suite_started_id(&suite_id)],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    let text = |key: &str| payload[key].as_str().unwrap_or_default().to_owned();
+    Ok(Some(OpenSuite {
+        ended_id: crate::ids::member(&ended, n),
+        agent: text("agent"),
+        implementation_sha256: text("implementation_sha256"),
+        suite_id,
+        n,
+        started,
+    }))
+}
+
+/// The holder of the project's writer slot at `now` (RFC 3339), if its lease is effective: its attempt and epoch.
+pub(super) fn writer_holder(
+    tx: &Connection,
+    project_id: &str,
+    now: &str,
+) -> Result<Option<(String, i64)>, PersistError> {
+    Ok(row(tx, project_id, "writer")?
+        .filter(|held| effective(held, now))
+        .map(|held| (held.attempt_id, held.epoch)))
+}
+
 /// The slot a task needs, if one is free at `now`: `writer` for a writer task, else the first free `reader-k` with
-/// k ≤ `reader_slots`.
+/// k ≤ `reader_slots`. The writer slot is not free while a compat suite is open, waiting or running (docs/adr/ADR-030.md
+/// decision 10, K7): a suite deferred for the holder is not starved by the writers after it.
 pub(super) fn free_slot(
     tx: &Connection,
     project_id: &str,
@@ -79,6 +177,9 @@ pub(super) fn free_slot(
     reader_slots: u32,
     now: SystemTime,
 ) -> Result<Option<String>, PersistError> {
+    if writer && suite_open(tx, project_id)?.is_some() {
+        return Ok(None);
+    }
     let now = rfc3339_utc(now);
     let kinds: Vec<String> = if writer {
         vec!["writer".to_owned()]
@@ -105,7 +206,8 @@ pub(super) fn is_free(
     Ok(row(tx, project_id, kind)?.is_none_or(|held| !effective(&held, &now)))
 }
 
-/// Grant `kind` to `attempt_id` at `now`: refused while the slot is held.
+/// Grant `kind` to `attempt_id` at `now`: refused while the slot is held, and the writer slot while a compat suite is
+/// open (docs/adr/ADR-030.md decision 10, K7).
 pub(super) fn grant(
     tx: &Transaction<'_>,
     project_id: &str,
@@ -113,6 +215,14 @@ pub(super) fn grant(
     attempt_id: &str,
     now: SystemTime,
 ) -> Result<Grant, PersistError> {
+    if kind == "writer"
+        && let Some(open) = suite_open(tx, project_id)?
+    {
+        return Err(PersistError::LeaseUnavailable(format!(
+            "the writer slot waits for compat suite {}",
+            open.suite_id
+        )));
+    }
     let stamp = rfc3339_utc(now);
     match row(tx, project_id, kind)? {
         None => {

@@ -216,6 +216,11 @@ enum Job {
         Box<super::runner::RunnerJob>,
         oneshot::Sender<Result<super::runner::RunnerDone, PersistError>>,
     ),
+    /// A compat suite's admission, publication or end ([`super::suites`]).
+    Suite(
+        Box<super::suites::SuiteJob>,
+        oneshot::Sender<Result<super::suites::SuiteDone, PersistError>>,
+    ),
     /// A pause or cancel write ([`super::control`]).
     Control(
         Box<super::control::ControlJob>,
@@ -428,6 +433,7 @@ impl Job {
                 "Supervise"
             }
             Job::Runner(..) => "Runner",
+            Job::Suite(job, _) => job.name(),
             Job::Control(..) => "Control",
             Job::Wake => "Wake",
             Job::Keep(..) => "Keep",
@@ -649,6 +655,13 @@ impl Writer {
                                 super::runner::run(&mut conn, *job, &ctx),
                             ));
                         }
+                        Job::Suite(job, reply) => {
+                            deferred = Some(answer(
+                                &ctx,
+                                reply,
+                                super::suites::run(&mut conn, *job, &ctx),
+                            ));
+                        }
                         Job::Control(job, reply) => {
                             deferred = Some(answer(
                                 &ctx,
@@ -812,6 +825,13 @@ impl Writer {
 
     pub(super) async fn attempt(&self, job: AttemptJob) -> Result<(), PersistError> {
         self.submit(|tx| Job::Attempt(Box::new(job), tx)).await
+    }
+
+    pub(super) async fn suite(
+        &self,
+        job: super::suites::SuiteJob,
+    ) -> Result<super::suites::SuiteDone, PersistError> {
+        self.submit(|tx| Job::Suite(Box::new(job), tx)).await
     }
 
     pub(super) async fn outbox(&self, job: OutboxJob) -> Result<OutboxDone, PersistError> {

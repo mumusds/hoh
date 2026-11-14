@@ -5,6 +5,7 @@
 #![forbid(clippy::disallowed_methods)]
 #![forbid(unsafe_code)]
 
+pub mod compat;
 pub mod gate;
 pub mod host;
 pub mod unit;

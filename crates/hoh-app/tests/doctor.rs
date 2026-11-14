@@ -12,8 +12,7 @@
 #![forbid(clippy::disallowed_methods)]
 #![forbid(unsafe_code)]
 
-use hoh_agents::compat::{Agent, CompatManifest, SuiteStatus, suite};
-use hoh_agents::probe::{ProbeEnv, ProbeStop, probe};
+use hoh_agents::compat::{Agent, SuiteStatus};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
@@ -220,35 +219,22 @@ impl Sandbox {
     }
 
     /// Register the installed fakes of `agents` as compatible in the project's compat manifest: the entry this build's
-    /// compat suite earns on each, which must be a PASS (the fakes serve the recorded helps and schema; docs/adr/
-    /// ADR-030.md decision 10, never a forged PASS).
+    /// compat suite earns on each, published as a host publishes it (`hoh_app::compat::register`), which must be a PASS
+    /// (the fakes serve the recorded helps and schema; docs/adr/ADR-030.md decision 10, never a forged PASS).
     fn register(&self, agents: &[Agent]) -> R {
-        let env = ProbeEnv {
-            path: self.path().into(),
-            fixture_root: Some(fixtures()),
-            timeout: Duration::from_secs(30),
-            log: None,
-            deadline: None,
-            cancel: None,
-        };
-        let mut entries = BTreeMap::new();
         for agent in agents {
-            let looked = probe(*agent, &env)?;
-            let ran = suite::run(*agent, &looked, &env, &ProbeStop::default())?;
+            let ran = hoh_app::compat::register(
+                self.project.path(),
+                *agent,
+                std::ffi::OsStr::new(&self.path()),
+            )?;
             assert_eq!(
                 ran.entry.suite.status,
                 SuiteStatus::Pass,
                 "{agent:?}: {:#?}",
                 ran.cases
             );
-            entries.insert(*agent, ran.entry);
         }
-        let dir = self.project.path().join(".hoh");
-        std::fs::create_dir_all(&dir)?;
-        std::fs::write(
-            dir.join("compat-manifest.json"),
-            serde_json::to_vec_pretty(&CompatManifest::new(entries))?,
-        )?;
         Ok(())
     }
 
