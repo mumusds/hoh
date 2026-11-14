@@ -2859,8 +2859,7 @@ fn tree_sha256_from(root: &Path, digests: &[(PathBuf, String)]) -> io::Result<St
 }
 
 /// The tree digest of named members: sha256 over the sorted lines `<name> <digest>\n`, so the members count in
-/// (name, digest) order (the compat suite set uses it too, docs/adr/ADR-030.md decision 10; crates/hoh-agents/build.rs
-/// computes the definition digest the same way).
+/// (name, digest) order (the compat suite set and its definition digest use it too, docs/adr/ADR-030.md decision 10).
 pub(crate) fn members_sha256(members: Vec<(String, String)>) -> String {
     let mut lines: Vec<String> = members
         .into_iter()

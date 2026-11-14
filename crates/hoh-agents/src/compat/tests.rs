@@ -367,7 +367,7 @@ fn a_pass_of_another_request_definition_is_not_verified() {
     // pending for this build even though the agent and the fixtures are the same.
     let fixtures = fixture_members();
     let requests = request_members();
-    let s1 = suite_set(&fixtures, &requests, DEFINITION_SHA256);
+    let s1 = suite_set(&fixtures, &requests, &DEFINITION_SHA256);
     assert_eq!(s1, *SUITE_SET_SHA256);
     assert!(
         s1.len() == 64 && s1.bytes().all(|b| b.is_ascii_hexdigit()),
@@ -388,7 +388,7 @@ fn a_pass_of_another_request_definition_is_not_verified() {
     let s2 = suite_set(
         &fixtures,
         &replaced(&requests, name, canonical(&built)),
-        DEFINITION_SHA256,
+        &DEFINITION_SHA256,
     );
     assert_ne!(s2, s1, "another thread/start");
     let s3 = suite_set(&fixtures, &requests, &"0".repeat(64));
@@ -445,10 +445,14 @@ fn a_pass_of_another_request_definition_is_not_verified() {
             .iter()
             .map(|(name, _)| format!("crates/hoh-agents/src/compat/fixtures/{name}")),
     ) {
-        assert!(DEFINITION_FILES.contains(&file.as_str()), "{file}");
-    }
-    for file in ["crates/hoh-agents/Cargo.toml", "Cargo.lock"] {
         assert!(DEFINITION_FILES.contains(&file), "{file}");
+    }
+    // The dependencies through the lock's digest (tests/compat_definition.rs checks it is the workspace lock's).
+    for file in [
+        "crates/hoh-agents/Cargo.toml",
+        "crates/hoh-agents/src/compat/definition/cargo-lock.sha256",
+    ] {
+        assert!(DEFINITION_FILES.iter().any(|f| f == file), "{file}");
     }
 }
 

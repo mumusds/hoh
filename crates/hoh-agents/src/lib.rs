@@ -2,7 +2,7 @@
 //! (docs/13-adapters.md, REQ-027), protocol framing and process supervision (M1-T02). The adapters follow in
 //! M1-T03..M1-T05.
 
-// No SQLite outside hoh-core::persistence (AC-062-05; see clippy.toml), and no unsafe code (no FFI way around it).
+// No database access outside hoh-core::persistence (AC-062-05; see clippy.toml), and no unsafe code (no FFI way around it).
 #![forbid(clippy::disallowed_methods)]
 #![forbid(unsafe_code)]
 

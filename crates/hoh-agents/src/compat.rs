@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
+mod definition;
 pub mod fixtures;
 pub mod suite;
 
@@ -23,17 +24,52 @@ mod tests;
 /// builders give for every launch variant ([`request_members`]) and the suite's definition ([`DEFINITION_SHA256`]),
 /// computed once on first use. A PASS recorded under any other is pending for this build.
 pub static SUITE_SET_SHA256: LazyLock<String> =
-    LazyLock::new(|| suite_set(&fixture_members(), &request_members(), DEFINITION_SHA256));
+    LazyLock::new(|| suite_set(&fixture_members(), &request_members(), &DEFINITION_SHA256));
 
-/// The suite's definition digest, computed by build.rs when this crate is compiled (docs/adr/ADR-030.md decision 10):
-/// the tree digest of [`DEFINITION_FILES`] (this crate's sources, the builders, the validator, the replays and the
-/// embedded fixtures among them; its Cargo.toml; the workspace's Cargo.lock; the frame registries the replays judge
-/// by), so changing how requests are built, checked or replayed changes the key.
-pub const DEFINITION_SHA256: &str = env!("HOH_AGENTS_DEFINITION_SHA256");
+/// The suite's definition digest (docs/adr/ADR-030.md decision 10), computed once on first use from the files this
+/// build embeds ([`definition_files`]: this crate's sources, the builders, the validator, the replays and the embedded
+/// fixtures among them; its Cargo.toml; the digest of the workspace's Cargo.lock; the frame registries the replays
+/// judge by): sha256 over the sorted lines `<path in the workspace> <sha256>\n` (the probe's tree digest), so changing
+/// how requests are built, checked or replayed changes the key.
+pub static DEFINITION_SHA256: LazyLock<String> = LazyLock::new(|| {
+    crate::probe::members_sha256(
+        definition_files()
+            .into_iter()
+            .map(|(name, bytes)| {
+                let digest = Sha256::digest(bytes)
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                (name, digest)
+            })
+            .collect(),
+    )
+});
 
-/// The files [`DEFINITION_SHA256`] covers, by their path in the workspace.
-pub static DEFINITION_FILES: LazyLock<Vec<&'static str>> =
-    LazyLock::new(|| env!("HOH_AGENTS_DEFINITION_FILES").split(';').collect());
+/// The files [`DEFINITION_SHA256`] covers, by their path in the workspace, sorted.
+pub static DEFINITION_FILES: LazyLock<Vec<String>> = LazyLock::new(|| {
+    definition_files()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect()
+});
+
+/// Every file of the suite's definition with the bytes this build embeds, by its path in the workspace, sorted:
+/// `definition::FILES` and the embedded fixtures ([`fixtures::FILES`] under `crates/hoh-agents/src/compat/fixtures/`).
+pub fn definition_files() -> Vec<(String, &'static [u8])> {
+    let mut files: Vec<(String, &'static [u8])> = definition::FILES
+        .iter()
+        .map(|(name, bytes)| ((*name).to_owned(), *bytes))
+        .chain(fixtures::FILES.iter().map(|(name, bytes)| {
+            (
+                format!("crates/hoh-agents/src/compat/fixtures/{name}"),
+                *bytes,
+            )
+        }))
+        .collect();
+    files.sort_unstable();
+    files
+}
 
 /// The fixed inputs the request builders are given for the suite set, and the launch a replay judges
 /// (docs/adr/ADR-030.md decision 10): the working directory, the prompt, the model, the session (claude's session,
