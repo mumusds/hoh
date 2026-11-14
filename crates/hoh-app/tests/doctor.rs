@@ -5,15 +5,15 @@
 //!   commands. They appear in no output or written file, and strace sees no open of those files.
 //!
 //! The fakes answer the probe from the recorded help texts and schema, and their status commands as the real CLIs do
-//! (ADR-015 decision 3). The compatible fakes' hashes are registered in a PASS compat manifest under the project's
-//! `.hoh/`.
+//! (ADR-015 decision 3). The compatible fakes are registered in the project's `.hoh/` compat manifest with the PASS
+//! entries this build's compat suite earns on them.
 
 // No SQLite outside hoh-core::persistence (AC-062-05; see clippy.toml), and no unsafe code (no FFI way around it).
 #![forbid(clippy::disallowed_methods)]
 #![forbid(unsafe_code)]
 
-use hoh_agents::compat::{Agent, CompatManifest, SuiteStatus};
-use hoh_agents::probe::{ProbeEnv, probe};
+use hoh_agents::compat::{Agent, CompatManifest, SuiteStatus, suite};
+use hoh_agents::probe::{ProbeEnv, ProbeStop, probe};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
@@ -219,7 +219,9 @@ impl Sandbox {
         format!("{}:/usr/bin:/bin", self.bin.path().display())
     }
 
-    /// Register the installed fakes of `agents` as compatible (suite PASS) in the project's compat manifest.
+    /// Register the installed fakes of `agents` as compatible in the project's compat manifest: the entry this build's
+    /// compat suite earns on each, which must be a PASS (the fakes serve the recorded helps and schema; docs/adr/
+    /// ADR-030.md decision 10, never a forged PASS).
     fn register(&self, agents: &[Agent]) -> R {
         let env = ProbeEnv {
             path: self.path().into(),
@@ -231,9 +233,15 @@ impl Sandbox {
         };
         let mut entries = BTreeMap::new();
         for agent in agents {
-            let mut entry = probe(*agent, &env)?;
-            entry.suite.status = SuiteStatus::Pass;
-            entries.insert(*agent, entry);
+            let looked = probe(*agent, &env)?;
+            let ran = suite::run(*agent, &looked, &env, &ProbeStop::default())?;
+            assert_eq!(
+                ran.entry.suite.status,
+                SuiteStatus::Pass,
+                "{agent:?}: {:#?}",
+                ran.cases
+            );
+            entries.insert(*agent, ran.entry);
         }
         let dir = self.project.path().join(".hoh");
         std::fs::create_dir_all(&dir)?;

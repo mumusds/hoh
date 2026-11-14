@@ -2,7 +2,9 @@
 
 use super::assess::{conclusion, protocol};
 use super::report::{Auth, Protocol};
-use hoh_agents::compat::{Agent, AgentEntry, CompatManifest, Suite, SuiteStatus, Transport};
+use hoh_agents::compat::{
+    Agent, AgentEntry, CompatManifest, SUITE_SET_SHA256, Suite, SuiteStatus, Transport,
+};
 use hoh_agents::probe::Captured;
 use std::collections::BTreeMap;
 use std::os::unix::process::ExitStatusExt;
@@ -132,6 +134,8 @@ fn only_a_registered_passing_version_is_compatible() {
     );
     let mut known = installed.clone();
     known.suite.status = SuiteStatus::Pass;
+    // Recorded by this build's suite (docs/adr/ADR-030.md decision 9: the doctor judges through `compat::verdict`).
+    known.suite.fixture_set_sha256 = SUITE_SET_SHA256.clone();
     let manifest =
         |e: &AgentEntry| CompatManifest::new(BTreeMap::from([(Agent::Codex, e.clone())]));
     assert_eq!(
@@ -160,9 +164,40 @@ fn only_a_registered_passing_version_is_compatible() {
     let exec = entry(Transport::Exec);
     let mut known_exec = exec.clone();
     known_exec.suite.status = SuiteStatus::Pass;
+    known_exec.suite.fixture_set_sha256 = SUITE_SET_SHA256.clone();
     assert_eq!(
         protocol(&exec, Some(&manifest(&known_exec)), Agent::Codex).0,
         Protocol::Degraded
+    );
+}
+
+#[test]
+fn a_pass_of_another_suite_set_is_unknown() {
+    // docs/adr/ADR-030.md decision 9: doctor, the gate and staffing share `compat::verdict`, so a PASS this build's
+    // suite did not earn (another suite set: another HoH build's requests, checks or replays) verifies nothing, though
+    // the identity, the hashes and the version all match; the detail says why.
+    let installed = entry(Transport::AppServer);
+    let mut known = installed.clone();
+    known.suite.status = SuiteStatus::Pass;
+    known.suite.run_at = Some(Some("2026-11-14T00:00:00Z".to_owned()));
+    known.suite.fixture_set_sha256 = "0".repeat(64);
+    assert_ne!(known.suite.fixture_set_sha256, *SUITE_SET_SHA256);
+    let manifest = CompatManifest::new(BTreeMap::from([(Agent::Codex, known.clone())]));
+    let (found, detail) = protocol(&installed, Some(&manifest), Agent::Codex);
+    assert_eq!(found, Protocol::Unknown);
+    let detail = detail.unwrap_or_default();
+    assert!(
+        detail.contains(&"0".repeat(64)) && detail.contains(SUITE_SET_SHA256.as_str()),
+        "{detail}"
+    );
+    // The launcher's path is part of the identity the verdict compares (M2T15D-104).
+    let mut moved = known;
+    moved.suite.fixture_set_sha256 = SUITE_SET_SHA256.clone();
+    moved.launcher_path = "/usr/local/bin/x".to_owned();
+    let manifest = CompatManifest::new(BTreeMap::from([(Agent::Codex, moved)]));
+    assert_eq!(
+        protocol(&installed, Some(&manifest), Agent::Codex).0,
+        Protocol::Unknown
     );
 }
 

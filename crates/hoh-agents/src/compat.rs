@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::sync::LazyLock;
 
 pub mod fixtures;
+pub mod suite;
 
 #[cfg(test)]
 mod tests;
@@ -45,10 +46,18 @@ pub const SUITE_TURN: &str = "hoh-suite-turn";
 pub const SUITE_STEER: &str = "Also say HOH_SUITE_STEER.";
 pub const SUITE_PI_SESSION_DIR: &str = "/hoh-suite/pi-session";
 
-/// The server requests of codex's `tool` case, which the adapter answers headless ([`crate::codex::headless_answer`]).
-pub const TOOL_SERVER_REQUESTS: [&str; 2] = [
-    "item/commandExecution/requestApproval",
-    "item/fileChange/requestApproval",
+/// The server requests of codex's `tool` case, which the adapter answers headless ([`crate::codex::headless_answer`]),
+/// each with the file of the App Server's schema export that describes its answer's `result` (0.166.0's names; an
+/// export without it cannot tell, docs/adr/ADR-030.md decision 10).
+pub const TOOL_SERVER_REQUESTS: [(&str, &str); 2] = [
+    (
+        "item/commandExecution/requestApproval",
+        "CommandExecutionRequestApprovalResponse.json",
+    ),
+    (
+        "item/fileChange/requestApproval",
+        "FileChangeRequestApprovalResponse.json",
+    ),
 ];
 
 /// The help texts the argv builders are given for the suite set: each declares every option its builder may pass, so
@@ -86,14 +95,11 @@ pub fn request_members() -> Vec<(String, Vec<u8>)> {
     members
 }
 
-/// What `suite`'s builders give for `case` launched as `variant`.
-fn built(suite: &str, case: &str, variant: fixtures::Variant) -> Value {
+/// What `suite`'s builders give for `case` launched as `variant`, the argv builders given the suite set's helps: the App
+/// Server's `{"messages": […], "answers": {method: {"result"|"error": …}}}`, an argv's `{"argv": […]}`, or
+/// `{"refused": why}`.
+pub fn built(suite: &str, case: &str, variant: fixtures::Variant) -> Value {
     let model = variant.model.then_some(SUITE_MODEL);
-    let resume = variant.resume.then(|| SUITE_SESSION.to_owned());
-    let argv = |built: Result<Vec<String>, String>| match built {
-        Ok(argv) => json!({"argv": argv}),
-        Err(why) => json!({"refused": why}),
-    };
     match suite {
         "codex" => {
             let thread = if variant.resume {
@@ -117,7 +123,7 @@ fn built(suite: &str, case: &str, variant: fixtures::Variant) -> Value {
                         Some(SUITE_TURN),
                         SUITE_STEER,
                     ));
-                    for method in TOOL_SERVER_REQUESTS {
+                    for (method, _) in TOOL_SERVER_REQUESTS {
                         let answer = match crate::codex::headless_answer(method) {
                             Ok(result) => json!({"result": result}),
                             Err((code, message)) => {
@@ -131,54 +137,76 @@ fn built(suite: &str, case: &str, variant: fixtures::Variant) -> Value {
             }
             json!({"messages": messages, "answers": answers})
         }
-        "codex-exec" => argv(
-            crate::codex::exec_args(&crate::codex::Launch {
-                program: PathBuf::from("codex"),
-                app_server_help: None,
-                exec_help: CODEX_EXEC_HELP.to_owned(),
-                exec_resume_help: Some(CODEX_EXEC_HELP.to_owned()),
-                cwd: PathBuf::from(SUITE_CWD),
-                yolo: true,
-                resume,
-                model: model.map(str::to_owned),
-                known: Default::default(),
-                requests: Default::default(),
-                client_notifications: Default::default(),
-                capabilities: crate::capabilities::Probed::new(),
-            })
-            .map_err(|crate::codex::Blocked(why)| why),
-        ),
-        "claude" => argv(
-            crate::claude::argv(&crate::claude::Launch {
-                program: PathBuf::from("claude"),
-                help: CLAUDE_HELP.to_owned(),
-                cwd: PathBuf::from(SUITE_CWD),
-                yolo: true,
-                partial: false,
-                resume,
-                model: model.map(str::to_owned),
-                root: false,
-                capabilities: crate::capabilities::Probed::new(),
-            })
-            .map(|argv| argv.args)
-            .map_err(|crate::claude::Blocked(why)| why),
-        ),
-        "pi" => argv(
-            crate::pi::args(&crate::pi::Launch {
-                program: PathBuf::from("pi"),
-                help: PI_HELP.to_owned(),
-                cwd: PathBuf::from(SUITE_CWD),
-                session_dir: PathBuf::from(SUITE_PI_SESSION_DIR),
-                session_id: SUITE_SESSION.to_owned(),
-                resume: variant.resume,
-                provider: None,
-                model: model.map(str::to_owned),
-                settled_event: true,
-                capabilities: crate::capabilities::Probed::new(),
-            })
-            .map_err(|crate::pi::Blocked(why)| why),
-        ),
+        "codex-exec" | "claude" | "pi" => {
+            let help = match suite {
+                "claude" => CLAUDE_HELP,
+                "pi" => PI_HELP,
+                _ => CODEX_EXEC_HELP,
+            };
+            match argv(suite, variant, help, Some(CODEX_EXEC_HELP)) {
+                Ok(argv) => json!({"argv": argv}),
+                Err(why) => json!({"refused": why}),
+            }
+        }
         other => json!({"refused": format!("no suite {other}")}),
+    }
+}
+
+/// The argv `suite`'s builder (`claude::argv`, `codex::exec_args`, `pi::args`) gives for the product's YOLO launch as
+/// `variant` with the suite's fixed inputs, given `help` (claude's or pi's `--help`, `codex exec --help`) and, for codex
+/// exec, `resume_help` (`codex exec resume --help`, `None` when it could not be read), or why it refuses
+/// (docs/adr/ADR-030.md decision 10: the suite set builds with its own helps, the suite with the tested binary's).
+pub fn argv(
+    suite: &str,
+    variant: fixtures::Variant,
+    help: &str,
+    resume_help: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let model = variant.model.then(|| SUITE_MODEL.to_owned());
+    let resume = variant.resume.then(|| SUITE_SESSION.to_owned());
+    match suite {
+        "codex-exec" => crate::codex::exec_args(&crate::codex::Launch {
+            program: PathBuf::from("codex"),
+            app_server_help: None,
+            exec_help: help.to_owned(),
+            exec_resume_help: resume_help.map(str::to_owned),
+            cwd: PathBuf::from(SUITE_CWD),
+            yolo: true,
+            resume,
+            model,
+            known: Default::default(),
+            requests: Default::default(),
+            client_notifications: Default::default(),
+            capabilities: crate::capabilities::Probed::new(),
+        })
+        .map_err(|crate::codex::Blocked(why)| why),
+        "claude" => crate::claude::argv(&crate::claude::Launch {
+            program: PathBuf::from("claude"),
+            help: help.to_owned(),
+            cwd: PathBuf::from(SUITE_CWD),
+            yolo: true,
+            partial: false,
+            resume,
+            model,
+            root: false,
+            capabilities: crate::capabilities::Probed::new(),
+        })
+        .map(|argv| argv.args)
+        .map_err(|crate::claude::Blocked(why)| why),
+        "pi" => crate::pi::args(&crate::pi::Launch {
+            program: PathBuf::from("pi"),
+            help: help.to_owned(),
+            cwd: PathBuf::from(SUITE_CWD),
+            session_dir: PathBuf::from(SUITE_PI_SESSION_DIR),
+            session_id: SUITE_SESSION.to_owned(),
+            resume: variant.resume,
+            provider: None,
+            model,
+            settled_event: true,
+            capabilities: crate::capabilities::Probed::new(),
+        })
+        .map_err(|crate::pi::Blocked(why)| why),
+        other => Err(format!("no argv suite {other}")),
     }
 }
 
