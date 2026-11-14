@@ -24,26 +24,125 @@ pub const CASES: [&str; 6] = [
     "unknown_fields",
 ];
 
-/// The embedded files by their path under `compat/fixtures/`.
-macro_rules! embedded {
-    ($($suite:literal),* $(,)?) => {
-        &[
-            ("variants.json", include_bytes!("fixtures/variants.json") as &[u8]),
-            $(
-                (concat!($suite, "/expected.json"), include_bytes!(concat!("fixtures/", $suite, "/expected.json"))),
-                (concat!($suite, "/success.jsonl"), include_bytes!(concat!("fixtures/", $suite, "/success.jsonl"))),
-                (concat!($suite, "/failure.jsonl"), include_bytes!(concat!("fixtures/", $suite, "/failure.jsonl"))),
-                (concat!($suite, "/cancel.jsonl"), include_bytes!(concat!("fixtures/", $suite, "/cancel.jsonl"))),
-                (concat!($suite, "/compaction.jsonl"), include_bytes!(concat!("fixtures/", $suite, "/compaction.jsonl"))),
-                (concat!($suite, "/tool.jsonl"), include_bytes!(concat!("fixtures/", $suite, "/tool.jsonl"))),
-                (concat!($suite, "/unknown_fields.jsonl"), include_bytes!(concat!("fixtures/", $suite, "/unknown_fields.jsonl"))),
-            )*
-        ]
-    };
-}
-
 /// Every embedded file, by its path under `compat/fixtures/`.
-pub const FILES: &[(&str, &[u8])] = embedded!["claude", "codex", "codex-exec", "pi"];
+pub const FILES: &[(&str, &[u8])] = &[
+    (
+        "variants.json",
+        include_bytes!("fixtures/variants.json") as &[u8],
+    ),
+    (
+        "claude/expected.json",
+        include_bytes!("fixtures/claude/expected.json") as &[u8],
+    ),
+    (
+        "claude/success.jsonl",
+        include_bytes!("fixtures/claude/success.jsonl") as &[u8],
+    ),
+    (
+        "claude/failure.jsonl",
+        include_bytes!("fixtures/claude/failure.jsonl") as &[u8],
+    ),
+    (
+        "claude/cancel.jsonl",
+        include_bytes!("fixtures/claude/cancel.jsonl") as &[u8],
+    ),
+    (
+        "claude/compaction.jsonl",
+        include_bytes!("fixtures/claude/compaction.jsonl") as &[u8],
+    ),
+    (
+        "claude/tool.jsonl",
+        include_bytes!("fixtures/claude/tool.jsonl") as &[u8],
+    ),
+    (
+        "claude/unknown_fields.jsonl",
+        include_bytes!("fixtures/claude/unknown_fields.jsonl") as &[u8],
+    ),
+    (
+        "codex/expected.json",
+        include_bytes!("fixtures/codex/expected.json") as &[u8],
+    ),
+    (
+        "codex/success.jsonl",
+        include_bytes!("fixtures/codex/success.jsonl") as &[u8],
+    ),
+    (
+        "codex/failure.jsonl",
+        include_bytes!("fixtures/codex/failure.jsonl") as &[u8],
+    ),
+    (
+        "codex/cancel.jsonl",
+        include_bytes!("fixtures/codex/cancel.jsonl") as &[u8],
+    ),
+    (
+        "codex/compaction.jsonl",
+        include_bytes!("fixtures/codex/compaction.jsonl") as &[u8],
+    ),
+    (
+        "codex/tool.jsonl",
+        include_bytes!("fixtures/codex/tool.jsonl") as &[u8],
+    ),
+    (
+        "codex/unknown_fields.jsonl",
+        include_bytes!("fixtures/codex/unknown_fields.jsonl") as &[u8],
+    ),
+    (
+        "codex-exec/expected.json",
+        include_bytes!("fixtures/codex-exec/expected.json") as &[u8],
+    ),
+    (
+        "codex-exec/success.jsonl",
+        include_bytes!("fixtures/codex-exec/success.jsonl") as &[u8],
+    ),
+    (
+        "codex-exec/failure.jsonl",
+        include_bytes!("fixtures/codex-exec/failure.jsonl") as &[u8],
+    ),
+    (
+        "codex-exec/cancel.jsonl",
+        include_bytes!("fixtures/codex-exec/cancel.jsonl") as &[u8],
+    ),
+    (
+        "codex-exec/compaction.jsonl",
+        include_bytes!("fixtures/codex-exec/compaction.jsonl") as &[u8],
+    ),
+    (
+        "codex-exec/tool.jsonl",
+        include_bytes!("fixtures/codex-exec/tool.jsonl") as &[u8],
+    ),
+    (
+        "codex-exec/unknown_fields.jsonl",
+        include_bytes!("fixtures/codex-exec/unknown_fields.jsonl") as &[u8],
+    ),
+    (
+        "pi/expected.json",
+        include_bytes!("fixtures/pi/expected.json") as &[u8],
+    ),
+    (
+        "pi/success.jsonl",
+        include_bytes!("fixtures/pi/success.jsonl") as &[u8],
+    ),
+    (
+        "pi/failure.jsonl",
+        include_bytes!("fixtures/pi/failure.jsonl") as &[u8],
+    ),
+    (
+        "pi/cancel.jsonl",
+        include_bytes!("fixtures/pi/cancel.jsonl") as &[u8],
+    ),
+    (
+        "pi/compaction.jsonl",
+        include_bytes!("fixtures/pi/compaction.jsonl") as &[u8],
+    ),
+    (
+        "pi/tool.jsonl",
+        include_bytes!("fixtures/pi/tool.jsonl") as &[u8],
+    ),
+    (
+        "pi/unknown_fields.jsonl",
+        include_bytes!("fixtures/pi/unknown_fields.jsonl") as &[u8],
+    ),
+];
 
 /// The embedded file `name` (its path under `compat/fixtures/`).
 pub fn file(name: &str) -> Option<&'static [u8]> {
