@@ -23,6 +23,8 @@ pub mod product;
 mod reconcile;
 mod runner;
 mod suites;
+#[cfg(test)]
+mod tests;
 pub use processes::ATTEMPT_ENV;
 pub use reconcile::ReconcileSettings;
 pub use runner::{Executor, Gate, Outcome, Refusal, RunnerConfig, RunnerPoint, Started, Work};
@@ -749,8 +751,31 @@ impl Drop for HostFiles {
 /// taken again by a second host, M2T12R-152); `host.lock` only names the holder's pid. A database file moved into a
 /// new `.hoh` while a host runs is not covered: the host-epoch fencing of writes is (M2-T05, ADR-016 decision 1).
 struct ProjectLock {
-    _directory: std::fs::File,
+    _directory: DirLock,
     _pid: std::fs::File,
+}
+
+/// An exclusive `flock` on a project's `.hoh` directory, taken without waiting and released explicitly when dropped:
+/// the lock belongs to the open file description, which a child another thread forked holds a copy of until it execs,
+/// so closing this descriptor alone could leave the project locked meanwhile.
+pub(crate) struct DirLock(std::fs::File);
+
+impl Drop for DirLock {
+    fn drop(&mut self) {
+        let _ = rustix::fs::flock(&self.0, rustix::fs::FlockOperation::Unlock);
+    }
+}
+
+impl DirLock {
+    /// The lock on `directory`, or `None` while another holds it.
+    pub(crate) fn try_take(directory: &Path) -> std::io::Result<Option<DirLock>> {
+        let file = std::fs::File::open(directory)?;
+        Ok(
+            rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+                .is_ok()
+                .then_some(DirLock(file)),
+        )
+    }
 }
 
 /// Take the project lock without waiting; a held lock names its holder. The directory is locked first: a start that is
@@ -758,15 +783,10 @@ struct ProjectLock {
 /// hide a held project; only the holder (re)writes it (M2T12R-182).
 fn take_lock(files: &Path) -> Result<ProjectLock, StartError> {
     use std::io::{Seek as _, Write as _};
-    let directory = std::fs::File::open(files)
+    let directory = DirLock::try_take(files)
         .map_err(|e| StartError::other(format!("cannot open {}: {e}", files.display())))?;
     let pid_path = files.join("host.lock");
-    if rustix::fs::flock(
-        &directory,
-        rustix::fs::FlockOperation::NonBlockingLockExclusive,
-    )
-    .is_err()
-    {
+    let Some(directory) = directory else {
         let holder = std::fs::read_to_string(&pid_path)
             .ok()
             .map(|pid| pid.trim().to_owned())
@@ -779,7 +799,7 @@ fn take_lock(files: &Path) -> Result<ProjectLock, StartError> {
                 files.display()
             ),
         });
-    }
+    };
     let mut pid = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
