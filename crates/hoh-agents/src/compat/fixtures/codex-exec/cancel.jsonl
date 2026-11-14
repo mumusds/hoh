@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"hoh-suite-session"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_0","type":"command_execution","command":"echo hoh","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"hoh_replay":"cancel"}

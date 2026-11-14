@@ -1,0 +1,15 @@
+{"id":0,"result":{"userAgent":"hoh-suite/0.0.0","codexHome":"/hoh-suite/.codex","platformFamily":"unix","platformOs":"linux"}}
+{"id":1,"result":{"thread":{"id":"hoh-suite-session","preview":"","ephemeral":false,"turns":[]},"model":"codex-suite-model","modelProvider":"openai","cwd":"/hoh-suite","approvalPolicy":"never","sandbox":{"type":"dangerFullAccess"},"reasoningEffort":null}}
+{"method":"thread/started","params":{"thread":{"id":"hoh-suite-session","preview":"","ephemeral":false,"turns":[]}}}
+{"id":2,"result":{"turn":{"id":"hoh-suite-turn","items":[],"status":"inProgress","error":null}}}
+{"method":"turn/started","params":{"threadId":"hoh-suite-session","turn":{"id":"hoh-suite-turn","items":[],"status":"inProgress","error":null}}}
+{"method":"item/started","params":{"item":{"type":"userMessage","id":"item-user","content":[{"type":"text","text":"Reply with exactly HOH_SUITE_OK and nothing else."}]},"threadId":"hoh-suite-session","turnId":"hoh-suite-turn","startedAtMs":1}}
+{"method":"item/completed","params":{"item":{"type":"userMessage","id":"item-user","content":[{"type":"text","text":"Reply with exactly HOH_SUITE_OK and nothing else."}]},"threadId":"hoh-suite-session","turnId":"hoh-suite-turn","completedAtMs":1}}
+{"method":"item/started","params":{"item":{"type":"commandExecution","id":"item-cmd","command":"echo hoh","commandActions":[],"cwd":"/hoh-suite","status":"inProgress"},"threadId":"hoh-suite-session","turnId":"hoh-suite-turn","startedAtMs":2}}
+{"id":100,"method":"item/commandExecution/requestApproval","params":{"threadId":"hoh-suite-session","turnId":"hoh-suite-turn","itemId":"item-cmd","startedAtMs":2,"command":"echo hoh","cwd":"/hoh-suite","reason":null}}
+{"id":101,"method":"item/fileChange/requestApproval","params":{"threadId":"hoh-suite-session","turnId":"hoh-suite-turn","itemId":"item-patch","startedAtMs":2,"reason":null,"grantRoot":null}}
+{"method":"item/completed","params":{"item":{"type":"commandExecution","id":"item-cmd","command":"echo hoh","commandActions":[],"cwd":"/hoh-suite","status":"completed","aggregatedOutput":"hoh\n","exitCode":0,"durationMs":5},"threadId":"hoh-suite-session","turnId":"hoh-suite-turn","completedAtMs":3}}
+{"method":"item/started","params":{"item":{"type":"agentMessage","id":"item-reply","text":""},"threadId":"hoh-suite-session","turnId":"hoh-suite-turn","startedAtMs":4}}
+{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"item-reply","text":"HOH_SUITE_OK"},"threadId":"hoh-suite-session","turnId":"hoh-suite-turn","completedAtMs":5}}
+{"method":"thread/tokenUsage/updated","params":{"threadId":"hoh-suite-session","turnId":"hoh-suite-turn","tokenUsage":{"total":{"totalTokens":30,"inputTokens":20,"cachedInputTokens":0,"outputTokens":10,"reasoningOutputTokens":0},"last":{"totalTokens":30,"inputTokens":20,"cachedInputTokens":0,"outputTokens":10,"reasoningOutputTokens":0},"modelContextWindow":null}}}
+{"method":"turn/completed","params":{"threadId":"hoh-suite-session","turn":{"id":"hoh-suite-turn","items":[],"status":"completed","error":null}}}

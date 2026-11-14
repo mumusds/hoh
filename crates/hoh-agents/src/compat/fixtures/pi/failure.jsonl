@@ -1,0 +1,2 @@
+{"id":"hoh-state-1","type":"response","command":"get_state","success":true,"data":{"model":{"id":"pi-suite-model","name":"Suite","provider":"suite"},"thinkingLevel":"off","isStreaming":false,"isCompacting":false,"sessionFile":"/hoh-suite/pi-session/hoh-suite-session.jsonl","sessionId":"hoh-suite-session","autoCompactionEnabled":true,"messageCount":0,"pendingMessageCount":0}}
+{"id":"hoh-prompt-2","type":"response","command":"prompt","success":false,"error":"No API key found for the selected model."}

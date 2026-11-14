@@ -16,6 +16,10 @@ serde_json = { version = "1.0.154", features = ["float_roundtrip"] }
 sha2 = "0.11.1"
 tokio = { version = "1.53.3", features = ["rt", "net", "io-util", "time", "sync", "macros", "signal"] }
 
+# build.rs: the compat suite's definition digest (docs/adr/ADR-030.md decision 10).
+[build-dependencies]
+sha2 = "0.11.1"
+
 [lints]
 workspace = true
 

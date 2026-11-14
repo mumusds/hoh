@@ -18,12 +18,12 @@
 //! stdout and the cancel are driven together, so a child that never reads its prompt cannot hold up a cancel.
 
 pub use crate::adapter::{AdapterError, AttemptRef, Facts, GateCommand, Held, Recorded, Refused};
-use crate::adapter::{Recorder, Stop, finish, now, offers, sha256_file, step};
+use crate::adapter::{Recorder, Replay, Replayed, Stop, finish, now, offers, sha256_file, step};
 use crate::frame::Frame;
 use crate::known;
 use crate::process::{Cause, Config, Escalation, Event, Process, Signal, Step, Termination};
 use hoh_core::lifecycle::AttemptState;
-use hoh_core::persistence::{AttemptFacts, CancelLatch, Session, Store};
+use hoh_core::persistence::{AttemptFacts, CancelLatch, PersistError, Session, Store};
 use serde_json::{Value, json};
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -584,9 +584,102 @@ struct Driven {
     cancelled: bool,
     fed: Option<std::io::Result<()>>,
     report: Option<crate::process::ExitReport>,
+    /// `result` frames and unknown records seen, numbering their events.
+    results: usize,
+    unknown_records: usize,
 }
 
 impl Driven {
+    fn new(cancelled: bool) -> Driven {
+        Driven {
+            native_session: None,
+            model: None,
+            result: None,
+            usage: None,
+            cost: None,
+            diagnostics: 0,
+            too_large: false,
+            auth_failed: false,
+            cancelled,
+            fed: None,
+            report: None,
+            results: 0,
+            unknown_records: 0,
+        }
+    }
+
+    /// Judge one stdout line and record what it shows.
+    async fn on_line(
+        &mut self,
+        recorder: &mut Recorder<'_>,
+        attempt_id: &str,
+        line: &[u8],
+    ) -> Result<(), PersistError> {
+        let Ok(frame) = serde_json::from_slice::<Value>(line) else {
+            self.diagnostics += 1;
+            return recorder
+                .event(
+                    &format!("diagnostic-{}", self.diagnostics),
+                    "adapter.diagnostic",
+                    json!({
+                        "reason": "stdout line is not JSON",
+                        "bytes": line.len(),
+                        "head": String::from_utf8_lossy(&line[..line.len().min(256)]),
+                    }),
+                )
+                .await;
+        };
+        let key = known::claude_key(&frame);
+        if !known::is_known(known::claude(), key.as_deref()) {
+            self.unknown_records += 1;
+            recorder
+                .event(
+                    &format!("unknown-{}", self.unknown_records),
+                    "adapter.unknown_event",
+                    known::unknown_event(attempt_id, key.as_deref(), line, &frame),
+                )
+                .await?;
+        }
+        match frame["type"].as_str() {
+            Some("system") if frame["subtype"] == "init" => {
+                self.native_session = frame["session_id"].as_str().map(str::to_owned);
+                self.model = frame["model"].as_str().map(str::to_owned);
+                if let Some(native) = &self.native_session {
+                    recorder.native_session(native).await?;
+                }
+            }
+            Some("assistant") if frame["error"] == "authentication_failed" => {
+                self.auth_failed = true;
+            }
+            Some("result") => {
+                let frame_result = ResultFrame {
+                    subtype: frame["subtype"].as_str().map(str::to_owned),
+                    is_error: frame["is_error"].as_bool(),
+                    text: frame["result"].as_str().map(str::to_owned),
+                };
+                self.usage = frame.get("usage").filter(|u| u.is_object()).cloned();
+                self.cost = frame["total_cost_usd"].as_f64();
+                self.results += 1;
+                // Kept whatever the end: after a cancel it is only a diagnostic (CR-003).
+                recorder
+                    .event(
+                        &format!("result-{}", self.results),
+                        "adapter.result",
+                        json!({
+                            "subtype": frame_result.subtype,
+                            "is_error": frame_result.is_error,
+                            "terminal_reason": frame["terminal_reason"],
+                            "after_cancel": self.cancelled,
+                        }),
+                    )
+                    .await?;
+                self.result = Some(frame_result);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn verdict(&self) -> (AttemptState, Option<String>) {
         let report = self.report.as_ref();
         let logs_incomplete = report.is_none_or(|r| {
@@ -622,21 +715,7 @@ async fn drive(
         pipe.write_all(&input).await?;
         pipe.shutdown().await
     });
-    let mut driven = Driven {
-        native_session: None,
-        model: None,
-        result: None,
-        usage: None,
-        cost: None,
-        diagnostics: 0,
-        too_large: false,
-        auth_failed: false,
-        cancelled: stop.requested_now(),
-        fed: None,
-        report: None,
-    };
-    let mut results = 0;
-    let mut unknown_records = 0;
+    let mut driven = Driven::new(stop.requested_now());
     if driven.cancelled {
         act(&stop, process, escalation);
     }
@@ -678,69 +757,7 @@ async fn drive(
             Some(Event::Exit(report)) => break Some(*report),
             None => break None,
         };
-        let Ok(frame) = serde_json::from_slice::<Value>(&line) else {
-            driven.diagnostics += 1;
-            recorder
-                .event(
-                    &format!("diagnostic-{}", driven.diagnostics),
-                    "adapter.diagnostic",
-                    json!({
-                        "reason": "stdout line is not JSON",
-                        "bytes": line.len(),
-                        "head": String::from_utf8_lossy(&line[..line.len().min(256)]),
-                    }),
-                )
-                .await?;
-            continue;
-        };
-        let key = known::claude_key(&frame);
-        if !known::is_known(known::claude(), key.as_deref()) {
-            unknown_records += 1;
-            recorder
-                .event(
-                    &format!("unknown-{unknown_records}"),
-                    "adapter.unknown_event",
-                    known::unknown_event(attempt_id, key.as_deref(), &line, &frame),
-                )
-                .await?;
-        }
-        match frame["type"].as_str() {
-            Some("system") if frame["subtype"] == "init" => {
-                driven.native_session = frame["session_id"].as_str().map(str::to_owned);
-                driven.model = frame["model"].as_str().map(str::to_owned);
-                if let Some(native) = &driven.native_session {
-                    recorder.native_session(native).await?;
-                }
-            }
-            Some("assistant") if frame["error"] == "authentication_failed" => {
-                driven.auth_failed = true;
-            }
-            Some("result") => {
-                let frame_result = ResultFrame {
-                    subtype: frame["subtype"].as_str().map(str::to_owned),
-                    is_error: frame["is_error"].as_bool(),
-                    text: frame["result"].as_str().map(str::to_owned),
-                };
-                driven.usage = frame.get("usage").filter(|u| u.is_object()).cloned();
-                driven.cost = frame["total_cost_usd"].as_f64();
-                results += 1;
-                // Kept whatever the end: after a cancel it is only a diagnostic (CR-003).
-                recorder
-                    .event(
-                        &format!("result-{results}"),
-                        "adapter.result",
-                        json!({
-                            "subtype": frame_result.subtype,
-                            "is_error": frame_result.is_error,
-                            "terminal_reason": frame["terminal_reason"],
-                            "after_cancel": driven.cancelled,
-                        }),
-                    )
-                    .await?;
-                driven.result = Some(frame_result);
-            }
-            _ => {}
-        }
+        driven.on_line(recorder, attempt_id, &line).await?;
     };
     if let Some(r) = &driven.report
         && (r.stdout.error.is_some() || r.stderr.error.is_some() || !r.stdout.eof || !r.stderr.eof)
@@ -758,6 +775,39 @@ async fn drive(
             .await?;
     }
     Ok(driven)
+}
+
+/// Replay `bytes` (claude's stdout, with the host's cancel where [`crate::adapter::REPLAY_CANCEL`] stands) through this
+/// adapter's own judging, no process started (docs/adr/ADR-030.md decision 10): see [`Replayed`]. Every claude version
+/// is judged alike (the frame registry built in, [`known::claude`]); `_version` is the tested one's.
+pub fn replay(bytes: &[u8], _version: &str) -> Replayed {
+    let mut recorder = Recorder::Collect(Vec::new());
+    let mut driven = Driven::new(false);
+    driven.fed = Some(Ok(()));
+    for step in crate::adapter::replay_steps(bytes) {
+        match step {
+            // The runner's cancel: one SIGINT to claude, which goes on printing until it exits.
+            Replay::Cancel => driven.cancelled = true,
+            Replay::Frame(line) => {
+                match crate::adapter::at_once(driven.on_line(&mut recorder, "replay", &line)) {
+                    Some(Ok(())) => {}
+                    Some(Err(e)) => return crate::adapter::unreplayable(&e.to_string()),
+                    None => return crate::adapter::unreplayable("the judging waited"),
+                }
+            }
+        }
+    }
+    driven.report = Some(crate::adapter::replayed_exit());
+    let (state, failure) = driven.verdict();
+    let recorded = match recorder {
+        Recorder::Collect(recorded) => recorded,
+        Recorder::Store { .. } => Vec::new(),
+    };
+    Replayed {
+        state,
+        failure,
+        unknown_events: crate::adapter::unknown_events(&recorded),
+    }
 }
 
 #[cfg(test)]

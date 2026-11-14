@@ -25,7 +25,7 @@
 //! a tool had started. Every end is committed through the attempt's cancel latch.
 
 use crate::adapter::{
-    AdapterError, AttemptRef, Sink, Stop, finish, now, offers, sha256_file, step,
+    AdapterError, AttemptRef, Replay, Replayed, Sink, Stop, finish, now, offers, sha256_file, step,
 };
 pub use crate::adapter::{Facts, GateCommand, Held, Recorded, Refused};
 use crate::clock::{Clock, Timer};
@@ -33,7 +33,7 @@ use crate::frame::Frame;
 use crate::known;
 use crate::process::{Config, Escalation, Event, Process, Step, Termination};
 use hoh_core::lifecycle::{AttemptState, InputState};
-use hoh_core::persistence::{AttemptFacts, CancelLatch, Session, Store};
+use hoh_core::persistence::{AttemptFacts, CancelLatch, PersistError, Session, Store};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -684,6 +684,482 @@ struct Driven {
     report: Option<crate::process::ExitReport>,
 }
 
+/// What a cancel or the deadline asks of the driver once [`Rpc::abort`] has done its part.
+enum AbortNext {
+    /// Give the `abort` its native grace (the direct mode).
+    Grace,
+    /// End the process now.
+    HardStop,
+    Nothing,
+}
+
+/// What a Pi turn knows while it runs, judged record by record ([`Rpc::on_record`]); the driver owns the process and
+/// the timers, a replay has neither.
+struct Rpc<'a> {
+    turn: &'a Turn,
+    /// The attempt's id.
+    id: &'a str,
+    /// The session files noted before the start.
+    noted: &'a [SessionFile],
+    lines: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    pending: HashMap<String, Pending>,
+    next: usize,
+    cancelled: bool,
+    native_only: bool,
+    deadline: bool,
+    too_large: bool,
+    tool_started: bool,
+    aborted: bool,
+    failure: Option<String>,
+    settled: Option<SettledBy>,
+    disposition: Option<String>,
+    native_session: Option<String>,
+    model: Option<String>,
+    reply: Option<String>,
+    unknown_records: usize,
+    parse_errors: usize,
+    state_queries: usize,
+    agent_starts: usize,
+    dialogs: usize,
+    data: usize,
+    prompt_sent: bool,
+    stopped: bool,
+    abort_sent: bool,
+    /// The input's facts, applied in order whichever comes first (M1T05R-01): Pi took the prompt, its run began.
+    accepted: bool,
+    begun: bool,
+    input_at: InputState,
+    /// Once a move of it is refused (someone else moved it on), the turn leaves the input alone.
+    input: Option<String>,
+    /// A busy answer is checked again once work ends (M1T05R-02).
+    recheck: bool,
+    ended_since_query: bool,
+    provider_error: Option<String>,
+    /// stdin was closed since the driver last looked: Pi is given the term grace to exit.
+    closed: bool,
+}
+
+impl<'a> Rpc<'a> {
+    fn new(
+        turn: &'a Turn,
+        id: &'a str,
+        noted: &'a [SessionFile],
+        lines: mpsc::UnboundedSender<Vec<u8>>,
+        native_only: bool,
+        cancelled: bool,
+    ) -> Rpc<'a> {
+        Rpc {
+            turn,
+            id,
+            noted,
+            lines: Some(lines),
+            pending: HashMap::new(),
+            next: 0,
+            cancelled,
+            native_only,
+            deadline: false,
+            too_large: false,
+            tool_started: false,
+            aborted: false,
+            failure: None,
+            settled: None,
+            disposition: None,
+            native_session: None,
+            model: None,
+            reply: None,
+            unknown_records: 0,
+            parse_errors: 0,
+            state_queries: 0,
+            agent_starts: 0,
+            dialogs: 0,
+            data: 0,
+            prompt_sent: false,
+            stopped: false,
+            abort_sent: false,
+            accepted: false,
+            begun: false,
+            input_at: InputState::Queued,
+            input: turn.input_id.clone(),
+            recheck: false,
+            ended_since_query: false,
+            provider_error: None,
+            closed: false,
+        }
+    }
+
+    fn send(&self, message: Value) {
+        if let Some(l) = &self.lines {
+            let mut line = message.to_string().into_bytes();
+            line.push(b'\n');
+            let _ = l.send(line);
+        }
+    }
+
+    fn command_id(&mut self, prefix: &str) -> String {
+        self.next += 1;
+        format!("hoh-{prefix}-{}", self.next)
+    }
+
+    /// The first `get_state`, checking the session.
+    fn open(&mut self) {
+        let state_id = self.command_id("state");
+        self.pending.insert(state_id.clone(), Pending::Session);
+        self.send(json!({"id": state_id, "type": "get_state"}));
+    }
+
+    /// Close stdin; the driver gives Pi the term grace to exit.
+    fn close(&mut self) {
+        self.lines = None;
+        self.closed = true;
+    }
+
+    /// A cancel or the deadline: `abort` a prompt that runs; else close stdin (the runner's mode) or end the process.
+    fn abort(&mut self) -> AbortNext {
+        if self.prompt_sent && self.settled.is_none() && self.lines.is_some() && !self.abort_sent {
+            let abort_id = self.command_id("abort");
+            self.pending.insert(abort_id.clone(), Pending::Abort);
+            self.send(json!({"id": abort_id, "type": "abort"}));
+            self.abort_sent = true;
+            // The runner's mode: the abort only; the host's ladder ends the process (ADR-022 decision 14).
+            if self.native_only {
+                AbortNext::Nothing
+            } else {
+                AbortNext::Grace
+            }
+        } else if self.native_only {
+            self.lines = None;
+            AbortNext::Nothing
+        } else if !self.stopped {
+            self.lines = None;
+            self.stopped = true;
+            AbortNext::HardStop
+        } else {
+            AbortNext::Nothing
+        }
+    }
+
+    async fn sync_input(&mut self, sink: &mut Sink<'_>) -> Result<(), PersistError> {
+        if self.accepted
+            && self.input_at == InputState::Queued
+            && let Some(i) = &self.input
+        {
+            if sink
+                .soft_move(self.id, i, InputState::Queued, InputState::Delivered, None)
+                .await?
+            {
+                self.input_at = InputState::Delivered;
+            } else {
+                self.input = None;
+            }
+        }
+        if self.begun
+            && self.input_at == InputState::Delivered
+            && let Some(i) = &self.input
+        {
+            if sink
+                .soft_move(self.id, i, InputState::Delivered, InputState::Applied, None)
+                .await?
+            {
+                self.input_at = InputState::Applied;
+            } else {
+                self.input = None;
+            }
+        }
+        Ok(())
+    }
+
+    fn check_idle(&mut self) {
+        let asking = self.pending.values().any(|p| matches!(p, Pending::Idle));
+        if !self.turn.launch.settled_event
+            && self.settled.is_none()
+            && self.lines.is_some()
+            && !asking
+        {
+            let check = self.command_id("state");
+            self.pending.insert(check.clone(), Pending::Idle);
+            self.send(json!({"id": check, "type": "get_state"}));
+            self.state_queries += 1;
+            self.ended_since_query = false;
+        }
+    }
+
+    /// Judge one stdout line and record what it shows.
+    async fn on_record(&mut self, sink: &mut Sink<'_>, bytes: &[u8]) -> Result<(), PersistError> {
+        let (id, turn) = (self.id, self.turn);
+        let launch = &turn.launch;
+        let Some(record) = serde_json::from_slice::<Value>(bytes)
+            .ok()
+            .filter(Value::is_object)
+        else {
+            self.parse_errors += 1;
+            return sink
+                .attempt_event(
+                    id,
+                    &format!("diagnostic-{}", self.parse_errors),
+                    "adapter.diagnostic",
+                    json!({"attempt_id": id, "reason": "stdout line is not a JSON object", "bytes": bytes.len(),
+                           "head": String::from_utf8_lossy(&bytes[..bytes.len().min(256)])}),
+                )
+                .await;
+        };
+        if let Some(events) = &turn.events {
+            let _ = events.send(record.clone());
+        }
+        let key = known::pi_key(&record);
+        if !known::is_known(known::pi(), key.as_deref()) {
+            self.unknown_records += 1;
+            sink.attempt_event(
+                id,
+                &format!("unknown-{}", self.unknown_records),
+                "adapter.unknown_event",
+                known::unknown_event(id, key.as_deref(), bytes, &record),
+            )
+            .await?;
+        }
+        match record["type"].as_str().unwrap_or_default() {
+            "response" => {
+                let what = record["id"].as_str().and_then(|i| self.pending.remove(i));
+                let ok = record["success"] == true;
+                let error = record["error"].as_str().unwrap_or_default().to_owned();
+                match what {
+                    Some(Pending::Session) if ok => {
+                        self.native_session =
+                            record["data"]["sessionId"].as_str().map(str::to_owned);
+                        self.model = record["data"]["model"]["id"].as_str().map(str::to_owned);
+                        // A resumed session is one of the files noted before the start, as pi itself chose it; a
+                        // file it made anew, one gone or one not written yet is not (module docs).
+                        let opened = record["data"]["sessionFile"].as_str().and_then(identity);
+                        let other_file = launch.resume
+                            && !opened.as_ref().is_some_and(|o| self.noted.contains(o));
+                        if self.native_session.as_deref() != Some(launch.session_id.as_str())
+                            || other_file
+                        {
+                            self.failure = Some("SESSION_MISMATCH".to_owned());
+                            sink.attempt_event(id, "session-mismatch", "adapter.diagnostic",
+                                               json!({"attempt_id": id, "reason": "SESSION_MISMATCH",
+                                                      "asked": launch.session_id, "got": self.native_session,
+                                                      "noted": self.noted.iter().map(|(p, _, _)| p).collect::<Vec<_>>(),
+                                                      "opened": record["data"]["sessionFile"]}))
+                                .await?;
+                            self.close();
+                        } else if self.lines.is_some() {
+                            let prompt_id = self.command_id("prompt");
+                            self.pending.insert(prompt_id.clone(), Pending::Prompt);
+                            self.send(
+                                json!({"id": prompt_id, "type": "prompt", "message": turn.prompt}),
+                            );
+                            self.prompt_sent = true;
+                        }
+                    }
+                    Some(Pending::Session) => {
+                        self.failure = Some(format!("get_state: {error}"));
+                        self.close();
+                    }
+                    Some(Pending::Prompt) if ok => {
+                        self.disposition =
+                            record["data"]["disposition"].as_str().map(str::to_owned);
+                        self.accepted = true;
+                        if self.disposition.as_deref() == Some("handled") {
+                            self.settled = Some(SettledBy::Handled);
+                            self.begun = true;
+                            self.close();
+                        }
+                        self.sync_input(sink).await?;
+                    }
+                    Some(Pending::Prompt) => {
+                        let reason = error_class(&error);
+                        self.failure = Some(reason.to_owned());
+                        sink.attempt_event(
+                            id,
+                            "prompt-refused",
+                            "adapter.prompt_refused",
+                            json!({"attempt_id": id, "reason": reason, "error": error}),
+                        )
+                        .await?;
+                        if self.input_at == InputState::Queued
+                            && let Some(i) = self.input.take()
+                            && sink
+                                .soft_move(
+                                    id,
+                                    &i,
+                                    InputState::Queued,
+                                    InputState::Rejected,
+                                    Some(error),
+                                )
+                                .await?
+                        {
+                            self.input_at = InputState::Rejected;
+                        }
+                        self.close();
+                    }
+                    Some(Pending::Idle) => {
+                        let d = &record["data"];
+                        let idle = ok
+                            && d["isStreaming"] == false
+                            && d["isCompacting"] == false
+                            && d["pendingMessageCount"].as_u64() == Some(0);
+                        if idle && self.settled.is_none() {
+                            self.settled = Some(SettledBy::State);
+                            self.close();
+                        } else if !idle && self.ended_since_query {
+                            // Work ended while this answer was on its way: it may be stale already.
+                            self.check_idle();
+                        } else if !idle {
+                            self.recheck = true;
+                        }
+                    }
+                    // Pi answers an abort once it is idle; its agent_settled came first.
+                    Some(Pending::Abort) if self.settled.is_some() => {
+                        self.close();
+                    }
+                    Some(Pending::Abort) | None => {}
+                }
+            }
+            "agent_start" => {
+                self.agent_starts += 1;
+                sink.attempt_event(
+                    id,
+                    &format!("agent-start-{}", self.agent_starts),
+                    "adapter.agent_start",
+                    json!({"attempt_id": id}),
+                )
+                .await?;
+                self.begun = true;
+                self.sync_input(sink).await?;
+            }
+            "agent_end" => {
+                self.ended_since_query = true;
+                self.recheck = false;
+                self.check_idle();
+            }
+            // Ends of work after a run: a busy answer is checked again.
+            "compaction_end" | "auto_retry_end" | "queue_update" | "turn_end" | "message_end"
+            | "tool_execution_end"
+                if !launch.settled_event =>
+            {
+                self.ended_since_query = true;
+                if self.recheck {
+                    self.recheck = false;
+                    self.check_idle();
+                }
+                if record["type"] == "message_end" && record["message"]["role"] == "assistant" {
+                    note_message(
+                        &record["message"],
+                        &mut self.reply,
+                        &mut self.provider_error,
+                    );
+                }
+            }
+            "agent_settled" => {
+                if self.settled.is_none() {
+                    self.settled = Some(SettledBy::AgentSettled);
+                    self.aborted = record["aborted"] == true;
+                }
+                self.close();
+            }
+            "tool_execution_start" => self.tool_started = true,
+            "message_end" if record["message"]["role"] == "assistant" => {
+                note_message(
+                    &record["message"],
+                    &mut self.reply,
+                    &mut self.provider_error,
+                );
+            }
+            "extension_ui_request" => {
+                let method = record["method"].as_str().unwrap_or_default();
+                if DIALOGS.contains(&method) {
+                    // Headless: no option is chosen for anyone.
+                    self.dialogs += 1;
+                    self.send(
+                        json!({"type": "extension_ui_response", "id": record["id"], "cancelled": true}),
+                    );
+                    sink.attempt_event(
+                        id,
+                        &format!("ui-request-{}", self.dialogs),
+                        "adapter.ui_request",
+                        json!({"attempt_id": id, "method": method, "request": record,
+                                              "decision": "cancelled"}),
+                    )
+                    .await?;
+                } else {
+                    self.data += 1;
+                    sink.attempt_event(
+                        id,
+                        &format!("ui-data-{}", self.data),
+                        "adapter.ui_data",
+                        json!({"attempt_id": id, "method": method, "request": record}),
+                    )
+                    .await?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// The verdict once the process ended (`report`; `None`: it was not seen to end) and stdin is closed, with what it
+    /// records.
+    async fn conclude(
+        self,
+        sink: &mut Sink<'_>,
+        report: Option<crate::process::ExitReport>,
+    ) -> Result<Driven, PersistError> {
+        let id = self.id;
+        let logs_incomplete = report.as_ref().is_none_or(|r| {
+            r.stdout.error.is_some() || r.stderr.error.is_some() || !r.stdout.eof || !r.stderr.eof
+        });
+        if logs_incomplete && let Some(r) = &report {
+            sink.attempt_event(
+                id,
+                "raw-log-incomplete",
+                "adapter.diagnostic",
+                json!({"attempt_id": id, "reason": "RAW_LOG_INCOMPLETE",
+                           "stdout": {"eof": r.stdout.eof, "error": r.stdout.error},
+                           "stderr": {"eof": r.stderr.eof, "error": r.stderr.error}}),
+            )
+            .await?;
+        }
+        let provider_class = self.provider_error.as_deref().map(error_class);
+        let (state, failure) = verdict(&Ending {
+            cancelled: self.cancelled,
+            too_large: self.too_large,
+            deadline: self.deadline,
+            logs_incomplete,
+            failure: self.failure.as_deref(),
+            settled: self.settled,
+            aborted: self.aborted,
+            tool_started: self.tool_started,
+            provider_error: provider_class,
+        });
+        if let (Some(class), Some(message)) = (provider_class, &self.provider_error) {
+            sink.attempt_event(
+                id,
+                "provider-failed",
+                "adapter.turn_failed",
+                json!({"attempt_id": id, "reason": class, "errorMessage": message}),
+            )
+            .await?;
+        }
+        Ok(Driven {
+            state,
+            failure,
+            cancelled: self.cancelled,
+            // A prompt pi handled started no run: pi wrote no message, so no session file, and a later turn must not be
+            // sent to resume it (M2T17R-551; docs/adr/ADR-024.md decision 4).
+            native_session: self
+                .native_session
+                .filter(|_| self.settled != Some(SettledBy::Handled)),
+            model: self.model,
+            disposition: self.disposition,
+            settled: self.settled,
+            reply: self.reply,
+            parse_errors: self.parse_errors,
+            state_queries: self.state_queries,
+            report,
+        })
+    }
+}
+
 /// Drive one Pi turn on `process` until it ended: the session query, the prompt, its records, dialogs answered
 /// headless, a cancel from `stop` (an abort; in the direct mode then SIGTERM and SIGKILL after their graces).
 /// `preamble` is written first (the runner's mode: the gate's `go`).
@@ -696,7 +1172,6 @@ async fn drive(
     preamble: Option<Vec<u8>>,
     noted: &[SessionFile],
 ) -> Result<Driven, AdapterError> {
-    let launch = &turn.launch;
     let id = &attempt.attempt_id;
     let (lines, mut queue) = mpsc::unbounded_channel::<Vec<u8>>();
     // The runner's mode: the gate's line goes first.
@@ -711,41 +1186,16 @@ async fn drive(
         }
         input.shutdown().await
     });
-    let mut lines = Some(lines);
-    let send = |lines: &Option<mpsc::UnboundedSender<Vec<u8>>>, message: Value| {
-        if let Some(l) = lines {
-            let mut line = message.to_string().into_bytes();
-            line.push(b'\n');
-            let _ = l.send(line);
-        }
-    };
-    let mut pending: HashMap<String, Pending> = HashMap::new();
-    let mut next = 0usize;
-    let mut command_id = |prefix: &str| {
-        next += 1;
-        format!("hoh-{prefix}-{next}")
-    };
-    let state_id = command_id("state");
-    pending.insert(state_id.clone(), Pending::Session);
-    send(&lines, json!({"id": state_id, "type": "get_state"}));
-    let mut cancelled = stop.requested_now();
-    let native_only = stop.is_native();
-    let (mut deadline, mut too_large, mut tool_started, mut aborted) = (false, false, false, false);
-    let (mut failure, mut settled, mut disposition) =
-        (None::<String>, None::<SettledBy>, None::<String>);
-    let (mut native_session, mut model, mut reply) =
-        (None::<String>, None::<String>, None::<String>);
-    let mut unknown_records = 0;
-    let (mut parse_errors, mut state_queries, mut agent_starts, mut dialogs, mut data) =
-        (0, 0, 0, 0, 0);
-    let (mut prompt_sent, mut stopped, mut abort_sent, mut written) = (false, false, false, false);
-    // The input's facts, applied in order whichever comes first (M1T05R-01): Pi took the prompt, its run began.
-    let (mut accepted, mut begun, mut input_at) = (false, false, InputState::Queued);
-    // Once a move of it is refused (someone else moved it on), the turn leaves the input alone.
-    let mut input = turn.input_id.clone();
-    // A busy answer is checked again once work ends (M1T05R-02).
-    let (mut recheck, mut ended_since_query) = (false, false);
-    let mut provider_error: Option<String> = None;
+    let mut r = Rpc::new(
+        turn,
+        id,
+        noted,
+        lines,
+        stop.is_native(),
+        stop.requested_now(),
+    );
+    r.open();
+    let mut written = false;
     let mut deadline_timer: Option<Timer> = turn.deadline.map(|d| turn.clock.sleep(d));
     let mut abort_timer: Option<Timer> = None;
     // Process lifecycle, not a judgement of the turn: how long Pi may take to exit once stdin is closed.
@@ -757,104 +1207,40 @@ async fn drive(
             ..turn.escalation
         });
     };
-    macro_rules! close {
-        () => {
-            lines = None;
-            if exit_timer.is_none() {
-                exit_timer = Some(Box::pin(tokio::time::sleep(turn.escalation.term_grace)));
-            }
+    let abort =
+        |r: &mut Rpc<'_>, process: &Process, abort_timer: &mut Option<Timer>| match r.abort() {
+            AbortNext::Grace => *abort_timer = Some(turn.clock.sleep(turn.escalation.native_grace)),
+            AbortNext::HardStop => hard_stop(process),
+            AbortNext::Nothing => {}
         };
-    }
-    macro_rules! abort {
-        () => {
-            if prompt_sent && settled.is_none() && lines.is_some() && !abort_sent {
-                let abort_id = command_id("abort");
-                pending.insert(abort_id.clone(), Pending::Abort);
-                send(&lines, json!({"id": abort_id, "type": "abort"}));
-                abort_sent = true;
-                // The runner's mode: the abort only; the host's ladder ends the process (ADR-022 decision 14).
-                if !native_only {
-                    abort_timer = Some(turn.clock.sleep(turn.escalation.native_grace));
-                }
-            } else if native_only {
-                lines = None;
-            } else if !stopped {
-                lines = None;
-                hard_stop(process);
-                stopped = true;
-            }
-        };
-    }
-    macro_rules! sync_input {
-        () => {
-            if accepted
-                && input_at == InputState::Queued
-                && let Some(i) = &input
-            {
-                if sink
-                    .soft_move(id, i, InputState::Queued, InputState::Delivered, None)
-                    .await?
-                {
-                    input_at = InputState::Delivered;
-                } else {
-                    input = None;
-                }
-            }
-            if begun
-                && input_at == InputState::Delivered
-                && let Some(i) = &input
-            {
-                if sink
-                    .soft_move(id, i, InputState::Delivered, InputState::Applied, None)
-                    .await?
-                {
-                    input_at = InputState::Applied;
-                } else {
-                    input = None;
-                }
-            }
-        };
-    }
-    macro_rules! check_idle {
-        () => {
-            let asking = pending.values().any(|p| matches!(p, Pending::Idle));
-            if !launch.settled_event && settled.is_none() && lines.is_some() && !asking {
-                let check = command_id("state");
-                pending.insert(check.clone(), Pending::Idle);
-                send(&lines, json!({"id": check, "type": "get_state"}));
-                state_queries += 1;
-                ended_since_query = false;
-            }
-        };
-    }
-    if cancelled {
-        abort!();
+    if r.cancelled {
+        abort(&mut r, process, &mut abort_timer);
     }
     let report = loop {
         let event = tokio::select! {
             biased;
-            () = stop.requested(), if !cancelled => {
-                cancelled = true;
-                abort!();
+            () = stop.requested(), if !r.cancelled => {
+                r.cancelled = true;
+                abort(&mut r, process, &mut abort_timer);
                 continue;
             }
-            () = fire(&mut deadline_timer), if deadline_timer.is_some() && !deadline => {
-                deadline = true;
+            () = fire(&mut deadline_timer), if deadline_timer.is_some() && !r.deadline => {
+                r.deadline = true;
                 deadline_timer = None;
-                abort!();
+                abort(&mut r, process, &mut abort_timer);
                 continue;
             }
-            () = fire(&mut abort_timer), if abort_timer.is_some() && !stopped => {
+            () = fire(&mut abort_timer), if abort_timer.is_some() && !r.stopped => {
                 abort_timer = None;
-                lines = None;
+                r.lines = None;
                 hard_stop(process);
-                stopped = true;
+                r.stopped = true;
                 continue;
             }
-            () = async { if let Some(t) = exit_timer.as_mut() { t.await } }, if exit_timer.is_some() && !stopped => {
+            () = async { if let Some(t) = exit_timer.as_mut() { t.await } }, if exit_timer.is_some() && !r.stopped => {
                 exit_timer = None;
                 hard_stop(process);
-                stopped = true;
+                r.stopped = true;
                 continue;
             }
             result = &mut writer, if !written => {
@@ -865,14 +1251,14 @@ async fn drive(
                     Err(e) => Some(e.to_string()),
                 };
                 // Pi can no longer be told anything: stop it; the stream's end decides the outcome.
-                if let Some(e) = failed.filter(|_| lines.is_some()) {
+                if let Some(e) = failed.filter(|_| r.lines.is_some()) {
                     sink
                         .attempt_event(id, "stdin-failed", "adapter.diagnostic",
                                        json!({"attempt_id": id, "reason": "stdin failed", "error": e}))
                         .await?;
-                    lines = None;
+                    r.lines = None;
                     hard_stop(process);
-                    stopped = true;
+                    r.stopped = true;
                 }
                 continue;
             }
@@ -881,10 +1267,10 @@ async fn drive(
         let bytes = match event {
             Some(Event::Frame(Frame::Line(bytes) | Frame::Partial(bytes))) => bytes,
             Some(Event::Frame(Frame::TooLarge(refused))) => {
-                too_large = true;
-                lines = None;
+                r.too_large = true;
+                r.lines = None;
                 hard_stop(process);
-                stopped = true;
+                r.stopped = true;
                 sink
                     .attempt_event(
                         id,
@@ -900,262 +1286,76 @@ async fn drive(
             Some(Event::Exit(report)) => break Some(*report),
             None => break None,
         };
-        let Some(record) = serde_json::from_slice::<Value>(&bytes)
-            .ok()
-            .filter(Value::is_object)
-        else {
-            parse_errors += 1;
-            sink
-                .attempt_event(
-                    id,
-                    &format!("diagnostic-{parse_errors}"),
-                    "adapter.diagnostic",
-                    json!({"attempt_id": id, "reason": "stdout line is not a JSON object", "bytes": bytes.len(),
-                           "head": String::from_utf8_lossy(&bytes[..bytes.len().min(256)])}),
-                )
-                .await?;
-            continue;
-        };
-        if let Some(events) = &turn.events {
-            let _ = events.send(record.clone());
-        }
-        let key = known::pi_key(&record);
-        if !known::is_known(known::pi(), key.as_deref()) {
-            unknown_records += 1;
-            sink.attempt_event(
-                id,
-                &format!("unknown-{unknown_records}"),
-                "adapter.unknown_event",
-                known::unknown_event(id, key.as_deref(), &bytes, &record),
-            )
-            .await?;
-        }
-        match record["type"].as_str().unwrap_or_default() {
-            "response" => {
-                let what = record["id"].as_str().and_then(|i| pending.remove(i));
-                let ok = record["success"] == true;
-                let error = record["error"].as_str().unwrap_or_default().to_owned();
-                match what {
-                    Some(Pending::Session) if ok => {
-                        native_session = record["data"]["sessionId"].as_str().map(str::to_owned);
-                        model = record["data"]["model"]["id"].as_str().map(str::to_owned);
-                        // A resumed session is one of the files noted before the start, as pi itself chose it; a
-                        // file it made anew, one gone or one not written yet is not (module docs).
-                        let opened = record["data"]["sessionFile"].as_str().and_then(identity);
-                        let other_file =
-                            launch.resume && !opened.as_ref().is_some_and(|o| noted.contains(o));
-                        if native_session.as_deref() != Some(launch.session_id.as_str())
-                            || other_file
-                        {
-                            failure = Some("SESSION_MISMATCH".to_owned());
-                            sink
-                                .attempt_event(id, "session-mismatch", "adapter.diagnostic",
-                                               json!({"attempt_id": id, "reason": "SESSION_MISMATCH",
-                                                      "asked": launch.session_id, "got": native_session,
-                                                      "noted": noted.iter().map(|(p, _, _)| p).collect::<Vec<_>>(),
-                                                      "opened": record["data"]["sessionFile"]}))
-                                .await?;
-                            close!();
-                        } else if lines.is_some() {
-                            let prompt_id = command_id("prompt");
-                            pending.insert(prompt_id.clone(), Pending::Prompt);
-                            send(
-                                &lines,
-                                json!({"id": prompt_id, "type": "prompt", "message": turn.prompt}),
-                            );
-                            prompt_sent = true;
-                        }
-                    }
-                    Some(Pending::Session) => {
-                        failure = Some(format!("get_state: {error}"));
-                        close!();
-                    }
-                    Some(Pending::Prompt) if ok => {
-                        disposition = record["data"]["disposition"].as_str().map(str::to_owned);
-                        accepted = true;
-                        if disposition.as_deref() == Some("handled") {
-                            settled = Some(SettledBy::Handled);
-                            begun = true;
-                            close!();
-                        }
-                        sync_input!();
-                    }
-                    Some(Pending::Prompt) => {
-                        let reason = error_class(&error);
-                        failure = Some(reason.to_owned());
-                        sink.attempt_event(
-                            id,
-                            "prompt-refused",
-                            "adapter.prompt_refused",
-                            json!({"attempt_id": id, "reason": reason, "error": error}),
-                        )
-                        .await?;
-                        if input_at == InputState::Queued
-                            && let Some(i) = input.take()
-                            && sink
-                                .soft_move(
-                                    id,
-                                    &i,
-                                    InputState::Queued,
-                                    InputState::Rejected,
-                                    Some(error),
-                                )
-                                .await?
-                        {
-                            input_at = InputState::Rejected;
-                        }
-                        close!();
-                    }
-                    Some(Pending::Idle) => {
-                        let d = &record["data"];
-                        let idle = ok
-                            && d["isStreaming"] == false
-                            && d["isCompacting"] == false
-                            && d["pendingMessageCount"].as_u64() == Some(0);
-                        if idle && settled.is_none() {
-                            settled = Some(SettledBy::State);
-                            close!();
-                        } else if !idle && ended_since_query {
-                            // Work ended while this answer was on its way: it may be stale already.
-                            check_idle!();
-                        } else if !idle {
-                            recheck = true;
-                        }
-                    }
-                    // Pi answers an abort once it is idle; its agent_settled came first.
-                    Some(Pending::Abort) if settled.is_some() => {
-                        close!();
-                    }
-                    Some(Pending::Abort) | None => {}
-                }
-            }
-            "agent_start" => {
-                agent_starts += 1;
-                sink.attempt_event(
-                    id,
-                    &format!("agent-start-{agent_starts}"),
-                    "adapter.agent_start",
-                    json!({"attempt_id": id}),
-                )
-                .await?;
-                begun = true;
-                sync_input!();
-            }
-            "agent_end" => {
-                ended_since_query = true;
-                recheck = false;
-                check_idle!();
-            }
-            // Ends of work after a run: a busy answer is checked again.
-            "compaction_end" | "auto_retry_end" | "queue_update" | "turn_end" | "message_end"
-            | "tool_execution_end"
-                if !launch.settled_event =>
-            {
-                ended_since_query = true;
-                if recheck {
-                    recheck = false;
-                    check_idle!();
-                }
-                if record["type"] == "message_end" && record["message"]["role"] == "assistant" {
-                    note_message(&record["message"], &mut reply, &mut provider_error);
-                }
-            }
-            "agent_settled" => {
-                if settled.is_none() {
-                    settled = Some(SettledBy::AgentSettled);
-                    aborted = record["aborted"] == true;
-                }
-                close!();
-            }
-            "tool_execution_start" => tool_started = true,
-            "message_end" if record["message"]["role"] == "assistant" => {
-                note_message(&record["message"], &mut reply, &mut provider_error);
-            }
-            "extension_ui_request" => {
-                let method = record["method"].as_str().unwrap_or_default();
-                if DIALOGS.contains(&method) {
-                    // Headless: no option is chosen for anyone.
-                    dialogs += 1;
-                    send(
-                        &lines,
-                        json!({"type": "extension_ui_response", "id": record["id"], "cancelled": true}),
-                    );
-                    sink.attempt_event(
-                        id,
-                        &format!("ui-request-{dialogs}"),
-                        "adapter.ui_request",
-                        json!({"attempt_id": id, "method": method, "request": record,
-                                              "decision": "cancelled"}),
-                    )
-                    .await?;
-                } else {
-                    data += 1;
-                    sink.attempt_event(
-                        id,
-                        &format!("ui-data-{data}"),
-                        "adapter.ui_data",
-                        json!({"attempt_id": id, "method": method, "request": record}),
-                    )
-                    .await?;
-                }
-            }
-            _ => {}
+        r.on_record(sink, &bytes).await?;
+        // stdin was closed: Pi has the term grace to exit by itself.
+        if std::mem::take(&mut r.closed) && exit_timer.is_none() {
+            exit_timer = Some(Box::pin(tokio::time::sleep(turn.escalation.term_grace)));
         }
     };
-    drop(lines);
+    r.lines = None;
     if !written {
         writer.abort();
     }
-    let logs_incomplete = report.as_ref().is_none_or(|r| {
-        r.stdout.error.is_some() || r.stderr.error.is_some() || !r.stdout.eof || !r.stderr.eof
-    });
-    if logs_incomplete && let Some(r) = &report {
-        sink.attempt_event(
-            id,
-            "raw-log-incomplete",
-            "adapter.diagnostic",
-            json!({"attempt_id": id, "reason": "RAW_LOG_INCOMPLETE",
-                       "stdout": {"eof": r.stdout.eof, "error": r.stdout.error},
-                       "stderr": {"eof": r.stderr.eof, "error": r.stderr.error}}),
-        )
-        .await?;
+    Ok(r.conclude(sink, report).await?)
+}
+
+/// Replay `bytes` (pi's stdout, with the host's cancel where [`crate::adapter::REPLAY_CANCEL`] stands) through this
+/// adapter's own judging, no process started (docs/adr/ADR-030.md decision 10): see [`Replayed`]. `version` (pi's
+/// `--version`) decides whether the turn waits for `agent_settled` or checks for idle ([`emits_settled`]).
+pub fn replay(bytes: &[u8], version: &str) -> Replayed {
+    let turn = Turn {
+        launch: Launch {
+            program: PathBuf::from("pi"),
+            help: String::new(),
+            cwd: PathBuf::from(crate::compat::SUITE_CWD),
+            session_dir: PathBuf::from(crate::compat::SUITE_PI_SESSION_DIR),
+            session_id: crate::compat::SUITE_SESSION.to_owned(),
+            resume: false,
+            provider: None,
+            model: None,
+            settled_event: emits_settled(Some(version)),
+            capabilities: crate::capabilities::Probed::new(),
+        },
+        prompt: crate::compat::SUITE_PROMPT.to_owned(),
+        input_id: None,
+        logs: PathBuf::from(crate::compat::SUITE_CWD),
+        escalation: Turn::default_escalation(),
+        deadline: None,
+        clock: Arc::new(crate::clock::SystemClock),
+        events: None,
+    };
+    let mut sink = Sink {
+        store: None,
+        recorded: Vec::new(),
+    };
+    let (lines, _written) = mpsc::unbounded_channel::<Vec<u8>>();
+    let mut r = Rpc::new(&turn, "replay", &[], lines, true, false);
+    r.open();
+    for step in crate::adapter::replay_steps(bytes) {
+        match step {
+            Replay::Cancel if !r.cancelled => {
+                // The runner's cancel: the abort only (no timer, no process to stop).
+                r.cancelled = true;
+                let _ = r.abort();
+            }
+            Replay::Cancel => {}
+            Replay::Frame(line) => match crate::adapter::at_once(r.on_record(&mut sink, &line)) {
+                Some(Ok(())) => {}
+                Some(Err(e)) => return crate::adapter::unreplayable(&e.to_string()),
+                None => return crate::adapter::unreplayable("the judging waited"),
+            },
+        }
     }
-    let provider_class = provider_error.as_deref().map(error_class);
-    let (state, failure) = verdict(&Ending {
-        cancelled,
-        too_large,
-        deadline,
-        logs_incomplete,
-        failure: failure.as_deref(),
-        settled,
-        aborted,
-        tool_started,
-        provider_error: provider_class,
-    });
-    if let (Some(class), Some(message)) = (provider_class, &provider_error) {
-        sink.attempt_event(
-            id,
-            "provider-failed",
-            "adapter.turn_failed",
-            json!({"attempt_id": id, "reason": class, "errorMessage": message}),
-        )
-        .await?;
+    r.lines = None;
+    match crate::adapter::at_once(r.conclude(&mut sink, Some(crate::adapter::replayed_exit()))) {
+        Some(Ok(driven)) => Replayed {
+            state: driven.state,
+            failure: driven.failure,
+            unknown_events: crate::adapter::unknown_events(&sink.recorded),
+        },
+        Some(Err(e)) => crate::adapter::unreplayable(&e.to_string()),
+        None => crate::adapter::unreplayable("the judging waited"),
     }
-    Ok(Driven {
-        state,
-        failure,
-        cancelled,
-        // A prompt pi handled started no run: pi wrote no message, so no session file, and a later turn must not be
-        // sent to resume it (M2T17R-551; docs/adr/ADR-024.md decision 4).
-        native_session: native_session.filter(|_| settled != Some(SettledBy::Handled)),
-        model,
-        disposition,
-        settled,
-        reply,
-        parse_errors,
-        state_queries,
-        report,
-    })
 }
 
 /// Whether the session's file (`<timestamp>_<id>.jsonl`, as pi names it) is in its directory.

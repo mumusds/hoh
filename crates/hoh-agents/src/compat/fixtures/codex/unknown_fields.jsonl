@@ -1,0 +1,12 @@
+{"id":0,"result":{"userAgent":"hoh-suite/0.0.0","codexHome":"/hoh-suite/.codex","platformFamily":"unix","platformOs":"linux"}}
+{"id":1,"result":{"thread":{"id":"hoh-suite-session","preview":"","ephemeral":false,"turns":[]},"model":"codex-suite-model","modelProvider":"openai","cwd":"/hoh-suite","approvalPolicy":"never","sandbox":{"type":"dangerFullAccess"},"reasoningEffort":null}}
+{"method":"thread/started","params":{"thread":{"id":"hoh-suite-session","preview":"","ephemeral":false,"turns":[]}}}
+{"id":2,"result":{"turn":{"id":"hoh-suite-turn","items":[],"status":"inProgress","error":null}}}
+{"method":"turn/started","params":{"threadId":"hoh-suite-session","turn":{"id":"hoh-suite-turn","items":[],"status":"inProgress","error":null}}}
+{"method":"item/started","params":{"item":{"type":"userMessage","id":"item-user","content":[{"type":"text","text":"Reply with exactly HOH_SUITE_OK and nothing else."}]},"threadId":"hoh-suite-session","turnId":"hoh-suite-turn","startedAtMs":1}}
+{"method":"item/completed","params":{"item":{"type":"userMessage","id":"item-user","content":[{"type":"text","text":"Reply with exactly HOH_SUITE_OK and nothing else."}]},"threadId":"hoh-suite-session","turnId":"hoh-suite-turn","completedAtMs":1}}
+{"method":"hoh/futureNotification","params":{"threadId":"hoh-suite-session","note":"a method no registry names"}}
+{"method":"item/started","params":{"item":{"type":"agentMessage","id":"item-reply","text":""},"threadId":"hoh-suite-session","turnId":"hoh-suite-turn","startedAtMs":3}}
+{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"item-reply","text":"HOH_SUITE_OK","x_future":{"kept":true}},"threadId":"hoh-suite-session","turnId":"hoh-suite-turn","completedAtMs":4}}
+{"method":"thread/tokenUsage/updated","params":{"threadId":"hoh-suite-session","turnId":"hoh-suite-turn","tokenUsage":{"total":{"totalTokens":30,"inputTokens":20,"cachedInputTokens":0,"outputTokens":10,"reasoningOutputTokens":0},"last":{"totalTokens":30,"inputTokens":20,"cachedInputTokens":0,"outputTokens":10,"reasoningOutputTokens":0},"modelContextWindow":null}}}
+{"method":"turn/completed","params":{"threadId":"hoh-suite-session","turn":{"id":"hoh-suite-turn","items":[],"status":"completed","error":null}}}
