@@ -1385,8 +1385,8 @@
    "summary": "适配器从实际版本、--help 与原生 schema 探测能力并写入 compat manifest，按能力而非品牌启用功能；未知事件/字段原样保存不 panic，超大帧有界失败，不支持的能力显式降级。",
    "behavior": [
     "probe() 必须记录 launcher path 与 sha256，以及解析后的实际实现 path 与 sha256（如 pi 由 install/current-version 解析到 releases/<版本>，codex 由 npm 包装解析到 vendored 原生二进制）、--version 原文、相关 --help 的 sha256、原生 schema hash（Codex 用 `codex app-server generate-json-schema` 输出），写入符合 contracts/compat-manifest.schema.json 的 compat manifest（CR-003）。",
-    "Capabilities（structured_events、resume、mid_turn_steer、custom_tools、images、browser、ui_dialogs、token_usage）必须由探测与兼容套件结果得出，不按品牌硬编码，并写入 sessions.capabilities_json。",
-    "兼容套件 fixture 必须对每个 agent 覆盖成功、失败、取消、压缩、工具、未知字段6类，manifest 记录所用 fixture 集 hash 与结果。",
+    "Capabilities（structured_events、resume、mid_turn_steer、custom_tools、images、browser、ui_dialogs、token_usage、command_execution）必须由探测与兼容套件结果得出，不按品牌硬编码，并写入 sessions.capabilities_json；command_execution 指适配器在 HoH 的启动选项下可运行命令，由被测二进制的 help/schema 实测（ADR-030 决定 12）。",
+    "兼容套件 fixture 必须对每个 agent 覆盖成功、失败、取消、压缩、工具、未知字段6类，manifest 记录所用 fixture 集 hash（本构建的套件集摘要：覆盖嵌入 fixture、请求构建函数的实际输出与套件定义，ADR-030 决定 10）与结果。",
     "实现 sha256、help 或 schema hash 与 manifest 不符时，新 attempt 不得使用该版本（COMPAT_UNVERIFIED），直到在无写租约时重跑兼容套件通过；运行中的 attempt 不受影响。",
     "未知事件类型与已知事件中的未知字段必须保存原始帧并产生 `adapter.unknown_event` 诊断，不 panic、不改变终态判定。",
     "请求不支持的能力必须返回 CAPABILITY_UNSUPPORTED（API 为422）或走文档化降级（如 steer 排到下一轮），不得静默伪装支持。",
